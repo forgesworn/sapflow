@@ -25,7 +25,8 @@ matters.
 
 - Larix on Android.
 - A network drop (Wi-Fi off), the phone locked or backgrounded, SRT with a
-  passphrase, bursty loss.
+  passphrase.
+- OBS dropping and reconnecting; OBS's Apple hardware encoder; vMix.
 
 ## Stopping and restarting
 
@@ -36,39 +37,133 @@ segments). sapflow holds nothing for a publisher that leaves; a silent one
 is dropped after 10 s. Holding the stage across a drop is v4v's side (its
 ingest gate covers a dropped encoder held and resumed). How hls.js and
 Safari recover from the 404 and the new playlist is not yet checked.
-- OBS dropping and reconnecting; SRT under packet loss; OBS's Apple
-  hardware encoder; vMix.
 
 ## SRT under packet loss (2026-10-20)
 
-libsrt's `srt-live-transmit` sent a 60 s clip in real time through a UDP
-proxy that dropped packets at random in both directions (handshakes
-exempt) and added 60 ms round trip; the same sender fed sapflow and
-libsrt's own receiver, one run per condition, on loopback.
+`scripts/srt-loss.sh` compares sapflow's SRT receiver with libsrt's under
+packet loss, with several seeds per condition. libsrt's `srt-live-transmit`
+is the sender in every trial. It plays a generated 30 s clip (720p30,
+2.5 Mbit/s, about 7,200 SRT packets) in real time through `srt-loss-proxy`
+(in `crates/sapflow-bench`), which drops packets in both directions, delays
+each by 30 ms (a 60 ms round trip), keeps them in order and never drops
+handshakes. The receiver is sapflow or libsrt's own `srt-live-transmit`.
+Conditions: random loss of 3, 10 and 20%, and bursty loss (Gilbert-Elliott:
+8% on average, bursts of 8 packets on average), each at an SRT latency of
+2000 ms and of 200 ms. Six seeds per condition; every cell is the mean and
+sample standard deviation over them, and the receivers alternate seed by
+seed so both meet the same machine load.
 
-| Loss | Sender traffic, ideal | libsrt receiver | sapflow receiver |
-|------|-----------------------|-----------------|------------------|
-| 3% | 1.03x | 1.03x | 1.13x |
-| 10% | 1.11x | 1.10x | 1.73x |
-| 20% | 1.25x | 1.23x | 2.34x |
+- **Retransmission overhead:** retransmitted data packets as a percentage of
+  the original ones, counted by the proxy from the SRT headers. With no
+  waste it is p / (1 - p) for a loss rate p (11% at 10%).
+- **Not recovered in time:** original data packets for which no copy reached
+  the receiver within the latency of the first send, counted by the proxy.
+  The same definition for both receivers, whatever they do with the packets.
+- **Video and audio delivered:** packets in the receiver's output against
+  the same receiver's loss-free run. Decode messages: lines `ffmpeg -v error`
+  prints decoding it. These two depend on what each receiver writes. sapflow
+  demuxes the stream and drops frames a lost packet damaged; libsrt writes the
+  damaged stream as it is, so its delivered count stays near 100% and its
+  decode messages are many (89 in its loss-free 2000 ms run). Compare them
+  between sapflow builds, not with libsrt.
 
-- With 2 s latency sapflow delivered the same media at every loss rate,
-  with no decode errors: recovery is correct.
-- Before the fix it asked for far more retransmission than libsrt, and at
-  200 ms latency and 10% loss lost 87 video packets that libsrt's receiver
-  recovered.
-- Cause: `srt-protocol`'s handshake did not advertise `TLPKTDROP` and
-  `NAKREPORT`, which its receiver implements, so libsrt senders also
-  retransmitted on their own timer. Advertising them alone made delivery
-  worse (the receiver backed off its re-requests: 2, 3, 4... RTTs); with
-  re-requests every RTT as well, both are patched in `vendor/srt-protocol`:
+Receivers: `upstream` is `srt-protocol` as published (no `NAKREPORT` or
+`TLPKTDROP` in the handshake; asks again after 2, 3, 4... RTTs); `flags +
+RTT` has the first two patches in `vendor/srt-protocol/PATCHES.md`
+(advertise both, ask every RTT); `current` adds the deadline-aware
+re-requests; `libsrt` is libsrt's receiver.
 
-| Receiver | 10% loss, 2 s | 20% loss, 2 s | 10% loss, 200 ms |
-|----------|---------------|---------------|------------------|
-| sapflow before | 1.69x, no decode errors | 2.34x, none | 1.59x, 139 decode messages |
-| sapflow patched | 1.09x, none | 1.21x, none | 1.08x, 83 |
-| libsrt | 1.10x | 1.23x | 1.11x, 18 |
+| Loss | Latency | Receiver | n | Retransmission overhead | Not recovered in time | Video delivered | Audio delivered | Decode messages |
+| ------ | --------: | ---------- | --: | ------------------------: | ----------------------: | ----------------: | ----------------: | ----------------: |
+| 3% random | 2000 ms | upstream | 6 | 20.9% ± 2.0 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 3% random | 2000 ms | flags + RTT | 6 | 3.4% ± 0.1 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 3% random | 2000 ms | current | 6 | 3.5% ± 0.3 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 3% random | 2000 ms | libsrt | 6 | 3.5% ± 0.1 | 0.00% ± 0.01 | 100.07% ± 0.06 | 99.96% ± 0.09 | 31.0 ± 44.9 |
+| 10% random | 2000 ms | upstream | 6 | 73.9% ± 4.1 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | flags + RTT | 6 | 11.7% ± 0.4 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | current | 6 | 11.8% ± 0.5 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | libsrt | 6 | 12.6% ± 0.6 | 0.00% ± 0.01 | 100.02% ± 0.05 | 99.96% ± 0.09 | 74.5 ± 35.5 |
+| 20% random | 2000 ms | upstream | 6 | 149.3% ± 3.6 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 20% random | 2000 ms | flags + RTT | 6 | 26.6% ± 0.5 | 0.00% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 20% random | 2000 ms | current | 6 | 26.8% ± 0.7 | 0.01% ± 0.01 | 99.92% ± 0.12 | 100.00% ± 0.00 | 0.8 ± 1.3 |
+| 20% random | 2000 ms | libsrt | 6 | 29.1% ± 0.9 | 0.00% ± 0.01 | 100.07% ± 0.06 | 99.96% ± 0.09 | 31.0 ± 44.9 |
+| bursty 8% | 2000 ms | upstream | 6 | 54.7% ± 7.4 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| bursty 8% | 2000 ms | flags + RTT | 6 | 9.8% ± 1.1 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| bursty 8% | 2000 ms | current | 6 | 9.8% ± 1.0 | 0.04% ± 0.07 | 99.88% ± 0.23 | 99.90% ± 0.24 | 1.2 ± 1.8 |
+| bursty 8% | 2000 ms | libsrt | 6 | 10.7% ± 1.0 | 0.03% ± 0.06 | 100.04% ± 0.09 | 99.94% ± 0.15 | 45.3 ± 47.5 |
+| 3% random | 200 ms | upstream | 6 | 19.0% ± 3.7 | 0.08% ± 0.03 | 99.86% ± 0.19 | 100.00% ± 0.00 | 2.0 ± 1.8 |
+| 3% random | 200 ms | flags + RTT | 6 | 3.3% ± 0.2 | 0.03% ± 0.02 | 99.90% ± 0.11 | 99.70% ± 0.33 | 1.2 ± 1.5 |
+| 3% random | 200 ms | current | 6 | 4.1% ± 0.4 | 0.01% ± 0.02 | 99.96% ± 0.09 | 99.90% ± 0.24 | 0.5 ± 1.2 |
+| 3% random | 200 ms | libsrt | 6 | 3.4% ± 0.1 | 0.02% ± 0.01 | 99.89% ± 0.00 | 100.00% ± 0.00 | 90.3 ± 1.6 |
+| 10% random | 200 ms | upstream | 6 | 67.9% ± 11.2 | 1.10% ± 0.42 | 92.36% ± 5.12 | 93.94% ± 4.77 | 90.5 ± 45.5 |
+| 10% random | 200 ms | flags + RTT | 6 | 11.9% ± 0.4 | 0.64% ± 0.45 | 94.46% ± 4.99 | 93.68% ± 5.75 | 54.5 ± 45.8 |
+| 10% random | 200 ms | current | 6 | 14.5% ± 1.2 | 0.37% ± 0.36 | 97.26% ± 4.24 | 97.72% ± 3.64 | 28.5 ± 35.2 |
+| 10% random | 200 ms | libsrt | 6 | 13.4% ± 1.5 | 0.39% ± 0.54 | 99.94% ± 0.06 | 99.49% ± 0.53 | 70.8 ± 47.3 |
+| 20% random | 200 ms | upstream | 6 | 110.9% ± 25.9 | 3.93% ± 1.62 | 73.53% ± 10.90 | 70.70% ± 11.99 | 276.8 ± 76.5 |
+| 20% random | 200 ms | flags + RTT | 6 | 24.2% ± 2.0 | 3.98% ± 1.78 | 74.23% ± 13.88 | 69.93% ± 15.59 | 266.2 ± 83.6 |
+| 20% random | 200 ms | current | 6 | 29.2% ± 0.6 | 2.41% ± 1.28 | 83.78% ± 9.81 | 83.32% ± 10.32 | 175.0 ± 73.3 |
+| 20% random | 200 ms | libsrt | 6 | 29.0% ± 2.3 | 2.20% ± 1.29 | 99.89% ± 0.07 | 97.20% ± 2.33 | 203.2 ± 94.1 |
+| bursty 8% | 200 ms | upstream | 6 | 49.5% ± 4.6 | 0.41% ± 0.22 | 98.96% ± 0.43 | 98.91% ± 0.88 | 12.7 ± 3.1 |
+| bursty 8% | 200 ms | flags + RTT | 6 | 9.3% ± 1.2 | 1.26% ± 0.34 | 98.32% ± 0.39 | 97.92% ± 0.50 | 15.8 ± 3.3 |
+| bursty 8% | 200 ms | current | 6 | 11.2% ± 1.3 | 0.88% ± 0.26 | 98.59% ± 0.42 | 98.41% ± 0.49 | 14.0 ± 5.1 |
+| bursty 8% | 200 ms | libsrt | 6 | 10.2% ± 1.0 | 0.89% ± 0.39 | 99.72% ± 0.18 | 99.56% ± 0.43 | 79.8 ± 35.3 |
 
-- One run per condition, one seed: the 200 ms column is a direction, not a
-  measurement. At tight latency libsrt still recovers more; re-requesting
-  more often as a packet's deadline nears is the next thing to try.
+`current` minus libsrt, with a Welch t statistic over the seeds (with 6
+seeds, |t| below about 2.3 is noise):
+
+| Loss | Latency | Overhead, points | t | Not recovered, points | t |
+| ------ | --------: | -----------------: | --: | ----------------------: | --: |
+| 3% random | 2000 ms | -0.1 | -0.4 | -0.00 | -1.0 |
+| 10% random | 2000 ms | -0.8 | -2.6 | -0.00 | -1.0 |
+| 20% random | 2000 ms | -2.3 | -4.9 | +0.01 | 1.9 |
+| bursty 8% | 2000 ms | -0.9 | -1.5 | +0.01 | 0.3 |
+| 3% random | 200 ms | +0.7 | 4.5 | -0.00 | -0.5 |
+| 10% random | 200 ms | +1.0 | 1.3 | -0.02 | -0.1 |
+| 20% random | 200 ms | +0.2 | 0.3 | +0.22 | 0.3 |
+| bursty 8% | 200 ms | +1.0 | 1.4 | -0.01 | -0.0 |
+
+What it shows:
+
+- **The handshake patch matters most.** `upstream` leaves libsrt's sender to
+  retransmit on its own timer: 21, 74 and 149% overhead at 3, 10 and 20%
+  random loss (55% bursty), against 3.5, 12.6 and 29.1% (10.7%) for libsrt's
+  receiver. Every receiver recovered everything at 2000 ms; the difference is
+  what it cost.
+- **At 2000 ms `current` is level with libsrt's overhead or a little lower**:
+  0.8 points lower at 10% loss (t -2.6) and 2.3 lower at 20% (t -4.9), with
+  the same complete delivery. Up to 8% fewer retransmissions is the only
+  respect in which it comes out ahead.
+- **At 200 ms `current` equals libsrt.** Packets not recovered in time differ
+  by -0.02, +0.22 and -0.01 points at 10%, 20% and bursty loss (|t| 0.3 or
+  less), and overhead is level at 20% and 0.7 to 1.0 points above libsrt's
+  at 3%, 10% and bursty loss. The deadline-aware change is what closes the
+  gap: `flags + RTT` leaves 1.78 points more unrecovered than libsrt at 20%
+  (t 2.0) and 0.37 more under bursts (t 1.8), borderline at 6 seeds. Pooling
+  the three batches that ran both builds (11 or 12 same-seed pairs), the
+  change leaves 1.6, 0.45 and 0.2 points fewer packets unrecovered at 20%,
+  10% and bursty loss (t 9.7, 4.8 and 2.4), at 0.6 to 0.8 points more
+  overhead than libsrt at 3%, 10% and bursty loss (t 3 to 6).
+- **It is not better than libsrt.** Nothing here shows `current` delivering
+  more than libsrt at any condition; the spread does not support that claim.
+- **Tried and dropped:** also running the NAK timer every quarter RTT while a
+  loss is near its deadline. At 20% loss and 200 ms (6 seeds, a separate
+  batch) it left 1.11% ± 0.23 unrecovered against 1.94% ± 0.12 without it
+  and 1.52% ± 0.30 for libsrt, but at 33.4% ± 1.9 overhead against 29.5% ±
+  1.1 and 27.9% ± 1.3. At 10% and bursty loss it gained nothing beyond the
+  noise for about 3 points more overhead than without it. It buys delivery
+  with retransmissions and libsrt sits on the better side of that trade, so
+  it is not kept.
+- **`upstream` recovers bursts better at 200 ms** (0.41% ± 0.22 unrecovered
+  against libsrt's 0.89% ± 0.39, t -2.6) because the sender retransmits on
+  its own timer too, for 49.5% overhead against 10.2%.
+
+Limits: one sender (libsrt 1.5.4, which OBS and Larix also use), one clip and
+loopback with an emulated delay and independent loss in both directions, so
+NAKs and ACKs are lost as often as data; no jitter, reordering, long round
+trips, encryption or several connections. The machine was shared and busy
+(load average from 13 to over 180 across these runs). Interleaving shares
+that load between receivers within a batch, but absolute numbers move between
+batches (libsrt at 20% and 200 ms was 2.2% unrecovered in one batch and 1.5%
+in another), so compare within a batch. A full run with four receivers takes
+about 40 minutes: `scripts/srt-loss.sh`, or `RECEIVERS="a=/path/sapflow-a
+libsrt"` to compare builds.

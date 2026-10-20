@@ -22,6 +22,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 scripts/smoke.sh     # end to end: SRT and RTMP in, LL-HLS out, recording
+scripts/srt-loss.sh  # SRT receivers under packet loss against libsrt (about 40 minutes)
 scripts/tidy.sh          # build size; --clean empties target/
 python3 scripts/third-party-licences.py   # after dependency changes
 ```
