@@ -103,5 +103,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg srt-tools curl python3
           command -v srt-live-transmit ffmpeg ffprobe
-      - name: Smoke
-        run: scripts/smoke.sh
+      - name: Smoke (both SRT implementations)
+        run: SRT_IMPLS="srt-rs own" scripts/smoke.sh
