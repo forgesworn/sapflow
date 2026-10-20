@@ -5,6 +5,7 @@
 #   scripts/srt-loss.sh                          # the full matrix, 5 seeds
 #   SEEDS=3 LOSSES=random:10 LATENCIES=200 scripts/srt-loss.sh
 #   RECEIVERS=sapflow SAPFLOW_BIN=/path/to/sapflow scripts/srt-loss.sh
+#   RECEIVERS="old=/path/sapflow-old new=/path/sapflow-new libsrt" scripts/srt-loss.sh
 #   scripts/srt-loss.sh --summarise scratch/srt-loss/<run>/results.tsv
 #
 # A 30 s test clip (ffmpeg lavfi: 720p30 and a tone, 2.5 Mbit/s H.264 with 1 s
@@ -36,7 +37,7 @@
 #                       srt-loss-proxy --loss values; burst:P,L is bursty loss
 #                       (Gilbert-Elliott), P percent on average, L packets a burst
 #   LATENCIES="2000 200"   SRT latency in ms, set on sender and receiver
-#   RECEIVERS="sapflow libsrt"
+#   RECEIVERS="sapflow libsrt"   `NAME=binary` runs another sapflow build as NAME
 #   CLIP_SECS=30  DELAY_MS=30 (one way)  JOBS=3 (trials at once)
 #   SAPFLOW_BIN, PROXY_BIN   default: release builds of this checkout
 set -euo pipefail
@@ -56,6 +57,7 @@ summarise() { # results.tsv
       if (loss == "none") { bv[r, lat] = v; ba[r, lat] = a; bd[r, lat] = dec; bo[r, lat] = orig > 0 ? 100 * retx / orig : 0; next }
       k = r SUBSEP loss SUBSEP lat
       if (!(k in seen)) { seen[k] = 1; keys[++nk] = k }
+      if (!(r in rseen)) { rseen[r] = 1; recs[++nr] = r }
       n[k]++
       o = orig > 0 ? 100 * retx / orig : 0
       so[k] += o; sso[k] += o * o
@@ -85,18 +87,23 @@ summarise() { # results.tsv
         if (!(loss SUBSEP lat in cond)) { cond[loss SUBSEP lat] = 1; conds[++nc] = loss SUBSEP lat }
       }
       print ""
-      print "sapflow minus libsrt (Welch t over the seeds; |t| below about 2.3 is noise):"
+      print "Each sapflow build minus libsrt (Welch t over the seeds; |t| below about 2.3 is noise):"
       print ""
-      print "| Loss | Latency | Overhead, points | t | Not recovered, points | t | Video delivered, points | t | Decode messages | t |"
-      print "|------|--------:|-----------------:|--:|----------------------:|--:|------------------------:|--:|----------------:|--:|"
+      print "| Loss | Latency | Receiver | Overhead, points | t | Not recovered, points | t | Video delivered, points | t | Decode messages | t |"
+      print "|------|--------:|----------|-----------------:|--:|----------------------:|--:|------------------------:|--:|----------------:|--:|"
       for (i = 1; i <= nc; i++) {
-        split(conds[i], c, SUBSEP); ks = "sapflow" SUBSEP c[1] SUBSEP c[2]; kl = "libsrt" SUBSEP c[1] SUBSEP c[2]
-        if (!(ks in n) || !(kl in n)) continue
-        printf "| %s | %s ms | %+.1f | %s | %+.2f | %s | %+.2f | %s | %+.1f | %s |\n", c[1], c[2], \
-          m_o[ks] - m_o[kl], welch(m_o[ks], s_o[ks], n[ks], m_o[kl], s_o[kl], n[kl]), \
-          m_r[ks] - m_r[kl], welch(m_r[ks], s_r[ks], n[ks], m_r[kl], s_r[kl], n[kl]), \
-          m_v[ks] - m_v[kl], welch(m_v[ks], s_v[ks], n[ks], m_v[kl], s_v[kl], n[kl]), \
-          m_d[ks] - m_d[kl], welch(m_d[ks], s_d[ks], n[ks], m_d[kl], s_d[kl], n[kl])
+        split(conds[i], c, SUBSEP); kl = "libsrt" SUBSEP c[1] SUBSEP c[2]
+        if (!(kl in n)) continue
+        for (j = 1; j <= nr; j++) {
+          if (recs[j] ~ /^libsrt/) continue
+          ks = recs[j] SUBSEP c[1] SUBSEP c[2]
+          if (!(ks in n)) continue
+          printf "| %s | %s ms | %s | %+.1f | %s | %+.2f | %s | %+.2f | %s | %+.1f | %s |\n", c[1], c[2], recs[j], \
+            m_o[ks] - m_o[kl], welch(m_o[ks], s_o[ks], n[ks], m_o[kl], s_o[kl], n[kl]), \
+            m_r[ks] - m_r[kl], welch(m_r[ks], s_r[ks], n[ks], m_r[kl], s_r[kl], n[kl]), \
+            m_v[ks] - m_v[kl], welch(m_v[ks], s_v[ks], n[ks], m_v[kl], s_v[kl], n[kl]), \
+            m_d[ks] - m_d[kl], welch(m_d[ks], s_d[ks], n[ks], m_d[kl], s_d[kl], n[kl])
+        }
       }
       print ""
       print "clean runs (the baseline each receiver is compared with):"
@@ -114,17 +121,21 @@ if [ "${1:-}" = "--summarise" ]; then summarise "${2:?usage: --summarise results
 # One trial: --trial INDEX RECEIVER LOSS LATENCY SEED. Appends one line to
 # $OUT/trials. Run by xargs, below.
 if [ "${1:-}" = "--trial" ]; then
-  shift; idx=$1; recv=$2; loss=$3; lat=$4; seed=$5
+  shift; idx=$1; spec=$2; loss=$3; lat=$4; seed=$5
+  # A receiver is `libsrt` or `NAME[=sapflow binary]`; any name starting with
+  # libsrt means libsrt's srt-live-transmit.
+  recv=${spec%%=*}; bin=${spec#*=}; [ "$bin" != "$spec" ] || bin=$SAPFLOW_BIN
+  if [ "${recv#libsrt}" != "$recv" ]; then kind=libsrt; else kind=sapflow; fi
   d=$WORK/t$idx; mkdir -p "$d"
   base=$((PORT_BASE + (idx % 50) * 4)); sp=$base; pp=$((base + 1)); lp=$((base + 2)); hp=$((base + 3))
   pids=()
   cleanup() { for p in "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
   trap cleanup EXIT
 
-  if [ "$recv" = sapflow ]; then
+  if [ "$kind" = sapflow ]; then
     SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:$hp SAPFLOW_SRT_ADDR=127.0.0.1:$sp \
       SAPFLOW_RTMP_ADDR=off SAPFLOW_RECORDINGS="$d/rec" RUST_LOG=warn \
-      "$SAPFLOW_BIN" > "$d/rcv.log" 2>&1 &
+      "$bin" > "$d/rcv.log" 2>&1 &
     rp=$!; target=$sp; sid="&streamid=publish:live/event-loss"
   else
     srt-live-transmit "srt://127.0.0.1:$lp?mode=listener&latency=$lat" file://con \
@@ -152,7 +163,7 @@ if [ "${1:-}" = "--trial" ]; then
   kill -INT "$rp" 2>/dev/null || true
   for _ in 1 2 3 4 5 6; do kill -0 "$rp" 2>/dev/null || break; sleep 1; done
 
-  if [ "$recv" = sapflow ]; then f=$(ls "$d"/rec/live/event-loss/*.mp4 2>/dev/null | head -1 || true); else f=$d/out.ts; fi
+  if [ "$kind" = sapflow ]; then f=$(ls "$d"/rec/live/event-loss/*.mp4 2>/dev/null | head -1 || true); else f=$d/out.ts; fi
   v=0; a=0; e=NA; st=FAIL
   if [ -n "${f:-}" ] && [ -s "$f" ]; then
     v=$(ffprobe -v error -count_packets -select_streams v -show_entries stream=nb_read_packets -of csv=p=0 "$f" | head -1)
@@ -202,9 +213,14 @@ jobs=$WORK/jobs; : > "$jobs"; : > "$WORK/clean"; i=0
 for lat in $LATENCIES; do for r in $RECEIVERS; do
   i=$((i + 1)); echo "$i $r none $lat 0" >> "$WORK/clean"
 done; done
-for lat in $LATENCIES; do for loss in $LOSSES; do for r in $RECEIVERS; do
-  s=1; while [ "$s" -le "$SEEDS" ]; do i=$((i + 1)); echo "$i $r $loss $lat $s" >> "$jobs"; s=$((s + 1)); done
-done; done; done
+# Receivers alternate for each seed, so the two run side by side under the same
+# conditions on a busy machine.
+for lat in $LATENCIES; do for loss in $LOSSES; do
+  s=1; while [ "$s" -le "$SEEDS" ]; do
+    for r in $RECEIVERS; do i=$((i + 1)); echo "$i $r $loss $lat $s" >> "$jobs"; done
+    s=$((s + 1))
+  done
+done; done
 echo "$(wc -l < "$WORK/clean" | tr -d ' ') clean runs, then $(wc -l < "$jobs" | tr -d ' ') loss trials"
 xargs -P "$JOBS" -L 1 "$SELF" --trial < "$WORK/clean"
 xargs -P "$JOBS" -L 1 "$SELF" --trial < "$jobs"
