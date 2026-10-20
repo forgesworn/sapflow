@@ -1,0 +1,22 @@
+[package]
+name = "sapflow-bench"
+description = "Simulated LL-HLS viewers for M4: response times and part fan-out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sapflow-bench"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "1.12.1"
+http-body-util = "0.1.5"
+hyper = "1.12.0"
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+
+[lints]
+workspace = true

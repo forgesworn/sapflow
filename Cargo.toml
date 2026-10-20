@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sapflow-core",
+    "crates/sapflow-hls",
+    "crates/sapflow-server",
+    "crates/sapflow-bench",
+]
+exclude = ["fuzz", "vendor/srt-protocol"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+license = "MIT"
+repository = "https://github.com/forgesworn/sapflow"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+
+# Smaller builds on a nearly full disk: line tables are enough for backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# Unwind, not abort: fuzzing found panics in a dependency on hostile input.
+# With unwinding a panic ends only the task it happened in (one connection),
+# and srt-protocol's parser can turn its own panics into errors.
+panic = "unwind"
+
+# srt-protocol 0.4.4 with fixes for panics found by fuzzing; see its
+# PATCHES.md.
+[patch.crates-io]
+srt-protocol = { path = "vendor/srt-protocol" }
+
+# Release code with symbols, for profilers: cargo build --profile profiling
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"

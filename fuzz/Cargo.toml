@@ -1,0 +1,70 @@
+[package]
+name = "sapflow-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+bytes = "1.12.1"
+sapflow-core = { path = "../crates/sapflow-core" }
+sapflow-hls = { path = "../crates/sapflow-hls" }
+srt-protocol = "=0.4.4"
+
+[[bin]]
+name = "ts_ingest"
+path = "fuzz_targets/ts_ingest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flv_ingest"
+path = "fuzz_targets/flv_ingest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "small_parsers"
+path = "fuzz_targets/small_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "srt_packet"
+path = "fuzz_targets/srt_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "srt_listener"
+path = "fuzz_targets/srt_listener.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtmp_session"
+path = "fuzz_targets/rtmp_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "amf0"
+path = "fuzz_targets/amf0.rs"
+test = false
+doc = false
+bench = false
+
+[patch.crates-io]
+srt-protocol = { path = "../vendor/srt-protocol" }
+
+[workspace]

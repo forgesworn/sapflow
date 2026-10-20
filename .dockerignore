@@ -1,0 +1,8 @@
+target
+fuzz/target
+fuzz/artifacts
+fuzz/corpus
+.git
+*.local.md
+recordings
+scratch

@@ -1,0 +1,4 @@
+# One build directory, inside this checkout. Never point a task or subagent at
+# a fresh target dir: each one recompiles every dependency (gigabytes).
+[build]
+target-dir = "target"

@@ -1,0 +1,30 @@
+[package]
+name = "sapflow-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sapflow"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+bytes = "1.12.1"
+futures = "0.3.34"
+sapflow-core = { path = "../sapflow-core" }
+sapflow-hls = { path = "../sapflow-hls" }
+srt-tokio = "0.4.4"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util"] }
+tracing = "0.1.44"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio", "service"] }
+http-body-util = "0.1.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+rustix = { version = "1.1.5", default-features = false, features = ["process", "std"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,66 @@
+# What v4v expects from its media server
+
+Taken from the v4v repo as of 2026-10-20 (`docs/live-stage.md`, "Live Video
+Boundary"; `docs/examples/mediamtx.yml`; `scripts/live-ingest-smoke.mjs`).
+v4v talks to the media server only through URL templates and one callback,
+so sapflow can replace mediamtx without a code change in v4v.
+
+## Stream paths
+
+- Every stage stream is `live/<eventId>`, with `<eventId>` matching
+  `event-[a-z0-9-]+` (`PULSEWIRE_LIVE_STREAM_ID_TEMPLATE={eventId}`).
+- Only the configured publisher may push to those paths. Anyone may read HLS
+  (v4v enforces its closed beta itself, in front).
+
+## Ingest addresses v4v hands to encoders
+
+| Template | Example value |
+|----------|---------------|
+| `PULSEWIRE_LIVE_RTMP_SERVER_URL_TEMPLATE` | `rtmp://<media-host>:1935/live` |
+| `PULSEWIRE_LIVE_STREAM_KEY_TEMPLATE` | `{streamId}?user=<publisher>&pass=<publisher-pass>` |
+| `PULSEWIRE_LIVE_SRT_URL_TEMPLATE` | `srt://<media-host>:8890?streamid=publish:{streamId}` (mediamtx form; credentials can ride in the streamid as `publish:<path>:<user>:<pass>`) |
+
+Studio appends `&latency=2000000` (microseconds) to the SRT URL it shows for
+OBS. Larix sets its own latency.
+
+## Playback
+
+- `PULSEWIRE_LIVE_HLS_URL_TEMPLATE`, e.g.
+  `https://<your-domain>/live-hls/live/{streamId}/index.m3u8`, proxied by Caddy
+  to the media server's HLS port (8888 in the reference config).
+- `PULSEWIRE_LIVE_PLAYBACK_PROBE_URL_TEMPLATE`: the internal address v4v
+  fetches to confirm the manifest before opening a stage.
+- Reference LL-HLS settings: 1 s segments, 200 ms parts, 24 segments kept,
+  remux as soon as the encoder connects (not on first viewer), CORS `*`.
+
+## The callback
+
+One shared secret for every path (`PULSEWIRE_LIVE_CALLBACK_SECRET`), the event
+id taken from the last segment of the path:
+
+```
+POST http://<app>:5181/api/public/live-events/<eventId>/stream-health?token=<callback-secret>
+content-type: application/json
+```
+
+| When | Body |
+|------|------|
+| Stream ready to play | `{"event":"publish","path":"live/<eventId>"}` |
+| Stream gone | `{"event":"unpublish","path":"live/<eventId>"}` |
+| Recording finished | `{"event":"recordSegmentComplete","path":"live/<eventId>","segmentPath":"/recordings/live/<eventId>/<unix-start>.mp4","segmentDuration":"3723.5"}` |
+
+v4v rejects a callback whose path does not match the prepared session.
+
+## Recording
+
+- Fragmented MP4 (plays in a browser `<video>`), one file per show, named by
+  start time in unix seconds (`recordPath: /recordings/%path/%s`).
+- v4v only reads files under `PULSEWIRE_LIVE_RECORDING_DIR` (its mount of the
+  same directory, read-only) and copies them into its own store.
+- mediamtx keeps its copy for 7 days (`recordDeleteAfter: 7d`).
+
+## Encoder settings v4v recommends (and checks from the playlist)
+
+1 s keyframe interval, 720p, 24-30 fps, CBR 2,500-4,000 kbps at 720p, x264
+veryfast / zerolatency. The keyframe interval sets the shortest possible
+segment.

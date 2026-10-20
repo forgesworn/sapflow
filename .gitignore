@@ -1,0 +1,13 @@
+/target
+*.local.md
+/recordings
+/scratch
+.DS_Store
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus
+/fuzz/coverage
+
+# Certificates mediamtx writes when benchmarked from here
+/auto.crt
+/auto.key
