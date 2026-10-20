@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use crate::loss::LossList;
+use crate::loss::{LossList, Timing};
 use crate::packet::{Ack, AckStats, Control, ControlPacket, DataPacket, MAX_LOSS_ENTRIES};
 use crate::rtt::Rtt;
 use crate::seq::{Seq, TimestampExtender};
@@ -184,6 +184,8 @@ pub struct Receiver {
     since_ack: u32,
     last_sent: i64,
     last_received: i64,
+    /// The latest time seen.
+    now: i64,
     rate: RateMeter,
     pairs: PacketPairs,
     stats: Stats,
@@ -222,6 +224,7 @@ impl Receiver {
             since_ack: 0,
             last_sent: now,
             last_received: now,
+            now,
             rate: RateMeter {
                 since: now,
                 ..RateMeter::default()
@@ -272,6 +275,7 @@ impl Receiver {
     }
 
     pub fn on_data(&mut self, now: i64, p: &DataPacket) {
+        self.now = self.now.max(now);
         if self.closed.is_some() {
             return;
         }
@@ -290,12 +294,17 @@ impl Receiver {
         if p.retransmitted {
             self.stats.retransmitted += 1;
         } else {
-            self.drift.sample(now - (self.base + ext));
+            self.drift
+                .sample(now.saturating_sub(self.base.saturating_add(ext)));
             self.rate.add(now, p.payload.len());
             self.pairs.add(p.seq, now);
         }
-        let deliver_at = (self.base + self.drift.offset + ext + self.settings.latency)
-            .min(now + self.settings.latency + MAX_HOLD_BEYOND_LATENCY);
+        let deliver_at = self
+            .base
+            .saturating_add(self.drift.offset)
+            .saturating_add(ext)
+            .saturating_add(self.settings.latency)
+            .min(now.saturating_add(self.settings.latency + MAX_HOLD_BEYOND_LATENCY));
 
         let mut d = self.head.distance_to(p.seq);
         if d < 0 {
@@ -417,11 +426,18 @@ impl Receiver {
         }
     }
 
+    fn timing(&self) -> Timing {
+        Timing {
+            rtt: self.rtt.rtt(),
+            retry: self.rtt.retry(),
+        }
+    }
+
     fn nak_due(&mut self, now: i64) {
         if self.loss.is_empty() {
             return;
         }
-        let ranges = self.loss.due(now, self.rtt.rtt(), MAX_LOSS_ENTRIES / 2);
+        let ranges = self.loss.due(now, self.timing(), MAX_LOSS_ENTRIES / 2);
         if !ranges.is_empty() {
             self.stats.naks_sent += 1;
             self.queue(now, Control::Nak(ranges));
@@ -467,6 +483,7 @@ impl Receiver {
     }
 
     pub fn on_control(&mut self, now: i64, c: &Control) {
+        self.now = self.now.max(now);
         if self.closed.is_some() {
             return;
         }
@@ -486,19 +503,14 @@ impl Receiver {
             }
             Control::DropRequest { first, last, .. } => {
                 // The sender no longer has these: stop asking for them.
-                if first.distance_to(*last) >= 0 {
-                    let mut s = *first;
-                    for _ in 0..=first.distance_to(*last).min(self.settings.buffer as i32) {
-                        self.loss.remove(s);
-                        s = s.next();
-                    }
-                }
+                self.loss.remove_range(*first, *last);
             }
             _ => {}
         }
     }
 
     pub fn on_timer(&mut self, now: i64) {
+        self.now = self.now.max(now);
         if self.closed.is_some() {
             return;
         }
@@ -518,12 +530,14 @@ impl Receiver {
 
     /// When [`on_timer`](Self::on_timer) next has something to do.
     pub fn next_timer(&self) -> i64 {
-        let mut t =
-            (self.last_received + self.settings.peer_idle).min(self.last_sent + KEEPALIVE_INTERVAL);
+        let mut t = self
+            .last_received
+            .saturating_add(self.settings.peer_idle)
+            .min(self.last_sent + KEEPALIVE_INTERVAL);
         if self.ack_pos != self.last_ack_sent {
             t = t.min(self.last_full_ack + ACK_INTERVAL);
         }
-        if let Some(at) = self.loss.next_due(self.rtt.rtt()) {
+        if let Some(at) = self.loss.next_due(self.now, self.timing()) {
             t = t.min(at);
         }
         if let Some(at) = self

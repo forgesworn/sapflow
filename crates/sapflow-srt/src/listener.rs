@@ -237,7 +237,10 @@ impl<S: BuildHasher> Listener<S> {
     /// there are no connections.
     pub fn poll_timeout(&self) -> Option<Instant> {
         let t = self.conns.values().map(|c| c.next_timer).min()?;
-        Some(self.epoch + Duration::from_micros(t.max(0) as u64))
+        let at = Duration::from_micros(t.max(0) as u64);
+        self.epoch
+            .checked_add(at)
+            .or_else(|| self.epoch.checked_add(Duration::from_secs(3600)))
     }
 
     pub fn handle_datagram(&mut self, now: Instant, peer: SocketAddr, datagram: &[u8]) {
@@ -564,7 +567,7 @@ impl<S: BuildHasher> Listener<S> {
                     latency: ours.max(theirs),
                     since: t,
                 })),
-                next_timer: t + duration_micros(self.config.accept_timeout),
+                next_timer: t.saturating_add(duration_micros(self.config.accept_timeout)),
             },
         );
         self.events.push_back(Event::Connect {

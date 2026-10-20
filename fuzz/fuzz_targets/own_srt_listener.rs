@@ -67,17 +67,20 @@ fuzz_target!(|data: &[u8]| {
         let refuse = ctl & 0x20 != 0;
         if ctl & 0x80 != 0 {
             listener.handle_timeout(now);
+            assert!(listener.poll_timeout().is_none_or(|t| t > now), "timer in the past");
         } else if ctl & 0x40 != 0 {
             listener.handle_datagram(now, peer, datagram);
         } else {
             let d = as_client(datagram, cookies.get(&peer).copied(), sockets.get(&peer).copied());
             listener.handle_datagram(now, peer, &d);
         }
-        // Timers that came due during the step.
+        // Timers that came due during the step. Once handled, nothing is
+        // due before `now` again: a timer that stayed in the past would spin.
         if let Some(t) = listener.poll_timeout()
             && t <= now
         {
             listener.handle_timeout(now);
+            assert!(listener.poll_timeout().is_none_or(|t| t > now), "timer in the past");
         }
         while let Some(ev) = listener.poll_event() {
             match ev {

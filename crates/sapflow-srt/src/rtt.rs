@@ -49,6 +49,15 @@ impl Rtt {
         self.rtt = (7 * self.rtt + rtt) / 8;
     }
 
+    /// How long to wait for a retransmission before asking again: the round
+    /// trip plus four times its variance, the specification's allowance for
+    /// a round trip that is late but normal. Asking again after exactly one
+    /// round trip raced retransmissions already on their way (measured in
+    /// `docs/interop.md`).
+    pub fn retry(&self) -> i64 {
+        self.rtt + 4 * self.var
+    }
+
     /// How often periodic NAK reports go out: (RTT + 4 * RTTVar) / 2, at
     /// least 20 ms.
     pub fn nak_interval(&self) -> i64 {
@@ -71,6 +80,14 @@ mod tests {
         assert_eq!(r.var(), 31_848 * 3 / 4);
         r.sample(71_697);
         assert_eq!(r.rtt(), 63_697 + 1_000);
+    }
+
+    #[test]
+    fn retry_allows_for_the_variance() {
+        let mut r = Rtt::new();
+        assert_eq!(r.retry(), 300_000);
+        r.sample(60_000);
+        assert_eq!(r.retry(), 60_000 + 4 * 30_000);
     }
 
     #[test]

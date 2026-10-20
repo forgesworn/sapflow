@@ -2,17 +2,27 @@
 //! each with when it was last asked for.
 //!
 //! When to ask again follows what `docs/interop.md` measured against
-//! libsrt's own receiver: every round trip, and every quarter round trip
-//! (at most eight times) once the packet's delivery deadline is under three
-//! round trips away, but never once a retransmission could no longer arrive
-//! before the deadline.
+//! libsrt's own receiver: after a round trip and its variance, and every
+//! quarter round trip (at most eight times) once the packet's delivery
+//! deadline is under three round trips away, but never once a
+//! retransmission could no longer arrive before the deadline.
 
 use crate::seq::Seq;
 
 /// Re-requests closer together than one round trip, per loss.
 pub const MAX_FAST_REQUESTS: u32 = 8;
+/// Ranges tracked at most. The list is scanned on every packet, so a
+/// sender that leaves every other packet missing must not grow it with the
+/// buffer; gaps beyond this are reported once and then left to the
+/// too-late drop.
+pub const MAX_RANGES: usize = 1024;
 /// Within this many round trips of the deadline, ask every quarter round trip.
 const NEAR_DEADLINE_RTTS: i64 = 3;
+/// However short the round trip, ask again no more often than this
+/// (microseconds; the ACK period)...
+const MIN_INTERVAL: i64 = 10_000;
+/// ...or this near the deadline.
+const MIN_FAST_INTERVAL: i64 = 2_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Loss {
@@ -24,6 +34,22 @@ pub struct Loss {
     pub last_request: i64,
     pub requests: u32,
     pub fast_requests: u32,
+}
+
+/// The round trip and how long to wait before asking again (at least the
+/// round trip; more allows for the retransmission's own delay), in
+/// microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    pub rtt: i64,
+    pub retry: i64,
+}
+
+impl Timing {
+    /// Ask again exactly one round trip later.
+    pub const fn rtt(rtt: i64) -> Self {
+        Self { rtt, retry: rtt }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -63,7 +89,7 @@ impl LossList {
 
     /// Records `first..=last` as lost, asked for once at `now`.
     pub fn add(&mut self, first: Seq, last: Seq, now: i64, deadline: i64) {
-        if last < first {
+        if last < first || self.entries.len() >= MAX_RANGES {
             return;
         }
         let e = Loss {
@@ -110,6 +136,8 @@ impl LossList {
                 e.last = s.prev();
                 tail.first = s.next();
                 self.entries.insert(i + 1, tail);
+                // At the limit the latest losses are no longer tracked.
+                self.entries.truncate(MAX_RANGES);
             }
         }
         true
@@ -128,59 +156,99 @@ impl LossList {
         });
     }
 
+    /// Forgets `first..=last` (the sender said it no longer has them).
+    pub fn remove_range(&mut self, first: Seq, last: Seq) {
+        if last < first {
+            return;
+        }
+        let mut kept = Vec::with_capacity(self.entries.len() + 1);
+        for e in self.entries.drain(..) {
+            if e.last < first || last < e.first {
+                kept.push(e);
+                continue;
+            }
+            if e.first < first {
+                kept.push(Loss {
+                    last: first.prev(),
+                    ..e
+                });
+            }
+            if last < e.last {
+                kept.push(Loss {
+                    first: last.next(),
+                    ..e
+                });
+            }
+        }
+        kept.truncate(MAX_RANGES);
+        self.entries = kept;
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
     }
 
     /// The losses to ask for again at `now`, marked as asked; at most
     /// `limit` ranges, earliest first.
-    pub fn due(&mut self, now: i64, rtt: i64, limit: usize) -> Vec<(Seq, Seq)> {
-        let rtt = rtt.max(1);
+    pub fn due(&mut self, now: i64, t: Timing, limit: usize) -> Vec<(Seq, Seq)> {
+        let rtt = t.rtt.max(1);
         let mut out = Vec::new();
         for e in &mut self.entries {
             if out.len() >= limit {
                 break;
             }
-            // A retransmission needs a round trip: the NAK there, the
-            // packet back.
-            if now.saturating_add(rtt) > e.deadline {
+            if !matches!(e.next_request(now, t), Some(at) if at <= now) {
                 continue;
             }
-            let near = e.deadline - now < NEAR_DEADLINE_RTTS * rtt;
-            let fast = near && e.fast_requests < MAX_FAST_REQUESTS;
-            let interval = if fast { rtt / 4 } else { rtt };
-            if now - e.last_request < interval {
-                continue;
+            if e.near(now, rtt) && e.fast_requests < MAX_FAST_REQUESTS {
+                e.fast_requests += 1;
             }
             e.last_request = now;
             e.requests = e.requests.saturating_add(1);
-            if fast {
-                e.fast_requests += 1;
-            }
             out.push((e.first, e.last));
         }
         out
     }
 
-    /// When [`due`](Self::due) would next have something to send.
-    pub fn next_due(&self, rtt: i64) -> Option<i64> {
-        let rtt = rtt.max(1);
+    /// When [`due`](Self::due) next has something to send, given that it
+    /// has just run at `now`: never earlier than `now`, and nothing for a
+    /// loss a retransmission could no longer fill in time.
+    pub fn next_due(&self, now: i64, t: Timing) -> Option<i64> {
         self.entries
             .iter()
-            .filter_map(|e| {
-                let last_useful = e.deadline - rtt;
-                // Due at the end of the ordinary interval, or sooner once near.
-                let ordinary = e.last_request + rtt;
-                let near_from = e.deadline - NEAR_DEADLINE_RTTS * rtt + 1;
-                let fast = if e.fast_requests < MAX_FAST_REQUESTS {
-                    (e.last_request + rtt / 4).max(near_from)
-                } else {
-                    ordinary
-                };
-                let at = ordinary.min(fast);
-                (at <= last_useful).then_some(at)
-            })
+            .filter_map(|e| e.next_request(now, t))
+            .map(|at| at.max(now))
             .min()
+    }
+}
+
+impl Loss {
+    /// Within three round trips of the deadline at `t`.
+    fn near(&self, t: i64, rtt: i64) -> bool {
+        self.deadline.saturating_sub(t) < NEAR_DEADLINE_RTTS * rtt
+    }
+
+    /// When to ask for this loss next, seen from `now`: a round trip after
+    /// the last request, or a quarter round trip once near the deadline;
+    /// `None` once a retransmission asked for then could not arrive in time
+    /// (it needs a round trip: the NAK there, the packet back).
+    fn next_request(&self, now: i64, t: Timing) -> Option<i64> {
+        let rtt = t.rtt.max(1);
+        let ordinary = self
+            .last_request
+            .saturating_add(t.retry.max(rtt).max(MIN_INTERVAL));
+        let at = if self.fast_requests < MAX_FAST_REQUESTS {
+            let near_from = self.deadline.saturating_sub(NEAR_DEADLINE_RTTS * rtt) + 1;
+            let fast = self
+                .last_request
+                .saturating_add((rtt / 4).max(MIN_FAST_INTERVAL))
+                .max(near_from);
+            ordinary.min(fast)
+        } else {
+            ordinary
+        };
+        let useful = |t: i64| t.saturating_add(rtt) <= self.deadline;
+        (useful(now) && useful(at)).then_some(at)
     }
 }
 
@@ -226,6 +294,38 @@ mod tests {
     }
 
     #[test]
+    fn the_list_is_bounded() {
+        let mut l = LossList::new();
+        for i in 0..(MAX_RANGES as u32 + 10) {
+            l.add(s(i * 2), s(i * 2), 0, 1_000_000);
+        }
+        assert_eq!(l.ranges(), MAX_RANGES);
+        // Splitting does not grow it past the limit either.
+        let mut l = LossList::new();
+        l.add(s(0), s(10_000), 0, 1_000_000);
+        for i in 0..5000 {
+            l.remove(s(i * 2 + 1));
+        }
+        assert!(l.ranges() <= MAX_RANGES);
+    }
+
+    #[test]
+    fn remove_a_range() {
+        let mut l = LossList::new();
+        l.add(s(10), s(20), 0, 1_000_000);
+        l.add(s(30), s(30), 0, 1_000_000);
+        l.add(s(40), s(45), 0, 1_000_000);
+        l.remove_range(s(15), s(42));
+        assert_eq!(l.count(), 5 + 3);
+        assert!(l.contains(s(14)) && !l.contains(s(15)));
+        assert!(!l.contains(s(30)) && !l.contains(s(42)) && l.contains(s(43)));
+        l.remove_range(s(12), s(11));
+        assert_eq!(l.count(), 8, "an empty range removes nothing");
+        l.remove_range(s(11), s(11));
+        assert_eq!(l.ranges(), 3, "a hole splits a range");
+    }
+
+    #[test]
     fn overlapping_adds_are_ignored() {
         let mut l = LossList::new();
         l.add(s(5), s(9), 0, 10);
@@ -242,11 +342,11 @@ mod tests {
         let mut l = LossList::new();
         let deadline = 2_000_000;
         l.add(s(1), s(1), 0, deadline);
-        assert!(l.due(RTT - 1, RTT, 10).is_empty());
-        assert_eq!(l.next_due(RTT), Some(RTT));
-        assert_eq!(l.due(RTT, RTT, 10), vec![(s(1), s(1))]);
-        assert!(l.due(RTT + 1, RTT, 10).is_empty());
-        assert_eq!(l.due(2 * RTT, RTT, 10).len(), 1);
+        assert!(l.due(RTT - 1, Timing::rtt(RTT), 10).is_empty());
+        assert_eq!(l.next_due(RTT - 1, Timing::rtt(RTT)), Some(RTT));
+        assert_eq!(l.due(RTT, Timing::rtt(RTT), 10), vec![(s(1), s(1))]);
+        assert!(l.due(RTT + 1, Timing::rtt(RTT), 10).is_empty());
+        assert_eq!(l.due(2 * RTT, Timing::rtt(RTT), 10).len(), 1);
     }
 
     #[test]
@@ -255,7 +355,7 @@ mod tests {
         let deadline = 1_000_000;
         l.add(s(1), s(1), 0, deadline);
         let near = deadline - 3 * RTT + 1;
-        assert_eq!(l.due(near, RTT, 10).len(), 1);
+        assert_eq!(l.due(near, Timing::rtt(RTT), 10).len(), 1);
         let mut t = near;
         let mut asked = 1;
         loop {
@@ -263,21 +363,48 @@ mod tests {
             if t + RTT > deadline {
                 break;
             }
-            asked += l.due(t, RTT, 10).len();
+            asked += l.due(t, Timing::rtt(RTT), 10).len();
         }
         // Eight quick ones at most, and none once it cannot arrive in time.
         assert!(asked <= 1 + MAX_FAST_REQUESTS as usize, "{asked}");
         assert!(asked >= 7, "{asked}");
-        assert!(l.due(deadline - RTT + 1, RTT, 10).is_empty());
-        assert_eq!(l.next_due(RTT), None);
+        assert!(l.due(deadline - RTT + 1, Timing::rtt(RTT), 10).is_empty());
+        assert_eq!(l.next_due(deadline - RTT + 1, Timing::rtt(RTT)), None);
     }
 
     #[test]
     fn never_asks_when_a_retransmission_would_be_too_late() {
         let mut l = LossList::new();
         l.add(s(1), s(3), 0, RTT / 2);
-        assert!(l.due(RTT, RTT, 10).is_empty());
-        assert_eq!(l.next_due(RTT), None);
+        assert!(l.due(RTT, Timing::rtt(RTT), 10).is_empty());
+        assert_eq!(l.next_due(RTT, Timing::rtt(RTT)), None);
+    }
+
+    #[test]
+    fn the_next_request_is_never_in_the_past_nor_useless() {
+        let mut l = LossList::new();
+        let deadline = 1_000_000;
+        l.add(s(1), s(1), 0, deadline);
+        // A timer that fires late: the next request is now, not before.
+        assert_eq!(l.next_due(500_000, Timing::rtt(RTT)), Some(500_000));
+        // Late enough that a retransmission cannot make it: no timer at all.
+        assert_eq!(l.next_due(deadline - RTT + 1, Timing::rtt(RTT)), None);
+        // A request whose turn would come too late is not scheduled.
+        let mut l = LossList::new();
+        l.add(s(1), s(1), 0, RTT + RTT / 8);
+        assert_eq!(l.next_due(0, Timing::rtt(RTT)), None);
+    }
+
+    #[test]
+    fn tiny_round_trips_do_not_flood() {
+        let mut l = LossList::new();
+        l.add(s(1), s(1), 0, 10_000_000);
+        assert_eq!(l.next_due(0, Timing::rtt(3)), Some(MIN_INTERVAL));
+        let mut asked = 0;
+        for t in 0..=100_000 {
+            asked += l.due(t, Timing::rtt(3), 10).len();
+        }
+        assert_eq!(asked, 10, "every 10 ms over 100 ms");
     }
 
     #[test]
@@ -286,9 +413,9 @@ mod tests {
         for i in 0..10 {
             l.add(s(i * 2), s(i * 2), 0, 10_000_000);
         }
-        let d = l.due(RTT, RTT, 3);
+        let d = l.due(RTT, Timing::rtt(RTT), 3);
         assert_eq!(d, vec![(s(0), s(0)), (s(2), s(2)), (s(4), s(4))]);
         // The rest are still due.
-        assert_eq!(l.due(RTT, RTT, 100).len(), 7);
+        assert_eq!(l.due(RTT, Timing::rtt(RTT), 100).len(), 7);
     }
 }
