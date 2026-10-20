@@ -24,4 +24,4 @@ After the fixes, `srt_packet` (parse then re-encode) ran 6.2 million inputs
 without a panic. Not yet fuzzed: the listener and connection state machines
 behind the parser.
 
-Drop this copy once upstream ships the fixes.
+The fixes are not reported upstream: this copy is maintained here.

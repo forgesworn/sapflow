@@ -45,7 +45,7 @@ the callback token, the recordings, and the host.
 | T12 | Viewer privacy | No sessions, cookies or query strings in chunk URLs; viewer IPs are not logged. | Done |
 | T13 | Log flooding with bad datagrams or refused publishes | `srt_protocol` and `srt_tokio` log errors only; refused publishes are logged at most 20 a minute, with a count of those suppressed. | Done |
 | T14 | Unmaintained dependencies (`srt-tokio`/`srt-protocol` 2024-05) | Pinned versions; `srt-protocol` vendored with our fixes; fuzz targets exercise it. Fallback for SRT: bindings to libsrt. RTMP no longer depends on `rml_rtmp` (2023-04): it is our own code. | Ongoing: one patched copy |
-| T16 | Spoofed-source SRT handshakes (the SYN cookie is meant to prove the client receives at the address it claims) | `srt-protocol` derives the cookie from the peer address and the current second with a fixed-key hash, so it can be computed by anyone; a spoofed handshake can get as far as access control. The stream id check and credentials still apply, and a spoofed source never receives the replies. | Accepted for now; report upstream with the panics, or key the hash per process in the vendored copy |
+| T16 | Spoofed-source SRT handshakes (the SYN cookie is meant to prove the client receives at the address it claims) | `srt-protocol` derives the cookie from the peer address and the current second with a fixed-key hash, so it can be computed by anyone; a spoofed handshake can get as far as access control. The stream id check and credentials still apply, and a spoofed source never receives the replies. | Accepted for now; key the hash per process in the vendored copy |
 | T15 | Supply chain | Few dependencies, all permissive licences (`THIRD_PARTY_LICENSES.txt`), `Cargo.lock` committed, `unsafe` forbidden in our crates. | Done |
 
 ## Out of scope
@@ -58,10 +58,10 @@ the callback token, the recordings, and the host.
 
 ## Known gaps, next steps
 
-- Report the `srt-protocol` panics upstream (the crash inputs are in
-  `fuzz/regressions/`), so the vendored copy can go. The `rml_rtmp` panics
-  could still be reported, though sapflow no longer uses it.
-- Run OBS, Larix and vMix against sapflow's own RTMP (only ffmpeg has been).
+- The fixes stay in our vendored copy: they are not being reported
+  upstream, so the copy is ours to keep current.
+- Run vMix against sapflow (OBS and Larix have published over both
+  protocols; `docs/interop.md`).
 - Fuzz srt-tokio's own glue (socket tasks, timers) as well as srt-protocol.
 - Run the fuzz targets for hours, ideally in CI (the longest run so far is 20
   minutes per target).

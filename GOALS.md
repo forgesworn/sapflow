@@ -124,8 +124,8 @@ crashed the server (`srt-protocol`) and that crafted RTMP bytes panicked
 by our own), and release builds unwind so a panic ends one connection. Limits: publishers per protocol, bitrate per
 publisher, failed-login throttling, HTTP connection cap and header timeout,
 buffer and segment caps, free disk for recording, rate-limited refusal logs.
-`docs/threat-model.md` covers each threat and lists follow-ups (upstream
-reports, longer fuzzing, SRT after the handshake). The `Dockerfile` builds a
+`docs/threat-model.md` covers each threat and lists follow-ups (longer
+fuzzing, SRT after the handshake). The `Dockerfile` builds a
 38.5 MB arm64 image that runs and serves a stream.
 
 ### Later
@@ -141,7 +141,8 @@ reports, longer fuzzing, SRT after the handshake). The `Dockerfile` builds a
   production use (first pass across Wi-Fi in `docs/benchmarks.md`).
 - **2026-10-20, protocol libraries:** no SRT implementation of our own: keep
   the patched `srt-protocol` under fuzzing, with bindings to libsrt as the
-  fallback.
+  fallback. Since then its handshake flags and re-requests are patched and
+  it matches libsrt under loss over several seeds (`docs/interop.md`).
 - **2026-10-20, RTMP is our own, publish only** (user's decision): rather
   than carry a patched `rml_rtmp` (last release 2023-04, two panics on
   unauthenticated input), sapflow has its own sans-IO implementation in
@@ -154,10 +155,10 @@ reports, longer fuzzing, SRT after the handshake). The `Dockerfile` builds a
   from a single initial commit.
 - **2026-10-20, delivery:** the user treats M0 to M5 as delivered. Their
   follow-ups: a wired two-machine run at 250 and 750 full viewers, review of
-  the v4v PR, upstream reports, and any move to production.
+  the v4v PR, and any move to production.
+- **2026-10-20, upstream:** no reports to `srt-rs` or `rml_rtmp`; our
+  fixes live in `vendor/srt-protocol` and our own RTMP.
 
 ## Decisions owed by the user
 
-- Whether to report the `srt-protocol` and `rml_rtmp` panics and the
-  predictable SRT cookie upstream (outreach is the user's; sapflow no longer
-  uses `rml_rtmp`).
+None at present.
