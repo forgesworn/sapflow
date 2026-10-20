@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4.13"
 bytes = "1.12.1"
 sapflow-core = { path = "../crates/sapflow-core" }
 sapflow-hls = { path = "../crates/sapflow-hls" }
+sapflow-srt = { path = "../crates/sapflow-srt" }
 srt-protocol = "=0.4.4"
 
 [[bin]]
@@ -60,6 +61,20 @@ bench = false
 [[bin]]
 name = "amf0"
 path = "fuzz_targets/amf0.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "own_srt_packet"
+path = "fuzz_targets/own_srt_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "own_srt_listener"
+path = "fuzz_targets/own_srt_listener.rs"
 test = false
 doc = false
 bench = false
