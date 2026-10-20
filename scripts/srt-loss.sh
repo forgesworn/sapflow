@@ -226,7 +226,8 @@ xargs -P "$JOBS" -L 1 "$SELF" --trial < "$WORK/clean"
 xargs -P "$JOBS" -L 1 "$SELF" --trial < "$jobs"
 
 printf 'receiver\tloss\tlatency_ms\tseed\tvideo\taudio\tdecode_msgs\tdata_orig\tdata_retx\tnaks\thandshake_flags\tstatus\treordered\torig_distinct\tin_time\n' > "$OUT/results.tsv"
-cat "$OUT"/trials/*.tsv >> "$OUT/results.tsv"
+# In the order the trials were listed, not file name order.
+for f in $(ls "$OUT/trials" | sort -n); do cat "$OUT/trials/$f"; done >> "$OUT/results.tsv"
 summarise "$OUT/results.tsv" | tee "$OUT/summary.md"
 echo
 echo "results: $OUT/results.tsv"
