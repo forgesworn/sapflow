@@ -19,32 +19,36 @@ pub use flv::FlvIngest;
 pub use ingest::{EsIngest, IngestError, TsIngest};
 pub use muxer::{Muxer, MuxerConfig, PartLookup, Readiness, Update};
 
-/// Tracks `EXT-X-TARGETDURATION`, which may only ever go up during a stream.
+/// `EXT-X-TARGETDURATION`, fixed for the life of a stream.
 ///
-/// Every segment's duration, rounded to the nearest second, must be at or
-/// below the target. iOS fails if the target changes, so a long segment
-/// raises it for the rest of the stream; it never comes back down.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// RFC 8216bis 4.4.3.1: every segment's `EXTINF`, rounded to the nearest
+/// second, must be at most the target, and the target must not change;
+/// Safari stops a stream whose target rises. So it is chosen once, from the
+/// first segment (which follows the encoder's keyframe interval), with a
+/// second of headroom for keyframes that come a little late, and segments
+/// are kept under `limit_ticks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetDuration {
     secs: u64,
 }
 
 impl TargetDuration {
+    /// The first segment's duration, rounded, plus one second.
+    pub fn for_first_segment(first: Duration) -> Self {
+        Self {
+            secs: (first.as_secs_f64().round() as u64).max(1) + 1,
+        }
+    }
+
     pub fn secs(self) -> u64 {
         self.secs
     }
 
-    /// Feeds a finished segment. Returns true when the target had to rise,
-    /// which the caller should log: iOS clients may stall at that moment.
-    pub fn observe(&mut self, segment: Duration) -> bool {
-        // A target of 0 is invalid, so very short segments count as 1 s.
-        let rounded = (segment.as_secs_f64().round() as u64).max(1);
-        let first = self.secs == 0;
-        if rounded > self.secs {
-            self.secs = rounded;
-            return !first;
-        }
-        false
+    /// The longest a segment may run, in 90 kHz ticks: under the target
+    /// plus half a second (so it rounds to the target at most), with a
+    /// millisecond to spare.
+    pub fn limit_ticks(self) -> i64 {
+        self.secs as i64 * 90_000 + 45_000 - 90
     }
 }
 
@@ -125,23 +129,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_duration_only_rises() {
-        let mut t = TargetDuration::default();
-        assert!(!t.observe(Duration::from_millis(1000)));
-        assert_eq!(t.secs(), 1);
-        assert!(!t.observe(Duration::from_millis(1400)));
-        assert_eq!(t.secs(), 1);
-        assert!(t.observe(Duration::from_millis(3600)));
-        assert_eq!(t.secs(), 4);
-        assert!(!t.observe(Duration::from_millis(1000)));
-        assert_eq!(t.secs(), 4);
-    }
-
-    #[test]
-    fn target_duration_is_never_zero() {
-        let mut t = TargetDuration::default();
-        t.observe(Duration::from_millis(300));
-        assert_eq!(t.secs(), 1);
+    fn target_duration_comes_from_the_first_segment_with_headroom() {
+        let t = TargetDuration::for_first_segment(Duration::from_millis(2002));
+        assert_eq!(t.secs(), 3);
+        // 3.49 s rounds to 3; 3.5 s would round to 4.
+        assert!(t.limit_ticks() < 315_000 && t.limit_ticks() >= 314_000);
+        assert_eq!(
+            TargetDuration::for_first_segment(Duration::from_millis(8333)).secs(),
+            9
+        );
+        assert_eq!(
+            TargetDuration::for_first_segment(Duration::from_millis(300)).secs(),
+            2
+        );
     }
 
     fn ticks(t: i64) -> Duration {

@@ -7,7 +7,11 @@
 //! its duration. Unlike gohlslib, `PART-TARGET` is fixed once the first
 //! segment is complete (`PartTiming`), parts are closed against it, a frame
 //! too long to fit is clamped, and audio is split between parts by its
-//! timestamp.
+//! timestamp. `EXT-X-TARGETDURATION` is fixed by the first segment too; a
+//! long stall, a late keyframe or a jump in time ends the segment instead
+//! (a break): video waits for the next keyframe, output timestamps are
+//! rebased so they carry on where the last segment ended, and the next
+//! segment is marked as a discontinuity.
 //!
 //! No I/O and no clock: the caller passes the wall-clock time for
 //! `EXT-X-PROGRAM-DATE-TIME`.
@@ -37,6 +41,18 @@ const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Frame durations kept for choosing the part timing.
 const MAX_LEARNED_FRAMES: usize = 1024;
+
+/// A gap between video frames (forwards or back) at which the segment ends
+/// and video waits for a keyframe. Shorter stalls (one Larix frame lasted
+/// 0.367 s over Wi-Fi) are clamped into a held frame instead, which costs
+/// no video; this one second is under the headroom `TargetDuration` leaves,
+/// so a single clamped stall cannot by itself push a segment past it, and
+/// the length rule in `push_video` catches several.
+const BREAK_GAP: i64 = 90_000;
+
+/// AAC-LC frames are 1024 samples. A longer gap between two (the audio
+/// stopped) is not given to the frame before it.
+const AAC_FRAME: i64 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxerConfig {
@@ -75,6 +91,9 @@ pub struct Segment {
     pub id: u64,
     pub duration: Duration,
     pub start: SystemTime,
+    /// Follows a break (a stall, a late keyframe, a jump in time): the
+    /// playlist puts `EXT-X-DISCONTINUITY` before it.
+    pub discontinuity: bool,
     pub parts: Vec<Arc<Part>>,
     pub data: Bytes,
 }
@@ -154,6 +173,7 @@ struct OpenSegment {
     start: SystemTime,
     parts: Vec<Arc<Part>>,
     bytes: usize,
+    discontinuity: bool,
 }
 
 #[derive(Debug)]
@@ -206,7 +226,19 @@ pub struct Muxer {
     /// The first segment's video frames, held until the timing is chosen
     /// and then cut into parts. Nothing is served before then.
     learning: Vec<Frame>,
-    target: TargetDuration,
+    /// Set by the first segment; never changes after.
+    target: Option<TargetDuration>,
+    /// Added to every input timestamp (90 kHz): changes at each break so
+    /// output time carries on where the last segment ended.
+    offset: i64,
+    /// After a break: the output time the next keyframe is moved to.
+    rebase_to: Option<i64>,
+    /// After a break: audio before this output time is dropped.
+    audio_floor: i64,
+    /// The next segment to open follows a break.
+    discontinuity_next: bool,
+    /// Discontinuities that have left the window.
+    discontinuity_sequence: u64,
 }
 
 impl Muxer {
@@ -230,7 +262,12 @@ impl Muxer {
             next_part_id: 0,
             timing: None,
             learning: Vec::new(),
-            target: TargetDuration::default(),
+            target: None,
+            offset: duration_to_ticks(START_OFFSET, VIDEO_TIMESCALE),
+            rebase_to: None,
+            audio_floor: 0,
+            discontinuity_next: false,
+            discontinuity_sequence: 0,
         }
     }
 
@@ -259,10 +296,18 @@ impl Muxer {
         if self.pending_video.is_none() && self.next_segment.is_none() && !sync {
             return Ok(Update::default());
         }
-        let offset = duration_to_ticks(START_OFFSET, VIDEO_TIMESCALE);
+        let cts = (pts - dts).clamp(0, i64::from(i32::MAX)) as i32;
+        let mut dts = dts.saturating_add(self.offset);
+        if self.pending_video.is_none() && self.next_segment.is_none() {
+            // The keyframe that resumes the stream after a break.
+            if let Some(to) = self.rebase_to.take() {
+                self.rebase(dts, to);
+                dts = to;
+            }
+        }
         let mut next = Pending {
-            dts: dts + offset,
-            cts: (pts - dts).clamp(0, i64::from(i32::MAX)) as i32,
+            dts,
+            cts,
             sync,
             data,
         };
@@ -273,23 +318,39 @@ impl Muxer {
             self.pending_video = Some(next);
             return Ok(Update::default());
         };
+        if (next.dts - cur.dts).abs() > BREAK_GAP {
+            return Ok(self.break_stream(cur.dts, next, now));
+        }
         if next.dts < cur.dts {
             next.dts = cur.dts;
         }
         let next_dts = next.dts;
         let next_sync = next.sync;
-        self.pending_video = Some(next);
 
         if self.next_segment.is_none() {
+            let id = if self.entries.is_empty() {
+                LEADING_GAPS
+            } else {
+                self.next_segment_id()
+            };
             self.next_segment = Some(OpenSegment {
-                id: LEADING_GAPS,
+                id,
                 start_dts: cur.dts,
                 start: now,
                 parts: Vec::new(),
                 bytes: 0,
+                discontinuity: std::mem::take(&mut self.discontinuity_next),
             });
             self.part = Some(OpenPart::new(self.next_part_id, cur.dts));
         }
+        // Never let a segment run past the target duration: with no
+        // keyframe in time, end it here.
+        if let (Some(t), Some(seg)) = (self.target, self.next_segment.as_ref())
+            && next_dts - seg.start_dts > t.limit_ticks()
+        {
+            return Ok(self.break_stream(cur.dts, next, now));
+        }
+        self.pending_video = Some(next);
 
         let seg = self
             .next_segment
@@ -319,11 +380,74 @@ impl Muxer {
             }
         }
         if ends_segment {
-            self.rotate_segment(next_dts, now);
+            self.rotate_segment(next_dts, now, true);
             update.part = true;
             update.segment = true;
         }
         Ok(update)
+    }
+
+    /// Ends the stream's current run at `end` (output time), dropping the
+    /// frame there: a hole or jump of over `BREAK_GAP` before `next`, or a
+    /// segment about to outrun the target duration. The open part and
+    /// segment close at `end` (a segment's last part may be short), video
+    /// waits for a keyframe, and that keyframe is moved to `end` so output
+    /// time carries straight on; the playlist marks the new segment as a
+    /// discontinuity, since media was lost. A segment cannot be cut on a
+    /// frame that is not a keyframe: the multivariant playlist promises
+    /// `EXT-X-INDEPENDENT-SEGMENTS`.
+    fn break_stream(&mut self, end: i64, next: Pending, now: SystemTime) -> Update {
+        if self.timing.is_none() {
+            // Nothing is served before the first segment completes: start
+            // over, so the targets come from a whole segment.
+            tracing::warn!("timestamps broke before the first segment was complete; starting over");
+            self.learning.clear();
+            self.next_segment = None;
+            self.part = None;
+            self.pending_video = next.sync.then_some(next);
+            return Update::default();
+        }
+        tracing::warn!(
+            gap_ms = (next.dts - end) / 90,
+            keyframe = next.sync,
+            "media broke off (stall, late keyframe or jump in time); new segment from the next keyframe, marked as a discontinuity"
+        );
+        if self.part.as_ref().is_some_and(|p| !p.video.is_empty()) {
+            self.rotate_part(end, end);
+        }
+        // An open part with no video (audio alone) is dropped.
+        self.part = None;
+        let closed = self
+            .next_segment
+            .as_ref()
+            .is_some_and(|s| !s.parts.is_empty());
+        if closed {
+            self.rotate_segment(end, now, false);
+        } else {
+            self.next_segment = None;
+        }
+        self.discontinuity_next = true;
+        if next.sync {
+            let mut next = next;
+            self.rebase(next.dts, end);
+            next.dts = end;
+            self.pending_video = Some(next);
+        } else {
+            self.pending_video = None;
+            self.rebase_to = Some(end);
+        }
+        Update {
+            part: closed,
+            segment: closed,
+        }
+    }
+
+    /// Moves output time so that input now at output `from` lands at `to`.
+    fn rebase(&mut self, from: i64, to: i64) {
+        self.offset += to - from;
+        self.audio_floor = to;
+        // Its timestamp was taken with the old offset.
+        self.pending_audio = None;
     }
 
     /// Fixes the part timing from the first segment's frames and cuts that
@@ -401,9 +525,12 @@ impl Muxer {
             return;
         }
         let rate = audio.sample_rate;
-        let offset = duration_to_ticks(START_OFFSET, VIDEO_TIMESCALE);
+        let pts = pts.saturating_add(self.offset);
+        if pts < 0 {
+            return;
+        }
         let mut next = Pending {
-            dts: (pts + offset) * i64::from(rate) / i64::from(VIDEO_TIMESCALE),
+            dts: pts.saturating_mul(i64::from(rate)) / i64::from(VIDEO_TIMESCALE),
             cts: 0,
             sync: true,
             data,
@@ -415,7 +542,12 @@ impl Muxer {
         if next.dts < cur.dts {
             next.dts = cur.dts;
         }
-        let duration = (next.dts - cur.dts) as u32;
+        // Timestamp jitter is kept; a gap (the audio stopped) is not.
+        let mut duration = next.dts - cur.dts;
+        if duration > 3 * AAC_FRAME {
+            duration = AAC_FRAME;
+        }
+        let duration = duration as u32;
         self.pending_audio = Some(next);
 
         // Audio waits for video to open the first part.
@@ -423,6 +555,9 @@ impl Muxer {
             return;
         };
         let at = cur.dts * i64::from(VIDEO_TIMESCALE) / i64::from(rate);
+        if at < self.audio_floor {
+            return;
+        }
         part.audio_times.push((at, cur.dts as u64));
         part.audio.push(Sample {
             duration,
@@ -479,9 +614,9 @@ impl Muxer {
         self.part = Some(next);
     }
 
-    /// Closes the open segment at `end_dts`. Its last part is already
-    /// closed (`place_video` with `ends_segment`).
-    fn rotate_segment(&mut self, end_dts: i64, now: SystemTime) {
+    /// Closes the open segment at `end_dts` and, unless the stream broke,
+    /// opens the next. Its last part is already closed.
+    fn rotate_segment(&mut self, end_dts: i64, now: SystemTime, open_next: bool) {
         let Some(open) = self.next_segment.take() else {
             return;
         };
@@ -494,6 +629,7 @@ impl Muxer {
             id: open.id,
             duration,
             start: open.start,
+            discontinuity: open.discontinuity,
             parts: open.parts,
             data: data.freeze(),
         });
@@ -509,22 +645,28 @@ impl Muxer {
                 for _ in 0..old.parts.len() {
                     self.parts.pop_front();
                 }
+                if old.discontinuity {
+                    self.discontinuity_sequence += 1;
+                }
             }
             self.media_sequence += 1;
         }
-        if self.target.observe(duration) {
-            tracing::warn!(
-                target_secs = self.target.secs(),
-                "segment longer than the target duration; iOS clients may stall (check the encoder's keyframe interval)"
+        if self.target.is_none() {
+            let t = TargetDuration::for_first_segment(duration);
+            tracing::info!(
+                target_secs = t.secs(),
+                "target duration fixed from the first segment; a segment longer than this is cut and video waits for the next keyframe (set the encoder's keyframe interval to at most this)"
             );
+            self.target = Some(t);
         }
 
-        self.next_segment = Some(OpenSegment {
+        self.next_segment = open_next.then(|| OpenSegment {
             id: open.id + 1,
             start_dts: end_dts,
             start: now,
             parts: Vec::new(),
             bytes: 0,
+            discontinuity: false,
         });
     }
 
@@ -539,7 +681,17 @@ impl Muxer {
     }
 
     pub fn target_duration(&self) -> u64 {
-        self.target.secs().max(1)
+        self.target.map_or(1, TargetDuration::secs)
+    }
+
+    /// `EXT-X-DISCONTINUITY-SEQUENCE`.
+    pub fn discontinuity_sequence(&self) -> u64 {
+        self.discontinuity_sequence
+    }
+
+    /// Whether the segment being written follows a break.
+    pub fn open_discontinuity(&self) -> bool {
+        self.next_segment.as_ref().is_some_and(|s| s.discontinuity)
     }
 
     /// `PART-TARGET`: zero until the first segment is complete, then fixed.
@@ -718,13 +870,20 @@ pub(crate) mod tests {
     }
 
     /// Pushes video at the given decode times (keyframe flag alongside)
-    /// with 48 kHz AAC running continuously underneath, interleaved in
-    /// timestamp order, and checks the part rules on the playlist after
-    /// every push. Returns every `PART-TARGET` rendered.
+    /// with 48 kHz AAC running underneath, interleaved in timestamp order,
+    /// and checks the playlist rules after every push. Audio stops where
+    /// video stops for over a second (a network drop loses both). Returns
+    /// every playlist rendered.
     pub fn feed_checked(m: &mut Muxer, frames: &[(i64, bool)]) -> Vec<String> {
-        let mut targets = Vec::new();
+        let mut rendered = Vec::new();
+        let mut rules = crate::playlist::RuleCheck::default();
         let mut next_audio = frames.first().map_or(0, |f| f.0);
+        let mut prev = next_audio;
         for &(dts, sync) in frames {
+            if (dts - prev).abs() > 90_000 {
+                next_audio = dts;
+            }
+            prev = dts;
             while next_audio <= dts {
                 m.push_audio(next_audio, Bytes::from_static(b"aac"));
                 next_audio += 1920;
@@ -739,13 +898,24 @@ pub(crate) mod tests {
             .expect("push");
             if m.has_content() {
                 let pl = crate::playlist::media(m, "p");
-                match crate::playlist::check_part_rules(&pl) {
-                    Ok(t) => targets.push(t),
-                    Err(e) => panic!("at dts {dts}: {e}\n{pl}"),
+                if let Err(e) = rules.check(&pl) {
+                    panic!("at dts {dts}: {e}\n{pl}");
                 }
+                rendered.push(pl);
             }
         }
-        targets
+        rendered
+    }
+
+    fn part_targets(rendered: &[String]) -> Vec<String> {
+        rendered
+            .iter()
+            .filter_map(|pl| {
+                pl.lines()
+                    .find_map(|l| l.strip_prefix("#EXT-X-PART-INF:PART-TARGET="))
+                    .map(str::to_string)
+            })
+            .collect()
     }
 
     /// A small deterministic generator, so the jitter is the same every run.
@@ -793,22 +963,20 @@ pub(crate) mod tests {
     fn larix_timing_keeps_apples_part_rules() {
         let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
         // Two minutes: the 24-segment window rolls past every long frame.
-        let targets = feed_checked(&mut m, &larix_frames(3600));
-        assert!(!targets.is_empty());
+        assert!(!feed_checked(&mut m, &larix_frames(3600)).is_empty());
     }
 
     #[test]
     fn rtmp_millisecond_timing_keeps_apples_part_rules() {
         let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
-        let targets = feed_checked(&mut m, &rtmp_frames(3600));
-        assert!(!targets.is_empty());
+        assert!(!feed_checked(&mut m, &rtmp_frames(3600)).is_empty());
     }
 
     #[test]
     fn part_target_never_changes_once_the_stream_is_servable() {
         for frames in [larix_frames(3600), rtmp_frames(3600)] {
             let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
-            let targets = feed_checked(&mut m, &frames);
+            let targets = part_targets(&feed_checked(&mut m, &frames));
             assert!(
                 targets.iter().all(|t| *t == targets[0]),
                 "PART-TARGET changed: {:?}",
@@ -928,6 +1096,190 @@ pub(crate) mod tests {
         assert!(clamped >= 3, "the stalls were clamped ({clamped})");
     }
 
+    /// Moves every frame from `at` on later by `hole` ticks (negative: a
+    /// jump back), as a Wi-Fi drop or an encoder restart does.
+    fn with_hole(mut frames: Vec<(i64, bool)>, at: usize, hole: i64) -> Vec<(i64, bool)> {
+        for f in &mut frames[at..] {
+            f.0 += hole;
+        }
+        frames
+    }
+
+    /// Every part of every segment in the window, in order.
+    fn all_parts(m: &Muxer) -> Vec<(bool, Arc<Part>)> {
+        let mut out = Vec::new();
+        for e in m.entries() {
+            if let Entry::Segment(s) = e {
+                for (i, p) in s.parts.iter().enumerate() {
+                    out.push((i == 0 && s.discontinuity, p.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Output decode times only move forward and leave no hole at a break
+    /// (they are rebased), every segment after a break starts on a
+    /// keyframe, and no AAC frame lasts more than one frame's time.
+    fn assert_clean_timeline(m: &Muxer) -> usize {
+        let mut breaks = 0;
+        let (mut video_end, mut audio_end) = (None::<u64>, None::<u64>);
+        for (after_break, p) in all_parts(m) {
+            let (base, len, _) = track_run(&p, VIDEO_TRACK).expect("video");
+            if let Some(end) = video_end {
+                assert!(base >= end, "part {} goes back", p.id);
+            }
+            if after_break {
+                breaks += 1;
+                assert!(p.independent, "part {} after a break", p.id);
+                assert_eq!(Some(base), video_end, "part {}: rebased onto the end", p.id);
+            }
+            video_end = Some(base + len + (ticks_of(p.span) - ticks_of(p.duration)));
+            if let Some((abase, alen, starts)) = track_run(&p, AUDIO_TRACK) {
+                if let Some(end) = audio_end {
+                    assert!(abase >= end, "audio in part {} goes back", p.id);
+                }
+                audio_end = Some(abase + alen);
+                let mut all = starts.clone();
+                all.push(abase + alen);
+                for w in all.windows(2) {
+                    assert!(
+                        w[1] - w[0] <= 1024,
+                        "part {}: AAC frame of {}",
+                        p.id,
+                        w[1] - w[0]
+                    );
+                }
+            }
+        }
+        breaks
+    }
+
+    fn ticks_of(d: Duration) -> u64 {
+        ((d.as_nanos() * 90_000 + 500_000_000) / 1_000_000_000) as u64
+    }
+
+    fn header(pl: &str, tag: &str) -> u64 {
+        pl.lines()
+            .find_map(|l| l.strip_prefix(tag))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no {tag}"))
+    }
+
+    /// Wi-Fi off for 3 s and later 4 s: both tracks stop, and the frame
+    /// after each hole is not a keyframe.
+    fn wifi_drop_frames() -> Vec<(i64, bool)> {
+        with_hole(with_hole(larix_frames(3600), 1000, 270_000), 2000, 360_000)
+    }
+
+    #[test]
+    fn a_network_drop_never_changes_the_target_duration() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        let rendered = feed_checked(&mut m, &wifi_drop_frames());
+        let first = &rendered[0];
+        assert_eq!(header(first, "#EXT-X-TARGETDURATION:"), 3);
+        let last = rendered.last().expect("rendered");
+        // Both breaks have left the window, and were counted as they went.
+        assert_eq!(header(last, "#EXT-X-DISCONTINUITY-SEQUENCE:"), 2);
+        assert!(
+            rendered
+                .iter()
+                .any(|pl| pl.contains("#EXT-X-DISCONTINUITY\n"))
+        );
+    }
+
+    #[test]
+    fn a_network_drop_breaks_the_timeline_cleanly() {
+        let cfg = MuxerConfig {
+            segment_count: 1000,
+            ..MuxerConfig::default()
+        };
+        let mut m = Muxer::new(cfg, video(), Some(aac()));
+        feed_checked(&mut m, &wifi_drop_frames());
+        assert_eq!(assert_clean_timeline(&m), 2);
+    }
+
+    /// No hole, but no keyframe for 6 s: the segment may not run past the
+    /// target, so it ends and video waits for the keyframe.
+    #[test]
+    fn a_late_keyframe_never_changes_the_target_duration() {
+        let frames: Vec<(i64, bool)> = (0..3600)
+            .map(|i| (i * 3000, i % 60 == 0 && !(660..840).contains(&i)))
+            .collect();
+        let cfg = MuxerConfig {
+            segment_count: 1000,
+            ..MuxerConfig::default()
+        };
+        let mut m = Muxer::new(cfg, video(), Some(aac()));
+        feed_checked(&mut m, &frames);
+        assert_eq!(assert_clean_timeline(&m), 1);
+    }
+
+    /// The encoder restarts its clock: a jump back of 30 s.
+    #[test]
+    fn a_jump_back_breaks_instead_of_freezing_time() {
+        let frames = with_hole(larix_frames(3600), 1200, -2_700_000);
+        let cfg = MuxerConfig {
+            segment_count: 1000,
+            ..MuxerConfig::default()
+        };
+        let mut m = Muxer::new(cfg, video(), Some(aac()));
+        feed_checked(&mut m, &frames);
+        assert_eq!(assert_clean_timeline(&m), 1);
+        // Media after the jump still made segments.
+        let parts = all_parts(&m);
+        assert!(parts.len() > 400, "{} parts", parts.len());
+    }
+
+    /// A drop before the first segment is complete: nothing was served, so
+    /// the stream starts over and the targets come from a whole segment.
+    #[test]
+    fn a_drop_in_the_first_segment_starts_over() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        let rendered = feed_checked(&mut m, &with_hole(larix_frames(600), 30, 270_000));
+        assert_eq!(header(&rendered[0], "#EXT-X-TARGETDURATION:"), 3);
+        assert!(
+            !rendered
+                .iter()
+                .any(|pl| pl.contains("#EXT-X-DISCONTINUITY\n"))
+        );
+    }
+
+    /// The policy's failure mode: an early extra keyframe (a scene cut)
+    /// makes the first segment short, so the target is too small for the
+    /// encoder's 4 s keyframe interval and every later segment is cut short
+    /// with video dropped to the next keyframe. The rules still hold.
+    #[test]
+    fn a_short_first_segment_still_keeps_the_rules() {
+        let frames: Vec<(i64, bool)> = (0..3600)
+            .map(|i| (i * 3000, i == 35 || i % 120 == 0))
+            .collect();
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        let rendered = feed_checked(&mut m, &frames);
+        assert_eq!(header(&rendered[0], "#EXT-X-TARGETDURATION:"), 2);
+    }
+
+    /// While the stream waits for a keyframe after a break, blocking
+    /// requests for the next segment wait too, and the preload hint still
+    /// names the part that will come.
+    #[test]
+    fn blocking_reload_waits_across_a_break() {
+        let frames = with_hole(larix_frames(1100), 1000, 270_000);
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        feed_checked(&mut m, &frames[..1001]);
+        let next = m.media_sequence() + m.entries().len() as u64;
+        // The break closed the segment: nothing is open.
+        assert!(m.open_parts().is_empty());
+        assert_eq!(m.readiness(Some(next), Some(0)), Readiness::Wait);
+        assert!(matches!(m.part(m.next_part_id()), PartLookup::Next));
+        let hint = m.next_part_id();
+        feed_checked(&mut m, &frames[1001..]);
+        let seg = m.segment(next).expect("segment after the break");
+        assert!(seg.discontinuity);
+        assert_eq!(seg.parts[0].id, hint);
+        assert_eq!(m.readiness(Some(next), Some(0)), Readiness::Ready);
+    }
+
     #[test]
     fn waits_for_a_keyframe_and_then_cuts_one_second_segments() {
         let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
@@ -942,7 +1294,8 @@ pub(crate) mod tests {
         assert_eq!(m.entries().len(), 8);
         let seg = m.segment(LEADING_GAPS).expect("segment 7");
         assert_eq!(seg.duration, Duration::from_secs(1));
-        assert_eq!(m.target_duration(), 1);
+        // One second of headroom over the first segment.
+        assert_eq!(m.target_duration(), 2);
         for e in m.entries().iter().take(7) {
             assert!(matches!(e, Entry::Gap { duration } if *duration == Duration::from_secs(1)));
         }
@@ -1000,10 +1353,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn long_gop_raises_the_target_duration() {
+    fn long_gop_sets_the_target_duration() {
         let mut m = Muxer::new(MuxerConfig::default(), video(), None);
         feed(&mut m, 0..(30 * 9 + 1), 90);
-        assert_eq!(m.target_duration(), 3);
+        assert_eq!(m.target_duration(), 4);
         let seg = m.segment(LEADING_GAPS).expect("segment");
         assert_eq!(seg.duration, Duration::from_secs(3));
     }

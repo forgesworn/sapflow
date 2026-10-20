@@ -90,7 +90,7 @@ echo "ok   refusals (409 live path, 401 credentials, 400 read)"
 sleep 4
 curl -s "$BASE/stream.m3u8" -o "$WORK/stream.m3u8"
 for tag in '#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=' '#EXT-X-PART-INF:PART-TARGET=0.2' \
-           '#EXT-X-TARGETDURATION:1' '#EXT-X-PRELOAD-HINT:TYPE=PART' '#EXT-X-PART:DURATION='; do
+           '#EXT-X-TARGETDURATION:2' '#EXT-X-PRELOAD-HINT:TYPE=PART' '#EXT-X-PART:DURATION='; do
   grep -q "$tag" "$WORK/stream.m3u8" || fail "media playlist lacks $tag"
 done
 [ "$(grep -c '^#EXT-X-GAP' "$WORK/stream.m3u8")" = 7 ] || fail "expected 7 leading gaps"

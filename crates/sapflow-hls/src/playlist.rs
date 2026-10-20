@@ -91,11 +91,12 @@ pub fn media(m: &Muxer, prefix: &str) -> String {
         "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{}\n\
          #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={}\n\
          #EXT-X-PART-INF:PART-TARGET={}\n#EXT-X-MEDIA-SEQUENCE:{}\n\
-         #EXT-X-MAP:URI=\"{}\"\n",
+         #EXT-X-DISCONTINUITY-SEQUENCE:{}\n#EXT-X-MAP:URI=\"{}\"\n",
         m.target_duration(),
         secs(part_target * 25 / 10),
         secs(part_target),
         m.media_sequence(),
+        m.discontinuity_sequence(),
         init_name(prefix),
     );
 
@@ -106,6 +107,10 @@ pub fn media(m: &Muxer, prefix: &str) -> String {
                 let _ = write!(s, "#EXT-X-GAP\n#EXTINF:{},\ngap.mp4\n", secs(*duration));
             }
             Entry::Segment(seg) => {
+                // Before the segment's date and parts, never among them.
+                if seg.discontinuity {
+                    s.push_str("#EXT-X-DISCONTINUITY\n");
+                }
                 let recent = n - i <= 2;
                 if recent {
                     let _ = writeln!(s, "#EXT-X-PROGRAM-DATE-TIME:{}", rfc3339_millis(seg.start));
@@ -121,6 +126,9 @@ pub fn media(m: &Muxer, prefix: &str) -> String {
                 );
             }
         }
+    }
+    if m.open_discontinuity() && !m.open_parts().is_empty() {
+        s.push_str("#EXT-X-DISCONTINUITY\n");
     }
     for p in m.open_parts() {
         write_part(&mut s, prefix, p.id, p.duration, p.independent);
@@ -147,51 +155,100 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
     s.push('\n');
 }
 
-/// Checks Apple's part rules on one rendered media playlist (RFC 8216bis
-/// 4.4.3.7 and 4.4.4.9): no part longer than `PART-TARGET`, and every part
-/// but the last of its segment at least 85% of it. Durations are compared
-/// as the printed decimals, as a client reads them. The last part after the
-/// final `EXTINF` is exempt: it may yet be the last of its segment. Returns
-/// the `PART-TARGET` text, which must also never change during a stream.
+/// Checks the renders of one stream's media playlist against the rules a
+/// client holds them to (RFC 8216bis 4.4.3.1, 4.4.3.3, 4.4.3.7, 4.4.4.9):
+///
+/// - `EXT-X-TARGETDURATION` and `PART-TARGET` never change;
+/// - every `EXTINF`, rounded to the nearest second, is at most the target;
+/// - no part is longer than `PART-TARGET`, and every part but the last of
+///   its segment is at least 85% of it (the last part after the final
+///   `EXTINF` is exempt: it may yet be the last of its segment);
+/// - an `EXT-X-DISCONTINUITY` sits before a segment's parts, never among
+///   them, and every media sequence number keeps one discontinuity
+///   sequence number from render to render.
+///
+/// Durations are compared as the printed decimals, as a client reads them.
 /// For tests and fuzzing; `scripts/check-playlist.py` is the same check.
-pub fn check_part_rules(pl: &str) -> Result<String, String> {
-    let fixed = |v: &str| -> Result<u64, String> {
-        let (whole, frac) = v.split_once('.').unwrap_or((v, ""));
-        let frac = format!("{frac:0<5}");
-        format!("{whole}{}", &frac[..5])
-            .parse()
-            .map_err(|_| format!("bad duration {v}"))
-    };
-    let target_text = pl
-        .lines()
-        .find_map(|l| l.strip_prefix("#EXT-X-PART-INF:PART-TARGET="))
-        .ok_or("no PART-TARGET")?
-        .to_string();
-    let target = fixed(&target_text)?;
-    let check = |run: &[u64], open: bool| -> Result<(), String> {
-        for (i, &d) in run.iter().enumerate() {
-            if d > target {
-                return Err(format!("part {d} longer than PART-TARGET {target}"));
-            }
-            let last = i + 1 == run.len();
-            if !last && d * 100 < target * 85 {
-                let what = if open { "open segment" } else { "segment" };
-                return Err(format!("part {d} under 85% of {target} ({what})"));
-            }
-        }
-        Ok(())
-    };
-    let mut run = Vec::new();
-    for l in pl.lines() {
-        if let Some(rest) = l.strip_prefix("#EXT-X-PART:DURATION=") {
-            run.push(fixed(rest.split(',').next().unwrap_or_default())?);
-        } else if l.starts_with("#EXTINF:") {
-            check(&run, false)?;
-            run.clear();
-        }
+#[derive(Debug, Default)]
+pub struct RuleCheck {
+    part_target: Option<u64>,
+    target: Option<u64>,
+    discontinuity: std::collections::BTreeMap<u64, u64>,
+}
+
+/// A decimal with up to 5 places, in units of 0.00001.
+fn fixed5(v: &str) -> Result<u64, String> {
+    let (whole, frac) = v.split_once('.').unwrap_or((v, ""));
+    if frac.len() > 5 {
+        return Err(format!("more than 5 decimals: {v}"));
     }
-    check(&run, true)?;
-    Ok(target_text)
+    format!("{whole}{frac:0<5}")
+        .parse()
+        .map_err(|_| format!("bad decimal {v}"))
+}
+
+impl RuleCheck {
+    pub fn check(&mut self, pl: &str) -> Result<(), String> {
+        let tag = |name: &str| pl.lines().find_map(|l| l.strip_prefix(name));
+        let part_target = fixed5(tag("#EXT-X-PART-INF:PART-TARGET=").ok_or("no PART-TARGET")?)?;
+        let target: u64 = tag("#EXT-X-TARGETDURATION:")
+            .and_then(|v| v.parse().ok())
+            .ok_or("no TARGETDURATION")?;
+        let mut msn: u64 = tag("#EXT-X-MEDIA-SEQUENCE:")
+            .and_then(|v| v.parse().ok())
+            .ok_or("no MEDIA-SEQUENCE")?;
+        let mut dseq: u64 = match tag("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+            Some(v) => v.parse().map_err(|_| "bad DISCONTINUITY-SEQUENCE")?,
+            None => 0,
+        };
+        if *self.part_target.get_or_insert(part_target) != part_target {
+            return Err(format!("PART-TARGET changed to {part_target}"));
+        }
+        if *self.target.get_or_insert(target) != target {
+            return Err(format!("TARGETDURATION changed to {target}"));
+        }
+        let parts = |run: &[u64], open: bool| -> Result<(), String> {
+            for (i, &d) in run.iter().enumerate() {
+                if d > part_target {
+                    return Err(format!("part {d} longer than PART-TARGET {part_target}"));
+                }
+                let last = i + 1 == run.len();
+                if !last && d * 100 < part_target * 85 {
+                    let what = if open { "open segment" } else { "segment" };
+                    return Err(format!("part {d} under 85% of {part_target} ({what})"));
+                }
+            }
+            Ok(())
+        };
+        let mut run = Vec::new();
+        for l in pl.lines() {
+            if let Some(rest) = l.strip_prefix("#EXT-X-PART:DURATION=") {
+                run.push(fixed5(rest.split(',').next().unwrap_or_default())?);
+            } else if l == "#EXT-X-DISCONTINUITY" {
+                if !run.is_empty() {
+                    return Err(format!("discontinuity among the parts of segment {msn}"));
+                }
+                dseq += 1;
+            } else if let Some(rest) = l.strip_prefix("#EXTINF:") {
+                parts(&run, false)?;
+                run.clear();
+                let d = fixed5(rest.trim_end_matches(','))?;
+                // Rounded to the nearest second, halves up.
+                if (d + 50_000) / 100_000 > target {
+                    return Err(format!(
+                        "segment {msn} lasts {d}, over TARGETDURATION {target}"
+                    ));
+                }
+                if *self.discontinuity.entry(msn).or_insert(dseq) != dseq {
+                    return Err(format!(
+                        "segment {msn} changed discontinuity sequence to {dseq}"
+                    ));
+                }
+                msn += 1;
+            }
+        }
+        parts(&run, true)
+    }
 }
 
 /// The multivariant playlist pointing at the one media playlist.
@@ -228,7 +285,9 @@ mod tests {
         let pl = media(&m, "p1");
         let lines: Vec<&str> = pl.lines().collect();
         assert_eq!(lines[0], "#EXTM3U");
-        assert!(pl.contains("#EXT-X-TARGETDURATION:1\n"));
+        assert!(pl.contains("#EXT-X-TARGETDURATION:2\n"));
+        assert!(pl.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0\n"));
+        assert!(!pl.contains("#EXT-X-DISCONTINUITY\n"));
         assert!(pl.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=0.58500\n"));
         assert!(pl.contains("#EXT-X-PART-INF:PART-TARGET=0.23400\n"));
         assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
@@ -248,26 +307,76 @@ mod tests {
     }
 
     #[test]
-    fn part_rule_check_catches_each_rule() {
-        let pl = |parts: &str| {
-            format!("#EXT-X-PART-INF:PART-TARGET=0.23400\n{parts}#EXT-X-PRELOAD-HINT:x\n")
+    fn rule_check_catches_each_rule() {
+        let head = |target: u64, msn: u64, dseq: u64| {
+            format!(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-PART-INF:PART-TARGET=0.23400\n\
+                 #EXT-X-MEDIA-SEQUENCE:{msn}\n#EXT-X-DISCONTINUITY-SEQUENCE:{dseq}\n"
+            )
         };
         let part = |d: &str| format!("#EXT-X-PART:DURATION={d},URI=\"p\"\n");
+        let seg = |d: &str| format!("#EXTINF:{d},\ns\n");
         let ok = format!(
-            "{}{}#EXTINF:0.4,\ns\n{}{}",
+            "{}{}{}{}#EXT-X-DISCONTINUITY\n{}{}{}",
+            head(3, 10, 0),
             part("0.20000"),
             part("0.03300"),
+            seg("3.49000"),
             part("0.19890"),
-            part("0.01000")
+            seg("1.0"),
+            part("0.01000"),
         );
-        assert_eq!(check_part_rules(&pl(&ok)), Ok("0.23400".into()));
-        let long = format!("{}#EXTINF:0.4,\ns\n", part("0.23401"));
-        assert!(check_part_rules(&pl(&long)).is_err());
-        let short = format!("{}{}#EXTINF:0.4,\ns\n", part("0.19889"), part("0.2"));
-        assert!(check_part_rules(&pl(&short)).is_err());
-        let short_open = format!("{}{}", part("0.19889"), part("0.2"));
-        assert!(check_part_rules(&pl(&short_open)).is_err());
-        assert!(check_part_rules("#EXTM3U\n").is_err());
+        let mut c = RuleCheck::default();
+        assert_eq!(c.check(&ok), Ok(()));
+        // The same window a segment later: segment 11 is now first, its
+        // discontinuity still tagged, the sequence unchanged.
+        let rolled = format!(
+            "{}#EXT-X-DISCONTINUITY\n{}{}",
+            head(3, 11, 0),
+            part("0.2"),
+            seg("1.0")
+        );
+        assert_eq!(c.check(&rolled), Ok(()));
+        // Once it leaves, the sequence must have counted it.
+        let gone = format!("{}{}", head(3, 12, 0), seg("1.0"));
+        assert_eq!(c.check(&gone), Ok(()));
+        let wrong = format!("{}{}", head(3, 11, 0), seg("1.0"));
+        assert!(
+            c.check(&wrong).is_err(),
+            "segment 11 lost its discontinuity"
+        );
+        let mut fresh = RuleCheck::default();
+        for bad in [
+            format!("{}{}", head(3, 0, 0), seg("3.50000")),
+            format!("{}{}{}", head(3, 0, 0), part("0.23401"), seg("1")),
+            format!(
+                "{}{}{}{}",
+                head(3, 0, 0),
+                part("0.19889"),
+                part("0.2"),
+                seg("1")
+            ),
+            format!("{}{}{}", head(3, 0, 0), part("0.19889"), part("0.2")),
+            format!(
+                "{}{}#EXT-X-DISCONTINUITY\n{}{}",
+                head(3, 0, 0),
+                part("0.2"),
+                part("0.2"),
+                seg("1")
+            ),
+            "#EXTM3U\n".to_string(),
+        ] {
+            assert!(RuleCheck::default().check(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            fresh.check(&format!("{}{}", head(3, 0, 0), seg("1"))),
+            Ok(())
+        );
+        assert!(
+            fresh
+                .check(&format!("{}{}", head(4, 1, 0), seg("1")))
+                .is_err()
+        );
     }
 
     #[test]
