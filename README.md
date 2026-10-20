@@ -58,6 +58,15 @@ lists every setting.
 [ForgeSworn](https://forgesworn.dev) builds open-source cryptographic identity,
 payments, and coordination tools for Nostr.
 
+## Support
+
+If you find sapflow useful, consider supporting development:
+
+- **GitHub Sponsors:** [TheCryptoDonkey](https://github.com/sponsors/TheCryptoDonkey)
+- **Lightning:** `profusemeat89@walletofsatoshi.com`
+- **Nostr zaps:** `npub1mgvlrnf5hm9yf0n5mf9nqmvarhvxkc6remu5ec3vf8r0txqkuk7su0e7q2`
+- **Geyser:** [forgesworn](https://geyser.fund/project/forgesworn)
+
 ## Licence
 
 MIT, see [LICENSE](LICENSE).
