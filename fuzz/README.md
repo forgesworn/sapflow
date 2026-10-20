@@ -4,6 +4,7 @@
 |--------|---------------|
 | `ts_ingest` | Arbitrary MPEG-TS in arbitrary chunks (SRT publisher) |
 | `flv_ingest` | Arbitrary FLV video/audio tag bodies (RTMP publisher) |
+| `muxer_timing` | Arbitrary frame timing into the LL-HLS muxer (steps, stalls, steps back, keyframes anywhere, audio between); every rendered playlist must keep Apple's part rules and a fixed `PART-TARGET` |
 | `small_parsers` | Stream ids, RTMP keys, chunk names, HLS queries, ages, ASC, avcC, ADTS, Annex B, AVCC |
 | `srt_packet` | `srt-protocol` packet parse, then re-encode (every datagram to the SRT port) |
 | `srt_listener` | `srt-protocol`'s listener and, once a handshake completes, the connection: datagrams from several peers (each echoing its SYN cookie, as a client does), access-control answers, timers. Seeded with a captured real session (`corpus/srt_listener/real-session`, gitignored; see below) |

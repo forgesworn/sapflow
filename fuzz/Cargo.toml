@@ -83,3 +83,10 @@ bench = false
 srt-protocol = { path = "../vendor/srt-protocol" }
 
 [workspace]
+
+[[bin]]
+name = "muxer_timing"
+path = "fuzz_targets/muxer_timing.rs"
+test = false
+doc = false
+bench = false
