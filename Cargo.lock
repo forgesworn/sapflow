@@ -1059,6 +1059,7 @@ dependencies = [
  "sapflow-core",
  "sapflow-hls",
  "sapflow-srt",
+ "srt-protocol",
  "srt-tokio",
  "tokio",
  "tracing",
