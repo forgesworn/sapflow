@@ -147,6 +147,53 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
     s.push('\n');
 }
 
+/// Checks Apple's part rules on one rendered media playlist (RFC 8216bis
+/// 4.4.3.7 and 4.4.4.9): no part longer than `PART-TARGET`, and every part
+/// but the last of its segment at least 85% of it. Durations are compared
+/// as the printed decimals, as a client reads them. The last part after the
+/// final `EXTINF` is exempt: it may yet be the last of its segment. Returns
+/// the `PART-TARGET` text, which must also never change during a stream.
+/// For tests and fuzzing; `scripts/check-playlist.py` is the same check.
+pub fn check_part_rules(pl: &str) -> Result<String, String> {
+    let fixed = |v: &str| -> Result<u64, String> {
+        let (whole, frac) = v.split_once('.').unwrap_or((v, ""));
+        let frac = format!("{frac:0<5}");
+        format!("{whole}{}", &frac[..5])
+            .parse()
+            .map_err(|_| format!("bad duration {v}"))
+    };
+    let target_text = pl
+        .lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-PART-INF:PART-TARGET="))
+        .ok_or("no PART-TARGET")?
+        .to_string();
+    let target = fixed(&target_text)?;
+    let check = |run: &[u64], open: bool| -> Result<(), String> {
+        for (i, &d) in run.iter().enumerate() {
+            if d > target {
+                return Err(format!("part {d} longer than PART-TARGET {target}"));
+            }
+            let last = i + 1 == run.len();
+            if !last && d * 100 < target * 85 {
+                let what = if open { "open segment" } else { "segment" };
+                return Err(format!("part {d} under 85% of {target} ({what})"));
+            }
+        }
+        Ok(())
+    };
+    let mut run = Vec::new();
+    for l in pl.lines() {
+        if let Some(rest) = l.strip_prefix("#EXT-X-PART:DURATION=") {
+            run.push(fixed(rest.split(',').next().unwrap_or_default())?);
+        } else if l.starts_with("#EXTINF:") {
+            check(&run, false)?;
+            run.clear();
+        }
+    }
+    check(&run, true)?;
+    Ok(target_text)
+}
+
 /// The multivariant playlist pointing at the one media playlist.
 pub fn multivariant(m: &Muxer) -> String {
     let (peak, avg) = m.bandwidth();
@@ -182,8 +229,8 @@ mod tests {
         let lines: Vec<&str> = pl.lines().collect();
         assert_eq!(lines[0], "#EXTM3U");
         assert!(pl.contains("#EXT-X-TARGETDURATION:1\n"));
-        assert!(pl.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=0.50000\n"));
-        assert!(pl.contains("#EXT-X-PART-INF:PART-TARGET=0.20000\n"));
+        assert!(pl.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=0.58500\n"));
+        assert!(pl.contains("#EXT-X-PART-INF:PART-TARGET=0.23400\n"));
         assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
         assert!(pl.contains("#EXT-X-MAP:URI=\"p1_init.mp4\"\n"));
         assert_eq!(pl.matches("#EXT-X-GAP\n").count(), 7);
@@ -198,6 +245,29 @@ mod tests {
         assert!(pl.ends_with("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p1_part16.mp4\"\n"));
         assert!(!pl.contains("CAN-SKIP-UNTIL"));
         assert_eq!(pl.matches("#EXT-X-PROGRAM-DATE-TIME:").count(), 2);
+    }
+
+    #[test]
+    fn part_rule_check_catches_each_rule() {
+        let pl = |parts: &str| {
+            format!("#EXT-X-PART-INF:PART-TARGET=0.23400\n{parts}#EXT-X-PRELOAD-HINT:x\n")
+        };
+        let part = |d: &str| format!("#EXT-X-PART:DURATION={d},URI=\"p\"\n");
+        let ok = format!(
+            "{}{}#EXTINF:0.4,\ns\n{}{}",
+            part("0.20000"),
+            part("0.03300"),
+            part("0.19890"),
+            part("0.01000")
+        );
+        assert_eq!(check_part_rules(&pl(&ok)), Ok("0.23400".into()));
+        let long = format!("{}#EXTINF:0.4,\ns\n", part("0.23401"));
+        assert!(check_part_rules(&pl(&long)).is_err());
+        let short = format!("{}{}#EXTINF:0.4,\ns\n", part("0.19889"), part("0.2"));
+        assert!(check_part_rules(&pl(&short)).is_err());
+        let short_open = format!("{}{}", part("0.19889"), part("0.2"));
+        assert!(check_part_rules(&pl(&short_open)).is_err());
+        assert!(check_part_rules("#EXTM3U\n").is_err());
     }
 
     #[test]

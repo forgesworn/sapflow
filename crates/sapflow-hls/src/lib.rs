@@ -48,32 +48,76 @@ impl TargetDuration {
     }
 }
 
-/// iOS fails if a part is shorter than 85% of the longest part. Given the
-/// frame durations seen so far, find the shortest part duration at or above
-/// `min` that every frame duration divides into closely enough.
-pub fn compatible_part_duration(min: Duration, frame_durations: &[Duration]) -> Duration {
-    let step = Duration::from_millis(5);
-    let mut candidate = min;
-    while candidate < Duration::from_secs(5) {
-        if frame_durations.iter().all(|&f| part_fits(candidate, f)) {
-            return candidate;
-        }
-        candidate += step;
-    }
-    candidate
+/// How parts are cut, fixed for the life of a stream.
+///
+/// Apple's rules for parts (RFC 8216bis 4.4.4.9, the HLS authoring
+/// specification): no part may be longer than `PART-TARGET`, every part but
+/// the last of its segment must be at least 85% of it, and the target must
+/// not change. So the target is chosen once, from the frame duration seen
+/// over the first segment, and a part is closed at the first frame boundary
+/// past `cut` (85% of the target). The target is set so that the nominal
+/// part (whole frames, at least `part_min`) lands a millisecond above `cut`,
+/// which leaves about a frame of headroom above it for jitter, millisecond
+/// timestamps and a dropped frame. A frame that still does not fit (a stall)
+/// has its duration clamped by the muxer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartTiming {
+    /// `PART-TARGET` in 90 kHz ticks: a whole number of milliseconds, so it
+    /// prints exactly.
+    pub target: i64,
+    /// A part is closed at the first frame boundary at least this many
+    /// ticks after its start: 85% of the target, rounded up.
+    pub cut: i64,
 }
 
-fn part_fits(part: Duration, frame: Duration) -> bool {
-    if frame.is_zero() {
-        return true;
+/// 90 kHz ticks.
+const TICKS_PER_MS: i64 = 90;
+/// Below `cut`, room for jitter on a part of nominal frames (one millisecond
+/// covers RTMP's millisecond timestamps).
+const JITTER: i64 = TICKS_PER_MS;
+/// Fewer frames per part and the 15% between `cut` and the target is less
+/// than a frame wide.
+const MIN_FRAMES_PER_PART: i64 = 5;
+
+impl PartTiming {
+    /// `frame_durations` are the video frame durations seen so far, in 90 kHz
+    /// ticks. Long frames (stalls, dropped frames) are left out of the
+    /// estimate; with none at all, 30 fps is assumed.
+    pub fn new(part_min: Duration, frame_durations: &[u32]) -> Self {
+        let frame = typical_frame(frame_durations).clamp(TICKS_PER_MS, 200 * TICKS_PER_MS);
+        let min = (part_min.as_micros() as i64 * 9 / 100).max(1);
+        // Whole frames, allowing a tenth of a frame of rounding: 30 fps
+        // measured as 2999.5 ticks still makes 6-frame parts of 200 ms.
+        let frames = ((min - frame / 10).max(1) + frame - 1) / frame;
+        let nominal = frames.max(MIN_FRAMES_PER_PART) * frame;
+        let target_ms = (nominal - JITTER) * 100 / 85 / TICKS_PER_MS;
+        let target = target_ms * TICKS_PER_MS;
+        Self {
+            target,
+            cut: (target * 85 + 99) / 100,
+        }
     }
-    if frame > part {
-        return false;
+
+    pub fn target_duration(self) -> Duration {
+        Duration::from_millis((self.target / TICKS_PER_MS) as u64)
     }
-    let part_n = part.as_nanos();
-    let frame_n = frame.as_nanos();
-    let frames = part_n.div_ceil(frame_n);
-    part_n * 100 > frames * frame_n * 85
+}
+
+/// The mean frame duration, leaving out zeros and anything over 1.5 times
+/// the median.
+fn typical_frame(durations: &[u32]) -> i64 {
+    let mut d: Vec<u32> = durations.iter().copied().filter(|&d| d > 0).collect();
+    if d.is_empty() {
+        return 3000;
+    }
+    d.sort_unstable();
+    let median = i64::from(d[d.len() / 2]);
+    let usual: Vec<i64> = d
+        .iter()
+        .map(|&x| i64::from(x))
+        .filter(|&x| x * 2 <= median * 3)
+        .collect();
+    usual.iter().sum::<i64>() / usual.len() as i64
 }
 
 #[cfg(test)]
@@ -100,19 +144,81 @@ mod tests {
         assert_eq!(t.secs(), 1);
     }
 
-    #[test]
-    fn part_duration_fits_30fps_video() {
-        let frame = Duration::from_nanos(33_333_333);
-        let part = compatible_part_duration(Duration::from_millis(200), &[frame]);
-        assert!(part >= Duration::from_millis(200));
-        assert!(part_fits(part, frame));
+    fn ticks(t: i64) -> Duration {
+        Duration::from_nanos((t * 1_000_000_000 / 90_000) as u64)
     }
 
     #[test]
-    fn part_duration_fits_aac_and_video_together() {
-        let video = Duration::from_nanos(33_333_333);
-        let aac_48k = Duration::from_nanos(21_333_333);
-        let part = compatible_part_duration(Duration::from_millis(200), &[video, aac_48k]);
-        assert!(part_fits(part, video) && part_fits(part, aac_48k));
+    fn part_timing_at_30fps() {
+        let t = PartTiming::new(Duration::from_millis(200), &[3000; 30]);
+        assert_eq!(t.target_duration(), Duration::from_millis(234));
+        assert_eq!(t.target, 21_060);
+        assert_eq!(t.cut, 17_901);
+    }
+
+    /// For each frame rate: nominal parts of whole frames close at `cut`,
+    /// fit the target, are at least 85% of it, and a frame of jitter or one
+    /// dropped frame still fits where the rate allows.
+    #[test]
+    fn part_timing_suits_common_frame_rates() {
+        for (fps_milli, frame) in [
+            (10_000, 9000i64),
+            (15_000, 6000),
+            (23_976, 3754),
+            (24_000, 3750),
+            (25_000, 3600),
+            (29_970, 3003),
+            (30_000, 3000),
+            (50_000, 1800),
+            (59_940, 1502),
+            (60_000, 1500),
+        ] {
+            let t = PartTiming::new(Duration::from_millis(200), &[frame as u32; 60]);
+            let n = (1..).find(|n| n * frame >= t.cut).expect("frames");
+            let part = n * frame;
+            assert!(n >= 5, "{fps_milli}: {n} frames");
+            assert!(part <= t.target, "{fps_milli}: {part} > {}", t.target);
+            assert!(part * 100 >= t.target * 85, "{fps_milli}");
+            assert!(
+                ticks(part) >= Duration::from_millis(190),
+                "{fps_milli}: {part}"
+            );
+            assert!(t.cut * 100 >= t.target * 85, "{fps_milli}");
+            // A part a millisecond short of nominal still closes on time.
+            assert!(part - 90 >= t.cut, "{fps_milli}: no room for jitter");
+            assert_eq!(t.target % 90, 0);
+        }
+    }
+
+    #[test]
+    fn part_timing_ignores_stalls_and_rounding() {
+        let mut d = vec![3000u32; 40];
+        d.extend([33_030, 9000, 6000]);
+        assert_eq!(
+            PartTiming::new(Duration::from_millis(200), &d),
+            PartTiming::new(Duration::from_millis(200), &[3000])
+        );
+        // RTMP's millisecond timestamps: 33 and 34 ms frames.
+        let rtmp: Vec<u32> = (0..60)
+            .map(|i| if i % 3 == 2 { 3060 } else { 2970 })
+            .collect();
+        assert_eq!(
+            PartTiming::new(Duration::from_millis(200), &rtmp),
+            PartTiming::new(Duration::from_millis(200), &[3000])
+        );
+        assert_eq!(
+            PartTiming::new(Duration::from_millis(200), &[2999]),
+            PartTiming::new(Duration::from_millis(200), &[3000])
+        );
+    }
+
+    #[test]
+    fn part_timing_survives_nonsense() {
+        for d in [&[][..], &[0, 0], &[1], &[u32::MAX], &[u32::MAX, 1]] {
+            let t = PartTiming::new(Duration::from_millis(200), d);
+            assert!(t.target > 0 && t.cut > 0 && t.cut <= t.target, "{d:?}");
+        }
+        let t = PartTiming::new(Duration::ZERO, &[3000]);
+        assert!(t.cut <= 5 * 3000 && t.target >= 5 * 3000);
     }
 }

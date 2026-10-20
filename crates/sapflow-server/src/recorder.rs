@@ -124,7 +124,7 @@ async fn write(
                 continue;
             }
             failed = file.write_all(&p.data).await.is_err();
-            duration += p.duration;
+            duration += p.span;
         }
     }
     // Now the length is known: rewrite the init in place (same size).
