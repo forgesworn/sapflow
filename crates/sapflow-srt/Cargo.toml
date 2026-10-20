@@ -1,0 +1,11 @@
+[package]
+name = "sapflow-srt"
+description = "SRT receiver for live streams, sans-IO: datagrams and time in, datagrams, events and timers out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

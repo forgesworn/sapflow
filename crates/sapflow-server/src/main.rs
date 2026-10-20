@@ -8,6 +8,7 @@ mod publish;
 mod recorder;
 mod rtmp;
 mod srt;
+mod srt_own;
 mod stream;
 
 use std::sync::Arc;

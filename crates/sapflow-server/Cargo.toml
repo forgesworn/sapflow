@@ -16,6 +16,7 @@ bytes = "1.12.1"
 futures = "0.3.34"
 sapflow-core = { path = "../sapflow-core" }
 sapflow-hls = { path = "../sapflow-hls" }
+sapflow-srt = { path = "../sapflow-srt" }
 srt-tokio = "0.4.4"
 tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util"] }
 tracing = "0.1.44"

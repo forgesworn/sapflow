@@ -17,6 +17,8 @@ Every setting is an environment variable; a flag of the same name in
 lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
 
   SAPFLOW_SRT_ADDR         SRT listener (default 0.0.0.0:8890)
+  SAPFLOW_SRT_IMPL         SRT implementation: srt-rs (default) or own
+                           (sapflow's own receiver, unencrypted callers only)
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
   SAPFLOW_PUBLISH_USER     the one publisher allowed to push
@@ -60,11 +62,23 @@ const KEYS: &[&str] = &[
     "SAPFLOW_MAX_PUBLISHERS",
     "SAPFLOW_MAX_PUBLISH_MBPS",
     "SAPFLOW_RECORD_MIN_FREE_GB",
+    "SAPFLOW_SRT_IMPL",
 ];
+
+/// Which SRT implementation serves the SRT port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrtImpl {
+    /// `srt-tokio` with the patched `srt-protocol` (the default until our
+    /// own is proven).
+    SrtRs,
+    /// `sapflow-srt`.
+    Own,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub srt_addr: SocketAddr,
+    pub srt_impl: SrtImpl,
     pub rtmp_addr: Option<SocketAddr>,
     pub http_addr: SocketAddr,
     /// `None` only when open publishing was asked for explicitly.
@@ -210,7 +224,18 @@ impl Config {
                 })?,
         };
 
+        let srt_impl = match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
+            None | Some("srt-rs") => SrtImpl::SrtRs,
+            Some("own") => SrtImpl::Own,
+            Some(v) => {
+                return Err(ConfigError::Invalid(format!(
+                    "SAPFLOW_SRT_IMPL: srt-rs or own, not {v}"
+                )));
+            }
+        };
+
         Ok(Self {
+            srt_impl,
             record_min_free,
             max_publish_bps,
             rtmp_addr,
@@ -327,6 +352,28 @@ mod tests {
             ),
             Err(ConfigError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn srt_implementation_switch() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let c = load(&[open], &[]).expect("config");
+        assert_eq!(
+            c.srt_impl,
+            SrtImpl::SrtRs,
+            "srt-rs until ours is the default"
+        );
+        let c = load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &[]).expect("config");
+        assert_eq!(c.srt_impl, SrtImpl::Own);
+        let c = load(&[open], &["--srt-impl", "own"]).expect("config");
+        assert_eq!(c.srt_impl, SrtImpl::Own);
+        let c = load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &["--srt-impl=srt-rs"]).expect("config");
+        assert_eq!(c.srt_impl, SrtImpl::SrtRs);
+        assert!(matches!(
+            load(&[open, ("SAPFLOW_SRT_IMPL", "libsrt")], &[]),
+            Err(ConfigError::Invalid(_))
+        ));
+        assert!(HELP.contains("SAPFLOW_SRT_IMPL"));
     }
 
     #[test]

@@ -6,8 +6,20 @@
 # ffmpeg encodes to stdout and srt-live-transmit, which is libsrt, sends it).
 # Builds sapflow, publishes a test signal, checks the playlists, decodes the
 # segments and parts, checks the publish and unpublish callbacks.
+#
+# SAPFLOW_SRT_IMPL=own picks the SRT implementation (default srt-rs);
+# SRT_IMPLS="srt-rs own" runs the whole check once with each.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+if [ -n "${SRT_IMPLS:-}" ]; then
+  for impl in $SRT_IMPLS; do
+    echo "== SAPFLOW_SRT_IMPL=$impl"
+    SRT_IMPLS= SAPFLOW_SRT_IMPL=$impl "$0"
+  done
+  exit 0
+fi
+SRT_IMPL=${SAPFLOW_SRT_IMPL:-srt-rs}
 
 for bin in ffmpeg ffprobe srt-live-transmit python3 curl; do
   command -v "$bin" >/dev/null || { echo "missing $bin" >&2; exit 1; }
@@ -41,8 +53,10 @@ SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret \
 SAPFLOW_CALLBACK_URL="http://127.0.0.1:$CB_PORT/api/public/live-events/{eventId}/stream-health" \
 SAPFLOW_CALLBACK_SECRET=tok SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:$SRT_PORT \
 SAPFLOW_RTMP_ADDR=127.0.0.1:$RTMP_PORT SAPFLOW_RECORDINGS="$WORK/rec" SAPFLOW_RECORD_SKIP='live/event-norec' \
-  ./target/debug/sapflow > "$WORK/sapflow.log" 2>&1 & pids+=($!)
+SAPFLOW_SRT_IMPL=$SRT_IMPL ./target/debug/sapflow > "$WORK/sapflow.log" 2>&1 & pids+=($!)
 sleep 1
+grep 'SRT listening' "$WORK/sapflow.log" | grep -q "implementation=\"$SRT_IMPL\"" || fail "SRT is not served by $SRT_IMPL"
+echo "ok   SRT served by $SRT_IMPL"
 
 publish() { # streamid seconds
   ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \

@@ -1058,11 +1058,16 @@ dependencies = [
  "rustix",
  "sapflow-core",
  "sapflow-hls",
+ "sapflow-srt",
  "srt-tokio",
  "tokio",
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "sapflow-srt"
+version = "0.0.0"
 
 [[package]]
 name = "semver"

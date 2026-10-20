@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/sapflow-core",
     "crates/sapflow-hls",
+    "crates/sapflow-srt",
     "crates/sapflow-server",
     "crates/sapflow-bench",
 ]
