@@ -38,8 +38,18 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     let mut publishers: HashMap<ConnId, mpsc::Sender<Vec<u8>>> = HashMap::new();
     // Big enough for any datagram, so none is truncated into a valid one.
     let mut buf = vec![0u8; 65_536];
+    // One timer, moved only when the listener's deadline changes.
+    let timer = tokio::time::sleep(std::time::Duration::ZERO);
+    tokio::pin!(timer);
+    let mut armed: Option<Instant> = None;
     loop {
         let deadline = listener.poll_timeout();
+        if deadline != armed {
+            if let Some(d) = deadline {
+                timer.as_mut().reset(d.into());
+            }
+            armed = deadline;
+        }
         tokio::select! {
             r = socket.recv_from(&mut buf) => {
                 // A failed receive (an ICMP error from an earlier send, on
@@ -50,7 +60,8 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                     listener.handle_datagram(Instant::now(), peer, datagram);
                 }
             }
-            () = sleep_until(deadline), if deadline.is_some() => {
+            () = &mut timer, if armed.is_some() => {
+                armed = None;
                 listener.handle_timeout(Instant::now());
             }
             Some(id) = ended_rx.recv() => {
@@ -117,13 +128,6 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                 tracing::debug!(error = %e, "SRT send failed");
             }
         }
-    }
-}
-
-async fn sleep_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(d) => tokio::time::sleep_until(d.into()).await,
-        None => std::future::pending().await,
     }
 }
 
