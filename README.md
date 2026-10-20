@@ -1,5 +1,7 @@
 # sapflow
 
+[![CI](https://github.com/forgesworn/sapflow/actions/workflows/ci.yml/badge.svg)](https://github.com/forgesworn/sapflow/actions/workflows/ci.yml)
+
 A small live media server in Rust: SRT in, Low-Latency HLS out, recording and
 a stream-health callback. Built to do only what a live stage needs, with a
 core that iOS and Android apps can share.

@@ -178,7 +178,8 @@ packet filters (FEC), sending (a later milestone, for phones).
 - Measured on Linux behind Caddy: the wired 250 and 750 full-viewer run,
   and glass-to-glass delay.
 - CI on the public repo: tests, clippy, fmt, short fuzz runs, nightly long
-  fuzzing.
+  fuzzing. Written (`.github/workflows/ci.yml`, `fuzz-nightly.yml`); not
+  verified until it has run on GitHub.
 
 ### Later
 

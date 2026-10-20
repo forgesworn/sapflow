@@ -1,0 +1,76 @@
+name: Fuzz nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  targets:
+    name: List targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: list
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, tomllib
+          with open("fuzz/Cargo.toml", "rb") as f:
+              names = [b["name"] for b in tomllib.load(f)["bin"]]
+          print("matrix=" + json.dumps({"target": names}))
+          PY
+
+  fuzz:
+    name: ${{ matrix.target }}
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+          cache-bin: "true"
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz for 20 minutes
+        working-directory: fuzz
+        env:
+          RUSTC_BOOTSTRAP: "1"
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # A fresh corpus seeded from the regressions; nothing is committed back.
+          corpus=$(mktemp -d)
+          if [ -d "regressions/$TARGET" ]; then cp "regressions/$TARGET"/* "$corpus"/; fi
+          cargo fuzz run -O "$TARGET" "$corpus" -- -max_total_time=1200
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
