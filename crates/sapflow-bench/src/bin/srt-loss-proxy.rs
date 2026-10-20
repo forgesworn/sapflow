@@ -12,7 +12,10 @@
 //! dropped, so a connection always forms. On SIGINT or SIGTERM it writes what
 //! it saw as `key=value` lines: packets sent and dropped each way, and, read
 //! from the SRT headers, original and retransmitted data packets, NAK and ACK
-//! packets and the handshake flags the target advertised.
+//! packets and the handshake flags the target advertised. With `--latency-ms`
+//! set to the SRT latency it also counts the original data packets that reached
+//! the target in time, by any copy, within that latency of their first send;
+//! the rest are residual loss whatever the receiver does with them.
 //!
 //! Loss models (`--loss`):
 //!
@@ -226,6 +229,15 @@ struct Stats {
     hs_flags: Option<u32>,
     reordered_orig: u64,
     last_orig_sent: Option<u32>,
+    /// Per original data packet: when it first reached the proxy and when a
+    /// copy of it was first let through.
+    seen: HashMap<u32, Seen>,
+    latency: Duration,
+}
+
+struct Seen {
+    first: Instant,
+    through: Option<Instant>,
 }
 
 impl Stats {
@@ -252,6 +264,35 @@ impl Stats {
             }
             _ => {}
         }
+    }
+
+    /// Records a client-to-target data packet as it arrives and whether the
+    /// loss process dropped it.
+    fn note_data(&mut self, now: Instant, d: &[u8], dropped: bool) {
+        let Kind::Data { seq, retransmit } = classify(d) else {
+            return;
+        };
+        if !retransmit {
+            self.seen.entry(seq).or_insert(Seen {
+                first: now,
+                through: None,
+            });
+        }
+        if !dropped && let Some(s) = self.seen.get_mut(&seq) {
+            s.through.get_or_insert(now);
+        }
+    }
+
+    /// Original data packets that got through within the latency of their
+    /// first send.
+    fn recovered_in_time(&self) -> usize {
+        self.seen
+            .values()
+            .filter(|s| {
+                s.through
+                    .is_some_and(|t| t.saturating_duration_since(s.first) <= self.latency)
+            })
+            .count()
     }
 
     /// Called as a packet leaves towards the target: an original data packet
@@ -293,6 +334,8 @@ impl Stats {
         kv("nak_seqs", self.nak_seqs.to_string());
         kv("ack_packets", self.ack_packets.to_string());
         kv("reordered_orig", self.reordered_orig.to_string());
+        kv("orig_distinct", self.seen.len().to_string());
+        kv("in_time", self.recovered_in_time().to_string());
         kv(
             "hs_flags",
             self.hs_flags
@@ -307,6 +350,7 @@ struct Args {
     target: SocketAddr,
     loss: LossSpec,
     delay: Duration,
+    latency: Duration,
     seed: u64,
     stats: Option<PathBuf>,
 }
@@ -317,6 +361,7 @@ fn args() -> Result<Args, String> {
         target: "127.0.0.1:0".parse().map_err(|_| "target")?,
         loss: LossSpec::None,
         delay: Duration::ZERO,
+        latency: Duration::ZERO,
         seed: 1,
         stats: None,
     };
@@ -333,6 +378,9 @@ fn args() -> Result<Args, String> {
             "--loss" => a.loss = LossSpec::parse(&v)?,
             "--delay-ms" => {
                 a.delay = Duration::from_millis(v.parse().map_err(|_| "--delay-ms: a number")?);
+            }
+            "--latency-ms" => {
+                a.latency = Duration::from_millis(v.parse().map_err(|_| "--latency-ms: a number")?);
             }
             "--seed" => a.seed = v.parse().map_err(|_| "--seed: a number")?,
             "--stats" => a.stats = Some(v.into()),
@@ -357,7 +405,10 @@ async fn run(a: Args) -> std::io::Result<Stats> {
         Lossy::new(a.loss, a.seed),
         Lossy::new(a.loss, a.seed ^ 0x5DEE_CE66_D1CE_4E5B),
     ];
-    let mut stats = Stats::default();
+    let mut stats = Stats {
+        latency: a.latency,
+        ..Stats::default()
+    };
     let mut client: Option<SocketAddr> = None;
     // Direction 0 is client to target, 1 is target to client.
     let mut queue: DelayQueue<(usize, Vec<u8>)> = DelayQueue::new(a.delay);
@@ -370,10 +421,13 @@ async fn run(a: Args) -> std::io::Result<Stats> {
                 client = Some(from);
                 let d = fbuf[..n].to_vec();
                 stats.account(0, &d);
-                if classify(&d) != Kind::Handshake && loss[0].drops() {
+                let now = Instant::now();
+                let dropped = classify(&d) != Kind::Handshake && loss[0].drops();
+                stats.note_data(now, &d, dropped);
+                if dropped {
                     stats.dropped[0] += 1;
                 } else {
-                    queue.push(Instant::now(), (0, d));
+                    queue.push(now, (0, d));
                 }
             }
             r = up.recv(&mut ubuf) => {
@@ -417,7 +471,7 @@ async fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!(
-                "{e}\nusage: srt-loss-proxy --target host:port [--listen host:port] [--loss none|random:P|burst:P,L] [--delay-ms N] [--seed N] [--stats file]"
+                "{e}\nusage: srt-loss-proxy --target host:port [--listen host:port] [--loss none|random:P|burst:P,L] [--delay-ms N] [--latency-ms N] [--seed N] [--stats file]"
             );
             return ExitCode::from(2);
         }
@@ -587,6 +641,30 @@ mod tests {
             w.note_sent_to_target(&header(seq, 0));
         }
         assert_eq!(w.reordered_orig, 0);
+    }
+
+    #[test]
+    fn counts_packets_recovered_within_the_latency() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut s = Stats {
+            latency: ms(200),
+            ..Stats::default()
+        };
+        // 1 arrives. 2 is dropped, then a copy gets through 150 ms later.
+        // 3 is dropped and its copy gets through 250 ms later. 4 is dropped
+        // and never recovered.
+        s.note_data(t0, &header(1, 0), false);
+        s.note_data(t0, &header(2, 0), true);
+        s.note_data(t0, &header(3, 0), true);
+        s.note_data(t0, &header(4, 0), true);
+        s.note_data(t0 + ms(150), &header(2, 0x0400_0000), false);
+        s.note_data(t0 + ms(250), &header(3, 0x0400_0000), false);
+        assert_eq!(s.seen.len(), 4);
+        assert_eq!(s.recovered_in_time(), 2);
+        // A retransmission that is itself dropped does not count.
+        s.note_data(t0 + ms(100), &header(4, 0x0400_0000), true);
+        assert_eq!(s.recovered_in_time(), 2);
     }
 
     #[test]

@@ -18,6 +18,9 @@
 # Reported per receiver and condition over the seeds, as mean and sample
 # standard deviation:
 #   - retransmission overhead: retransmitted / original data packets
+#   - not recovered in time: original data packets for which no copy reached the
+#     receiver within the SRT latency of the first send, counted by the proxy
+#     (the same definition for both receivers, whatever they do afterwards)
 #   - video and audio packets delivered, against the same receiver's clean run
 #   - decode messages: lines `ffmpeg -v error` prints decoding the output
 # plus sapflow minus libsrt with a Welch t statistic. With 5 seeds |t| below
@@ -56,38 +59,42 @@ summarise() { # results.tsv
       n[k]++
       o = orig > 0 ? 100 * retx / orig : 0
       so[k] += o; sso[k] += o * o
+      rl = $14 > 0 ? 100 * (1 - $15 / $14) : 0
+      sr[k] += rl; ssr[k] += rl * rl
       sv[k] += v; ssv[k] += v * v; sa[k] += a; ssa[k] += a * a
       sd_[k] += dec; ssd[k] += dec * dec
     }
     END {
       if (reordered) printf "WARNING: the proxy reordered packets in %d trials; those numbers are suspect\n\n", reordered
-      print "| Loss | Latency | Receiver | n | Retransmission overhead | Video delivered | Audio delivered | Decode messages |"
-      print "|------|--------:|----------|--:|------------------------:|----------------:|----------------:|----------------:|"
+      print "| Loss | Latency | Receiver | n | Retransmission overhead | Not recovered in time | Video delivered | Audio delivered | Decode messages |"
+      print "|------|--------:|----------|--:|------------------------:|----------------------:|----------------:|----------------:|----------------:|"
       for (i = 1; i <= nk; i++) {
         k = keys[i]; split(k, p, SUBSEP); r = p[1]; loss = p[2]; lat = p[3]
         bvv = bv[r, lat]; baa = ba[r, lat]
         m_o[k] = mean(so[k], n[k]); s_o[k] = sd(so[k], sso[k], n[k])
+        m_r[k] = mean(sr[k], n[k]); s_r[k] = sd(sr[k], ssr[k], n[k])
         m_v[k] = bvv ? 100 * mean(sv[k], n[k]) / bvv : 0
         s_v[k] = bvv ? 100 * sd(sv[k], ssv[k], n[k]) / bvv : 0
         m_a[k] = baa ? 100 * mean(sa[k], n[k]) / baa : 0
         s_a[k] = baa ? 100 * sd(sa[k], ssa[k], n[k]) / baa : 0
         m_d[k] = mean(sd_[k], n[k]); s_d[k] = sd(sd_[k], ssd[k], n[k])
         f = failed[k] ? sprintf(" (%d failed)", failed[k]) : ""
-        printf "| %s | %s ms | %s | %d%s | %.1f%% ± %.1f | %.2f%% ± %.2f | %.2f%% ± %.2f | %.1f ± %.1f |\n", \
-          loss, lat, r, n[k], f, m_o[k], s_o[k], m_v[k], s_v[k], m_a[k], s_a[k], m_d[k], s_d[k]
+        printf "| %s | %s ms | %s | %d%s | %.1f%% ± %.1f | %.2f%% ± %.2f | %.2f%% ± %.2f | %.2f%% ± %.2f | %.1f ± %.1f |\n", \
+          loss, lat, r, n[k], f, m_o[k], s_o[k], m_r[k], s_r[k], m_v[k], s_v[k], m_a[k], s_a[k], m_d[k], s_d[k]
         nn[k] = n[k]
         if (!(loss SUBSEP lat in cond)) { cond[loss SUBSEP lat] = 1; conds[++nc] = loss SUBSEP lat }
       }
       print ""
       print "sapflow minus libsrt (Welch t over the seeds; |t| below about 2.3 is noise):"
       print ""
-      print "| Loss | Latency | Overhead, points | t | Video delivered, points | t | Decode messages | t |"
-      print "|------|--------:|-----------------:|--:|------------------------:|--:|----------------:|--:|"
+      print "| Loss | Latency | Overhead, points | t | Not recovered, points | t | Video delivered, points | t | Decode messages | t |"
+      print "|------|--------:|-----------------:|--:|----------------------:|--:|------------------------:|--:|----------------:|--:|"
       for (i = 1; i <= nc; i++) {
         split(conds[i], c, SUBSEP); ks = "sapflow" SUBSEP c[1] SUBSEP c[2]; kl = "libsrt" SUBSEP c[1] SUBSEP c[2]
         if (!(ks in n) || !(kl in n)) continue
-        printf "| %s | %s ms | %+.1f | %s | %+.2f | %s | %+.1f | %s |\n", c[1], c[2], \
+        printf "| %s | %s ms | %+.1f | %s | %+.2f | %s | %+.2f | %s | %+.1f | %s |\n", c[1], c[2], \
           m_o[ks] - m_o[kl], welch(m_o[ks], s_o[ks], n[ks], m_o[kl], s_o[kl], n[kl]), \
+          m_r[ks] - m_r[kl], welch(m_r[ks], s_r[ks], n[ks], m_r[kl], s_r[kl], n[kl]), \
           m_v[ks] - m_v[kl], welch(m_v[ks], s_v[ks], n[ks], m_v[kl], s_v[kl], n[kl]), \
           m_d[ks] - m_d[kl], welch(m_d[ks], s_d[ks], n[ks], m_d[kl], s_d[kl], n[kl])
       }
@@ -126,7 +133,7 @@ if [ "${1:-}" = "--trial" ]; then
   fi
   pids+=("$rp"); sleep 1
   "$PROXY_BIN" --listen 127.0.0.1:$pp --target 127.0.0.1:$target --loss "$loss" \
-    --delay-ms "$DELAY_MS" --seed "$seed" --stats "$d/proxy.txt" 2> "$d/proxy.log" &
+    --delay-ms "$DELAY_MS" --latency-ms "$lat" --seed "$seed" --stats "$d/proxy.txt" 2> "$d/proxy.log" &
   prp=$!; pids+=("$prp"); sleep 0.5
 
   # srt-live-transmit does not exit when its input ends, so find ffmpeg in the
@@ -154,9 +161,9 @@ if [ "${1:-}" = "--trial" ]; then
     st=ok
   fi
   pstat() { awk -F= -v k="$1" '$1 == k { print $2 }' "$d/proxy.txt" 2>/dev/null || true; }
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$recv" "$loss" "$lat" "$seed" "${v:-0}" "${a:-0}" "$e" "$(pstat data_orig)" "$(pstat data_retx)" \
-    "$(pstat nak_packets)" "$(pstat hs_flags)" "$st" "$(pstat reordered_orig)" > "$OUT/trials/$idx.tsv"
+    "$(pstat nak_packets)" "$(pstat hs_flags)" "$st" "$(pstat reordered_orig)" "$(pstat orig_distinct)" "$(pstat in_time)" > "$OUT/trials/$idx.tsv"
   [ -n "${KEEP:-}" ] || rm -rf "$d"
   exit 0
 fi
@@ -202,7 +209,7 @@ echo "$(wc -l < "$WORK/clean" | tr -d ' ') clean runs, then $(wc -l < "$jobs" | 
 xargs -P "$JOBS" -L 1 "$SELF" --trial < "$WORK/clean"
 xargs -P "$JOBS" -L 1 "$SELF" --trial < "$jobs"
 
-printf 'receiver\tloss\tlatency_ms\tseed\tvideo\taudio\tdecode_msgs\tdata_orig\tdata_retx\tnaks\thandshake_flags\tstatus\treordered\n' > "$OUT/results.tsv"
+printf 'receiver\tloss\tlatency_ms\tseed\tvideo\taudio\tdecode_msgs\tdata_orig\tdata_retx\tnaks\thandshake_flags\tstatus\treordered\torig_distinct\tin_time\n' > "$OUT/results.tsv"
 cat "$OUT"/trials/*.tsv >> "$OUT/results.tsv"
 summarise "$OUT/results.tsv" | tee "$OUT/summary.md"
 echo
