@@ -12,6 +12,7 @@ is tried.
 | 2026-10-20 | OBS 32.1.2 | RTMP | OBS's default x264 (250-frame keyframes, B-frames) | Servable in 9.3 s; one 8.33 s GOP per segment, target duration 8; decodes cleanly |
 | 2026-10-20 | Larix Broadcaster (iPhone) | RTMP | Larix defaults (H.264 Baseline 720p30, AAC mono, 2 s keyframes); credentials in the URL | Servable in 1.0 s; 2 s segments decode cleanly, A/V start within 7 ms |
 | 2026-10-20 | Larix Broadcaster (iPhone) | SRT | Larix defaults, credentials in the `streamid`, 2 s latency | Servable in 4.5 s; 24 segments decode cleanly; 4 late packets dropped once over Wi-Fi (one segment 59 frames of 60) |
+| 2026-10-20 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults over Wi-Fi | Safari refused the stream (crossed-out play button) after Wi-Fi stalls (one frame of 0.367 s) raised `PART-TARGET` to 0.534 s while parts stayed 0.2 to 0.233 s. Fixed on branch `fix/part-target`: `PART-TARGET` fixed at 0.234 s, long frames clamped (`docs/reference.md`, Part timing) |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) | SRT, `SAPFLOW_SRT_IMPL=own` | `SRT_IMPLS="srt-rs own" scripts/smoke.sh` | Pass with both implementations (refusals 400, 401, 409 included) |
 | 2026-10-20 | ffmpeg 8.1.2 (libsrt 1.5.3, in Docker) | SRT, `SAPFLOW_SRT_IMPL=own` | 720p30 x264 2.5 Mbit/s, `latency=2000000` | Accepted at 2000 ms latency, servable in 3.5 s, clean shutdown and unpublish |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) with `passphrase=` | SRT, `SAPFLOW_SRT_IMPL=own` | 200 ms | Refused in the handshake: libsrt reports `ERROR:UNSECURE`, "Password required or unexpected" (encryption is M6b) |
@@ -23,6 +24,27 @@ each segment.
 With OBS's defaults the stream plays, but segments follow the keyframes, so
 viewers join up to about 8 s behind. v4v's advice to set 1 s keyframes
 matters.
+
+## Reproducing irregular encoder timing
+
+`scripts/irregular-publish.sh` publishes ffmpeg's test signal with Larix's
+timing faults (jittered frames, dropped frames, a 0.367 s stall every 10 s)
+and `scripts/check-playlist.py` polls a playlist and reports any render
+that breaks the part rules. Against a sapflow on spare ports, so a running
+one is left alone:
+
+```bash
+SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=0.0.0.0:18881 SAPFLOW_SRT_ADDR=0.0.0.0:18871 \
+  SAPFLOW_RTMP_ADDR=0.0.0.0:11981 ./target/debug/sapflow &
+scripts/irregular-publish.sh srt 127.0.0.1:18871 event-irr 600 &
+python3 -I scripts/check-playlist.py http://127.0.0.1:18881/live/event-irr/stream.m3u8 60
+```
+
+Safari plays `http://<host>:18881/live/event-irr/index.m3u8`. On
+2026-10-20, 75 s over SRT: before the fix `PART-TARGET` went 0.234, 0.467,
+0.534 and hundreds of parts broke the 85% rule; after it, 0.234
+throughout and no render broke a rule. Over RTMP (`irregular-publish.sh rtmp 127.0.0.1:11981 ...`)
+the same: 0.233 then 0.400 before, 0.234 throughout after.
 
 ## Not yet tried
 

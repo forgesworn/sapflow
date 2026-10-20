@@ -13,13 +13,68 @@ git clone --depth 1 --branch v2.4.0  https://github.com/bluenviron/gohlslib.git
 | Rule | Where in gohlslib | sapflow |
 |------|-------------------|---------|
 | `EXT-X-TARGETDURATION` is the longest segment rounded to the nearest second, and may only rise during a stream; changing it breaks iOS. | `muxer_stream.go` `targetDuration`, `rotateSegments` | `sapflow_hls::TargetDuration` |
-| Every part must be at least 85% of the longest part, so the part duration is chosen to suit every frame duration seen (video and audio). It is frozen after the first segment. | `muxer_segmenter.go` `findCompatiblePartDuration`, `fmp4AdjustPartDuration` | `sapflow_hls::compatible_part_duration` |
+| No part may be longer than `PART-TARGET`, every part but the last of its segment must be at least 85% of it, and `PART-TARGET` must not change during a stream (see [Part timing](#part-timing) for the wording and how sapflow keeps it). gohlslib reads the rule as 85% of the longest part and recomputes `PART-TARGET` as the longest part in the window at every part, only logging when it changes, so one long frame raises it; do not copy that. | `muxer_segmenter.go` `findCompatiblePartDuration`, `fmp4AdjustPartDuration`; `muxer_stream.go` `partTargetDuration` | `sapflow_hls::PartTiming`, `Muxer::place_video` |
 | The LL-HLS playlist starts with seven gap segments (same duration as the first real one); iOS needs them. This is why mediamtx refuses fewer than 7 segments. | `muxer_stream.go` `rotateSegments` | M1 |
 | Blocking reload: a request with `_HLS_msn` beyond last + 1, or older than the window, gets 400; otherwise it waits until that part exists. `_HLS_part` without `_HLS_msn` is 400. | `muxer_stream.go` `handleMediaPlaylist` | M1 |
 | `PART-HOLD-BACK` is 2.5 x part target; `CAN-SKIP-UNTIL` is 6 x target duration; `CAN-BLOCK-RELOAD=YES`. | `generateMediaPlaylistFMP4` | M1 |
 | Segments are cut only on a keyframe once the minimum duration has passed, so segment length follows the encoder's keyframe interval. | `fmp4WriteSample` | M1 |
 | fMP4 base time must not be negative; gohlslib adds a fixed start offset to every DTS. | `fmp4WriteSample` (`fmp4StartDTS`) | M1 |
 | LL-HLS playlists are `Cache-Control: no-cache`; segments and parts are cacheable. | `mediaPlaylistMaxAge`, segment handlers | M1 |
+
+## Part timing
+
+The rule sapflow implements, from RFC 8216bis (draft-pantos-hls-rfc8216bis)
+section 4.4.4.9 on `EXT-X-PART`, quoted from memory and not re-read here:
+a Partial Segment's duration must be less than or equal to the Part Target
+Duration, and at least 85% of it, except for the last Partial Segment of a
+Parent Segment (the draft may also exempt `INDEPENDENT=YES` parts; sapflow
+does not rely on that). `PART-TARGET` (4.4.3.7) is treated like
+`EXT-X-TARGETDURATION`: fixed for the life of the stream. Safari on macOS
+refused a Larix stream that broke all three (`PART-TARGET` climbed to
+0.534 s while its parts stayed 0.2 s; `docs/interop.md`); which one it
+tripped on is not known.
+`scripts/check-playlist.py` and `sapflow_hls::playlist::check_part_rules`
+check exactly these three things against the rendered playlist.
+
+How sapflow keeps it (`sapflow_hls::PartTiming`, `Muxer::place_video`):
+
+- **Chosen once.** The first segment's video frames are held (nothing is
+  served before the first segment exists, so this costs no latency) and the
+  typical frame duration is taken from them: the mean, leaving out frames
+  over 1.5 times the median, so a stall or dropped frame in the first
+  second does not count. A nominal part is the fewest whole frames, at least
+  five, that reach the configured minimum (200 ms) to within a tenth of a
+  frame. `PART-TARGET` is set so that 85% of it, rounded up to a tick (the
+  cut point), lies 1 ms below the nominal part, and is a whole number of
+  milliseconds so it prints exactly. At 30 fps: parts of 6 frames (0.2 s),
+  cut point 0.1989 s, `PART-TARGET` 0.234 s, `PART-HOLD-BACK` 0.585 s. The
+  15% between the cut point and the target is about a frame wide (it must
+  be at least one frame, hence five frames a part at least), so a part of
+  whole frames always fits in it.
+- **Cut on a threshold.** A part closes at the first frame boundary at or
+  past the cut point. Jittered frames (Larix: 2998 to 3004 ticks) and
+  RTMP's millisecond timestamps (33 and 34 ms frames) still give 6-frame
+  parts, not the alternating 6 and 7 frames of a cut at exactly 200 ms. A
+  dropped frame at the end of a part (5 frames plus a double) still fits
+  under the target.
+- **Long frames are clamped.** A frame longer than the room left before
+  the target (a Wi-Fi stall: one Larix frame lasted 0.367 s) is written
+  with its `trun` duration cut so the part ends exactly at the target; the
+  next part's `tfdt` carries the true time, leaving a gap in the video
+  track that audio still covers. Letting the part run long would exceed
+  `PART-TARGET`; closing the part before the frame would leave it under
+  85%; raising the target is the fault itself. Safari and hls.js tolerate a
+  short gap in one track (hls.js steps over buffer holes); that is the
+  expected behaviour, not yet watched in either.
+- **EXTINF stays true.** A segment's `EXTINF` is still the media time it
+  covers, so after a clamp its parts' `DURATION`s add up to less than its
+  `EXTINF` by the gap. `Part::span` is the part's duration plus any gap
+  after it; the spans add up to the segment, and the recorder sums spans so
+  a recording's length is right.
+- **Audio follows the timestamps.** When a part closes, AAC frames that
+  start at or after its end move to the next part, so a part's audio
+  covers its own time (to within one AAC frame, which is placed only when
+  the next arrives).
 
 ## mediamtx behaviour worth not copying
 
