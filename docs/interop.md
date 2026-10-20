@@ -13,6 +13,7 @@ is tried.
 | 2026-10-20 | Larix Broadcaster (iPhone) | RTMP | Larix defaults (H.264 Baseline 720p30, AAC mono, 2 s keyframes); credentials in the URL | Servable in 1.0 s; 2 s segments decode cleanly, A/V start within 7 ms |
 | 2026-10-20 | Larix Broadcaster (iPhone) | SRT | Larix defaults, credentials in the `streamid`, 2 s latency | Servable in 4.5 s; 24 segments decode cleanly; 4 late packets dropped once over Wi-Fi (one segment 59 frames of 60) |
 | 2026-10-20 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults over Wi-Fi | Safari refused the stream (crossed-out play button) after Wi-Fi stalls (one frame of 0.367 s) raised `PART-TARGET` to 0.534 s while parts stayed 0.2 to 0.233 s. Fixed in a94da2f: `PART-TARGET` fixed at 0.234 s, long frames clamped (`docs/reference.md`, Part timing) |
+| 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults, Wi-Fi switched off briefly, served by a94da2f | Part rules held (`PART-TARGET` 0.234 throughout), but the drop left a 6 s segment and `EXT-X-TARGETDURATION` rose from 2 to 6; Safari stopped. Fixed in d480bb9: the target is fixed and a drop ends the segment, marked as a discontinuity (`docs/reference.md`, Target duration and breaks). An SRT silence of 5 s still ends the stream (M7) |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) | SRT, `SAPFLOW_SRT_IMPL=own` | `SRT_IMPLS="srt-rs own" scripts/smoke.sh` | Pass with both implementations (refusals 400, 401, 409 included) |
 | 2026-10-20 | ffmpeg 8.1.2 (libsrt 1.5.3, in Docker) | SRT, `SAPFLOW_SRT_IMPL=own` | 720p30 x264 2.5 Mbit/s, `latency=2000000` | Accepted at 2000 ms latency, servable in 3.5 s, clean shutdown and unpublish |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) with `passphrase=` | SRT, `SAPFLOW_SRT_IMPL=own` | 200 ms | Refused in the handshake: libsrt reports `ERROR:UNSECURE`, "Password required or unexpected" (encryption is M6b) |
@@ -28,23 +29,33 @@ matters.
 ## Reproducing irregular encoder timing
 
 `scripts/irregular-publish.sh` publishes ffmpeg's test signal with Larix's
-timing faults (jittered frames, dropped frames, a 0.367 s stall every 10 s)
-and `scripts/check-playlist.py` polls a playlist and reports any render
-that breaks the part rules. Against a sapflow on spare ports, so a running
+timing faults: jittered frames, dropped frames and a 0.367 s stall every
+10 s, and a network drop every 30 s (both tracks stop for `STALL` seconds,
+default 3, and video resumes on a frame that is not a keyframe).
+`scripts/check-playlist.py` polls a playlist and reports any render that
+breaks the rules in `docs/reference.md` (part rules, a fixed
+`TARGETDURATION` and `PART-TARGET`, `EXTINF` within the target,
+consistent discontinuities). Against a sapflow on spare ports, so a running
 one is left alone:
 
 ```bash
-SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=0.0.0.0:18881 SAPFLOW_SRT_ADDR=0.0.0.0:18871 \
-  SAPFLOW_RTMP_ADDR=0.0.0.0:11981 ./target/debug/sapflow &
-scripts/irregular-publish.sh srt 127.0.0.1:18871 event-irr 600 &
-python3 -I scripts/check-playlist.py http://127.0.0.1:18881/live/event-irr/stream.m3u8 60
+SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=0.0.0.0:18882 SAPFLOW_SRT_ADDR=0.0.0.0:18872 \
+  SAPFLOW_RTMP_ADDR=0.0.0.0:11982 ./target/debug/sapflow &
+scripts/irregular-publish.sh srt 127.0.0.1:18872 event-irr 600 &
+python3 -I scripts/check-playlist.py http://127.0.0.1:18882/live/event-irr/stream.m3u8 60
 ```
 
-Safari plays `http://<host>:18881/live/event-irr/index.m3u8`. On
-2026-10-20, 75 s over SRT: before the fix `PART-TARGET` went 0.234, 0.467,
-0.534 and hundreds of parts broke the 85% rule; after it, 0.234
-throughout and no render broke a rule. Over RTMP (`irregular-publish.sh rtmp 127.0.0.1:11981 ...`)
-the same: 0.233 then 0.400 before, 0.234 throughout after.
+Safari plays `http://<host>:18882/live/event-irr/index.m3u8`. On
+2026-10-21, 80 s with two drops, the same stream to three builds:
+
+| Build | SRT | RTMP |
+|-------|-----|------|
+| main (04ab35d) | `TARGETDURATION` 2 then 4, `PART-TARGET` 0.234 up to 3.067, about 500 rule failures | 2 then 4, 0.233 up to 3.100, about 500 |
+| a94da2f (part timing only) | `TARGETDURATION` 2 then 4; `PART-TARGET` 0.234 throughout | 2 then 4; 0.234 throughout |
+| d480bb9 | `TARGETDURATION` 3, `PART-TARGET` 0.234 throughout, two discontinuities, longest `EXTINF` 2.0 s, no render broke a rule | the same |
+
+A recording of 60 s of it from d480bb9 lasts 50.8 s (the drops, and the
+video waiting for keyframes, are left out), decodes cleanly and seeks.
 
 ## Not yet tried
 

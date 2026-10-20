@@ -12,7 +12,7 @@ git clone --depth 1 --branch v2.4.0  https://github.com/bluenviron/gohlslib.git
 
 | Rule | Where in gohlslib | sapflow |
 |------|-------------------|---------|
-| `EXT-X-TARGETDURATION` is the longest segment rounded to the nearest second, and may only rise during a stream; changing it breaks iOS. | `muxer_stream.go` `targetDuration`, `rotateSegments` | `sapflow_hls::TargetDuration` |
+| `EXT-X-TARGETDURATION` must not change during a stream, and every segment's `EXTINF`, rounded to the nearest second, must be at most it. gohlslib raises it whenever a segment runs long, which Safari does not accept; sapflow fixes it once and breaks the segment instead (see [Target duration and breaks](#target-duration-and-breaks)). | `muxer_stream.go` `targetDuration`, `rotateSegments` | `sapflow_hls::TargetDuration`, `Muxer::break_stream` |
 | No part may be longer than `PART-TARGET`, every part but the last of its segment must be at least 85% of it, and `PART-TARGET` must not change during a stream (see [Part timing](#part-timing) for the wording and how sapflow keeps it). gohlslib reads the rule as 85% of the longest part and recomputes `PART-TARGET` as the longest part in the window at every part, only logging when it changes, so one long frame raises it; do not copy that. | `muxer_segmenter.go` `findCompatiblePartDuration`, `fmp4AdjustPartDuration`; `muxer_stream.go` `partTargetDuration` | `sapflow_hls::PartTiming`, `Muxer::place_video` |
 | The LL-HLS playlist starts with seven gap segments (same duration as the first real one); iOS needs them. This is why mediamtx refuses fewer than 7 segments. | `muxer_stream.go` `rotateSegments` | M1 |
 | Blocking reload: a request with `_HLS_msn` beyond last + 1, or older than the window, gets 400; otherwise it waits until that part exists. `_HLS_part` without `_HLS_msn` is 400. | `muxer_stream.go` `handleMediaPlaylist` | M1 |
@@ -33,8 +33,9 @@ does not rely on that). `PART-TARGET` (4.4.3.7) is treated like
 refused a Larix stream that broke all three (`PART-TARGET` climbed to
 0.534 s while its parts stayed 0.2 s; `docs/interop.md`); which one it
 tripped on is not known.
-`scripts/check-playlist.py` and `sapflow_hls::playlist::check_part_rules`
-check exactly these three things against the rendered playlist.
+`scripts/check-playlist.py` and `sapflow_hls::playlist::RuleCheck` check
+these three things, and the target-duration and discontinuity rules below,
+against every rendered playlist.
 
 How sapflow keeps it (`sapflow_hls::PartTiming`, `Muxer::place_video`):
 
@@ -75,6 +76,71 @@ How sapflow keeps it (`sapflow_hls::PartTiming`, `Muxer::place_video`):
   start at or after its end move to the next part, so a part's audio
   covers its own time (to within one AAC frame, which is placed only when
   the next arrives).
+
+## Target duration and breaks
+
+RFC 8216bis 4.4.3.1 (from memory, not re-read here): every segment's
+`EXTINF`, rounded to the nearest integer, must be at most
+`EXT-X-TARGETDURATION`, and the target must not change. On 2026-10-21 a
+Larix stream with Wi-Fi switched off briefly kept the part rules but left
+a 6 s segment, so sapflow raised the target from 2 to 6 and Safari
+stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
+`Muxer::break_stream`):
+
+- **Fixed by the first segment.** The first segment follows the encoder's
+  keyframe interval; the target is its duration rounded, plus one second
+  of headroom for a keyframe that comes a little late (Larix's 2 s
+  keyframes give 3). A segment may then run to just under the target plus
+  half a second (it rounds to the target at most). The failure mode: an
+  early extra keyframe (a scene cut) makes the first segment short, the
+  target is then too small for the encoder's interval, and every later
+  segment is cut short as below. The log line naming the target says to
+  set the keyframe interval to at most it.
+- **A break instead of a long segment.** A segment ends early (a break)
+  when the gap between two video frames is over a second either way (a
+  network drop, an encoder restarting its clock), or when it is about to
+  run past the limit because no keyframe came in time. A segment cannot
+  be cut on a frame that is not a keyframe: the multivariant playlist
+  declares `EXT-X-INDEPENDENT-SEGMENTS`, and after a drop the frames that
+  follow may reference lost ones. So video is dropped until the next
+  keyframe. Gaps of a second or less are clamped into a held frame instead
+  (Part timing, above): one second is under the target's headroom, so one
+  such stall cannot by itself push a segment past the limit, and the
+  length rule catches several.
+- **Output time carries on.** The keyframe that resumes the stream is
+  moved to the time the last segment ended, and everything after it, audio
+  included, by the same amount. Output timestamps therefore only move
+  forward with no hole, even across an encoder clock jumping back, and a
+  recording (one fMP4 file) plays and seeks straight through; its length is
+  the media kept.
+- **Marked as a discontinuity.** The segment after a break carries
+  `EXT-X-DISCONTINUITY`, before its `EXT-X-PROGRAM-DATE-TIME` and its
+  parts (never among them), because media was lost and the wall clock
+  jumped. `EXT-X-DISCONTINUITY-SEQUENCE` counts the marked segments that
+  have left the window, so each media sequence number keeps the same
+  discontinuity number from render to render. While the stream waits for
+  the keyframe there is no open segment: blocking requests for the next
+  segment, and for the part the preload hint names, wait (up to three
+  target durations, then 503), and the hinted part becomes the new
+  segment's first.
+- **Audio.** AAC from before the resuming keyframe is dropped, and an AAC
+  frame is never given a gap as its duration (a frame lasts 1024 samples;
+  anything over three frames' time becomes one).
+- **The first segment.** A break before the first segment is complete
+  starts the stream over: nothing has been served, and the targets should
+  come from a whole segment. The seven leading gap segments are only ever
+  at the start of a stream.
+- **Not handled here:** an SRT publisher silent for 5 s is dropped and the
+  stream ends; holding it across a longer drop is M7's grace period.
+
+What players should do at a break (expected, not yet watched): during a
+drop the playlist stops growing, so Safari and hls.js play out what they
+hold (about the part hold-back plus what was buffered) and then wait;
+when the stream resumes they cross the discontinuity, resetting their
+decoders, and carry on, a little further from live by about the time
+spent waiting. hls.js logs a change of discontinuity sequence and may jump
+forward to the live edge. A shorter stall (up to a second) shows as one
+frame held while audio plays on.
 
 ## mediamtx behaviour worth not copying
 
