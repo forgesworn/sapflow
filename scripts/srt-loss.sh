@@ -6,6 +6,7 @@
 #   SEEDS=3 LOSSES=random:10 LATENCIES=200 scripts/srt-loss.sh
 #   RECEIVERS=sapflow SAPFLOW_BIN=/path/to/sapflow scripts/srt-loss.sh
 #   RECEIVERS="old=/path/sapflow-old new=/path/sapflow-new libsrt" scripts/srt-loss.sh
+#   RECEIVERS="srt-rs own libsrt" scripts/srt-loss.sh   # both SRT implementations
 #   scripts/srt-loss.sh --summarise scratch/srt-loss/<run>/results.tsv
 #
 # A 30 s test clip (ffmpeg lavfi: 720p30 and a tone, 2.5 Mbit/s H.264 with 1 s
@@ -37,7 +38,9 @@
 #                       srt-loss-proxy --loss values; burst:P,L is bursty loss
 #                       (Gilbert-Elliott), P percent on average, L packets a burst
 #   LATENCIES="2000 200"   SRT latency in ms, set on sender and receiver
-#   RECEIVERS="sapflow libsrt"   `NAME=binary` runs another sapflow build as NAME
+#   RECEIVERS="sapflow libsrt"   `NAME=binary` runs another sapflow build as NAME;
+#                       a NAME starting with `own` runs sapflow with
+#                       SAPFLOW_SRT_IMPL=own (our SRT), any other with srt-rs
 #   CLIP_SECS=30  DELAY_MS=30 (one way)  JOBS=3 (trials at once)
 #   SAPFLOW_BIN, PROXY_BIN   default: release builds of this checkout
 set -euo pipefail
@@ -133,7 +136,8 @@ if [ "${1:-}" = "--trial" ]; then
   trap cleanup EXIT
 
   if [ "$kind" = sapflow ]; then
-    SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:$hp SAPFLOW_SRT_ADDR=127.0.0.1:$sp \
+    impl=srt-rs; [ "${recv#own}" = "$recv" ] || impl=own
+    SAPFLOW_SRT_IMPL=$impl SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:$hp SAPFLOW_SRT_ADDR=127.0.0.1:$sp \
       SAPFLOW_RTMP_ADDR=off SAPFLOW_RECORDINGS="$d/rec" RUST_LOG=warn \
       "$bin" > "$d/rcv.log" 2>&1 &
     rp=$!; target=$sp; sid="&streamid=publish:live/event-loss"
