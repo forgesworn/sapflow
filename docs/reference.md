@@ -133,7 +133,9 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
 - **Not handled here:** an SRT publisher silent for 5 s is dropped and the
   stream ends; holding it across a longer drop is M7's grace period.
 
-What players should do at a break (expected, not yet watched): during a
+What players should do at a break (Safari on macOS seen to carry on
+through two Larix Wi-Fi drops of 3.1 and 4.4 s on 2026-10-21, judged by
+eye; hls.js not yet watched): during a
 drop the playlist stops growing, so Safari and hls.js play out what they
 hold (about the part hold-back plus what was buffered) and then wait;
 when the stream resumes they cross the discontinuity, resetting their
