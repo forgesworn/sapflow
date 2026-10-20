@@ -15,24 +15,57 @@ use super::{
     DataPacketAction, DataPacketError,
 };
 
+// sapflow patch: a lost packet is asked for again every RTT (was 2, 3, 4...
+// RTTs), as libsrt does; needed once senders stop resending on their own
+// timer (see SUPPORTED in packet/control/srt.rs). Once its delivery deadline is
+// less than NEAR_DEADLINE_RTTS round trips away it is asked for every quarter
+// RTT, so a lost request or retransmission can be retried before the deadline.
+// Never more than MAX_REQUESTS times, and not once a retransmission could no
+// longer arrive in time, so NAK traffic stays bounded.
+const NEAR_DEADLINE_RTTS: u32 = 3;
+const MAX_REQUESTS: u32 = 8;
+
 #[derive(Debug)]
 pub struct LostPacket {
     data_sequence_number: SeqNumber,
     feedback_time: Instant,
-    k: i32,
+    /// sapflow patch: when a retransmission has to arrive by, as far as the
+    /// receiver can tell: the delivery time of the packet that showed this one
+    /// was missing (this one was sent no later, so it is a little generous).
+    deadline: Instant,
+    /// sapflow patch: how many times this packet has been asked for. Replaces
+    /// the upstream back-off counter `k`.
+    requests: u32,
 }
 
 impl LostPacket {
-    pub fn new(data_sequence_number: SeqNumber, feedback_time: Instant) -> Self {
+    /// A packet found missing when the report that revealed it is sent, so
+    /// that report counts as the first request.
+    pub fn new(data_sequence_number: SeqNumber, feedback_time: Instant, deadline: Instant) -> Self {
         Self {
             data_sequence_number,
             feedback_time,
-            // sapflow patch: re-request a lost packet every RTT (was 2, 3, 4...
-            // RTTs), as libsrt does; needed once senders stop resending on
-            // their own timer (see SUPPORTED in packet/control/srt.rs).
-            k: 1,
+            deadline,
+            requests: 1,
         }
     }
+
+    /// sapflow patch: whether to ask for this packet again now.
+    fn ready_for_feedback(&self, now: Instant, rtt_mean: TimeSpan) -> bool {
+        let rtt = Duration::from_micros(u64::try_from(rtt_mean.as_micros()).unwrap_or(0));
+        let remaining = self.deadline.saturating_duration_since(now);
+        // A retransmission takes a round trip: skip it if it cannot make it.
+        if self.requests >= MAX_REQUESTS || remaining < rtt / 2 {
+            return false;
+        }
+        let interval = if remaining < rtt * NEAR_DEADLINE_RTTS {
+            rtt / 4
+        } else {
+            rtt
+        };
+        now > self.feedback_time + interval
+    }
+
 }
 
 #[derive(Debug)]
@@ -94,9 +127,7 @@ impl BufferPacket {
         rtt_mean: TimeSpan,
     ) -> Option<&mut LostPacket> {
         match self {
-            BufferPacket::Lost(lost) if now > lost.feedback_time + (rtt_mean * lost.k) => {
-                Some(lost)
-            }
+            BufferPacket::Lost(lost) if lost.ready_for_feedback(now, rtt_mean) => Some(lost),
             _ => None,
         }
     }
@@ -329,8 +360,8 @@ impl ReceiveBuffer {
         rtt_mean: TimeSpan,
     ) -> Option<CompressedLossList> {
         // Search the receiver's loss list, find out all those sequence numbers
-        // whose last feedback time is k*RTT before, where k is initialized as 2
-        // and increased by 1 each time the number is fed back. Compress
+        // that are due another request (see `LostPacket::ready_for_feedback`;
+        // upstream waited k*RTT, k starting at 2 and growing). Compress
         // (according to section 6.4) and send these numbers back to the sender
         // in an NAK packet.
         let loss_list = self
@@ -338,8 +369,8 @@ impl ReceiveBuffer {
             .range_mut(self.lost_list_index()..)
             .filter_map(|p| p.lost_ready_for_feedback_mut(now, rtt_mean))
             .map(|lost| {
-                // increment k and change feedback time, returning sequence numbers
-                // sapflow patch: no back-off (`lost.k += 1` removed).
+                // sapflow patch: count the request instead of backing off.
+                lost.requests += 1;
                 lost.feedback_time = now;
                 lost.data_sequence_number
             });
@@ -400,7 +431,9 @@ impl ReceiveBuffer {
                 buffer_required,
             })
         } else {
-            self.append_lost_packets(now, &lost);
+            // sapflow patch: the lost packets are due when this one is.
+            let deadline = self.remote_clock.instant_from(data.timestamp) + self.tsbpd_latency;
+            self.append_lost_packets(now, &lost, deadline);
             self.append_data(data);
             Ok(DataPacketAction::ReceivedWithLoss(lost.into()))
         }
@@ -435,10 +468,10 @@ impl ReceiveBuffer {
         self.buffer.push_back(BufferPacket::Received(data));
     }
 
-    fn append_lost_packets(&mut self, now: Instant, lost: &Range<SeqNumber>) {
+    fn append_lost_packets(&mut self, now: Instant, lost: &Range<SeqNumber>, deadline: Instant) {
         let lost_count = lost.end - lost.start;
         for i in 0..lost_count {
-            let loss = LostPacket::new(lost.start + i, now);
+            let loss = LostPacket::new(lost.start + i, now, deadline);
             self.buffer.push_back(BufferPacket::Lost(loss));
         }
     }
@@ -1227,6 +1260,92 @@ mod receive_buffer {
         assert!(buf.prepare_loss_list(start + ms(150), rtt).is_none());
         assert!(buf.prepare_loss_list(start + ms(202), rtt).is_some());
         assert!(buf.prepare_loss_list(start + ms(303), rtt).is_some());
+    }
+
+    // sapflow patch: deadline-aware re-requests. Packet 6 is lost; packet 7,
+    // sent at `trigger_ts`, reveals it, so its deadline is that of packet 7.
+    fn lost_one(tsbpd: Duration, start: Instant, trigger_ts: TimeStamp) -> ReceiveBuffer {
+        let mut buf = ReceiveBuffer::new(start, tsbpd, true, SeqNumber(5), PacketCount(8192));
+        for (seq, timestamp) in [(5, TimeStamp::from_micros(0)), (7, trigger_ts)] {
+            let _ = buf.push_packet(
+                start,
+                DataPacket {
+                    seq_number: SeqNumber(seq),
+                    timestamp,
+                    ..basic_pack()
+                },
+            );
+        }
+        buf
+    }
+
+    #[test]
+    fn re_requests_come_faster_as_the_deadline_nears() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let rtt = TimeSpan::from_millis(60);
+
+        // Deadline 200 ms out: within 3 RTTs (180 ms) of it, every quarter RTT.
+        let mut near = lost_one(ms(200), start, TimeStamp::from_micros(0));
+        assert!(near.prepare_loss_list(start + ms(10), rtt).is_none());
+        assert!(near.prepare_loss_list(start + ms(25), rtt).is_some());
+        assert!(near.prepare_loss_list(start + ms(35), rtt).is_none());
+        assert!(near.prepare_loss_list(start + ms(41), rtt).is_some());
+        assert!(near.prepare_loss_list(start + ms(57), rtt).is_some());
+
+        // Deadline 2 s out: still every RTT.
+        let mut far = lost_one(Duration::from_secs(2), start, TimeStamp::from_micros(0));
+        assert!(far.prepare_loss_list(start + ms(25), rtt).is_none());
+        assert!(far.prepare_loss_list(start + ms(61), rtt).is_some());
+        assert!(far.prepare_loss_list(start + ms(100), rtt).is_none());
+        assert!(far.prepare_loss_list(start + ms(122), rtt).is_some());
+    }
+
+    #[test]
+    fn stops_asking_when_a_retransmission_cannot_arrive_in_time() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let rtt = TimeSpan::from_millis(60);
+        let mut buf = lost_one(ms(200), start, TimeStamp::from_micros(0));
+        // 31 ms left: just over half an RTT, still worth asking.
+        assert!(buf.prepare_loss_list(start + ms(169), rtt).is_some());
+        // 24 ms left, and later: under half an RTT.
+        assert!(buf.prepare_loss_list(start + ms(176), rtt).is_none());
+        assert!(buf.prepare_loss_list(start + ms(190), rtt).is_none());
+        // Past the deadline there is no underflow either.
+        assert!(buf.prepare_loss_list(start + ms(500), rtt).is_none());
+    }
+
+    #[test]
+    fn asks_for_a_packet_at_most_max_requests_times() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let rtt = TimeSpan::from_millis(60);
+        let mut buf = lost_one(ms(200), start, TimeStamp::from_micros(0));
+        // Ten chances 16 ms apart, all inside the window where it is due.
+        let asked = (0..10)
+            .filter(|i| {
+                buf.prepare_loss_list(start + ms(20 + 16 * i), rtt)
+                    .is_some()
+            })
+            .count();
+        // The report that revealed the loss was the first request.
+        assert_eq!(asked, (MAX_REQUESTS - 1) as usize);
+    }
+
+    #[test]
+    fn deadline_is_that_of_the_packet_that_revealed_the_loss() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let rtt = TimeSpan::from_millis(60);
+        // Packet 7 was sent 50 ms after packet 5, so the deadline is 350 ms.
+        let mut buf = lost_one(ms(300), start, TimeStamp::from_micros(50_000));
+        assert!(buf.prepare_loss_list(start + ms(140), rtt).is_some());
+        // 190 ms left: not near yet, so not asked again for a full RTT. (With
+        // the deadline of packet 5, 300 ms, it would be near and asked now.)
+        assert!(buf.prepare_loss_list(start + ms(160), rtt).is_none());
+        // 175 ms left: near, asked every quarter RTT.
+        assert!(buf.prepare_loss_list(start + ms(175), rtt).is_some());
     }
 
 }
