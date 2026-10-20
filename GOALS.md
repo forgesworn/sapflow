@@ -14,10 +14,11 @@ mediamtx in production before the numbers favour it and the user decides.
 - **Only what the stage needs.** One way in, one way out, recording, one
   callback. No RTSP, WebRTC, transcoding, playback API or config file the size
   of mediamtx's.
-- **Do not hand-roll hostile-input parsers** without a reason. SRT, MPEG-TS
-  and H.264 bitstream parsing come from maintained crates. RTMP is the
-  exception: the maintained choice was not, so sapflow carries its own
-  publish-only implementation (see Decisions). Our other code is glue,
+- **Do not hand-roll hostile-input parsers** without a reason. MPEG-TS and
+  H.264 bitstream parsing come from maintained crates. The ingest protocols
+  are the exception: no maintained Rust choice exists for RTMP or SRT, so
+  sapflow carries its own, narrow to what the stage needs (see Decisions),
+  and proves each against the reference implementation before it ships. Our other code is glue,
   policy and the LL-HLS playlist logic. Anything we parse ourselves gets a
   fuzz target before it faces the internet.
 - **Private by default.** No outbound calls except the configured callback. Do
@@ -128,10 +129,61 @@ buffer and segment caps, free disk for recording, rate-limited refusal logs.
 fuzzing, SRT after the handshake). The `Dockerfile` builds a
 38.5 MB arm64 image that runs and serves a stream.
 
+### M6 Our own SRT (MIT)
+
+srt-rs is unmaintained (last release 2024-05; its authors say they do not
+support it and it never tracked the spec), so sapflow already maintains a
+patched copy. Replace it with `sapflow-srt`: our own MIT implementation of
+what the stage uses, written from the SRT specification
+(draft-sharabayko-srt) and observed wire behaviour. No code is copied from
+srt-rs (Apache-2.0) or libsrt (MPL-2.0).
+
+Scope: live mode, listener, one publisher per connection, receiving;
+handshake v5 (and v4 if an encoder needs it), stream id, loss reports
+and periodic NAKs, too-late packet drop, TSBPD delivery, ACK/ACKACK and RTT,
+keepalive and shutdown. Sans-IO (bytes and time in, packets and events
+out), no async runtime, `unsafe` forbidden, so it builds for iOS and Android.
+Out of scope: file mode, rendezvous, caller mode, groups and bonding,
+packet filters (FEC), sending (a later milestone, for phones).
+
+- **M6a, receive:** unencrypted, behind a switch (`SAPFLOW_SRT_IMPL`), with
+  `srt-protocol` still the default.
+- **M6b, encryption:** SRT passphrase (AES key wrap, AES-CTR), so the
+  credential no longer travels in clear.
+- **M6c, switch:** make it the default, remove `vendor/srt-protocol`,
+  `srt-tokio` and their dependencies.
+
+**Done when** (all measured, not asserted):
+- fuzz targets for the packet parser and the connection, clean for 20
+  minutes each, regressions committed;
+- `scripts/smoke.sh` and v4v's SRT gate (`e2e:ingest-srt-sapflow`) pass;
+- ffmpeg, `srt-live-transmit` (libsrt 1.5), OBS and Larix publish, with
+  and without a passphrase;
+- `scripts/srt-loss.sh` over at least 6 seeds: unrecovered packets and
+  retransmission overhead within run-to-run spread of libsrt, or better, at
+  every condition; no worse than the patched `srt-protocol`;
+- CPU and memory per stream no worse than `srt-protocol` (the profiling
+  harness);
+- `srt-protocol`'s known faults absent by design: no panic on any input, a
+  per-process SYN cookie key (T16), no per-packet `getsockname`, no idle
+  timer tick.
+
+### M7 Stage resilience and production readiness
+
+- An encoder that drops (phone locked, network switch) and returns within a
+  grace period continues the same stream with `EXT-X-DISCONTINUITY`, and
+  hls.js and Safari keep playing; agree the split with v4v's own hold.
+- The stream-health callback reports keyframe interval, bitrate and audio,
+  so v4v Studio can tell a performer to set 1 s keyframes.
+- Measured on Linux behind Caddy: the wired 250 and 750 full-viewer run,
+  and glass-to-glass delay.
+- CI on the public repo: tests, clippy, fmt, short fuzz runs, nightly long
+  fuzzing.
+
 ### Later
 
-- `sapflow-core` for iOS and Android via UniFFI: SRT sending (go live from the
-  phone), relayswarm chunk verification, a native swarm peer.
+- `sapflow-core` and `sapflow-srt` for iOS and Android via UniFFI: SRT
+  sending (go live from the phone), relayswarm chunk verification, a native swarm peer.
 - relayswarm's signed segment commitments produced at the origin.
 - A second rendition.
 
@@ -158,6 +210,11 @@ fuzzing, SRT after the handshake). The `Dockerfile` builds a
   the v4v PR, and any move to production.
 - **2026-10-20, upstream:** no reports to `srt-rs` or `rml_rtmp`; our
   fixes live in `vendor/srt-protocol` and our own RTMP.
+
+- **2026-10-20, own SRT:** the user decided to replace srt-rs with our own
+  MIT implementation (M6), developed inside sapflow first, unencrypted
+  receive first and encryption before it becomes the default. This
+  supersedes "no SRT implementation of our own" above.
 
 ## Decisions owed by the user
 
