@@ -1,7 +1,8 @@
 //! Arbitrary frame timing into the LL-HLS muxer: decode-time steps, stalls,
 //! steps backwards, keyframes anywhere and audio in between. After every
-//! push the rendered playlist must keep Apple's part rules, and
-//! `PART-TARGET` must never change once set.
+//! push the rendered playlist must keep the rules `playlist::RuleCheck`
+//! holds it to: fixed `TARGETDURATION` and `PART-TARGET`, no `EXTINF` over
+//! the target, the part rules, consistent discontinuities.
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
@@ -26,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut m = Muxer::new(MuxerConfig::default(), video, Some(aac));
     let (mut dts, mut audio) = (0i64, 0i64);
-    let mut target: Option<String> = None;
+    let mut rules = playlist::RuleCheck::default();
     // Each record: a step in ticks (2 bytes), then flags: bit 0 keyframe,
     // bit 1 the step is a stall (x 16), bit 2 the step goes backwards,
     // bits 3-5 AAC frames before the frame, bits 6-7 a composition offset.
@@ -55,12 +56,8 @@ fuzz_target!(|data: &[u8]| {
             continue;
         }
         let pl = playlist::media(&m, "p");
-        match playlist::check_part_rules(&pl) {
-            Ok(t) => match &target {
-                Some(first) => assert_eq!(first, &t, "PART-TARGET changed"),
-                None => target = Some(t),
-            },
-            Err(e) => panic!("{e}\n{pl}"),
+        if let Err(e) = rules.check(&pl) {
+            panic!("{e}\n{pl}");
         }
     }
 });
