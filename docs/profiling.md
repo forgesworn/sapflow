@@ -317,3 +317,34 @@ less loaded machine (load average 10 to 24).
 - Whole-stream totals also came out lower (0.37% at 720p, 0.47% at 1080p,
   9.2% at 250 viewers), but by more than the RTMP saving, so most of that is
   the quieter machine, not the rewrite.
+
+## Own SRT against `srt-protocol` (2026-10-20, M6a)
+
+Whole-server CPU and memory with `ps`, not the profiler: a fresh server
+per run (release binary of commit 4722f34), one SRT stream from ffmpeg
+through `srt-live-transmit` (720p30 `testsrc2`, x264 `veryfast`
+`zerolatency` 2.5 Mbit/s CBR, AAC 128 kbit/s, `latency=2000`), no viewers.
+CPU time read 25 s after the stream became servable and again 60 s later;
+RSS read every second in that window. Runs alternated between the two
+implementations (`SAPFLOW_SRT_IMPL=own` and the default) on a shared
+machine, load average 7 to 13.
+
+| SRT | CPU, % of one core (4 runs) | Mean | RSS at the end of the window | Peak RSS |
+|-----|-----------------------------|-----:|-----------------------------:|---------:|
+| `srt-protocol` / `srt-tokio` | 0.90, 0.74, 0.72, 1.43 | 0.95 (median 0.82) | 10.0 to 16.5 MB | 12.6 to 16.8 MB |
+| own (`sapflow-srt`) | 0.77, 0.84, 0.74, 0.67 | 0.76 | 9.6 to 14.8 MB | 14.5 to 15.3 MB |
+
+- **No worse, within this noise.** Both sit where the M4 profile put an
+  SRT stream (0.90 to 1.07%); `ps` resolves 0.01 s in 60 s, and the spread
+  between runs of one implementation is as large as the gap between them.
+  Memory is mostly the muxer's segments and parts; the receive buffer for
+  2 s at this rate is about 0.7 MB in either.
+- **Idle, no connections, 300 s:** `own` used 0.00 s of CPU and the process
+  made no context switches; with `srt-tokio` the server used 0.09 s
+  (0.03% of a core) and woke about 23 times a second. `sapflow-srt` sets no
+  timer without a connection (`Listener::poll_timeout` is `None`; unit
+  tested and asserted by the `own_srt_listener` fuzz target).
+- `srt-tokio` asked the kernel for the socket's own address on every packet
+  (`getsockname`, above); the `own` path receives with `recv_from` on one
+  socket and does not.
+- Not measured: a profiler breakdown of the `own` path, and 1080p.

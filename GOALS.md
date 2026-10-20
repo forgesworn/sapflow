@@ -168,6 +168,50 @@ packet filters (FEC), sending (a later milestone, for phones).
   per-process SYN cookie key (T16), no per-packet `getsockname`, no idle
   timer tick.
 
+**Status (2026-10-20): M6a done.** `crates/sapflow-srt` serves SRT with
+`SAPFLOW_SRT_IMPL=own` (in `--help`); `srt-tokio` stays the default. Live
+mode, listener, receive: version 5 handshake with SYN cookies keyed per
+process, stream id, latency negotiation, TSBPD with drift handling and
+too-late drop, ACK/ACKACK/RTT, light ACKs, immediate and repeated NAKs,
+keepalive, shutdown, idle timeout, connection, buffer, loss-list and
+handshake-rate limits; encrypted callers refused (`REJ_UNSECURE`). The
+server shares admission and media code with the `srt-tokio` path. Each
+proof:
+
+- Unit tests per layer (54 in the crate) and a differential test: three
+  recorded publishes (`srt-live-transmit`; ffmpeg 8.1.2 with libsrt 1.5.3;
+  `srt-live-transmit` at 200 ms under 20% loss) replayed through
+  `srt-protocol`, as a black box, and through ours. Identical payloads
+  without loss; under loss ours delivers exactly what libsrt's receiver
+  delivered in the recorded session, and `srt-protocol` two packets fewer
+  (it discards the in-time packet after one it skips as too late; a fault
+  in the default path, recorded in `docs/reference.md`).
+- Fuzzing, 20 minutes each with overflow checks: `own_srt_packet` 207
+  million inputs and `own_srt_listener` 4.2 million (whole sessions, after
+  handshakes too); no crash, so no regressions to commit. Earlier
+  5-minute runs (45 million and 1.8 million) were clean too.
+- `SRT_IMPLS="srt-rs own" scripts/smoke.sh` passes with both; v4v's SRT
+  gate (`npm run e2e:ingest-srt-sapflow`) passes with
+  `SAPFLOW_SRT_IMPL=own` set in the environment (no v4v change needed).
+- `scripts/srt-loss.sh`, 6 seeds, 8 conditions: within run-to-run spread
+  of libsrt or better at every condition (lower overhead at 10% and 20%
+  random loss at 2000 ms, fewer packets unrecovered at 10% and 20% at
+  200 ms) and no worse than `srt-protocol` at any. The first run was 2
+  points worse than `srt-protocol` on overhead at 2000 ms; the cause
+  (re-requests racing retransmissions) and the fix are in
+  `docs/interop.md`.
+- CPU and memory per 720p stream level with `srt-protocol` within the noise
+  (0.76% against 0.95% of a core, 4 runs each); idle, no timer and no
+  context switches at all in 300 s (`docs/profiling.md`).
+- By design: no panicking constructs outside tests (denied by lint), the
+  per-process cookie key (T16), one `recv_from` socket with no per-packet
+  `getsockname`, no timer without a connection.
+
+Still open for M6 as a whole: OBS and Larix against `own` (not tried; they
+need the encoder hardware or app), anything with a passphrase (M6b), and
+the version 4 handshake, which no encoder tested so far needed (every one
+used version 5).
+
 ### M7 Stage resilience and production readiness
 
 - An encoder that drops (phone locked, network switch) and returns within a

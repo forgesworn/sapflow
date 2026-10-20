@@ -12,6 +12,9 @@ is tried.
 | 2026-10-20 | OBS 32.1.2 | RTMP | OBS's default x264 (250-frame keyframes, B-frames) | Servable in 9.3 s; one 8.33 s GOP per segment, target duration 8; decodes cleanly |
 | 2026-10-20 | Larix Broadcaster (iPhone) | RTMP | Larix defaults (H.264 Baseline 720p30, AAC mono, 2 s keyframes); credentials in the URL | Servable in 1.0 s; 2 s segments decode cleanly, A/V start within 7 ms |
 | 2026-10-20 | Larix Broadcaster (iPhone) | SRT | Larix defaults, credentials in the `streamid`, 2 s latency | Servable in 4.5 s; 24 segments decode cleanly; 4 late packets dropped once over Wi-Fi (one segment 59 frames of 60) |
+| 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) | SRT, `SAPFLOW_SRT_IMPL=own` | `SRT_IMPLS="srt-rs own" scripts/smoke.sh` | Pass with both implementations (refusals 400, 401, 409 included) |
+| 2026-10-20 | ffmpeg 8.1.2 (libsrt 1.5.3, in Docker) | SRT, `SAPFLOW_SRT_IMPL=own` | 720p30 x264 2.5 Mbit/s, `latency=2000000` | Accepted at 2000 ms latency, servable in 3.5 s, clean shutdown and unpublish |
+| 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) with `passphrase=` | SRT, `SAPFLOW_SRT_IMPL=own` | 200 ms | Refused in the handshake: libsrt reports `ERROR:UNSECURE`, "Password required or unexpected" (encryption is M6b) |
 
 Output checked for the 1 s keyframe runs: H.264 High 1280x720 30 fps and
 AAC-LC 48 kHz stereo, 1 s segments, 200 ms parts, a keyframe at the start of
@@ -167,3 +170,107 @@ batches (libsrt at 20% and 200 ms was 2.2% unrecovered in one batch and 1.5%
 in another), so compare within a batch. A full run with four receivers takes
 about 40 minutes: `scripts/srt-loss.sh`, or `RECEIVERS="a=/path/sapflow-a
 libsrt"` to compare builds.
+
+## Our own SRT under packet loss (2026-10-20, M6a)
+
+The same harness and conditions as above, with three receivers: `own` is
+sapflow with `SAPFLOW_SRT_IMPL=own` (`sapflow-srt`), `srt-rs` the same
+binary on the patched `srt-protocol` (what was `current` above), and
+`libsrt` libsrt's `srt-live-transmit`. Six seeds per condition, receivers
+interleaved seed by seed, `RECEIVERS="srt-rs own libsrt" scripts/srt-loss.sh`.
+
+| Loss | Latency | Receiver | n | Retransmission overhead | Not recovered in time | Video delivered | Audio delivered | Decode messages |
+|------|--------:|----------|--:|------------------------:|----------------------:|----------------:|----------------:|----------------:|
+| 3% random | 2000 ms | srt-rs | 6 | 3.4% ± 0.1 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 3% random | 2000 ms | own | 6 | 3.3% ± 0.1 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 3% random | 2000 ms | libsrt | 6 | 3.3% ± 0.1 | 0.00% ± 0.00 | 100.02% ± 0.05 | 100.00% ± 0.00 | 74.5 ± 35.5 |
+| 10% random | 2000 ms | srt-rs | 6 | 11.9% ± 0.4 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | own | 6 | 11.6% ± 0.4 | 0.00% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | libsrt | 6 | 12.3% ± 0.5 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 89.0 ± 0.0 |
+| 20% random | 2000 ms | srt-rs | 6 | 26.5% ± 0.7 | 0.01% ± 0.01 | 99.85% ± 0.27 | 99.70% ± 0.50 | 1.3 ± 2.0 |
+| 20% random | 2000 ms | own | 6 | 25.7% ± 0.8 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 20% random | 2000 ms | libsrt | 6 | 27.6% ± 0.9 | 0.00% ± 0.01 | 100.04% ± 0.06 | 99.96% ± 0.09 | 60.0 ± 44.9 |
+| bursty 8% | 2000 ms | srt-rs | 6 | 10.0% ± 1.2 | 0.08% ± 0.12 | 99.77% ± 0.29 | 99.80% ± 0.31 | 1.7 ± 1.9 |
+| bursty 8% | 2000 ms | own | 6 | 9.6% ± 1.1 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| bursty 8% | 2000 ms | libsrt | 6 | 10.1% ± 1.0 | 0.00% ± 0.00 | 100.04% ± 0.06 | 100.00% ± 0.00 | 60.0 ± 44.9 |
+| 3% random | 200 ms | srt-rs | 6 | 4.0% ± 0.4 | 0.02% ± 0.01 | 99.88% ± 0.00 | 99.90% ± 0.24 | 2.5 ± 1.4 |
+| 3% random | 200 ms | own | 6 | 3.4% ± 0.2 | 0.00% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 3% random | 200 ms | libsrt | 6 | 3.5% ± 0.2 | 0.01% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 89.3 ± 0.8 |
+| 10% random | 200 ms | srt-rs | 6 | 13.9% ± 1.0 | 0.20% ± 0.04 | 99.00% ± 0.47 | 99.01% ± 0.61 | 11.7 ± 1.8 |
+| 10% random | 200 ms | own | 6 | 12.4% ± 0.7 | 0.13% ± 0.02 | 99.90% ± 0.17 | 99.60% ± 0.72 | 8.5 ± 3.0 |
+| 10% random | 200 ms | libsrt | 6 | 12.4% ± 0.4 | 0.19% ± 0.03 | 100.00% ± 0.00 | 99.80% ± 0.30 | 100.0 ± 2.4 |
+| 20% random | 200 ms | srt-rs | 6 | 28.1% ± 1.1 | 1.27% ± 0.18 | 92.03% ± 2.00 | 91.99% ± 3.12 | 101.5 ± 14.1 |
+| 20% random | 200 ms | own | 6 | 26.1% ± 0.7 | 1.00% ± 0.08 | 99.19% ± 0.34 | 98.80% ± 1.19 | 65.3 ± 12.4 |
+| 20% random | 200 ms | libsrt | 6 | 27.2% ± 1.0 | 1.40% ± 0.10 | 99.98% ± 0.05 | 98.12% ± 0.97 | 174.2 ± 6.3 |
+| bursty 8% | 200 ms | srt-rs | 6 | 11.1% ± 1.7 | 0.93% ± 0.51 | 98.69% ± 0.98 | 98.81% ± 1.46 | 10.3 ± 6.3 |
+| bursty 8% | 200 ms | own | 6 | 9.7% ± 1.2 | 0.83% ± 0.44 | 99.48% ± 0.52 | 99.60% ± 0.61 | 9.2 ± 8.3 |
+| bursty 8% | 200 ms | libsrt | 6 | 10.2% ± 0.8 | 0.87% ± 0.37 | 99.94% ± 0.17 | 99.64% ± 0.45 | 66.8 ± 46.0 |
+
+Each sapflow receiver minus libsrt, with a Welch t statistic over the seeds
+(with 6 seeds, |t| below about 2.3 is noise):
+
+| Loss | Latency | Receiver | Overhead, points | t | Not recovered, points | t | Video delivered, points | t | Decode messages | t |
+|------|--------:|----------|-----------------:|--:|----------------------:|--:|------------------------:|--:|----------------:|--:|
+| 3% random | 2000 ms | srt-rs | +0.0 | 0.6 | +0.00 | - | -0.02 | -1.0 | -74.5 | -5.1 |
+| 3% random | 2000 ms | own | -0.1 | -0.9 | +0.00 | - | -0.02 | -1.0 | -74.5 | -5.1 |
+| 10% random | 2000 ms | srt-rs | -0.4 | -1.7 | +0.00 | - | +0.00 | - | -89.0 | - |
+| 10% random | 2000 ms | own | -0.8 | -3.0 | +0.00 | 1.0 | +0.00 | - | -89.0 | - |
+| 20% random | 2000 ms | srt-rs | -1.0 | -2.2 | +0.01 | 1.3 | -0.19 | -1.7 | -58.7 | -3.2 |
+| 20% random | 2000 ms | own | -1.8 | -3.8 | -0.00 | -1.0 | -0.04 | -1.6 | -60.0 | -3.3 |
+| bursty 8% | 2000 ms | srt-rs | -0.1 | -0.2 | +0.08 | 1.6 | -0.27 | -2.2 | -58.3 | -3.2 |
+| bursty 8% | 2000 ms | own | -0.5 | -0.9 | +0.00 | - | -0.04 | -1.6 | -60.0 | -3.3 |
+| 3% random | 200 ms | srt-rs | +0.5 | 3.0 | +0.01 | 1.3 | -0.12 | - | -86.8 | -132.8 |
+| 3% random | 200 ms | own | -0.0 | -0.3 | -0.01 | -1.5 | +0.00 | - | -89.3 | -268.0 |
+| 10% random | 200 ms | srt-rs | +1.6 | 3.8 | +0.00 | 0.2 | -1.00 | -5.3 | -88.3 | -71.9 |
+| 10% random | 200 ms | own | +0.0 | 0.1 | -0.06 | -4.5 | -0.10 | -1.4 | -91.5 | -57.7 |
+| 20% random | 200 ms | srt-rs | +0.9 | 1.4 | -0.13 | -1.5 | -7.95 | -9.7 | -72.7 | -11.5 |
+| 20% random | 200 ms | own | -1.1 | -2.1 | -0.40 | -7.3 | -0.79 | -5.7 | -108.8 | -19.1 |
+| bursty 8% | 200 ms | srt-rs | +0.9 | 1.1 | +0.07 | 0.3 | -1.26 | -3.1 | -56.5 | -3.0 |
+| bursty 8% | 200 ms | own | -0.5 | -0.8 | -0.04 | -0.2 | -0.47 | -2.1 | -57.7 | -3.0 |
+
+What it shows (the binary was commit 4722f34; the machine was shared, load
+average between about 8 and 17 when checked):
+
+- **`own` is no worse than libsrt anywhere and no worse than srt-rs
+  anywhere.** Retransmission overhead is level with libsrt's or lower:
+  0.8 points lower at 10% random and 2000 ms (t -3.0), 1.8 lower at 20%
+  random and 2000 ms (t -3.8), 1.1 lower at 20% random and 200 ms (t -2.1),
+  level within noise at every other condition. It is at or below srt-rs's
+  overhead at every condition.
+- **At 200 ms it leaves fewer packets unrecovered than libsrt** at 10% and
+  20% random loss: 0.13% against 0.19% (t -4.5) and 1.00% against 1.40%
+  (t -7.3). Under bursts the two are level (0.83% against 0.87%). At 2000 ms
+  all three recover everything, apart from srt-rs's 0.08% under bursts.
+- **srt-rs delivers less video than `own` at 200 ms under loss** (92.0%
+  against 99.2% at 20% random) by more than its unrecovered packets
+  explain. The differential test found why: when srt-protocol skips a packet
+  as too late it discards the next one too, even one that arrived in time
+  (`docs/reference.md`). `own` drops only the packets that are missing.
+- Video and audio delivered and decode messages still compare sapflow
+  builds only: libsrt writes damaged streams out as they are.
+
+Limits as above: one sender (libsrt 1.5.4), one clip, loopback with an
+emulated 60 ms round trip and independent loss both ways, a shared machine.
+
+How it got there:
+
+- **The first full run failed "no worse than srt-rs" at 2000 ms.** `own`
+  asked again for a loss exactly one RTT after the last request, and its
+  retransmission overhead was 28.9% ± 0.5 against srt-rs's 26.7% ± 0.7 at
+  20% random loss, and 12.2% ± 1.2 against 9.9% ± 0.9 (libsrt 10.2% ± 1.1,
+  t 3.0) under bursts. At 200 ms it was already level with libsrt or
+  better.
+- **Why:** a bursty 2000 ms session recorded between the loss proxy and each
+  receiver (seed 1, 15 s) showed `own` asking twice for 115 of 329 losses
+  against srt-rs's 41 of 320. The retransmission arrived a median 63 ms
+  after the first request (90th percentile 64 ms); `own`'s RTT estimate was
+  63.6 ms with a variance of 0.6 ms, so its second request went out just
+  before the packet it asked for arrived, and the libsrt sender sent it
+  again. srt-rs's estimate on the same link reads about 70 ms, which leaves
+  it a margin.
+- **Fix:** ask again after RTT + 4 x RTTVar (the specification's allowance
+  for a late but normal round trip), keeping the quarter-RTT re-requests
+  near the deadline. On a 4-seed check at 2000 ms that brought overhead to
+  25.9% ± 0.6 at 20% random (srt-rs 26.9% ± 0.6, libsrt 27.5% ± 0.8) and
+  9.3% ± 1.2 under bursts (9.4% ± 1.2, 10.4% ± 1.4), with 200 ms unchanged.
+  A wider margin (at least RTT/8) measured the same and was not kept.

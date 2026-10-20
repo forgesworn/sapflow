@@ -40,7 +40,8 @@ Pinned in the crates' `Cargo.toml`. These are decisions the user may revisit.
 | Need | Crate | Notes |
 |------|-------|-------|
 | Async runtime, HTTP | `tokio` 1.54, `axum` 0.8.9 | `hyper-util` legacy client for the callback, no `reqwest` |
-| SRT | `srt-tokio` 0.4.4 (pure Rust) | Last release 2024-05. Builds on Rust 1.94 and tokio 1.54, interoperates with libsrt's `srt-live-transmit`, and exposes the stream id before accept, so publishers are refused in the handshake. Risks: unmaintained upstream, and `srt-protocol` has a `panic!` on one malformed-handshake encode path (M5: fuzz it, or move to libsrt bindings). |
+| SRT, our own (M6a) | `sapflow-srt` | Live-mode receiver, sans-IO, MIT, no dependencies; written from draft-sharabayko-srt-01 and recorded sessions (findings below). Serves the port with `SAPFLOW_SRT_IMPL=own`; encrypted callers refused until M6b. |
+| SRT, the default until M6c | `srt-tokio` 0.4.4 (pure Rust) | Last release 2024-05. Builds on Rust 1.94 and tokio 1.54, interoperates with libsrt's `srt-live-transmit`, and exposes the stream id before accept, so publishers are refused in the handshake. Risks: unmaintained upstream, and `srt-protocol` has a `panic!` on one malformed-handshake encode path (M5: fuzz it, or move to libsrt bindings). |
 | SRT parsing | `srt-protocol` 0.4.4, vendored and patched | Fuzzing found that one unauthenticated datagram crashed the server; fixes and the reasons are in `vendor/srt-protocol/PATCHES.md`. |
 | MPEG-TS demux | `mpeg2ts` 0.6.1 | Fed one 188-byte packet at a time from our buffer (`sapflow_hls::ingest`), because its reader treats some stream errors as fatal and stops at end of input. |
 | H.264 | `h264-reader` 0.9.0 | Annex B splitting and SPS parsing. |
@@ -59,7 +60,9 @@ Our own parsing is the SRT stream id, the RTMP stream key, the chunk file
 names, the `_HLS_msn`/`_HLS_part` query, the FLV video and audio tag headers
 (5 and 2 bytes), the AudioSpecificConfig (2 bytes) and NAL length prefixes,
 all small and unit-tested, and, since 2026-10-20, the whole RTMP protocol
-(publish only: `sapflow_hls::rtmp`). Each has a fuzz target.
+(publish only: `sapflow_hls::rtmp`) and, with `SAPFLOW_SRT_IMPL=own`, the
+whole SRT receiver (`sapflow-srt`: every packet type, the handshake and its
+extensions, loss lists). Each has a fuzz target.
 
 ### RTMP handshake findings (2026-10-20)
 
@@ -77,6 +80,64 @@ all small and unit-tested, and, since 2026-10-20, the whole RTMP protocol
   original form (S2 echoes C1). C2 is not checked, as in nginx-rtmp,
   mediamtx and rml_rtmp. Larix and vMix are untested; both are known to
   work with nginx-rtmp and mediamtx, which answer the same way.
+
+### SRT wire findings (2026-10-20)
+
+From draft-sharabayko-srt-01 and sessions recorded through a UDP relay:
+libsrt 1.5.4 (`srt-live-transmit`) as caller and listener, and ffmpeg 8.1.2
+with libsrt 1.5.3 (in Docker) as caller. Marked **observed** where what
+real peers do differs from, or is not in, the specification; `sapflow-srt`
+follows the observed behaviour.
+
+- **Observed:** libsrt's listener answers the induction with the caller's
+  own socket id in the SRT Socket ID field (the specification says the
+  listener's) and echoes the caller's sequence number, MTU and window.
+  The caller's conclusion is sent to destination socket id 0, not to the
+  id from the induction reply. sapflow-srt echoes the caller's id too and
+  finds a conclusion by its source address and the caller's socket id.
+- **Observed:** the conclusion reply carries the listener's new socket id,
+  the cookie echoed, Extension Field 1 (HSRSP) and only the HSRSP
+  extension, not the stream id. libsrt advertises flags 0xBF there, which
+  includes PACKET_FILTER although no filter was agreed; sapflow-srt sends
+  0x3F (TSBPD both ways, CRYPT, TLPKTDROP, PERIODICNAK, REXMITFLG) and
+  version 1.5.0, which libsrt 1.5.3 and 1.5.4 accept.
+- The Peer IP Address field holds the address as 32-bit little-endian
+  words: 127.0.0.1 is `01 00 00 7f` (observed, matching the text). The
+  stream id is little-endian words too, its last word padded with zeros
+  inside the word (`read:live/event-x` ends `00 00 00 78`).
+- **Observed:** a refusal is a handshake whose type is the reason: 1000 and
+  up for the protocol's, 2000 plus an HTTP status for the application's,
+  which libsrt prints as `PREDEFINED:401`. srt-tokio sends 400, 401, 402
+  (overload, and our throttle), 404 and 409 for sapflow's refusals;
+  sapflow-srt sends the same.
+- **Observed:** a libsrt receiver sends a full ACK at most every 10 ms and
+  only when the acknowledged position has moved (the specification reads
+  as every 10 ms); keepalives every second when idle, both ways.
+- **Observed:** its first RTT sample replaces the starting 100 ms / 50 ms:
+  the ACK after the first ACKACK reports that sample as the RTT and half
+  of it as the variance. Later samples are smoothed as specified (7/8,
+  3/4). Its first ACKs report a link capacity of 1000 packets per second.
+- **Observed:** libsrt sends a NAK range for two consecutive lost numbers
+  (the specification describes ranges for more than two); sapflow-srt
+  does the same, and accepts either.
+- **Observed:** periodic NAK reports list every outstanding loss about
+  every (RTT + 4 x RTTVar) / 2, so libsrt asks again before a
+  retransmission could have arrived. sapflow-srt asks again per loss after
+  RTT + 4 x RTTVar, every quarter RTT (at most eight times) once the
+  delivery deadline is under three RTTs away, and never once a
+  retransmission could no longer arrive in time: the deadline-aware policy
+  `docs/interop.md` measured for the patched srt-protocol, with the
+  ordinary interval widened from one RTT, which raced retransmissions
+  already on their way (`docs/interop.md`).
+- **Observed:** ffmpeg (libsrt 1.5.3) sets the order flag on every data
+  packet and sends payloads of whole TS packets (188 to 1,316 bytes);
+  `srt-live-transmit` leaves the flag clear and sends 1,456-byte payloads
+  with no regard to TS packet boundaries. Live mode ignores the flag.
+- **Observed, srt-protocol fault:** when it skips a packet that is too
+  late, srt-protocol also discards the next packet, even one that arrived
+  in time. On the recorded 200 ms session under 20% loss it delivered 57
+  packets where libsrt's receiver and sapflow-srt delivered the same 59
+  (`crates/sapflow-srt/tests/differential.rs`).
 
 ## Related
 

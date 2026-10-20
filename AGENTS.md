@@ -13,6 +13,7 @@ iOS rules and the mediamtx/gohlslib source they came from.
 |-------|------|
 | `sapflow-core` | Shared types (stream paths, callback events). No networking, no async runtime: it must build for iOS and Android later. |
 | `sapflow-hls` | LL-HLS packaging: segmenting, parts, playlists, the Apple rules. |
+| `sapflow-srt` | Our own SRT receiver (live mode, listener), sans-IO, no dependencies. Written from the specification and wire observation only: never read or copy srt-rs (`vendor/srt-protocol`, `srt-tokio`) or libsrt source; run them only as black boxes. |
 | `sapflow-server` | The `sapflow` binary: ingest, HTTP, callbacks, recording. |
 
 ## Run and test
@@ -22,6 +23,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 scripts/smoke.sh     # end to end: SRT and RTMP in, LL-HLS out, recording
+SRT_IMPLS="srt-rs own" scripts/smoke.sh   # once per SRT implementation
+scripts/srt-loss.sh  # SRT under loss against libsrt (RECEIVERS="srt-rs own libsrt")
 scripts/srt-loss.sh  # SRT receivers under packet loss against libsrt (about 40 minutes)
 scripts/tidy.sh          # build size; --clean empties target/
 python3 scripts/third-party-licences.py   # after dependency changes
