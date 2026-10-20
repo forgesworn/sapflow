@@ -736,17 +736,35 @@ mod tests {
     }
 
     #[test]
-    fn nak_again_every_rtt() {
-        let mut r = rx();
+    fn nak_again_after_a_round_trip_and_its_variance() {
+        let mut r = Receiver::new(
+            Settings {
+                latency: 2_000 * MS,
+                ..settings()
+            },
+            0,
+            77,
+            Seq::new(ISN),
+            0,
+        );
+        // One RTT sample: 60 ms, so the variance is 30 ms and a loss is
+        // asked for again 60 + 4 x 30 = 180 ms after the last request.
         r.on_data(0, &data(ISN, 0, b"0"));
-        r.on_data(MS, &data(ISN + 2, 150 * MS as u32, b"2"));
-        assert_eq!(sent(&mut r).len(), 1, "the immediate NAK");
-        // RTT is the starting 100 ms: nothing again before that.
-        r.on_timer(50 * MS);
+        r.on_timer(10 * MS);
+        r.on_control(70 * MS, &Control::AckAck { number: 1 });
+        assert_eq!((r.rtt().rtt(), r.rtt().retry()), (60 * MS, 180 * MS));
+        sent(&mut r);
+        // A gap far from its 2 s deadline, so only the ordinary interval
+        // applies.
+        r.on_data(71 * MS, &data(ISN + 2, 71 * MS as u32, b"2"));
         let naks = |c: Vec<Control>| c.iter().filter(|c| matches!(c, Control::Nak(_))).count();
+        assert_eq!(naks(sent(&mut r)), 1, "the immediate NAK");
+        assert_eq!(r.next_timer(), 251 * MS);
+        r.on_timer(250 * MS);
         assert_eq!(naks(sent(&mut r)), 0);
-        r.on_timer(101 * MS);
+        r.on_timer(251 * MS);
         assert_eq!(naks(sent(&mut r)), 1);
+        assert_eq!(r.next_timer(), 431 * MS);
     }
 
     #[test]

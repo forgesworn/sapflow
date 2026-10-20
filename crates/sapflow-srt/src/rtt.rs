@@ -54,6 +54,11 @@ impl Rtt {
     /// a round trip that is late but normal. Asking again after exactly one
     /// round trip raced retransmissions already on their way (measured in
     /// `docs/interop.md`).
+    ///
+    /// Just after the first sample the variance is half the RTT, so for the
+    /// first few ACKs (about 100 ms) this is up to three round trips; it
+    /// shrinks by a quarter with each sample after. A loss in that time is
+    /// asked for again later than it would be once the estimate settles.
     pub fn retry(&self) -> i64 {
         self.rtt + 4 * self.var
     }
