@@ -148,8 +148,10 @@ packet filters (FEC), sending (a later milestone, for phones).
 
 - **M6a, receive:** unencrypted, behind a switch (`SAPFLOW_SRT_IMPL`), with
   `srt-protocol` still the default.
-- **M6b, encryption:** SRT passphrase (AES key wrap, AES-CTR), so the
-  credential no longer travels in clear.
+- **M6b, encryption:** SRT passphrase (AES key wrap, AES-CTR) protects media
+  payloads. SRT control packets, including stream IDs, remain visible; never
+  assume encryption hides credentials placed in a stream ID. Provision
+  session-scoped secrets through an authenticated destination channel.
 - **M6c, switch:** make it the default, remove `vendor/srt-protocol`,
   `srt-tokio` and their dependencies.
 
@@ -207,9 +209,21 @@ proof:
   per-process cookie key (T16), one `recv_from` socket with no per-packet
   `getsockname`, no timer without a connection.
 
+**M6b implementation (2026-10-21):** the own caller/sender and listener now
+support optional AES-128/256-CTR with bounded key negotiation and refresh,
+wrong-secret rejection and no configured plaintext downgrade. The listener
+supports selecting a session secret after bounded stream-ID admission; see
+[the supported crypto profile](crates/sapflow-srt/src/crypto.rs). Server
+configuration/provisioning is separate and must validate keys before claiming
+or resuming a stream held by reconnect grace.
+Independent executable tests cover both directions with libsrt, key rotation,
+clean/impaired loopback delivery and wrong/missing secrets. These are finite
+implementation checks, not completion of the full M6 qualification matrix.
+The existing default receiver is unchanged; CTR does not authenticate media.
+
 Still open for M6 as a whole: OBS against `own` (Larix on an iPhone
 published to `own` over Wi-Fi on 2026-10-21, alone and alongside an RTMP
-publish), anything with a passphrase (M6b), and
+publish), the full encrypted qualification matrix, and
 the version 4 handshake, which no encoder tested so far needed (every one
 used version 5).
 

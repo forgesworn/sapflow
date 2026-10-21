@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 
+use crate::crypto::Decryptor;
 use crate::loss::{LossList, Timing};
 use crate::packet::{Ack, AckStats, Control, ControlPacket, DataPacket, MAX_LOSS_ENTRIES};
 use crate::rtt::Rtt;
@@ -59,8 +60,10 @@ pub struct Stats {
     /// Missing packets skipped at their delivery time.
     pub dropped: u64,
     pub delivered: u64,
-    /// Data packets refused because they were encrypted.
+    /// Data packets refused for a plaintext/key mismatch or expired key.
     pub encrypted: u64,
+    pub decrypted: u64,
+    pub km_rejected: u64,
     pub naks_sent: u64,
     pub acks_sent: u64,
 }
@@ -193,6 +196,8 @@ pub struct Receiver {
     /// Control packets to send, encoded.
     send: VecDeque<Vec<u8>>,
     deliver: VecDeque<Vec<u8>>,
+    crypto: Option<Decryptor>,
+    next_km: i64,
 }
 
 impl Receiver {
@@ -234,6 +239,8 @@ impl Receiver {
             closed: None,
             send: VecDeque::new(),
             deliver: VecDeque::new(),
+            crypto: None,
+            next_km: 0,
         }
     }
 
@@ -247,6 +254,10 @@ impl Receiver {
 
     pub fn latency(&self) -> i64 {
         self.settings.latency
+    }
+
+    pub(crate) fn set_crypto(&mut self, crypto: Option<Decryptor>) {
+        self.crypto = crypto;
     }
 
     pub fn closed(&self) -> Option<CloseReason> {
@@ -279,9 +290,10 @@ impl Receiver {
         if self.closed.is_some() {
             return;
         }
-        self.last_received = now;
-        if p.key != 0 {
-            // Encrypted: nothing here can read it.
+        if (self.crypto.is_some() && !matches!(p.key, 1 | 2))
+            || (self.crypto.is_none() && p.key != 0)
+        {
+            // A key mismatch must never become plaintext delivery.
             self.stats.encrypted += 1;
             return;
         }
@@ -290,10 +302,30 @@ impl Receiver {
         }
         self.stats.received += 1;
         self.stats.received_bytes += p.payload.len() as u64;
-        let ext = self.ts.extend(p.timestamp);
         if p.retransmitted {
             self.stats.retransmitted += 1;
-        } else {
+        }
+        // Reject replay/duplicate sequences before allocating or decrypting.
+        let distance = self.head.distance_to(p.seq);
+        if distance < 0 {
+            self.stats.belated += 1;
+            return;
+        }
+        if self.buf.get(distance as usize).is_some_and(Option::is_some) {
+            self.stats.duplicates += 1;
+            return;
+        }
+        let mut payload = p.payload.to_vec();
+        if let Some(crypto) = &mut self.crypto {
+            if crypto.decrypt(p.key, p.seq, &mut payload).is_err() {
+                self.stats.encrypted += 1;
+                return;
+            }
+            self.stats.decrypted += 1;
+        }
+        self.last_received = now;
+        let ext = self.ts.extend(p.timestamp);
+        if !p.retransmitted {
             self.drift
                 .sample(now.saturating_sub(self.base.saturating_add(ext)));
             self.rate.add(now, p.payload.len());
@@ -318,7 +350,7 @@ impl Receiver {
         let idx = d as usize;
         let slot = Slot {
             deliver_at,
-            payload: p.payload.to_vec(),
+            payload,
         };
         if let Some(existing) = self.buf.get_mut(idx) {
             if existing.is_some() {
@@ -485,6 +517,39 @@ impl Receiver {
     pub fn on_control(&mut self, now: i64, c: &Control) {
         self.now = self.now.max(now);
         if self.closed.is_some() {
+            return;
+        }
+        if let Control::Other {
+            control_type: 0x7fff,
+            subtype: 3,
+            info: 0,
+            cif,
+        } = c
+        {
+            // One bounded unwrap and response per 100ms per connection;
+            // repeated or hostile KM cannot drive KDF work or queue growth.
+            if now < self.next_km {
+                return;
+            }
+            self.next_km = now.saturating_add(100_000);
+            if self
+                .crypto
+                .as_mut()
+                .is_some_and(|crypto| crypto.refresh(cif).is_ok())
+            {
+                self.last_received = now;
+                self.queue(
+                    now,
+                    Control::Other {
+                        control_type: 0x7fff,
+                        subtype: 4,
+                        info: 0,
+                        cif: cif.clone(),
+                    },
+                );
+            } else {
+                self.stats.km_rejected += 1;
+            }
             return;
         }
         self.last_received = now;

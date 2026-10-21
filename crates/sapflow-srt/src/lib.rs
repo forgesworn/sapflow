@@ -1,4 +1,4 @@
-//! SRT for sapflow: the receiving side of live-mode SRT, as a listener.
+//! SRT for sapflow: live receiver/listener and bounded paced caller/sender.
 //!
 //! Written from the SRT specification (draft-sharabayko-srt-01) and from
 //! watching real sessions on the wire (libsrt 1.5.4's `srt-live-transmit`
@@ -21,8 +21,10 @@
 //! - [`listener`]: handshakes (version 5, SYN cookies keyed per process),
 //!   stream ids, limits, and the connections.
 //!
-//! Live mode only: no file mode, rendezvous, caller mode, groups, packet
-//! filters or sending. Encrypted callers are refused for now.
+//! [`Caller`] adds bounded, paced live sending. Live mode only: no file
+//! mode, rendezvous, groups or packet filters. Optional AES-128/256-CTR uses
+//! strict key negotiation and refresh. CTR does not authenticate media;
+//! control/stream IDs remain clear. See [`crypto`] for the supported profile.
 //!
 //! Every byte that arrives is hostile until the application accepts the
 //! caller: nothing here indexes without a bound or trusts a length, and
@@ -40,12 +42,18 @@
     )
 )]
 
+pub mod caller;
+pub mod crypto;
 pub mod listener;
 pub mod loss;
 pub mod packet;
 pub mod receiver;
 pub mod rtt;
+pub mod sender;
 pub mod seq;
+
+pub use caller::{Caller, CallerCloseReason, CallerConfig, CallerEvent, CallerStats};
+pub use sender::{SendConfig, SendError, SendStats};
 
 pub use listener::{Config, ConnId, Event, Listener, ListenerStats, RejectCode};
 pub use receiver::{CloseReason, Stats};

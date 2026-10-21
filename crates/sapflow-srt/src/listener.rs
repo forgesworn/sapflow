@@ -11,6 +11,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use crate::crypto::{CryptoConfig, Decryptor};
 use crate::packet::{
     Control, ControlPacket, Extension, Handshake, HandshakeKind, Packet, SRT_MAGIC, SrtHandshake,
     ext_flags, srt_flags,
@@ -53,6 +54,11 @@ pub struct Config {
     pub peer_idle: Duration,
     /// The application has this long to accept or reject a caller.
     pub accept_timeout: Duration,
+    /// Lab/global secret. Production admission can use accept_with_crypto.
+    pub crypto: Option<CryptoConfig>,
+    /// Require KM before emitting Connect; select the session secret in
+    /// accept_with_crypto when no global secret is configured.
+    pub require_encryption: bool,
 }
 
 impl Default for Config {
@@ -64,6 +70,8 @@ impl Default for Config {
             buffer_packets: 8192,
             peer_idle: Duration::from_secs(5),
             accept_timeout: Duration::from_secs(5),
+            crypto: None,
+            require_encryption: false,
         }
     }
 }
@@ -85,6 +93,7 @@ impl RejectCode {
     pub const BACKLOG: Self = Self(1005);
     pub const CLOSE: Self = Self(1007);
     pub const VERSION: Self = Self(1008);
+    pub const BADSECRET: Self = Self(1010);
     pub const UNSECURE: Self = Self(1011);
     pub const MESSAGE_API: Self = Self(1012);
     pub const CONGESTION: Self = Self(1013);
@@ -100,8 +109,10 @@ impl RejectCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A caller completed the handshake. Answer with
-    /// [`Listener::accept`] or [`Listener::reject`].
+    /// A caller passed bounded handshake parsing and cookie checks. The
+    /// stream ID is untrusted; KM/secret validation happens during acceptance.
+    /// Answer with [`Listener::accept`], [`Listener::accept_with_crypto`] or
+    /// [`Listener::reject`]. This event does not establish peer identity.
     Connect {
         id: ConnId,
         peer: SocketAddr,
@@ -245,6 +256,10 @@ impl<S: BuildHasher> Listener<S> {
 
     pub fn handle_datagram(&mut self, now: Instant, peer: SocketAddr, datagram: &[u8]) {
         let t = self.micros(now);
+        if datagram.len() > 1500 {
+            self.stats.malformed += 1;
+            return;
+        }
         let packet = match Packet::parse(datagram) {
             Ok(p) => p,
             Err(_) => {
@@ -319,6 +334,44 @@ impl<S: BuildHasher> Listener<S> {
     /// Accepts a caller announced by [`Event::Connect`]: the handshake
     /// response goes out and data is delivered from now on.
     pub fn accept(&mut self, id: ConnId, now: Instant) -> bool {
+        self.accept_with_crypto(id, now, self.config.crypto.clone())
+    }
+
+    /// Select an authenticated admission/session secret after inspecting the
+    /// bounded stream ID. A configured secret requires matching KM; a missing
+    /// secret never downgrades an encrypted or encryption-required session.
+    /// Failed key validation rejects and removes the pending connection.
+    pub fn accept_with_crypto(
+        &mut self,
+        id: ConnId,
+        now: Instant,
+        crypto: Option<CryptoConfig>,
+    ) -> bool {
+        let Some(c) = self.conns.get(&id.0) else {
+            return false;
+        };
+        let State::Pending(p) = &c.state else {
+            return false;
+        };
+        let km = p.hs.extensions.iter().find_map(|e| match e {
+            Extension::KmReq(b) => Some(b),
+            _ => None,
+        });
+        let decryptor = match (&crypto, km) {
+            (Some(config), Some(bytes)) => match Decryptor::new(config, bytes) {
+                Ok(d) => Some(d),
+                Err(_) => {
+                    self.reject(id, RejectCode::BADSECRET);
+                    return false;
+                }
+            },
+            (None, None) if !self.config.require_encryption && self.config.crypto.is_none() => None,
+            _ => {
+                self.reject(id, RejectCode::UNSECURE);
+                return false;
+            }
+        };
+        let km_response = km.cloned();
         let t = self.micros(now);
         let max_payload = MTU_MAX - OVERHEAD;
         let buffer = self.config.buffer_packets.max(32);
@@ -337,10 +390,15 @@ impl<S: BuildHasher> Listener<S> {
             sender_delay: 0,
         });
         let ms = u16::try_from(p.latency / 1000).unwrap_or(u16::MAX);
-        let response = Handshake {
+        let mut response = Handshake {
             version: 5,
-            encryption: 0,
-            extension: ext_flags::HSREQ,
+            encryption: crypto.as_ref().map_or(0, |c| c.key_size.field()),
+            extension: ext_flags::HSREQ
+                | if decryptor.is_some() {
+                    ext_flags::KMREQ
+                } else {
+                    0
+                },
             initial_seq: p.hs.initial_seq,
             mtu: p.hs.mtu.min(MTU_MAX),
             flow_window: p
@@ -358,9 +416,12 @@ impl<S: BuildHasher> Listener<S> {
                 sender_delay: ms.max(req.receiver_delay),
             })],
         };
-        let mut bytes = Vec::with_capacity(80);
+        if let Some(km) = km_response {
+            response.extensions.push(Extension::KmRsp(km));
+        }
+        let mut bytes = Vec::with_capacity(184);
         ControlPacket::new(0, c.caller_socket, Control::Handshake(response)).encode(&mut bytes);
-        let rx = Receiver::new(
+        let mut rx = Receiver::new(
             Settings {
                 latency: p.latency,
                 buffer,
@@ -372,6 +433,7 @@ impl<S: BuildHasher> Listener<S> {
             Seq::new(p.hs.initial_seq),
             p.hs_timestamp,
         );
+        rx.set_crypto(decryptor);
         self.transmits.push_back((c.peer, bytes.clone()));
         c.state = State::Open {
             rx: Box::new(rx),
@@ -524,7 +586,11 @@ impl<S: BuildHasher> Listener<S> {
         // caller's own socket id, sequence number, MTU and window echoed.
         let reply = Handshake {
             version: 5,
-            encryption: 0,
+            encryption: self
+                .config
+                .crypto
+                .as_ref()
+                .map_or(0, |c| c.key_size.field()),
             extension: SRT_MAGIC,
             initial_seq: h.initial_seq,
             mtu: h.mtu,
@@ -583,12 +649,34 @@ impl<S: BuildHasher> Listener<S> {
         if h.version != 5 {
             return Err(RejectCode::VERSION);
         }
-        let km = h
+        let requests: Vec<_> = h
             .extensions
             .iter()
-            .any(|e| matches!(e, Extension::KmReq(_)));
-        if h.encryption != 0 || km || h.extension & ext_flags::KMREQ != 0 {
-            // Encryption is not implemented yet (M6b).
+            .filter_map(|e| match e {
+                Extension::KmReq(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        let km = requests.first();
+        if requests.len() > 1
+            || h.extensions
+                .iter()
+                .any(|e| matches!(e, Extension::KmRsp(_)))
+        {
+            return Err(RejectCode::ROGUE);
+        }
+        if let Some(km) = km {
+            if !self.config.require_encryption && self.config.crypto.is_none() {
+                return Err(RejectCode::UNSECURE);
+            }
+            if h.extension & ext_flags::KMREQ == 0 || !crate::crypto::valid_km(km, h.encryption) {
+                return Err(RejectCode::ROGUE);
+            }
+        } else if h.encryption != 0
+            || h.extension & ext_flags::KMREQ != 0
+            || self.config.require_encryption
+            || self.config.crypto.is_some()
+        {
             return Err(RejectCode::UNSECURE);
         }
         let req = h.srt_request().ok_or(RejectCode::ROGUE)?;
