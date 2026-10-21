@@ -6,8 +6,9 @@ encoder through VideoToolbox, encodes AAC-LC with AVAudioConverter and writes
 those same compressed access units through AVAssetWriter passthrough inputs.
 It includes manual RTMP/RTMPS and SRT publishing adapters using the owned Rust
 protocols over Network.framework TCP/TLS and UDP. Recording and publishing remain
-independent. This is an initial single-attempt integration, with physical
-phone-to-origin qualification and shared reconnect integration still open.
+independent. A logical publisher now binds the shared Rust reconnect policy
+across socket attempts and orientation codec epochs. Physical iPhone recovery,
+remote decoded observation and sustained capture qualification remain open.
 
 ## Build
 
@@ -121,14 +122,20 @@ A/V timestamp epoch. Rapid turns coalesce during finalisation. Each successfully
 finished segment remains in Files. The latest finished segment remains exportable
 while the next records. This applies to local-only capture, RTMP/RTMPS and SRT.
 
-This introduces a visible media gap and a new destination publishing session;
-continuous playback across an aspect change has not been qualified. It does
+This introduces a visible media gap and a fresh destination connection while
+retaining the same logical reconnect policy. Continuous playback across an
+aspect change has not been qualified on iPhone. It does
 not send replacement codec configuration into an existing immutable session.
 Automatic restart is cancelled if finalisation has not completed within six
 seconds. This fences resumption rather than forcibly interrupting an AVFoundation
 driver or file operation; cleanup may finish later. Network stop retains its
-existing three-second RTMP or 100 ms SRT bound, while the next connection has its
-normal separate startup deadline. Stop, backgrounding, capture/audio interruption,
+existing three-second RTMP or 100 ms SRT drain bound. Completion additionally
+requires Network.framework's actual `.cancelled` state. A separate logical-owner
+four-second cleanup deadline reports failure and retains an unconfirmed owner;
+it cannot claim cancellation success or start a successor. A later cancellation
+may release that owner but never resurrect a failed or stopped session. Recording
+finalisation still proceeds if publisher cleanup fails. The next admitted
+connection has its normal separate startup deadline. Stop, backgrounding, capture/audio interruption,
 recording failure or storage/permission failure cancels automatic resumption.
 Attempt/capture generations fence old callbacks.
 
@@ -175,8 +182,10 @@ Delete removes that profile and its Keychain item. Selecting a saved profile
 fills the form; it does not start a connection. A locked/unavailable Keychain
 fails visibly rather than using an old key silently.
 
-`ManualRtmpPublisher` implements `EncodedPublishingSink.start/offer/stop`.
-`CaptureEngine.setDestination` installs it while stopped, before Prepare. The
+`ReconnectingPublisher` implements the logical `EncodedPublishingSink` and
+creates a fresh `ManualRtmpPublisher` per attempt. `CaptureEngine.setDestination`
+installs it while stopped, before Prepare; replacement is refused while an old
+publisher still has unconfirmed cleanup. The
 sink sends only validated immutable generated `MediaSample` handles; raw media
 never enters the networking queue. Rust's `NativeRtmpPublisher` owns RTMP
 handshake, command state, configuration and FLV framing. AVFoundation timestamps
@@ -213,9 +222,30 @@ The UI labels successful publication as “Sending”, with RTMP wire bytes acce
 by the socket measured over a rolling interval. That rate excludes TLS/IP
 framing and is not an origin/player acknowledgement. It always says playback is
 unconfirmed. An origin viewer/monitor is still required for decoded media
-confirmation. No retry is scheduled automatically: a failed attempt requires
-Stop, Prepare and Start. This intentionally does not duplicate V4V's 90-second
-grace or claim reliable reconnect before the shared SDK session policy is bound.
+confirmation. The logical owner uses `NativeSession` with the manual 90-second
+grace. Failure starts the original retry window before asynchronous cleanup;
+repeated failures cannot extend it. A fresh attempt waits for actual old-socket
+cancellation. Healthy orientation replacement uses `replaceTransport`, retaining
+an existing deadline without manufacturing an outage.
+
+RTMP declares both fixed capture tracks before media. The fused send/output
+record and cold receive-event drain expose complete startup submission and
+validated peer watermark progress. SRT supplies the corresponding typed events.
+The coordinator latches at most two facts for the current attempt and applies
+`connected`, `sending` and `transportRecovered` in that order. Generation,
+codec-epoch and attempt tokens reject old observations. No sample-level FFI
+polling or second encoder is added. See the exact conservative RTMP ACK guard
+and network-versus-decoding distinction in [transport recovery](transport-recovery.md).
+
+Only timely peer media progress clears the network window; it never calls
+`mediaConfirmed`. An accepted sending attempt with absent/sparse ACKs may remain
+active after retry permission exhausts, with an explicit uncertain/exhausted
+status. A later failure or rotation then cannot reconnect automatically.
+`nextDeadlineNs` drives one logical timer and becomes empty after exhaustion;
+there is no idle polling. Explicit Stop closes logical admission synchronously,
+cancels future retries and prevents queued Start/callback work opening a socket.
+A new explicit Prepare is required after terminal publishing failure. Recording
+and capture can continue through network failure.
 
 `RustEncodedIngress` reuses one generated MediaCodec per encoder configuration
 and refuses mid-run format replacement. The recorder remains a native compressed
@@ -288,8 +318,8 @@ backlog failure, repeated start/stop and process-termination recovery. Measure
 actual copies, allocations, CPU, A/V sync, thermal state and sustained power.
 Then prove the attached manual RTMP/RTMPS implementation delivers actual
 phone-to-origin-to-viewer media, rejects invalid TLS trust/hostname, preserves
-recording through a failed uplink, and completes explicit stop. Bind and qualify
-the shared reconnect policy separately; qualify the SRT UDP adapter on-device.
+recording through a failed uplink, and completes explicit stop. Qualify the bound
+shared reconnect policy and the SRT UDP adapter on-device.
 Unsigned compilation, native SDK validation and a recording implementation are
 not physical-device or live-broadcast acceptance.
 
@@ -303,7 +333,8 @@ Network references: [default TLS options](https://developer.apple.com/documentat
 
 ## SRT caller integration
 
-`ManualSrtPublisher` and SwiftUI now provide a single-attempt manual SRT caller.
+`ManualSrtPublisher` provides each individual SRT attempt beneath the shared
+logical publisher; SwiftUI selects manual encrypted SRT independently of RTMP.
 The initial destination accepts explicit numeric unicast IPv4/IPv6 peers and
 ports; DNS/rendezvous/listener modes are not attached. AES-256 is the default and
 requires a 10 to 79 byte printable ASCII passphrase. Plaintext requires a separate
@@ -345,7 +376,8 @@ Failure closes only publishing. Explicit stop cancels media and attempts at most
 one best-effort SRT shutdown, bounded by the same submission deadline; recording
 continues independently and destination end remains unconfirmed. Timer callbacks,
 UDP callbacks, sample admission and queued continuations carry attempt generations.
-Rust common reconnect/session policy still needs its native adapter.
+The logical publisher uses the shared Rust reconnect/session policy; transport
+ACK progress remains distinct from decoded-media confirmation.
 
 Ten actual pure Swift XCTest cases pass on macOS, including cancelled/rearmed
 Dispatch timers, latest-generation timer delivery, SRT numeric/secret bounds and
@@ -401,3 +433,50 @@ is `target/ios-app/orientation-verification.json`, with network and frame-hash
 logs alongside. Its executable and Debug application-dylib hashes identify the
 current unsigned build. The owned listener, fixture media and helper scratch
 were removed after verification; no simulator, device or live origin was used.
+
+## Logical reconnect source qualification
+
+The reusable `ReconnectController` has no SDK, socket, media, timer or file
+runtime. Its injected policy/attempt ports exercise the actual lifecycle owner
+with deterministic asynchronous cleanup. `ReconnectingPublisher` binds those
+ports to the real generated SDK and existing bounded Network.framework adapters.
+It retains immutable codec handles until the old attempt's actual cancellation;
+no successor can share an unfinished transport or its borrowed configuration.
+
+The pure macOS Swift gate currently executes 30 tests, including sixteen new cases
+for dormant preparation, reordered acceptance/progress facts, first-failure
+ordering, cleanup before retry, synchronous Stop versus queued Start admission,
+orientation replacement, stale
+attempts, exhausted retry permission, serial-clock observations after an
+interleaved timer, clock rejection and late cleanup after the
+fixed owner deadline, an overdue native deadline delivered after actual cleanup,
+and bounded one-shot progress draining when RTMP startup submission occurs
+during an outstanding write. Fused media results avoid extra progress polls;
+existing network completion/output/deadline work drains queued facts. These tests
+establish source invariants, not a physical
+network recovery or a decoded playback result. Existing fixture receipts above
+refer to their earlier single-attempt snapshots.
+
+The refreshed Apple package uses SDK source `1634a809` (the subsequent server
+HTTP-test helper change does not change its native inputs). Its archive SHA-256
+is `9eb2f7e3faf0fa9be2242b0358bccd6daa2b373d41d10b8691e43912cc49c7f8`.
+The real external Swift consumer passed; the actual unsigned arm64 application
+and XCTest bundle passed `build-for-testing` with no warnings. The thirty pure
+Swift tests ran on macOS; the iOS test bundle was compiled only.
+
+`mobile/ios/check-publisher-lifecycle.sh` compiles the production SRT adapter
+against that real package and runs three no-media loopback UDP ready/cancel
+cycles. All six Stop completion callbacks arrived after actual cancellation and
+reported released owners. This catches suppression of Network.framework's
+`.cancelled` event after cancellation admission closes. The check creates no
+camera, codec, SRT handshake or media, and removes its listener and build scratch.
+It establishes this host cancellation boundary, not iPhone network recovery.
+
+Current receipts and logs are `target/ios-reconnect-receipt.local.json`,
+`target/ios-reconnect-source-hashes.json`, `target/ios-reconnect-pure-tests.log`,
+`target/ios-reconnect-lifecycle-check.log`, `target/ios-reconnect-build.log` and
+`target/ios-reconnect-apple-build.log`. The preceding Apple package is retained
+under `target/native-packages/apple-before-ios-reconnect` with its original
+file-hash manifest. No signed build, physical capture, radio failure/recovery,
+orientation recovery, trusted decoded-media confirmation, thermal or sustained
+power qualification follows from these source and host checks.

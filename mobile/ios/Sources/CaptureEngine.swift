@@ -44,14 +44,14 @@ final class IngressWorker {
     private func fail(_ error: Error) {
         guard !failed else { return }
         failed = true
-        ingress.destination?.stop()
+        ingress.destination?.endDestination()
         failure(error)
     }
-    func finish(_ completion: @escaping () -> Void) {
+    func finish(_ completion: @escaping (Result<Void, Error>) -> Void) {
         budget.close()
         queue.async {
-            if let destination = self.ingress.destination { destination.stop(completion: completion) }
-            else { completion() }
+            if let destination = self.ingress.destination { destination.finishEpoch(completion: completion) }
+            else { completion(.success(())) }
         }
     }
 }
@@ -95,6 +95,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var storageTimer: DispatchSourceTimer?
     private var notifications: [NSObjectProtocol] = []
     private let ingress = RustEncodedIngress()
+    private let destinationLock = NSLock()
+    private var destinationFence: EncodedPublishingSink?
     var onChange: ((CaptureSnapshot) -> Void)?
     private var lastMeterUpdate = 0.0
 
@@ -117,13 +119,23 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     /// Attach a real bounded destination adapter before preparing. No endpoint
     /// or credential is inferred from a display label or bundled configuration.
-    func setDestination(_ destination: EncodedPublishingSink?) {
+    func setDestination(_ destination: EncodedPublishingSink?, completion: @escaping (Bool) -> Void = { _ in }) {
         control.async {
-            guard !self.snapshot.running, !self.stopping else { return }
+            guard !self.snapshot.running, !self.stopping else { completion(false); return }
+            guard self.ingress.destination?.cleanupComplete != false else {
+                self.snapshot.detail = "Previous publisher cleanup is unconfirmed; Prepare is blocked."
+                self.publish(); completion(false); return
+            }
+            self.ingress.destination?.endDestination()
             self.ingress.destination = destination
+            self.destinationLock.lock(); self.destinationFence = destination; self.destinationLock.unlock()
             self.snapshot.publisher = self.ingress.status
-            self.publish()
+            self.publish(); completion(true)
         }
+    }
+    private func fencePublishing() {
+        destinationLock.lock(); let owner = destinationFence; destinationLock.unlock()
+        owner?.endDestination()
     }
     func setOrientation(_ orientation: CaptureOrientation) {
         control.async {
@@ -133,6 +145,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 let timeout = DispatchWorkItem { [weak self] in
                     guard let self, self.orientationPlan.pending == token else { return }
                     self.orientationPlan.cancel(); self.rotationTimeout = nil
+                    self.fencePublishing()
                     self.stopReason = "Rotation finalisation timed out; automatic restart cancelled."
                     self.snapshot.detail = "Rotation finalisation exceeded six seconds. Automatic restart cancelled; cleanup may still finish."
                     self.publish()
@@ -308,9 +321,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
             }
             self.storageTimer = timer; timer.resume()
-        } catch { self.ingress.destination?.stop(); self.report(error) }
+        } catch { self.fencePublishing(); self.report(error) }
     }
     func stop() {
+        fencePublishing() // synchronous admission fence precedes queued cleanup
         control.async {
             self.orientationPlan.cancel(); self.rotationTimeout?.cancel(); self.rotationTimeout = nil
             if self.stopping { self.snapshot.detail = "Restart cancelled; finishing the recording."; self.publish() }
@@ -322,6 +336,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard !stopping else { return }
         stopReason = reason
         let rotationToken = orientationPlan.pending
+        if rotationToken == nil { fencePublishing() }
         storageTimer?.cancel(); storageTimer = nil
         setSampleDelivery(false)
         if session.isRunning { session.stopRunning() }
@@ -344,7 +359,14 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 self.control.async { self.recordingFailureDescription = "AAC flush failed: \(error.localizedDescription)" }
             }
             run.video.finish()
-            run.worker.finish {
+            run.worker.finish { publishingResult in
+                // A retained network owner blocks rotation, never file flush.
+                if case .failure = publishingResult {
+                    self.control.async {
+                        self.orientationPlan.cancel()
+                        self.stopReason = "Publisher cleanup unconfirmed; automatic restart blocked."
+                    }
+                }
                 run.recorder.finish { result in
                     self.control.async {
                         self.stopping = false

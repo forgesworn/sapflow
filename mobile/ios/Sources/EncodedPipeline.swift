@@ -26,6 +26,9 @@ enum CodecDescription {
 /// It must never perform socket or disk I/O in this callback.
 protocol EncodedPublishingSink: AnyObject {
     var status: String { get }
+    var cleanupComplete: Bool { get }
+    func endDestination()
+    func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void)
     func start() throws
     func configure(video: MediaCodec, audio: MediaCodec) throws
     func offer(_ sample: MediaSample) throws
@@ -34,6 +37,9 @@ protocol EncodedPublishingSink: AnyObject {
 }
 
 extension EncodedPublishingSink {
+    var cleanupComplete: Bool { true }
+    func endDestination() { stop() }
+    func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void) { stop { completion(.success(())) } }
     func configure(video: MediaCodec, audio: MediaCodec) throws {}
     func stop(completion: @escaping () -> Void) { stop(); completion() }
 }
@@ -114,7 +120,8 @@ final class RustEncodedIngress {
     }
 
     func reset() {
-        destination?.stop()
+        // The old epoch barrier is owned by finishEpoch; resetting codec
+        // discovery must not cancel the logical reconnect session.
         video = nil; audio = nil
         previousVideoConfig = nil; previousAudioConfig = nil
         accepted = 0; configuredDestination = false

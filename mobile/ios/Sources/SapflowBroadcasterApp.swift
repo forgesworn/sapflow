@@ -43,10 +43,14 @@ final class BroadcasterModel: ObservableObject {
             destinationError = nil
             let sink: EncodedPublishingSink?
             if recordingOnly { sink = nil }
-            else if transport == .srt { sink = ManualSrtPublisher(destination: try srtDestination()) }
-            else { sink = ManualRtmpPublisher(destination: try destination()) }
-            engine.setDestination(sink)
-            engine.prepare()
+            else if transport == .srt {
+                let destination = try srtDestination()
+                sink = try ReconnectingPublisher(source: .srtPeerAcknowledgedWatermark) { ManualSrtPublisher(destination: destination, observe: $0) }
+            } else {
+                let destination = try destination()
+                sink = try ReconnectingPublisher(source: .rtmpPeerAcknowledgedWatermark) { ManualRtmpPublisher(destination: destination, observe: $0) }
+            }
+            engine.setDestination(sink) { [weak self] accepted in if accepted { self?.engine.prepare() } }
         } catch { destinationError = error.localizedDescription }
     }
     private func destination() throws -> ManualDestination {
