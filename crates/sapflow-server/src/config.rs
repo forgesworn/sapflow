@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use sapflow_core::Publisher;
 use sapflow_core::recording::{RecordPolicy, parse_age};
+use sapflow_srt::crypto::{CryptoConfig, KeySize};
 
 pub const HELP: &str = "\
 sapflow: SRT in, Low-Latency HLS out, for the v4v live stage.
@@ -18,7 +19,10 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
 
   SAPFLOW_SRT_ADDR         SRT listener (default 0.0.0.0:8890)
   SAPFLOW_SRT_IMPL         SRT implementation: srt-rs (default) or own
-                           (sapflow's own receiver, unencrypted callers only)
+                           (sapflow's own receiver is opt-in)
+  SAPFLOW_SRT_PASSPHRASE   own SRT only: require encryption, 10..79 non-NUL bytes
+                           (separate from the publish password; unset: plaintext)
+  SAPFLOW_SRT_CIPHER       own SRT only: aes128 or aes256 (default with secret)
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
   SAPFLOW_PUBLISH_USER     the one publisher allowed to push
@@ -39,6 +43,10 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_MAX_PUBLISH_MBPS drop a publisher above this bitrate, averaged over
                            5 s (default 40)
   RUST_LOG                 log filter (default info)
+  SAPFLOW_RECONNECT_GRACE  seconds to retain a disconnected stream (default 90;
+                           0 disables, maximum 3600)
+  SAPFLOW_HEALTH_INTERVAL  seconds between health callbacks (default 30;
+                           0 disables, maximum 3600)
 
 Publish with SRT, streamid=publish:live/<eventId>:<user>:<pass>, or RTMP,
 rtmp://<host>:1935/live with key <eventId>?user=<user>&pass=<pass>.
@@ -63,6 +71,10 @@ const KEYS: &[&str] = &[
     "SAPFLOW_MAX_PUBLISH_MBPS",
     "SAPFLOW_RECORD_MIN_FREE_GB",
     "SAPFLOW_SRT_IMPL",
+    "SAPFLOW_SRT_PASSPHRASE",
+    "SAPFLOW_SRT_CIPHER",
+    "SAPFLOW_RECONNECT_GRACE",
+    "SAPFLOW_HEALTH_INTERVAL",
 ];
 
 /// Which SRT implementation serves the SRT port.
@@ -79,6 +91,8 @@ pub enum SrtImpl {
 pub struct Config {
     pub srt_addr: SocketAddr,
     pub srt_impl: SrtImpl,
+    /// Independent transport secret. Shared zeroising ownership, redacted Debug.
+    pub srt_crypto: Option<CryptoConfig>,
     pub rtmp_addr: Option<SocketAddr>,
     pub http_addr: SocketAddr,
     /// `None` only when open publishing was asked for explicitly.
@@ -93,6 +107,8 @@ pub struct Config {
     pub max_publish_bps: u64,
     /// Bytes of free disk below which recording does not start or stops.
     pub record_min_free: u64,
+    pub reconnect_grace: Duration,
+    pub health_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -108,9 +124,19 @@ impl Config {
         get: impl Fn(&str) -> Option<String>,
         args: impl IntoIterator<Item = String>,
     ) -> Result<Self, ConfigError> {
+        // Move the owned environment value directly into zeroising storage,
+        // including invalid values. Never place it in the generic String map.
+        // Retain a redacted error until overrides have been applied.
+        let secret = |value: String| CryptoConfig::new(value.into_bytes(), KeySize::Aes256);
+        let mut srt_crypto = get("SAPFLOW_SRT_PASSPHRASE").map(secret);
         let mut vals: std::collections::HashMap<String, String> = KEYS
             .iter()
-            .filter_map(|k| get(k).filter(|v| !v.is_empty()).map(|v| (k.to_string(), v)))
+            .filter(|k| **k != "SAPFLOW_SRT_PASSPHRASE")
+            .filter_map(|k| {
+                get(k)
+                    .filter(|v| !v.is_empty() || *k == "SAPFLOW_SRT_CIPHER")
+                    .map(|v| (k.to_string(), v))
+            })
             .collect();
 
         let mut args = args.into_iter();
@@ -137,7 +163,11 @@ impl Config {
                     .next()
                     .ok_or_else(|| ConfigError::Invalid(format!("--{name} needs a value")))?,
             };
-            vals.insert(key, value);
+            if key == "SAPFLOW_SRT_PASSPHRASE" {
+                srt_crypto = Some(secret(value));
+            } else {
+                vals.insert(key, value);
+            }
         }
 
         let addr = |key: &str, default: &str| -> Result<SocketAddr, ConfigError> {
@@ -224,6 +254,19 @@ impl Config {
                 })?,
         };
 
+        let seconds = |key: &str, default| -> Result<Duration, ConfigError> {
+            match vals.get(key) {
+                None => Ok(Duration::from_secs(default)),
+                Some(value) => value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n <= 3600)
+                    .map(Duration::from_secs)
+                    .ok_or_else(|| ConfigError::Invalid(format!("{key}: seconds, 0 to 3600"))),
+            }
+        };
+        let reconnect_grace = seconds("SAPFLOW_RECONNECT_GRACE", 90)?;
+        let health_interval = seconds("SAPFLOW_HEALTH_INTERVAL", 30)?;
         let srt_impl = match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
             None | Some("srt-rs") => SrtImpl::SrtRs,
             Some("own") => SrtImpl::Own,
@@ -233,9 +276,41 @@ impl Config {
                 )));
             }
         };
+        let srt_cipher = vals.get("SAPFLOW_SRT_CIPHER");
+        if srt_impl != SrtImpl::Own && (srt_crypto.is_some() || srt_cipher.is_some()) {
+            return Err(ConfigError::Invalid(
+                "SRT encryption settings require SAPFLOW_SRT_IMPL=own".into(),
+            ));
+        }
+        if srt_cipher.is_some() && srt_crypto.is_none() {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_SRT_CIPHER requires SAPFLOW_SRT_PASSPHRASE".into(),
+            ));
+        }
+        let cipher = match srt_cipher.map(String::as_str) {
+            None | Some("aes256") => KeySize::Aes256,
+            Some("aes128") => KeySize::Aes128,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_SRT_CIPHER: aes128 or aes256".into(),
+                ));
+            }
+        };
+        let srt_crypto = srt_crypto
+            .transpose()
+            .map_err(|_| {
+                ConfigError::Invalid("SAPFLOW_SRT_PASSPHRASE: 10..79 non-NUL bytes required".into())
+            })?
+            .map(|mut config| {
+                config.key_size = cipher;
+                config
+            });
 
         Ok(Self {
+            reconnect_grace,
+            health_interval,
             srt_impl,
+            srt_crypto,
             record_min_free,
             max_publish_bps,
             rtmp_addr,
@@ -281,6 +356,22 @@ mod tests {
         assert_eq!(c.http_addr.port(), 8888);
         assert!(c.publisher.is_some());
         assert_eq!(c.segment_count, 24);
+    }
+
+    #[test]
+    fn grace_and_health_settings_are_bounded_and_do_not_change_crypto() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let config = load(&[open], &[]).expect("valid bounded settings");
+        assert_eq!(config.reconnect_grace, Duration::from_secs(90));
+        assert_eq!(config.health_interval, Duration::from_secs(30));
+        let config = load(&[open], &["--reconnect-grace=0", "--health-interval=10"])
+            .expect("valid bounded settings");
+        assert_eq!(config.reconnect_grace, Duration::ZERO);
+        assert_eq!(config.health_interval, Duration::from_secs(10));
+        for invalid in ["-1", "3601", "1.5"] {
+            assert!(load(&[open, ("SAPFLOW_RECONNECT_GRACE", invalid)], &[]).is_err());
+            assert!(load(&[open, ("SAPFLOW_HEALTH_INTERVAL", invalid)], &[]).is_err());
+        }
     }
 
     #[test]
@@ -374,6 +465,110 @@ mod tests {
             Err(ConfigError::Invalid(_))
         ));
         assert!(HELP.contains("SAPFLOW_SRT_IMPL"));
+    }
+
+    #[test]
+    fn own_srt_encryption_is_explicit_separate_and_redacted() {
+        let base = [
+            ("SAPFLOW_PUBLISH_USER", "publisher"),
+            ("SAPFLOW_PUBLISH_PASS", "publish credential"),
+            ("SAPFLOW_SRT_IMPL", "own"),
+            ("SAPFLOW_SRT_PASSPHRASE", "transport credential"),
+        ];
+        let config = load(&base, &[]).expect("encrypted own");
+        assert_eq!(
+            config.srt_crypto.as_ref().expect("crypto").key_size,
+            KeySize::Aes256
+        );
+        assert!(config.publisher.is_some());
+        let publish = |password| {
+            sapflow_core::PublishRequest::parse_srt_stream_id(&format!(
+                "publish:live/event-test:publisher:{password}"
+            ))
+            .expect("request")
+            .authorise(config.publisher.as_ref().expect("publisher"))
+        };
+        assert!(publish("publish credential").is_ok());
+        assert!(publish("transport credential").is_err());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("transport credential"));
+        assert!(!debug.contains("publish credential"));
+        let config = load(
+            &base,
+            &[
+                "--srt-cipher=aes128",
+                "--srt-passphrase",
+                "replacement secret",
+            ],
+        )
+        .expect("override");
+        assert_eq!(config.srt_crypto.expect("crypto").key_size, KeySize::Aes128);
+        assert!(
+            load(&[("SAPFLOW_OPEN_PUBLISH", "1")], &[])
+                .expect("default")
+                .srt_crypto
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn own_srt_encryption_rejects_invalid_and_ignored_configuration() {
+        let base = [("SAPFLOW_OPEN_PUBLISH", "1"), ("SAPFLOW_SRT_IMPL", "own")];
+        for secret in [
+            "".to_owned(),
+            "short".into(),
+            "x".repeat(80),
+            "has\0a nul byte".into(),
+        ] {
+            let mut env = base.to_vec();
+            env.push(("SAPFLOW_SRT_PASSPHRASE", &secret));
+            let Err(ConfigError::Invalid(error)) = load(&env, &[]) else {
+                panic!("bad secret accepted")
+            };
+            assert_eq!(
+                error,
+                "SAPFLOW_SRT_PASSPHRASE: 10..79 non-NUL bytes required"
+            );
+        }
+        for n in [10, 79] {
+            let secret = "x".repeat(n);
+            let mut env = base.to_vec();
+            env.push(("SAPFLOW_SRT_PASSPHRASE", &secret));
+            assert!(load(&env, &[]).is_ok());
+        }
+        for cipher in ["", "aes192", "aes256-gcm", "off"] {
+            let mut env = base.to_vec();
+            env.extend([
+                ("SAPFLOW_SRT_PASSPHRASE", "transport credential"),
+                ("SAPFLOW_SRT_CIPHER", cipher),
+            ]);
+            assert!(matches!(load(&env, &[]), Err(ConfigError::Invalid(_))));
+        }
+        assert!(matches!(
+            load(&base, &["--srt-cipher=aes128"]),
+            Err(ConfigError::Invalid(_))
+        ));
+        assert!(matches!(
+            load(&base, &["--srt-passphrase="]),
+            Err(ConfigError::Invalid(_))
+        ));
+        for args in [
+            vec!["--srt-passphrase=transport credential"],
+            vec!["--srt-cipher=aes256"],
+        ] {
+            assert!(matches!(
+                load(&[("SAPFLOW_OPEN_PUBLISH", "1")], &args),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
+        // Explicitly switching implementations must not silently drop crypto.
+        assert!(matches!(
+            load(
+                &base,
+                &["--srt-passphrase=transport credential", "--srt-impl=srt-rs"]
+            ),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

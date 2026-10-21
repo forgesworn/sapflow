@@ -14,6 +14,7 @@ bytes = "1.12.1"
 sapflow-core = { path = "../crates/sapflow-core" }
 sapflow-hls = { path = "../crates/sapflow-hls" }
 sapflow-srt = { path = "../crates/sapflow-srt" }
+sapflow-client = { path = "../crates/sapflow-client" }
 srt-protocol = "=0.4.4"
 
 [[bin]]
@@ -87,6 +88,27 @@ srt-protocol = { path = "../vendor/srt-protocol" }
 [[bin]]
 name = "muxer_timing"
 path = "fuzz_targets/muxer_timing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtmp_client"
+path = "fuzz_targets/rtmp_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mobile_media"
+path = "fuzz_targets/mobile_media.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "own_srt_caller"
+path = "fuzz_targets/own_srt_caller.rs"
 test = false
 doc = false
 bench = false

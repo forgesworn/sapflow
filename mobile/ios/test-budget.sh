@@ -1,0 +1,31 @@
+#!/bin/bash
+# Run the actual pure Swift budget/profile XCTest cases without a simulator.
+set -euo pipefail
+sapflow_root="$(cd "$(dirname "$0")/../.." && pwd)"
+sapflow_developer="$(xcode-select -p)"
+sapflow_frameworks="$sapflow_developer/Platforms/MacOSX.platform/Developer/Library/Frameworks"
+sapflow_testlibs="$sapflow_developer/Platforms/MacOSX.platform/Developer/usr/lib"
+mkdir -p "$sapflow_root/target"
+sapflow_scratch="$(mktemp -d "$sapflow_root/target/sapflow-ios-budget-XXXXXX")"
+trap 'rm -rf "$sapflow_scratch"' EXIT
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/EncodedWorkBudgetTests.swift" > "$sapflow_scratch/main.swift"
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/DestinationProfileTests.swift" >> "$sapflow_scratch/main.swift"
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/NativeDeadlineTimerTests.swift" >> "$sapflow_scratch/main.swift"
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/SrtDestinationTests.swift" >> "$sapflow_scratch/main.swift"
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/CaptureOrientationTests.swift" >> "$sapflow_scratch/main.swift"
+cat >> "$sapflow_scratch/main.swift" <<'SWIFT'
+let suite = XCTestSuite(name: "Native broadcaster invariants")
+suite.addTest(EncodedWorkBudgetTests.defaultTestSuite)
+suite.addTest(DestinationProfileTests.defaultTestSuite)
+suite.addTest(NativeDeadlineTimerTests.defaultTestSuite)
+suite.addTest(SrtDestinationTests.defaultTestSuite)
+suite.addTest(CaptureOrientationTests.defaultTestSuite)
+suite.run()
+guard let result = suite.testRun, result.executionCount == 14, result.hasSucceeded else { exit(1) }
+SWIFT
+swiftc -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
+  -Xlinker -rpath -Xlinker "$sapflow_frameworks" \
+  -Xlinker -rpath -Xlinker "$sapflow_testlibs" \
+  "$sapflow_root/mobile/ios/Sources/EncodedWorkBudget.swift" "$sapflow_root/mobile/ios/Sources/DestinationProfile.swift" "$sapflow_root/mobile/ios/Sources/SrtDestination.swift" "$sapflow_root/mobile/ios/Sources/NativeDeadlineTimer.swift" "$sapflow_root/mobile/ios/Sources/CaptureOrientation.swift" "$sapflow_scratch/main.swift" \
+  -o "$sapflow_scratch/budget-tests"
+"$sapflow_scratch/budget-tests"

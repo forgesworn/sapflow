@@ -1,0 +1,569 @@
+# Mobile delivery status
+
+The delivery goal is active. This record separates implemented code, local
+tests, native packages, actual broadcasting, physical acceptance and release.
+It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
+or [native performance contract](native-performance-contract.md).
+
+Latest local checkpoint, 21 October: the current Rust workspace passes 332
+tests, format and strict Clippy. Both explicitly run SDK decoder/reference
+tests and the origin's three-recording epoch decoder gate pass. AddressSanitizer
+runs with overflow checks pass 61 seconds each for RTMP client, mobile media and
+own SRT caller, with 162,047, 3,665,058 and 20,669 executions respectively. These
+finite local runs do not replace longer fuzz, CI or physical acceptance.
+
+The Pixel has published real hardware video and AAC through our AES256 SRT
+sender to our encrypted own listener. A bounded origin sample independently
+decodes with about 9 ms between track starts, and the unchanged native Safari
+source presents frames. This initial run uses 120 ms negotiated SRT latency,
+not the two-second reference network profile. Its independent phone recording
+has not been accessed. A separate normal-Stop correction passes 112 Android
+tests, lint and isolation; its physical shutdown/restart gate is still pending.
+
+V4V commit `711d1a8077c4bea9e1ed4bb155a9bcf6a8bcbb2b` on a separate local branch
+prevents ended-event telemetry resurrection and rejects recording copies when
+the prepared session changes. Live browser and generated-media ingest gates
+pass. Scoped native grants, active origin revocation and callback session
+identity remain open; global lab credentials are not a production connector.
+No changes from this task have been pushed or deployed publicly.
+
+## Product constraints
+
+- Standalone native SwiftUI iOS and Compose/Kotlin Android broadcaster, backed
+  by a reusable Rust SDK and suitable existing ForgeSworn components.
+- Our own SRT and RTMP/RTMPS protocol state machines. Platform hardware video
+  and native AAC, maintained TLS/cryptographic primitives, no borrowed
+  broadcaster SDK. Never read libsrt/srt-rs implementation source.
+- Reliable publishing, independent recording and origin playback first;
+  RelaySwarm follows its existing qualification gates.
+- Open source, unrestricted free Android edition through Zapstore and no
+  required Google Play runtime for that route.
+- Always-free, unlimited, watermark-free V4V broadcasting in every build.
+  Store pricing and the external-destination allowance remain undecided.
+- Performance superiority needs matched physical measurements. Proposed
+  percentage improvements are not achieved results.
+- Real camera footage, extracted frames, phone recordings and archives that
+  contain them must never be committed or published. Private lab evidence
+  remains outside source control; only verified generated media may be a fixture.
+
+## Licensing decision
+
+The owner chose to retain MIT for the broadcaster and SDK, accepting permitted
+closed commercial reuse and competing through price, performance, reliability
+and the official product. The existing public Sapflow repository remains MIT;
+no licence file or package licensing metadata needed changing. The valuable
+client, protocol and native app work stays within that decision. Third-party
+copyright and licence notices remain required.
+
+Always-free unlimited V4V and the unrestricted Zapstore edition remain firm.
+Store pricing, allowances and paid value are separate product decisions and
+have not been implemented or silently frozen by this licensing choice.
+
+## Current implementation and evidence
+
+Source base at delivery start: 8af1d91 on the existing origin-fix branch.
+The other origin session subsequently advanced the base through 37f428a.
+The mobile work is isolated on feat/native-broadcaster-sdk.
+Its changes were preserved; these are development bases, not release receipts.
+
+| Component | Evidence so far | Remaining boundary |
+| --- | --- | --- |
+| sapflow-client | 36 regular tests passed, two external tests run separately; own SRT/MPEG-TS publisher and exact bytes into independent libsrt | Native journey, storage and platform qualification |
+| Own RTMP publisher | Bounded Hard/Soft/Dynamic peer-window governor and real media-age deadlines; independent ffmpeg received 180 H264 and 283 AAC frames over 5.9 MB; an explicitly injected Hard control separately exercised the governor | Sustained mobile TLS/network and performance qualification |
+| Own SRT caller/sender | 54 unit, 21 caller and 3 differential tests passed before encryption changes | Complete encrypted interoperability, negotiated late drop, adaptation, reconnection and allocation optimisation |
+| Independent SRT receiver | libsrt 1.5.4, exact bytes in no-loss and six seeded impaired profiles | Physical carriers, sustained runs, congestion/energy comparison |
+| Native ownership/sample/session bindings | 28 regular binding tests passed; expanded actual Swift and Kotlin consumers exercised shared samples, recording and SRT handshake/stop/stats | Physical hot-path profiling, complete session integration |
+| Apple package | ARM64 macOS, iOS and Simulator slices refreshed with RTMP/session bindings; external Swift consumer and real unsigned network app/test bundle compiled | Signing/install and physical qualification |
+| Android package/app | Refreshed four-ABI AAR and external Kotlin consumer passed; actual network APK built, 16 JVM tests passed, lint zero errors | Current-source package refresh, audio/file recording and sustained physical qualification |
+| Physical Android capture and broadcast | Pixel 10 Pro XL, Android 17/API 37: actual hardware H264 and native AAC through our RTMP to our origin; Safari picture and sound confirmed by owner; independent decode of 90 video and 140 audio frames | Owner measured 10.5 s end-to-end delay; latency investigation, phone recording, sustained and comparative measurements remain open |
+| Native iOS capture/recording | Hardware-only VideoToolbox, native AAC and independent fragmented AVAssetWriter source; actual app and test bundle compiled; 5 pure Swift tests passed | Physical capture, recording decode/recovery and complete publishing journey |
+| MPEG-TS writer | Independent ffmpeg video/audio and audio-only decode passed; bounded 1,316-byte chunks and explicit copy accounting | Real native sender integration and sustained measurements |
+| Encrypted SRT | Integrated tests and independent bidirectional AES-128/256 rotation/loss tests passed; wrong/missing keys delivered no media | Full hostile-input qualification, authenticated destination secret provisioning, mobile integration and performance |
+| Fuzzing | RTMP-client, SDK-media and own-SRT-caller pass current ASAN/overflow runs for 61 seconds each, using generated seeds | Longer runs, CI and physical network acceptance |
+
+The SRT receiver harness is
+`python3 crates/sapflow-srt/tests/black_box_sender.py`. Its initial independent
+receipt covered 67,492 bytes, SHA-256
+`4b1b1b22fd4df8cb65c2ae31b5a98c7f3dd084d42d75eac8c1acfa60f63ebaf3`.
+Impaired profiles used 10% data loss, 10% ACK loss and 0 to 20 ms reordering.
+They required retransmissions; these are compatibility results, not efficiency
+or Larix-parity evidence. Task-owned receivers, proxies and staging were removed.
+
+The encrypted harness is
+`python3 crates/sapflow-srt/tests/black_box_crypto.py`. Eight positive cases
+cover AES-128 and AES-256 in both directions against libsrt 1.5.4, clean and
+with seeded 10% data loss, 10% ACK loss and up to 20 ms reordering. Each
+delivered the same 140,812 bytes, SHA-256
+`59643299c6a6890d9a2c74cef4aaf3a02395db80a4d4a01d5af2d2221aa84339`,
+with both key slots and three refresh requests observed. Four wrong/missing
+secret cases delivered zero media. These finite executable checks do not
+establish cryptographic authentication, broad SRT compatibility or physical
+network acceptance. AES-CTR does not authenticate media. Control packets and
+stream IDs remain visible, as specified in the public
+[SRT protocol draft](https://datatracker.ietf.org/doc/html/draft-sharabayko-srt-01#section-6.1.1).
+Those initial encrypted checks preceded the separate server/default integration
+recorded below; they did not switch public credential policy.
+
+Native build commands are `node scripts/build-native.mjs check`, `apple` and
+`android`. An explicit `android --abis=arm64-v8a` produces a separately named
+ARM64-only development package; the default Android command still builds all
+four ABIs. They reuse this checkout's target directory and remove owned staging.
+Packages are development artefacts under `target/native-packages`; they are
+not published or signed mobile releases. Builders retain checksums and notices.
+The refreshed Apple development archive SHA-256 is
+`71f4d0c1d046336b21f68e207a788770f0854b85def0548a097e32540d6434a6`.
+This newer snapshot includes recording, microsecond SRT scheduling and RTMP
+wire-age deadline bindings; its expanded external Swift consumer passed.
+The matching ARM64-only development Android archive is
+`ca03f58dbe856082b1d57722d979eab93b122ffc8f22961013540871d71b96cf`.
+Its expanded Kotlin consumer and archive readback passed.
+The refreshed four-ABI Android archive SHA-256 is
+`748744876af3e751c34b4c85df82ce52a4f08b462c594c7654a3403dee2ec673`.
+Subsequent source changes require another package refresh; these are finite
+snapshot receipts, not qualifications of later protocol revisions.
+
+## Delivery gates still open
+
+### Sustained-publishing investigation, 21 October
+
+The frozen Android `drain-throughput-debug.apk`, SHA-256
+`159643b2fab9988e0e896014e8e8f61dacbc04cb685c46eebf769a5981f96f6b`,
+passed 37 JVM tests and lint with zero errors before its physical run. It
+released publisher admission on the worker rather than waiting for a codec
+handler continuation. The initial physical observations had zero publishing
+resets: queue high-water 405 ms, five startup wait-for-IDR rejections and no
+additional ingress rejection at about three minutes.
+
+This candidate failed sustained acceptance. The origin logged its first
+missing-media discontinuity about eight minutes after connection, followed by
+16 discontinuities before the clean stop. At the ten-minute checkpoint the
+phone reported 11 queue resets and 1,720 dropped samples. The publisher had
+consumed 45,369 samples against 47,169 captured audio/video samples. Average
+socket writes were about 220 microseconds; average per-sample consume was
+8.255 ms and handler continuation delay was 6.157 ms. These measurements point
+to insufficient handoff throughput on this device, without establishing a
+general network or codec performance result. Increasing queue limits is not
+the fix being qualified.
+
+The bounded-batch candidate, SHA-256
+`60819df1a94bfa964568724842c5c72c7ab01a6f88bf36435f6ffbe822308740`,
+passed 42 JVM tests and lint with zero errors. It retained handler ownership of
+native queue pops, existing queue limits and independent recording. At about
+10 minutes 50 seconds its physical queue checkpoint had zero resets, zero IDR
+requests and a 277 ms high-water mark. Only three startup wait-for-IDR samples
+were rejected. The whole 12 minute 35 second origin session had no muxer breaks.
+
+That run still failed playback acceptance: audio progressively fell behind
+video and Safari stalled. Independently inspected live-part bytes contained
+video PTS 493.333 to 500.767 seconds and AAC PTS 464.526 to 470.244 seconds.
+Accepted AAC output also advanced slower than the required 46.875 units per
+second. Zero queue resets therefore did not establish A/V continuity. The
+frames-read counter did not validate microphone progress against its hardware
+clock; AAC input availability shared the busy video/fanout callback handler.
+The next source candidate isolates AAC callbacks and validates real microphone
+position/time, read backlog and input/output cadence. Physical acceptance of
+that correction remains open. No phone recording was accessed for diagnosis.
+
+The origin in that run was SHA-256
+`8639ee51056a01479bb37d1a7509f977ae5d95ae43daff28a20b42dd60272f68`.
+The HLS test viewer could initially play around 1.5 to 2.6 seconds from its
+estimated origin edge. That metric is not a capture-to-screen measurement.
+Later viewer stalls coincided with real upstream gaps; earlier parsing
+warnings still need their full fragment/timing evidence. The reusable
+`tests/live-viewer.html` now captures error reasons, all buffered ranges,
+fragment/part metadata, response metadata, bounded media bytes, init segments
+and adjacent parts. Its diagnostic retention/export checks run with
+`node tests/live-viewer-diagnostics.test.mjs`.
+
+The viewer/performance fixtures are committed locally as `db346ef`. The
+performance observer has 25 passing deterministic tests and a completed
+lightweight idle-device smoke check. A short late-run diagnostic with repeated
+memory-query timeouts was intrusive and is not a valid performance baseline;
+use its explicit lightweight options for subsequent tick-only observations.
+No matched Larix run or energy comparison has been completed.
+
+The iOS orientation source now produces physical portrait encoder dimensions
+and starts a new publisher/recording segment for live rotation. Fourteen Swift
+tests, an unsigned arm64 app/test build and an independent portrait RTMP
+fixture passed. Physical iPhone orientation and viewer recovery remain open.
+The next Android portrait/audio candidate passed 68 JVM tests and lint with
+zero errors. On the Pixel, its real H.264 bitstream decoded as 720×1280 with
+autorotation disabled; 546 video and 849 AAC frames were independently decoded
+from the short origin prefix. This proves encoded dimensions, not upright
+four-pose acceptance: no asymmetric visual chart was available.
+
+That candidate failed its hardware audio-continuity guard after about 20
+seconds. A second source defect then reset an already-completed microphone
+worker flag during Stop, preventing native teardown until its six-second
+deadline. The origin eventually closed on idle timeout and finalised an
+18.2-second prefix. The failed app was force-stopped; its private recordings
+were not accessed. A bounded dedicated PCM-reader/pump path and monotonic
+worker-completion fencing were then tested in a separately frozen candidate.
+Its 75 JVM tests and lint passed, and physical failure cleanup subsequently
+completed: all native owner flags were released, the publisher closed promptly
+and the origin finalised a 53-second prefix. Throughput still failed after
+about 55 seconds when all eight PCM blocks were occupied, seven waiting and
+one held by the encoder pump. The microphone hardware position continued to
+match frames read. Long encoded-callback delays and rising allocation counters
+remain diagnostic evidence, not a completed causal or performance result.
+The next implementation moves compressed AAC construction/release to its audio
+owner and uses a bounded immutable-handle handoff to the single fanout owner.
+
+An offline, synthetic binding benchmark on the Pixel measured about 0.251 ms
+mean for one native sample getter, 1.063 ms for four getters, 0.474 ms for sample
+creation/release and 2.132 ms for creation/fanout/both pops/releases. Each case
+used 32 warm-up and 200 measured iterations through the actual installed AAR.
+This finite debug benchmark identifies boundary overhead; it measures no
+broadcast quality, whole-app energy or advantage over Larix. A combined native
+RTMP operation now passes 13 targeted tests and real generated Swift/Kotlin
+host consumers, including successful results, partial output, deadlines and
+errors. Its refreshed ARM64 development AAR is SHA-256
+`4d782d501ab8c171aaf83a7dcbe70675988c32f5551c3916e1149f530286fc1a`.
+The previous `5f0822…` package is preserved under
+`target/native-packages/android-arm64-v8a-before-fused`; the completed physical
+runs above used that older package.
+
+An installed Pixel debug benchmark then measured the previous RTMP call
+sequence at 2.261 ms mean and the combined operation at 1.330 ms mean, with
+200 measured iterations after 32 warm-up iterations per case. The combined
+case had an 82.934 ms maximum outlier; its 95th percentile was 1.019 ms. This
+is a sequential synthetic binding comparison, including sample creation and
+release, without camera, microphone, sockets or decoding. It is not sustained
+broadcast, battery or Larix evidence. The frozen offline-only APK is SHA-256
+`444d473a9a7f29844862eae9ed08373dadff96d5d86ac000a1a63a2e066353f3`;
+its receipt and displayed results are retained under `target/mobile-android`
+and `target/physical-android`. Live activation remains to be qualified.
+
+The combined-operation/AAC-owner candidate passed 85 tests and an exact-source
+M4 build/lint check with zero errors and seven warnings. All 71 frozen source
+hashes matched, as did the release-built native library. Its APK was re-signed
+with the existing development certificate; all 149 non-signature payload
+entries were unchanged. No uninstall or phone-recording access was needed.
+
+Its physical run still failed after about 30.6 seconds: a compressed AAC
+handoff reached 256.158 ms against its 250 ms bound. PCM stayed caught up with
+a two-block high-water mark, while publishing had zero resets and a 99 ms
+queue high-water mark. Cleanup released every owner and the origin promptly
+finalised a 28.433-second prefix. The frozen APK is SHA-256
+`d0a56e369418346b41fbec580d60947d11c5464d1f967563a5fafc581de686ff`.
+The physical receipt is
+`target/physical-android/aac-owner-fused-physical-receipt.json`.
+
+The reported 4.96 ms AAC conversion average includes clock work, platform
+buffer access, native sample construction and platform buffer release. It
+does not isolate Rust or JNA cost. About 188 MB of reported allocations and
+504 ms of cumulative GC time over this run do not prove a 256 ms GC pause.
+The app was debuggable; performance attribution now requires a controlled
+non-debuggable internal build with the same media code, AAR and queue bounds.
+
+The controlled non-debuggable/profileable variant passed the same 85 tests,
+lint with zero errors, release-source isolation and actual APK manifest/native
+checks. Its 74-input archive changes only build/verification inputs from the
+previous candidate. With explicit ART `speed` compilation in both controls,
+the fanout benchmark fell from 2.133 ms to 0.100 ms and the combined RTMP case
+from 1.284 ms to 0.062 ms. These are finite offline control measurements.
+
+The same variant still failed live acceptance after about 63.7 seconds on a
+212.213 ms PCM block age against its unchanged 200 ms bound. Publishing had
+zero resets and a 127 ms high-water mark; all cleanup owners completed, and
+the origin promptly finalised a 61.034-second prefix. The installed APK is
+SHA-256 `71f9f9cd4796b58035e9197d7cb9bca087a079d164540abb5598452b81102e20`.
+Its physical receipt is
+`target/physical-android/qualification-physical-receipt.json`.
+
+Own-process GC logs identify `NativeAlloc` collections and actual allocation
+waits up to 827.105 ms around the failure. The final collection's reported
+pauses were 0.719 ms and 1.227 ms, while total collection time was 1.117 s.
+The long wait is established. Two subsequent process-scoped allocation traces
+passed loss/error/heap validation before attribution. The native trace sampled
+605.46 MB of cumulative allocation, ending with 3.60 MB of tracked live bytes;
+actual JNA Memory/Structure allocation sites accounted for 3.43%. Generic JNI
+frames around every Rust call are not evidence of JNA allocator dominance.
+That instrumented run failed with all eight PCM blocks occupied and completed
+cleanup. Profiling overhead prevents treating it as a performance baseline.
+
+The separate 30-second ART trace sampled 199.50 MB of allocation. Explicit JNA
+Structure, Memory, marshalling and cleanup contexts accounted for 128.51 MB
+(64.42%); UI/text accounted for 2.63%, and app diagnostic formatting for 0.95%.
+Many sampled stacks pass through generated status construction during receiver
+clones, fanout pops and buffer frees. ART allocation records do not establish
+retained bytes or leaks. The short run remained capturing until normal Stop,
+returned to idle and finalised a 29.8-second origin prefix. It does not pass
+sustained acceptance or prove the cause of a particular GC wait.
+
+Validated trace receipts and complete attribution are retained in
+`target/physical-android/native-alloc-trace/native-analysis-22333.md` and
+`art-analysis-23473.md`. The controlled experiment now reproducibly generates
+four lazy per-thread nested call-status slots, retaining legacy allocation on
+cache overflow. Error-buffer ownership, nested frees, native handle consumption
+and all media/queue bounds remain unchanged. Two generator-guard tests, eight
+actual host helper suites, the Swift/Kotlin consumers and independent review
+passed. The extracted AAR-class consumer also verifies compiled cache reuse.
+The refreshed ARM64 AAR is SHA-256
+`6102340fe9df6b9eaf674fa02afb3c9dd6d89dbd63998fbe0ede5816798fd4b2`;
+its native ELF remains byte-for-byte identical to the preceding control.
+The exact-source Android comparison build passed 85 tests, lint with zero
+errors and release-source isolation. Its 76 frozen Android inputs change only
+the verifier and add its tests/fixture. Physical allocation attribution and an
+untraced sustained run remain required before calling this a performance fix.
+Neither failed candidate established Safari playback: the viewer's first
+manifest request followed unpublication, so the resulting 404 is not an
+independent origin regression.
+
+The installed status-cache comparison APK is SHA-256
+`8d5205796febf19864e6dd1322974e9fbca6810220555fa83354a5bc8db6cb4c`.
+Actual manifest/native checks passed; all 151 non-signature ZIP entries were
+unchanged by re-signing with the existing development certificate. The same
+explicit ART `speed` setup and offline benchmark measured a native getter at
+2.28 microseconds mean versus the control's 22.15, and combined RTMP at 16.92
+versus 61.96. Each case used 32 warm-up and 200 measured iterations. These are
+sequential finite synthetic results, not sustained or comparative app evidence.
+
+The subsequent live run exposed an owner-confirmed orientation failure:
+portrait/landscape appeared swapped, movement distorted the image, and fixed
+landscape put the grass on the right. Independent origin decoding with
+autorotation disabled confirms sideways, stretched pixels inside a 1280×720
+H.264 stream with no display-rotation metadata. The last epoch finalised with
+83.4 seconds of video and 83.409 seconds of AAC after normal Stop. Multiple
+orientation-triggered publisher restarts invalidate a steady throughput
+comparison. This is not evidence that the prior audio stall was fixed.
+
+The correction under review separates the Camera2/SurfaceTexture producer
+transform from the app's encoded and preview rotations, keeps raw-buffer
+dimensions in the sensor basis, and requires stable pose input before a new
+epoch. Asymmetric labelled-corner/producer-matrix fixtures and a new physical
+four-pose acceptance run are required; previous dimension-only checks did not
+prove upright images. Private receipts, decoded origin frame and benchmark
+results remain under `target/physical-android/status-leases-*`.
+
+The first producer-transform correction passed 89 tests and independent source
+review, but failed physical acceptance: fixed landscape became upside down.
+The actual Pixel matrix confirmed that the producer already supplied the sensor
+quarter-turn. A bounded live-origin segment independently decoded the same
+upside-down 1280×720 pixels without rotation metadata. Normal Stop finalised a
+163.8-second prefix; this finite run is not sustained acceptance. The initial
+software oracle had used the wrong rear-camera physical rotation convention.
+
+The revised correction uses the standard rear-camera sensor/pose convention,
+with positive physical-pose vertex rotation for encoding and negative display
+rotation for preview. Its independent world-labelled corner and ground-point
+fixtures catch the prior upside-down result. These labels are test oracles;
+runtime orientation uses camera metadata and the texture matrix, with no image
+recognition or per-phone calibration. The 77 frozen inputs changed only the
+orientation plan and tests from the previous correction. All 90 JVM tests,
+lint with zero errors and independent source review passed. The APK is
+SHA-256 `dc07e2330700ded6e43dd6e7023f552cf07a3044880e6a037c9f214cc016ef3c`;
+the AAR/native library and all 151 non-signature entries survived verification
+and re-signing unchanged. Independent inspection of the prepared landscape
+preview and a bounded live-origin decode confirms upright, proportionate
+1280×720 pixels. After physical rotation, the owner confirmed upright portrait
+on the Pixel; an independent live-origin decode confirms upright 720×1280
+pixels with autorotation disabled and AAC present. Both sampled live segments
+decoded without errors. Four-pose qualification remains open. Evidence is under
+`target/mobile-android/orientation-world-*` and
+`target/physical-android/orientation-world-*`; the prior failure remains under
+`target/physical-android/orientation-producer-*`.
+
+Safari initially played the landscape stream with advancing media time and
+decoded frames. It then stopped after the resolution changes and did not
+recover. Its retained fatal error reports a media-sequence mismatch: the old
+and new resolution both advertised sequence 7 with different segment URIs,
+while resetting the media and discontinuity sequences to zero. Distinct file
+prefixes do not make that timeline replacement legal. The frozen origin has
+no reconnect grace. Current main adds grace for matching codec configuration,
+but its changed-codec path still replaces the muxer. The correction in progress
+backports the grace/health changes and preserves the HLS timeline through
+resolution epochs, with immutable per-epoch init segments and recording rolls.
+The viewer also gains bounded recovery and truthful stalled/error status;
+source reloads must not conceal an invalid origin timeline.
+
+The continuity candidate passed 147 focused Rust tests, strict Clippy and the
+explicit independent recording-decode gate. Its release binary is SHA-256
+`8643d87c47005c84a34ba03c56329c0e24b469c03c1615122fd4446a78e3bdd8`.
+A private lab deployment retained presentation identity through three observed
+codec epochs: 598 playlist observations over 20 minutes found no numbering,
+URI, target or retained-init/media mutation. Bounded origin samples decoded
+both actual portrait and landscape video with AAC. These results correct the
+previous sequence-reuse defect; they do not qualify Safari recovery.
+
+Physical native Safari acceptance still failed. One portrait change paused
+the existing element and the owner pressed Play. A later change stalled it.
+Both runs kept one source assignment. Rapid physical rotation subsequently
+left the Android app in ERROR, with every camera, audio and publisher owner
+released. Its first failure message had been overwritten by a normal rotation
+message. Normal Prepare/Start recovered the rear landscape stream without
+uninstalling the app or accessing its private recordings. The independent
+diagnostic correction preserves the first failure cause and bounded lifecycle
+codes; its frozen build passed 94 JVM tests, qualification isolation and lint
+with zero errors and seven warnings. That APK has not yet been physically
+qualified and is not a claimed rotation fix.
+
+The viewer investigation now uses a separate automated synthetic event.
+An unchanged native element accepted five aspect changes with advancing
+decoded frames and no post-start pause during three publisher cycles. This
+establishes that changing dimensions alone is not sufficient to reproduce the
+Pixel failure. Subsequent replays used bounded excerpts from private
+lab-origin recordings and phone-like reconnect gaps. No phone recording was read.
+The arrival-clock PROGRAM-DATE-TIME defect now has a failing legacy regression
+and a corrected media-clock anchor. All 151 focused unit tests and strict
+Clippy pass. Candidate binary SHA-256
+`d1344a4ac5659af03657f18b56fc415f1f228d4c433864051365be416ebaf6bc`
+was tested on a separate loopback origin, retaining the Pixel origin. Both
+old and corrected origins accepted the same mobile-media replays, six
+20-second publishers with two-second reconnect gaps. Each native element
+kept one source and automatically accepted four aspect changes. Expected
+outages caused about 2.3 seconds of buffering before automatic recovery.
+The corrected playlist's six sampled adjacent same-continuity date pairs had
+zero timing mismatch; the old origin's pairs ranged from -6 to +2 ms.
+This proves the metadata correction, not a cure for the owner's pause.
+The temporary replay excerpts and their origin recordings were removed after
+retaining metadata and hashes. The comparison origin, extra forward and three
+synthetic browser windows were stopped; the original Pixel viewer was restored
+without changing its source.
+
+The qualification-only camera-pose control subsequently passed 102 JVM tests,
+lint with zero errors and seven existing warnings, source review and actual
+release-APK isolation checks. Its installed APK is SHA-256
+`f77c0636cd39f2ff8ceba2d3e88a8bfa2645f9e1c2d22ec1e2bd5f1f98eacd7c`.
+The control cannot start capture or choose a destination, is restricted to
+the foreground qualification build and is absent from the release entrypoint.
+It drives the production pose selector and real encoder restart. Six actual
+camera/encoder changes and six further changes with Android window/surface
+rotation completed without replacing the app process. The window test restored
+all rotation settings. Safari accepted all six window-test aspect changes
+with one source and no pause, but also had two sampled presentation stalls.
+These are finite automated tests with a physically stationary phone; they do
+not qualify upright physical rotation, rapid rotation, latency or the owner's
+previous pause. The corrected date-anchor origin is now the private primary.
+
+The local viewing proxy also logged upstream connection-address failures and
+connection timeouts taking about 26 seconds. Its original configuration opened
+a new upstream connection per HLS request. A private fixture change enabled
+an upstream keepalive pool and added connect/header/response timing. Over
+1,500 subsequent requests succeeded with zero measured connection delay;
+the sampled forward sockets had no TIME_WAIT entries, versus 311 beforehand.
+This establishes connection reuse, not the cause of every earlier stall.
+Four additional native camera and window rotations completed on the same app
+process with settings restored. Their Safari presentation result remains under
+investigation: the presentation callback counter stopped before these changes
+while the media clock and decoder counter continued. No Play, seek or source
+replacement was used to conceal that result. All receipts are metadata in
+ignored private lab storage; no real footage is part of the source commits.
+Physical orientation and same-source Safari acceptance remain open.
+
+The owner subsequently confirmed that the existing picture and sound were
+working despite its stalled label, with a very large delay. The observer now
+reports `unverified` when the clock advances without fresh selected frame
+evidence, preserving the strict paired-evidence `playing` gate. It reserves
+`stalled` for sustained clock nonprogress and never silently substitutes decoder
+counts for a present but failing presentation API. Its deterministic regression
+tests pass; this changes observation specificity, not playback behaviour.
+
+A separately labelled fresh native session on the repaired proxy measured
+about 0.4 seconds buffered ahead and roughly one second of arrival-derived
+programme-clock offset, without a seek. The owner still reported a large real
+delay with working picture and sound. That failed physical observation takes
+precedence over any inference from those metadata estimates. Capture, encoder,
+publishing and actual screen delay remained under investigation. The fresh
+comparison page subsequently acquired a different browser instance and was
+paused; no continuous observation is claimed across that replacement. After
+retiring the old test tabs, a separately recorded single native viewer kept one
+source with advancing presentation callbacks. The owner compared a physical hand
+movement and reported under two seconds. This is one approximate physical
+observation, not a latency percentile, sustained qualification or a competitor
+comparison.
+
+The owner then rotated the real Pixel to upright portrait and back to landscape
+with the same Safari window untouched, confirming that picture and sound
+recovered automatically after both changes. The retained native event log shows
+720×1280 then 1280×720, automatic buffering recoveries of about 0.94 and 2.07
+seconds, no pause and one source assignment in the unchanged browser instance.
+Presentation callbacks continued afterwards and the app process was unchanged.
+This is the first successful bounded physical rotation check on the repaired
+viewing path. It does not establish all four poses, rapid rotation, sustained
+latency after repeated changes, physical iPhone behaviour or a release gate.
+
+The task's origin, local tunnel and viewing fixtures remain running for the
+continuity investigation; their private process/port manifest and synthetic
+evidence remain under `target/mobile-origin-av`. The primary Pixel stream is
+landscape at the latest observation. No profiler or task emulator is running.
+The native-HLS fixture observes one source without automatic Play, reload or
+seek, so manual intervention cannot count as automatic recovery. The master's
+omitted RESOLUTION is permitted by RFC 8216 but leaves Apple's authoring
+requirement unresolved; no full Apple-authoring compliance is claimed.
+
+Fetched `origin/main` at `8ee5704` now contains the separate M6b passphrase
+commit `771c750d61006ab1c2bbfde97ee3f130f24cd828`, server integration `e608bf2`
+and own-SRT-default change `681d458`, delivered by the other session. Mobile
+development no longer blocks that integration. The task's M6b worktree was
+verified clean with no unpushed commits and its HEAD an ancestor of
+`origin/main`, then removed using `git worktree remove` and pruned. This mobile
+branch and the frozen lab-origin binary have not yet incorporated the newer
+server default; these observations do not establish mobile SRT or release
+acceptance. This session did not push those changes.
+
+Keep every gate in the source delivery plan open until its actual evidence
+exists. In particular:
+
+- B0: finish device/OS matrix, real reference measurements, interface and
+  queue/thread/copy budgets, and destination authorisation contract.
+- B1: build and install actual native consumers, capture on physical phones,
+  verify single encode and seekable/recoverable recording, measure overhead.
+- B2: retain origin fixes and prove authorised encrypted ingest, reconnect
+  continuity in real players and the V4V event/replay contract.
+- B3/B3R: complete our encrypted SRT and RTMPS publishing paths, independent
+  interoperability, hostile-input fuzzing and impaired-network acceptance.
+- B4/B4R: attach real publishers; complete manual/V4V creator flows, observed
+  media status, audio-only/external audio, controls, standby and safe profiles.
+- B5: sustained physical/network/thermal/storage tests, SDK consumption,
+  route-specific signed packages, upgrade and free-V4V behaviour, owner
+  acceptance, release readback and any production decision at its own gate.
+- B6: native RelaySwarm/browser interoperability, verified delivery/fallback,
+  consent, metered data and measured benefit, preserving existing peer gates.
+- B7: separately qualified wider formats, advanced accessories, recording
+  distribution, optional bonding and studio work as scoped by the plan.
+
+A physical iPhone was reachable during discovery. The owner's physical Pixel
+on a remote development host has now run the actual network debug app. Its
+first origin run decoded video but omitted audio; the server's provisional
+video-only init was then corrected for AAC configuration arriving before
+servable content. The fresh session independently decoded H264 720p and AAC
+48 kHz mono, and the owner confirmed both picture and sound in Safari.
+
+The owner subsequently measured 10.5 seconds of glass-to-glass delay. Safari's
+native player was about six seconds behind media it had already downloaded.
+This is a tracked latency failure, not a passed performance gate. A local
+live-part player and native capture-age measurements are being used to
+separate player buffering from camera, encoder and transport delay. No claim
+of beating Larix, sustained reliability or energy efficiency follows.
+
+Private UI, frozen APK, decode receipts and local process/port manifests are
+retained under `target/physical-android` and `target/mobile-origin-av`. The
+Pixel later locked, ending its foreground-only session. A fresh recording
+and deadline candidate was installed while locked; the next physical latency
+test awaits unlock. An origin on the remote development host and a local
+HTTP/2, gzip viewing fixture are prepared to remove the ADB ingest bridge
+from the next measurement. The old ADB reverse and original origin were stopped.
+The earlier video-only origin and its tunnel were stopped cleanly after its
+recording finalised. No task-created emulator was started. No store submission,
+paid subscription or production deployment is claimed here.
+
+The last broad check, before encrypted SRT integration, passed 250 tests with
+one external ffmpeg test ignored by default. That external MPEG-TS test was
+also run explicitly and passed. Workspace strict clippy passed. Re-run the
+appropriate checks after integration; these receipts are not release approval.
+
+## Delegation and integration
+
+- GPT-6.1 Sol, high effort: reusable SDK core, then native iOS implementation.
+- GPT-6.1 Sol, high effort: RTMP client, then native Android implementation.
+- GPT-6 Astra, high effort: own SRT sender and independent wire testing, then
+  MPEG-TS integration.
+- Parent: source/scope coordination, native bindings/packages, integration,
+  consequential review, whole-workspace validation and release evidence.
+
+Assignments do not establish a cost saving. Actual usage/cost is not recorded
+as measured savings. Shared Cargo builds are serialised by agreement, with no
+new CARGO_TARGET_DIR or CARGO_INCREMENTAL override. Only task-owned staging,
+services, emulator resources and build output may be removed. Retain named
+evidence and packages while their delivery/qualification work remains active.

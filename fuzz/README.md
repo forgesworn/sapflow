@@ -12,6 +12,9 @@
 | `own_srt_listener` | Our SRT listener (`sapflow_srt::Listener`) as the server drives it: datagrams from three peers, time steps, accept or refuse, the application closing connections. Each peer echoes its SYN cookie and addresses the socket id it was given, so data, ACKACKs, drop requests and shutdowns reach open connections. Checks that everything sent parses and that a timer exists exactly while connections do. Seeded with recorded sessions (see below) |
 | `rtmp_session` | Our RTMP connection (`sapflow_hls::rtmp`): from C0 on arbitrary bytes, or replaying the recorded ffmpeg session to its publish and continuing with arbitrary chunk bytes so media reaches `FlvIngest`. Seeded from `crates/sapflow-hls/tests/fixtures/ffmpeg-rtmp-publish.bin` (see below) |
 | `amf0` | AMF0 decoding (every RTMP command and metadata message) and stable re-encoding |
+| `rtmp_client` | Own publishing client before or after an original publish exchange, then fragmented hostile receiver bytes; cancellation clears pending output |
+| `mobile_media` | SDK H264/AAC configuration and compressed sample admission with bounded hostile framing and timing |
+| `own_srt_caller` | Own sender before or after an original caller/listener exchange, hostile receiver traffic, stray peers, bounded payload admission, time and cancellation |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
@@ -39,6 +42,39 @@ listener target needs room for whole sessions:
 
 ```bash
 RUSTC_BOOTSTRAP=1 cargo fuzz run -O -a own_srt_listener corpus/own_srt_listener -- -max_len=65536
+```
+
+The caller target uses a mode byte (bit 0 establishes the session), followed
+by records `[operation, step_ms, len_hi, len_lo, bytes]`. The low two operation
+bits select receiver input, stray-peer input, media admission or a timer.
+Keep `-max_len=65536` when exercising these mobile publishing targets. Their
+budget assertions cover retained media and immediate output; fuzz runs are
+separate from sustained network or physical-device qualification.
+
+`seeds/<target>/` contains deliberately valid native samples and original
+publishing exchanges so mutation reaches the open state and sample parsers.
+These are seed inputs, not historical crashes. CI and the nightly run copy
+them into temporary corpora alongside any recorded regressions and retain
+overflow checks. New targets still need actual local/CI execution receipts;
+their inclusion in the workflow is not a passing fuzz result.
+
+The own caller target uses a mode byte and records
+`[operation, step_ms, len_hi, len_lo, bytes]`. Without the high mode bit, it
+preserves the original plaintext handshake/admission format. With that bit,
+it can negotiate AES128/256, select wrong/missing secrets, begin near sequence
+wrap and send a bounded warmup through both key slots before mutation. Records
+can replay or mutate captured data/KM packets, suppress replies, submit
+oversized/stray datagrams, move time backwards or stop. Only setup admits a
+connection and derives its key; hostile records cannot repeat PBKDF work.
+See the target comments for bit assignments and fixed work/memory bounds.
+
+Use `seeds/own_srt_caller/` for the published ACK and encrypted fixtures. These
+are seed inputs, not historical core crashes. ASAN with overflow checks passed
+all seven seeds and 20,980 executions over 61 seconds locally; this is not the
+20-minute M6 gate or physical-network acceptance. To replay the seeds:
+
+```bash
+RUSTC_BOOTSTRAP=1 cargo fuzz run -O -a own_srt_caller seeds/own_srt_caller -- -runs=0 -max_len=65536
 ```
 
 To seed `own_srt_listener`: each record is `[control, step in ms, len_hi,

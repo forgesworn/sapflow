@@ -1,0 +1,342 @@
+package dev.forgesworn.sapflow.broadcaster
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.hardware.display.DisplayManager
+import android.view.OrientationEventListener
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.WindowManager
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.viewinterop.AndroidView
+
+class MainActivity : ComponentActivity() {
+    private lateinit var capture: CaptureController
+    private var preview: Surface? = null
+    private var previewWidth = 1
+    private var previewHeight = 1
+    private lateinit var poseSelector: PoseInputPolicy
+    private var qualificationPoseControlEnabled = false
+    private lateinit var orientation: OrientationEventListener
+    private var poseTracking = false
+
+    @Suppress("DEPRECATION")
+    private fun captureDisplay() = if (android.os.Build.VERSION.SDK_INT >= 30) display ?: windowManager.defaultDisplay else windowManager.defaultDisplay
+
+    private fun displayRotation(): Int = captureDisplay().rotation
+
+    private fun displayPose() = CardinalPose.fromDegrees((360 - displayRotation() * 90) % 360)
+
+    private fun updatePreview() {
+        val degrees = displayRotation() * 90
+        // Physical mode dimensions are independent of the Activity's current
+        // viewport/configuration transition, unlike a transient window aspect.
+        val mode = captureDisplay().mode
+        val naturalPortrait = mode.physicalHeight >= mode.physicalWidth
+        capture.updatePreview(preview, previewWidth, previewHeight, degrees, naturalPortrait)
+    }
+    private var snapshot by mutableStateOf<CaptureSnapshot?>(null)
+    private var permissionMessage by mutableStateOf<String?>(null)
+    private var surfaceReady by mutableStateOf(false)
+    private var destinationUrl by mutableStateOf("")
+    private var destinationKey by mutableStateOf("")
+    private var allowPlaintextDevelopment by mutableStateOf(false)
+    private var useSrt by mutableStateOf(false)
+    private var srtPassphrase by mutableStateOf("")
+    private var srtPlaintextLab by mutableStateOf(false)
+    private var recordLocally by mutableStateOf(true)
+    private val ui = Handler(Looper.getMainLooper())
+    private val settlePose = object : Runnable {
+        override fun run() {
+            if (!poseTracking) return
+            val previous = poseSelector.pose
+            val maySettle = poseSelector.overridePose == null || capture.snapshot().stage == CaptureStage.CAPTURING
+            val next = poseSelector.settle(System.nanoTime(), maySettle)
+            if (next != previous && !poseSelector.captureStopped) capture.orientationChanged(next)
+            schedulePoseSettlement()
+        }
+    }
+    private fun schedulePoseSettlement() {
+        ui.removeCallbacks(settlePose)
+        poseSelector.deadlineNs?.let { deadline ->
+            ui.postDelayed(settlePose, ((deadline - System.nanoTime()).coerceAtLeast(0) + 999_999) / 1_000_000)
+        }
+    }
+
+    /** Called only by the qualification-source Application; release has no
+     * receiver, Application override or external route to these methods. */
+    internal fun enableQualificationPoseControl(enabled: Boolean) {
+        qualificationPoseControlEnabled = enabled
+        if (::poseSelector.isInitialized) poseSelector.enableQualification(enabled)
+        if (!enabled) ui.removeCallbacks(settlePose)
+    }
+
+    internal fun requestQualificationPose(value: String?): PoseInputPolicy.Result {
+        if (!poseTracking) return PoseInputPolicy.Result.INACTIVE
+        val previous = poseSelector.pose
+        val capturing = capture.snapshot().stage == CaptureStage.CAPTURING
+        val result = poseSelector.request(value, capturing, System.nanoTime())
+        if (result == PoseInputPolicy.Result.CLEARED && capturing && !poseSelector.captureStopped && poseSelector.pose != previous) {
+            capture.orientationChanged(poseSelector.pose)
+        }
+        if (result == PoseInputPolicy.Result.ACCEPTED || result == PoseInputPolicy.Result.CLEARED) schedulePoseSettlement()
+        return result
+    }
+    private val displayChanges = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) { if (poseTracking && displayId == captureDisplay().displayId) updatePreview() }
+    }
+    private val refresh = object : Runnable {
+        override fun run() {
+            snapshot = capture.snapshot()
+            ui.postDelayed(this, 200)
+        }
+    }
+    private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (result.values.all { it }) {
+            permissionMessage = null
+            prepareCapture()
+        } else {
+            permissionMessage = "Camera and microphone permission are required. Enable them in system settings if permission was permanently denied."
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        capture = CaptureController(applicationContext)
+        poseSelector = PoseInputPolicy(displayPose(), qualificationPoseControlEnabled)
+        capture.orientationChanged(poseSelector.pose)
+        orientation = object : OrientationEventListener(this) {
+            override fun onOrientationChanged(angle: Int) {
+                if (!poseTracking) return
+                val previous = poseSelector.pose
+                val next = poseSelector.acceptPhysical(angle, System.nanoTime())
+                if (next != previous && !poseSelector.captureStopped) capture.orientationChanged(next)
+                schedulePoseSettlement()
+            }
+        }
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFFFFAA62), background = Color(0xFF111416))) {
+                BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).windowInsetsPadding(WindowInsets.safeDrawing)) {
+                    if (maxWidth > maxHeight) {
+                        Row(Modifier.fillMaxSize()) { PreviewPane(Modifier.weight(1f).fillMaxHeight()); Controls(Modifier.width(300.dp).fillMaxHeight()) }
+                    } else {
+                        Column(Modifier.fillMaxSize()) { PreviewPane(Modifier.weight(1f).fillMaxWidth()); Controls(Modifier.weight(1f).fillMaxWidth()) }
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun PreviewPane(modifier: Modifier) {
+        Box(modifier, contentAlignment = Alignment.Center) {
+            AndroidView(factory = { context -> SurfaceView(context).apply {
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(holder: SurfaceHolder) { preview = holder.surface; surfaceReady = true; updatePreview() }
+                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                        preview = holder.surface; previewWidth = width; previewHeight = height; updatePreview()
+                    }
+                    override fun surfaceDestroyed(holder: SurfaceHolder) { surfaceReady = false; preview = null; updatePreview() }
+                })
+            } }, modifier = Modifier.fillMaxSize())
+            Text("SAPFLOW  ·  NATIVE CAPTURE", Modifier.align(Alignment.TopStart).padding(16.dp), color = Color.White)
+        }
+    }
+
+    @Composable
+    private fun Controls(modifier: Modifier) {
+        Column(modifier.verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Create, freely", style = MaterialTheme.typography.headlineSmall)
+                        Text("Free V4V in every build", color = MaterialTheme.colorScheme.primary)
+                        val current = snapshot
+                        Text(current?.stage?.name ?: "IDLE", style = MaterialTheme.typography.labelLarge)
+                        Text(permissionMessage ?: current?.message ?: "Prepare the camera and microphone")
+                        Text(current?.orientation ?: "720p30 · H264 · AAC 48 kHz", style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(
+                            onClick = { prepareWithPermissions() },
+                            enabled = surfaceReady && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Prepare") }
+                        Button(
+                            onClick = { capture.start(); window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) },
+                            enabled = current?.stage == CaptureStage.PREPARED,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Start capture") }
+                        Button(
+                            onClick = {
+                                ui.removeCallbacks(settlePose)
+                                poseSelector.stopCapture()
+                                capture.stop()
+                                schedulePoseSettlement()
+                                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            },
+                            enabled = current?.stage in listOf(CaptureStage.PREPARING, CaptureStage.PREPARED, CaptureStage.CAPTURING, CaptureStage.STOPPING),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF833D38)),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Stop") }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = recordLocally, onCheckedChange = { recordLocally = it },
+                                enabled = current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR))
+                            Text("Record private MP4 on this device", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text("Microphone", style = MaterialTheme.typography.labelMedium)
+                        LinearProgressIndicator(progress = { current?.audioLevel ?: 0f }, modifier = Modifier.fillMaxWidth())
+                        Text("Video ${current?.videoSamples ?: 0} · Audio ${current?.audioSamples ?: 0} · Ingress rejects ${current?.drops ?: 0}", style = MaterialTheme.typography.bodySmall)
+                        Text("Video timing/IDR ${current?.videoRejects ?: 0} · AAC priming ${current?.audioPrimingRejects ?: 0} · Wait IDR ${current?.waitingKeyframeRejects ?: 0} · Other ingress rejects ${current?.queueRejects ?: 0}", style = MaterialTheme.typography.bodySmall)
+                        Text(current?.queueDiagnostics ?: "Queue diagnostics not sampled", style = MaterialTheme.typography.bodySmall)
+                        Text(current?.cleanupDiagnostics ?: "", style = MaterialTheme.typography.bodySmall)
+                        Text(current?.audioDiagnostics ?: "", style = MaterialTheme.typography.bodySmall)
+                        Text(current?.renderer ?: "GPU not prepared", style = MaterialTheme.typography.bodySmall)
+                        Text(current?.sinkDiagnostics ?: "", style = MaterialTheme.typography.bodySmall)
+                        Text("Encoded video capture age ${current?.videoCaptureAgeMs?.let { "${it}ms" } ?: "Not measured"}", style = MaterialTheme.typography.bodySmall)
+                        Text(current?.publishingStatus ?: "No publisher attached", style = MaterialTheme.typography.bodySmall)
+                        Text(current?.recordingStatus ?: "No recorder attached", style = MaterialTheme.typography.bodySmall)
+                        val configurable = current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)
+                        Text("Manual destination · one attempt", style = MaterialTheme.typography.labelMedium)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = useSrt, onCheckedChange = { useSrt = it }, enabled = configurable)
+                            Text("Use SRT over UDP", style = MaterialTheme.typography.bodySmall)
+                        }
+                        OutlinedTextField(
+                            value = destinationUrl, onValueChange = { destinationUrl = it.take(4096) },
+                            label = { Text(if (useSrt) "SRT numeric address and port" else "RTMPS application URL") },
+                            placeholder = { Text(if (useSrt) "srt://192.0.2.1:8890" else "rtmps://origin.invalid/live") },
+                            enabled = configurable, singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = destinationKey, onValueChange = { destinationKey = it.take(4096) },
+                            label = { Text(if (useSrt) "SRT stream ID (optional)" else "Stream key") }, visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            enabled = configurable, singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        if (useSrt) {
+                            OutlinedTextField(
+                                value = srtPassphrase, onValueChange = { srtPassphrase = it.take(79) },
+                                label = { Text("AES-256 passphrase · 10 to 79 bytes") },
+                                visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                                enabled = configurable, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                            )
+                            Row {
+                                Checkbox(checked = srtPlaintextLab, onCheckedChange = { srtPlaintextLab = it }, enabled = configurable)
+                                Text("Plaintext SRT lab only · clear passphrase", style = MaterialTheme.typography.bodySmall)
+                            }
+                        } else {
+                            Row {
+                                Checkbox(checked = allowPlaintextDevelopment, onCheckedChange = { allowPlaintextDevelopment = it }, enabled = configurable)
+                                Text("Allow plaintext RTMP for development", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                        Text("Leave blank for SDK validation only. No automatic retry or transport downgrade.", style = MaterialTheme.typography.bodySmall)
+                        Text("Video: ${current?.videoEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
+                        Text("Audio: ${current?.audioEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
+                        Text("Capture stops when this screen leaves the foreground.", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+
+
+    private fun prepareWithPermissions() {
+        val needed = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+        if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
+            permissionMessage = null
+            prepareCapture()
+        } else permissions.launch(needed)
+    }
+
+    private fun prepareCapture() {
+        try {
+            val surface = preview?.takeIf { it.isValid } ?: return
+            val key = destinationKey
+            val passphrase = srtPassphrase
+            val plaintext = srtPlaintextLab
+            val publisher: () -> EncodedSink? = if (destinationUrl.isBlank()) ({ null }) else if (useSrt) {
+                SrtDestination.validateCredentials(key, passphrase, plaintext)
+                val destination = SrtDestination.parse(destinationUrl.trim())
+                ({ SrtPublishingSink(destination, key, passphrase, plaintext) })
+            } else {
+                require(key.isNotEmpty()) { "A stream key is required" }
+                val destination = RtmpDestination.parse(destinationUrl.trim(), allowPlaintextDevelopment)
+                ({ RtmpPublishingSink(destination, key) })
+            }
+            val directory = filesDir.toPath().resolve("recordings")
+            val recorder: () -> EncodedSink? = if (recordLocally) ({ PrivateRecordingSink(directory) }) else ({ null })
+            updatePreview()
+            // Explicit Prepare restores the stable physical pose even if no
+            // further sensor callback followed qualification Stop/CLEAR.
+            capture.orientationChanged(poseSelector.prepareSession())
+            capture.prepare(surface, publisher, recorder)
+        } catch (error: Exception) {
+            permissionMessage = error.message?.take(240) ?: "Destination configuration failed"
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) { super.onConfigurationChanged(newConfig); updatePreview() }
+    override fun onStart() {
+        super.onStart()
+        poseSelector = PoseInputPolicy(displayPose(), qualificationPoseControlEnabled)
+        capture.orientationChanged(poseSelector.pose)
+        poseTracking = true
+        getSystemService(DisplayManager::class.java).registerDisplayListener(displayChanges, ui)
+        updatePreview()
+        if (orientation.canDetectOrientation()) orientation.enable()
+        ui.post(refresh)
+    }
+    override fun onStop() {
+        poseTracking = false
+        enableQualificationPoseControl(false)
+        orientation.disable()
+        ui.removeCallbacks(settlePose); poseSelector.cancelPending()
+        getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayChanges)
+        ui.removeCallbacks(refresh)
+        capture.stop("Capture interrupted: the app left the foreground. Prepare again to resume.")
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        super.onStop()
+    }
+    override fun onDestroy() { enableQualificationPoseControl(false); capture.close(); super.onDestroy() }
+}

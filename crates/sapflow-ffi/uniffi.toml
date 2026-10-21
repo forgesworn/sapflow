@@ -1,0 +1,7 @@
+[bindings.swift]
+module_name = "Sapflow"
+ffi_module_name = "SapflowFFI"
+
+[bindings.kotlin]
+package_name = "dev.forgesworn.sapflow"
+cdylib_name = "sapflow_ffi"

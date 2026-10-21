@@ -6,6 +6,8 @@ members = [
     "crates/sapflow-srt",
     "crates/sapflow-server",
     "crates/sapflow-bench",
+    "crates/sapflow-ffi",
+    "crates/sapflow-client",
 ]
 exclude = ["fuzz", "vendor/srt-protocol"]
 

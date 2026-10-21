@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use sapflow_core::limits::RateCap;
 
-use sapflow_core::{PublishError, PublishRequest, StreamEvent};
+use sapflow_core::{Health, PublishError, PublishRequest, StreamEvent};
 use sapflow_hls::MuxerConfig;
 
 use crate::App;
 use crate::recorder::Recorder;
-use crate::stream::{LiveStream, Source, SourceKind};
+use crate::stream::{Claim, LiveStream, Source, SourceKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -35,14 +35,16 @@ impl std::fmt::Display for OverRate {
 pub struct Publication {
     app: Arc<App>,
     pub stream: Arc<LiveStream>,
+    generation: u64,
     published: bool,
     connected: Instant,
-    recorder: Option<Recorder>,
+    last_health: Instant,
     rate: RateCap,
 }
 
 impl Publication {
-    /// Authorises the request and claims its path.
+    /// Authorises the request and claims its path, or takes over a stream
+    /// held for a reconnect.
     pub fn begin(
         app: &Arc<App>,
         req: &PublishRequest,
@@ -63,28 +65,46 @@ impl Publication {
             segment_count: app.config.segment_count,
             ..MuxerConfig::default()
         };
-        let stream = app
+        let (stream, generation, claim) = app
             .streams
             .claim(&req.path, cfg, kind)
             .ok_or(Refusal::AlreadyLive)?;
-        let recorder = match &app.config.recordings {
-            Some(dir) if app.config.record_policy.records(&req.path) => Some(Recorder::start(
+        let recording = {
+            let mut session = stream.session();
+            if claim == Claim::Fresh {
+                session.recorder = Self::recorder(app, &req.path);
+            }
+            session.recorder.is_some()
+        };
+        tracing::info!(
+            path = %req.path.as_path(),
+            ?kind,
+            recording,
+            resumed = claim == Claim::Resumed,
+            "publisher connected"
+        );
+        let now = Instant::now();
+        Ok(Self {
+            app: app.clone(),
+            stream,
+            generation,
+            published: false,
+            connected: now,
+            last_health: now,
+            rate: RateCap::new(app.config.max_publish_bps, Duration::from_secs(5)),
+        })
+    }
+
+    fn recorder(app: &Arc<App>, path: &sapflow_core::StreamPath) -> Option<Recorder> {
+        match &app.config.recordings {
+            Some(dir) if app.config.record_policy.records(path) => Some(Recorder::start(
                 dir,
-                &req.path,
+                path,
                 app.callbacks.clone(),
                 app.config.record_min_free,
             )),
             _ => None,
-        };
-        tracing::info!(path = %req.path.as_path(), ?kind, recording = recorder.is_some(), "publisher connected");
-        Ok(Self {
-            app: app.clone(),
-            stream,
-            published: false,
-            connected: Instant::now(),
-            recorder,
-            rate: RateCap::new(app.config.max_publish_bps, Duration::from_secs(5)),
-        })
+        }
     }
 
     /// Counts bytes received from the publisher against the bitrate cap.
@@ -104,8 +124,12 @@ impl Publication {
             std::time::SystemTime,
         ) -> Result<sapflow_hls::Update, sapflow_hls::IngestError>,
     ) -> Result<(), sapflow_hls::IngestError> {
-        let ready = self.stream.apply(f)?;
-        if ready && !self.published {
+        // Keep session ownership stable through ingest, the recovered callback
+        // and recording rollover. Registry operations use session -> state too.
+        let mut session = self.stream.session();
+        let applied = self.stream.apply(f)?;
+        if applied.ready && !self.published {
+            session.recovered();
             self.published = true;
             tracing::info!(
                 path = %self.stream.path.as_path(),
@@ -116,12 +140,44 @@ impl Publication {
                 .callbacks
                 .send(&self.stream.path, StreamEvent::Publish);
         }
-        if let Some(rec) = &mut self.recorder
+        if applied.restarted {
+            // A new init segment: the old recording ends here (its file is
+            // finished and reported) and a new one starts.
+            session.recorder = Self::recorder(&self.app, &self.stream.path);
+        }
+        if let Some(rec) = &mut session.recorder
             && let Some((init, parts)) = self.stream.parts_after(rec.last_part())
         {
             rec.feed(init, parts);
         }
+        drop(session);
+        self.report_health();
         Ok(())
+    }
+
+    /// Every `health_interval` while the stream is up.
+    fn report_health(&mut self) {
+        let interval = self.app.config.health_interval;
+        if interval.is_zero() || !self.published || self.last_health.elapsed() < interval {
+            return;
+        }
+        self.last_health = Instant::now();
+        let health = {
+            let st = self.stream.lock();
+            let Some(m) = st.ingest.muxer() else { return };
+            let Some((bps, keyframe)) = m.recent(6) else {
+                return;
+            };
+            Health {
+                bitrate_kbps: bps / 1000,
+                keyframe_interval_ms: keyframe.as_millis() as u64,
+                audio: m.audio().is_some(),
+                breaks: m.breaks(),
+            }
+        };
+        self.app
+            .callbacks
+            .send(&self.stream.path, StreamEvent::Health(health));
     }
 
     /// The publisher left: unpublish, finish the recording, free the path.
@@ -132,6 +188,10 @@ impl Publication {
 
 /// Runs on every exit, including a panic in the connection's task, so a
 /// path is never left claimed by a publisher that is gone.
+///
+/// v4v hears `unpublish` at once (its stage reads "reconnecting"). The
+/// stream itself, with its playlist and recording, is held for
+/// `reconnect_grace` so an encoder that comes back carries it on.
 impl Drop for Publication {
     fn drop(&mut self) {
         if self.published {
@@ -139,10 +199,29 @@ impl Drop for Publication {
                 .callbacks
                 .send(&self.stream.path, StreamEvent::Unpublish);
         }
-        // Dropping the recorder closes its queue; the writer then finishes
-        // the file and sends recordSegmentComplete.
-        self.recorder.take();
-        self.app.streams.release(&self.stream);
-        tracing::info!(path = %self.stream.path.as_path(), "publisher left");
+        let grace = self
+            .stream
+            .session()
+            .hold_remaining(self.app.config.reconnect_grace, Instant::now());
+        let runtime = tokio::runtime::Handle::try_current();
+        let hold = !grace.is_zero() && runtime.is_ok() && self.stream.has_content();
+        let held = self.app.streams.detach(&self.stream, self.generation, hold);
+        if let (true, Ok(rt)) = (held, runtime) {
+            let (app, stream, generation) =
+                (self.app.clone(), self.stream.clone(), self.generation);
+            rt.spawn(async move {
+                tokio::time::sleep(grace).await;
+                if app.streams.expire(&stream, generation) {
+                    tracing::info!(path = %stream.path.as_path(), "no reconnect within the grace period; stream ended");
+                }
+            });
+            tracing::info!(
+                path = %self.stream.path.as_path(),
+                grace_s = grace.as_secs(),
+                "publisher left; stream held for a reconnect"
+            );
+        } else {
+            tracing::info!(path = %self.stream.path.as_path(), "publisher left");
+        }
     }
 }

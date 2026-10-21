@@ -13,7 +13,9 @@ iOS rules and the mediamtx/gohlslib source they came from.
 |-------|------|
 | `sapflow-core` | Shared types (stream paths, callback events). No networking, no async runtime: it must build for iOS and Android later. |
 | `sapflow-hls` | LL-HLS packaging: segmenting, parts, playlists, the Apple rules. |
-| `sapflow-srt` | Our own SRT receiver (live mode, listener), sans-IO, no dependencies. Written from the specification and wire observation only: never read or copy srt-rs (`vendor/srt-protocol`, `srt-tokio`) or libsrt source; run them only as black boxes. |
+| `sapflow-srt` | Our own live SRT listener/receiver and caller/sender, sans-IO, using maintained cryptographic primitives. Written from the specification and wire observation only: never read or copy srt-rs (`vendor/srt-protocol`, `srt-tokio`) or libsrt source; run them only as black boxes. |
+| `sapflow-client` | Runtime-free native compressed-media validation, bounded queues, session policy and MPEG-TS writing. No camera, codec, network, file or billing runtime. |
+| `sapflow-ffi` | Typed Swift/Kotlin boundary for shared compressed samples and protocol/session state; platform adapters own sockets, TLS and native codecs. |
 | `sapflow-server` | The `sapflow` binary: ingest, HTTP, callbacks, recording. |
 
 ## Run and test

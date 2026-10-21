@@ -1,0 +1,51 @@
+name: SapflowBroadcaster
+options:
+  deploymentTarget:
+    iOS: '16.0'
+  createIntermediateGroups: true
+packages:
+  Sapflow:
+    path: ../../target/native-packages/apple
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    DEVELOPMENT_TEAM: ''
+    CURRENT_PROJECT_VERSION: '1'
+    MARKETING_VERSION: '0.1.0'
+    CODE_SIGN_STYLE: Automatic
+    GENERATE_INFOPLIST_FILE: YES
+    IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+    TARGETED_DEVICE_FAMILY: '1'
+    PRODUCT_BUNDLE_IDENTIFIER: dev.forgesworn.sapflow.broadcaster
+    SWIFT_EMIT_LOC_STRINGS: NO
+targets:
+  SapflowBroadcaster:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    dependencies:
+      - package: Sapflow
+        product: Sapflow
+    settings:
+      base:
+        PRODUCT_NAME: SapflowBroadcaster
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: $(SRCROOT)/../../mobile/ios/Info.plist
+        TARGETED_DEVICE_FAMILY: '1' 
+  SapflowBroadcasterTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests]
+    dependencies:
+      - target: SapflowBroadcaster
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.forgesworn.sapflow.broadcaster.tests
+schemes:
+  SapflowBroadcaster:
+    build:
+      targets:
+        SapflowBroadcaster: all
+        SapflowBroadcasterTests: [test]
+    test:
+      targets: [SapflowBroadcasterTests]

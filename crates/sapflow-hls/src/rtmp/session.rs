@@ -167,7 +167,10 @@ impl Session {
         s.control(WINDOW_ACK, &WINDOW_ACK_SIZE.to_be_bytes());
         s.user_control(STREAM_BEGIN, &0u32.to_be_bytes());
         let mut bw = PEER_BANDWIDTH.to_be_bytes().to_vec();
-        bw.push(2); // dynamic
+        // Dynamic is ignored without an earlier Hard limit (RTMP 5.4.5).
+        // Advertise a real initial window so a compliant publisher can govern
+        // outstanding bytes and request the matching acknowledgement cadence.
+        bw.push(0); // hard
         s.control(SET_PEER_BANDWIDTH, &bw);
         s.command(
             0,
@@ -191,14 +194,17 @@ impl Session {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
         let n = bytes.len() as u64;
         self.received = self.received.wrapping_add(n);
-        if let Some(window) = self.peer_window {
-            self.since_ack = self.since_ack.saturating_add(n);
-            if self.since_ack >= u64::from(window) {
-                self.since_ack = 0;
-                // The sequence number is the byte count so far, mod 2^32.
-                let seq = self.received as u32;
-                self.control(ACKNOWLEDGEMENT, &seq.to_be_bytes());
-            }
+        // Bytes received before the peer installs its window still belong to
+        // the cumulative acknowledgement sequence. Otherwise a strict sender
+        // can exhaust its window just before our first acknowledgement.
+        self.since_ack = self.since_ack.saturating_add(n);
+        if let Some(window) = self.peer_window
+            && self.since_ack >= u64::from(window)
+        {
+            self.since_ack = 0;
+            // The sequence number is the byte count so far, mod 2^32.
+            let seq = self.received as u32;
+            self.control(ACKNOWLEDGEMENT, &seq.to_be_bytes());
         }
         if self.pos > 0 {
             self.input.drain(..self.pos);
@@ -838,6 +844,37 @@ pub(crate) mod tests {
                 data: vec![0x27, 1, 0, 0, 0, 9, 9]
             }]
         );
+    }
+
+    #[test]
+    fn first_ack_window_counts_bytes_received_before_negotiation() {
+        let mut client = Client::new();
+        let mut sess = Session::new();
+        client.replies(&sess.take_output());
+        let filler = client.message(ACKNOWLEDGEMENT, 0, 0, &[0, 0, 0, 0]);
+        let mut sent = 0;
+        while sent < 4900 {
+            sess.feed(&filler).expect("pre-window feed");
+            all(&mut sess);
+            sent += filler.len();
+        }
+        let window = client.message(WINDOW_ACK, 0, 0, &5000u32.to_be_bytes());
+        sess.feed(&window).expect("window");
+        sent += window.len();
+        all(&mut sess);
+        let mut replies = client.replies(&sess.take_output());
+        while sent < 5000 {
+            sess.feed(&filler).expect("windowed feed");
+            all(&mut sess);
+            sent += filler.len();
+            replies.extend(client.replies(&sess.take_output()));
+        }
+        let acks: Vec<_> = replies
+            .iter()
+            .filter(|m| m.type_id == ACKNOWLEDGEMENT)
+            .collect();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(be32(&acks[0].payload), Some(sent as u32));
     }
 
     #[test]

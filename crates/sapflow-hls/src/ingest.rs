@@ -29,6 +29,8 @@ const MAX_BUFFER: usize = 8 * 1024 * 1024;
 pub enum IngestError {
     /// The program carries a video codec other than H.264.
     UnsupportedVideo,
+    /// The held presentation expired before new media recovered it.
+    PresentationExpired,
     /// No keyframe for too long, or a segment beyond the size limit.
     SegmentTooLarge,
 }
@@ -36,6 +38,7 @@ pub enum IngestError {
 impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PresentationExpired => f.write_str("presentation reconnect deadline expired"),
             Self::UnsupportedVideo => f.write_str("video is not H.264"),
             Self::SegmentTooLarge => f.write_str("segment too large (keyframe interval?)"),
         }
@@ -172,8 +175,29 @@ impl EsIngest {
         }
     }
 
+    /// Carries on another connection's stream (see [`Muxer::interrupt`]).
+    /// The first keyframe decides: with the same parameter sets and audio
+    /// config, its media continues the stream after a discontinuity;
+    /// otherwise it starts a new initialization epoch on the retained muxer
+    /// and the update says `restarted` (for recording rollover).
+    pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
+        Self {
+            muxer: Some(muxer),
+            ..Self::new(cfg)
+        }
+    }
+
     pub fn muxer(&self) -> Option<&Muxer> {
         self.muxer.as_ref()
+    }
+
+    pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
+        self.muxer.as_mut()
+    }
+
+    pub fn take_muxer(&mut self) -> Option<Muxer> {
+        self.origin = None;
+        self.muxer.take()
     }
 
     pub fn set_expect_audio(&mut self, expect: bool) {
@@ -184,6 +208,7 @@ impl EsIngest {
     pub fn parameter_sets(&mut self, sps: Option<Vec<u8>>, pps: Option<Vec<u8>>) {
         if let Some(sps) = sps {
             if let Some(m) = &self.muxer
+                && self.origin.is_some()
                 && m.video().sps != sps
                 && self.sps.as_ref() != Some(&sps)
             {
@@ -205,6 +230,24 @@ impl EsIngest {
 
     pub fn audio_config(&mut self, config: AacConfig) {
         if self.aac.is_none() {
+            if let Some(muxer) = &self.muxer
+                && muxer.audio().is_none()
+            {
+                if muxer.has_content() {
+                    // A served init segment and the recorder's track identity
+                    // cannot acquire a new track in place.
+                    tracing::warn!(
+                        "AAC configuration arrived after video-only content became servable; audio cannot be added to this init segment"
+                    );
+                } else {
+                    // Separate hardware encoders may deliver AVC + first IDR
+                    // before AAC's sequence header. No content was published,
+                    // so discard the provisional video-only muxer and start
+                    // with both tracks at the next IDR.
+                    self.muxer = None;
+                    self.origin = None;
+                }
+            }
             self.aac = Some(config);
         }
     }
@@ -221,7 +264,8 @@ impl EsIngest {
         if au.data.is_empty() {
             return Ok(Update::default());
         }
-        if self.muxer.is_none() {
+        let mut restarted = false;
+        if self.origin.is_none() {
             if !au.idr {
                 return Ok(Update::default());
             }
@@ -232,18 +276,31 @@ impl EsIngest {
                 return Ok(Update::default());
             };
             // If audio is expected, wait for its config before the init
-            // segment is fixed; the next keyframe will do.
+            // segment is fixed (or compared); the next keyframe will do.
             if self.expect_audio && self.aac.is_none() {
                 return Ok(Update::default());
             }
             let audio = if self.expect_audio { self.aac } else { None };
-            self.muxer = Some(Muxer::new(self.cfg, video, audio));
+            if let Some(m) = &mut self.muxer
+                && (m.video().sps != video.sps
+                    || m.video().pps != video.pps
+                    || m.audio().copied() != audio)
+            {
+                tracing::warn!(
+                    "reconnected encoder changed configuration; starting a new codec epoch on the existing timeline"
+                );
+                m.reconfigure(video.clone(), audio, now);
+                restarted = true;
+            }
+            if self.muxer.is_none() {
+                self.muxer = Some(Muxer::new(self.cfg, video, audio));
+            }
             self.origin = Some(dts);
         }
         let (Some(muxer), Some(origin)) = (self.muxer.as_mut(), self.origin) else {
             return Ok(Update::default());
         };
-        muxer
+        let mut update = muxer
             .push_video(
                 dts - origin,
                 pts - origin,
@@ -253,7 +310,9 @@ impl EsIngest {
             )
             .map_err(|e| match e {
                 MuxError::SegmentTooLarge => IngestError::SegmentTooLarge,
-            })
+            })?;
+        update.restarted |= restarted;
+        Ok(update)
     }
 
     /// One raw AAC frame.
@@ -279,6 +338,21 @@ pub struct TsIngest {
 }
 
 impl TsIngest {
+    /// Carries on another connection's stream ([`EsIngest::resume`]).
+    pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
+        let mut ts = Self::new(cfg);
+        ts.es = EsIngest::resume(cfg, muxer);
+        ts
+    }
+
+    pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
+        self.es.muxer_mut()
+    }
+
+    pub fn take_muxer(&mut self) -> Option<Muxer> {
+        self.es.take_muxer()
+    }
+
     pub fn new(cfg: MuxerConfig) -> Self {
         let input = Arc::new(Mutex::new(Input::default()));
         let slot = SlotReader::default();
@@ -381,8 +455,7 @@ impl TsIngest {
         let dts = self.clock.unwrap(dts_raw);
         let pts = dts + signed_delta(pts_raw, dts_raw);
         let up = self.es.video(dts, pts, codec::access_unit(data), now)?;
-        self.pending.part |= up.part;
-        self.pending.segment |= up.segment;
+        self.pending.merge(up);
         Ok(())
     }
 
@@ -509,5 +582,113 @@ mod tests {
             ing.push(c, SystemTime::UNIX_EPOCH).expect("push");
         }
         assert!(ing.muxer().is_some_and(|m| m.has_content()));
+    }
+}
+
+#[cfg(test)]
+mod epoch_window_tests {
+    use super::*;
+    use crate::{muxer::Entry, playlist};
+    #[test]
+    fn codec_epochs_retain_old_maps_only_for_the_bounded_window_and_inflight_owners() {
+        let portrait = include_bytes!("../tests/fixtures/epoch-portrait.ts");
+        let landscape = include_bytes!("../tests/fixtures/epoch-landscape.ts");
+        let cfg = MuxerConfig {
+            segment_count: 8,
+            ..MuxerConfig::default()
+        };
+        let mut ingest = TsIngest::new(cfg);
+        let mut checker = playlist::RuleCheck::default();
+        let mut old = None;
+        let mut video_end = 0;
+        let mut last_part = None;
+        for epoch in 0..16 {
+            let bytes = if epoch % 2 == 0 {
+                portrait.as_slice()
+            } else {
+                landscape.as_slice()
+            };
+            for chunk in bytes.chunks(1316) {
+                ingest
+                    .push(chunk, SystemTime::UNIX_EPOCH)
+                    .expect("valid epoch regression fixture");
+                let Some(muxer) = ingest.muxer() else {
+                    continue;
+                };
+                if muxer.has_content() {
+                    checker
+                        .check(&playlist::media(muxer, "fixed"))
+                        .expect("valid epoch regression fixture");
+                }
+            }
+            let muxer = ingest.muxer().expect("valid epoch regression fixture");
+            assert_eq!(muxer.current_initialization_id(), epoch);
+            assert_eq!(muxer.target_duration(), 2);
+            assert!(muxer.entries().len() <= cfg.segment_count);
+            for id in last_part.map_or(0, |id| id + 1)..muxer.next_part_id() {
+                if let crate::PartLookup::Found(part) = muxer.part(id) {
+                    use mp4_atom::Decode;
+                    let mut input = part.data.as_ref();
+                    let moof =
+                        mp4_atom::Moof::decode(&mut input).expect("valid epoch regression fixture");
+                    let video = moof
+                        .traf
+                        .iter()
+                        .find(|track| track.tfhd.track_id == 1)
+                        .expect("valid epoch regression fixture");
+                    let at = video
+                        .tfdt
+                        .as_ref()
+                        .expect("valid epoch regression fixture")
+                        .base_media_decode_time;
+                    assert!(
+                        at >= video_end,
+                        "HLS decode time must not reset at a new epoch"
+                    );
+                    video_end = at
+                        + video
+                            .trun
+                            .iter()
+                            .flat_map(|run| &run.entries)
+                            .map(|sample| {
+                                u64::from(sample.duration.expect("valid epoch regression fixture"))
+                            })
+                            .sum::<u64>();
+                    last_part = Some(id);
+                }
+            }
+            if epoch == 0 {
+                old = Some(muxer.segment(7).expect("valid epoch regression fixture"));
+            }
+            if epoch > 5 {
+                assert!(muxer.initialization(0).is_none());
+            }
+            let epochs: std::collections::BTreeSet<_> = muxer
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Segment(segment) => Some(segment.initialization.id),
+                    _ => None,
+                })
+                .chain(muxer.open_parts().iter().map(|part| part.initialization.id))
+                .collect();
+            assert!(epochs.len() <= cfg.segment_count + 1);
+            let mut held = ingest.take_muxer().expect("valid epoch regression fixture");
+            held.interrupt(SystemTime::UNIX_EPOCH);
+            ingest = TsIngest::resume(cfg, held);
+        }
+        let old = old.expect("valid epoch regression fixture"); // a response already holding this Arc can finish
+        assert_eq!(old.initialization.id, 0);
+        assert!(!old.initialization.data.is_empty() && !old.data.is_empty());
+        let latest = playlist::media(
+            ingest.muxer().expect("valid epoch regression fixture"),
+            "fixed",
+        );
+        assert!(
+            checker
+                .check(&latest.replace("fixed_seg", "changed_seg"))
+                .is_err(),
+            "same MSN must never be relabelled"
+        );
     }
 }

@@ -148,8 +148,10 @@ packet filters (FEC), sending (a later milestone, for phones).
 
 - **M6a, receive:** unencrypted, behind a switch (`SAPFLOW_SRT_IMPL`), with
   `srt-protocol` still the default.
-- **M6b, encryption:** SRT passphrase (AES key wrap, AES-CTR), so the
-  credential no longer travels in clear.
+- **M6b, encryption:** SRT passphrase (AES key wrap, AES-CTR) protects media
+  payloads. SRT control packets, including stream IDs, remain visible; never
+  assume encryption hides credentials placed in a stream ID. Provision
+  session-scoped secrets through an authenticated destination channel.
 - **M6c, switch:** make it the default, remove `vendor/srt-protocol`,
   `srt-tokio` and their dependencies.
 
@@ -207,8 +209,18 @@ proof:
   per-process cookie key (T16), one `recv_from` socket with no per-packet
   `getsockname`, no timer without a connection.
 
+**M6b implementation (2026-10-21):** the own caller/sender and listener now
+support optional AES-128/256-CTR with bounded key negotiation and refresh,
+wrong-secret rejection and no configured plaintext downgrade. The server can
+require a separately provisioned transport secret with `SAPFLOW_SRT_IMPL=own`;
+[the configuration and limits](docs/own-origin-encryption.md) are documented.
+Independent executable tests cover both directions with libsrt, key rotation,
+clean/impaired loopback delivery and wrong/missing secrets. These are finite
+implementation checks, not completion of the full M6 qualification matrix.
+The existing default receiver is unchanged; CTR does not authenticate media.
+
 Still open for M6 as a whole: OBS and Larix against `own` (not tried; they
-need the encoder hardware or app), anything with a passphrase (M6b), and
+need the encoder hardware or app), the full encrypted qualification matrix, and
 the version 4 handshake, which no encoder tested so far needed (every one
 used version 5).
 
@@ -226,6 +238,15 @@ used version 5).
   verified until it has run on GitHub.
 
 ### Later
+
+The [mobile broadcaster and SDK delivery plan](docs/mobile-streaming-plan.md)
+sets out the standalone iOS/Android app, shared SDK and origin-first release,
+followed by native RelaySwarm playback. Existing server milestones and gates
+still apply.
+
+The linked [competition and distribution review](docs/mobile-competitive-review.md)
+adds our own SRT/RTMP client requirement, measured native-performance targets,
+open-source/free Android distribution and always-free V4V broadcasting.
 
 - `sapflow-core` and `sapflow-srt` for iOS and Android via UniFFI: SRT
   sending (go live from the phone), relayswarm chunk verification, a native swarm peer.

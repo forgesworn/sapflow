@@ -3,8 +3,8 @@
 `mobile-device-observer.py` collects bounded, read-only counters during a broadcast
 that the operator has already arranged. It does not launch, stop, install or
 configure an app. It never accesses media, logcat, recordings or app storage.
-The full observer has had one short physical smoke run; lightweight-mode device
-validation is pending. Neither run is matched performance-comparison evidence.
+The full observer and lightweight mode have had short physical smoke checks.
+Neither run is matched performance-comparison evidence.
 
 ```sh
 python3 -B tests/mobile-device-observer.py \
@@ -100,8 +100,15 @@ Hz, with three delta readings of approximately 268.6%, 264.3% and 265.3%
 one-core CPU use. Thermal status was 1 without an override. Every memory query
 hit its two-second timeout, leaving memory unavailable and costing about 2.7
 seconds per sample overall. This intrusive observation is not a baseline or a
-matched comparison. The skip options address that measurement overhead; their
-actual device cost and CPU continuity still require a separate physical check.
+matched comparison.
+
+A separate four-sample, 12-second run against the idle app used both skip
+options. It completed without command errors, sample collection took 0.46 to
+0.50 seconds and CPU deltas were available. Skipped memory/device metrics
+remained explicitly null. This validates those command/parsing paths on that
+device. Transport and scheduling still add uncertainty, and these finite checks
+prove no advantage over another app. Local evidence is retained under
+`target/physical-android/*observer.local.jsonl` for this development session.
 
 Primary command/field references:
 [Android dumpsys documentation](https://developer.android.com/tools/dumpsys) and

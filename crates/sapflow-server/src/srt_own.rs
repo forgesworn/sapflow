@@ -25,12 +25,8 @@ const QUEUE: usize = 16_384;
 
 pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     let socket = UdpSocket::bind(addr).await?;
-    tracing::info!(%addr, implementation = "own", "SRT listening");
-    let config = Config {
-        // Room for publishers plus callers being turned away.
-        max_connections: app.config.max_publishers.saturating_mul(2).max(4),
-        ..Config::default()
-    };
+    tracing::info!(%addr, implementation = "own", encrypted = app.config.srt_crypto.is_some(), "SRT listening");
+    let config = listener_config(&app.config);
     let mut listener = Listener::new(config, Instant::now());
     // Publisher tasks that ended (idle, over the bitrate cap, bad media)
     // and whose SRT connection should be shut.
@@ -79,7 +75,13 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                     let stream_id = String::from_utf8_lossy(&stream_id);
                     match admit(&app, &stream_id, peer.ip(), publishers.len()) {
                         Ok(publication) => {
-                            listener.accept(id, Instant::now());
+                            if !listener.accept(id, Instant::now()) {
+                                // Wrong secret/cipher is terminal. Dropping the
+                                // admission guard releases the stream claim;
+                                // no publisher queue/task or media is created.
+                                drop(publication);
+                                continue;
+                            }
                             let (tx, rx) = mpsc::channel(QUEUE);
                             publishers.insert(id, tx);
                             tracing::info!(
@@ -131,6 +133,17 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     }
 }
 
+fn listener_config(config: &crate::config::Config) -> Config {
+    Config {
+        // Room for publishers plus callers being turned away. Configured KM
+        // and publish authentication are independent admission requirements.
+        max_connections: config.max_publishers.saturating_mul(2).max(4),
+        require_encryption: config.srt_crypto.is_some(),
+        crypto: config.srt_crypto.clone(),
+        ..Config::default()
+    }
+}
+
 fn reject_code(r: Refused) -> RejectCode {
     RejectCode::http(r.status())
 }
@@ -160,4 +173,114 @@ async fn publish(
     }
     publication.end();
     let _ = ended.send(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sapflow_srt::crypto::{CryptoConfig, KeySize};
+    use sapflow_srt::seq::Seq;
+    use sapflow_srt::{Caller, CallerConfig};
+    use std::time::Duration;
+
+    #[test]
+    fn configured_origin_accepts_matching_crypto_and_refuses_downgrade() {
+        for cipher in ["aes128", "aes256"] {
+            for profile in 0..4 {
+                let config = crate::config::Config::load(
+                    |key| match key {
+                        "SAPFLOW_SRT_IMPL" => Some("own".into()),
+                        "SAPFLOW_OPEN_PUBLISH" => Some("1".into()),
+                        "SAPFLOW_SRT_PASSPHRASE" => Some("transport test secret".into()),
+                        "SAPFLOW_SRT_CIPHER" => Some(cipher.into()),
+                        _ => None,
+                    },
+                    [],
+                )
+                .expect("origin config");
+                let start = Instant::now();
+                let mut listener = Listener::new(listener_config(&config), start);
+                let size = if cipher == "aes128" {
+                    KeySize::Aes128
+                } else {
+                    KeySize::Aes256
+                };
+                let crypto = match profile {
+                    1 => None,
+                    2 => Some(
+                        CryptoConfig::new(b"wrong transport secret".to_vec(), size)
+                            .expect("secret"),
+                    ),
+                    3 => Some(
+                        CryptoConfig::new(
+                            b"transport test secret".to_vec(),
+                            if size == KeySize::Aes128 {
+                                KeySize::Aes256
+                            } else {
+                                KeySize::Aes128
+                            },
+                        )
+                        .expect("secret"),
+                    ),
+                    _ => config.srt_crypto.clone(),
+                };
+                let peer = "192.0.2.1:9000".parse().expect("peer");
+                let source = "192.0.2.2:9001".parse().expect("source");
+                let mut caller = Caller::with_ids(
+                    CallerConfig {
+                        crypto,
+                        ..CallerConfig::default()
+                    },
+                    peer,
+                    11,
+                    Seq::new(100),
+                    start,
+                )
+                .expect("caller");
+                let mut accepted = false;
+                let mut sent = false;
+                let mut received = Vec::new();
+                for ms in (0..1000).step_by(10) {
+                    let now = start + Duration::from_millis(ms);
+                    caller.handle_timeout(now);
+                    listener.handle_timeout(now);
+                    for _ in 0..32 {
+                        let Some((_, bytes)) = caller.poll_transmit(now) else {
+                            break;
+                        };
+                        listener.handle_datagram(now, source, &bytes);
+                    }
+                    for _ in 0..32 {
+                        let Some(event) = listener.poll_event() else {
+                            break;
+                        };
+                        match event {
+                            Event::Connect { id, .. } => accepted |= listener.accept(id, now),
+                            Event::Data { payload, .. } => received.extend(payload),
+                            Event::Closed { .. } => {}
+                        }
+                    }
+                    for _ in 0..32 {
+                        let Some((_, bytes)) = listener.poll_transmit() else {
+                            break;
+                        };
+                        caller.handle_datagram(now, peer, &bytes);
+                    }
+                    if caller.is_connected() && !sent {
+                        caller.enqueue(now, vec![0x47; 188]).expect("media");
+                        sent = true;
+                    }
+                }
+                assert_eq!(accepted, profile == 0);
+                if profile == 0 {
+                    assert_eq!(received, vec![0x47; 188]);
+                } else {
+                    assert!(caller.is_closed());
+                    assert!(received.is_empty());
+                    assert_eq!(listener.connections(), 0);
+                }
+                caller.stop(start + Duration::from_secs(1));
+            }
+        }
+    }
 }

@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sapflow_core::recording::{is_recording_name, recording_file};
 use sapflow_core::{StreamEvent, StreamPath};
-use sapflow_hls::fmp4::init_segment_for_file;
+use sapflow_hls::fmp4::{init_segment_for_file, rebase_part_for_file};
 use sapflow_hls::muxer::Part;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -108,6 +108,7 @@ async fn write(
         return;
     };
     let mut duration = Duration::ZERO;
+    let mut origin = None;
     let mut failed = file.write_all(&init).await.is_err();
     let mut full = false;
     let mut parts = 0u64;
@@ -123,7 +124,18 @@ async fn write(
                 full = true;
                 continue;
             }
-            failed = file.write_all(&p.data).await.is_err();
+            let output = match rebase_part_for_file(
+                &p.data,
+                audio.as_ref().map(|a| a.sample_rate),
+                &mut origin,
+            ) {
+                Ok(output) => output,
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            };
+            failed = file.write_all(&output).await.is_err();
             duration += p.span;
         }
     }

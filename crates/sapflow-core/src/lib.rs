@@ -196,6 +196,23 @@ pub enum StreamEvent {
         segment_path: String,
         duration_secs: f64,
     },
+    /// Measured from the encoder's media, every so often while it publishes.
+    /// v4v reads `bitrateKbps`; the rest is for Studio's encoder check.
+    Health(Health),
+}
+
+/// What the stream-health callback reports about a live publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Health {
+    /// Media received, audio and video, over the recent segments.
+    pub bitrate_kbps: u64,
+    /// The typical segment length, which is the encoder's keyframe interval
+    /// once that is at least the segment target (1 s).
+    pub keyframe_interval_ms: u64,
+    /// Whether the stream carries audio.
+    pub audio: bool,
+    /// Breaks in the media (stalls, reconnects) since the publisher connected.
+    pub breaks: u64,
 }
 
 impl StreamEvent {
@@ -205,6 +222,7 @@ impl StreamEvent {
             Self::Publish => "publish",
             Self::Unpublish => "unpublish",
             Self::RecordSegmentComplete { .. } => "recordSegmentComplete",
+            Self::Health(_) => "health",
         }
     }
 
@@ -215,16 +233,20 @@ impl StreamEvent {
             self.name(),
             json_escape(&path.as_path())
         );
-        if let Self::RecordSegmentComplete {
-            segment_path,
-            duration_secs,
-        } = self
-        {
-            s.push_str(&format!(
+        match self {
+            Self::RecordSegmentComplete {
+                segment_path,
+                duration_secs,
+            } => s.push_str(&format!(
                 ",\"segmentPath\":\"{}\",\"segmentDuration\":\"{}\"",
                 json_escape(segment_path),
                 duration_secs
-            ));
+            )),
+            Self::Health(h) => s.push_str(&format!(
+                ",\"health\":{{\"bitrateKbps\":{},\"keyframeIntervalMs\":{},\"audio\":{},\"breaks\":{}}}",
+                h.bitrate_kbps, h.keyframe_interval_ms, h.audio, h.breaks
+            )),
+            Self::Publish | Self::Unpublish => {}
         }
         s.push('}');
         s
@@ -435,6 +457,18 @@ mod tests {
         assert!(
             odd.callback_body(&p)
                 .contains(r#""segmentPath":"a\"b\\c\u000a""#)
+        );
+        let health = StreamEvent::Health(Health {
+            bitrate_kbps: 2620,
+            keyframe_interval_ms: 1000,
+            audio: true,
+            breaks: 2,
+        });
+        // v4v reads `health.bitrateKbps` and leaves the stage's status as it
+        // is for an event name it does not know.
+        assert_eq!(
+            health.callback_body(&p),
+            r#"{"event":"health","path":"live/event-a1","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":2}}"#
         );
     }
 

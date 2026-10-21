@@ -1,0 +1,871 @@
+# Android native capture adapter
+
+`mobile/android` is the standalone Kotlin/Compose application consuming the
+actual generated Sapflow AAR. Its initial qualified profile is still pending:
+the implementation requests rear-camera 720p at 30 fps, hardware H264
+baseline without B frames, a one-second GOP, and mono 48 kHz AAC-LC at 96 kbit/s.
+The orientation candidate uses upright 720x1280 portrait or 1280x720 landscape
+coded pixels, with a bounded GPU surface transform and no rotation-tag dependency.
+The selected platform encoder names are visible. Unsupported camera timestamp
+sources, surface combinations or hardware profiles produce explicit errors;
+there is no software-video fallback.
+
+## Build
+
+The parent native-package build must first produce
+`target/native-packages/android/sapflow-0.0.0.aar`. The app uses that AAR and
+JNA 5.19.1, with metadata checks enabled. Build from the repository root:
+
+```sh
+mobile/android/build-debug.sh
+```
+
+A development-only device package can be selected with
+`-PsapflowAar=/absolute/path/to/a/real-device-package.aar`. The override must be
+absolute and must contain the real generated bindings and matching native
+library from the same source. A device-only APK is not the complete four-ABI
+SDK archive or a general-release artefact.
+
+Gradle 8.13 is pinned with its distribution SHA-256. AGP 8.13.0 and Kotlin plus
+the matching Compose compiler 2.2.20 use the existing house toolchain cache.
+Compose BOM 2024.12.01 and Activity Compose 1.9.3 match the proven native house
+dependency set. The app targets API 36 and requires API 29 to inspect actual
+hardware-encoder capabilities. Build output and project caches belong under
+`target/mobile-android`; the debug APK is
+`target/mobile-android/app/outputs/apk/debug/app-debug.apk`.
+
+The capture/SDK-only baseline is preserved separately at
+`target/mobile-android/capture-baseline-debug.apk`, SHA-256
+`3dd51a6d820d122fe297fa2368551fb135ef842828d6521b30a60f2943ed8fde`.
+Its debug assembly, eight JVM tests and lint passed with zero errors and five
+warnings. This is compilation evidence; it does not establish a physical run
+duration or acceptance. The manual RTMPS integration is a subsequent build.
+
+The manual RTMPS debug APK compiled against the real generated arm64-device
+AAR, SHA-256
+`71da5a1af89703a4519ed38906ca0194dd38fc001933a51b9fcf10fc36724431`.
+Its APK SHA-256 is
+`245614ac8861e6d5f44e1533e786ff3b81c30ff1f0677afe0167f176c5c22c9f`.
+All 16 JVM tests passed, including explicit-start cancellation and bounded
+cleanup with a stalled writer. Lint passed with zero errors and the same five
+warnings as the baseline. The single-use Gradle process exited after the build.
+This arm64 development build is separate from
+the complete SDK archive and from physical camera-to-origin acceptance.
+The recording/deadline candidate is preserved at
+`target/mobile-android/recording-deadline-debug.apk`, SHA-256
+`0b886f7969476ff4c3e6210cf8d80a952f82b3335b03143a7267590b4875b63e`.
+Its actual assembly, 20 JVM tests and lint passed. The subsequent SRT/recording
+candidate is `target/mobile-android/srt-recording-debug.apk`, SHA-256
+`bec445d08e3805fb2734eb8e8fff2bd5a3a709fdc02ca46824993ff1a9fb07d1`.
+It passed actual assembly, 27 JVM tests and lint with zero errors and five
+existing warnings. Both consume real arm64 bindings/native code from AAR
+SHA-256 `bb753fa14e0d39949dad4fb1aed206e8b63495d8d4d0dba42711fd1177ee0399`,
+including recording, RTMP deadlines and microsecond SRT APIs. Their named JSON
+receipts sit beside the APKs. These builds establish neither physical Android
+storage behaviour nor physical encrypted SRT delivery. The corrected encoder-
+clock build is preserved at `target/mobile-android/monotonic-clock-debug.apk`,
+SHA-256 `4cbeace64f576a59fd7aa8762de4e7ef8d4971b3988fc9b0464df87da3cbd65d`.
+It passed actual assembly, 28 JVM tests and lint with the same five warnings;
+`monotonic-clock-receipt.json` records the matching AAR and clock regression.
+Its physical recording, capture-age and SRT checks remain pending.
+
+The subsequent queue-accounting/recovery diagnostic candidate is
+`target/mobile-android/queue-recovery-debug.apk`, SHA-256
+`a957fe5c78a377beae41fc4aa3f60420cad73e35b8fa16161653e62716f5555f`.
+Actual assembly, 31 JVM tests and lint passed with zero errors and the same
+five warnings. Its native library is byte-identical to the refreshed real
+arm64 AAR, SHA-256
+`5f082221a9ec0dc5fa6230206f80654417f14fd1e212b1ed3314a05b4e57ced6`.
+`queue-recovery-receipt.json` records queue bounds, diagnostic scope and build
+gates. Focused Rust validation covered 37 client and 29 FFI passing tests,
+with three external-fixture tests explicitly ignored; strict Clippy passed.
+This candidate preserves the two-second socket write watchdog and needs a
+physical run to identify the original stall trigger and qualify recovery.
+
+The Kotlin drainer-throughput candidate is preserved at
+`target/mobile-android/drain-throughput-debug.apk`, SHA-256
+`159643b2fab9988e0e896014e8e8f61dacbc04cb685c46eebf769a5981f96f6b`.
+It passed actual assembly, 37 JVM tests and lint with zero errors and the same
+five warnings, against the unchanged verified arm64 AAR above. All 33 Kotlin
+source hashes were rechecked after coordinated shared-index restoration;
+`drain-throughput-receipt.json` and its source-hash manifest retain the build
+context. Rust/native APIs and watchdogs were unchanged. Its early 177-second
+publisher snapshot had no resets, but the later ten-minute gate failed as
+described below; the early snapshot was not sustained acceptance.
+
+The bounded-batch candidate is preserved at
+`target/mobile-android/bounded-batch-debug.apk`, SHA-256
+`60819df1a94bfa964568724842c5c72c7ab01a6f88bf36435f6ffbe822308740`.
+Its actual assembly, 42 JVM tests and lint passed. A parent-observed physical
+run stopped after approximately 12m35s: the 10m50s checkpoint reported zero
+publishing resets, zero recovery IDR requests and 277ms queue high water.
+That is finite queue evidence only: the same run failed A/V synchronisation.
+Independent live-part probing found video PTS approximately 493–501s while
+audio was approximately 465–470s. PCM read throughput and hardware timestamps
+were not observed in that frozen candidate, so a microphone overrun remains a
+source-supported diagnosis rather than a measured hardware event.
+
+The orientation/audio candidate is frozen at
+`target/mobile-android/orientation-audio-debug.apk`, SHA-256
+`f90e729a390bdc9b991a250d08f909638d425415a32b91c6e6ae22ff8bf81d57`.
+Actual offline assembly, all 68 JVM tests and lint passed: zero errors and six
+warnings (the five existing warnings plus the debug benchmark's untranslated
+label). The native library remains byte-identical to the verified arm64 AAR
+above. `orientation-audio-receipt.json` and `orientation-audio-build.log` retain
+the gates. All 61 app-source/build inputs were hashed before the final build,
+rechecked unchanged afterwards and preserved in
+`orientation-audio-source.tar.gz`, SHA-256
+`33a78fa2111ef8332a45bd6b2d57dbf21b5e729d436517661ae2f1df4379d171`.
+The source archive excludes Gradle caches, generated artefacts and credentials.
+The APK includes the parent's debug-only offline FFI benchmark activity; that
+entry point is absent from the release manifest. These are development build
+receipts, with physical orientation/audio acceptance still pending.
+
+The free build has no billing SDK, trial timer, advertisements, proprietary
+capture SDK or Google Play services dependency. Android/AndroidX open-source
+components are used. Free V4V remains visible and available in every build;
+destination discovery and V4V publication still require the shared destination
+adapter to be attached.
+
+## Capture, ownership and workers
+
+Camera2 sends native camera buffers to one SurfaceTexture/OES input owned by
+an EGL worker. That worker applies the validated rear-sensor/cardinal-pose
+transform to the hardware MediaCodec input surface and the same-frame preview.
+It letterboxes the preview and refuses an incompatible camera-input aspect.
+No raw video enters a Kotlin byte array, Bitmap or FFI; no glReadPixels path
+exists. A dedicated AUDIO-priority reader continuously captures PCM16 into eight
+fixed direct blocks. A separate AUDIO-priority AAC pump copies each block once
+into a MediaCodec input buffer and computes the RMS meter. PCM stays on Android.
+
+Video callbacks and all fanout operations use one owned HandlerThread. AAC
+configuration, audio-clock validation and Rust sample construction belong to a
+separate AUDIO callback owner. That owner releases the MediaCodec output buffer
+before posting an immutable sample handle. A coalesced handoff holds at most
+16 shared handles/64 KiB across queued and borrowed ownership, with a 250ms
+residence limit and at most eight consumers per handler turn. It retains no
+platform output buffers or second compressed payload copy. A serial AUDIO
+quiescence barrier transfers descriptor ownership for final cleanup; release
+waits both audio workers, the barrier and all handoff owners. Input indices
+have a fixed 32-element bound. The PCM pool adds exactly 16 KiB across reader,
+ready queue and pump ownership, with a 200ms capture-age limit and no ring
+increase. A compressed direct
+ByteBuffer slice is borrowed synchronously by the generated Rust codec call;
+Rust makes the one ownership copy into an immutable sample. AAC requires no
+per-sample conversion buffer. For Annex-B H264, the adapter first performs one
+additional framing-conversion copy into a reusable direct buffer capped at
+4 MiB. Existing AVCC can be borrowed directly. Repeated SPS/PPS are stripped
+from Annex-B samples and carried by the validated descriptor. Configuration
+bytes are small separate control copies. No end-to-end zero-copy claim is made.
+
+Rust's NativeSampleFanout shares the same immutable payload between its
+4 MiB publishing and 8 MiB recording queues, each bounded to two seconds.
+Media duration is tracked independently for audio and video and bounded by
+their maximum, so interleaved A/V has approximately two seconds of capacity.
+The previous sum counted concurrent tracks twice and could reset publishing
+after approximately one second of A/V backlog. Byte, sample-count and
+two-second scheduler-residence bounds remain unchanged. Independent tests
+cover approximately two seconds of interleaved A/V, audio-only and video-only,
+per-track draining, overflow and cancellation accounting.
+Every fanout call runs on the codec handler, preserving the FFI's monotonic
+clock order. A consumer worker owns one fixed batch of at most eight shared
+sample handles in addition to those Rust queues. A publishing batch is capped
+at 4 MiB and a recording batch at 8 MiB; these are separate ownership bounds
+from the unchanged native queues. Collection cannot wait for more samples and
+does not copy compressed payloads. Only one sample is borrowed by the sink at
+a time; cancellation closes the batch's unconsumed remainder. There is no
+additional unbounded staging queue. Native queue duration/residence bounds do
+not establish combined queue-plus-batch or end-to-end latency. The
+encoder output buffer is released in `finally`, before a consumer can stall
+on disk or networking. UI snapshots and the meter refresh at 5 Hz. Rejection
+counters distinguish video timing/initial-IDR, AAC priming, publishing queue
+waiting for IDR and other queue rejection. They count ingress rejection,
+not network loss or origin/player delivery; queue evictions and the publishing
+sink's preacceptance drops require separate accounting.
+The UI now labels the old queue rejection counter as **Other ingress rejects**.
+Separate five-Hz diagnostics expose current publishing bytes/media duration,
+high-water marks, all discarded queue samples and reset counts by byte,
+sample-count, media-duration or residence cause. Fixed-size latency counters
+report publishing worker dispatch, consume and handler-return delays, plus
+RTMP lock wait, socket-write duration and native wire bytes. Delay maxima and
+counts of operations at least 100 ms survive short stalls between UI samples;
+there is no per-packet logging or unbounded history.
+The subsequent drainer fix also reports timing sample counts and mean
+microseconds. Low maxima alone do not prove sufficient sustained service rate.
+
+Entering wait-for-IDR after a runtime queue reset posts one sync-frame request
+on the codec handler. Requests are generation fenced, coalesced and limited
+to one per 500 ms; initial startup wait does not request an extra IDR. The
+encoder request is not proof that an IDR has appeared. The two-second socket
+write watchdog and native stale-wire deadlines are unchanged. Diagnostics are
+needed to distinguish slow IO, lock contention and handler scheduling before
+claiming the physical stalls are resolved.
+For the next physical run, retain startup and periodic diagnostic snapshots.
+If resets recur, correlate their reason with consume/write/lock and handler
+maxima rather than treating a sampled zero-byte queue as proof it never filled.
+Decode the independent local recording and compare its frame/packet timestamps
+through each origin gap to distinguish capture loss from publishing loss.
+
+The queue-recovery candidate failed the physical steady-state gate. In the
+reported 67-second observation, current publishing backlog was 219,439 bytes/
+666 ms, high water 642,237 bytes/1,983 ms, with 466 dropped samples and three
+media-duration resets. Write maximum was only 3 ms, lock maximum 7 ms and
+consume maximum 123 ms; origin timestamp gaps were approximately two seconds.
+These are finite observations, not sustained performance acceptance.
+
+The old drainer kept its admission flag set after worker completion until a
+per-sample handler continuation ran. Fresh capture callbacks therefore skipped
+draining even when the worker was idle. Admission now becomes available as
+soon as the worker closes its sole sample owner. Both fresh ingress and a
+single coalesced handler continuation claim admission atomically; a stale
+continuation cannot pop a second handle. This removes the mandatory handler
+return trip from the next ingress's progress path without adding a media queue.
+One explicit handoff owns an admitted handle awaiting its worker; cancellation
+closes it if its task is removed before execution. Pure tests hold the handler
+continuation indefinitely while processing 1,000 ingress/completion cycles,
+and cover claim races, stale wake-ups, idle wake-up, stop and owner cancellation.
+The change still requires physical throughput and local-recording validation.
+
+At approximately 611 seconds that single-handle drainer had 47,169 ingress
+samples and 45,369 publishing consumes, current backlog 1,066 ms, high water
+1,999 ms, 11 resets (nine media-duration, two residence), 11 recovery requests
+and 1,720 drops. Mean consume, dispatch and handler-return costs were 8,255,
+259 and 6,157 microseconds. Socket writes averaged 220 microseconds with a
+10 ms maximum. These finite observations identify inadequate aggregate
+scheduling throughput despite low individual maxima; they do not implicate
+network write latency.
+
+The bounded batch revision collects at most eight existing shared handles on
+the codec handler and sends them in FIFO order on the same sink worker. It
+does not wait to fill a batch. The next handler continuation occurs once per
+batch. One batch may be admitted per sink; queued and active batch cancellation
+close every unconsumed handle while the currently borrowed sample stays owned
+by its worker until that call returns. Graceful recording stop processes its
+accepted batch before the remaining native queue and final file rewrite.
+Diagnostics show batch count, mean/maximum size, retained handles/bytes and
+batch service time while retaining per-sample consume timing.
+
+An independent 600-second virtual scheduler using those measured costs needs
+approximately 1.366 samples per handoff to keep up with 77.2 ingress units/s.
+The batch helper model averages approximately 1.366 (a mixture of one and two)
+with less than 26 ms peak backlog; the single-sample model falls behind.
+This is deterministic model evidence, not an Android throughput result.
+Unit cases also cover eight-handle admission, ninth-item retention in the
+source queue, FIFO order, cancellation during a borrow, queued cancellation,
+sink/cleanup failure and byte bounds. Native queue settings and protocol
+watchdogs are unchanged, and physical steady-state acceptance remains open.
+
+The fixed 30 Hz profile quantises camera presentation times onto 90 kHz frame
+slots; duplicate slots are counted and dropped. Baseline encoding excludes
+B frames, so DTS equals PTS. AAC uses 1024-sample units on its 48 kHz clock,
+anchored to the first encoder output timestamp. Negative AAC priming timestamps
+are discarded and counted rather than passed into the non-negative SDK timeline.
+The selected camera currently requires a realtime sensor timestamp source, but
+that does not determine encoder-surface timestamps. Android's default
+MediaCodec output-surface timebase is MONOTONIC. Capture epoch, microphone
+input anchoring and signed video age therefore use `System.nanoTime`, while
+Rust queue residence and transport deadline clocks remain separate.
+The earlier frozen APKs incorrectly mixed an `elapsedRealtime` epoch with
+encoder PTS; accumulated suspend time can cause pre-epoch video rejection,
+A/V offset and misleading age. A pure regression simulates a 16-second
+BOOTTIME/MONOTONIC offset. Synchronisation, orientation, older supported
+platforms and long-run clock drift still require physical measurement.
+An independent native clock probe on the selected physical Android device
+measured `CLOCK_BOOTTIME - CLOCK_MONOTONIC = 1,935,120,157 ns`, with a
+312 ns sampling span. This is one finite clock-offset observation, not an
+encoder-PTS, recording-sync or latency measurement. It confirms that the two
+clocks cannot be treated as interchangeable on that device; it does not
+explain the owner's reported 16-second playback delay by itself.
+See [the platform output timestamp contract](https://developer.android.com/reference/android/hardware/camera2/params/OutputConfiguration#TIMESTAMP_BASE_DEFAULT).
+The UI exposes signed encoded-video capture age. It separates encoder/callback
+freshness from SDK, transport and player latency; it is not glass-to-glass latency.
+
+A source-only clock audit after that probe found no remaining subtraction or
+comparison between encoder PTS and BOOTTIME in the Android capture/publisher
+path. Fanout enqueue/pop/residence use BOOTTIME consistently. RTMP startup,
+native feed/tick and absolute-deadline calculations consistently use BOOTTIME
+milliseconds, independently of rebased sample timestamps. SRT offers, socket
+write bounds and native protocol calls consistently use MONOTONIC microseconds.
+Recording derives file timing from the rebased sample timeline. Relative JVM
+waits/timers are separate scheduling mechanisms; suspension behaviour must be
+requalified if background capture is introduced. This audit did not execute
+capture or alter the frozen APK.
+
+## Sink seam and truthful status
+
+`CaptureController.publishingSink` and `.recordingSink` accept `EncodedSink`
+implementations before preparation. `consume` runs on separate owned workers,
+with one borrowed immutable sample at a time from the fixed batch. It must complete within
+the consumer's transport/storage bounds. `close` must promptly cancel pending
+IO. The handle is borrowed for that call and is closed immediately afterwards.
+An adapter needing asynchronous retention must define and enforce its own
+bounded ownership contract; it must not introduce an unbounded queue.
+
+Leaving the manual destination blank attaches no publisher. It performs real
+capture, Rust sample validation, shared fanout and bounded draining, then
+releases publishing handles. The UI says **SDK validation only** and **No
+publisher attached**. A manual RTMPS application URL and stream key attach
+`RtmpPublishingSink`, using the generated `NativeRtmpPublisher` and our own
+RTMP implementation. Plain RTMP requires the separate development checkbox;
+there is no fallback from TLS. The stream key stays in memory and is hidden
+in the input field. URL userinfo, query strings and fragments are refused.
+Preparation creates a dormant destination. Only the explicit Start action
+constructs the RTMP connection, starts its startup deadline and begins network
+IO; encoder sample arrival never implicitly starts a destination.
+
+The platform TLS provider checks the normal certificate chain and the original
+destination hostname using HTTPS endpoint identification. No trust manager
+override exists. Cancellable platform DNS has a three-second deadline, TCP
+connection has a three-second total address budget, TLS has five seconds,
+and each write has a two-second socket-close watchdog. A network reader and
+deadline worker are owned by that one attempt. Rust calls and socket output
+are serialised outside capture callbacks, with at most one bounded wire output
+buffer in flight. Prepublication media is dropped, and sending waits for a
+fresh IDR after acceptance. A stopped attempt is not automatically retried.
+
+The UI reports **Origin accepted ... media delivery unconfirmed** after
+Publish.Start. It does not invent an origin/player acknowledgement. A failed
+network attempt drops publishing samples while capture and independent local
+recording can continue. A recording queue/sink failure closes recording alone
+and leaves publishing running. The shared session grace/reconnect policy is
+an additional parent integration, not implemented by this single-attempt sink.
+
+The sender enforces the negotiated Hard/Soft/Dynamic outstanding-byte window,
+validates cumulative wrapping acknowledgements and retains partial wire output
+within its byte budget. A partial take adds one accounted wire copy. Native
+adapters must drive the absolute `nextDeadlineMs` with one real timer. Android
+ticks before each send and expires still-owned media wire output after one second,
+even if small acknowledgements continue. Socket writes have their separate
+two-second deadline. These bounds do not establish one-second end-to-end latency.
+
+The SRT destination option attaches `SrtPublishingSink` to our own Rust SRT
+caller. The current scope is a numeric unicast IPv4/IPv6 socket address with an
+explicit port and separate stream ID; DNS, multicast and URL query credentials
+are refused. AES-256 is the default and requires a 10–79-byte UTF-8 passphrase.
+Plaintext requires the explicit lab option and an empty secret. SRT encryption
+does not establish server identity in the way validated TLS does.
+
+Preparation is dormant. Explicit Start opens a connected nonblocking
+DatagramChannel and waits at most 15 seconds for codec configuration. Its
+Selector worker owns all SRT calls at actual microsecond precision. It has at
+most one borrowed sample offer, one outgoing datagram of at most 1500 bytes,
+16 bounded steps per turn and one native-deadline timer; there is no idle
+polling or additional media queue. A zero-byte socket write enables writable
+readiness and a 100 ms deadline. The native configuration uses 120 ms latency,
+128 packets, 4 MiB, one-second packet/sample residence and a 1,250,000-byte/s
+bandwidth ceiling. These separate bounds do not sum to a one-second latency
+guarantee. Prehandshake samples are dropped and sending starts at a fresh IDR.
+Failure ends that attempt while independent recording continues. Connected
+means handshake completion; media reception remains unconfirmed.
+
+Private MP4 recording is a separate explicit checkbox, enabled initially.
+`PrivateRecordingSink` consumes the same immutable encoded handles through
+`NativeRecordingMuxer`. Only its worker creates a unique exclusive file under
+the app's private `files/recordings`, writes bounded mux output and performs the
+final fixed-size duration-header rewrite, force and close. Preparation performs
+no recording IO. Fragment assembly and generated owned-byte transfer have their
+own accounted copies; recording never creates a second encoder or payload
+staging queue. Disabling recording truthfully reports that no file is written.
+
+Normal Stop drains the accepted Rust recording queue before finalising on its
+worker, with a three-second grace and one-second abort wait. A recording failure
+drains its accepted prefix asynchronously, keeping clocked queue pops on the
+codec handler while file IO stays on the recording worker. Cancellation closes
+the channel to interrupt pending IO; a failed/deadline-limited file is reported
+as a retained partial prefix. Physical storage-full and interruption acceptance
+remain open. Recreate closed sink adapters before preparing another session.
+
+## Interruption and evidence gates
+
+Camera/microphone permissions are requested together before preparation.
+Capture is foreground-only: leaving the Activity, losing its preview surface,
+camera disconnection, microphone silencing, codec/configuration rejection or
+shared-ingress failure stops the session. Resumption requires preparation and an
+explicit start. No foreground service or background-capture claim exists yet.
+Cleanup stops the camera, audio input and codecs, cancels Rust queues, closes
+sinks and immutable handles, and stops owned workers on Activity destruction.
+
+Unit tests cover independent Annex-B/AVCC fixtures, parameter-set extraction,
+borrowed direct views, buffer reuse, priming/cadence/restart timing, strict
+destination parsing and hostile length/framing limits. APK
+assembly proves packaging/compilation only. Signed release packaging, installed
+no-Play GrapheneOS execution, hardware selection, native buffer behaviour,
+timestamp correctness, interruptions, actual origin/file output and the
+two-hour performance/battery/thermal profile remain separate acceptance gates.
+
+Implementation references:
+[Camera2 simultaneous surfaces](https://developer.android.com/media/camera/camera2/multiple-camera-streams-simultaneously),
+[MediaCodec lifecycle and buffers](https://developer.android.com/reference/android/media/MediaCodec),
+and [matching Kotlin/Compose compiler setup](https://developer.android.com/develop/ui/compose/setup-compose-dependencies-and-compiler).
+TLS references are the platform's
+[security guidance](https://developer.android.com/privacy-and-security/security-ssl)
+and [endpoint identification API](https://developer.android.com/reference/javax/net/ssl/SSLParameters).
+
+## Independent protocol evidence
+
+The native wrapper's five Rust tests cover typed configuration, common-epoch
+audio/video offsets, composition offsets, gating, continuity, configuration
+identity and bounded retry after saturation. The underlying publisher has
+eighteen wire/state tests. An independent plaintext receiver check is repeatable:
+
+```sh
+cargo build --offline -p sapflow-hls --example rtmp-publish -j 2
+python3 tests/rtmp-publish-interop.py
+```
+
+The black-box ffmpeg listener received 180 H264 frames and 283 AAC frames from
+a 5,962,135-byte fixture; codec/rate checks and complete decoding passed. The
+driver and decoder are separate implementations. ffmpeg's initial Dynamic
+bandwidth limit has no preceding Hard and is ignored as the specification
+requires. The harness therefore explicitly injects one independently specified
+2,500,000-byte Hard control after S0/S1/S2 through a bounded loopback proxy.
+The effective sender window was 2,500,000; the receiver cumulatively acknowledged
+5,119,878 bytes. A separate uninjected run also decoded successfully with over
+5 MB acknowledged, and an own-origin test governs a transfer exceeding 6 MB.
+The harness removes its generated media, proxy threads/sockets and receiver
+process even on failure. This is RTMP interoperability evidence, not TLS,
+physical camera, destination authorisation or sustained-performance acceptance.
+
+The strict governor gives no control-message exemption. Tiny windows, ACK wrap,
+forged/future ACKs, saturation and ACK stalls are covered by independent wire
+cases; stalls fail on a driven deadline or bounded backpressure. The own origin
+now advertises initial Hard and counts pre-negotiation bytes in its first ACK.
+See [RTMP section 5.4.5](https://rtmp.veriskope.com/pdf/rtmp_specification_1.0.pdf).
+
+`mobile/android/qualification/srt-loop.py` compiles the exact production SRT
+Selector/offer/parser sources against the real generated AAR classes and JNA,
+then loads the matching host Rust SDK. An independent libsrt receiver accepted
+AES-256 output; ffmpeg completely decoded 180 H264 frames and 282 AAC frames.
+One of 283 offered AAC samples preceded the first IDR and was intentionally
+dropped. The harness removes its temporary media/classes and receiver process.
+This qualifies the production Kotlin protocol loop on the host JVM; Android
+UDP/runtime, camera, storage and physical encrypted delivery remain separate.
+
+## Next capture controls: bounded capability plan
+
+Further controls wait for the first physical recording/capture-age check.
+No additional controls below are implemented or exposed by the current UI.
+
+1. Add bitrate and manual IDR requests on the codec handler using
+   `PARAMETER_KEY_VIDEO_BITRATE` and `PARAMETER_KEY_REQUEST_SYNC_FRAME`.
+   Validate bitrate range/mode first, and distinguish requested values from
+   observed throughput/keyframes. These need no new Rust API. An SPS/PPS
+   change requires a new configuration epoch, recording file and sink attempt.
+   [MediaCodec parameters](https://developer.android.com/reference/android/media/MediaCodec).
+2. Offer only the intersection of camera size/exact FPS, encoder surface,
+   size/rate/alignment, profile, bitrate range and bitrate-mode support.
+   Current selection checks 720p30 baseline but requests CBR without probing
+   its support; this must be corrected before offering profiles. Keep no-B-frame
+   baseline first; other profiles require native descriptor and destination
+   qualification. OEM performance estimates are not sustained-FPS proof.
+   [Video capabilities](https://developer.android.com/reference/android/media/MediaCodecInfo.VideoCapabilities),
+   [encoder modes](https://developer.android.com/reference/android/media/MediaCodecInfo.EncoderCapabilities).
+3. Probe front/rear cameras individually, including orientation, AF modes and
+   timestamp behaviour. Recreate the camera session against the encoder surface,
+   fence old callbacks and request an IDR. Preserve the media clock across a
+   supported switch; configuration changes instead require a new attempt/file.
+   A seamless switch needs physical qualification.
+4. Freeze an audio-only track mode before Prepare. Skip camera/preview/permission,
+   set fanout `hasVideo=false`, remove IDR gating and pass the audio-only track
+   intent into both sinks. The shared recorder and SRT constructor already
+   support optional video; RTMP supports AAC-only wire output. The own-origin
+   HLS ingest currently creates its muxer from video, so end-to-end audio-only
+   requires a separate origin change and receiver proof.
+5. Move capture ownership into a bound foreground service before permitting
+   background/screen-off operation, with optional preview and a notification
+   Stop action. Declare camera/microphone service types and their permissions,
+   start from visible UI after runtime permission, and test privacy toggles,
+   screen-off, service kill and storage finalisation. Current Activity/surface
+   loss intentionally stops capture. Android's while-in-use restrictions remain
+   applicable; no Google runtime is needed.
+   [Foreground service types](https://developer.android.com/develop/background-work/services/fgs/service-types),
+   [background-start restrictions](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start).
+
+## Upright pixels and bounded orientation epochs
+
+The orientation candidate handles all four cardinal poses relative to the
+natural device orientation. Prepared preview does not start a publisher or
+recording. A pose change while prepared rebuilds the native canvas; during
+capture it stops the old camera/GPU producer, drains a maximum 500ms encoder
+EOS tail, finalises the accepted recording prefix, and constructs fresh codec,
+recorder and publisher objects. Each recording has a new private filename;
+immutable codec descriptors and transport epochs never change in place.
+Latest pose requests coalesce under the original six-second restart deadline.
+Stop, foreground interruption, cleanup timeout and recording finalisation
+failure cancel automatic resumption. A pose change during an inhibited initial
+preparation can require explicit Prepare again; it does not invent a new
+cleanup deadline. Storage errors remain visible independently of publishing.
+
+GPU stop/close callbacks report actual detach/release only. An independent
+watchdog reports stalled native driver calls; it cannot forcibly complete an
+uninterruptible driver operation. Borrowed encoder surfaces remain owned until
+real GPU detach. Unfinished cleanup retains owners and prevents a new epoch.
+Transient abandoned preview surfaces are separate from encoder/context errors.
+The four-pose decoded-pixel, aligned-preview, live-turn, Stop-during-turn,
+background-during-turn and storage-failure matrix remains physical acceptance,
+not a JVM or compilation claim. See [the design](mobile-android-orientation.md).
+
+API33+ requests `OutputConfiguration.TIMESTAMP_BASE_MONOTONIC` explicitly for
+SurfaceTexture input. API29–32 requires a REALTIME sensor source and a bounded,
+bracketed BOOTTIME-to-MONOTONIC mapper. This differs from the old direct encoder
+surface default; raw SurfaceTexture sensor timestamps must not enter the media
+epoch unchanged. GPU presentation and AudioRecord hardware timestamps use the
+same MONOTONIC epoch. Queue residence and network deadlines retain their own
+existing elapsed-realtime clock contract.
+
+## Audio capture safety and diagnostics
+
+The frozen batch implementation timestamped AAC input from the count of PCM
+frames successfully read, while waiting for encoder indices before each read.
+If input callback starvation allowed AudioRecord's capture ring to overrun,
+that scheme could compress missing real time into apparently contiguous AAC.
+The new path isolates AAC availability/pump scheduling at AUDIO priority and
+validates each read cursor against `AudioRecord.getTimestamp` using
+`TIMEBASE_MONOTONIC`. It maps the actual first PCM frame through the hardware
+frame-position/time pair and subtracts the shared capture epoch. Before-read
+checks refuse a cursor beyond the actual `bufferSizeInFrames`; stale,
+unavailable or regressing hardware timestamps and uncertain positions fail
+explicitly. There is no silence insertion, stale-PCM retiming or larger-buffer
+substitute. AAC output keeps the exact 1024-frame cadence with the existing
+discontinuity guard.
+
+Coalesced five-Hz diagnostics separately show PCM frames read, AAC input frames
+and PTS, raw AAC output count/PTS, validated AAC count, capture elapsed time,
+hardware frame position, unread backlog/capture capacity, timestamp age,
+input-index wait maximum, read maximum and encoded callback-handler delay.
+Tests cover hardware mapping, sustained 48k sample arithmetic, before-read
+starvation/overrun, stale/regressing timestamps and atomic output ownership
+across cancellation. A successful fail-fast check is a safety result, not
+proof of sustainable audio throughput. Physical acceptance must independently
+show approximately 48,000 PCM frames and 46.875 AAC access units per second,
+bounded hardware backlog and stable A/V PTS across a sustained run and turns.
+The Android hardware timestamp contract is documented in
+[AudioRecord](https://developer.android.com/reference/android/media/AudioRecord#getTimestamp(android.media.AudioTimestamp,%20int)).
+
+## PCM pool and failure cleanup correction
+
+The orientation/audio candidate above failed its physical safety gate after
+approximately 20 seconds. The last good UI snapshot reported 964,608 PCM/input
+frames, 937 AAC output units, 20,147ms elapsed and an estimated hardware backlog
+of 374/4096 frames; it was not the failing hardware observation. Maxima were
+57,113us input-index wait, 91,009us AudioRecord read and 127,383us encoded callback
+handler delay. The exact failing frame-position/time pair was missing, so this
+does not establish definite ring overwrite. Hardware position can include
+capture-pipeline latency. The conservative error correctly labelled uncertain
+position as well as possible overrun. The origin prefix independently decoded
+as 720x1280 with 546 video frames and 849 AAC units over approximately 18.2s;
+no asymmetric chart was used, so upright four-pose acceptance remains open.
+
+The next source packet separates continuous microphone reading from AAC input
+availability. Exactly eight 1024-frame direct PCM blocks (16 KiB total) cover
+all reader, queued and encoder-pump ownership. The reader does no MediaCodec,
+JNA, RMS or input-index waiting. The separate AUDIO-priority pump waits for AAC
+indices and performs one explicit platform-only PCM copy into the codec input.
+The AudioRecord ring is unchanged (4096 frames on the measured phone). Blocks
+retain hardware-mapped first-frame timestamps and fail at 200ms capture age;
+exhaustion, stale PCM and uncertain hardware position never insert silence or
+move old PCM to the present. Normal Stop may drain queued blocks under the same
+age bound before encoder EOS; failure cancels the fixed pool. This cannot
+promise survival of ART pauses beyond the native capture ring: a dedicated
+Java reader still participates in runtime suspension.
+
+Hardware safety failures now retain both exact before/after read cursors,
+frame positions, timestamp/observation nanoseconds, counts, capacity and epoch.
+The hot path stores primitives; diagnostic strings are formatted on failure,
+with normal status coalesced at five Hz. Approximate ART GC counts, GC time,
+blocking-GC counts/time and allocated-byte totals are sampled only at start
+and failure. These process totals can correlate runtime pressure but do not
+identify an individual stop-the-world pause.
+
+The same failed run exposed a separate concrete cleanup race. Microphone
+finally could post completion before deferred Stop; Stop then overwrote that
+fact because its non-null Thread reference remained. No later completion could
+unblock teardown, so the six-second fence expired and the origin eventually
+closed on idle timeout. Completion facts are now monotonic across reader/pump
+finally and deferred Stop, with deterministic ordering regressions. Failure
+also aborts the publisher on an independent control thread before microphone
+or GPU cleanup gates. Exact owner flags and the current control-cleanup phase
+remain visible; Prepare is disabled while owners remain. This does not fake
+GPU/codec release, and an actually blocked owner still prevents another epoch.
+
+The PCM/cleanup candidate is frozen at
+`target/mobile-android/pcm-pool-cleanup-debug.apk`, SHA-256
+`34642ff2ff414bad5bee5199b9baa05cd929783a965a0a143c626ed5d7e5c6ef`.
+Actual offline assembly, all 75 JVM tests and lint passed with zero errors and
+the same six warnings. The native library is byte-identical to the unchanged
+verified arm64 AAR. `pcm-pool-cleanup-receipt.json` and
+`pcm-pool-cleanup-build.log` retain the checks. All 65 app-source/build inputs
+were rechecked unchanged and archived in `pcm-pool-cleanup-source.tar.gz`,
+SHA-256 `31f43a3b6993e0045289aeb6dd4b02b237d6bb7fe8b44aec70b0c258bf0c98bc`.
+The fixed-pool tests cover a virtual 127ms delayed encoder, ordered unchanged
+PCM timestamps, total ownership capacity, cancellation and 200ms stale-data
+refusal. Completion tests cover the exact finally-before-deferred-Stop ordering
+and both worker completion orders. These are source/build safety gates only;
+sustained physical capture, stop ownership and four-pose acceptance remain
+pending. Previous frozen APKs and receipts are preserved unchanged.
+
+## AAC owner and fused RTMP follow-up
+
+The PCM candidate failed after approximately 55.26s with its pool exhausted:
+zero free blocks, seven ready and one encoder-owned. Hardware continuity was
+still healthy: 2,650,112 PCM frames versus 2,641,920 AAC input frames, with
+2,580 encoded units. This identifies a producer/encoder scheduling backlog,
+without establishing that every cause is now known. The previously sampled
+input wait maximum was 121,678us and encoded-handler delay 196,927us. Approximate
+process GC totals increased from three runs/164ms/26MB allocated to six runs/
+1211ms/463MB allocated; no blocking-GC run was reported. Those totals do not
+prove an individual pause or a causal allocation source.
+
+The same physical failure passed the corrected cleanup gate: reader, pump,
+camera, GPU and output owners completed, Prepare became available, the origin
+received normal unpublish/EOF, and its recording prefix finalised at about
+53s. The source correction is therefore backed by finite failure-path hardware
+evidence; sustained capture throughput remains failed, with no publishing
+queue resets in that observation.
+
+The next packet moves compressed AAC construction to the AUDIO callback owner
+and releases the platform buffer before the sole fanout handler is scheduled.
+The native encoder can regain its inputs even while that handler is busy. The
+new immutable handle handoff is explicitly bounded as described above; count
+and bytes remain charged until the currently borrowed handle is actually
+closed. Cancellation closes only unborrowed owners. Residence checks cover
+both dispatch and the synchronous fanout call: a blocked call cannot be safely
+interrupted, so an overrun is reported after it returns without concurrent
+handle closure. Normal EOS drains accepted handoff owners before finalisation;
+failure cancels the unaccepted remainder and preserves the recording prefix.
+Configuration and exact AAC cadence remain per epoch, with no shared mutable
+audio clock and no stale PCM retiming.
+
+The app also consumes the actual additive `sendAndTakeOutput` SDK API. One
+native call performs RTMP tick, typed sample validation, send and bounded wire
+output transfer, returning state, remaining bytes and the next deadline from
+the same native guard. Kotlin arms that returned deadline before its unchanged
+two-second socket-write watchdog. Existing TLS trust/hostname validation,
+ACK/window policy and transport failure behaviour are preserved. First-IDR
+metadata crosses FFI only until a successful first IDR send; steady-state
+samples require neither video nor keyframe getter. This reduces crossings;
+physical allocation, timing and sustained playback improvements still require
+measurement. The parent debug-only benchmark includes complete legacy/fused
+sample operations against the same in-memory fixture.
+
+The AAC-owner/fused-RTMP candidate is frozen at
+`target/mobile-android/aac-owner-fused-debug.apk`, SHA-256
+`d0a56e369418346b41fbec580d60947d11c5464d1f967563a5fafc581de686ff`.
+It consumes the verified additive fused-API AAR, SHA-256
+`4d782d501ab8c171aaf83a7dcbe70675988c32f5551c3916e1149f530286fc1a`;
+the packaged native library matches that AAR. All 71 exact app-source/build
+inputs are preserved in `aac-owner-fused-source.tar.gz`, SHA-256
+`059fc7913ea8a294c5d79a95029ff139d327df613675538a6cf285800428d4ed`,
+with the accompanying source-hash manifest.
+
+The local final offline build passed actual assembly and all 85 JVM tests.
+Severe host swapping delayed the build, so the parent also built the exact
+hash-verified archive on the M4 with the same pinned toolchain and AAR. That
+run passed all 85 tests in 24 suites and lint with zero errors/seven warnings.
+The warnings cover target-API guidance, two dependency-update hints,
+fullSensor orientation guidance, backup rules, the missing application icon
+and the debug benchmark's untranslated status text. The obsolete first local
+lint run was cancelled; the final lint gate is the successful exact-source M4
+run, not an inferred local result.
+
+The parent re-signed the M4 APK with the existing development key and verified
+the installed-app certificate plus all 149 non-signature payload entries.
+Installation therefore does not require deleting existing app data. The
+canonical `aac-owner-fused-receipt.json` retains signing/M4 verification, with
+local test/assembly validation recorded separately. No source changed after
+that archive was frozen. These gates establish the debug build and ownership
+regressions; sustained physical audio, stable A/V PTS, four-pose visual
+correctness and the new AUDIO-owner stop path remain acceptance checks.
+
+That debug candidate failed the next physical run at about 30.6s: the
+compressed-AAC handoff reached 13/16 handles and its oldest handle waited
+256.158ms, beyond the unchanged 250ms limit. PCM kept pace with a pool high
+of two blocks, publishing had zero queue resets and a 99ms high, and cleanup
+completed all owners with prompt origin EOF. GC totals increased by 504ms
+and approximately 188MB allocated; cumulative totals do not identify an
+individual pause or its cause. The failure therefore remains a scheduling
+and allocation investigation, with no wider buffers or timestamp changes.
+
+The next controlled comparison is the internal `qualification` build type.
+It inherits `release`, explicitly disables debugging, retains the existing
+minification/resource-shrinking behaviour, and uses the local development
+signing configuration for private updates. Its own manifest permits shell
+profiling; only debug and qualification source sets include the offline
+benchmark. The production release source set excludes that Activity. This
+follows Android's recommendation to measure a non-debuggable, profileable
+release-derived variant; no benchmark library or runtime dependency is
+added. [Android performance build guidance](https://developer.android.com/topic/performance/benchmarking/macrobenchmark-overview#setup-app)
+
+`mobile/android/build-qualification.sh` runs source-isolation checks, the
+existing qualification JVM tests, assembly and lint. After assembly,
+`mobile/android/verify-qualification.py` checks the actual APK manifest,
+benchmark Activity and exact frozen AAR/native-library identity. The variant
+retains every media source, queue bound, clock and watchdog from the failed
+debug candidate. Its source archive and manifest use the
+`aac-owner-fused-qualification` prefix under `target/mobile-android`.
+Build and physical acceptance remain separate gates; adding this variant
+does not establish that debug overhead caused the failure.
+
+The later non-debuggable status-cache candidate failed physical orientation:
+both the phone preview and an independently decoded origin frame were sideways
+and stretched. Camera2's SurfaceTexture producer matrix already contains sensor
+rotation; applying the same sensor correction again to shader vertices was the
+concrete defect. The next source packet separates raw sensor dimensions from
+natural-texture/encoded/preview geometry, retains the complete producer matrix,
+and applies only the residual physical/display rotations. It adds bounded
+250ms pose settlement with a real one-shot timer, including unchanged-angle
+callback suppression and foreground cancellation. Source-oracle tests cover
+producer composition, labelled corners, physical pixel aspect and four poses;
+actual M4 build and phone/origin visual acceptance remain pending. Details and
+the first-frame-only `SapflowGeometry` log contract are in
+[the orientation contract](mobile-android-orientation.md).
+
+The subsequent rotation run reached ERROR with all native owners released, but
+still displayed the ordinary orientation-transition message. The original
+cause cannot be recovered from that finite packet. Two diagnostic-loss paths
+exist: recording failure during a pending rotation and a cleanup watchdog
+followed by successful owner completion. The next diagnostics-only packet
+latches the first terminal failure per capture epoch separately from transition
+text. Final ERROR and repeated Stop retain that cause; manual Prepare starts a
+new diagnostic epoch without clearing the bounded lifecycle history.
+
+`SapflowLifecycle` logs fixed reason codes and scalar epoch, generation, pose,
+stage and ownership flags. It never logs exception messages, destinations,
+credentials, private recording paths or media. The history retains 16 entries;
+repeated failure codes are logged once per epoch. No per-frame logging is added.
+Flag bits 0–12 respectively mean stopping, teardown, camera closed, GPU stopped,
+GPU closed, microphone workers stopped, AudioRecord stop returned, publisher
+abort completed, encoder tail completed, AAC owner quiesced, zero AAC handoff
+handles, terminal failure and cleanup timeout/retained ownership. A completed
+cleanup is a separate observation and cannot erase the first failure.
+
+The four added JVM tests cover failure during rotation, timeout followed by
+successful cleanup, stale epochs/bounded immutable history and log privacy.
+M4 qualification tests, compile/lint and renewed physical rotation acceptance
+remain pending for this packet. It diagnoses the black-preview failure rather
+than claiming its underlying scheduling or platform cause is fixed. Queue,
+PCM/AAC, protocol, cleanup and pose-stability bounds remain unchanged, as do
+the orientation transform and native/status-cache package.
+
+The next qualification-only pose control exercises actual encoder/audio,
+recording and publisher restart while the owner leaves the phone stationary.
+It does not establish upright physical geometry: the injected pose deliberately
+differs from the real device pose. The existing SurfaceTexture producer matrix,
+shader geometry, queues, clocks, native package and 250ms pose dwell are retained.
+
+Only `src/qualification` declares `QualificationPoseApplication`. It registers
+a dynamic receiver while the existing MainActivity is visible, and requires a
+non-debuggable, shell-profileable package plus sender `android.permission.DUMP`.
+There is no manifest receiver to cold-start the app, Activity launch, destination
+or credential input, prepare/start, unlock, capture-file access or background
+control. The release/debug source sets exclude that Application; their default
+pure pose-input policy rejects every override request. Android documents sender
+permission checks for context-registered receivers, and AOSP's shell requests
+DUMP. [Broadcast permissions](https://developer.android.com/develop/background-work/background-tasks/broadcasts#restrict-broadcasts-permissions),
+[AOSP shell permissions](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/packages/Shell/AndroidManifest.xml)
+
+The owner may send one package-targeted command to an already capturing app:
+
+```sh
+adb -s DEVICE_SERIAL shell am broadcast \
+  -a dev.forgesworn.sapflow.broadcaster.QUALIFICATION_POSE \
+  -p dev.forgesworn.sapflow.broadcaster --es pose CLOCKWISE_90
+```
+
+Accepted values are `NATURAL`, `CLOCKWISE_90`, `REVERSE`, `CLOCKWISE_270` and
+`CLEAR`; no other extras or intent data are accepted. A pose is admitted only in
+CAPTURING. Transition commands return INACTIVE without changing the override,
+so automation must wait for CAPTURING before each step. The same selector and
+one-shot 250ms timer then call the production orientation restart method.
+Physical notifications are suppressed while overridden, but the normal sensor
+selector continues its 250ms dwell internally using the same one-shot timer.
+CLEAR therefore restores an already stable physical pose without waiting for
+another unchanged sensor callback; an unfinished physical dwell still has to
+complete. CLEAR also works in error/idle without requesting a native restart.
+Normal UI Stop clears the override and fences synthetic commands immediately,
+even before the asynchronous controller leaves CAPTURING. Physical settling
+continues without notifying the stopped controller; explicit manual Prepare
+synchronises its stable pose before preparing a new epoch. Stop/Prepare preserve
+the qualification enablement and the 16-request foreground budget. Leaving the
+foreground/destruction disables and resets the hook and cancels its timer.
+CLEAR stays available after the request budget is exhausted.
+
+Ordered broadcast result codes are 0 DISABLED, 1 INACTIVE, 2 INVALID, 3 LIMIT,
+4 ACCEPTED and 5 CLEARED. `SapflowPoseQualification` logs only these fixed
+results. No command repeats itself or performs network/file work. This is a
+private qualification control, not a production remote-control interface.
+
+The source isolation gate is `:app:verifyQualificationIsolation`. The next M4
+packet must run all 102 qualification JVM tests (eight new pure pose-policy
+cases), qualification/release assembly and qualification lint. The 20 Python
+verifier tests pass locally; no Gradle/device run has been made for this packet.
+Actual APK checks additionally require the hook Application and its DEX markers
+in qualification, and reject the Application/action/benchmark markers in release:
+
+```sh
+python3 mobile/android/verify-qualification.py QUALIFICATION_APK FROZEN_AAR \
+  --aapt2 AAPT2 --expected-aar-sha256 FROZEN_AAR_SHA256 \
+  --expected-native-sha256 FROZEN_NATIVE_SHA256 --expect-pose-hook \
+  --release-apk RELEASE_APK
+```
+
+This keeps existing verifier defaults usable for older receipts. Full compile,
+artifact isolation, DUMP-gated delivery, active-state fencing and actual restart
+continuity remain separate M4/physical gates until exercised by the parent.
+
+The frozen `qualification-pose-hook-v2` packet subsequently passed the M4
+qualification gate: 102 JVM tests in 26 suites, no failures/errors/skips, zero
+lint errors and the seven existing warnings. Static isolation and actual APK
+checks passed: the qualification Application/action are present only in the
+qualification artifact, and the release artifact contains neither the hook
+nor the benchmark and does not permit shell profiling. The AAR and native
+library remain unchanged. The first attempt exposed an unflagged legacy
+receiver registration; the final source uses the existing AndroidX
+`ContextCompat.registerReceiver` overload with explicit exported status and
+the DUMP sender permission across all supported versions.
+
+The original qualification APK SHA-256 is
+`8300f25db6ec6fc8ad8ce901437bccac609e842b68f9a5b9956df9a69d7d1db0`;
+the unsigned release negative control is
+`e81e09f616a975206279e9f9adff1fa9533c8cc9272f7789b63e7ff22885af37`.
+The source archive and manifest, build log, original APKs and independent local
+verification are retained under ignored
+`target/mobile-android/qualification-pose-hook-v2-*`. These are internal build
+receipts. No device access, additional signing, install, sender-permission
+exercise or actual rotation-continuity acceptance was performed by this task.
+
+The subsequent SRT normal-Stop correction is source-only. It is **not** in the
+installed `f77c0636…` qualification APK, which remains the baseline for the
+first stationary AES256 phone-to-origin run. That binary closes UDP before
+polling the native shutdown control, so the origin can retain its publisher
+until peer-idle expiry. No package, capture, renderer, audio or media-age bound
+was changed by this correction.
+
+Normal Stop now publishes one original 100ms deadline, closes admission and
+wakes the Selector without interrupting its worker or closing UDP early. The
+UDP owner cancels native media/keys, discards its previously returned media,
+then polls at most one fresh 16-byte SRT SHUTDOWN control. It makes one
+nonblocking write only: zero-write, partial write, exception or expiry ends the
+attempt without retry. Local submission never means destination receipt. The
+original deadline cannot be renewed; its watchdog hard-closes the channel and
+interrupts the worker. Immediate failure still takes that hard-abort path,
+and the control worker retains its one-second join/retained-owner check.
+Prepare-only cancellation creates no native publisher, duplicate Close remains
+idempotent, and normal Stop preserves a prior failure message.
+
+This ordering avoids poisoning the graceful control write with an early
+interrupt. Java documents that interrupting channel I/O can close the channel;
+Selector wakeup releases selection without setting that interrupt status.
+See [DatagramChannel.write](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/channels/DatagramChannel.html#write(java.nio.ByteBuffer))
+and [Selector.wakeup](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/channels/Selector.html#wakeup()).
+
+The exact production JVM SRT sources compile with warnings treated as errors
+against frozen AAR `6102340f…`. Twenty pure JUnit tests pass, including ten new
+shutdown cases covering original deadline, native-before-control ordering,
+zero-write/no retry, missing control before handshake, hard abort, native and
+write faults, media rejection, expiry during each callback, concurrent owner
+fencing, Stop-before-Start and duplicate Close. The existing production-loop
+host harness includes the new helper in its source list. No native calls,
+socket activity, Gradle build or device operation ran for this gate. Full
+qualification tests/lint/package and an independently observed prompt origin
+shutdown/reconnect remain pending before this source correction is qualified.
