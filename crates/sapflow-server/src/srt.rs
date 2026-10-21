@@ -5,8 +5,8 @@
 //! path are all rejected there.
 //!
 //! Two implementations serve the port, chosen by `SAPFLOW_SRT_IMPL`:
-//! `srt-tokio` (the default, below) and our own `sapflow-srt`
-//! ([`crate::srt_own`]). The policy (who may publish, limits, what happens
+//! our own `sapflow-srt` ([`crate::srt_own`], the default) and `srt-tokio`
+//! (below, a fallback until it is removed). The policy (who may publish, limits, what happens
 //! to the media) is shared and lives here.
 
 use std::net::{IpAddr, SocketAddr};

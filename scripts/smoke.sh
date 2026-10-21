@@ -7,7 +7,7 @@
 # Builds sapflow, publishes a test signal, checks the playlists, decodes the
 # segments and parts, checks the publish and unpublish callbacks.
 #
-# SAPFLOW_SRT_IMPL=own picks the SRT implementation (default srt-rs);
+# SAPFLOW_SRT_IMPL=srt-rs picks the SRT implementation (default own);
 # SRT_IMPLS="srt-rs own" runs the whole check once with each.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -19,7 +19,7 @@ if [ -n "${SRT_IMPLS:-}" ]; then
   done
   exit 0
 fi
-SRT_IMPL=${SAPFLOW_SRT_IMPL:-srt-rs}
+SRT_IMPL=${SAPFLOW_SRT_IMPL:-own}
 
 for bin in ffmpeg ffprobe srt-live-transmit python3 curl; do
   command -v "$bin" >/dev/null || { echo "missing $bin" >&2; exit 1; }

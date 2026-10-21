@@ -18,8 +18,9 @@ Every setting is an environment variable; a flag of the same name in
 lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
 
   SAPFLOW_SRT_ADDR         SRT listener (default 0.0.0.0:8890)
-  SAPFLOW_SRT_IMPL         SRT implementation: srt-rs (default) or own
-                           (sapflow's own receiver)
+  SAPFLOW_SRT_IMPL         SRT implementation: own (default, sapflow's own
+                           receiver) or srt-rs (the patched srt-rs, kept as
+                           a fallback until it is removed)
   SAPFLOW_SRT_PASSPHRASE   encrypt SRT media with this passphrase (10 to 79
                            characters; needs SAPFLOW_SRT_IMPL=own); callers
                            without it, or with another, are refused
@@ -83,10 +84,10 @@ const KEYS: &[&str] = &[
 /// Which SRT implementation serves the SRT port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrtImpl {
-    /// `srt-tokio` with the patched `srt-protocol` (the default until our
-    /// own is proven).
+    /// `srt-tokio` with the patched `srt-protocol`: a fallback until it
+    /// is removed (M6c).
     SrtRs,
-    /// `sapflow-srt`.
+    /// `sapflow-srt`, the default.
     Own,
 }
 
@@ -258,8 +259,8 @@ impl Config {
         let health_interval = secs("SAPFLOW_HEALTH_INTERVAL", 30)?;
 
         let srt_impl = match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
-            None | Some("srt-rs") => SrtImpl::SrtRs,
-            Some("own") => SrtImpl::Own,
+            Some("srt-rs") => SrtImpl::SrtRs,
+            None | Some("own") => SrtImpl::Own,
             Some(v) => {
                 return Err(ConfigError::Invalid(format!(
                     "SAPFLOW_SRT_IMPL: srt-rs or own, not {v}"
@@ -369,7 +370,11 @@ mod tests {
         .expect("config");
         assert_eq!(c.srt_crypto.expect("crypto").key_size, KeySize::Aes256);
         for bad in [
-            vec![open, ("SAPFLOW_SRT_PASSPHRASE", "correct horse")],
+            vec![
+                open,
+                ("SAPFLOW_SRT_IMPL", "srt-rs"),
+                ("SAPFLOW_SRT_PASSPHRASE", "correct horse"),
+            ],
             vec![open, own, ("SAPFLOW_SRT_PASSPHRASE", "short")],
             vec![
                 open,
@@ -475,11 +480,9 @@ mod tests {
     fn srt_implementation_switch() {
         let open = ("SAPFLOW_OPEN_PUBLISH", "1");
         let c = load(&[open], &[]).expect("config");
-        assert_eq!(
-            c.srt_impl,
-            SrtImpl::SrtRs,
-            "srt-rs until ours is the default"
-        );
+        assert_eq!(c.srt_impl, SrtImpl::Own, "ours is the default");
+        let c = load(&[open, ("SAPFLOW_SRT_IMPL", "srt-rs")], &[]).expect("config");
+        assert_eq!(c.srt_impl, SrtImpl::SrtRs);
         let c = load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &[]).expect("config");
         assert_eq!(c.srt_impl, SrtImpl::Own);
         let c = load(&[open], &["--srt-impl", "own"]).expect("config");

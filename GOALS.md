@@ -153,7 +153,10 @@ packet filters (FEC), sending (a later milestone, for phones).
   assume encryption hides credentials placed in a stream ID. Provision
   session-scoped secrets through an authenticated destination channel.
 - **M6c, switch:** make it the default, remove `vendor/srt-protocol`,
-  `srt-tokio` and their dependencies.
+  `srt-tokio` and their dependencies. **Default since 2026-10-21** (the
+  user's decision): `srt-rs` stays behind `SAPFLOW_SRT_IMPL=srt-rs` as a
+  fallback, and is removed once OBS publishes to ours, and OBS and Larix
+  publish with a passphrase.
 
 **Done when** (all measured, not asserted):
 - fuzz targets for the packet parser and the connection, clean for 20

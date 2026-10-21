@@ -183,7 +183,7 @@ Pinned in the crates' `Cargo.toml`. These are decisions the user may revisit.
 |------|-------|-------|
 | Async runtime, HTTP | `tokio` 1.54, `axum` 0.8.9 | `hyper-util` legacy client for the callback, no `reqwest` |
 | SRT, our own (M6a) | `sapflow-srt` | Live-mode receiver, sans-IO, MIT, no dependencies; written from draft-sharabayko-srt-01 and recorded sessions (findings below). Serves the port with `SAPFLOW_SRT_IMPL=own`; encrypted callers refused until M6b. |
-| SRT, the default until M6c | `srt-tokio` 0.4.4 (pure Rust) | Last release 2024-05. Builds on Rust 1.94 and tokio 1.54, interoperates with libsrt's `srt-live-transmit`, and exposes the stream id before accept, so publishers are refused in the handshake. Risks: unmaintained upstream, and `srt-protocol` has a `panic!` on one malformed-handshake encode path (M5: fuzz it, or move to libsrt bindings). |
+| SRT, the default until 2026-10-21, now a fallback | `srt-tokio` 0.4.4 (pure Rust) | Last release 2024-05. Builds on Rust 1.94 and tokio 1.54, interoperates with libsrt's `srt-live-transmit`, and exposes the stream id before accept, so publishers are refused in the handshake. Risks: unmaintained upstream, and `srt-protocol` has a `panic!` on one malformed-handshake encode path (M5: fuzz it, or move to libsrt bindings). |
 | SRT parsing | `srt-protocol` 0.4.4, vendored and patched | Fuzzing found that one unauthenticated datagram crashed the server; fixes and the reasons are in `vendor/srt-protocol/PATCHES.md`. |
 | MPEG-TS demux | `mpeg2ts` 0.6.1 | Fed one 188-byte packet at a time from our buffer (`sapflow_hls::ingest`), because its reader treats some stream errors as fatal and stops at end of input. |
 | H.264 | `h264-reader` 0.9.0 | Annex B splitting and SPS parsing. |
