@@ -1,3 +1,16 @@
+import com.android.build.gradle.BaseExtension
+import java.io.ByteArrayInputStream
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.security.MessageDigest
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import java.util.Base64
+import javax.xml.XMLConstants
+import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.transform.TransformerFactory
+import javax.xml.transform.dom.DOMSource
+import javax.xml.transform.stream.StreamResult
 import java.io.File
 import java.net.URI
 
@@ -123,4 +136,131 @@ dependencies {
     implementation("fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.22.0")
     testRuntimeOnly("fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.22.0")
     testImplementation("junit:junit:4.13.2")
+}
+
+// Public certificate and public routing only. This opt-in source set never
+// changes release/default configuration or the platform TLS implementation.
+val fixtureNames = listOf("CaFile", "ApiOrigin", "PlaybackOrigin", "PlaybackPrefix")
+val fixtureValues = fixtureNames.associateWith { providers.gradleProperty("sapflowQualificationV4v$it").orElse("").get() }
+require(fixtureValues.values.all { it.isEmpty() } || fixtureValues.values.all { it.isNotEmpty() }) {
+    "Supply all four qualification V4V fixture properties or leave them disabled"
+}
+if (fixtureValues.values.any { it.isNotEmpty() }) {
+    fun localOrigin(value: String): String {
+        val uri = URI(value)
+        require(value.matches(Regex("https://localhost(?::[1-9][0-9]{0,4})?/?")) &&
+            uri.host == "localhost" && (uri.port == -1 || uri.port in 1..65535)) {
+            "Qualification fixture origins must be HTTPS literal localhost"
+        }
+        return value.trimEnd('/')
+    }
+    val api = localOrigin(fixtureValues.getValue("ApiOrigin"))
+    val playback = localOrigin(fixtureValues.getValue("PlaybackOrigin"))
+    val prefix = fixtureValues.getValue("PlaybackPrefix")
+    require(prefix.length <= 256 && prefix.startsWith('/') && prefix.endsWith('/') &&
+        !prefix.contains("..") && !prefix.contains("//") && prefix.matches(Regex("/[A-Za-z0-9/_-]*"))) {
+        "Invalid qualification playback prefix"
+    }
+    val ca = File(fixtureValues.getValue("CaFile"))
+    fun publicCaBytes(): ByteArray {
+        require(ca.isAbsolute && Files.isRegularFile(ca.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            "Qualification fixture requires an absolute regular PUBLIC CA file (at most 16 KiB)"
+        }
+        return Files.newInputStream(ca.toPath(), LinkOption.NOFOLLOW_LINKS).use { input ->
+            input.readNBytes(16_385).also {
+                require(it.size in 1..16_384) { "PUBLIC CA input exceeds 16 KiB or is empty" }
+            }
+        }
+    }
+    val supplied = publicCaBytes()
+    val der = if (supplied.first() == '-'.code.toByte()) {
+        require(supplied.all { it.toInt() in 0..127 }) { "Invalid public CA PEM" }
+        val pem = supplied.toString(Charsets.US_ASCII)
+        val match = Regex("\\s*-----BEGIN CERTIFICATE-----\\s*([A-Za-z0-9+/=\\r\\n]+)\\s*-----END CERTIFICATE-----\\s*").matchEntire(pem)
+        require(match != null) { "Supply exactly one public CA certificate, without keys or other PEM blocks" }
+        Base64.getMimeDecoder().decode(match.groupValues[1])
+    } else supplied
+    val input = ByteArrayInputStream(der)
+    val certificate = CertificateFactory.getInstance("X.509").generateCertificate(input) as X509Certificate
+    require(input.available() == 0 && certificate.basicConstraints >= 0) { "Public trust input must be one X.509 CA certificate" }
+    certificate.checkValidity()
+    certificate.keyUsage?.let { require(it.size > 5 && it[5]) { "CA certificate does not permit certificate signing" } }
+    val canonical = certificate.encoded
+    require(canonical.contentEquals(der)) { "CA certificate must use canonical DER" }
+    val digest = MessageDigest.getInstance("SHA-256").digest(canonical).joinToString("") { "%02x".format(it) }
+
+    val android = extensions.getByType<BaseExtension>()
+    val productionFields = android.defaultConfig.buildConfigFields.toMap()
+    val releaseFields = android.buildTypes.getByName("release").buildConfigFields.toMap()
+    android.buildTypes.getByName("qualification").apply {
+        buildConfigField("String", "V4V_API_ORIGIN", "\"$api\"")
+        buildConfigField("String", "V4V_PLAYBACK_ORIGIN", "\"$playback\"")
+        buildConfigField("String", "V4V_PLAYBACK_PREFIX", "\"$prefix\"")
+    }
+    val output = layout.buildDirectory.dir("generated/qualification-v4v-fixture")
+    val sourceManifest = file("src/qualification/AndroidManifest.xml")
+    val generatedManifest = output.map { it.file("AndroidManifest.xml") }
+    val generatedResources = output.map { it.dir("res") }
+    val generate = tasks.register("generateQualificationV4vFixture") {
+        inputs.file(ca)
+        inputs.file(sourceManifest)
+        inputs.properties(mapOf("api" to api, "playback" to playback, "prefix" to prefix, "caDerSha256" to digest))
+        outputs.dir(output)
+        doLast {
+            // Certificate validation above is repeated on every Gradle invocation;
+            // no key is accepted or copied. Only canonical public DER is emitted.
+            check(publicCaBytes().contentEquals(supplied)) { "Public CA changed during this build" }
+            val root = output.get().asFile
+            val raw = File(root, "res/raw").apply { mkdirs() }
+            val xml = File(root, "res/xml").apply { mkdirs() }
+            File(raw, "sapflow_qualification_ca.der").writeBytes(canonical)
+            File(xml, "sapflow_qualification_network_security.xml").writeText("""
+                <network-security-config>
+                    <base-config cleartextTrafficPermitted="false">
+                        <trust-anchors><certificates src="system" /></trust-anchors>
+                    </base-config>
+                    <domain-config cleartextTrafficPermitted="false">
+                        <domain includeSubdomains="false">localhost</domain>
+                        <trust-anchors><certificates src="@raw/sapflow_qualification_ca" /></trust-anchors>
+                    </domain-config>
+                </network-security-config>
+            """.trimIndent() + "\n")
+            val factory = DocumentBuilderFactory.newInstance().apply {
+                isNamespaceAware = true
+                setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+                setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "")
+                setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "")
+            }
+            val document = factory.newDocumentBuilder().parse(sourceManifest)
+            val application = document.getElementsByTagName("application")
+            check(application.length == 1)
+            // Keep the original qualification components unchanged.
+            (application.item(0) as org.w3c.dom.Element).setAttributeNS(
+                "http://schemas.android.com/apk/res/android", "android:networkSecurityConfig",
+                "@xml/sapflow_qualification_network_security")
+            val transformer = TransformerFactory.newInstance().apply {
+                setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "")
+                setAttribute(XMLConstants.ACCESS_EXTERNAL_STYLESHEET, "")
+            }.newTransformer()
+            transformer.transform(DOMSource(document), StreamResult(generatedManifest.get().asFile))
+        }
+    }
+    android.sourceSets.getByName("qualification").apply {
+        manifest.srcFile(generatedManifest)
+        res.srcDir(generatedResources)
+    }
+    tasks.configureEach {
+        if (name == "preQualificationBuild") dependsOn(generate)
+    }
+    tasks.named("verifyQualificationIsolation") {
+        doLast {
+            check(android.defaultConfig.buildConfigFields == productionFields)
+            check(android.buildTypes.getByName("release").buildConfigFields == releaseFields)
+            for (name in listOf("main", "release", "debug")) {
+                val sources = android.sourceSets.getByName(name)
+                check(sources.manifest.srcFile != generatedManifest.get().asFile)
+                check(generatedResources.get().asFile !in sources.res.srcDirs)
+            }
+        }
+    }
 }

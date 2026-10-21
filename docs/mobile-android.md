@@ -1053,3 +1053,66 @@ This build uses the disabled default V4V profile, performs no additional signing
 or installation, and makes no physical or all-ABI release claim. Decoded-media
 confirmation remains disabled. The actor/permit/journal packet's independently
 reviewed v4 snapshot is retained separately from the subsequent typed SDK delta.
+
+### Private localhost TLS qualification
+
+A separate opt-in build configuration can enable the V4V connector against a
+private HTTPS localhost fixture without changing the default or production
+profile. Supply all four public properties together:
+
+```sh
+./gradlew assembleQualification assembleRelease \
+  -PsapflowQualificationV4vCaFile=/absolute/path/to/public-ca.pem \
+  -PsapflowQualificationV4vApiOrigin=https://localhost:4443 \
+  -PsapflowQualificationV4vPlaybackOrigin=https://localhost:4443 \
+  -PsapflowQualificationV4vPlaybackPrefix=/live/
+```
+
+The CA file must be absolute, regular, non-symlink, at most 16 KiB and contain
+one currently valid X.509 CA certificate, with no private-key/other PEM blocks.
+The build emits canonical public DER, a network-security configuration and a
+qualification-only manifest under the app build directory. Only exact
+`localhost` trusts that CA, without subdomains or cleartext; other HTTPS hosts
+retain platform system trust. Both origins must be literal HTTPS localhost,
+optionally with a valid port. The existing production profile properties are
+unchanged, and qualification fields never alter release/default BuildConfig.
+There is no trust-all socket factory, hostname override, OS CA installation or
+runtime URL import.
+
+This uses Android's documented [per-domain custom trust anchors](https://developer.android.com/privacy-and-security/security-config),
+not debug overrides, since qualification is non-debuggable. The opt-in artifact
+verifier requires expected public API/playback origins, prefix and canonical CA
+DER SHA-256. It checks the actual binary manifest/XML/resource references,
+CA bytes and qualification Dex, then proves the fixture resources, certificate
+and origin strings are absent from release. An invocation assembling both
+variants must pass the existing release hook/benchmark isolation checks too.
+
+Private fixture certificates and generated files are build inputs/outputs kept
+outside the source archive. A valid-TLS package gate establishes neither a
+running API nor installed signer, creator permissions, media decode or physical
+connector acceptance. The earlier 108-input APK/receipt remains immutable.
+
+The private-TLS source packet passed the M4 default and opt-in builds: each ran
+174 JVM tests across 33 suites with zero failures/skips, and lint reported zero
+errors with the same ten warnings. The artifact-verifier suite passed 33 tests,
+including shortened compiled resource paths and refusal of alternate qualified
+trust resources. Six actual Gradle configuration checks refused partial inputs,
+a non-local origin, a relative or symlink CA, oversized input and malformed CA.
+An explicit public placeholder profile retained its release fields and compiled
+origin strings while qualification used only its own fixture profile.
+
+The opt-in original qualification APK is
+`6fc3581d3e743903b83bf4604036315d0acc9fb7ab5a7e5a3d482eb52de7063f`.
+The default qualification APK and unsigned release remained byte-identical to
+`1d1820e8…` and `dd5fc5ee…` above. A warm qualification rebuild after removing
+all fixture properties also reproduced the exact default APK, with empty
+profile fields and no fixture trust/configuration/origin. Generated BuildConfig
+field readback separately checks the playback prefix; the APK verifier proves
+the compiled origins and trust configuration. Evidence and the certificate-free
+108-input source archive are retained under ignored
+`target/mobile-android/qualification-v4v-tls-v4-*`.
+
+These are package/build gates only. No fixture listener, system trust change,
+signing replacement, installation, phone interaction or running V4V/NIP55
+journey was performed by this packet. The public fixture CA was supplied
+explicitly; this work neither generated nor accessed private TLS keys.

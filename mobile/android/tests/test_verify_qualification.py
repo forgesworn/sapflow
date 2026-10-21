@@ -221,5 +221,152 @@ class ConnectorNativeVerifierTest(unittest.TestCase):
                     verify(apk)
 
 
+class QualificationFixtureVerifierTest(unittest.TestCase):
+    """Synthetic ZIP/tree payloads test the verifier, not X.509 issuance or TLS."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "target/mobile-android", prefix="tls-verifier-")
+        self.addCleanup(self.temp.cleanup)
+        self.apk = Path(self.temp.name) / "qualification.apk"
+        self.release = Path(self.temp.name) / "release.apk"
+        self.ca = b"synthetic public certificate bytes for hash verification only"
+        self.api, self.playback = "https://localhost:4443", "https://localhost:4444"
+        self.resources = ("resource 0x7f010001 xml/sapflow_qualification_network_security\n  () (file) " + VERIFIER["FIXTURE_CONFIG"]
+                          + "\nresource 0x7f020001 raw/sapflow_qualification_ca\n  () (file) " + VERIFIER["FIXTURE_CA"] + "\n")
+        self.manifest = "E: manifest\n  E: application\n    A: http://schemas.android.com/apk/res/android:networkSecurityConfig(0x01010527)=@0x7f010001\n"
+        self.tree = '''E: network-security-config
+  E: base-config
+    A: cleartextTrafficPermitted=(type 0x12)0x0
+    E: trust-anchors
+      E: certificates
+        A: src="system"
+  E: domain-config
+    A: cleartextTrafficPermitted=(type 0x12)0x0
+    E: domain
+      A: includeSubdomains=(type 0x12)0x0
+      T: "localhost"
+    E: trust-anchors
+      E: certificates
+        A: src=@0x7f020001
+'''
+        self.write_qualification()
+        self.write_release()
+
+    def write_qualification(self, ca=None, dex=None):
+        with ZipFile(self.apk, "w") as archive:
+            archive.writestr(VERIFIER["FIXTURE_CA"], self.ca if ca is None else ca)
+            archive.writestr(VERIFIER["FIXTURE_CONFIG"], b"synthetic compiled XML placeholder")
+            archive.writestr("classes.dex", (self.api + " " + self.playback).encode() if dex is None else dex)
+
+    def write_release(self, extra=None, dex=b"production code"):
+        with ZipFile(self.release, "w") as archive:
+            archive.writestr("classes.dex", dex)
+            if extra:
+                archive.writestr(*extra)
+
+    def aapt(self, command, **_kwargs):
+        if command[-1] == str(self.release):
+            return ""  # No fixture resources in the production resource table.
+        if command[2] == "resources":
+            return self.resources
+        return self.manifest if command[4] == "AndroidManifest.xml" else self.tree
+
+    def verify(self, **overrides):
+        values = dict(ca_sha256=VERIFIER["sha256"](self.ca), api_origin=self.api,
+                      playback_origin=self.playback, prefix="/live/")
+        values.update(overrides)
+        with patch("subprocess.check_output", side_effect=self.aapt):
+            return VERIFIER["verify_qualification_fixture"](self.apk, self.release, Path("aapt2"), **values)
+
+    def test_exact_domain_resource_references_public_hash_and_variant_profile(self):
+        result = self.verify()
+        self.assertEqual(result["domain"], "localhost")
+        self.assertFalse(result["include_subdomains"])
+        self.assertTrue(result["release_fixture_profile_and_trust_absent"])
+
+    def test_wrong_public_certificate_or_missing_ca_is_refused(self):
+        self.write_qualification(ca=b"different public bytes")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.verify()
+        with ZipFile(self.apk, "w") as archive:
+            archive.writestr("classes.dex", self.api.encode())
+        with self.assertRaises(KeyError):
+            self.verify()
+
+    def test_actual_compiled_resource_table_paths_survive_resource_optimisation(self):
+        self.resources = self.resources.replace(VERIFIER["FIXTURE_CONFIG"], "res/A.xml").replace(VERIFIER["FIXTURE_CA"], "res/B.der")
+        with ZipFile(self.apk, "w") as archive:
+            archive.writestr("res/A.xml", b"compiled XML placeholder")
+            archive.writestr("res/B.der", self.ca)
+            archive.writestr("classes.dex", (self.api + " " + self.playback).encode())
+        self.assertEqual(self.verify()["ca_der_sha256"], VERIFIER["sha256"](self.ca))
+
+    def test_alternate_qualified_resource_cannot_hide_another_trust_configuration(self):
+        self.resources += "  (en) (file) res/other.der\n"
+        with self.assertRaisesRegex(ValueError, "resource variants"):
+            self.verify()
+
+    def test_manifest_or_domain_cannot_reference_another_trust_resource(self):
+        self.manifest = self.manifest.replace("@0x7f010001", "@0x7f010099")
+        with self.assertRaisesRegex(ValueError, "manifest"):
+            self.verify()
+        self.manifest = self.manifest.replace("@0x7f010099", "@0x7f010001")
+        self.tree = self.tree.replace("@0x7f020001", "@0x7f020099")
+        with self.assertRaisesRegex(ValueError, "CA-only"):
+            self.verify()
+
+    def test_wide_domain_cleartext_system_or_debug_trust_is_refused(self):
+        original = self.tree
+        mutations = [original.replace('T: "localhost"', 'T: "example.invalid"'),
+                     original.replace("includeSubdomains=(type 0x12)0x0", "includeSubdomains=(type 0x12)0x1"),
+                     original.replace("cleartextTrafficPermitted=(type 0x12)0x0", "cleartextTrafficPermitted=(type 0x12)0x1"),
+                     original.replace("src=@0x7f020001", 'src="system"'),
+                     original + "  E: debug-overrides\n"]
+        for tree in mutations:
+            with self.subTest(tree=tree):
+                self.tree = tree
+                with self.assertRaises(ValueError):
+                    self.verify()
+
+    def test_extra_trust_anchor_is_refused(self):
+        self.tree += '      E: certificates\n        A: src="user"\n'
+        with self.assertRaisesRegex(ValueError, "shape"):
+            self.verify()
+
+    def test_release_rejects_fixture_resources_even_with_an_unrecognised_filename(self):
+        for extra in ((VERIFIER["FIXTURE_CONFIG"], b"config"), ("res/raw/other.der", self.ca)):
+            self.write_release(extra=extra)
+            with self.assertRaisesRegex(ValueError, "leaked into release"):
+                self.verify()
+
+    def test_release_fixture_origin_in_any_dex_is_refused(self):
+        with ZipFile(self.release, "a") as archive:
+            archive.writestr("classes2.dex", self.playback.encode())
+        with self.assertRaisesRegex(ValueError, "origin leaked"):
+            self.verify()
+
+    def test_missing_qualification_profile_is_refused(self):
+        self.write_qualification(dex=self.api.encode())
+        with self.assertRaisesRegex(ValueError, "origins missing"):
+            self.verify()
+
+    def test_nonlocal_origin_bad_prefix_or_malformed_hash_is_refused(self):
+        for origin in ("http://localhost", "https://example.invalid", "https://localhost.example.invalid",
+                       "https://user@localhost", "https://localhost:0", "https://localhost/path"):
+            with self.subTest(origin=origin), self.assertRaises(ValueError):
+                self.verify(api_origin=origin)
+        for prefix in ("/../", "/a//", "/a%20/", "live/"):
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                self.verify(prefix=prefix)
+        with self.assertRaises(ValueError):
+            self.verify(ca_sha256="invalid")
+
+    def test_release_base_verifier_rejects_fixture_resource_without_opt_in_flags(self):
+        with ZipFile(self.apk, "w") as archive:
+            archive.writestr(VERIFIER["FIXTURE_CA"], self.ca)
+        with patch("subprocess.check_output", return_value=QualificationVerifierTest.release_manifest(self)):
+            with self.assertRaisesRegex(ValueError, "fixture resource"):
+                VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"))
+
+
 if __name__ == "__main__":
     unittest.main()
