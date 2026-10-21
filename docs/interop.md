@@ -700,3 +700,35 @@ a shared machine), and:
   and refresh rates of 1,500 and 2,000 packets; the pre-announce was a
   quarter of the rate. A passphrase with `%20` is not covered (libsrt 1.5.3
   does not decode it).
+
+### 200 ms again, on a quieter machine (2026-10-21)
+
+The 200 ms gap above came from runs at a load average of 80 to 130. The
+same comparison again with nothing else heavy running (load average 10 to
+18), 6 seeds, the same binary (8ee5704), unencrypted and then AES-128 with
+a key refresh every 1,500 packets:
+
+```bash
+RECEIVERS="own=$SAPFLOW_BIN libsrt" LATENCIES=200 SEEDS=6 JOBS=2 scripts/srt-loss.sh
+RECEIVERS="own=$SAPFLOW_BIN libsrt" LATENCIES=200 SEEDS=6 JOBS=2 \
+  PASSPHRASE=loss-test-key KMREFRESH=1500 scripts/srt-loss.sh
+```
+
+`own` minus libsrt (Welch t; |t| below about 2.3 is noise):
+
+| Loss | Overhead, unencrypted | Overhead, AES-128 | Not recovered, unencrypted | Not recovered, AES-128 |
+|------|----------------------:|------------------:|---------------------------:|-----------------------:|
+| 3% random | +0.1 (t 0.6) | +0.5 (t 2.6) | +0.01 (t 1.0) | 0.00 |
+| 10% random | -0.1 (t -0.5) | +0.2 (t 0.3) | -0.07 (t -2.2) | -0.10 (t -2.6) |
+| 20% random | -0.3 (t -0.3) | -0.2 (t -0.4) | -0.49 (t -5.2) | -0.43 (t -5.6) |
+| bursty 8% | +1.5 (t 1.7) | +0.7 (t 1.2) | +0.02 (t 0.1) | -0.24 (t -1.1) |
+
+On a quiet machine `own` is level with libsrt on retransmission overhead at
+200 ms, with and without encryption (the one t above 2.3 is half a point at
+3% loss), and recovers more packets in time at 10% and 20% loss. The
+earlier excess was the load, not the receiver or the encryption. One
+figure to look into: at 20% random loss `own` delivers fewer video packets
+relative to its own clean run than libsrt does (99.05% against 99.89%,
+unencrypted), although fewer of its packets go unrecovered; the two
+receivers' outputs are counted differently (sapflow's after muxing into
+HLS, libsrt's as the raw stream), which may explain it; not yet checked.
