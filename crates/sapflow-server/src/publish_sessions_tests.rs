@@ -298,7 +298,6 @@ async fn released_lease_cannot_use_media_or_credentials_and_cannot_destroy_held_
     prepare(&manager).await;
     let lease = manager.admit(&request(SID)).await.expect("admit");
     lease.accepted();
-    lease.media_ready();
     let registry = Arc::new(Registry::default());
     let (stream, generation) = lease
         .with_open(|| {
@@ -373,7 +372,6 @@ async fn staged_refresh_crossing_old_expiry_never_revives_the_cancelled_owner() 
         let old_expiry = prepare(&manager).await;
         let lease = manager.admit(&request(SID)).await.expect("admit");
         lease.accepted();
-        lease.media_ready();
         let registry = Arc::new(Registry::default());
         let (stream, generation) = lease
             .with_open(|| {
@@ -1016,4 +1014,278 @@ async fn poisoned_media_gate_fails_closed_and_cancels_existing_owners() {
         manager.admit(&request(SID)).await,
         Err(Error::Unavailable)
     ));
+}
+
+fn fresh_media_app(
+    manager: &PublishSessions,
+) -> (
+    Arc<crate::App>,
+    tokio::sync::mpsc::Receiver<crate::callback::Queued>,
+) {
+    let mut config = crate::config::Config::load(
+        |key| (key == "SAPFLOW_OPEN_PUBLISH").then(|| "1".into()),
+        Vec::new(),
+    )
+    .expect("synthetic config");
+    config.recordings = None;
+    let (callbacks, receiver) =
+        crate::callback::test_queue(crate::publish_observer::fixture_scope("fresh", 1, 1, 1), 32);
+    (
+        Arc::new(crate::App {
+            config,
+            publish_sessions: Some(manager.clone()),
+            streams: Arc::new(Registry::default()),
+            callbacks,
+            auth_throttle: Mutex::new(sapflow_core::limits::AuthThrottle::new(
+                10,
+                Duration::from_secs(60),
+            )),
+            refusal_log: Mutex::new(sapflow_core::limits::LogLimiter::new(
+                20,
+                Duration::from_secs(60),
+            )),
+        }),
+        receiver,
+    )
+}
+fn fresh_events(
+    receiver: &mut tokio::sync::mpsc::Receiver<crate::callback::Queued>,
+) -> Vec<String> {
+    std::iter::from_fn(|| receiver.try_recv().ok())
+        .map(|item| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&item.body).expect("JSON callback");
+            json["event"].as_str().expect("event").to_owned()
+        })
+        .collect()
+}
+async fn fresh_publication(app: &Arc<crate::App>) -> crate::publish::Publication {
+    let publication = crate::publish::Publication::begin_srt(
+        app,
+        &request(SID),
+        "127.0.0.1".parse().expect("loopback"),
+    )
+    .await
+    .expect("scoped publication");
+    publication.scoped_lease().expect("scope").accepted();
+    publication
+}
+fn feed_generated(publication: &mut crate::publish::Publication, data: &[u8]) {
+    for packet in data.chunks(188) {
+        crate::srt::feed(publication, packet).expect("generated feed");
+    }
+}
+fn next_part(publication: &crate::publish::Publication) -> u64 {
+    publication
+        .stream
+        .lock()
+        .ingest
+        .muxer()
+        .expect("muxer")
+        .next_part_id()
+}
+
+#[tokio::test]
+async fn changed_codec_first_idr_cannot_announce_old_retained_media_as_current_ready() {
+    const PORTRAIT: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-portrait.ts");
+    const LANDSCAPE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-landscape.ts");
+    let scratch = Scratch::new();
+    let manager = scratch.open(false).await;
+    prepare(&manager).await;
+    let (app, mut callbacks) = fresh_media_app(&manager);
+    let mut first = fresh_publication(&app).await;
+    assert!(
+        manager
+            .status(SID)
+            .await
+            .expect("empty status")
+            .fresh_media
+            .is_none()
+    );
+    feed_generated(&mut first, PORTRAIT);
+    let old = manager.status(SID).await.expect("old media");
+    assert_eq!(old.state, "live");
+    let old_media = old.fresh_media.expect("completed old media");
+    assert_eq!(fresh_events(&mut callbacks), ["publish"]);
+    let old_stream = first.stream.clone();
+    let before_tail = next_part(&first);
+    first.end(); // interrupt seals the previous partial part under claim locks.
+    assert_eq!(fresh_events(&mut callbacks), ["unpublish"]);
+    let after_tail = old_stream
+        .lock()
+        .ingest
+        .muxer()
+        .expect("retained")
+        .next_part_id();
+    assert!(
+        after_tail > before_tail,
+        "fixture must have a real pending old tail"
+    );
+    let held = manager.status(SID).await.expect("held status");
+    assert_eq!(held.state, "held");
+    assert!(held.fresh_media.is_none());
+    let mut resumed = fresh_publication(&app).await;
+    assert!(Arc::ptr_eq(&old_stream, &resumed.stream));
+    let empty = manager.status(SID).await.expect("new empty epoch");
+    assert_eq!(empty.connection_epoch, old_media.connection_epoch + 1);
+    assert_eq!(empty.state, "connected");
+    assert!(empty.fresh_media.is_none());
+    assert!(resumed.stream.has_content(), "old HLS remains available");
+    let mut consumed = 0;
+    for packet in LANDSCAPE.chunks(188) {
+        crate::srt::feed(&mut resumed, packet).expect("landscape packet");
+        consumed += packet.len();
+        if resumed
+            .stream
+            .lock()
+            .ingest
+            .muxer()
+            .expect("muxer")
+            .current_initialization_id()
+            > old_media.part.initialization_id
+        {
+            break;
+        }
+    }
+    assert!(
+        consumed < LANDSCAPE.len(),
+        "must stop at first changed-config IDR"
+    );
+    assert_eq!(
+        next_part(&resumed),
+        after_tail,
+        "first IDR has no completed fresh part"
+    );
+    let first_idr = manager.status(SID).await.expect("pending IDR status");
+    assert_eq!(first_idr.state, "connected");
+    assert!(first_idr.fresh_media.is_none());
+    assert!(
+        fresh_events(&mut callbacks).is_empty(),
+        "no premature scoped publish callback"
+    );
+    feed_generated(&mut resumed, &LANDSCAPE[consumed..]);
+    let ready = manager.status(SID).await.expect("fresh completed part");
+    assert_eq!(ready.state, "live");
+    assert_eq!(fresh_events(&mut callbacks), ["publish"]);
+    let encoded = serde_json::to_value(&ready).expect("receipt JSON");
+    let object = encoded["freshMedia"].as_object().expect("flat descriptor");
+    assert_eq!(object.len(), 7);
+    assert_eq!(object["connectionEpoch"], encoded["connectionEpoch"]);
+    assert_eq!(object["hasVideo"], true);
+    assert_eq!(object["hasAudio"], true);
+    let fresh = ready.fresh_media.expect("fresh descriptor");
+    assert_eq!(fresh.connection_epoch, ready.connection_epoch);
+    assert!(fresh.part.part_id >= after_tail);
+    assert!(fresh.part.initialization_id > old_media.part.initialization_id);
+    assert!(fresh.part.has_video && fresh.part.has_audio);
+    {
+        let st = resumed.stream.lock();
+        let muxer = st.ingest.muxer().expect("muxer");
+        let part = match muxer.part(fresh.part.part_id) {
+            sapflow_hls::PartLookup::Found(part) => part,
+            _ => panic!("descriptor part retained"),
+        };
+        assert!(part.independent);
+        assert_eq!(part.initialization.id, fresh.part.initialization_id);
+        assert_eq!(
+            fresh.part.init_path,
+            format!(
+                "/live/{EVENT}/{}",
+                sapflow_hls::playlist::epoch_init_name(&st.prefix, part.initialization.id)
+            )
+        );
+        assert_eq!(
+            fresh.part.part_path,
+            format!(
+                "/live/{EVENT}/{}",
+                sapflow_hls::playlist::part_name(&st.prefix, part.id)
+            )
+        );
+    }
+    manager.revoke(SID, revoke(SID, 1, 2)).await.expect("end");
+    assert!(
+        manager
+            .status(SID)
+            .await
+            .expect("ended")
+            .fresh_media
+            .is_none()
+    );
+    resumed.end();
+}
+
+#[tokio::test]
+async fn same_codec_reconnect_requires_new_parts_and_old_lease_cannot_restore_freshness() {
+    const VIDEO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-portrait.ts");
+    let scratch = Scratch::new();
+    let manager = scratch.open(false).await;
+    let expires = prepare(&manager).await;
+    let (app, mut callbacks) = fresh_media_app(&manager);
+    let mut first = fresh_publication(&app).await;
+    feed_generated(&mut first, VIDEO);
+    assert_eq!(fresh_events(&mut callbacks), ["publish"]);
+    let old_lease = first.scoped_lease().expect("old scope");
+    let first_media = manager
+        .status(SID)
+        .await
+        .expect("first")
+        .fresh_media
+        .expect("first part");
+    first.end();
+    assert_eq!(fresh_events(&mut callbacks), ["unpublish"]);
+    let mut resumed = fresh_publication(&app).await;
+    let floor = next_part(&resumed);
+    let without_media = manager.status(SID).await.expect("retained status");
+    assert_eq!(without_media.state, "connected");
+    assert!(without_media.fresh_media.is_none());
+    feed_generated(&mut resumed, &VIDEO[..188]);
+    assert!(
+        manager
+            .status(SID)
+            .await
+            .expect("headers only")
+            .fresh_media
+            .is_none()
+    );
+    assert!(fresh_events(&mut callbacks).is_empty());
+    feed_generated(&mut resumed, &VIDEO[188..]);
+    assert_eq!(fresh_events(&mut callbacks), ["publish"]);
+    let ready = manager.status(SID).await.expect("fresh media");
+    assert_eq!(ready.state, "live");
+    let fresh = ready.fresh_media.expect("fresh same codec part");
+    assert_eq!(
+        fresh.part.initialization_id,
+        first_media.part.initialization_id
+    );
+    assert!(fresh.part.part_id >= floor);
+    assert!(matches!(old_lease.with_open(|| ()), Err(Error::Denied)));
+    assert!(
+        manager
+            .status(SID)
+            .await
+            .expect("stale call cannot clear successor")
+            .fresh_media
+            .is_some()
+    );
+    // A higher prepared session generation cancels the old owner. Its retained
+    // part identities never become a descriptor for the replacement grant.
+    let replaced = manager
+        .put(NEXT_SID, put(NEXT_SID, 2, 1, expires), MAX_BPS)
+        .await
+        .expect("replacement");
+    assert!(replaced.fresh_media.is_none());
+    assert_eq!(replaced.state, "prepared");
+    assert!(matches!(
+        resumed.push(|_, _| Ok(sapflow_hls::Update::default())),
+        Err(crate::publish::PushError::Revoked)
+    ));
+    assert!(
+        manager
+            .status(NEXT_SID)
+            .await
+            .expect("replacement unchanged")
+            .fresh_media
+            .is_none()
+    );
+    resumed.end();
 }

@@ -84,6 +84,7 @@ secret-free receipt:
 | Identity | `contractVersion`, `eventId`, `eventGeneration`, `sessionId`, `revision` |
 | `expiresAtUnixMs` | Grant expiry; zero only for a never-provisioned terminal tombstone |
 | `connectionEpoch` | Durable per-event high-water mark, reserved before accepting the protocol |
+| `freshMedia` | `null` or the current connection's independently decodable completed-part descriptor below; encoded availability only |
 | `state` | `inactive`, `prepared`, `connected`, `live`, `held`, `expired`, `revoked` |
 | `admission` | `open` or `denied` |
 | `protocol` | `none`, `active`, `stopping`, `stopped` |
@@ -96,6 +97,60 @@ HTTP errors use static codes: 400 invalid request, 401 missing/wrong bearer,
 413 oversized body, 429 capacity, 503 unusable authority and 504 request timeout.
 Neither an acknowledged End nor a stopped socket alone proves recording or
 callback completion. Poll the independent receipts to determine completion.
+
+## Fresh encoded-media boundary
+
+`freshMedia` is `null` until the current accepted connection emits a completed
+independent video part. Once available its exact additive shape is:
+
+```json
+{
+  "connectionEpoch": 2,
+  "partId": 15,
+  "initializationId": 1,
+  "initPath": "/live/example/abcdef012345_init1.mp4",
+  "partPath": "/live/example/abcdef012345_part15.mp4",
+  "hasVideo": true,
+  "hasAudio": true
+}
+```
+
+The containing receipt binds `eventId`, `eventGeneration`, `sessionId` and
+`revision`. Descriptor `connectionEpoch` equals the containing receipt's epoch;
+all IDs are JavaScript-safe integers, with a positive connection epoch and
+nonnegative part/initialization IDs. `hasVideo` is always true in this initial
+video-origin profile. `hasAudio` declares the initialization's audio track; it
+does not claim that an audio frame was received or decoded.
+
+Paths are canonical leading-slash relative origin paths for that exact event,
+with one shared lower-case hexadecimal presentation prefix of one through twelve
+characters. Initialization zero uses `_init.mp4`; positive initialization IDs use
+`_init<ID>.mp4`. Parts use `_part<ID>.mp4`. These are existing immutable HLS
+identities, without credentials, query strings or an authority. A connector maps
+them through trusted **public playback routing**, including any configured proxy
+prefix; it must never resolve them against the private control API URL.
+
+The old connection's pending run is sealed under the registry/session locks
+before the replacement captures its completed-part floor. A pending first IDR,
+codec-restart notification, retained old playlist or old completed part cannot
+satisfy this boundary. The descriptor selects a retained independent part at or
+above that floor from the current initialization. It holds no media references
+and cannot extend retention. It becomes null while held, cancelled, revoked,
+expired, replaced, after restart, or after a codec reset until a matching fresh
+independent part exists. No retained matching part also yields null. Scoped
+`state: "live"` and nonnull `freshMedia` derive from the same locked snapshot;
+otherwise an active accepted connection remains `connected`. Legacy lab HLS
+continuation and codec-epoch numbering remain unchanged.
+
+**This is not decoded-media proof.** A native connector must bind its local
+attempt to a fresh authenticated origin connection epoch, fetch only the
+appropriate fresh media, observe actual decode progress for every declared
+track, and recheck the session/epoch before confirming recovery. HWM reservation
+alone, a ready socket, a manifest probe, or this descriptor alone cannot clear
+`NativeSession`'s outage deadline. Existing-wire binding requires a pre-attempt
+origin epoch floor and previous-attempt cleanup; there is no per-attempt nonce
+in the current ingest stream ID. Delayed responses and decode completions need
+local destination/attempt fences as well as the origin identity.
 
 ## Durability and runtime admission
 

@@ -81,7 +81,6 @@ struct Owner {
     cancel: watch::Sender<bool>,
     protocol: AtomicU8, // 0 never accepted, 1 active, 2 stopping, 3 stopped.
     released: AtomicBool,
-    published: AtomicBool,
     held: AtomicBool,
     binding: Mutex<Option<Binding>>,
 }
@@ -128,6 +127,15 @@ impl Clock {
     }
 }
 
+/// Identity-bound encoded availability, never a decoded playback observation.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshMedia {
+    pub connection_epoch: u64,
+    #[serde(flatten)]
+    pub part: crate::stream::FreshMediaPart,
+}
+
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Receipt {
@@ -138,6 +146,7 @@ pub struct Receipt {
     pub revision: u64,
     pub expires_at_unix_ms: u64,
     pub connection_epoch: u64,
+    pub fresh_media: Option<FreshMedia>,
     pub state: &'static str,
     pub admission: &'static str,
     pub protocol: &'static str,
@@ -496,6 +505,24 @@ impl PublishSessions {
             _ if row.connection_epoch > 0 && grant.is_none() => "stopped",
             _ => "none",
         };
+        let continuing = owner.filter(|o| !*o.cancel.borrow());
+        let active =
+            continuing.filter(|o| protocol == "active" && !o.released.load(Ordering::Acquire));
+        let fresh_media = if open {
+            active.and_then(|owner| {
+                let binding = owner.binding.lock().unwrap_or_else(|e| e.into_inner());
+                let bound = binding.as_ref()?;
+                let stream = bound.stream.upgrade()?;
+                let generation = bound.generation;
+                drop(binding);
+                stream.fresh_media(generation).map(|part| FreshMedia {
+                    connection_epoch: owner.lease.connection_epoch,
+                    part,
+                })
+            })
+        } else {
+            None
+        };
         let session_state = match row.status {
             SessionStatus::Revoked => "revoked",
             SessionStatus::Expired => "expired",
@@ -504,12 +531,9 @@ impl PublishSessions {
                 // A refresh may commit after the old fast deadline cancelled
                 // its owner. Renewed authority permits a new connection, never
                 // retroactively confirms that cancelled connection's media.
-                let continuing = owner.filter(|o| !*o.cancel.borrow());
-                let active = continuing
-                    .filter(|o| protocol == "active" && !o.released.load(Ordering::Acquire));
                 if continuing.is_some_and(|o| o.held.load(Ordering::Acquire)) {
                     "held"
-                } else if active.is_some_and(|o| o.published.load(Ordering::Acquire)) {
+                } else if fresh_media.is_some() {
                     "live"
                 } else if active.is_some() {
                     "connected"
@@ -526,6 +550,7 @@ impl PublishSessions {
             revision: row.revision.get(),
             expires_at_unix_ms: row.grant.as_ref().map_or(0, |g| g.expires_at_ms.get()),
             connection_epoch: row.connection_epoch,
+            fresh_media,
             state: session_state,
             admission: if open { "open" } else { "denied" },
             protocol,
@@ -629,7 +654,6 @@ impl PublishSessions {
                             cancel,
                             protocol: AtomicU8::new(0),
                             released: AtomicBool::new(false),
-                            published: AtomicBool::new(false),
                             held: AtomicBool::new(false),
                             binding: Mutex::new(None),
                         });
@@ -805,9 +829,6 @@ impl ScopedLease {
             .owner
             .protocol
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
-    }
-    pub fn media_ready(&self) {
-        self.owner.published.store(true, Ordering::Release);
     }
     pub fn released(&self, held: bool) {
         self.owner.held.store(held, Ordering::Release);

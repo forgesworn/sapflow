@@ -296,12 +296,17 @@ impl Publication {
                 return Err(error);
             }
         };
-        if applied.ready && !self.published {
+        let ready = !self.published
+            && if self.scope.is_some() {
+                self.stream
+                    .fresh_media_locked(&session, self.generation)
+                    .is_some()
+            } else {
+                applied.ready
+            };
+        if ready {
             session.recovered();
             self.published = true;
-            if let Some(scope) = &self.scope {
-                scope.media_ready();
-            }
             tracing::info!(
                 path = %self.stream.path.as_path(),
                 ready_ms = self.connected.elapsed().as_millis() as u64,

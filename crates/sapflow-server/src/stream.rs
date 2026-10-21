@@ -105,6 +105,9 @@ pub struct Session {
     /// from an earlier one changes nothing.
     generation: u64,
     attached: bool,
+    /// All completed parts below this floor belong to the previous connection.
+    /// detach seals its pending run before claim can advance this floor.
+    fresh_part_floor: u64,
     /// Kept across a reconnect: one recording per show.
     pub recorder: Option<Recorder>,
     outage_deadline: Option<Instant>,
@@ -131,6 +134,18 @@ impl Session {
     pub fn recovered(&mut self) {
         self.outage_deadline = None;
     }
+}
+
+/// Encoded availability only: neither fetching nor decoding has occurred.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshMediaPart {
+    pub part_id: u64,
+    pub initialization_id: u64,
+    pub init_path: String,
+    pub part_path: String,
+    pub has_video: bool,
+    pub has_audio: bool,
 }
 
 /// What a push did.
@@ -166,6 +181,7 @@ impl LiveStream {
             session: Mutex::new(Session {
                 generation: 0,
                 attached: true,
+                fresh_part_floor: 0,
                 recorder: None,
                 outage_deadline: None,
             }),
@@ -181,6 +197,54 @@ impl LiveStream {
 
     pub fn session(&self) -> MutexGuard<'_, Session> {
         self.session.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Snapshot one independently decodable completed part from this exact
+    /// connection's run. Retained old media and pending first IDRs do not qualify.
+    pub fn fresh_media(&self, generation: u64) -> Option<FreshMediaPart> {
+        self.fresh_media_locked(&self.session(), generation)
+    }
+
+    pub fn fresh_media_locked(&self, session: &Session, generation: u64) -> Option<FreshMediaPart> {
+        if session.generation != generation || !session.attached {
+            return None;
+        }
+        let state = self.lock();
+        if state.closed {
+            return None;
+        }
+        let muxer = state.ingest.muxer()?;
+        let init_id = muxer.current_initialization_id();
+        const JS_MAX: u64 = (1 << 53) - 1;
+        if init_id > JS_MAX {
+            return None;
+        }
+        // Search newest first, stopping at the retained window. No media Arc is
+        // stored in a receipt/owner, so status cannot extend media retention.
+        for id in (session.fresh_part_floor..muxer.next_part_id()).rev() {
+            let part = match muxer.part(id) {
+                PartLookup::Found(part) => part,
+                _ => break,
+            };
+            if part.initialization.id != init_id {
+                break;
+            }
+            if part.independent && id <= JS_MAX {
+                let root = self.path.as_path();
+                return Some(FreshMediaPart {
+                    part_id: id,
+                    initialization_id: init_id,
+                    init_path: format!(
+                        "/{root}/{}",
+                        playlist::epoch_init_name(&state.prefix, init_id)
+                    ),
+                    part_path: format!("/{root}/{}", playlist::part_name(&state.prefix, id)),
+                    has_video: true,
+                    has_audio: muxer.audio().is_some(),
+                });
+            }
+        }
+        None
     }
 
     /// Subscribe before checking state, then wait on `changed()`.
@@ -316,6 +380,10 @@ impl Registry {
                 session.attached = true;
                 let mut st = stream.lock();
                 let muxer = st.ingest.take_muxer();
+                // detach() held the same map/session locks while interrupting
+                // the old run. Its final pending part is already below this
+                // floor, and cannot be completed by this connection's first IDR.
+                session.fresh_part_floor = muxer.as_ref().map_or(0, Muxer::next_part_id);
                 st.ingest = Source::resume(kind, stream.cfg, muxer);
                 return Some((stream.clone(), session.generation, Claim::Resumed));
             }
@@ -502,6 +570,7 @@ mod grace_tests {
         let mut session = Session {
             generation: 0,
             attached: true,
+            fresh_part_floor: 0,
             recorder: None,
             outage_deadline: None,
         };
