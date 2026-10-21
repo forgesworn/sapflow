@@ -217,8 +217,8 @@ untried.
 **Still needs the wired Linux machine:** Caddy on Linux with a real
 certificate and the real v4v Caddyfile (its `encode`, `header`, logging and
 timeouts could each change this); Safari on an iPhone and a Mac through it;
-HTTP/3; the 250 and 750 full-viewer runs through Caddy (`sapflow-bench` speaks
-plain HTTP/1.1 only), and Caddy's CPU at that load; Caddy and sapflow on
+HTTP/3; the 250 and 750 full-viewer runs through Caddy (`sapflow-bench`
+now speaks HTTP/2 over TLS: `docs/benchmarks.md`), and Caddy's CPU at that load; Caddy and sapflow on
 separate hosts; and a quiet machine for a long soak, which the drift above
 rules out here. `CADDY_URL` points the script at a Caddy that is already
 running; `CADDY_NETWORK=host` runs the container on Linux's host network.
