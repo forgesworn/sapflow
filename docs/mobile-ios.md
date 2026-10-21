@@ -475,8 +475,34 @@ It establishes this host cancellation boundary, not iPhone network recovery.
 Current receipts and logs are `target/ios-reconnect-receipt.local.json`,
 `target/ios-reconnect-source-hashes.json`, `target/ios-reconnect-pure-tests.log`,
 `target/ios-reconnect-lifecycle-check.log`, `target/ios-reconnect-build.log` and
-`target/ios-reconnect-apple-build.log`. The preceding Apple package is retained
-under `target/native-packages/apple-before-ios-reconnect` with its original
-file-hash manifest. No signed build, physical capture, radio failure/recovery,
+`target/ios-reconnect-apple-build.log`. The preceding Apple package was retained
+under `target/native-packages/apple-before-ios-reconnect` during replacement
+qualification. That task-owned backup was subsequently removed after all eighteen
+file hashes were reverified. Its original file-hash manifest and package
+provenance remain recorded in `target/ios-reconnect-previous-apple-hashes.json`
+and `target/ios-reconnect-previous-apple-cleanup.local.json`.
+No signed build, physical capture, radio failure/recovery,
 orientation recovery, trusted decoded-media confirmation, thermal or sustained
 power qualification follows from these source and host checks.
+
+## UI wording after the frozen physical snapshot
+
+The manual destination form now describes the bound logical reconnect owner,
+its shared 90-second outage window and independent local recording. Repeated
+failures retain the original window. Timely validated acknowledgement of
+submitted startup media can restore network retry permission; decoded media
+confirmation remains a separate observation. If an accepted sending attempt lacks that
+acknowledgement when the window expires, it can continue with exhausted retry
+permission. A subsequent failure or intentional transport replacement then ends
+publishing until a new explicit Prepare. Sending alone never establishes decoded
+Live playback. The per-attempt adapters still describe individual child attempts;
+the logical owner supplies the application's reconnect status.
+
+This follow-up changes three displayed strings and documentation only. It does
+not change session, transport, recording or UI control logic. The development-
+signed application installed for physical testing remains the frozen `a399d13`
+source snapshot with the earlier explanatory wording. Its signed-app manifest
+and install/launch receipts identify that artefact separately. Neither that
+application nor the separate UI qualification runner was rebuilt, re-signed or
+reinstalled for this wording change. Physical acceptance must follow the frozen
+artefact's recorded identity rather than the newer source wording.

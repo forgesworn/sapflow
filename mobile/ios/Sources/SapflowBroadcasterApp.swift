@@ -174,7 +174,7 @@ struct BroadcasterView: View {
     @ViewBuilder private var destinationForm: some View {
         Toggle("Local recording only", isOn: $model.recordingOnly).accessibilityIdentifier("destination.recording-only")
         if !model.recordingOnly {
-            Text("Manual destination · one connection attempt").font(.caption.bold())
+            Text("Manual destination · bounded automatic reconnect").font(.caption.bold())
             if !model.profiles.isEmpty {
                 Picker("Saved profile", selection: $model.selectedProfile) {
                     Text("Unsaved destination").tag(Optional<UUID>.none)
@@ -195,7 +195,7 @@ struct BroadcasterView: View {
                 Toggle("Explicit plaintext SRT", isOn: $model.srtPlaintext).font(.caption)
                 Text(model.srtPlaintext ? "Clear the passphrase to send plaintext media. There is no automatic downgrade." : "AES-256 media encryption. Stream ID/control remain clear; SRT does not authenticate peer identity.")
                     .font(.caption).foregroundStyle(model.srtPlaintext ? .orange : .secondary)
-                Text("Numeric IPv4/IPv6 peer only · 120 ms latency · no automatic reconnect").font(.caption).foregroundStyle(.secondary)
+                Text("Numeric IPv4/IPv6 peer only · 120 ms SRT latency").font(.caption).foregroundStyle(.secondary)
             } else {
                 TextField("rtmps://stream.example.invalid/live", text: $model.endpoint).accessibilityIdentifier("destination.endpoint")
                     .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL).textFieldStyle(.roundedBorder)
@@ -209,7 +209,7 @@ struct BroadcasterView: View {
                 Button("Save profile") { model.saveProfile() }
                 if model.selectedProfile != nil { Button("Delete", role: .destructive) { model.deleteProfile() } }
             }.buttonStyle(.bordered)
-            Text("Save keeps destination secrets in this device's unlocked Keychain. Network loss leaves recording running; automatic reconnect is not attached yet. Playback confirmation requires a viewer.")
+            Text("Save keeps destination secrets in this device's unlocked Keychain. Local recording continues through uplink loss. Automatic reconnect shares a 90-second outage window; repeated failures do not extend it. Timely media acknowledgement can restore retries. If retries exhaust while sending, that attempt may continue; a later failure needs a new Prepare. Sending does not confirm decoded playback.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
