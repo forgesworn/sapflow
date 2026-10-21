@@ -20,20 +20,21 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
     private var preparedGrant: V4vGrant? = null
     private val expiry = V4vGrantExpiry(System::nanoTime)
     private val admission = V4vCaptureAdmission()
+    private val correlation = AtomicReference<V4vAttemptCorrelation?>()
     private val expiryOwner = ScheduledThreadPoolExecutor(1) { Thread(it, "sapflow-v4v-grant-expiry").apply { isDaemon = true } }.apply { removeOnCancelPolicy = true }
     private var expiryAlarm: ScheduledFuture<*>? = null
     private fun arm(ticket: V4vGrantExpiry.Ticket) {
         synchronized(expiry) {
             expiryAlarm?.cancel(false)
             expiryAlarm = expiryOwner.schedule({
-                synchronized(expiry) { if (expiry.expired(ticket) != null) { admission.invalidate(); preparedGrant = null; destination.getAndSet(null)?.stopDestination() } }
+                synchronized(expiry) { if (expiry.expired(ticket) != null) { admission.invalidate(); correlation.getAndSet(null)?.clear(); preparedGrant = null; destination.getAndSet(null)?.stopDestination() } }
             }, (ticket.deadlineNs - System.nanoTime()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
         }
     }
     /** Called under the same lock as expiry/admission/destination adoption. */
     private fun fenceExpiredOwner() {
         if (expiry.expiredCurrent() != null) {
-            admission.invalidate(); preparedGrant = null
+            admission.invalidate(); correlation.getAndSet(null)?.clear(); preparedGrant = null
             expiryAlarm?.cancel(false); expiryAlarm = null
             destination.getAndSet(null)?.stopDestination()
         }
@@ -51,7 +52,7 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
             { wallAnchor + (System.nanoTime() - monoAnchor) / 1_000_000 }, { V4vDestinationSession.nonce() }, ::stopPublisher, ::grantCommitted)
     }
     fun stopPublisher() {
-        synchronized(expiry) { admission.invalidate(); preparedGrant = null; expiry.clear(); expiryAlarm?.cancel(false); expiryAlarm = null; destination.getAndSet(null)?.stopDestination() }
+        synchronized(expiry) { admission.invalidate(); correlation.getAndSet(null)?.clear(); preparedGrant = null; expiry.clear(); expiryAlarm?.cancel(false); expiryAlarm = null; destination.getAndSet(null)?.stopDestination() }
     }
     fun current(permit: V4vCapturePermit): Boolean = synchronized(expiry) {
         fenceExpiredOwner(); admission.current(permit.ticket)
@@ -67,19 +68,33 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
             // Reject insufficient quality BEFORE retiring an owner or consuming
             // approval. End/reconcile remain available on the control actor.
             admission.consume(permit.ticket, permit.profile, permit.grant.maxPublishBps)
-            expiry.clear(); expiryAlarm?.cancel(false); preparedGrant = null; destination.getAndSet(null)?.stopDestination()
+            correlation.getAndSet(null)?.clear(); expiry.clear(); expiryAlarm?.cancel(false); preparedGrant = null; destination.getAndSet(null)?.stopDestination()
             val grant = permit.grant
             val ticket = expiry.begin(++captureSerial, grant.identity, grant.expiresAtMonotonicNs)
             val numeric = SrtDestination.parse(grant.endpoint)
+            // A retired factory cannot overwrite the next destination's scope.
+            val attempts = V4vAttemptCorrelation()
             val coordinator = ReconnectingPublishingSink(graceMs = grant.graceMs) { events ->
-                SrtPublishingSink(numeric, grant.streamId, grant.passphrase, false, events, permit.profile.srtPacingBytesPerSecond(grant.maxPublishBps))
+                val wire = attempts.begin(this, grant)
+                SrtPublishingSink(numeric, wire.streamId, grant.passphrase, false, events, permit.profile.srtPacingBytesPerSecond(grant.maxPublishBps))
             }
-            destination.set(coordinator); preparedGrant = grant; arm(ticket)
+            destination.set(coordinator); correlation.set(attempts); preparedGrant = grant; arm(ticket)
             V4vPreparedDestination(admission.bind(captureSerial, grant.identity, permit.profile)) { coordinator.newEpoch() }
         }
         // Private bounded scalar lifecycle correlation only; no destination/event/credential/media data.
         Log.i("SapflowV4v", "explicitCapturePrepare serial=$captureSerial graceMs=${permit.grant.graceMs}")
         return result
+    }
+    /** Future finite-decoder input only. No probe or confirmation runs here. */
+    fun observationScope(): V4vCapturedAttempt? = synchronized(expiry) {
+        fenceExpiredOwner()
+        val context = destination.get()?.observationScope ?: return@synchronized null
+        correlation.get()?.currentFor(context)
+    }
+    fun matchFreshMedia(scope: V4vCapturedAttempt, receipt: V4vSessionReceipt): V4vMatchedMedia? = synchronized(expiry) {
+        if (observationScope() !== scope) return@synchronized null
+        val matched = correlation.get()?.matchFreshMedia(scope, receipt)
+        if (observationScope() === scope) matched else null
     }
     fun beginLogin(packageName: String, context: Context, complete: (Exception?) -> Unit) {
         var challenge: V4vLoginChallenge? = null

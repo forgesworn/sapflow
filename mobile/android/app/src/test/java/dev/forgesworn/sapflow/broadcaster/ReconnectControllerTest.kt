@@ -10,13 +10,17 @@ import java.util.concurrent.atomic.AtomicReference
 
 class ReconnectControllerTest {
     private class Policy : ReconnectPolicyPort {
+        override var attemptIdentity: SdkAttemptIdentity? = null
+        private var sdkEpoch = 0uL
+        private fun connect(): ReconnectAction { attemptIdentity = SdkAttemptIdentity(1uL, ++sdkEpoch); return ReconnectAction.Connect }
         var deadlineNs: Long? = null
         var retry: Long? = null
         override val nextDeadlineNs: Long? get() = listOfNotNull(deadlineNs, retry).minOrNull()
         val progress = mutableListOf<String>()
         var sending = false; var exhausted = false
         var starts = 0; var connections = 0; var confirmations = 0; var stops = 0
-        override fun start(nowNs: Long): ReconnectAction { starts++; return ReconnectAction.Connect }
+        var lastConfirmation: SdkAttemptIdentity? = null
+        override fun start(nowNs: Long): ReconnectAction { starts++; return connect() }
         override fun failed(nowNs: Long): ReconnectAction {
             if (exhausted) return ReconnectAction.Expired
             sending = false
@@ -42,12 +46,16 @@ class ReconnectControllerTest {
             retry = null
             if (exhausted) return ReconnectAction.Expired
             sending = false
-            return if (deadlineNs?.let { nowNs >= it } == true) ReconnectAction.Expired else ReconnectAction.Connect
+            return if (deadlineNs?.let { nowNs >= it } == true) ReconnectAction.Expired else connect()
         }
-        override fun confirmed(nowNs: Long) { confirmations++; deadlineNs = null; retry = null }
+        override fun confirmed(attempt: SdkAttemptIdentity, nowNs: Long) {
+            lastConfirmation = attempt
+            check(attempt == attemptIdentity) { "SDK rejected stale attempt" }
+            confirmations++; deadlineNs = null; retry = null
+        }
         override fun tick(nowNs: Long): ReconnectAction {
             if (deadlineNs?.let { nowNs >= it } == true) return if (sending) exhaust() else ReconnectAction.Expired
-            if (retry?.let { nowNs >= it } == true) { retry = null; return ReconnectAction.Connect }
+            if (retry?.let { nowNs >= it } == true) { retry = null; return connect() }
             return ReconnectAction.None
         }
         override fun stop() { stops++ }
@@ -65,7 +73,7 @@ class ReconnectControllerTest {
         val attempts = mutableListOf<Attempt>()
         val ready = mutableListOf<Pair<Long, Long>>()
         var failNextStart = false
-        val controller = ReconnectController(policy, { now }, { permitted }, { epoch, token ->
+        val controller = ReconnectController(policy, { now }, { permitted }, { epoch, token, _ ->
             assertTrue("old attempt must finish before replacement", attempts.lastOrNull()?.let { it.closes > 0 } != false)
             Attempt(epoch, token).also { it.startFails = failNextStart; failNextStart = false; attempts.add(it) }
         }, { epoch, token -> ready.add(epoch to token) })
@@ -128,11 +136,11 @@ class ReconnectControllerTest {
         h.now = 5; h.controller.tick(); h.accepted()
         h.controller.event(1, PublishingAttemptEvent.Failed())
         h.controller.event(1, PublishingAttemptEvent.Accepted)
-        h.controller.observedMedia(1, 1)
-        h.controller.observedMedia(99, 2)
+        h.controller.observedMedia(1, 1, checkNotNull(h.policy.attemptIdentity))
+        h.controller.observedMedia(99, 2, checkNotNull(h.policy.attemptIdentity))
         assertEquals(0, h.policy.confirmations)
         assertEquals(0, h.attempts[1].closes)
-        h.controller.observedMedia(1, 2)
+        h.controller.observedMedia(1, 2, checkNotNull(h.policy.attemptIdentity))
         assertEquals(1, h.policy.confirmations)
         assertNull(h.controller.nextWakeNs)
         h.now = 200; h.failed()
@@ -150,7 +158,7 @@ class ReconnectControllerTest {
         assertEquals(1, h.policy.starts)
         h.controller.detach(1) // Delayed old epoch cleanup is harmless.
         assertEquals(0, h.attempts[1].closes)
-        h.controller.observedMedia(1, 2)
+        h.controller.observedMedia(1, 2, checkNotNull(h.policy.attemptIdentity))
         assertEquals(0, h.policy.confirmations)
     }
     @Test fun orientationCannotCreateTransportAfterOriginalGraceExpires() {
@@ -190,7 +198,7 @@ class ReconnectControllerTest {
     }
     @Test fun nonretryableFailureStopsAndUnacceptedTransportCannotConfirmMedia() {
         val h = Harness(); h.controller.attach(1)
-        h.controller.observedMedia(1, 1)
+        h.controller.observedMedia(1, 1, checkNotNull(h.policy.attemptIdentity))
         assertEquals(0, h.policy.confirmations)
         h.controller.event(1, PublishingAttemptEvent.Failed(retryable = false))
         h.now = 100; h.controller.tick()
@@ -320,4 +328,35 @@ class ReconnectControllerTest {
         assertEquals(290L, h.policy.deadlineNs)
     }
 
+    @Test fun oldSdkReplyCannotConfirmTheNewLocalAttemptInTheSameGeneration() {
+        val h = Harness(); h.controller.attach(1); h.accepted()
+        val old = checkNotNull(h.policy.attemptIdentity)
+        h.now = 10; h.failed(); h.now = 15; h.controller.tick(); h.accepted()
+        val current = checkNotNull(h.policy.attemptIdentity)
+        assertEquals(old.generation, current.generation); assertNotEquals(old.attemptEpoch, current.attemptEpoch)
+        h.controller.observedMedia(1, h.controller.token, old)
+        assertEquals(0, h.policy.confirmations); assertEquals(100L, h.policy.deadlineNs)
+        h.controller.observedMedia(1, h.controller.token, current)
+        h.controller.observedMedia(1, h.controller.token, current)
+        assertEquals(1, h.policy.confirmations); assertEquals(current, h.policy.lastConfirmation)
+    }
+    @Test fun finalPolicyReceivesCapturedSdkIdentityRatherThanLatestCompletionSnapshot() {
+        val h = Harness(); h.controller.attach(1); h.accepted(); h.now = 10; h.failed()
+        h.now = 15; h.controller.tick(); h.accepted()
+        val captured = checkNotNull(h.policy.attemptIdentity)
+        // Simulates the SDK's final defence if a platform forgot to retire an
+        // observation after a separately advanced SDK attempt.
+        h.policy.attemptIdentity = captured.copy(attemptEpoch = captured.attemptEpoch + 1uL)
+        assertThrows(IllegalStateException::class.java) { h.controller.observedMedia(1, h.controller.token, captured) }
+        assertEquals(captured, h.policy.lastConfirmation)
+        assertEquals(0, h.policy.confirmations); assertEquals(100L, h.policy.deadlineNs)
+    }
+    @Test fun laterTransportFactsCannotDowngradeAnActualDecodedObservation() {
+        val h = Harness(); h.controller.attach(1); h.accepted()
+        h.controller.observedMedia(1, 1, checkNotNull(h.policy.attemptIdentity))
+        h.controller.event(1, PublishingAttemptEvent.Sending)
+        h.controller.event(1, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.SRT))
+        assertEquals("Origin confirmed playable media", h.controller.status)
+        assertEquals(1, h.policy.confirmations)
+    }
 }

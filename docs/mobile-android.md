@@ -1175,3 +1175,59 @@ The historical signed 8e9… and private-TLS 6fc… APKs remain unchanged. The n
 playback acceptance; no signing, installation or phone action is part of these
 source/build checks. The selected ABI is ARM64; an all-ABI release is not
 qualified by this packet.
+
+
+The next Android source packet binds future decoded observations to a captured
+transport attempt. Each Connect captures the SDK generation and attempt epoch
+before any transport/probe starts, alongside the local destination, codec epoch
+and attempt token. Scope becomes observable only after control-owner acceptance;
+Stop, codec close and the first reported failure fence it immediately, including
+while cleanup is queued. A cold linearisation gate covers that final validation
+and SDK confirmation together with synchronous failure, Stop and codec-close
+flags; it never covers transport close/join, IO or IDR callbacks. Delayed
+completion must still pass the current local context and captured SDK identity. The final SDK call is
+`mediaConfirmedForAttempt(capturedGeneration, capturedAttemptEpoch, nowNs)`;
+it never substitutes a newer snapshot at completion. The server's connection
+epoch is a separate namespace and is not an SDK attempt number.
+
+For V4V only, every actual retry/rotation transport factory obtains a fresh
+cryptographic 128-bit lowercase hexadecimal nonce. It derives an ephemeral
+canonical SRT ID from the validated grant's colon credentials:
+`#!::m=publish,r=live/<event>,u=<session>,s=<password>,forgesworn_attempt=<nonce>`.
+The durable grant, refresh comparisons and Start's immutable credential checks
+retain the original colon ID. Manual RTMP/SRT factories and stream IDs remain
+unchanged. One current scope is held per logical destination; a retired factory
+cannot overwrite its successor's correlation owner. The SDK context is not
+persisted and no attempt ID is added to the durable grant. The existing status
+journal can retain the origin's visible echoed ID as metadata; it must never
+substitute for a fresh status response or reconstruct an observation scope.
+No wire credentials or event identifiers are added to logs.
+
+The cold correlation helper checks authenticated receipt identity/revision,
+active/live/open protocol state, the exact echoed nonce, positive server epoch,
+and the existing strict seven-field fresh-media descriptor with canonical
+same-event paths. Missing/null metadata is unknown, not success. Its result is
+encoded availability only. The future finite decoder must obtain fresh GET
+status, map paths exclusively through the approved public playback profile,
+validate correlation before and after genuine video/audio decode, and then
+submit the originally captured context. No decoder/probe or production caller
+of the confirmation seam is enabled by this packet; it makes no new Live,
+playback or recovery-acceptance claim. The nonce adds correlation, not admission,
+encryption, anti-replay or protection against another holder of the credentials.
+
+Original reconnect deadlines, network-watermark semantics, media residence and
+queue limits, grant expiry, Stop/End barriers and capture/recording independence
+are retained. The signed quality APK remains an immutable separate artefact.
+The focused host gate passed 99 JVM tests with Kotlin 2.2 and the actual
+`55f55bee…` AAR classes, including SDK attempt fencing, executor ownership and deterministic failure/Stop
+races at the final confirmation boundary.
+The full M4 offline Android API/package gate then passed 200 tests across 35
+suites, lint zero errors (ten warnings), actual ARM64 native 16 KiB checks and
+qualification/release isolation using the same AAR. The original qualification
+APK is `8163a1aaa84396abf9159ad0918b91619add52a1da34e9aa569f2590dbcbe706`;
+the unsigned release is
+`557f31700ece8bc356aec424a28cb6941a00e825a3cb35c83d20309456ded617`.
+The 112-input source archive, tests and package receipts are retained under
+ignored `target/mobile-android/v4v-attempt-v3-*`. These source/package gates
+remain separate from future signing, network execution, real decoded proof
+and physical qualification.

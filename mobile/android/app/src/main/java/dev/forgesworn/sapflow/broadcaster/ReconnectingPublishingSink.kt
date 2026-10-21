@@ -13,19 +13,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
-internal data class OriginMediaConfirmation(val destination: Long, val epoch: Long, val attempt: Long)
-
 /** One logical destination, fresh bounded transport per attempt, no media queue.
  * Epoch.close joins transport cleanup before CaptureController releases codecs.
  * Explicit Stop fences synchronously, then cleans up on this control owner. */
 internal class ReconnectingPublishingSink(
     private val policyFactory: (() -> ReconnectPolicyPort)? = null,
     private val graceMs: Long = 90_000,
-    private val factory: ((PublishingAttemptEvent) -> Unit) -> EncodedSink,
+    private val observationGate: ObservationLinearisation = ObservationLinearisation(),
+    private val factory: PublishingAttemptContext.((PublishingAttemptEvent) -> Unit) -> EncodedSink,
 ) {
     init { require(graceMs in 0..3_600_000) }
     private data class Codecs(val video: RustCodec?, val audio: RustCodec?)
-    private data class Current(val epoch: Epoch, val token: Long, val sink: EncodedSink, val report: (PublishingAttemptEvent) -> Unit)
+    private data class Current(val epoch: Epoch, val token: Long, val context: PublishingAttemptContext, val admitted: AtomicBoolean, val failed: AtomicBoolean, val sink: EncodedSink, val report: (PublishingAttemptEvent) -> Unit)
     private val fenced = AtomicBoolean(false)
     private val destinationId = destinations.incrementAndGet()
     private val sequence = AtomicLong()
@@ -33,12 +32,12 @@ internal class ReconnectingPublishingSink(
     private val message = AtomicReference("Destination prepared · press Start")
     private val executor = ScheduledThreadPoolExecutor(1) { Thread(it, "sapflow-reconnect") }.apply { removeOnCancelPolicy = true }
     private val stopped = CompletableFuture<Unit>()
-    private val observation = AtomicReference<OriginMediaConfirmation?>()
+    private val observation = AtomicReference<PublishingAttemptContext?>()
     private val observationPosted = AtomicBoolean(false)
     private var alarm: ScheduledFuture<*>? = null // Control owner only.
     private val epochs = java.util.concurrent.ConcurrentHashMap<Long, Epoch>()
     private val controller: ReconnectController by lazy { ReconnectController(policyFactory?.invoke() ?: NativePolicy(graceMs), System::nanoTime, { !fenced.get() },
-        factory = attempt@{ epoch, token ->
+        factory = attempt@{ epoch, token, sdk ->
             val owner = epochs[epoch]
             if (owner == null || owner.closed.get() || fenced.get()) return@attempt object : PublishingAttempt {
                 override fun start() {}
@@ -51,12 +50,13 @@ internal class ReconnectingPublishingSink(
                     PublishingAttemptEvent.Accepted -> accepted.compareAndSet(false, true)
                     PublishingAttemptEvent.Sending -> sending.compareAndSet(false, true)
                     is PublishingAttemptEvent.PeerMediaProgress -> progress.compareAndSet(false, true)
-                    is PublishingAttemptEvent.Failed -> failed.compareAndSet(false, true)
+                    is PublishingAttemptEvent.Failed -> observationGate.withGate { failed.compareAndSet(false, true) }
                 }
                 if (first) post { controller.event(token, event) }
             }
-            val sink = factory(report)
-            val record = Current(owner, token, sink, report)
+            val context = PublishingAttemptContext(destinationId, epoch, token, sdk)
+            val sink = factory(context, report)
+            val record = Current(owner, token, context, AtomicBoolean(false), failed, sink, report)
             current.set(record)
             object : PublishingAttempt {
                 private var closeError: Exception? = null
@@ -83,30 +83,45 @@ internal class ReconnectingPublishingSink(
                     try { sink.close() } catch (error: Exception) { closeError = error; throw error }
                 }
             }
-        }, ready = { epoch, _ -> epochs[epoch]?.requestIdr?.get()?.invoke() }) }
+        }, ready = { epoch, token ->
+            current.get()?.takeIf { it.epoch.id == epoch && it.token == token && !it.failed.get() }?.admitted?.set(true)
+            epochs[epoch]?.requestIdr?.get()?.invoke()
+        }) }
 
     fun newEpoch(): EncodedSink {
         val epoch = Epoch(sequence.incrementAndGet())
         if (!fenced.get()) epochs[epoch.id] = epoch
         return epoch
     }
-    /** Future V4V adapter seam. Manual mode deliberately never invokes it. */
-    fun originMediaConfirmed(value: OriginMediaConfirmation) {
-        if (fenced.get() || value.destination != destinationId) return
-        observation.set(value)
+    /** Reserved for a future independently validated finite decoder result.
+     * Receipt metadata alone MUST NOT invoke this. No production caller exists
+     * until decoding and before/after origin correlation are integrated. */
+    fun originMediaConfirmed(value: PublishingAttemptContext) {
+        if (!isCurrentObservation(value)) return
+        observation.updateAndGet { pending -> if (isCurrentObservation(value)) value else pending }
         postObservation()
     }
     private fun postObservation() {
         if (observationPosted.compareAndSet(false, true)) post {
             try {
-                observation.getAndSet(null)?.let { controller.observedMedia(it.epoch, it.attempt) }
+                observation.getAndSet(null)?.let { captured ->
+                    observationGate.withGate {
+                        if (isCurrentObservation(captured)) controller.observedMedia(captured.epoch, captured.attempt, captured.sdk)
+                    }
+                }
             } finally {
                 observationPosted.set(false)
                 if (!fenced.get() && observation.get() != null) postObservation()
             }
         }
     }
-    val observationScope: OriginMediaConfirmation? get() = current.get()?.let { OriginMediaConfirmation(destinationId, it.epoch.id, it.token) }
+    private fun isCurrentObservation(value: PublishingAttemptContext): Boolean = observationScope == value
+    val observationScope: PublishingAttemptContext? get() {
+        if (fenced.get()) return null
+        val record = current.get() ?: return null
+        if (record.epoch.closed.get() || record.failed.get() || !record.admitted.get()) return null
+        return record.context
+    }
     private fun post(action: () -> Unit) {
         if (fenced.get()) return
         runCatching { executor.execute { runControl(action) } }.onFailure { stopDestination() }
@@ -134,7 +149,7 @@ internal class ReconnectingPublishingSink(
         }
     }
     fun stopDestination() {
-        if (!fenced.compareAndSet(false, true)) return
+        if (!observationGate.withGate { fenced.compareAndSet(false, true) }) return
         message.set("Stopping publisher")
         try { executor.execute {
             alarm?.cancel(false)
@@ -176,7 +191,7 @@ internal class ReconnectingPublishingSink(
         }
         override fun stopDestination() = this@ReconnectingPublishingSink.stopDestination()
         override fun close() {
-            closed.set(true)
+            observationGate.withGate { closed.set(true) }
             val future = CompletableFuture<Unit>()
             val existing = if (completion.compareAndSet(null, future)) null else completion.get()
             val result = existing ?: future.also {
@@ -194,6 +209,8 @@ internal class ReconnectingPublishingSink(
         private val native = NativeSession(graceMs.toULong())
         private var generation: ULong? = null
         private var attemptEpoch = 0uL
+        override var attemptIdentity: SdkAttemptIdentity? = null
+            private set
         override fun start(nowNs: Long): ReconnectAction {
             val value = native.start(nowNs.toULong()); generation = value
             return action(native.prepared(value))
@@ -206,7 +223,7 @@ internal class ReconnectingPublishingSink(
             PeerProgressSource.SRT -> NativeTransportRecoverySource.SRT_PEER_ACKNOWLEDGED_WATERMARK
             PeerProgressSource.RTMP -> NativeTransportRecoverySource.RTMP_PEER_ACKNOWLEDGED_WATERMARK
         }))
-        override fun confirmed(nowNs: Long) = native.mediaConfirmed(checkNotNull(generation), nowNs.toULong())
+        override fun confirmed(attempt: SdkAttemptIdentity, nowNs: Long) = native.mediaConfirmedForAttempt(attempt.generation, attempt.attemptEpoch, nowNs.toULong())
         override fun tick(nowNs: Long) = action(native.tick(checkNotNull(generation), nowNs.toULong()))
         override val nextDeadlineNs: Long? get() = native.snapshot().nextDeadlineNs?.toLong()
         override fun stop() {
@@ -216,6 +233,7 @@ internal class ReconnectingPublishingSink(
         private fun action(value: NativeSessionAction): ReconnectAction = when (value) {
             NativeSessionAction.Connect -> {
                 attemptEpoch = native.snapshot().attemptEpoch
+                attemptIdentity = SdkAttemptIdentity(checkNotNull(generation), attemptEpoch)
                 ReconnectAction.Connect
             }
             is NativeSessionAction.RetryAt -> ReconnectAction.At(value.atNs.toLong())

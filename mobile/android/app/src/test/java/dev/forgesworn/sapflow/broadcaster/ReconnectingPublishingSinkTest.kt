@@ -12,6 +12,9 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Exercise real Java executor/epoch/cleanup ownership with no native calls. */
 class ReconnectingPublishingSinkTest {
     private class Policy : ReconnectPolicyPort {
+        override var attemptIdentity: SdkAttemptIdentity? = null
+        private var sdkEpoch = 0uL
+        private fun connect(): ReconnectAction { attemptIdentity = SdkAttemptIdentity(1uL, ++sdkEpoch); return ReconnectAction.Connect }
         var deadlineNs: Long? = null
         override val nextDeadlineNs: Long? get() = deadlineNs
         val progress = CopyOnWriteArrayList<String>()
@@ -23,19 +26,20 @@ class ReconnectingPublishingSinkTest {
         var graceNs = 90_000_000_000L
         val starts = AtomicInteger(); val failures = AtomicInteger(); val replacements = AtomicInteger()
         val confirmations = AtomicInteger(); val stops = AtomicInteger()
-        override fun start(nowNs: Long): ReconnectAction { starts.incrementAndGet(); return ReconnectAction.Connect }
+        override fun start(nowNs: Long): ReconnectAction { starts.incrementAndGet(); return connect() }
         override fun failed(nowNs: Long): ReconnectAction {
             failures.incrementAndGet(); if (deadlineNs == null) deadlineNs = nowNs + graceNs
-            return ReconnectAction.Connect
+            return connect()
         }
-        override fun intentionalReplace(nowNs: Long): ReconnectAction { replacements.incrementAndGet(); return ReconnectAction.Connect }
+        override fun intentionalReplace(nowNs: Long): ReconnectAction { replacements.incrementAndGet(); return connect() }
         override fun connected(nowNs: Long) { progress.add("accepted") }
-        override fun confirmed(nowNs: Long) { confirmations.incrementAndGet(); deadlineNs = null }
+        override fun confirmed(attempt: SdkAttemptIdentity, nowNs: Long) { confirmations.incrementAndGet(); deadlineNs = null }
         override fun tick(nowNs: Long) = if (deadlineNs?.let { nowNs >= it } == true) ReconnectAction.Expired else ReconnectAction.None
         override fun stop() { stops.incrementAndGet() }
     }
     private class Sink(val events: (PublishingAttemptEvent) -> Unit) : EncodedSink {
         val started = CountDownLatch(1)
+        val controlThread = java.util.concurrent.atomic.AtomicReference<Thread?>()
         val closing = CountDownLatch(1)
         val closed = CountDownLatch(1)
         var releaseClose: CountDownLatch? = null
@@ -43,6 +47,7 @@ class ReconnectingPublishingSinkTest {
         var failedStartupCleanup = false
         override val status = "synthetic transport"
         override fun start() {
+            controlThread.set(Thread.currentThread())
             started.countDown()
             if (failedStartupCleanup) throw IllegalStateException("synthetic setup failure").apply {
                 addSuppressed(IllegalStateException("synthetic partial cleanup failure"))
@@ -56,11 +61,11 @@ class ReconnectingPublishingSinkTest {
             closed.countDown()
         }
     }
-    private class Harness {
+    private class Harness(val gate: ObservationLinearisation = ObservationLinearisation()) {
         val policy = Policy()
         val sinks = CopyOnWriteArrayList<Sink>()
         var configure: (Sink) -> Unit = {}
-        val owner = ReconnectingPublishingSink(policyFactory = { policy }, factory = { events ->
+        val owner = ReconnectingPublishingSink(policyFactory = { policy }, observationGate = gate, factory = { events ->
             assertTrue("old ownership must be released", sinks.lastOrNull()?.closed?.count != 1L)
             Sink(events).also { configure(it); sinks.add(it) }
         })
@@ -198,4 +203,106 @@ class ReconnectingPublishingSinkTest {
         assertEquals(0, h.policy.confirmations.get())
     }
 
+    @Test fun immediateFailureFencesScopeBeforeItsQueuedControlEventCanRun() {
+        val h = Harness(); val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val epoch = h.owner.newEpoch()
+        epoch.setKeyframeRequester { entered.countDown(); check(release.await(2, TimeUnit.SECONDS)) }
+        epoch.start(); val sink = h.sink(0)
+        assertNull(h.owner.observationScope) // Captured but not control-owner accepted.
+        sink.events(PublishingAttemptEvent.Accepted)
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            val scope = checkNotNull(h.owner.observationScope)
+            assertEquals(SdkAttemptIdentity(1uL, 1uL), scope.sdk)
+            sink.events(PublishingAttemptEvent.Failed()) // Queued behind ready callback.
+            assertNull(h.owner.observationScope)
+            h.owner.originMediaConfirmed(scope)
+        } finally { release.countDown(); epoch.stopDestination(); epoch.close() }
+        assertEquals(0, h.policy.confirmations.get())
+    }
+    @Test fun closingCodecEpochImmediatelyFencesACapturedObservationBeforeCleanupCompletes() {
+        val h = Harness(); val release = CountDownLatch(1)
+        h.configure = { it.releaseClose = release }
+        val epoch = h.owner.newEpoch(); val ready = CountDownLatch(1)
+        epoch.setKeyframeRequester { ready.countDown() }; epoch.start(); val sink = h.sink(0)
+        sink.events(PublishingAttemptEvent.Accepted); assertTrue(ready.await(2, TimeUnit.SECONDS))
+        val scope = checkNotNull(h.owner.observationScope)
+        val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val closing = Thread { try { epoch.close() } catch (error: Throwable) { failure.set(error) } }.apply { start() }
+        try {
+            assertTrue(sink.closing.await(2, TimeUnit.SECONDS)); assertNull(h.owner.observationScope)
+            h.owner.originMediaConfirmed(scope)
+        } finally { release.countDown(); closing.join(2000); epoch.stopDestination(); epoch.close() }
+        assertFalse(closing.isAlive); assertNull(failure.get()); assertEquals(0, h.policy.confirmations.get())
+    }
+    @Test fun v4vRetryAndRotationConstructFreshWireIdsFromCapturedSdkAttempts() {
+        val policy = Policy(); val sinks = CopyOnWriteArrayList<Sink>(); val wires = CopyOnWriteArrayList<V4vWireAttempt>()
+        val correlation = V4vAttemptCorrelation()
+        val identity = V4vIdentity("event-fixture", 1, "a".repeat(32), 1)
+        val original = "publish:live/event-fixture:${identity.sessionId}:${"b".repeat(43)}"
+        val grant = V4vGrant(identity, "srt://192.0.2.1:8890", original, "c".repeat(43), 1000, 500, 90000, 4_000_000, 524288, 1000000)
+        val owner = ReconnectingPublishingSink(policyFactory = { policy }) { events ->
+            wires.add(correlation.begin(this, grant))
+            Sink(events).also { sinks.add(it) }
+        }
+        fun next(index: Int): Sink {
+            val until = System.nanoTime() + 2_000_000_000
+            while (sinks.size <= index && System.nanoTime() < until) Thread.sleep(1)
+            check(sinks.size > index); return sinks[index].also { check(it.started.await(2, TimeUnit.SECONDS)) }
+        }
+        val firstEpoch = owner.newEpoch(); var secondEpoch: EncodedSink? = null
+        try {
+            firstEpoch.start(); val a = next(0); a.events(PublishingAttemptEvent.Accepted)
+            a.events(PublishingAttemptEvent.Failed()); val b = next(1)
+            b.events(PublishingAttemptEvent.Accepted); firstEpoch.close()
+            secondEpoch = owner.newEpoch(); secondEpoch.start(); next(2)
+            assertEquals(3, wires.map { it.scope.nonce }.toSet().size)
+            assertEquals(listOf(1uL, 2uL, 3uL), wires.map { it.scope.context.sdk.attemptEpoch })
+            assertEquals(listOf(1L, 1L, 2L), wires.map { it.scope.context.epoch })
+            assertEquals(1, wires.map { it.scope.context.destination }.toSet().size)
+            assertTrue(wires.all { it.streamId.endsWith("forgesworn_attempt=${it.scope.nonce}") })
+            assertEquals(original, grant.streamId); assertEquals(0, policy.confirmations.get())
+            assertEquals(1, policy.failures.get()) // Rotation is not a new outage.
+        } finally { owner.stopDestination(); secondEpoch?.close(); firstEpoch.close() }
+    }
+    private fun awaitFinalGate(sink: Sink) {
+        val owner = checkNotNull(sink.controlThread.get())
+        val until = System.nanoTime() + 2_000_000_000
+        while (owner.state != Thread.State.BLOCKED && System.nanoTime() < until) Thread.sleep(1)
+        assertEquals("observation reached its final cold gate", Thread.State.BLOCKED, owner.state)
+    }
+    @Test fun failureWinningAtTheFinalPolicyGateCannotResetTheOriginalOutage() {
+        val h = Harness(); val epoch = h.owner.newEpoch(); val ready = CountDownLatch(1)
+        epoch.setKeyframeRequester { ready.countDown() }
+        try {
+            epoch.start(); h.sink(0).events(PublishingAttemptEvent.Failed())
+            val second = h.sink(1); second.events(PublishingAttemptEvent.Accepted)
+            assertTrue(ready.await(2, TimeUnit.SECONDS)); val originalDeadline = h.policy.deadlineNs
+            val captured = checkNotNull(h.owner.observationScope)
+            h.gate.withGate {
+                h.owner.originMediaConfirmed(captured)
+                awaitFinalGate(second) // After queue admission, just before final SDK validation/call.
+                second.events(PublishingAttemptEvent.Failed()) // Reentrant fence wins while confirmation waits.
+                assertNull(h.owner.observationScope)
+            }
+            h.sink(2) // Serial barrier after rejected completion and failure/retry.
+            assertEquals(0, h.policy.confirmations.get()); assertEquals(originalDeadline, h.policy.deadlineNs)
+            assertEquals(2, h.policy.failures.get())
+        } finally { epoch.stopDestination(); epoch.close() }
+    }
+    @Test fun explicitStopWinningAtTheFinalPolicyGateCannotConfirmOrRestart() {
+        val h = Harness(); val epoch = h.owner.newEpoch(); val ready = CountDownLatch(1)
+        epoch.setKeyframeRequester { ready.countDown() }
+        epoch.start(); val sink = h.sink(0); sink.events(PublishingAttemptEvent.Accepted)
+        assertTrue(ready.await(2, TimeUnit.SECONDS)); val captured = checkNotNull(h.owner.observationScope)
+        try {
+            h.gate.withGate {
+                h.owner.originMediaConfirmed(captured)
+                awaitFinalGate(sink)
+                epoch.stopDestination() // Same synchronous fence used by End and grant expiry.
+                assertNull(h.owner.observationScope)
+            }
+        } finally { epoch.stopDestination(); epoch.close() }
+        assertEquals(0, h.policy.confirmations.get()); assertEquals(1, h.policy.stops.get()); assertEquals(1, h.sinks.size)
+    }
 }

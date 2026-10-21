@@ -9,6 +9,15 @@ internal fun failAttemptOnce(closed: AtomicBoolean, notify: () -> Unit, cleanup:
     try { notify() } finally { cleanup() }
 }
 
+/** Cold linearisation point for validated decoder completion and asynchronous
+ * Stop/failure/codec-close flags. Never hold across sockets, joins, IO or IDR
+ * callbacks; guarded native work is session confirmation and its immediate
+ * policy snapshot, both runtime-free session calls. */
+internal class ObservationLinearisation {
+    private val monitor = Any()
+    fun <T> withGate(action: () -> T): T = synchronized(monitor, action)
+}
+
 /** Serial control-plane policy. No samples, sockets, timers or Android runtime. */
 internal sealed interface ReconnectAction {
     data object Connect : ReconnectAction
@@ -17,14 +26,22 @@ internal sealed interface ReconnectAction {
     data object Expired : ReconnectAction
     data object Exhausted : ReconnectAction
 }
+/** Captured from the SDK Connect action before a transport/probe can start. */
+internal data class SdkAttemptIdentity(val generation: ULong, val attemptEpoch: ULong) {
+    init { require(generation > 0uL && attemptEpoch > 0uL) }
+}
+internal data class PublishingAttemptContext(val destination: Long, val epoch: Long, val attempt: Long, val sdk: SdkAttemptIdentity) {
+    init { require(destination > 0 && epoch > 0 && attempt > 0) }
+}
 internal interface ReconnectPolicyPort {
+    val attemptIdentity: SdkAttemptIdentity?
     fun start(nowNs: Long): ReconnectAction
     fun failed(nowNs: Long): ReconnectAction
     fun intentionalReplace(nowNs: Long): ReconnectAction
     fun connected(nowNs: Long)
     fun sending(nowNs: Long): ReconnectAction
     fun peerProgress(source: PeerProgressSource, nowNs: Long): ReconnectAction
-    fun confirmed(nowNs: Long)
+    fun confirmed(attempt: SdkAttemptIdentity, nowNs: Long)
     fun tick(nowNs: Long): ReconnectAction
     val nextDeadlineNs: Long?
     fun stop()
@@ -44,7 +61,7 @@ internal class ReconnectController(
     private val policy: ReconnectPolicyPort,
     private val now: () -> Long,
     private val permitted: () -> Boolean,
-    private val factory: (Long, Long) -> PublishingAttempt,
+    private val factory: (Long, Long, SdkAttemptIdentity) -> PublishingAttempt,
     private val ready: (Long, Long) -> Unit,
 ) {
     private var epoch: Long? = null
@@ -53,6 +70,7 @@ internal class ReconnectController(
     private var policyStopped = false
     private var pendingConnect = false
     private var active: PublishingAttempt? = null
+    private var activeSdkAttempt: SdkAttemptIdentity? = null
     private var accepted = false
     // Events can arrive from different transport owners before Accepted is
     // queued. Retain only this attempt's two scalar facts until acceptance.
@@ -60,6 +78,7 @@ internal class ReconnectController(
     private var proofPending: PeerProgressSource? = null
     private var sendingApplied = false
     private var proofApplied = false
+    private var confirmationApplied = false
     private var retryExhausted = false
     var token = 0L; private set
     var nextWakeNs: Long? = null; private set
@@ -112,26 +131,27 @@ internal class ReconnectController(
         if (sendingPending && !sendingApplied) {
             sendingApplied = true
             val action = policy.sending(now())
-            status = "Sending · decoded media unconfirmed"
+            if (!confirmationApplied) status = "Sending · decoded media unconfirmed"
             apply(action)
         }
         if (stopped || retryExhausted || !sendingApplied || proofApplied) return
         proofPending?.let { source ->
             proofApplied = true
             val action = policy.peerProgress(source, now())
-            if (action == ReconnectAction.None) status = "Peer acknowledged startup media · decoded media unconfirmed"
+            if (action == ReconnectAction.None && !confirmationApplied) status = "Peer acknowledged startup media · decoded media unconfirmed"
             apply(action)
         }
     }
     private fun clearProgress() {
         accepted = false; sendingPending = false; proofPending = null
-        sendingApplied = false; proofApplied = false; retryExhausted = false
+        sendingApplied = false; proofApplied = false; confirmationApplied = false; retryExhausted = false
     }
     /** Trusted origin observation only. Socket/ACK/encoder callbacks cannot
      * enter this seam. Both media epoch and attempt must still be current. */
-    fun observedMedia(value: Long, attempt: Long) {
-        if (!stopped && permitted() && epoch == value && token == attempt && active != null && accepted) {
-            policy.confirmed(now())
+    fun observedMedia(value: Long, attempt: Long, sdk: SdkAttemptIdentity) {
+        if (!stopped && permitted() && epoch == value && token == attempt && active != null && accepted && !confirmationApplied && sdk == activeSdkAttempt) {
+            policy.confirmed(sdk, now())
+            confirmationApplied = true
             nextWakeNs = policy.nextDeadlineNs
             status = "Origin confirmed playable media"
         }
@@ -157,7 +177,9 @@ internal class ReconnectController(
         pendingConnect = false; clearProgress(); token = Math.addExact(token, 1)
         status = "Connecting attempt $token · media delivery unconfirmed"
         try {
-            active = factory(checkNotNull(epoch), token)
+            val sdk = checkNotNull(policy.attemptIdentity) { "SDK attempt identity is unavailable" }
+            activeSdkAttempt = sdk
+            active = factory(checkNotNull(epoch), token, sdk)
             active!!.start()
         } catch (_: Exception) {
             val next = policy.failed(now())
@@ -167,6 +189,7 @@ internal class ReconnectController(
     }
     private fun closeActive() {
         val previous = active ?: return
+        activeSdkAttempt = null
         clearProgress() // Delayed one-shot progress must never enter another attempt.
         try { previous.close(); active = null }
         catch (error: Exception) {
