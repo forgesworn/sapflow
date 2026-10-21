@@ -10,7 +10,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const TOKEN: &str = "synthetic-private-control-token-000000000000";
 const SID: &str = "0123456789abcdef0123456789abcdef";
@@ -94,11 +94,39 @@ impl Fixture {
             .await
             .expect("request headers");
         socket.write_all(body).await.expect("request body");
+        // An early rejection can close with unread request bytes and reset TCP
+        // after sending its full response. Require complete HTTP framing, not
+        // a graceful socket EOF after the response.
+        let mut reader = BufReader::new(socket.take(32 * 1024));
         let mut response = Vec::new();
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            socket.take(32 * 1024).read_to_end(&mut response),
-        )
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let line_start = response.len();
+                let count = reader.read_until(b'\n', &mut response).await?;
+                if count == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                if &response[line_start..] == b"\r\n" {
+                    break;
+                }
+            }
+            let headers = std::str::from_utf8(&response).expect("HTTP response headers");
+            let length: usize = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .expect("control response content length")
+                .1
+                .trim()
+                .parse()
+                .expect("valid response length");
+            let body_start = response.len();
+            let total = body_start.checked_add(length).expect("bounded response");
+            assert!(total <= 32 * 1024, "bounded response");
+            response.resize(total, 0);
+            reader.read_exact(&mut response[body_start..]).await?;
+            Ok::<(), std::io::Error>(())
+        })
         .await
         .expect("bounded response")
         .expect("HTTP response");
