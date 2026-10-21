@@ -6,12 +6,14 @@ final class ReconnectControllerTests: XCTestCase {
     private final class Policy: ReconnectPolicyPort {
         var calls: [String] = []
         var observationTimes: [UInt64] = []
+        var generation: UInt64 = 7
         var attemptEpoch: UInt64 = 0
         var nextDeadlineNs: UInt64?
         var exhausted = false
         var nextTick = ReconnectAction.none
         var failureAction = ReconnectAction.retryAt(50)
         var rejectSending = false
+        var rejectConfirmation = false
         func start(_ now: UInt64) throws -> ReconnectAction { calls.append("start"); attemptEpoch += 1; return .connect }
         func replace(_ now: UInt64) throws -> ReconnectAction { calls.append("replace"); if exhausted { return .expired }; attemptEpoch += 1; return .connect }
         func connected(_ now: UInt64) throws { observationTimes.append(now); calls.append("accepted") }
@@ -19,6 +21,11 @@ final class ReconnectControllerTests: XCTestCase {
             observationTimes.append(now); calls.append("sending:\(epoch)"); if rejectSending { throw Failure.clock }; return .none
         }
         func recovered(_ epoch: UInt64, _ now: UInt64) throws -> ReconnectAction { observationTimes.append(now); calls.append("peer:\(epoch)"); nextDeadlineNs = nil; return .none }
+        func confirmed(_ context: ReconnectAttemptContext, _ now: UInt64) throws {
+            if rejectConfirmation { throw Failure.clock }
+            calls.append("confirmed:\(context.sdkGeneration):\(context.sdkAttempt)")
+            nextDeadlineNs = nil
+        }
         func failed(_ now: UInt64) throws -> ReconnectAction { calls.append("failed:\(now)"); nextDeadlineNs = 100; return failureAction }
         func tick(_ now: UInt64) throws -> ReconnectAction {
             calls.append("tick")
@@ -44,17 +51,116 @@ final class ReconnectControllerTests: XCTestCase {
         var time: UInt64 = 0
         var attempts: [Attempt] = []
         var active: ReconnectAttemptPort?
+        var contexts: [ReconnectAttemptContext] = []
+        var ready: [(ReconnectAttemptContext, UInt64)] = []
         lazy var controller = ReconnectController(policy: policy, now: { [unowned self] in time },
-            activeChanged: { [unowned self] in active = $0 }, changed: {})
+            activeChanged: { [unowned self] in active = $0 }, changed: {},
+            attemptReady: { [unowned self] context, now in ready.append((context, now)) })
         func attach(_ epoch: UInt64 = 1) {
-            controller.attach(epoch: epoch) { [unowned self] observe in
+            controller.attach(epoch: epoch, contextualFactory: { [unowned self] context, observe in
+                contexts.append(context)
                 let attempt = Attempt(observe); attempts.append(attempt); return attempt
-            }
+            })
         }
         func acceptAndSend() {
             attempts.last!.events(.accepted, time)
             attempts.last!.events(.sending, time)
         }
+    }
+    func testThrowingFactoryNeverStartsAnOwnerAndKeepsRecordingOnlyEpoch() {
+        let h = Harness(); var captured: ReconnectAttemptContext?
+        h.controller.attach(epoch: 1, contextualFactory: { context, _ in
+            captured = context
+            throw Failure.clock // expired grant or canonical credential refusal
+        })
+        XCTAssertEqual(captured?.sdkGeneration, 7); XCTAssertEqual(captured?.sdkAttempt, 1)
+        XCTAssertTrue(h.controller.cleanupComplete); XCTAssertTrue(h.attempts.isEmpty)
+        XCTAssertTrue(h.controller.status.contains("local recording continues"))
+        XCTAssertTrue(h.policy.calls.contains("stop")); XCTAssertTrue(h.ready.isEmpty)
+        h.attach(2); XCTAssertTrue(h.attempts.isEmpty)
+    }
+    func testConfirmedEpochDetachesWithoutAdvertisingOldLiveThroughDelayedCleanup() throws {
+        let h = Harness(); h.attach(); h.acceptAndSend(); let old = h.contexts[0]
+        try h.controller.confirmObservedMedia(old, nowNs: 1)
+        XCTAssertTrue(h.controller.status.hasPrefix("Live"))
+        var done = false
+        h.controller.detach(epoch: 1) { _ in done = true }
+        XCTAssertFalse(h.controller.status.hasPrefix("Live")); XCTAssertFalse(done)
+        h.attempts[0].events(.peerMediaProgress, 2)
+        XCTAssertFalse(h.controller.status.hasPrefix("Live"))
+        XCTAssertThrowsError(try h.controller.confirmObservedMedia(old, nowNs: 3))
+        h.attempts[0].release(); h.attach(2); h.acceptAndSend()
+        XCTAssertTrue(done); XCTAssertFalse(h.controller.status.hasPrefix("Live"))
+        try h.controller.confirmObservedMedia(h.contexts[1], nowNs: 4)
+        XCTAssertTrue(h.controller.status.hasPrefix("Live"))
+    }
+    func testFactoryCapturesPolicyAndCodecIdentityBeforeTransportStarts() {
+        let h = Harness(); h.attach(12)
+        XCTAssertEqual(h.contexts, [ReconnectAttemptContext(codecEpoch: 12, token: 1, sdkGeneration: 7, sdkAttempt: 1)])
+        XCTAssertEqual(h.attempts[0].starts, 1)
+        h.time = 10; h.attempts[0].events(.failed, 10)
+        h.policy.nextTick = .connect; h.time = 50; h.controller.tick(); h.attempts[0].release()
+        XCTAssertEqual(h.contexts[1], ReconnectAttemptContext(codecEpoch: 12, token: 2, sdkGeneration: 7, sdkAttempt: 2))
+    }
+    func testObservationReadyRequiresAcceptedSendingAndFiresOnlyOnce() {
+        let h = Harness(); h.attach()
+        h.attempts[0].events(.peerMediaProgress, 1)
+        XCTAssertTrue(h.ready.isEmpty)
+        h.time = 3; h.attempts[0].events(.accepted, 2)
+        XCTAssertEqual(h.ready.count, 1); XCTAssertEqual(h.ready[0].0, h.contexts[0]); XCTAssertEqual(h.ready[0].1, 3)
+        h.attempts[0].events(.sending, 4); h.attempts[0].events(.accepted, 5)
+        XCTAssertEqual(h.ready.count, 1)
+    }
+    func testDecodedConfirmationRequiresExactAcceptedSendingContextAndDoesNotDowngrade() throws {
+        let h = Harness(); h.attach(); let current = h.contexts[0]
+        XCTAssertThrowsError(try h.controller.confirmObservedMedia(current, nowNs: 1))
+        h.attempts[0].events(.accepted, 2)
+        XCTAssertThrowsError(try h.controller.confirmObservedMedia(current, nowNs: 2))
+        h.attempts[0].events(.sending, 3)
+        let wrong = ReconnectAttemptContext(codecEpoch: 1, token: 1, sdkGeneration: 8, sdkAttempt: 1)
+        XCTAssertThrowsError(try h.controller.confirmObservedMedia(wrong, nowNs: 4))
+        try h.controller.confirmObservedMedia(current, nowNs: 5)
+        XCTAssertEqual(h.policy.calls.last, "confirmed:7:1")
+        let verified = h.controller.status
+        h.attempts[0].events(.peerMediaProgress, 6); h.attempts[0].events(.sending, 7)
+        XCTAssertEqual(h.controller.status, verified)
+        XCTAssertTrue(verified.hasPrefix("Live"))
+        XCTAssertThrowsError(try h.controller.confirmObservedMedia(current, nowNs: 8))
+    }
+    func testOldDecodedReplyCannotConfirmNewAttemptInSameSdkGeneration() throws {
+        let h = Harness(); h.attach(); h.acceptAndSend(); let old = h.contexts[0]
+        h.time = 10; h.attempts[0].events(.failed, 10)
+        h.policy.nextTick = .connect; h.time = 50; h.controller.tick(); h.attempts[0].release(); h.acceptAndSend()
+        XCTAssertThrowsError(try h.controller.confirmObservedMedia(old, nowNs: 51))
+        XCTAssertEqual(h.policy.nextDeadlineNs, 100)
+        XCTAssertFalse(h.policy.calls.contains { $0.hasPrefix("confirmed:") })
+        try h.controller.confirmObservedMedia(h.contexts[1], nowNs: 52)
+        XCTAssertEqual(h.policy.calls.last, "confirmed:7:2")
+    }
+    func testStopFailureAndCodecCloseRejectPendingDecodedResults() {
+        for action in 0..<3 {
+            let h = Harness(); h.attach(); h.acceptAndSend(); let captured = h.contexts[0]
+            if action == 0 { h.controller.stop() }
+            else if action == 1 { h.time = 10; h.attempts[0].events(.failed, 10) }
+            else { h.controller.detach(epoch: 1) { _ in } }
+            XCTAssertThrowsError(try h.controller.confirmObservedMedia(captured, nowNs: 11))
+            XCTAssertFalse(h.policy.calls.contains { $0.hasPrefix("confirmed:") })
+            if action == 1 { XCTAssertEqual(h.policy.nextDeadlineNs, 100) }
+        }
+    }
+    func testRejectedNativeConfirmationRemainsUnconfirmedWithoutTransportFailure() {
+        let h = Harness(); h.attach(); h.acceptAndSend(); h.policy.rejectConfirmation = true
+        XCTAssertThrowsError(try h.controller.confirmObservedMedia(h.contexts[0], nowNs: 3))
+        XCTAssertTrue(h.controller.status.contains("unconfirmed")); XCTAssertEqual(h.attempts[0].closes, 0)
+        XCTAssertFalse(h.policy.calls.contains("stop"))
+    }
+    func testRotationCapturesNewCodecEpochWithoutStartingOutageOrChangingGeneration() {
+        let h = Harness(); h.attach(); h.acceptAndSend(); let old = h.contexts[0]
+        h.controller.detach(epoch: 1) { _ in }; h.attempts[0].release(); h.attach(2); h.acceptAndSend()
+        XCTAssertEqual(h.contexts[1].sdkGeneration, old.sdkGeneration)
+        XCTAssertEqual(h.contexts[1].sdkAttempt, 2); XCTAssertEqual(h.contexts[1].codecEpoch, 2)
+        XCTAssertNil(h.policy.nextDeadlineNs)
+        XCTAssertThrowsError(try h.controller.confirmObservedMedia(old, nowNs: 1))
     }
     func testColdProgressDrainExposesLegacySendingWithoutInboundTrafficAndDeduplicatesFusedFacts() {
         let latch = PublishingProgressLatch()

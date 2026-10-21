@@ -23,7 +23,7 @@ suite.addTest(SrtDestinationTests.defaultTestSuite)
 suite.addTest(CaptureOrientationTests.defaultTestSuite)
 suite.addTest(ReconnectControllerTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 30, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 39, result.hasSucceeded else { exit(1) }
 SWIFT
 swiftc -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
   -Xlinker -rpath -Xlinker "$sapflow_frameworks" \
