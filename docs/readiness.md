@@ -12,7 +12,7 @@ That supports a staged trial on one non-critical show, with mediamtx left
 running and a rehearsed way back. It does not yet support a full switch:
 no benchmark, profile or load test has run on Linux, behind Caddy, over a
 wired link at 250 and 750 viewers, which is the shape of the deployment, and
-three pieces of work are in progress (section 3).
+the v4v player fix for Safari drift is not merged (section 3).
 
 ## 2. Proven
 
@@ -33,14 +33,14 @@ three pieces of work are in progress (section 3).
 | Gap | What would prove it | Needs |
 |-----|---------------------|-------|
 | Linux | Every measurement is from macOS (`docs/profiling.md` Limits). Only CI (tests, smoke test and fuzzing on Ubuntu) and the container image serving a stream have run on Linux. Repeat the benchmark and a long run on the trial host's OS. | A Linux machine |
-| 250 and 750 full viewers, wired, behind Caddy | `scripts/bench-remote.sh` with Caddy and HTTP/2 in front, mediamtx back to back; confirm Caddy does not hold back blocking playlist reloads. Caddy in Docker: in progress. | A second wired Linux machine |
+| 250 and 750 full viewers, wired, behind Caddy | `scripts/bench-remote.sh` with Caddy and HTTP/2 in front, mediamtx back to back; Caddy in Docker on the Mac did not hold back blocking reloads or parts, added about 2 ms, and changed no bytes (`docs/interop.md`, Behind Caddy); `sapflow-bench` needs an HTTP/2 and TLS client first. | A second wired Linux machine |
 | Delay behind real Caddy, and against mediamtx | Larix to Safari through Caddy with mediamtx beside it. The only side-by-side was over HTTP/1.1, where sapflow sat about 4 s further back (target duration 3 against 2). | Phone, Mac, a clock |
-| Encryption under loss, and fuzzed longer | `scripts/srt-loss.sh` with a passphrase against libsrt (in progress). `own_srt_caller` was added after the 2026-10-21 nightly, so it has had 60 s CI runs only; then hours per target. | The next nightly; manual runs |
+| Encryption under loss, and fuzzed longer | `scripts/srt-loss.sh` with a passphrase and key refresh against libsrt: every packet delivered at 2000 ms, less overhead than libsrt; at 200 ms more overhead than libsrt, unencrypted too, on a heavily loaded machine, so rerun quietly (`docs/interop.md`). `own_srt_caller` was added after the 2026-10-21 nightly, so it has had 60 s CI runs only; then hours per target. | The next nightly; manual runs |
 | A show-length run | No recorded run lasts more than minutes. Publish for hours with drops, sampling memory, open descriptors and the recording. | A Linux machine |
 | Larix's first SRT attempt | Sometimes accepted but sends no data, times out after 5 s, and a later attempt works (`docs/interop.md`). Repeat cold starts with a capture at both ends. Unexplained. | The phone, a capture |
 | Other encoders | Larix with the phone locked; Larix on Android; OBS's Apple hardware encoder; vMix. | Devices; vMix access |
 | SRT handshake version 4 | No encoder tested needed it. Find one that does and test it, or document it as unsupported. | An older encoder |
-| Safari after drops | Safari ended about 10 s behind the camera after seven drops. The v4v player fix is in progress; rewatch with a measured offset once it ships. | The v4v fix |
+| Safari after drops | Safari ended about 10 s behind the camera after seven drops. The v4v player fix is on an unmerged v4v branch; rewatch with a measured offset once it ships. | The v4v fix |
 
 ## 4. Risks for a switch, and mitigations
 
@@ -101,8 +101,8 @@ deployment, so a trial is a window on the whole stage, or a second stack.
 
 1. Choose the build (section 4, unmerged work). Run `cargo test --workspace`,
    `scripts/smoke.sh` and both v4v ingest gates against it.
-2. Finish the in-progress work (Caddy in Docker, encrypted loss comparison,
-   the v4v player fix). Run the wired Linux load test if a machine is free.
+2. Merge the v4v player fix and rerun the 200 ms loss comparison on a
+   quiet machine. Run the wired Linux load test if a machine is free.
 3. Prepare a Linux trial host: sapflow on its own ports beside mediamtx, the
    open-file limit raised, recordings on the volume v4v reads, Caddy with TLS
    and HTTP/2 (never point Safari at sapflow directly: 10.8 s against 3.0 to
