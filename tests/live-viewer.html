@@ -12,6 +12,7 @@
 <main>
   <video id="video" controls autoplay playsinline></video>
   <p id="status">Connecting to the test stream…</p>
+  <button id="toggle">Pause</button>
   <button id="live">Go live</button>
   <button id="export">Save diagnostic evidence</button>
 </main>
@@ -125,6 +126,106 @@ globalThis.SapflowViewerDiagnostics = (() => {
   return {Evidence, ranges, fragment, part, stats, bytes, loaderClass};
 })();
 </script>
+<script id="recovery">
+// Recovery keeps the same Hls/source instance. It cannot repair an invalid
+// origin timeline. One timer covers retry delay or the progress watchdog.
+globalThis.SapflowViewerRecovery = class {
+  constructor({network, media, stop, onState = () => {}, now = () => performance.now(),
+    wall = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout}) {
+    Object.assign(this, {network, media, stop, onState, now, wall, setTimer, clearTimer});
+    this.attempts = {network:0, media:0}; this.limits = {network:3, media:2};
+    this.timer = null; this.pending = null; this.active = null; this.paused = false;
+    this.phase = 'connecting'; this.terminal = null; this.history = []; this.baseline = null;
+  }
+  record(action, detail = '') {
+    this.history.push({at:this.wall(), action, detail:String(detail).slice(0, 240), attempts:{...this.attempts}});
+    if (this.history.length > 64) this.history.shift();
+  }
+  notify() { this.onState(this.snapshot()); }
+  snapshot() { return {phase:this.phase, paused:this.paused, terminal:this.terminal,
+    pending:this.pending, attempts:{...this.attempts}, actions:this.history.slice()}; }
+  cancelTimer() { if (this.timer !== null) this.clearTimer(this.timer); this.timer = null; }
+  halt(reason) {
+    this.cancelTimer(); this.pending = null; this.active = null;
+    this.terminal = reason; this.phase = 'failed'; this.record('terminal', reason);
+    try { this.stop(); } catch (error) { this.record('stop-threw', error.message); }
+    this.notify();
+  }
+  end(draining = false) {
+    if (this.terminal && this.terminal !== 'event-ended') return;
+    this.cancelTimer(); this.pending = null; this.active = null;
+    this.terminal = 'event-ended'; this.phase = draining ? 'ending' : 'ended';
+    this.record(draining ? 'end-list' : 'ended');
+    if (!draining) try { this.stop(); } catch (error) { this.record('stop-threw', error.message); }
+    this.notify();
+  }
+  pause(reason = 'intentional-pause') {
+    this.paused = true; this.pending ||= this.active; this.cancelTimer();
+    if (!this.terminal) this.phase = 'paused';
+    this.record(reason); this.notify();
+  }
+  resume(reason = 'intentional-resume') {
+    this.paused = false;
+    if (this.terminal) { this.notify(); return; }
+    this.phase = this.active ? 'recovering' : 'buffering'; this.record(reason); this.notify(); this.schedule();
+  }
+  waiting() {
+    if (!this.terminal && !this.paused) { this.phase = this.active ? 'recovering' : 'waiting'; this.notify(); }
+  }
+  error(data) {
+    if (!data.fatal || this.terminal) return;
+    const code = Number(data.response?.code ?? data.networkDetails?.status);
+    if (code === 401 || code === 403) { this.halt('authorisation-failed'); return; }
+    const reason = String(data.reason || data.error?.message || '');
+    if (data.details === 'levelParsingError' && /media sequence mismatch/i.test(reason)) {
+      this.halt('origin-media-sequence-mismatch'); return;
+    }
+    const kind = data.type === 'networkError' ? 'network' : data.type === 'mediaError' ? 'media' : null;
+    if (!kind) { this.halt('unrecoverable-' + String(data.details || data.type)); return; }
+    this.record('fatal-' + kind, data.details);
+    this.pending = kind;
+    if (this.paused) { this.phase = 'paused'; this.notify(); return; }
+    this.schedule();
+  }
+  schedule() {
+    if (this.terminal || this.paused || !this.pending || this.timer !== null) return;
+    const kind = this.pending;
+    if (this.attempts[kind] >= this.limits[kind]) { this.halt(kind + '-recovery-exhausted'); return; }
+    const delay = [500, 1000, 2000][this.attempts[kind]];
+    this.phase = 'recovering'; this.record('schedule-' + kind, delay + 'ms'); this.notify();
+    this.timer = this.setTimer(() => {
+      this.timer = null;
+      if (this.terminal || this.paused) return;
+      const next = this.pending; this.pending = null;
+      if (!next) return;
+      if (this.attempts[next] >= this.limits[next]) { this.halt(next + '-recovery-exhausted'); return; }
+      this.attempts[next]++; this.active = next;
+      this.record(next === 'network' ? 'start-load' : 'recover-media'); this.notify();
+      // No progress/error callback must leave an unbounded hanging attempt.
+      this.timer = this.setTimer(() => {
+        this.timer = null;
+        if (this.terminal || this.paused) return;
+        this.record('progress-timeout', next); this.pending ||= next; this.schedule();
+      }, 4000);
+      try { (next === 'network' ? this.network : this.media)(); }
+      catch (error) { this.record('recovery-threw', error.message); this.pending = next; }
+    }, delay);
+  }
+  progress({time, frames, ready, paused}) {
+    if (this.terminal || this.paused || paused || ready < 3 || !Number.isFinite(time)) return;
+    if (!this.baseline) { this.baseline = {time, frames}; return; }
+    // A playing event alone is not evidence. Require advancing media time,
+    // and advancing decoded-video count whenever that counter is available.
+    if (time < this.baseline.time) { this.baseline = {time, frames}; return; }
+    const advancedFrames = !Number.isFinite(frames) || !Number.isFinite(this.baseline.frames) || frames > this.baseline.frames;
+    if (time - this.baseline.time < 0.25 || !advancedFrames) return;
+    this.baseline = {time, frames};
+    if (this.phase !== 'playing' || this.attempts.network || this.attempts.media) this.record('actual-progress');
+    this.cancelTimer(); this.pending = null; this.active = null;
+    this.attempts = {network:0, media:0}; this.phase = 'playing'; this.notify();
+  }
+};
+</script>
 <script src="/hls.js"></script>
 <script>
 const video = document.querySelector('video'), status = document.querySelector('#status');
@@ -141,6 +242,7 @@ for (const type of ['playing', 'waiting', 'stalled', 'seeking', 'seeked', 'ended
     if (playbackEvents.length > 128) playbackEvents.shift();
   });
 }
+let restoringMedia = false, restorePlayback = false, pauseGestureDuringReset = false;
 window.hls = new Hls({lowLatencyMode:true, liveSyncDuration:1, liveMaxLatencyDuration:3,
   maxLiveSyncPlaybackRate:1.1, maxBufferLength:4, backBufferLength:10, preferManagedMediaSource:false,
   fLoader:SapflowViewerDiagnostics.loaderClass(Hls.DefaultConfig.loader, evidence)});
@@ -151,28 +253,86 @@ window.metrics = () => {
   rate:video.playbackRate, buffered:SapflowViewerDiagnostics.ranges(video.buffered),
   quality:quality ? {totalVideoFrames:quality.totalVideoFrames, droppedVideoFrames:quality.droppedVideoFrames,
     corruptedVideoFrames:quality.corruptedVideoFrames} : null,
-  playbackEvents, failures:evidence.failures};
+  playbackEvents, failures:evidence.failures, recovery:recovery.snapshot()};
 };
-hls.on(Hls.Events.LEVEL_LOADED, (_, data) => evidence.playlist(data));
+function renderStatus() {
+  const state = recovery.snapshot();
+  document.querySelector('#toggle').textContent = state.paused ? 'Play' : 'Pause';
+  document.querySelector('#toggle').disabled = Boolean(state.terminal && state.terminal !== 'event-ended');
+  document.querySelector('#live').disabled = Boolean(state.terminal);
+  if (state.phase === 'failed') status.textContent = 'Playback stopped: ' + state.terminal;
+  else if (state.terminal === 'event-ended') status.textContent = state.phase === 'ended' ? 'Broadcast ended' : 'Broadcast ended · buffered media may finish';
+  else if (state.paused || video.paused && state.phase === 'paused') status.textContent = 'Paused · Press Play to resume';
+  else if (state.phase === 'recovering') status.textContent = 'Recovering · network ' + state.attempts.network + '/3 · media ' + state.attempts.media + '/2';
+  else if (state.phase === 'playing' && video.readyState >= 3 && !video.paused) {
+    status.textContent = Number.isFinite(hls.latency) ? 'Playing · ' + hls.latency.toFixed(2) + ' s from the estimated origin edge' : 'Playing · edge estimate unavailable';
+  } else status.textContent = state.phase === 'connecting' ? 'Connecting to the test stream…' : 'Waiting for advancing media';
+}
+window.recovery = new SapflowViewerRecovery({
+  network:() => hls.startLoad(),
+  media:() => {
+    restorePlayback = !recovery.paused;
+    restoringMedia = true; pauseGestureDuringReset = false;
+    hls.recoverMediaError();
+  },
+  stop:() => { restoringMedia = false; restorePlayback = false; hls.stopLoad(); },
+  onState:renderStatus,
+});
+function playIntentionally(reason = 'intentional-resume') {
+  if (recovery.terminal && recovery.terminal !== 'event-ended') { renderStatus(); return; }
+  recovery.resume(reason); video.autoplay = true;
+  video.play().catch(error => {
+    if (!recovery.terminal) {
+      recovery.record('play-rejected', error.name); recovery.pause('play-rejected-pause'); video.autoplay = false;
+    }
+  });
+}
+for (const type of ['pointerdown', 'keydown']) video.addEventListener(type, () => { if (restoringMedia) pauseGestureDuringReset = true; });
+video.addEventListener('pause', () => {
+  if (!video.paused) return; // Ignore an older queued pause after playback resumed.
+  // A recoverMediaError detach can emit pause. Explicit controls remain
+  // authoritative even while media is detached; ordinary native-control pause
+  // is preserved, including a control gesture during that short reset window.
+  if (!restoringMedia || pauseGestureDuringReset) {
+    pauseGestureDuringReset = false; restorePlayback = false; video.autoplay = false; recovery.pause('media-pause-event');
+  }
+});
+video.addEventListener('play', () => { if (!recovery.terminal || recovery.terminal === 'event-ended') { recovery.resume('media-play-event'); video.autoplay = true; } });
+for (const type of ['waiting', 'stalled']) video.addEventListener(type, () => recovery.waiting());
+video.addEventListener('ended', () => recovery.end());
+video.addEventListener('timeupdate', () => recovery.progress({time:video.currentTime,
+  frames:video.getVideoPlaybackQuality?.().totalVideoFrames, ready:video.readyState, paused:video.paused}));
+hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+  if (!restoringMedia) return;
+  restoringMedia = false;
+  if (restorePlayback && !recovery.paused && !recovery.terminal) playIntentionally('restore-after-media-recovery');
+});
+hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
+  evidence.playlist(data);
+  if (data.details?.live === false) recovery.end(true);
+});
 hls.on(Hls.Events.ERROR, (_, data) => {
   const item = evidence.error(data, video);
   console.warn('Sapflow playback evidence', item);
-  if (data.fatal) status.textContent = 'Playback interrupted: ' + data.details;
+  recovery.error(data);
 });
+hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!recovery.paused) playIntentionally('autoplay-request'); });
 hls.loadSource('/live/' + event + '/index.m3u8');
 hls.attachMedia(video);
-hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {status.textContent = 'Press Play to watch live';}));
+document.querySelector('#toggle').onclick = () => {
+  if (!recovery.paused) { recovery.pause(); video.autoplay = false; video.pause(); }
+  else playIntentionally();
+};
 document.querySelector('#live').onclick = () => {
+  if (recovery.terminal) { renderStatus(); return; }
   if (Number.isFinite(hls.liveSyncPosition)) video.currentTime = hls.liveSyncPosition;
-  video.play();
+  playIntentionally();
 };
 document.querySelector('#export').onclick = () => {
   const url = URL.createObjectURL(new Blob([JSON.stringify(evidence.packet(metrics()))], {type:'application/json'}));
   const link = document.createElement('a'); link.href = url; link.download = event + '-viewer-evidence.json'; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
-setInterval(() => {
-  if (!video.paused) status.textContent = 'Test stream · ' + hls.latency.toFixed(2) + ' s from the estimated origin edge';
-}, 1000);
+setInterval(renderStatus, 1000);
 </script>
 </html>

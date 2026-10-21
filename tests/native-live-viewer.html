@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sapflow native HLS qualification</title>
+<style>
+  body { margin:0; background:#101014; color:#eee; font:16px system-ui }
+  main { max-width:1200px; margin:auto; padding:20px }
+  video { width:100%; max-height:80vh; background:#000; object-fit:contain }
+  button { font:inherit; padding:10px } p { color:#ccc }
+</style>
+<main>
+  <video id="video" controls autoplay playsinline></video>
+  <p id="status">Connecting through native HLS…</p>
+  <button id="play">Play</button>
+  <button id="export">Save diagnostic evidence</button>
+  <p>This fixture assigns one native video source. Rotate the broadcaster without reloading this page.
+    Buffered time is not capture-to-screen latency.</p>
+</main>
+<script id="observation">
+globalThis.SapflowNativeHls = (() => {
+  const finite = value => Number.isFinite(value) ? value : null;
+  function sourceFor(event) {
+    if (typeof event !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(event)) {
+      throw new Error('Use a single event identifier containing letters, digits, underscores or hyphens');
+    }
+    return `/live/${event}/index.m3u8`;
+  }
+  function ranges(value) {
+    const result = [];
+    for (let i = 0; i < Math.min(value?.length || 0, 64); i++) {
+      result.push([finite(value.start(i)), finite(value.end(i))]);
+    }
+    return result;
+  }
+  function frames(video) {
+    const quality = video.getVideoPlaybackQuality?.();
+    return finite(quality?.totalVideoFrames ?? video.webkitDecodedFrameCount);
+  }
+  class Observation {
+    constructor(video, event, {now = () => performance.now(), wall = () => new Date().toISOString(),
+      instanceId = 'unlabelled'} = {}) {
+      const source = sourceFor(event);
+      if (!video.canPlayType('application/vnd.apple.mpegurl')) throw new Error('Native HLS is unavailable');
+      this.video = video; this.source = source; this.now = now; this.wall = wall;
+      this.instanceId = instanceId; this.events = []; this.handlers = new Map(); this.disposed = false;
+      this.startedAt = now(); this.lastProgressAt = null;
+      this.previousTime = finite(video.currentTime); this.previousFrames = frames(video);
+      for (const type of ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'waiting',
+        'stalled', 'pause', 'ended', 'error', 'resize', 'seeking', 'seeked', 'emptied']) {
+        const handler = () => this.record(type);
+        this.handlers.set(type, handler); video.addEventListener(type, handler);
+      }
+      // Deliberately no load(), source replacement or recovery player. Origin
+      // continuity must be accepted by the browser's existing native instance.
+      video.src = source;
+      this.sourceAssignments = 1;
+      this.record('source-assigned');
+    }
+    record(type) {
+      this.events.push({utc:this.wall(), elapsedMs:this.now() - this.startedAt, type,
+        currentTime:finite(this.video.currentTime), width:this.video.videoWidth, height:this.video.videoHeight,
+        readyState:this.video.readyState, errorCode:this.video.error?.code ?? null});
+      if (this.events.length > 128) this.events.shift();
+    }
+    sample() {
+      const video = this.video, now = this.now(), time = finite(video.currentTime), decoded = frames(video);
+      const frameProgress = decoded === null || this.previousFrames === null || decoded > this.previousFrames;
+      if (!video.paused && !video.ended && !video.error && video.readyState >= 2 && video.videoWidth > 0 &&
+          time !== null && this.previousTime !== null && time > this.previousTime + 0.01 && frameProgress) {
+        this.lastProgressAt = now;
+      }
+      this.previousTime = time; this.previousFrames = decoded;
+      let state;
+      if (video.error) state = 'error';
+      else if (video.ended) state = 'ended';
+      else if (video.paused) state = 'paused';
+      else if (this.lastProgressAt !== null && now - this.lastProgressAt < 4000 && video.readyState >= 2) state = 'playing';
+      else if (now - (this.lastProgressAt ?? this.startedAt) >= 4000) state = 'stalled';
+      else state = 'waiting';
+      const buffered = ranges(video.buffered), seekable = ranges(video.seekable);
+      const covering = buffered.find(([start, end]) => time !== null && start <= time && time <= end);
+      return {utc:this.wall(), playerKind:'native-hls', instanceId:this.instanceId, source:this.source,
+        sourceAssignments:this.sourceAssignments, state, currentTime:time, decodedFrames:decoded,
+        width:video.videoWidth, height:video.videoHeight, readyState:video.readyState,
+        networkState:video.networkState, paused:video.paused, ended:video.ended,
+        errorCode:video.error?.code ?? null, buffered, seekable,
+        bufferedAheadSeconds:covering ? covering[1] - time : null,
+        lastProgressElapsedMs:this.lastProgressAt === null ? null : this.lastProgressAt - this.startedAt,
+        events:this.events.map(event => ({...event}))};
+    }
+    dispose() {
+      if (this.disposed) return;
+      this.disposed = true;
+      for (const [type, handler] of this.handlers) this.video.removeEventListener(type, handler);
+      this.handlers.clear();
+    }
+  }
+  return {sourceFor, Observation};
+})();
+</script>
+<script>
+(() => {
+  const video = document.getElementById('video'), status = document.getElementById('status');
+  let observation, timer;
+  try {
+    const params = new URLSearchParams(location.search);
+    if (params.getAll('event').length !== 1) throw new Error('Supply exactly one event identifier');
+    observation = new SapflowNativeHls.Observation(video, params.get('event'), {instanceId:crypto.randomUUID()});
+    globalThis.sapflowNativeMetrics = () => observation.sample();
+    const update = () => {
+      const metrics = observation.sample();
+      status.textContent = `Native HLS: ${metrics.state} · ${metrics.width}×${metrics.height} · ` +
+        `${(metrics.currentTime ?? 0).toFixed(2)} s · source assigned ${metrics.sourceAssignments} time`;
+    };
+    timer = setInterval(update, 1000); update();
+    document.getElementById('play').onclick = async () => {
+      try { await video.play(); }
+      catch (_) { observation.record('play-rejected'); }
+      update();
+    };
+    document.getElementById('export').onclick = () => {
+      const url = URL.createObjectURL(new Blob([JSON.stringify(observation.sample(), null, 2)], {type:'application/json'}));
+      const link = document.createElement('a'); link.href = url; link.download = 'sapflow-native-hls.local.json';
+      link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+    window.addEventListener('pagehide', () => { clearInterval(timer); observation.dispose(); }, {once:true});
+  } catch (error) {
+    clearInterval(timer); observation?.dispose(); status.textContent = error.message;
+  }
+})();
+</script>
+</html>
