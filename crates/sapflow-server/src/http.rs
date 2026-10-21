@@ -200,7 +200,8 @@ async fn chunk(
     let Some(stream) = stream_for(&app, &event) else {
         return not_found();
     };
-    let Some(chunk) = playlist::parse_chunk(&stream.prefix, &file) else {
+    let prefix = stream.lock().prefix.clone();
+    let Some(chunk) = playlist::parse_chunk(&prefix, &file) else {
         return not_found();
     };
     const CACHE: &str = "public, max-age=3600";
@@ -209,7 +210,8 @@ async fn chunk(
     loop {
         {
             let st = stream.lock();
-            if st.closed {
+            // A restart (a reconnect with new settings) renames every chunk.
+            if st.closed || st.prefix != prefix {
                 return not_found();
             }
             let Some(m) = st.ingest.muxer() else {

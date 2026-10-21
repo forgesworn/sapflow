@@ -53,6 +53,7 @@ SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret \
 SAPFLOW_CALLBACK_URL="http://127.0.0.1:$CB_PORT/api/public/live-events/{eventId}/stream-health" \
 SAPFLOW_CALLBACK_SECRET=tok SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:$SRT_PORT \
 SAPFLOW_RTMP_ADDR=127.0.0.1:$RTMP_PORT SAPFLOW_RECORDINGS="$WORK/rec" SAPFLOW_RECORD_SKIP='live/event-norec' \
+SAPFLOW_RECONNECT_GRACE=4 SAPFLOW_HEALTH_INTERVAL=2 \
 SAPFLOW_SRT_IMPL=$SRT_IMPL ./target/debug/sapflow > "$WORK/sapflow.log" 2>&1 & pids+=($!)
 sleep 1
 grep 'SRT listening' "$WORK/sapflow.log" | grep -q "implementation=\"$SRT_IMPL\"" || fail "SRT is not served by $SRT_IMPL"
@@ -115,7 +116,12 @@ for _ in $(seq 1 60); do grep -q '"event":"unpublish"' "$WORK/cb.log" && break; 
 grep -q '"event":"unpublish","path":"live/event-smoke"' "$WORK/cb.log" || fail "no unpublish callback"
 echo "ok   unpublish callback"
 
-for _ in $(seq 1 20); do grep -q recordSegmentComplete "$WORK/cb.log" && break; sleep 0.5; done
+grep -q '"event":"health","path":"live/event-smoke","health":{"bitrateKbps":[1-9]' "$WORK/cb.log" || fail "no health callback"
+grep -q '"keyframeIntervalMs":1000,"audio":true' "$WORK/cb.log" || fail "health: keyframe interval or audio"
+echo "ok   health callback (bitrate, keyframe interval, audio)"
+
+# The recording finishes when the reconnect grace (4 s here) is over.
+for _ in $(seq 1 30); do grep -q recordSegmentComplete "$WORK/cb.log" && break; sleep 0.5; done
 rec=$(grep -o '"segmentPath":"[^"]*"' "$WORK/cb.log" | head -1 | cut -d'"' -f4)
 case "$rec" in "$WORK/rec/live/$EVENT/"[0-9]*.mp4) ;; *) fail "recordSegmentComplete path: $rec" ;; esac
 grep -q '"segmentDuration":"[0-9.]*"' "$WORK/cb.log" || fail "no segmentDuration"
@@ -139,4 +145,28 @@ for _ in $(seq 1 40); do grep -q '"unpublish","path":"live/event-norec"' "$WORK/
 grep -q '"unpublish","path":"live/event-norec"' "$WORK/cb.log" || fail "no RTMP unpublish"
 [ ! -e "$WORK/rec/live/event-norec" ] || fail "skipped path was recorded"
 echo "ok   RTMP publish, refusals, callbacks; skipped path not recorded"
+
+# An encoder that drops and comes back within the grace period carries on
+# the same playlist (same chunk names, after a discontinuity) and the same
+# recording; v4v still hears unpublish and publish.
+R=event-resume
+publish "publish:live/$R:pub:secret" 8 > /dev/null 2>&1
+for _ in $(seq 1 20); do grep -q "\"unpublish\",\"path\":\"live/$R\"" "$WORK/cb.log" && break; sleep 0.25; done
+grep -q "\"unpublish\",\"path\":\"live/$R\"" "$WORK/cb.log" || fail "no unpublish at the drop"
+curl -sf "http://$HTTP/live/$R/stream.m3u8" -o "$WORK/held.m3u8" || fail "held stream not served"
+init=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/held.m3u8")
+python3 -I scripts/check-playlist.py "http://$HTTP/live/$R/stream.m3u8" 12 > "$WORK/resume-check.log" 2>&1 & check=$!
+publish "publish:live/$R:pub:secret" 8 > /dev/null 2>&1
+curl -sf "http://$HTTP/live/$R/stream.m3u8" -o "$WORK/resumed.m3u8" || fail "resumed stream not served"
+grep -q "$init" "$WORK/resumed.m3u8" || fail "reconnect did not keep the chunk names"
+grep -q '^#EXT-X-DISCONTINUITY$' "$WORK/resumed.m3u8" || fail "no discontinuity at the reconnect"
+wait $check || { cat "$WORK/resume-check.log" >&2; fail "playlist rules broken across the reconnect"; }
+[ "$(grep -c "\"publish\",\"path\":\"live/$R\"" "$WORK/cb.log")" = 2 ] || fail "expected two publish callbacks"
+for _ in $(seq 1 30); do grep -q "recordSegmentComplete\",\"path\":\"live/$R\"" "$WORK/cb.log" && break; sleep 0.5; done
+[ "$(grep -c "recordSegmentComplete\",\"path\":\"live/$R\"" "$WORK/cb.log")" = 1 ] || fail "expected one recording across the reconnect"
+rec=$(grep "live/$R" "$WORK/cb.log" | grep -o '"segmentPath":"[^"]*"' | cut -d'"' -f4)
+secs=$(grep "live/$R" "$WORK/cb.log" | grep -o '"segmentDuration":"[0-9.]*"' | cut -d'"' -f4)
+awk "BEGIN { exit !($secs > 12) }" || fail "recording too short across the reconnect ($secs s)"
+ffmpeg -hide_banner -v error -xerror -i "$rec" -f null - || fail "resumed recording does not decode"
+echo "ok   reconnect within grace: same playlist, discontinuity, one recording (${secs}s)"
 echo "PASS"

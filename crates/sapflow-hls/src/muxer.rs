@@ -118,11 +118,21 @@ impl Entry {
 pub struct Update {
     pub part: bool,
     pub segment: bool,
+    /// A reconnected encoder's settings differed from the stream it took
+    /// over, so a new muxer started (new init segment, numbering from the
+    /// start): chunk names must change.
+    pub restarted: bool,
 }
 
 impl Update {
     pub fn any(self) -> bool {
-        self.part || self.segment
+        self.part || self.segment || self.restarted
+    }
+
+    pub fn merge(&mut self, other: Update) {
+        self.part |= other.part;
+        self.segment |= other.segment;
+        self.restarted |= other.restarted;
     }
 }
 
@@ -239,6 +249,8 @@ pub struct Muxer {
     discontinuity_next: bool,
     /// Discontinuities that have left the window.
     discontinuity_sequence: u64,
+    /// Breaks since the stream started (stalls, jumps, reconnects).
+    breaks: u64,
 }
 
 impl Muxer {
@@ -268,6 +280,7 @@ impl Muxer {
             audio_floor: 0,
             discontinuity_next: false,
             discontinuity_sequence: 0,
+            breaks: 0,
         }
     }
 
@@ -412,6 +425,50 @@ impl Muxer {
             keyframe = next.sync,
             "media broke off (stall, late keyframe or jump in time); new segment from the next keyframe, marked as a discontinuity"
         );
+        let closed = self.close_run(end, now);
+        if next.sync {
+            let mut next = next;
+            self.rebase(next.dts, end);
+            next.dts = end;
+            self.pending_video = Some(next);
+        } else {
+            self.rebase_to = Some(end);
+        }
+        Update {
+            part: closed,
+            segment: closed,
+            ..Update::default()
+        }
+    }
+
+    /// The encoder went away; another connection may carry on the stream.
+    /// Ends the current run as a break does, at the last frame (which is
+    /// dropped, its duration unknown): whatever video arrives next, from
+    /// any clock, waits for a keyframe, is moved to carry straight on in
+    /// output time, and opens a segment marked as a discontinuity.
+    pub fn interrupt(&mut self, now: SystemTime) -> Update {
+        let Some(cur) = self.pending_video.take() else {
+            return Update::default();
+        };
+        if self.timing.is_none() {
+            self.learning.clear();
+            self.next_segment = None;
+            self.part = None;
+            return Update::default();
+        }
+        let closed = self.close_run(cur.dts, now);
+        self.rebase_to = Some(cur.dts);
+        Update {
+            part: closed,
+            segment: closed,
+            ..Update::default()
+        }
+    }
+
+    /// Closes the open part and segment at `end`, drops the held frame,
+    /// and marks the next segment as a discontinuity. Returns whether a
+    /// segment was closed.
+    fn close_run(&mut self, end: i64, now: SystemTime) -> bool {
         if self.part.as_ref().is_some_and(|p| !p.video.is_empty()) {
             self.rotate_part(end, end);
         }
@@ -426,20 +483,10 @@ impl Muxer {
         } else {
             self.next_segment = None;
         }
+        self.pending_video = None;
         self.discontinuity_next = true;
-        if next.sync {
-            let mut next = next;
-            self.rebase(next.dts, end);
-            next.dts = end;
-            self.pending_video = Some(next);
-        } else {
-            self.pending_video = None;
-            self.rebase_to = Some(end);
-        }
-        Update {
-            part: closed,
-            segment: closed,
-        }
+        self.breaks += 1;
+        closed
     }
 
     /// Moves output time so that input now at output `from` lands at `to`.
@@ -817,6 +864,36 @@ impl Muxer {
             0
         };
         (peak.max(1), avg.max(1))
+    }
+
+    /// Breaks in the media since the stream started.
+    pub fn breaks(&self) -> u64 {
+        self.breaks
+    }
+
+    /// Over the newest `n` segments: the average bitrate (bits per second)
+    /// and the median segment length, which is the encoder's keyframe
+    /// interval when that is at least the segment target. `None` before the
+    /// first segment.
+    pub fn recent(&self, n: usize) -> Option<(u64, Duration)> {
+        let segs: Vec<&Segment> = self
+            .entries
+            .iter()
+            .rev()
+            .filter_map(|e| match e {
+                Entry::Segment(s) if !s.duration.is_zero() => Some(s.as_ref()),
+                _ => None,
+            })
+            .take(n.max(1))
+            .collect();
+        if segs.is_empty() {
+            return None;
+        }
+        let bytes: u64 = segs.iter().map(|s| s.data.len() as u64).sum();
+        let secs: f64 = segs.iter().map(|s| s.duration.as_secs_f64()).sum();
+        let mut lens: Vec<Duration> = segs.iter().map(|s| s.duration).collect();
+        lens.sort();
+        Some(((bytes as f64 * 8.0 / secs) as u64, lens[lens.len() / 2]))
     }
 }
 
@@ -1229,6 +1306,47 @@ pub(crate) mod tests {
         // Media after the jump still made segments.
         let parts = all_parts(&m);
         assert!(parts.len() > 400, "{} parts", parts.len());
+    }
+
+    /// The encoder drops and comes back on a new connection: its clock
+    /// restarts from zero, or carries on where it was. Either way the
+    /// stream resumes at the next keyframe after one discontinuity, and the
+    /// playlist rules hold throughout.
+    #[test]
+    fn an_interrupted_stream_resumes_from_any_clock() {
+        let cfg = MuxerConfig {
+            segment_count: 1000,
+            ..MuxerConfig::default()
+        };
+        let frames = larix_frames(1200);
+        for resumed in [&frames[..600], &frames[600..]] {
+            let mut m = Muxer::new(cfg, video(), Some(aac()));
+            feed_checked(&mut m, &frames[..600]);
+            let before = m.next_part_id();
+            m.interrupt(SystemTime::UNIX_EPOCH);
+            assert!(m.next_part_id() > before, "the open part was closed");
+            // Nothing more until the new encoder's first keyframe.
+            assert!(m.interrupt(SystemTime::UNIX_EPOCH) == Update::default());
+            feed_checked(&mut m, resumed);
+            assert_eq!(assert_clean_timeline(&m), 1);
+            let after: usize = all_parts(&m).iter().skip_while(|(brk, _)| !brk).count();
+            assert!(after > 80, "{after} parts after the resume");
+        }
+    }
+
+    /// The health report's measures: keyframe interval from segment
+    /// lengths, bitrate from their bytes.
+    #[test]
+    fn recent_measures_follow_the_keyframe_interval() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        assert_eq!(m.recent(6), None);
+        feed(&mut m, 0..600, 60);
+        let (bps, len) = m.recent(6).expect("segments");
+        assert_eq!(len, Duration::from_secs(2));
+        assert!(bps > 0);
+        assert_eq!(m.breaks(), 0);
+        m.interrupt(SystemTime::UNIX_EPOCH);
+        assert_eq!(m.breaks(), 1);
     }
 
     /// A drop before the first segment is complete: nothing was served, so

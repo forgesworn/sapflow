@@ -38,6 +38,12 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_MAX_PUBLISHERS   simultaneous publishers per protocol (default 16)
   SAPFLOW_MAX_PUBLISH_MBPS drop a publisher above this bitrate, averaged over
                            5 s (default 40)
+  SAPFLOW_RECONNECT_GRACE  seconds a stream is held after its encoder drops,
+                           so a reconnect carries on the same playlist and
+                           recording (default 90, as v4v's hold; 0 disables)
+  SAPFLOW_HEALTH_INTERVAL  seconds between health callbacks while a stream is
+                           live: bitrate, keyframe interval, audio (default 30;
+                           0 disables)
   RUST_LOG                 log filter (default info)
 
 Publish with SRT, streamid=publish:live/<eventId>:<user>:<pass>, or RTMP,
@@ -63,6 +69,8 @@ const KEYS: &[&str] = &[
     "SAPFLOW_MAX_PUBLISH_MBPS",
     "SAPFLOW_RECORD_MIN_FREE_GB",
     "SAPFLOW_SRT_IMPL",
+    "SAPFLOW_RECONNECT_GRACE",
+    "SAPFLOW_HEALTH_INTERVAL",
 ];
 
 /// Which SRT implementation serves the SRT port.
@@ -93,6 +101,10 @@ pub struct Config {
     pub max_publish_bps: u64,
     /// Bytes of free disk below which recording does not start or stops.
     pub record_min_free: u64,
+    /// How long a dropped publisher's stream is held for a reconnect.
+    pub reconnect_grace: Duration,
+    /// Between health callbacks; zero: none.
+    pub health_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -224,6 +236,18 @@ impl Config {
                 })?,
         };
 
+        let secs = |key: &str, default: u64| match vals.get(key) {
+            None => Ok(Duration::from_secs(default)),
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n <= 3600)
+                .map(Duration::from_secs)
+                .ok_or_else(|| ConfigError::Invalid(format!("{key}: seconds, 0 to 3600"))),
+        };
+        let reconnect_grace = secs("SAPFLOW_RECONNECT_GRACE", 90)?;
+        let health_interval = secs("SAPFLOW_HEALTH_INTERVAL", 30)?;
+
         let srt_impl = match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
             None | Some("srt-rs") => SrtImpl::SrtRs,
             Some("own") => SrtImpl::Own,
@@ -235,6 +259,8 @@ impl Config {
         };
 
         Ok(Self {
+            reconnect_grace,
+            health_interval,
             srt_impl,
             record_min_free,
             max_publish_bps,
@@ -281,6 +307,26 @@ mod tests {
         assert_eq!(c.http_addr.port(), 8888);
         assert!(c.publisher.is_some());
         assert_eq!(c.segment_count, 24);
+        assert_eq!(c.reconnect_grace, Duration::from_secs(90));
+        assert_eq!(c.health_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn grace_and_health_interval() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let c = load(
+            &[open, ("SAPFLOW_RECONNECT_GRACE", "0")],
+            &["--health-interval", "10"],
+        )
+        .expect("config");
+        assert_eq!(c.reconnect_grace, Duration::ZERO);
+        assert_eq!(c.health_interval, Duration::from_secs(10));
+        for bad in ["-1", "1.5", "3601", "soon"] {
+            assert!(matches!(
+                load(&[open, ("SAPFLOW_RECONNECT_GRACE", bad)], &[]),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
     }
 
     #[test]

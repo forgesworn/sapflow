@@ -35,8 +35,28 @@ impl FlvIngest {
         }
     }
 
+    /// Carries on another connection's stream ([`EsIngest::resume`]).
+    pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
+        let mut es = EsIngest::resume(cfg, muxer);
+        es.set_expect_audio(false);
+        Self {
+            es,
+            nal_length_size: 4,
+            last_ms: None,
+            base: 0,
+        }
+    }
+
     pub fn muxer(&self) -> Option<&Muxer> {
         self.es.muxer()
+    }
+
+    pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
+        self.es.muxer_mut()
+    }
+
+    pub fn take_muxer(&mut self) -> Option<Muxer> {
+        self.es.take_muxer()
     }
 
     /// From RTMP's `onMetaData`: whether to hold the first keyframe until
@@ -190,6 +210,50 @@ mod tests {
         assert_eq!(m.audio().map(|a| a.sample_rate), Some(48000));
         let seg = m.segment(LEADING_GAPS).expect("segment");
         assert_eq!(seg.duration.as_millis(), 1000);
+    }
+
+    fn feed(ing: &mut FlvIngest, tags: &[(bool, u32, Vec<u8>)]) -> Update {
+        let mut up = Update::default();
+        for (video, ms, tag) in tags {
+            if *video {
+                up.merge(ing.video(*ms, tag, SystemTime::UNIX_EPOCH).expect("video"));
+            } else {
+                ing.audio(*ms, tag);
+            }
+        }
+        up
+    }
+
+    /// A reconnecting encoder with the same settings carries on the stream
+    /// it left; one with different settings (here, no audio) starts afresh.
+    #[test]
+    fn a_reconnect_resumes_or_restarts() {
+        let tags = flv_from_fixture();
+        let mut first = FlvIngest::new(MuxerConfig::default());
+        feed(&mut first, &tags);
+        let mut held = first.take_muxer().expect("muxer");
+        held.interrupt(SystemTime::UNIX_EPOCH);
+        let segments = held.next_part_id();
+
+        let mut same = FlvIngest::resume(MuxerConfig::default(), held);
+        let up = feed(&mut same, &tags);
+        assert!(!up.restarted);
+        let m = same.muxer().expect("muxer");
+        assert!(m.next_part_id() > segments + 10, "media carried on");
+        assert!(m.entries().iter().any(|e| matches!(
+            e,
+            crate::muxer::Entry::Segment(s) if s.discontinuity
+        )));
+
+        let mut held = same.take_muxer().expect("muxer");
+        held.interrupt(SystemTime::UNIX_EPOCH);
+        let video_only: Vec<_> = tags.iter().filter(|t| t.0).cloned().collect();
+        let mut other = FlvIngest::resume(MuxerConfig::default(), held);
+        let up = feed(&mut other, &video_only);
+        assert!(up.restarted);
+        let m = other.muxer().expect("muxer");
+        assert!(m.audio().is_none());
+        assert!(m.has_content());
     }
 
     #[test]

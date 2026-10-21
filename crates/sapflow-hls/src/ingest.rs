@@ -157,6 +157,8 @@ pub struct EsIngest {
     /// Whether to hold the first keyframe until the audio config is known.
     expect_audio: bool,
     muxer: Option<Muxer>,
+    /// A taken-over muxer was dropped for a new one not yet made.
+    restarting: bool,
 }
 
 impl EsIngest {
@@ -169,11 +171,32 @@ impl EsIngest {
             aac: None,
             expect_audio: true,
             muxer: None,
+            restarting: false,
+        }
+    }
+
+    /// Carries on another connection's stream (see [`Muxer::interrupt`]).
+    /// The first keyframe decides: with the same parameter sets and audio
+    /// config, its media continues the stream after a discontinuity;
+    /// otherwise a new muxer starts and the update says `restarted`.
+    pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
+        Self {
+            muxer: Some(muxer),
+            ..Self::new(cfg)
         }
     }
 
     pub fn muxer(&self) -> Option<&Muxer> {
         self.muxer.as_ref()
+    }
+
+    pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
+        self.muxer.as_mut()
+    }
+
+    pub fn take_muxer(&mut self) -> Option<Muxer> {
+        self.origin = None;
+        self.muxer.take()
     }
 
     pub fn set_expect_audio(&mut self, expect: bool) {
@@ -184,6 +207,7 @@ impl EsIngest {
     pub fn parameter_sets(&mut self, sps: Option<Vec<u8>>, pps: Option<Vec<u8>>) {
         if let Some(sps) = sps {
             if let Some(m) = &self.muxer
+                && self.origin.is_some()
                 && m.video().sps != sps
                 && self.sps.as_ref() != Some(&sps)
             {
@@ -221,7 +245,8 @@ impl EsIngest {
         if au.data.is_empty() {
             return Ok(Update::default());
         }
-        if self.muxer.is_none() {
+        let mut restarted = false;
+        if self.origin.is_none() {
             if !au.idr {
                 return Ok(Update::default());
             }
@@ -232,18 +257,32 @@ impl EsIngest {
                 return Ok(Update::default());
             };
             // If audio is expected, wait for its config before the init
-            // segment is fixed; the next keyframe will do.
+            // segment is fixed (or compared); the next keyframe will do.
             if self.expect_audio && self.aac.is_none() {
                 return Ok(Update::default());
             }
             let audio = if self.expect_audio { self.aac } else { None };
-            self.muxer = Some(Muxer::new(self.cfg, video, audio));
+            if let Some(m) = &self.muxer
+                && (m.video().sps != video.sps
+                    || m.video().pps != video.pps
+                    || m.audio().copied() != audio)
+            {
+                tracing::warn!(
+                    "reconnected encoder's settings differ from the stream it resumes; starting the stream afresh"
+                );
+                self.muxer = None;
+                self.restarting = true;
+            }
+            if self.muxer.is_none() {
+                self.muxer = Some(Muxer::new(self.cfg, video, audio));
+                restarted = std::mem::take(&mut self.restarting);
+            }
             self.origin = Some(dts);
         }
         let (Some(muxer), Some(origin)) = (self.muxer.as_mut(), self.origin) else {
             return Ok(Update::default());
         };
-        muxer
+        let mut update = muxer
             .push_video(
                 dts - origin,
                 pts - origin,
@@ -253,7 +292,9 @@ impl EsIngest {
             )
             .map_err(|e| match e {
                 MuxError::SegmentTooLarge => IngestError::SegmentTooLarge,
-            })
+            })?;
+        update.restarted |= restarted;
+        Ok(update)
     }
 
     /// One raw AAC frame.
@@ -279,6 +320,21 @@ pub struct TsIngest {
 }
 
 impl TsIngest {
+    /// Carries on another connection's stream ([`EsIngest::resume`]).
+    pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
+        let mut ts = Self::new(cfg);
+        ts.es = EsIngest::resume(cfg, muxer);
+        ts
+    }
+
+    pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
+        self.es.muxer_mut()
+    }
+
+    pub fn take_muxer(&mut self) -> Option<Muxer> {
+        self.es.take_muxer()
+    }
+
     pub fn new(cfg: MuxerConfig) -> Self {
         let input = Arc::new(Mutex::new(Input::default()));
         let slot = SlotReader::default();
@@ -381,8 +437,7 @@ impl TsIngest {
         let dts = self.clock.unwrap(dts_raw);
         let pts = dts + signed_delta(pts_raw, dts_raw);
         let up = self.es.video(dts, pts, codec::access_unit(data), now)?;
-        self.pending.part |= up.part;
-        self.pending.segment |= up.segment;
+        self.pending.merge(up);
         Ok(())
     }
 
