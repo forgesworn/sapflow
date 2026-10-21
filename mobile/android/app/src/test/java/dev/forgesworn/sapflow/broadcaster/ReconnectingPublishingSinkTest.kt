@@ -61,11 +61,12 @@ class ReconnectingPublishingSinkTest {
             closed.countDown()
         }
     }
-    private class Harness(val gate: ObservationLinearisation = ObservationLinearisation()) {
+    private class Harness(val gate: ObservationLinearisation = ObservationLinearisation(),
+        changed: (PublishingAttemptContext, Boolean) -> Unit = { _, _ -> }) {
         val policy = Policy()
         val sinks = CopyOnWriteArrayList<Sink>()
         var configure: (Sink) -> Unit = {}
-        val owner = ReconnectingPublishingSink(policyFactory = { policy }, observationGate = gate, factory = { events ->
+        val owner = ReconnectingPublishingSink(policyFactory = { policy }, observationGate = gate, observationChanged = changed, factory = { events ->
             assertTrue("old ownership must be released", sinks.lastOrNull()?.closed?.count != 1L)
             Sink(events).also { configure(it); sinks.add(it) }
         })
@@ -304,5 +305,59 @@ class ReconnectingPublishingSinkTest {
             }
         } finally { epoch.stopDestination(); epoch.close() }
         assertEquals(0, h.policy.confirmations.get()); assertEquals(1, h.policy.stops.get()); assertEquals(1, h.sinks.size)
+    }
+    @Test fun delayedGrantExpiryFenceIsRecheckedAtTheActualSdkCall() {
+        val h = Harness(); val epoch = h.owner.newEpoch(); val ready = CountDownLatch(1)
+        val valid = java.util.concurrent.atomic.AtomicBoolean(true)
+        epoch.setKeyframeRequester { ready.countDown() }
+        try {
+            epoch.start(); h.sink(0).events(PublishingAttemptEvent.Failed())
+            val sink = h.sink(1); sink.events(PublishingAttemptEvent.Accepted)
+            assertTrue(ready.await(2, TimeUnit.SECONDS)); val oldDeadline = h.policy.deadlineNs
+            val scope = checkNotNull(h.owner.observationScope)
+            h.gate.withGate {
+                h.owner.originMediaConfirmed(scope) { valid.get() }
+                awaitFinalGate(sink)
+                valid.set(false) // Expiry/End can invalidate independently of the queued Stop task.
+            }
+            epoch.close() // Control-owner barrier after pending confirmation.
+            assertEquals(0, h.policy.confirmations.get()); assertEquals(oldDeadline, h.policy.deadlineNs)
+        } finally { epoch.stopDestination(); epoch.close() }
+    }
+    @Test fun blockingObserverDisconnectCannotDelayTheOriginalTransportFailure() {
+        val identity = V4vIdentity("event-fixture", 1, "a".repeat(32), 1)
+        val profile = checkNotNull(V4vProfile.approved("https://api.example.invalid", "https://play.example.invalid", "/live/"))
+        val entered = CountDownLatch(1); val releaseDecode = CountDownLatch(1)
+        val closing = CountDownLatch(1); val releaseClose = CountDownLatch(1)
+        lateinit var observer: V4vOriginObserver
+        val h = Harness(changed = { context, active ->
+            if (active) observer.accepted(V4vCapturedAttempt(context, identity, "0".repeat(32)), CaptureProfile.HD_720)
+            else observer.cancel(context)
+        })
+        val receipt = V4vSessionReceipt.read(kotlinx.serialization.json.buildJsonObject {
+            put("contractVersion", kotlinx.serialization.json.JsonPrimitive(1)); put("eventId", kotlinx.serialization.json.JsonPrimitive(identity.eventId))
+            put("eventGeneration", kotlinx.serialization.json.JsonPrimitive(1)); put("sessionId", kotlinx.serialization.json.JsonPrimitive(identity.sessionId))
+            put("revision", kotlinx.serialization.json.JsonPrimitive(1)); put("phase", kotlinx.serialization.json.JsonPrimitive("active"))
+            put("expiresAtUnixMs", kotlinx.serialization.json.JsonPrimitive(1000)); put("endComplete", kotlinx.serialization.json.JsonPrimitive(false))
+        })
+        observer = V4vOriginObserver(profile, { _, answer -> answer(V4vObservationPermit(identity, "synthetic", Long.MAX_VALUE)) },
+            { h.owner.observationScope == it.context }, { scope, _ -> V4vMatchedMedia(scope, 1, 1, 0, "/live/event-fixture/a_init.mp4", "/live/event-fixture/a_part1.mp4", true) },
+            { _, _, _ -> error("cancelled decode must not confirm") }, OriginDecoder { _, _, _, _ -> entered.countDown(); check(releaseDecode.await(2, TimeUnit.SECONDS)); error("cancelled") },
+            { object : OriginObservationResources {
+                override fun status() = receipt
+                override fun get(path: String, max: Int, cancel: OriginProbeCancellation) = byteArrayOf(1)
+                override fun close() { closing.countDown(); check(releaseClose.await(2, TimeUnit.SECONDS)) }
+            } })
+        val epoch = h.owner.newEpoch()
+        try {
+            epoch.start(); val first = h.sink(0); first.events(PublishingAttemptEvent.Accepted)
+            assertTrue(entered.await(2, TimeUnit.SECONDS)); first.events(PublishingAttemptEvent.Failed())
+            h.sink(1) // Failure reached the policy and retry factory before observer IO cleanup returns.
+            assertTrue(closing.await(1, TimeUnit.SECONDS)); assertEquals(1L, releaseClose.count)
+            assertEquals(1, h.policy.failures.get()); assertNotNull(h.policy.deadlineNs); assertEquals(0, h.policy.confirmations.get())
+        } finally {
+            releaseClose.countDown(); releaseDecode.countDown(); epoch.stopDestination(); epoch.close()
+            observer.close(); assertTrue(observer.awaitStopped(2000))
+        }
     }
 }

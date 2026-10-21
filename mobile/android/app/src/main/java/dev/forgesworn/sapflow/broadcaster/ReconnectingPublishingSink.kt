@@ -20,6 +20,7 @@ internal class ReconnectingPublishingSink(
     private val policyFactory: (() -> ReconnectPolicyPort)? = null,
     private val graceMs: Long = 90_000,
     private val observationGate: ObservationLinearisation = ObservationLinearisation(),
+    private val observationChanged: (PublishingAttemptContext, Boolean) -> Unit = { _, _ -> },
     private val factory: PublishingAttemptContext.((PublishingAttemptEvent) -> Unit) -> EncodedSink,
 ) {
     init { require(graceMs in 0..3_600_000) }
@@ -32,7 +33,8 @@ internal class ReconnectingPublishingSink(
     private val message = AtomicReference("Destination prepared · press Start")
     private val executor = ScheduledThreadPoolExecutor(1) { Thread(it, "sapflow-reconnect") }.apply { removeOnCancelPolicy = true }
     private val stopped = CompletableFuture<Unit>()
-    private val observation = AtomicReference<PublishingAttemptContext?>()
+    private data class Observation(val context: PublishingAttemptContext, val valid: () -> Boolean)
+    private val observation = AtomicReference<Observation?>()
     private val observationPosted = AtomicBoolean(false)
     private var alarm: ScheduledFuture<*>? = null // Control owner only.
     private val epochs = java.util.concurrent.ConcurrentHashMap<Long, Epoch>()
@@ -52,7 +54,10 @@ internal class ReconnectingPublishingSink(
                     is PublishingAttemptEvent.PeerMediaProgress -> progress.compareAndSet(false, true)
                     is PublishingAttemptEvent.Failed -> observationGate.withGate { failed.compareAndSet(false, true) }
                 }
-                if (first) post { controller.event(token, event) }
+                if (first) {
+                    if (event is PublishingAttemptEvent.Failed) current.get()?.takeIf { it.token == token }?.let { notifyObservation(it.context, false) }
+                    post { controller.event(token, event) }
+                }
             }
             val context = PublishingAttemptContext(destinationId, epoch, token, sdk)
             val sink = factory(context, report)
@@ -76,7 +81,7 @@ internal class ReconnectingPublishingSink(
                     }
                 }
                 override fun close() {
-                    current.compareAndSet(record, null)
+                    if (current.compareAndSet(record, null)) notifyObservation(record.context, false)
                     closeError?.let { throw it }
                     if (closed) return
                     closed = true
@@ -84,7 +89,9 @@ internal class ReconnectingPublishingSink(
                 }
             }
         }, ready = { epoch, token ->
-            current.get()?.takeIf { it.epoch.id == epoch && it.token == token && !it.failed.get() }?.admitted?.set(true)
+            current.get()?.takeIf { it.epoch.id == epoch && it.token == token && !it.failed.get() }?.let {
+                it.admitted.set(true); notifyObservation(it.context, true)
+            }
             epochs[epoch]?.requestIdr?.get()?.invoke()
         }) }
 
@@ -93,12 +100,11 @@ internal class ReconnectingPublishingSink(
         if (!fenced.get()) epochs[epoch.id] = epoch
         return epoch
     }
-    /** Reserved for a future independently validated finite decoder result.
-     * Receipt metadata alone MUST NOT invoke this. No production caller exists
-     * until decoding and before/after origin correlation are integrated. */
-    fun originMediaConfirmed(value: PublishingAttemptContext) {
+    /** Only actual finite decoded evidence may call this, with a nonblocking
+     * final grant fence. No network/codec operation runs under this cold gate. */
+    fun originMediaConfirmed(value: PublishingAttemptContext, valid: () -> Boolean = { true }) {
         if (!isCurrentObservation(value)) return
-        observation.updateAndGet { pending -> if (isCurrentObservation(value)) value else pending }
+        observation.updateAndGet { pending -> if (isCurrentObservation(value)) Observation(value, valid) else pending }
         postObservation()
     }
     private fun postObservation() {
@@ -106,7 +112,8 @@ internal class ReconnectingPublishingSink(
             try {
                 observation.getAndSet(null)?.let { captured ->
                     observationGate.withGate {
-                        if (isCurrentObservation(captured)) controller.observedMedia(captured.epoch, captured.attempt, captured.sdk)
+                        val value = captured.context
+                        if (isCurrentObservation(value) && runCatching(captured.valid).getOrDefault(false)) controller.observedMedia(value.epoch, value.attempt, value.sdk)
                     }
                 }
             } finally {
@@ -122,6 +129,10 @@ internal class ReconnectingPublishingSink(
         if (record.epoch.closed.get() || record.failed.get() || !record.admitted.get()) return null
         return record.context
     }
+    private fun notifyObservation(context: PublishingAttemptContext, active: Boolean) {
+        // Observation failure must never fail the publisher/capture owner.
+        runCatching { observationChanged(context, active) }
+    }
     private fun post(action: () -> Unit) {
         if (fenced.get()) return
         runCatching { executor.execute { runControl(action) } }.onFailure { stopDestination() }
@@ -131,7 +142,7 @@ internal class ReconnectingPublishingSink(
         try {
             action(); message.set(controller.status)
             if (controller.terminal) {
-                fenced.set(true); alarm?.cancel(false)
+                fenced.set(true); current.get()?.let { notifyObservation(it.context, false) }; alarm?.cancel(false)
                 releaseEpochDescriptors(); stopped.complete(Unit); executor.shutdown()
             } else arm()
         }
@@ -150,6 +161,7 @@ internal class ReconnectingPublishingSink(
     }
     fun stopDestination() {
         if (!observationGate.withGate { fenced.compareAndSet(false, true) }) return
+        current.get()?.let { notifyObservation(it.context, false) }
         message.set("Stopping publisher")
         try { executor.execute {
             alarm?.cancel(false)
@@ -192,6 +204,7 @@ internal class ReconnectingPublishingSink(
         override fun stopDestination() = this@ReconnectingPublishingSink.stopDestination()
         override fun close() {
             observationGate.withGate { closed.set(true) }
+            current.get()?.takeIf { it.epoch === this }?.let { notifyObservation(it.context, false) }
             val future = CompletableFuture<Unit>()
             val existing = if (completion.compareAndSet(null, future)) null else completion.get()
             val result = existing ?: future.also {

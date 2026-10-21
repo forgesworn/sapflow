@@ -159,6 +159,13 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
         message = when { receipt.endComplete -> "V4V End completed"; receipt.recoveryState != null -> "Recording failure acknowledged · explicit Prepare required"; terminalIntent -> "V4V End/finalisation not complete"; else -> "V4V origin status received · decoded media unconfirmed" }
         statusAt = now + 5000
     }
+    /** Fresh status-only authority; never reconstructed from a cached receipt. */
+    fun observationPermit(identity: V4vIdentity): V4vObservationPermit {
+        val grant = captureGrant()
+        require(identity.sameSession(grant.identity) && grant.identity.revision >= identity.revision)
+        val deadline = minOf(grant.expiresAtMonotonicNs, System.nanoTime() + (bearerExpiry - now).coerceAtLeast(0) * 1_000_000)
+        return V4vObservationPermit(grant.identity, authenticated(), deadline)
+    }
     fun captureGrant(): V4vGrant {
         authenticated(); check(!restoredRequiresRefresh) { "Refresh the restored V4V grant before capture" }; check(!terminalIntent && operation() == null)
         val grant = V4vGrant.read(checkNotNull(document["grant"] as? JsonObject), now)

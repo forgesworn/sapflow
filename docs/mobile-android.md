@@ -1231,3 +1231,104 @@ The 112-input source archive, tests and package receipts are retained under
 ignored `target/mobile-android/v4v-attempt-v3-*`. These source/package gates
 remain separate from future signing, network execution, real decoded proof
 and physical qualification.
+
+
+The next source packet adds a finite Android origin check for V4V destinations.
+It leaves manual transport bytes, capture, audio, GPU rendering and quality
+selection unchanged. An accepted attempt obtains ephemeral, status-only API
+authority from the control actor, then uses its own cancellable HTTPS client;
+End and grant refresh retain their independent control owner. Only a fresh
+session-specific GET can supply availability. The check allows three bounded
+status attempts before decode and one after it, plus at most three
+nonblocking control-permit admissions, within an original 20-second
+monotonic deadline. Missing metadata remains unverified, without continuous
+polling, a second encode or a continuously running decoder.
+
+Canonical media paths are mapped exclusively through the approved playback
+profile. The configured prefix replaces `/live/`: `/live/event-fixture/file`
+with prefix `/media/live/` becomes `/media/live/event-fixture/file` on the
+approved HTTPS origin. A proxy mount `/origin/` therefore uses the full prefix
+`/origin/live/`. Neither grant playback URLs nor receipt metadata select an
+authority. The media fetcher has no bearer argument, refuses ambient cookies,
+redirects and compressed responses, and keeps normal platform TLS and hostname
+validation. Init and completed independent part downloads are limited to
+256 KiB and 2 MiB, with five-second request watchdogs inside the total deadline.
+Public-route authorisation failures do not forward API credentials.
+
+Downloaded immutable bytes back a `MediaDataSource`; no existing phone file,
+private recording, camera image, temporary file or decoded frame is read or
+written. Top-level Sapflow `ftyp+moov` / `moof+mdat` shapes are checked before
+native parsing. Separate MediaExtractors select exactly AVC and AAC-LC, with
+profile dimensions in either admitted orientation, 48 kHz mono audio, bounded
+access units and an independent first video sample. A finite buffer-mode
+MediaCodec check requires two advancing H264 outputs and at least 2048 decoded mono PCM
+frames (4096 bytes) with their actual 48 kHz time extent. One coalesced PCM
+buffer qualifies; multiple buffers must have consistent byte/time cadence. It does not render frames or
+play sound. The selected AVC decoder must report hardware acceleration on
+Android API 29+, including the actual created implementation; native AAC may
+report software. PCM cadence permits at most one 48 kHz sample (21 microseconds)
+of timestamp quantisation between outputs; the supported ASC is exactly 1188
+(AAC-LC, 48 kHz mono, 1024-frame mode). This vendor classification is not physical performance proof.
+The existing performance contract requires hardware video encoding and does
+not require hardware AAC. Actual names, software flag, PCM bytes and output
+PTS are retained only in bounded observation diagnostics.
+
+The native work has a four-second checked deadline, at most 128 encoded inputs
+per track, 512 KiB per access unit, 32 output buffers per track and 256 KiB PCM. The finite
+check normally stops after two video outputs and 2048 audio PCM frames. Platform native calls have
+no guaranteed interruptible cancellation: a separate deadline closes admission immediately and schedules HTTP cancellation
+on one independent cancellation owner. No platform disconnect runs on UI,
+expiry, capture or transport callbacks. The single native worker retains its
+slot until both actual codec/extractor and HTTP cleanup return. One latest
+accepted scalar scope may wait behind cleanup, keeping its original deadline;
+it is revalidated before admission and never queues a second native owner. Failed release retains the platform wrappers
+and disables further checks in that process. No queued second decoder can
+bypass a stalled or uncertain owner. This is an explicit platform limitation,
+not a hard promise that a blocked driver stops within four seconds.
+
+Success additionally requires fresh post-decode receipt correlation with the
+same local destination, codec epoch, attempt token, captured SDK generation and
+attempt epoch, exact nonce, session/generation, server connection epoch and
+immutable initialization path/ID. Revision and part may advance monotonically.
+Both declared and decoded audio are mandatory for these A/V capture profiles.
+Stop, End, expiry, replacement and failure synchronously fence observation;
+the final SDK call rechecks the current atomic grant deadline under the cold
+attempt gate. Neither a status receipt nor a successful fetch alone invokes
+`mediaConfirmedForAttempt`. Native cleanup must finish before submitting actual
+decoded evidence. Observation errors remain unverified and do not fail capture,
+recording or the transport's network recovery policy.
+
+Source/API and pure tests are separate from Android decoder acceptance. No
+Pixel, emulator, phone media, fixture, sign/install or runtime request was used
+for this source packet. Sapflow fragmented-MP4 compatibility, actual hardware
+outputs, both-track native decode, bounded device cleanup and causal Live
+confirmation still require an explicitly authorised physical or generated-media
+Android gate. macOS/FFmpeg format inspection cannot supply that evidence.
+
+The focused V4 source gate passed 117 JVM tests with Kotlin 2.2 `-Werror`,
+Android API 36 and the actual frozen `55f55bee…` SDK classes. It compiles all
+non-Compose main sources, including the real MediaExtractor/MediaCodec adapter
+and V4V owner. Tests include coalesced PCM, PCM extent/cadence, stale scopes,
+new initialization/connection, delayed grant expiry at the final SDK gate,
+late control authority, busy control admission, blocked native cleanup and
+blocked/failed HTTP disconnect. A real reconnect-executor regression proves
+that observer disconnect cannot postpone the transport failure or its original
+outage deadline. This remains a source/API gate; no Android native decoder was
+executed and no new APK is qualified by these tests.
+
+The exact frozen 118-input V4 packet subsequently passed the full offline M4
+Android gate: 218 JVM tests across 37 suites, zero failures/errors/skips,
+lint zero errors (ten warnings), qualification/release isolation and all four
+packaged ARM64 libraries' 16 KiB ELF LOAD alignment checks. The actual SDK
+remains AAR `55f55bee…`, classes `0c29482e…`, native `608cd7ca…`.
+The retained original qualification APK is
+`4acb3e633ebcad7fca8f52d19fa1e42b007c8b65e5559a49037c3e7fc543d655`;
+the unsigned release is
+`a2fa27f9a1889179a2e9cb67216c40642e57151c27aaa13ab89298827a741a9f`.
+Source archives, local original APKs, XML reports, package verification and
+terminal/cleanup receipts are under ignored
+`target/mobile-android/origin-native-probe-v4-*`. Both own Gradle launcher and
+single-use daemon terminated; no unrelated daemon was stopped. This packet
+performed no extra signing, install, device, network fixture or native decoder
+execution. Default V4V configuration remains disabled, and native Android
+fragment/codec/cleanup/causal-confirmation acceptance remains open.
