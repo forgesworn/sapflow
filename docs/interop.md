@@ -14,6 +14,7 @@ is tried.
 | 2026-10-20 | Larix Broadcaster (iPhone) | SRT | Larix defaults, credentials in the `streamid`, 2 s latency | Servable in 4.5 s; 24 segments decode cleanly; 4 late packets dropped once over Wi-Fi (one segment 59 frames of 60) |
 | 2026-10-20 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults over Wi-Fi | Safari refused the stream (crossed-out play button) after Wi-Fi stalls (one frame of 0.367 s) raised `PART-TARGET` to 0.534 s while parts stayed 0.2 to 0.233 s. Fixed in a94da2f: `PART-TARGET` fixed at 0.234 s, long frames clamped (`docs/reference.md`, Part timing) |
 | 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults, Wi-Fi switched off briefly, served by a94da2f | Part rules held (`PART-TARGET` 0.234 throughout), but the drop left a 6 s segment and `EXT-X-TARGETDURATION` rose from 2 to 6; Safari stopped. Fixed in d480bb9: the target is fixed and a drop ends the segment, marked as a discontinuity (`docs/reference.md`, Target duration and breaks). An SRT silence of 5 s still ends the stream (M7) |
+| 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT (`SAPFLOW_SRT_IMPL=own`) and RTMP at once | Larix defaults over Wi-Fi, served by d480bb9; Wi-Fi switched off twice | Both streams stayed live through drops of 3.1 and 4.4 s, each marked as a discontinuity; Safari carried on (by eye); recordings 98.6 s (SRT) and 107.8 s (RTMP). One RTMP reconnect was refused as already live until the old connection timed out, then accepted 3 s later |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) | SRT, `SAPFLOW_SRT_IMPL=own` | `SRT_IMPLS="srt-rs own" scripts/smoke.sh` | Pass with both implementations (refusals 400, 401, 409 included) |
 | 2026-10-20 | ffmpeg 8.1.2 (libsrt 1.5.3, in Docker) | SRT, `SAPFLOW_SRT_IMPL=own` | 720p30 x264 2.5 Mbit/s, `latency=2000000` | Accepted at 2000 ms latency, servable in 3.5 s, clean shutdown and unpublish |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) with `passphrase=` | SRT, `SAPFLOW_SRT_IMPL=own` | 200 ms | Refused in the handshake: libsrt reports `ERROR:UNSECURE`, "Password required or unexpected" (encryption is M6b) |
@@ -60,19 +61,22 @@ video waiting for keyframes, are left out), decodes cleanly and seeks.
 ## Not yet tried
 
 - Larix on Android.
-- A network drop (Wi-Fi off), the phone locked or backgrounded, SRT with a
-  passphrase.
-- OBS dropping and reconnecting; OBS's Apple hardware encoder; vMix.
+- The phone locked or backgrounded; SRT with a passphrase.
+- Larix or OBS reconnecting after a drop of over 5 s, which the grace
+  period now carries on (tested with ffmpeg only).
+- OBS's Apple hardware encoder; vMix.
 
 ## Stopping and restarting
 
-Tried with Larix over RTMP: stopping the broadcast ends the stream at once
-(the playlist is 404); restarting gives a new stream about 1 to 2 s after
-the encoder reconnects (media sequence 0, new chunk names, seven gap
-segments). sapflow holds nothing for a publisher that leaves; a silent one
-is dropped after 10 s. Holding the stage across a drop is v4v's side (its
-ingest gate covers a dropped encoder held and resumed). How hls.js and
-Safari recover from the 404 and the new playlist is not yet checked.
+Tried with Larix over RTMP on 2026-10-20, before the grace period:
+stopping the broadcast ended the stream at once (the playlist was 404) and
+restarting gave a new stream (media sequence 0, new chunk names). Since
+then a publisher that leaves, or a silent one dropped (SRT after 5 s, RTMP
+after 10 s), has its stream held for `SAPFLOW_RECONNECT_GRACE` (default
+90 s): a restart within it carries on the same playlist and recording
+after a discontinuity (`docs/reference.md`, Target duration and breaks).
+With ffmpeg, the smoke test and v4v's ingest gates cover it; hls.js was
+watched crossing a reconnect. Not yet tried with Larix or OBS restarting.
 
 ## SRT under packet loss (2026-10-20)
 
