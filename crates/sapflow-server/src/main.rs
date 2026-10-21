@@ -5,6 +5,11 @@ mod config;
 mod fdlimit;
 mod http;
 mod publish;
+mod publish_control;
+mod publish_observer;
+mod publish_session_store;
+mod publish_session_wire;
+mod publish_sessions;
 mod recorder;
 mod rtmp;
 mod srt;
@@ -33,11 +38,12 @@ impl App {
 
 pub struct App {
     pub config: Config,
+    pub publish_sessions: Option<publish_sessions::PublishSessions>,
     /// Failed publish attempts per address.
     pub auth_throttle: std::sync::Mutex<sapflow_core::limits::AuthThrottle>,
     /// Refusal log lines, at most 20 a minute.
     pub refusal_log: std::sync::Mutex<sapflow_core::limits::LogLimiter>,
-    pub streams: Registry,
+    pub streams: Arc<Registry>,
     pub callbacks: Callbacks,
 }
 
@@ -97,15 +103,26 @@ async fn run(config: Config) -> std::io::Result<()> {
     } else {
         tracing::info!(before, after, "open-file limit");
     }
-    if config.publisher.is_none() {
+    if config.publisher.is_none() && config.control.is_none() {
         tracing::warn!("SAPFLOW_OPEN_PUBLISH=1: anyone can publish to any stage path");
     }
     if config.callback_url.is_none() {
         tracing::warn!("no SAPFLOW_CALLBACK_URL: stream events are only logged");
     }
+    let publish_sessions = match &config.control {
+        Some(control) => Some(
+            publish_sessions::PublishSessions::open(control, config.callback_url.is_some())
+                .await
+                .map_err(|_| {
+                    std::io::Error::other("cannot open scoped publish-session authority")
+                })?,
+        ),
+        None => None,
+    };
     let app = Arc::new(App {
+        publish_sessions,
         callbacks: Callbacks::start(config.callback_url.clone(), config.callback_secret.clone()),
-        streams: Registry::default(),
+        streams: Arc::new(Registry::default()),
         refusal_log: std::sync::Mutex::new(sapflow_core::limits::LogLimiter::new(
             20,
             std::time::Duration::from_secs(60),
@@ -129,6 +146,30 @@ async fn run(config: Config) -> std::io::Result<()> {
             }
         }
     });
+    let control_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            if let Some(control) = &app.config.control {
+                let listener = tokio::net::TcpListener::bind(control.addr).await?;
+                tracing::info!(addr=%control.addr,"private scoped control listening");
+                publish_control::serve(listener, app).await
+            } else {
+                std::future::pending().await
+            }
+        }
+    });
+    let expiry_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let Some(sessions) = &app.publish_sessions else {
+                return std::future::pending::<std::io::Result<()>>().await;
+            };
+            sessions
+                .run_expiry()
+                .await
+                .map_err(|_| std::io::Error::other("scoped authority failed closed"))
+        }
+    });
     if let Some(dir) = &app.config.recordings {
         tracing::info!(dir = %dir.display(), "recording shows");
         tokio::spawn(recorder::expire_forever(
@@ -150,5 +191,7 @@ async fn run(config: Config) -> std::io::Result<()> {
             Ok(r) => r,
             Err(e) => Err(std::io::Error::other(e)),
         },
+        r = control_task => r.map_err(std::io::Error::other)?,
+        r = expiry_task => r.map_err(std::io::Error::other)?,
     }
 }

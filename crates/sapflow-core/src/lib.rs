@@ -4,6 +4,7 @@
 //! for phones (UniFFI) without dragging the server's dependencies along.
 
 pub mod limits;
+pub mod publish_session;
 pub mod recording;
 
 /// The prefix every stage stream lives under, matching the v4v contract.
@@ -55,12 +56,32 @@ pub enum PublishError {
     Unauthorized,
 }
 
+/// Company-namespaced SRT access-control correlation attribute (Appendix B.2).
+pub const SRT_ATTEMPT_ATTRIBUTE: &str = "forgesworn_attempt";
+
+/// Public correlation metadata, not a credential or replay/authentication token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionAttemptId(String);
+impl ConnectionAttemptId {
+    pub fn parse(value: &str) -> Option<Self> {
+        (value.len() == 32
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .then(|| Self(value.to_owned()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A request to publish, as carried in an SRT stream id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRequest {
     pub path: StreamPath,
     pub user: Option<String>,
     pub pass: Option<String>,
+    pub connection_attempt_id: Option<ConnectionAttemptId>,
 }
 
 impl PublishRequest {
@@ -88,7 +109,12 @@ impl PublishRequest {
             return Err(PublishError::BadRequest);
         }
         let path = StreamPath::parse(path).ok_or(PublishError::BadPath)?;
-        Ok(Self { path, user, pass })
+        Ok(Self {
+            path,
+            user,
+            pass,
+            connection_attempt_id: None,
+        })
     }
 
     /// Parses an RTMP publish: the app from the server URL (`live`) and the
@@ -110,11 +136,17 @@ impl PublishRequest {
                 _ => {}
             }
         }
-        Ok(Self { path, user, pass })
+        Ok(Self {
+            path,
+            user,
+            pass,
+            connection_attempt_id: None,
+        })
     }
 
     fn parse_access_control(rest: &str) -> Result<Self, PublishError> {
         let (mut mode, mut path, mut user, mut pass) = (None, None, None, None);
+        let mut connection_attempt_id = None;
         for pair in rest.split(',') {
             let (k, v) = pair.split_once('=').ok_or(PublishError::BadRequest)?;
             match k {
@@ -122,6 +154,16 @@ impl PublishRequest {
                 "r" => path = Some(v),
                 "u" => user = Some(v.to_owned()),
                 "s" => pass = Some(v.to_owned()),
+                SRT_ATTEMPT_ATTRIBUTE => {
+                    if connection_attempt_id.is_some() {
+                        return Err(PublishError::BadRequest);
+                    }
+                    connection_attempt_id =
+                        Some(ConnectionAttemptId::parse(v).ok_or(PublishError::BadRequest)?);
+                }
+                _ if k.trim().eq_ignore_ascii_case(SRT_ATTEMPT_ATTRIBUTE) => {
+                    return Err(PublishError::BadRequest);
+                }
                 _ => {}
             }
         }
@@ -130,7 +172,12 @@ impl PublishRequest {
         }
         let path = path.ok_or(PublishError::BadRequest)?;
         let path = StreamPath::parse(path).ok_or(PublishError::BadPath)?;
-        Ok(Self { path, user, pass })
+        Ok(Self {
+            path,
+            user,
+            pass,
+            connection_attempt_id,
+        })
     }
 
     /// Checks the request's credentials against the configured publisher.
@@ -501,3 +548,6 @@ mod tests {
         assert_eq!(rec.name(), "recordSegmentComplete");
     }
 }
+
+#[cfg(test)]
+mod publish_attempt_tests;

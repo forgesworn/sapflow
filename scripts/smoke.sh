@@ -60,7 +60,20 @@ for _ in $(seq 1 40); do
   curl -sf "$BASE/index.m3u8" -o "$WORK/index.m3u8" && break; sleep 0.25
 done
 [ -s "$WORK/index.m3u8" ] || fail "multivariant playlist never appeared"
-grep -q 'CODECS="avc1\.[0-9a-f]*,mp4a\.40\.2",RESOLUTION=1280x720' "$WORK/index.m3u8" || fail "multivariant playlist"
+python3 - "$WORK/index.m3u8" <<'PY' || fail "multivariant playlist"
+import pathlib, re, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+assert lines[0] == "#EXTM3U"
+variants = [i for i, line in enumerate(lines) if line.startswith("#EXT-X-STREAM-INF:")]
+assert len(variants) == 1
+i = variants[0]
+assert re.search(r'(?:[:,])CODECS="avc1\.[0-9a-f]{6},mp4a\.40\.2"(?:,|$)', lines[i])
+assert lines[i + 1] == "stream.m3u8"
+# Codec epochs can change dimensions without replacing the master source.
+# Check a resolution attribute when present, and verify actual media below.
+resolution = re.search(r'(?:[:,])RESOLUTION=([^,]+)', lines[i])
+assert resolution is None or resolution.group(1) == "1280x720"
+PY
 echo "ok   multivariant playlist"
 
 curl -s "http://$HTTP/live/event-nope/index.m3u8" -o /dev/null -w '%{http_code}' | grep -q 404 || fail "unknown path not 404"
@@ -91,6 +104,17 @@ for s in $(grep '_seg' "$WORK/stream.m3u8"); do curl -s "$BASE/$s" >> "$WORK/seg
 for p in $(grep -o '[0-9a-f]*_part[0-9]*\.mp4' "$WORK/stream.m3u8"); do curl -s "$BASE/$p" >> "$WORK/parts.mp4"; done
 ffmpeg -hide_banner -v error -xerror -i "$WORK/segs.mp4" -f null - || fail "segments do not decode"
 ffmpeg -hide_banner -v error -xerror -i "$WORK/parts.mp4" -f null - || fail "parts do not decode"
+for media in "$WORK/segs.mp4" "$WORK/parts.mp4"; do
+  ffprobe -v error -show_streams -of json "$media" | python3 -c '
+import json, sys
+streams = json.load(sys.stdin)["streams"]
+video = [s for s in streams if s["codec_type"] == "video"]
+audio = [s for s in streams if s["codec_type"] == "audio"]
+assert len(video) == len(audio) == 1
+assert (video[0]["codec_name"], video[0]["width"], video[0]["height"]) == ("h264", 1280, 720)
+assert (audio[0]["codec_name"], int(audio[0]["sample_rate"]), audio[0]["channels"]) == ("aac", 48000, 1)
+' || fail "decoded track profile"
+done
 echo "ok   segments and parts decode"
 
 curl -s "$BASE/stream.m3u8" -o "$WORK/now.m3u8"
@@ -186,7 +210,7 @@ epublish "publish:live/event-wrong:pub:secret" 3 "&passphrase=not-the-passphrase
 for e in event-plain event-wrong; do
   [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/$e/index.m3u8")" = 404 ] || fail "$e was accepted"
 done
-grep -q 'wrong passphrase or key length' "$WORK/sapflow-enc.log" || fail "wrong passphrase not logged as refused"
+grep -Eq 'wrong passphrase or key length|passphrase, key length or admission handshake refused' "$WORK/sapflow-enc.log" || fail "wrong passphrase not logged as refused"
 grep -q 'not-the-passphrase' "$WORK/sapflow-enc.log" && fail "a passphrase reached the log"
 echo "ok   SRT passphrase: encrypted publish plays; none or a wrong one refused"
 echo "PASS"

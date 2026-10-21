@@ -159,6 +159,13 @@ async fn media(
     let Ok((msn, part)) = playlist::parse_blocking_query(query.as_deref()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // Without parts or CAN-BLOCK-RELOAD, the client reloads completed segments.
+    // Ignore an in-flight blocking request from before an operator changed mode.
+    let (msn, part) = if app.config.low_latency {
+        (msn, part)
+    } else {
+        (None, None)
+    };
     let Some(stream) = stream_for(&app, &event) else {
         return not_found();
     };
@@ -177,6 +184,15 @@ async fn media(
             match readiness {
                 Readiness::BadRequest => return StatusCode::BAD_REQUEST.into_response(),
                 Readiness::Ready => {
+                    if !app.config.low_latency
+                        && let Some(muxer) = st.ingest.muxer()
+                    {
+                        return body(
+                            Bytes::from(playlist::media_with_mode(muxer, &st.prefix, false)),
+                            PLAYLIST_TYPE,
+                            "no-cache",
+                        );
+                    }
                     if let Some(b) = st.media.clone() {
                         return body(b, PLAYLIST_TYPE, "no-cache");
                     }
@@ -210,7 +226,7 @@ async fn chunk(
     loop {
         {
             let st = stream.lock();
-            // A restart (a reconnect with new settings) renames every chunk.
+            // Reconnect codec epochs keep this prefix; closed presentations do not.
             if st.closed || st.prefix != prefix {
                 return not_found();
             }
@@ -218,7 +234,16 @@ async fn chunk(
                 return not_found();
             };
             match chunk {
-                Chunk::Init => return body(m.init().clone(), "video/mp4", CACHE),
+                Chunk::Init | Chunk::InitEpoch(_) => {
+                    let epoch = match chunk {
+                        Chunk::InitEpoch(id) => id,
+                        _ => 0,
+                    };
+                    return match m.initialization(epoch) {
+                        Some(init) => body(init.clone(), "video/mp4", CACHE),
+                        None => not_found(),
+                    };
+                }
                 Chunk::Segment(id) => {
                     return match m.segment(id) {
                         Some(s) => body(s.data.clone(), "video/mp4", CACHE),
@@ -237,6 +262,426 @@ async fn chunk(
             Ok(Ok(())) => {}
             Ok(Err(_)) => return not_found(),
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::*;
+    use crate::{
+        callback::Callbacks,
+        config::Config,
+        publish::Publication,
+        stream::{Registry, Source, SourceKind},
+    };
+    use http_body_util::BodyExt;
+    use sapflow_core::{PublishRequest, StreamPath};
+    use std::path::PathBuf;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    const PORTRAIT: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-portrait.ts");
+    const LANDSCAPE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-landscape.ts");
+    static TEMP: AtomicU64 = AtomicU64::new(0);
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn app(record: bool) -> (Arc<App>, Scratch) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "origin-epoch-test-{}-{}",
+                std::process::id(),
+                TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir(&root).expect("new task-owned scratch");
+        let mut config = Config::load(
+            |key| match key {
+                "SAPFLOW_OPEN_PUBLISH" => Some("1".into()),
+                "SAPFLOW_RECORDINGS" => Some(
+                    root.to_str()
+                        .expect("valid epoch regression fixture")
+                        .into(),
+                ),
+                "SAPFLOW_RECORD_MIN_FREE_GB" => Some("0".into()),
+                _ => None,
+            },
+            Vec::new(),
+        )
+        .expect("valid epoch regression fixture");
+        if !record {
+            config.recordings = None;
+        }
+        (
+            Arc::new(App {
+                publish_sessions: None,
+                config,
+                streams: Arc::new(Registry::default()),
+                callbacks: Callbacks::start(None, None),
+                auth_throttle: Mutex::new(sapflow_core::limits::AuthThrottle::new(
+                    10,
+                    Duration::from_secs(60),
+                )),
+                refusal_log: Mutex::new(sapflow_core::limits::LogLimiter::new(
+                    20,
+                    Duration::from_secs(60),
+                )),
+            }),
+            Scratch(root),
+        )
+    }
+    fn begin(app: &Arc<App>) -> Publication {
+        let req = PublishRequest::parse_srt_stream_id("publish:live/event-epochs:fixture:fixture")
+            .expect("valid epoch regression fixture");
+        Publication::begin(
+            app,
+            &req,
+            SourceKind::Ts,
+            "127.0.0.1".parse().expect("valid epoch regression fixture"),
+        )
+        .expect("valid epoch regression fixture")
+    }
+
+    #[tokio::test]
+    async fn whole_mode_serves_completed_segments_without_waiting_for_old_part_queries() {
+        let (mut app, _scratch) = app(false);
+        Arc::get_mut(&mut app)
+            .expect("unshared fixture")
+            .config
+            .low_latency = false;
+        let mut publisher = begin(&app);
+        publisher
+            .push(|source, now| match source {
+                Source::Ts(ts) => ts.push(LANDSCAPE, now),
+                _ => unreachable!(),
+            })
+            .expect("synthetic transport stream");
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            media(
+                State(app.clone()),
+                Path("event-epochs".into()),
+                RawQuery(Some("_HLS_msn=999999&_HLS_part=99".into())),
+            ),
+        )
+        .await
+        .expect("whole playlists do not wait for parts");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("playlist body")
+            .to_bytes();
+        let text = std::str::from_utf8(&bytes).expect("UTF-8 playlist");
+        assert!(!text.contains("#EXT-X-PART"));
+        assert!(!text.contains("#EXT-X-SERVER-CONTROL"));
+        assert!(!text.contains("#EXT-X-PRELOAD-HINT"));
+        let file = text
+            .lines()
+            .find(|line| !line.starts_with('#') && line.contains("_seg"))
+            .expect("completed segment");
+        let response = chunk(
+            State(app.clone()),
+            Path(("event-epochs".into(), file.into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .into_body()
+                .collect()
+                .await
+                .expect("segment body")
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
+    async fn exercise(app: &Arc<App>) {
+        let mut check = playlist::RuleCheck::default();
+        let mut pending = None;
+        let mut preloaded = None;
+        let mut original = None;
+        let mut prefix = String::new();
+        for (epoch, data) in [PORTRAIT, LANDSCAPE, PORTRAIT].into_iter().enumerate() {
+            let mut publisher = begin(app);
+            publisher
+                .push(|source, now| match source {
+                    Source::Ts(ts) => ts.push(data, now),
+                    _ => unreachable!(),
+                })
+                .expect("valid epoch regression fixture");
+            let stream = publisher.stream.clone();
+            {
+                let st = stream.lock();
+                let m = st.ingest.muxer().expect("valid epoch regression fixture");
+                assert_eq!(
+                    (m.video().width, m.video().height),
+                    if epoch == 1 { (1280, 720) } else { (720, 1280) }
+                );
+                assert_eq!(
+                    m.audio()
+                        .expect("valid epoch regression fixture")
+                        .sample_rate,
+                    48_000
+                );
+                let text =
+                    std::str::from_utf8(st.media.as_ref().expect("valid epoch regression fixture"))
+                        .expect("valid epoch regression fixture");
+                check.check(text).expect("valid epoch regression fixture");
+                assert_eq!(m.target_duration(), 2);
+                assert_eq!(m.current_initialization_id(), epoch as u64);
+                assert_eq!(text.matches("#EXT-X-MAP:").count(), epoch + 1);
+                if epoch == 0 {
+                    prefix = st.prefix.clone();
+                    original = Some((
+                        m.init().clone(),
+                        m.segment(7)
+                            .expect("valid epoch regression fixture")
+                            .data
+                            .clone(),
+                    ));
+                    let msn = m.media_sequence() + m.entries().len() as u64 + 1;
+                    assert_eq!(m.readiness(Some(msn), Some(0)), Readiness::Wait);
+                    pending = Some(tokio::spawn(media(
+                        State(app.clone()),
+                        Path("event-epochs".into()),
+                        RawQuery(Some(format!("_HLS_msn={msn}&_HLS_part=0"))),
+                    )));
+                } else {
+                    assert_eq!(st.prefix, prefix);
+                    let (init, segment) =
+                        original.as_ref().expect("valid epoch regression fixture");
+                    assert_eq!(m.initialization(0), Some(init));
+                    assert_eq!(
+                        &m.segment(7).expect("valid epoch regression fixture").data,
+                        segment
+                    );
+                    let new_map = format!(
+                        "#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"{}\"",
+                        playlist::epoch_init_name(&prefix, epoch as u64)
+                    );
+                    assert!(
+                        text.contains(&new_map),
+                        "new MAP must precede all new-epoch parts"
+                    );
+                }
+                // Do not hold a state lock while polling handlers or publication cleanup.
+            }
+            let (_, parts) = stream
+                .parts_after(None)
+                .expect("valid epoch regression fixture");
+            assert!(!parts.is_empty());
+            assert!(
+                parts
+                    .iter()
+                    .all(|part| part.initialization.id == epoch as u64)
+            );
+            if epoch == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(
+                    !pending
+                        .as_ref()
+                        .expect("valid epoch regression fixture")
+                        .is_finished()
+                );
+            }
+            publisher.end();
+            if epoch == 0 {
+                let before = stream.lock().media.clone();
+                // A short intermediate phone pose may connect and leave before
+                // any frame. It must not advertise an empty epoch or new MAP.
+                begin(app).end();
+                assert_eq!(stream.lock().media, before);
+                let hint = stream
+                    .lock()
+                    .ingest
+                    .muxer()
+                    .expect("valid epoch regression fixture")
+                    .next_part_id();
+                let request = tokio::spawn(chunk(
+                    State(app.clone()),
+                    Path(("event-epochs".into(), playlist::part_name(&prefix, hint))),
+                ));
+                preloaded = Some((hint, request));
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                assert!(
+                    !preloaded
+                        .as_ref()
+                        .expect("valid epoch regression fixture")
+                        .1
+                        .is_finished()
+                );
+            }
+            if epoch == 1 {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    pending.take().expect("valid epoch regression fixture"),
+                )
+                .await
+                .expect("valid epoch regression fixture")
+                .expect("valid epoch regression fixture");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("valid epoch regression fixture")
+                    .to_bytes();
+                assert!(
+                    std::str::from_utf8(&body)
+                        .expect("valid epoch regression fixture")
+                        .contains(&prefix)
+                );
+                let (hint, request) = preloaded.take().expect("valid epoch regression fixture");
+                let response = tokio::time::timeout(Duration::from_secs(1), request)
+                    .await
+                    .expect("valid epoch regression fixture")
+                    .expect("valid epoch regression fixture");
+                assert_eq!(response.status(), StatusCode::OK);
+                let PartLookup::Found(part) = stream
+                    .lock()
+                    .ingest
+                    .muxer()
+                    .expect("valid epoch regression fixture")
+                    .part(hint)
+                else {
+                    panic!("hint must resolve")
+                };
+                assert_eq!(part.initialization.id, 1);
+                assert_eq!(
+                    response
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("valid epoch regression fixture")
+                        .to_bytes(),
+                    part.data
+                );
+            }
+        }
+        // Old cached initialization URI remains servable across the window.
+        let response = chunk(
+            State(app.clone()),
+            Path(("event-epochs".into(), playlist::init_name(&prefix))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("valid epoch regression fixture")
+                .to_bytes(),
+            original.expect("valid epoch regression fixture").0
+        );
+        let path = StreamPath::parse("live/event-epochs").expect("valid epoch regression fixture");
+        let (stream, generation, _) = app
+            .streams
+            .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Ts)
+            .expect("valid epoch regression fixture");
+        app.streams.detach(&stream, generation, false);
+    }
+
+    #[tokio::test]
+    async fn portrait_landscape_portrait_preserves_http_identity_and_pending_reload() {
+        let (app, _scratch) = app(false);
+        exercise(&app).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
+    async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
+        let (app, scratch) = app(true);
+        exercise(&app).await;
+        let directory = scratch.0.join("live/event-epochs");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let files = loop {
+            let mut files: Vec<_> = std::fs::read_dir(&directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect();
+            files.sort();
+            if files.len() == 3
+                && files.iter().all(|file| {
+                    let output = std::process::Command::new("ffprobe")
+                        .args([
+                            "-v",
+                            "error",
+                            "-show_entries",
+                            "format=duration",
+                            "-of",
+                            "csv=p=0",
+                        ])
+                        .arg(file)
+                        .output()
+                        .expect("valid epoch regression fixture");
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse::<f64>()
+                        .is_ok_and(|seconds| seconds > 1.5 && seconds < 3.0)
+                })
+            {
+                break files;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "three finalised epoch files required"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        for (index, file) in files.iter().enumerate() {
+            let output = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,width,height,start_time",
+                    "-of",
+                    "json",
+                ])
+                .arg(file)
+                .output()
+                .expect("valid epoch regression fixture");
+            let text = String::from_utf8(output.stdout).expect("valid epoch regression fixture");
+            assert!(output.status.success());
+            assert!(
+                text.contains("h264") && text.contains("aac"),
+                "both tracks required: {text}"
+            );
+            assert!(
+                text.contains(if index == 1 {
+                    "\"width\": 1280"
+                } else {
+                    "\"width\": 720"
+                }),
+                "{text}"
+            );
+            assert!(
+                text.contains("0.000000") || text.contains("0.000011"),
+                "file origin near zero: {text}"
+            );
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-xerror", "-i"])
+                .arg(file)
+                .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+                .status()
+                .expect("valid epoch regression fixture");
+            assert!(
+                status.success(),
+                "independent audio+video decode failed: {}",
+                file.display()
+            );
         }
     }
 }

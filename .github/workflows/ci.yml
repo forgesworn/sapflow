@@ -61,16 +61,22 @@ jobs:
         run: |
           set -euo pipefail
           scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
           for target in $(cargo fuzz list); do
             echo "::group::$target"
             reg="regressions/$target"
             mkdir -p "$scratch/$target"
             if [ -d "$reg" ] && [ -n "$(ls -A "$reg")" ]; then
               # Files as arguments: each runs once and nothing is written back.
-              cargo fuzz run -O "$target" "$reg"/*
+              cargo fuzz run -O -a "$target" "$reg"/*
               cp "$reg"/* "$scratch/$target/"
             fi
-            cargo fuzz run -O "$target" "$scratch/$target" -- -max_total_time=60
+            if [ -d "seeds/$target" ]; then
+              for seed in "seeds/$target"/*; do
+                if [ -f "$seed" ]; then cp "$seed" "$scratch/$target/"; fi
+              done
+            fi
+            cargo fuzz run -O -a "$target" "$scratch/$target" -- -max_total_time=60 -max_len=65536
             echo "::endgroup::"
           done
       - name: Upload crashes

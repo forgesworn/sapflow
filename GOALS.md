@@ -132,22 +132,26 @@ fuzzing, SRT after the handshake). The `Dockerfile` builds a
 ### M6 Our own SRT (MIT)
 
 srt-rs is unmaintained (last release 2024-05; its authors say they do not
-support it and it never tracked the spec), so sapflow already maintains a
-patched copy. Replace it with `sapflow-srt`: our own MIT implementation of
+support it and it never tracked the spec). Sapflow previously maintained a
+patched copy; M6 replaced it with `sapflow-srt`, our own MIT implementation of
 what the stage uses, written from the SRT specification
 (draft-sharabayko-srt) and observed wire behaviour. No code is copied from
 srt-rs (Apache-2.0) or libsrt (MPL-2.0).
 
-Scope: live mode, listener, one publisher per connection, receiving;
+Original receive milestone scope: live mode, listener, one publisher per
+connection, receiving;
 handshake v5 (and v4 if an encoder needs it), stream id, loss reports
 and periodic NAKs, too-late packet drop, TSBPD delivery, ACK/ACKACK and RTT,
 keepalive and shutdown. Sans-IO (bytes and time in, packets and events
 out), no async runtime, `unsafe` forbidden, so it builds for iOS and Android.
-Out of scope: file mode, rendezvous, caller mode, groups and bonding,
-packet filters (FEC), sending (a later milestone, for phones).
+File mode, rendezvous, groups and bonding, and packet filters (FEC) remain
+out of scope. Caller/sender support and native bindings were added separately
+for the mobile plan below; their implementation and device/release acceptance
+are separate from the historical receive results recorded here.
 
-- **M6a, receive:** unencrypted, behind a switch (`SAPFLOW_SRT_IMPL`), with
-  `srt-protocol` still the default.
+- **M6a, receive (historical):** initially unencrypted, behind a switch
+  (`SAPFLOW_SRT_IMPL`), with `srt-protocol` then the default. The M6a status
+  below records that earlier implementation; M6b and M6c supersede it.
 - **M6b, encryption:** SRT passphrase (AES key wrap, AES-CTR) protects media
   payloads. SRT control packets, including stream IDs, remain visible; never
   assume encryption hides credentials placed in a stream ID. Provision
@@ -232,7 +236,8 @@ review of the crypto found no defects; its hardening suggestions are in
 Independent executable tests cover both directions with libsrt, key rotation,
 clean/impaired loopback delivery and wrong/missing secrets. These are finite
 implementation checks, not completion of the full M6 qualification matrix.
-CTR does not authenticate media.
+CTR does not authenticate media. The native branch configuration and limits
+are also documented in [the own-origin encryption contract](docs/own-origin-encryption.md).
 
 Still open for M6 as a whole: the full encrypted qualification matrix, and
 the version 4 handshake, which no encoder tested so far needed (every one
@@ -273,12 +278,37 @@ per target). The Linux and Caddy measurements are not done.
 - CI on the public repo: tests, clippy, fmt, short fuzz runs, nightly long
   fuzzing (`.github/workflows/ci.yml`, `fuzz-nightly.yml`). `ci.yml` passed
   on its first run on GitHub, and `fuzz-nightly.yml` (run by hand on
-  2026-10-21) fuzzed every target for 20 minutes with no crash.
+  2026-10-21) fuzzed the targets present in that run for 20 minutes with no
+  crash. That historical receipt does not qualify targets or source added
+  later, including the mobile publishing targets.
 
 ### Later
 
-- `sapflow-core` and `sapflow-srt` for iOS and Android via UniFFI: SRT
-  sending (go live from the phone), relayswarm chunk verification, a native swarm peer.
+The [mobile broadcaster and SDK delivery plan](docs/mobile-streaming-plan.md)
+sets out the standalone iOS/Android app, shared SDK and origin-first release,
+followed by native RelaySwarm playback. Existing server milestones and gates
+still apply.
+
+The [reusable library and OBS plan](docs/library-quality-plan.md) records the
+owner's wider library ambition and the LQ1 to LQ8 work queue. Public APIs,
+independent consumers, packaging, interoperability and performance evidence
+are deliverables alongside the apps. OBS adapters and a later desktop studio
+remain explicitly scoped proposals until their product decisions are made.
+
+The linked [competition and distribution review](docs/mobile-competitive-review.md)
+adds our own SRT/RTMP client requirement, measured native-performance targets,
+open-source/free Android distribution and always-free V4V broadcasting.
+
+The origin [readiness assessment](docs/readiness.md) retains the separate
+trial and production-switch decision and its open Linux, wired Caddy/load,
+show-length and player checks. The native [delivery status](docs/mobile-delivery-status.md)
+tracks mobile implementation, physical-device, end-to-end V4V and installed
+release gates separately. Origin encoder or CI evidence does not complete
+those mobile gates. V4V broadcasting remains unlimited, free and watermark-free
+in every official build.
+
+- Native RelaySwarm chunk verification and a swarm peer through shared Rust
+  bindings for iOS and Android.
 - relayswarm's signed segment commitments produced at the origin.
 - A second rendition.
 

@@ -13,7 +13,9 @@ iOS rules and the mediamtx/gohlslib source they came from.
 |-------|------|
 | `sapflow-core` | Shared types (stream paths, callback events). No networking, no async runtime: it must build for iOS and Android later. |
 | `sapflow-hls` | LL-HLS packaging: segmenting, parts, playlists, the Apple rules. |
-| `sapflow-srt` | Our own SRT receiver (live mode, listener), sans-IO, no dependencies. Written from the specification and wire observation only: never read or copy srt-rs or libsrt source; run libsrt only as a black box. |
+| `sapflow-srt` | Our own live SRT listener/receiver and caller/sender, sans-IO, using maintained cryptographic primitives. Written from the specification and wire observation only: never read or copy srt-rs (`srt-protocol`, `srt-tokio`) or libsrt source; run them only as black boxes. |
+| `sapflow-client` | Runtime-free native compressed-media validation, bounded queues, session policy and MPEG-TS writing. No camera, codec, network, file or billing runtime. |
+| `sapflow-ffi` | Typed Swift/Kotlin boundary for shared compressed samples and protocol/session state; platform adapters own sockets, TLS and native codecs. |
 | `sapflow-server` | The `sapflow` binary: ingest, HTTP, callbacks, recording. |
 
 ## Run and test
@@ -48,6 +50,11 @@ The Mac's disk is nearly full and Rust builds are large.
 
 ## Conventions
 
+- Never commit, push or publish real camera footage, extracted camera frames,
+  phone recordings or archives containing them. Keep these in ignored private
+  lab storage. Only generated, non-camera media fixtures may be considered for
+  source control; verify their provenance before staging. A media extension
+  alone does not establish that a file is safe to publish.
 - British English in prose and identifiers. No em dashes.
 - Commits: `type: description`, no `Co-Authored-By` trailers. Commit as
   `TheCryptoDonkey <TheCryptoDonkey@users.noreply.github.com>`.

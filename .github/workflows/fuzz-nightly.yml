@@ -63,10 +63,16 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          # A fresh corpus seeded from the regressions; nothing is committed back.
+          # A fresh corpus seeded from regressions and valid exchanges.
           corpus=$(mktemp -d)
+          trap 'rm -rf "$corpus"' EXIT
           if [ -d "regressions/$TARGET" ]; then cp "regressions/$TARGET"/* "$corpus"/; fi
-          cargo fuzz run -O "$TARGET" "$corpus" -- -max_total_time=1200
+          if [ -d "seeds/$TARGET" ]; then
+            for seed in "seeds/$TARGET"/*; do
+              if [ -f "$seed" ]; then cp "$seed" "$corpus/"; fi
+            done
+          fi
+          cargo fuzz run -O -a "$TARGET" "$corpus" -- -max_total_time=1200 -max_len=65536
       - name: Upload crashes
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

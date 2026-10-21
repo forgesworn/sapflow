@@ -24,20 +24,9 @@ pub struct FlvIngest {
 impl FlvIngest {
     pub fn new(cfg: MuxerConfig) -> Self {
         let mut es = EsIngest::new(cfg);
-        // RTMP encoders send both sequence headers before any frame, so the
-        // audio config is known by the first keyframe when there is audio.
-        es.set_expect_audio(false);
-        Self {
-            es,
-            nal_length_size: 4,
-            last_ms: None,
-            base: 0,
-        }
-    }
-
-    /// Carries on another connection's stream ([`EsIngest::resume`]).
-    pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
-        let mut es = EsIngest::resume(cfg, muxer);
+        // Explicit metadata can announce audio before either encoder supplies
+        // media. Without metadata, the first IDR starts a provisional video
+        // muxer; AAC arriving before servable content restarts it at an IDR.
         es.set_expect_audio(false);
         Self {
             es,
@@ -49,6 +38,18 @@ impl FlvIngest {
 
     pub fn muxer(&self) -> Option<&Muxer> {
         self.es.muxer()
+    }
+
+    /// Carries on another connection's stream ([`EsIngest::resume`]).
+    pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
+        let expect_audio = muxer.audio().is_some();
+        let mut ingest = Self::new(cfg);
+        ingest.es = EsIngest::resume(cfg, muxer);
+        // An immutable served A/V initialization cannot provisionally become
+        // video-only merely because this connection's AAC header comes later.
+        // Explicit metadata may still announce that audio was disabled.
+        ingest.es.set_expect_audio(expect_audio);
+        ingest
     }
 
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
@@ -142,7 +143,10 @@ mod tests {
     /// Converts the TS fixture's frames into FLV tags, as an RTMP encoder
     /// would send them, by demuxing it with `TsIngest`'s building blocks.
     fn flv_from_fixture() -> Vec<(bool, u32, Vec<u8>)> {
-        let ts = include_bytes!("../tests/fixtures/testsrc-3s.ts");
+        flv_from_ts(include_bytes!("../tests/fixtures/testsrc-3s.ts"))
+    }
+
+    fn flv_from_ts(ts: &[u8]) -> Vec<(bool, u32, Vec<u8>)> {
         let mut tags = Vec::new();
         let mut seq_sent = false;
         let mut audio_seq_sent = false;
@@ -195,6 +199,76 @@ mod tests {
     }
 
     #[test]
+    fn resumed_rtmp_aspect_epochs_keep_audio_when_its_header_follows_first_idr() {
+        for metadata in [false, true] {
+            let cfg = MuxerConfig::default();
+            let mut ingest = FlvIngest::new(cfg);
+            let mut check = crate::playlist::RuleCheck::default();
+            for (epoch, bytes) in [
+                include_bytes!("../tests/fixtures/epoch-portrait.ts").as_slice(),
+                include_bytes!("../tests/fixtures/epoch-landscape.ts").as_slice(),
+                include_bytes!("../tests/fixtures/epoch-portrait.ts").as_slice(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if metadata {
+                    ingest.expect_audio(true);
+                }
+                let mut tags = flv_from_ts(bytes);
+                if epoch != 0 {
+                    let audio_index = tags
+                        .iter()
+                        .position(|(video, _, tag)| !*video && tag[1] == 0)
+                        .expect("valid RTMP epoch fixture");
+                    let audio = tags.remove(audio_index);
+                    let idr_index = tags
+                        .iter()
+                        .position(|(video, _, tag)| *video && tag[1] == 1)
+                        .expect("valid RTMP epoch fixture");
+                    tags.insert(idr_index + 1, audio);
+                }
+                for (video, ms, tag) in tags {
+                    if video {
+                        ingest
+                            .video(ms, &tag, SystemTime::UNIX_EPOCH)
+                            .expect("valid RTMP epoch fixture");
+                    } else {
+                        ingest.audio(ms, &tag);
+                    }
+                    if let Some(muxer) = ingest.muxer().filter(|m| m.has_content()) {
+                        check
+                            .check(&crate::playlist::media(muxer, "rtmp"))
+                            .expect("valid RTMP epoch fixture");
+                    }
+                }
+                let muxer = ingest.muxer().expect("valid RTMP epoch fixture");
+                assert_eq!(muxer.current_initialization_id(), epoch as u64);
+                assert_eq!(
+                    muxer.audio().expect("valid RTMP epoch fixture").sample_rate,
+                    48_000
+                );
+                assert_eq!(muxer.video().width, if epoch == 1 { 1280 } else { 720 });
+                assert!(
+                    muxer
+                        .open_parts()
+                        .iter()
+                        .chain(muxer.entries().iter().filter_map(|entry| match entry {
+                            crate::muxer::Entry::Segment(segment)
+                                if segment.initialization.id == epoch as u64 =>
+                                segment.parts.first(),
+                            _ => None,
+                        }))
+                        .any(|part| part.initialization.id == epoch as u64)
+                );
+                let mut held = ingest.take_muxer().expect("valid RTMP epoch fixture");
+                held.interrupt(SystemTime::UNIX_EPOCH);
+                ingest = FlvIngest::resume(cfg, held);
+            }
+        }
+    }
+
+    #[test]
     fn rtmp_style_tags_become_segments() {
         let mut ing = FlvIngest::new(MuxerConfig::default());
         for (video, ms, tag) in flv_from_fixture() {
@@ -224,10 +298,11 @@ mod tests {
         up
     }
 
-    /// A reconnecting encoder with the same settings carries on the stream
-    /// it left; one with different settings (here, no audio) starts afresh.
+    /// Preserve main's reconnect/audio-disable case while enforcing retained
+    /// codec epochs: changed tracks require an explicit announcement, and old
+    /// media keeps its original initialization instead of resetting the stream.
     #[test]
-    fn a_reconnect_resumes_or_restarts() {
+    fn a_reconnect_resumes_or_changes_codec_epoch_without_resetting_media() {
         let tags = flv_from_fixture();
         let mut first = FlvIngest::new(MuxerConfig::default());
         feed(&mut first, &tags);
@@ -247,13 +322,98 @@ mod tests {
 
         let mut held = same.take_muxer().expect("muxer");
         held.interrupt(SystemTime::UNIX_EPOCH);
+        let next_part = held.next_part_id();
+        let targets = (held.target_duration(), held.part_target());
+        let old = held.segment(LEADING_GAPS).expect("retained old segment");
         let video_only: Vec<_> = tags.iter().filter(|t| t.0).cloned().collect();
         let mut other = FlvIngest::resume(MuxerConfig::default(), held);
+        other.expect_audio(false); // Explicit metadata disables audio for this epoch.
         let up = feed(&mut other, &video_only);
         assert!(up.restarted);
         let m = other.muxer().expect("muxer");
         assert!(m.audio().is_none());
         assert!(m.has_content());
+        assert!(m.next_part_id() > next_part);
+        assert_eq!(m.epoch_first_part_id(), next_part);
+        assert_eq!((m.target_duration(), m.part_target()), targets);
+        assert_eq!(m.current_initialization_id(), old.initialization.id + 1);
+        assert_eq!(
+            m.initialization(old.initialization.id),
+            Some(&old.initialization.data)
+        );
+        assert!(m.entries().iter().any(|entry| matches!(
+            entry,
+            crate::muxer::Entry::Segment(segment)
+                if segment.initialization.id == m.current_initialization_id() && segment.discontinuity
+        )));
+        let mut rules = crate::playlist::RuleCheck::default();
+        rules
+            .check(&crate::playlist::media(m, "reconnect"))
+            .expect("valid retained epochs");
+    }
+
+    #[test]
+    fn aac_after_first_idr_restarts_only_the_unpublished_provisional_muxer() {
+        let mut tags = flv_from_fixture();
+        let sequence_index = tags
+            .iter()
+            .position(|(video, _, tag)| !*video && tag[1] == 0)
+            .expect("AAC config");
+        let audio_sequence = tags.remove(sequence_index);
+        let first_frame = tags
+            .iter()
+            .position(|(video, _, tag)| *video && tag[1] == 1)
+            .expect("first IDR");
+        tags.insert(first_frame + 1, audio_sequence);
+        let mut ing = FlvIngest::new(MuxerConfig::default());
+        let mut saw_provisional = false;
+        let mut saw_audio = false;
+        for (video, ms, tag) in tags {
+            if video {
+                ing.video(ms, &tag, SystemTime::UNIX_EPOCH).expect("video");
+                if !saw_audio && tag[1] == 1 {
+                    let muxer = ing.muxer().expect("first IDR starts provisional muxer");
+                    assert!(muxer.audio().is_none());
+                    assert!(!muxer.has_content());
+                    saw_provisional = true;
+                }
+            } else {
+                ing.audio(ms, &tag);
+                if tag[1] == 0 {
+                    assert!(saw_provisional);
+                    assert!(ing.muxer().is_none(), "unpublished init may be discarded");
+                    saw_audio = true;
+                }
+            }
+        }
+        let muxer = ing.muxer().expect("next IDR starts A/V muxer");
+        assert!(muxer.has_content());
+        assert_eq!(muxer.audio().map(|config| config.sample_rate), Some(48_000));
+    }
+
+    #[test]
+    fn aac_after_servable_video_does_not_change_the_existing_track_identity() {
+        let tags = flv_from_fixture();
+        let audio_sequence = tags
+            .iter()
+            .find(|(video, _, tag)| !*video && tag[1] == 0)
+            .expect("AAC config")
+            .2
+            .clone();
+        let mut ing = FlvIngest::new(MuxerConfig::default());
+        for (video, ms, tag) in tags {
+            if video {
+                ing.video(ms, &tag, SystemTime::UNIX_EPOCH).expect("video");
+            }
+        }
+        let muxer = ing.muxer().expect("video-only muxer");
+        assert!(muxer.has_content());
+        let init = muxer.init().clone();
+        ing.audio(3000, &audio_sequence);
+        let muxer = ing.muxer().expect("existing muxer retained");
+        assert!(muxer.has_content());
+        assert!(muxer.audio().is_none());
+        assert_eq!(muxer.init(), &init);
     }
 
     #[test]

@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sapflow live qualification</title>
+<style>
+  body { margin:0; background:#101014; color:#eee; font:16px system-ui }
+  main { max-width:1200px; margin:auto; padding:20px }
+  video { width:100%; max-height:80vh; background:#000 }
+  p { color:#bbb } button { font:inherit; padding:10px }
+</style>
+<main>
+  <video id="video" controls autoplay playsinline></video>
+  <p id="status">Connecting to the test stream…</p>
+  <button id="toggle">Pause</button>
+  <button id="live">Go live</button>
+  <button id="export">Save diagnostic evidence</button>
+</main>
+<script id="diagnostics">
+// Bounded test-viewer evidence. Media bytes are retained only in this page.
+globalThis.SapflowViewerDiagnostics = (() => {
+  const finite = value => Number.isFinite(value) ? value : null;
+  const fields = (value, keys) => Object.fromEntries(keys.filter(k => value?.[k] !== undefined)
+    .map(k => [k, typeof value[k] === 'number' ? finite(value[k]) : value[k]]));
+  const timing = value => fields(value, ['start', 'first', 'end']);
+  const stats = value => ({...fields(value, ['aborted', 'loaded', 'total', 'retry', 'chunkCount', 'bwEstimate']),
+    loading:timing(value?.loading), parsing:timing(value?.parsing), buffering:timing(value?.buffering)});
+  const ranges = value => Array.from({length:value?.length || 0}, (_, i) => [value.start(i), value.end(i)]);
+  const fragment = value => value ? ({...fields(value, ['sn', 'cc', 'url', 'start', 'duration', 'startPTS',
+    'endPTS', 'startDTS', 'endDTS', 'gap', 'type', 'level', 'baseurl']),
+    elementaryStreams:Object.fromEntries(Object.entries(value.elementaryStreams || {})
+      .map(([key, stream]) => [key, fields(stream, ['startPTS', 'endPTS', 'startDTS', 'endDTS', 'partial'])])),
+    stats:stats(value.stats)}) : null;
+  const part = value => value ? ({...fields(value, ['index', 'url', 'start', 'duration', 'gap', 'independent']),
+    stats:stats(value.stats)}) : null;
+  function response(value) {
+    if (!value) return null;
+    let contentType = null, contentLength = null;
+    try {
+      contentType = value.getResponseHeader?.('Content-Type') || value.headers?.get?.('Content-Type') || null;
+      contentLength = value.getResponseHeader?.('Content-Length') || value.headers?.get?.('Content-Length') || null;
+    }
+    catch (_) { /* Inaccessible headers remain explicit. */ }
+    return {...fields(value, ['status', 'statusText', 'responseURL', 'url']), contentType, contentLength};
+  }
+  function bytes(value) {
+    try {
+      if (value instanceof ArrayBuffer) return new Uint8Array(value).slice();
+      if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+    } catch (_) { /* A worker may already own a transferred event payload. */ }
+    return null;
+  }
+  function loaderClass(Base, evidence) {
+    return class extends Base {
+      load(context, config, callbacks) {
+        return super.load(context, config, {...callbacks, onSuccess:(response, stats, ctx, networkDetails) => {
+          // Copy at loader completion, before hls.js transfers bytes to its
+          // demux worker. A FRAG_LOADED observer can see a detached buffer.
+          try { evidence.loaded({payload:response.data, frag:ctx.frag, part:ctx.part, networkDetails}); }
+          catch (_) { evidence.captureErrors++; }
+          callbacks.onSuccess(response, stats, ctx, networkDetails);
+        }});
+      }
+    };
+  }
+  class Evidence {
+    constructor(limit = 8 * 1024 * 1024, count = 32) {
+      this.limit = limit; this.count = count; this.used = 0; this.media = []; this.failures = [];
+      this.incident = null; this.incidentUsed = 0; this.following = 0; this.playlists = []; this.init = []; this.captureErrors = 0;
+    }
+    loaded(data) {
+      if (!data.payload || data.payload.byteLength > this.limit) return;
+      const payload = bytes(data.payload);
+      if (!payload || payload.byteLength > this.limit) return;
+      const item = {at:Date.now(), frag:fragment(data.frag), part:part(data.part),
+        response:response(data.networkDetails), bytes:payload};
+      if (data.frag?.sn === 'initSegment' && payload.byteLength <= 512 * 1024) {
+        this.init.push(item);
+        if (this.init.length > 2) this.init.shift();
+      }
+      this.media.push(item); this.used += payload.byteLength;
+      while (this.used > this.limit || this.media.length > this.count) this.used -= this.media.shift().bytes.byteLength;
+      if (this.incident && this.following > 0 && this.incidentUsed + payload.byteLength <= this.limit) {
+        this.incident.media.push(item); this.incidentUsed += payload.byteLength; this.following--;
+      }
+    }
+    playlist(data) {
+      const text = data.networkDetails?.responseText;
+      this.playlists.push({at:Date.now(), response:response(data.networkDetails),
+        text:typeof text === 'string' ? text.slice(0, 256 * 1024) : null,
+        details:fields(data.details, ['url', 'startSN', 'endSN', 'startCC', 'endCC', 'targetduration',
+          'partTarget', 'totalduration', 'live', 'ageHeader'])});
+      if (this.playlists.length > 4) this.playlists.shift();
+    }
+    error(data, video) {
+      const item = {at:Date.now(), ...fields(data, ['type', 'details', 'fatal', 'reason']),
+        message:String(data.error?.message || data.message || ''), frag:fragment(data.frag), part:part(data.part),
+        stats:stats(data.stats), response:{...response(data.networkDetails),
+          ...fields(data.response, ['code', 'text', 'url'])}, buffered:ranges(video?.buffered),
+        currentTime:finite(video?.currentTime)};
+      this.failures.push(item);
+      if (this.failures.length > 128) this.failures.shift();
+      if (!this.incident && /pars|gap|append/i.test(data.details || '')) {
+        this.incident = {error:item, playlists:this.playlists.slice(), init:this.init.slice(), media:this.media.slice(-12)};
+        this.incidentUsed = this.incident.media.reduce((sum, media) => sum + media.bytes.byteLength, 0);
+        // Leave room for immediately adjacent parts without exceeding a second bounded byte budget.
+        while (this.incidentUsed > this.limit / 2 && this.incident.media.length > 1)
+          this.incidentUsed -= this.incident.media.shift().bytes.byteLength;
+        this.following = 4;
+      }
+      return item;
+    }
+    packet(metrics) {
+      const encode = media => media.map(item => {
+        let binary = '';
+        for (let offset = 0; offset < item.bytes.length; offset += 8192)
+          binary += String.fromCharCode(...item.bytes.subarray(offset, offset + 8192));
+        return {...item, bytes:undefined, byteLength:item.bytes.length, base64:btoa(binary)};
+      });
+      return {metrics, failures:this.failures, playlists:this.playlists, captureErrors:this.captureErrors,
+        retainedBytes:this.used, incidentBytes:this.incidentUsed,
+        init:encode(this.init), recent:encode(this.media),
+        incident:this.incident ? {...this.incident, init:encode(this.incident.init), media:encode(this.incident.media)} : null};
+    }
+  }
+  return {Evidence, ranges, fragment, part, stats, bytes, loaderClass};
+})();
+</script>
+<script id="recovery">
+// Recovery keeps the same Hls/source instance. It cannot repair an invalid
+// origin timeline. One timer covers retry delay or the progress watchdog.
+globalThis.SapflowViewerRecovery = class {
+  constructor({network, media, stop, onState = () => {}, now = () => performance.now(),
+    wall = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout}) {
+    Object.assign(this, {network, media, stop, onState, now, wall, setTimer, clearTimer});
+    this.attempts = {network:0, media:0}; this.limits = {network:3, media:2};
+    this.timer = null; this.pending = null; this.active = null; this.paused = false;
+    this.phase = 'connecting'; this.terminal = null; this.history = []; this.baseline = null;
+  }
+  record(action, detail = '') {
+    this.history.push({at:this.wall(), action, detail:String(detail).slice(0, 240), attempts:{...this.attempts}});
+    if (this.history.length > 64) this.history.shift();
+  }
+  notify() { this.onState(this.snapshot()); }
+  snapshot() { return {phase:this.phase, paused:this.paused, terminal:this.terminal,
+    pending:this.pending, attempts:{...this.attempts}, actions:this.history.slice()}; }
+  cancelTimer() { if (this.timer !== null) this.clearTimer(this.timer); this.timer = null; }
+  halt(reason) {
+    this.cancelTimer(); this.pending = null; this.active = null;
+    this.terminal = reason; this.phase = 'failed'; this.record('terminal', reason);
+    try { this.stop(); } catch (error) { this.record('stop-threw', error.message); }
+    this.notify();
+  }
+  end(draining = false) {
+    if (this.terminal && this.terminal !== 'event-ended') return;
+    this.cancelTimer(); this.pending = null; this.active = null;
+    this.terminal = 'event-ended'; this.phase = draining ? 'ending' : 'ended';
+    this.record(draining ? 'end-list' : 'ended');
+    if (!draining) try { this.stop(); } catch (error) { this.record('stop-threw', error.message); }
+    this.notify();
+  }
+  pause(reason = 'intentional-pause') {
+    this.paused = true; this.pending ||= this.active; this.cancelTimer();
+    if (!this.terminal) this.phase = 'paused';
+    this.record(reason); this.notify();
+  }
+  resume(reason = 'intentional-resume') {
+    this.paused = false;
+    if (this.terminal) { this.notify(); return; }
+    this.phase = this.active ? 'recovering' : 'buffering'; this.record(reason); this.notify(); this.schedule();
+  }
+  waiting() {
+    if (!this.terminal && !this.paused) { this.phase = this.active ? 'recovering' : 'waiting'; this.notify(); }
+  }
+  error(data) {
+    if (!data.fatal || this.terminal) return;
+    const code = Number(data.response?.code ?? data.networkDetails?.status);
+    if (code === 401 || code === 403) { this.halt('authorisation-failed'); return; }
+    const reason = String(data.reason || data.error?.message || '');
+    if (data.details === 'levelParsingError' && /media sequence mismatch/i.test(reason)) {
+      this.halt('origin-media-sequence-mismatch'); return;
+    }
+    const kind = data.type === 'networkError' ? 'network' : data.type === 'mediaError' ? 'media' : null;
+    if (!kind) { this.halt('unrecoverable-' + String(data.details || data.type)); return; }
+    this.record('fatal-' + kind, data.details);
+    this.pending = kind;
+    if (this.paused) { this.phase = 'paused'; this.notify(); return; }
+    this.schedule();
+  }
+  schedule() {
+    if (this.terminal || this.paused || !this.pending || this.timer !== null) return;
+    const kind = this.pending;
+    if (this.attempts[kind] >= this.limits[kind]) { this.halt(kind + '-recovery-exhausted'); return; }
+    const delay = [500, 1000, 2000][this.attempts[kind]];
+    this.phase = 'recovering'; this.record('schedule-' + kind, delay + 'ms'); this.notify();
+    this.timer = this.setTimer(() => {
+      this.timer = null;
+      if (this.terminal || this.paused) return;
+      const next = this.pending; this.pending = null;
+      if (!next) return;
+      if (this.attempts[next] >= this.limits[next]) { this.halt(next + '-recovery-exhausted'); return; }
+      this.attempts[next]++; this.active = next;
+      this.record(next === 'network' ? 'start-load' : 'recover-media'); this.notify();
+      // No progress/error callback must leave an unbounded hanging attempt.
+      this.timer = this.setTimer(() => {
+        this.timer = null;
+        if (this.terminal || this.paused) return;
+        this.record('progress-timeout', next); this.pending ||= next; this.schedule();
+      }, 4000);
+      try { (next === 'network' ? this.network : this.media)(); }
+      catch (error) { this.record('recovery-threw', error.message); this.pending = next; }
+    }, delay);
+  }
+  progress({time, frames, ready, paused}) {
+    if (this.terminal || this.paused || paused || ready < 3 || !Number.isFinite(time)) return;
+    if (!this.baseline) { this.baseline = {time, frames}; return; }
+    // A playing event alone is not evidence. Require advancing media time,
+    // and advancing decoded-video count whenever that counter is available.
+    if (time < this.baseline.time || (Number.isFinite(frames) && Number.isFinite(this.baseline.frames) &&
+        frames < this.baseline.frames)) {
+      // Reattaching a decoder may reset its counter without rewinding media
+      // time. Establish a fresh observation; this alone never resets budgets.
+      this.baseline = {time, frames}; return;
+    }
+    const advancedFrames = !Number.isFinite(frames) || !Number.isFinite(this.baseline.frames) || frames > this.baseline.frames;
+    if (time - this.baseline.time < 0.25 || !advancedFrames) return;
+    this.baseline = {time, frames};
+    if (this.phase !== 'playing' || this.attempts.network || this.attempts.media) this.record('actual-progress');
+    this.cancelTimer(); this.pending = null; this.active = null;
+    this.attempts = {network:0, media:0}; this.phase = 'playing'; this.notify();
+  }
+};
+</script>
+<script src="/hls.js"></script>
+<script>
+const video = document.querySelector('video'), status = document.querySelector('#status');
+const event = new URLSearchParams(location.search).get('event') || 'event-test';
+if (!/^[a-z0-9-]{1,80}$/.test(event)) throw Error('Invalid test event');
+video.disableRemotePlayback = true;
+window.evidence = new SapflowViewerDiagnostics.Evidence();
+window.playbackEvents = [];
+for (const type of ['playing', 'waiting', 'stalled', 'seeking', 'seeked', 'ended', 'error']) {
+  video.addEventListener(type, () => {
+    playbackEvents.push({at:Date.now(), type, currentTime:video.currentTime, ready:video.readyState,
+      buffered:SapflowViewerDiagnostics.ranges(video.buffered),
+      error:video.error ? {code:video.error.code, message:video.error.message} : null});
+    if (playbackEvents.length > 128) playbackEvents.shift();
+  });
+}
+let restoringMedia = false, restorePlayback = false, pauseGestureDuringReset = false;
+let endListKnown = false, liveEdgeEnded = false, liveEdgePlayRequested = false;
+let mediaControlGestureAt = -Infinity;
+window.hls = new Hls({lowLatencyMode:true, liveSyncDuration:1, liveMaxLatencyDuration:3,
+  maxLiveSyncPlaybackRate:1.1, maxBufferLength:4, backBufferLength:10, preferManagedMediaSource:false,
+  fLoader:SapflowViewerDiagnostics.loaderClass(Hls.DefaultConfig.loader, evidence)});
+window.metrics = () => {
+  const quality = video.getVideoPlaybackQuality?.();
+  return {now:Date.now(), event, hlsVersion:Hls.version, currentTime:video.currentTime,
+  paused:video.paused, ready:video.readyState, latency:hls.latency, liveSync:hls.liveSyncPosition,
+  rate:video.playbackRate, buffered:SapflowViewerDiagnostics.ranges(video.buffered),
+  quality:quality ? {totalVideoFrames:quality.totalVideoFrames, droppedVideoFrames:quality.droppedVideoFrames,
+    corruptedVideoFrames:quality.corruptedVideoFrames} : null,
+  playbackEvents, failures:evidence.failures, recovery:recovery.snapshot()};
+};
+function renderStatus() {
+  const state = recovery.snapshot();
+  document.querySelector('#toggle').textContent = state.paused ? 'Play' : 'Pause';
+  document.querySelector('#toggle').disabled = Boolean(state.terminal && state.terminal !== 'event-ended');
+  document.querySelector('#live').disabled = Boolean(state.terminal);
+  if (state.phase === 'failed') status.textContent = 'Playback stopped: ' + state.terminal;
+  else if (state.terminal === 'event-ended') status.textContent = state.phase === 'ended' ? 'Broadcast ended' : 'Broadcast ended · buffered media may finish';
+  else if (state.paused || video.paused && state.phase === 'paused') status.textContent = 'Paused · Press Play to resume';
+  else if (state.phase === 'recovering') status.textContent = 'Recovering · network ' + state.attempts.network + '/3 · media ' + state.attempts.media + '/2';
+  else if (state.phase === 'playing' && video.readyState >= 3 && !video.paused) {
+    status.textContent = Number.isFinite(hls.latency) ? 'Playing · ' + hls.latency.toFixed(2) + ' s from the estimated origin edge' : 'Playing · edge estimate unavailable';
+  } else status.textContent = state.phase === 'connecting' ? 'Connecting to the test stream…' : 'Waiting for advancing media';
+}
+window.recovery = new SapflowViewerRecovery({
+  network:() => {
+    liveEdgePlayRequested = false;
+    hls.startLoad();
+    resumeBufferedLiveEdge();
+  },
+  media:() => {
+    restorePlayback = !recovery.paused;
+    restoringMedia = true; pauseGestureDuringReset = false;
+    hls.recoverMediaError();
+  },
+  stop:() => { restoringMedia = false; restorePlayback = false; hls.stopLoad(); },
+  onState:renderStatus,
+});
+function playIntentionally(reason = 'intentional-resume') {
+  if (recovery.terminal && recovery.terminal !== 'event-ended') { renderStatus(); return; }
+  recovery.resume(reason); video.autoplay = true;
+  video.play().catch(error => {
+    if (!recovery.terminal) {
+      recovery.record('play-rejected', error.name); recovery.pause('play-rejected-pause'); video.autoplay = false;
+    }
+  });
+}
+function resumeBufferedLiveEdge() {
+  if (!liveEdgeEnded || liveEdgePlayRequested || recovery.paused || recovery.terminal) return;
+  const time = video.currentTime;
+  const available = SapflowViewerDiagnostics.ranges(video.buffered)
+    .some(([start, end]) => start <= time && end > time + 0.05);
+  if (!available || video.readyState < 2) return;
+  liveEdgePlayRequested = true;
+  // Resume at the unchanged media time only after the buffer has extended.
+  // The existing network budget/watchdog still requires actual progress.
+  playIntentionally('resume-buffered-live-edge');
+}
+for (const type of ['pointerdown', 'keydown']) video.addEventListener(type, () => {
+  mediaControlGestureAt = performance.now();
+  if (restoringMedia) pauseGestureDuringReset = true;
+});
+video.addEventListener('pause', () => {
+  if (!video.paused) return; // Ignore an older queued pause after playback resumed.
+  const controlGesture = performance.now() - mediaControlGestureAt < 1000;
+  mediaControlGestureAt = -Infinity;
+  if (video.ended && !endListKnown && !controlGesture) {
+    recovery.record('live-edge-pause'); return;
+  }
+  // A recoverMediaError detach can emit pause. Explicit controls remain
+  // authoritative even while media is detached; ordinary native-control pause
+  // is preserved, including a control gesture during that short reset window.
+  if (!restoringMedia || pauseGestureDuringReset) {
+    pauseGestureDuringReset = false; restorePlayback = false; video.autoplay = false; recovery.pause('media-pause-event');
+  }
+});
+video.addEventListener('play', () => {
+  mediaControlGestureAt = -Infinity;
+  if (!recovery.terminal || recovery.terminal === 'event-ended') { recovery.resume('media-play-event'); video.autoplay = true; }
+});
+for (const type of ['waiting', 'stalled']) video.addEventListener(type, () => recovery.waiting());
+video.addEventListener('ended', () => {
+  if (endListKnown) { recovery.end(); return; }
+  liveEdgeEnded = true; liveEdgePlayRequested = false;
+  recovery.record('live-edge-ended');
+  if (recovery.paused || recovery.terminal) return;
+  recovery.error({fatal:true, type:'networkError', details:'live-edge-ended'});
+});
+video.addEventListener('timeupdate', () => {
+  recovery.progress({time:video.currentTime, frames:video.getVideoPlaybackQuality?.().totalVideoFrames,
+    ready:video.readyState, paused:video.paused});
+  if (recovery.phase === 'playing') liveEdgeEnded = false;
+});
+for (const type of ['canplay', 'loadeddata', 'progress']) video.addEventListener(type, resumeBufferedLiveEdge);
+hls.on(Hls.Events.BUFFER_APPENDED, resumeBufferedLiveEdge);
+hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+  if (!restoringMedia) return;
+  restoringMedia = false;
+  if (restorePlayback && !recovery.paused && !recovery.terminal) playIntentionally('restore-after-media-recovery');
+});
+hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
+  evidence.playlist(data);
+  if (data.details?.live === false) { endListKnown = true; recovery.end(!video.ended); }
+});
+hls.on(Hls.Events.ERROR, (_, data) => {
+  const item = evidence.error(data, video);
+  console.warn('Sapflow playback evidence', item);
+  recovery.error(data);
+});
+hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!recovery.paused) playIntentionally('autoplay-request'); });
+hls.loadSource('/live/' + event + '/index.m3u8');
+hls.attachMedia(video);
+document.querySelector('#toggle').onclick = () => {
+  if (!recovery.paused) { recovery.pause(); video.autoplay = false; video.pause(); }
+  else playIntentionally();
+};
+document.querySelector('#live').onclick = () => {
+  if (recovery.terminal) { renderStatus(); return; }
+  if (Number.isFinite(hls.liveSyncPosition)) video.currentTime = hls.liveSyncPosition;
+  playIntentionally();
+};
+document.querySelector('#export').onclick = () => {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(evidence.packet(metrics()))], {type:'application/json'}));
+  const link = document.createElement('a'); link.href = url; link.download = event + '-viewer-evidence.json'; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+setInterval(renderStatus, 1000);
+</script>
+</html>

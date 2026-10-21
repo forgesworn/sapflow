@@ -2,6 +2,13 @@
 *.local.md
 /recordings
 /scratch
+# Camera footage stays in private lab storage, never in Git.
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.webm
+*.avi
 .DS_Store
 /fuzz/target
 /fuzz/artifacts

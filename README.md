@@ -31,8 +31,18 @@ or `rtmp://<host>:1935/live` with key `<eventId>?user=<publisher>&pass=<password
 and play `http://<host>:8888/live/<eventId>/index.m3u8`. `sapflow --help`
 lists every setting.
 
+`SAPFLOW_HLS_MODE=whole` serves complete segments without low-latency part
+advertising. Use it when a delivery path cannot fetch parts quickly enough;
+the default remains `low-latency`. Both modes serve the same encoded media,
+segment timeline and codec changes.
+
 - [Goals and milestones](GOALS.md)
+- [Standalone mobile broadcaster and SDK delivery plan](docs/mobile-streaming-plan.md)
+- [Native performance and ForgeSworn library reuse](docs/native-performance-contract.md)
+- [Reusable media libraries and OBS integration plan](docs/library-quality-plan.md)
+- [Mobile competition, feature priorities and free V4V distribution](docs/mobile-competitive-review.md)
 - [What v4v expects from its media server](docs/v4v-contract.md)
+- [Scoped native publishing sessions and private control API](docs/scoped-publish-sessions.md)
 - [Encoders tried so far](docs/interop.md)
 - [Apple's LL-HLS rules and the mediamtx/gohlslib reference](docs/reference.md)
 - [Agent guide](AGENTS.md)

@@ -6,16 +6,24 @@ Run from the repository root after changing dependencies:
     python3 scripts/third-party-licences.py
 """
 import json
+import argparse
 import pathlib
 import subprocess
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--package", action="append", dest="packages")
+parser.add_argument("--output", default="THIRD_PARTY_LICENSES.txt")
+args = parser.parse_args()
 
 meta = json.loads(subprocess.check_output(
     ["cargo", "metadata", "--format-version", "1", "--locked"], text=True))
 pkgs = {p["id"]: p for p in meta["packages"]}
-# Only what the server binary links: walk the resolve graph from it.
+# Walk normal dependencies from the requested distributable packages.
 nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
-root = next(p["id"] for p in meta["packages"] if p["name"] == "sapflow-server")
-seen, stack = set(), [root]
+requested = args.packages or ["sapflow-server"]
+roots = [next(p["id"] for p in meta["packages"] if p["name"] == name)
+         for name in requested]
+seen, stack = set(), roots
 while stack:
     i = stack.pop()
     if i in seen:
@@ -65,5 +73,5 @@ for i in sorted(seen, key=lambda i: (pkgs[i]["name"], pkgs[i]["version"])):
     else:
         out.append("(No licence file in the published crate.)")
     out.append("")
-pathlib.Path("THIRD_PARTY_LICENSES.txt").write_text("\n".join(out) + "\n")
+pathlib.Path(args.output).write_text("\n".join(out) + "\n")
 print(f"{count} crates")

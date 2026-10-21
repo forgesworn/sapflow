@@ -10,7 +10,10 @@
 | `own_srt_listener` | Our SRT listener (`sapflow_srt::Listener`) as the server drives it: datagrams from three peers, time steps, accept or refuse, the application closing connections. Each peer echoes its SYN cookie and addresses the socket id it was given, so data, ACKACKs, drop requests and shutdowns reach open connections. Checks that everything sent parses and that a timer exists exactly while connections do. Seeded with recorded sessions (see below) |
 | `rtmp_session` | Our RTMP connection (`sapflow_hls::rtmp`): from C0 on arbitrary bytes, or replaying the recorded ffmpeg session to its publish and continuing with arbitrary chunk bytes so media reaches `FlvIngest`. Seeded from `crates/sapflow-hls/tests/fixtures/ffmpeg-rtmp-publish.bin` (see below) |
 | `amf0` | AMF0 decoding (every RTMP command and metadata message) and stable re-encoding |
+| `rtmp_client` | Own publishing client before or after an original publish exchange, then fragmented hostile receiver bytes; cancellation clears pending output |
+| `mobile_media` | SDK H264/AAC configuration and compressed sample admission with bounded hostile framing and timing |
 | `own_srt_caller` | Own caller/sender, optional original encrypted negotiation, AES128/256 refresh, hostile data/KM replays and mutations, bounded admission, clocks and cancellation |
+| `publish_session` | Production scoped-session JSON and checksummed metadata parsers, plus bounded pure authority commands, durable snapshots, connection claims and stale lease/restart/terminal fences; no I/O |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
@@ -40,6 +43,42 @@ listener target needs room for whole sessions:
 ```bash
 RUSTC_BOOTSTRAP=1 cargo fuzz run -O -a own_srt_listener corpus/own_srt_listener -- -max_len=65536
 ```
+
+Keep `-max_len=65536` when exercising the mobile publishing targets.
+Their budget assertions cover retained media and immediate output; fuzz
+runs are separate from sustained network or physical-device qualification.
+
+`seeds/<target>/` contains deliberately valid native samples and original
+publishing exchanges so mutation reaches the open state and sample parsers.
+These are seed inputs, not historical crashes. CI and the nightly run copy
+them into temporary corpora alongside any recorded regressions and retain
+overflow checks. New targets still need actual local/CI execution receipts;
+their inclusion in the workflow is not a passing fuzz result.
+
+`seeds/small_parsers/` includes synthetic SRT attempt-correlation attributes:
+valid and duplicate IDs, uppercase/malformed IDs, and exact/over-512-byte stream
+IDs. The production parser's successful results are checked for bounded canonical
+attempt IDs by the existing `small_parsers` target. These are regression seeds,
+not historical crashes or a claim of completed fuzz-duration qualification.
+
+`seeds/publish_session/` contains original synthetic PUT/revoke JSON, checksummed
+empty/prepared/revoked/expired documents, and stateful command sequences. No
+credential in these files grants access to a running service. The target feeds
+raw bytes to the production parsers and shapes valid JSON to reach semantic
+checks. It also starts four prepared rows and interprets up to 64 sixteen-byte
+records as provision, refresh, revoke, reserve/commit/release, clock advance or
+restore. Eight retained event rows bound memory; sixteen possible paths exercise
+capacity refusal. Successful commands must retain monotonic generations,
+revisions, connection epochs and terminal fences; restored admission stays
+disabled. Mutated snapshots exercise structural rejection. For a finite run:
+
+```bash
+RUSTC_BOOTSTRAP=1 cargo fuzz run -O -a publish_session seeds/publish_session -- -runs=0 -max_len=65536
+```
+
+Use a temporary copy of these seeds for mutation runs so generated corpus files
+do not become source fixtures. Actual local execution and CI remain separate
+evidence from the presence of the target and seeds.
 
 The own caller target uses a mode byte and records
 `[operation, step_ms, len_hi, len_lo, bytes]`. Without the high mode bit, it

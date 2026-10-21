@@ -43,11 +43,36 @@ pub fn recording_file(path: &StreamPath, unix_start: u64) -> String {
     format!("{}/{unix_start}.mp4", path.as_path())
 }
 
-/// Whether a file name is one of ours (`<digits>.mp4`), so expiry never
-/// touches anything else in the directory.
+/// A scoped recording retains its real start second even when another codec
+/// epoch starts in the same second. The callback identity supplies uniqueness.
+pub fn scoped_recording_file(
+    path: &StreamPath,
+    unix_start: u64,
+    recording_id: &str,
+) -> Option<String> {
+    is_recording_id(recording_id)
+        .then(|| format!("{}/{unix_start}-{recording_id}.mp4", path.as_path()))
+}
+
+fn is_recording_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Only legacy `<digits>.mp4` and scoped `<digits>-<32 lower hex>.mp4`
+/// names belong to expiry. Other files in the directory remain untouched.
 pub fn is_recording_name(name: &str) -> bool {
-    name.strip_suffix(".mp4")
-        .is_some_and(|n| !n.is_empty() && n.len() <= 20 && n.bytes().all(|b| b.is_ascii_digit()))
+    let Some(stem) = name.strip_suffix(".mp4") else {
+        return false;
+    };
+    let start = match stem.split_once('-') {
+        Some((start, id)) if is_recording_id(id) => start,
+        Some(_) => return false,
+        None => stem,
+    };
+    !start.is_empty() && start.len() <= 20 && start.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Parses an age like `7d`, `12h`, `30m` or `90s`.
@@ -97,6 +122,44 @@ mod tests {
         );
         assert!(is_recording_name("1792500000.mp4"));
         for bad in [".mp4", "x.mp4", "1792500000.mp4.part", "../1.mp4", "1.MP4"] {
+            assert!(!is_recording_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn scoped_file_names_keep_the_start_and_require_exact_recording_identity() {
+        let p = path("live/event-a");
+        let id = "0123456789abcdef0123456789abcdef";
+        let file = scoped_recording_file(&p, 1_792_500_000, id).expect("scoped file");
+        assert_eq!(
+            file,
+            "live/event-a/1792500000-0123456789abcdef0123456789abcdef.mp4"
+        );
+        assert!(is_recording_name(file.rsplit('/').next().expect("name")));
+        for bad in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+            "../0123456789abcdef0123456789abcdef",
+        ] {
+            assert_eq!(scoped_recording_file(&p, 1, bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn expiry_refuses_near_matches_of_scoped_names() {
+        for bad in [
+            "-0123456789abcdef0123456789abcdef.mp4",
+            "1-0123456789abcdef0123456789abcde.mp4",
+            "1-0123456789ABCDEF0123456789ABCDEF.mp4",
+            "1-0123456789abcdef0123456789abcdef-extra.mp4",
+            "1-0123456789abcdef0123456789abcdef.mp4.tmp",
+            "../1-0123456789abcdef0123456789abcdef.mp4",
+            "1-0123456789abcdef0123456789abcdef.MP4",
+            "123456789012345678901-0123456789abcdef0123456789abcdef.mp4",
+        ] {
             assert!(!is_recording_name(bad), "{bad}");
         }
     }

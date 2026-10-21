@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use sapflow_core::StreamPath;
@@ -59,6 +59,13 @@ impl Source {
         }
     }
 
+    pub fn dropped_packets(&self) -> u64 {
+        match self {
+            Self::Ts(ingest) => ingest.dropped_packets(),
+            Self::Flv(_) => 0,
+        }
+    }
+
     pub fn muxer(&self) -> Option<&Muxer> {
         match self {
             Self::Ts(t) => t.muxer(),
@@ -83,7 +90,7 @@ impl Source {
 
 pub struct State {
     pub ingest: Source,
-    /// Chunk-name prefix, unique per stream (and per restart) so a new
+    /// Chunk-name prefix, unique per presentation so a new
     /// stream never collides with chunks a cache still holds from the last.
     pub prefix: String,
     pub closed: bool,
@@ -98,8 +105,52 @@ pub struct Session {
     /// from an earlier one changes nothing.
     generation: u64,
     attached: bool,
+    /// All completed parts below this floor belong to the previous connection.
+    /// detach seals its pending run before claim can advance this floor.
+    fresh_part_floor: u64,
     /// Kept across a reconnect: one recording per show.
     pub recorder: Option<Recorder>,
+    outage_deadline: Option<Instant>,
+}
+
+impl Session {
+    /// Ignore delayed notices from an older connection after replacement.
+    pub fn mark_recording_incomplete(&self, generation: u64) {
+        if self.generation == generation
+            && let Some(recorder) = &self.recorder
+        {
+            recorder.mark_incomplete();
+        }
+    }
+
+    pub fn hold_remaining(&mut self, grace: Duration, now: Instant) -> Duration {
+        if grace.is_zero() {
+            return Duration::ZERO;
+        }
+        let deadline = *self.outage_deadline.get_or_insert(now + grace);
+        deadline.saturating_duration_since(now)
+    }
+
+    pub fn recovered(&mut self) {
+        self.outage_deadline = None;
+    }
+}
+
+/// Encoded availability only: neither fetching nor decoding has occurred.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshMediaPart {
+    pub part_id: u64,
+    pub initialization_id: u64,
+    pub init_path: String,
+    pub part_path: String,
+    pub has_video: bool,
+    pub has_audio: bool,
+}
+
+/// One matching attached connection, with optional fresh encoded availability.
+pub struct ConnectionMediaSnapshot {
+    pub fresh_media: Option<FreshMediaPart>,
 }
 
 /// What a push did.
@@ -107,8 +158,8 @@ pub struct Session {
 pub struct Applied {
     /// The stream is servable.
     pub ready: bool,
-    /// A reconnected encoder's settings differed, so the stream started
-    /// afresh (new chunk names, new init): a new recording too.
+    /// A new codec initialization epoch: the HLS timeline continues, and a
+    /// new recording begins at the epoch's first part.
     pub restarted: bool,
 }
 
@@ -135,7 +186,9 @@ impl LiveStream {
             session: Mutex::new(Session {
                 generation: 0,
                 attached: true,
+                fresh_part_floor: 0,
                 recorder: None,
+                outage_deadline: None,
             }),
             version: watch::Sender::new(0),
         }
@@ -149,6 +202,68 @@ impl LiveStream {
 
     pub fn session(&self) -> MutexGuard<'_, Session> {
         self.session.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Snapshot one independently decodable completed part from this exact
+    /// connection's run. Retained old media and pending first IDRs do not qualify.
+    pub fn connection_media(&self, generation: u64) -> Option<ConnectionMediaSnapshot> {
+        let session = self.session();
+        if session.generation != generation || !session.attached {
+            return None;
+        }
+        let state = self.lock();
+        if state.closed {
+            return None;
+        }
+        Some(ConnectionMediaSnapshot {
+            fresh_media: self.fresh_media_from_state(&session, &state),
+        })
+    }
+
+    pub fn fresh_media_locked(&self, session: &Session, generation: u64) -> Option<FreshMediaPart> {
+        if session.generation != generation || !session.attached {
+            return None;
+        }
+        let state = self.lock();
+        if state.closed {
+            return None;
+        }
+        self.fresh_media_from_state(session, &state)
+    }
+
+    fn fresh_media_from_state(&self, session: &Session, state: &State) -> Option<FreshMediaPart> {
+        let muxer = state.ingest.muxer()?;
+        let init_id = muxer.current_initialization_id();
+        const JS_MAX: u64 = (1 << 53) - 1;
+        if init_id > JS_MAX {
+            return None;
+        }
+        // Search newest first, stopping at the retained window. No media Arc is
+        // stored in a receipt/owner, so status cannot extend media retention.
+        for id in (session.fresh_part_floor..muxer.next_part_id()).rev() {
+            let part = match muxer.part(id) {
+                PartLookup::Found(part) => part,
+                _ => break,
+            };
+            if part.initialization.id != init_id {
+                break;
+            }
+            if part.independent && id <= JS_MAX {
+                let root = self.path.as_path();
+                return Some(FreshMediaPart {
+                    part_id: id,
+                    initialization_id: init_id,
+                    init_path: format!(
+                        "/{root}/{}",
+                        playlist::epoch_init_name(&state.prefix, init_id)
+                    ),
+                    part_path: format!("/{root}/{}", playlist::part_name(&state.prefix, id)),
+                    has_video: true,
+                    has_audio: muxer.audio().is_some(),
+                });
+            }
+        }
+        None
     }
 
     /// Subscribe before checking state, then wait on `changed()`.
@@ -167,15 +282,15 @@ impl LiveStream {
         f: impl FnOnce(&mut Source, SystemTime) -> Result<Update, IngestError>,
     ) -> Result<Applied, IngestError> {
         let mut st = self.lock();
+        if st.closed {
+            return Err(IngestError::PresentationExpired);
+        }
         let update = f(&mut st.ingest, SystemTime::now())?;
         if !update.any() {
             return Ok(Applied::default());
         }
-        if update.restarted {
-            st.prefix = fresh_prefix();
-            st.media = None;
-            st.multivariant = None;
-        }
+        // Codec epochs retain this presentation's prefix and all media IDs.
+        // Per-segment immutable initialization identities select each MAP.
         let ready = Self::render(&mut st);
         drop(st);
         self.version.send_modify(|v| *v += 1);
@@ -221,7 +336,7 @@ impl LiveStream {
     pub fn parts_after(&self, after: Option<u64>) -> Option<(Tracks, Vec<Arc<Part>>)> {
         let st = self.lock();
         let m = st.ingest.muxer()?;
-        let mut id = after.map_or(0, |a| a + 1);
+        let mut id = after.map_or(0, |a| a + 1).max(m.epoch_first_part_id());
         let mut parts = Vec::new();
         while id < m.next_part_id() {
             if let PartLookup::Found(p) = m.part(id) {
@@ -267,17 +382,30 @@ impl Registry {
         kind: SourceKind,
     ) -> Option<(Arc<LiveStream>, u64, Claim)> {
         let mut map = self.map();
-        if let Some(stream) = map.get(path.event_id()) {
+        if let Some(stream) = map.get(path.event_id()).cloned() {
             let mut session = stream.session();
             if session.attached {
                 return None;
             }
-            session.generation += 1;
-            session.attached = true;
-            let mut st = stream.lock();
-            let muxer = st.ingest.take_muxer();
-            st.ingest = Source::resume(kind, stream.cfg, muxer);
-            return Some((stream.clone(), session.generation, Claim::Resumed));
+            // A delayed expiry task cannot extend the original outage window.
+            if session
+                .outage_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                drop(session);
+                Self::end(&mut map, &stream);
+            } else {
+                session.generation += 1;
+                session.attached = true;
+                let mut st = stream.lock();
+                let muxer = st.ingest.take_muxer();
+                // detach() held the same map/session locks while interrupting
+                // the old run. Its final pending part is already below this
+                // floor, and cannot be completed by this connection's first IDR.
+                session.fresh_part_floor = muxer.as_ref().map_or(0, Muxer::next_part_id);
+                st.ingest = Source::resume(kind, stream.cfg, muxer);
+                return Some((stream.clone(), session.generation, Claim::Resumed));
+            }
         }
         let stream = Arc::new(LiveStream::new(path.clone(), cfg, kind));
         map.insert(path.event_id().to_owned(), stream.clone());
@@ -299,12 +427,18 @@ impl Registry {
             return false;
         }
         session.attached = false;
-        drop(session);
         if hold {
-            drop(map);
+            // Keep claim() excluded until the previous run and recording tail
+            // are closed. A new publisher must not race this interruption.
             stream.interrupt();
+            if let Some(recorder) = &mut session.recorder
+                && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
+            {
+                recorder.feed(tracks, parts);
+            }
             return true;
         }
+        drop(session);
         Self::end(&mut map, stream);
         false
     }
@@ -318,6 +452,33 @@ impl Registry {
         let session = stream.session();
         if session.generation != generation || session.attached || stream.lock().closed {
             return false;
+        }
+        drop(session);
+        Self::end(&mut map, stream);
+        true
+    }
+
+    /// An explicit scoped revocation has no reconnect grace. Flush only media
+    /// already accepted before the authority gate closed, then finalise its
+    /// recorder. A delayed old owner cannot terminate a replacement stream.
+    pub fn terminate(&self, stream: &Arc<LiveStream>, generation: u64) -> bool {
+        let mut map = self.map();
+        if !map
+            .get(stream.path.event_id())
+            .is_some_and(|s| Arc::ptr_eq(s, stream))
+        {
+            return false;
+        }
+        let mut session = stream.session();
+        if session.generation != generation || stream.lock().closed {
+            return false;
+        }
+        session.attached = false;
+        stream.interrupt();
+        if let Some(recorder) = &mut session.recorder
+            && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
+        {
+            recorder.feed(tracks, parts);
         }
         drop(session);
         Self::end(&mut map, stream);
@@ -396,5 +557,54 @@ mod tests {
         assert!(again.lock().closed);
         assert!(reg.get("event-a").is_none());
         assert_eq!(claim(&reg, &p).expect("free").2, Claim::Fresh);
+    }
+}
+
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+    #[test]
+    fn delayed_expiry_task_cannot_allow_a_claim_past_the_original_deadline() {
+        let registry = Registry::default();
+        let path = StreamPath::parse("live/event-expired").expect("valid epoch regression fixture");
+        let (stream, generation, _) = registry
+            .claim(&path, MuxerConfig::default(), SourceKind::Ts)
+            .expect("valid epoch regression fixture");
+        stream.session().hold_remaining(
+            Duration::from_secs(1),
+            Instant::now() - Duration::from_secs(2),
+        );
+        assert!(registry.detach(&stream, generation, true));
+        let (fresh, _, claim) = registry
+            .claim(&path, MuxerConfig::default(), SourceKind::Ts)
+            .expect("valid epoch regression fixture");
+        assert_eq!(claim, Claim::Fresh);
+        assert!(!Arc::ptr_eq(&stream, &fresh));
+        assert!(stream.lock().closed);
+    }
+
+    #[test]
+    fn failed_connections_keep_original_deadline_but_media_recovery_rearms_it() {
+        let now = Instant::now();
+        let mut session = Session {
+            generation: 0,
+            attached: true,
+            fresh_part_floor: 0,
+            recorder: None,
+            outage_deadline: None,
+        };
+        let grace = Duration::from_secs(90);
+        assert_eq!(session.hold_remaining(grace, now), grace);
+        assert_eq!(
+            session.hold_remaining(grace, now + Duration::from_secs(80)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(session.hold_remaining(grace, now + grace), Duration::ZERO);
+        session.recovered();
+        assert_eq!(
+            session.hold_remaining(grace, now + Duration::from_secs(3600)),
+            grace
+        );
+        assert_eq!(session.hold_remaining(Duration::ZERO, now), Duration::ZERO);
     }
 }

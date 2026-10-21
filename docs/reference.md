@@ -16,7 +16,7 @@ git clone --depth 1 --branch v2.4.0  https://github.com/bluenviron/gohlslib.git
 | No part may be longer than `PART-TARGET`, every part but the last of its segment must be at least 85% of it, and `PART-TARGET` must not change during a stream (see [Part timing](#part-timing) for the wording and how sapflow keeps it). gohlslib reads the rule as 85% of the longest part and recomputes `PART-TARGET` as the longest part in the window at every part, only logging when it changes, so one long frame raises it; do not copy that. | `muxer_segmenter.go` `findCompatiblePartDuration`, `fmp4AdjustPartDuration`; `muxer_stream.go` `partTargetDuration` | `sapflow_hls::PartTiming`, `Muxer::place_video` |
 | The LL-HLS playlist starts with seven gap segments (same duration as the first real one); iOS needs them. This is why mediamtx refuses fewer than 7 segments. | `muxer_stream.go` `rotateSegments` | M1 |
 | Blocking reload: a request with `_HLS_msn` beyond last + 1, or older than the window, gets 400; otherwise it waits until that part exists. `_HLS_part` without `_HLS_msn` is 400. | `muxer_stream.go` `handleMediaPlaylist` | M1 |
-| `PART-HOLD-BACK` is 2.5 x part target; `CAN-SKIP-UNTIL` is 6 x target duration; `CAN-BLOCK-RELOAD=YES`. | `generateMediaPlaylistFMP4` | M1 |
+| The reference uses `PART-HOLD-BACK` at 2.5 x part target; Sapflow uses 3 x to meet [Apple authoring specification §14.3](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices/). `CAN-BLOCK-RELOAD=YES`; Sapflow does not offer delta updates. | `generateMediaPlaylistFMP4` | `sapflow_hls::playlist::media` |
 | Segments are cut only on a keyframe once the minimum duration has passed, so segment length follows the encoder's keyframe interval. | `fmp4WriteSample` | M1 |
 | fMP4 base time must not be negative; gohlslib adds a fixed start offset to every DTS. | `fmp4WriteSample` (`fmp4StartDTS`) | M1 |
 | LL-HLS playlists are `Cache-Control: no-cache`; segments and parts are cacheable. | `mediaPlaylistMaxAge`, segment handlers | M1 |
@@ -48,7 +48,7 @@ How sapflow keeps it (`sapflow_hls::PartTiming`, `Muxer::place_video`):
   frame. `PART-TARGET` is set so that 85% of it, rounded up to a tick (the
   cut point), lies 1 ms below the nominal part, and is a whole number of
   milliseconds so it prints exactly. At 30 fps: parts of 6 frames (0.2 s),
-  cut point 0.1989 s, `PART-TARGET` 0.234 s, `PART-HOLD-BACK` 0.585 s. The
+  cut point 0.1989 s, `PART-TARGET` 0.234 s, `PART-HOLD-BACK` 0.702 s. The
   15% between the cut point and the target is about a frame wide (it must
   be at least one frame, hence five frames a part at least), so a part of
   whole frames always fits in it.

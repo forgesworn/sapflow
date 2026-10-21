@@ -6,6 +6,7 @@
 //! and the next one parsed, and running out of input is reported as an error
 //! that leaves the reader's state intact for the next push.
 
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -13,7 +14,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use mpeg2ts::es::StreamType;
 use mpeg2ts::pes::{PesPacketReader, ReadPesPacket};
-use mpeg2ts::ts::{ReadTsPacket, TsPacket, TsPacketReader, TsPayload};
+use mpeg2ts::ts::{Pid, ReadTsPacket, TsPacket, TsPacketReader, TsPayload};
 
 use crate::codec::{self, AAC_FRAME_SAMPLES, AacConfig, H264Config};
 use crate::muxer::{MuxError, Muxer, MuxerConfig, Update};
@@ -29,6 +30,8 @@ const MAX_BUFFER: usize = 8 * 1024 * 1024;
 pub enum IngestError {
     /// The program carries a video codec other than H.264.
     UnsupportedVideo,
+    /// The held presentation expired before new media recovered it.
+    PresentationExpired,
     /// No keyframe for too long, or a segment beyond the size limit.
     SegmentTooLarge,
 }
@@ -36,6 +39,7 @@ pub enum IngestError {
 impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PresentationExpired => f.write_str("presentation reconnect deadline expired"),
             Self::UnsupportedVideo => f.write_str("video is not H.264"),
             Self::SegmentTooLarge => f.write_str("segment too large (keyframe interval?)"),
         }
@@ -78,16 +82,22 @@ struct Input {
     starved: bool,
     program: Program,
     dropped: u64,
+    reset_pes: bool,
 }
 
 struct Feed {
     input: Arc<Mutex<Input>>,
     slot: SlotReader,
     inner: TsPacketReader<SlotReader>,
+    continuity: HashMap<Pid, (u8, [u8; TS_SIZE])>,
+    pending: Option<Box<TsPacket>>,
 }
 
 impl ReadTsPacket for Feed {
     fn read_ts_packet(&mut self) -> mpeg2ts::Result<Option<TsPacket>> {
+        if let Some(packet) = self.pending.take() {
+            return Ok(Some(*packet));
+        }
         loop {
             let packet = {
                 let mut input = self.input.lock().map_err(|_| starved())?;
@@ -101,17 +111,63 @@ impl ReadTsPacket for Feed {
                     input.starved = true;
                     return Err(starved());
                 }
-                let p = input.buf[input.start..input.start + TS_SIZE].to_vec();
+                let mut p = [0; TS_SIZE];
+                p.copy_from_slice(&input.buf[input.start..input.start + TS_SIZE]);
                 input.start += TS_SIZE;
                 p
             };
             {
                 let mut slot = self.slot.0.lock().map_err(|_| starved())?;
-                slot.buf = packet;
+                slot.buf.clear();
+                slot.buf.extend_from_slice(&packet);
                 slot.pos = 0;
             }
             match self.inner.read_ts_packet() {
                 Ok(Some(p)) => {
+                    let pid = p.header.pid;
+                    let carries_pes = matches!(
+                        p.payload,
+                        Some(TsPayload::PesStart(_) | TsPayload::PesContinuation(_))
+                    );
+                    let discontinuity = p
+                        .adaptation_field
+                        .as_ref()
+                        .is_some_and(|field| field.discontinuity_indicator);
+                    let previous = self.continuity.get(&pid);
+                    let counter = p.header.continuity_counter.as_u8();
+                    let gap = carries_pes
+                        && previous.is_some_and(|(last, _)| counter != ((last + 1) & 0x0f));
+                    // An identical retransmission must not append its payload
+                    // twice, including at the start of an unbounded video PES.
+                    if carries_pes
+                        && !discontinuity
+                        && !p.header.transport_error_indicator
+                        && previous.is_some_and(|(_, bytes)| *bytes == packet)
+                    {
+                        continue;
+                    }
+                    let reset = p.header.transport_error_indicator
+                        || gap
+                        || (discontinuity && previous.is_some());
+                    if carries_pes || (discontinuity && previous.is_some()) {
+                        self.continuity.insert(pid, (counter, packet));
+                    }
+                    if reset {
+                        // mpeg2ts does not check continuity and cannot validate
+                        // the length of an unbounded video PES. Reset its PES
+                        // assembly before a truncated frame can be returned.
+                        // Keep its TS/PMT reader and the first clean packet.
+                        self.pending = (!p.header.transport_error_indicator).then(|| Box::new(p));
+                        if let Ok(mut input) = self.input.lock() {
+                            input.reset_pes = true;
+                            input.dropped += 1;
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "transport continuity lost",
+                        )
+                        .into());
+                    }
                     if let Some(TsPayload::Pmt(pmt)) = &p.payload
                         && let Ok(mut input) = self.input.lock()
                     {
@@ -135,7 +191,13 @@ impl ReadTsPacket for Feed {
                 Err(_) => {
                     if let Ok(mut input) = self.input.lock() {
                         input.dropped += 1;
+                        input.reset_pes = true;
                     }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed transport packet",
+                    )
+                    .into());
                 }
             }
         }
@@ -157,8 +219,6 @@ pub struct EsIngest {
     /// Whether to hold the first keyframe until the audio config is known.
     expect_audio: bool,
     muxer: Option<Muxer>,
-    /// A taken-over muxer was dropped for a new one not yet made.
-    restarting: bool,
 }
 
 impl EsIngest {
@@ -171,14 +231,14 @@ impl EsIngest {
             aac: None,
             expect_audio: true,
             muxer: None,
-            restarting: false,
         }
     }
 
     /// Carries on another connection's stream (see [`Muxer::interrupt`]).
     /// The first keyframe decides: with the same parameter sets and audio
     /// config, its media continues the stream after a discontinuity;
-    /// otherwise a new muxer starts and the update says `restarted`.
+    /// otherwise it starts a new initialization epoch on the retained muxer
+    /// and the update says `restarted` (for recording rollover).
     pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
         Self {
             muxer: Some(muxer),
@@ -229,6 +289,24 @@ impl EsIngest {
 
     pub fn audio_config(&mut self, config: AacConfig) {
         if self.aac.is_none() {
+            if let Some(muxer) = &self.muxer
+                && muxer.audio().is_none()
+            {
+                if muxer.has_content() {
+                    // A served init segment and the recorder's track identity
+                    // cannot acquire a new track in place.
+                    tracing::warn!(
+                        "AAC configuration arrived after video-only content became servable; audio cannot be added to this init segment"
+                    );
+                } else {
+                    // Separate hardware encoders may deliver AVC + first IDR
+                    // before AAC's sequence header. No content was published,
+                    // so discard the provisional video-only muxer and start
+                    // with both tracks at the next IDR.
+                    self.muxer = None;
+                    self.origin = None;
+                }
+            }
             self.aac = Some(config);
         }
     }
@@ -262,20 +340,19 @@ impl EsIngest {
                 return Ok(Update::default());
             }
             let audio = if self.expect_audio { self.aac } else { None };
-            if let Some(m) = &self.muxer
+            if let Some(m) = &mut self.muxer
                 && (m.video().sps != video.sps
                     || m.video().pps != video.pps
                     || m.audio().copied() != audio)
             {
                 tracing::warn!(
-                    "reconnected encoder's settings differ from the stream it resumes; starting the stream afresh"
+                    "reconnected encoder changed configuration; starting a new codec epoch on the existing timeline"
                 );
-                self.muxer = None;
-                self.restarting = true;
+                m.reconfigure(video.clone(), audio, now);
+                restarted = true;
             }
             if self.muxer.is_none() {
                 self.muxer = Some(Muxer::new(self.cfg, video, audio));
-                restarted = std::mem::take(&mut self.restarting);
             }
             self.origin = Some(dts);
         }
@@ -313,10 +390,11 @@ impl EsIngest {
 /// One publisher's stream: TS bytes in, LL-HLS muxer state out.
 pub struct TsIngest {
     input: Arc<Mutex<Input>>,
-    pes: PesPacketReader<Feed>,
+    pes: Option<PesPacketReader<Feed>>,
     clock: Unwrapper,
     es: EsIngest,
     pending: Update,
+    waiting_keyframe: bool,
 }
 
 impl TsIngest {
@@ -342,13 +420,16 @@ impl TsIngest {
             input: input.clone(),
             slot: slot.clone(),
             inner: TsPacketReader::new(slot),
+            continuity: HashMap::new(),
+            pending: None,
         };
         Self {
             input,
-            pes: PesPacketReader::new(feed),
+            pes: Some(PesPacketReader::new(feed)),
             clock: Unwrapper::default(),
             es: EsIngest::new(cfg),
             pending: Update::default(),
+            waiting_keyframe: false,
         }
     }
 
@@ -356,7 +437,7 @@ impl TsIngest {
         self.es.muxer()
     }
 
-    /// Packets the TS reader could not parse, for diagnostics.
+    /// Invalid transport/PES packets and continuity losses, for diagnostics.
     pub fn dropped_packets(&self) -> u64 {
         self.input.lock().map(|i| i.dropped).unwrap_or(0)
     }
@@ -380,10 +461,30 @@ impl TsIngest {
         }
         self.pending = Update::default();
         loop {
-            match self.pes.read_pes_packet() {
+            match self
+                .pes
+                .as_mut()
+                .expect("PES reader restored after reset")
+                .read_pes_packet()
+            {
                 Ok(Some(pes)) => self.on_pes(pes, now)?,
                 Ok(None) => break,
                 Err(_) => {
+                    let reset = self
+                        .input
+                        .lock()
+                        .map(|mut input| std::mem::take(&mut input.reset_pes))
+                        .unwrap_or(false);
+                    if reset {
+                        let feed = self
+                            .pes
+                            .take()
+                            .expect("PES reader present")
+                            .into_ts_packet_reader();
+                        self.pes = Some(PesPacketReader::new(feed));
+                        self.waiting_keyframe = true;
+                        continue;
+                    }
                     let starved = self.input.lock().map(|i| i.starved).unwrap_or(true);
                     if starved {
                         break;
@@ -436,7 +537,12 @@ impl TsIngest {
         let dts_raw = dts_raw.unwrap_or(pts_raw);
         let dts = self.clock.unwrap(dts_raw);
         let pts = dts + signed_delta(pts_raw, dts_raw);
-        let up = self.es.video(dts, pts, codec::access_unit(data), now)?;
+        let au = codec::access_unit(data);
+        if self.waiting_keyframe && !au.idr {
+            return Ok(());
+        }
+        self.waiting_keyframe = false;
+        let up = self.es.video(dts, pts, au, now)?;
         self.pending.merge(up);
         Ok(())
     }
@@ -548,6 +654,149 @@ mod tests {
         assert_eq!(sa.data, sb.data);
     }
 
+    fn video_samples(ing: &TsIngest) -> Vec<Vec<u8>> {
+        use mp4_atom::Decode;
+        let muxer = ing.muxer().expect("muxer");
+        let mut samples = Vec::new();
+        for id in 0..muxer.next_part_id() {
+            let crate::PartLookup::Found(part) = muxer.part(id) else {
+                continue;
+            };
+            let moof = mp4_atom::Moof::decode(&mut part.data.as_ref()).expect("fragment");
+            for track in moof.traf.iter().filter(|track| track.tfhd.track_id == 1) {
+                for run in &track.trun {
+                    let mut offset = run.data_offset.expect("sample offset") as usize;
+                    for entry in &run.entries {
+                        let end = offset + entry.size.expect("sample size") as usize;
+                        samples.push(part.data[offset..end].to_vec());
+                        offset = end;
+                    }
+                }
+            }
+        }
+        samples
+    }
+
+    // Entirely generated testsrc2 + sine media. Six seconds leaves enough
+    // keyframes to verify recovery as well as rejection of the damaged frame.
+    const LOSS_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/transport-loss-6s.ts");
+
+    fn loss_start_packet() -> usize {
+        let mut probe = TsIngest::new(MuxerConfig::default());
+        let packets: Vec<_> = LOSS_FIXTURE.chunks_exact(TS_SIZE).collect();
+        for (index, pair) in packets.windows(2).enumerate() {
+            probe.push(pair[0], SystemTime::UNIX_EPOCH).expect("probe");
+            let video = |p: &[u8]| (u16::from(p[1] & 0x1f) << 8 | u16::from(p[2])) == 256;
+            if probe.muxer().is_some_and(|muxer| muxer.has_content())
+                && video(pair[0])
+                && video(pair[1])
+                && pair[0][1] & 0x40 != 0
+                && pair[1][1] & 0x40 == 0
+            {
+                return index;
+            }
+        }
+        panic!("fixture must contain a multi-packet video PES after playback starts");
+    }
+
+    fn loss_ingest(data: &[u8]) -> TsIngest {
+        let mut ing = TsIngest::new(MuxerConfig::default());
+        for chunk in data.chunks(1000) {
+            ing.push(chunk, SystemTime::UNIX_EPOCH).expect("ingest");
+        }
+        ing
+    }
+
+    #[test]
+    fn lost_transport_packet_never_becomes_a_corrupt_video_sample() {
+        // Generated ffmpeg test pattern, not camera footage. Drop a packet
+        // inside a multi-packet video PES after playback has begun.
+        let lost = loss_start_packet() + 1;
+        let damaged: Vec<u8> = LOSS_FIXTURE
+            .chunks_exact(TS_SIZE)
+            .enumerate()
+            .filter(|(index, _)| *index != lost)
+            .flat_map(|(_, packet)| packet.iter().copied())
+            .collect();
+        let clean = video_samples(&loss_ingest(LOSS_FIXTURE));
+        assert!(clean.len() > 20, "exercise actual video samples");
+        let ing = loss_ingest(&damaged);
+        let emitted = video_samples(&ing);
+        assert!(!emitted.is_empty(), "playback must recover after the loss");
+        assert!(
+            emitted.iter().all(|sample| clean.contains(sample)),
+            "a truncated PES must never reach a viewer's decoder"
+        );
+        assert_eq!(
+            emitted.last(),
+            clean.last(),
+            "recover through the final complete part"
+        );
+        assert!(ing.dropped_packets() > 0, "report transport loss");
+    }
+
+    #[test]
+    fn retransmitted_packets_and_adaptation_only_packets_preserve_media() {
+        let baseline = ingest_in_chunks(1316);
+        let mut data = Vec::new();
+        for (index, packet) in FIXTURE.chunks_exact(TS_SIZE).enumerate() {
+            data.extend_from_slice(packet);
+            if index == 3 || index == 133 {
+                // Duplicate both a PES start and a PES continuation.
+                data.extend_from_slice(packet);
+            }
+            if index == 134 {
+                // Adaptation-only packets retain the preceding payload's
+                // counter; they do not consume a payload counter value.
+                let mut adaptation = [0xff; TS_SIZE];
+                adaptation[..4].copy_from_slice(&packet[..4]);
+                adaptation[1] &= !0x40;
+                adaptation[3] = 0x20 | (packet[3] & 0x0f);
+                adaptation[4] = 183;
+                adaptation[5] = 0;
+                data.extend_from_slice(&adaptation);
+            }
+        }
+        let mut ing = TsIngest::new(MuxerConfig::default());
+        for chunk in data.chunks(1000) {
+            ing.push(chunk, SystemTime::UNIX_EPOCH).expect("ingest");
+        }
+        assert_eq!(video_samples(&ing), video_samples(&baseline));
+        assert_eq!(ing.dropped_packets(), 0);
+        assert_eq!(
+            ing.muxer()
+                .expect("muxer")
+                .segment(LEADING_GAPS)
+                .expect("segment")
+                .data,
+            baseline
+                .muxer()
+                .expect("baseline")
+                .segment(LEADING_GAPS)
+                .expect("segment")
+                .data
+        );
+    }
+
+    #[test]
+    fn flagged_transport_errors_do_not_reach_the_decoder() {
+        let clean = video_samples(&loss_ingest(LOSS_FIXTURE));
+        let start = loss_start_packet();
+        for lost_start in [false, true] {
+            let mut damaged = LOSS_FIXTURE.to_vec();
+            if lost_start {
+                damaged.drain(start * TS_SIZE..(start + 1) * TS_SIZE);
+            } else {
+                damaged[(start + 1) * TS_SIZE + 1] |= 0x80;
+            }
+            let ing = loss_ingest(&damaged);
+            let emitted = video_samples(&ing);
+            assert!(emitted.iter().all(|sample| clean.contains(sample)));
+            assert_eq!(emitted.last(), clean.last(), "recover without a reconnect");
+            assert!(ing.dropped_packets() > 0);
+        }
+    }
+
     #[test]
     fn garbage_and_truncation_do_not_derail_it() {
         let mut ing = TsIngest::new(MuxerConfig::default());
@@ -564,5 +813,113 @@ mod tests {
             ing.push(c, SystemTime::UNIX_EPOCH).expect("push");
         }
         assert!(ing.muxer().is_some_and(|m| m.has_content()));
+    }
+}
+
+#[cfg(test)]
+mod epoch_window_tests {
+    use super::*;
+    use crate::{muxer::Entry, playlist};
+    #[test]
+    fn codec_epochs_retain_old_maps_only_for_the_bounded_window_and_inflight_owners() {
+        let portrait = include_bytes!("../tests/fixtures/epoch-portrait.ts");
+        let landscape = include_bytes!("../tests/fixtures/epoch-landscape.ts");
+        let cfg = MuxerConfig {
+            segment_count: 8,
+            ..MuxerConfig::default()
+        };
+        let mut ingest = TsIngest::new(cfg);
+        let mut checker = playlist::RuleCheck::default();
+        let mut old = None;
+        let mut video_end = 0;
+        let mut last_part = None;
+        for epoch in 0..16 {
+            let bytes = if epoch % 2 == 0 {
+                portrait.as_slice()
+            } else {
+                landscape.as_slice()
+            };
+            for chunk in bytes.chunks(1316) {
+                ingest
+                    .push(chunk, SystemTime::UNIX_EPOCH)
+                    .expect("valid epoch regression fixture");
+                let Some(muxer) = ingest.muxer() else {
+                    continue;
+                };
+                if muxer.has_content() {
+                    checker
+                        .check(&playlist::media(muxer, "fixed"))
+                        .expect("valid epoch regression fixture");
+                }
+            }
+            let muxer = ingest.muxer().expect("valid epoch regression fixture");
+            assert_eq!(muxer.current_initialization_id(), epoch);
+            assert_eq!(muxer.target_duration(), 2);
+            assert!(muxer.entries().len() <= cfg.segment_count);
+            for id in last_part.map_or(0, |id| id + 1)..muxer.next_part_id() {
+                if let crate::PartLookup::Found(part) = muxer.part(id) {
+                    use mp4_atom::Decode;
+                    let mut input = part.data.as_ref();
+                    let moof =
+                        mp4_atom::Moof::decode(&mut input).expect("valid epoch regression fixture");
+                    let video = moof
+                        .traf
+                        .iter()
+                        .find(|track| track.tfhd.track_id == 1)
+                        .expect("valid epoch regression fixture");
+                    let at = video
+                        .tfdt
+                        .as_ref()
+                        .expect("valid epoch regression fixture")
+                        .base_media_decode_time;
+                    assert!(
+                        at >= video_end,
+                        "HLS decode time must not reset at a new epoch"
+                    );
+                    video_end = at
+                        + video
+                            .trun
+                            .iter()
+                            .flat_map(|run| &run.entries)
+                            .map(|sample| {
+                                u64::from(sample.duration.expect("valid epoch regression fixture"))
+                            })
+                            .sum::<u64>();
+                    last_part = Some(id);
+                }
+            }
+            if epoch == 0 {
+                old = Some(muxer.segment(7).expect("valid epoch regression fixture"));
+            }
+            if epoch > 5 {
+                assert!(muxer.initialization(0).is_none());
+            }
+            let epochs: std::collections::BTreeSet<_> = muxer
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Segment(segment) => Some(segment.initialization.id),
+                    _ => None,
+                })
+                .chain(muxer.open_parts().iter().map(|part| part.initialization.id))
+                .collect();
+            assert!(epochs.len() <= cfg.segment_count + 1);
+            let mut held = ingest.take_muxer().expect("valid epoch regression fixture");
+            held.interrupt(SystemTime::UNIX_EPOCH);
+            ingest = TsIngest::resume(cfg, held);
+        }
+        let old = old.expect("valid epoch regression fixture"); // a response already holding this Arc can finish
+        assert_eq!(old.initialization.id, 0);
+        assert!(!old.initialization.data.is_empty() && !old.data.is_empty());
+        let latest = playlist::media(
+            ingest.muxer().expect("valid epoch regression fixture"),
+            "fixed",
+        );
+        assert!(
+            checker
+                .check(&latest.replace("fixed_seg", "changed_seg"))
+                .is_err(),
+            "same MSN must never be relabelled"
+        );
     }
 }

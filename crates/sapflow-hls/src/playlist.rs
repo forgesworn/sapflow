@@ -16,6 +16,14 @@ pub fn init_name(prefix: &str) -> String {
     format!("{prefix}_init.mp4")
 }
 
+pub fn epoch_init_name(prefix: &str, epoch: u64) -> String {
+    if epoch == 0 {
+        init_name(prefix)
+    } else {
+        format!("{prefix}_init{epoch}.mp4")
+    }
+}
+
 pub fn segment_name(prefix: &str, id: u64) -> String {
     format!("{prefix}_seg{id}.mp4")
 }
@@ -28,6 +36,7 @@ pub fn part_name(prefix: &str, id: u64) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chunk {
     Init,
+    InitEpoch(u64),
     Segment(u64),
     Part(u64),
 }
@@ -47,6 +56,9 @@ pub fn parse_chunk(prefix: &str, name: &str) -> Option<Chunk> {
     };
     if let Some(n) = rest.strip_prefix("seg") {
         return parse(n).map(Chunk::Segment);
+    }
+    if let Some(n) = rest.strip_prefix("init") {
+        return parse(n).map(Chunk::InitEpoch);
     }
     if let Some(n) = rest.strip_prefix("part") {
         return parse(n).map(Chunk::Part);
@@ -84,23 +96,74 @@ fn secs(d: Duration) -> String {
 
 /// The LL-HLS media playlist. Call only once `has_content()` is true.
 pub fn media(m: &Muxer, prefix: &str) -> String {
+    media_with_mode(m, prefix, true)
+}
+
+/// Complete segments remain available when a deployment disables part delivery.
+/// The segment timeline, gaps and codec-epoch maps are shared with LL-HLS.
+pub fn media_with_mode(m: &Muxer, prefix: &str, low_latency: bool) -> String {
     let mut s = String::with_capacity(4096);
     let part_target = m.part_target();
     let _ = write!(
         s,
-        "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{}\n\
-         #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={}\n\
-         #EXT-X-PART-INF:PART-TARGET={}\n#EXT-X-MEDIA-SEQUENCE:{}\n\
-         #EXT-X-DISCONTINUITY-SEQUENCE:{}\n#EXT-X-MAP:URI=\"{}\"\n",
+        "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{}\n",
         m.target_duration(),
-        secs(part_target * 25 / 10),
-        secs(part_target),
+    );
+    if low_latency {
+        let _ = write!(
+            s,
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={}\n\
+             #EXT-X-PART-INF:PART-TARGET={}\n",
+            // Apple HLS authoring specification 14.3 requires at least three
+            // Part Target Durations, stronger than the HLS draft's two-target floor.
+            secs(part_target * 3),
+            secs(part_target),
+        );
+    }
+    let _ = write!(
+        s,
+        "#EXT-X-MEDIA-SEQUENCE:{}\n#EXT-X-DISCONTINUITY-SEQUENCE:{}\n#EXT-X-MAP:URI=\"{}\"\n",
         m.media_sequence(),
         m.discontinuity_sequence(),
-        init_name(prefix),
+        epoch_init_name(
+            prefix,
+            m.entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::Segment(segment) => Some(segment.initialization.id),
+                    Entry::Gap { .. } => None,
+                })
+                .unwrap_or(m.current_initialization_id())
+        ),
     );
 
+    let mut initialization = m
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            Entry::Segment(segment) => Some(segment.initialization.id),
+            Entry::Gap { .. } => None,
+        })
+        .unwrap_or(m.current_initialization_id());
+
     let n = m.entries().len();
+    // RFC 8216bis 6.2.2 uses media duration, not a count of parents, for
+    // recent part tags. Keep whole parent part sets while their end lies
+    // within three target durations of the published edge (inclusive).
+    // Count published open-part spans too, including any decode-time gaps.
+    let part_window = Duration::from_secs(m.target_duration().saturating_mul(3));
+    let mut age = m
+        .open_parts()
+        .iter()
+        .fold(Duration::ZERO, |sum, part| sum.saturating_add(part.span));
+    let mut parts_from = n;
+    for (i, entry) in m.entries().iter().enumerate().rev() {
+        if age > part_window {
+            break;
+        }
+        parts_from = i;
+        age = age.saturating_add(entry.duration());
+    }
     for (i, entry) in m.entries().iter().enumerate() {
         match entry {
             Entry::Gap { duration } => {
@@ -111,9 +174,20 @@ pub fn media(m: &Muxer, prefix: &str) -> String {
                 if seg.discontinuity {
                     s.push_str("#EXT-X-DISCONTINUITY\n");
                 }
-                let recent = n - i <= 2;
-                if recent {
+                if initialization != seg.initialization.id {
+                    let _ = writeln!(
+                        s,
+                        "#EXT-X-MAP:URI=\"{}\"",
+                        epoch_init_name(prefix, seg.initialization.id)
+                    );
+                    initialization = seg.initialization.id;
+                }
+                // Preserve the existing PDT policy here; correcting its
+                // arrival-time mapping is a separate change.
+                if n - i <= 2 {
                     let _ = writeln!(s, "#EXT-X-PROGRAM-DATE-TIME:{}", rfc3339_millis(seg.start));
+                }
+                if low_latency && i >= parts_from {
                     for p in &seg.parts {
                         write_part(&mut s, prefix, p.id, p.duration, p.independent);
                     }
@@ -127,11 +201,34 @@ pub fn media(m: &Muxer, prefix: &str) -> String {
             }
         }
     }
+    if !low_latency {
+        return s;
+    }
     if m.open_discontinuity() && !m.open_parts().is_empty() {
         s.push_str("#EXT-X-DISCONTINUITY\n");
     }
+    if let Some(part) = m.open_parts().first()
+        && initialization != part.initialization.id
+    {
+        let _ = writeln!(
+            s,
+            "#EXT-X-MAP:URI=\"{}\"",
+            epoch_init_name(prefix, part.initialization.id)
+        );
+        initialization = part.initialization.id;
+    }
     for p in m.open_parts() {
         write_part(&mut s, prefix, p.id, p.duration, p.independent);
+    }
+    // RFC 8216bis 6.2.5: a hinted part may cross a discontinuity/MAP.
+    // Hint its known initialization too; the binding MAP is emitted only
+    // when a real part is present, never for an empty codec epoch.
+    if initialization != m.current_initialization_id() {
+        let _ = writeln!(
+            s,
+            "#EXT-X-PRELOAD-HINT:TYPE=MAP,URI=\"{}\"",
+            epoch_init_name(prefix, m.current_initialization_id())
+        );
     }
     // hls.js loops without a preload hint, so there is always one.
     let _ = writeln!(
@@ -174,6 +271,8 @@ pub struct RuleCheck {
     part_target: Option<u64>,
     target: Option<u64>,
     discontinuity: std::collections::BTreeMap<u64, u64>,
+    media_identity: std::collections::BTreeMap<u64, (String, String)>,
+    first_msn: Option<u64>,
 }
 
 /// A decimal with up to 5 places, in units of 0.00001.
@@ -197,6 +296,10 @@ impl RuleCheck {
         let mut msn: u64 = tag("#EXT-X-MEDIA-SEQUENCE:")
             .and_then(|v| v.parse().ok())
             .ok_or("no MEDIA-SEQUENCE")?;
+        if self.first_msn.is_some_and(|previous| msn < previous) {
+            return Err("MEDIA-SEQUENCE decreased".into());
+        }
+        self.first_msn = Some(msn);
         let mut dseq: u64 = match tag("#EXT-X-DISCONTINUITY-SEQUENCE:") {
             Some(v) => v.parse().map_err(|_| "bad DISCONTINUITY-SEQUENCE")?,
             None => 0,
@@ -221,7 +324,28 @@ impl RuleCheck {
             Ok(())
         };
         let mut run = Vec::new();
+        let mut map = String::new();
+        let mut pending_uri = None;
         for l in pl.lines() {
+            if let Some(value) = l.strip_prefix("#EXT-X-MAP:") {
+                map = value.to_owned();
+            }
+            if !l.is_empty()
+                && !l.starts_with('#')
+                && let Some(id) = pending_uri.take()
+            {
+                let identity = (l.to_owned(), map.clone());
+                if self
+                    .media_identity
+                    .entry(id)
+                    .or_insert_with(|| identity.clone())
+                    != &identity
+                {
+                    return Err(format!(
+                        "media sequence mismatch {id}: URI or initialization changed"
+                    ));
+                }
+            }
             if let Some(rest) = l.strip_prefix("#EXT-X-PART:DURATION=") {
                 run.push(fixed5(rest.split(',').next().unwrap_or_default())?);
             } else if l == "#EXT-X-DISCONTINUITY" {
@@ -244,6 +368,7 @@ impl RuleCheck {
                         "segment {msn} changed discontinuity sequence to {dseq}"
                     ));
                 }
+                pending_uri = Some(msn);
                 msn += 1;
             }
         }
@@ -262,8 +387,7 @@ pub fn multivariant(m: &Muxer) -> String {
     }
     let mut s = format!(
         "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-INDEPENDENT-SEGMENTS\n\n\
-         #EXT-X-STREAM-INF:BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg},CODECS=\"{codecs}\",RESOLUTION={}x{}",
-        v.width, v.height
+         #EXT-X-STREAM-INF:BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg},CODECS=\"{codecs}\""
     );
     if let Some(fps) = v.fps.filter(|f| f.is_finite() && *f > 0.0) {
         let _ = write!(s, ",FRAME-RATE={fps:.3}");
@@ -279,6 +403,45 @@ mod tests {
     use crate::muxer::{Muxer, MuxerConfig};
 
     #[test]
+    fn whole_segment_mode_keeps_the_completed_timeline_without_part_advertising() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        feed(&mut m, 0..(30 * 3 + 7), 30);
+        let low = media(&m, "p1");
+        let whole = media_with_mode(&m, "p1", false);
+        for tag in [
+            "#EXT-X-PART",
+            "#EXT-X-SERVER-CONTROL",
+            "#EXT-X-PRELOAD-HINT",
+        ] {
+            assert!(
+                !whole.contains(tag),
+                "{tag} must not advertise partial delivery"
+            );
+        }
+        let closed = |text: &str| {
+            text.lines()
+                .filter(|line| {
+                    line.starts_with("#EXTINF:") || (!line.starts_with('#') && !line.is_empty())
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(closed(&whole), closed(&low));
+        for tag in [
+            "#EXT-X-TARGETDURATION:",
+            "#EXT-X-MEDIA-SEQUENCE:",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:",
+            "#EXT-X-MAP:",
+        ] {
+            assert_eq!(
+                whole.lines().find(|line| line.starts_with(tag)),
+                low.lines().find(|line| line.starts_with(tag))
+            );
+        }
+        assert!(whole.ends_with("p1_seg9.mp4\n"));
+    }
+
+    #[test]
     fn media_playlist_has_the_ios_shape() {
         let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
         feed(&mut m, 0..(30 * 3 + 7), 30);
@@ -288,15 +451,16 @@ mod tests {
         assert!(pl.contains("#EXT-X-TARGETDURATION:2\n"));
         assert!(pl.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0\n"));
         assert!(!pl.contains("#EXT-X-DISCONTINUITY\n"));
-        assert!(pl.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=0.58500\n"));
+        assert!(pl.contains("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=0.70200\n"));
         assert!(pl.contains("#EXT-X-PART-INF:PART-TARGET=0.23400\n"));
         assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
         assert!(pl.contains("#EXT-X-MAP:URI=\"p1_init.mp4\"\n"));
         assert_eq!(pl.matches("#EXT-X-GAP\n").count(), 7);
         assert!(pl.contains("#EXTINF:1.00000,\np1_seg7.mp4\n"));
         assert!(pl.contains("p1_seg9.mp4"));
-        // Parts only for the last two segments and the open one.
-        assert!(!pl.contains("URI=\"p1_part0.mp4\""));
+        // All three completed segments remain within the six-second part
+        // window, in addition to the published open part.
+        assert!(pl.contains("URI=\"p1_part0.mp4\""));
         assert!(pl.contains("#EXT-X-PART:DURATION=0.20000,URI=\"p1_part5.mp4\",INDEPENDENT=YES\n"));
         assert!(
             pl.contains("#EXT-X-PART:DURATION=0.20000,URI=\"p1_part15.mp4\",INDEPENDENT=YES\n")
@@ -304,6 +468,94 @@ mod tests {
         assert!(pl.ends_with("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p1_part16.mp4\"\n"));
         assert!(!pl.contains("CAN-SKIP-UNTIL"));
         assert_eq!(pl.matches("#EXT-X-PROGRAM-DATE-TIME:").count(), 2);
+    }
+
+    #[test]
+    fn apple_part_hold_back_is_at_least_three_printed_part_targets() {
+        // Apple HLS authoring specification 14.3 makes the three-target
+        // minimum mandatory. Check the decimals actually seen by clients,
+        // with different learned targets and after the live window rolls.
+        for part_min_ms in [200, 350, 1000] {
+            let config = MuxerConfig {
+                part_min: Duration::from_millis(part_min_ms),
+                ..MuxerConfig::default()
+            };
+            let mut m = Muxer::new(config, video(), Some(aac()));
+            feed(&mut m, 0..97, 30);
+            let mut initial = None;
+            for end in [97, 30 * 30 + 7] {
+                if end > 97 {
+                    feed(&mut m, 97..end, 30);
+                }
+                let pl = media(&m, "p");
+                let target = fixed5(
+                    pl.lines()
+                        .find_map(|line| line.strip_prefix("#EXT-X-PART-INF:PART-TARGET="))
+                        .expect("PART-TARGET"),
+                )
+                .expect("decimal target");
+                let hold_back = fixed5(
+                    pl.lines()
+                        .find_map(|line| line.strip_prefix("#EXT-X-SERVER-CONTROL:"))
+                        .expect("SERVER-CONTROL")
+                        .split(',')
+                        .find_map(|attribute| attribute.strip_prefix("PART-HOLD-BACK="))
+                        .expect("PART-HOLD-BACK"),
+                )
+                .expect("decimal hold-back");
+                assert!(target > 0);
+                assert!(
+                    hold_back >= 3 * target,
+                    "Apple 14.3: {hold_back} < 3 * {target}"
+                );
+                assert_eq!(
+                    *initial.get_or_insert((target, hold_back)),
+                    (target, hold_back)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn part_tag_history_follows_duration_and_the_published_open_edge() {
+        // Ten completed parents. A one-second GOP has target 2 and a
+        // six-second history; a three-second GOP has target 4 and twelve.
+        // At the exact boundary keep the older parent's entire part set.
+        for (gop, boundary_first, open_first, open_count, history_secs) in
+            [(30, 15, 20, 31, 6), (90, 75, 90, 61, 12)]
+        {
+            let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+            let end = gop * 10;
+            feed(&mut m, 0..end + 1, gop);
+            assert!(m.open_parts().is_empty());
+            let pl = media(&m, "p");
+            let first = pl
+                .lines()
+                .find(|line| line.starts_with("#EXT-X-PART:"))
+                .expect("part history");
+            assert!(first.contains(&format!("URI=\"p_part{boundary_first}.mp4\"")));
+            assert!(first.contains("INDEPENDENT=YES"));
+
+            // Publishing one 200 ms open part advances the edge and evicts
+            // the older parent's tags, without waiting for another segment.
+            feed(&mut m, end + 1..end + 7, gop);
+            assert_eq!(m.open_parts().len(), 1);
+            let pl = media(&m, "p");
+            let parts: Vec<_> = pl
+                .lines()
+                .filter(|line| line.starts_with("#EXT-X-PART:"))
+                .collect();
+            assert_eq!(parts.len(), open_count);
+            assert!(parts[0].contains(&format!("URI=\"p_part{open_first}.mp4\"")));
+            assert!(!pl.contains(&format!("URI=\"p_part{boundary_first}.mp4\"")));
+            // The default resource window still serves the removed part
+            // throughout the following three target durations.
+            feed(&mut m, end + 7..end + 7 + history_secs * 30, gop);
+            assert!(matches!(
+                m.part(boundary_first),
+                crate::PartLookup::Found(_)
+            ));
+        }
     }
 
     #[test]
@@ -385,7 +637,9 @@ mod tests {
         feed(&mut m, 0..61, 30);
         let pl = multivariant(&m);
         assert!(pl.contains("CODECS=\"avc1.4d400d,mp4a.40.2\""));
-        assert!(pl.contains("RESOLUTION="));
+        // A single live rendition can change aspect at a codec epoch. A fixed
+        // master RESOLUTION would ask clients to retain that old rectangle.
+        assert!(!pl.contains("RESOLUTION="));
         assert!(pl.ends_with("\nstream.m3u8\n"));
     }
 
