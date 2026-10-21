@@ -38,6 +38,12 @@ is required for B0, B1, B3 and release qualification. It fixes native platform
 interfaces, hardware codec use, single-encode fan-out, ownership and benchmark
 requirements for existing ForgeSworn components.
 
+The [reusable library and OBS plan](library-quality-plan.md) preserves the
+broader goal of making these libraries independently useful and production
+quality. Its LQ1 to LQ8 work queue covers APIs, packages, interoperability,
+performance evidence and possible OBS or desktop consumers alongside the
+mobile milestones. Specific OBS adapters and a desktop studio remain proposals.
+
 This is an implementation plan. Its milestones are open. Sapflow's existing
 [M0 to M7 goals](../GOALS.md), including the decision to keep experimenting
 before a production replacement, retain their own acceptance requirements.

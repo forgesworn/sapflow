@@ -34,6 +34,7 @@ lists every setting.
 - [Goals and milestones](GOALS.md)
 - [Standalone mobile broadcaster and SDK delivery plan](docs/mobile-streaming-plan.md)
 - [Native performance and ForgeSworn library reuse](docs/native-performance-contract.md)
+- [Reusable media libraries and OBS integration plan](docs/library-quality-plan.md)
 - [Mobile competition, feature priorities and free V4V distribution](docs/mobile-competitive-review.md)
 - [What v4v expects from its media server](docs/v4v-contract.md)
 - [Scoped native publishing sessions and private control API](docs/scoped-publish-sessions.md)

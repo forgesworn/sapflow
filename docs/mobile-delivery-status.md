@@ -23,6 +23,29 @@ consumer pass. This is an additive source/package gate; it does not attach a
 native origin decoder or qualify either phone. Earlier frozen app packages are
 preserved separately from these refreshed SDK artefacts.
 
+Android commit `aa8d5826` adds explicit pre-Prepare 480p and 720p profiles with
+immutable profile admission and scoped SRT pacing. Its frozen package passes
+183 JVM tests in 34 suites, lint with zero errors and ten warnings, actual
+qualification/release isolation and native alignment checks. The signed
+qualification APK has not replaced the owner's active Android capture. Actual
+480p hardware, sustained grant-cap and orientation qualification remain open.
+
+iOS commit `fdc731fc` provides typed V4V contracts, bounded URLSession control,
+durable session operations and encrypted journal storage. It passes 35 host
+Swift tests and an iOS 16 compile check with warnings treated as errors.
+Independent review is clear. It is a foundation separate from the installed
+app: creator sign-in, application wiring and real Keychain/network acceptance
+remain open.
+
+Test commit `d0643ff` adds a generated-media-only macOS native reader gate.
+The current origin's exact init plus independent part passes independent FFmpeg
+and Apple decoding; the latter produces six video outputs and 7,104 validated
+PCM frames in one output buffer. Header-only input is refused. Five wrapper
+regressions and independent source review pass. The harness removes generated
+media and stops its children. This finite format check does not qualify a
+production observer, phone decoder, hardware decoder or sustained performance.
+See [native origin observation](native-origin-observation.md).
+
 The refreshed ARM64 AAR passes its actual packaged consumer. Android commit
 `4e2ff845` retains one logical destination across codec epochs and consumes the
 new typed startup/progress events. Its exact 108-input source packet passes
@@ -41,9 +64,14 @@ capture remains running; neither new qualification APK has replaced it.
 The iOS reconnect source at `a399d13` passes 30 pure Swift tests and a real
 Network.framework cancellation probe without media. Its frozen application
 and test bundle compile, and the development-signed app passes strict signature
-verification, installation and launch on the primary iPhone. The subsequent
-UI test stopped at the device lock screen before execution. Installation does
-not establish physical capture, publishing, recording or reconnect acceptance.
+verification, installation and launch on the primary iPhone. An initial UI
+inspection stopped at the lock screen. A later fresh device query confirmed
+the phone was unlocked and the UI runner launched, but XCTest timed out while
+enabling automation mode, before a test method ran. The owner confirms that
+UI Automation was already enabled. The cause remains unresolved; no camera
+test ran. A metadata-only result audit found no attachments and extracted no
+payloads. Installation does not establish physical capture, publishing,
+recording or reconnect acceptance.
 Later text-only commit `5d5133a` corrects reconnect guidance; it does not rebuild
 that frozen app. Native iOS creator authentication and release acceptance remain
 open. New SDK packages do not silently replace the signed application.

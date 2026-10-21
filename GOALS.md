@@ -289,6 +289,12 @@ sets out the standalone iOS/Android app, shared SDK and origin-first release,
 followed by native RelaySwarm playback. Existing server milestones and gates
 still apply.
 
+The [reusable library and OBS plan](docs/library-quality-plan.md) records the
+owner's wider library ambition and the LQ1 to LQ8 work queue. Public APIs,
+independent consumers, packaging, interoperability and performance evidence
+are deliverables alongside the apps. OBS adapters and a later desktop studio
+remain explicitly scoped proposals until their product decisions are made.
+
 The linked [competition and distribution review](docs/mobile-competitive-review.md)
 adds our own SRT/RTMP client requirement, measured native-performance targets,
 open-source/free Android distribution and always-free V4V broadcasting.
