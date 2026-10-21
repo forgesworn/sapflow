@@ -50,6 +50,11 @@ The Mac's disk is nearly full and Rust builds are large.
 
 ## Conventions
 
+- Never commit, push or publish real camera footage, extracted camera frames,
+  phone recordings or archives containing them. Keep these in ignored private
+  lab storage. Only generated, non-camera media fixtures may be considered for
+  source control; verify their provenance before staging. A media extension
+  alone does not establish that a file is safe to publish.
 - British English in prose and identifiers. No em dashes.
 - Commits: `type: description`, no `Co-Authored-By` trailers. Commit as
   `TheCryptoDonkey <TheCryptoDonkey@users.noreply.github.com>`.
