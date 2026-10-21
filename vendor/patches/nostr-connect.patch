@@ -1,0 +1,30 @@
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -48,6 +48,18 @@
+         timeout: Duration,
+         opts: Option<RelayOptions>,
+     ) -> Result<Self, Error> {
++        Self::new_with_client_builder(uri, client_keys, timeout, opts, ClientBuilder::default())
++    }
++
++    /// Construct on a caller-configured fresh SDK client. All NIP46 bootstrap,
++    /// persona discovery, verification and signing semantics remain unchanged.
++    pub fn new_with_client_builder(
++        uri: NostrConnectUri,
++        client_keys: Keys,
++        timeout: Duration,
++        opts: Option<RelayOptions>,
++        client_builder: ClientBuilder,
++    ) -> Result<Self, Error> {
+         // Check app keys
+         if let NostrConnectUri::Client { public_key, .. } = &uri {
+             if public_key != &client_keys.public_key() {
+@@ -63,7 +75,7 @@
+             // If the URI is bunker, the remote_signer_public_key is set in the bootstrap method.
+             remote_signer_public_key: OnceCell::new(),
+             user_public_key: OnceCell::new(),
+-            client: Client::default(),
++            client: client_builder.build(),
+             timeout,
+             opts: opts.unwrap_or_default(),
+             auth_url_handler: None,

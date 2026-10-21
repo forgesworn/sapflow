@@ -1,0 +1,131 @@
+--- a/src/native/mod.rs
++++ b/src/native/mod.rs
+@@ -35,14 +35,29 @@
+     mode: &ConnectionMode,
+     headers: HeaderMap,
+ ) -> Result<WebSocket, Error> {
++    connect_with_headers_and_config(url, mode, headers, None).await
++}
++
++/// The existing DNS/proxy/TLS path with caller-selected native WebSocket
++/// buffer and assembled-message limits. None preserves upstream defaults.
++pub async fn connect_with_headers_and_config(
++    url: &Url,
++    mode: &ConnectionMode,
++    headers: HeaderMap,
++    config: Option<WebSocketConfig>,
++) -> Result<WebSocket, Error> {
+     match mode {
+-        ConnectionMode::Direct => connect_direct(url, headers).await,
++        ConnectionMode::Direct => connect_direct(url, headers, config).await,
+         #[cfg(feature = "socks")]
+-        ConnectionMode::Proxy(proxy) => connect_proxy(url, *proxy, headers).await,
+-    }
+-}
+-
+-async fn connect_direct(url: &Url, headers: HeaderMap) -> Result<WebSocket, Error> {
++        ConnectionMode::Proxy(proxy) => connect_proxy(url, *proxy, headers, config).await,
++    }
++}
++
++async fn connect_direct(
++    url: &Url,
++    headers: HeaderMap,
++    config: Option<WebSocketConfig>,
++) -> Result<WebSocket, Error> {
+     let host: &str = url.host_str().ok_or_else(Error::empty_host)?;
+     let port: u16 = url
+         .port_or_known_default()
+@@ -52,7 +67,7 @@
+ 
+     let tcp_stream: TcpStream = tokio_happy_eyeballs::connect(host).await?;
+ 
+-    connect_stream(url, tcp_stream, headers).await
++    connect_stream(url, tcp_stream, headers, config).await
+ }
+ 
+ #[cfg(feature = "socks")]
+@@ -60,6 +75,7 @@
+     url: &Url,
+     proxy: SocketAddr,
+     headers: HeaderMap,
++    config: Option<WebSocketConfig>,
+ ) -> Result<WebSocket, Error> {
+     let host: &str = url.host_str().ok_or_else(Error::empty_host)?;
+     let port: u16 = url
+@@ -68,15 +84,16 @@
+     let addr: String = format!("{host}:{port}");
+ 
+     let conn: TcpStream = TcpSocks5Stream::connect(proxy, addr).await?;
+-    connect_stream(url, conn, headers).await
++    connect_stream(url, conn, headers, config).await
+ }
+ 
+ async fn connect_stream(
+     url: &Url,
+     stream: TcpStream,
+     headers: HeaderMap,
+-) -> Result<WebSocket, Error> {
+-    let stream = client_async(url, stream, headers).await?;
++    config: Option<WebSocketConfig>,
++) -> Result<WebSocket, Error> {
++    let stream = client_async(url, stream, headers, config).await?;
+     Ok(WebSocket::tokio(Box::new(stream)))
+ }
+ 
+@@ -92,9 +109,13 @@
+     url: &Url,
+     stream: TcpStream,
+     headers: HeaderMap,
++    config: Option<WebSocketConfig>,
+ ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
+     let request = request_with_headers(url, headers)?;
+-    let (stream, _) = Box::pin(tokio_tungstenite::client_async_tls(request, stream)).await?;
++    let (stream, _) = Box::pin(tokio_tungstenite::client_async_tls_with_config(
++        request, stream, config, None,
++    ))
++    .await?;
+     Ok(stream)
+ }
+ 
+@@ -108,6 +129,7 @@
+     url: &Url,
+     stream: TcpStream,
+     headers: HeaderMap,
++    config: Option<WebSocketConfig>,
+ ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
+     if url.scheme() == "wss" {
+         return Err(tokio_tungstenite::tungstenite::Error::Url(
+@@ -117,9 +139,10 @@
+     }
+ 
+     let request = request_with_headers(url, headers)?;
+-    let (stream, _) = Box::pin(tokio_tungstenite::client_async(
++    let (stream, _) = Box::pin(tokio_tungstenite::client_async_with_config(
+         request,
+         MaybeTlsStream::Plain(stream),
++        config,
+     ))
+     .await?;
+     Ok(stream)
+--- a/src/socket.rs
++++ b/src/socket.rs
+@@ -64,6 +64,18 @@
+         headers: crate::native::HeaderMap,
+     ) -> Result<Self, Error> {
+         crate::native::connect_with_headers(url, mode, headers).await
++    }
++    /// Configure native buffers/assembled-message limits on the same maintained
++    /// connection path. TLS, host validation, DNS, headers and proxy behaviour
++    /// remain those of connect_with_headers.
++    #[cfg(not(target_arch = "wasm32"))]
++    pub async fn connect_with_headers_and_config(
++        url: &Url,
++        mode: &ConnectionMode,
++        headers: crate::native::HeaderMap,
++        config: Option<crate::native::WebSocketConfig>,
++    ) -> Result<Self, Error> {
++        crate::native::connect_with_headers_and_config(url, mode, headers, config).await
+     }
+ }
+ 

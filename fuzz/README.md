@@ -13,6 +13,7 @@
 | `rtmp_client` | Own publishing client before or after an original publish exchange, then fragmented hostile receiver bytes; cancellation clears pending output |
 | `mobile_media` | SDK H264/AAC configuration and compressed sample admission with bounded hostile framing and timing |
 | `own_srt_caller` | Own caller/sender, optional original encrypted negotiation, AES128/256 refresh, hostile data/KM replays and mutations, bounded admission, clocks and cancellation |
+| `signet_auth` | Bounded cold-auth credential/URI and fixed kind-21236 contract parsers; no runtime, relay, signer or account |
 | `publish_session` | Production scoped-session JSON and checksummed metadata parsers, plus bounded pure authority commands, durable snapshots, connection claims and stale lease/restart/terminal fences; no I/O |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
@@ -111,3 +112,7 @@ To recapture the SRT session seed: run sapflow on 127.0.0.1:8890, proxy a
 datagram as `[0, step, len_hi, len_lo, bytes]`, and save the result as
 `regressions/own_srt_listener/real-session` (recorded for the srt-protocol
 listener target, removed 2026-10-21; the format is the same).
+
+`seeds/signet_auth/` contains generated-only fixed login fields, a synthetic
+client credential and escaped duplicate keys. The target never creates a native
+worker or connects to a relay. Use `-max_len=16384` for this cold-auth parser.

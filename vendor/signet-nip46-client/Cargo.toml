@@ -1,0 +1,32 @@
+[package]
+name = "signet-nip46-client"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Thin NIP-46 bunker signer for Rust — pair / sign / restore over nostr-connect. Generic; ships sensible defaults for the Signet/Heartwood bunker flow."
+license = "MIT"
+repository = "https://github.com/forgesworn/signet-nip46-client"
+homepage = "https://github.com/forgesworn/signet-nip46-client"
+documentation = "https://docs.rs/signet-nip46-client"
+readme = "README.md"
+keywords = ["nostr", "nip46", "signer", "bunker", "signet"]
+categories = ["cryptography", "authentication", "api-bindings"]
+
+[features]
+default = []
+# Temporary opt-in until maintained NostrConnect publishes its client-builder
+# seam. Sapflow pins the complete reviewed source patch group.
+bounded-client = []
+
+[dependencies]
+# 0.2 exposes the maintained rust-nostr 0.45 trait family. This is a public
+# Rust API break from 0.1 (nostr 0.44), not a wire/credential format change.
+nostr = "=0.45.5"
+nostr-connect = "=0.45.2"
+nostr-sdk = { version = "=0.45.4", default-features = false }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+bitcoin_hashes = "=1.2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
