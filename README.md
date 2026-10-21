@@ -36,6 +36,7 @@ lists every setting.
 - [Native performance and ForgeSworn library reuse](docs/native-performance-contract.md)
 - [Mobile competition, feature priorities and free V4V distribution](docs/mobile-competitive-review.md)
 - [What v4v expects from its media server](docs/v4v-contract.md)
+- [Scoped native publishing sessions and private control API](docs/scoped-publish-sessions.md)
 - [Encoders tried so far](docs/interop.md)
 - [Apple's LL-HLS rules and the mediamtx/gohlslib reference](docs/reference.md)
 - [Agent guide](AGENTS.md)

@@ -1381,6 +1381,7 @@ dependencies = [
  "axum",
  "bytes",
  "fs4",
+ "getrandom 0.4.3",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1388,9 +1389,13 @@ dependencies = [
  "sapflow-core",
  "sapflow-hls",
  "sapflow-srt",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

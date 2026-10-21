@@ -43,9 +43,55 @@ source merge and Apple holdback correction have not been deployed there.
 V4V commit `711d1a8077c4bea9e1ed4bb155a9bcf6a8bcbb2b` on a separate local branch
 prevents ended-event telemetry resurrection and rejects recording copies when
 the prepared session changes. Live browser and generated-media ingest gates
-pass. Scoped native grants, active origin revocation and callback session
-identity remain open; global lab credentials are not a production connector.
+pass. The follow-on scoped connector now has real creator prepare, refresh,
+status and End, durable terminal-intent retries, and session/epoch/sequence
+callback and recording fences. Its source at `28e8e313` passes 112 relevant
+tests; the local branch retains the safe generated-media evidence and contract
+at `182aef1b`. This remains separate from physical native creator integration.
 No changes from this task have been pushed or deployed publicly.
+
+### Scoped origin and connector checkpoint
+
+The [scoped-session contract](scoped-publish-sessions.md) is implemented locally.
+It provides a separate bounded loopback control listener, durable metadata with
+no grant secrets, required per-session AES256 SRT, monotonic revisions and
+connection epochs, terminal replay fences and active idle cancellation. Released
+or cancelled leases cannot reopen admission or erase a refreshed grant's keys.
+Restart restores admission disabled; retrying the old exact provision stays
+inactive until a fresh higher-revision refresh. Retained session IDs cannot alias
+another event's control route.
+
+Core, store, manager, HTTP, callback and recorder checks pass, including 88 server
+tests. The production parser/state fuzz target passes 12,332 executions over
+61 seconds under AddressSanitizer with overflow checks. Its eleven original
+synthetic seeds and the target participate in the existing dynamic CI fuzz list.
+This finite local result is not a CI or sustained-network qualification.
+
+A real isolated V4V/origin pair exercised signed creator login, provision,
+encrypted black-box libsrt publishing, active refresh, independent H264/AAC HLS
+decode, active End, callback delivery and independent HTTP replay decode. A saved
+End request made while the origin was down recovered through the real retry
+worker with its original session, revision and idempotency key. Wrong admission
+and AES secrets, superseded generations and late terminal telemetry were refused
+or ignored without reopening the event. An admitted idle encrypted caller also
+reached native protocol shutdown on credential expiry. These tests used generated
+colour/noise and sine media only; they did not exercise a phone or a real show.
+
+The generated over-rate test exposed and then verified a recording correction:
+rate rejection, ingest discard and SRT queue/transport loss now retain a synced
+accepted prefix as `incomplete`. A normal clean End can still finalise. On the
+corrected binary, V4V retained the incomplete recording receipt, kept End
+incomplete and imported no replay. A finalised epoch file alone still does not
+prove complete-show aggregation. The connector currently blocks preparing a
+replacement for the same event after an incomplete/failed receipt; an explicit
+recovery workflow remains open.
+
+Both isolated listeners and every generated-media child were stopped, and their
+temporary credentials, stores and media removed after safe receipts were retained.
+The owner's separate camera lab was not changed. Scoped native creator login,
+refresh and observed-media confirmation, production configuration and deployment,
+complete-show recovery and physical iOS/Android acceptance remain open. Global
+lab credentials are not a production connector.
 
 ## Product constraints
 

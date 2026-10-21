@@ -59,6 +59,13 @@ impl Source {
         }
     }
 
+    pub fn dropped_packets(&self) -> u64 {
+        match self {
+            Self::Ts(ingest) => ingest.dropped_packets(),
+            Self::Flv(_) => 0,
+        }
+    }
+
     pub fn muxer(&self) -> Option<&Muxer> {
         match self {
             Self::Ts(t) => t.muxer(),
@@ -104,6 +111,15 @@ pub struct Session {
 }
 
 impl Session {
+    /// Ignore delayed notices from an older connection after replacement.
+    pub fn mark_recording_incomplete(&self, generation: u64) {
+        if self.generation == generation
+            && let Some(recorder) = &self.recorder
+        {
+            recorder.mark_incomplete();
+        }
+    }
+
     pub fn hold_remaining(&mut self, grace: Duration, now: Instant) -> Duration {
         if grace.is_zero() {
             return Duration::ZERO;
@@ -349,6 +365,33 @@ impl Registry {
         let session = stream.session();
         if session.generation != generation || session.attached || stream.lock().closed {
             return false;
+        }
+        drop(session);
+        Self::end(&mut map, stream);
+        true
+    }
+
+    /// An explicit scoped revocation has no reconnect grace. Flush only media
+    /// already accepted before the authority gate closed, then finalise its
+    /// recorder. A delayed old owner cannot terminate a replacement stream.
+    pub fn terminate(&self, stream: &Arc<LiveStream>, generation: u64) -> bool {
+        let mut map = self.map();
+        if !map
+            .get(stream.path.event_id())
+            .is_some_and(|s| Arc::ptr_eq(s, stream))
+        {
+            return false;
+        }
+        let mut session = stream.session();
+        if session.generation != generation || stream.lock().closed {
+            return false;
+        }
+        session.attached = false;
+        stream.interrupt();
+        if let Some(recorder) = &mut session.recorder
+            && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
+        {
+            recorder.feed(tracks, parts);
         }
         drop(session);
         Self::end(&mut map, stream);

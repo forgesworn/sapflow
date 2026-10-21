@@ -15,7 +15,7 @@ use sapflow_core::{PublishError, PublishRequest};
 
 use crate::App;
 use crate::publish::{Publication, Refusal};
-use crate::stream::{Source, SourceKind};
+use crate::stream::Source;
 
 /// Drop a publisher that sends nothing for this long (the SRT
 /// connection's own 5 s timeout normally fires first).
@@ -61,7 +61,7 @@ impl Refused {
 /// Decides on a caller from its stream id, with `active` SRT publishers
 /// already live: begins its publication, or says why not (and logs it,
 /// rate-limited).
-pub fn admit(
+pub async fn admit(
     app: &Arc<App>,
     stream_id: &str,
     from: IpAddr,
@@ -70,7 +70,9 @@ pub fn admit(
     let admitted = match PublishRequest::parse_srt_stream_id(stream_id) {
         Err(e) => Err(Refused::Policy(Refusal::Request(e))),
         Ok(_) if active >= app.config.max_publishers => Err(Refused::PublisherLimit),
-        Ok(req) => Publication::begin(app, &req, SourceKind::Ts, from).map_err(Refused::Policy),
+        Ok(req) => Publication::begin_srt(app, &req, from)
+            .await
+            .map_err(Refused::Policy),
     };
     if let Err(r) = &admitted {
         match r {

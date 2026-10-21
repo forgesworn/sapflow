@@ -7,9 +7,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::publish_session_wire::Secret;
 use sapflow_core::Publisher;
 use sapflow_core::recording::{RecordPolicy, parse_age};
 use sapflow_srt::crypto::{CryptoConfig, KeySize};
+use std::sync::Arc;
 
 pub const HELP: &str = "\
 sapflow: SRT in, Low-Latency HLS out, for the v4v live stage.
@@ -25,6 +27,11 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            settings are present they must agree
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
+  SAPFLOW_CONTROL_ADDR     enable scoped SRT publishing: private loopback control
+                           listener, behind an authenticated private TLS proxy
+  SAPFLOW_CONTROL_TOKEN    dedicated control bearer (32..256 ASCII token bytes)
+  SAPFLOW_SESSION_STORE    absolute metadata file in an existing private directory
+                           (all three required; disables global/open publishing)
   SAPFLOW_PUBLISH_USER     the one publisher allowed to push
   SAPFLOW_PUBLISH_PASS     its password
   SAPFLOW_OPEN_PUBLISH     set to 1 to accept any publisher (local testing only)
@@ -55,6 +62,9 @@ Play at http://<host>:8888/live/<eventId>/index.m3u8.
 
 /// Every setting, as an environment variable.
 const KEYS: &[&str] = &[
+    "SAPFLOW_CONTROL_ADDR",
+    "SAPFLOW_CONTROL_TOKEN",
+    "SAPFLOW_SESSION_STORE",
     "SAPFLOW_SRT_ADDR",
     "SAPFLOW_HTTP_ADDR",
     "SAPFLOW_PUBLISH_USER",
@@ -79,7 +89,15 @@ const KEYS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
+pub struct ControlConfig {
+    pub addr: SocketAddr,
+    pub token: Arc<Secret>,
+    pub store: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
+    pub control: Option<ControlConfig>,
     pub srt_addr: SocketAddr,
     /// Independent transport secret. Shared zeroising ownership, redacted Debug.
     pub srt_crypto: Option<CryptoConfig>,
@@ -119,9 +137,10 @@ impl Config {
         // Retain a redacted error until overrides have been applied.
         let secret = |value: String| CryptoConfig::new(value.into_bytes(), KeySize::Aes128);
         let mut srt_crypto = get("SAPFLOW_SRT_PASSPHRASE").map(secret);
+        let mut control_token = get("SAPFLOW_CONTROL_TOKEN").map(Secret::new);
         let mut vals: std::collections::HashMap<String, String> = KEYS
             .iter()
-            .filter(|k| **k != "SAPFLOW_SRT_PASSPHRASE")
+            .filter(|k| !matches!(**k, "SAPFLOW_SRT_PASSPHRASE" | "SAPFLOW_CONTROL_TOKEN"))
             .filter_map(|k| {
                 get(k)
                     .filter(|v| {
@@ -157,6 +176,8 @@ impl Config {
             };
             if key == "SAPFLOW_SRT_PASSPHRASE" {
                 srt_crypto = Some(secret(value));
+            } else if key == "SAPFLOW_CONTROL_TOKEN" {
+                control_token = Some(Secret::new(value));
             } else {
                 vals.insert(key, value);
             }
@@ -167,13 +188,38 @@ impl Config {
             v.parse()
                 .map_err(|_| ConfigError::Invalid(format!("{key}: not an address: {v}")))
         };
+        let control = match (vals.get("SAPFLOW_CONTROL_ADDR"), control_token, vals.get("SAPFLOW_SESSION_STORE")) {
+            (None, None, None) => None,
+            (Some(address), Some(token), Some(store)) => {
+                let addr: SocketAddr = address.parse().map_err(|_| ConfigError::Invalid("SAPFLOW_CONTROL_ADDR: numeric loopback address required".into()))?;
+                let value = token.expose();
+                if !addr.ip().is_loopback() || !(32..=256).contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-'|b'_'|b'.'|b'~')) {
+                    return Err(ConfigError::Invalid("control listener requires loopback and a 32..256-byte token".into()));
+                }
+                let store = PathBuf::from(store);
+                if !store.is_absolute() || store.file_name().is_none() { return Err(ConfigError::Invalid("SAPFLOW_SESSION_STORE: absolute file path required".into())); }
+                Some(ControlConfig { addr, token: Arc::new(token), store })
+            }
+            _ => return Err(ConfigError::Invalid("SAPFLOW_CONTROL_ADDR, SAPFLOW_CONTROL_TOKEN and SAPFLOW_SESSION_STORE must be configured together".into())),
+        };
         let open = vals.get("SAPFLOW_OPEN_PUBLISH").is_some_and(|v| v == "1");
+        if control.is_some()
+            && (open
+                || vals.contains_key("SAPFLOW_PUBLISH_USER")
+                || vals.contains_key("SAPFLOW_PUBLISH_PASS")
+                || srt_crypto.is_some()
+                || vals.contains_key("SAPFLOW_SRT_CIPHER")
+                || vals.contains_key("SAPFLOW_SRT_PBKEYLEN")
+                || vals.get("SAPFLOW_RTMP_ADDR").is_some_and(|v| v != "off"))
+        {
+            return Err(ConfigError::Invalid("scoped control mode requires per-session encrypted SRT; global/open publishing, global SRT keys and RTMP are disabled".into()));
+        }
         let publisher = match (
             vals.get("SAPFLOW_PUBLISH_USER"),
             vals.get("SAPFLOW_PUBLISH_PASS"),
         ) {
             (Some(u), Some(p)) => Some(Publisher::new(u, p)),
-            (None, None) if open => None,
+            (None, None) if open || control.is_some() => None,
             (None, None) => {
                 return Err(ConfigError::Invalid(
                     "set SAPFLOW_PUBLISH_USER and SAPFLOW_PUBLISH_PASS (or SAPFLOW_OPEN_PUBLISH=1 for local testing)".into(),
@@ -204,6 +250,7 @@ impl Config {
         };
 
         let rtmp_addr = match vals.get("SAPFLOW_RTMP_ADDR").map(String::as_str) {
+            _ if control.is_some() => None,
             Some("off") => None,
             _ => Some(addr("SAPFLOW_RTMP_ADDR", "0.0.0.0:1935")?),
         };
@@ -313,6 +360,7 @@ impl Config {
             });
 
         Ok(Self {
+            control,
             reconnect_grace,
             health_interval,
             srt_crypto,
@@ -664,6 +712,52 @@ mod tests {
             ),
             Err(ConfigError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn scoped_mode_is_explicit_private_and_cannot_fall_back_to_global_credentials() {
+        let base = [
+            ("SAPFLOW_CONTROL_ADDR", "127.0.0.1:9000"),
+            (
+                "SAPFLOW_CONTROL_TOKEN",
+                "independent-control-token-32-bytes-minimum",
+            ),
+            ("SAPFLOW_SESSION_STORE", "/private/session-authority.json"),
+        ];
+        let config = load(&base, &[]).expect("scoped config");
+        assert!(config.control.is_some());
+        assert!(config.publisher.is_none());
+        assert!(config.rtmp_addr.is_none());
+        assert!(config.srt_crypto.is_none());
+        assert!(!format!("{config:?}").contains("independent-control-token"));
+        for (key, value) in [
+            ("SAPFLOW_OPEN_PUBLISH", "1"),
+            ("SAPFLOW_PUBLISH_USER", "publisher"),
+            ("SAPFLOW_PUBLISH_PASS", "password"),
+            ("SAPFLOW_SRT_PASSPHRASE", "transport-secret"),
+            ("SAPFLOW_SRT_PBKEYLEN", "32"),
+            ("SAPFLOW_RTMP_ADDR", "127.0.0.1:1935"),
+        ] {
+            let mut values = base.to_vec();
+            values.push((key, value));
+            assert!(load(&values, &[]).is_err(), "{key}");
+        }
+        for values in [
+            vec![base[0], base[1]],
+            vec![base[1], base[2]],
+            vec![base[0], base[2]],
+        ] {
+            assert!(load(&values, &[]).is_err());
+        }
+        for args in [
+            vec!["--control-addr=0.0.0.0:9000"],
+            vec!["--control-token="],
+            vec!["--control-token=short"],
+            vec!["--session-store=relative.json"],
+        ] {
+            assert!(load(&base, &args).is_err());
+        }
+        assert!(load(&base, &["--control-addr=[::1]:9000", "--rtmp-addr=off"]).is_ok());
     }
 
     #[test]

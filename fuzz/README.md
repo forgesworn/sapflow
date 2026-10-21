@@ -13,6 +13,7 @@
 | `rtmp_client` | Own publishing client before or after an original publish exchange, then fragmented hostile receiver bytes; cancellation clears pending output |
 | `mobile_media` | SDK H264/AAC configuration and compressed sample admission with bounded hostile framing and timing |
 | `own_srt_caller` | Own caller/sender, optional original encrypted negotiation, AES128/256 refresh, hostile data/KM replays and mutations, bounded admission, clocks and cancellation |
+| `publish_session` | Production scoped-session JSON and checksummed metadata parsers, plus bounded pure authority commands, durable snapshots, connection claims and stale lease/restart/terminal fences; no I/O |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
@@ -53,6 +54,25 @@ These are seed inputs, not historical crashes. CI and the nightly run copy
 them into temporary corpora alongside any recorded regressions and retain
 overflow checks. New targets still need actual local/CI execution receipts;
 their inclusion in the workflow is not a passing fuzz result.
+
+`seeds/publish_session/` contains original synthetic PUT/revoke JSON, checksummed
+empty/prepared/revoked/expired documents, and stateful command sequences. No
+credential in these files grants access to a running service. The target feeds
+raw bytes to the production parsers and shapes valid JSON to reach semantic
+checks. It also starts four prepared rows and interprets up to 64 sixteen-byte
+records as provision, refresh, revoke, reserve/commit/release, clock advance or
+restore. Eight retained event rows bound memory; sixteen possible paths exercise
+capacity refusal. Successful commands must retain monotonic generations,
+revisions, connection epochs and terminal fences; restored admission stays
+disabled. Mutated snapshots exercise structural rejection. For a finite run:
+
+```bash
+RUSTC_BOOTSTRAP=1 cargo fuzz run -O -a publish_session seeds/publish_session -- -runs=0 -max_len=65536
+```
+
+Use a temporary copy of these seeds for mutation runs so generated corpus files
+do not become source fixtures. Actual local execution and CI remain separate
+evidence from the presence of the target and seeds.
 
 The own caller target uses a mode byte and records
 `[operation, step_ms, len_hi, len_lo, bytes]`. Without the high mode bit, it

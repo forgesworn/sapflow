@@ -304,8 +304,9 @@ mod epoch_tests {
         }
         (
             Arc::new(App {
+                publish_sessions: None,
                 config,
-                streams: Registry::default(),
+                streams: Arc::new(Registry::default()),
                 callbacks: Callbacks::start(None, None),
                 auth_throttle: Mutex::new(sapflow_core::limits::AuthThrottle::new(
                     10,
