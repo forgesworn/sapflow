@@ -216,7 +216,9 @@ used version 5).
 ### M7 Stage resilience and production readiness
 
 **Status (2026-10-21):** the grace period and the health callback are done;
-the Linux and Caddy measurements and CI's first run are not.
+CI's first run on GitHub passed (2026-10-21: format, clippy and tests;
+the smoke test with both SRT implementations; fuzz regressions and 60 s
+per target). The Linux and Caddy measurements are not done.
 - `SAPFLOW_RECONNECT_GRACE` (default 90 s, equal to v4v's
   `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`): a dropped publisher's stream,
   playlist and recording are held; a reconnect on either protocol carries
@@ -242,8 +244,8 @@ the Linux and Caddy measurements and CI's first run are not.
 - Measured on Linux behind Caddy: the wired 250 and 750 full-viewer run,
   and glass-to-glass delay.
 - CI on the public repo: tests, clippy, fmt, short fuzz runs, nightly long
-  fuzzing. Written (`.github/workflows/ci.yml`, `fuzz-nightly.yml`); not
-  verified until it has run on GitHub.
+  fuzzing (`.github/workflows/ci.yml`, `fuzz-nightly.yml`). `ci.yml` passed
+  on its first run on GitHub; the nightly fuzz run is not yet seen.
 
 ### Later
 
