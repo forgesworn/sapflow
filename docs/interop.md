@@ -58,12 +58,33 @@ Safari plays `http://<host>:18882/live/event-irr/index.m3u8`. On
 A recording of 60 s of it from d480bb9 lasts 50.8 s (the drops, and the
 video waiting for keyframes, are left out), decodes cleanly and seeks.
 
+## Delay through the server
+
+`scripts/ingest-lag.py` publishes ffmpeg's test signal in real time and
+times when each part appears in the playlist against when ffmpeg sent its
+last frame: SRT latency plus whatever the server adds, without the player.
+On 2026-10-21, own SRT and RTMP on the same server, 30 to 40 s each:
+
+| Publish | Median lag | p90 |
+|---------|------------|-----|
+| RTMP | -0.23 s | 0.03 s |
+| SRT, 200 ms latency | -0.12 s | 0.16 s |
+| SRT, 2000 ms latency | 1.68 s | 1.97 s |
+| SRT, 200 ms, ffmpeg's MPEG-TS defaults | 1.91 s | 2.12 s |
+
+ffmpeg's read burst at the start puts every sample about 0.3 s early, so a
+part is servable about when the SRT latency has passed: the server adds
+nothing measurable. ffmpeg's own MPEG-TS defaults (`muxdelay`, PES
+packing) add about 1.7 s, the same against srt-rs; `-muxdelay 0
+-muxpreload 0 -pes_payload_size 0 -flush_packets 1` removes it. That is
+the sender's delay, worth knowing when an ffmpeg-based encoder seems slow.
+
 ## Not yet tried
 
 - Larix on Android.
 - The phone locked or backgrounded; SRT with a passphrase.
-- Larix or OBS reconnecting after a drop of over 5 s, which the grace
-  period now carries on (tested with ffmpeg only).
+- OBS reconnecting after a drop of over 5 s, which the grace period now
+  carries on (Larix: see Stopping and restarting).
 - OBS's Apple hardware encoder; vMix.
 
 ## Stopping and restarting
@@ -76,7 +97,16 @@ after 10 s), has its stream held for `SAPFLOW_RECONNECT_GRACE` (default
 90 s): a restart within it carries on the same playlist and recording
 after a discontinuity (`docs/reference.md`, Target duration and breaks).
 With ffmpeg, the smoke test and v4v's ingest gates cover it; hls.js was
-watched crossing a reconnect. Not yet tried with Larix or OBS restarting.
+watched crossing a reconnect.
+
+On 2026-10-21 Larix (iPhone, Wi-Fi) published over RTMP and our own SRT at
+once. The RTMP connection dropped seven times in six minutes (the phone
+closing it, gone 10 to 58 s each time); every reconnect resumed the held
+stream, with `unpublish` at the drop and `publish` on the return. Safari
+kept playing but ended about 10 s behind the camera, as each break left it
+further back. The SRT stream had one break. Larix's first two SRT attempts
+that session were accepted but sent no data, and timed out after 5 s; its
+third, 20 s later, ran cleanly. Not yet explained. Not yet tried with OBS restarting.
 
 ## SRT under packet loss (2026-10-20)
 
