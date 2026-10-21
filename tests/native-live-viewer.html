@@ -45,7 +45,7 @@ globalThis.SapflowNativeHls = (() => {
       this.video = video; this.source = source; this.now = now; this.wall = wall;
       this.instanceId = instanceId; this.events = []; this.handlers = new Map(); this.disposed = false;
       this.startedAt = now(); this.lastProgressAt = null;
-      this.previousTime = finite(video.currentTime); this.previousFrames = frames(video);
+      this.progressTime = finite(video.currentTime); this.progressFrames = frames(video);
       for (const type of ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'waiting',
         'stalled', 'pause', 'ended', 'error', 'resize', 'seeking', 'seeked', 'emptied']) {
         const handler = () => this.record(type);
@@ -65,12 +65,19 @@ globalThis.SapflowNativeHls = (() => {
     }
     sample() {
       const video = this.video, now = this.now(), time = finite(video.currentTime), decoded = frames(video);
-      const frameProgress = decoded === null || this.previousFrames === null || decoded > this.previousFrames;
-      if (!video.paused && !video.ended && !video.error && video.readyState >= 2 && video.videoWidth > 0 &&
-          time !== null && this.previousTime !== null && time > this.previousTime + 0.01 && frameProgress) {
-        this.lastProgressAt = now;
+      const reset = (time !== null && this.progressTime !== null && time < this.progressTime) ||
+        (decoded !== null && this.progressFrames !== null && decoded < this.progressFrames);
+      if (reset || video.paused || video.ended || video.error) {
+        this.progressTime = time; this.progressFrames = decoded;
       }
-      this.previousTime = time; this.previousFrames = decoded;
+      const frameProgress = decoded === null || this.progressFrames === null || decoded > this.progressFrames;
+      if (!video.paused && !video.ended && !video.error && video.readyState >= 2 && video.videoWidth > 0 &&
+          time !== null && this.progressTime !== null && time > this.progressTime + 0.01 && frameProgress) {
+        this.lastProgressAt = now;
+        // Safari may expose time and frame-counter changes on separate reads.
+        // Compare both with the last confirmed progress, not the last poll.
+        this.progressTime = time; this.progressFrames = decoded;
+      }
       let state;
       if (video.error) state = 'error';
       else if (video.ended) state = 'ended';

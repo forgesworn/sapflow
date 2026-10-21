@@ -18,7 +18,10 @@ player; it does not fetch or retain media bytes.
 The status requires advancing media time, available decoded-frame progress
 and sufficient ready state before reporting playback. Four seconds without
 progress reports stalled. An intentional pause, end or media error has its own
-status. The frame counter is sampled once per second, not a count of frames
+status. Time and frame-counter changes are compared with the last confirmed
+progress so separate native counter updates cannot cause a false stall. A
+decoder counter reset establishes a new baseline without fabricating progress.
+The frame counter is sampled once per second, not a count of frames
 physically presented. Buffered-ahead time and seekable ranges are diagnostic
 values, not glass-to-glass latency. Native HLS may buffer differently from the
 separate hls.js fixture; qualify both independently.

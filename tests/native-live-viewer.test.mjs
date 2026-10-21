@@ -32,6 +32,26 @@ function fixture(supported = 'maybe', frameCounter = true) {
 }
 assert.throws(() => fixture(''), /Native HLS is unavailable/);
 {
+  const f = fixture(); f.video.readyState = 4;
+  assert.equal(f.tick(1, 0, 30).state, 'waiting'); // Frame counter becomes visible before media time.
+  assert.equal(f.tick(1000, 1, 30).state, 'playing');
+  f.tick(1000, 0, 40); // A backwards media-time reset establishes a fresh baseline.
+  assert.equal(f.tick(4000, 0, 40).state, 'stalled');
+  assert.equal(f.tick(1000, 1, 70).state, 'playing');
+}
+{
+  const f = fixture(); f.video.readyState = 4;
+  f.tick(1000, 1, 0); // Media time and decoder counters can update on separate observations.
+  assert.equal(f.tick(1, 1, 30).state, 'playing');
+  f.tick(1000, 2, 30);
+  assert.equal(f.tick(1, 2, 60).state, 'playing');
+  assert.equal(f.tick(4000, 3, 60).state, 'stalled'); // Clock-only progress remains insufficient.
+  assert.equal(f.tick(1, 3, 90).state, 'playing');
+  f.tick(1000, 4, 0); // Decoder replacement resets its counter, not necessarily media time.
+  assert.equal(f.tick(4000, 4, 0).state, 'stalled');
+  assert.equal(f.tick(1000, 5, 30).state, 'playing');
+}
+{
   const f = fixture();
   assert.equal(f.observation.sample().state, 'waiting');
   assert.equal(f.tick(4000).state, 'stalled'); // paused=false never means playing by itself.
