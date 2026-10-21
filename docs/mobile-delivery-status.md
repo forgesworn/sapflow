@@ -8,10 +8,20 @@ or [native performance contract](native-performance-contract.md).
 Latest local checkpoint, 21 October: the requested origin-main integration is
 complete as `1485ec0`; the later main documentation changes are merged as
 `8116361`. SDK commit `1634a809` separates transport recovery from decoded
-readiness. The current Rust workspace passes 475 tests, with four normally
-ignored, plus strict all-target Clippy and formatting. Test-only commit
+readiness. The full workspace gate at that checkpoint passes 475 tests, with
+four normally ignored, plus strict all-target Clippy and formatting. Test-only commit
 `8c2df4f` reads complete framed control responses without requiring graceful
 TCP closure after early request rejection.
+
+SDK commit `6235165` adds attempt-scoped decoded-media confirmation. An old
+asynchronous decoder reply cannot confirm a successor connection, advance its
+clock or clear its outage window. The client and binding crates pass 112 tests,
+with three normally ignored, and strict all-target Clippy. Actual generated
+Swift and Kotlin consumers, eight Kotlin status-lease checks, the refreshed
+ARM64 AAR's packaged consumer and the refreshed Apple package's external
+consumer pass. This is an additive source/package gate; it does not attach a
+native origin decoder or qualify either phone. Earlier frozen app packages are
+preserved separately from these refreshed SDK artefacts.
 
 The refreshed ARM64 AAR passes its actual packaged consumer. Android commit
 `4e2ff845` retains one logical destination across codec epochs and consumes the
@@ -21,11 +31,22 @@ warnings, actual qualification/release isolation and ARM64 native alignment
 checks. Independent source and artefact review is clear. These are source and
 package gates; they do not qualify the new APK on a physical network.
 
-The refreshed Apple package passes its external Swift consumer. The iOS
-application and XCTest bundle compile against it without signing. Reconnect
-ownership tests also run separately as pure Swift tests; compiling the iOS
-test bundle does not establish physical execution. Physical iOS publishing,
-native creator authentication and release acceptance remain open.
+Separate commit `be965e5a` adds opt-in localhost TLS fixtures to the
+qualification build only. Its 33 verifier tests and actual APK isolation checks
+pass; removing the fixture properties restores the default APK exactly, and
+the production APK stays byte-identical. No system trust installation or new
+physical V4V authentication result is implied. The owner's current Android
+capture remains running; neither new qualification APK has replaced it.
+
+The iOS reconnect source at `a399d13` passes 30 pure Swift tests and a real
+Network.framework cancellation probe without media. Its frozen application
+and test bundle compile, and the development-signed app passes strict signature
+verification, installation and launch on the primary iPhone. The subsequent
+UI test stopped at the device lock screen before execution. Installation does
+not establish physical capture, publishing, recording or reconnect acceptance.
+Later text-only commit `5d5133a` corrects reconnect guidance; it does not rebuild
+that frozen app. Native iOS creator authentication and release acceptance remain
+open. New SDK packages do not silently replace the signed application.
 
 The device results below identify earlier APKs. In particular, the earlier
 manual reconnect APK stopped at its original outage deadline despite recovering
