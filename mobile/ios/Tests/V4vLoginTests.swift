@@ -200,4 +200,17 @@ final class V4vLoginTests: XCTestCase {
         XCTAssertTrue(owner.cleanupComplete)
     }
 
+    func testProductionWaitHelperStopsOnCancellationBeforeRuntimeIsClosed() throws {
+        let cancellation = V4vSignetCancellation()
+        var reads = 0, closedReads = 0
+        XCTAssertThrowsError(try cancellation.wait(read: { () -> Int? in
+            reads += 1; cancellation.cancel(); return nil
+        }, isClosed: { closedReads += 1; return false }))
+        XCTAssertEqual(reads, 1); XCTAssertEqual(closedReads, 0)
+        XCTAssertThrowsError(try cancellation.wait(read: { () -> Int? in
+            reads += 1; return 42
+        }, isClosed: { false }))
+        XCTAssertEqual(reads, 1, "known cancellation performs no further FFI wait")
+    }
+
 }

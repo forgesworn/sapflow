@@ -18,13 +18,13 @@ suite.addTest(V4vSessionEngineTests.defaultTestSuite)
 suite.addTest(V4vAdaptersTests.defaultTestSuite)
 suite.addTest(V4vLoginTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 50, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 51, result.hasSucceeded else { exit(1) }
 SWIFT
 swiftc -swift-version 5 -warnings-as-errors -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
   -Xlinker -rpath -Xlinker "$sapflow_frameworks" -Xlinker -rpath -Xlinker "$sapflow_testlibs" \
   "$sapflow_root/mobile/ios/Sources/V4vContracts.swift" "$sapflow_root/mobile/ios/Sources/SrtDestination.swift" \
   "$sapflow_root/mobile/ios/Sources/V4vSessionEngine.swift" "$sapflow_root/mobile/ios/Sources/V4vJournal.swift" \
   "$sapflow_root/mobile/ios/Sources/V4vControlClient.swift" \
-  "$sapflow_root/mobile/ios/Sources/V4vLoginContracts.swift" "$sapflow_root/mobile/ios/Sources/V4vSignetLoginOwner.swift" \
+  "$sapflow_root/mobile/ios/Sources/V4vLoginContracts.swift" "$sapflow_root/mobile/ios/Sources/V4vSignetLoginOwner.swift" "$sapflow_root/mobile/ios/Sources/V4vNativeSignet.swift" \
   "$sapflow_scratch/main.swift" -o "$sapflow_scratch/v4v-tests"
 "$sapflow_scratch/v4v-tests"
