@@ -5,7 +5,37 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-Latest local checkpoint, 21 October: merge `1485ec0` integrates origin main
+Latest local checkpoint, 21 October: the requested origin-main integration is
+complete as `1485ec0`; the later main documentation changes are merged as
+`8116361`. SDK commit `1634a809` separates transport recovery from decoded
+readiness. The current Rust workspace passes 475 tests, with four normally
+ignored, plus strict all-target Clippy and formatting. Test-only commit
+`8c2df4f` reads complete framed control responses without requiring graceful
+TCP closure after early request rejection.
+
+The refreshed ARM64 AAR passes its actual packaged consumer. Android commit
+`4e2ff845` retains one logical destination across codec epochs and consumes the
+new typed startup/progress events. Its exact 108-input source packet passes
+174 tests in 33 suites, 21 APK-verifier tests, lint with zero errors and ten
+warnings, actual qualification/release isolation and ARM64 native alignment
+checks. Independent source and artefact review is clear. These are source and
+package gates; they do not qualify the new APK on a physical network.
+
+The refreshed Apple package passes its external Swift consumer. The iOS
+application and XCTest bundle compile against it without signing. Reconnect
+ownership tests also run separately as pure Swift tests; compiling the iOS
+test bundle does not establish physical execution. Physical iOS publishing,
+native creator authentication and release acceptance remain open.
+
+The device results below identify earlier APKs. In particular, the earlier
+manual reconnect APK stopped at its original outage deadline despite recovering
+the socket. The new transport policy addresses that source limitation; a new
+physical qualification must establish its behaviour. No changes from this task
+have been pushed or deployed publicly.
+
+### Earlier integration and device evidence
+
+Merge `1485ec0` integrates origin main
 `10b7e40` into `feat/native-broadcaster-sdk`, including own SRT as the sole
 server implementation and removal of srt-rs. Cargo regenerated both lockfiles;
 the licence generator regenerated its output and reproduced it unchanged.
@@ -147,13 +177,15 @@ timed capture-to-screen latency or competitive-performance result.
 
 Native V4V authentication and trusted current-media observations are still open.
 Manual destinations never turn a handshake, ACK or local encoder into a playable
-media confirmation. After a real outage their original 90-second window can
-therefore expire even after a healthy socket reconnect. Attaching the real
-V4V observation contract remains required for verified playback status. The
-manual-mode policy also needs separate transport recovery and playback evidence:
-third-party destinations do not necessarily provide a trusted playback API.
-The tested build reached its original outage deadline and stopped publishing;
-it is not ready for a show. Later, unattributed re-admission and reset counters
+media confirmation. The earlier tested build reached its original outage deadline
+and stopped publishing; it is not ready for a show. The new
+[transport recovery policy](transport-recovery.md) keeps retry permission separate
+from decoded readiness. Timely current-attempt peer media progress can re-arm
+network recovery without a playback API. An accepted bounded sending attempt
+with unknown ACKs can continue after its window expires, with further retries
+disabled. New physical qualification remains required. Attaching the real V4V
+decoded-observation contract is still necessary for verified playback status.
+Later, unattributed re-admission and reset counters
 are excluded from the finite recovery result. The test ended with normal Stop,
 and its owned origin, viewer and proxy processes were stopped.
 
