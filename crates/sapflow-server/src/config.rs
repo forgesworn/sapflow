@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use sapflow_core::Publisher;
 use sapflow_core::recording::{RecordPolicy, parse_age};
+use sapflow_srt::crypto::{CryptoConfig, KeySize};
 
 pub const HELP: &str = "\
 sapflow: SRT in, Low-Latency HLS out, for the v4v live stage.
@@ -18,7 +19,11 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
 
   SAPFLOW_SRT_ADDR         SRT listener (default 0.0.0.0:8890)
   SAPFLOW_SRT_IMPL         SRT implementation: srt-rs (default) or own
-                           (sapflow's own receiver, unencrypted callers only)
+                           (sapflow's own receiver)
+  SAPFLOW_SRT_PASSPHRASE   encrypt SRT media with this passphrase (10 to 79
+                           characters; needs SAPFLOW_SRT_IMPL=own); callers
+                           without it, or with another, are refused
+  SAPFLOW_SRT_PBKEYLEN     AES key length callers must use: 16 (default) or 32
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
   SAPFLOW_PUBLISH_USER     the one publisher allowed to push
@@ -71,6 +76,8 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_IMPL",
     "SAPFLOW_RECONNECT_GRACE",
     "SAPFLOW_HEALTH_INTERVAL",
+    "SAPFLOW_SRT_PASSPHRASE",
+    "SAPFLOW_SRT_PBKEYLEN",
 ];
 
 /// Which SRT implementation serves the SRT port.
@@ -105,6 +112,8 @@ pub struct Config {
     pub reconnect_grace: Duration,
     /// Between health callbacks; zero: none.
     pub health_interval: Duration,
+    /// SRT passphrase encryption, required of every caller when set.
+    pub srt_crypto: Option<CryptoConfig>,
 }
 
 #[derive(Debug)]
@@ -258,7 +267,30 @@ impl Config {
             }
         };
 
+        let key_size = match vals.get("SAPFLOW_SRT_PBKEYLEN").map(String::as_str) {
+            None | Some("16") => KeySize::Aes128,
+            Some("32") => KeySize::Aes256,
+            Some(_) => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_SRT_PBKEYLEN: 16 or 32".into(),
+                ));
+            }
+        };
+        let srt_crypto =
+            match vals.get("SAPFLOW_SRT_PASSPHRASE") {
+                None => None,
+                Some(_) if srt_impl != SrtImpl::Own => {
+                    return Err(ConfigError::Invalid(
+                        "SAPFLOW_SRT_PASSPHRASE needs SAPFLOW_SRT_IMPL=own".into(),
+                    ));
+                }
+                Some(p) => Some(CryptoConfig::new(p.as_bytes().to_vec(), key_size).map_err(
+                    |_| ConfigError::Invalid("SAPFLOW_SRT_PASSPHRASE: 10 to 79 characters".into()),
+                )?),
+            };
+
         Ok(Self {
+            srt_crypto,
             reconnect_grace,
             health_interval,
             srt_impl,
@@ -309,6 +341,45 @@ mod tests {
         assert_eq!(c.segment_count, 24);
         assert_eq!(c.reconnect_grace, Duration::from_secs(90));
         assert_eq!(c.health_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn srt_passphrase() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let own = ("SAPFLOW_SRT_IMPL", "own");
+        assert!(load(&[open], &[]).expect("config").srt_crypto.is_none());
+        let c = load(
+            &[open, own, ("SAPFLOW_SRT_PASSPHRASE", "correct horse")],
+            &[],
+        )
+        .expect("config");
+        let crypto = c.srt_crypto.expect("crypto");
+        assert_eq!(crypto.key_size, KeySize::Aes128);
+        // Never printed.
+        assert!(!format!("{crypto:?}").contains("horse"));
+        let c = load(
+            &[
+                open,
+                own,
+                ("SAPFLOW_SRT_PASSPHRASE", "correct horse"),
+                ("SAPFLOW_SRT_PBKEYLEN", "32"),
+            ],
+            &[],
+        )
+        .expect("config");
+        assert_eq!(c.srt_crypto.expect("crypto").key_size, KeySize::Aes256);
+        for bad in [
+            vec![open, ("SAPFLOW_SRT_PASSPHRASE", "correct horse")],
+            vec![open, own, ("SAPFLOW_SRT_PASSPHRASE", "short")],
+            vec![
+                open,
+                own,
+                ("SAPFLOW_SRT_PASSPHRASE", "correct horse"),
+                ("SAPFLOW_SRT_PBKEYLEN", "24"),
+            ],
+        ] {
+            assert!(matches!(load(&bad, &[]), Err(ConfigError::Invalid(_))));
+        }
     }
 
     #[test]

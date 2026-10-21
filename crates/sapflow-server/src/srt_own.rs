@@ -25,10 +25,19 @@ const QUEUE: usize = 16_384;
 
 pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     let socket = UdpSocket::bind(addr).await?;
-    tracing::info!(%addr, implementation = "own", "SRT listening");
+    tracing::info!(
+        %addr,
+        implementation = "own",
+        encrypted = app.config.srt_crypto.is_some(),
+        "SRT listening"
+    );
     let config = Config {
         // Room for publishers plus callers being turned away.
         max_connections: app.config.max_publishers.saturating_mul(2).max(4),
+        // With a passphrase, a caller without encryption is refused during
+        // the handshake, before the application hears of it.
+        crypto: app.config.srt_crypto.clone(),
+        require_encryption: app.config.srt_crypto.is_some(),
         ..Config::default()
     };
     let mut listener = Listener::new(config, Instant::now());
@@ -79,7 +88,20 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                     let stream_id = String::from_utf8_lossy(&stream_id);
                     match admit(&app, &stream_id, peer.ip(), publishers.len()) {
                         Ok(publication) => {
-                            listener.accept(id, Instant::now());
+                            if !listener.accept(id, Instant::now()) {
+                                // A wrong passphrase or key length: the
+                                // listener has refused it (BADSECRET).
+                                // Counted as a failed login, as a wrong
+                                // password is. Dropping the publication
+                                // returns a held stream to its hold.
+                                app.auth_throttle
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .failed(peer.ip(), Instant::now());
+                                app.log_refusal("srt", &"wrong passphrase or key length");
+                                drop(publication);
+                                continue;
+                            }
                             let (tx, rx) = mpsc::channel(QUEUE);
                             publishers.insert(id, tx);
                             tracing::info!(

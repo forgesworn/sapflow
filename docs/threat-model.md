@@ -50,10 +50,15 @@ the callback token, the recordings, and the host.
 
 ## Out of scope
 
-- TLS: HLS is served behind Caddy, which terminates TLS. SRT encryption
-  (passphrase) is not configured; the stream id carries the credential in
-  clear, as mediamtx's form does. A deployment that needs it should use
-  SRT's passphrase option (not yet exposed) or a VPN.
+- TLS: HLS is served behind Caddy, which terminates TLS. SRT control
+  packets are never encrypted, so the stream id carries the publisher
+  credential in clear, as mediamtx's form does, with or without a
+  passphrase. `SAPFLOW_SRT_PASSPHRASE` (our own receiver only) encrypts the
+  media (AES-CTR, which does not authenticate it); every caller must then
+  use it, and a wrong one is refused and counted as a failed login (T4).
+  Its salt and wrapped key travel in clear, so a weak passphrase can be
+  guessed offline: use a long random one. Hiding the credential itself
+  needs a VPN.
 - Denial of service by volume (raw bandwidth floods): the network's job.
 
 ## Known gaps, next steps
@@ -65,5 +70,9 @@ the callback token, the recordings, and the host.
 - Fuzz srt-tokio's own glue (socket tasks, timers) as well as srt-protocol.
 - Run the fuzz targets for hours, ideally in CI (the longest run so far is 20
   minutes per target).
-- SRT encryption (passphrase) is not exposed. `sapflow-srt` refuses a
-  caller that asks for it (`REJ_UNSECURE`); M6b adds it.
+- SRT encryption hardening from the M6b review (2026-10-21), all low:
+  rate-limit only failed in-session key messages, so a forged one (which
+  needs a spoofed address and the socket id) cannot delay a key refresh;
+  reject retransmissions older than the previous key switch once a key
+  slot is reused; check whether libsrt expects a reply to a key message
+  that only retires the old key.

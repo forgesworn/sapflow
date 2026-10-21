@@ -213,9 +213,16 @@ proof:
 support optional AES-128/256-CTR with bounded key negotiation and refresh,
 wrong-secret rejection and no configured plaintext downgrade. The listener
 supports selecting a session secret after bounded stream-ID admission; see
-[the supported crypto profile](crates/sapflow-srt/src/crypto.rs). Server
-configuration/provisioning is separate and must validate keys before claiming
-or resuming a stream held by reconnect grace.
+[the supported crypto profile](crates/sapflow-srt/src/crypto.rs). The
+server takes `SAPFLOW_SRT_PASSPHRASE` and `SAPFLOW_SRT_PBKEYLEN` (16 or 32)
+with `SAPFLOW_SRT_IMPL=own`: a caller without encryption is refused in the
+handshake, and one with a wrong passphrase or key length is refused
+(`BADSECRET`) and counted as a failed login; a stream held by the reconnect
+grace goes back to its hold. `scripts/smoke.sh` publishes with
+`srt-live-transmit` (libsrt 1.5.4) using a passphrase, decodes the result,
+and checks that no passphrase and a wrong one are refused. An independent
+review of the crypto found no defects; its hardening suggestions are in
+`docs/threat-model.md`. OBS and Larix with a passphrase are not yet tried.
 Independent executable tests cover both directions with libsrt, key rotation,
 clean/impaired loopback delivery and wrong/missing secrets. These are finite
 implementation checks, not completion of the full M6 qualification matrix.
