@@ -50,4 +50,24 @@ internal class V4vCaptureAdmissionTest {
         assertFalse(grant(2, cap = 5_000_000).permitsStartOf(prepared, 90))
         assertFalse(grant(2, expires = 90).permitsStartOf(prepared, 90))
     }
+    @Test fun preparedProfileCannotBeChangedByALaterStartApproval() {
+        val policy = V4vCaptureAdmission(); val identity = V4vIdentity("event-fixture", 1, "a".repeat(32), 1)
+        policy.consume(policy.snapshot()); val prepared = policy.bind(1, identity, CaptureProfile.SD_480)
+        assertTrue(policy.canStart(prepared, policy.snapshot(), identity.copy(revision = 2), CaptureProfile.SD_480))
+        assertFalse(policy.canStart(prepared, policy.snapshot(), identity.copy(revision = 2), CaptureProfile.HD_720))
+        val oldAnswer = policy.snapshot()
+        policy.invalidate() // Quality selection retires outstanding UI answers.
+        assertThrows(IllegalStateException::class.java) { policy.consume(oldAnswer) }
+        assertFalse(policy.canStart(prepared, policy.snapshot(), identity, CaptureProfile.SD_480))
+    }
+    @Test fun insufficientCapDoesNotConsumeApprovalOrRetireTheCurrentOwner() {
+        val policy = V4vCaptureAdmission(); val identity = V4vIdentity("event-fixture", 1, "a".repeat(32), 1)
+        val old = policy.bind(1, identity, CaptureProfile.SD_480)
+        val ticket = policy.snapshot()
+        assertThrows(IllegalArgumentException::class.java) { policy.consume(ticket, CaptureProfile.HD_720, 1_000_000) }
+        assertTrue(policy.current(ticket))
+        assertTrue(policy.canStart(old, ticket, identity, CaptureProfile.SD_480))
+        policy.invalidate() // End is not gated by quality admission.
+        assertFalse(policy.canStart(old, ticket, identity, CaptureProfile.SD_480))
+    }
 }

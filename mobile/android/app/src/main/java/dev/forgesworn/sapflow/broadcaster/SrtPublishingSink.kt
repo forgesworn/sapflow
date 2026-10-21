@@ -28,6 +28,7 @@ internal class SrtPublishingSink(
     passphrase: String,
     private val plaintext: Boolean,
     private val events: (PublishingAttemptEvent) -> Unit = {},
+    private val pacingBytesPerSecond: ULong = 1_250_000uL,
 ) : EncodedSink {
     private data class Codecs(val video: RustCodec?, val audio: RustCodec?)
     private val codecs = AtomicReference(Codecs(null, null))
@@ -41,11 +42,14 @@ internal class SrtPublishingSink(
     @Volatile private var worker: Thread? = null
     private val shutdown = SrtShutdown()
     private val shutdownResult = AtomicReference<SrtShutdown.Result?>()
-    override val diagnostics: String get() = "SRT shutdown ${shutdownResult.get()?.name ?: "not requested"}"
+    override val diagnostics: String get() = "SRT pacer ${pacingBytesPerSecond} B/s · shutdown ${shutdownResult.get()?.name ?: "not requested"}"
     private val timers = ScheduledThreadPoolExecutor(1) { task -> Thread(task, "sapflow-srt-deadline") }.apply { removeOnCancelPolicy = true }
     private val lifecycle = ExplicitAttempt(::startNetwork, ::closeNetwork)
 
-    init { SrtDestination.validateCredentials(streamId, passphrase, plaintext) }
+    init {
+        require(pacingBytesPerSecond in 1uL..1_250_000uL) { "Invalid SRT pacing ceiling" }
+        SrtDestination.validateCredentials(streamId, passphrase, plaintext)
+    }
 
     override fun configure(video: RustCodec?, audio: RustCodec?) {
         if (!closed.get()) { codecs.set(Codecs(video, audio)); selector.get()?.wakeup() }
@@ -96,7 +100,7 @@ internal class SrtPublishingSink(
                             cipher = if (plaintext) null else NativeSrtCipher.AES256,
                             latencyMs = 120u, maxBufferedPackets = 128u,
                             maxBufferedBytes = 4u * 1024u * 1024u, maxPacketAgeMs = 1000u,
-                            maxSampleResidenceMs = 1000u, bandwidthBytesPerSecond = 1_250_000uL,
+                            maxSampleResidenceMs = 1000u, bandwidthBytesPerSecond = pacingBytesPerSecond,
                         )
                         val pass = secret.getAndSet(null)
                         try { native = NativeSrtPublisher(config, descriptors.video, descriptors.audio, pass, now.toULong()) }

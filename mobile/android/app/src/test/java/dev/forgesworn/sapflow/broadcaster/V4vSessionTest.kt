@@ -76,10 +76,15 @@ internal class V4vSessionTest {
         assertEquals(1, h.fences); assertTrue(h.sent.isEmpty())
         assertThrows(Exception::class.java) { e.prepare(event) }
     }
-    @Test fun insufficientCapRetainsAcknowledgedSessionButCannotCaptureAndCanEnd() {
+    @Test fun grantControlRemainsAvailableIndependentOfSelectedCaptureQuality() {
         val h = Harness(); h.bps = 1_000_000; val e = h.signed(); e.prepare(event)
         assertFalse(e.view().pending)
-        assertThrows(IllegalArgumentException::class.java) { e.captureGrant() }
+        val grant = e.captureGrant()
+        assertEquals(1_000_000L, e.view().maxPublishBps)
+        assertTrue(e.view().prepared)
+        assertThrows(IllegalArgumentException::class.java) { CaptureProfile.HD_720.requireGrant(grant.maxPublishBps) }
+        CaptureProfile.SD_480.requireGrant(grant.maxPublishBps)
+        e.refresh(); assertEquals(2L, e.captureGrant().identity.revision)
         e.end(); assertTrue(e.view().endComplete); assertTrue(h.fences > 0)
     }
     @Test fun endRetainsTerminalIntentAcrossUncertainRefreshAndDoesNotReprepare() {

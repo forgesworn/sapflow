@@ -142,6 +142,8 @@ class CaptureController(private val context: Context) {
     private val restart = OrientationRestartPlan()
     private var renderer: CameraGlRenderer? = null
     private var plan: OrientationPlan? = null
+    private var captureProfile = CaptureProfile.DEFAULT
+    private val prepareAdmission = CapturePrepareAdmission()
     private var previewWidth = 1
     private var previewHeight = 1
     private var displayDegrees = 0
@@ -197,17 +199,18 @@ class CaptureController(private val context: Context) {
         (if (!recordingFailed && stage in listOf(CaptureStage.PREPARING, CaptureStage.PREPARED, CaptureStage.CAPTURING)) recordingSink?.status ?: recordStatus else recordStatus) + if (previousRecording.isNotEmpty()) " · Previous: ${previousRecording.take(240)}" else "",
         queueDiagnostics, "Publish drainer ${publishing?.diagnostics ?: "none"} · ${publishingSink?.diagnostics ?: ""}",
         orientationStatus, rendererStatus, audioDiagnostics + if (audioFailureDiagnostics.isNotEmpty()) " · $audioFailureDiagnostics" else "", "$cleanupPhase · $cleanupDiagnostics",
-        !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioEncoder == null && renderer == null && audioRecord == null)
+        !prepareAdmission.pending && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioEncoder == null && renderer == null && audioRecord == null)
 
-    fun prepare(previewSurface: Surface, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?) {
-        handler.post {
-            if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) return@post
+    internal fun prepare(previewSurface: Surface, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, profile: CaptureProfile = CaptureProfile.DEFAULT) {
+        prepareAdmission.submit(profile, snapshot().canPrepare, { handler.post(it) }) admitted@{ requestedProfile ->
+            if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) return@admitted
             if (videoEncoder != null || renderer != null || teardownStarted) {
                 message = lifecycle.message("Previous native cleanup is unfinished; capture cannot restart")
-                return@post
+                return@admitted
             }
             cleanupExpired = false; stopFailed = false
             publishingSession?.stopDestination(); publishingSession = null
+            captureProfile = requestedProfile // Retained through every orientation restart.
             publishFactory = publisher
             recordFactory = recorder
             autoStart = false
@@ -296,16 +299,16 @@ class CaptureController(private val context: Context) {
         val cameraId = manager.cameraIdList.firstOrNull { id ->
             val c = manager.getCameraCharacteristics(id)
             val sensor = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: return@firstOrNull false
-            val candidate = OrientationPlan.forRear(sensor, pose, naturalPortrait)
+            val candidate = OrientationPlan.forRear(sensor, pose, naturalPortrait, captureProfile)
             c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
                 (Build.VERSION.SDK_INT >= 33 || c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) &&
                 c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.getOutputSizes(SurfaceTexture::class.java)?.contains(Size(candidate.cameraWidth, candidate.cameraHeight)) == true &&
                 c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.contains(Range(30, 30)) == true
         } ?: error("No rear camera supports the upright 720p30 GPU input and a validated timestamp source")
         val characteristics = manager.getCameraCharacteristics(cameraId)
-        val selected = OrientationPlan.forRear(characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)!!, pose, naturalPortrait)
+        val selected = OrientationPlan.forRear(characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)!!, pose, naturalPortrait, captureProfile)
         plan = selected
-        orientationStatus = "${selected.width}×${selected.height} · ${pose.name} · natural texture rotation ${selected.encoderClockwiseDegrees}°"
+        orientationStatus = "${captureProfile.label} · ${captureProfile.videoBps} bps AVC + ${captureProfile.audioBps} bps AAC · ${selected.width}×${selected.height} · ${pose.name} · natural texture rotation ${selected.encoderClockwiseDegrees}°"
         autofocusMode = if (characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) == true)
             CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO else CaptureRequest.CONTROL_AF_MODE_OFF
 
@@ -313,20 +316,22 @@ class CaptureController(private val context: Context) {
             info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } &&
                 runCatching {
                     val caps = info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                    caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface) &&
-                        caps.videoCapabilities?.areSizeAndRateSupported(selected.width, selected.height, 30.0) == true &&
-                        caps.videoCapabilities?.bitrateRange?.contains(2_500_000) == true &&
-                        caps.encoderCapabilities?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) == true &&
-                        caps.profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline }
+                    val videoCaps = checkNotNull(caps.videoCapabilities)
+                    captureProfile.supportedBy(videoCaps.widthAlignment, videoCaps.heightAlignment,
+                        videoCaps.bitrateRange.lower, videoCaps.bitrateRange.upper,
+                        caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface),
+                        caps.encoderCapabilities?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) == true,
+                        caps.profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline },
+                        videoCaps::areSizeAndRateSupported)
                 }.getOrDefault(false)
-        } ?: error("No hardware H264 baseline encoder supports 720p30")
+        } ?: error("No hardware H264 baseline encoder supports ${captureProfile.label}30 CBR in both orientations")
         val video = PlatformCodec.createByCodecName(videoInfo.name)
         videoEncoder = video
         videoEncoderName = "${videoInfo.name} (hardware)"
         video.setCallback(videoCallback(), handler)
         video.configure(MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, selected.width, selected.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
+            setInteger(MediaFormat.KEY_BIT_RATE, captureProfile.videoBps)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
@@ -344,7 +349,7 @@ class CaptureController(private val context: Context) {
         audio.setCallback(encodedAudio!!, audioHandler)
         audio.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 48_000, 1).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-            setInteger(MediaFormat.KEY_BIT_RATE, 96_000)
+            setInteger(MediaFormat.KEY_BIT_RATE, captureProfile.audioBps)
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2048)
         }, null, null, PlatformCodec.CONFIGURE_FLAG_ENCODE)
         val minAudio = AudioRecord.getMinBufferSize(48_000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -655,7 +660,7 @@ class CaptureController(private val context: Context) {
             override fun onOutputFormatChanged(codec: PlatformCodec, format: MediaFormat) {
                 if (token != drainGeneration) return
                 try {
-                    require(format.getInteger(MediaFormat.KEY_WIDTH) == plan?.width && format.getInteger(MediaFormat.KEY_HEIGHT) == plan?.height) { "Encoder changed the requested upright 720p profile" }
+                    require(format.getInteger(MediaFormat.KEY_WIDTH) == plan?.width && format.getInteger(MediaFormat.KEY_HEIGHT) == plan?.height) { "Encoder changed the requested ${captureProfile.label} profile" }
                     check(videoCodec == null) { "Video format changed; prepare a new epoch" }
                     val first = format.getByteBuffer("csd-0")
                     val second = format.getByteBuffer("csd-1")
@@ -694,7 +699,10 @@ class CaptureController(private val context: Context) {
         }
     }
 
+    internal fun cancelPendingPrepare() = prepareAdmission.cancelPending()
+
     fun stop(reason: String = "Stopped") {
+        prepareAdmission.cancelPending()
         publishingSession?.stopDestination() // Fence even while codec-handler work is queued.
         handler.post {
             publishingSession?.stopDestination()
@@ -985,6 +993,7 @@ class CaptureController(private val context: Context) {
     }
 
     fun close() {
+        prepareAdmission.cancelPending()
         publishingSession?.stopDestination()
         handler.post {
             shutdownRequested = true; autoStart = false; restart.cancel()

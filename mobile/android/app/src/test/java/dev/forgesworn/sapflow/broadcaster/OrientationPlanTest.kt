@@ -126,9 +126,9 @@ class OrientationPlanTest {
             270 to listOf("DABC", "ABCD", "BCDA", "CDAB"),
         )
         val outputCorners = listOf(0f to 0f, 1f to 0f, 1f to 1f, 0f to 1f)
-        for (naturalPortrait in listOf(true, false)) for (sensor in listOf(90, 270)) {
+        for (profile in CaptureProfile.entries) for (naturalPortrait in listOf(true, false)) for (sensor in listOf(90, 270)) {
             CardinalPose.entries.forEachIndexed { index, pose ->
-                val plan = OrientationPlan.forRear(sensor, pose, naturalPortrait)
+                val plan = OrientationPlan.forRear(sensor, pose, naturalPortrait, profile)
                 val below = ground.getValue(sensor)[index]
                 val above = 1f - below.first to 1f - below.second
                 assertSample(below, sample(plan.encoderPositionMatrix(), producer(sensor), 0.5f, 0.8f))

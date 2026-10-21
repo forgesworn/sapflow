@@ -1116,3 +1116,62 @@ These are package/build gates only. No fixture listener, system trust change,
 signing replacement, installation, phone interaction or running V4V/NIP55
 journey was performed by this packet. The public fixture CA was supplied
 explicitly; this work neither generated nor accessed private TLS keys.
+
+
+The explicit quality source packet adds a pre-Prepare choice. 720p remains the
+initial default: 1280×720 (720×1280 portrait), H264 baseline hardware CBR at
+2,500,000 bits/s, AAC LC mono 48 kHz at 96,000 bits/s, 30 fps and a one-second
+GOP. Its V4V minimum grant remains 4,000,000 bits/s. The added 480p preset uses
+848×480 (480×848 portrait), 600,000 bits/s H264 with the same audio, cadence and
+GOP, and requires at least 1,000,000 bits/s. These are explicit fixed choices,
+with no automatic downgrade or change to the backend's limits.
+
+The raw Camera2 source remains the existing sensor-basis 720p source. GPU
+rotation still uses the validated complete producer matrix and world-oriented
+pose convention. At 480p the 16:9 image fits into 848×477 pixels, leaving three
+black rows in total; portrait uses 477×848 with three black columns. Preview
+fits the source image aspect independently. 720p remains a full-canvas fit.
+Hardware selection requires surface input, baseline AVC, CBR, the selected
+bitrate, alignment and 30 fps support in both encoded orientations. An
+unsupported profile fails explicitly; capability metadata is not physical
+qualification.
+
+Quality is immutable from Prepare through all orientation epochs. A synchronous
+Prepare reservation also closes the UI-to-codec-handler enqueue gap: its exact
+profile is held until the queued task starts or is retired. Stop, End and screen
+cleanup cancel queued admission; an old task cannot release a newer reservation.
+Selection is
+available only when native cleanup permits a new Prepare, retires queued grant
+answers and invalidates old publisher admission. V4V prepared-owner and Start
+permissions bind the exact profile as well as the existing session, generation,
+revision, immutable grant and monotonic expiry checks. The control journal and
+End/refresh/reconciliation remain available for grants too small for the chosen
+quality; capture admission rejects them before retiring another owner. Session
+control does not implicitly choose a quality.
+
+Rates are in bits/s at the grant boundary. The scoped SRT data pacer uses
+`min(1_250_000, floor(maxPublishBps / 8))` bytes/s, shared by original and
+retransmitted SRT data including its header. The origin admission limiter counts
+unique reassembled TS bytes over its existing window; it does not count every
+NIC byte. The 480p elementary target totals 696,000 bits/s, leaving 304,000 bits/s
+below its minimum grant for TS overhead and variation. This is budgeting, not
+proof that a particular encoder fits the cap. Native residence, wire-age,
+queue-byte, PCM and cleanup bounds remain unchanged, and overload fails rather
+than silently retiming media. Existing coalesced status shows selected codec
+rates, cap and SRT pacer without new per-frame native calls.
+
+This packet passed independent source review, 51 focused JVM tests and the
+full M4 offline build against AAR `55f55bee…`: 183 tests across 34 suites with no
+failures/skips, lint zero errors (ten warnings), actual APK/native 16 KiB checks
+and qualification/release isolation. The original qualification APK is
+`e5815c5465de3083d8986f9b3640dabe3d24c63823177f9d8d799767094a1fc0`;
+the unsigned release is
+`2c30c8f2715d15e05268e14fe2efa0fb305980743ac6203a2db997a642e1bac2`.
+The certificate-free 110-input source archive and reports are retained under
+ignored `target/mobile-android/quality-presets-v2-*`.
+
+The historical signed 8e9… and private-TLS 6fc… APKs remain unchanged. The new
+480p profile still needs actual hardware, encoded four-pose, sustained cap and
+playback acceptance; no signing, installation or phone action is part of these
+source/build checks. The selected ABI is ARM64; an all-ABI release is not
+qualified by this packet.

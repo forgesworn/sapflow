@@ -39,7 +39,7 @@ internal class CameraGlRenderer(
         require(inputWidth > 0 && inputHeight > 0) { "Invalid camera texture size" }
         val naturalWidth = if (plan.sensorClockwiseDegrees % 180 == 0) inputWidth else inputHeight
         val naturalHeight = if (plan.sensorClockwiseDegrees % 180 == 0) inputHeight else inputWidth
-        require(naturalWidth.toLong() * plan.naturalHeight == naturalHeight.toLong() * plan.naturalWidth) { "Raw camera sensor buffer aspect does not match the natural texture canvas" }
+        require(naturalWidth.toLong() * plan.sourceNaturalHeight == naturalHeight.toLong() * plan.sourceNaturalWidth) { "Raw camera sensor buffer aspect does not match the natural texture canvas" }
         start()
     }
     private val owner = Handler(thread.looper)
@@ -66,7 +66,7 @@ internal class CameraGlRenderer(
     private var previewHeight = 0
     private var previewDisplayDegrees = 0
     private var previewViewport = IntArray(4)
-    private val encoderViewport = intArrayOf(0, 0, plan.width, plan.height)
+    private val encoderViewport = fitViewport(plan.width, plan.height, plan.contentWidth, plan.contentHeight)
     private val encoderMatrix = plan.encoderPositionMatrix()
     private var previewMatrix = encoderMatrix
     private val textureMatrix = FloatArray(16)
@@ -108,8 +108,8 @@ internal class CameraGlRenderer(
                         previewDisplayDegrees = displayRotationDegrees
                         previewMatrix = plan.previewPositionMatrix(displayRotationDegrees)
                         previewViewport = fitViewport(width, height,
-                            if (extra % 180 == 0) plan.width else plan.height,
-                            if (extra % 180 == 0) plan.height else plan.width)
+                            if (extra % 180 == 0) plan.contentWidth else plan.contentHeight,
+                            if (extra % 180 == 0) plan.contentHeight else plan.contentWidth)
                     } catch (error: Exception) {
                         if (!expectedPreviewLoss(surface)) throw error
                     }
@@ -239,7 +239,7 @@ internal class CameraGlRenderer(
                 source.getTransformMatrix(textureMatrix)
                 if (!geometryLogged) {
                     geometryLogged = true
-                    Log.i("SapflowGeometry", "epoch=$captureEpoch sensor=${plan.sensorClockwiseDegrees} raw=${inputWidth}x$inputHeight natural=${plan.naturalWidth}x${plan.naturalHeight} pose=${plan.pose.name} encoded=${plan.width}x${plan.height} vertexCW=${plan.encoderClockwiseDegrees} preview=${previewWidth}x$previewHeight display=$previewDisplayDegrees STM=${textureMatrix.joinToString(prefix = "[", postfix = "]")}")
+                    Log.i("SapflowGeometry", "epoch=$captureEpoch sensor=${plan.sensorClockwiseDegrees} raw=${inputWidth}x$inputHeight natural=${plan.sourceNaturalWidth}x${plan.sourceNaturalHeight} pose=${plan.pose.name} encoded=${plan.width}x${plan.height} vertexCW=${plan.encoderClockwiseDegrees} preview=${previewWidth}x$previewHeight display=$previewDisplayDegrees STM=${textureMatrix.joinToString(prefix = "[", postfix = "]")}")
                 }
                 CameraTextureGeometry.validate(textureMatrix, plan.sensorClockwiseDegrees, inputWidth, inputHeight)
                 if (encoder != EGL14.EGL_NO_SURFACE && requestedEncoding.get() == encoderToken) {
@@ -429,16 +429,7 @@ internal class CameraGlRenderer(
             eglError == EGL14.EGL_BAD_SURFACE || eglError == EGL14.EGL_BAD_NATIVE_WINDOW ||
                 (!surfaceValid && eglError == EGL14.EGL_SUCCESS)
 
-        internal fun fitViewport(width: Int, height: Int, imageWidth: Int, imageHeight: Int): IntArray {
-            require(width > 0 && height > 0 && imageWidth > 0 && imageHeight > 0)
-            val fitWidth: Int
-            val fitHeight: Int
-            if (width.toLong() * imageHeight <= height.toLong() * imageWidth) {
-                fitWidth = width; fitHeight = maxOf(1, (width.toLong() * imageHeight / imageWidth).toInt())
-            } else {
-                fitHeight = height; fitWidth = maxOf(1, (height.toLong() * imageWidth / imageHeight).toInt())
-            }
-            return intArrayOf((width - fitWidth) / 2, (height - fitHeight) / 2, fitWidth, fitHeight)
-        }
+        internal fun fitViewport(width: Int, height: Int, imageWidth: Int, imageHeight: Int): IntArray =
+            CaptureProfile.fitViewport(width, height, imageWidth, imageHeight)
     }
 }

@@ -57,16 +57,23 @@ internal class OrientationPlan private constructor(
     val pose: CardinalPose,
     val naturalPortrait: Boolean,
     val sensorClockwiseDegrees: Int,
+    val profile: CaptureProfile,
 ) {
-    val naturalWidth = if (naturalPortrait) 720 else 1280
-    val naturalHeight = if (naturalPortrait) 1280 else 720
+    val naturalWidth = if (naturalPortrait) profile.landscapeHeight else profile.landscapeWidth
+    val naturalHeight = if (naturalPortrait) profile.landscapeWidth else profile.landscapeHeight
+    // Fixed proven camera source. Encoding quality never changes sensor-space
+    // input selection or the SurfaceTexture producer transform.
+    val sourceNaturalWidth = if (naturalPortrait) 720 else 1280
+    val sourceNaturalHeight = if (naturalPortrait) 1280 else 720
+    val contentWidth = if (pose.clockwiseDegrees % 180 == 0) sourceNaturalWidth else sourceNaturalHeight
+    val contentHeight = if (pose.clockwiseDegrees % 180 == 0) sourceNaturalHeight else sourceNaturalWidth
     val width = if (pose.clockwiseDegrees % 180 == 0) naturalWidth else naturalHeight
     val height = if (pose.clockwiseDegrees % 180 == 0) naturalHeight else naturalWidth
     val isPortrait: Boolean get() = height > width
     // Camera2 stream dimensions remain in SENSOR buffer space. SurfaceTexture's
     // producer transform already rotates that space to device-natural space.
-    val cameraWidth = if (sensorClockwiseDegrees % 180 == 0) naturalWidth else naturalHeight
-    val cameraHeight = if (sensorClockwiseDegrees % 180 == 0) naturalHeight else naturalWidth
+    val cameraWidth = if (sensorClockwiseDegrees % 180 == 0) sourceNaturalWidth else sourceNaturalHeight
+    val cameraHeight = if (sensorClockwiseDegrees % 180 == 0) sourceNaturalHeight else sourceNaturalWidth
     // CaptureRequest.JPEG_ORIENTATION's rear-camera convention is sensor +
     // OrientationEventListener angle. The producer already supplies sensor.
     val rawToEncodedClockwiseDegrees = (sensorClockwiseDegrees + pose.clockwiseDegrees) % 360
@@ -81,7 +88,7 @@ internal class OrientationPlan private constructor(
         return clockwisePositionMatrix((360 - displayRotationDegrees) % 360)
     }
 
-    /** Relative dimensions of the encoded canvas when fitted into preview. */
+    /** Relative orientation of the encoded content when fitted into preview. */
     fun previewRelativeClockwiseDegrees(displayRotationDegrees: Int): Int {
         require(displayRotationDegrees in listOf(0, 90, 180, 270))
         return (720 - pose.clockwiseDegrees - displayRotationDegrees) % 360
@@ -104,9 +111,9 @@ internal class OrientationPlan private constructor(
             )
         }
 
-        fun forRear(sensorOrientationDegrees: Int, pose: CardinalPose, naturalPortrait: Boolean = true): OrientationPlan {
+        fun forRear(sensorOrientationDegrees: Int, pose: CardinalPose, naturalPortrait: Boolean = true, profile: CaptureProfile = CaptureProfile.DEFAULT): OrientationPlan {
             require(sensorOrientationDegrees in listOf(0, 90, 180, 270)) { "Invalid camera sensor orientation" }
-            return OrientationPlan(pose, naturalPortrait, sensorOrientationDegrees)
+            return OrientationPlan(pose, naturalPortrait, sensorOrientationDegrees, profile)
         }
     }
 }

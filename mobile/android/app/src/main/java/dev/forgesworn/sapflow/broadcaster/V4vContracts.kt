@@ -84,8 +84,7 @@ internal class V4vGrant(val identity: V4vIdentity, val endpoint: String, val str
         endpoint == prepared.endpoint && streamId == prepared.streamId && passphrase == prepared.passphrase &&
         graceMs == prepared.graceMs && maxPublishBps == prepared.maxPublishBps && maxQueueBytes == prepared.maxQueueBytes
     companion object {
-        // Current fixed capture profile plus transport/headroom; do not silently lower the encoder.
-        const val REQUIRED_PUBLISH_BPS = 4_000_000L
+        // Parse the negotiated ceiling independently of local quality selection.
         fun read(o: JsonObject, nowMs: Long): V4vGrant = with(V4vJson) {
             val identity = V4vIdentity.read(o)
             val policy = o.getValue("destination").jsonObject

@@ -56,24 +56,26 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
     fun current(permit: V4vCapturePermit): Boolean = synchronized(expiry) {
         fenceExpiredOwner(); admission.current(permit.ticket)
     }
-    fun canStart(binding: V4vCaptureAdmission.Prepared, permit: V4vCapturePermit): Boolean = synchronized(expiry) {
+    fun canStart(binding: V4vCaptureAdmission.Prepared, permit: V4vCapturePermit, profile: CaptureProfile): Boolean = synchronized(expiry) {
         fenceExpiredOwner()
         val old = preparedGrant
-        old != null && expiry.admits(binding.owner) && destination.get() != null && admission.canStart(binding, permit.ticket, permit.grant.identity) &&
+        old != null && expiry.admits(binding.owner) && destination.get() != null && permit.profile == profile && admission.canStart(binding, permit.ticket, permit.grant.identity, profile) &&
             permit.grant.permitsStartOf(old, System.nanoTime())
     }
     fun captureFactory(permit: V4vCapturePermit): V4vPreparedDestination {
         val result = synchronized(expiry) {
-            admission.consume(permit.ticket)
+            // Reject insufficient quality BEFORE retiring an owner or consuming
+            // approval. End/reconcile remain available on the control actor.
+            admission.consume(permit.ticket, permit.profile, permit.grant.maxPublishBps)
             expiry.clear(); expiryAlarm?.cancel(false); preparedGrant = null; destination.getAndSet(null)?.stopDestination()
             val grant = permit.grant
             val ticket = expiry.begin(++captureSerial, grant.identity, grant.expiresAtMonotonicNs)
             val numeric = SrtDestination.parse(grant.endpoint)
             val coordinator = ReconnectingPublishingSink(graceMs = grant.graceMs) { events ->
-                SrtPublishingSink(numeric, grant.streamId, grant.passphrase, false, events)
+                SrtPublishingSink(numeric, grant.streamId, grant.passphrase, false, events, permit.profile.srtPacingBytesPerSecond(grant.maxPublishBps))
             }
             destination.set(coordinator); preparedGrant = grant; arm(ticket)
-            V4vPreparedDestination(admission.bind(captureSerial, grant.identity)) { coordinator.newEpoch() }
+            V4vPreparedDestination(admission.bind(captureSerial, grant.identity, permit.profile)) { coordinator.newEpoch() }
         }
         // Private bounded scalar lifecycle correlation only; no destination/event/credential/media data.
         Log.i("SapflowV4v", "explicitCapturePrepare serial=$captureSerial graceMs=${permit.grant.graceMs}")
@@ -89,11 +91,11 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
             } } catch (_: Exception) { complete(IllegalStateException("Signer unavailable")) }
         } }
     }
-    fun grant(complete: (V4vCapturePermit?, Exception?) -> Unit) {
+    fun grant(profile: CaptureProfile, complete: (V4vCapturePermit?, Exception?) -> Unit) {
         val ticket = synchronized(expiry) { admission.snapshot() }
         var value: V4vGrant? = null
         control.submit({ value = captureGrant() }) { error -> ui.post {
-            complete(if (error == null) V4vCapturePermit(ticket, checkNotNull(value)) else null, error)
+            complete(if (error == null) V4vCapturePermit(ticket, checkNotNull(value), profile) else null, error)
         } }
     }
     companion object {

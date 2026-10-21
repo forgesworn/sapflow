@@ -104,6 +104,7 @@ class MainActivity : ComponentActivity() {
     private var srtPassphrase by mutableStateOf("")
     private var srtPlaintextLab by mutableStateOf(false)
     private var recordLocally by mutableStateOf(true)
+    private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
     private val ui = Handler(Looper.getMainLooper())
     private val settlePose = object : Runnable {
         override fun run() {
@@ -215,7 +216,19 @@ class MainActivity : ComponentActivity() {
                         val current = snapshot
                         Text(current?.stage?.name ?: "IDLE", style = MaterialTheme.typography.labelLarge)
                         Text(permissionMessage ?: current?.message ?: "Prepare the camera and microphone")
-                        Text(current?.orientation ?: "720p30 · H264 · AAC 48 kHz", style = MaterialTheme.typography.bodySmall)
+                        Text(current?.orientation ?: "${captureProfile.label}30 · H264 · AAC 48 kHz", style = MaterialTheme.typography.bodySmall)
+                        val qualityConfigurable = current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)
+                        Text("Capture quality · choose before Prepare", style = MaterialTheme.typography.labelMedium)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CaptureProfile.entries.forEach { quality ->
+                                OutlinedButton(enabled = qualityConfigurable, onClick = {
+                                    if (capture.snapshot().canPrepare && captureProfile != quality) {
+                                        prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
+                                        captureProfile = quality
+                                    }
+                                }) { Text(if (captureProfile == quality) "${quality.label} selected" else quality.label) }
+                            }
+                        }
                         OutlinedButton(
                             onClick = { prepareWithPermissions() },
                             enabled = surfaceReady && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR),
@@ -309,9 +322,9 @@ class MainActivity : ComponentActivity() {
         else {
             val request = prepareRequest
             val binding = preparedV4v ?: return
-            v4v?.grant { permit, error ->
+            v4v?.grant(captureProfile) { permit, error ->
                 if (request != prepareRequest || !useV4v || preparedV4v != binding) return@grant
-                if (error == null && permit != null && v4v?.canStart(binding, permit) == true && poseTracking && capture.snapshot().stage == CaptureStage.PREPARED) start()
+                if (error == null && permit != null && v4v?.canStart(binding, permit, captureProfile) == true && poseTracking && capture.snapshot().stage == CaptureStage.PREPARED) start()
                 else permissionMessage = error?.message?.take(160) ?: "V4V start permission no longer matches this prepared capture"
             }
         }
@@ -331,6 +344,10 @@ class MainActivity : ComponentActivity() {
         }
         if (!useV4v) return
         Text(v4vState?.message ?: "Loading V4V journal", style = MaterialTheme.typography.bodySmall)
+        v4vState?.maxPublishBps?.let { cap ->
+            Text("V4V cap $cap bits/s · ${captureProfile.label} needs ${captureProfile.minimumPublishBps} bits/s", style = MaterialTheme.typography.bodySmall)
+            if (cap < captureProfile.minimumPublishBps) Text("Select a supported quality before Prepare. The reserved session can still be ended.", style = MaterialTheme.typography.bodySmall)
+        }
         if (configurable) {
             val signers = remember(owner) { Nip55Login(this, owner.signerRelay).installed() }
             signers.forEach { (pkg, label) -> OutlinedButton(onClick = {
@@ -349,7 +366,7 @@ class MainActivity : ComponentActivity() {
         OutlinedButton(enabled = configurable && v4vEvent.isNotBlank() && v4vState?.signedIn == true && v4vState?.pending != true,
             onClick = { val selected = v4vEvent; v4vCommand { prepare(selected) } }) { Text("Prepare V4V session") }
         OutlinedButton(enabled = v4vState?.pending == true, onClick = { v4vCommand { retry() } }) { Text("Retry saved operation") }
-        OutlinedButton(enabled = v4vState?.eventId != null, onClick = { prepareRequest++; owner.stopPublisher(); owner.control.endDestination { error -> ui.post { if (error != null) permissionMessage = "V4V End intent not confirmed"; v4vState = owner.control.view } } }) { Text("End V4V destination") }
+        OutlinedButton(enabled = v4vState?.eventId != null, onClick = { prepareRequest++; capture.cancelPendingPrepare(); owner.stopPublisher(); owner.control.endDestination { error -> ui.post { if (error != null) permissionMessage = "V4V End intent not confirmed"; v4vState = owner.control.view } } }) { Text("End V4V destination") }
         OutlinedButton(enabled = v4vState?.eventId != null, onClick = { v4vCommand { status() } }) { Text("Check origin finalisation") }
         if (v4vState?.recoveryOffered == true) {
             Row { Checkbox(acknowledgeLoss, { acknowledgeLoss = it }); Text("Abandon failed automatic recording", style = MaterialTheme.typography.bodySmall) }
@@ -368,11 +385,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun prepareCapture(approvedGrant: V4vCapturePermit? = null) {
+        if (!capture.snapshot().canPrepare) return
         if (useV4v && approvedGrant == null) {
             val owner = v4v ?: return
             val request = ++prepareRequest
-            owner.grant { grant, error ->
-                if (request != prepareRequest || !useV4v) return@grant
+            val requestedProfile = captureProfile
+            owner.grant(requestedProfile) { grant, error ->
+                if (request != prepareRequest || !useV4v || captureProfile != requestedProfile) return@grant
                 if (error != null) permissionMessage = error.message?.take(160) ?: "V4V grant unavailable"
                 else if (poseTracking && capture.snapshot().canPrepare) prepareCapture(checkNotNull(grant))
             }
@@ -384,6 +403,7 @@ class MainActivity : ComponentActivity() {
             val passphrase = srtPassphrase
             val plaintext = srtPlaintextLab
             val publisher: () -> EncodedSink? = if (useV4v) {
+                require(approvedGrant?.profile == captureProfile) { "Capture quality changed; Prepare again" }
                 val prepared = checkNotNull(v4v).captureFactory(checkNotNull(approvedGrant))
                 preparedV4v = prepared.binding
                 prepared.factory
@@ -404,7 +424,7 @@ class MainActivity : ComponentActivity() {
             // Explicit Prepare restores the stable physical pose even if no
             // further sensor callback followed qualification Stop/CLEAR.
             capture.orientationChanged(poseSelector.prepareSession())
-            capture.prepare(surface, publisher, recorder)
+            capture.prepare(surface, publisher, recorder, captureProfile)
         } catch (error: Exception) {
             permissionMessage = error.message?.take(240) ?: "Destination configuration failed"
         }

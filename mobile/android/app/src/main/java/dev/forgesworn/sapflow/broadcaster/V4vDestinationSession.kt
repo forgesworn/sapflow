@@ -9,7 +9,7 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.serialization.json.*
 
 internal data class V4vView(val message: String, val eventId: String?, val phase: String?, val signedIn: Boolean,
-    val pending: Boolean, val endComplete: Boolean, val recoveryState: String?, val prepared: Boolean, val recoveryOffered: Boolean = false)
+    val pending: Boolean, val endComplete: Boolean, val recoveryState: String?, val prepared: Boolean, val recoveryOffered: Boolean = false, val maxPublishBps: Long? = null)
 
 /** Single-owner transaction engine. Tests inject clock, API and durable store.
  * A save failure permanently fences this instance; an uncertain HTTP result retains exactly its saved operation. */
@@ -139,7 +139,7 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
                 committedGrant(V4vGrant.read(grantJson, now))
             }
             retryAt = Long.MAX_VALUE; failures = 0; statusAt = now + 5000
-            message = when { grantJson != null && !terminalIntent && with(V4vJson) { grantJson.getValue("limits").jsonObject.number("maxPublishBps") } < V4vGrant.REQUIRED_PUBLISH_BPS -> "V4V session reserved but cap is insufficient for fixed 720p (requires 4 Mbps)"; receipt.endComplete -> "V4V End completed"; receipt.recoveryState != null -> "Recording failure acknowledged · explicit Prepare required"; terminalIntent -> "V4V End pending confirmation"; grantJson != null -> "V4V grant prepared · explicit capture Start required"; else -> "V4V operation confirmed without a publishing grant" }
+            message = when { receipt.endComplete -> "V4V End completed"; receipt.recoveryState != null -> "Recording failure acknowledged · explicit Prepare required"; terminalIntent -> "V4V End pending confirmation"; grantJson != null -> "V4V grant prepared · explicit capture Start required"; else -> "V4V operation confirmed without a publishing grant" }
             if (terminalIntent && op.kind !in setOf(V4vOperationKind.END, V4vOperationKind.ACKNOWLEDGE) && !receipt.endComplete) end()
         } catch (error: Exception) {
             if (unusable) throw error
@@ -163,7 +163,6 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
         authenticated(); check(!restoredRequiresRefresh) { "Refresh the restored V4V grant before capture" }; check(!terminalIntent && operation() == null)
         val grant = V4vGrant.read(checkNotNull(document["grant"] as? JsonObject), now)
         require(session?.identity == grant.identity && session?.phase == "active" && grant.expiresMs > now) { "V4V grant expired" }
-        require(grant.maxPublishBps >= V4vGrant.REQUIRED_PUBLISH_BPS) { "V4V cap is insufficient for fixed 720p capture (requires 4 Mbps)" }
         return grant
     }
     fun tick() {
@@ -183,8 +182,8 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
         return with(V4vJson) { origin.text("admission") == "denied" && origin.text("protocol") in setOf("none", "stopped") && (origin.text("recording") in setOf("incomplete", "failed") || origin.text("callbacks") == "failed") }
     }
     fun view() = V4vView(message, session?.identity?.eventId, session?.phase, signedIn(), operation() != null, session?.endComplete == true, session?.recoveryState,
-        !terminalIntent && !unusable && !restoredRequiresRefresh && operation() == null && signedIn() && session?.phase == "active" && (session?.expiresMs ?: 0) > now && (document["grant"] as? JsonObject)?.let { with(V4vJson) { it.getValue("limits").jsonObject.number("maxPublishBps") >= V4vGrant.REQUIRED_PUBLISH_BPS } } == true,
-        recoveryOffered(session))
+        !terminalIntent && !unusable && !restoredRequiresRefresh && operation() == null && signedIn() && session?.phase == "active" && (session?.expiresMs ?: 0) > now && document["grant"] is JsonObject,
+        recoveryOffered(session), (document["grant"] as? JsonObject)?.let { with(V4vJson) { it.getValue("limits").jsonObject.number("maxPublishBps") } })
     fun loginChallenge(): V4vLoginChallenge = with(V4vJson) {
         val answer = api.request("GET", "/api/auth/nostr/challenge", null)
         require(answer.flag("enabled")) { "V4V login is not enabled for this account" }
