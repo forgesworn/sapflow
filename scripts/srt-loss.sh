@@ -200,10 +200,12 @@ if [ "${1:-}" = "--trial" ]; then
   if [ "$kind" = sapflow ]; then f=$(ls "$d"/rec/live/event-loss/*.mp4 2>/dev/null | head -1 || true); else f=$d/out.ts; fi
   v=0; a=0; e=NA; st=FAIL
   if [ -n "${f:-}" ] && [ -s "$f" ]; then
-    v=$(ffprobe -v error -count_packets -select_streams v -show_entries stream=nb_read_packets -of csv=p=0 "$f" | head -1)
-    a=$(ffprobe -v error -count_packets -select_streams a -show_entries stream=nb_read_packets -of csv=p=0 "$f" | head -1)
-    e=$(ffmpeg -v error -i "$f" -f null - 2>&1 | wc -l | tr -d ' ')
-    st=ok
+    # A probe that fails (a damaged file) makes this trial FAIL; it must not
+    # end the script, which would lose the whole run's results.
+    v=$(ffprobe -v error -count_packets -select_streams v -show_entries stream=nb_read_packets -of csv=p=0 "$f" | head -1) || v=NA
+    a=$(ffprobe -v error -count_packets -select_streams a -show_entries stream=nb_read_packets -of csv=p=0 "$f" | head -1) || a=NA
+    e=$(ffmpeg -v error -i "$f" -f null - 2>&1 | wc -l | tr -d ' ') || e=NA
+    if [ "$v" != NA ] && [ "$a" != NA ] && [ "$e" != NA ]; then st=ok; fi
   fi
   pstat() { awk -F= -v k="$1" '$1 == k { print $2 }' "$d/proxy.txt" 2>/dev/null || true; }
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' \
@@ -294,8 +296,9 @@ for lat in $LATENCIES; do for loss in $LOSSES; do
   done
 done; done
 echo "$(wc -l < "$WORK/clean" | tr -d ' ') clean runs, then $(wc -l < "$jobs" | tr -d ' ') loss trials"
-xargs -P "$JOBS" -L 1 "$SELF" --trial < "$WORK/clean"
-xargs -P "$JOBS" -L 1 "$SELF" --trial < "$jobs"
+# A trial script that dies leaves no row; say so, and still summarise the rest.
+xargs -P "$JOBS" -L 1 "$SELF" --trial < "$WORK/clean" || echo "warning: a trial exited with an error; its row is missing" >&2
+xargs -P "$JOBS" -L 1 "$SELF" --trial < "$jobs" || echo "warning: a trial exited with an error; its row is missing" >&2
 
 printf 'receiver\tloss\tlatency_ms\tseed\tvideo\taudio\tdecode_msgs\tdata_orig\tdata_retx\tnaks\thandshake_flags\tstatus\treordered\torig_distinct\tin_time%s\n' "${PASSPHRASE:+$(printf '\t')encryption}" > "$OUT/results.tsv"
 # In the order the trials were listed, not file name order.
