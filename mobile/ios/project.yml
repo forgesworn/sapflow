@@ -6,6 +6,8 @@ options:
 packages:
   Sapflow:
     path: ../../target/native-packages/apple
+  SignetAuth:
+    path: ../../target/native-packages/signet-apple
 settings:
   base:
     SWIFT_VERSION: '5.0'
@@ -26,6 +28,8 @@ targets:
     dependencies:
       - package: Sapflow
         product: Sapflow
+      - package: SignetAuth
+        product: SignetAuth
     settings:
       base:
         PRODUCT_NAME: SapflowBroadcaster

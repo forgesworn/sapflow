@@ -12,11 +12,14 @@ remote decoded observation and sustained capture qualification remain open.
 
 ## Build
 
-The app uses XcodeGen and the parent-generated Sapflow Swift package. From the
-repository root, build the package first, then generate outside the source tree:
+The app uses XcodeGen and the generated Sapflow and SignetAuth Swift packages.
+From the repository root, build both packages, then generate outside the source
+tree. SignetAuth has a separate bounded authentication runtime; it is never
+created by camera or media callbacks.
 
 ```sh
 node scripts/build-native.mjs apple
+node scripts/build-signet-native.mjs apple
 mkdir -p target/ios-app
 xcodegen --spec mobile/ios/project.yml --project target/ios-app --cache-path target/ios-app/xcodegen-cache
 xcodebuild -project target/ios-app/SapflowBroadcaster.xcodeproj \

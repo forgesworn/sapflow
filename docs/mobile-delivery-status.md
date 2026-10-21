@@ -5,7 +5,7 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-Latest local checkpoint, 21 October: the requested origin-main integration is
+Latest local checkpoint, 22 October: the requested origin-main integration is
 complete as `1485ec0`; the later main documentation changes are merged as
 `8116361`. SDK commit `1634a809` separates transport recovery from decoded
 readiness. The full workspace gate at that checkpoint passes 475 tests, with
@@ -62,6 +62,30 @@ without polling or admitting another decoder. Scoped queue/pacing limits,
 early codec-close fencing and an independent monotonic grant-expiry alarm are
 implemented in source. Normal creator application wiring remains open; the
 installed app has not been replaced by this work.
+
+The separate maintained Signet authentication package now builds for ARM64
+macOS, iOS and iOS Simulator. The actual combined static consumer, iOS 16
+module/typecheck and combined iOS static link pass. The scoped worker and
+dependency packet passes 512 workspace tests, strict Clippy, parser fuzz and
+ten packaging regressions. The generated app project declares both packages;
+the full unsigned iOS application builds and links both with zero warnings or
+errors. Authentication headers have their own module directory, avoiding a
+shared Xcode include destination. Creator
+sign-in UI, real remote-signer consent and physical app qualification remain
+open. No real account or relay was used by these build gates.
+
+The creator-read packet passes 63 Foundation tests, including twelve new tests,
+and real-package macOS/iOS 16 compiler checks. Its event list is bounded and
+display-only. Fixed authenticated collection and exact-session reads preserve
+uncertain operations and terminal End intent; reads never recover a grant.
+The capture-admission fix passes 59 host tests, including twenty ticket tests.
+All 32 production Swift files typecheck for iOS 16 with both real native modules
+and no warnings. Prepare, permission replies, Start, Stop and rotation retain
+their exact admitted intent. Stop waits for outstanding destination construction
+and actual rejected-destination cleanup before allowing another intent. These
+are source gates; physical capture and normal V4V creator UI remain open.
+CI now includes source verification and the generated-only source and packaging
+regressions. Those commands pass locally; hosted CI has not run for this branch.
 
 Test commit `d0643ff` adds a generated-media-only macOS native reader gate.
 The current origin's exact init plus independent part passes independent FFmpeg
