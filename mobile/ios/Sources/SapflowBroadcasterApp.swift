@@ -21,6 +21,7 @@ final class BroadcasterModel: ObservableObject {
     @Published var selectedProfile: UUID?
     @Published var destinationError: String?
     private let profileStore = DestinationProfileStore()
+    private var preparation: CaptureAdmission.Preparation?
     private var hasOrientation = false
     let engine = CaptureEngine()
     init() {
@@ -36,8 +37,14 @@ final class BroadcasterModel: ObservableObject {
         }
         // Face-up/down and unknown readings retain the last valid orientation.
     }
-    func start() { updateOrientation(); engine.start() }
+    func start() {
+        guard let preparation else { return }
+        updateOrientation(); engine.start(preparation: preparation)
+    }
+    func stop() { preparation = nil; engine.stop() }
     func prepare() {
+        guard let ticket = engine.reservePreparation() else { return }
+        preparation = ticket
         updateOrientation()
         do {
             destinationError = nil
@@ -50,8 +57,14 @@ final class BroadcasterModel: ObservableObject {
                 let destination = try destination()
                 sink = try ReconnectingPublisher(source: .rtmpPeerAcknowledgedWatermark) { ManualRtmpPublisher(destination: destination, observe: $0) }
             }
-            engine.setDestination(sink) { [weak self] accepted in if accepted { self?.engine.prepare() } }
-        } catch { destinationError = error.localizedDescription }
+            engine.setDestination(sink, preparation: ticket) { [weak engine] accepted in
+                if accepted { engine?.prepare(ticket) }
+            }
+        } catch {
+            engine.abandonPreparation(ticket)
+            if preparation == ticket { preparation = nil }
+            destinationError = error.localizedDescription
+        }
     }
     private func destination() throws -> ManualDestination {
         try ManualDestination(endpoint: endpoint, streamKey: streamKey, allowPlaintext: allowPlaintext)
@@ -116,7 +129,7 @@ struct CameraPreview: UIViewRepresentable {
 
 struct BroadcasterView: View {
     @StateObject private var model = BroadcasterModel()
-    private var controlsLocked: Bool { model.snapshot.running || model.snapshot.phase == "Finalising" }
+    private var controlsLocked: Bool { model.snapshot.running || model.snapshot.phase == "Finalising" || model.snapshot.phase == "Preparing" }
     var body: some View {
         GeometryReader { geometry in
             Group {
@@ -160,8 +173,8 @@ struct BroadcasterView: View {
                     Button("Prepare") { model.prepare() }.disabled(controlsLocked).accessibilityIdentifier("capture.prepare")
                     Button(model.recordingOnly ? "Start recording" : "Start broadcast") { model.start() }.disabled(!model.snapshot.canStart).accessibilityIdentifier("capture.start")
                 }.buttonStyle(.borderedProminent)
-                Button("Stop and save") { model.engine.stop() }
-                    .buttonStyle(.bordered).disabled(!model.snapshot.running && !model.snapshot.canStart && model.snapshot.phase != "Finalising").accessibilityIdentifier("capture.stop")
+                Button("Stop and save") { model.stop() }
+                    .buttonStyle(.bordered).disabled(!model.snapshot.running && !model.snapshot.canStart && model.snapshot.phase != "Finalising" && model.snapshot.phase != "Preparing").accessibilityIdentifier("capture.stop")
                 if let url = model.snapshot.recordingURL {
                     ShareLink(item: url) { Label("Export recording", systemImage: "square.and.arrow.up") }
                     Text("Saved in Files → On My iPhone → Sapflow").font(.caption).foregroundStyle(.secondary)
