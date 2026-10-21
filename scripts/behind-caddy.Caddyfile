@@ -1,0 +1,26 @@
+# Caddy in front of sapflow as the live stage serves it: TLS and HTTP/2 (and
+# HTTP/3) outside, sapflow's plain HLS port inside, under /live-hls/.
+# scripts/behind-caddy.sh runs it in Docker and sets the variables below;
+# `tls internal` (Caddy's own CA) stands in for a real certificate there.
+# For production, copy the handle_path block into the real site block.
+#
+# CADDY_SITE_EXTRA and CADDY_PROXY_EXTRA are empty unless a run tries an
+# extra directive (for example `encode gzip zstd`, or `flush_interval -1`).
+{
+	admin off
+	https_port {$CADDY_HTTPS_PORT}
+	auto_https disable_redirects
+	servers {
+		protocols {$CADDY_PROTOCOLS}
+	}
+}
+
+{$CADDY_SITE}:{$CADDY_HTTPS_PORT} {
+	tls internal
+	{$CADDY_SITE_EXTRA}
+	handle_path /live-hls/* {
+		reverse_proxy {$SAPFLOW_UPSTREAM} {
+			{$CADDY_PROXY_EXTRA}
+		}
+	}
+}
