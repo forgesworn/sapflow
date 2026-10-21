@@ -1,0 +1,119 @@
+# Readiness to replace mediamtx
+
+An assessment for the maintainer, written 2026-10-21 against `main` (985de00).
+`GOALS.md` keeps sapflow an experiment until the numbers favour it and the
+maintainer decides. This page lists what is measured and what is not.
+
+## 1. Recommendation (the maintainer's to make)
+
+Ingest, packaging, recording, callbacks and reconnects work with real encoders
+and v4v's gates, at about a third of mediamtx's CPU and memory on one machine.
+That supports a staged trial on one non-critical show, with mediamtx left
+running and a rehearsed way back. It does not yet support a full switch:
+no benchmark, profile or load test has run on Linux, behind Caddy, over a
+wired link at 250 and 750 viewers, which is the shape of the deployment, and
+three pieces of work are in progress (section 3).
+
+## 2. Proven
+
+| Area | What was shown | Where |
+|------|----------------|-------|
+| Ingest, real encoders | RTMP: ffmpeg, OBS, Larix (iPhone). SRT on our own receiver (the default): ffmpeg, `srt-live-transmit`, OBS, Larix, with and without a passphrase. All used handshake version 5. | `docs/interop.md` |
+| LL-HLS | Plays in hls.js (Chrome), Safari on macOS, Safari on a physical iPhone (72 s, no stalls) and the iOS simulator. Every rendered playlist is checked against the Apple rules by tests, a fuzz target and a live checker. | `GOALS.md` M1; `docs/reference.md`; `docs/interop.md` "Reproducing irregular encoder timing" |
+| Recording | One fMP4 file per show, plays and seeks in Chrome; v4v imports sapflow's own file, byte for byte, as the replay. | `GOALS.md` M3 |
+| Callbacks, v4v gates | `publish`, `unpublish`, `recordSegmentComplete`, `health`. v4v's ingest gate passed over RTMP and SRT on 2026-10-20; the suites are on a v4v branch not yet merged. | `GOALS.md` M1 to M3, M6; `docs/v4v-contract.md` |
+| Resources against mediamtx 1.19.1 | One Mac, 750 simulated viewers: 26 to 30% of a core against 103 to 107%, peak memory 66 to 77 MB against 263 to 267 MB, median playlist times about half, no failed requests after the keep-alive and open-file fixes. A second Mac over Wi-Fi: the same ratio. Worst-case segment and part fan-out times at 750 viewers were sometimes worse than mediamtx's. | `docs/benchmarks.md`; `docs/profiling.md` |
+| Hardening | Ten fuzz targets ran 20 minutes each on GitHub, no crash. Limits on connections, sizes, bitrate, logins and disk. Threat model T1 to T16. The last completed CI run on `main` passed. | `docs/threat-model.md`; `fuzz/README.md` |
+| Encryption | SRT passphrase (AES-CTR): OBS and Larix publish with it, a wrong one is refused, both directions against libsrt, key rotation; an independent review found no defects. CTR does not authenticate media; the stream id, which carries the credential, stays in clear. | `GOALS.md` M6b; `docs/interop.md`; `docs/threat-model.md` "Out of scope" |
+| Reconnect grace | A dropped encoder is held 90 s, v4v's own window. Larix over RTMP resumed seven times in six minutes; OBS restarted after 62 s resumed. hls.js crossed the discontinuities; Safari carried on (by eye). | `docs/interop.md` "Stopping and restarting"; `docs/reference.md` "Target duration and breaks" |
+| Delay | Camera to Safari 3.0 and 3.2 s over HTTP/2 (a Node HTTP/2 front stood in for Caddy); 10.8 s over plain HTTP/1.1, where Safari ignores the low-latency position. The server adds nothing measurable beyond the SRT latency. | `docs/interop.md` "Delay through the server" |
+
+## 3. Not yet proven
+
+| Gap | What would prove it | Needs |
+|-----|---------------------|-------|
+| Linux | Every measurement is from macOS (`docs/profiling.md` Limits). Only CI (tests, smoke test and fuzzing on Ubuntu) and the container image serving a stream have run on Linux. Repeat the benchmark and a long run on the trial host's OS. | A Linux machine |
+| 250 and 750 full viewers, wired, behind Caddy | `scripts/bench-remote.sh` with Caddy and HTTP/2 in front, mediamtx back to back; confirm Caddy does not hold back blocking playlist reloads. Caddy in Docker: in progress. | A second wired Linux machine |
+| Delay behind real Caddy, and against mediamtx | Larix to Safari through Caddy with mediamtx beside it. The only side-by-side was over HTTP/1.1, where sapflow sat about 4 s further back (target duration 3 against 2). | Phone, Mac, a clock |
+| Encryption under loss, and fuzzed longer | `scripts/srt-loss.sh` with a passphrase against libsrt (in progress). `own_srt_caller` was added after the 2026-10-21 nightly, so it has had 60 s CI runs only; then hours per target. | The next nightly; manual runs |
+| A show-length run | No recorded run lasts more than minutes. Publish for hours with drops, sampling memory, open descriptors and the recording. | A Linux machine |
+| Larix's first SRT attempt | Sometimes accepted but sends no data, times out after 5 s, and a later attempt works (`docs/interop.md`). Repeat cold starts with a capture at both ends. Unexplained. | The phone, a capture |
+| Other encoders | Larix with the phone locked; Larix on Android; OBS's Apple hardware encoder; vMix. | Devices; vMix access |
+| SRT handshake version 4 | No encoder tested needed it. Find one that does and test it, or document it as unsupported. | An older encoder |
+| Safari after drops | Safari ended about 10 s behind the camera after seven drops. The v4v player fix is in progress; rewatch with a measured offset once it ships. | The v4v fix |
+
+## 4. Risks for a switch, and mitigations
+
+- **Rollback.** Keep mediamtx's config and image ready, untouched, and switch
+  back by restoring the templates and Caddy upstream (section 5). Do it
+  between shows: a rollback during a show ends the stream, and has not been
+  rehearsed.
+- **Unmerged work.** The srt-rs removal (`feat/m6c-remove-srt-rs`) and v4v's
+  gate branch are not merged. On `main`, `SAPFLOW_SRT_IMPL=srt-rs` is still an
+  in-binary fallback; after the removal the only fallback is mediamtx. Run the
+  trial on a named build and re-run the smoke test and both gates against it.
+- **Larix first attempt.** Unexplained. Tell performers to retry, keep the
+  encoder's auto-reconnect on, and keep logs from the trial.
+- **Safari drift.** Each drop leaves Safari further behind until the v4v fix
+  ships. Ship it before the trial, or choose a show on a wired encoder.
+- **One maintainer, our own protocol code.** Both ingest protocols are ours,
+  with no upstream to lean on. The answers are fuzzing, the loss comparison
+  against libsrt and the mediamtx fallback.
+- **Features sapflow lacks.** RTMP, RTSP and WebRTC playback (v4v's optional
+  WebRTC monitor), hooks that run commands (a simulcast relay) and the control
+  API. v4v's reference config has WebRTC off and v4v says nothing in
+  production depends on the API, but the production host's config is not in
+  these repositories: check it first.
+- **Open-file limit.** systemd's usual 1,024 would have failed at 250 viewers
+  (`docs/benchmarks.md`). Set `LimitNOFILE`, or the container's `ulimit`, well
+  above the viewer count and read the startup log for the warning.
+- **Passphrase.** Start the trial without `SAPFLOW_SRT_PASSPHRASE`: v4v's
+  reference mediamtx config sets none (it has SRT off), and Studio's SRT URL
+  carries one only if the template does. Enabling it is a separate decision that changes the
+  URL v4v hands out.
+
+## 5. What a switch changes
+
+v4v needs no code change (`docs/v4v-contract.md`): it reaches the media server
+only through URL templates and the callback. The gate branch changes only the
+gate script and a helper that script alone uses. The templates are one set per
+deployment, so a trial is a window on the whole stage, or a second stack.
+
+- **Media host.** Run sapflow where mediamtx ran (RTMP 1935, SRT 8890/udp,
+  HLS 8888 are the defaults for both) and point the Caddy path for HLS at it.
+  The playlist path, `/live/{streamId}/index.m3u8`, is the same.
+- **v4v environment, only where host, port or credentials differ:**
+  `PULSEWIRE_LIVE_RTMP_SERVER_URL_TEMPLATE`, `PULSEWIRE_LIVE_SRT_URL_TEMPLATE`
+  and `PULSEWIRE_LIVE_PLAYBACK_PROBE_URL_TEMPLATE`. The SRT template needs the
+  credentials in the stream id:
+  `srt://<host>:8890?streamid=publish:live/{streamId}:<user>:<pass>`.
+- **sapflow settings that must match v4v:** `SAPFLOW_PUBLISH_USER` and
+  `SAPFLOW_PUBLISH_PASS` (the stream key's user and password),
+  `SAPFLOW_CALLBACK_URL`
+  (`http://<app>:5181/api/public/live-events/{eventId}/stream-health`),
+  `SAPFLOW_CALLBACK_SECRET` (`PULSEWIRE_LIVE_CALLBACK_SECRET`),
+  `SAPFLOW_RECORDINGS` (the directory v4v mounts as
+  `PULSEWIRE_LIVE_RECORDING_DIR`) and `SAPFLOW_RECONNECT_GRACE`
+  (`PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`). They replace mediamtx's
+  `runOnReady`, `runOnNotReady` and `runOnRecordSegmentComplete` hooks.
+
+## 6. Staged rollout
+
+1. Choose the build (section 4, unmerged work). Run `cargo test --workspace`,
+   `scripts/smoke.sh` and both v4v ingest gates against it.
+2. Finish the in-progress work (Caddy in Docker, encrypted loss comparison,
+   the v4v player fix). Run the wired Linux load test if a machine is free.
+3. Prepare a Linux trial host: sapflow on its own ports beside mediamtx, the
+   open-file limit raised, recordings on the volume v4v reads, Caddy with TLS
+   and HTTP/2 (never point Safari at sapflow directly: 10.8 s against 3.0 to
+   3.2 s). Play a stream from a web client on another origin; sapflow sends
+   `Access-Control-Allow-Origin: *`, but no such client has tried it.
+4. Rehearse: the Studio test signal, then OBS and Larix over RTMP and SRT with
+   1 s keyframes; drop each encoder and return within 90 s; confirm the replay
+   reaches Studio; then switch back to mediamtx once.
+5. Trial: one non-critical show with someone watching the logs, the `health`
+   callbacks and Safari through Caddy. Change the templates and the Caddy
+   upstream before the show; leave mediamtx running.
+6. Rollback, at any step: restore the previous templates and Caddy upstream.
+   After the trial the maintainer decides whether to widen it, repeat it or
+   stop, and the outcome goes in `GOALS.md`.
