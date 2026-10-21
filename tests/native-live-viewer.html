@@ -45,7 +45,19 @@ globalThis.SapflowNativeHls = (() => {
       this.video = video; this.source = source; this.now = now; this.wall = wall;
       this.instanceId = instanceId; this.events = []; this.handlers = new Map(); this.disposed = false;
       this.startedAt = now(); this.lastProgressAt = null;
-      this.progressTime = finite(video.currentTime); this.progressFrames = frames(video);
+      this.presentationSupported = typeof video.requestVideoFrameCallback === 'function' &&
+        typeof video.cancelVideoFrameCallback === 'function';
+      this.presentedCallbacks = 0; this.lastPresentedMediaTime = null; this.frameCallbackId = null;
+      this.onPresentedFrame = (_now, metadata) => {
+        if (this.disposed || !this.presentationSupported) return;
+        this.frameCallbackId = null;
+        this.presentedCallbacks = Math.min(Number.MAX_SAFE_INTEGER, this.presentedCallbacks + 1);
+        const mediaTime = finite(metadata?.mediaTime);
+        if (mediaTime !== null) this.lastPresentedMediaTime = mediaTime;
+        this.requestPresentation();
+      };
+      this.progressTime = finite(video.currentTime);
+      this.progressFrames = this.presentationSupported ? this.presentedCallbacks : frames(video);
       for (const type of ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'waiting',
         'stalled', 'pause', 'ended', 'error', 'resize', 'seeking', 'seeked', 'emptied']) {
         const handler = () => this.record(type);
@@ -56,6 +68,17 @@ globalThis.SapflowNativeHls = (() => {
       video.src = source;
       this.sourceAssignments = 1;
       this.record('source-assigned');
+      this.requestPresentation();
+    }
+    requestPresentation() {
+      if (this.disposed || !this.presentationSupported || this.frameCallbackId !== null) return;
+      try { this.frameCallbackId = this.video.requestVideoFrameCallback(this.onPresentedFrame); }
+      catch (_) {
+        this.presentationSupported = false;
+        // Start the fallback counter in its own domain; do not compare it with
+        // the presentation callback count or invent progress during a switch.
+        this.progressTime = finite(this.video.currentTime); this.progressFrames = frames(this.video);
+      }
     }
     record(type) {
       this.events.push({utc:this.wall(), elapsedMs:this.now() - this.startedAt, type,
@@ -65,18 +88,20 @@ globalThis.SapflowNativeHls = (() => {
     }
     sample() {
       const video = this.video, now = this.now(), time = finite(video.currentTime), decoded = frames(video);
+      const progress = this.presentationSupported ? this.presentedCallbacks : decoded;
       const reset = (time !== null && this.progressTime !== null && time < this.progressTime) ||
-        (decoded !== null && this.progressFrames !== null && decoded < this.progressFrames);
-      if (reset || video.paused || video.ended || video.error) {
-        this.progressTime = time; this.progressFrames = decoded;
+        (progress !== null && this.progressFrames !== null && progress < this.progressFrames);
+      if (reset || (progress !== null && this.progressFrames === null) ||
+          (time !== null && this.progressTime === null) || video.paused || video.ended || video.error) {
+        this.progressTime = time; this.progressFrames = progress;
       }
-      const frameProgress = decoded === null || this.progressFrames === null || decoded > this.progressFrames;
+      const frameProgress = progress !== null && this.progressFrames !== null && progress > this.progressFrames;
       if (!video.paused && !video.ended && !video.error && video.readyState >= 2 && video.videoWidth > 0 &&
           time !== null && this.progressTime !== null && time > this.progressTime + 0.01 && frameProgress) {
         this.lastProgressAt = now;
         // Safari may expose time and frame-counter changes on separate reads.
         // Compare both with the last confirmed progress, not the last poll.
-        this.progressTime = time; this.progressFrames = decoded;
+        this.progressTime = time; this.progressFrames = progress;
       }
       let state;
       if (video.error) state = 'error';
@@ -89,6 +114,8 @@ globalThis.SapflowNativeHls = (() => {
       const covering = buffered.find(([start, end]) => time !== null && start <= time && time <= end);
       return {utc:this.wall(), playerKind:'native-hls', instanceId:this.instanceId, source:this.source,
         sourceAssignments:this.sourceAssignments, state, currentTime:time, decodedFrames:decoded,
+        presentationSupported:this.presentationSupported, presentedCallbacks:this.presentedCallbacks,
+        lastPresentedMediaTime:this.lastPresentedMediaTime,
         width:video.videoWidth, height:video.videoHeight, readyState:video.readyState,
         networkState:video.networkState, paused:video.paused, ended:video.ended,
         errorCode:video.error?.code ?? null, buffered, seekable,
@@ -99,6 +126,8 @@ globalThis.SapflowNativeHls = (() => {
     dispose() {
       if (this.disposed) return;
       this.disposed = true;
+      const pending = this.frameCallbackId; this.frameCallbackId = null;
+      if (pending !== null) this.video.cancelVideoFrameCallback(pending);
       for (const [type, handler] of this.handlers) this.video.removeEventListener(type, handler);
       this.handlers.clear();
     }

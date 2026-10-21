@@ -10,23 +10,38 @@ Keep the page open while rotating the physical broadcaster. The source is
 assigned once, with no reload, seek-to-live or player recreation. Check
 `sapflowNativeMetrics()` before and after each rotation: the instance identifier
 and source-assignment count must stay fixed, dimensions must change to the
-actual encoded resolution, and media time and decoded frames must resume.
+actual encoded resolution, and media time and presented callbacks must resume.
 Save the bounded diagnostic evidence and the origin's request/timeline evidence.
 The event history retains at most 128 entries. The fixture observes the native
 player; it does not fetch or retain media bytes.
 
-The status requires advancing media time, available decoded-frame progress
-and sufficient ready state before reporting playback. Four seconds without
-progress reports stalled. An intentional pause, end or media error has its own
-status. Time and frame-counter changes are compared with the last confirmed
-progress so separate native counter updates cannot cause a false stall. A
-decoder counter reset establishes a new baseline without fabricating progress.
-The frame counter is sampled once per second, not a count of frames
-physically presented. Buffered-ahead time and seekable ranges are diagnostic
+The observer owns one `requestVideoFrameCallback` when that API and its cancel
+method are available. It retains only a bounded numeric callback count and the
+last finite `mediaTime`; it retains no frames or per-frame event history.
+`presentedCallbacks`, `lastPresentedMediaTime` and `presentationSupported` are
+included in the snapshot. One callback is re-armed after each invocation.
+Disposal and pagehide cancel the outstanding request; a late callback is fenced
+and cannot update counters or re-arm itself.
+
+Playback status requires advancing media time, advancing presentation callbacks
+and sufficient ready state. A frozen `getVideoPlaybackQuality` counter therefore
+cannot override observed presentation. `decodedFrames` remains a separate
+diagnostic. Where frame callbacks are unavailable or requesting one fails,
+decoded-counter progress is the fallback. If neither frame signal exists,
+clock movement alone cannot certify playback and reports waiting, then stalled.
+Four seconds without confirmed progress reports stalled. An intentional pause,
+end or media error has its own status. Clock and frame signals are compared with
+the last confirmed progress so staggered native updates cannot cause a false
+stall. Counter/time resets establish a baseline without fabricating progress.
+The callback is a browser presentation signal, not physical screen/camera proof.
+Buffered-ahead time and seekable ranges are diagnostic
 values, not glass-to-glass latency. Native HLS may buffer differently from the
 separate hls.js fixture; qualify both independently.
 
 Run `node tests/native-live-viewer.test.mjs` for event/path validation,
 single-source identity through simulated dimension changes and errors,
-progress/stall/pause/end handling, bounded immutable snapshots and listener
-cleanup. These deterministic tests do not establish physical Safari recovery.
+progress/stall/pause/end handling, a frozen quality counter with continuing
+presentation, no-frame stalls, bounded immutable snapshots, one owned callback,
+dispose/pagehide cancellation and stale-callback fencing. These deterministic
+tests do not establish physical Safari recovery. This observer correction does
+not fix or reclassify the earlier confirmed native playback failures.

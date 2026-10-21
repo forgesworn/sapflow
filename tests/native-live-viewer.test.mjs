@@ -11,9 +11,10 @@ assert.equal(sourceFor('event-native_1'), '/live/event-native_1/index.m3u8');
 for (const event of ['', '../stream', 'event?a=b', 'https://example.invalid', '%2f', 'x/y', 'a'.repeat(129), null]) {
   assert.throws(() => sourceFor(event));
 }
-function fixture(supported = 'maybe', frameCounter = true) {
+function fixture(supported = 'maybe', frameCounter = true, presentation = false) {
   let now = 0, assignments = 0, decoded = 0;
-  const handlers = new Map();
+  let nextCallback = 0, requested = 0, cancelled = 0;
+  const handlers = new Map(), callbacks = new Map();
   const video = {currentTime:0, videoWidth:720, videoHeight:1280, readyState:1,
     networkState:2, paused:false, ended:false, error:null,
     buffered:{length:1, start:() => 0, end:() => 2}, seekable:{length:0},
@@ -23,9 +24,24 @@ function fixture(supported = 'maybe', frameCounter = true) {
     set src(value) { assignments++; assert.equal(value, '/live/event-native/index.m3u8'); },
     load:() => assert.fail('fixture must not reload the native source')};
   if (frameCounter) video.getVideoPlaybackQuality = () => ({totalVideoFrames:decoded});
+  if (presentation) {
+    video.requestVideoFrameCallback = callback => {
+      const id = nextCallback++; requested++; callbacks.set(id, callback);
+      assert.equal(callbacks.size, 1, 'only one presentation callback may be pending');
+      return id;
+    };
+    video.cancelVideoFrameCallback = id => { cancelled++; callbacks.delete(id); };
+  }
   const observation = new Observation(video, 'event-native', {now:() => now,
     wall:() => 'fixture-time', instanceId:'stable-instance'});
   return {video, handlers, observation, assignments:() => assignments,
+    callbackPending:() => callbacks.size, requested:() => requested, cancelled:() => cancelled,
+    peekCallback:() => callbacks.values().next().value,
+    present(mediaTime = video.currentTime) {
+      const next = callbacks.entries().next().value;
+      if (!next) return false;
+      callbacks.delete(next[0]); next[1](now, {mediaTime}); return true;
+    },
     tick(ms, time = video.currentTime, frames = decoded) {
       now += ms; video.currentTime = time; decoded = frames; return observation.sample();
     }};
@@ -87,9 +103,87 @@ assert.throws(() => fixture(''), /Native HLS is unavailable/);
 {
   const f = fixture('probably', false); f.video.readyState = 4;
   const metrics = f.tick(1000, 1);
-  assert.equal(metrics.state, 'playing'); assert.equal(metrics.decodedFrames, null);
+  assert.equal(metrics.state, 'waiting'); assert.equal(metrics.decodedFrames, null);
+  assert.equal(f.tick(4000, 5).state, 'stalled'); // No frame signal cannot certify playback.
   assert.deepEqual(plain(metrics.buffered), [[0, 2]]);
   assert.equal(metrics.bufferedAheadSeconds, 1);
   f.tick(1000, 3); assert.equal(f.observation.sample().bufferedAheadSeconds, null);
 }
-console.log('Native HLS fixture: constrained event, one source, progress/stall/pause/error, rotation identity and bounded evidence passed');
+{
+  const f = fixture('probably', true, true); f.video.readyState = 4;
+  f.present(1);
+  assert.equal(f.tick(1000, 1, 775).state, 'playing');
+  for (let second = 2; second <= 7; second++) {
+    for (let frame = 0; frame < 29; frame++) f.present(second + frame / 30);
+    const metrics = f.tick(1000, second, 775);
+    assert.equal(metrics.state, 'playing', 'frozen decoded quality must not override progressing presentation');
+    assert.equal(metrics.decodedFrames, 775);
+    assert.equal(metrics.presentationSupported, true);
+  }
+  const metrics = f.observation.sample();
+  assert.equal(metrics.presentedCallbacks, 175);
+  assert.equal(metrics.lastPresentedMediaTime, 7 + 28 / 30);
+  assert.equal(f.callbackPending(), 1); assert.equal(f.assignments(), 1);
+  f.present(8);
+  assert.equal(f.tick(1000, 8, 0).state, 'playing'); // Decoder-stat reset cannot hide real presentation.
+  f.present(NaN); f.present(Infinity);
+  assert.equal(f.observation.sample().lastPresentedMediaTime,8); // Retain finite scalar metadata only.
+  f.observation.dispose();
+}
+{
+  const f = fixture('probably', true, true); f.video.readyState = 4;
+  assert.equal(f.tick(4000, 4, 120).state, 'stalled'); // Clock+decoded progress cannot replace absent presentation.
+  f.present(4);
+  assert.equal(f.tick(1, 4, 120).state, 'playing'); // Clock-first, callback-later observations combine.
+  f.present(5);
+  assert.equal(f.tick(1000, 5, 120).state, 'playing'); // Callback-first, clock-later also combines.
+  for (let frame = 0; frame < 100; frame++) f.present(5);
+  assert.equal(f.tick(4000, 5, 120).state, 'stalled'); // Callbacks alone cannot qualify a frozen clock.
+  f.video.paused = true; f.present(6);
+  assert.equal(f.tick(1000, 6, 120).state, 'paused');
+  f.video.paused = false; f.video.error = {code:3};
+  assert.equal(f.tick(1000, 7, 120).state, 'error');
+  f.video.error = null; f.video.ended = true;
+  assert.equal(f.tick(1000, 7, 120).state, 'ended');
+  f.observation.dispose();
+}
+{
+  const f = fixture('probably', true, true);
+  assert.equal(f.requested(), 1); assert.equal(f.callbackPending(), 1);
+  const stale = f.peekCallback(), requests = f.requested();
+  f.observation.dispose(); f.observation.dispose();
+  assert.equal(f.cancelled(), 1); assert.equal(f.callbackPending(), 0); assert.equal(f.handlers.size, 0);
+  stale(0, {mediaTime:1});
+  assert.equal(f.requested(), requests); assert.equal(f.observation.sample().presentedCallbacks, 0);
+}
+{
+  const f = fixture('probably', true, true); f.video.readyState = 4;
+  f.video.requestVideoFrameCallback = () => { throw new Error('Unavailable'); };
+  f.present(1); // Re-arming failed; switch to a fresh quality-counter baseline.
+  const switched = f.observation.sample();
+  assert.equal(switched.presentationSupported, false); assert.equal(switched.state, 'waiting');
+  assert.equal(f.tick(1000, 1, 30).state, 'playing');
+  assert.equal(f.tick(4000, 2, 30).state, 'stalled');
+  f.observation.dispose();
+}
+{
+  // Exercise the actual pagehide wiring, with no browser, timers or network.
+  const f = fixture('probably', true, true); f.observation.dispose();
+  const nodes = {video:f.video, status:{}, play:{}, export:{}};
+  let hide, cleared = 0;
+  const page = vm.createContext({SapflowNativeHls:context.SapflowNativeHls, URLSearchParams,
+    document:{getElementById:id => nodes[id]}, location:{search:'?event=event-native'},
+    crypto:{randomUUID:() => 'page-instance'}, setInterval:() => 42,
+    clearInterval:id => { assert.equal(id,42); cleared++; },
+    window:{addEventListener:(event,callback,options) => {
+      assert.equal(event,'pagehide'); assert.equal(options.once,true); hide=callback;
+    }}});
+  vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],page);
+  assert.equal(f.callbackPending(),1);
+  const stale=f.peekCallback(), requests=f.requested(), cancellations=f.cancelled();
+  hide();
+  assert.equal(cleared,1); assert.equal(f.callbackPending(),0);
+  assert.equal(f.cancelled(),cancellations+1); assert.equal(f.handlers.size,0);
+  stale(0,{mediaTime:9}); assert.equal(f.requested(),requests);
+}
+console.log('Native HLS fixture: owned presentation callbacks, quality fallback, one source, progress/stall/pause/error, rotation identity and bounded evidence passed');
