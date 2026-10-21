@@ -7,6 +7,7 @@
 #   RECEIVERS=sapflow SAPFLOW_BIN=/path/to/sapflow scripts/srt-loss.sh
 #   RECEIVERS="old=/path/sapflow-old new=/path/sapflow-new libsrt" scripts/srt-loss.sh
 #   RECEIVERS="srt-rs own libsrt" scripts/srt-loss.sh   # both SRT implementations
+#   PASSPHRASE=loss-test-key KMREFRESH=2000 RECEIVERS="own libsrt" scripts/srt-loss.sh
 #   scripts/srt-loss.sh --summarise scratch/srt-loss/<run>/results.tsv
 #
 # A 30 s test clip (ffmpeg lavfi: 720p30 and a tone, 2.5 Mbit/s H.264 with 1 s
@@ -42,6 +43,23 @@
 #                       a NAME starting with `own` runs sapflow with
 #                       SAPFLOW_SRT_IMPL=own (our SRT), any other with srt-rs
 #   CLIP_SECS=30  DELAY_MS=30 (one way)  JOBS=3 (trials at once)
+#   PASSPHRASE=         encrypt the stream, off when unset (the output is then
+#                       what it was before this option existed). 10 to 79 of
+#                       A-Z a-z 0-9 . _ - (libsrt 1.5.3 does not decode %20).
+#                       The sender and libsrt receiver get it as URL options,
+#                       sapflow as SAPFLOW_SRT_PASSPHRASE, so every sapflow
+#                       receiver must be our own SRT (a name starting `own`).
+#   PBKEYLEN=16         AES key length with PASSPHRASE: 16 (AES-128) or 32
+#   KMREFRESH=          sender key refresh every this many packets (libsrt
+#                       kmrefreshrate; its default of 2^24 never fires in a
+#                       clip). At 2.5 Mbit/s a 30 s clip is about 7,300 packets.
+#   KMPREANNOUNCE=      packets before the switch that the new key is sent
+#                       (default KMREFRESH / 4; at most (KMREFRESH - 1) / 2)
+#   SENDER_PASSPHRASE=  testing only: a different passphrase on the sender, to
+#                       show that a mismatch delivers nothing
+#   With PASSPHRASE the settings are the last column of results.tsv, the
+#   summary starts with them, and each trial's receiver, sender and proxy logs
+#   are kept in $OUT/logs.
 #   SAPFLOW_BIN, PROXY_BIN   default: release builds of this checkout
 set -euo pipefail
 
@@ -56,6 +74,7 @@ summarise() { # results.tsv
     {
       r = $1; loss = $2; lat = $3; v = $5; a = $6; dec = $7; orig = $8; retx = $9
       if ($13 + 0 > 0) reordered++
+      if (NF >= 16 && !($16 in encseen)) { encseen[$16] = 1; encs[++nenc] = $16 }
       if ($12 != "ok") { failed[r SUBSEP loss SUBSEP lat]++; next }
       if (loss == "none") { bv[r, lat] = v; ba[r, lat] = a; bd[r, lat] = dec; bo[r, lat] = orig > 0 ? 100 * retx / orig : 0; next }
       k = r SUBSEP loss SUBSEP lat
@@ -70,6 +89,8 @@ summarise() { # results.tsv
       sd_[k] += dec; ssd[k] += dec * dec
     }
     END {
+      for (i = 1; i <= nenc; i++) printf "Encryption: %s\n", encs[i]
+      if (nenc) print ""
       if (reordered) printf "WARNING: the proxy reordered packets in %d trials; those numbers are suspect\n\n", reordered
       print "| Loss | Latency | Receiver | n | Retransmission overhead | Not recovered in time | Video delivered | Audio delivered | Decode messages |"
       print "|------|--------:|----------|--:|------------------------:|----------------------:|----------------:|----------------:|----------------:|"
@@ -131,6 +152,15 @@ if [ "${1:-}" = "--trial" ]; then
   if [ "${recv#libsrt}" != "$recv" ]; then kind=libsrt; else kind=sapflow; fi
   d=$WORK/t$idx; mkdir -p "$d"
   base=$((PORT_BASE + (idx % 50) * 4)); sp=$base; pp=$((base + 1)); lp=$((base + 2)); hp=$((base + 3))
+  # Encryption is opt-in. libsrt takes it as URL options; sapflow as
+  # environment (exported here, so it reaches only this trial's children).
+  sndq=""; rcvq=""
+  if [ -n "${PASSPHRASE:-}" ]; then
+    export SAPFLOW_SRT_PASSPHRASE=$PASSPHRASE SAPFLOW_SRT_PBKEYLEN=$PBKEYLEN
+    rcvq="&passphrase=$PASSPHRASE&pbkeylen=$PBKEYLEN"
+    sndq="&passphrase=${SENDER_PASSPHRASE:-$PASSPHRASE}&pbkeylen=$PBKEYLEN"
+    [ -z "${KMREFRESH:-}" ] || sndq="$sndq&kmrefreshrate=$KMREFRESH&kmpreannounce=$KMPREANNOUNCE"
+  fi
   pids=()
   cleanup() { for p in "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
   trap cleanup EXIT
@@ -142,7 +172,7 @@ if [ "${1:-}" = "--trial" ]; then
       "$bin" > "$d/rcv.log" 2>&1 &
     rp=$!; target=$sp; sid="&streamid=publish:live/event-loss"
   else
-    srt-live-transmit "srt://127.0.0.1:$lp?mode=listener&latency=$lat" file://con \
+    srt-live-transmit "srt://127.0.0.1:$lp?mode=listener&latency=$lat$rcvq" file://con \
       > "$d/out.ts" 2> "$d/rcv.log" &
     rp=$!; target=$lp; sid=""
   fi
@@ -154,7 +184,7 @@ if [ "${1:-}" = "--trial" ]; then
   # srt-live-transmit does not exit when its input ends, so find ffmpeg in the
   # pipeline, wait for it, let the receiver drain, then stop the sender.
   ( ffmpeg -hide_banner -loglevel error -re -i "$WORK/src.ts" -c copy -f mpegts - 2> "$d/ff.log" |
-    srt-live-transmit -a:no file://con "srt://127.0.0.1:$pp?latency=$lat$sid" > "$d/snd.log" 2>&1 ) &
+    srt-live-transmit -a:no file://con "srt://127.0.0.1:$pp?latency=$lat$sndq$sid" > "$d/snd.log" 2>&1 ) &
   sp_=$!; pids+=("$sp_"); sleep 2
   fp=$(pgrep -P "$sp_" -x ffmpeg | head -1 || true)
   waited=0
@@ -176,9 +206,14 @@ if [ "${1:-}" = "--trial" ]; then
     st=ok
   fi
   pstat() { awk -F= -v k="$1" '$1 == k { print $2 }' "$d/proxy.txt" 2>/dev/null || true; }
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' \
     "$recv" "$loss" "$lat" "$seed" "${v:-0}" "${a:-0}" "$e" "$(pstat data_orig)" "$(pstat data_retx)" \
-    "$(pstat nak_packets)" "$(pstat hs_flags)" "$st" "$(pstat reordered_orig)" "$(pstat orig_distinct)" "$(pstat in_time)" > "$OUT/trials/$idx.tsv"
+    "$(pstat nak_packets)" "$(pstat hs_flags)" "$st" "$(pstat reordered_orig)" "$(pstat orig_distinct)" "$(pstat in_time)" \
+    "${PASSPHRASE:+$(printf '\t%s' "$ENC_DESC")}" > "$OUT/trials/$idx.tsv"
+  if [ -n "${PASSPHRASE:-}" ]; then
+    mkdir -p "$OUT/logs"
+    for n in rcv snd proxy; do [ ! -s "$d/$n.log" ] || cp "$d/$n.log" "$OUT/logs/$idx-$recv-$n.log"; done
+  fi
   [ -n "${KEEP:-}" ] || rm -rf "$d"
   exit 0
 fi
@@ -190,6 +225,37 @@ RECEIVERS=${RECEIVERS:-"sapflow libsrt"}
 CLIP_SECS=${CLIP_SECS:-30}
 DELAY_MS=${DELAY_MS:-30}
 JOBS=${JOBS:-3}
+PASSPHRASE=${PASSPHRASE:-}
+PBKEYLEN=${PBKEYLEN:-16}
+KMREFRESH=${KMREFRESH:-}
+KMPREANNOUNCE=${KMPREANNOUNCE:-}
+SENDER_PASSPHRASE=${SENDER_PASSPHRASE:-}
+
+die() { echo "$*" >&2; exit 1; }
+ENC_DESC=""
+if [ -n "$PASSPHRASE" ]; then
+  for pw in "$PASSPHRASE" "$SENDER_PASSPHRASE"; do
+    [ -z "$pw" ] || [[ $pw =~ ^[A-Za-z0-9._-]{10,79}$ ]] || die "a passphrase is 10 to 79 characters of A-Z a-z 0-9 . _ -"
+  done
+  case $PBKEYLEN in 16|32) ;; *) die "PBKEYLEN is 16 or 32" ;; esac
+  for r in $RECEIVERS; do
+    [ "${r#libsrt}" != "$r" ] || [ "${r#own}" != "$r" ] || die "with PASSPHRASE a sapflow receiver must be named own (our SRT): $r"
+  done
+  ENC_DESC="aes$((PBKEYLEN * 8))"
+  if [ -n "$KMREFRESH" ]; then
+    [[ $KMREFRESH =~ ^[0-9]+$ ]] && [ "$KMREFRESH" -ge 3 ] || die "KMREFRESH is a packet count, at least 3"
+    KMPREANNOUNCE=${KMPREANNOUNCE:-$((KMREFRESH / 4))}
+    [[ $KMPREANNOUNCE =~ ^[0-9]+$ ]] && [ "$KMPREANNOUNCE" -le $(((KMREFRESH - 1) / 2)) ] ||
+      die "KMPREANNOUNCE is at most (KMREFRESH - 1) / 2 = $(((KMREFRESH - 1) / 2))"
+    ENC_DESC="$ENC_DESC, key refresh every $KMREFRESH packets (new key sent $KMPREANNOUNCE before)"
+  else
+    [ -z "$KMPREANNOUNCE" ] || die "KMPREANNOUNCE needs KMREFRESH"
+    ENC_DESC="$ENC_DESC, no key refresh"
+  fi
+  [ -z "$SENDER_PASSPHRASE" ] || ENC_DESC="$ENC_DESC, sender passphrase differs from the receiver's"
+elif [ -n "$KMREFRESH$KMPREANNOUNCE$SENDER_PASSPHRASE" ]; then
+  die "KMREFRESH, KMPREANNOUNCE and SENDER_PASSPHRASE need PASSPHRASE"
+fi
 
 for bin in ffmpeg ffprobe srt-live-transmit; do
   command -v "$bin" > /dev/null || { echo "missing $bin" >&2; exit 1; }
@@ -205,8 +271,10 @@ WORK=$(mktemp -d)
 PORT_BASE=${PORT_BASE:-19000}
 trap '[ -n "${KEEP:-}" ] || rm -rf "$WORK"' EXIT
 export WORK OUT SAPFLOW_BIN PROXY_BIN DELAY_MS CLIP_SECS PORT_BASE KEEP
+[ -z "$PASSPHRASE" ] || export PASSPHRASE PBKEYLEN KMREFRESH KMPREANNOUNCE SENDER_PASSPHRASE ENC_DESC
 
 echo "clip: ${CLIP_SECS} s, seeds: $SEEDS, receivers: $RECEIVERS, losses: $LOSSES, latencies: $LATENCIES, jobs: $JOBS"
+[ -z "$PASSPHRASE" ] || echo "encryption: $ENC_DESC"
 ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30" \
   -f lavfi -i sine=frequency=440:sample_rate=48000 -pix_fmt yuv420p \
   -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -maxrate 2500k -bufsize 2500k \
@@ -229,7 +297,7 @@ echo "$(wc -l < "$WORK/clean" | tr -d ' ') clean runs, then $(wc -l < "$jobs" | 
 xargs -P "$JOBS" -L 1 "$SELF" --trial < "$WORK/clean"
 xargs -P "$JOBS" -L 1 "$SELF" --trial < "$jobs"
 
-printf 'receiver\tloss\tlatency_ms\tseed\tvideo\taudio\tdecode_msgs\tdata_orig\tdata_retx\tnaks\thandshake_flags\tstatus\treordered\torig_distinct\tin_time\n' > "$OUT/results.tsv"
+printf 'receiver\tloss\tlatency_ms\tseed\tvideo\taudio\tdecode_msgs\tdata_orig\tdata_retx\tnaks\thandshake_flags\tstatus\treordered\torig_distinct\tin_time%s\n' "${PASSPHRASE:+$(printf '\t')encryption}" > "$OUT/results.tsv"
 # In the order the trials were listed, not file name order.
 for f in $(ls "$OUT/trials" | sort -n); do cat "$OUT/trials/$f"; done >> "$OUT/results.tsv"
 summarise "$OUT/results.tsv" | tee "$OUT/summary.md"
