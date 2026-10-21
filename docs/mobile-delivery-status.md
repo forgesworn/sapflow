@@ -5,20 +5,40 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-Latest local checkpoint, 21 October: the current Rust workspace passes 332
-tests, format and strict Clippy. Both explicitly run SDK decoder/reference
-tests and the origin's three-recording epoch decoder gate pass. AddressSanitizer
-runs with overflow checks pass 61 seconds each for RTMP client, mobile media and
-own SRT caller, with 162,047, 3,665,058 and 20,669 executions respectively. These
-finite local runs do not replace longer fuzz, CI or physical acceptance.
+Latest local checkpoint, 21 October: merge `1485ec0` integrates origin main
+`10b7e40` into `feat/native-broadcaster-sdk`, including own SRT as the sole
+server implementation and removal of srt-rs. Cargo regenerated both lockfiles;
+the licence generator regenerated its output and reproduced it unchanged.
+The merged Rust workspace passes 347 tests, format and strict Clippy. Both
+explicitly run SDK decoder/reference tests and the origin's three-recording
+epoch decoder gate pass. All 11 fuzz targets compile against the regenerated
+lockfile. Four tests are ignored by the normal workspace command; the two SDK
+tests and the recording decoder test were also run explicitly.
+
+Before this merge, AddressSanitizer runs with overflow checks passed 61 seconds
+each for RTMP client, mobile media and own SRT caller, with 162,047, 3,665,058
+and 20,669 executions respectively. These finite local runs do not replace
+longer fuzz, CI or physical acceptance.
 
 The Pixel has published real hardware video and AAC through our AES256 SRT
 sender to our encrypted own listener. A bounded origin sample independently
 decodes with about 9 ms between track starts, and the unchanged native Safari
-source presents frames. This initial run uses 120 ms negotiated SRT latency,
+source presents frames. The owner confirms picture and sound with an estimated
+delay under two seconds on this path. The earlier RTMP test also received an
+under-two-second owner report, with automatic picture and sound recovery after
+portrait and landscape changes in the same untouched Safari view.
+This initial SRT run uses 120 ms negotiated SRT latency,
 not the two-second reference network profile. Its independent phone recording
 has not been accessed. A separate normal-Stop correction passes 112 Android
-tests, lint and isolation; its physical shutdown/restart gate is still pending.
+tests, lint and isolation. Its signed qualification APK also passes one physical
+normal Stop and same-event restart: the origin received SRT shutdown about
+381 ms after the Stop request, versus the previous build's five-second peer
+timeout. The same app process restarted, a later origin segment independently
+decoded as H264/AAC, and the unchanged Safari source resumed frame presentation
+without another Play, seek or reload. This finite check does not qualify
+repeated restart, orientation, carrier, recording or sustained behaviour on
+that APK. The running origin remains the earlier frozen lab binary; the
+source merge and Apple holdback correction have not been deployed there.
 
 V4V commit `711d1a8077c4bea9e1ed4bb155a9bcf6a8bcbb2b` on a separate local branch
 prevents ended-event telemetry resurrection and rejects recording copies when
@@ -68,14 +88,14 @@ Its changes were preserved; these are development bases, not release receipts.
 
 | Component | Evidence so far | Remaining boundary |
 | --- | --- | --- |
-| sapflow-client | 36 regular tests passed, two external tests run separately; own SRT/MPEG-TS publisher and exact bytes into independent libsrt | Native journey, storage and platform qualification |
+| sapflow-client | 37 regular tests passed, two external tests run separately; own SRT/MPEG-TS publisher and exact bytes into independent libsrt | Native journey, storage and platform qualification |
 | Own RTMP publisher | Bounded Hard/Soft/Dynamic peer-window governor and real media-age deadlines; independent ffmpeg received 180 H264 and 283 AAC frames over 5.9 MB; an explicitly injected Hard control separately exercised the governor | Sustained mobile TLS/network and performance qualification |
 | Own SRT caller/sender | 54 unit, 21 caller and 3 differential tests passed before encryption changes | Complete encrypted interoperability, negotiated late drop, adaptation, reconnection and allocation optimisation |
 | Independent SRT receiver | libsrt 1.5.4, exact bytes in no-loss and six seeded impaired profiles | Physical carriers, sustained runs, congestion/energy comparison |
 | Native ownership/sample/session bindings | 28 regular binding tests passed; expanded actual Swift and Kotlin consumers exercised shared samples, recording and SRT handshake/stop/stats | Physical hot-path profiling, complete session integration |
 | Apple package | ARM64 macOS, iOS and Simulator slices refreshed with RTMP/session bindings; external Swift consumer and real unsigned network app/test bundle compiled | Signing/install and physical qualification |
 | Android package/app | Refreshed four-ABI AAR and external Kotlin consumer passed; actual network APK built, 16 JVM tests passed, lint zero errors | Current-source package refresh, audio/file recording and sustained physical qualification |
-| Physical Android capture and broadcast | Pixel 10 Pro XL, Android 17/API 37: actual hardware H264 and native AAC through our RTMP to our origin; Safari picture and sound confirmed by owner; independent decode of 90 video and 140 audio frames | Owner measured 10.5 s end-to-end delay; latency investigation, phone recording, sustained and comparative measurements remain open |
+| Physical Android capture and broadcast | Pixel 10 Pro XL, Android 17/API 37: hardware H264/native AAC through our RTMP and AES256 SRT to our origin; independent decode and Safari presentation; owner reports picture/sound under two seconds, and RTMP portrait/landscape automatic recovery | Earlier 10.5 s delay superseded for the tested LAN path; timed latency distribution, phone recording, sustained and comparative measurements remain open |
 | Native iOS capture/recording | Hardware-only VideoToolbox, native AAC and independent fragmented AVAssetWriter source; actual app and test bundle compiled; 5 pure Swift tests passed | Physical capture, recording decode/recovery and complete publishing journey |
 | MPEG-TS writer | Independent ffmpeg video/audio and audio-only decode passed; bounded 1,316-byte chunks and explicit copy accounting | Real native sender integration and sustained measurements |
 | Encrypted SRT | Integrated tests and independent bidirectional AES-128/256 rotation/loss tests passed; wrong/missing keys delivered no media | Full hostile-input qualification, authenticated destination secret provisioning, mobile integration and performance |
