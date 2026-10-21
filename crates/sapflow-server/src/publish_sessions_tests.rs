@@ -1060,9 +1060,15 @@ fn fresh_events(
         .collect()
 }
 async fn fresh_publication(app: &Arc<crate::App>) -> crate::publish::Publication {
+    fresh_publication_request(app, &request(SID)).await
+}
+async fn fresh_publication_request(
+    app: &Arc<crate::App>,
+    request: &PublishRequest,
+) -> crate::publish::Publication {
     let publication = crate::publish::Publication::begin_srt(
         app,
-        &request(SID),
+        request,
         "127.0.0.1".parse().expect("loopback"),
     )
     .await
@@ -1288,4 +1294,222 @@ async fn same_codec_reconnect_requires_new_parts_and_old_lease_cannot_restore_fr
             .is_none()
     );
     resumed.end();
+}
+
+fn attempt_request(attempt: &str) -> PublishRequest {
+    PublishRequest::parse_srt_stream_id(&format!(
+        "#!::m=publish,r=live/{EVENT},u={SID},s={PASSWORD},forgesworn_attempt={attempt}"
+    ))
+    .expect("typed attempt request")
+}
+
+#[tokio::test]
+async fn attempt_echo_binds_current_connection_and_fresh_media_in_one_receipt_snapshot() {
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const VIDEO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-portrait.ts");
+    let scratch = Scratch::new();
+    let manager = scratch.open(false).await;
+    let expiry = prepare(&manager).await;
+    let (app, _callbacks) = fresh_media_app(&manager);
+    let mut first = fresh_publication_request(&app, &attempt_request(A)).await;
+    let lease = first.scoped_lease().expect("lease");
+    let connected = manager.status(SID).await.expect("bound connected");
+    assert_eq!(connected.state, "connected");
+    assert_eq!(connected.connection_attempt_id.as_deref(), Some(A));
+    assert!(connected.fresh_media.is_none());
+    feed_generated(&mut first, VIDEO);
+    let live = manager.status(SID).await.expect("first live");
+    assert_eq!(live.connection_attempt_id.as_deref(), Some(A));
+    assert_eq!(
+        live.fresh_media
+            .as_ref()
+            .expect("first fresh")
+            .connection_epoch,
+        live.connection_epoch
+    );
+    // A grant refresh preserves this transport's identity rather than treating
+    // request revision as an attempt ID or silently rotating active keys.
+    let refreshed = manager
+        .put(SID, put(SID, 1, 2, expiry + 1), MAX_BPS)
+        .await
+        .expect("refresh");
+    assert_eq!(refreshed.connection_attempt_id.as_deref(), Some(A));
+    first.end();
+    lease.protocol_stopped();
+    let held = manager.status(SID).await.expect("held");
+    assert!(held.connection_attempt_id.is_none() && held.fresh_media.is_none());
+    let mut second = fresh_publication_request(&app, &attempt_request(B)).await;
+    let second_epoch = manager.status(SID).await.expect("second bound");
+    assert!(second_epoch.connection_epoch > live.connection_epoch);
+    assert_eq!(second_epoch.connection_attempt_id.as_deref(), Some(B));
+    assert!(second_epoch.fresh_media.is_none());
+    assert!(matches!(lease.with_open(|| ()), Err(Error::Denied)));
+    lease.protocol_stopped(); // Late old protocol cleanup cannot alter the echo.
+    feed_generated(&mut second, VIDEO);
+    let receipt = manager.status(SID).await.expect("second live");
+    let json = serde_json::to_value(&receipt).expect("wire JSON");
+    assert_eq!(json["connectionAttemptId"], B);
+    assert_eq!(json["state"], "live");
+    assert_eq!(
+        json["freshMedia"]["connectionEpoch"],
+        json["connectionEpoch"]
+    );
+    assert_eq!(
+        json["freshMedia"]
+            .as_object()
+            .expect("unchanged fresh schema")
+            .len(),
+        7
+    );
+    // Explicit replacement clears the echo before any successor is bound.
+    let replaced = manager
+        .put(NEXT_SID, put(NEXT_SID, 2, 1, expiry + 2), MAX_BPS)
+        .await
+        .expect("replace session");
+    assert!(replaced.connection_attempt_id.is_none() && replaced.fresh_media.is_none());
+    assert!(matches!(
+        second.push(|_, _| Ok(sapflow_hls::Update::default())),
+        Err(crate::publish::PushError::Revoked)
+    ));
+    second.end();
+    let terminal = manager
+        .revoke(NEXT_SID, revoke(NEXT_SID, 2, 2))
+        .await
+        .expect("end");
+    assert!(terminal.connection_attempt_id.is_none() && terminal.fresh_media.is_none());
+}
+
+#[tokio::test]
+async fn attempt_metadata_needs_admitted_accepted_bound_connection_and_is_never_restored() {
+    const ATTEMPT: &str = "abcdef0123456789abcdef0123456789";
+    let scratch = Scratch::new();
+    {
+        let manager = scratch.open(false).await;
+        prepare(&manager).await;
+        let mut wrong = attempt_request(ATTEMPT);
+        wrong.pass = Some("wrong".into());
+        assert!(matches!(manager.admit(&wrong).await, Err(Error::Denied)));
+        let refused = manager
+            .status(SID)
+            .await
+            .expect("denied request did not attach");
+        assert_eq!(refused.connection_epoch, 0);
+        assert!(refused.connection_attempt_id.is_none());
+        let lease = manager
+            .admit(&attempt_request(ATTEMPT))
+            .await
+            .expect("admitted");
+        assert!(
+            manager
+                .status(SID)
+                .await
+                .expect("unaccepted")
+                .connection_attempt_id
+                .is_none()
+        );
+        lease.accepted();
+        assert!(
+            manager
+                .status(SID)
+                .await
+                .expect("unbound")
+                .connection_attempt_id
+                .is_none()
+        );
+        let registry = Arc::new(Registry::default());
+        let (stream, generation, _) = registry
+            .claim(&request(SID).path, MuxerConfig::default(), SourceKind::Ts)
+            .expect("claim");
+        lease.bind(&registry, &stream, generation);
+        assert_eq!(
+            manager
+                .status(SID)
+                .await
+                .expect("bound")
+                .connection_attempt_id
+                .as_deref(),
+            Some(ATTEMPT)
+        );
+        // Revocation clears a live binding, independently of media completion.
+        let revoked = manager
+            .revoke(SID, revoke(SID, 1, 2))
+            .await
+            .expect("revoke");
+        assert!(revoked.connection_attempt_id.is_none());
+        assert!(matches!(lease.with_open(|| ()), Err(Error::Denied)));
+        lease.released(false);
+        lease.protocol_stopped();
+        let stored = fs::read(scratch.config().store).expect("metadata");
+        assert!(!String::from_utf8_lossy(&stored).contains(ATTEMPT));
+    }
+    let restored = scratch.open(false).await;
+    let receipt = restored.status(SID).await.expect("restored terminal");
+    assert!(receipt.connection_attempt_id.is_none() && receipt.fresh_media.is_none());
+    assert_eq!(receipt.state, "revoked");
+}
+
+#[tokio::test]
+async fn legacy_scoped_reconnect_never_inherits_previous_attempt_id() {
+    const ATTEMPT: &str = "abcdef0123456789abcdef0123456789";
+    const VIDEO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-portrait.ts");
+    let scratch = Scratch::new();
+    let manager = scratch.open(false).await;
+    prepare(&manager).await;
+    let (app, _callbacks) = fresh_media_app(&manager);
+    let mut first = fresh_publication_request(&app, &attempt_request(ATTEMPT)).await;
+    feed_generated(&mut first, VIDEO);
+    first.end();
+    let mut legacy = fresh_publication(&app).await;
+    feed_generated(&mut legacy, VIDEO);
+    let receipt = manager.status(SID).await.expect("compatible publisher");
+    assert_eq!(receipt.state, "live");
+    assert!(receipt.fresh_media.is_some());
+    assert!(receipt.connection_attempt_id.is_none());
+    manager.revoke(SID, revoke(SID, 1, 2)).await.expect("end");
+    legacy.end();
+}
+
+#[tokio::test]
+async fn active_attempt_echo_is_runtime_only_and_a_fresh_revision_cannot_restore_it() {
+    const ATTEMPT: &str = "aabbccddeeff00112233445566778899";
+    let scratch = Scratch::new();
+    let expiry;
+    {
+        let manager = scratch.open(false).await;
+        expiry = prepare(&manager).await;
+        let lease = manager
+            .admit(&attempt_request(ATTEMPT))
+            .await
+            .expect("admitted");
+        lease.accepted();
+        let registry = Arc::new(Registry::default());
+        let (stream, generation, _) = registry
+            .claim(&request(SID).path, MuxerConfig::default(), SourceKind::Ts)
+            .expect("claim");
+        lease.bind(&registry, &stream, generation);
+        assert_eq!(
+            manager
+                .status(SID)
+                .await
+                .expect("active echo")
+                .connection_attempt_id
+                .as_deref(),
+            Some(ATTEMPT)
+        );
+        let bytes = fs::read(scratch.config().store).expect("durable metadata");
+        assert!(!String::from_utf8_lossy(&bytes).contains(ATTEMPT));
+        lease.released(false);
+        lease.protocol_stopped();
+    }
+    let restored = scratch.open(false).await;
+    let inactive = restored.status(SID).await.expect("inactive restart");
+    assert_eq!(inactive.state, "inactive");
+    assert!(inactive.connection_attempt_id.is_none() && inactive.fresh_media.is_none());
+    let refreshed = restored
+        .put(SID, put(SID, 1, 2, expiry + 1), MAX_BPS)
+        .await
+        .expect("authoritative refresh");
+    assert_eq!(refreshed.state, "prepared");
+    assert!(refreshed.connection_attempt_id.is_none() && refreshed.fresh_media.is_none());
 }

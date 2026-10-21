@@ -148,6 +148,11 @@ pub struct FreshMediaPart {
     pub has_audio: bool,
 }
 
+/// One matching attached connection, with optional fresh encoded availability.
+pub struct ConnectionMediaSnapshot {
+    pub fresh_media: Option<FreshMediaPart>,
+}
+
 /// What a push did.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Applied {
@@ -201,8 +206,18 @@ impl LiveStream {
 
     /// Snapshot one independently decodable completed part from this exact
     /// connection's run. Retained old media and pending first IDRs do not qualify.
-    pub fn fresh_media(&self, generation: u64) -> Option<FreshMediaPart> {
-        self.fresh_media_locked(&self.session(), generation)
+    pub fn connection_media(&self, generation: u64) -> Option<ConnectionMediaSnapshot> {
+        let session = self.session();
+        if session.generation != generation || !session.attached {
+            return None;
+        }
+        let state = self.lock();
+        if state.closed {
+            return None;
+        }
+        Some(ConnectionMediaSnapshot {
+            fresh_media: self.fresh_media_from_state(&session, &state),
+        })
     }
 
     pub fn fresh_media_locked(&self, session: &Session, generation: u64) -> Option<FreshMediaPart> {
@@ -213,6 +228,10 @@ impl LiveStream {
         if state.closed {
             return None;
         }
+        self.fresh_media_from_state(session, &state)
+    }
+
+    fn fresh_media_from_state(&self, session: &Session, state: &State) -> Option<FreshMediaPart> {
         let muxer = state.ingest.muxer()?;
         let init_id = muxer.current_initialization_id();
         const JS_MAX: u64 = (1 << 53) - 1;

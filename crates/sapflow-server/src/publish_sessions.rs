@@ -77,6 +77,7 @@ struct Binding {
 }
 struct Owner {
     lease: ConnectionLease,
+    connection_attempt_id: Option<sapflow_core::ConnectionAttemptId>,
     scope: Arc<CallbackScope>,
     cancel: watch::Sender<bool>,
     protocol: AtomicU8, // 0 never accepted, 1 active, 2 stopping, 3 stopped.
@@ -146,6 +147,7 @@ pub struct Receipt {
     pub revision: u64,
     pub expires_at_unix_ms: u64,
     pub connection_epoch: u64,
+    pub connection_attempt_id: Option<String>,
     pub fresh_media: Option<FreshMedia>,
     pub state: &'static str,
     pub admission: &'static str,
@@ -508,21 +510,32 @@ impl PublishSessions {
         let continuing = owner.filter(|o| !*o.cancel.borrow());
         let active =
             continuing.filter(|o| protocol == "active" && !o.released.load(Ordering::Acquire));
-        let fresh_media = if open {
+        let connection = if open {
             active.and_then(|owner| {
                 let binding = owner.binding.lock().unwrap_or_else(|e| e.into_inner());
                 let bound = binding.as_ref()?;
                 let stream = bound.stream.upgrade()?;
                 let generation = bound.generation;
                 drop(binding);
-                stream.fresh_media(generation).map(|part| FreshMedia {
-                    connection_epoch: owner.lease.connection_epoch,
-                    part,
-                })
+                stream
+                    .connection_media(generation)
+                    .map(|snapshot| (owner, snapshot))
             })
         } else {
             None
         };
+        let connection_attempt_id = connection.as_ref().and_then(|(owner, _)| {
+            owner
+                .connection_attempt_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())
+        });
+        let fresh_media = connection.and_then(|(owner, snapshot)| {
+            snapshot.fresh_media.map(|part| FreshMedia {
+                connection_epoch: owner.lease.connection_epoch,
+                part,
+            })
+        });
         let session_state = match row.status {
             SessionStatus::Revoked => "revoked",
             SessionStatus::Expired => "expired",
@@ -550,6 +563,7 @@ impl PublishSessions {
             revision: row.revision.get(),
             expires_at_unix_ms: row.grant.as_ref().map_or(0, |g| g.expires_at_ms.get()),
             connection_epoch: row.connection_epoch,
+            connection_attempt_id,
             fresh_media,
             state: session_state,
             admission: if open { "open" } else { "denied" },
@@ -650,6 +664,7 @@ impl PublishSessions {
                         let (cancel, _) = watch::channel(false);
                         let owner = Arc::new(Owner {
                             scope: CallbackScope::new(&lease, grant.observations.clone()),
+                            connection_attempt_id: request.connection_attempt_id.clone(),
                             lease,
                             cancel,
                             protocol: AtomicU8::new(0),

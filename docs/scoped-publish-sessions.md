@@ -84,6 +84,7 @@ secret-free receipt:
 | Identity | `contractVersion`, `eventId`, `eventGeneration`, `sessionId`, `revision` |
 | `expiresAtUnixMs` | Grant expiry; zero only for a never-provisioned terminal tombstone |
 | `connectionEpoch` | Durable per-event high-water mark, reserved before accepting the protocol |
+| `connectionAttemptId` | `null` or the current accepted/bound SRT connection's 32-character lower-case hexadecimal correlation ID |
 | `freshMedia` | `null` or the current connection's independently decodable completed-part descriptor below; encoded availability only |
 | `state` | `inactive`, `prepared`, `connected`, `live`, `held`, `expired`, `revoked` |
 | `admission` | `open` or `denied` |
@@ -97,6 +98,44 @@ HTTP errors use static codes: 400 invalid request, 401 missing/wrong bearer,
 413 oversized body, 429 capacity, 503 unusable authority and 504 request timeout.
 Neither an acknowledged End nor a stopped socket alone proves recording or
 callback completion. Poll the independent receipts to determine completion.
+
+## Per-attempt correlation
+
+A native SRT caller can send a fresh CSPRNG-generated 16-byte attempt identifier,
+encoded as 32 lower-case hexadecimal characters, in this access-control form:
+
+```text
+#!::m=publish,r=live/event-example,u=<sessionId>,s=<publishPassword>,forgesworn_attempt=0123456789abcdef0123456789abcdef
+```
+
+The canonical custom key is `forgesworn_attempt`, following the company-prefixed
+custom-key convention in the primary [SRT Internet-Draft, Appendix B.2](https://datatracker.ietf.org/doc/html/draft-sharabayko-srt-01#appendix-B.2).
+This is an expired informational draft's recommended convention, not a registered
+standard attribute. `x-sapflow-attempt` is not an alias. The parser refuses duplicate
+canonical attributes, missing/invalid values and case/whitespace variants of the
+reserved key. The entire stream ID retains its 512-byte limit. Other existing
+publisher forms remain compatible; colon-form SRT and RTMP requests have no
+attempt binding.
+
+Authenticated receipts add `connectionAttemptId: string | null`. It becomes
+nonnull only after valid scoped admission, protocol acceptance and binding to
+the exact current stream generation. It can be available in `connected` before
+a fresh media part exists; when `freshMedia` is present, both values come from
+the same current connection snapshot and its `connectionEpoch`. A credential
+refresh preserves the current connection's ID. A reconnect must supply a new ID;
+it never inherits the prior one. Held, cancelled, revoked, expired, unbound or
+replaced connections expose null. Restart also exposes null: correlation IDs are
+runtime metadata and are not written into the durable grant snapshot.
+
+The native adapter must compare the exact fresh random attempt ID alongside the
+session identity, generation, connection epoch and its local attempt token before
+and after a finite decode observation. Missing or mismatched IDs cannot confirm
+that attempt. The value is caller-supplied visible correlation metadata, not an
+extra credential, uniqueness authority, replay-prevention mechanism, peer
+authentication or encryption guarantee. Reusing an ID destroys its causal value;
+the origin does not maintain an unbounded nonce-history table. The attribute does
+not change publishing permission, key selection, grant expiry or callback bodies.
+Never log or persist a full credential-bearing stream ID to diagnose correlation.
 
 ## Fresh encoded-media boundary
 
@@ -147,10 +186,11 @@ attempt to a fresh authenticated origin connection epoch, fetch only the
 appropriate fresh media, observe actual decode progress for every declared
 track, and recheck the session/epoch before confirming recovery. HWM reservation
 alone, a ready socket, a manifest probe, or this descriptor alone cannot clear
-`NativeSession`'s outage deadline. Existing-wire binding requires a pre-attempt
-origin epoch floor and previous-attempt cleanup; there is no per-attempt nonce
-in the current ingest stream ID. Delayed responses and decode completions need
-local destination/attempt fences as well as the origin identity.
+`NativeSession`'s outage deadline. Binding requires the current `connectionAttemptId` echo and previous-attempt
+cleanup; an epoch high-water increase alone can also reflect a failed admission.
+Publishers without an attempt ID remain usable but do not expose this confirmation
+binding. Delayed responses and decode completions need local destination/attempt
+fences as well as the origin identity.
 
 ## Durability and runtime admission
 

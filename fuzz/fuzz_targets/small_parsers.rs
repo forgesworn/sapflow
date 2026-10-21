@@ -7,7 +7,19 @@ use sapflow_hls::playlist;
 
 fuzz_target!(|data: &[u8]| {
     let s = String::from_utf8_lossy(data);
-    let _ = PublishRequest::parse_srt_stream_id(&s);
+    if let Ok(request) = PublishRequest::parse_srt_stream_id(&s) {
+        assert!(s.len() <= 512);
+        if let Some(attempt) = request.connection_attempt_id {
+            assert!(s.starts_with("#!::"));
+            assert_eq!(attempt.as_str().len(), 32);
+            assert!(
+                attempt
+                    .as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+        }
+    }
     if let Some((app, key)) = s.split_once('\n') {
         let _ = PublishRequest::parse_rtmp(app, key);
     }

@@ -55,6 +55,12 @@ them into temporary corpora alongside any recorded regressions and retain
 overflow checks. New targets still need actual local/CI execution receipts;
 their inclusion in the workflow is not a passing fuzz result.
 
+`seeds/small_parsers/` includes synthetic SRT attempt-correlation attributes:
+valid and duplicate IDs, uppercase/malformed IDs, and exact/over-512-byte stream
+IDs. The production parser's successful results are checked for bounded canonical
+attempt IDs by the existing `small_parsers` target. These are regression seeds,
+not historical crashes or a claim of completed fuzz-duration qualification.
+
 `seeds/publish_session/` contains original synthetic PUT/revoke JSON, checksummed
 empty/prepared/revoked/expired documents, and stateful command sequences. No
 credential in these files grants access to a running service. The target feeds
