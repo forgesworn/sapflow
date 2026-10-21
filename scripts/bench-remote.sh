@@ -9,6 +9,12 @@
 # only the first FULL (default 10) also fetch parts and segments, so a slow
 # link carries the test (each full viewer pulls about twice the stream
 # bitrate). Prints server CPU and memory on HOST and the viewers' results.
+#
+# Through a TLS front on HOST, as production runs (Caddy, HTTP/2): BENCH_URL
+# is the front's URL for the stream and BENCH_ARGS goes to the viewers, e.g.
+#   BENCH_URL=https://front.example/live-hls/live/event-bench/index.m3u8 \
+#   BENCH_ARGS='--http2 --ca caddy-root.crt' HOST=... scripts/bench-remote.sh sapflow
+# The CPU and memory reported are sapflow's alone, not the front's.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -98,7 +104,8 @@ sleep 25
 read -r cpu_one one_mb < <(measure 20)
 echo "$SERVER on $HOST: idle RSS ${idle_mb} MB; one stream ${one_mb} MB, CPU ${cpu_one}%"
 
-"$BENCH" --url "$URL" --viewers "$VIEWERS" --full "$FULL" --secs "$SECS" --ramp 10 > /tmp/bench-remote-$SERVER.txt &
+# shellcheck disable=SC2086  # BENCH_ARGS is a list of options
+"$BENCH" --url "${BENCH_URL:-$URL}" --viewers "$VIEWERS" --full "$FULL" --secs "$SECS" --ramp 10 ${BENCH_ARGS:-} > /tmp/bench-remote-$SERVER.txt &
 bp=$!
 sleep 10
 read -r cpu_n peak_n < <(measure "$SECS")
