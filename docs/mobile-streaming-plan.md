@@ -572,4 +572,3 @@ qualification and distribution work against the actual supported matrix.
 The first SRT pilot converges at B4. General release additionally needs B3R,
 B4R and B5. B6 is the agreed peer-playback release and does not hold the
 origin-first broadcaster release.
-

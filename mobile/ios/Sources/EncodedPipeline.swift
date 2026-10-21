@@ -120,4 +120,3 @@ final class RustEncodedIngress {
         accepted = 0; configuredDestination = false
     }
 }
-

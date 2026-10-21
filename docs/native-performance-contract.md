@@ -320,4 +320,3 @@ Keep optional production features off in all apps for the former, and match
 them for the latter. An overlay-free result cannot support a claim about a
 feature-heavy IRL show. Publish the reproducible profile and failures with any
 claim of superiority, scoped to the qualified devices and app versions.
-

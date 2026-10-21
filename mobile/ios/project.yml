@@ -31,7 +31,7 @@ targets:
         PRODUCT_NAME: SapflowBroadcaster
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: $(SRCROOT)/../../mobile/ios/Info.plist
-        TARGETED_DEVICE_FAMILY: '1' 
+        TARGETED_DEVICE_FAMILY: '1'
   SapflowBroadcasterTests:
     type: bundle.unit-test
     platform: iOS

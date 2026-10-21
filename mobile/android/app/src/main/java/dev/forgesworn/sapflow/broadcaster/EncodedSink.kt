@@ -19,4 +19,3 @@ interface EncodedSink : AutoCloseable {
     fun finish() = close()
     override fun close()
 }
-
