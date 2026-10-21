@@ -79,6 +79,28 @@ packing) add about 1.7 s, the same against srt-rs; `-muxdelay 0
 -muxpreload 0 -pes_payload_size 0 -flush_packets 1` removes it. That is
 the sender's delay, worth knowing when an ffmpeg-based encoder seems slow.
 
+Glass to glass, 2026-10-21: Larix on an iPhone over Wi-Fi, our own SRT at
+2 s latency, 2 s keyframes, filming a millisecond clock on the Mac, played
+by Safari (macOS) straight from sapflow over plain HTTP/1.1 on the LAN: 10.8
+s in two samples, on a freshly loaded page. Safari held about 8.8 s of
+media ahead of the playhead, so about 9 s of the delay is the player's
+starting distance from the live edge; Larix and the SRT latency are the
+rest. Safari made blocking reloads and fetched every part, yet positioned
+about 3 x `TARGETDURATION` back rather than `PART-HOLD-BACK`. mediamtx
+(`latest-ffmpeg` image) given the same ffmpeg stream (2 s keyframes) side
+by side behaved the same way relative to its own `TARGETDURATION` (2 against
+our 3): 5.5 s held against 9.4 s, so sapflow played about 4 s further
+behind.
+
+The same Larix stream through a TLS and HTTP/2 front (Node's `http2`
+module with a locally trusted certificate, standing in for Caddy): 3.0 and
+3.2 s glass to glass, with Safari holding almost nothing ahead of the
+playhead. Safari takes the low-latency position only over HTTP/2, as
+Apple's LL-HLS guidance says; over HTTP/1.1 it falls back to 3 x
+`TARGETDURATION`. Production goes through Caddy with HTTP/2, so measure
+latency that way: a plain-HTTP test overstates it by about 9 s at 2 s
+keyframes. The 2 s SRT latency is most of what remains.
+
 ## Not yet tried
 
 - Larix on Android.
