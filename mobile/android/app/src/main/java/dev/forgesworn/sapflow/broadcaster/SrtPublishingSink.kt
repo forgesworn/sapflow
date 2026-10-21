@@ -115,17 +115,6 @@ internal class SrtPublishingSink(
                             publisher.feed(destination.nativeAddress, input, nowUs().toULong())
                         }
                     }
-                    for (index in 0 until 16) {
-                        when (val event = publisher.pollEvent()) {
-                            is NativeSrtEvent.Connected -> {
-                                message.set("SRT ${if (plaintext) "plaintext lab" else "AES-256"} handshake complete · media delivery unconfirmed")
-                                events(PublishingAttemptEvent.Accepted)
-                            }
-                            is NativeSrtEvent.Closed -> error("SRT closed: ${event.reason}")
-                            is NativeSrtEvent.Failed -> error("SRT failed: ${event.reason}")
-                            null -> break
-                        }
-                    }
                     check(publisher.state() != NativeSrtState.CLOSED) { "SRT origin closed the attempt" }
                 }
                 if (closed.get()) break
@@ -168,6 +157,23 @@ internal class SrtPublishingSink(
                             error("Partial SRT datagram write refused")
                         }
                         pendingWrite = null; writeDeadlineUs = null
+                    }
+                }
+                if (publisher != null) {
+                    // push/pollDatagram may generate one-shot startup facts.
+                    // Drain after bounded work, before sleeping on readiness.
+                    for (index in 0 until 16) {
+                        when (val event = publisher.pollEvent()) {
+                            is NativeSrtEvent.Connected -> {
+                                message.set("SRT ${if (plaintext) "plaintext lab" else "AES-256"} handshake complete · media delivery unconfirmed")
+                                events(PublishingAttemptEvent.Accepted)
+                            }
+                            NativeSrtEvent.Sending -> events(PublishingAttemptEvent.Sending)
+                            NativeSrtEvent.PeerMediaProgress -> events(PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.SRT))
+                            is NativeSrtEvent.Closed -> error("SRT closed: ${event.reason}")
+                            is NativeSrtEvent.Failed -> error("SRT failed: ${event.reason}")
+                            null -> break
+                        }
                     }
                 }
                 key.interestOps(SelectionKey.OP_READ or if (pendingWrite != null) SelectionKey.OP_WRITE else 0)

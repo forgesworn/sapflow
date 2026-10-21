@@ -895,10 +895,24 @@ posts a generation-fenced encoder sync-frame request, at most once per second.
 `OriginMediaConfirmation(destination, epoch, attempt)` is an explicit typed seam for a future
 trusted V4V observation. Manual destinations do not call it. TCP/TLS, SRT
 handshake/ACKs, RTMP Publish.Start, writes and local encoding never confirm
-playable media. Consequently a manual destination can reconnect and send while
-still labelled unconfirmed; after a real outage, the original 90-second window
-expires without a trusted observation, even if the replacement transport is
-healthy. Only a genuine current origin-media observation closes that outage.
+playable media. The current SDK separates Sending, network recovery and decoded
+media readiness. Complete declared startup media entering native ownership emits
+Sending; only a validated peer acknowledgement across that current attempt's
+startup watermark can clear the network outage window. It still leaves playback
+unverified. RTMP declares the fixed H264/AAC profile before media, and native
+ACK accounting includes its checked handshake-domain guard.
+
+Two bounded per-attempt facts latch startup/progress arriving before transport
+acceptance; the control owner applies connected, sending and peer recovery in
+that order. Failed, replaced and stopped attempts discard those facts. Native
+`attemptEpoch` is captured on Connect independently of the local callback token.
+Only `snapshot.nextDeadlineNs` drives the control alarm; the retained historical
+outage deadline never creates an exhausted-state timer loop. At the original
+deadline, an accepted Sending attempt may continue with automatic retries
+exhausted and peer progress unknown. A later failure or intentional replacement
+cannot open another transport. An unaccepted/no-startup attempt expires. This
+retains manual publishing without manufacturing decoded proof or extending the
+original retry budget from local writes.
 
 The pure controller tests use fake clocks, policy and transport factories. The
 Java-owner tests use synthetic sinks without camera, native protocol calls or
@@ -912,3 +926,130 @@ reports are retained in ignored `target/mobile-android/reconnect-v2-*` evidence.
 The owned Gradle process group terminated. No additional signing, installation,
 network-drop test or physical acceptance was performed for this packet; earlier
 frozen APKs do not include it.
+
+### B4 creator connector (source implementation, not physical qualification)
+
+The connector is disabled unless the builder supplies all three reviewed public
+routing properties: `sapflowV4vApiOrigin`, `sapflowV4vPlaybackOrigin` and
+`sapflowV4vPlaybackPrefix`. Origins must be HTTPS origins without user info,
+paths, queries or fragments; the playback prefix is an absolute directory.
+No private/production hostname or credential is committed. These properties
+require operator approval for the intended deployment before packaging. There
+is no in-app API endpoint editor, imported destination policy, Google service,
+wallet authority, origin control token or callback secret. Manual destinations
+remain separate. An authenticated grant from this connector alone carries V4V's
+unlimited, free, watermark-free destination policy.
+
+The process-owned control actor owns bounded platform HTTPS and an encrypted
+Keystore AES-GCM/AtomicFile journal in no-backup app storage. A missing existing
+key/ciphertext, corruption or failed write blocks the connector and fences its
+publisher. It never resets an existing journal to an empty identity. Exact
+Prepare/Refresh/End/recovery operations and idempotency keys are saved before
+sending; uncertain responses retain that request. End has one reserved control
+admission behind an in-flight request, fences publishing immediately, and retains
+terminal intent before reconciliation. It never implies recording/callback
+completion merely because the local socket closed. Restoring a grant requires a
+fresh acknowledged higher-revision refresh before capture can start.
+
+Sign-in uses an installed NIP-55 signer for kind 21236 only. The returned event
+must match every requested field, canonical SHA-256 ID and BIP-340 signature.
+No persona private key is imported or generated. Signer launches are single-file
+with a 60-second budget, bounded abandoned-result fences and Activity result
+reattachment. Sign-in is offered only outside active/prepared capture because
+leaving the foreground intentionally stops capture. Ordinary grant refresh uses
+the existing bearer without opening a signer. Bearer expiry requires explicit
+reauthentication; no permission prompt or capture resume happens automatically.
+
+The fixed encoder profile requires an immutable grant cap of at least 4 Mbps
+(`maxPublishBps` is bits/second, unlike native SRT's byte-rate pacing field).
+A smaller grant remains a reconcilable reserved session, but camera preparation
+is refused; End remains available. The actual grant reconnect grace is passed
+to the existing shared policy. Refresh does not recreate that coordinator or
+reset an outage. Orientation still replaces only its media/transport epoch.
+Private cold-path diagnostics expose scalar destination/epoch/attempt identities
+and an explicit capture-Prepare serial without credentials or media.
+
+Recording-failure acknowledgement is an explicit, separate action after a safe
+terminal-origin receipt. It never marks End complete or obtains credentials.
+A replacement requires another explicit Prepare carrying the saved old identity
+and acknowledgement fence. No automatic scheduling, publishing or recovery
+acknowledgement is performed.
+
+Decoded confirmation remains **disabled** in this packet. Status, a fresh-media
+descriptor, socket acceptance, ACKs and local encoding never call
+`originMediaConfirmed`. The independently coordinated `forgesworn_attempt`
+metadata/receipt and finite Android decoder must be integrated and tested before
+that gate can be enabled; this source does not append an unvalidated suffix.
+
+The signing-only KithMoot adaptation retains its MIT notice. ACINQ secp256k1
+0.22.0 is pinned for verify-only BIP-340: actual bytecode is JVM8 and Kotlin
+metadata 2.2.0, fitting the existing compiler. Upstream 0.23/0.24 require Kotlin
+2.3.10; no broad toolchain upgrade is made. Its Android ARM64 and x86_64 ELF LOAD
+alignments were independently inspected as 16 KiB. The first connector APK is
+restricted to ARM64; other ABI releases remain unqualified. Apache-2.0 wrapper,
+MIT libsecp256k1 and MIT adaptation notices are packaged in assets. JSON parsing
+uses pinned kotlinx-serialization-json 1.7.3 for canonical event handling, with
+body/depth/duplicate-key/number bounds. No BouncyCastle or whole KithMoot module
+is imported.
+
+Source tests cover uncertain mutation replay across restart, failed durable
+writes, insufficient cap with working End, End during uncertain refresh,
+explicit acknowledgement/replacement, expiry, corrupt-store refusal, hostile
+JSON and real synthetic BIP-340/event-field rejection. The pure authenticated
+journal envelope and artifact ABI/hash/alignment checks are independently tested.
+The pre-policy API compile and 31 pure Kotlin / 21 artifact-verifier tests are
+retained as intermediate gates. The combined SDK integration below subsequently
+passed full Android tests, lint and package checks. Installed signer, an enabled
+approved creator API journey, finite media decoder and physical connector/recovery
+acceptance remain separate gates.
+
+A dedicated monotonic grant-expiry alarm is independent of the HTTP/journal
+executor. It is generation/session/revision fenced and superseded only after a
+validated refresh has been durably saved. Start admission independently checks
+the active owner's deadline under the same ownership lock, so delayed alarm
+delivery cannot let a newer approval revive an expired prepared owner. A late
+refresh commit synchronously fences that owner. Expiry fences the current
+publisher; a late HTTP result cannot start it again. Completed End with no pending command
+cancels idle control polling. HTTPS uses finite connect/read budgets and an
+8-second disconnect watchdog; a platform DNS/native call that ignores cancellation
+retains the single blocked owner rather than creating unbounded replacement
+threads. Such a stall cannot delay the separate grant-expiry admission fence.
+
+Queued grant/start replies carry a single-use owner permission and the exact
+prepared-capture binding. End, Stop, expiry and foreground interruption retire
+that permission synchronously; a reply for capture A cannot prepare/start
+capture B. A higher revision may authorise the same prepared session only with
+matching immutable credentials, limits and grace and a live monotonic deadline.
+
+The Android journal does not trust `AtomicFile.finishWrite`'s void result alone:
+it sets mode 0600, syncs the output, verifies bounded actual-base ciphertext
+readback and syncs the parent directory. Silent rename or directory-sync failure
+therefore cannot authorise sending a mutation. Base/backup/new symlinks are
+refused on both load and save; the parent must be a non-symlink directory owned
+by the app with no group/other permission bits. An unconfirmed commit retains
+an unusable engine; a later process must
+reopen and validate the retained journal rather than reset it.
+
+
+### Combined B4 and typed transport-recovery build
+
+The frozen 108-input combined source packet passed the M4 offline qualification
+and release build against AAR `39d2af97…` (SDK source `1634a809`). All 174 JVM
+tests across 33 suites passed with no failures or skips; the Python APK-verifier
+suite passed 21 tests. Lint reported zero errors and ten warnings: retained target,
+dependency-update, orientation, backup, icon and debug-label guidance, the explicit
+ARM64-only ChromeOS limitation, and two optional URI KTX style suggestions.
+
+The original qualification APK is `1d1820e8248db58be579750ca0eefb21ec0002beccc19de46850e088c7e55cfc`;
+the unsigned release APK is `dd5fc5eed79bec8d78d85495206491d5e787522a4bbdc45674da8222d0220d16`.
+Both contain the exact SDK library `4a45c951…` and pinned ACINQ verifier; every
+packaged ARM64 ELF LOAD alignment is at least 16 KiB. Actual manifest/Dex checks
+confirm qualification is non-debuggable and shell-profileable, while release
+contains neither the pose hook nor offline benchmark and is not shell-profileable.
+Build commands, test XML, lint XML, source archive and package-verifier receipts
+are retained under ignored `target/mobile-android/v4v-transport-recovery-*`.
+
+This build uses the disabled default V4V profile, performs no additional signing
+or installation, and makes no physical or all-ABI release claim. Decoded-media
+confirmation remains disabled. The actor/permit/journal packet's independently
+reviewed v4 snapshot is retained separately from the subsequent typed SDK delta.

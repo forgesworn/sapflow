@@ -12,7 +12,14 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Exercise real Java executor/epoch/cleanup ownership with no native calls. */
 class ReconnectingPublishingSinkTest {
     private class Policy : ReconnectPolicyPort {
-        override var deadlineNs: Long? = null
+        var deadlineNs: Long? = null
+        override val nextDeadlineNs: Long? get() = deadlineNs
+        val progress = CopyOnWriteArrayList<String>()
+        val proofDelivered = CountDownLatch(1)
+        override fun sending(nowNs: Long): ReconnectAction { progress.add("sending"); return ReconnectAction.None }
+        override fun peerProgress(source: PeerProgressSource, nowNs: Long): ReconnectAction {
+            progress.add("peer:$source"); proofDelivered.countDown(); return ReconnectAction.None
+        }
         var graceNs = 90_000_000_000L
         val starts = AtomicInteger(); val failures = AtomicInteger(); val replacements = AtomicInteger()
         val confirmations = AtomicInteger(); val stops = AtomicInteger()
@@ -22,7 +29,7 @@ class ReconnectingPublishingSinkTest {
             return ReconnectAction.Connect
         }
         override fun intentionalReplace(nowNs: Long): ReconnectAction { replacements.incrementAndGet(); return ReconnectAction.Connect }
-        override fun connected(nowNs: Long) {}
+        override fun connected(nowNs: Long) { progress.add("accepted") }
         override fun confirmed(nowNs: Long) { confirmations.incrementAndGet(); deadlineNs = null }
         override fun tick(nowNs: Long) = if (deadlineNs?.let { nowNs >= it } == true) ReconnectAction.Expired else ReconnectAction.None
         override fun stop() { stops.incrementAndGet() }
@@ -180,4 +187,15 @@ class ReconnectingPublishingSinkTest {
         epoch.stopDestination(); epoch.close()
         assertEquals(0, second.policy.confirmations.get())
     }
+    @Test fun crossOwnerProgressBeforeAcceptedIsAppliedOnceOnTheCurrentControlOwner() {
+        val h = Harness(); val epoch = h.owner.newEpoch(); epoch.start(); val sink = h.sink(0)
+        sink.events(PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.RTMP))
+        repeat(100) { sink.events(PublishingAttemptEvent.Sending) }
+        sink.events(PublishingAttemptEvent.Accepted)
+        assertTrue(h.policy.proofDelivered.await(2, TimeUnit.SECONDS))
+        epoch.stopDestination(); epoch.close()
+        assertEquals(listOf("accepted", "sending", "peer:RTMP"), h.policy.progress)
+        assertEquals(0, h.policy.confirmations.get())
+    }
+
 }

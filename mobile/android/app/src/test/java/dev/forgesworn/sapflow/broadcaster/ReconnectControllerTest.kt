@@ -10,23 +10,43 @@ import java.util.concurrent.atomic.AtomicReference
 
 class ReconnectControllerTest {
     private class Policy : ReconnectPolicyPort {
-        override var deadlineNs: Long? = null
+        var deadlineNs: Long? = null
         var retry: Long? = null
+        override val nextDeadlineNs: Long? get() = listOfNotNull(deadlineNs, retry).minOrNull()
+        val progress = mutableListOf<String>()
+        var sending = false; var exhausted = false
         var starts = 0; var connections = 0; var confirmations = 0; var stops = 0
         override fun start(nowNs: Long): ReconnectAction { starts++; return ReconnectAction.Connect }
         override fun failed(nowNs: Long): ReconnectAction {
+            if (exhausted) return ReconnectAction.Expired
+            sending = false
             if (deadlineNs == null) deadlineNs = nowNs + 90
             retry = minOf(nowNs + 5, deadlineNs!!)
             return if (nowNs >= deadlineNs!!) ReconnectAction.Expired else ReconnectAction.At(retry!!)
         }
-        override fun connected(nowNs: Long) { connections++; retry = null }
+        override fun connected(nowNs: Long) { connections++; retry = null; progress.add("accepted") }
+        override fun sending(nowNs: Long): ReconnectAction {
+            progress.add("sending")
+            if (!sending && deadlineNs?.let { nowNs >= it } == true) return ReconnectAction.Expired
+            sending = true
+            return if (deadlineNs?.let { nowNs >= it } == true) exhaust() else ReconnectAction.None
+        }
+        override fun peerProgress(source: PeerProgressSource, nowNs: Long): ReconnectAction {
+            check(sending)
+            progress.add("peer:$source")
+            if (deadlineNs?.let { nowNs >= it } == true) return exhaust()
+            deadlineNs = null; return ReconnectAction.None
+        }
+        private fun exhaust(): ReconnectAction { exhausted = true; deadlineNs = null; return ReconnectAction.Exhausted }
         override fun intentionalReplace(nowNs: Long): ReconnectAction {
             retry = null
+            if (exhausted) return ReconnectAction.Expired
+            sending = false
             return if (deadlineNs?.let { nowNs >= it } == true) ReconnectAction.Expired else ReconnectAction.Connect
         }
         override fun confirmed(nowNs: Long) { confirmations++; deadlineNs = null; retry = null }
         override fun tick(nowNs: Long): ReconnectAction {
-            if (deadlineNs?.let { nowNs >= it } == true) return ReconnectAction.Expired
+            if (deadlineNs?.let { nowNs >= it } == true) return if (sending) exhaust() else ReconnectAction.Expired
             if (retry?.let { nowNs >= it } == true) { retry = null; return ReconnectAction.Connect }
             return ReconnectAction.None
         }
@@ -218,4 +238,86 @@ class ReconnectControllerTest {
         failAttemptOnce(closed, notify = { fail("duplicate failure") }, cleanup = { cleanups++ })
         assertEquals(1, cleanups)
     }
+    @Test fun oneShotProgressBeforeAcceptedIsLatchedAndAppliedInPolicyOrderOnce() {
+        val h = Harness(); h.controller.attach(1)
+        h.controller.event(1, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.RTMP))
+        h.controller.event(1, PublishingAttemptEvent.Sending)
+        assertTrue(h.policy.progress.isEmpty())
+        assertEquals(0, h.policy.confirmations)
+        h.accepted()
+        assertEquals(listOf("accepted", "sending", "peer:RTMP"), h.policy.progress)
+        repeat(3) {
+            h.accepted(); h.controller.event(1, PublishingAttemptEvent.Sending)
+            h.controller.event(1, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.RTMP))
+        }
+        assertEquals(3, h.policy.progress.size)
+        assertEquals(0, h.policy.confirmations)
+        assertTrue(h.controller.status.contains("decoded media unconfirmed"))
+    }
+    @Test fun failedAttemptDiscardsEarlyProgressBeforeReplacementAcceptance() {
+        val h = Harness(); h.controller.attach(1)
+        h.controller.event(1, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.SRT))
+        h.failed(); h.now = 5; h.controller.tick()
+        h.controller.event(1, PublishingAttemptEvent.Accepted)
+        h.controller.event(1, PublishingAttemptEvent.Sending)
+        h.controller.event(1, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.SRT))
+        h.accepted()
+        assertEquals(listOf("accepted"), h.policy.progress)
+        assertEquals(90L, h.policy.deadlineNs)
+        h.controller.event(2, PublishingAttemptEvent.Sending)
+        h.controller.event(2, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.SRT))
+        assertEquals(listOf("accepted", "sending", "peer:SRT"), h.policy.progress)
+        assertNull(h.policy.deadlineNs); assertNull(h.controller.nextWakeNs)
+        assertEquals(0, h.policy.confirmations)
+    }
+    @Test fun stopAndRotationCannotCarryPendingProofIntoAnotherEpoch() {
+        val h = Harness(); h.controller.attach(1)
+        h.controller.event(1, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.RTMP))
+        h.controller.detach(1); h.controller.attach(2); h.accepted()
+        assertEquals(listOf("accepted"), h.policy.progress)
+        h.controller.event(2, PublishingAttemptEvent.Sending)
+        h.controller.stop()
+        h.controller.event(2, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.RTMP))
+        assertEquals(listOf("accepted", "sending"), h.policy.progress)
+    }
+    @Test fun acceptedSendingWithoutProofSurvivesDeadlineWithNoWakeOrNewRetry() {
+        val h = Harness(); h.controller.attach(1); h.accepted(); h.now = 10; h.failed()
+        h.now = 15; h.controller.tick(); h.accepted()
+        h.controller.event(2, PublishingAttemptEvent.Sending)
+        h.now = 100; h.controller.tick()
+        assertFalse(h.controller.terminal); assertNull(h.controller.nextWakeNs)
+        assertEquals(0, h.attempts[1].closes)
+        assertTrue(h.controller.status.contains("retry budget exhausted"))
+        h.controller.event(2, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.SRT))
+        assertFalse(h.policy.progress.any { it.startsWith("peer:") })
+        repeat(5) { h.controller.tick() }
+        assertNull(h.controller.nextWakeNs); assertEquals(2, h.attempts.size)
+        h.now = 101; h.failed()
+        assertTrue(h.controller.terminal); assertEquals(2, h.attempts.size)
+    }
+    @Test fun exhaustedSendingOrientationClosesOldOwnerWithoutCreatingNewTransport() {
+        val h = Harness(); h.controller.attach(1); h.failed()
+        h.now = 5; h.controller.tick(); h.accepted(); h.controller.event(2, PublishingAttemptEvent.Sending)
+        h.now = 90; h.controller.tick(); h.controller.detach(1)
+        assertTrue(h.controller.terminal); assertEquals(1, h.attempts[1].closes)
+        assertThrows(IllegalStateException::class.java) { h.controller.attach(2) }
+        assertEquals(2, h.attempts.size)
+    }
+    @Test fun firstStartupSubmittedAtDeadlineCannotReviveAnUnstartedAttempt() {
+        val h = Harness(); h.controller.attach(1); h.failed()
+        h.now = 5; h.controller.tick(); h.accepted()
+        h.now = 90; h.controller.event(2, PublishingAttemptEvent.Sending)
+        assertTrue(h.controller.terminal); assertEquals(1, h.attempts[1].closes)
+        assertEquals(0, h.policy.confirmations)
+    }
+    @Test fun peerWatermarkClearsOnlyNetworkWindowAndLaterFailureStartsNewWindow() {
+        val h = Harness(); h.controller.attach(1); h.failed()
+        h.now = 5; h.controller.tick(); h.accepted(); h.controller.event(2, PublishingAttemptEvent.Sending)
+        h.now = 20; h.controller.event(2, PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.SRT))
+        assertNull(h.policy.deadlineNs); assertNull(h.controller.nextWakeNs)
+        assertEquals(0, h.policy.confirmations)
+        h.now = 200; h.failed()
+        assertEquals(290L, h.policy.deadlineNs)
+    }
+
 }

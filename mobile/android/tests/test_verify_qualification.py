@@ -4,6 +4,7 @@ from contextlib import redirect_stderr
 import io
 from pathlib import Path
 import runpy
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -179,6 +180,45 @@ class QualificationVerifierTest(unittest.TestCase):
         with patch("subprocess.check_output", return_value=self.release_manifest()):
             with self.assertRaisesRegex(ValueError, "Release Rust library"):
                 VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"), expected_native="0" * 64)
+
+
+class ConnectorNativeVerifierTest(unittest.TestCase):
+    @staticmethod
+    def elf(align=16384):
+        value = bytearray(120)
+        value[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", value, 18, 183)
+        struct.pack_into("<Q", value, 32, 64)
+        struct.pack_into("<HH", value, 54, 56, 1)
+        struct.pack_into("<I", value, 64, 1)
+        struct.pack_into("<Q", value, 112, align)
+        return bytes(value)
+
+    def test_exact_arm64_hash_and_real_header_alignment_are_required(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "target/mobile-android", prefix="connector-verifier-") as directory:
+            apk = Path(directory) / "synthetic.apk"
+            verify = VERIFIER["verify_connector_native"]
+            good = self.elf()
+            def write(data, extra=False):
+                with ZipFile(apk, "w") as archive:
+                    archive.writestr("lib/arm64-v8a/libsecp256k1-jni.so", data)
+                    if extra:
+                        archive.writestr("lib/x86_64/libsecp256k1-jni.so", data)
+            with patch.dict(verify.__globals__, {"EXPECTED_SECP_ARM64": VERIFIER["sha256"](good)}):
+                write(good)
+                self.assertEqual(verify(apk)["native_abis"], ["arm64-v8a"])
+                write(good, True)
+                with self.assertRaisesRegex(ValueError, "exactly the ARM64"):
+                    verify(apk)
+                write(self.elf(4096))
+                with self.assertRaisesRegex(ValueError, "16 KiB"):
+                    verify(apk)
+                write(good + b"changed")
+                with self.assertRaisesRegex(ValueError, "mismatch"):
+                    verify(apk)
+                write(good[:80])
+                with self.assertRaisesRegex(ValueError, "program headers"):
+                    verify(apk)
 
 
 if __name__ == "__main__":

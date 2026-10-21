@@ -6,6 +6,7 @@ import android.os.CancellationSignal
 import android.os.SystemClock
 import dev.forgesworn.sapflow.MediaSample
 import dev.forgesworn.sapflow.NativeRtmpPublisher
+import dev.forgesworn.sapflow.NativeRtmpEvent
 import dev.forgesworn.sapflow.NativeRtmpState
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -35,6 +36,8 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
     private val closed = AtomicBoolean(false)
     private val ready = AtomicBoolean(false)
     private val accepted = AtomicBoolean(false)
+    private val startupReported = AtomicBoolean(false)
+    private val peerReported = AtomicBoolean(false)
     private val firstKeyframe = FirstKeyframeGate()
     private val socket = AtomicReference<Socket?>()
     private val tcpSocket = AtomicReference<Socket?>()
@@ -61,7 +64,11 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
     private fun startNetwork() {
         check(!closed.get()) { "Attempt closed" }
         startedMs = SystemClock.elapsedRealtime()
-        publisher = NativeRtmpPublisher(destination.app, preparedKey, destination.tcUrl, 0uL, startedMs.toULong())
+        publisher = NativeRtmpPublisher(destination.app, preparedKey, destination.tcUrl, 0uL, startedMs.toULong()).apply {
+            // The current hardware capture profile always declares H264 + AAC.
+            // A partial first CSD arrival must never turn this into video-only.
+            declareTracks(true, true)
+        }
         preparedKey = ""
         lock.withLock { armNativeDeadline() }
         message.set("Connecting one ${if (destination.tls) "RTMPS" else "development RTMP"} attempt")
@@ -80,6 +87,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                 // transport clock before assigning owned wire-media deadlines.
                 val snapshot = publisher!!.sendAndTakeOutput(sample, nowMs())
                 check(snapshot.state == NativeRtmpState.PUBLISHING) { "Origin stopped publication" }
+                reportProgress(snapshot.startupSubmitted, snapshot.peerMediaProgress)
                 queuedWireBytes.set(snapshot.queuedOutputBytes.toLong())
                 // These fields are Kotlin values from the SAME native lock,
                 // avoiding separate sample/state/queue/deadline crossings.
@@ -144,6 +152,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                         publisher!!.feed(bytes, nowMs())
                         flushOutput()
                         updateState()
+                        pollProgress()
                     }
                 } catch (_: SocketTimeoutException) {
                     lock.withLock {
@@ -151,6 +160,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                         publisher!!.tick(nowMs())
                         flushOutput()
                         updateState()
+                        pollProgress()
                     }
                 }
             }
@@ -171,6 +181,24 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
             }
             NativeRtmpState.CLOSED, NativeRtmpState.FAILED -> error("Origin stopped publication")
             else -> message.set("Negotiating one ${if (destination.tls) "RTMPS" else "development RTMP"} attempt")
+        }
+    }
+
+    /** Current publisher's native facts only; no socket/write/encode inference.
+     * Events can race Accepted across reader/drainer threads; control latches
+     * them under its exact attempt token before applying the ordered policy. */
+    private fun reportProgress(startup: Boolean, peer: Boolean) {
+        if (startup && startupReported.compareAndSet(false, true)) events(PublishingAttemptEvent.Sending)
+        if (peer && peerReported.compareAndSet(false, true))
+            events(PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.RTMP))
+    }
+    private fun pollProgress() {
+        repeat(16) {
+            when (publisher!!.pollEvent()) {
+                NativeRtmpEvent.SENDING -> reportProgress(true, false)
+                NativeRtmpEvent.PEER_MEDIA_PROGRESS -> reportProgress(true, true)
+                null -> return
+            }
         }
     }
 
@@ -213,6 +241,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                 if (closed.get() || deadlineGeneration.get() != generation) return@Runnable
                 publisher!!.tick(nowMs())
                 updateState()
+                pollProgress()
                 armNativeDeadline()
             } catch (_: Exception) {
                 fail("Attempt stopped: native wire deadline expired. Capture can continue.")

@@ -3,6 +3,7 @@ package dev.forgesworn.sapflow.broadcaster
 import dev.forgesworn.sapflow.MediaSample
 import dev.forgesworn.sapflow.NativeSession
 import dev.forgesworn.sapflow.NativeSessionAction
+import dev.forgesworn.sapflow.NativeTransportRecoverySource
 import dev.forgesworn.sapflow.MediaCodec as RustCodec
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ScheduledFuture
@@ -18,9 +19,11 @@ internal data class OriginMediaConfirmation(val destination: Long, val epoch: Lo
  * Epoch.close joins transport cleanup before CaptureController releases codecs.
  * Explicit Stop fences synchronously, then cleans up on this control owner. */
 internal class ReconnectingPublishingSink(
-    private val policyFactory: () -> ReconnectPolicyPort = { NativePolicy() },
+    private val policyFactory: (() -> ReconnectPolicyPort)? = null,
+    private val graceMs: Long = 90_000,
     private val factory: ((PublishingAttemptEvent) -> Unit) -> EncodedSink,
 ) {
+    init { require(graceMs in 0..3_600_000) }
     private data class Codecs(val video: RustCodec?, val audio: RustCodec?)
     private data class Current(val epoch: Epoch, val token: Long, val sink: EncodedSink, val report: (PublishingAttemptEvent) -> Unit)
     private val fenced = AtomicBoolean(false)
@@ -34,7 +37,7 @@ internal class ReconnectingPublishingSink(
     private val observationPosted = AtomicBoolean(false)
     private var alarm: ScheduledFuture<*>? = null // Control owner only.
     private val epochs = java.util.concurrent.ConcurrentHashMap<Long, Epoch>()
-    private val controller: ReconnectController by lazy { ReconnectController(policyFactory(), System::nanoTime, { !fenced.get() },
+    private val controller: ReconnectController by lazy { ReconnectController(policyFactory?.invoke() ?: NativePolicy(graceMs), System::nanoTime, { !fenced.get() },
         factory = attempt@{ epoch, token ->
             val owner = epochs[epoch]
             if (owner == null || owner.closed.get() || fenced.get()) return@attempt object : PublishingAttempt {
@@ -42,9 +45,12 @@ internal class ReconnectingPublishingSink(
                 override fun close() {}
             }
             val accepted = AtomicBoolean(false); val failed = AtomicBoolean(false)
+            val sending = AtomicBoolean(false); val progress = AtomicBoolean(false)
             val report: (PublishingAttemptEvent) -> Unit = { event ->
                 val first = when (event) {
                     PublishingAttemptEvent.Accepted -> accepted.compareAndSet(false, true)
+                    PublishingAttemptEvent.Sending -> sending.compareAndSet(false, true)
+                    is PublishingAttemptEvent.PeerMediaProgress -> progress.compareAndSet(false, true)
                     is PublishingAttemptEvent.Failed -> failed.compareAndSet(false, true)
                 }
                 if (first) post { controller.event(token, event) }
@@ -148,7 +154,10 @@ internal class ReconnectingPublishingSink(
         private val started = AtomicBoolean(false)
         private val completion = AtomicReference<CompletableFuture<Unit>?>(null)
         override val status: String get() = message.get()
-        override val diagnostics: String get() = current.get()?.takeIf { it.epoch === this }?.sink?.diagnostics ?: "No active publishing attempt"
+        override val diagnostics: String get() {
+            val active = current.get()?.takeIf { it.epoch === this }
+            return "Destination $destinationId epoch=$id attempt=${active?.token ?: 0} stopped=${fenced.get()} · ${active?.sink?.diagnostics ?: "No active publishing attempt"}"
+        }
         override fun setKeyframeRequester(request: () -> Unit) { requestIdr.set(request) }
         override fun configure(video: RustCodec?, audio: RustCodec?) {
             if (closed.get() || fenced.get()) return
@@ -181,9 +190,10 @@ internal class ReconnectingPublishingSink(
         }
     }
 
-    private class NativePolicy : ReconnectPolicyPort {
-        private val native = NativeSession(90_000uL)
+    private class NativePolicy(graceMs: Long) : ReconnectPolicyPort {
+        private val native = NativeSession(graceMs.toULong())
         private var generation: ULong? = null
+        private var attemptEpoch = 0uL
         override fun start(nowNs: Long): ReconnectAction {
             val value = native.start(nowNs.toULong()); generation = value
             return action(native.prepared(value))
@@ -191,18 +201,27 @@ internal class ReconnectingPublishingSink(
         override fun failed(nowNs: Long) = action(native.transportFailed(checkNotNull(generation), nowNs.toULong()))
         override fun intentionalReplace(nowNs: Long) = action(native.replaceTransport(checkNotNull(generation), nowNs.toULong()))
         override fun connected(nowNs: Long) = native.connected(checkNotNull(generation), nowNs.toULong())
+        override fun sending(nowNs: Long) = action(native.sending(checkNotNull(generation), attemptEpoch, nowNs.toULong()))
+        override fun peerProgress(source: PeerProgressSource, nowNs: Long) = action(native.transportRecovered(checkNotNull(generation), attemptEpoch, nowNs.toULong(), when (source) {
+            PeerProgressSource.SRT -> NativeTransportRecoverySource.SRT_PEER_ACKNOWLEDGED_WATERMARK
+            PeerProgressSource.RTMP -> NativeTransportRecoverySource.RTMP_PEER_ACKNOWLEDGED_WATERMARK
+        }))
         override fun confirmed(nowNs: Long) = native.mediaConfirmed(checkNotNull(generation), nowNs.toULong())
         override fun tick(nowNs: Long) = action(native.tick(checkNotNull(generation), nowNs.toULong()))
-        override val deadlineNs: Long? get() = native.snapshot().reconnectDeadlineNs?.toLong()
+        override val nextDeadlineNs: Long? get() = native.snapshot().nextDeadlineNs?.toLong()
         override fun stop() {
             try { generation?.let { native.finishStop(native.stop(it).generation) } }
             finally { native.close() }
         }
         private fun action(value: NativeSessionAction): ReconnectAction = when (value) {
-            NativeSessionAction.Connect -> ReconnectAction.Connect
+            NativeSessionAction.Connect -> {
+                attemptEpoch = native.snapshot().attemptEpoch
+                ReconnectAction.Connect
+            }
             is NativeSessionAction.RetryAt -> ReconnectAction.At(value.atNs.toLong())
             is NativeSessionAction.AwaitGraceDeadline -> ReconnectAction.At(value.atNs.toLong())
             NativeSessionAction.GraceExpired, NativeSessionAction.EndDestination -> ReconnectAction.Expired
+            NativeSessionAction.RetryBudgetExhausted -> ReconnectAction.Exhausted
             NativeSessionAction.None -> ReconnectAction.None
         }
     }

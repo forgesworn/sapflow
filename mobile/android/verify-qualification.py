@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import struct
 from zipfile import ZipFile
 
 
@@ -26,6 +27,37 @@ def expected_sha256(value):
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
         raise ValueError("Expected SHA-256 must contain exactly 64 hexadecimal digits")
     return value.lower()
+
+
+EXPECTED_SECP_ARM64 = "c4cc8233878301d16f1c8590fbea9f71383bee2605db9fec5b57a62c6a8e02f0"
+
+
+def verify_connector_native(apk):
+    """First connector packet is ARM64 only. Inspect actual ELF bytes, not packaging declarations."""
+    with ZipFile(apk) as archive:
+        libs = [p for p in archive.namelist() if p.startswith("lib/") and p.endswith(".so")]
+        if not libs or {p.split("/")[1] for p in libs} != {"arm64-v8a"}:
+            raise ValueError("Connector qualification requires exactly the ARM64 native ABI")
+        result = {}
+        for name in libs:
+            data = archive.read(name)
+            if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+                raise ValueError("Invalid ARM64 ELF")
+            if struct.unpack_from("<H", data, 18)[0] != 183:
+                raise ValueError("Native ELF machine is not AArch64")
+            offset = struct.unpack_from("<Q", data, 32)[0]
+            size, count = struct.unpack_from("<HH", data, 54)
+            if size < 56 or count > 128 or offset + size * count > len(data):
+                raise ValueError("Invalid ELF program headers")
+            alignments = [struct.unpack_from("<Q", data, offset + i * size + 48)[0]
+                          for i in range(count) if struct.unpack_from("<I", data, offset + i * size)[0] == 1]
+            if not alignments or any(x < 16384 or x & (x - 1) for x in alignments):
+                raise ValueError("Native ELF lacks 16 KiB LOAD alignment")
+            result[name] = {"sha256": sha256(data), "load_alignments": alignments}
+        secp = result.get("lib/arm64-v8a/libsecp256k1-jni.so")
+        if not secp or secp["sha256"] != EXPECTED_SECP_ARM64:
+            raise ValueError("Pinned ACINQ 0.22.0 ARM64 library mismatch")
+        return {"native_abis": ["arm64-v8a"], "libraries": result, "all_abi_release_qualified": False}
 
 
 def node_block(tree, name):
@@ -136,6 +168,7 @@ if __name__ == "__main__":
     parser.add_argument("--expected-native-sha256", type=expected_sha256, default=EXPECTED_NATIVE)
     parser.add_argument("--expect-pose-hook", action="store_true")
     parser.add_argument("--release-apk", type=Path)
+    parser.add_argument("--expect-v4v-connector", action="store_true")
     options = parser.parse_args()
     if options.release_apk and not options.expect_pose_hook:
         parser.error("--release-apk requires --expect-pose-hook")
@@ -148,4 +181,8 @@ if __name__ == "__main__":
     if options.release_apk:
         result["release_isolation"] = verify_release_isolation(options.release_apk, options.aapt2,
             expected_native=options.expected_native_sha256)
+    if options.expect_v4v_connector:
+        result["connector_native"] = verify_connector_native(options.apk)
+        if options.release_apk:
+            result["release_isolation"]["connector_native"] = verify_connector_native(options.release_apk)
     print(json.dumps(result, indent=2))

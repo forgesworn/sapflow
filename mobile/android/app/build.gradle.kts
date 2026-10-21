@@ -1,4 +1,5 @@
 import java.io.File
+import java.net.URI
 
 plugins {
     id("com.android.application")
@@ -23,8 +24,26 @@ android {
         applicationId = "dev.forgesworn.sapflow.broadcaster"
         minSdk = 29
         targetSdk = 36
+        // This first connector package is ARM64 qualification; other ABIs require their own SDK/JNI gate.
+        ndk { abiFilters += setOf("arm64-v8a") }
         versionCode = 1
         versionName = "0.0.0"
+        fun literal(value: String) = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        // Build-approved public routing only. No credential or arbitrary in-app profile import.
+        val apiOrigin = providers.gradleProperty("sapflowV4vApiOrigin").orElse("").get()
+        val playbackOrigin = providers.gradleProperty("sapflowV4vPlaybackOrigin").orElse("").get()
+        val playbackPrefix = providers.gradleProperty("sapflowV4vPlaybackPrefix").orElse("").get()
+        require(listOf(apiOrigin, playbackOrigin, playbackPrefix).all { it.isEmpty() } || listOf(apiOrigin, playbackOrigin, playbackPrefix).all { it.isNotEmpty() }) { "Supply the complete approved V4V profile or leave it disabled" }
+        if (apiOrigin.isNotEmpty()) {
+            for (value in listOf(apiOrigin, playbackOrigin)) {
+                val uri = URI(value)
+                require(value.all { it.code >= 32 } && uri.scheme == "https" && uri.host != null && uri.rawUserInfo == null && uri.rawQuery == null && uri.rawFragment == null && uri.rawPath in listOf("", "/")) { "V4V profile requires HTTPS origins" }
+            }
+            require(playbackPrefix.startsWith('/') && playbackPrefix.endsWith('/') && !playbackPrefix.contains("..") && !playbackPrefix.contains("//") && playbackPrefix.matches(Regex("/[A-Za-z0-9/_-]*"))) { "Invalid approved playback prefix" }
+        }
+        buildConfigField("String", "V4V_API_ORIGIN", literal(apiOrigin))
+        buildConfigField("String", "V4V_PLAYBACK_ORIGIN", literal(playbackOrigin))
+        buildConfigField("String", "V4V_PLAYBACK_PREFIX", literal(playbackPrefix))
     }
     buildTypes {
         create("qualification") {
@@ -42,7 +61,7 @@ android {
             res.srcDir("src/debug/res")
         }
     }
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -98,5 +117,10 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    // Newest Kotlin 2.2-metadata compatible release. 0.23/0.24 require Kotlin 2.3.
+    implementation("fr.acinq.secp256k1:secp256k1-kmp-jvm:0.22.0")
+    implementation("fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.22.0")
+    testRuntimeOnly("fr.acinq.secp256k1:secp256k1-kmp-jni-jvm:0.22.0")
     testImplementation("junit:junit:4.13.2")
 }

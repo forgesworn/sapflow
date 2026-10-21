@@ -1,6 +1,8 @@
 package dev.forgesworn.sapflow.broadcaster
 
 import android.Manifest
+import android.content.Intent
+import android.app.Activity
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.hardware.display.DisplayManager
@@ -42,6 +44,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -55,6 +58,19 @@ import androidx.compose.ui.viewinterop.AndroidView
 
 class MainActivity : ComponentActivity() {
     private lateinit var capture: CaptureController
+    private var v4v: V4vAppOwner? = null
+    private var useV4v by mutableStateOf(false)
+    private var prepareRequest = 0L
+    private var preparedV4v: V4vCaptureAdmission.Prepared? = null
+    private var v4vState by mutableStateOf<V4vView?>(null)
+    private var v4vEvents by mutableStateOf<List<Pair<String, String>>>(emptyList())
+    private var v4vEvent by mutableStateOf("")
+    private var acknowledgeLoss by mutableStateOf(false)
+    private val signerResult = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        v4v?.signerRelay?.deliver(it.resultCode == Activity.RESULT_OK, it.data)
+    }
+    private val launchSigner: (Intent) -> Unit = { signerResult.launch(it) }
+
     private var preview: Surface? = null
     private var previewWidth = 1
     private var previewHeight = 1
@@ -133,6 +149,7 @@ class MainActivity : ComponentActivity() {
     private val refresh = object : Runnable {
         override fun run() {
             snapshot = capture.snapshot()
+            v4vState = v4v?.control?.view
             ui.postDelayed(this, 200)
         }
     }
@@ -148,6 +165,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         capture = CaptureController(applicationContext)
+        try { v4v = V4vAppOwner.configured(applicationContext); v4v?.signerRelay?.attach(launchSigner) }
+        catch (_: Exception) { permissionMessage = "Approved V4V configuration is invalid; connector disabled" }
         poseSelector = PoseInputPolicy(displayPose(), qualificationPoseControlEnabled)
         capture.orientationChanged(poseSelector.pose)
         orientation = object : OrientationEventListener(this) {
@@ -203,7 +222,7 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Prepare") }
                         Button(
-                            onClick = { capture.start(); window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) },
+                            onClick = { startWithAuth() },
                             enabled = current?.stage == CaptureStage.PREPARED,
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Start capture") }
@@ -211,6 +230,8 @@ class MainActivity : ComponentActivity() {
                             onClick = {
                                 ui.removeCallbacks(settlePose)
                                 poseSelector.stopCapture()
+                                prepareRequest++
+                                v4v?.stopPublisher()
                                 capture.stop()
                                 schedulePoseSettlement()
                                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -237,7 +258,8 @@ class MainActivity : ComponentActivity() {
                         Text(current?.publishingStatus ?: "No publisher attached", style = MaterialTheme.typography.bodySmall)
                         Text(current?.recordingStatus ?: "No recorder attached", style = MaterialTheme.typography.bodySmall)
                         val configurable = current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)
-                        Text("Manual destination · one attempt", style = MaterialTheme.typography.labelMedium)
+                        V4vControls(configurable)
+                        Text("Manual destination · bounded reconnect", style = MaterialTheme.typography.labelMedium)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Checkbox(checked = useSrt, onCheckedChange = { useSrt = it }, enabled = configurable)
                             Text("Use SRT over UDP", style = MaterialTheme.typography.bodySmall)
@@ -273,13 +295,69 @@ class MainActivity : ComponentActivity() {
                                 Text("Allow plaintext RTMP for development", style = MaterialTheme.typography.bodySmall)
                             }
                         }
-                        Text("Leave blank for SDK validation only. No automatic retry or transport downgrade.", style = MaterialTheme.typography.bodySmall)
+                        Text("Leave blank for SDK validation only. No transport downgrade.", style = MaterialTheme.typography.bodySmall)
                         Text("Video: ${current?.videoEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
                         Text("Audio: ${current?.audioEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
                         Text("Capture stops when this screen leaves the foreground.", style = MaterialTheme.typography.bodySmall)
         }
     }
 
+
+    private fun startWithAuth() {
+        fun start() { capture.start(); window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        if (!useV4v) start()
+        else {
+            val request = prepareRequest
+            val binding = preparedV4v ?: return
+            v4v?.grant { permit, error ->
+                if (request != prepareRequest || !useV4v || preparedV4v != binding) return@grant
+                if (error == null && permit != null && v4v?.canStart(binding, permit) == true && poseTracking && capture.snapshot().stage == CaptureStage.PREPARED) start()
+                else permissionMessage = error?.message?.take(160) ?: "V4V start permission no longer matches this prepared capture"
+            }
+        }
+    }
+    private fun v4vCommand(action: V4vSessionEngine.() -> Unit) {
+        v4v?.control?.submit(action) { error -> ui.post {
+            if (error != null) permissionMessage = error.message?.take(160) ?: "V4V operation not confirmed"
+            v4vState = v4v?.control?.view
+        } }
+    }
+    @Composable private fun V4vControls(configurable: Boolean) {
+        val owner = v4v
+        if (owner == null) { Text("V4V sign-in is unavailable in this build", style = MaterialTheme.typography.bodySmall); return }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(useV4v, { prepareRequest++; useV4v = it }, enabled = configurable)
+            Text("Use approved V4V connector", style = MaterialTheme.typography.bodySmall)
+        }
+        if (!useV4v) return
+        Text(v4vState?.message ?: "Loading V4V journal", style = MaterialTheme.typography.bodySmall)
+        if (configurable) {
+            val signers = remember(owner) { Nip55Login(this, owner.signerRelay).installed() }
+            signers.forEach { (pkg, label) -> OutlinedButton(onClick = {
+                owner.beginLogin(pkg, this) { error -> permissionMessage = error?.message?.take(160) }
+            }) { Text("Sign in with $label") } }
+            if (signers.isEmpty()) Text("Install a NIP-55 signer to sign in; no key import", style = MaterialTheme.typography.bodySmall)
+        }
+        OutlinedButton(enabled = v4vState?.signedIn == true, onClick = {
+            var rows: List<Pair<String, String>> = emptyList()
+            owner.control.submit({ rows = listEvents() }) { error -> ui.post {
+                if (error == null) v4vEvents = rows else permissionMessage = error.message?.take(160)
+            } }
+        }) { Text("Load my live events") }
+        v4vEvents.forEach { (id, title) -> OutlinedButton(enabled = configurable, onClick = { v4vEvent = id }) { Text(title.take(60)) } }
+        Text(if (v4vEvent.isBlank()) "Select an event" else "Event selected", style = MaterialTheme.typography.bodySmall)
+        OutlinedButton(enabled = configurable && v4vEvent.isNotBlank() && v4vState?.signedIn == true && v4vState?.pending != true,
+            onClick = { val selected = v4vEvent; v4vCommand { prepare(selected) } }) { Text("Prepare V4V session") }
+        OutlinedButton(enabled = v4vState?.pending == true, onClick = { v4vCommand { retry() } }) { Text("Retry saved operation") }
+        OutlinedButton(enabled = v4vState?.eventId != null, onClick = { prepareRequest++; owner.stopPublisher(); owner.control.endDestination { error -> ui.post { if (error != null) permissionMessage = "V4V End intent not confirmed"; v4vState = owner.control.view } } }) { Text("End V4V destination") }
+        OutlinedButton(enabled = v4vState?.eventId != null, onClick = { v4vCommand { status() } }) { Text("Check origin finalisation") }
+        if (v4vState?.recoveryOffered == true) {
+            Row { Checkbox(acknowledgeLoss, { acknowledgeLoss = it }); Text("Abandon failed automatic recording", style = MaterialTheme.typography.bodySmall) }
+            OutlinedButton(enabled = acknowledgeLoss && v4vState?.pending != true, onClick = { v4vCommand { acknowledge() }; acknowledgeLoss = false }) { Text("Acknowledge recording failure") }
+        }
+        if (v4vState?.recoveryState == "acknowledged") OutlinedButton(enabled = configurable && v4vEvent.isNotBlank(), onClick = { val selected = v4vEvent; v4vCommand { prepare(selected, true) } }) { Text("Explicitly prepare replacement") }
+        Text("Playback has not been verified", style = MaterialTheme.typography.bodySmall)
+    }
 
     private fun prepareWithPermissions() {
         val needed = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
@@ -289,13 +367,27 @@ class MainActivity : ComponentActivity() {
         } else permissions.launch(needed)
     }
 
-    private fun prepareCapture() {
+    private fun prepareCapture(approvedGrant: V4vCapturePermit? = null) {
+        if (useV4v && approvedGrant == null) {
+            val owner = v4v ?: return
+            val request = ++prepareRequest
+            owner.grant { grant, error ->
+                if (request != prepareRequest || !useV4v) return@grant
+                if (error != null) permissionMessage = error.message?.take(160) ?: "V4V grant unavailable"
+                else if (poseTracking && capture.snapshot().canPrepare) prepareCapture(checkNotNull(grant))
+            }
+            return
+        }
         try {
             val surface = preview?.takeIf { it.isValid } ?: return
             val key = destinationKey
             val passphrase = srtPassphrase
             val plaintext = srtPlaintextLab
-            val publisher: () -> EncodedSink? = if (destinationUrl.isBlank()) ({ null }) else if (useSrt) {
+            val publisher: () -> EncodedSink? = if (useV4v) {
+                val prepared = checkNotNull(v4v).captureFactory(checkNotNull(approvedGrant))
+                preparedV4v = prepared.binding
+                prepared.factory
+            } else if (destinationUrl.isBlank()) ({ null }) else if (useSrt) {
                 SrtDestination.validateCredentials(key, passphrase, plaintext)
                 val destination = SrtDestination.parse(destinationUrl.trim())
                 val coordinator = ReconnectingPublishingSink { events -> SrtPublishingSink(destination, key, passphrase, plaintext, events) }
@@ -331,14 +423,16 @@ class MainActivity : ComponentActivity() {
     }
     override fun onStop() {
         poseTracking = false
+        prepareRequest++
         enableQualificationPoseControl(false)
         orientation.disable()
         ui.removeCallbacks(settlePose); poseSelector.cancelPending()
         getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayChanges)
         ui.removeCallbacks(refresh)
+        v4v?.stopPublisher()
         capture.stop("Capture interrupted: the app left the foreground. Prepare again to resume.")
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
-    override fun onDestroy() { enableQualificationPoseControl(false); capture.close(); super.onDestroy() }
+    override fun onDestroy() { v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); capture.close(); super.onDestroy() }
 }
