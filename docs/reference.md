@@ -65,8 +65,9 @@ How sapflow keeps it (`sapflow_hls::PartTiming`, `Muxer::place_video`):
   track that audio still covers. Letting the part run long would exceed
   `PART-TARGET`; closing the part before the frame would leave it under
   85%; raising the target is the fault itself. Safari and hls.js tolerate a
-  short gap in one track (hls.js steps over buffer holes); that is the
-  expected behaviour, not yet watched in either.
+  short gap in one track (hls.js steps over buffer holes); both were seen
+  to carry on across stalls and reconnects (below, What players should do
+  at a break).
 - **EXTINF stays true.** A segment's `EXTINF` is still the media time it
   covers, so after a clamp its parts' `DURATION`s add up to less than its
   `EXTINF` by the gap. `Part::span` is the part's duration plus any gap
@@ -216,12 +217,14 @@ extensions, loss lists). Each has a fuzz target.
   here: it sends a digest C1, verifies a digest S1 and signed S2 strictly
   when S1 carries a server version, and falls back to the original form
   when the version is zero. The unit tests check our answer against that
-  algorithm; OBS itself has not been run against sapflow yet.
+  algorithm; OBS has since published over RTMP to sapflow
+  (`docs/interop.md`).
 - So sapflow answers a digest C1 with a digest S1 (server version
   13.14.10.13, as nginx-rtmp) and a signed S2, and anything else with the
   original form (S2 echoes C1). C2 is not checked, as in nginx-rtmp,
-  mediamtx and rml_rtmp. Larix and vMix are untested; both are known to
-  work with nginx-rtmp and mediamtx, which answer the same way.
+  mediamtx and rml_rtmp. Larix has since published over RTMP
+  (`docs/interop.md`); vMix is untested, and is known to work with
+  nginx-rtmp and mediamtx, which answer the same way.
 
 ### SRT wire findings (2026-10-20)
 

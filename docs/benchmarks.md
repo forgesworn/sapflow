@@ -53,7 +53,7 @@ Reproduce with `scripts/bench.sh sapflow` and
 | Segment p50 / p95 / p99 | 6.8-8.2 / 21.0-37.3 / 35.8-88.5 ms | 8.0-13.5 / 37.4-74.8 / 72.4-207.0 ms |
 | Part fan-out p50 / p95 / max | 34.2-42.1 / 92.8-130.7 / 126.9-460.8 ms | 55.5 / 116.4 / 393.5 ms |
 | Failed requests | 0 (up to 3 per run before the fix) | 0 |
-| Glass-to-glass delay | not measured | not measured |
+| Glass-to-glass delay | not measured here; 3.0 to 3.2 s later, Larix to Safari over HTTP/2 (`docs/interop.md`) | not measured |
 
 ## Reading it
 
@@ -73,7 +73,8 @@ Reproduce with `scripts/bench.sh sapflow` and
   its medians and p95s are lower. With the load generator on the same
   machine these maxima are noisy; a test on separate machines would settle
   it.
-- Not measured: glass-to-glass delay, which needs a camera filming a clock
+- Not measured in this run: glass-to-glass delay (measured later: 3.0 to
+  3.2 s, Larix to Safari over HTTP/2, `docs/interop.md`), which needs a camera filming a clock
   and a phone playing the stream. Time from encoder connect to a servable
   stream was measured instead: about 4 s over SRT with a 2 s SRT latency,
   about 1 s over RTMP.

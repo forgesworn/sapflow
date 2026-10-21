@@ -13,7 +13,7 @@ is tried.
 | 2026-10-20 | Larix Broadcaster (iPhone) | RTMP | Larix defaults (H.264 Baseline 720p30, AAC mono, 2 s keyframes); credentials in the URL | Servable in 1.0 s; 2 s segments decode cleanly, A/V start within 7 ms |
 | 2026-10-20 | Larix Broadcaster (iPhone) | SRT | Larix defaults, credentials in the `streamid`, 2 s latency | Servable in 4.5 s; 24 segments decode cleanly; 4 late packets dropped once over Wi-Fi (one segment 59 frames of 60) |
 | 2026-10-20 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults over Wi-Fi | Safari refused the stream (crossed-out play button) after Wi-Fi stalls (one frame of 0.367 s) raised `PART-TARGET` to 0.534 s while parts stayed 0.2 to 0.233 s. Fixed in a94da2f: `PART-TARGET` fixed at 0.234 s, long frames clamped (`docs/reference.md`, Part timing) |
-| 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults, Wi-Fi switched off briefly, served by a94da2f | Part rules held (`PART-TARGET` 0.234 throughout), but the drop left a 6 s segment and `EXT-X-TARGETDURATION` rose from 2 to 6; Safari stopped. Fixed in d480bb9: the target is fixed and a drop ends the segment, marked as a discontinuity (`docs/reference.md`, Target duration and breaks). An SRT silence of 5 s still ends the stream (M7) |
+| 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults, Wi-Fi switched off briefly, served by a94da2f | Part rules held (`PART-TARGET` 0.234 throughout), but the drop left a 6 s segment and `EXT-X-TARGETDURATION` rose from 2 to 6; Safari stopped. Fixed in d480bb9: the target is fixed and a drop ends the segment, marked as a discontinuity (`docs/reference.md`, Target duration and breaks). An SRT silence of 5 s then ended the stream; since M7 the stream is held for a reconnect (`SAPFLOW_RECONNECT_GRACE`) |
 | 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT (`SAPFLOW_SRT_IMPL=own`) and RTMP at once | Larix defaults over Wi-Fi, served by d480bb9; Wi-Fi switched off twice | Both streams stayed live through drops of 3.1 and 4.4 s, each marked as a discontinuity; Safari carried on (by eye); recordings 98.6 s (SRT) and 107.8 s (RTMP). One RTMP reconnect was refused as already live until the old connection timed out, then accepted 3 s later |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) | SRT, `SAPFLOW_SRT_IMPL=own` | `SRT_IMPLS="srt-rs own" scripts/smoke.sh` | Pass with both implementations (refusals 400, 401, 409 included) |
 | 2026-10-20 | ffmpeg 8.1.2 (libsrt 1.5.3, in Docker) | SRT, `SAPFLOW_SRT_IMPL=own` | 720p30 x264 2.5 Mbit/s, `latency=2000000` | Accepted at 2000 ms latency, servable in 3.5 s, clean shutdown and unpublish |
@@ -101,8 +101,8 @@ module with a locally trusted certificate, standing in for Caddy): 3.0 and
 playhead. Safari takes the low-latency position only over HTTP/2, as
 Apple's LL-HLS guidance says; over HTTP/1.1 it falls back to 3 x
 `TARGETDURATION`. Production goes through Caddy with HTTP/2, so measure
-latency that way: a plain-HTTP test overstates it by about 9 s at 2 s
-keyframes. The 2 s SRT latency is most of what remains.
+latency that way: here plain HTTP overstated it by about 7.7 s (10.8 s
+against 3.0 to 3.2 s) at 2 s keyframes. The 2 s SRT latency is most of what remains.
 
 ## Not yet tried
 

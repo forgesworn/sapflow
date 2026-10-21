@@ -294,7 +294,7 @@ protocol, codec and HTTP logic and lock operations.
 - Attribution depends on debug line tables and symbol names (see Method).
   "Tokio runtime and unattributed" is a residue, not a measured runtime cost.
 - Sample counts are in every section. Anything under about 5 samples is noise.
-- The profiled binary came from the working tree at the commit above, with
+- The profiled binary came from the working tree on 2026-10-20, with
   the vendored libraries as they are there. A separate RTMP rewrite on another
   branch was not profiled.
 
