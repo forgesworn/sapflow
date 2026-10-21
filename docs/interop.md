@@ -104,6 +104,125 @@ Apple's LL-HLS guidance says; over HTTP/1.1 it falls back to 3 x
 latency that way: here plain HTTP overstated it by about 7.7 s (10.8 s
 against 3.0 to 3.2 s) at 2 s keyframes. The 2 s SRT latency is most of what remains.
 
+## Behind Caddy, in Docker on the Mac (2026-10-21)
+
+A stand-in for the M7 item "measured on Linux behind Caddy" while no second
+wired machine is free. Caddy 2.11.7 (the official `caddy:2` image) runs in
+Docker Desktop on the same Mac as sapflow (8ee5704, release build, on the
+host) and the test clients. `tls internal` gives it its own CA, trusted only
+by those clients. One port serves TLS with HTTP/2 (and offers HTTP/3);
+`handle_path /live-hls/*` then `reverse_proxy` to sapflow's HLS port, the
+shape `docs/v4v-contract.md` describes. The publisher is ffmpeg over RTMP,
+720p30 x264 at 2.5 Mbit/s, 200 ms parts, keyframes every 1 s or 2 s.
+
+```
+HTTP_PORT=28888 RTMP_PORT=28935 CADDY_PORT=28943 SAPFLOW_BIN=<sapflow> \
+  PLAYWRIGHT_DIR=<playwright package> HLS_JS=<hls.min.js> \
+  scripts/behind-caddy.sh lag blocking check player     # KEYINT=2: 2 s keyframes
+```
+
+`scripts/behind-caddy.Caddyfile` is the Caddyfile. The clients are
+`scripts/behind-caddy.mjs` (Node's `http2`, no packages) and
+`scripts/behind-caddy-player.mjs` (hls.js 1.7.1 in an already installed
+Playwright and Chrome; nothing was downloaded). The Mac was busy with other
+work throughout (one-minute load average 20 to 177 on 8 cores), so absolute
+times wobble; what counts was measured on the same stream at the same moment
+by both paths.
+
+**What Caddy needed:** nothing beyond the plain `reverse_proxy`. Tried
+without effect: `flush_interval -1` (bodies have a length and are held until
+ready, so there is nothing to flush early; two runs of 200 blocking reloads
+cost a median 2.3 and 2.2 ms, against 2.4 and 2.2 ms for the plain config)
+and `encode gzip zstd` (its default match leaves playlists and fMP4 alone: no
+`Content-Encoding` on any response, with browser-style `Accept-Encoding`
+offered). Forcing gzip onto playlists works (2,001 bytes became 417, median
+cost 2.4 and 1.8 ms) but saves little. Caddy added `alt-svc` and
+`via: 1.1 Caddy` and dropped nothing. sapflow sets
+`access-control-allow-origin` itself, so Caddy should not add another.
+
+**Correct through Caddy** (`check`, at both keyframe intervals, no failures):
+
+- HTTP/2 negotiated (ALPN `h2`; `curl --http2` reports "using HTTP/2").
+- The multivariant playlist, init segment, parts and segments identical to
+  direct byte for byte, with the same `content-type`, `cache-control`
+  (`no-cache` for playlists, `public, max-age=3600` for media),
+  `content-length` and CORS header. Media playlists fetched in pairs just
+  after a part appeared: 40 of 40 identical in each of four runs.
+- 404 (unknown stream, unknown chunk) and 400 (`_HLS_msn=abc`, `_HLS_part`
+  without `_HLS_msn`, `_HLS_msn` far ahead) kept, with empty bodies and the
+  CORS header; the CORS preflight still 204.
+- A preload-hinted part asked for before it existed was held until it did,
+  then identical (12 of 12 in each run; about 200 ms, 2 to 5 ms over direct).
+- A request held for sapflow's whole limit ended in its own 503 as soon as
+  direct did: 6.00 against 6.04 s (`TARGETDURATION` 2), 9.00 against 9.03 s
+  (3). Caddy cuts nothing short.
+- `scripts/check-playlist.py` through Caddy (HTTP/1.1 over TLS: it has no
+  HTTP/2) and direct: every render kept the rules.
+
+**Cost and delay.** The first three rows are Caddy minus direct, the same
+request asked on both paths at once; the last two are absolute.
+
+| Measure | 1 s keyframes | 2 s keyframes |
+|---------|---------------|---------------|
+| Blocking reload for the next part, 200 samples, median / p90 / p99 | 1.6 / 3.0 / 16 ms | 1.3 / 3.5 / 24 ms |
+| The same against a second plain connection (noise floor) | -0.03 / 0.6 / 22 ms | -0.01 / 0.4 / 5.1 ms |
+| First sight of each new part, 445 parts, median / p90 / p99 | 1.7 / 4.1 / 15 ms | 2.0 / 6.0 / 16.5 ms |
+| hls.js `lowLatencyMode`, Chrome 155 headless, direct over HTTP/1.1 | 1.51 s (1.17 to 2.11) | 2.14 s (1.08 to 3.50) |
+| The same through Caddy over HTTP/2 | 1.62 s (1.21 to 2.17) | 2.10 s (1.18 to 3.60) |
+
+Every blocking reload carried the part it asked for (none early), and no part
+seen directly was missed through Caddy (0 of 453).
+
+What each includes. The first three rows time sapflow to a client on
+loopback: Caddy, TLS, HTTP/2 framing and Docker Desktop's two network hops,
+with no player and no encoder (a native Caddy on Linux has fewer hops, so
+this probably overstates its cost). The hls.js rows are `hls.latency`, the
+playlist's live edge as hls.js last loaded it minus the playhead; the wall
+clock against the programme date-time of the frame on screen agreed within
+0.05 s. They include where hls.js chose to start and the age of its playlist;
+they exclude the encoder, the ingest hop and the time sapflow takes to form a
+part. Each is the median of the run medians (lowest to highest) over 8 and 6
+runs of 70 s, direct and Caddy playing the same stream together, in
+alternating start order. The spread is where hls.js happens to start: in the
+first set the page that started second sat about 0.1 s further back (Caddy
+second: +0.15 s on average, first: -0.08 s). Caddy minus direct averaged
++0.03 s (1 s keyframes) and +0.07 s (2 s), inside that effect. hls.js held
+1.5 s (1 s keyframes) and 2.1 s (2 s) back; its target is `PART-HOLD-BACK`,
+0.585 s.
+
+Absolute part lag, measured as `scripts/ingest-lag.py` does, was the same on
+both paths: -0.43 s on the quietest 90 s run at 1 s keyframes (every third of
+the run alike), against -0.31 s from `ingest-lag.py` itself (2 s keyframes)
+on the same machine; that is the encoder start-up bias noted above. On busier
+runs the spread widened (p90 +0.27 s), and at 2 s keyframes the lag drifted
+from +1.4 to -0.4 s over the run on both paths together, probably ffmpeg
+starved of CPU.
+
+Over four minutes both players drifted back together (2.9 to 5.9 s direct and
+2.5 to 5.5 s through Caddy at 1 s keyframes; 1.7 to 4.1 s and 1.7 to 4.0 s at
+2 s). hls.js does not speed up to catch the edge, and under that load the
+browser played 1.2 to 1.8% slower than real time; hence the 70 s runs. Frames
+dropped ranged from 0 to 5% a run: through Caddy 2.6% against 0.9% direct in
+the first set but 1.1% against 1.0% in the second, so not put down to the
+path.
+
+**What this does not show.** Chrome does not show the difference Safari shows
+between HTTP/1.1 and HTTP/2 (9 s against 3 s, earlier in this file), so the
+Safari figure still rests on the Node stand-in. Caddy passed the same bytes
+and headers over HTTP/2, so there is no reason Safari would differ, but nobody
+has watched it through Caddy. Chrome stayed on HTTP/2 for every response
+although Caddy offered HTTP/3 (its UDP port was published), so HTTP/3 is
+untried.
+
+**Still needs the wired Linux machine:** Caddy on Linux with a real
+certificate and the real v4v Caddyfile (its `encode`, `header`, logging and
+timeouts could each change this); Safari on an iPhone and a Mac through it;
+HTTP/3; the 250 and 750 full-viewer runs through Caddy (`sapflow-bench` speaks
+plain HTTP/1.1 only), and Caddy's CPU at that load; Caddy and sapflow on
+separate hosts; and a quiet machine for a long soak, which the drift above
+rules out here. `CADDY_URL` points the script at a Caddy that is already
+running; `CADDY_NETWORK=host` runs the container on Linux's host network.
+
 ## Not yet tried
 
 - Larix on Android.
