@@ -31,6 +31,7 @@ struct OriginPCMProgress {
 
 protocol OriginMediaDecoding: AnyObject {
     var cleanupComplete: Bool { get }
+    func whenCleanupComplete(_ completion: @escaping () -> Void)
     func decode(_ data: Data, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void)
     func close()
 }
@@ -43,7 +44,9 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
     private let lock = NSLock()
     private var job: Job?
     private var closed = false
+    private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return job == nil }
+    func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func decode(_ data: Data, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
         lock.lock()
         guard !closed, job == nil else { let error: OriginObservationFailure = closed ? .cancelled : .busy; lock.unlock(); completion(.failure(error)); return }
@@ -63,13 +66,18 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
                 do { try current.cleanup(); result = .failure((error as? OriginObservationFailure) ?? .decode) }
                 catch { current.report(.failure(.cleanup)); return } // Retain the uncertain owner.
             }
-            lock.withLock { if job === current { job = nil } }
+            let fullyClosed = lock.withLock { () -> Bool in
+                if job === current { job = nil }
+                return closed && job == nil
+            }
+            if fullyClosed { cleanup.complete() }
             current.report(result)
         }
     }
     func close() {
         lock.lock(); closed = true; let old = job; lock.unlock()
         old?.cancel(.cancelled)
+        if old == nil { cleanup.complete() }
     }
 
     private final class Job: @unchecked Sendable {

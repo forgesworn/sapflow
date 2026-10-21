@@ -122,6 +122,27 @@ struct OriginMediaBody {
     }
 }
 
+/// One cold listener, fired only by actual owner cleanup. Registering after
+/// completion is safe; neither registration nor delivery waits or polls.
+final class OriginCleanupNotification: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false, registered = false
+    private var listener: (() -> Void)?
+    func observe(_ listener: @escaping () -> Void) {
+        lock.lock()
+        guard !registered else { lock.unlock(); return }
+        registered = true
+        if completed { lock.unlock(); listener() }
+        else { self.listener = listener; lock.unlock() }
+    }
+    func complete() {
+        lock.lock()
+        guard !completed else { lock.unlock(); return }
+        completed = true; let saved = listener; listener = nil; lock.unlock()
+        saved?()
+    }
+}
+
 /// The same cold lock must order Stop/End/expiry/transport-failure/codec-close
 /// against final SDK confirmation. No socket, storage, decode, close/join or
 /// notification callback belongs inside it.
@@ -129,18 +150,56 @@ final class OriginConfirmationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var authority: OriginCurrentAuthority?
     private var closed = false
-    func replace(_ next: OriginCurrentAuthority) throws {
+    private var active = false
+    private var destination: UInt64?
+    private var sdkGeneration: UInt64?
+    private var newestToken: UInt64 = 0, newestSDKAttempt: UInt64 = 0, newestCodecEpoch: UInt64 = 0, closedCodecEpoch: UInt64 = 0
+    /// Stage before constructing a transport. Reusing a failed token or SDK
+    /// attempt cannot reopen it, including after a delayed queued callback.
+    func stage(_ next: OriginCurrentAuthority, clock: () -> UInt64) throws {
         lock.lock(); defer { lock.unlock() }
-        guard !closed else { throw OriginObservationFailure.cancelled }; authority = next
+        let local = next.attempt.local
+        guard !closed, local.codecEpoch > closedCodecEpoch, local.codecEpoch >= newestCodecEpoch,
+              local.token > newestToken, local.sdkAttempt > newestSDKAttempt,
+              destination == nil || destination == local.destination,
+              sdkGeneration == nil || sdkGeneration == local.sdkGeneration,
+              next.permits(next.attempt, nowNs: clock()) else { throw OriginObservationFailure.scope }
+        destination = local.destination; sdkGeneration = local.sdkGeneration
+        newestToken = local.token; newestSDKAttempt = local.sdkAttempt; newestCodecEpoch = local.codecEpoch
+        authority = next; active = false
     }
-    func invalidate() { lock.lock(); authority = nil; lock.unlock() }
+    /// Accepted plus complete startup Sending is a one-shot admission to
+    /// observation. It cannot reconstruct authority cleared by a cold fence.
+    func activate(_ attempt: V4vObservedAttempt, clock: () -> UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, !active, authority?.permits(attempt, nowNs: clock()) == true else { return false }
+        active = true; return true
+    }
+    func refresh(_ next: OriginCurrentAuthority, clock: () -> UInt64) throws {
+        lock.lock(); defer { lock.unlock() }
+        let now = clock()
+        guard !closed, let current = authority, current.permits(next.attempt, nowNs: now),
+              next.permits(current.attempt, nowNs: now), next.grant.identity.revision >= current.grant.identity.revision,
+              next.expiresAtNs >= current.expiresAtNs else { throw OriginObservationFailure.scope }
+        authority = next // Preserve staged/active state; refresh never activates.
+    }
+    func invalidate() { lock.lock(); authority = nil; active = false; lock.unlock() }
     func invalidate(attempt: V4vObservedAttempt) {
         lock.lock(); defer { lock.unlock() }
-        if authority?.attempt == attempt { authority = nil }
+        if authority?.attempt == attempt { authority = nil; active = false }
     }
-    func close() { lock.lock(); closed = true; authority = nil; lock.unlock() }
+    func invalidate(local: OriginAttemptIdentity) {
+        lock.lock(); defer { lock.unlock() }
+        if authority?.attempt.local == local { authority = nil; active = false }
+    }
+    func closeEpoch(_ epoch: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        closedCodecEpoch = max(closedCodecEpoch, epoch)
+        if let current = authority, current.attempt.local.codecEpoch <= closedCodecEpoch { authority = nil; active = false }
+    }
+    func close() { lock.lock(); closed = true; authority = nil; active = false; lock.unlock() }
     func permits(_ attempt: V4vObservedAttempt, nowNs: UInt64) -> Bool {
-        lock.lock(); defer { lock.unlock() }; return !closed && authority?.permits(attempt, nowNs: nowNs) == true
+        lock.lock(); defer { lock.unlock() }; return !closed && active && authority?.permits(attempt, nowNs: nowNs) == true
     }
     func confirm(_ attempt: V4vObservedAttempt, beforeNs: UInt64, clock: () -> UInt64,
                  apply: (OriginAttemptIdentity, UInt64) throws -> Void) throws {
@@ -148,7 +207,7 @@ final class OriginConfirmationGate: @unchecked Sendable {
         // The lock may have waited across expiry. Sample after acquisition,
         // including the original observation and bearer-permit deadline.
         let nowNs = clock()
-        guard !closed, nowNs < beforeNs, authority?.permits(attempt, nowNs: nowNs) == true else { throw OriginObservationFailure.scope }
+        guard !closed, active, nowNs < beforeNs, authority?.permits(attempt, nowNs: nowNs) == true else { throw OriginObservationFailure.scope }
         // The caller invokes only mediaConfirmedForAttempt with these captured
         // SDK fields. It must not fetch a newer SDK snapshot to replace them.
         try apply(attempt.local, nowNs)

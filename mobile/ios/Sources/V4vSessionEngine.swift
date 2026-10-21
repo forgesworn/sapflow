@@ -23,6 +23,13 @@ struct V4vObservationStatusPermit: CustomStringConvertible, CustomDebugStringCon
     var debugDescription: String { description }
 }
 
+struct V4vPublishingGrantPermit: CustomStringConvertible, CustomDebugStringConvertible {
+    let grant: V4vGrant
+    let expiresAtNs: UInt64
+    var description: String { "V4V publishing authority (redacted)" }
+    var debugDescription: String { description }
+}
+
 /// Runtime-free, single serial owner. It stages exact durable requests; the
 /// caller runs HTTP asynchronously and returns the captured operation. No timer,
 /// automatic capture start, signer, socket or camera is owned here.
@@ -43,6 +50,13 @@ final class V4vSessionEngine {
     private(set) var pending: V4vOperation?
     private(set) var session: V4vSessionReceipt?
     private var grant: V4vGrant?
+
+    /// Immutable composition check, safe before allocating another client.
+    /// A bearer owned by this engine must never be routed by a different
+    /// control or playback profile, even if that profile is otherwise valid.
+    func requireProfile(_ candidate: V4vConnectorProfile) throws {
+        guard candidate == profile else { throw V4vFailure.invalidProfile }
+    }
 
     init(profile: V4vConnectorProfile, store: V4vJournalStore, clock: V4vClock, fencePublisher: @escaping () -> Void) throws {
         guard clock.wallMs > 0, clock.wallMs <= V4vJSON.maxEpoch else { throw V4vFailure.bounds }
@@ -261,6 +275,13 @@ final class V4vSessionEngine {
         guard !restoredRequiresRefresh, !terminalIntent, pending == nil, expiredScope == nil, let grant, session?.identity == grant.identity,
               session?.permitsGrant == true, grant.expiresMs > lastMs, grant.maxPublishBps >= 4_000_000 else { throw V4vFailure.terminal }
         return grant
+    }
+    /// Use this effective, rollback-resistant deadline for the independent
+    /// publishing expiry alarm. Raw wall time must never extend a grant.
+    func publishingGrant(clock: V4vClock) throws -> V4vPublishingGrantPermit {
+        let grant = try captureGrant(clock: clock)
+        guard grant.expiresMs > lastMs, grant.expiresMs - lastMs <= (UInt64.max - clock.monotonicNs) / 1_000_000 else { throw V4vFailure.bounds }
+        return V4vPublishingGrantPermit(grant: grant, expiresAtNs: clock.monotonicNs + (grant.expiresMs - lastMs) * 1_000_000)
     }
     func close() { if !closed { closed = true; fencePublisher() } }
     private static func identityJSON(_ id: V4vIdentity) -> V4vJSON {

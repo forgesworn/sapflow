@@ -28,6 +28,7 @@ protocol EncodedPublishingSink: AnyObject {
     var status: String { get }
     var cleanupComplete: Bool { get }
     func endDestination()
+    func closeCodecEpoch()
     func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void)
     func start() throws
     func configure(video: MediaCodec, audio: MediaCodec) throws
@@ -39,6 +40,7 @@ protocol EncodedPublishingSink: AnyObject {
 extension EncodedPublishingSink {
     var cleanupComplete: Bool { true }
     func endDestination() { stop() }
+    func closeCodecEpoch() {}
     func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void) { stop { completion(.success(())) } }
     func configure(video: MediaCodec, audio: MediaCodec) throws {}
     func stop(completion: @escaping () -> Void) { stop(); completion() }

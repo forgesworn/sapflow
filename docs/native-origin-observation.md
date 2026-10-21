@@ -3,7 +3,8 @@
 An origin status or fresh media resource establishes encoded availability.
 Remote-media confirmation additionally requires actual decoded video and audio
 from resources belonging to the current publishing attempt. The native apps
-still need their authenticated fetch, attempt correlation and decoder wiring.
+have source components for authenticated fetch, attempt correlation and decoding.
+Normal application wiring and physical qualification remain separate gates.
 
 The macOS regression below establishes a smaller prerequisite: Apple's native
 reader can decode Sapflow's exact initialisation object plus one completed
@@ -129,10 +130,14 @@ an older observer's cancellation cannot invalidate a successor attempt.
 No observer failure changes the protocol retry budget or stops local recording.
 
 Cancellation fences confirmation immediately and requests asynchronous
-cleanup. The owner must retain an observer until `cleanupComplete`, including
+cleanup. The owner must retain an observer until actual cleanup, including
 after an error. A two-second cleanup-reporting limit does not turn an unfinished
 native call into released capacity. Actual URLSession invalidation callbacks,
 native cancellation completion and owned scratch removal establish cleanup.
+`V4vObservationSlot` retains the active observer until its actual cleanup
+notification, without polling. One latest pending attempt may wait without
+allocating a client or decoder; it retains its original observation deadline.
+Uncertain cleanup does not admit a successor or reset its deadline.
 The generated-media harness binds decoder temporary files to its own scratch,
 so its parent can also remove them after a subprocess timeout or forced exit.
 
@@ -147,6 +152,30 @@ Run the actual host policy/pipeline tests with:
 ```sh
 bash mobile/ios/test-origin-observation.sh
 ```
+
+`V4vObservedPublisher` composes this observer with the existing capture sink,
+logical reconnect owner and owned SRT transport. It captures the real SDK
+generation and attempt before constructing each transport, uses a fresh
+connection nonce, and admits observation only after acceptance and complete
+startup sending. Its confirmation bridge applies to that same native session.
+Codec close fences confirmation before encoder flushing; recording stays
+independent. Scoped SRT queue and pacing limits can reduce the manual adapter's
+caps, and a separate monotonic alarm ends expired publishing authority even
+while the control owner is blocked. Acknowledged refresh can extend a still
+valid lease, but cannot revive an expired or ended one.
+The engine and publisher must share the exact reviewed control/playback profile;
+mismatched composition is rejected before allocating a status client.
+
+The combined host gate uses the actual packaged Rust session and policy with
+simulated transport, status and decoder facts. It passes 41 tests, including
+fresh proof, rotation, synchronous Stop and refresh/expiry races:
+
+```sh
+bash mobile/ios/test-observed-publisher.sh
+```
+
+This adapter is not yet selected by the normal creator application flow. These
+host tests do not establish actual transport, phone decoding or camera behaviour.
 
 Exercise the production decoder against newly generated origin media with:
 

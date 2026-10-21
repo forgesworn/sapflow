@@ -36,12 +36,55 @@ private enum OriginFixture {
     }
     static func gate(_ clock: OriginTestClock) throws -> OriginConfirmationGate {
         let gate = OriginConfirmationGate()
-        try gate.replace(OriginCurrentAuthority(attempt: scope(), grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: clock.base + 60_000_000_000))
+        try gate.stage(OriginCurrentAuthority(attempt: scope(), grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: clock.base + 60_000_000_000), clock: { clock.base })
+        XCTAssertTrue(try gate.activate(scope(), clock: { clock.base }))
         return gate
     }
 }
 
 final class OriginObservationPolicyTests: XCTestCase {
+    func testStatusCompositionRejectsAnotherProfileBeforeAllocatingClient() throws {
+        final class Store: V4vJournalStore { func load() -> V4vJSON? { nil }; func save(_ next: V4vJSON) {} }
+        final class NeverClient: OriginStatusControlExecuting {
+            var cleanupComplete: Bool { true }
+            func execute(_ call: V4vHTTPCall, completion: @escaping (Result<V4vJSON, V4vFailure>) -> Void) { XCTFail("Mismatched profile executed a bearer request") }
+            func close() {}
+        }
+        let profile = try V4vFixture.profile(), queue = DispatchQueue(label: "origin.profile.binding")
+        let engine = try V4vSessionEngine(profile: profile, store: Store(), clock: V4vFixture.clock(), fencePublisher: {})
+        try engine.installAuthenticatedSession(pubkey: String(repeating: "a", count: 64), token: "generated-fixture-bearer", maxAgeSeconds: 60, clock: V4vFixture.clock())
+        var clients = 0
+        for candidate in [
+            try V4vConnectorProfile(apiOrigin: "https://another.example.invalid", playbackOrigin: profile.playbackOrigin, playbackPrefix: profile.playbackPrefix),
+            try V4vConnectorProfile(apiOrigin: profile.apiOrigin, playbackOrigin: "https://another.example.invalid", playbackPrefix: profile.playbackPrefix),
+            try V4vConnectorProfile(apiOrigin: profile.apiOrigin, playbackOrigin: profile.playbackOrigin, playbackPrefix: "/another/live/")
+        ] {
+            XCTAssertThrowsError(try V4vOriginStatusHTTP(profile: candidate, engine: engine, owner: queue, clock: { V4vFixture.clock() }, makeClient: { _ in clients += 1; return NeverClient() }))
+        }
+        XCTAssertEqual(clients, 0)
+        XCTAssertNoThrow(try engine.requireProfile(profile))
+    }
+    func testScopedSRTLimitsConvertBitsAndNeverEnlargeManualCaps() throws {
+        let scoped = try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 4_000_007)
+        XCTAssertEqual(scoped.queueBytes, 65_536); XCTAssertEqual(scoped.bandwidthBytesPerSecond, 500_000)
+        XCTAssertEqual(try SrtPublishingLimits.scoped(maxQueueBytes: 4_194_304, maxPublishBps: .max), .manual)
+        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 1499, maxPublishBps: 4_000_000))
+        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 4_194_305, maxPublishBps: 4_000_000))
+        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 1500, maxPublishBps: 3_999_999))
+    }
+    func testPublishingExpiryUsesEffectiveClockAfterWallRollback() throws {
+        final class Store: V4vJournalStore { var value: V4vJSON?; func load() -> V4vJSON? { value }; func save(_ next: V4vJSON) { value = next } }
+        let store = Store(), fences = OriginTestBox(0)
+        let engine = try V4vSessionEngine(profile: V4vFixture.profile(), store: store, clock: V4vFixture.clock(), fencePublisher: { fences.update { $0 += 1 } })
+        try engine.installAuthenticatedSession(pubkey: String(repeating: "a", count: 64), token: "generated-fixture-bearer", maxAgeSeconds: 60, clock: V4vFixture.clock())
+        try engine.stagePrepare(event: V4vFixture.event, expectedGeneration: 0, key: V4vFixture.key, clock: V4vFixture.clock())
+        try engine.applyResponse(V4vFixture.answer(), for: XCTUnwrap(engine.pending), clock: V4vFixture.clock())
+        let permit = try engine.publishingGrant(clock: V4vFixture.clock(50_000, wall: 1))
+        XCTAssertEqual(permit.expiresAtNs, 60_000_000_000)
+        XCTAssertFalse(String(reflecting: permit).contains("generated-fixture-bearer"))
+        XCTAssertThrowsError(try engine.publishingGrant(clock: V4vFixture.clock(60_000, wall: 1)))
+        XCTAssertGreaterThan(fences.value, 0)
+    }
     func testCapturedSDKIdentityRejectsZeroFields() {
         for index in 0..<5 {
             var fields: [UInt64] = [1, 2, 3, 4, 5]; fields[index] = 0
@@ -152,9 +195,43 @@ final class OriginObservationPolicyTests: XCTestCase {
         let clock = OriginTestClock(), gate = try OriginFixture.gate(clock), old = try OriginFixture.scope()
         let next = try V4vObservedAttempt(local: OriginAttemptIdentity(destination: 1, codecEpoch: 2, token: 4, sdkGeneration: 4, sdkAttempt: 6), grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), nonce: String(repeating: "d", count: 32))
         let authority = try OriginCurrentAuthority(attempt: next, grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: clock.base + 60_000_000_000)
-        try gate.replace(authority)
+        try gate.stage(authority, clock: { clock.base })
+        XCTAssertTrue(gate.activate(next, clock: { clock.base }))
         XCTAssertThrowsError(try gate.confirm(old, beforeNs: .max, clock: { clock.base }) { _, _ in XCTFail("Old SDK scope") })
-        gate.close(); XCTAssertThrowsError(try gate.replace(authority))
+        gate.close(); XCTAssertThrowsError(try gate.stage(authority, clock: { clock.base }))
+    }
+    func testStagedAttemptNeedsStartupAndCannotActivateAfterFailure() throws {
+        let clock = OriginTestClock(), gate = OriginConfirmationGate(), scope = try OriginFixture.scope()
+        let authority = try OriginCurrentAuthority(attempt: scope, grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: clock.base + 60_000_000_000)
+        try gate.stage(authority, clock: { clock.base })
+        XCTAssertFalse(gate.permits(scope, nowNs: clock.base))
+        gate.invalidate(attempt: scope)
+        XCTAssertFalse(gate.activate(scope, clock: { clock.base }))
+        XCTAssertThrowsError(try gate.stage(authority, clock: { clock.base }))
+        XCTAssertThrowsError(try gate.confirm(scope, beforeNs: .max, clock: { clock.base }) { _, _ in XCTFail("Failed startup reopened") })
+    }
+    func testClosedCodecEpochRefusesQueuedStageButPreservesLaterEpoch() throws {
+        let clock = OriginTestClock(), gate = OriginConfirmationGate(), old = try OriginFixture.scope()
+        let grant = try V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time)
+        gate.closeEpoch(2)
+        XCTAssertThrowsError(try gate.stage(OriginCurrentAuthority(attempt: old, grant: grant, expiresAtNs: clock.base + 60_000_000_000), clock: { clock.base }))
+        let next = try V4vObservedAttempt(local: OriginAttemptIdentity(destination: 1, codecEpoch: 3, token: 4, sdkGeneration: 4, sdkAttempt: 6), grant: grant, nonce: String(repeating: "d", count: 32))
+        try gate.stage(OriginCurrentAuthority(attempt: next, grant: grant, expiresAtNs: clock.base + 60_000_000_000), clock: { clock.base })
+        XCTAssertTrue(gate.activate(next, clock: { clock.base }))
+        gate.closeEpoch(2)
+        XCTAssertTrue(gate.permits(next, nowNs: clock.base))
+    }
+    func testGrantRefreshPreservesStagingAndCannotReviveInvalidatedAttempt() throws {
+        let clock = OriginTestClock(), gate = OriginConfirmationGate(), scope = try OriginFixture.scope()
+        let original = try OriginCurrentAuthority(attempt: scope, grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: clock.base + 60_000_000_000)
+        let newer = try OriginCurrentAuthority(attempt: scope, grant: V4vGrant(V4vFixture.grant(2, expiry: V4vFixture.time + 120_000), nowMs: V4vFixture.time), expiresAtNs: clock.base + 120_000_000_000)
+        try gate.stage(original, clock: { clock.base })
+        try gate.refresh(newer, clock: { clock.base })
+        XCTAssertFalse(gate.permits(scope, nowNs: clock.base))
+        XCTAssertTrue(gate.activate(scope, clock: { clock.base }))
+        XCTAssertTrue(gate.permits(scope, nowNs: clock.base + 70_000_000_000))
+        gate.invalidate(attempt: scope)
+        XCTAssertThrowsError(try gate.refresh(newer, clock: { clock.base }))
     }
     func testNativeDecoderRefusesEmptyInputAndCloseBeforeAdmission() {
         let decoder = OriginMediaDecoder(), callback = expectation(description: "empty")
@@ -188,9 +265,10 @@ final class OriginObservationPolicyTests: XCTestCase {
             let issued = DispatchSemaphore(value: 0)
             let pending = OriginTestBox<((Result<V4vJSON, V4vFailure>) -> Void)?>(nil)
             let closed = OriginTestBox(false)
+            var onClosed: (() -> Void)?
             var cleanupComplete: Bool { closed.value }
             func execute(_ call: V4vHTTPCall, completion: @escaping (Result<V4vJSON, V4vFailure>) -> Void) { pending.value = completion; issued.signal() }
-            func close() { closed.value = true }
+            func close() { closed.value = true; onClosed?() }
         }
         let fences = OriginTestBox(0), store = Store(), queue = DispatchQueue(label: "origin.status.refresh.regression")
         let engine = try V4vSessionEngine(profile: V4vFixture.profile(), store: store, clock: V4vFixture.clock(), fencePublisher: { fences.update { $0 += 1 } })
@@ -198,7 +276,7 @@ final class OriginObservationPolicyTests: XCTestCase {
         try engine.stagePrepare(event: V4vFixture.event, expectedGeneration: 0, key: V4vFixture.key, clock: V4vFixture.clock())
         try engine.applyResponse(V4vFixture.answer(), for: XCTUnwrap(engine.pending), clock: V4vFixture.clock())
         let client = Control(), done = expectation(description: "stale read refused")
-        let status = try V4vOriginStatusHTTP(profile: V4vFixture.profile(), engine: engine, owner: queue, clock: { V4vFixture.clock() }, client: client)
+        let status = try V4vOriginStatusHTTP(profile: V4vFixture.profile(), engine: engine, owner: queue, clock: { V4vFixture.clock() }, makeClient: { client.onClosed = $0; return client })
         status.fresh(try OriginFixture.scope()) { answer in
             if case .success = answer { XCTFail("Old revision must not become observation authority") }
             done.fulfill()
@@ -220,24 +298,31 @@ final class OriginObservationPolicyTests: XCTestCase {
 private final class OriginFakeStatus: OriginSessionStatusFetching {
     let pending = OriginTestBox<[(Result<OriginStatusSnapshot, OriginObservationFailure>) -> Void]>([])
     let closed = OriginTestBox(false)
+    private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { closed.value }
+    func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func fresh(_ attempt: V4vObservedAttempt, completion: @escaping (Result<OriginStatusSnapshot, OriginObservationFailure>) -> Void) { pending.update { $0.append(completion) } }
-    func close() { closed.value = true }
+    func close() { closed.value = true; cleanup.complete() }
     func reply(_ index: Int, _ receipt: V4vSessionReceipt, expiry: UInt64 = UInt64.max) { pending.value[index](.success(OriginStatusSnapshot(receipt: receipt, expiresAtNs: expiry))) }
 }
 private final class OriginFakeMedia: OriginMediaFetching {
     let closed = OriginTestBox(false)
     let calls = OriginTestBox(0)
+    private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { closed.value }
+    func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func fetch(_ resources: OriginApprovedResources, deadlineNs: UInt64, completion: @escaping (Result<Data, OriginObservationFailure>) -> Void) { calls.update { $0 += 1 }; completion(.success(Data([1]))) }
-    func close() { closed.value = true }
+    func close() { closed.value = true; cleanup.complete() }
 }
 private final class OriginFakeDecoder: OriginMediaDecoding {
     let callbacks = OriginTestBox<[(Result<OriginDecodedMedia, OriginObservationFailure>) -> Void]>([])
     let cleaned = OriginTestBox(true)
+    private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { cleaned.value }
+    func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func decode(_ data: Data, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) { callbacks.update { $0.append(completion) } }
-    func close() {}
+    func close() { if cleaned.value { cleanup.complete() } }
+    func completeCleanup() { cleaned.value = true; cleanup.complete() }
     func reply(_ result: Result<OriginDecodedMedia, OriginObservationFailure> = .success(OriginDecodedMedia(videoOutputs: 2, pcmFrames: 7104, pcmOutputs: 1, hardwareVideo: true))) { callbacks.value[0](result) }
 }
 
@@ -280,11 +365,37 @@ final class OriginObservationPipelineTests: XCTestCase {
         h.observer.start { result in originAssertFailure(result); done.fulfill() }
         until { h.status.pending.value.count == 1 }
         let successor = try V4vObservedAttempt(local: OriginAttemptIdentity(destination: 1, codecEpoch: 2, token: 4, sdkGeneration: 4, sdkAttempt: 6), grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), nonce: String(repeating: "d", count: 32))
-        try h.gate.replace(OriginCurrentAuthority(attempt: successor, grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: h.clock.base + 60_000_000_000))
+        try h.gate.stage(OriginCurrentAuthority(attempt: successor, grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: h.clock.base + 60_000_000_000), clock: { h.clock.base })
+        XCTAssertTrue(h.gate.activate(successor, clock: { h.clock.base }))
         h.observer.cancel()
         h.status.reply(0, try OriginFixture.receipt())
         wait(for: [done], timeout: 1)
         XCTAssertTrue(h.gate.permits(successor, nowNs: h.clock.now().monotonicNs))
+        XCTAssertEqual(h.confirmations.value.count, 0)
+    }
+    func testQueuedObservationCannotRestartAnExpiredOriginalDeadline() throws {
+        let h = try Harness(), done = expectation(description: "original deadline expired")
+        h.observer.start(deadlineNs: h.clock.base) { result in originAssertFailure(result); done.fulfill() }
+        wait(for: [done], timeout: 1)
+        XCTAssertTrue(h.status.pending.value.isEmpty)
+        XCTAssertTrue(h.confirmations.value.isEmpty)
+        XCTAssertTrue(h.observer.cleanupComplete)
+    }
+    func testActualLateCleanupNotifiesRetainedSlotWithoutAdoptingFailedProof() throws {
+        let h = try Harness(), failed = expectation(description: "cleanup failure reported"), cleaned = expectation(description: "actual late cleanup")
+        let reports = OriginTestBox(0)
+        h.decoder.cleaned.value = false
+        h.observer.whenCleanupComplete { cleaned.fulfill() }
+        h.observer.start { result in originAssertFailure(result); reports.update { $0 += 1 }; failed.fulfill() }
+        until { h.status.pending.value.count == 1 }; h.status.reply(0, try OriginFixture.receipt())
+        until { h.decoder.callbacks.value.count == 1 }; h.decoder.reply()
+        wait(for: [failed], timeout: 3)
+        XCTAssertFalse(h.observer.cleanupComplete)
+        XCTAssertEqual(h.confirmations.value.count, 0)
+        h.decoder.completeCleanup()
+        wait(for: [cleaned], timeout: 1)
+        XCTAssertTrue(h.observer.cleanupComplete)
+        XCTAssertEqual(reports.value, 1)
         XCTAssertEqual(h.confirmations.value.count, 0)
     }
     func testTransportFenceWinsAfterDecodeBeforePostStatus() throws {
@@ -333,5 +444,108 @@ final class OriginObservationPipelineTests: XCTestCase {
         until { h.status.pending.value.count == 1 }; h.status.reply(0, try OriginFixture.receipt())
         until { h.decoder.callbacks.value.count == 1 }; h.decoder.cleaned.value = false; h.decoder.reply(.failure(.deadline))
         wait(for: [done], timeout: 3); XCTAssertEqual(h.confirmations.value.count, 0); XCTAssertFalse(h.observer.cleanupComplete)
+    }
+}
+
+private final class OriginSlotCandidate {
+    let scope: V4vObservedAttempt
+    let gate: OriginConfirmationGate
+    let clock: OriginTestClock
+    let status = OriginFakeStatus(), media = OriginFakeMedia(), decoder = OriginFakeDecoder()
+    let builds = OriginTestBox(0)
+    let results = OriginTestBox<[Result<OriginDecodedMedia, OriginObservationFailure>]>([])
+    let confirmations = OriginTestBox(0)
+    init(token: UInt64, gate: OriginConfirmationGate, clock: OriginTestClock, destination: UInt64 = 1) throws {
+        self.gate = gate; self.clock = clock
+        let grant = try V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time)
+        scope = try V4vObservedAttempt(local: OriginAttemptIdentity(destination: destination, codecEpoch: 2, token: token, sdkGeneration: 4, sdkAttempt: token + 2), grant: grant, nonce: String(format: "%032llx", token))
+        try gate.stage(OriginCurrentAuthority(attempt: scope, grant: grant, expiresAtNs: clock.base + 60_000_000_000), clock: { clock.now().monotonicNs })
+        XCTAssertTrue(gate.activate(scope, clock: { clock.now().monotonicNs }))
+    }
+    func request(owner: DispatchQueue, deadlineNs: UInt64? = nil, refuseFactory: Bool = false) -> V4vObservationRequest {
+        V4vObservationRequest(attempt: scope, gate: gate, deadlineNs: deadlineNs ?? clock.base + 8_000_000_000, make: {
+            self.builds.update { $0 += 1 }
+            if refuseFactory { throw OriginObservationFailure.unavailable }
+            return try V4vOriginObserver(attempt: self.scope, profile: V4vFixture.profile(), gate: self.gate,
+                status: self.status, media: self.media, decoder: self.decoder, owner: owner, clock: self.clock.now,
+                confirm: { _, _ in self.confirmations.update { $0 += 1 } })
+        }, completed: { result in self.results.update { $0.append(result) } })
+    }
+}
+
+final class OriginObservationSlotTests: XCTestCase {
+    private func until(_ predicate: () -> Bool, file: StaticString = #filePath, line: UInt = #line) {
+        let end = Date().addingTimeInterval(1.5)
+        while Date() < end && !predicate() { Thread.sleep(forTimeInterval: 0.001) }
+        XCTAssertTrue(predicate(), file: file, line: line)
+    }
+    private func decodeStarted(_ candidate: OriginSlotCandidate, slot: V4vObservationSlot, owner: DispatchQueue) throws {
+        owner.sync { slot.submit(candidate.request(owner: owner)) }
+        until { candidate.status.pending.value.count == 1 }
+        candidate.status.reply(0, try OriginFixture.receipt(nonce: candidate.scope.nonce))
+        until { candidate.decoder.callbacks.value.count == 1 }
+    }
+    func testCoalescedLatestSuccessorWaitsForActualCleanupAfterFailure() throws {
+        let owner = DispatchQueue(label: "origin.slot.coalesce"), clock = OriginTestClock(), gate = OriginConfirmationGate()
+        let slot = V4vObservationSlot(owner: owner, clock: clock.now)
+        let old = try OriginSlotCandidate(token: 3, gate: gate, clock: clock); old.decoder.cleaned.value = false
+        try decodeStarted(old, slot: slot, owner: owner)
+        old.decoder.reply(.failure(.decode))
+        let skipped = try OriginSlotCandidate(token: 4, gate: gate, clock: clock)
+        owner.sync { slot.submit(skipped.request(owner: owner)) }
+        let latest = try OriginSlotCandidate(token: 5, gate: gate, clock: clock)
+        owner.sync { slot.submit(latest.request(owner: owner)) }
+        let failure = expectation(description: "semantic failure before actual cleanup")
+        owner.asyncAfter(deadline: .now() + 2.1) { failure.fulfill() }
+        wait(for: [failure], timeout: 3)
+        XCTAssertEqual(old.results.value.count, 1)
+        XCTAssertEqual(skipped.builds.value, 0); XCTAssertEqual(latest.builds.value, 0)
+        old.decoder.completeCleanup()
+        until { latest.builds.value == 1 }
+        XCTAssertEqual(skipped.builds.value, 0); XCTAssertEqual(old.confirmations.value, 0)
+        gate.close(); owner.sync { slot.cancelDestination(1) }
+        until { latest.results.value.count == 1 }
+    }
+    func testOriginalPendingDeadlineCannotRestartAfterOldNativeCleanup() throws {
+        let owner = DispatchQueue(label: "origin.slot.expiry"), clock = OriginTestClock(), gate = OriginConfirmationGate()
+        let slot = V4vObservationSlot(owner: owner, clock: clock.now)
+        let old = try OriginSlotCandidate(token: 3, gate: gate, clock: clock); old.decoder.cleaned.value = false
+        try decodeStarted(old, slot: slot, owner: owner)
+        let next = try OriginSlotCandidate(token: 4, gate: gate, clock: clock)
+        owner.sync { slot.submit(next.request(owner: owner)) }
+        clock.offset.value = 9_000_000_000; old.decoder.completeCleanup()
+        until { next.results.value.count == 1 }
+        XCTAssertEqual(next.builds.value, 0)
+        if case let .failure(reason) = next.results.value[0] { XCTAssertEqual(reason, .deadline) } else { XCTFail("Expired pending probe succeeded") }
+        XCTAssertEqual(old.confirmations.value, 0); gate.close()
+    }
+    func testDestinationEndRemovesItsPendingScopeBeforeLateCleanup() throws {
+        let owner = DispatchQueue(label: "origin.slot.end"), clock = OriginTestClock(), gate = OriginConfirmationGate()
+        let slot = V4vObservationSlot(owner: owner, clock: clock.now)
+        let old = try OriginSlotCandidate(token: 3, gate: gate, clock: clock); old.decoder.cleaned.value = false
+        try decodeStarted(old, slot: slot, owner: owner)
+        let next = try OriginSlotCandidate(token: 4, gate: gate, clock: clock)
+        owner.sync { slot.submit(next.request(owner: owner)); slot.cancelDestination(1) }
+        gate.close(); old.decoder.completeCleanup()
+        until { old.results.value.count == 1 }
+        XCTAssertEqual(next.results.value.count, 1); XCTAssertEqual(next.builds.value, 0)
+    }
+    func testThrowingFactoryDoesNotOccupySlotOrPreventExplicitSuccessor() throws {
+        let owner = DispatchQueue(label: "origin.slot.factory"), clock = OriginTestClock(), gate = OriginConfirmationGate()
+        let slot = V4vObservationSlot(owner: owner, clock: clock.now)
+        let refused = try OriginSlotCandidate(token: 3, gate: gate, clock: clock)
+        owner.sync { slot.submit(refused.request(owner: owner, refuseFactory: true)) }
+        XCTAssertEqual(refused.results.value.count, 1)
+        let next = try OriginSlotCandidate(token: 4, gate: gate, clock: clock)
+        owner.sync { slot.submit(next.request(owner: owner)) }
+        until { next.status.pending.value.count == 1 }; XCTAssertEqual(next.builds.value, 1)
+        gate.close(); owner.sync { slot.cancelDestination(1) }
+        until { next.results.value.count == 1 }
+    }
+    func testActualCleanupNotificationSupportsOneLateListener() {
+        let signal = OriginCleanupNotification(), calls = OriginTestBox(0)
+        signal.complete(); signal.observe { calls.update { $0 += 1 } }
+        signal.complete(); signal.observe { calls.update { $0 += 10 } }
+        XCTAssertEqual(calls.value, 1)
     }
 }

@@ -46,13 +46,22 @@ app: creator sign-in, application wiring and real Keychain/network acceptance
 remain open.
 
 Further iOS source adds a finite production origin-observation component with
-23 passing host tests and an iOS 16 compiler check. It requires hardware H264
+36 passing host tests. The earlier component passes an iOS 16 compiler check.
+It requires hardware H264
 decode on iOS 17 or later, real PCM progress, fresh status on both sides of
 decode and a final attempt-scoped SDK confirmation. The generated-media macOS
 gate produces six hardware video outputs and 7,104 PCM frames, rejects
 header-only input and confirms cleanup. Delayed observer replies cannot mutate
 the creator's refreshed grant. This component is separate from application
 wiring, physical iPhone decoding, real creator sign-in and sustained performance.
+The new scoped publisher composes the existing reconnect owner, captured SDK
+attempt, fresh nonce and origin observer. Its combined host gate passes 41
+tests against the actual packaged Rust session, using simulated transport and
+decode facts. A single app-owned observation slot retains uncertain cleanup
+without polling or admitting another decoder. Scoped queue/pacing limits,
+early codec-close fencing and an independent monotonic grant-expiry alarm are
+implemented in source. Normal creator application wiring remains open; the
+installed app has not been replaced by this work.
 
 Test commit `d0643ff` adds a generated-media-only macOS native reader gate.
 The current origin's exact init plus independent part passes independent FFmpeg

@@ -14,6 +14,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     }
     private let observe: (PublishingAttemptEvent, UInt64) -> Void
     private let destination: ManualSrtDestination
+    private let limits: SrtPublishingLimits
     private let queue = DispatchQueue(label: "sapflow.manual-srt", qos: .userInitiated)
     private let lock = NSLock()
     private var generation: UInt64 = 0
@@ -41,7 +42,9 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private var stopDeadlineUs: UInt64?
     private var statusAtUs: UInt64 = 0
 
-    init(destination: ManualSrtDestination, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) { self.destination = destination; self.observe = observe }
+    init(destination: ManualSrtDestination, limits: SrtPublishingLimits = .manual, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) {
+        self.destination = destination; self.limits = limits; self.observe = observe
+    }
     deinit { timer.cancel(); connection?.cancel(); try? publisher?.stop(nowUs: Self.nowUs()) }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
     var status: String { lock.lock(); defer { lock.unlock() }; return currentStatus }
@@ -52,7 +55,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         guard generation < UInt64.max else { lock.unlock(); throw CaptureFailure(message: "Publisher generation exhausted") }
         generation += 1
         let token = generation
-        admission.close(); admission = EncodedWorkBudget(bytes: 4 * 1024 * 1024, count: 128, span: 1)
+        admission.close(); admission = EncodedWorkBudget(bytes: Int(limits.queueBytes), count: 128, span: 1)
         accepting = true; released = false; currentStatus = "Preparing SRT UDP caller · single attempt"
         lock.unlock()
         queue.async {
@@ -112,8 +115,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         }
         let config = NativeSrtConfig(destination: destination.socketAddress, streamId: destination.streamID,
             cipher: destination.encrypted ? .aes256 : nil, latencyMs: 120,
-            maxBufferedPackets: 128, maxBufferedBytes: 4 * 1024 * 1024,
-            maxPacketAgeMs: 1000, maxSampleResidenceMs: 1000, bandwidthBytesPerSecond: 1_250_000)
+            maxBufferedPackets: 128, maxBufferedBytes: limits.queueBytes,
+            maxPacketAgeMs: 1000, maxSampleResidenceMs: 1000, bandwidthBytesPerSecond: limits.bandwidthBytesPerSecond)
         // Foreign String/Data copies cannot promise zeroisation. The Rust key
         // owner zeroises its transferred secret; no credential is logged here.
         publisher = try NativeSrtPublisher(config: config, video: video, audio: audio,
@@ -126,7 +129,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         guard active else { return }
         let bytes = sample.len()
         guard bytes <= UInt64(Int.max), let reservation = budget.reserve(bytes: Int(bytes)) else {
-            if budget.close() { queue.async { self.fail(token, "SRT ingress exceeded 4 MiB / 128 samples / 1 s · local recording continues") } }
+            if budget.close() { queue.async { self.fail(token, "SRT publishing queue exceeded its limits · local recording continues") } }
             return
         }
         let admitted = Self.nowUs()

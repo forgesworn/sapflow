@@ -137,6 +137,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         destinationLock.lock(); let owner = destinationFence; destinationLock.unlock()
         owner?.endDestination()
     }
+    private func fenceCodecEpoch() {
+        destinationLock.lock(); let owner = destinationFence; destinationLock.unlock()
+        owner?.closeCodecEpoch()
+    }
     func setOrientation(_ orientation: CaptureOrientation) {
         control.async {
             guard self.orientationPlan.desired != orientation else { return }
@@ -336,7 +340,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard !stopping else { return }
         stopReason = reason
         let rotationToken = orientationPlan.pending
-        if rotationToken == nil { fencePublishing() }
+        if rotationToken == nil { fencePublishing() } else { fenceCodecEpoch() }
         storageTimer?.cancel(); storageTimer = nil
         setSampleDelivery(false)
         if session.isRunning { session.stopRunning() }

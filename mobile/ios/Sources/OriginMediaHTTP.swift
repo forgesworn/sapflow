@@ -2,6 +2,7 @@ import Foundation
 
 protocol OriginMediaFetching: AnyObject {
     var cleanupComplete: Bool { get }
+    func whenCleanupComplete(_ completion: @escaping () -> Void)
     func fetch(_ resources: OriginApprovedResources, deadlineNs: UInt64, completion: @escaping (Result<Data, OriginObservationFailure>) -> Void)
     func close()
 }
@@ -14,7 +15,9 @@ final class OriginMediaHTTP: NSObject, URLSessionDataDelegate, OriginMediaFetchi
     private let admission = NSLock()
     private var admitted = false, admissionClosed = false
     private var invalidated = false
+    private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { admission.lock(); defer { admission.unlock() }; return admissionClosed && invalidated }
+    func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     private var session: URLSession!
     private var task: URLSessionDataTask?
     private var deadline: DispatchSourceTimer?
@@ -109,5 +112,6 @@ final class OriginMediaHTTP: NSObject, URLSessionDataDelegate, OriginMediaFetchi
     }
     func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
         admission.lock(); invalidated = true; admission.unlock()
+        cleanup.complete()
     }
 }
