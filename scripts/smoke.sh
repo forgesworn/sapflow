@@ -173,7 +173,7 @@ echo "ok   reconnect within grace: same playlist, discontinuity, one recording (
 # SRT passphrase encryption (our own receiver only): a second server that
 # requires it. The right passphrase plays; none, or a wrong one, is refused.
 if [ "$SRT_IMPL" = own ]; then
-  ESRT=18891 EHTTP=127.0.0.1:18887 PASS_E='smoke passphrase 1'
+  ESRT=18891 EHTTP=127.0.0.1:18887 PASS_E=smoke-passphrase-1
   SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret SAPFLOW_SRT_IMPL=own \
   SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
   SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-enc.log" 2>&1 & pids+=($!)
@@ -185,22 +185,22 @@ if [ "$SRT_IMPL" = own ]; then
       -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -c:a aac -b:a 128k \
       -f mpegts - | srt-live-transmit -q -a:no file://con "srt://127.0.0.1:$ESRT?streamid=$1&latency=2000$3"
   }
-  epublish "publish:live/event-enc:pub:secret" 10 "&passphrase=${PASS_E// /%20}&pbkeylen=16" > /dev/null 2>&1 & pids+=($!)
+  epublish "publish:live/event-enc:pub:secret" 10 "&passphrase=$PASS_E&pbkeylen=16" > /dev/null 2>&1 & pids+=($!)
   for _ in $(seq 1 60); do
     curl -sf "http://$EHTTP/live/event-enc/stream.m3u8" -o "$WORK/enc.m3u8" && grep -q _seg "$WORK/enc.m3u8" && break; sleep 0.25
   done
-  grep -q _seg "$WORK/enc.m3u8" || fail "encrypted publish never became a stream"
+  grep -qs _seg "$WORK/enc.m3u8" || { tail -20 "$WORK/sapflow-enc.log" >&2; fail "encrypted publish never became a stream"; }
   einit=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/enc.m3u8")
   curl -s "http://$EHTTP/live/event-enc/$einit" > "$WORK/enc.mp4"
   for s in $(grep '_seg' "$WORK/enc.m3u8"); do curl -s "http://$EHTTP/live/event-enc/$s" >> "$WORK/enc.mp4"; done
   ffmpeg -hide_banner -v error -xerror -i "$WORK/enc.mp4" -f null - || fail "encrypted stream does not decode"
   epublish "publish:live/event-plain:pub:secret" 3 "" > /dev/null 2>&1 || true
-  epublish "publish:live/event-wrong:pub:secret" 3 "&passphrase=not%20the%20passphrase&pbkeylen=16" > /dev/null 2>&1 || true
+  epublish "publish:live/event-wrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" > /dev/null 2>&1 || true
   for e in event-plain event-wrong; do
     [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/$e/index.m3u8")" = 404 ] || fail "$e was accepted"
   done
   grep -q 'wrong passphrase or key length' "$WORK/sapflow-enc.log" || fail "wrong passphrase not logged as refused"
-  grep -q 'not the passphrase' "$WORK/sapflow-enc.log" && fail "a passphrase reached the log"
+  grep -q 'not-the-passphrase' "$WORK/sapflow-enc.log" && fail "a passphrase reached the log"
   echo "ok   SRT passphrase: encrypted publish plays; none or a wrong one refused"
 fi
 echo "PASS"
