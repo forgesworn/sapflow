@@ -2,11 +2,12 @@
 //! Native adapters still fence individual socket attempts and own their timers.
 use crate::BindingError;
 use sapflow_client::session::{
-    Generation, ReconnectPolicy, Session, SessionAction, SessionError, SessionState,
+    Generation, MediaReadiness, ReconnectPolicy, RetryBudgetState, Session, SessionAction,
+    SessionError, SessionState, TransportRecoverySource,
 };
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, uniffi::Enum)]
+#[derive(Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum NativeSessionAction {
     None,
     Connect,
@@ -14,6 +15,7 @@ pub enum NativeSessionAction {
     AwaitGraceDeadline { at_ns: u64 },
     EndDestination,
     GraceExpired,
+    RetryBudgetExhausted,
 }
 impl From<SessionAction> for NativeSessionAction {
     fn from(action: SessionAction) -> Self {
@@ -24,6 +26,7 @@ impl From<SessionAction> for NativeSessionAction {
             SessionAction::AwaitGraceDeadline(at_ns) => Self::AwaitGraceDeadline { at_ns },
             SessionAction::EndDestination => Self::EndDestination,
             SessionAction::GraceExpired => Self::GraceExpired,
+            SessionAction::RetryBudgetExhausted => Self::RetryBudgetExhausted,
         }
     }
 }
@@ -33,6 +36,7 @@ pub enum NativeSessionState {
     Idle,
     Preparing,
     Connecting,
+    Sending,
     Live,
     Reconnecting,
     Interrupted,
@@ -46,6 +50,7 @@ impl From<SessionState> for NativeSessionState {
             SessionState::Idle => Self::Idle,
             SessionState::Preparing => Self::Preparing,
             SessionState::Connecting => Self::Connecting,
+            SessionState::Sending => Self::Sending,
             SessionState::Live => Self::Live,
             SessionState::Reconnecting => Self::Reconnecting,
             SessionState::Interrupted => Self::Interrupted,
@@ -56,9 +61,76 @@ impl From<SessionState> for NativeSessionState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NativeMediaReadiness {
+    Unknown,
+    Confirmed,
+}
+impl From<MediaReadiness> for NativeMediaReadiness {
+    fn from(value: MediaReadiness) -> Self {
+        match value {
+            MediaReadiness::Unknown => Self::Unknown,
+            MediaReadiness::Confirmed => Self::Confirmed,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NativeRetryBudgetState {
+    Available,
+    WindowOpen,
+    Exhausted,
+}
+impl From<RetryBudgetState> for NativeRetryBudgetState {
+    fn from(value: RetryBudgetState) -> Self {
+        match value {
+            RetryBudgetState::Available => Self::Available,
+            RetryBudgetState::WindowOpen => Self::WindowOpen,
+            RetryBudgetState::Exhausted => Self::Exhausted,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NativeTransportRecoverySource {
+    SrtPeerAcknowledgedWatermark,
+    RtmpPeerAcknowledgedWatermark,
+}
+impl From<NativeTransportRecoverySource> for TransportRecoverySource {
+    fn from(value: NativeTransportRecoverySource) -> Self {
+        match value {
+            NativeTransportRecoverySource::SrtPeerAcknowledgedWatermark => {
+                Self::SrtPeerAcknowledgedWatermark
+            }
+            NativeTransportRecoverySource::RtmpPeerAcknowledgedWatermark => {
+                Self::RtmpPeerAcknowledgedWatermark
+            }
+        }
+    }
+}
+impl From<TransportRecoverySource> for NativeTransportRecoverySource {
+    fn from(value: TransportRecoverySource) -> Self {
+        match value {
+            TransportRecoverySource::SrtPeerAcknowledgedWatermark => {
+                Self::SrtPeerAcknowledgedWatermark
+            }
+            TransportRecoverySource::RtmpPeerAcknowledgedWatermark => {
+                Self::RtmpPeerAcknowledgedWatermark
+            }
+        }
+    }
+}
+
 #[derive(uniffi::Record)]
 pub struct NativeSessionSnapshot {
     pub generation: u64,
+    pub attempt_epoch: u64,
+    pub media_readiness: NativeMediaReadiness,
+    pub retry_budget: NativeRetryBudgetState,
+    pub transport_recovery_source: Option<NativeTransportRecoverySource>,
+    pub network_recoveries: u64,
+    /// Original outage boundary, retained when retries are exhausted.
+    pub outage_deadline_ns: Option<u64>,
+    /// Drive this deadline, not the historical outage boundary.
+    pub next_deadline_ns: Option<u64>,
     pub state: NativeSessionState,
     pub transport_connected: bool,
     pub reconnect_deadline_ns: Option<u64>,
@@ -105,7 +177,9 @@ impl NativeSession {
             }
             callback(&mut control.session, current).map_err(|error| match error {
                 SessionError::ClockWentBackwards => BindingError::ClockWentBackwards,
-                SessionError::StaleGeneration => BindingError::StaleSession,
+                SessionError::StaleGeneration | SessionError::StaleAttempt => {
+                    BindingError::StaleSession
+                }
                 _ => BindingError::InvalidSession,
             })
         })
@@ -152,6 +226,34 @@ impl NativeSession {
     pub fn connected(&self, generation: u64, now_ns: u64) -> Result<(), BindingError> {
         self.current(generation, |session, current| {
             session.connected(current, now_ns)
+        })
+    }
+    /// Complete startup media entered this exact attempt; this clears no grace.
+    pub fn sending(
+        &self,
+        generation: u64,
+        attempt_epoch: u64,
+        now_ns: u64,
+    ) -> Result<NativeSessionAction, BindingError> {
+        self.current(generation, |session, current| {
+            session
+                .sending(current, attempt_epoch, now_ns)
+                .map(Into::into)
+        })
+    }
+    /// Only native validated current-attempt peer watermark progress may call
+    /// this. It clears a network outage, never confirms decoded playback.
+    pub fn transport_recovered(
+        &self,
+        generation: u64,
+        attempt_epoch: u64,
+        now_ns: u64,
+        source: NativeTransportRecoverySource,
+    ) -> Result<NativeSessionAction, BindingError> {
+        self.current(generation, |session, current| {
+            session
+                .transport_recovered(current, attempt_epoch, now_ns, source.into())
+                .map(Into::into)
         })
     }
     /// Only observed playable media may call this. A ready socket, publish
@@ -214,13 +316,25 @@ impl NativeSession {
             let stats = control.session.stats();
             Ok(NativeSessionSnapshot {
                 generation: control.session.generation().value(),
+                attempt_epoch: control.session.attempt_epoch(),
+                media_readiness: control.session.media_readiness().into(),
+                retry_budget: control.session.retry_budget().into(),
+                transport_recovery_source: control
+                    .session
+                    .transport_recovery_source()
+                    .map(Into::into),
+                network_recoveries: stats.network_recoveries,
+                outage_deadline_ns: control.session.outage_deadline_ns(),
+                next_deadline_ns: control.session.next_deadline_ns(),
                 state: control.session.state().into(),
                 transport_connected: control.session.transport_connected(),
                 reconnect_deadline_ns: control.session.reconnect_deadline_ns(),
                 transport_failures: stats.transport_failures,
                 retry_attempts: stats.retry_attempts,
                 media_confirmations: stats.media_confirmations,
-                stale_callbacks: control.stale_callbacks,
+                stale_callbacks: control
+                    .stale_callbacks
+                    .saturating_add(stats.stale_callbacks),
             })
         })
     }
@@ -232,18 +346,26 @@ mod tests {
     use super::*;
     #[test]
     fn intentional_replacement_preserves_the_logical_session_and_observed_media_gate() {
-        let session = NativeSession::new(90_000).unwrap();
-        let generation = session.start(0).unwrap();
-        session.prepared(generation).unwrap();
-        session.connected(generation, 1).unwrap();
-        session.media_confirmed(generation, 2).unwrap();
+        let session = NativeSession::new(90_000).expect("valid recovery fixture operation");
+        let generation = session.start(0).expect("valid recovery fixture operation");
+        session
+            .prepared(generation)
+            .expect("valid recovery fixture operation");
+        session
+            .connected(generation, 1)
+            .expect("valid recovery fixture operation");
+        session
+            .media_confirmed(generation, 2)
+            .expect("valid recovery fixture operation");
         assert!(matches!(
             session
                 .replace_transport(generation, 200_000_000_000)
-                .unwrap(),
+                .expect("valid recovery fixture operation"),
             NativeSessionAction::Connect
         ));
-        let replaced = session.snapshot().unwrap();
+        let replaced = session
+            .snapshot()
+            .expect("valid recovery fixture operation");
         assert_eq!(replaced.generation, generation);
         assert_eq!(replaced.state, NativeSessionState::Connecting);
         assert!(!replaced.transport_connected);
@@ -254,59 +376,102 @@ mod tests {
             session.media_confirmed(generation, 200_000_000_001),
             Err(BindingError::InvalidSession)
         ));
-        session.connected(generation, 200_000_000_002).unwrap();
+        session
+            .connected(generation, 200_000_000_002)
+            .expect("valid recovery fixture operation");
         assert_eq!(
-            session.snapshot().unwrap().state,
+            session
+                .snapshot()
+                .expect("valid recovery fixture operation")
+                .state,
             NativeSessionState::Connecting
         );
         session
             .media_confirmed(generation, 200_000_000_003)
-            .unwrap();
-        assert_eq!(session.snapshot().unwrap().state, NativeSessionState::Live);
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            session
+                .snapshot()
+                .expect("valid recovery fixture operation")
+                .state,
+            NativeSessionState::Live
+        );
     }
 
     #[test]
     fn replacement_while_reconnecting_preserves_expiry_and_clears_prior_retry() {
-        let session = NativeSession::new(90_000).unwrap();
-        let generation = session.start(0).unwrap();
-        session.prepared(generation).unwrap();
-        session.transport_failed(generation, 10).unwrap();
-        let deadline = session.snapshot().unwrap().reconnect_deadline_ns.unwrap();
+        let session = NativeSession::new(90_000).expect("valid recovery fixture operation");
+        let generation = session.start(0).expect("valid recovery fixture operation");
+        session
+            .prepared(generation)
+            .expect("valid recovery fixture operation");
+        session
+            .transport_failed(generation, 10)
+            .expect("valid recovery fixture operation");
+        let deadline = session
+            .snapshot()
+            .expect("valid recovery fixture operation")
+            .reconnect_deadline_ns
+            .expect("valid recovery fixture operation");
         assert!(matches!(
-            session.replace_transport(generation, 20).unwrap(),
+            session
+                .replace_transport(generation, 20)
+                .expect("valid recovery fixture operation"),
             NativeSessionAction::Connect
         ));
         assert!(matches!(
-            session.tick(generation, 500_000_010).unwrap(),
+            session
+                .tick(generation, 500_000_010)
+                .expect("valid recovery fixture operation"),
             NativeSessionAction::None
         ));
-        let replaced = session.snapshot().unwrap();
+        let replaced = session
+            .snapshot()
+            .expect("valid recovery fixture operation");
         assert_eq!(replaced.state, NativeSessionState::Reconnecting);
         assert_eq!(replaced.reconnect_deadline_ns, Some(deadline));
         assert_eq!(replaced.transport_failures, 1);
         assert_eq!(replaced.retry_attempts, 0);
         assert!(matches!(
-            session.replace_transport(generation, deadline).unwrap(),
+            session
+                .replace_transport(generation, deadline)
+                .expect("valid recovery fixture operation"),
             NativeSessionAction::GraceExpired
         ));
         assert_eq!(
-            session.snapshot().unwrap().state,
+            session
+                .snapshot()
+                .expect("valid recovery fixture operation")
+                .state,
             NativeSessionState::Failed
         );
     }
 
     #[test]
     fn replacement_binding_rejects_clock_rollback_and_stopped_or_stale_generations() {
-        let session = NativeSession::new(90_000).unwrap();
-        let generation = session.start(100).unwrap();
-        session.prepared(generation).unwrap();
-        session.connected(generation, 200).unwrap();
+        let session = NativeSession::new(90_000).expect("valid recovery fixture operation");
+        let generation = session
+            .start(100)
+            .expect("valid recovery fixture operation");
+        session
+            .prepared(generation)
+            .expect("valid recovery fixture operation");
+        session
+            .connected(generation, 200)
+            .expect("valid recovery fixture operation");
         assert!(matches!(
             session.replace_transport(generation, 199),
             Err(BindingError::ClockWentBackwards)
         ));
-        assert!(session.snapshot().unwrap().transport_connected);
-        let stopped = session.stop(generation).unwrap();
+        assert!(
+            session
+                .snapshot()
+                .expect("valid recovery fixture operation")
+                .transport_connected
+        );
+        let stopped = session
+            .stop(generation)
+            .expect("valid recovery fixture operation");
         assert!(matches!(
             session.replace_transport(generation, 201),
             Err(BindingError::StaleSession)
@@ -315,13 +480,18 @@ mod tests {
             session.replace_transport(stopped.generation, 201),
             Err(BindingError::InvalidSession)
         ));
-        session.finish_stop(stopped.generation).unwrap();
+        session
+            .finish_stop(stopped.generation)
+            .expect("valid recovery fixture operation");
         assert!(matches!(
             session.replace_transport(stopped.generation, 201),
             Err(BindingError::InvalidSession)
         ));
         assert_eq!(
-            session.snapshot().unwrap().state,
+            session
+                .snapshot()
+                .expect("valid recovery fixture operation")
+                .state,
             NativeSessionState::Stopped
         );
     }
@@ -332,59 +502,193 @@ mod tests {
             NativeSession::new(3_600_001),
             Err(BindingError::InvalidSession)
         ));
-        let session = NativeSession::new(3_600_000).unwrap();
-        let generation = session.start(100).unwrap();
-        session.prepared(generation).unwrap();
-        session.transport_failed(generation, 250).unwrap();
+        let session = NativeSession::new(3_600_000).expect("valid recovery fixture operation");
+        let generation = session
+            .start(100)
+            .expect("valid recovery fixture operation");
+        session
+            .prepared(generation)
+            .expect("valid recovery fixture operation");
+        session
+            .transport_failed(generation, 250)
+            .expect("valid recovery fixture operation");
         let expected_deadline = 250 + 3_600_000 * 1_000_000u64;
         assert_eq!(
-            session.snapshot().unwrap().reconnect_deadline_ns,
+            session
+                .snapshot()
+                .expect("valid recovery fixture operation")
+                .reconnect_deadline_ns,
             Some(expected_deadline)
         );
         // A second failure retains the actual destination window.
-        session.transport_failed(generation, 2000).unwrap();
+        session
+            .transport_failed(generation, 2000)
+            .expect("valid recovery fixture operation");
         assert_eq!(
-            session.snapshot().unwrap().reconnect_deadline_ns,
+            session
+                .snapshot()
+                .expect("valid recovery fixture operation")
+                .reconnect_deadline_ns,
             Some(expected_deadline)
         );
         assert!(matches!(
-            session.tick(generation, expected_deadline).unwrap(),
+            session
+                .tick(generation, expected_deadline)
+                .expect("valid recovery fixture operation"),
             NativeSessionAction::GraceExpired
         ));
         assert_eq!(
-            session.snapshot().unwrap().state,
+            session
+                .snapshot()
+                .expect("valid recovery fixture operation")
+                .state,
             NativeSessionState::Failed
         );
     }
     #[test]
     fn stop_fences_all_late_callbacks_without_resurrecting_the_show() {
-        let session = NativeSession::new(90_000).unwrap();
-        let generation = session.start(0).unwrap();
+        let session = NativeSession::new(90_000).expect("valid recovery fixture operation");
+        let generation = session.start(0).expect("valid recovery fixture operation");
         assert!(matches!(
-            session.prepared(generation).unwrap(),
+            session
+                .prepared(generation)
+                .expect("valid recovery fixture operation"),
             NativeSessionAction::Connect
         ));
-        session.connected(generation, 1).unwrap();
-        session.transport_failed(generation, 2).unwrap();
-        let stopped = session.stop(generation).unwrap();
+        session
+            .connected(generation, 1)
+            .expect("valid recovery fixture operation");
+        session
+            .transport_failed(generation, 2)
+            .expect("valid recovery fixture operation");
+        let stopped = session
+            .stop(generation)
+            .expect("valid recovery fixture operation");
         assert!(matches!(
             session.connected(generation, 3),
             Err(BindingError::StaleSession)
         ));
-        session.finish_stop(stopped.generation).unwrap();
-        let snapshot = session.snapshot().unwrap();
+        session
+            .finish_stop(stopped.generation)
+            .expect("valid recovery fixture operation");
+        let snapshot = session
+            .snapshot()
+            .expect("valid recovery fixture operation");
         assert_eq!(snapshot.state, NativeSessionState::Stopped);
         assert_eq!(snapshot.stale_callbacks, 1);
         assert!(snapshot.reconnect_deadline_ns.is_none());
     }
     #[test]
     fn zero_destination_grace_is_not_replaced_by_a_default() {
-        let session = NativeSession::new(0).unwrap();
-        let generation = session.start(0).unwrap();
-        session.prepared(generation).unwrap();
+        let session = NativeSession::new(0).expect("valid recovery fixture operation");
+        let generation = session.start(0).expect("valid recovery fixture operation");
+        session
+            .prepared(generation)
+            .expect("valid recovery fixture operation");
         assert!(matches!(
-            session.transport_failed(generation, 1).unwrap(),
+            session
+                .transport_failed(generation, 1)
+                .expect("valid recovery fixture operation"),
             NativeSessionAction::GraceExpired
         ));
+    }
+}
+
+#[cfg(test)]
+mod recovery_binding_tests {
+    use super::*;
+    #[test]
+    fn typed_recovery_fences_attempt_and_never_claims_decoded_media() {
+        let s = NativeSession::new(90_000).expect("valid recovery fixture operation");
+        let g = s.start(0).expect("valid recovery fixture operation");
+        s.prepared(g).expect("valid recovery fixture operation");
+        s.connected(g, 1).expect("valid recovery fixture operation");
+        let attempt = s
+            .snapshot()
+            .expect("valid recovery fixture operation")
+            .attempt_epoch;
+        s.sending(g, attempt, 2)
+            .expect("valid recovery fixture operation");
+        s.transport_failed(g, 3)
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            s.tick(g, 500_000_003)
+                .expect("valid recovery fixture operation"),
+            NativeSessionAction::Connect
+        );
+        s.connected(g, 500_000_004)
+            .expect("valid recovery fixture operation");
+        let next = s
+            .snapshot()
+            .expect("valid recovery fixture operation")
+            .attempt_epoch;
+        assert!(matches!(
+            s.sending(g, attempt, 500_000_005),
+            Err(BindingError::StaleSession)
+        ));
+        s.sending(g, next, 500_000_006)
+            .expect("valid recovery fixture operation");
+        s.transport_recovered(
+            g,
+            next,
+            500_000_007,
+            NativeTransportRecoverySource::SrtPeerAcknowledgedWatermark,
+        )
+        .expect("valid recovery fixture operation");
+        let snapshot = s.snapshot().expect("valid recovery fixture operation");
+        assert_eq!(snapshot.state, NativeSessionState::Sending);
+        assert_eq!(snapshot.media_readiness, NativeMediaReadiness::Unknown);
+        assert_eq!(snapshot.retry_budget, NativeRetryBudgetState::Available);
+        assert_eq!(snapshot.network_recoveries, 1);
+        assert_eq!(snapshot.next_deadline_ns, None);
+        s.media_confirmed(g, 500_000_008)
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            s.snapshot()
+                .expect("valid recovery fixture operation")
+                .media_readiness,
+            NativeMediaReadiness::Confirmed
+        );
+    }
+    #[test]
+    fn unknown_peer_ack_exhausts_permission_not_current_sending_socket() {
+        let s = NativeSession::new(1).expect("valid recovery fixture operation");
+        let g = s.start(0).expect("valid recovery fixture operation");
+        s.prepared(g).expect("valid recovery fixture operation");
+        s.transport_failed(g, 1)
+            .expect("valid recovery fixture operation");
+        s.replace_transport(g, 2)
+            .expect("valid recovery fixture operation");
+        let a = s
+            .snapshot()
+            .expect("valid recovery fixture operation")
+            .attempt_epoch;
+        s.connected(g, 3).expect("valid recovery fixture operation");
+        s.sending(g, a, 4)
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            s.tick(g, 1_000_001)
+                .expect("valid recovery fixture operation"),
+            NativeSessionAction::RetryBudgetExhausted
+        );
+        let snapshot = s.snapshot().expect("valid recovery fixture operation");
+        assert_eq!(snapshot.retry_budget, NativeRetryBudgetState::Exhausted);
+        assert!(snapshot.transport_connected);
+        assert_eq!(snapshot.next_deadline_ns, None);
+        assert_eq!(snapshot.outage_deadline_ns, Some(1_000_001));
+        assert!(matches!(
+            s.transport_recovered(
+                g,
+                a,
+                1_000_002,
+                NativeTransportRecoverySource::RtmpPeerAcknowledgedWatermark
+            ),
+            Err(BindingError::InvalidSession)
+        ));
+        assert_eq!(
+            s.transport_failed(g, 1_000_003)
+                .expect("valid recovery fixture operation"),
+            NativeSessionAction::GraceExpired
+        );
     }
 }

@@ -592,4 +592,101 @@ fn av_tracks_keep_independent_dts_order_through_encrypted_publishing() {
     assert_eq!(received, expected);
     assert_eq!(publisher.stats().mux.accepted_samples, 3);
     assert!(publisher.failure().is_none());
+    assert!(publisher.startup.submitted());
+    assert!(publisher.startup.peer_acknowledged());
+    let mut progress = Vec::new();
+    while let Some(event) = publisher.poll_event() {
+        if matches!(
+            event,
+            PublisherEvent::Sending | PublisherEvent::PeerMediaProgress
+        ) {
+            progress.push(event);
+        }
+    }
+    assert_eq!(
+        progress,
+        vec![PublisherEvent::Sending, PublisherEvent::PeerMediaProgress]
+    );
+}
+
+#[test]
+fn emitted_startup_boundary_requires_current_peer_ack_of_every_chunk() {
+    let now = Instant::now();
+    let (mut publisher, mut listener) = open(config(), now);
+    while publisher.poll_event().is_some() {}
+    publisher
+        .push(now + Duration::from_millis(10), sample(0, 8000))
+        .expect("valid recovery fixture operation");
+    let mut wire = Vec::new();
+    for n in 10..50 {
+        if let Some((_, bytes)) = publisher.poll_transmit(now + Duration::from_millis(n)) {
+            wire.push(bytes);
+        }
+    }
+    assert!(publisher.is_ready());
+    assert!(wire.len() > 1);
+    let target = publisher
+        .startup
+        .end_position()
+        .expect("valid recovery fixture operation");
+    assert_eq!(target, publisher.stats().transport.send.accepted_bytes);
+    assert_eq!(publisher.stats().transport.send.acknowledged_bytes, 0);
+    assert_eq!(publisher.poll_event(), Some(PublisherEvent::Sending));
+    assert_eq!(publisher.poll_event(), None);
+    let at = now + Duration::from_millis(60);
+    listener.handle_datagram(at, source(), &wire[0]);
+    listener.handle_timeout(at + Duration::from_millis(10));
+    while let Some((_, ack)) = listener.poll_transmit() {
+        publisher.handle_datagram(at + Duration::from_millis(10), peer(), &ack);
+    }
+    assert!(publisher.stats().transport.send.acknowledged_bytes < target);
+    assert_eq!(publisher.poll_event(), None);
+    for bytes in &wire[1..] {
+        listener.handle_datagram(at + Duration::from_millis(11), source(), bytes);
+    }
+    listener.handle_timeout(at + Duration::from_millis(25));
+    let mut acknowledgements = Vec::new();
+    while let Some((_, ack)) = listener.poll_transmit() {
+        acknowledgements.push(ack);
+    }
+    let wrong = "127.0.0.1:9002"
+        .parse()
+        .expect("valid recovery fixture operation");
+    for ack in &acknowledgements {
+        publisher.handle_datagram(at + Duration::from_millis(25), wrong, ack);
+    }
+    assert_eq!(publisher.poll_event(), None);
+    for ack in &acknowledgements {
+        publisher.handle_datagram(at + Duration::from_millis(25), peer(), ack);
+    }
+    assert!(publisher.stats().transport.send.acknowledged_bytes >= target);
+    assert_eq!(
+        publisher.poll_event(),
+        Some(PublisherEvent::PeerMediaProgress)
+    );
+    assert_eq!(publisher.poll_event(), None);
+}
+
+#[test]
+fn local_abandonment_closes_and_discards_even_pending_startup_events() {
+    let now = Instant::now();
+    let (mut publisher, _) = open(config(), now);
+    while publisher.poll_event().is_some() {}
+    publisher
+        .push(now + Duration::from_millis(10), sample(0, 8000))
+        .expect("valid recovery fixture operation");
+    for n in 10..30 {
+        publisher.poll_transmit(now + Duration::from_millis(n));
+    }
+    assert!(publisher.startup.submitted());
+    publisher.stop(now + Duration::from_millis(30));
+    assert!(publisher.is_closed());
+    assert!(publisher.stats().transport.send.abandoned_bytes > 0);
+    assert!(!publisher.startup.peer_acknowledged());
+    while let Some(event) = publisher.poll_event() {
+        assert!(!matches!(
+            event,
+            PublisherEvent::Sending | PublisherEvent::PeerMediaProgress
+        ));
+    }
 }

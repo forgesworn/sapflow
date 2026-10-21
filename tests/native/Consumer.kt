@@ -6,6 +6,7 @@ fun main() {
     check(sdkAbiVersion() == 1u)
     checkPackagedStatusLeaseCache()
     checkIntentionalTransportReplacement()
+    checkNetworkRecoveryAxes()
     val input = ByteBuffer.allocateDirect(4)
     input.put(byteArrayOf(1, 2, 3, 4)).flip()
     EncodedBuffer(input).use { sample ->
@@ -23,6 +24,7 @@ fun main() {
         codec.sample(payload, 0, 0, 1024u, 48_000u, false).use { sample ->
             // The mock peer is entirely in memory: no socket or TLS connection.
             NativeRtmpPublisher("live", "synthetic", "rtmp://origin.invalid/live", 0uL, 0uL).use { rtmp ->
+                rtmp.declareTracks(false, true)
                 val pendingHandshake = rtmp.queuedOutputBytes()
                 check(pendingHandshake == 1537uL)
                 try { rtmp.sendAndTakeOutput(sample, 1uL); error("prepublication fused send accepted media") }
@@ -33,7 +35,7 @@ fun main() {
                 val response = ByteBuffer.allocateDirect(3073)
                     .put(3.toByte()).put(ByteArray(1536)).put(c0c1, 1, 1536).flip()
                 rtmp.feed(response, 2uL)
-                rtmp.takeOutput() // C2/connect, never written to a socket
+                var transferredWire = rtmp.takeOutput().size - 1536 // C2 excluded from ACK accounting
                 // Independent fmt-0 AMF0 connect/createStream/Publish.Start replies.
                 val replies = listOf(
                     "AwAAAAAAPhQAAAAAAgAHX3Jlc3VsdAA/8AAAAAAAAAUDAARjb2RlAgAdTmV0Q29ubmVjdGlvbi5Db25uZWN0LlN1Y2Nlc3MAAAk=",
@@ -43,23 +45,37 @@ fun main() {
                 replies.forEachIndexed { index, reply ->
                     val bytes = Base64.getDecoder().decode(reply)
                     rtmp.feed(ByteBuffer.allocateDirect(bytes.size).put(bytes).flip(), (index + 3).toULong())
-                    rtmp.takeOutput()
+                    transferredWire += rtmp.takeOutput().size
                 }
                 val sent: NativeRtmpSendOutput = rtmp.sendAndTakeOutput(sample, 6uL)
                 check(sent.output.isNotEmpty() && sent.output.size <= 8 * 1024 * 1024)
                 check(sent.queuedOutputBytes == 0uL && sent.nextDeadlineMs == null && sent.state == NativeRtmpState.PUBLISHING)
-                codec.sample(payload, 1024, 1024, 1024u, 48_000u, false).use { second ->
+                check(sent.startupSubmitted && !sent.peerMediaProgress)
+                check(rtmp.pollEvent() == NativeRtmpEvent.SENDING)
+                transferredWire += sent.output.size
+                val acknowledgement = ByteBuffer.allocateDirect(16)
+                    .put(byteArrayOf(2, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0)).putInt(transferredWire).flip()
+                rtmp.feed(acknowledgement, 6uL)
+                check(rtmp.pollEvent() == null)
+                codec.sample(ByteBuffer.allocateDirect(4096).put(ByteArray(4096) { 0x21 }).flip(), 1024, 1024, 1024u, 48_000u, false).use { second ->
                     rtmp.send(second)
                     val queued = rtmp.queuedOutputBytes()
                     try { rtmp.sendAndTakeOutput(second, 7uL); error("duplicate fused sample was accepted") }
                     catch (_: NativeRtmpException.InvalidMedia) {}
-                    check(queued > 0uL && rtmp.queuedOutputBytes() == queued && rtmp.takeOutput().isNotEmpty())
+                    check(queued > 0uL && rtmp.queuedOutputBytes() == queued)
+                    val retainedOutput = rtmp.takeOutput()
+                    check(retainedOutput.isNotEmpty())
+                    transferredWire += retainedOutput.size
+                    val guardedAck = ByteBuffer.allocateDirect(16)
+                        .put(byteArrayOf(2, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0)).putInt(transferredWire).flip()
+                    rtmp.feed(guardedAck, 7uL)
+                    check(rtmp.pollEvent() == NativeRtmpEvent.PEER_MEDIA_PROGRESS)
                 }
                 val window = byteArrayOf(2, 0, 0, 0, 0, 0, 5, 6, 0, 0, 0, 0, 0, 0, 0, 1, 0)
                 rtmp.feed(ByteBuffer.allocateDirect(window.size).put(window).flip(), 8uL)
                 codec.sample(payload, 2048, 2048, 1024u, 48_000u, false).use { third ->
                     val blocked: NativeRtmpSendOutput = rtmp.sendAndTakeOutput(third, 9uL)
-                    check(blocked.output.isEmpty() && blocked.queuedOutputBytes > 0uL)
+                    check(blocked.output.size == 1 && blocked.queuedOutputBytes > 0uL)
                     check(blocked.nextDeadlineMs == 1009uL && blocked.state == NativeRtmpState.PUBLISHING)
                 }
                 codec.sample(payload, 3072, 3072, 1024u, 48_000u, false).use { fourth ->
@@ -147,5 +163,33 @@ private fun checkIntentionalTransportReplacement() {
         try { session.replaceTransport(generation, deadline); error("stale replacement accepted") }
         catch (_: BindingException.StaleSession) {}
         check(session.snapshot().generation == cancelled && session.snapshot().state == NativeSessionState.STOPPED)
+    }
+}
+
+private fun checkNetworkRecoveryAxes() {
+    NativeSession(1uL).use { session ->
+        val generation = session.start(0uL)
+        session.prepared(generation)
+        session.transportFailed(generation, 1uL)
+        session.replaceTransport(generation, 2uL)
+        val attempt = session.snapshot().attemptEpoch
+        session.connected(generation, 3uL)
+        session.sending(generation, attempt, 4uL)
+        session.transportRecovered(generation, attempt, 5uL, NativeTransportRecoverySource.SRT_PEER_ACKNOWLEDGED_WATERMARK)
+        val networkOnly = session.snapshot()
+        check(networkOnly.state == NativeSessionState.SENDING && networkOnly.mediaReadiness == NativeMediaReadiness.UNKNOWN)
+        check(networkOnly.retryBudget == NativeRetryBudgetState.AVAILABLE && networkOnly.networkRecoveries == 1uL && networkOnly.nextDeadlineNs == null)
+        session.transportFailed(generation, 10uL)
+        session.replaceTransport(generation, 11uL)
+        val uncertainAttempt = session.snapshot().attemptEpoch
+        session.connected(generation, 12uL)
+        session.sending(generation, uncertainAttempt, 13uL)
+        check(session.tick(generation, 1_000_010uL) == NativeSessionAction.RetryBudgetExhausted)
+        val uncertain = session.snapshot()
+        check(uncertain.transportConnected && uncertain.retryBudget == NativeRetryBudgetState.EXHAUSTED)
+        check(uncertain.nextDeadlineNs == null && uncertain.outageDeadlineNs == 1_000_010uL)
+        try { session.transportRecovered(generation, attempt, 1_000_011uL, NativeTransportRecoverySource.SRT_PEER_ACKNOWLEDGED_WATERMARK); error("stale attempt recovered") }
+        catch (_: BindingException.StaleSession) {}
+        session.cancel(generation)
     }
 }

@@ -32,6 +32,34 @@ do {
 let lifecycleStopped = try lifecycle.snapshot()
 precondition(lifecycleStopped.generation == lifecycleCancelled && lifecycleStopped.state == .stopped)
 
+// Network recovery is distinct from decoded readiness; exercise generated enums.
+let recovery = try NativeSession(graceMs: 1)
+let recoveryGeneration = try recovery.start(nowNs: 0)
+_ = try recovery.prepared(generation: recoveryGeneration)
+_ = try recovery.transportFailed(generation: recoveryGeneration, nowNs: 1)
+_ = try recovery.replaceTransport(generation: recoveryGeneration, nowNs: 2)
+let recoveryAttempt = try recovery.snapshot().attemptEpoch
+try recovery.connected(generation: recoveryGeneration, nowNs: 3)
+_ = try recovery.sending(generation: recoveryGeneration, attemptEpoch: recoveryAttempt, nowNs: 4)
+_ = try recovery.transportRecovered(generation: recoveryGeneration, attemptEpoch: recoveryAttempt, nowNs: 5, source: .srtPeerAcknowledgedWatermark)
+let networkOnly = try recovery.snapshot()
+precondition(networkOnly.state == .sending && networkOnly.mediaReadiness == .unknown)
+precondition(networkOnly.retryBudget == .available && networkOnly.networkRecoveries == 1 && networkOnly.nextDeadlineNs == nil)
+_ = try recovery.transportFailed(generation: recoveryGeneration, nowNs: 10)
+_ = try recovery.replaceTransport(generation: recoveryGeneration, nowNs: 11)
+let uncertainAttempt = try recovery.snapshot().attemptEpoch
+try recovery.connected(generation: recoveryGeneration, nowNs: 12)
+_ = try recovery.sending(generation: recoveryGeneration, attemptEpoch: uncertainAttempt, nowNs: 13)
+let exhaustedAction = try recovery.tick(generation: recoveryGeneration, nowNs: 1_000_010)
+let uncertain = try recovery.snapshot()
+precondition(exhaustedAction == .retryBudgetExhausted && uncertain.transportConnected)
+precondition(uncertain.retryBudget == .exhausted && uncertain.nextDeadlineNs == nil && uncertain.outageDeadlineNs == 1_000_010)
+do {
+    _ = try recovery.transportRecovered(generation: recoveryGeneration, attemptEpoch: recoveryAttempt, nowNs: 1_000_011, source: .srtPeerAcknowledgedWatermark)
+    fatalError("stale attempt recovered")
+} catch BindingError.StaleSession {}
+_ = try recovery.cancel(generation: recoveryGeneration)
+
 var input = Data([1, 2, 3, 4])
 let sample = try EncodedBuffer(bytes: input)
 input.resetBytes(in: 0..<input.count)
@@ -56,6 +84,7 @@ let frame = try codec.sample(bytes: Data([1, 2, 3]), pts: 0, dts: 0,
 // as errors. No destination or networking implementation is attached here.
 let rtmp = try NativeRtmpPublisher(app: "live", streamKey: "synthetic",
     tcUrl: "rtmp://origin.invalid/live", mediaEpochNs: 0, nowMs: 0)
+try rtmp.declareTracks(hasVideo: false, hasAudio: true)
 let pendingHandshake = try rtmp.queuedOutputBytes()
 precondition(pendingHandshake == 1537)
 do {
@@ -71,7 +100,8 @@ var response = Data([3])
 response.append(Data(repeating: 0, count: 1536)) // original S1, no digest version
 response.append(c0c1.dropFirst()) // S2 echoes C1
 try rtmp.feed(bytes: response, nowMs: 2)
-_ = try rtmp.takeOutput() // C2 and connect command, never written to a socket
+let connectWire = try rtmp.takeOutput() // C2 and connect command, never written to a socket
+var transferredWire = connectWire.count - 1536
 // Independent fmt-0 AMF0 connect/createStream/Publish.Start response vectors.
 let replies = [
     "AwAAAAAAPhQAAAAAAgAHX3Jlc3VsdAA/8AAAAAAAAAUDAARjb2RlAgAdTmV0Q29ubmVjdGlvbi5Db25uZWN0LlN1Y2Nlc3MAAAk=",
@@ -80,12 +110,22 @@ let replies = [
 ]
 for (index, reply) in replies.enumerated() {
     try rtmp.feed(bytes: Data(base64Encoded: reply)!, nowMs: UInt64(index + 3))
-    _ = try rtmp.takeOutput()
+    transferredWire += try rtmp.takeOutput().count
 }
 let sent: NativeRtmpSendOutput = try rtmp.sendAndTakeOutput(sample: frame, nowMs: 6)
 precondition(!sent.output.isEmpty && sent.output.count <= 8 * 1024 * 1024)
 precondition(sent.queuedOutputBytes == 0 && sent.nextDeadlineMs == nil && sent.state == .publishing)
-let second = try codec.sample(bytes: Data([4, 5, 6]), pts: 1024, dts: 1024,
+precondition(sent.startupSubmitted && !sent.peerMediaProgress)
+let sendingEvent = try rtmp.pollEvent()
+precondition(sendingEvent == .sending)
+transferredWire += sent.output.count
+var acknowledgedWire = UInt32(transferredWire).bigEndian
+var acknowledgement = Data([2, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0])
+withUnsafeBytes(of: &acknowledgedWire) { acknowledgement.append(contentsOf: $0) }
+try rtmp.feed(bytes: acknowledgement, nowMs: 6)
+let progressEvent = try rtmp.pollEvent()
+precondition(progressEvent == nil)
+let second = try codec.sample(bytes: Data(repeating: 0x21, count: 4096), pts: 1024, dts: 1024,
                              duration: 1024, timescale: 48_000, keyframe: false)
 try rtmp.send(sample: second)
 let queuedBeforeError = try rtmp.queuedOutputBytes()
@@ -96,11 +136,18 @@ do {
 let queuedAfterError = try rtmp.queuedOutputBytes()
 let retainedOutput = try rtmp.takeOutput()
 precondition(queuedBeforeError > 0 && queuedAfterError == queuedBeforeError && !retainedOutput.isEmpty)
+transferredWire += retainedOutput.count
+acknowledgedWire = UInt32(transferredWire).bigEndian
+acknowledgement = Data([2, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0])
+withUnsafeBytes(of: &acknowledgedWire) { acknowledgement.append(contentsOf: $0) }
+try rtmp.feed(bytes: acknowledgement, nowMs: 7)
+let guardedProgress = try rtmp.pollEvent()
+precondition(guardedProgress == .peerMediaProgress)
 try rtmp.feed(bytes: Data([2, 0, 0, 0, 0, 0, 5, 6, 0, 0, 0, 0, 0, 0, 0, 1, 0]), nowMs: 8)
 let third = try codec.sample(bytes: Data([7, 8, 9]), pts: 2048, dts: 2048,
                             duration: 1024, timescale: 48_000, keyframe: false)
 let blocked: NativeRtmpSendOutput = try rtmp.sendAndTakeOutput(sample: third, nowMs: 9)
-precondition(blocked.output.isEmpty && blocked.queuedOutputBytes > 0)
+precondition(blocked.output.count == 1 && blocked.queuedOutputBytes > 0)
 precondition(blocked.nextDeadlineMs == 1009 && blocked.state == .publishing)
 let fourth = try codec.sample(bytes: Data([10, 11, 12]), pts: 3072, dts: 3072,
                              duration: 1024, timescale: 48_000, keyframe: false)

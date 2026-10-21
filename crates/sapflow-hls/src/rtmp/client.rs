@@ -250,6 +250,19 @@ impl Publisher {
         self.peer_acknowledgement
     }
 
+    /// Validated cumulative post-handshake peer byte progress, not playback.
+    pub fn peer_acknowledged_bytes(&self) -> u64 {
+        self.peer_acknowledged
+    }
+    /// Absolute end of FIFO output in the acknowledgement byte coordinate.
+    /// None on overflow; handshake bytes are excluded.
+    pub fn output_end_position(&self) -> Option<u64> {
+        self.sent.checked_add(
+            self.queued_output_bytes()
+                .checked_sub(self.handshake_output_bytes)? as u64,
+        )
+    }
+
     /// Wire bytes transferred after the handshake and not yet cumulatively
     /// acknowledged. Neither transfer nor RTMP acknowledgement proves playback.
     pub fn outstanding_output_bytes(&self) -> u64 {
@@ -1648,6 +1661,38 @@ mod tests {
             assert_eq!(publisher.peer_bandwidth, expected);
             assert_eq!(publisher.peer_limit_type, effective_kind);
         }
+    }
+
+    #[test]
+    fn absolute_watermark_positions_exclude_handshake_and_survive_partial_window_and_wrap() {
+        let mut publisher = client();
+        assert_eq!(publisher.output_end_position(), Some(0));
+        assert_eq!(publisher.take_output().len(), 1537);
+        assert_eq!(publisher.output_end_position(), Some(0));
+        // Use a separately completed handshake fixture, then put the accounting
+        // coordinate just before its specified 32-bit ACK rollover.
+        let mut publisher = client();
+        publish_independently(&mut publisher, 7);
+        publisher.sent = (1u64 << 32) - 8;
+        publisher.peer_acknowledged = publisher.sent;
+        publisher.peer_bandwidth = Some(1);
+        publisher
+            .send_aac_config(&[0x11, 0x90])
+            .expect("configuration");
+        publisher.send_aac(0, &[1, 2, 3]).expect("media");
+        let target = publisher.output_end_position().expect("bounded output end");
+        assert!(target > 1u64 << 32);
+        while publisher.queued_output_bytes() != 0 {
+            assert_eq!(publisher.take_output().len(), 1);
+            assert_eq!(publisher.output_end_position(), Some(target));
+            let transferred = publisher.sent;
+            publisher
+                .feed(&wire(3, 0, &(transferred as u32).to_be_bytes(), 128), 3)
+                .expect("valid independent ACK");
+            assert_eq!(publisher.peer_acknowledged_bytes(), transferred);
+            assert_eq!(publisher.output_end_position(), Some(target));
+        }
+        assert_eq!(publisher.peer_acknowledged_bytes(), target);
     }
 
     #[test]

@@ -14,9 +14,12 @@ pub use media::{FanoutOutcome, MediaCodec, MediaSample, NativeQueueStats, Native
 pub use recording::{
     NativeRecordingError, NativeRecordingMuxer, NativeRecordingStats, RecordingWrite,
 };
-pub use rtmp::{NativeRtmpError, NativeRtmpPublisher, NativeRtmpSendOutput, NativeRtmpState};
+pub use rtmp::{
+    NativeRtmpError, NativeRtmpEvent, NativeRtmpPublisher, NativeRtmpSendOutput, NativeRtmpState,
+};
 pub use session::{
-    NativeSession, NativeSessionAction, NativeSessionSnapshot, NativeSessionState, NativeStopResult,
+    NativeMediaReadiness, NativeRetryBudgetState, NativeSession, NativeSessionAction,
+    NativeSessionSnapshot, NativeSessionState, NativeStopResult, NativeTransportRecoverySource,
 };
 pub use srt::{
     NativeSrtCipher, NativeSrtCloseReason, NativeSrtConfig, NativeSrtDatagram, NativeSrtError,

@@ -16,6 +16,8 @@ pub enum SessionState {
     Idle,
     Preparing,
     Connecting,
+    /// Complete startup media was submitted; decoded playback remains unknown.
+    Sending,
     Live,
     Reconnecting,
     Interrupted,
@@ -32,6 +34,24 @@ pub enum SessionError {
     ClockOverflow,
     GenerationExhausted,
     InvalidPolicy,
+    StaleAttempt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaReadiness {
+    Unknown,
+    Confirmed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryBudgetState {
+    Available,
+    WindowOpen,
+    Exhausted,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportRecoverySource {
+    SrtPeerAcknowledgedWatermark,
+    RtmpPeerAcknowledgedWatermark,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +99,8 @@ pub enum SessionAction {
     AwaitGraceDeadline(u64),
     EndDestination,
     GraceExpired,
+    /// Keep the current bounded sending attempt, but permit no further retry.
+    RetryBudgetExhausted,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +110,7 @@ pub struct SessionStats {
     pub transport_failures: u64,
     pub retry_attempts: u64,
     pub stale_callbacks: u64,
+    pub network_recoveries: u64,
 }
 
 #[derive(Debug)]
@@ -101,6 +124,10 @@ pub struct Session {
     failures_in_window: u32,
     transport_connected: bool,
     stats: SessionStats,
+    attempt_epoch: u64,
+    budget_exhausted: bool,
+    media_readiness: MediaReadiness,
+    recovery_source: Option<TransportRecoverySource>,
 }
 impl Session {
     pub fn new(policy: ReconnectPolicy) -> Self {
@@ -114,6 +141,10 @@ impl Session {
             failures_in_window: 0,
             transport_connected: false,
             stats: SessionStats::default(),
+            attempt_epoch: 0,
+            budget_exhausted: false,
+            media_readiness: MediaReadiness::Unknown,
+            recovery_source: None,
         }
     }
     pub fn generation(&self) -> Generation {
@@ -126,7 +157,66 @@ impl Session {
         self.stats
     }
     pub fn reconnect_deadline_ns(&self) -> Option<u64> {
+        (!self.budget_exhausted)
+            .then_some(self.deadline_ns)
+            .flatten()
+    }
+    pub fn outage_deadline_ns(&self) -> Option<u64> {
         self.deadline_ns
+    }
+    pub fn next_deadline_ns(&self) -> Option<u64> {
+        if self.budget_exhausted
+            || !matches!(
+                self.state,
+                SessionState::Connecting
+                    | SessionState::Reconnecting
+                    | SessionState::Sending
+                    | SessionState::Live
+            )
+        {
+            return None;
+        }
+        [self.deadline_ns, self.retry_at_ns]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+    pub fn attempt_epoch(&self) -> u64 {
+        self.attempt_epoch
+    }
+    pub fn retry_budget(&self) -> RetryBudgetState {
+        if self.budget_exhausted {
+            RetryBudgetState::Exhausted
+        } else if self.deadline_ns.is_some() {
+            RetryBudgetState::WindowOpen
+        } else {
+            RetryBudgetState::Available
+        }
+    }
+    pub fn media_readiness(&self) -> MediaReadiness {
+        self.media_readiness
+    }
+    pub fn transport_recovery_source(&self) -> Option<TransportRecoverySource> {
+        self.recovery_source
+    }
+    fn connect_attempt(&mut self) -> Result<SessionAction, SessionError> {
+        self.attempt_epoch = self
+            .attempt_epoch
+            .checked_add(1)
+            .ok_or(SessionError::GenerationExhausted)?;
+        Ok(SessionAction::Connect)
+    }
+    fn check_attempt(&mut self, generation: Generation, attempt: u64) -> Result<(), SessionError> {
+        self.check(generation)?;
+        if attempt == 0 || attempt != self.attempt_epoch {
+            self.stats.stale_callbacks = self.stats.stale_callbacks.saturating_add(1);
+            return Err(SessionError::StaleAttempt);
+        }
+        Ok(())
+    }
+    fn invalidate_media(&mut self) {
+        self.media_readiness = MediaReadiness::Unknown;
+        self.recovery_source = None;
     }
     pub fn transport_connected(&self) -> bool {
         self.transport_connected
@@ -165,6 +255,8 @@ impl Session {
         self.clock(now_ns)?;
         let generation = self.advance_generation()?;
         self.deadline_ns = None;
+        self.budget_exhausted = false;
+        self.invalidate_media();
         self.retry_at_ns = None;
         self.failures_in_window = 0;
         self.transport_connected = false;
@@ -177,7 +269,7 @@ impl Session {
             return Err(SessionError::InvalidTransition);
         }
         self.state = SessionState::Connecting;
-        Ok(SessionAction::Connect)
+        self.connect_attempt()
     }
     /// A socket handshake does not establish that a viewer can receive media.
     pub fn connected(&mut self, generation: Generation, now_ns: u64) -> Result<(), SessionError> {
@@ -209,23 +301,91 @@ impl Session {
         if !self.transport_connected
             || !matches!(
                 self.state,
-                SessionState::Connecting | SessionState::Reconnecting | SessionState::Live
+                SessionState::Connecting
+                    | SessionState::Reconnecting
+                    | SessionState::Sending
+                    | SessionState::Live
             )
         {
             return Err(SessionError::InvalidTransition);
         }
         self.clock(now_ns)?;
-        if self.state != SessionState::Live
-            && self.deadline_ns.is_some_and(|deadline| now_ns >= deadline)
-        {
-            self.expire();
-            return Err(SessionError::InvalidTransition);
+        if self.deadline_ns.is_some_and(|deadline| now_ns >= deadline) && !self.budget_exhausted {
+            if self.state != SessionState::Sending {
+                self.expire();
+                return Err(SessionError::InvalidTransition);
+            }
+            self.budget_exhausted = true;
+            self.retry_at_ns = None;
         }
         self.state = SessionState::Live;
-        self.deadline_ns = None;
-        self.failures_in_window = 0;
+        self.media_readiness = MediaReadiness::Confirmed;
+        if !self.budget_exhausted {
+            self.deadline_ns = None;
+            self.failures_in_window = 0;
+        }
         self.stats.media_confirmations = self.stats.media_confirmations.saturating_add(1);
         Ok(())
+    }
+    /// Complete declared startup media entered this attempt's bounded transport.
+    /// This is neither acknowledgement nor decoded-media confirmation.
+    pub fn sending(
+        &mut self,
+        generation: Generation,
+        attempt: u64,
+        now_ns: u64,
+    ) -> Result<SessionAction, SessionError> {
+        self.check_attempt(generation, attempt)?;
+        if !self.transport_connected
+            || !matches!(
+                self.state,
+                SessionState::Connecting
+                    | SessionState::Reconnecting
+                    | SessionState::Sending
+                    | SessionState::Live
+            )
+        {
+            return Err(SessionError::InvalidTransition);
+        }
+        self.clock(now_ns)?;
+        if self.deadline_ns.is_some_and(|d| now_ns >= d) && !self.budget_exhausted {
+            return self.tick(generation, now_ns);
+        }
+        if self.state != SessionState::Live {
+            self.state = SessionState::Sending;
+        }
+        Ok(SessionAction::None)
+    }
+    /// Adapter supplies current-attempt cumulative peer progress across the
+    /// complete startup watermark. It proves network progress, never playback.
+    pub fn transport_recovered(
+        &mut self,
+        generation: Generation,
+        attempt: u64,
+        now_ns: u64,
+        source: TransportRecoverySource,
+    ) -> Result<SessionAction, SessionError> {
+        self.check_attempt(generation, attempt)?;
+        if !self.transport_connected
+            || !matches!(self.state, SessionState::Sending | SessionState::Live)
+        {
+            return Err(SessionError::InvalidTransition);
+        }
+        self.clock(now_ns)?;
+        if self.budget_exhausted {
+            return Err(SessionError::InvalidTransition);
+        }
+        if self.deadline_ns.is_some_and(|d| now_ns >= d) {
+            return self.tick(generation, now_ns);
+        }
+        if self.recovery_source.is_none() {
+            self.stats.network_recoveries = self.stats.network_recoveries.saturating_add(1);
+        }
+        self.recovery_source = Some(source);
+        self.deadline_ns = None;
+        self.retry_at_ns = None;
+        self.failures_in_window = 0;
+        Ok(SessionAction::None)
     }
     /// Replace an intentional codec/socket epoch within this logical session.
     /// The adapter must fence and close the old attempt before acting on Connect.
@@ -239,7 +399,10 @@ impl Session {
         self.check(generation)?;
         if !matches!(
             self.state,
-            SessionState::Connecting | SessionState::Live | SessionState::Reconnecting
+            SessionState::Connecting
+                | SessionState::Sending
+                | SessionState::Live
+                | SessionState::Reconnecting
         ) {
             return Err(SessionError::InvalidTransition);
         }
@@ -249,13 +412,14 @@ impl Session {
             return Ok(SessionAction::GraceExpired);
         }
         self.transport_connected = false;
+        self.invalidate_media();
         self.retry_at_ns = None;
         self.state = if self.deadline_ns.is_some() {
             SessionState::Reconnecting
         } else {
             SessionState::Connecting
         };
-        Ok(SessionAction::Connect)
+        self.connect_attempt()
     }
 
     pub fn transport_failed(
@@ -266,7 +430,10 @@ impl Session {
         self.check(generation)?;
         if !matches!(
             self.state,
-            SessionState::Connecting | SessionState::Reconnecting | SessionState::Live
+            SessionState::Connecting
+                | SessionState::Reconnecting
+                | SessionState::Sending
+                | SessionState::Live
         ) {
             return Err(SessionError::InvalidTransition);
         }
@@ -280,6 +447,7 @@ impl Session {
         self.deadline_ns = Some(deadline);
         self.stats.transport_failures = self.stats.transport_failures.saturating_add(1);
         self.transport_connected = false;
+        self.invalidate_media();
         if now_ns >= deadline {
             self.expire();
             return Ok(SessionAction::GraceExpired);
@@ -305,6 +473,8 @@ impl Session {
     }
     fn expire(&mut self) {
         self.state = SessionState::Failed;
+        self.budget_exhausted = true;
+        self.invalidate_media();
         self.retry_at_ns = None;
         self.transport_connected = false;
     }
@@ -318,9 +488,12 @@ impl Session {
         self.clock(now_ns)?;
         if self.deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
             match self.state {
-                SessionState::Live => {
-                    self.deadline_ns = None;
-                    self.failures_in_window = 0;
+                SessionState::Sending | SessionState::Live if self.transport_connected => {
+                    if !self.budget_exhausted {
+                        self.budget_exhausted = true;
+                        self.retry_at_ns = None;
+                        return Ok(SessionAction::RetryBudgetExhausted);
+                    }
                 }
                 SessionState::Connecting | SessionState::Reconnecting => {
                     self.expire();
@@ -334,7 +507,7 @@ impl Session {
         {
             self.retry_at_ns = None;
             self.stats.retry_attempts = self.stats.retry_attempts.saturating_add(1);
-            return Ok(SessionAction::Connect);
+            return self.connect_attempt();
         }
         Ok(SessionAction::None)
     }
@@ -346,6 +519,7 @@ impl Session {
             self.state,
             SessionState::Preparing
                 | SessionState::Connecting
+                | SessionState::Sending
                 | SessionState::Live
                 | SessionState::Reconnecting
         ) {
@@ -353,6 +527,7 @@ impl Session {
         }
         let generation = self.advance_generation()?;
         self.state = SessionState::Interrupted;
+        self.invalidate_media();
         self.retry_at_ns = None;
         self.transport_connected = false;
         Ok(generation)
@@ -372,6 +547,7 @@ impl Session {
         }
         let generation = self.advance_generation()?;
         self.state = SessionState::Stopping;
+        self.invalidate_media();
         self.retry_at_ns = None;
         self.deadline_ns = None;
         self.transport_connected = false;
@@ -391,6 +567,7 @@ impl Session {
         self.check(generation)?;
         let generation = self.advance_generation()?;
         self.state = SessionState::Stopped;
+        self.invalidate_media();
         self.retry_at_ns = None;
         self.deadline_ns = None;
         self.transport_connected = false;
@@ -529,7 +706,8 @@ mod replacement_tests {
                 Ok(SessionAction::GraceExpired)
             );
             assert_eq!(session.state(), SessionState::Failed);
-            assert_eq!(session.reconnect_deadline_ns(), Some(deadline));
+            assert_eq!(session.reconnect_deadline_ns(), None);
+            assert_eq!(session.outage_deadline_ns(), Some(deadline));
             assert!(!session.transport_connected());
             assert_eq!(session.stats().transport_failures, 1);
             assert_eq!(
@@ -627,3 +805,7 @@ mod replacement_tests {
         assert_eq!(session.state(), SessionState::Failed);
     }
 }
+
+#[cfg(test)]
+#[path = "session_recovery_tests.rs"]
+mod recovery_tests;

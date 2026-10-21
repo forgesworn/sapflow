@@ -115,7 +115,7 @@ history or sample list.
 
 ## Session and destination boundary
 
-`session::Session` moves through `Idle`, `Preparing`, `Connecting`, `Live`,
+`session::Session` moves through `Idle`, `Preparing`, `Connecting`, `Sending`, `Live`,
 `Reconnecting`, `Interrupted`, `Stopping`, `Stopped` and `Failed`. `start` returns
 a new opaque `Generation`, supplied to every asynchronous result. `prepared`
 requests `SessionAction::Connect`; `connected` records only the transport
@@ -128,16 +128,20 @@ retry and 8-second maximum delay. Use `ReconnectPolicy::new` with the actual
 destination-configured grace. The `NativeSession` FFI accepts the destination's
 full `0..=3_600_000` millisecond range; larger values are refused rather than
 clamped. Zero grace fails immediately without retry. Repeated failures and socket-only reconnects retain
-the first deadline. At that deadline, `tick` fails the session before attempting
-another connection. `AwaitGraceDeadline` requests only the deadline timer when
+the first deadline. At that deadline, `tick` refuses another connection. An
+already accepted `Sending` attempt may continue with exhausted retry permission;
+a handshake or disconnected attempt fails. `AwaitGraceDeadline` requests only the deadline timer when
 there is insufficient time left for a retry; it never requests a connection at
-or after expiry. Observed media recovery clears the window; a later independent
-outage receives a fresh deadline. Retry is a request to the adapter, never a
+or after expiry. Timely validated peer progress across the current attempt's
+complete startup-media watermark clears the network window, without confirming
+playback. Timely decoded media confirmation also clears the window; a later
+independent outage receives a fresh deadline. See the exact attempt fences,
+optional-ACK behaviour and native API in [transport recovery](transport-recovery.md). Retry is a request to the adapter, never a
 hidden thread or network operation.
 
 `replace_transport(generation, now_ns)` (FFI `replaceTransport`) requests an
 intentional codec/socket replacement within an ongoing logical session. It clears
-the old connected flag and retry timer and returns `Connect`. A healthy `Live` or
+the old connected flag and retry timer and returns `Connect`. A healthy `Live`, `Sending` or
 unconfirmed `Connecting` session returns to `Connecting` without starting a grace
 window or counting a network failure. During an outage it stays `Reconnecting`
 and preserves the exact original deadline and backoff history; at or after that

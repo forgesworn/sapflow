@@ -531,7 +531,8 @@ fn zero_destination_grace_fails_immediately_without_a_retry() {
         session.transport_failed(generation, 7),
         Ok(SessionAction::GraceExpired)
     );
-    assert_eq!(session.reconnect_deadline_ns(), Some(7));
+    assert_eq!(session.outage_deadline_ns(), Some(7));
+    assert_eq!(session.reconnect_deadline_ns(), None);
     assert_eq!(session.state(), SessionState::Failed);
     assert_eq!(session.tick(generation, 7), Ok(SessionAction::None));
     assert_eq!(session.stats().retry_attempts, 0);

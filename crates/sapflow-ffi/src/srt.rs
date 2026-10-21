@@ -139,6 +139,10 @@ pub enum NativeSrtCloseReason {
 }
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum NativeSrtEvent {
+    /// Complete declared startup media entered bounded transport ownership.
+    Sending,
+    /// Peer advanced across its watermark; not lossless or decoded delivery.
+    PeerMediaProgress,
     Connected {
         latency_ms: u32,
         max_payload_bytes: u32,
@@ -464,6 +468,8 @@ impl NativeSrtPublisher {
     pub fn poll_event(&self) -> Result<Option<NativeSrtEvent>, NativeSrtError> {
         let mut state = self.state_guard()?;
         Ok(state.publisher.poll_event().map(|event| match event {
+            PublisherEvent::Sending => NativeSrtEvent::Sending,
+            PublisherEvent::PeerMediaProgress => NativeSrtEvent::PeerMediaProgress,
             PublisherEvent::Transport(CallerEvent::Connected {
                 latency,
                 max_payload,

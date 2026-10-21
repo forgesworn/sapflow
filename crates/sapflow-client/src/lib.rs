@@ -8,6 +8,7 @@ pub mod mpegts;
 pub mod queue;
 pub mod session;
 pub mod srt;
+pub mod transport_progress;
 
 pub use media::{AacConfig, CodecConfig, EncodedSample, H264Config, SampleTiming, SharedSample};
 

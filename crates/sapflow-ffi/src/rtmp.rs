@@ -3,10 +3,16 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use sapflow_client::CodecConfig;
+use sapflow_client::{
+    CodecConfig,
+    transport_progress::{StartupProgressEvent, StartupWatermark},
+};
 use sapflow_hls::rtmp::client::{ClientError, Publisher, PublisherConfig, PublisherState};
 
 use crate::{MAX_ENCODED_BUFFER_BYTES, MediaSample};
+// C0+C1+C2. Proof only: do not infer a counter baseline from the first peer ACK.
+// Existing peer-window accounting remains post-handshake and is unchanged.
+const RTMP_ACK_HANDSHAKE_MARGIN: u64 = 3073;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum NativeRtmpState {
@@ -51,6 +57,14 @@ pub struct NativeRtmpSendOutput {
     pub next_deadline_ms: Option<u64>,
     /// Publication acceptance does not confirm that the origin received media.
     pub state: NativeRtmpState,
+    pub startup_submitted: bool,
+    pub peer_media_progress: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NativeRtmpEvent {
+    Sending,
+    PeerMediaProgress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Error)]
@@ -113,6 +127,7 @@ struct State {
     epoch_ns: u64,
     video: Track,
     audio: Track,
+    startup: Option<StartupWatermark>,
 }
 
 #[derive(uniffi::Object)]
@@ -161,14 +176,69 @@ impl NativeRtmpPublisher {
                 epoch_ns: media_epoch_ns,
                 video: Track::default(),
                 audio: Track::default(),
+                startup: None,
             }),
         }))
     }
 
+    /// Cold immutable track declaration, before the first sample. Legacy callers
+    /// may omit it and publish normally with startup progress unknown.
+    pub fn declare_tracks(&self, has_video: bool, has_audio: bool) -> Result<(), NativeRtmpError> {
+        let mut state = self.state_guard()?;
+        let candidate =
+            StartupWatermark::new(has_video, has_audio).ok_or(NativeRtmpError::InvalidConfig)?;
+        if let Some(current) = &state.startup {
+            return if current.tracks() == candidate.tracks() {
+                Ok(())
+            } else {
+                Err(NativeRtmpError::InvalidConfig)
+            };
+        }
+        if state.video.end_ns.is_some()
+            || state.audio.end_ns.is_some()
+            || matches!(
+                state.publisher.state(),
+                PublisherState::Closed | PublisherState::Failed | PublisherState::Finishing
+            )
+        {
+            return Err(NativeRtmpError::InvalidConfig);
+        }
+        state.startup = Some(candidate);
+        Ok(())
+    }
+    /// Drain after existing socket reads, not by polling per sample. Each event
+    /// occurs at most once per publisher. No payload is retained by events.
+    pub fn poll_event(&self) -> Result<Option<NativeRtmpEvent>, NativeRtmpError> {
+        let mut state = self.state_guard()?;
+        if state.publisher.state() != PublisherState::Publishing {
+            return Ok(None);
+        }
+        Ok(state
+            .startup
+            .as_mut()
+            .and_then(StartupWatermark::poll_event)
+            .map(|event| match event {
+                StartupProgressEvent::Sending => NativeRtmpEvent::Sending,
+                StartupProgressEvent::PeerMediaProgress => NativeRtmpEvent::PeerMediaProgress,
+            }))
+    }
     /// Feed one bounded ordered socket/TLS read. A failure terminates this
     /// attempt. Drop any previously taken but unwritten output on failure.
     pub fn feed(&self, bytes: &[u8], now_ms: u64) -> Result<(), NativeRtmpError> {
-        Ok(self.state_guard()?.publisher.feed(bytes, now_ms)?)
+        let mut state = self.state_guard()?;
+        if let Err(error) = state.publisher.feed(bytes, now_ms) {
+            if let Some(startup) = &mut state.startup {
+                startup.cancel();
+            }
+            return Err(error.into());
+        }
+        let acknowledged = state.publisher.peer_acknowledged_bytes();
+        if state.publisher.state() == PublisherState::Publishing
+            && let Some(startup) = &mut state.startup
+        {
+            startup.acknowledge_with_margin(acknowledged, RTMP_ACK_HANDSHAKE_MARGIN);
+        }
+        Ok(())
     }
 
     pub fn tick(&self, now_ms: u64) -> Result<(), NativeRtmpError> {
@@ -233,6 +303,14 @@ impl NativeRtmpPublisher {
             queued_output_bytes: state.publisher.queued_output_bytes() as u64,
             next_deadline_ms: state.publisher.next_deadline_ms(),
             state: state.publisher.state().into(),
+            startup_submitted: state
+                .startup
+                .as_ref()
+                .is_some_and(StartupWatermark::submitted),
+            peer_media_progress: state
+                .startup
+                .as_ref()
+                .is_some_and(StartupWatermark::peer_acknowledged),
         })
     }
 
@@ -245,6 +323,9 @@ impl NativeRtmpPublisher {
     pub fn cancel(&self) -> Result<(), NativeRtmpError> {
         let mut state = self.state_guard()?;
         state.publisher.cancel();
+        if let Some(startup) = &mut state.startup {
+            startup.cancel();
+        }
         state.video = Track::default();
         state.audio = Track::default();
         Ok(())
@@ -261,6 +342,13 @@ fn send_sample(state: &mut State, sample: &MediaSample) -> Result<(), NativeRtmp
         });
     }
     let encoded = &sample.sample;
+    if state
+        .startup
+        .as_ref()
+        .is_some_and(|m| !m.declares(encoded.is_video()))
+    {
+        return Err(NativeRtmpError::InvalidMedia);
+    }
     let timing = encoded.timing();
     let dts_ns = timing.decode_time_ns();
     let end_ns = timing
@@ -323,6 +411,11 @@ fn send_sample(state: &mut State, sample: &MediaSample) -> Result<(), NativeRtmp
             state.publisher.send_aac(timestamp, encoded.payload())?;
             state.audio.end_ns = Some(end_ns);
         }
+    }
+    if let Some(end) = state.publisher.output_end_position()
+        && let Some(startup) = &mut state.startup
+    {
+        startup.complete_sample(encoded.is_video(), encoded.is_keyframe(), end);
     }
     Ok(())
 }
@@ -395,6 +488,222 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    #[test]
+    fn backpressure_cannot_commit_startup_candidate_or_timing() {
+        let (publisher, _) = ready(0);
+        publisher
+            .declare_tracks(false, true)
+            .expect("valid recovery fixture operation");
+        let codec = MediaCodec::aac(&[0x11, 0x90]).expect("valid recovery fixture operation");
+        let sample = codec
+            .sample(&[1], 0, 0, 1024, 48_000, false)
+            .expect("valid recovery fixture operation");
+        {
+            let mut state = publisher
+                .state_guard()
+                .expect("valid recovery fixture operation");
+            // Fill the already bounded native output, rather than mutate sample limits.
+            while state.publisher.send_aac_config_at(0, &[0x11, 0x90]).is_ok() {}
+        }
+        assert_eq!(publisher.send(sample), Err(NativeRtmpError::Backpressure));
+        let state = publisher
+            .state_guard()
+            .expect("valid recovery fixture operation");
+        assert!(
+            !state
+                .startup
+                .as_ref()
+                .expect("valid recovery fixture operation")
+                .submitted()
+        );
+        assert_eq!(state.audio.end_ns, None);
+    }
+
+    fn peer_ack(end: u64) -> Vec<u8> {
+        let mut wire = vec![2, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0];
+        wire.extend_from_slice(&(end as u32).to_be_bytes());
+        wire
+    }
+
+    #[test]
+    fn startup_watermark_requires_complete_idr_then_audio_and_exact_peer_wire_ack() {
+        let (publisher, _) = ready(0);
+        publisher
+            .declare_tracks(true, true)
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            publisher.declare_tracks(false, true),
+            Err(NativeRtmpError::InvalidConfig)
+        );
+        let video = MediaCodec::h264(SPS, PPS).expect("valid recovery fixture operation");
+        let audio = MediaCodec::aac(&[0x11, 0x90]).expect("valid recovery fixture operation");
+        let early_audio = audio
+            .sample(&[1], 0, 0, 1024, 48_000, false)
+            .expect("valid recovery fixture operation");
+        let early = publisher
+            .send_and_take_output(early_audio, 2)
+            .expect("valid recovery fixture operation");
+        assert!(!early.startup_submitted && !early.peer_media_progress);
+        let idr = video
+            .sample(&[0, 0, 0, 2, 0x65, 0x80], 0, 0, 3000, 90_000, true)
+            .expect("valid recovery fixture operation");
+        let idr = publisher
+            .send_and_take_output(idr, 3)
+            .expect("valid recovery fixture operation");
+        assert!(!idr.startup_submitted);
+        let next_audio = audio
+            .sample(&[2], 1024, 1024, 1024, 48_000, false)
+            .expect("valid recovery fixture operation");
+        let result = publisher
+            .send_and_take_output(next_audio, 4)
+            .expect("valid recovery fixture operation");
+        assert!(result.startup_submitted && !result.peer_media_progress);
+        assert_eq!(
+            publisher
+                .poll_event()
+                .expect("valid recovery fixture operation"),
+            Some(NativeRtmpEvent::Sending)
+        );
+        let target = publisher
+            .state_guard()
+            .expect("valid recovery fixture operation")
+            .startup
+            .as_ref()
+            .expect("valid recovery fixture operation")
+            .end_position()
+            .expect("valid recovery fixture operation");
+        publisher
+            .feed(&peer_ack(target - 1), 5)
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            publisher
+                .poll_event()
+                .expect("valid recovery fixture operation"),
+            None
+        );
+        publisher
+            .feed(&peer_ack(target), 6)
+            .expect("bare target ACK");
+        assert_eq!(publisher.poll_event().expect("event"), None);
+        // Additional wire makes a handshake-inclusive control-only ACK valid
+        // under the existing counter parser, but it must not prove media.
+        let padding = audio
+            .sample(&vec![0x21; 4096], 2048, 2048, 1024, 48_000, false)
+            .expect("padding AAC");
+        publisher
+            .send_and_take_output(padding, 7)
+            .expect("extra wire");
+        publisher
+            .feed(&peer_ack(target.max(3073)), 8)
+            .expect("potential handshake-inclusive ACK");
+        assert_eq!(publisher.poll_event().expect("event"), None);
+        publisher
+            .feed(&peer_ack(target + 3072), 9)
+            .expect("partial guard");
+        assert_eq!(publisher.poll_event().expect("event"), None);
+        publisher
+            .feed(&peer_ack(target + 3073), 10)
+            .expect("complete conservative guard");
+        assert_eq!(
+            publisher.poll_event().expect("event"),
+            Some(NativeRtmpEvent::PeerMediaProgress)
+        );
+        publisher
+            .feed(&peer_ack(target + 3073), 11)
+            .expect("duplicate guard");
+        assert_eq!(publisher.poll_event().expect("event"), None);
+        publisher
+            .cancel()
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            publisher
+                .poll_event()
+                .expect("valid recovery fixture operation"),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_progress_is_unknown_and_track_declaration_is_cold_and_bounded() {
+        let (publisher, _) = ready(0);
+        assert_eq!(
+            publisher.declare_tracks(false, false),
+            Err(NativeRtmpError::InvalidConfig)
+        );
+        let codec = MediaCodec::aac(&[0x11, 0x90]).expect("valid recovery fixture operation");
+        let sample = codec
+            .sample(&[1], 0, 0, 1024, 48_000, false)
+            .expect("valid recovery fixture operation");
+        let result = publisher
+            .send_and_take_output(sample, 2)
+            .expect("valid recovery fixture operation");
+        assert!(!result.startup_submitted && !result.peer_media_progress);
+        let target = publisher
+            .state_guard()
+            .expect("valid recovery fixture operation")
+            .publisher
+            .output_end_position()
+            .expect("valid recovery fixture operation");
+        publisher
+            .feed(&peer_ack(target), 3)
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            publisher
+                .poll_event()
+                .expect("valid recovery fixture operation"),
+            None
+        );
+        assert_eq!(
+            publisher.declare_tracks(false, true),
+            Err(NativeRtmpError::InvalidConfig)
+        );
+    }
+
+    #[test]
+    fn startup_partial_peer_window_cannot_ack_unsent_media_and_cancel_discards_proof() {
+        let (publisher, _) = ready(0);
+        publisher
+            .declare_tracks(false, true)
+            .expect("valid recovery fixture operation");
+        let codec = MediaCodec::aac(&[0x11, 0x90]).expect("valid recovery fixture operation");
+        // Existing peer-window fixture forces all newly submitted media to remain queued.
+        publisher
+            .feed(&[2, 0, 0, 0, 0, 0, 5, 6, 0, 0, 0, 0, 0, 0, 0, 1, 0], 2)
+            .expect("valid recovery fixture operation");
+        let sample = codec
+            .sample(&[1], 0, 0, 1024, 48_000, false)
+            .expect("valid recovery fixture operation");
+        let result = publisher
+            .send_and_take_output(sample, 3)
+            .expect("valid recovery fixture operation");
+        assert!(result.startup_submitted && !result.peer_media_progress);
+        assert!(result.output.is_empty());
+        let target = publisher
+            .state_guard()
+            .expect("valid recovery fixture operation")
+            .startup
+            .as_ref()
+            .expect("valid recovery fixture operation")
+            .end_position()
+            .expect("valid recovery fixture operation");
+        assert!(publisher.feed(&peer_ack(target), 4).is_err()); // ACK beyond transferred wire is invalid
+        assert_eq!(
+            publisher
+                .poll_event()
+                .expect("valid recovery fixture operation"),
+            None
+        );
+        publisher
+            .cancel()
+            .expect("valid recovery fixture operation");
+        assert_eq!(
+            publisher
+                .poll_event()
+                .expect("valid recovery fixture operation"),
+            None
+        );
     }
 
     #[test]

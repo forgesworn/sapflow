@@ -18,6 +18,7 @@
 use crate::{
     media::SharedSample,
     mpegts::{MpegTsConfig, MpegTsMuxer, MuxError, MuxStats, TS_CHUNK_BYTES},
+    transport_progress::{StartupProgressEvent, StartupWatermark},
 };
 use sapflow_srt::{Caller, CallerConfig, CallerEvent, CallerStats, SendError};
 use std::{
@@ -97,6 +98,8 @@ pub enum PublisherEvent {
     Transport(CallerEvent),
     /// Local packaging/residence failure; followed by Caller's cancellation.
     Failed(PublisherError),
+    Sending,
+    PeerMediaProgress,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PublisherStats {
@@ -125,6 +128,8 @@ pub struct SrtPublisher {
     failure_pending: bool,
     deferred_event: Option<CallerEvent>,
     stats: PublisherStats,
+    startup: StartupWatermark,
+    sample_role: Option<(bool, bool)>,
 }
 impl SrtPublisher {
     pub fn new(
@@ -140,6 +145,8 @@ impl SrtPublisher {
         {
             return Err(PublisherConfigError::Limits);
         }
+        let startup = StartupWatermark::new(config.mux.video.is_some(), config.mux.audio.is_some())
+            .ok_or(PublisherConfigError::Mux(MuxError::TrackNotConfigured))?;
         let mux = MpegTsMuxer::new(config.mux).map_err(PublisherConfigError::Mux)?;
         let caller = Caller::new(config.caller, peer, now).map_err(PublisherConfigError::Caller)?;
         Ok(Self {
@@ -154,6 +161,8 @@ impl SrtPublisher {
             failure_pending: false,
             deferred_event: None,
             stats: PublisherStats::default(),
+            startup,
+            sample_role: None,
         })
     }
     pub fn is_connected(&self) -> bool {
@@ -191,7 +200,13 @@ impl SrtPublisher {
             self.failure_pending = false;
             return self.failure.map(PublisherEvent::Failed);
         }
-        event.map(PublisherEvent::Transport)
+        if let Some(event) = event {
+            return Some(PublisherEvent::Transport(event));
+        }
+        self.startup.poll_event().map(|event| match event {
+            StartupProgressEvent::Sending => PublisherEvent::Sending,
+            StartupProgressEvent::PeerMediaProgress => PublisherEvent::PeerMediaProgress,
+        })
     }
     /// Backwards input clocks are clamped and counted, never extend deadlines.
     pub fn push(&mut self, now: Instant, sample: SharedSample) -> Result<(), RejectedSample> {
@@ -217,6 +232,7 @@ impl SrtPublisher {
         if let Err(error) = result {
             return self.reject(PushError::Mux(error), sample);
         }
+        self.sample_role = Some((sample.is_video(), sample.is_keyframe()));
         self.sample_since = Some(self.now);
         self.blocked = false;
         Ok(())
@@ -255,6 +271,15 @@ impl SrtPublisher {
             }
             if self.pending.is_none() && self.mux.as_ref().is_some_and(MpegTsMuxer::is_idle) {
                 self.sample_since = None;
+                if let Some((video, keyframe)) = self.sample_role.take() {
+                    // Caller ACK bytes retire the actual contiguous Flight prefix.
+                    // Abandonment always closes Caller; never compare after close.
+                    self.startup.complete_sample(
+                        video,
+                        keyframe,
+                        self.caller.stats().send.accepted_bytes,
+                    );
+                }
             }
         }
         let output = self.caller.poll_transmit(self.now);
@@ -266,6 +291,9 @@ impl SrtPublisher {
         let before = self.caller.stats().send;
         self.caller.handle_datagram(self.now, peer, bytes);
         let after = self.caller.stats().send;
+        if self.caller.is_connected() && after.abandoned_bytes == 0 {
+            self.startup.acknowledge(after.acknowledged_bytes);
+        }
         if after.buffered_packets < before.buffered_packets
             || after.buffered_bytes < before.buffered_bytes
         {
@@ -332,6 +360,8 @@ impl SrtPublisher {
         if !self.caller.is_closed() {
             return;
         }
+        self.startup.cancel();
+        self.sample_role = None;
         if let Some(mux) = self.mux.take() {
             self.stats.mux = mux.stats();
             self.stats.mux.discarded_sample_bytes = self
