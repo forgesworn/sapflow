@@ -240,16 +240,27 @@ reported incomplete; it must never advertise a complete-show replay. Orientation
 or reconnect can produce multiple files. A finalised epoch file alone does not
 prove that every epoch of the show was aggregated.
 
+Scoped files use `<unix-start>-<recordingId>.mp4`, with the exact callback ID
+and the start second captured by the writer. Atomic creation refuses a duplicate
+identity without overwriting it or advancing the timestamp. Distinct same-second
+epochs have no sixty-file collision limit. Legacy publishers retain their
+Unix-second filenames. Expiry recognises only the exact legacy or scoped grammar;
+consumers must recognise the scoped suffix before inferring a replay start.
+
 The bounded callback queue retains completion failures in status. Only a real
 successful HTTP response records delivery. A dropped queue entry, exhausted
 retry, recorder failure or uncertain restart cannot silently become success.
 These are runtime receipts, not a transactional outbox surviving process restart.
 
-The current V4V connector requires complete prior receipts before preparing a
-replacement for the same event. An incomplete/failed recording therefore blocks
-that replacement even after admission closes and the protocol stops. An explicit
-owner recovery/abandonment workflow still needs implementation; do not turn the
-incomplete receipt into success to get past this gate.
+The V4V connector supports explicit acknowledgement to abandon automatic
+recording adoption after a terminal incomplete/failed receipt. It rechecks fresh
+authenticated origin status and preserves the failure with End incomplete. The
+acknowledgement returns no grant and never starts a successor. A separate explicit
+Prepare can consume that exact acknowledged identity and reserve one successor;
+lost replies retry the saved request. An ended event may return to scheduled only
+when adopting that authorised successor. Cancelled/archived events and events
+with an existing adopted recording or replay remain blocked. Late abandoned
+recording copies and callbacks cannot attach to the replacement.
 
 ## Verification boundaries
 

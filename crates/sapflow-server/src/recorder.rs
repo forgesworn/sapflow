@@ -1,4 +1,5 @@
-//! Recording: one fragmented MP4 per show, `<dir>/live/<eventId>/<unix-start>.mp4`.
+//! Fragmented MP4 recording per codec epoch. Scoped files include the callback
+//! recording identity after their real Unix start second; legacy names remain.
 //!
 //! The file is the init segment followed by every LL-HLS part, which is a
 //! valid fragmented MP4 that plays in a browser `<video>`. Writes happen on
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sapflow_core::recording::{is_recording_name, recording_file};
+use sapflow_core::recording::{is_recording_name, recording_file, scoped_recording_file};
 use sapflow_core::{StreamEvent, StreamPath};
 use sapflow_hls::fmp4::{init_segment_for_file, rebase_part_for_file};
 use sapflow_hls::muxer::Part;
@@ -205,7 +206,12 @@ async fn write(
         tracing::error!(path = %path.as_path(), "not recording: recordings disk is nearly full");
         return;
     }
-    let Some((file_path, mut file)) = create(&dir, &path, start).await else {
+    let created = if let Some(observation) = &observation {
+        create_scoped(&dir, &path, start, observation.id()).await
+    } else {
+        create(&dir, &path, start).await
+    };
+    let Some((file_path, mut file)) = created else {
         return;
     };
     if let Some(observation) = &observation {
@@ -316,6 +322,35 @@ async fn create(dir: &Path, path: &StreamPath, start: u64) -> Option<(PathBuf, t
         }
     }
     None
+}
+
+async fn create_scoped(
+    dir: &Path,
+    path: &StreamPath,
+    start: u64,
+    recording_id: &str,
+) -> Option<(PathBuf, tokio::fs::File)> {
+    let file_path = dir.join(scoped_recording_file(path, start, recording_id)?);
+    if let Some(parent) = file_path.parent()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::error!(%error, "cannot create recording directory");
+        return None;
+    }
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file_path)
+        .await
+    {
+        Ok(file) => Some((file_path, file)),
+        Err(error) => {
+            // A duplicate identity must neither overwrite the existing file
+            // nor invent a later wall-clock start to hide the collision.
+            tracing::error!(%error, "cannot create scoped recording");
+            None
+        }
+    }
 }
 
 /// Deletes recordings older than `max_age`, every ten minutes. Only files
@@ -455,6 +490,16 @@ mod tests {
         assert_eq!(body["eventGeneration"], 1);
         assert_eq!(body["connectionEpoch"], 3);
         assert_eq!(body["recordingId"].as_str().expect("ID").len(), 32);
+        let name = Path::new(body["segmentPath"].as_str().expect("path"))
+            .file_name()
+            .expect("recording name")
+            .to_str()
+            .expect("UTF-8");
+        assert!(is_recording_name(name));
+        assert!(name.ends_with(&format!(
+            "-{}.mp4",
+            body["recordingId"].as_str().expect("ID")
+        )));
         let bytes = tokio::fs::read(body["segmentPath"].as_str().expect("path"))
             .await
             .expect("read synced file");
@@ -712,13 +757,16 @@ mod tests {
         let dir = scratch("expire");
         let ev = dir.join("live/event-a");
         std::fs::create_dir_all(&ev).expect("mkdir");
-        for f in ["100.mp4", "notes.txt", "200.mp4.tmp"] {
+        let scoped = "100-0123456789abcdef0123456789abcdef.mp4";
+        let near_match = "100-0123456789abcdef0123456789abcdeg.mp4";
+        for f in ["100.mp4", scoped, near_match, "notes.txt", "200.mp4.tmp"] {
             std::fs::write(ev.join(f), b"x").expect("write");
         }
         let later = SystemTime::now() + Duration::from_secs(3600);
         assert_eq!(expire(&dir, Duration::from_secs(7200), later).await, 0);
-        assert_eq!(expire(&dir, Duration::from_secs(60), later).await, 1);
-        assert!(!ev.join("100.mp4").exists());
+        assert_eq!(expire(&dir, Duration::from_secs(60), later).await, 2);
+        assert!(!ev.join("100.mp4").exists() && !ev.join(scoped).exists());
+        assert!(ev.join(near_match).exists());
         assert!(ev.join("notes.txt").exists() && ev.join("200.mp4.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -742,5 +790,41 @@ mod tests {
         assert!(a.ends_with("live/event-a/1000.mp4"));
         assert!(b.ends_with("live/event-a/1001.mp4"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn scoped_epochs_share_the_real_start_without_overwrite_or_sixty_file_limit() {
+        let scratch = ScopedScratch::new("scoped-create");
+        let path = StreamPath::parse("live/event-a").expect("path");
+        let first_id = format!("{:032x}", 1);
+        let (first, mut file) = create_scoped(&scratch.0, &path, 1000, &first_id)
+            .await
+            .expect("first recording");
+        file.write_all(b"generated-prefix").await.expect("write");
+        file.flush().await.expect("flush");
+        drop(file);
+        assert!(
+            create_scoped(&scratch.0, &path, 1000, &first_id)
+                .await
+                .is_none(),
+            "a repeated callback identity cannot replace its file"
+        );
+        assert_eq!(
+            tokio::fs::read(&first).await.expect("existing bytes"),
+            b"generated-prefix"
+        );
+        for value in 2..=64 {
+            let id = format!("{value:032x}");
+            let (file_path, file) = create_scoped(&scratch.0, &path, 1000, &id)
+                .await
+                .expect("distinct epoch in the same second");
+            drop(file);
+            assert!(file_path.ends_with(format!("live/event-a/1000-{id}.mp4")));
+        }
+        assert!(
+            create_scoped(&scratch.0, &path, 1000, "../invalid")
+                .await
+                .is_none()
+        );
     }
 }

@@ -37,8 +37,8 @@ timeout. The same app process restarted, a later origin segment independently
 decoded as H264/AAC, and the unchanged Safari source resumed frame presentation
 without another Play, seek or reload. This finite check does not qualify
 repeated restart, orientation, carrier, recording or sustained behaviour on
-that APK. The running origin remains the earlier frozen lab binary; the
-source merge and Apple holdback correction have not been deployed there.
+that APK. That Stop-test origin preceded the main merge; the newer reconnect
+qualification below uses a separate frozen APK and the integrated private origin.
 
 V4V commit `711d1a8077c4bea9e1ed4bb155a9bcf6a8bcbb2b` on a separate local branch
 prevents ended-event telemetry resurrection and rejects recording copies when
@@ -82,9 +82,20 @@ rate rejection, ingest discard and SRT queue/transport loss now retain a synced
 accepted prefix as `incomplete`. A normal clean End can still finalise. On the
 corrected binary, V4V retained the incomplete recording receipt, kept End
 incomplete and imported no replay. A finalised epoch file alone still does not
-prove complete-show aggregation. The connector currently blocks preparing a
-replacement for the same event after an incomplete/failed receipt; an explicit
-recovery workflow remains open.
+prove complete-show aggregation. The connector now has an explicit acknowledgement
+to abandon automatic adoption of an incomplete/failed recording. It returns no
+grant and preserves the failed receipt. A separate explicit Prepare can reserve
+one acknowledged successor, including when the previous event ended. Ordinary
+Prepare cannot reopen an ended event; cancelled or archived events stay closed.
+
+The generated cross-runtime recovery check passed actual creator authentication,
+fresh independent H264/AAC media after two connection epochs, End with a genuine
+failed recording callback, acknowledgement and explicit replacement. A withheld
+provision reply retried the exact successor request without minting another
+session. Paused old recording copies and late callbacks could not attach to the
+successor. Status polling and mutations now have separate rate budgets, so polling
+cannot consume the End allowance. This evidence uses the frozen origin before
+the newer attempt-ID and scoped-filename changes; their runtime gate is separate.
 
 Both isolated listeners and every generated-media child were stopped, and their
 temporary credentials, stores and media removed after safe receipts were retained.
@@ -121,14 +132,39 @@ The frozen Android source packet has 88 inputs. Its M4 build passes all 135 test
 in 29 suites, lint with zero errors and seven warnings, and actual APK checks for
 qualification/release isolation with the new AAR and native library hashes.
 The qualification APK retains its private test controls; the release APK has
-neither those controls nor the benchmark entrypoint. Signing, installation and
-physical network-drop acceptance remain separate from that build evidence.
+neither those controls nor the benchmark entrypoint.
+
+The signed qualification APK subsequently passed one physical unattended recovery
+after a 12-second Pixel Wi-Fi cut. Fresh origin media was observed about 11.4
+seconds after Wi-Fi was re-enabled. The same app process continued capture;
+video/audio counters advanced and the private recording timer progressed from
+68 to 122 seconds without Stop, Prepare or Start during recovery. The same native
+Safari instance resumed presentation with its source assigned once. A recovered
+origin segment independently decoded as H264/AAC; its temporary sample was deleted.
+Phone recording files were never accessed, so their file continuity and decoding
+remain unqualified. This one LAN test is not a sustained, carrier, rotation,
+timed capture-to-screen latency or competitive-performance result.
 
 Native V4V authentication and trusted current-media observations are still open.
 Manual destinations never turn a handshake, ACK or local encoder into a playable
 media confirmation. After a real outage their original 90-second window can
 therefore expire even after a healthy socket reconnect. Attaching the real
-V4V observation contract is required before treating this as ready for a show.
+V4V observation contract remains required for verified playback status. The
+manual-mode policy also needs separate transport recovery and playback evidence:
+third-party destinations do not necessarily provide a trusted playback API.
+The tested build reached its original outage deadline and stopped publishing;
+it is not ready for a show. Later, unattributed re-admission and reset counters
+are excluded from the finite recovery result. The test ended with normal Stop,
+and its owned origin, viewer and proxy processes were stopped.
+
+The origin's scoped `live` receipt now requires an independent completed part
+from the current connection. Retained old HLS content and a changed-codec first
+IDR alone cannot qualify it. Authenticated `freshMedia` identifies retained init
+and part resources; optional `connectionAttemptId` correlates the accepted SRT
+attempt. Neither field proves decoding. Scoped recording names now include their
+callback recording identity, so same-second codec epochs cannot advance the
+filename's start time or overwrite one another. The combined Rust source passes
+456 workspace tests, four normally ignored, and strict all-target Clippy.
 
 ## Product constraints
 

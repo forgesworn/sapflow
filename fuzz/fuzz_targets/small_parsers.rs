@@ -27,6 +27,13 @@ fuzz_target!(|data: &[u8]| {
     let _ = playlist::parse_blocking_query(Some(&s));
     let _ = recording::parse_age(&s);
     let _ = recording::is_recording_name(&s);
+    if let Some(path) = sapflow_core::StreamPath::parse("live/event-fuzz-recording")
+        && let Some(file) = recording::scoped_recording_file(&path, 1, &s)
+    {
+        assert!(recording::is_recording_name(
+            file.rsplit('/').next().expect("generated file name")
+        ));
+    }
     let _ = AacConfig::from_audio_specific_config(data);
     let _ = codec::avc_decoder_config(data);
     let _ = codec::adts_frames(data);
