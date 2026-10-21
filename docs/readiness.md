@@ -99,10 +99,12 @@ deployment, so a trial is a window on the whole stage, or a second stack.
 
 ## 6. Staged rollout
 
-1. Choose the build (section 4, unmerged work). Run `cargo test --workspace`,
+1. Choose the build (a named commit of main). Run `cargo test --workspace`,
    `scripts/smoke.sh` and both v4v ingest gates against it.
-2. Merge the v4v player fix and rerun the 200 ms loss comparison on a
-   quiet machine. Run the wired Linux load test if a machine is free.
+2. Done on 2026-10-21: the v4v player fix is merged and was checked in
+   Safari, and the 200 ms loss comparison was rerun on a quiet machine
+   (level with libsrt). Run the wired Linux load test if a machine is free.
+   The detailed steps for the night are in `docs/trial-plan.md`.
 3. Prepare a Linux trial host: sapflow on its own ports beside mediamtx, the
    open-file limit raised, recordings on the volume v4v reads, Caddy with TLS
    and HTTP/2 (never point Safari at sapflow directly: 10.8 s against 3.0 to
