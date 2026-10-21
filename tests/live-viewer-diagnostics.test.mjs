@@ -94,6 +94,20 @@ const mediaFatal = {fatal:true, type:'mediaError', details:'bufferAppendError'};
 }
 {
   const f = recoveryFixture();
+  f.progress(100, 3000); f.progress(100.5, 3015);
+  f.recovery.error(mediaFatal); f.step();
+  f.progress(100.5, 0); // Decoder reattachment resets frames, preserving currentTime.
+  assert.equal(f.recovery.attempts.media, 1);
+  assert.equal(f.timers.size, 1);
+  f.progress(100.6, 3); // A reset or a tiny clock advance alone is insufficient.
+  assert.equal(f.recovery.attempts.media, 1);
+  f.progress(100.8, 9);
+  assert.equal(f.recovery.phase, 'playing');
+  assert.equal(f.recovery.attempts.media, 0);
+  assert.equal(f.timers.size, 0);
+}
+{
+  const f = recoveryFixture();
   f.recovery.error(networkFatal);
   while (f.timers.size) f.step(); // No further error callbacks; watchdog must terminate.
   assert.deepEqual(f.calls, ['network', 'network', 'network', 'stop']);

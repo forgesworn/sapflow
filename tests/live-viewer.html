@@ -216,7 +216,12 @@ globalThis.SapflowViewerRecovery = class {
     if (!this.baseline) { this.baseline = {time, frames}; return; }
     // A playing event alone is not evidence. Require advancing media time,
     // and advancing decoded-video count whenever that counter is available.
-    if (time < this.baseline.time) { this.baseline = {time, frames}; return; }
+    if (time < this.baseline.time || (Number.isFinite(frames) && Number.isFinite(this.baseline.frames) &&
+        frames < this.baseline.frames)) {
+      // Reattaching a decoder may reset its counter without rewinding media
+      // time. Establish a fresh observation; this alone never resets budgets.
+      this.baseline = {time, frames}; return;
+    }
     const advancedFrames = !Number.isFinite(frames) || !Number.isFinite(this.baseline.frames) || frames > this.baseline.frames;
     if (time - this.baseline.time < 0.25 || !advancedFrames) return;
     this.baseline = {time, frames};

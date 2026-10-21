@@ -38,6 +38,8 @@ An attempt that hangs without another error still exhausts its budget. Budgets
 reset only after advancing media time and decoded frames when that counter is
 available, not after a `playing` event. No automatic source reload, Hls
 reconstruction or live-edge seek hides a new origin epoch.
+Decoder-counter resets establish a fresh observation without clearing attempts;
+subsequent advancing time and frames are still required.
 
 The explicit Play/Pause control preserves intent during media detachment;
 ordinary native-control pause is also observed. Pausing cancels the timer
