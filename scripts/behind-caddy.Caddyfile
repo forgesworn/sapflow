@@ -10,6 +10,10 @@
 	admin off
 	https_port {$CADDY_HTTPS_PORT}
 	auto_https disable_redirects
+	# A client sends no SNI for an IP-literal site, and Docker's NAT hides the
+	# address it dialled, so name the certificate to serve then (a no-op for
+	# a hostname, which clients do send).
+	default_sni {$CADDY_SITE}
 	servers {
 		protocols {$CADDY_PROTOCOLS}
 	}

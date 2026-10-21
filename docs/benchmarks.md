@@ -208,6 +208,223 @@ keyframes); Caddy 2.11.7 in Docker Desktop with
   `keepalive_idle_conns_per_host` raised, a look at 502s in Caddy's log, and
   Caddy's own CPU measured (the script reports sapflow's only).
 
+## Two machines over Wi-Fi, through Caddy (2026-10-21)
+
+**This is not the wired Linux run.** The milestone item "measured on Linux
+behind Caddy: the wired 250 and 750 full-viewer run" is still open. Neither
+machine had a wired link or ran Linux, so the maintainer chose to run it now
+over Wi-Fi with Caddy in Docker Desktop, and to label it as such. The Wi-Fi
+carried 12 full viewers at 250 viewers and none at 750, so it cannot answer
+the milestone's question; it does show how the pieces behave and what the
+wired run must be built to measure. **Every run here was taken under high
+local load** on the server Mac (one-minute load average 34 to 373 on 8 cores;
+see Setup), so read the times as what a busy shared machine gives, not as
+what sapflow or Caddy do on a quiet one.
+
+### Setup
+
+- **Server side:** this Mac (Apple M1, 8 cores, 16 GB, macOS 14.6). sapflow
+  release build of main at 10b7e40, HTTP bound to the Wi-Fi address only
+  (RTMP and SRT on loopback), fed by an ffmpeg RTMP test signal on the same
+  Mac (720p30, H.264 2.5 Mbit/s CBR, 1 s keyframes, AAC 128 kbit/s; the
+  multivariant playlist advertises 2.7 Mbit/s). Caddy 2.11.7 in Docker
+  Desktop (its VM has 2 CPUs and 3.8 GB, shared with other containers) with
+  `scripts/behind-caddy.Caddyfile`: `tls internal`, `h1 h2`, the Wi-Fi
+  address as the site address, sapflow at the same address as upstream, and
+  `keepalive_idle_conns_per_host` raised to 1024 (checked with `caddy adapt`).
+- **Viewers:** a second Mac (Apple M4 Max, 16 cores, 64 GB, macOS 26.6),
+  `sapflow-bench` release build of the same commit in a throwaway worktree
+  (removed afterwards), Caddy's root certificate copied next to it for
+  `--ca`, `ulimit -n 65536` (an ssh session gets 256).
+- **Link:** both machines on one 5 GHz access point, 802.11ac, channel 100
+  (80 MHz); the radios reported transmit rates of 520 to 585 Mbit/s (MCS 6
+  and 7) at -51 to -60 dBm. A single TCP stream of 600 MiB from this Mac to
+  the viewer host (Python sender and sink) ran at 131 and 122 Mbit/s. That is
+  what to expect when every byte crosses the air twice, but the cause was
+  not isolated. The earlier two-machine run (plain HTTP) had about 72
+  Mbit/s.
+- **Not quiet:** this Mac carried other sessions' builds, tests and a
+  fuzzer, with 20 GB of swap in use and about 0% idle CPU in the checks.
+  Its one-minute load average over the final runs was 40 to 373 on 8 cores
+  (and 34 to 159 over the sweeps below). The load did not ease in the half hour the
+  runs were held back for it, so they went ahead. The viewer host's one-minute
+  load average was 2.6 to 10.5 over the final runs (16 cores); the runner
+  waited up to five minutes for it to fall below 8 before each run, and read
+  `uptime` on both machines before, during and after. The viewers used 7 to
+  22% of one core in the 250-viewer runs and 8 to 40% in the 750-viewer runs, so
+  the load generator was not the limit. The other
+  session's lab origin, Ollama and the Android device on the viewer host
+  were left alone.
+- **Full viewers:** the bench makes every viewer full unless `--full` is
+  given; `scripts/bench-remote.sh` defaults to 10, which is what "default"
+  means here and what the earlier Wi-Fi run used. The second count is the
+  most the link carried without saturating, found by the sweep below.
+
+```
+# server side (this Mac)
+SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=<server-ip>:28888 \
+  SAPFLOW_RTMP_ADDR=127.0.0.1:28935 SAPFLOW_SRT_ADDR=127.0.0.1:28890 \
+  RUST_LOG=warn target/release/sapflow
+docker run -d --name sapflow-wifi-caddy -p <server-ip>:28943:28943 \
+  -e CADDY_HTTPS_PORT=28943 -e CADDY_SITE=<server-ip> -e CADDY_PROTOCOLS="h1 h2" \
+  -e SAPFLOW_UPSTREAM=<server-ip>:28888 -e CADDY_SITE_EXTRA= \
+  -e CADDY_PROXY_EXTRA=$'transport http {\n\t\t\tkeepalive_idle_conns_per_host 1024\n\t\t}' \
+  -v "$PWD/scripts/behind-caddy.Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2
+docker cp sapflow-wifi-caddy:/data/caddy/pki/authorities/local/root.crt caddy-root.crt
+ffmpeg -re -stream_loop -1 -f lavfi -i testsrc2=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=440:sample_rate=48000 -pix_fmt yuv420p \
+  -c:v libx264 -preset veryfast -tune zerolatency -g 30 -keyint_min 30 -sc_threshold 0 \
+  -b:v 2500k -maxrate 2500k -bufsize 2500k -c:a aac -b:a 128k \
+  -f flv rtmp://127.0.0.1:28935/live/event-wifi-b
+
+# viewer host, over ssh, each run 10 s ramp then 60 s
+sapflow-bench --url https://<server-ip>:28943/live-hls/live/event-wifi-b/index.m3u8 \
+  --ca caddy-root.crt --http2 --viewers 250 --full 10 --secs 60 --ramp 10
+sapflow-bench --url http://<server-ip>:28888/live/event-wifi-b/index.m3u8 \
+  --viewers 250 --full 10 --secs 60 --ramp 10        # the control, no Caddy
+```
+
+- **One Caddyfile line was added** for this: `default_sni {$CADDY_SITE}`.
+  A client sends no SNI for an IP-literal site, and Docker's NAT hides the
+  address it dialled, so Caddy had no certificate to pick and answered
+  `tlsv1 alert internal error`. It changes nothing for a hostname.
+- **Sampled on this Mac every second from 10 s in until the viewers exited:**
+  sapflow's CPU (`ps` time) and RSS, the Caddy container's CPU and memory
+  (its cgroup's `cpu.stat` and `memory.current`), the Docker Desktop backend
+  process's CPU, and the bytes the Wi-Fi interface sent (`netstat -ib`: all
+  traffic on it, headers and retransmissions included). The viewers ran under
+  `/usr/bin/time -l`. The bench's counts and percentiles cover the whole
+  70 s run, ramp included.
+- **Rounds:** three interleaved rounds (Caddy and direct alternating, so each
+  pair shares conditions), so every figure below is a range, lowest to
+  highest across three runs. Times in ms: p50 / p95 / max.
+- A request counts as failed if the bench saw an error status, a reset or a
+  timeout. Caddy's log was read for each run too.
+
+### 250 viewers
+
+| 250 viewers | Caddy, HTTP/2, 10 full | Direct, HTTP/1.1, 10 full | Caddy, HTTP/2, 12 full | Direct, HTTP/1.1, 12 full |
+|---------|---------|---------|---------|---------|
+| Failed requests | 0 of 52,934-64,868 | 0 of 93,529-101,609 | 0 of 55,482-66,775 | 0 of 100,817-102,250 |
+| Caddy error lines (502s, refused dials) | 0 | n/a | 0 | n/a |
+| Playlist | 179-265 / 539-676 / 1,008-1,583 | 32-46 / 117-217 / 230-2,346 | 195-231 / 538-716 / 1,458-4,564 | 36-40 / 119-150 / 434-722 |
+| Segment (full viewers) | 192-330 / 711-798 / 1,054-1,558 | 74-151 / 234-846 / 459-4,913 | 252-320 / 562-860 / 1,339-4,775 | 79-189 / 291-466 / 826-1,060 |
+| Part fan-out | 192-288 / 779-1,001 / 1,254-2,060 | 43-118 / 225-1,052 / 389-4,960 | 264-313 / 898-1,051 / 1,678-5,004 | 57-164 / 391-533 / 854-1,646 |
+| Requests per second (mean over the run) | 756-927 | 1,336-1,452 | 793-954 | 1,440-1,461 |
+| Wi-Fi out of the server, Mbit/s | 36-49 | 70-87 | 44-52 | 91-97 |
+| sapflow CPU / peak memory | 3.4-3.9% / 15-19 MB | 7.0-8.1% / 19-23 MB | 3.5-3.9% / 14-22 MB | 7.7-8.0% / 20-22 MB |
+| Caddy container CPU / peak memory | 92-104% / 87-194 MB | 3-5% (idle) | 93-101% / 101-184 MB | 3-5% (idle) |
+| Docker Desktop backend CPU | 36-43% | 6-7% | 38-45% | 5-6% |
+
+### 750 viewers
+
+| 750 viewers, Caddy, HTTP/2 | 10 full | 0 full (playlists only) |
+|---------|---------|---------|
+| Failed requests | 0 of 70,114-110,489 | 0 of 40,256-55,868 |
+| Caddy error lines | 0 | 0 |
+| Playlist | 291-519 / 1,375-2,022 / 3,972-4,600 | 734-1,054 / 1,790-2,405 / 4,508-11,535 |
+| Segment (full viewers) | 585-711 / 2,280-2,360 / 3,573-4,807 | none |
+| Part fan-out | 396-572 / 1,670-2,631 / 4,573-6,627 | none |
+| Requests per second (mean over the run) | 1,002-1,578 | 575-798 |
+| Wi-Fi out of the server, Mbit/s | 31-51 | 11-17 |
+| sapflow CPU / peak memory | 3.9-5.8% / 23-28 MB | 2.7-3.5% / 21-22 MB |
+| Caddy container CPU / peak memory | 107-114% / 214-265 MB | 93-105% / 234-265 MB |
+| Docker Desktop backend CPU | 40-56% | 29-37% |
+
+### How many full viewers the Wi-Fi carries
+
+Direct to sapflow over HTTP/1.1, 250 viewers, 30 s runs, one run each
+(Wi-Fi out in Mbit/s; times in ms, p50 / p95 / max):
+
+| Full viewers | Wi-Fi out | Segment | Part fan-out |
+|---------|---------|---------|---------|
+| 5 | 57 | 61 / 205 / 394 | 22 / 141 / 653 |
+| 8 | 71 | 94 / 251 / 489 | 44 / 244 / 484 |
+| 10 | 79 | 85 / 232 / 415 | 59 / 249 / 373 |
+| 12 | 92 | 102 / 310 / 820 | 99 / 387 / 790 |
+| 15 | 100 | 164 / 466 / 1,751 | 252 / 756 / 1,767 |
+| 20 (busier period) | 76 | 191 / 524 / 2,140 | 222 / 714 / 2,056 |
+| 30 (busier period) | 101 | 345 / 964 / 2,363 | 564 / 1,647 / 2,305 |
+
+The output grew by about 5 Mbit/s per added full viewer up to 12, then
+flattened at about 100 Mbit/s, which is the link (a single TCP stream gave
+122 to 131). So 12 is the most it carried without saturating, and 15 is
+past the knee: the fan-out median went from 99 to 252 ms. That is the
+"12 full" column above.
+
+At 750 viewers none can be added. Direct, 30 s, one run each: with no full
+viewer at all the Wi-Fi already sent 102 Mbit/s, just for the blocking
+playlist reloads (playlist 53 / 229 / 3,044), and with 4, 6 and 8 full it
+sent 104, 88 and 96, with segment medians of 422, 333 and 427 ms and p95s of
+1.6 to 3.8 s. No request failed in any of them. The "10 full" column in the
+750 table is therefore already past what the link carries, and the Caddy
+runs were not link-limited anyway (below).
+
+### What it shows
+
+- **Not one failed request, and no 502.** 45 runs, 2,855,441 requests, 0
+  failed, 0 error lines in Caddy's log. That includes one run each at 250
+  and 750 viewers with `keepalive_idle_conns_per_host` left at its default
+  (0 of 29,978 and 0 of 23,686). Those are not a test of the earlier 502s: at
+  these request rates the viewers never put the pool under that pressure.
+  They were slower, though: 21 Mbit/s and 428 requests a second at 250
+  viewers (playlist median 513 ms) and 10 Mbit/s and 338 a second at 750
+  (median 2,055 ms), against 36-49 Mbit/s and 756-927 a second at 250 and
+  31-51 Mbit/s and 1,002-1,578 a second at 750 with the pool at 1,024, with
+  the server host's load average at 103 to 132 for the default-pool runs,
+  inside the range of the others. One run each, so a hint that the pool
+  size matters for throughput as well as for 502s, not a finding.
+- **The Wi-Fi limits direct runs; Caddy limits the runs through it.** Direct,
+  250 viewers use the link to its ceiling at 12 full (91 to 97 Mbit/s).
+  Through Caddy the same viewers got 36 to 52 Mbit/s and about 60% of the
+  requests they asked for (760 to 950 a second against 1,340 to 1,460
+  direct), and the Caddy container sat at 92 to 104% of a core in every
+  run. At 750 viewers with no full viewer, where the direct link carried 102
+  Mbit/s and 3,750 requests a second (30 s probe), Caddy passed 11 to 17
+  Mbit/s and 575 to 798 requests a second, at 93 to 105% of a core.
+- **Cost of the front at 250 viewers, 10 full:** playlist median 179-265
+  against 32-46 ms, segment median 192-330 against 74-151 ms, part fan-out
+  median 192-288 against 43-118 ms. At 750 viewers the playlist median was
+  290 to 1,050 ms. Part fan-out through Caddy sits near a part's length
+  (about 234 ms), as it did on one machine.
+- **Where the time goes:** into Caddy in Docker Desktop, not sapflow and not
+  the radio. sapflow used 3 to 6% of a core through Caddy and 7 to 8% direct
+  at 250 viewers (13 to 15% direct at 750), with 14 to 33 MB; Caddy's
+  container used 20 to 40 times its through-Caddy figure, plus 29 to 56% of
+  a core in Docker Desktop's backend process. Two caveats: the container's CPU is its guest
+  kernel's accounting inside a 2-CPU VM on a host with no idle CPU, which can
+  overstate it; and TLS with HTTP/2 is not the main part. A probe with Caddy
+  proxying plain HTTP/1.1 (two interleaved runs each, 250 viewers, 10 full)
+  gave Wi-Fi out of 31-36 Mbit/s, Caddy at 73-80% and playlist median
+  213-272 ms, against 23-26 Mbit/s, 87-94% and 316-418 ms over TLS and
+  HTTP/2 in the same rounds, so TLS and HTTP/2 may add some cost, but two
+  runs under this load do not resolve it. At 750 viewers (10 full) plain
+  HTTP gave 21-27 Mbit/s, Caddy at 90-96%, playlist median 775-901 ms.
+- **Run-to-run spread is wide on this host,** for example direct playlist
+  maximum 230 to 2,346 ms in the same cell. The medians and the Caddy-versus-
+  direct gap held in every round; the maxima and the 5,000 ms tails are the
+  host's and should not be read as sapflow's or Caddy's.
+- **Per full viewer:** about 5 Mbit/s of Wi-Fi output each in the sweep.
+  At that rate 250 full viewers need about 1.3 Gbit/s and 750 about 3.8
+  Gbit/s (the one-machine run measured 3.8 Gbit/s over loopback at 750), so
+  gigabit Ethernet cannot carry the 250 all-full milestone run either.
+
+### What the wired Linux run still needs
+
+- A Linux host for sapflow and Caddy, with Caddy native (or on the host
+  network) rather than behind Docker Desktop's VM, and the viewers on a
+  separate wired machine. The link has to be faster than gigabit: about 1.3
+  Gbit/s for 250 full viewers and 3.8 for 750 by the figures above, so 10
+  GbE, or the viewers split across several machines.
+- `keepalive_idle_conns_per_host` raised, with Caddy's log read for 502s at
+  the full request rate (this run could not reach it), and Caddy's own CPU
+  read from the host (`pidstat` or its cgroup), not only sapflow's.
+- A quiet server host with its load recorded, three or more runs per row, the
+  viewer host's file-descriptor limit raised, and 60 s after a 10 s ramp as
+  here so the rows compare.
+- Not done here: the same run against mediamtx behind the same Caddy, and
+  all 250 or 750 viewers full (the link could not carry it).
+
 ## Decision
 
 2026-10-20, the user: **keep experimenting.** Before any production
