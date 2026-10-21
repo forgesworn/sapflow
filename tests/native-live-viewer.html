@@ -48,6 +48,10 @@ globalThis.SapflowNativeHls = (() => {
       this.presentationSupported = typeof video.requestVideoFrameCallback === 'function' &&
         typeof video.cancelVideoFrameCallback === 'function';
       this.presentedCallbacks = 0; this.lastPresentedMediaTime = null; this.frameCallbackId = null;
+      this.presentationRequestFailed = false;
+      this.clockObservedTime = finite(video.currentTime); this.lastClockProgressAt = null;
+      this.frameObservedCount = this.presentationSupported ? 0 : frames(video);
+      this.lastFrameProgressAt = null;
       this.onPresentedFrame = (_now, metadata) => {
         if (this.disposed || !this.presentationSupported) return;
         this.frameCallbackId = null;
@@ -71,13 +75,12 @@ globalThis.SapflowNativeHls = (() => {
       this.requestPresentation();
     }
     requestPresentation() {
-      if (this.disposed || !this.presentationSupported || this.frameCallbackId !== null) return;
+      if (this.disposed || !this.presentationSupported || this.presentationRequestFailed || this.frameCallbackId !== null) return;
       try { this.frameCallbackId = this.video.requestVideoFrameCallback(this.onPresentedFrame); }
       catch (_) {
-        this.presentationSupported = false;
-        // Start the fallback counter in its own domain; do not compare it with
-        // the presentation callback count or invent progress during a switch.
-        this.progressTime = finite(this.video.currentTime); this.progressFrames = frames(this.video);
+        // Keep the selected signal explicit. A present but failing callback API
+        // must not silently turn decoder activity into presentation evidence.
+        this.presentationRequestFailed = true;
       }
     }
     record(type) {
@@ -89,6 +92,20 @@ globalThis.SapflowNativeHls = (() => {
     sample() {
       const video = this.video, now = this.now(), time = finite(video.currentTime), decoded = frames(video);
       const progress = this.presentationSupported ? this.presentedCallbacks : decoded;
+      const active = !video.paused && !video.ended && !video.error;
+      // Independent scalar observations explain missing paired evidence. They
+      // cannot qualify playing or substitute decoder counts for callbacks.
+      if (time !== null && this.clockObservedTime !== null && time > this.clockObservedTime + 0.01 && active) {
+        this.lastClockProgressAt = now; this.clockObservedTime = time;
+      } else if (time === null || this.clockObservedTime === null || time < this.clockObservedTime || !active) {
+        this.clockObservedTime = time;
+      }
+      if (progress !== null && this.frameObservedCount !== null && progress > this.frameObservedCount && active) {
+        this.lastFrameProgressAt = now;
+      }
+      this.frameObservedCount = progress;
+      const clockProgressAgeMs = now - (this.lastClockProgressAt ?? this.startedAt);
+      const selectedFrameProgressAgeMs = now - (this.lastFrameProgressAt ?? this.startedAt);
       const reset = (time !== null && this.progressTime !== null && time < this.progressTime) ||
         (progress !== null && this.progressFrames !== null && progress < this.progressFrames);
       if (reset || (progress !== null && this.progressFrames === null) ||
@@ -97,24 +114,40 @@ globalThis.SapflowNativeHls = (() => {
       }
       const frameProgress = progress !== null && this.progressFrames !== null && progress > this.progressFrames;
       if (!video.paused && !video.ended && !video.error && video.readyState >= 2 && video.videoWidth > 0 &&
-          time !== null && this.progressTime !== null && time > this.progressTime + 0.01 && frameProgress) {
+          time !== null && this.progressTime !== null && time > this.progressTime + 0.01 && frameProgress &&
+          clockProgressAgeMs < 4000) {
         this.lastProgressAt = now;
         // Safari may expose time and frame-counter changes on separate reads.
         // Compare both with the last confirmed progress, not the last poll.
         this.progressTime = time; this.progressFrames = progress;
       }
-      let state;
-      if (video.error) state = 'error';
-      else if (video.ended) state = 'ended';
-      else if (video.paused) state = 'paused';
-      else if (this.lastProgressAt !== null && now - this.lastProgressAt < 4000 && video.readyState >= 2) state = 'playing';
-      else if (now - (this.lastProgressAt ?? this.startedAt) >= 4000) state = 'stalled';
-      else state = 'waiting';
+      let state, stateReason;
+      if (video.error) { state = 'error'; stateReason = 'media-error'; }
+      else if (video.ended) { state = 'ended'; stateReason = 'media-ended'; }
+      else if (video.paused) { state = 'paused'; stateReason = 'media-paused'; }
+      else if (this.lastProgressAt !== null && now - this.lastProgressAt < 4000 && video.readyState >= 2) {
+        state = 'playing'; stateReason = 'paired-progress';
+      } else if (clockProgressAgeMs >= 4000) {
+        state = 'stalled'; stateReason = 'media-clock-nonprogress';
+      } else if (now - this.startedAt >= 4000) {
+        state = 'unverified';
+        stateReason = this.presentationSupported
+          ? (this.presentationRequestFailed ? 'presentation-callback-unavailable' : 'presentation-callback-unresponsive')
+          : (decoded === null ? 'frame-signal-unavailable' : 'decoded-counter-unresponsive');
+        if (selectedFrameProgressAgeMs < 4000 && this.lastFrameProgressAt !== null) {
+          stateReason = 'paired-progress-unconfirmed';
+        }
+      } else { state = 'waiting'; stateReason = 'awaiting-paired-progress'; }
       const buffered = ranges(video.buffered), seekable = ranges(video.seekable);
       const covering = buffered.find(([start, end]) => time !== null && start <= time && time <= end);
       return {utc:this.wall(), playerKind:'native-hls', instanceId:this.instanceId, source:this.source,
-        sourceAssignments:this.sourceAssignments, state, currentTime:time, decodedFrames:decoded,
-        presentationSupported:this.presentationSupported, presentedCallbacks:this.presentedCallbacks,
+        sourceAssignments:this.sourceAssignments, state, stateReason, currentTime:time, decodedFrames:decoded,
+        progressSignal:this.presentationSupported ? 'presentation-callback' : (decoded === null ? 'none' : 'decoded-counter'),
+        clockProgressAgeMs, selectedFrameProgressAgeMs,
+        lastClockProgressElapsedMs:this.lastClockProgressAt === null ? null : this.lastClockProgressAt - this.startedAt,
+        lastSelectedFrameProgressElapsedMs:this.lastFrameProgressAt === null ? null : this.lastFrameProgressAt - this.startedAt,
+        presentationSupported:this.presentationSupported, presentationRequestFailed:this.presentationRequestFailed,
+        presentedCallbacks:this.presentedCallbacks,
         lastPresentedMediaTime:this.lastPresentedMediaTime,
         width:video.videoWidth, height:video.videoHeight, readyState:video.readyState,
         networkState:video.networkState, paused:video.paused, ended:video.ended,
@@ -146,7 +179,7 @@ globalThis.SapflowNativeHls = (() => {
     globalThis.sapflowNativeMetrics = () => observation.sample();
     const update = () => {
       const metrics = observation.sample();
-      status.textContent = `Native HLS: ${metrics.state} · ${metrics.width}×${metrics.height} · ` +
+      status.textContent = `Native HLS: ${metrics.state} (${metrics.stateReason}) · ${metrics.width}×${metrics.height} · ` +
         `${(metrics.currentTime ?? 0).toFixed(2)} s · source assigned ${metrics.sourceAssignments} time`;
     };
     timer = setInterval(update, 1000); update();

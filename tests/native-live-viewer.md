@@ -26,13 +26,31 @@ and cannot update counters or re-arm itself.
 Playback status requires advancing media time, advancing presentation callbacks
 and sufficient ready state. A frozen `getVideoPlaybackQuality` counter therefore
 cannot override observed presentation. `decodedFrames` remains a separate
-diagnostic. Where frame callbacks are unavailable or requesting one fails,
-decoded-counter progress is the fallback. If neither frame signal exists,
-clock movement alone cannot certify playback and reports waiting, then stalled.
-Four seconds without confirmed progress reports stalled. An intentional pause,
-end or media error has its own status. Clock and frame signals are compared with
-the last confirmed progress so staggered native updates cannot cause a false
-stall. Counter/time resets establish a baseline without fabricating progress.
+diagnostic. Where the callback API or its cancel method is absent, decoded-counter
+progress is the fallback. A present but unresponsive or failing callback API
+remains the selected signal; decoder activity cannot silently replace it.
+`presentationRequestFailed` records a failed request without retrying it.
+
+The `playing` gate requires paired evidence within four seconds. After the
+initial four-second observation window, advancing clock without that evidence
+reports `unverified`, with an explicit `stateReason`: callback unresponsive or
+unavailable, decoder counter unresponsive, no frame signal, or paired progress
+unconfirmed. It does not establish either successful presentation or frozen
+pictures. Four seconds without observed clock progress reports `stalled` with
+`media-clock-nonprogress`, even if callbacks continue. This describes the sampled
+media clock, not proven physical screen behaviour. Pause, end and media error
+retain priority over both classifications.
+
+`progressSignal` identifies the selected evidence. `clockProgressAgeMs` and
+`selectedFrameProgressAgeMs` measure time since independently observed advances,
+or since observation began if no advance has been seen. The corresponding
+`lastClockProgressElapsedMs` and `lastSelectedFrameProgressElapsedMs` are null
+until progress is observed. These sampled scalar diagnostics do not relax the
+paired gate. `lastProgressElapsedMs` still identifies confirmed paired progress.
+Clock and frame signals are compared with the last confirmed pair so staggered
+native updates cannot cause a false stall. A callback arriving after the clock
+has been frozen for four seconds cannot turn that stale pair into playing.
+Counter/time resets establish a baseline without fabricating progress.
 The callback is a browser presentation signal, not physical screen/camera proof.
 Buffered-ahead time and seekable ranges are diagnostic
 values, not glass-to-glass latency. Native HLS may buffer differently from the
@@ -40,8 +58,9 @@ separate hls.js fixture; qualify both independently.
 
 Run `node tests/native-live-viewer.test.mjs` for event/path validation,
 single-source identity through simulated dimension changes and errors,
-progress/stall/pause/end handling, a frozen quality counter with continuing
-presentation, no-frame stalls, bounded immutable snapshots, one owned callback,
+paired-progress/unverified/clock-stall/pause/end handling, a frozen quality counter
+with continuing presentation, advancing clock with no selected frame signal,
+frozen clock with callbacks, bounded immutable snapshots, one owned callback,
 dispose/pagehide cancellation and stale-callback fencing. These deterministic
 tests do not establish physical Safari recovery. This observer correction does
-not fix or reclassify the earlier confirmed native playback failures.
+not fix playback or retrospectively certify periods without presentation evidence.
