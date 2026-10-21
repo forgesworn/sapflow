@@ -245,7 +245,8 @@ per target). The Linux and Caddy measurements are not done.
   and glass-to-glass delay.
 - CI on the public repo: tests, clippy, fmt, short fuzz runs, nightly long
   fuzzing (`.github/workflows/ci.yml`, `fuzz-nightly.yml`). `ci.yml` passed
-  on its first run on GitHub; the nightly fuzz run is not yet seen.
+  on its first run on GitHub, and `fuzz-nightly.yml` (run by hand on
+  2026-10-21) fuzzed every target for 20 minutes with no crash.
 
 ### Later
 
