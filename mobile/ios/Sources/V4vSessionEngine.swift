@@ -15,6 +15,14 @@ struct V4vControlRequest: CustomStringConvertible, CustomDebugStringConvertible 
     var debugDescription: String { description }
 }
 
+struct V4vObservationStatusPermit: CustomStringConvertible, CustomDebugStringConvertible {
+    let call: V4vHTTPCall
+    let identity: V4vIdentity
+    let expiresAtNs: UInt64
+    var description: String { "Ephemeral V4V status authority (redacted)" }
+    var debugDescription: String { description }
+}
+
 /// Runtime-free, single serial owner. It stages exact durable requests; the
 /// caller runs HTTP asynchronously and returns the captured operation. No timer,
 /// automatic capture start, signer, socket or camera is owned here.
@@ -164,6 +172,18 @@ final class V4vSessionEngine {
     func pendingRequest(clock: V4vClock) throws -> V4vControlRequest? {
         let bearer = try auth(clock)
         return pending.map { V4vControlRequest(operation: $0, bearer: bearer) }
+    }
+    /// Fresh exact-session GET for the observer's separate control client.
+    /// Neither the journal nor a collection lookup is an observation receipt.
+    func observationStatusRequest(clock: V4vClock) throws -> V4vObservationStatusPermit {
+        try tick(clock: clock)
+        let bearer = try auth(clock)
+        guard pending == nil, !terminalIntent, !restoredRequiresRefresh, expiredScope == nil,
+              let session, session.phase == "active", session.permitsGrant, let grant, grant.identity == session.identity else { throw V4vFailure.terminal }
+        let expiryMs = min(grant.expiresMs, try document.uint("bearerExpiresMs", min: 1, max: V4vJSON.maxEpoch))
+        guard expiryMs > lastMs, expiryMs - lastMs <= (UInt64.max - clock.monotonicNs) / 1_000_000 else { throw V4vFailure.terminal }
+        return V4vObservationStatusPermit(call: V4vHTTPCall(status: session.identity, bearer: bearer), identity: session.identity,
+                                         expiresAtNs: clock.monotonicNs + (expiryMs - lastMs) * 1_000_000)
     }
     /// No failure path clears pending. Re-send this same operation after timeout,
     /// including process restart; status is not an idempotency acknowledgement.

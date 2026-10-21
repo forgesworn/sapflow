@@ -30,12 +30,29 @@ qualification/release isolation and native alignment checks. The signed
 qualification APK has not replaced the owner's active Android capture. Actual
 480p hardware, sustained grant-cap and orientation qualification remain open.
 
+Android commit `b3b7398`, following attempt-correlation commit `97f0656`, adds
+finite native hardware-video and PCM-audio observation. Fresh authenticated
+status before and after decoding, captured attempt identity and current grant
+authority guard SDK confirmation. Its reviewed qualification and unsigned
+release APKs pass 218 JVM tests in 37 suites, lint with zero errors and ten
+warnings, package isolation and ARM64 alignment checks. The new decoder has
+not run on the Pixel; the owner's existing capture remains untouched.
+
 iOS commit `fdc731fc` provides typed V4V contracts, bounded URLSession control,
 durable session operations and encrypted journal storage. It passes 35 host
 Swift tests and an iOS 16 compile check with warnings treated as errors.
 Independent review is clear. It is a foundation separate from the installed
 app: creator sign-in, application wiring and real Keychain/network acceptance
 remain open.
+
+Further iOS source adds a finite production origin-observation component with
+23 passing host tests and an iOS 16 compiler check. It requires hardware H264
+decode on iOS 17 or later, real PCM progress, fresh status on both sides of
+decode and a final attempt-scoped SDK confirmation. The generated-media macOS
+gate produces six hardware video outputs and 7,104 PCM frames, rejects
+header-only input and confirms cleanup. Delayed observer replies cannot mutate
+the creator's refreshed grant. This component is separate from application
+wiring, physical iPhone decoding, real creator sign-in and sustained performance.
 
 Test commit `d0643ff` adds a generated-media-only macOS native reader gate.
 The current origin's exact init plus independent part passes independent FFmpeg

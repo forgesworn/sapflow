@@ -39,6 +39,21 @@ def independent_part_uris(epoch, raw):
     return result
 
 
+def reader_environment(scratch):
+    # Native decoder timeout callbacks precede actual cleanup. Even if this
+    # subprocess must be killed, its generated downloaded media stays inside
+    # the parent's scratch and is removed after the child has terminated.
+    return dict(os.environ, TMPDIR=str(scratch.resolve()) + os.sep)
+
+
+def validate_reader_result(summary, returncode, expected, require_cleanup):
+    assert summary["ok"] == expected and (returncode == 0) == expected and returncode != 124
+    if require_cleanup:
+        assert summary.get("cleanupComplete") is True, "reader returned before its native cleanup completed"
+    if expected:
+        assert summary["videoOutputs"] >= 2 and summary["validatedPCMFrames"] >= 2048
+
+
 def cleanup_owned(children, scratch):
     errors = []
     for child in children:
@@ -90,6 +105,8 @@ def main():
     parser.add_argument("--origin-binary", required=True, type=Path)
     parser.add_argument("--reader-executable", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--require-cleanup-complete", action="store_true",
+                        help="require actual native cleanup receipts from the production decoder")
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("this native reader check requires macOS")
@@ -122,7 +139,7 @@ def main():
     origin = publisher = None
     receipt = {
         "startedUtc": datetime.now(timezone.utc).isoformat(),
-        "scope": "macOS native reader feasibility; no hardware, iPhone or playback qualification",
+        "scope": "finite macOS native reader check; no phone or playback qualification",
         "source": "lavfi testsrc2 and sine generated in this run",
         "originBinarySha256": hashlib.sha256(origin_binary.read_bytes()).hexdigest(),
         "readerBinarySha256": hashlib.sha256(reader_binary.read_bytes()).hexdigest(),
@@ -207,19 +224,19 @@ def main():
                         "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"],
                        capture_output=True, timeout=10, check=True)
         receipt["independentDecodedTracks"] = streams
-        subprocess.run([str(reader_binary), "--check-pcm-timing"], capture_output=True, timeout=6, check=True)
+        reader_env = reader_environment(scratch)
+        receipt["readerTemporaryDirectoryParentOwned"] = True
+        subprocess.run([str(reader_binary), "--check-pcm-timing"], capture_output=True, timeout=6, check=True, env=reader_env)
         receipt["pcmTimingNegativeAndBoundaryChecksPassed"] = True
         for name, path, expected in [("init-and-independent-part", fixture, True), ("initialisation-without-media", header, False)]:
             started = time.monotonic()
             result = subprocess.run([str(reader_binary), "--synthetic-mp4", str(path)],
-                                    capture_output=True, text=True, timeout=6)
+                                    capture_output=True, text=True, timeout=6, env=reader_env)
             summary = json.loads(result.stdout)
             case = {"name": name, "exitCode": result.returncode, "elapsedSeconds": time.monotonic() - started,
                     "expectedPass": expected, "summary": summary, "stderrBytes": len(result.stderr)}
             receipt["cases"].append(case)
-            assert summary["ok"] == expected and (result.returncode == 0) == expected and result.returncode != 124
-            if expected:
-                assert summary["videoOutputs"] >= 2 and summary["validatedPCMFrames"] >= 2048
+            validate_reader_result(summary, result.returncode, expected, args.require_cleanup_complete)
         receipt["passed"] = True
     finally:
         try:

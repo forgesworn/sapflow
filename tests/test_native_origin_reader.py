@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -52,6 +53,29 @@ class Child:
 
 
 class NativeReaderHarnessTests(unittest.TestCase):
+    def test_legacy_result_and_strict_production_cleanup_receipts(self):
+        legacy = {"ok": True, "videoOutputs": 6, "validatedPCMFrames": 7104}
+        harness.validate_reader_result(legacy, 0, True, False)
+        with self.assertRaises(AssertionError):
+            harness.validate_reader_result(legacy, 0, True, True)
+        harness.validate_reader_result(dict(legacy, cleanupComplete=True), 0, True, True)
+        refused = {"ok": False, "cleanupComplete": False}
+        with self.assertRaises(AssertionError):
+            harness.validate_reader_result(refused, 1, False, True)
+        harness.validate_reader_result(dict(refused, cleanupComplete=True), 1, False, True)
+
+    def test_reader_temporary_files_remain_in_parent_owned_cleanup(self):
+        with tempfile.TemporaryDirectory(prefix="native-reader-unit-") as parent:
+            scratch = Path(parent) / "own"
+            scratch.mkdir()
+            environment = harness.reader_environment(scratch)
+            subprocess.run([sys.executable, "-c", "import pathlib,tempfile; p=pathlib.Path(tempfile.mkdtemp(prefix='decoder-')); (p/'generated-input').write_bytes(b'synthetic')"],
+                           env=environment, timeout=5, check=True)
+            self.assertEqual(len(list(scratch.glob("decoder-*/generated-input"))), 1)
+            result = harness.cleanup_owned([], scratch)
+            self.assertTrue(result["ownSyntheticScratchRemoved"])
+            self.assertEqual(result["cleanupErrors"], [])
+
     def test_absolute_deadline_is_not_a_retryable_poll_error(self):
         caught = False
         with self.assertRaises(harness.HarnessDeadline):
