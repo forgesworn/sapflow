@@ -290,14 +290,31 @@ impl Session {
         self.stats.transport_connections = self.stats.transport_connections.saturating_add(1);
         Ok(())
     }
-    /// Destination adapter supplies observed playable-media confirmation.
-    /// A confirmed recovery closes this outage; a later outage starts a new one.
+    /// Synchronous adapters that already fence attempts may confirm media here.
+    /// Asynchronous probes must use `media_confirmed_for_attempt` with the
+    /// attempt captured before starting their observation.
     pub fn media_confirmed(
         &mut self,
         generation: Generation,
         now_ns: u64,
     ) -> Result<(), SessionError> {
         self.check(generation)?;
+        self.confirm_media(now_ns)
+    }
+    /// Confirm genuinely decoded media from this exact connection attempt.
+    /// Reject stale work before it can advance the clock or clear an outage.
+    /// A confirmed timely recovery closes this outage; a later failure starts
+    /// a new window. Late confirmation never restores exhausted retries.
+    pub fn media_confirmed_for_attempt(
+        &mut self,
+        generation: Generation,
+        attempt: u64,
+        now_ns: u64,
+    ) -> Result<(), SessionError> {
+        self.check_attempt(generation, attempt)?;
+        self.confirm_media(now_ns)
+    }
+    fn confirm_media(&mut self, now_ns: u64) -> Result<(), SessionError> {
         if !self.transport_connected
             || !matches!(
                 self.state,

@@ -190,6 +190,16 @@ private fun checkNetworkRecoveryAxes() {
         check(uncertain.nextDeadlineNs == null && uncertain.outageDeadlineNs == 1_000_010uL)
         try { session.transportRecovered(generation, attempt, 1_000_011uL, NativeTransportRecoverySource.SRT_PEER_ACKNOWLEDGED_WATERMARK); error("stale attempt recovered") }
         catch (_: BindingException.StaleSession) {}
+        try { session.mediaConfirmedForAttempt(generation, attempt, ULong.MAX_VALUE); error("old decoded observation confirmed successor") }
+        catch (_: BindingException.StaleSession) {}
+        check(session.snapshot().mediaReadiness == NativeMediaReadiness.UNKNOWN)
+        // This fixture exercises the control input, not an actual media decoder.
+        session.mediaConfirmedForAttempt(generation, uncertainAttempt, 1_000_012uL)
+        val decoded = session.snapshot()
+        check(decoded.state == NativeSessionState.LIVE && decoded.mediaReadiness == NativeMediaReadiness.CONFIRMED)
+        check(decoded.retryBudget == NativeRetryBudgetState.EXHAUSTED && decoded.outageDeadlineNs == 1_000_010uL)
         session.cancel(generation)
+        try { session.mediaConfirmedForAttempt(generation, uncertainAttempt, 1_000_013uL); error("decoded observation resurrected cancelled session") }
+        catch (_: BindingException.StaleSession) {}
     }
 }

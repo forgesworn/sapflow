@@ -256,11 +256,25 @@ impl NativeSession {
                 .map(Into::into)
         })
     }
-    /// Only observed playable media may call this. A ready socket, publish
-    /// acceptance or local preview is not a decoded-media observation.
+    /// Legacy synchronous input for adapters that already fence each attempt.
+    /// Async probes must capture attemptEpoch before starting and use
+    /// mediaConfirmedForAttempt. Socket readiness is never a media observation.
     pub fn media_confirmed(&self, generation: u64, now_ns: u64) -> Result<(), BindingError> {
         self.current(generation, |session, current| {
             session.media_confirmed(current, now_ns)
+        })
+    }
+    /// Only actual decoded progress from the captured attempt may call this.
+    /// Generation and attempt checks share the session's existing control lock;
+    /// a delayed old probe cannot confirm its successor or extend its deadline.
+    pub fn media_confirmed_for_attempt(
+        &self,
+        generation: u64,
+        attempt_epoch: u64,
+        now_ns: u64,
+    ) -> Result<(), BindingError> {
+        self.current(generation, |session, current| {
+            session.media_confirmed_for_attempt(current, attempt_epoch, now_ns)
         })
     }
     /// Intentional socket/codec replacement is not a transport failure.
@@ -344,6 +358,64 @@ impl NativeSession {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn decoded_observation_export_fences_attempt_before_clock_and_readiness() {
+        let session = NativeSession::new(90_000).expect("session");
+        let generation = session.start(0).expect("start");
+        session.prepared(generation).expect("prepare");
+        let prior = session.snapshot().expect("first attempt").attempt_epoch;
+        session.transport_failed(generation, 10).expect("failure");
+        assert_eq!(
+            session.tick(generation, 500_000_010).expect("retry"),
+            NativeSessionAction::Connect
+        );
+        let current = session.snapshot().expect("current attempt").attempt_epoch;
+        assert!(prior < current);
+        session
+            .connected(generation, 500_000_011)
+            .expect("replacement accepted");
+        for stale in [0, prior, current + 1] {
+            assert!(matches!(
+                session.media_confirmed_for_attempt(generation, stale, u64::MAX),
+                Err(BindingError::StaleSession)
+            ));
+        }
+        let snapshot = session.snapshot().expect("unconfirmed snapshot");
+        assert_eq!(snapshot.media_readiness, NativeMediaReadiness::Unknown);
+        assert_eq!(snapshot.media_confirmations, 0);
+        assert_eq!(snapshot.stale_callbacks, 3);
+        assert_eq!(snapshot.outage_deadline_ns, Some(90_000_000_010));
+        session
+            .media_confirmed_for_attempt(generation, current, 500_000_012)
+            .expect("current decoder");
+        let snapshot = session.snapshot().expect("confirmed snapshot");
+        assert_eq!(snapshot.media_readiness, NativeMediaReadiness::Confirmed);
+        assert_eq!(snapshot.state, NativeSessionState::Live);
+        assert_eq!(snapshot.outage_deadline_ns, None);
+    }
+
+    #[test]
+    fn decoded_observation_export_cannot_resurrect_stopped_session() {
+        let session = NativeSession::new(90_000).expect("session");
+        let generation = session.start(0).expect("start");
+        session.prepared(generation).expect("prepare");
+        session.connected(generation, 1).expect("accepted");
+        let attempt = session.snapshot().expect("attempt").attempt_epoch;
+        let stopped = session.cancel(generation).expect("cancel");
+        assert!(matches!(
+            session.media_confirmed_for_attempt(generation, attempt, 2),
+            Err(BindingError::StaleSession)
+        ));
+        assert!(matches!(
+            session.media_confirmed_for_attempt(stopped, attempt, 2),
+            Err(BindingError::InvalidSession)
+        ));
+        assert_eq!(
+            session.snapshot().expect("stopped snapshot").state,
+            NativeSessionState::Stopped
+        );
+    }
+
     #[test]
     fn intentional_replacement_preserves_the_logical_session_and_observed_media_gate() {
         let session = NativeSession::new(90_000).expect("valid recovery fixture operation");

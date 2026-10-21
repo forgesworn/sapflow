@@ -58,7 +58,22 @@ do {
     _ = try recovery.transportRecovered(generation: recoveryGeneration, attemptEpoch: recoveryAttempt, nowNs: 1_000_011, source: .srtPeerAcknowledgedWatermark)
     fatalError("stale attempt recovered")
 } catch BindingError.StaleSession {}
+do {
+    try recovery.mediaConfirmedForAttempt(generation: recoveryGeneration, attemptEpoch: recoveryAttempt, nowNs: UInt64.max)
+    fatalError("old decoded observation confirmed successor")
+} catch BindingError.StaleSession {}
+let beforeDecoded = try recovery.snapshot()
+precondition(beforeDecoded.mediaReadiness == .unknown)
+// This is a control-only fixture, not an actual media decoder.
+try recovery.mediaConfirmedForAttempt(generation: recoveryGeneration, attemptEpoch: uncertainAttempt, nowNs: 1_000_012)
+let afterDecoded = try recovery.snapshot()
+precondition(afterDecoded.state == .live && afterDecoded.mediaReadiness == .confirmed)
+precondition(afterDecoded.retryBudget == .exhausted && afterDecoded.outageDeadlineNs == 1_000_010)
 _ = try recovery.cancel(generation: recoveryGeneration)
+do {
+    try recovery.mediaConfirmedForAttempt(generation: recoveryGeneration, attemptEpoch: uncertainAttempt, nowNs: 1_000_013)
+    fatalError("decoded observation resurrected cancelled session")
+} catch BindingError.StaleSession {}
 
 var input = Data([1, 2, 3, 4])
 let sample = try EncodedBuffer(bytes: input)

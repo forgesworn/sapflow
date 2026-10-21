@@ -23,8 +23,19 @@ actual failure then starts a new window using the destination's actual grace,
 including zero. Repeated failures or intentional codec/socket replacement do
 not extend an existing window. Clock rollback and stale attempts are refused.
 
-`mediaConfirmed` remains a decoded-observation input. Only it sets `live` and
-confirmed readiness. Transport recovery leaves decoded readiness unknown.
+An asynchronous decoded-media probe must capture the session generation and
+`attemptEpoch` before fetching or decoding, then call
+`mediaConfirmedForAttempt(generation, capturedAttemptEpoch, nowNs)`. The SDK
+checks both identities under its existing control lock before advancing the
+clock, changing readiness or clearing an outage. A stale reply cannot confirm
+a successor attempt, even within the same logical show. Do not substitute the
+latest snapshot's attempt when an old probe completes. The adapter must also
+check its destination, capture epoch and exact origin resource/connection nonce.
+
+The older `mediaConfirmed` input remains available for synchronous adapters
+that already fence their attempts. It does not fence delayed probes by itself.
+Only genuine decoded observations set `live` and confirmed readiness.
+Transport recovery leaves decoded readiness unknown.
 Actual decoded observation after the retry window has exhausted may describe
 playback, but cannot restore retry permission. Admission expiry, revoke and
 explicit End remain independently terminal; network recovery grants no authority.
