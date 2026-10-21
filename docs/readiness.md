@@ -40,7 +40,7 @@ the v4v player fix for Safari drift is not merged (section 3).
 | Larix's first SRT attempt | Sometimes accepted but sends no data, times out after 5 s, and a later attempt works (`docs/interop.md`). Repeat cold starts with a capture at both ends. Unexplained. | The phone, a capture |
 | Other encoders | Larix with the phone locked; Larix on Android; OBS's Apple hardware encoder; vMix. | Devices; vMix access |
 | SRT handshake version 4 | No encoder tested needed it. Find one that does and test it, or document it as unsupported. | An older encoder |
-| Safari after drops | Safari ended about 10 s behind the camera after seven drops. The v4v player fix is on an unmerged v4v branch; rewatch with a measured offset once it ships. | The v4v fix |
+| Safari after drops | Safari ended about 10 s behind the camera after seven drops. The v4v player fix is merged (v4v #475) but not yet watched in real Safari; rewatch with `?stats=1` across drops. | A Safari or iPhone check |
 
 ## 4. Risks for a switch, and mitigations
 
@@ -48,14 +48,14 @@ the v4v player fix for Safari drift is not merged (section 3).
   back by restoring the templates and Caddy upstream (section 5). Do it
   between shows: a rollback during a show ends the stream, and has not been
   rehearsed.
-- **Unmerged work.** The srt-rs removal (`feat/m6c-remove-srt-rs`) and v4v's
-  gate branch are not merged. On `main`, `SAPFLOW_SRT_IMPL=srt-rs` is still an
-  in-binary fallback; after the removal the only fallback is mediamtx. Run the
-  trial on a named build and re-run the smoke test and both gates against it.
+- **No in-binary fallback.** srt-rs was removed (M6c), so the only fallback
+  is mediamtx. v4v's gate branch is not merged. Run the trial on a named
+  build and re-run the smoke test and both gates against it.
 - **Larix first attempt.** Unexplained. Tell performers to retry, keep the
   encoder's auto-reconnect on, and keep logs from the trial.
-- **Safari drift.** Each drop leaves Safari further behind until the v4v fix
-  ships. Ship it before the trial, or choose a show on a wired encoder.
+- **Safari drift.** Each drop left Safari further behind; the v4v fix
+  (#475) jumps back to live, untested in real Safari. Check it before the
+  trial, or choose a show on a wired encoder.
 - **One maintainer, our own protocol code.** Both ingest protocols are ours,
   with no upstream to lean on. The answers are fuzzing, the loss comparison
   against libsrt and the mediamtx fallback.
