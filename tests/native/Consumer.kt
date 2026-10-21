@@ -5,6 +5,7 @@ import java.util.Base64
 fun main() {
     check(sdkAbiVersion() == 1u)
     checkPackagedStatusLeaseCache()
+    checkIntentionalTransportReplacement()
     val input = ByteBuffer.allocateDirect(4)
     input.put(byteArrayOf(1, 2, 3, 4)).flip()
     EncodedBuffer(input).use { sample ->
@@ -121,4 +122,30 @@ private fun checkPackagedStatusLeaseCache() {
     val first = slots[0] ?: error("SDK call did not populate the generated status cache")
     repeat(100) { check(sdkAbiVersion() == 1u) }
     check((cached.get(stack) as Array<*>)[0] === first && depth.getInt(stack) == 0)
+}
+
+/** Real generated control bindings; no sockets, capture or timers are started. */
+private fun checkIntentionalTransportReplacement() {
+    NativeSession(90_000uL).use { session ->
+        val generation = session.start(0uL)
+        check(session.prepared(generation) == NativeSessionAction.Connect)
+        session.connected(generation, 1uL)
+        session.mediaConfirmed(generation, 2uL)
+        check(session.replaceTransport(generation, 200_000_000_000uL) == NativeSessionAction.Connect)
+        val healthy = session.snapshot()
+        check(healthy.generation == generation && healthy.state == NativeSessionState.CONNECTING)
+        check(!healthy.transportConnected && healthy.reconnectDeadlineNs == null && healthy.transportFailures == 0uL)
+        session.transportFailed(generation, 200_000_000_010uL)
+        val deadline = session.snapshot().reconnectDeadlineNs!!
+        check(deadline == 290_000_000_010uL)
+        check(session.replaceTransport(generation, 200_000_000_020uL) == NativeSessionAction.Connect)
+        val outage = session.snapshot()
+        check(outage.state == NativeSessionState.RECONNECTING && outage.reconnectDeadlineNs == deadline)
+        check(!outage.transportConnected && outage.transportFailures == 1uL)
+        check(session.replaceTransport(generation, deadline) == NativeSessionAction.GraceExpired)
+        val cancelled = session.cancel(generation)
+        try { session.replaceTransport(generation, deadline); error("stale replacement accepted") }
+        catch (_: BindingException.StaleSession) {}
+        check(session.snapshot().generation == cancelled && session.snapshot().state == NativeSessionState.STOPPED)
+    }
 }

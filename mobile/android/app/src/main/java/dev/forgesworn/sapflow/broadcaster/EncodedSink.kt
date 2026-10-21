@@ -14,6 +14,10 @@ interface EncodedSink : AutoCloseable {
     fun start() {}
     /** Borrowed immutable descriptors, valid until sink close completes. */
     fun configure(video: RustCodec?, audio: RustCodec?) {}
+    /** A transport became ready; controller posts a generation-fenced IDR request. */
+    fun setKeyframeRequester(request: () -> Unit) {}
+    /** Nonblocking logical-destination fence, before capture/epoch teardown. */
+    fun stopDestination() {}
     fun consume(sample: MediaSample)
     /** Graceful finalisation on the existing sink worker, after accepted media. */
     fun finish() = close()

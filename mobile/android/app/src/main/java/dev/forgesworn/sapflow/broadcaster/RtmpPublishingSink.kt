@@ -28,11 +28,13 @@ import kotlin.concurrent.withLock
 /** One explicitly selected attempt. Platform TLS validates CA chains and the
  * destination hostname; there is no trust override or plaintext fallback.
  * Failed attempts stop sending while independent capture/recording can continue. */
-internal class RtmpPublishingSink(private val destination: RtmpDestination, streamKey: String) : EncodedSink {
+internal class RtmpPublishingSink(private val destination: RtmpDestination, streamKey: String,
+    private val events: (PublishingAttemptEvent) -> Unit = {}) : EncodedSink {
     private val message = AtomicReference("Destination prepared · press Start to connect")
     override val status: String get() = message.get()
     private val closed = AtomicBoolean(false)
     private val ready = AtomicBoolean(false)
+    private val accepted = AtomicBoolean(false)
     private val firstKeyframe = FirstKeyframeGate()
     private val socket = AtomicReference<Socket?>()
     private val tcpSocket = AtomicReference<Socket?>()
@@ -153,7 +155,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                 }
             }
         } catch (error: Exception) {
-            if (!closed.get()) fail("Attempt stopped: ${error.javaClass.simpleName}. No automatic retry.")
+            if (!closed.get()) fail("Attempt stopped: ${error.javaClass.simpleName}.")
         } finally {
             abortTransport()
             if (closed.get()) runCatching { releasePublisher() }
@@ -164,6 +166,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         when (publisher!!.state()) {
             NativeRtmpState.PUBLISHING -> {
                 ready.set(true)
+                if (accepted.compareAndSet(false, true)) events(PublishingAttemptEvent.Accepted)
                 message.set("Origin accepted ${if (destination.tls) "RTMPS" else "development RTMP"} · media delivery unconfirmed")
             }
             NativeRtmpState.CLOSED, NativeRtmpState.FAILED -> error("Origin stopped publication")
@@ -230,9 +233,10 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         return answer.get()
     }
 
-    private fun fail(reason: String) {
+    private fun fail(reason: String) = failAttemptOnce(closed, notify = {
         message.set(reason)
-        closed.set(true)
+        events(PublishingAttemptEvent.Failed())
+    }, cleanup = {
         deadlineGeneration.incrementAndGet()
         ready.set(false)
         dnsCancellation.cancel()
@@ -241,7 +245,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         // Called under the publishing worker's lock or by the reader after its
         // lock scope. A future consume sees Closed and releases its handle.
         releasePublisher()
-    }
+    })
 
     override fun close() = lifecycle.close()
 

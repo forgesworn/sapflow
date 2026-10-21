@@ -27,6 +27,7 @@ internal class SrtPublishingSink(
     private val streamId: String,
     passphrase: String,
     private val plaintext: Boolean,
+    private val events: (PublishingAttemptEvent) -> Unit = {},
 ) : EncodedSink {
     private data class Codecs(val video: RustCodec?, val audio: RustCodec?)
     private val codecs = AtomicReference(Codecs(null, null))
@@ -116,7 +117,10 @@ internal class SrtPublishingSink(
                     }
                     for (index in 0 until 16) {
                         when (val event = publisher.pollEvent()) {
-                            is NativeSrtEvent.Connected -> message.set("SRT ${if (plaintext) "plaintext lab" else "AES-256"} handshake complete · media delivery unconfirmed")
+                            is NativeSrtEvent.Connected -> {
+                                message.set("SRT ${if (plaintext) "plaintext lab" else "AES-256"} handshake complete · media delivery unconfirmed")
+                                events(PublishingAttemptEvent.Accepted)
+                            }
                             is NativeSrtEvent.Closed -> error("SRT closed: ${event.reason}")
                             is NativeSrtEvent.Failed -> error("SRT failed: ${event.reason}")
                             null -> break
@@ -213,11 +217,13 @@ internal class SrtPublishingSink(
         worker?.takeIf { it !== Thread.currentThread() }?.interrupt()
     }
 
-    private fun fail(reason: String) {
+    private fun fail(reason: String) = failAttemptOnce(closed, notify = {
         message.set(reason)
+        events(PublishingAttemptEvent.Failed())
+    }, cleanup = {
         abortTransport()
         offered.cancel()
-    }
+    })
 
     override fun close() = lifecycle.close()
 

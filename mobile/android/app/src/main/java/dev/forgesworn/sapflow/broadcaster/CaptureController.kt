@@ -187,6 +187,8 @@ class CaptureController(private val context: Context) {
     /** Attach configured sinks before prepare. Their IO executes on separate
      * owned workers, with one in-flight immutable handle each. */
     private var publishingSink: EncodedSink? = null
+    @Volatile private var publishingSession: EncodedSink? = null
+    private var lastTransportSyncNs = Long.MIN_VALUE
     private var recordingSink: EncodedSink? = null
 
     fun snapshot() = CaptureSnapshot(stage, message, videoEncoderName, audioEncoderName,
@@ -205,6 +207,7 @@ class CaptureController(private val context: Context) {
                 return@post
             }
             cleanupExpired = false; stopFailed = false
+            publishingSession?.stopDestination(); publishingSession = null
             publishFactory = publisher
             recordFactory = recorder
             autoStart = false
@@ -236,6 +239,19 @@ class CaptureController(private val context: Context) {
         traceLifecycle(CaptureLifecycleDiagnostics.Code.PREPARING)
         try {
             publishingSink = publishFactory?.invoke()
+            if (publishingSession == null) publishingSession = publishingSink
+            val publishingEpoch = generation
+            publishingSink?.setKeyframeRequester { handler.post {
+                val now = System.nanoTime()
+                if (publishingEpoch == generation && stage == CaptureStage.CAPTURING &&
+                    (lastTransportSyncNs == Long.MIN_VALUE || now - lastTransportSyncNs >= 1_000_000_000L)) {
+                    lastTransportSyncNs = now
+                    try {
+                        videoEncoder?.setParameters(android.os.Bundle().apply { putInt(PlatformCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+                        syncRequests++
+                    } catch (error: Exception) { fail("Transport recovery keyframe request failed: ${error.javaClass.simpleName}") }
+                }
+            } }
             recordingSink = recordFactory?.invoke()
             prepareOnHandler(previewSurface, generation)
         } catch (error: Exception) { fail("Prepare failed: ${error.message ?: error.javaClass.simpleName}") }
@@ -678,13 +694,18 @@ class CaptureController(private val context: Context) {
         }
     }
 
-    fun stop(reason: String = "Stopped") { handler.post {
-        autoStart = false; restart.cancel(); restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
-        stopOnHandler(reason, failed = false)
-    } }
+    fun stop(reason: String = "Stopped") {
+        publishingSession?.stopDestination() // Fence even while codec-handler work is queued.
+        handler.post {
+            publishingSession?.stopDestination()
+            autoStart = false; restart.cancel(); restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
+            stopOnHandler(reason, failed = false)
+        }
+    }
 
     private fun fail(reason: String, code: CaptureLifecycleDiagnostics.Code = CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE) {
         if (stage == CaptureStage.STOPPING || stage == CaptureStage.ERROR || stage == CaptureStage.IDLE) return
+        publishingSession?.stopDestination()
         markFailure(code, reason)
         stage = CaptureStage.STOPPING
         // Queue control cleanup after the callback has released its codec buffer.
@@ -719,6 +740,7 @@ class CaptureController(private val context: Context) {
             markFailure(CaptureLifecycleDiagnostics.Code.RECORDING_FAILURE, stopReason)
         }
         if (failed) {
+            publishingSession?.stopDestination()
             autoStart = false; restart.cancel()
             abortPublisherEarly()
         }
@@ -870,6 +892,7 @@ class CaptureController(private val context: Context) {
             handler.post {
                 stopDeadline?.let(handler::removeCallbacks); stopDeadline = null
                 if (!resourcesReleased) {
+                    publishingSession?.stopDestination()
                     markFailure(CaptureLifecycleDiagnostics.Code.CLEANUP_FAILURE,
                         "Capture/sink cleanup unfinished; retained resources prevent a new epoch", cleanupTimedOut = true)
                     stage = CaptureStage.ERROR
@@ -898,6 +921,7 @@ class CaptureController(private val context: Context) {
                     stopReason = "Preview unavailable after orientation change; prepare again"
                 }
                 stage = if (stopFailed || cleanupExpired) CaptureStage.ERROR else CaptureStage.IDLE
+                publishingSession?.stopDestination()
                 message = lifecycle.message(stopReason)
                 publishFactory = null; recordFactory = null
                 finishControllerClose()
@@ -961,8 +985,10 @@ class CaptureController(private val context: Context) {
     }
 
     fun close() {
+        publishingSession?.stopDestination()
         handler.post {
             shutdownRequested = true; autoStart = false; restart.cancel()
+            publishingSession?.stopDestination()
             publishFactory = null; recordFactory = null
             stopOnHandler("Closed", failed = false)
         }

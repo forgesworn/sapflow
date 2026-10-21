@@ -1,6 +1,37 @@
 import Foundation
 
 precondition(sdkAbiVersion() == 1)
+// Exercise actual generated lifecycle control; no network/capture is attached.
+let lifecycle = try NativeSession(graceMs: 90_000)
+let lifecycleGeneration = try lifecycle.start(nowNs: 0)
+let preparedAction = try lifecycle.prepared(generation: lifecycleGeneration)
+precondition(preparedAction == .connect)
+try lifecycle.connected(generation: lifecycleGeneration, nowNs: 1)
+try lifecycle.mediaConfirmed(generation: lifecycleGeneration, nowNs: 2)
+let replaceHealthy = try lifecycle.replaceTransport(generation: lifecycleGeneration, nowNs: 200_000_000_000)
+let healthySnapshot = try lifecycle.snapshot()
+precondition(replaceHealthy == .connect && healthySnapshot.generation == lifecycleGeneration)
+precondition(healthySnapshot.state == .connecting && !healthySnapshot.transportConnected)
+precondition(healthySnapshot.reconnectDeadlineNs == nil && healthySnapshot.transportFailures == 0)
+_ = try lifecycle.transportFailed(generation: lifecycleGeneration, nowNs: 200_000_000_010)
+let outageBefore = try lifecycle.snapshot()
+let outageDeadline = outageBefore.reconnectDeadlineNs!
+precondition(outageDeadline == 290_000_000_010)
+let replaceOutage = try lifecycle.replaceTransport(generation: lifecycleGeneration, nowNs: 200_000_000_020)
+let outageAfter = try lifecycle.snapshot()
+precondition(replaceOutage == .connect && outageAfter.state == .reconnecting)
+precondition(outageAfter.reconnectDeadlineNs == outageDeadline && !outageAfter.transportConnected)
+precondition(outageAfter.transportFailures == 1)
+let expiredReplacement = try lifecycle.replaceTransport(generation: lifecycleGeneration, nowNs: outageDeadline)
+precondition(expiredReplacement == .graceExpired)
+let lifecycleCancelled = try lifecycle.cancel(generation: lifecycleGeneration)
+do {
+    _ = try lifecycle.replaceTransport(generation: lifecycleGeneration, nowNs: outageDeadline)
+    fatalError("stale replacement accepted")
+} catch BindingError.StaleSession {}
+let lifecycleStopped = try lifecycle.snapshot()
+precondition(lifecycleStopped.generation == lifecycleCancelled && lifecycleStopped.state == .stopped)
+
 var input = Data([1, 2, 3, 4])
 let sample = try EncodedBuffer(bytes: input)
 input.resetBytes(in: 0..<input.count)

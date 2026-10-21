@@ -227,6 +227,37 @@ impl Session {
         self.stats.media_confirmations = self.stats.media_confirmations.saturating_add(1);
         Ok(())
     }
+    /// Replace an intentional codec/socket epoch within this logical session.
+    /// The adapter must fence and close the old attempt before acting on Connect.
+    /// This is not a network failure: a healthy replacement starts no outage,
+    /// while an existing outage keeps its original deadline and failure history.
+    pub fn replace_transport(
+        &mut self,
+        generation: Generation,
+        now_ns: u64,
+    ) -> Result<SessionAction, SessionError> {
+        self.check(generation)?;
+        if !matches!(
+            self.state,
+            SessionState::Connecting | SessionState::Live | SessionState::Reconnecting
+        ) {
+            return Err(SessionError::InvalidTransition);
+        }
+        self.clock(now_ns)?;
+        if self.deadline_ns.is_some_and(|deadline| now_ns >= deadline) {
+            self.expire();
+            return Ok(SessionAction::GraceExpired);
+        }
+        self.transport_connected = false;
+        self.retry_at_ns = None;
+        self.state = if self.deadline_ns.is_some() {
+            SessionState::Reconnecting
+        } else {
+            SessionState::Connecting
+        };
+        Ok(SessionAction::Connect)
+    }
+
     pub fn transport_failed(
         &mut self,
         generation: Generation,
@@ -364,5 +395,235 @@ impl Session {
         self.deadline_ns = None;
         self.transport_connected = false;
         Ok(generation)
+    }
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+
+    fn connecting() -> (Session, Generation) {
+        let mut session = Session::new(ReconnectPolicy::default());
+        let generation = session.start(0).expect("start");
+        session.prepared(generation).expect("prepared");
+        (session, generation)
+    }
+    fn live() -> (Session, Generation) {
+        let (mut session, generation) = connecting();
+        session.connected(generation, 1).expect("connected");
+        session
+            .media_confirmed(generation, 2)
+            .expect("observed media");
+        (session, generation)
+    }
+
+    #[test]
+    fn healthy_rotation_after_long_show_does_not_create_an_outage() {
+        let (mut session, generation) = live();
+        let stats = session.stats();
+        let rotation = 600_000_000_000;
+        assert_eq!(
+            session.replace_transport(generation, rotation),
+            Ok(SessionAction::Connect)
+        );
+        assert_eq!(session.generation(), generation);
+        assert_eq!(session.state(), SessionState::Connecting);
+        assert!(!session.transport_connected());
+        assert_eq!(session.reconnect_deadline_ns(), None);
+        assert_eq!(session.stats(), stats);
+        assert_eq!(
+            session.media_confirmed(generation, rotation + 1),
+            Err(SessionError::InvalidTransition)
+        );
+        session
+            .connected(generation, rotation + 2)
+            .expect("new socket");
+        assert_eq!(session.state(), SessionState::Connecting);
+        session
+            .media_confirmed(generation, rotation + 3)
+            .expect("new playable media");
+        assert_eq!(session.state(), SessionState::Live);
+        let later_outage = rotation + 300_000_000_000;
+        session
+            .transport_failed(generation, later_outage)
+            .expect("real failure");
+        assert_eq!(
+            session.reconnect_deadline_ns(),
+            Some(later_outage + DEFAULT_RECONNECT_GRACE_NS)
+        );
+        assert_eq!(session.stats().transport_failures, 1);
+    }
+
+    #[test]
+    fn unconfirmed_connecting_replacement_never_starts_a_failure_window() {
+        for has_socket in [false, true] {
+            let (mut session, generation) = connecting();
+            if has_socket {
+                session.connected(generation, 1).expect("socket only");
+            }
+            for now in [200_000_000_000, 400_000_000_000] {
+                assert_eq!(
+                    session.replace_transport(generation, now),
+                    Ok(SessionAction::Connect)
+                );
+                assert_eq!(session.state(), SessionState::Connecting);
+                assert!(!session.transport_connected());
+                assert_eq!(session.reconnect_deadline_ns(), None);
+                assert_eq!(session.stats().transport_failures, 0);
+                assert_eq!(session.stats().retry_attempts, 0);
+            }
+            session
+                .transport_failed(generation, 500_000_000_000)
+                .expect("first actual failure");
+            assert_eq!(session.reconnect_deadline_ns(), Some(590_000_000_000));
+        }
+    }
+
+    #[test]
+    fn rotation_during_outage_preserves_deadline_and_backoff_but_consumes_old_retry() {
+        let (mut session, generation) = live();
+        assert_eq!(
+            session.transport_failed(generation, 10),
+            Ok(SessionAction::RetryAt(500_000_010))
+        );
+        let deadline = 10 + DEFAULT_RECONNECT_GRACE_NS;
+        let stats = session.stats();
+        assert_eq!(
+            session.replace_transport(generation, 20),
+            Ok(SessionAction::Connect)
+        );
+        assert_eq!(session.state(), SessionState::Reconnecting);
+        assert_eq!(session.reconnect_deadline_ns(), Some(deadline));
+        assert_eq!(session.stats(), stats);
+        assert_eq!(
+            session.tick(generation, 500_000_010),
+            Ok(SessionAction::None)
+        );
+        session
+            .connected(generation, 500_000_020)
+            .expect("replacement handshake");
+        assert_eq!(session.state(), SessionState::Reconnecting);
+        assert_eq!(
+            session.replace_transport(generation, 1_000_000_000),
+            Ok(SessionAction::Connect)
+        );
+        assert!(!session.transport_connected());
+        // The next actual failure retains the prior outage's backoff history.
+        assert_eq!(
+            session.transport_failed(generation, 2_000_000_000),
+            Ok(SessionAction::RetryAt(3_000_000_000))
+        );
+        assert_eq!(session.reconnect_deadline_ns(), Some(deadline));
+        assert_eq!(session.stats().transport_failures, 2);
+        assert_eq!(session.stats().retry_attempts, 0);
+    }
+
+    #[test]
+    fn replacement_at_or_after_outage_expiry_never_rearms_or_connects() {
+        for offset in [0, 1] {
+            let (mut session, generation) = live();
+            session.transport_failed(generation, 10).expect("failure");
+            let deadline = session.reconnect_deadline_ns().expect("deadline");
+            assert_eq!(
+                session.replace_transport(generation, deadline + offset),
+                Ok(SessionAction::GraceExpired)
+            );
+            assert_eq!(session.state(), SessionState::Failed);
+            assert_eq!(session.reconnect_deadline_ns(), Some(deadline));
+            assert!(!session.transport_connected());
+            assert_eq!(session.stats().transport_failures, 1);
+            assert_eq!(
+                session.tick(generation, deadline + offset),
+                Ok(SessionAction::None)
+            );
+            assert_eq!(
+                session.replace_transport(generation, deadline + offset),
+                Err(SessionError::InvalidTransition)
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_is_fenced_by_stop_cancel_and_nonongoing_states() {
+        for cancel in [false, true] {
+            let (mut session, generation) = live();
+            let stopped = if cancel {
+                session.cancel(generation).expect("cancel")
+            } else {
+                let (stopping, _) = session.stop(generation).expect("stop");
+                assert_eq!(
+                    session.replace_transport(stopping, 3),
+                    Err(SessionError::InvalidTransition)
+                );
+                session.finish_stop(stopping).expect("stopped");
+                stopping
+            };
+            assert_eq!(
+                session.replace_transport(generation, 3),
+                Err(SessionError::StaleGeneration)
+            );
+            assert_eq!(
+                session.replace_transport(stopped, 3),
+                Err(SessionError::InvalidTransition)
+            );
+            assert_eq!(session.state(), SessionState::Stopped);
+            assert_eq!(session.reconnect_deadline_ns(), None);
+        }
+        let (mut session, generation) = live();
+        let interrupted = session.interrupt(generation).expect("interrupt");
+        assert_eq!(
+            session.replace_transport(interrupted, 3),
+            Err(SessionError::InvalidTransition)
+        );
+        let mut session = Session::new(ReconnectPolicy::default());
+        let idle = session.generation();
+        assert_eq!(
+            session.replace_transport(idle, 0),
+            Err(SessionError::InvalidTransition)
+        );
+        let preparing = session.start(0).expect("start");
+        assert_eq!(
+            session.replace_transport(preparing, 1),
+            Err(SessionError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn replacement_rejects_clock_rollback_without_mutating_current_attempt() {
+        let (mut session, generation) = live();
+        session.transport_failed(generation, 100).expect("failure");
+        session.connected(generation, 200).expect("socket");
+        let stats = session.stats();
+        let deadline = session.reconnect_deadline_ns();
+        assert_eq!(
+            session.replace_transport(generation, 199),
+            Err(SessionError::ClockWentBackwards)
+        );
+        assert_eq!(session.state(), SessionState::Reconnecting);
+        assert!(session.transport_connected());
+        assert_eq!(session.reconnect_deadline_ns(), deadline);
+        assert_eq!(session.stats(), stats);
+        assert_eq!(
+            session.replace_transport(generation, 201),
+            Ok(SessionAction::Connect)
+        );
+        assert!(!session.transport_connected());
+    }
+
+    #[test]
+    fn zero_grace_still_allows_intentional_replacement_but_no_failure_retry() {
+        let mut session = Session::new(ReconnectPolicy::new(0, 1, 2).expect("zero grace"));
+        let generation = session.start(0).expect("start");
+        session.prepared(generation).expect("prepared");
+        assert_eq!(
+            session.replace_transport(generation, 100),
+            Ok(SessionAction::Connect)
+        );
+        assert_eq!(session.reconnect_deadline_ns(), None);
+        assert_eq!(
+            session.transport_failed(generation, 101),
+            Ok(SessionAction::GraceExpired)
+        );
+        assert_eq!(session.state(), SessionState::Failed);
     }
 }

@@ -298,11 +298,13 @@ class MainActivity : ComponentActivity() {
             val publisher: () -> EncodedSink? = if (destinationUrl.isBlank()) ({ null }) else if (useSrt) {
                 SrtDestination.validateCredentials(key, passphrase, plaintext)
                 val destination = SrtDestination.parse(destinationUrl.trim())
-                ({ SrtPublishingSink(destination, key, passphrase, plaintext) })
+                val coordinator = ReconnectingPublishingSink { events -> SrtPublishingSink(destination, key, passphrase, plaintext, events) }
+                ({ coordinator.newEpoch() })
             } else {
                 require(key.isNotEmpty()) { "A stream key is required" }
                 val destination = RtmpDestination.parse(destinationUrl.trim(), allowPlaintextDevelopment)
-                ({ RtmpPublishingSink(destination, key) })
+                val coordinator = ReconnectingPublishingSink { events -> RtmpPublishingSink(destination, key, events) }
+                ({ coordinator.newEpoch() })
             }
             val directory = filesDir.toPath().resolve("recordings")
             val recorder: () -> EncodedSink? = if (recordLocally) ({ PrivateRecordingSink(directory) }) else ({ null })

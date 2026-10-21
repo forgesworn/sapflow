@@ -93,6 +93,43 @@ refresh and observed-media confirmation, production configuration and deployment
 complete-show recovery and physical iOS/Android acceptance remain open. Global
 lab credentials are not a production connector.
 
+The legacy generated-media smoke gate also passes SRT and RTMP ingest, health
+and publish callbacks, independent segment/part decoding, grace reconnect with
+one recording, encrypted ingest and missing/wrong-key refusal. Its master check
+now permits codec-epoch dimensions without a fixed resolution attribute and
+independently checks the decoded H264 dimensions and AAC profile instead.
+
+### Native reconnect source and package checkpoint
+
+Android now retains one shared destination session across orientation epochs.
+Typed transport failures schedule a fresh attempt within the original grace;
+the old transport must finish bounded cleanup first. Stop fences retries before
+the codec handler queue. Failed cleanup retains its owner, and stale attempt,
+destination or media-epoch callbacks cannot reopen it. Network loss leaves the
+independent camera/audio capture and private recording running without adding a
+disconnected media backlog. Each accepted attempt requests a fresh keyframe.
+
+The SDK's new `replaceTransport` operation distinguishes healthy intentional
+codec/socket replacement from failure. It starts no outage for a healthy
+rotation and preserves the exact original deadline during an existing outage.
+Its generated Swift and Kotlin consumers pass actual calls. The full Rust
+workspace passes 443 tests, with four normally ignored, plus strict Clippy and
+formatting. The ARM64 AAR builds and passes its packed-consumer check. This is
+an ARM64 qualification package, not all-ABI or physical iOS acceptance.
+
+The frozen Android source packet has 88 inputs. Its M4 build passes all 135 tests
+in 29 suites, lint with zero errors and seven warnings, and actual APK checks for
+qualification/release isolation with the new AAR and native library hashes.
+The qualification APK retains its private test controls; the release APK has
+neither those controls nor the benchmark entrypoint. Signing, installation and
+physical network-drop acceptance remain separate from that build evidence.
+
+Native V4V authentication and trusted current-media observations are still open.
+Manual destinations never turn a handshake, ACK or local encoder into a playable
+media confirmation. After a real outage their original 90-second window can
+therefore expire even after a healthy socket reconnect. Attaching the real
+V4V observation contract is required before treating this as ready for a show.
+
 ## Product constraints
 
 - Standalone native SwiftUI iOS and Compose/Kotlin Android broadcaster, backed

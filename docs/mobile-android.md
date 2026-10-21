@@ -321,14 +321,16 @@ and each write has a two-second socket-close watchdog. A network reader and
 deadline worker are owned by that one attempt. Rust calls and socket output
 are serialised outside capture callbacks, with at most one bounded wire output
 buffer in flight. Prepublication media is dropped, and sending waits for a
-fresh IDR after acceptance. A stopped attempt is not automatically retried.
+fresh IDR after acceptance. The destination coordinator creates fresh attempts
+when the shared reconnect policy permits; it never reuses a stopped attempt.
 
 The UI reports **Origin accepted ... media delivery unconfirmed** after
 Publish.Start. It does not invent an origin/player acknowledgement. A failed
 network attempt drops publishing samples while capture and independent local
 recording can continue. A recording queue/sink failure closes recording alone
-and leaves publishing running. The shared session grace/reconnect policy is
-an additional parent integration, not implemented by this single-attempt sink.
+and leaves publishing running. The single-attempt transport adapters sit behind
+the shared session grace/reconnect coordinator described below. Its trusted
+origin-media observation remains a separate V4V integration gate.
 
 The sender enforces the negotiated Hard/Soft/Dynamic outstanding-byte window,
 validates cumulative wrapping acknowledgements and retains partial wire output
@@ -869,3 +871,44 @@ host harness includes the new helper in its source list. No native calls,
 socket activity, Gradle build or device operation ran for this gate. Full
 qualification tests/lint/package and an independently observed prompt origin
 shutdown/reconnect remain pending before this source correction is qualified.
+
+
+### Automatic destination reconnect (source packet, not physical qualification)
+
+`ReconnectingPublishingSink` keeps one logical `NativeSession(90_000)` across
+encoded orientation epochs. Explicit Prepare remains dormant; Start connects.
+A transport failure produces one typed event and retires that attempt before a
+fresh socket/native publisher can be constructed. One timer drives the shared
+retry actions and original absolute outage deadline, including while the next
+handshake is pending. Repeated failures and orientation changes do not create a
+new outage window. Healthy intentional orientation replacement uses the explicit
+`replaceTransport` policy seam, which does not manufacture an outage.
+
+Stop, background interruption and capture failure first fence the destination,
+then finish its bounded transport cleanup. A delayed callback, timer or old media
+epoch cannot reopen it. A cleanup failure retains the owner and cancels retries.
+Transport loss does not restart camera/audio capture or the independent private
+recorder. No disconnected media queue is added: existing sample/byte/residence
+bounds remain, and every new attempt waits for an IDR. Transport acceptance also
+posts a generation-fenced encoder sync-frame request, at most once per second.
+
+`OriginMediaConfirmation(destination, epoch, attempt)` is an explicit typed seam for a future
+trusted V4V observation. Manual destinations do not call it. TCP/TLS, SRT
+handshake/ACKs, RTMP Publish.Start, writes and local encoding never confirm
+playable media. Consequently a manual destination can reconnect and send while
+still labelled unconfirmed; after a real outage, the original 90-second window
+expires without a trusted observation, even if the replacement transport is
+healthy. Only a genuine current origin-media observation closes that outage.
+
+The pure controller tests use fake clocks, policy and transport factories. The
+Java-owner tests use synthetic sinks without camera, native protocol calls or
+media. The frozen 88-input v2 packet passed the actual M4 offline build against
+AAR `71c62232…` exposing `NativeSession.replaceTransport`: 135 tests across 29
+suites, no failures or skips, lint zero errors and seven warnings. Qualification
+APK `2bc718f4…` is non-debuggable and shell-profileable; unsigned release APK
+`2fc32f05…` excludes the qualification hook, offline benchmark and profileability.
+Both contain the approved native library `a3d59bab…`. Exact hashes, commands and
+reports are retained in ignored `target/mobile-android/reconnect-v2-*` evidence.
+The owned Gradle process group terminated. No additional signing, installation,
+network-drop test or physical acceptance was performed for this packet; earlier
+frozen APKs do not include it.

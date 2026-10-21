@@ -1,0 +1,183 @@
+package dev.forgesworn.sapflow.broadcaster
+
+import dev.forgesworn.sapflow.MediaSample
+import org.junit.Assert.*
+import org.junit.Test
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+/** Exercise real Java executor/epoch/cleanup ownership with no native calls. */
+class ReconnectingPublishingSinkTest {
+    private class Policy : ReconnectPolicyPort {
+        override var deadlineNs: Long? = null
+        var graceNs = 90_000_000_000L
+        val starts = AtomicInteger(); val failures = AtomicInteger(); val replacements = AtomicInteger()
+        val confirmations = AtomicInteger(); val stops = AtomicInteger()
+        override fun start(nowNs: Long): ReconnectAction { starts.incrementAndGet(); return ReconnectAction.Connect }
+        override fun failed(nowNs: Long): ReconnectAction {
+            failures.incrementAndGet(); if (deadlineNs == null) deadlineNs = nowNs + graceNs
+            return ReconnectAction.Connect
+        }
+        override fun intentionalReplace(nowNs: Long): ReconnectAction { replacements.incrementAndGet(); return ReconnectAction.Connect }
+        override fun connected(nowNs: Long) {}
+        override fun confirmed(nowNs: Long) { confirmations.incrementAndGet(); deadlineNs = null }
+        override fun tick(nowNs: Long) = if (deadlineNs?.let { nowNs >= it } == true) ReconnectAction.Expired else ReconnectAction.None
+        override fun stop() { stops.incrementAndGet() }
+    }
+    private class Sink(val events: (PublishingAttemptEvent) -> Unit) : EncodedSink {
+        val started = CountDownLatch(1)
+        val closing = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        var releaseClose: CountDownLatch? = null
+        var failClose = false
+        var failedStartupCleanup = false
+        override val status = "synthetic transport"
+        override fun start() {
+            started.countDown()
+            if (failedStartupCleanup) throw IllegalStateException("synthetic setup failure").apply {
+                addSuppressed(IllegalStateException("synthetic partial cleanup failure"))
+            }
+        }
+        override fun consume(sample: MediaSample) { error("No media expected in control tests") }
+        override fun close() {
+            closing.countDown()
+            releaseClose?.let { check(it.await(2, TimeUnit.SECONDS)) { "bounded synthetic close" } }
+            if (failClose) error("synthetic retained owner")
+            closed.countDown()
+        }
+    }
+    private class Harness {
+        val policy = Policy()
+        val sinks = CopyOnWriteArrayList<Sink>()
+        var configure: (Sink) -> Unit = {}
+        val owner = ReconnectingPublishingSink(policyFactory = { policy }, factory = { events ->
+            assertTrue("old ownership must be released", sinks.lastOrNull()?.closed?.count != 1L)
+            Sink(events).also { configure(it); sinks.add(it) }
+        })
+        fun sink(index: Int): Sink {
+            val deadline = System.nanoTime() + 2_000_000_000L
+            while (sinks.size <= index && System.nanoTime() < deadline) Thread.sleep(1)
+            check(sinks.size > index) { "attempt was not created" }
+            return sinks[index].also { check(it.started.await(2, TimeUnit.SECONDS)) }
+        }
+    }
+    @Test fun explicitStopFinishesOwnedTransportAndLateEventsNeverReconnect() {
+        val h = Harness(); val epoch = h.owner.newEpoch()
+        epoch.start(); val sink = h.sink(0)
+        epoch.stopDestination(); epoch.close()
+        assertEquals(0L, sink.closed.count)
+        sink.events(PublishingAttemptEvent.Accepted)
+        sink.events(PublishingAttemptEvent.Failed())
+        assertEquals(1, h.sinks.size)
+        assertEquals(1, h.policy.stops.get())
+        assertNull(h.owner.observationScope)
+    }
+    @Test fun failedAttemptMustFinishCleanupBeforeFreshFactoryAndEventsAreCoalesced() {
+        val h = Harness(); val release = CountDownLatch(1)
+        h.configure = { if (h.sinks.isEmpty()) it.releaseClose = release }
+        val epoch = h.owner.newEpoch(); epoch.start(); val first = h.sink(0)
+        first.events(PublishingAttemptEvent.Failed())
+        assertTrue(first.closing.await(2, TimeUnit.SECONDS))
+        repeat(100) { first.events(PublishingAttemptEvent.Failed()) }
+        assertEquals(1, h.sinks.size)
+        release.countDown(); h.sink(1)
+        assertEquals(0L, first.closed.count)
+        assertEquals(1, h.policy.failures.get())
+        epoch.stopDestination(); epoch.close()
+    }
+    @Test fun epochClosePreservesCoordinatorAndOldObservationCannotConfirmNewTransport() {
+        val h = Harness(); val firstEpoch = h.owner.newEpoch(); val ready = CountDownLatch(1)
+        firstEpoch.setKeyframeRequester { ready.countDown() }
+        firstEpoch.start(); val first = h.sink(0)
+        first.events(PublishingAttemptEvent.Accepted)
+        assertTrue(ready.await(2, TimeUnit.SECONDS))
+        val old = checkNotNull(h.owner.observationScope)
+        firstEpoch.close()
+        assertEquals(0, h.policy.stops.get())
+        val secondEpoch = h.owner.newEpoch(); secondEpoch.start(); val second = h.sink(1)
+        second.events(PublishingAttemptEvent.Accepted)
+        first.events(PublishingAttemptEvent.Failed())
+        h.owner.originMediaConfirmed(old)
+        secondEpoch.close() // Serial barrier after the observation.
+        assertEquals(0, h.policy.confirmations.get())
+        assertEquals(1, h.policy.starts.get())
+        assertEquals(2, h.policy.replacements.get())
+        assertEquals(0, h.policy.failures.get())
+        val finalEpoch = h.owner.newEpoch(); finalEpoch.stopDestination(); finalEpoch.close()
+        assertEquals(1, h.policy.stops.get())
+    }
+    @Test fun failedCleanupIsHonestAndPreventsFurtherTransportWhileCaptureCanContinue() {
+        val h = Harness(); h.configure = { it.failClose = true }
+        val epoch = h.owner.newEpoch(); epoch.start(); h.sink(0)
+        epoch.stopDestination()
+        assertThrows(ExecutionException::class.java) { epoch.close() }
+        val inert = h.owner.newEpoch()
+        inert.start() // Terminal publishing does not fail a later capture epoch.
+        assertThrows(ExecutionException::class.java) { inert.close() }
+        assertEquals(1, h.sinks.size)
+        assertTrue(epoch.status.contains("cleanup incomplete"))
+    }
+    @Test fun stoppingPreparedEpochPreventsItsQueuedStartFromCreatingTransport() {
+        val h = Harness(); val epoch = h.owner.newEpoch()
+        epoch.stopDestination(); epoch.start(); epoch.close()
+        assertEquals(0, h.sinks.size)
+        assertEquals(0, h.policy.starts.get())
+        assertEquals(1, h.policy.stops.get())
+    }
+    @Test fun stopDuringFailureCleanupFencesRetryBeforeOldOwnerReturns() {
+        val h = Harness(); val release = CountDownLatch(1)
+        h.configure = { it.releaseClose = release }
+        val epoch = h.owner.newEpoch(); epoch.start(); val first = h.sink(0)
+        first.events(PublishingAttemptEvent.Failed())
+        assertTrue(first.closing.await(2, TimeUnit.SECONDS))
+        epoch.stopDestination()
+        release.countDown(); epoch.close()
+        assertEquals(1, h.sinks.size)
+        assertEquals(1, h.policy.stops.get())
+    }
+    @Test fun originalDeadlineExpiresDuringUnacceptedRetryAndLaterEpochIsInert() {
+        val h = Harness(); h.policy.graceNs = 20_000_000L
+        val epoch = h.owner.newEpoch(); epoch.start(); val first = h.sink(0)
+        first.events(PublishingAttemptEvent.Failed()); h.sink(1)
+        val until = System.nanoTime() + 2_000_000_000L
+        while (!epoch.status.contains("grace expired") && System.nanoTime() < until) Thread.sleep(1)
+        assertTrue(epoch.status.contains("grace expired"))
+        epoch.close()
+        val next = h.owner.newEpoch(); next.start(); next.close()
+        assertEquals(2, h.sinks.size)
+        assertEquals(0, h.policy.confirmations.get())
+        assertEquals(1, h.policy.stops.get())
+    }
+    @Test fun failedPartialStartupCleanupCannotBeMistakenForSuccessfulDuplicateClose() {
+        val h = Harness(); h.configure = { it.failedStartupCleanup = true }
+        val epoch = h.owner.newEpoch(); epoch.start(); h.sink(0)
+        val until = System.nanoTime() + 2_000_000_000L
+        while (!epoch.status.contains("cleanup incomplete") && System.nanoTime() < until) Thread.sleep(1)
+        assertTrue(epoch.status.contains("cleanup incomplete"))
+        assertThrows(ExecutionException::class.java) { epoch.close() }
+        assertEquals(1, h.sinks.size)
+        assertEquals(1L, h.sinks[0].closed.count)
+    }
+    @Test fun anObservationFromDifferentDestinationCannotConfirmReusedEpochAndAttemptNumbers() {
+        val first = Harness(); val oldEpoch = first.owner.newEpoch(); val oldReady = CountDownLatch(1)
+        oldEpoch.setKeyframeRequester { oldReady.countDown() }; oldEpoch.start()
+        first.sink(0).events(PublishingAttemptEvent.Accepted)
+        assertTrue(oldReady.await(2, TimeUnit.SECONDS))
+        val oldScope = checkNotNull(first.owner.observationScope)
+        oldEpoch.stopDestination(); oldEpoch.close()
+        val second = Harness(); val epoch = second.owner.newEpoch(); val ready = CountDownLatch(1)
+        epoch.setKeyframeRequester { ready.countDown() }; epoch.start()
+        second.sink(0).events(PublishingAttemptEvent.Accepted)
+        assertTrue(ready.await(2, TimeUnit.SECONDS))
+        val current = checkNotNull(second.owner.observationScope)
+        assertEquals(oldScope.epoch, current.epoch)
+        assertEquals(oldScope.attempt, current.attempt)
+        assertNotEquals(oldScope.destination, current.destination)
+        second.owner.originMediaConfirmed(oldScope)
+        epoch.stopDestination(); epoch.close()
+        assertEquals(0, second.policy.confirmations.get())
+    }
+}

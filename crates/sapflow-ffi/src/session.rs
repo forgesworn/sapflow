@@ -113,10 +113,11 @@ impl NativeSession {
 }
 #[uniffi::export]
 impl NativeSession {
-    /// Consume the actual destination grace. Zero explicitly disables retry.
+    /// Consume the actual destination grace, 0..=3_600_000 milliseconds.
+    /// Zero explicitly disables retry; larger values are refused, never clamped.
     #[uniffi::constructor]
     pub fn new(grace_ms: u64) -> Result<Arc<Self>, BindingError> {
-        if grace_ms > 30 * 60 * 1000 {
+        if grace_ms > 60 * 60 * 1000 {
             return Err(BindingError::InvalidSession);
         }
         let grace_ns = grace_ms * 1_000_000;
@@ -158,6 +159,17 @@ impl NativeSession {
     pub fn media_confirmed(&self, generation: u64, now_ns: u64) -> Result<(), BindingError> {
         self.current(generation, |session, current| {
             session.media_confirmed(current, now_ns)
+        })
+    }
+    /// Intentional socket/codec replacement is not a transport failure.
+    /// Native owns cancellation and per-attempt fencing before Connect.
+    pub fn replace_transport(
+        &self,
+        generation: u64,
+        now_ns: u64,
+    ) -> Result<NativeSessionAction, BindingError> {
+        self.current(generation, |session, current| {
+            session.replace_transport(current, now_ns).map(Into::into)
         })
     }
     pub fn transport_failed(
@@ -218,6 +230,132 @@ impl NativeSession {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn intentional_replacement_preserves_the_logical_session_and_observed_media_gate() {
+        let session = NativeSession::new(90_000).unwrap();
+        let generation = session.start(0).unwrap();
+        session.prepared(generation).unwrap();
+        session.connected(generation, 1).unwrap();
+        session.media_confirmed(generation, 2).unwrap();
+        assert!(matches!(
+            session
+                .replace_transport(generation, 200_000_000_000)
+                .unwrap(),
+            NativeSessionAction::Connect
+        ));
+        let replaced = session.snapshot().unwrap();
+        assert_eq!(replaced.generation, generation);
+        assert_eq!(replaced.state, NativeSessionState::Connecting);
+        assert!(!replaced.transport_connected);
+        assert_eq!(replaced.reconnect_deadline_ns, None);
+        assert_eq!(replaced.transport_failures, 0);
+        assert_eq!(replaced.media_confirmations, 1);
+        assert!(matches!(
+            session.media_confirmed(generation, 200_000_000_001),
+            Err(BindingError::InvalidSession)
+        ));
+        session.connected(generation, 200_000_000_002).unwrap();
+        assert_eq!(
+            session.snapshot().unwrap().state,
+            NativeSessionState::Connecting
+        );
+        session
+            .media_confirmed(generation, 200_000_000_003)
+            .unwrap();
+        assert_eq!(session.snapshot().unwrap().state, NativeSessionState::Live);
+    }
+
+    #[test]
+    fn replacement_while_reconnecting_preserves_expiry_and_clears_prior_retry() {
+        let session = NativeSession::new(90_000).unwrap();
+        let generation = session.start(0).unwrap();
+        session.prepared(generation).unwrap();
+        session.transport_failed(generation, 10).unwrap();
+        let deadline = session.snapshot().unwrap().reconnect_deadline_ns.unwrap();
+        assert!(matches!(
+            session.replace_transport(generation, 20).unwrap(),
+            NativeSessionAction::Connect
+        ));
+        assert!(matches!(
+            session.tick(generation, 500_000_010).unwrap(),
+            NativeSessionAction::None
+        ));
+        let replaced = session.snapshot().unwrap();
+        assert_eq!(replaced.state, NativeSessionState::Reconnecting);
+        assert_eq!(replaced.reconnect_deadline_ns, Some(deadline));
+        assert_eq!(replaced.transport_failures, 1);
+        assert_eq!(replaced.retry_attempts, 0);
+        assert!(matches!(
+            session.replace_transport(generation, deadline).unwrap(),
+            NativeSessionAction::GraceExpired
+        ));
+        assert_eq!(
+            session.snapshot().unwrap().state,
+            NativeSessionState::Failed
+        );
+    }
+
+    #[test]
+    fn replacement_binding_rejects_clock_rollback_and_stopped_or_stale_generations() {
+        let session = NativeSession::new(90_000).unwrap();
+        let generation = session.start(100).unwrap();
+        session.prepared(generation).unwrap();
+        session.connected(generation, 200).unwrap();
+        assert!(matches!(
+            session.replace_transport(generation, 199),
+            Err(BindingError::ClockWentBackwards)
+        ));
+        assert!(session.snapshot().unwrap().transport_connected);
+        let stopped = session.stop(generation).unwrap();
+        assert!(matches!(
+            session.replace_transport(generation, 201),
+            Err(BindingError::StaleSession)
+        ));
+        assert!(matches!(
+            session.replace_transport(stopped.generation, 201),
+            Err(BindingError::InvalidSession)
+        ));
+        session.finish_stop(stopped.generation).unwrap();
+        assert!(matches!(
+            session.replace_transport(stopped.generation, 201),
+            Err(BindingError::InvalidSession)
+        ));
+        assert_eq!(
+            session.snapshot().unwrap().state,
+            NativeSessionState::Stopped
+        );
+    }
+
+    #[test]
+    fn destination_grace_accepts_the_full_hour_without_clamping() {
+        assert!(matches!(
+            NativeSession::new(3_600_001),
+            Err(BindingError::InvalidSession)
+        ));
+        let session = NativeSession::new(3_600_000).unwrap();
+        let generation = session.start(100).unwrap();
+        session.prepared(generation).unwrap();
+        session.transport_failed(generation, 250).unwrap();
+        let expected_deadline = 250 + 3_600_000 * 1_000_000u64;
+        assert_eq!(
+            session.snapshot().unwrap().reconnect_deadline_ns,
+            Some(expected_deadline)
+        );
+        // A second failure retains the actual destination window.
+        session.transport_failed(generation, 2000).unwrap();
+        assert_eq!(
+            session.snapshot().unwrap().reconnect_deadline_ns,
+            Some(expected_deadline)
+        );
+        assert!(matches!(
+            session.tick(generation, expected_deadline).unwrap(),
+            NativeSessionAction::GraceExpired
+        ));
+        assert_eq!(
+            session.snapshot().unwrap().state,
+            NativeSessionState::Failed
+        );
+    }
     #[test]
     fn stop_fences_all_late_callbacks_without_resurrecting_the_show() {
         let session = NativeSession::new(90_000).unwrap();
