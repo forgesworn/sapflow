@@ -10,7 +10,7 @@ const mode = process.argv[2];
 if (!['check', 'apple'].includes(mode) || process.argv.length !== 3) throw new Error('choose check or apple; native slices require a separate reviewed build gate');
 const apple = join(root, 'target/native-packages/signet-apple');
 if (process.env.CARGO_TARGET_DIR && resolve(process.env.CARGO_TARGET_DIR) !== join(root, 'target')) throw new Error('reuse existing target');
-const output = join(root, mode === 'apple' ? 'target/signet-auth-apple' : 'target/signet-auth-host');
+const output = join(root, mode === 'apple' ? 'target/signet-auth-apple-headers-v2' : 'target/signet-auth-host');
 const resultPath = join(output, 'result.local.json');
 const archiveReceipt = join(output, 'archive.local.json');
 const appleArchive = join(root, 'target/native-packages/signet-auth-apple.zip');
@@ -38,13 +38,17 @@ try {
  writeFileSync(join(pkg, 'Sources/SignetAuthFFI/module.modulemap'), 'module SignetAuthFFI { header "SignetAuthFFI.h" export * link "sapflow_signet_ffi" }\n');
  writeFileSync(join(pkg, 'Package.swift'), '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name: "SignetAuth", platforms: [.macOS(.v12)], products: [.library(name: "SignetAuth", targets: ["SignetAuth"])], targets: [.systemLibrary(name: "SignetAuthFFI"), .target(name: "SignetAuth", dependencies: ["SignetAuthFFI"])])\n');
  if (mode === 'apple') {
-   const headers = join(staging, 'headers'); mkdirSync(headers);
+   // Xcode merges static XCFramework headers into one include directory.
+   // Keep the original map name/module/relative header inside a unique module
+   // directory so another SDK's flat module.modulemap remains untouched.
+   const headersRoot = join(staging, 'headers');
+   const headers = join(headersRoot, 'SignetAuthFFI'); mkdirSync(headers, {recursive: true});
    cpSync(join(generated, 'SignetAuthFFI.h'), join(headers, 'SignetAuthFFI.h'));
    cpSync(join(generated, 'SignetAuthFFI.modulemap'), join(headers, 'module.modulemap'));
    const libraries = [];
    for (const target of ['aarch64-apple-darwin', 'aarch64-apple-ios', 'aarch64-apple-ios-sim']) {
      run('cargo', ['build', '--offline', '--release', '-j2', '-p', 'sapflow-signet-ffi', '--target', target], {env: {...process.env, CARGO_BUILD_JOBS: '2', MACOSX_DEPLOYMENT_TARGET: '12.0', IPHONEOS_DEPLOYMENT_TARGET: '16.0'}});
-     libraries.push('-library', join(root, 'target', target, 'release/libsapflow_signet_ffi.a'), '-headers', headers);
+     libraries.push('-library', join(root, 'target', target, 'release/libsapflow_signet_ffi.a'), '-headers', headersRoot);
    }
    run('xcodebuild', ['-create-xcframework', ...libraries, '-output', join(pkg, 'SignetAuthFFI.xcframework')]);
    rmSync(join(pkg, 'Sources/SignetAuthFFI'), {recursive: true});
@@ -80,7 +84,7 @@ try {
  run('swift', ['run', '--package-path', consumer, '--scratch-path', join(output, 'swift-build'), '-j', '2', ...(mode === 'apple' ? [] : ['-Xlinker', '-L'+join(root, 'target/debug'), '-Xlinker', '-rpath', '-Xlinker', join(root, 'target/debug')]), 'Consumer']);
  cpSync(generated, join(output, 'generated'), { recursive: true });
  if (mode === 'apple') {
-   writeFileSync(join(pkg, 'README.md'), 'Separate cold SignetAuth Swift package, ARM64 macOS/iOS/iOS Simulator. Existing Sapflow media package unchanged. Real signer consent/site authority/Keychain/app/device qualification remain open.\n');
+   writeFileSync(join(pkg, 'README.md'), 'Separate cold SignetAuth Swift package, ARM64 macOS/iOS/iOS Simulator. Clang headers use Headers/SignetAuthFFI/ to coexist with other static XCFrameworks. Existing Sapflow media package unchanged. Real signer consent/site authority/Keychain/app/device qualification remain open.\n');
    run('zip', ['-q', '-r', appleArchive, 'signet-apple'], {cwd: join(root, 'target/native-packages')});
  }
  success = true;
@@ -90,9 +94,9 @@ try {
 }
 
 // Reached only after every tool succeeded AND actual staging cleanup succeeded.
-const completed = { terminalExit: 0, combinedActualNativeConsumer: true, nativeSlicesBuilt: mode === 'apple', appOrDeviceChanged: false, stagingRemoved: true };
+const completed = { headerLayoutVersion: mode === 'apple' ? 2 : 1, terminalExit: 0, combinedActualNativeConsumer: true, nativeSlicesBuilt: mode === 'apple', appOrDeviceChanged: false, stagingRemoved: true };
 if (mode === 'apple') {
-  const archive = {archive: appleArchive, sha256: createHash('sha256').update(readFileSync(appleArchive)).digest('hex'), physicalQualified: false};
+  const archive = {headerLayoutVersion: 2, archive: appleArchive, sha256: createHash('sha256').update(readFileSync(appleArchive)).digest('hex'), physicalQualified: false};
   writeFileSync(join(apple, 'verification.json'), JSON.stringify(archive, null, 2)+'\n');
   writeFileSync(archiveReceipt, JSON.stringify(archive, null, 2)+'\n');
 }

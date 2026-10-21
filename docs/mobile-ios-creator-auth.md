@@ -57,8 +57,29 @@ Run `mobile/ios/test-v4v.sh` for the strict contracts and owner races, and
 linked with the existing Sapflow package. The combined consumer also compiles
 the attempt-scoped origin-confirmation bridge. Source/package gates, actual
 remote consent, HTTPS login/authority, Keychain behaviour, app integration and
-physical iPhone acceptance are separate evidence. iOS auth slices and their
-combined static link remain a subsequent packaging gate.
+physical iPhone acceptance are separate evidence. The `apple` packager builds
+three ARM64 slices and checks their real combined static consumer and iOS 16
+module/typecheck/link. An actual combined iOS app build is required in addition:
+a successful standalone consumer does not prove Xcode header-copy coexistence.
+
+The auth XCFramework retains its `SignetAuthFFI` module and original generated
+map, with the header and map together under `Headers/SignetAuthFFI/`. Xcode can
+then merge it with another static XCFramework's include directory without two
+commands producing a flat `include/module.modulemap`. SwiftPM requires matching
+binary/module names and relative header references ([module-map documentation](https://docs.swift.org/main/documentation/packagemanagerdocs/modulemaps/),
+[Apple binary-package documentation](https://developer.apple.com/documentation/xcode/distributing-binary-frameworks-as-swift-packages)).
+Nested implicit discovery is checked with fresh module caches and the actual
+generated Swift modules; no custom map override or import-validation bypass is
+used. Packaging regressions also merge the script-produced header tree with
+another SDK's flat map and require both original maps to survive.
+
+The header-layout receipt uses `target/signet-auth-apple-headers-v2`, separate
+from historical flat-layout success. Existing package/archive destinations are
+refused. Preserve their hashes and move the previous accepted pair to named
+historical storage before generating a replacement. A new layout is accepted
+only after the combined SwiftPM consumer, iOS static link and real Xcode app
+gate pass. No Rust archive, media SDK, signer authority or signing profile is
+changed by this header layout.
 
 The native transport caps and exact source provenance are described in
 [the snapshot inventory](../vendor/README.md). Loopback tests cover normal and
