@@ -365,3 +365,219 @@ How it got there:
   25.9% ± 0.6 at 20% random (srt-rs 26.9% ± 0.6, libsrt 27.5% ± 0.8) and
   9.3% ± 1.2 under bursts (9.4% ± 1.2, 10.4% ± 1.4), with 200 ms unchanged.
   A wider margin (at least RTT/8) measured the same and was not kept.
+
+## SRT under packet loss, encrypted (2026-10-21)
+
+The harness of the two sections above with a passphrase on: `PASSPHRASE`,
+`PBKEYLEN` and `KMREFRESH` in `scripts/srt-loss.sh` give libsrt's sender and
+receiver `passphrase`, `pbkeylen`, and on the sender `kmrefreshrate` and
+`kmpreannounce` (a quarter of the refresh rate), and sapflow
+`SAPFLOW_SRT_PASSPHRASE` and `SAPFLOW_SRT_PBKEYLEN`. The sender is libsrt
+1.5.4 in every trial, so it also does the key refreshes. The binary is a
+release build of commit 8ee5704 (our own SRT, which has the passphrase).
+Receivers: `own` is sapflow, `libsrt` is libsrt's `srt-live-transmit`. A
+sapflow receiver not named `own` would run the patched srt-rs, which has no
+passphrase, so the script refuses that combination.
+
+```
+PASSPHRASE=loss-test-key PBKEYLEN=16 KMREFRESH=1500 SEEDS=6 JOBS=2 \
+  RECEIVERS="own libsrt" scripts/srt-loss.sh
+PASSPHRASE=loss-test-key PBKEYLEN=32 KMREFRESH=2000 SEEDS=3 JOBS=2 \
+  LOSSES="random:10 burst:8,8" RECEIVERS="own libsrt" scripts/srt-loss.sh
+```
+
+A 30 s clip is about 7,180 original data packets (7,142 to 7,182 across the
+trials). A refresh every 1,500 packets sends the new key 375 packets ahead
+(about 1.5 s), switches at about packets 1,500, 3,000, 4,500 and 6,000, and
+so makes four switches in a clip; every 2,000 gives three. libsrt prints
+`SRTO_KMREFRESHRATE=...: setting SRTO_KMPREANNOUNCE=...` when it starts: it
+clamps its default pre-announce of 4096 packets before applying the one in
+the URL. The URL value is the one in force (libsrt rejects one above
+(refresh - 1) / 2), and the capture below shows the first KMREQ about 375
+packets before the first switch.
+
+Before the runs, three checks that encryption is on and that the key
+refresh happens:
+
+- **A wrong passphrase delivers nothing.** With a different passphrase on
+  the sender (`SENDER_PASSPHRASE`), 4 of 4 short trials (10 s clip, one per
+  receiver with and without loss) failed: both receivers refuse the
+  connection in the handshake (libsrt logs `BADSECRET`, `Incorrect
+  passphrase`), and no media was recorded or written.
+- **The payload on the wire is not MPEG-TS.** A throwaway relay between the
+  sender and the proxy (not in the repository) read the SRT headers in a 30 s
+  trial at 20% random loss and 200 ms against each receiver, and in a third
+  at AES-256 and 10%. Of 9,980 data packets (originals and retransmissions)
+  in the first none had the MPEG-TS sync byte 0x47 at both offset 0 and
+  offset 188 of its payload, which every plain packet has; nor had any of
+  9,632 and 8,618 in the others.
+- **The key switches, under loss.** The key flag of the original data
+  packets, in the order sent, held one key for 1,500 packets, then the
+  other for 1,501, then 1,501, 1,501 and 1,179 (against both receivers, at a
+  refresh of 1,500), and 2,000, 2,001, 2,001 and 1,180 at a refresh of 2,000.
+  In the AES-128 trial against `own` the sender sent 10 KMREQs for 5
+  refreshes (the fifth, at packet 7,128, announces a switch the clip ends
+  before), repeating a request when no answer came back, and 5 KMRSPs got
+  back through the 20% loss; against libsrt, 9 KMREQs and 5 KMRSPs. The
+  AES-256 trial at 10% needed no repeats (3 and 3).
+
+AES-128, key refresh every 1,500 packets (four switches a clip), 6 seeds per
+condition, the receivers interleaved seed by seed. One of the 100 trials
+(libsrt at 3% and 200 ms, seed 5) died in the script and was run again
+afterwards with the same settings:
+
+| Loss | Latency | Receiver | n | Retransmission overhead | Not recovered in time | Video delivered | Audio delivered | Decode messages |
+| ------ | --------: | ---------- | --: | ------------------------: | ----------------------: | ----------------: | ----------------: | ----------------: |
+| 3% random | 2000 ms | own | 6 | 3.3% ± 0.1 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 3% random | 2000 ms | libsrt | 6 | 3.6% ± 0.4 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 89.0 ± 0.0 |
+| 10% random | 2000 ms | own | 6 | 11.7% ± 0.3 | 0.00% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | libsrt | 6 | 14.5% ± 0.4 | 0.00% ± 0.00 | 100.04% ± 0.06 | 100.00% ± 0.00 | 60.0 ± 44.9 |
+| 20% random | 2000 ms | own | 6 | 26.1% ± 0.7 | 0.00% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 20% random | 2000 ms | libsrt | 6 | 31.1% ± 1.0 | 0.00% ± 0.01 | 99.96% ± 0.15 | 99.94% ± 0.15 | 72.8 ± 35.4 |
+| bursty 8% | 2000 ms | own | 6 | 9.8% ± 1.0 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| bursty 8% | 2000 ms | libsrt | 6 | 12.0% ± 1.5 | 0.00% ± 0.01 | 100.00% ± 0.12 | 99.94% ± 0.15 | 58.8 ± 44.1 |
+| 3% random | 200 ms | own | 6 | 5.2% ± 0.7 | 0.01% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.3 ± 0.8 |
+| 3% random | 200 ms | libsrt | 6 | 4.3% ± 0.4 | 0.01% ± 0.01 | 100.04% ± 0.06 | 100.00% ± 0.00 | 60.0 ± 44.9 |
+| 10% random | 200 ms | own | 6 | 20.3% ± 1.6 | 0.23% ± 0.15 | 99.79% ± 0.32 | 99.80% ± 0.49 | 12.8 ± 14.0 |
+| 10% random | 200 ms | libsrt | 6 | 15.9% ± 1.1 | 0.43% ± 0.13 | 100.06% ± 0.06 | 99.15% ± 0.72 | 66.5 ± 54.6 |
+| 20% random | 200 ms | own | 6 | 37.7% ± 2.7 | 0.91% ± 0.16 | 99.25% ± 0.22 | 98.02% ± 0.81 | 54.5 ± 7.1 |
+| 20% random | 200 ms | libsrt | 6 | 32.2% ± 2.1 | 1.96% ± 0.31 | 100.06% ± 0.09 | 97.19% ± 0.71 | 138.7 ± 23.6 |
+| bursty 8% | 200 ms | own | 6 | 14.6% ± 3.1 | 0.75% ± 0.19 | 99.63% ± 0.09 | 99.80% ± 0.49 | 7.8 ± 1.7 |
+| bursty 8% | 200 ms | libsrt | 6 | 11.3% ± 1.7 | 1.03% ± 0.51 | 99.83% ± 0.22 | 99.27% ± 0.60 | 39.0 ± 45.0 |
+
+`own` minus libsrt, with a Welch t statistic over the 6 seeds (|t| below
+about 2.3 is noise). Video and audio delivered and decode messages compare
+sapflow builds only, as above, so they are left out:
+
+| Loss | Latency | Overhead, points | t | Not recovered, points | t |
+| ------ | --------: | -----------------: | --: | ----------------------: | --: |
+| 3% random | 2000 ms | -0.3 | -1.7 | +0.00 | - |
+| 10% random | 2000 ms | -2.8 | -12.6 | +0.00 | 1.0 |
+| 20% random | 2000 ms | -4.9 | -10.1 | +0.00 | 0.0 |
+| bursty 8% | 2000 ms | -2.2 | -3.0 | -0.00 | -1.0 |
+| 3% random | 200 ms | +0.9 | 2.6 | -0.00 | -0.3 |
+| 10% random | 200 ms | +4.4 | 5.6 | -0.20 | -2.5 |
+| 20% random | 200 ms | +5.5 | 3.9 | -1.05 | -7.3 |
+| bursty 8% | 200 ms | +3.3 | 2.3 | -0.28 | -1.3 |
+
+AES-256, key refresh every 2,000 packets (3 switches a clip), 3 seeds, two
+conditions at each latency:
+
+| Loss | Latency | Receiver | n | Retransmission overhead | Not recovered in time | Video delivered | Audio delivered | Decode messages |
+| ------ | --------: | ---------- | --: | ------------------------: | ----------------------: | ----------------: | ----------------: | ----------------: |
+| 10% random | 2000 ms | own | 3 | 11.8% ± 0.2 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | libsrt | 3 | 15.2% ± 1.0 | 0.00% ± 0.00 | 99.89% ± 0.00 | 100.00% ± 0.00 | 89.0 ± 0.0 |
+| bursty 8% | 2000 ms | own | 3 | 9.4% ± 1.2 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| bursty 8% | 2000 ms | libsrt | 3 | 10.7% ± 0.6 | 0.00% ± 0.00 | 99.89% ± 0.00 | 100.00% ± 0.00 | 89.0 ± 0.0 |
+| 10% random | 200 ms | own | 3 | 16.1% ± 3.5 | 0.19% ± 0.09 | 99.73% ± 0.07 | 99.21% ± 0.69 | 11.7 ± 1.5 |
+| 10% random | 200 ms | libsrt | 3 | 14.3% ± 1.0 | 0.37% ± 0.04 | 99.96% ± 0.06 | 99.74% ± 0.45 | 48.3 ± 49.6 |
+| bursty 8% | 200 ms | own | 3 | 12.1% ± 2.1 | 0.63% ± 0.31 | 99.54% ± 0.20 | 99.60% ± 0.34 | 10.3 ± 2.5 |
+| bursty 8% | 200 ms | libsrt | 3 | 10.7% ± 1.2 | 0.95% ± 0.32 | 99.56% ± 0.11 | 99.55% ± 0.40 | 73.3 ± 44.5 |
+
+`own` minus libsrt, 3 seeds (with 3 seeds only |t| above about 3 to 4 is worth
+claiming):
+
+| Loss | Latency | Overhead, points | t | Not recovered, points | t |
+| ------ | --------: | -----------------: | --: | ----------------------: | --: |
+| 10% random | 2000 ms | -3.4 | -6.0 | +0.00 | - |
+| bursty 8% | 2000 ms | -1.3 | -1.8 | +0.00 | - |
+| 10% random | 200 ms | +1.8 | 0.9 | -0.18 | -3.2 |
+| bursty 8% | 200 ms | +1.5 | 1.1 | -0.32 | -1.2 |
+
+Does encryption, or the refresh, cost anything? The first batch above mostly
+ran at a load average of 80 to 130 and its 200 ms overhead was well above the
+M6a run's, so a second set ran in the same session at 200 ms with 4 seeds,
+one run after another: unencrypted, AES-128 without a refresh, and AES-128
+with one every 1,500 packets; then the binary of the M6a table (4722f34)
+beside the current one, unencrypted. Overhead is the mean over the seeds,
+then `own` minus libsrt with its t statistic (with 4 seeds only |t| above
+about 3 is worth claiming); unrecovered is the mean for `own` and then
+libsrt:
+
+| Run | Loss | Own overhead | libsrt overhead | Own minus libsrt | Unrecovered, own / libsrt |
+| ----- | ------ | -----------: | --------------: | ---------------: | ------------------------: |
+| unencrypted | 10% random | 17.5% ± 2.5 | 14.8% ± 1.4 | +2.7 (t 1.9) | 0.17% / 0.28% |
+| unencrypted | 20% random | 38.8% ± 1.4 | 31.8% ± 1.2 | +7.0 (t 7.5) | 1.07% / 1.98% |
+| AES-128, no refresh | 10% random | 13.3% ± 1.9 | 12.9% ± 0.8 | +0.4 (t 0.4) | 0.18% / 0.28% |
+| AES-128, no refresh | 20% random | 34.9% ± 4.9 | 31.7% ± 1.6 | +3.2 (t 1.2) | 0.99% / 1.59% |
+| AES-128, refresh 1500 | 10% random | 19.2% ± 0.7 | 15.0% ± 0.3 | +4.2 (t 11.6) | 0.10% / 0.25% |
+| AES-128, refresh 1500 | 20% random | 37.7% ± 2.7 | 32.5% ± 1.8 | +5.2 (t 3.2) | 0.95% / 1.79% |
+| unencrypted, M6a binary 4722f34 | 10% random | 19.4% ± 0.7 | 15.3% ± 0.7 | +4.1 (t 8.5) | 0.16% / 0.26% |
+| unencrypted, M6a binary 4722f34 | 20% random | 36.2% ± 1.2 | 30.8% ± 0.8 | +5.3 (t 7.5) | 0.93% / 1.71% |
+| unencrypted, 8ee5704 (same run) | 10% random | 19.1% ± 1.1 | 15.3% ± 0.7 | +3.8 (t 5.8) | 0.14% / 0.26% |
+| unencrypted, 8ee5704 (same run) | 20% random | 37.0% ± 1.7 | 30.8% ± 0.8 | +6.1 (t 6.6) | 0.99% / 1.71% |
+
+At 2000 ms, unencrypted in the same session (4 seeds): `own` 11.7% ± 0.4 and
+25.9% ± 0.5 overhead at 10% and 20% random loss against libsrt's 13.5% ± 0.7
+and 32.3% ± 0.8, and 0.00% unrecovered for `own` in both.
+
+What it shows (the machine was shared and heavily loaded: load average
+about 5 when the first run started, then mostly 80 to 130):
+
+- **Encryption with key refresh works under loss.** At 2000 ms `own`
+  delivered every video and audio packet its loss-free run did (864 and
+  1,344) with no decode messages in all 24 AES-128 trials (four conditions,
+  6 seeds, four key switches each) and in all 6 AES-256 trials, and at most
+  0.03% of packets unrecovered in any of the AES-128 ones (none in the
+  AES-256 ones). A key that was not in place at a switch would make every
+  packet until it arrived undecryptable, a run of packets (about 240 a
+  second) and the frames they carry in each trial; none of the trials shows
+  one.
+- **At 2000 ms `own` is level with libsrt or lower on overhead**, the same
+  as unencrypted: 0.3 points lower at 3% random (t -1.7), 2.8 at 10% (t
+  -12.6), 4.9 at 20% (t -10.1) and 2.2 under bursts (t -3.0). Our own
+  figures did not move from the unencrypted M6a run (3.3, 11.7, 26.1 and
+  9.8%, against 3.3, 11.6, 25.7 and 9.6%); libsrt's did (14.5% and 31.1%
+  at 10% and 20%, against 12.3% and 27.6%), and the same-session
+  unencrypted run shows libsrt's higher figure there too (13.5% and
+  32.3%). The larger lead than in M6a is libsrt's figure moving, not ours.
+- **At 200 ms `own` leaves fewer packets unrecovered than libsrt** under
+  loss that is not bursty: 0.20 points fewer at 10% (t -2.5) and 1.05 at
+  20% (t -7.3), level at 3% and under bursts (0.28 fewer, t -1.3). The
+  AES-256 batch agrees at 10% (0.18 fewer, t -3.2).
+- **At 200 ms `own` costs more retransmissions than libsrt in this session**,
+  by more than the spread: +4.4 points at 10% random (t 5.6), +5.5 at 20% (t
+  3.9), +3.3 under bursts (t 2.3, borderline) and +0.9 at 3% (t 2.6). It is
+  not the encryption: the unencrypted run in the same session shows +2.7 and
+  +7.0 points, AES-128 without a refresh +0.4 and +3.2, and the binary of the
+  M6a table, unencrypted, +4.1 and +5.3, where M6a measured it level (+0.0 and
+  -1.1). The same code gives a different overhead at a different time: what
+  about this session moved it (the load, most likely) was not isolated. The
+  refresh does not show as a cost either: at 10% `own` had 19.2% and 20.3%
+  overhead with refresh (the same-session run and the first batch) against
+  17.5%, 19.1% and 19.4% unencrypted, and it left no more packets unrecovered
+  with a refresh than without (0.10% and 0.95% against 0.18% and 0.99% with
+  encryption but no refresh). The run without a refresh is the odd one out, at
+  13.3% (three of its four seeds between 12.0% and 12.5%, level with libsrt,
+  whose overhead was also about two points lower in it than in the others); it
+  was not repeated, so a small cost of the refresh at 200 ms is not excluded.
+- **Video and audio delivered and decode messages** are as in the
+  unencrypted tables: they depend on what each receiver writes, so they
+  compare sapflow builds, not libsrt.
+- **Nothing in the logs.** The 82 sapflow logs kept from these runs hold only
+  the two start-up warnings (`SAPFLOW_OPEN_PUBLISH` and no callback URL). The
+  libsrt receiver logs hold its too-late drop warnings and teardown messages
+  and no key or decryption message.
+
+Limits as in the sections above (one sender, libsrt 1.5.4; one clip;
+loopback with an emulated 60 ms round trip and independent loss both ways;
+a shared machine), and:
+
+- **No decrypt counter was read.** The receiver counts packets it could not
+  decrypt and key requests it rejected (`encrypted`, `km_rejected` in the
+  receiver's `Stats`), but the server only logs received, retransmitted, lost
+  and dropped packets when a connection closes, at the `info` level (the
+  harness runs it at `warn`). The argument above is indirect: the delivered
+  counts, not a counter.
+- **The key capture is three trials**, not every trial, and the relay adds a
+  hop; it shows the sender's refreshes and the receivers answering them,
+  not that every packet of every trial was decrypted.
+- **The same-session set is 4 seeds** at two conditions and one latency, run
+  one after another, not interleaved with each other (the two receivers
+  within each run were), so a few points of overhead between those runs
+  (13.3% against 19.2% for `own` at 10%) cannot be put down to the
+  setting on this evidence.
+- **Passphrase and key lengths:** AES-128 and AES-256 only, one passphrase,
+  and refresh rates of 1,500 and 2,000 packets; the pre-announce was a
+  quarter of the rate. A passphrase with `%20` is not covered (libsrt 1.5.3
+  does not decode it).
