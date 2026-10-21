@@ -130,12 +130,31 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   starts the stream over: nothing has been served, and the targets should
   come from a whole segment. The seven leading gap segments are only ever
   at the start of a stream.
-- **Not handled here:** an SRT publisher silent for 5 s is dropped and the
-  stream ends; holding it across a longer drop is M7's grace period.
+- **An encoder that drops and reconnects** (an SRT publisher silent for
+  5 s is dropped; RTMP when its socket closes or is idle for 10 s) is a
+  break too. The stream, with its playlist, chunk names and recording, is
+  held for `SAPFLOW_RECONNECT_GRACE` (default 90 s, v4v's own window). A
+  publisher on the same path within it, over either protocol, takes the
+  stream over: the muxer ends the run at the last frame
+  (`Muxer::interrupt`), and the new connection's first keyframe, from
+  whatever clock it brings, carries output time straight on after an
+  `EXT-X-DISCONTINUITY`. Its parameter sets and AAC config must match the
+  stream's: the init segment is fixed. If they do not (a new resolution),
+  the stream starts afresh in place under new chunk names, and a new
+  recording begins. v4v still hears `unpublish` at the drop (its stage
+  reads "reconnecting") and `publish` on the return; `recordSegmentComplete`
+  comes once, when the stream finally ends. Keep `SAPFLOW_RECONNECT_GRACE`
+  equal to `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`. A publisher whose
+  socket is still open holds the path (`409`/`BadName`) until the timeouts
+  above notice it has gone.
 
 What players should do at a break (Safari on macOS seen to carry on
 through two Larix Wi-Fi drops of 3.1 and 4.4 s on 2026-10-21, judged by
-eye; hls.js not yet watched): during a
+eye; hls.js 1.5.20 in Chrome, low-latency mode, logged crossing a 4 s
+stall and then a full disconnect and reconnect on 2026-10-21, with no
+fatal error; it logged non-fatal errors, recovered from: one
+`fragParsingError` on the first fragment after the reconnect, and a
+`levelLoadTimeOut` about once a minute, which are not yet explained): during a
 drop the playlist stops growing, so Safari and hls.js play out what they
 hold (about the part hold-back plus what was buffered) and then wait;
 when the stream resumes they cross the discontinuity, resetting their

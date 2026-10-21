@@ -207,12 +207,32 @@ proof:
   per-process cookie key (T16), one `recv_from` socket with no per-packet
   `getsockname`, no timer without a connection.
 
-Still open for M6 as a whole: OBS and Larix against `own` (not tried; they
-need the encoder hardware or app), anything with a passphrase (M6b), and
+Still open for M6 as a whole: OBS against `own` (Larix on an iPhone
+published to `own` over Wi-Fi on 2026-10-21, alone and alongside an RTMP
+publish), anything with a passphrase (M6b), and
 the version 4 handshake, which no encoder tested so far needed (every one
 used version 5).
 
 ### M7 Stage resilience and production readiness
+
+**Status (2026-10-21):** the grace period and the health callback are done;
+the Linux and Caddy measurements and CI's first run are not.
+- `SAPFLOW_RECONNECT_GRACE` (default 90 s, equal to v4v's
+  `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`): a dropped publisher's stream,
+  playlist and recording are held; a reconnect on either protocol carries
+  them on after `EXT-X-DISCONTINUITY`. The split with v4v: sapflow sends
+  `unpublish` at the drop and `publish` on the return (v4v shows
+  "reconnecting" and holds the gig); sapflow keeps the media continuous.
+  Proven by unit tests, `scripts/smoke.sh` (both SRT implementations: same
+  chunk names, a discontinuity, playlist rules across it, one recording),
+  v4v's `e2e:ingest-srt-sapflow` (with `SAPFLOW_SRT_IMPL=own`) and
+  `e2e:ingest-sapflow` with `SAPFLOW_RECONNECT_GRACE=10` to match the
+  gate's window, and hls.js in Chrome across a stall and a reconnect
+  (`docs/reference.md`). Safari across a reconnect, as against a stall, is
+  not yet watched.
+- The `health` callback every `SAPFLOW_HEALTH_INTERVAL` (default 30 s):
+  bitrate, keyframe interval, audio, breaks (`docs/v4v-contract.md`). v4v
+  reads the bitrate today; it reads the keyframe interval from the playlist.
 
 - An encoder that drops (phone locked, network switch) and returns within a
   grace period continues the same stream with `EXT-X-DISCONTINUITY`, and

@@ -205,8 +205,9 @@ impl Drop for Publication {
                 (self.app.clone(), self.stream.clone(), self.generation);
             rt.spawn(async move {
                 tokio::time::sleep(grace).await;
-                app.streams.expire(&stream, generation);
-                tracing::info!(path = %stream.path.as_path(), "reconnect grace over");
+                if app.streams.expire(&stream, generation) {
+                    tracing::info!(path = %stream.path.as_path(), "no reconnect within the grace period; stream ended");
+                }
             });
             tracing::info!(
                 path = %self.stream.path.as_path(),

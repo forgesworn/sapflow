@@ -310,17 +310,18 @@ impl Registry {
     }
 
     /// The grace period for `generation`'s drop is over: ends the stream
-    /// unless a publisher has taken it over since.
-    pub fn expire(&self, stream: &Arc<LiveStream>, generation: u64) {
+    /// unless a publisher has taken it over since. Returns whether it ended.
+    pub fn expire(&self, stream: &Arc<LiveStream>, generation: u64) -> bool {
         // The map stays locked from the check to the removal, so a
         // reconnect cannot take the stream over in between.
         let mut map = self.map();
         let session = stream.session();
-        if session.generation != generation || session.attached {
-            return;
+        if session.generation != generation || session.attached || stream.lock().closed {
+            return false;
         }
         drop(session);
         Self::end(&mut map, stream);
+        true
     }
 
     /// Frees the path (if still this stream's), closes the stream, and
@@ -361,7 +362,7 @@ mod tests {
         let (second, g2, _) = claim(&reg, &p).expect("free again");
         // A late detach or expiry of the old stream must not evict the new one.
         assert!(!reg.detach(&first, g1, false));
-        reg.expire(&first, g1);
+        assert!(!reg.expire(&first, g1));
         assert!(reg.get("event-a").is_some_and(|s| Arc::ptr_eq(&s, &second)));
         assert!(!second.lock().closed);
         let _ = g2;
@@ -386,12 +387,12 @@ mod tests {
         assert_eq!(again.lock().prefix, prefix);
         assert!(matches!(again.lock().ingest, Source::Flv(_)));
         // The first drop's grace running out changes nothing now.
-        reg.expire(&first, g1);
+        assert!(!reg.expire(&first, g1));
         assert!(!again.lock().closed);
         assert!(claim(&reg, &p).is_none(), "attached again");
         // The second drop, expired: the stream ends.
         assert!(reg.detach(&again, g2, true));
-        reg.expire(&again, g2);
+        assert!(reg.expire(&again, g2));
         assert!(again.lock().closed);
         assert!(reg.get("event-a").is_none());
         assert_eq!(claim(&reg, &p).expect("free").2, Claim::Fresh);

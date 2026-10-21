@@ -48,6 +48,21 @@ content-type: application/json
 | Stream ready to play | `{"event":"publish","path":"live/<eventId>"}` |
 | Stream gone | `{"event":"unpublish","path":"live/<eventId>"}` |
 | Recording finished | `{"event":"recordSegmentComplete","path":"live/<eventId>","segmentPath":"/recordings/live/<eventId>/<unix-start>.mp4","segmentDuration":"3723.5"}` |
+| While live, every `SAPFLOW_HEALTH_INTERVAL` (sapflow only; default 30 s) | `{"event":"health","path":"live/<eventId>","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":0}}` |
+
+v4v reads `health.bitrateKbps` (Studio's bitrate and its lagging and
+unstable thresholds) and leaves the stage's status alone for an event name
+it does not know. It works out the keyframe interval from the playlist
+itself, so `keyframeIntervalMs`, `audio` and `breaks` are not yet read by
+v4v. The callback endpoint allows 120 requests a minute from one address:
+at 30 s, 16 live stages use 32.
+
+When an encoder drops, sapflow sends `unpublish` at once and holds the
+stream for `SAPFLOW_RECONNECT_GRACE` (default 90 s); an encoder back in
+time continues the same playlist and recording and sends `publish` again.
+v4v holds the gig for `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS` (default
+90). Keep the two equal. `recordSegmentComplete` arrives when the stream
+ends, so up to the grace period after the encoder's last drop.
 
 v4v rejects a callback whose path does not match the prepared session.
 
