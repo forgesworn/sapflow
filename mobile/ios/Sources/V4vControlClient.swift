@@ -3,7 +3,7 @@ import Foundation
 struct V4vHTTPCall: CustomStringConvertible, CustomDebugStringConvertible {
     let method: String
     let path: String
-    let bearer: String
+    let bearer: String?
     let body: Data?
     init(_ request: V4vControlRequest) {
         method = "POST"; path = request.operation.path; bearer = request.bearer; body = request.operation.bytes
@@ -14,12 +14,21 @@ struct V4vHTTPCall: CustomStringConvertible, CustomDebugStringConvertible {
     init(current event: String, bearer: String) throws {
         method = "GET"; path = "/api/live-events/\(try V4vIdentity.event(event))/native-session"; self.bearer = bearer; body = nil
     }
+    init(loginChallenge: Void) {
+        method = "GET"; path = "/api/auth/nostr/challenge"; bearer = nil; body = nil
+    }
+    init(login proof: V4vLoginProof) throws {
+        method = "POST"; path = "/api/auth/nostr/login"; bearer = nil; body = try proof.body
+    }
     func urlRequest(profile: V4vConnectorProfile) throws -> URLRequest {
-        guard (1...8192).contains(bearer.utf8.count), bearer.unicodeScalars.allSatisfy({ $0.value >= 33 && $0.value <= 126 }), let url = URL(string: profile.apiOrigin + path) else { throw V4vFailure.unauthenticated }
+        guard let url = URL(string: profile.apiOrigin + path) else { throw V4vFailure.invalidProfile }
+        if let bearer {
+            guard (1...8192).contains(bearer.utf8.count), bearer.unicodeScalars.allSatisfy({ $0.value >= 33 && $0.value <= 126 }) else { throw V4vFailure.unauthenticated }
+        }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
         request.httpMethod = method; request.httpBody = body
         request.httpShouldHandleCookies = false
-        request.setValue("Bearer " + bearer, forHTTPHeaderField: "Authorization")
+        if let bearer { request.setValue("Bearer " + bearer, forHTTPHeaderField: "Authorization") }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
@@ -64,8 +73,13 @@ final class V4vControlClient: NSObject, URLSessionDataDelegate, @unchecked Senda
     private let admission = NSLock()
     private var admitted = false
     private var admissionClosed = false
-    init(profile: V4vConnectorProfile) {
-        self.profile = profile
+    private var invalidated = false
+    private let onClosed: () -> Void
+    /// Only an actual URLSession invalidation callback completes close. A
+    /// cancel request alone does not release a retained observation owner.
+    var cleanupComplete: Bool { admission.lock(); defer { admission.unlock() }; return admissionClosed && invalidated }
+    init(profile: V4vConnectorProfile, onClosed: @escaping () -> Void = {}) {
+        self.profile = profile; self.onClosed = onClosed
         super.init()
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false; configuration.httpCookieStorage = nil; configuration.urlCache = nil
@@ -137,5 +151,9 @@ final class V4vControlClient: NSObject, URLSessionDataDelegate, @unchecked Senda
         guard error == nil, acceptedResponse else { finish(.failure(.unavailable)); return }
         do { finish(.success(try V4vJSON.parse(body.bytes))) }
         catch { finish(.failure((error as? V4vFailure) ?? .invalidContract)) }
+    }
+    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
+        admission.lock(); let first = !invalidated; invalidated = true; admission.unlock()
+        if first { onClosed() }
     }
 }

@@ -7,7 +7,7 @@ sapflow_frameworks="$sapflow_developer/Platforms/MacOSX.platform/Developer/Libra
 sapflow_testlibs="$sapflow_developer/Platforms/MacOSX.platform/Developer/usr/lib"
 sapflow_scratch="$(mktemp -d "$sapflow_root/target/sapflow-ios-v4v-XXXXXX")"
 trap 'rm -rf "$sapflow_scratch"' EXIT
-for sapflow_test in V4vContractsTests V4vSessionEngineTests V4vAdaptersTests; do
+for sapflow_test in V4vContractsTests V4vSessionEngineTests V4vAdaptersTests V4vLoginTests; do
   sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/$sapflow_test.swift" >> "$sapflow_scratch/main.swift"
 done
 cat >> "$sapflow_scratch/main.swift" <<'SWIFT'
@@ -16,13 +16,15 @@ suite.addTest(V4vContractsTests.defaultTestSuite)
 suite.addTest(V4vTypedContractsTests.defaultTestSuite)
 suite.addTest(V4vSessionEngineTests.defaultTestSuite)
 suite.addTest(V4vAdaptersTests.defaultTestSuite)
+suite.addTest(V4vLoginTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 35, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 50, result.hasSucceeded else { exit(1) }
 SWIFT
 swiftc -swift-version 5 -warnings-as-errors -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
   -Xlinker -rpath -Xlinker "$sapflow_frameworks" -Xlinker -rpath -Xlinker "$sapflow_testlibs" \
   "$sapflow_root/mobile/ios/Sources/V4vContracts.swift" "$sapflow_root/mobile/ios/Sources/SrtDestination.swift" \
   "$sapflow_root/mobile/ios/Sources/V4vSessionEngine.swift" "$sapflow_root/mobile/ios/Sources/V4vJournal.swift" \
   "$sapflow_root/mobile/ios/Sources/V4vControlClient.swift" \
+  "$sapflow_root/mobile/ios/Sources/V4vLoginContracts.swift" "$sapflow_root/mobile/ios/Sources/V4vSignetLoginOwner.swift" \
   "$sapflow_scratch/main.swift" -o "$sapflow_scratch/v4v-tests"
 "$sapflow_scratch/v4v-tests"
