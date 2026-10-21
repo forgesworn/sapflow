@@ -187,6 +187,25 @@ final class V4vSessionEngine {
         let bearer = try auth(clock)
         return pending.map { V4vControlRequest(operation: $0, bearer: bearer) }
     }
+    /// Cold creator reads only: these do not adopt a receipt or grant, clear an
+    /// uncertain operation, or change terminal End intent. Existing tick still
+    /// fences an expired grant. Collection metadata is not fresh origin proof.
+    func creatorEventsRequest(clock: V4vClock) throws -> V4vHTTPCall {
+        try tick(clock: clock)
+        return V4vHTTPCall(creatorEvents: (), bearer: try auth(clock))
+    }
+    func currentRequest(event: String, clock: V4vClock) throws -> V4vHTTPCall {
+        try tick(clock: clock)
+        return try V4vHTTPCall(current: event, bearer: auth(clock))
+    }
+    /// No caller-provided SID: status can target only the engine's existing
+    /// durable session, including pending or terminal operations needing review.
+    func sessionStatusRequest(clock: V4vClock) throws -> V4vHTTPCall {
+        try tick(clock: clock)
+        let bearer = try auth(clock)
+        guard let session else { throw V4vFailure.terminal }
+        return V4vHTTPCall(status: session.identity, bearer: bearer)
+    }
     /// Fresh exact-session GET for the observer's separate control client.
     /// Neither the journal nor a collection lookup is an observation receipt.
     func observationStatusRequest(clock: V4vClock) throws -> V4vObservationStatusPermit {
