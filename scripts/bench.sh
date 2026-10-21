@@ -25,7 +25,10 @@ pids=()
 cleanup() { { for p in "${pids[@]}"; do kill "$p"; done; wait; } 2>/dev/null || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-cargo build --release -q -p sapflow-server -p sapflow-bench
+# Two builds, not one: cargo unifies features across the packages of one build,
+# and the viewers' HTTP/2 would then be compiled into the server being measured.
+cargo build --release -q -p sapflow-server
+cargo build --release -q -p sapflow-bench
 BENCH=./target/release/sapflow-bench
 
 case "$SERVER" in

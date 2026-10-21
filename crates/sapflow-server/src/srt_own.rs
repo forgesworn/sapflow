@@ -1,4 +1,4 @@
-//! SRT through our own `sapflow-srt` (`SAPFLOW_SRT_IMPL=own`): one UDP
+//! SRT through our own `sapflow-srt`: one UDP
 //! socket, one task driving the sans-IO listener, and a task per publisher
 //! that feeds its media to the muxer, so a slow or failing muxer holds up
 //! only its own stream.
@@ -76,9 +76,14 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                     match admit(&app, &stream_id, peer.ip(), publishers.len()) {
                         Ok(publication) => {
                             if !listener.accept(id, Instant::now()) {
-                                // Wrong secret/cipher is terminal. Dropping the
-                                // admission guard releases the stream claim;
+                                // Wrong secret/cipher is terminal. Count it
+                                // as a failed login before releasing the claim;
                                 // no publisher queue/task or media is created.
+                                app.auth_throttle
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .failed(peer.ip(), Instant::now());
+                                app.log_refusal("srt", &"wrong passphrase or key length");
                                 drop(publication);
                                 continue;
                             }
@@ -189,7 +194,6 @@ mod tests {
             for profile in 0..4 {
                 let config = crate::config::Config::load(
                     |key| match key {
-                        "SAPFLOW_SRT_IMPL" => Some("own".into()),
                         "SAPFLOW_OPEN_PUBLISH" => Some("1".into()),
                         "SAPFLOW_SRT_PASSPHRASE" => Some("transport test secret".into()),
                         "SAPFLOW_SRT_CIPHER" => Some(cipher.into()),

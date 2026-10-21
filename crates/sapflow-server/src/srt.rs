@@ -4,40 +4,28 @@
 //! accepted: wrong form, wrong path, wrong credentials or an already-live
 //! path are all rejected there.
 //!
-//! Two implementations serve the port, chosen by `SAPFLOW_SRT_IMPL`:
-//! `srt-tokio` (the default, below) and our own `sapflow-srt`
-//! ([`crate::srt_own`]). The policy (who may publish, limits, what happens
-//! to the media) is shared and lives here.
+//! Our own `sapflow-srt` serves the port ([`crate::srt_own`]); the policy
+//! (who may publish, limits, what happens to the media) lives here.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use futures::StreamExt;
 use sapflow_core::{PublishError, PublishRequest};
-use srt_tokio::SrtListener;
-use srt_tokio::access::{RejectReason, ServerRejectReason};
 
 use crate::App;
-use crate::config::SrtImpl;
 use crate::publish::{Publication, Refusal};
 use crate::stream::{Source, SourceKind};
 
-/// Drop a publisher that sends nothing for this long (SRT's own idle
-/// timeout normally fires first).
+/// Drop a publisher that sends nothing for this long (the SRT
+/// connection's own 5 s timeout normally fires first).
 pub const IDLE: Duration = Duration::from_secs(10);
 
-/// Serves SRT, rebinding if the listener ever stops (a panic inside
-/// srt-tokio's listener task ends its incoming stream).
+/// Serves SRT, rebinding if the listener ever stops.
 pub async fn listen(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     let mut first = true;
     loop {
-        let served = match app.config.srt_impl {
-            SrtImpl::SrtRs => serve(app.clone(), addr).await,
-            SrtImpl::Own => crate::srt_own::serve(app.clone(), addr).await,
-        };
-        match served {
+        match crate::srt_own::serve(app.clone(), addr).await {
             Err(e) if first => return Err(e),
             Err(e) => tracing::error!(error = %e, "SRT listener failed; retrying"),
             Ok(()) => tracing::error!("SRT listener stopped; restarting"),
@@ -57,8 +45,8 @@ pub enum Refused {
 
 impl Refused {
     /// The HTTP-style status the caller is told (libsrt prints it as
-    /// `PREDEFINED:<status>`): the codes `srt-tokio` sends for the same
-    /// refusals.
+    /// `PREDEFINED:<status>`): the codes srt-tokio, which served SRT until
+    /// 2026-10-21, sent for the same refusals.
     pub fn status(self) -> u16 {
         match self {
             Self::Policy(Refusal::Request(PublishError::BadRequest)) => 400,
@@ -107,83 +95,12 @@ pub fn feed(publication: &mut Publication, data: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
-    let (_listener, mut incoming) = SrtListener::builder().bind(addr).await?;
-    tracing::info!(%addr, implementation = "srt-rs", "SRT listening");
-    let active = Arc::new(AtomicUsize::new(0));
-    while let Some(request) = incoming.incoming().next().await {
-        let app = app.clone();
-        let active = active.clone();
-        tokio::spawn(async move {
-            let stream_id = request
-                .stream_id()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let from = request.remote().ip();
-            let mut publication =
-                match admit(&app, &stream_id, from, active.load(Ordering::Relaxed)) {
-                    Ok(p) => p,
-                    Err(r) => {
-                        let _ = request.reject(reject_reason(r)).await;
-                        return;
-                    }
-                };
-            let mut socket = match request.accept(None).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "SRT accept failed");
-                    publication.end();
-                    return;
-                }
-            };
-            active.fetch_add(1, Ordering::Relaxed);
-            loop {
-                let data = match tokio::time::timeout(IDLE, socket.next()).await {
-                    Ok(Some(Ok((_, data)))) => data,
-                    Ok(Some(Err(e))) => {
-                        tracing::info!(error = %e, "SRT receive ended");
-                        break;
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        tracing::info!("SRT publisher idle, dropping");
-                        break;
-                    }
-                };
-                if let Err(e) = feed(&mut publication, &data) {
-                    tracing::warn!(error = %e, "dropping SRT publisher");
-                    break;
-                }
-            }
-            active.fetch_sub(1, Ordering::Relaxed);
-            publication.end();
-        });
-    }
-    Ok(())
-}
-
-fn reject_reason(r: Refused) -> RejectReason {
-    RejectReason::Server(match r {
-        Refused::Policy(Refusal::Request(PublishError::BadRequest)) => {
-            ServerRejectReason::BadRequest
-        }
-        Refused::Policy(Refusal::Request(PublishError::BadPath)) => ServerRejectReason::Notfound,
-        Refused::Policy(Refusal::Request(PublishError::Unauthorized)) => {
-            ServerRejectReason::Unauthorized
-        }
-        Refused::Policy(Refusal::AlreadyLive) => ServerRejectReason::Conflict,
-        Refused::Policy(Refusal::Throttled) | Refused::PublisherLimit => {
-            ServerRejectReason::Overload
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn statuses_match_what_srt_tokio_sends() {
+    fn statuses_match_what_srt_tokio_sent() {
         // Observed from srt-live-transmit against the srt-tokio listener:
         // PREDEFINED:400, 401, 402, 404 and 409.
         for (r, status) in [

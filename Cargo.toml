@@ -9,7 +9,7 @@ members = [
     "crates/sapflow-ffi",
     "crates/sapflow-client",
 ]
-exclude = ["fuzz", "vendor/srt-protocol"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.0"
@@ -36,15 +36,9 @@ debug = false
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-# Unwind, not abort: fuzzing found panics in a dependency on hostile input.
-# With unwinding a panic ends only the task it happened in (one connection),
-# and srt-protocol's parser can turn its own panics into errors.
+# Unwind, not abort: a panic on hostile input then ends only the task it
+# happened in (one connection), not the server.
 panic = "unwind"
-
-# srt-protocol 0.4.4 with fixes for panics found by fuzzing; see its
-# PATCHES.md.
-[patch.crates-io]
-srt-protocol = { path = "vendor/srt-protocol" }
 
 # Release code with symbols, for profilers: cargo build --profile profiling
 [profile.profiling]

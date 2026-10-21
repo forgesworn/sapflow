@@ -1,16 +1,23 @@
 # Encrypted own-SRT origin
 
-`SAPFLOW_SRT_IMPL=own` opts into the original Sapflow SRT implementation.
-The default implementation remains unchanged. For this listener, configure
-`SAPFLOW_SRT_PASSPHRASE` independently of `SAPFLOW_PUBLISH_PASS`, and optionally
-`SAPFLOW_SRT_CIPHER=aes256` (the default with a passphrase) or `aes128`.
+Sapflow uses its own SRT implementation. Configure `SAPFLOW_SRT_PASSPHRASE`
+independently of `SAPFLOW_PUBLISH_PASS`, and optionally
+`SAPFLOW_SRT_PBKEYLEN=16` (the default, AES128) or `32` (AES256).
+The earlier explicit `SAPFLOW_SRT_CIPHER=aes128` or `aes256` setting remains
+supported; if both key-size settings are present they must agree.
 The caller must use the same transport secret and cipher. Provision the
 transport secret separately; never derive it from the clear-text stream ID.
 
 A transport passphrase must contain 10 through 79 bytes and no NUL. An empty
 value is invalid, rather than disabling encryption. A cipher without a
-passphrase, an unsupported cipher, or either encryption setting with the
-default `srt-rs` implementation causes startup failure. Flags of the same name
+passphrase, an unsupported key size or conflicting key-size settings cause
+startup failure. The removed `srt-rs` implementation is refused explicitly;
+the old `SAPFLOW_SRT_IMPL=own` setting is accepted for compatibility.
+`SAPFLOW_SRT_PBKEYLEN` only chooses the encryption key size. Without a
+passphrase it permits plaintext, matching the existing origin configuration;
+set a passphrase to require encryption. The named `SAPFLOW_SRT_CIPHER` alias
+requires a passphrase.
+Flags of the same name
 are supported, but environment provisioning avoids putting the secret in a
 command line. Setting neither option preserves the existing plaintext
 own-listener behaviour. Configuring a secret requires encryption and rejects
@@ -43,8 +50,6 @@ Focused regressions exercise actual own Caller/Listener negotiation with the
 server-generated configuration: AES128/AES256 media delivery, wrong secret,
 wrong cipher and missing encryption, plus configuration bounds and redaction.
 
-Local validation: `cargo test --offline -p sapflow-server --bin sapflow config::
--j 2` passed all eight configuration tests; the `srt_own::` filter passed its
-eight-case protocol matrix. Strict binary Clippy and the debug origin binary
-build also passed. No active server was restarted by these checks, and no
-physical-device result is implied.
+Configuration and protocol regressions cover these settings in the server
+test suite. Source tests and physical device qualification remain separate;
+the mobile Stop-test APK retains its frozen source and artefact receipt.

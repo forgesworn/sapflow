@@ -13,10 +13,14 @@ is tried.
 | 2026-10-20 | Larix Broadcaster (iPhone) | RTMP | Larix defaults (H.264 Baseline 720p30, AAC mono, 2 s keyframes); credentials in the URL | Servable in 1.0 s; 2 s segments decode cleanly, A/V start within 7 ms |
 | 2026-10-20 | Larix Broadcaster (iPhone) | SRT | Larix defaults, credentials in the `streamid`, 2 s latency | Servable in 4.5 s; 24 segments decode cleanly; 4 late packets dropped once over Wi-Fi (one segment 59 frames of 60) |
 | 2026-10-20 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults over Wi-Fi | Safari refused the stream (crossed-out play button) after Wi-Fi stalls (one frame of 0.367 s) raised `PART-TARGET` to 0.534 s while parts stayed 0.2 to 0.233 s. Fixed in a94da2f: `PART-TARGET` fixed at 0.234 s, long frames clamped (`docs/reference.md`, Part timing) |
-| 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults, Wi-Fi switched off briefly, served by a94da2f | Part rules held (`PART-TARGET` 0.234 throughout), but the drop left a 6 s segment and `EXT-X-TARGETDURATION` rose from 2 to 6; Safari stopped. Fixed in d480bb9: the target is fixed and a drop ends the segment, marked as a discontinuity (`docs/reference.md`, Target duration and breaks). An SRT silence of 5 s still ends the stream (M7) |
+| 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT | Larix defaults, Wi-Fi switched off briefly, served by a94da2f | Part rules held (`PART-TARGET` 0.234 throughout), but the drop left a 6 s segment and `EXT-X-TARGETDURATION` rose from 2 to 6; Safari stopped. Fixed in d480bb9: the target is fixed and a drop ends the segment, marked as a discontinuity (`docs/reference.md`, Target duration and breaks). An SRT silence of 5 s then ended the stream; since M7 the stream is held for a reconnect (`SAPFLOW_RECONNECT_GRACE`) |
+| 2026-10-21 | Larix Broadcaster (iPhone), Safari on macOS playing | SRT (`SAPFLOW_SRT_IMPL=own`) and RTMP at once | Larix defaults over Wi-Fi, served by d480bb9; Wi-Fi switched off twice | Both streams stayed live through drops of 3.1 and 4.4 s, each marked as a discontinuity; Safari carried on (by eye); recordings 98.6 s (SRT) and 107.8 s (RTMP). One RTMP reconnect was refused as already live until the old connection timed out, then accepted 3 s later |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) | SRT, `SAPFLOW_SRT_IMPL=own` | `SRT_IMPLS="srt-rs own" scripts/smoke.sh` | Pass with both implementations (refusals 400, 401, 409 included) |
 | 2026-10-20 | ffmpeg 8.1.2 (libsrt 1.5.3, in Docker) | SRT, `SAPFLOW_SRT_IMPL=own` | 720p30 x264 2.5 Mbit/s, `latency=2000000` | Accepted at 2000 ms latency, servable in 3.5 s, clean shutdown and unpublish |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) with `passphrase=` | SRT, `SAPFLOW_SRT_IMPL=own` | 200 ms | Refused in the handshake: libsrt reports `ERROR:UNSECURE`, "Password required or unexpected" (encryption is M6b) |
+| 2026-10-21 | OBS 32.1.2 (libsrt 1.5.2) | SRT, own receiver (the default) | OBS's default x264 (8.33 s keyframes), browser source, `latency=2000000`; served by 8ee5704 | Servable in 19.7 s (the long GOP); a segment decodes cleanly (250 frames, AAC). OBS quit and restarted 62 s later: resumed the held stream, one discontinuity, same chunk names |
+| 2026-10-21 | OBS 32.1.2 (libsrt 1.5.2) | SRT with `passphrase=` and `pbkeylen=16`, own receiver | as above, server `SAPFLOW_SRT_PASSPHRASE` set | Servable in 19.6 s, decodes cleanly; with one letter of the passphrase wrong, refused in the handshake ("wrong passphrase or key length") |
+| 2026-10-21 | Larix Broadcaster (iPhone) | SRT with a passphrase (AES-128), own receiver | Larix defaults over Wi-Fi, 2 s latency; served by 8ee5704 | Servable in 6.0 s, a segment decodes cleanly (60 frames, AAC). With the server's passphrase changed by one letter: refused nine times, about every 3 s; with it changed back, Larix reconnected by itself |
 
 Output checked for the 1 s keyframe runs: H.264 High 1280x720 30 fps and
 AAC-LC 48 kHz stereo, 1 s segments, 200 ms parts, a keyframe at the start of
@@ -57,22 +61,195 @@ Safari plays `http://<host>:18882/live/event-irr/index.m3u8`. On
 A recording of 60 s of it from d480bb9 lasts 50.8 s (the drops, and the
 video waiting for keyframes, are left out), decodes cleanly and seeks.
 
+## Delay through the server
+
+`scripts/ingest-lag.py` publishes ffmpeg's test signal in real time and
+times when each part appears in the playlist against when ffmpeg sent its
+last frame: SRT latency plus whatever the server adds, without the player.
+On 2026-10-21, own SRT and RTMP on the same server, 30 to 40 s each:
+
+| Publish | Median lag | p90 |
+|---------|------------|-----|
+| RTMP | -0.23 s | 0.03 s |
+| SRT, 200 ms latency | -0.12 s | 0.16 s |
+| SRT, 2000 ms latency | 1.68 s | 1.97 s |
+| SRT, 200 ms, ffmpeg's MPEG-TS defaults | 1.91 s | 2.12 s |
+
+ffmpeg's read burst at the start puts every sample about 0.3 s early, so a
+part is servable about when the SRT latency has passed: the server adds
+nothing measurable. ffmpeg's own MPEG-TS defaults (`muxdelay`, PES
+packing) add about 1.7 s, the same against srt-rs; `-muxdelay 0
+-muxpreload 0 -pes_payload_size 0 -flush_packets 1` removes it. That is
+the sender's delay, worth knowing when an ffmpeg-based encoder seems slow.
+
+Glass to glass, 2026-10-21: Larix on an iPhone over Wi-Fi, our own SRT at
+2 s latency, 2 s keyframes, filming a millisecond clock on the Mac, played
+by Safari (macOS) straight from sapflow over plain HTTP/1.1 on the LAN: 10.8
+s in two samples, on a freshly loaded page. Safari held about 8.8 s of
+media ahead of the playhead, so about 9 s of the delay is the player's
+starting distance from the live edge; Larix and the SRT latency are the
+rest. Safari made blocking reloads and fetched every part, yet positioned
+about 3 x `TARGETDURATION` back rather than `PART-HOLD-BACK`. mediamtx
+(`latest-ffmpeg` image) given the same ffmpeg stream (2 s keyframes) side
+by side behaved the same way relative to its own `TARGETDURATION` (2 against
+our 3): 5.5 s held against 9.4 s, so sapflow played about 4 s further
+behind.
+
+The same Larix stream through a TLS and HTTP/2 front (Node's `http2`
+module with a locally trusted certificate, standing in for Caddy): 3.0 and
+3.2 s glass to glass, with Safari holding almost nothing ahead of the
+playhead. Safari takes the low-latency position only over HTTP/2, as
+Apple's LL-HLS guidance says; over HTTP/1.1 it falls back to 3 x
+`TARGETDURATION`. Production goes through Caddy with HTTP/2, so measure
+latency that way: here plain HTTP overstated it by about 7.7 s (10.8 s
+against 3.0 to 3.2 s) at 2 s keyframes. The 2 s SRT latency is most of what remains.
+
+## Behind Caddy, in Docker on the Mac (2026-10-21)
+
+A stand-in for the M7 item "measured on Linux behind Caddy" while no second
+wired machine is free. Caddy 2.11.7 (the official `caddy:2` image) runs in
+Docker Desktop on the same Mac as sapflow (8ee5704, release build, on the
+host) and the test clients. `tls internal` gives it its own CA, trusted only
+by those clients. One port serves TLS with HTTP/2 (and offers HTTP/3);
+`handle_path /live-hls/*` then `reverse_proxy` to sapflow's HLS port, the
+shape `docs/v4v-contract.md` describes. The publisher is ffmpeg over RTMP,
+720p30 x264 at 2.5 Mbit/s, 200 ms parts, keyframes every 1 s or 2 s.
+
+```
+HTTP_PORT=28888 RTMP_PORT=28935 CADDY_PORT=28943 SAPFLOW_BIN=<sapflow> \
+  PLAYWRIGHT_DIR=<playwright package> HLS_JS=<hls.min.js> \
+  scripts/behind-caddy.sh lag blocking check player     # KEYINT=2: 2 s keyframes
+```
+
+`scripts/behind-caddy.Caddyfile` is the Caddyfile. The clients are
+`scripts/behind-caddy.mjs` (Node's `http2`, no packages) and
+`scripts/behind-caddy-player.mjs` (hls.js 1.7.1 in an already installed
+Playwright and Chrome; nothing was downloaded). The Mac was busy with other
+work throughout (one-minute load average 20 to 177 on 8 cores), so absolute
+times wobble; what counts was measured on the same stream at the same moment
+by both paths.
+
+**What Caddy needed:** nothing beyond the plain `reverse_proxy`. Tried
+without effect: `flush_interval -1` (bodies have a length and are held until
+ready, so there is nothing to flush early; two runs of 200 blocking reloads
+cost a median 2.3 and 2.2 ms, against 2.4 and 2.2 ms for the plain config)
+and `encode gzip zstd` (its default match leaves playlists and fMP4 alone: no
+`Content-Encoding` on any response, with browser-style `Accept-Encoding`
+offered). Forcing gzip onto playlists works (2,001 bytes became 417, median
+cost 2.4 and 1.8 ms) but saves little. Caddy added `alt-svc` and
+`via: 1.1 Caddy` and dropped nothing. sapflow sets
+`access-control-allow-origin` itself, so Caddy should not add another.
+
+**Correct through Caddy** (`check`, at both keyframe intervals, no failures):
+
+- HTTP/2 negotiated (ALPN `h2`; `curl --http2` reports "using HTTP/2").
+- The multivariant playlist, init segment, parts and segments identical to
+  direct byte for byte, with the same `content-type`, `cache-control`
+  (`no-cache` for playlists, `public, max-age=3600` for media),
+  `content-length` and CORS header. Media playlists fetched in pairs just
+  after a part appeared: 40 of 40 identical in each of four runs.
+- 404 (unknown stream, unknown chunk) and 400 (`_HLS_msn=abc`, `_HLS_part`
+  without `_HLS_msn`, `_HLS_msn` far ahead) kept, with empty bodies and the
+  CORS header; the CORS preflight still 204.
+- A preload-hinted part asked for before it existed was held until it did,
+  then identical (12 of 12 in each run; about 200 ms, 2 to 5 ms over direct).
+- A request held for sapflow's whole limit ended in its own 503 as soon as
+  direct did: 6.00 against 6.04 s (`TARGETDURATION` 2), 9.00 against 9.03 s
+  (3). Caddy cuts nothing short.
+- `scripts/check-playlist.py` through Caddy (HTTP/1.1 over TLS: it has no
+  HTTP/2) and direct: every render kept the rules.
+
+**Cost and delay.** The first three rows are Caddy minus direct, the same
+request asked on both paths at once; the last two are absolute.
+
+| Measure | 1 s keyframes | 2 s keyframes |
+|---------|---------------|---------------|
+| Blocking reload for the next part, 200 samples, median / p90 / p99 | 1.6 / 3.0 / 16 ms | 1.3 / 3.5 / 24 ms |
+| The same against a second plain connection (noise floor) | -0.03 / 0.6 / 22 ms | -0.01 / 0.4 / 5.1 ms |
+| First sight of each new part, 445 parts, median / p90 / p99 | 1.7 / 4.1 / 15 ms | 2.0 / 6.0 / 16.5 ms |
+| hls.js `lowLatencyMode`, Chrome 155 headless, direct over HTTP/1.1 | 1.51 s (1.17 to 2.11) | 2.14 s (1.08 to 3.50) |
+| The same through Caddy over HTTP/2 | 1.62 s (1.21 to 2.17) | 2.10 s (1.18 to 3.60) |
+
+Every blocking reload carried the part it asked for (none early), and no part
+seen directly was missed through Caddy (0 of 453).
+
+What each includes. The first three rows time sapflow to a client on
+loopback: Caddy, TLS, HTTP/2 framing and Docker Desktop's two network hops,
+with no player and no encoder (a native Caddy on Linux has fewer hops, so
+this probably overstates its cost). The hls.js rows are `hls.latency`, the
+playlist's live edge as hls.js last loaded it minus the playhead; the wall
+clock against the programme date-time of the frame on screen agreed within
+0.05 s. They include where hls.js chose to start and the age of its playlist;
+they exclude the encoder, the ingest hop and the time sapflow takes to form a
+part. Each is the median of the run medians (lowest to highest) over 8 and 6
+runs of 70 s, direct and Caddy playing the same stream together, in
+alternating start order. The spread is where hls.js happens to start: in the
+first set the page that started second sat about 0.1 s further back (Caddy
+second: +0.15 s on average, first: -0.08 s). Caddy minus direct averaged
++0.03 s (1 s keyframes) and +0.07 s (2 s), inside that effect. hls.js held
+1.5 s (1 s keyframes) and 2.1 s (2 s) back; its target is `PART-HOLD-BACK`,
+0.585 s.
+
+Absolute part lag, measured as `scripts/ingest-lag.py` does, was the same on
+both paths: -0.43 s on the quietest 90 s run at 1 s keyframes (every third of
+the run alike), against -0.31 s from `ingest-lag.py` itself (2 s keyframes)
+on the same machine; that is the encoder start-up bias noted above. On busier
+runs the spread widened (p90 +0.27 s), and at 2 s keyframes the lag drifted
+from +1.4 to -0.4 s over the run on both paths together, probably ffmpeg
+starved of CPU.
+
+Over four minutes both players drifted back together (2.9 to 5.9 s direct and
+2.5 to 5.5 s through Caddy at 1 s keyframes; 1.7 to 4.1 s and 1.7 to 4.0 s at
+2 s). hls.js does not speed up to catch the edge, and under that load the
+browser played 1.2 to 1.8% slower than real time; hence the 70 s runs. Frames
+dropped ranged from 0 to 5% a run: through Caddy 2.6% against 0.9% direct in
+the first set but 1.1% against 1.0% in the second, so not put down to the
+path.
+
+**What this does not show.** Chrome does not show the difference Safari shows
+between HTTP/1.1 and HTTP/2 (9 s against 3 s, earlier in this file), so the
+Safari figure still rests on the Node stand-in. Caddy passed the same bytes
+and headers over HTTP/2, so there is no reason Safari would differ, but nobody
+has watched it through Caddy. Chrome stayed on HTTP/2 for every response
+although Caddy offered HTTP/3 (its UDP port was published), so HTTP/3 is
+untried.
+
+**Still needs the wired Linux machine:** Caddy on Linux with a real
+certificate and the real v4v Caddyfile (its `encode`, `header`, logging and
+timeouts could each change this); Safari on an iPhone and a Mac through it;
+HTTP/3; the 250 and 750 full-viewer runs through Caddy (`sapflow-bench`
+now speaks HTTP/2 over TLS: `docs/benchmarks.md`), and Caddy's CPU at that load; Caddy and sapflow on
+separate hosts; and a quiet machine for a long soak, which the drift above
+rules out here. `CADDY_URL` points the script at a Caddy that is already
+running; `CADDY_NETWORK=host` runs the container on Linux's host network.
+
 ## Not yet tried
 
 - Larix on Android.
-- A network drop (Wi-Fi off), the phone locked or backgrounded, SRT with a
-  passphrase.
-- OBS dropping and reconnecting; OBS's Apple hardware encoder; vMix.
+- The phone locked or backgrounded.
+- OBS's Apple hardware encoder; vMix.
 
 ## Stopping and restarting
 
-Tried with Larix over RTMP: stopping the broadcast ends the stream at once
-(the playlist is 404); restarting gives a new stream about 1 to 2 s after
-the encoder reconnects (media sequence 0, new chunk names, seven gap
-segments). sapflow holds nothing for a publisher that leaves; a silent one
-is dropped after 10 s. Holding the stage across a drop is v4v's side (its
-ingest gate covers a dropped encoder held and resumed). How hls.js and
-Safari recover from the 404 and the new playlist is not yet checked.
+Tried with Larix over RTMP on 2026-10-20, before the grace period:
+stopping the broadcast ended the stream at once (the playlist was 404) and
+restarting gave a new stream (media sequence 0, new chunk names). Since
+then a publisher that leaves, or a silent one dropped (SRT after 5 s, RTMP
+after 10 s), has its stream held for `SAPFLOW_RECONNECT_GRACE` (default
+90 s): a restart within it carries on the same playlist and recording
+after a discontinuity (`docs/reference.md`, Target duration and breaks).
+With ffmpeg, the smoke test and v4v's ingest gates cover it; hls.js was
+watched crossing a reconnect.
+
+On 2026-10-21 Larix (iPhone, Wi-Fi) published over RTMP and our own SRT at
+once. The RTMP connection dropped seven times in six minutes (the phone
+closing it, gone 10 to 58 s each time); every reconnect resumed the held
+stream, with `unpublish` at the drop and `publish` on the return. Safari
+kept playing but ended about 10 s behind the camera, as each break left it
+further back. The SRT stream had one break. Larix's first two SRT attempts
+that session were accepted but sent no data, and timed out after 5 s; its
+third, 20 s later, ran cleanly. Not yet explained. OBS quit and
+restarted 62 s later also resumed its held stream (table above).
 
 ## SRT under packet loss (2026-10-20)
 
@@ -307,3 +484,251 @@ How it got there:
   25.9% ± 0.6 at 20% random (srt-rs 26.9% ± 0.6, libsrt 27.5% ± 0.8) and
   9.3% ± 1.2 under bursts (9.4% ± 1.2, 10.4% ± 1.4), with 200 ms unchanged.
   A wider margin (at least RTT/8) measured the same and was not kept.
+
+## SRT under packet loss, encrypted (2026-10-21)
+
+The harness of the two sections above with a passphrase on: `PASSPHRASE`,
+`PBKEYLEN` and `KMREFRESH` in `scripts/srt-loss.sh` give libsrt's sender and
+receiver `passphrase`, `pbkeylen`, and on the sender `kmrefreshrate` and
+`kmpreannounce` (a quarter of the refresh rate), and sapflow
+`SAPFLOW_SRT_PASSPHRASE` and `SAPFLOW_SRT_PBKEYLEN`. The sender is libsrt
+1.5.4 in every trial, so it also does the key refreshes. The binary is a
+release build of commit 8ee5704 (our own SRT, which has the passphrase).
+Receivers: `own` is sapflow, `libsrt` is libsrt's `srt-live-transmit`. A
+sapflow receiver not named `own` would run the patched srt-rs, which has no
+passphrase, so the script refuses that combination.
+
+```
+PASSPHRASE=loss-test-key PBKEYLEN=16 KMREFRESH=1500 SEEDS=6 JOBS=2 \
+  RECEIVERS="own libsrt" scripts/srt-loss.sh
+PASSPHRASE=loss-test-key PBKEYLEN=32 KMREFRESH=2000 SEEDS=3 JOBS=2 \
+  LOSSES="random:10 burst:8,8" RECEIVERS="own libsrt" scripts/srt-loss.sh
+```
+
+A 30 s clip is about 7,180 original data packets (7,142 to 7,182 across the
+trials). A refresh every 1,500 packets sends the new key 375 packets ahead
+(about 1.5 s), switches at about packets 1,500, 3,000, 4,500 and 6,000, and
+so makes four switches in a clip; every 2,000 gives three. libsrt prints
+`SRTO_KMREFRESHRATE=...: setting SRTO_KMPREANNOUNCE=...` when it starts: it
+clamps its default pre-announce of 4096 packets before applying the one in
+the URL. The URL value is the one in force (libsrt rejects one above
+(refresh - 1) / 2), and the capture below shows the first KMREQ about 375
+packets before the first switch.
+
+Before the runs, three checks that encryption is on and that the key
+refresh happens:
+
+- **A wrong passphrase delivers nothing.** With a different passphrase on
+  the sender (`SENDER_PASSPHRASE`), 4 of 4 short trials (10 s clip, one per
+  receiver with and without loss) failed: both receivers refuse the
+  connection in the handshake (libsrt logs `BADSECRET`, `Incorrect
+  passphrase`), and no media was recorded or written.
+- **The payload on the wire is not MPEG-TS.** A throwaway relay between the
+  sender and the proxy (not in the repository) read the SRT headers in a 30 s
+  trial at 20% random loss and 200 ms against each receiver, and in a third
+  at AES-256 and 10%. Of 9,980 data packets (originals and retransmissions)
+  in the first none had the MPEG-TS sync byte 0x47 at both offset 0 and
+  offset 188 of its payload, which every plain packet has; nor had any of
+  9,632 and 8,618 in the others.
+- **The key switches, under loss.** The key flag of the original data
+  packets, in the order sent, held one key for 1,500 packets, then the
+  other for 1,501, then 1,501, 1,501 and 1,179 (against both receivers, at a
+  refresh of 1,500), and 2,000, 2,001, 2,001 and 1,180 at a refresh of 2,000.
+  In the AES-128 trial against `own` the sender sent 10 KMREQs for 5
+  refreshes (the fifth, at packet 7,128, announces a switch the clip ends
+  before), repeating a request when no answer came back, and 5 KMRSPs got
+  back through the 20% loss; against libsrt, 9 KMREQs and 5 KMRSPs. The
+  AES-256 trial at 10% needed no repeats (3 and 3).
+
+AES-128, key refresh every 1,500 packets (four switches a clip), 6 seeds per
+condition, the receivers interleaved seed by seed. One of the 100 trials
+(libsrt at 3% and 200 ms, seed 5) died in the script and was run again
+afterwards with the same settings:
+
+| Loss | Latency | Receiver | n | Retransmission overhead | Not recovered in time | Video delivered | Audio delivered | Decode messages |
+| ------ | --------: | ---------- | --: | ------------------------: | ----------------------: | ----------------: | ----------------: | ----------------: |
+| 3% random | 2000 ms | own | 6 | 3.3% ± 0.1 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 3% random | 2000 ms | libsrt | 6 | 3.6% ± 0.4 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 89.0 ± 0.0 |
+| 10% random | 2000 ms | own | 6 | 11.7% ± 0.3 | 0.00% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | libsrt | 6 | 14.5% ± 0.4 | 0.00% ± 0.00 | 100.04% ± 0.06 | 100.00% ± 0.00 | 60.0 ± 44.9 |
+| 20% random | 2000 ms | own | 6 | 26.1% ± 0.7 | 0.00% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 20% random | 2000 ms | libsrt | 6 | 31.1% ± 1.0 | 0.00% ± 0.01 | 99.96% ± 0.15 | 99.94% ± 0.15 | 72.8 ± 35.4 |
+| bursty 8% | 2000 ms | own | 6 | 9.8% ± 1.0 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| bursty 8% | 2000 ms | libsrt | 6 | 12.0% ± 1.5 | 0.00% ± 0.01 | 100.00% ± 0.12 | 99.94% ± 0.15 | 58.8 ± 44.1 |
+| 3% random | 200 ms | own | 6 | 5.2% ± 0.7 | 0.01% ± 0.01 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.3 ± 0.8 |
+| 3% random | 200 ms | libsrt | 6 | 4.3% ± 0.4 | 0.01% ± 0.01 | 100.04% ± 0.06 | 100.00% ± 0.00 | 60.0 ± 44.9 |
+| 10% random | 200 ms | own | 6 | 20.3% ± 1.6 | 0.23% ± 0.15 | 99.79% ± 0.32 | 99.80% ± 0.49 | 12.8 ± 14.0 |
+| 10% random | 200 ms | libsrt | 6 | 15.9% ± 1.1 | 0.43% ± 0.13 | 100.06% ± 0.06 | 99.15% ± 0.72 | 66.5 ± 54.6 |
+| 20% random | 200 ms | own | 6 | 37.7% ± 2.7 | 0.91% ± 0.16 | 99.25% ± 0.22 | 98.02% ± 0.81 | 54.5 ± 7.1 |
+| 20% random | 200 ms | libsrt | 6 | 32.2% ± 2.1 | 1.96% ± 0.31 | 100.06% ± 0.09 | 97.19% ± 0.71 | 138.7 ± 23.6 |
+| bursty 8% | 200 ms | own | 6 | 14.6% ± 3.1 | 0.75% ± 0.19 | 99.63% ± 0.09 | 99.80% ± 0.49 | 7.8 ± 1.7 |
+| bursty 8% | 200 ms | libsrt | 6 | 11.3% ± 1.7 | 1.03% ± 0.51 | 99.83% ± 0.22 | 99.27% ± 0.60 | 39.0 ± 45.0 |
+
+`own` minus libsrt, with a Welch t statistic over the 6 seeds (|t| below
+about 2.3 is noise). Video and audio delivered and decode messages compare
+sapflow builds only, as above, so they are left out:
+
+| Loss | Latency | Overhead, points | t | Not recovered, points | t |
+| ------ | --------: | -----------------: | --: | ----------------------: | --: |
+| 3% random | 2000 ms | -0.3 | -1.7 | +0.00 | - |
+| 10% random | 2000 ms | -2.8 | -12.6 | +0.00 | 1.0 |
+| 20% random | 2000 ms | -4.9 | -10.1 | +0.00 | 0.0 |
+| bursty 8% | 2000 ms | -2.2 | -3.0 | -0.00 | -1.0 |
+| 3% random | 200 ms | +0.9 | 2.6 | -0.00 | -0.3 |
+| 10% random | 200 ms | +4.4 | 5.6 | -0.20 | -2.5 |
+| 20% random | 200 ms | +5.5 | 3.9 | -1.05 | -7.3 |
+| bursty 8% | 200 ms | +3.3 | 2.3 | -0.28 | -1.3 |
+
+AES-256, key refresh every 2,000 packets (3 switches a clip), 3 seeds, two
+conditions at each latency:
+
+| Loss | Latency | Receiver | n | Retransmission overhead | Not recovered in time | Video delivered | Audio delivered | Decode messages |
+| ------ | --------: | ---------- | --: | ------------------------: | ----------------------: | ----------------: | ----------------: | ----------------: |
+| 10% random | 2000 ms | own | 3 | 11.8% ± 0.2 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| 10% random | 2000 ms | libsrt | 3 | 15.2% ± 1.0 | 0.00% ± 0.00 | 99.89% ± 0.00 | 100.00% ± 0.00 | 89.0 ± 0.0 |
+| bursty 8% | 2000 ms | own | 3 | 9.4% ± 1.2 | 0.00% ± 0.00 | 100.00% ± 0.00 | 100.00% ± 0.00 | 0.0 ± 0.0 |
+| bursty 8% | 2000 ms | libsrt | 3 | 10.7% ± 0.6 | 0.00% ± 0.00 | 99.89% ± 0.00 | 100.00% ± 0.00 | 89.0 ± 0.0 |
+| 10% random | 200 ms | own | 3 | 16.1% ± 3.5 | 0.19% ± 0.09 | 99.73% ± 0.07 | 99.21% ± 0.69 | 11.7 ± 1.5 |
+| 10% random | 200 ms | libsrt | 3 | 14.3% ± 1.0 | 0.37% ± 0.04 | 99.96% ± 0.06 | 99.74% ± 0.45 | 48.3 ± 49.6 |
+| bursty 8% | 200 ms | own | 3 | 12.1% ± 2.1 | 0.63% ± 0.31 | 99.54% ± 0.20 | 99.60% ± 0.34 | 10.3 ± 2.5 |
+| bursty 8% | 200 ms | libsrt | 3 | 10.7% ± 1.2 | 0.95% ± 0.32 | 99.56% ± 0.11 | 99.55% ± 0.40 | 73.3 ± 44.5 |
+
+`own` minus libsrt, 3 seeds (with 3 seeds only |t| above about 3 to 4 is worth
+claiming):
+
+| Loss | Latency | Overhead, points | t | Not recovered, points | t |
+| ------ | --------: | -----------------: | --: | ----------------------: | --: |
+| 10% random | 2000 ms | -3.4 | -6.0 | +0.00 | - |
+| bursty 8% | 2000 ms | -1.3 | -1.8 | +0.00 | - |
+| 10% random | 200 ms | +1.8 | 0.9 | -0.18 | -3.2 |
+| bursty 8% | 200 ms | +1.5 | 1.1 | -0.32 | -1.2 |
+
+Does encryption, or the refresh, cost anything? The first batch above mostly
+ran at a load average of 80 to 130 and its 200 ms overhead was well above the
+M6a run's, so a second set ran in the same session at 200 ms with 4 seeds,
+one run after another: unencrypted, AES-128 without a refresh, and AES-128
+with one every 1,500 packets; then the binary of the M6a table (4722f34)
+beside the current one, unencrypted. Overhead is the mean over the seeds,
+then `own` minus libsrt with its t statistic (with 4 seeds only |t| above
+about 3 is worth claiming); unrecovered is the mean for `own` and then
+libsrt:
+
+| Run | Loss | Own overhead | libsrt overhead | Own minus libsrt | Unrecovered, own / libsrt |
+| ----- | ------ | -----------: | --------------: | ---------------: | ------------------------: |
+| unencrypted | 10% random | 17.5% ± 2.5 | 14.8% ± 1.4 | +2.7 (t 1.9) | 0.17% / 0.28% |
+| unencrypted | 20% random | 38.8% ± 1.4 | 31.8% ± 1.2 | +7.0 (t 7.5) | 1.07% / 1.98% |
+| AES-128, no refresh | 10% random | 13.3% ± 1.9 | 12.9% ± 0.8 | +0.4 (t 0.4) | 0.18% / 0.28% |
+| AES-128, no refresh | 20% random | 34.9% ± 4.9 | 31.7% ± 1.6 | +3.2 (t 1.2) | 0.99% / 1.59% |
+| AES-128, refresh 1500 | 10% random | 19.2% ± 0.7 | 15.0% ± 0.3 | +4.2 (t 11.6) | 0.10% / 0.25% |
+| AES-128, refresh 1500 | 20% random | 37.7% ± 2.7 | 32.5% ± 1.8 | +5.2 (t 3.2) | 0.95% / 1.79% |
+| unencrypted, M6a binary 4722f34 | 10% random | 19.4% ± 0.7 | 15.3% ± 0.7 | +4.1 (t 8.5) | 0.16% / 0.26% |
+| unencrypted, M6a binary 4722f34 | 20% random | 36.2% ± 1.2 | 30.8% ± 0.8 | +5.3 (t 7.5) | 0.93% / 1.71% |
+| unencrypted, 8ee5704 (same run) | 10% random | 19.1% ± 1.1 | 15.3% ± 0.7 | +3.8 (t 5.8) | 0.14% / 0.26% |
+| unencrypted, 8ee5704 (same run) | 20% random | 37.0% ± 1.7 | 30.8% ± 0.8 | +6.1 (t 6.6) | 0.99% / 1.71% |
+
+At 2000 ms, unencrypted in the same session (4 seeds): `own` 11.7% ± 0.4 and
+25.9% ± 0.5 overhead at 10% and 20% random loss against libsrt's 13.5% ± 0.7
+and 32.3% ± 0.8, and 0.00% unrecovered for `own` in both.
+
+What it shows (the machine was shared and heavily loaded: load average
+about 5 when the first run started, then mostly 80 to 130):
+
+- **Encryption with key refresh works under loss.** At 2000 ms `own`
+  delivered every video and audio packet its loss-free run did (864 and
+  1,344) with no decode messages in all 24 AES-128 trials (four conditions,
+  6 seeds, four key switches each) and in all 6 AES-256 trials, and at most
+  0.03% of packets unrecovered in any of the AES-128 ones (none in the
+  AES-256 ones). A key that was not in place at a switch would make every
+  packet until it arrived undecryptable, a run of packets (about 240 a
+  second) and the frames they carry in each trial; none of the trials shows
+  one.
+- **At 2000 ms `own` is level with libsrt or lower on overhead**, the same
+  as unencrypted: 0.3 points lower at 3% random (t -1.7), 2.8 at 10% (t
+  -12.6), 4.9 at 20% (t -10.1) and 2.2 under bursts (t -3.0). Our own
+  figures did not move from the unencrypted M6a run (3.3, 11.7, 26.1 and
+  9.8%, against 3.3, 11.6, 25.7 and 9.6%); libsrt's did (14.5% and 31.1%
+  at 10% and 20%, against 12.3% and 27.6%), and the same-session
+  unencrypted run shows libsrt's higher figure there too (13.5% and
+  32.3%). The larger lead than in M6a is libsrt's figure moving, not ours.
+- **At 200 ms `own` leaves fewer packets unrecovered than libsrt** under
+  loss that is not bursty: 0.20 points fewer at 10% (t -2.5) and 1.05 at
+  20% (t -7.3), level at 3% and under bursts (0.28 fewer, t -1.3). The
+  AES-256 batch agrees at 10% (0.18 fewer, t -3.2).
+- **At 200 ms `own` costs more retransmissions than libsrt in this session**,
+  by more than the spread: +4.4 points at 10% random (t 5.6), +5.5 at 20% (t
+  3.9), +3.3 under bursts (t 2.3, borderline) and +0.9 at 3% (t 2.6). It is
+  not the encryption: the unencrypted run in the same session shows +2.7 and
+  +7.0 points, AES-128 without a refresh +0.4 and +3.2, and the binary of the
+  M6a table, unencrypted, +4.1 and +5.3, where M6a measured it level (+0.0 and
+  -1.1). The same code gives a different overhead at a different time: what
+  about this session moved it (the load, most likely) was not isolated. The
+  refresh does not show as a cost either: at 10% `own` had 19.2% and 20.3%
+  overhead with refresh (the same-session run and the first batch) against
+  17.5%, 19.1% and 19.4% unencrypted, and it left no more packets unrecovered
+  with a refresh than without (0.10% and 0.95% against 0.18% and 0.99% with
+  encryption but no refresh). The run without a refresh is the odd one out, at
+  13.3% (three of its four seeds between 12.0% and 12.5%, level with libsrt,
+  whose overhead was also about two points lower in it than in the others); it
+  was not repeated, so a small cost of the refresh at 200 ms is not excluded.
+- **Video and audio delivered and decode messages** are as in the
+  unencrypted tables: they depend on what each receiver writes, so they
+  compare sapflow builds, not libsrt.
+- **Nothing in the logs.** The 82 sapflow logs kept from these runs hold only
+  the two start-up warnings (`SAPFLOW_OPEN_PUBLISH` and no callback URL). The
+  libsrt receiver logs hold its too-late drop warnings and teardown messages
+  and no key or decryption message.
+
+Limits as in the sections above (one sender, libsrt 1.5.4; one clip;
+loopback with an emulated 60 ms round trip and independent loss both ways;
+a shared machine), and:
+
+- **No decrypt counter was read.** The receiver counts packets it could not
+  decrypt and key requests it rejected (`encrypted`, `km_rejected` in the
+  receiver's `Stats`), but the server only logs received, retransmitted, lost
+  and dropped packets when a connection closes, at the `info` level (the
+  harness runs it at `warn`). The argument above is indirect: the delivered
+  counts, not a counter.
+- **The key capture is three trials**, not every trial, and the relay adds a
+  hop; it shows the sender's refreshes and the receivers answering them,
+  not that every packet of every trial was decrypted.
+- **The same-session set is 4 seeds** at two conditions and one latency, run
+  one after another, not interleaved with each other (the two receivers
+  within each run were), so a few points of overhead between those runs
+  (13.3% against 19.2% for `own` at 10%) cannot be put down to the
+  setting on this evidence.
+- **Passphrase and key lengths:** AES-128 and AES-256 only, one passphrase,
+  and refresh rates of 1,500 and 2,000 packets; the pre-announce was a
+  quarter of the rate. A passphrase with `%20` is not covered (libsrt 1.5.3
+  does not decode it).
+
+### 200 ms again, on a quieter machine (2026-10-21)
+
+The 200 ms gap above came from runs at a load average of 80 to 130. The
+same comparison again with nothing else heavy running (load average 10 to
+18), 6 seeds, the same binary (8ee5704), unencrypted and then AES-128 with
+a key refresh every 1,500 packets:
+
+```bash
+RECEIVERS="own=$SAPFLOW_BIN libsrt" LATENCIES=200 SEEDS=6 JOBS=2 scripts/srt-loss.sh
+RECEIVERS="own=$SAPFLOW_BIN libsrt" LATENCIES=200 SEEDS=6 JOBS=2 \
+  PASSPHRASE=loss-test-key KMREFRESH=1500 scripts/srt-loss.sh
+```
+
+`own` minus libsrt (Welch t; |t| below about 2.3 is noise):
+
+| Loss | Overhead, unencrypted | Overhead, AES-128 | Not recovered, unencrypted | Not recovered, AES-128 |
+|------|----------------------:|------------------:|---------------------------:|-----------------------:|
+| 3% random | +0.1 (t 0.6) | +0.5 (t 2.6) | +0.01 (t 1.0) | 0.00 |
+| 10% random | -0.1 (t -0.5) | +0.2 (t 0.3) | -0.07 (t -2.2) | -0.10 (t -2.6) |
+| 20% random | -0.3 (t -0.3) | -0.2 (t -0.4) | -0.49 (t -5.2) | -0.43 (t -5.6) |
+| bursty 8% | +1.5 (t 1.7) | +0.7 (t 1.2) | +0.02 (t 0.1) | -0.24 (t -1.1) |
+
+On a quiet machine `own` is level with libsrt on retransmission overhead at
+200 ms, with and without encryption (the one t above 2.3 is half a point at
+3% loss), and recovers more packets in time at 10% and 20% loss. The
+earlier excess was the load, not the receiver or the encryption. One
+figure to look into: at 20% random loss `own` delivers fewer video packets
+relative to its own clean run than libsrt does (99.05% against 99.89%,
+unencrypted), although fewer of its packets go unrecovered; the two
+receivers' outputs are counted differently (sapflow's after muxing into
+HLS, libsrt's as the raw stream), which may explain it; not yet checked.

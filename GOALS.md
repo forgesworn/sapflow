@@ -132,28 +132,37 @@ fuzzing, SRT after the handshake). The `Dockerfile` builds a
 ### M6 Our own SRT (MIT)
 
 srt-rs is unmaintained (last release 2024-05; its authors say they do not
-support it and it never tracked the spec), so sapflow already maintains a
-patched copy. Replace it with `sapflow-srt`: our own MIT implementation of
+support it and it never tracked the spec). Sapflow previously maintained a
+patched copy; M6 replaced it with `sapflow-srt`, our own MIT implementation of
 what the stage uses, written from the SRT specification
 (draft-sharabayko-srt) and observed wire behaviour. No code is copied from
 srt-rs (Apache-2.0) or libsrt (MPL-2.0).
 
-Scope: live mode, listener, one publisher per connection, receiving;
+Original receive milestone scope: live mode, listener, one publisher per
+connection, receiving;
 handshake v5 (and v4 if an encoder needs it), stream id, loss reports
 and periodic NAKs, too-late packet drop, TSBPD delivery, ACK/ACKACK and RTT,
 keepalive and shutdown. Sans-IO (bytes and time in, packets and events
 out), no async runtime, `unsafe` forbidden, so it builds for iOS and Android.
-Out of scope: file mode, rendezvous, caller mode, groups and bonding,
-packet filters (FEC), sending (a later milestone, for phones).
+File mode, rendezvous, groups and bonding, and packet filters (FEC) remain
+out of scope. Caller/sender support and native bindings were added separately
+for the mobile plan below; their implementation and device/release acceptance
+are separate from the historical receive results recorded here.
 
-- **M6a, receive:** unencrypted, behind a switch (`SAPFLOW_SRT_IMPL`), with
-  `srt-protocol` still the default.
+- **M6a, receive (historical):** initially unencrypted, behind a switch
+  (`SAPFLOW_SRT_IMPL`), with `srt-protocol` then the default. The M6a status
+  below records that earlier implementation; M6b and M6c supersede it.
 - **M6b, encryption:** SRT passphrase (AES key wrap, AES-CTR) protects media
   payloads. SRT control packets, including stream IDs, remain visible; never
   assume encryption hides credentials placed in a stream ID. Provision
   session-scoped secrets through an authenticated destination channel.
 - **M6c, switch:** make it the default, remove `vendor/srt-protocol`,
-  `srt-tokio` and their dependencies.
+  `srt-tokio` and their dependencies. **Done 2026-10-21:** ours became the
+  default, then, once OBS had published to it and OBS and Larix had
+  published with a passphrase (`docs/interop.md`), srt-rs was removed.
+  `SAPFLOW_SRT_IMPL=srt-rs` is now refused with a message saying so. The
+  differential test keeps srt-protocol's recorded output as fixtures; the
+  datagrams that crashed it are regression inputs for our parser.
 
 **Done when** (all measured, not asserted):
 - fuzz targets for the packet parser and the connection, clean for 20
@@ -211,20 +220,53 @@ proof:
 
 **M6b implementation (2026-10-21):** the own caller/sender and listener now
 support optional AES-128/256-CTR with bounded key negotiation and refresh,
-wrong-secret rejection and no configured plaintext downgrade. The server can
-require a separately provisioned transport secret with `SAPFLOW_SRT_IMPL=own`;
-[the configuration and limits](docs/own-origin-encryption.md) are documented.
+wrong-secret rejection and no configured plaintext downgrade. The listener
+supports selecting a session secret after bounded stream-ID admission; see
+[the supported crypto profile](crates/sapflow-srt/src/crypto.rs). The
+server takes `SAPFLOW_SRT_PASSPHRASE` and `SAPFLOW_SRT_PBKEYLEN` (16 or 32)
+with `SAPFLOW_SRT_IMPL=own`: a caller without encryption is refused in the
+handshake, and one with a wrong passphrase or key length is refused
+(`BADSECRET`) and counted as a failed login; a stream held by the reconnect
+grace goes back to its hold. `scripts/smoke.sh` publishes with
+`srt-live-transmit` (libsrt 1.5.4) using a passphrase, decodes the result,
+and checks that no passphrase and a wrong one are refused. An independent
+review of the crypto found no defects; its hardening suggestions are in
+`docs/threat-model.md`. OBS and Larix published with a passphrase on
+2026-10-21, and were refused with a wrong one (`docs/interop.md`).
 Independent executable tests cover both directions with libsrt, key rotation,
 clean/impaired loopback delivery and wrong/missing secrets. These are finite
 implementation checks, not completion of the full M6 qualification matrix.
-The existing default receiver is unchanged; CTR does not authenticate media.
+CTR does not authenticate media. The native branch configuration and limits
+are also documented in [the own-origin encryption contract](docs/own-origin-encryption.md).
 
-Still open for M6 as a whole: OBS and Larix against `own` (not tried; they
-need the encoder hardware or app), the full encrypted qualification matrix, and
+Still open for M6 as a whole: the full encrypted qualification matrix, and
 the version 4 handshake, which no encoder tested so far needed (every one
-used version 5).
+used version 5). OBS and Larix have published to our own receiver, with
+and without a passphrase (2026-10-21).
 
 ### M7 Stage resilience and production readiness
+
+**Status (2026-10-21):** the grace period and the health callback are done;
+CI's first run on GitHub passed (2026-10-21: format, clippy and tests;
+the smoke test with both SRT implementations; fuzz regressions and 60 s
+per target). The Linux and Caddy measurements are not done.
+- `SAPFLOW_RECONNECT_GRACE` (default 90 s, equal to v4v's
+  `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`): a dropped publisher's stream,
+  playlist and recording are held; a reconnect on either protocol carries
+  them on after `EXT-X-DISCONTINUITY`. The split with v4v: sapflow sends
+  `unpublish` at the drop and `publish` on the return (v4v shows
+  "reconnecting" and holds the gig); sapflow keeps the media continuous.
+  Proven by unit tests, `scripts/smoke.sh` (both SRT implementations: same
+  chunk names, a discontinuity, playlist rules across it, one recording),
+  v4v's `e2e:ingest-srt-sapflow` (with `SAPFLOW_SRT_IMPL=own`) and
+  `e2e:ingest-sapflow` with `SAPFLOW_RECONNECT_GRACE=10` to match the
+  gate's window, and hls.js in Chrome across a stall and a reconnect
+  (`docs/reference.md`). Safari kept playing across seven Larix RTMP
+  reconnects, but fell further behind with each (`docs/interop.md`); OBS
+  restarted 62 s later resumed its held stream.
+- The `health` callback every `SAPFLOW_HEALTH_INTERVAL` (default 30 s):
+  bitrate, keyframe interval, audio, breaks (`docs/v4v-contract.md`). v4v
+  reads the bitrate today; it reads the keyframe interval from the playlist.
 
 - An encoder that drops (phone locked, network switch) and returns within a
   grace period continues the same stream with `EXT-X-DISCONTINUITY`, and
@@ -234,8 +276,11 @@ used version 5).
 - Measured on Linux behind Caddy: the wired 250 and 750 full-viewer run,
   and glass-to-glass delay.
 - CI on the public repo: tests, clippy, fmt, short fuzz runs, nightly long
-  fuzzing. Written (`.github/workflows/ci.yml`, `fuzz-nightly.yml`); not
-  verified until it has run on GitHub.
+  fuzzing (`.github/workflows/ci.yml`, `fuzz-nightly.yml`). `ci.yml` passed
+  on its first run on GitHub, and `fuzz-nightly.yml` (run by hand on
+  2026-10-21) fuzzed the targets present in that run for 20 minutes with no
+  crash. That historical receipt does not qualify targets or source added
+  later, including the mobile publishing targets.
 
 ### Later
 
@@ -248,8 +293,16 @@ The linked [competition and distribution review](docs/mobile-competitive-review.
 adds our own SRT/RTMP client requirement, measured native-performance targets,
 open-source/free Android distribution and always-free V4V broadcasting.
 
-- `sapflow-core` and `sapflow-srt` for iOS and Android via UniFFI: SRT
-  sending (go live from the phone), relayswarm chunk verification, a native swarm peer.
+The origin [readiness assessment](docs/readiness.md) retains the separate
+trial and production-switch decision and its open Linux, wired Caddy/load,
+show-length and player checks. The native [delivery status](docs/mobile-delivery-status.md)
+tracks mobile implementation, physical-device, end-to-end V4V and installed
+release gates separately. Origin encoder or CI evidence does not complete
+those mobile gates. V4V broadcasting remains unlimited, free and watermark-free
+in every official build.
+
+- Native RelaySwarm chunk verification and a swarm peer through shared Rust
+  bindings for iOS and Android.
 - relayswarm's signed segment commitments produced at the origin.
 - A second rendition.
 

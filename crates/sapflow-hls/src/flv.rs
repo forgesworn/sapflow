@@ -40,6 +40,7 @@ impl FlvIngest {
         self.es.muxer()
     }
 
+    /// Carries on another connection's stream ([`EsIngest::resume`]).
     pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
         let expect_audio = muxer.audio().is_some();
         let mut ingest = Self::new(cfg);
@@ -283,6 +284,72 @@ mod tests {
         assert_eq!(m.audio().map(|a| a.sample_rate), Some(48000));
         let seg = m.segment(LEADING_GAPS).expect("segment");
         assert_eq!(seg.duration.as_millis(), 1000);
+    }
+
+    fn feed(ing: &mut FlvIngest, tags: &[(bool, u32, Vec<u8>)]) -> Update {
+        let mut up = Update::default();
+        for (video, ms, tag) in tags {
+            if *video {
+                up.merge(ing.video(*ms, tag, SystemTime::UNIX_EPOCH).expect("video"));
+            } else {
+                ing.audio(*ms, tag);
+            }
+        }
+        up
+    }
+
+    /// Preserve main's reconnect/audio-disable case while enforcing retained
+    /// codec epochs: changed tracks require an explicit announcement, and old
+    /// media keeps its original initialization instead of resetting the stream.
+    #[test]
+    fn a_reconnect_resumes_or_changes_codec_epoch_without_resetting_media() {
+        let tags = flv_from_fixture();
+        let mut first = FlvIngest::new(MuxerConfig::default());
+        feed(&mut first, &tags);
+        let mut held = first.take_muxer().expect("muxer");
+        held.interrupt(SystemTime::UNIX_EPOCH);
+        let segments = held.next_part_id();
+
+        let mut same = FlvIngest::resume(MuxerConfig::default(), held);
+        let up = feed(&mut same, &tags);
+        assert!(!up.restarted);
+        let m = same.muxer().expect("muxer");
+        assert!(m.next_part_id() > segments + 10, "media carried on");
+        assert!(m.entries().iter().any(|e| matches!(
+            e,
+            crate::muxer::Entry::Segment(s) if s.discontinuity
+        )));
+
+        let mut held = same.take_muxer().expect("muxer");
+        held.interrupt(SystemTime::UNIX_EPOCH);
+        let next_part = held.next_part_id();
+        let targets = (held.target_duration(), held.part_target());
+        let old = held.segment(LEADING_GAPS).expect("retained old segment");
+        let video_only: Vec<_> = tags.iter().filter(|t| t.0).cloned().collect();
+        let mut other = FlvIngest::resume(MuxerConfig::default(), held);
+        other.expect_audio(false); // Explicit metadata disables audio for this epoch.
+        let up = feed(&mut other, &video_only);
+        assert!(up.restarted);
+        let m = other.muxer().expect("muxer");
+        assert!(m.audio().is_none());
+        assert!(m.has_content());
+        assert!(m.next_part_id() > next_part);
+        assert_eq!(m.epoch_first_part_id(), next_part);
+        assert_eq!((m.target_duration(), m.part_target()), targets);
+        assert_eq!(m.current_initialization_id(), old.initialization.id + 1);
+        assert_eq!(
+            m.initialization(old.initialization.id),
+            Some(&old.initialization.data)
+        );
+        assert!(m.entries().iter().any(|entry| matches!(
+            entry,
+            crate::muxer::Entry::Segment(segment)
+                if segment.initialization.id == m.current_initialization_id() && segment.discontinuity
+        )));
+        let mut rules = crate::playlist::RuleCheck::default();
+        rules
+            .check(&crate::playlist::media(m, "reconnect"))
+            .expect("valid retained epochs");
     }
 
     #[test]

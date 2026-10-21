@@ -36,12 +36,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # vendor/srt-protocol is outside the workspace. Cargo finds the root
-      # .cargo/config.toml from this directory, and its relative target-dir
-      # resolves against the directory holding .cargo, so it shares target/.
-      - name: Test vendored srt-protocol
-        working-directory: vendor/srt-protocol
-        run: cargo test --manifest-path Cargo.toml
 
   fuzz:
     name: Fuzz regressions and 60 s per target
@@ -109,5 +103,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg srt-tools curl python3
           command -v srt-live-transmit ffmpeg ffprobe
-      - name: Smoke (both SRT implementations)
-        run: SRT_IMPLS="srt-rs own" scripts/smoke.sh
+      - name: Smoke
+        run: scripts/smoke.sh

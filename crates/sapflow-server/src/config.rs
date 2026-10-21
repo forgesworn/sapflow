@@ -18,11 +18,11 @@ Every setting is an environment variable; a flag of the same name in
 lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
 
   SAPFLOW_SRT_ADDR         SRT listener (default 0.0.0.0:8890)
-  SAPFLOW_SRT_IMPL         SRT implementation: srt-rs (default) or own
-                           (sapflow's own receiver is opt-in)
-  SAPFLOW_SRT_PASSPHRASE   own SRT only: require encryption, 10..79 non-NUL bytes
+  SAPFLOW_SRT_PASSPHRASE   require SRT encryption, 10..79 non-NUL bytes
                            (separate from the publish password; unset: plaintext)
-  SAPFLOW_SRT_CIPHER       own SRT only: aes128 or aes256 (default with secret)
+  SAPFLOW_SRT_PBKEYLEN     AES key length callers must use: 16 (default) or 32
+  SAPFLOW_SRT_CIPHER       compatibility alias: aes128 or aes256; when both key
+                           settings are present they must agree
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
   SAPFLOW_PUBLISH_USER     the one publisher allowed to push
@@ -73,24 +73,14 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_IMPL",
     "SAPFLOW_SRT_PASSPHRASE",
     "SAPFLOW_SRT_CIPHER",
+    "SAPFLOW_SRT_PBKEYLEN",
     "SAPFLOW_RECONNECT_GRACE",
     "SAPFLOW_HEALTH_INTERVAL",
 ];
 
-/// Which SRT implementation serves the SRT port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SrtImpl {
-    /// `srt-tokio` with the patched `srt-protocol` (the default until our
-    /// own is proven).
-    SrtRs,
-    /// `sapflow-srt`.
-    Own,
-}
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub srt_addr: SocketAddr,
-    pub srt_impl: SrtImpl,
     /// Independent transport secret. Shared zeroising ownership, redacted Debug.
     pub srt_crypto: Option<CryptoConfig>,
     pub rtmp_addr: Option<SocketAddr>,
@@ -127,14 +117,16 @@ impl Config {
         // Move the owned environment value directly into zeroising storage,
         // including invalid values. Never place it in the generic String map.
         // Retain a redacted error until overrides have been applied.
-        let secret = |value: String| CryptoConfig::new(value.into_bytes(), KeySize::Aes256);
+        let secret = |value: String| CryptoConfig::new(value.into_bytes(), KeySize::Aes128);
         let mut srt_crypto = get("SAPFLOW_SRT_PASSPHRASE").map(secret);
         let mut vals: std::collections::HashMap<String, String> = KEYS
             .iter()
             .filter(|k| **k != "SAPFLOW_SRT_PASSPHRASE")
             .filter_map(|k| {
                 get(k)
-                    .filter(|v| !v.is_empty() || *k == "SAPFLOW_SRT_CIPHER")
+                    .filter(|v| {
+                        !v.is_empty() || matches!(*k, "SAPFLOW_SRT_CIPHER" | "SAPFLOW_SRT_PBKEYLEN")
+                    })
                     .map(|v| (k.to_string(), v))
             })
             .collect();
@@ -267,35 +259,49 @@ impl Config {
         };
         let reconnect_grace = seconds("SAPFLOW_RECONNECT_GRACE", 90)?;
         let health_interval = seconds("SAPFLOW_HEALTH_INTERVAL", 30)?;
-        let srt_impl = match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
-            None | Some("srt-rs") => SrtImpl::SrtRs,
-            Some("own") => SrtImpl::Own,
+        // Keep recognising the removed implementation switch so obsolete
+        // deployments fail explicitly rather than silently changing transport.
+        match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
+            None | Some("own") => {}
             Some(v) => {
                 return Err(ConfigError::Invalid(format!(
-                    "SAPFLOW_SRT_IMPL: srt-rs or own, not {v}"
+                    "SAPFLOW_SRT_IMPL={v}: srt-rs was removed; unset SAPFLOW_SRT_IMPL"
                 )));
             }
+        }
+        let key_size = match vals.get("SAPFLOW_SRT_PBKEYLEN").map(String::as_str) {
+            None => None,
+            Some("16") => Some(KeySize::Aes128),
+            Some("32") => Some(KeySize::Aes256),
+            Some(_) => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_SRT_PBKEYLEN: 16 or 32".into(),
+                ));
+            }
         };
-        let srt_cipher = vals.get("SAPFLOW_SRT_CIPHER");
-        if srt_impl != SrtImpl::Own && (srt_crypto.is_some() || srt_cipher.is_some()) {
-            return Err(ConfigError::Invalid(
-                "SRT encryption settings require SAPFLOW_SRT_IMPL=own".into(),
-            ));
-        }
-        if srt_cipher.is_some() && srt_crypto.is_none() {
-            return Err(ConfigError::Invalid(
-                "SAPFLOW_SRT_CIPHER requires SAPFLOW_SRT_PASSPHRASE".into(),
-            ));
-        }
-        let cipher = match srt_cipher.map(String::as_str) {
-            None | Some("aes256") => KeySize::Aes256,
-            Some("aes128") => KeySize::Aes128,
-            _ => {
+        let cipher_alias = match vals.get("SAPFLOW_SRT_CIPHER").map(String::as_str) {
+            None => None,
+            Some("aes128") => Some(KeySize::Aes128),
+            Some("aes256") => Some(KeySize::Aes256),
+            Some(_) => {
                 return Err(ConfigError::Invalid(
                     "SAPFLOW_SRT_CIPHER: aes128 or aes256".into(),
                 ));
             }
         };
+        if cipher_alias.is_some() && srt_crypto.is_none() {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_SRT_CIPHER requires SAPFLOW_SRT_PASSPHRASE".into(),
+            ));
+        }
+        if let (Some(key_size), Some(alias)) = (key_size, cipher_alias)
+            && key_size != alias
+        {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_SRT_PBKEYLEN and SAPFLOW_SRT_CIPHER disagree".into(),
+            ));
+        }
+        let cipher = key_size.or(cipher_alias).unwrap_or(KeySize::Aes128);
         let srt_crypto = srt_crypto
             .transpose()
             .map_err(|_| {
@@ -309,7 +315,6 @@ impl Config {
         Ok(Self {
             reconnect_grace,
             health_interval,
-            srt_impl,
             srt_crypto,
             record_min_free,
             max_publish_bps,
@@ -446,25 +451,122 @@ mod tests {
     }
 
     #[test]
-    fn srt_implementation_switch() {
+    fn srt_rs_is_refused_by_name() {
         let open = ("SAPFLOW_OPEN_PUBLISH", "1");
-        let c = load(&[open], &[]).expect("config");
-        assert_eq!(
-            c.srt_impl,
-            SrtImpl::SrtRs,
-            "srt-rs until ours is the default"
+        assert!(load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &[]).is_ok());
+        assert!(load(&[open], &["--srt-impl", "own"]).is_ok());
+        for v in ["srt-rs", "libsrt"] {
+            assert!(matches!(
+                load(&[open, ("SAPFLOW_SRT_IMPL", v)], &[]),
+                Err(ConfigError::Invalid(m)) if m.contains("removed")
+            ));
+        }
+        assert!(!HELP.contains("SAPFLOW_SRT_IMPL"));
+    }
+
+    #[test]
+    fn srt_passphrase() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let own = ("SAPFLOW_SRT_IMPL", "own");
+        assert!(load(&[open], &[]).expect("config").srt_crypto.is_none());
+        let c = load(
+            &[open, own, ("SAPFLOW_SRT_PASSPHRASE", "correct horse")],
+            &[],
+        )
+        .expect("config");
+        let crypto = c.srt_crypto.expect("crypto");
+        assert_eq!(crypto.key_size, KeySize::Aes128);
+        // Never printed.
+        assert!(!format!("{crypto:?}").contains("horse"));
+        let c = load(
+            &[
+                open,
+                own,
+                ("SAPFLOW_SRT_PASSPHRASE", "correct horse"),
+                ("SAPFLOW_SRT_PBKEYLEN", "32"),
+            ],
+            &[],
+        )
+        .expect("config");
+        assert_eq!(c.srt_crypto.expect("crypto").key_size, KeySize::Aes256);
+        for bad in [
+            vec![open, own, ("SAPFLOW_SRT_PASSPHRASE", "short")],
+            vec![
+                open,
+                own,
+                ("SAPFLOW_SRT_PASSPHRASE", "correct horse"),
+                ("SAPFLOW_SRT_PBKEYLEN", "24"),
+            ],
+        ] {
+            assert!(matches!(load(&bad, &[]), Err(ConfigError::Invalid(_))));
+        }
+    }
+
+    #[test]
+    fn srt_key_settings_must_agree_and_never_ignore_invalid_values() {
+        let base = [
+            ("SAPFLOW_OPEN_PUBLISH", "1"),
+            ("SAPFLOW_SRT_PASSPHRASE", "transport credential"),
+        ];
+        // PBKEYLEN preserves main's configuration semantics: selecting a key
+        // size alone never promises encryption or requires a passphrase.
+        assert!(
+            load(
+                &[
+                    ("SAPFLOW_OPEN_PUBLISH", "1"),
+                    ("SAPFLOW_SRT_PBKEYLEN", "32"),
+                ],
+                &[],
+            )
+            .expect("key size without secret")
+            .srt_crypto
+            .is_none()
         );
-        let c = load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &[]).expect("config");
-        assert_eq!(c.srt_impl, SrtImpl::Own);
-        let c = load(&[open], &["--srt-impl", "own"]).expect("config");
-        assert_eq!(c.srt_impl, SrtImpl::Own);
-        let c = load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &["--srt-impl=srt-rs"]).expect("config");
-        assert_eq!(c.srt_impl, SrtImpl::SrtRs);
-        assert!(matches!(
-            load(&[open, ("SAPFLOW_SRT_IMPL", "libsrt")], &[]),
-            Err(ConfigError::Invalid(_))
-        ));
-        assert!(HELP.contains("SAPFLOW_SRT_IMPL"));
+        for (length, alias, expected) in [
+            ("16", "aes128", KeySize::Aes128),
+            ("32", "aes256", KeySize::Aes256),
+        ] {
+            let mut env = base.to_vec();
+            env.extend([
+                ("SAPFLOW_SRT_PBKEYLEN", length),
+                ("SAPFLOW_SRT_CIPHER", alias),
+            ]);
+            assert_eq!(
+                load(&env, &[])
+                    .expect("matching key settings")
+                    .srt_crypto
+                    .expect("crypto")
+                    .key_size,
+                expected
+            );
+        }
+        for (length, alias) in [("16", "aes256"), ("32", "aes128")] {
+            let mut env = base.to_vec();
+            env.extend([
+                ("SAPFLOW_SRT_PBKEYLEN", length),
+                ("SAPFLOW_SRT_CIPHER", alias),
+            ]);
+            assert!(
+                matches!(load(&env, &[]), Err(ConfigError::Invalid(m)) if m.contains("disagree"))
+            );
+        }
+        for invalid in ["", "24", "aes256"] {
+            let mut env = base.to_vec();
+            env.push(("SAPFLOW_SRT_PBKEYLEN", invalid));
+            assert!(matches!(load(&env, &[]), Err(ConfigError::Invalid(_))));
+        }
+        // Existing native pilot recipes used the named cipher before main
+        // introduced PBKEYLEN; both explicit aliases retain their meaning.
+        for (alias, expected) in [("aes128", KeySize::Aes128), ("aes256", KeySize::Aes256)] {
+            assert_eq!(
+                load(&base, &[&format!("--srt-cipher={alias}")])
+                    .expect("cipher alias")
+                    .srt_crypto
+                    .expect("crypto")
+                    .key_size,
+                expected
+            );
+        }
     }
 
     #[test]
@@ -474,6 +576,7 @@ mod tests {
             ("SAPFLOW_PUBLISH_PASS", "publish credential"),
             ("SAPFLOW_SRT_IMPL", "own"),
             ("SAPFLOW_SRT_PASSPHRASE", "transport credential"),
+            ("SAPFLOW_SRT_PBKEYLEN", "32"),
         ];
         let config = load(&base, &[]).expect("encrypted own");
         assert_eq!(
@@ -496,6 +599,7 @@ mod tests {
         let config = load(
             &base,
             &[
+                "--srt-pbkeylen=16",
                 "--srt-cipher=aes128",
                 "--srt-passphrase",
                 "replacement secret",
@@ -552,15 +656,6 @@ mod tests {
             load(&base, &["--srt-passphrase="]),
             Err(ConfigError::Invalid(_))
         ));
-        for args in [
-            vec!["--srt-passphrase=transport credential"],
-            vec!["--srt-cipher=aes256"],
-        ] {
-            assert!(matches!(
-                load(&[("SAPFLOW_OPEN_PUBLISH", "1")], &args),
-                Err(ConfigError::Invalid(_))
-            ));
-        }
         // Explicitly switching implementations must not silently drop crypto.
         assert!(matches!(
             load(

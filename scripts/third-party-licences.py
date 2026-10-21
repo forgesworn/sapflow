@@ -33,7 +33,14 @@ while stack:
         if any(k["kind"] in (None, "normal") for k in d["dep_kinds"]):
             stack.append(d["pkg"])
 
-apache = pathlib.Path("vendor/srt-protocol/LICENSE-APACHE").read_text()
+# The Apache-2.0 text, for crates that publish none: from the first
+# dependency that ships it.
+apache = next(
+    f.read_text()
+    for i in sorted(seen, key=lambda i: pkgs[i]["name"])
+    for f in sorted(pathlib.Path(pkgs[i]["manifest_path"]).parent.glob("LICENSE-APACHE*"))
+    if f.is_file()
+)
 out = ["Third-party software in sapflow, with its licences. A text that is",
        "identical to one printed earlier is referenced rather than repeated.\n"]
 printed = {}

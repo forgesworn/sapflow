@@ -15,7 +15,6 @@ sapflow-core = { path = "../crates/sapflow-core" }
 sapflow-hls = { path = "../crates/sapflow-hls" }
 sapflow-srt = { path = "../crates/sapflow-srt" }
 sapflow-client = { path = "../crates/sapflow-client" }
-srt-protocol = "=0.4.4"
 
 [[bin]]
 name = "ts_ingest"
@@ -34,20 +33,6 @@ bench = false
 [[bin]]
 name = "small_parsers"
 path = "fuzz_targets/small_parsers.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "srt_packet"
-path = "fuzz_targets/srt_packet.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "srt_listener"
-path = "fuzz_targets/srt_listener.rs"
 test = false
 doc = false
 bench = false
@@ -80,14 +65,18 @@ test = false
 doc = false
 bench = false
 
-[patch.crates-io]
-srt-protocol = { path = "../vendor/srt-protocol" }
-
 [workspace]
 
 [[bin]]
 name = "muxer_timing"
 path = "fuzz_targets/muxer_timing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "own_srt_caller"
+path = "fuzz_targets/own_srt_caller.rs"
 test = false
 doc = false
 bench = false
@@ -102,13 +91,6 @@ bench = false
 [[bin]]
 name = "mobile_media"
 path = "fuzz_targets/mobile_media.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "own_srt_caller"
-path = "fuzz_targets/own_srt_caller.rs"
 test = false
 doc = false
 bench = false

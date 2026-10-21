@@ -13,7 +13,7 @@ iOS rules and the mediamtx/gohlslib source they came from.
 |-------|------|
 | `sapflow-core` | Shared types (stream paths, callback events). No networking, no async runtime: it must build for iOS and Android later. |
 | `sapflow-hls` | LL-HLS packaging: segmenting, parts, playlists, the Apple rules. |
-| `sapflow-srt` | Our own live SRT listener/receiver and caller/sender, sans-IO, using maintained cryptographic primitives. Written from the specification and wire observation only: never read or copy srt-rs (`vendor/srt-protocol`, `srt-tokio`) or libsrt source; run them only as black boxes. |
+| `sapflow-srt` | Our own live SRT listener/receiver and caller/sender, sans-IO, using maintained cryptographic primitives. Written from the specification and wire observation only: never read or copy srt-rs (`srt-protocol`, `srt-tokio`) or libsrt source; run them only as black boxes. |
 | `sapflow-client` | Runtime-free native compressed-media validation, bounded queues, session policy and MPEG-TS writing. No camera, codec, network, file or billing runtime. |
 | `sapflow-ffi` | Typed Swift/Kotlin boundary for shared compressed samples and protocol/session state; platform adapters own sockets, TLS and native codecs. |
 | `sapflow-server` | The `sapflow` binary: ingest, HTTP, callbacks, recording. |
@@ -25,15 +25,13 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 scripts/smoke.sh     # end to end: SRT and RTMP in, LL-HLS out, recording
-SRT_IMPLS="srt-rs own" scripts/smoke.sh   # once per SRT implementation
-scripts/srt-loss.sh  # SRT under loss against libsrt (RECEIVERS="srt-rs own libsrt")
 scripts/srt-loss.sh  # SRT receivers under packet loss against libsrt (about 40 minutes)
 scripts/tidy.sh          # build size; --clean empties target/
 python3 scripts/third-party-licences.py   # after dependency changes
 ```
 
 CI (`.github/workflows/ci.yml`) runs the fmt, clippy and test commands above,
-the vendored crate's tests, the fuzz regressions plus 60 s per target, and
+the fuzz regressions plus 60 s per target, and
 `scripts/smoke.sh`. `fuzz-nightly.yml` fuzzes each target for 20 minutes. Keep
 the local commands and the workflow in step.
 
@@ -70,5 +68,3 @@ The Mac's disk is nearly full and Rust builds are large.
 - Before adding a crate, check it is maintained and pin the current version;
   prefer fewer dependencies. Anything parsing outside input gets a fuzz
   target (`fuzz/README.md`).
-- `vendor/srt-protocol` is a patched copy (Apache-2.0); record every change
-  in its `PATCHES.md`.

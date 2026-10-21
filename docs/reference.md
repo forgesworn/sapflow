@@ -65,8 +65,9 @@ How sapflow keeps it (`sapflow_hls::PartTiming`, `Muxer::place_video`):
   track that audio still covers. Letting the part run long would exceed
   `PART-TARGET`; closing the part before the frame would leave it under
   85%; raising the target is the fault itself. Safari and hls.js tolerate a
-  short gap in one track (hls.js steps over buffer holes); that is the
-  expected behaviour, not yet watched in either.
+  short gap in one track (hls.js steps over buffer holes); both were seen
+  to carry on across stalls and reconnects (below, What players should do
+  at a break).
 - **EXTINF stays true.** A segment's `EXTINF` is still the media time it
   covers, so after a clamp its parts' `DURATION`s add up to less than its
   `EXTINF` by the gap. `Part::span` is the part's duration plus any gap
@@ -130,12 +131,31 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   starts the stream over: nothing has been served, and the targets should
   come from a whole segment. The seven leading gap segments are only ever
   at the start of a stream.
-- **Not handled here:** an SRT publisher silent for 5 s is dropped and the
-  stream ends; holding it across a longer drop is M7's grace period.
+- **An encoder that drops and reconnects** (an SRT publisher silent for
+  5 s is dropped; RTMP when its socket closes or is idle for 10 s) is a
+  break too. The stream, with its playlist, chunk names and recording, is
+  held for `SAPFLOW_RECONNECT_GRACE` (default 90 s, v4v's own window). A
+  publisher on the same path within it, over either protocol, takes the
+  stream over: the muxer ends the run at the last frame
+  (`Muxer::interrupt`), and the new connection's first keyframe, from
+  whatever clock it brings, carries output time straight on after an
+  `EXT-X-DISCONTINUITY`. Its parameter sets and AAC config must match the
+  stream's: the init segment is fixed. If they do not (a new resolution),
+  the stream starts afresh in place under new chunk names, and a new
+  recording begins. v4v still hears `unpublish` at the drop (its stage
+  reads "reconnecting") and `publish` on the return; `recordSegmentComplete`
+  comes once, when the stream finally ends. Keep `SAPFLOW_RECONNECT_GRACE`
+  equal to `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`. A publisher whose
+  socket is still open holds the path (`409`/`BadName`) until the timeouts
+  above notice it has gone.
 
 What players should do at a break (Safari on macOS seen to carry on
 through two Larix Wi-Fi drops of 3.1 and 4.4 s on 2026-10-21, judged by
-eye; hls.js not yet watched): during a
+eye; hls.js 1.5.20 in Chrome, low-latency mode, logged crossing a 4 s
+stall and then a full disconnect and reconnect on 2026-10-21, with no
+fatal error; it logged non-fatal errors, recovered from: one
+`fragParsingError` on the first fragment after the reconnect, and a
+`levelLoadTimeOut` about once a minute, which are not yet explained): during a
 drop the playlist stops growing, so Safari and hls.js play out what they
 hold (about the part hold-back plus what was buffered) and then wait;
 when the stream resumes they cross the discontinuity, resetting their
@@ -163,9 +183,8 @@ Pinned in the crates' `Cargo.toml`. These are decisions the user may revisit.
 | Need | Crate | Notes |
 |------|-------|-------|
 | Async runtime, HTTP | `tokio` 1.54, `axum` 0.8.9 | `hyper-util` legacy client for the callback, no `reqwest` |
-| SRT, our own (M6a) | `sapflow-srt` | Live-mode receiver, sans-IO, MIT, no dependencies; written from draft-sharabayko-srt-01 and recorded sessions (findings below). Serves the port with `SAPFLOW_SRT_IMPL=own`; encrypted callers refused until M6b. |
-| SRT, the default until M6c | `srt-tokio` 0.4.4 (pure Rust) | Last release 2024-05. Builds on Rust 1.94 and tokio 1.54, interoperates with libsrt's `srt-live-transmit`, and exposes the stream id before accept, so publishers are refused in the handshake. Risks: unmaintained upstream, and `srt-protocol` has a `panic!` on one malformed-handshake encode path (M5: fuzz it, or move to libsrt bindings). |
-| SRT parsing | `srt-protocol` 0.4.4, vendored and patched | Fuzzing found that one unauthenticated datagram crashed the server; fixes and the reasons are in `vendor/srt-protocol/PATCHES.md`. |
+| SRT | `sapflow-srt`, our own | Live-mode receiver and sender, sans-IO, MIT; written from draft-sharabayko-srt-01 and recorded sessions (findings below). Serves the port alone since 2026-10-21. Passphrase encryption (M6b) uses RustCrypto's `aes`, `aes-kw`, `ctr`, `pbkdf2` and `sha1`, plus `getrandom` and `zeroize`; nothing else. |
+| SRT until 2026-10-21 (removed) | `srt-tokio` 0.4.4 with `srt-protocol` 0.4.4, vendored and patched | Last release 2024-05. Fuzzing found that one unauthenticated datagram crashed the server; we patched our copy. Removed once OBS and Larix had published to our own receiver, with and without a passphrase (M6c). The patches are in the history before that date. |
 | MPEG-TS demux | `mpeg2ts` 0.6.1 | Fed one 188-byte packet at a time from our buffer (`sapflow_hls::ingest`), because its reader treats some stream errors as fatal and stops at end of input. |
 | H.264 | `h264-reader` 0.9.0 | Annex B splitting and SPS parsing. |
 | AAC | `adts-reader` 0.4.0 | ADTS headers. It reports the raw-block count as the field plus one. |
@@ -173,18 +192,15 @@ Pinned in the crates' `Cargo.toml`. These are decisions the user may revisit.
 | RTMP (M2) | our own, `sapflow_hls::rtmp` | Publish only, sans-IO: handshake (original and digest forms), chunk stream, AMF0, the publish commands. Replaced `rml_rtmp` 0.8.0 (last release 2023-04), in which fuzzing found two panics on unauthenticated input. The digest handshake uses `hmac` 0.12.1 and `sha2` 0.10.9. |
 | Fuzzing (M5) | `cargo-fuzz` | |
 
-Licences: every dependency is permissive. `srt-tokio`, `srt-protocol` and
-`sync_wrapper` are Apache-2.0 only (no NOTICE files); the rest are MIT, BSD,
-Unicode-3.0 or dual-licensed. Distributed binaries and images must carry the
-third-party licence texts; forking `srt-tokio` would keep Apache-2.0 on that
-code.
+Licences: every dependency is permissive. `sync_wrapper` is Apache-2.0
+only (no NOTICE file); the rest are MIT, BSD, Unicode-3.0 or dual-licensed.
+Distributed binaries and images must carry the third-party licence texts.
 
 Our own parsing is the SRT stream id, the RTMP stream key, the chunk file
 names, the `_HLS_msn`/`_HLS_part` query, the FLV video and audio tag headers
 (5 and 2 bytes), the AudioSpecificConfig (2 bytes) and NAL length prefixes,
 all small and unit-tested, and, since 2026-10-20, the whole RTMP protocol
-(publish only: `sapflow_hls::rtmp`) and, with `SAPFLOW_SRT_IMPL=own`, the
-whole SRT receiver (`sapflow-srt`: every packet type, the handshake and its
+(publish only: `sapflow_hls::rtmp`) and the whole SRT receiver (`sapflow-srt`: every packet type, the handshake and its
 extensions, loss lists). Each has a fuzz target.
 
 ### RTMP handshake findings (2026-10-20)
@@ -197,12 +213,14 @@ extensions, loss lists). Each has a fuzz target.
   here: it sends a digest C1, verifies a digest S1 and signed S2 strictly
   when S1 carries a server version, and falls back to the original form
   when the version is zero. The unit tests check our answer against that
-  algorithm; OBS itself has not been run against sapflow yet.
+  algorithm; OBS has since published over RTMP to sapflow
+  (`docs/interop.md`).
 - So sapflow answers a digest C1 with a digest S1 (server version
   13.14.10.13, as nginx-rtmp) and a signed S2, and anything else with the
   original form (S2 echoes C1). C2 is not checked, as in nginx-rtmp,
-  mediamtx and rml_rtmp. Larix and vMix are untested; both are known to
-  work with nginx-rtmp and mediamtx, which answer the same way.
+  mediamtx and rml_rtmp. Larix has since published over RTMP
+  (`docs/interop.md`); vMix is untested, and is known to work with
+  nginx-rtmp and mediamtx, which answer the same way.
 
 ### SRT wire findings (2026-10-20)
 
@@ -230,7 +248,7 @@ follows the observed behaviour.
   inside the word (`read:live/event-x` ends `00 00 00 78`).
 - **Observed:** a refusal is a handshake whose type is the reason: 1000 and
   up for the protocol's, 2000 plus an HTTP status for the application's,
-  which libsrt prints as `PREDEFINED:401`. srt-tokio sends 400, 401, 402
+  which libsrt prints as `PREDEFINED:401`. srt-tokio sent 400, 401, 402
   (overload, and our throttle), 404 and 409 for sapflow's refusals;
   sapflow-srt sends the same.
 - **Observed:** a libsrt receiver sends a full ACK at most every 10 ms and

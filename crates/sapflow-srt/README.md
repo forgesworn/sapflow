@@ -47,6 +47,7 @@ for a passphrase is refused in the handshake (`REJ_UNSECURE`).
 
 - Unit tests per module (`cargo test -p sapflow-srt`).
 - `tests/differential.rs`: recorded publishes replayed through the listener
-  must deliver what `srt-protocol` delivers for the same trace, and under
+  must deliver what `srt-protocol` delivered for the same trace (its
+  output recorded before it was removed), and under
   loss exactly what libsrt's receiver delivered in the recorded session.
 - Fuzz targets `own_srt_packet` and `own_srt_listener` (`fuzz/README.md`).
