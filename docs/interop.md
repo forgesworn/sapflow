@@ -18,6 +18,9 @@ is tried.
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) | SRT, `SAPFLOW_SRT_IMPL=own` | `SRT_IMPLS="srt-rs own" scripts/smoke.sh` | Pass with both implementations (refusals 400, 401, 409 included) |
 | 2026-10-20 | ffmpeg 8.1.2 (libsrt 1.5.3, in Docker) | SRT, `SAPFLOW_SRT_IMPL=own` | 720p30 x264 2.5 Mbit/s, `latency=2000000` | Accepted at 2000 ms latency, servable in 3.5 s, clean shutdown and unpublish |
 | 2026-10-20 | `srt-live-transmit` (libsrt 1.5.4) with `passphrase=` | SRT, `SAPFLOW_SRT_IMPL=own` | 200 ms | Refused in the handshake: libsrt reports `ERROR:UNSECURE`, "Password required or unexpected" (encryption is M6b) |
+| 2026-10-21 | OBS 32.1.2 (libsrt 1.5.2) | SRT, own receiver (the default) | OBS's default x264 (8.33 s keyframes), browser source, `latency=2000000`; served by 8ee5704 | Servable in 19.7 s (the long GOP); a segment decodes cleanly (250 frames, AAC). OBS quit and restarted 62 s later: resumed the held stream, one discontinuity, same chunk names |
+| 2026-10-21 | OBS 32.1.2 (libsrt 1.5.2) | SRT with `passphrase=` and `pbkeylen=16`, own receiver | as above, server `SAPFLOW_SRT_PASSPHRASE` set | Servable in 19.6 s, decodes cleanly; with one letter of the passphrase wrong, refused in the handshake ("wrong passphrase or key length") |
+| 2026-10-21 | Larix Broadcaster (iPhone) | SRT with a passphrase (AES-128), own receiver | Larix defaults over Wi-Fi, 2 s latency; served by 8ee5704 | Servable in 6.0 s, a segment decodes cleanly (60 frames, AAC). With the server's passphrase changed by one letter: refused nine times, about every 3 s; with it changed back, Larix reconnected by itself |
 
 Output checked for the 1 s keyframe runs: H.264 High 1280x720 30 fps and
 AAC-LC 48 kHz stereo, 1 s segments, 200 ms parts, a keyframe at the start of
@@ -104,9 +107,7 @@ keyframes. The 2 s SRT latency is most of what remains.
 ## Not yet tried
 
 - Larix on Android.
-- The phone locked or backgrounded; SRT with a passphrase.
-- OBS reconnecting after a drop of over 5 s, which the grace period now
-  carries on (Larix: see Stopping and restarting).
+- The phone locked or backgrounded.
 - OBS's Apple hardware encoder; vMix.
 
 ## Stopping and restarting
@@ -128,7 +129,8 @@ stream, with `unpublish` at the drop and `publish` on the return. Safari
 kept playing but ended about 10 s behind the camera, as each break left it
 further back. The SRT stream had one break. Larix's first two SRT attempts
 that session were accepted but sent no data, and timed out after 5 s; its
-third, 20 s later, ran cleanly. Not yet explained. Not yet tried with OBS restarting.
+third, 20 s later, ran cleanly. Not yet explained. OBS quit and
+restarted 62 s later also resumed its held stream (table above).
 
 ## SRT under packet loss (2026-10-20)
 
