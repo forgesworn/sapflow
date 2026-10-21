@@ -43,13 +43,12 @@ lists every setting.
   [mediamtx](https://github.com/bluenviron/mediamtx) and
   [gohlslib](https://github.com/bluenviron/gohlslib) (both MIT); see
   [docs/reference.md](docs/reference.md).
-- SRT is served by our own receiver, `crates/sapflow-srt` (MIT), by
-  default. [srt-rs](https://github.com/russelltg/srt-rs) (Apache-2.0) stays
-  as a fallback (`SAPFLOW_SRT_IMPL=srt-rs`) until it is removed;
-  `vendor/srt-protocol` is a patched copy, with every change listed in its
-  `PATCHES.md` and marked in the source. `sapflow-srt` was written from the
-  SRT specification (draft-sharabayko-srt) and observed wire behaviour, not
-  from srt-rs or libsrt.
+- SRT is served by our own receiver, `crates/sapflow-srt` (MIT), written
+  from the SRT specification (draft-sharabayko-srt) and observed wire
+  behaviour, not from srt-rs or libsrt.
+  [srt-rs](https://github.com/russelltg/srt-rs) (Apache-2.0), patched,
+  served SRT until 2026-10-21 and was the reference our receiver was
+  measured against.
 - Every dependency's licence is reproduced in
   [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt), which the container
   image also carries.

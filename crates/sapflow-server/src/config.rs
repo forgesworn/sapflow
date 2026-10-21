@@ -18,12 +18,9 @@ Every setting is an environment variable; a flag of the same name in
 lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
 
   SAPFLOW_SRT_ADDR         SRT listener (default 0.0.0.0:8890)
-  SAPFLOW_SRT_IMPL         SRT implementation: own (default, sapflow's own
-                           receiver) or srt-rs (the patched srt-rs, kept as
-                           a fallback until it is removed)
   SAPFLOW_SRT_PASSPHRASE   encrypt SRT media with this passphrase (10 to 79
-                           characters; needs SAPFLOW_SRT_IMPL=own); callers
-                           without it, or with another, are refused
+                           characters); callers without it, or with
+                           another, are refused
   SAPFLOW_SRT_PBKEYLEN     AES key length callers must use: 16 (default) or 32
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
@@ -81,20 +78,9 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_PBKEYLEN",
 ];
 
-/// Which SRT implementation serves the SRT port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SrtImpl {
-    /// `srt-tokio` with the patched `srt-protocol`: a fallback until it
-    /// is removed (M6c).
-    SrtRs,
-    /// `sapflow-srt`, the default.
-    Own,
-}
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub srt_addr: SocketAddr,
-    pub srt_impl: SrtImpl,
     pub rtmp_addr: Option<SocketAddr>,
     pub http_addr: SocketAddr,
     /// `None` only when open publishing was asked for explicitly.
@@ -258,15 +244,17 @@ impl Config {
         let reconnect_grace = secs("SAPFLOW_RECONNECT_GRACE", 90)?;
         let health_interval = secs("SAPFLOW_HEALTH_INTERVAL", 30)?;
 
-        let srt_impl = match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
-            Some("srt-rs") => SrtImpl::SrtRs,
-            None | Some("own") => SrtImpl::Own,
+        // srt-rs served SRT until 2026-10-21; only our own remains. The
+        // old setting is still read so that asking for srt-rs fails
+        // loudly rather than quietly getting ours.
+        match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
+            None | Some("own") => {}
             Some(v) => {
                 return Err(ConfigError::Invalid(format!(
-                    "SAPFLOW_SRT_IMPL: srt-rs or own, not {v}"
+                    "SAPFLOW_SRT_IMPL={v}: srt-rs was removed; unset SAPFLOW_SRT_IMPL"
                 )));
             }
-        };
+        }
 
         let key_size = match vals.get("SAPFLOW_SRT_PBKEYLEN").map(String::as_str) {
             None | Some("16") => KeySize::Aes128,
@@ -280,11 +268,6 @@ impl Config {
         let srt_crypto =
             match vals.get("SAPFLOW_SRT_PASSPHRASE") {
                 None => None,
-                Some(_) if srt_impl != SrtImpl::Own => {
-                    return Err(ConfigError::Invalid(
-                        "SAPFLOW_SRT_PASSPHRASE needs SAPFLOW_SRT_IMPL=own".into(),
-                    ));
-                }
                 Some(p) => Some(CryptoConfig::new(p.as_bytes().to_vec(), key_size).map_err(
                     |_| ConfigError::Invalid("SAPFLOW_SRT_PASSPHRASE: 10 to 79 characters".into()),
                 )?),
@@ -294,7 +277,6 @@ impl Config {
             srt_crypto,
             reconnect_grace,
             health_interval,
-            srt_impl,
             record_min_free,
             max_publish_bps,
             rtmp_addr,
@@ -370,11 +352,6 @@ mod tests {
         .expect("config");
         assert_eq!(c.srt_crypto.expect("crypto").key_size, KeySize::Aes256);
         for bad in [
-            vec![
-                open,
-                ("SAPFLOW_SRT_IMPL", "srt-rs"),
-                ("SAPFLOW_SRT_PASSPHRASE", "correct horse"),
-            ],
             vec![open, own, ("SAPFLOW_SRT_PASSPHRASE", "short")],
             vec![
                 open,
@@ -477,23 +454,17 @@ mod tests {
     }
 
     #[test]
-    fn srt_implementation_switch() {
+    fn srt_rs_is_refused_by_name() {
         let open = ("SAPFLOW_OPEN_PUBLISH", "1");
-        let c = load(&[open], &[]).expect("config");
-        assert_eq!(c.srt_impl, SrtImpl::Own, "ours is the default");
-        let c = load(&[open, ("SAPFLOW_SRT_IMPL", "srt-rs")], &[]).expect("config");
-        assert_eq!(c.srt_impl, SrtImpl::SrtRs);
-        let c = load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &[]).expect("config");
-        assert_eq!(c.srt_impl, SrtImpl::Own);
-        let c = load(&[open], &["--srt-impl", "own"]).expect("config");
-        assert_eq!(c.srt_impl, SrtImpl::Own);
-        let c = load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &["--srt-impl=srt-rs"]).expect("config");
-        assert_eq!(c.srt_impl, SrtImpl::SrtRs);
-        assert!(matches!(
-            load(&[open, ("SAPFLOW_SRT_IMPL", "libsrt")], &[]),
-            Err(ConfigError::Invalid(_))
-        ));
-        assert!(HELP.contains("SAPFLOW_SRT_IMPL"));
+        assert!(load(&[open, ("SAPFLOW_SRT_IMPL", "own")], &[]).is_ok());
+        assert!(load(&[open], &["--srt-impl", "own"]).is_ok());
+        for v in ["srt-rs", "libsrt"] {
+            assert!(matches!(
+                load(&[open, ("SAPFLOW_SRT_IMPL", v)], &[]),
+                Err(ConfigError::Invalid(m)) if m.contains("removed")
+            ));
+        }
+        assert!(!HELP.contains("SAPFLOW_SRT_IMPL"));
     }
 
     #[test]

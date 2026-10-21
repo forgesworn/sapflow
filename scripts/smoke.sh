@@ -6,20 +6,8 @@
 # ffmpeg encodes to stdout and srt-live-transmit, which is libsrt, sends it).
 # Builds sapflow, publishes a test signal, checks the playlists, decodes the
 # segments and parts, checks the publish and unpublish callbacks.
-#
-# SAPFLOW_SRT_IMPL=srt-rs picks the SRT implementation (default own);
-# SRT_IMPLS="srt-rs own" runs the whole check once with each.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-if [ -n "${SRT_IMPLS:-}" ]; then
-  for impl in $SRT_IMPLS; do
-    echo "== SAPFLOW_SRT_IMPL=$impl"
-    SRT_IMPLS= SAPFLOW_SRT_IMPL=$impl "$0"
-  done
-  exit 0
-fi
-SRT_IMPL=${SAPFLOW_SRT_IMPL:-own}
 
 for bin in ffmpeg ffprobe srt-live-transmit python3 curl; do
   command -v "$bin" >/dev/null || { echo "missing $bin" >&2; exit 1; }
@@ -54,10 +42,10 @@ SAPFLOW_CALLBACK_URL="http://127.0.0.1:$CB_PORT/api/public/live-events/{eventId}
 SAPFLOW_CALLBACK_SECRET=tok SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:$SRT_PORT \
 SAPFLOW_RTMP_ADDR=127.0.0.1:$RTMP_PORT SAPFLOW_RECORDINGS="$WORK/rec" SAPFLOW_RECORD_SKIP='live/event-norec' \
 SAPFLOW_RECONNECT_GRACE=4 SAPFLOW_HEALTH_INTERVAL=2 \
-SAPFLOW_SRT_IMPL=$SRT_IMPL ./target/debug/sapflow > "$WORK/sapflow.log" 2>&1 & pids+=($!)
+./target/debug/sapflow > "$WORK/sapflow.log" 2>&1 & pids+=($!)
 sleep 1
-grep 'SRT listening' "$WORK/sapflow.log" | grep -q "implementation=\"$SRT_IMPL\"" || fail "SRT is not served by $SRT_IMPL"
-echo "ok   SRT served by $SRT_IMPL"
+grep 'SRT listening' "$WORK/sapflow.log" | grep -q 'implementation="own"' || fail "SRT is not served by our own receiver"
+echo "ok   SRT served by our own receiver"
 
 publish() { # streamid seconds
   ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
@@ -170,37 +158,35 @@ awk "BEGIN { exit !($secs > 12) }" || fail "recording too short across the recon
 ffmpeg -hide_banner -v error -xerror -i "$rec" -f null - || fail "resumed recording does not decode"
 echo "ok   reconnect within grace: same playlist, discontinuity, one recording (${secs}s)"
 
-# SRT passphrase encryption (our own receiver only): a second server that
-# requires it. The right passphrase plays; none, or a wrong one, is refused.
-if [ "$SRT_IMPL" = own ]; then
-  ESRT=18891 EHTTP=127.0.0.1:18887 PASS_E=smoke-passphrase-1
-  SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret SAPFLOW_SRT_IMPL=own \
-  SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
-  SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-enc.log" 2>&1 & pids+=($!)
-  sleep 1
-  grep -q 'encrypted=true' "$WORK/sapflow-enc.log" || fail "encrypted server did not start"
-  epublish() { # streamid seconds extra-srt-options
-    ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
-      -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
-      -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -c:a aac -b:a 128k \
-      -f mpegts - | srt-live-transmit -q -a:no file://con "srt://127.0.0.1:$ESRT?streamid=$1&latency=2000$3"
-  }
-  epublish "publish:live/event-enc:pub:secret" 10 "&passphrase=$PASS_E&pbkeylen=16" > /dev/null 2>&1 & pids+=($!)
-  for _ in $(seq 1 60); do
-    curl -sf "http://$EHTTP/live/event-enc/stream.m3u8" -o "$WORK/enc.m3u8" && grep -q _seg "$WORK/enc.m3u8" && break; sleep 0.25
-  done
-  grep -qs _seg "$WORK/enc.m3u8" || { tail -20 "$WORK/sapflow-enc.log" >&2; fail "encrypted publish never became a stream"; }
-  einit=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/enc.m3u8")
-  curl -s "http://$EHTTP/live/event-enc/$einit" > "$WORK/enc.mp4"
-  for s in $(grep '_seg' "$WORK/enc.m3u8"); do curl -s "http://$EHTTP/live/event-enc/$s" >> "$WORK/enc.mp4"; done
-  ffmpeg -hide_banner -v error -xerror -i "$WORK/enc.mp4" -f null - || fail "encrypted stream does not decode"
-  epublish "publish:live/event-plain:pub:secret" 3 "" > /dev/null 2>&1 || true
-  epublish "publish:live/event-wrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" > /dev/null 2>&1 || true
-  for e in event-plain event-wrong; do
-    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/$e/index.m3u8")" = 404 ] || fail "$e was accepted"
-  done
-  grep -q 'wrong passphrase or key length' "$WORK/sapflow-enc.log" || fail "wrong passphrase not logged as refused"
-  grep -q 'not-the-passphrase' "$WORK/sapflow-enc.log" && fail "a passphrase reached the log"
-  echo "ok   SRT passphrase: encrypted publish plays; none or a wrong one refused"
-fi
+# SRT passphrase encryption: a second server that requires it. The right
+# passphrase plays; none, or a wrong one, is refused.
+ESRT=18891 EHTTP=127.0.0.1:18887 PASS_E=smoke-passphrase-1
+SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret \
+SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
+SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-enc.log" 2>&1 & pids+=($!)
+sleep 1
+grep -q 'encrypted=true' "$WORK/sapflow-enc.log" || fail "encrypted server did not start"
+epublish() { # streamid seconds extra-srt-options
+  ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
+    -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
+    -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -c:a aac -b:a 128k \
+    -f mpegts - | srt-live-transmit -q -a:no file://con "srt://127.0.0.1:$ESRT?streamid=$1&latency=2000$3"
+}
+epublish "publish:live/event-enc:pub:secret" 10 "&passphrase=$PASS_E&pbkeylen=16" > /dev/null 2>&1 & pids+=($!)
+for _ in $(seq 1 60); do
+  curl -sf "http://$EHTTP/live/event-enc/stream.m3u8" -o "$WORK/enc.m3u8" && grep -q _seg "$WORK/enc.m3u8" && break; sleep 0.25
+done
+grep -qs _seg "$WORK/enc.m3u8" || { tail -20 "$WORK/sapflow-enc.log" >&2; fail "encrypted publish never became a stream"; }
+einit=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/enc.m3u8")
+curl -s "http://$EHTTP/live/event-enc/$einit" > "$WORK/enc.mp4"
+for s in $(grep '_seg' "$WORK/enc.m3u8"); do curl -s "http://$EHTTP/live/event-enc/$s" >> "$WORK/enc.mp4"; done
+ffmpeg -hide_banner -v error -xerror -i "$WORK/enc.mp4" -f null - || fail "encrypted stream does not decode"
+epublish "publish:live/event-plain:pub:secret" 3 "" > /dev/null 2>&1 || true
+epublish "publish:live/event-wrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" > /dev/null 2>&1 || true
+for e in event-plain event-wrong; do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/$e/index.m3u8")" = 404 ] || fail "$e was accepted"
+done
+grep -q 'wrong passphrase or key length' "$WORK/sapflow-enc.log" || fail "wrong passphrase not logged as refused"
+grep -q 'not-the-passphrase' "$WORK/sapflow-enc.log" && fail "a passphrase reached the log"
+echo "ok   SRT passphrase: encrypted publish plays; none or a wrong one refused"
 echo "PASS"

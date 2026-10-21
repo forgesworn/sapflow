@@ -1,8 +1,8 @@
 //! Differential test: each recorded publish (`fixtures/*.trace`, the
 //! caller's datagrams with their timing) replayed through our listener must
-//! deliver the payloads `srt-protocol` delivers for the same trace
-//! (`fixtures/*.expected`, made by `crates/sapflow-server/tests/
-//! srt_protocol_reference.rs`): same payloads, same order, same lengths.
+//! deliver the payloads `srt-protocol` delivered for the same trace
+//! (`fixtures/*.expected`, made by srt-protocol 0.4.4 before it was removed
+//! on 2026-10-21, so now fixed): same payloads, same order, same lengths.
 //! Where they differ under loss, libsrt's own delivery of the recorded
 //! session decides (`*.libsrt-expected`).
 //!

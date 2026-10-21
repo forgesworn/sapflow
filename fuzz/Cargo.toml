@@ -14,7 +14,6 @@ bytes = "1.12.1"
 sapflow-core = { path = "../crates/sapflow-core" }
 sapflow-hls = { path = "../crates/sapflow-hls" }
 sapflow-srt = { path = "../crates/sapflow-srt" }
-srt-protocol = "=0.4.4"
 
 [[bin]]
 name = "ts_ingest"
@@ -33,20 +32,6 @@ bench = false
 [[bin]]
 name = "small_parsers"
 path = "fuzz_targets/small_parsers.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "srt_packet"
-path = "fuzz_targets/srt_packet.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "srt_listener"
-path = "fuzz_targets/srt_listener.rs"
 test = false
 doc = false
 bench = false
@@ -78,9 +63,6 @@ path = "fuzz_targets/own_srt_listener.rs"
 test = false
 doc = false
 bench = false
-
-[patch.crates-io]
-srt-protocol = { path = "../vendor/srt-protocol" }
 
 [workspace]
 

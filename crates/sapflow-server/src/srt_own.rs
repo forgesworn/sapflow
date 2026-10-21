@@ -1,4 +1,4 @@
-//! SRT through our own `sapflow-srt` (`SAPFLOW_SRT_IMPL=own`): one UDP
+//! SRT through our own `sapflow-srt`: one UDP
 //! socket, one task driving the sans-IO listener, and a task per publisher
 //! that feeds its media to the muxer, so a slow or failing muxer holds up
 //! only its own stream.

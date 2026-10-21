@@ -6,7 +6,6 @@
 #   SEEDS=3 LOSSES=random:10 LATENCIES=200 scripts/srt-loss.sh
 #   RECEIVERS=sapflow SAPFLOW_BIN=/path/to/sapflow scripts/srt-loss.sh
 #   RECEIVERS="old=/path/sapflow-old new=/path/sapflow-new libsrt" scripts/srt-loss.sh
-#   RECEIVERS="srt-rs own libsrt" scripts/srt-loss.sh   # both SRT implementations
 #   PASSPHRASE=loss-test-key KMREFRESH=2000 RECEIVERS="own libsrt" scripts/srt-loss.sh
 #   scripts/srt-loss.sh --summarise scratch/srt-loss/<run>/results.tsv
 #
@@ -39,9 +38,9 @@
 #                       srt-loss-proxy --loss values; burst:P,L is bursty loss
 #                       (Gilbert-Elliott), P percent on average, L packets a burst
 #   LATENCIES="2000 200"   SRT latency in ms, set on sender and receiver
-#   RECEIVERS="sapflow libsrt"   `NAME=binary` runs another sapflow build as NAME;
-#                       a NAME starting with `own` runs sapflow with
-#                       SAPFLOW_SRT_IMPL=own (our SRT), any other with srt-rs
+#   RECEIVERS="sapflow libsrt"   `NAME=binary` runs another sapflow build as NAME
+#                       (each with its own default SRT: builds before
+#                       2026-10-21 default to srt-rs, since then our own)
 #   CLIP_SECS=30  DELAY_MS=30 (one way)  JOBS=3 (trials at once)
 #   PASSPHRASE=         encrypt the stream, off when unset (the output is then
 #                       what it was before this option existed). 10 to 79 of
@@ -166,8 +165,7 @@ if [ "${1:-}" = "--trial" ]; then
   trap cleanup EXIT
 
   if [ "$kind" = sapflow ]; then
-    impl=srt-rs; [ "${recv#own}" = "$recv" ] || impl=own
-    SAPFLOW_SRT_IMPL=$impl SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:$hp SAPFLOW_SRT_ADDR=127.0.0.1:$sp \
+    SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:$hp SAPFLOW_SRT_ADDR=127.0.0.1:$sp \
       SAPFLOW_RTMP_ADDR=off SAPFLOW_RECORDINGS="$d/rec" RUST_LOG=warn \
       "$bin" > "$d/rcv.log" 2>&1 &
     rp=$!; target=$sp; sid="&streamid=publish:live/event-loss"
@@ -240,9 +238,6 @@ if [ -n "$PASSPHRASE" ]; then
     [ -z "$pw" ] || [[ $pw =~ ^[A-Za-z0-9._-]{10,79}$ ]] || die "a passphrase is 10 to 79 characters of A-Z a-z 0-9 . _ -"
   done
   case $PBKEYLEN in 16|32) ;; *) die "PBKEYLEN is 16 or 32" ;; esac
-  for r in $RECEIVERS; do
-    [ "${r#libsrt}" != "$r" ] || [ "${r#own}" != "$r" ] || die "with PASSPHRASE a sapflow receiver must be named own (our SRT): $r"
-  done
   ENC_DESC="aes$((PBKEYLEN * 8))"
   if [ -n "$KMREFRESH" ]; then
     [[ $KMREFRESH =~ ^[0-9]+$ ]] && [ "$KMREFRESH" -ge 3 ] || die "KMREFRESH is a packet count, at least 3"

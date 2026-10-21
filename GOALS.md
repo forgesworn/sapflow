@@ -153,10 +153,12 @@ packet filters (FEC), sending (a later milestone, for phones).
   assume encryption hides credentials placed in a stream ID. Provision
   session-scoped secrets through an authenticated destination channel.
 - **M6c, switch:** make it the default, remove `vendor/srt-protocol`,
-  `srt-tokio` and their dependencies. **Default since 2026-10-21** (the
-  user's decision): `srt-rs` stays behind `SAPFLOW_SRT_IMPL=srt-rs` as a
-  fallback, and is removed once OBS publishes to ours, and OBS and Larix
-  publish with a passphrase.
+  `srt-tokio` and their dependencies. **Done 2026-10-21:** ours became the
+  default, then, once OBS had published to it and OBS and Larix had
+  published with a passphrase (`docs/interop.md`), srt-rs was removed.
+  `SAPFLOW_SRT_IMPL=srt-rs` is now refused with a message saying so. The
+  differential test keeps srt-protocol's recorded output as fixtures; the
+  datagrams that crashed it are regression inputs for our parser.
 
 **Done when** (all measured, not asserted):
 - fuzz targets for the packet parser and the connection, clean for 20
@@ -225,17 +227,17 @@ grace goes back to its hold. `scripts/smoke.sh` publishes with
 `srt-live-transmit` (libsrt 1.5.4) using a passphrase, decodes the result,
 and checks that no passphrase and a wrong one are refused. An independent
 review of the crypto found no defects; its hardening suggestions are in
-`docs/threat-model.md`. OBS and Larix with a passphrase are not yet tried.
+`docs/threat-model.md`. OBS and Larix published with a passphrase on
+2026-10-21, and were refused with a wrong one (`docs/interop.md`).
 Independent executable tests cover both directions with libsrt, key rotation,
 clean/impaired loopback delivery and wrong/missing secrets. These are finite
 implementation checks, not completion of the full M6 qualification matrix.
-The existing default receiver is unchanged; CTR does not authenticate media.
+CTR does not authenticate media.
 
-Still open for M6 as a whole: OBS against `own` (Larix on an iPhone
-published to `own` over Wi-Fi on 2026-10-21, alone and alongside an RTMP
-publish), the full encrypted qualification matrix, and
+Still open for M6 as a whole: the full encrypted qualification matrix, and
 the version 4 handshake, which no encoder tested so far needed (every one
-used version 5).
+used version 5). OBS and Larix have published to our own receiver, with
+and without a passphrase (2026-10-21).
 
 ### M7 Stage resilience and production readiness
 
@@ -254,8 +256,9 @@ per target). The Linux and Caddy measurements are not done.
   v4v's `e2e:ingest-srt-sapflow` (with `SAPFLOW_SRT_IMPL=own`) and
   `e2e:ingest-sapflow` with `SAPFLOW_RECONNECT_GRACE=10` to match the
   gate's window, and hls.js in Chrome across a stall and a reconnect
-  (`docs/reference.md`). Safari across a reconnect, as against a stall, is
-  not yet watched.
+  (`docs/reference.md`). Safari kept playing across seven Larix RTMP
+  reconnects, but fell further behind with each (`docs/interop.md`); OBS
+  restarted 62 s later resumed its held stream.
 - The `health` callback every `SAPFLOW_HEALTH_INTERVAL` (default 30 s):
   bitrate, keyframe interval, audio, breaks (`docs/v4v-contract.md`). v4v
   reads the bitrate today; it reads the keyframe interval from the playlist.

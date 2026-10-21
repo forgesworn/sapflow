@@ -183,9 +183,8 @@ Pinned in the crates' `Cargo.toml`. These are decisions the user may revisit.
 | Need | Crate | Notes |
 |------|-------|-------|
 | Async runtime, HTTP | `tokio` 1.54, `axum` 0.8.9 | `hyper-util` legacy client for the callback, no `reqwest` |
-| SRT, our own (M6a) | `sapflow-srt` | Live-mode receiver, sans-IO, MIT, no dependencies; written from draft-sharabayko-srt-01 and recorded sessions (findings below). Serves the port with `SAPFLOW_SRT_IMPL=own`; encrypted callers refused until M6b. |
-| SRT, the default until 2026-10-21, now a fallback | `srt-tokio` 0.4.4 (pure Rust) | Last release 2024-05. Builds on Rust 1.94 and tokio 1.54, interoperates with libsrt's `srt-live-transmit`, and exposes the stream id before accept, so publishers are refused in the handshake. Risks: unmaintained upstream, and `srt-protocol` has a `panic!` on one malformed-handshake encode path (M5: fuzz it, or move to libsrt bindings). |
-| SRT parsing | `srt-protocol` 0.4.4, vendored and patched | Fuzzing found that one unauthenticated datagram crashed the server; fixes and the reasons are in `vendor/srt-protocol/PATCHES.md`. |
+| SRT | `sapflow-srt`, our own | Live-mode receiver and sender, sans-IO, MIT; written from draft-sharabayko-srt-01 and recorded sessions (findings below). Serves the port alone since 2026-10-21. Passphrase encryption (M6b) uses RustCrypto's `aes`, `aes-kw`, `ctr`, `pbkdf2` and `sha1`, plus `getrandom` and `zeroize`; nothing else. |
+| SRT until 2026-10-21 (removed) | `srt-tokio` 0.4.4 with `srt-protocol` 0.4.4, vendored and patched | Last release 2024-05. Fuzzing found that one unauthenticated datagram crashed the server; we patched our copy. Removed once OBS and Larix had published to our own receiver, with and without a passphrase (M6c). The patches are in the history before that date. |
 | MPEG-TS demux | `mpeg2ts` 0.6.1 | Fed one 188-byte packet at a time from our buffer (`sapflow_hls::ingest`), because its reader treats some stream errors as fatal and stops at end of input. |
 | H.264 | `h264-reader` 0.9.0 | Annex B splitting and SPS parsing. |
 | AAC | `adts-reader` 0.4.0 | ADTS headers. It reports the raw-block count as the field plus one. |
@@ -193,18 +192,15 @@ Pinned in the crates' `Cargo.toml`. These are decisions the user may revisit.
 | RTMP (M2) | our own, `sapflow_hls::rtmp` | Publish only, sans-IO: handshake (original and digest forms), chunk stream, AMF0, the publish commands. Replaced `rml_rtmp` 0.8.0 (last release 2023-04), in which fuzzing found two panics on unauthenticated input. The digest handshake uses `hmac` 0.12.1 and `sha2` 0.10.9. |
 | Fuzzing (M5) | `cargo-fuzz` | |
 
-Licences: every dependency is permissive. `srt-tokio`, `srt-protocol` and
-`sync_wrapper` are Apache-2.0 only (no NOTICE files); the rest are MIT, BSD,
-Unicode-3.0 or dual-licensed. Distributed binaries and images must carry the
-third-party licence texts; forking `srt-tokio` would keep Apache-2.0 on that
-code.
+Licences: every dependency is permissive. `sync_wrapper` is Apache-2.0
+only (no NOTICE file); the rest are MIT, BSD, Unicode-3.0 or dual-licensed.
+Distributed binaries and images must carry the third-party licence texts.
 
 Our own parsing is the SRT stream id, the RTMP stream key, the chunk file
 names, the `_HLS_msn`/`_HLS_part` query, the FLV video and audio tag headers
 (5 and 2 bytes), the AudioSpecificConfig (2 bytes) and NAL length prefixes,
 all small and unit-tested, and, since 2026-10-20, the whole RTMP protocol
-(publish only: `sapflow_hls::rtmp`) and, with `SAPFLOW_SRT_IMPL=own`, the
-whole SRT receiver (`sapflow-srt`: every packet type, the handshake and its
+(publish only: `sapflow_hls::rtmp`) and the whole SRT receiver (`sapflow-srt`: every packet type, the handshake and its
 extensions, loss lists). Each has a fuzz target.
 
 ### RTMP handshake findings (2026-10-20)
@@ -252,7 +248,7 @@ follows the observed behaviour.
   inside the word (`read:live/event-x` ends `00 00 00 78`).
 - **Observed:** a refusal is a handshake whose type is the reason: 1000 and
   up for the protocol's, 2000 plus an HTTP status for the application's,
-  which libsrt prints as `PREDEFINED:401`. srt-tokio sends 400, 401, 402
+  which libsrt prints as `PREDEFINED:401`. srt-tokio sent 400, 401, 402
   (overload, and our throttle), 404 and 409 for sapflow's refusals;
   sapflow-srt sends the same.
 - **Observed:** a libsrt receiver sends a full ACK at most every 10 ms and
