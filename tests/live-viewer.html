@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sapflow live qualification</title>
+<style>
+  body { margin:0; background:#101014; color:#eee; font:16px system-ui }
+  main { max-width:1200px; margin:auto; padding:20px }
+  video { width:100%; max-height:80vh; background:#000 }
+  p { color:#bbb } button { font:inherit; padding:10px }
+</style>
+<main>
+  <video id="video" controls autoplay playsinline></video>
+  <p id="status">Connecting to the test stream…</p>
+  <button id="live">Go live</button>
+  <button id="export">Save diagnostic evidence</button>
+</main>
+<script id="diagnostics">
+// Bounded test-viewer evidence. Media bytes are retained only in this page.
+globalThis.SapflowViewerDiagnostics = (() => {
+  const finite = value => Number.isFinite(value) ? value : null;
+  const fields = (value, keys) => Object.fromEntries(keys.filter(k => value?.[k] !== undefined)
+    .map(k => [k, typeof value[k] === 'number' ? finite(value[k]) : value[k]]));
+  const timing = value => fields(value, ['start', 'first', 'end']);
+  const stats = value => ({...fields(value, ['aborted', 'loaded', 'total', 'retry', 'chunkCount', 'bwEstimate']),
+    loading:timing(value?.loading), parsing:timing(value?.parsing), buffering:timing(value?.buffering)});
+  const ranges = value => Array.from({length:value?.length || 0}, (_, i) => [value.start(i), value.end(i)]);
+  const fragment = value => value ? ({...fields(value, ['sn', 'cc', 'url', 'start', 'duration', 'startPTS',
+    'endPTS', 'startDTS', 'endDTS', 'gap', 'type', 'level', 'baseurl']),
+    elementaryStreams:Object.fromEntries(Object.entries(value.elementaryStreams || {})
+      .map(([key, stream]) => [key, fields(stream, ['startPTS', 'endPTS', 'startDTS', 'endDTS', 'partial'])])),
+    stats:stats(value.stats)}) : null;
+  const part = value => value ? ({...fields(value, ['index', 'url', 'start', 'duration', 'gap', 'independent']),
+    stats:stats(value.stats)}) : null;
+  function response(value) {
+    if (!value) return null;
+    let contentType = null, contentLength = null;
+    try {
+      contentType = value.getResponseHeader?.('Content-Type') || value.headers?.get?.('Content-Type') || null;
+      contentLength = value.getResponseHeader?.('Content-Length') || value.headers?.get?.('Content-Length') || null;
+    }
+    catch (_) { /* Inaccessible headers remain explicit. */ }
+    return {...fields(value, ['status', 'statusText', 'responseURL', 'url']), contentType, contentLength};
+  }
+  function bytes(value) {
+    try {
+      if (value instanceof ArrayBuffer) return new Uint8Array(value).slice();
+      if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+    } catch (_) { /* A worker may already own a transferred event payload. */ }
+    return null;
+  }
+  function loaderClass(Base, evidence) {
+    return class extends Base {
+      load(context, config, callbacks) {
+        return super.load(context, config, {...callbacks, onSuccess:(response, stats, ctx, networkDetails) => {
+          // Copy at loader completion, before hls.js transfers bytes to its
+          // demux worker. A FRAG_LOADED observer can see a detached buffer.
+          try { evidence.loaded({payload:response.data, frag:ctx.frag, part:ctx.part, networkDetails}); }
+          catch (_) { evidence.captureErrors++; }
+          callbacks.onSuccess(response, stats, ctx, networkDetails);
+        }});
+      }
+    };
+  }
+  class Evidence {
+    constructor(limit = 8 * 1024 * 1024, count = 32) {
+      this.limit = limit; this.count = count; this.used = 0; this.media = []; this.failures = [];
+      this.incident = null; this.incidentUsed = 0; this.following = 0; this.playlists = []; this.init = []; this.captureErrors = 0;
+    }
+    loaded(data) {
+      if (!data.payload || data.payload.byteLength > this.limit) return;
+      const payload = bytes(data.payload);
+      if (!payload || payload.byteLength > this.limit) return;
+      const item = {at:Date.now(), frag:fragment(data.frag), part:part(data.part),
+        response:response(data.networkDetails), bytes:payload};
+      if (data.frag?.sn === 'initSegment' && payload.byteLength <= 512 * 1024) {
+        this.init.push(item);
+        if (this.init.length > 2) this.init.shift();
+      }
+      this.media.push(item); this.used += payload.byteLength;
+      while (this.used > this.limit || this.media.length > this.count) this.used -= this.media.shift().bytes.byteLength;
+      if (this.incident && this.following > 0 && this.incidentUsed + payload.byteLength <= this.limit) {
+        this.incident.media.push(item); this.incidentUsed += payload.byteLength; this.following--;
+      }
+    }
+    playlist(data) {
+      const text = data.networkDetails?.responseText;
+      this.playlists.push({at:Date.now(), response:response(data.networkDetails),
+        text:typeof text === 'string' ? text.slice(0, 256 * 1024) : null,
+        details:fields(data.details, ['url', 'startSN', 'endSN', 'startCC', 'endCC', 'targetduration',
+          'partTarget', 'totalduration', 'live', 'ageHeader'])});
+      if (this.playlists.length > 4) this.playlists.shift();
+    }
+    error(data, video) {
+      const item = {at:Date.now(), ...fields(data, ['type', 'details', 'fatal', 'reason']),
+        message:String(data.error?.message || data.message || ''), frag:fragment(data.frag), part:part(data.part),
+        stats:stats(data.stats), response:{...response(data.networkDetails),
+          ...fields(data.response, ['code', 'text', 'url'])}, buffered:ranges(video?.buffered),
+        currentTime:finite(video?.currentTime)};
+      this.failures.push(item);
+      if (this.failures.length > 128) this.failures.shift();
+      if (!this.incident && /pars|gap|append/i.test(data.details || '')) {
+        this.incident = {error:item, playlists:this.playlists.slice(), init:this.init.slice(), media:this.media.slice(-12)};
+        this.incidentUsed = this.incident.media.reduce((sum, media) => sum + media.bytes.byteLength, 0);
+        // Leave room for immediately adjacent parts without exceeding a second bounded byte budget.
+        while (this.incidentUsed > this.limit / 2 && this.incident.media.length > 1)
+          this.incidentUsed -= this.incident.media.shift().bytes.byteLength;
+        this.following = 4;
+      }
+      return item;
+    }
+    packet(metrics) {
+      const encode = media => media.map(item => {
+        let binary = '';
+        for (let offset = 0; offset < item.bytes.length; offset += 8192)
+          binary += String.fromCharCode(...item.bytes.subarray(offset, offset + 8192));
+        return {...item, bytes:undefined, byteLength:item.bytes.length, base64:btoa(binary)};
+      });
+      return {metrics, failures:this.failures, playlists:this.playlists, captureErrors:this.captureErrors,
+        retainedBytes:this.used, incidentBytes:this.incidentUsed,
+        init:encode(this.init), recent:encode(this.media),
+        incident:this.incident ? {...this.incident, init:encode(this.incident.init), media:encode(this.incident.media)} : null};
+    }
+  }
+  return {Evidence, ranges, fragment, part, stats, bytes, loaderClass};
+})();
+</script>
+<script src="/hls.js"></script>
+<script>
+const video = document.querySelector('video'), status = document.querySelector('#status');
+const event = new URLSearchParams(location.search).get('event') || 'event-test';
+if (!/^[a-z0-9-]{1,80}$/.test(event)) throw Error('Invalid test event');
+video.disableRemotePlayback = true;
+window.evidence = new SapflowViewerDiagnostics.Evidence();
+window.playbackEvents = [];
+for (const type of ['playing', 'waiting', 'stalled', 'seeking', 'seeked', 'ended', 'error']) {
+  video.addEventListener(type, () => {
+    playbackEvents.push({at:Date.now(), type, currentTime:video.currentTime, ready:video.readyState,
+      buffered:SapflowViewerDiagnostics.ranges(video.buffered),
+      error:video.error ? {code:video.error.code, message:video.error.message} : null});
+    if (playbackEvents.length > 128) playbackEvents.shift();
+  });
+}
+window.hls = new Hls({lowLatencyMode:true, liveSyncDuration:1, liveMaxLatencyDuration:3,
+  maxLiveSyncPlaybackRate:1.1, maxBufferLength:4, backBufferLength:10, preferManagedMediaSource:false,
+  fLoader:SapflowViewerDiagnostics.loaderClass(Hls.DefaultConfig.loader, evidence)});
+window.metrics = () => {
+  const quality = video.getVideoPlaybackQuality?.();
+  return {now:Date.now(), event, hlsVersion:Hls.version, currentTime:video.currentTime,
+  paused:video.paused, ready:video.readyState, latency:hls.latency, liveSync:hls.liveSyncPosition,
+  rate:video.playbackRate, buffered:SapflowViewerDiagnostics.ranges(video.buffered),
+  quality:quality ? {totalVideoFrames:quality.totalVideoFrames, droppedVideoFrames:quality.droppedVideoFrames,
+    corruptedVideoFrames:quality.corruptedVideoFrames} : null,
+  playbackEvents, failures:evidence.failures};
+};
+hls.on(Hls.Events.LEVEL_LOADED, (_, data) => evidence.playlist(data));
+hls.on(Hls.Events.ERROR, (_, data) => {
+  const item = evidence.error(data, video);
+  console.warn('Sapflow playback evidence', item);
+  if (data.fatal) status.textContent = 'Playback interrupted: ' + data.details;
+});
+hls.loadSource('/live/' + event + '/index.m3u8');
+hls.attachMedia(video);
+hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {status.textContent = 'Press Play to watch live';}));
+document.querySelector('#live').onclick = () => {
+  if (Number.isFinite(hls.liveSyncPosition)) video.currentTime = hls.liveSyncPosition;
+  video.play();
+};
+document.querySelector('#export').onclick = () => {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(evidence.packet(metrics()))], {type:'application/json'}));
+  const link = document.createElement('a'); link.href = url; link.download = event + '-viewer-evidence.json'; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+setInterval(() => {
+  if (!video.paused) status.textContent = 'Test stream · ' + hls.latency.toFixed(2) + ' s from the estimated origin edge';
+}, 1000);
+</script>
+</html>
