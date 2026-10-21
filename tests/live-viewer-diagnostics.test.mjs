@@ -187,15 +187,15 @@ function pageFixture() {
     addEventListener(type, callback) { const list = this.handlers.get(type) || []; list.push(callback); this.handlers.set(type, list); }
     emit(type) { for (const callback of this.handlers.get(type) || []) callback({type}); }
   }
-  const video = Object.assign(new Element(), {currentTime:0, readyState:4, paused:true, autoplay:true,
+  const video = Object.assign(new Element(), {currentTime:0, readyState:4, paused:true, ended:false, autoplay:true,
     playbackRate:1, frames:0, plays:0, buffered:{length:0},
     getVideoPlaybackQuality() { return {totalVideoFrames:this.frames, droppedVideoFrames:0}; },
-    play() { this.plays++; this.paused = false; this.emit('play'); return Promise.resolve(); },
+    play() { this.plays++; this.paused = false; this.ended = false; this.emit('play'); return Promise.resolve(); },
     pause() { this.paused = true; this.emit('pause'); },
   });
   const elements = new Map([['video', video], ...['status', 'toggle', 'live', 'export'].map(id => ['#' + id, new Element()])]);
   class Hls {
-    static Events = {LEVEL_LOADED:'level', ERROR:'error', MANIFEST_PARSED:'manifest', MEDIA_ATTACHED:'attached'};
+    static Events = {LEVEL_LOADED:'level', ERROR:'error', MANIFEST_PARSED:'manifest', MEDIA_ATTACHED:'attached', BUFFER_APPENDED:'buffer'};
     static DefaultConfig = {loader:class {}};
     static version = 'test-pinned';
     static instances = [];
@@ -235,6 +235,7 @@ function pageFixture() {
     error(data) { hls.emit(Hls.Events.ERROR, data); },
     attach() { hls.emit(Hls.Events.MEDIA_ATTACHED); },
     level(live) { hls.emit(Hls.Events.LEVEL_LOADED, {details:{live}}); },
+    buffer(end) { video.buffered = {length:1, start:() => 0, end:() => end}; hls.emit(Hls.Events.BUFFER_APPENDED); },
   };
 }
 {
@@ -278,6 +279,75 @@ function pageFixture() {
   assert.equal(f.page.recovery.phase, 'ended');
   assert.match(f.elements.get('#status').textContent, /^Broadcast ended/);
   assert.equal(f.instances.length, 1);
+}
+{
+  const f = pageFixture(); f.manifest(); f.advance(163, 4890); f.advance(164, 4920);
+  f.buffer(164);
+  f.video.ended = true; f.video.pause(); // Browser's natural edge pause precedes ended.
+  assert.equal(f.page.recovery.paused, false);
+  f.video.emit('ended'); f.refresh();
+  assert.equal(f.page.recovery.terminal, null);
+  assert.match(f.elements.get('#status').textContent, /^Recovering/);
+  f.step();
+  assert.deepEqual(f.hls.calls, ['network']);
+  assert.equal(f.video.plays, 1, 'do not replay the exhausted live buffer');
+  f.buffer(165); f.buffer(165);
+  assert.equal(f.video.plays, 2, 'one autoresume only after new media is buffered');
+  assert.equal(f.video.currentTime, 164, 'recovery must not seek to the new edge');
+  assert.equal(f.page.recovery.attempts.network, 1);
+  f.advance(164.5, 4935);
+  assert.equal(f.page.recovery.phase, 'playing'); assert.equal(f.timers.size, 0);
+  assert.equal(f.page.recovery.attempts.network, 0);
+  assert.equal(f.instances.length, 1);
+  assert.deepEqual(f.hls.sources, ['/live/event-recovery-test/index.m3u8']);
+  assert.ok(f.page.recovery.history.some(action => action.action === 'resume-buffered-live-edge'));
+}
+{
+  const f = pageFixture(); f.manifest(); f.buffer(1);
+  f.video.currentTime = 1; f.video.ended = true; f.video.pause(); f.video.emit('ended');
+  while (f.timers.size) f.step();
+  assert.equal(f.page.recovery.terminal, 'network-recovery-exhausted');
+  assert.deepEqual(f.hls.calls, ['network', 'network', 'network', 'stop']);
+  f.buffer(2); assert.equal(f.video.plays, 1, 'exhausted live-edge recovery stays terminal');
+}
+{
+  const f = pageFixture(); f.manifest();
+  f.video.ended = true; f.video.pause(); f.video.emit('ended');
+  f.elements.get('#toggle').onclick(); // User Pause while edge recovery is pending.
+  f.buffer(2);
+  assert.equal(f.video.plays, 1); assert.equal(f.page.recovery.paused, true);
+  assert.equal(f.timers.size, 0);
+  f.elements.get('#toggle').onclick();
+  assert.equal(f.video.plays, 2); assert.equal(f.page.recovery.paused, false);
+}
+{
+  const f = pageFixture(); f.manifest();
+  f.video.emit('pointerdown'); f.video.ended = true; f.video.pause(); f.video.emit('ended');
+  assert.equal(f.page.recovery.paused, true, 'native-control pause intent wins at live edge');
+  assert.equal(f.timers.size, 0); f.buffer(2); assert.equal(f.video.plays, 1);
+}
+{
+  const f = pageFixture(); f.manifest(); f.level(false);
+  f.video.ended = true; f.video.pause(); f.video.emit('ended'); f.buffer(2); f.refresh();
+  assert.equal(f.page.recovery.terminal, 'event-ended');
+  assert.equal(f.page.recovery.phase, 'ended');
+  assert.deepEqual(f.hls.calls, ['stop']); assert.equal(f.timers.size, 0);
+  assert.equal(f.video.plays, 1);
+  assert.match(f.elements.get('#status').textContent, /^Broadcast ended/);
+}
+{
+  const f = pageFixture(); f.manifest();
+  f.video.ended = true; f.video.pause(); f.video.emit('ended');
+  f.level(false); // ENDLIST arrives after the natural edge event, before retry.
+  assert.equal(f.page.recovery.phase, 'ended');
+  assert.equal(f.timers.size, 0); assert.deepEqual(f.hls.calls, ['stop']);
+}
+{
+  const f = pageFixture(); f.manifest();
+  f.video.ended = true; f.video.pause(); f.video.emit('ended');
+  f.error({...networkFatal, response:{code:403}}); f.buffer(2);
+  assert.equal(f.page.recovery.terminal, 'authorisation-failed');
+  assert.equal(f.timers.size, 0); assert.equal(f.video.plays, 1);
 }
 {
   const f = recoveryFixture(); let throws = 0;

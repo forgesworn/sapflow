@@ -248,6 +248,8 @@ for (const type of ['playing', 'waiting', 'stalled', 'seeking', 'seeked', 'ended
   });
 }
 let restoringMedia = false, restorePlayback = false, pauseGestureDuringReset = false;
+let endListKnown = false, liveEdgeEnded = false, liveEdgePlayRequested = false;
+let mediaControlGestureAt = -Infinity;
 window.hls = new Hls({lowLatencyMode:true, liveSyncDuration:1, liveMaxLatencyDuration:3,
   maxLiveSyncPlaybackRate:1.1, maxBufferLength:4, backBufferLength:10, preferManagedMediaSource:false,
   fLoader:SapflowViewerDiagnostics.loaderClass(Hls.DefaultConfig.loader, evidence)});
@@ -274,7 +276,11 @@ function renderStatus() {
   } else status.textContent = state.phase === 'connecting' ? 'Connecting to the test stream…' : 'Waiting for advancing media';
 }
 window.recovery = new SapflowViewerRecovery({
-  network:() => hls.startLoad(),
+  network:() => {
+    liveEdgePlayRequested = false;
+    hls.startLoad();
+    resumeBufferedLiveEdge();
+  },
   media:() => {
     restorePlayback = !recovery.paused;
     restoringMedia = true; pauseGestureDuringReset = false;
@@ -292,9 +298,28 @@ function playIntentionally(reason = 'intentional-resume') {
     }
   });
 }
-for (const type of ['pointerdown', 'keydown']) video.addEventListener(type, () => { if (restoringMedia) pauseGestureDuringReset = true; });
+function resumeBufferedLiveEdge() {
+  if (!liveEdgeEnded || liveEdgePlayRequested || recovery.paused || recovery.terminal) return;
+  const time = video.currentTime;
+  const available = SapflowViewerDiagnostics.ranges(video.buffered)
+    .some(([start, end]) => start <= time && end > time + 0.05);
+  if (!available || video.readyState < 2) return;
+  liveEdgePlayRequested = true;
+  // Resume at the unchanged media time only after the buffer has extended.
+  // The existing network budget/watchdog still requires actual progress.
+  playIntentionally('resume-buffered-live-edge');
+}
+for (const type of ['pointerdown', 'keydown']) video.addEventListener(type, () => {
+  mediaControlGestureAt = performance.now();
+  if (restoringMedia) pauseGestureDuringReset = true;
+});
 video.addEventListener('pause', () => {
   if (!video.paused) return; // Ignore an older queued pause after playback resumed.
+  const controlGesture = performance.now() - mediaControlGestureAt < 1000;
+  mediaControlGestureAt = -Infinity;
+  if (video.ended && !endListKnown && !controlGesture) {
+    recovery.record('live-edge-pause'); return;
+  }
   // A recoverMediaError detach can emit pause. Explicit controls remain
   // authoritative even while media is detached; ordinary native-control pause
   // is preserved, including a control gesture during that short reset window.
@@ -302,11 +327,25 @@ video.addEventListener('pause', () => {
     pauseGestureDuringReset = false; restorePlayback = false; video.autoplay = false; recovery.pause('media-pause-event');
   }
 });
-video.addEventListener('play', () => { if (!recovery.terminal || recovery.terminal === 'event-ended') { recovery.resume('media-play-event'); video.autoplay = true; } });
+video.addEventListener('play', () => {
+  mediaControlGestureAt = -Infinity;
+  if (!recovery.terminal || recovery.terminal === 'event-ended') { recovery.resume('media-play-event'); video.autoplay = true; }
+});
 for (const type of ['waiting', 'stalled']) video.addEventListener(type, () => recovery.waiting());
-video.addEventListener('ended', () => recovery.end());
-video.addEventListener('timeupdate', () => recovery.progress({time:video.currentTime,
-  frames:video.getVideoPlaybackQuality?.().totalVideoFrames, ready:video.readyState, paused:video.paused}));
+video.addEventListener('ended', () => {
+  if (endListKnown) { recovery.end(); return; }
+  liveEdgeEnded = true; liveEdgePlayRequested = false;
+  recovery.record('live-edge-ended');
+  if (recovery.paused || recovery.terminal) return;
+  recovery.error({fatal:true, type:'networkError', details:'live-edge-ended'});
+});
+video.addEventListener('timeupdate', () => {
+  recovery.progress({time:video.currentTime, frames:video.getVideoPlaybackQuality?.().totalVideoFrames,
+    ready:video.readyState, paused:video.paused});
+  if (recovery.phase === 'playing') liveEdgeEnded = false;
+});
+for (const type of ['canplay', 'loadeddata', 'progress']) video.addEventListener(type, resumeBufferedLiveEdge);
+hls.on(Hls.Events.BUFFER_APPENDED, resumeBufferedLiveEdge);
 hls.on(Hls.Events.MEDIA_ATTACHED, () => {
   if (!restoringMedia) return;
   restoringMedia = false;
@@ -314,7 +353,7 @@ hls.on(Hls.Events.MEDIA_ATTACHED, () => {
 });
 hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
   evidence.playlist(data);
-  if (data.details?.live === false) recovery.end(true);
+  if (data.details?.live === false) { endListKnown = true; recovery.end(!video.ended); }
 });
 hls.on(Hls.Events.ERROR, (_, data) => {
   const item = evidence.error(data, video);

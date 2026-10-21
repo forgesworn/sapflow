@@ -51,6 +51,16 @@ cannot regain a Playing/edge status from the periodic status timer alone.
 `metrics().recovery` exports a bounded 64-action history, counters and terminal
 reason; the pre-existing diagnostic evidence survives recovery.
 
+A browser `ended` event alone does not mean the broadcast has ended. Only a
+known ENDLIST makes it terminal. A live-edge end and its automatic pause use
+the same three-attempt network budget and progress watchdog; loading resumes
+on the existing Hls instance. Automatic play waits until the buffer extends
+past the unchanged current media time. It never seeks or replaces the source.
+Explicit Pause, an observed native-control pause gesture, authentication failure
+or exhausted recovery prevents that autoresume. Every edge/recovery action is
+retained in the bounded history. ENDLIST arriving after a live-edge end cancels
+any pending retry and reports the actual broadcast end.
+
 This safety net does not repair origin discontinuities. A logical reconnect
 must preserve media/discontinuity sequence identity, retain advertised old
 resources and introduce the correct immutable init map for changed codec
@@ -69,6 +79,7 @@ node tests/live-viewer-diagnostics.test.mjs
 The deterministic harness covers byte retention plus single-flight retries,
 hanging/thrown actions, budgets and real-progress reset, pause/resume during
 decoder reattachment, End/authentication, invalid-origin sequences, status
-rendering and evidence retention. Its browser/Hls adapters are synthetic;
+rendering, live-edge end before new buffered media and evidence retention.
+Its browser/Hls adapters are synthetic;
 actual pinned hls.js, Safari controls and decoder recovery remain browser
 qualification checks. Source changes do not update an already deployed fixture.
