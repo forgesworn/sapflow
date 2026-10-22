@@ -68,7 +68,9 @@ try {
     const consumer=join(staging,'consumer'),consumerSource=join(consumer,'Sources/NativeCheck');mkdirSync(consumerSource,{recursive:true});
     writeFileSync(join(consumer,'Package.swift'),`// swift-tools-version: 5.9\nimport PackageDescription\nlet package=Package(name:"NativeCheck",platforms:[.macOS(.v12)],dependencies:[.package(name:"Sapflow",path:${JSON.stringify(output)})],targets:[.executableTarget(name:"NativeCheck",dependencies:[.product(name:"Sapflow",package:"Sapflow")])])\n`);
     writeFileSync(join(consumerSource,'main.swift'),`import Sapflow\n${readFileSync(join(root,'tests/native/consumer.swift'),'utf8')}`);
-    run('swift',['run','--package-path',consumer,'--scratch-path',join(staging,'consumer-build'),'NativeCheck']);
+    // Keep scratch outside the package path's textual prefix: SwiftPM debug
+    // prefix mapping otherwise turns consumer-build into consumer/-build.
+    run('swift',['run','--package-path',consumer,'--scratch-path',join(staging,'installed-check-build'),'NativeCheck']);
     writeFileSync(join(output,'README.md'),'Sapflow Swift package. Add this directory as a local Swift package. Requires iOS 15/macOS 12; this build contains ARM64 macOS, iOS and iOS Simulator slices. Broadcaster integration and physical-device qualification remain in progress. See the bundled dependency licences and the source delivery plan.\n');
   } else {
     output=refreshOwned(join(root,'target/native-packages',packageLabel));const jar=await jnaJar();
