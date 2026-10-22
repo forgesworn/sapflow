@@ -30,6 +30,7 @@ internal class ReconnectingPublishingSink(
     private val destinationId = destinations.incrementAndGet()
     private val sequence = AtomicLong()
     private val current = AtomicReference<Current?>()
+    private val output = LogicalSocketOutput()
     private val message = AtomicReference("Destination prepared · press Start")
     private val executor = ScheduledThreadPoolExecutor(1) { Thread(it, "sapflow-reconnect") }.apply { removeOnCancelPolicy = true }
     private val stopped = CompletableFuture<Unit>()
@@ -63,6 +64,7 @@ internal class ReconnectingPublishingSink(
             val sink = factory(context, report)
             val record = Current(owner, token, context, AtomicBoolean(false), failed, sink, report)
             current.set(record)
+            output.attach(context, runCatching { (sink as? SocketOutputProvider)?.socketOutput }.getOrNull())
             object : PublishingAttempt {
                 private var closeError: Exception? = null
                 private var closed = false
@@ -81,11 +83,13 @@ internal class ReconnectingPublishingSink(
                     }
                 }
                 override fun close() {
+                    output.closing(record.context)
                     if (current.compareAndSet(record, null)) notifyObservation(record.context, false)
-                    closeError?.let { throw it }
+                    closeError?.let { output.unconfirmed(record.context); throw it }
                     if (closed) return
                     closed = true
-                    try { sink.close() } catch (error: Exception) { closeError = error; throw error }
+                    try { sink.close(); output.retired(record.context, System.nanoTime()) }
+                    catch (error: Exception) { output.unconfirmed(record.context); closeError = error; throw error }
                 }
             }
         }, ready = { epoch, token ->
@@ -142,6 +146,7 @@ internal class ReconnectingPublishingSink(
         try {
             action(); message.set(controller.status)
             if (controller.terminal) {
+                output.ended(System.nanoTime())
                 fenced.set(true); current.get()?.let { notifyObservation(it.context, false) }; alarm?.cancel(false)
                 releaseEpochDescriptors(); stopped.complete(Unit); executor.shutdown()
             } else arm()
@@ -161,6 +166,7 @@ internal class ReconnectingPublishingSink(
     }
     fun stopDestination() {
         if (!observationGate.withGate { fenced.compareAndSet(false, true) }) return
+        output.ended(System.nanoTime())
         current.get()?.let { notifyObservation(it.context, false) }
         message.set("Stopping publisher")
         try { executor.execute {
@@ -174,7 +180,8 @@ internal class ReconnectingPublishingSink(
             finally { executor.shutdown() }
         } } catch (error: Exception) { stopped.completeExceptionally(error) }
     }
-    private inner class Epoch(val id: Long) : EncodedSink {
+    private inner class Epoch(val id: Long) : EncodedSink, SocketOutputProvider {
+        override val socketOutput: SocketOutputSource get() = output
         val closed = AtomicBoolean(false)
         val codecs = AtomicReference(Codecs(null, null))
         val requestIdr = AtomicReference<(() -> Unit)?>(null)

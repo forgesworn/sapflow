@@ -11,7 +11,8 @@ import java.util.concurrent.atomic.AtomicReference
 /** One existing publishing epoch, no new worker, queue, timer or media owner.
  * Publishing failure discards subsequent publishing borrows; recording remains
  * independent. The controller owns asynchronous actual close on its usual path. */
-internal class IsolatedPublishingSink(private val delegate: EncodedSink, private val failed: (Exception) -> Unit) : EncodedSink {
+internal class IsolatedPublishingSink(private val delegate: EncodedSink, private val failed: (Exception) -> Unit) : EncodedSink, SocketOutputProvider {
+    override val socketOutput: SocketOutputSource? get() = runCatching { (delegate as? SocketOutputProvider)?.socketOutput }.getOrNull()
     private val unavailable = AtomicBoolean(false)
     private val cleanupFailure = AtomicReference<Exception?>()
     private val closure = AtomicReference<CompletableFuture<Unit>?>()

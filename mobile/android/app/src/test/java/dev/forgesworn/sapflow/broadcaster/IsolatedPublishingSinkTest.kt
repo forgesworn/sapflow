@@ -11,7 +11,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class IsolatedPublishingSinkTest {
-    private class Sink : EncodedSink {
+    private class Sink : EncodedSink, SocketOutputProvider {
+        val output = SocketOutputCounter(SocketOutputAccounting.SRT_DATAGRAM)
+        override val socketOutput: SocketOutputSource get() = output
         override val status = "Synthetic publisher"
         var starts = 0; var configures = 0; var fences = 0
         var samples = 0; var lastSample: MediaSample? = null
@@ -23,7 +25,7 @@ class IsolatedPublishingSinkTest {
         override fun configure(video: RustCodec?, audio: RustCodec?) { configures++; configureError?.let { throw it } }
         override fun consume(sample: MediaSample) { samples++; lastSample = sample; consumeError?.let { throw it } }
         override fun stopDestination() { fences++; fenceError?.let { throw it } }
-        override fun close() { closes.incrementAndGet(); entered?.countDown(); release?.let { check(it.await(2, TimeUnit.SECONDS)) }; closeError?.let { throw it } }
+        override fun close() { closes.incrementAndGet(); entered?.countDown(); release?.let { check(it.await(2, TimeUnit.SECONDS)) }; closeError?.let { throw it }; output.seal() }
     }
 
     @Test fun publishingStartupFailureDoesNotPreventRecorderCreationOrMediaAdmission() {
@@ -72,6 +74,18 @@ class IsolatedPublishingSinkTest {
         assertEquals(1, reports); assertEquals(1, publisher.configures); assertEquals(0, publisher.starts)
         assertEquals(1, publisher.fences)
         isolated.close()
+    }
+
+    @Test fun isolatedFailureKeepsTheSameColdCounterWithoutTurningCloseIntoDeliveryProof() {
+        val publisher = Sink().apply { startError = IllegalStateException("synthetic startup") }
+        val isolated = IsolatedPublishingSink(publisher) {}
+        assertSame(publisher.output, isolated.socketOutput)
+        publisher.output.completed(16); isolated.start()
+        assertSame(publisher.output, isolated.socketOutput)
+        assertEquals(16L, isolated.socketOutput!!.socketSnapshot(1).completedBytes)
+        publisher.closeError = IllegalStateException("synthetic retained owner")
+        assertThrows(IllegalStateException::class.java) { isolated.close() }
+        assertEquals(SocketOutputPhase.ACTIVE, isolated.socketOutput!!.socketSnapshot(2).phase)
     }
 
     @Test fun actualCloseFailureRemainsStickyAcrossDuplicateCloseAndNoOpDelegate() {

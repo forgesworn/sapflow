@@ -16,11 +16,15 @@ internal class CaptureStartAdmission {
     private var preserve = false
     private var cleaned = false
     private var cleaning = false
+    private val elapsed = CaptureElapsed()
+    private var timingPreparation: Preparation? = null
     val idle: Boolean @Synchronized get() = current == null
     val preparation: Preparation? @Synchronized get() = current
+    val elapsedPreparation: Preparation? @Synchronized get() = timingPreparation
     @Synchronized fun reserve(): Preparation? {
         if (current != null || serial == Long.MAX_VALUE) return null
         return Preparation(++serial).also {
+            timingPreparation = it; elapsed.reset()
             current = it; epoch = -1; live = true; candidate = true; committed = false
             prepared = false; pending = null; preserve = false; cleaned = false; cleaning = false
         }
@@ -50,21 +54,30 @@ internal class CaptureStartAdmission {
     }
     @Synchronized fun permits(value: Start): Boolean = live && current == value.preparation && epoch == value.epoch && pending == value
     /** After recorder creation, immediately before actual media admission. */
-    @Synchronized fun commit(value: Start): Boolean {
+    @Synchronized fun commit(value: Start, nowNs: Long? = null): Boolean {
         if (!permits(value)) return false
+        elapsed.commit(nowNs ?: System.nanoTime())
         pending = null; committed = true; return true
     }
     /** End retires only the first pending run, preserving recording rotations. */
-    @Synchronized fun cancelInitial(value: Preparation): Boolean {
-        if (current != value || committed) return false
+    @Synchronized fun cancelInitial(value: Preparation, nowNs: Long? = null): Boolean {
+        if (current != value) return false
+        elapsed.end(nowNs ?: System.nanoTime())
+        if (committed) return false
         live = false; prepared = false; pending = null; preserve = false
         return true
     }
-    @Synchronized fun stop(): Preparation? {
+    @Synchronized fun stop(nowNs: Long? = null): Preparation? {
+        elapsed.stop(nowNs ?: System.nanoTime())
         live = false; prepared = false; pending = null; preserve = false
         return current
     }
     @Synchronized fun owns(value: Preparation): Boolean = current == value
+    @Synchronized fun freezeElapsed(nowNs: Long? = null) = elapsed.stop(nowNs ?: System.nanoTime())
+    @Synchronized fun elapsed(value: Preparation?, nowNs: Long?, publisherAttached: Boolean, destinationEndNs: Long?): CaptureElapsedSnapshot {
+        if (value !== timingPreparation) return CaptureElapsedSnapshot(null, null, true)
+        return elapsed.snapshot(nowNs ?: System.nanoTime(), publisherAttached, destinationEndNs)
+    }
     @Synchronized fun beginCleanup(value: Preparation, rotate: Boolean) {
         if (current != value) return
         preserve = rotate && live

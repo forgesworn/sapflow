@@ -30,7 +30,9 @@ import kotlin.concurrent.withLock
  * destination hostname; there is no trust override or plaintext fallback.
  * Failed attempts stop sending while independent capture/recording can continue. */
 internal class RtmpPublishingSink(private val destination: RtmpDestination, streamKey: String,
-    private val events: (PublishingAttemptEvent) -> Unit = {}) : EncodedSink {
+    private val events: (PublishingAttemptEvent) -> Unit = {}) : EncodedSink, SocketOutputProvider {
+    private val outputCounter = SocketOutputCounter(if (destination.tls) SocketOutputAccounting.RTMPS_APPLICATION else SocketOutputAccounting.RTMP_APPLICATION)
+    override val socketOutput: SocketOutputSource get() = outputCounter
     private val message = AtomicReference("Destination prepared · press Start to connect")
     override val status: String get() = message.get()
     private val closed = AtomicBoolean(false)
@@ -217,7 +219,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         val transport = socket.get() ?: error("Transport unavailable")
         val deadline = timers.schedule(Runnable { abortTransport() }, 2, TimeUnit.SECONDS)
         val writeStartedNs = System.nanoTime()
-        try { transport.getOutputStream().write(output) }
+        try { outputCounter.write(output.size) { transport.getOutputStream().write(output); output.size } }
         finally { writeDelay.record(System.nanoTime() - writeStartedNs); deadline.cancel(false) }
     }
 
@@ -290,6 +292,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         val released = releasePublisher()
         preparedKey = ""
         check(reader?.isAlive != true && released) { "RTMP worker cleanup exceeded its deadline" }
+        outputCounter.seal()
         message.set("RTMP attempt stopped")
     }
 

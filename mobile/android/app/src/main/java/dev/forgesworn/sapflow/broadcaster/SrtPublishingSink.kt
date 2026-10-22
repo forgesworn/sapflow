@@ -29,7 +29,9 @@ internal class SrtPublishingSink(
     private val plaintext: Boolean,
     private val events: (PublishingAttemptEvent) -> Unit = {},
     private val pacingBytesPerSecond: ULong = 1_250_000uL,
-) : EncodedSink {
+) : EncodedSink, SocketOutputProvider {
+    private val outputCounter = SocketOutputCounter(SocketOutputAccounting.SRT_DATAGRAM)
+    override val socketOutput: SocketOutputSource get() = outputCounter
     private data class Codecs(val video: RustCodec?, val audio: RustCodec?)
     private val codecs = AtomicReference(Codecs(null, null))
     private val secret = AtomicReference(if (plaintext) null else passphrase.toByteArray(Charsets.UTF_8))
@@ -152,7 +154,7 @@ internal class SrtPublishingSink(
                             error("SRT UDP write deadline exceeded")
                         }
                         val size = datagram.remaining()
-                        val sent = try { socket.write(datagram) } catch (error: Exception) {
+                        val sent = try { outputCounter.write(size) { socket.write(datagram) } } catch (error: Exception) {
                             publisher.socketSendFailed(nowUs().toULong()); throw error
                         }
                         if (sent == 0) break
@@ -210,12 +212,13 @@ internal class SrtPublishingSink(
             shutdownResult.set(shutdown.finish(::nowUs,
                 stopNative = { native?.stop(nowUs().toULong()) },
                 takeControl = { native?.pollDatagram(nowUs().toULong())?.bytes },
-                write = { bytes -> channel.get()?.write(bytes) ?: 0 }))
+                write = { bytes -> outputCounter.write(bytes.remaining()) { channel.get()?.write(bytes) ?: 0 } }))
             runCatching { native?.close() }
             secret.getAndSet(null)?.fill(0)
             runCatching { channel.getAndSet(null)?.close() }
             runCatching { selector.getAndSet(null)?.close() }
             timers.shutdownNow()
+            outputCounter.seal() // This sole writer has completed, including shutdown.
         }
     }
 
@@ -253,6 +256,7 @@ internal class SrtPublishingSink(
             if (running == null) {
                 shutdown.abort()
                 offered.cancel()
+                outputCounter.seal()
             } else {
                 // No early interrupt: interrupting an interruptible UDP channel
                 // can close it before its owner submits the shutdown control.

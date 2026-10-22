@@ -64,6 +64,10 @@ data class CaptureSnapshot(
     val audioDiagnostics: String,
     val cleanupDiagnostics: String,
     val canPrepare: Boolean,
+    val captureElapsedMs: Long? = null,
+    val broadcastElapsedMs: Long? = null,
+    val timingUncertain: Boolean = false,
+    val socketOutput: SocketOutputView = SocketOutputView.empty(),
 )
 
 /** Native surfaces carry raw video. PCM stays in AudioRecord/MediaCodec input.
@@ -192,16 +196,30 @@ class CaptureController(private val context: Context) {
      * owned workers, with one in-flight immutable handle each. */
     private var publishingSink: EncodedSink? = null
     @Volatile private var publishingSession: EncodedSink? = null
+    private data class TelemetryDestination(val preparation: CaptureStartAdmission.Preparation, val source: SocketOutputSource?, val attached: Boolean)
+    @Volatile private var telemetryDestination: TelemetryDestination? = null
+    private val socketSampler = SocketOutputSampler()
     private var lastTransportSyncNs = Long.MIN_VALUE
     private var recordingSink: EncodedSink? = null
 
-    fun snapshot() = CaptureSnapshot(stage, message, videoEncoderName, audioEncoderName,
+    fun snapshot(): CaptureSnapshot {
+        val now = System.nanoTime()
+        val ticket = startAdmission.elapsedPreparation
+        val destination = telemetryDestination?.takeIf { it.preparation === ticket }
+        val sampled = socketSampler.sample(now, ticket, destination?.source, destination?.attached == true)
+        val elapsed = startAdmission.elapsed(ticket, null, destination?.attached == true, socketSampler.destinationEnd())
+        val socket = if (startAdmission.elapsedPreparation !== ticket) SocketOutputView.empty().copy(availability = SocketOutputAvailability.UNKNOWN, incomplete = true)
+        else if (elapsed.broadcastEnded && destination?.attached == true) sampled.copy(bitsPerSecond = null,
+            availability = SocketOutputAvailability.UNKNOWN, ended = true) else sampled
+        return CaptureSnapshot(stage, message, videoEncoderName, audioEncoderName,
         acceptedVideo.get(), acceptedAudio.get(), drops.get(), videoRejects.get(), audioPrimingRejects.get(), waitingKeyframeRejects.get(), queueRejects.get(), audioLevel, videoCaptureAgeMs,
         if (stage in listOf(CaptureStage.PREPARING, CaptureStage.PREPARED, CaptureStage.CAPTURING)) publishingSink?.status ?: publishStatus else publishStatus,
         (if (!recordingFailed && stage in listOf(CaptureStage.PREPARING, CaptureStage.PREPARED, CaptureStage.CAPTURING)) recordingSink?.status ?: recordStatus else recordStatus) + if (previousRecording.isNotEmpty()) " · Previous: ${previousRecording.take(240)}" else "",
         queueDiagnostics, "Publish drainer ${publishing?.diagnostics ?: "none"} · ${publishingSink?.diagnostics ?: ""}",
         orientationStatus, rendererStatus, audioDiagnostics + if (audioFailureDiagnostics.isNotEmpty()) " · $audioFailureDiagnostics" else "", "$cleanupPhase · $cleanupDiagnostics",
-        !prepareAdmission.pending && startAdmission.idle && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioEncoder == null && renderer == null && audioRecord == null)
+        !prepareAdmission.pending && startAdmission.idle && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioEncoder == null && renderer == null && audioRecord == null,
+            elapsed.captureMs, elapsed.broadcastMs, elapsed.uncertain, socket)
+    }
 
     internal fun prepare(previewSurface: Surface, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, profile: CaptureProfile = CaptureProfile.DEFAULT): CaptureStartAdmission.Preparation? {
         val canPrepare = snapshot().canPrepare
@@ -217,6 +235,7 @@ class CaptureController(private val context: Context) {
             preparation = ticket
             cleanupExpired = false; stopFailed = false
             publishingSession?.stopDestination(); publishingSession = null
+            telemetryDestination = TelemetryDestination(ticket, null, false)
             captureProfile = requestedProfile // Retained through every orientation restart.
             publishFactory = publisher
             recordFactory = recorder
@@ -262,7 +281,10 @@ class CaptureController(private val context: Context) {
                 }
             } } }
             publishingSink = isolated
-            if (publishingSession == null) publishingSession = publishingSink
+            if (publishingSession == null) {
+                publishingSession = publishingSink
+                telemetryDestination = TelemetryDestination(intent, (publishingSink as? SocketOutputProvider)?.socketOutput, publishingSink != null)
+            }
             val publishingEpoch = generation
             publishingSink?.setKeyframeRequester { handler.post {
                 val now = System.nanoTime()
@@ -1015,6 +1037,7 @@ class CaptureController(private val context: Context) {
     }
 
     private fun markFailure(code: CaptureLifecycleDiagnostics.Code, reason: String, cleanupTimedOut: Boolean = false) {
+        startAdmission.freezeElapsed()
         stopFailed = true
         cleanupExpired = cleanupExpired || cleanupTimedOut
         autoStart = false

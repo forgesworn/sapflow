@@ -157,4 +157,38 @@ class CaptureStartAdmissionTest {
         r.gate.beginCleanup(stopped, false); r.gate.cleanup(stopped, true)
         assertTrue(r.gate.permits(next)); assertTrue(r.gate.commit(next))
     }
+
+    @Test fun clockCommitEndAndStopShareTheActualAdmissionLinearisation() {
+        val r = Run(); val first = r.start(); val second = 1_000_000_000L
+        assertTrue(r.gate.commit(first, second))
+        assertFalse(r.gate.cancelInitial(r.preparation, 4 * second)) // End preserves an admitted recording.
+        r.gate.beginCleanup(r.preparation, true); r.gate.cleanup(r.preparation, true)
+        assertTrue(r.gate.beginEpoch(r.preparation, 2)); assertTrue(r.gate.prepared(r.preparation, 2))
+        assertTrue(r.gate.commit(r.start(), 8 * second))
+        val running = r.gate.elapsed(r.preparation, 10 * second, true, null)
+        assertEquals(9_000L, running.captureMs); assertEquals(3_000L, running.broadcastMs)
+        r.gate.stop(11 * second)
+        val stopped = r.gate.elapsed(r.preparation, 20 * second, true, null)
+        assertEquals(10_000L, stopped.captureMs); assertEquals(3_000L, stopped.broadcastMs)
+        assertNull(r.gate.reserve()) // Timing freeze is not actual resource cleanup.
+    }
+
+    @Test fun stopOrEndWinningBeforeCommitCannotBeResurrectedByALateClockStart() {
+        val r = Run(); val queued = r.start()
+        assertTrue(r.gate.cancelInitial(r.preparation, 10))
+        assertFalse(r.gate.commit(queued, 20))
+        assertNull(r.gate.elapsed(r.preparation, 30, true, null).captureMs)
+        assertNull(r.gate.elapsed(r.preparation, 30, true, null).broadcastMs)
+    }
+
+    @Test fun staleTimingReadAndEndCannotFreezeSuccessorAndFinalElapsedSurvivesCleanup() {
+        val r = Run(); assertTrue(r.gate.commit(r.start(), 1_000_000))
+        r.gate.stop(3_000_000); r.gate.beginCleanup(r.preparation, false); r.gate.cleanup(r.preparation, true)
+        assertEquals(2L, r.gate.elapsed(r.preparation, 4_000_000, true, null).captureMs)
+        val next = checkNotNull(r.gate.reserve()); assertTrue(r.gate.claim(next)); assertTrue(r.gate.beginEpoch(next, 2)); assertTrue(r.gate.prepared(next, 2))
+        assertTrue(r.gate.commit(checkNotNull(r.gate.start(next)), 10_000_000))
+        assertFalse(r.gate.cancelInitial(r.preparation, 11_000_000))
+        assertTrue(r.gate.elapsed(r.preparation, 12_000_000, true, 1).uncertain)
+        assertEquals(2L, r.gate.elapsed(next, 12_000_000, true, null).broadcastMs)
+    }
 }

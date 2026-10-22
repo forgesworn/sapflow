@@ -37,7 +37,9 @@ class ReconnectingPublishingSinkTest {
         override fun tick(nowNs: Long) = if (deadlineNs?.let { nowNs >= it } == true) ReconnectAction.Expired else ReconnectAction.None
         override fun stop() { stops.incrementAndGet() }
     }
-    private class Sink(val events: (PublishingAttemptEvent) -> Unit) : EncodedSink {
+    private class Sink(val events: (PublishingAttemptEvent) -> Unit) : EncodedSink, SocketOutputProvider {
+        val output = SocketOutputCounter(SocketOutputAccounting.SRT_DATAGRAM)
+        override val socketOutput: SocketOutputSource get() = output
         val started = CountDownLatch(1)
         val controlThread = java.util.concurrent.atomic.AtomicReference<Thread?>()
         val closing = CountDownLatch(1)
@@ -58,6 +60,7 @@ class ReconnectingPublishingSinkTest {
             closing.countDown()
             releaseClose?.let { check(it.await(2, TimeUnit.SECONDS)) { "bounded synthetic close" } }
             if (failClose) error("synthetic retained owner")
+            output.seal()
             closed.countDown()
         }
     }
@@ -87,6 +90,34 @@ class ReconnectingPublishingSinkTest {
         assertEquals(1, h.sinks.size)
         assertEquals(1, h.policy.stops.get())
         assertNull(h.owner.observationScope)
+    }
+    @Test fun logicalSocketBytesSurviveActualEpochCloseAndOldCounterCannotCountTwice() {
+        val h = Harness(); val a = h.owner.newEpoch(); a.start(); val first = h.sink(0)
+        val source = checkNotNull((a as SocketOutputProvider).socketOutput)
+        first.output.completed(100); a.close()
+        assertNull(source.socketSnapshot(System.nanoTime()).endedAtNs) // Codec rotation is not logical End.
+        val b = h.owner.newEpoch(); b.start(); val second = h.sink(1)
+        assertSame(source, (b as SocketOutputProvider).socketOutput)
+        second.output.completed(200); first.output.completed(100) // First real writer is sealed.
+        assertEquals(300L, source.socketSnapshot(System.nanoTime()).completedBytes)
+        b.stopDestination(); b.close()
+        val final = source.socketSnapshot(System.nanoTime())
+        assertEquals(300L, final.completedBytes); assertEquals(SocketOutputPhase.CLOSED, final.phase)
+        assertNotNull(final.endedAtNs); assertFalse(final.incomplete)
+    }
+    @Test fun blockedActualCloseRetainsClosingCounterAndUnknownCleanupNeverRetiresItAsComplete() {
+        val h = Harness(); val release = CountDownLatch(1)
+        h.configure = { it.releaseClose = release; it.failClose = true }
+        val epoch = h.owner.newEpoch(); epoch.start(); val sink = h.sink(0)
+        val source = checkNotNull((epoch as SocketOutputProvider).socketOutput)
+        sink.output.completed(100); epoch.stopDestination()
+        assertTrue(sink.closing.await(2, TimeUnit.SECONDS)); sink.output.completed(16)
+        assertEquals(116L, source.socketSnapshot(System.nanoTime()).completedBytes)
+        assertEquals(SocketOutputPhase.CLOSING, source.socketSnapshot(System.nanoTime()).phase)
+        release.countDown(); assertThrows(ExecutionException::class.java) { epoch.close() }
+        val final = source.socketSnapshot(System.nanoTime())
+        assertEquals(116L, final.completedBytes); assertTrue(final.incomplete)
+        assertEquals(1, h.sinks.size)
     }
     @Test fun failedAttemptMustFinishCleanupBeforeFreshFactoryAndEventsAreCoalesced() {
         val h = Harness(); val release = CountDownLatch(1)
