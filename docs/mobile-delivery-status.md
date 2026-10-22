@@ -5,6 +5,38 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The source also integrates upstream library publication preparation at
+`efea332`, including workspace version `0.1.0`, public Rust API documentation
+and the server Cargo package name `sapflow`. The server's directory and binary
+paths remain unchanged. Both lock files were regenerated with Cargo, preserving
+all external dependency entries and the Signet patches. Merge resolution keeps
+the feature branch's executable Rust behaviour; additive audio-only/topology
+documentation now passes the new strict documentation lint.
+
+Apple, four-ABI Android and ARM64 development media SDK packages build as
+`0.1.0` and pass their installed host ownership consumers. Android's normal
+default and SRT qualification helper derive the AAR filename from the workspace
+version; the explicit absolute override and independent app marketing version
+are retained. Earlier SDK archives remain available. The merged workspace
+passes 605 tests with four normally ignored, strict Clippy, formatting and
+locked compilation of all fuzz targets. The synthetic origin smoke passes
+SRT/RTMP, independent HLS decoding, reconnect with one recording and encrypted
+passphrase acceptance/refusal. Finite compilation and generated loopback checks
+remain separate from long fuzzing, physical shows and publication. No crate,
+app or branch has been published by this integration. Receipts remain under
+`target/mobile-origin-integration/v2/`.
+
+Against those rebuilt media packages, all three unsigned iOS app configurations
+and the actual Debug unit-test bundle compile with compiler warnings as errors;
+the 47-test packaged creator-owner regression passes. Android Debug and
+Qualification each pass 419 tests in 55 suites with no failures, errors or
+skips. All three APK assemblies, Qualification/Release lint and isolation,
+actual ARM64 native equality and 16 KiB ZIP/ELF checks pass. Lint retains 14/13
+warnings and zero errors. Required-reason iOS privacy resources and the bundled manual
+profile corpus are verified in the actual products. The separate reviewed
+SignetAuth package is retained. No phone capture was interrupted. This integration
+did not install an app, execute the iOS unit bundle or exercise a live service.
+
 The source now adds [pre-Prepare orientation selection](capture-orientation.md)
 on both apps: Automatic remains the default, with fixed Portrait and landscape
 mounting choices. The exact preparation retains fixed geometry through

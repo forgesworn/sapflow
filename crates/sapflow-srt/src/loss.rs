@@ -24,15 +24,26 @@ const MIN_INTERVAL: i64 = 10_000;
 /// ...or this near the deadline.
 const MIN_FAST_INTERVAL: i64 = 2_500;
 
+/// A run of lost sequence numbers, `first..=last`, and the state of asking
+/// for it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Loss {
+    /// First lost sequence number.
     pub first: Seq,
+    /// Last lost sequence number, inclusive.
     pub last: Seq,
     /// When the packet that revealed the loss is to be delivered: the lost
     /// ones are due no later (microseconds, the listener's clock).
     pub deadline: i64,
+    /// When the range was last asked for (microseconds, the listener's
+    /// clock).
     pub last_request: i64,
+    /// How many times the range has been asked for, the first report
+    /// included.
     pub requests: u32,
+    /// How many requests were made within three round trips of the deadline,
+    /// counted up to [`MAX_FAST_REQUESTS`]; after that the ordinary interval
+    /// applies.
     pub fast_requests: u32,
 }
 
@@ -41,7 +52,10 @@ pub struct Loss {
 /// microseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
+    /// The round-trip time, in microseconds.
     pub rtt: i64,
+    /// How long to wait after a request before asking again, in microseconds;
+    /// used as at least `rtt`.
     pub retry: i64,
 }
 
@@ -52,6 +66,8 @@ impl Timing {
     }
 }
 
+/// The losses to ask for: sorted, non-overlapping ranges, at most
+/// [`MAX_RANGES`].
 #[derive(Debug, Default, Clone)]
 pub struct LossList {
     /// Sorted, not overlapping.
@@ -59,14 +75,18 @@ pub struct LossList {
 }
 
 impl LossList {
+    /// An empty list.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Whether nothing is missing.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Number of ranges on the list; [`count`](Self::count) gives the number
+    /// of sequence numbers.
     pub fn ranges(&self) -> usize {
         self.entries.len()
     }
@@ -79,10 +99,12 @@ impl LossList {
             .sum()
     }
 
+    /// Whether `s` is a missing sequence number on the list.
     pub fn contains(&self, s: Seq) -> bool {
         self.entries.iter().any(|e| e.first <= s && s <= e.last)
     }
 
+    /// The earliest missing sequence number, if any.
     pub fn first(&self) -> Option<Seq> {
         self.entries.first().map(|e| e.first)
     }
@@ -184,6 +206,7 @@ impl LossList {
         self.entries = kept;
     }
 
+    /// Forgets every loss.
     pub fn clear(&mut self) {
         self.entries.clear();
     }

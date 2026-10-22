@@ -258,7 +258,7 @@ for bin in ffmpeg ffprobe srt-live-transmit; do
   command -v "$bin" > /dev/null || { echo "missing $bin" >&2; exit 1; }
 done
 if [ -z "${SAPFLOW_BIN:-}" ] || [ -z "${PROXY_BIN:-}" ]; then
-  (cd "$ROOT" && cargo build --release -q -p sapflow-server -p sapflow-bench)
+  (cd "$ROOT" && cargo build --release -q -p sapflow -p sapflow-bench)
 fi
 SAPFLOW_BIN=${SAPFLOW_BIN:-$ROOT/target/release/sapflow}
 PROXY_BIN=${PROXY_BIN:-$ROOT/target/release/srt-loss-proxy}

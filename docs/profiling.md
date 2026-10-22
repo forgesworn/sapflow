@@ -44,7 +44,7 @@ they are two separate runs.
 
 ## Method
 
-- **Build:** `cargo build --profile profiling -p sapflow-server -p sapflow-bench`.
+- **Build:** `cargo build --profile profiling -p sapflow -p sapflow-bench`.
   The `profiling` profile inherits `release` (thin LTO, one codegen unit,
   `panic = "unwind"`) and keeps symbols with line tables.
 - **Machine:** Apple silicon, 8 cores, macOS 14. Server, encoder, load

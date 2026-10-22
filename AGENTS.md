@@ -16,7 +16,7 @@ iOS rules and the mediamtx/gohlslib source they came from.
 | `sapflow-srt` | Our own live SRT listener/receiver and caller/sender, sans-IO, using maintained cryptographic primitives. Written from the specification and wire observation only: never read or copy srt-rs (`srt-protocol`, `srt-tokio`) or libsrt source; run them only as black boxes. |
 | `sapflow-client` | Runtime-free native compressed-media validation, bounded queues, session policy and MPEG-TS writing. No camera, codec, network, file or billing runtime. |
 | `sapflow-ffi` | Typed Swift/Kotlin boundary for shared compressed samples and protocol/session state; platform adapters own sockets, TLS and native codecs. |
-| `sapflow-server` | The `sapflow` binary: ingest, HTTP, callbacks, recording. |
+| `sapflow` (`crates/sapflow-server`) | The `sapflow` binary: ingest, HTTP, callbacks, recording. |
 
 ## Run and test
 

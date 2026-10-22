@@ -28,9 +28,12 @@ use zeroize::Zeroizing;
 const MAX_PERIOD: u32 = 1 << 25;
 const KM_RETRY_US: i64 = 100_000;
 
+/// AES key length: the two sizes this profile supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySize {
+    /// AES-128 (16-byte keys).
     Aes128,
+    /// AES-256 (32-byte keys).
     Aes256,
 }
 impl KeySize {
@@ -49,6 +52,7 @@ impl KeySize {
 #[derive(Clone)]
 pub struct CryptoConfig {
     secret: Arc<Zeroizing<Vec<u8>>>,
+    /// AES key length for the session.
     pub key_size: KeySize,
     /// Original packets per key, at most 2^25. Retransmissions do not count.
     pub refresh_packets: u32,
@@ -89,15 +93,29 @@ impl CryptoConfig {
     }
 }
 
+/// Why a key, key material or payload operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
+    /// The passphrase or key refresh settings are not valid.
     Config,
+    /// The system's secure random source failed.
     Random,
+    /// The key material or payload is the wrong shape or size.
     Malformed,
+    /// Well formed but outside the supported profile (for example AES-192,
+    /// GCM, a nonzero KEKI, or a key size or salt that differs from the
+    /// session's).
     Unsupported,
+    /// The key material would not unwrap with this passphrase.
     BadSecret,
+    /// Encryption was required but not supplied. This crate does not
+    /// currently return it.
     Required,
+    /// No usable key: a key slot is empty, a key has run its period or cannot
+    /// yet be replaced, or the next key was not confirmed in time.
     KeyExpired,
+    /// A key refresh that repeats or contradicts the current keys, or a
+    /// packet under a key that has already been replaced.
     Replay,
 }
 impl fmt::Display for CryptoError {

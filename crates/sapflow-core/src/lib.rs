@@ -1,7 +1,14 @@
-//! Types shared by the server and, later, the iOS and Android apps.
+//! Types and rules shared by the sapflow media server and its native clients:
+//! stream paths, publish requests and publisher credentials, the stream-health
+//! callback events, publisher limits, recording policy and file names, and the
+//! prepared publish-session authority.
 //!
-//! Keep this crate free of networking and async runtimes so it can be built
-//! for phones (UniFFI) without dragging the server's dependencies along.
+//! Everything here is pure parsing and bookkeeping. The crate has no
+//! dependencies beyond `std`, no networking, no async runtime and no
+//! filesystem access, and callers pass the time in, so it builds for iOS and
+//! Android as well as the server.
+
+#![warn(missing_docs)]
 
 pub mod limits;
 pub mod publish_session;
@@ -19,6 +26,7 @@ pub struct StreamPath {
 impl StreamPath {
     /// Parses `live/<eventId>`, where the event id is `event-` followed by
     /// lowercase letters, digits and hyphens (v4v's `^live/event-[a-z0-9-]+$`).
+    /// The event id, `event-` included, is at most 128 bytes.
     pub fn parse(path: &str) -> Option<Self> {
         let event_id = path.strip_prefix(STREAM_PREFIX)?;
         let rest = event_id.strip_prefix("event-")?;
@@ -36,10 +44,12 @@ impl StreamPath {
         })
     }
 
+    /// The event id including its `event-` prefix, such as `event-abc-123`.
     pub fn event_id(&self) -> &str {
         &self.event_id
     }
 
+    /// The full path, `live/<eventId>`.
     pub fn as_path(&self) -> String {
         format!("{STREAM_PREFIX}{}", self.event_id)
     }
@@ -63,6 +73,7 @@ pub const SRT_ATTEMPT_ATTRIBUTE: &str = "forgesworn_attempt";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionAttemptId(String);
 impl ConnectionAttemptId {
+    /// Accepts exactly 32 lowercase hexadecimal characters.
     pub fn parse(value: &str) -> Option<Self> {
         (value.len() == 32
             && value
@@ -70,6 +81,7 @@ impl ConnectionAttemptId {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
         .then(|| Self(value.to_owned()))
     }
+    /// The 32 lowercase hexadecimal characters.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -78,9 +90,15 @@ impl ConnectionAttemptId {
 /// A request to publish, as carried in an SRT stream id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRequest {
+    /// The stream to publish to.
     pub path: StreamPath,
+    /// The publisher user name from the request, if it carried one.
     pub user: Option<String>,
+    /// The publisher password from the request, if it carried one.
     pub pass: Option<String>,
+    /// The caller's correlation id, from the `forgesworn_attempt` attribute.
+    /// Only the SRT access-control form can carry one; every other form leaves
+    /// it `None`.
     pub connection_attempt_id: Option<ConnectionAttemptId>,
 }
 
@@ -202,6 +220,7 @@ impl std::fmt::Debug for Publisher {
 }
 
 impl Publisher {
+    /// Creates a publisher that accepts exactly this user name and password.
     pub fn new(user: impl Into<String>, pass: impl Into<String>) -> Self {
         Self {
             user: user.into(),
@@ -235,8 +254,11 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// This describes tracks, not playability or complete-show coverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingTracks {
+    /// The recording initialization contains audio and no video track.
     AudioOnly,
+    /// The recording initialization contains video and no audio track.
     VideoOnly,
+    /// The recording initialization contains both video and audio tracks.
     AudioVideo,
 }
 
@@ -251,10 +273,12 @@ impl RecordingTracks {
         }
     }
 
+    /// Whether the captured recording initialization contains video.
     pub fn has_video(self) -> bool {
         self != Self::AudioOnly
     }
 
+    /// Whether the captured recording initialization contains audio.
     pub fn has_audio(self) -> bool {
         self != Self::VideoOnly
     }
@@ -269,8 +293,14 @@ pub enum StreamEvent {
     Unpublish,
     /// A recording finished; `segment_path` is as the media server sees it.
     RecordSegmentComplete {
+        /// Where the finished recording file is, sent as `segmentPath`.
         segment_path: String,
+        /// Length of the recording in seconds, sent as the string
+        /// `segmentDuration`.
         duration_secs: f64,
+        /// Immutable topology captured from this recording's first init, not
+        /// inferred from the latest live stream. Legacy callback bytes omit it;
+        /// the scoped callback serializer may include it as `recordingTracks`.
         recording_tracks: RecordingTracks,
     },
     /// Measured from the encoder's media, every so often while it publishes.

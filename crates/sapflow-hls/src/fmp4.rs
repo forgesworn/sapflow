@@ -13,8 +13,11 @@ use mp4_atom::{
 
 use crate::codec::{AacConfig, H264Config};
 
+/// `track_ID` of the video track.
 pub const VIDEO_TRACK: u32 = 1;
+/// `track_ID` of the audio track.
 pub const AUDIO_TRACK: u32 = 2;
+/// Ticks per second on the video track: 90 kHz, the MPEG-TS clock.
 pub const VIDEO_TIMESCALE: u32 = 90_000;
 
 /// Sample flags (ISO/IEC 14496-12 8.8.3.1): a sync sample depends on
@@ -29,16 +32,22 @@ pub struct Sample {
     pub duration: u32,
     /// Composition offset (PTS - DTS) in the track's timescale.
     pub cts: i32,
+    /// Whether this is a sync sample (a keyframe).
     pub sync: bool,
+    /// The coded sample: length-prefixed NAL units for video, one raw AAC frame
+    /// for audio.
     pub data: Bytes,
 }
 
 /// A track's samples within one part.
 #[derive(Debug, Clone)]
 pub struct TrackRun<'a> {
+    /// The `track_ID` the samples belong to ([`VIDEO_TRACK`] or
+    /// [`AUDIO_TRACK`]).
     pub track_id: u32,
     /// Decode time of the first sample, in the track's timescale.
     pub base_time: u64,
+    /// The samples, in decode order.
     pub samples: &'a [Sample],
 }
 
@@ -332,6 +341,8 @@ pub struct FileTimeBase {
     timescale: u32,
 }
 
+/// [`rebase_part_for_file`] refused its input: it is not one of our own `moof`
+/// + `mdat` fragments, or it is too large.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidFileFragment;
 

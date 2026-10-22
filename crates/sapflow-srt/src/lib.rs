@@ -30,6 +30,7 @@
 //! caller: nothing here indexes without a bound or trusts a length, and
 //! it is fuzzed (`own_srt_packet`, `own_srt_listener`).
 
+#![warn(missing_docs)]
 #![cfg_attr(
     not(test),
     deny(

@@ -1,11 +1,16 @@
 [package]
 name = "sapflow-srt"
-description = "SRT receiver for live streams, sans-IO: datagrams and time in, datagrams, events and timers out."
+description = "SRT (Secure Reliable Transport) for live streams in pure Rust, sans-IO: listener/receiver and caller/sender, optional AES-CTR encryption, no libsrt."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["srt", "streaming", "sans-io", "live", "video"]
+categories = ["network-programming", "multimedia::video"]
 
 [lints]
 workspace = true

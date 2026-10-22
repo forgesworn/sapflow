@@ -15,6 +15,8 @@ pub struct Unwrapper {
 }
 
 impl Unwrapper {
+    /// The next point on the 64-bit timeline, from a raw 33-bit tick count.
+    /// Only the low 33 bits of `raw` are used.
     pub fn unwrap(&mut self, raw: u64) -> i64 {
         let raw = raw & (WRAP as u64 - 1);
         let value = match self.last {

@@ -474,7 +474,7 @@ close the milestone item for the wired Linux run behind Caddy.
   was needed) and would have aborted at 12.
 
 ```
-cargo build --release --target aarch64-apple-darwin -p sapflow-server -p sapflow-bench
+cargo build --release --target aarch64-apple-darwin -p sapflow -p sapflow-bench
 
 # per run: a fresh sapflow, then the publisher, then 30 s
 SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:38888 \
@@ -707,7 +707,7 @@ over twelve loaded runs each. The full tables, ranges and conditions follow.
 
 ```
 # build, in a throwaway worktree of origin/main on the M4
-cargo build --release --target aarch64-apple-darwin -p sapflow-server
+cargo build --release --target aarch64-apple-darwin -p sapflow
 cargo build --release --target aarch64-apple-darwin -p sapflow-bench
 file target/aarch64-apple-darwin/release/sapflow     # Mach-O 64-bit executable arm64
 
@@ -1082,7 +1082,7 @@ change them (see "Found on the way").
 
 ```
 # build, in a temporary worktree of origin/main on the M4
-cargo build --release --target aarch64-apple-darwin -p sapflow-server
+cargo build --release --target aarch64-apple-darwin -p sapflow
 cargo build --release --target aarch64-apple-darwin -p sapflow-bench     # includes srt-loss-proxy
 
 # A: the clip, once (a 150 s version for B); then one trial

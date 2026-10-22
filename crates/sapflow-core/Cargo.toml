@@ -1,10 +1,16 @@
 [package]
 name = "sapflow-core"
+description = "Shared types for the sapflow live media server: stream paths, limits, publish sessions and recording metadata. No networking, no async runtime."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["streaming", "live", "media-server"]
+categories = ["multimedia::video"]
 
 [lints]
 workspace = true

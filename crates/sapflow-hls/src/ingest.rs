@@ -35,6 +35,7 @@ const MAX_PENDING_PES_BYTES: usize = 16 * 1024 * 1024;
 #[path = "pes_limits_tests.rs"]
 mod pes_limits_tests;
 
+/// Why an ingest cannot carry on with the publisher's media.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestError {
     /// The program carries a video codec other than H.264.
@@ -43,9 +44,13 @@ pub enum IngestError {
     PresentationExpired,
     /// No keyframe for too long, or a segment beyond the size limit.
     SegmentTooLarge,
+    /// No supported non-empty track topology can be initialized.
     InvalidTracks,
+    /// Media contradicts this connection's explicit immutable declaration.
     TrackConflict,
+    /// The AAC configuration is unsupported or changes within the connection.
     InvalidAudio,
+    /// An AAC timestamp cannot be represented on the supported timeline.
     InvalidTimestamp,
     /// This connection has explicitly finished; resume with a new ingest.
     InputFinished,
@@ -455,6 +460,8 @@ pub struct EsIngest {
 }
 
 impl EsIngest {
+    /// An ingest with no muxer yet. Audio is expected, so the first keyframe
+    /// waits for an AAC configuration (see [`EsIngest::set_expect_audio`]).
     pub fn new(cfg: MuxerConfig) -> Self {
         Self {
             cfg,
@@ -469,7 +476,7 @@ impl EsIngest {
     }
 
     /// Carries on another connection's stream (see [`Muxer::interrupt`]).
-    /// The first keyframe decides: with the same parameter sets and audio
+    /// The first supported media decides: with the same parameter sets and audio
     /// config, its media continues the stream after a discontinuity;
     /// otherwise it starts a new initialization epoch on the retained muxer
     /// and the update says `restarted` (for recording rollover).
@@ -480,14 +487,19 @@ impl EsIngest {
         }
     }
 
+    /// The muxer, once a video keyframe or explicitly declared audio-only frame
+    /// has created one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.muxer.as_ref()
     }
 
+    /// Mutable access to the muxer after the first supported media creates it.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.muxer.as_mut()
     }
 
+    /// Removes and returns the muxer and forgets the timeline origin, for
+    /// [`EsIngest::resume`] on a later connection.
     pub fn take_muxer(&mut self) -> Option<Muxer> {
         self.origin = None;
         self.muxer.take()
@@ -495,6 +507,7 @@ impl EsIngest {
 
     /// Only an authoritative PMT or explicit RTMP declaration may select
     /// audio-only. Missing video metadata and early AAC do not imply radio.
+    /// A declaration alone creates no muxer or servable media.
     pub fn declare_tracks(
         &mut self,
         tracks: TrackSet,
@@ -510,10 +523,13 @@ impl EsIngest {
         Ok(Update::default())
     }
 
+    /// The explicitly declared topology, or `None` for legacy video-led ingest.
     pub fn declared_tracks(&self) -> Option<TrackSet> {
         self.declared
     }
 
+    /// Sets whether the first video keyframe waits for AAC configuration before
+    /// fixing the init segment. An explicit track declaration takes precedence.
     pub fn set_expect_audio(&mut self, expect: bool) {
         if self.declared.is_none() {
             self.expect_audio = expect;
@@ -540,10 +556,14 @@ impl EsIngest {
         }
     }
 
+    /// The AAC configuration, once one has been seen.
     pub fn known_audio(&self) -> Option<AacConfig> {
         self.aac
     }
 
+    /// Records the AAC configuration; only the first is kept. A muxer that has
+    /// no audio track and nothing servable yet is discarded, so the next
+    /// keyframe starts one with both tracks.
     pub fn audio_config(&mut self, config: AacConfig) {
         if self.aac.is_none() {
             if let Some(muxer) = &self.muxer
@@ -721,14 +741,20 @@ impl TsIngest {
         ts
     }
 
+    /// The muxer, mutably, once a video keyframe or declared audio-only frame
+    /// has created one.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.es.muxer_mut()
     }
 
+    /// Removes and returns the muxer, for [`TsIngest::resume`] on a later
+    /// connection.
     pub fn take_muxer(&mut self) -> Option<Muxer> {
         self.es.take_muxer()
     }
 
+    /// An ingest with no input yet. `cfg` configures the muxer created by the
+    /// first supported media after the program's topology is known.
     pub fn new(cfg: MuxerConfig) -> Self {
         let input = Arc::new(Mutex::new(Input::default()));
         let slot = SlotReader::default();
@@ -751,6 +777,8 @@ impl TsIngest {
         }
     }
 
+    /// The muxer, once a keyframe or explicitly declared audio-only frame has
+    /// created one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.es.muxer()
     }
@@ -761,6 +789,13 @@ impl TsIngest {
     }
 
     /// Feeds raw TS bytes (any alignment). `now` stamps new segments.
+    ///
+    /// Unread input is checked against 8 MiB before copying. Pending assembled
+    /// PES payload/reservation requests are limited to 8 MiB per PES and 16 MiB
+    /// in aggregate, including same-PID transient replacement. These are logical
+    /// limits, not allocator capacity or whole-process memory bounds. Exceeding
+    /// one releases pending assemblies and permanently refuses further input;
+    /// [`TsIngest::finish`] can still seal the accepted prefix with media loss.
     pub fn push(&mut self, data: &[u8], now: SystemTime) -> Result<Update, IngestError> {
         let exceeded = {
             let Ok(mut input) = self.input.lock() else {

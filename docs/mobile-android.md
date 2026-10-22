@@ -32,8 +32,10 @@ Physical document-provider and Keystore acceptance remain open.
 
 ## Build
 
-The parent native-package build must first produce
-`target/native-packages/android/sapflow-0.0.0.aar`. The app uses that AAR and
+The parent native-package build must first produce the AAR named for
+`[workspace.package].version`, currently
+`target/native-packages/android/sapflow-0.1.0.aar`. The app derives that filename
+from the workspace manifest and uses that AAR and
 JNA 5.19.1, with metadata checks enabled. Build from the repository root:
 
 ```sh

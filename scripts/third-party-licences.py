@@ -20,7 +20,7 @@ meta = json.loads(subprocess.check_output(
 pkgs = {p["id"]: p for p in meta["packages"]}
 # Walk normal dependencies from the requested distributable packages.
 nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
-requested = args.packages or ["sapflow-server"]
+requested = args.packages or ["sapflow"]
 roots = [next(p["id"] for p in meta["packages"] if p["name"] == name)
          for name in requested]
 seen, stack = set(), roots
@@ -47,7 +47,7 @@ printed = {}
 count = 0
 for i in sorted(seen, key=lambda i: (pkgs[i]["name"], pkgs[i]["version"])):
     p = pkgs[i]
-    if p["name"].startswith("sapflow-"):
+    if p["name"] == "sapflow" or p["name"].startswith("sapflow-"):
         continue
     count += 1
     d = pathlib.Path(p["manifest_path"]).parent

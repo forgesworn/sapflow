@@ -32,6 +32,7 @@ const MAX_HOLD_BEYOND_LATENCY: i64 = 1_000_000;
 /// Unanswered full ACKs remembered for RTT measurement.
 const ACKS_REMEMBERED: usize = 64;
 
+/// Per-connection receiver settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
     /// Microseconds.
@@ -40,6 +41,7 @@ pub struct Settings {
     pub buffer: usize,
     /// Close after this long with nothing received (microseconds).
     pub peer_idle: i64,
+    /// Largest data payload accepted, in bytes; larger packets are ignored.
     pub max_payload: usize,
 }
 
@@ -48,6 +50,7 @@ pub struct Settings {
 pub struct Stats {
     /// Data packets received, every copy.
     pub received: u64,
+    /// Payload bytes in those packets.
     pub received_bytes: u64,
     /// Of those, retransmissions.
     pub retransmitted: u64,
@@ -59,15 +62,22 @@ pub struct Stats {
     pub lost: u64,
     /// Missing packets skipped at their delivery time.
     pub dropped: u64,
+    /// Packets handed over in order for delivery.
     pub delivered: u64,
     /// Data packets refused for a plaintext/key mismatch or expired key.
     pub encrypted: u64,
+    /// Data packets decrypted.
     pub decrypted: u64,
+    /// Key material refresh messages refused: encryption is not in use on the
+    /// connection, or the message failed to unwrap or validate.
     pub km_rejected: u64,
+    /// NAK packets sent.
     pub naks_sent: u64,
+    /// ACK packets sent, light and full.
     pub acks_sent: u64,
 }
 
+/// Why a receiver closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
     /// The peer sent SHUTDOWN.
@@ -163,6 +173,8 @@ impl Drift {
     }
 }
 
+/// One connection's receiving side; see the module docs. Give it packets and
+/// the time, then take its control packets and deliveries.
 pub struct Receiver {
     settings: Settings,
     peer_socket: u32,
@@ -244,14 +256,17 @@ impl Receiver {
         }
     }
 
+    /// The connection's counters so far.
     pub fn stats(&self) -> Stats {
         self.stats
     }
 
+    /// The round-trip time estimate.
     pub fn rtt(&self) -> &Rtt {
         &self.rtt
     }
 
+    /// The TSBPD latency this connection delivers with, in microseconds.
     pub fn latency(&self) -> i64 {
         self.settings.latency
     }
@@ -260,14 +275,17 @@ impl Receiver {
         self.crypto = crypto;
     }
 
+    /// Why the connection closed, or `None` while it is open.
     pub fn closed(&self) -> Option<CloseReason> {
         self.closed
     }
 
+    /// Takes the next encoded control packet to send to the caller, if any.
     pub fn take_send(&mut self) -> Option<Vec<u8>> {
         self.send.pop_front()
     }
 
+    /// Takes the next payload due for delivery, in sequence order, if any.
     pub fn take_delivery(&mut self) -> Option<Vec<u8>> {
         self.deliver.pop_front()
     }
@@ -285,6 +303,9 @@ impl Receiver {
         self.last_sent = now;
     }
 
+    /// Takes a data packet that arrived at `now`: checks its encryption,
+    /// buffers it, reports any gap in a NAK, sends a light ACK after enough
+    /// packets and releases what is due.
     pub fn on_data(&mut self, now: i64, p: &DataPacket) {
         self.now = self.now.max(now);
         if self.closed.is_some() {
@@ -514,6 +535,10 @@ impl Receiver {
         self.queue(now, Control::Ack(ack));
     }
 
+    /// Takes a control packet that arrived at `now`. An ACKACK gives an RTT
+    /// sample, SHUTDOWN flushes and closes, a drop request stops asking for
+    /// those packets and a key material refresh is answered (at most one per
+    /// 100 ms). Any other control packet only shows the caller is alive.
     pub fn on_control(&mut self, now: i64, c: &Control) {
         self.now = self.now.max(now);
         if self.closed.is_some() {
@@ -574,6 +599,8 @@ impl Receiver {
         }
     }
 
+    /// Does what is due at `now`: the idle timeout, delivery of due packets,
+    /// a full ACK, NAK re-requests and a keepalive.
     pub fn on_timer(&mut self, now: i64) {
         self.now = self.now.max(now);
         if self.closed.is_some() {

@@ -8,7 +8,7 @@
 FROM rust:1.94.1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p sapflow-server \
+RUN cargo build --release --locked -p sapflow \
  && strip target/release/sapflow
 
 FROM gcr.io/distroless/cc-debian12:nonroot

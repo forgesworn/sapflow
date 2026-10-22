@@ -2,7 +2,7 @@
 
 > A small live media server in pure Rust: SRT or RTMP in (H.264 and AAC), Low-Latency HLS out, recording to fragmented MP4 and a stream-health webhook. One 3.3 MB binary, no `unsafe`, no C dependencies. Its SRT, RTMP and LL-HLS code is its own, written as sans-IO Rust libraries. A lightweight alternative to mediamtx for the single job "one encoder in, LL-HLS out". MIT.
 
-Status: experimental. Not yet run in a production show; measurements are from macOS. The crates are version 0.0.0 and not on crates.io: depend on them by git (`sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }`). Rust 1.94, edition 2024.
+Status: experimental. Not yet run in a production show; measurements are from macOS. The crates are version 0.1.0 and not on crates.io yet: depend on them by git (`sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }`). Rust 1.94, edition 2024.
 
 Measured against mediamtx 1.21.2 on one machine (medians of three runs, 250 / 750 LL-HLS viewers all fetching video): CPU 18% / 62% of a core against 60% / 155%; peak memory 69 / 216 MB against 161 / 274 MB; no failed requests in 3.55 million. Its SRT receiver asked for no more retransmissions than libsrt 1.5.7 or gosrt under 2 to 10% loss. Conditions and caveats are in docs/benchmarks.md.
 

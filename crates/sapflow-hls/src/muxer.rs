@@ -1,7 +1,7 @@
 //! The LL-HLS segmenter: samples in, parts and segments out.
 //!
-//! Follows gohlslib v2.4.0 (`muxer_segmenter.go`, `muxer_stream.go`) where
-//! it keeps Apple's rules: video leads, segments are cut on a keyframe once
+//! For video-led streams, follows gohlslib v2.4.0 (`muxer_segmenter.go`,
+//! `muxer_stream.go`) where it keeps Apple's rules: segments are cut on a keyframe once
 //! the minimum duration has passed, parts are cut on the video timeline.
 //! Each sample is held until the next one on its track arrives, which gives
 //! its duration. Unlike gohlslib, `PART-TARGET` is fixed once the first
@@ -12,6 +12,9 @@
 //! (a break): video waits for the next keyframe, output timestamps are
 //! rebased so they carry on where the last segment ended, and the next
 //! segment is marked as a discontinuity.
+//!
+//! Explicit AAC-only streams instead use complete 1024-sample frames to cut
+//! independent parts and segments on a rational audio sample clock.
 //!
 //! No I/O and no clock: the caller passes the wall-clock time for
 //! `EXT-X-PROGRAM-DATE-TIME`.
@@ -54,9 +57,14 @@ const BREAK_GAP: i64 = 90_000;
 /// stopped) is not given to the frame before it.
 const AAC_FRAME: i64 = 1024;
 
+/// Settings for a [`Muxer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxerConfig {
+    /// A segment is cut at the first keyframe after it has lasted this long,
+    /// or at a complete AAC frame boundary for audio-only. Default 1 s.
     pub segment_min: Duration,
+    /// The shortest nominal part, from which `PART-TARGET` is derived (see
+    /// [`PartTiming`]). Default 200 ms.
     pub part_min: Duration,
     /// Segments kept in the playlist, gaps included. At least 7.
     pub segment_count: usize,
@@ -75,13 +83,20 @@ impl Default for MuxerConfig {
 /// Immutable initialization identity, shared by every part of one codec epoch.
 #[derive(Debug)]
 pub struct Initialization {
+    /// Codec epoch number: 0 for the first, one more after each
+    /// reconfiguration. It names the init segment's URI.
     pub id: u64,
+    /// The init segment: `ftyp` + `moov`.
     pub data: Bytes,
 }
 
+/// One LL-HLS partial segment (`EXT-X-PART`): a `moof` + `mdat` fragment.
 #[derive(Debug)]
 pub struct Part {
+    /// The init segment of the codec epoch this part belongs to.
     pub initialization: Arc<Initialization>,
+    /// Counts parts across the whole stream, not within a segment. It names the
+    /// part's URI.
     pub id: u64,
     /// What the playlist says: never above `PART-TARGET`.
     pub duration: Duration,
@@ -90,30 +105,50 @@ pub struct Part {
     /// which case it includes the gap that left before the next frame. The
     /// spans of a segment's parts add up to the segment's duration.
     pub span: Duration,
+    /// Whether the part can be decoded independently (`INDEPENDENT=YES`): a
+    /// video keyframe or complete audio-only AAC frames.
     pub independent: bool,
+    /// The part's `moof` + `mdat` fragment.
     pub data: Bytes,
 }
 
+/// One complete segment: its parts, joined.
 #[derive(Debug)]
 pub struct Segment {
+    /// The init segment of the codec epoch this segment belongs to.
     pub initialization: Arc<Initialization>,
+    /// The media sequence number. It names the segment's URI; a stream's first
+    /// segment is [`LEADING_GAPS`].
     pub id: u64,
+    /// How long the segment lasts (`EXTINF`).
     pub duration: Duration,
+    /// Wall-clock start of the segment, as `EXT-X-PROGRAM-DATE-TIME` prints it.
     pub start: SystemTime,
     /// Follows a break (a stall, a late keyframe, a jump in time): the
     /// playlist puts `EXT-X-DISCONTINUITY` before it.
     pub discontinuity: bool,
+    /// The segment's parts, in order.
     pub parts: Vec<Arc<Part>>,
+    /// The whole segment: its parts' fragments, concatenated.
     pub data: Bytes,
 }
 
+/// One slot in the playlist window.
 #[derive(Debug, Clone)]
 pub enum Entry {
-    Gap { duration: Duration },
+    /// A placeholder for a segment that does not exist, written as
+    /// `EXT-X-GAP`. iOS needs [`LEADING_GAPS`] of them before the first real
+    /// segment.
+    Gap {
+        /// The `EXTINF` duration; the leading gaps copy the first segment's.
+        duration: Duration,
+    },
+    /// A real segment.
     Segment(Arc<Segment>),
 }
 
 impl Entry {
+    /// The entry's `EXTINF` duration.
     pub fn duration(&self) -> Duration {
         match self {
             Self::Gap { duration } => *duration,
@@ -125,7 +160,9 @@ impl Entry {
 /// What a push changed, so the caller knows whether to wake viewers.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Update {
+    /// A part was closed.
     pub part: bool,
+    /// A segment was closed.
     pub segment: bool,
     /// A reconnected encoder starts a new initialization/recording epoch.
     /// The presentation's numbering, timing targets and retained media persist.
@@ -137,10 +174,12 @@ pub struct Update {
 }
 
 impl Update {
+    /// Whether anything changed.
     pub fn any(self) -> bool {
         self.part || self.segment || self.restarted || self.media_loss
     }
 
+    /// Folds `other` in: each flag is set if it is set in either.
     pub fn merge(&mut self, other: Update) {
         self.part |= other.part;
         self.segment |= other.segment;
@@ -152,25 +191,38 @@ impl Update {
 /// The answer to a media playlist request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
+    /// Serve the playlist now.
     Ready,
+    /// Hold the request until the segment or part it names exists, or until
+    /// the stream has a first segment to serve.
     Wait,
+    /// The request cannot be met: `_HLS_part` without `_HLS_msn`, or an
+    /// `_HLS_msn` more than one segment past the one being written.
     BadRequest,
 }
 
 /// The answer to a part request.
 #[derive(Debug, Clone)]
 pub enum PartLookup {
+    /// The part, which is still in the window.
     Found(Arc<Part>),
     /// The part the preload hint points at: wait for it.
     Next,
+    /// The part is not in the window: too old, or never produced.
     Missing,
 }
 
+/// Why the muxer refused media.
 #[derive(Debug, Clone)]
 pub enum MuxError {
+    /// The open segment passed 64 MiB: no keyframe in time, or a hostile
+    /// stream.
     SegmentTooLarge,
+    /// The requested topology has no supported media tracks.
     InvalidTracks,
+    /// The AAC configuration or resulting part timing is unsupported.
     InvalidAudio,
+    /// An AAC timestamp or decode-time calculation is outside its valid range.
     Timestamp,
 }
 
@@ -243,6 +295,9 @@ struct AudioRun {
     next_sample: i64,
 }
 
+/// The segmenter for one stream: media samples in, parts and segments out, with
+/// a bounded recent window retained for playlists and HTTP. Audio-only requires
+/// the explicit checked [`Muxer::audio_only`] constructor.
 #[derive(Debug)]
 pub struct Muxer {
     cfg: MuxerConfig,
@@ -287,6 +342,9 @@ pub struct Muxer {
 }
 
 impl Muxer {
+    /// A muxer for H.264 video and optional AAC audio. The init segment (codec
+    /// epoch 0) is built here, and `segment_count` is raised to at least
+    /// [`LEADING_GAPS`].
     pub fn new(cfg: MuxerConfig, video: H264Config, audio: Option<AacConfig>) -> Self {
         let init = fmp4::init_segment(&video, audio.as_ref());
         Self::with_tracks(cfg, Some(video), audio, init)
@@ -349,10 +407,12 @@ impl Muxer {
         }
     }
 
+    /// The current video configuration, or `None` for an audio-only epoch.
     pub fn video(&self) -> Option<&H264Config> {
         self.video.as_ref()
     }
 
+    /// The non-empty track topology represented by the current initialization.
     pub fn tracks(&self) -> TrackSet {
         if self.video.is_none() {
             TrackSet::AudioOnly
@@ -363,10 +423,13 @@ impl Muxer {
         }
     }
 
+    /// The audio track's configuration in the current codec epoch, or `None`
+    /// for video only.
     pub fn audio(&self) -> Option<&AacConfig> {
         self.audio.as_ref()
     }
 
+    /// The current init segment: `ftyp` + `moov`.
     pub fn init(&self) -> &Bytes {
         &self.init.data
     }
@@ -380,6 +443,11 @@ impl Muxer {
         self.replace_tracks(Some(video), audio, init, now);
     }
 
+    /// Replaces topology at a connection boundary, preserving playlist and
+    /// decode-time identities while sealing accepted media under its old init.
+    /// Audio-only configuration and part timing are checked before mutation;
+    /// neither track may be absent simultaneously. Forward the returned update
+    /// so recorders consume the sealed old parts before a new codec epoch.
     pub fn reconfigure_tracks(
         &mut self,
         video: Option<H264Config>,
@@ -421,10 +489,14 @@ impl Muxer {
         update
     }
 
+    /// The id of the first part cut under the current init segment (zero until
+    /// the first [`Muxer::reconfigure`]).
     pub fn epoch_first_part_id(&self) -> u64 {
         self.epoch_first_part_id
     }
 
+    /// The init segment of codec epoch `id`, if it is the current one or a part
+    /// in the window still uses it.
     pub fn initialization(&self, id: u64) -> Option<&Bytes> {
         if self.init.id == id {
             return Some(&self.init.data);
@@ -435,6 +507,7 @@ impl Muxer {
             .map(|part| &part.initialization.data)
     }
 
+    /// The id of the current codec epoch.
     pub fn current_initialization_id(&self) -> u64 {
         self.init.id
     }
@@ -601,6 +674,8 @@ impl Muxer {
     /// dropped, its duration unknown): whatever video arrives next, from
     /// any clock, waits for a keyframe, is moved to carry straight on in
     /// output time, and opens a segment marked as a discontinuity.
+    /// Audio-only seals every accepted complete AAC frame, whose duration is
+    /// known, then rebases the next run after a discontinuity.
     pub fn interrupt(&mut self, now: SystemTime) -> Update {
         if self.video.is_none() {
             self.audio_run = None;
@@ -1046,14 +1121,17 @@ impl Muxer {
 
     // ---- the window, for playlists and HTTP ----
 
+    /// The playlist window, oldest first: gaps and segments.
     pub fn entries(&self) -> &VecDeque<Entry> {
         &self.entries
     }
 
+    /// `EXT-X-MEDIA-SEQUENCE`: the sequence number of the oldest entry.
     pub fn media_sequence(&self) -> u64 {
         self.media_sequence
     }
 
+    /// `EXT-X-TARGETDURATION` in seconds; 1 until the first segment fixes it.
     pub fn target_duration(&self) -> u64 {
         self.target.map_or(1, TargetDuration::secs)
     }
@@ -1079,6 +1157,7 @@ impl Muxer {
         self.next_segment.as_ref().map_or(&[], |s| &s.parts)
     }
 
+    /// The id of the part now being written, which `EXT-X-PRELOAD-HINT` names.
     pub fn next_part_id(&self) -> u64 {
         self.next_part_id
     }
@@ -1154,6 +1233,8 @@ impl Muxer {
         }
     }
 
+    /// The real segment with media sequence number `id`; `None` for a gap or a
+    /// number outside the window.
     pub fn segment(&self, id: u64) -> Option<Arc<Segment>> {
         let idx = id.checked_sub(self.media_sequence)?;
         match self.entries.get(idx as usize)? {
@@ -1162,6 +1243,7 @@ impl Muxer {
         }
     }
 
+    /// Looks up part `id`, parts of the segment still being written included.
     pub fn part(&self, id: u64) -> PartLookup {
         if id == self.next_part_id {
             return PartLookup::Next;

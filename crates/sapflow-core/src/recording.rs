@@ -28,6 +28,8 @@ impl RecordPolicy {
         }
     }
 
+    /// Whether a stream at `path` should be recorded: false when it matches a
+    /// skip pattern.
     pub fn records(&self, path: &StreamPath) -> bool {
         let p = path.as_path();
         !self.skip.iter().any(|pat| match pat.strip_suffix('*') {

@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 pub struct Seq(u32);
 
 impl Seq {
+    /// The largest sequence number, `0x7FFF_FFFF` (2^31 - 1).
     pub const MAX: u32 = 0x7FFF_FFFF;
 
     /// The low 31 bits of `v`.
@@ -18,6 +19,7 @@ impl Seq {
         Self(v & Self::MAX)
     }
 
+    /// The sequence number as a plain integer, at most [`Seq::MAX`].
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -27,10 +29,12 @@ impl Seq {
         Self::new(self.0.wrapping_add(n))
     }
 
+    /// The next sequence number, wrapping from [`Seq::MAX`] to 0.
     pub const fn next(self) -> Self {
         self.add(1)
     }
 
+    /// The previous sequence number, wrapping from 0 to [`Seq::MAX`].
     pub const fn prev(self) -> Self {
         Self::new(self.0.wrapping_sub(1))
     }
@@ -74,6 +78,8 @@ pub struct TimestampExtender {
 }
 
 impl TimestampExtender {
+    /// An extender that has seen no timestamp yet: the first one passed to
+    /// [`extend`](Self::extend) starts the count at its own value.
     pub fn new() -> Self {
         Self::default()
     }
@@ -85,6 +91,10 @@ impl TimestampExtender {
         }
     }
 
+    /// Returns `ts` as a microsecond count that does not wrap, placed nearest
+    /// the latest timestamp seen (negative for one just before the starting
+    /// timestamp). Only a timestamp ahead of the latest moves it on, so a
+    /// retransmission's older timestamp never moves the count backwards.
     pub fn extend(&mut self, ts: u32) -> i64 {
         match self.latest {
             None => {

@@ -26,6 +26,11 @@ pub struct FlvIngest {
 }
 
 impl FlvIngest {
+    /// An ingest with no muxer yet: normally the first keyframe, once its
+    /// parameter sets are known, creates one from `cfg`. Explicit audio-only
+    /// declarations instead initialize on their first AAC frame. No audio is expected until
+    /// [`FlvIngest::expect_audio`] or an AAC sequence header says there is
+    /// some.
     pub fn new(cfg: MuxerConfig) -> Self {
         let mut es = EsIngest::new(cfg);
         // Explicit metadata can announce audio before either encoder supplies
@@ -41,6 +46,8 @@ impl FlvIngest {
         }
     }
 
+    /// The muxer, once a keyframe or explicitly declared audio-only frame has
+    /// started one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.es.muxer()
     }
@@ -57,10 +64,13 @@ impl FlvIngest {
         ingest
     }
 
+    /// Mutable access to the muxer after the first supported media starts it.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.es.muxer_mut()
     }
 
+    /// Removes and returns the muxer, for [`FlvIngest::resume`] on a later
+    /// connection.
     pub fn take_muxer(&mut self) -> Option<Muxer> {
         self.es.take_muxer()
     }
@@ -71,6 +81,9 @@ impl FlvIngest {
         self.es.set_expect_audio(expect);
     }
 
+    /// Accepts the publisher's explicit immutable topology. Audio-only is never
+    /// inferred from early AAC; declaring it also checks previously seen AAC
+    /// headers for the supported canonical 1024-sample AAC-LC profile.
     pub fn declare_tracks(
         &mut self,
         tracks: TrackSet,
