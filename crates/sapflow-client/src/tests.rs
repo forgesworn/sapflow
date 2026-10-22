@@ -49,6 +49,93 @@ fn audio(n: i64) -> SharedSample {
         .expect("audio unit"),
     )
 }
+
+#[test]
+fn terminal_publishing_admission_keeps_the_accepted_prefix_and_recording() {
+    let mut fanout = SampleFanout::new(limits(1024), limits(1024), true);
+    let first = video(0, true);
+    fanout.push(first.clone(), 10).expect("first");
+    fanout.publishing().close_admission();
+    fanout.publishing().close_admission();
+    assert_eq!(
+        fanout.push(video(1, false), 11).expect("remaining branch"),
+        (EnqueueOutcome::AdmissionClosed, EnqueueOutcome::Queued)
+    );
+    let accepted = fanout.publishing().pop(12).expect("clock").expect("prefix");
+    assert!(Arc::ptr_eq(&accepted, &first));
+    assert!(fanout.publishing().pop(12).expect("clock").is_none());
+    assert!(Arc::ptr_eq(
+        &fanout.recording().pop(12).expect("clock").expect("first"),
+        &first
+    ));
+    assert!(fanout.recording().pop(12).expect("clock").is_some());
+    assert_eq!(fanout.publishing().stats().overflow_events, 0);
+    assert!(fanout.recording().recording_failure().is_none());
+    fanout.clear();
+    assert_eq!(
+        fanout
+            .push(video(2, true), 13)
+            .expect("clear is not reopen"),
+        (EnqueueOutcome::AdmissionClosed, EnqueueOutcome::Queued)
+    );
+}
+
+#[test]
+fn terminal_recording_admission_and_both_closed_keep_truthful_outcomes() {
+    let mut fanout = SampleFanout::new(limits(1024), limits(1024), false);
+    fanout.push(audio(0), 10).expect("first");
+    fanout.recording().close_admission();
+    assert_eq!(
+        fanout.push(audio(1024), 11).expect("publishing still open"),
+        (EnqueueOutcome::Queued, EnqueueOutcome::AdmissionClosed)
+    );
+    assert!(fanout.recording().pop(12).expect("clock").is_some());
+    assert!(fanout.recording().pop(12).expect("clock").is_none());
+    fanout.publishing().close_admission();
+    assert_eq!(
+        fanout.push(audio(2048), 13).expect("both terminal"),
+        (
+            EnqueueOutcome::AdmissionClosed,
+            EnqueueOutcome::AdmissionClosed
+        )
+    );
+    assert_eq!(fanout.publishing().stats().queued_samples, 2);
+    assert_eq!(fanout.recording().stats().queued_samples, 0);
+    assert_eq!(fanout.recording().stats().overflow_events, 0);
+    assert!(fanout.recording().recording_failure().is_none());
+    assert!(fanout.publishing().admission_closed());
+    assert!(fanout.recording().admission_closed());
+}
+
+#[test]
+fn terminal_branch_preserves_clock_preflight_and_normal_residence_rules() {
+    let mut fanout = SampleFanout::new(limits(1024), limits(1024), false);
+    fanout.push(audio(0), 10).expect("first");
+    fanout.publishing().close_admission();
+    let before = fanout.recording().stats();
+    assert_eq!(
+        fanout.push(audio(1024), 9),
+        Err(QueueError::ClockWentBackwards)
+    );
+    assert_eq!(fanout.recording().stats(), before);
+    let expired = 1_000_000_010; // Fixture residence limit is one second.
+    assert!(
+        fanout
+            .publishing()
+            .pop(expired)
+            .expect("residence")
+            .is_none()
+    );
+    assert!(fanout.publishing().admission_closed());
+    assert!(
+        fanout
+            .recording()
+            .pop(expired)
+            .expect("accepted recording prefix")
+            .is_some()
+    );
+    assert!(fanout.recording().recording_failure().is_some());
+}
 fn limits(bytes: usize) -> QueueLimits {
     QueueLimits::new(bytes, 64, 2_000_000_000, 1_000_000_000).expect("limits")
 }

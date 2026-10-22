@@ -89,8 +89,21 @@ fun main() {
             NativeSampleFanout(1024uL, 1024uL, 1000u, false).use { queues ->
                 val result = queues.push(sample, 0uL)
                 check(result.publishingQueued && result.recordingQueued)
+                queues.closePublishingAdmission()
+                queues.closePublishingAdmission()
+                codec.sample(payload, 1024, 1024, 1024u, 48_000u, false).use { next ->
+                    val recordingOnly = queues.push(next, 1uL)
+                    check(!recordingOnly.publishingQueued && recordingOnly.recordingQueued && !recordingOnly.recordingFailed)
+                }
                 queues.popPublishing(1uL)!!.use { check(it.len() == 3uL) }
+                check(queues.popPublishing(1uL) == null)
                 queues.popRecording(1uL)!!.use { check(it.timescale() == 48_000u) }
+                queues.popRecording(1uL)!!.use { check(it.len() == 3uL) }
+                queues.closeRecordingAdmission()
+                codec.sample(payload, 2048, 2048, 1024u, 48_000u, false).use { next ->
+                    val neither = queues.push(next, 2uL)
+                    check(!neither.publishingQueued && !neither.recordingQueued && !neither.recordingFailed)
+                }
                 queues.cancel()
                 try { queues.push(sample, 2uL); error("cancelled fanout accepted media") }
                 catch (_: BindingException.Closed) {}

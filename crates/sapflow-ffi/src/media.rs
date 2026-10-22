@@ -269,6 +269,19 @@ impl NativeSampleFanout {
             recording_failed: failed,
         })
     }
+    /// Irreversibly fence this branch's future admission without clearing its
+    /// accepted prefix or affecting recording. Successful return is a local
+    /// admission receipt, not transport completion or remote erasure.
+    pub fn close_publishing_admission(&self) -> Result<(), BindingError> {
+        self.state()?.fanout.publishing().close_admission();
+        Ok(())
+    }
+    /// Irreversibly fence future recording admission while keeping the
+    /// accepted prefix available to its actual recorder owner.
+    pub fn close_recording_admission(&self) -> Result<(), BindingError> {
+        self.state()?.fanout.recording().close_admission();
+        Ok(())
+    }
     pub fn cancel(&self) -> Result<(), BindingError> {
         let mut state = self.state()?;
         state.closed = true;
@@ -282,6 +295,72 @@ impl NativeSampleFanout {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn selective_fences_keep_prefix_identity_and_independent_admission() {
+        let codec = MediaCodec::aac(&[0x11, 0x88]).unwrap();
+        let queues = NativeSampleFanout::new(1024, 1024, 1000, false).unwrap();
+        let sample = codec.sample(&[1, 2, 3], 0, 0, 1024, 48_000, false).unwrap();
+        queues.push(sample.clone(), 0).unwrap();
+        queues.close_publishing_admission().unwrap();
+        queues.close_publishing_admission().unwrap();
+        let next = codec
+            .sample(&[4, 5], 1024, 1024, 1024, 48_000, false)
+            .unwrap();
+        let outcome = queues.push(next.clone(), 1).unwrap();
+        assert!(
+            !outcome.publishing_queued && outcome.recording_queued && !outcome.recording_failed
+        );
+        let prefix = queues.pop_publishing(2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            prefix.sample.payload(),
+            sample.sample.payload()
+        ));
+        assert!(queues.pop_publishing(2).unwrap().is_none());
+        let first_recorded = queues.pop_recording(2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            first_recorded.sample.payload(),
+            sample.sample.payload()
+        ));
+        assert!(queues.pop_recording(2).unwrap().is_some());
+        queues.close_recording_admission().unwrap();
+        let final_sample = codec.sample(&[6], 2048, 2048, 1024, 48_000, false).unwrap();
+        let closed = queues.push(final_sample, 3).unwrap();
+        assert!(!closed.publishing_queued && !closed.recording_queued && !closed.recording_failed);
+        queues.cancel().unwrap();
+        queues.close_recording_admission().unwrap();
+        let successor = NativeSampleFanout::new(1024, 1024, 1000, false).unwrap();
+        queues.close_publishing_admission().unwrap();
+        let fresh = successor.push(sample, 0).unwrap();
+        assert!(fresh.publishing_queued && fresh.recording_queued);
+    }
+
+    #[test]
+    fn fence_busy_or_invalid_media_is_not_a_successful_detach_or_clock_reset() {
+        let codec = MediaCodec::aac(&[0x11, 0x88]).unwrap();
+        let queues = NativeSampleFanout::new(1024, 1024, 1000, false).unwrap();
+        let hold = queues.state.lock().unwrap();
+        assert!(matches!(
+            queues.close_publishing_admission(),
+            Err(BindingError::Busy)
+        ));
+        drop(hold);
+        let sample = codec.sample(&[1], 0, 0, 1024, 48_000, false).unwrap();
+        assert!(queues.push(sample.clone(), 10).unwrap().publishing_queued);
+        queues.close_publishing_admission().unwrap();
+        assert!(matches!(
+            queues.push(sample.clone(), 9),
+            Err(BindingError::ClockWentBackwards)
+        ));
+        assert!(matches!(
+            queues.push(sample, 11),
+            Err(BindingError::InvalidMedia)
+        ));
+        assert_eq!(queues.stats().unwrap().recording_bytes, 1);
+        let next = codec.sample(&[2], 1024, 1024, 1024, 48_000, false).unwrap();
+        let accepted = queues.push(next, 11).unwrap();
+        assert!(!accepted.publishing_queued && accepted.recording_queued);
+    }
+
     #[test]
     fn native_fanout_shares_payload_and_cancellation_releases_it() {
         let codec = MediaCodec::aac(&[0x11, 0x90]).unwrap();

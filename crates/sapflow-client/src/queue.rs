@@ -62,6 +62,9 @@ pub enum OverflowReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueOutcome {
+    /// This branch has irreversibly stopped accepting new samples. Its
+    /// previously accepted prefix remains available under ordinary drain rules.
+    AdmissionClosed,
     Queued,
     QueuedAfterReset {
         discarded: usize,
@@ -117,6 +120,7 @@ pub struct BoundedQueue {
     last_now: Option<u64>,
     waiting_for_keyframe: bool,
     recording_failure: Option<OverflowReason>,
+    admission_closed: bool,
 }
 
 impl BoundedQueue {
@@ -129,6 +133,7 @@ impl BoundedQueue {
             last_now: None,
             waiting_for_keyframe: matches!(policy, OverflowPolicy::Publishing { has_video: true }),
             recording_failure: None,
+            admission_closed: false,
         }
     }
     pub fn stats(&self) -> QueueStats {
@@ -139,6 +144,17 @@ impl BoundedQueue {
     }
     pub fn waiting_for_keyframe(&self) -> bool {
         self.waiting_for_keyframe
+    }
+
+    /// Stop only future ingress. This is idempotent and does not clear the
+    /// accepted prefix, reset clocks or convert intentional closure to loss.
+    /// Construct a new queue to begin a new admission lifetime.
+    pub fn close_admission(&mut self) {
+        self.admission_closed = true;
+    }
+
+    pub fn admission_closed(&self) -> bool {
+        self.admission_closed
     }
 
     fn check_clock(&mut self, now_ns: u64) -> Result<(), QueueError> {
@@ -202,6 +218,10 @@ impl BoundedQueue {
         now_ns: u64,
     ) -> Result<EnqueueOutcome, QueueError> {
         self.check_clock(now_ns)?;
+        if self.admission_closed {
+            self.stats.dropped_samples = self.stats.dropped_samples.saturating_add(1);
+            return Ok(EnqueueOutcome::AdmissionClosed);
+        }
         if self.recording_failure.is_some() {
             self.stats.dropped_samples = self.stats.dropped_samples.saturating_add(1);
             return Ok(EnqueueOutcome::RecordingAlreadyFailed);
