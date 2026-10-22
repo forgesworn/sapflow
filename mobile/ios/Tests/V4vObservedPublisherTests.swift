@@ -3,8 +3,9 @@ import Sapflow
 @testable import SapflowBroadcaster
 
 // Real NativeSession/ForAttempt orchestration, with generated codec descriptors
-// and explicitly simulated transport/status/decode facts. No camera, files,
-// sockets or physical decode evidence is supplied by these fixtures.
+// and explicitly simulated transport/status/decode facts. The worker tests own
+// generated private catalogue files and real empty recorders, joined before
+// scratch removal. No camera, sockets or physical decode evidence is supplied.
 private final class PublisherBox<T>: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: T
@@ -292,44 +293,32 @@ final class V4vObservedPublisherTests: XCTestCase {
     }
     func testPublishingStartsBeforeEarliestActivatedCodecDiscovery() throws {
         let h = try PublisherHarness(); defer { h.stop() }
-        let ingress = RustEncodedIngress(); ingress.destination = h.publisher
-        let worker = IngressWorker(ingress: ingress, failure: { _ in XCTFail("Unexpected publishing failure") }, statistics: { _, _ in })
-        // Activation makes native callbacks eligible immediately. Discovering
-        // both codecs here must configure the already started logical epoch.
-        XCTAssertTrue(worker.startPublishing {
-            do {
-                try ingress.prepare(
-                    video: .h264(sps: Data([0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0, 0, 3, 0, 8, 0, 0, 3, 1, 0xe0, 0x78, 0xa1, 0x4c, 0xb0]), pps: Data([0x68, 0xef, 0xbc, 0x80])),
-                    audio: .aac(asc: Data([0x11, 0x90])))
-            } catch { XCTFail("Codec discovery failed") }
-        })
-        until { h.sinks.value.count == 1 && h.observations.value.count == 1 }
-        XCTAssertFalse(h.publisher.status.hasPrefix("Live"))
-        let closed = expectation(description: "actual epoch cleanup")
-        worker.finish { result in
-            if case .failure = result { XCTFail("Unexpected retained publisher") }
-            closed.fulfill()
+        try withIngressWorker(publisher: h.publisher, failure: { _ in XCTFail("Unexpected publishing failure") }) { worker, ingress in
+            // Activation makes native callbacks eligible immediately. Discovering
+            // both codecs here must configure the already started logical epoch.
+            XCTAssertTrue(worker.startPublishing {
+                do {
+                    try ingress.prepare(
+                        video: .h264(sps: Data([0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0, 0, 3, 0, 8, 0, 0, 3, 1, 0xe0, 0x78, 0xa1, 0x4c, 0xb0]), pps: Data([0x68, 0xef, 0xbc, 0x80])),
+                        audio: .aac(asc: Data([0x11, 0x90])))
+                } catch { XCTFail("Codec discovery failed") }
+            })
+            until { h.sinks.value.count == 1 && h.observations.value.count == 1 }
+            XCTAssertFalse(h.publisher.status.hasPrefix("Live"))
         }
-        wait(for: [closed], timeout: 1)
     }
     func testEndedPublisherStartupClosesOnlyIngressAcrossRecordingEpochs() throws {
         let h = try PublisherHarness(); defer { h.stop() }
         h.publisher.endDestination()
         for _ in 0..<2 {
-            let ingress = RustEncodedIngress(); ingress.destination = h.publisher
             let failed = expectation(description: "publishing failure reported once")
             let failures = PublisherBox(0)
-            let worker = IngressWorker(ingress: ingress, failure: { _ in failures.update { $0 += 1 }; failed.fulfill() }, statistics: { _, _ in })
-            XCTAssertFalse(worker.startPublishing())
-            XCTAssertFalse(worker.startPublishing())
-            wait(for: [failed], timeout: 1)
-            XCTAssertEqual(failures.value, 1)
-            let closed = expectation(description: "actual publisher epoch cleanup")
-            worker.finish { result in
-                if case .failure = result { XCTFail("Unexpected retained publisher") }
-                closed.fulfill()
+            try withIngressWorker(publisher: h.publisher, failure: { _ in failures.update { $0 += 1 }; failed.fulfill() }) { worker, _ in
+                XCTAssertFalse(worker.startPublishing())
+                XCTAssertFalse(worker.startPublishing())
+                wait(for: [failed], timeout: 1)
+                XCTAssertEqual(failures.value, 1)
             }
-            wait(for: [closed], timeout: 1)
         }
         h.owner.sync {}
         XCTAssertTrue(h.sinks.value.isEmpty)
@@ -349,6 +338,75 @@ final class V4vObservedPublisherTests: XCTestCase {
             transports += 1; return PublisherTransport(observe)
         }, observation: { _, _, _ in observations += 1; throw OriginObservationFailure.scope }))
         XCTAssertEqual(transports, 0); XCTAssertEqual(observations, 0)
+    }
+    /// Real cold file owners, with no compressed media offered. Even an empty
+    /// recorder must reach actual closure before catalogue/scratch retirement.
+    private func withIngressWorker(publisher: V4vObservedPublisher, failure: @escaping (Error) -> Void,
+                                   _ body: (IngressWorker, RustEncodedIngress) -> Void) throws {
+        let admission = CaptureAdmission()
+        let preparation = try XCTUnwrap(admission.reservePreparation())
+        XCTAssertTrue(admission.attached(preparation))
+        XCTAssertTrue(admission.beginPermissions(preparation))
+        XCTAssertTrue(admission.prepared(preparation))
+        let start = try XCTUnwrap(admission.reserveStart(preparation))
+        let run = try XCTUnwrap(admission.reserveMediaRun(start))
+        XCTAssertTrue(admission.commitMediaRun(run, start: start, nowNs: 0, broadcasting: true))
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("sapflow-publisher-worker-" + UUID().uuidString)
+        let recording = DispatchQueue(label: "publisher.generated-recording-test")
+        let catalogue = try recording.sync { try RecordingCatalogue(root: scratch) }
+        let receipt: RecordingCatalogue.Writer
+        do { receipt = try recording.sync { try catalogue.begin(identity: catalogue.newShow(profile: .defaultProfile).nextIdentity()) } }
+        catch {
+            try recording.sync { try catalogue.close() }
+            try FileManager.default.removeItem(at: scratch)
+            throw error
+        }
+        let recorder: CompressedRecorder
+        do { recorder = try recording.sync { try CompressedRecorder(receipt: receipt, queue: recording, onFailure: { _ in /* Empty native writer has no valid media extent. */ }) } }
+        catch {
+            receipt.cancel(); try receipt.ownersClosed(); try recording.sync { try catalogue.close() }
+            try FileManager.default.removeItem(at: scratch)
+            throw error
+        }
+        let ingress = RustEncodedIngress(); ingress.destination = publisher
+        var worker: IngressWorker?
+        defer {
+            let recorded = expectation(description: "actual empty recorder closure")
+            let published = expectation(description: "actual publisher epoch closure")
+            let recordingClosed = PublisherBox(false), publishingClosed = PublisherBox(false)
+            let recordingFinished: (CompressedRecorder.Completion) -> Void = { result in
+                recordingClosed.value = result.cleanupComplete
+                XCTAssertTrue(result.cleanupComplete)
+                XCTAssertFalse(result.finalised) // No media/file completion is invented.
+                recorded.fulfill()
+            }
+            if let worker {
+                worker.finish(recording: recordingFinished, publishing: { result in
+                    if case .failure = result { XCTFail("Unexpected retained publisher") }
+                    else { publishingClosed.value = true }
+                    published.fulfill()
+                })
+            } else {
+                recorder.finish(recordingFinished)
+                publishingClosed.value = true
+                published.fulfill() // Construction failed before publisher admission.
+            }
+            wait(for: [recorded, published], timeout: 2)
+            if recordingClosed.value && publishingClosed.value {
+                admission.mediaRunClosed(run)
+                do {
+                    try recording.sync { try catalogue.close() }
+                    XCTAssertTrue(catalogue.cleanupComplete)
+                    try FileManager.default.removeItem(at: scratch)
+                } catch { XCTFail("Generated recording cleanup could not be confirmed") }
+            } // Unknown real cleanup retains its generated evidence/owners.
+        }
+        let created = try IngressWorker(run: run, ingress: ingress, recorder: recorder, admission: admission,
+            boundary: { _ in XCTFail("Empty worker produced a media boundary") },
+            terminal: { _ = admission.sinkTerminated($0) },
+            mediaFailure: { _ in XCTFail("Unexpected empty media failure") }, failure: failure, statistics: { _, _ in })
+        worker = created
+        body(created, ingress)
     }
     private func until(_ predicate: () -> Bool, file: StaticString = #filePath, line: UInt = #line) {
         let end = Date().addingTimeInterval(2)

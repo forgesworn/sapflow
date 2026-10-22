@@ -14,7 +14,7 @@ import datetime,hashlib,json,os,shutil,signal,subprocess,sys,tempfile,uuid
 root=Path(sys.argv[1]);scratch=Path(sys.argv[2]);base=root/'target/ios-audio-only-fixture'
 run=base/(datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ-')+uuid.uuid4().hex[:8]);run.mkdir(mode=0o700)
 sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
-names=['AudioRecordingTiming','AudioShowLifecycle','NativeAudioEncoder','CompressedRecorder','RecordingCatalogue','RecordingStorage','RecordingCaptureAdmission','AudioInputPolicy','CameraControlPolicy','CaptureAdmission','CaptureProfile','CaptureOrientation','PublishingTelemetry','EncodedWorkBudget','EncodedPipeline']
+names=['AudioRecordingTiming','AudioShowLifecycle','NativeAudioEncoder','CompressedRecorder','RecordingCatalogue','RecordingStorage','RecordingCaptureAdmission','AudioInputPolicy','CameraControlPolicy','CaptureAdmission','CaptureProfile','CaptureOrientation','PublishingTelemetry','EncodedWorkBudget','EncodedPipeline','QuickTimeAudioPriming','QuickTimeAudioPrimingFile','QuickTimeMovieLayout']
 sources=[root/('mobile/ios/Sources/'+name+'.swift') for name in names]
 sources += [root/'mobile/ios/Tools/AudioOnlyFixtureCheck.swift',root/'mobile/ios/check-audio-only.sh']
 package=root/'target/native-packages/apple';package_files=sorted(p for p in package.rglob('*') if p.is_file())

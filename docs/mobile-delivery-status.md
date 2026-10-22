@@ -8,8 +8,9 @@ or [native performance contract](native-performance-contract.md).
 Privacy standby is the next source packet. Its
 [contract](privacy-standby.md) requires synchronous raw-input fencing,
 independently paced replacement picture and silence, explicit Resume and
-matching recording. Its app integration remains under qualification. Cold AAC replacement needs
-per-generation timing and recording proof before native integration.
+matching recording. Its app integration remains under qualification. Cold AAC
+replacement now has per-generation timing and generated recording proof; native
+runtime composition and physical acceptance remain separate gates.
 
 The reviewed Android runtime candidate now includes a timed partial wake lease
 for the existing, explicitly authorised microphone-only background service.
@@ -27,20 +28,59 @@ and app receipts are retained under
 `target/camera-controls/android-standby-runtime-v3/` and
 `target/camera-controls/android-audio-wake-v1/`.
 
-The actual iOS encoder/recorder candidate exercises three AAC generations with
-explicit Resume, exact payload retention and independently pinned source
-markers. Mono 48 kHz and stereo 44.1 kHz input pass native timing and declared
-AAC-LC settling checks. Real converter experiments establish explicit resampling
-and EOF accounting; 27 timing tests pass with warnings as errors. Grouping the
-initial A/V AAC head preserves all 97 AAC and 63 H.264 packets, and eight short
-prefix cases retain their original media. These remain partial gates: the A/V
-MOV's independent decoded presentation disagrees with its native presentation.
-Container-header correction is still experimental; the source is not accepted
-on native decoding alone. The single-generation regression passed before the
-latest A/V tail changes and must be rerun against final source. Evidence is in
-`target/privacy-standby/ios-codec-v7-resampling/`,
-`target/ios-audio-standby-fixture/20261022T194601Z-b1c79a3a/` and
-`target/ios-audio-only-fixture/20261022T193050Z-a09efbc6/`.
+The iOS encoder/recorder candidate now passes both native and independent
+presentation checks for three AAC generations, explicit Resume, mono 48 kHz
+and stereo 44.1 kHz source input. Full A/V cases retain all 97 AAC and 63 H.264
+packets, including incomplete recording. Eight short-prefix cases retain their
+original accepted media. A delayed first audio track retains its declared 30 ms empty edit,
+exact native silence and unchanged following waveform. Closed-writer MOV
+metadata correction resolves the earlier decoder disagreement without changing
+encoded media or chunk offsets. The unchanged single-generation regression also
+passes against the current recorder. These are generated host-native checks,
+not microphone or phone acceptance. Evidence is retained under
+`target/ios-audio-standby-fixture/20261022T212016Z-5a5d2fbb/` and
+`target/ios-audio-only-fixture/20261022T205929Z-6f09bb95/`.
+
+The metadata parsers pass 20 priming and 14 layout tests with compiler warnings
+as errors, plus 203,981 coverage-guided ASan fuzz executions. The anchored cold
+file lease passes 48 recording lifecycle tests, including partial writes,
+failed syncs, ambiguous close, cancellation and file substitution. Independent
+review is clear. Evidence is retained under
+`target/privacy-standby/quicktime-priming-layout-v2/` and
+`target/privacy-standby/ios-cold-metadata-independent-review.local.json`.
+
+A generated native VT check selects an actual hardware H.264 implementation,
+retains one encoder for source-to-slate, preserves original callback tokens and
+timestamps, and verifies an actual slate IDR with unchanged SPS/PPS and canvas.
+Independent decoding verifies the procedural slate. The real ingress/recorder
+fixture also reproduces the old lost-tail Stop bug and proves corrected EOF
+ordering, independent recording completion and retained validation after End.
+These results do not qualify the continuous app driver or an iPhone. Evidence
+is retained under
+`target/ios-video-ownership-fixture/20261022T212152Z-1ee027cf/` and
+`target/privacy-standby/output-ownership-v3/`.
+
+The first iOS runtime composition was held on five review findings: stale
+failure arbitration, held Resume probes, lost route-fault receipts, off-grid
+video cutover and a premature first AAC timer slot. The second candidate repairs
+these paths and passes 241 focused tests with warnings as errors. Independent
+review is clear for the ten runtime files. Publishing confirmation requires an actual SDK
+queue admission and dequeue for the same validated sample, with independent
+recording admission. Seven generated native integration cases and two historical
+negative controls pass, including a one-byte publishing queue refusal,
+pre-IDR audio refusal followed by valid IDR recovery, and End with continued
+recording and validation. Independent review of the final source and these
+proofs is clear. Evidence is retained under
+`target/privacy-standby/ios-runtime-v2/` and
+`target/privacy-standby/output-ownership-v3/`.
+The final independent review receipt is
+`target/privacy-standby/ios-final-composition-independent-review.local.json`.
+No transport call or absent handshake substitutes for a local queue receipt.
+
+iOS background and locked-screen synthetic execution remains a release blocker:
+the timer has no proven operating-system execution anchor after capture parks.
+The paired iPhone is currently disconnected. No phone or Pixel capture was
+changed during these checks.
 
 The SDK now supports independently closing publishing or recording admission.
 Each successful close is irreversible for that fanout, preserves its accepted
@@ -63,12 +103,18 @@ qualification before selecting our app. Evidence is retained under
 `target/mobile-origin-integration/v4/`; this merge did not rebuild the earlier
 native SDK packages or qualify a phone or deployment.
 
-The current iOS recording/encoder candidate also compiles all three unsigned
-app configurations and the actual Debug test bundle with compiler warnings as
-errors. Required-reason resources verify in all three products. This is compile
-evidence only: the bundle was not executed on a phone, and the independent A/V
-presentation gate above remains failed. Receipts are retained under
-`target/privacy-standby/ios-app-current/`.
+The complete current iOS composition compiles Debug, Qualification and Release
+unsigned apps and the actual Debug device test bundle with compiler warnings
+as errors and zero warnings. Built required-reason resources and creator
+configuration verify in every app; the test bundle contains the byte-identical
+manual-profile corpus. Its two publisher worker tests now use real admission,
+an actual empty recorder and joined cleanup; 86 packaged host tests pass.
+The final 62-source iOS 16 API check also passes against the current packaged
+libraries. Evidence is retained under
+`target/privacy-standby/ios-composition-app-v2/` and
+`target/privacy-standby/ios-runtime-v2/final-context-addendum.local.json`.
+These apps are unsigned and the device test bundle was compiled, not executed
+on a phone. No app or SDK package was published.
 
 The preceding single-generation macOS AAC snapshot passes the unchanged strict
 stored-payload and presentation oracles for six recording cases. Native output

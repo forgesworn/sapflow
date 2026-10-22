@@ -13,6 +13,8 @@ final class BroadcasterModel: ObservableObject {
     @Published private(set) var selectedAudioInputID: String?
     @Published private(set) var captureProfile = CaptureIntent.defaultProfile
     @Published private(set) var continueAudioInBackground = false
+    @Published private(set) var initialStandby = false
+    @Published private(set) var privacyCover = false
     @Published private(set) var selectedCamera = CameraPosition.rear
     @Published private(set) var orientationChoice = CaptureOrientationChoice.automatic
     @Published var destinationMode = BroadcasterDestinationMode.recording {
@@ -43,7 +45,16 @@ final class BroadcasterModel: ObservableObject {
         _ = manual
         engine.onChange = { [weak self] snapshot in
             guard let self else { return }
-            self.snapshot = snapshot; self.manual.captureChanged(); self.updateCreatorActivity()
+            self.snapshot = snapshot
+            // Queued snapshots cannot uncover a newer urgent gesture or a
+            // successor. Only the exact current successful Resume may uncover.
+            if let current = self.engine.privacyState, let value = snapshot.privacy,
+               current.preparation == value.preparation, current.run == value.run,
+               current.revision == value.revision, current.phase == value.phase {
+                if current.previewHidden { self.privacyCover = true }
+                else if current.phase == .live { self.privacyCover = false }
+            }
+            self.manual.captureChanged(); self.updateCreatorActivity()
         }
         // App-lifetime ownership, independent of navigation/view disappearance.
         let centre = NotificationCenter.default
@@ -88,6 +99,18 @@ final class BroadcasterModel: ObservableObject {
     func selectBackgroundAudio(_ enabled: Bool) {
         guard canChangeCaptureProfile, engine.selectBackgroundAudio(enabled) else { return }
         continueAudioInBackground = enabled
+    }
+    func selectInitialStandby(_ enabled: Bool) {
+        guard canChangeCaptureProfile, engine.selectInitialStandby(enabled) else { return }
+        initialStandby = enabled; privacyCover = enabled
+    }
+    func standby(_ state: CaptureAdmission.PrivacyView) {
+        guard engine.standby(preparation: state.preparation) != nil else { return }
+        privacyCover = true // Original gesture, independent of native/control queues.
+    }
+    func resume(_ state: CaptureAdmission.PrivacyView) {
+        guard engine.resume(preparation: state.preparation, run: state.run, revision: state.revision) != nil else { return }
+        privacyCover = true // Keep concealed until exact native readiness commits.
     }
     func selectOrientationChoice(_ choice: CaptureOrientationChoice) {
         guard canChangeCaptureProfile, engine.selectOrientationChoice(choice) else { return }
@@ -311,6 +334,18 @@ struct BroadcasterView: View {
             }
         }
             .background(Color.black)
+            .overlay {
+                if model.privacyCover {
+                    ZStack {
+                        Color.black
+                        VStack(spacing: 10) {
+                            Image(systemName: "pause.circle.fill").font(.largeTitle)
+                            Text("Privacy standby").font(.headline)
+                            Text("Previously accepted media may still be buffered").font(.caption)
+                        }.foregroundStyle(.white).padding()
+                    }.allowsHitTesting(true).accessibilityIdentifier("capture.privacyCover")
+                }
+            }
             .overlay(alignment: .topLeading) {
                 Text(model.captureProfile.hasVideo ? "LOCAL PREVIEW" : "MICROPHONE").font(.caption.bold()).padding(8).background(.black.opacity(0.6)).foregroundStyle(.white).padding()
             }
@@ -319,6 +354,17 @@ struct BroadcasterView: View {
         guard let nanoseconds else { return "Unavailable" }
         let seconds = nanoseconds / 1_000_000_000
         return String(format: "%02llu:%02llu:%02llu", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    }
+    private func privacyText(_ value: CaptureAdmission.PrivacyView) -> String {
+        switch value.phase {
+        case .live: return "Live input selected"
+        case .armed: return "Standby selected; awaiting explicit Start"
+        case .enteringStandby: return "Standby pending; previously accepted media may still drain"
+        case .standby: return "Generated replacement accepted locally; remote buffers may contain old media"
+        case .resuming: return "Resume pending; verifying fresh native sources"
+        case .failed: return "Privacy failed; raw input remains closed. Stop and prepare again."
+        case .stopped: return "Capture stopped"
+        }
     }
     private var controls: some View {
         ScrollView {
@@ -354,6 +400,8 @@ struct BroadcasterView: View {
                 Picker("Capture mode and quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
                     ForEach(model.captureProfiles, id: \.self) { Text($0.label).tag($0) }
                 }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.quality")
+                Toggle("Start in privacy standby", isOn: Binding(get: { model.initialStandby }, set: { model.selectInitialStandby($0) }))
+                    .disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.initialStandby")
                 if model.captureProfile.hasVideo {
                     Picker("Initial camera", selection: Binding(get: { model.selectedCamera }, set: { model.selectCamera($0) })) {
                         ForEach(CameraPosition.allCases) { position in Text(position.label).tag(position) }
@@ -372,6 +420,17 @@ struct BroadcasterView: View {
                     Button("Prepare") { model.prepare() }.disabled(!model.canPrepare).accessibilityIdentifier("capture.prepare")
                     Button(model.recordingOnly ? "Start recording" : "Start broadcast") { model.start() }.disabled(!model.canStart).accessibilityIdentifier("capture.start")
                 }.buttonStyle(.borderedProminent)
+                if let privacy = model.snapshot.privacy {
+                    HStack {
+                        Button("Standby") { model.standby(privacy) }
+                            .disabled(privacy.phase == .failed || privacy.phase == .stopped)
+                            .accessibilityIdentifier("capture.standby")
+                        Button("Resume") { model.resume(privacy) }
+                            .disabled(privacy.phase != .standby)
+                            .accessibilityIdentifier("capture.resume")
+                    }.buttonStyle(.bordered)
+                    Text(privacyText(privacy)).font(.caption)
+                }
                 let stopControl = model.snapshot.stopControl
                 Button("Stop and save") { if let stopControl { model.stop(stopControl) } }
                     .buttonStyle(.bordered).disabled(stopControl == nil).accessibilityIdentifier("capture.stop")

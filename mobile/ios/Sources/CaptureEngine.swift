@@ -33,11 +33,14 @@ struct CaptureSnapshot {
     var systemRecordingControl = "Stop and save is available in Sapflow; system recording controls are unavailable on this SDK."
     var stopControl: AudioShowStopControl?
     var socketKilobitsPerSecond: Double?
+    var privacy: CaptureAdmission.PrivacyView?
 }
 
 extension CaptureEngine: V4vCreatorCapturePort {}
 
 final class CaptureRun {
+    let mediaRun: CaptureAdmission.MediaRun
+    let admission: CaptureAdmission
     let profile: CaptureIntent
     let recorder: CompressedRecorder
     let recordingTicket: RecordingCaptureAdmission.Ticket
@@ -48,19 +51,58 @@ final class CaptureRun {
     var epoch: CMTime?
     var videoTimeline = CameraVideoTimeline()
     var admitting = false
-    var startup: [(sample: CMSampleBuffer, video: Bool)] = []
+    var startup: [(sample: CMSampleBuffer, video: Bool, token: CaptureAdmission.MediaToken, audio: NativeAudioEncoder.InputToken?)] = []
     var startupBytes = 0
-    init(recorder: CompressedRecorder, recordingTicket: RecordingCaptureAdmission.Ticket, orientation: CaptureOrientation, profile: CaptureIntent, ingress: RustEncodedIngress, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
+    let audioBinding: CaptureAudioBinding
+    var privacyDriver: CapturePrivacyDriver?
+    var sourceClock: CMClock?
+    var initialPCMFormat: CapturePCMFormat?
+    var privacyRequest: CaptureAdmission.PrivacyRequest?
+    var resumeCutover: CaptureResumeCutover<(CMSampleBuffer, CaptureAdmission.MediaToken)>?
+    var mediaClock: CaptureMediaClock?
+    var audioBeganAt: CMTime?
+    var lastVideoTime: CMTime?
+    var cadence: CapturePrivacyCadence?
+    var slate: PreparedVideoSlate?
+    var firstSlate = true
+    var rawSources: [CaptureRawSource] = []
+    var retiringRawSources: [CaptureRawSource] = []
+    var failurePosted = false
+    var committedHostTime: CMTime?
+    var slateToken: CaptureAdmission.MediaToken?
+    var zeroMediaToken: CaptureAdmission.MediaToken?
+    var resumeCutoff: CMTime?
+    init(mediaRun: CaptureAdmission.MediaRun, admission: CaptureAdmission, recorder: CompressedRecorder, recordingTicket: RecordingCaptureAdmission.Ticket, orientation: CaptureOrientation, profile: CaptureIntent, ingress: RustEncodedIngress, boundary: @escaping (CaptureAdmission.MediaBoundary) -> Void, terminal: @escaping (CaptureAdmission.SinkToken) -> Void, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
+        self.mediaRun = mediaRun; self.admission = admission
         self.profile = profile
         self.recorder = recorder; self.recordingTicket = recordingTicket
-        worker = IngressWorker(ingress: ingress, failure: publishingFailure, statistics: statistics)
-        let recorder = self.recorder; let worker = self.worker
-        let output: (CompressedUnit) -> Void = { unit in recorder.offer(unit); worker.offer(unit) }
+        worker = try IngressWorker(run: mediaRun, ingress: ingress, recorder: recorder, admission: admission,
+            boundary: boundary, terminal: terminal, mediaFailure: failure, failure: publishingFailure, statistics: statistics)
+        guard let raw = admission.mediaToken(mediaRun, kind: .raw) else { throw CaptureFailure(message: "Native capture identity was retired") }
+        let worker = self.worker
+        audioBinding = CaptureAudioBinding(token: raw)
+        let binding = audioBinding
         if let camera = profile.videoProfile {
-            video = try HardwareVideoEncoder(orientation: orientation, profile: camera, output: output, failure: failure)
+            video = try HardwareVideoEncoder(orientation: orientation, profile: camera,
+                output: { unit, token in worker.offer(unit, token: token) },
+                fault: { token, error in if admission.nativeFault(token ?? raw) { failure(error) } },
+                permitsInput: { admission.allowsInput($0) == .allow })
         }
-        audio = try NativeAudioEncoder(output: output, meter: meter, recordingTiming: profile.hasVideo ? nil : { recorder.audioTiming($0) })
+        // All timing events, including generation EOF, follow the exact same
+        // worker FIFO as the original encoded units. Never bypass the worker.
+        audio = try NativeAudioEncoder(output: { unit in
+            worker.offer(unit, token: binding.token, audioGeneration: binding.encoder?.lastOutputGeneration)
+        }, meter: meter, recordingTiming: { worker.audioTiming($0) })
+        binding.encoder = audio
     }
+}
+
+/// Samples-owner binding changes only AFTER synchronous old-generation EOF and
+/// disposal. Its output closure therefore attributes every old EOF AU correctly.
+final class CaptureAudioBinding {
+    var token: CaptureAdmission.MediaToken
+    weak var encoder: NativeAudioEncoder?
+    init(token: CaptureAdmission.MediaToken) { self.token = token }
 }
 
 private final class RecordingRunStop {
@@ -124,9 +166,11 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private let ingress = RustEncodedIngress()
     private let destinationLock = NSLock()
     private var destinationFence: EncodedPublishingSink?
+    private var publishingWorkerFence: (CaptureAdmission.Preparation, CaptureAdmission.MediaRun, IngressWorker)?
     var onChange: ((CaptureSnapshot) -> Void)?
     private var lastMeterUpdate = 0.0
     private var cleanupObservation: (CaptureAdmission.Preparation, () -> Void)? // control only, one exact show
+    private var privacyTimeout: DispatchWorkItem?
 
     override init() {
         super.init()
@@ -158,6 +202,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
     var canChooseCaptureProfile: Bool { recordings != nil && admission.canChooseCaptureProfile && !recordingAdmission.hasOwner }
     var canReservePreparation: Bool { canChooseCaptureProfile }
+    var privacyState: CaptureAdmission.PrivacyView? { admission.privacyView }
     /// Root installs the same app-owned catalogue used by the library. No file
     /// work is performed here, and a second instance is never silently opened.
     func setRecordingCatalogue(_ catalogue: RecordingCatalogue, admission gate: RecordingLibraryAdmission,
@@ -254,11 +299,17 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 try self.replaceCamera(candidate, source: source, orientation: self.orientationPlan.desired, profile: profile)
             })
             guard changed else {
-                if retired { failCamera(request.owner, reason: "Camera switch was cancelled or expired after producer retirement") }
+                if retired, admission.privacyView?.desired == .standby {
+                    if let privacy = admission.privacyView?.request { beginPrivacy(privacy) }
+                }
+                else if retired { failCamera(request.owner, reason: "Camera switch was cancelled or expired after producer retirement") }
                 else { _ = admission.rejectCameraSwitch(request); refreshCameraSnapshot(); publish(); applyDeferredOrientation() }
                 return
             }
             publish()
+            if let current = samples.sync(execute: { self.run }), admission.privacyView?.phase == .live {
+                installRawDelivery(current)
+            }
             let timer = DispatchWorkItem { [weak self] in
                 guard let self, self.admission.pendingCameraSwitch == request else { return }
                 _ = self.admission.failCameraSwitch(request)
@@ -287,7 +338,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         snapshot.cameraControl = source
         snapshot.cameraPending = admission.pendingCameraSwitch != nil
         snapshot.cameraRequested = admission.pendingCameraSwitch?.position ?? admission.desiredCamera
-        snapshot.canStart = admission.currentPhase == .prepared && (source != nil || !snapshot.profile.hasVideo)
+        snapshot.canStart = admission.currentPhase == .prepared && (admission.privacyView?.desired == .standby || source != nil || !snapshot.profile.hasVideo)
         if let source, let device = cameraDevice, device.source == source {
             snapshot.cameraActive = source.position
             snapshot.cameraCapabilities = device.capabilities; snapshot.cameraValues = device.values
@@ -307,6 +358,374 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
     func selectOrientationChoice(_ choice: CaptureOrientationChoice) -> Bool {
         canChooseCaptureProfile && admission.selectOrientationChoice(choice)
+    }
+    func selectInitialStandby(_ enabled: Bool) -> Bool {
+        canChooseCaptureProfile && admission.selectInitialStandby(enabled)
+    }
+    private func observedPCMFormat() throws -> CapturePCMFormat {
+        guard let output = session.outputs.compactMap({ $0 as? AVCaptureAudioDataOutput }).first,
+              let ports = output.connection(with: .audio)?.inputPorts.filter({ $0.mediaType == .audio && $0.isEnabled }),
+              ports.count == 1, let description = ports[0].formatDescription,
+              CMFormatDescriptionGetMediaType(description) == kCMMediaType_Audio,
+              CMFormatDescriptionGetMediaType(description) == kCMMediaType_Audio else {
+            throw CaptureFailure(message: "Native microphone PCM metadata is unavailable for initial Standby; raw input remains closed")
+        }
+        // This is metadata, not proof of delivered PCM. Resume additionally
+        // requires exact equality with the first actual fresh native buffer.
+        return try CapturePCMFormat(description)
+    }
+    private func installRawDelivery(_ run: CaptureRun) {
+        guard let token = admission.mediaToken(run.mediaRun, kind: .raw) else { return }
+        let audio = CaptureRawSource(token: token, frame: { [weak self] sample, token, _ in
+            self?.processCapture(sample, isVideo: false, token: token)
+        })
+        let video: CaptureRawSource? = cameraDevice.map { device in
+            CaptureRawSource(token: token, camera: device.source, frame: { [weak self] sample, token, source in
+                guard let source else { return }; self?.cameraFrame(source, sample: sample, token: token)
+            }, drop: { [weak self] in self?.control.async { self?.snapshot.captureDrops += 1 } })
+        }
+        samples.sync {
+            guard self.run === run else { return }
+            run.retiringRawSources = run.rawSources
+            run.rawSources = [audio] + (video.map { [$0] } ?? [])
+        }
+        for output in session.outputs {
+            if let output = output as? AVCaptureAudioDataOutput { output.setSampleBufferDelegate(audio, queue: samples) }
+            else if let output = output as? AVCaptureVideoDataOutput, let video,
+                    output === cameraDevice?.output { output.setSampleBufferDelegate(video, queue: samples) }
+        }
+        // The prior delegate was disabled before replacement. This barrier
+        // joins its already queued callbacks before releasing the retained pair.
+        samples.sync { run.retiringRawSources.removeAll() }
+    }
+    private func beginPrivacy(_ request: CaptureAdmission.PrivacyRequest) {
+        guard admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) else {
+            if admission.privacyView?.phase == .failed {
+                privacyFailed(request, error: CaptureFailure(message: "Privacy operation exceeded its original deadline"))
+            }
+            return
+        }
+        if request.desired == .live { beginPrivacyResume(request); return }
+        if samples.sync(execute: { self.run?.privacyRequest == request && self.run?.privacyDriver != nil }) { publish(); return }
+        _ = admission.parkPrivacySources(request.preparation)
+        setSampleDelivery(false); cameraDevice?.pause()
+        let oldRoute = audioRoute
+        let retiringToken = samples.sync { () -> CaptureAdmission.MediaToken? in
+            guard let run = self.run, let oldRoute, run.audioRoute === oldRoute else { return nil }
+            return self.admission.mediaToken(run.mediaRun, kind: .raw)
+        }
+        let routeFailed = oldRoute.map { CapturePrivacyRouteRetirement.close($0, admission: admission, token: retiringToken) } ?? false
+        audioRoute = nil
+        if routeFailed {
+            privacyFailed(request, error: CaptureFailure(message: oldRoute?.failureDescription ?? "Microphone route failed before privacy retirement"))
+            return
+        }
+        if session.isRunning { session.stopRunning() }
+        let format = try? observedPCMFormat()
+        do {
+            try samples.sync {
+                guard let run = self.run, run.mediaRun == request.run else { return } // Armed before explicit Start.
+                guard self.admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) else {
+                    if self.admission.privacyView?.phase == .failed { throw CaptureFailure(message: "Privacy source retirement timed out") }
+                    return
+                }
+                run.retiringRawSources = run.rawSources; run.rawSources.removeAll()
+                run.resumeCutover = nil
+                run.startup.removeAll(); run.startupBytes = 0
+                run.audioRoute = nil
+                var sealedVideoEnd: CMTime?
+                if let video = run.video, let duration = try video.sealForPrivacy() {
+                    guard run.videoTimeline.beginSourceSwitch(sealedDuration: duration), let last = run.lastVideoTime else { throw CaptureFailure(message: "Privacy video boundary is unavailable") }
+                    sealedVideoEnd = CMTimeAdd(last, duration)
+                }
+                guard let native = run.audio.inputToken,
+                      let zero = self.admission.mediaToken(run.mediaRun, kind: .zero) else {
+                    throw CaptureFailure(message: "Privacy audio owner was retired")
+                }
+                let previousGeneration = run.audio.generationLedger.activeGeneration
+                let next: NativeAudioEncoder.InputToken
+                if run.audio.nextInputTime != nil { next = try run.audio.beginStandby(from: native) }
+                else {
+                    guard let actual = run.initialPCMFormat ?? format else { throw CaptureFailure(message: "Initial Standby has no verified native PCM format") }
+                    run.initialPCMFormat = actual; run.audioBeganAt = .zero
+                    next = try run.audio.beginStandby(format: actual.format, at: .zero)
+                }
+                // beginStandby synchronously emits old EOF with the old binding
+                // and disposes that converter before returning the fresh one.
+                run.audioBinding.token = zero
+                guard self.admission.zeroOwnerReady(request, generation: next.generation,
+                    retiredGeneration: previousGeneration, nowNs: DispatchTime.now().uptimeNanoseconds) else {
+                    if self.admission.privacyView?.phase == .failed { throw CaptureFailure(message: "Fresh privacy audio missed its original deadline") }
+                    return
+                }
+                if run.mediaClock == nil {
+                    let host = CMClockGetHostTimeClock()
+                    guard let epoch = run.committedHostTime else { throw CaptureFailure(message: "Committed native clock is unavailable") }
+                    run.mediaClock = try CaptureMediaClock(clock: host, epoch: epoch); run.epoch = epoch
+                }
+                guard let clock = run.mediaClock else { throw CaptureFailure(message: "Privacy media clock is unavailable") }
+                let now = try clock.now()
+                run.cadence = try CapturePrivacyCadence(nextVideoFrame: CapturePrivacyCadence.firstVideoFrame(now: now, sealedEnd: sealedVideoEnd))
+                run.privacyRequest = request; run.firstSlate = true
+                run.slateToken = self.admission.mediaToken(run.mediaRun, kind: .slate).flatMap { $0.revision == request.revision ? $0 : nil }
+                run.zeroMediaToken = zero
+                run.privacyDriver?.stop()
+                run.privacyDriver = CapturePrivacyDriver(queue: self.samples) { [weak self, weak run] in
+                    guard let self, let run else { return }; self.drivePrivacy(run)
+                }
+                run.retiringRawSources.removeAll()
+            }
+            schedulePrivacyDeadline(request); refreshCameraSnapshot(); publish()
+        } catch { privacyFailed(request, error: error) }
+    }
+    private func schedulePrivacyDeadline(_ request: CaptureAdmission.PrivacyRequest) {
+        privacyTimeout?.cancel(); privacyTimeout = nil
+        guard let deadline = request.deadlineNs else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.admission.privacyView?.request == request,
+                  self.admission.privacyView?.phase != .standby else { return }
+            if !self.admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) {
+                self.privacyFailed(request, error: CaptureFailure(message: "Privacy operation exceeded six seconds"))
+            }
+        }
+        privacyTimeout = item
+        control.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: deadline), execute: item)
+    }
+    private func privacyFailed(_ request: CaptureAdmission.PrivacyRequest, error: Error) {
+        samples.async {
+            // The exact request claims the fault at the mutation boundary, not
+            // before dispatch. An intervening Stop/new request is cancellation.
+            guard let claim = self.admission.claimPrivacyFailure(request, nowNs: DispatchTime.now().uptimeNanoseconds) else { return }
+            switch claim {
+            case let .preparation(ticket): self.stopCaptured(ticket, reason: error.localizedDescription)
+            case let .media(value):
+                guard let run = self.run, run.mediaRun == value else { return }
+                self.failMedia(run, error: error)
+            }
+        }
+    }
+    private func failMedia(_ run: CaptureRun, error: Error) {
+        if let token = admission.mediaToken(run.mediaRun, kind: .raw) { admission.nativeFault(token) }
+        run.admitting = false; run.privacyDriver?.stop()
+        run.startup.removeAll(); run.startupBytes = 0
+        run.resumeCutover = nil
+        run.recorder.markIncomplete(error)
+        guard !run.failurePosted else { return }; run.failurePosted = true
+        control.async {
+            guard self.admission.ownsPreparation(run.mediaRun.preparation) else { return }
+            self.stopOnControl(reason: error.localizedDescription)
+        }
+    }
+    private func drivePrivacy(_ run: CaptureRun) {
+        guard self.run === run, run.admitting, let request = run.privacyRequest else { run.privacyDriver?.stop(); return }
+        do {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard admission.permitsPrivacy(request, nowNs: now) else {
+                if admission.privacyView?.phase == .failed { throw CaptureFailure(message: "Privacy deadline expired while native owners were withheld") }
+                run.privacyDriver?.stop(); return // Normal supersession/Stop, never a codec failure.
+            }
+            guard let clock = run.mediaClock, var cadence = run.cadence else { throw CaptureFailure(message: "Privacy cadence is absent") }
+            let time = try clock.now()
+            let ns = CMTimeConvertScale(time, timescale: 1_000_000_000, method: .roundTowardZero).value
+            guard ns >= 0 else { throw CaptureFailure(message: "Privacy clock moved backwards") }
+            let plan = try cadence.plan(elapsedNs: UInt64(ns), video: run.profile.hasVideo && (request.desired == .standby || run.resumeCutover?.generatesSlate == true))
+            run.cadence = cadence
+            if let video = run.video, let slate = run.slate,
+               let token = run.slateToken {
+                for slot in plan.videoFrames {
+                    guard admission.allowsInput(token) == .allow else {
+                        if admission.allowsInput(token) == .failed { throw CaptureFailure(message: "Synthetic picture authority expired") }; return
+                    }
+                    let pts = CMTime(value: slot, timescale: 30)
+                    var timeline = run.videoTimeline
+                    guard timeline.accept(pts) else { throw CaptureFailure(message: "Synthetic picture violated the retained video timeline") }
+                    if try video.encode(slate, time: pts, token: token, forceIdr: run.firstSlate) {
+                        run.videoTimeline = timeline; run.firstSlate = false; run.lastVideoTime = pts
+                    }
+                }
+            }
+            if request.desired == .standby || run.resumeCutover?.generatesZero == true {
+                guard let native = run.audio.inputToken, let token = run.zeroMediaToken,
+                      let audioBeganAt = run.audioBeganAt else { throw CaptureFailure(message: "Generated audio ownership is absent") }
+                let base = CMTimeConvertScale(audioBeganAt, timescale: 48_000, method: .roundHalfAwayFromZero).value
+                let target = plan.audioFramesThrough > UInt64(max(0, base)) ? plan.audioFramesThrough - UInt64(max(0, base)) : 0
+                guard let nextInput = run.audio.nextInputTime else { throw CaptureFailure(message: "Measured privacy audio cursor is unavailable") }
+                // Native cold retirement/priming can place the next input in a
+                // future slot. Wait for the real clock, never request future PCM.
+                guard try CapturePrivacyCadence.audioTargetIsDue(framesThrough: plan.audioFramesThrough, nextInputTime: nextInput) else { return }
+                let wanted = try run.audio.standbyPlan(validFramesThrough: target, token: native)
+                guard wanted.additionalSourceFrames <= 4 * 4096 else { throw CaptureFailure(message: "Generated audio producer stalled") }
+                var remaining = wanted.additionalSourceFrames
+                while remaining > 0 {
+                    let allowed = admission.allowsInput(token)
+                    guard allowed == .allow else {
+                        if allowed == .failed { throw CaptureFailure(message: "Generated audio authority expired") }; return
+                    }
+                    let count = UInt32(min(4096, remaining))
+                    run.audioBinding.token = token
+                    try run.audio.encodeSilence(frames: count, token: native)
+                    remaining -= UInt64(count)
+                }
+            }
+        } catch { failMedia(run, error: error) }
+    }
+    private enum PrivacyCancellation: Error { case superseded }
+    private func requirePrivacy(_ request: CaptureAdmission.PrivacyRequest) throws {
+        guard admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) else {
+            if admission.privacyView?.phase == .failed { throw CaptureFailure(message: "Privacy operation missed its original deadline") }
+            throw PrivacyCancellation.superseded
+        }
+    }
+    private func beginPrivacyResume(_ request: CaptureAdmission.PrivacyRequest) {
+        do {
+            try requirePrivacy(request)
+            guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+                  !request.preparation.profile.hasVideo || AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
+                throw CaptureFailure(message: "Camera/microphone permission is unavailable for Resume")
+            }
+            destinationLock.lock(); let publisher = destinationFence; destinationLock.unlock()
+            publisher?.revalidateAuthority()
+            let nativeRun = samples.sync { self.run }
+            guard let nativeRun, nativeRun.mediaRun == request.run else { throw PrivacyCancellation.superseded }
+            let cutoff = CMClockGetTime(CMClockGetHostTimeClock())
+            try samples.sync {
+                try self.requirePrivacy(request)
+                guard let clock = nativeRun.mediaClock else { throw CaptureFailure(message: "Original Resume media clock is unavailable") }
+                nativeRun.resumeCutoff = try clock.time(cutoff, from: CMClockGetHostTimeClock())
+                nativeRun.privacyRequest = request; nativeRun.resumeCutover = CaptureResumeCutover(hasVideo: nativeRun.profile.hasVideo)
+                nativeRun.sourceClock = nil // Do not interpret a new source using the old clock.
+                nativeRun.slateToken = self.admission.mediaToken(nativeRun.mediaRun, kind: .slate)
+                nativeRun.zeroMediaToken = self.admission.mediaToken(nativeRun.mediaRun, kind: .zero)
+                // Retain the warmed zero owner; no new raw is admitted yet.
+                if let zero = nativeRun.zeroMediaToken { nativeRun.audioBinding.token = zero }
+                nativeRun.privacyDriver?.stop()
+                nativeRun.privacyDriver = CapturePrivacyDriver(queue: self.samples) { [weak self, weak nativeRun] in
+                    guard let self, let nativeRun else { return }; self.drivePrivacy(nativeRun)
+                }
+            }
+            // Replacement is already running under the new exact request while
+            // this cold native activation may block. No callback is its clock.
+            try AVAudioSession.sharedInstance().setActive(true)
+            try requirePrivacy(request)
+            if let profile = request.preparation.profile.videoProfile {
+                let candidate = try CameraDeviceControls.preflight(position: admission.desiredCamera, profile: profile)
+                try requirePrivacy(request)
+                let dimensions = profile.dimensions(for: orientationPlan.desired)
+                guard let source = admission.initialCameraSource(canvas: .init(width: Int(dimensions.width), height: Int(dimensions.height))) else { throw PrivacyCancellation.superseded }
+                try replaceCamera(candidate, source: source, orientation: orientationPlan.desired, profile: profile)
+            }
+            try requirePrivacy(request)
+            let route = try attachAudioRoute(request.preparation)
+            samples.sync { nativeRun.audioRoute = route }
+            try requirePrivacy(request)
+            installRawDelivery(nativeRun)
+            session.startRunning()
+            try requirePrivacy(request)
+            guard route.verify(), let clock = session.synchronizationClock else { throw CaptureFailure(message: "Fresh Resume route/capture clock could not be verified") }
+            samples.sync {
+                nativeRun.sourceClock = clock
+                nativeRun.resumeCutover?.sourceStarted()
+            }
+            schedulePrivacyDeadline(request); refreshCameraSnapshot(); publish()
+        } catch is PrivacyCancellation {
+            // A queued urgent Standby/Stop owns the actual subsequent teardown.
+            // Disable this candidate immediately; never classify it as a fault.
+            setSampleDelivery(false); if session.isRunning { session.stopRunning() }
+        } catch { privacyFailed(request, error: error) }
+    }
+    private func resumeProbe(_ sample: CMSampleBuffer, video: Bool, token: CaptureAdmission.MediaToken, run: CaptureRun) throws {
+        guard let request = run.privacyRequest, request.desired == .live,
+              request.revision == token.revision, request.run == token.run,
+              admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds),
+              let clock = run.mediaClock, let sourceClock = run.sourceClock else { return }
+        let time = try clock.time(CMSampleBufferGetPresentationTimeStamp(sample), from: sourceClock)
+        guard let cutoff = run.resumeCutoff, time >= cutoff else { return }
+        let videoEnd = run.lastVideoTime.map { CMTimeAdd($0, CMTime(value: 1, timescale: 30)) } ?? .zero
+        if video {
+            guard CameraFrameGeometry.read(sample) != nil else { throw CaptureFailure(message: "Fresh Resume camera geometry is invalid") }
+            _ = run.resumeCutover?.offerPicture((sample, token), pts: time, cutoff: cutoff, sealedEnd: videoEnd)
+            return // An old held PCM buffer can never commit from a video callback.
+        }
+        let count = CMSampleBufferGetNumSamples(sample)
+        let bytes = CMSampleBufferGetTotalSampleSize(sample)
+        guard count > 0, count <= 8192, bytes > 0, bytes <= 256 * 1024 else {
+            throw CaptureFailure(message: "Fresh Resume PCM exceeded its bounded native probe")
+        }
+        guard run.audioRoute?.awaitPCM() == true,
+              admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds),
+              let description = CMSampleBufferGetFormatDescription(sample),
+              let expected = run.initialPCMFormat, expected.matches(description) else {
+            if admission.privacyView?.request != request { return }
+            throw CaptureFailure(message: "Fresh microphone PCM format or pinned route differs from the warmed native owner")
+        }
+        guard let native = run.audio.inputToken, let next = run.audio.nextInputTime,
+              let decision = run.resumeCutover?.currentAudio(pts: time, cutoff: cutoff, nextInput: next, sealedVideoEnd: videoEnd) else { return }
+        let picture: (CMSampleBuffer, CaptureAdmission.MediaToken)?
+        switch decision {
+        case .wait: return
+        case let .cutover(value): picture = value
+        }
+        // This exact callback supplies the first admitted raw PCM; earlier
+        // unadmitted microphone probes were not retained or relabelled.
+        let rawAudio = (sample, token)
+        let audioTime = time
+        guard let bridge = try CaptureResumeBridge.plan(actualPTS: audioTime, nextInputTime: next,
+                                                        sourceRate: UInt32(expected.format.sampleRate)) else { return }
+        var remaining = Int64(bridge.zeroFrames)
+        while remaining > 0 {
+            guard admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) else { return }
+            let count = UInt32(min(4096, remaining))
+            try run.audio.encodeSilence(frames: count, token: native); remaining -= Int64(count)
+        }
+        if let video = run.video, let duration = try video.sealForPrivacy() {
+            guard run.videoTimeline.beginSourceSwitch(sealedDuration: duration) else { throw CaptureFailure(message: "Resume video boundary is unavailable") }
+            video.requestKeyframe()
+        }
+        guard admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) else {
+            if admission.privacyView?.phase == .failed { throw CaptureFailure(message: "Resume sealing missed its original deadline") }; return
+        }
+        // Actual raw PTS is passed unchanged. The converter independently
+        // validates it against its native next-input cursor; no source rebase.
+        let freshNative = try run.audio.resumeInput(from: native, at: audioTime)
+        switch admission.commitResume(request, nowNs: DispatchTime.now().uptimeNanoseconds) {
+        case .superseded, .stopped: return
+        case .failed: throw CaptureFailure(message: "Resume missed its original authority boundary")
+        case .allow: break
+        }
+        run.privacyDriver?.stop(); run.privacyDriver = nil
+        run.audioBinding.token = rawAudio.1
+        guard admission.allowsInput(rawAudio.1) == .allow else {
+            if admission.allowsInput(rawAudio.1) == .failed { throw CaptureFailure(message: "Resume raw authority expired") }; return
+        }
+        try run.audio.encode(rawAudio.0, time: audioTime, token: freshNative)
+        if let picture { try process(picture.0, video: true, token: picture.1, run: run) }
+        run.resumeCutover = nil; run.privacyRequest = nil
+        control.async {
+            guard self.admission.privacyView?.run == run.mediaRun,
+                  self.admission.privacyView?.revision == request.revision,
+                  self.admission.privacyView?.phase == .live else { return }
+            self.privacyTimeout?.cancel(); self.privacyTimeout = nil
+            self.publish(); self.applyDeferredOrientation()
+        }
+    }
+    /// The gesture closes raw under Admission's existing lock BEFORE posting
+    /// control/samples work. The caller immediately covers its borrowed preview.
+    @discardableResult func standby(preparation: CaptureAdmission.Preparation) -> CaptureAdmission.PrivacyView? {
+        let request = admission.requestStandby(preparation: preparation, nowNs: DispatchTime.now().uptimeNanoseconds)
+        guard let view = admission.privacyView, view.preparation == preparation else { return nil }
+        if let request { control.async { self.beginPrivacy(request) } }
+        else if view.phase == .failed {
+            samples.async {
+                guard let run = self.run, run.mediaRun.preparation == preparation else { return }
+                self.failMedia(run, error: CaptureFailure(message: "Privacy command capacity was exhausted; raw input remains closed"))
+            }
+        } else { return nil }
+        return view // Also conceals immediately on a fail-closed reservation.
+    }
+    @discardableResult func resume(preparation: CaptureAdmission.Preparation, run: CaptureAdmission.MediaRun?, revision: UInt64) -> CaptureAdmission.PrivacyView? {
+        guard let run, let request = admission.requestResume(preparation: preparation, expectedRun: run, expectedRevision: revision, nowNs: DispatchTime.now().uptimeNanoseconds) else { return nil }
+        control.async { self.beginPrivacy(request) }
+        return admission.privacyView
     }
     var backgroundContinuation: CaptureAdmission.Preparation? { admission.backgroundContinuation }
     /// Admission and the committed Start share one lock. No timer, UI snapshot
@@ -459,7 +878,15 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             self.snapshot.orientationChoice = ticket.orientationChoice
             self.snapshot.cameraRequested = ticket.initialCamera; self.snapshot.cameraActive = nil
             self.snapshot.cameraControl = nil; self.snapshot.cameraPending = false
-            destination?.observeBroadcastEnd { [weak self] instant in self?.admission.broadcastEnded(ticket, nowNs: instant) }
+            destination?.observeBroadcastEnd { [weak self] instant in
+                guard let self else { return }
+                self.destinationLock.lock()
+                if let binding = self.publishingWorkerFence, binding.0 == ticket {
+                    _ = binding.2.closePublishingAdmission()
+                }
+                self.admission.broadcastEnded(ticket, nowNs: instant)
+                self.destinationLock.unlock()
+            }
             if self.configuredProfile != ticket.profile { self.configured = false }
             self.snapshot.profile = ticket.profile
             self.snapshot.backgroundAudioEnabled = ticket.continuesAudioInBackground
@@ -470,7 +897,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
     private func fencePublishing() {
-        destinationLock.lock(); let owner = destinationFence; destinationLock.unlock()
+        destinationLock.lock()
+        let owner = destinationFence
+        if let binding = publishingWorkerFence { _ = binding.2.closePublishingAdmission() }
+        destinationLock.unlock()
         owner?.endDestination()
     }
     private func fenceCodecEpoch() {
@@ -484,7 +914,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private func applyOrientationObservation(_ observation: CaptureAdmission.OrientationObservation) {
         guard self.admission.permitsOrientation(observation) else { return }
         guard (self.preparedIntent?.profile ?? self.snapshot.profile).hasVideo else { return }
-        if self.admission.pendingCameraSwitch != nil { self.deferredOrientation = observation.orientation; return }
+        if self.admission.pendingCameraSwitch != nil || self.preparedIntent.map(self.admission.privacyBlocksOrientation) == true {
+            self.deferredOrientation = observation.orientation; return
+        }
         guard self.orientationPlan.desired != observation.orientation else { return }
         let token = self.orientationPlan.request(observation.orientation, running: self.snapshot.running)
         if let token {
@@ -515,7 +947,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 let resumePreview = self.session.isRunning
                 if self.configured { try self.applyOrientation() }
                 self.snapshot.orientation = observation.orientation
-                if resumePreview { self.setSampleDelivery(true); self.session.startRunning() }
+                if resumePreview, self.admission.privacyView?.desired != .standby { self.setSampleDelivery(true); self.session.startRunning() }
                 if self.snapshot.canStart { self.snapshot.detail = self.orientationDescription }
                 self.publish()
             } catch { self.report(error) }
@@ -544,6 +976,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private func setSampleDelivery(_ enabled: Bool) {
         // Stop the old producers before the sample-queue barrier/encoder flush.
         // A later epoch restores delegates only after its orientation is set.
+        if enabled, let current = samples.sync(execute: { self.run }) {
+            installRawDelivery(current); return
+        }
         for output in session.outputs {
             if let video = output as? AVCaptureVideoDataOutput {
                 if enabled, let device = cameraDevice, video === device.output { device.deliver(on: samples) }
@@ -609,12 +1044,14 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     }, attach: {
                         try self.attachAudioRoute(ticket)
                     }, start: {
-                        self.setSampleDelivery(true); self.session.startRunning()
+                        if self.admission.privacyView?.desired != .standby {
+                            self.setSampleDelivery(true); self.session.startRunning()
+                        }
                     })
                     guard self.admission.prepared(ticket) else { self.stopOnControl(reason: nil); return }
                     self.snapshot.phase = "Prepared"
                     self.snapshot.detail = self.orientationDescription
-                    self.snapshot.canStart = !ticket.profile.hasVideo || self.admission.cameraControlSource != nil
+                    self.snapshot.canStart = self.admission.privacyView?.desired == .standby || !ticket.profile.hasVideo || self.admission.cameraControlSource != nil
                     self.snapshot.publisher = self.ingress.status
                     self.publish()
                   } catch { self.stopOnControl(reason: error.localizedDescription) }
@@ -677,7 +1114,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
     /// Runs on the existing samples queue. No extra frame dispatch, pixel copy,
     /// device getter, or allocation is added to the steady-state video path.
-    private func cameraFrame(_ source: CaptureAdmission.CameraSource, sample: CMSampleBuffer) {
+    private func cameraFrame(_ source: CaptureAdmission.CameraSource, sample: CMSampleBuffer, token: CaptureAdmission.MediaToken? = nil) {
         let dimensions = CameraFrameGeometry.read(sample)
         switch admission.cameraFrame(source, width: dimensions?.width ?? 0, height: dimensions?.height ?? 0, nowNs: DispatchTime.now().uptimeNanoseconds) {
         case .stale: return
@@ -691,13 +1128,14 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 self.snapshot.cameraDetail = "Native camera verified; remote picture is not verified"
                 self.publish(); self.applyDeferredOrientation()
             } }
-            processCapture(sample, isVideo: true, source: source)
+            if let token { processCapture(sample, isVideo: true, token: token, source: source) }
         }
     }
     /// Samples-owner fault fence precedes the cold cleanup task. A withheld
     /// control queue cannot keep microphone/media admission open after failure.
     private func fenceCameraMedia(_ preparation: CaptureAdmission.Preparation, reason: String) {
         if let run, run.recordingTicket.request.preparation == preparation {
+            if let token = admission.mediaToken(run.mediaRun, kind: .raw) { admission.nativeFault(token) }
             run.admitting = false; run.startup.removeAll(); run.startupBytes = 0
             run.recorder.markIncomplete(CaptureFailure(message: reason))
         }
@@ -814,10 +1252,31 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         self.captureGeneration &+= 1
         let captureToken = self.captureGeneration
         var constructedRun: CaptureRun?
+        guard let mediaRun = admission.reserveMediaRun(ticket, publishing: ingress.destination != nil) else {
+            closeRejectedRecorder(recorder, work: work); stopOnControl(reason: nil); return
+        }
         do {
             self.ingress.reset(hasVideo: ticket.preparation.profile.hasVideo)
             self.recordingFailureDescription = nil
-            let run = try CaptureRun(recorder: recorder, recordingTicket: work, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress,
+            let run = try CaptureRun(mediaRun: mediaRun, admission: admission, recorder: recorder, recordingTicket: work, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress,
+                boundary: { [weak self] value in
+                    guard let self else { return }
+                    if self.admission.recordBoundary(value, nowNs: DispatchTime.now().uptimeNanoseconds) {
+                        self.control.async {
+                            guard self.admission.privacyView?.run == mediaRun else { return }
+                            self.privacyTimeout?.cancel(); self.privacyTimeout = nil
+                            self.publish(); self.applyDeferredOrientation()
+                        }
+                    }
+                }, terminal: { [weak self] value in
+                    guard let self, self.admission.sinkTerminated(value) else { return }
+                    self.control.async {
+                        guard self.admission.privacyView?.run == mediaRun else { return }
+                        if self.admission.requiredSinkMask(run: mediaRun).isEmpty {
+                            self.stopOnControl(reason: "All local media branches have ended; Stop and prepare again.")
+                        } else { self.publish() }
+                    }
+                },
                 failure: { [weak self] error in
                     recorder.markIncomplete(error)
                     self?.control.async {
@@ -833,28 +1292,42 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     guard self?.captureGeneration == captureToken, self?.preparedIntent == ticket.preparation else { return }
                     self?.snapshot.encoded = count; self?.snapshot.publisher = status; self?.publish()
                 } }, meter: { [weak self] level in self?.meter(level) })
-            run.audioRoute = self.audioRoute
             constructedRun = run
+            // Retain every constructed native/worker owner before any subsequent
+            // blocking setup. Media remains closed until the exact Start commit;
+            // cancellation now uses the normal joined run cleanup, never a
+            // recorder-direct shortcut which could overtake worker EOF.
+            samples.sync { self.run = run }
+            snapshot.running = true
+            destinationLock.lock()
+            publishingWorkerFence = (ticket.preparation, mediaRun, run.worker)
+            if !admission.requiredSinkMask(run: mediaRun).contains(.publishing) { _ = run.worker.closePublishingAdmission() }
+            destinationLock.unlock()
+            run.audioRoute = self.audioRoute
+            run.sourceClock = session.synchronizationClock
+            run.slate = try run.video?.prepareSlate()
+            if admission.privacyView?.desired == .standby {
+                run.initialPCMFormat = try observedPCMFormat()
+            }
             // Once native owners exist, even a winning synchronous Stop must
             // reach their actual worker/recorder cleanup path before admission.
             guard self.admission.permitsStart(ticket),
                   !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true,
                   self.recordingAdmission.activate(work) else {
-                run.video?.finish(); try? run.audio.finish()
-                self.closeRejectedRecorder(recorder, work: work)
-                if self.admission.permitsStart(ticket) { self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.") }
+                self.stopOnControl(reason: self.admission.permitsStart(ticket) ? "Rotation finalisation timed out; automatic restart cancelled." : nil)
                 return
             }
             if keepSavedSegment {
                 try AVAudioSession.sharedInstance().setActive(true)
                 run.audioRoute = try AudioInputRouting.activate(configure: { try self.applyOrientation() }, attach: {
                     try self.attachAudioRoute(ticket.preparation)
-                }, start: { self.setSampleDelivery(true); self.session.startRunning() })
+                }, start: {
+                    if self.admission.privacyView?.desired != .standby { self.setSampleDelivery(true); self.session.startRunning() }
+                })
             }
             guard self.admission.permitsStart(ticket), self.recordingAdmission.isActive(work),
                   !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
-                run.video?.finish(); try? run.audio.finish(); self.closeRejectedRecorder(recorder, work: work)
-                if self.admission.permitsStart(ticket) { self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.") }
+                self.stopOnControl(reason: self.admission.permitsStart(ticket) ? "Rotation finalisation timed out; automatic restart cancelled." : nil)
                 return
             }
             var currentAtExposure = false
@@ -874,9 +1347,19 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                   !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: committedAt) == true else {
                 self.stopOnControl(reason: keepSavedSegment && self.admission.permitsStart(ticket) ? "Rotation finalisation timed out; automatic restart cancelled." : nil); return
             }
-            guard self.admission.started(ticket, nowNs: committedAt, broadcasting: self.ingress.destination != nil) else { self.stopOnControl(reason: nil); return }
+            guard self.admission.commitMediaRun(mediaRun, start: ticket, nowNs: committedAt,
+                broadcasting: self.admission.requiredSinkMask(run: mediaRun).contains(.publishing)) else { self.stopOnControl(reason: nil); return }
             self.samples.sync {
-                if self.admission.currentPreparation == ticket.preparation, self.admission.currentPhase == .running { run.admitting = true }
+                if self.admission.currentPreparation == ticket.preparation, self.admission.currentPhase == .running {
+                    run.admitting = true
+                    let anchor = CMClockGetTime(CMClockGetHostTimeClock())
+                    run.committedHostTime = anchor
+                    if self.admission.privacyView?.desired == .standby {
+                        let host = CMClockGetHostTimeClock()
+                        run.mediaClock = try? CaptureMediaClock(clock: host, epoch: anchor)
+                        run.epoch = run.mediaClock?.epoch
+                    }
+                }
             }
             guard self.admission.currentPreparation == ticket.preparation, self.admission.currentPhase == .running else { self.stopOnControl(reason: nil); return }
             if keepSavedSegment, let token = self.orientationPlan.pending {
@@ -902,10 +1385,17 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
             }
             self.storageTimer = timer; timer.resume()
+            if let request = admission.privacyView?.request, request.run == mediaRun {
+                beginPrivacy(request)
+            } else { installRawDelivery(run) }
         } catch {
-            constructedRun?.video?.finish(); try? constructedRun?.audio.finish()
-            self.closeRejectedRecorder(recorder, work: work)
-            self.fencePublishing(); self.stopOnControl(reason: error.localizedDescription)
+            self.fencePublishing()
+            if constructedRun != nil { self.stopOnControl(reason: error.localizedDescription) }
+            else {
+                self.closeRejectedRecorder(recorder, work: work)
+                self.admission.mediaRunClosed(mediaRun)
+                self.stopOnControl(reason: error.localizedDescription)
+            }
         }
     }
     func stop() {
@@ -953,6 +1443,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let rotationToken = rotationAllowed ? orientationPlan.pending : nil
         if rotationToken == nil { fencePublishing() } else { fenceCodecEpoch() }
         storageTimer?.cancel(); storageTimer = nil
+        privacyTimeout?.cancel(); privacyTimeout = nil
         snapshot.activeAudioInput = "Not active"
         cameraSwitchTimer?.cancel(); cameraSwitchTimer = nil; deferredOrientation = nil
         cameraCommands.invalidate(); snapshot.cameraControlPending = false
@@ -995,27 +1486,32 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 self.snapshot.detail = "Capture cleanup unconfirmed; Prepare is blocked."; self.publish()
             }; return }
             self.run = nil
-            var flushFailed = false
+            run.admitting = false; run.privacyDriver?.stop(); run.privacyDriver = nil
+            run.resumeCutover = nil
+            run.rawSources.removeAll(); run.retiringRawSources.removeAll()
+            var flushFailed = self.admission.mediaHasFault(run.mediaRun)
             do { try run.audio.finish() } catch {
                 flushFailed = true
                 self.control.async { self.recordingFailureDescription = "AAC flush failed: \(error.localizedDescription)" }
             }
-            run.video?.finish()
+            do { try run.video?.finishChecked() } catch {
+                flushFailed = true; run.recorder.markIncomplete(error)
+            }
             self.recordingAdmission.closing(run.recordingTicket)
             let state = RecordingRunStop(run: run, rotationToken: rotationToken, rotation: child)
             self.control.async { self.runStop = state }
-            // File finalisation must not wait behind network cleanup. Both real
-            // receipts join before rotation or a new capture can be admitted.
-            run.recorder.finish(incomplete: flushFailed) { result in self.control.async {
+            // All final native units AND EOF timing first pass the worker FIFO.
+            // Its one barrier then starts file and network cleanup independently.
+            if flushFailed { run.recorder.markIncomplete(CaptureFailure(message: "Native capture did not complete cleanly")) }
+            run.worker.finish(recording: { result in self.control.async {
                 state.recording = result
                 self.recordingAdmission.closed(run.recordingTicket, cleanupComplete: result.cleanupComplete)
                 if !result.cleanupComplete { self.retainedRecorder = run.recorder }
                 self.finishRunStopIfReady(state)
-            } }
-            run.worker.finish { result in self.control.async {
+            } }, publishing: { result in self.control.async {
                 state.publishing = result
                 self.finishRunStopIfReady(state)
-            } }
+            } })
         }
     }
     private func finishRunStopIfReady(_ state: RecordingRunStop) {
@@ -1025,6 +1521,12 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         if case .success = publishingResult { publishingClean = ingress.destination?.cleanupComplete != false }
         else { publishingClean = false }
         let clean = recording.cleanupComplete && publishingClean && !recordingAdmission.hasOwner
+        if clean {
+            admission.mediaRunClosed(state.run.mediaRun)
+            destinationLock.lock()
+            if publishingWorkerFence?.1 == state.run.mediaRun { publishingWorkerFence = nil }
+            destinationLock.unlock()
+        }
         if !publishingClean { stopReason = "Publisher cleanup unconfirmed; automatic restart blocked." }
         snapshot.phase = stopReason == nil ? "Stopped" : "Interrupted"
         if !recording.cleanupComplete { snapshot.detail = "Recording cleanup unconfirmed; Prepare is blocked." }
@@ -1144,6 +1646,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private func publish() {
         snapshot.recordingIOBusy = recordingAdmission.isWorking || storageCheckPending
         snapshot.stopControl = admission.currentPreparation.map { AudioShowStopControl(preparation: $0, admission: admission) }
+        snapshot.privacy = admission.privacyView
         let value = snapshot
         DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = value.running; self.onChange?(value) }
     }
@@ -1155,13 +1658,24 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         control.async { self.snapshot.level = level; self.publish() }
     }
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard !(output is AVCaptureVideoDataOutput) else { return }
-        processCapture(sampleBuffer, isVideo: false)
+        // Prepared-session delegate is metadata-only. Actual running input uses
+        // an immutable CaptureRawSource; it can never borrow a resumed token.
     }
-    private func processCapture(_ sampleBuffer: CMSampleBuffer, isVideo: Bool, source: CaptureAdmission.CameraSource? = nil) {
-        guard let run, run.admitting else { return }
+    private func processCapture(_ sampleBuffer: CMSampleBuffer, isVideo: Bool, token: CaptureAdmission.MediaToken, source: CaptureAdmission.CameraSource? = nil) {
+        guard let run, run.admitting, run.mediaRun == token.run else { return }
         do {
-            guard run.audioRoute?.awaitPCM() == true else { return }
+            let permission = admission.allowsInput(token)
+            if permission != .allow {
+                if permission == .failed { throw CaptureFailure(message: "Raw media admission failed its current native boundary") }
+                try resumeProbe(sampleBuffer, video: isVideo, token: token, run: run)
+                return
+            }
+            let audioToken = isVideo ? nil : run.audio.inputToken
+            let waited = admission.rawAfterWait(token) { run.audioRoute?.awaitPCM() == true }
+            guard waited == .allow else {
+                if waited == .failed { throw CaptureFailure(message: "Raw media expired while route verification was withheld") }
+                return
+            }
             switch admission.cameraMedia(run.recordingTicket.request.preparation) {
             case .stale: return
             case .failed:
@@ -1180,31 +1694,46 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 guard run.startup.count < 8, bytes <= 12 * 1024 * 1024 - run.startupBytes else {
                     throw CaptureFailure(message: "Camera/microphone startup exceeded its native buffer bound")
                 }
-                run.startup.append((sampleBuffer, isVideo)); run.startupBytes += bytes
+                run.startup.append((sampleBuffer, isVideo, token, audioToken)); run.startupBytes += bytes
                 guard (!run.profile.hasVideo || run.startup.contains(where: { $0.video })), run.startup.contains(where: { !$0.video }) else { return }
                 let initial = run.startup.sorted {
                     CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0.sample), CMSampleBufferGetPresentationTimeStamp($1.sample)) < 0
                 }
-                run.epoch = CMSampleBufferGetPresentationTimeStamp(initial[0].sample)
+                guard let sourceClock = run.sourceClock else { throw CaptureFailure(message: "Native capture synchronization clock is unavailable") }
+                let epoch = CMSampleBufferGetPresentationTimeStamp(initial[0].sample)
+                run.epoch = epoch
+                let host = CMClockGetHostTimeClock()
+                run.mediaClock = try CaptureMediaClock(clock: host, epoch: CMSyncConvertTime(epoch, from: sourceClock, to: host))
                 run.startup.removeAll(); run.startupBytes = 0
-                for pending in initial { try process(pending.sample, video: pending.video, run: run) }
-            } else { try process(sampleBuffer, video: isVideo, run: run) }
+                for pending in initial { try process(pending.sample, video: pending.video, token: pending.token, audioToken: pending.audio, run: run) }
+            } else { try process(sampleBuffer, video: isVideo, token: token, audioToken: audioToken, run: run) }
         } catch {
-            run.admitting = false; run.startup.removeAll(); run.startupBytes = 0
-            run.recorder.markIncomplete(error)
-            control.async { self.stopOnControl(reason: error.localizedDescription) }
+            failMedia(run, error: error)
         }
     }
-    private func process(_ sample: CMSampleBuffer, video: Bool, run: CaptureRun) throws {
-        guard let epoch = run.epoch else { return }
-        let time = CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(sample), epoch)
-        guard time.isValid, time.seconds >= 0 else { throw CaptureFailure(message: "Capture clock moved before the session epoch") }
+    private func process(_ sample: CMSampleBuffer, video: Bool, token: CaptureAdmission.MediaToken,
+                         audioToken: NativeAudioEncoder.InputToken? = nil, run: CaptureRun) throws {
+        let permission = admission.allowsInput(token)
+        guard permission == .allow else {
+            if permission == .failed { throw CaptureFailure(message: "Native input authority failed") }; return
+        }
+        guard let clock = run.mediaClock, let sourceClock = run.sourceClock else { throw CaptureFailure(message: "Native source clock is unavailable") }
+        let time = try clock.time(CMSampleBufferGetPresentationTimeStamp(sample), from: sourceClock)
         if video {
             guard let encoder = run.video else { throw CaptureFailure(message: "Video encoder is absent for this capture") }
-            guard run.videoTimeline.accept(time) else { throw CaptureFailure(message: "Camera timestamp changed its existing media timeline") }
-            try encoder.encode(sample, time: time)
+            var timeline = run.videoTimeline
+            guard timeline.accept(time) else { throw CaptureFailure(message: "Camera timestamp changed its existing media timeline") }
+            if try encoder.encode(sample, time: time, token: token) { run.videoTimeline = timeline; run.lastVideoTime = time }
         }
-        else { try run.audio.encode(sample, time: time) }
+        else {
+            guard let audioToken else { throw CaptureFailure(message: "Captured native audio token is absent") }
+            if run.initialPCMFormat == nil, let description = CMSampleBufferGetFormatDescription(sample) {
+                run.initialPCMFormat = try CapturePCMFormat(description)
+            }
+            if run.audioBeganAt == nil { run.audioBeganAt = time }
+            run.audioBinding.token = token
+            try run.audio.encode(sample, time: time, token: audioToken)
+        }
     }
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         control.async { self.snapshot.captureDrops += 1 }

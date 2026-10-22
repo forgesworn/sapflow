@@ -1,8 +1,8 @@
 # Native privacy standby
 
 This is the B4R implementation and qualification contract for pre-start standby
-and live privacy pause. An Android runtime candidate is under review; the iOS
-runtime control remains to be implemented and neither app is qualified.
+and live privacy pause. Both native runtime candidates are implemented and
+source-reviewed. Neither app is physically qualified for this control.
 Source policy tests, native codec experiments, app builds and physical acceptance
 are separate gates. See the [delivery status](mobile-delivery-status.md).
 
@@ -89,6 +89,17 @@ video canvas, active hardware encoder, compressed sinks and destination grant
 remain unchanged. Successful transitions retain the existing publisher timing
 and queue limits; they do not weaken MPEG-TS continuity guards.
 
+The iOS adapter validates each compressed unit once. Its independent publishing
+receipt comes from a real per-run SDK fanout queue with the unused recording
+branch closed, followed by dequeue of that same immutable sample. Only one
+sample can occupy that queue, within the ingress owner's 128-item, 4 MiB and
+one-second bounds. The queue retains compressed payload ownership without a
+second payload copy; the exported dequeue still allocates a small handle.
+A missing transport attempt may drain this local branch during recovery, but
+a refused queue admission or pre-IDR audio cannot confirm Standby. Recording
+requires its own actual recorder reservation. End synchronously closes the
+Swift admission gate; a distinct native-close receipt follows on the SDK owner.
+
 ## Codec boundary
 
 Closing raw ingress alone does not remove history from a native codec. In
@@ -128,14 +139,13 @@ old video callback cannot confirm or reopen the new privacy revision.
 
 ## Recording prerequisite
 
-iOS audio-only recording currently expects one converter's initial priming and
-final extent. Cold AAC replacement therefore requires explicit per-generation
-accounting before it can be integrated. Do not replay initial-file trim on an
+iOS recording now accounts for each native converter generation, the first
+file-leading trim and the actual final extent. Do not replay initial-file trim on an
 interior transition, discard valid samples without accounting, count priming as
 original capture or report a false complete recording. Apple describes
 [sample-buffer trim metadata](https://developer.apple.com/documentation/coremedia/kcmsamplebufferattachmentkey_trimdurationatstart);
-its actual interaction with the chosen writer and interior transitions needs a
-generated-media experiment and independent decode.
+its actual interaction with the chosen writer and interior transitions is
+checked using generated native media and independent decode.
 
 The candidate accounting keeps all coded units on one show-level cursor and
 applies only the first file-leading and final file-trailing trim. Interior
@@ -145,9 +155,23 @@ rather than extending the recording or dropping original captured input.
 This accounting does not relabel old-generation EOF output as sanitised: it
 remains the accepted old prefix until the fresh-generation coded boundary.
 An interval too short for the measured overhead must be refused. Generated
-host experiments support this candidate, including repeated joins, but its
-native production integration, continuous real-time pacing and resumed
-microphone timestamp mapping remain prerequisites.
+host checks support this candidate, including repeated joins, exact encoded
+payload retention, A/V presentation and a delayed first microphone track.
+The actual adapters and rational media driver are now connected; physical
+continuous pacing and resumed microphone timestamp mapping remain prerequisites.
+
+For A/V MOV files, closed-writer finalisation prepares bounded metadata from the
+original header, writes an explicit measured AAC presentation edit and complete
+roll sample groups, then appends and syncs the replacement before retiring the
+old header. It does not rewrite media payloads or chunk offsets. An unsupported
+layout stays incomplete. Ambiguous write, sync or descriptor closure retains
+the recording owner and blocks another recording. Generated tests qualify this
+specific finalisation path, not physical storage durability after power loss.
+
+iOS background and locked-screen synthetic execution remains open. Its current
+timer does not establish an operating-system execution anchor after native
+capture owners park. Foreground build or generated-codec evidence cannot close
+that gate, and Standby adds no background authority.
 
 The experiment must exercise non-1024-aligned input lengths, old signal followed
 by fresh zero-only encoding, multiple Standby/Resume cycles and final partial

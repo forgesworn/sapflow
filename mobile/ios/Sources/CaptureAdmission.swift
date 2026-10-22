@@ -4,7 +4,11 @@ import Foundation
 /// native cleanup receipt is still required before releasing a stopped intent.
 /// No callback, codec, socket or file operation runs under this scalar lock.
 final class CaptureAdmission {
+    fileprivate final class Identity: Equatable, Sendable {
+        static func == (lhs: Identity, rhs: Identity) -> Bool { lhs === rhs }
+    }
     struct Preparation: Equatable {
+        fileprivate let owner: Identity
         fileprivate let serial: UInt64
         let profile: CaptureIntent
         let audioInputID: String?
@@ -12,6 +16,7 @@ final class CaptureAdmission {
         let orientationChoice: CaptureOrientationChoice
         let initialOrientation: CaptureOrientation?
         let initialCamera: CameraPosition
+        let initialStandby: Bool
     }
     struct OrientationObservation {
         fileprivate let serial: UInt64
@@ -30,13 +35,93 @@ final class CaptureAdmission {
         fileprivate let serial: UInt64
         let preparation: Preparation?
     }
+    /// Immutable native ownership. Only this Admission can mint a run/token;
+    /// callbacks retain the originally submitted value, never a current lookup.
+    struct MediaRun: Equatable {
+        let preparation: Preparation
+        fileprivate let serial: UInt64
+    }
+    enum MediaKind: Equatable { case raw, slate, zero }
+    struct MediaToken: Equatable {
+        let run: MediaRun
+        let revision: UInt64
+        let kind: MediaKind
+        fileprivate let serial: UInt64
+    }
+    enum MediaAdmission: Equatable { case allow, superseded, stopped, failed }
+    enum OutputAdmission: Equatable { case current, acceptedPrefix, superseded, failed }
+    enum PrivacyDesired: Equatable { case live, standby }
+    enum PrivacyPhase: Equatable { case live, armed, enteringStandby, standby, resuming, failed, stopped }
+    struct PrivacyRequest: Equatable {
+        let preparation: Preparation
+        let run: MediaRun?
+        let revision: UInt64
+        let desired: PrivacyDesired
+        let beganAtNs: UInt64
+        let deadlineNs: UInt64?
+        fileprivate let serial: UInt64
+    }
+    struct PrivacyView {
+        let preparation: Preparation
+        let run: MediaRun?
+        let revision: UInt64
+        let desired: PrivacyDesired
+        let phase: PrivacyPhase
+        let previewHidden: Bool
+        let request: PrivacyRequest?
+    }
+    enum Sink: UInt8 { case publishing = 1, recording = 2 }
+    struct SinkMask: OptionSet, Equatable {
+        let rawValue: UInt8
+        static let publishing = SinkMask(rawValue: Sink.publishing.rawValue)
+        static let recording = SinkMask(rawValue: Sink.recording.rawValue)
+        static let both: SinkMask = [.publishing, .recording]
+    }
+    struct SinkToken: Equatable {
+        let run: MediaRun
+        let sink: Sink
+        fileprivate let serial: UInt64
+    }
+    /// Trust boundary: only actual coded validation plus the same unit's bounded
+    /// branch reservations may construct this receipt. Requested keyframe flags
+    /// and a void consume/offer call are not independent-IDR/admission evidence.
+    struct MediaBoundary {
+        let token: MediaToken
+        let pts: Int64
+        let duration: UInt32
+        let codedIdr: Bool
+        let audioGeneration: UInt64?
+        let acceptedSinks: SinkMask
+    }
     enum Phase { case idle, reserved, attached, permissions, prepared, starting, running, rotating, stopping, retained }
     private let lock = NSLock()
+    private let identity = Identity()
     private var serial: UInt64
     private var selectedAudioInputID: String?
     private var selectedCamera = CameraPosition.rear
     private var camera = CameraControlPolicy<Preparation>()
     private var selectedBackgroundAudio = false
+    private var selectedInitialStandby = false
+    private var privacyDesired = PrivacyDesired.live
+    private var privacyPhase = PrivacyPhase.live
+    private var privacyRevision: UInt64 = 0
+    private var privacyRequest: PrivacyRequest?
+    private var mediaRun: MediaRun?
+    private var closingMediaRun: MediaRun?
+    private var rawToken: MediaToken?
+    private var slateToken: MediaToken?
+    private var zeroToken: MediaToken?
+    private var mediaStarted = false
+    private var mediaFailed = false
+    private var terminalBranches: UInt8 = 0
+    private var mediaOperationDeadlineNs: UInt64?
+    private var mediaOperationBeganAtNs: UInt64?
+    private var publishingSink: SinkToken?
+    private var recordingSink: SinkToken?
+    private var expectedZeroGeneration: UInt64?
+    private var slateConfirmed = false
+    private var zeroThrough: Int64?
+    private var zeroFrames: UInt64 = 0
     private var selectedOrientationChoice = CaptureOrientationChoice.automatic
     private var latestAutoOrientation = CaptureOrientation.portrait
     private var orientationObservation: UInt64?
@@ -118,23 +203,25 @@ final class CaptureAdmission {
     var pendingCameraSwitch: CameraSwitch? { locked { camera.pending } }
     var cameraControlSource: CameraSource? {
         locked {
-            guard foreground, phase == .prepared || phase == .running, let source = camera.source,
+            guard foreground, privacyDesired == .live, privacyPhase != .resuming,
+                  phase == .prepared || phase == .running, let source = camera.source,
                   camera.permitsControls(source) else { return nil }; return source
         }
     }
     func permitsCameraControls(_ source: CameraSource) -> Bool {
-        locked { foreground && (phase == .prepared || phase == .running) && preparation == source.owner && camera.permitsControls(source) }
+        locked { foreground && privacyDesired == .live && privacyPhase != .resuming && (phase == .prepared || phase == .running) && preparation == source.owner && camera.permitsControls(source) }
     }
     func initialCameraSource(canvas: CameraCanvas) -> CameraSource? {
         locked {
             guard foreground, let preparation, preparation.profile.hasVideo,
-                  [.permissions, .prepared, .starting].contains(phase) else { return nil }
+                  [.permissions, .prepared, .starting].contains(phase) || phase == .running && privacyPhase == .resuming else { return nil }
             return camera.initial(preparation, canvas: canvas)
         }
     }
     func reserveCameraSwitch(_ position: CameraPosition, source: CameraSource, nowNs: UInt64) -> CameraSwitch? {
         locked {
-            guard foreground, phase == .prepared || phase == .running, let preparation,
+            guard foreground, privacyDesired == .live, privacyPhase == .live,
+                  phase == .prepared || phase == .running, let preparation,
                   preparation == source.owner, camera.permitsControls(source) else { return nil }
             return camera.reserveSwitch(preparation, position: position, nowNs: nowNs)
         }
@@ -156,6 +243,21 @@ final class CaptureAdmission {
                 camera.source == source && !camera.failed
         }
     }
+    /// Delegates are disabled and the native session stop joins on the control
+    /// owner. This scalar retirement rejects old source callbacks immediately.
+    func parkPrivacySources(_ value: Preparation) -> Bool {
+        locked {
+            guard preparation == value, privacyDesired == .standby,
+                  phase != .stopping, phase != .retained else { return false }
+            let position = camera.desired
+            camera.close()
+            if value.profile.hasVideo { camera.prepare(value, initial: position) }
+            return true
+        }
+    }
+    func privacyBlocksOrientation(_ value: Preparation) -> Bool {
+        locked { preparation == value && (privacyPhase == .enteringStandby || privacyPhase == .resuming) }
+    }
     func cameraMedia(_ value: Preparation, nowNs: UInt64? = nil) -> CameraControlPolicy<Preparation>.Media {
         locked {
             guard preparation == value, phase == .running else { return .stale }
@@ -175,20 +277,289 @@ final class CaptureAdmission {
     func selectBackgroundAudio(_ enabled: Bool) -> Bool {
         locked { guard phase == .idle, foreground else { return false }; selectedBackgroundAudio = enabled; return true }
     }
+    func selectInitialStandby(_ enabled: Bool) -> Bool {
+        locked { guard phase == .idle, foreground else { return false }; selectedInitialStandby = enabled; return true }
+    }
+    var privacyView: PrivacyView? {
+        locked {
+            guard let preparation else { return nil }
+            return PrivacyView(preparation: preparation, run: mediaRun, revision: privacyRevision,
+                desired: privacyDesired, phase: privacyPhase,
+                previewHidden: privacyDesired == .standby || privacyPhase == .resuming || mediaFailed,
+                request: privacyRequest)
+        }
+    }
+    private func privacyFaultLocked() {
+        mediaFailed = true; privacyPhase = .failed
+    }
+    private func privacyDeadlineLocked(_ nowNs: UInt64, prior: UInt64? = nil) -> UInt64? {
+        guard nowNs <= UInt64.max - 6_000_000_000 else { privacyFaultLocked(); return nil }
+        return [nowNs + 6_000_000_000, prior, camera.pending?.deadlineNs, mediaOperationDeadlineNs].compactMap { $0 }.min()
+    }
+    private func mintMediaTokensLocked(_ run: MediaRun) -> Bool {
+        guard let raw = next(), let slate = next(), let zero = next() else { privacyFaultLocked(); return false }
+        rawToken = MediaToken(run: run, revision: privacyRevision, kind: .raw, serial: raw)
+        slateToken = MediaToken(run: run, revision: privacyRevision, kind: .slate, serial: slate)
+        zeroToken = MediaToken(run: run, revision: privacyRevision, kind: .zero, serial: zero)
+        return true
+    }
+    /// Reserve immutable native identity before any encoder/worker is created.
+    /// Registration does not grant input; only the exact committed Start does.
+    func reserveMediaRun(_ start: Start, publishing: Bool = true) -> MediaRun? {
+        locked {
+            guard preparation == start.preparation, starting == start, phase == .starting,
+                  mediaRun == nil, closingMediaRun == nil, !mediaFailed, let id = next() else { return nil }
+            let value = MediaRun(preparation: start.preparation, serial: id)
+            guard mintMediaTokensLocked(value) else { return nil }
+            guard let publishingID = next(), let recordingID = next() else { privacyFaultLocked(); return nil }
+            publishingSink = SinkToken(run: value, sink: .publishing, serial: publishingID)
+            recordingSink = SinkToken(run: value, sink: .recording, serial: recordingID)
+            if !publishing { terminalBranches |= Sink.publishing.rawValue }
+            mediaRun = value; mediaStarted = false
+            expectedZeroGeneration = nil; slateConfirmed = false; zeroThrough = nil; zeroFrames = 0
+            if privacyDesired == .standby {
+                guard let command = next() else { privacyFaultLocked(); return nil }
+                let pending = privacyPhase == .armed || privacyPhase == .enteringStandby || privacyPhase == .resuming
+                let priorBegan = pending ? privacyRequest?.beganAtNs : nil
+                let priorDeadline = pending ? privacyRequest?.deadlineNs : nil
+                privacyPhase = .armed
+                privacyRequest = PrivacyRequest(preparation: start.preparation, run: value, revision: privacyRevision,
+                    desired: .standby, beganAtNs: priorBegan ?? 0,
+                    deadlineNs: priorDeadline, serial: command)
+            }
+            return value
+        }
+    }
+    func mediaToken(_ run: MediaRun, kind: MediaKind) -> MediaToken? {
+        locked {
+            guard mediaRun == run else { return nil }
+            switch kind { case .raw: return rawToken; case .slate: return slateToken; case .zero: return zeroToken }
+        }
+    }
+    @discardableResult func commitMediaRun(_ run: MediaRun, start: Start, nowNs: UInt64, broadcasting: Bool) -> Bool {
+        locked {
+            guard mediaRun == run, !mediaFailed else { return false }
+            if let deadline = mediaOperationDeadlineNs,
+               nowNs >= deadline || nowNs < (mediaOperationBeganAtNs ?? 0) { privacyFaultLocked(); return false }
+            var activation: PrivacyRequest?
+            if privacyDesired == .standby {
+                guard let prior = privacyRequest, let deadline = privacyDeadlineLocked(nowNs, prior: prior.deadlineNs),
+                      nowNs < deadline, prior.deadlineNs == nil || nowNs >= prior.beganAtNs else { privacyFaultLocked(); return false }
+                activation = PrivacyRequest(preparation: run.preparation, run: run, revision: privacyRevision,
+                    desired: .standby, beganAtNs: prior.deadlineNs == nil ? nowNs : prior.beganAtNs,
+                    deadlineNs: deadline, serial: prior.serial)
+            }
+            guard startedLocked(start, nowNs: nowNs, broadcasting: broadcasting) else { return false }
+            mediaStarted = true
+            if let activation {
+                privacyRequest = activation
+                privacyPhase = .enteringStandby
+            }
+            mediaOperationDeadlineNs = nil; mediaOperationBeganAtNs = nil
+            return true
+        }
+    }
+    /// Urgent privacy is show-scoped and wins even while native/source/Auto work
+    /// is queued. No callback, preview, native close or dispatch occurs here.
+    func requestStandby(preparation value: Preparation, nowNs: UInt64) -> PrivacyRequest? {
+        locked {
+            guard preparation == value, ![.idle, .stopping, .retained].contains(phase), !mediaFailed else { return nil }
+            if privacyDesired == .standby, let request = privacyRequest { return request }
+            privacyDesired = .standby // Fence raw before any fallible reservation.
+            guard privacyRevision < UInt64.max, let id = next() else { privacyFaultLocked(); return nil }
+            privacyRevision += 1
+            expectedZeroGeneration = nil; slateConfirmed = false; zeroThrough = nil; zeroFrames = 0
+            if let mediaRun, !mintMediaTokensLocked(mediaRun) { return nil }
+            let needsBudget = mediaStarted || camera.pending != nil || mediaOperationDeadlineNs != nil
+            let deadline = needsBudget ? privacyDeadlineLocked(nowNs, prior: privacyRequest?.deadlineNs) : nil
+            if needsBudget, deadline == nil { return nil }
+            let request = PrivacyRequest(preparation: value, run: mediaRun, revision: privacyRevision,
+                desired: .standby, beganAtNs: nowNs, deadlineNs: deadline, serial: id)
+            privacyRequest = request; privacyPhase = mediaStarted ? .enteringStandby : .armed
+            return request
+        }
+    }
+    /// Explicit displayed-revision approval only. An unknown old AAC/source
+    /// retirement cannot be bypassed by a ready Boolean or a second gesture.
+    func requestResume(preparation value: Preparation, expectedRun: MediaRun? = nil, expectedRevision: UInt64, nowNs: UInt64) -> PrivacyRequest? {
+        locked {
+            guard foreground, preparation == value, phase == .running, mediaStarted, !mediaFailed,
+                  privacyPhase == .standby, privacyRevision == expectedRevision,
+                  expectedRun.map({ $0 == mediaRun }) ?? true,
+                  let mediaRun, privacyRevision < UInt64.max, let id = next(),
+                  let deadline = privacyDeadlineLocked(nowNs) else { return nil }
+            privacyRevision += 1
+            guard mintMediaTokensLocked(mediaRun) else { return nil }
+            privacyDesired = .live; privacyPhase = .resuming
+            let request = PrivacyRequest(preparation: value, run: mediaRun, revision: privacyRevision,
+                desired: .live, beganAtNs: nowNs, deadlineNs: deadline, serial: id)
+            privacyRequest = request; return request
+        }
+    }
+    enum PrivacyFailureClaim { case media(MediaRun), preparation(Stop) }
+    /// Queueing a diagnostic is not fault ownership. Claim only when the exact
+    /// request still owns admission at the point of mutation. Stop/supersession
+    /// wins normally; a claim that wins first remains sticky through Stop.
+    func claimPrivacyFailure(_ value: PrivacyRequest, nowNs: UInt64) -> PrivacyFailureClaim? {
+        locked {
+            guard preparation == value.preparation, privacyRequest == value,
+                  phase != .stopping, phase != .retained, phase != .idle else { return nil }
+            if let run = value.run {
+                guard mediaRun == run else { return nil }
+                privacyFaultLocked(); return .media(run)
+            }
+            guard mediaRun == nil else { return nil }
+            return .preparation(stopLocked(nowNs: nowNs))
+        }
+    }
+    private func requestCurrentLocked(_ value: PrivacyRequest, nowNs: UInt64) -> Bool {
+        guard privacyRequest == value, preparation == value.preparation, mediaRun == value.run,
+              !mediaFailed, phase != .stopping, phase != .retained else { return false }
+        if privacyPhase != .standby, let deadline = value.deadlineNs, nowNs < value.beganAtNs || nowNs >= deadline {
+            privacyFaultLocked(); return false
+        }
+        return true
+    }
+    func permitsPrivacy(_ value: PrivacyRequest, nowNs: UInt64) -> Bool {
+        locked { requestCurrentLocked(value, nowNs: nowNs) }
+    }
+    func sinkToken(run: MediaRun, kind: Sink) -> SinkToken? {
+        locked { guard mediaRun == run else { return nil }; return kind == .publishing ? publishingSink : recordingSink }
+    }
+    func requiredSinkMask(run: MediaRun) -> SinkMask {
+        locked { preparation == run.preparation ? SinkMask(rawValue: SinkMask.both.rawValue & ~terminalBranches) : [] }
+    }
+    /// Called only after the exact local branch has irreversibly closed input.
+    /// Prefix cleanup remains separately owned. Transient retry is not terminal.
+    @discardableResult func sinkTerminated(_ value: SinkToken) -> Bool {
+        locked {
+            guard preparation == value.run.preparation,
+                  mediaRun == value.run || mediaRun == nil && closingMediaRun == value.run,
+                  value == (value.sink == .publishing ? publishingSink : recordingSink) else { return false }
+            terminalBranches |= value.sink.rawValue
+            if terminalBranches & SinkMask.both.rawValue == SinkMask.both.rawValue { privacyFaultLocked() }
+            return true
+        }
+    }
+    /// Native beginStandby has synchronously joined the prior converter and
+    /// returned this newly installed zero-only generation; no guessed padding.
+    func zeroOwnerReady(_ request: PrivacyRequest, generation: UInt64, retiredGeneration: UInt64?, nowNs: UInt64) -> Bool {
+        locked {
+            guard requestCurrentLocked(request, nowNs: nowNs), request.desired == .standby,
+                  retiredGeneration != generation else { return false }
+            expectedZeroGeneration = generation; return true
+        }
+    }
+    @discardableResult func recordBoundary(_ value: MediaBoundary, nowNs: UInt64) -> Bool {
+        locked {
+            guard let request = privacyRequest, mediaStarted, privacyPhase == .enteringStandby,
+                  requestCurrentLocked(request, nowNs: nowNs), value.token.run == mediaRun,
+                  value.token.revision == privacyRevision, value.pts >= 0,
+                  value.duration > 0 else { return false }
+            let required = SinkMask(rawValue: SinkMask.both.rawValue & ~terminalBranches)
+            guard !required.isEmpty else { privacyFaultLocked(); return false }
+            guard value.acceptedSinks.intersection(required) == required else { return false }
+            switch value.token.kind {
+            case .raw: return false
+            case .slate:
+                guard value.token == slateToken, value.codedIdr else { return false }
+                slateConfirmed = true
+            case .zero:
+                guard value.token == zeroToken, let expectedZeroGeneration,
+                      value.audioGeneration == expectedZeroGeneration, value.duration == 1024,
+                      value.pts <= Int64.max - 1024 else { return false }
+                if let zeroThrough, zeroThrough != value.pts { return false }
+                zeroThrough = value.pts + 1024; zeroFrames = min(2048, zeroFrames + 1024)
+            }
+            guard zeroFrames >= 2048, !value.token.run.preparation.profile.hasVideo || slateConfirmed else { return false }
+            privacyPhase = .standby
+            return true
+        }
+    }
+    /// Readiness is established on the samples owner before this final scalar
+    /// commit. A newer urgent Standby or ordinary Stop wins without a false fault.
+    func commitResume(_ request: PrivacyRequest, nowNs: UInt64) -> MediaAdmission {
+        locked {
+            guard preparation == request.preparation, mediaRun == request.run else { return .superseded }
+            if mediaFailed { return .failed }
+            if phase == .stopping || phase == .retained { return .stopped }
+            guard privacyRequest == request, privacyPhase == .resuming else { return .superseded }
+            guard requestCurrentLocked(request, nowNs: nowNs) else { return mediaFailed ? .failed : .superseded }
+            privacyPhase = .live; privacyRequest = nil; return .allow
+        }
+    }
+    func allowsInput(_ token: MediaToken, nowNs: UInt64? = nil) -> MediaAdmission {
+        locked {
+            guard mediaRun == token.run, preparation == token.run.preparation else { return .superseded }
+            if mediaFailed { return .failed }
+            if phase == .stopping || phase == .retained || !mediaStarted { return .stopped }
+            guard token.revision == privacyRevision else { return .superseded }
+            if privacyPhase != .standby, let request = privacyRequest, let deadline = request.deadlineNs {
+                let now = nowNs ?? DispatchTime.now().uptimeNanoseconds
+                if now < request.beganAtNs || now >= deadline { privacyFaultLocked(); return .failed }
+            }
+            switch token.kind {
+            case .raw: return privacyPhase == .live && privacyDesired == .live && rawToken == token ? .allow : .superseded
+            case .slate: return token.run.preparation.profile.hasVideo && (privacyDesired == .standby || privacyPhase == .resuming) && slateToken == token ? .allow : .superseded
+            case .zero: return privacyDesired == .standby && zeroToken == token || privacyPhase == .resuming && zeroToken == token ? .allow : .superseded
+            }
+        }
+    }
+    /// The possibly blocking route/source wait is deliberately OUTSIDE the
+    /// scalar lock. It cannot carry a token across a newer privacy fence.
+    func rawAfterWait(_ token: MediaToken, wait: () -> Bool) -> MediaAdmission {
+        let before = allowsInput(token)
+        guard before == .allow else { return before }
+        guard wait() else { return .superseded }
+        return allowsInput(token)
+    }
+    /// Call only for actual previously submitted native work retained by the
+    /// bounded codec ledger. Prefix is never a sanitised-output confirmation.
+    func outputAdmission(_ token: MediaToken, nowNs: UInt64? = nil) -> OutputAdmission {
+        locked {
+            guard preparation == token.run.preparation, mediaRun == token.run || closingMediaRun == token.run else { return .superseded }
+            if mediaFailed { return .failed }
+            if token.revision != privacyRevision || phase == .stopping || phase == .rotating || closingMediaRun == token.run { return .acceptedPrefix }
+            if privacyPhase != .standby, let request = privacyRequest, let deadline = request.deadlineNs {
+                let now = nowNs ?? DispatchTime.now().uptimeNanoseconds
+                if now < request.beganAtNs || now >= deadline { privacyFaultLocked(); return .failed }
+            }
+            return .current
+        }
+    }
+    /// Native callbacks may synchronously latch only scalars. Cleanup/diagnostic
+    /// work is dispatched after this method returns; a stale run cannot fail B.
+    @discardableResult func nativeFault(_ token: MediaToken) -> Bool {
+        locked {
+            guard preparation == token.run.preparation, mediaRun == token.run || closingMediaRun == token.run,
+                  !mediaFailed else { return false }
+            privacyFaultLocked(); return true
+        }
+    }
+    func mediaHasFault(_ value: MediaRun) -> Bool {
+        locked { preparation == value.preparation && (mediaRun == value || closingMediaRun == value) && mediaFailed }
+    }
+    /// Called only after the actual old codec/worker owners have closed.
+    func mediaRunClosed(_ value: MediaRun) {
+        locked {
+            if mediaRun == value { mediaRun = nil; mediaStarted = false }
+            if closingMediaRun == value { closingMediaRun = nil }
+        }
+    }
     /// nil Stop means this exact committed audio show may continue, or the
     /// foreground returned. Prepared/queued Start is synchronously invalidated.
     func visibilityChanged(foreground active: Bool, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> (continuing: Preparation?, stop: Stop?) {
         locked {
             foreground = active
             if active { return (nil, nil) }
-            if let preparation, AudioShowLifecycle.mayContinue(hasVideo: preparation.profile.hasVideo,
+            if !mediaFailed, let preparation, AudioShowLifecycle.mayContinue(hasVideo: preparation.profile.hasVideo,
                 optedIn: preparation.continuesAudioInBackground, committedRunning: phase == .running) { return (preparation, nil) }
             return (nil, phase == .idle ? nil : stopLocked(nowNs: nowNs))
         }
     }
     var backgroundContinuation: Preparation? {
         locked {
-            guard let preparation, AudioShowLifecycle.mayContinue(hasVideo: preparation.profile.hasVideo,
+            guard !mediaFailed, let preparation, AudioShowLifecycle.mayContinue(hasVideo: preparation.profile.hasVideo,
                 optedIn: preparation.continuesAudioInBackground, committedRunning: phase == .running) else { return nil }
             return preparation
         }
@@ -214,13 +585,19 @@ final class CaptureAdmission {
     func reservePreparation(profile: CaptureIntent = .defaultProfile) -> Preparation? {
         locked {
             guard foreground, phase == .idle, let serial = next() else { return nil }
-            let ticket = Preparation(serial: serial, profile: profile, audioInputID: selectedAudioInputID,
+            let ticket = Preparation(owner: identity, serial: serial, profile: profile, audioInputID: selectedAudioInputID,
                                      continuesAudioInBackground: selectedBackgroundAudio && !profile.hasVideo,
                                      orientationChoice: profile.hasVideo ? selectedOrientationChoice : .automatic,
                                      initialOrientation: profile.hasVideo ? (selectedOrientationChoice.fixedOrientation ?? latestAutoOrientation) : nil,
-                                     initialCamera: selectedCamera)
+                                     initialCamera: selectedCamera, initialStandby: selectedInitialStandby)
             orientationObservation = nil
             preparation = ticket; candidatePending = true; hasCommittedRun = false; phase = .reserved
+            privacyDesired = ticket.initialStandby ? .standby : .live
+            privacyPhase = ticket.initialStandby ? .armed : .live
+            privacyRevision = 0; privacyRequest = nil; mediaRun = nil; closingMediaRun = nil
+            rawToken = nil; slateToken = nil; zeroToken = nil; mediaStarted = false; mediaFailed = false; terminalBranches = 0
+            mediaOperationDeadlineNs = nil
+            mediaOperationBeganAtNs = nil
             if profile.hasVideo { camera.prepare(ticket, initial: selectedCamera) } else { camera.close() }
             timingPreparation = ticket
             captureBeganAtNs = nil; captureStoppedAtNs = nil
@@ -252,8 +629,8 @@ final class CaptureAdmission {
     }
     func reserveStart(_ ticket: Preparation) -> Start? {
         locked {
-            guard preparation == ticket, phase == .prepared,
-                  !ticket.profile.hasVideo || (camera.source == nil || (camera.confirmed && camera.pending == nil && !camera.failed)),
+            guard preparation == ticket, phase == .prepared, !mediaFailed,
+                  !ticket.profile.hasVideo || privacyDesired == .standby || (camera.source == nil || (camera.confirmed && camera.pending == nil && !camera.failed)),
                   let serial = next() else { return nil }
             let value = Start(serial: serial, preparation: ticket)
             starting = value; phase = .starting; return value
@@ -263,21 +640,25 @@ final class CaptureAdmission {
         locked { preparation == ticket.preparation && starting == ticket && phase == .starting }
     }
     func started(_ ticket: Start, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds, broadcasting: Bool = true) -> Bool {
-        locked {
+        locked { startedLocked(ticket, nowNs: nowNs, broadcasting: broadcasting) }
+    }
+    private func startedLocked(_ ticket: Start, nowNs: UInt64, broadcasting: Bool) -> Bool {
             guard preparation == ticket.preparation, starting == ticket, phase == .starting else { return false }
             if !hasCommittedRun {
                 captureBeganAtNs = nowNs
                 if broadcasting && broadcastStoppedAtNs == nil { broadcastBeganAtNs = nowNs }
             }
             starting = nil; hasCommittedRun = true; phase = .running; return true
-        }
     }
-    func beginRotation(_ ticket: Preparation) -> Rotation? {
+    func beginRotation(_ ticket: Preparation, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Rotation? {
         locked {
             guard preparation == ticket, ticket.profile.hasVideo, ticket.orientationChoice == .automatic else { return nil }
             if phase == .rotating { return rotation }
             guard phase == .running, let serial = next() else { return nil }
+            guard let deadline = privacyDeadlineLocked(nowNs) else { return nil }
+            mediaOperationDeadlineNs = deadline; mediaOperationBeganAtNs = nowNs
             let value = Rotation(serial: serial, preparation: ticket)
+            closingMediaRun = mediaRun; mediaRun = nil; mediaStarted = false
             rotation = value; phase = .rotating; return value
         }
     }
@@ -316,6 +697,7 @@ final class CaptureAdmission {
         // A saturated cleanup ticket still permits the current owner to stop.
         let value = Stop(serial: next() ?? UInt64.max, preparation: preparation)
         stopping = value; starting = nil; rotation = nil; phase = .stopping
+        privacyPhase = .stopped; mediaStarted = false
         camera.close()
         return value
     }
@@ -324,6 +706,9 @@ final class CaptureAdmission {
     func broadcastEnded(_ ticket: Preparation, nowNs: UInt64) {
         locked {
             guard preparation == ticket, timingPreparation == ticket else { return }
+            // The caller first closes the actual publisher admission, including
+            // End before a native run exists. This logical mask survives Auto.
+            terminalBranches |= Sink.publishing.rawValue
             broadcastStoppedAtNs = min(broadcastStoppedAtNs ?? nowNs, nowNs)
         }
     }

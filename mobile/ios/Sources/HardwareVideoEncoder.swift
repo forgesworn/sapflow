@@ -9,26 +9,48 @@ final class HardwareVideoEncoder {
     private var encoderFailure: Error?
     private var keyframeRequested = false // samples queue only
     private let keyframeProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
-    private var pending: CMSampleBuffer?
+    private typealias Policy = VideoEncodingPolicy<CaptureAdmission.MediaToken?>
+    private var callbacks: VideoCallbackQueue<CaptureAdmission.MediaToken?, CMSampleBuffer>
+    private var faultDelivered = false
+    private var pending: (sample: CMSampleBuffer, submission: Policy.Submission)?
+    private var sealedEnd: CMTime?
+    private var preparedSlate: PreparedVideoSlate?
     private var cachedFormat: CMFormatDescription?
     private var configuration: CodecDescription?
-    private let lock = NSLock()
-    private let output: (CompressedUnit) -> Void
-    private let failure: (Error) -> Void
+    private let state = NSCondition()
+    private let output: (CompressedUnit, CaptureAdmission.MediaToken?) -> Void
+    private let fault: (CaptureAdmission.MediaToken?, Error) -> Void
+    private let permitsInput: (CaptureAdmission.MediaToken) -> Bool
+    private let strict: Bool
     private(set) var implementation = "Hardware H.264"
 
-    init(orientation: CaptureOrientation, profile: CaptureProfile = .defaultProfile, output: @escaping (CompressedUnit) -> Void, failure: @escaping (Error) -> Void) throws {
-        self.output = output; self.failure = failure
+    /// Legacy capture/fixture mode has no privacy-attribution authority. Strict
+    /// runtime composition uses the token-bearing initializer and encode APIs.
+    convenience init(orientation: CaptureOrientation, profile: CaptureProfile = .defaultProfile,
+                     output: @escaping (CompressedUnit) -> Void, failure: @escaping (Error) -> Void) throws {
+        try self.init(orientation: orientation, profile: profile, strict: false,
+            output: { unit, _ in output(unit) }, fault: { _, error in failure(error) }, permitsInput: { _ in false })
+    }
+    convenience init(orientation: CaptureOrientation, profile: CaptureProfile = .defaultProfile,
+                     output: @escaping (CompressedUnit, CaptureAdmission.MediaToken) -> Void,
+                     fault: @escaping (CaptureAdmission.MediaToken?, Error) -> Void,
+                     permitsInput: @escaping (CaptureAdmission.MediaToken) -> Bool) throws {
+        try self.init(orientation: orientation, profile: profile, strict: true,
+            output: { unit, token in if let token { output(unit, token) } }, fault: fault, permitsInput: permitsInput)
+    }
+    private init(orientation: CaptureOrientation, profile: CaptureProfile, strict: Bool,
+                 output: @escaping (CompressedUnit, CaptureAdmission.MediaToken?) -> Void,
+                 fault: @escaping (CaptureAdmission.MediaToken?, Error) -> Void,
+                 permitsInput: @escaping (CaptureAdmission.MediaToken) -> Bool) throws {
+        self.output = output; self.fault = fault; self.permitsInput = permitsInput; self.strict = strict
+        self.callbacks = try .init()
         self.profile = profile
         let dimensions = profile.dimensions(for: orientation)
         width = Int(dimensions.width); height = Int(dimensions.height)
-        let callback: VTCompressionOutputCallback = { context, _, status, _, sample in
+        let callback: VTCompressionOutputCallback = { context, reference, status, flags, sample in
             guard let context else { return }
             let encoder = Unmanaged<HardwareVideoEncoder>.fromOpaque(context).takeUnretainedValue()
-            guard status == noErr, let sample, CMSampleBufferDataIsReady(sample) else {
-                encoder.failure(CaptureFailure(message: "Hardware video encoder failed (\(status))")); return
-            }
-            encoder.receive(sample)
+            encoder.receive(reference: reference, status: status, flags: flags, sample: sample)
         }
         var created: VTCompressionSession?
         var encoderList: CFArray?
@@ -83,42 +105,150 @@ final class HardwareVideoEncoder {
         let status = VTSessionSetProperty(session, key: key, value: value)
         guard status == noErr else { throw CaptureFailure(message: "Video encoder setting failed (\(status))") }
     }
-    /// Complete accepted old frames without invalidating the encoder. The held
-    /// final old picture gets one nominal frame, not the camera-switch gap.
-    func sealForCameraSwitch() throws -> CMTime {
-        guard let session else { throw CaptureFailure(message: "Video encoder is closed") }
-        let status = VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-        guard status == noErr else { throw CaptureFailure(message: "Could not drain video before camera switch") }
-        lock.lock(); defer { lock.unlock() }
-        if let encoderFailure { throw encoderFailure }
-        guard let previous = pending else { throw CaptureFailure(message: "No accepted video boundary is available for camera switch") }
+    /// Allocate once, cold, independently of any private camera frame.
+    func prepareSlate() throws -> PreparedVideoSlate {
+        if let preparedSlate { return preparedSlate }
+        let created = try PreparedVideoSlate(width: width, height: height)
+        preparedSlate = created; return created
+    }
+
+    /// Accepted old native output keeps its original token. Empty is valid for
+    /// initial Standby; camera switching keeps its existing nonempty contract.
+    func sealForPrivacy() throws -> CMTime? {
+        try completeNativePrefix()
+        guard let previous = pending else { return nil }
         let duration = CMTime(value: 1, timescale: profile.frameRate)
-        try emit(previous, duration: duration); pending = nil
+        do { try emit(previous.sample, duration: duration, submission: previous.submission) }
+        catch { latchFault(previous.submission.token, error); throw error }
+        pending = nil
+        sealedEnd = try VideoEncodingTiming.sealedEnd(last: previous.submission.time, frameRate: profile.frameRate)
         return duration
     }
+    func sealForCameraSwitch() throws -> CMTime {
+        guard let duration = try sealForPrivacy() else {
+            throw CaptureFailure(message: "No accepted video boundary is available for camera switch")
+        }
+        return duration
+    }
+    private func completeNativePrefix() throws {
+        guard let session else { throw CaptureFailure(message: "Video encoder is closed") }
+        // Never hold state while VT waits for callbacks. Callbacks never wait
+        // for the samples/control owner or downstream IO.
+        let status = VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        if status != noErr {
+            let error = CaptureFailure(message: "Could not drain accepted hardware video (\(status))")
+            latchFault(nil, error); throw error
+        }
+        state.lock()
+        while callbacks.draining { state.wait() }
+        let failure = encoderFailure
+        let quiet = callbacks.quiescent
+        state.unlock()
+        if let failure { throw failure }
+        guard quiet else {
+            let error = CaptureFailure(message: "Hardware video callback ownership did not close")
+            latchFault(nil, error); throw error
+        }
+    }
     func requestKeyframe() { keyframeRequested = true }
-    func encode(_ sample: CMSampleBuffer, time: CMTime) throws {
-        guard let session, let image = CMSampleBufferGetImageBuffer(sample) else { throw CaptureFailure(message: "Video capture lost its pixel buffer") }
-        guard CVPixelBufferGetWidth(image) == width, CVPixelBufferGetHeight(image) == height else { throw CaptureFailure(message: "Camera no longer produces the prepared \(width)×\(height) format") }
-        let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: time,
-            duration: CMTime(value: 1, timescale: profile.frameRate), frameProperties: keyframeRequested ? keyframeProperties : nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
-        guard status == noErr else { throw CaptureFailure(message: "Hardware encoding failed (\(status))") }
-        keyframeRequested = false
+    @discardableResult func encode(_ sample: CMSampleBuffer, time: CMTime) throws -> Bool {
+        guard !strict else { throw CaptureFailure(message: "Video input requires its captured media token") }
+        guard let image = CMSampleBufferGetImageBuffer(sample) else { throw CaptureFailure(message: "Video capture lost its pixel buffer") }
+        return try submit(image, time: time, token: nil, forceIdr: false)
     }
-    private func receive(_ sample: CMSampleBuffer) {
-        lock.lock(); defer { lock.unlock() }
+    @discardableResult func encode(_ sample: CMSampleBuffer, time: CMTime, token: CaptureAdmission.MediaToken) throws -> Bool {
+        guard token.kind == .raw else {
+            let error = CaptureFailure(message: "Camera sample cannot claim synthetic video provenance")
+            latchFault(token, error); throw error
+        }
+        guard let image = CMSampleBufferGetImageBuffer(sample) else { throw CaptureFailure(message: "Video capture lost its pixel buffer") }
+        return try submit(image, time: time, token: token, forceIdr: false)
+    }
+    @discardableResult func encode(_ image: CVPixelBuffer, time: CMTime, token: CaptureAdmission.MediaToken, forceIdr: Bool = false) throws -> Bool {
+        return try submit(image, time: time, token: token, forceIdr: forceIdr)
+    }
+    @discardableResult func encode(_ slate: PreparedVideoSlate, time: CMTime, token: CaptureAdmission.MediaToken, forceIdr: Bool = false) throws -> Bool {
+        return try slate.withImage { try submit($0, time: time, token: token, forceIdr: forceIdr) }
+    }
+    private func submit(_ image: CVPixelBuffer, time: CMTime, token: CaptureAdmission.MediaToken?, forceIdr: Bool) throws -> Bool {
+        guard let session else { throw CaptureFailure(message: "Video encoder is closed") }
+        if strict {
+            guard let token, permitsInput(token) else { return false } // supersession/Stop is ordinary cancellation
+        }
         do {
-            // Hold one compressed frame so its duration follows actual capture
-            // PTS, rather than asserting fixed cadence across camera jitter.
-            if let previous = pending {
-                let delta = CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(sample), CMSampleBufferGetPresentationTimeStamp(previous))
-                guard delta.isValid, delta.seconds > 0, delta.seconds < 2 else { throw CaptureFailure(message: "Video timestamps jumped; prepare a new session") }
-                try emit(previous, duration: delta)
+            if let token {
+                guard token.kind == .raw || (token.kind == .slate && preparedSlate?.contains(image) == true) else {
+                    throw CaptureFailure(message: "Video token does not identify this prepared synthetic source")
+                }
             }
-            pending = sample
-        } catch { pending = nil; encoderFailure = encoderFailure ?? error; failure(error) }
+            try VideoEncodingTiming.requireNoOverlap(time, sealedEnd: sealedEnd)
+            guard CVPixelBufferGetWidth(image) == width, CVPixelBufferGetHeight(image) == height else {
+                throw CaptureFailure(message: "Video no longer matches its prepared canvas or sealed timeline")
+            }
+            state.lock()
+            let submission: Policy.Submission
+            do { submission = try callbacks.reserve(token: token, time: time) }
+            catch { state.unlock(); throw error }
+            state.unlock()
+            var flags = VTEncodeInfoFlags(rawValue: 0)
+            let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: time,
+                duration: CMTime(value: 1, timescale: profile.frameRate),
+                frameProperties: keyframeRequested || forceIdr ? keyframeProperties : nil,
+                sourceFrameRefcon: UnsafeMutableRawPointer(bitPattern: UInt(submission.serial)), infoFlagsOut: &flags)
+            guard status == noErr, !flags.contains(.frameDropped) else {
+                // The rejected native call may have returned without a callback.
+                // CompleteFrames/invalidation still own actual native teardown.
+                let error = CaptureFailure(message: "Hardware video submission failed or dropped (\(status))")
+                latchFault(token, error); throw error
+            }
+            keyframeRequested = false
+            return true
+        } catch { latchFault(token, error); throw error }
     }
-    private func emit(_ sample: CMSampleBuffer, duration: CMTime) throws {
+    private func receive(reference: UnsafeMutableRawPointer?, status: OSStatus, flags: VTEncodeInfoFlags, sample: CMSampleBuffer?) {
+        let serial = reference.map { UInt64(UInt(bitPattern: $0)) } ?? 0
+        let time = sample.map { CMSampleBufferGetPresentationTimeStamp($0) }
+        let usable = status == noErr && !flags.contains(.frameDropped) && sample.map({ CMSampleBufferDataIsReady($0) }) == true
+        state.lock()
+        let submission = callbacks.submission(serial)
+        var error: Error?
+        do { try callbacks.complete(serial, time: time, frame: usable ? sample : nil) } catch let problem { error = problem }
+        if !usable { error = error ?? CaptureFailure(message: "Hardware video callback failed or dropped (\(status))") }
+        if error != nil { callbacks.fail() }
+        let elected = callbacks.electDrainer()
+        state.unlock()
+        if let error { latchFault(submission?.token, error) }
+        if elected { drainCallbacks() }
+    }
+    /// One inline callback drainer, no per-frame dispatch or native query. A
+    /// concurrent callback only fills its already reserved bounded slot.
+    private func drainCallbacks() {
+        while true {
+            state.lock()
+            guard let (submission, sample) = callbacks.takeNext() else {
+                state.broadcast(); state.unlock(); return
+            }
+            let failed = encoderFailure != nil || callbacks.failed
+            state.unlock()
+            guard !failed, let sample else { continue }
+            do {
+                if let previous = pending {
+                    let duration = try VideoEncodingTiming.duration(from: previous.submission.time, to: submission.time)
+                    try emit(previous.sample, duration: duration, submission: previous.submission)
+                }
+                pending = (sample, submission)
+            } catch { pending = nil; latchFault(submission.token, error) }
+        }
+    }
+    /// The caller's callback must synchronously latch ONLY the immutable run's
+    /// scalar fault. Never samples.sync, control.sync or perform file/socket IO.
+    private func latchFault(_ token: CaptureAdmission.MediaToken?, _ error: Error) {
+        state.lock(); callbacks.fail(); encoderFailure = encoderFailure ?? error
+        let notify = !faultDelivered; faultDelivered = true
+        state.broadcast(); state.unlock()
+        if notify { fault(token, error) }
+    }
+    private func emit(_ sample: CMSampleBuffer, duration: CMTime, submission: Policy.Submission) throws {
         guard let format = CMSampleBufferGetFormatDescription(sample) else { throw CaptureFailure(message: "H.264 format is unavailable") }
         let dimensions = CMVideoFormatDescriptionGetDimensions(format)
         guard Int(dimensions.width) == width, Int(dimensions.height) == height else {
@@ -149,17 +279,30 @@ final class HardwareVideoEncoder {
         let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault, sampleBuffer: sample,
             sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &retimed)
         guard status == noErr, let retimed else { throw CaptureFailure(message: "Video timing conversion failed") }
-        output(CompressedUnit(buffer: retimed, isVideo: true, keyframe: keyframe, time: pts, duration: exactDuration, configuration: configuration))
+        output(CompressedUnit(buffer: retimed, isVideo: true, keyframe: keyframe, time: pts, duration: exactDuration, configuration: configuration), submission.token)
+    }
+    /// Checked terminal barrier for strict runtime. Even a failed prefix must
+    /// orderly invalidate the native session; the error remains sticky.
+    func finishChecked() throws {
+        guard let current = session else {
+            state.lock(); let failure = encoderFailure; state.unlock()
+            if let failure { throw failure }; return
+        }
+        state.lock(); callbacks.closeInput(); state.unlock()
+        defer {
+            // Even a failed CompleteFrames must not race a still-delivering
+            // callback's retained pending sample during actual native teardown.
+            VTCompressionSessionInvalidate(current)
+            session = nil
+            state.lock()
+            while callbacks.draining { state.wait() }
+            state.unlock()
+            pending = nil
+        }
+        _ = try sealForPrivacy()
     }
     func finish() {
-        guard let session else { return }
-        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-        lock.lock()
-        if let pending { do { try emit(pending, duration: CMTime(value: 1, timescale: profile.frameRate)) } catch { failure(error) } }
-        pending = nil
-        lock.unlock()
-        VTCompressionSessionInvalidate(session)
-        self.session = nil
+        do { try finishChecked() } catch { latchFault(nil, error) }
     }
     deinit { if let session { VTCompressionSessionInvalidate(session) } }
 }

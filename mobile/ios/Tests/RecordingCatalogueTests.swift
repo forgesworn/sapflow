@@ -29,6 +29,151 @@ final class RecordingCatalogueTests: XCTestCase {
     private func assertFailure(_ expected: RecordingCatalogue.Failure, _ body: () throws -> Void, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertThrowsError(try body(), file: file, line: line) { XCTAssertEqual($0 as? RecordingCatalogue.Failure, expected, file: file, line: line) }
     }
+    private let originalMovie = Data([0, 0, 0, 12] + Array("mdat".utf8) + [9, 8, 7, 6] + [0, 0, 0, 8] + Array("moov".utf8))
+    private let replacementMovie = Data([0, 0, 0, 12] + Array("moov".utf8) + [1, 2, 3, 4])
+    private func metadataWriter(_ catalogue: RecordingCatalogue) throws -> RecordingCatalogue.Writer {
+        let writer = try catalogue.begin(identity: catalogue.newShow(profile: .sd480p30).nextIdentity())
+        try originalMovie.write(to: writer.fileURL, options: .withoutOverwriting)
+        return writer
+    }
+    private func install(_ lease: RecordingCatalogue.Writer.MediaUpdate) throws {
+        try lease.installMovieHeader(offset: 12, original: originalMovie.subdata(in: 12..<20), replacement: replacementMovie)
+    }
+    func testClosedMetadataUpdateRetainsEveryMediaByteAndExpiresLeaseBeforeExport() throws {
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let writer = try metadataWriter(catalogue)
+        var escaped: RecordingCatalogue.Writer.MediaUpdate?
+        try writer.updateClosedMedia { lease in
+            escaped = lease
+            XCTAssertEqual(lease.originalBytes, 20)
+            XCTAssertEqual(try lease.read(offset: 8, count: 4), Data([9, 8, 7, 6]))
+            try install(lease)
+        }
+        var expected = originalMovie; expected.replaceSubrange(16..<20, with: Data("free".utf8)); expected.append(replacementMovie)
+        XCTAssertEqual(try Data(contentsOf: writer.fileURL), expected)
+        assertFailure(.unsafe) { _ = try escaped!.read(offset: 0, count: 8) }
+        XCTAssertThrowsError(try install(escaped!))
+        try writer.complete(durationMs: 100, outcome: .finalised)
+        let entry = try XCTUnwrap(catalogue.scan().first)
+        XCTAssertEqual(entry.state, .finalised)
+        let export = try catalogue.openExport(entry: entry)
+        var bytes = Data(); _ = try export.copy { bytes.append($0) }; try export.close()
+        XCTAssertEqual(bytes, expected)
+    }
+    func testRejectedMetadataBeforeMutationCanCloseAsExplicitlyIncomplete() throws {
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let writer = try metadataWriter(catalogue)
+        assertFailure(.unsafe) { try writer.updateClosedMedia { _ in throw RecordingCatalogue.Failure.unsafe } }
+        XCTAssertFalse(catalogue.cleanupUncertain)
+        XCTAssertEqual(try Data(contentsOf: writer.fileURL), originalMovie)
+        try writer.complete(durationMs: 100, outcome: .incomplete)
+        XCTAssertEqual(try catalogue.scan().first?.state, .incomplete)
+    }
+    func testCancelDuringMetadataLeaseCannotReleaseActualOpenOwner() throws {
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let writer = try metadataWriter(catalogue)
+        try writer.updateClosedMedia { lease in
+            writer.cancel()
+            assertFailure(.busy) { try writer.ownersClosed() }
+            XCTAssertTrue(catalogue.cleanupRetained)
+            assertFailure(.busy) { try catalogue.checkRecordingCapacity() }
+            XCTAssertEqual(try lease.read(offset: 8, count: 4), Data([9, 8, 7, 6]))
+        }
+        XCTAssertTrue(catalogue.cleanupRetained)
+        try writer.ownersClosed()
+        XCTAssertFalse(catalogue.cleanupRetained)
+        XCTAssertEqual(try catalogue.scan().first?.state, .incomplete)
+    }
+    func testMetadataUpdateRefusesHardLinksBeforeWritingOtherFile() throws {
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let writer = try metadataWriter(catalogue), linked = scratch.appendingPathComponent("linked.mov")
+        XCTAssertEqual(link(writer.fileURL.path, linked.path), 0)
+        assertFailure(.unsafe) { try writer.updateClosedMedia { try install($0) } }
+        XCTAssertEqual(try Data(contentsOf: linked), originalMovie)
+        XCTAssertFalse(catalogue.cleanupUncertain)
+        try FileManager.default.removeItem(at: linked)
+        writer.cancel(); try writer.ownersClosed()
+    }
+    func testMetadataPathSubstitutionCannotFinaliseOrAdoptReplacement() throws {
+        let catalogue = try RecordingCatalogue(root: directory())
+        let writer = try metadataWriter(catalogue), original = scratch.appendingPathComponent("retired.mov")
+        assertFailure(.changed) {
+            try writer.updateClosedMedia { lease in
+                try FileManager.default.moveItem(at: writer.fileURL, to: original)
+                try Data([5, 4, 3]).write(to: writer.fileURL)
+                try install(lease)
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: writer.fileURL), Data([5, 4, 3]))
+        XCTAssertTrue(catalogue.cleanupUncertain); XCTAssertTrue(catalogue.cleanupRetained)
+        XCTAssertFalse(writer.cleanupComplete)
+    }
+    func testPartialHeaderAppendNeverRetiresOriginalOrReleasesUncertainOwner() throws {
+        var writes = 0
+        let io = RecordingCatalogue.MediaUpdateIO(write: { fd, bytes, count, offset in
+            writes += 1
+            if writes == 1 { return Darwin.pwrite(fd, bytes, min(3, count), offset) }
+            errno = EIO; return -1
+        }, synchronize: Darwin.fsync)
+        let catalogue = try RecordingCatalogue(root: directory(), mediaUpdateIO: io), writer = try metadataWriter(catalogue)
+        assertFailure(.io) { try writer.updateClosedMedia { try install($0) } }
+        let bytes = try Data(contentsOf: writer.fileURL)
+        XCTAssertEqual(bytes.prefix(originalMovie.count), originalMovie)
+        XCTAssertEqual(bytes.count, originalMovie.count + 3); XCTAssertEqual(writes, 2)
+        XCTAssertTrue(catalogue.cleanupUncertain); XCTAssertFalse(writer.cleanupComplete)
+        assertFailure(.closed) { try catalogue.checkRecordingCapacity() }
+    }
+    func testAppendSyncFailureLeavesOriginalHeaderAndKeepsOwner() throws {
+        var syncs = 0
+        let io = RecordingCatalogue.MediaUpdateIO(write: { Darwin.pwrite($0, $1, $2, $3) }, synchronize: { _ in
+            syncs += 1; errno = EIO; return -1
+        })
+        let catalogue = try RecordingCatalogue(root: directory(), mediaUpdateIO: io), writer = try metadataWriter(catalogue)
+        assertFailure(.io) { try writer.updateClosedMedia { try install($0) } }
+        XCTAssertEqual(try Data(contentsOf: writer.fileURL), originalMovie + replacementMovie)
+        XCTAssertEqual(syncs, 1); XCTAssertTrue(catalogue.cleanupUncertain)
+        writer.cancel(); assertFailure(.busy) { try writer.ownersClosed() }
+    }
+    func testRetirementSyncFailureDoesNotClaimSuccessfulFinalisation() throws {
+        var syncs = 0
+        let io = RecordingCatalogue.MediaUpdateIO(write: { Darwin.pwrite($0, $1, $2, $3) }, synchronize: { fd in
+            syncs += 1
+            if syncs == 2 { errno = EIO; return -1 }; return Darwin.fsync(fd)
+        })
+        let catalogue = try RecordingCatalogue(root: directory(), mediaUpdateIO: io), writer = try metadataWriter(catalogue)
+        assertFailure(.io) { try writer.updateClosedMedia { try install($0) } }
+        XCTAssertEqual(syncs, 2); XCTAssertTrue(catalogue.cleanupUncertain)
+        XCTAssertFalse(writer.cleanupComplete)
+        assertFailure(.cancelled) { try writer.complete(durationMs: 100, outcome: .finalised) }
+    }
+    func testMetadataDescriptorCloseErrorNeverRetriesRecycledNumber() throws {
+        var fault = false, closes = 0
+        let catalogue = try RecordingCatalogue(root: directory(), closeFileDescriptor: { fd in
+            closes += 1; let result = Darwin.close(fd)
+            return fault ? -1 : result
+        })
+        let writer = try metadataWriter(catalogue); fault = true
+        assertFailure(.io) { try writer.updateClosedMedia { try install($0) } }
+        let closedOnce = closes
+        XCTAssertTrue(catalogue.cleanupUncertain); XCTAssertFalse(writer.cleanupComplete)
+        assertFailure(.busy) { try writer.updateClosedMedia { _ in } }
+        writer.cancel(); assertFailure(.busy) { try writer.ownersClosed() }
+        XCTAssertEqual(closes, closedOnce)
+    }
+    func testMetadataWritesRetryInterruptedAndShortSyscallsWithinOriginalOrder() throws {
+        var writes = 0
+        let io = RecordingCatalogue.MediaUpdateIO(write: { fd, bytes, count, offset in
+            writes += 1
+            if writes == 1 { errno = EINTR; return -1 }
+            return Darwin.pwrite(fd, bytes, min(2, count), offset)
+        }, synchronize: Darwin.fsync)
+        let catalogue = try RecordingCatalogue(root: directory(), mediaUpdateIO: io), writer = try metadataWriter(catalogue)
+        defer { try? catalogue.close() }
+        try writer.updateClosedMedia { try install($0) }
+        XCTAssertEqual(writes, 9)
+        XCTAssertFalse(catalogue.cleanupUncertain)
+        try writer.complete(durationMs: 100, outcome: .finalised)
+    }
     func testNewAudioOnlyM4AIdentityAndExactExportSurviveReopen() throws {
         let catalogue = try RecordingCatalogue(root: directory())
         let writer = try catalogue.begin(identity: catalogue.newShow(profile: .audioOnly48kMono).nextIdentity())

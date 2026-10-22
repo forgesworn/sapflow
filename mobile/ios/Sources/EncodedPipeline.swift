@@ -59,6 +59,13 @@ extension EncodedPublishingSink {
 /// Connects native compressed data to the actual Rust descriptor validator.
 /// No attached destination means recording/SDK validation only, visibly so.
 final class RustEncodedIngress {
+    struct ValidatedUnit {
+        let sample: MediaSample
+        let pts: Int64
+        let duration: UInt32
+        /// MediaCodec.sample rejects a flag that differs from coded AVCC IDR.
+        let codedIdr: Bool
+    }
     private var expectsVideo = true
     private var video: MediaCodec?
     private var audio: MediaCodec?
@@ -106,10 +113,9 @@ final class RustEncodedIngress {
             configuredDestination = true
         }
     }
-    func accept(_ unit: CompressedUnit) throws {
+    func validate(_ unit: CompressedUnit) throws -> ValidatedUnit {
         guard !unit.isVideo || expectsVideo else { throw CaptureFailure(message: "Video is forbidden in this audio-only capture") }
         let codec = try codec(for: unit.configuration)
-        try configureDestination()
         guard let block = CMSampleBufferGetDataBuffer(unit.buffer) else { throw CaptureFailure(message: "Compressed buffer has no payload") }
         var pointer: UnsafeMutablePointer<Int8>?
         var contiguous = 0
@@ -127,13 +133,25 @@ final class RustEncodedIngress {
         guard durationTicks > 0, durationTicks <= Int64(UInt32.max) else { throw CaptureFailure(message: "Compressed sample duration is invalid") }
         let duration = UInt32(durationTicks)
         guard pts >= 0 else { throw CaptureFailure(message: "Encoder timestamp precedes the recording epoch") }
-        try withExtendedLifetime(unit.buffer) {
+        guard accepted < UInt64.max else { throw CaptureFailure(message: "Encoded validation counter is exhausted") }
+        let sample = try withExtendedLifetime(unit.buffer) {
             let sample = try codec.sample(bytes: view, pts: pts, dts: pts, duration: duration, timescale: UInt32(scale), keyframe: unit.keyframe)
-            // Immutable sample goes through the same seam with or without a
-            // network adapter; validation is real, network status is separate.
-            try destination?.offer(sample)
+            return sample
         }
         accepted += 1
+        return ValidatedUnit(sample: sample, pts: pts, duration: duration, codedIdr: unit.isVideo && unit.keyframe)
+    }
+
+    /// Validation remains available after a terminal publishing End. Recording
+    /// uses the original native compressed buffer; transport gets this same
+    /// immutable Rust sample without a second payload validation or copy.
+    func publish(_ validated: ValidatedUnit, sample: MediaSample? = nil) throws {
+        try configureDestination()
+        try destination?.offer(sample ?? validated.sample)
+    }
+
+    func accept(_ unit: CompressedUnit) throws {
+        try publish(validate(unit))
     }
 
     func reset(hasVideo: Bool = true) {

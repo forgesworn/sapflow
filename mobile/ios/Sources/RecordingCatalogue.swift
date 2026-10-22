@@ -90,6 +90,14 @@ final class RecordingCatalogue {
     private let root: Directory
     private let legacy: Directory?
     private let closeFileDescriptor: (Int32) -> Int32
+    /// Cold metadata writes only. Tests replace syscall receipts, never the
+    /// catalogue's ownership, identity checks or mutation order.
+    struct MediaUpdateIO {
+        let write: (Int32, UnsafeRawPointer, Int, off_t) -> Int
+        let synchronize: (Int32) -> Int32
+        static let native = MediaUpdateIO(write: { Darwin.pwrite($0, $1, $2, $3) }, synchronize: Darwin.fsync)
+    }
+    private let mediaUpdateIO: MediaUpdateIO
     private let lock = NSLock()
     private var owner: (token: UUID, kind: Owner)?
     private var uncertain = false
@@ -103,8 +111,10 @@ final class RecordingCatalogue {
     private static let maxReceipt = 4096
 
     init(root: URL, legacyRoot: URL? = nil,
+         mediaUpdateIO: MediaUpdateIO = .native,
          closeFileDescriptor: @escaping (Int32) -> Int32 = Darwin.close) throws {
         self.closeFileDescriptor = closeFileDescriptor
+        self.mediaUpdateIO = mediaUpdateIO
         guard root.isFileURL, !root.path.utf8.contains(0) else { throw Failure.unsafe }
         do { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         catch { throw Failure.io }
@@ -305,15 +315,136 @@ final class RecordingCatalogue {
         let identity: Identity
         private let createdAtMs: Int64
         private let lock = NSLock()
-        private enum Phase { case writing, cancelled, finishing, closed }
+        private enum Phase { case writing, updating, cancelled, finishing, closed }
         private var phase = Phase.writing
+        private var cancelAfterUpdate = false
         fileprivate init(catalogue: RecordingCatalogue, token: UUID, identity: Identity, createdAtMs: Int64) {
             self.catalogue = catalogue; self.token = token; self.identity = identity; self.createdAtMs = createdAtMs
         }
         var fileURL: URL { catalogue.root.url.appendingPathComponent(identity.filename) }
         var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return phase == .closed }
-        func cancel() { lock.lock(); if phase == .writing { phase = .cancelled }; lock.unlock() }
+        func cancel() {
+            lock.lock()
+            if phase == .writing { phase = .cancelled }
+            else if phase == .updating { cancelAfterUpdate = true }
+            lock.unlock()
+        }
         func retainUncertainCleanup() { catalogue.poison(self) }
+        /// A scoped descriptor after AVAssetWriter has actually closed. Neither
+        /// its number nor a share URL escapes to the caller. A stale lease can
+        /// never touch a recycled descriptor after this method returns.
+        final class MediaUpdate {
+            private let operation = NSRecursiveLock()
+            private let io: MediaUpdateIO
+            fileprivate let fd: Int32
+            let originalBytes: UInt64
+            fileprivate var active = true
+            fileprivate var mutationBegan = false
+            fileprivate var committed = false
+            fileprivate var expectedBytes: UInt64
+            fileprivate init(fd: Int32, bytes: UInt64, io: MediaUpdateIO) {
+                self.fd = fd; originalBytes = bytes; expectedBytes = bytes; self.io = io
+            }
+            fileprivate func invalidate() { operation.lock(); active = false; operation.unlock() }
+            private static let metadataLimit = 16 * 1024 * 1024 + 4096
+            func read(offset: UInt64, count: Int) throws -> Data {
+                operation.lock(); defer { operation.unlock() }
+                guard active, count >= 0, count <= Self.metadataLimit,
+                      offset <= UInt64(Int64.max), UInt64(count) <= UInt64(Int64.max) - offset else { throw Failure.unsafe }
+                var bytes = Data(count: count)
+                try bytes.withUnsafeMutableBytes { buffer in
+                    var position = 0
+                    while position < count {
+                        let n = pread(fd, buffer.baseAddress!.advanced(by: position), count - position, off_t(offset) + off_t(position))
+                        if n < 0 && errno == EINTR { continue }
+                        guard n > 0 else { throw Failure.io }
+                        position += n
+                    }
+                }
+                return bytes
+            }
+            private func write(_ bytes: Data, offset: UInt64) throws {
+                operation.lock(); defer { operation.unlock() }
+                guard active, !bytes.isEmpty, bytes.count <= Self.metadataLimit,
+                      offset <= UInt64(Int64.max), UInt64(bytes.count) <= UInt64(Int64.max) - offset else { throw Failure.unsafe }
+                try bytes.withUnsafeBytes { buffer in
+                    var position = 0
+                    while position < bytes.count {
+                        let n = io.write(fd, buffer.baseAddress!.advanced(by: position), bytes.count - position, off_t(offset) + off_t(position))
+                        if n < 0 && errno == EINTR { continue }
+                        guard n > 0 else { throw Failure.io }
+                        position += n
+                    }
+                }
+            }
+            /// All preparation precedes mutation. The original header remains
+            /// usable until the complete replacement is durably appended and
+            /// read back. No media byte or chunk offset is relocated.
+            func installMovieHeader(offset: UInt64, original: Data, replacement: Data) throws {
+                operation.lock(); defer { operation.unlock() }
+                guard active, !mutationBegan, original.count >= 8, replacement.count >= 8,
+                      original.startIndex == 0, replacement.startIndex == 0,
+                      original.count <= Self.metadataLimit, replacement.count <= Self.metadataLimit,
+                      originalBytes <= UInt64(Int64.max), UInt64(replacement.count) <= UInt64(Int64.max) - originalBytes,
+                      offset <= originalBytes, UInt64(original.count) == originalBytes - offset,
+                      original.subdata(in: 4..<8) == Data("moov".utf8),
+                      replacement.subdata(in: 4..<8) == Data("moov".utf8),
+                      try read(offset: offset, count: original.count) == original else { throw Failure.changed }
+                expectedBytes = originalBytes + UInt64(replacement.count)
+                mutationBegan = true
+                try write(replacement, offset: originalBytes)
+                guard io.synchronize(fd) == 0,
+                      try read(offset: originalBytes, count: replacement.count) == replacement,
+                      try read(offset: offset + 4, count: 4) == Data("moov".utf8) else { throw Failure.io }
+                try write(Data("free".utf8), offset: offset + 4)
+                guard io.synchronize(fd) == 0,
+                      try read(offset: offset + 4, count: 4) == Data("free".utf8),
+                      try read(offset: originalBytes, count: replacement.count) == replacement else { throw Failure.io }
+                committed = true
+            }
+        }
+        /// Unsupported metadata before the first write may leave the original
+        /// prefix explicitly incomplete. Any ambiguous mutation or close keeps
+        /// the catalogue owner retained and blocks a new recording.
+        func updateClosedMedia<T>(_ body: (MediaUpdate) throws -> T) throws -> T {
+            lock.lock()
+            guard phase == .writing else { lock.unlock(); throw Failure.busy }
+            phase = .updating; lock.unlock()
+            var needsClose = false
+            var knownClosed = true
+            var descriptor: Int32 = -1
+            var update: MediaUpdate?
+            do {
+                try catalogue.check(catalogue.root)
+                guard let before = try catalogue.info(catalogue.root, identity.filename), before.size > 0 else { throw Failure.ineligible }
+                descriptor = openat(catalogue.root.fd, identity.filename, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+                guard descriptor >= 0 else { throw Failure.io }
+                needsClose = true; knownClosed = false
+                guard try catalogue.descriptorInfo(descriptor) == before else { throw Failure.changed }
+                let lease = MediaUpdate(fd: descriptor, bytes: UInt64(before.size), io: catalogue.mediaUpdateIO); update = lease
+                let result = try body(lease)
+                lease.invalidate()
+                guard !lease.mutationBegan || lease.committed else { throw Failure.io }
+                let after = try catalogue.descriptorInfo(descriptor)
+                guard after.device == before.device, after.inode == before.inode,
+                      after.size >= 0, UInt64(after.size) == lease.expectedBytes,
+                      try catalogue.info(catalogue.root, identity.filename) == after else { throw Failure.changed }
+                try catalogue.check(catalogue.root)
+                needsClose = false // Never retry an ambiguous numeric close.
+                try catalogue.closeFD(descriptor); knownClosed = true
+                lock.lock(); phase = cancelAfterUpdate ? .cancelled : .writing; lock.unlock()
+                return result
+            } catch {
+                update?.invalidate()
+                if needsClose {
+                    needsClose = false
+                    do { try catalogue.closeFD(descriptor); knownClosed = true } catch { knownClosed = false }
+                }
+                if !knownClosed || update?.mutationBegan == true { catalogue.poison(self) }
+                else { lock.lock(); phase = cancelAfterUpdate ? .cancelled : .writing; lock.unlock() }
+                throw error
+            }
+        }
         /// Invoke only after the real writer completed and owns no further IO.
         /// Prior append/backlog loss must select incomplete even if it completed.
         func complete(durationMs: Int64, outcome: Completion) throws {
