@@ -64,6 +64,10 @@ The existing A/V constructor and reconfigure method remain available;
 topologies. Audio-only callers must forward updates and errors. The older void
 audio methods remain video-led compatibility paths.
 
+Rust consumers matching RTMP events must handle the new `Event::Tracks` variant.
+Update literals need `media_loss` or a default initializer; consumers must
+preserve that flag when merging updates and reporting recording completion.
+
 `Health.keyframe_interval_ms` is now `Option<u64>`: A/V JSON retains its numeric
 field, while audio-only JSON carries `keyframeIntervalMs: null`. Bitrate remains
 measured. A scoped fresh-media receipt reports the actual tracks in a current
@@ -73,11 +77,21 @@ It is encoded availability, separate from fetching and decoding.
 ## Remaining release gates
 
 Finite generated loopback tests decode four SRT/RTMP audio profiles through HLS
-and recording, plus an A/V SRT regression. RTMP recordings retain all 283/260
-source AAC frames at 48/44.1 kHz. The corresponding SRT recordings contain
-272/253 frames. The source remux preserves every input frame; the loss stage
-between black-box SRT sending and origin close is not yet isolated. These SRT
-results establish decodable prefixes, not complete tail retention.
+and recording, plus an A/V SRT regression. RTMP recordings retain the source
+counts of 283/260 AAC frames at 48/44.1 kHz. The initial SRT recordings contain
+272/253 frames. A controlled follow-up uses an explicit 1,316-byte read chunk,
+a nine-second sender timer and a loopback UDP proxy. Unpadded input loses its
+final 1,128/188 bytes before the origin; the captured wire bytes equal the exact
+source prefix. Adding valid null TS packets to complete the last block makes
+the transmitted and captured bytes/hash equal, and recordings contain 283/260
+frames. This isolates final short-input truncation by the black-box test sender
+in that controlled configuration. The original default-chunk/EOF run remains
+separate evidence. Neither run qualifies native shutdown or a complete show.
+
+Terminal TS coverage must also exercise a complete bounded PES contained in one
+TS start packet. Source inspection identifies a reader path that waits for the
+next PES or real EOF; current live-feed starvation supplies neither terminal
+policy nor an executed regression for that case.
 
 The native apps still need mic-only capture/permissions, audio-only recording
 and remote PCM observation, with no camera, video encoder or keyframe wait.

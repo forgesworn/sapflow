@@ -26,9 +26,14 @@ Generated loopback tests independently decode four AAC profiles through SRT or
 our production RTMP publisher, HLS parts/segments and recordings; an A/V SRT
 regression and nine negative cases also pass. Actual audio-only health carries
 a null keyframe interval; A/V remains numeric. RTMP recordings preserve all
-283/260 source frames. The SRT recordings contain 272/253, despite a complete
-source remux, so terminal SRT frame retention remains an explicit open gate.
-Those SRT results prove decodable prefixes. No phone recording was accessed;
+283/260 source frame counts. Initial SRT recordings contain 272/253. A separate
+controlled test with an explicit 1,316-byte chunk and nine-second sender timer
+captures the exact TS wire bytes: the unpadded test sender omits the final
+1,128/188 bytes before the origin. Valid null-TS padding completes its last
+block; captured bytes/hash then match the input and recordings contain 283/260
+frames. Native shutdown, terminal PES cases and complete-show retention remain
+open. The earlier default-chunk/EOF run remains separately labelled evidence.
+No phone recording was accessed;
 all test media were generated and all owned runtime children/scratch removed.
 Native mic-only mode, audio-only V4V observation/profile admission, physical
 background/lock/routes and complete-show qualification remain unfinished.
