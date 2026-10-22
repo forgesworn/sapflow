@@ -5,12 +5,16 @@ turns the staged rollout in [readiness.md](readiness.md) into steps. The
 trial is one non-critical show of the v4v live stage with mediamtx left
 ready, and it ends in a decision (section 5), not a switch.
 
-Facts from 2026-10-21 that `main`'s docs do not carry yet: OBS, Larix and
+Historical checkpoint from 2026-10-21: OBS, Larix and
 our own Android app have published over SRT (with and without a passphrase)
 and RTMP (the docs record the first two only); v4v's player fix for jumping back to live after a drop (v4v #475)
 is merged and was checked in real Safari; our Android app does not
-reconnect by itself yet (Larix and OBS do); the wired Linux load test has
-not run. `readiness.md` still says the player fix is unmerged.
+reconnect by itself at that checkpoint (Larix and OBS did); the wired Linux
+load test had not run. Later native development adds bounded reconnect and
+records a finite Pixel recovery test in
+[mobile delivery status](mobile-delivery-status.md). That evidence does not
+qualify the native app for this complete-show trial. Check current readiness
+and player/deployment evidence when choosing the frozen trial revision.
 
 Everything in angle brackets is a placeholder, filled in from the
 deployment and never committed.
@@ -36,7 +40,8 @@ deployment and never committed.
   switch window (the switch is deployment-wide, section 6), whose planned
   peak is 50 concurrent viewers or fewer, inside the closed beta.
 - [ ] **The performer's encoder.** Larix or OBS, with auto-reconnect on.
-  Not our Android app (no auto-reconnect yet).
+  Our Android app remains outside this trial until its current build passes
+  complete-show qualification, including reconnect and local recording.
 - [ ] **The performer's protocol.** RTMP is the first choice: it is what v4v's
   reference mediamtx config serves (SRT is off there), and it has the longer record (Larix resumed seven
   drops in six minutes). Use SRT only if the venue's uplink needs it, and
@@ -66,6 +71,10 @@ deployment and never committed.
   - `PULSEWIRE_LIVE_PLAYBACK_PROBE_URL_TEMPLATE` is `https://`, not the
     internal `http://` form in section 2.5: read where it points before
     changing it.
+
+  These observations describe the legacy trial deployment. They do not
+  configure native V4V clients or replace their scoped destination grants,
+  per-session encryption or approved playback origins.
 - [ ] **Who decides a rollback on the night**, and the channel to the
   performer that stays open throughout (a call or a chat, not Studio).
 
