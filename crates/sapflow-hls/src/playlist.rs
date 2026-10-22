@@ -96,19 +96,33 @@ fn secs(d: Duration) -> String {
 
 /// The LL-HLS media playlist. Call only once `has_content()` is true.
 pub fn media(m: &Muxer, prefix: &str) -> String {
+    media_with_mode(m, prefix, true)
+}
+
+/// Complete segments remain available when a deployment disables part delivery.
+/// The segment timeline, gaps and codec-epoch maps are shared with LL-HLS.
+pub fn media_with_mode(m: &Muxer, prefix: &str, low_latency: bool) -> String {
     let mut s = String::with_capacity(4096);
     let part_target = m.part_target();
     let _ = write!(
         s,
-        "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{}\n\
-         #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={}\n\
-         #EXT-X-PART-INF:PART-TARGET={}\n#EXT-X-MEDIA-SEQUENCE:{}\n\
-         #EXT-X-DISCONTINUITY-SEQUENCE:{}\n#EXT-X-MAP:URI=\"{}\"\n",
+        "#EXTM3U\n#EXT-X-VERSION:10\n#EXT-X-TARGETDURATION:{}\n",
         m.target_duration(),
-        // Apple HLS authoring specification 14.3 requires at least three
-        // Part Target Durations, stronger than the HLS draft's two-target floor.
-        secs(part_target * 3),
-        secs(part_target),
+    );
+    if low_latency {
+        let _ = write!(
+            s,
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={}\n\
+             #EXT-X-PART-INF:PART-TARGET={}\n",
+            // Apple HLS authoring specification 14.3 requires at least three
+            // Part Target Durations, stronger than the HLS draft's two-target floor.
+            secs(part_target * 3),
+            secs(part_target),
+        );
+    }
+    let _ = write!(
+        s,
+        "#EXT-X-MEDIA-SEQUENCE:{}\n#EXT-X-DISCONTINUITY-SEQUENCE:{}\n#EXT-X-MAP:URI=\"{}\"\n",
         m.media_sequence(),
         m.discontinuity_sequence(),
         epoch_init_name(
@@ -173,7 +187,7 @@ pub fn media(m: &Muxer, prefix: &str) -> String {
                 if n - i <= 2 {
                     let _ = writeln!(s, "#EXT-X-PROGRAM-DATE-TIME:{}", rfc3339_millis(seg.start));
                 }
-                if i >= parts_from {
+                if low_latency && i >= parts_from {
                     for p in &seg.parts {
                         write_part(&mut s, prefix, p.id, p.duration, p.independent);
                     }
@@ -186,6 +200,9 @@ pub fn media(m: &Muxer, prefix: &str) -> String {
                 );
             }
         }
+    }
+    if !low_latency {
+        return s;
     }
     if m.open_discontinuity() && !m.open_parts().is_empty() {
         s.push_str("#EXT-X-DISCONTINUITY\n");
@@ -384,6 +401,45 @@ mod tests {
     use super::*;
     use crate::muxer::tests::{aac, feed, video};
     use crate::muxer::{Muxer, MuxerConfig};
+
+    #[test]
+    fn whole_segment_mode_keeps_the_completed_timeline_without_part_advertising() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        feed(&mut m, 0..(30 * 3 + 7), 30);
+        let low = media(&m, "p1");
+        let whole = media_with_mode(&m, "p1", false);
+        for tag in [
+            "#EXT-X-PART",
+            "#EXT-X-SERVER-CONTROL",
+            "#EXT-X-PRELOAD-HINT",
+        ] {
+            assert!(
+                !whole.contains(tag),
+                "{tag} must not advertise partial delivery"
+            );
+        }
+        let closed = |text: &str| {
+            text.lines()
+                .filter(|line| {
+                    line.starts_with("#EXTINF:") || (!line.starts_with('#') && !line.is_empty())
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(closed(&whole), closed(&low));
+        for tag in [
+            "#EXT-X-TARGETDURATION:",
+            "#EXT-X-MEDIA-SEQUENCE:",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:",
+            "#EXT-X-MAP:",
+        ] {
+            assert_eq!(
+                whole.lines().find(|line| line.starts_with(tag)),
+                low.lines().find(|line| line.starts_with(tag))
+            );
+        }
+        assert!(whole.ends_with("p1_seg9.mp4\n"));
+    }
 
     #[test]
     fn media_playlist_has_the_ios_shape() {

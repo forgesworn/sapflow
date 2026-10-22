@@ -159,6 +159,13 @@ async fn media(
     let Ok((msn, part)) = playlist::parse_blocking_query(query.as_deref()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // Without parts or CAN-BLOCK-RELOAD, the client reloads completed segments.
+    // Ignore an in-flight blocking request from before an operator changed mode.
+    let (msn, part) = if app.config.low_latency {
+        (msn, part)
+    } else {
+        (None, None)
+    };
     let Some(stream) = stream_for(&app, &event) else {
         return not_found();
     };
@@ -177,6 +184,15 @@ async fn media(
             match readiness {
                 Readiness::BadRequest => return StatusCode::BAD_REQUEST.into_response(),
                 Readiness::Ready => {
+                    if !app.config.low_latency
+                        && let Some(muxer) = st.ingest.muxer()
+                    {
+                        return body(
+                            Bytes::from(playlist::media_with_mode(muxer, &st.prefix, false)),
+                            PLAYLIST_TYPE,
+                            "no-cache",
+                        );
+                    }
                     if let Some(b) = st.media.clone() {
                         return body(b, PLAYLIST_TYPE, "no-cache");
                     }
@@ -331,6 +347,63 @@ mod epoch_tests {
         )
         .expect("valid epoch regression fixture")
     }
+
+    #[tokio::test]
+    async fn whole_mode_serves_completed_segments_without_waiting_for_old_part_queries() {
+        let (mut app, _scratch) = app(false);
+        Arc::get_mut(&mut app)
+            .expect("unshared fixture")
+            .config
+            .low_latency = false;
+        let mut publisher = begin(&app);
+        publisher
+            .push(|source, now| match source {
+                Source::Ts(ts) => ts.push(LANDSCAPE, now),
+                _ => unreachable!(),
+            })
+            .expect("synthetic transport stream");
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            media(
+                State(app.clone()),
+                Path("event-epochs".into()),
+                RawQuery(Some("_HLS_msn=999999&_HLS_part=99".into())),
+            ),
+        )
+        .await
+        .expect("whole playlists do not wait for parts");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("playlist body")
+            .to_bytes();
+        let text = std::str::from_utf8(&bytes).expect("UTF-8 playlist");
+        assert!(!text.contains("#EXT-X-PART"));
+        assert!(!text.contains("#EXT-X-SERVER-CONTROL"));
+        assert!(!text.contains("#EXT-X-PRELOAD-HINT"));
+        let file = text
+            .lines()
+            .find(|line| !line.starts_with('#') && line.contains("_seg"))
+            .expect("completed segment");
+        let response = chunk(
+            State(app.clone()),
+            Path(("event-epochs".into(), file.into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .into_body()
+                .collect()
+                .await
+                .expect("segment body")
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
     async fn exercise(app: &Arc<App>) {
         let mut check = playlist::RuleCheck::default();
         let mut pending = None;

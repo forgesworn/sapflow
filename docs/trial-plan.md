@@ -41,6 +41,19 @@ deployment and never committed.
   reference mediamtx config serves (SRT is off there), and it has the longer record (Larix resumed seven
   drops in six minutes). Use SRT only if the venue's uplink needs it, and
   then only after the dry run has shown Larix or OBS connecting reliably.
+- [ ] **Read production's live settings from the server.** They are not in
+  the repository. On the production host, list the variable names and their
+  scheme only, without printing secrets:
+  `grep -oE '^PULSEWIRE_LIVE_[A-Z_]+=([a-z]+://)?' <env-file>`. Then check:
+  - `PULSEWIRE_LIVE_RTMP_SERVER_URL_TEMPLATE` starts `rtmp://`. If it starts
+    `rtmps://`, sapflow cannot take it directly: either the trial offers plain
+    `rtmp://` to the one performer, or a TLS front (Caddy layer4 or stunnel)
+    terminates RTMPS in front of sapflow's RTMP port, and the dry run covers it.
+  - `PULSEWIRE_LIVE_STREAM_ID_TEMPLATE` is `{eventId}` (section 2.5).
+  - The publisher password in mediamtx's `authInternalUsers` is letters and
+    digits only (section 2.3).
+  - Who owns mediamtx's recording directory, so sapflow's
+    `SAPFLOW_RECORDINGS` gets the same owner (section 2.3).
 - [ ] **Who decides a rollback on the night**, and the channel to the
   performer that stays open throughout (a call or a chat, not Studio).
 

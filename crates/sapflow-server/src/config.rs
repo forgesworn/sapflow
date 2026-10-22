@@ -40,6 +40,7 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_CALLBACK_SECRET  the callback token (appended as token= if the URL
                            has no {token})
   SAPFLOW_SEGMENT_COUNT    segments kept in the playlist (default 24, min 7)
+  SAPFLOW_HLS_MODE         low-latency (default) or whole; whole omits parts
   SAPFLOW_RECORDINGS       record every show to this directory (unset: off)
   SAPFLOW_RECORD_SKIP      paths not to record, comma-separated; a trailing *
                            matches a prefix (live/event-loop-*)
@@ -73,6 +74,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_CALLBACK_URL",
     "SAPFLOW_CALLBACK_SECRET",
     "SAPFLOW_SEGMENT_COUNT",
+    "SAPFLOW_HLS_MODE",
     "SAPFLOW_RTMP_ADDR",
     "SAPFLOW_RECORDINGS",
     "SAPFLOW_RECORD_SKIP",
@@ -108,6 +110,7 @@ pub struct Config {
     pub callback_url: Option<String>,
     pub callback_secret: Option<String>,
     pub segment_count: usize,
+    pub low_latency: bool,
     pub recordings: Option<PathBuf>,
     pub record_policy: RecordPolicy,
     pub record_delete_after: Duration,
@@ -360,6 +363,15 @@ impl Config {
             });
 
         Ok(Self {
+            low_latency: match vals.get("SAPFLOW_HLS_MODE").map(String::as_str) {
+                None | Some("low-latency") => true,
+                Some("whole") => false,
+                Some(_) => {
+                    return Err(ConfigError::Invalid(
+                        "SAPFLOW_HLS_MODE: low-latency or whole".into(),
+                    ));
+                }
+            },
             control,
             reconnect_grace,
             health_interval,
@@ -386,6 +398,23 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hls_delivery_mode_is_explicit_and_defaults_to_low_latency() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        assert!(load(&[open], &[]).expect("default config").low_latency);
+        assert!(
+            !load(&[open, ("SAPFLOW_HLS_MODE", "whole")], &[])
+                .expect("whole config")
+                .low_latency
+        );
+        assert!(load(&[open, ("SAPFLOW_HLS_MODE", "invalid")], &[]).is_err());
+        assert!(
+            !load(&[open], &["--hls-mode", "whole"])
+                .expect("flag override")
+                .low_latency
+        );
+    }
 
     fn load(env: &[(&str, &str)], args: &[&str]) -> Result<Config, ConfigError> {
         let env: Vec<(String, String)> = env

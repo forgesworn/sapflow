@@ -425,6 +425,172 @@ runs were not link-limited anyway (below).
 - Not done here: the same run against mediamtx behind the same Caddy, and
   all 250 or 750 viewers full (the link could not carry it).
 
+## One machine over loopback, all viewers full (2026-10-21)
+
+The Wi-Fi run above could not carry more than 12 full viewers, so 250 and 750
+viewers all fetching media were never measured across a network. This run
+takes the network away: sapflow, the publisher and the viewers all ran on one
+Mac over 127.0.0.1, direct HTTP/1.1, with no Caddy and no TLS. It is the
+2026-10-20 one-machine test (every viewer full) repeated on a 16-core M4 with
+the current main, three runs each. **It measures sapflow's own cost at full
+load. It does not measure the network, Caddy, TLS or HTTP/2,** and it does not
+close the milestone item for the wired Linux run behind Caddy.
+
+### Setup
+
+- **One machine:** Apple M4 Max, 16 cores, 64 GB, macOS 26.6, shared with
+  other sessions' work (see Conditions). sapflow release build of main at
+  b92e735 in a throwaway worktree (removed afterwards). The only 1.94.1 Rust
+  toolchain installed on that Mac is the x86_64 build, which would have
+  produced Rosetta binaries, so the build named the target and `file`
+  confirmed both binaries as arm64.
+- **Feed:** the same ffmpeg test signal as above (generated, 720p30, H.264
+  2.5 Mbit/s CBR, 1 s keyframes, AAC 128 kbit/s) into RTMP on loopback.
+- **Every run started its own sapflow and publisher,** waited 30 s (the
+  playlist then held 24 segments and 12 parts, checked with a request before
+  each run) and stopped both afterwards, so each peak memory is that run's
+  own. Ports were free high ones, bound to 127.0.0.1 only.
+- **Viewers:** `sapflow-bench` from the same build, every viewer full
+  (`--full` equal to `--viewers`), 10 s ramp then 60 s, plain HTTP/1.1, one
+  client per viewer (about three connections each). `ulimit -n 65536` for the
+  bench (an ssh session gets 256). sapflow was started under that 256 limit
+  and raised its own (`fdlimit.rs`): 2,267 to 2,271 `lsof` entries mid-run at
+  750 viewers, no "too many open files" in its log.
+- **Rounds:** three rounds, 250 then 750 in each, so each pair shares
+  conditions. Every figure below is a range, lowest to highest across the
+  three runs. Times in ms: p50 / p95 / max. The bench's counts and
+  percentiles cover the whole 70 s run, ramp included; "reach" in its output
+  (232 of 250, 696 or 697 of 750) is below the viewer count because viewers
+  join over the first 10 s, so the average part reached about 93% of them.
+- **Sampled on the Mac every second from 10 s in until the viewers exited:**
+  sapflow's CPU (`ps` time) and RSS, and the bytes the loopback interface sent
+  (`netstat -ib -I lo0`, one direction; it counts every process's loopback
+  traffic, headers included, and the 2.7 Mbit/s feed). The viewers ran under
+  `/usr/bin/time -l` for their CPU and peak memory over the whole 70 s.
+- **Machine state,** read before the stack started, at the start of the
+  bench, mid-run and after: `uptime`, and whole-machine CPU from `top` (a 2 s
+  sample), plus a `top` snapshot of the busiest processes mid-run.
+  Each run waited for the one-minute load average to fall below 8 (0 to 20 s
+  was needed) and would have aborted at 12.
+
+```
+cargo build --release --target aarch64-apple-darwin -p sapflow-server -p sapflow-bench
+
+# per run: a fresh sapflow, then the publisher, then 30 s
+SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:38888 \
+  SAPFLOW_RTMP_ADDR=127.0.0.1:38935 SAPFLOW_SRT_ADDR=127.0.0.1:38890 \
+  RUST_LOG=warn target/aarch64-apple-darwin/release/sapflow
+ffmpeg -re -stream_loop -1 -f lavfi -i testsrc2=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=440:sample_rate=48000 -pix_fmt yuv420p \
+  -c:v libx264 -preset veryfast -tune zerolatency -g 30 -keyint_min 30 -sc_threshold 0 \
+  -b:v 2500k -maxrate 2500k -bufsize 2500k -c:a aac -b:a 128k \
+  -f flv rtmp://127.0.0.1:38935/live/event-loop
+
+ulimit -n 65536
+/usr/bin/time -l target/aarch64-apple-darwin/release/sapflow-bench \
+  --url http://127.0.0.1:38888/live/event-loop/index.m3u8 \
+  --viewers 250 --full 250 --secs 60 --ramp 10      # then --viewers 750 --full 750
+```
+
+### Results
+
+| All viewers full, direct, HTTP/1.1, loopback | 250 viewers | 750 viewers |
+|---------|---------|---------|
+| Failed requests | 0 of 196,086-196,110 | 0 of 587,980-588,090 |
+| Playlist | 4.2-4.5 / 8.6-9.3 / 19.0-22.7 | 9.6-9.8 / 19.8-21.2 / 49.6-51.7 |
+| Segment | 3.1-3.5 / 6.9-7.1 / 13.6-17.3 | 5.3-5.5 / 9.3-9.7 / 36.7-50.3 |
+| Part fan-out | 12.8-14.9 / 19.6-22.7 / 22.2-27.9 | 26.9-30.8 / 44.0-46.0 / 55.1-66.1 |
+| Requests per second (mean over the run) | 2,801-2,802 | 8,400-8,401 |
+| Loopback out, Mbit/s (60 s window) | 1,371-1,380 | 4,109-4,177 |
+| Received by the viewers, MB (70 s) | 11,032-11,033 | 33,080-33,086 |
+| Connections | 750-751 | 2,251-2,255 |
+| sapflow CPU / peak memory | 11.5-18.6% / 42-73 MB | 54.7-62.6% / 183-234 MB |
+| Viewers (bench) CPU / peak memory | 13.0-19.5% / 205-238 MB | 49.8-57.2% / 494-511 MB |
+
+CPU is a percentage of one core; the Mac has 16.
+
+### Conditions
+
+| Conditions on the Mac | 250 viewers | 750 viewers |
+|---------|---------|---------|
+| One-minute load average: before / mid-run / after | 3.6-7.8 / 5.2-9.3 / 4.2-7.6 | 3.8-7.2 / 3.3-6.2 / 4.1-9.95 |
+| Whole-machine CPU idle (2 s samples): before / mid-run / after | 74-89% / 70-86% / 76-87% | 73-93% / 79-81% / 85-87% |
+
+- **Not a quiet machine,** but not a starved one either. The highest load
+  average in any recorded reading was 9.95, so the abort threshold of 12 was
+  never reached, and the machine was at least 70% idle in every sample. The
+  `top` snapshots show what else was running: the window server (up to 43% of
+  a core), a browser (one helper at 68% in one 250-viewer run), an agent
+  app, an Android emulator, Docker's backend (20% in one 750-viewer run) and
+  `kernel_task` at 18 to 30% of a core, which is not in the per-process
+  figures above and which was not separated into loopback and other work.
+  Swap in use was unchanged at about 3.6 GB.
+- **Two shorter trial runs** (250 viewers for 15 s, 750 for 35 s) came first
+  to check the driver and are not included. The 750 trial read a one-minute
+  load average of 13.8 mid-run with the CPU 77% idle, which was mostly the
+  trial's own load; no reported run came near it.
+
+### What it shows
+
+- **Not one failed request.** Six runs, 2,352,424 requests, 0 failed, and no
+  error of any kind in the bench's output.
+- **All full is about 5.5 Mbit/s per viewer,** 1.37 Gbit/s for 250 and
+  4.1 Gbit/s for 750 over the window (3.78 Gbit/s averaged over the 70 s run,
+  ramp included, close to the 3.8 Gbit/s the earlier one-machine run
+  reported).
+  That matches the "about 5 Mbit/s per added full viewer" from the Wi-Fi
+  sweep, and it is what a network would have to carry: gigabit Ethernet is
+  not enough for either count.
+- **Response times stayed small.** At 750 viewers the median playlist and
+  segment times were under 10 ms, the part fan-out median 27 to 31 ms and its
+  maximum under 70 ms; at 250 viewers the fan-out median was 13 to 15 ms. The
+  hundreds of milliseconds in the Wi-Fi tables are therefore not sapflow's
+  own cost at this load, which agrees with that section's reading. What the
+  link and Caddy add at full load is still unmeasured.
+- **sapflow used 0.55 to 0.63 of one core at 750 full viewers** and 0.12 to
+  0.19 at 250, with 183 to 234 MB and 42 to 73 MB. For three times the
+  viewers CPU rose 3.4 to 4.8 times and peak memory 3.2 to 4.4 times (per round).
+  The viewers used 0.50 to 0.57 of a core at 750, so the load generator
+  did not saturate and neither did the Mac.
+- **The CPU spread at 250 viewers is wider than the latency spread:** 11.5%
+  in the first round against 18.0 and 18.6%, and the viewers' CPU moved the
+  same way (13.0% against 19.5 and 19.4%). The first round also had the
+  busiest machine (load 7.8 before, a browser at 68%). The cause was not
+  established.
+- **Against the 2026-10-20 one-machine table (the 8-core M1 Mac, macOS 14, an
+  earlier commit):** the response times are of the same order (at 750 viewers:
+  playlist median 10.3-13.5 then, 9.6-9.8 now; part fan-out median 34-42
+  then, 27-31 now; at 250 the fan-out median was 5.7-6.3 then, 12.8-14.9
+  now). **CPU and memory are higher here:** 250 viewers 10.2-11.5% and
+  45-56 MB then, 11.5-18.6% and 42-73 MB now; 750 viewers 26.0-29.7% and
+  66-77 MB then, 54.7-62.6% and 183-234 MB now. The measurement method is
+  the same (`ps` time and RSS) and the bench's plain HTTP client has not
+  changed since its first commit, so this is the Mac, macOS 26, the commits
+  in between, or some mix of them; this run cannot say which. Running the
+  earlier commit on this Mac would separate the code from the machine. Read
+  the two tables as separate machines, not as a trend.
+
+### What it does not show
+
+- **The network.** Loopback has no link limit, no loss and no network card.
+  Moving 1.4 and 4.1 Gbit/s needed a link faster than gigabit, as the Wi-Fi
+  section worked out, and a real card's cost is not in these numbers.
+- **Caddy, TLS or HTTP/2.** The production path has Caddy in front; this one
+  does not, and the Wi-Fi section's measurements of Caddy's cost stand
+  alone.
+- **A separate viewer machine.** The viewers, the publisher and sapflow
+  shared the cores and the kernel's loopback path. Nobody was starved, but
+  part of the loopback work is charged to the kernel and not to either
+  process, so sapflow's CPU here is the process's, not the whole cost of
+  serving.
+- **A quiet machine, Linux, or mediamtx.** The Mac was shared (see
+  Conditions), and there is no mediamtx run of this shape.
+- **A ceiling.** At 750 full viewers sapflow and the bench each used about
+  half a core on 16, with the Mac mostly idle, so the most this machine could
+  serve was neither reached nor looked for.
+- **Real players.** Viewers are the bench's model of hls.js; one rendition,
+  one stream.
+
 ## Decision
 
 2026-10-20, the user: **keep experimenting.** Before any production
