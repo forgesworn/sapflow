@@ -29,11 +29,14 @@ trap cleanup EXIT
 # and the viewers' HTTP/2 would then be compiled into the server being measured.
 cargo build --release -q -p sapflow
 cargo build --release -q -p sapflow-bench
-BENCH=./target/release/sapflow-bench
+# CARGO_BUILD_TARGET (a cross build, as on a Mac whose toolchain is x86_64)
+# moves the binaries.
+REL=./target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release
+BENCH=$REL/sapflow-bench
 
 case "$SERVER" in
   sapflow)
-    BIN=./target/release/sapflow
+    BIN=$REL/sapflow
     SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:8890 \
     SAPFLOW_RTMP_ADDR=127.0.0.1:1935 RUST_LOG=warn "$BIN" > "$WORK/server.log" 2>&1 &
     ;;
