@@ -130,6 +130,15 @@ reports the primary iPhone unavailable. UI Automation was already enabled;
 no new physical runner, installation or camera test is claimed. The Pixel's
 current capture remains untouched.
 
+Scoped origin recording completions now include non-empty immutable
+`recordingTracks` booleans captured from each writer's own initialization.
+Legacy callback bytes remain unchanged, codec epochs retain their distinct
+topologies and synced incomplete prefixes stay labelled incomplete. This is the
+producer half of replay classification. The V4V receiver still needs to persist
+and fence the topology with the exact recording receipt before selecting
+`audio/mp4` or `video/mp4`; current acceptance does not prove replay adoption,
+decoding or complete-show aggregation.
+
 The checkpoints below retain their original source/package context and counts.
 
 The preceding origin prerequisite adds [explicit AAC-only ingest](audio-only-origin.md)

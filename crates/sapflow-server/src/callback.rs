@@ -146,12 +146,22 @@ impl Callbacks {
         object.insert("sessionId".into(), scope.key().session_id.as_str().into());
         object.insert("connectionEpoch".into(), scope.connection_epoch().into());
         object.insert("eventSequence".into(), sequence.into());
-        if matches!(event, StreamEvent::RecordSegmentComplete { .. }) {
+        if let StreamEvent::RecordSegmentComplete {
+            recording_tracks, ..
+        } = event
+        {
             let recording = self.recording.as_ref()?;
             object.insert("recordingId".into(), recording.id().into());
             object.insert(
                 "recordingState".into(),
                 recording.completion_state()?.into(),
+            );
+            object.insert(
+                "recordingTracks".into(),
+                serde_json::json!({
+                    "hasVideo": recording_tracks.has_video(),
+                    "hasAudio": recording_tracks.has_audio(),
+                }),
             );
         }
         let body = serde_json::to_string(&body).ok()?;
@@ -240,6 +250,68 @@ mod tests {
         StreamEvent::RecordSegmentComplete {
             segment_path: "/fixture/recording.mp4".into(),
             duration_secs: 1.0,
+            recording_tracks: sapflow_core::RecordingTracks::AudioVideo,
+        }
+    }
+
+    #[test]
+    fn scoped_completion_has_exact_immutable_topology_and_frozen_retry_body() {
+        use sapflow_core::RecordingTracks;
+        for tracks in [
+            RecordingTracks::AudioOnly,
+            RecordingTracks::VideoOnly,
+            RecordingTracks::AudioVideo,
+        ] {
+            for incomplete in [false, true] {
+                let scope = fixture_scope("a", 2, 11, 3);
+                let (callbacks, mut rx) = test_queue(scope.clone(), 4);
+                let (writer_callbacks, recording) = callbacks.for_recording().expect("writer");
+                let recording = recording.expect("scoped");
+                recording.active();
+                if incomplete {
+                    recording.synced_incomplete();
+                } else {
+                    recording.finalised();
+                }
+                writer_callbacks.send(
+                    &scope.key().path,
+                    StreamEvent::RecordSegmentComplete {
+                        segment_path: "/fixture/recording.mp4".into(),
+                        duration_secs: 1.0,
+                        recording_tracks: tracks,
+                    },
+                );
+                let queued = rx.try_recv().expect("completion");
+                let expected = serde_json::json!({
+                    "event": "recordSegmentComplete", "path": "live/event-a",
+                    "segmentPath": "/fixture/recording.mp4", "segmentDuration": "1",
+                    "contractVersion": 1, "eventId": "event-a", "eventGeneration": 2,
+                    "sessionId": scope.key().session_id.as_str(), "connectionEpoch": 3,
+                    "eventSequence": 1, "recordingId": recording.id(),
+                    "recordingState": if incomplete { "incomplete" } else { "finalised" },
+                    "recordingTracks": {"hasVideo": tracks.has_video(), "hasAudio": tracks.has_audio()},
+                });
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&queued.body).expect("JSON"),
+                    expected
+                );
+                // Later telemetry advances the shared sequencer, but retries
+                // clone the queued Bytes, never reconstructing this receipt.
+                callbacks.send(&scope.key().path, StreamEvent::Publish);
+                let next: serde_json::Value =
+                    serde_json::from_slice(&rx.try_recv().expect("later event").body)
+                        .expect("JSON");
+                assert_eq!(next["eventSequence"], 2);
+                for _ in 0..4 {
+                    let retry_body = queued.body.clone();
+                    assert_eq!(retry_body.as_ptr(), queued.body.as_ptr());
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&retry_body)
+                            .expect("same JSON"),
+                        expected
+                    );
+                }
+            }
         }
     }
 
@@ -366,13 +438,23 @@ mod tests {
             .expect("legacy");
         assert_eq!(body, StreamEvent::Publish.callback_body(&scope.key().path));
         assert!(!body.contains("sessionId"));
+        let completion = completion();
+        let body = legacy
+            .body(&scope.key().path, &completion)
+            .expect("legacy completion");
+        assert_eq!(body, completion.callback_body(&scope.key().path));
+        assert_eq!(
+            body,
+            r#"{"event":"recordSegmentComplete","path":"live/event-a","segmentPath":"/fixture/recording.mp4","segmentDuration":"1"}"#
+        );
         assert!(
             legacy
                 .body(
                     &scope.key().path,
                     &StreamEvent::RecordSegmentComplete {
                         segment_path: "x".repeat(MAX_BODY),
-                        duration_secs: 1.0
+                        duration_secs: 1.0,
+                        recording_tracks: sapflow_core::RecordingTracks::AudioVideo,
                     }
                 )
                 .is_none()

@@ -2,8 +2,10 @@
 
 Taken from the v4v repo as of 2026-10-20 (`docs/live-stage.md`, "Live Video
 Boundary"; `docs/examples/mediamtx.yml`; `scripts/live-ingest-smoke.mjs`).
-v4v talks to the media server only through URL templates and one callback,
-so sapflow can replace mediamtx without a code change in v4v.
+This is the historical legacy URL-template/callback contract. The current
+[scoped-session contract](scoped-publish-sessions.md) adds private provisioning,
+immutable session/recording identities and bounded terminal receipts; it needs
+a corresponding V4V connector. These are separate integration contracts.
 
 ## Stream paths
 
@@ -73,6 +75,17 @@ v4v rejects a callback whose path does not match the prepared session.
 - v4v only reads files under `PULSEWIRE_LIVE_RECORDING_DIR` (its mount of the
   same directory, read-only) and copies them into its own store.
 - mediamtx keeps its copy for 7 days (`recordDeleteAfter: 7d`).
+
+The one-file-per-show description above is historical legacy behaviour, not a
+guarantee of current scoped recording. Current codec epochs can produce separate
+files, with scoped names `<unix-start>-<recordingId>.mp4`. Scoped completions add
+immutable `recordingTracks: {"hasVideo": boolean, "hasAudio": boolean}` from the
+actual file initialization. Audio-only files map to `audio/mp4`; video-bearing
+files map to `video/mp4`. Legacy callback JSON is unchanged and has no track
+classification. Do not infer an old file's topology from the latest live
+session, and do not equate a finalised epoch file with a complete-show replay.
+See [callbacks and recordings](scoped-publish-sessions.md#callbacks-and-recordings)
+for required identity, sync, incomplete-prefix and asynchronous adoption fences.
 
 ## Encoder settings v4v recommends (and checks from the playlist)
 

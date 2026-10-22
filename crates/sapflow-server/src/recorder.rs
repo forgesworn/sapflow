@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sapflow_core::recording::{is_recording_name, recording_file, scoped_recording_file};
-use sapflow_core::{StreamEvent, StreamPath};
+use sapflow_core::{RecordingTracks, StreamEvent, StreamPath};
 use sapflow_hls::fmp4::{init_segment_for_tracks, rebase_part_for_file};
 use sapflow_hls::muxer::Part;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -254,6 +254,11 @@ async fn write(
     let Some(Msg::Init(tracks)) = rx.recv().await else {
         return;
     };
+    let Some(recording_tracks) =
+        RecordingTracks::new(tracks.video().is_some(), tracks.audio().is_some())
+    else {
+        return;
+    };
     let mut receipt = WriteReceipt {
         observation: observation.clone(),
         completed: false,
@@ -362,6 +367,7 @@ async fn write(
         StreamEvent::RecordSegmentComplete {
             segment_path: file_path.display().to_string(),
             duration_secs: (duration.as_secs_f64() * 1000.0).round() / 1000.0,
+            recording_tracks,
         },
     );
 }
@@ -554,6 +560,10 @@ mod tests {
                     "finalised"
                 };
                 assert_eq!(body["recordingState"], expected);
+                assert_eq!(
+                    body["recordingTracks"],
+                    serde_json::json!({"hasVideo": false, "hasAudio": true})
+                );
                 assert_eq!(scope.observations.recording_state(), expected);
                 let bytes = tokio::fs::read(body["segmentPath"].as_str().expect("file path"))
                     .await
@@ -590,6 +600,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_refuses_missing_or_out_of_order_initialization_without_completion() {
+        for part_before_init in [false, true] {
+            let scratch = ScopedScratch::new("missing-init");
+            let scope = crate::publish_observer::fixture_scope("a", 1, 1, 1);
+            let (callbacks, receiver) = crate::callback::test_queue(scope.clone(), 1);
+            let (callbacks, observation) = callbacks.for_recording().expect("writer");
+            let (tx, rx) = mpsc::channel(2);
+            if part_before_init {
+                let (_, parts) = fixture_parts();
+                tx.send(Msg::Part(parts[0].clone()))
+                    .await
+                    .expect("first part");
+            }
+            drop(tx);
+            write(
+                scratch.0.clone(),
+                scope.key().path.clone(),
+                rx,
+                callbacks,
+                0,
+                observation,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+            assert_eq!(receiver.len(), 0);
+            assert_eq!(scope.observations.recording_state(), "never-started");
+            assert!(!scratch.0.join("live").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn real_file_completion_is_synced_before_scoped_callback_and_keeps_old_identity() {
         let scratch = ScopedScratch::new("complete");
         let scope = crate::publish_observer::fixture_scope("a", 1, 11, 3);
@@ -615,6 +656,10 @@ mod tests {
         assert_eq!(scope.observations.callback_state(), "pending");
         assert_eq!(body["event"], "recordSegmentComplete");
         assert_eq!(body["recordingState"], "finalised");
+        assert_eq!(
+            body["recordingTracks"],
+            serde_json::json!({"hasVideo": true, "hasAudio": true})
+        );
         assert_eq!(body["sessionId"], scope.key().session_id.as_str());
         assert_eq!(body["eventGeneration"], 1);
         assert_eq!(body["connectionEpoch"], 3);
@@ -743,6 +788,10 @@ mod tests {
                 let body: serde_json::Value =
                     serde_json::from_slice(&receiver.try_recv().expect("partial completion").body)
                         .expect("JSON");
+                assert_eq!(
+                    body["recordingTracks"],
+                    serde_json::json!({"hasVideo": true, "hasAudio": true})
+                );
                 assert_eq!(body["recordingState"], "incomplete");
                 assert_eq!(scope.observations.recording_state(), "incomplete");
                 assert_eq!(scope.observations.counts().recordings_finalised, 0);
@@ -862,6 +911,7 @@ mod tests {
                 StreamEvent::RecordSegmentComplete {
                     segment_path: "/fixture/recording.mp4".into(),
                     duration_secs: 1.0,
+                    recording_tracks: RecordingTracks::AudioVideo,
                 },
             );
             if fault == "none" {

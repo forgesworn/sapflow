@@ -231,6 +231,35 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Non-empty track topology captured from a recording's own initialization.
+/// This describes tracks, not playability or complete-show coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingTracks {
+    AudioOnly,
+    VideoOnly,
+    AudioVideo,
+}
+
+impl RecordingTracks {
+    /// Refuses an initialization with no tracks.
+    pub fn new(has_video: bool, has_audio: bool) -> Option<Self> {
+        match (has_video, has_audio) {
+            (false, true) => Some(Self::AudioOnly),
+            (true, false) => Some(Self::VideoOnly),
+            (true, true) => Some(Self::AudioVideo),
+            (false, false) => None,
+        }
+    }
+
+    pub fn has_video(self) -> bool {
+        self != Self::AudioOnly
+    }
+
+    pub fn has_audio(self) -> bool {
+        self != Self::VideoOnly
+    }
+}
+
 /// What the server reports to v4v's stream-health callback.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
@@ -242,6 +271,7 @@ pub enum StreamEvent {
     RecordSegmentComplete {
         segment_path: String,
         duration_secs: f64,
+        recording_tracks: RecordingTracks,
     },
     /// Measured from the encoder's media, every so often while it publishes.
     /// v4v reads `bitrateKbps`; the rest is for Studio's encoder check.
@@ -285,6 +315,7 @@ impl StreamEvent {
             Self::RecordSegmentComplete {
                 segment_path,
                 duration_secs,
+                ..
             } => s.push_str(&format!(
                 ",\"segmentPath\":\"{}\",\"segmentDuration\":\"{}\"",
                 json_escape(segment_path),
@@ -375,6 +406,25 @@ fn percent_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_topology_is_nonempty_and_does_not_change_legacy_callback_bytes() {
+        assert_eq!(RecordingTracks::new(false, false), None);
+        let path = StreamPath::parse("live/event-a1").expect("path");
+        for (video, audio) in [(false, true), (true, false), (true, true)] {
+            let tracks = RecordingTracks::new(video, audio).expect("nonempty");
+            assert_eq!((tracks.has_video(), tracks.has_audio()), (video, audio));
+            let event = StreamEvent::RecordSegmentComplete {
+                segment_path: "/fixture.mp4".into(),
+                duration_secs: 1.0,
+                recording_tracks: tracks,
+            };
+            assert_eq!(
+                event.callback_body(&path),
+                r#"{"event":"recordSegmentComplete","path":"live/event-a1","segmentPath":"/fixture.mp4","segmentDuration":"1"}"#
+            );
+        }
+    }
 
     #[test]
     fn accepts_v4v_event_paths() {
@@ -496,6 +546,7 @@ mod tests {
         let rec = StreamEvent::RecordSegmentComplete {
             segment_path: "/recordings/live/event-a1/1792500000.mp4".into(),
             duration_secs: 3723.5,
+            recording_tracks: RecordingTracks::AudioVideo,
         };
         assert_eq!(
             rec.callback_body(&p),
@@ -504,6 +555,7 @@ mod tests {
         let odd = StreamEvent::RecordSegmentComplete {
             segment_path: "a\"b\\c\n".into(),
             duration_secs: 1.0,
+            recording_tracks: RecordingTracks::AudioOnly,
         };
         assert!(
             odd.callback_body(&p)
@@ -563,6 +615,7 @@ mod tests {
         let rec = StreamEvent::RecordSegmentComplete {
             segment_path: "/r/x.mp4".into(),
             duration_secs: 1.0,
+            recording_tracks: RecordingTracks::VideoOnly,
         };
         assert_eq!(rec.name(), "recordSegmentComplete");
     }

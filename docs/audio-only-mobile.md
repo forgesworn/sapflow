@@ -235,11 +235,13 @@ These experiments do not provide a production fix or pass the production
 fixture gate. Intended complete-show presentation remains open, and the failed
 receipts are retained without weakening the original checks.
 
-V4V replay adoption and audio MIME must eventually use immutable topology from
-the actual recording ID and writer initialization. Live fresh-media flags or
-the caller's requested mode cannot relabel an older recording. That integration
-remains open; this packet changes no replay callback schema or automatic replay
-publication policy.
+Scoped Sapflow recording completions now carry non-empty immutable
+`recordingTracks` from the actual writer initialization and exact recording ID;
+legacy callback bytes remain unchanged. Audio-only maps to `audio/mp4`, while
+any video-bearing file maps to `video/mp4`. Live fresh-media flags or the
+caller's requested mode cannot relabel an older recording. The V4V receiver
+does not yet persist or use this field, so topology-aware replay adoption and
+automatic replay publication remain open.
 
 No real camera footage, extracted camera frames or phone recordings may enter
 source control. Generated fixture receipts belong in ignored private lab storage.

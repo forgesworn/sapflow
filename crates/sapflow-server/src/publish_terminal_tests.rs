@@ -192,6 +192,10 @@ async fn ts_resource_limit_syncs_only_the_accepted_prefix_as_incomplete() {
         publication.end();
         let body = completion(&mut fixture, "incomplete").await;
         assert_eq!(
+            body["recordingTracks"],
+            serde_json::json!({"hasVideo": false, "hasAudio": true})
+        );
+        assert_eq!(
             recording_samples(&body),
             if failure == "raw-input" { 1 } else { 2 },
             "never include the rejected/held payload"
@@ -341,8 +345,20 @@ async fn terminal_only_codec_epoch_uses_new_init_and_distinct_actual_recording()
     let a = completion(&mut fixture, "finalised").await;
     let b = completion(&mut fixture, "finalised").await;
     assert_ne!(a["recordingId"], b["recordingId"]);
-    let lone = if recording_samples(&a) == 1 { a } else { b };
+    let (lone, av) = if recording_samples(&a) == 1 {
+        (a, b)
+    } else {
+        (b, a)
+    };
     assert_eq!(recording_samples(&lone), 1);
+    assert_eq!(
+        lone["recordingTracks"],
+        serde_json::json!({"hasVideo": false, "hasAudio": true})
+    );
+    assert_eq!(
+        av["recordingTracks"],
+        serde_json::json!({"hasVideo": true, "hasAudio": true})
+    );
     let bytes =
         std::fs::read(lone["segmentPath"].as_str().expect("audio epoch file")).expect("file");
     assert!(
@@ -418,6 +434,10 @@ async fn terminal_codec_change_then_error_cannot_append_new_aac_under_old_file_i
             .is_none()
     );
     let body = completion(&mut fixture, "incomplete").await;
+    assert_eq!(
+        body["recordingTracks"],
+        serde_json::json!({"hasVideo": true, "hasAudio": true})
+    );
     let file =
         std::fs::read(body["segmentPath"].as_str().expect("old file")).expect("synced prefix");
     assert_eq!(
