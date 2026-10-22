@@ -7,7 +7,8 @@ below is tied to a file in this repository or to a public page, listed under
 checked it says so. Performance figures (CPU, memory, latency, throughput) are
 not repeated here: they live in [benchmarks.md](benchmarks.md) and are linked
 from each section. The only measured figures quoted are binary and image sizes,
-which that file already records against mediamtx 1.19.1.
+which that file already records against mediamtx 1.19.1, and a few ingest
+figures in the SRT and RTMP library sections.
 
 ## Summary
 
@@ -160,9 +161,15 @@ the direct requirements in `go.mod` (and include test-only modules).
 | Interoperability evidence | Receiver: ffmpeg 8 (libsrt 1.5.3), `srt-live-transmit` (libsrt 1.5.4), OBS 32.1.2, Larix on iPhone, each with and without a passphrase; v4v's ingest gate. Sender: exact bytes into libsrt 1.5.4, no loss and six seeded impaired profiles. All in `docs/interop.md`, `docs/mobile-delivery-status.md`. | Is the reference; the others are measured against it | Was sapflow's receiver until 2026-10-21; compared as a black box | Accepts FFmpeg, GStreamer and OBS Studio publishers in mediamtx (publish/srt page); no independent run here |
 | Written from | The SRT draft and recorded sessions only. Never libsrt or srt-rs source (`AGENTS.md`). | n/a | n/a | Its README says the published RFC |
 
-Measured (CPU, memory and delivery per stream, SRT under loss): see
-[benchmarks.md](benchmarks.md); this line is a placeholder until the
-measurement run lands there.
+Measured (2026-10-22, one M4, libsrt 1.5.7's `srt-live-transmit` as sender,
+three runs per cell; conditions and limits in [benchmarks.md](benchmarks.md#srt-and-rtmp-our-implementations-against-libsrt-gosrt-and-mediamtxs-rtmp-2026-10-22)):
+at 2, 5 and 10% loss, 200 and 2000 ms, plain and AES-128, sapflow-srt's
+retransmission overhead range overlapped libsrt's in every condition while
+gosrt's (mediamtx) averaged 0.2 to 0.9 points higher, but sapflow's recording dropped many more
+frames than either after a packet left unrecovered at 200 ms (by design), and
+with 50 concurrent SRT publishers it logged video parser errors that are not yet
+explained or fixed. Per stream, with LL-HLS packaging, sapflow used 0.7 to 1.3% of
+a core and 19 to 25 MB against mediamtx's 1.3 to 4.1% and 43 to 92 MB.
 
 What the loss evidence does and does not say (`docs/interop.md`, "Our own SRT
 under packet loss"): with libsrt's `srt-live-transmit` as sender over a
@@ -209,9 +216,12 @@ crate.
 | Fuzz targets | `rtmp_session`, `amf0`, `rtmp_client`, `flv_ingest`. Twenty-minute runs: `rtmp_session` 4.7 million inputs, `amf0` 45 million, no crash (`docs/threat-model.md`). `rtmp_client` was added later and has only 60 s runs on record. | 9 Go fuzz functions: chunk, handshake client and server, AMF0, raw message reader, message reader | Not checked | Not checked |
 | Interoperability evidence | Server: ffmpeg 8.0.1, OBS 32.1.2, Larix on iPhone, v4v's ingest gate; matched `rml_rtmp` event for event on a recorded ffmpeg publish before that crate was removed. Client: an independent ffmpeg received 180 H.264 and 283 AAC frames. No record of the client publishing to nginx-rtmp-module or mediamtx. | Used by mediamtx; independent evidence not checked | Not assessed here | README lists Wirecast, FMS, Wowza, ffmpeg and others |
 
-Measured (CPU, memory, handshake and publish cost): see
-[benchmarks.md](benchmarks.md); this line is a placeholder until the
-measurement run lands there.
+Measured (2026-10-22, one M4, 1, 10 and 50 concurrent ffmpeg publishers at
+720p30 and 2.5 Mbit/s, no viewers, three runs per cell; see [benchmarks.md](benchmarks.md#srt-and-rtmp-our-implementations-against-libsrt-gosrt-and-mediamtxs-rtmp-2026-10-22)):
+per stream, with LL-HLS packaging, sapflow's server used 0.2 to 0.6% of a core
+and 19 to 25 MB against mediamtx's 0.4 to 1.5% and 40 to 90 MB, and every stream
+produced a playlist. The RTMP code's own share and the handshake cost were not
+separated from the server's.
 
 Choose gortmplib (or mediamtx) when you need RTMPS, Enhanced RTMP, other codecs
 or RTMP playback. Choose librtmp when you need a C client library with RTMPE

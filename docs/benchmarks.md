@@ -641,8 +641,9 @@ over twelve loaded runs each. The full tables, ranges and conditions follow.
   added:** `moq: no`. MoQ is new, on by default, listened on `*:8892` (TCP and
   UDP) and UDP 8893 and wrote `auto.key` and `auto.crt` into the working
   directory. With it off, `lsof` showed only the two 127.0.0.1 listeners for
-  every run (recorded in each run's conditions). `scripts/bench.sh` itself
-  does not set it; its mediamtx config needs the line for 1.21.
+  every run (recorded in each run's conditions). `scripts/bench.sh` did not set
+  it when this ran; it now adds the line when the binary accepts it (see
+  [`scripts/bench.sh`](#scriptsbenchsh) below).
   ```
   logLevel: warn
   rtmp: yes
@@ -996,6 +997,603 @@ day. Same driver, same conditions checks (no run abandoned or repeated).
   (sapflow's 750-viewer CPU 43.8% in its first run and 62.0% in the next two;
   both servers' 10-full CPU 20 to 30% lower in round 1) is bigger than some of
   the differences above, which is why they are given as ranges.
+
+## SRT and RTMP: our implementations against libsrt, gosrt and mediamtx's RTMP (2026-10-22)
+
+The sections above measured whole servers. This one measures the ingest code
+inside them: sapflow's own SRT (`sapflow-srt`) and RTMP (`sapflow_hls::rtmp`)
+against libsrt's `srt-live-transmit` and against mediamtx 1.21.2, which
+receives SRT with gosrt and RTMP with gortmplib (versions as pinned in its
+`go.mod`, per [comparison.md](comparison.md); not checked from the binary).
+Three measurements: **A**, SRT receive under packet loss; **B**, ingest cost per
+stream with 1, 10 and 50 concurrent publishers, over SRT and over RTMP, no
+viewers; **C**, delay through the server over SRT. **One sender, loopback only,
+a generated test signal, and a Mac that other sessions also use. It says
+nothing about a network, real encoders, other senders, other platforms or
+longer streams.** The feature side is in [comparison.md](comparison.md).
+
+Headline, ranges over three runs per cell (libsrt is a relay to a file, so its
+CPU and memory are a floor and not a like-for-like cost; see A):
+
+| SRT receive under loss (A), 200 and 2000 ms, plain and AES-128 pooled | sapflow | libsrt 1.5.7 | gosrt (mediamtx 1.21.2) |
+|---------|---------|---------|---------|
+| Retransmission overhead at 2 / 5 / 10% loss (12 trials each) | 1.8-2.2 / 5.2-5.8 / 11.4-12.8% | 1.9-2.1 / 5.4-6.0 / 11.8-13.2% | 2.1-2.4 / 5.7-6.5 / 12.1-13.5% |
+| Packets unrecovered at 200 ms and 2 / 5 / 10% loss (6 trials of about 7,040) | 2 / 8 / 56 | 2 / 13 / 70 | 4 / 18 / 78 |
+| Video frames missing from the receiver's own output, all 48 trials | 600 | 9 | 11 |
+| Receiver CPU, one stream: median (range of 48 trials) | 1.13% (0.64 to 1.42) | 0.99% (0.68 to 1.31) | 3.59% (2.35 to 4.40) |
+| Receiver peak memory: median (range) | 25 MB (22 to 26) | 5 MB (4 to 7) | 67 MB (66 to 70) |
+
+| Ingest cost, no viewers (B), mediamtx / sapflow | sapflow | mediamtx 1.21.2 | ratio |
+|---------|---------|---------|---------|
+| SRT, 50 streams: CPU per stream | 0.69 to 0.79% | 1.31 to 1.35% | 1.7x |
+| SRT, 50 streams: memory per stream | 19.0 to 20.0 MB | 43.4 to 45.0 MB | 2.3x |
+| RTMP, 50 streams: CPU per stream | 0.22 to 0.41% | 0.43 to 0.74% | 1.8x |
+| RTMP, 50 streams: memory per stream | 19.6 to 19.8 MB | 40.4 to 42.4 MB | 2.1x |
+| One SRT stream: CPU / memory | 1.06 to 1.34% / 24 to 25 MB | 3.55 to 4.06% / 90 to 92 MB | 3.1x / 3.7x |
+| One RTMP stream: CPU / memory | 0.42 to 0.61% / 24 to 25 MB | 0.90 to 1.49% / 82 to 90 MB | 2.4x / 3.6x |
+| Delay through the server over SRT (C), median at 200 / 2000 ms | -0.21 to -0.20 s / 1.59 to 1.60 s | -0.23 to -0.22 s / 1.58 s | no measurable difference |
+
+All streams produced a playlist in every run (732 stream-runs). Two things to
+know before quoting any of this: at 200 ms and 2% loss or more sapflow's
+recording lost far more frames than the other two after an unrecovered packet
+(a policy, see A), and with 50 SRT publishers sapflow logged video parser errors
+and the OS counted dropped UDP datagrams (see "Found on the way").
+
+### Setup
+
+- **Machine:** Apple M4 Max, 16 cores, 64 GB, macOS 26.6.2, the Mac of the
+  previous section. Everything over 127.0.0.1; no test traffic left the
+  machine. Not dedicated. The one-minute load average at the start of a run was
+  2.4 to 6.2 in A, 1.9 to 7.7 in B and 3.5 to 8.0 in C (the gate was below 8;
+  runs above 12 were to be repeated and none was; two C runs waited 20 and 30 s
+  for the gate), and whole-machine CPU idle at the start of a run was 58 to 93%.
+  A first attempt on an 8-core M1 was stopped after 12 of 144 trials because
+  other sessions' builds held its load average between 8 and 40; none of it is
+  used.
+- **sapflow:** `eee669c`, current main and the code of the previous section,
+  built in a temporary worktree on the M4 with `--target aarch64-apple-darwin`
+  (the only 1.94.1 toolchain there is x86_64; `file` confirmed arm64), as
+  `scripts/bench.sh` builds, in two cargo invocations. `sapflow` is 3,480,704
+  bytes, sha256 `d6a2e43140d0...f28e3ea`. `srt-loss-proxy` and `sapflow-bench`
+  came from the same build. The worktree was removed afterwards.
+- **mediamtx:** v1.21.2 darwin/arm64, sha256 `72f67f718cfe...e61be`, checked
+  again after copying it to the M4.
+- **libsrt:** Homebrew `srt` 1.5.7_1, installed on the M4 for this run;
+  `srt-live-transmit` reports "SRT Library version: 1.5.7". It is the sender in
+  every SRT trial and the libsrt receiver in A. (The earlier SRT sections used
+  libsrt 1.5.3 and 1.5.4.)
+- **Others:** ffmpeg 8.1.2, Python 3.14.6 for the drivers, macOS `dd`.
+- **Driver:** shell and Python that start and stop everything below, sample
+  `ps` once a second and write each run's conditions. Like the previous
+  section's driver it is not in the repository; `scripts/srt-loss.sh` and
+  `scripts/bench.sh` were not used (they would have needed a third receiver,
+  CPU sampling and the `dd` below). The commands are what each run executes.
+- **Order:** A, then B, then C. Within each, three rounds, each round running
+  every cell once with the compared implementations back to back: all three
+  receivers in rotating order in A; sapflow and mediamtx with the order flipping
+  each round in B and C.
+- **CPU and memory:** as in the previous section: process CPU time over wall
+  time from `ps` (10 ms resolution; 100% is one core) and resident set size.
+  Cells are the lowest to the highest of the three runs. Ratios are the median
+  of mediamtx's three over the median of sapflow's three.
+- **A cell of 3 runs is not a significance test.** Where two ranges overlap the
+  text says so and claims no difference.
+
+```
+# build, in a temporary worktree of origin/main on the M4
+cargo build --release --target aarch64-apple-darwin -p sapflow-server
+cargo build --release --target aarch64-apple-darwin -p sapflow-bench     # includes srt-loss-proxy
+
+# A: the clip, once (a 150 s version for B); then one trial
+ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
+  -pix_fmt yuv420p -c:v libx264 -preset veryfast -tune zerolatency -g 30 -keyint_min 30 -sc_threshold 0 \
+  -b:v 2500k -maxrate 2500k -bufsize 2500k -c:a aac -b:a 128k -t 30 -f mpegts src.ts
+# receiver, one of (ports are per trial):
+SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:$HP SAPFLOW_SRT_ADDR=127.0.0.1:$SP SAPFLOW_RTMP_ADDR=off \
+  SAPFLOW_RECORDINGS=rec RUST_LOG=warn [SAPFLOW_SRT_PASSPHRASE=loss-test-key SAPFLOW_SRT_PBKEYLEN=16] sapflow
+mediamtx mtx.yml                                   # the file below
+srt-live-transmit "srt://127.0.0.1:$LP?mode=listener&latency=$LAT[&passphrase=loss-test-key&pbkeylen=16]" file://con > out.ts
+# the proxy, in front of the receiver; the seed is the round (1 to 3)
+srt-loss-proxy --listen 127.0.0.1:$PP --target 127.0.0.1:<the receiver's SRT port> --loss random:5 \
+  --delay-ms 30 --latency-ms $LAT --seed $ROUND --stats proxy.txt          # --loss none for 0%
+# the sender, the same for all three (streamid for sapflow and mediamtx only)
+ffmpeg -hide_banner -loglevel error -re -i src.ts -c copy -f mpegts - | dd ibs=188 obs=1456 | \
+  srt-live-transmit -a:no file://con \
+  "srt://127.0.0.1:$PP?latency=$LAT[&passphrase=loss-test-key&pbkeylen=16][&streamid=publish:live/event-loss]"
+```
+
+mediamtx's file for A (the 2026-10-22 file with `rtmp: no`, `srt: yes`, `moq: no`
+and recording; `srtPublishPassphrase` only in the AES-128 trials):
+
+```
+logLevel: warn
+rtmp: no
+hls: yes
+hlsAddress: 127.0.0.1:<port>
+hlsAlwaysRemux: yes
+hlsVariant: lowLatency
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentCount: 24
+hlsAllowOrigins: ['*']
+rtsp: no
+webrtc: no
+srt: yes
+srtAddress: 127.0.0.1:<port>
+moq: no
+api: no
+authInternalUsers:
+  - user: any
+    permissions:
+      - action: publish
+      - action: read
+pathDefaults:
+  record: yes
+  recordPath: ./rec/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 1h
+  srtPublishPassphrase: loss-test-key
+paths:
+  all_others:
+```
+
+### A. SRT receive under packet loss
+
+The method of `scripts/srt-loss.sh` (see [SRT under packet loss](interop.md#srt-under-packet-loss-2026-10-20)),
+with a third receiver and with the receiver's CPU and memory sampled. Each trial:
+
+- A generated 30 s clip (`testsrc2` 1280x720 at 30 fps and a 440 Hz tone, x264
+  `veryfast` `zerolatency`, 2.5 Mbit/s with `-maxrate` and `-bufsize` at the same
+  value, 1 s keyframes with `-keyint_min 30 -sc_threshold 0`, AAC 128 kbit/s) is
+  played in real time by `ffmpeg -re -c copy` into `srt-live-transmit` (libsrt),
+  the sender in every trial.
+- It goes through `srt-loss-proxy` (`crates/sapflow-bench`), which drops UDP
+  packets at random in both directions at the stated rate, delays each by 30 ms
+  (60 ms round trip), keeps them in order, never drops handshakes and counts
+  original and retransmitted data packets from the SRT headers. SRT latency is
+  set to the same value on the sender and receiver: 200 ms or 2000 ms.
+- The receiver is **sapflow** (its recording of the show), **libsrt**
+  (`srt-live-transmit` as listener, writing the stream to a file) or **gosrt**
+  (mediamtx 1.21.2 with `srt: yes`, recording to fMP4). All three listen
+  behind the same proxy. With encryption, the sender and libsrt receiver get
+  `passphrase=loss-test-key&pbkeylen=16`, sapflow `SAPFLOW_SRT_PASSPHRASE` and
+  `SAPFLOW_SRT_PBKEYLEN=16`, mediamtx `srtPublishPassphrase`. There is no key
+  refresh (libsrt's default never fires in a clip). That mediamtx enforces the
+  passphrase was checked on its own: a sender with none was refused ("passphrase
+  not provided by client"), a wrong one was refused ("invalid passphrase"), and
+  the right one was accepted at `pbkeylen=16` and 32.
+- 0%, 2%, 5% and 10% random loss (0% is the same path with `--loss none`),
+  at both latencies, plain and AES-128: 16 conditions, 3 receivers, 3 runs each,
+  144 trials. A run is one round of all 48 trials, three trials at a time, the
+  receivers' order rotated cell by cell. The proxy's loss seed is the round
+  number (1 to 3), the same for all three receivers in a round. 11:35 to 12:12
+  local time.
+- mediamtx runs with the 2026-10-22 server configuration (HLS with
+  `hlsAlwaysRemux`, so it packages LL-HLS as sapflow always does), plus
+  `rtmp: no`, `srt: yes`, `moq: no` and recording
+  (`pathDefaults.record`, `recordFormat: fmp4`, one hour segments). sapflow has
+  RTMP off and `SAPFLOW_RECORDINGS` set; it cannot turn LL-HLS packaging off.
+
+**Columns.** All counts are per trial; cells are the lowest to the highest of
+the three runs.
+
+- *Retransmission overhead:* retransmitted data packets as a percentage of
+  original ones, from the proxy, so the same measure for every receiver.
+- *Not recovered in time:* original data packets for which no copy reached the
+  receiver within the SRT latency of the first send (proxy), as a percentage.
+  This is the residual loss at the SRT layer, whatever the receiver then does.
+- *Video frames missing:* frames absent from the receiver's output between its
+  first and last video timestamp (the span at 30 fps minus the packets present),
+  by `ffprobe`. *Longest video gap:* the largest step between consecutive video
+  timestamps; 33 ms means nothing is missing.
+- *Decode messages:* lines `ffmpeg -v error` prints decoding the output from
+  the first keyframe at or after 3 s (a stream copy cut, then a decode).
+- *TS errors* (libsrt only, because it writes MPEG-TS and the others write MP4):
+  resynchronisations plus continuity-counter jumps after the first 1 MB of the
+  file, found by a demuxer-style scan.
+
+**What each receiver writes differs, so the last four columns are not one
+yardstick.** libsrt writes the bytes it was given, holes included, so a
+lost packet shows as a TS error and as decode messages while no frame is
+counted missing. gosrt (mediamtx) and sapflow demux the stream and record
+what they can parse. sapflow also withholds video from a damaged frame to the
+next keyframe (commit `62d2d02`, "reject incomplete video after transport
+loss"), which costs frames and gives a cleaner recording. The first two columns
+are the like-for-like ones.
+
+**Two properties of the sender shape these tables** (details under "Found on
+the way", items 1 and 2). It drops the first GOP of every stream, so every
+receiver's output starts mid-GOP: decoding libsrt's whole file gave 36 to 62
+decode messages at every loss rate, 0% included, and sapflow's and gosrt's
+none, which is a property of the sender and not of the receivers, so the decode
+column counts from 3 s in. And libsrt 1.5.7's `srt-live-transmit` zero-pads
+short reads from a pipe, so a `dd` re-blocks the pipe in every trial.
+
+**Plain (no encryption).** Three runs per row.
+
+| Loss | Latency | Receiver | Retransmission overhead (%) | Not recovered in time (%) | Video frames missing | Longest video gap (ms) | Decode messages | TS errors |
+|------|--------:|----------|----------------------------:|--------------------------:|---------------------:|-----------------------:|----------------:|----------:|
+| 0% | 200 ms | sapflow | 0.0 | 0.00 | 0 | 33 | 0 | n/a |
+| 0% | 200 ms | libsrt 1.5.7 | 0.0 | 0.00 | 0 | 33 | 0 | 0 |
+| 0% | 200 ms | gosrt (mediamtx 1.21.2) | 0.0 | 0.00 | 0 | 33 | 0 | n/a |
+| 2% | 200 ms | sapflow | 1.9 to 2.2 | 0.00 to 0.01 | 0 to 5 | 33 to 200 | 0 | n/a |
+| 2% | 200 ms | libsrt 1.5.7 | 2.0 to 2.1 | 0.00 to 0.01 | 0 | 33 | 0 to 2 | 0 |
+| 2% | 200 ms | gosrt (mediamtx 1.21.2) | 2.2 to 2.4 | 0.00 to 0.01 | 0 | 33 | 0 | n/a |
+| 5% | 200 ms | sapflow | 5.5 to 5.8 | 0.01 to 0.04 | 3 to 41 | 133 to 900 | 0 | n/a |
+| 5% | 200 ms | libsrt 1.5.7 | 5.5 to 5.8 | 0.01 to 0.04 | 0 | 33 | 0 to 1 | 0 to 4 |
+| 5% | 200 ms | gosrt (mediamtx 1.21.2) | 5.8 to 6.5 | 0.03 to 0.06 | 0 | 33 | 0 | n/a |
+| 10% | 200 ms | sapflow | 11.5 to 12.8 | 0.11 to 0.14 | 50 to 76 | 500 to 1000 | 0 | n/a |
+| 10% | 200 ms | libsrt 1.5.7 | 11.8 to 13.2 | 0.13 to 0.23 | 0 to 3 | 33 to 67 | 9 to 23 | 7 to 26 |
+| 10% | 200 ms | gosrt (mediamtx 1.21.2) | 12.2 to 13.4 | 0.13 to 0.28 | 2 to 3 | 100 | 0 | n/a |
+| 0% | 2000 ms | sapflow | 0.0 | 0.00 | 0 | 33 | 0 | n/a |
+| 0% | 2000 ms | libsrt 1.5.7 | 0.0 | 0.00 | 0 | 33 | 0 | 0 |
+| 0% | 2000 ms | gosrt (mediamtx 1.21.2) | 0.0 | 0.00 | 0 | 33 | 0 | n/a |
+| 2% | 2000 ms | sapflow | 1.9 to 2.1 | 0.00 to 0.01 | 0 | 33 | 0 | n/a |
+| 2% | 2000 ms | libsrt 1.5.7 | 1.9 to 2.1 | 0.00 | 0 | 33 | 0 | 0 |
+| 2% | 2000 ms | gosrt (mediamtx 1.21.2) | 2.1 to 2.4 | 0.00 | 0 | 33 | 0 | n/a |
+| 5% | 2000 ms | sapflow | 5.2 to 5.7 | 0.00 | 0 | 33 | 0 | n/a |
+| 5% | 2000 ms | libsrt 1.5.7 | 5.4 to 5.8 | 0.00 | 0 | 33 | 0 | 0 |
+| 5% | 2000 ms | gosrt (mediamtx 1.21.2) | 6.0 to 6.4 | 0.00 | 0 | 33 | 0 | n/a |
+| 10% | 2000 ms | sapflow | 11.4 to 12.1 | 0.00 | 0 | 33 | 0 | n/a |
+| 10% | 2000 ms | libsrt 1.5.7 | 11.9 to 12.9 | 0.00 | 0 | 33 | 0 | 0 |
+| 10% | 2000 ms | gosrt (mediamtx 1.21.2) | 12.1 to 13.5 | 0.00 | 0 | 33 | 0 | n/a |
+
+**AES-128.** Three runs per row.
+
+| Loss | Latency | Receiver | Retransmission overhead (%) | Not recovered in time (%) | Video frames missing | Longest video gap (ms) | Decode messages | TS errors |
+|------|--------:|----------|----------------------------:|--------------------------:|---------------------:|-----------------------:|----------------:|----------:|
+| 0% | 200 ms | sapflow | 0.0 | 0.00 | 0 | 33 | 0 | n/a |
+| 0% | 200 ms | libsrt 1.5.7 | 0.0 | 0.00 | 0 | 33 | 0 | 0 |
+| 0% | 200 ms | gosrt (mediamtx 1.21.2) | 0.0 | 0.00 | 0 | 33 | 0 | n/a |
+| 2% | 200 ms | sapflow | 1.8 to 2.2 | 0.00 to 0.01 | 0 to 22 | 33 to 767 | 0 | n/a |
+| 2% | 200 ms | libsrt 1.5.7 | 1.9 to 2.1 | 0.00 to 0.01 | 0 | 33 | 0 to 1 | 0 to 2 |
+| 2% | 200 ms | gosrt (mediamtx 1.21.2) | 2.2 to 2.3 | 0.00 to 0.03 | 0 | 33 | 0 | n/a |
+| 5% | 200 ms | sapflow | 5.4 to 5.8 | 0.00 to 0.03 | 0 to 18 | 33 to 633 | 0 | n/a |
+| 5% | 200 ms | libsrt 1.5.7 | 5.5 to 5.9 | 0.01 to 0.07 | 0 | 33 | 0 to 4 | 0 to 6 |
+| 5% | 200 ms | gosrt (mediamtx 1.21.2) | 5.7 to 6.4 | 0.03 to 0.06 | 0 | 33 | 0 | n/a |
+| 10% | 200 ms | sapflow | 11.4 to 12.6 | 0.13 to 0.14 | 78 to 114 | 833 to 1000 | 0 | n/a |
+| 10% | 200 ms | libsrt 1.5.7 | 11.9 to 12.9 | 0.13 to 0.18 | 1 to 2 | 67 | 5 to 14 | 12 to 15 |
+| 10% | 200 ms | gosrt (mediamtx 1.21.2) | 12.1 to 13.4 | 0.10 to 0.21 | 0 to 2 | 33 to 67 | 0 | n/a |
+| 0% | 2000 ms | sapflow | 0.0 | 0.00 | 0 | 33 | 0 | n/a |
+| 0% | 2000 ms | libsrt 1.5.7 | 0.0 | 0.00 | 0 | 33 | 0 | 0 |
+| 0% | 2000 ms | gosrt (mediamtx 1.21.2) | 0.0 | 0.00 | 0 | 33 | 0 | n/a |
+| 2% | 2000 ms | sapflow | 2.0 to 2.1 | 0.00 | 0 | 33 | 0 | n/a |
+| 2% | 2000 ms | libsrt 1.5.7 | 1.9 to 2.1 | 0.00 to 0.01 | 0 | 33 | 0 to 2 | 0 |
+| 2% | 2000 ms | gosrt (mediamtx 1.21.2) | 2.1 to 2.3 | 0.00 | 0 | 33 | 0 | n/a |
+| 5% | 2000 ms | sapflow | 5.3 to 5.6 | 0.00 | 0 | 33 | 0 | n/a |
+| 5% | 2000 ms | libsrt 1.5.7 | 5.5 to 6.0 | 0.00 | 0 | 33 | 0 | 0 |
+| 5% | 2000 ms | gosrt (mediamtx 1.21.2) | 5.7 to 6.3 | 0.00 | 0 | 33 | 0 | n/a |
+| 10% | 2000 ms | sapflow | 11.4 to 12.3 | 0.00 | 0 | 33 | 0 | n/a |
+| 10% | 2000 ms | libsrt 1.5.7 | 12.0 to 12.9 | 0.00 | 0 | 33 | 0 | 0 |
+| 10% | 2000 ms | gosrt (mediamtx 1.21.2) | 12.1 to 13.5 | 0.00 | 0 | 33 | 0 | n/a |
+
+**Receiver CPU and memory in the same trials.** Process CPU time over the
+28 s from 2 s after the sender starts until ffmpeg has sent its last frame
+(`ps` time, 10 ms resolution), as a percentage of one core, and the peak
+resident set sampled each second. Pooled over the four loss rates and three
+runs (12 trials per row), since loss made no visible difference.
+
+| Receiver | Encryption | Latency | CPU (% of one core): range, median | Peak RSS (MB) |
+|----------|------------|--------:|---------------------------------|--------------:|
+| sapflow | plain | 200 ms | 1.03 to 1.42, 1.24 | 22.1 to 25.2 |
+| sapflow | plain | 2000 ms | 0.85 to 1.35, 1.03 | 25.2 to 26.3 |
+| sapflow | AES-128 | 200 ms | 0.99 to 1.42, 1.24 | 22.0 to 25.4 |
+| sapflow | AES-128 | 2000 ms | 0.64 to 1.28, 1.03 | 24.3 to 26.5 |
+| libsrt 1.5.7 | plain | 200 ms | 0.89 to 1.17, 1.01 | 3.8 to 4.0 |
+| libsrt 1.5.7 | plain | 2000 ms | 0.78 to 1.13, 0.99 | 4.5 to 4.7 |
+| libsrt 1.5.7 | AES-128 | 200 ms | 0.89 to 1.31, 1.06 | 5.9 to 6.1 |
+| libsrt 1.5.7 | AES-128 | 2000 ms | 0.68 to 1.17, 0.97 | 6.7 to 6.8 |
+| gosrt (mediamtx 1.21.2) | plain | 200 ms | 3.15 to 4.08, 3.44 | 66.1 to 67.9 |
+| gosrt (mediamtx 1.21.2) | plain | 2000 ms | 2.94 to 4.22, 3.62 | 66.2 to 69.7 |
+| gosrt (mediamtx 1.21.2) | AES-128 | 200 ms | 3.12 to 4.15, 3.58 | 66.0 to 69.7 |
+| gosrt (mediamtx 1.21.2) | AES-128 | 2000 ms | 2.35 to 4.40, 3.62 | 67.3 to 69.4 |
+
+**This is not a like-for-like cost for libsrt.** `srt-live-transmit` only
+relays the stream to a file. sapflow and mediamtx also demux MPEG-TS, package
+LL-HLS and record fMP4 (sapflow cannot turn the packaging off, so mediamtx was
+left packaging too). libsrt is the floor for receiving SRT in these trials, not
+a library cost to set against the other two. The two servers are comparable
+with each other, and B measures them without recording.
+
+**What it shows**
+
+- *Retransmissions.* sapflow's overhead range overlapped libsrt's in all 12
+  conditions with loss. Pooled over latency and encryption (12 trials each),
+  the means at 2, 5 and 10% loss were 2.04, 5.54 and 11.80% for sapflow, 2.04,
+  5.68 and 12.33% for libsrt and 2.24, 6.10 and 12.68% for gosrt. gosrt's was
+  the highest: 0.2, 0.4 and 0.35 points above libsrt's mean at 2, 5 and 10%
+  and 0.2, 0.6 and 0.9 above sapflow's, outside libsrt's range in 3 of the 12
+  conditions and outside sapflow's in 4. sapflow's mean was at or below libsrt's
+  at every loss rate (by 0.0, 0.1 and 0.5 points) with every range overlapping,
+  so nothing here separates the two.
+- *Residual loss.* At 2000 ms, over the 18 trials with loss per receiver, the
+  packets left unrecovered were 1 for sapflow, 1 for libsrt and none for gosrt
+  (none at 0%): all three recover nearly everything a 2 s latency allows at
+  these rates. At 200 ms, summed over
+  the six trials (three runs, plain and AES-128) at 2, 5 and 10% loss, sapflow
+  left 2, 8 and 56 packets unrecovered, libsrt 2, 13 and 70, gosrt 4, 18 and 78,
+  of about 42,000 each. sapflow's totals are the lowest at every loss rate, but
+  the per-condition ranges overlap and the worst single trials at 10% (10, 16
+  and 20 packets) are close, so with three runs per cell this is a lean, not a
+  difference to claim.
+- *Encryption.* AES-128 made no visible difference to CPU for any receiver at
+  this bitrate (medians within 0.15 points of the plain trials), and none to the
+  overhead or residual loss. libsrt's resident set was about 2 MB larger.
+- *What the recordings contain.* Where there was residual loss (200 ms, 2% and
+  up), sapflow's recording was missing many more frames than the other two: over
+  all 144 trials 600 frames against 9 for libsrt and 11 for gosrt, for 67, 86
+  and 100 unrecovered packets. One unrecovered packet cost sapflow 5 frames in
+  one trial and 22 in another (gaps of 200 and 767 ms); three cost 41; at 10%
+  loss a trial lost 50 to 114 frames, a gap of up to a second. This is its
+  policy of withholding video from a damaged frame to the next keyframe, not
+  SRT losing more: its unrecovered packet counts were the lowest. libsrt's
+  output kept nearly every frame and carried the damage instead (5 to 23
+  decode messages and 7 to 26 TS errors per trial at 10% loss and 200 ms); gosrt's recording
+  kept nearly every frame and had no decode messages. Which is better depends on
+  what is downstream, and **these files are not what a player would show**.
+  At 2000 ms no receiver lost a frame. mediamtx's log had 2 warnings per trial
+  with no loss (the missing first GOP) and up to 5 at 10% loss and 200 ms, and
+  none about samples received too late.
+- *CPU and memory.* At 2.5 Mbit/s one SRT stream cost every receiver about a
+  percent of a core. gosrt in mediamtx used about 3 times sapflow's CPU
+  (median 3.4 to 3.6% against 1.0 to 1.2%) and about 2.7 times its peak resident
+  set (66 to 70 MB against 22 to 26 MB), both doing the same packaging and
+  recording. libsrt's 0.97 to 1.06% and 4 to 7 MB are the relay alone.
+
+**What it does not show**
+
+- One sender (libsrt 1.5.7's `srt-live-transmit`), one 30 s clip, three runs per
+  cell, random loss only and a fixed 60 ms round trip with no jitter or
+  reordering. Bursty loss, which `docs/interop.md` ran against libsrt, was not
+  repeated here.
+- That sapflow's SRT is better than libsrt's. At the SRT layer it is level;
+  the difference in the recordings is a choice about damaged video.
+- Anything about the sender side of `sapflow-srt` (sapflow as caller).
+- Long streams: a 30 s clip never reaches a key refresh, and receive buffers had
+  no time to grow.
+
+### B. Ingest cost per stream
+
+N concurrent publishers (1, 10 and 50) into one fresh server, no viewers, over SRT
+and, separately, over RTMP; sapflow and mediamtx 1.21.2 back to back in each
+round, the order flipping each round, three rounds, 36 runs, 12:16 to 13:13.
+
+- **Publishers.** The v4v encoder settings (1280x720, 30 fps, H.264 2.5 Mbit/s,
+  1 s keyframes, AAC 128 kbit/s), encoded **once** into a 150 s clip and
+  played with `ffmpeg -re -stream_loop -1 -c copy`, so the publishers do not
+  encode and cost little. The RTMP clip is the same encode remuxed to FLV. A
+  run lasts under 100 s after its first publisher starts, so the loop never
+  wrapped. An SRT publisher is `ffmpeg | dd | srt-live-transmit` at 200 ms
+  latency (three processes plus a shell), so 50 of them are 200 processes. Their
+  CPU is summed from `ps` and listed in the tables (20 to 33% of a core for 50
+  RTMP publishers, 64 to 90% for 50 SRT publishers, comparable to or above the
+  servers' own) on a 16-core Mac whose CPU idle was at least 64% in all but one of
+  the 144 samples taken before, during and after the runs. Publishers start
+  0.1 s apart.
+- **Servers.** Fresh for each run, with both the SRT and RTMP listeners on
+  whichever protocol is used, and HLS as in the 2026-10-22 configuration;
+  mediamtx with `srt: yes` and `moq: no` (the file above without recording);
+  sapflow with `SAPFLOW_MAX_PUBLISHERS=100`, because its default of 16 per
+  protocol would stop at 16 streams (mediamtx was given no such limit). No
+  recording in either. The driver checked that the process it started held the
+  HTTP and publish ports.
+- **Measured.** The driver waited until every media playlist had at least one
+  segment and one part; the window started 25 s after that, by which time every
+  playlist held 24 segments, and ran for 45 s (45.1 to 46.0). Server CPU is its CPU time over the
+  window; memory is the peak of one sample a second. At the end of the window
+  every playlist was fetched again: all N had segments, their media sequence
+  had advanced by at least 49 in every run and every publisher was still running. That
+  is a check that streams are being served, not that their video is intact (see
+  "Found on the way").
+
+**SRT**
+
+| Streams | Server | Server CPU (% of one core) | CPU per stream (%) | Peak RSS (MB) | RSS per stream (MB) | Publishers' CPU (% of one core) | mediamtx / sapflow: CPU, RSS |
+|--------:|--------|---------------------------:|-------------------:|--------------:|--------------------:|--------------------------------:|-----------------------------:|
+| 1 | sapflow | 1.06 to 1.34 | 1.06 to 1.34 | 24 to 25 | 24.2 to 25.0 | 2 |  |
+| 1 | mediamtx 1.21.2 | 3.55 to 4.06 | 3.55 to 4.06 | 90 to 92 | 90.3 to 91.9 | 2 to 3 | 3.1x, 3.7x |
+| 10 | sapflow | 9.61 to 10.69 | 0.96 to 1.07 | 190 to 194 | 19.0 to 19.4 | 19 to 22 |  |
+| 10 | mediamtx 1.21.2 | 21.73 to 25.35 | 2.17 to 2.54 | 473 to 482 | 47.3 to 48.2 | 16 to 20 | 2.3x, 2.5x |
+| 50 | sapflow | 34.54 to 39.38 | 0.69 to 0.79 | 950 to 998 | 19.0 to 20.0 | 77 to 90 |  |
+| 50 | mediamtx 1.21.2 | 65.27 to 67.40 | 1.31 to 1.35 | 2170 to 2252 | 43.4 to 45.0 | 64 to 68 | 1.7x, 2.3x |
+
+**RTMP**
+
+| Streams | Server | Server CPU (% of one core) | CPU per stream (%) | Peak RSS (MB) | RSS per stream (MB) | Publishers' CPU (% of one core) | mediamtx / sapflow: CPU, RSS |
+|--------:|--------|---------------------------:|-------------------:|--------------:|--------------------:|--------------------------------:|-----------------------------:|
+| 1 | sapflow | 0.42 to 0.61 | 0.42 to 0.61 | 24 to 25 | 24.5 to 25.0 | 1 |  |
+| 1 | mediamtx 1.21.2 | 0.90 to 1.49 | 0.90 to 1.49 | 82 to 90 | 82.5 to 90.0 | 1 | 2.4x, 3.6x |
+| 10 | sapflow | 2.79 to 4.93 | 0.28 to 0.49 | 191 to 194 | 19.1 to 19.4 | 5 to 7 |  |
+| 10 | mediamtx 1.21.2 | 5.56 to 9.87 | 0.56 to 0.99 | 445 to 457 | 44.5 to 45.7 | 4 to 7 | 2.0x, 2.3x |
+| 50 | sapflow | 11.17 to 20.50 | 0.22 to 0.41 | 981 to 989 | 19.6 to 19.8 | 20 to 33 |  |
+| 50 | mediamtx 1.21.2 | 21.27 to 36.97 | 0.43 to 0.74 | 2018 to 2119 | 40.4 to 42.4 | 19 to 31 | 1.8x, 2.1x |
+
+Each cell is three runs. Idle memory (3 s after start) was 3.3 to 3.4 MB for
+sapflow and 32.7 to 33.4 MB for mediamtx. Per round (the machine drifts by tens
+of percent over an hour), mediamtx / sapflow CPU was 2.8 to 3.4x, 2.3 to 2.4x
+and 1.7 to 1.9x at 1, 10 and 50 SRT streams, and 2.1 to 2.4x, 2.0 to 2.1x and
+1.8 to 1.9x for RTMP. Time from the first publisher starting until every
+playlist had a segment and a part (it includes the 5 s it takes to start 50
+publishers):
+
+| First playable, seconds from the first publisher starting | 1 stream | 10 streams | 50 streams |
+|---|---|---|---|
+| SRT, sapflow | 2.2 | 3.2 to 3.3 | 7.3 to 7.5 |
+| SRT, mediamtx 1.21.2 | 0.9 | 1.9 to 2.8 | 6.4 to 6.7 |
+| RTMP, sapflow | 0.6 | 1.7 to 1.8 | 6.3 to 6.5 |
+| RTMP, mediamtx 1.21.2 | 1.7 | 2.8 | 7.4 to 7.6 |
+
+**What it shows**
+
+- sapflow used less CPU and memory than mediamtx at every N, over both
+  protocols, and the ratio fell as N rose: SRT CPU 3.1x at one stream and 1.7x
+  at 50, memory 3.7x and 2.3x. Part of the one-stream gap is fixed cost
+  (mediamtx idles at 33 MB, sapflow at 3.4 MB).
+- Memory per stream is flat in sapflow from 10 streams (19 to 19.4 MB) to 50
+  (19 to 20 MB) and the same over SRT and RTMP, which suggests the LL-HLS window
+  (24 one-second segments and their parts) rather than the ingest path; that was
+  not confirmed. mediamtx's was 40 to 48 MB per stream. Neither server showed anything that looks
+  like a leak over 45 s; mediamtx's memory was still rising through the
+  window at one stream (64 MB to 90 MB), as in the previous section.
+- SRT cost both servers more than RTMP: sapflow about 0.7 to 1.3% of a core per
+  SRT stream against 0.2 to 0.6% per RTMP stream, mediamtx 1.3 to 4.1% against
+  0.4 to 1.5%. Why was not separated; SRT also brings the MPEG-TS demux that
+  RTMP does not need.
+- One RTMP stream cost sapflow 0.4 to 0.6% of a core. The RTMP code's own
+  share (handshake, chunking, AMF0, FLV) was not separated from LL-HLS
+  packaging; these are server figures.
+- First playable: sapflow was quicker over RTMP (0.6 s against 1.7 s at one
+  stream) and slower over SRT (2.2 s against 0.9 s), in the same direction at 10
+  and 50 streams. Not investigated. The SRT times include the 200 ms latency,
+  the wait for the next keyframe after the sender's dropped start (see A) and a
+  poll every 0.5 s.
+
+**What it does not show**
+
+- Viewers (previous section), recording, or anything about the cost of
+  connecting: the window starts at least 25 s after the last stream is up.
+- SRT at 2000 ms; receive buffers grow with latency and the memory above is at
+  200 ms.
+- A limit. 50 streams used up to 0.4 of one core for sapflow and 0.7 for
+  mediamtx on a 16-core Mac; neither was pushed to the point of failure.
+- Real encoders: stream-copied clips have no jitter, no rate variation beyond
+  the clip's own and no keyframe-interval changes.
+- Linux, where mediamtx's Go runtime and sapflow's tokio runtime may behave
+  differently.
+- That every one of the 50 SRT streams into sapflow was undamaged.
+
+
+### C. Delay through the server over SRT
+
+The method of [Delay through the server](interop.md#delay-through-the-server)
+(`scripts/ingest-lag.py`) as generalised for the previous section's RTMP
+delay (it takes the master playlist's first variant, follows mediamtx's session
+redirect with a cookie jar and, for mediamtx, subtracts the 10 s its media
+timeline starts at), with `dd` between ffmpeg and `srt-live-transmit`: ffmpeg's
+test signal (720p30, 2 Mbit/s, 2 s keyframes, `-muxdelay 0 -muxpreload 0
+-pes_payload_size 0 -flush_packets 1`) in real time into the server, the media
+playlist polled every 20 ms, and for each new part the moment it appeared
+compared with the moment ffmpeg sent its last frame. 40 s a run, the first 8 parts
+skipped, three runs each, interleaved with the order flipping each round,
+13:14 to 13:25. The lag includes the SRT latency and excludes the player.
+
+| SRT latency | Server | Runs | Median | p90 | Parts per run |
+|--:|---|--:|---|---|---|
+| 200 ms | sapflow | 3 | -0.21 to -0.20 s | -0.20 to -0.19 s | 190 |
+| 200 ms | mediamtx | 3 | -0.23 to -0.22 s | -0.21 s | 190 |
+| 2000 ms | sapflow | 3 | 1.59 to 1.60 s | 1.60 to 1.61 s | 181 |
+| 2000 ms | mediamtx | 3 | 1.58 s | 1.59 to 1.60 s | 171 to 181 |
+
+- At this method's resolution there is **no measurable difference in delay
+  through the server over SRT** at either latency: sapflow's parts appeared 0.01
+  to 0.03 s after mediamtx's relative to the encoder at 200 ms, and 0.01 to
+  0.02 s after at 2000 ms, about the size of the run-to-run spread and of the
+  20 ms poll. The RTMP delay was
+  measured in the previous section (also no difference) and is not repeated.
+- The medians are negative at 200 ms because ffmpeg's read burst at the start
+  puts every sample about 0.2 to 0.4 s early; read the difference. The step
+  from 200 to 2000 ms is 1.8 s, the step in latency. The 2026-10-21 figures in
+  `docs/interop.md` (-0.12 and 1.68 s for sapflow, an earlier day and sender) are
+  within 0.1 s of these.
+- At 2000 ms two of mediamtx's three runs saw 171 parts against sapflow's 181
+  (both saw 190 at 200 ms): about 2 s of media fewer in the same 40 s, so its
+  stream became playable later in those runs. Not investigated.
+- This is not glass to glass and not a player. The 2 s GOP and 2 Mbit/s are the
+  method's, not v4v's settings.
+
+### Found on the way
+
+1. **libsrt 1.5.7's `srt-live-transmit` pads short reads with zeros.** Piping
+   `ffmpeg -re` straight into it, as `scripts/srt-loss.sh` and
+   `scripts/ingest-lag.py` do, sent 2,529 data packets of 1,456 bytes for a
+   3,562,976-byte stream that needs 2,448 (seen with a throwaway UDP relay that
+   logged SRT payload sizes). The receiver's output had 473 runs of zero
+   bytes in 10.6 MB, which break the MPEG-TS packet alignment. With `dd
+   ibs=188 obs=1456` in between, every packet is full and the output is
+   the sent stream plus the final packet's padding. Not seen with 1.5.4 on
+   macOS 14 in one short direct check; 1.5.7 against macOS 26 was not
+   separated. Those two scripts, run with 1.5.7, send a stream with zero bytes
+   inserted; they were not changed here. A first run of A without the `dd` (66 of
+   144 trials) was discarded.
+2. **`srt-live-transmit` as sender drops the first 145 chunks.** About
+   211 KB, the first GOP, is read and never sent (the proxy counts 7,038 original
+   packets for a 7,183-chunk stream; 7,030 to 7,038 in all 144 trials). All three receivers
+   therefore start mid-GOP. Not isolated; it looks like input read before the
+   connection is up being discarded. libsrt's output was compared byte for
+   byte with the stream ffmpeg sent in one clean trial: it is exactly that
+   stream from byte 211,120 to the end. The output therefore starts without
+   the SPS and PPS, ffmpeg complains about every frame until the next keyframe
+   (36 to 62 decode messages whatever the loss rate, 0% included), and sapflow
+   and gosrt, which wait for a keyframe, record nothing until then (868 or 869
+   video packets against libsrt's 882 or 883, of 900). The decode columns in A
+   count from 3 s in for that reason. It also means the first playable time in B
+   includes a wait for the next keyframe.
+3. **sapflow logged video parser errors at 50 SRT streams while the OS dropped
+   UDP datagrams.** In the 50-stream SRT
+   runs sapflow logged `h264_reader::annexb` "invalid byte" errors: 10,837, 5,194
+   and 110 lines in the three runs, none at 1 or 10 streams, none over RTMP, and
+   none for mediamtx (0 or 1 warnings). In one extra diagnostic run per server
+   (not part of the table) the system's UDP counters, from `netstat -s -p udp`
+   before and after, rose by **347 "dropped due to full socket buffers" during
+   sapflow's run and by none during mediamtx's**. The errors came in two bursts
+   in that run, one as the publishers started and one inside the measurement
+   window. `srt_own.rs` binds its socket with `UdpSocket::bind` and sets no
+   receive buffer, so it has macOS's default of 786,896 bytes (net.inet.udp.recvspace),
+   about 50 ms of 50 streams at 2.6 Mbit/s, where kern.ipc.maxsockbuf allows
+   8,388,608. That fits the evidence but was **not tested** (no larger buffer was
+   tried, the counters are system-wide, and only playlists were checked, not
+   the video). Effect on the numbers: sapflow's 50-stream SRT CPU rose with the
+   error count (34.5% with 110 lines, 38.6% with 5,194, 39.4% with 10,837), so
+   its figure there is probably a little high and the 1.7x ratio a little low.
+4. **sapflow withholds video from a damaged frame to the next keyframe** (A):
+   one unrecovered SRT packet cost it 5 to 22 frames in a trial where libsrt and
+   gosrt kept nearly all of theirs. A deliberate policy (commit `62d2d02`), shown
+   here because it is the one place its recordings look worse than the others'.
+5. **A mediamtx media playlist URL stopped working after about a minute** in
+   one B run (apparently the viewer session behind it expiring); the first
+   version of the driver then counted that stream as failed, and the run was
+   discarded and repeated with a driver that fetches the master playlist again
+   after a failure. Not investigated.
+
+### `scripts/bench.sh`
+
+Its mediamtx configuration now carries `moq: no` when the binary accepts it.
+mediamtx 1.21 starts a Media-over-QUIC server by default (listening on `*:8892`
+over TCP and UDP and on UDP 8893, and writing `auto.key` and `auto.crt` into the
+working directory, which for this script is the repository root). A release
+that predates the key is expected to reject it with `json: unknown field` (1.21.2
+does so for an unknown key), so the script first starts the binary on a minimal
+probe file containing the line and keeps the line only if the process stays up. Checked with the 1.21.2 binary:
+`moq: no` accepted, a made-up key rejected, a full run
+(`VIEWERS= MEDIAMTX=<1.21.2> scripts/bench.sh mediamtx`) listening only on
+127.0.0.1:1935 and 127.0.0.1:8888 and writing no key files. **mediamtx 1.19.1
+was not available to run**, so that the key is rejected there is an assumption
+from the behaviour of the 1.21.2 strict config reader; the fallback for an old
+binary was tested only with the made-up key. The usage message no longer says
+1.19.1 only.
+
+### What this section shows, and what it does not
+
+- At the SRT layer sapflow's receiver is level with libsrt's: retransmission
+  overhead ranges overlapping libsrt's in all 12 lossy conditions, residual loss
+  no higher, AES-128 changing nothing visible. gosrt in mediamtx used more
+  retransmission overhead: its mean at 2, 5 and 10% loss was 0.2 to 0.4 points
+  above libsrt's and 0.2 to 0.9 above sapflow's.
+- sapflow's CPU and memory per stream were lower than mediamtx's over both SRT
+  and RTMP, at 1, 10 and 50 streams: by 1.7 to 3.1x in CPU and 2.1 to 3.7x in
+  memory, narrowing as streams are added. With 50 SRT publishers sapflow shows
+  a problem (item 3) that mediamtx does not.
+- Delay through the server over SRT: no measurable difference.
+- **Not shown:** that sapflow's SRT or RTMP is better than libsrt's, gosrt's or
+  gortmplib's in general; behaviour with a sender other than libsrt 1.5.7's
+  `srt-live-transmit`, with jitter or reordering, with bursty loss, with a real
+  encoder or over a network; the sender role of `sapflow-srt`; RTMP handshake and
+  publish cost separate from the server; Linux; longer streams or key refresh;
+  nginx-rtmp-module or librtmp (not installed). The SRT numbers also depend on
+  three harness choices described above (the `dd`, the lost first GOP, counting
+  decode messages from 3 s in), which changed what libsrt's output looked like
+  more than any receiver difference did.
 
 ## Decision
 

@@ -2,7 +2,7 @@
 # M4 measurements for one server, the same way for sapflow and mediamtx.
 #
 #   scripts/bench.sh sapflow
-#   MEDIAMTX=/path/to/mediamtx scripts/bench.sh mediamtx
+#   MEDIAMTX=/path/to/mediamtx scripts/bench.sh mediamtx    # 1.19.1 or 1.21.x
 #
 # Feed: ffmpeg test signal over RTMP, 720p30, 2.5 Mbit/s, 1 s keyframes, AAC
 # (v4v's recommended encoder settings). Measures binary size, idle and loaded
@@ -38,7 +38,26 @@ case "$SERVER" in
     SAPFLOW_RTMP_ADDR=127.0.0.1:1935 RUST_LOG=warn "$BIN" > "$WORK/server.log" 2>&1 &
     ;;
   mediamtx)
-    BIN=${MEDIAMTX:?set MEDIAMTX to the mediamtx 1.19.1 binary}
+    BIN=${MEDIAMTX:?set MEDIAMTX to the mediamtx binary (1.19.1 or 1.21.x)}
+    # mediamtx 1.21 starts a Media-over-QUIC server unless told not to: it listens
+    # on *:8892 (TCP and UDP) and UDP 8893 and writes auto.key and auto.crt into the
+    # working directory. `moq: no` turns it off, but a release that predates the key
+    # rejects it (`json: unknown field`), so the line is added only if this binary
+    # accepts it. Written with 1.21.2 in hand; 1.19.1 was not available to run, so
+    # the fallback for an older binary was tested against a made-up key instead.
+    mtx_accepts() { # one config line -> 0 if the binary starts with it, 1 if it names an unknown field
+      local p
+      printf 'logLevel: warn\nrtmp: no\nhls: no\nrtsp: no\nwebrtc: no\nsrt: no\napi: no\n%s\n' "$1" > "$WORK/probe.yml"
+      "$BIN" "$WORK/probe.yml" > "$WORK/probe.log" 2>&1 &
+      p=$!
+      sleep 1
+      if kill -0 "$p" 2>/dev/null; then kill "$p"; wait "$p" 2>/dev/null || true; return 0; fi
+      wait "$p" 2>/dev/null || true
+      grep -q 'unknown field' "$WORK/probe.log" && return 1
+      echo "mediamtx exited on its probe config:" >&2; cat "$WORK/probe.log" >&2; exit 1
+    }
+    MOQ=""
+    if mtx_accepts "moq: no"; then MOQ="moq: no"; fi
     # v4v's reference settings (docs/examples/mediamtx.yml), local ports.
     cat > "$WORK/mediamtx.yml" <<EOF
 logLevel: warn
@@ -55,6 +74,7 @@ hlsAllowOrigins: ['*']
 rtsp: no
 webrtc: no
 srt: no
+$MOQ
 api: no
 authInternalUsers:
   - user: any
