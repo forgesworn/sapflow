@@ -5,7 +5,49 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-The latest iOS quality packet adds an explicit native 640×480 option beside
+The latest reviewed source adds Capture elapsed, Broadcast elapsed and measured
+Socket outbound to both native apps. Local write completion remains separate
+from remote delivery or decoded-media proof. Reconnect gaps have no fresh rate;
+incomplete historical totals remain labelled while a healthy successor warms
+up its own rate. End freezes the broadcast clock without stopping independent
+capture/recording. iOS telemetry is committed locally as `0a92e51`.
+
+Android commit `7a50c0d` adds a private show/segment catalogue, cold profile-specific capacity
+and storage checks, and explicit export through the system document picker.
+Unfinished and orphaned files remain visibly unverified. Export revalidates its
+original selected file, preserves the private original and retains capacity
+until actual owners close. The picker is unavailable during capture. Late
+permission/storage replies cannot revive a cancelled Prepare; healthy live
+file ownership and uncertain cleanup are distinct. The catalogue currently
+bounds scans to 256 segments; management/pagination and iOS catalogue/export
+remain open. There is no automatic crash repair, deletion or replay publication.
+This builds on `1e9b031`, which preserves recording across queued Start/End,
+rotation and publisher-failure races with exact intent and actual cleanup fences.
+
+The combined Android gate passes 305 tests across 46 suites in each of Debug
+and Qualification, with zero failures/errors/skips. Three APKs assemble,
+qualification/release isolation and all ARM64 libraries' 16 KiB alignment pass.
+Lint has zero errors and seven/six warnings. Debug/Qualification use only the
+existing debug certificate; Release is unsigned. The separate generated-media
+macOS native mux/recorder test independently decodes finalised and clean-abort
+segments. This does not qualify Android storage/providers or torn-file repair.
+
+iOS telemetry passes 109 pure tests, 65 packaged control/authentication tests
+and 32 creator-owner tests. These suites overlap. All three complete unsigned
+app configurations compile and link with zero warnings, using identical source
+and both existing native packages. The actual 94-input unit-test bundle also
+compiles and links; it was not executed. Independent source and artefact reviews
+are clear. No app was installed and the owner's Pixel capture was untouched.
+A fresh read-only Apple device inventory still reports the primary iPhone
+unavailable; the owner's confirmation that UI Automation was already enabled
+does not establish a new runner or camera result.
+
+These are local source/build checkpoints. Physical profiles, current app
+recording/export, real creator/signer consent, sustained performance, store and
+owner acceptance remain open. The [OBS and library-quality work](library-quality-plan.md)
+continues alongside these app gates; performance superiority is not established.
+
+The preceding iOS quality commit `0710256` adds an explicit native 640×480 option beside
 720p30, retaining the selected profile through Prepare, Start, rotation and
 reconnects. Native camera output and compressed H.264 dimensions are checked;
 1080p remains an engineering path excluded from the ordinary picker. V4V
@@ -848,7 +890,9 @@ exists. In particular:
 - B3/B3R: complete our encrypted SRT and RTMPS publishing paths, independent
   interoperability, hostile-input fuzzing and impaired-network acceptance.
 - B4/B4R: attach real publishers; complete manual/V4V creator flows, observed
-  media status, audio-only/external audio, controls, standby and safe profiles.
+  media status, audio-only/external audio, controls, standby and safe profiles;
+  physically qualify elapsed/socket readouts, storage preflight and exact
+  recording export, and implement the iOS recording catalogue/export.
 - B5: sustained physical/network/thermal/storage tests, SDK consumption,
   route-specific signed packages, upgrade and free-V4V behaviour, owner
   acceptance, release readback and any production decision at its own gate.

@@ -1332,3 +1332,48 @@ single-use daemon terminated; no unrelated daemon was stopped. This packet
 performed no extra signing, install, device, network fixture or native decoder
 execution. Default V4V configuration remains disabled, and native Android
 fragment/codec/cleanup/causal-confirmation acceptance remains open.
+
+### Live readouts and private recording library
+
+The capture screen now displays Capture elapsed, Broadcast elapsed and measured
+Socket outbound. Capture time begins only at committed Start, includes rotation
+and retry gaps, and freezes on Stop/interruption. Destination End freezes its
+broadcast clock while independent recording can continue. Socket accounting is
+local successful write completion, with fresh current-socket rates separated
+from potentially incomplete historical totals. Reconnect backoff, partial
+writes and stale samples never become false zero-throughput measurements.
+The detailed accounting and ownership contract is in the
+[SDK contract](mobile-sdk-contract.md#native-live-telemetry).
+
+Private recordings are grouped by show and ordered segment. Finalised means
+the recorder completed its mux/file lifecycle; incomplete and orphaned files
+remain visibly unverified. Preparing local recording checks catalogue capacity
+and free space off the UI/codec threads for the selected immutable profile.
+The check does not promise a recording duration. Recording is never silently
+disabled because storage is low. Late permissions, grants or storage replies
+cannot restart a cancelled Prepare or choose a different destination.
+
+Export uses the system document picker only when capture is stopped. An
+application-owned single IO slot keeps the exact file selection through
+Activity recreation, revalidates it before opening the document provider, then
+copies bounded chunks and closes actual owners. Cancel or failure keeps the
+private original; a partial provider document may remain. Unverified files
+require explicit confirmation, without repair or automatic completion claims.
+Healthy live ownership and ordinary busy refusals are distinct from uncertain
+cleanup. Unconfirmed actual closure blocks replacement work. The current
+catalogue is bounded to 256 segments; capacity failure preserves files, and
+management/pagination remain follow-on work.
+
+The combined local gate passes 305 JVM tests in 46 suites in each of Debug and
+Qualification, with no failures, errors or skips. All three application
+configurations assemble; qualification isolation and both lint tasks pass.
+These actual Gradle suites include separate production/test Kotlin modules,
+real generated-byte file tests, close/cancel/export ownership, storage
+preflight, stale permission replies and telemetry retry continuity. Earlier
+focused gates are overlapping subsets, not additional unique test totals.
+
+The separate macOS native proof uses only generated H.264/AAC and the actual
+packaged mux/recorder classes. Completed and clean-abort segments independently
+decode, demonstrating that particular accepted prefix. It does not prove
+torn-file repair, complete-show recovery, Android filesystem/SAF behaviour or
+physical playback. This work has not replaced the owner's Pixel app or capture.

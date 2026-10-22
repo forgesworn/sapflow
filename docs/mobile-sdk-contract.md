@@ -333,3 +333,94 @@ also sought to 2.2 seconds and decoded the expected source frame. Duration staye
 are under `target/native-recording-check/`; owned fixture/build-input scratch was
 removed and no server was started. These desktop mux/IO checks do not qualify
 Android FileChannel lifecycle, physical codecs, storage failure or durability.
+
+## Native live telemetry
+
+The native applications expose three separate facts: Capture elapsed,
+Broadcast elapsed and Socket outbound. Capture elapsed starts at the actual
+first committed Start and follows that foreground capture intent through
+rotation and reconnect gaps. Stop or foreground interruption freezes it.
+Broadcast elapsed is absent for record-only capture and freezes at actual
+destination End, expiry or terminal failure while independent recording may
+continue. Neither clock is the written file's media duration. Prepare, a
+pending Start and a transport handshake do not start either clock.
+
+Socket outbound counts successful local socket completions from the existing
+transport adapters. iOS uses the existing Network.framework
+[`contentProcessed`](https://developer.apple.com/documentation/network/nwconnection/sendcompletion/contentprocessed(_:))
+callback. Android counts a complete successful application write or whole
+[`DatagramChannel.write`](https://developer.android.com/reference/java/nio/channels/DatagramChannel)
+return. RTMP counts protocol bytes; RTMPS excludes TLS, TCP and IP overhead.
+SRT includes its datagram headers, control and retransmission bytes but excludes
+UDP and IP overhead. This is neither NIC throughput, remote receipt nor decoded
+playback. The existing current-attempt origin observer remains the source of
+decoded-media confirmation.
+
+The hook adds scalar accounting to existing send completions, with no payload
+copy, extra FFI call, packet timer or packet dispatch. Cold reads occur at most
+once a second. A rate requires two complete monotonic samples, each fresh
+within three seconds and separated by no more than three seconds. Warm-up,
+stale clocks, unsupported accounting, overflow, ambiguous/partial writes and
+absence of an active socket have unavailable rates. Zero requires a valid
+complete interval with no completed bytes. Positive rates below 1 kbit/s display
+as `<1 kbit/s`. A historical incomplete total remains labelled incomplete;
+a new complete socket warms up its own rate without bridging the failed socket.
+
+Attempts are correlated to their actual destination, epoch and token. Actual
+close folds their final scalar accounting before admitting a successor. Final
+totals may be lower bounds when cleanup or writes are unconfirmed. There is no
+unbounded attempt history. End retains the final total with an unavailable rate.
+On iOS one outstanding cold read is allowed per show; Android reads bounded
+scalar snapshots from its existing display refresh without queuing statistics
+jobs. Statistics cannot admit media, revive a stopped intent, bypass policy or
+delay resource cleanup. Physical energy and sustained throughput costs remain
+measurement work rather than an inference from this source design.
+
+## Android private recording catalogue and export
+
+The Android recording adapter groups independently written segments by a
+private show identity and ordered segment identities. Rotation produces a new
+segment in the same show. Small bounded sidecar receipts distinguish active,
+recorder-finalised, incomplete and unverified files. Finalisation requires
+actual mux finish/drain, file force and close; it does not establish decoded
+playability, a complete show, remote replay publication or crash repair.
+Missing, corrupt or mismatched receipts never promote an orphan to complete.
+
+Prepare performs its local recording capacity and free-space check on a cold
+IO worker, using the immutable selected profile. The initial storage budget is
+a 60-second bitrate horizon plus headroom and reserve, not a duration limit or
+a promise that future writes will fit. Low or unavailable storage visibly
+refuses preparation. Turning recording off is an explicit user action. The
+worker result is time-bounded and correlated to the original foreground
+Prepare; late permission, grant and storage replies cannot revive cancellation
+or silently select a different destination. The recorder checks capacity again
+when it actually begins writing.
+
+The catalogue bounds scans to 256 segments and 1024 directory entries. Capacity
+failure preserves existing files. Its current list supports inspection and
+explicit copying, without automatic deletion or repair; catalogue management
+and pagination remain follow-on work. Listing a live recorder is permitted,
+but the document picker requires capture to be stopped so choosing an export
+destination cannot interrupt a live show. Unfinished and unverified files need
+an explicit confirmation and retain their status after export.
+
+One application-owned cold IO slot survives Activity recreation. The document
+picker receives no private path or file handle. Its original opaque selection
+is retained until the system reply is consumed; an old reply cannot choose a
+successor file. The worker revalidates exact file and receipt identities before
+opening the provider, copies in 64 KiB chunks, detects truncation, growth and
+replacement, and closes actual input/output owners before releasing capacity.
+Cancellation preserves the private original; a partly written provider document
+may remain. A failed or uncertain close retains capacity instead of treating a
+timeout or repeated no-op close as proof of cleanup.
+
+The process registry prevents a second local channel being opened on an owned
+lock inode, including rejected writers and aliases. This matters because the
+Java [`FileLock`](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/nio/channels/FileLock.html)
+contract permits closing another channel to release process locks on the same
+file. Healthy live ownership and abnormal cleanup are separate scalar states:
+a successful live scan or an ordinary busy refusal must not permanently block
+the library. Cross-process locking, receipt bounds and private originals remain
+independent of the media/network queues. Generated host-file tests do not
+qualify Android filesystem behaviour, document providers, process termination,
+physical storage failure or device media playback.
