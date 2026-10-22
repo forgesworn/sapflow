@@ -53,9 +53,16 @@ internal class ManualQrPolicy(val beganNs: Long) {
         delivered = true
         val text = candidate.takeIf { timely(nowNs) }
         candidate = null
-        return Reply(text)
+        return Reply(text, beganNs, deadlineNs)
     }
-    class Reply(val text: String?) { override fun toString() = "QR scan reply (redacted)" }
+    class Reply internal constructor(private val text: String?, private val beganNs: Long, private val deadlineNs: Long) {
+        // Native completion can precede a withheld UI relay. Only the actual
+        // receiver may offer an invitation, under the unchanged original clock.
+        fun textForDelivery(nowNs: Long): String? = text.takeIf {
+            deadlineNs >= 0 && nowNs >= beganNs && nowNs < deadlineNs
+        }
+        override fun toString() = "QR scan reply (redacted)"
+    }
 }
 
 /** Runtime permission replies carry no native request identity. Keep one exact

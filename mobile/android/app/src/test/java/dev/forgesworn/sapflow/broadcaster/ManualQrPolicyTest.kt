@@ -13,30 +13,30 @@ class ManualQrPolicyTest {
         val p = ManualQrPolicy(begin); p.cancel()
         assertFalse(p.claimOpen(begin)); assertFalse(p.beginDecode(begin))
         assertNull(p.finish(begin)); p.presentationClosed()
-        assertNull(requireNotNull(p.finish(begin)).text); assertNull(p.finish(begin))
+        assertNull(requireNotNull(p.finish(begin)).textForDelivery(begin)); assertNull(p.finish(begin))
     }
     @Test fun resultRequiresActualNativeDecoderAndPresentationReceipts() {
         val p = open(); validResult(p)
         assertNull(p.finish(begin)); p.nativeClosed(true); assertNull(p.finish(begin))
         p.presentationClosed(); assertNull(p.finish(begin)) // Actual decoder still owns its array.
-        p.decodeReturned(); assertEquals("generated-untrusted-candidate", requireNotNull(p.finish(begin)).text)
+        p.decodeReturned(); assertEquals("generated-untrusted-candidate", requireNotNull(p.finish(begin)).textForDelivery(begin))
         assertNull(p.finish(begin)); assertFalse(p.claimOpen(begin))
     }
     @Test fun cancellationAfterCandidateWhileNativeCloseHeldDiscardsIt() {
         val p = open(); validResult(p); p.decodeReturned(); p.cancel(); p.presentationClosed()
         assertNull(p.finish(begin)); assertFalse(p.nativeAndDecoderClosed)
-        p.nativeClosed(true); assertNull(requireNotNull(p.finish(begin)).text)
+        p.nativeClosed(true); assertNull(requireNotNull(p.finish(begin)).textForDelivery(begin))
     }
     @Test fun originalDeadlineCannotBeExtendedByFirstFrameOrWithheldTimer() {
         val p = open(); assertEquals(begin + 60_000_000_000L, p.deadlineNs)
         assertFalse(p.beginDecode(p.deadlineNs)); assertTrue(p.stopped)
         assertFalse(p.claimOpen(p.deadlineNs)); p.presentationClosed()
         assertNull(p.finish(p.deadlineNs)); p.nativeClosed(true)
-        assertNull(requireNotNull(p.finish(p.deadlineNs)).text)
+        assertNull(requireNotNull(p.finish(p.deadlineNs)).textForDelivery(begin))
     }
     @Test fun successfulResultHeldBeyondOriginalDeadlineHasNoAuthority() {
         val p = open(); validResult(p); p.decodeReturned(); p.nativeClosed(true); p.presentationClosed()
-        assertNull(requireNotNull(p.finish(p.deadlineNs)).text)
+        assertNull(requireNotNull(p.finish(p.deadlineNs)).textForDelivery(begin))
     }
     @Test fun unknownCleanupIsNotReleasedByLaterNoOpOrTime() {
         val p = open(); validResult(p); p.decodeReturned(); p.nativeClosed(false); p.presentationClosed()
@@ -78,5 +78,23 @@ class ManualQrPolicyTest {
         val gate = CaptureStartAdmission(); val scan = requireNotNull(gate.reserveScanner(Any()))
         assertNull(gate.stop()); assertFalse(gate.idle); assertTrue(gate.ownsScanner(scan))
         assertFalse(gate.scannerClosed(scan, false)); assertFalse(gate.idle)
+    }
+
+    @Test fun nativeCompletionBeforeDeadlineCannotOfferAfterWithheldUiRelay() {
+        val p = open(); validResult(p); p.decodeReturned(); p.nativeClosed(true); p.presentationClosed()
+        val reply = requireNotNull(p.finish(p.deadlineNs - 1))
+        assertEquals("generated-untrusted-candidate", reply.textForDelivery(p.deadlineNs - 1))
+        assertNull(reply.textForDelivery(p.deadlineNs))
+        assertNull(reply.textForDelivery(p.deadlineNs + 1))
+        assertEquals("QR scan reply (redacted)", reply.toString())
+    }
+    @Test fun actualUiDeliveryRefusesClockBeforeOriginalBeginAndCannotReviveRejectedCompletion() {
+        val p = open(); validResult(p); p.decodeReturned(); p.nativeClosed(true); p.presentationClosed()
+        val reply = requireNotNull(p.finish(begin))
+        assertNull(reply.textForDelivery(begin - 1))
+        assertEquals("generated-untrusted-candidate", reply.textForDelivery(begin))
+        val expired = open(); validResult(expired); expired.decodeReturned(); expired.nativeClosed(true); expired.presentationClosed()
+        val rejected = requireNotNull(expired.finish(expired.deadlineNs))
+        assertNull(rejected.textForDelivery(begin)) // Native expiry never revives via UI clock.
     }
 }

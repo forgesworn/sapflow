@@ -13,12 +13,14 @@ and dialog receipts. Checked Y-plane copies close each native Image before
 serial decoding. The pinned pure ZXing core has no Play service or model runtime;
 its exact licence and notice bytes are present in all three APK variants.
 
-The Android QR composition passes 85 focused JVM tests with warnings as errors,
-then 573 tests in each of Debug and Qualification, all three actual APK builds,
+The Android QR composition passes 87 focused JVM tests with warnings as errors,
+then 575 tests in each of Debug and Qualification, all three actual APK builds,
 Qualification/Release lint and qualification isolation. Built APK checks verify
 the QR decoder in DEX, native SDK byte identity, manifest registration, licence
 resources and 16 KiB alignment. Evidence remains under
-`target/manual-destination-links/android-qr-v1/` and `android-qr-app-v1/`.
+`target/manual-destination-links/android-qr-v1/`, `android-qr-deadline-v2/`
+and `android-qr-app-v2/`. The actual UI receiver rechecks the original scan
+deadline, so a withheld completion relay cannot offer an expired invitation.
 These checks do not establish installed Camera2 permissions, preview/readability,
 real callback cleanup or physical creator acceptance. iOS QR implementation
 and coverage-guided JVM fuzzing retain separate gates. No device or active

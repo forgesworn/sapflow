@@ -774,7 +774,7 @@ class MainActivity : ComponentActivity() {
                 val allowed = manualAllowed() && !manualIO.busy && !manualPicker.hasOutstanding && !libraryVisible
                 val valid = action != null && manualActions.finish(action, allowed)
                 manualBusy = manualActions.busy
-                val text = event.reply.text
+                val text = event.reply.textForDelivery(SystemClock.elapsedRealtimeNanos())
                 if (valid && text != null) {
                     val invitation = manualLinks.offer(runtimeClient, text, manualLinkAllowed(foreground = true))
                     if (invitation != null) manualInvitation = manualLinks.foreground(runtimeClient, manualLinkAllowed(foreground = true))
