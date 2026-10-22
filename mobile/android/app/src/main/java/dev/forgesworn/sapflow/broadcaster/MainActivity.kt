@@ -67,7 +67,7 @@ class MainActivity : ComponentActivity() {
     private var preparedCapture: CaptureStartAdmission.Preparation? = null
     private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
     private class PreparationIntent(val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
-        val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean)
+        val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?)
     private var pendingPreparation: PreparationIntent? = null
     private val permissionReplies = PendingPermissionReply<PreparationIntent>()
     private var permissionReplyOutstanding by mutableStateOf(false)
@@ -124,6 +124,8 @@ class MainActivity : ComponentActivity() {
     private var recordLocally by mutableStateOf(true)
     private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
     private var microphoneOnly by mutableStateOf(false)
+    private var selectedAudioInputId by mutableStateOf<String?>(null)
+    private var audioInputOptions by mutableStateOf<List<AudioInputOption>>(emptyList())
     private val selectedIntent: CaptureIntent get() = if (microphoneOnly) CaptureIntent.AudioOnly48kMono else CaptureIntent.AudioVideo(captureProfile)
     private val ui = Handler(Looper.getMainLooper())
     private val settlePose = object : Runnable {
@@ -260,6 +262,20 @@ class MainActivity : ComponentActivity() {
                                 }) { Text(if (microphoneOnly == audioOnly) "$label selected" else label) }
                             }
                         }
+                        Text("Microphone input", style = MaterialTheme.typography.labelLarge)
+                        OutlinedButton(enabled = qualityConfigurable, onClick = {
+                            if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) selectedAudioInputId = null
+                        }) { Text(if (selectedAudioInputId == null) "System Default selected" else "System Default") }
+                        audioInputOptions.forEach { input ->
+                            OutlinedButton(enabled = qualityConfigurable, onClick = {
+                                if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) selectedAudioInputId = input.id
+                            }) { Text("${input.name} · ${input.kind}" + if (selectedAudioInputId == input.id) " selected" else "") }
+                        }
+                        OutlinedButton(enabled = qualityConfigurable, onClick = {
+                            if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) audioInputOptions = AudioInputRouting.inventory(this@MainActivity)
+                        }) { Text("Refresh microphone inputs") }
+                        if (selectedAudioInputId != null && audioInputOptions.none { it.id == selectedAudioInputId }) Text("Selected microphone unavailable")
+                        Text("Active microphone: ${current?.activeAudioInput ?: "Not verified"}", style = MaterialTheme.typography.bodySmall)
                         if (microphoneOnly) Text("Foreground audio only. Capture stops when this screen leaves the foreground.", style = MaterialTheme.typography.bodySmall)
                         Text("Capture quality · choose before Prepare", style = MaterialTheme.typography.labelMedium)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -493,7 +509,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentPreparation(intent: PreparationIntent): Boolean = pendingPreparation === intent && intent.request == prepareRequest &&
-        poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && recordLocally == intent.record && useV4v == intent.v4v &&
+        poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && recordLocally == intent.record && useV4v == intent.v4v &&
         (intent.v4v || (useSrt == intent.srt && destinationUrl == intent.endpoint && destinationKey == intent.key && srtPassphrase == intent.passphrase &&
             srtPlaintextLab == intent.srtPlaintext && allowPlaintextDevelopment == intent.rtmpPlaintext))
 
@@ -503,7 +519,7 @@ class MainActivity : ComponentActivity() {
     }
     private fun prepareWithPermissions() {
         if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
-        val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment)
+        val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId)
         pendingPreparation = intent; preparationPending = true
         val needed = intent.capture.requiredPermissions.toTypedArray()
         if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
@@ -576,7 +592,7 @@ class MainActivity : ComponentActivity() {
             // Explicit Prepare restores the stable physical pose even if no
             // further sensor callback followed qualification Stop/CLEAR.
             if (intent.capture.hasVideo) capture.orientationChanged(poseSelector.prepareSession())
-            preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture)
+            preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture, intent.audioInputId)
             if (intent.v4v) preparedV4vCapture = preparedCapture
             pendingPreparation = null; preparationPending = false
         } catch (error: Exception) {

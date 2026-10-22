@@ -9,6 +9,7 @@ struct SapflowBroadcasterApp: App {
 
 final class BroadcasterModel: ObservableObject {
     @Published var snapshot = CaptureSnapshot()
+    @Published private(set) var selectedAudioInputID: String?
     @Published private(set) var captureProfile = CaptureIntent.defaultProfile
     @Published var destinationMode = BroadcasterDestinationMode.recording {
         didSet {
@@ -67,6 +68,11 @@ final class BroadcasterModel: ObservableObject {
     var canChangeCaptureProfile: Bool {
         recordingLibrary.captureAllowed && engine.canChooseCaptureProfile && (destinationMode != .v4v || creatorOwner?.canChangeCaptureSettings != false)
     }
+    func selectAudioInput(_ id: String?) {
+        guard canChangeCaptureProfile, engine.selectAudioInput(id) else { return }
+        selectedAudioInputID = id
+    }
+    func refreshAudioInputs() { guard canChangeCaptureProfile else { return }; engine.refreshAudioInputs(profile: captureProfile) }
     func selectCaptureProfile(_ profile: CaptureIntent) {
         guard canChangeCaptureProfile, captureProfiles.contains(profile) else { return }
         captureProfile = profile
@@ -301,6 +307,15 @@ struct BroadcasterView: View {
                 ProgressView(value: Double(model.snapshot.level + 60), total: 60).accessibilityLabel("Microphone level")
                 Text("Mic \(Int(model.snapshot.level)) dBFS · encoded \(model.snapshot.encoded) · capture drops \(model.snapshot.captureDrops)").font(.caption.monospacedDigit())
                 destinationForm
+                Picker("Microphone input", selection: Binding(get: { model.selectedAudioInputID }, set: { model.selectAudioInput($0) })) {
+                    Text("System Default").tag(String?.none)
+                    ForEach(model.snapshot.audioInputs) { input in Text("\(input.name) · \(input.kind.rawValue)").tag(Optional(input.id)) }
+                    if let selected = model.selectedAudioInputID, !model.snapshot.audioInputs.contains(where: { $0.id == selected }) {
+                        Text("Selected microphone unavailable").tag(Optional(selected))
+                    }
+                }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.microphone")
+                Button("Refresh microphone inputs") { model.refreshAudioInputs() }.disabled(!model.canChangeCaptureProfile)
+                Text("Active microphone: \(model.snapshot.activeAudioInput)").font(.caption)
                 Picker("Capture mode and quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
                     ForEach(model.captureProfiles, id: \.self) { Text($0.label).tag($0) }
                 }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.quality")

@@ -15,6 +15,9 @@ struct CaptureSnapshot {
     var running = false
     var captureElapsedNs: UInt64?
     var broadcastElapsedNs: UInt64?
+    var audioInputs: [AudioInputOption] = []
+    var requestedAudioInputID: String?
+    var activeAudioInput = "Not verified"
     var socketKilobitsPerSecond: Double?
 }
 
@@ -27,6 +30,7 @@ final class CaptureRun {
     let worker: IngressWorker
     var video: HardwareVideoEncoder?
     var audio: NativeAudioEncoder!
+    var audioRoute: AudioInputRouting?
     var epoch: CMTime?
     var admitting = false
     var startup: [(sample: CMSampleBuffer, video: Bool)] = []
@@ -75,6 +79,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private let samples = DispatchQueue(label: "sapflow.capture-samples", qos: .userInteractive)
     private var run: CaptureRun? // samples queue only
     private var captureGeneration: UInt64 = 0 // control queue only
+    private var audioRoute: AudioInputRouting? // control owner; immutable reference captured by CaptureRun
+    private var audioPin: (CaptureAdmission.Preparation, AudioInputPin)?
+    private var audioEpoch: UInt64 = 0
     private var configured = false // control queue only
     private var configuredProfile: CaptureIntent? // control queue only
     private var orientationPlan = OrientationRestartPlan()
@@ -105,11 +112,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         super.init()
         let centre = NotificationCenter.default
         for name in [AVCaptureSession.wasInterruptedNotification, AVCaptureSession.runtimeErrorNotification,
-                     AVAudioSession.interruptionNotification, AVAudioSession.routeChangeNotification,
+                     AVAudioSession.interruptionNotification,
                      UIApplication.didEnterBackgroundNotification] {
             notifications.append(centre.addObserver(forName: name, object: nil, queue: nil) { [weak self] notification in
                 guard let self else { return }
-                if notification.name == AVAudioSession.routeChangeNotification && self.admission.currentPhase != .running { return }
                 let ticket = self.admission.stop()
                 self.recordingAdmission.cancel(ticket.preparation)
                 self.fencePublishing()
@@ -142,6 +148,54 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             self.recordingBindingLock.unlock()
             completion(accepted)
         }
+    }
+    func selectAudioInput(_ id: String?) -> Bool {
+        guard canChooseCaptureProfile else { return false }
+        return admission.selectAudioInput(id)
+    }
+    func refreshAudioInputs(profile: CaptureIntent) {
+        control.async {
+            guard self.canChooseCaptureProfile else { return }
+            do {
+                // Inventory is category-dependent; never activate the session just to list it.
+                let audio = AVAudioSession.sharedInstance()
+                try audio.setCategory(.playAndRecord, mode: profile.hasVideo ? .videoRecording : .measurement,
+                                      options: [.defaultToSpeaker, .allowBluetooth])
+                let inputs = AudioInputRouting.inventory(audio)
+                guard self.canChooseCaptureProfile else { return }
+                self.snapshot.audioInputs = inputs
+                self.publish()
+            } catch { self.snapshot.detail = "Microphone inventory unavailable: \(error.localizedDescription)"; self.publish() }
+        }
+    }
+    private func attachAudioRoute(_ preparation: CaptureAdmission.Preparation) throws -> AudioInputRouting {
+        audioRoute?.close(); audioRoute = nil
+        if audioPin?.0 != preparation { audioPin = (preparation, AudioInputPin(requestedID: preparation.audioInputID)) }
+        guard let pin = audioPin?.1 else { throw CaptureFailure(message: "Microphone selection is unavailable") }
+        guard audioEpoch < UInt64.max else { throw CaptureFailure(message: "Microphone owner counter exhausted") }
+        audioEpoch += 1
+        let owner = AudioInputOwner(preparation: preparation, epoch: audioEpoch)
+        let route = try AudioInputRouting.attach(owner: owner, pin: pin, failure: { [weak self] in
+            self?.control.async {
+                guard let self, self.audioRoute?.owner == owner, self.preparedIntent == preparation,
+                      self.admission.currentPreparation == preparation else { return }
+                self.samples.sync {
+                    guard let run = self.run, run.audioRoute?.owner == owner else { return }
+                    run.admitting = false
+                    run.recorder.markIncomplete(CaptureFailure(message: "Microphone changed or disconnected"))
+                }
+                self.snapshot.activeAudioInput = "Microphone changed or disconnected"
+                self.stopOnControl(reason: self.audioRoute?.failureDescription)
+            }
+        }, changed: { [weak self] id in self?.control.async {
+            guard let self, self.audioRoute?.owner == owner, self.audioRoute?.permitsPCM() == true else { return }
+            self.snapshot.activeAudioInput = self.snapshot.audioInputs.first { $0.id == id }?.name ?? "Verified microphone"
+            self.publish()
+        } })
+        audioRoute = route
+        snapshot.audioInputs = AudioInputRouting.inventory()
+        snapshot.requestedAudioInputID = preparation.audioInputID
+        return route
     }
     func reservePreparation(profile: CaptureIntent = .defaultProfile) -> CaptureAdmission.Preparation? {
         guard let binding = recordings else { return nil }
@@ -339,10 +393,14 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     try audio.setCategory(.playAndRecord, mode: ticket.profile.hasVideo ? .videoRecording : .measurement, options: [.defaultToSpeaker, .allowBluetooth])
                     try audio.setPreferredSampleRate(48_000)
                     try audio.setActive(true)
-                    if !self.configured { try self.configure(profile: ticket.profile) }
-                    try self.applyOrientation()
-                    self.setSampleDelivery(true)
-                    self.session.startRunning()
+                    _ = try AudioInputRouting.activate(configure: {
+                        if !self.configured { try self.configure(profile: ticket.profile) }
+                        try self.applyOrientation()
+                    }, attach: {
+                        try self.attachAudioRoute(ticket)
+                    }, start: {
+                        self.setSampleDelivery(true); self.session.startRunning()
+                    })
                     guard self.admission.prepared(ticket) else { self.stopOnControl(reason: nil); return }
                     self.snapshot.phase = "Prepared"
                     self.snapshot.detail = self.orientationDescription
@@ -510,7 +568,6 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let captureToken = self.captureGeneration
         var constructedRun: CaptureRun?
         do {
-            if keepSavedSegment { try self.applyOrientation() }
             self.ingress.reset(hasVideo: ticket.preparation.profile.hasVideo)
             self.recordingFailureDescription = nil
             let run = try CaptureRun(recorder: recorder, recordingTicket: work, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress,
@@ -529,6 +586,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     guard self?.captureGeneration == captureToken, self?.preparedIntent == ticket.preparation else { return }
                     self?.snapshot.encoded = count; self?.snapshot.publisher = status; self?.publish()
                 } }, meter: { [weak self] level in self?.meter(level) })
+            run.audioRoute = self.audioRoute
             constructedRun = run
             // Once native owners exist, even a winning synchronous Stop must
             // reach their actual worker/recorder cleanup path before admission.
@@ -542,7 +600,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
             if keepSavedSegment {
                 try AVAudioSession.sharedInstance().setActive(true)
-                self.setSampleDelivery(true); self.session.startRunning()
+                run.audioRoute = try AudioInputRouting.activate(configure: { try self.applyOrientation() }, attach: {
+                    try self.attachAudioRoute(ticket.preparation)
+                }, start: { self.setSampleDelivery(true); self.session.startRunning() })
             }
             guard self.admission.permitsStart(ticket), self.recordingAdmission.isActive(work),
                   !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
@@ -620,7 +680,18 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         snapshot.canStart = false
         publish()
     }
-    private func stopOnControl(reason: String?) {
+    private func stopOnControl(reason requestedReason: String?) {
+        let retiringRoute = audioRoute
+        let routeFailed = retiringRoute?.close() == true
+        audioRoute = nil
+        let reason = routeFailed ? retiringRoute?.failureDescription : requestedReason
+        if routeFailed, let retiringRoute {
+            self.samples.sync {
+                guard let run = self.run, run.audioRoute?.owner == retiringRoute.owner else { return }
+                run.admitting = false
+                run.recorder.markIncomplete(CaptureFailure(message: "Microphone route changed or disconnected"))
+            }
+        }
         if let reason { stopReason = reason; orientationPlan.cancel(); rotationTimeout?.cancel(); rotationTimeout = nil }
         let child = rotationIntent
         let rotationAllowed = reason == nil && child.map(admission.permitsRotation) == true && orientationPlan.pending != nil
@@ -634,6 +705,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let rotationToken = rotationAllowed ? orientationPlan.pending : nil
         if rotationToken == nil { fencePublishing() } else { fenceCodecEpoch() }
         storageTimer?.cancel(); storageTimer = nil
+        snapshot.activeAudioInput = "Not active"
         setSampleDelivery(false)
         if session.isRunning { session.stopRunning() }
         snapshot.canStart = false
@@ -821,6 +893,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let run, run.admitting else { return }
         do {
+            guard run.audioRoute?.awaitPCM() == true else { return }
             let isVideo = output is AVCaptureVideoDataOutput
             guard !isVideo || run.profile.hasVideo else { throw CaptureFailure(message: "Unexpected camera sample in audio-only capture") }
             if run.epoch == nil {

@@ -720,3 +720,27 @@ and install/launch receipts identify that artefact separately. Neither that
 application nor the separate UI qualification runner was rebuilt, re-signed or
 reinstalled for this wording change. Physical acceptance must follow the frozen
 artefact's recorded identity rather than the newer source wording.
+
+## Foreground input routing checkpoint
+
+The normal controls now expose System Default plus bounded built-in, wired and
+USB input choices. An idle refresh reads `AVAudioSession.availableInputs` under
+the capture category without activating capture. Prepare freezes the input UID,
+sets `preferredInput` and verifies `currentRoute.inputs` after capture starts and
+before first PCM. Route notifications recheck the exact native epoch's input;
+unchanged input/output-only events do not stop capture. Default pins the actual
+input across orientation epochs of the same preparation. Mismatch or removal
+stops recording and publishing without fallback. Listeners are removed before
+deliberate deactivation; stale owners cannot stop later preparations.
+
+A cold route transition closes PCM admission while its native lookup runs
+outside the state lock. The existing sample owner can wait up to 250 ms on a
+relative, monotonic condition; success/Stop/failure wakes it without polling or
+a new timer. Timeout is a sticky route failure. Initial events coalesce before
+pinning, and late verification cannot reopen a closed or newer owner.
+
+The active microphone label is separate from the selected preference. Bluetooth
+and other routes outside this built-in/wired/USB profile are unsupported, even
+under Default. Actual USB microphones, hot-unplug, route callback timing and
+background/locked-screen behaviour remain physical B4R gates. See
+[audio-only mobile scope](audio-only-mobile.md#foreground-microphone-selection).

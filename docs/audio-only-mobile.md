@@ -3,7 +3,7 @@
 The native apps have an explicit microphone-only capture intent alongside the
 existing camera profiles. This is the foreground prerequisite for B4R. The full
 [mobile plan](mobile-streaming-plan.md) still requires background and locked-screen
-operation, external audio routes, controls, standby, safe profiles and physical
+operation, physical external-route qualification, controls, standby, safe profiles and physical
 acceptance. Those requirements are not satisfied by host tests.
 
 ## Frozen intent and native ownership
@@ -35,6 +35,41 @@ compressed-media seams.
 Android uses AudioRecord and MediaCodec; iOS uses native audio capture and its
 AVAudioConverter encoder. This initial mode stops on leaving the foreground.
 There is no claim of background, locked-screen or external-device qualification.
+
+## Foreground microphone selection
+
+Both native apps offer System Default and a bounded local list of built-in,
+wired and USB microphones. Refresh the list while capture is idle, then select
+an input before Prepare. Prepare freezes that choice before asynchronous
+permission, storage and destination work. Device names are display metadata;
+the platform input identifier selects the device and is not a saved profile.
+A disappeared selection stays unavailable until explicitly changed.
+
+The actual input must be verified before PCM enters the existing encoder.
+System Default pins its first verified input for that logical preparation,
+including later orientation epochs. A changed or disconnected input closes the
+current epoch's media gate and stops capture and publishing; it never falls back
+or restarts automatically. Per-epoch callbacks cannot stop a successor capture.
+The active-input display reports verified routing, not merely an accepted input
+preference. Bluetooth and other unqualified routes are explicitly unsupported
+in this bounded profile, including when chosen by System Default.
+
+Route checks use local platform APIs at setup, first PCM and route/device events;
+subsequent PCM admission uses cached scalar state. A route event closes that
+admission before querying the platform outside its state lock. The existing
+media owner may wait on a condition for at most 250 ms of monotonic time while
+that cold transition is verified; same-input success reopens admission, Stop
+wakes cleanly, and a timeout or true mismatch stays failed. No native query or
+callback runs under that lock, and late results cannot reopen a stopped or
+failed owner. Active waiters retain their original deadlines across later route
+events. Initial notifications coalesce before Default pins a stable input.
+Android's existing 200 ms PCM age ceiling remains stricter than the route wait;
+a stale queued block is refused and the recording remains incomplete.
+There is no per-buffer device
+enumeration, new payload copy, Rust call or route timer. The 48 kHz mono AAC
+profile and foreground-stop policy are unchanged. These source and automated
+checks do not qualify physical USB devices, unplug/replug timing, Bluetooth,
+background/lock operation or a sustained show. Those B4R gates remain open.
 
 ## Transport and observation
 

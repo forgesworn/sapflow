@@ -10,8 +10,17 @@ on iOS and Android. Its immutable intent follows permissions, storage, grant
 admission, Start, reconnect, private recording and exact-topology observation.
 Audio-only creates no camera, video encoder or preview and waits for no video
 keyframe. Native output is AAC-LC 48 kHz mono at a 96 kbit/s target, with a separate
-1 Mbit/s engineering grant floor. Background/lock, external routes and the rest
+1 Mbit/s engineering grant floor. Background/lock, physical external-route qualification and the rest
 of B4R remain required; foreground mode does not complete that milestone.
+
+Foreground microphone selection now has native adapters and normal controls on
+both platforms: System Default plus bounded built-in/wired/USB inventory, frozen
+Prepare choice and actual-input verification before PCM admission. Default pins
+its first verified input through rotation; mismatch/disconnect stops the current
+capture without fallback or restart. Bluetooth/unqualified routes remain
+unsupported. Physical USB, hot-unplug, background/lock and sustained performance
+are open; source tests and app builds do not complete B4R. Routing
+source tests and source-matched app builds are separate from those physical gates.
 
 This source also adds explicit terminal TS input and actual recording drain.
 A complete bounded AAC PES held in one start packet is no longer stranded at
@@ -49,13 +58,13 @@ production loss handling and smoke assertions remain unchanged. Five generated
 13,298 executions over 62 seconds. These finite local checks do not establish
 a complete physical show, a total-memory bound or sustained performance.
 
-App checks pass 316 Android unit tests in each of Debug and Qualification,
+App checks pass 347 Android unit tests in each of Debug and Qualification,
 with three APKs, build isolation, 16 KiB ZIP/ARM64 ELF alignment and Release
 lint. The current Qualification report has 14 warnings and the Release report
 has 13, both with zero errors. All three unsigned iOS app
 configurations and its actual unit-test bundle compile with zero warnings;
 the iOS unit bundle was not executed. Focused Swift checks also pass
-121 capture/control, 26 catalogue/storage, 33 library/export and 33
+149 capture/control/routing, 26 catalogue/storage, 33 library/export and 33
 creator-owner tests. Observation has 49 host tests and 77 packaged Rust publisher
 tests; these suites overlap. An actual generated macOS decoder matrix accepts
 48 kHz mono AAC without video, rejects wrong profiles/topologies and passes the
@@ -64,12 +73,24 @@ also pass. Fresh Apple, ARM64 Android and four-ABI Android SDK packages now buil
 from the PES-limit source and pass their installed ownership consumers. The 77
 publisher and 33 creator host tests continue to pass against the Apple package.
 Unsigned Debug, Qualification and Release iOS builds compile with warnings as
-errors. Android Debug and Qualification each pass 316 unit tests; their app
+errors. Android Debug and Qualification each pass 347 unit tests; their app
 assemblies, qualification isolation and lint pass, as do Release assembly and
 lint. An initial Android compile used the stale four-ABI AAR after only the
 separate ARM64 package had been refreshed; rebuilding the actual app dependency
 resolved the missing generated bindings without a source change. These are
 local package/build results, not CI or phone acceptance.
+
+The foreground-input source has a source-matched final app gate: all three
+unsigned iOS configurations and the actual unit-test bundle compile/link with
+zero warnings; the unit bundle was not executed. Android Debug and Qualification
+each pass 347 tests with no failures, errors or skips. All three APKs assemble;
+qualification/release isolation, native ARM64 and 16 KiB ZIP/ELF checks pass.
+Qualification/Release lint has 14/13 warnings and zero errors. Debug and
+Qualification use the existing debug certificate; Release is unsigned. These
+builds reuse the existing native SDK packages unchanged. Focused routing checks
+pass 28 Swift and 46 JVM tests, including the existing policy/admission tests.
+No phone, USB/hot-unplug, Bluetooth, background or sustained-performance
+qualification is claimed.
 
 The native AAC recorder experiment preserves all encoded units in stored media,
 but priming and edit interpretation change the presented packet list. Exact

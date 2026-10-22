@@ -68,6 +68,7 @@ data class CaptureSnapshot(
     val broadcastElapsedMs: Long? = null,
     val timingUncertain: Boolean = false,
     val socketOutput: SocketOutputView = SocketOutputView.empty(),
+    val activeAudioInput: String = "Not verified",
 )
 
 /** Native surfaces carry raw video. PCM stays in AudioRecord/MediaCodec input.
@@ -119,6 +120,11 @@ class CaptureController(private val context: Context) {
     private var videoEncoder: PlatformCodec? = null
     private var audioEncoder: PlatformCodec? = null
     private var audioRecord: AudioRecord? = null
+    @Volatile private var audioRoute: AudioInputRouting? = null
+    private var audioRouteFailure: String? = null
+    private var audioRouteFailed = false // sticky for this native epoch, including queued Stop
+    private var audioPin: AudioInputPin? = null // logical Preparation; preserved across rotations
+    @Volatile private var activeAudioInput = "Not verified"
     private var audioThread: Thread? = null
     private var audioPumpThread: Thread? = null
     private var pcmPool: PcmBlockPool? = null
@@ -219,12 +225,12 @@ class CaptureController(private val context: Context) {
         queueDiagnostics, "Publish drainer ${publishing?.diagnostics ?: "none"} · ${publishingSink?.diagnostics ?: ""}",
         orientationStatus, rendererStatus, audioDiagnostics + if (audioFailureDiagnostics.isNotEmpty()) " · $audioFailureDiagnostics" else "", "$cleanupPhase · $cleanupDiagnostics",
         !prepareAdmission.pending && startAdmission.idle && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioEncoder == null && renderer == null && audioRecord == null,
-            elapsed.captureMs, elapsed.broadcastMs, elapsed.uncertain, socket)
+            elapsed.captureMs, elapsed.broadcastMs, elapsed.uncertain, socket, activeAudioInput)
     }
 
-    internal fun prepare(previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, intent: CaptureIntent = CaptureIntent.DEFAULT): CaptureStartAdmission.Preparation? {
+    internal fun prepare(previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null): CaptureStartAdmission.Preparation? {
         val canPrepare = snapshot().canPrepare
-        val ticket = startAdmission.reserve(intent) ?: return null
+        val ticket = startAdmission.reserve(intent, audioInputId) ?: return null
         val admitted = try { prepareAdmission.submit(intent, canPrepare, { handler.post(it) }) admitted@{ requestedIntent ->
             if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) { startAdmission.abandon(ticket); return@admitted }
             if (videoEncoder != null || renderer != null || teardownStarted) {
@@ -234,6 +240,7 @@ class CaptureController(private val context: Context) {
             }
             if (!startAdmission.claim(ticket)) { startAdmission.abandon(ticket); return@admitted }
             preparation = ticket
+            audioPin = AudioInputPin(ticket.audioInputId); activeAudioInput = "Not verified"
             cleanupExpired = false; stopFailed = false
             publishingSession?.stopDestination(); publishingSession = null
             telemetryDestination = TelemetryDestination(ticket, null, false)
@@ -256,6 +263,7 @@ class CaptureController(private val context: Context) {
         message = if (captureIntent.hasVideo) "Preparing hardware pixel rotation and native audio" else "Preparing microphone and native AAC"
         generation++
         drainGeneration = generation
+        audioRouteFailed = false; audioRouteFailure = null
         captureEpoch = drainGeneration
         lifecycle.beginEpoch(captureEpoch)
         teardownStarted = false
@@ -492,6 +500,23 @@ class CaptureController(private val context: Context) {
             .setBufferSizeInBytes(maxOf(minAudio * 2, 8192)).build()
         require(audioRecord?.state == AudioRecord.STATE_INITIALIZED) { "Microphone initialisation failed" }
         require(audioRecord?.sampleRate == 48_000 && audioRecord?.channelCount == 1 && audioRecord?.audioFormat == AudioFormat.ENCODING_PCM_16BIT) { "Microphone changed the requested 48k mono PCM format" }
+        val record = requireNotNull(audioRecord)
+        val prepared = requireNotNull(preparation)
+        val owner = AudioInputOwner(prepared, token)
+        val pin = requireNotNull(audioPin)
+        audioRoute = AudioInputRouting.attach(context, record, audioHandler, owner, pin, failed = {
+            // Listener closes its own scalar gate before posting; old epochs never stop a successor.
+            handler.post {
+                if (audioRoute?.owner == owner && audioRecord === record && preparation === prepared && token == drainGeneration && !stoppingEpoch) {
+                    activeAudioInput = "Microphone changed or disconnected"
+                    fail(audioRoute?.failureDescription ?: "Microphone route is unavailable")
+                }
+            }
+        }, changed = { id -> handler.post {
+            if (audioRoute?.owner == owner && audioRoute?.permitsPcm() == true && audioRecord === record && token == drainGeneration) {
+                activeAudioInput = AudioInputRouting.inventory(context).firstOrNull { it.id == id }?.name ?: "Verified microphone"
+            }
+        } })
         queues = NativeSampleFanout(4uL * 1024uL * 1024uL, 8uL * 1024uL * 1024uL, 2000u, captureIntent.hasVideo)
         publishing = QueueDrainer(handler, queues!!, true, publishingSink, { fail(it) })
         recording = QueueDrainer(handler, queues!!, false, recordingSink, ::failRecording)
@@ -548,6 +573,7 @@ class CaptureController(private val context: Context) {
 
     private fun startAudio() {
         val record = audioRecord!!
+        val route = requireNotNull(audioRoute)
         val codec = audioEncoder!!
         val epochNs = clock.mediaEpochNs()
         val pool = PcmBlockPool()
@@ -568,6 +594,9 @@ class CaptureController(private val context: Context) {
             runningAudio.set(false); pool.cancel()
             handler.post { if (token == drainGeneration) {
                 val reason = "Audio $owner failed: ${error.message ?: error.javaClass.simpleName}"
+                // Worker completion is joined before recorder close. Definite
+                // PCM loss must not become a clean prefix just because Stop won.
+                audioRouteFailed = true; audioRouteFailure = reason
                 audioFailureDiagnostics = "FAILED $owner PCM=${pcmFrames.get()} input=${queuedAudioFrames.get()} output=${outputAudioUnits.get()} poolBeforeCancel={$failedPool}: ${error.message ?: error.javaClass.simpleName} · runtimeStart={$runtimeAtStart} runtimeFailure={${runtimeDiagnostics()}}"
                 if (stoppingEpoch) {
                     markFailure(if (owner == "AAC pump") CaptureLifecycleDiagnostics.Code.AUDIO_PUMP_FAILURE else CaptureLifecycleDiagnostics.Code.AUDIO_READER_FAILURE, reason)
@@ -591,6 +620,7 @@ class CaptureController(private val context: Context) {
                         }
                         audioInputWaitMaxUs.accumulateAndGet((System.nanoTime() - waitStart) / 1000, ::maxOf)
                         pool.checkAge(block, System.nanoTime())
+                        check(route.awaitQueuedPcm(pool, block)) { "Microphone route could not be verified before AAC admission" }
                         val input = codec.getInputBuffer(index) ?: error("AAC input buffer unavailable")
                         require(input.capacity() >= block.bytes) { "AAC input buffer smaller than PCM block" }
                         block.buffer.position(0); block.buffer.limit(block.bytes)
@@ -607,6 +637,7 @@ class CaptureController(private val context: Context) {
                             square += value * value
                         }
                         audioLevel = sqrt(square / (block.bytes / 2)).toFloat().coerceIn(0f, 1f)
+                        pool.checkAge(block, System.nanoTime())
                         codec.queueInputBuffer(index, 0, block.bytes, block.ptsUs, 0)
                         queuedAudioFrames.addAndGet(block.bytes / 2L)
                         audioInputEndUs.set(block.ptsUs + block.bytes / 2L * 1_000_000 / 48_000)
@@ -622,6 +653,7 @@ class CaptureController(private val context: Context) {
             try {
                 synchronized(record) { if (runningAudio.get()) record.startRecording() }
                 require(record.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "Microphone did not start" }
+                check(route.verify()) { "Actual microphone route is unavailable, changed or unsupported; use built-in, wired or USB input" }
                 val captureStartedNs = System.nanoTime()
                 val capacityFrames = record.bufferSizeInFrames.toLong()
                 val timing = AudioCaptureTiming(epochNs, capacityFrames)
@@ -629,6 +661,7 @@ class CaptureController(private val context: Context) {
                 val stamp = AudioTimestamp()
                 var diagnosticAt = 0L
                 while (runningAudio.get()) {
+                    if (!route.admitReader(runningAudio)) break
                     val block = pool.acquireReader() ?: break
                     owned = block
                     val beforeStatus = record.getTimestamp(stamp, AudioTimestamp.TIMEBASE_MONOTONIC)
@@ -645,6 +678,7 @@ class CaptureController(private val context: Context) {
                     val afterStatus = record.getTimestamp(stamp, AudioTimestamp.TIMEBASE_MONOTONIC)
                     check(afterStatus == AudioRecord.SUCCESS) { "Microphone hardware timestamp unavailable after read; status=$afterStatus ${timing.observation}" }
                     val ptsUs = timing.read(count / 2, stamp.framePosition, stamp.nanoTime, System.nanoTime())
+                    if (!route.admitReader(runningAudio)) break
                     pool.publish(block, count, ptsUs, epochNs + ptsUs * 1000)
                     owned = null
                     if (nowNs >= diagnosticAt) {
@@ -832,14 +866,21 @@ class CaptureController(private val context: Context) {
 
     private var stoppingEpoch = false
 
-    private fun stopOnHandler(reason: String, failed: Boolean) {
+    private fun stopOnHandler(requestedReason: String, failed: Boolean) {
+        val stoppingRoute = audioRoute
+        if (stoppingRoute != null) {
+            if (stoppingRoute.stopProducer(runningAudio)) { audioRouteFailed = true; audioRouteFailure = stoppingRoute.failureDescription }
+        } else runningAudio.set(false)
+        audioRoute = null; activeAudioInput = "Not active"
+        val terminalFailure = failed || audioRouteFailed
+        val reason = if (audioRouteFailed) audioRouteFailure ?: "Microphone route is unavailable" else requestedReason
         stopReason = reason
-        if (failed) markFailure(CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE, reason)
+        if (terminalFailure) markFailure(CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE, reason)
         if (recordingFailed && restart.pending != null) {
             stopReason = "Recording failed; prepare manually before changing capture orientation"
             markFailure(CaptureLifecycleDiagnostics.Code.RECORDING_FAILURE, stopReason)
         }
-        if (failed) {
+        if (terminalFailure) {
             publishingSession?.stopDestination()
             autoStart = false; restart.cancel()
             abortPublisherEarly()
@@ -847,7 +888,7 @@ class CaptureController(private val context: Context) {
         traceLifecycle(CaptureLifecycleDiagnostics.Code.STOP_REQUEST)
         if (stoppingEpoch) { message = lifecycle.message(reason); return }
         val captureIntent = preparation ?: startAdmission.preparation
-        captureIntent?.let { startAdmission.beginCleanup(it, restart.pending != null && !failed && !shutdownRequested) }
+        captureIntent?.let { startAdmission.beginCleanup(it, restart.pending != null && !terminalFailure && !shutdownRequested) }
         if (videoEncoder == null && renderer == null && audioEncoder == null && publishingSink == null && recordingSink == null && audioRecord == null) {
             captureIntent?.let { startAdmission.cleanup(it, true) }
             if (startAdmission.idle) preparation = null
@@ -858,7 +899,7 @@ class CaptureController(private val context: Context) {
         }
         stoppingEpoch = true
         cleanupPhase = "awaiting producer owners"
-        tailEnabled = stage == CaptureStage.CAPTURING && !failed
+        tailEnabled = stage == CaptureStage.CAPTURING && !terminalFailure
         tailDone = !tailEnabled
         tailStarted = false
         videoEos = false; audioEos = false; audioEosQueued = false
@@ -890,7 +931,7 @@ class CaptureController(private val context: Context) {
         runningAudio.set(false)
         audioTailRequested.set(true)
         audioThread?.interrupt()
-        if (failed) { pcmPool?.cancel(); audioPumpThread?.interrupt() }
+        if (terminalFailure) { pcmPool?.cancel(); audioPumpThread?.interrupt() }
         audioWorkers.observeStopped(audioThread?.isAlive == true, audioPumpThread?.isAlive == true)
         val record = audioRecord
         audioStopReturned = record == null
@@ -970,11 +1011,12 @@ class CaptureController(private val context: Context) {
         val oldRecord = audioRecord; val oldQueues = queues; val oldVideoCodec = videoCodec; val oldAudioCodec = audioCodec
         val oldPublishing = publishing; val oldRecording = recording; val oldRecordCleanup = recordingCleanup
         val oldPublishingSink = publishingSink; val oldRecordingSink = recordingSink
+        val canFinaliseRecording = !audioRouteFailed
         controls.execute {
             cleanupPhase = "publisher close"
             val publishingStopped = runCatching { oldPublishing?.close() != false }.getOrDefault(false)
             cleanupPhase = "recording drain/finalisation"
-            val recordingFinalised = runCatching { oldRecording?.close(graceful = true, drainQueued = true, drainViaHandler = true) != false }.getOrDefault(false)
+            val recordingFinalised = runCatching { oldRecording?.close(graceful = canFinaliseRecording, drainQueued = canFinaliseRecording, drainViaHandler = canFinaliseRecording) != false }.getOrDefault(false)
             val recordingStopped = recordingFinalised || runCatching { oldRecording?.close() != false }.getOrDefault(false)
             runCatching { oldRecordCleanup?.join(1000) }
             val stopped = publishingStopped && recordingStopped && oldRecordCleanup?.isAlive != true

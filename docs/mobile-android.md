@@ -1377,3 +1377,33 @@ packaged mux/recorder classes. Completed and clean-abort segments independently
 decode, demonstrating that particular accepted prefix. It does not prove
 torn-file repair, complete-show recovery, Android filesystem/SAF behaviour or
 physical playback. This work has not replaced the owner's Pixel app or capture.
+
+## Foreground input routing checkpoint
+
+The normal controls now expose System Default plus a bounded AudioManager input
+inventory of built-in, wired and USB devices. Prepare freezes the selected local
+device ID before permission, storage and destination work. `setPreferredDevice`
+is a request: only the captured AudioRecord's actual `routedDevice`, checked
+after `startRecording` and before the first read is admitted, establishes routing.
+Routing and removal callbacks close the exact epoch's scalar media gate before
+queued cleanup. Cached checks also fence queued PCM before AAC admission.
+Default retains its first verified input across orientation epochs; a change or
+disconnect stops capture without fallback or automatic restart. Device IDs are
+ephemeral and names never authorise routing.
+
+Cold route transitions close PCM admission before querying outside the state
+lock. Existing reader/pump owners can wait on a condition up to 250 ms; current
+success reopens the gate, Stop wakes cleanly and timeout/mismatch remains failed.
+Accepted queued PCM can drain on ordinary Stop; a latched route fault instead
+uses the existing incomplete recording close and cancels rotation. No route
+timer or new thread is created for this transition. The route budget does not
+extend the PCM pool's existing 200 ms maximum age: queued blocks are checked
+after the wait and immediately before codec submission. Stale PCM stops the
+epoch and retains an incomplete recording instead of being queued as fresh.
+
+No route enumeration, timer, additional payload copy or FFI poll was added per
+PCM block. The existing 48 kHz mono path, foreground Stop and actual-close
+barriers remain. Bluetooth and other unqualified Default routes are unsupported.
+Actual USB/hot-unplug and sustained routing behaviour remain physical B4R gates;
+[audio-only mobile scope](audio-only-mobile.md#foreground-microphone-selection)
+does not claim background or locked-screen support.
