@@ -5,6 +5,7 @@ final class HardwareVideoEncoder {
     private var session: VTCompressionSession?
     private let width: Int
     private let height: Int
+    private let profile: CaptureProfile
     private var pending: CMSampleBuffer?
     private var cachedFormat: CMFormatDescription?
     private var configuration: CodecDescription?
@@ -13,9 +14,11 @@ final class HardwareVideoEncoder {
     private let failure: (Error) -> Void
     private(set) var implementation = "Hardware H.264"
 
-    init(orientation: CaptureOrientation, output: @escaping (CompressedUnit) -> Void, failure: @escaping (Error) -> Void) throws {
+    init(orientation: CaptureOrientation, profile: CaptureProfile = .defaultProfile, output: @escaping (CompressedUnit) -> Void, failure: @escaping (Error) -> Void) throws {
         self.output = output; self.failure = failure
-        width = Int(orientation.width); height = Int(orientation.height)
+        self.profile = profile
+        let dimensions = profile.dimensions(for: orientation)
+        width = Int(dimensions.width); height = Int(dimensions.height)
         let callback: VTCompressionOutputCallback = { context, _, status, _, sample in
             guard let context else { return }
             let encoder = Unmanaged<HardwareVideoEncoder>.fromOpaque(context).takeUnretainedValue()
@@ -37,7 +40,7 @@ final class HardwareVideoEncoder {
         implementation = encoderID
         var specification: [CFString: Any] = [kVTVideoEncoderSpecification_EncoderID: encoderID]
         if #available(iOS 17.4, *) { specification[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true }
-        let status = VTCompressionSessionCreate(allocator: nil, width: orientation.width, height: orientation.height, codecType: kCMVideoCodecType_H264,
+        let status = VTCompressionSessionCreate(allocator: nil, width: dimensions.width, height: dimensions.height, codecType: kCMVideoCodecType_H264,
             encoderSpecification: specification as CFDictionary,
             imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: callback,
             refcon: Unmanaged.passUnretained(self).toOpaque(), compressionSessionOut: &created)
@@ -47,10 +50,10 @@ final class HardwareVideoEncoder {
             try set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
             try set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Main_AutoLevel)
             try set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
-            try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: 2_500_000))
-            try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: 30))
-            try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 30))
-            try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 1))
+            try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: profile.videoBps))
+            try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: profile.frameRate))
+            try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: profile.gopFrames))
+            try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: profile.gopSeconds))
             let prepared = VTCompressionSessionPrepareToEncodeFrames(created)
             guard prepared == noErr else { throw CaptureFailure(message: "Video encoder preparation failed (\(prepared))") }
             guard try property(kVTCompressionPropertyKey_EncoderID, session: created) as? String == encoderID else {
@@ -81,7 +84,7 @@ final class HardwareVideoEncoder {
         guard let session, let image = CMSampleBufferGetImageBuffer(sample) else { throw CaptureFailure(message: "Video capture lost its pixel buffer") }
         guard CVPixelBufferGetWidth(image) == width, CVPixelBufferGetHeight(image) == height else { throw CaptureFailure(message: "Camera no longer produces the prepared \(width)×\(height) format") }
         let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: time,
-            duration: CMTime(value: 1, timescale: 30), frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
+            duration: CMTime(value: 1, timescale: profile.frameRate), frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
         guard status == noErr else { throw CaptureFailure(message: "Hardware encoding failed (\(status))") }
     }
     private func receive(_ sample: CMSampleBuffer) {
@@ -99,6 +102,10 @@ final class HardwareVideoEncoder {
     }
     private func emit(_ sample: CMSampleBuffer, duration: CMTime) throws {
         guard let format = CMSampleBufferGetFormatDescription(sample) else { throw CaptureFailure(message: "H.264 format is unavailable") }
+        let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+        guard Int(dimensions.width) == width, Int(dimensions.height) == height else {
+            throw CaptureFailure(message: "Hardware H.264 no longer matches the prepared \(width)×\(height) format")
+        }
         func parameter(_ index: Int) throws -> Data {
             var pointer: UnsafePointer<UInt8>?
             var size = 0; var count = 0; var header: Int32 = 0
@@ -130,7 +137,7 @@ final class HardwareVideoEncoder {
         guard let session else { return }
         VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
         lock.lock()
-        if let pending { do { try emit(pending, duration: CMTime(value: 1, timescale: 30)) } catch { failure(error) } }
+        if let pending { do { try emit(pending, duration: CMTime(value: 1, timescale: profile.frameRate)) } catch { failure(error) } }
         pending = nil
         lock.unlock()
         VTCompressionSessionInvalidate(session)

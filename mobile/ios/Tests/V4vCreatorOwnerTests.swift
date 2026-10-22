@@ -24,12 +24,13 @@ private final class CreatorHTTP: V4vCreatorHTTP {
 }
 private final class CreatorCapture: V4vCreatorCapturePort {
     let admission = CaptureAdmission()
-    var prepared = 0, started = 0, globalStops = 0, cancels = 0
+    var canChooseCaptureProfile: Bool { admission.canChooseCaptureProfile }
+    var prepared = 0, started = 0, globalStops = 0, cancels = 0, reservations = 0
     var pendingAttach: ((Bool) -> Void)?
     var holdAttach = false
     var beforeAttachCompletion: (() -> Void)?
     var ticket: CaptureAdmission.Preparation?
-    func reservePreparation() -> CaptureAdmission.Preparation? { ticket = admission.reservePreparation(); return ticket }
+    func reservePreparation(profile: CaptureProfile) -> CaptureAdmission.Preparation? { reservations += 1; ticket = admission.reservePreparation(profile: profile); return ticket }
     func abandonPreparation(_ ticket: CaptureAdmission.Preparation) { admission.candidateClosed(ticket, cleanupComplete: true); admission.failed(ticket, cleanupComplete: true) }
     func setDestination(_ sink: EncodedPublishingSink?, preparation: CaptureAdmission.Preparation, completion: @escaping (Bool) -> Void) {
         let result = admission.attached(preparation)
@@ -120,6 +121,8 @@ private final class CreatorFixture {
     let journal = CreatorJournal(), signerJournal = CreatorJournal(), capture = CreatorCapture()
     var client: CreatorHTTP!
     var publishers: [CreatorPublisher] = []
+    var publisherProfiles: [CaptureProfile] = []
+    var publisherError: V4vFailure?
     var login: CreatorLogin?
     var beforePublisherReturn: ((CreatorPublisher) -> Void)?
     var withPublisherContext: ((V4vObservationSlot) throws -> Void)?
@@ -149,7 +152,11 @@ private final class CreatorFixture {
                 if let override = loginFactoryOverride { return try override(uri, profile, credentials, queue, clock, commit, cleanup) }
                 let next = CreatorLogin(commit: commit, cleanupHint: cleanup); next.acceptStart = !refuseLogin; login = next; beforeLoginReturn?(next); return next
             },
-            makePublisher: { [unowned self] _, _, _, _, slot, _ in let next = CreatorPublisher(); publishers.append(next); try withPublisherContext?(slot); beforePublisherReturn?(next); return next })
+            makePublisher: { [unowned self] _, _, _, _, slot, _, captureProfile in
+                if let publisherError { throw publisherError }
+                let next = CreatorPublisher(); publisherProfiles.append(captureProfile); publishers.append(next)
+                try withPublisherContext?(slot); beforePublisherReturn?(next); return next
+            })
         flush()
     }
     func flush() { for _ in 0..<8 { queue.sync {} } }
@@ -175,6 +182,55 @@ final class V4vCreatorOwnerTests: XCTestCase {
         XCTAssertTrue(f.last.ready); XCTAssertNil(f.login); XCTAssertEqual(f.capture.prepared, 0); XCTAssertTrue(f.calls.isEmpty)
         try f.events(); XCTAssertEqual(f.last.events.count, 1); XCTAssertEqual(f.calls.map(\.method), ["GET", "GET"])
         XCTAssertTrue(f.publishers.isEmpty); XCTAssertNil(f.last.publicPersona)
+    }
+    func testLowCapRejectsBeforeOwnersAndExplicit480ReusesDurableGrant() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()
+        XCTAssertTrue(f.owner.canChangeCaptureSettings)
+        XCTAssertTrue(f.owner.prepare()); XCTAssertFalse(f.owner.canChangeCaptureSettings); f.flush()
+        let low = V4vFixture.edit(V4vFixture.grant(), ["limits": .object(["maxPublishBps": .integer(1_000_000), "maxQueueBytes": .integer(4_194_304)])])
+        f.answer(.success(V4vFixture.answer(grant: low)))
+        XCTAssertEqual(f.capture.reservations, 0); XCTAssertTrue(f.publishers.isEmpty)
+        XCTAssertTrue(f.last.error?.contains("Choose a lower quality") == true)
+        XCTAssertNil(f.last.pending); XCTAssertTrue(f.owner.canChangeCaptureSettings)
+        let requests = f.calls.count
+        XCTAssertTrue(f.owner.prepare(captureProfile: .sd480p30)); f.flush()
+        XCTAssertEqual(f.calls.count, requests); XCTAssertEqual(f.capture.reservations, 1)
+        XCTAssertEqual(f.capture.ticket?.profile, .sd480p30); XCTAssertEqual(f.publisherProfiles, [.sd480p30])
+        XCTAssertEqual(f.capture.prepared, 1); XCTAssertEqual(f.capture.started, 0)
+        XCTAssertFalse(f.owner.canChangeCaptureSettings)
+        f.owner.captureChanged(prepared: true, running: false, stopping: false); f.flush()
+        XCTAssertTrue(f.owner.start()); f.flush(); XCTAssertEqual(f.capture.started, 1)
+        XCTAssertEqual(f.capture.admission.currentPreparation?.profile, .sd480p30)
+    }
+    func testPendingPrepareRetainsExplicitProfileAcrossHTTPAndCallerChanges() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()
+        var selected = CaptureProfile.sd480p30
+        XCTAssertTrue(f.owner.prepare(captureProfile: selected)); selected = .hd720p30
+        f.flush(); XCTAssertFalse(f.owner.canChangeCaptureSettings)
+        f.answer(.success(V4vFixture.answer()))
+        XCTAssertEqual(selected, .hd720p30)
+        XCTAssertEqual(f.capture.ticket?.profile, .sd480p30); XCTAssertEqual(f.publisherProfiles, [.sd480p30])
+        XCTAssertEqual(f.capture.prepared, 1); XCTAssertEqual(f.capture.started, 0)
+    }
+    func testEngineering1080CannotConsumeDefaultGrantOrCreateOwners() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()
+        XCTAssertTrue(f.owner.prepare(captureProfile: .fullHD1080p30)); f.flush()
+        f.answer(.success(V4vFixture.answer()))
+        XCTAssertEqual(f.capture.reservations, 0); XCTAssertTrue(f.publishers.isEmpty)
+        XCTAssertTrue(f.last.error?.contains("Choose a lower quality") == true)
+        XCTAssertTrue(f.owner.canChangeCaptureSettings)
+    }
+    func testPublisherFactoryFailureReleasesQualityOnlyAfterRealCaptureCleanup() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()
+        f.publisherError = .unavailable
+        XCTAssertTrue(f.owner.prepare()); f.flush(); f.answer(.success(V4vFixture.answer()))
+        XCTAssertTrue(f.publishers.isEmpty); XCTAssertEqual(f.capture.reservations, 1)
+        XCTAssertEqual(f.capture.admission.currentPhase, .idle)
+        XCTAssertEqual(f.calls.count, 3); XCTAssertNil(f.last.pending)
+        XCTAssertTrue(f.owner.canChangeCaptureSettings)
+        f.publisherError = nil
+        XCTAssertTrue(f.owner.prepare(captureProfile: .sd480p30)); f.flush()
+        XCTAssertEqual(f.capture.ticket?.profile, .sd480p30); XCTAssertFalse(f.owner.canChangeCaptureSettings)
     }
     func testPreparePersistsBeforeHTTPAndNeverStarts() throws {
         let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
@@ -404,7 +460,11 @@ final class V4vCreatorOwnerTests: XCTestCase {
         XCTAssertFalse(f.owner.reloadEvents(), "priority End must retain admission while its request is in flight")
         XCTAssertNil(f.capture.admission.reservePreparation())
         XCTAssertFalse(f.publishers[0].cleanupComplete)
+        let origin = V4vFixture.origin(2, state: "revoked", recording: "never-started")
+        f.answer(.success(V4vFixture.answer(V4vFixture.session(2, phase: "ended", origin: origin, complete: true), grant: nil)))
+        XCTAssertFalse(f.owner.canChangeCaptureSettings, "uncertain candidate cleanup still retains quality admission")
         f.queue.sync { f.publishers[0].closed() }; f.flush()
+        XCTAssertTrue(f.owner.canChangeCaptureSettings, "a stale cold ticket cannot retain actual closed capacity")
         XCTAssertNotNil(f.capture.admission.reservePreparation())
         XCTAssertEqual(f.capture.globalStops, 0)
     }

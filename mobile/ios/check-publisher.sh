@@ -23,7 +23,7 @@ else
   trap 'rm -rf "$sapflow_scratch"' EXIT
 fi
 mkdir -p "$sapflow_scratch/Sources/PublisherCheck"
-for sapflow_source in EncodedPipeline EncodedWorkBudget DestinationProfile SrtDestination SrtPublishingLimits NativeDeadlineTimer ReconnectController ManualRtmpPublisher ManualSrtPublisher; do
+for sapflow_source in EncodedPipeline EncodedWorkBudget DestinationProfile CaptureOrientation CaptureProfile SrtDestination SrtPublishingLimits NativeDeadlineTimer ReconnectController ManualRtmpPublisher ManualSrtPublisher; do
   cp "$sapflow_root/mobile/ios/Sources/$sapflow_source.swift" "$sapflow_scratch/Sources/PublisherCheck/"
 done
 cp "$sapflow_root/mobile/ios/Tools/PublisherFixtureCheck.swift" "$sapflow_scratch/Sources/PublisherCheck/main.swift"

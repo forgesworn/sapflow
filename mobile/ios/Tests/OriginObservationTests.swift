@@ -71,6 +71,11 @@ final class OriginObservationPolicyTests: XCTestCase {
         XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 1499, maxPublishBps: 4_000_000))
         XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 4_194_305, maxPublishBps: 4_000_000))
         XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 1500, maxPublishBps: 3_999_999))
+        let low = try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 1_000_007, captureProfile: .sd480p30)
+        XCTAssertEqual(low.bandwidthBytesPerSecond, 125_000); XCTAssertEqual(low.queueBytes, 65_536)
+        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 999_999, captureProfile: .sd480p30))
+        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 7_999_999, captureProfile: .fullHD1080p30))
+        XCTAssertEqual(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 8_000_007, captureProfile: .fullHD1080p30).bandwidthBytesPerSecond, 1_000_000)
     }
     func testPublishingExpiryUsesEffectiveClockAfterWallRollback() throws {
         final class Store: V4vJournalStore { var value: V4vJSON?; func load() -> V4vJSON? { value }; func save(_ next: V4vJSON) { value = next } }

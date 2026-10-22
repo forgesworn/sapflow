@@ -6,7 +6,7 @@ mkdir -p "$sapflow_root/target"
 sapflow_scratch="$(mktemp -d "$sapflow_root/target/sapflow-ios-lifecycle-XXXXXX")"
 trap 'rm -rf "$sapflow_scratch"' EXIT
 mkdir -p "$sapflow_scratch/Sources/PublisherLifecycleCheck"
-for sapflow_source in EncodedPipeline EncodedWorkBudget DestinationProfile SrtDestination SrtPublishingLimits NativeDeadlineTimer ReconnectController ManualSrtPublisher; do
+for sapflow_source in EncodedPipeline EncodedWorkBudget DestinationProfile CaptureOrientation CaptureProfile SrtDestination SrtPublishingLimits NativeDeadlineTimer ReconnectController ManualSrtPublisher; do
   cp "$sapflow_root/mobile/ios/Sources/$sapflow_source.swift" "$sapflow_scratch/Sources/PublisherLifecycleCheck/"
 done
 cp "$sapflow_root/mobile/ios/Tools/PublisherLifecycleCheck.swift" "$sapflow_scratch/Sources/PublisherLifecycleCheck/main.swift"

@@ -136,9 +136,36 @@ The app keeps the screen awake during an active run; an explicit phone lock,
 background transition or capture/audio interruption ends the current run.
 There is no background-camera claim or silent capture resumption.
 
-The profile is 720×1280 in portrait or 1280×720 in landscape at 30 fps,
-2.5 Mbit/s Main-profile H.264, no frame
-reordering, a maximum one-second/30-frame GOP, and 48 kHz mono 96 kbit/s AAC-LC.
+Choose capture quality before Prepare. The ordinary picker offers native
+640×480 at 600 kbit/s video, or the default 1280×720 at 2.5 Mbit/s video.
+Portrait swaps those dimensions. Both use 30 fps, Main-profile H.264, no frame
+reordering, a maximum one-second/30-frame GOP and 48 kHz mono 96 kbit/s AAC-LC.
+The 480p option is native 4:3 on iOS; Android's 848×480 option has a different
+aspect ratio. There is no software rescale or automatic quality fallback.
+A 1920×1080, 5 Mbit/s engineering path is excluded from the ordinary picker
+until physical qualification. Its source and compile checks are not a claim
+that the phone can sustain it.
+
+Each preparation ticket carries immutable quality through permission replies,
+first Start, recording segments, orientation epochs and publishing retries.
+Changing the next selection requires actual camera cleanup, rather than a
+possibly delayed UI snapshot. V4V grant admission happens before camera or
+publisher creation: 480p requires at least 1 Mbit/s, 720p requires 4 Mbit/s,
+and engineering 1080p requires 8 Mbit/s. An insufficient grant remains durable;
+the user can explicitly select a lower quality and Prepare again without
+repeating the acknowledged server mutation. A local publisher construction
+failure also cannot retry that acknowledged HTTP mutation.
+
+The native camera preset, frame rate, VideoToolbox target bitrate and GOP use
+that exact profile. Both incoming pixel buffers and compressed H.264 format
+dimensions must match its current orientation. The admission allowance above
+the H.264/AAC targets is budgeting, not proof of peak bitrate or retransmission
+capacity. Scoped SRT pacing still converts the granted bits per second to
+bytes per second and cannot increase the manual ceiling. Physical hardware,
+quality, pacing and sustained resource qualification remain separate gates.
+The finite iOS origin probe confirms actual audio/video decode and the current
+publishing attempt; it does not yet compare remote dimensions with the selected
+capture profile.
 The encoder is selected from VTCopyVideoEncoderList entries explicitly marked
 hardware accelerated and the session's actual EncoderID must match. On iOS
 17.4 and later the app additionally requires and verifies hardware acceleration

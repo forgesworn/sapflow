@@ -93,16 +93,17 @@ private final class PublisherHarness {
     let engine: V4vSessionEngine
     let slot: V4vObservationSlot
     let publisher: V4vObservedPublisher
-    init() throws {
+    init(captureProfile: CaptureProfile = .defaultProfile, maxPublishBps: UInt64 = 5_000_000) throws {
         let owner = owner, clock = clock, sinks = sinks, wires = wireIDs, observations = observations
         engine = try V4vSessionEngine(profile: V4vFixture.profile(), store: PublisherJournal(), clock: clock.now(), fencePublisher: {})
         try engine.installAuthenticatedSession(pubkey: String(repeating: "a", count: 64), token: "generated-fixture-bearer", maxAgeSeconds: 60, clock: clock.now())
         try engine.stagePrepare(event: V4vFixture.event, expectedGeneration: 0, key: V4vFixture.key, clock: clock.now())
-        try engine.applyResponse(V4vFixture.answer(), for: XCTUnwrap(engine.pending), clock: clock.now())
+        let grant = V4vFixture.edit(V4vFixture.grant(), ["limits": .object(["maxPublishBps": .integer(maxPublishBps), "maxQueueBytes": .integer(4_194_304)])])
+        try engine.applyResponse(V4vFixture.answer(grant: grant), for: XCTUnwrap(engine.pending), clock: clock.now())
         slot = V4vObservationSlot(owner: owner, clock: clock.now)
         publisher = try V4vObservedPublisher(destination: 1, permit: engine.publishingGrant(clock: clock.now()), profile: V4vFixture.profile(), engine: engine,
-            owner: owner, slot: slot, clock: clock.now, transport: { destination, limits, observe in
-                XCTAssertEqual(limits.bandwidthBytesPerSecond, 625_000)
+            owner: owner, slot: slot, clock: clock.now, captureProfile: captureProfile, transport: { destination, limits, observe in
+                XCTAssertEqual(limits.bandwidthBytesPerSecond, min(1_250_000, maxPublishBps / 8))
                 XCTAssertTrue(destination.encrypted)
                 wires.update { $0.append(destination.streamID) }
                 let sink = PublisherTransport(observe); sinks.update { $0.append(sink) }; return sink
@@ -121,6 +122,27 @@ private final class PublisherHarness {
 }
 
 final class V4vObservedPublisherTests: XCTestCase {
+    func testExplicit480RetainsOneMegabitLimitAcrossRecordingEpochs() throws {
+        // The codec fixture exercises publishing ownership, not camera geometry.
+        let h = try PublisherHarness(captureProfile: .sd480p30, maxPublishBps: 1_000_000); defer { h.stop() }
+        for count in 1...2 {
+            try h.startEpoch(); until { h.sinks.value.count == count }
+            let closed = expectation(description: "real epoch closed")
+            h.publisher.closeCodecEpoch()
+            h.publisher.finishEpoch { result in
+                if case .failure = result { XCTFail("Unexpected retained epoch") }
+                closed.fulfill()
+            }
+            wait(for: [closed], timeout: 2); h.owner.sync {}
+        }
+        XCTAssertEqual(h.sinks.value.count, 2)
+        XCTAssertThrowsError(try PublisherHarness(maxPublishBps: 1_000_000))
+    }
+    func testEngineering1080AdmissionNeedsEightMegabits() throws {
+        XCTAssertThrowsError(try PublisherHarness(captureProfile: .fullHD1080p30))
+        let h = try PublisherHarness(captureProfile: .fullHD1080p30, maxPublishBps: 8_000_000); defer { h.stop() }
+        try h.startEpoch(); until { h.sinks.value.count == 1 }
+    }
     func testPublishingStartsBeforeEarliestActivatedCodecDiscovery() throws {
         let h = try PublisherHarness(); defer { h.stop() }
         let ingress = RustEncodedIngress(); ingress.destination = h.publisher

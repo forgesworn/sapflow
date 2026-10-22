@@ -5,6 +5,26 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The latest iOS quality packet adds an explicit native 640×480 option beside
+720p30, retaining the selected profile through Prepare, Start, rotation and
+reconnects. Native camera output and compressed H.264 dimensions are checked;
+1080p remains an engineering path excluded from the ordinary picker. V4V
+quality admission precedes camera/publisher construction, accepts an explicit
+480p choice with a 1 Mbit/s grant and refuses insufficient capacity without
+changing quality. Acknowledged server operations cannot be retried merely
+because local publisher construction failed. Settings reopen only after the
+actual capture cleanup barrier, including rejected late candidates.
+
+Its generated-fixture checks pass 88 pure capture/profile/destination tests,
+65 control/authentication tests, 32 creator-owner tests, 39 observation tests
+and 48 publisher/observation tests. These suites overlap. All three complete
+unsigned iOS configurations and the actual unit-test bundle compile and link
+with zero warnings or errors, using both existing native packages. The unit
+bundle was not executed. This is source/build evidence; physical per-profile
+capture, real service/signer acceptance, sustained performance and distribution
+remain open. The iOS origin probe still confirms actual A/V decode for the
+current attempt without comparing remote dimensions to the chosen profile.
+
 Latest local checkpoint, 22 October: the requested origin-main integration is
 complete as `1485ec0`; the later main documentation changes are merged as
 `8116361`. SDK commit `1634a809` separates transport recovery from decoded
@@ -112,7 +132,7 @@ and build boundaries do not establish a deployed native-session backend, real
 signer consent, Keychain acceptance or a physical V4V show. No installed app or
 active Android capture has been replaced by this work.
 
-The final generated-fixture checks pass 74 pure capture/destination tests,
+The earlier creator-wiring checks passed 74 pure capture/destination tests,
 64 control/authentication tests, 28 creator-owner tests using both real native
 packages, 39 observation/cleanup tests, 46 publisher/observation tests using the
 real Rust policy, and 14 configuration tests. These suites overlap; the counts

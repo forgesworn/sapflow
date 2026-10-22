@@ -287,12 +287,13 @@ final class V4vSessionEngine {
             try save(d)
         }
     }
-    /// Cold admission query only. Capture must also retain a separate monotonic
-    /// expiry alarm outside the HTTP owner; a blocked request cannot extend it.
+    /// Cold authority query only. The immutable capture profile separately
+    /// admits this grant's bandwidth. Capture also retains a monotonic expiry
+    /// alarm outside the HTTP owner; a blocked request cannot extend it.
     func captureGrant(clock: V4vClock) throws -> V4vGrant {
         try tick(clock: clock); _ = try auth(clock)
         guard !restoredRequiresRefresh, !terminalIntent, pending == nil, expiredScope == nil, let grant, session?.identity == grant.identity,
-              session?.permitsGrant == true, grant.expiresMs > lastMs, grant.maxPublishBps >= 4_000_000 else { throw V4vFailure.terminal }
+              session?.permitsGrant == true, grant.expiresMs > lastMs else { throw V4vFailure.terminal }
         return grant
     }
     /// Use this effective, rollback-resistant deadline for the independent

@@ -125,6 +125,16 @@ final class V4vSessionEngineTests: XCTestCase {
         let op = try XCTUnwrap(e.pending)
         try e.applyResponse(V4vFixture.answer(), for: op, clock: V4vFixture.clock()); return op
     }
+    func testSmallPositiveGrantRetainsAuthorityWithoutChoosingCaptureQuality() throws {
+        let e = try engine(V4vMemoryJournal()); try login(e)
+        try e.stagePrepare(event: V4vFixture.event, expectedGeneration: 0, key: V4vFixture.key, clock: V4vFixture.clock())
+        let grant = V4vFixture.edit(V4vFixture.grant(), ["limits": .object(["maxPublishBps": .integer(1_000_000), "maxQueueBytes": .integer(65_536)])])
+        try e.applyResponse(V4vFixture.answer(grant: grant), for: XCTUnwrap(e.pending), clock: V4vFixture.clock())
+        XCTAssertNil(e.pending)
+        XCTAssertEqual(try e.captureGrant(clock: V4vFixture.clock()).maxPublishBps, 1_000_000)
+        XCTAssertEqual(try e.publishingGrant(clock: V4vFixture.clock()).grant.maxQueueBytes, 65_536)
+        XCTAssertThrowsError(try V4vGrant(V4vFixture.edit(grant, ["limits": .object(["maxPublishBps": .integer(0), "maxQueueBytes": .integer(65_536)])]), nowMs: V4vFixture.time))
+    }
     func testPrepareIsDurableBeforeAnyRequestAndFailurePoisonsAdmission() throws {
         let store = V4vMemoryJournal(); var fences = 0; let e = try engine(store, fence: { fences += 1 }); try login(e)
         store.fails = true

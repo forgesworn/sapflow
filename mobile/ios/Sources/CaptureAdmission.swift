@@ -6,6 +6,7 @@ import Foundation
 final class CaptureAdmission {
     struct Preparation: Equatable {
         fileprivate let serial: UInt64
+        let profile: CaptureProfile
     }
     struct Start: Equatable {
         fileprivate let serial: UInt64
@@ -40,14 +41,15 @@ final class CaptureAdmission {
         serial += 1; return serial
     }
     var currentPhase: Phase { locked { phase } }
+    var canChooseCaptureProfile: Bool { locked { phase == .idle } }
     var preparedTicket: Preparation? { locked { phase == .prepared ? preparation : nil } }
     var currentPreparation: Preparation? {
         locked { [.stopping, .retained, .idle].contains(phase) ? nil : preparation }
     }
-    func reservePreparation() -> Preparation? {
+    func reservePreparation(profile: CaptureProfile = .defaultProfile) -> Preparation? {
         locked {
             guard phase == .idle, let serial = next() else { return nil }
-            let ticket = Preparation(serial: serial)
+            let ticket = Preparation(serial: serial, profile: profile)
             preparation = ticket; candidatePending = true; hasCommittedRun = false; phase = .reserved
             return ticket
         }

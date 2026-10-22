@@ -17,7 +17,7 @@ suite.addTest(OriginObservationSlotTests.defaultTestSuite)
 suite.run()
 guard let result = suite.testRun, result.executionCount == 39, result.hasSucceeded else { exit(1) }
 SWIFT
-sapflow_sources=(SrtDestination SrtPublishingLimits V4vContracts V4vSessionEngine V4vControlClient V4vLoginContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot)
+sapflow_sources=(CaptureOrientation CaptureProfile SrtDestination SrtPublishingLimits V4vContracts V4vSessionEngine V4vControlClient V4vLoginContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot)
 sapflow_files=()
 for sapflow_source in "${sapflow_sources[@]}"; do sapflow_files+=("$sapflow_root/mobile/ios/Sources/$sapflow_source.swift"); done
 swiftc -swift-version 5 -warnings-as-errors -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \

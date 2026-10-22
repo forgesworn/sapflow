@@ -9,6 +9,7 @@ struct SapflowBroadcasterApp: App {
 
 final class BroadcasterModel: ObservableObject {
     @Published var snapshot = CaptureSnapshot()
+    @Published private(set) var captureProfile = CaptureProfile.defaultProfile
     @Published var destinationMode = BroadcasterDestinationMode.recording {
         didSet {
             guard destinationMode != oldValue else { return }
@@ -56,6 +57,15 @@ final class BroadcasterModel: ObservableObject {
     }
     deinit { creatorOwner?.close() }
     var recordingOnly: Bool { destinationMode == .recording }
+    // 1080p has an engineering encoder path, pending physical qualification.
+    let captureProfiles = CaptureProfile.allCases.filter { !$0.isEngineeringOnly }
+    var canChangeCaptureProfile: Bool {
+        engine.canChooseCaptureProfile && (destinationMode != .v4v || creatorOwner?.canChangeCaptureSettings != false)
+    }
+    func selectCaptureProfile(_ profile: CaptureProfile) {
+        guard canChangeCaptureProfile, captureProfiles.contains(profile) else { return }
+        captureProfile = profile
+    }
     var captureBusy: Bool { snapshot.running || snapshot.phase == "Finalising" || snapshot.phase == "Preparing" }
     var canPrepare: Bool {
         !captureBusy && !snapshot.canStart && (destinationMode != .v4v || creator.canPrepare)
@@ -82,7 +92,7 @@ final class BroadcasterModel: ObservableObject {
     func retryCreatorAction() { creatorOwner?.retryPending() }
     func endBroadcast() { creatorOwner?.end() }
     func acknowledgeRecovery() { creatorOwner?.acknowledgeRecovery() }
-    func prepareReplacement() { updateOrientation(); creatorOwner?.prepare(replacingAcknowledged: true) }
+    func prepareReplacement() { updateOrientation(); creatorOwner?.prepare(captureProfile: captureProfile, replacingAcknowledged: true) }
     func updateOrientation() {
         if let orientation = CaptureOrientation.device(UIDevice.current.orientation) {
             hasOrientation = true; engine.setOrientation(orientation)
@@ -103,8 +113,8 @@ final class BroadcasterModel: ObservableObject {
         else { engine.stop() }
     }
     func prepare() {
-        if destinationMode == .v4v { updateOrientation(); creatorOwner?.prepare(); return }
-        guard let ticket = engine.reservePreparation() else { return }
+        if destinationMode == .v4v { updateOrientation(); creatorOwner?.prepare(captureProfile: captureProfile); return }
+        guard let ticket = engine.reservePreparation(profile: captureProfile) else { return }
         guard destinationSelection.reserve(ticket) else { engine.abandonPreparation(ticket); return }
         updateOrientation()
         do {
@@ -255,6 +265,9 @@ struct BroadcasterView: View {
                 ProgressView(value: Double(model.snapshot.level + 60), total: 60).accessibilityLabel("Microphone level")
                 Text("Mic \(Int(model.snapshot.level)) dBFS · encoded \(model.snapshot.encoded) · capture drops \(model.snapshot.captureDrops)").font(.caption.monospacedDigit())
                 destinationForm
+                Picker("Capture quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
+                    ForEach(model.captureProfiles, id: \.self) { Text($0.label).tag($0) }
+                }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.quality")
                 if model.destinationMode == .manual, let error = model.destinationError {
                     Text(error).font(.caption).foregroundStyle(.red)
                 }
@@ -268,7 +281,7 @@ struct BroadcasterView: View {
                     ShareLink(item: url) { Label("Export recording", systemImage: "square.and.arrow.up") }
                     Text("Saved in Files → On My iPhone → Sapflow").font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Keep the app in the foreground. Turning the phone restarts publishing and saves a new recording segment. Locking the phone or an audio interruption ends capture.")
+                Text("Keep the app in the foreground. Turning the phone saves a new recording segment and reconnects any active broadcast. Locking the phone or an audio interruption ends capture.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.vertical)
         }.scrollDismissesKeyboard(.interactively)

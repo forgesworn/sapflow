@@ -3,7 +3,8 @@ import Foundation
 /// The camera owner enforces these exact tickets again after every asynchronous
 /// permission/start boundary. Cancelling one ticket must never stop another mode.
 protocol V4vCreatorCapturePort: AnyObject {
-    func reservePreparation() -> CaptureAdmission.Preparation?
+    var canChooseCaptureProfile: Bool { get }
+    func reservePreparation(profile: CaptureProfile) -> CaptureAdmission.Preparation?
     func abandonPreparation(_ ticket: CaptureAdmission.Preparation)
     func setDestination(_ sink: EncodedPublishingSink?, preparation: CaptureAdmission.Preparation, completion: @escaping (Bool) -> Void)
     func prepare(_ ticket: CaptureAdmission.Preparation)
@@ -54,7 +55,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
                               @escaping () -> V4vClock, @escaping (V4vLoginResult) throws -> Void,
                               @escaping () -> Void) throws -> V4vCreatorLogin
     typealias PublisherFactory = (UInt64, V4vPublishingGrantPermit, V4vSessionEngine, DispatchQueue,
-                                  V4vObservationSlot, @escaping () -> V4vClock) throws -> V4vCreatorPublisher
+                                  V4vObservationSlot, @escaping () -> V4vClock, CaptureProfile) throws -> V4vCreatorPublisher
 
     /// Scalar admission only. No IO, callbacks, HTTP or camera work under lock.
     private let gate = NSLock()
@@ -87,7 +88,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private var window: Window?
     private var refreshAtNs: UInt64?
     private var capturePrepared = false, captureRunning = false, captureStopping = false
-    private var prepareGeneration: UInt64?
+    private var prepareIntent: (generation: UInt64, profile: CaptureProfile)?
     private var ending = false
     private var slotClosed = false
     private var actorCommand: UInt64 = 0
@@ -123,9 +124,9 @@ final class V4vCreatorOwner: @unchecked Sendable {
                 clock: { clock().monotonicNs }, unixSeconds: { clock().wallMs / 1000 },
                 onCleanupComplete: cleanupHint, commit: commit)
         }
-        self.makePublisher = makePublisher ?? { destination, permit, engine, queue, slot, clock in
+        self.makePublisher = makePublisher ?? { destination, permit, engine, queue, slot, clock, captureProfile in
             try V4vObservedPublisher(destination: destination, permit: permit, profile: profile,
-                engine: engine, owner: queue, slot: slot, clock: clock)
+                engine: engine, owner: queue, slot: slot, clock: clock, captureProfile: captureProfile)
         }
         timer = NativeDeadlineTimer(queue: owner); slot = V4vObservationSlot(owner: owner, clock: clock)
         owner.async { [self] in bootstrap() }
@@ -228,14 +229,21 @@ final class V4vCreatorOwner: @unchecked Sendable {
     @discardableResult func status() -> Bool {
         command { [self] _ in guard let identity = engine?.session?.identity else { throw V4vFailure.terminal }; try read(.status(identity)) }
     }
-    @discardableResult func prepare(replacingAcknowledged: Bool = false) -> Bool {
+    /// This scalar admission is authoritative even while the UI snapshot lags.
+    var canChangeCaptureSettings: Bool {
+        gate.lock(); let free = !closed && !busy && !endQueued; gate.unlock()
+        // A failed or late candidate may have no adopted Binding. Only the
+        // actual capture cleanup barrier can release its preparation capacity.
+        return free && capture.canChooseCaptureProfile
+    }
+    @discardableResult func prepare(captureProfile: CaptureProfile = .defaultProfile, replacingAcknowledged: Bool = false) -> Bool {
         command { [self] token in
             guard let engine, binding == nil, !capturePrepared, !captureRunning, !captureStopping, engine.pending == nil,
                   let selected = value.selectedEvent else { throw V4vFailure.busy }
             // A saved acknowledged grant can prepare a fresh local camera epoch;
             // restore cannot supply this permit until a fresh durable refresh.
             if let session = engine.session, !session.terminal, session.identity.eventId == selected {
-                try attach(engine.publishingGrant(clock: clock()), token: token); releaseCommand(); return
+                try attach(engine.publishingGrant(clock: clock()), token: token, captureProfile: captureProfile); releaseCommand(); return
             }
             if let remote = current?.receipt {
                 guard let local = engine.session, local.identity.sameSession(remote.identity) else { throw V4vFailure.conflict }
@@ -244,9 +252,10 @@ final class V4vCreatorOwner: @unchecked Sendable {
             if let local = engine.session, local.identity.eventId == selected { expectedGeneration = local.identity.generation }
             else if let current, current.receipt == nil { expectedGeneration = current.generation }
             else { throw V4vFailure.conflict }
-            prepareGeneration = token
             try engine.stagePrepare(event: selected, expectedGeneration: expectedGeneration, key: nonce(), replacingAcknowledged: replacingAcknowledged, clock: clock())
-            try beginWindow(); pump()
+            prepareIntent = (token, captureProfile)
+            do { try beginWindow(); pump() }
+            catch { prepareIntent = nil; throw error }
         }
     }
     @discardableResult func start() -> Bool {
@@ -254,6 +263,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
             guard let engine, let binding, capturePrepared, !captureRunning, !captureStopping, engine.pending == nil, !engine.terminalIntent else { throw V4vFailure.terminal }
             let permit = try engine.publishingGrant(clock: clock())
             guard binding.permit.grant.immutableMatches(permit.grant), clock().monotonicNs < binding.permit.expiresAtNs else { throw V4vFailure.terminal }
+            try binding.ticket.profile.requireGrant(maxPublishBps: permit.grant.maxPublishBps)
             capture.start(preparation: binding.ticket); releaseCommand()
         }
     }
@@ -286,7 +296,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         publisher?.endDestination(); login?.cancel()
         owner.async { [self] in
             gate.lock(); endNeedsStaging = false; gate.unlock()
-            prepareGeneration = nil; refreshAtNs = nil; ending = true
+            prepareIntent = nil; refreshAtNs = nil; ending = true
             commandStartedNs = started
             do { guard let engine else { throw V4vFailure.journal }; try engine.requestEnd(clock: clock()); if window == nil { try beginWindow() }; if inflight == nil { pump() } }
             catch { fail(error); completeWindow() }
@@ -297,7 +307,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         // Only this immediate explicit user action may invoke global Stop.
         let cold = state(); guard cold.active, !cold.closed else { return }
         retireAuthority(); capture.stop()
-        owner.async { [self] in prepareGeneration = nil; refreshAtNs = nil; retireBinding(); publish() }
+        owner.async { [self] in prepareIntent = nil; refreshAtNs = nil; retireBinding(); publish() }
     }
     func setActive(_ active: Bool) {
         gate.lock(); guard !closed, enabled != active else { gate.unlock(); return }; enabled = active; gate.unlock()
@@ -305,7 +315,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         gate.lock(); guard !modeUpdateQueued else { gate.unlock(); return }; modeUpdateQueued = true; gate.unlock()
         owner.async { [self] in
             gate.lock(); modeUpdateQueued = false; let active = enabled; gate.unlock()
-            prepareGeneration = nil
+            prepareIntent = nil
             if !active { refreshAtNs = nil; retireBinding() }
             else if engine?.pending != nil || engine?.terminalIntent == true { if window == nil { commandStartedNs = clock().monotonicNs; try? beginWindow() }; pump() }
             publish()
@@ -339,8 +349,11 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private var captureUpdateQueued = false
     private var captureActivityPending = false
 
-    private func attach(_ permit: V4vPublishingGrantPermit, token: UInt64) throws {
-        guard live(token), binding == nil, let engine, let ticket = capture.reservePreparation() else { throw V4vFailure.busy }
+    private func attach(_ permit: V4vPublishingGrantPermit, token: UInt64, captureProfile: CaptureProfile) throws {
+        // Reject an insufficient grant before creating a camera or publisher
+        // owner. The selected profile is never inferred from a service cap.
+        try captureProfile.requireGrant(maxPublishBps: permit.grant.maxPublishBps)
+        guard live(token), binding == nil, let engine, let ticket = capture.reservePreparation(profile: captureProfile) else { throw V4vFailure.busy }
         guard nextDestination < UInt64.max else { capture.abandonPreparation(ticket); throw V4vFailure.bounds }
         gate.lock()
         let mayConstruct = !closed && enabled && generation == token
@@ -349,7 +362,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         guard mayConstruct else { capture.abandonPreparation(ticket); throw V4vFailure.closed }
         nextDestination += 1
         let publisher: V4vCreatorPublisher
-        do { publisher = try makePublisher(nextDestination, permit, engine, owner, slot, clock) }
+        do { publisher = try makePublisher(nextDestination, permit, engine, owner, slot, clock, captureProfile) }
         catch { capture.abandonPreparation(ticket); throw error }
         gate.lock()
         let accepted = !closed && enabled && generation == token
@@ -446,10 +459,17 @@ final class V4vCreatorOwner: @unchecked Sendable {
                 // Late mutation acknowledgements still durably resolve the
                 // EXACT pending operation. Cold End already fenced adoption.
                 try engine.applyResponse(json, for: operation, clock: clock())
-                if !engine.terminalIntent, let permit = try? engine.publishingGrant(clock: clock()) {
-                    if let binding { try binding.publisher.committed(permit); self.binding?.permit = permit; scheduleRefresh(permit) }
-                    else if withinWindow && prepareGeneration == token && live(token) { try attach(permit, token: token) }
-                }
+                // The server operation is now durably acknowledged. Local
+                // capture/publisher failure cannot retry that HTTP mutation or
+                // supply fresh capture approval from a later retry timer.
+                do {
+                    if !engine.terminalIntent, let permit = try? engine.publishingGrant(clock: clock()) {
+                        if let binding { try binding.publisher.committed(permit); self.binding?.permit = permit; scheduleRefresh(permit) }
+                        else if withinWindow, let intent = prepareIntent, intent.generation == token, live(token) {
+                            try attach(permit, token: token, captureProfile: intent.profile)
+                        }
+                    }
+                } catch { fail(error); completeWindow(); return }
                 if engine.terminalIntent { pump() } else { completeWindow() }
             case let .read(kind):
                 switch kind {
@@ -519,7 +539,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     }
     private func completeWindow() {
         let completedCommand = window?.command ?? actorCommand
-        window = nil; timer.cancel(); prepareGeneration = nil
+        window = nil; timer.cancel(); prepareIntent = nil
         gate.lock()
         if busyCommand == completedCommand { busy = false; busyCommand = nil }
         if !endNeedsStaging { endQueued = false }
@@ -527,6 +547,11 @@ final class V4vCreatorOwner: @unchecked Sendable {
         armRefresh(); publish()
     }
     private func fail(_ error: Error) {
+        if (error as? CaptureProfileFailure) == .insufficientPublishCap {
+            value.error = "The destination limit is too low for the selected quality. Choose a lower quality and Prepare again."
+            value.message = "Selected quality exceeds the destination limit"
+            publish(); return
+        }
         value.error = (error as? V4vFailure ?? .unavailable).description
         value.message = engine?.pending != nil ? "Operation unconfirmed; retry the saved operation" :
             ((error as? V4vFailure) == .conflict ? "Session conflict; reconcile saved state or resolve the existing remote session in the service" : "Creator action could not complete")
@@ -568,7 +593,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         gate.lock(); guard !closed else { gate.unlock(); return }; closed = true; generation &+= 1; gate.unlock()
         retireAuthority()
         owner.async { [self] in
-            retainedSelf = self; timer.cancel(); window = nil; prepareGeneration = nil; refreshAtNs = nil
+            retainedSelf = self; timer.cancel(); window = nil; prepareIntent = nil; refreshAtNs = nil
             slot.close { [weak self] in self?.slotClosed = true; self?.finishClose() }
             engine?.close(); http?.close(); login?.cancel(); retireBinding(); publish(); finishClose()
         }

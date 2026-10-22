@@ -2,6 +2,72 @@ import XCTest
 @testable import SapflowBroadcaster
 
 final class CaptureAdmissionTests: XCTestCase {
+    func testDefaultPreparationPreserves720AndReservesProfileSelectionSynchronously() {
+        let gate = CaptureAdmission()
+        XCTAssertTrue(gate.canChooseCaptureProfile)
+        let ticket = gate.reservePreparation()!
+        XCTAssertEqual(ticket.profile, .hd720p30)
+        XCTAssertFalse(gate.canChooseCaptureProfile)
+        XCTAssertNil(gate.reservePreparation(profile: .sd480p30))
+        XCTAssertEqual(gate.currentPreparation?.profile, .hd720p30)
+    }
+    func testImmutableProfileSurvivesPreparationStartAndRepeatedRotation() {
+        for profile in CaptureProfile.allCases {
+            let gate = CaptureAdmission(), ticket = gate.reservePreparation(profile: profile)!
+            XCTAssertEqual(ticket.profile, profile)
+            XCTAssertTrue(gate.attached(ticket)); XCTAssertTrue(gate.beginPermissions(ticket))
+            XCTAssertTrue(gate.prepared(ticket)); XCTAssertEqual(gate.preparedTicket?.profile, profile)
+            let start = gate.reserveStart(ticket)!
+            XCTAssertEqual(start.preparation.profile, profile); XCTAssertTrue(gate.started(start))
+            for _ in 0..<3 {
+                let child = gate.beginRotation(ticket)!
+                XCTAssertEqual(child.preparation.profile, profile)
+                let restart = gate.reserveRotationStart(child)!
+                XCTAssertEqual(restart.preparation.profile, profile)
+                XCTAssertTrue(gate.started(restart)); XCTAssertFalse(gate.canChooseCaptureProfile)
+                XCTAssertNil(gate.reservePreparation(profile: .defaultProfile))
+            }
+            XCTAssertEqual(gate.currentPreparation?.profile, profile)
+        }
+    }
+    func testOldProfileCallbacksCannotAdoptStartOrRotateNewProfile() {
+        let gate = CaptureAdmission(), old = gate.reservePreparation(profile: .sd480p30)!
+        XCTAssertTrue(gate.attached(old)); XCTAssertTrue(gate.beginPermissions(old)); XCTAssertTrue(gate.prepared(old))
+        let oldStart = gate.reserveStart(old)!
+        XCTAssertTrue(gate.started(oldStart)); let oldRotation = gate.beginRotation(old)!
+        let stop = gate.stop(); XCTAssertFalse(gate.canChooseCaptureProfile)
+        XCTAssertTrue(gate.completeStop(stop, cleanupComplete: true)); XCTAssertTrue(gate.canChooseCaptureProfile)
+        let next = gate.reservePreparation(profile: .fullHD1080p30)!
+        XCTAssertFalse(gate.attached(old)); XCTAssertFalse(gate.prepared(old)); XCTAssertFalse(gate.started(oldStart))
+        XCTAssertNil(gate.reserveRotationStart(oldRotation)); XCTAssertNil(gate.beginRotation(old))
+        XCTAssertFalse(gate.failed(old, cleanupComplete: true)); XCTAssertFalse(gate.completeStop(stop, cleanupComplete: true))
+        XCTAssertEqual(gate.currentPreparation, next); XCTAssertEqual(next.profile, .fullHD1080p30)
+        XCTAssertTrue(gate.attached(next)); XCTAssertTrue(gate.beginPermissions(next)); XCTAssertTrue(gate.prepared(next))
+        XCTAssertTrue(gate.started(gate.reserveStart(next)!))
+        XCTAssertEqual(gate.currentPreparation?.profile, .fullHD1080p30)
+    }
+    func testProfileSelectionCannotBypassStoppedFactoryOrUncertainCleanup() {
+        let gate = CaptureAdmission(), old = gate.reservePreparation(profile: .sd480p30)!, stop = gate.stop()
+        XCTAssertFalse(gate.completeStop(stop, cleanupComplete: false))
+        XCTAssertFalse(gate.canChooseCaptureProfile); XCTAssertNil(gate.reservePreparation(profile: .hd720p30))
+        XCTAssertFalse(gate.candidateClosed(old, cleanupComplete: true))
+        XCTAssertFalse(gate.canChooseCaptureProfile)
+        XCTAssertTrue(gate.completeStop(stop, cleanupComplete: true))
+        XCTAssertTrue(gate.canChooseCaptureProfile)
+        let next = gate.reservePreparation(profile: .hd720p30)!
+        XCTAssertEqual(next.profile, .hd720p30); XCTAssertFalse(gate.canChooseCaptureProfile)
+    }
+    func testStopWinningAfterRotationStartCannotReopenItsProfile() {
+        let gate = CaptureAdmission(), ticket = gate.reservePreparation(profile: .fullHD1080p30)!
+        XCTAssertTrue(gate.attached(ticket)); XCTAssertTrue(gate.beginPermissions(ticket)); XCTAssertTrue(gate.prepared(ticket))
+        XCTAssertTrue(gate.started(gate.reserveStart(ticket)!))
+        let restart = gate.reserveRotationStart(gate.beginRotation(ticket)!)!
+        let stop = gate.stop()
+        XCTAssertFalse(gate.started(restart)); XCTAssertFalse(gate.canChooseCaptureProfile)
+        XCTAssertTrue(gate.completeStop(stop, cleanupComplete: true))
+        XCTAssertFalse(gate.started(restart)); XCTAssertTrue(gate.canChooseCaptureProfile)
+        XCTAssertEqual(gate.reservePreparation()?.profile, .hd720p30)
+    }
     func testEndRetiresEveryInitialPreparationPhaseBeforeStartCommits() {
         for stage in 0...4 {
             let gate = CaptureAdmission(), ticket = gate.reservePreparation()!

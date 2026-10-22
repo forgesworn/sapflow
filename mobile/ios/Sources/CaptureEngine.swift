@@ -3,6 +3,7 @@ import UIKit
 
 struct CaptureSnapshot {
     var orientation = CaptureOrientation.portrait
+    var profile = CaptureProfile.defaultProfile
     var phase = "Idle"
     var detail = "Prepare the camera and microphone to begin."
     var publisher = "Publisher not attached · local recording only"
@@ -17,6 +18,7 @@ struct CaptureSnapshot {
 extension CaptureEngine: V4vCreatorCapturePort {}
 
 final class CaptureRun {
+    let profile: CaptureProfile
     let recorder: CompressedRecorder
     let worker: IngressWorker
     var video: HardwareVideoEncoder!
@@ -25,12 +27,13 @@ final class CaptureRun {
     var admitting = true
     var startup: [(sample: CMSampleBuffer, video: Bool)] = []
     var startupBytes = 0
-    init(url: URL, orientation: CaptureOrientation, ingress: RustEncodedIngress, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, recordingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
+    init(url: URL, orientation: CaptureOrientation, profile: CaptureProfile, ingress: RustEncodedIngress, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, recordingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
+        self.profile = profile
         recorder = try CompressedRecorder(url: url, onFailure: recordingFailure)
         worker = IngressWorker(ingress: ingress, failure: publishingFailure, statistics: statistics)
         let recorder = self.recorder; let worker = self.worker
         let output: (CompressedUnit) -> Void = { unit in recorder.offer(unit); worker.offer(unit) }
-        video = try HardwareVideoEncoder(orientation: orientation, output: output, failure: failure)
+        video = try HardwareVideoEncoder(orientation: orientation, profile: profile, output: output, failure: failure)
         audio = try NativeAudioEncoder(output: output, meter: meter)
     }
 }
@@ -46,6 +49,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var run: CaptureRun? // samples queue only
     private var captureGeneration: UInt64 = 0 // control queue only
     private var configured = false // control queue only
+    private var configuredProfile: CaptureProfile? // control queue only
     private var orientationPlan = OrientationRestartPlan()
     private var rotationTimeout: DispatchWorkItem?
     private let admission = CaptureAdmission()
@@ -88,7 +92,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     /// Attach a real bounded destination adapter before preparing. No endpoint
     /// or credential is inferred from a display label or bundled configuration.
-    func reservePreparation() -> CaptureAdmission.Preparation? { admission.reservePreparation() }
+    var canChooseCaptureProfile: Bool { admission.canChooseCaptureProfile }
+    func reservePreparation(profile: CaptureProfile = .defaultProfile) -> CaptureAdmission.Preparation? { admission.reservePreparation(profile: profile) }
     /// The destination owner separately fences its captured publisher. This
     /// exact camera fence cancels initial approval without stopping a recording
     /// that already began, including its later orientation epochs.
@@ -139,6 +144,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             self.ingress.destination?.endDestination()
             self.ingress.destination = destination
             self.preparedIntent = ticket
+            if self.configuredProfile != ticket.profile { self.configured = false }
+            self.snapshot.profile = ticket.profile
             self.destinationLock.lock(); self.destinationFence = destination; self.destinationLock.unlock()
             self.snapshot.publisher = self.ingress.status
             self.publish(); completion(true)
@@ -187,7 +194,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
     private var orientationDescription: String {
-        "\(orientationPlan.desired.width)×\(orientationPlan.desired.height) at 30 fps · hardware H.264 · AAC 48 kHz mono"
+        let profile = preparedIntent?.profile ?? snapshot.profile
+        let dimensions = profile.dimensions(for: orientationPlan.desired)
+        return "\(dimensions.width)×\(dimensions.height) at \(profile.frameRate) fps · hardware H.264 · AAC 48 kHz mono"
     }
     private func applyOrientation() throws {
         guard !snapshot.running, !stopping else { throw CaptureFailure(message: "Orientation requires a new encoder epoch") }
@@ -229,7 +238,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             snapshot.canStart = true
             startOnControl(start, keepSavedSegment: true)
             if snapshot.running {
-                snapshot.detail = "\(orientationDescription). Rotation began a new publishing session and recording segment; previous segment remains in Files."
+                snapshot.detail = "\(orientationDescription). Rotation began a new recording segment; active publishing reconnects. The previous segment remains in Files."
                 publish()
             }
         } catch { stopOnControl(reason: error.localizedDescription) }
@@ -264,7 +273,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     try audio.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .allowBluetooth])
                     try audio.setPreferredSampleRate(48_000)
                     try audio.setActive(true)
-                    if !self.configured { try self.configure() }
+                    if !self.configured { try self.configure(profile: ticket.profile) }
                     try self.applyOrientation()
                     self.setSampleDelivery(true)
                     self.session.startRunning()
@@ -278,13 +287,13 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
         }
     }
-    private func configure() throws {
+    private func configure(profile: CaptureProfile) throws {
         session.beginConfiguration(); defer { session.commitConfiguration() }
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
         session.automaticallyConfiguresApplicationAudioSession = false
-        guard session.canSetSessionPreset(.hd1280x720) else { throw CaptureFailure(message: "720p capture is unavailable") }
-        session.sessionPreset = .hd1280x720
+        guard session.canSetSessionPreset(profile.sessionPreset) else { throw CaptureFailure(message: "\(profile.label) capture is unavailable") }
+        session.sessionPreset = profile.sessionPreset
         guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let microphone = AVCaptureDevice.default(for: .audio) else { throw CaptureFailure(message: "Camera or microphone unavailable") }
         let cameraInput = try AVCaptureDeviceInput(device: camera)
@@ -293,9 +302,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         session.addInput(cameraInput); session.addInput(micInput)
         try camera.lockForConfiguration()
         defer { camera.unlockForConfiguration() }
-        guard camera.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }) else { throw CaptureFailure(message: "720p30 is unsupported on this camera") }
-        camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-        camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+        let rate = Double(profile.frameRate)
+        guard camera.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= rate && $0.maxFrameRate >= rate }) else { throw CaptureFailure(message: "\(profile.label) is unsupported on this camera") }
+        camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: profile.frameRate)
+        camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: profile.frameRate)
         let video = AVCaptureVideoDataOutput()
         video.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
         video.alwaysDiscardsLateVideoFrames = true
@@ -309,6 +319,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
         connection.videoOrientation = orientationPlan.desired.capture
         snapshot.orientation = orientationPlan.desired
+        configuredProfile = profile
         configured = true
     }
     func start() { if let ticket = admission.preparedTicket { start(preparation: ticket) } }
@@ -327,7 +338,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             let url = folder.appendingPathComponent("Sapflow-\(UUID().uuidString).mov")
             self.ingress.reset()
             self.recordingFailureDescription = nil
-            let run = try CaptureRun(url: url, orientation: self.orientationPlan.desired, ingress: self.ingress,
+            let run = try CaptureRun(url: url, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress,
                 failure: { [weak self] error in self?.control.async {
                     guard self?.captureGeneration == captureToken, self?.preparedIntent == ticket.preparation else { return }
                     self?.stopOnControl(reason: error.localizedDescription)
@@ -431,7 +442,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         stopping = true
         snapshot.running = false; snapshot.phase = "Finalising"
         snapshot.publisher = ingress.destination == nil ? "Local capture stopping" : "Publisher stop requested · destination end unconfirmed"
-        snapshot.detail = rotationToken == nil ? (reason ?? "Closing the recording safely.") : "Rotating: saving this segment and restarting the publisher upright."
+        snapshot.detail = rotationToken == nil ? (reason ?? "Closing the recording safely.") : "Rotating: saving this recording segment. Active publishing will reconnect upright."
         publish()
         samples.async {
             guard let run = self.run else { self.control.async {

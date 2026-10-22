@@ -42,6 +42,7 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
     typealias TransportFactory = (ManualSrtDestination, SrtPublishingLimits, @escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> EncodedPublishingSink
     typealias ObserverFactory = (V4vObservedAttempt, OriginConfirmationGate, @escaping (OriginAttemptIdentity, UInt64) throws -> Void) throws -> V4vOriginObserver
     private let destination: UInt64
+    private let captureProfile: CaptureProfile
     private let owner: DispatchQueue
     private let clock: () -> V4vClock
     private let lifetime: V4vPublishingLifetime
@@ -56,11 +57,13 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
 
     init(destination: UInt64, permit: V4vPublishingGrantPermit, profile: V4vConnectorProfile,
          engine: V4vSessionEngine, owner: DispatchQueue, slot: V4vObservationSlot, clock: @escaping () -> V4vClock,
+         captureProfile: CaptureProfile = .defaultProfile,
          transport: @escaping TransportFactory = { ManualSrtPublisher(destination: $0, limits: $1, observe: $2) },
          observation: ObserverFactory? = nil) throws {
         try engine.requireProfile(profile)
         guard destination > 0 else { throw OriginObservationFailure.scope }
-        _ = try SrtPublishingLimits.scoped(maxQueueBytes: permit.grant.maxQueueBytes, maxPublishBps: permit.grant.maxPublishBps)
+        _ = try SrtPublishingLimits.scoped(maxQueueBytes: permit.grant.maxQueueBytes, maxPublishBps: permit.grant.maxPublishBps, captureProfile: captureProfile)
+        self.captureProfile = captureProfile
         self.destination = destination; self.owner = owner; self.slot = slot; self.clock = clock; self.transport = transport
         lifetime = try V4vPublishingLifetime(permit, nowNs: clock().monotonicNs)
         expiryTimer = NativeDeadlineTimer(queue: expiryQueue)
@@ -91,7 +94,7 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
         try gate.stage(OriginCurrentAuthority(attempt: attempt, grant: permit.grant, expiresAtNs: permit.expiresAtNs), clock: { self.clock().monotonicNs })
         do {
             let destination = try ManualSrtDestination(endpoint: permit.grant.endpoint, streamID: attempt.wireStreamID(grant: permit.grant), passphrase: permit.grant.passphrase, allowPlaintext: false)
-            let limits = try SrtPublishingLimits.scoped(maxQueueBytes: permit.grant.maxQueueBytes, maxPublishBps: permit.grant.maxPublishBps)
+            let limits = try SrtPublishingLimits.scoped(maxQueueBytes: permit.grant.maxQueueBytes, maxPublishBps: permit.grant.maxPublishBps, captureProfile: captureProfile)
             currentAttempt = attempt
             return try transport(destination, limits, observe)
         } catch { gate.invalidate(attempt: attempt); throw error }
