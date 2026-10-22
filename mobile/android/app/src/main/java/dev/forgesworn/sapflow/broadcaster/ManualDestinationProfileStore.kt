@@ -91,6 +91,7 @@ internal class ManualDestinationProfileIO private constructor(context: Context) 
     private val app = context.applicationContext
     val picker = ManualProfilePicker<Uri>() // One untagged platform result across Activity recreation.
     private val admission = ManualProfileIOAdmission()
+    val busy: Boolean get() = admission.busy
     private val worker = ThreadPoolExecutor(1, 1, 10, TimeUnit.SECONDS, ArrayBlockingQueue(1), { r -> Thread(r, "sapflow-manual-profiles").apply { isDaemon = true } }).apply { allowCoreThreadTimeOut(true) }
     private val alarms = ScheduledThreadPoolExecutor(1) { r -> Thread(r, "sapflow-manual-import-deadline").apply { isDaemon = true } }.apply { removeOnCancelPolicy = true }
     private val main = Handler(Looper.getMainLooper())

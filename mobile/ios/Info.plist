@@ -10,6 +10,7 @@
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
 <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+<key>CFBundleURLTypes</key><array><dict><key>CFBundleTypeRole</key><string>Editor</string><key>CFBundleURLName</key><string>Manual destination invitation</string><key>CFBundleURLSchemes</key><array><string>sapflow-manual</string></array></dict></array>
 <key>LSRequiresIPhoneOS</key><true/>
 <key>SapflowV4vEnabled</key><string>$(SAPFLOW_V4V_ENABLED)</string>
 <key>SapflowV4vApiOrigin</key><string>$(SAPFLOW_V4V_API_ORIGIN)</string>

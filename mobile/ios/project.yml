@@ -64,6 +64,8 @@ targets:
       - path: Tests
       - path: ../../tests/fixtures/manual-destination-v1.json
         buildPhase: resources
+      - path: ../../tests/fixtures/manual-destination-link-v1.json
+        buildPhase: resources
     dependencies:
       - target: SapflowBroadcaster
     settings:

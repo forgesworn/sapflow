@@ -82,8 +82,10 @@ This generated example uses a reserved address and a non-service test secret:
 The file itself contains credentials. Obtain it through an appropriate private
 channel and retain or remove the source file using its owner's normal file
 controls. Import does not erase a provider's original. There is no automatic
-credential export, QR scan, deep-link handler or unsolicited Intent import in
-this packet.
+credential export or QR camera scanner. The separate
+[reviewed manual link contract](manual-destination-links.md) adds bounded native
+link invitations to the same explicit Review and Apply flow; receipt never
+starts broadcasting or supplies plaintext consent.
 
 ## Local storage and evidence
 

@@ -42,9 +42,10 @@ struct ImportedManualDestination: CustomStringConvertible, CustomDebugStringConv
 }
 
 enum ManualImportError: Error, LocalizedError {
-    case invalidFile, unavailable, stale
+    case invalidFile, invalidLink, unavailable, stale
     var errorDescription: String? {
         switch self {
+        case .invalidLink: return "This is not a supported manual destination link. Nothing was changed."
         case .invalidFile: return "This is not a supported manual destination JSON file. Nothing was changed."
         case .unavailable: return "The destination file could not be read and closed safely. Nothing was changed."
         case .stale: return "The destination or capture state changed. Choose the file again."
@@ -111,7 +112,11 @@ final class ManualDestinationSettings: ObservableObject {
     @Published private(set) var pickerVisible = false
     @Published private(set) var review: Review?
     @Published private(set) var reading = false
+    /// Contains no imported label, endpoint, path or secret. One per app model.
+    @Published private(set) var invitation: Ticket?
     private let available: () -> Bool
+    private let invitationAvailable: () -> Bool
+    private let invitationReviewAvailable: () -> Bool
     private let store: ManualDestinationProfileStoring
     private let reader: ManualDestinationFileReader
     private let work: (@escaping () -> Void) -> Void
@@ -120,12 +125,18 @@ final class ManualDestinationSettings: ObservableObject {
     private var batching = false, exhausted = false
     private var pending: (Ticket, ImportedManualDestination)?
     private var readingTicket: Ticket?
+    private var invited: (Ticket, ImportedManualDestination)?
+    private var active = false
+    private var selectingInvitationMode = false
     private var retainedSelf: ManualDestinationSettings?
     init(store: ManualDestinationProfileStoring = DestinationProfileStore(), available: @escaping () -> Bool,
          reader: ManualDestinationFileReader = ManualDestinationFileReader(),
+         invitationAvailable: (() -> Bool)? = nil, invitationReviewAvailable: (() -> Bool)? = nil,
          work: ((@escaping () -> Void) -> Void)? = nil,
          delivery: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) }) {
         self.store = store; self.available = available; self.reader = reader; self.delivery = delivery
+        self.invitationAvailable = invitationAvailable ?? available
+        self.invitationReviewAvailable = invitationReviewAvailable ?? available
         let queue = DispatchQueue(label: "sapflow.manual-destination-import", qos: .utility)
         self.work = work ?? { queue.async(execute: $0) }
         do { profiles = try store.load() } catch { self.error = DestinationError.storage.localizedDescription }
@@ -134,9 +145,58 @@ final class ManualDestinationSettings: ObservableObject {
     private func edited() { if !batching { invalidate() } }
     func invalidate() {
         if revision == UInt64.max { exhausted = true } else { revision += 1 }
-        presentation = nil; pickerVisible = false; review = nil; pending = nil
+        presentation = nil; pickerVisible = false; review = nil; pending = nil; invitation = nil; invited = nil
     }
-    func captureChanged() { if !available(), presentation != nil || review != nil { invalidate() } }
+    func captureChanged() {
+        if invitation != nil { if !invitationAvailable() { invalidate() } }
+        else if !available(), presentation != nil || review != nil { invalidate() }
+    }
+    func modeChanged() { if !selectingInvitationMode { invalidate() } }
+    func sceneChanged(active value: Bool) {
+        // False means actual background, not a permission-prompt inactive
+        // phase. Even background-before-first-active retires the invitation.
+        if !value { active = false; invalidate(); return }
+        guard !active else { return }
+        active = true
+        // A new invitation may precede the first active hook on cold launch,
+        // or arrive after backgrounding. Becoming active never reviews it.
+        if invitation == nil { invalidate() }
+    }
+    @discardableResult func receiveInvitation(_ text: String) -> Bool {
+        // Incoming links cannot displace a review, picker or its retained IO.
+        guard invitation == nil, presentation == nil, review == nil,
+              !reading, !exhausted, invitationAvailable() else { return false }
+        invalidate()
+        do {
+            let profile = try ImportedManualDestination(ManualDestinationEnvelope(text).document)
+            guard invitationAvailable(), !reading else { return false }
+            let ticket = Ticket(id: UUID(), revision: revision)
+            invited = (ticket, profile); invitation = ticket; error = nil
+            return true
+        } catch { self.error = ManualImportError.invalidLink.localizedDescription; return false }
+    }
+    func cancelInvitation(_ ticket: Ticket) { if invitation == ticket { invalidate() } }
+    var canReviewInvitation: Bool { active && !reading && !exhausted && invitationReviewAvailable() }
+    @discardableResult func reviewInvitation(_ ticket: Ticket, selectManual: () -> Void) -> Bool {
+        guard canReviewInvitation, let (saved, profile) = invited, saved == ticket,
+              ticket.revision == revision else { return false }
+        // Only this explicit action may select Manual. Mode invalidation is
+        // suppressed solely during the synchronous model-owned selection.
+        selectingInvitationMode = true
+        selectManual()
+        selectingInvitationMode = false
+        guard invitation == ticket, ticket.revision == revision, canReviewInvitation, canEdit else { return false }
+        invitation = nil; invited = nil
+        installReview(ticket, profile: profile)
+        return true
+    }
+    private func installReview(_ ticket: Ticket, profile: ImportedManualDestination) {
+        pending = (ticket, profile)
+        let peer = profile.host.contains(":") ? "[\(profile.host)]:\(profile.port)" : "\(profile.host):\(profile.port)"
+        review = Review(ticket: ticket, peer: peer,
+            security: profile.requiresPlaintext ? "Plaintext: independent permission required" : (profile.transport == .rtmp ? "RTMPS (TLS)" : "SRT AES-256 media; control and stream ID are clear"),
+            requiresPlaintext: profile.requiresPlaintext)
+    }
     @discardableResult func beginImport() -> Ticket? {
         guard canEdit, presentation == nil else { return nil }
         invalidate(); let ticket = Ticket(id: UUID(), revision: revision)
@@ -157,11 +217,7 @@ final class ManualDestinationSettings: ObservableObject {
                 guard ticket.revision == revision, available() else { return }
                 switch answer.result {
                 case let .success(profile):
-                    pending = (ticket, profile)
-                    let peer = profile.host.contains(":") ? "[\(profile.host)]:\(profile.port)" : "\(profile.host):\(profile.port)"
-                    review = Review(ticket: ticket, peer: peer,
-                        security: profile.requiresPlaintext ? "Plaintext: independent permission required" : (profile.transport == .rtmp ? "RTMPS (TLS)" : "SRT AES-256 media; control and stream ID are clear"),
-                        requiresPlaintext: profile.requiresPlaintext)
+                    installReview(ticket, profile: profile)
                 case let .failure(failure): error = failure.localizedDescription
                 }
             }

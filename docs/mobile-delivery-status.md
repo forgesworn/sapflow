@@ -5,6 +5,35 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+Reviewed [manual destination links](manual-destination-links.md) are implemented
+in both native apps. The shared generated corpus has 98 envelope cases and all
+64 existing strict JSON profile vectors. Explicit Review, independent plaintext
+consent and fields-only Apply remain required; receipt cannot prepare or start
+capture. Both paths refuse selected V4V mode and conflicting capture or import
+owners. Independent source reviews cover the original-owner, repeated-delivery,
+foreground and stale-callback rules.
+
+The exact link composition passes 39 focused iOS host tests with warnings as
+errors, the 64-source iOS 16 API check, and unsigned Debug, Qualification and
+Release app builds. The actual Debug test bundle compiles and contains both
+byte-identical corpora; it has not executed on a phone. Built URL scheme,
+privacy and creator configuration checks pass in all three variants. Android
+passes 549 tests in each of Debug and Qualification, all three APK assemblies,
+Qualification and Release lint, isolation checks and actual APK manifest/native
+byte/16 KiB alignment verification. The finite Swift ASan/libFuzzer parser run
+completes 65,317 executions without a finding. Kotlin corpus and deterministic
+mutation checks do not establish coverage-guided JVM fuzzing.
+
+Exact local receipts are under `target/manual-destination-links/` (iOS
+`ios-app-v2`, Android `android-app-v3`), with the Swift fuzz receipt under
+`target/ios-manual-destination-fuzz/20261022T220444Z-5359ab2f/`. Failed initial
+checks remain retained: the Android run timed out during final Release lint,
+and Xcode reported stale signed-product paths when switching to unsigned
+outputs. The complete Android retry and stable unsigned iOS retry passed the
+same required checks. Installed OS routing, physical creator acceptance and QR
+camera scanning remain open. No phone, active capture, signing, publication or
+native SDK package changes were made for this link packet.
+
 The first [publishing admission benchmark](sdk-publishing-benchmark.md) passes
 its predeclared paired Release host checks. The measured median added thread
 CPU is about 2.8 microseconds per AAC unit for the actual SDK queue receipt.

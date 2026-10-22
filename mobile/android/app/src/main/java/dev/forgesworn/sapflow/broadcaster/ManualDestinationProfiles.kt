@@ -128,6 +128,7 @@ internal class ManualProfilePicker<T> {
     }
     private var launch: Launch<T>? = null
     fun expectedDeparture(client: Any): Boolean = launch?.let { it.client === client && it.valid } == true
+    val hasOutstanding: Boolean get() = launch != null
     fun outstandingFor(client: Any): Boolean = launch?.client === client
     fun restoreDiscard(client: Any) {
         // A saved marker never restores approval or a secret-bearing draft.
@@ -156,6 +157,7 @@ internal class ManualProfilePicker<T> {
 internal class ManualProfileIOAdmission {
     private val occupied = AtomicBoolean(false)
     private val retained = AtomicBoolean(false)
+    val busy: Boolean get() = occupied.get() || retained.get()
     fun reserve() = !retained.get() && occupied.compareAndSet(false, true)
     fun finish(cleanupComplete: Boolean) {
         if (!cleanupComplete) retained.set(true)

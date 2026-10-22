@@ -142,6 +142,8 @@ class MainActivity : ComponentActivity() {
     private var manualMessage by mutableStateOf<String?>(null)
     private val manualPicker: ManualProfilePicker<Uri> get() = manualIO.picker
     private var manualForeground = false
+    private val manualLinks = ManualLinkInbox.application
+    private var manualInvitation by mutableStateOf<ManualLinkInbox.Invitation?>(null)
     private val importManualDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         manualPicker.returned(runtimeClient, uri)
         if (manualForeground) resumeManualDocument()
@@ -261,6 +263,7 @@ class MainActivity : ComponentActivity() {
                 schedulePoseSettlement()
             }
         }
+        receiveManualLink(intent, newDelivery = savedInstanceState == null)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFFFFAA62), background = Color(0xFF111416))) {
                 BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -270,6 +273,7 @@ class MainActivity : ComponentActivity() {
                         Column(Modifier.fillMaxSize()) { PreviewPane(Modifier.weight(1f).fillMaxWidth()); Controls(Modifier.weight(1f).fillMaxWidth()) }
                     }
                 }
+                ManualLinkInvitation()
                 RecordingLibraryPanel(libraryVisible, libraryEntries, libraryBusy, libraryMessage, captureIdleForFiles(),
                     onDismiss = { libraryVisible = false }, onRefresh = { loadRecordings() },
                     onExport = ::chooseRecordingExport, onCancelExport = ::cancelLibraryOperation)
@@ -321,7 +325,7 @@ class MainActivity : ComponentActivity() {
                             listOf(false to "Video", true to "Microphone").forEach { (audioOnly, label) ->
                                 OutlinedButton(enabled = qualityConfigurable, onClick = {
                                     if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare && microphoneOnly != audioOnly) {
-                                        prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
+                                        manualEdited(); prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
                                         microphoneOnly = audioOnly
                                     }
                                 }) { Text(if (microphoneOnly == audioOnly) "$label selected" else label) }
@@ -329,11 +333,11 @@ class MainActivity : ComponentActivity() {
                         }
                         Text("Microphone input", style = MaterialTheme.typography.labelLarge)
                         OutlinedButton(enabled = qualityConfigurable, onClick = {
-                            if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) selectedAudioInputId = null
+                            if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) { manualEdited(); selectedAudioInputId = null }
                         }) { Text(if (selectedAudioInputId == null) "System Default selected" else "System Default") }
                         audioInputOptions.forEach { input ->
                             OutlinedButton(enabled = qualityConfigurable, onClick = {
-                                if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) selectedAudioInputId = input.id
+                                if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) { manualEdited(); selectedAudioInputId = input.id }
                             }) { Text("${input.name} · ${input.kind}" + if (selectedAudioInputId == input.id) " selected" else "") }
                         }
                         OutlinedButton(enabled = qualityConfigurable, onClick = {
@@ -343,7 +347,7 @@ class MainActivity : ComponentActivity() {
                         Text("Active microphone: ${current?.activeAudioInput ?: "Not verified"}", style = MaterialTheme.typography.bodySmall)
                         if (microphoneOnly) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Checkbox(backgroundAudio, { backgroundAudio = it }, enabled = qualityConfigurable)
+                                Checkbox(backgroundAudio, { manualEdited(); backgroundAudio = it }, enabled = qualityConfigurable)
                                 Text("Continue microphone capture when locked", style = MaterialTheme.typography.bodySmall)
                             }
                             Text("Choose before Prepare. Background capture requires notifications and provides Stop and save.", style = MaterialTheme.typography.bodySmall)
@@ -353,7 +357,7 @@ class MainActivity : ComponentActivity() {
                             if (!microphoneOnly) CaptureProfile.entries.forEach { quality ->
                                 OutlinedButton(enabled = qualityConfigurable, onClick = {
                                     if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare && captureProfile != quality) {
-                                        prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
+                                        manualEdited(); prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
                                         captureProfile = quality
                                     }
                                 }) { Text(if (captureProfile == quality) "${quality.label} selected" else quality.label) }
@@ -428,7 +432,7 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Stop") }
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(checked = recordLocally, onCheckedChange = { recordLocally = it },
+                            Checkbox(checked = recordLocally, onCheckedChange = { manualEdited(); recordLocally = it },
                                 enabled = !preparationPending && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR))
                             Text("Record private MP4 on this device", style = MaterialTheme.typography.bodySmall)
                         }
@@ -506,10 +510,76 @@ class MainActivity : ComponentActivity() {
     }
 
 
+    // Actual process-owned admission, not the delayed Compose capture snapshot.
+    // V4V mode is deliberately not changed by an untrusted native delivery.
+    private fun manualLinkAllowed(foreground: Boolean): Boolean = !useV4v && !isDestroyed &&
+        (!foreground || manualForeground && poseTracking) && !preparationPending && !permissionReplies.outstanding &&
+        ::capture.isInitialized && capture.snapshot().canPrepare && ::recordingLibrary.isInitialized && recordingLibrary.idle &&
+        !libraryVisible && !manualActions.busy && manualActions.review == null && !manualIO.busy && !manualPicker.hasOutstanding
+
+    private fun invalidateManualLink() {
+        manualLinks.invalidate(runtimeClient); manualInvitation = null
+    }
+    private fun receiveManualLink(delivery: Intent?, newDelivery: Boolean = true) {
+        // Never retain an Intent/Uri or put the secret-bearing link in restoration.
+        // singleTask routes subsequent native deliveries to this same owner.
+        val text = try {
+            if (delivery?.action == Intent.ACTION_VIEW) delivery.dataString?.takeIf { it.length <= ManualDestinationEnvelope.MAX_URL_BYTES } else null
+        } finally { delivery?.data = null; intent?.data = null }
+        if (text == null) return
+        // A fresh singleTask delivery can precede onStart/onResume. It may
+        // wait only as an untrusted invitation; restored launch data is refused.
+        val selected = manualLinks.offer(runtimeClient, text, manualLinkAllowed(foreground = false), newDelivery)
+        if (selected == null) {
+            permissionMessage = "The manual destination link was refused. Stop capture and finish any private operation before opening a new link."
+            return
+        }
+        if (manualForeground) manualInvitation = manualLinks.foreground(runtimeClient, manualLinkAllowed(foreground = true))
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        receiveManualLink(intent)
+    }
+    private fun reviewManualLink(selected: ManualLinkInbox.Invitation) {
+        val text = manualLinks.consume(runtimeClient, selected, manualLinkAllowed(foreground = true)) ?: run {
+            if (manualInvitation === selected) manualInvitation = null
+            return
+        }
+        // Consume first, then invalidate old drafts and obtain fresh Apply authority.
+        manualEdited()
+        val ticket = manualTicket() ?: return
+        val deadline = Math.addExact(SystemClock.elapsedRealtimeNanos(), 5_000_000_000L)
+        manualSubmit(ticket, { _ ->
+            val bytes = ManualDestinationEnvelope.decode(text)
+            try { ManualDestinationProfile.parse(bytes) } finally { bytes.fill(0) }
+        }, deadline) { current, active, result ->
+            result.fold(onSuccess = { profile ->
+                if (current.manualActions.reviewed(active, profile, current.manualAllowed())) current.manualReview = current.manualActions.review
+            }, onFailure = {
+                current.manualActions.finish(active, false)
+                current.manualMessage = "The manual destination link could not be validated. Existing fields were preserved."
+            })
+        }
+    }
+    @Composable private fun ManualLinkInvitation() {
+        manualInvitation?.let { selected ->
+            AlertDialog(onDismissRequest = {
+                if (manualInvitation === selected) invalidateManualLink()
+            }, title = { Text("Manual destination received") }, text = {
+                Text("Review the destination before applying it. This does not save a profile or prepare or start capture.")
+            }, confirmButton = {
+                Button(onClick = { reviewManualLink(selected) }) { Text("Review") }
+            }, dismissButton = {
+                OutlinedButton(onClick = { if (manualInvitation === selected) invalidateManualLink() }) { Text("Discard") }
+            })
+        }
+    }
+
     private fun manualAllowed(): Boolean = !useV4v && manualForeground && poseTracking && !isDestroyed && !preparationPending && !permissionReplies.outstanding &&
         ::capture.isInitialized && ::recordingLibrary.isInitialized && recordingLibrary.idle && capture.snapshot().canPrepare
 
     private fun manualEdited() {
+        invalidateManualLink()
         manualPicker.invalidate(runtimeClient)
         manualActions.invalidate(); manualReview = null; manualConsent = false; manualReviewSaved = null
     }
@@ -520,6 +590,7 @@ class MainActivity : ComponentActivity() {
     }
     private fun manualTicket(): ManualProfileActions.Ticket? {
         val ticket = manualActions.begin(manualAllowed()) ?: return null
+        invalidateManualLink()
         manualReview = null; manualConsent = false; manualReviewSaved = null; manualMessage = null; manualBusy = true
         return ticket
     }
@@ -725,6 +796,7 @@ class MainActivity : ComponentActivity() {
     private fun captureIdleForFiles(): Boolean = !preparationPending && ::capture.isInitialized && capture.snapshot().canPrepare
 
     private fun loadRecordings() {
+        manualEdited()
         if (preparationPending) { libraryMessage = "Wait for capture preparation to finish before refreshing."; return }
         val screen = WeakReference(this)
         libraryMessage = null
@@ -738,6 +810,7 @@ class MainActivity : ComponentActivity() {
         if (ticket == null) libraryMessage = "A private file operation is still finishing. Wait before refreshing."
     }
     private fun chooseRecordingExport(entry: RecordingCatalogue.Entry, allowUnverified: Boolean) {
+        manualEdited()
         if (!captureIdleForFiles()) { libraryMessage = "Stop and save capture before opening the document picker."; return }
         val selected = recordingLibrary.select(entry, allowUnverified)
         if (selected == null) { libraryMessage = "Another private file operation is still finishing."; return }
@@ -959,10 +1032,14 @@ class MainActivity : ComponentActivity() {
         ui.post(refresh)
     }
     override fun onResume() {
-        super.onResume(); manualForeground = true; resumeManualDocument()
+        super.onResume(); manualForeground = true
+        manualInvitation = manualLinks.foreground(runtimeClient, manualLinkAllowed(foreground = true))
+        resumeManualDocument()
     }
     override fun onPause() {
+        manualLinks.pause(runtimeClient, manualInvitation != null || manualActions.review != null || manualActions.busy || manualPicker.hasOutstanding)
         manualForeground = false
+        invalidateManualLink()
         if (!manualPicker.expectedDeparture(runtimeClient)) manualEdited()
         super.onPause()
     }
@@ -971,6 +1048,7 @@ class MainActivity : ComponentActivity() {
         super.onSaveInstanceState(outState)
     }
     override fun onStop() {
+        manualLinks.stopped(runtimeClient)
         if (!manualPicker.expectedDeparture(runtimeClient)) manualEdited()
         poseTracking = false
         prepareRequest++

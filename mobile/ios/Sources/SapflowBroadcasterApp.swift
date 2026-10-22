@@ -20,7 +20,7 @@ final class BroadcasterModel: ObservableObject {
     @Published var destinationMode = BroadcasterDestinationMode.recording {
         didSet {
             guard destinationMode != oldValue else { return }
-            manual.invalidate()
+            manual.modeChanged()
             destinationSelection.select(destinationMode)
             updateCreatorActivity()
         }
@@ -32,6 +32,15 @@ final class BroadcasterModel: ObservableObject {
         guard let self else { return false }
         return self.foreground && self.destinationMode == .manual && self.recordingLibrary.captureAllowed &&
             self.engine.canChooseCaptureProfile
+    }, invitationAvailable: { [weak self] in
+        guard let self, self.destinationMode != .v4v else { return false }
+        // Initial library setup can precede onOpenURL/first active. It cannot
+        // reserve capture; retain only the invitation until actual idle review.
+        if !self.recordingLibrary.ready { return !self.recordingLibrary.cleanupRetained }
+        return self.recordingLibrary.captureAllowed && self.engine.canChooseCaptureProfile
+    }, invitationReviewAvailable: { [weak self] in
+        guard let self, self.destinationMode != .v4v else { return false }
+        return self.foreground && self.recordingLibrary.captureAllowed && self.engine.canChooseCaptureProfile
     })
     private lazy var destinationSelection = BroadcasterDestinationSelection { [weak engine] in engine?.cancelPendingPreparation($0) }
     private var hasOrientation = false
@@ -123,8 +132,12 @@ final class BroadcasterModel: ObservableObject {
     }
     var canStart: Bool { recordingLibrary.captureAllowed && snapshot.canStart && (destinationMode != .v4v || creator.canStart) }
     func setForeground(_ active: Bool) {
-        if foreground != active { manual.invalidate() }
+        manual.sceneChanged(active: active)
         foreground = active; _ = engine.setForeground(active); updateCreatorActivity()
+    }
+    func receiveManualLink(_ url: URL) { _ = manual.receiveInvitation(url.absoluteString) }
+    func reviewManualLink(_ ticket: ManualDestinationSettings.Ticket) {
+        _ = manual.reviewInvitation(ticket) { destinationMode = .manual }
     }
     private func updateCreatorActivity() {
         updateCreatorCapture()
@@ -292,6 +305,7 @@ struct BroadcasterView: View {
             }
         }
         .onDisappear { UIDevice.current.endGeneratingDeviceOrientationNotifications() }
+        .onOpenURL { model.receiveManualLink($0) }
         .onChange(of: scenePhase) { phase in
             if let active = AudioShowLifecycle.sceneVisibility(active: phase == .active, background: phase == .background) {
                 model.setForeground(active)
@@ -382,6 +396,17 @@ struct BroadcasterView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 ProgressView(value: Double(model.snapshot.level + 60), total: 60).accessibilityLabel("Microphone level")
                 Text("Mic \(Int(model.snapshot.level)) dBFS · encoded \(model.snapshot.encoded) · capture drops \(model.snapshot.captureDrops)").font(.caption.monospacedDigit())
+                if let invitation = manual.invitation {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Manual destination invitation").font(.headline)
+                        Text("This link contains untrusted settings. Review may select Manual mode; nothing is applied or started.").font(.caption)
+                        HStack {
+                            Button("Review") { model.reviewManualLink(invitation) }.disabled(!manual.canReviewInvitation)
+                                .accessibilityIdentifier("destination.link-review")
+                            Button("Dismiss", role: .cancel) { manual.cancelInvitation(invitation) }
+                        }
+                    }.padding(10).background(.thinMaterial).clipShape(RoundedRectangle(cornerRadius: 8))
+                }
                 destinationForm
                 Picker("Microphone input", selection: Binding(get: { model.selectedAudioInputID }, set: { model.selectAudioInput($0) })) {
                     Text("System Default").tag(String?.none)

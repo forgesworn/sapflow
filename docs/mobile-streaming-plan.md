@@ -420,9 +420,11 @@ Test advertised 1080p30 profiles against the same sustained quality and resource
 requirements. Engineering capacity results alone do not add a supported preset.
 
 The [version 1 manual profile contract](manual-destination-profiles.md) covers
-saved destinations and reviewed JSON file import. QR and deep-link handling,
-physical document-provider behaviour and the remaining B4R controls retain
-their own implementation and acceptance gates.
+saved destinations and reviewed JSON file import. The
+[manual link contract](manual-destination-links.md) adds implemented native
+invitations using the same explicit Review and Apply flow. QR camera scanning
+remains to implement. Installed link routing, physical document-provider
+behaviour and the remaining B4R controls retain their own acceptance gates.
 
 The [native orientation contract](capture-orientation.md) separates the default
 Automatic behaviour from a fixed mounting choice frozen before Prepare, and

@@ -13,10 +13,16 @@
     </queries>
     <application android:allowBackup="false" android:label="Sapflow" android:theme="@style/AppTheme" android:supportsRtl="true">
         <service android:name=".AudioBroadcastService" android:exported="false" android:foregroundServiceType="microphone" android:stopWithTask="false" />
-        <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="fullSensor" android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout">
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask" android:screenOrientation="fullSensor" android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="sapflow-manual" android:host="import" android:path="/v1" />
             </intent-filter>
         </activity>
     </application>
