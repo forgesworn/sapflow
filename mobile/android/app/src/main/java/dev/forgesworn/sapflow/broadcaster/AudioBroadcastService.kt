@@ -20,6 +20,8 @@ import android.os.Looper
  * A delivered Intent never creates a capture controller or reconstructs a show. */
 class AudioBroadcastService : Service() {
     private val main = Handler(Looper.getMainLooper())
+    // The existing coalesced cold check also renews only the exact eligible
+    // owner's timed partial wake lease. No media/UI callback drives renewal.
     private val check: Runnable = Runnable { lifecycle.check() }
     private val lifecycle: AudioBroadcastLifecycle<BackgroundAudioPolicy.Owner> = AudioBroadcastLifecycle(
         object : AudioBroadcastLifecycle.Owners<BackgroundAudioPolicy.Owner> {

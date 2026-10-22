@@ -11,15 +11,21 @@ independently paced replacement picture and silence, explicit Resume and
 matching recording. Its app integration remains under qualification. Cold AAC replacement needs
 per-generation timing and recording proof before native integration.
 
-The reviewed Android runtime candidate passes the offline Debug and
-Qualification app suites: 521 tests in 62 suites each, with no failures, errors
-or skips. All three APK assemblies, lint, qualification isolation, exact native
-library matching and 16 KiB ZIP/ELF alignment pass. Independent source review
-clears the cancellation, stale Resume, native-fault fencing and preview-only
-surface-loss repairs. Sustained screen-lock standby still needs explicit power
-ownership after microphone capture closes. Native codec/GPU and physical
-acceptance remain open. Source and app receipts are retained under
-`target/camera-controls/android-standby-runtime-v3/`.
+The reviewed Android runtime candidate now includes a timed partial wake lease
+for the existing, explicitly authorised microphone-only background service.
+Only the exact promoted capture owner may acquire it; the existing cold service
+check renews it against its original BOOTTIME deadline. Stop, authority loss,
+expiry and destruction close it separately from retained recorder/publisher
+cleanup. Standby grants no additional background authority.
+
+Debug and Qualification each pass 535 tests in 63 suites with no failures,
+errors or skips. All three APK assemblies, lint, qualification isolation, exact
+native library matching and 16 KiB ZIP/ELF alignment pass. Independent source
+review is clear for the runtime and wake lease. Actual locked-screen, Doze,
+codec/GPU, sustained power/thermal and physical acceptance remain open. Source
+and app receipts are retained under
+`target/camera-controls/android-standby-runtime-v3/` and
+`target/camera-controls/android-audio-wake-v1/`.
 
 The actual iOS encoder/recorder candidate exercises three AAC generations with
 explicit Resume, exact payload retention and independently pinned source
@@ -46,6 +52,23 @@ Apple, four-ABI Android and ARM64 development packages are rebuilt and their
 installed ownership consumers pass. These SDK gates do not qualify the pending
 native standby adapters or a physical phone. Evidence is retained under
 `target/privacy-standby/sdk-fences-v1/`.
+
+The latest upstream merge is pinned to `9f75eaa`, adding optional SRT encryption
+and clean SIGTERM shutdown. The merged workspace passes 631 tests with four
+normally ignored, strict all-target Clippy, formatting and locked compilation of
+all fuzz targets. The generated SRT/RTMP smoke passes independent HLS decoding,
+callbacks, retained reconnect recording, encrypted/unencrypted optional SRT,
+wrong-passphrase refusal and SIGTERM. The trial plan retains complete-show
+qualification before selecting our app. Evidence is retained under
+`target/mobile-origin-integration/v4/`; this merge did not rebuild the earlier
+native SDK packages or qualify a phone or deployment.
+
+The current iOS recording/encoder candidate also compiles all three unsigned
+app configurations and the actual Debug test bundle with compiler warnings as
+errors. Required-reason resources verify in all three products. This is compile
+evidence only: the bundle was not executed on a phone, and the independent A/V
+presentation gate above remains failed. Receipts are retained under
+`target/privacy-standby/ios-app-current/`.
 
 The preceding single-generation macOS AAC snapshot passes the unchanged strict
 stored-payload and presentation oracles for six recording cases. Native output
@@ -113,7 +136,7 @@ used. Physical source switching, preview/decoded geometry, controls, audio and
 recording continuity remain open, alongside standby, QR/deep-link and other
 B4R/B5 work. This does not claim a performance advantage over another app.
 
-The latest upstream integration is pinned to `004be18`. RTMP now lives in
+The preceding upstream integration is pinned to `004be18`. RTMP now lives in
 `sapflow-rtmp`; its publishing client and receiver retain this branch's bounded
 queues, explicit audio-only topology and terminal semantics. `TrackSet` lives
 in runtime-free `sapflow-core`, with the existing HLS exports retained, avoiding
