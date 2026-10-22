@@ -12,6 +12,8 @@ import android.view.OrientationEventListener
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.CancellationSignal
+import android.os.SystemClock
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -37,6 +39,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.LinearProgressIndicator
@@ -123,6 +126,22 @@ class MainActivity : ComponentActivity() {
     private var useSrt by mutableStateOf(false)
     private var srtPassphrase by mutableStateOf("")
     private var srtPlaintextLab by mutableStateOf(false)
+    private val manualActions = ManualProfileActions()
+    private lateinit var manualIO: ManualDestinationProfileIO
+    private var manualBusy by mutableStateOf(false)
+    private var manualName by mutableStateOf("")
+    private var manualSaved by mutableStateOf<List<ManualDestinationProfiles.Saved>>(emptyList())
+    private var manualSelected: String? = null
+    private var manualReview by mutableStateOf<ManualProfileActions.Review?>(null)
+    private var manualReviewSaved: String? = null
+    private var manualConsent by mutableStateOf(false)
+    private var manualMessage by mutableStateOf<String?>(null)
+    private val manualPicker: ManualProfilePicker<Uri> get() = manualIO.picker
+    private var manualForeground = false
+    private val importManualDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        manualPicker.returned(runtimeClient, uri)
+        if (manualForeground) resumeManualDocument()
+    }
     private var recordLocally by mutableStateOf(true)
     private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
     private var microphoneOnly by mutableStateOf(false)
@@ -197,6 +216,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        manualIO = ManualDestinationProfileIO.application(applicationContext)
+        if (savedInstanceState?.getBoolean("sapflow.manual-picker.discard") == true) manualPicker.restoreDiscard(runtimeClient)
         audioOwner = AudioBroadcastOwner.application(applicationContext)
         capture = audioOwner.capture
         preparedCapture = capture.currentPreparation()
@@ -375,40 +396,41 @@ class MainActivity : ComponentActivity() {
                         V4vControls(configurable)
                         Text("Manual destination · bounded reconnect", style = MaterialTheme.typography.labelMedium)
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(checked = useSrt, onCheckedChange = { useSrt = it }, enabled = configurable)
+                            Checkbox(checked = useSrt, onCheckedChange = { manualEdited(); useSrt = it }, enabled = configurable && !useV4v)
                             Text("Use SRT over UDP", style = MaterialTheme.typography.bodySmall)
                         }
                         OutlinedTextField(
-                            value = destinationUrl, onValueChange = { destinationUrl = it.take(4096) },
+                            value = destinationUrl, onValueChange = { manualEdited(); destinationUrl = it.take(4096) },
                             label = { Text(if (useSrt) "SRT numeric address and port" else "RTMPS application URL") },
                             placeholder = { Text(if (useSrt) "srt://192.0.2.1:8890" else "rtmps://origin.invalid/live") },
-                            enabled = configurable, singleLine = true,
+                            enabled = configurable && !useV4v, singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
                         OutlinedTextField(
-                            value = destinationKey, onValueChange = { destinationKey = it.take(4096) },
+                            value = destinationKey, onValueChange = { manualEdited(); destinationKey = it.take(4096) },
                             label = { Text(if (useSrt) "SRT stream ID (optional)" else "Stream key") }, visualTransformation = PasswordVisualTransformation(),
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                            enabled = configurable, singleLine = true,
+                            enabled = configurable && !useV4v, singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
                         if (useSrt) {
                             OutlinedTextField(
-                                value = srtPassphrase, onValueChange = { srtPassphrase = it.take(79) },
+                                value = srtPassphrase, onValueChange = { manualEdited(); srtPassphrase = it.take(79) },
                                 label = { Text("AES-256 passphrase · 10 to 79 bytes") },
                                 visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                                enabled = configurable, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                                enabled = configurable && !useV4v, singleLine = true, modifier = Modifier.fillMaxWidth(),
                             )
                             Row {
-                                Checkbox(checked = srtPlaintextLab, onCheckedChange = { srtPlaintextLab = it }, enabled = configurable)
+                                Checkbox(checked = srtPlaintextLab, onCheckedChange = { manualEdited(); srtPlaintextLab = it }, enabled = configurable && !useV4v)
                                 Text("Plaintext SRT lab only · clear passphrase", style = MaterialTheme.typography.bodySmall)
                             }
                         } else {
                             Row {
-                                Checkbox(checked = allowPlaintextDevelopment, onCheckedChange = { allowPlaintextDevelopment = it }, enabled = configurable)
+                                Checkbox(checked = allowPlaintextDevelopment, onCheckedChange = { manualEdited(); allowPlaintextDevelopment = it }, enabled = configurable && !useV4v)
                                 Text("Allow plaintext RTMP for development", style = MaterialTheme.typography.bodySmall)
                             }
                         }
+                        ManualProfileControls(configurable && !useV4v)
                         Text("Leave blank for SDK validation only. No transport downgrade.", style = MaterialTheme.typography.bodySmall)
                         Text("Video: ${current?.videoEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
                         Text("Audio: ${current?.audioEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
@@ -416,6 +438,148 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+
+    private fun manualAllowed(): Boolean = !useV4v && manualForeground && poseTracking && !isDestroyed && !preparationPending && !permissionReplies.outstanding &&
+        ::capture.isInitialized && ::recordingLibrary.isInitialized && recordingLibrary.idle && capture.snapshot().canPrepare
+
+    private fun manualEdited() {
+        manualPicker.invalidate(runtimeClient)
+        manualActions.invalidate(); manualReview = null; manualConsent = false; manualReviewSaved = null
+    }
+    private fun dismissManualReview(selected: ManualProfileActions.Review) {
+        if (manualActions.cancel(selected)) {
+            manualReview = null; manualConsent = false; manualReviewSaved = null
+        }
+    }
+    private fun manualTicket(): ManualProfileActions.Ticket? {
+        val ticket = manualActions.begin(manualAllowed()) ?: return null
+        manualReview = null; manualConsent = false; manualReviewSaved = null; manualMessage = null; manualBusy = true
+        return ticket
+    }
+    private fun <T> manualSubmit(ticket: ManualProfileActions.Ticket, action: (ManualDestinationProfiles) -> T,
+        deadlineNs: Long? = null, cancel: (() -> Unit)? = null,
+        reply: (MainActivity, ManualProfileActions.Ticket, Result<T>) -> Unit) {
+        val screen = WeakReference(this)
+        val actions = manualActions
+        if (!manualIO.submit({ store -> check(actions.current(ticket, true)); action(store) }, deadlineNs, cancel) { result ->
+            val current = screen.get() ?: return@submit
+            if (current.manualActions.current(ticket, current.manualAllowed())) reply(current, ticket, result)
+            else current.manualActions.finish(ticket, false)
+            current.manualBusy = current.manualActions.busy
+        }) {
+            manualActions.finish(ticket, false); manualBusy = false
+            manualMessage = "A destination file operation is still finishing. Wait before trying again."
+        }
+    }
+    private fun refreshManualProfiles() {
+        val ticket = manualTicket() ?: return
+        manualSubmit(ticket, { it.list() }) { current, active, result ->
+            if (current.manualActions.finish(active, current.manualAllowed())) result.fold(
+                onSuccess = { current.manualSaved = it }, onFailure = { current.manualMessage = "Saved destinations could not be read. Existing data was preserved." })
+        }
+    }
+    private fun saveManualProfile() {
+        if (!manualAllowed()) return
+        val profile = try { ManualDestinationProfile.fields(manualName, if (useSrt) "srt" else "rtmp", destinationUrl,
+            if (useSrt) "" else destinationKey, if (useSrt) destinationKey else "", if (useSrt) srtPassphrase else "",
+            if (useSrt) srtPlaintextLab else allowPlaintextDevelopment) }
+        catch (_: Exception) { manualMessage = "Check the profile name, destination and separate credentials before saving."; return }
+        val selected = manualSelected
+        val ticket = manualTicket() ?: return
+        manualSubmit(ticket, { store -> val id = store.save(selected, profile); id to store.list() }) { current, active, result ->
+            if (current.manualActions.finish(active, current.manualAllowed())) result.fold(onSuccess = {
+                current.manualSelected = it.first; current.manualSaved = it.second; current.manualMessage = "Destination saved on this device."
+            }, onFailure = { current.manualMessage = "The saved action could not be confirmed. Check saved profiles before retrying." })
+        }
+    }
+    private fun loadManualProfile(id: String) {
+        val ticket = manualTicket() ?: return
+        manualSubmit(ticket, { it.load(id) }) { current, active, result ->
+            result.fold(onSuccess = { profile ->
+                if (current.manualActions.reviewed(active, profile, current.manualAllowed())) {
+                    current.manualReview = current.manualActions.review; current.manualReviewSaved = id
+                }
+            }, onFailure = {
+                current.manualActions.finish(active, false); current.manualMessage = "The saved destination could not be loaded. Existing data was preserved."
+            })
+        }
+    }
+    private fun deleteManualProfile() {
+        val selected = manualSelected ?: return
+        val ticket = manualTicket() ?: return
+        manualSubmit(ticket, { store -> store.delete(selected); store.list() }) { current, active, result ->
+            if (current.manualActions.finish(active, current.manualAllowed())) result.fold(onSuccess = {
+                current.manualSelected = null; current.manualSaved = it; current.manualMessage = "Saved destination deleted."
+            }, onFailure = { current.manualMessage = "The delete action could not be confirmed. Check saved profiles before retrying." })
+        }
+    }
+    private fun chooseManualDocument() {
+        val ticket = manualTicket() ?: return
+        if (!manualPicker.begin(runtimeClient, ticket)) {
+            manualActions.finish(ticket, false); manualBusy = false; manualMessage = "An earlier document picker is still pending. Close it before importing again."; return
+        }
+        try { importManualDocument.launch(arrayOf("application/json")) }
+        catch (_: Exception) { manualPicker.returned(runtimeClient, null); manualPicker.resume(runtimeClient, false); manualActions.finish(ticket, false); manualBusy = false; manualMessage = "The document picker could not open." }
+    }
+    private fun resumeManualDocument() {
+        val delivery = manualPicker.resume(runtimeClient, manualAllowed()) ?: return
+        val ticket = delivery.ticket ?: return
+        val uri = delivery.value
+        if (!delivery.valid || uri == null || uri.scheme != "content" || !manualActions.current(ticket, manualAllowed())) {
+            manualActions.finish(ticket, false); manualBusy = manualActions.busy; return
+        }
+        val io = manualIO
+        val deadline = Math.addExact(SystemClock.elapsedRealtimeNanos(), 5_000_000_000L)
+        val signal = CancellationSignal()
+        manualSubmit(ticket, { io.readDocument(uri, deadline, signal) }, deadline, { signal.cancel() }) { current, active, result ->
+            result.fold(onSuccess = { profile ->
+                if (current.manualActions.reviewed(active, profile, current.manualAllowed())) current.manualReview = current.manualActions.review
+            }, onFailure = {
+                current.manualActions.finish(active, false); current.manualMessage = "The selected document could not be validated. Wait for any pending file cleanup before trying again."
+            })
+        }
+    }
+    @Composable private fun ManualProfileControls(configurable: Boolean) {
+        OutlinedTextField(value = manualName, onValueChange = { manualEdited(); manualName = it.take(48) }, label = { Text("Profile name") },
+            enabled = configurable, singleLine = true, modifier = Modifier.fillMaxWidth())
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(enabled = configurable && !manualBusy, onClick = { saveManualProfile() }) { Text("Save") }
+            OutlinedButton(enabled = configurable && !manualBusy && manualSelected != null, onClick = { deleteManualProfile() }) { Text("Delete saved") }
+        }
+        OutlinedButton(enabled = configurable && !manualBusy, onClick = { refreshManualProfiles() }) { Text("Load saved destinations") }
+        manualSaved.forEach { saved -> OutlinedButton(enabled = configurable && !manualBusy, onClick = { loadManualProfile(saved.id) }) { Text("Load ${saved.name}") } }
+        OutlinedButton(enabled = configurable && !manualBusy, onClick = { chooseManualDocument() }) { Text("Import reviewed JSON file") }
+        manualMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        if (manualBusy) Text("Destination file operation pending", style = MaterialTheme.typography.bodySmall)
+        manualReview?.let { selected ->
+            val review = selected.profile.review
+            AlertDialog(onDismissRequest = { dismissManualReview(selected) }, title = { Text("Review manual destination") }, text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${if (review.transport == "srt") "SRT" else "RTMP"} · ${review.security}")
+                    Text("${if (review.host.contains(':')) "[${review.host}]" else review.host}:${review.port}")
+                    Text("Apply changes fields only. Save and Prepare remain separate actions.")
+                    if (review.plaintext) Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(manualConsent, { if (manualActions.setConsent(selected, it)) manualConsent = it }); Text("I allow this unencrypted destination")
+                    }
+                }
+            }, confirmButton = {
+                Button(enabled = configurable && (!review.plaintext || manualConsent), onClick = {
+                    val saved = manualReviewSaved
+                    val applied = manualActions.apply(selected, manualAllowed()) { profile ->
+                        useSrt = profile.transport == "srt"; destinationUrl = profile.endpoint
+                        destinationKey = if (useSrt) profile.streamID else profile.streamKey
+                        srtPassphrase = if (useSrt) profile.passphrase else ""
+                        // A secure imported endpoint never grants future plaintext consent.
+                        srtPlaintextLab = useSrt && profile.review.plaintext
+                        allowPlaintextDevelopment = !useSrt && profile.review.plaintext
+                        manualName = if (saved == null) "" else profile.name
+                        manualSelected = saved
+                    }
+                    if (applied && manualReview === selected) { manualReview = null; manualConsent = false; manualReviewSaved = null }
+                }) { Text("Apply") }
+            }, dismissButton = { OutlinedButton(onClick = { dismissManualReview(selected) }) { Text("Cancel") } })
+        }
+    }
 
     private fun startWithAuth() {
         val captureIntent = preparedCapture ?: return
@@ -454,7 +618,7 @@ class MainActivity : ComponentActivity() {
         val owner = v4v
         if (owner == null) { Text("V4V sign-in is unavailable in this build", style = MaterialTheme.typography.bodySmall); return }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(useV4v, { prepareRequest++; useV4v = it }, enabled = configurable)
+            Checkbox(useV4v, { manualEdited(); prepareRequest++; useV4v = it }, enabled = configurable)
             Text("Use approved V4V connector", style = MaterialTheme.typography.bodySmall)
         }
         if (!useV4v) return
@@ -561,6 +725,7 @@ class MainActivity : ComponentActivity() {
 
     private fun prepareWithPermissions() {
         if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
+        manualEdited()
         val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo)
         pendingPreparation = intent; preparationPending = true
         val needed = preparationPermissions(intent).toTypedArray()
@@ -661,7 +826,20 @@ class MainActivity : ComponentActivity() {
         if (orientation.canDetectOrientation()) orientation.enable()
         ui.post(refresh)
     }
+    override fun onResume() {
+        super.onResume(); manualForeground = true; resumeManualDocument()
+    }
+    override fun onPause() {
+        manualForeground = false
+        if (!manualPicker.expectedDeparture(runtimeClient)) manualEdited()
+        super.onPause()
+    }
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("sapflow.manual-picker.discard", manualPicker.outstandingFor(runtimeClient))
+        super.onSaveInstanceState(outState)
+    }
     override fun onStop() {
+        if (!manualPicker.expectedDeparture(runtimeClient)) manualEdited()
         poseTracking = false
         prepareRequest++
         cancelPreparation()
@@ -679,5 +857,5 @@ class MainActivity : ComponentActivity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
-    override fun onDestroy() { libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); super.onDestroy() }
+    override fun onDestroy() { manualEdited(); libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); super.onDestroy() }
 }

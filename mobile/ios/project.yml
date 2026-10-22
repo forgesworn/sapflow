@@ -60,7 +60,10 @@ targets:
   SapflowBroadcasterTests:
     type: bundle.unit-test
     platform: iOS
-    sources: [Tests]
+    sources:
+      - path: Tests
+      - path: ../../tests/fixtures/manual-destination-v1.json
+        buildPhase: resources
     dependencies:
       - target: SapflowBroadcaster
     settings:

@@ -5,6 +5,50 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The current source adds
+[saved manual destinations and reviewed JSON file import](manual-destination-profiles.md)
+on both platforms. Android stores up to 16 profiles in a separate Keystore-backed
+encrypted document. Both importers enforce one 16 KiB versioned format, present
+only validated host/port/security for review, require independent plaintext
+permission and keep Apply separate from Save, Prepare and Start. Exact import
+tickets and actual capture availability reject stale replies. Android retains
+its own document picker's ticket through the expected external-activity
+departure, defers reading until foreground return and prevents an old result
+from being adopted by a recreated activity. V4V configuration and scoped grants
+remain outside manual imports.
+
+Independent review also exposed and this packet repairs two existing iOS
+credential-pairing seams. New Keychain values bind the secret to its exact
+profile identity, endpoint, transport and plaintext setting, so interrupted
+metadata/protected writes cannot pair an old peer with a new secret. Resolution
+also checks the exact cached profile selected by the caller against fresh
+metadata. Historical raw secrets remain readable until their next explicit
+Save upgrades them; their original endpoint binding cannot be reconstructed.
+Corrupt profile metadata now fails visibly instead of becoming an empty list.
+QR/deep-link import, physical document providers, Keychain/Keystore, crash
+durability and the remaining B4R controls retain separate gates.
+
+The reviewed profile packet passes 25 focused Swift tests and the existing
+159-test capture/control suite, with an iOS 16 typecheck and all three unsigned
+app configurations built with Swift warnings treated as errors. The actual
+Debug unit-test bundle compiles and contains a byte-identical copy of the
+64-case shared profile corpus; the iOS bundle was not executed. Android passes
+25 focused host and actual Gradle tests, then 410 tests in 54 suites in each of
+Debug and Qualification, with zero failures, errors or skips. All three APKs,
+qualification/release isolation, actual ARM64 native libraries, 16 KiB ZIP/ELF
+alignment and required iOS privacy resources pass. Qualification/Release lint
+has zero errors and the existing 14/13 warnings. Finite seeded mutation checks
+cover 1,024 Swift and 2,048 Kotlin inputs; these are not long-fuzz acceptance.
+
+The first full Android lint run correctly refused two calls requiring API 30.
+The repaired implementation keeps API 29, uses a five-second logical timeout
+and retains its IO slot until real read/close and any begun cancellation finish.
+Independent review is clear on the final source. Receipts remain under
+`target/manual-destination-ios/v2/` and
+`target/manual-destination-profiles/android-v3/`; the original lint failure is
+retained under `android-v2/`. No device installation, app launch, private media,
+real provider, live service or signer action was exercised by these gates.
+
 The current source adds the first background slice of the
 [native microphone-only mode](audio-only-mobile.md) on iOS and Android. Its
 immutable intent follows permissions, storage, grant admission, Start, reconnect,

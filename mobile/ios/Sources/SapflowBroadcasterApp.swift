@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 @main
 struct SapflowBroadcasterApp: App {
@@ -15,6 +16,7 @@ final class BroadcasterModel: ObservableObject {
     @Published var destinationMode = BroadcasterDestinationMode.recording {
         didSet {
             guard destinationMode != oldValue else { return }
+            manual.invalidate()
             destinationSelection.select(destinationMode)
             updateCreatorActivity()
         }
@@ -22,18 +24,11 @@ final class BroadcasterModel: ObservableObject {
     @Published private(set) var creator = V4vCreatorOwner.Snapshot()
     @Published private(set) var creatorSetupError: String?
     @Published var bunkerURI = ""
-    @Published var transport = ManualTransport.rtmp
-    @Published var endpoint = ""
-    @Published var srtStreamID = ""
-    @Published var srtPassphrase = ""
-    @Published var srtPlaintext = false
-    @Published var streamKey = ""
-    @Published var profileName = ""
-    @Published var allowPlaintext = false
-    @Published var profiles: [SavedDestinationProfile] = []
-    @Published var selectedProfile: UUID?
-    @Published var destinationError: String?
-    private let profileStore = DestinationProfileStore()
+    lazy var manual = ManualDestinationSettings(available: { [weak self] in
+        guard let self else { return false }
+        return self.foreground && self.destinationMode == .manual && self.recordingLibrary.captureAllowed &&
+            self.engine.canChooseCaptureProfile
+    })
     private lazy var destinationSelection = BroadcasterDestinationSelection { [weak engine] in engine?.cancelPendingPreparation($0) }
     private var hasOrientation = false
     private var foreground = false
@@ -43,10 +38,10 @@ final class BroadcasterModel: ObservableObject {
     let engine = CaptureEngine()
     let recordingLibrary = RecordingLibraryOwner()
     init() {
-        profiles = profileStore.load()
+        _ = manual
         engine.onChange = { [weak self] snapshot in
             guard let self else { return }
-            self.snapshot = snapshot; self.updateCreatorActivity()
+            self.snapshot = snapshot; self.manual.captureChanged(); self.updateCreatorActivity()
         }
         // App-lifetime ownership, independent of navigation/view disappearance.
         let centre = NotificationCenter.default
@@ -92,7 +87,10 @@ final class BroadcasterModel: ObservableObject {
         recordingLibrary.captureAllowed && engine.canReservePreparation && !captureBusy && !snapshot.canStart && (destinationMode != .v4v || creator.canPrepare)
     }
     var canStart: Bool { recordingLibrary.captureAllowed && snapshot.canStart && (destinationMode != .v4v || creator.canStart) }
-    func setForeground(_ active: Bool) { foreground = active; _ = engine.setForeground(active); updateCreatorActivity() }
+    func setForeground(_ active: Bool) {
+        if foreground != active { manual.invalidate() }
+        foreground = active; _ = engine.setForeground(active); updateCreatorActivity()
+    }
     private func updateCreatorActivity() {
         updateCreatorCapture()
         if let creatorOwner {
@@ -145,19 +143,20 @@ final class BroadcasterModel: ObservableObject {
     }
     func prepare() {
         guard canPrepare else { return }
+        manual.invalidate()
         if destinationMode == .v4v { updateOrientation(); creatorOwner?.prepare(captureProfile: captureProfile); return }
         guard let ticket = engine.reservePreparation(profile: captureProfile) else { return }
         guard destinationSelection.reserve(ticket) else { engine.abandonPreparation(ticket); return }
         updateOrientation()
         do {
-            destinationError = nil
+
             let sink: EncodedPublishingSink?
             if recordingOnly { sink = nil }
-            else if transport == .srt {
-                let destination = try srtDestination()
+            else if manual.transport == .srt {
+                let destination = try manual.srtDestination()
                 sink = try ReconnectingPublisher(source: .srtPeerAcknowledgedWatermark, hasVideo: ticket.profile.hasVideo) { ManualSrtPublisher(destination: destination, hasVideo: ticket.profile.hasVideo, observe: $0) }
             } else {
-                let destination = try destination()
+                let destination = try manual.rtmpDestination()
                 sink = try ReconnectingPublisher(source: .rtmpPeerAcknowledgedWatermark, hasVideo: ticket.profile.hasVideo) { ManualRtmpPublisher(destination: destination, hasVideo: ticket.profile.hasVideo, observe: $0) }
             }
             if let sink, !destinationSelection.installManual(ticket, end: { sink.endDestination() }) {
@@ -171,47 +170,10 @@ final class BroadcasterModel: ObservableObject {
         } catch {
             engine.abandonPreparation(ticket)
             destinationSelection.forgetFailedReservation(ticket)
-            destinationError = error.localizedDescription
+            manual.reportInvalidDestination()
         }
     }
-    private func destination() throws -> ManualDestination {
-        try ManualDestination(endpoint: endpoint, streamKey: streamKey, allowPlaintext: allowPlaintext)
-    }
-    private func srtDestination() throws -> ManualSrtDestination {
-        try ManualSrtDestination(endpoint: endpoint, streamID: srtStreamID, passphrase: srtPassphrase, allowPlaintext: srtPlaintext)
-    }
-    func loadProfile(_ id: UUID?) {
-        guard let id, let profile = profiles.first(where: { $0.id == id }) else { return }
-        do {
-            if profile.transport == "srt" {
-                let secret = try profileStore.srtSecret(for: id)
-                transport = .srt; srtStreamID = secret.streamID; srtPassphrase = secret.passphrase
-                srtPlaintext = profile.allowPlaintext
-            } else {
-                transport = .rtmp; streamKey = try profileStore.key(for: id)
-                allowPlaintext = profile.allowPlaintext
-            }
-            endpoint = profile.endpoint
-            profileName = profile.name; destinationMode = .manual; destinationError = nil
-        } catch { streamKey = ""; destinationError = error.localizedDescription }
-    }
-    func saveProfile() {
-        do {
-            if transport == .srt {
-                selectedProfile = try profileStore.saveSrt(id: selectedProfile, name: profileName, destination: srtDestination(), allowPlaintext: srtPlaintext)
-            } else {
-                selectedProfile = try profileStore.save(id: selectedProfile, name: profileName, destination: destination(), allowPlaintext: allowPlaintext)
-            }
-            profiles = profileStore.load(); destinationError = nil
-        } catch { destinationError = error.localizedDescription }
-    }
-    func deleteProfile() {
-        guard let selectedProfile else { return }
-        do {
-            try profileStore.delete(selectedProfile)
-            profiles = profileStore.load(); self.selectedProfile = nil; streamKey = ""; srtStreamID = ""; srtPassphrase = ""; destinationError = nil
-        } catch { destinationError = error.localizedDescription }
-    }
+
 }
 
 struct CameraPreview: UIViewRepresentable {
@@ -238,6 +200,7 @@ struct CameraPreview: UIViewRepresentable {
 struct BroadcasterView: View {
     @ObservedObject var model: BroadcasterModel
     @ObservedObject private var recordings: RecordingLibraryOwner
+    @ObservedObject private var manual: ManualDestinationSettings
     @Environment(\.scenePhase) private var scenePhase
     @State private var confirmEnd = false
     @State private var confirmEndExisting = false
@@ -246,6 +209,7 @@ struct BroadcasterView: View {
     init(model: BroadcasterModel) {
         self.model = model
         _recordings = ObservedObject(wrappedValue: model.recordingLibrary)
+        _manual = ObservedObject(wrappedValue: model.manual)
     }
     private var controlsLocked: Bool { model.captureBusy || model.snapshot.canStart || !recordings.captureAllowed }
     var body: some View {
@@ -352,7 +316,7 @@ struct BroadcasterView: View {
                 Picker("Capture mode and quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
                     ForEach(model.captureProfiles, id: \.self) { Text($0.label).tag($0) }
                 }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.quality")
-                if model.destinationMode == .manual, let error = model.destinationError {
+                if model.destinationMode == .manual, let error = manual.error {
                     Text(error).font(.caption).foregroundStyle(.red)
                 }
                 HStack {
@@ -452,42 +416,84 @@ struct BroadcasterView: View {
     private var manualForm: some View {
         Group {
             Text("Manual destination · bounded automatic reconnect").font(.caption.bold())
-            if !model.profiles.isEmpty {
-                Picker("Saved profile", selection: $model.selectedProfile) {
+            Button("Import destination JSON") { _ = manual.beginImport() }.disabled(!manual.canEdit)
+                .accessibilityIdentifier("destination.import")
+            if let ticket = manual.presentation { ManualDestinationFilePresentation(settings: manual, ticket: ticket).id(ticket.id) }
+            if let review = manual.review { ManualDestinationImportReview(settings: manual, review: review).id(review.id) }
+            if !manual.profiles.isEmpty {
+                Picker("Saved profile", selection: $manual.selectedProfile) {
                     Text("Unsaved destination").tag(Optional<UUID>.none)
-                    ForEach(model.profiles) { profile in Text(profile.name).tag(Optional(profile.id)) }
-                }.onChange(of: model.selectedProfile) { model.loadProfile($0) }
+                    ForEach(manual.profiles) { profile in Text(profile.name).tag(Optional(profile.id)) }
+                }.onChange(of: manual.selectedProfile) { manual.loadProfile($0) }
             }
-            Picker("Transport", selection: $model.transport) {
+            Picker("Transport", selection: $manual.transport) {
                 Text("RTMPS / RTMP").tag(ManualTransport.rtmp)
                 Text("SRT caller").tag(ManualTransport.srt)
             }.pickerStyle(.segmented)
-            if model.transport == .srt {
-                TextField("srt://192.0.2.1:9000", text: $model.endpoint).accessibilityIdentifier("destination.endpoint")
+            if manual.transport == .srt {
+                TextField("srt://192.0.2.1:9000", text: $manual.endpoint).accessibilityIdentifier("destination.endpoint")
                     .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL).textFieldStyle(.roundedBorder)
-                SecureField("SRT stream ID (optional)", text: $model.srtStreamID).accessibilityIdentifier("destination.srt-stream-id")
+                SecureField("SRT stream ID (optional)", text: $manual.srtStreamID).accessibilityIdentifier("destination.srt-stream-id")
                     .textInputAutocapitalization(.never).autocorrectionDisabled().textFieldStyle(.roundedBorder).privacySensitive()
-                SecureField("SRT passphrase", text: $model.srtPassphrase).accessibilityIdentifier("destination.srt-passphrase")
+                SecureField("SRT passphrase", text: $manual.srtPassphrase).accessibilityIdentifier("destination.srt-passphrase")
                     .textInputAutocapitalization(.never).autocorrectionDisabled().textFieldStyle(.roundedBorder).privacySensitive()
-                Toggle("Explicit plaintext SRT", isOn: $model.srtPlaintext).font(.caption)
-                Text(model.srtPlaintext ? "Clear the passphrase to send plaintext media. There is no automatic downgrade." : "AES-256 media encryption. Stream ID/control remain clear; SRT does not authenticate peer identity.")
-                    .font(.caption).foregroundStyle(model.srtPlaintext ? .orange : .secondary)
+                Toggle("Explicit plaintext SRT", isOn: $manual.srtPlaintext).font(.caption)
+                Text(manual.srtPlaintext ? "Clear the passphrase to send plaintext media. There is no automatic downgrade." : "AES-256 media encryption. Stream ID/control remain clear; SRT does not authenticate peer identity.")
+                    .font(.caption).foregroundStyle(manual.srtPlaintext ? .orange : .secondary)
                 Text("Numeric IPv4/IPv6 peer only · 120 ms SRT latency").font(.caption).foregroundStyle(.secondary)
             } else {
-                TextField("rtmps://stream.example.invalid/live", text: $model.endpoint).accessibilityIdentifier("destination.endpoint")
+                TextField("rtmps://stream.example.invalid/live", text: $manual.endpoint).accessibilityIdentifier("destination.endpoint")
                     .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL).textFieldStyle(.roundedBorder)
-                SecureField("Stream key (kept separate from URL)", text: $model.streamKey).accessibilityIdentifier("destination.stream-key")
+                SecureField("Stream key (kept separate from URL)", text: $manual.streamKey).accessibilityIdentifier("destination.stream-key")
                     .textInputAutocapitalization(.never).autocorrectionDisabled().textFieldStyle(.roundedBorder).privacySensitive()
-                Toggle("Allow plaintext RTMP for this destination", isOn: $model.allowPlaintext).font(.caption)
-                if model.allowPlaintext { Text("rtmp:// sends the stream key and media without encryption. RTMPS will never downgrade automatically.").font(.caption).foregroundStyle(.orange) }
+                Toggle("Allow plaintext RTMP for this destination", isOn: $manual.allowPlaintext).font(.caption)
+                if manual.allowPlaintext { Text("rtmp:// sends the stream key and media without encryption. RTMPS will never downgrade automatically.").font(.caption).foregroundStyle(.orange) }
             }
-            TextField("Profile name", text: $model.profileName).textFieldStyle(.roundedBorder)
+            TextField("Profile name", text: $manual.profileName).textFieldStyle(.roundedBorder)
             HStack {
-                Button("Save profile") { model.saveProfile() }
-                if model.selectedProfile != nil { Button("Delete", role: .destructive) { model.deleteProfile() } }
+                Button("Save profile") { manual.saveProfile() }
+                if manual.selectedProfile != nil { Button("Delete", role: .destructive) { manual.deleteProfile() } }
             }.buttonStyle(.bordered)
             Text("Save keeps destination secrets in this device's unlocked Keychain. Local recording continues through uplink loss. Automatic reconnect shares a 90-second outage window; repeated failures do not extend it. Timely media acknowledgement can restore retries. If retries exhaust while sending, that attempt may continue; a later failure needs a new Prepare. Sending does not confirm decoded playback.")
                 .font(.caption).foregroundStyle(.secondary)
         }
+    }
+}
+
+/// Each native picker callback retains its original immutable ticket. A late
+/// dismissal/selection cannot borrow a newer import's admission.
+private struct ManualDestinationFilePresentation: View {
+    @ObservedObject var settings: ManualDestinationSettings
+    let ticket: ManualDestinationSettings.Ticket
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .fileImporter(isPresented: Binding(get: { settings.presentation == ticket && settings.pickerVisible }, set: { if !$0 { settings.pickerDismissed(ticket) } }), allowedContentTypes: [.json], allowsMultipleSelection: false) { result in
+                let file = result.flatMap { urls -> Result<URL, Error> in
+                    guard urls.count == 1, let url = urls.first else { return .failure(ManualImportError.invalidFile) }
+                    return .success(url)
+                }
+                settings.received(ticket, file: file)
+            }
+    }
+}
+private struct ManualDestinationImportReview: View {
+    @ObservedObject var settings: ManualDestinationSettings
+    let review: ManualDestinationSettings.Review
+    @State private var plaintextConfirmed = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Review imported destination").font(.headline)
+            Text(review.peer).font(.callout.monospaced())
+            Text(review.security).font(.caption)
+            if review.requiresPlaintext {
+                Toggle("I permit plaintext for this imported destination", isOn: $plaintextConfirmed)
+            }
+            Text("Apply fills the form only. It does not save, prepare or start a broadcast.").font(.caption)
+            HStack {
+                Button("Apply") { _ = settings.apply(review.ticket, plaintextConfirmed: plaintextConfirmed) }
+                    .disabled(!settings.canEdit || (review.requiresPlaintext && !plaintextConfirmed))
+                Button("Cancel", role: .cancel) { settings.cancelReview(review.ticket) }
+            }
+        }.padding(10).background(.thinMaterial).clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }

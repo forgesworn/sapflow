@@ -10,6 +10,22 @@ The selected platform encoder names are visible. Unsupported camera timestamp
 sources, surface combinations or hardware profiles produce explicit errors;
 there is no software-video fallback.
 
+## Manual destination profiles
+
+The normal manual controls support explicit save, load and delete for up to 16
+destinations, plus [reviewed version 1 JSON file import](manual-destination-profiles.md).
+The local collection uses a separate Android Keystore key and AES-GCM encrypted
+document in app-private no-backup storage. A missing existing key, damaged file
+or unconfirmed write fails visibly; it does not reset the collection.
+
+Document reading and storage run away from capture callbacks and UI work.
+Import presents a redacted host/port/security review with independent plaintext
+permission before Apply. Applying only fills the manual fields; Save, Prepare
+and Start are separate actions. The original action generation and actual
+capture availability fence stale replies across edits, foreground transitions
+and preparation. V4V configuration and scoped grants are outside this format.
+Physical document-provider and Keystore acceptance remain open.
+
 ## Build
 
 The parent native-package build must first produce

@@ -397,6 +397,16 @@ Delete removes that profile and its Keychain item. Selecting a saved profile
 fills the form; it does not start a connection. A locked/unavailable Keychain
 fails visibly rather than using an old key silently.
 
+Manual settings also accept a
+[reviewed version 1 JSON destination file](manual-destination-profiles.md).
+The bounded cold reader retains document access through actual close, then
+offers a redacted host/port/security review. Apply fills the form only, with
+independent permission for plaintext. Destination edits, leaving the foreground
+and capture preparation invalidate the original import ticket. Saved-profile
+load/save/delete use actual capture availability guards too; corrupt metadata
+fails visibly instead of appearing as an empty profile list. Physical provider
+and Keychain behaviour still require device qualification.
+
 `ReconnectingPublisher` implements the logical `EncodedPublishingSink` and
 creates a fresh `ManualRtmpPublisher` per attempt. `CaptureEngine.setDestination`
 installs it while stopped, before Prepare; replacement is refused while an old
