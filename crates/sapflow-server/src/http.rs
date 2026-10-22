@@ -267,7 +267,7 @@ async fn chunk(
 }
 
 #[cfg(test)]
-mod epoch_tests {
+pub(crate) mod epoch_tests {
     use super::*;
     use crate::{
         callback::Callbacks,
@@ -283,16 +283,18 @@ mod epoch_tests {
         atomic::{AtomicU64, Ordering},
     };
 
-    const PORTRAIT: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-portrait.ts");
-    const LANDSCAPE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-landscape.ts");
+    pub(crate) const PORTRAIT: &[u8] =
+        include_bytes!("../../sapflow-hls/tests/fixtures/epoch-portrait.ts");
+    pub(crate) const LANDSCAPE: &[u8] =
+        include_bytes!("../../sapflow-hls/tests/fixtures/epoch-landscape.ts");
     static TEMP: AtomicU64 = AtomicU64::new(0);
-    struct Scratch(PathBuf);
+    pub(crate) struct Scratch(PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    fn app(record: bool) -> (Arc<App>, Scratch) {
+    pub(crate) fn app(record: bool) -> (Arc<App>, Scratch) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
             .join(format!(
@@ -336,7 +338,7 @@ mod epoch_tests {
             Scratch(root),
         )
     }
-    fn begin(app: &Arc<App>) -> Publication {
+    pub(crate) fn begin(app: &Arc<App>) -> Publication {
         let req = PublishRequest::parse_srt_stream_id("publish:live/event-epochs:fixture:fixture")
             .expect("valid epoch regression fixture");
         Publication::begin(

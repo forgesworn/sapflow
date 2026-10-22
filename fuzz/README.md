@@ -14,6 +14,7 @@
 | `mobile_media` | SDK H264/AAC configuration and compressed sample admission with bounded hostile framing and timing |
 | `own_srt_caller` | Own caller/sender, optional original encrypted negotiation, AES128/256 refresh, hostile data/KM replays and mutations, bounded admission, clocks and cancellation |
 | `publish_session` | Production scoped-session JSON and checksummed metadata parsers, plus bounded pure authority commands, durable snapshots, connection claims and stale lease/restart/terminal fences; no I/O |
+| `http1_request` | HTTP/1.1 request framing for the viewer event loop (`SAPFLOW_HTTP_IMPL=own`): arbitrary bytes taken one request at a time; progress, the head limit, refusal of bodies, and that later bytes never change an earlier request |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's

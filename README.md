@@ -64,7 +64,7 @@ want the protocol code as reusable, fuzzed, memory-safe Rust.
 
 An experiment that is close to its first production trial. It passes v4v's
 ingest gate, plays in Safari on iPhone (3.0 to 3.2 s glass to glass over
-HTTP/2), resumes after encoder drops, and has twelve fuzz targets run nightly.
+HTTP/2), resumes after encoder drops, and has thirteen fuzz targets run nightly.
 It has not yet run a production show, and every measurement so far is from
 macOS. The crates are version 0.1.0 and not on crates.io yet. See
 [GOALS.md](GOALS.md), [docs/readiness.md](docs/readiness.md) and

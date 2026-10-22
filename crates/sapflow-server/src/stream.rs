@@ -294,6 +294,7 @@ impl LiveStream {
         let ready = Self::render(&mut st);
         drop(st);
         self.version.send_modify(|v| *v += 1);
+        crate::own_http::notify();
         Ok(Applied {
             ready,
             restarted: update.restarted,
@@ -328,6 +329,7 @@ impl LiveStream {
         }
         drop(st);
         self.version.send_modify(|v| *v += 1);
+        crate::own_http::notify();
     }
 
     /// The init segment and every finished part after `after`, for the
@@ -350,6 +352,7 @@ impl LiveStream {
     pub fn close(&self) {
         self.lock().closed = true;
         self.version.send_modify(|v| *v += 1);
+        crate::own_http::notify();
     }
 }
 

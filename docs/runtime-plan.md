@@ -105,7 +105,12 @@ our own event loop".
 In order, each one landing behind a setting so the tokio path stays the
 default until the new one matches it in `scripts/smoke.sh` and the benchmarks:
 
-1. The HTTP server, with fuzz targets for request parsing.
+1. The HTTP server, with fuzz targets for request parsing. Done
+   (2026-10-22): `SAPFLOW_HTTP_IMPL=own` (`own_http.rs`, framing in
+   `http1.rs`, fuzz target `http1_request`), with a connection cap, an idle
+   timeout and one response in flight per connection. CI runs the smoke test
+   on it as well as on hyper; hyper stays the default until a production
+   show has run on the own loop.
 2. SRT ingest (UDP; the listener is sans-IO already).
 3. RTMP ingest (TCP; `sapflow_hls::rtmp::Connection` is sans-IO already).
 4. The callback client.

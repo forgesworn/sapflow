@@ -105,3 +105,7 @@ jobs:
           command -v srt-live-transmit ffmpeg ffprobe
       - name: Smoke
         run: scripts/smoke.sh
+      - name: Smoke, viewers on the own event loop
+        env:
+          SAPFLOW_HTTP_IMPL: own
+        run: scripts/smoke.sh
