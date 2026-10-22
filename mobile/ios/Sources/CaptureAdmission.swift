@@ -7,6 +7,7 @@ final class CaptureAdmission {
     struct Preparation: Equatable {
         fileprivate let serial: UInt64
         let profile: CaptureIntent
+        let audioInputID: String?
     }
     struct Start: Equatable {
         fileprivate let serial: UInt64
@@ -23,6 +24,7 @@ final class CaptureAdmission {
     enum Phase { case idle, reserved, attached, permissions, prepared, starting, running, rotating, stopping, retained }
     private let lock = NSLock()
     private var serial: UInt64
+    private var selectedAudioInputID: String?
     private var phase: Phase = .idle
     private var preparation: Preparation?
     private var starting: Start?
@@ -47,6 +49,13 @@ final class CaptureAdmission {
     }
     var currentPhase: Phase { locked { phase } }
     var canChooseCaptureProfile: Bool { locked { phase == .idle } }
+    func selectAudioInput(_ id: String?) -> Bool {
+        guard id.map(AudioInputOption.validID) ?? true else { return false }
+        return locked {
+            guard phase == .idle else { return false }
+            selectedAudioInputID = id; return true
+        }
+    }
     var preparedTicket: Preparation? { locked { phase == .prepared ? preparation : nil } }
     var currentPreparation: Preparation? {
         locked { [.stopping, .retained, .idle].contains(phase) ? nil : preparation }
@@ -54,7 +63,7 @@ final class CaptureAdmission {
     func reservePreparation(profile: CaptureIntent = .defaultProfile) -> Preparation? {
         locked {
             guard phase == .idle, let serial = next() else { return nil }
-            let ticket = Preparation(serial: serial, profile: profile)
+            let ticket = Preparation(serial: serial, profile: profile, audioInputID: selectedAudioInputID)
             preparation = ticket; candidatePending = true; hasCommittedRun = false; phase = .reserved
             timingPreparation = ticket
             captureBeganAtNs = nil; captureStoppedAtNs = nil
