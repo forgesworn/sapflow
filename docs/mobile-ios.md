@@ -34,6 +34,10 @@ supported; upside-down portrait capture follows device orientation even where
 the system keeps the application's interface upright.
 The [orientation contract](capture-orientation.md) defines Automatic and the
 fixed mounting choices, their immutable Prepare boundary and physical gates.
+The [camera contract](native-camera-controls.md) covers Front/Rear selection,
+live input replacement within one encoder/show, supported zoom/focus/exposure/
+white-balance controls and preview-only front mirroring. Source checks and
+unsigned builds remain separate from physical switching and recording acceptance.
 The bundle identifier is a development placeholder and no development team,
 signing identity, provisioning profile or distributable package is assumed.
 Generated projects, build products and DerivedData stay under `target/`.

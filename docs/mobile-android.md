@@ -2,7 +2,7 @@
 
 `mobile/android` is the standalone Kotlin/Compose application consuming the
 actual generated Sapflow AAR. Its initial qualified profile is still pending:
-the implementation requests rear-camera 720p at 30 fps, hardware H264
+the implementation requests a 720p camera source at 30 fps (Rear by default), hardware H264
 baseline without B frames, a one-second GOP, and mono 48 kHz AAC-LC at 96 kbit/s.
 The orientation candidate uses upright 720x1280 portrait or 1280x720 landscape
 coded pixels, with a bounded GPU surface transform and no rotation-tag dependency.
@@ -13,6 +13,12 @@ there is no software-video fallback.
 The [orientation contract](capture-orientation.md) defines Automatic and fixed
 mounting choices, including the declared natural-landscape reference, immutable
 Prepare boundary and physical gates.
+The [camera contract](native-camera-controls.md) covers initial Front/Rear choice,
+live input replacement within one GL context/encoder/show, capability-bound
+controls and unmirrored transmitted pixels with mirrored front preview. Native
+settings acknowledgement is separate from autofocus/exposure convergence;
+Refresh camera status requests a new observation without continuous polling.
+Physical front/rear geometry, switching and recording acceptance remain open.
 
 ## Manual destination profiles
 

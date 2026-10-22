@@ -52,12 +52,13 @@ internal class CardinalPoseSelector(initial: CardinalPose = CardinalPose.NATURAL
 }
 
 /** One immutable encoder/transport epoch. Rotation changes actual pixels,
- * never MP4 display metadata. Rear-camera output is deliberately unmirrored. */
+ * never MP4 display metadata. Encoded camera output is deliberately unmirrored. */
 internal class OrientationPlan private constructor(
     val pose: CardinalPose,
     val naturalPortrait: Boolean,
     val sensorClockwiseDegrees: Int,
     val profile: CaptureProfile,
+    val front: Boolean = false,
 ) {
     val naturalWidth = if (naturalPortrait) profile.landscapeHeight else profile.landscapeWidth
     val naturalHeight = if (naturalPortrait) profile.landscapeWidth else profile.landscapeHeight
@@ -76,22 +77,25 @@ internal class OrientationPlan private constructor(
     val cameraHeight = if (sensorClockwiseDegrees % 180 == 0) sourceNaturalHeight else sourceNaturalWidth
     // CaptureRequest.JPEG_ORIENTATION's rear-camera convention is sensor +
     // OrientationEventListener angle. The producer already supplies sensor.
-    val rawToEncodedClockwiseDegrees = (sensorClockwiseDegrees + pose.clockwiseDegrees) % 360
-    val encoderClockwiseDegrees = pose.clockwiseDegrees
+    val rawToEncodedClockwiseDegrees = (sensorClockwiseDegrees + (if (front) -pose.clockwiseDegrees else pose.clockwiseDegrees) + 360) % 360
+    val encoderClockwiseDegrees = if (front) (360 - pose.clockwiseDegrees) % 360 else pose.clockwiseDegrees
 
     /** The sampled texture is already device-natural, not raw sensor pixels. */
     fun encoderPositionMatrix(): FloatArray = clockwisePositionMatrix(encoderClockwiseDegrees)
 
     /** Preview is aligned to the display independently of the encoder epoch. */
-    fun previewPositionMatrix(displayRotationDegrees: Int): FloatArray {
+    fun previewPositionMatrix(displayRotationDegrees: Int, mirrored: Boolean = false): FloatArray {
         require(displayRotationDegrees in listOf(0, 90, 180, 270))
-        return clockwisePositionMatrix((360 - displayRotationDegrees) % 360)
+        return clockwisePositionMatrix((if (front) displayRotationDegrees else 360 - displayRotationDegrees) % 360).also { matrix ->
+            // Reflect screen X after rotation, only for local front preview.
+            if (mirrored) { matrix[0] = -matrix[0]; matrix[4] = -matrix[4] }
+        }
     }
 
     /** Relative orientation of the encoded content when fitted into preview. */
     fun previewRelativeClockwiseDegrees(displayRotationDegrees: Int): Int {
         require(displayRotationDegrees in listOf(0, 90, 180, 270))
-        return (720 - pose.clockwiseDegrees - displayRotationDegrees) % 360
+        return (720 + (if (front) pose.clockwiseDegrees + displayRotationDegrees else -pose.clockwiseDegrees - displayRotationDegrees)) % 360
     }
 
     companion object {
@@ -114,6 +118,14 @@ internal class OrientationPlan private constructor(
         fun forRear(sensorOrientationDegrees: Int, pose: CardinalPose, naturalPortrait: Boolean = true, profile: CaptureProfile = CaptureProfile.DEFAULT): OrientationPlan {
             require(sensorOrientationDegrees in listOf(0, 90, 180, 270)) { "Invalid camera sensor orientation" }
             return OrientationPlan(pose, naturalPortrait, sensorOrientationDegrees, profile)
+        }
+
+        /** SurfaceTexture already supplies sensor rotation. Front-facing
+         * capture needs the opposite physical-pose/display term; mirror NONE
+         * alone does not supply it. Preview reflection is a separate stage. */
+        fun forCamera(sensorOrientationDegrees: Int, pose: CardinalPose, naturalPortrait: Boolean, profile: CaptureProfile, front: Boolean): OrientationPlan {
+            require(sensorOrientationDegrees in listOf(0, 90, 180, 270)) { "Invalid camera sensor orientation" }
+            return OrientationPlan(pose, naturalPortrait, sensorOrientationDegrees, profile, front)
         }
     }
 }

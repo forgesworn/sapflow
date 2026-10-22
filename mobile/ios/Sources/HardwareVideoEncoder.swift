@@ -6,6 +6,9 @@ final class HardwareVideoEncoder {
     private let width: Int
     private let height: Int
     private let profile: CaptureProfile
+    private var encoderFailure: Error?
+    private var keyframeRequested = false // samples queue only
+    private let keyframeProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
     private var pending: CMSampleBuffer?
     private var cachedFormat: CMFormatDescription?
     private var configuration: CodecDescription?
@@ -80,12 +83,27 @@ final class HardwareVideoEncoder {
         let status = VTSessionSetProperty(session, key: key, value: value)
         guard status == noErr else { throw CaptureFailure(message: "Video encoder setting failed (\(status))") }
     }
+    /// Complete accepted old frames without invalidating the encoder. The held
+    /// final old picture gets one nominal frame, not the camera-switch gap.
+    func sealForCameraSwitch() throws -> CMTime {
+        guard let session else { throw CaptureFailure(message: "Video encoder is closed") }
+        let status = VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        guard status == noErr else { throw CaptureFailure(message: "Could not drain video before camera switch") }
+        lock.lock(); defer { lock.unlock() }
+        if let encoderFailure { throw encoderFailure }
+        guard let previous = pending else { throw CaptureFailure(message: "No accepted video boundary is available for camera switch") }
+        let duration = CMTime(value: 1, timescale: profile.frameRate)
+        try emit(previous, duration: duration); pending = nil
+        return duration
+    }
+    func requestKeyframe() { keyframeRequested = true }
     func encode(_ sample: CMSampleBuffer, time: CMTime) throws {
         guard let session, let image = CMSampleBufferGetImageBuffer(sample) else { throw CaptureFailure(message: "Video capture lost its pixel buffer") }
         guard CVPixelBufferGetWidth(image) == width, CVPixelBufferGetHeight(image) == height else { throw CaptureFailure(message: "Camera no longer produces the prepared \(width)×\(height) format") }
         let status = VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: time,
-            duration: CMTime(value: 1, timescale: profile.frameRate), frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
+            duration: CMTime(value: 1, timescale: profile.frameRate), frameProperties: keyframeRequested ? keyframeProperties : nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
         guard status == noErr else { throw CaptureFailure(message: "Hardware encoding failed (\(status))") }
+        keyframeRequested = false
     }
     private func receive(_ sample: CMSampleBuffer) {
         lock.lock(); defer { lock.unlock() }
@@ -98,7 +116,7 @@ final class HardwareVideoEncoder {
                 try emit(previous, duration: delta)
             }
             pending = sample
-        } catch { pending = nil; failure(error) }
+        } catch { pending = nil; encoderFailure = encoderFailure ?? error; failure(error) }
     }
     private func emit(_ sample: CMSampleBuffer, duration: CMTime) throws {
         guard let format = CMSampleBufferGetFormatDescription(sample) else { throw CaptureFailure(message: "H.264 format is unavailable") }

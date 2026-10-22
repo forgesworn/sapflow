@@ -47,6 +47,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.Slider
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -73,7 +74,7 @@ class MainActivity : ComponentActivity() {
     private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
     private class PreparationIntent(val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
         val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?, val backgroundAudio: Boolean,
-        val orientation: CaptureOrientationChoice.Selection?)
+        val orientation: CaptureOrientationChoice.Selection?, val cameraChoice: CameraSourceChoice)
     private var pendingPreparation: PreparationIntent? = null
     private val permissionReplies = PendingPermissionReply<PreparationIntent>()
     private var permissionReplyOutstanding by mutableStateOf(false)
@@ -145,6 +146,8 @@ class MainActivity : ComponentActivity() {
     private var recordLocally by mutableStateOf(true)
     private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
     private var orientationChoice by mutableStateOf(CaptureOrientationChoice.AUTO)
+    private var cameraChoice by mutableStateOf(CameraSourceChoice.REAR)
+    private var cameraState by mutableStateOf(CameraSourceSnapshot())
     private var microphoneOnly by mutableStateOf(false)
     private var backgroundAudio by mutableStateOf(false)
     private var selectedAudioInputId by mutableStateOf<String?>(null)
@@ -196,6 +199,7 @@ class MainActivity : ComponentActivity() {
     private val refresh = object : Runnable {
         override fun run() {
             snapshot = capture.snapshot()
+            cameraState = capture.cameraSnapshot()
             v4vState = v4v?.control?.view
             libraryBusy = !recordingLibrary.idle
             if (recordingLibrary.cleanupRetained) libraryMessage = "File cleanup was not confirmed. Existing recordings are preserved; further file operations are blocked."
@@ -228,6 +232,7 @@ class MainActivity : ComponentActivity() {
             microphoneOnly = !retained.intent.hasVideo
             retained.intent.videoProfile?.let { captureProfile = it }
             orientationChoice = retained.orientation?.choice ?: CaptureOrientationChoice.AUTO
+            cameraChoice = capture.cameraSnapshot().requested ?: retained.cameraChoice ?: CameraSourceChoice.REAR
             backgroundAudio = retained.backgroundAudio
         }
         audioOwner.continuingShow()?.let { retained ->
@@ -335,6 +340,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         if (!microphoneOnly) {
+                            cameraControls(qualityConfigurable, current)
                             Text("Capture orientation · choose before Prepare", style = MaterialTheme.typography.labelMedium)
                             CaptureOrientationChoice.entries.forEach { choice ->
                                 OutlinedButton(enabled = qualityConfigurable, onClick = {
@@ -355,7 +361,7 @@ class MainActivity : ComponentActivity() {
                         Button(
                             onClick = { startWithAuth() },
                             enabled = current?.stage == CaptureStage.PREPARED &&
-                                (preparedCapture?.backgroundAudio != true || current.backgroundAudioReady),
+                                (preparedCapture?.backgroundAudio != true || current.backgroundAudioReady) && (!selectedIntent.hasVideo || !cameraState.busy),
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Start capture") }
                         if (current?.stage == CaptureStage.PREPARED && preparedCapture?.backgroundAudio == true && !current.backgroundAudioReady) {
@@ -727,9 +733,71 @@ class MainActivity : ComponentActivity() {
         libraryBusy = !recordingLibrary.idle
     }
 
+    @Composable
+    private fun cameraControls(idle: Boolean, current: CaptureSnapshot?) {
+        val source = cameraState
+        val displayedPreparation = preparedCapture
+        val live = current?.stage in listOf(CaptureStage.PREPARED, CaptureStage.CAPTURING) && !source.busy
+        Text("Camera source", style = MaterialTheme.typography.labelMedium)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            CameraSourceChoice.entries.forEach { choice ->
+                OutlinedButton(enabled = idle || live, onClick = {
+                    if (idle) {
+                        if (!preparationPending && !permissionReplies.outstanding && recordingLibrary.idle && capture.snapshot().canPrepare && cameraChoice != choice) {
+                            manualEdited(); prepareRequest++; cameraChoice = choice
+                        }
+                    } else displayedPreparation?.let { ticket -> if (capture.switchCamera(ticket, choice, source.sourceToken)) cameraChoice = choice }
+                }) { Text(choice.label + if ((source.active ?: cameraChoice) == choice) " selected" else "") }
+            }
+        }
+        if (current?.stage !in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)) Text(source.status, style = MaterialTheme.typography.bodySmall)
+        val caps = source.capabilities ?: return
+        var requested by remember(source.sourceToken) { mutableStateOf(source.requestedSettings ?: CameraControlSettings()) }
+        fun change(value: CameraControlSettings) {
+            val ticket = displayedPreparation ?: return
+            if (capture.adjustCamera(ticket, source.sourceToken, value)) requested = value
+        }
+        if (caps.maxZoom > caps.minZoom) {
+            Text("Zoom ${"%.1f".format(requested.zoom)}×", style = MaterialTheme.typography.bodySmall)
+            Slider(value = requested.zoom.coerceIn(caps.minZoom, caps.maxZoom), onValueChange = { change(requested.copy(zoom = it)) },
+                valueRange = caps.minZoom..caps.maxZoom, enabled = live)
+        }
+        if (caps.focusLock) Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(requested.focusLocked, { change(requested.copy(focusLocked = it)) }, enabled = live)
+            Text("Request focus lock")
+        } else Text(if (caps.focusContinuous) "Continuous focus" else "Fixed focus", style = MaterialTheme.typography.bodySmall)
+        if (caps.maxExposure > caps.minExposure) {
+            Text("Exposure compensation ${"%.1f".format(requested.exposure * caps.exposureStep)} EV", style = MaterialTheme.typography.bodySmall)
+            Slider(value = requested.exposure.toFloat(), onValueChange = { change(requested.copy(exposure = kotlin.math.round(it).toInt())) },
+                valueRange = caps.minExposure.toFloat()..caps.maxExposure.toFloat(), enabled = live)
+        }
+        if (caps.exposureLock) Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(requested.exposureLocked, { change(requested.copy(exposureLocked = it)) }, enabled = live); Text("Request exposure lock")
+        }
+        Text("White balance", style = MaterialTheme.typography.labelMedium)
+        val labels = listOf("", "Automatic", "Incandescent", "Fluorescent", "Warm fluorescent", "Daylight", "Cloudy", "Twilight", "Shade")
+        caps.whiteBalanceModes.forEach { mode ->
+            OutlinedButton(enabled = live, onClick = { change(requested.copy(whiteBalance = mode, whiteBalanceLocked = false)) }) {
+                Text(labels[mode] + if (requested.whiteBalance == mode) " selected" else "")
+            }
+        }
+        if (caps.whiteBalanceLock) Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(requested.whiteBalanceLocked, { change(requested.copy(whiteBalanceLocked = it)) }, enabled = live && requested.whiteBalance == 1); Text("Request automatic white balance lock")
+        }
+        Text(if (!source.controlsPending && source.requestedSettings == requested && source.confirmedRevision > 0 && source.confirmedRevision == source.requestedRevision) "Native camera request acknowledged" else "Waiting for native camera acknowledgement", style = MaterialTheme.typography.bodySmall)
+        OutlinedButton(enabled = live, onClick = { change(requested) }) { Text("Refresh camera status") }
+        Text("Native values are from the last requested camera observation.", style = MaterialTheme.typography.bodySmall)
+        source.nativeZoom?.let { Text("Native zoom ${"%.1f".format(it)}×", style = MaterialTheme.typography.bodySmall) }
+        source.nativeExposure?.let { Text("Native exposure compensation ${"%.1f".format(it * caps.exposureStep)} EV", style = MaterialTheme.typography.bodySmall) }
+        source.nativeWhiteBalance?.let { mode -> labels.getOrNull(mode)?.let { Text("Native white balance $it", style = MaterialTheme.typography.bodySmall) } }
+        Text(when (source.exposureState) { 1 -> "Exposure adjusting"; 2 -> "Exposure settled"; 3 -> "Exposure locked"; else -> "Exposure state unavailable" }, style = MaterialTheme.typography.bodySmall)
+        Text(when (source.whiteBalanceState) { 1 -> "White balance adjusting"; 2 -> "White balance settled"; 3 -> "White balance locked"; else -> "White balance state unavailable" }, style = MaterialTheme.typography.bodySmall)
+        Text(when (source.focusState) { 4 -> "Focus locked"; 5 -> "Focus lock did not converge"; 2 -> "Focus settled"; 1, 3 -> "Focusing"; 6 -> "Focus not settled"; 0 -> "Focus inactive"; else -> "Focus state unavailable" }, style = MaterialTheme.typography.bodySmall)
+    }
+
     private fun currentPreparation(intent: PreparationIntent): Boolean = pendingPreparation === intent && intent.request == prepareRequest &&
         poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && (backgroundAudio && !intent.capture.hasVideo) == intent.backgroundAudio && recordLocally == intent.record && useV4v == intent.v4v &&
-        (!intent.capture.hasVideo || orientationChoice == intent.orientation?.choice) &&
+        (!intent.capture.hasVideo || orientationChoice == intent.orientation?.choice && cameraChoice == intent.cameraChoice) &&
         (intent.v4v || (useSrt == intent.srt && destinationUrl == intent.endpoint && destinationKey == intent.key && srtPassphrase == intent.passphrase &&
             srtPlaintextLab == intent.srtPlaintext && allowPlaintextDevelopment == intent.rtmpPlaintext))
 
@@ -744,7 +812,7 @@ class MainActivity : ComponentActivity() {
         if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
         manualEdited()
         val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo,
-            orientationChoice.freeze(selectedIntent.hasVideo, naturalPortrait(), poseSelector.pose))
+            orientationChoice.freeze(selectedIntent.hasVideo, naturalPortrait(), poseSelector.pose), cameraChoice)
         pendingPreparation = intent; preparationPending = true
         val needed = preparationPermissions(intent).toTypedArray()
         if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
@@ -820,7 +888,7 @@ class MainActivity : ComponentActivity() {
             // further sensor callback followed qualification Stop/CLEAR.
             val stablePose = if (intent.capture.hasVideo) poseSelector.prepareSession() else CardinalPose.NATURAL
             preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture, intent.audioInputId, intent.backgroundAudio,
-                intent.orientation?.atPrepare(stablePose))
+                intent.orientation?.atPrepare(stablePose), intent.cameraChoice)
             if (intent.backgroundAudio) {
                 val prepared = checkNotNull(preparedCapture) { "Capture preparation was not admitted" }
                 require(audioOwner.arm(prepared, intent.v4v, intent.record)) { "Background audio service could not be admitted. Prepare again." }

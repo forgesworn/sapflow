@@ -11,6 +11,7 @@ final class CaptureAdmission {
         let continuesAudioInBackground: Bool
         let orientationChoice: CaptureOrientationChoice
         let initialOrientation: CaptureOrientation?
+        let initialCamera: CameraPosition
     }
     struct OrientationObservation {
         fileprivate let serial: UInt64
@@ -33,6 +34,8 @@ final class CaptureAdmission {
     private let lock = NSLock()
     private var serial: UInt64
     private var selectedAudioInputID: String?
+    private var selectedCamera = CameraPosition.rear
+    private var camera = CameraControlPolicy<Preparation>()
     private var selectedBackgroundAudio = false
     private var selectedOrientationChoice = CaptureOrientationChoice.automatic
     private var latestAutoOrientation = CaptureOrientation.portrait
@@ -87,12 +90,86 @@ final class CaptureAdmission {
             return phase == .idle && selectedOrientationChoice == .automatic
         }
     }
+    /// Resume a deferred pose without minting a new sensor serial. A newer
+    /// synchronously admitted observation may still be waiting on the owner queue.
+    var latestOrientationObservation: OrientationObservation? {
+        locked {
+            guard foreground, let serial = orientationObservation,
+                  let preparation, preparation.profile.hasVideo, preparation.orientationChoice == .automatic,
+                  phase != .stopping, phase != .retained, phase != .idle else { return nil }
+            return OrientationObservation(serial: serial, preparation: preparation, orientation: latestAutoOrientation)
+        }
+    }
     /// Auto may have a newer physical pose by the time its queued candidate is
     /// attached. A fixed preparation always uses its immutable initial value.
     func orientationAtAttachment(_ value: Preparation) -> CaptureOrientation? {
         locked {
             guard preparation == value, phase == .attached, value.profile.hasVideo else { return nil }
             return value.orientationChoice == .automatic ? latestAutoOrientation : value.initialOrientation
+        }
+    }
+    typealias CameraSource = CameraControlPolicy<Preparation>.Source
+    typealias CameraSwitch = CameraControlPolicy<Preparation>.Switch
+    typealias CameraCanvas = CameraControlPolicy<Preparation>.Canvas
+    func selectCamera(_ position: CameraPosition) -> Bool {
+        locked { guard phase == .idle, foreground else { return false }; selectedCamera = position; return true }
+    }
+    var desiredCamera: CameraPosition { locked { camera.desired } }
+    var pendingCameraSwitch: CameraSwitch? { locked { camera.pending } }
+    var cameraControlSource: CameraSource? {
+        locked {
+            guard foreground, phase == .prepared || phase == .running, let source = camera.source,
+                  camera.permitsControls(source) else { return nil }; return source
+        }
+    }
+    func permitsCameraControls(_ source: CameraSource) -> Bool {
+        locked { foreground && (phase == .prepared || phase == .running) && preparation == source.owner && camera.permitsControls(source) }
+    }
+    func initialCameraSource(canvas: CameraCanvas) -> CameraSource? {
+        locked {
+            guard foreground, let preparation, preparation.profile.hasVideo,
+                  [.permissions, .prepared, .starting].contains(phase) else { return nil }
+            return camera.initial(preparation, canvas: canvas)
+        }
+    }
+    func reserveCameraSwitch(_ position: CameraPosition, source: CameraSource, nowNs: UInt64) -> CameraSwitch? {
+        locked {
+            guard foreground, phase == .prepared || phase == .running, let preparation,
+                  preparation == source.owner, camera.permitsControls(source) else { return nil }
+            return camera.reserveSwitch(preparation, position: position, nowNs: nowNs)
+        }
+    }
+    func permitsCameraSwitch(_ value: CameraSwitch, nowNs: UInt64) -> Bool {
+        locked { foreground && (phase == .prepared || phase == .running) && preparation == value.owner && camera.permits(value, nowNs: nowNs) }
+    }
+    func retireCameraSwitch(_ value: CameraSwitch, nowNs: UInt64) -> CameraSource? {
+        locked {
+            guard foreground, phase == .prepared || phase == .running, preparation == value.owner else { return nil }
+            return camera.retire(value, nowNs: nowNs)
+        }
+    }
+    func rejectCameraSwitch(_ value: CameraSwitch) -> Bool { locked { camera.reject(value) } }
+    func failCameraSwitch(_ value: CameraSwitch) -> Bool { locked { camera.fail(value) } }
+    func permitsCameraFrame(_ source: CameraSource) -> Bool {
+        locked {
+            foreground && preparation == source.owner && (phase == .permissions || phase == .prepared || phase == .starting || phase == .running) &&
+                camera.source == source && !camera.failed
+        }
+    }
+    func cameraMedia(_ value: Preparation, nowNs: UInt64? = nil) -> CameraControlPolicy<Preparation>.Media {
+        locked {
+            guard preparation == value, phase == .running else { return .stale }
+            guard value.profile.hasVideo else { return .allowed }
+            // Steady-state audio uses only the scalar owner gate. Read the
+            // monotonic clock solely during a retired-source transition.
+            let now = camera.retired && camera.pending != nil ? (nowNs ?? DispatchTime.now().uptimeNanoseconds) : 0
+            return camera.media(value, nowNs: now)
+        }
+    }
+    func cameraFrame(_ source: CameraSource, width: Int, height: Int, nowNs: UInt64) -> CameraControlPolicy<Preparation>.Frame {
+        locked {
+            guard foreground, preparation == source.owner, (phase == .permissions || phase == .prepared || phase == .starting || phase == .running) else { return .stale }
+            return camera.frame(source, width: width, height: height, nowNs: nowNs)
         }
     }
     func selectBackgroundAudio(_ enabled: Bool) -> Bool {
@@ -140,9 +217,11 @@ final class CaptureAdmission {
             let ticket = Preparation(serial: serial, profile: profile, audioInputID: selectedAudioInputID,
                                      continuesAudioInBackground: selectedBackgroundAudio && !profile.hasVideo,
                                      orientationChoice: profile.hasVideo ? selectedOrientationChoice : .automatic,
-                                     initialOrientation: profile.hasVideo ? (selectedOrientationChoice.fixedOrientation ?? latestAutoOrientation) : nil)
+                                     initialOrientation: profile.hasVideo ? (selectedOrientationChoice.fixedOrientation ?? latestAutoOrientation) : nil,
+                                     initialCamera: selectedCamera)
             orientationObservation = nil
             preparation = ticket; candidatePending = true; hasCommittedRun = false; phase = .reserved
+            if profile.hasVideo { camera.prepare(ticket, initial: selectedCamera) } else { camera.close() }
             timingPreparation = ticket
             captureBeganAtNs = nil; captureStoppedAtNs = nil
             broadcastBeganAtNs = nil; broadcastStoppedAtNs = nil
@@ -173,7 +252,9 @@ final class CaptureAdmission {
     }
     func reserveStart(_ ticket: Preparation) -> Start? {
         locked {
-            guard preparation == ticket, phase == .prepared, let serial = next() else { return nil }
+            guard preparation == ticket, phase == .prepared,
+                  !ticket.profile.hasVideo || (camera.source == nil || (camera.confirmed && camera.pending == nil && !camera.failed)),
+                  let serial = next() else { return nil }
             let value = Start(serial: serial, preparation: ticket)
             starting = value; phase = .starting; return value
         }
@@ -235,6 +316,7 @@ final class CaptureAdmission {
         // A saturated cleanup ticket still permits the current owner to stop.
         let value = Stop(serial: next() ?? UInt64.max, preparation: preparation)
         stopping = value; starting = nil; rotation = nil; phase = .stopping
+        camera.close()
         return value
     }
     /// Cold destination End/expiry only. Never stops the independent capture or

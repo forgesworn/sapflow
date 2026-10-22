@@ -29,11 +29,16 @@ internal class CameraGlRenderer(
     private val inputWidth: Int,
     private val inputHeight: Int,
     private val plan: OrientationPlan,
-    private val timestamps: CameraTimestampMapper,
+    timestamps: CameraTimestampMapper,
     private val captureEpoch: Long,
     private val callbacks: Handler,
     private val onReady: (Surface, String) -> Unit,
     private val onFailure: (String) -> Unit,
+    initialSourceToken: Long = 0,
+    initialFront: Boolean = false,
+    initialLegacyMirror: Boolean = false,
+    private val rawAdmission: CameraRunAdmission,
+    private val onSourceFrame: (Long, Long) -> Unit = { _, _ -> },
 ) {
     private val thread = HandlerThread("sapflow-camera-gl").apply {
         require(inputWidth > 0 && inputHeight > 0) { "Invalid camera texture size" }
@@ -43,7 +48,17 @@ internal class CameraGlRenderer(
         start()
     }
     private val owner = Handler(thread.looper)
-    private val admission = RenderAdmission()
+    private var admission = RenderAdmission()
+    private val requestedSource = AtomicLong(initialSourceToken)
+    private var sourceToken = initialSourceToken
+    private var sourcePlan = plan
+    private var sourceWidth = inputWidth
+    private var sourceHeight = inputHeight
+    private var timestamps = timestamps
+    private var front = initialFront
+    private var legacyMirror = initialLegacyMirror
+    private var firstFrame = true
+    private val sourceTimeline = CameraSourceTimeline()
     private val live = AtomicBoolean(true)
     private val failed = AtomicBoolean(false)
     private val closing = AtomicBoolean(false)
@@ -67,8 +82,8 @@ internal class CameraGlRenderer(
     private var previewDisplayDegrees = 0
     private var previewViewport = IntArray(4)
     private val encoderViewport = fitViewport(plan.width, plan.height, plan.contentWidth, plan.contentHeight)
-    private val encoderMatrix = plan.encoderPositionMatrix()
-    private var previewMatrix = encoderMatrix
+    private var encoderMatrix = plan.encoderPositionMatrix()
+    private var previewMatrix = plan.previewPositionMatrix(0, initialFront)
     private val textureMatrix = FloatArray(16)
     private var textureName = 0
     private var cameraTexture: SurfaceTexture? = null
@@ -93,7 +108,7 @@ internal class CameraGlRenderer(
      * displayRotationDegrees = Surface.ROTATION_* converted to 0/90/180/270. */
     fun setPreview(surface: Surface?, width: Int, height: Int, displayRotationDegrees: Int) {
         require(surface == null || (width > 0 && height > 0))
-        val extra = plan.previewRelativeClockwiseDegrees(displayRotationDegrees)
+        val extra = sourcePlan.previewRelativeClockwiseDegrees(displayRotationDegrees)
         if (!live.get()) return
         owner.post {
             if (!live.get()) return@post
@@ -106,7 +121,7 @@ internal class CameraGlRenderer(
                         preview = window(surface); previewSurface = surface
                         previewWidth = width; previewHeight = height
                         previewDisplayDegrees = displayRotationDegrees
-                        previewMatrix = plan.previewPositionMatrix(displayRotationDegrees)
+                        previewMatrix = sourcePlan.previewPositionMatrix(displayRotationDegrees, front)
                         previewViewport = fitViewport(width, height,
                             if (extra % 180 == 0) plan.contentWidth else plan.contentHeight,
                             if (extra % 180 == 0) plan.contentHeight else plan.contentWidth)
@@ -203,6 +218,41 @@ internal class CameraGlRenderer(
         textureUniform = GLES20.glGetUniformLocation(program, "uTexture")
         samplerUniform = GLES20.glGetUniformLocation(program, "uSampler")
         check(listOf(positionAttribute, textureAttribute, positionUniform, textureUniform, samplerUniform).all { it >= 0 }) { "GPU shader interface unavailable" }
+        createSource(sourceToken) { surface -> onReady(surface, renderer.take(160)) }
+    }
+
+    /** Cold fence only. Old queued producer notifications cannot submit new
+     * raw frames; already accepted compressed output still drains normally. */
+    fun fenceSource() { requestedSource.set(NO_ENCODING) }
+
+    fun sourceFrameNs(token: Long): Long? = if (requestedSource.get() == token) rawAdmission.confirmed(token) else null
+
+    /** Caller has the old CameraDevice.onClosed hardware receipt. Only its
+     * texture/input is replaced; GL context, encoder EGL surface and PTS stay. */
+    fun replaceSource(token: Long, next: OrientationPlan, front: Boolean, legacyMirror: Boolean,
+        mapper: CameraTimestampMapper, onReady: (Surface) -> Unit) {
+        check(next.width == plan.width && next.height == plan.height && next.pose == plan.pose && next.profile == plan.profile)
+        owner.post {
+            if (!live.get()) return@post
+            guarded("Camera source replacement", 1000) {
+                makeCurrent(scratch)
+                cameraTexture?.setOnFrameAvailableListener(null); owner.removeCallbacks(render)
+                admission.close()
+                cameraSurface?.release(); cameraSurface = null
+                cameraTexture?.release(); cameraTexture = null
+                if (textureName != 0) { GLES20.glDeleteTextures(1, intArrayOf(textureName), 0); textureName = 0 }
+                sourcePlan = next; sourceWidth = next.cameraWidth; sourceHeight = next.cameraHeight
+                this.front = front; this.legacyMirror = legacyMirror; timestamps = mapper
+                sourceToken = token; lastTextureNs = -1; geometryLogged = false; firstFrame = true
+                encoderMatrix = next.encoderPositionMatrix()
+                previewMatrix = next.previewPositionMatrix(previewDisplayDegrees, front)
+                admission = RenderAdmission(); requestedSource.set(token)
+                createSource(token, onReady)
+            }
+        }
+    }
+
+    private fun createSource(token: Long, ready: (Surface) -> Unit) {
         val texture = IntArray(1); GLES20.glGenTextures(1, texture, 0); textureName = texture[0]
         check(textureName != 0) { "Camera texture allocation failed" }
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureName)
@@ -211,20 +261,20 @@ internal class CameraGlRenderer(
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         glCheck()
-        val source = SurfaceTexture(textureName)
-        cameraTexture = source
-        source.setDefaultBufferSize(inputWidth, inputHeight)
+        val source = SurfaceTexture(textureName); cameraTexture = source
+        source.setDefaultBufferSize(sourceWidth, sourceHeight)
+        val queue = admission
         source.setOnFrameAvailableListener({
-            if (live.get() && admission.offer()) owner.post(render)
+            if (live.get() && requestedSource.get() == token && queue.offer()) owner.post(render)
         }, owner)
         val surface = Surface(source); cameraSurface = surface
-        callbacks.post { if (live.get()) onReady(surface, renderer.take(160)) }
+        callbacks.post { if (live.get() && requestedSource.get() == token) ready(surface) }
     }
 
     private fun renderLatest() {
         if (!admission.begin()) return
         try {
-            if (!live.get()) return
+            if (!live.get() || requestedSource.get() != sourceToken || rawAdmission.failure != null) return
             guarded("GPU frame submission") {
                 makeCurrent(scratch)
                 val source = cameraTexture ?: error("Camera texture is unavailable")
@@ -236,18 +286,37 @@ internal class CameraGlRenderer(
                 if (sourceNs == lastTextureNs) return@guarded
                 lastTextureNs = sourceNs
                 val pts = timestamps.map(sourceNs)
+                val encoding = encoder != EGL14.EGL_NO_SURFACE && requestedEncoding.get() == encoderToken
+                check(sourceTimeline.frame(pts, firstFrame, encoding)) { "Camera source regressed timing or exceeded the live video gap bound" }
                 source.getTransformMatrix(textureMatrix)
                 if (!geometryLogged) {
                     geometryLogged = true
-                    Log.i("SapflowGeometry", "epoch=$captureEpoch sensor=${plan.sensorClockwiseDegrees} raw=${inputWidth}x$inputHeight natural=${plan.sourceNaturalWidth}x${plan.sourceNaturalHeight} pose=${plan.pose.name} encoded=${plan.width}x${plan.height} vertexCW=${plan.encoderClockwiseDegrees} preview=${previewWidth}x$previewHeight display=$previewDisplayDegrees STM=${textureMatrix.joinToString(prefix = "[", postfix = "]")}")
+                    Log.i("SapflowGeometry", "epoch=$captureEpoch sensor=${sourcePlan.sensorClockwiseDegrees} raw=${sourceWidth}x$sourceHeight natural=${plan.sourceNaturalWidth}x${plan.sourceNaturalHeight} pose=${plan.pose.name} encoded=${plan.width}x${plan.height} vertexCW=${sourcePlan.encoderClockwiseDegrees} preview=${previewWidth}x$previewHeight display=$previewDisplayDegrees STM=${textureMatrix.joinToString(prefix = "[", postfix = "]")}")
                 }
-                CameraTextureGeometry.validate(textureMatrix, plan.sensorClockwiseDegrees, inputWidth, inputHeight)
+                CameraTextureGeometry.normalise(textureMatrix, sourcePlan.sensorClockwiseDegrees, sourceWidth, sourceHeight, legacyMirror)
+                if (requestedSource.get() != sourceToken) return@guarded
+                if (!rawAdmission.admit(System.nanoTime())) { fail("Camera source deadline expired before frame submission"); return@guarded }
                 if (encoder != EGL14.EGL_NO_SURFACE && requestedEncoding.get() == encoderToken) {
                     draw(encoder, plan.width, plan.height, encoderMatrix, encoderViewport)
                     check(EGLExt.eglPresentationTimeANDROID(display, encoder, pts)) { "Encoder presentation timestamp rejected" }
                     check(EGL14.eglSwapBuffers(display, encoder)) { "Encoder EGL submission failed" }
+                    sourceTimeline.submitted(pts)
                 }
-                if (preview != EGL14.EGL_NO_SURFACE && live.get()) {
+                // A live source is not confirmed until its actual encoder
+                // submission returns. PCM keeps the original source deadline
+                // while EGL is blocked, even if the codec handler cannot run.
+                if (firstFrame && !rawAdmission.confirmSource(sourceToken, System.nanoTime())) {
+                    if (rawAdmission.failure != null) fail("Camera source deadline expired before its first valid native submission")
+                    return@guarded // Ordinary Stop canceled the pending source without a fault.
+                }
+                if (rawAdmission.failure != null) return@guarded
+                if (firstFrame) {
+                    firstFrame = false
+                    val confirmed = sourceToken
+                    val observedAtNs = checkNotNull(rawAdmission.confirmed(confirmed))
+                    callbacks.post { if (live.get() && requestedSource.get() == confirmed) onSourceFrame(confirmed, observedAtNs) }
+                }
+                if (preview != EGL14.EGL_NO_SURFACE && live.get() && requestedSource.get() == sourceToken) {
                     val borrowed = previewSurface ?: error("Preview native window owner unavailable")
                     if (!borrowed.isValid) detachPreview()
                     else try {
@@ -323,12 +392,16 @@ internal class CameraGlRenderer(
     }
 
     private fun fail(message: String) {
+        rawAdmission.fail() // Exact captured run, synchronously before any queued owner notification.
         if (failed.compareAndSet(false, true)) callbacks.post { onFailure(message) }
-        initiateClose()
+        // Fence now, but the controller owns the CameraDevice close barrier.
+        // It calls close only after that actual producer closure; destroying a
+        // texture here could race an in-flight native producer.
+        live.set(false); requestedSource.set(NO_ENCODING); requestedEncoding.set(NO_ENCODING); admission.close()
     }
 
     private fun initiateClose() {
-        live.set(false); requestedEncoding.set(NO_ENCODING); admission.close()
+        live.set(false); requestedSource.set(NO_ENCODING); requestedEncoding.set(NO_ENCODING); admission.close()
         if (!closing.compareAndSet(false, true)) return
         owner.post {
             guarded("GPU cleanup") {

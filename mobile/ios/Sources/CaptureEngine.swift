@@ -5,6 +5,16 @@ struct CaptureSnapshot {
     var orientation = CaptureOrientation.portrait
     var orientationChoice = CaptureOrientationChoice.automatic
     var profile = CaptureIntent.defaultProfile
+    var cameraRequested = CameraPosition.rear
+    var cameraActive: CameraPosition?
+    var cameraPending = false
+    var cameraPreviewMirrored = false
+    var cameraControl: CaptureAdmission.CameraSource?
+    var cameraCapabilities = CameraCapabilities()
+    var cameraValues = CameraNativeValues()
+    var cameraControlPending = false
+    var cameraRequestedCommand: CameraCommand?
+    var cameraDetail = "Camera is not verified"
     var phase = "Idle"
     var detail = "Prepare the camera and microphone to begin."
     var publisher = "Publisher not attached · local recording only"
@@ -36,6 +46,7 @@ final class CaptureRun {
     var audio: NativeAudioEncoder!
     var audioRoute: AudioInputRouting?
     var epoch: CMTime?
+    var videoTimeline = CameraVideoTimeline()
     var admitting = false
     var startup: [(sample: CMSampleBuffer, video: Bool)] = []
     var startupBytes = 0
@@ -86,6 +97,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var audioRoute: AudioInputRouting? // control owner; immutable reference captured by CaptureRun
     private var audioPin: (CaptureAdmission.Preparation, AudioInputPin)?
     private var audioEpoch: UInt64 = 0
+    private var cameraDevice: CameraDeviceControls? // control only; immutable source delegate owns video callbacks
+    private var cameraSwitchTimer: DispatchWorkItem?
+    private var deferredOrientation: CaptureOrientation?
+    private let cameraCommands = CameraCommandMailbox<CaptureAdmission.CameraSource>()
     private var configured = false // control queue only
     private var configuredProfile: CaptureIntent? // control queue only
     private var orientationPlan = OrientationRestartPlan()
@@ -155,6 +170,133 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             self.recordingBindingLock.unlock()
             completion(accepted)
         }
+    }
+    func selectCamera(_ position: CameraPosition) -> Bool {
+        canChooseCaptureProfile && admission.selectCamera(position)
+    }
+    func cameraCommand(_ command: CameraCommand, source: CaptureAdmission.CameraSource) {
+        guard admission.permitsCameraControls(source) else { return }
+        if cameraCommands.offer(source, command) { control.async { self.drainCameraCommands() } }
+    }
+    private func drainCameraCommands() {
+        for request in cameraCommands.take() {
+            let source = request.source; let command = request.command
+            guard admission.permitsCameraControls(source), let device = cameraDevice, device.source == source else { finishCameraCommand(request); continue }
+            guard device.capabilities.accepts(command) else { finishCameraCommand(request); snapshot.cameraDetail = "Camera control is unsupported or outside its current range"; publish(); continue }
+            do {
+                snapshot.cameraRequestedCommand = command; snapshot.cameraControlPending = true; publish()
+                try device.apply(command) { [weak self, weak device] in
+                    self?.control.async {
+                        guard let self else { return }
+                        let confirmed = self.finishCameraCommand(request)
+                        guard confirmed, let device, self.admission.permitsCameraControls(source), self.cameraDevice === device else { return }
+                        self.snapshot.cameraValues = device.values; self.snapshot.cameraCapabilities = device.capabilities
+                        self.snapshot.cameraControlPending = self.cameraCommands.pending(source); self.snapshot.cameraDetail = "Native-reported camera settings; remote picture is not verified"; self.publish()
+                    }
+                }
+            } catch {
+                guard admission.permitsCameraControls(source) else { continue }
+                finishCameraCommand(request)
+                snapshot.cameraControlPending = cameraCommands.pending(source); snapshot.cameraDetail = "Camera setting could not be applied"; publish()
+            }
+        }
+    }
+    @discardableResult private func finishCameraCommand(_ request: CameraCommandMailbox<CaptureAdmission.CameraSource>.Request) -> Bool {
+        guard let result = cameraCommands.complete(request) else { return false }
+        if result.schedule { control.async { self.drainCameraCommands() } }
+        return result.confirmed
+    }
+    func switchCamera(_ position: CameraPosition, source: CaptureAdmission.CameraSource) {
+        guard admission.permitsCameraControls(source),
+              let request = admission.reserveCameraSwitch(position, source: source, nowNs: DispatchTime.now().uptimeNanoseconds) else { return }
+        control.async { self.switchCameraOnControl(request) }
+    }
+    private func switchCameraOnControl(_ request: CaptureAdmission.CameraSwitch) {
+        guard admission.permitsCameraSwitch(request, nowNs: DispatchTime.now().uptimeNanoseconds),
+              let old = cameraDevice, let profile = request.owner.profile.videoProfile else {
+            if admission.rejectCameraSwitch(request) {
+                refreshCameraSnapshot(); snapshot.cameraDetail = "Camera request expired before source retirement"; publish(); applyDeferredOrientation()
+            }
+            return
+        }
+        guard !cameraCommands.pending(old.source), samples.sync(execute: { self.run == nil || self.run?.epoch != nil }) else {
+            _ = admission.rejectCameraSwitch(request); snapshot.cameraDetail = "Camera settings or capture startup are busy; try switching when ready"; publish(); return
+        }
+        snapshot.cameraRequested = request.position; snapshot.cameraPending = true; snapshot.cameraControl = nil
+        snapshot.canStart = false
+        snapshot.cameraDetail = "Checking requested camera; remote picture is not verified"; publish()
+        var retired = false
+        do {
+            let changed = try CameraSourceTransaction.perform(preflight: {
+                try CameraDeviceControls.preflight(position: request.position, profile: profile)
+            }, retire: { () -> CaptureAdmission.CameraSource? in
+                guard self.admission.permitsCameraSwitch(request, nowNs: DispatchTime.now().uptimeNanoseconds) else { return nil }
+                // All previously admitted raw work precedes this sample-owner
+                // boundary. Publish retirement before any native mutation or
+                // flush, so queued audio inherits the original deadline too.
+                return try CameraSourceTransaction.onSampleOwner(queue: self.samples, retire: {
+                    guard let source = self.admission.retireCameraSwitch(request, nowNs: DispatchTime.now().uptimeNanoseconds) else { return nil }
+                    retired = true; return source
+                }, seal: { _ in
+                    old.pause()
+                    if let run = self.run, let encoder = run.video {
+                        let duration = try encoder.sealForCameraSwitch()
+                        guard run.videoTimeline.beginSourceSwitch(sealedDuration: duration) else {
+                            throw CaptureFailure(message: "Camera switch has no valid media boundary")
+                        }
+                    }
+                }, sealFailed: { source, _ in
+                    // A real VT/prefix error is a samples-owned media fault,
+                    // even if ordinary Stop concurrently claimed cleanup.
+                    self.fenceCameraMedia(source.owner, reason: "Video encoder failed while sealing camera switch")
+                }, requestKeyframe: { _ in self.run?.video?.requestKeyframe() })
+            }, isCurrent: { self.admission.permitsCameraFrame($0) && self.admission.permitsCameraSwitch(request, nowNs: DispatchTime.now().uptimeNanoseconds) }, retirementStarted: { retired }, replace: { candidate, source in
+                try self.replaceCamera(candidate, source: source, orientation: self.orientationPlan.desired, profile: profile)
+            })
+            guard changed else {
+                if retired { failCamera(request.owner, reason: "Camera switch was cancelled or expired after producer retirement") }
+                else { _ = admission.rejectCameraSwitch(request); refreshCameraSnapshot(); publish(); applyDeferredOrientation() }
+                return
+            }
+            publish()
+            let timer = DispatchWorkItem { [weak self] in
+                guard let self, self.admission.pendingCameraSwitch == request else { return }
+                _ = self.admission.failCameraSwitch(request)
+                self.failCamera(request.owner, reason: "Camera switch exceeded six seconds; Stop and prepare again")
+            }
+            cameraSwitchTimer = timer
+            control.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: request.deadlineNs), execute: timer)
+        } catch {
+            if retired { _ = admission.failCameraSwitch(request); failCamera(request.owner, reason: "Camera switch failed after retiring the old source") }
+            else if admission.rejectCameraSwitch(request) {
+                refreshCameraSnapshot(); snapshot.cameraDetail = "Selected camera cannot provide the prepared format; current camera unchanged"; publish()
+                applyDeferredOrientation()
+            }
+        }
+    }
+    private func failCamera(_ preparation: CaptureAdmission.Preparation, reason: String) {
+        CameraSourceTransaction.claimFailure(claim: { self.admission.stop(preparation: preparation) }, markIncomplete: {
+            self.samples.sync {
+                guard let run = self.run, run.recordingTicket.request.preparation == preparation else { return }
+                run.admitting = false; run.recorder.markIncomplete(CaptureFailure(message: reason))
+            }
+        }, stop: { ticket in self.stopCaptured(ticket, reason: reason) })
+    }
+    private func refreshCameraSnapshot() {
+        let source = admission.cameraControlSource
+        snapshot.cameraControl = source
+        snapshot.cameraPending = admission.pendingCameraSwitch != nil
+        snapshot.cameraRequested = admission.pendingCameraSwitch?.position ?? admission.desiredCamera
+        snapshot.canStart = admission.currentPhase == .prepared && (source != nil || !snapshot.profile.hasVideo)
+        if let source, let device = cameraDevice, device.source == source {
+            snapshot.cameraActive = source.position
+            snapshot.cameraCapabilities = device.capabilities; snapshot.cameraValues = device.values
+        } else { snapshot.cameraActive = nil }
+    }
+    private func applyDeferredOrientation() {
+        guard deferredOrientation != nil else { return }
+        deferredOrientation = nil
+        if let observation = admission.latestOrientationObservation { applyOrientationObservation(observation) }
     }
     func selectAudioInput(_ id: String?) -> Bool {
         guard canChooseCaptureProfile else { return false }
@@ -315,6 +457,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 self.snapshot.orientation = orientation
             }
             self.snapshot.orientationChoice = ticket.orientationChoice
+            self.snapshot.cameraRequested = ticket.initialCamera; self.snapshot.cameraActive = nil
+            self.snapshot.cameraControl = nil; self.snapshot.cameraPending = false
             destination?.observeBroadcastEnd { [weak self] instant in self?.admission.broadcastEnded(ticket, nowNs: instant) }
             if self.configuredProfile != ticket.profile { self.configured = false }
             self.snapshot.profile = ticket.profile
@@ -335,44 +479,46 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
     func setOrientation(_ orientation: CaptureOrientation) {
         guard let observation = admission.observeOrientation(orientation) else { return }
-        control.async {
-            guard self.admission.permitsOrientation(observation) else { return }
-            guard (self.preparedIntent?.profile ?? self.snapshot.profile).hasVideo else { return }
-            guard self.orientationPlan.desired != observation.orientation else { return }
-            let token = self.orientationPlan.request(observation.orientation, running: self.snapshot.running)
-            if let token {
-                guard let intent = self.preparedIntent, let child = self.admission.beginRotation(intent) else {
-                    self.orientationPlan.cancel(); return
-                }
-                guard let deadline = RecordingCaptureAdmission.RotationDeadline(preparation: intent, nowNs: DispatchTime.now().uptimeNanoseconds) else {
-                    self.stopOnControl(reason: "Rotation deadline could not be established."); return
-                }
-                self.rotationDeadline = deadline
-                self.rotationIntent = child
-                let timeout = DispatchWorkItem { [weak self] in
-                    guard let self, self.orientationPlan.pending == token else { return }
-                    self.orientationPlan.cancel(); self.rotationTimeout = nil
-                    self.stopIntent = self.admission.stop(); self.recordingAdmission.cancel(self.stopIntent?.preparation); self.rotationIntent = nil
-                    self.fencePublishing()
-                    self.stopReason = "Rotation finalisation timed out; automatic restart cancelled."
-                    self.snapshot.detail = "Rotation finalisation exceeded six seconds. Automatic restart cancelled; cleanup may still finish."
-                    self.publish()
-                    self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.")
-                }
-                self.rotationTimeout = timeout
-                self.control.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: deadline.deadlineNs), execute: timeout)
-                self.stopOnControl(reason: nil)
-            } else if !self.stopping && !self.snapshot.running {
-                guard self.admission.currentPhase != .stopping, self.admission.currentPhase != .retained else { return }
-                do {
-                    let resumePreview = self.session.isRunning
-                    if self.configured { try self.applyOrientation() }
-                    self.snapshot.orientation = observation.orientation
-                    if resumePreview { self.setSampleDelivery(true); self.session.startRunning() }
-                    if self.snapshot.canStart { self.snapshot.detail = self.orientationDescription }
-                    self.publish()
-                } catch { self.report(error) }
+        control.async { self.applyOrientationObservation(observation) }
+    }
+    private func applyOrientationObservation(_ observation: CaptureAdmission.OrientationObservation) {
+        guard self.admission.permitsOrientation(observation) else { return }
+        guard (self.preparedIntent?.profile ?? self.snapshot.profile).hasVideo else { return }
+        if self.admission.pendingCameraSwitch != nil { self.deferredOrientation = observation.orientation; return }
+        guard self.orientationPlan.desired != observation.orientation else { return }
+        let token = self.orientationPlan.request(observation.orientation, running: self.snapshot.running)
+        if let token {
+            guard let intent = self.preparedIntent, let child = self.admission.beginRotation(intent) else {
+                self.orientationPlan.cancel(); return
             }
+            guard let deadline = RecordingCaptureAdmission.RotationDeadline(preparation: intent, nowNs: DispatchTime.now().uptimeNanoseconds) else {
+                self.stopOnControl(reason: "Rotation deadline could not be established."); return
+            }
+            self.rotationDeadline = deadline
+            self.rotationIntent = child
+            let timeout = DispatchWorkItem { [weak self] in
+                guard let self, self.orientationPlan.pending == token else { return }
+                self.orientationPlan.cancel(); self.rotationTimeout = nil
+                self.stopIntent = self.admission.stop(); self.recordingAdmission.cancel(self.stopIntent?.preparation); self.rotationIntent = nil
+                self.fencePublishing()
+                self.stopReason = "Rotation finalisation timed out; automatic restart cancelled."
+                self.snapshot.detail = "Rotation finalisation exceeded six seconds. Automatic restart cancelled; cleanup may still finish."
+                self.publish()
+                self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.")
+            }
+            self.rotationTimeout = timeout
+            self.control.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: deadline.deadlineNs), execute: timeout)
+            self.stopOnControl(reason: nil)
+        } else if !self.stopping && !self.snapshot.running {
+            guard self.admission.currentPhase != .stopping, self.admission.currentPhase != .retained else { return }
+            do {
+                let resumePreview = self.session.isRunning
+                if self.configured { try self.applyOrientation() }
+                self.snapshot.orientation = observation.orientation
+                if resumePreview { self.setSampleDelivery(true); self.session.startRunning() }
+                if self.snapshot.canStart { self.snapshot.detail = self.orientationDescription }
+                self.publish()
+            } catch { self.report(error) }
         }
     }
     private var orientationDescription: String {
@@ -386,13 +532,13 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard (preparedIntent?.profile ?? snapshot.profile).hasVideo else { return }
         setSampleDelivery(false)
         if session.isRunning { session.stopRunning() }
-        guard let output = session.outputs.compactMap({ $0 as? AVCaptureVideoDataOutput }).first,
-              let connection = output.connection(with: .video), connection.isVideoOrientationSupported else {
-            throw CaptureFailure(message: "Camera cannot rotate its encoded pixel buffers")
+        guard let preparation = preparedIntent, let profile = preparation.profile.videoProfile else { return }
+        let dimensions = profile.dimensions(for: orientationPlan.desired)
+        let candidate = try CameraDeviceControls.preflight(position: admission.desiredCamera, profile: profile)
+        guard let source = admission.initialCameraSource(canvas: .init(width: Int(dimensions.width), height: Int(dimensions.height))) else {
+            throw CaptureFailure(message: "Camera preparation was retired")
         }
-        // AVCaptureVideoDataOutput physically rotates buffers in hardware.
-        // Configure while stopped; the encoder receives actual upright pixels.
-        connection.videoOrientation = orientationPlan.desired.capture
+        try replaceCamera(candidate, source: source, orientation: orientationPlan.desired, profile: profile)
         snapshot.orientation = orientationPlan.desired
     }
     private func setSampleDelivery(_ enabled: Bool) {
@@ -400,7 +546,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         // A later epoch restores delegates only after its orientation is set.
         for output in session.outputs {
             if let video = output as? AVCaptureVideoDataOutput {
-                video.setSampleBufferDelegate(enabled ? self : nil, queue: enabled ? samples : nil)
+                if enabled, let device = cameraDevice, video === device.output { device.deliver(on: samples) }
+                else { video.setSampleBufferDelegate(nil, queue: nil) }
             } else if let audio = output as? AVCaptureAudioDataOutput {
                 audio.setSampleBufferDelegate(enabled ? self : nil, queue: enabled ? samples : nil)
             }
@@ -467,7 +614,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     guard self.admission.prepared(ticket) else { self.stopOnControl(reason: nil); return }
                     self.snapshot.phase = "Prepared"
                     self.snapshot.detail = self.orientationDescription
-                    self.snapshot.canStart = true
+                    self.snapshot.canStart = !ticket.profile.hasVideo || self.admission.cameraControlSource != nil
                     self.snapshot.publisher = self.ingress.status
                     self.publish()
                   } catch { self.stopOnControl(reason: error.localizedDescription) }
@@ -495,38 +642,75 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
         }
     }
+    private func replaceCamera(_ candidate: CameraDeviceControls.Candidate, source: CaptureAdmission.CameraSource,
+                               orientation: CaptureOrientation, profile: CaptureProfile) throws {
+        guard admission.permitsCameraFrame(source) else { throw CaptureFailure(message: "Camera source was retired") }
+        let previous = cameraDevice
+        previous?.pause()
+        samples.sync {} // old accepted work is ordered before the new source
+        let device = CameraDeviceControls(candidate: candidate, source: source, frame: { [weak self] source, sample in
+            self?.cameraFrame(source, sample: sample)
+        }, dropped: { [weak self] source in
+            self?.control.async {
+                guard let self, self.admission.permitsCameraControls(source) else { return }
+                self.snapshot.captureDrops += 1
+            }
+        })
+        session.beginConfiguration()
+        defer { session.commitConfiguration(); withExtendedLifetime(previous) {} }
+        cameraDevice = device // retain the new native candidate even if session mutation fails
+        if let previous {
+            if session.outputs.contains(where: { $0 === previous.output }) { session.removeOutput(previous.output) }
+            if session.inputs.contains(where: { $0 === previous.candidate.input }) { session.removeInput(previous.candidate.input) }
+        }
+        guard session.canAddInput(candidate.input) else { throw CaptureFailure(message: "Selected camera input is unsupported") }
+        session.addInput(candidate.input)
+        guard session.canAddOutput(device.output) else { throw CaptureFailure(message: "Selected camera output is unsupported") }
+        session.addOutput(device.output)
+        try device.configure(orientation: orientation, profile: profile)
+        device.deliver(on: samples)
+        cameraCommands.invalidate(); snapshot.cameraControlPending = false; snapshot.cameraRequestedCommand = nil
+        snapshot.cameraActive = nil; snapshot.cameraControl = nil
+        snapshot.cameraPreviewMirrored = source.position.previewMirrored
+        snapshot.cameraPending = admission.pendingCameraSwitch != nil
+        snapshot.cameraDetail = "Waiting for a valid native camera frame; remote picture is not verified"
+    }
+    /// Runs on the existing samples queue. No extra frame dispatch, pixel copy,
+    /// device getter, or allocation is added to the steady-state video path.
+    private func cameraFrame(_ source: CaptureAdmission.CameraSource, sample: CMSampleBuffer) {
+        let dimensions = CameraFrameGeometry.read(sample)
+        switch admission.cameraFrame(source, width: dimensions?.width ?? 0, height: dimensions?.height ?? 0, nowNs: DispatchTime.now().uptimeNanoseconds) {
+        case .stale: return
+        case .failed:
+            fenceCameraMedia(source.owner, reason: "Camera output changed format or missed the switch deadline"); return
+        case let .accepted(first):
+            if first { control.async {
+                guard self.admission.permitsCameraControls(source), self.cameraDevice?.source == source else { return }
+                self.cameraSwitchTimer?.cancel(); self.cameraSwitchTimer = nil
+                self.refreshCameraSnapshot()
+                self.snapshot.cameraDetail = "Native camera verified; remote picture is not verified"
+                self.publish(); self.applyDeferredOrientation()
+            } }
+            processCapture(sample, isVideo: true, source: source)
+        }
+    }
+    /// Samples-owner fault fence precedes the cold cleanup task. A withheld
+    /// control queue cannot keep microphone/media admission open after failure.
+    private func fenceCameraMedia(_ preparation: CaptureAdmission.Preparation, reason: String) {
+        if let run, run.recordingTicket.request.preparation == preparation {
+            run.admitting = false; run.startup.removeAll(); run.startupBytes = 0
+            run.recorder.markIncomplete(CaptureFailure(message: reason))
+        }
+        control.async { self.failCamera(preparation, reason: reason) }
+    }
     private func configure(profile: CaptureIntent) throws {
         session.beginConfiguration(); defer { session.commitConfiguration() }
+        cameraDevice?.pause(); cameraDevice = nil
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
         session.automaticallyConfiguresApplicationAudioSession = false
         guard let microphone = AVCaptureDevice.default(for: .audio) else { throw CaptureFailure(message: "Microphone unavailable") }
         let micInput = try AVCaptureDeviceInput(device: microphone)
-        if let cameraProfile = profile.videoProfile {
-            guard session.canSetSessionPreset(cameraProfile.sessionPreset) else { throw CaptureFailure(message: "\(profile.label) capture is unavailable") }
-            session.sessionPreset = cameraProfile.sessionPreset
-            guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { throw CaptureFailure(message: "Camera unavailable") }
-            let cameraInput = try AVCaptureDeviceInput(device: camera)
-            guard session.canAddInput(cameraInput) else { throw CaptureFailure(message: "Camera input is unsupported") }
-            session.addInput(cameraInput)
-            try camera.lockForConfiguration()
-            defer { camera.unlockForConfiguration() }
-            let rate = Double(cameraProfile.frameRate)
-            guard camera.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= rate && $0.maxFrameRate >= rate }) else { throw CaptureFailure(message: "\(profile.label) is unsupported on this camera") }
-            camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: cameraProfile.frameRate)
-            camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: cameraProfile.frameRate)
-            let video = AVCaptureVideoDataOutput()
-            video.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
-            video.alwaysDiscardsLateVideoFrames = true
-            video.setSampleBufferDelegate(self, queue: samples)
-            guard session.canAddOutput(video) else { throw CaptureFailure(message: "Camera output unavailable") }
-            session.addOutput(video)
-            guard let connection = video.connection(with: .video), connection.isVideoOrientationSupported else {
-                throw CaptureFailure(message: "Camera cannot produce physically oriented video buffers")
-            }
-            connection.videoOrientation = orientationPlan.desired.capture
-            snapshot.orientation = orientationPlan.desired
-        }
         guard session.canAddInput(micInput) else { throw CaptureFailure(message: "Microphone input is unsupported") }
         session.addInput(micInput)
         let audio = AVCaptureAudioDataOutput()
@@ -770,8 +954,18 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         if rotationToken == nil { fencePublishing() } else { fenceCodecEpoch() }
         storageTimer?.cancel(); storageTimer = nil
         snapshot.activeAudioInput = "Not active"
+        cameraSwitchTimer?.cancel(); cameraSwitchTimer = nil; deferredOrientation = nil
+        cameraCommands.invalidate(); snapshot.cameraControlPending = false
+        snapshot.cameraControl = nil; snapshot.cameraActive = nil; snapshot.cameraPending = false
         setSampleDelivery(false)
         if session.isRunning { session.stopRunning() }
+        if let device = cameraDevice {
+            session.beginConfiguration()
+            if session.outputs.contains(where: { $0 === device.output }) { session.removeOutput(device.output) }
+            if session.inputs.contains(where: { $0 === device.candidate.input }) { session.removeInput(device.candidate.input) }
+            session.commitConfiguration()
+            cameraDevice = nil
+        }
         snapshot.canStart = false
         guard snapshot.running else {
             snapshot.phase = "Finalising"
@@ -961,10 +1155,22 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         control.async { self.snapshot.level = level; self.publish() }
     }
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard !(output is AVCaptureVideoDataOutput) else { return }
+        processCapture(sampleBuffer, isVideo: false)
+    }
+    private func processCapture(_ sampleBuffer: CMSampleBuffer, isVideo: Bool, source: CaptureAdmission.CameraSource? = nil) {
         guard let run, run.admitting else { return }
         do {
             guard run.audioRoute?.awaitPCM() == true else { return }
-            let isVideo = output is AVCaptureVideoDataOutput
+            switch admission.cameraMedia(run.recordingTicket.request.preparation) {
+            case .stale: return
+            case .failed:
+                fenceCameraMedia(run.recordingTicket.request.preparation, reason: "Camera switch exceeded its original deadline"); return
+            case .allowed: break
+            }
+            if let source {
+                guard admission.permitsCameraFrame(source), run.recordingTicket.request.preparation == source.owner else { return }
+            }
             guard !isVideo || run.profile.hasVideo else { throw CaptureFailure(message: "Unexpected camera sample in audio-only capture") }
             if run.epoch == nil {
                 // Preserve early audio while waiting for the first camera
@@ -995,6 +1201,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard time.isValid, time.seconds >= 0 else { throw CaptureFailure(message: "Capture clock moved before the session epoch") }
         if video {
             guard let encoder = run.video else { throw CaptureFailure(message: "Video encoder is absent for this capture") }
+            guard run.videoTimeline.accept(time) else { throw CaptureFailure(message: "Camera timestamp changed its existing media timeline") }
             try encoder.encode(sample, time: time)
         }
         else { try run.audio.encode(sample, time: time) }

@@ -5,7 +5,41 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-The next upstream integration is pinned to `004be18`. RTMP now lives in
+The [native camera packet](native-camera-controls.md) now implements Front/Rear
+selection before Prepare, live source replacement and capability-bound zoom,
+focus, exposure and white-balance controls on both apps. A successful source
+change retains one hardware encoder, canvas, audio path, recording, publisher
+and grant. Front preview is mirrored separately from unmirrored encoded output;
+Android uses the facing-aware sensor/pose convention and complete producer crop.
+Requested settings and native acknowledgement remain distinct from optical
+convergence or remote playback. Microphone-only remains camera-free.
+
+Source retirement, first-frame deadlines, true video timestamp gaps, delayed
+callbacks, Stop and incomplete recordings have explicit ownership gates. The
+six-second operation ceiling retains the existing sub-two-second successful
+video-gap requirement and MPEG-TS limits. A source fault fences new camera/audio
+admission on its exact run. Normal Stop cannot rearm an old switch deadline or
+turn a successfully cancelled switch into an incomplete recording.
+
+The reviewed iOS V3 and Android V4 snapshots pass 205 Swift host tests and 67
+focused JVM tests with warnings as errors. All three unsigned iOS configurations
+and the actual Debug test bundle compile with compiler warnings as errors;
+the packaged creator-owner consumer passes 47 tests. The actual products pass
+required-reason privacy and byte-identical manual-profile corpus checks. The
+iOS device test bundle was compiled, not executed on a phone.
+
+Android Debug and Qualification each pass 449 tests in 57 suites with no failures,
+errors or skips. All three APK assemblies, lint and isolation pass. The actual
+ARM64 media library matches the current AAR, with 16 KiB ZIP and ELF alignment
+verified. Lint has 15/14 warnings and zero errors, including a cosmetic Compose
+function-naming warning in the new controls. Receipts are retained under
+`target/camera-controls/`, with final app gates in `delivery-v2/`. No device
+installation, capture interruption, private media, signer or live service was
+used. Physical source switching, preview/decoded geometry, controls, audio and
+recording continuity remain open, alongside standby, QR/deep-link and other
+B4R/B5 work. This does not claim a performance advantage over another app.
+
+The latest upstream integration is pinned to `004be18`. RTMP now lives in
 `sapflow-rtmp`; its publishing client and receiver retain this branch's bounded
 queues, explicit audio-only topology and terminal semantics. `TrackSet` lives
 in runtime-free `sapflow-core`, with the existing HLS exports retained, avoiding
@@ -28,8 +62,8 @@ encrypted passphrase acceptance/refusal. Receipts are retained under
 The `0.1.0` Apple, four-ABI Android and ARM64 development media SDKs are rebuilt
 and pass their installed ownership consumers. Their previous same-version
 archives are preserved with the `v2` receipts. The native app results and SDK
-hashes in that earlier record below belong to its exact prior source snapshot,
-and do not qualify the in-progress native camera packet. No phone capture,
+hashes in that earlier record below belong to its exact prior source snapshot;
+the camera packet's current app results are recorded above. No phone capture,
 signer, private media or live service was used by this integration.
 
 The source also integrates upstream library publication preparation at

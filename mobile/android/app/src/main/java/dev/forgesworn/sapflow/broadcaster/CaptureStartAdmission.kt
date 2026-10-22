@@ -4,11 +4,13 @@ package dev.forgesworn.sapflow.broadcaster
  * performed under this lock. Actual native cleanup releases each preparation. */
 internal class CaptureStartAdmission {
     class Preparation internal constructor(val id: Long, val intent: CaptureIntent, val audioInputId: String? = null,
-        val backgroundAudio: Boolean = false, val orientation: CaptureOrientationChoice.Selection? = null)
+        val backgroundAudio: Boolean = false, val orientation: CaptureOrientationChoice.Selection? = null,
+        val cameraChoice: CameraSourceChoice? = null)
     class Start internal constructor(val id: Long, val preparation: Preparation, val epoch: Long)
     private var serial = 0L
     private var current: Preparation? = null
     private var epoch = -1L
+    private var selectedCamera: CameraSourceChoice? = null
     private var live = false
     private var candidate = false
     private var committed = false
@@ -24,12 +26,13 @@ internal class CaptureStartAdmission {
     val preparation: Preparation? @Synchronized get() = current
     val elapsedPreparation: Preparation? @Synchronized get() = timingPreparation
     @Synchronized fun reserve(intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
-        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null): Preparation? {
+        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null, cameraChoice: CameraSourceChoice = CameraSourceChoice.REAR): Preparation? {
         if (current != null || serial == Long.MAX_VALUE) return null
         if (audioInputId != null && !AudioInputOption.validId(audioInputId)) return null
         if (backgroundAudio && intent.hasVideo) return null
         val frozen = if (intent.hasVideo) orientation ?: CaptureOrientationChoice.AUTO.freeze(true, true, CardinalPose.NATURAL) else null
-        return Preparation(++serial, intent, audioInputId, backgroundAudio, frozen).also {
+        return Preparation(++serial, intent, audioInputId, backgroundAudio, frozen, cameraChoice.takeIf { intent.hasVideo }).also {
+            selectedCamera = it.cameraChoice
             timingPreparation = it; elapsed.reset()
             current = it; epoch = -1; live = true; candidate = true; committed = false
             prepared = false; pending = null; preserve = false; cleaned = false; cleaning = false
@@ -45,6 +48,13 @@ internal class CaptureStartAdmission {
      * poses during its preserved orientation cleanup, as before. */
     @Synchronized fun permitsOrientation(value: Preparation): Boolean = current === value && live &&
         value.intent.hasVideo && value.orientation?.automatic == true
+    @Synchronized fun cameraChoice(value: Preparation): CameraSourceChoice? = selectedCamera.takeIf { current === value }
+    @Synchronized fun selectCamera(value: Preparation, choice: CameraSourceChoice): Boolean {
+        if (!permitsCamera(value)) return false
+        selectedCamera = choice; return true
+    }
+    @Synchronized fun canSwitchCamera(value: Preparation): Boolean = permitsCamera(value) && pending == null && !cleaning
+    @Synchronized fun permitsCamera(value: Preparation): Boolean = current === value && live && value.intent.hasVideo
     /** Only a queued Prepare that never constructed owners may abandon. */
     @Synchronized fun abandon(value: Preparation) {
         if (current != value || !candidate) return

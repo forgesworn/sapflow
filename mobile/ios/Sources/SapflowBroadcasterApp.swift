@@ -13,6 +13,7 @@ final class BroadcasterModel: ObservableObject {
     @Published private(set) var selectedAudioInputID: String?
     @Published private(set) var captureProfile = CaptureIntent.defaultProfile
     @Published private(set) var continueAudioInBackground = false
+    @Published private(set) var selectedCamera = CameraPosition.rear
     @Published private(set) var orientationChoice = CaptureOrientationChoice.automatic
     @Published var destinationMode = BroadcasterDestinationMode.recording {
         didSet {
@@ -70,6 +71,11 @@ final class BroadcasterModel: ObservableObject {
     var canChangeCaptureProfile: Bool {
         recordingLibrary.captureAllowed && engine.canChooseCaptureProfile && (destinationMode != .v4v || creatorOwner?.canChangeCaptureSettings != false)
     }
+    func selectCamera(_ position: CameraPosition) {
+        guard canChangeCaptureProfile, engine.selectCamera(position) else { return }; selectedCamera = position
+    }
+    func cameraCommand(_ command: CameraCommand, source: CaptureAdmission.CameraSource) { engine.cameraCommand(command, source: source) }
+    func switchCamera(_ position: CameraPosition, source: CaptureAdmission.CameraSource) { engine.switchCamera(position, source: source) }
     func selectAudioInput(_ id: String?) {
         guard canChangeCaptureProfile, engine.selectAudioInput(id) else { return }
         selectedAudioInputID = id
@@ -185,6 +191,22 @@ final class BroadcasterModel: ObservableObject {
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     let orientation: CaptureOrientation
+    let mirrored: Bool
+    let source: CaptureAdmission.CameraSource?
+    let point: (CaptureAdmission.CameraSource, CameraPoint) -> Void
+    final class Coordinator: NSObject {
+        weak var surface: Surface?
+        var source: CaptureAdmission.CameraSource?
+        var point: (CaptureAdmission.CameraSource, CameraPoint) -> Void
+        init(point: @escaping (CaptureAdmission.CameraSource, CameraPoint) -> Void) { self.point = point }
+        @objc func tapped(_ recognizer: UITapGestureRecognizer) {
+            guard let surface, let source else { return }
+            let value = surface.preview.captureDevicePointConverted(fromLayerPoint: recognizer.location(in: surface))
+            let native = CameraPoint(x: value.x, y: value.y)
+            if native.valid { point(source, native) }
+        }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(point: point) }
     final class Surface: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
         var preview: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
@@ -193,12 +215,18 @@ struct CameraPreview: UIViewRepresentable {
         let view = Surface()
         view.preview.session = session
         view.preview.videoGravity = .resizeAspect
+        context.coordinator.surface = view; context.coordinator.source = source
+        view.addGestureRecognizer(UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:))))
         if let connection = view.preview.connection, connection.isVideoOrientationSupported { connection.videoOrientation = orientation.capture }
+        updateUIView(view, context: context)
         return view
     }
     func updateUIView(_ view: Surface, context: Context) {
+        context.coordinator.source = source; context.coordinator.point = point
         if let connection = view.preview.connection, connection.isVideoOrientationSupported {
             connection.videoOrientation = orientation.capture
+            connection.automaticallyAdjustsVideoMirroring = false
+            if connection.isVideoMirroringSupported { connection.isVideoMirrored = mirrored }
         }
     }
 }
@@ -270,7 +298,11 @@ struct BroadcasterView: View {
     private var preview: some View {
         Group {
             if model.captureProfile.hasVideo {
-                CameraPreview(session: model.engine.session, orientation: model.snapshot.orientation)
+                CameraPreview(session: model.engine.session, orientation: model.snapshot.orientation,
+                              mirrored: model.snapshot.cameraPreviewMirrored, source: model.snapshot.cameraControl) { source, point in
+                    if model.snapshot.cameraCapabilities.focusPoint && model.snapshot.cameraCapabilities.focusAuto { model.cameraCommand(.focusPoint(point), source: source) }
+                    if model.snapshot.cameraCapabilities.exposurePoint && model.snapshot.cameraCapabilities.exposureAuto { model.cameraCommand(.exposurePoint(point), source: source) }
+                }
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "mic.fill").font(.largeTitle)
@@ -323,6 +355,10 @@ struct BroadcasterView: View {
                     ForEach(model.captureProfiles, id: \.self) { Text($0.label).tag($0) }
                 }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.quality")
                 if model.captureProfile.hasVideo {
+                    Picker("Initial camera", selection: Binding(get: { model.selectedCamera }, set: { model.selectCamera($0) })) {
+                        ForEach(CameraPosition.allCases) { position in Text(position.label).tag(position) }
+                    }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.camera")
+                    cameraControls
                     Picker("Capture orientation", selection: Binding(get: { model.orientationChoice }, set: { model.selectOrientationChoice($0) })) {
                         ForEach(CaptureOrientationChoice.allCases) { choice in Text(choice.label).tag(choice) }
                     }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.orientationChoice")
@@ -346,6 +382,50 @@ struct BroadcasterView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.vertical)
         }.scrollDismissesKeyboard(.interactively)
+    }
+    @ViewBuilder private var cameraControls: some View {
+        Text("Native camera: \(model.snapshot.cameraActive?.label ?? "Not verified")").font(.caption)
+        Text(model.snapshot.cameraDetail).font(.caption).foregroundStyle(.secondary)
+        if model.snapshot.cameraPending { Text("Camera switch pending").font(.caption) }
+        if let source = model.snapshot.cameraControl {
+            let caps = model.snapshot.cameraCapabilities
+            HStack {
+                ForEach(CameraPosition.allCases) { position in
+                    Button("Switch to \(position.label)") { model.switchCamera(position, source: source) }
+                        .disabled(position == source.position || model.snapshot.cameraPending)
+                }
+            }
+            if caps.valid {
+                if caps.maximumZoom > caps.minimumZoom {
+                    Text(String(format: "Native zoom %.2f×", model.snapshot.cameraValues.zoom)).font(.caption)
+                    Slider(value: Binding(get: { min(caps.maximumZoom, max(caps.minimumZoom, model.snapshot.cameraValues.zoom)) },
+                                          set: { model.cameraCommand(.zoom($0), source: source) }), in: caps.minimumZoom...caps.maximumZoom)
+                        .accessibilityLabel("Camera zoom")
+                }
+                HStack {
+                    if caps.focusAuto { Button("Auto focus") { model.cameraCommand(.focus(.automatic), source: source) } }
+                    if caps.focusLock { Button("Lock focus") { model.cameraCommand(.focus(.locked), source: source) } }
+                }
+                HStack {
+                    if caps.exposureAuto { Button("Auto exposure") { model.cameraCommand(.exposure(.automatic), source: source) } }
+                    if caps.exposureLock { Button("Lock exposure") { model.cameraCommand(.exposure(.locked), source: source) } }
+                }
+                if caps.maximumBias > caps.minimumBias {
+                    Text(String(format: "Native exposure compensation %+.1f EV", model.snapshot.cameraValues.bias)).font(.caption)
+                    Slider(value: Binding(get: { min(caps.maximumBias, max(caps.minimumBias, model.snapshot.cameraValues.bias)) },
+                                          set: { model.cameraCommand(.bias($0), source: source) }), in: caps.minimumBias...caps.maximumBias)
+                        .accessibilityLabel("Exposure compensation")
+                }
+                HStack {
+                    if caps.whiteBalanceAuto { Button("Auto white balance") { model.cameraCommand(.whiteBalance(.automatic), source: source) } }
+                    if caps.whiteBalanceLock { Button("Lock white balance") { model.cameraCommand(.whiteBalance(.locked), source: source) } }
+                }
+                if caps.focusPoint || caps.exposurePoint { Text("Tap the preview to focus/expose where supported. Front preview is mirrored; recording and broadcast pixels are unmirrored.").font(.caption) }
+                Text("Native modes: focus \(model.snapshot.cameraValues.focus.rawValue), exposure \(model.snapshot.cameraValues.exposure.rawValue), white balance \(model.snapshot.cameraValues.whiteBalance.rawValue)").font(.caption)
+                if let requested = model.snapshot.cameraRequestedCommand { Text("Requested: " + requested.label).font(.caption) }
+                if model.snapshot.cameraControlPending { Text("Camera setting pending; waiting for native observation").font(.caption) }
+            }
+        }
     }
     @ViewBuilder private var destinationForm: some View {
         Picker("Destination", selection: $model.destinationMode) {

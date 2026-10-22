@@ -428,6 +428,10 @@ The [native orientation contract](capture-orientation.md) separates the default
 Automatic behaviour from a fixed mounting choice frozen before Prepare, and
 defines the physical preview, decoder and recording qualification still needed.
 
+The [native camera contract](native-camera-controls.md) defines source ownership,
+live Front/Rear switching within one encoder/show, unmirrored transmitted pixels,
+capability-bound controls and the source and physical gates for that B4R packet.
+
 ### B5 First release qualification
 
 Treat the following as initial acceptance targets. B0 may revise a target

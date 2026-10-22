@@ -113,11 +113,21 @@ class CaptureController internal constructor(private val context: Context,
     @Volatile private var publishStatus = "No publisher attached"
     @Volatile private var recordStatus = "No recorder attached"
     @Volatile private var recordingFailed = false
-    private var camera: CameraDevice? = null
-    private var session: CameraCaptureSession? = null
+    @Volatile private var cameraOwner: CameraCaptureOwner? = null
+    @Volatile private var sourcePolicy = CameraSourcePolicy()
+    @Volatile private var sourceRequests = CameraRequestSlot()
+    private var sourceRequest: CameraRequestSlot.Ticket? = null
+    @Volatile private var runAdmission = CameraRunAdmission(-1)
+    private var sourceSerial = 0L // Never reused across orientation epochs within this controller.
+    private var sourceOperation: CameraSourcePolicy.Operation? = null
+    private var cameraDesired = CameraSourceChoice.REAR
+    private var sourceDeadline: Runnable? = null
+    private var deferredCameraPose = false
+    private val poseInputs = CameraPoseInput<CaptureStartAdmission.Preparation>()
+    @Volatile private var cameraView = CameraSourceSnapshot()
+    @Volatile private var controlMailbox = CameraControlMailbox()
     private var preview: Surface? = null
     private var cameraInput: Surface? = null
-    private var autofocusMode = CaptureRequest.CONTROL_AF_MODE_OFF
     private var encoderSurface: Surface? = null
     private var videoEncoder: PlatformCodec? = null
     private var audioEncoder: PlatformCodec? = null
@@ -243,10 +253,10 @@ class CaptureController internal constructor(private val context: Context,
     internal fun revalidatePublishingAuthority() { publishingSession?.revalidateAuthority() }
 
     internal fun prepare(previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
-        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null): CaptureStartAdmission.Preparation? {
+        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null, cameraChoice: CameraSourceChoice = CameraSourceChoice.REAR): CaptureStartAdmission.Preparation? {
         val canPrepare = snapshot().canPrepare
         val frozen = orientation ?: CaptureOrientationChoice.AUTO.freeze(intent.hasVideo, observedNaturalPortrait, observedPose)
-        val ticket = startAdmission.reserve(intent, audioInputId, backgroundAudio, frozen) ?: return null
+        val ticket = startAdmission.reserve(intent, audioInputId, backgroundAudio, frozen, cameraChoice) ?: return null
         val admitted = try { prepareAdmission.submit(intent, canPrepare, { handler.post(it) }) admitted@{ requestedIntent ->
             if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) { startAdmission.abandon(ticket); return@admitted }
             if (videoEncoder != null || renderer != null || teardownStarted) {
@@ -256,6 +266,7 @@ class CaptureController internal constructor(private val context: Context,
             }
             if (!startAdmission.claim(ticket)) { startAdmission.abandon(ticket); return@admitted }
             preparation = ticket
+            cameraDesired = ticket.cameraChoice ?: CameraSourceChoice.REAR
             ticket.orientation?.let {
                 check(restart.pending == null) { "Previous orientation cleanup is unfinished" }
                 naturalPortrait = it.naturalPortrait
@@ -284,6 +295,7 @@ class CaptureController internal constructor(private val context: Context,
         message = if (captureIntent.hasVideo) "Preparing hardware pixel rotation and native audio" else "Preparing microphone and native AAC"
         generation++
         drainGeneration = generation
+        runAdmission = CameraRunAdmission(drainGeneration)
         audioRouteFailed = false; audioRouteFailure = null
         captureEpoch = drainGeneration
         lifecycle.beginEpoch(captureEpoch)
@@ -345,23 +357,28 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     internal fun orientationChanged(pose: CardinalPose) {
-        observedPose = pose // Shadow input for a future explicit Auto Prepare.
-        val owner = startAdmission.preparation ?: return
-        handler.post {
-            if (shutdownRequested || !startAdmission.permitsOrientation(owner)) return@post
-            val active = videoEncoder != null || renderer != null
-            val ticket = restart.request(pose, active, System.nanoTime())
-            if (ticket != null) {
-                traceLifecycle(CaptureLifecycleDiagnostics.Code.ORIENTATION_REQUEST)
-                restartDeadline?.let(handler::removeCallbacks)
-                restartDeadline = Runnable {
-                    if (restart.pending?.token == ticket.token && restart.expired(System.nanoTime())) {
-                        markFailure(CaptureLifecycleDiagnostics.Code.ORIENTATION_TIMEOUT, "Orientation restart exceeded six seconds")
-                        stopOnHandler("Orientation restart exceeded six seconds", failed = true)
-                    }
-                }.also { handler.postDelayed(it, ((ticket.deadlineNs - System.nanoTime()).coerceAtLeast(0) + 999_999) / 1_000_000) }
-                stopOnHandler("Changing encoded orientation; finalising the previous file", failed = false)
-            }
+        observedPose = pose // Only real physical/qualification input writes the future Auto shadow.
+        val observation = poseInputs.record(startAdmission.preparation, pose)
+        if (observation.owner != null) handler.post { applyOrientation(observation) }
+    }
+
+    private fun applyOrientation(observation: CameraPoseInput.Observation<CaptureStartAdmission.Preparation>) {
+        val owner = observation.owner ?: return
+        if (shutdownRequested || !startAdmission.permitsOrientation(owner) || !poseInputs.isCurrent(observation)) return
+        if (sourcePolicy.pending()) { deferredCameraPose = true; return }
+        val pose = observation.pose
+        val active = videoEncoder != null || renderer != null
+        val ticket = restart.request(pose, active, System.nanoTime())
+        if (ticket != null) {
+            traceLifecycle(CaptureLifecycleDiagnostics.Code.ORIENTATION_REQUEST)
+            restartDeadline?.let(handler::removeCallbacks)
+            restartDeadline = Runnable {
+                if (restart.pending?.token == ticket.token && restart.expired(System.nanoTime())) {
+                    markFailure(CaptureLifecycleDiagnostics.Code.ORIENTATION_TIMEOUT, "Orientation restart exceeded six seconds")
+                    stopOnHandler("Orientation restart exceeded six seconds", failed = true)
+                }
+            }.also { handler.postDelayed(it, ((ticket.deadlineNs - System.nanoTime()).coerceAtLeast(0) + 999_999) / 1_000_000) }
+            stopOnHandler("Changing encoded orientation; finalising the previous file", failed = false)
         }
     }
 
@@ -369,6 +386,7 @@ class CaptureController internal constructor(private val context: Context,
     private fun prepareOnHandler(previewSurface: Surface?, token: Long) {
         if (!captureIntent.hasVideo) {
             plan = null; preview = null; recordingFailed = false
+            cameraView = CameraSourceSnapshot(status = "No camera · microphone only")
             videoEncoderName = "Not used · microphone only"; rendererStatus = "No camera or GPU"
             orientationStatus = "Microphone only · AAC-LC 48 kHz mono · 96 kbit/s"
             rendererStopped = true; rendererClosed = true; cameraClosed = true
@@ -386,23 +404,25 @@ class CaptureController internal constructor(private val context: Context,
         require(previewSurface.isValid) { "Preview surface is unavailable" }
         preview = previewSurface
         recordingFailed = false
-        val manager = context.getSystemService(CameraManager::class.java)
         val pose = restart.desiredPose
-        val cameraId = manager.cameraIdList.firstOrNull { id ->
-            val c = manager.getCameraCharacteristics(id)
-            val sensor = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: return@firstOrNull false
-            val candidate = OrientationPlan.forRear(sensor, pose, naturalPortrait, captureProfile)
-            c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
-                (Build.VERSION.SDK_INT >= 33 || c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) &&
-                c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.getOutputSizes(SurfaceTexture::class.java)?.contains(Size(candidate.cameraWidth, candidate.cameraHeight)) == true &&
-                c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.contains(Range(30, 30)) == true
-        } ?: error("No rear camera supports the upright 720p30 GPU input and a validated timestamp source")
-        val characteristics = manager.getCameraCharacteristics(cameraId)
-        val selected = OrientationPlan.forRear(characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)!!, pose, naturalPortrait, captureProfile)
+        cameraDesired = preparation?.let(startAdmission::cameraChoice) ?: cameraDesired
+        val descriptor = CameraCaptureOwner.discover(context, cameraDesired, OrientationPlan.forRear(0, pose, naturalPortrait, captureProfile))
+        val selected = descriptor.plan
         plan = selected
-        orientationStatus = "${captureProfile.label} · ${captureProfile.videoBps} bps AVC + ${captureProfile.audioBps} bps AAC · ${selected.width}×${selected.height} · ${pose.name} · natural texture rotation ${selected.encoderClockwiseDegrees}°"
-        autofocusMode = if (characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) == true)
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO else CaptureRequest.CONTROL_AF_MODE_OFF
+        sourceRequests.close(); sourceRequests = CameraRequestSlot(); sourceRequest = null
+        sourcePolicy = CameraSourcePolicy(initialSerial = sourceSerial)
+        val operation = checkNotNull(sourcePolicy.begin(cameraDesired, System.nanoTime()))
+        sourceOperation = operation; sourceSerial = operation.serial
+        val sourceAdmission = runAdmission.beginSource(operation)
+        if (!sourceAdmission.admitted) {
+            if (sourceAdmission.requiresFailure) fail("Camera run is no longer admitting a source")
+            return // Ordinary Stop cancellation must not become a new camera fault.
+        }
+        check(sourcePolicy.cameraClosed(operation, System.nanoTime()))
+        controlMailbox.close(); controlMailbox = CameraControlMailbox()
+        cameraView = CameraSourceSnapshot(cameraDesired, busy = true, status = "Opening ${cameraDesired.label} camera")
+        armSourceDeadline(operation)
+        orientationStatus = "${captureProfile.label} · ${captureProfile.videoBps} bps AVC + ${captureProfile.audioBps} bps AAC · ${selected.width}×${selected.height} · ${pose.name} · native pixel rotation ${selected.encoderClockwiseDegrees}°"
 
         val videoInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
             info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } &&
@@ -434,70 +454,153 @@ class CaptureController internal constructor(private val context: Context,
 
         prepareAudio(token)
         video.start()
-        val mapper = if (Build.VERSION.SDK_INT >= 33) CameraTimestampMapper.monotonic() else CameraTimestampMapper.realtime()
-        renderer = CameraGlRenderer(selected.cameraWidth, selected.cameraHeight, selected, mapper, token, handler,
+        val rawRun = runAdmission
+        renderer = CameraGlRenderer(selected.cameraWidth, selected.cameraHeight, selected, sourceMapper(), token, handler,
             onReady = { input, diagnostic ->
-                if (token == generation && stage == CaptureStage.PREPARING) {
-                    cameraInput = input
-                    rendererStatus = diagnostic
-                    renderer?.setPreview(preview, previewWidth, previewHeight, displayDegrees)
-                    cameraClosed = false
-                    try {
-                        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                            override fun onOpened(device: CameraDevice) {
-                                if (token != generation || stage != CaptureStage.PREPARING) { device.close(); return }
-                                camera = device
-                                val output = OutputConfiguration(input)
-                                if (Build.VERSION.SDK_INT >= 33) output.timestampBase = OutputConfiguration.TIMESTAMP_BASE_MONOTONIC
-                                device.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, listOf(output), Executor { handler.post(it) }, object : CameraCaptureSession.StateCallback() {
-                                    override fun onConfigured(configured: CameraCaptureSession) {
-                                        if (token != generation || stage != CaptureStage.PREPARING) { configured.close(); return }
-                                        try {
-                                            session = configured
-                                            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                                                addTarget(input)
-                                                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30, 30))
-                                                set(CaptureRequest.CONTROL_AF_MODE, autofocusMode)
-                                                if (Build.VERSION.SDK_INT >= 31 && characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_ROTATE_AND_CROP_MODES)?.contains(CaptureRequest.SCALER_ROTATE_AND_CROP_NONE) == true)
-                                                    set(CaptureRequest.SCALER_ROTATE_AND_CROP, CaptureRequest.SCALER_ROTATE_AND_CROP_NONE)
-                                            }.build()
-                                            configured.setRepeatingRequest(request, null, handler)
-                                            if (restart.desiredPose != selected.pose) {
-                                                stopOnHandler("Pose changed during preparation; using the latest pose", false)
-                                                return
-                                            }
-                                            stage = CaptureStage.PREPARED
-                                            val intent = preparation
-                                            if (intent == null || !startAdmission.prepared(intent, token)) {
-                                                stopOnHandler("Capture approval ended before preparation completed", false)
-                                                return
-                                            }
-                                            traceLifecycle(CaptureLifecycleDiagnostics.Code.PREPARED)
-                                            message = "Ready: upright ${selected.width}×${selected.height} hardware video and AAC"
-                                            if (autoStart) startAdmission.start(intent)?.let(::startOnHandler)
-                                            else restart.pending?.let {
-                                                check(restart.complete(it.token, System.nanoTime()) != null) { "Orientation preparation deadline expired" }
-                                                restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
-                                            }
-                                            if (!autoStart) restart.beginSession()
-                                        } catch (error: Exception) { fail("Camera start failed: ${error.message}") }
-                                    }
-                                    override fun onConfigureFailed(failed: CameraCaptureSession) { failed.close(); if (token == generation) fail("Camera GPU input session was refused") }
-                                }))
-                            }
-                            override fun onClosed(device: CameraDevice) {
-                                if (token == drainGeneration) { cameraClosed = true; finishStoppedEpoch() }
-                            }
-                            override fun onDisconnected(device: CameraDevice) { device.close(); if (token == generation) fail("Camera disconnected") }
-                            override fun onError(device: CameraDevice, code: Int) { device.close(); if (token == generation) fail("Camera interrupted (error $code)") }
-                        }, handler)
-                    } catch (error: Exception) { cameraClosed = true; fail("Camera open failed: ${error.message}") }
-                }
+                rendererStatus = diagnostic
+                renderer?.setPreview(preview, previewWidth, previewHeight, displayDegrees)
+                openSource(operation, descriptor, input, token)
             }, onFailure = { reason -> if (token == drainGeneration) {
                 autoStart = false; restart.cancel()
                 if (stoppingEpoch) { markFailure(CaptureLifecycleDiagnostics.Code.GPU_FAILURE, reason); stopReason = reason }
                 else fail(reason, CaptureLifecycleDiagnostics.Code.GPU_FAILURE)
-            } })
+            } }, initialSourceToken = operation.serial, initialFront = cameraDesired == CameraSourceChoice.FRONT,
+            initialLegacyMirror = descriptor.legacyMirror, rawAdmission = rawRun,
+            onSourceFrame = { serial, observedAtNs -> sourceFrame(serial, token, observedAtNs) })
+    }
+
+    private fun sourceMapper(): CameraTimestampMapper = if (Build.VERSION.SDK_INT >= 33) CameraTimestampMapper.monotonic() else CameraTimestampMapper.realtime()
+
+    internal fun cameraSnapshot(): CameraSourceSnapshot {
+        val view = cameraView; val native = cameraOwner
+        return CameraSourceSnapshot(view.requested, view.active, view.sourceToken, view.busy || sourceRequests.busy(),
+            if (!view.busy && sourceRequests.busy()) "Checking camera capabilities" else view.status, view.capabilities,
+            native?.requestedSettings ?: view.requestedSettings, native?.revision ?: 0, native?.confirmedRevision ?: 0,
+            native?.nativeZoom?.takeIf { it.isFinite() }, native?.nativeExposure?.takeIf { it != Int.MIN_VALUE }, native?.nativeWhiteBalance?.takeIf { it >= 0 },
+            native?.focusState?.takeIf { it >= 0 }, native?.exposureState?.takeIf { it >= 0 }, native?.whiteBalanceState?.takeIf { it >= 0 }, native?.controlsPending ?: false)
+    }
+
+    private fun sourceCurrent(operation: CameraSourcePolicy.Operation, epoch: Long): Boolean {
+        val ticket = preparation ?: return false
+        return epoch == generation && !stoppingEpoch && startAdmission.permitsCamera(ticket) && sourcePolicy.owns(operation)
+    }
+
+    private fun armSourceDeadline(operation: CameraSourcePolicy.Operation) {
+        sourceDeadline?.let(handler::removeCallbacks)
+        val epoch = generation
+        sourceDeadline = Runnable {
+            if (sourcePolicy.owns(operation) && !sourcePolicy.active(operation)) {
+                renderer?.sourceFrameNs(operation.serial)?.let { sourceFrame(operation.serial, epoch, it) }
+            }
+            if (sourcePolicy.owns(operation) && !sourcePolicy.active(operation)) fail("Camera switch exceeded six seconds; native cleanup must finish before another Prepare")
+        }.also { handler.postDelayed(it, ((operation.deadlineNs - System.nanoTime()).coerceAtLeast(0) + 999_999) / 1_000_000) }
+    }
+
+    private fun openSource(operation: CameraSourcePolicy.Operation, descriptor: CameraCaptureOwner.Descriptor, input: Surface, epoch: Long) {
+        if (!sourceCurrent(operation, epoch)) return
+        if (!sourcePolicy.textureReady(operation, System.nanoTime())) { fail("Camera source deadline expired before native open"); return }
+        cameraInput = input
+        if (context.checkSelfPermission(android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) { fail("Camera permission is no longer available"); return }
+        val manager = context.getSystemService(CameraManager::class.java)
+        val native = CameraCaptureOwner(manager, descriptor, input, handler, { sourceCurrent(operation, epoch) },
+            onConfigured = { if (sourceCurrent(operation, epoch) && !sourcePolicy.configured(operation, System.nanoTime())) fail("Camera source deadline expired while configuring") },
+            onFailure = { if (sourceCurrent(operation, epoch)) fail("${descriptor.choice.label} camera source failed; no fallback was selected") })
+        cameraOwner = native; cameraClosed = false
+        native.open()
+    }
+
+    private fun sourceFrame(serial: Long, epoch: Long, observedAtNs: Long) {
+        val operation = sourceOperation ?: return
+        if (operation.serial != serial || !sourceCurrent(operation, epoch) || sourcePolicy.active(operation)) return
+        if (runAdmission.failure != null) { fail("Camera source faulted before native frame admission completed"); return }
+        if (!sourcePolicy.frame(operation, observedAtNs)) { fail("Camera source deadline expired before its first valid frame"); return }
+        sourceDeadline?.let(handler::removeCallbacks); sourceDeadline = null
+        sourceRequest?.let(sourceRequests::release); sourceRequest = null
+        val native = cameraOwner ?: return
+        cameraView = CameraSourceSnapshot(operation.choice, operation.choice, operation.serial, false,
+            "${operation.choice.label} native frame confirmed · remote source change not verified", native.descriptor.capabilities, native.requestedSettings)
+        if (stage == CaptureStage.PREPARING) {
+            val intent = preparation ?: return
+            if (!startAdmission.prepared(intent, epoch)) { stopOnHandler("Capture approval ended before preparation completed", false); return }
+            stage = CaptureStage.PREPARED
+            traceLifecycle(CaptureLifecycleDiagnostics.Code.PREPARED)
+            message = "Ready: upright ${plan?.width}×${plan?.height} hardware video and AAC"
+            if (autoStart) startAdmission.start(intent)?.let(::startOnHandler)
+            else restart.pending?.let {
+                if (restart.complete(it.token, System.nanoTime()) == null) { fail("Orientation preparation deadline expired"); return }
+                restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
+            }
+            if (!autoStart) restart.beginSession()
+        } else if (stage == CaptureStage.CAPTURING) {
+            // Same encoder/configuration/timeline. One cold IDR request helps
+            // decoders see the new scene; no transport attempt is replaced.
+            runCatching { videoEncoder?.setParameters(android.os.Bundle().apply { putInt(PlatformCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }) }
+        }
+        if (deferredCameraPose) {
+            deferredCameraPose = false
+            preparation?.let { owner -> poseInputs.latest(owner)?.let(::applyOrientation) }
+        }
+    }
+
+    internal fun switchCamera(ticket: CaptureStartAdmission.Preparation, choice: CameraSourceChoice, expectedSourceToken: Long): Boolean {
+        if (!startAdmission.canSwitchCamera(ticket) || !sourcePolicy.acceptsControl(expectedSourceToken) || cameraView.sourceToken != expectedSourceToken) return false
+        val slot = sourceRequests
+        val request = slot.reserve() ?: return false
+        val requestedNs = System.nanoTime()
+        val posted = handler.post {
+            var handedOff = false
+            try {
+            if (slot !== sourceRequests || !slot.owns(request) || !startAdmission.canSwitchCamera(ticket) || (!sourcePolicy.acceptsControl(expectedSourceToken) || cameraView.sourceToken != expectedSourceToken) || preparation !== ticket || stage !in listOf(CaptureStage.PREPARED, CaptureStage.CAPTURING) || startPending || sourcePolicy.pending()) return@post
+            val current = cameraOwner ?: return@post
+            if (current.descriptor.choice == choice) return@post
+            val descriptor = try { CameraCaptureOwner.discover(context, choice, checkNotNull(plan)) }
+                catch (_: Exception) { cameraView = CameraSourceSnapshot(choice, current.descriptor.choice, cameraView.sourceToken, false,
+                    "${choice.label} is unavailable for this canvas; current source retained", current.descriptor.capabilities, current.requestedSettings); return@post }
+            val deadline = try { Math.addExact(requestedNs, 6_000_000_000L) } catch (_: ArithmeticException) { return@post }
+            if (System.nanoTime() >= deadline) {
+                cameraView = CameraSourceSnapshot(choice, current.descriptor.choice, cameraView.sourceToken, false,
+                    "Camera preflight exceeded six seconds; current source retained", current.descriptor.capabilities, current.requestedSettings)
+                return@post
+            }
+            val operation = sourcePolicy.begin(choice, requestedNs) ?: return@post
+            if (!startAdmission.selectCamera(ticket, choice)) { sourcePolicy.close(); return@post }
+            sourceOperation = operation; sourceSerial = operation.serial; cameraDesired = choice
+            val sourceAdmission = runAdmission.beginSource(operation)
+            if (!sourceAdmission.admitted) {
+                if (sourceAdmission.requiresFailure) fail("Camera run is no longer admitting a source")
+                return@post
+            }
+            sourceRequest = request; handedOff = true
+            controlMailbox.close(); controlMailbox = CameraControlMailbox()
+            renderer?.fenceSource()
+            cameraView = CameraSourceSnapshot(choice, busy = true, status = "Switching to ${choice.label}; accepted output may still drain")
+            armSourceDeadline(operation)
+            val epoch = generation
+            current.close {
+                if (cameraOwner !== current) return@close
+                cameraOwner = null; cameraClosed = true
+                if (stoppingEpoch) { finishStoppedEpoch(); return@close }
+                if (!sourceCurrent(operation, epoch)) return@close
+                if (!sourcePolicy.cameraClosed(operation, System.nanoTime())) { fail("Camera source deadline expired during native close"); return@close }
+                renderer?.replaceSource(operation.serial, descriptor.plan, choice == CameraSourceChoice.FRONT, descriptor.legacyMirror, sourceMapper()) { input ->
+                    openSource(operation, descriptor, input, epoch)
+                }
+            }
+            } finally { if (!handedOff) slot.release(request) }
+        }
+        if (!posted) slot.release(request)
+        return posted
+    }
+
+    internal fun adjustCamera(ticket: CaptureStartAdmission.Preparation, sourceToken: Long, settings: CameraControlSettings): Boolean {
+        val view = cameraView
+        if (!startAdmission.canSwitchCamera(ticket) || !sourcePolicy.acceptsControl(sourceToken) || view.sourceToken != sourceToken || view.busy || sourceRequests.busy() || view.capabilities?.accepts(settings) != true) return false
+        val mailbox = controlMailbox
+        if (mailbox.offer(settings)) handler.post {
+            val value = mailbox.take() ?: return@post
+            if (mailbox === controlMailbox && startAdmission.canSwitchCamera(ticket) && cameraView.sourceToken == sourceToken && sourcePolicy.acceptsControl(sourceToken) && !sourceRequests.busy()) cameraOwner?.adjust(value)
+        }
+        return true
     }
 
     private fun prepareAudio(token: Long) {
@@ -549,6 +652,7 @@ class CaptureController internal constructor(private val context: Context,
 
     fun start() { startAdmission.preparation?.let(::start) }
     internal fun start(preparation: CaptureStartAdmission.Preparation) {
+        if (preparation.intent.hasVideo && (sourcePolicy.pending() || sourceRequests.busy())) return
         val ticket = startAdmission.start(preparation) ?: return
         if (!handler.post { if (startAdmission.permits(ticket) && stage == CaptureStage.PREPARED) { autoStart = true; startOnHandler(ticket) } }) startAdmission.cancelInitial(ticket.preparation)
     }
@@ -600,6 +704,7 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     private fun startAudio() {
+        val rawRun = runAdmission
         val record = audioRecord!!
         val route = requireNotNull(audioRoute)
         val codec = audioEncoder!!
@@ -649,6 +754,7 @@ class CaptureController internal constructor(private val context: Context,
                         audioInputWaitMaxUs.accumulateAndGet((System.nanoTime() - waitStart) / 1000, ::maxOf)
                         pool.checkAge(block, System.nanoTime())
                         check(route.awaitQueuedPcm(pool, block)) { "Microphone route could not be verified before AAC admission" }
+                        check(rawRun.admit(System.nanoTime())) { "Camera run stopped admitting raw audio" }
                         val input = codec.getInputBuffer(index) ?: error("AAC input buffer unavailable")
                         require(input.capacity() >= block.bytes) { "AAC input buffer smaller than PCM block" }
                         block.buffer.position(0); block.buffer.limit(block.bytes)
@@ -666,6 +772,7 @@ class CaptureController internal constructor(private val context: Context,
                         }
                         audioLevel = sqrt(square / (block.bytes / 2)).toFloat().coerceIn(0f, 1f)
                         pool.checkAge(block, System.nanoTime())
+                        check(rawRun.admit(System.nanoTime())) { "Camera run stopped admitting raw audio" }
                         codec.queueInputBuffer(index, 0, block.bytes, block.ptsUs, 0)
                         queuedAudioFrames.addAndGet(block.bytes / 2L)
                         audioInputEndUs.set(block.ptsUs + block.bytes / 2L * 1_000_000 / 48_000)
@@ -690,6 +797,7 @@ class CaptureController internal constructor(private val context: Context,
                 var diagnosticAt = 0L
                 while (runningAudio.get()) {
                     if (!route.admitReader(runningAudio)) break
+                    check(rawRun.admit(System.nanoTime())) { "Camera run stopped admitting microphone capture" }
                     val block = pool.acquireReader() ?: break
                     owned = block
                     val beforeStatus = record.getTimestamp(stamp, AudioTimestamp.TIMEBASE_MONOTONIC)
@@ -701,12 +809,14 @@ class CaptureController internal constructor(private val context: Context,
                     val nowNs = System.nanoTime()
                     audioReadMaxUs.accumulateAndGet((nowNs - readStart) / 1000, ::maxOf)
                     if (!runningAudio.get()) break
+                    check(rawRun.admit(nowNs)) { "Camera run stopped admitting microphone capture" }
                     require(count > 0 && count % 2 == 0) { "Microphone read failed ($count); ${timing.observation}" }
                     pcmFrames.addAndGet(count / 2L)
                     val afterStatus = record.getTimestamp(stamp, AudioTimestamp.TIMEBASE_MONOTONIC)
                     check(afterStatus == AudioRecord.SUCCESS) { "Microphone hardware timestamp unavailable after read; status=$afterStatus ${timing.observation}" }
                     val ptsUs = timing.read(count / 2, stamp.framePosition, stamp.nanoTime, System.nanoTime())
                     if (!route.admitReader(runningAudio)) break
+                    check(rawRun.admit(System.nanoTime())) { "Camera run stopped admitting microphone capture" }
                     pool.publish(block, count, ptsUs, epochNs + ptsUs * 1000)
                     owned = null
                     if (nowNs >= diagnosticAt) {
@@ -732,6 +842,7 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     private fun createAudioEpoch(token: Long): EncodedAudioEpoch {
+        val rawRun = runAdmission
         val inputs = audioInputAdmission
         val tail = audioTailRequested
         return EncodedAudioEpoch(audioHandler, handler,
@@ -749,7 +860,7 @@ class CaptureController internal constructor(private val context: Context,
                 }
             },
             onSample = { sample ->
-                if (token == drainGeneration && (stage == CaptureStage.CAPTURING || (stoppingEpoch && tailEnabled && !stopFailed))) submitSample(sample, token)
+                if (token == drainGeneration && (stage == CaptureStage.CAPTURING || (stoppingEpoch && tailEnabled && !stopFailed))) submitSample(sample, token, rawRun)
             },
             onValidated = { acceptedAudio.incrementAndGet() },
             onPriming = { drops.incrementAndGet(); audioPrimingRejects.incrementAndGet() },
@@ -770,7 +881,15 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     /** Borrowed immutable owner; all fanout calls remain on this handler. */
-    private fun submitSample(sample: MediaSample, token: Long) {
+    private fun submitSample(sample: MediaSample, token: Long, rawRun: CameraRunAdmission) {
+        if (!rawRun.admit(System.nanoTime())) {
+            drops.incrementAndGet()
+            if (token == drainGeneration) {
+                markFailure(CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE, "Camera source fault; new media admission stopped")
+                if (!stoppingEpoch) fail("Camera source fault; new media admission stopped")
+            }
+            return
+        }
         val nowNs = SystemClock.elapsedRealtimeNanos()
         val result = queues!!.push(sample, nowNs.toULong())
         if (captureIntent.hasVideo && recovery.observe(token, result.publishingWaitingKeyframe, result.publishingOverflows, nowNs)) {
@@ -799,6 +918,7 @@ class CaptureController internal constructor(private val context: Context,
 
 
     private fun videoCallback(): PlatformCodec.Callback {
+        val rawRun = runAdmission
         val token = drainGeneration
         return object : PlatformCodec.Callback() {
             override fun onInputBufferAvailable(codec: PlatformCodec, index: Int) = Unit
@@ -828,7 +948,7 @@ class CaptureController internal constructor(private val context: Context,
                     val avcc = framing.sample(buffer)
                     val sample = (videoCodec ?: error("Video configuration not ready")).sample(avcc, tick, tick, 3000u, 90_000u, key)
                     acceptedVideo.incrementAndGet()
-                    sample.use { submitSample(it, token) }
+                    sample.use { submitSample(it, token, rawRun) }
                 } catch (error: Exception) { fail("Encoded video rejected: ${error.message ?: error.javaClass.simpleName}") }
                 finally { runCatching { codec.releaseOutputBuffer(index, false) }; if (stoppingEpoch) handler.post { finishStoppedEpoch() } }
             }
@@ -867,6 +987,7 @@ class CaptureController internal constructor(private val context: Context,
         return true
     }
     private fun stopAdmitted(intent: CaptureStartAdmission.Preparation, reason: String, failed: Boolean = false) {
+        sourcePolicy.close(); sourceRequests.close(); controlMailbox.close(); runAdmission.cancelSourceBudget(); renderer?.fenceSource()
         publishingSession?.stopDestination() // Fence even while codec-handler work is queued.
         handler.post {
             if (!startAdmission.owns(intent)) return@post
@@ -877,8 +998,10 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     private fun fail(reason: String, code: CaptureLifecycleDiagnostics.Code = CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE) {
+        if (captureIntent.hasVideo) runAdmission.fail()
         if (stage == CaptureStage.STOPPING || stage == CaptureStage.ERROR || stage == CaptureStage.IDLE) return
         startAdmission.stop()
+        sourcePolicy.close(); sourceRequests.close(); controlMailbox.close(); runAdmission.cancelSourceBudget(); renderer?.fenceSource()
         publishingSession?.stopDestination()
         markFailure(code, reason)
         stage = CaptureStage.STOPPING
@@ -907,13 +1030,20 @@ class CaptureController internal constructor(private val context: Context,
     private var stoppingEpoch = false
 
     private fun stopOnHandler(requestedReason: String, failed: Boolean) {
+        sourcePolicy.close(); sourceRequests.close(); controlMailbox.close(); runAdmission.cancelSourceBudget(); renderer?.fenceSource()
+        sourceDeadline?.let(handler::removeCallbacks); sourceDeadline = null; deferredCameraPose = false
+        cameraView = CameraSourceSnapshot(status = "Camera stopping; waiting for native closure")
         val stoppingRoute = audioRoute
         if (stoppingRoute != null) {
             if (stoppingRoute.stopProducer(runningAudio)) { audioRouteFailed = true; audioRouteFailure = stoppingRoute.failureDescription }
         } else runningAudio.set(false)
         audioRoute = null; activeAudioInput = "Not active"
-        val terminalFailure = failed || audioRouteFailed
-        val reason = if (audioRouteFailed) audioRouteFailure ?: "Microphone route is unavailable" else requestedReason
+        val terminalFailure = failed || audioRouteFailed || runAdmission.failure != null
+        val reason = when {
+            audioRouteFailed -> audioRouteFailure ?: "Microphone route is unavailable"
+            runAdmission.failure != null -> "Camera source fault (${runAdmission.failure}); any accepted recording prefix is incomplete"
+            else -> requestedReason
+        }
         stopReason = reason
         if (terminalFailure) markFailure(CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE, reason)
         if (recordingFailed && restart.pending != null) {
@@ -960,9 +1090,11 @@ class CaptureController internal constructor(private val context: Context,
                 finishStoppedEpoch()
             }
         }.also { handler.postDelayed(it, ((deadlineNs - System.nanoTime()).coerceAtLeast(0) + 999_999) / 1_000_000) }
-        runCatching { session?.stopRepeating() }
-        runCatching { session?.close() }; session = null
-        runCatching { camera?.close() }
+        val nativeCamera = cameraOwner
+        if (nativeCamera == null) cameraClosed = true
+        else nativeCamera.close {
+            if (cameraOwner === nativeCamera) { cameraOwner = null; cameraClosed = true; finishStoppedEpoch() }
+        }
         val gpu = renderer
         if (gpu == null) { rendererStopped = true; rendererClosed = true }
         else gpu.stopEncoding(token) {
@@ -1051,7 +1183,8 @@ class CaptureController internal constructor(private val context: Context,
         val oldRecord = audioRecord; val oldQueues = queues; val oldVideoCodec = videoCodec; val oldAudioCodec = audioCodec
         val oldPublishing = publishing; val oldRecording = recording; val oldRecordCleanup = recordingCleanup
         val oldPublishingSink = publishingSink; val oldRecordingSink = recordingSink
-        val canFinaliseRecording = !audioRouteFailed
+        val recordingRun = runAdmission
+        val canFinaliseRecording = !audioRouteFailed && recordingRun.recordingCanFinalise
         controls.execute {
             cleanupPhase = "publisher close"
             val publishingStopped = runCatching { oldPublishing?.close() != false }.getOrDefault(false)
@@ -1092,7 +1225,7 @@ class CaptureController internal constructor(private val context: Context,
                 }
                 videoEncoder = null; audioEncoder = null; encoderSurface = null; audioRecord = null; audioThread = null; audioPumpThread = null; pcmPool = null; publisherAbort = null; encodedAudio = null
                 queues = null; videoCodec = null; audioCodec = null; publishing = null; recording = null; recordingCleanup = null
-                publishingSink = null; recordingSink = null; renderer = null; camera = null; cameraInput = null
+                publishingSink = null; recordingSink = null; renderer = null; cameraOwner = null; cameraInput = null
                 audioInputs.clear(); framing.clear(); audioLevel = 0f
                 teardownStarted = false; stoppingEpoch = false
                 cleanupPhase = "completed"; updateCleanupDiagnostics()
@@ -1179,6 +1312,7 @@ class CaptureController internal constructor(private val context: Context,
 
     fun close() {
         startAdmission.stop()
+        sourcePolicy.close(); sourceRequests.close(); controlMailbox.close(); runAdmission.cancelSourceBudget(); renderer?.fenceSource()
         publishingSession?.stopDestination()
         handler.post {
             shutdownRequested = true; autoStart = false; restart.cancel()

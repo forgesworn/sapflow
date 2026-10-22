@@ -247,4 +247,26 @@ class CaptureStartAdmissionTest {
         assertNull(ticket.orientation); assertFalse(gate.permitsOrientation(ticket))
         assertTrue(gate.claim(ticket)); assertTrue(gate.beginEpoch(ticket, 1)); assertFalse(gate.permitsOrientation(ticket))
     }
+    @Test fun initialCameraIsFrozenBeforeClaimAndAppliedFrontSurvivesAutomaticRotation() {
+        val gate = CaptureStartAdmission(); val a = checkNotNull(gate.reserve(cameraChoice = CameraSourceChoice.REAR))
+        assertEquals(CameraSourceChoice.REAR, a.cameraChoice)
+        assertNull(gate.reserve(cameraChoice = CameraSourceChoice.FRONT))
+        assertTrue(gate.claim(a)); assertTrue(gate.beginEpoch(a, 1)); assertTrue(gate.prepared(a, 1))
+        assertTrue(gate.commit(checkNotNull(gate.start(a)), 1))
+        assertTrue(gate.selectCamera(a, CameraSourceChoice.FRONT))
+        gate.beginCleanup(a, true); gate.cleanup(a, true)
+        assertTrue(gate.beginEpoch(a, 2)); assertEquals(CameraSourceChoice.FRONT, gate.cameraChoice(a))
+        assertEquals(CameraSourceChoice.REAR, a.cameraChoice) // Immutable original intent, distinct applied source.
+        assertTrue(gate.stop(a, 2)); assertFalse(gate.selectCamera(a, CameraSourceChoice.REAR))
+        gate.beginCleanup(a, false); gate.cleanup(a, true)
+        val b = checkNotNull(gate.reserve(cameraChoice = CameraSourceChoice.REAR))
+        assertFalse(gate.selectCamera(a, CameraSourceChoice.FRONT)); assertNull(gate.cameraChoice(a))
+        assertEquals(CameraSourceChoice.REAR, gate.cameraChoice(b))
+    }
+
+    @Test fun microphoneIntentHasNoCameraSelectionOrDiscoveryAuthority() {
+        val gate = CaptureStartAdmission(); val a = checkNotNull(gate.reserve(CaptureIntent.AudioOnly48kMono, cameraChoice = CameraSourceChoice.FRONT))
+        assertNull(a.cameraChoice); assertNull(gate.cameraChoice(a)); assertFalse(gate.permitsCamera(a))
+        assertFalse(gate.selectCamera(a, CameraSourceChoice.FRONT))
+    }
 }
