@@ -67,16 +67,37 @@ bounded read. Do not restore credentials or approval from saved instance state.
 Delayed callbacks, repeated native delivery and cancelled consent cannot rearm
 an old invitation or change a newer destination.
 
-## QR follow-on and verification
+## Camera QR import and verification
 
-The proposed camera scanner accepts only the same envelope with a smaller
-2,048-byte ASCII limit. Larger profiles use the existing file-import route.
-Scanning must hold an exclusive native camera owner that excludes capture
-before permissions or device opening, and retain it until actual callback and
-native closure. No background scanning, external scanner Intent, network model
-or Google runtime service is required. Decoder choice, notices, native camera
-lifecycle and physical scanning are separate gates; the link parser alone does
-not complete QR import.
+The Android camera scanner is implemented using native Camera2 and pinned
+ZXing core 3.5.4, with its Apache notices packaged in every app variant. iOS
+camera scanning remains under development. Installed camera behaviour and
+physical acceptance are separate from source tests and app builds.
+
+The scanner accepts only the same envelope with a smaller 2,048-byte ASCII
+limit. Canonical base64url cannot produce a complete envelope of exactly
+2,048 bytes: the adjacent valid sizes are 2,047 and 2,049. Larger profiles use
+the existing file-import route. A successful scan offers the ordinary transient
+invitation; Review, independent plaintext consent, Apply, Prepare and Start
+remain separate.
+
+Scanning holds an exclusive native camera owner that excludes capture before
+permissions or device opening. Android Prepare reserves that same admission
+before its permissions, destination grant or recording-storage checks. A scan
+cannot borrow a prepared, live, audio-only, Standby or incompletely closed
+capture owner. Retain the exact outstanding OS permission reply independently
+of cancellation or activity replacement. Native camera closure, decoder return
+and actual scanner-dialog dismissal must all be confirmed before releasing
+scanner capacity or offering its result.
+
+The original scan has a fixed 60-second logical deadline. Expiry cancels result
+authority; it cannot prove cleanup or release an uncertain native owner. Recheck
+the original deadline at final delivery, including delayed cleanup or dismissal.
+A late permission grant cannot reopen a cancelled scan or supply a successor.
+No background scanning, external scanner Intent, network model or Google runtime
+service is used. Android copies only checked, bounded Y-plane pixels, closes the
+Image before decoding, and keeps one decoder owner. Physical scanning, native
+closure behaviour and coverage-guided JVM fuzzing retain separate gates.
 
 The shared synthetic corpus is
 [`manual-destination-link-v1.json`](../tests/fixtures/manual-destination-link-v1.json).

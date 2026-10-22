@@ -5,6 +5,25 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+Android [QR camera import](manual-destination-links.md#camera-qr-import-and-verification)
+is implemented and independently source-reviewed. It shares the actual capture
+reservation before permissions or destination/storage preparation, with an
+original 60-second deadline and separate permission, Camera2 closure, decoder
+and dialog receipts. Checked Y-plane copies close each native Image before
+serial decoding. The pinned pure ZXing core has no Play service or model runtime;
+its exact licence and notice bytes are present in all three APK variants.
+
+The Android QR composition passes 85 focused JVM tests with warnings as errors,
+then 573 tests in each of Debug and Qualification, all three actual APK builds,
+Qualification/Release lint and qualification isolation. Built APK checks verify
+the QR decoder in DEX, native SDK byte identity, manifest registration, licence
+resources and 16 KiB alignment. Evidence remains under
+`target/manual-destination-links/android-qr-v1/` and `android-qr-app-v1/`.
+These checks do not establish installed Camera2 permissions, preview/readability,
+real callback cleanup or physical creator acceptance. iOS QR implementation
+and coverage-guided JVM fuzzing retain separate gates. No device or active
+capture was changed for this packet.
+
 Reviewed [manual destination links](manual-destination-links.md) are implemented
 in both native apps. The shared generated corpus has 98 envelope cases and all
 64 existing strict JSON profile vectors. Explicit Review, independent plaintext
@@ -13,7 +32,7 @@ capture. Both paths refuse selected V4V mode and conflicting capture or import
 owners. Independent source reviews cover the original-owner, repeated-delivery,
 foreground and stale-callback rules.
 
-The exact link composition passes 39 focused iOS host tests with warnings as
+The earlier link-only composition passes 39 focused iOS host tests with warnings as
 errors, the 64-source iOS 16 API check, and unsigned Debug, Qualification and
 Release app builds. The actual Debug test bundle compiles and contains both
 byte-identical corpora; it has not executed on a phone. Built URL scheme,

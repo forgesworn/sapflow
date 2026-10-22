@@ -8,6 +8,11 @@ internal object ManualDestinationEnvelope {
     const val MAX_URL_BYTES = 24_576
     const val MAX_DOCUMENT_BYTES = 16_384
 
+    fun decodeQr(text: String): ByteArray {
+        if (text.length > 2048) throw ManualProfileFailure()
+        return decode(text)
+    }
+
     fun decode(text: String): ByteArray {
         var decoded: ByteArray? = null
         try {

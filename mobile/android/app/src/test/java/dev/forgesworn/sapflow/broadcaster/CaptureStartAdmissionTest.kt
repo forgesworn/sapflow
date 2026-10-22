@@ -279,4 +279,38 @@ class CaptureStartAdmissionTest {
         val successor=checkNotNull(admission.reserve());assertFalse(successor.initialStandby)
     }
 
+    @Test fun scannerAndRealPrePermissionPreparationContendOnOneReservation() {
+        val gate = CaptureStartAdmission(); val scan = requireNotNull(gate.reserveScanner(Any()))
+        assertFalse(gate.idle); assertNull(gate.reserve(CaptureIntent.AudioOnly48kMono))
+        assertTrue(gate.scannerClosed(scan, true))
+        val capture = requireNotNull(gate.reserve(CaptureIntent.AudioOnly48kMono))
+        assertTrue(gate.candidate(capture)); assertNull(gate.reserveScanner(Any()))
+        // Permission/grant/storage are still pending, no codec claim required.
+        assertTrue(gate.cancelCandidate(capture)); assertFalse(gate.candidate(capture))
+        assertFalse(gate.claim(capture)); assertNull(gate.reserveScanner(Any()))
+        gate.abandon(capture) // Actual queued candidate acknowledgement.
+        assertNotNull(gate.reserveScanner(Any()))
+    }
+    @Test fun earlyTicketKeepsFixedReferenceAndDelayedOldAbandonCannotReleaseB() {
+        val gate = CaptureStartAdmission()
+        val frozen = CaptureOrientationChoice.LANDSCAPE_TOP_LEFT.freeze(true, false, CardinalPose.NATURAL)
+        val old = requireNotNull(gate.reserve(orientation = frozen, cameraChoice = CameraSourceChoice.FRONT, initialStandby = true))
+        assertSame(frozen, old.orientation); assertEquals(CameraSourceChoice.FRONT, old.cameraChoice); assertTrue(old.initialStandby)
+        assertTrue(gate.cancelCandidate(old)); gate.abandon(old)
+        val next = requireNotNull(gate.reserve())
+        assertFalse(gate.cancelCandidate(old)); gate.abandon(old)
+        assertTrue(gate.candidate(next)); assertNull(gate.reserveScanner(Any()))
+        assertTrue(gate.claim(next)); assertFalse(gate.candidate(next))
+    }
+    @Test fun concurrentScannerAndPreparationHaveExactlyOneWinnerBeforeAnyNativeCalls() {
+        repeat(32) {
+            val gate = CaptureStartAdmission(); val start = CountDownLatch(1)
+            val captureWon = AtomicBoolean(); val scanWon = AtomicBoolean()
+            val a = Thread { check(start.await(2, TimeUnit.SECONDS)); captureWon.set(gate.reserve() != null) }
+            val b = Thread { check(start.await(2, TimeUnit.SECONDS)); scanWon.set(gate.reserveScanner(Any()) != null) }
+            a.start(); b.start(); start.countDown(); a.join(2000); b.join(2000)
+            assertFalse(a.isAlive); assertFalse(b.isAlive)
+            assertNotEquals(captureWon.get(), scanWon.get()); assertFalse(gate.idle)
+        }
+    }
 }

@@ -6,9 +6,11 @@ internal class CaptureStartAdmission {
     class Preparation internal constructor(val id: Long, val intent: CaptureIntent, val audioInputId: String? = null,
         val backgroundAudio: Boolean = false, val orientation: CaptureOrientationChoice.Selection? = null,
         val cameraChoice: CameraSourceChoice? = null, val initialStandby: Boolean = false)
+    class ScannerTicket internal constructor(val id: Long, internal val client: Any)
     class Start internal constructor(val id: Long, val preparation: Preparation, val epoch: Long)
     private var serial = 0L
     private var current: Preparation? = null
+    private var scanner: ScannerTicket? = null
     private var epoch = -1L
     private var selectedCamera: CameraSourceChoice? = null
     private var live = false
@@ -22,12 +24,26 @@ internal class CaptureStartAdmission {
     private var serviceReady = false
     private val elapsed = CaptureElapsed()
     private var timingPreparation: Preparation? = null
-    val idle: Boolean @Synchronized get() = current == null
+    val idle: Boolean @Synchronized get() = current == null && scanner == null
     val preparation: Preparation? @Synchronized get() = current
     val elapsedPreparation: Preparation? @Synchronized get() = timingPreparation
+    @Synchronized fun reserveScanner(client: Any): ScannerTicket? {
+        if (!idle || serial == Long.MAX_VALUE) return null
+        return ScannerTicket(++serial, client).also { scanner = it }
+    }
+    @Synchronized fun ownsScanner(ticket: ScannerTicket): Boolean = scanner === ticket
+    @Synchronized fun scannerClosed(ticket: ScannerTicket, cleanupComplete: Boolean): Boolean {
+        if (scanner !== ticket || !cleanupComplete) return false
+        scanner = null; return true
+    }
+    @Synchronized fun candidate(value: Preparation): Boolean = current === value && candidate && live
+    @Synchronized fun cancelCandidate(value: Preparation): Boolean {
+        if (current !== value || !candidate) return false
+        live = false; prepared = false; pending = null; return true
+    }
     @Synchronized fun reserve(intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
         backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null, cameraChoice: CameraSourceChoice = CameraSourceChoice.REAR, initialStandby: Boolean = false): Preparation? {
-        if (current != null || serial == Long.MAX_VALUE) return null
+        if (current != null || scanner != null || serial == Long.MAX_VALUE) return null
         if (audioInputId != null && !AudioInputOption.validId(audioInputId)) return null
         if (backgroundAudio && intent.hasVideo) return null
         val frozen = if (intent.hasVideo) orientation ?: CaptureOrientationChoice.AUTO.freeze(true, true, CardinalPose.NATURAL) else null

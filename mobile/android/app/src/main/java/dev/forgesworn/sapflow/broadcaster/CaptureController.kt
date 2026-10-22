@@ -157,6 +157,8 @@ class CaptureController internal constructor(private val context: Context,
     @Volatile private var captureIntent: CaptureIntent = CaptureIntent.DEFAULT
     private val prepareAdmission = CapturePrepareAdmission()
     private val startAdmission = CaptureStartAdmission()
+    private val scannerPermissions = ManualQrPermissionReplies<CaptureStartAdmission.ScannerTicket>()
+    @Volatile private var scanner: ManualQrScanner? = null
     private var preparation: CaptureStartAdmission.Preparation? = null // codec owner only
     private var previewWidth = 1
     private var previewHeight = 1
@@ -227,7 +229,7 @@ class CaptureController internal constructor(private val context: Context,
         (if (!recordingFailed && stage in listOf(CaptureStage.PREPARING, CaptureStage.PREPARED, CaptureStage.CAPTURING)) recordingSink?.status ?: recordStatus else recordStatus) + if (previousRecording.isNotEmpty()) " · Previous: ${previousRecording.take(240)}" else "",
         queueDiagnostics, "Publish drainer ${publishing?.diagnostics ?: "none"} · ${publishingSink?.diagnostics ?: ""}",
         orientationStatus, rendererStatus, audioOwner?.diagnostics ?: audioDiagnostics, "$cleanupPhase · $cleanupDiagnostics",
-        !prepareAdmission.pending && startAdmission.idle && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioOwner == null && renderer == null,
+        !prepareAdmission.pending && !scannerPermissions.outstanding && startAdmission.idle && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioOwner == null && renderer == null,
             elapsed.captureMs, elapsed.broadcastMs, elapsed.uncertain, socket, activeAudioInput,
             startAdmission.preparation?.let(startAdmission::backgroundReady) == true,
             privacyView?.desired==PrivacyStandbyPolicy.Desired.STANDBY || privacyView?.phase in listOf(PrivacyStandbyPolicy.Phase.RESUMING,PrivacyStandbyPolicy.Phase.FAILED),
@@ -252,11 +254,53 @@ class CaptureController internal constructor(private val context: Context,
     /** Cold wake/resume check. No media timestamp clock or PCM-age policy changes. */
     internal fun revalidatePublishingAuthority() { publishingSession?.revalidateAuthority() }
 
-    internal fun prepare(previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
-        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null, cameraChoice: CameraSourceChoice = CameraSourceChoice.REAR, initialStandby: Boolean = false): CaptureStartAdmission.Preparation? {
-        val canPrepare = snapshot().canPrepare
+    /** Reserve the actual immutable candidate before permission, grant, storage
+     * or destination work. Scanner admission contends on this same monitor. */
+    internal fun reservePreparation(intent: CaptureIntent, audioInputId: String?, backgroundAudio: Boolean,
+        orientation: CaptureOrientationChoice.Selection?, cameraChoice: CameraSourceChoice, initialStandby: Boolean): CaptureStartAdmission.Preparation? {
+        if (!snapshot().canPrepare) return null
         val frozen = orientation ?: CaptureOrientationChoice.AUTO.freeze(intent.hasVideo, observedNaturalPortrait, observedPose)
-        val ticket = startAdmission.reserve(intent, audioInputId, backgroundAudio, frozen, cameraChoice, initialStandby) ?: return null
+        return startAdmission.reserve(intent, audioInputId, backgroundAudio, frozen, cameraChoice, initialStandby)
+    }
+    internal fun pendingPreparation(ticket: CaptureStartAdmission.Preparation): Boolean = startAdmission.candidate(ticket)
+    internal fun abandonPreparation(ticket: CaptureStartAdmission.Preparation) {
+        if (!startAdmission.cancelCandidate(ticket)) return
+        // The acknowledgement stays behind any already queued Prepare. It
+        // cannot release a queued candidate while its Handler is withheld.
+        handler.post { startAdmission.abandon(ticket) }
+    }
+    internal val scannerPermissionOutstanding: Boolean get() = scannerPermissions.outstanding
+    internal fun scannerPermissionFor(client: Any): Boolean = scannerPermissions.pending()?.client === client
+    internal fun restoreScannerPermissionDiscard() = scannerPermissions.restoreDiscard()
+    internal fun reserveScannerPermission(ticket: CaptureStartAdmission.ScannerTicket): Boolean =
+        startAdmission.ownsScanner(ticket) && scannerPermissions.reserve(ticket)
+    internal fun receiveScannerPermission(): CaptureStartAdmission.ScannerTicket? = scannerPermissions.receive()
+    internal fun reserveScanner(client: Any, event: (CaptureStartAdmission.ScannerTicket, ManualQrScanner.Event) -> Unit): CaptureStartAdmission.ScannerTicket? {
+        if (!snapshot().canPrepare) return null
+        val ticket = startAdmission.reserveScanner(client) ?: return null
+        val owner = ManualQrScanner(context.applicationContext, handler, ticket, { startAdmission.ownsScanner(ticket) }, scannerEvent@{ reply ->
+            if (reply is ManualQrScanner.Event.Finished) {
+                if (!startAdmission.scannerClosed(ticket, true)) return@scannerEvent
+                if (scanner?.ticket === ticket) scanner = null
+            }
+            event(ticket, reply)
+        })
+        scanner = owner
+        owner.arm()
+        return ticket
+    }
+    internal fun ownsScanner(ticket: CaptureStartAdmission.ScannerTicket): Boolean = startAdmission.ownsScanner(ticket)
+    internal fun openScanner(ticket: CaptureStartAdmission.ScannerTicket, texture: SurfaceTexture): Boolean =
+        scanner?.takeIf { it.ticket === ticket }?.open(texture) == true
+    internal fun cancelScanner(ticket: CaptureStartAdmission.ScannerTicket) { scanner?.takeIf { it.ticket === ticket }?.cancel() }
+    internal fun scannerPresentationClosed(ticket: CaptureStartAdmission.ScannerTicket) {
+        scanner?.takeIf { it.ticket === ticket }?.presentationClosed()
+    }
+
+    internal fun prepare(ticket: CaptureStartAdmission.Preparation, previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?): Boolean {
+        val intent = ticket.intent
+        val canPrepare = startAdmission.candidate(ticket) && !shutdownRequested && !stoppingEpoch && !teardownStarted &&
+            stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioOwner == null && renderer == null
         val admitted = try { prepareAdmission.submit(intent, canPrepare, { handler.post(it) }) admitted@{ requestedIntent ->
             if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) { startAdmission.abandon(ticket); return@admitted }
             if (videoEncoder != null || renderer != null || teardownStarted) {
@@ -272,7 +316,10 @@ class CaptureController internal constructor(private val context: Context,
             ticket.orientation?.let {
                 check(restart.pending == null) { "Previous orientation cleanup is unfinished" }
                 naturalPortrait = it.naturalPortrait
-                restart.request(it.initialPose, false, System.nanoTime())
+                // Automatic observes physical input while permission/preflight
+                // is pending; fixed preserves its original reference exactly.
+                val pose = if (it.automatic) observedPose else it.initialPose
+                restart.request(pose, false, System.nanoTime())
             }
             audioPin = AudioInputPin(ticket.audioInputId); activeAudioInput = "Not verified"
             cleanupExpired = false; stopFailed = false
@@ -285,8 +332,8 @@ class CaptureController internal constructor(private val context: Context,
             autoStart = false
             prepareEpoch(previewSurface)
         } } catch (error: Exception) { startAdmission.abandon(ticket); throw error }
-        if (!admitted) { startAdmission.abandon(ticket); return null }
-        return ticket
+        if (!admitted) { startAdmission.abandon(ticket); return false }
+        return true
     }
 
     private fun prepareEpoch(previewSurface: Surface?) {
@@ -365,7 +412,7 @@ class CaptureController internal constructor(private val context: Context,
 
     private fun applyOrientation(observation: CameraPoseInput.Observation<CaptureStartAdmission.Preparation>) {
         val owner = observation.owner ?: return
-        if (shutdownRequested || !startAdmission.permitsOrientation(owner) || !poseInputs.isCurrent(observation)) return
+        if (shutdownRequested || preparation !== owner || !startAdmission.permitsOrientation(owner) || !poseInputs.isCurrent(observation)) return
         if (sourcePolicy.pending() || privacy?.snapshot()?.pending!=null) { deferredCameraPose = true; return }
         val pose = observation.pose
         val active = videoEncoder != null || renderer != null

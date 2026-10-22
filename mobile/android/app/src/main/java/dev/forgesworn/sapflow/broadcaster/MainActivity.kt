@@ -75,7 +75,7 @@ class MainActivity : ComponentActivity() {
     private var preparedV4v: V4vCaptureAdmission.Prepared? = null
     private var preparedCapture: CaptureStartAdmission.Preparation? = null
     private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
-    private class PreparationIntent(val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
+    private class PreparationIntent(val ticket: CaptureStartAdmission.Preparation, val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
         val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?, val backgroundAudio: Boolean,
         val orientation: CaptureOrientationChoice.Selection?, val cameraChoice: CameraSourceChoice, val initialStandby:Boolean)
     private var pendingPreparation: PreparationIntent? = null
@@ -144,6 +144,23 @@ class MainActivity : ComponentActivity() {
     private var manualForeground = false
     private val manualLinks = ManualLinkInbox.application
     private var manualInvitation by mutableStateOf<ManualLinkInbox.Invitation?>(null)
+    private var manualScanTicket: CaptureStartAdmission.ScannerTicket? = null
+    private var manualScanAction: ManualProfileActions.Ticket? = null
+    private var manualScanDialog: android.app.Dialog? = null
+    private var manualScanPreview: android.view.TextureView? = null
+    private class QrPreviewTransfer { var owned: android.graphics.SurfaceTexture? = null }
+    private var manualScanTransfer: QrPreviewTransfer? = null
+    private var manualScanNativeClosed = false
+    private var manualScanGeometry: ManualQrScanner.Event.Geometry? = null
+    private val scanPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (::capture.isInitialized) {
+            val ticket = capture.receiveScannerPermission()
+            if (ticket != null && manualScanTicket === ticket && ticket.client === runtimeClient) {
+                if (granted && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) openManualScanner(ticket)
+                else { manualMessage = "Camera permission is required to scan. File and link import remain available."; cancelManualScanner(ticket) }
+            } else if (ticket != null) capture.cancelScanner(ticket)
+        }
+    }
     private val importManualDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         manualPicker.returned(runtimeClient, uri)
         if (manualForeground) resumeManualDocument()
@@ -201,7 +218,7 @@ class MainActivity : ComponentActivity() {
     private val displayChanges = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
         override fun onDisplayRemoved(displayId: Int) = Unit
-        override fun onDisplayChanged(displayId: Int) { if (poseTracking && displayId == captureDisplay().displayId) updatePreview() }
+        override fun onDisplayChanged(displayId: Int) { if (poseTracking && displayId == captureDisplay().displayId) { updatePreview(); updateManualScannerPreview() } }
     }
     private val refresh = object : Runnable {
         override fun run() {
@@ -234,6 +251,7 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState?.getBoolean("sapflow.manual-picker.discard") == true) manualPicker.restoreDiscard(runtimeClient)
         audioOwner = AudioBroadcastOwner.application(applicationContext)
         capture = audioOwner.capture
+        if (savedInstanceState?.getBoolean("sapflow.qr-permission.discard") == true) capture.restoreScannerPermissionDiscard()
         preparedCapture = capture.currentPreparation()
         preparedCapture?.let { retained ->
             // Observe the exact process-owned intent; never reconstruct destination credentials.
@@ -438,7 +456,7 @@ class MainActivity : ComponentActivity() {
                         }
                         if (preparationPending) Text("Checking capture preparation", style = MaterialTheme.typography.bodySmall)
                         else if (permissionReplyOutstanding) Text("Finish the permission request before preparing again.", style = MaterialTheme.typography.bodySmall)
-                        OutlinedButton(enabled = !preparationPending && !libraryBusy, onClick = { libraryVisible = true; loadRecordings() }, modifier = Modifier.fillMaxWidth()) { Text("Private recordings") }
+                        OutlinedButton(enabled = !preparationPending && !libraryBusy && !manualBusy, onClick = { libraryVisible = true; loadRecordings() }, modifier = Modifier.fillMaxWidth()) { Text("Private recordings") }
                         Text("Microphone", style = MaterialTheme.typography.labelMedium)
                         LinearProgressIndicator(progress = { current?.audioLevel ?: 0f }, modifier = Modifier.fillMaxWidth())
                         Text("Video ${current?.videoSamples ?: 0} · Audio ${current?.audioSamples ?: 0} · Ingress rejects ${current?.drops ?: 0}", style = MaterialTheme.typography.bodySmall)
@@ -579,6 +597,7 @@ class MainActivity : ComponentActivity() {
         ::capture.isInitialized && ::recordingLibrary.isInitialized && recordingLibrary.idle && capture.snapshot().canPrepare
 
     private fun manualEdited() {
+        manualScanTicket?.let(::cancelManualScanner)
         invalidateManualLink()
         manualPicker.invalidate(runtimeClient)
         manualActions.invalidate(); manualReview = null; manualConsent = false; manualReviewSaved = null
@@ -651,6 +670,119 @@ class MainActivity : ComponentActivity() {
             }, onFailure = { current.manualMessage = "The delete action could not be confirmed. Check saved profiles before retrying." })
         }
     }
+    private fun beginManualScanner() {
+        if (!manualLinkAllowed(foreground = true) || manualInvitation != null) return
+        val action = manualTicket() ?: return
+        val screen = WeakReference(this)
+        val delivery = ui
+        val ticket = capture.reserveScanner(runtimeClient) { owned, event ->
+            delivery.post { screen.get()?.scannerEvent(owned, event) }
+        }
+        if (ticket == null) {
+            manualActions.finish(action, false); manualBusy = false
+            manualMessage = "Capture or another camera operation is still finishing. Wait before scanning."
+            return
+        }
+        manualScanTicket = ticket; manualScanAction = action; manualScanNativeClosed = false; manualScanGeometry = null
+        val transfer = QrPreviewTransfer(); manualScanTransfer = transfer
+        val dialog = android.app.Dialog(this)
+        val content = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(20, 20, 20, 20)
+            addView(TextView(this@MainActivity).apply { text = "Scan a Sapflow manual destination QR. Review and Apply remain separate." })
+            addView(android.view.TextureView(this@MainActivity).apply {
+                manualScanPreview = this
+                surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
+                    override fun onSurfaceTextureAvailable(texture: android.graphics.SurfaceTexture, width: Int, height: Int) { openManualScanner(ticket) }
+                    override fun onSurfaceTextureSizeChanged(texture: android.graphics.SurfaceTexture, width: Int, height: Int) { updateManualScannerPreview() }
+                    override fun onSurfaceTextureDestroyed(texture: android.graphics.SurfaceTexture): Boolean {
+                        if (manualScanTicket === ticket) {
+                            manualScanPreview = null
+                            if (!manualScanNativeClosed) capture.cancelScanner(ticket)
+                        }
+                        // A transferred native producer is released only by its actual owner.
+                        return transfer.owned !== texture
+                    }
+                    override fun onSurfaceTextureUpdated(texture: android.graphics.SurfaceTexture) = Unit
+                }
+            }, android.widget.LinearLayout.LayoutParams(720.coerceAtMost(resources.displayMetrics.widthPixels - 40), 600.coerceAtMost(resources.displayMetrics.heightPixels / 2)))
+            addView(android.widget.Button(this@MainActivity).apply { text = "Cancel scan"; setOnClickListener { cancelManualScanner(ticket) } })
+        }
+        dialog.setContentView(content)
+        dialog.setOnCancelListener { cancelManualScanner(ticket) }
+        dialog.setOnDismissListener {
+            if (!manualScanNativeClosed) capture.cancelScanner(ticket)
+            capture.scannerPresentationClosed(ticket)
+            if (manualScanDialog === dialog) { manualScanDialog = null; manualScanPreview = null }
+        }
+        manualScanDialog = dialog
+        try {
+            dialog.show()
+            if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) openManualScanner(ticket)
+            else if (capture.reserveScannerPermission(ticket)) {
+                try { scanPermission.launch(Manifest.permission.CAMERA) }
+                catch (_: Exception) { capture.receiveScannerPermission(); cancelManualScanner(ticket) }
+            } else cancelManualScanner(ticket)
+        } catch (_: Exception) {
+            capture.cancelScanner(ticket); capture.scannerPresentationClosed(ticket)
+            manualMessage = "The QR camera view could not open. Existing fields were preserved."
+        }
+    }
+    private fun openManualScanner(ticket: CaptureStartAdmission.ScannerTicket) {
+        if (manualScanTicket !== ticket || ticket.client !== runtimeClient || !manualForeground || !poseTracking || isDestroyed || !capture.ownsScanner(ticket) || manualScanTransfer?.owned != null) return
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
+        val view = manualScanPreview?.takeIf { it.isAvailable } ?: return
+        val texture = view.surfaceTexture ?: return
+        if (capture.openScanner(ticket, texture)) manualScanTransfer?.owned = texture
+    }
+    private fun updateManualScannerPreview() {
+        val view = manualScanPreview ?: return
+        val geometry = manualScanGeometry ?: return
+        if (view.width <= 0 || view.height <= 0) return
+        val rotation = (geometry.sensorOrientation - displayRotation() * 90 + 360) % 360
+        val rotatedWidth = if (rotation % 180 == 0) geometry.width else geometry.height
+        val rotatedHeight = if (rotation % 180 == 0) geometry.height else geometry.width
+        val scale = minOf(view.width.toFloat() / rotatedWidth, view.height.toFloat() / rotatedHeight)
+        val x = view.width / 2f; val y = view.height / 2f
+        view.setTransform(android.graphics.Matrix().apply {
+            setScale(geometry.width * scale / view.width, geometry.height * scale / view.height, x, y)
+            postRotate(rotation.toFloat(), x, y)
+        })
+    }
+    private fun cancelManualScanner(ticket: CaptureStartAdmission.ScannerTicket) {
+        if (manualScanTicket !== ticket) return
+        manualActions.invalidate()
+        capture.cancelScanner(ticket)
+        manualScanDialog?.dismiss()
+    }
+    private fun scannerEvent(ticket: CaptureStartAdmission.ScannerTicket, event: ManualQrScanner.Event) {
+        if (manualScanTicket !== ticket || ticket.client !== runtimeClient) return
+        when (event) {
+            is ManualQrScanner.Event.Geometry -> { manualScanGeometry = event; updateManualScannerPreview() }
+            ManualQrScanner.Event.CameraClosed -> {
+                manualScanNativeClosed = true
+                val dialog = manualScanDialog
+                if (dialog != null) dialog.dismiss() else capture.scannerPresentationClosed(ticket)
+            }
+            ManualQrScanner.Event.Retained -> {
+                manualMessage = "QR camera cleanup was not confirmed. Capture and further scanning remain blocked. Existing fields were preserved."
+                manualScanDialog?.dismiss()
+            }
+            is ManualQrScanner.Event.Finished -> {
+                val action = manualScanAction
+                manualScanTicket = null; manualScanAction = null; manualScanTransfer = null; manualScanGeometry = null
+                val allowed = manualAllowed() && !manualIO.busy && !manualPicker.hasOutstanding && !libraryVisible
+                val valid = action != null && manualActions.finish(action, allowed)
+                manualBusy = manualActions.busy
+                val text = event.reply.text
+                if (valid && text != null) {
+                    val invitation = manualLinks.offer(runtimeClient, text, manualLinkAllowed(foreground = true))
+                    if (invitation != null) manualInvitation = manualLinks.foreground(runtimeClient, manualLinkAllowed(foreground = true))
+                } else if (manualForeground) manualMessage = "Scan ended. Existing destination fields were preserved."
+            }
+        }
+    }
+
     private fun chooseManualDocument() {
         val ticket = manualTicket() ?: return
         if (!manualPicker.begin(runtimeClient, ticket)) {
@@ -687,6 +819,7 @@ class MainActivity : ComponentActivity() {
         OutlinedButton(enabled = configurable && !manualBusy, onClick = { refreshManualProfiles() }) { Text("Load saved destinations") }
         manualSaved.forEach { saved -> OutlinedButton(enabled = configurable && !manualBusy, onClick = { loadManualProfile(saved.id) }) { Text("Load ${saved.name}") } }
         OutlinedButton(enabled = configurable && !manualBusy, onClick = { chooseManualDocument() }) { Text("Import reviewed JSON file") }
+        OutlinedButton(enabled = configurable && !manualBusy && !capture.scannerPermissionOutstanding, onClick = { beginManualScanner() }) { Text("Scan manual destination QR") }
         manualMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         if (manualBusy) Text("Destination file operation pending", style = MaterialTheme.typography.bodySmall)
         manualReview?.let { selected ->
@@ -796,6 +929,7 @@ class MainActivity : ComponentActivity() {
     private fun captureIdleForFiles(): Boolean = !preparationPending && ::capture.isInitialized && capture.snapshot().canPrepare
 
     private fun loadRecordings() {
+        if (manualScanTicket != null) { libraryMessage = "Finish camera scanning and its cleanup before opening recordings."; return }
         manualEdited()
         if (preparationPending) { libraryMessage = "Wait for capture preparation to finish before refreshing."; return }
         val screen = WeakReference(this)
@@ -810,6 +944,7 @@ class MainActivity : ComponentActivity() {
         if (ticket == null) libraryMessage = "A private file operation is still finishing. Wait before refreshing."
     }
     private fun chooseRecordingExport(entry: RecordingCatalogue.Entry, allowUnverified: Boolean) {
+        if (manualScanTicket != null) { libraryMessage = "Finish camera scanning and its cleanup before exporting."; return }
         manualEdited()
         if (!captureIdleForFiles()) { libraryMessage = "Stop and save capture before opening the document picker."; return }
         val selected = recordingLibrary.select(entry, allowUnverified)
@@ -914,12 +1049,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentPreparation(intent: PreparationIntent): Boolean = pendingPreparation === intent && intent.request == prepareRequest &&
-        poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && (backgroundAudio && !intent.capture.hasVideo) == intent.backgroundAudio && initialStandby==intent.initialStandby && recordLocally == intent.record && useV4v == intent.v4v &&
+        poseTracking && !isDestroyed && capture.pendingPreparation(intent.ticket) && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && (backgroundAudio && !intent.capture.hasVideo) == intent.backgroundAudio && initialStandby==intent.initialStandby && recordLocally == intent.record && useV4v == intent.v4v &&
         (!intent.capture.hasVideo || orientationChoice == intent.orientation?.choice && cameraChoice == intent.cameraChoice) &&
         (intent.v4v || (useSrt == intent.srt && destinationUrl == intent.endpoint && destinationKey == intent.key && srtPassphrase == intent.passphrase &&
             srtPlaintextLab == intent.srtPlaintext && allowPlaintextDevelopment == intent.rtmpPlaintext))
 
     private fun cancelPreparation() {
+        pendingPreparation?.ticket?.let(capture::abandonPreparation)
         pendingPreparation = null; preparationPending = false
         recordingPreflight?.let(recordingLibrary::cancel); recordingPreflight = null
     }
@@ -929,8 +1065,10 @@ class MainActivity : ComponentActivity() {
     private fun prepareWithPermissions() {
         if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
         manualEdited()
-        val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo,
-            orientationChoice.freeze(selectedIntent.hasVideo, naturalPortrait(), poseSelector.pose), cameraChoice,initialStandby)
+        val frozen = orientationChoice.freeze(selectedIntent.hasVideo, naturalPortrait(), poseSelector.pose)
+        val ticket = capture.reservePreparation(selectedIntent, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo, frozen, cameraChoice, initialStandby) ?: return
+        val intent = PreparationIntent(ticket, ++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo,
+            frozen, cameraChoice,initialStandby)
         pendingPreparation = intent; preparationPending = true
         val needed = preparationPermissions(intent).toTypedArray()
         if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
@@ -1004,9 +1142,9 @@ class MainActivity : ComponentActivity() {
             updatePreview()
             // Explicit Prepare restores the stable physical pose even if no
             // further sensor callback followed qualification Stop/CLEAR.
-            val stablePose = if (intent.capture.hasVideo) poseSelector.prepareSession() else CardinalPose.NATURAL
-            preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture, intent.audioInputId, intent.backgroundAudio,
-                intent.orientation?.atPrepare(stablePose), intent.cameraChoice,intent.initialStandby)
+            if (intent.capture.hasVideo) capture.orientationChanged(poseSelector.prepareSession())
+            require(capture.prepare(intent.ticket, surface, publisher, recorder)) { "Capture preparation was not admitted" }
+            preparedCapture = intent.ticket
             if (intent.backgroundAudio) {
                 val prepared = checkNotNull(preparedCapture) { "Capture preparation was not admitted" }
                 require(audioOwner.arm(prepared, intent.v4v, intent.record)) { "Background audio service could not be admitted. Prepare again." }
@@ -1019,7 +1157,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onConfigurationChanged(newConfig: Configuration) { super.onConfigurationChanged(newConfig); updatePreview() }
+    override fun onConfigurationChanged(newConfig: Configuration) { super.onConfigurationChanged(newConfig); updatePreview(); updateManualScannerPreview() }
     override fun onStart() {
         super.onStart()
         audioOwner.enterForeground(runtimeClient)
@@ -1035,16 +1173,18 @@ class MainActivity : ComponentActivity() {
         super.onResume(); manualForeground = true
         manualInvitation = manualLinks.foreground(runtimeClient, manualLinkAllowed(foreground = true))
         resumeManualDocument()
+        manualScanTicket?.let(::openManualScanner)
     }
     override fun onPause() {
         manualLinks.pause(runtimeClient, manualInvitation != null || manualActions.review != null || manualActions.busy || manualPicker.hasOutstanding)
         manualForeground = false
         invalidateManualLink()
-        if (!manualPicker.expectedDeparture(runtimeClient)) manualEdited()
+        if (!manualPicker.expectedDeparture(runtimeClient) && !capture.scannerPermissionFor(runtimeClient)) manualEdited()
         super.onPause()
     }
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putBoolean("sapflow.manual-picker.discard", manualPicker.outstandingFor(runtimeClient))
+        outState.putBoolean("sapflow.qr-permission.discard", capture.scannerPermissionFor(runtimeClient) || capture.scannerPermissionOutstanding)
         super.onSaveInstanceState(outState)
     }
     override fun onStop() {

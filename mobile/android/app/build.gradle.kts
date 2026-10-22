@@ -157,6 +157,8 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    // Pure Apache-2.0 QR core, no Play services, MLKit, model or external scanner app.
+    implementation("com.google.zxing:core:3.5.4")
     // Newest Kotlin 2.2-metadata compatible release. 0.23/0.24 require Kotlin 2.3.
     implementation("fr.acinq.secp256k1:secp256k1-kmp-jvm:0.22.0")
     implementation("fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.22.0")
