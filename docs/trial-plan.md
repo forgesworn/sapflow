@@ -127,8 +127,10 @@ No release tag exists. The trial runs a commit, and the image and every log
 carry it.
 
 - [ ] Choose `<commit>` on `main`, at or after the commits that add
-  `SAPFLOW_SRT_ENCRYPTION` and stop on SIGTERM (without the second, a
-  rollback waits 10 s for Docker to kill sapflow). Confirm CI is green on that exact commit
+  `SAPFLOW_SRT_ENCRYPTION`, stop on SIGTERM (without it, a rollback waits
+  10 s for Docker to kill sapflow) and report a recording with a gap as
+  finished (without it, an SRT drop during the show means v4v gets no
+  replay). Confirm CI is green on that exact commit
   (Ubuntu: fmt, clippy, tests, `scripts/smoke.sh`, fuzz regressions and 60 s
   per target).
 - [ ] On the build machine, at `<commit>`: `cargo test --workspace`,
@@ -140,7 +142,10 @@ carry it.
   into a local copy of it first; its changes are the gate script and a
   playlist helper, not the player):
   `SAPFLOW_BIN=<path to target/release/sapflow> npm run e2e:ingest-sapflow`
-  and `... npm run e2e:ingest-srt-sapflow`. The SRT suite already uses the
+  and `... npm run e2e:ingest-srt-sapflow`. The merge conflicts in
+  `scripts/live-ingest-smoke.mjs` (keep both sides), and the SRT suite needs
+  `SAPFLOW_RECONNECT_GRACE: "10"` in its smoke environment to match the
+  app's 10 s grace. Both passed this way on 2026-10-22. The SRT suite already uses the
   stream id form of section 2.5. The gates run the macOS binary; CI's smoke
   run is the only Linux evidence for ingest until the dry run.
 - [ ] Build the image from `<commit>` with the repository's `Dockerfile`
