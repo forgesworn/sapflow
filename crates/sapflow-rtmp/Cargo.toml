@@ -1,0 +1,25 @@
+[package]
+name = "sapflow-rtmp"
+description = "RTMP publishing in pure Rust, sans-IO: the server side of a publish and a publishing client, original and digest handshakes, AMF0. Fuzzed, no unsafe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["rtmp", "streaming", "sans-io", "live", "flv"]
+categories = ["network-programming", "multimedia::video"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The digest handshake.
+hmac = "0.12.1"
+sha2 = "0.10.9"
+
+[dev-dependencies]
+# tests/flv_ingest.rs: RTMP media into LL-HLS.
+sapflow-hls = { path = "../sapflow-hls" }

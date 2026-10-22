@@ -189,7 +189,7 @@ Pinned in the crates' `Cargo.toml`. These are decisions the user may revisit.
 | H.264 | `h264-reader` 0.9.0 | Annex B splitting and SPS parsing. |
 | AAC | `adts-reader` 0.4.0 | ADTS headers. It reports the raw-block count as the field plus one. |
 | fMP4 writing | `mp4-atom` 0.16.2 | `ftyp`/`moov`/`moof`/`mdat` encoding. |
-| RTMP (M2) | our own, `sapflow_hls::rtmp` | Publish only, sans-IO: handshake (original and digest forms), chunk stream, AMF0, the publish commands. Replaced `rml_rtmp` 0.8.0 (last release 2023-04), in which fuzzing found two panics on unauthenticated input. The digest handshake uses `hmac` 0.12.1 and `sha2` 0.10.9. |
+| RTMP (M2) | our own, `sapflow-rtmp` | Publish only, sans-IO: handshake (original and digest forms), chunk stream, AMF0, the publish commands. Replaced `rml_rtmp` 0.8.0 (last release 2023-04), in which fuzzing found two panics on unauthenticated input. The digest handshake uses `hmac` 0.12.1 and `sha2` 0.10.9. |
 | Fuzzing (M5) | `cargo-fuzz` | |
 
 Licences: every dependency is permissive. `sync_wrapper` is Apache-2.0
@@ -200,7 +200,7 @@ Our own parsing is the SRT stream id, the RTMP stream key, the chunk file
 names, the `_HLS_msn`/`_HLS_part` query, the FLV video and audio tag headers
 (5 and 2 bytes), the AudioSpecificConfig (2 bytes) and NAL length prefixes,
 all small and unit-tested, and, since 2026-10-20, the whole RTMP protocol
-(publish only: `sapflow_hls::rtmp`) and the whole SRT receiver (`sapflow-srt`: every packet type, the handshake and its
+(publish only: `sapflow-rtmp`) and the whole SRT receiver (`sapflow-srt`: every packet type, the handshake and its
 extensions, loss lists). Each has a fuzz target.
 
 ### RTMP handshake findings (2026-10-20)

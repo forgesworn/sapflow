@@ -2,7 +2,7 @@
 //! re-encoding what was decoded is stable.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use sapflow_hls::rtmp::amf0;
+use sapflow_rtmp::amf0;
 
 fn encode(values: &[amf0::Value]) -> Vec<u8> {
     let mut out = Vec::new();

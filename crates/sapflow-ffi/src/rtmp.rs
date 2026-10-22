@@ -7,7 +7,7 @@ use sapflow_client::{
     CodecConfig,
     transport_progress::{StartupProgressEvent, StartupWatermark},
 };
-use sapflow_hls::rtmp::client::{ClientError, Publisher, PublisherConfig, PublisherState};
+use sapflow_rtmp::client::{ClientError, Publisher, PublisherConfig, PublisherState};
 
 use crate::{MAX_ENCODED_BUFFER_BYTES, MediaSample};
 // C0+C1+C2. Proof only: do not infer a counter baseline from the first peer ACK.
@@ -440,7 +440,7 @@ fn avc_configuration(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>, NativeRtmpError>
 mod tests {
     use super::*;
     use crate::MediaCodec;
-    use sapflow_hls::rtmp::{Connection, Event};
+    use sapflow_rtmp::{Connection, Event};
 
     const SPS: &[u8] = &[
         0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0, 0, 3, 0, 8, 0, 0, 3,

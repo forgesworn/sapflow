@@ -1,6 +1,6 @@
 [package]
 name = "sapflow-hls"
-description = "Low-Latency HLS packaging in pure Rust, plus sans-IO RTMP publish ingest, FLV and MPEG-TS demuxing and fragmented MP4 writing."
+description = "Low-Latency HLS packaging in pure Rust: FLV and MPEG-TS ingest, fragmented MP4 parts and segments, and playlists that follow Apple's rules."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["hls", "ll-hls", "rtmp", "mpeg-ts", "fmp4"]
+keywords = ["hls", "ll-hls", "mpeg-ts", "fmp4", "streaming"]
 categories = ["multimedia::video", "network-programming"]
 
 [lints]
@@ -22,6 +22,3 @@ adts-reader = "0.4.0"
 h264-reader = "0.9.0"
 mpeg2ts = "0.6.1"
 tracing = "0.1.44"
-# The RTMP digest handshake.
-hmac = "0.12.1"
-sha2 = "0.10.9"

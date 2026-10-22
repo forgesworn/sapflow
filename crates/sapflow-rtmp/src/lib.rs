@@ -1,16 +1,25 @@
-//! RTMP ingest, publish only: our own, sans-IO.
+//! RTMP publishing in pure Rust, sans-IO: the server side of a publish
+//! ([`Connection`]) and the publishing client ([`client::Publisher`]).
 //!
 //! Bytes from the socket go in, events and bytes to send come out; the
-//! server crate owns the socket, timeouts and policy. Layers:
+//! caller owns the socket, timeouts and policy. Layers:
 //!
 //! - [`handshake`]: C0/C1/C2 and S0/S1/S2, original and digest forms.
 //! - [`chunk`]: the chunk stream, reassembling messages, with bounds.
 //! - [`amf0`]: the values commands and metadata are made of.
 //! - [`session`]: connect, createStream, publish and the media that follows.
+//! - [`client`]: the same exchange from the publishing side.
+//!
+//! Video and audio arrive as FLV tag bodies with millisecond timestamps;
+//! `sapflow-hls` turns them into LL-HLS (`FlvIngest`). Plain RTMP only: bring
+//! your own TLS for RTMPS.
 //!
 //! Every input is hostile until the publish is accepted: nothing here
 //! indexes without a bound, does unchecked arithmetic on a length or
-//! allocates from a declared length. Fuzzed by `rtmp_session` and `amf0`.
+//! allocates from a declared length. Fuzzed by `rtmp_session`, `rtmp_client`
+//! and `amf0`.
+
+#![warn(missing_docs)]
 
 pub mod amf0;
 pub mod chunk;
@@ -133,15 +142,13 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FlvIngest, MuxerConfig};
-    use std::time::SystemTime;
 
     /// The client side of a real publish, recorded through a TCP relay:
     /// `ffmpeg -f lavfi -i testsrc=size=160x90:rate=15 -f lavfi -i sine
     /// -t 3 -c:v libx264 -g 15 -b:v 100k -c:a aac -b:a 32k -f flv
     /// rtmp://127.0.0.1:<port>/live/event-x?user=u&pass=p` (ffmpeg 8.0.1).
     pub(crate) const FFMPEG_PUBLISH: &[u8] =
-        include_bytes!("../../tests/fixtures/ffmpeg-rtmp-publish.bin");
+        include_bytes!("../tests/fixtures/ffmpeg-rtmp-publish.bin");
 
     fn run(slice: usize) -> (Vec<Event>, Option<Form>) {
         let mut conn = Connection::new(1);
@@ -192,28 +199,6 @@ mod tests {
         };
         assert_eq!(data.get(1), Some(&2), "AVC end of sequence last");
         assert!((140..=150).contains(&audio), "{audio} audio messages");
-
-        // The media makes segments.
-        let mut ing = FlvIngest::new(MuxerConfig::default());
-        let mut last_video = 0;
-        for ev in &events {
-            match ev {
-                Event::Metadata { audio } => ing.expect_audio(*audio),
-                Event::Video { timestamp, data } => {
-                    assert!(*timestamp >= last_video, "video timestamps rise");
-                    last_video = *timestamp;
-                    ing.video(*timestamp, data, SystemTime::UNIX_EPOCH)
-                        .expect("video");
-                }
-                Event::Audio { timestamp, data } => ing.audio(*timestamp, data),
-                _ => {}
-            }
-        }
-        assert!(last_video > 2800, "last video at {last_video} ms");
-        let m = ing.muxer().expect("muxer");
-        assert!(m.has_content());
-        assert_eq!((m.video().width, m.video().height), (160, 90));
-        assert_eq!(m.audio().map(|a| a.sample_rate), Some(48000));
     }
 
     #[test]

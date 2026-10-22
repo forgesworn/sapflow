@@ -15,7 +15,8 @@ them, and using one means a git dependency.
 
 Checked on 2026-10-22 against the crates.io API: `sapflow`, `sapflow-srt`,
 `sapflow-hls`, `sapflow-core`, `sapflow-client`, `sapflow-ffi`,
-`sapflow-server` and `sapflow-bench` were all unregistered. crates.io asks
+`sapflow-server` and `sapflow-bench` were all unregistered; `sapflow-rtmp`, split
+out of `sapflow-hls` the same day, was too. crates.io asks
 that names are not reserved without code, so register each by publishing it.
 
 ## Which crates, in order
@@ -27,7 +28,8 @@ Publish in dependency order. Each internal `path` dependency needs a
 |-------|-------|----------|-------|
 | 1 | `sapflow-srt` | yes | No internal dependencies. The crate with the clearest audience: pure-Rust SRT with no libsrt |
 | 2 | `sapflow-core` | yes | Needed by the server |
-| 3 | `sapflow-hls` | yes | RTMP, MPEG-TS ingest and LL-HLS packaging |
+| 3 | `sapflow-hls` | yes | FLV and MPEG-TS ingest and LL-HLS packaging |
+| 3a | `sapflow-rtmp` | yes | RTMP publishing, server side and client. Its dev-dependency on `sapflow-hls` (one integration test) is path-only, so `cargo publish` drops it |
 | 4 | `sapflow-client` | later | Depends on `sapflow-srt`; its API is still moving with the mobile work |
 | 5 | `sapflow-ffi` | no | A Swift/Kotlin binding, shipped as native packages, not as a Rust library |
 | 6 | `sapflow` | yes | The server; the package was renamed from `sapflow-server` (its directory keeps the old name) so `cargo install sapflow` gives the `sapflow` binary |
@@ -42,7 +44,9 @@ Publish in dependency order. Each internal `path` dependency needs a
 - [x] `description`, up to five `keywords` and `categories`, and `readme`:
   - `sapflow-srt`: keywords `srt`, `streaming`, `sans-io`, `live`, `video`;
     categories `network-programming`, `multimedia::video`.
-  - `sapflow-hls`: keywords `hls`, `ll-hls`, `rtmp`, `mpeg-ts`, `fmp4`;
+  - `sapflow-rtmp`: keywords `rtmp`, `streaming`, `sans-io`, `live`, `flv`;
+    categories `network-programming`, `multimedia::video`.
+  - `sapflow-hls`: keywords `hls`, `ll-hls`, `mpeg-ts`, `fmp4`, `streaming`;
     categories `multimedia::video`, `network-programming`.
   - `sapflow`: keywords `media-server`, `srt`, `rtmp`, `hls`, `streaming`;
     categories `multimedia::video`, `command-line-utilities`.
@@ -53,7 +57,10 @@ Publish in dependency order. Each internal `path` dependency needs a
 - [x] `cargo package -p <crate> --list`: check what ships. The test fixtures
       ship (SRT 240 KB, HLS 640 KB); every one is generated (ffmpeg test
       signal or solid colour), and the HLS tests include them at compile time.
-- [ ] `cargo publish --dry-run -p <crate>`.
+- [ ] `cargo publish --workspace --dry-run --exclude sapflow-bench --exclude
+      sapflow-ffi --exclude sapflow-client` (passed 2026-10-22). Clear
+      `target/package` first: a tarball left from an earlier layout made cargo
+      1.94.1 fail with "no hash listed".
 - [x] Each crate carries the MIT `LICENSE` (a link to the root file, which
       `cargo package` copies in). `THIRD_PARTY_LICENSES.txt` stays with the
       container image.

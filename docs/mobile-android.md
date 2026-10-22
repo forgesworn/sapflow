@@ -411,7 +411,7 @@ identity and bounded retry after saturation. The underlying publisher has
 eighteen wire/state tests. An independent plaintext receiver check is repeatable:
 
 ```sh
-cargo build --offline -p sapflow-hls --example rtmp-publish -j 2
+cargo build --offline -p sapflow-rtmp --example rtmp-publish -j 2
 python3 tests/rtmp-publish-interop.py
 ```
 

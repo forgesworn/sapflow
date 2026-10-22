@@ -611,6 +611,7 @@ dependencies = [
  "sapflow-client",
  "sapflow-core",
  "sapflow-hls",
+ "sapflow-rtmp",
  "sapflow-srt",
  "serde",
  "serde_json",
@@ -625,11 +626,17 @@ dependencies = [
  "adts-reader",
  "bytes",
  "h264-reader",
- "hmac 0.12.1",
  "mp4-atom",
  "mpeg2ts",
- "sha2",
  "tracing",
+]
+
+[[package]]
+name = "sapflow-rtmp"
+version = "0.1.0"
+dependencies = [
+ "hmac 0.12.1",
+ "sha2",
 ]
 
 [[package]]

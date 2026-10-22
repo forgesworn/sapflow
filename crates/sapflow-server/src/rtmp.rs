@@ -1,6 +1,6 @@
 //! RTMP ingest (OBS's default, Larix's too). Publish only: no playback.
 //!
-//! The handshake and chunk protocol are ours (`sapflow_hls::rtmp`,
+//! The handshake and chunk protocol are ours (`sapflow_rtmp`,
 //! sans-IO); this is the socket loop and the policy. Credentials ride in
 //! the stream key's query (`<eventId>?user=..&pass=..`) and are checked
 //! when the encoder asks to publish, before any media is accepted.
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use sapflow_core::PublishRequest;
-use sapflow_hls::rtmp::{Connection, Event};
+use sapflow_rtmp::{Connection, Event};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;

@@ -1000,7 +1000,7 @@ fn exact_u32(bytes: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtmp::{Connection, Event, Form};
+    use crate::{Connection, Event, Form};
 
     fn config() -> PublisherConfig {
         PublisherConfig::new(

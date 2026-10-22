@@ -170,7 +170,7 @@ guards or claim sustained improvement from a synthetic helper benchmark.
 Existing source entry points:
 
 - [SRT protocol](../crates/sapflow-srt/src/lib.rs)
-- [Our RTMP protocol](../crates/sapflow-hls/src/rtmp/mod.rs)
+- [Our RTMP protocol](../crates/sapflow-rtmp/src/lib.rs)
 - [HLS muxer](../crates/sapflow-hls/src/muxer.rs)
 - [Fragmented MP4 assembly](../crates/sapflow-hls/src/fmp4.rs)
 - forgesworn-link recording delivery worktree: crates/link-engine and crates/link-blossom

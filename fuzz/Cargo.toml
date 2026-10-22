@@ -18,6 +18,7 @@ httparse = "1.10.1"
 bytes = "1.12.1"
 sapflow-core = { path = "../crates/sapflow-core" }
 sapflow-hls = { path = "../crates/sapflow-hls" }
+sapflow-rtmp = { path = "../crates/sapflow-rtmp" }
 sapflow-srt = { path = "../crates/sapflow-srt" }
 sapflow-client = { path = "../crates/sapflow-client" }
 serde = { version = "=1.0.229", features = ["derive"] }

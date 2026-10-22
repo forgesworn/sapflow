@@ -14,7 +14,6 @@ pub mod fmp4;
 pub mod ingest;
 pub mod muxer;
 pub mod playlist;
-pub mod rtmp;
 pub mod time;
 
 pub use flv::FlvIngest;

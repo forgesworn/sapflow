@@ -26,5 +26,6 @@ workspace = true
 bytes = "=1.12.1"
 sapflow-client = { path = "../sapflow-client" }
 sapflow-hls = { path = "../sapflow-hls" }
+sapflow-rtmp = { path = "../sapflow-rtmp" }
 sapflow-srt = { path = "../sapflow-srt" }
 uniffi = { version = "=0.32.2", default-features = false }

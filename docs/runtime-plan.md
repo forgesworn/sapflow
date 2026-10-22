@@ -112,7 +112,7 @@ default until the new one matches it in `scripts/smoke.sh` and the benchmarks:
    on it as well as on hyper; hyper stays the default until a production
    show has run on the own loop.
 2. SRT ingest (UDP; the listener is sans-IO already).
-3. RTMP ingest (TCP; `sapflow_hls::rtmp::Connection` is sans-IO already).
+3. RTMP ingest (TCP; `sapflow_rtmp::Connection` is sans-IO already).
 4. The callback client.
 5. Recording on a writer thread.
 6. Signals and shutdown.
