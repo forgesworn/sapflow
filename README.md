@@ -79,6 +79,13 @@ macOS. The crates are version 0.0.0 and not on crates.io yet. See
 | `sapflow-ffi` | Typed Swift/Kotlin boundary for the shared core |
 | `sapflow-server` | The `sapflow` binary: ingest, HTTP, callbacks, recording |
 
+The libraries are not on crates.io yet; depend on them by git, for example
+`sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }`. Rust 1.94,
+edition 2024. A complete SRT listener is
+[crates/sapflow-srt/examples/listen.rs](crates/sapflow-srt/examples/listen.rs);
+the RTMP code is the `sapflow_hls::rtmp` module, publish only. No C
+dependencies.
+
 ## Build and run
 
 ```bash
@@ -100,6 +107,12 @@ Publish to `srt://<host>:8890?streamid=publish:live/<eventId>:<publisher>:<passw
 or `rtmp://<host>:1935/live` with key `<eventId>?user=<publisher>&pass=<password>`,
 and play `http://<host>:8888/live/<eventId>/index.m3u8`. `sapflow --help`
 lists every setting.
+
+sapflow serves HTTP/1.1 without TLS. Put Caddy or another HTTP/2 proxy in
+front: Safari takes the low-latency position only over HTTP/2 (about 3 s
+glass to glass through it, against about 10 s over HTTP/1.1; see
+[docs/interop.md](docs/interop.md)). There is a container image
+([Dockerfile](Dockerfile)); no prebuilt release binaries yet.
 
 `SAPFLOW_HLS_MODE=whole` serves complete segments without low-latency part
 advertising. Use it when a delivery path cannot fetch parts quickly enough;

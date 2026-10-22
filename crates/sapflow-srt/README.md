@@ -23,13 +23,45 @@ indexing are denied by lint). A `Listener` takes datagrams with their
 source address and the time and gives back datagrams to send, events and
 the next time it needs; the server owns the socket and the timer.
 
-```rust
-let mut l = sapflow_srt::Listener::new(sapflow_srt::Config::default(), Instant::now());
-l.handle_datagram(now, peer, &datagram);   // or l.handle_timeout(now)
-while let Some(ev) = l.poll_event() { /* Connect: accept or reject; Data; Closed */ }
-while let Some((to, bytes)) = l.poll_transmit() { /* send */ }
-let next = l.poll_timeout();               // None when there are no connections
+Not on crates.io yet; depend on it by git:
+
+```toml
+[dependencies]
+sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }
 ```
+
+A complete listener that accepts every caller and prints each payload is
+[`examples/listen.rs`](examples/listen.rs) (`cargo run -p sapflow-srt --example listen`).
+Its core:
+
+```rust
+use sapflow_srt::{Config, Event, Listener};
+
+let mut listener = Listener::new(Config::default(), Instant::now());
+// for each datagram from the socket:
+listener.handle_datagram(Instant::now(), peer, &datagram);
+// and whenever poll_timeout() comes due:
+listener.handle_timeout(Instant::now());
+
+while let Some(event) = listener.poll_event() {
+    match event {
+        // The stream id is untrusted: check it, then accept or reject.
+        Event::Connect { id, peer, stream_id } => { listener.accept(id, Instant::now()); }
+        Event::Data { id, payload } => { /* MPEG-TS bytes, in order, on time */ }
+        Event::Closed { id, reason, stats } => {}
+    }
+}
+while let Some((to, bytes)) = listener.poll_transmit() {
+    socket.send_to(&bytes, to)?;
+}
+let next: Option<Instant> = listener.poll_timeout(); // None when idle
+```
+
+`Config` sets the latency (default 120 ms; a caller asking for more gets
+more), connection and handshake limits, buffer size, idle and accept
+timeouts, and encryption (`crypto`, `require_encryption`). To refuse a
+caller, `listener.reject(id, RejectCode::...)`; to choose a per-caller
+secret, `accept_with_crypto`. Sending is `Caller` (`examples/send.rs`).
 
 | Module | What |
 |--------|------|
