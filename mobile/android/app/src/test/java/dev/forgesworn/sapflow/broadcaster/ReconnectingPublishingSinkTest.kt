@@ -1,6 +1,7 @@
 package dev.forgesworn.sapflow.broadcaster
 
 import dev.forgesworn.sapflow.MediaSample
+import dev.forgesworn.sapflow.NoHandle
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
@@ -47,15 +48,22 @@ class ReconnectingPublishingSinkTest {
         var releaseClose: CountDownLatch? = null
         var failClose = false
         var failedStartupCleanup = false
+        var startRelease: CountDownLatch? = null
+        var acceptsSamples = false
+        val samples = AtomicInteger()
         override val status = "synthetic transport"
         override fun start() {
             controlThread.set(Thread.currentThread())
             started.countDown()
+            startRelease?.let { check(it.await(2, TimeUnit.SECONDS)) }
             if (failedStartupCleanup) throw IllegalStateException("synthetic setup failure").apply {
                 addSuppressed(IllegalStateException("synthetic partial cleanup failure"))
             }
         }
-        override fun consume(sample: MediaSample) { error("No media expected in control tests") }
+        override fun consume(sample: MediaSample) {
+            check(acceptsSamples) { "No media expected in control tests" }
+            samples.incrementAndGet()
+        }
         override fun close() {
             closing.countDown()
             releaseClose?.let { check(it.await(2, TimeUnit.SECONDS)) { "bounded synthetic close" } }
@@ -90,6 +98,40 @@ class ReconnectingPublishingSinkTest {
         assertEquals(1, h.sinks.size)
         assertEquals(1, h.policy.stops.get())
         assertNull(h.owner.observationScope)
+    }
+
+    @Test fun firstResumedSampleExpiresBeforeTransportWhenWakeTickIsWithheldAndRefreshStaysSameOwner() {
+        val boot = java.util.concurrent.atomic.AtomicLong(1)
+        data class Grant(val owner: Long, val deadline: Long)
+        val grant = java.util.concurrent.atomic.AtomicReference(Grant(1, 100))
+        val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val policy = Policy()
+        var transport: Sink? = null
+        val coordinator = ReconnectingPublishingSink(policyFactory = { policy }, authorityNowNs = boot::get,
+            sampleAuthority = PublishingAuthority { val current = grant.get(); current.owner == 1L && boot.get() < current.deadline }) { events ->
+            Sink(events).also { transport = it; it.acceptsSamples = true; it.startRelease = release; entered.countDown() }
+        }
+        val epoch = coordinator.newEpoch()
+        epoch.start()
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            val sink = checkNotNull(transport); assertTrue(sink.started.await(2, TimeUnit.SECONDS))
+            // The actual control executor is blocked inside transport start.
+            // Neither a scheduled alarm nor this explicit wake tick can run.
+            epoch.revalidateAuthority()
+            MediaSample(NoHandle).use { sample ->
+                epoch.consume(sample); assertEquals(1, sink.samples.get())
+                boot.set(50); grant.set(Grant(1, 200)) // Valid committed same-owner refresh.
+                boot.set(150); epoch.consume(sample); assertEquals(2, sink.samples.get())
+                boot.set(200) // Suspension advances BOOTTIME, not a media timestamp.
+                assertThrows(IllegalStateException::class.java) { epoch.consume(sample) }
+                assertEquals(2, sink.samples.get()); assertFalse(sample.uniffiIsDestroyed)
+                // Late refresh cannot resurrect an already fenced coordinator.
+                grant.set(Grant(1, 300)); epoch.consume(sample)
+                assertEquals(2, sink.samples.get())
+            }
+        } finally { release.countDown(); epoch.close() }
+        assertEquals(1, policy.starts.get()); assertEquals(0, policy.failures.get())
     }
     @Test fun logicalSocketBytesSurviveActualEpochCloseAndOldCounterCannotCountTwice() {
         val h = Harness(); val a = h.owner.newEpoch(); a.start(); val first = h.sink(0)

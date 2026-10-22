@@ -38,8 +38,8 @@ internal class ProbeMediaSource(private val init: ByteArray, private val part: B
 internal class FiniteNativeOriginDecoder : OriginDecoder {
     override fun decode(init: ByteArray, part: ByteArray, intent: CaptureIntent, cancel: OriginProbeCancellation): NativeOriginEvidence {
         validateProbeMp4(init, true); validateProbeMp4(part, false)
-        val deadline = minOf(cancel.deadlineNs, System.nanoTime() + OriginProbeLimits.DECODE_NS)
-        fun checkDeadline() { cancel.check(); check(System.nanoTime() < deadline) { "Native origin decode timed out" } }
+        val deadline = minOf(cancel.deadlineNs, cancel.nowNs() + OriginProbeLimits.DECODE_NS)
+        fun checkDeadline() { cancel.check(); check(cancel.nowNs() < deadline) { "Native origin decode timed out" } }
         fun track(video: Boolean): NativeTrackEvidence {
             val source = ProbeMediaSource(init, part)
             val extractor = MediaExtractor()

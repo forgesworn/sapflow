@@ -109,16 +109,18 @@ final class V4vOriginObserver: @unchecked Sendable {
     var cleanupComplete: Bool { status.cleanupComplete && media.cleanupComplete && decoder.cleanupComplete }
 
     init(attempt: V4vObservedAttempt, profile: V4vConnectorProfile, gate: OriginConfirmationGate,
-         status: OriginSessionStatusFetching, media: OriginMediaFetching = OriginMediaHTTP(), decoder: OriginMediaDecoding = OriginMediaDecoder(),
+         status: OriginSessionStatusFetching, media: OriginMediaFetching? = nil, decoder: OriginMediaDecoding? = nil,
          owner: DispatchQueue = DispatchQueue(label: "sapflow.origin.observer"),
          clock: @escaping () -> V4vClock, confirm: @escaping (OriginAttemptIdentity, UInt64) throws -> Void) {
-        self.attempt = attempt; self.profile = profile; self.gate = gate; self.status = status; self.media = media; self.decoder = decoder
+        self.attempt = attempt; self.profile = profile; self.gate = gate; self.status = status
+        self.media = media ?? OriginMediaHTTP(now: { clock().monotonicNs })
+        self.decoder = decoder ?? OriginMediaDecoder(now: { clock().monotonicNs })
         queue = owner; self.clock = clock; self.confirm = confirm
         let changed = { [weak self] in
             guard let self else { return }
             self.queue.async { [weak self] in self?.cleanupChanged() }
         }
-        status.whenCleanupComplete(changed); media.whenCleanupComplete(changed); decoder.whenCleanupComplete(changed)
+        status.whenCleanupComplete(changed); self.media.whenCleanupComplete(changed); self.decoder.whenCleanupComplete(changed)
     }
     func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func start(deadlineNs originalDeadlineNs: UInt64? = nil, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
@@ -132,7 +134,7 @@ final class V4vOriginObserver: @unchecked Sendable {
             deadlineNs = originalDeadlineNs ?? now + 8_000_000_000
             guard deadlineNs > now, deadlineNs - now <= 8_000_000_000 else { finish(.failure(.deadline)); return }
             let deadline = DispatchSource.makeTimerSource(queue: queue)
-            deadline.schedule(deadline: DispatchTime(uptimeNanoseconds: deadlineNs))
+            deadline.schedule(deadline: .now() + .nanoseconds(Int(deadlineNs - now)))
             deadline.setEventHandler { [weak self] in self?.cancel(.deadline) }
             timer = deadline; deadline.resume()
             guard permitted() else { finish(.failure(.scope)); return }

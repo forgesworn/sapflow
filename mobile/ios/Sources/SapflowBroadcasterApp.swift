@@ -11,6 +11,7 @@ final class BroadcasterModel: ObservableObject {
     @Published var snapshot = CaptureSnapshot()
     @Published private(set) var selectedAudioInputID: String?
     @Published private(set) var captureProfile = CaptureIntent.defaultProfile
+    @Published private(set) var continueAudioInBackground = false
     @Published var destinationMode = BroadcasterDestinationMode.recording {
         didSet {
             guard destinationMode != oldValue else { return }
@@ -36,6 +37,7 @@ final class BroadcasterModel: ObservableObject {
     private lazy var destinationSelection = BroadcasterDestinationSelection { [weak engine] in engine?.cancelPendingPreparation($0) }
     private var hasOrientation = false
     private var foreground = false
+    private var lifecycleNotifications: [NSObjectProtocol] = []
     private var creatorOwner: V4vCreatorOwner?
     let creatorConfiguration = V4vCreatorConfiguration.load()
     let engine = CaptureEngine()
@@ -44,8 +46,12 @@ final class BroadcasterModel: ObservableObject {
         profiles = profileStore.load()
         engine.onChange = { [weak self] snapshot in
             guard let self else { return }
-            self.snapshot = snapshot; self.updateCreatorCapture()
+            self.snapshot = snapshot; self.updateCreatorActivity()
         }
+        // App-lifetime ownership, independent of navigation/view disappearance.
+        let centre = NotificationCenter.default
+        lifecycleNotifications.append(centre.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in self?.setForeground(false) })
+        lifecycleNotifications.append(centre.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.setForeground(true) })
         recordingLibrary.initialise { [weak engine] catalogue, admission, complete in
             guard let engine else { complete(false); return }
             engine.setRecordingCatalogue(catalogue, admission: admission, completion: complete)
@@ -61,7 +67,7 @@ final class BroadcasterModel: ObservableObject {
                 })
         }
     }
-    deinit { creatorOwner?.close() }
+    deinit { for token in lifecycleNotifications { NotificationCenter.default.removeObserver(token) }; creatorOwner?.close() }
     var recordingOnly: Bool { destinationMode == .recording }
     // 1080p has an engineering encoder path, pending physical qualification.
     let captureProfiles = CaptureIntent.allCases.filter { !$0.isEngineeringOnly }
@@ -77,15 +83,22 @@ final class BroadcasterModel: ObservableObject {
         guard canChangeCaptureProfile, captureProfiles.contains(profile) else { return }
         captureProfile = profile
     }
+    func selectBackgroundAudio(_ enabled: Bool) {
+        guard canChangeCaptureProfile, engine.selectBackgroundAudio(enabled) else { return }
+        continueAudioInBackground = enabled
+    }
     var captureBusy: Bool { snapshot.running || snapshot.phase == "Finalising" || snapshot.phase == "Preparing" }
     var canPrepare: Bool {
         recordingLibrary.captureAllowed && engine.canReservePreparation && !captureBusy && !snapshot.canStart && (destinationMode != .v4v || creator.canPrepare)
     }
     var canStart: Bool { recordingLibrary.captureAllowed && snapshot.canStart && (destinationMode != .v4v || creator.canStart) }
-    func setForeground(_ active: Bool) { foreground = active; updateCreatorActivity() }
+    func setForeground(_ active: Bool) { foreground = active; _ = engine.setForeground(active); updateCreatorActivity() }
     private func updateCreatorActivity() {
         updateCreatorCapture()
-        creatorOwner?.setActive(destinationMode == .v4v && foreground)
+        if let creatorOwner {
+            let permitted = creatorOwner.setSceneForeground(foreground, continuing: engine.backgroundContinuation)
+            creatorOwner.setActive(destinationMode == .v4v && permitted)
+        }
     }
     private func updateCreatorCapture() {
         guard destinationMode == .v4v else { return }
@@ -123,10 +136,11 @@ final class BroadcasterModel: ObservableObject {
         guard let preparation = destinationSelection.preparation else { return }
         updateOrientation(); engine.start(preparation: preparation)
     }
-    func stop() {
-        destinationSelection.stop()
-        if destinationMode == .v4v, let creatorOwner { creatorOwner.stopCapture() }
-        else { engine.stop() }
+    func stop(_ control: AudioShowStopControl) {
+        control.stop(capture: { engine.stop(control: $0) }, retirePublisher: { ticket in
+            destinationSelection.stop(preparation: ticket)
+            creatorOwner?.captureStopped(preparation: ticket)
+        })
     }
     func prepare() {
         guard canPrepare else { return }
@@ -249,12 +263,15 @@ struct BroadcasterView: View {
         }.background(Color(.systemBackground))
         .onAppear {
             UIDevice.current.beginGeneratingDeviceOrientationNotifications(); model.updateOrientation()
-            model.setForeground(scenePhase == .active)
+            if let active = AudioShowLifecycle.sceneVisibility(active: scenePhase == .active, background: scenePhase == .background) {
+                model.setForeground(active)
+            }
         }
-        .onDisappear { model.setForeground(false); UIDevice.current.endGeneratingDeviceOrientationNotifications() }
+        .onDisappear { UIDevice.current.endGeneratingDeviceOrientationNotifications() }
         .onChange(of: scenePhase) { phase in
-            if phase == .active { model.setForeground(true) }
-            else if phase == .background { model.setForeground(false) }
+            if let active = AudioShowLifecycle.sceneVisibility(active: phase == .active, background: phase == .background) {
+                model.setForeground(active)
+            }
             // A camera permission prompt may make the scene inactive briefly.
         }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in model.updateOrientation() }
@@ -316,6 +333,11 @@ struct BroadcasterView: View {
                 }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.microphone")
                 Button("Refresh microphone inputs") { model.refreshAudioInputs() }.disabled(!model.canChangeCaptureProfile)
                 Text("Active microphone: \(model.snapshot.activeAudioInput)").font(.caption)
+                if !model.captureProfile.hasVideo {
+                    Toggle("Continue started audio with the screen locked", isOn: Binding(get: { model.continueAudioInBackground }, set: { model.selectBackgroundAudio($0) }))
+                        .disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.backgroundAudio")
+                    Text("Only an audio show already recording can continue. Return to Sapflow to Stop and save; system recording controls are unavailable on this SDK. Calls, route faults and permission loss still interrupt capture. Background operation requires physical qualification.").font(.caption)
+                }
                 Picker("Capture mode and quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
                     ForEach(model.captureProfiles, id: \.self) { Text($0.label).tag($0) }
                 }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.quality")
@@ -326,12 +348,13 @@ struct BroadcasterView: View {
                     Button("Prepare") { model.prepare() }.disabled(!model.canPrepare).accessibilityIdentifier("capture.prepare")
                     Button(model.recordingOnly ? "Start recording" : "Start broadcast") { model.start() }.disabled(!model.canStart).accessibilityIdentifier("capture.start")
                 }.buttonStyle(.borderedProminent)
-                Button("Stop and save") { model.stop() }
-                    .buttonStyle(.bordered).disabled(!model.snapshot.running && !model.snapshot.canStart && model.snapshot.phase != "Finalising" && model.snapshot.phase != "Preparing").accessibilityIdentifier("capture.stop")
+                let stopControl = model.snapshot.stopControl
+                Button("Stop and save") { if let stopControl { model.stop(stopControl) } }
+                    .buttonStyle(.bordered).disabled(stopControl == nil).accessibilityIdentifier("capture.stop")
                 RecordingLibraryView(owner: recordings, canExport: model.engine.canChooseCaptureProfile) { entry, allowUnverified in
                     recordings.choose(entry: entry, allowUnverified: allowUnverified, canExport: { model.engine.canChooseCaptureProfile })
                 }
-                Text("Keep the app in the foreground. Turning the phone saves a new recording segment and reconnects any active broadcast. Locking the phone or an audio interruption ends capture.")
+                Text("Camera capture and audio without the locked-screen option require the foreground. Only an opted-in audio show already recording may continue when locked. Turning the phone saves a new camera segment and reconnects its broadcast. Audio interruptions still stop capture; return to Sapflow to Stop and save.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.vertical)
         }.scrollDismissesKeyboard(.interactively)

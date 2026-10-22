@@ -30,6 +30,7 @@ internal class SrtPublishingSink(
     private val events: (PublishingAttemptEvent) -> Unit = {},
     private val pacingBytesPerSecond: ULong = 1_250_000uL,
     private val intent: CaptureIntent = CaptureIntent.DEFAULT,
+    private val authority: PublishingAuthority? = null,
 ) : EncodedSink, SocketOutputProvider {
     private val outputCounter = SocketOutputCounter(SocketOutputAccounting.SRT_DATAGRAM)
     override val socketOutput: SocketOutputSource get() = outputCounter
@@ -63,6 +64,7 @@ internal class SrtPublishingSink(
 
     private fun startNetwork() {
         check(!closed.get()) { "SRT attempt closed" }
+        authority?.requireValid()
         val configureDeadlineUs = nowUs() + 15_000_000
         message.set("Starting one ${if (plaintext) "plaintext lab" else "AES-256"} SRT attempt")
         worker = Thread({ runNetwork(configureDeadlineUs) }, "sapflow-srt-udp").apply { start() }
@@ -71,6 +73,7 @@ internal class SrtPublishingSink(
     override fun consume(sample: MediaSample) {
         if (closed.get()) return
         try {
+            authority?.requireValid()
             val ticket = offered.offer(sample, nowUs() + 1_000_000)
             selector.get()?.wakeup()
             if (!offered.await(ticket, 1000) && !closed.get()) fail("SRT sample admission exceeded one second · capture can continue")
@@ -93,6 +96,7 @@ internal class SrtPublishingSink(
             val key = socket.register(readiness, SelectionKey.OP_READ)
             val input = ByteBuffer.allocateDirect(1501)
             while (!closed.get()) {
+                authority?.requireValid()
                 alarm?.cancel(false); alarm = null
                 val now = nowUs()
                 if (native == null) {
@@ -133,7 +137,7 @@ internal class SrtPublishingSink(
                     else if (waitingIdr && (!sample.isVideo() || !sample.isKeyframe())) true
                     else if (!publisher.isReady()) false
                     else {
-                        publisher.push(sample, nowUs().toULong())
+                        withPublishingAuthority(authority) { publisher.push(sample, nowUs().toULong()) }
                         if (sample.isVideo() && sample.isKeyframe()) waitingIdr = false
                         true
                     }
@@ -156,7 +160,9 @@ internal class SrtPublishingSink(
                             error("SRT UDP write deadline exceeded")
                         }
                         val size = datagram.remaining()
-                        val sent = try { outputCounter.write(size) { socket.write(datagram) } } catch (error: Exception) {
+                        val sent = try { outputCounter.write(size) {
+                            withPublishingAuthority(authority) { socket.write(datagram) }
+                        } } catch (error: Exception) {
                             publisher.socketSendFailed(nowUs().toULong()); throw error
                         }
                         if (sent == 0) break
@@ -214,7 +220,9 @@ internal class SrtPublishingSink(
             shutdownResult.set(shutdown.finish(::nowUs,
                 stopNative = { native?.stop(nowUs().toULong()) },
                 takeControl = { native?.pollDatagram(nowUs().toULong())?.bytes },
-                write = { bytes -> outputCounter.write(bytes.remaining()) { channel.get()?.write(bytes) ?: 0 } }))
+                write = { bytes -> outputCounter.write(bytes.remaining()) {
+                    withPublishingAuthority(authority) { channel.get()?.write(bytes) ?: 0 }
+                } }))
             runCatching { native?.close() }
             secret.getAndSet(null)?.fill(0)
             runCatching { channel.getAndSet(null)?.close() }

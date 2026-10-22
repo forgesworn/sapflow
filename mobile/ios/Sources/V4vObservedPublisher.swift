@@ -8,19 +8,22 @@ final class V4vPublishingLifetime: @unchecked Sendable {
     private let lock = NSLock()
     private var value: V4vPublishingGrantPermit
     private var ended = false
+    private var highWaterNs: UInt64
     init(_ permit: V4vPublishingGrantPermit, nowNs: UInt64) throws {
         guard permit.expiresAtNs > nowNs else { throw OriginObservationFailure.deadline }
-        value = permit
+        value = permit; highWaterNs = nowNs
     }
     func current(nowNs: UInt64) throws -> V4vPublishingGrantPermit {
         try lock.withLock {
-            guard !ended, nowNs < value.expiresAtNs else { throw OriginObservationFailure.deadline }
+            highWaterNs = max(highWaterNs, nowNs)
+            guard !ended, highWaterNs < value.expiresAtNs else { ended = true; throw OriginObservationFailure.deadline }
             return value
         }
     }
     func committed(_ next: V4vPublishingGrantPermit, nowNs: UInt64) throws {
         try lock.withLock {
-            guard !ended, nowNs < value.expiresAtNs, next.expiresAtNs > nowNs,
+            highWaterNs = max(highWaterNs, nowNs)
+            guard !ended, highWaterNs < value.expiresAtNs, next.expiresAtNs > highWaterNs,
                   next.expiresAtNs >= value.expiresAtNs, value.grant.immutableMatches(next.grant),
                   next.grant.identity.revision >= value.grant.identity.revision else { throw OriginObservationFailure.scope }
             value = next
@@ -28,7 +31,8 @@ final class V4vPublishingLifetime: @unchecked Sendable {
     }
     func expire(nowNs: UInt64) -> Bool {
         lock.withLock {
-            guard !ended, nowNs >= value.expiresAtNs else { return false }
+            highWaterNs = max(highWaterNs, nowNs)
+            guard !ended, highWaterNs >= value.expiresAtNs else { return false }
             ended = true; return true
         }
     }
@@ -39,7 +43,8 @@ final class V4vPublishingLifetime: @unchecked Sendable {
 /// existing reconnect, SRT and compressed-media path. Observer failures affect
 /// decoded confirmation only; independent capture/recording keep their owners.
 final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
-    typealias TransportFactory = (ManualSrtDestination, SrtPublishingLimits, Bool, @escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> EncodedPublishingSink
+    typealias TransportFactory = (ManualSrtDestination, SrtPublishingLimits, Bool, AudioShowOutputAuthority,
+                                 @escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> EncodedPublishingSink
     typealias ObserverFactory = (V4vObservedAttempt, OriginConfirmationGate, @escaping (OriginAttemptIdentity, UInt64) throws -> Void) throws -> V4vOriginObserver
     private let destination: UInt64
     private let captureProfile: CaptureIntent
@@ -47,6 +52,7 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
     private let owner: DispatchQueue
     private let clock: () -> V4vClock
     private let lifetime: V4vPublishingLifetime
+    private let outputAuthority: AudioShowOutputAuthority
     private let gate = OriginConfirmationGate()
     private let slot: V4vObservationSlot
     private let transport: TransportFactory
@@ -59,22 +65,27 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
     init(destination: UInt64, permit: V4vPublishingGrantPermit, profile: V4vConnectorProfile,
          engine: V4vSessionEngine, owner: DispatchQueue, slot: V4vObservationSlot, clock: @escaping () -> V4vClock,
          captureProfile: CaptureIntent = .defaultProfile,
-         transport: @escaping TransportFactory = { ManualSrtPublisher(destination: $0, limits: $1, hasVideo: $2, observe: $3) },
+         transport: TransportFactory? = nil,
          observation: ObserverFactory? = nil) throws {
         try engine.requireProfile(profile)
         guard destination > 0, captureProfile.hasAudio else { throw OriginObservationFailure.scope }
         _ = try SrtPublishingLimits.scoped(maxQueueBytes: permit.grant.maxQueueBytes, maxPublishBps: permit.grant.maxPublishBps, captureProfile: captureProfile)
         self.captureProfile = captureProfile
         expectedMedia = captureProfile.hasVideo ? .audioVideo : .audioOnly48kMono
-        self.destination = destination; self.owner = owner; self.slot = slot; self.clock = clock; self.transport = transport
-        lifetime = try V4vPublishingLifetime(permit, nowNs: clock().monotonicNs)
-        expiryTimer = NativeDeadlineTimer(queue: expiryQueue)
+        self.destination = destination; self.owner = owner; self.slot = slot; self.clock = clock
+        let lifetime = try V4vPublishingLifetime(permit, nowNs: clock().monotonicNs)
+        self.lifetime = lifetime
+        let authority = AudioShowOutputAuthority(check: { (try? lifetime.current(nowNs: clock().monotonicNs)) != nil })
+        outputAuthority = authority
+        self.transport = transport ?? { ManualSrtPublisher(destination: $0, limits: $1, hasVideo: $2, outputAuthority: $3, observe: $4) }
+        expiryTimer = NativeDeadlineTimer(queue: expiryQueue, now: { clock().monotonicNs })
         self.observation = observation ?? { attempt, gate, confirm in
             try V4vOriginObserver(attempt: attempt, profile: profile, gate: gate,
                 status: V4vOriginStatusHTTP(profile: profile, engine: engine, owner: owner, clock: clock),
                 owner: owner, clock: clock, confirm: confirm)
         }
-        logical = try ReconnectingPublisher(graceMs: permit.grant.graceMs, source: .srtPeerAcknowledgedWatermark, hasVideo: captureProfile.hasVideo, ownerQueue: owner,
+        logical = try ReconnectingPublisher(graceMs: permit.grant.graceMs, source: .srtPeerAcknowledgedWatermark, hasVideo: captureProfile.hasVideo,
+            authorityClock: { clock().monotonicNs }, ownerQueue: owner,
             attemptReady: { [weak self] in self?.ready($0, nowNs: $1) },
             attemptInvalidated: { [weak self] in self?.invalidated($0) },
             epochClosed: { [weak self] in self?.epochClosed($0) },
@@ -84,6 +95,7 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
                 return try self.make(context, observe: observe)
             })
         armExpiry(permit)
+        outputAuthority.denied = { [weak self] in self?.endDestination() }
     }
     private func local(_ context: ReconnectAttemptContext) throws -> OriginAttemptIdentity {
         try OriginAttemptIdentity(destination: destination, codecEpoch: context.codecEpoch, token: context.token,
@@ -98,7 +110,7 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
             let destination = try ManualSrtDestination(endpoint: permit.grant.endpoint, streamID: attempt.wireStreamID(grant: permit.grant), passphrase: permit.grant.passphrase, allowPlaintext: false)
             let limits = try SrtPublishingLimits.scoped(maxQueueBytes: permit.grant.maxQueueBytes, maxPublishBps: permit.grant.maxPublishBps, captureProfile: captureProfile)
             currentAttempt = attempt
-            return try transport(destination, limits, captureProfile.hasVideo, observe)
+            return try transport(destination, limits, captureProfile.hasVideo, outputAuthority, observe)
         } catch { gate.invalidate(attempt: attempt); throw error }
     }
     private func ready(_ context: ReconnectAttemptContext, nowNs: UInt64) {
@@ -168,7 +180,17 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
         guard captureProfile.hasVideo == (video != nil) else { throw OriginObservationFailure.scope }
         try logical.configure(video: video, audio: audio)
     }
-    func offer(_ sample: MediaSample) throws { try logical.offer(sample) }
+    func offer(_ sample: MediaSample) throws {
+        // An alarm may be withheld while suspended. Never let its queue order
+        // admit encoded media past the unchanged authoritative grant deadline.
+        do { _ = try lifetime.current(nowNs: clock().monotonicNs) }
+        catch { endDestination(); throw error }
+        try logical.offer(sample)
+    }
+    func revalidateAuthority() {
+        do { _ = try lifetime.current(nowNs: clock().monotonicNs); logical.revalidateAuthority() }
+        catch { endDestination() }
+    }
     func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void) { logical.finishEpoch(completion: completion) }
     func closeCodecEpoch() { logical.closeCodecEpoch() }
     func endDestination() { logical.endDestination() }

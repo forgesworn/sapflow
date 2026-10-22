@@ -18,6 +18,8 @@ interface EncodedSink : AutoCloseable {
     fun setKeyframeRequester(request: () -> Unit) {}
     /** Nonblocking logical-destination fence, before capture/epoch teardown. */
     fun stopDestination() {}
+    /** Cold wake/resume hook only. Never reads media timestamps or performs IO. */
+    fun revalidateAuthority() {}
     fun consume(sample: MediaSample)
     /** Graceful finalisation on the existing sink worker, after accepted media. */
     fun finish() = close()

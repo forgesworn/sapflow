@@ -47,6 +47,7 @@ internal class ApprovedPlaybackRoute(private val profile: V4vProfile) {
 internal class OriginProbeCancellation(private val now: () -> Long = System::nanoTime,
     val deadlineNs: Long = now() + OriginProbeLimits.TOTAL_NS) {
     private val cancelled = AtomicBoolean()
+    fun nowNs(): Long = now()
     fun cancel() { cancelled.set(true) }
     fun check() { check(!cancelled.get() && now() < deadlineNs) { "Origin check cancelled or timed out" } }
     fun remainingNs(): Long { check(); return deadlineNs - now() }

@@ -69,11 +69,13 @@ data class CaptureSnapshot(
     val timingUncertain: Boolean = false,
     val socketOutput: SocketOutputView = SocketOutputView.empty(),
     val activeAudioInput: String = "Not verified",
+    val backgroundAudioReady: Boolean = false,
 )
 
 /** Native surfaces carry raw video. PCM stays in AudioRecord/MediaCodec input.
  * Only compressed direct buffers cross the synchronous borrowed-byte FFI. */
-class CaptureController(private val context: Context) {
+class CaptureController internal constructor(private val context: Context,
+    private val backgroundStartAllowed: (CaptureStartAdmission.Preparation) -> Boolean = { false }) {
     private val thread = HandlerThread("sapflow-codecs").apply { start() }
     private val handler = Handler(thread.looper)
     private val audioCallbacks = HandlerThread("sapflow-aac-callbacks", android.os.Process.THREAD_PRIORITY_AUDIO).apply { start() }
@@ -225,12 +227,23 @@ class CaptureController(private val context: Context) {
         queueDiagnostics, "Publish drainer ${publishing?.diagnostics ?: "none"} · ${publishingSink?.diagnostics ?: ""}",
         orientationStatus, rendererStatus, audioDiagnostics + if (audioFailureDiagnostics.isNotEmpty()) " · $audioFailureDiagnostics" else "", "$cleanupPhase · $cleanupDiagnostics",
         !prepareAdmission.pending && startAdmission.idle && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioEncoder == null && renderer == null && audioRecord == null,
-            elapsed.captureMs, elapsed.broadcastMs, elapsed.uncertain, socket, activeAudioInput)
+            elapsed.captureMs, elapsed.broadcastMs, elapsed.uncertain, socket, activeAudioInput,
+            startAdmission.preparation?.let(startAdmission::backgroundReady) == true)
     }
 
-    internal fun prepare(previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null): CaptureStartAdmission.Preparation? {
+    internal fun currentPreparation(): CaptureStartAdmission.Preparation? = startAdmission.preparation
+    internal fun owns(value: CaptureStartAdmission.Preparation): Boolean = startAdmission.owns(value)
+    internal fun backgroundReady(value: CaptureStartAdmission.Preparation): Boolean = startAdmission.backgroundReady(value)
+    internal fun servicePromoted(value: CaptureStartAdmission.Preparation): Boolean = startAdmission.servicePromoted(value)
+    internal fun continuesInBackground(value: CaptureStartAdmission.Preparation): Boolean =
+        stage == CaptureStage.CAPTURING && startAdmission.continuesInBackground(value)
+    /** Cold wake/resume check. No media timestamp clock or PCM-age policy changes. */
+    internal fun revalidatePublishingAuthority() { publishingSession?.revalidateAuthority() }
+
+    internal fun prepare(previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
+        backgroundAudio: Boolean = false): CaptureStartAdmission.Preparation? {
         val canPrepare = snapshot().canPrepare
-        val ticket = startAdmission.reserve(intent, audioInputId) ?: return null
+        val ticket = startAdmission.reserve(intent, audioInputId, backgroundAudio) ?: return null
         val admitted = try { prepareAdmission.submit(intent, canPrepare, { handler.post(it) }) admitted@{ requestedIntent ->
             if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) { startAdmission.abandon(ticket); return@admitted }
             if (videoEncoder != null || renderer != null || teardownStarted) {
@@ -548,6 +561,10 @@ class CaptureController(private val context: Context) {
                     videoCaptureAgeMs = null
                     videoRejects.set(0); audioPrimingRejects.set(0); waitingKeyframeRejects.set(0); queueRejects.set(0)
                     recordingSink?.start()
+                    if (ticket.preparation.backgroundAudio && !backgroundStartAllowed(ticket.preparation)) {
+                        stop(ticket.preparation, "Background audio service admission changed before Start. Prepare again.")
+                        return
+                    }
                     if (!startAdmission.commit(ticket)) {
                         autoStart = false; restart.cancel()
                         stopOnHandler("Destination ended before capture admission; closing prepared recording owners", false)
@@ -826,13 +843,25 @@ class CaptureController(private val context: Context) {
     }
 
     fun stop(reason: String = "Stopped") {
-        val intent = startAdmission.stop() ?: return
+        startAdmission.preparation?.let { stop(it, reason) }
+    }
+    internal fun stop(value: CaptureStartAdmission.Preparation, reason: String): Boolean {
+        if (!startAdmission.stop(value)) return false
+        stopAdmitted(value, reason)
+        return true
+    }
+    internal fun serviceInterrupted(value: CaptureStartAdmission.Preparation, reason: String): Boolean {
+        if (!startAdmission.interrupt(value)) return false
+        stopAdmitted(value, reason, failed = true)
+        return true
+    }
+    private fun stopAdmitted(intent: CaptureStartAdmission.Preparation, reason: String, failed: Boolean = false) {
         publishingSession?.stopDestination() // Fence even while codec-handler work is queued.
         handler.post {
             if (!startAdmission.owns(intent)) return@post
             publishingSession?.stopDestination()
             autoStart = false; restart.cancel(); restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
-            stopOnHandler(reason, failed = false)
+            stopOnHandler(reason, failed)
         }
     }
 

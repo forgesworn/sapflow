@@ -27,7 +27,9 @@ final class OriginMediaHTTP: NSObject, URLSessionDataDelegate, OriginMediaFetchi
     private var initialization = Data()
     private var accepted = false, fetchingPart = false, closed = false
     private var limitNs: UInt64 = 0
-    override init() {
+    private let now: () -> UInt64
+    init(now: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) {
+        self.now = now
         super.init()
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false; configuration.httpCookieStorage = nil; configuration.urlCache = nil
@@ -46,11 +48,11 @@ final class OriginMediaHTTP: NSObject, URLSessionDataDelegate, OriginMediaFetchi
         admitted = true; admission.unlock()
         queue.async { [self] in
             guard !closed else { finish(.failure(.cancelled), fallback: completion); return }
-            let now = DispatchTime.now().uptimeNanoseconds
+            let now = self.now()
             guard deadlineNs > now, deadlineNs - now <= 8_000_000_000 else { finish(.failure(.deadline), fallback: completion); return }
             self.completion = completion; self.resources = resources; limitNs = deadlineNs
             let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: DispatchTime(uptimeNanoseconds: deadlineNs))
+            timer.schedule(deadline: .now() + .nanoseconds(Int(deadlineNs - now)))
             timer.setEventHandler { [weak self] in self?.finish(.failure(.deadline)) }
             deadline = timer; timer.resume()
             start(resources.initialization, limit: OriginMediaBody.initLimit)
@@ -58,7 +60,7 @@ final class OriginMediaHTTP: NSObject, URLSessionDataDelegate, OriginMediaFetchi
     }
     private func start(_ url: URL, limit: Int) {
         do {
-            let now = DispatchTime.now().uptimeNanoseconds
+            let now = self.now()
             guard now < limitNs, let resources else { throw OriginObservationFailure.deadline }
             let request = try resources.request(url, timeout: min(8, Double(limitNs - now) / 1_000_000_000))
             body = try OriginMediaBody(limit: limit); accepted = false
@@ -99,7 +101,7 @@ final class OriginMediaHTTP: NSObject, URLSessionDataDelegate, OriginMediaFetchi
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard self.task === task else { return }
-        guard error == nil, accepted, let bytes = body?.bytes, !bytes.isEmpty, DispatchTime.now().uptimeNanoseconds < limitNs else { finish(.failure(.network)); return }
+        guard error == nil, accepted, let bytes = body?.bytes, !bytes.isEmpty, now() < limitNs else { finish(.failure(.network)); return }
         self.task = nil
         if !fetchingPart {
             initialization = bytes; fetchingPart = true

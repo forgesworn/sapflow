@@ -5,13 +5,28 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-The current source adds the [native microphone-only foreground prerequisite](audio-only-mobile.md)
-on iOS and Android. Its immutable intent follows permissions, storage, grant
-admission, Start, reconnect, private recording and exact-topology observation.
-Audio-only creates no camera, video encoder or preview and waits for no video
-keyframe. Native output is AAC-LC 48 kHz mono at a 96 kbit/s target, with a separate
-1 Mbit/s engineering grant floor. Background/lock, physical external-route qualification and the rest
-of B4R remain required; foreground mode does not complete that milestone.
+The current source adds the first background slice of the
+[native microphone-only mode](audio-only-mobile.md) on iOS and Android. Its
+immutable intent follows permissions, storage, grant admission, Start, reconnect,
+private recording and exact-topology observation. Audio-only creates no camera,
+video encoder or preview and waits for no video keyframe. Native output is AAC-LC
+48 kHz mono at a 96 kbit/s target, with a separate 1 Mbit/s engineering grant
+floor. Background continuation is off by default and is limited to an opted-in,
+already committed audio-only show. Video and any audio-only show whose Start has
+not committed stop on foreground departure. An eligible committed show may still
+be establishing or re-establishing its authorised transport.
+
+Android uses an application-owned, non-exported, `START_NOT_STICKY` microphone
+foreground service and an exact per-show notification **Stop and save** action.
+Notification and microphone authority are required before Start. iOS uses the
+declared `audio` background mode and an exact in-app Stop action; SDK 18.2 has no
+truthful locked-screen microphone Stop facility, so no playback/Now Playing state
+is fabricated. Both platforms keep V4V End distinct from Stop and save, retain
+exact journal/owner leases through real cleanup and recheck grant authority at
+native transport submission. Physical lock/background, process/service kill,
+network switch, notification/privacy toggles, external routes, recording and
+sustained-show qualification remain open; this source/build packet does not
+complete B4R.
 
 Foreground microphone selection now has native adapters and normal controls on
 both platforms: System Default plus bounded built-in/wired/USB inventory, frozen
@@ -80,17 +95,19 @@ separate ARM64 package had been refreshed; rebuilding the actual app dependency
 resolved the missing generated bindings without a source change. These are
 local package/build results, not CI or phone acceptance.
 
-The foreground-input source has a source-matched final app gate: all three
+The background-audio source has a source-matched final app gate: all three
 unsigned iOS configurations and the actual unit-test bundle compile/link with
 zero warnings; the unit bundle was not executed. Android Debug and Qualification
-each pass 347 tests with no failures, errors or skips. All three APKs assemble;
+each pass 372 tests with no failures, errors or skips. All three APKs assemble;
 qualification/release isolation, native ARM64 and 16 KiB ZIP/ELF checks pass.
 Qualification/Release lint has 14/13 warnings and zero errors. Debug and
 Qualification use the existing debug certificate; Release is unsigned. These
 builds reuse the existing native SDK packages unchanged. Focused routing checks
-pass 28 Swift and 46 JVM tests, including the existing policy/admission tests.
-No phone, USB/hot-unplug, Bluetooth, background or sustained-performance
-qualification is claimed.
+remain green; final Swift host gates pass 159 budget/lifecycle, 69 V4V, 50
+observation, 86 publisher, 36 creator-owner and 14 configuration tests. The
+production SRT Network.framework cancellation check also passes. No phone,
+USB/hot-unplug, Bluetooth, physical background/lock, process/service kill or
+sustained-performance qualification is claimed.
 
 The native AAC recorder experiment preserves all encoded units in stored media,
 but priming and edit interpretation change the presented packet list. Exact

@@ -8,6 +8,7 @@ final class CaptureAdmission {
         fileprivate let serial: UInt64
         let profile: CaptureIntent
         let audioInputID: String?
+        let continuesAudioInBackground: Bool
     }
     struct Start: Equatable {
         fileprivate let serial: UInt64
@@ -25,6 +26,8 @@ final class CaptureAdmission {
     private let lock = NSLock()
     private var serial: UInt64
     private var selectedAudioInputID: String?
+    private var selectedBackgroundAudio = false
+    private var foreground = true
     private var phase: Phase = .idle
     private var preparation: Preparation?
     private var starting: Start?
@@ -49,6 +52,34 @@ final class CaptureAdmission {
     }
     var currentPhase: Phase { locked { phase } }
     var canChooseCaptureProfile: Bool { locked { phase == .idle } }
+    func selectBackgroundAudio(_ enabled: Bool) -> Bool {
+        locked { guard phase == .idle, foreground else { return false }; selectedBackgroundAudio = enabled; return true }
+    }
+    /// nil Stop means this exact committed audio show may continue, or the
+    /// foreground returned. Prepared/queued Start is synchronously invalidated.
+    func visibilityChanged(foreground active: Bool, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> (continuing: Preparation?, stop: Stop?) {
+        locked {
+            foreground = active
+            if active { return (nil, nil) }
+            if let preparation, AudioShowLifecycle.mayContinue(hasVideo: preparation.profile.hasVideo,
+                optedIn: preparation.continuesAudioInBackground, committedRunning: phase == .running) { return (preparation, nil) }
+            return (nil, phase == .idle ? nil : stopLocked(nowNs: nowNs))
+        }
+    }
+    var backgroundContinuation: Preparation? {
+        locked {
+            guard let preparation, AudioShowLifecycle.mayContinue(hasVideo: preparation.profile.hasVideo,
+                optedIn: preparation.continuesAudioInBackground, committedRunning: phase == .running) else { return nil }
+            return preparation
+        }
+    }
+    func ownsPreparation(_ ticket: Preparation) -> Bool { locked { preparation == ticket } }
+    func interruption(_ event: AudioShowLifecycle.Interruption, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Stop? {
+        locked {
+            guard event != .audioEnded, phase != .idle else { return nil }
+            return stopLocked(nowNs: nowNs)
+        }
+    }
     func selectAudioInput(_ id: String?) -> Bool {
         guard id.map(AudioInputOption.validID) ?? true else { return false }
         return locked {
@@ -62,8 +93,9 @@ final class CaptureAdmission {
     }
     func reservePreparation(profile: CaptureIntent = .defaultProfile) -> Preparation? {
         locked {
-            guard phase == .idle, let serial = next() else { return nil }
-            let ticket = Preparation(serial: serial, profile: profile, audioInputID: selectedAudioInputID)
+            guard foreground, phase == .idle, let serial = next() else { return nil }
+            let ticket = Preparation(serial: serial, profile: profile, audioInputID: selectedAudioInputID,
+                                     continuesAudioInBackground: selectedBackgroundAudio && !profile.hasVideo)
             preparation = ticket; candidatePending = true; hasCommittedRun = false; phase = .reserved
             timingPreparation = ticket
             captureBeganAtNs = nil; captureStoppedAtNs = nil
@@ -137,6 +169,9 @@ final class CaptureAdmission {
     /// joins the same cleanup owner; it cannot release that owner's capacity.
     func stop(nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Stop {
         locked { stopLocked(nowNs: nowNs) }
+    }
+    func stop(preparation ticket: Preparation, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Stop? {
+        locked { guard preparation == ticket, stopping == nil else { return nil }; return stopLocked(nowNs: nowNs) }
     }
     /// Ending a destination retires its initial camera approval, while an
     /// existing recording keeps its intent through rotation and restart.

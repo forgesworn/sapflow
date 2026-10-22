@@ -1,10 +1,12 @@
 # Native microphone-only capture
 
 The native apps have an explicit microphone-only capture intent alongside the
-existing camera profiles. This is the foreground prerequisite for B4R. The full
-[mobile plan](mobile-streaming-plan.md) still requires background and locked-screen
-operation, physical external-route qualification, controls, standby, safe profiles and physical
-acceptance. Those requirements are not satisfied by host tests.
+existing camera profiles. The first B4R background slice can keep an explicitly
+opted-in, already committed audio-only show running when the app leaves the
+foreground. The full [mobile plan](mobile-streaming-plan.md) still requires
+physical lock/background qualification, external-route qualification, standby,
+safe profiles and sustained physical acceptance. Host tests do not satisfy those
+requirements.
 
 ## Frozen intent and native ownership
 
@@ -33,8 +35,12 @@ encode feeds both publishing and private recording through existing bounded
 compressed-media seams.
 
 Android uses AudioRecord and MediaCodec; iOS uses native audio capture and its
-AVAudioConverter encoder. This initial mode stops on leaving the foreground.
-There is no claim of background, locked-screen or external-device qualification.
+AVAudioConverter encoder. Background continuation is off by default and applies
+only to audio-only capture whose Start has committed. Video and any audio-only
+show whose Start has not committed stop when the last foreground owner leaves.
+A committed show may still be establishing or re-establishing its authorised
+transport.
+There is no claim of physical locked-screen or external-device qualification.
 
 ## Foreground microphone selection
 
@@ -67,9 +73,51 @@ Android's existing 200 ms PCM age ceiling remains stricter than the route wait;
 a stale queued block is refused and the recording remains incomplete.
 There is no per-buffer device
 enumeration, new payload copy, Rust call or route timer. The 48 kHz mono AAC
-profile and foreground-stop policy are unchanged. These source and automated
-checks do not qualify physical USB devices, unplug/replug timing, Bluetooth,
-background/lock operation or a sustained show. Those B4R gates remain open.
+profile and route-stop policy are unchanged. These source and automated checks
+do not qualify physical USB devices, unplug/replug timing, Bluetooth,
+background/lock operation or a sustained show. Those physical B4R gates remain
+open.
+
+## Background ownership and controls
+
+Background continuation is an immutable Prepare choice and never starts capture.
+Only the exact committed audio-only preparation may continue. Stop, capture
+failure, route failure, grant expiry and destination authority fence that exact
+show; a queued action or callback from an older show cannot affect its successor.
+Authority deadlines use clocks that include device sleep. PCM age, encoded media
+timestamps and telemetry retain their existing monotonic or hardware clocks.
+
+Android promotes the application-owned capture controller into a non-exported
+microphone foreground service before Start may commit. Android 13 and later need
+notification permission, and notifications must remain enabled. The service is
+`START_NOT_STICKY`: it has no boot receiver, worker, alarm, binding or state
+reconstruction, and the system cannot resurrect a stopped show. Its private,
+ongoing notification has an exact per-show **Stop and save** action. The action
+checks a random capability as well as the preparation ID before stopping capture;
+an old notification cannot stop a replacement. API 29 uses the compatible
+two-argument foreground call, while API 30 and later declare the microphone type.
+
+iOS declares only the `audio` background mode. The application lifetime owns the
+committed show across scene inactivity/backgrounding, and returning to the app
+revalidates its grant and transport authority. SDK 18.2 exposes no truthful
+locked-screen Stop control for background microphone recording:
+`AVCaptureEventInteraction` is camera/foreground-specific and MediaPlayer remote
+commands describe playback. Sapflow therefore provides the exact per-show Stop
+inside the app and does not create fake playback, silence or Now Playing state.
+This is an explicit platform limitation, not a claim that locked controls work.
+
+On both platforms **Stop and save** remains separate from confirmed V4V **End**.
+The journal keeps the exact show key lease until recorder and publisher cleanup
+really finish. Background output uses the same live grant authority at native
+SRT/RTMP submission boundaries; queued bytes are refused once that authority is
+gone. Bytes already submitted to the operating-system network stack cannot be
+recalled.
+
+Host evidence covers stale controls, scene/Activity ownership, sleep-sized clock
+jumps, grant expiry, queued transport output and retained cleanup. It does not
+cover a locked physical phone, notification/privacy toggles, process or service
+kill, network switching, external microphones, recording finalisation, thermal
+load, battery drain or a full show. Those remain physical acceptance gates.
 
 ## Transport and observation
 
@@ -133,15 +181,17 @@ uses app-issued fixture bearer identities, a mock origin control service and
 generated file-copy inputs. It does not qualify real signer login, actual
 origin transport or media decoding.
 
-Fresh Apple and ARM64 Android SDK packages now build from the current library
-source and pass their installed host consumers. All three unsigned iOS app
-configurations and the actual iOS unit-test bundle compile with no warnings;
-the iOS unit bundle was not executed. Android Debug and Qualification each pass
-316 unit tests, all three APKs assemble and build isolation passes. Qualification
-lint has 14 warnings and Release lint has 13, both with zero errors. ZIP and all
-four ARM64 libraries pass 16 KiB alignment checks. Publisher and creator host
-tests also pass against the refreshed Swift package. None of these checks installs
-an app or establishes physical phone, store or distribution acceptance.
+Fresh Apple and ARM64 Android SDK packages build from the current library source
+and pass their installed host consumers. The background-audio packet compiles all
+three unsigned iOS app configurations and the actual iOS unit-test bundle with
+warnings as errors; the bundle was not executed on iOS. Focused host suites pass
+159 budget/lifecycle, 69 V4V, 50 observation, 86 publisher, 36 creator-owner and
+14 configuration tests. The production Network.framework cancellation check also
+passes. Android Debug and Qualification each pass 372 unit tests, all three APKs
+assemble and package isolation passes. Qualification lint has 14 warnings and
+Release lint has 13, both with zero errors. All four packaged ARM64 libraries pass
+16 KiB load-alignment checks. None of these checks installs an app or establishes
+physical phone, store or distribution acceptance.
 
 ## Private recording and unfinished qualification
 
@@ -159,9 +209,12 @@ recording completion, incomplete prefixes, repeated finish and export. Its
 independent media checks do not establish physical capture, background behaviour,
 crash repair, real disk-pressure behaviour, thermal limits or battery performance.
 
-The production generated fixture passes those functional checks and strict
-AAC/PCM decoding, but its gate still exits 1. Separate controlled writer
-experiments store all 143 native AAC units in order. For our experimental
+The latest generated fixture run on this host exited before media production:
+`AVAudioConverter` refused the generated PCM-to-AAC conversion, so its retained
+receipt has no media result. Earlier retained runs of this production gate reached
+the functional recording and strict AAC/PCM checks, then still exited 1 at the
+presentation/retention oracle. Separate controlled writer experiments from that
+investigation store all 143 native AAC units in order. For our experimental
 grouped-trim file, native AVAssetReader presents the exact input duration at
 zero marker lag for both 144000-frame and 144123-frame sources. Default FFmpeg
 instead presents 144384 PCM frames with a real 2112-frame leading marker lag

@@ -14,8 +14,9 @@ private final class PublisherBox<T>: @unchecked Sendable {
 }
 private final class PublisherClock {
     let base = DispatchTime.now().uptimeNanoseconds
+    let offset = PublisherBox<UInt64>(0)
     func now() -> V4vClock {
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = DispatchTime.now().uptimeNanoseconds + offset.value
         return V4vClock(wallMs: V4vFixture.time + (now - base) / 1_000_000, monotonicNs: now)
     }
 }
@@ -28,11 +29,12 @@ private final class PublisherTransport: EncodedPublishingSink {
     let observe: (PublishingAttemptEvent, UInt64) -> Void
     let closed = PublisherBox(false), delayed = PublisherBox(false)
     let completion = PublisherBox<(() -> Void)?>(nil)
+    let offers = PublisherBox(0)
     var status: String { "Generated transport fixture" }
     init(_ observe: @escaping (PublishingAttemptEvent, UInt64) -> Void) { self.observe = observe }
     func start() {}
     func configure(video: MediaCodec?, audio: MediaCodec) throws { emit(.accepted); emit(.sending) }
-    func offer(_ sample: MediaSample) {}
+    func offer(_ sample: MediaSample) { offers.update { $0 += 1 } }
     func emit(_ event: PublishingAttemptEvent) { observe(event, DispatchTime.now().uptimeNanoseconds) }
     func endDestination() { closed.value = true }
     func stop() { endDestination() }
@@ -112,11 +114,12 @@ private final class PublisherHarness {
         try engine.applyResponse(V4vFixture.answer(grant: grant), for: XCTUnwrap(engine.pending), clock: clock.now())
         slot = V4vObservationSlot(owner: owner, clock: clock.now)
         publisher = try V4vObservedPublisher(destination: 1, permit: engine.publishingGrant(clock: clock.now()), profile: V4vFixture.profile(), engine: engine,
-            owner: owner, slot: slot, clock: clock.now, captureProfile: captureProfile, transport: { destination, limits, hasVideo, observe in
+            owner: owner, slot: slot, clock: clock.now, captureProfile: captureProfile, transport: { destination, limits, hasVideo, authority, observe in
                 XCTAssertEqual(limits.bandwidthBytesPerSecond, min(1_250_000, maxPublishBps / 8))
                 XCTAssertEqual(hasVideo, captureProfile.hasVideo)
                 XCTAssertTrue(destination.encrypted)
                 wires.update { $0.append(destination.streamID) }
+                XCTAssertTrue(authority.permits())
                 let sink = PublisherTransport(observe); sinks.update { $0.append(sink) }; return sink
             }, observation: { scope, gate, confirm in
                 let fixture = try! PublisherObservation(scope: scope, gate: gate, owner: owner, clock: clock.now, confirm: confirm)
@@ -136,6 +139,113 @@ private final class PublisherHarness {
 }
 
 final class V4vObservedPublisherTests: XCTestCase {
+    func testQueuedNativeAndUserSpaceOutputRefuseExpiredGrantWithoutTimerOrOwnerWake() throws {
+        let clock = PublisherBox<UInt64>(1), expires: UInt64 = 60_000_000_000
+        let lifetime = try V4vPublishingLifetime(V4vPublishingGrantPermit(
+            grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: expires), nowNs: clock.value)
+        let authority = AudioShowOutputAuthority(check: { (try? lifetime.current(nowNs: clock.value)) != nil })
+        let denied = PublisherBox(0); authority.denied = { denied.update { $0 += 1 } }
+        let destination = try ManualSrtDestination(endpoint: "srt://192.0.2.10:9000", streamID: "generated-only", passphrase: "", allowPlaintext: true)
+        let config = NativeSrtConfig(destination: destination.socketAddress, streamId: destination.streamID, cipher: nil,
+            latencyMs: 120, maxBufferedPackets: 128, maxBufferedBytes: 4_194_304,
+            maxPacketAgeMs: 1000, maxSampleResidenceMs: 1000, bandwidthBytesPerSecond: 125_000)
+        let native = try NativeSrtPublisher(config: config, video: nil, audio: MediaCodec.aac(asc: Data([0x11, 0x88])), passphrase: nil, nowUs: 1)
+        defer { try? native.stop(nowUs: 2) }
+        // Generated native handshake output, not a socket or a real destination.
+        let datagram = try XCTUnwrap(native.pollDatagram(nowUs: 1)); XCTAssertFalse(datagram.bytes.isEmpty)
+        let queue = DispatchQueue(label: "generated.held.srt.output"), entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let submitted = PublisherBox(0), drained = PublisherBox(0), pushed = PublisherBox(0)
+        queue.async { entered.signal(); release.wait() }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        queue.async {
+            authority.submit { pushed.update { $0 += 1 } } // Native sample-push boundary.
+            authority.submit { _ = try? native.pollDatagram(nowUs: 1); drained.update { $0 += 1 } }
+            authority.submit { submitted.update { $0 += datagram.bytes.count } } // Final owned socket boundary.
+        }
+        clock.value = 120_000_000_000; release.signal(); queue.sync {}
+        XCTAssertEqual(pushed.value, 0); XCTAssertEqual(drained.value, 0); XCTAssertEqual(submitted.value, 0)
+        XCTAssertEqual(denied.value, 3)
+    }
+    func testOutputAuthorityRechecksBetweenNativeGenerationAndFinalSubmission() throws {
+        let clock = PublisherBox<UInt64>(1), count = PublisherBox(0)
+        let authority = AudioShowOutputAuthority(check: { clock.value < 100 })
+        XCTAssertTrue(authority.submit { count.update { $0 += 1 }; clock.value = 100 })
+        XCTAssertFalse(authority.submit { count.update { $0 += 1 } })
+        XCTAssertEqual(count.value, 1)
+        // Manual publishers do not install an authority; their existing
+        // protocol/transport deadlines remain their own independent policy.
+        let unrestricted: AudioShowOutputAuthority? = nil
+        XCTAssertTrue(unrestricted?.permits() != false)
+    }
+    func testForegroundWakeBeforeExplicitStartDoesNotStartOrEndPreparedPolicy() throws {
+        let queue = DispatchQueue(label: "generated.prepared.wake"), sinks = PublisherBox<[PublisherTransport]>([])
+        let logical = try ReconnectingPublisher(source: .srtPeerAcknowledgedWatermark, hasVideo: false,
+            ownerQueue: queue, contextualFactory: { _, observe in
+                let sink = PublisherTransport(observe); sinks.update { $0.append(sink) }; return sink
+            })
+        defer { logical.endDestination() }
+        logical.revalidateAuthority(); queue.sync {}
+        XCTAssertTrue(sinks.value.isEmpty)
+        try logical.start(); try logical.configure(video: nil, audio: MediaCodec.aac(asc: Data([0x11, 0x88])))
+        until { logical.status.hasPrefix("Sending") }; XCTAssertEqual(sinks.value.count, 1)
+    }
+    private func generatedAudioSample() throws -> MediaSample {
+        try MediaCodec.aac(asc: Data([0x11, 0x88])).sample(bytes: Data([0x21, 0x10, 0x04, 0x60]),
+            pts: 0, dts: 0, duration: 1024, timescale: 48_000, keyframe: false)
+    }
+    func testSynchronousFailureFenceRejectsMediaBeforeQueuedControllerClearsOwner() throws {
+        let h = try PublisherHarness(captureProfile: .audioOnly48kMono); defer { h.stop() }
+        try h.startEpoch(); until { h.observations.value.count == 1 }
+        let sink = h.sinks.value[0], sample = try generatedAudioSample()
+        try h.publisher.offer(sample); XCTAssertEqual(sink.offers.value, 1)
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        h.owner.async { entered.signal(); release.wait() }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        sink.emit(.failed)
+        try h.publisher.offer(sample); XCTAssertEqual(sink.offers.value, 1)
+        release.signal(); h.owner.sync {}
+    }
+    func testForegroundWakeExpiresGrantBeforeWithheldTimerOrAnotherOffer() throws {
+        let h = try PublisherHarness(captureProfile: .audioOnly48kMono); defer { h.stop() }
+        try h.startEpoch(); until { h.observations.value.count == 1 }
+        let sink = h.sinks.value[0], sample = try generatedAudioSample()
+        h.clock.offset.value = 120_000_000_000
+        h.publisher.revalidateAuthority()
+        XCTAssertThrowsError(try h.publisher.offer(sample))
+        XCTAssertTrue(sink.closed.value); XCTAssertEqual(sink.offers.value, 0)
+    }
+    func testForegroundWakeTicksOriginalReconnectGraceWithoutWaitingForOldRelativeTimer() throws {
+        let queue = DispatchQueue(label: "generated.publisher.resume"), clock = PublisherBox<UInt64>(1_000_000)
+        let sinks = PublisherBox<[PublisherTransport]>([])
+        let logical = try ReconnectingPublisher(graceMs: 90_000, source: .srtPeerAcknowledgedWatermark, hasVideo: false,
+            authorityClock: { clock.value }, ownerQueue: queue, contextualFactory: { _, observe in
+                let sink = PublisherTransport(observe); sinks.update { $0.append(sink) }; return sink
+            })
+        defer { logical.endDestination() }
+        try logical.start(); try logical.configure(video: nil, audio: MediaCodec.aac(asc: Data([0x11, 0x88])))
+        until { logical.status.hasPrefix("Sending") }; sinks.value[0].emit(.failed); queue.sync {}
+        clock.value += 120_000_000_000
+        logical.revalidateAuthority(); queue.sync {}
+        XCTAssertTrue(logical.status.hasPrefix("Publishing stopped")); XCTAssertEqual(sinks.value.count, 1)
+        try logical.offer(generatedAudioSample()); XCTAssertEqual(sinks.value[0].offers.value, 0)
+    }
+    func testWithheldAlarmCannotExtendGrantAndEarlierObservationCannotReopenIt() throws {
+        let grant = try V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time)
+        let first = V4vPublishingGrantPermit(grant: grant, expiresAtNs: 60_000_000_000)
+        let lifetime = try V4vPublishingLifetime(first, nowNs: 1)
+        // No timer is fired. A suspension-inclusive authority read passes TTL.
+        XCTAssertThrowsError(try lifetime.current(nowNs: 120_000_000_000))
+        XCTAssertThrowsError(try lifetime.current(nowNs: 2))
+        XCTAssertThrowsError(try lifetime.committed(V4vPublishingGrantPermit(grant: grant, expiresAtNs: 180_000_000_000), nowNs: 3))
+    }
+    func testPackagedSessionExpiresOriginalGraceAfterWithheldTimerAndSleep() throws {
+        let session = try NativeSession(graceMs: 90_000)
+        let generation = try session.start(nowNs: 100)
+        XCTAssertEqual(try session.prepared(generation: generation), .connect)
+        _ = try session.transportFailed(generation: generation, nowNs: 200)
+        XCTAssertEqual(try session.tick(generation: generation, nowNs: 120_000_000_200), .graceExpired)
+        XCTAssertThrowsError(try session.connected(generation: generation, nowNs: 120_000_000_201))
+    }
     func testAudioOnlyUsesOneMegabitGrantAndActualAttemptScopedPCMConfirmation() throws {
         XCTAssertThrowsError(try PublisherHarness(captureProfile: .audioOnly48kMono, maxPublishBps: 999_999))
         let h = try PublisherHarness(captureProfile: .audioOnly48kMono, maxPublishBps: 1_000_000); defer { h.stop() }
@@ -235,7 +345,7 @@ final class V4vObservedPublisherTests: XCTestCase {
         let other = try V4vConnectorProfile(apiOrigin: "https://another.example.invalid", playbackOrigin: profile.playbackOrigin, playbackPrefix: profile.playbackPrefix)
         let slot = V4vObservationSlot(owner: owner, clock: clock.now)
         var transports = 0, observations = 0
-        XCTAssertThrowsError(try V4vObservedPublisher(destination: 1, permit: engine.publishingGrant(clock: clock.now()), profile: other, engine: engine, owner: owner, slot: slot, clock: clock.now, transport: { _, _, _, observe in
+        XCTAssertThrowsError(try V4vObservedPublisher(destination: 1, permit: engine.publishingGrant(clock: clock.now()), profile: other, engine: engine, owner: owner, slot: slot, clock: clock.now, transport: { _, _, _, _, observe in
             transports += 1; return PublisherTransport(observe)
         }, observation: { _, _, _ in observations += 1; throw OriginObservationFailure.scope }))
         XCTAssertEqual(transports, 0); XCTAssertEqual(observations, 0)

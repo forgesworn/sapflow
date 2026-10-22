@@ -10,6 +10,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     private let observe: (PublishingAttemptEvent, UInt64) -> Void
     private let destination: ManualDestination
     private let hasVideo: Bool
+    private let outputAuthority: AudioShowOutputAuthority?
     private let queue = DispatchQueue(label: "sapflow.manual-rtmp", qos: .userInitiated)
     private let lock = NSLock()
     // lock owns only admission/generation/status, never transport or FFI calls.
@@ -37,7 +38,10 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     private var socketCounter = SocketCompletionCounter()
     private var finalCounters: SocketOutboundSample? // published under lock at actual close
 
-    init(destination: ManualDestination, hasVideo: Bool = true, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) { self.destination = destination; self.hasVideo = hasVideo; self.observe = observe }
+    init(destination: ManualDestination, hasVideo: Bool = true, outputAuthority: AudioShowOutputAuthority? = nil,
+         observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) {
+        self.destination = destination; self.hasVideo = hasVideo; self.observe = observe; self.outputAuthority = outputAuthority
+    }
     deinit { timer.cancel(); connection?.cancel(); try? publisher?.cancel() }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
     var status: String { lock.lock(); defer { lock.unlock() }; return currentStatus }
@@ -62,6 +66,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
         lock.unlock()
         queue.async {
             guard self.isCurrent(token), self.isAccepting() else { return }
+            guard self.authorized(token) else { return }
             self.stopping = false; self.waitingForKeyframe = self.hasVideo
             self.socketCounter = SocketCompletionCounter()
             self.connectDeadline = self.nowMs() + 15_000
@@ -84,6 +89,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
                 guard let self, self.isCurrent(token) else { return }
                 switch state {
                 case .ready:
+                    guard self.authorized(token) else { return }
                     guard !self.cancelling else { return }
                     guard !self.stopping else { self.finishTransport(token); return }
                     self.connectDeadline = nil
@@ -118,6 +124,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     }
 
     func offer(_ sample: MediaSample) throws {
+        guard outputAuthority?.permits() != false else { return }
         guard hasVideo || !sample.isVideo() else { throw CaptureFailure(message: "Video is forbidden in this audio-only RTMP attempt") }
         lock.lock()
         let active = accepting; let token = generation; let budget = admission
@@ -142,9 +149,11 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
                 }
                 if self.writeInFlight {
                     try publisher.tick(nowMs: self.nowMs())
+                    guard self.authorized(token) else { return }
                     try publisher.send(sample: sample)
                     self.protocolDeadline = try publisher.nextDeadlineMs()
                 } else {
+                    guard self.authorized(token) else { return }
                     let result = try publisher.sendAndTakeOutput(sample: sample, nowMs: self.nowMs())
                     self.protocolDeadline = result.nextDeadlineMs
                     self.progress(result.startupSubmitted, result.peerMediaProgress)
@@ -177,9 +186,10 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     }
 
     private func receive(_ token: UInt64) {
-        guard let connection, isCurrent(token) else { return }
+        guard let connection, isCurrent(token), !cancelling, authorized(token) else { return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, complete, error in
             guard let self, self.isCurrent(token), self.connection != nil, !self.cancelling else { return }
+            guard self.authorized(token) else { return }
             do {
                 if let data, !data.isEmpty, let publisher = self.publisher {
                     try publisher.feed(bytes: data, nowMs: self.nowMs())
@@ -202,6 +212,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     private func pumpOutput(_ token: UInt64, provided: Data? = nil) throws {
         defer { armDeadline(token) }
         guard isCurrent(token), !cancelling, let connection, let publisher else { return }
+        guard authorized(token) else { return }
         // Legacy send while a write is outstanding can create Sending without
         // inbound ACK traffic. Drain from existing cold output/completion work,
         // including an outstanding write, rather than adding sample hot-path calls.
@@ -215,6 +226,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
             if stopping { finishTransport(token, graceful: true) }
             return
         }
+        guard authorized(token) else { return } // Recheck after taking native output, immediately before submission.
         writeInFlight = true
         let write = socketCounter.begin(bytes: data.count)
         writeDeadline = nowMs() + 5_000
@@ -301,6 +313,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     }
     private func finishTransport(_ token: UInt64, graceful: Bool = false) {
         guard isCurrent(token) else { return }
+        guard authorized(token) else { return }
         if graceful, let connection {
             guard !finalizingTransport else { return }
             finalizingTransport = true
@@ -316,6 +329,13 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
         }
         releaseTransport()
         setStatus(token, "Publisher stopped · destination end unconfirmed")
+    }
+    private func authorized(_ token: UInt64) -> Bool {
+        guard outputAuthority?.permits() == false else { return true }
+        lock.lock()
+        if generation == token { accepting = false; admission.close(); currentStatus = "Publishing authority ended · local recording continues" }
+        lock.unlock()
+        releaseTransport(); return false
     }
     private func progress(_ sending: Bool, _ peer: Bool) {
         progressLatch.observe(sending: sending, peer: peer) { event in

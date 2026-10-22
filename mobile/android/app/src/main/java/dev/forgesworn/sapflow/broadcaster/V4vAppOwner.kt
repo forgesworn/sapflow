@@ -18,7 +18,7 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
     private val destination = AtomicReference<ReconnectingPublishingSink?>()
     private var captureSerial = 0L
     private var preparedGrant: V4vGrant? = null
-    private val expiry = V4vGrantExpiry(System::nanoTime)
+    private val expiry = V4vGrantExpiry(AndroidAuthorityClock::nowNs)
     private val admission = V4vCaptureAdmission()
     private val correlation = AtomicReference<V4vAttemptCorrelation?>()
     private data class ObservationAdmission(val owner: Long, val deadlineNs: Long)
@@ -32,7 +32,7 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
             expiryAlarm?.cancel(false)
             expiryAlarm = expiryOwner.schedule({
                 synchronized(expiry) { if (expiry.expired(ticket) != null) { observationAdmission.set(null); observer.cancel(); admission.invalidate(); correlation.getAndSet(null)?.clear(); preparedGrant = null; destination.getAndSet(null)?.stopDestination() } }
-            }, (ticket.deadlineNs - System.nanoTime()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
+            }, (ticket.deadlineNs - AndroidAuthorityClock.nowNs()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
         }
     }
     /** Called under the same lock as expiry/admission/destination adoption. */
@@ -49,11 +49,10 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
             expiry.refresh(grant.identity, grant.expiresAtMonotonicNs)?.let(::arm)
         }
     }
-    private val wallAnchor = System.currentTimeMillis()
-    private val monoAnchor = System.nanoTime()
+    private val authorityTime = AuthorityTimebase(System.currentTimeMillis(), AndroidAuthorityClock::nowNs)
     val control = V4vDestinationSession {
         V4vSessionEngine(profile, V4vControlClient(profile), V4vSessionStore(context.applicationContext),
-            { wallAnchor + (System.nanoTime() - monoAnchor) / 1_000_000 }, { V4vDestinationSession.nonce() }, ::stopPublisher, ::grantCommitted)
+            authorityTime::nowMs, { V4vDestinationSession.nonce() }, ::stopPublisher, ::grantCommitted, authorityTime::nowNs)
     }
     private val observer by lazy { V4vOriginObserver(profile,
         permit = { scope, complete ->
@@ -68,13 +67,14 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
                     coordinator?.originMediaConfirmed(scope.context) {
                         // No locks, HTTP or decoder work under final SDK gate.
                         val ticket = observationAdmission.get()
-                        ticket != null && ticket.owner == owner && System.nanoTime() < minOf(ticket.deadlineNs, probeDeadlineNs) &&
+                        ticket != null && ticket.owner == owner && AndroidAuthorityClock.nowNs() < minOf(ticket.deadlineNs, probeDeadlineNs) &&
                             destination.get() === coordinator && correlation.get()?.currentFor(scope.context) === scope
                     }
                 }
             }
-        }) }
+        }, nowNs = AndroidAuthorityClock::nowNs) }
     val playbackStatus: String get() = observer.diagnostics
+    fun revalidateAuthority() { synchronized(expiry) { fenceExpiredOwner() } }
     fun stopPublisher() {
         synchronized(expiry) { observationAdmission.set(null); observer.cancel(); admission.invalidate(); correlation.getAndSet(null)?.clear(); preparedGrant = null; expiry.clear(); expiryAlarm?.cancel(false); expiryAlarm = null; destination.getAndSet(null)?.stopDestination() }
     }
@@ -85,7 +85,7 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
         fenceExpiredOwner()
         val old = preparedGrant
         old != null && expiry.admits(binding.owner) && destination.get() != null && permit.intent == intent && admission.canStart(binding, permit.ticket, permit.grant.identity, intent) &&
-            permit.grant.permitsStartOf(old, System.nanoTime())
+            permit.grant.permitsStartOf(old, AndroidAuthorityClock.nowNs())
     }
     fun captureFactory(permit: V4vCapturePermit): V4vPreparedDestination {
         val result = synchronized(expiry) {
@@ -98,13 +98,16 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
             val numeric = SrtDestination.parse(grant.endpoint)
             // A retired factory cannot overwrite the next destination's scope.
             val attempts = V4vAttemptCorrelation()
-            val coordinator = ReconnectingPublishingSink(graceMs = grant.graceMs,
+            lateinit var coordinator: ReconnectingPublishingSink
+            val authority = PublishingAuthority(onDenied = { coordinator.stopDestination() }, permitted = { expiry.admits(ticket.owner) })
+            coordinator = ReconnectingPublishingSink(graceMs = grant.graceMs, authorityNowNs = AndroidAuthorityClock::nowNs,
+                sampleAuthority = authority,
                 observationChanged = { context, active ->
                     if (active) attempts.currentFor(context)?.let { observer.accepted(it, permit.intent) }
                     else observer.cancel(context)
                 }) { events ->
                 val wire = attempts.begin(this, grant, permit.intent)
-                SrtPublishingSink(numeric, wire.streamId, grant.passphrase, false, events, permit.intent.srtPacingBytesPerSecond(grant.maxPublishBps), permit.intent)
+                SrtPublishingSink(numeric, wire.streamId, grant.passphrase, false, events, permit.intent.srtPacingBytesPerSecond(grant.maxPublishBps), permit.intent, authority)
             }
             destination.set(coordinator); correlation.set(attempts); preparedGrant = grant; arm(ticket)
             V4vPreparedDestination(admission.bind(captureSerial, grant.identity, permit.intent)) { coordinator.newEpoch() }
@@ -143,6 +146,7 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
     }
     companion object {
         @Volatile private var instance: V4vAppOwner? = null
+        fun existing(): V4vAppOwner? = instance
         @Synchronized fun configured(context: Context): V4vAppOwner? {
             instance?.let { return it }
             val profile = V4vProfile.approved(BuildConfig.V4V_API_ORIGIN, BuildConfig.V4V_PLAYBACK_ORIGIN, BuildConfig.V4V_PLAYBACK_PREFIX) ?: return null

@@ -3,7 +3,8 @@ package dev.forgesworn.sapflow.broadcaster
 /** Cold scalar authority only. No callback, renderer, recorder or sink work is
  * performed under this lock. Actual native cleanup releases each preparation. */
 internal class CaptureStartAdmission {
-    class Preparation internal constructor(val id: Long, val intent: CaptureIntent, val audioInputId: String? = null)
+    class Preparation internal constructor(val id: Long, val intent: CaptureIntent, val audioInputId: String? = null,
+        val backgroundAudio: Boolean = false)
     class Start internal constructor(val id: Long, val preparation: Preparation, val epoch: Long)
     private var serial = 0L
     private var current: Preparation? = null
@@ -16,18 +17,22 @@ internal class CaptureStartAdmission {
     private var preserve = false
     private var cleaned = false
     private var cleaning = false
+    private var serviceReady = false
     private val elapsed = CaptureElapsed()
     private var timingPreparation: Preparation? = null
     val idle: Boolean @Synchronized get() = current == null
     val preparation: Preparation? @Synchronized get() = current
     val elapsedPreparation: Preparation? @Synchronized get() = timingPreparation
-    @Synchronized fun reserve(intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null): Preparation? {
+    @Synchronized fun reserve(intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
+        backgroundAudio: Boolean = false): Preparation? {
         if (current != null || serial == Long.MAX_VALUE) return null
         if (audioInputId != null && !AudioInputOption.validId(audioInputId)) return null
-        return Preparation(++serial, intent, audioInputId).also {
+        if (backgroundAudio && intent.hasVideo) return null
+        return Preparation(++serial, intent, audioInputId, backgroundAudio).also {
             timingPreparation = it; elapsed.reset()
             current = it; epoch = -1; live = true; candidate = true; committed = false
             prepared = false; pending = null; preserve = false; cleaned = false; cleaning = false
+            serviceReady = false
         }
     }
     @Synchronized fun claim(value: Preparation): Boolean {
@@ -49,11 +54,31 @@ internal class CaptureStartAdmission {
         prepared = true; return true
     }
     @Synchronized fun start(value: Preparation): Start? {
-        if (current != value || !live || !prepared || pending != null || serial == Long.MAX_VALUE) return null
+        if (current != value || !live || !prepared || pending != null || serial == Long.MAX_VALUE || value.backgroundAudio && !serviceReady) return null
         prepared = false
         return Start(++serial, value, epoch).also { pending = it }
     }
-    @Synchronized fun permits(value: Start): Boolean = live && current == value.preparation && epoch == value.epoch && pending == value
+    @Synchronized fun permits(value: Start): Boolean = live && current == value.preparation && epoch == value.epoch && pending == value &&
+        (!value.preparation.backgroundAudio || serviceReady)
+    /** Promotion is a scalar prerequisite, never inferred from a queued service Intent. */
+    @Synchronized fun servicePromoted(value: Preparation): Boolean {
+        if (current !== value || !live || !value.backgroundAudio || value.intent.hasVideo) return false
+        serviceReady = true; return true
+    }
+    @Synchronized fun backgroundReady(value: Preparation): Boolean = current === value && live && value.backgroundAudio && serviceReady
+    @Synchronized fun continuesInBackground(value: Preparation): Boolean = backgroundReady(value) && committed &&
+        !cleaning && pending == null && !value.intent.hasVideo
+    /** Exact callback/action fence: never resample and stop a successor. */
+    @Synchronized fun stop(value: Preparation, nowNs: Long? = null): Boolean {
+        if (current !== value || !live) return false
+        stop(nowNs); return true
+    }
+    /** Unexpected loss of the exact logical service owner, not a native input callback.
+     * A normal Stop that already won must not be reclassified as a failed save. */
+    @Synchronized fun interrupt(value: Preparation, nowNs: Long? = null): Boolean {
+        if (current !== value || !live) return false
+        stop(nowNs); return true
+    }
     /** After recorder creation, immediately before actual media admission. */
     @Synchronized fun commit(value: Start, nowNs: Long? = null): Boolean {
         if (!permits(value)) return false

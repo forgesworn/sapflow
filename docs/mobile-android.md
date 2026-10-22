@@ -379,13 +379,19 @@ remain open. Recreate closed sink adapters before preparing another session.
 
 ## Interruption and evidence gates
 
-Camera/microphone permissions are requested together before preparation.
-Capture is foreground-only: leaving the Activity, losing its preview surface,
-camera disconnection, microphone silencing, codec/configuration rejection or
-shared-ingress failure stops the session. Resumption requires preparation and an
-explicit start. No foreground service or background-capture claim exists yet.
-Cleanup stops the camera, audio input and codecs, cancels Rust queues, closes
-sinks and immutable handles, and stops owned workers on Activity destruction.
+Camera/microphone permissions are requested according to the selected intent
+before preparation. Leaving the Activity stops video and any audio-only show
+whose Start has not committed. An explicitly opted-in, already committed
+audio-only show can continue through the non-exported microphone foreground
+service while its authorised transport connects or reconnects, after notification
+and microphone authority are rechecked. Losing the video preview surface, camera
+disconnection, microphone silencing, codec/configuration rejection or
+shared-ingress failure stops the exact session. Resumption requires preparation
+and an explicit Start; the service is `START_NOT_STICKY` and reconstructs no show.
+When the exact capture stops, cleanup stops the camera, audio input and codecs,
+cancels Rust queues, closes sinks and immutable handles, and joins its owned
+workers. Activity destruction detaches the UI; only an eligible committed
+audio-only capture remains owned by the application/service.
 
 Unit tests cover independent Annex-B/AVCC fixtures, parameter-set extraction,
 borrowed direct views, buffer reuse, priming/cadence/restart timing, strict
@@ -473,13 +479,12 @@ No additional controls below are implemented or exposed by the current UI.
    support optional video; RTMP supports AAC-only wire output. The own-origin
    HLS ingest currently creates its muxer from video, so end-to-end audio-only
    requires a separate origin change and receiver proof.
-5. Move capture ownership into a bound foreground service before permitting
-   background/screen-off operation, with optional preview and a notification
-   Stop action. Declare camera/microphone service types and their permissions,
-   start from visible UI after runtime permission, and test privacy toggles,
-   screen-off, service kill and storage finalisation. Current Activity/surface
-   loss intentionally stops capture. Android's while-in-use restrictions remain
-   applicable; no Google runtime is needed.
+5. The first background slice now moves only opted-in committed audio-only capture
+   into an application-owned, non-exported microphone foreground service with an
+   exact notification Stop action. Physical privacy-toggle, screen-off, service
+   kill, network-switch and storage-finalisation qualification remains open.
+   Android's while-in-use restrictions remain applicable; no Google runtime is
+   needed.
    [Foreground service types](https://developer.android.com/develop/background-work/services/fgs/service-types),
    [background-start restrictions](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start).
 
@@ -1402,8 +1407,8 @@ after the wait and immediately before codec submission. Stale PCM stops the
 epoch and retains an incomplete recording instead of being queued as fresh.
 
 No route enumeration, timer, additional payload copy or FFI poll was added per
-PCM block. The existing 48 kHz mono path, foreground Stop and actual-close
-barriers remain. Bluetooth and other unqualified Default routes are unsupported.
-Actual USB/hot-unplug and sustained routing behaviour remain physical B4R gates;
-[audio-only mobile scope](audio-only-mobile.md#foreground-microphone-selection)
-does not claim background or locked-screen support.
+PCM block. The existing 48 kHz mono path and actual-close barriers remain.
+Bluetooth and other unqualified Default routes are unsupported. Actual
+USB/hot-unplug, locked-screen and sustained routing behaviour remain physical
+B4R gates; the implemented source contract is recorded in the
+[audio-only mobile scope](audio-only-mobile.md#background-ownership-and-controls).

@@ -5,7 +5,7 @@ sapflow_root="$(cd "$(dirname "$0")/../.." && pwd)"
 sapflow_scratch="$(mktemp -d "$sapflow_root/target/sapflow-ios-creator-owner-XXXXXX")"
 trap 'rm -rf "$sapflow_scratch"' EXIT
 mkdir -p "$sapflow_scratch/Sources/SapflowBroadcaster" "$sapflow_scratch/Tests/CreatorOwnerTests"
-for sapflow_source in PublishingTelemetry AudioInputPolicy CaptureAdmission EncodedPipeline EncodedWorkBudget DestinationProfile CaptureOrientation CaptureProfile SrtDestination SrtPublishingLimits NativeDeadlineTimer ReconnectController ReconnectingPublisher ManualSrtPublisher V4vContracts V4vSessionEngine V4vJournal V4vControlClient V4vLoginContracts V4vSignetLoginOwner V4vNativeSignet V4vCreatorContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot OriginSDKConfirmation V4vObservedPublisher V4vCreatorOwner; do
+for sapflow_source in AudioShowLifecycle AudioShowControls PublishingTelemetry AudioInputPolicy CaptureAdmission EncodedPipeline EncodedWorkBudget DestinationProfile CaptureOrientation CaptureProfile SrtDestination SrtPublishingLimits NativeDeadlineTimer ReconnectController ReconnectingPublisher ManualSrtPublisher V4vContracts V4vSessionEngine V4vJournal V4vControlClient V4vLoginContracts V4vSignetLoginOwner V4vNativeSignet V4vCreatorContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot OriginSDKConfirmation V4vObservedPublisher V4vCreatorOwner; do
   cp "$sapflow_root/mobile/ios/Sources/$sapflow_source.swift" "$sapflow_scratch/Sources/SapflowBroadcaster/"
 done
 sed '/^final class V4vTypedContractsTests/,$d' "$sapflow_root/mobile/ios/Tests/V4vSessionEngineTests.swift" > "$sapflow_scratch/Tests/CreatorOwnerTests/Fixtures.swift"

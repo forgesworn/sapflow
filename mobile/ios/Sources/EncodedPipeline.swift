@@ -38,6 +38,9 @@ protocol EncodedPublishingSink: AnyObject {
     func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void)
     var finalSocketOutbound: SocketOutboundSample? { get }
     func observeBroadcastEnd(_ completion: @escaping (UInt64) -> Void)
+    /// Cold app-activation hint. Implementations recheck original authority,
+    /// never create a fresh user Start or reset a reconnect/grant deadline.
+    func revalidateAuthority()
 }
 
 extension EncodedPublishingSink {
@@ -50,6 +53,7 @@ extension EncodedPublishingSink {
     func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) { completion(nil) }
     var finalSocketOutbound: SocketOutboundSample? { nil }
     func observeBroadcastEnd(_ completion: @escaping (UInt64) -> Void) {}
+    func revalidateAuthority() {}
 }
 
 /// Connects native compressed data to the actual Rust descriptor validator.

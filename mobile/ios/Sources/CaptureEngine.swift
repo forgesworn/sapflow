@@ -18,6 +18,9 @@ struct CaptureSnapshot {
     var audioInputs: [AudioInputOption] = []
     var requestedAudioInputID: String?
     var activeAudioInput = "Not verified"
+    var backgroundAudioEnabled = false
+    var systemRecordingControl = "Stop and save is available in Sapflow; system recording controls are unavailable on this SDK."
+    var stopControl: AudioShowStopControl?
     var socketKilobitsPerSecond: Double?
 }
 
@@ -107,23 +110,26 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var destinationFence: EncodedPublishingSink?
     var onChange: ((CaptureSnapshot) -> Void)?
     private var lastMeterUpdate = 0.0
+    private var cleanupObservation: (CaptureAdmission.Preparation, () -> Void)? // control only, one exact show
 
     override init() {
         super.init()
         let centre = NotificationCenter.default
         for name in [AVCaptureSession.wasInterruptedNotification, AVCaptureSession.runtimeErrorNotification,
-                     AVAudioSession.interruptionNotification,
-                     UIApplication.didEnterBackgroundNotification] {
+                     AVAudioSession.interruptionNotification, AVAudioSession.mediaServicesWereResetNotification] {
             notifications.append(centre.addObserver(forName: name, object: nil, queue: nil) { [weak self] notification in
                 guard let self else { return }
-                let ticket = self.admission.stop()
-                self.recordingAdmission.cancel(ticket.preparation)
-                self.fencePublishing()
-                self.control.async {
-                    guard self.admission.permitsStop(ticket) else { return }
-                    self.stopIntent = ticket
-                    self.stopOnControl(reason: "Capture interrupted. Return to the foreground and prepare again.")
+                let event: AudioShowLifecycle.Interruption
+                if notification.name == AVAudioSession.interruptionNotification {
+                    let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+                    event = type == AVAudioSession.InterruptionType.ended.rawValue ? .audioEnded : .audioBegan
+                } else if notification.name == AVAudioSession.mediaServicesWereResetNotification { event = .mediaServicesReset }
+                else {
+                    guard notification.object as? AVCaptureSession === self.session else { return }
+                    event = .captureFailed
                 }
+                guard let ticket = self.admission.interruption(event) else { return }
+                self.stopCaptured(ticket, reason: "Capture interrupted. Return to the foreground and prepare again.")
             })
         }
     }
@@ -152,6 +158,49 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     func selectAudioInput(_ id: String?) -> Bool {
         guard canChooseCaptureProfile else { return false }
         return admission.selectAudioInput(id)
+    }
+    func selectBackgroundAudio(_ enabled: Bool) -> Bool {
+        canChooseCaptureProfile && admission.selectBackgroundAudio(enabled)
+    }
+    var backgroundContinuation: CaptureAdmission.Preparation? { admission.backgroundContinuation }
+    /// Admission and the committed Start share one lock. No timer, UI snapshot
+    /// or scene callback can grant continuation to a merely starting owner.
+    @discardableResult func setForeground(_ active: Bool) -> CaptureAdmission.Preparation? {
+        let action = admission.visibilityChanged(foreground: active)
+        if let ticket = action.stop { stopCaptured(ticket, reason: "Capture interrupted. Return to the foreground and prepare again.") }
+        if active {
+            destinationLock.lock(); let publisher = destinationFence; destinationLock.unlock()
+            publisher?.revalidateAuthority()
+        }
+        return action.continuing
+    }
+    @discardableResult func stop(preparation: CaptureAdmission.Preparation) -> Bool {
+        stop(control: AudioShowStopControl(preparation: preparation, admission: admission))
+    }
+    @discardableResult func stop(control: AudioShowStopControl) -> Bool {
+        guard let ticket = control.perform(on: admission) else { return false }
+        stopCaptured(ticket, reason: nil)
+        return true
+    }
+    private func stopCaptured(_ ticket: CaptureAdmission.Stop, reason: String?) {
+        recordingAdmission.cancel(ticket.preparation); fencePublishing()
+        control.async {
+            guard self.admission.permitsStop(ticket) else { return }
+            self.stopIntent = ticket; self.stopOnControl(reason: reason)
+        }
+    }
+    /// The single listener is an internal app-lifetime journal lease owner.
+    /// Admission releases only after every real native/file/candidate closes.
+    func whenCleanupComplete(_ ticket: CaptureAdmission.Preparation, completion: @escaping () -> Void) {
+        control.async {
+            guard self.admission.ownsPreparation(ticket) else { completion(); return }
+            guard self.cleanupObservation == nil else { return }
+            self.cleanupObservation = (ticket, completion)
+        }
+    }
+    private func notifyCleanupIfReleased() {
+        guard let (ticket, completion) = cleanupObservation, !admission.ownsPreparation(ticket) else { return }
+        cleanupObservation = nil; completion()
     }
     func refreshAudioInputs(profile: CaptureIntent) {
         control.async {
@@ -223,6 +272,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             let released = self.admission.candidateClosed(ticket, cleanupComplete: true)
             _ = self.admission.failed(ticket, cleanupComplete: true)
             if released { self.admissionStopped() }
+            self.notifyCleanupIfReleased()
         }
     }
     func setDestination(_ destination: EncodedPublishingSink?, preparation ticket: CaptureAdmission.Preparation,
@@ -245,6 +295,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                         if clean, self.rejectedCandidate?.0 == ticket { self.rejectedCandidate = nil }
                         if ownsReservation { _ = self.admission.failed(ticket, cleanupComplete: clean && self.ingress.destination?.cleanupComplete != false) }
                         if released { self.admissionStopped() }
+                        self.notifyCleanupIfReleased()
                     }
                 }
                 if let destination, destination !== self.ingress.destination {
@@ -258,6 +309,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             destination?.observeBroadcastEnd { [weak self] instant in self?.admission.broadcastEnded(ticket, nowNs: instant) }
             if self.configuredProfile != ticket.profile { self.configured = false }
             self.snapshot.profile = ticket.profile
+            self.snapshot.backgroundAudioEnabled = ticket.continuesAudioInBackground
             self.snapshot.captureElapsedNs = nil; self.snapshot.broadcastElapsedNs = nil; self.snapshot.socketKilobitsPerSecond = nil
             self.destinationLock.lock(); self.destinationFence = destination; self.destinationLock.unlock()
             self.snapshot.publisher = self.ingress.status
@@ -638,7 +690,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
             self.beginTelemetry(ticket.preparation)
             self.snapshot.phase = "Recording"
-            self.snapshot.detail = keepSavedSegment ? "Rotation began a new recording segment. Active publishing reconnects; the previous private segment is retained." : run.video.map { "Hardware encoder: \($0.implementation). Saving compressed video and audio locally." } ?? "Saving microphone AAC locally. Keep Sapflow in the foreground."
+            self.snapshot.detail = keepSavedSegment ? "Rotation began a new recording segment. Active publishing reconnects; the previous private segment is retained." : run.video.map { "Hardware encoder: \($0.implementation). Saving compressed video and audio locally." } ?? (ticket.preparation.continuesAudioInBackground ? "Saving microphone AAC locally. This started audio show may continue with the screen locked. Return to Sapflow to Stop and save." : "Saving microphone AAC locally. Keep Sapflow in the foreground.")
             self.snapshot.encoded = 0; self.snapshot.captureDrops = 0; self.snapshot.level = -60
             self.snapshot.publisher = self.ingress.status
             self.publish()
@@ -678,6 +730,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         stopping = false; preparedIntent = nil; stopIntent = nil; recordingShow = nil; preparedPublisherClosed = nil; rotationDeadline = nil
         snapshot.phase = stopReason == nil ? "Stopped" : "Interrupted"
         snapshot.canStart = false
+        notifyCleanupIfReleased()
         publish()
     }
     private func stopOnControl(reason requestedReason: String?) {
@@ -789,6 +842,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             let stopped = stopIntent ?? admission.stop()
             _ = admission.completeStop(stopped, cleanupComplete: clean)
             if admission.currentPhase == .idle { preparedIntent = nil; stopIntent = nil; recordingShow = nil; runStop = nil }
+            notifyCleanupIfReleased()
             publish()
         }
     }
@@ -882,7 +936,12 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         snapshot.socketKilobitsPerSecond = nil
     }
     private func report(_ error: Error) { snapshot.phase = "Error"; snapshot.detail = error.localizedDescription; snapshot.canStart = false; publish() }
-    private func publish() { snapshot.recordingIOBusy = recordingAdmission.isWorking || storageCheckPending; let value = snapshot; DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = value.running; self.onChange?(value) } }
+    private func publish() {
+        snapshot.recordingIOBusy = recordingAdmission.isWorking || storageCheckPending
+        snapshot.stopControl = admission.currentPreparation.map { AudioShowStopControl(preparation: $0, admission: admission) }
+        let value = snapshot
+        DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = value.running; self.onChange?(value) }
+    }
     private func meter(_ level: Float) {
         // Audio callback only schedules coalesced UI work, never logs per packet.
         let now = ProcessInfo.processInfo.systemUptime

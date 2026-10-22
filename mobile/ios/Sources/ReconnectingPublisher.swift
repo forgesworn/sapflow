@@ -88,13 +88,15 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     private let epochClosed: (UInt64) -> Void
     private let destinationEnded: () -> Void
     private let policy: ReconnectPolicyPort
+    private let authorityClock: () -> UInt64
     private let hasVideo: Bool
-    private lazy var timer = NativeDeadlineTimer(queue: queue)
-    private lazy var controller = ReconnectController(policy: policy, now: { DispatchTime.now().uptimeNanoseconds },
+    private lazy var timer = NativeDeadlineTimer(queue: queue, now: authorityClock)
+    private lazy var controller = ReconnectController(policy: policy, now: authorityClock,
         activeChanged: { [weak self] value in self?.setActive(value as? NativePublishingAttempt) },
         changed: { [weak self] in self?.publishState() },
         attemptReady: { [weak self] context, instant in self?.attemptReady(context, instant) })
     private var attachedEpoch: UInt64? // serial owner only
+    private var policyStarted = false // serial owner only; no wake may prepare/start a session
     private var currentEpoch: UInt64?
     private var epochCounter: UInt64 = 0
     private var configured = false
@@ -103,6 +105,8 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     private var fenced = false
     private var released = true
     private var active: NativePublishingAttempt?
+    private var authorityDeadlineNs: UInt64? // scalar mirror, lock only
+    private var authorityCheckQueued = false // one cold revalidation, lock only
     private var currentStatus = "Destination prepared · explicit Start required"
     private var telemetry = PublishingTelemetryAggregate<ReconnectAttemptContext>() // queue only
     private var telemetryContext: ReconnectAttemptContext? // queue only
@@ -118,6 +122,7 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     /// callbacks can arrive from any thread and must never perform IO or joins.
     init(graceMs: UInt64 = 90_000, source: NativeTransportRecoverySource,
          hasVideo: Bool = true,
+         authorityClock: @escaping () -> UInt64 = AudioShowAuthorityClock.nowNs,
          ownerQueue: DispatchQueue = DispatchQueue(label: "sapflow.logical-publisher", qos: .userInitiated),
          attemptReady: @escaping (ReconnectAttemptContext, UInt64) -> Void = { _, _ in },
          attemptInvalidated: @escaping (ReconnectAttemptContext) -> Void = { _ in },
@@ -125,6 +130,7 @@ final class ReconnectingPublisher: EncodedPublishingSink {
          destinationEnded: @escaping () -> Void = {},
          contextualFactory: @escaping ContextualAttemptFactory) throws {
         policy = try NativeReconnectPolicy(graceMs: graceMs, source: source)
+        self.authorityClock = authorityClock
         self.hasVideo = hasVideo
         queue = ownerQueue; factory = contextualFactory
         self.attemptReady = attemptReady; self.attemptInvalidated = attemptInvalidated
@@ -185,6 +191,7 @@ final class ReconnectingPublisher: EncodedPublishingSink {
         queue.async {
             guard self.isCurrentEpoch(epoch) else { self.publishState(); return }
             self.attachedEpoch = epoch
+            self.policyStarted = true
             self.controller.attach(epoch: epoch, contextualFactory: { [weak self] context, observe in
                 guard let self, self.isCurrentEpoch(epoch) else { throw ReconnectFailure.invalidEpoch }
                 let sink = try self.factory(context, { [weak self] event, instant in
@@ -203,8 +210,24 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     }
     func offer(_ sample: MediaSample) throws {
         guard hasVideo || !sample.isVideo() else { throw CaptureFailure(message: "Video is forbidden in this audio-only session") }
-        lock.lock(); let attempt = !fenced && !codecClosing && currentEpoch != nil ? active : nil; lock.unlock()
+        lock.lock(); let deadline = authorityDeadlineNs; lock.unlock()
+        // Usually no clock read is needed. At an outstanding retry/cleanup
+        // boundary, close this scalar gate before a delayed timer can race PCM.
+        if let deadline, authorityClock() >= deadline { revalidateAuthority(); return }
+        lock.lock()
+        let attempt = !fenced && !codecClosing && currentEpoch != nil && failedContext == nil && !authorityCheckQueued ? active : nil
+        lock.unlock()
         try attempt?.sink.offer(sample)
+    }
+    func revalidateAuthority() {
+        lock.lock()
+        guard !fenced, !authorityCheckQueued else { lock.unlock(); return }
+        authorityCheckQueued = true
+        lock.unlock()
+        queue.async { [self] in
+            if policyStarted { controller.tick(); publishState() }
+            lock.lock(); authorityCheckQueued = false; lock.unlock()
+        }
     }
     private func isCurrentEpoch(_ epoch: UInt64) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -229,14 +252,16 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     }
     private func publishState() {
         let clean = controller.cleanupComplete; let value = controller.status
+        let deadline = controller.nextDeadlineNs
         lock.lock(); released = clean
+        authorityDeadlineNs = deadline
         // A queued old controller publication must never restore Live after a
         // synchronous cold fence, including the gap before detach is processed.
         if value.hasPrefix("Live"), fenced || codecClosing || currentEpoch == nil || failedContext != nil {
             currentStatus = fenced ? "Publisher stopping · playback unconfirmed" : "Publisher epoch closing · playback unconfirmed"
         } else { currentStatus = value }
         lock.unlock()
-        if let terminal = controller.terminalAtNs { noteTerminal(terminal) }
+        if controller.terminalAtNs != nil { noteTerminal(DispatchTime.now().uptimeNanoseconds) }
         timer.schedule(atNs: controller.nextDeadlineNs, generation: 1) { [weak self] _ in self?.controller.tick() }
     }
     /// Early codec-teardown fence. Keep the epoch identity for the later actual

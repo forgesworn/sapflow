@@ -45,6 +45,6 @@ enum V4vCreatorProduction {
         let milliseconds = Date().timeIntervalSince1970 * 1000
         let wall: UInt64 = milliseconds.isFinite && milliseconds > 0 && milliseconds < Double(V4vJSON.maxEpoch)
             ? UInt64(milliseconds) : 0
-        return V4vClock(wallMs: wall, monotonicNs: DispatchTime.now().uptimeNanoseconds)
+        return V4vClock(wallMs: wall, monotonicNs: AudioShowAuthorityClock.nowNs())
     }
 }

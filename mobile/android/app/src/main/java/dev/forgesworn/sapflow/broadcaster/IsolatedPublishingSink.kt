@@ -32,6 +32,7 @@ internal class IsolatedPublishingSink(private val delegate: EncodedSink, private
     override fun start() = publish { delegate.start() }
     override fun consume(sample: MediaSample) = publish { delegate.consume(sample) }
     override fun setKeyframeRequester(request: () -> Unit) = publish { delegate.setKeyframeRequester(request) }
+    override fun revalidateAuthority() = publish { delegate.revalidateAuthority() }
     override fun stopDestination() { runCatching { delegate.stopDestination() }.onFailure {
         val error = it as? Exception ?: IllegalStateException("Publisher fence failed")
         cleanupFailure.compareAndSet(null, error)

@@ -60,6 +60,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 
 class MainActivity : ComponentActivity() {
     private lateinit var capture: CaptureController
+    private lateinit var audioOwner: AudioBroadcastOwner
+    private val runtimeClient = Any()
     private var v4v: V4vAppOwner? = null
     private var useV4v by mutableStateOf(false)
     private var prepareRequest = 0L
@@ -67,7 +69,7 @@ class MainActivity : ComponentActivity() {
     private var preparedCapture: CaptureStartAdmission.Preparation? = null
     private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
     private class PreparationIntent(val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
-        val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?)
+        val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?, val backgroundAudio: Boolean)
     private var pendingPreparation: PreparationIntent? = null
     private val permissionReplies = PendingPermissionReply<PreparationIntent>()
     private var permissionReplyOutstanding by mutableStateOf(false)
@@ -124,6 +126,7 @@ class MainActivity : ComponentActivity() {
     private var recordLocally by mutableStateOf(true)
     private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
     private var microphoneOnly by mutableStateOf(false)
+    private var backgroundAudio by mutableStateOf(false)
     private var selectedAudioInputId by mutableStateOf<String?>(null)
     private var audioInputOptions by mutableStateOf<List<AudioInputOption>>(emptyList())
     private val selectedIntent: CaptureIntent get() = if (microphoneOnly) CaptureIntent.AudioOnly48kMono else CaptureIntent.AudioVideo(captureProfile)
@@ -182,19 +185,32 @@ class MainActivity : ComponentActivity() {
         val intent = permissionReplies.receive()
         permissionReplyOutstanding = permissionReplies.outstanding
         if (intent != null && currentPreparation(intent)) {
-            if (intent.capture.permissionsGranted { result[it] == true || checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
+            if (preparationPermissions(intent).all { result[it] == true || checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
                 permissionMessage = null
                 prepareCapture(intent)
             } else {
                 cancelPreparation()
-                permissionMessage = if (intent.capture.hasVideo) "Camera and microphone permission are required. Enable them in system settings if permission was permanently denied." else "Microphone permission is required. Enable it in system settings if permission was permanently denied."
+                permissionMessage = if (intent.capture.hasVideo) "Camera and microphone permission are required. Enable them in system settings if permission was permanently denied." else "Microphone and, for background mode, notification permission are required. Enable them in system settings if denied."
             }
         } else if (pendingPreparation === intent && intent != null) cancelPreparation()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        capture = CaptureController(applicationContext)
+        audioOwner = AudioBroadcastOwner.application(applicationContext)
+        capture = audioOwner.capture
+        preparedCapture = capture.currentPreparation()
+        preparedCapture?.let { retained ->
+            // Observe the exact process-owned intent; never reconstruct destination credentials.
+            microphoneOnly = !retained.intent.hasVideo
+            retained.intent.videoProfile?.let { captureProfile = it }
+            backgroundAudio = retained.backgroundAudio
+        }
+        audioOwner.continuingShow()?.let { retained ->
+            useV4v = retained.usesV4v
+            recordLocally = retained.recordsLocally
+            if (retained.usesV4v) preparedV4vCapture = retained.preparation
+        }
         recordingLibrary = RecordingLibraryOwner.application(applicationContext)
         try { v4v = V4vAppOwner.configured(applicationContext); v4v?.signerRelay?.attach(launchSigner) }
         catch (_: Exception) { permissionMessage = "Approved V4V configuration is invalid; connector disabled" }
@@ -276,7 +292,13 @@ class MainActivity : ComponentActivity() {
                         }) { Text("Refresh microphone inputs") }
                         if (selectedAudioInputId != null && audioInputOptions.none { it.id == selectedAudioInputId }) Text("Selected microphone unavailable")
                         Text("Active microphone: ${current?.activeAudioInput ?: "Not verified"}", style = MaterialTheme.typography.bodySmall)
-                        if (microphoneOnly) Text("Foreground audio only. Capture stops when this screen leaves the foreground.", style = MaterialTheme.typography.bodySmall)
+                        if (microphoneOnly) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(backgroundAudio, { backgroundAudio = it }, enabled = qualityConfigurable)
+                                Text("Continue microphone capture when locked", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Text("Choose before Prepare. Background capture requires notifications and provides Stop and save.", style = MaterialTheme.typography.bodySmall)
+                        }
                         Text("Capture quality · choose before Prepare", style = MaterialTheme.typography.labelMedium)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (!microphoneOnly) CaptureProfile.entries.forEach { quality ->
@@ -295,9 +317,13 @@ class MainActivity : ComponentActivity() {
                         ) { Text("Prepare") }
                         Button(
                             onClick = { startWithAuth() },
-                            enabled = current?.stage == CaptureStage.PREPARED,
+                            enabled = current?.stage == CaptureStage.PREPARED &&
+                                (preparedCapture?.backgroundAudio != true || current.backgroundAudioReady),
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Start capture") }
+                        if (current?.stage == CaptureStage.PREPARED && preparedCapture?.backgroundAudio == true && !current.backgroundAudioReady) {
+                            Text("Waiting for the microphone service", style = MaterialTheme.typography.bodySmall)
+                        }
                         Button(
                             onClick = {
                                 ui.removeCallbacks(settlePose)
@@ -386,14 +412,27 @@ class MainActivity : ComponentActivity() {
                         Text("Leave blank for SDK validation only. No transport downgrade.", style = MaterialTheme.typography.bodySmall)
                         Text("Video: ${current?.videoEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
                         Text("Audio: ${current?.audioEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
-                        Text("Capture stops when this screen leaves the foreground.", style = MaterialTheme.typography.bodySmall)
+                        Text("Only an opted-in, started microphone show can continue when this screen closes.", style = MaterialTheme.typography.bodySmall)
         }
     }
 
 
     private fun startWithAuth() {
         val captureIntent = preparedCapture ?: return
-        fun start() { capture.start(captureIntent); window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        fun start() {
+            audioOwner.revalidateAuthority()
+            if (audioOwner.awaitingPromotion(captureIntent)) {
+                permissionMessage = "Waiting for the microphone service. Start will be available when it is ready."
+                return
+            }
+            if (!audioOwner.canStart(captureIntent)) {
+                if (capture.stop(captureIntent, "Background audio service is not ready or permission changed. Prepare again.")) v4v?.stopPublisher()
+                permissionMessage = "Background service and notification permission are required before Start. Prepare again."
+                return
+            }
+            capture.start(captureIntent)
+            if (!captureIntent.backgroundAudio) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         if (!useV4v) start()
         else {
             val request = prepareRequest
@@ -509,7 +548,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentPreparation(intent: PreparationIntent): Boolean = pendingPreparation === intent && intent.request == prepareRequest &&
-        poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && recordLocally == intent.record && useV4v == intent.v4v &&
+        poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && (backgroundAudio && !intent.capture.hasVideo) == intent.backgroundAudio && recordLocally == intent.record && useV4v == intent.v4v &&
         (intent.v4v || (useSrt == intent.srt && destinationUrl == intent.endpoint && destinationKey == intent.key && srtPassphrase == intent.passphrase &&
             srtPlaintextLab == intent.srtPlaintext && allowPlaintextDevelopment == intent.rtmpPlaintext))
 
@@ -517,11 +556,14 @@ class MainActivity : ComponentActivity() {
         pendingPreparation = null; preparationPending = false
         recordingPreflight?.let(recordingLibrary::cancel); recordingPreflight = null
     }
+    private fun preparationPermissions(intent: PreparationIntent): List<String> =
+        intent.capture.requiredPermissions + if (intent.backgroundAudio && android.os.Build.VERSION.SDK_INT >= 33) listOf(Manifest.permission.POST_NOTIFICATIONS) else emptyList()
+
     private fun prepareWithPermissions() {
         if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
-        val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId)
+        val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo)
         pendingPreparation = intent; preparationPending = true
-        val needed = intent.capture.requiredPermissions.toTypedArray()
+        val needed = preparationPermissions(intent).toTypedArray()
         if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
             permissionMessage = null
             prepareCapture(intent)
@@ -563,6 +605,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         try {
+            require(preparationPermissions(intent).all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) { "Capture permissions changed. Prepare again." }
+            require(!intent.backgroundAudio || audioOwner.notificationsGranted()) { "Enable microphone-capture notifications before Prepare." }
             val surface = if (intent.capture.hasVideo) preview?.takeIf { it.isValid } ?: run { cancelPreparation(); return } else null
             if (intent.record) {
                 val ready = checkNotNull(checkedRecording)
@@ -579,12 +623,12 @@ class MainActivity : ComponentActivity() {
             } else if (intent.endpoint.isBlank()) ({ null }) else if (intent.srt) {
                 SrtDestination.validateCredentials(key, passphrase, plaintext)
                 val destination = SrtDestination.parse(intent.endpoint.trim())
-                val coordinator = ReconnectingPublishingSink { events -> SrtPublishingSink(destination, key, passphrase, plaintext, events, intent = intent.capture) }
+                val coordinator = ReconnectingPublishingSink(authorityNowNs = AndroidAuthorityClock::nowNs) { events -> SrtPublishingSink(destination, key, passphrase, plaintext, events, intent = intent.capture) }
                 ({ coordinator.newEpoch() })
             } else {
                 require(key.isNotEmpty()) { "A stream key is required" }
                 val destination = RtmpDestination.parse(intent.endpoint.trim(), intent.rtmpPlaintext)
-                val coordinator = ReconnectingPublishingSink { events -> RtmpPublishingSink(destination, key, events, intent.capture) }
+                val coordinator = ReconnectingPublishingSink(authorityNowNs = AndroidAuthorityClock::nowNs) { events -> RtmpPublishingSink(destination, key, events, intent.capture) }
                 ({ coordinator.newEpoch() })
             }
             val recorder: () -> EncodedSink? = if (intent.record) ({ checkNotNull(checkedRecording).recorder() }) else ({ null })
@@ -592,7 +636,11 @@ class MainActivity : ComponentActivity() {
             // Explicit Prepare restores the stable physical pose even if no
             // further sensor callback followed qualification Stop/CLEAR.
             if (intent.capture.hasVideo) capture.orientationChanged(poseSelector.prepareSession())
-            preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture, intent.audioInputId)
+            preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture, intent.audioInputId, intent.backgroundAudio)
+            if (intent.backgroundAudio) {
+                val prepared = checkNotNull(preparedCapture) { "Capture preparation was not admitted" }
+                require(audioOwner.arm(prepared, intent.v4v, intent.record)) { "Background audio service could not be admitted. Prepare again." }
+            }
             if (intent.v4v) preparedV4vCapture = preparedCapture
             pendingPreparation = null; preparationPending = false
         } catch (error: Exception) {
@@ -604,6 +652,7 @@ class MainActivity : ComponentActivity() {
     override fun onConfigurationChanged(newConfig: Configuration) { super.onConfigurationChanged(newConfig); updatePreview() }
     override fun onStart() {
         super.onStart()
+        audioOwner.enterForeground(runtimeClient)
         poseSelector = PoseInputPolicy(displayPose(), qualificationPoseControlEnabled)
         capture.orientationChanged(poseSelector.pose)
         poseTracking = true
@@ -621,10 +670,14 @@ class MainActivity : ComponentActivity() {
         ui.removeCallbacks(settlePose); poseSelector.cancelPending()
         getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayChanges)
         ui.removeCallbacks(refresh)
-        v4v?.stopPublisher()
-        capture.stop("Capture interrupted: the app left the foreground. Prepare again to resume.")
+        if (audioOwner.leaveForeground(runtimeClient) == CaptureForegroundClients.Departure.STOP) {
+            // An old Activity's delayed onStop must not retire any newer publisher.
+            preparedCapture?.let {
+                if (capture.stop(it, "Capture interrupted: the app left the foreground. Prepare again to resume.")) v4v?.stopPublisher()
+            }
+        }
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
-    override fun onDestroy() { libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); capture.close(); super.onDestroy() }
+    override fun onDestroy() { libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); super.onDestroy() }
 }

@@ -10,7 +10,9 @@ protocol V4vCreatorCapturePort: AnyObject {
     func prepare(_ ticket: CaptureAdmission.Preparation)
     func start(preparation: CaptureAdmission.Preparation)
     func cancelPendingPreparation(_ ticket: CaptureAdmission.Preparation)
+    func whenCleanupComplete(_ ticket: CaptureAdmission.Preparation, completion: @escaping () -> Void)
     func stop()
+    @discardableResult func stop(preparation: CaptureAdmission.Preparation) -> Bool
 }
 
 protocol V4vCreatorHTTP: AnyObject {
@@ -60,6 +62,8 @@ final class V4vCreatorOwner: @unchecked Sendable {
     /// Scalar admission only. No IO, callbacks, HTTP or camera work under lock.
     private let gate = NSLock()
     private var enabled = true, closed = false, busy = false, endQueued = false
+    private var sceneForeground = true
+    private var continuingAudio: CaptureAdmission.Preparation?
     private var endNeedsStaging = false
     private var generation: UInt64 = 1
     private var commandSerial: UInt64 = 0, busyCommand: UInt64?
@@ -79,6 +83,8 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private var http: V4vCreatorHTTP?
     private var login: V4vCreatorLogin?
     private var retainedSelf: V4vCreatorOwner?
+    private var leaseRetention: V4vCreatorOwner?
+    private var showLease: (UUID, CaptureAdmission.Preparation)? // owner queue only
     private var value = Snapshot()
     private var current: V4vCurrentSession?
     private var binding: Binding?
@@ -128,7 +134,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
             try V4vObservedPublisher(destination: destination, permit: permit, profile: profile,
                 engine: engine, owner: queue, slot: slot, clock: clock, captureProfile: captureProfile)
         }
-        timer = NativeDeadlineTimer(queue: owner); slot = V4vObservationSlot(owner: owner, clock: clock)
+        timer = NativeDeadlineTimer(queue: owner, now: { clock().monotonicNs }); slot = V4vObservationSlot(owner: owner, clock: clock)
         owner.async { [self] in bootstrap() }
     }
     private func bootstrap() {
@@ -142,14 +148,19 @@ final class V4vCreatorOwner: @unchecked Sendable {
     }
     /// One ordinary command is admitted before dispatch. Bool is admission,
     /// never HTTP success, authority, capture readiness or decoded proof.
-    private func command(_ action: @escaping (UInt64) throws -> Void) -> Bool {
+    private func command(allowBackgroundRefresh: Bool = false, _ action: @escaping (UInt64) throws -> Void) -> Bool {
         let started = clock().monotonicNs
         gate.lock()
-        guard !closed, enabled, !busy, !endQueued, commandSerial < UInt64.max else { gate.unlock(); return false }
+        guard !closed, enabled, (sceneForeground || (allowBackgroundRefresh && continuingAudio != nil && continuingAudio == coldTicket)),
+              !busy, !endQueued, commandSerial < UInt64.max else { gate.unlock(); return false }
         commandSerial += 1; let admitted = commandSerial
         busy = true; busyCommand = admitted; let token = generation; gate.unlock()
         owner.async { [self] in
-            guard live(token) else { releaseCommand(admitted); return }
+            gate.lock()
+            let admittedHere = !closed && enabled && generation == token && (sceneForeground ||
+                (allowBackgroundRefresh && continuingAudio != nil && continuingAudio == coldTicket))
+            gate.unlock()
+            guard admittedHere else { releaseCommand(admitted); return }
             commandStartedNs = started; actorCommand = admitted
             do { try action(token) } catch { fail(error); releaseCommand() }
         }
@@ -158,8 +169,8 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private func live(_ token: UInt64) -> Bool {
         gate.lock(); defer { gate.unlock() }; return !closed && enabled && token == generation
     }
-    private func state() -> (active: Bool, closed: Bool, busy: Bool, generation: UInt64, ending: Bool) {
-        gate.lock(); defer { gate.unlock() }; return (enabled, closed, busy, generation, endQueued)
+    private func state() -> (active: Bool, closed: Bool, busy: Bool, generation: UInt64, ending: Bool, foreground: Bool) {
+        gate.lock(); defer { gate.unlock() }; return (enabled, closed, busy, generation, endQueued, sceneForeground)
     }
     private func releaseCommand(_ captured: UInt64? = nil) {
         let expected = captured ?? actorCommand
@@ -189,7 +200,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
             do { remaining = try remainingLoginMs(deadline: loginDeadline) }
             catch { next.cancel(); throw error }
             gate.lock()
-            let registered = !closed && enabled && generation == token
+            let registered = !closed && enabled && sceneForeground && generation == token
             if registered { coldLogin = next }
             gate.unlock()
             guard registered else { next.cancel(); throw V4vFailure.closed }
@@ -268,7 +279,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         }
     }
     @discardableResult func refresh() -> Bool {
-        command { [self] _ in
+        command(allowBackgroundRefresh: true) { [self] _ in
             guard let engine else { throw V4vFailure.closed }
             try engine.stageRefresh(key: nonce(), clock: clock()); try beginWindow(); pump()
         }
@@ -304,10 +315,24 @@ final class V4vCreatorOwner: @unchecked Sendable {
         }
     }
     func stopCapture() {
-        // Only this immediate explicit user action may invoke global Stop.
         let cold = state(); guard cold.active, !cold.closed else { return }
-        retireAuthority(); capture.stop()
-        owner.async { [self] in prepareIntent = nil; refreshAtNs = nil; retireBinding(); publish() }
+        gate.lock(); let ticket = coldTicket; gate.unlock()
+        guard let ticket, capture.stop(preparation: ticket) else { return }
+        captureStopped(preparation: ticket)
+    }
+    /// The app's exact capture Stop already won. Never look up a different
+    /// capture or publisher when this command eventually reaches the owner.
+    func captureStopped(preparation ticket: CaptureAdmission.Preparation) {
+        gate.lock()
+        guard coldTicket == ticket, !closed else { gate.unlock(); return }
+        generation &+= 1; let publisher = coldPublisher
+        continuingAudio = nil
+        gate.unlock()
+        publisher?.endDestination()
+        owner.async { [self] in
+            guard binding?.ticket == ticket else { return }
+            prepareIntent = nil; refreshAtNs = nil; retireBinding(); publish()
+        }
     }
     func setActive(_ active: Bool) {
         gate.lock(); guard !closed, enabled != active else { gate.unlock(); return }; enabled = active; gate.unlock()
@@ -320,6 +345,22 @@ final class V4vCreatorOwner: @unchecked Sendable {
             else if engine?.pending != nil || engine?.terminalIntent == true { if window == nil { commandStartedNs = clock().monotonicNs; try? beginWindow() }; pump() }
             publish()
         }
+    }
+    /// Called by the single app model, never by view disappearance. The exact
+    /// CaptureAdmission committed-run decision controls existing publishing;
+    /// this does not permit sign-in, event selection or a new background Start.
+    @discardableResult func setSceneForeground(_ active: Bool, continuing ticket: CaptureAdmission.Preparation?) -> Bool {
+        gate.lock()
+        let awakening = active && !sceneForeground
+        sceneForeground = active
+        continuingAudio = !active && ticket?.continuesAudioInBackground == true && ticket == coldTicket ? ticket : nil
+        let permitted = active || continuingAudio != nil
+        let signing = !active ? coldLogin : nil
+        let publisher = awakening ? coldPublisher : nil
+        gate.unlock()
+        signing?.cancel()
+        publisher?.revalidateAuthority()
+        return permitted
     }
     private func retireAuthority() {
         gate.lock(); generation &+= 1; let ticket = coldTicket, publisher = coldPublisher, login = coldLogin; gate.unlock()
@@ -354,6 +395,20 @@ final class V4vCreatorOwner: @unchecked Sendable {
         // owner. The selected profile is never inferred from a service cap.
         try captureProfile.requireGrant(maxPublishBps: permit.grant.maxPublishBps)
         guard live(token), binding == nil, let engine, let ticket = capture.reservePreparation(profile: captureProfile) else { throw V4vFailure.busy }
+        if ticket.continuesAudioInBackground {
+            do {
+                gate.lock(); let foreground = sceneForeground; gate.unlock()
+                guard foreground, showLease == nil, let leasing = journal as? V4vJournalShowLeasing else { throw V4vFailure.journal }
+                let lease = UUID()
+                try leasing.acquireShowLease(owner: lease)
+                showLease = (lease, ticket); leaseRetention = self
+                capture.whenCleanupComplete(ticket) { [weak self] in self?.owner.async { [weak self] in
+                    guard let self, self.showLease?.0 == lease, self.showLease?.1 == ticket else { return }
+                    leasing.releaseShowLease(owner: lease)
+                    self.showLease = nil; self.leaseRetention = nil; self.finishClose()
+                } }
+            } catch { capture.abandonPreparation(ticket); throw error }
+        }
         guard nextDestination < UInt64.max else { capture.abandonPreparation(ticket); throw V4vFailure.bounds }
         gate.lock()
         let mayConstruct = !closed && enabled && generation == token
@@ -563,7 +618,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         value.phase = engine?.session?.phase ?? (value.ready ? "No session" : "Unavailable")
         value.pending = engine?.pending?.kind.rawValue; value.expiresAtUnixMs = engine?.session?.expiresMs
         value.endComplete = engine?.session?.endComplete == true
-        let free = value.ready && cold.active && !cold.closed && !cold.busy && !cold.ending
+        let free = value.ready && cold.active && cold.foreground && !cold.closed && !cold.busy && !cold.ending
         let authenticated = (try? engine?.creatorEventsRequest(clock: clock())) != nil
         let idleCapture = !capturePrepared && !captureRunning && !captureStopping && binding == nil
         value.canSignIn = free && idleCapture && (login == nil || login?.cleanupComplete == true)
@@ -599,7 +654,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         }
     }
     private func finishClose() {
-        guard state().closed, slotClosed, binding == nil, (http == nil || http?.cleanupComplete == true),
+        guard state().closed, showLease == nil, slotClosed, binding == nil, (http == nil || http?.cleanupComplete == true),
               (login == nil || login?.cleanupComplete == true) else { return }
         retainedSelf = nil
     }

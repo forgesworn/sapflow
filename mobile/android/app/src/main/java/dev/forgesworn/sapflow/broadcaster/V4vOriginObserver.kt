@@ -48,9 +48,10 @@ internal class V4vOriginObserver(private val profile: V4vProfile,
     private val match: (V4vCapturedAttempt, V4vSessionReceipt) -> V4vMatchedMedia?,
     private val confirmed: (V4vCapturedAttempt, NativeOriginEvidence, Long) -> Unit,
     private val decoder: OriginDecoder = FiniteNativeOriginDecoder(),
-    private val resources: (V4vObservationPermit) -> OriginObservationResources = { PlatformObservationResources(profile, it) }) : AutoCloseable {
-    private class Job(val scope: V4vCapturedAttempt, val intent: CaptureIntent) {
-        val cancel = OriginProbeCancellation()
+    private val resources: (V4vObservationPermit) -> OriginObservationResources = { PlatformObservationResources(profile, it) },
+    private val nowNs: () -> Long = System::nanoTime) : AutoCloseable {
+    private class Job(val scope: V4vCapturedAttempt, val intent: CaptureIntent, nowNs: () -> Long) {
+        val cancel = OriginProbeCancellation(nowNs)
         val resources = AtomicReference<OriginObservationResources?>()
         val wake = CountDownLatch(1)
         val permitWaiter = AtomicReference<CountDownLatch?>()
@@ -79,7 +80,7 @@ internal class V4vOriginObserver(private val profile: V4vProfile,
     @Synchronized fun accepted(scope: V4vCapturedAttempt, intent: CaptureIntent) {
         if (closed.get() || owner.get()?.scope === scope || pending.get()?.scope === scope) return
         reported.set(scope.context); state.set("Playback has not been verified")
-        val job = Job(scope, intent) // Deadline starts at Accepted, not deferred cleanup completion.
+        val job = Job(scope, intent, nowNs) // Deadline starts at Accepted, not deferred cleanup completion.
         val old = owner.get()
         if (old != null) {
             pending.getAndSet(job)?.let(::cancelJob)
@@ -124,7 +125,7 @@ internal class V4vOriginObserver(private val profile: V4vProfile,
         if (job.retainedFailure != null) return // Keep actual uncertain wrappers alive; never admit a successor.
         val proof = job.result
         if (proof != null && !job.invalidated.get() && !closed.get() && current(job.scope) &&
-            System.nanoTime() < minOf(job.cancel.deadlineNs, job.authorityDeadline)) {
+            nowNs() < minOf(job.cancel.deadlineNs, job.authorityDeadline)) {
             runCatching { confirmed(job.scope, proof, minOf(job.cancel.deadlineNs, job.authorityDeadline)) }
                 .onSuccess { state.set("Origin ${if (proof.video == null) "audio" else "video and audio"} decoded · ${proof.audio.codec} software=${proof.audio.software} native AAC · PCM ${proof.audio.decodedBytes}B pts=${proof.audio.firstPtsUs}..${proof.audio.lastPtsUs}us") }
                 .onFailure { state.set("Playback has not been verified") }

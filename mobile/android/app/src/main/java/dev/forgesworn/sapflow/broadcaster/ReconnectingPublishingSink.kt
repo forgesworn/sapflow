@@ -21,6 +21,11 @@ internal class ReconnectingPublishingSink(
     private val graceMs: Long = 90_000,
     private val observationGate: ObservationLinearisation = ObservationLinearisation(),
     private val observationChanged: (PublishingAttemptContext, Boolean) -> Unit = { _, _ -> },
+    // Production supplies BOOTTIME; pure host tests retain their injected domain.
+    private val authorityNowNs: () -> Long = System::nanoTime,
+    /** Optional exact logical-grant fence. One atomic deadline read plus clock;
+     * no callback dispatch, FFI, IO, sample copy or allocation on a valid sample. */
+    private val sampleAuthority: PublishingAuthority? = null,
     private val factory: PublishingAttemptContext.((PublishingAttemptEvent) -> Unit) -> EncodedSink,
 ) {
     init { require(graceMs in 0..3_600_000) }
@@ -37,9 +42,10 @@ internal class ReconnectingPublishingSink(
     private data class Observation(val context: PublishingAttemptContext, val valid: () -> Boolean)
     private val observation = AtomicReference<Observation?>()
     private val observationPosted = AtomicBoolean(false)
+    private val authorityPosted = AtomicBoolean(false)
     private var alarm: ScheduledFuture<*>? = null // Control owner only.
     private val epochs = java.util.concurrent.ConcurrentHashMap<Long, Epoch>()
-    private val controller: ReconnectController by lazy { ReconnectController(policyFactory?.invoke() ?: NativePolicy(graceMs), System::nanoTime, { !fenced.get() },
+    private val controller: ReconnectController by lazy { ReconnectController(policyFactory?.invoke() ?: NativePolicy(graceMs), authorityNowNs, { !fenced.get() },
         factory = attempt@{ epoch, token, sdk ->
             val owner = epochs[epoch]
             if (owner == null || owner.closed.get() || fenced.get()) return@attempt object : PublishingAttempt {
@@ -161,7 +167,7 @@ internal class ReconnectingPublishingSink(
     private fun arm() {
         alarm?.cancel(false); alarm = null
         controller.nextWakeNs?.let { at ->
-            alarm = executor.schedule({ runControl { controller.tick() } }, (at - System.nanoTime()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
+            alarm = executor.schedule({ runControl { controller.tick() } }, (at - authorityNowNs()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
         }
     }
     fun stopDestination() {
@@ -205,10 +211,19 @@ internal class ReconnectingPublishingSink(
         }
         override fun consume(sample: MediaSample) {
             if (!closed.get() && !fenced.get()) current.get()?.takeIf { it.epoch === this }?.let {
+                // Timers may not execute during suspend. Validate BOOTTIME here
+                // before the first resumed AAC can reach any transport owner.
+                try { sampleAuthority?.requireValid() }
+                catch (error: Exception) { stopDestination(); throw error }
                 try { it.sink.consume(sample) } catch (_: Exception) { it.report(PublishingAttemptEvent.Failed()) }
             }
         }
         override fun stopDestination() = this@ReconnectingPublishingSink.stopDestination()
+        override fun revalidateAuthority() {
+            if (authorityPosted.compareAndSet(false, true)) post {
+                try { controller.tick() } finally { authorityPosted.set(false) }
+            }
+        }
         override fun close() {
             observationGate.withGate { closed.set(true) }
             current.get()?.takeIf { it.epoch === this }?.let { notifyObservation(it.context, false) }

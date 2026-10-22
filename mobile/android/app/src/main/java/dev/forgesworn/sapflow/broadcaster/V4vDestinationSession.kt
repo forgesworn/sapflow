@@ -15,7 +15,8 @@ internal data class V4vView(val message: String, val eventId: String?, val phase
  * A save failure permanently fences this instance; an uncertain HTTP result retains exactly its saved operation. */
 internal class V4vSessionEngine(private val profile: V4vProfile, private val api: V4vApi,
     private val store: V4vJournalStore, private val clock: () -> Long, private val nonce: () -> String,
-    private val fencePublisher: () -> Unit, private val committedGrant: (V4vGrant) -> Unit = {}) {
+    private val fencePublisher: () -> Unit, private val committedGrant: (V4vGrant) -> Unit = {},
+    private val authorityNowNs: () -> Long = System::nanoTime) {
     private var document: JsonObject = store.load()?.also(::validateDocument) ?: buildJsonObject {
         put("version", 1); put("apiOrigin", profile.apiOrigin); put("clockFloorMs", 0)
     }
@@ -127,7 +128,7 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
             if (prior != null && op.kind != V4vOperationKind.PREPARE) require(receipt.identity.sameSession(prior.identity) && receipt.identity.revision >= prior.identity.revision)
             val grantJson = answer["grant"] as? JsonObject
             if (grantJson != null) {
-                val grant = V4vGrant.read(grantJson, now); require(grant.identity == receipt.identity)
+                val grant = V4vGrant.read(grantJson, now, authorityNowNs()); require(grant.identity == receipt.identity)
                 (document["grant"] as? JsonObject)?.takeIf { op.kind == V4vOperationKind.REFRESH }?.let { old ->
                     require(with(V4vJson) { grantJson.number("expiresAtUnixMs") >= old.number("expiresAtUnixMs") })
                     for (key in listOf("endpoint", "streamId", "encryption", "limits", "reconnectGraceMs", "destination", "transport")) require(old[key] == grantJson[key])
@@ -136,7 +137,7 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
             save("session" to receipt.raw, "pending" to null, "grant" to if (terminalIntent || op.kind in setOf(V4vOperationKind.END, V4vOperationKind.ACKNOWLEDGE)) null else grantJson)
             if (grantJson != null && !terminalIntent && op.kind in setOf(V4vOperationKind.PREPARE, V4vOperationKind.REFRESH)) {
                 restoredRequiresRefresh = false
-                committedGrant(V4vGrant.read(grantJson, now))
+                committedGrant(V4vGrant.read(grantJson, now, authorityNowNs()))
             }
             retryAt = Long.MAX_VALUE; failures = 0; statusAt = now + 5000
             message = when { receipt.endComplete -> "V4V End completed"; receipt.recoveryState != null -> "Recording failure acknowledged · explicit Prepare required"; terminalIntent -> "V4V End pending confirmation"; grantJson != null -> "V4V grant prepared · explicit capture Start required"; else -> "V4V operation confirmed without a publishing grant" }
@@ -163,12 +164,12 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
     fun observationPermit(identity: V4vIdentity): V4vObservationPermit {
         val grant = captureGrant()
         require(identity.sameSession(grant.identity) && grant.identity.revision >= identity.revision)
-        val deadline = minOf(grant.expiresAtMonotonicNs, System.nanoTime() + (bearerExpiry - now).coerceAtLeast(0) * 1_000_000)
-        return V4vObservationPermit(grant.identity, authenticated(), deadline)
+        val deadline = minOf(grant.expiresAtMonotonicNs, Math.addExact(authorityNowNs(), Math.multiplyExact((bearerExpiry - now).coerceAtLeast(0), 1_000_000)))
+        return V4vObservationPermit(grant.identity, authenticated(), deadline, authorityNowNs)
     }
     fun captureGrant(): V4vGrant {
         authenticated(); check(!restoredRequiresRefresh) { "Refresh the restored V4V grant before capture" }; check(!terminalIntent && operation() == null)
-        val grant = V4vGrant.read(checkNotNull(document["grant"] as? JsonObject), now)
+        val grant = V4vGrant.read(checkNotNull(document["grant"] as? JsonObject), now, authorityNowNs())
         require(session?.identity == grant.identity && session?.phase == "active" && grant.expiresMs > now) { "V4V grant expired" }
         return grant
     }

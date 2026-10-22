@@ -101,7 +101,8 @@ final class V4vObservationSlot {
         cancelPendingTimer()
         guard let captured = pending else { return }
         let timer = DispatchSource.makeTimerSource(queue: owner)
-        timer.schedule(deadline: DispatchTime(uptimeNanoseconds: captured.deadlineNs))
+        let remaining = AudioShowLifecycle.remaining(deadline: captured.deadlineNs, now: clock().monotonicNs)
+        timer.schedule(deadline: .now() + .nanoseconds(Int(min(remaining, 8_000_000_000))))
         timer.setEventHandler { [weak self] in
             guard let self, self.pending?.attempt == captured.attempt else { return }
             self.pending = nil; self.cancelPendingTimer(); self.discard(captured, reason: .deadline)

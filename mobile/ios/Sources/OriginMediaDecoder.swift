@@ -77,6 +77,8 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
     private var job: Job?
     private var closed = false
     private let cleanup = OriginCleanupNotification()
+    private let now: () -> UInt64
+    init(now: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) { self.now = now }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return job == nil }
     func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func decode(_ data: Data, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
@@ -85,12 +87,12 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
     func decode(_ data: Data, expectedMedia: OriginExpectedMedia, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
         lock.lock()
         guard !closed, job == nil else { let error: OriginObservationFailure = closed ? .cancelled : .busy; lock.unlock(); completion(.failure(error)); return }
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = self.now()
         guard !data.isEmpty, data.count <= OriginMediaBody.totalLimit, deadlineNs > now, deadlineNs - now <= 3_000_000_000 else { lock.unlock(); completion(.failure(.bounds)); return }
         if expectedMedia.hasVideo {
             guard #available(iOS 17, macOS 12, *) else { lock.unlock(); completion(.failure(.unsupported)); return }
         }
-        let current = Job(expectedMedia: expectedMedia, deadline: deadlineNs, completion: completion); job = current; lock.unlock()
+        let current = Job(expectedMedia: expectedMedia, deadline: deadlineNs, now: self.now, completion: completion); job = current; lock.unlock()
         current.startDeadline()
         Task.detached(priority: .utility) { [self, current] in
             let result: Result<OriginDecodedMedia, OriginObservationFailure>
@@ -120,6 +122,7 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
     private final class Job: @unchecked Sendable {
         private let lock = NSLock()
         private let deadline: UInt64
+        private let now: () -> UInt64
         private let expectedMedia: OriginExpectedMedia
         private var callback: ((Result<OriginDecodedMedia, OriginObservationFailure>) -> Void)?
         private var timer: DispatchSourceTimer?
@@ -133,20 +136,22 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
         private var videoCount = 0
         private var videoPTS: CMTime?
         private var pcm: OriginPCMProgress
-        init(expectedMedia: OriginExpectedMedia, deadline: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
-            self.expectedMedia = expectedMedia; self.deadline = deadline; callback = completion
+        init(expectedMedia: OriginExpectedMedia, deadline: UInt64, now: @escaping () -> UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
+            self.expectedMedia = expectedMedia; self.deadline = deadline; self.now = now; callback = completion
             pcm = OriginPCMProgress(requireContiguous: expectedMedia == .audioOnly48kMono)
         }
         func startDeadline() {
             let next = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "sapflow.origin.decode.deadline"))
-            next.schedule(deadline: DispatchTime(uptimeNanoseconds: deadline))
+            let instant = now()
+            let remaining = deadline > instant ? deadline - instant : 0
+            next.schedule(deadline: .now() + .nanoseconds(Int(min(remaining, 3_000_000_000))))
             next.setEventHandler { [weak self] in self?.cancel(.deadline) }
             lock.withLock { timer = next }; next.resume()
         }
         func check() throws {
             try lock.withLock {
                 if let failure { throw failure }
-                guard DispatchTime.now().uptimeNanoseconds < deadline else { throw OriginObservationFailure.deadline }
+                guard now() < deadline else { throw OriginObservationFailure.deadline }
             }
         }
         func report(_ result: Result<OriginDecodedMedia, OriginObservationFailure>) {

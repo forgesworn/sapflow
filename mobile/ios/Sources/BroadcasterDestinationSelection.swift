@@ -43,4 +43,7 @@ final class BroadcasterDestinationSelection {
     func stop() {
         let end = endManual; endManual = nil; preparation = nil; end?()
     }
+    func stop(preparation ticket: CaptureAdmission.Preparation) {
+        guard preparation == ticket else { return }; stop()
+    }
 }

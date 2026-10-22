@@ -122,19 +122,24 @@ followed by the path and the three expected routing values.
 
 The complete normal application currently passes unsigned Debug, Qualification
 and Release builds with both real packages and warnings treated as errors.
-Built-property-list checks verify default Debug, enabled example Qualification
-and disabled ordinary Release despite supplied qualification settings. The
-iOS unit-test bundle also compiles and links. These are compiler/configuration
-gates; no test runner, phone, signer, account or capture is exercised by them.
+Built-property-list checks verify that the retained Debug, Qualification and
+Release outputs are all connector-disabled. The separate configuration suite
+checks enabled routing validation without claiming that this retained
+Qualification app is enabled. The iOS unit-test bundle also compiles and links.
+These are compiler/configuration gates; no test runner, phone, signer, account
+or capture is exercised by them.
 
 ## Capture and ownership
 
 The capture-control queue owns session configuration and state. A separate
 serial sample queue receives native camera buffers and microphone PCM. The
 raw media never crosses FFI. Camera preview uses AVCaptureVideoPreviewLayer.
-The app keeps the screen awake during an active run; an explicit phone lock,
-background transition or capture/audio interruption ends the current run.
-There is no background-camera claim or silent capture resumption.
+The app keeps the screen awake during an active video run. Lock/background ends
+video and any audio-only show whose Start has not committed. An explicitly
+opted-in, already committed audio-only show may continue under the declared
+`audio` background mode while its authorised transport connects or reconnects;
+it never starts or resumes capture silently. Capture/audio
+interruption still ends the exact run. There is no background-camera claim.
 
 Choose capture quality before Prepare. The ordinary picker offers native
 640×480 at 600 kbit/s video, or the default 1280×720 at 2.5 Mbit/s video.
@@ -742,5 +747,6 @@ pinning, and late verification cannot reopen a closed or newer owner.
 The active microphone label is separate from the selected preference. Bluetooth
 and other routes outside this built-in/wired/USB profile are unsupported, even
 under Default. Actual USB microphones, hot-unplug, route callback timing and
-background/locked-screen behaviour remain physical B4R gates. See
-[audio-only mobile scope](audio-only-mobile.md#foreground-microphone-selection).
+physical background/locked-screen behaviour remain B4R gates. The implemented
+ownership and app-only Stop contract are described in the
+[audio-only mobile scope](audio-only-mobile.md#background-ownership-and-controls).

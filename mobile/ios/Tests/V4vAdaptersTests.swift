@@ -9,6 +9,52 @@ final class V4vFakeJournalKey: V4vJournalKeySource {
 }
 
 final class V4vAdaptersTests: XCTestCase {
+    func testShowLeaseWritesWhileKeySourceIsLockedAndReleasesExactlyItsOwner() throws {
+        let dir = try directory(), keys = V4vFakeJournalKey()
+        let store = try V4vEncryptedJournal(directory: dir, profile: V4vFixture.profile(), keys: keys)
+        try store.save(.object(["version": .integer(1)]))
+        let a = UUID(), b = UUID()
+        try store.acquireShowLease(owner: a)
+        XCTAssertNoThrow(try store.acquireShowLease(owner: a))
+        XCTAssertThrowsError(try store.acquireShowLease(owner: b))
+        keys.failed = true
+        store.releaseShowLease(owner: b)
+        let document = V4vJSON.object(["generated-locked-refresh": .integer(2)])
+        try store.save(document); XCTAssertEqual(try store.load(), document)
+        store.releaseShowLease(owner: a)
+        XCTAssertThrowsError(try store.save(.object(["after-cleanup": .integer(3)])))
+        XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent("session.v1.sealed")).isEmpty, false)
+    }
+    func testLeaseCannotCreateOrRepairJournalAndIsNotRestoredIntoAnotherOwner() throws {
+        let dir = try directory(), keys = V4vFakeJournalKey(), profile = try V4vFixture.profile()
+        var store: V4vEncryptedJournal? = try V4vEncryptedJournal(directory: dir, profile: profile, keys: keys)
+        XCTAssertThrowsError(try XCTUnwrap(store).acquireShowLease(owner: UUID()))
+        XCTAssertNil(keys.key); XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+        try XCTUnwrap(store).save(.object(["generated": .bool(true)]))
+        try XCTUnwrap(store).acquireShowLease(owner: UUID())
+        store = nil; keys.failed = true
+        let restored = try V4vEncryptedJournal(directory: dir, profile: profile, keys: keys)
+        XCTAssertThrowsError(try restored.load())
+        XCTAssertThrowsError(try restored.acquireShowLease(owner: UUID()))
+    }
+    func testOldLeaseReleaseCannotReleaseSuccessorLeaseOrUnlockSignerJournal() throws {
+        let keys = V4vFakeJournalKey(), profile = try V4vFixture.profile()
+        let publishing = try V4vEncryptedJournal(directory: directory(), profile: profile, keys: keys)
+        try publishing.save(.object(["publish": .bool(true)]))
+        // A separate generated key source reflects the separate production
+        // signer Keychain service, without accessing any real Keychain.
+        let signerKeys = V4vFakeJournalKey()
+        let signer = try V4vEncryptedJournal(directory: directory(), profile: profile, keys: signerKeys)
+        try signer.save(.object(["signer": .bool(true)]))
+        let old = UUID(), current = UUID()
+        try publishing.acquireShowLease(owner: old); publishing.releaseShowLease(owner: old)
+        try publishing.acquireShowLease(owner: current); keys.failed = true; signerKeys.failed = true
+        publishing.releaseShowLease(owner: old)
+        XCTAssertNoThrow(try publishing.save(.object(["refresh": .integer(2)])))
+        XCTAssertThrowsError(try signer.save(.object(["unexpected-sign-in": .bool(true)])))
+        publishing.releaseShowLease(owner: current)
+        XCTAssertThrowsError(try publishing.load())
+    }
     private func directory() throws -> URL {
         // Only this test's generated files, never a user's Keychain/app files.
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("sapflow-v4v-test-" + UUID().uuidString)

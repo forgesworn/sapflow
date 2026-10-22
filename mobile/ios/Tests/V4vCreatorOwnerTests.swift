@@ -2,9 +2,12 @@ import XCTest
 import Sapflow
 @testable import SapflowBroadcaster
 
-private final class CreatorJournal: V4vJournalStore {
+private final class CreatorJournal: V4vJournalStore, V4vJournalShowLeasing {
     var document: V4vJSON?
     var failSave = false
+    var leased: UUID?, leaseAcquires = 0, leaseReleases = 0
+    func acquireShowLease(owner: UUID) throws { guard leased == nil else { throw V4vFailure.busy }; leased = owner; leaseAcquires += 1 }
+    func releaseShowLease(owner: UUID) { guard leased == owner else { return }; leased = nil; leaseReleases += 1 }
     func load() throws -> V4vJSON? { document }
     func save(_ document: V4vJSON) throws { if failSave { throw V4vFailure.journal }; self.document = document }
 }
@@ -30,8 +33,19 @@ private final class CreatorCapture: V4vCreatorCapturePort {
     var holdAttach = false
     var beforeAttachCompletion: (() -> Void)?
     var ticket: CaptureAdmission.Preparation?
+    private var onCleanup: (() -> Void)?
+    func whenCleanupComplete(_ ticket: CaptureAdmission.Preparation, completion: @escaping () -> Void) {
+        if admission.ownsPreparation(ticket) { XCTAssertNil(onCleanup); onCleanup = completion } else { completion() }
+    }
+    func completedActualCleanup() {
+        let stop = admission.stop(); guard admission.completeStop(stop, cleanupComplete: true) else { return }
+        let callback = onCleanup; onCleanup = nil; callback?()
+    }
     func reservePreparation(profile: CaptureIntent) -> CaptureAdmission.Preparation? { reservations += 1; ticket = admission.reservePreparation(profile: profile); return ticket }
-    func abandonPreparation(_ ticket: CaptureAdmission.Preparation) { admission.candidateClosed(ticket, cleanupComplete: true); admission.failed(ticket, cleanupComplete: true) }
+    func abandonPreparation(_ ticket: CaptureAdmission.Preparation) {
+        admission.candidateClosed(ticket, cleanupComplete: true); admission.failed(ticket, cleanupComplete: true)
+        if !admission.ownsPreparation(ticket) { let callback = onCleanup; onCleanup = nil; callback?() }
+    }
     func setDestination(_ sink: EncodedPublishingSink?, preparation: CaptureAdmission.Preparation, completion: @escaping (Bool) -> Void) {
         let result = admission.attached(preparation)
         if !result {
@@ -56,6 +70,10 @@ private final class CreatorCapture: V4vCreatorCapturePort {
         if let stop = admission.stopIfPending(ticket) { _ = admission.completeStop(stop, cleanupComplete: true) }
     }
     func stop() { globalStops += 1; _ = admission.stop() }
+    @discardableResult func stop(preparation: CaptureAdmission.Preparation) -> Bool {
+        guard admission.stop(preparation: preparation) != nil else { return false }
+        globalStops += 1; return true
+    }
 }
 private final class CreatorPublisher: V4vCreatorPublisher {
     var status = "Sending test fixture"
@@ -177,6 +195,62 @@ private final class CreatorFixture {
 }
 
 final class V4vCreatorOwnerTests: XCTestCase {
+    func testProductionStopActionCannotRetireSuccessorV4vPublisherInSameOwner() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()
+        XCTAssertTrue(f.owner.prepare(captureProfile: .audioOnly48kMono)); f.flush(); f.answer(.success(V4vFixture.answer()))
+        f.owner.captureChanged(prepared: true, running: false, stopping: false); f.flush()
+        XCTAssertTrue(f.owner.start()); f.flush()
+        let a = try XCTUnwrap(f.capture.ticket), action = AudioShowStopControl(preparation: a, admission: f.capture.admission)
+        func invoke() -> Bool {
+            action.stop(capture: { $0.perform(on: f.capture.admission) != nil },
+                        retirePublisher: { f.owner.captureStopped(preparation: $0) })
+        }
+        XCTAssertTrue(invoke()); f.flush(); f.capture.completedActualCleanup()
+        f.owner.captureChanged(prepared: false, running: false, stopping: false); f.flush()
+        XCTAssertTrue(f.owner.prepare(captureProfile: .audioOnly48kMono)); f.flush()
+        let b = try XCTUnwrap(f.capture.ticket); XCTAssertNotEqual(a, b)
+        XCTAssertEqual(f.publishers.count, 2); XCTAssertEqual(f.publishers[1].ends, 0)
+        XCTAssertFalse(invoke()); f.flush()
+        XCTAssertEqual(f.capture.admission.currentPreparation, b); XCTAssertEqual(f.publishers[1].ends, 0)
+    }
+    func testBackgroundLeaseRetainsExactOwnerUntilRecordingAndPublisherCleanup() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); try f.events()
+        XCTAssertTrue(f.capture.admission.selectBackgroundAudio(true))
+        XCTAssertTrue(f.owner.prepare(captureProfile: .audioOnly48kMono)); f.flush(); f.answer(.success(V4vFixture.answer()))
+        XCTAssertEqual(f.journal.leaseAcquires, 1); XCTAssertEqual(f.signerJournal.leaseAcquires, 0)
+        f.owner.captureChanged(prepared: true, running: false, stopping: false); f.flush()
+        XCTAssertTrue(f.owner.start()); f.flush(); XCTAssertEqual(f.capture.started, 1)
+        f.owner.captureChanged(prepared: false, running: true, stopping: false); f.flush()
+        let ticket = try XCTUnwrap(f.capture.ticket)
+        XCTAssertEqual(f.capture.admission.visibilityChanged(foreground: false).continuing, ticket)
+        XCTAssertTrue(f.owner.setSceneForeground(false, continuing: ticket))
+        XCTAssertFalse(f.owner.signIn(bunkerURI: "bunker://generated")); XCTAssertFalse(f.owner.prepare())
+        f.publishers[0].autoClose = false
+        weak var retained = f.owner
+        f.owner.close(); f.flush(); f.queue.sync { f.client?.closed() }; f.flush()
+        f.owner = nil; f.flush()
+        XCTAssertNotNil(retained); XCTAssertNotNil(f.journal.leased)
+        f.queue.sync { f.publishers[0].closed() }; f.flush()
+        XCTAssertNotNil(retained); XCTAssertEqual(f.journal.leaseReleases, 0)
+        f.capture.completedActualCleanup(); f.flush()
+        XCTAssertNil(f.journal.leased); XCTAssertEqual(f.journal.leaseReleases, 1); XCTAssertNil(retained)
+    }
+    func testBackgroundLeaseFactoryThrowAndCancelledPrepareReleaseOnlyActualCleanup() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()
+        XCTAssertTrue(f.capture.admission.selectBackgroundAudio(true)); f.publisherError = .unavailable
+        XCTAssertTrue(f.owner.prepare(captureProfile: .audioOnly48kMono)); f.flush(); f.answer(.success(V4vFixture.answer()))
+        XCTAssertEqual(f.journal.leaseAcquires, 1); XCTAssertEqual(f.journal.leaseReleases, 1)
+        f.publisherError = nil
+        XCTAssertTrue(f.owner.prepare(captureProfile: .audioOnly48kMono)); f.flush()
+        XCTAssertEqual(f.journal.leaseAcquires, 2)
+        let ticket = try XCTUnwrap(f.capture.ticket)
+        XCTAssertNotNil(f.capture.admission.visibilityChanged(foreground: false).stop)
+        XCTAssertFalse(f.owner.setSceneForeground(false, continuing: nil)); f.owner.setActive(false); f.flush()
+        XCTAssertEqual(f.journal.leaseReleases, 1)
+        XCTAssertNil(f.capture.admission.reserveStart(ticket))
+        f.capture.completedActualCleanup(); f.flush()
+        XCTAssertEqual(f.journal.leaseReleases, 2)
+    }
     func testBootAndReadsNeverSignOrCapture() throws {
         let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }
         XCTAssertTrue(f.last.ready); XCTAssertNil(f.login); XCTAssertEqual(f.capture.prepared, 0); XCTAssertTrue(f.calls.isEmpty)

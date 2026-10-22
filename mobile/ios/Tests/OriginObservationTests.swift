@@ -44,6 +44,27 @@ private enum OriginFixture {
 }
 
 final class OriginObservationPolicyTests: XCTestCase {
+    func testInjectedSleepSizedAuthorityJumpRefusesHTTPAndDecoderBeforeNativeWork() throws {
+        let base: UInt64 = 1_000_000, deadline = base + 3_000_000_000
+        let afterSleep = base + 120_000_000_000
+        let decoder = OriginMediaDecoder(now: { afterSleep })
+        var decoded = false
+        decoder.decode(Data([1]), expectedMedia: .audioOnly48kMono, deadlineNs: deadline) { result in
+            decoded = true; originAssertFailure(result)
+        }
+        XCTAssertTrue(decoded); XCTAssertTrue(decoder.cleanupComplete); decoder.close()
+        let selected = try OriginMediaSelection.match(OriginFixture.receipt(), attempt: OriginFixture.scope(), nowMs: V4vFixture.time)
+        let resources = try OriginApprovedResources(profile: V4vFixture.profile(), media: selected)
+        let http = OriginMediaHTTP(now: { afterSleep })
+        let refused = expectation(description: "expired before creating a network task")
+        let closed = expectation(description: "real URLSession invalidation")
+        http.whenCleanupComplete { closed.fulfill() }
+        http.fetch(resources, deadlineNs: deadline) { result in
+            guard case .failure(.deadline) = result else { XCTFail("Suspended deadline must not extend"); refused.fulfill(); return }
+            refused.fulfill()
+        }
+        wait(for: [refused], timeout: 2); http.close(); wait(for: [closed], timeout: 2)
+    }
     func testAudioOnlyNativeDescriptionRefusesContradictoryProfileAndFormat() throws {
         for flags in [UInt32(0), 2] {
             XCTAssertNoThrow(try OriginAACDescription.requireAudioOnly(formatID: kAudioFormatMPEG4AAC, objectFlags: flags, rate: 48000, channels: 1, framesPerPacket: 1024))
