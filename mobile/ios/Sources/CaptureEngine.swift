@@ -10,7 +10,7 @@ struct CaptureSnapshot {
     var level: Float = -60
     var encoded: UInt64 = 0
     var captureDrops: UInt64 = 0
-    var recordingURL: URL?
+    var recordingIOBusy = false
     var canStart = false
     var running = false
     var captureElapsedNs: UInt64?
@@ -23,21 +23,34 @@ extension CaptureEngine: V4vCreatorCapturePort {}
 final class CaptureRun {
     let profile: CaptureProfile
     let recorder: CompressedRecorder
+    let recordingTicket: RecordingCaptureAdmission.Ticket
     let worker: IngressWorker
     var video: HardwareVideoEncoder!
     var audio: NativeAudioEncoder!
     var epoch: CMTime?
-    var admitting = true
+    var admitting = false
     var startup: [(sample: CMSampleBuffer, video: Bool)] = []
     var startupBytes = 0
-    init(url: URL, orientation: CaptureOrientation, profile: CaptureProfile, ingress: RustEncodedIngress, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, recordingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
+    init(recorder: CompressedRecorder, recordingTicket: RecordingCaptureAdmission.Ticket, orientation: CaptureOrientation, profile: CaptureProfile, ingress: RustEncodedIngress, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
         self.profile = profile
-        recorder = try CompressedRecorder(url: url, onFailure: recordingFailure)
+        self.recorder = recorder; self.recordingTicket = recordingTicket
         worker = IngressWorker(ingress: ingress, failure: publishingFailure, statistics: statistics)
         let recorder = self.recorder; let worker = self.worker
         let output: (CompressedUnit) -> Void = { unit in recorder.offer(unit); worker.offer(unit) }
         video = try HardwareVideoEncoder(orientation: orientation, profile: profile, output: output, failure: failure)
         audio = try NativeAudioEncoder(output: output, meter: meter)
+    }
+}
+
+private final class RecordingRunStop {
+    let run: CaptureRun
+    let rotationToken: UInt64?
+    let rotation: CaptureAdmission.Rotation?
+    var publishing: Result<Void, Error>?
+    var recording: CompressedRecorder.Completion?
+    var completed = false
+    init(run: CaptureRun, rotationToken: UInt64?, rotation: CaptureAdmission.Rotation?) {
+        self.run = run; self.rotationToken = rotationToken; self.rotation = rotation
     }
 }
 
@@ -48,6 +61,15 @@ final class CaptureRun {
 final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     let session = AVCaptureSession()
     private let control = DispatchQueue(label: "sapflow.capture-control", qos: .userInitiated)
+    private let recordingIO = DispatchQueue(label: "sapflow.recording-io", qos: .utility)
+    private let recordingAdmission = RecordingCaptureAdmission()
+    private let recordingBindingLock = NSLock()
+    private var recordingBinding: (catalogue: RecordingCatalogue, admission: RecordingLibraryAdmission)?
+    private var recordingShow: (CaptureAdmission.Preparation, RecordingCatalogue.Show)? // control only
+    private var retainedRecorder: CompressedRecorder?
+    private var runStop: RecordingRunStop?
+    private var preparedPublisherClosed: (CaptureAdmission.Stop, Bool)?
+    private var storageCheckPending = false // one coalesced cold capacity query
     private let samples = DispatchQueue(label: "sapflow.capture-samples", qos: .userInteractive)
     private var run: CaptureRun? // samples queue only
     private var captureGeneration: UInt64 = 0 // control queue only
@@ -55,6 +77,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var configuredProfile: CaptureProfile? // control queue only
     private var orientationPlan = OrientationRestartPlan()
     private var rotationTimeout: DispatchWorkItem?
+    private var rotationDeadline: RecordingCaptureAdmission.RotationDeadline?
     private let admission = CaptureAdmission()
     private var preparedIntent: CaptureAdmission.Preparation? // control owner only
     private var rotationIntent: CaptureAdmission.Rotation?
@@ -86,6 +109,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 guard let self else { return }
                 if notification.name == AVAudioSession.routeChangeNotification && self.admission.currentPhase != .running { return }
                 let ticket = self.admission.stop()
+                self.recordingAdmission.cancel(ticket.preparation)
                 self.fencePublishing()
                 self.control.async {
                     guard self.admission.permitsStop(ticket) else { return }
@@ -99,13 +123,37 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     /// Attach a real bounded destination adapter before preparing. No endpoint
     /// or credential is inferred from a display label or bundled configuration.
-    var canChooseCaptureProfile: Bool { admission.canChooseCaptureProfile }
-    func reservePreparation(profile: CaptureProfile = .defaultProfile) -> CaptureAdmission.Preparation? { admission.reservePreparation(profile: profile) }
+    private var recordings: (catalogue: RecordingCatalogue, admission: RecordingLibraryAdmission)? {
+        recordingBindingLock.lock(); defer { recordingBindingLock.unlock() }; return recordingBinding
+    }
+    var canChooseCaptureProfile: Bool { recordings != nil && admission.canChooseCaptureProfile && !recordingAdmission.hasOwner }
+    var canReservePreparation: Bool { canChooseCaptureProfile }
+    /// Root installs the same app-owned catalogue used by the library. No file
+    /// work is performed here, and a second instance is never silently opened.
+    func setRecordingCatalogue(_ catalogue: RecordingCatalogue, admission gate: RecordingLibraryAdmission,
+                               completion: @escaping (Bool) -> Void) {
+        control.async {
+            guard self.admission.canChooseCaptureProfile, !self.recordingAdmission.hasOwner, !catalogue.cleanupUncertain else { completion(false); return }
+            self.recordingBindingLock.lock()
+            let accepted = self.recordingBinding == nil
+            if accepted { self.recordingBinding = (catalogue, gate) }
+            self.recordingBindingLock.unlock()
+            completion(accepted)
+        }
+    }
+    func reservePreparation(profile: CaptureProfile = .defaultProfile) -> CaptureAdmission.Preparation? {
+        guard let binding = recordings else { return nil }
+        return binding.admission.withCaptureReservation {
+            guard !self.recordingAdmission.hasOwner else { return nil }
+            return self.admission.reservePreparation(profile: profile)
+        }
+    }
     /// The destination owner separately fences its captured publisher. This
     /// exact camera fence cancels initial approval without stopping a recording
     /// that already began, including its later orientation epochs.
     func cancelPendingPreparation(_ preparation: CaptureAdmission.Preparation) {
         guard let ticket = admission.stopIfPending(preparation) else { return }
+        recordingAdmission.cancel(preparation)
         control.async {
             guard self.admission.permitsStop(ticket) else { return }
             self.stopIntent = ticket
@@ -176,18 +224,23 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 guard let intent = self.preparedIntent, let child = self.admission.beginRotation(intent) else {
                     self.orientationPlan.cancel(); return
                 }
+                guard let deadline = RecordingCaptureAdmission.RotationDeadline(preparation: intent, nowNs: DispatchTime.now().uptimeNanoseconds) else {
+                    self.stopOnControl(reason: "Rotation deadline could not be established."); return
+                }
+                self.rotationDeadline = deadline
                 self.rotationIntent = child
                 let timeout = DispatchWorkItem { [weak self] in
                     guard let self, self.orientationPlan.pending == token else { return }
                     self.orientationPlan.cancel(); self.rotationTimeout = nil
-                    self.stopIntent = self.admission.stop(); self.rotationIntent = nil
+                    self.stopIntent = self.admission.stop(); self.recordingAdmission.cancel(self.stopIntent?.preparation); self.rotationIntent = nil
                     self.fencePublishing()
                     self.stopReason = "Rotation finalisation timed out; automatic restart cancelled."
                     self.snapshot.detail = "Rotation finalisation exceeded six seconds. Automatic restart cancelled; cleanup may still finish."
                     self.publish()
+                    self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.")
                 }
                 self.rotationTimeout = timeout
-                self.control.asyncAfter(deadline: .now() + 6, execute: timeout)
+                self.control.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: deadline.deadlineNs), execute: timeout)
                 self.stopOnControl(reason: nil)
             } else if !self.stopping && !self.snapshot.running {
                 guard self.admission.currentPhase != .stopping, self.admission.currentPhase != .retained else { return }
@@ -233,21 +286,19 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
     private func restartForOrientation(_ child: CaptureAdmission.Rotation) {
         guard admission.permitsRotation(child) else { return }
+        guard rotationDeadline?.permits(child.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
+            stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled."); return
+        }
         do {
             guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized,
                   AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
                 throw CaptureFailure(message: "Capture permission changed; prepare again")
             }
-            try checkStorage()
-            try applyOrientation()
-            try AVAudioSession.sharedInstance().setActive(true)
-            setSampleDelivery(true)
-            session.startRunning()
             guard let start = admission.reserveRotationStart(child) else { return }
             snapshot.canStart = true
             startOnControl(start, keepSavedSegment: true)
             if snapshot.running {
-                snapshot.detail = "\(orientationDescription). Rotation began a new recording segment; active publishing reconnects. The previous segment remains in Files."
+                snapshot.detail = "\(orientationDescription). Rotation began a new recording segment; active publishing reconnects. The previous segment is retained in the private recording library."
                 publish()
             }
         } catch { stopOnControl(reason: error.localizedDescription) }
@@ -276,8 +327,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 guard camera && microphone else {
                     self.stopOnControl(reason: "Camera and microphone permission are required. Enable them in Settings."); return
                 }
-                do {
-                    try self.checkStorage()
+                self.preflightRecording(ticket) {
+                  do {
+                    guard self.admission.permitsPreparation(ticket), self.preparedIntent == ticket else { return }
                     let audio = AVAudioSession.sharedInstance()
                     try audio.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .allowBluetooth])
                     try audio.setPreferredSampleRate(48_000)
@@ -292,7 +344,28 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     self.snapshot.canStart = true
                     self.snapshot.publisher = self.ingress.status
                     self.publish()
-                } catch { self.stopOnControl(reason: error.localizedDescription) }
+                  } catch { self.stopOnControl(reason: error.localizedDescription) }
+                }
+            }
+        }
+    }
+    private func preflightRecording(_ preparation: CaptureAdmission.Preparation, completion: @escaping () -> Void) {
+        guard let binding = recordings, let work = recordingAdmission.begin(.preflight(preparation)) else {
+            stopOnControl(reason: "Recording storage is unavailable or still closing."); return
+        }
+        snapshot.detail = "Checking recording storage."; publish()
+        recordingIO.async {
+            var failure: Error?
+            if self.recordingAdmission.permits(work), self.admission.permitsPreparation(preparation) {
+                do { try binding.catalogue.checkRecordingCapacity(); try self.checkStorage(binding.catalogue, profile: preparation.profile) } catch { failure = error }
+            }
+            let observedFailure = failure
+            self.control.async {
+                let allowed = self.recordingAdmission.permits(work) && self.admission.permitsPreparation(preparation)
+                self.recordingAdmission.closed(work, cleanupComplete: !binding.catalogue.cleanupUncertain)
+                if !allowed { self.finishPreparedStopIfReady(); return }
+                if let observedFailure { self.stopOnControl(reason: "Recording storage preflight failed: \(observedFailure.localizedDescription)") }
+                else { completion() }
             }
         }
     }
@@ -338,17 +411,101 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
     private func startOnControl(_ ticket: CaptureAdmission.Start, keepSavedSegment: Bool = false) {
         guard admission.permitsStart(ticket), preparedIntent == ticket.preparation,
-              self.snapshot.canStart, !self.snapshot.running, !self.stopping else { return }
+              snapshot.canStart, !snapshot.running, !stopping else { return }
+        guard !keepSavedSegment || rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
+            stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled."); return
+        }
+        guard let binding = recordings, let work = recordingAdmission.begin(.segment(ticket)) else {
+            stopOnControl(reason: "Recording storage is unavailable or still closing."); return
+        }
+        let previousShow = recordingShow?.0 == ticket.preparation ? recordingShow?.1 : nil
+        let deadline = keepSavedSegment ? rotationDeadline : nil
+        snapshot.phase = "Starting"; snapshot.canStart = false
+        snapshot.detail = "Preparing the private recording segment."; publish()
+        recordingIO.async {
+            var recorder: CompressedRecorder?
+            var show: RecordingCatalogue.Show?
+            var failure: Error?
+            var receipt: RecordingCatalogue.Writer?
+            do {
+                guard self.recordingAdmission.permits(work), self.admission.permitsStart(ticket),
+                      deadline.map({ $0.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) }) ?? true else {
+                    self.control.async {
+                        self.recordingAdmission.closed(work, cleanupComplete: true)
+                        if self.admission.permitsStart(ticket) { self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.") }
+                        else { self.finishPreparedStopIfReady() }
+                    }; return
+                }
+                try binding.catalogue.checkRecordingCapacity()
+                try self.checkStorage(binding.catalogue, profile: ticket.preparation.profile)
+                guard self.recordingAdmission.permits(work), self.admission.permitsStart(ticket),
+                      deadline.map({ $0.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) }) ?? true else {
+                    self.control.async {
+                        self.recordingAdmission.closed(work, cleanupComplete: true)
+                        if self.admission.permitsStart(ticket) { self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.") }
+                        else { self.finishPreparedStopIfReady() }
+                    }; return
+                }
+                let selected = previousShow ?? binding.catalogue.newShow(profile: ticket.preparation.profile)
+                show = selected
+                let created = try binding.catalogue.begin(identity: selected.nextIdentity())
+                receipt = created
+                recorder = try CompressedRecorder(receipt: created, queue: self.recordingIO) { [weak self] error in
+                    self?.control.async {
+                        guard let self, self.preparedIntent == ticket.preparation, self.recordingAdmission.contains(work) else { return }
+                        self.recordingFailureDescription = error.localizedDescription
+                        self.snapshot.detail = "Recording stopped early: \(error.localizedDescription)"; self.publish()
+                    }
+                }
+            } catch {
+                failure = error
+                if let receipt { receipt.cancel(); do { try receipt.ownersClosed() } catch { receipt.retainUncertainCleanup() } }
+            }
+            let readyRecorder = recorder; let readyShow = show
+            let ownedReceipt = receipt; let creationFailure = failure
+            self.control.async {
+                guard let recorder = readyRecorder, let show = readyShow else {
+                    let clean = ownedReceipt?.cleanupComplete ?? !binding.catalogue.cleanupUncertain
+                    self.recordingAdmission.closed(work, cleanupComplete: clean)
+                    if self.admission.permitsStart(ticket) { self.stopOnControl(reason: creationFailure.map { "Recording could not be created: \($0.localizedDescription)" } ?? "Recording could not be created.") }
+                    else { self.finishPreparedStopIfReady() }
+                    return
+                }
+                guard self.admission.permitsStart(ticket), self.recordingAdmission.permits(work) else {
+                    self.closeRejectedRecorder(recorder, work: work); return
+                }
+                self.recordingShow = (ticket.preparation, show)
+                self.snapshot.canStart = true
+                self.adoptRecording(recorder, work: work, ticket: ticket, keepSavedSegment: keepSavedSegment)
+            }
+        }
+    }
+    private func closeRejectedRecorder(_ recorder: CompressedRecorder, work: RecordingCaptureAdmission.Ticket) {
+        recordingAdmission.closing(work)
+        recorder.finish { result in self.control.async {
+            self.recordingAdmission.closed(work, cleanupComplete: result.cleanupComplete)
+            if !result.cleanupComplete { self.retainedRecorder = recorder }
+            self.finishPreparedStopIfReady()
+        } }
+    }
+    private func adoptRecording(_ recorder: CompressedRecorder, work: RecordingCaptureAdmission.Ticket, ticket: CaptureAdmission.Start, keepSavedSegment: Bool) {
+        guard admission.permitsStart(ticket), recordingAdmission.permits(work), preparedIntent == ticket.preparation,
+              snapshot.canStart, !snapshot.running, !stopping else { closeRejectedRecorder(recorder, work: work); return }
+        guard !keepSavedSegment || rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
+            closeRejectedRecorder(recorder, work: work)
+            stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled."); return
+        }
         self.captureGeneration &+= 1
         let captureToken = self.captureGeneration
+        var constructedRun: CaptureRun?
         do {
-            try self.checkStorage()
-            let folder = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            let url = folder.appendingPathComponent("Sapflow-\(UUID().uuidString).mov")
+            if keepSavedSegment { try self.applyOrientation() }
             self.ingress.reset()
             self.recordingFailureDescription = nil
-            let run = try CaptureRun(url: url, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress,
-                failure: { [weak self] error in self?.control.async {
+            let run = try CaptureRun(recorder: recorder, recordingTicket: work, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress,
+                failure: { [weak self] error in
+                    recorder.markIncomplete(error)
+                    self?.control.async {
                     guard self?.captureGeneration == captureToken, self?.preparedIntent == ticket.preparation else { return }
                     self?.stopOnControl(reason: error.localizedDescription)
                 } },
@@ -357,25 +514,60 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     self?.snapshot.publisher = "Publisher stopped: \(error.localizedDescription)"
                     self?.snapshot.detail = "Local recording continues. Stop and prepare again to restart publishing."
                     self?.publish()
-                } }, recordingFailure: { [weak self] error in self?.control.async {
-                    guard self?.captureGeneration == captureToken, self?.preparedIntent == ticket.preparation else { return }
-                    self?.recordingFailureDescription = error.localizedDescription
-                    self?.snapshot.detail = "Recording failed: \(error.localizedDescription)"; self?.publish()
                 } }, statistics: { [weak self] count, status in self?.control.async {
                     guard self?.captureGeneration == captureToken, self?.preparedIntent == ticket.preparation else { return }
                     self?.snapshot.encoded = count; self?.snapshot.publisher = status; self?.publish()
                 } }, meter: { [weak self] level in self?.meter(level) })
+            constructedRun = run
             // Once native owners exist, even a winning synchronous Stop must
             // reach their actual worker/recorder cleanup path before admission.
+            guard self.admission.permitsStart(ticket),
+                  !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true,
+                  self.recordingAdmission.activate(work) else {
+                run.video.finish(); try? run.audio.finish()
+                self.closeRejectedRecorder(recorder, work: work)
+                if self.admission.permitsStart(ticket) { self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.") }
+                return
+            }
+            if keepSavedSegment {
+                try AVAudioSession.sharedInstance().setActive(true)
+                self.setSampleDelivery(true); self.session.startRunning()
+            }
+            guard self.admission.permitsStart(ticket), self.recordingAdmission.isActive(work),
+                  !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
+                run.video.finish(); try? run.audio.finish(); self.closeRejectedRecorder(recorder, work: work)
+                if self.admission.permitsStart(ticket) { self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.") }
+                return
+            }
+            var currentAtExposure = false
             run.worker.startPublishing {
-                self.samples.sync { self.run = run }
+                self.samples.sync {
+                    currentAtExposure = self.admission.permitsStart(ticket) &&
+                        (!keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true)
+                    // Register ownership even when cancellation won, so normal
+                    // Stop joins this worker's queued failure/close callbacks.
+                    // Media remains fenced until the exact Start commits.
+                    self.run = run
+                }
                 self.snapshot.running = true; self.snapshot.canStart = false
             }
-            guard self.admission.started(ticket, nowNs: DispatchTime.now().uptimeNanoseconds, broadcasting: self.ingress.destination != nil) else { self.stopOnControl(reason: nil); return }
+            let committedAt = DispatchTime.now().uptimeNanoseconds
+            guard currentAtExposure,
+                  !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: committedAt) == true else {
+                self.stopOnControl(reason: keepSavedSegment && self.admission.permitsStart(ticket) ? "Rotation finalisation timed out; automatic restart cancelled." : nil); return
+            }
+            guard self.admission.started(ticket, nowNs: committedAt, broadcasting: self.ingress.destination != nil) else { self.stopOnControl(reason: nil); return }
+            self.samples.sync {
+                if self.admission.currentPreparation == ticket.preparation, self.admission.currentPhase == .running { run.admitting = true }
+            }
+            guard self.admission.currentPreparation == ticket.preparation, self.admission.currentPhase == .running else { self.stopOnControl(reason: nil); return }
+            if keepSavedSegment, let token = self.orientationPlan.pending {
+                _ = self.orientationPlan.complete(token)
+                self.rotationTimeout?.cancel(); self.rotationTimeout = nil; self.rotationDeadline = nil
+            }
             self.beginTelemetry(ticket.preparation)
             self.snapshot.phase = "Recording"
-            self.snapshot.detail = "Hardware encoder: \(run.video.implementation). Saving compressed video and audio locally."
-            if !keepSavedSegment { self.snapshot.recordingURL = nil }
+            self.snapshot.detail = keepSavedSegment ? "Rotation began a new recording segment. Active publishing reconnects; the previous private segment is retained." : "Hardware encoder: \(run.video.implementation). Saving compressed video and audio locally."
             self.snapshot.encoded = 0; self.snapshot.captureDrops = 0; self.snapshot.level = -60
             self.snapshot.publisher = self.ingress.status
             self.publish()
@@ -383,7 +575,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             timer.schedule(deadline: .now() + 3, repeating: 5)
             timer.setEventHandler { [weak self] in
                 guard let self, self.captureGeneration == captureToken, self.preparedIntent == ticket.preparation else { return }
-                do { try self.checkStorage() } catch { self.stopOnControl(reason: error.localizedDescription) }
+                self.checkActiveStorage(run.recorder, work: run.recordingTicket, preparation: ticket.preparation, generation: captureToken)
                 self.samples.async {
                     if self.run?.epoch == nil { self.control.async {
                         guard self.captureGeneration == captureToken, self.preparedIntent == ticket.preparation else { return }
@@ -392,10 +584,15 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
             }
             self.storageTimer = timer; timer.resume()
-        } catch { self.fencePublishing(); self.stopOnControl(reason: error.localizedDescription) }
+        } catch {
+            constructedRun?.video.finish(); try? constructedRun?.audio.finish()
+            self.closeRejectedRecorder(recorder, work: work)
+            self.fencePublishing(); self.stopOnControl(reason: error.localizedDescription)
+        }
     }
     func stop() {
         let ticket = admission.stop()
+        recordingAdmission.cancel(ticket.preparation)
         fencePublishing() // synchronous admission fence precedes queued cleanup
         control.async {
             guard self.admission.permitsStop(ticket) else { return }
@@ -407,7 +604,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
     private func admissionStopped() {
-        stopping = false; preparedIntent = nil; stopIntent = nil
+        stopping = false; preparedIntent = nil; stopIntent = nil; recordingShow = nil; preparedPublisherClosed = nil; rotationDeadline = nil
         snapshot.phase = stopReason == nil ? "Stopped" : "Interrupted"
         snapshot.canStart = false
         publish()
@@ -417,7 +614,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let child = rotationIntent
         let rotationAllowed = reason == nil && child.map(admission.permitsRotation) == true && orientationPlan.pending != nil
         if !rotationAllowed {
-            stopIntent = admission.stop(); rotationIntent = nil
+            stopIntent = admission.stop(); recordingAdmission.cancel(stopIntent?.preparation); rotationIntent = nil
             orientationPlan.cancel()
             stopTelemetry()
         }
@@ -439,13 +636,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             let stopped = stopIntent ?? admission.stop()
             let finish = { self.control.async {
                 guard self.admission.permitsStop(stopped) else { return }
-                let clean = self.ingress.destination?.cleanupComplete != false
-                let released = self.admission.completeStop(stopped, cleanupComplete: clean)
-                if released { self.admissionStopped() }
-                else if self.admission.currentPhase == .retained {
-                    self.stopping = false; self.snapshot.phase = "Interrupted"
-                    self.snapshot.detail = "Publisher cleanup unconfirmed; Prepare is blocked."; self.publish()
-                }
+                self.preparedPublisherClosed = (stopped, self.ingress.destination?.cleanupComplete != false)
+                self.finishPreparedStopIfReady()
             } }
             if let destination = ingress.destination { destination.stop(completion: finish) } else { finish() }
             return
@@ -462,54 +654,108 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 self.snapshot.detail = "Capture cleanup unconfirmed; Prepare is blocked."; self.publish()
             }; return }
             self.run = nil
+            var flushFailed = false
             do { try run.audio.finish() } catch {
+                flushFailed = true
                 self.control.async { self.recordingFailureDescription = "AAC flush failed: \(error.localizedDescription)" }
             }
             run.video.finish()
-            run.worker.finish { publishingResult in
-                // A retained network owner blocks rotation, never file flush.
-                if case .failure = publishingResult {
-                    self.control.async {
-                        self.orientationPlan.cancel()
-                        self.stopReason = "Publisher cleanup unconfirmed; automatic restart blocked."
-                    }
-                }
-                run.recorder.finish { result in
-                    self.control.async {
-                        self.stopping = false
-                        let completedReason = self.stopReason
-                        self.snapshot.phase = completedReason == nil ? "Stopped" : "Interrupted"
-                        switch result {
-                        case let .success(url):
-                            self.snapshot.recordingURL = url
-                            self.snapshot.detail = completedReason ?? self.recordingFailureDescription.map { "Recording stopped early: \($0). Accepted prefix saved." } ?? "Recording saved. Export it below or from Files."
-                        case let .failure(error): self.snapshot.detail = "Recording finalisation failed: \(error.localizedDescription)"
-                        }
-                        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-                        self.rotationTimeout?.cancel(); self.rotationTimeout = nil
-                        if case .success = result, self.recordingFailureDescription == nil,
-                           case .success = publishingResult, let rotationToken, let child,
-                           self.admission.permitsRotation(child), self.orientationPlan.complete(rotationToken) != nil {
-                            self.rotationIntent = nil
-                            self.restartForOrientation(child)
-                        } else {
-                            self.orientationPlan.cancel(); self.rotationIntent = nil
-                            let stopped = self.stopIntent ?? self.admission.stop()
-                            let clean: Bool
-                            if case .success = publishingResult { clean = self.ingress.destination?.cleanupComplete != false } else { clean = false }
-                            _ = self.admission.completeStop(stopped, cleanupComplete: clean)
-                            if self.admission.currentPhase == .idle { self.preparedIntent = nil; self.stopIntent = nil }
-                            self.publish()
-                        }
-                    }
-                }
-            }
+            self.recordingAdmission.closing(run.recordingTicket)
+            let state = RecordingRunStop(run: run, rotationToken: rotationToken, rotation: child)
+            self.control.async { self.runStop = state }
+            // File finalisation must not wait behind network cleanup. Both real
+            // receipts join before rotation or a new capture can be admitted.
+            run.recorder.finish(incomplete: flushFailed) { result in self.control.async {
+                state.recording = result
+                self.recordingAdmission.closed(run.recordingTicket, cleanupComplete: result.cleanupComplete)
+                if !result.cleanupComplete { self.retainedRecorder = run.recorder }
+                self.finishRunStopIfReady(state)
+            } }
+            run.worker.finish { result in self.control.async {
+                state.publishing = result
+                self.finishRunStopIfReady(state)
+            } }
         }
     }
-    private func checkStorage() throws {
-        let folder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let available = try folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
-        guard available > 200 * 1024 * 1024 else { throw CaptureFailure(message: "Less than 200 MiB storage available. Free space before recording.") }
+    private func finishRunStopIfReady(_ state: RecordingRunStop) {
+        guard runStop === state, !state.completed, let recording = state.recording, let publishingResult = state.publishing else { return }
+        state.completed = true; stopping = false
+        let publishingClean: Bool
+        if case .success = publishingResult { publishingClean = ingress.destination?.cleanupComplete != false }
+        else { publishingClean = false }
+        let clean = recording.cleanupComplete && publishingClean && !recordingAdmission.hasOwner
+        if !publishingClean { stopReason = "Publisher cleanup unconfirmed; automatic restart blocked." }
+        snapshot.phase = stopReason == nil ? "Stopped" : "Interrupted"
+        if !recording.cleanupComplete { snapshot.detail = "Recording cleanup unconfirmed; Prepare is blocked." }
+        else if recording.finalised { snapshot.detail = stopReason ?? "Recording finalised. It has not been independently decoded." }
+        else { snapshot.detail = "Recording is incomplete. The private original was retained for inspection." }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        if clean, recording.finalised, recordingFailureDescription == nil,
+           let token = state.rotationToken, let child = state.rotation,
+           admission.permitsRotation(child), orientationPlan.pending == token,
+           rotationDeadline?.permits(child.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true {
+            runStop = nil; rotationIntent = nil
+            restartForOrientation(child)
+        } else {
+            if state.rotationToken != nil, rotationDeadline?.permits(state.rotation?.preparation ?? state.run.recordingTicket.request.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) != true {
+                stopReason = "Rotation finalisation timed out; automatic restart cancelled."
+                snapshot.phase = "Interrupted"; snapshot.detail = stopReason!
+            }
+            rotationTimeout?.cancel(); rotationTimeout = nil; rotationDeadline = nil
+            orientationPlan.cancel(); rotationIntent = nil
+            let stopped = stopIntent ?? admission.stop()
+            _ = admission.completeStop(stopped, cleanupComplete: clean)
+            if admission.currentPhase == .idle { preparedIntent = nil; stopIntent = nil; recordingShow = nil; runStop = nil }
+            publish()
+        }
+    }
+    private func finishPreparedStopIfReady() {
+        guard let (stopped, publisherClean) = preparedPublisherClosed, admission.permitsStop(stopped) else { return }
+        guard !recordingAdmission.hasOwner else {
+            if recordingAdmission.cleanupRetained {
+                _ = admission.completeStop(stopped, cleanupComplete: false)
+                stopping = false; snapshot.phase = "Interrupted"
+                snapshot.detail = "Recording cleanup unconfirmed; Prepare is blocked."
+            } else { snapshot.detail = "Waiting for recording storage cleanup." }
+            publish(); return
+        }
+        let clean = publisherClean && recordings?.catalogue.cleanupUncertain != true
+        let released = admission.completeStop(stopped, cleanupComplete: clean)
+        if released { admissionStopped() }
+        else if admission.currentPhase == .retained {
+            stopping = false; snapshot.phase = "Interrupted"
+            snapshot.detail = "Recording or publisher cleanup unconfirmed; Prepare is blocked."; publish()
+        }
+    }
+    /// All resource-values filesystem work runs only on recordingIO.
+    private func checkStorage(_ catalogue: RecordingCatalogue, profile: CaptureProfile) throws {
+        let available = try catalogue.recordingRootURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage
+        guard let available, available >= 0, RecordingCaptureAdmission.storageAvailable(profile: profile, bytes: UInt64(available)) else {
+            throw CaptureFailure(message: "Recording storage is below its required reserve")
+        }
+    }
+    private func checkActiveStorage(_ recorder: CompressedRecorder, work: RecordingCaptureAdmission.Ticket, preparation: CaptureAdmission.Preparation, generation: UInt64) {
+        guard !storageCheckPending else { return }
+        storageCheckPending = true
+        recorder.checkStorage(profile: preparation.profile) { result in self.control.async {
+            self.storageCheckPending = false
+            guard self.preparedIntent == preparation, self.captureGeneration == generation, self.snapshot.running else { return }
+            if case .failure = result {
+                self.recordingFailureDescription = "Recording storage is below its required reserve."
+                self.snapshot.detail = "Local recording stopped early because storage is low. Publishing continues."
+                self.publish()
+                // Stop only recording admission, preserving the accepted prefix
+                // and the independent publisher/capture. Stop later joins this
+                // same coalesced actual finalisation result.
+                self.recordingAdmission.closing(work)
+                recorder.finish(incomplete: true) { completion in self.control.async {
+                    self.recordingAdmission.closed(work, cleanupComplete: completion.cleanupComplete)
+                    if !completion.cleanupComplete { self.retainedRecorder = recorder }
+                    guard self.preparedIntent == preparation, self.captureGeneration == generation else { return }
+                    self.publish()
+                } }
+            }
+        } }
     }
     private func beginTelemetry(_ intent: CaptureAdmission.Preparation) {
         if telemetryIntent == intent, telemetryTimer != nil { return }
@@ -553,7 +799,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         snapshot.socketKilobitsPerSecond = nil
     }
     private func report(_ error: Error) { snapshot.phase = "Error"; snapshot.detail = error.localizedDescription; snapshot.canStart = false; publish() }
-    private func publish() { let value = snapshot; DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = value.running; self.onChange?(value) } }
+    private func publish() { snapshot.recordingIOBusy = recordingAdmission.isWorking || storageCheckPending; let value = snapshot; DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = value.running; self.onChange?(value) } }
     private func meter(_ level: Float) {
         // Audio callback only schedules coalesced UI work, never logs per packet.
         let now = ProcessInfo.processInfo.systemUptime
@@ -584,6 +830,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             } else { try process(sampleBuffer, video: isVideo, run: run) }
         } catch {
             run.admitting = false; run.startup.removeAll(); run.startupBytes = 0
+            run.recorder.markIncomplete(error)
             control.async { self.stopOnControl(reason: error.localizedDescription) }
         }
     }

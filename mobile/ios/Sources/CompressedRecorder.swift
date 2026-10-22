@@ -3,22 +3,36 @@ import AVFoundation
 /// File work has its own queue and never blocks capture or publishing. Already
 /// encoded H.264/AAC goes directly to passthrough inputs: no second encode.
 final class CompressedRecorder {
-    private let queue = DispatchQueue(label: "sapflow.recording", qos: .utility)
+    private let queue: DispatchQueue
     private let budget = EncodedWorkBudget()
-    private let writer: AVAssetWriter
+    private var writer: AVAssetWriter?
+    private let receipt: RecordingCatalogue.Writer
     private var video: AVAssetWriterInput?
     private var audio: AVAssetWriterInput?
     private var staged: [(unit: CompressedUnit, reservation: EncodedWorkBudget.Reservation)] = []
     private var finishing = false
     private var failure: Error?
     private let onFailure: (Error) -> Void
-    let url: URL
+    private var hasAcceptedMedia = false
+    private var endTime = CMTime.zero
+    private var completion: ((Completion) -> Void)?
+    private var joinedCompletion: ((Completion) -> Void)?
+    private var completed: Completion?
+    struct Completion {
+        let fileURL: URL?
+        let finalised: Bool
+        let cleanupComplete: Bool
+        let failure: Error?
+    }
 
-    init(url: URL, onFailure: @escaping (Error) -> Void) throws {
-        self.url = url; self.onFailure = onFailure
-        writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        writer.movieFragmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
-        writer.shouldOptimizeForNetworkUse = false
+    /// Called only on the explicit recording IO owner, after its durable WRITING
+    /// receipt. The caller closes the receipt if AVAssetWriter creation throws.
+    init(receipt: RecordingCatalogue.Writer, queue: DispatchQueue, onFailure: @escaping (Error) -> Void) throws {
+        self.receipt = receipt; self.queue = queue; self.onFailure = onFailure
+        let created = try AVAssetWriter(outputURL: receipt.fileURL, fileType: .mov)
+        created.movieFragmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
+        created.shouldOptimizeForNetworkUse = false
+        writer = created
     }
 
     func offer(_ unit: CompressedUnit) {
@@ -27,9 +41,9 @@ final class CompressedRecorder {
             return
         }
         queue.async {
-            guard !self.finishing, self.failure == nil else { self.budget.release(reservation); return }
+            guard !self.finishing, self.failure == nil, let writer = self.writer else { self.budget.release(reservation); return }
             do {
-                if self.writer.status == .unknown {
+                if writer.status == .unknown {
                     self.staged.append((unit, reservation))
                     if unit.isVideo && self.video == nil {
                         self.video = try self.makeInput(type: .video, unit: unit)
@@ -37,8 +51,8 @@ final class CompressedRecorder {
                         self.audio = try self.makeInput(type: .audio, unit: unit)
                     }
                     guard self.video != nil && self.audio != nil else { return }
-                    guard self.writer.startWriting() else { throw self.writer.error ?? CaptureFailure(message: "Recording could not start") }
-                    self.writer.startSession(atSourceTime: .zero)
+                    guard writer.startWriting() else { throw writer.error ?? CaptureFailure(message: "Recording could not start") }
+                    writer.startSession(atSourceTime: .zero)
                     let initial = self.staged
                     self.staged.removeAll(keepingCapacity: false)
                     defer { for pending in initial { self.budget.release(pending.reservation) } }
@@ -52,6 +66,7 @@ final class CompressedRecorder {
     }
 
     private func makeInput(type: AVMediaType, unit: CompressedUnit) throws -> AVAssetWriterInput {
+        guard let writer else { throw CaptureFailure(message: "Recording writer is closed") }
         let input = AVAssetWriterInput(mediaType: type, outputSettings: nil, sourceFormatHint: CMSampleBufferGetFormatDescription(unit.buffer))
         input.expectsMediaDataInRealTime = true
         guard writer.canAdd(input) else { throw CaptureFailure(message: "Recording cannot accept the encoded format") }
@@ -60,9 +75,15 @@ final class CompressedRecorder {
     }
     private func append(_ unit: CompressedUnit) throws {
         let input = unit.isVideo ? video : audio
-        guard let input, writer.status == .writing, input.isReadyForMoreMediaData, input.append(unit.buffer) else {
-            throw writer.error ?? CaptureFailure(message: "Recording storage cannot keep up; recording stopped")
+        guard let writer, let input, writer.status == .writing, input.isReadyForMoreMediaData, input.append(unit.buffer) else {
+            throw writer?.error ?? CaptureFailure(message: "Recording storage cannot keep up; recording stopped")
         }
+        hasAcceptedMedia = true
+        let end = CMTimeAdd(unit.time, unit.duration)
+        guard end.isNumeric, end.seconds >= 0, end.seconds.isFinite else {
+            throw CaptureFailure(message: "Recording sample extent is invalid")
+        }
+        if CMTimeCompare(end, endTime) > 0 { endTime = end }
     }
     private func fail(_ error: Error) {
         guard failure == nil else { return }
@@ -72,26 +93,80 @@ final class CompressedRecorder {
         staged.removeAll()
         onFailure(error)
     }
-    func finish(_ completion: @escaping (Result<URL, Error>) -> Void) {
+    func markIncomplete(_ error: Error) { queue.async { self.fail(error) } }
+    func checkStorage(profile: CaptureProfile, _ completion: @escaping (Result<Void, Error>) -> Void) {
+        queue.async {
+            do {
+                let available = try self.receipt.fileURL.deletingLastPathComponent().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
+                guard available >= 0, RecordingCaptureAdmission.storageAvailable(profile: profile, bytes: UInt64(available)) else { throw CaptureFailure(message: "Recording storage is below its required reserve") }
+                completion(.success(()))
+            } catch { self.fail(error); completion(.failure(error)) }
+        }
+    }
+    /// One recording-only failure may begin finish before capture Stop. Retain
+    /// at most those two listeners; all further duplicates coalesce. Completed
+    /// results replay without repeating native/file IO.
+    func finish(incomplete: Bool = false, _ completion: @escaping (Completion) -> Void) {
         budget.close()
         queue.async {
-            guard !self.finishing else { return }
-            self.finishing = true
-            for pending in self.staged { self.budget.release(pending.reservation) }
-            self.staged.removeAll()
-            guard self.writer.status == .writing else {
-                self.writer.cancelWriting()
-                completion(.failure(self.failure ?? CaptureFailure(message: "No complete audio/video recording was captured")))
+            if let completed = self.completed { completion(completed); return }
+            guard !self.finishing else {
+                if self.joinedCompletion == nil { self.joinedCompletion = completion }
                 return
             }
-            self.video?.markAsFinished(); self.audio?.markAsFinished()
-            self.writer.finishWriting {
-                if self.writer.status == .completed {
-                    completion(.success(self.url))
-                } else {
-                    completion(.failure(self.writer.error ?? self.failure ?? CaptureFailure(message: "Recording finalisation failed")))
-                }
+            self.finishing = true; self.completion = completion
+            if incomplete && self.failure == nil { self.failure = CaptureFailure(message: "Recording ended with missing encoded media") }
+            for pending in self.staged { self.budget.release(pending.reservation) }
+            self.staged.removeAll()
+            guard let writer = self.writer else {
+                self.finishNativeWriter(containerCompleted: false); return
+            }
+            if writer.status == .writing && self.hasAcceptedMedia {
+                // All appends use this same queue. Preserve a positive accepted
+                // prefix: cancelWriting would block and delete the original.
+                self.video?.markAsFinished(); self.audio?.markAsFinished()
+                writer.finishWriting { self.queue.async { self.finishNativeWriter(containerCompleted: self.writer?.status == .completed) } }
+            } else {
+                // Public API permits cancellation only after appends have
+                // returned; it can delete this never-started/empty output.
+                if writer.status == .unknown || writer.status == .writing { writer.cancelWriting() }
+                self.finishNativeWriter(containerCompleted: writer.status == .completed && self.hasAcceptedMedia)
             }
         }
+    }
+    private func finishNativeWriter(containerCompleted: Bool) {
+        let nativeFailure = writer?.error
+        video = nil; audio = nil; writer = nil
+        // The preceding native callback/cancel queue turn may still have a
+        // local strong writer reference. Its return precedes this metadata turn.
+        queue.async { self.finishReceipt(containerCompleted: containerCompleted, nativeFailure: nativeFailure) }
+    }
+    private func finishReceipt(containerCompleted: Bool, nativeFailure: Error?) {
+        var error = failure ?? nativeFailure
+        let finalised = containerCompleted && error == nil
+        var saved: URL?
+        do {
+            if containerCompleted {
+                let milliseconds = endTime.seconds * 1_000
+                guard milliseconds.isFinite, milliseconds >= 0, milliseconds < Double(Int64.max) else {
+                    throw CaptureFailure(message: "Recording duration is outside its supported bound")
+                }
+                try receipt.complete(durationMs: Int64(milliseconds), outcome: finalised ? .finalised : .incomplete)
+                saved = receipt.fileURL
+            } else {
+                receipt.cancel()
+                try receipt.ownersClosed()
+                if error == nil { error = CaptureFailure(message: "No finalised audio/video recording was captured") }
+            }
+        } catch let persistenceError {
+            receipt.retainUncertainCleanup()
+            if error == nil { error = persistenceError }
+        }
+        let result = Completion(fileURL: saved, finalised: finalised && receipt.cleanupComplete,
+                                cleanupComplete: receipt.cleanupComplete, failure: error)
+        completed = result
+        let reply = completion; let joined = joinedCompletion
+        completion = nil; joinedCompletion = nil
+        reply?(result); joined?(result)
     }
 }

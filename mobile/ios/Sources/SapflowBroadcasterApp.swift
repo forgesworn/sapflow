@@ -38,11 +38,16 @@ final class BroadcasterModel: ObservableObject {
     private var creatorOwner: V4vCreatorOwner?
     let creatorConfiguration = V4vCreatorConfiguration.load()
     let engine = CaptureEngine()
+    let recordingLibrary = RecordingLibraryOwner()
     init() {
         profiles = profileStore.load()
         engine.onChange = { [weak self] snapshot in
             guard let self else { return }
             self.snapshot = snapshot; self.updateCreatorCapture()
+        }
+        recordingLibrary.initialise { [weak engine] catalogue, admission, complete in
+            guard let engine else { complete(false); return }
+            engine.setRecordingCatalogue(catalogue, admission: admission, completion: complete)
         }
         if creatorConfiguration.profile != nil {
             V4vCreatorProduction.open(configuration: creatorConfiguration, capture: engine,
@@ -60,7 +65,7 @@ final class BroadcasterModel: ObservableObject {
     // 1080p has an engineering encoder path, pending physical qualification.
     let captureProfiles = CaptureProfile.allCases.filter { !$0.isEngineeringOnly }
     var canChangeCaptureProfile: Bool {
-        engine.canChooseCaptureProfile && (destinationMode != .v4v || creatorOwner?.canChangeCaptureSettings != false)
+        recordingLibrary.captureAllowed && engine.canChooseCaptureProfile && (destinationMode != .v4v || creatorOwner?.canChangeCaptureSettings != false)
     }
     func selectCaptureProfile(_ profile: CaptureProfile) {
         guard canChangeCaptureProfile, captureProfiles.contains(profile) else { return }
@@ -68,9 +73,9 @@ final class BroadcasterModel: ObservableObject {
     }
     var captureBusy: Bool { snapshot.running || snapshot.phase == "Finalising" || snapshot.phase == "Preparing" }
     var canPrepare: Bool {
-        !captureBusy && !snapshot.canStart && (destinationMode != .v4v || creator.canPrepare)
+        recordingLibrary.captureAllowed && engine.canReservePreparation && !captureBusy && !snapshot.canStart && (destinationMode != .v4v || creator.canPrepare)
     }
-    var canStart: Bool { snapshot.canStart && (destinationMode != .v4v || creator.canStart) }
+    var canStart: Bool { recordingLibrary.captureAllowed && snapshot.canStart && (destinationMode != .v4v || creator.canStart) }
     func setForeground(_ active: Bool) { foreground = active; updateCreatorActivity() }
     private func updateCreatorActivity() {
         updateCreatorCapture()
@@ -92,7 +97,10 @@ final class BroadcasterModel: ObservableObject {
     func retryCreatorAction() { creatorOwner?.retryPending() }
     func endBroadcast() { creatorOwner?.end() }
     func acknowledgeRecovery() { creatorOwner?.acknowledgeRecovery() }
-    func prepareReplacement() { updateOrientation(); creatorOwner?.prepare(captureProfile: captureProfile, replacingAcknowledged: true) }
+    func prepareReplacement() {
+        guard recordingLibrary.captureAllowed, engine.canReservePreparation else { return }
+        updateOrientation(); creatorOwner?.prepare(captureProfile: captureProfile, replacingAcknowledged: true)
+    }
     func updateOrientation() {
         if let orientation = CaptureOrientation.device(UIDevice.current.orientation) {
             hasOrientation = true; engine.setOrientation(orientation)
@@ -103,6 +111,7 @@ final class BroadcasterModel: ObservableObject {
         // Face-up/down and unknown readings retain the last valid orientation.
     }
     func start() {
+        guard canStart else { return }
         if destinationMode == .v4v { updateOrientation(); creatorOwner?.start(); return }
         guard let preparation = destinationSelection.preparation else { return }
         updateOrientation(); engine.start(preparation: preparation)
@@ -113,6 +122,7 @@ final class BroadcasterModel: ObservableObject {
         else { engine.stop() }
     }
     func prepare() {
+        guard canPrepare else { return }
         if destinationMode == .v4v { updateOrientation(); creatorOwner?.prepare(captureProfile: captureProfile); return }
         guard let ticket = engine.reservePreparation(profile: captureProfile) else { return }
         guard destinationSelection.reserve(ticket) else { engine.abandonPreparation(ticket); return }
@@ -205,10 +215,15 @@ struct CameraPreview: UIViewRepresentable {
 
 struct BroadcasterView: View {
     @ObservedObject var model: BroadcasterModel
+    @ObservedObject private var recordings: RecordingLibraryOwner
     @Environment(\.scenePhase) private var scenePhase
     @State private var confirmEnd = false
     @State private var confirmRecovery = false
-    private var controlsLocked: Bool { model.captureBusy || model.snapshot.canStart }
+    init(model: BroadcasterModel) {
+        self.model = model
+        _recordings = ObservedObject(wrappedValue: model.recordingLibrary)
+    }
+    private var controlsLocked: Bool { model.captureBusy || model.snapshot.canStart || !recordings.captureAllowed }
     var body: some View {
         GeometryReader { geometry in
             Group {
@@ -288,9 +303,8 @@ struct BroadcasterView: View {
                 }.buttonStyle(.borderedProminent)
                 Button("Stop and save") { model.stop() }
                     .buttonStyle(.bordered).disabled(!model.snapshot.running && !model.snapshot.canStart && model.snapshot.phase != "Finalising" && model.snapshot.phase != "Preparing").accessibilityIdentifier("capture.stop")
-                if let url = model.snapshot.recordingURL {
-                    ShareLink(item: url) { Label("Export recording", systemImage: "square.and.arrow.up") }
-                    Text("Saved in Files → On My iPhone → Sapflow").font(.caption).foregroundStyle(.secondary)
+                RecordingLibraryView(owner: recordings, canExport: model.engine.canChooseCaptureProfile) { entry, allowUnverified in
+                    recordings.choose(entry: entry, allowUnverified: allowUnverified, canExport: { model.engine.canChooseCaptureProfile })
                 }
                 Text("Keep the app in the foreground. Turning the phone saves a new recording segment and reconnects any active broadcast. Locking the phone or an audio interruption ends capture.")
                     .font(.caption).foregroundStyle(.secondary)

@@ -42,7 +42,10 @@ targets:
   SapflowBroadcaster:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources:
+      - path: Sources
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - package: Sapflow
         product: Sapflow
