@@ -5,6 +5,43 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+Privacy standby is the next source packet. Its
+[contract](privacy-standby.md) requires synchronous raw-input fencing,
+independently paced replacement picture and silence, explicit Resume and
+matching recording. It is not yet an app control. Cold AAC replacement needs
+per-generation timing and recording proof before native integration.
+
+The current generated macOS AAC baseline passes the unchanged strict
+stored-payload and presentation oracles for six recording cases. Native output
+is shared with actual packaged Rust validation and the real recording writer.
+The aligned, partial and 511-frame nonperiodic cases retain exact native PCM
+extents and exceed 0.99994 zero-lag correlation in both native and independent
+decoding. This supersedes the older pre-repair payload failure for this exact
+source; it does not qualify a cold encoder transition or a physical phone.
+Evidence is retained at
+`target/ios-audio-only-fixture/20261022T175340Z-9c5c8319/receipt.local.json`.
+
+An independently reviewed Android standby transaction model now passes 32
+warnings-as-errors JVM tests and the same 32 tests in the real Debug Gradle
+project. It covers priority privacy fencing, explicit Start/Resume, delayed
+callbacks, immutable retiring-AAC identity, sink admission and original
+deadlines. It is not connected to capture, codecs, the UI or the SDK queues;
+trusted native receipt adapters and terminal branch fences remain to be built.
+
+Generated macOS feasibility experiments expose why cold AAC needs separate
+recording accounting. Discarding the old encoder leaves one decoded access
+unit of old overlap in the tested continuous decoder; applying another file
+head trim at an interior join fails the prototype writer. A second prototype
+preserves all coded units, accounts for interior transition slots against the
+requested standby interval and applies only the initial file trim and final
+tail trim. One, two and three joins retain exact native decoded frame counts
+and payload sequences, with independently decoded silence at each predetermined
+fresh-generation boundary; an insufficient interval is refused. This is an
+offline generated feasibility result, not actual app integration, real-time
+pacing, independently verified native PCM timestamp continuity, Resume-to-live
+testing, Android codec proof or physical qualification.
+Receipts are retained under `target/privacy-standby/ios-feasibility/`.
+
 The [native camera packet](native-camera-controls.md) now implements Front/Rear
 selection before Prepare, live source replacement and capability-bound zoom,
 focus, exposure and white-balance controls on both apps. A successful source

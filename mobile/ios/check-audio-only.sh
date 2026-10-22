@@ -14,7 +14,7 @@ import datetime,hashlib,json,os,shutil,signal,subprocess,sys,tempfile,uuid
 root=Path(sys.argv[1]);scratch=Path(sys.argv[2]);base=root/'target/ios-audio-only-fixture'
 run=base/(datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ-')+uuid.uuid4().hex[:8]);run.mkdir(mode=0o700)
 sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
-names=['AudioRecordingTiming','AudioShowLifecycle','NativeAudioEncoder','CompressedRecorder','RecordingCatalogue','RecordingStorage','RecordingCaptureAdmission','AudioInputPolicy','CaptureAdmission','CaptureProfile','CaptureOrientation','PublishingTelemetry','EncodedWorkBudget','EncodedPipeline']
+names=['AudioRecordingTiming','AudioShowLifecycle','NativeAudioEncoder','CompressedRecorder','RecordingCatalogue','RecordingStorage','RecordingCaptureAdmission','AudioInputPolicy','CameraControlPolicy','CaptureAdmission','CaptureProfile','CaptureOrientation','PublishingTelemetry','EncodedWorkBudget','EncodedPipeline']
 sources=[root/('mobile/ios/Sources/'+name+'.swift') for name in names]
 sources += [root/'mobile/ios/Tools/AudioOnlyFixtureCheck.swift',root/'mobile/ios/check-audio-only.sh']
 package=root/'target/native-packages/apple';package_files=sorted(p for p in package.rglob('*') if p.is_file())
@@ -73,7 +73,7 @@ let package = Package(name: "AudioOnlyCheck", platforms: [.macOS(.v12)], depende
         assert 0<float(facts['format']['duration'])<3.5
         packet_views={}
         for view,options in [('default',[]),('ignore_editlist',['-ignore_editlist','1']),('simple_editlist',['-advanced_editlist','0'])]:
-            packets=json.loads(invoke(['ffprobe','-v','error',*options,'-show_packets','-show_data_hash','sha256','-show_entries','packet=size,data_hash,pts,duration,side_data_list','-of','json',str(exported)],case+'-'+view+'-packet-hashes.local.json',10).read_text())['packets']
+            packets=json.loads(invoke(['ffprobe','-v','error',*options,'-show_packets','-show_data_hash','sha256','-show_entries','packet=pos,size,data_hash,pts,duration,side_data_list','-of','json',str(exported)],case+'-'+view+'-packet-hashes.local.json',10).read_text())['packets']
             assert len(packets)<=176
             positive=[packet for packet in packets if int(packet['size'])>0]
             assert len(packets)-len(positive)<=16

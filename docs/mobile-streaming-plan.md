@@ -432,6 +432,12 @@ The [native camera contract](native-camera-controls.md) defines source ownership
 live Front/Rear switching within one encoder/show, unmirrored transmitted pixels,
 capability-bound controls and the source and physical gates for that B4R packet.
 
+The [privacy standby contract](privacy-standby.md) defines the next packet:
+immediate raw-input fencing, independently paced replacement media, explicit
+Resume and matching recording. Native AAC generation changes need their own
+priming and recording proof before app integration; the control is not yet
+implemented.
+
 ### B5 First release qualification
 
 Treat the following as initial acceptance targets. B0 may revise a target
