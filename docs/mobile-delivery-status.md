@@ -49,6 +49,17 @@ Independent review is clear on the final source. Receipts remain under
 retained under `android-v2/`. No device installation, app launch, private media,
 real provider, live service or signer action was exercised by these gates.
 
+The branch subsequently integrates `origin/main` at `7a3435f` through merge
+`422fd5b`, including receive-buffer hardening, default parser-log filtering and
+the standalone listener example. The combined workspace passes 605
+unit/integration/doc tests with four normally ignored, strict all-target Clippy
+and formatting. The new upstream example needed formatting only. Regenerating
+the 136-crate licence notice produces no tracked change. The generated loopback
+smoke passes SRT/RTMP ingest, independent HLS decode, callbacks, reconnect with
+one recording and encrypted passphrase acceptance/refusal. Its fixture servers
+and generated media are cleaned by the harness. These remain local origin
+gates, separate from physical phones or a deployed V4V show.
+
 The current source adds the first background slice of the
 [native microphone-only mode](audio-only-mobile.md) on iOS and Android. Its
 immutable intent follows permissions, storage, grant admission, Start, reconnect,
@@ -111,7 +122,7 @@ also confirms the malformed special-header accounting repair and its three
 red-to-green regressions, preserving the old allocation's charge when upstream
 rejects a replacement before insertion.
 
-The current Rust source passes 598 workspace tests with four normally ignored,
+The earlier PES-limit snapshot passed 598 workspace tests with four normally ignored,
 strict all-target Clippy and formatting. The initial sandboxed run could not
 bind a loopback socket; the unrestricted loopback rerun passes, so that initial
 failure is an infrastructure limitation. The current source's full origin

@@ -22,7 +22,9 @@ fn main() -> std::io::Result<()> {
         let now = Instant::now();
         let wait = listener
             .poll_timeout()
-            .map_or(Duration::from_millis(100), |at| at.saturating_duration_since(now))
+            .map_or(Duration::from_millis(100), |at| {
+                at.saturating_duration_since(now)
+            })
             .max(Duration::from_millis(1));
         socket.set_read_timeout(Some(wait))?;
         match socket.recv_from(&mut buf) {
@@ -38,7 +40,11 @@ fn main() -> std::io::Result<()> {
 
         while let Some(event) = listener.poll_event() {
             match event {
-                Event::Connect { id, peer, stream_id } => {
+                Event::Connect {
+                    id,
+                    peer,
+                    stream_id,
+                } => {
                     // The stream id is untrusted input: check it here, and
                     // call `listener.reject(id, code)` to refuse a caller.
                     println!("{peer} wants {:?}", String::from_utf8_lossy(&stream_id));
