@@ -1,6 +1,7 @@
 # sapflow-srt
 
-sapflow's own SRT: the receiving side of live-mode SRT, as a listener.
+sapflow's own SRT: live-mode SRT as a listener and receiver, and as a
+bounded, paced caller and sender, with optional AES-128/256-CTR encryption.
 MIT, like the rest of sapflow.
 
 Written from the SRT specification, [draft-sharabayko-srt-01], and from
@@ -14,7 +15,9 @@ win; each difference is recorded in `docs/reference.md`.
 
 ## Shape
 
-Sans-IO, no async runtime, no dependencies, `unsafe` forbidden, and no
+Sans-IO, no async runtime, `unsafe` forbidden, no dependencies beyond pinned
+RustCrypto primitives for encryption (`aes`, `ctr`, `aes-kw`, `pbkdf2`,
+`sha1`) with `zeroize` and `getrandom`, and no
 panicking constructs outside tests (`unwrap`, `expect`, `panic!` and
 indexing are denied by lint). A `Listener` takes datagrams with their
 source address and the time and gives back datagrams to send, events and
@@ -36,12 +39,21 @@ let next = l.poll_timeout();               // None when there are no connections
 | `rtt` | RTT from ACK/ACKACK |
 | `receiver` | one connection: buffer, TSBPD delivery, too-late drop, drift, ACK, NAK, keepalive, idle timeout |
 | `listener` | version 5 handshake, SYN cookies keyed per process, stream id, latency negotiation, limits |
+| `caller`, `sender` | live caller: handshake, paced bounded sending, retransmission from NAKs |
+| `crypto` | AES-128/256-CTR key material: PBKDF2 key derivation, key wrap, refresh |
 
 ## Scope
 
-Live mode, listener, receiving. Not file mode, rendezvous, caller mode,
-groups, packet filters, sending, or (yet) encryption: a caller that asks
-for a passphrase is refused in the handshake (`REJ_UNSECURE`).
+Live mode only: listener/receiver and caller/sender. Not file mode,
+rendezvous, groups or packet filters. Encryption is AES-128 or AES-256 in
+CTR mode with strict key negotiation and refresh; AES-192 and GCM are refused.
+CTR does not authenticate media, and control packets, including the stream
+id, stay in clear. The supported profile is set out in `src/crypto.rs`.
+Seamless reconnection, late-drop negotiation and adaptive bitrate on the
+caller side are not yet qualified.
+
+How it compares with libsrt and gosrt under loss, with measurements, is in
+`docs/benchmarks.md` and `docs/comparison.md` at the repository root.
 
 ## Tests
 
@@ -50,4 +62,8 @@ for a passphrase is refused in the handshake (`REJ_UNSECURE`).
   must deliver what `srt-protocol` delivered for the same trace (its
   output recorded before it was removed), and under
   loss exactly what libsrt's receiver delivered in the recorded session.
-- Fuzz targets `own_srt_packet` and `own_srt_listener` (`fuzz/README.md`).
+- `tests/caller.rs`: the caller and sender against our listener.
+- `tests/black_box_sender.py`, `tests/black_box_crypto.py`: our sender and
+  encryption against libsrt's tools, as black boxes.
+- Fuzz targets `own_srt_packet`, `own_srt_listener` and `own_srt_caller`
+  (`fuzz/README.md`).

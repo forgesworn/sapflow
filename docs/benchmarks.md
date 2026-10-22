@@ -1036,8 +1036,9 @@ CPU and memory are a floor and not a like-for-like cost; see A):
 All streams produced a playlist in every run (732 stream-runs). Two things to
 know before quoting any of this: at 200 ms and 2% loss or more sapflow's
 recording lost far more frames than the other two after an unrecovered packet
-(a policy, see A), and with 50 SRT publishers sapflow logged video parser errors
-and the OS counted dropped UDP datagrams (see "Found on the way").
+(a policy, see A), and with 50 SRT publishers sapflow logged video parser errors, most
+likely from streams starting mid-frame; a larger receive buffer did not
+change them (see "Found on the way").
 
 ### Setup
 
@@ -1546,6 +1547,26 @@ skipped, three runs each, interleaved with the order flipping each round,
    the video). Effect on the numbers: sapflow's 50-stream SRT CPU rose with the
    error count (34.5% with 110 lines, 38.6% with 5,194, 39.4% with 10,837), so
    its figure there is probably a little high and the 1.7x ratio a little low.
+
+   **Followed up the same day: the receive buffer is not the cause.** The
+   commit "fix: size the SRT receive buffer for many publishers" now asks for
+   512 KiB per allowed publisher; macOS granted its 8,388,608-byte ceiling.
+   Seven more 50-stream SRT runs on the same M4 (three before that commit,
+   four after; all 50 streams served in every run):
+
+   | Build | Dropped, full socket buffers | annexb error lines | CPU | Peak memory |
+   |-------|------------------------------|--------------------|-----|-------------|
+   | before | 0, 1, 0 | 1,867 / 8,764 / 6,555 | 39.2 to 40.1% | 944 to 950 MB |
+   | after | 0, 0, 0, 0 | 1,291 / 5,980 / 0 / 11,875 | 37.5 to 40.0% | 939 to 956 MB |
+
+   The 347 drops did not recur with the old build either, and the errors come
+   at the same rate with and without the larger buffer. Nearly all of them
+   fall 5 to 9 s after the server starts, while the 50 publishers connect,
+   and some bursts repeat to the line (1,828 three times). That points to
+   streams starting mid-frame, as item 2's sender does with its first
+   chunks, rather than to loss in the server. Not yet proven: the video was
+   not decoded. The larger buffer stays as hardening. sapflow logging one
+   line per bad NAL unit at that rate is itself worth limiting.
 4. **sapflow withholds video from a damaged frame to the next keyframe** (A):
    one unrecovered SRT packet cost it 5 to 22 frames in a trial where libsrt and
    gosrt kept nearly all of theirs. A deliberate policy (commit `62d2d02`), shown
