@@ -41,6 +41,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private var writeDeadlineUs: UInt64?
     private var stopDeadlineUs: UInt64?
     private var statusAtUs: UInt64 = 0
+    private var socketCounter = SocketCompletionCounter()
+    private var finalCounters: SocketOutboundSample? // published under lock at actual close
 
     init(destination: ManualSrtDestination, limits: SrtPublishingLimits = .manual, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) {
         self.destination = destination; self.limits = limits; self.observe = observe
@@ -48,6 +50,13 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     deinit { timer.cancel(); connection?.cancel(); try? publisher?.stop(nowUs: Self.nowUs()) }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
     var status: String { lock.lock(); defer { lock.unlock() }; return currentStatus }
+    var finalSocketOutbound: SocketOutboundSample? { lock.lock(); defer { lock.unlock() }; return finalCounters }
+    func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) {
+        queue.async {
+            completion(self.socketCounter.sample(nowNs: DispatchTime.now().uptimeNanoseconds,
+                available: self.socketReady && self.connection != nil && !self.cancelling && !self.stopping))
+        }
+    }
 
     func start() throws {
         lock.lock()
@@ -56,13 +65,14 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         generation += 1
         let token = generation
         admission.close(); admission = EncodedWorkBudget(bytes: Int(limits.queueBytes), count: 128, span: 1)
-        accepting = true; released = false; currentStatus = "Preparing SRT UDP caller · single attempt"
+        accepting = true; released = false; finalCounters = nil; currentStatus = "Preparing SRT UDP caller · single attempt"
         lock.unlock()
         queue.async {
             guard self.isCurrent(token), self.isAccepting() else { return }
             self.stopping = false; self.waitingForKeyframe = true
             self.connectDeadlineUs = Self.nowUs() + 15_000_000
             self.statusAtUs = 0
+            self.socketCounter = SocketCompletionCounter()
             guard let port = NWEndpoint.Port(rawValue: self.destination.port) else {
                 self.fail(token, "Invalid SRT destination port"); return
             }
@@ -213,8 +223,11 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private func send(_ bytes: Data, _ token: UInt64) {
         guard let connection else { return }
         writing = true; writeDeadlineUs = Self.nowUs() + 100_000
+        let write = socketCounter.begin(bytes: bytes.count)
         connection.send(content: bytes, completion: .contentProcessed { [weak self] error in
-            guard let self, self.isCurrent(token), self.connection != nil, !self.cancelling else { return }
+            guard let self, self.isCurrent(token) else { return }
+            guard self.socketCounter.completed(write, success: error == nil) != .stale else { return }
+            guard self.connection != nil, !self.cancelling, self.writing else { return }
             self.writing = false; self.writeDeadlineUs = nil
             if error != nil {
                 try? self.publisher?.socketSendFailed(nowUs: Self.nowUs())
@@ -331,7 +344,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     }
     private func completeRelease() {
         connection?.stateUpdateHandler = nil; connection = nil; cancelling = false
-        lock.lock(); released = true; accepting = false; lock.unlock()
+        let final = socketCounter.seal(nowNs: DispatchTime.now().uptimeNanoseconds)
+        lock.lock(); finalCounters = final; released = true; accepting = false; lock.unlock()
         let completions = stopCompletions; stopCompletions.removeAll()
         for completion in completions { completion() }
     }

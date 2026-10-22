@@ -166,6 +166,42 @@ quality, pacing and sustained resource qualification remain separate gates.
 The finite iOS origin probe confirms actual audio/video decode and the current
 publishing attempt; it does not yet compare remote dimensions with the selected
 capture profile.
+
+### Elapsed time and socket outbound telemetry
+
+The normal capture screen displays Capture elapsed, Broadcast elapsed and Socket
+outbound. These are separate from transport acknowledgement and native decoded
+playback readiness. Capture elapsed starts at the first committed Start, never
+Prepare or a grant response. It includes orientation/reconnection gaps in the
+same foreground logical capture, and freezes at Stop or interruption. It is not
+an encoded-media or written-file duration. A local-only capture has no broadcast
+clock. Destination End/expiry freezes Broadcast elapsed while independent local
+capture and recording can continue; rotation cannot restart an ended clock.
+
+Socket outbound counts successful existing Network.framework `contentProcessed`
+completions: bytes consumed by the local network stack, not bytes delivered to a
+NIC, peer or decoder. RTMP includes submitted protocol bytes; RTMPS excludes TLS
+and TCP/IP overhead. SRT includes submitted UDP protocol/control/retransmission
+bytes but excludes UDP/IP headers. The metric does not alter SDK readiness or
+admission, and Rust's pre-submission counters are not used for it.
+
+The counter adds only scalar work to existing completions, without another
+packet callback, dispatch, clock read, FFI call, payload copy, allocation or
+timer. One capture-owned 1 Hz reader spans reconnect and orientation epochs,
+with at most one outstanding cold read. Two complete, monotonic samples within
+three seconds are required for a rate; fresh no-delta samples produce zero.
+Warmup, missing/stale/unsupported samples, counter overflow or rollback remain
+unavailable. End does not leave a historical number labelled as current.
+
+The logical destination retains only current and closing counter baselines.
+Its exact attempt context fences reads and final reports. Final accounting is
+folded before the existing actual-close completion can create a successor.
+Cancellation ordering is not assumed: a failed or unresolved final send is marked
+incomplete and breaks rate continuity, without delaying capture/transport
+cleanup or fabricating completed bytes. Sealed totals cannot grow from a late
+callback. These source/host checks are not an installed-phone throughput or
+performance qualification.
+
 The encoder is selected from VTCopyVideoEncoderList entries explicitly marked
 hardware accelerated and the session's actual EncoderID must match. On iOS
 17.4 and later the app additionally requires and verifies hardware acceleration

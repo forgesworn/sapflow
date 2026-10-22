@@ -159,6 +159,8 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
     }
     var status: String { logical.status }
     var cleanupComplete: Bool { logical.cleanupComplete }
+    func observeBroadcastEnd(_ completion: @escaping (UInt64) -> Void) { logical.observeBroadcastEnd(completion) }
+    func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) { logical.readSocketOutbound(completion: completion) }
     func start() throws { _ = try lifetime.current(nowNs: clock().monotonicNs); try logical.start() }
     func configure(video: MediaCodec, audio: MediaCodec) throws { try logical.configure(video: video, audio: audio) }
     func offer(_ sample: MediaSample) throws { try logical.offer(sample) }

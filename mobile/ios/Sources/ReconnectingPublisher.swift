@@ -49,8 +49,10 @@ private final class NativePublishingAttempt: ReconnectAttemptPort {
     private var codecs: (MediaCodec, MediaCodec)?
     private let admission = AttemptStartFence()
     private let deliver: (@escaping () -> Void) -> Void
-    init(sink: EncodedPublishingSink, context: ReconnectAttemptContext, video: MediaCodec, audio: MediaCodec, deliver: @escaping (@escaping () -> Void) -> Void) {
-        self.sink = sink; self.context = context; codecs = (video, audio); self.deliver = deliver
+    private let closed: (ReconnectAttemptContext, SocketOutboundSample?) -> Void
+    init(sink: EncodedPublishingSink, context: ReconnectAttemptContext, video: MediaCodec, audio: MediaCodec,
+         deliver: @escaping (@escaping () -> Void) -> Void, closed: @escaping (ReconnectAttemptContext, SocketOutboundSample?) -> Void) {
+        self.sink = sink; self.context = context; codecs = (video, audio); self.deliver = deliver; self.closed = closed
     }
     func start() throws {
         try admission.start {
@@ -64,7 +66,10 @@ private final class NativePublishingAttempt: ReconnectAttemptPort {
     func close(completion: @escaping () -> Void) {
         fence()
         sink.stop { [self] in
-            deliver { [self] in codecs = nil; completion() }
+            deliver { [self] in
+                closed(context, sink.finalSocketOutbound)
+                codecs = nil; completion() // final accounting precedes any successor
+            }
         }
     }
 }
@@ -98,6 +103,12 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     private var released = true
     private var active: NativePublishingAttempt?
     private var currentStatus = "Destination prepared · explicit Start required"
+    private var telemetry = PublishingTelemetryAggregate<ReconnectAttemptContext>() // queue only
+    private var telemetryContext: ReconnectAttemptContext? // queue only
+    private var telemetryReadPending = false // queue only
+    private var telemetryReadSerial: UInt64 = 0 // queue only
+    private var broadcastEndedAtNs: UInt64? // lock only
+    private var broadcastEndObserver: ((UInt64) -> Void)? // lock only, one cold listener
 
     convenience init(graceMs: UInt64 = 90_000, source: NativeTransportRecoverySource, factory: @escaping AttemptFactory) throws {
         try self.init(graceMs: graceMs, source: source, contextualFactory: { _, observe in factory(observe) })
@@ -125,6 +136,37 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     }
     var status: String { lock.lock(); defer { lock.unlock() }; return currentStatus }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
+    func observeBroadcastEnd(_ completion: @escaping (UInt64) -> Void) {
+        lock.lock(); broadcastEndObserver = completion; let ended = broadcastEndedAtNs; lock.unlock()
+        if let ended { completion(ended) }
+    }
+    private func noteTerminal(_ instant: UInt64) {
+        lock.lock()
+        guard broadcastEndedAtNs == nil else { lock.unlock(); return }
+        broadcastEndedAtNs = instant; let callback = broadcastEndObserver
+        lock.unlock(); callback?(instant)
+    }
+    func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) {
+        queue.async {
+            self.lock.lock()
+            let attempt = !self.fenced && !self.codecClosing && self.failedContext == nil ? self.active : nil
+            self.lock.unlock()
+            guard !self.telemetryReadPending, let attempt, self.telemetryReadSerial < UInt64.max else { completion(nil); return }
+            self.telemetryReadSerial += 1; let query = self.telemetryReadSerial
+            self.telemetryReadPending = true
+            attempt.sink.readSocketOutbound { [weak self] sample in
+                guard let self else { return }
+                self.queue.async {
+                    guard self.telemetryReadPending, self.telemetryReadSerial == query else { return }
+                    self.telemetryReadPending = false
+                    self.lock.lock()
+                    let current = !self.fenced && !self.codecClosing && self.failedContext == nil && self.active?.context == attempt.context
+                    self.lock.unlock()
+                    completion(current ? self.telemetry.read(attempt.context, sample: sample) : nil)
+                }
+            }
+        }
+    }
     func start() throws {
         lock.lock(); defer { lock.unlock() }
         guard !fenced, released, currentEpoch == nil, epochCounter < UInt64.max else { throw ReconnectFailure.cleanupRetained }
@@ -147,8 +189,10 @@ final class ReconnectingPublisher: EncodedPublishingSink {
                     if case .failed = event { self?.invalidateAttempt(context) }
                     self?.queue.async { observe(event, instant) }
                 })
+                self.telemetry.opened(context); self.telemetryContext = context
                 return NativePublishingAttempt(sink: sink, context: context, video: video, audio: audio,
-                    deliver: { [weak self] work in self?.queue.async(execute: work) })
+                    deliver: { [weak self] work in self?.queue.async(execute: work) },
+                    closed: { [weak self] context, sample in self?.telemetry.finished(context, sample: sample) })
             })
             self.publishState()
         }
@@ -171,6 +215,7 @@ final class ReconnectingPublisher: EncodedPublishingSink {
         attemptInvalidated(context)
     }
     private func setActive(_ value: NativePublishingAttempt?) {
+        if value == nil, let context = telemetryContext { telemetry.closing(context); telemetryContext = nil }
         lock.lock(); let closed = fenced || codecClosing || (value != nil && currentEpoch != value?.codecEpoch)
         active = closed ? nil : value
         if !closed, let value, value.context != failedContext { failedContext = nil }
@@ -186,6 +231,7 @@ final class ReconnectingPublisher: EncodedPublishingSink {
             currentStatus = fenced ? "Publisher stopping · playback unconfirmed" : "Publisher epoch closing · playback unconfirmed"
         } else { currentStatus = value }
         lock.unlock()
+        if let terminal = controller.terminalAtNs { noteTerminal(terminal) }
         timer.schedule(atNs: controller.nextDeadlineNs, generation: 1) { [weak self] _ in self?.controller.tick() }
     }
     /// Early codec-teardown fence. Keep the epoch identity for the later actual
@@ -214,9 +260,14 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     }
     func endDestination() {
         lock.lock(); fenced = true; let attempt = active; active = nil
+        let instant = DispatchTime.now().uptimeNanoseconds
+        let notify = broadcastEndedAtNs == nil
+        if notify { broadcastEndedAtNs = instant }
+        let endObserver = notify ? broadcastEndObserver : nil
         currentStatus = "Publisher stopping · playback unconfirmed"
         lock.unlock()
         destinationEnded() // observation fence precedes any policy/socket queue
+        endObserver?(instant)
         attempt?.fence() // close admission before queued policy/socket cleanup
         queue.async { self.controller.stop() }
     }

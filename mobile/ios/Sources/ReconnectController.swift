@@ -64,6 +64,7 @@ final class ReconnectController {
     private var decodedApplied = false
     private var context: ReconnectAttemptContext?
     private(set) var status = "Destination prepared · explicit Start required"
+    private(set) var terminalAtNs: UInt64?
     var cleanupComplete: Bool { owner == nil && !closing }
     var nextDeadlineNs: UInt64? {
         [terminal || stopped ? nil : policy.nextDeadlineNs, cleanupDeadline].compactMap { $0 }.min()
@@ -104,6 +105,7 @@ final class ReconnectController {
     func stop() {
         guard !stopped else { return }
         stopped = true; terminal = true; pendingConnect = false; factory = nil
+        if terminalAtNs == nil { terminalAtNs = now() }
         activeChanged(nil)
         try? policy.stop()
         status = "Publisher stopping · playback unconfirmed"
@@ -237,6 +239,7 @@ final class ReconnectController {
         let completion = detachCompletion; detachCompletion = nil; completion?(result)
     }
     private func failClosed(_ message: String) {
+        if terminalAtNs == nil { terminalAtNs = now() }
         terminal = true; pendingConnect = false; factory = nil
         activeChanged(nil); try? policy.stop(); status = message
         if owner != nil { beginClose() }

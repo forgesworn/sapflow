@@ -33,16 +33,20 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     private var protocolDeadline: UInt64?
     private var stopCompletions: [() -> Void] = []
     private var waitingForKeyframe = true
-    private var completedBytes: UInt64 = 0
-    private var inflightBytes = 0
-    private var bitrateWindowMs: UInt64 = 0
-    private var bitrateWindowBytes: UInt64 = 0
-    private var kilobitsPerSecond: UInt64 = 0
+    private var socketCounter = SocketCompletionCounter()
+    private var finalCounters: SocketOutboundSample? // published under lock at actual close
 
     init(destination: ManualDestination, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) { self.destination = destination; self.observe = observe }
     deinit { timer.cancel(); connection?.cancel(); try? publisher?.cancel() }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
     var status: String { lock.lock(); defer { lock.unlock() }; return currentStatus }
+    var finalSocketOutbound: SocketOutboundSample? { lock.lock(); defer { lock.unlock() }; return finalCounters }
+    func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) {
+        queue.async {
+            completion(self.socketCounter.sample(nowNs: DispatchTime.now().uptimeNanoseconds,
+                available: self.connection != nil && self.publisher != nil && !self.cancelling && !self.stopping))
+        }
+    }
 
     func start() throws {
         lock.lock()
@@ -52,13 +56,13 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
         let token = generation
         admission.close()
         admission = EncodedWorkBudget(bytes: 4 * 1024 * 1024, count: 128, span: 1)
-        accepting = true; released = false
+        accepting = true; released = false; finalCounters = nil
         currentStatus = destination.encrypted ? "Connecting with TLS · single attempt" : "Connecting with explicit plaintext RTMP · single attempt"
         lock.unlock()
         queue.async {
             guard self.isCurrent(token), self.isAccepting() else { return }
             self.stopping = false; self.waitingForKeyframe = true
-            self.completedBytes = 0; self.bitrateWindowBytes = 0; self.kilobitsPerSecond = 0; self.bitrateWindowMs = self.nowMs()
+            self.socketCounter = SocketCompletionCounter()
             self.connectDeadline = self.nowMs() + 15_000
             let parameters: NWParameters
             if self.destination.encrypted {
@@ -205,21 +209,15 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
             if stopping { finishTransport(token, graceful: true) }
             return
         }
-        writeInFlight = true; inflightBytes = data.count
+        writeInFlight = true
+        let write = socketCounter.begin(bytes: data.count)
         writeDeadline = nowMs() + 5_000
         connection.send(content: data, completion: .contentProcessed { [weak self] error in
-            guard let self, self.isCurrent(token), self.connection != nil, !self.cancelling else { return }
-            let bytes = self.inflightBytes
-            self.writeInFlight = false; self.inflightBytes = 0; self.writeDeadline = nil
+            guard let self, self.isCurrent(token) else { return }
+            guard self.socketCounter.completed(write, success: error == nil) != .stale else { return }
+            guard self.connection != nil, !self.cancelling, self.writeInFlight else { return }
+            self.writeInFlight = false; self.writeDeadline = nil
             if let error { self.failNetwork(token, error); return }
-            let sum = self.completedBytes.addingReportingOverflow(UInt64(bytes))
-            self.completedBytes = sum.overflow ? UInt64.max : sum.partialValue
-            self.bitrateWindowBytes += UInt64(bytes)
-            let elapsed = self.nowMs() - self.bitrateWindowMs
-            if elapsed >= 1_000 {
-                self.kilobitsPerSecond = self.bitrateWindowBytes * 8 / elapsed
-                self.bitrateWindowBytes = 0; self.bitrateWindowMs = self.nowMs()
-            }
             do {
                 try self.pumpOutput(token)
                 try self.updateProtocolStatus(token)
@@ -239,7 +237,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
                 return
             }
             let transport = destination.encrypted ? "RTMPS" : "plaintext RTMP"
-            setStatus(token, "Sending \(transport) · \(kilobitsPerSecond) kbit/s accepted by socket · playback unconfirmed")
+            setStatus(token, "Sending \(transport) · playback unconfirmed")
         case .handshaking: setStatus(token, "RTMP handshake · local recording active")
         case .connecting, .creatingStream, .awaitingPublish: setStatus(token, "Awaiting destination publish acceptance · local recording active")
         case .finishing: break
@@ -331,7 +329,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
         timer.cancel()
         try? publisher?.cancel(); publisher = nil
         connectDeadline = nil; protocolDeadline = nil; writeDeadline = nil; stopDeadline = nil
-        writeInFlight = false; finalizingTransport = false; inflightBytes = 0
+        writeInFlight = false; finalizingTransport = false
         guard let connection else { completeRelease(); return }
         guard !cancelling else { return }
         cancelling = true
@@ -339,7 +337,8 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     }
     private func completeRelease() {
         connection?.stateUpdateHandler = nil; connection = nil; cancelling = false
-        lock.lock(); released = true; accepting = false; lock.unlock()
+        let final = socketCounter.seal(nowNs: DispatchTime.now().uptimeNanoseconds)
+        lock.lock(); finalCounters = final; released = true; accepting = false; lock.unlock()
         let completions = stopCompletions; stopCompletions.removeAll()
         for completion in completions { completion() }
     }

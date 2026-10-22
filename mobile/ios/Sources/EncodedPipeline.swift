@@ -35,6 +35,9 @@ protocol EncodedPublishingSink: AnyObject {
     func offer(_ sample: MediaSample) throws
     func stop()
     func stop(completion: @escaping () -> Void)
+    func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void)
+    var finalSocketOutbound: SocketOutboundSample? { get }
+    func observeBroadcastEnd(_ completion: @escaping (UInt64) -> Void)
 }
 
 extension EncodedPublishingSink {
@@ -44,6 +47,9 @@ extension EncodedPublishingSink {
     func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void) { stop { completion(.success(())) } }
     func configure(video: MediaCodec, audio: MediaCodec) throws {}
     func stop(completion: @escaping () -> Void) { stop(); completion() }
+    func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) { completion(nil) }
+    var finalSocketOutbound: SocketOutboundSample? { nil }
+    func observeBroadcastEnd(_ completion: @escaping (UInt64) -> Void) {}
 }
 
 /// Connects native compressed data to the actual Rust descriptor validator.

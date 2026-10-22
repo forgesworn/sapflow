@@ -13,6 +13,9 @@ struct CaptureSnapshot {
     var recordingURL: URL?
     var canStart = false
     var running = false
+    var captureElapsedNs: UInt64?
+    var broadcastElapsedNs: UInt64?
+    var socketKilobitsPerSecond: Double?
 }
 
 extension CaptureEngine: V4vCreatorCapturePort {}
@@ -62,6 +65,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var stopReason: String?
     private var snapshot = CaptureSnapshot() // control queue only
     private var storageTimer: DispatchSourceTimer?
+    private var telemetryTimer: DispatchSourceTimer? // one per logical capture, survives rotation
+    private var telemetryIntent: CaptureAdmission.Preparation? // control queue only
+    private var telemetryReads = TelemetryReadAdmission<CaptureAdmission.Preparation>()
+    private var socketRate = SocketOutboundRate()
     private var notifications: [NSObjectProtocol] = []
     private let ingress = RustEncodedIngress()
     private let destinationLock = NSLock()
@@ -88,7 +95,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             })
         }
     }
-    deinit { for token in notifications { NotificationCenter.default.removeObserver(token) }; storageTimer?.cancel(); rotationTimeout?.cancel() }
+    deinit { for token in notifications { NotificationCenter.default.removeObserver(token) }; storageTimer?.cancel(); rotationTimeout?.cancel(); telemetryTimer?.cancel() }
 
     /// Attach a real bounded destination adapter before preparing. No endpoint
     /// or credential is inferred from a display label or bundled configuration.
@@ -144,8 +151,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             self.ingress.destination?.endDestination()
             self.ingress.destination = destination
             self.preparedIntent = ticket
+            destination?.observeBroadcastEnd { [weak self] instant in self?.admission.broadcastEnded(ticket, nowNs: instant) }
             if self.configuredProfile != ticket.profile { self.configured = false }
             self.snapshot.profile = ticket.profile
+            self.snapshot.captureElapsedNs = nil; self.snapshot.broadcastElapsedNs = nil; self.snapshot.socketKilobitsPerSecond = nil
             self.destinationLock.lock(); self.destinationFence = destination; self.destinationLock.unlock()
             self.snapshot.publisher = self.ingress.status
             self.publish(); completion(true)
@@ -362,7 +371,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 self.samples.sync { self.run = run }
                 self.snapshot.running = true; self.snapshot.canStart = false
             }
-            guard self.admission.started(ticket) else { self.stopOnControl(reason: nil); return }
+            guard self.admission.started(ticket, nowNs: DispatchTime.now().uptimeNanoseconds, broadcasting: self.ingress.destination != nil) else { self.stopOnControl(reason: nil); return }
+            self.beginTelemetry(ticket.preparation)
             self.snapshot.phase = "Recording"
             self.snapshot.detail = "Hardware encoder: \(run.video.implementation). Saving compressed video and audio locally."
             if !keepSavedSegment { self.snapshot.recordingURL = nil }
@@ -409,6 +419,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         if !rotationAllowed {
             stopIntent = admission.stop(); rotationIntent = nil
             orientationPlan.cancel()
+            stopTelemetry()
         }
         guard !stopping else { return }
         stopReason = reason
@@ -499,6 +510,47 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let folder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let available = try folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
         guard available > 200 * 1024 * 1024 else { throw CaptureFailure(message: "Less than 200 MiB storage available. Free space before recording.") }
+    }
+    private func beginTelemetry(_ intent: CaptureAdmission.Preparation) {
+        if telemetryIntent == intent, telemetryTimer != nil { return }
+        telemetryTimer?.setEventHandler {}; telemetryTimer?.cancel()
+        telemetryIntent = intent; telemetryReads.invalidate(); socketRate = SocketOutboundRate()
+        updateElapsed(intent, nowNs: DispatchTime.now().uptimeNanoseconds)
+        let timer = DispatchSource.makeTimerSource(queue: control)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in self?.readTelemetry(intent) }
+        telemetryTimer = timer; timer.resume()
+    }
+    @discardableResult private func updateElapsed(_ intent: CaptureAdmission.Preparation, nowNs: UInt64) -> CaptureElapsedSnapshot {
+        let value = admission.elapsed(intent, nowNs: nowNs)
+        snapshot.captureElapsedNs = value.captureNs; snapshot.broadcastElapsedNs = value.broadcastNs
+        return value
+    }
+    private func readTelemetry(_ intent: CaptureAdmission.Preparation) {
+        guard telemetryIntent == intent else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsed = updateElapsed(intent, nowNs: now)
+        socketRate.expire(nowNs: now)
+        snapshot.socketKilobitsPerSecond = elapsed.broadcastRunning ? socketRate.kilobitsPerSecond : nil
+        publish() // Other meter/statistics publications use only these cached metrics.
+        guard admission.currentPreparation == intent, elapsed.captureRunning, elapsed.broadcastRunning,
+              let destination = ingress.destination, let query = telemetryReads.begin(intent) else { return }
+        destination.readSocketOutbound { [weak self] sample in
+            guard let self else { return }
+            self.control.async {
+                guard self.telemetryReads.complete(query), self.telemetryIntent == intent,
+                      self.admission.currentPreparation == intent else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                let current = self.admission.elapsed(intent, nowNs: now)
+                self.socketRate.update(current.broadcastRunning ? sample : nil, nowNs: now)
+            }
+        }
+    }
+    private func stopTelemetry() {
+        telemetryTimer?.setEventHandler {}; telemetryTimer?.cancel(); telemetryTimer = nil
+        telemetryReads.invalidate(); socketRate = SocketOutboundRate()
+        if let intent = telemetryIntent { updateElapsed(intent, nowNs: DispatchTime.now().uptimeNanoseconds) }
+        snapshot.socketKilobitsPerSecond = nil
     }
     private func report(_ error: Error) { snapshot.phase = "Error"; snapshot.detail = error.localizedDescription; snapshot.canStart = false; publish() }
     private func publish() { let value = snapshot; DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = value.running; self.onChange?(value) } }

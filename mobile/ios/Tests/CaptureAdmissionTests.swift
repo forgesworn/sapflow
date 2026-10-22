@@ -2,6 +2,78 @@ import XCTest
 @testable import SapflowBroadcaster
 
 final class CaptureAdmissionTests: XCTestCase {
+    func testElapsedBeginsOnlyAtFirstCommittedStartAndFreezesExplicitStop() {
+        let gate = CaptureAdmission(), ticket = preparing(gate)
+        XCTAssertNil(gate.elapsed(ticket, nowNs: 50).captureNs)
+        XCTAssertTrue(gate.prepared(ticket)); let start = gate.reserveStart(ticket)!
+        XCTAssertNil(gate.elapsed(ticket, nowNs: 90).captureNs)
+        XCTAssertTrue(gate.started(start, nowNs: 100))
+        XCTAssertEqual(gate.elapsed(ticket, nowNs: 150).captureNs, 50)
+        XCTAssertFalse(gate.started(start, nowNs: 160))
+        _ = gate.stop(nowNs: 200); _ = gate.stop(nowNs: 300)
+        let stopped = gate.elapsed(ticket, nowNs: 1000)
+        XCTAssertEqual(stopped.captureNs, 100); XCTAssertEqual(stopped.broadcastNs, 100)
+        XCTAssertFalse(stopped.captureRunning); XCTAssertFalse(stopped.broadcastRunning)
+    }
+    func testRotationStartRetainsLogicalCaptureAndBroadcastAnchors() {
+        let gate = CaptureAdmission(), ticket = preparing(gate)
+        XCTAssertTrue(gate.prepared(ticket)); XCTAssertTrue(gate.started(gate.reserveStart(ticket)!, nowNs: 100))
+        let child = gate.beginRotation(ticket)!
+        XCTAssertEqual(gate.elapsed(ticket, nowNs: 500).captureNs, 400)
+        XCTAssertTrue(gate.started(gate.reserveRotationStart(child)!, nowNs: 1000))
+        XCTAssertEqual(gate.elapsed(ticket, nowNs: 1200).captureNs, 1100)
+        XCTAssertEqual(gate.elapsed(ticket, nowNs: 1200).broadcastNs, 1100)
+    }
+    func testDestinationEndFreezesOnlyBroadcastAndNeverRenewsItOnRotation() {
+        let gate = CaptureAdmission(), ticket = preparing(gate)
+        XCTAssertTrue(gate.prepared(ticket)); XCTAssertTrue(gate.started(gate.reserveStart(ticket)!, nowNs: 100))
+        gate.broadcastEnded(ticket, nowNs: 150); gate.broadcastEnded(ticket, nowNs: 180)
+        let child = gate.beginRotation(ticket)!
+        XCTAssertTrue(gate.started(gate.reserveRotationStart(child)!, nowNs: 200))
+        let value = gate.elapsed(ticket, nowNs: 300)
+        XCTAssertEqual(value.captureNs, 200); XCTAssertTrue(value.captureRunning)
+        XCTAssertEqual(value.broadcastNs, 50); XCTAssertFalse(value.broadcastRunning)
+    }
+    func testStopWinningAtCommitBoundaryCannotStartOrReviveElapsed() {
+        let gate = CaptureAdmission(), ticket = preparing(gate)
+        XCTAssertTrue(gate.prepared(ticket)); let queued = gate.reserveStart(ticket)!
+        _ = gate.stop(nowNs: 100)
+        XCTAssertFalse(gate.started(queued, nowNs: 101))
+        XCTAssertNil(gate.elapsed(ticket, nowNs: 200).captureNs)
+        let other = CaptureAdmission(), admitted = preparing(other)
+        XCTAssertTrue(other.prepared(admitted))
+        XCTAssertTrue(other.started(other.reserveStart(admitted)!, nowNs: 100))
+        _ = other.stop(nowNs: 101)
+        XCTAssertEqual(other.elapsed(admitted, nowNs: 1000).captureNs, 1)
+    }
+    func testEndBeforeFirstStartCannotManufactureBroadcastClock() {
+        let gate = CaptureAdmission(), ticket = preparing(gate)
+        gate.broadcastEnded(ticket, nowNs: 50)
+        XCTAssertTrue(gate.prepared(ticket)); XCTAssertTrue(gate.started(gate.reserveStart(ticket)!, nowNs: 100))
+        XCTAssertEqual(gate.elapsed(ticket, nowNs: 200).captureNs, 100)
+        XCTAssertNil(gate.elapsed(ticket, nowNs: 200).broadcastNs)
+        XCTAssertFalse(gate.elapsed(ticket, nowNs: 200).broadcastRunning)
+    }
+    func testLocalOnlyClockHasNoBroadcastAndClockRollbackDoesNotUnderflow() {
+        let gate = CaptureAdmission(), ticket = preparing(gate)
+        XCTAssertTrue(gate.prepared(ticket)); XCTAssertTrue(gate.started(gate.reserveStart(ticket)!, nowNs: 100, broadcasting: false))
+        XCTAssertNil(gate.elapsed(ticket, nowNs: 99).captureNs)
+        XCTAssertEqual(gate.elapsed(ticket, nowNs: 200).captureNs, 100)
+        XCTAssertNil(gate.elapsed(ticket, nowNs: 200).broadcastNs)
+        _ = gate.stop(nowNs: 90)
+        XCTAssertNil(gate.elapsed(ticket, nowNs: UInt64.max).captureNs)
+    }
+    func testRetiredDestinationEndCannotFreezeSuccessorClocks() {
+        let gate = CaptureAdmission(), old = preparing(gate)
+        XCTAssertTrue(gate.prepared(old)); XCTAssertTrue(gate.started(gate.reserveStart(old)!, nowNs: 100))
+        XCTAssertTrue(gate.completeStop(gate.stop(nowNs: 200), cleanupComplete: true))
+        let next = preparing(gate); XCTAssertTrue(gate.prepared(next))
+        XCTAssertTrue(gate.started(gate.reserveStart(next)!, nowNs: 1000))
+        gate.broadcastEnded(old, nowNs: 1001)
+        XCTAssertEqual(gate.elapsed(next, nowNs: 1010).broadcastNs, 10)
+        XCTAssertTrue(gate.elapsed(next, nowNs: 1010).broadcastRunning)
+        XCTAssertNil(gate.elapsed(old, nowNs: 1010).captureNs)
+    }
     func testDefaultPreparationPreserves720AndReservesProfileSelectionSynchronously() {
         let gate = CaptureAdmission()
         XCTAssertTrue(gate.canChooseCaptureProfile)

@@ -16,6 +16,7 @@ sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/Cap
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/CaptureProfileTests.swift" >> "$sapflow_scratch/main.swift"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/ReconnectControllerTests.swift" >> "$sapflow_scratch/main.swift"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/CaptureAdmissionTests.swift" >> "$sapflow_scratch/main.swift"
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/PublishingTelemetryTests.swift" >> "$sapflow_scratch/main.swift"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/BroadcasterDestinationSelectionTests.swift" >> "$sapflow_scratch/main.swift"
 cat >> "$sapflow_scratch/main.swift" <<'SWIFT'
 let suite = XCTestSuite(name: "Native broadcaster invariants")
@@ -27,13 +28,14 @@ suite.addTest(CaptureOrientationTests.defaultTestSuite)
 suite.addTest(CaptureProfileTests.defaultTestSuite)
 suite.addTest(ReconnectControllerTests.defaultTestSuite)
 suite.addTest(CaptureAdmissionTests.defaultTestSuite)
+suite.addTest(PublishingTelemetryTests.defaultTestSuite)
 suite.addTest(BroadcasterDestinationSelectionTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 88, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 109, result.hasSucceeded else { exit(1) }
 SWIFT
-swiftc -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
+swiftc -swift-version 5 -warnings-as-errors -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
   -Xlinker -rpath -Xlinker "$sapflow_frameworks" \
   -Xlinker -rpath -Xlinker "$sapflow_testlibs" \
-  "$sapflow_root/mobile/ios/Sources/EncodedWorkBudget.swift" "$sapflow_root/mobile/ios/Sources/DestinationProfile.swift" "$sapflow_root/mobile/ios/Sources/SrtDestination.swift" "$sapflow_root/mobile/ios/Sources/NativeDeadlineTimer.swift" "$sapflow_root/mobile/ios/Sources/CaptureOrientation.swift" "$sapflow_root/mobile/ios/Sources/CaptureProfile.swift" "$sapflow_root/mobile/ios/Sources/ReconnectController.swift" "$sapflow_root/mobile/ios/Sources/CaptureAdmission.swift" "$sapflow_root/mobile/ios/Sources/BroadcasterDestinationSelection.swift" "$sapflow_scratch/main.swift" \
+  "$sapflow_root/mobile/ios/Sources/PublishingTelemetry.swift" "$sapflow_root/mobile/ios/Sources/EncodedWorkBudget.swift" "$sapflow_root/mobile/ios/Sources/DestinationProfile.swift" "$sapflow_root/mobile/ios/Sources/SrtDestination.swift" "$sapflow_root/mobile/ios/Sources/NativeDeadlineTimer.swift" "$sapflow_root/mobile/ios/Sources/CaptureOrientation.swift" "$sapflow_root/mobile/ios/Sources/CaptureProfile.swift" "$sapflow_root/mobile/ios/Sources/ReconnectController.swift" "$sapflow_root/mobile/ios/Sources/CaptureAdmission.swift" "$sapflow_root/mobile/ios/Sources/BroadcasterDestinationSelection.swift" "$sapflow_scratch/main.swift" \
   -o "$sapflow_scratch/budget-tests"
 "$sapflow_scratch/budget-tests"

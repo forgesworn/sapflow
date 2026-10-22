@@ -31,6 +31,11 @@ final class CaptureAdmission {
     private var candidatePending = false
     private var stoppedOwnersClean = false
     private var hasCommittedRun = false
+    private var timingPreparation: Preparation?
+    private var captureBeganAtNs: UInt64?
+    private var captureStoppedAtNs: UInt64?
+    private var broadcastBeganAtNs: UInt64?
+    private var broadcastStoppedAtNs: UInt64?
 
     init(initialSerial: UInt64 = 0) { serial = initialSerial }
     private func locked<T>(_ body: () -> T) -> T {
@@ -51,6 +56,9 @@ final class CaptureAdmission {
             guard phase == .idle, let serial = next() else { return nil }
             let ticket = Preparation(serial: serial, profile: profile)
             preparation = ticket; candidatePending = true; hasCommittedRun = false; phase = .reserved
+            timingPreparation = ticket
+            captureBeganAtNs = nil; captureStoppedAtNs = nil
+            broadcastBeganAtNs = nil; broadcastStoppedAtNs = nil
             return ticket
         }
     }
@@ -86,9 +94,13 @@ final class CaptureAdmission {
     func permitsStart(_ ticket: Start) -> Bool {
         locked { preparation == ticket.preparation && starting == ticket && phase == .starting }
     }
-    func started(_ ticket: Start) -> Bool {
+    func started(_ ticket: Start, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds, broadcasting: Bool = true) -> Bool {
         locked {
             guard preparation == ticket.preparation, starting == ticket, phase == .starting else { return false }
+            if !hasCommittedRun {
+                captureBeganAtNs = nowNs
+                if broadcasting && broadcastStoppedAtNs == nil { broadcastBeganAtNs = nowNs }
+            }
             starting = nil; hasCommittedRun = true; phase = .running; return true
         }
     }
@@ -114,24 +126,50 @@ final class CaptureAdmission {
     }
     /// Synchronous invalidation precedes queued cancellation. Duplicate Stop
     /// joins the same cleanup owner; it cannot release that owner's capacity.
-    func stop() -> Stop {
-        locked { stopLocked() }
+    func stop(nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Stop {
+        locked { stopLocked(nowNs: nowNs) }
     }
     /// Ending a destination retires its initial camera approval, while an
     /// existing recording keeps its intent through rotation and restart.
-    func stopIfPending(_ ticket: Preparation) -> Stop? {
+    func stopIfPending(_ ticket: Preparation, nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Stop? {
         locked {
             guard preparation == ticket, !hasCommittedRun, phase != .idle else { return nil }
-            return stopLocked()
+            return stopLocked(nowNs: nowNs)
         }
     }
-    private func stopLocked() -> Stop {
+    private func stopLocked(nowNs: UInt64) -> Stop {
+        if captureStoppedAtNs == nil { captureStoppedAtNs = nowNs }
+        if broadcastStoppedAtNs == nil { broadcastStoppedAtNs = nowNs }
         if let stopping { return stopping }
         // At serial exhaustion no fresh preparation can ever be admitted.
         // A saturated cleanup ticket still permits the current owner to stop.
         let value = Stop(serial: next() ?? UInt64.max, preparation: preparation)
         stopping = value; starting = nil; rotation = nil; phase = .stopping
         return value
+    }
+    /// Cold destination End/expiry only. Never stops the independent capture or
+    /// starts a clock. A retired ticket cannot alter a successor's elapsed time.
+    func broadcastEnded(_ ticket: Preparation, nowNs: UInt64) {
+        locked {
+            guard preparation == ticket, timingPreparation == ticket else { return }
+            broadcastStoppedAtNs = min(broadcastStoppedAtNs ?? nowNs, nowNs)
+        }
+    }
+    func elapsed(_ ticket: Preparation, nowNs: UInt64) -> CaptureElapsedSnapshot {
+        locked {
+            guard timingPreparation == ticket else {
+                return CaptureElapsedSnapshot(captureNs: nil, broadcastNs: nil, captureRunning: false, broadcastRunning: false)
+            }
+            func duration(_ start: UInt64?, _ stop: UInt64?) -> UInt64? {
+                guard let start else { return nil }
+                let end = stop ?? nowNs
+                return end >= start ? end - start : nil
+            }
+            return CaptureElapsedSnapshot(captureNs: duration(captureBeganAtNs, captureStoppedAtNs),
+                broadcastNs: duration(broadcastBeganAtNs, broadcastStoppedAtNs),
+                captureRunning: captureBeganAtNs != nil && captureStoppedAtNs == nil,
+                broadcastRunning: broadcastBeganAtNs != nil && broadcastStoppedAtNs == nil)
+        }
     }
     func permitsStop(_ ticket: Stop) -> Bool {
         locked { stopping == ticket && (phase == .stopping || phase == .retained) }

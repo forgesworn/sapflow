@@ -254,6 +254,11 @@ struct BroadcasterView: View {
                 Text("LOCAL PREVIEW").font(.caption.bold()).padding(8).background(.black.opacity(0.6)).foregroundStyle(.white).padding()
             }
     }
+    private func elapsed(_ nanoseconds: UInt64?) -> String {
+        guard let nanoseconds else { return "Unavailable" }
+        let seconds = nanoseconds / 1_000_000_000
+        return String(format: "%02llu:%02llu:%02llu", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    }
     private var controls: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
@@ -261,6 +266,12 @@ struct BroadcasterView: View {
                 Text(model.snapshot.phase).font(.headline)
                 Text(model.snapshot.detail).font(.callout)
                 Label(model.snapshot.publisher, systemImage: model.recordingOnly ? "record.circle" : "antenna.radiowaves.left.and.right")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Capture elapsed \(elapsed(model.snapshot.captureElapsedNs)) · Broadcast elapsed \(elapsed(model.snapshot.broadcastElapsedNs))")
+                    .font(.caption.monospacedDigit()).accessibilityIdentifier("capture.elapsed")
+                Text(model.snapshot.socketKilobitsPerSecond.map { $0 > 0 && $0 < 1 ? "Socket outbound <1 kbit/s" : String(format: "Socket outbound %.0f kbit/s", $0) } ?? "Socket outbound unavailable")
+                    .font(.caption.monospacedDigit()).accessibilityIdentifier("publisher.socketOutbound")
+                Text("Socket outbound measures local network-stack throughput, not peer delivery or verified playback. Capture elapsed is not saved recording duration.")
                     .font(.caption).foregroundStyle(.secondary)
                 ProgressView(value: Double(model.snapshot.level + 60), total: 60).accessibilityLabel("Microphone level")
                 Text("Mic \(Int(model.snapshot.level)) dBFS · encoded \(model.snapshot.encoded) · capture drops \(model.snapshot.captureDrops)").font(.caption.monospacedDigit())
