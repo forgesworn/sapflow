@@ -115,6 +115,7 @@ final class BroadcasterModel: ObservableObject {
     func checkCreatorStatus() { creatorOwner?.status() }
     func retryCreatorAction() { creatorOwner?.retryPending() }
     func endBroadcast() { creatorOwner?.end() }
+    func endExistingBroadcast(_ expected: V4vIdentity) { creatorOwner?.endExisting(expected: expected) }
     func acknowledgeRecovery() { creatorOwner?.acknowledgeRecovery() }
     func prepareReplacement() {
         guard recordingLibrary.captureAllowed, engine.canReservePreparation else { return }
@@ -239,6 +240,8 @@ struct BroadcasterView: View {
     @ObservedObject private var recordings: RecordingLibraryOwner
     @Environment(\.scenePhase) private var scenePhase
     @State private var confirmEnd = false
+    @State private var confirmEndExisting = false
+    @State private var confirmedEndExistingIdentity: V4vIdentity?
     @State private var confirmRecovery = false
     init(model: BroadcasterModel) {
         self.model = model
@@ -279,6 +282,14 @@ struct BroadcasterView: View {
             Button("End broadcast", role: .destructive) { model.endBroadcast() }
         } message: {
             Text("Publishing will end. A local recording already in progress will continue until you choose Stop and save.")
+        }
+        .confirmationDialog("End the existing V4V broadcast?", isPresented: $confirmEndExisting, titleVisibility: .visible) {
+            Button("End existing broadcast", role: .destructive) {
+                if let expected = confirmedEndExistingIdentity { model.endExistingBroadcast(expected) }
+                confirmedEndExistingIdentity = nil
+            }
+        } message: {
+            Text("Sapflow will recheck the exact remote session before saving and sending End. It will not start or adopt its camera stream.")
         }
         .confirmationDialog("Acknowledge the incomplete replay?", isPresented: $confirmRecovery, titleVisibility: .visible) {
             Button("Acknowledge incomplete replay", role: .destructive) { model.acknowledgeRecovery() }
@@ -419,6 +430,13 @@ struct BroadcasterView: View {
             }.buttonStyle(.bordered)
             Button("End broadcast", role: .destructive) { confirmEnd = true }
                 .disabled(!model.creator.canEnd).accessibilityIdentifier("v4v.end")
+            if model.creator.canEndExisting {
+                Button("End existing broadcast", role: .destructive) {
+                    confirmedEndExistingIdentity = model.creator.endExistingIdentity
+                    confirmEndExisting = confirmedEndExistingIdentity != nil
+                }
+                    .accessibilityIdentifier("v4v.end-existing")
+            }
             if model.creator.canAcknowledge {
                 Button("Acknowledge incomplete replay", role: .destructive) { confirmRecovery = true }
                     .accessibilityIdentifier("v4v.acknowledge-recovery")

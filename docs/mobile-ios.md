@@ -71,6 +71,17 @@ session without matching local ownership is a visible conflict, not a grant
 to adopt it. Restored credentials require fresh authentication; a restored
 publish session requires a fresh acknowledged refresh before use.
 
+An authenticated event may also show an active broadcast for which this app
+has no local journal. Its separate **End existing broadcast** action freezes the
+exact event, session, generation and revision shown by the confirmation dialog,
+then performs a fresh exact-session status read. The read permit lasts at most
+eight seconds and remains inside the command's original 60-second window. Only
+an exact, still-active response can atomically save terminal-only ownership and
+End intent before the ordinary durable End pump runs. This path never accepts a
+publishing grant, constructs a publisher, prepares the camera or adopts capture.
+A changed identity, late response, non-active phase or journal failure leaves
+the journal without that session and sends no End mutation.
+
 The control path admits one ordinary command and one primary HTTP request at
 a time. Session HTTP operations have an original 60-second window and at most
 four attempts. Explicit sign-in has a separate original 120-second limit that

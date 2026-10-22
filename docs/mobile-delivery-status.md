@@ -374,6 +374,24 @@ of delayed display state. Closed creator owners retain the observation slot,
 HTTP, signer and journal ownership until actual cleanup. The fixed production
 journal lock prevents a replacement production owner overlapping that cleanup.
 
+The current iOS source also gives an authenticated creator an explicit way to
+end an active event broadcast that has no local journal. The destructive
+confirmation carries the exact displayed event/session/generation/revision into
+the owner. A fresh exact-session GET must complete within both its eight-second
+permit and the original 60-second command window. Only an exact active receipt
+is atomically persisted with terminal End intent; no grant, publisher, camera
+preparation or capture authority is adopted. Identity changes, contradictory or
+late replies and journal-save failure send no End. The resulting terminal scope
+then uses the existing durable End request and restart/retry rules.
+
+This packet passes 72 Foundation control/authentication tests and 40 creator-owner
+tests against the actual Apple packages. The generic unsigned arm64 Debug app
+also builds with warnings treated as errors. Independent review found and the
+implementation closed both a stale confirmation identity race and a retry that
+could otherwise adopt terminal ownership after the original command window.
+These are host and compiler gates; no service request, signer consent, signed
+installation or physical iPhone flow was exercised.
+
 V4V is unavailable by default in Debug and Release. A separate Qualification
 configuration requires explicit approved routing and native authentication.
 Qualification settings do not enable the ordinary configurations. These source

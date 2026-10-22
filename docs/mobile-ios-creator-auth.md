@@ -2,8 +2,10 @@
 
 The cold `sapflow-signet-ffi` library and `SignetAuth` Swift module reuse
 ForgeSworn's maintained Signet NIP-46 wrapper. They are separate from Sapflow's
-media library and runtime. The application UI and existing signed phone app do
-not yet enable this connector.
+media library and runtime. The application source includes the explicit creator
+UI, while ordinary Debug and Release builds keep the connector disabled. The
+previously installed signed phone app is a separate frozen artefact; no current
+physical connector acceptance follows from the source integration.
 
 A caller explicitly supplies a bunker URI or chooses restore from the encrypted
 client-credential journal. Only WSS relays are admitted. Restore retains the

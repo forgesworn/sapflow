@@ -49,7 +49,8 @@ final class V4vCreatorOwner: @unchecked Sendable {
         var message = "Loading creator state"
         var error: String?
         var canSignIn = false, canCancelSignIn = false, canReloadEvents = false, canSelectEvent = false
-        var canPrepare = false, canStart = false, canRefresh = false, canStatus = false, canEnd = false
+        var canPrepare = false, canStart = false, canRefresh = false, canStatus = false, canEnd = false, canEndExisting = false
+        var endExistingIdentity: V4vIdentity?
         var canRetry = false, canAcknowledge = false, canReplace = false, closing = false
     }
     typealias HTTPFactory = (@escaping () -> Void) -> V4vCreatorHTTP
@@ -108,7 +109,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         var sawCaptureActivity = false
     }
     private struct Window { let end: UInt64; let command: UInt64; var attempts = 0 }
-    private enum Read { case events, current(String), status(V4vIdentity) }
+    private enum Read { case events, current(String), status(V4vIdentity), remoteEnd(V4vRemoteEndRead) }
     private enum Purpose { case mutation(V4vOperation), read(Read) }
 
     init(profile: V4vConnectorProfile, journal: V4vJournalStore, credentials: V4vSignetCredentialStore,
@@ -239,6 +240,19 @@ final class V4vCreatorOwner: @unchecked Sendable {
     }
     @discardableResult func status() -> Bool {
         command { [self] _ in guard let identity = engine?.session?.identity else { throw V4vFailure.terminal }; try read(.status(identity)) }
+    }
+    /// The explicit remote-End control is the only path from a collection row
+    /// to local durable state. It first performs a short-lived exact-SID read.
+    @discardableResult func endExisting(expected: V4vIdentity) -> Bool {
+        command { [self] _ in
+            guard let engine, engine.session == nil, engine.pending == nil, binding == nil,
+                  !capturePrepared, !captureRunning, !captureStopping,
+                  let selected = value.selectedEvent, let remote = current?.receipt,
+                  remote.identity == expected, remote.identity.eventId == selected,
+                  remote.phase == "active", !remote.terminal, !remote.endComplete else { throw V4vFailure.conflict }
+            let read = try engine.remoteEndStatusRequest(identity: remote.identity, clock: clock())
+            try beginWindow(); send(read.call, purpose: .read(.remoteEnd(read)))
+        }
     }
     /// This scalar admission is authoritative even while the UI snapshot lags.
     var canChangeCaptureSettings: Bool {
@@ -466,6 +480,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         case .events: call = try engine.creatorEventsRequest(clock: clock())
         case let .current(event): call = try engine.currentRequest(event: event, clock: clock())
         case .status: call = try engine.sessionStatusRequest(clock: clock())
+        case let .remoteEnd(read): call = read.call
         }
         try beginWindow(); send(call, purpose: .read(kind))
     }
@@ -540,6 +555,11 @@ final class V4vCreatorOwner: @unchecked Sendable {
                     // discard pending, restore a grant or supply capture intent.
                     try engine.applyStatus(json, clock: clock())
                     if live(token), engine.pending == nil { lastFreshStatus = (parsed.receipt.identity, clock().monotonicNs) }
+                case let .remoteEnd(read):
+                    guard withinWindow, live(token), value.selectedEvent == read.identity.eventId,
+                          current?.receipt?.identity == read.identity, engine.session == nil else { throw V4vFailure.conflict }
+                    try engine.commitRemoteEnd(json, for: read, clock: clock())
+                    current = nil; ending = true; pump(); publish(); return
                 }
                 if ending, engine.session?.endComplete != true, engine.session?.recoveryState == nil { retry(purpose: nil) }
                 else { completeWindow() }
@@ -570,6 +590,9 @@ final class V4vCreatorOwner: @unchecked Sendable {
                     case .events: call = try engine.creatorEventsRequest(clock: self.clock())
                     case let .current(event): call = try engine.currentRequest(event: event, clock: self.clock())
                     case .status: call = try engine.sessionStatusRequest(clock: self.clock())
+                    case let .remoteEnd(old):
+                        let read = try engine.remoteEndStatusRequest(identity: old.identity, clock: self.clock())
+                        self.send(read.call, purpose: .read(.remoteEnd(read))); return
                     }
                     self.send(call, purpose: .read(kind))
                 } catch { self.fail(error); self.completeWindow() }
@@ -633,6 +656,10 @@ final class V4vCreatorOwner: @unchecked Sendable {
         value.canRefresh = free && authenticated && engine?.pending == nil && engine?.session?.phase == "active" && engine?.terminalIntent == false
         value.canStatus = free && authenticated && engine?.session != nil
         value.canEnd = value.ready && !cold.closed && (engine?.pending != nil || (engine?.session != nil && engine?.session?.endComplete == false))
+        value.canEndExisting = free && authenticated && idleCapture && engine?.session == nil && engine?.pending == nil &&
+            current?.receipt?.identity.eventId == value.selectedEvent && current?.receipt?.phase == "active" &&
+            current?.receipt?.terminal == false && current?.receipt?.endComplete == false
+        value.endExistingIdentity = value.canEndExisting ? current?.receipt?.identity : nil
         value.canRetry = free && authenticated && (engine?.pending != nil || (engine?.terminalIntent == true && engine?.session?.endComplete == false && engine?.session?.recoveryState == nil))
         value.canAcknowledge = free && authenticated && engine?.pending == nil && engine?.session?.origin?.recoveryOffered == true && engine?.session?.recoveryState == nil && lastFreshStatus?.0 == engine?.session?.identity
         value.canReplace = free && authenticated && idleCapture && engine?.session?.recoveryState == "acknowledged"

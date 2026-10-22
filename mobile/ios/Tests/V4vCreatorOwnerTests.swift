@@ -377,6 +377,98 @@ final class V4vCreatorOwnerTests: XCTestCase {
         XCTAssertTrue(f.owner.selectEvent(V4vFixture.event)); f.flush(); f.answer(.success(V4vFixture.answer(grant: nil)))
         XCTAssertTrue(f.owner.prepare()); f.flush(); XCTAssertEqual(f.calls.count, 2); XCTAssertTrue(f.publishers.isEmpty); XCTAssertNotNil(f.last.error)
     }
+    func testExplicitRemoteEndUsesFreshExactStatusAndNeverCreatesCaptureAuthority() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }
+        XCTAssertTrue(f.owner.reloadEvents()); f.flush()
+        f.answer(.success(.object(["ok": .bool(true), "events": .array([.object(["id": .string(V4vFixture.event)])])])))
+        XCTAssertTrue(f.owner.selectEvent(V4vFixture.event)); f.flush()
+        f.answer(.success(V4vFixture.answer(grant: nil)))
+        XCTAssertTrue(f.last.canEndExisting); XCTAssertFalse(f.last.canEnd); XCTAssertTrue(f.publishers.isEmpty)
+
+        let confirmed = try XCTUnwrap(f.last.endExistingIdentity)
+        XCTAssertTrue(f.owner.endExisting(expected: confirmed)); f.flush()
+        XCTAssertEqual(f.calls.last?.method, "GET")
+        XCTAssertEqual(f.calls.last?.path, "/api/live-events/\(V4vFixture.event)/native-session/\(V4vFixture.sid)")
+        XCTAssertEqual(f.capture.reservations, 0); XCTAssertTrue(f.publishers.isEmpty)
+        f.answer(.success(V4vFixture.answer(V4vFixture.session(2), grant: nil)))
+        XCTAssertEqual(f.calls.last?.method, "POST"); XCTAssertTrue(f.calls.last?.path.hasSuffix("/\(V4vFixture.sid)/end") == true)
+        let body = try V4vJSON.parse(XCTUnwrap(f.calls.last?.body)).object(required: ["revision", "idempotencyKey"])
+        XCTAssertEqual(try body.uint("revision"), 2)
+        XCTAssertEqual(f.capture.reservations, 0); XCTAssertEqual(f.capture.prepared, 0); XCTAssertTrue(f.publishers.isEmpty)
+
+        let origin = V4vFixture.origin(3, state: "revoked", recording: "never-started")
+        f.answer(.success(V4vFixture.answer(V4vFixture.session(3, phase: "ended", origin: origin, complete: true), grant: nil)))
+        XCTAssertTrue(f.last.endComplete); XCTAssertEqual(f.last.phase, "ended")
+        XCTAssertEqual(f.capture.reservations, 0); XCTAssertTrue(f.publishers.isEmpty)
+    }
+    func testRemoteEndContradictionOrJournalFailureCannotAdoptOrSendEnd() throws {
+        do {
+            let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }
+            XCTAssertTrue(f.owner.reloadEvents()); f.flush()
+            f.answer(.success(.object(["ok": .bool(true), "events": .array([.object(["id": .string(V4vFixture.event)])])])))
+            XCTAssertTrue(f.owner.selectEvent(V4vFixture.event)); f.flush(); f.answer(.success(V4vFixture.answer(grant: nil)))
+            let confirmed = try XCTUnwrap(f.last.endExistingIdentity)
+            XCTAssertTrue(f.owner.endExisting(expected: confirmed)); f.flush(); let before = f.calls.count
+            let successor = V4vFixture.session(generation: 2, sid: String(repeating: "c", count: 32))
+            f.answer(.success(V4vFixture.answer(successor, grant: nil)))
+            XCTAssertEqual(f.calls.count, before); XCTAssertFalse(f.last.canEnd); XCTAssertEqual(f.capture.reservations, 0); XCTAssertTrue(f.publishers.isEmpty)
+        }
+        do {
+            let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }
+            XCTAssertTrue(f.owner.reloadEvents()); f.flush()
+            f.answer(.success(.object(["ok": .bool(true), "events": .array([.object(["id": .string(V4vFixture.event)])])])))
+            XCTAssertTrue(f.owner.selectEvent(V4vFixture.event)); f.flush(); f.answer(.success(V4vFixture.answer(grant: nil)))
+            let confirmed = try XCTUnwrap(f.last.endExistingIdentity)
+            XCTAssertTrue(f.owner.endExisting(expected: confirmed)); f.flush(); let before = f.calls.count
+            f.queue.sync { f.journal.failSave = true }
+            f.answer(.success(V4vFixture.answer(V4vFixture.session(2), grant: nil)))
+            XCTAssertEqual(f.calls.count, before); XCTAssertEqual(f.capture.reservations, 0); XCTAssertTrue(f.publishers.isEmpty)
+        }
+    }
+    func testStaleRemoteEndConfirmationCannotTargetAnotherIdentity() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }
+        XCTAssertTrue(f.owner.reloadEvents()); f.flush()
+        f.answer(.success(.object(["ok": .bool(true), "events": .array([.object(["id": .string(V4vFixture.event)])])])))
+        XCTAssertTrue(f.owner.selectEvent(V4vFixture.event)); f.flush(); f.answer(.success(V4vFixture.answer(grant: nil)))
+        let confirmed = try XCTUnwrap(f.last.endExistingIdentity)
+        let successor = try V4vIdentity(eventId: confirmed.eventId, generation: confirmed.generation + 1,
+                                        sessionId: String(repeating: "c", count: 32), revision: 1)
+        let before = f.calls.count
+        XCTAssertTrue(f.owner.endExisting(expected: successor)); f.flush()
+        XCTAssertEqual(f.calls.count, before)
+        let saved = try XCTUnwrap(f.journal.document).object(
+            required: ["version", "apiOrigin", "clockFloorMs", "terminalIntent"],
+            optional: ["pubkey", "bearer", "bearerExpiresMs"])
+        XCTAssertNil(saved["session"])
+        XCTAssertEqual(f.capture.reservations, 0); XCTAssertTrue(f.publishers.isEmpty)
+    }
+    func testRemoteEndRetryResponseAfterOriginalWindowCannotAdopt() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }
+        XCTAssertTrue(f.owner.reloadEvents()); f.flush()
+        f.answer(.success(.object(["ok": .bool(true), "events": .array([.object(["id": .string(V4vFixture.event)])])])))
+        XCTAssertTrue(f.owner.selectEvent(V4vFixture.event)); f.flush(); f.answer(.success(V4vFixture.answer(grant: nil)))
+        let confirmed = try XCTUnwrap(f.last.endExistingIdentity)
+        XCTAssertTrue(f.owner.endExisting(expected: confirmed)); f.flush()
+        let firstReadCount = f.calls.count
+
+        f.queue.sync { f.elapsed = 58_000 }
+        f.answer(.failure(.unavailable))
+        f.queue.sync { f.elapsed = 59_000 }
+        let retryDeadline = Date().addingTimeInterval(2)
+        while f.calls.count == firstReadCount, Date() < retryDeadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        XCTAssertEqual(f.calls.count, firstReadCount + 1, "the bounded retry should issue a fresh exact-SID read")
+        XCTAssertEqual(f.calls.last?.path, "/api/live-events/\(V4vFixture.event)/native-session/\(V4vFixture.sid)")
+
+        let before = f.journal.document
+        f.queue.sync { f.elapsed = 60_001 }
+        f.answer(.success(V4vFixture.answer(
+            V4vFixture.session(2, expiry: V4vFixture.time + 120_000), grant: nil)))
+        XCTAssertEqual(f.journal.document, before)
+        XCTAssertEqual(f.calls.count, firstReadCount + 1, "an expired command cannot send End")
+        XCTAssertEqual(f.capture.reservations, 0); XCTAssertTrue(f.publishers.isEmpty)
+    }
     func testRefreshOnlyCommitsPublisherAfterDurableAcknowledgement() throws {
         let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
         XCTAssertTrue(f.owner.refresh()); f.flush(); XCTAssertEqual(f.publishers[0].commits, 0)

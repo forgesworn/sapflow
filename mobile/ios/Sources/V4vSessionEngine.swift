@@ -23,6 +23,17 @@ struct V4vObservationStatusPermit: CustomStringConvertible, CustomDebugStringCon
     var debugDescription: String { description }
 }
 
+/// One short-lived exact-session read used only to end a remotely discovered
+/// session. It cannot provide a publishing grant or become a general adoption
+/// path; the response and terminal intent are committed together.
+struct V4vRemoteEndRead: CustomStringConvertible, CustomDebugStringConvertible {
+    let call: V4vHTTPCall
+    let identity: V4vIdentity
+    let expiresAtNs: UInt64
+    var description: String { "Ephemeral V4V remote End read (redacted)" }
+    var debugDescription: String { description }
+}
+
 struct V4vPublishingGrantPermit: CustomStringConvertible, CustomDebugStringConvertible {
     let grant: V4vGrant
     let expiresAtNs: UInt64
@@ -205,6 +216,35 @@ final class V4vSessionEngine {
         let bearer = try auth(clock)
         guard let session else { throw V4vFailure.terminal }
         return V4vHTTPCall(status: session.identity, bearer: bearer)
+    }
+    /// A collection response never reaches the journal. This issues a fresh
+    /// exact-SID GET only while there is no local scope to reconcile.
+    func remoteEndStatusRequest(identity: V4vIdentity, clock: V4vClock) throws -> V4vRemoteEndRead {
+        try tick(clock: clock)
+        let bearer = try auth(clock)
+        guard session == nil, pending == nil, !terminalIntent, grant == nil, expiredScope == nil,
+              clock.monotonicNs <= UInt64.max - 8_000_000_000 else { throw V4vFailure.conflict }
+        return V4vRemoteEndRead(call: V4vHTTPCall(status: identity, bearer: bearer), identity: identity,
+                               expiresAtNs: clock.monotonicNs + 8_000_000_000)
+    }
+    /// Commits only terminal ownership. The fresh receipt and terminal intent
+    /// share one durable write, so a crash can never expose it as capture scope.
+    func commitRemoteEnd(_ answer: V4vJSON, for read: V4vRemoteEndRead, clock: V4vClock) throws {
+        fencePublisher()
+        guard clock.monotonicNs <= read.expiresAtNs else { throw V4vFailure.unavailable }
+        _ = try auth(clock)
+        guard session == nil, pending == nil, !terminalIntent, grant == nil, expiredScope == nil else { throw V4vFailure.conflict }
+        let receipt = try V4vCreatorSessionStatus(answer, requested: read.identity).receipt
+        guard receipt.phase == "active", !receipt.terminal, !receipt.endComplete, receipt.expiresMs > lastMs else { throw V4vFailure.terminal }
+        var d = document
+        d["session"] = receipt.raw
+        d["terminalIntent"] = .bool(true)
+        d.removeValue(forKey: "grant")
+        d.removeValue(forKey: "expiredScope")
+        d.removeValue(forKey: "grantPolicy")
+        d.removeValue(forKey: "grantExpiryMs")
+        try save(d)
+        session = receipt; terminalIntent = true; grant = nil; expiredScope = nil; restoredRequiresRefresh = true
     }
     /// Fresh exact-session GET for the observer's separate control client.
     /// Neither the journal nor a collection lookup is an observation receipt.
