@@ -1,10 +1,16 @@
 [package]
-name = "sapflow-server"
+name = "sapflow"
+description = "A small live media server: SRT or RTMP in (H.264, AAC), Low-Latency HLS out, fragmented MP4 recording and a stream-health webhook. Pure Rust, no unsafe."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["media-server", "srt", "rtmp", "hls", "streaming"]
+categories = ["multimedia::video", "command-line-utilities"]
 
 [features]
 fuzzing = []
@@ -16,10 +22,10 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8.9"
 bytes = "1.12.1"
-sapflow-core = { path = "../sapflow-core" }
-sapflow-hls = { path = "../sapflow-hls" }
-sapflow-srt = { path = "../sapflow-srt" }
-tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util"] }
+sapflow-core = { path = "../sapflow-core", version = "0.1.0" }
+sapflow-hls = { path = "../sapflow-hls", version = "0.1.0" }
+sapflow-srt = { path = "../sapflow-srt", version = "0.1.0" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util"] }
 tracing = "0.1.44"
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio", "service"] }

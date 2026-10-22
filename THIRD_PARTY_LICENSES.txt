@@ -4986,7 +4986,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-tokio 1.54.0  (MIT)
+tokio 1.54.1  (MIT)
 https://github.com/tokio-rs/tokio
 ==============================================================================
 --- LICENSE

@@ -1322,61 +1322,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "sapflow-bench"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "rcgen",
- "rustls",
- "tokio",
- "tokio-rustls",
-]
-
-[[package]]
-name = "sapflow-client"
-version = "0.0.0"
-dependencies = [
- "h264-reader",
- "mpeg2ts",
- "sapflow-srt",
-]
-
-[[package]]
-name = "sapflow-core"
-version = "0.0.0"
-
-[[package]]
-name = "sapflow-ffi"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "sapflow-client",
- "sapflow-hls",
- "sapflow-srt",
- "uniffi",
-]
-
-[[package]]
-name = "sapflow-hls"
-version = "0.0.0"
-dependencies = [
- "adts-reader",
- "bytes",
- "h264-reader",
- "hmac 0.12.1",
- "mp4-atom",
- "mpeg2ts",
- "sha2",
- "tracing",
-]
-
-[[package]]
-name = "sapflow-server"
-version = "0.0.0"
+name = "sapflow"
+version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1399,8 +1346,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "sapflow-bench"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "sapflow-client"
+version = "0.1.0"
+dependencies = [
+ "h264-reader",
+ "mpeg2ts",
+ "sapflow-srt",
+]
+
+[[package]]
+name = "sapflow-core"
+version = "0.1.0"
+
+[[package]]
+name = "sapflow-ffi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "sapflow-client",
+ "sapflow-hls",
+ "sapflow-srt",
+ "uniffi",
+]
+
+[[package]]
+name = "sapflow-hls"
+version = "0.1.0"
+dependencies = [
+ "adts-reader",
+ "bytes",
+ "h264-reader",
+ "hmac 0.12.1",
+ "mp4-atom",
+ "mpeg2ts",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
 name = "sapflow-srt"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes",
  "aes-kw",
@@ -1758,9 +1758,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.54.0"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",

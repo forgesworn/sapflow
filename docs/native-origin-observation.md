@@ -42,7 +42,7 @@ propagation and cleanup when individual child or scratch operations fail.
 Use this worktree's existing Rust target. The output directory must be new.
 
 ```sh
-cargo build --locked -j2 -p sapflow-server
+cargo build --locked -j2 -p sapflow
 mkdir -p target/native-origin-reader
 swiftc -swift-version 5 -warnings-as-errors -O \
   tests/native/OriginFragmentDecode.swift \

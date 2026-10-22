@@ -2,12 +2,13 @@
 
 A checklist for the maintainer. Nothing here has been published; every step
 that publishes, reserves a name or creates a credential is the maintainer's.
+The preparation (metadata, version, READMEs, docs, the rename) is done; what
+remains is the dry run, the credentials and the publish itself.
 
 ## Why
 
 Rust users and coding agents look for libraries on crates.io, docs.rs and
-lib.rs. Today the crates exist only in this repository (`publish = false`,
-version 0.0.0), so a search for a Rust SRT, RTMP or LL-HLS crate cannot find
+lib.rs. Until then the crates exist only in this repository, so a search for a Rust SRT, RTMP or LL-HLS crate cannot find
 them, and using one means a git dependency.
 
 ## Names
@@ -29,35 +30,33 @@ Publish in dependency order. Each internal `path` dependency needs a
 | 3 | `sapflow-hls` | yes | RTMP, MPEG-TS ingest and LL-HLS packaging |
 | 4 | `sapflow-client` | later | Depends on `sapflow-srt`; its API is still moving with the mobile work |
 | 5 | `sapflow-ffi` | no | A Swift/Kotlin binding, shipped as native packages, not as a Rust library |
-| 6 | the server | yes, as `sapflow` | Rename the package from `sapflow-server` to `sapflow` so `cargo install sapflow` gives the `sapflow` binary |
+| 6 | `sapflow` | yes | The server; the package was renamed from `sapflow-server` (its directory keeps the old name) so `cargo install sapflow` gives the `sapflow` binary |
 | - | `sapflow-bench` | no | Internal test tool |
 
 ## Per crate, before publishing
 
-- [ ] `publish = true` on the crate (the workspace default stays `false`, so
+- [x] `publish = true` on the crate (the workspace default stays `false`, so
       `sapflow-bench` and `sapflow-ffi` cannot go out by accident).
-- [ ] Version `0.1.0`. 0.x tells users the API may still change, which is
+- [x] Version `0.1.0`. 0.x tells users the API may still change, which is
       true; `docs/library-quality-plan.md` LQ5 sets the bar for promising more.
-- [ ] `description`, up to five `keywords` and `categories`, and `readme`.
-      Suggested:
-  - `sapflow-srt`: keywords `srt`, `streaming`, `sans-io`, `live`, `udp`;
+- [x] `description`, up to five `keywords` and `categories`, and `readme`:
+  - `sapflow-srt`: keywords `srt`, `streaming`, `sans-io`, `live`, `video`;
     categories `network-programming`, `multimedia::video`.
-  - `sapflow-hls`: keywords `hls`, `ll-hls`, `rtmp`, `mpeg-ts`, `streaming`;
+  - `sapflow-hls`: keywords `hls`, `ll-hls`, `rtmp`, `mpeg-ts`, `fmp4`;
     categories `multimedia::video`, `network-programming`.
   - `sapflow`: keywords `media-server`, `srt`, `rtmp`, `hls`, `streaming`;
     categories `multimedia::video`, `command-line-utilities`.
-- [ ] A README per crate. `sapflow-srt` has one; `sapflow-hls`, `sapflow-core`
-      and the server need one (the server can point at the root README).
-- [ ] `cargo doc --no-deps -p <crate>` builds without warnings, and every
-      public item has a doc comment (try `#![warn(missing_docs)]` per crate).
-- [ ] `cargo package -p <crate> --list`: check what ships. The SRT test
-      fixtures (`crates/sapflow-srt/tests/fixtures`, 240 KB, recorded from
-      ffmpeg's generated test signal) are fine to ship but not needed; add
-      `exclude = ["tests/fixtures"]` if size matters, and make the test skip
-      when they are absent.
+- [x] A README per crate; the server uses the root README.
+- [x] `cargo doc --no-deps -p <crate>` builds without warnings, and every
+      public item has a doc comment (`#![warn(missing_docs)]` in each library,
+      so clippy in CI keeps it that way).
+- [x] `cargo package -p <crate> --list`: check what ships. The test fixtures
+      ship (SRT 240 KB, HLS 640 KB); every one is generated (ffmpeg test
+      signal or solid colour), and the HLS tests include them at compile time.
 - [ ] `cargo publish --dry-run -p <crate>`.
-- [ ] `THIRD_PARTY_LICENSES.txt` stays with the server; the libraries carry
-      only their own MIT licence file.
+- [x] Each crate carries the MIT `LICENSE` (a link to the root file, which
+      `cargo package` copies in). `THIRD_PARTY_LICENSES.txt` stays with the
+      container image.
 
 ## Credentials
 

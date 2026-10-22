@@ -27,7 +27,7 @@ trap cleanup EXIT
 
 # Two builds, not one: cargo unifies features across the packages of one build,
 # and the viewers' HTTP/2 would then be compiled into the server being measured.
-cargo build --release -q -p sapflow-server
+cargo build --release -q -p sapflow
 cargo build --release -q -p sapflow-bench
 BENCH=./target/release/sapflow-bench
 

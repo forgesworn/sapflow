@@ -1,10 +1,16 @@
 [package]
 name = "sapflow-hls"
+description = "Low-Latency HLS packaging in pure Rust, plus sans-IO RTMP publish ingest, FLV and MPEG-TS demuxing and fragmented MP4 writing."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+publish = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["hls", "ll-hls", "rtmp", "mpeg-ts", "fmp4"]
+categories = ["multimedia::video", "network-programming"]
 
 [lints]
 workspace = true

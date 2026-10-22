@@ -83,9 +83,9 @@ capture or credentials are included.
 Focused commands use this checkout's existing target and jobs=2:
 
 ```
-cargo test --offline -p sapflow-core -p sapflow-hls -p sapflow-server --lib --bins -j 2
-cargo test --offline -p sapflow-server --bin sapflow each_resolution_epoch_recording_decodes_independently_with_audio -- --ignored --nocapture
-cargo clippy --offline -p sapflow-core -p sapflow-hls -p sapflow-server --lib --bins --tests -j 2 -- -D warnings
+cargo test --offline -p sapflow-core -p sapflow-hls -p sapflow --lib --bins -j 2
+cargo test --offline -p sapflow --bin sapflow each_resolution_epoch_recording_decodes_independently_with_audio -- --ignored --nocapture
+cargo clippy --offline -p sapflow-core -p sapflow-hls -p sapflow --lib --bins --tests -j 2 -- -D warnings
 ```
 
 The fixed-rate regression covers H.264 aspect changes at 30 fps with unchanged

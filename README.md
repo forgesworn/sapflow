@@ -66,7 +66,7 @@ An experiment that is close to its first production trial. It passes v4v's
 ingest gate, plays in Safari on iPhone (3.0 to 3.2 s glass to glass over
 HTTP/2), resumes after encoder drops, and has twelve fuzz targets run nightly.
 It has not yet run a production show, and every measurement so far is from
-macOS. The crates are version 0.0.0 and not on crates.io yet. See
+macOS. The crates are version 0.1.0 and not on crates.io yet. See
 [GOALS.md](GOALS.md), [docs/readiness.md](docs/readiness.md) and
 [docs/trial-plan.md](docs/trial-plan.md).
 
@@ -77,7 +77,7 @@ macOS. The crates are version 0.0.0 and not on crates.io yet. See
 | `sapflow-core` | Shared types: stream paths, callback events. No async runtime |
 | `sapflow-client` | Runtime-free media validation, bounded queues and session policy for apps |
 | `sapflow-ffi` | Typed Swift/Kotlin boundary for the shared core |
-| `sapflow-server` | The `sapflow` binary: ingest, HTTP, callbacks, recording |
+| `sapflow` | The server binary (`crates/sapflow-server`): ingest, HTTP, callbacks, recording |
 
 The libraries are not on crates.io yet; depend on them by git, for example
 `sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }`. Rust 1.94,
@@ -100,7 +100,7 @@ Run it:
 SAPFLOW_PUBLISH_USER=<publisher> SAPFLOW_PUBLISH_PASS=<password> \
 SAPFLOW_CALLBACK_URL='http://<app>:5181/api/public/live-events/{eventId}/stream-health' \
 SAPFLOW_CALLBACK_SECRET=<callback-secret> \
-cargo run --release -p sapflow-server
+cargo run --release -p sapflow
 ```
 
 Publish to `srt://<host>:8890?streamid=publish:live/<eventId>:<publisher>:<password>`

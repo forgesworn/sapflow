@@ -12,12 +12,13 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 publish = false
 license = "MIT"
 repository = "https://github.com/forgesworn/sapflow"
+homepage = "https://github.com/forgesworn/sapflow"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
