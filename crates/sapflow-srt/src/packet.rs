@@ -18,13 +18,16 @@ pub const MAX_EXTENSIONS: usize = 16;
 /// More NAK entries than this in one packet is not a real sender.
 pub const MAX_LOSS_ENTRIES: usize = 512;
 
+/// Why a datagram did not parse as an SRT packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
     /// Shorter than its type requires.
     Truncated,
     /// A handshake extension runs past the end of the datagram.
     BadExtension,
+    /// More than [`MAX_EXTENSIONS`] handshake extensions.
     TooManyExtensions,
+    /// A stream ID extension longer than [`MAX_STREAM_ID`] bytes.
     StreamIdTooLong,
     /// A NAK whose loss list is malformed (a range start with no end).
     BadLossList,
@@ -44,17 +47,23 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// A parsed SRT packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet<'a> {
+    /// A data packet.
     Data(DataPacket<'a>),
+    /// A control packet.
     Control(ControlPacket),
 }
 
 /// Where a data packet sits in its message (the PP field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {
+    /// A packet in the middle of a message.
     Middle = 0,
+    /// The last packet of a message.
     Last = 1,
+    /// The first packet of a message.
     First = 2,
     /// A whole message in one packet: what live mode sends.
     Only = 3,
@@ -71,54 +80,91 @@ impl Position {
     }
 }
 
+/// A data packet: sequence number, message fields and payload, which borrows
+/// from the datagram.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPacket<'a> {
+    /// The packet sequence number.
     pub seq: Seq,
+    /// Where the packet sits in its message (the PP field).
     pub position: Position,
+    /// The O flag: set when the message is to be delivered in order. This
+    /// crate's sender leaves it clear and its receiver ignores it.
     pub in_order: bool,
     /// The KK field: 0 when not encrypted, 1 even key, 2 odd key.
     pub key: u8,
+    /// The R flag: this packet is a retransmission.
     pub retransmitted: bool,
     /// 26 bits.
     pub message: u32,
+    /// Microseconds since the sender's connection began; 32 bits, wrapping
+    /// (see [`TimestampExtender`](crate::seq::TimestampExtender)).
     pub timestamp: u32,
+    /// The destination socket ID.
     pub dest: u32,
+    /// The payload, borrowed from the datagram.
     pub payload: &'a [u8],
 }
 
+/// A control packet: the header fields and a typed body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPacket {
+    /// Microseconds since the sender's connection began; 32 bits, wrapping
+    /// (see [`TimestampExtender`](crate::seq::TimestampExtender)).
     pub timestamp: u32,
+    /// The destination socket ID; 0 addresses the listener itself.
     pub dest: u32,
+    /// The control type and its control information.
     pub body: Control,
 }
 
+/// The control packet types and their control information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
+    /// Handshake (type 0).
     Handshake(Handshake),
+    /// Keep-alive (type 1); carries nothing.
     KeepAlive,
+    /// Acknowledgement (type 2).
     Ack(Ack),
     /// Lost sequence numbers as inclusive ranges, in packet order.
     Nak(Vec<(Seq, Seq)>),
+    /// Congestion warning (type 4); carries nothing.
     CongestionWarning,
+    /// Shutdown (type 5): the sender is closing the connection.
     Shutdown,
+    /// ACKACK (type 6): answers a full ACK so its sender can measure the
+    /// round trip.
     AckAck {
+        /// The ACK number being answered.
         number: u32,
     },
+    /// Message drop request (type 7): the sender no longer has these packets.
     DropRequest {
+        /// The message number the request applies to.
         message: u32,
+        /// First sequence number to drop.
         first: Seq,
+        /// Last sequence number to drop, inclusive.
         last: Seq,
     },
+    /// Peer error (type 8).
     PeerError {
+        /// The error code the peer reported.
         code: u32,
     },
     /// Any other control type, kept as it came (user-defined key material
     /// refreshes among them).
     Other {
+        /// The control type, 15 bits; 0x7FFF is the user-defined type that
+        /// carries key material messages.
         control_type: u16,
+        /// The subtype; in a user-defined packet, the SRT message type (3 is
+        /// a key material request, 4 its response).
         subtype: u16,
+        /// The type-specific word in the header's second field.
         info: u32,
+        /// The control information field, as received.
         cif: Vec<u8>,
     },
 }
@@ -126,6 +172,7 @@ pub enum Control {
 /// An ACK. `number` is 0 in a light or small ACK, which are not answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ack {
+    /// The ACK number, echoed by the ACKACK that answers it.
     pub number: u32,
     /// The first sequence number not acknowledged.
     pub ack: Seq,
@@ -133,10 +180,12 @@ pub struct Ack {
     pub stats: Option<AckStats>,
 }
 
+/// The statistics a full ACK carries after the acknowledged sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AckStats {
     /// Microseconds.
     pub rtt: u32,
+    /// Round-trip time variance, in microseconds.
     pub rtt_var: u32,
     /// Free receive buffer, in packets.
     pub buffer: u32,
@@ -148,10 +197,20 @@ pub struct AckStats {
 /// The Handshake Type field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeKind {
+    /// DONE (0xFFFF_FFFD): a type the specification defines for rendezvous
+    /// connections; this crate neither sends nor acts on it.
     Done,
+    /// AGREEMENT (0xFFFF_FFFE): a type the specification defines for
+    /// rendezvous connections; this crate neither sends nor acts on it.
     Agreement,
+    /// CONCLUSION (0xFFFF_FFFF): the second request and its response; carries
+    /// the extensions.
     Conclusion,
+    /// WAVEAHAND (0): the opening step of a rendezvous connection; this crate
+    /// neither sends nor acts on it.
     Waveahand,
+    /// INDUCTION (1): the first exchange, in which the listener replies with
+    /// a SYN cookie.
     Induction,
     /// A refusal: 1000 and up are the protocol's reasons, 2000 + an HTTP
     /// status the application's.
@@ -159,6 +218,8 @@ pub enum HandshakeKind {
 }
 
 impl HandshakeKind {
+    /// Decodes the Handshake Type field; a value that is not a named type
+    /// becomes [`Rejection`](Self::Rejection).
     pub fn from_u32(v: u32) -> Self {
         match v {
             0xFFFF_FFFD => Self::Done,
@@ -170,6 +231,7 @@ impl HandshakeKind {
         }
     }
 
+    /// The Handshake Type field value for this kind.
     pub fn to_u32(self) -> u32 {
         match self {
             Self::Done => 0xFFFF_FFFD,
@@ -182,27 +244,49 @@ impl HandshakeKind {
     }
 }
 
+/// A handshake: its fixed fields and extensions (section 3.2.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
+    /// The handshake version: a caller's induction carries 4, later
+    /// handshakes 5.
     pub version: u32,
+    /// The Encryption Field: 0 for none, 2 for AES-128, 4 for AES-256 (the
+    /// key length in 8-byte units).
     pub encryption: u16,
+    /// The Extension Field: 2 in a caller's induction request, [`SRT_MAGIC`]
+    /// in a listener's induction reply, the [`ext_flags`] set in a
+    /// conclusion.
     pub extension: u16,
+    /// The initial data packet sequence number, chosen by the caller and
+    /// echoed by the listener.
     pub initial_seq: u32,
+    /// Maximum transmission unit, in bytes, counting the IP, UDP and SRT
+    /// headers.
     pub mtu: u32,
+    /// Maximum flow window size, in packets.
     pub flow_window: u32,
+    /// The Handshake Type field.
     pub kind: HandshakeKind,
+    /// The SRT socket ID of the handshake's sender; a listener's induction
+    /// reply echoes the caller's.
     pub socket_id: u32,
+    /// The SYN cookie: made by the listener in its induction reply and echoed
+    /// in the caller's conclusion.
     pub cookie: u32,
     /// Four 32-bit words as on the wire (little-endian words; an IPv4
     /// address is the first word).
     pub peer_ip: [u8; 16],
+    /// The extensions that follow the fixed part, in wire order.
     pub extensions: Vec<Extension>,
 }
 
 /// The extension flags in a version 5 conclusion's Extension Field.
 pub mod ext_flags {
+    /// A handshake extension (HSREQ or HSRSP) is present.
     pub const HSREQ: u16 = 1;
+    /// A key material extension (KMREQ or KMRSP) is present.
     pub const KMREQ: u16 = 2;
+    /// Configuration extensions, such as a stream ID, are present.
     pub const CONFIG: u16 = 4;
 }
 
@@ -211,51 +295,87 @@ pub const SRT_MAGIC: u16 = 0x4A17;
 
 /// SRT flags in the handshake extension message.
 pub mod srt_flags {
+    /// The sender side uses timestamp-based packet delivery (TSBPD).
     pub const TSBPDSND: u32 = 0x01;
+    /// The receiver side uses TSBPD.
     pub const TSBPDRCV: u32 = 0x02;
+    /// Legacy flag: the peer understands the KK field of data packets. It
+    /// does not claim encryption.
     pub const CRYPT: u32 = 0x04;
+    /// Too-late packet drop is enabled.
     pub const TLPKTDROP: u32 = 0x08;
+    /// The receiver sends periodic NAK reports.
     pub const PERIODICNAK: u32 = 0x10;
+    /// Legacy flag: data packets carry the retransmission (R) flag.
     pub const REXMITFLG: u32 = 0x20;
+    /// Stream mode rather than message mode; the listener here refuses it.
     pub const STREAM: u32 = 0x40;
+    /// A packet filter is in use; none is supported here.
     pub const PACKET_FILTER: u32 = 0x80;
 }
 
+/// The body of an HSREQ or HSRSP extension: SRT version, flags and TSBPD
+/// delays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SrtHandshake {
     /// major * 0x10000 + minor * 0x100 + patch.
     pub version: u32,
+    /// A combination of the [`srt_flags`] constants.
     pub flags: u32,
     /// Milliseconds.
     pub receiver_delay: u16,
+    /// The sender's TSBPD delay, in milliseconds; in an HSREQ this crate's
+    /// caller puts its requested latency here.
     pub sender_delay: u16,
 }
 
+/// A handshake extension, decoded by type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Extension {
+    /// Handshake request (type 1): the caller's SRT version, flags and
+    /// delays.
     HsReq(SrtHandshake),
+    /// Handshake response (type 2): the listener's SRT version, flags and
+    /// delays.
     HsRsp(SrtHandshake),
+    /// Key material request (type 3): the key material message, as received.
     KmReq(Vec<u8>),
+    /// Key material response (type 4): the key material message, as received.
     KmRsp(Vec<u8>),
     /// The stream id's bytes, without the padding.
     StreamId(Vec<u8>),
+    /// The congestion controller name (type 6); only `live` is accepted here.
     Congestion(Vec<u8>),
+    /// Packet filter configuration (type 7); not supported here.
     Filter(Vec<u8>),
+    /// Group membership data (type 8), kept raw; not supported here.
     Group(Vec<u8>),
+    /// Any other extension type, kept raw.
     Other {
+        /// The extension type number.
         kind: u16,
+        /// The extension body as received.
         body: Vec<u8>,
     },
 }
 
+/// The type numbers of handshake extensions.
 pub mod ext_type {
+    /// Handshake request.
     pub const HSREQ: u16 = 1;
+    /// Handshake response.
     pub const HSRSP: u16 = 2;
+    /// Key material request.
     pub const KMREQ: u16 = 3;
+    /// Key material response.
     pub const KMRSP: u16 = 4;
+    /// Stream ID.
     pub const SID: u16 = 5;
+    /// Congestion controller name.
     pub const CONGESTION: u16 = 6;
+    /// Packet filter.
     pub const FILTER: u16 = 7;
+    /// Group membership.
     pub const GROUP: u16 = 8;
 }
 
@@ -294,6 +414,9 @@ fn encode_words(text: &[u8], out: &mut Vec<u8>) {
 }
 
 impl<'a> Packet<'a> {
+    /// Parses one datagram. Nothing is trusted beyond its bytes: a control
+    /// type this crate does not know becomes [`Control::Other`], and anything
+    /// shorter than its type needs is an error.
     pub fn parse(b: &'a [u8]) -> Result<Self, ParseError> {
         let (w0, w1, timestamp, dest) = match (be32(b, 0), be32(b, 4), be32(b, 8), be32(b, 12)) {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
@@ -353,6 +476,7 @@ impl<'a> Packet<'a> {
 }
 
 impl DataPacket<'_> {
+    /// Appends the packet's bytes to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
         let w1 = ((self.position as u32) << 30)
             | (u32::from(self.in_order) << 29)
@@ -421,6 +545,8 @@ pub fn encode_loss_list(ranges: &[(Seq, Seq)], out: &mut Vec<u8>) {
 }
 
 impl ControlPacket {
+    /// A control packet with `timestamp`, destination socket `dest` and
+    /// `body`.
     pub fn new(timestamp: u32, dest: u32, body: Control) -> Self {
         Self {
             timestamp,
@@ -429,6 +555,7 @@ impl ControlPacket {
         }
     }
 
+    /// Appends the packet's bytes to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
         let (control_type, subtype, info) = match &self.body {
             Control::Handshake(_) => (0, 0, 0),
@@ -483,6 +610,9 @@ impl ControlPacket {
 }
 
 impl Handshake {
+    /// Parses a handshake from a control information field, the bytes after
+    /// the 16-byte header. Fails on a short field, a malformed or overlong
+    /// extension, too many extensions or an overlong stream ID.
     pub fn parse(cif: &[u8]) -> Result<Self, ParseError> {
         let word = |at| be32(cif, at).ok_or(ParseError::Truncated);
         let version = word(0)?;
@@ -546,6 +676,8 @@ impl Handshake {
         Ok(h)
     }
 
+    /// Appends the control information field (without the packet header) to
+    /// `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.encryption.to_be_bytes());
@@ -592,6 +724,7 @@ impl Handshake {
         }
     }
 
+    /// The stream ID from the first stream ID extension, if any.
     pub fn stream_id(&self) -> Option<&[u8]> {
         self.extensions.iter().find_map(|e| match e {
             Extension::StreamId(s) => Some(s.as_slice()),
@@ -599,6 +732,7 @@ impl Handshake {
         })
     }
 
+    /// The first HSREQ extension's contents, if any.
     pub fn srt_request(&self) -> Option<SrtHandshake> {
         self.extensions.iter().find_map(|e| match e {
             Extension::HsReq(s) => Some(*s),
@@ -608,6 +742,8 @@ impl Handshake {
 }
 
 impl Extension {
+    /// The extension's type number: one of [`ext_type`], or the raw number
+    /// held by [`Extension::Other`].
     pub fn kind(&self) -> u16 {
         match self {
             Self::HsReq(_) => ext_type::HSREQ,

@@ -22,6 +22,10 @@ pub struct FlvIngest {
 }
 
 impl FlvIngest {
+    /// An ingest with no muxer yet: the first keyframe, once its parameter sets
+    /// are known, creates one from `cfg`. No audio is expected until
+    /// [`FlvIngest::expect_audio`] or an AAC sequence header says there is
+    /// some.
     pub fn new(cfg: MuxerConfig) -> Self {
         let mut es = EsIngest::new(cfg);
         // Explicit metadata can announce audio before either encoder supplies
@@ -36,6 +40,7 @@ impl FlvIngest {
         }
     }
 
+    /// The muxer, once a keyframe has started one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.es.muxer()
     }
@@ -52,10 +57,13 @@ impl FlvIngest {
         ingest
     }
 
+    /// The muxer, mutably, once a keyframe has started one.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.es.muxer_mut()
     }
 
+    /// Removes and returns the muxer, for [`FlvIngest::resume`] on a later
+    /// connection.
     pub fn take_muxer(&mut self) -> Option<Muxer> {
         self.es.take_muxer()
     }

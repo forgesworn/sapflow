@@ -26,6 +26,7 @@ const SYNC: u8 = 0x47;
 /// Cap on unconsumed input (a few seconds at stage bitrates).
 const MAX_BUFFER: usize = 8 * 1024 * 1024;
 
+/// Why an ingest cannot carry on with the publisher's media.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestError {
     /// The program carries a video codec other than H.264.
@@ -222,6 +223,8 @@ pub struct EsIngest {
 }
 
 impl EsIngest {
+    /// An ingest with no muxer yet. Audio is expected, so the first keyframe
+    /// waits for an AAC configuration (see [`EsIngest::set_expect_audio`]).
     pub fn new(cfg: MuxerConfig) -> Self {
         Self {
             cfg,
@@ -246,19 +249,25 @@ impl EsIngest {
         }
     }
 
+    /// The muxer, once the first keyframe has created one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.muxer.as_ref()
     }
 
+    /// The muxer, mutably, once the first keyframe has created one.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.muxer.as_mut()
     }
 
+    /// Removes and returns the muxer and forgets the timeline origin, for
+    /// [`EsIngest::resume`] on a later connection.
     pub fn take_muxer(&mut self) -> Option<Muxer> {
         self.origin = None;
         self.muxer.take()
     }
 
+    /// Sets whether the first keyframe waits for an AAC configuration before
+    /// the init segment is fixed.
     pub fn set_expect_audio(&mut self, expect: bool) {
         self.expect_audio = expect;
     }
@@ -283,10 +292,14 @@ impl EsIngest {
         }
     }
 
+    /// The AAC configuration, once one has been seen.
     pub fn known_audio(&self) -> Option<AacConfig> {
         self.aac
     }
 
+    /// Records the AAC configuration; only the first is kept. A muxer that has
+    /// no audio track and nothing servable yet is discarded, so the next
+    /// keyframe starts one with both tracks.
     pub fn audio_config(&mut self, config: AacConfig) {
         if self.aac.is_none() {
             if let Some(muxer) = &self.muxer
@@ -405,14 +418,19 @@ impl TsIngest {
         ts
     }
 
+    /// The muxer, mutably, once a keyframe has created one.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.es.muxer_mut()
     }
 
+    /// Removes and returns the muxer, for [`TsIngest::resume`] on a later
+    /// connection.
     pub fn take_muxer(&mut self) -> Option<Muxer> {
         self.es.take_muxer()
     }
 
+    /// An ingest with no input yet. `cfg` configures the muxer that the first
+    /// keyframe creates.
     pub fn new(cfg: MuxerConfig) -> Self {
         let input = Arc::new(Mutex::new(Input::default()));
         let slot = SlotReader::default();
@@ -433,6 +451,7 @@ impl TsIngest {
         }
     }
 
+    /// The muxer, once a keyframe has created one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.es.muxer()
     }

@@ -28,13 +28,21 @@ const MIN_ACK_WINDOW: u32 = 4096;
 /// of payload. Allocator capacities and chunk-header state are additional costs.
 #[derive(Clone)]
 pub struct PublisherConfig {
+    /// The RTMP application name (the `app` property of `connect`).
     pub app: String,
     /// Stream name/key, including any destination-authorised query parameters.
     pub stream_key: String,
     /// The destination's RTMP(S) application URL. This module does not open it.
     pub tc_url: String,
+    /// Most bytes held from the peer, counting incomplete chunks and partial
+    /// messages. Default 1 MiB; at least one handshake (3073 bytes) and at most
+    /// 16 MiB.
     pub max_input_bytes: usize,
+    /// Most bytes queued for the transport. Media that would pass it fails with
+    /// [`ClientError::Backpressure`]. Default 4 MiB; 8 KiB to 64 MiB.
     pub max_output_bytes: usize,
+    /// Largest media message, its FLV tag header included. Default 1 MiB; at
+    /// most 16 MiB less one byte.
     pub max_media_bytes: usize,
     /// Deadline for the complete handshake/connect/createStream/publish exchange.
     pub startup_timeout_ms: u64,
@@ -47,6 +55,9 @@ pub struct PublisherConfig {
 }
 
 impl PublisherConfig {
+    /// A configuration for the given destination with the default limits and
+    /// timeouts: 15 s to start up, media output at most 1 s old, no
+    /// receive-idle timeout.
     pub fn new(app: String, stream_key: String, tc_url: String) -> Self {
         Self {
             app,
@@ -62,38 +73,75 @@ impl PublisherConfig {
     }
 }
 
+/// Where a [`Publisher`] has got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublisherState {
+    /// C0 and C1 are sent; waiting for S0, S1 and S2.
     Handshaking,
+    /// `connect` is sent; waiting for its `_result`.
     Connecting,
+    /// `createStream` is sent; waiting for its `_result`.
     CreatingStream,
+    /// `publish` is sent; waiting for `NetStream.Publish.Start`.
     AwaitingPublish,
+    /// The server accepted the publish: media may be sent.
     Publishing,
+    /// `closeStream` is queued; the server's reply is optional.
     Finishing,
+    /// Ended by [`Publisher::cancel`] or by the server; nothing more is sent
+    /// or accepted.
     Closed,
+    /// Stopped by an error, a timeout or a disconnect.
     Failed,
 }
 
+/// Why a [`Publisher`] call failed or the publish ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientError {
+    /// A [`PublisherConfig`] string is empty, over 4096 bytes or contains NUL,
+    /// or a limit or timeout is out of range.
     InvalidConfig,
+    /// The server's S0 version is not 3; carries the version it sent.
     UnsupportedVersion(u8),
+    /// The server answered with a digest-form handshake, which this client does
+    /// not support.
     UnsupportedDigestHandshake,
+    /// S2 did not echo C1's time and random bytes.
     InvalidHandshakeEcho,
+    /// The chunk layer refused the server's input.
     Chunk(ChunkError),
+    /// A command from the server could not be decoded.
     Amf0(Amf0Error),
+    /// A message of this type id was malformed: a control message of the wrong
+    /// size or on the wrong chunk stream, or a bad command wrapper.
     Malformed(u8),
+    /// A command or response that does not fit the current step.
     UnexpectedResponse,
+    /// The server refused or ended the publish (`_error`, or `onStatus` at
+    /// level `error`). Carries the status code, or `remote error` if it gave
+    /// none, cut to 256 characters.
     Refused(String),
+    /// Input from the server would pass `max_input_bytes`, or it asked for a
+    /// chunk size too large for that budget.
     InputOverBudget,
     /// Media was not queued. Drain output and retry or drop by media policy.
     Backpressure,
+    /// A media message passed `max_media_bytes` or the 16 MiB wire limit.
     MediaTooLarge,
+    /// Empty data, a sample sent before its sequence header, or a composition
+    /// offset outside the signed 24-bit range.
     InvalidMedia,
+    /// Media or [`Publisher::finish`] before the server accepted the publish.
     NotPublishing,
+    /// The publisher is closed, failed or finishing.
     Closed,
+    /// The transport ended ([`Publisher::disconnected`]), or the server ended
+    /// the stream with a Stream EOF event.
     Disconnected,
+    /// A deadline from [`Publisher::next_deadline_ms`] passed.
     Timeout,
+    /// A time passed in was earlier than a previous one; all times must come
+    /// from one monotonic clock.
     TimeWentBackwards,
 }
 
@@ -136,6 +184,9 @@ impl From<Amf0Error> for ClientError {
     }
 }
 
+/// One RTMP publish to a server: handshake, `connect`, `createStream` and
+/// `publish`, then media as FLV tag bodies. Sans-IO: the caller moves bytes
+/// with [`Publisher::feed`] and [`Publisher::take_output`].
 pub struct Publisher {
     config: PublisherConfig,
     state: PublisherState,
@@ -232,14 +283,18 @@ impl Publisher {
         })
     }
 
+    /// Where the publish has got to.
     pub fn state(&self) -> PublisherState {
         self.state
     }
 
+    /// Bytes queued for the transport that [`Publisher::take_output`] has not
+    /// yet handed out, handshake included.
     pub fn queued_output_bytes(&self) -> usize {
         self.output.len() + self.pending_bytes
     }
 
+    /// Bytes held from the server: input not yet parsed, plus partial messages.
     pub fn buffered_input_bytes(&self) -> usize {
         self.input.len().saturating_add(self.reader.buffered())
     }
@@ -269,6 +324,8 @@ impl Publisher {
         self.sent - self.peer_acknowledged
     }
 
+    /// The window the server set with Set Peer Bandwidth: the most bytes that
+    /// may be unacknowledged after the handshake. `None` until it sets one.
     pub fn peer_output_window(&self) -> Option<u32> {
         self.peer_bandwidth
     }

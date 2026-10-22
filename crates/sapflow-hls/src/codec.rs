@@ -18,10 +18,15 @@ const MAX_NAL: usize = 4 * 1024 * 1024;
 /// the video track.
 #[derive(Debug, Clone, PartialEq)]
 pub struct H264Config {
+    /// The SPS NAL unit, with its header and without a start code.
     pub sps: Vec<u8>,
+    /// The PPS NAL unit, with its header and without a start code.
     pub pps: Vec<u8>,
+    /// Picture width in pixels, from the SPS.
     pub width: u16,
+    /// Picture height in pixels, from the SPS.
     pub height: u16,
+    /// Frame rate from the SPS timing information, if it carries any.
     pub fps: Option<f64>,
 }
 
@@ -44,14 +49,17 @@ impl H264Config {
         })
     }
 
+    /// `profile_idc` from the SPS.
     pub fn profile(&self) -> u8 {
         self.sps[1]
     }
 
+    /// The profile compatibility byte of the SPS (`constraint_set` flags).
     pub fn compatibility(&self) -> u8 {
         self.sps[2]
     }
 
+    /// `level_idc` from the SPS.
     pub fn level(&self) -> u8 {
         self.sps[3]
     }
@@ -73,8 +81,13 @@ pub struct AccessUnit {
     /// NAL units with 4-byte big-endian lengths, parameter sets and access
     /// unit delimiters removed (they live in the init segment).
     pub data: Vec<u8>,
+    /// Whether the access unit holds an IDR slice, so it is a keyframe.
     pub idr: bool,
+    /// An SPS NAL unit found in the access unit, with its header and no length
+    /// prefix.
     pub sps: Option<Vec<u8>>,
+    /// A PPS NAL unit found in the access unit, with its header and no length
+    /// prefix.
     pub pps: Option<Vec<u8>>,
 }
 
@@ -210,8 +223,12 @@ pub fn avc_decoder_config(record: &[u8]) -> Option<(Vec<u8>, Vec<u8>, usize)> {
 pub struct AacConfig {
     /// MPEG-4 audio object type (2 = AAC-LC).
     pub object_type: u8,
+    /// Index into the MPEG-4 sampling frequency table (3 is 48 kHz, 4 is 44.1
+    /// kHz).
     pub sample_rate_index: u8,
+    /// Sample rate in Hz.
     pub sample_rate: u32,
+    /// MPEG-4 channel configuration (1 is mono, 2 is stereo).
     pub channels: u8,
 }
 

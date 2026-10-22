@@ -4,6 +4,8 @@
 //! (`muxer_stream.go`, `muxer_segmenter.go`, MIT) is the reference for each;
 //! see `docs/reference.md`.
 
+#![warn(missing_docs)]
+
 use std::time::Duration;
 
 pub mod codec;
@@ -40,6 +42,7 @@ impl TargetDuration {
         }
     }
 
+    /// `EXT-X-TARGETDURATION` in whole seconds.
     pub fn secs(self) -> u64 {
         self.secs
     }
@@ -102,6 +105,7 @@ impl PartTiming {
         }
     }
 
+    /// `PART-TARGET` as a duration, to the millisecond.
     pub fn target_duration(self) -> Duration {
         Duration::from_millis((self.target / TICKS_PER_MS) as u64)
     }

@@ -24,23 +24,33 @@ const EXTENDED: u32 = 0x00ff_ffff;
 /// Basic header (up to 3) + message header (11) + extended timestamp (4).
 pub const MAX_HEADER: usize = 18;
 
+/// One reassembled RTMP message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    /// The chunk stream id it arrived on.
     pub csid: u32,
+    /// The RTMP message type id (8 is audio, 9 is video, 20 is an AMF0
+    /// command).
     pub type_id: u8,
+    /// The message stream id.
     pub stream_id: u32,
     /// Milliseconds; wraps at 2^32 like the protocol's.
     pub timestamp: u32,
+    /// The message body.
     pub payload: Vec<u8>,
 }
 
+/// Why a chunk was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkError {
     /// A compressed header on a csid that never had a full one.
     NoPreviousHeader(u32),
+    /// A new chunk stream would take the connection past [`MAX_CHUNK_STREAMS`].
     TooManyChunkStreams,
     /// Partial messages would hold more than the connection's budget.
     OverBudget,
+    /// A Set Chunk Size outside 1 to [`MAX_CHUNK_SIZE`]; carries the refused
+    /// size.
     BadChunkSize(u32),
 }
 
@@ -88,12 +98,16 @@ pub enum Read {
     NeedMore,
     /// One chunk consumed; it may have completed a message.
     Chunk {
+        /// Bytes taken from the front of the buffer.
         consumed: usize,
+        /// The message this chunk completed, if it completed one.
         message: Option<Message>,
     },
 }
 
 impl ChunkReader {
+    /// A reader at the default chunk size ([`DEFAULT_CHUNK_SIZE`]). `budget` is
+    /// the most bytes that partial messages may hold together.
     pub fn new(budget: usize) -> Self {
         Self {
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -103,14 +117,17 @@ impl ChunkReader {
         }
     }
 
+    /// Changes the most bytes that partial messages may hold together.
     pub fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
     }
 
+    /// Bytes now held in partial messages.
     pub fn buffered(&self) -> usize {
         self.buffered
     }
 
+    /// The chunk size in force for incoming chunks.
     pub fn chunk_size(&self) -> u32 {
         self.chunk_size
     }

@@ -49,24 +49,46 @@ const STREAM_BEGIN: u16 = 0;
 const PING_REQUEST: u16 = 6;
 const PING_RESPONSE: u16 = 7;
 
+/// What the publisher did, in the order it did it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// The client asked to publish `key` (the stream key, query included)
     /// in `app`. Answer before polling again.
-    Publish { app: String, key: String },
+    Publish {
+        /// The application name from `connect`, without a trailing slash.
+        app: String,
+        /// The stream key, query string included.
+        key: String,
+    },
     /// `onMetaData` arrived; `audio` is whether it names an audio codec.
-    Metadata { audio: bool },
+    Metadata {
+        /// Whether `audiocodecid` is present as a number or a string.
+        audio: bool,
+    },
     /// An FLV video tag body and its timestamp in milliseconds.
-    Video { timestamp: u32, data: Vec<u8> },
+    Video {
+        /// The message timestamp in milliseconds; it wraps at 2^32.
+        timestamp: u32,
+        /// The FLV video tag body, its header included.
+        data: Vec<u8>,
+    },
     /// An FLV audio tag body and its timestamp in milliseconds.
-    Audio { timestamp: u32, data: Vec<u8> },
+    Audio {
+        /// The message timestamp in milliseconds; it wraps at 2^32.
+        timestamp: u32,
+        /// The FLV audio tag body, its header included.
+        data: Vec<u8>,
+    },
     /// The publisher said it has finished.
     Finished,
 }
 
+/// Why a session failed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionError {
+    /// The chunk layer refused the input.
     Chunk(ChunkError),
+    /// A command could not be decoded.
     Amf0(Amf0Error),
     /// A protocol control message too short for its type.
     Malformed(u8),
@@ -77,6 +99,7 @@ pub enum SessionError {
     BadPublish,
     /// A second `publish` on one connection.
     SecondPublish,
+    /// More than [`MAX_STREAMS`] `createStream` calls on one connection.
     TooManyStreams,
     /// More unparsed input than the budget allows.
     OverBudget,
@@ -123,6 +146,7 @@ enum State {
     Done,
 }
 
+/// The server side of one publisher's connection after the handshake.
 pub struct Session {
     reader: ChunkReader,
     writer: ChunkWriter,

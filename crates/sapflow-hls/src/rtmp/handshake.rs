@@ -36,6 +36,7 @@ const KEY_TAIL: [u8; 32] = [
     0x6e, 0xec, 0x5d, 0x2d, 0x29, 0x80, 0x6f, 0xab, 0x93, 0xb8, 0xe6, 0x36, 0xcf, 0xeb, 0x31, 0xae,
 ];
 
+/// Why the handshake failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeError {
     /// C0 asked for something other than plain RTMP.
@@ -58,17 +59,24 @@ impl std::error::Error for HandshakeError {}
 /// Which form the client used; for logs and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Form {
+    /// The original form: S2 echoes C1.
     Original,
+    /// The digest form: C1 carried a valid HMAC-SHA256 digest, so S1 and S2 are
+    /// signed.
     Digest,
 }
 
+/// What a call to [`Handshake::feed`] achieved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Progress {
     /// Feed more bytes.
     Continue,
     /// Finished. `leftover` is the start of the chunk stream (clients may
     /// send their first command straight after C2).
-    Done { leftover: Vec<u8> },
+    Done {
+        /// The bytes that followed C2.
+        leftover: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +86,8 @@ enum Stage {
     Done,
 }
 
+/// The server side of the handshake: feed it the client's bytes and it appends
+/// the replies.
 pub struct Handshake {
     stage: Stage,
     buf: Vec<u8>,
@@ -97,6 +107,7 @@ impl Handshake {
         }
     }
 
+    /// Which form the client used, once its C1 has been read.
     pub fn form(&self) -> Option<Form> {
         self.form
     }

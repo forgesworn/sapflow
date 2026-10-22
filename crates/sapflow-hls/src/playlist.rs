@@ -10,12 +10,16 @@ use std::time::Duration;
 use crate::muxer::{Entry, Muxer};
 use crate::time::rfc3339_millis;
 
+/// The media playlist's URI, relative to the multivariant playlist.
 pub const MEDIA_PLAYLIST: &str = "stream.m3u8";
 
+/// `<prefix>_init.mp4`: the init segment of codec epoch 0.
 pub fn init_name(prefix: &str) -> String {
     format!("{prefix}_init.mp4")
 }
 
+/// The init segment's name for codec `epoch`: `<prefix>_init.mp4` for 0,
+/// otherwise `<prefix>_init<epoch>.mp4`.
 pub fn epoch_init_name(prefix: &str, epoch: u64) -> String {
     if epoch == 0 {
         init_name(prefix)
@@ -24,10 +28,12 @@ pub fn epoch_init_name(prefix: &str, epoch: u64) -> String {
     }
 }
 
+/// `<prefix>_seg<id>.mp4`.
 pub fn segment_name(prefix: &str, id: u64) -> String {
     format!("{prefix}_seg{id}.mp4")
 }
 
+/// `<prefix>_part<id>.mp4`.
 pub fn part_name(prefix: &str, id: u64) -> String {
     format!("{prefix}_part{id}.mp4")
 }
@@ -35,9 +41,13 @@ pub fn part_name(prefix: &str, id: u64) -> String {
 /// A chunk URL from a viewer, after checking it belongs to this muxer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chunk {
+    /// `<prefix>_init.mp4`: the init segment of codec epoch 0.
     Init,
+    /// `<prefix>_init<N>.mp4`: the init segment of codec epoch N.
     InitEpoch(u64),
+    /// `<prefix>_seg<N>.mp4`: the segment with id N.
     Segment(u64),
+    /// `<prefix>_part<N>.mp4`: the part with id N.
     Part(u64),
 }
 
@@ -66,13 +76,13 @@ pub fn parse_chunk(prefix: &str, name: &str) -> Option<Chunk> {
     None
 }
 
-/// Reads `_HLS_msn` and `_HLS_part` from a raw query string. Anything else
-/// is ignored (`_HLS_skip` included: delta updates are not offered). A value
-/// that is not a plain number is a bad request.
 /// A blocking-reload parameter that is not a plain number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BadQuery;
 
+/// Reads `_HLS_msn` and `_HLS_part` from a raw query string, in that order.
+/// Anything else is ignored (`_HLS_skip` included: delta updates are not
+/// offered). A value that is not a plain number is a bad request.
 pub fn parse_blocking_query(query: Option<&str>) -> Result<(Option<u64>, Option<u64>), BadQuery> {
     let (mut msn, mut part) = (None, None);
     for pair in query.unwrap_or("").split('&') {
@@ -287,6 +297,10 @@ fn fixed5(v: &str) -> Result<u64, String> {
 }
 
 impl RuleCheck {
+    /// Checks one more render, returning a description of the first rule it
+    /// breaks. Rules that span renders (the targets, and what each media
+    /// sequence number points at) are held against the renders seen by earlier
+    /// calls.
     pub fn check(&mut self, pl: &str) -> Result<(), String> {
         let tag = |name: &str| pl.lines().find_map(|l| l.strip_prefix(name));
         let part_target = fixed5(tag("#EXT-X-PART-INF:PART-TARGET=").ok_or("no PART-TARGET")?)?;

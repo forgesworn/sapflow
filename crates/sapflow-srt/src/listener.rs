@@ -40,6 +40,7 @@ const MTU_MAX: u32 = 1500;
 /// IP and UDP headers, and the SRT header.
 const OVERHEAD: u32 = 28 + 16;
 
+/// Limits and policy for a [`Listener`].
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Our receive latency; a caller asking for more gets more.
@@ -85,19 +86,41 @@ pub struct ConnId(pub u32);
 pub struct RejectCode(pub u32);
 
 impl RejectCode {
+    /// 1000: no reason given (the fallback).
     pub const UNKNOWN: Self = Self(1000);
+    /// 1001: a system function failed.
     pub const SYSTEM: Self = Self(1001);
+    /// 1002: refused by the peer, with no further detail.
     pub const PEER: Self = Self(1002);
+    /// 1003: a resource, usually memory, could not be allocated.
     pub const RESOURCE: Self = Self(1003);
+    /// 1004: the handshake data could not be interpreted; sent for malformed
+    /// or inconsistent handshakes.
     pub const ROGUE: Self = Self(1004);
+    /// 1005: the listener is full; sent when [`Config::max_connections`] is
+    /// reached.
     pub const BACKLOG: Self = Self(1005);
+    /// 1007: the listener was closing when the request arrived.
     pub const CLOSE: Self = Self(1007);
+    /// 1008: the peer's version is not supported; sent for any handshake
+    /// version other than 5.
     pub const VERSION: Self = Self(1008);
+    /// 1010: the passphrases differ; sent when the caller's key material
+    /// cannot be accepted with ours.
     pub const BADSECRET: Self = Self(1010);
+    /// 1011: only one side has a passphrase; sent when encryption is
+    /// configured or required and the caller sends none, or the reverse.
     pub const UNSECURE: Self = Self(1011);
+    /// 1012: stream and message mode differ; sent when the caller asks for
+    /// stream mode.
     pub const MESSAGE_API: Self = Self(1012);
+    /// 1013: the congestion controllers differ; sent for anything but `live`.
     pub const CONGESTION: Self = Self(1013);
+    /// 1014: packet filter settings differ; sent when the caller asks for a
+    /// filter.
     pub const FILTER: Self = Self(1014);
+    /// 1015: group settings are incompatible; sent when the caller asks for a
+    /// group.
     pub const GROUP: Self = Self(1015);
 
     /// An application refusal carrying an HTTP status (2000 + status),
@@ -107,6 +130,8 @@ impl RejectCode {
     }
 }
 
+/// Something the application needs to know about or answer; see
+/// [`Listener::poll_event`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A caller passed bounded handshake parsing and cookie checks. The
@@ -114,17 +139,29 @@ pub enum Event {
     /// Answer with [`Listener::accept`], [`Listener::accept_with_crypto`] or
     /// [`Listener::reject`]. This event does not establish peer identity.
     Connect {
+        /// The connection, for [`Listener::accept`] and [`Listener::reject`].
         id: ConnId,
+        /// The caller's address.
         peer: SocketAddr,
+        /// The caller's stream ID, untrusted; empty when it sent none.
         stream_id: Vec<u8>,
     },
     /// The next payload, in order, at its delivery time.
-    Data { id: ConnId, payload: Vec<u8> },
+    Data {
+        /// The connection the payload came from.
+        id: ConnId,
+        /// One packet's payload, decrypted when encryption is in use.
+        payload: Vec<u8>,
+    },
     /// The connection ended from the other side, or a caller was not
     /// answered in time (`reason` is `None` then).
     Closed {
+        /// The connection that ended.
         id: ConnId,
+        /// Why it ended; `None` when a caller was not answered in time.
         reason: Option<CloseReason>,
+        /// The connection's final counters; all zero if it was never
+        /// accepted.
         stats: Stats,
     },
 }
@@ -132,11 +169,16 @@ pub enum Event {
 /// Datagrams the listener threw away, by kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ListenerStats {
+    /// Datagrams over 1500 bytes or that did not parse as a packet.
     pub malformed: u64,
     /// For no connection, or from the wrong address.
     pub stray: u64,
+    /// Conclusion handshakes whose SYN cookie was wrong or stale.
     pub bad_cookie: u64,
+    /// Handshakes ignored because the handshake allowance was used up.
     pub rate_limited: u64,
+    /// Callers refused with a rejection handshake, by the listener or by the
+    /// application.
     pub rejected: u64,
 }
 
@@ -164,6 +206,9 @@ struct Conn {
     next_timer: i64,
 }
 
+/// A sans-IO SRT listener: every connection on one UDP port, with its
+/// handshakes, timers and events. `S` keys the SYN cookies and socket ids;
+/// [`Listener::new`] makes a random one.
 pub struct Listener<S = RandomState> {
     config: Config,
     epoch: Instant,
@@ -212,6 +257,7 @@ impl<S: BuildHasher> Listener<S> {
         i64::try_from(now.saturating_duration_since(self.epoch).as_micros()).unwrap_or(i64::MAX)
     }
 
+    /// Counts of datagrams discarded so far, by kind.
     pub fn stats(&self) -> ListenerStats {
         self.stats
     }
@@ -221,6 +267,8 @@ impl<S: BuildHasher> Listener<S> {
         self.conns.len()
     }
 
+    /// Counters for an open connection; `None` for an unknown id or one still
+    /// waiting for an answer.
     pub fn connection_stats(&self, id: ConnId) -> Option<Stats> {
         match &self.conns.get(&id.0)?.state {
             State::Open { rx, .. } => Some(rx.stats()),
@@ -236,10 +284,12 @@ impl<S: BuildHasher> Listener<S> {
         }
     }
 
+    /// The next datagram to send and the address to send it to, if any.
     pub fn poll_transmit(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         self.transmits.pop_front()
     }
 
+    /// The next [`Event`], if any.
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
     }
@@ -254,6 +304,8 @@ impl<S: BuildHasher> Listener<S> {
             .or_else(|| self.epoch.checked_add(Duration::from_secs(3600)))
     }
 
+    /// Takes a datagram that arrived from `peer` at `now`; bad ones are
+    /// counted in [`stats`](Self::stats) and dropped.
     pub fn handle_datagram(&mut self, now: Instant, peer: SocketAddr, datagram: &[u8]) {
         let t = self.micros(now);
         if datagram.len() > 1500 {
@@ -299,6 +351,8 @@ impl<S: BuildHasher> Listener<S> {
         }
     }
 
+    /// Does what is due at `now`: closes callers the application has not
+    /// answered in time and runs each open connection's timers.
     pub fn handle_timeout(&mut self, now: Instant) {
         let t = self.micros(now);
         let due: Vec<u32> = self

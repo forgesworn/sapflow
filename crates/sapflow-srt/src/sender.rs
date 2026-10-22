@@ -15,6 +15,8 @@ use crate::seq::Seq;
 /// transferred into the queue, retained once, and copied once per wire send.
 #[derive(Debug, Clone)]
 pub struct SendConfig {
+    /// Most packets held at once, queued or awaiting acknowledgement; default
+    /// 4096.
     pub max_packets: usize,
     /// Sum of retained payload allocation capacities (metadata is packet-bounded).
     pub max_bytes: usize,
@@ -52,11 +54,17 @@ impl SendConfig {
     }
 }
 
+/// Why a message was not accepted for sending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendError {
+    /// The session is not open: not yet connected, or already closed or
+    /// failed.
     NotConnected,
+    /// The message has no bytes.
     Empty,
+    /// The message is longer than [`SendConfig::max_payload`].
     PayloadTooLarge,
+    /// The packet or byte budget is used up (backpressure).
     QueueFull,
 }
 
@@ -72,30 +80,56 @@ impl std::fmt::Display for SendError {
 }
 impl std::error::Error for SendError {}
 
+/// Counters for the sender. Byte counts are payload bytes, without the SRT
+/// header, unless noted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SendStats {
+    /// Messages accepted into the send queue.
     pub accepted_packets: u64,
+    /// Payload bytes in accepted messages.
     pub accepted_bytes: u64,
+    /// Data packets put on the wire, originals and retransmissions.
     pub sent_packets: u64,
+    /// Payload bytes in those packets.
     pub sent_bytes: u64,
+    /// Of those, retransmissions.
     pub retransmitted_packets: u64,
+    /// Payload bytes in retransmissions.
     pub retransmitted_bytes: u64,
     /// Transport acknowledgements, not proof of playback or application receipt.
     pub acknowledged_packets: u64,
+    /// Payload bytes acknowledged.
     pub acknowledged_bytes: u64,
+    /// Messages refused with a [`SendError`].
     pub rejected_packets: u64,
+    /// Packets still queued or unacknowledged when the session closed.
     pub abandoned_packets: u64,
+    /// Payload bytes in those packets.
     pub abandoned_bytes: u64,
+    /// Packets queued or awaiting acknowledgement now.
     pub buffered_packets: usize,
+    /// Allocation capacity held by those payloads, in bytes; what
+    /// [`SendConfig::max_bytes`] limits.
     pub buffered_bytes: usize,
+    /// Highest `buffered_packets` reached.
     pub peak_buffered_packets: usize,
+    /// Highest `buffered_bytes` reached.
     pub peak_buffered_bytes: usize,
+    /// Valid NAK packets received.
     pub nak_packets: u64,
+    /// Control packets ignored as invalid or unsupported.
     pub invalid_controls: u64,
+    /// Packets queued for retransmission by the retransmission timeout rather
+    /// than by a NAK.
     pub timeout_retransmissions: u64,
+    /// Smoothed round-trip time, in microseconds.
     pub rtt_us: u64,
+    /// New data packets encrypted; retransmissions reuse the ciphertext and
+    /// are not counted.
     pub encrypted_packets: u64,
+    /// Key material requests sent, repeats included.
     pub km_requests: u64,
+    /// Key material responses that matched the outstanding request.
     pub km_responses: u64,
 }
 

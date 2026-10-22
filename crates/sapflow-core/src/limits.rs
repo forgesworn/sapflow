@@ -20,6 +20,8 @@ pub struct AuthThrottle {
 const MAX_TRACKED: usize = 10_000;
 
 impl AuthThrottle {
+    /// Creates a throttle that refuses an address after `max_failures`
+    /// failures, until `window` has passed since the first of them.
     pub fn new(max_failures: u32, window: Duration) -> Self {
         Self {
             max_failures,
@@ -40,6 +42,8 @@ impl AuthThrottle {
         }
     }
 
+    /// Records a failed publish attempt from `ip`, starting a new window if
+    /// the last one has ended.
     pub fn failed(&mut self, ip: IpAddr, now: Instant) {
         if self.failures.len() >= MAX_TRACKED && !self.failures.contains_key(&ip) {
             let window = self.window;
@@ -68,6 +72,8 @@ pub struct RateCap {
 }
 
 impl RateCap {
+    /// Creates a cap of `max_bits_per_sec`, averaged over each `window`. The
+    /// byte budget uses whole seconds of the window, with a minimum of one.
     pub fn new(max_bits_per_sec: u64, window: Duration) -> Self {
         Self {
             max_bytes_per_window: max_bits_per_sec / 8 * window.as_secs().max(1),
@@ -101,6 +107,7 @@ pub struct LogLimiter {
 }
 
 impl LogLimiter {
+    /// Creates a limiter that lets through `max` events in each `window`.
     pub fn new(max: u32, window: Duration) -> Self {
         Self {
             max,

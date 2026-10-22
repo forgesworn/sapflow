@@ -27,15 +27,29 @@ use crate::seq::Seq;
 /// We are send-only: do not advertise receiving or periodic NAK capability.
 const FLAGS: u32 = srt_flags::TSBPDSND | srt_flags::CRYPT | srt_flags::REXMITFLG;
 
+/// Settings for a [`Caller`]; [`Caller::new`] checks them and fails with a
+/// [`ConfigError`] if any is invalid.
 #[derive(Debug, Clone)]
 pub struct CallerConfig {
     /// UTF-8, at most 512 bytes, no NUL. Sent in clear in this lab milestone.
     pub stream_id: String,
+    /// Receiver latency (TSBPD delay) we ask the listener to use, rounded up
+    /// to whole milliseconds; it may use more. 1 ms to 65535 ms; default 120
+    /// ms.
     pub latency: Duration,
+    /// How long to wait for the handshake to complete, counted from creation;
+    /// at least `handshake_retry`, at most 60 s; default 5 s.
     pub connect_timeout: Duration,
+    /// Interval between handshake packets while connecting; 10 ms to 5 s;
+    /// default 250 ms.
     pub handshake_retry: Duration,
+    /// Most handshake packets sent before giving up with
+    /// [`CallerCloseReason::HandshakeLimit`]; 1 to 1024; default 32.
     pub max_handshake_packets: u32,
+    /// A connected session ends after this long without a valid packet from
+    /// the listener; 10 ms to 60 s; default 5 s.
     pub peer_idle: Duration,
+    /// Limits and pacing for the sending window.
     pub send: SendConfig,
     /// None explicitly selects plaintext; Some requires encryption.
     pub crypto: Option<CryptoConfig>,
@@ -56,12 +70,19 @@ impl Default for CallerConfig {
     }
 }
 
+/// Why a [`Caller`] could not be created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
+    /// The stream ID is longer than 512 bytes or contains a NUL.
     StreamId,
+    /// A time, packet, payload, bandwidth or byte limit is out of range.
     Limits,
+    /// The caller socket ID is zero.
     SocketId,
+    /// The peer address has port 0, or is unspecified or multicast.
     Peer,
+    /// The crypto configuration is invalid, or secure randomness was
+    /// unavailable.
     Crypto,
 }
 impl std::fmt::Display for ConfigError {
@@ -77,39 +98,71 @@ impl std::fmt::Display for ConfigError {
 }
 impl std::error::Error for ConfigError {}
 
+/// Why a [`Caller`] session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallerCloseReason {
+    /// [`Caller::stop`] was called.
     Cancelled,
+    /// The handshake did not complete within `connect_timeout`.
     ConnectTimeout,
+    /// `max_handshake_packets` were sent without completing the handshake.
     HandshakeLimit,
+    /// No valid packet from the listener for `peer_idle`.
     PeerIdle,
+    /// The listener refused the handshake; the code is its rejection reason
+    /// (see [`RejectCode`](crate::listener::RejectCode)).
     Rejected(u32),
+    /// The listener's handshake is not one this live caller can use: wrong
+    /// version, missing or unsupported extensions, or incompatible flags or
+    /// sizes.
     UnsupportedPeer,
+    /// Encryption failed: the listener's key material response did not match,
+    /// or a key could not be used or rotated safely.
     Crypto,
+    /// Queued media reached `send.max_age_us` before it was acknowledged.
     MediaExpired,
+    /// A packet was retransmitted `send.max_retransmits` times.
     RetryLimit,
+    /// The listener sent SHUTDOWN.
     PeerClosed,
+    /// The listener sent a peer error; the code is the one it reported.
     PeerError(u32),
 }
 
+/// What happened to a [`Caller`] session; see [`Caller::poll_event`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallerEvent {
     /// Handshake only; does not prove application acceptance or playback.
     Connected {
+        /// The socket ID the listener gave the connection.
         peer_socket: u32,
+        /// The negotiated TSBPD latency: the larger of ours and the
+        /// listener's receiver delay, in whole milliseconds.
         latency: Duration,
+        /// Largest message [`Caller::enqueue`] accepts, in bytes
+        /// (`send.max_payload`).
         max_payload: usize,
     },
+    /// The session ended.
     Closed {
+        /// Why it ended.
         reason: CallerCloseReason,
     },
 }
 
+/// Counters for a [`Caller`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CallerStats {
+    /// Handshake packets sent, repeats included.
     pub handshake_packets: u64,
+    /// Datagrams dropped for being over 1500 bytes or not a well-formed
+    /// control packet.
     pub malformed: u64,
+    /// Datagrams ignored as not meant for this session: wrong source address,
+    /// wrong destination socket, or unexpected in the current state.
     pub stray: u64,
+    /// The sender's counters; all zero until connected, and kept after
+    /// closing.
     pub send: SendStats,
 }
 
@@ -120,6 +173,8 @@ enum State {
     Closed,
 }
 
+/// A live SRT caller: connects to a listener, then sends queued messages
+/// paced and bounded. Sans-IO; see the module docs.
 pub struct Caller {
     config: CallerConfig,
     peer: SocketAddr,
@@ -136,6 +191,9 @@ pub struct Caller {
 }
 
 impl Caller {
+    /// A caller for `peer` with a random socket ID and initial sequence
+    /// number; `now` starts its clock. Fails if `config` or `peer` is not
+    /// valid.
     pub fn new(config: CallerConfig, peer: SocketAddr, now: Instant) -> Result<Self, ConfigError> {
         let random = RandomState::new();
         let socket_id = (random.hash_one(("sapflow caller", peer)) as u32 & 0x3fff_ffff).max(1);
@@ -203,12 +261,15 @@ impl Caller {
         self.latest
     }
 
+    /// Whether the handshake has completed and the session is still open.
     pub fn is_connected(&self) -> bool {
         matches!(self.state, State::Open(_))
     }
+    /// Whether the session has ended, for any reason.
     pub fn is_closed(&self) -> bool {
         matches!(self.state, State::Closed)
     }
+    /// The counters so far, with the sender's once connected.
     pub fn stats(&self) -> CallerStats {
         let mut stats = self.stats;
         if let State::Open(sender) = &self.state {
@@ -216,6 +277,7 @@ impl Caller {
         }
         stats
     }
+    /// The next [`CallerEvent`], if any.
     pub fn poll_event(&mut self) -> Option<CallerEvent> {
         self.events.pop_front()
     }
@@ -242,6 +304,9 @@ impl Caller {
         }
     }
 
+    /// Takes a datagram that arrived from `peer` at `now`. One that is not a
+    /// well-formed control packet for this session from the listener is
+    /// counted in [`CallerStats`] and ignored.
     pub fn handle_datagram(&mut self, now: Instant, peer: SocketAddr, bytes: &[u8]) {
         let t = self.micros(now);
         self.tick(t);
@@ -277,6 +342,8 @@ impl Caller {
         }
     }
 
+    /// Does what is due at `now`: connect and idle timeouts, the media age
+    /// limit and retransmission timers.
     pub fn handle_timeout(&mut self, now: Instant) {
         let t = self.micros(now);
         self.tick(t);
@@ -309,6 +376,8 @@ impl Caller {
         bytes.map(|bytes| (self.peer, bytes))
     }
 
+    /// When to call [`handle_timeout`](Self::handle_timeout) next; `None`
+    /// once the session has closed.
     pub fn poll_timeout(&self) -> Option<Instant> {
         let t = match &self.state {
             State::Induction | State::Conclusion { .. } => self

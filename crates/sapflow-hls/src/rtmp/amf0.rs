@@ -11,25 +11,33 @@ pub const MAX_DEPTH: usize = 16;
 /// Most values (counting nested ones) decoded from one message.
 pub const MAX_VALUES: usize = 4096;
 
+/// An AMF0 value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// A 64-bit float, AMF0's only number type.
     Number(f64),
+    /// A boolean.
     Boolean(bool),
+    /// A string. Long strings and XML documents decode to this too.
     String(String),
     /// Properties in the order they arrived. Typed objects decode to this
     /// too (the class name is dropped).
     Object(Vec<(String, Value)>),
+    /// The `null` marker.
     Null,
+    /// The `undefined` marker. The `unsupported` marker decodes to this too.
     Undefined,
     /// An associative array; the declared count is advisory, as encoders
     /// often get it wrong, so it is read to the end marker like an object.
     EcmaArray(Vec<(String, Value)>),
+    /// An array of values without keys.
     StrictArray(Vec<Value>),
     /// Milliseconds since the Unix epoch (the time zone field is ignored).
     Date(f64),
 }
 
 impl Value {
+    /// The string, if this is a [`Value::String`].
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(s) => Some(s),
@@ -37,6 +45,7 @@ impl Value {
         }
     }
 
+    /// The number, if this is a [`Value::Number`].
     pub fn as_number(&self) -> Option<f64> {
         match self {
             Self::Number(n) => Some(*n),
@@ -61,12 +70,19 @@ impl Value {
     }
 }
 
+/// Why AMF0 could not be decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Amf0Error {
+    /// The input ended inside a value, or a declared length ran past it.
     Truncated,
+    /// A type marker this decoder does not handle; carries the marker byte.
     UnsupportedMarker(u8),
+    /// Nesting went deeper than [`MAX_DEPTH`].
     TooDeep,
+    /// More than [`MAX_VALUES`] values in one message.
     TooManyValues,
+    /// An object's properties ended with an empty key that was not followed by
+    /// the object end marker.
     BadEndMarker,
 }
 

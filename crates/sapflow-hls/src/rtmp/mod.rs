@@ -23,9 +23,12 @@ pub use session::{Event, Session, SessionError};
 
 use handshake::{Handshake, Progress};
 
+/// Why a [`Connection`] failed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RtmpError {
+    /// The handshake failed.
     Handshake(HandshakeError),
+    /// The session failed after the handshake.
     Session(SessionError),
 }
 
@@ -113,10 +116,15 @@ impl Connection {
         out
     }
 
+    /// Accepts the publish an [`Event::Publish`] announced: the client may then
+    /// send media. See [`Session::accept_publish`].
     pub fn accept_publish(&mut self) {
         self.session.accept_publish();
     }
 
+    /// Refuses the publish with an `onStatus` error (`code` such as
+    /// `NetStream.Publish.Denied`). The caller should then close the
+    /// connection. See [`Session::refuse_publish`].
     pub fn refuse_publish(&mut self, code: &str, description: &str) {
         self.session.refuse_publish(code, description);
     }

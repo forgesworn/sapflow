@@ -24,10 +24,12 @@ impl Rtt {
         }
     }
 
+    /// The smoothed round-trip time, in microseconds.
     pub fn rtt(&self) -> i64 {
         self.rtt
     }
 
+    /// The smoothed round-trip time variance (RTTVar), in microseconds.
     pub fn var(&self) -> i64 {
         self.var
     }
