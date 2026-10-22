@@ -19,8 +19,8 @@ original selected file, preserves the private original and retains capacity
 until actual owners close. The picker is unavailable during capture. Late
 permission/storage replies cannot revive a cancelled Prepare; healthy live
 file ownership and uncertain cleanup are distinct. The catalogue currently
-bounds scans to 256 segments; management/pagination and iOS catalogue/export
-remain open. There is no automatic crash repair, deletion or replay publication.
+bounds scans to 256 segments; management and pagination remain open. There is
+no automatic crash repair, deletion or replay publication.
 This builds on `1e9b031`, which preserves recording across queued Start/End,
 rotation and publisher-failure races with exact intent and actual cleanup fences.
 
@@ -32,7 +32,7 @@ existing debug certificate; Release is unsigned. The separate generated-media
 macOS native mux/recorder test independently decodes finalised and clean-abort
 segments. This does not qualify Android storage/providers or torn-file repair.
 
-iOS telemetry passes 109 pure tests, 65 packaged control/authentication tests
+The preceding iOS telemetry snapshot passes 109 pure tests, 65 packaged control/authentication tests
 and 32 creator-owner tests. These suites overlap. All three complete unsigned
 app configurations compile and link with zero warnings, using identical source
 and both existing native packages. The actual 94-input unit-test bundle also
@@ -41,6 +41,30 @@ are clear. No app was installed and the owner's Pixel capture was untouched.
 A fresh read-only Apple device inventory still reports the primary iPhone
 unavailable; the owner's confirmation that UI Automation was already enabled
 does not establish a new runner or camera result.
+
+The subsequent iOS implementation adds a private show/segment catalogue,
+selected-profile storage admission, legacy unverified-file listing and explicit
+folder export. Capture and export share a reservation gate; actual modal
+dismissal and checked worker cleanup precede new capture. Unknown close retains
+the file owners, permission scope and directory lock. Storage work runs on cold
+workers; low space finalises an incomplete recording prefix while current
+publishing continues. A later rotation can still stop publishing because restart
+requires successful segment finalisation. This limitation remains open.
+
+Focused checks pass 117 pure capture/budget tests, 26 catalogue/storage tests,
+33 library/export tests and 17 generated privacy-resource tests. A generated
+macOS check uses the production native recorder: a 3.02-second finalised file
+and two 1.26-second incomplete prefixes independently decode with video and
+audio; exported copies match their originals. These are generated fixtures,
+not phone recordings, real disk-pressure or process-kill recovery evidence.
+The required-reason privacy resource is a partial packaging checkpoint;
+collection/tracking assessment and App Store readiness remain open.
+All three complete unsigned iOS app configurations compile and link with zero
+warnings, using identical 84-file source/package contexts. Each actual normal
+app archive contains the verified root privacy resource and the expected
+configuration. The actual 109-input iOS test bundle compiles and links with
+zero warnings after restricting its subprocess lock test to macOS; no iOS
+tests were executed. No app was installed, signed for distribution or published.
 
 These are local source/build checkpoints. Physical profiles, current app
 recording/export, real creator/signer consent, sustained performance, store and
@@ -892,7 +916,7 @@ exists. In particular:
 - B4/B4R: attach real publishers; complete manual/V4V creator flows, observed
   media status, audio-only/external audio, controls, standby and safe profiles;
   physically qualify elapsed/socket readouts, storage preflight and exact
-  recording export, and implement the iOS recording catalogue/export.
+  recording export and the implemented iOS recording catalogue/export UI.
 - B5: sustained physical/network/thermal/storage tests, SDK consumption,
   route-specific signed packages, upgrade and free-V4V behaviour, owner
   acceptance, release readback and any production decision at its own gate.

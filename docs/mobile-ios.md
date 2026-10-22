@@ -245,18 +245,48 @@ run outside the locks and capture callbacks. Reservation identity handles
 out-of-order completion correctly. Overflow closes admission once, so error
 notifications cannot themselves grow an unbounded callback backlog.
 Recording overflow/storage backpressure closes new recording ingress and retains
-its accepted prefix for finalisation when Stop is requested. It does not block
-publishing. The app reports recording failure explicitly. SDK ingress overflow or validation failure closes only publishing admission and
+its accepted prefix as incomplete. A low-space result requests finalisation on
+the recording worker while publishing continues. The app reports recording
+failure explicitly. SDK ingress overflow or validation failure closes only publishing admission and
 reports the failure while local recording continues. Capture/encoder failure
 stops the common session and closes its recording.
 
-Successful stop flushes native AAC and hardware video, stops the publisher, drains accepted
-recording work and waits for AVAssetWriter finalisation. Files are retained in
-the app's Documents directory; successful finalisation offers ShareLink export.
-Files sharing is enabled for recovery/export through Files. Capture refuses to
-start with 200 MiB or less free capacity and checks capacity every five seconds
-on the control queue. A failed or interrupted file is never labelled complete.
-Fragment configuration alone does not establish process-kill recovery.
+Successful stop flushes native AAC and hardware video, stops the publisher, drains
+accepted recording work and waits for actual AVAssetWriter finalisation. New
+files live in private `Library/Application Support/Recordings`. The inline
+recording library groups orientation segments by show and distinguishes writing,
+recorder-finalised, incomplete and unverified files. Old Documents recordings
+remain in place and are listed as unverified; they are not silently adopted.
+Recorder-finalised does not establish decoded playback or a complete show.
+
+Prepare and actual Start/rotation check catalogue capacity and selected-profile
+storage on a cold IO worker before admitting media. The budget is a 60-second
+bitrate horizon plus headroom and reserve, with the existing strict greater-than
+200 MiB floor retained. This is a preflight estimate, not a future-space promise.
+At most one five-second storage read is outstanding. Directory scans, storage
+reads, writer construction/finalisation and receipt writes run off camera,
+sample, UI and capture-control callbacks. Low or unavailable storage refuses
+initial admission. After a recording fails or stops for low space, a later
+rotation can still stop publishing because automatic restart requires successful
+segment finalisation. Recording-optional restart policy remains follow-on work.
+
+Reloading metadata is permitted during capture. Export requires capture to be
+idle and opens a folder picker without passing it a private recording URL.
+The exact selection reserves capture until the modal actually dismisses and
+the cold worker finishes. Incomplete, orphaned and legacy files require explicit
+confirmation. Export revalidates the selected file and receipt, creates a new
+exclusive copy in the coordinated folder and copies in at most 64 KiB chunks.
+It checks the created file's identity and byte count, synchronises it and closes
+actual owners before releasing security-scoped access or admitting capture.
+Cancellation preserves the private original; a partial destination copy may
+remain. Unconfirmed cleanup retains ownership and blocks new work.
+
+The catalogue bounds scans to 256 segments, 1024 directory entries and 4 KiB
+receipts. A lifetime directory lock prevents a fresh local owner bypassing
+pending cleanup. File/receipt identity checks detect replacement and changes;
+they are not content-authenticity hashes. No automatic deletion, migration,
+repair or replay publication occurs. Fragment configuration alone does not
+establish process-kill recovery. Catalogue management and pagination remain open.
 
 ## Upright capture and rotation
 
@@ -276,15 +306,18 @@ delivery, stop capture, flush the encoders, await bounded publisher teardown and
 finalise the current recording. A fresh hardware encoder, AAC encoder, recording
 file and publisher then start at the latest requested pose, with a new shared
 A/V timestamp epoch. Rapid turns coalesce during finalisation. Each successfully
-finished segment remains in Files. The latest finished segment remains exportable
-while the next records. This applies to local-only capture, RTMP/RTMPS and SRT.
+finished segment remains in the private recording library. Metadata may be
+reloaded while the next records; export requires capture to be stopped. This
+applies to local-only capture, RTMP/RTMPS and SRT.
 
 This introduces a visible media gap and a fresh destination connection while
 retaining the same logical reconnect policy. Continuous playback across an
 aspect change has not been qualified on iPhone. It does
 not send replacement codec configuration into an existing immutable session.
 Automatic restart is cancelled if finalisation has not completed within six
-seconds. This fences resumption rather than forcibly interrupting an AVFoundation
+seconds. The original monotonic deadline is rechecked after blocking stages
+and before adoption, even if its timer callback was delayed. This fences
+resumption rather than forcibly interrupting an AVFoundation
 driver or file operation; cleanup may finish later. Network stop retains its
 existing three-second RTMP or 100 ms SRT drain bound. Completion additionally
 requires Network.framework's actual `.cancelled` state. A separate logical-owner
@@ -433,6 +466,30 @@ to require certificate-handshake failure before publication, without overriding
 trust. It does not install a root certificate or change Keychain trust settings.
 
 ## Evidence and remaining acceptance
+
+The private recording library checkpoint on 22 October 2026 passes 117 pure
+capture/budget tests, 26 generated-file catalogue/storage tests and 33
+library/export tests on macOS with warnings treated as errors. The independent
+subprocess lock test is macOS-only; it is not an executed iOS test. Seventeen
+generated-bundle Python tests exercise the privacy-resource verifier. All three
+complete unsigned app configurations compile and link with zero warnings using
+the same 84 source/package inputs. The actual 109-input iOS XCTest bundle also
+compiles and links with zero warnings; it was not executed on iOS. The actual
+root `PrivacyInfo.xcprivacy` is
+verified in each normal app archive, separately from source and generated
+bundles. This is a required-reason packaging checkpoint; collection/tracking
+assessment and App Store readiness remain open.
+
+A generated-only macOS check uses the actual production CompressedRecorder,
+AVAssetWriter and catalogue with compressed H.264/AAC samples. Its finalised
+3.02-second file and two incomplete 1.26-second prefixes independently decode
+with video and audio. Exports match their originals, bounded copy chunks stay
+within 64 KiB and repeated finish listeners receive actual completion. The
+recording-only stop uses the explicit incomplete-finish seam, not real disk
+pressure. All generated media and build scratch were removed. Receipts remain
+under `target/ios-recording-native/v3/` and `target/ios-recording-library/`.
+This does not establish document-provider/modal behaviour, physical iOS
+recording, seeking, thermal performance, crash recovery or power-loss bounds.
 
 Verified on 21 October 2026 with Xcode 16.2 and the actual generated Sapflow
 XCFramework: the unsigned arm64 iOS application and XCTest bundle passed

@@ -424,3 +424,40 @@ the library. Cross-process locking, receipt bounds and private originals remain
 independent of the media/network queues. Generated host-file tests do not
 qualify Android filesystem behaviour, document providers, process termination,
 physical storage failure or device media playback.
+
+## iOS private recording catalogue and export
+
+The iOS adapter uses the same show/ordered-segment and explicit unverified-file
+policy with native compressed AVAssetWriter inputs. New media is app-private;
+legacy Documents files stay in place and unverified. Bounded sidecar receipts
+record actual writer completion, file synchronisation and close. Prior loss
+remains incomplete even when the container finishes. Receipts are not decoded
+playability, whole-show or authenticity proof. There is no automatic repair,
+deletion, migration or replay publication.
+
+Catalogue scans are bounded to 256 segments, 1024 directory entries and 4 KiB
+receipts. One app-owned catalogue holds a lifetime directory lock. Healthy live
+ownership permits metadata scans; uncertain cleanup retains ownership. Prepare,
+actual Start and rotation recheck capacity and selected-profile storage before
+media admission. iOS retains its strict greater-than-200 MiB floor alongside the
+60-second bitrate budget, headroom and reserve. The Android and iOS space floors
+are separate platform policies, not an SDK guarantee. Low-space recording stops
+preserve an incomplete prefix while the current publisher continues; later
+rotation still requires a successfully finalised segment to restart.
+
+Export and actual capture reservation share a scalar admission gate. The folder
+picker requires idle capture and receives no private URL or handle. Its exact
+selection stays reserved through actual dismissal; a reply, Cancel or owner
+close alone cannot release it. A cold worker acquires security-scoped access,
+coordinates the selected directory, revalidates the original file and receipt,
+and makes an exclusive copy in chunks no larger than 64 KiB. Actual byte count,
+created inode, sync and close are checked before success. Scope ends only after
+actual coordination and resource cleanup. Unknown close retains the owners,
+scope and directory lock; a new owner cannot bypass that state. Cancellation
+preserves the private original and may leave a partial destination copy.
+
+Generated host-file tests exercise the catalogue, gate, copy, scope and close
+failure seams. Generated macOS media also exercises the actual production
+CompressedRecorder/AVAssetWriter and independently decodes finalised and
+incomplete prefixes. These checks do not qualify physical iOS storage, document
+providers, UI dismissal, process termination, crash recovery or power loss.
