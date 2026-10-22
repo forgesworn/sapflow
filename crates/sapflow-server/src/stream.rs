@@ -266,6 +266,11 @@ impl LiveStream {
         None
     }
 
+    /// A counter that rises on every change a viewer could be waiting for.
+    pub fn version(&self) -> u64 {
+        *self.version.borrow()
+    }
+
     /// Subscribe before checking state, then wait on `changed()`.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.version.subscribe()

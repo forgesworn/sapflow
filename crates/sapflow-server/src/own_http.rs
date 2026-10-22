@@ -5,17 +5,25 @@
 //!
 //! Each worker thread owns a poller and the connections it accepts from a
 //! shared listener. Requests that must wait (blocking playlist reload, the
-//! preload-hinted part) park on their connection and are re-checked when a
-//! stream changes ([`notify`]). Request framing is `http1.rs`; the answers
-//! make the same decisions as `http.rs`.
+//! preload-hinted part) park on their connection. A stream change wakes
+//! every worker ([`notify`]), and each re-checks the parked requests whose
+//! stream changed. Request framing is `http1.rs`; routing and answers make
+//! the same decisions as `http.rs`.
 //!
-//! Limits: at most [`MAX_CONNECTIONS`] connections (past it, new ones wait
-//! in the kernel's accept queue); one response in flight per connection, so
-//! a client that sends without reading stops being read; a connection with
-//! nothing parked that makes no progress for [`IDLE_TIMEOUT`] is closed.
+//! Limits:
+//! - At most [`MAX_CONNECTIONS`] connections; past it, new ones wait in the
+//!   kernel's accept queue.
+//! - A request head must arrive within [`HEADER_TIMEOUT`] of its first byte.
+//! - A connection with nothing parked that makes no progress for
+//!   [`IDLE_TIMEOUT`] is closed.
+//! - One response in flight per connection, so a client that sends without
+//!   reading stops being read, and at most [`REQUESTS_PER_TURN`] requests per
+//!   connection before the worker serves the others.
+//! - A panic while serving a connection closes that connection only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, IoSlice, Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,7 +35,7 @@ use sapflow_hls::playlist::{self, Chunk};
 use sapflow_hls::{PartLookup, Readiness};
 
 use crate::App;
-use crate::http1::{self, Method, Parsed};
+use crate::http1::{self, Method, Parsed, Persist};
 use crate::stream::LiveStream;
 
 const LISTENER: Token = Token(0);
@@ -36,10 +44,18 @@ const PLAYLIST_TYPE: &str = "application/vnd.apple.mpegurl";
 const CHUNK_CACHE: &str = "public, max-age=3600";
 /// Concurrent connections across all workers, as in `http.rs`.
 pub const MAX_CONNECTIONS: usize = 20_000;
+/// Time allowed for a request head to arrive once its first byte has, as
+/// hyper's header read timeout in `http.rs` (slow-loris).
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 /// A connection with nothing parked is closed after this long without
 /// reading a byte or writing one. As in `http.rs`, it must outlast clients'
 /// idle keep-alive reuse.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Requests one connection may have answered before the worker turns to the
+/// others; the rest wait their turn on the ready queue.
+pub const REQUESTS_PER_TURN: usize = 16;
+/// Connections accepted per turn, for the same reason.
+const ACCEPTS_PER_TURN: usize = 64;
 /// How often each worker checks deadlines and retries a paused accept.
 const SWEEP: Duration = Duration::from_millis(250);
 
@@ -57,17 +73,42 @@ pub fn notify() {
     }
 }
 
-/// Starts `threads` workers serving `listener`.
-pub fn spawn(app: Arc<App>, listener: std::net::TcpListener, threads: usize) -> io::Result<()> {
+/// The timeouts, separate so tests can shorten them.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    pub header: Duration,
+    pub idle: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            header: HEADER_TIMEOUT,
+            idle: IDLE_TIMEOUT,
+        }
+    }
+}
+
+/// Starts `threads` workers serving `listener`. A worker that fails ends the
+/// process, so a supervisor restarts it rather than leaving viewers queued on
+/// a listener nobody serves.
+pub fn spawn(
+    app: Arc<App>,
+    listener: std::net::TcpListener,
+    threads: usize,
+    timeouts: Timeouts,
+) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     for i in 0..threads.max(1) {
-        let mut worker = Worker::new(app.clone(), listener.try_clone()?)?;
+        let mut worker = Worker::new(app.clone(), listener.try_clone()?, timeouts)?;
         std::thread::Builder::new()
             .name(format!("http-{i}"))
             .spawn(move || {
-                if let Err(e) = worker.run() {
-                    tracing::error!(error = %e, "HTTP worker stopped");
+                match catch_unwind(AssertUnwindSafe(|| worker.run())) {
+                    Ok(Err(e)) => tracing::error!(error = %e, "HTTP worker failed"),
+                    _ => tracing::error!("HTTP worker panicked"),
                 }
+                std::process::exit(1);
             })?;
     }
     Ok(())
@@ -77,6 +118,8 @@ struct Response {
     status: &'static str,
     headers: String,
     body: Bytes,
+    /// `false` for a 204, which carries no content-length.
+    has_length: bool,
 }
 
 impl Response {
@@ -85,6 +128,7 @@ impl Response {
             status,
             headers: String::new(),
             body: Bytes::new(),
+            has_length: true,
         }
     }
     fn ok(body: Bytes, content_type: &str, cache: &str) -> Self {
@@ -92,7 +136,11 @@ impl Response {
             status: "200 OK",
             headers: format!("content-type: {content_type}\r\ncache-control: {cache}\r\n"),
             body,
+            has_length: true,
         }
+    }
+    fn not_found() -> Self {
+        Self::empty("404 Not Found")
     }
 }
 
@@ -115,6 +163,8 @@ struct Parked {
     request: Request,
     head_only: bool,
     deadline: Instant,
+    /// The stream's version when last checked: re-check only after it moves.
+    seen: u64,
 }
 
 struct Conn {
@@ -126,8 +176,12 @@ struct Conn {
     parked: Option<Parked>,
     /// Close once the output is written.
     close_after: bool,
+    /// The request being answered was HTTP/1.0 asking to keep alive.
+    keep_alive_10: bool,
     writable_armed: bool,
     last_progress: Instant,
+    /// When the first byte of the request head now arriving came.
+    head_started: Option<Instant>,
     /// The socket may hold bytes not yet read, because the buffer was full.
     unread: bool,
 }
@@ -151,20 +205,35 @@ impl Drop for Slot {
     }
 }
 
+/// What a turn on one connection left behind.
+enum Turn {
+    /// Waiting for the socket or a stream change.
+    Idle,
+    /// Out of budget with requests still to answer: queue another turn.
+    Again,
+    /// Finished or broken: close it.
+    Close,
+}
+
 struct Worker {
     app: Arc<App>,
     poll: Poll,
     listener: TcpListener,
+    timeouts: Timeouts,
     conns: HashMap<usize, (Conn, Slot)>,
     parked: HashSet<usize>,
+    /// Connections with work left over from their last turn.
+    ready: VecDeque<usize>,
     next: usize,
-    /// Connections are waiting in the accept queue because of the cap.
+    /// Connections may be waiting in the accept queue.
+    accept_more: bool,
+    /// Accepting stopped on the connection cap or an error: retry at sweeps.
     accept_paused: bool,
     buf: Vec<u8>,
 }
 
 impl Worker {
-    fn new(app: Arc<App>, listener: std::net::TcpListener) -> io::Result<Self> {
+    fn new(app: Arc<App>, listener: std::net::TcpListener, timeouts: Timeouts) -> io::Result<Self> {
         let poll = Poll::new()?;
         let mut listener = TcpListener::from_std(listener);
         poll.registry()
@@ -177,9 +246,12 @@ impl Worker {
             app,
             poll,
             listener,
+            timeouts,
             conns: HashMap::new(),
             parked: HashSet::new(),
+            ready: VecDeque::new(),
             next: 2,
+            accept_more: false,
             accept_paused: false,
             buf: vec![0; 16 * 1024],
         })
@@ -189,7 +261,11 @@ impl Worker {
         let mut events = Events::with_capacity(1024);
         let mut next_sweep = Instant::now() + SWEEP;
         loop {
-            let timeout = next_sweep.saturating_duration_since(Instant::now());
+            let timeout = if self.ready.is_empty() && !self.accept_more {
+                next_sweep.saturating_duration_since(Instant::now())
+            } else {
+                Duration::ZERO
+            };
             match self.poll.poll(&mut events, Some(timeout)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -198,16 +274,26 @@ impl Worker {
             let mut woke = false;
             for ev in events.iter() {
                 match ev.token() {
-                    LISTENER => self.accept(),
+                    LISTENER => self.accept_more = true,
                     WAKE => woke = true,
-                    Token(id) => self.service(id, ev.is_readable()),
+                    Token(id) => {
+                        let read = ev.is_readable() || ev.is_read_closed() || ev.is_error();
+                        self.service(id, read);
+                    }
                 }
             }
-            if woke {
-                let ids: Vec<usize> = self.parked.iter().copied().collect();
-                for id in ids {
+            // One more turn for each connection left with work, oldest first;
+            // anything they queue again waits for the next round.
+            for _ in 0..self.ready.len() {
+                if let Some(id) = self.ready.pop_front() {
                     self.service(id, false);
                 }
+            }
+            if self.accept_more {
+                self.accept();
+            }
+            if woke {
+                self.wake_parked();
             }
             let now = Instant::now();
             if now >= next_sweep {
@@ -217,8 +303,27 @@ impl Worker {
         }
     }
 
+    /// Re-checks the parked requests whose stream has changed.
+    fn wake_parked(&mut self) {
+        let ids: Vec<usize> = self
+            .parked
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.conns
+                    .get(id)
+                    .and_then(|(c, _)| c.parked.as_ref())
+                    .is_some_and(|p| stream_of(&p.request).version() != p.seen)
+            })
+            .collect();
+        for id in ids {
+            self.service(id, false);
+        }
+    }
+
     fn accept(&mut self) {
-        loop {
+        self.accept_more = false;
+        for _ in 0..ACCEPTS_PER_TURN {
             let Some(slot) = Slot::take() else {
                 self.accept_paused = true;
                 return;
@@ -243,8 +348,10 @@ impl Worker {
                         written: 0,
                         parked: None,
                         close_after: false,
+                        keep_alive_10: false,
                         writable_armed: false,
                         last_progress: Instant::now(),
+                        head_started: None,
                         unread: false,
                     };
                     self.conns.insert(id, (conn, slot));
@@ -255,7 +362,12 @@ impl Worker {
                     self.accept_paused = false;
                     return;
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // One connection reset before it was accepted: carry on.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) => {}
                 Err(e) => {
                     // Out of file descriptors and the like: retry at the
                     // next sweep.
@@ -265,27 +377,35 @@ impl Worker {
                 }
             }
         }
+        // Budget spent with connections possibly still queued.
+        self.accept_more = true;
     }
 
-    /// Times out parked requests and idle connections, and retries a
-    /// paused accept.
+    /// Times out parked requests, slow request heads and idle connections,
+    /// and retries a paused accept.
     fn sweep(&mut self, now: Instant) {
-        let due: Vec<usize> = self
-            .conns
-            .iter()
-            .filter(|(_, (c, _))| match &c.parked {
-                Some(p) => p.deadline <= now,
-                None => now.duration_since(c.last_progress) >= IDLE_TIMEOUT,
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in due {
-            let parked = self.conns.get(&id).is_some_and(|(c, _)| c.parked.is_some());
-            if parked {
-                self.service(id, false);
-            } else {
-                self.close(id);
+        let t = self.timeouts;
+        let mut expired = Vec::new();
+        let mut closing = Vec::new();
+        for (id, (c, _)) in &self.conns {
+            match &c.parked {
+                Some(p) if p.deadline <= now => expired.push(*id),
+                Some(_) => {}
+                None => {
+                    let slow_head = c
+                        .head_started
+                        .is_some_and(|s| now.duration_since(s) >= t.header);
+                    if slow_head || now.duration_since(c.last_progress) >= t.idle {
+                        closing.push(*id);
+                    }
+                }
             }
+        }
+        for id in expired {
+            self.service(id, false);
+        }
+        for id in closing {
+            self.close(id);
         }
         if self.accept_paused {
             self.accept();
@@ -299,21 +419,35 @@ impl Worker {
         }
     }
 
-    /// Reads (if asked), answers what it can, writes what it can, and drops
-    /// the connection when it is finished or broken.
+    /// Gives one connection a turn and files it by the result.
     fn service(&mut self, id: usize, read: bool) {
         let Some((conn, _)) = self.conns.get_mut(&id) else {
             return;
         };
-        let alive =
-            drive(&self.app, &self.poll, conn, Token(id), &mut self.buf, read).unwrap_or(false);
+        let app = &self.app;
+        let poll = &self.poll;
+        let buf = &mut self.buf;
+        let turn = catch_unwind(AssertUnwindSafe(|| {
+            drive(app, poll, conn, Token(id), buf, read)
+        }))
+        .unwrap_or_else(|_| {
+            tracing::error!("panic while serving an HTTP connection; closed it");
+            Ok(Turn::Close)
+        })
+        .unwrap_or(Turn::Close);
         let parked = conn.parked.is_some();
-        if !alive {
-            self.close(id);
-        } else if parked {
-            self.parked.insert(id);
-        } else {
-            self.parked.remove(&id);
+        match turn {
+            Turn::Close => self.close(id),
+            Turn::Again => {
+                self.parked.remove(&id);
+                self.ready.push_back(id);
+            }
+            Turn::Idle if parked => {
+                self.parked.insert(id);
+            }
+            Turn::Idle => {
+                self.parked.remove(&id);
+            }
         }
     }
 }
@@ -325,28 +459,38 @@ fn drive(
     token: Token,
     buf: &mut [u8],
     mut read: bool,
-) -> io::Result<bool> {
-    let now = Instant::now();
-    loop {
+) -> io::Result<Turn> {
+    let mut taken = 0;
+    let turn = loop {
+        let now = Instant::now();
         if read || conn.unread {
             read = false;
             if !fill(conn, buf, now) {
-                return Ok(false);
+                return Ok(Turn::Close);
             }
         }
-        if let Some(p) = conn.parked.take() {
+        if let Some(mut p) = conn.parked.take() {
+            let seen = stream_of(&p.request).version();
             match answer(app, &p.request) {
                 Some(r) => respond(conn, r, p.head_only),
                 None if now >= p.deadline => {
                     respond(conn, Response::empty("503 Service Unavailable"), false)
                 }
-                None => conn.parked = Some(p),
+                None => {
+                    p.seen = seen;
+                    conn.parked = Some(p);
+                }
             }
         }
         // One response in flight: take the next request only once the last
         // is written.
         if conn.parked.is_none() && conn.output.is_empty() && !conn.close_after {
-            take_request(app, conn, now);
+            if taken == REQUESTS_PER_TURN {
+                break Turn::Again;
+            }
+            if take_request(app, conn, now) {
+                taken += 1;
+            }
         }
         flush(conn, now)?;
         // Go round again while there is another request to take: one already
@@ -354,9 +498,9 @@ fn drive(
         let ready_for_more = conn.parked.is_none() && conn.output.is_empty() && !conn.close_after;
         let more = conn.unread || !matches!(http1::parse(&conn.input), Parsed::Partial);
         if !(ready_for_more && more) {
-            break;
+            break Turn::Idle;
         }
-    }
+    };
     let want_write = !conn.output.is_empty();
     if want_write != conn.writable_armed {
         let interest = if want_write {
@@ -368,7 +512,10 @@ fn drive(
             .reregister(&mut conn.sock, token, interest)?;
         conn.writable_armed = want_write;
     }
-    Ok(!(conn.close_after && conn.output.is_empty() && conn.parked.is_none()))
+    if conn.close_after && conn.output.is_empty() && conn.parked.is_none() {
+        return Ok(Turn::Close);
+    }
+    Ok(turn)
 }
 
 /// Reads until the socket is empty or one request head is buffered. False
@@ -378,15 +525,22 @@ fn fill(conn: &mut Conn, buf: &mut [u8], now: Instant) -> bool {
     loop {
         // Stop past one request head: the rest waits in the socket, which
         // pushes back on the client.
-        if conn.input.len() > http1::MAX_HEAD {
+        let room = (http1::MAX_HEAD + 1).saturating_sub(conn.input.len());
+        if room == 0 {
             conn.unread = true;
             return true;
         }
-        match conn.sock.read(buf) {
+        let Some(into) = buf.get_mut(..room.min(buf.len())) else {
+            return false;
+        };
+        match conn.sock.read(into) {
             Ok(0) => return false,
             Ok(n) => {
+                if conn.input.is_empty() && conn.head_started.is_none() {
+                    conn.head_started = Some(now);
+                }
                 conn.input
-                    .extend_from_slice(buf.get(..n).unwrap_or_default());
+                    .extend_from_slice(into.get(..n).unwrap_or_default());
                 conn.last_progress = now;
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
@@ -396,50 +550,61 @@ fn fill(conn: &mut Conn, buf: &mut [u8], now: Instant) -> bool {
     }
 }
 
-/// Parses and answers the next buffered request, or parks it.
-fn take_request(app: &App, conn: &mut Conn, now: Instant) {
+/// Parses and answers the next buffered request, or parks it. True if a
+/// request was taken.
+fn take_request(app: &App, conn: &mut Conn, now: Instant) -> bool {
     let (req, used) = match http1::parse(&conn.input) {
         Parsed::Request(r, n) => (r, n),
-        Parsed::Partial => return,
+        Parsed::Partial => return false,
         Parsed::Invalid => {
             conn.close_after = true;
-            conn.input.clear();
+            conn.input = Vec::new();
             conn.unread = false;
+            conn.keep_alive_10 = false;
             respond(conn, Response::empty("400 Bad Request"), false);
-            return;
+            return true;
         }
     };
     conn.input.drain(..used);
+    // Pipelined bytes already here start the next head now.
+    conn.head_started = (!conn.input.is_empty()).then_some(now);
+    if conn.input.is_empty() && conn.input.capacity() > 4096 {
+        conn.input = Vec::new();
+    }
     conn.close_after = req.close;
-    match req.method {
-        Method::Get | Method::Head => {
-            let head_only = req.method == Method::Head;
-            match route(app, &req.target) {
-                Ok(request) => match answer(app, &request) {
-                    Some(r) => respond(conn, r, head_only),
-                    None => {
-                        let deadline = now + block_limit(stream_of(&request));
-                        conn.parked = Some(Parked {
-                            request,
-                            head_only,
-                            deadline,
-                        });
-                    }
-                },
-                Err(r) => respond(conn, r, head_only),
+    conn.keep_alive_10 = req.keep_alive_10;
+    let head_only = req.method == Method::Head;
+    match route(app, req.method, &req.target) {
+        Ok(request) => {
+            let seen = stream_of(&request).version();
+            match answer(app, &request) {
+                Some(r) => respond(conn, r, head_only),
+                None => {
+                    let deadline = now + block_limit(stream_of(&request));
+                    conn.parked = Some(Parked {
+                        request,
+                        head_only,
+                        deadline,
+                        seen,
+                    });
+                }
             }
         }
-        Method::Options => {
-            let mut r = Response::empty("204 No Content");
-            r.headers = "access-control-allow-methods: GET, OPTIONS\r\naccess-control-allow-headers: *\r\naccess-control-max-age: 86400\r\n".into();
-            respond(conn, r, false);
-        }
-        Method::Other => respond(conn, Response::empty("405 Method Not Allowed"), false),
+        Err(r) => respond(conn, r, head_only),
     }
+    true
 }
 
 fn respond(conn: &mut Conn, r: Response, head_only: bool) {
-    let head = http1::head(r.status, &r.headers, r.body.len(), conn.close_after);
+    let persist = if conn.close_after {
+        Persist::Close
+    } else if conn.keep_alive_10 {
+        Persist::KeepAlive
+    } else {
+        Persist::Default
+    };
+    let length = r.has_length.then_some(r.body.len());
+    let head = http1::head(r.status, &r.headers, length, persist);
     conn.output.push_back(Bytes::from(head));
     if !head_only && !r.body.is_empty() {
         conn.output.push_back(r.body);
@@ -502,22 +667,39 @@ fn block_limit(stream: &LiveStream) -> Duration {
     Duration::from_secs(3 * target)
 }
 
-fn route(app: &App, target: &str) -> Result<Request, Response> {
-    let not_found = || Response::empty("404 Not Found");
+/// The routes of `http.rs`: `/live/{event}/index.m3u8`, the media playlist
+/// and `/live/{event}/{file}`, each answering GET, HEAD and OPTIONS. Anything
+/// else is 404 whatever the method; another method on a route is 405.
+fn route(app: &App, method: Method, target: &str) -> Result<Request, Response> {
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (target, None),
     };
-    let rest = path.strip_prefix("/live/").ok_or_else(not_found)?;
-    let (event, file) = rest.split_once('/').ok_or_else(not_found)?;
-    if file.contains('/') {
-        return Err(not_found());
+    let (event, file) = path
+        .strip_prefix("/live/")
+        .and_then(|rest| rest.split_once('/'))
+        .filter(|(e, f)| !e.is_empty() && !f.is_empty() && !f.contains('/'))
+        .ok_or_else(Response::not_found)?;
+    match method {
+        Method::Get | Method::Head => {}
+        Method::Options => {
+            let mut r = Response::empty("204 No Content");
+            r.has_length = false;
+            r.headers = "access-control-allow-methods: GET, OPTIONS\r\naccess-control-allow-headers: *\r\naccess-control-max-age: 86400\r\n".into();
+            return Err(r);
+        }
+        Method::Other => {
+            let mut r = Response::empty("405 Method Not Allowed");
+            r.headers = "allow: GET,HEAD,OPTIONS\r\n".into();
+            return Err(r);
+        }
     }
-    let stream = app.streams.get(event).ok_or_else(not_found)?;
     if file == "index.m3u8" {
+        let stream = app.streams.get(event).ok_or_else(Response::not_found)?;
         return Ok(Request::Multivariant(stream));
     }
     if file == playlist::MEDIA_PLAYLIST {
+        // As in http.rs: the query is checked before the stream is looked up.
         let (msn, part) = playlist::parse_blocking_query(query)
             .map_err(|_| Response::empty("400 Bad Request"))?;
         // Without parts or CAN-BLOCK-RELOAD, the client reloads completed
@@ -527,10 +709,12 @@ fn route(app: &App, target: &str) -> Result<Request, Response> {
         } else {
             (None, None)
         };
+        let stream = app.streams.get(event).ok_or_else(Response::not_found)?;
         return Ok(Request::Media { stream, msn, part });
     }
+    let stream = app.streams.get(event).ok_or_else(Response::not_found)?;
     let prefix = stream.lock().prefix.clone();
-    let chunk = playlist::parse_chunk(&prefix, file).ok_or_else(not_found)?;
+    let chunk = playlist::parse_chunk(&prefix, file).ok_or_else(Response::not_found)?;
     Ok(Request::Chunk {
         stream,
         prefix,
@@ -540,7 +724,7 @@ fn route(app: &App, target: &str) -> Result<Request, Response> {
 
 /// The response if it can be given now, `None` if the request must wait.
 fn answer(app: &App, request: &Request) -> Option<Response> {
-    let not_found = || Some(Response::empty("404 Not Found"));
+    let not_found = || Some(Response::not_found());
     match request {
         Request::Multivariant(stream) => match stream.lock().multivariant.clone() {
             Some(b) => Some(Response::ok(b, PLAYLIST_TYPE, "no-cache")),
@@ -660,7 +844,7 @@ mod tests {
         let (app, _scratch) = app(false);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        spawn(app.clone(), listener, 2).expect("spawn");
+        spawn(app.clone(), listener, 2, Timeouts::default()).expect("spawn");
 
         let mut publisher = begin(&app);
         publisher
@@ -718,6 +902,7 @@ mod tests {
         let (status, headers, _) = response(&mut r);
         assert_eq!(status, "HTTP/1.1 204 No Content");
         assert!(headers.contains(&"access-control-allow-methods: get, options".to_string()));
+        assert!(!headers.iter().any(|h| h.starts_with("content-length")));
 
         // A blocking playlist reload and the preload-hinted part both park.
         let blocking = std::thread::spawn(move || {
@@ -765,12 +950,28 @@ mod tests {
         let (app, _scratch) = app(false);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        spawn(app, listener, 1).expect("spawn");
+        spawn(app, listener, 1, Timeouts::default()).expect("spawn");
 
         let (mut s, mut r) = connect(addr);
         s.write_all(b"POST /live/x/y HTTP/1.1\r\n\r\n")
             .expect("send");
-        assert_eq!(response(&mut r).0, "HTTP/1.1 405 Method Not Allowed");
+        let (status, headers, _) = response(&mut r);
+        assert_eq!(status, "HTTP/1.1 405 Method Not Allowed");
+        assert!(headers.contains(&"allow: get,head,options".to_string()));
+        // As in http.rs: off the routes, every method is 404.
+        for raw in [
+            "POST /elsewhere HTTP/1.1\r\n\r\n",
+            "OPTIONS /elsewhere HTTP/1.1\r\n\r\n",
+            "OPTIONS * HTTP/1.1\r\n\r\n",
+            "GET http://example/live/event-nothing/index.m3u8 HTTP/1.1\r\n\r\n",
+        ] {
+            s.write_all(raw.as_bytes()).expect("send");
+            assert_eq!(response(&mut r).0, "HTTP/1.1 404 Not Found", "{raw}");
+        }
+        // A bad blocking query is 400 before the stream is looked up.
+        s.write_all(b"GET /live/event-nothing/stream.m3u8?_HLS_msn=x HTTP/1.1\r\n\r\n")
+            .expect("send");
+        assert_eq!(response(&mut r).0, "HTTP/1.1 400 Bad Request");
 
         s.write_all(b"GET / HTTP/1.1\r\ncontent-length: 4\r\n\r\nGET ")
             .expect("send");
@@ -786,5 +987,97 @@ mod tests {
         assert_eq!(response(&mut r).0, "HTTP/1.1 404 Not Found");
         let mut rest = Vec::new();
         assert_eq!(r.read_to_end(&mut rest).expect("closed"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_1_0_keep_alive_is_answered_in_kind() {
+        let (app, _scratch) = app(false);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        spawn(app, listener, 1, Timeouts::default()).expect("spawn");
+        let (mut s, mut r) = connect(addr);
+        for _ in 0..2 {
+            s.write_all(b"GET /nothing HTTP/1.0\r\nconnection: keep-alive\r\n\r\n")
+                .expect("send");
+            let (status, headers, _) = response(&mut r);
+            assert_eq!(status, "HTTP/1.1 404 Not Found");
+            assert!(headers.contains(&"connection: keep-alive".to_string()));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trickled_request_head_is_cut_off_at_the_header_timeout() {
+        let (app, _scratch) = app(false);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let timeouts = Timeouts {
+            header: Duration::from_millis(400),
+            idle: Duration::from_secs(60),
+        };
+        spawn(app, listener, 1, timeouts).expect("spawn");
+        let (mut s, mut r) = connect(addr);
+        r.get_ref()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        let started = Instant::now();
+        let mut closed = false;
+        // A byte every 100 ms keeps the idle timer fresh but not the head's.
+        for b in b"GET /nothing HTTP/1.1\r\nx: ".iter().cycle().take(40) {
+            if s.write_all(&[*b]).is_err() {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            let mut probe = [0u8; 1];
+            if let Ok(0) = r.get_mut().read(&mut probe) {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the slow head was never cut off");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pipelining_client_does_not_hold_up_others_on_its_worker() {
+        let (app, _scratch) = app(false);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // One worker, so the hog and the other viewer share it.
+        spawn(app, listener, 1, Timeouts::default()).expect("spawn");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hog = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let (mut s, r) = connect(addr);
+                let reader = std::thread::spawn(move || {
+                    let mut r = r;
+                    let mut sink = [0u8; 64 * 1024];
+                    while matches!(r.read(&mut sink), Ok(n) if n > 0) {}
+                });
+                let burst = b"GET /nothing HTTP/1.1\r\n\r\n".repeat(512);
+                while !stop.load(Ordering::Relaxed) {
+                    if s.write_all(&burst).is_err() {
+                        break;
+                    }
+                }
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                let _ = reader.join();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..5 {
+            let (mut s, mut r) = connect(addr);
+            let t = Instant::now();
+            s.write_all(b"GET /nothing HTTP/1.1\r\n\r\n").expect("send");
+            assert_eq!(response(&mut r).0, "HTTP/1.1 404 Not Found");
+            assert!(
+                t.elapsed() < Duration::from_millis(500),
+                "{:?}",
+                t.elapsed()
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = hog.join();
     }
 }

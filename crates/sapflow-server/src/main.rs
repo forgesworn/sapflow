@@ -139,7 +139,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     let http = match app.config.own_http_threads {
         Some(threads) => {
             let l = std::net::TcpListener::bind(app.config.http_addr)?;
-            own_http::spawn(app.clone(), l, threads)?;
+            own_http::spawn(app.clone(), l, threads, own_http::Timeouts::default())?;
             tracing::info!(addr = %app.config.http_addr, threads, "HLS listening (own event loop)");
             None
         }

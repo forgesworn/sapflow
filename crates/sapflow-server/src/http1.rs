@@ -24,10 +24,13 @@ pub enum Method {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub method: Method,
-    /// The request target as sent: path and query, origin form.
+    /// The path and query. An absolute-form target (`http://host/path`)
+    /// arrives here as its path; `OPTIONS *` as `*`.
     pub target: String,
     /// Close the connection after answering.
     pub close: bool,
+    /// An HTTP/1.0 client asked to keep the connection: say yes in the reply.
+    pub keep_alive_10: bool,
 }
 
 /// The result of looking for a request at the start of a buffer.
@@ -55,9 +58,9 @@ pub fn parse(buf: &[u8]) -> Parsed {
     let (Some(method), Some(target), Some(version)) = (req.method, req.path, req.version) else {
         return Parsed::Invalid;
     };
-    if !target.starts_with('/') {
+    let Some(target) = origin_form(target) else {
         return Parsed::Invalid;
-    }
+    };
     // HTTP/1.0 closes unless asked to keep alive; HTTP/1.1 stays open unless
     // asked to close.
     let mut close = version == 0;
@@ -80,6 +83,7 @@ pub fn parse(buf: &[u8]) -> Parsed {
             }
         }
     }
+    let keep_alive_10 = version == 0 && !close;
     let method = match method {
         "GET" => Method::Get,
         "HEAD" => Method::Head,
@@ -89,18 +93,60 @@ pub fn parse(buf: &[u8]) -> Parsed {
     Parsed::Request(
         Request {
             method,
-            target: target.to_owned(),
+            target,
             close,
+            keep_alive_10,
         },
         used,
     )
 }
 
+/// The target in origin form: as sent if it starts with `/`, the path of an
+/// absolute-form `http://` or `https://` target (RFC 9112 3.2.2), `*` as is.
+fn origin_form(target: &str) -> Option<String> {
+    if target.starts_with('/') || target == "*" {
+        return Some(target.to_owned());
+    }
+    let scheme_end = target.find("://")?;
+    let scheme = target.get(..scheme_end)?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let rest = target.get(scheme_end + 3..)?;
+    match rest.find(['/', '?']) {
+        Some(i) if rest.get(i..i + 1) == Some("/") => rest.get(i..).map(str::to_owned),
+        Some(i) => rest.get(i..).map(|q| format!("/{q}")),
+        None => Some("/".to_owned()),
+    }
+}
+
+/// How the connection is left after a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Persist {
+    /// HTTP/1.1 default: say nothing.
+    Default,
+    /// Closing: `connection: close`.
+    Close,
+    /// An HTTP/1.0 client asked to keep alive: `connection: keep-alive`.
+    KeepAlive,
+}
+
 /// A response head. `headers` are extra header lines, each ending `\r\n`.
-pub fn head(status: &str, headers: &str, content_length: usize, close: bool) -> String {
+/// `content_length` is `None` for a 204, which must not carry one.
+pub fn head(
+    status: &str,
+    headers: &str,
+    content_length: Option<usize>,
+    persist: Persist,
+) -> String {
+    let length = content_length.map_or(String::new(), |n| format!("content-length: {n}\r\n"));
+    let connection = match persist {
+        Persist::Default => "",
+        Persist::Close => "connection: close\r\n",
+        Persist::KeepAlive => "connection: keep-alive\r\n",
+    };
     format!(
-        "HTTP/1.1 {status}\r\n{headers}access-control-allow-origin: *\r\ncontent-length: {content_length}\r\n{}\r\n",
-        if close { "connection: close\r\n" } else { "" }
+        "HTTP/1.1 {status}\r\n{headers}access-control-allow-origin: *\r\n{length}{connection}\r\n"
     )
 }
 
@@ -181,7 +227,8 @@ mod tests {
     #[test]
     fn garbage_absolute_targets_and_too_many_headers_are_refused() {
         assert_eq!(parse(b"\x16\x03\x01\x02\x00\r\n\r\n"), Parsed::Invalid);
-        assert_eq!(parse(b"GET http://x/ HTTP/1.1\r\n\r\n"), Parsed::Invalid);
+        assert_eq!(parse(b"GET ftp://x/ HTTP/1.1\r\n\r\n"), Parsed::Invalid);
+        assert_eq!(parse(b"GET x/y HTTP/1.1\r\n\r\n"), Parsed::Invalid);
         let mut many = String::from("GET / HTTP/1.1\r\n");
         for i in 0..=MAX_HEADERS {
             many.push_str(&format!("h{i}: v\r\n"));
@@ -191,17 +238,55 @@ mod tests {
     }
 
     #[test]
+    fn absolute_form_and_asterisk_targets_become_paths() {
+        let t = |raw: &str| request(raw).0.target;
+        assert_eq!(
+            t("GET http://h:8888/live/e/f?q=1 HTTP/1.1\r\n\r\n"),
+            "/live/e/f?q=1"
+        );
+        assert_eq!(t("GET HTTPS://h HTTP/1.1\r\n\r\n"), "/");
+        assert_eq!(t("GET http://h?q HTTP/1.1\r\n\r\n"), "/?q");
+        assert_eq!(t("OPTIONS * HTTP/1.1\r\n\r\n"), "*");
+    }
+
+    #[test]
+    fn http_1_0_keep_alive_is_echoed() {
+        assert!(
+            request("GET / HTTP/1.0\r\nconnection: keep-alive\r\n\r\n")
+                .0
+                .keep_alive_10
+        );
+        assert!(!request("GET / HTTP/1.0\r\n\r\n").0.keep_alive_10);
+        assert!(
+            !request("GET / HTTP/1.1\r\nconnection: keep-alive\r\n\r\n")
+                .0
+                .keep_alive_10
+        );
+    }
+
+    #[test]
     fn other_methods_parse_so_they_can_be_answered_405() {
         assert_eq!(request("POST / HTTP/1.1\r\n\r\n").0.method, Method::Other);
     }
 
     #[test]
     fn response_heads_carry_cors_length_and_close() {
-        let h = head("200 OK", "content-type: video/mp4\r\n", 3, false);
+        let h = head(
+            "200 OK",
+            "content-type: video/mp4\r\n",
+            Some(3),
+            Persist::Default,
+        );
         assert_eq!(
             h,
             "HTTP/1.1 200 OK\r\ncontent-type: video/mp4\r\naccess-control-allow-origin: *\r\ncontent-length: 3\r\n\r\n"
         );
-        assert!(head("400 Bad Request", "", 0, true).contains("connection: close\r\n"));
+        assert!(
+            head("400 Bad Request", "", Some(0), Persist::Close).contains("connection: close\r\n")
+        );
+        assert!(
+            head("200 OK", "", Some(0), Persist::KeepAlive).contains("connection: keep-alive\r\n")
+        );
+        assert!(!head("204 No Content", "", None, Persist::Default).contains("content-length"));
     }
 }
