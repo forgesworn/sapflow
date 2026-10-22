@@ -22,6 +22,17 @@ recovery-safe writer or journal is required before catalogue recovery can be
 qualified. Generated media and child processes were removed; source and scalar
 evidence remain under `target/privacy-standby/interrupted-recording-spike/`.
 
+A second five-case generated experiment uses the installed SDK's existing
+fragmented-MP4 recording muxer. Its unchanged init and complete output fragments
+remain decodable and seekable after both actual kills, retaining exact original
+coded prefixes. Its strict native and independent AAC presentation checks fail:
+leading and final padding are incorrect despite unchanged packets. The
+[recovery plan](recording-recovery.md) therefore requires checked recording
+presentation metadata before recorder migration or production recovery.
+Source and scalar evidence remain under
+`target/privacy-standby/recovery-muxer-spike/`. This does not close B5's
+source-presentation loss, durability or sustained resource gates.
+
 Privacy standby is integrated and remains under qualification. Its
 [contract](privacy-standby.md) requires synchronous raw-input fencing,
 independently paced replacement picture and silence, explicit Resume and
@@ -132,7 +143,7 @@ qualification before selecting our app. Evidence is retained under
 `target/mobile-origin-integration/v4/`; this merge did not rebuild the earlier
 native SDK packages or qualify a phone or deployment.
 
-The complete current iOS composition compiles Debug, Qualification and Release
+The reviewed background-audio iOS composition compiles Debug, Qualification and Release
 unsigned apps and the actual Debug device test bundle with compiler warnings
 as errors and zero warnings. Built required-reason resources and creator
 configuration verify in every app; the test bundle contains the byte-identical

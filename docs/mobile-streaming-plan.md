@@ -477,6 +477,11 @@ Keep degraded-network allowances separate from the no-loss stall requirement.
 Record charging, screen brightness, radios, OS, firmware, ambient temperature,
 bitrate, codec profile and actual media duration for power comparisons.
 
+The [recording recovery plan](recording-recovery.md) records actual process-kill
+failures, the existing SDK muxer's readable fragments and its unresolved AAC
+presentation prerequisite. Neither a nominal fragment interval nor a readable
+coded prefix substitutes for the source-presentation and durability checks above.
+
 Run the origin on Linux behind its intended TLS proxy. Measure 250 and 750
 full media consumers on a separate load machine with enough link capacity.
 750 receivers at the nominal bitrate need about 2 Gbit/s of media alone;
