@@ -13,6 +13,9 @@
 pub mod limits;
 pub mod publish_session;
 pub mod recording;
+pub mod tracks;
+
+pub use tracks::TrackSet;
 
 /// The prefix every stage stream lives under, matching the v4v contract.
 pub const STREAM_PREFIX: &str = "live/";

@@ -12,11 +12,11 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use libfuzzer_sys::fuzz_target;
-use sapflow_hls::rtmp::{Connection, Event};
+use sapflow_rtmp::{Connection, Event};
 use sapflow_hls::{FlvIngest, MuxerConfig};
 
 const RECORDED: &[u8] =
-    include_bytes!("../../crates/sapflow-hls/tests/fixtures/ffmpeg-rtmp-publish.bin");
+    include_bytes!("../../crates/sapflow-rtmp/tests/fixtures/ffmpeg-rtmp-publish.bin");
 
 /// How many bytes of the recording end with its publish request.
 fn publish_prefix() -> &'static [u8] {

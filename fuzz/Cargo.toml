@@ -14,9 +14,11 @@ fuzzing = []
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+httparse = "1.10.1"
 bytes = "1.12.1"
 sapflow-core = { path = "../crates/sapflow-core" }
 sapflow-hls = { path = "../crates/sapflow-hls" }
+sapflow-rtmp = { path = "../crates/sapflow-rtmp" }
 sapflow-srt = { path = "../crates/sapflow-srt" }
 sapflow-client = { path = "../crates/sapflow-client" }
 sapflow-signet-ffi = { path = "../crates/sapflow-signet-ffi" }
@@ -116,6 +118,13 @@ bench = false
 [[bin]]
 name = "signet_auth"
 path = "fuzz_targets/signet_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_request"
+path = "fuzz_targets/http1_request.rs"
 test = false
 doc = false
 bench = false

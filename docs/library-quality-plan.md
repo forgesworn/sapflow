@@ -81,7 +81,7 @@ before making a readiness claim.
 | --- | --- | --- |
 | `sapflow-core` and `sapflow-client` | Media/session types, compressed sample validation, bounded queues, clocks and cancellation policy | Documented invariants, caller ownership and failure semantics; deterministic tests and external consumer examples |
 | `sapflow-srt` | Our encrypted SRT receiver and caller/sender protocol machinery | Sustained sender/receiver interoperability, loss/reordering, pacing, rekeying, shutdown and resource bounds on each advertised profile |
-| `sapflow-hls` | Our RTMP machinery, media packaging and compatible origin output | Independent publishers/decoders/players, format changes, timestamp boundaries and bounded assembly costs |
+| `sapflow-hls` | Media packaging and compatible origin output (RTMP moved to `sapflow-rtmp` on 2026-10-22) | Independent publishers/decoders/players, format changes, timestamp boundaries and bounded assembly costs |
 | `sapflow-ffi` and native packages | Typed Swift/Kotlin access to the reusable media/session library | Real packaged consumers, ownership/cancellation guarantees, API compatibility, symbols, licences and measured binding overhead |
 | Native platform adapters | Hardware capture/codecs, preview, audio routing and application lifecycle | Physical device support matrix and behaviour under orientation, interruption, low storage, heat and network loss |
 | V4V connector and Signet adapter | Scoped creator authentication and destination lifecycle | Real signer consent, durable operations, refresh/End/expiry and current-attempt decoded-media confirmation; no V4V account requirement in generic publishing |

@@ -1,9 +1,9 @@
 //! Hostile receiver bytes before and after a valid publication exchange.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use sapflow_hls::TrackSet;
-use sapflow_hls::rtmp::client::{Publisher, PublisherConfig, PublisherState};
-use sapflow_hls::rtmp::{Connection, Event};
+use sapflow_rtmp::TrackSet;
+use sapflow_rtmp::client::{Publisher, PublisherConfig, PublisherState};
+use sapflow_rtmp::{Connection, Event};
 
 fuzz_target!(|data: &[u8]| {
     let Some((&head, input)) = data.split_first() else {

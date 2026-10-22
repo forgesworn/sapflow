@@ -1,8 +1,8 @@
 # sapflow-hls
 
-Low-Latency HLS packaging in pure Rust, and the ingest that feeds it: RTMP
-publishing (server and client, sans-IO), FLV tags, MPEG-TS and H.264/AAC
-elementary streams in, fragmented MP4 parts, segments and playlists out.
+Low-Latency HLS packaging in pure Rust, and the ingest that feeds it: FLV
+tags, MPEG-TS and H.264/AAC elementary streams in, fragmented MP4 parts,
+segments and playlists out.
 It is the packaging core of the [sapflow](https://github.com/forgesworn/sapflow)
 live media server. MIT.
 
@@ -19,11 +19,11 @@ live media server. MIT.
 - **Ingest.** `TsIngest` takes MPEG-TS (what SRT carries), `FlvIngest`
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
   units and AAC frames directly.
-- **RTMP** (`sapflow_hls::rtmp`). `Connection` is a publish-only RTMP
-  server connection: bytes in, events (`Publish`, `Video`, `Audio`,
-  `Metadata`, `Finished`) and bytes out, with the simple and digest
-  handshakes. `rtmp::client::Publisher` is the other side, for apps that
-  publish. Plain RTMP; bring your own TLS for RTMPS.
+
+For RTMP itself, see [`sapflow-rtmp`](https://crates.io/crates/sapflow-rtmp);
+its events feed `FlvIngest` directly. For SRT, see
+[`sapflow-srt`](https://crates.io/crates/sapflow-srt); it carries MPEG-TS for
+`TsIngest`.
 
 Sans-IO throughout: no sockets, no async runtime, no `unsafe`. You own the
 connections, the clock and the HTTP server.
@@ -54,28 +54,8 @@ if let Some(muxer) = ingest.muxer() {
 }
 ```
 
-An RTMP server connection:
-
-```rust
-use sapflow_hls::rtmp::{Connection, Event};
-
-let mut conn = Connection::new(seed);
-conn.feed(&bytes_from_socket)?;
-while let Some(event) = conn.poll()? {
-    match event {
-        Event::Publish { app, key } => conn.accept_publish(), // or refuse_publish
-        Event::Video { timestamp, data } => { /* FlvIngest::video */ }
-        Event::Audio { timestamp, data } => { /* FlvIngest::audio */ }
-        _ => {}
-    }
-}
-socket.write_all(&conn.take_output())?;
-```
-
-A complete RTMP publisher is
-[`examples/rtmp-publish.rs`](examples/rtmp-publish.rs). The sapflow server
-(`crates/sapflow-server` in the repository) shows the whole path from
-socket to HTTP.
+The sapflow server (`crates/sapflow-server` in the repository) shows the
+whole path from socket to HTTP.
 
 ## Status
 

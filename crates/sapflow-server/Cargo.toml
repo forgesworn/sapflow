@@ -20,10 +20,14 @@ name = "sapflow"
 path = "src/main.rs"
 
 [dependencies]
+# The own viewer event loop (own_http.rs, http1.rs).
+mio = { version = "1.2.4", features = ["net", "os-poll"] }
+httparse = "1.10.1"
 axum = "0.8.9"
 bytes = "1.12.1"
 sapflow-core = { path = "../sapflow-core", version = "0.1.0" }
 sapflow-hls = { path = "../sapflow-hls", version = "0.1.0" }
+sapflow-rtmp = { path = "../sapflow-rtmp", version = "0.1.0" }
 sapflow-srt = { path = "../sapflow-srt", version = "0.1.0" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util"] }
 tracing = "0.1.44"

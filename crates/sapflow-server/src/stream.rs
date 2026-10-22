@@ -297,6 +297,11 @@ impl LiveStream {
         None
     }
 
+    /// A counter that rises on every change a viewer could be waiting for.
+    pub fn version(&self) -> u64 {
+        *self.version.borrow()
+    }
+
     /// Subscribe before checking state, then wait on `changed()`.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.version.subscribe()
@@ -325,6 +330,7 @@ impl LiveStream {
         let ready = Self::render(&mut st);
         drop(st);
         self.version.send_modify(|v| *v += 1);
+        crate::own_http::notify();
         Ok(Applied {
             ready,
             restarted: update.restarted,
@@ -386,6 +392,7 @@ impl LiveStream {
             recorder.feed(tracks, parts);
         }
         self.version.send_modify(|v| *v += 1);
+        crate::own_http::notify();
     }
 
     /// The init segment and every finished part after `after`, for the
@@ -408,6 +415,7 @@ impl LiveStream {
     pub fn close(&self) {
         self.lock().closed = true;
         self.version.send_modify(|v| *v += 1);
+        crate::own_http::notify();
     }
 }
 

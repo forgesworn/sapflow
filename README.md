@@ -64,7 +64,7 @@ want the protocol code as reusable, fuzzed, memory-safe Rust.
 
 An experiment that is close to its first production trial. It passes v4v's
 ingest gate, plays in Safari on iPhone (3.0 to 3.2 s glass to glass over
-HTTP/2), resumes after encoder drops, and has twelve fuzz targets run nightly.
+HTTP/2), resumes after encoder drops, and has thirteen fuzz targets run nightly.
 It has not yet run a production show, and every measurement so far is from
 macOS. The crates are version 0.1.0 and not on crates.io yet. See
 [GOALS.md](GOALS.md), [docs/readiness.md](docs/readiness.md) and
@@ -73,7 +73,8 @@ macOS. The crates are version 0.1.0 and not on crates.io yet. See
 | Crate | What it is |
 |-------|------------|
 | `sapflow-srt` | SRT listener/receiver and caller/sender, sans-IO, AES-128/256-CTR |
-| `sapflow-hls` | RTMP and MPEG-TS ingest, LL-HLS packaging, playlists, Apple's rules |
+| `sapflow-rtmp` | RTMP publishing, server side and client, sans-IO |
+| `sapflow-hls` | FLV and MPEG-TS ingest, LL-HLS packaging, playlists, Apple's rules |
 | `sapflow-core` | Shared types: stream paths, callback events. No async runtime |
 | `sapflow-client` | Runtime-free media validation, bounded queues and session policy for apps |
 | `sapflow-ffi` | Typed Swift/Kotlin boundary for the shared core |
@@ -83,8 +84,7 @@ The libraries are not on crates.io yet; depend on them by git, for example
 `sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }`. Rust 1.94,
 edition 2024. A complete SRT listener is
 [crates/sapflow-srt/examples/listen.rs](crates/sapflow-srt/examples/listen.rs);
-the RTMP code is the `sapflow_hls::rtmp` module, publish only. No C
-dependencies.
+for RTMP, `sapflow_rtmp::Connection` accepts a publish. No C dependencies.
 
 ## Build and run
 

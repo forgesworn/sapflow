@@ -82,7 +82,7 @@ the file at tag v1.21.2.
 | Control API | ✗ The loopback control API exists only to provision scoped SRT publishing sessions. | ✓ `api` (:9997, off by default) (mediamtx.yml). |
 | Metrics | ✗ Logs (`RUST_LOG`) and the `health` callback only. | ✓ Prometheus-compatible `metrics` (:9998) and `pprof`, both off by default (mediamtx.yml). |
 | Reconnect grace | ✓ A dropped publisher's stream, playlist and recording are held for `SAPFLOW_RECONNECT_GRACE` (default 90 s, maximum 3600); a returning publisher on either protocol continues them after a discontinuity (`docs/reference.md`, `docs/interop.md`). | Not verified here. mediamtx has `alwaysAvailable` (plays an offline segment on repeat), `hlsMuxerCloseAfter: 60s` and `overridePublisher`; whether a returning publisher continues the same playlist was not checked. |
-| Configuration | partial. 25 `SAPFLOW_*` environment variables (24 in `--help`, plus `SAPFLOW_SRT_IMPL`, kept for compatibility: `own` is accepted, `srt-rs` is refused), each overridable by a flag. No config file, no reload; change a setting and restart (`crates/sapflow-server/src/config.rs`). | ✓ An 889-line YAML file with per-path overrides and regex paths, hot reload without dropping clients, and API-driven configuration (mediamtx.yml, README). |
+| Configuration | partial. 27 `SAPFLOW_*` environment variables (26 in `--help`, plus `SAPFLOW_SRT_IMPL`, kept for compatibility: `own` is accepted, `srt-rs` is refused), each overridable by a flag. No config file, no reload; change a setting and restart (`crates/sapflow-server/src/config.rs`). | ✓ An 889-line YAML file with per-path overrides and regex paths, hot reload without dropping clients, and API-driven configuration (mediamtx.yml, README). |
 | Platforms | partial. Developed and measured on macOS (Apple silicon); Linux in CI (Ubuntu) and a distroless container image. No Windows build or test is recorded (`docs/readiness.md`, `.github/workflows/ci.yml`, `Dockerfile`). | ✓ Linux, macOS, Windows; release archives for amd64, arm64, armv6 and armv7 on Linux, plus a Docker Hub image (README, release v1.21.2). |
 | Packaging | Build from source with Cargo, or the `Dockerfile`. No release binaries yet. | Official release archives and image. |
 | Size on disk | 3.5 MB binary, 38.5 MB arm64 container image. Recorded against mediamtx 1.19.1, not re-measured on 1.21.2 (`docs/benchmarks.md`). | 50.5 MB binary, 62.2 MB image, for 1.19.1 darwin/arm64 (`docs/benchmarks.md`). The 1.21.2 darwin/arm64 release archive is 27.5 MB compressed, which is not comparable to a binary size. |
@@ -192,17 +192,17 @@ sender you can embed with no C dependency, and you only need live mode with
 AES-128 or AES-256. srt-rs is not recommended for new work given its last
 release and its own README note.
 
-### RTMP: `sapflow_hls::rtmp` against gortmplib, librtmp and nginx-rtmp-module
+### RTMP: `sapflow-rtmp` against gortmplib, librtmp and nginx-rtmp-module
 
-The RTMP code lives in `crates/sapflow-hls/src/rtmp`, inside the `sapflow-hls`
-crate.
+The RTMP code is its own crate, `sapflow-rtmp` (`crates/sapflow-rtmp`), with
+11 transitive dependencies (`hmac`, `sha2` and theirs).
 
 | | sapflow RTMP | gortmplib (used by mediamtx) | librtmp (rtmpdump) | nginx-rtmp-module |
 |---|--------------|------------------------------|--------------------|-------------------|
 | Language | Rust | Go | C (not stated on the pages read) | C |
-| Version and status | 0.0.0, unpublished, part of `sapflow-hls` | v1.0.4, as pinned by mediamtx 1.21.2 | RTMPDump v2.4 dated 2011-07-20 on its man page; the project site points to a 2.6 in git | Latest tag v1.2.2, 2021-05-25; repository last pushed 2024-12-24 |
+| Version and status | 0.1.0, not yet on crates.io | v1.0.4, as pinned by mediamtx 1.21.2 | RTMPDump v2.4 dated 2011-07-20 on its man page; the project site points to a 2.6 in git | Latest tag v1.2.2, 2021-05-25; repository last pushed 2024-12-24 |
 | Licence | MIT | MIT | LGPL for librtmp, GPLv2 for rtmpdump (project site) | BSD-2-Clause |
-| Memory safety | `unsafe` forbidden; no unchecked length arithmetic or allocation from a declared length (`rtmp/mod.rs`) | Go; no `unsafe` import in the library's own code | No language-level guarantee (C) | No language-level guarantee (C) |
+| Memory safety | `unsafe` forbidden; no unchecked length arithmetic or allocation from a declared length (`sapflow-rtmp/src/lib.rs`) | Go; no `unsafe` import in the library's own code | No language-level guarantee (C) | No language-level guarantee (C) |
 | Sans-IO | ✓ `Connection::feed`, `poll`, `take_output` | ✗ Works on `net.Conn` and `io.ReadWriter` | ✗ | ✗ Runs on nginx's event loop |
 | Role | Server session: publish only, `play` refused. Separate publishing client for the mobile SDK (`rtmp/client.rs`). | Client and server; play and publish | Client library with "a few server functions" (man page) | Server: publish, play, relay, VOD |
 | Handshake | Server answers a digest C1 with a digest S1 and signed S2, anything else with the original form. Client: original only, digest refused. | Includes Diffie-Hellman based RTMPE (README) | RTMPE supported | Not stated in the README |
@@ -330,11 +330,9 @@ Origin server:
 
 Libraries:
 
-- Not published. All crates are `publish = false` at 0.0.0; there is no API
-  stability promise, migration policy or external consumer
+- Not yet on crates.io: the libraries are prepared at 0.1.0
+  (`docs/crates-io-plan.md`), with no API stability promise beyond 0.x, migration policy or external consumer
   (`docs/library-quality-plan.md`).
-- RTMP cannot be taken alone: it sits inside `sapflow-hls`, with 46 transitive
-  crates.
 - SRT: live mode only, handshake version 5 only, AES-128 and AES-256 in CTR
   mode only (no GCM, no AES-192), no FEC, bonding, rendezvous or file mode. The
   stream ID and its credentials are always visible; media encryption does not

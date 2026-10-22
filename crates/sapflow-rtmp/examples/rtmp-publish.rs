@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use sapflow_hls::rtmp::client::{Publisher, PublisherConfig, PublisherState};
+use sapflow_rtmp::client::{Publisher, PublisherConfig, PublisherState};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();

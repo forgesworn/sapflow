@@ -4,6 +4,10 @@ mod callback;
 mod config;
 mod fdlimit;
 mod http;
+mod http1;
+#[cfg(test)]
+mod http_backend_tests;
+mod own_http;
 mod publish;
 mod publish_control;
 mod publish_observer;
@@ -133,8 +137,20 @@ async fn run(config: Config) -> std::io::Result<()> {
         config,
     });
 
-    let http = tokio::net::TcpListener::bind(app.config.http_addr).await?;
-    tracing::info!(addr = %app.config.http_addr, "HLS listening");
+    // SAPFLOW_HTTP_IMPL=own serves viewers from our own event loop.
+    let http = match app.config.own_http_threads {
+        Some(threads) => {
+            let l = std::net::TcpListener::bind(app.config.http_addr)?;
+            own_http::spawn(app.clone(), l, threads, own_http::Timeouts::default())?;
+            tracing::info!(addr = %app.config.http_addr, threads, "HLS listening (own event loop)");
+            None
+        }
+        None => {
+            let l = tokio::net::TcpListener::bind(app.config.http_addr).await?;
+            tracing::info!(addr = %app.config.http_addr, "HLS listening");
+            Some(l)
+        }
+    };
     let srt_task = tokio::spawn(srt::listen(app.clone(), app.config.srt_addr));
     let rtmp_task = tokio::spawn({
         let app = app.clone();
@@ -176,9 +192,16 @@ async fn run(config: Config) -> std::io::Result<()> {
             app.config.record_delete_after,
         ));
     }
-    let http_task = http::serve(http, http::router(app.clone()), async {
-        let _ = tokio::signal::ctrl_c().await;
-    });
+    let http_task: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>>>> =
+        match http {
+            Some(http) => Box::pin(http::serve(http, http::router(app.clone()), async {
+                let _ = tokio::signal::ctrl_c().await;
+            })),
+            None => Box::pin(async {
+                let _ = tokio::signal::ctrl_c().await;
+                Ok(())
+            }),
+        };
 
     tokio::select! {
         r = http_task => r,

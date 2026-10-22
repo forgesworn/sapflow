@@ -4,6 +4,7 @@ members = [
     "crates/sapflow-core",
     "crates/sapflow-hls",
     "crates/sapflow-srt",
+    "crates/sapflow-rtmp",
     "crates/sapflow-server",
     "crates/sapflow-bench",
     "crates/sapflow-ffi",

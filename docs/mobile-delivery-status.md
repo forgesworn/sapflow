@@ -5,6 +5,33 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The next upstream integration is pinned to `004be18`. RTMP now lives in
+`sapflow-rtmp`; its publishing client and receiver retain this branch's bounded
+queues, explicit audio-only topology and terminal semantics. `TrackSet` lives
+in runtime-free `sapflow-core`, with the existing HLS exports retained, avoiding
+a production dependency cycle. Both lock files were regenerated with Cargo;
+external package identities are unchanged, and the licence notice regenerates
+without a change.
+
+The optional `SAPFLOW_HTTP_IMPL=own` viewer loop is integrated while Hyper/Tokio
+remains the default. The merged workspace passes 624 tests with four normally
+ignored, strict all-target Clippy, formatting and locked compilation of every
+fuzz target. No long fuzz run is claimed. New real-socket parity coverage checks AAC live playback, terminal-part
+wake-up, retained A/V-to-AAC initialization/part/segment bytes, GET/HEAD metadata,
+closed and replaced presentations, public control/API refusal and malformed or
+future blocking requests. Connection-close handling now honours `close`
+regardless of token/header order. Both backends pass the generated SRT/RTMP
+smoke, independent HLS decoding, callbacks, reconnect with one recording and
+encrypted passphrase acceptance/refusal. Receipts are retained under
+`target/mobile-origin-integration/v3/`; these remain local synthetic gates.
+
+The `0.1.0` Apple, four-ABI Android and ARM64 development media SDKs are rebuilt
+and pass their installed ownership consumers. Their previous same-version
+archives are preserved with the `v2` receipts. The native app results and SDK
+hashes in that earlier record below belong to its exact prior source snapshot,
+and do not qualify the in-progress native camera packet. No phone capture,
+signer, private media or live service was used by this integration.
+
 The source also integrates upstream library publication preparation at
 `efea332`, including workspace version `0.1.0`, public Rust API documentation
 and the server Cargo package name `sapflow`. The server's directory and binary

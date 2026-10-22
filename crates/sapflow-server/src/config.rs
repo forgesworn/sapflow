@@ -41,6 +41,9 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            has no {token})
   SAPFLOW_SEGMENT_COUNT    segments kept in the playlist (default 24, min 7)
   SAPFLOW_HLS_MODE         low-latency (default) or whole; whole omits parts
+  SAPFLOW_HTTP_IMPL        hyper (default) or own: serve viewers from sapflow's
+                           own event loop instead of hyper on tokio
+  SAPFLOW_HTTP_THREADS     own event loop threads (default: one per core, 1..256)
   SAPFLOW_RECORDINGS       record every show to this directory (unset: off)
   SAPFLOW_RECORD_SKIP      paths not to record, comma-separated; a trailing *
                            matches a prefix (live/event-loop-*)
@@ -75,6 +78,8 @@ const KEYS: &[&str] = &[
     "SAPFLOW_CALLBACK_SECRET",
     "SAPFLOW_SEGMENT_COUNT",
     "SAPFLOW_HLS_MODE",
+    "SAPFLOW_HTTP_IMPL",
+    "SAPFLOW_HTTP_THREADS",
     "SAPFLOW_RTMP_ADDR",
     "SAPFLOW_RECORDINGS",
     "SAPFLOW_RECORD_SKIP",
@@ -111,6 +116,9 @@ pub struct Config {
     pub callback_secret: Option<String>,
     pub segment_count: usize,
     pub low_latency: bool,
+    /// Threads for the own event loop (`own_http.rs`); `None` serves viewers
+    /// with hyper on tokio.
+    pub own_http_threads: Option<usize>,
     pub recordings: Option<PathBuf>,
     pub record_policy: RecordPolicy,
     pub record_delete_after: Duration,
@@ -362,7 +370,25 @@ impl Config {
                 config
             });
 
+        let own_http_threads = match vals.get("SAPFLOW_HTTP_IMPL").map(String::as_str) {
+            None | Some("hyper") => None,
+            Some("own") => Some(match vals.get("SAPFLOW_HTTP_THREADS") {
+                None => std::thread::available_parallelism().map_or(4, |n| n.get()),
+                Some(v) => v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=256).contains(n))
+                    .ok_or_else(|| ConfigError::Invalid("SAPFLOW_HTTP_THREADS: 1 to 256".into()))?,
+            }),
+            Some(_) => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_HTTP_IMPL: hyper or own".into(),
+                ));
+            }
+        };
+
         Ok(Self {
+            own_http_threads,
             low_latency: match vals.get("SAPFLOW_HLS_MODE").map(String::as_str) {
                 None | Some("low-latency") => true,
                 Some("whole") => false,
@@ -398,6 +424,58 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_impl_defaults_to_hyper_and_own_takes_a_thread_count() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        assert_eq!(load(&[open], &[]).expect("default").own_http_threads, None);
+        assert_eq!(
+            load(&[open, ("SAPFLOW_HTTP_IMPL", "hyper")], &[])
+                .expect("hyper")
+                .own_http_threads,
+            None
+        );
+        assert!(
+            load(&[open, ("SAPFLOW_HTTP_IMPL", "own")], &[])
+                .expect("own")
+                .own_http_threads
+                .is_some_and(|n| n >= 1)
+        );
+        assert_eq!(
+            load(
+                &[
+                    open,
+                    ("SAPFLOW_HTTP_IMPL", "own"),
+                    ("SAPFLOW_HTTP_THREADS", "3")
+                ],
+                &[]
+            )
+            .expect("own, 3 threads")
+            .own_http_threads,
+            Some(3)
+        );
+        assert!(load(&[open, ("SAPFLOW_HTTP_IMPL", "tokio")], &[]).is_err());
+        // Empty means unset, as for every setting.
+        assert_eq!(
+            load(&[open, ("SAPFLOW_HTTP_IMPL", "")], &[])
+                .expect("empty")
+                .own_http_threads,
+            None
+        );
+        for threads in ["0", "257", "many"] {
+            assert!(
+                load(
+                    &[
+                        open,
+                        ("SAPFLOW_HTTP_IMPL", "own"),
+                        ("SAPFLOW_HTTP_THREADS", threads)
+                    ],
+                    &[]
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn hls_delivery_mode_is_explicit_and_defaults_to_low_latency() {

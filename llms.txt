@@ -1,6 +1,6 @@
 # sapflow
 
-> A small live media server in pure Rust: SRT or RTMP in (H.264 and AAC), Low-Latency HLS out, recording to fragmented MP4 and a stream-health webhook. One 3.3 MB binary, no `unsafe`, no C dependencies. Its SRT, RTMP and LL-HLS code is its own, written as sans-IO Rust libraries. A lightweight alternative to mediamtx for the single job "one encoder in, LL-HLS out". MIT.
+> A small live media server in pure Rust: SRT or RTMP in (H.264 and AAC), Low-Latency HLS out, recording to fragmented MP4 and a stream-health webhook. One 3.3 MB binary, no `unsafe`, no C dependencies. Its SRT, RTMP and LL-HLS code is its own, written as sans-IO Rust libraries (`sapflow-srt`, `sapflow-rtmp`, `sapflow-hls`). A lightweight alternative to mediamtx for the single job "one encoder in, LL-HLS out". MIT.
 
 Status: experimental. Not yet run in a production show; measurements are from macOS. The crates are version 0.1.0 and not on crates.io yet: depend on them by git (`sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }`). Rust 1.94, edition 2024.
 
@@ -18,7 +18,8 @@ Choose mediamtx instead for RTSP, WebRTC, pulling from cameras, codecs beyond H.
 
 - [sapflow-srt](https://github.com/forgesworn/sapflow/blob/main/crates/sapflow-srt/README.md): SRT listener/receiver and caller/sender, live mode, sans-IO, optional AES-128/256-CTR; written from the specification, not from libsrt or srt-rs
 - [sapflow-srt listener example](https://github.com/forgesworn/sapflow/blob/main/crates/sapflow-srt/examples/listen.rs): a complete program that accepts callers and prints each payload
-- `sapflow-hls`: RTMP ingest (`sapflow_hls::rtmp`, publish only, sans-IO), MPEG-TS ingest, LL-HLS packaging and playlists following Apple's rules
+- [sapflow-rtmp](https://github.com/forgesworn/sapflow/blob/main/crates/sapflow-rtmp/README.md): RTMP publishing in pure Rust, sans-IO: the server side of a publish and a publishing client; fuzzed
+- [sapflow-hls](https://github.com/forgesworn/sapflow/blob/main/crates/sapflow-hls/README.md): FLV and MPEG-TS ingest, LL-HLS packaging and playlists following Apple's rules
 - `sapflow-core`, `sapflow-client`, `sapflow-ffi`: shared types, a runtime-free publishing core for apps, and its Swift/Kotlin boundary
 
 ## Running the server

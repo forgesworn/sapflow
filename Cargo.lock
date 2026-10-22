@@ -1503,6 +1503,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -2082,11 +2083,14 @@ dependencies = [
  "fs4",
  "getrandom 0.4.3",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
+ "mio",
  "rustix",
  "sapflow-core",
  "sapflow-hls",
+ "sapflow-rtmp",
  "sapflow-srt",
  "serde",
  "serde_json",
@@ -2132,6 +2136,7 @@ dependencies = [
  "bytes",
  "sapflow-client",
  "sapflow-hls",
+ "sapflow-rtmp",
  "sapflow-srt",
  "uniffi",
 ]
@@ -2143,11 +2148,20 @@ dependencies = [
  "adts-reader",
  "bytes",
  "h264-reader",
- "hmac 0.12.1",
  "mp4-atom",
  "mpeg2ts",
- "sha2",
+ "sapflow-core",
  "tracing",
+]
+
+[[package]]
+name = "sapflow-rtmp"
+version = "0.1.0"
+dependencies = [
+ "hmac 0.12.1",
+ "sapflow-core",
+ "sapflow-hls",
+ "sha2",
 ]
 
 [[package]]

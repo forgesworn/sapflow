@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent ffmpeg listener/decoder qualification for our publishing client.
 
-Run after: cargo build --example rtmp-publish -p sapflow-hls
+Run after: cargo build --example rtmp-publish -p sapflow-rtmp
 No downloaded media or protocol implementation source is used. All owned
 fixtures/processes are removed, including failure paths. TLS is not tested.
 """

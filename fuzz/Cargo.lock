@@ -1536,11 +1536,13 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
+ "httparse",
  "libfuzzer-sys",
  "rustix",
  "sapflow-client",
  "sapflow-core",
  "sapflow-hls",
+ "sapflow-rtmp",
  "sapflow-signet-ffi",
  "sapflow-srt",
  "serde",
@@ -1556,11 +1558,19 @@ dependencies = [
  "adts-reader",
  "bytes",
  "h264-reader",
- "hmac 0.12.1",
  "mp4-atom",
  "mpeg2ts",
- "sha2",
+ "sapflow-core",
  "tracing",
+]
+
+[[package]]
+name = "sapflow-rtmp"
+version = "0.1.0"
+dependencies = [
+ "hmac 0.12.1",
+ "sapflow-core",
+ "sha2",
 ]
 
 [[package]]

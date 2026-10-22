@@ -323,7 +323,7 @@ in every official build.
 - **2026-10-20, RTMP is our own, publish only** (user's decision): rather
   than carry a patched `rml_rtmp` (last release 2023-04, two panics on
   unauthenticated input), sapflow has its own sans-IO implementation in
-  `sapflow_hls::rtmp`: handshake (original and digest forms), chunk stream,
+  `sapflow_hls::rtmp` (since 2026-10-22 its own crate, `sapflow-rtmp`): handshake (original and digest forms), chunk stream,
   AMF0 and the publish commands; playback is refused. It matched `rml_rtmp`
   event for event on a recorded ffmpeg publish before `rml_rtmp` was
   removed, passes the smoke test, and is fuzzed (`rtmp_session`, `amf0`).
