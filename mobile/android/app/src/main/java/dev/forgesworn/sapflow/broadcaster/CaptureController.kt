@@ -144,6 +144,8 @@ class CaptureController(private val context: Context) {
     private var plan: OrientationPlan? = null
     private var captureProfile = CaptureProfile.DEFAULT
     private val prepareAdmission = CapturePrepareAdmission()
+    private val startAdmission = CaptureStartAdmission()
+    private var preparation: CaptureStartAdmission.Preparation? = null // codec owner only
     private var previewWidth = 1
     private var previewHeight = 1
     private var displayDegrees = 0
@@ -199,15 +201,20 @@ class CaptureController(private val context: Context) {
         (if (!recordingFailed && stage in listOf(CaptureStage.PREPARING, CaptureStage.PREPARED, CaptureStage.CAPTURING)) recordingSink?.status ?: recordStatus else recordStatus) + if (previousRecording.isNotEmpty()) " · Previous: ${previousRecording.take(240)}" else "",
         queueDiagnostics, "Publish drainer ${publishing?.diagnostics ?: "none"} · ${publishingSink?.diagnostics ?: ""}",
         orientationStatus, rendererStatus, audioDiagnostics + if (audioFailureDiagnostics.isNotEmpty()) " · $audioFailureDiagnostics" else "", "$cleanupPhase · $cleanupDiagnostics",
-        !prepareAdmission.pending && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioEncoder == null && renderer == null && audioRecord == null)
+        !prepareAdmission.pending && startAdmission.idle && !shutdownRequested && !stoppingEpoch && !teardownStarted && stage in listOf(CaptureStage.IDLE, CaptureStage.ERROR) && videoEncoder == null && audioEncoder == null && renderer == null && audioRecord == null)
 
-    internal fun prepare(previewSurface: Surface, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, profile: CaptureProfile = CaptureProfile.DEFAULT) {
-        prepareAdmission.submit(profile, snapshot().canPrepare, { handler.post(it) }) admitted@{ requestedProfile ->
-            if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) return@admitted
+    internal fun prepare(previewSurface: Surface, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, profile: CaptureProfile = CaptureProfile.DEFAULT): CaptureStartAdmission.Preparation? {
+        val canPrepare = snapshot().canPrepare
+        val ticket = startAdmission.reserve() ?: return null
+        val admitted = try { prepareAdmission.submit(profile, canPrepare, { handler.post(it) }) admitted@{ requestedProfile ->
+            if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) { startAdmission.abandon(ticket); return@admitted }
             if (videoEncoder != null || renderer != null || teardownStarted) {
                 message = lifecycle.message("Previous native cleanup is unfinished; capture cannot restart")
+                startAdmission.abandon(ticket)
                 return@admitted
             }
+            if (!startAdmission.claim(ticket)) { startAdmission.abandon(ticket); return@admitted }
+            preparation = ticket
             cleanupExpired = false; stopFailed = false
             publishingSession?.stopDestination(); publishingSession = null
             captureProfile = requestedProfile // Retained through every orientation restart.
@@ -215,11 +222,15 @@ class CaptureController(private val context: Context) {
             recordFactory = recorder
             autoStart = false
             prepareEpoch(previewSurface)
-        }
+        } } catch (error: Exception) { startAdmission.abandon(ticket); throw error }
+        if (!admitted) { startAdmission.abandon(ticket); return null }
+        return ticket
     }
 
     private fun prepareEpoch(previewSurface: Surface) {
         if (shutdownRequested || cleanupExpired) return
+        val intent = preparation ?: return
+        if (!startAdmission.beginEpoch(intent, generation + 1)) return
         stage = CaptureStage.PREPARING
         message = "Preparing hardware pixel rotation and native audio"
         generation++
@@ -241,7 +252,16 @@ class CaptureController(private val context: Context) {
         startPending = false
         traceLifecycle(CaptureLifecycleDiagnostics.Code.PREPARING)
         try {
-            publishingSink = publishFactory?.invoke()
+            val rawPublisher = publishFactory?.invoke()
+            val publisherGeneration = generation
+            var isolated: IsolatedPublishingSink? = null
+            isolated = rawPublisher?.let { delegate -> IsolatedPublishingSink(delegate) { error -> handler.post {
+                if (publisherGeneration == drainGeneration && publishingSink === isolated) {
+                    publishStatus = "Publisher failed (${error.javaClass.simpleName}) · local recording continues"
+                    abortPublisherEarly()
+                }
+            } } }
+            publishingSink = isolated
             if (publishingSession == null) publishingSession = publishingSink
             val publishingEpoch = generation
             publishingSink?.setKeyframeRequester { handler.post {
@@ -398,9 +418,14 @@ class CaptureController(private val context: Context) {
                                                 return
                                             }
                                             stage = CaptureStage.PREPARED
+                                            val intent = preparation
+                                            if (intent == null || !startAdmission.prepared(intent, token)) {
+                                                stopOnHandler("Capture approval ended before preparation completed", false)
+                                                return
+                                            }
                                             traceLifecycle(CaptureLifecycleDiagnostics.Code.PREPARED)
                                             message = "Ready: upright ${selected.width}×${selected.height} hardware video and AAC"
-                                            if (autoStart) startOnHandler()
+                                            if (autoStart) startAdmission.start(intent)?.let(::startOnHandler)
                                             else restart.pending?.let {
                                                 check(restart.complete(it.token, System.nanoTime()) != null) { "Orientation preparation deadline expired" }
                                                 restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
@@ -426,16 +451,20 @@ class CaptureController(private val context: Context) {
             } })
     }
 
-    fun start() { handler.post { if (stage == CaptureStage.PREPARED) { autoStart = true; startOnHandler() } } }
+    fun start() { startAdmission.preparation?.let(::start) }
+    internal fun start(preparation: CaptureStartAdmission.Preparation) {
+        val ticket = startAdmission.start(preparation) ?: return
+        if (!handler.post { if (startAdmission.permits(ticket) && stage == CaptureStage.PREPARED) { autoStart = true; startOnHandler(ticket) } }) startAdmission.cancelInitial(ticket.preparation)
+    }
 
-    private fun startOnHandler() {
-        if (stage != CaptureStage.PREPARED || startPending) return
+    private fun startOnHandler(ticket: CaptureStartAdmission.Start) {
+        if (stage != CaptureStage.PREPARED || startPending || !startAdmission.permits(ticket)) return
         startPending = true
         val token = generation
         try {
             clock.start()
             renderer!!.startEncoding(encoderSurface!!, token) {
-                if (token != generation || stage != CaptureStage.PREPARED) return@startEncoding
+                if (token != generation || stage != CaptureStage.PREPARED || !startAdmission.permits(ticket)) return@startEncoding
                 try {
                     check(plan?.pose == restart.desiredPose) { "Pose changed before encoder start" }
                     restart.pending?.let { check(restart.complete(it.token, System.nanoTime()) != null) { "Orientation restart deadline expired" } }
@@ -446,8 +475,14 @@ class CaptureController(private val context: Context) {
                     acceptedVideo.set(0); acceptedAudio.set(0); drops.set(0)
                     videoCaptureAgeMs = null
                     videoRejects.set(0); audioPrimingRejects.set(0); waitingKeyframeRejects.set(0); queueRejects.set(0)
+                    recordingSink?.start()
+                    if (!startAdmission.commit(ticket)) {
+                        autoStart = false; restart.cancel()
+                        stopOnHandler("Destination ended before capture admission; closing prepared recording owners", false)
+                        return@startEncoding
+                    }
                     publishingSink?.configure(videoCodec, audioCodec)
-                    publishingSink?.start(); recordingSink?.start()
+                    publishingSink?.start()
                     stage = CaptureStage.CAPTURING
                     traceLifecycle(CaptureLifecycleDiagnostics.Code.STARTED)
                     restart.beginSession()
@@ -699,12 +734,20 @@ class CaptureController(private val context: Context) {
         }
     }
 
-    internal fun cancelPendingPrepare() = prepareAdmission.cancelPending()
+    internal fun cancelPendingPrepare(ticket: CaptureStartAdmission.Preparation?) {
+        if (ticket == null || !startAdmission.cancelInitial(ticket)) return
+        handler.post {
+            if (!startAdmission.owns(ticket)) return@post
+            autoStart = false; restart.cancel(); restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
+            stopOnHandler("Destination ended before capture began", failed = false)
+        }
+    }
 
     fun stop(reason: String = "Stopped") {
-        prepareAdmission.cancelPending()
+        val intent = startAdmission.stop() ?: return
         publishingSession?.stopDestination() // Fence even while codec-handler work is queued.
         handler.post {
+            if (!startAdmission.owns(intent)) return@post
             publishingSession?.stopDestination()
             autoStart = false; restart.cancel(); restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
             stopOnHandler(reason, failed = false)
@@ -713,6 +756,7 @@ class CaptureController(private val context: Context) {
 
     private fun fail(reason: String, code: CaptureLifecycleDiagnostics.Code = CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE) {
         if (stage == CaptureStage.STOPPING || stage == CaptureStage.ERROR || stage == CaptureStage.IDLE) return
+        startAdmission.stop()
         publishingSession?.stopDestination()
         markFailure(code, reason)
         stage = CaptureStage.STOPPING
@@ -754,7 +798,11 @@ class CaptureController(private val context: Context) {
         }
         traceLifecycle(CaptureLifecycleDiagnostics.Code.STOP_REQUEST)
         if (stoppingEpoch) { message = lifecycle.message(reason); return }
+        val captureIntent = preparation ?: startAdmission.preparation
+        captureIntent?.let { startAdmission.beginCleanup(it, restart.pending != null && !failed && !shutdownRequested) }
         if (videoEncoder == null && renderer == null && audioEncoder == null && publishingSink == null && recordingSink == null && audioRecord == null) {
+            captureIntent?.let { startAdmission.cleanup(it, true) }
+            if (startAdmission.idle) preparation = null
             stage = if (stopFailed || cleanupExpired) CaptureStage.ERROR else CaptureStage.IDLE
             message = lifecycle.message(reason)
             finishControllerClose()
@@ -900,6 +948,7 @@ class CaptureController(private val context: Context) {
             handler.post {
                 stopDeadline?.let(handler::removeCallbacks); stopDeadline = null
                 if (!resourcesReleased) {
+                    preparation?.let { startAdmission.cleanup(it, false) }
                     publishingSession?.stopDestination()
                     markFailure(CaptureLifecycleDiagnostics.Code.CLEANUP_FAILURE,
                         "Capture/sink cleanup unfinished; retained resources prevent a new epoch", cleanupTimedOut = true)
@@ -922,12 +971,17 @@ class CaptureController(private val context: Context) {
                 recordStatus = finalRecordStatus
                 publishStatus = "Publisher stopped"
                 val pending = restart.pending
-                if (pending != null && !cleanupExpired && !stopFailed && !shutdownRequested && !restart.expired(System.nanoTime())) {
-                    val surface = preview?.takeIf { it.isValid }
-                    if (surface != null) { prepareEpoch(surface); return@post }
+                val surface = preview?.takeIf { it.isValid }
+                val resume = pending != null && !cleanupExpired && !stopFailed && !shutdownRequested && !restart.expired(System.nanoTime()) && surface != null
+                if (!resume) startAdmission.stop()
+                preparation?.let { startAdmission.cleanup(it, true) }
+                if (resume && preparation?.let(startAdmission::owns) == true) { prepareEpoch(checkNotNull(surface)); return@post }
+                if (pending != null) {
                     autoStart = false; restart.cancel()
-                    stopReason = "Preview unavailable after orientation change; prepare again"
+                    if (!cleanupExpired && !stopFailed && !shutdownRequested && surface == null)
+                        stopReason = "Preview unavailable after orientation change; prepare again"
                 }
+                preparation = null
                 stage = if (stopFailed || cleanupExpired) CaptureStage.ERROR else CaptureStage.IDLE
                 publishingSession?.stopDestination()
                 message = lifecycle.message(stopReason)
@@ -993,7 +1047,7 @@ class CaptureController(private val context: Context) {
     }
 
     fun close() {
-        prepareAdmission.cancelPending()
+        startAdmission.stop()
         publishingSession?.stopDestination()
         handler.post {
             shutdownRequested = true; autoStart = false; restart.cancel()

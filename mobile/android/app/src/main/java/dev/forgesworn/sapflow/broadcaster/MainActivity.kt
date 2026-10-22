@@ -62,6 +62,8 @@ class MainActivity : ComponentActivity() {
     private var useV4v by mutableStateOf(false)
     private var prepareRequest = 0L
     private var preparedV4v: V4vCaptureAdmission.Prepared? = null
+    private var preparedCapture: CaptureStartAdmission.Preparation? = null
+    private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
     private var v4vState by mutableStateOf<V4vView?>(null)
     private var v4vEvents by mutableStateOf<List<Pair<String, String>>>(emptyList())
     private var v4vEvent by mutableStateOf("")
@@ -317,13 +319,14 @@ class MainActivity : ComponentActivity() {
 
 
     private fun startWithAuth() {
-        fun start() { capture.start(); window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        val captureIntent = preparedCapture ?: return
+        fun start() { capture.start(captureIntent); window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
         if (!useV4v) start()
         else {
             val request = prepareRequest
             val binding = preparedV4v ?: return
             v4v?.grant(captureProfile) { permit, error ->
-                if (request != prepareRequest || !useV4v || preparedV4v != binding) return@grant
+                if (request != prepareRequest || !useV4v || preparedV4v != binding || preparedCapture != captureIntent) return@grant
                 if (error == null && permit != null && v4v?.canStart(binding, permit, captureProfile) == true && poseTracking && capture.snapshot().stage == CaptureStage.PREPARED) start()
                 else permissionMessage = error?.message?.take(160) ?: "V4V start permission no longer matches this prepared capture"
             }
@@ -366,7 +369,7 @@ class MainActivity : ComponentActivity() {
         OutlinedButton(enabled = configurable && v4vEvent.isNotBlank() && v4vState?.signedIn == true && v4vState?.pending != true,
             onClick = { val selected = v4vEvent; v4vCommand { prepare(selected) } }) { Text("Prepare V4V session") }
         OutlinedButton(enabled = v4vState?.pending == true, onClick = { v4vCommand { retry() } }) { Text("Retry saved operation") }
-        OutlinedButton(enabled = v4vState?.eventId != null, onClick = { prepareRequest++; capture.cancelPendingPrepare(); owner.stopPublisher(); owner.control.endDestination { error -> ui.post { if (error != null) permissionMessage = "V4V End intent not confirmed"; v4vState = owner.control.view } } }) { Text("End V4V destination") }
+        OutlinedButton(enabled = v4vState?.eventId != null, onClick = { prepareRequest++; capture.cancelPendingPrepare(preparedV4vCapture); owner.stopPublisher(); owner.control.endDestination { error -> ui.post { if (error != null) permissionMessage = "V4V End intent not confirmed"; v4vState = owner.control.view } } }) { Text("End V4V destination") }
         OutlinedButton(enabled = v4vState?.eventId != null, onClick = { v4vCommand { status() } }) { Text("Check origin finalisation") }
         if (v4vState?.recoveryOffered == true) {
             Row { Checkbox(acknowledgeLoss, { acknowledgeLoss = it }); Text("Abandon failed automatic recording", style = MaterialTheme.typography.bodySmall) }
@@ -424,7 +427,8 @@ class MainActivity : ComponentActivity() {
             // Explicit Prepare restores the stable physical pose even if no
             // further sensor callback followed qualification Stop/CLEAR.
             capture.orientationChanged(poseSelector.prepareSession())
-            capture.prepare(surface, publisher, recorder, captureProfile)
+            preparedCapture = capture.prepare(surface, publisher, recorder, captureProfile)
+            if (useV4v) preparedV4vCapture = preparedCapture
         } catch (error: Exception) {
             permissionMessage = error.message?.take(240) ?: "Destination configuration failed"
         }
