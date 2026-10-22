@@ -213,7 +213,9 @@ overrides.
 
 The reference mediamtx config is `docs/examples/mediamtx.yml` in v4v. The
 production config is not in either repository: read it and compare line by
-line against this table before the dry run.
+line against this table before the dry run. The settings below, with
+placeholders, are in [examples/trial-sapflow.env](examples/trial-sapflow.env):
+copy it to the host as `<sapflow-env-file>` and fill it in there.
 
 | mediamtx setting or hook | sapflow | Trial value |
 |--------------------------|---------|-------------|
