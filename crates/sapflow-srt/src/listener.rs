@@ -60,6 +60,11 @@ pub struct Config {
     /// Require KM before emitting Connect; select the session secret in
     /// accept_with_crypto when no global secret is configured.
     pub require_encryption: bool,
+    /// With a secret in `crypto`, also admit callers that send no key
+    /// material, as libsrt does with enforced encryption off. A caller that
+    /// does encrypt must still match the secret. Ignored when
+    /// `require_encryption` is set.
+    pub allow_plaintext: bool,
 }
 
 impl Default for Config {
@@ -73,6 +78,7 @@ impl Default for Config {
             accept_timeout: Duration::from_secs(5),
             crypto: None,
             require_encryption: false,
+            allow_plaintext: false,
         }
     }
 }
@@ -385,6 +391,12 @@ impl<S: BuildHasher> Listener<S> {
         }
     }
 
+    /// Whether a caller without key material may connect.
+    fn plaintext_allowed(&self) -> bool {
+        !self.config.require_encryption
+            && (self.config.crypto.is_none() || self.config.allow_plaintext)
+    }
+
     /// Accepts a caller announced by [`Event::Connect`]: the handshake
     /// response goes out and data is delivered from now on.
     pub fn accept(&mut self, id: ConnId, now: Instant) -> bool {
@@ -392,8 +404,9 @@ impl<S: BuildHasher> Listener<S> {
     }
 
     /// Select an authenticated admission/session secret after inspecting the
-    /// bounded stream ID. A configured secret requires matching KM; a missing
-    /// secret never downgrades an encrypted or encryption-required session.
+    /// bounded stream ID. A configured secret requires matching KM unless
+    /// `allow_plaintext` admits a caller that sent none; a missing secret
+    /// never downgrades an encrypted or encryption-required session.
     /// Failed key validation rejects and removes the pending connection.
     pub fn accept_with_crypto(
         &mut self,
@@ -419,7 +432,7 @@ impl<S: BuildHasher> Listener<S> {
                     return false;
                 }
             },
-            (None, None) if !self.config.require_encryption && self.config.crypto.is_none() => None,
+            (_, None) if self.plaintext_allowed() => None,
             _ => {
                 self.reject(id, RejectCode::UNSECURE);
                 return false;
@@ -446,7 +459,10 @@ impl<S: BuildHasher> Listener<S> {
         let ms = u16::try_from(p.latency / 1000).unwrap_or(u16::MAX);
         let mut response = Handshake {
             version: 5,
-            encryption: crypto.as_ref().map_or(0, |c| c.key_size.field()),
+            encryption: match (&crypto, &decryptor) {
+                (Some(c), Some(_)) => c.key_size.field(),
+                _ => 0,
+            },
             extension: ext_flags::HSREQ
                 | if decryptor.is_some() {
                     ext_flags::KMREQ
@@ -638,13 +654,16 @@ impl<S: BuildHasher> Listener<S> {
     fn induction(&mut self, t: i64, peer: SocketAddr, h: &Handshake) {
         // Observed from libsrt's listener: version 5, the magic number, the
         // caller's own socket id, sequence number, MTU and window echoed.
+        // The key length is advertised only when encryption is required: a
+        // plaintext caller may read it as a demand and give up.
         let reply = Handshake {
             version: 5,
-            encryption: self
-                .config
-                .crypto
-                .as_ref()
-                .map_or(0, |c| c.key_size.field()),
+            encryption: match &self.config.crypto {
+                Some(c) if !self.config.allow_plaintext || self.config.require_encryption => {
+                    c.key_size.field()
+                }
+                _ => 0,
+            },
             extension: SRT_MAGIC,
             initial_seq: h.initial_seq,
             mtu: h.mtu,
@@ -728,8 +747,7 @@ impl<S: BuildHasher> Listener<S> {
             }
         } else if h.encryption != 0
             || h.extension & ext_flags::KMREQ != 0
-            || self.config.require_encryption
-            || self.config.crypto.is_some()
+            || !self.plaintext_allowed()
         {
             return Err(RejectCode::UNSECURE);
         }

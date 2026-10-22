@@ -70,7 +70,8 @@ the v4v player fix for Safari drift is not merged (section 3).
 - **Passphrase.** Start the trial without `SAPFLOW_SRT_PASSPHRASE`: v4v's
   reference mediamtx config sets none (it has SRT off), and Studio's SRT URL
   carries one only if the template does. Enabling it is a separate decision that changes the
-  URL v4v hands out.
+  URL v4v hands out. `SAPFLOW_SRT_ENCRYPTION=optional` sets a passphrase
+  without forcing it on encoders, so the URL can stay as it is.
 
 ## 5. What a switch changes
 

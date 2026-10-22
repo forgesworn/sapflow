@@ -285,8 +285,10 @@ fn complete_admission(
 fn listener_config(config: &crate::config::Config) -> Config {
     Config {
         max_connections: config.max_publishers.saturating_mul(2).max(4),
-        require_encryption: config.control.is_some() || config.srt_crypto.is_some(),
+        require_encryption: config.control.is_some()
+            || (config.srt_crypto.is_some() && !config.srt_allow_plaintext),
         crypto: config.srt_crypto.clone(),
+        allow_plaintext: config.srt_allow_plaintext,
         ..Config::default()
     }
 }
@@ -416,13 +418,21 @@ mod tests {
 
     #[test]
     fn configured_origin_accepts_matching_crypto_and_refuses_downgrade() {
-        for cipher in ["aes128", "aes256"] {
+        // Optional encryption also admits plaintext (profile 1), never a
+        // wrong passphrase or key length.
+        for (cipher, encryption) in [
+            ("aes128", "required"),
+            ("aes256", "required"),
+            ("aes128", "optional"),
+            ("aes256", "optional"),
+        ] {
             for profile in 0..4 {
                 let config = crate::config::Config::load(
                     |key| match key {
                         "SAPFLOW_OPEN_PUBLISH" => Some("1".into()),
                         "SAPFLOW_SRT_PASSPHRASE" => Some("transport test secret".into()),
                         "SAPFLOW_SRT_CIPHER" => Some(cipher.into()),
+                        "SAPFLOW_SRT_ENCRYPTION" => Some(encryption.into()),
                         _ => None,
                     },
                     [],
@@ -501,8 +511,9 @@ mod tests {
                         sent = true;
                     }
                 }
-                assert_eq!(accepted, profile == 0);
-                if profile == 0 {
+                let admitted = profile == 0 || (profile == 1 && encryption == "optional");
+                assert_eq!(accepted, admitted, "{cipher} {encryption} {profile}");
+                if admitted {
                     assert_eq!(received, vec![0x47; 188]);
                 } else {
                     assert!(caller.is_closed());

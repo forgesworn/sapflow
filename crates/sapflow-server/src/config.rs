@@ -25,6 +25,8 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_SRT_PBKEYLEN     AES key length callers must use: 16 (default) or 32
   SAPFLOW_SRT_CIPHER       compatibility alias: aes128 or aes256; when both key
                            settings are present they must agree
+  SAPFLOW_SRT_ENCRYPTION   required (default) or optional: with a passphrase,
+                           optional also admits callers that send none
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
   SAPFLOW_CONTROL_ADDR     enable scoped SRT publishing: private loopback control
@@ -91,6 +93,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_PASSPHRASE",
     "SAPFLOW_SRT_CIPHER",
     "SAPFLOW_SRT_PBKEYLEN",
+    "SAPFLOW_SRT_ENCRYPTION",
     "SAPFLOW_RECONNECT_GRACE",
     "SAPFLOW_HEALTH_INTERVAL",
 ];
@@ -108,6 +111,8 @@ pub struct Config {
     pub srt_addr: SocketAddr,
     /// Independent transport secret. Shared zeroising ownership, redacted Debug.
     pub srt_crypto: Option<CryptoConfig>,
+    /// With `srt_crypto`, also admit SRT callers that do not encrypt.
+    pub srt_allow_plaintext: bool,
     pub rtmp_addr: Option<SocketAddr>,
     pub http_addr: SocketAddr,
     /// `None` only when open publishing was asked for explicitly.
@@ -221,6 +226,7 @@ impl Config {
                 || srt_crypto.is_some()
                 || vals.contains_key("SAPFLOW_SRT_CIPHER")
                 || vals.contains_key("SAPFLOW_SRT_PBKEYLEN")
+                || vals.contains_key("SAPFLOW_SRT_ENCRYPTION")
                 || vals.get("SAPFLOW_RTMP_ADDR").is_some_and(|v| v != "off"))
         {
             return Err(ConfigError::Invalid("scoped control mode requires per-session encrypted SRT; global/open publishing, global SRT keys and RTMP are disabled".into()));
@@ -370,6 +376,21 @@ impl Config {
                 config
             });
 
+        let srt_allow_plaintext = match vals.get("SAPFLOW_SRT_ENCRYPTION").map(String::as_str) {
+            None | Some("required") => false,
+            Some("optional") if srt_crypto.is_some() => true,
+            Some("optional") => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_SRT_ENCRYPTION=optional requires SAPFLOW_SRT_PASSPHRASE".into(),
+                ));
+            }
+            Some(_) => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_SRT_ENCRYPTION: required or optional".into(),
+                ));
+            }
+        };
+
         let own_http_threads = match vals.get("SAPFLOW_HTTP_IMPL").map(String::as_str) {
             None | Some("hyper") => None,
             Some("own") => Some(match vals.get("SAPFLOW_HTTP_THREADS") {
@@ -402,6 +423,7 @@ impl Config {
             reconnect_grace,
             health_interval,
             srt_crypto,
+            srt_allow_plaintext,
             record_min_free,
             max_publish_bps,
             rtmp_addr,
@@ -658,6 +680,30 @@ mod tests {
     }
 
     #[test]
+    fn srt_encryption_can_be_optional_only_with_a_passphrase() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let pass = ("SAPFLOW_SRT_PASSPHRASE", "correct horse");
+        assert!(
+            !load(&[open, pass], &[])
+                .expect("config")
+                .srt_allow_plaintext
+        );
+        let c = load(&[open, pass, ("SAPFLOW_SRT_ENCRYPTION", "optional")], &[]).expect("config");
+        assert!(c.srt_allow_plaintext && c.srt_crypto.is_some());
+        assert!(
+            !load(&[open, pass], &["--srt-encryption=required"])
+                .expect("config")
+                .srt_allow_plaintext
+        );
+        for bad in [
+            vec![open, ("SAPFLOW_SRT_ENCRYPTION", "optional")],
+            vec![open, pass, ("SAPFLOW_SRT_ENCRYPTION", "maybe")],
+        ] {
+            assert!(matches!(load(&bad, &[]), Err(ConfigError::Invalid(_))));
+        }
+    }
+
+    #[test]
     fn srt_key_settings_must_agree_and_never_ignore_invalid_values() {
         let base = [
             ("SAPFLOW_OPEN_PUBLISH", "1"),
@@ -843,6 +889,7 @@ mod tests {
             ("SAPFLOW_PUBLISH_PASS", "password"),
             ("SAPFLOW_SRT_PASSPHRASE", "transport-secret"),
             ("SAPFLOW_SRT_PBKEYLEN", "32"),
+            ("SAPFLOW_SRT_ENCRYPTION", "optional"),
             ("SAPFLOW_RTMP_ADDR", "127.0.0.1:1935"),
         ] {
             let mut values = base.to_vec();
