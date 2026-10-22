@@ -1,0 +1,31 @@
+# sapflow
+
+> A small live media server in pure Rust: SRT or RTMP in (H.264 and AAC), Low-Latency HLS out, recording to fragmented MP4 and a stream-health webhook. One 3.3 MB binary, no `unsafe`, no C dependencies. Its SRT, RTMP and LL-HLS code is its own, written as sans-IO Rust libraries. A lightweight alternative to mediamtx for the single job "one encoder in, LL-HLS out". MIT.
+
+Status: experimental. Not yet run in a production show; measurements are from macOS. The crates are version 0.0.0 and not on crates.io: depend on them by git (`sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }`). Rust 1.94, edition 2024.
+
+Measured against mediamtx 1.21.2 on one machine (medians of three runs, 250 / 750 LL-HLS viewers all fetching video): CPU 18% / 62% of a core against 60% / 155%; peak memory 69 / 216 MB against 161 / 274 MB; no failed requests in 3.55 million. Its SRT receiver asked for no more retransmissions than libsrt 1.5.7 or gosrt under 2 to 10% loss. Conditions and caveats are in docs/benchmarks.md.
+
+Choose mediamtx instead for RTSP, WebRTC, pulling from cameras, codecs beyond H.264/AAC, RTMPS, an HTTP API or metrics, delta playlists or several renditions.
+
+## Start here
+
+- [README](https://github.com/forgesworn/sapflow/blob/main/README.md): what it does, the comparison table, how to run it
+- [Feature comparison](https://github.com/forgesworn/sapflow/blob/main/docs/comparison.md): sapflow against mediamtx; sapflow-srt against libsrt, srt-rs and gosrt; the RTMP code against gortmplib, librtmp and nginx-rtmp-module; sapflow-hls against gohlslib
+- [Benchmarks](https://github.com/forgesworn/sapflow/blob/main/docs/benchmarks.md): method, every run, every caveat
+
+## Libraries
+
+- [sapflow-srt](https://github.com/forgesworn/sapflow/blob/main/crates/sapflow-srt/README.md): SRT listener/receiver and caller/sender, live mode, sans-IO, optional AES-128/256-CTR; written from the specification, not from libsrt or srt-rs
+- [sapflow-srt listener example](https://github.com/forgesworn/sapflow/blob/main/crates/sapflow-srt/examples/listen.rs): a complete program that accepts callers and prints each payload
+- `sapflow-hls`: RTMP ingest (`sapflow_hls::rtmp`, publish only, sans-IO), MPEG-TS ingest, LL-HLS packaging and playlists following Apple's rules
+- `sapflow-core`, `sapflow-client`, `sapflow-ffi`: shared types, a runtime-free publishing core for apps, and its Swift/Kotlin boundary
+
+## Running the server
+
+- Settings are environment variables; `sapflow --help` lists them all
+- Publish to `srt://<host>:8890?streamid=publish:live/<eventId>:<user>:<pass>` or `rtmp://<host>:1935/live` with key `<eventId>?user=<user>&pass=<pass>`; play `http://<host>:8888/live/<eventId>/index.m3u8`
+- HTTP/1.1 without TLS: put Caddy or another HTTP/2 proxy in front (Safari uses the low-latency position only over HTTP/2)
+- [What v4v expects from its media server](https://github.com/forgesworn/sapflow/blob/main/docs/v4v-contract.md)
+- [Encoders tried: OBS, Larix, ffmpeg](https://github.com/forgesworn/sapflow/blob/main/docs/interop.md)
+- [Threat model](https://github.com/forgesworn/sapflow/blob/main/docs/threat-model.md)

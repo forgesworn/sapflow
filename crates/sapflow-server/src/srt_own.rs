@@ -72,9 +72,48 @@ impl Drop for Engine {
     }
 }
 
+/// Receive buffer asked for per allowed publisher. Every SRT publisher shares
+/// one UDP socket, so the OS default (under 1 MB on macOS, 208 KB on Linux)
+/// overflows in bursts with tens of streams and drops datagrams before SRT
+/// sees them.
+const RCVBUF_PER_PUBLISHER: usize = 512 * 1024;
+const RCVBUF_MIN: usize = 4 * 1024 * 1024;
+const RCVBUF_MAX: usize = 64 * 1024 * 1024;
+
+fn wanted_recv_buffer(max_publishers: usize) -> usize {
+    max_publishers
+        .saturating_mul(RCVBUF_PER_PUBLISHER)
+        .clamp(RCVBUF_MIN, RCVBUF_MAX)
+}
+
+/// Binds the SRT socket with a receive buffer of up to `want` bytes. macOS
+/// refuses a size above its limit, so halve until the OS accepts one (Linux
+/// accepts and caps silently). Returns the socket and the size the OS reports.
+fn bind_udp(addr: SocketAddr, want: usize) -> std::io::Result<(UdpSocket, usize)> {
+    let std_socket = std::net::UdpSocket::bind(addr)?;
+    let mut size = want;
+    while size >= 64 * 1024 {
+        if rustix::net::sockopt::set_socket_recv_buffer_size(&std_socket, size).is_ok() {
+            break;
+        }
+        size /= 2;
+    }
+    let got = rustix::net::sockopt::socket_recv_buffer_size(&std_socket)?;
+    std_socket.set_nonblocking(true)?;
+    Ok((UdpSocket::from_std(std_socket)?, got))
+}
+
 pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
-    let socket = UdpSocket::bind(addr).await?;
-    tracing::info!(%addr,implementation="own",scoped=app.publish_sessions.is_some(),encrypted=app.publish_sessions.is_some()||app.config.srt_crypto.is_some(),"SRT listening");
+    let want = wanted_recv_buffer(app.config.max_publishers);
+    let (socket, recv_buffer) = bind_udp(addr, want)?;
+    if recv_buffer < want {
+        tracing::warn!(
+            requested = want,
+            granted = recv_buffer,
+            "SRT receive buffer below the requested size; raise the OS limit (Linux net.core.rmem_max, macOS kern.ipc.maxsockbuf) if many publishers share this server"
+        );
+    }
+    tracing::info!(%addr,implementation="own",recv_buffer,scoped=app.publish_sessions.is_some(),encrypted=app.publish_sessions.is_some()||app.config.srt_crypto.is_some(),"SRT listening");
     let mut engine = Engine {
         listener: Listener::new(listener_config(&app.config), Instant::now()),
         publishers: HashMap::new(),
@@ -473,5 +512,27 @@ mod tests {
                 caller.stop(start + Duration::from_secs(1));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recv_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn wanted_buffer_scales_with_publishers_within_bounds() {
+        assert_eq!(wanted_recv_buffer(1), RCVBUF_MIN);
+        assert_eq!(wanted_recv_buffer(16), 8 * 1024 * 1024);
+        assert_eq!(wanted_recv_buffer(50), 25 * 1024 * 1024);
+        assert_eq!(wanted_recv_buffer(usize::MAX), RCVBUF_MAX);
+    }
+
+    #[tokio::test]
+    async fn bind_raises_the_receive_buffer_above_the_default() -> std::io::Result<()> {
+        let plain = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let default = rustix::net::sockopt::socket_recv_buffer_size(&plain)?;
+        let (_socket, got) = bind_udp(SocketAddr::from(([127, 0, 0, 1], 0)), 4 * 1024 * 1024)?;
+        assert!(got > default, "granted {got}, default {default}");
+        Ok(())
     }
 }
