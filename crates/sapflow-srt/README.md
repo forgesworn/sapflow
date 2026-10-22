@@ -23,12 +23,11 @@ indexing are denied by lint). A `Listener` takes datagrams with their
 source address and the time and gives back datagrams to send, events and
 the next time it needs; the server owns the socket and the timer.
 
-Not on crates.io yet; depend on it by git:
-
-```toml
-[dependencies]
-sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }
+```sh
+cargo add sapflow-srt
 ```
+
+API documentation: [docs.rs/sapflow-srt](https://docs.rs/sapflow-srt).
 
 A complete listener that accepts every caller and prints each payload is
 [`examples/listen.rs`](examples/listen.rs) (`cargo run -p sapflow-srt --example listen`).

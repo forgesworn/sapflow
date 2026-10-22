@@ -66,7 +66,7 @@ An experiment that is close to its first production trial. It passes v4v's
 ingest gate, plays in Safari on iPhone (3.0 to 3.2 s glass to glass over
 HTTP/2), resumes after encoder drops, and has thirteen fuzz targets run nightly.
 It has not yet run a production show, and every measurement so far is from
-macOS. The crates are version 0.1.0 and not on crates.io yet. See
+macOS. The crates are version 0.1.0 on [crates.io](https://crates.io/crates/sapflow). See
 [GOALS.md](GOALS.md), [docs/readiness.md](docs/readiness.md) and
 [docs/trial-plan.md](docs/trial-plan.md).
 
@@ -80,9 +80,9 @@ macOS. The crates are version 0.1.0 and not on crates.io yet. See
 | `sapflow-ffi` | Typed Swift/Kotlin boundary for the shared core |
 | `sapflow` | The server binary (`crates/sapflow-server`): ingest, HTTP, callbacks, recording |
 
-The libraries are not on crates.io yet; depend on them by git, for example
-`sapflow-srt = { git = "https://github.com/forgesworn/sapflow" }`. Rust 1.94,
-edition 2024. A complete SRT listener is
+`cargo add sapflow-srt` (or `sapflow-rtmp`, `sapflow-hls`) for a library,
+`cargo install sapflow` for the server. API docs are on
+[docs.rs](https://docs.rs/sapflow-srt). Rust 1.94, edition 2024. A complete SRT listener is
 [crates/sapflow-srt/examples/listen.rs](crates/sapflow-srt/examples/listen.rs);
 for RTMP, `sapflow_rtmp::Connection` accepts a publish. No C dependencies.
 

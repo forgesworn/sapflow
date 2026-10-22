@@ -136,8 +136,9 @@ the file at tag v1.21.2.
 
 ## Libraries: ours and the ones they replace
 
-Common facts for every sapflow crate: licence MIT, version 0.0.0,
-`publish = false` (not on crates.io), `unsafe` forbidden, Rust edition 2024.
+Common facts for every sapflow crate: licence MIT, version 0.1.0 (on
+crates.io for `sapflow-srt`, `sapflow-rtmp`, `sapflow-hls`, `sapflow-core` and
+`sapflow`), `unsafe` forbidden, Rust edition 2024.
 Dependency counts are unique transitive crates on normal edges from
 `Cargo.lock`, so they are not like for like with Go module counts, which are
 the direct requirements in `go.mod` (and include test-only modules).
