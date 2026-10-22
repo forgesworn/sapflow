@@ -4,7 +4,7 @@ package dev.forgesworn.sapflow.broadcaster
  * performed under this lock. Actual native cleanup releases each preparation. */
 internal class CaptureStartAdmission {
     class Preparation internal constructor(val id: Long, val intent: CaptureIntent, val audioInputId: String? = null,
-        val backgroundAudio: Boolean = false)
+        val backgroundAudio: Boolean = false, val orientation: CaptureOrientationChoice.Selection? = null)
     class Start internal constructor(val id: Long, val preparation: Preparation, val epoch: Long)
     private var serial = 0L
     private var current: Preparation? = null
@@ -24,11 +24,12 @@ internal class CaptureStartAdmission {
     val preparation: Preparation? @Synchronized get() = current
     val elapsedPreparation: Preparation? @Synchronized get() = timingPreparation
     @Synchronized fun reserve(intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
-        backgroundAudio: Boolean = false): Preparation? {
+        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null): Preparation? {
         if (current != null || serial == Long.MAX_VALUE) return null
         if (audioInputId != null && !AudioInputOption.validId(audioInputId)) return null
         if (backgroundAudio && intent.hasVideo) return null
-        return Preparation(++serial, intent, audioInputId, backgroundAudio).also {
+        val frozen = if (intent.hasVideo) orientation ?: CaptureOrientationChoice.AUTO.freeze(true, true, CardinalPose.NATURAL) else null
+        return Preparation(++serial, intent, audioInputId, backgroundAudio, frozen).also {
             timingPreparation = it; elapsed.reset()
             current = it; epoch = -1; live = true; candidate = true; committed = false
             prepared = false; pending = null; preserve = false; cleaned = false; cleaning = false
@@ -39,6 +40,11 @@ internal class CaptureStartAdmission {
         if (current != value || !candidate || !live) return false
         candidate = false; return true
     }
+    /** Rechecked on the actual codec owner, including events queued before
+     * Stop, fixed selection or successor admission. Auto may still coalesce
+     * poses during its preserved orientation cleanup, as before. */
+    @Synchronized fun permitsOrientation(value: Preparation): Boolean = current === value && live &&
+        value.intent.hasVideo && value.orientation?.automatic == true
     /** Only a queued Prepare that never constructed owners may abandon. */
     @Synchronized fun abandon(value: Preparation) {
         if (current != value || !candidate) return

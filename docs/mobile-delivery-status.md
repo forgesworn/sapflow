@@ -5,6 +5,27 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The source now adds [pre-Prepare orientation selection](capture-orientation.md)
+on both apps: Automatic remains the default, with fixed Portrait and landscape
+mounting choices. The exact preparation retains fixed geometry through
+permissions, Start and later sensor/display events. Exact ownership rejects
+delayed Automatic events from a retired preparation. Microphone-only ignores
+the setting. The adapters reuse the existing rear-camera transform and one
+hardware video encoder; fixed mode does not track the horizon.
+
+This packet passes 166 Swift host tests and the 47-test creator-owner regression,
+all-production-source iOS 16 typechecking, all three unsigned iOS app builds
+with compiler warnings as errors, and actual Debug test-bundle compilation.
+The iOS bundle was not executed on a device. Android passes 37 focused host
+tests, 48 selected Gradle tests and 419 tests in 55 suites in each of Debug and
+Qualification, with zero failures, errors or skips. All three APK assemblies,
+Qualification/Release lint and isolation, actual ARM64 native bytes and 16 KiB
+ZIP/ELF checks pass. Lint retains 14/13 warnings and zero errors. Independent
+source review is clear on both exact source snapshots. Local receipts remain
+under `target/orientation-choice/`. Physical decoded pixels, preview fit,
+fixed-mode epoch/recording continuity and Automatic viewer recovery remain open.
+No phone installation, capture, private media or live service was used.
+
 The current source adds
 [saved manual destinations and reviewed JSON file import](manual-destination-profiles.md)
 on both platforms. Android stores up to 16 profiles in a separate Keystore-backed

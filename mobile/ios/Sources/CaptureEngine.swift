@@ -3,6 +3,7 @@ import UIKit
 
 struct CaptureSnapshot {
     var orientation = CaptureOrientation.portrait
+    var orientationChoice = CaptureOrientationChoice.automatic
     var profile = CaptureIntent.defaultProfile
     var phase = "Idle"
     var detail = "Prepare the camera and microphone to begin."
@@ -162,6 +163,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     func selectBackgroundAudio(_ enabled: Bool) -> Bool {
         canChooseCaptureProfile && admission.selectBackgroundAudio(enabled)
     }
+    func selectOrientationChoice(_ choice: CaptureOrientationChoice) -> Bool {
+        canChooseCaptureProfile && admission.selectOrientationChoice(choice)
+    }
     var backgroundContinuation: CaptureAdmission.Preparation? { admission.backgroundContinuation }
     /// Admission and the committed Start share one lock. No timer, UI snapshot
     /// or scene callback can grant continuation to a merely starting owner.
@@ -306,6 +310,11 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             self.ingress.destination?.endDestination()
             self.ingress.destination = destination
             self.preparedIntent = ticket
+            if let orientation = self.admission.orientationAtAttachment(ticket) {
+                self.orientationPlan.prepare(orientation)
+                self.snapshot.orientation = orientation
+            }
+            self.snapshot.orientationChoice = ticket.orientationChoice
             destination?.observeBroadcastEnd { [weak self] instant in self?.admission.broadcastEnded(ticket, nowNs: instant) }
             if self.configuredProfile != ticket.profile { self.configured = false }
             self.snapshot.profile = ticket.profile
@@ -325,10 +334,12 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         owner?.closeCodecEpoch()
     }
     func setOrientation(_ orientation: CaptureOrientation) {
+        guard let observation = admission.observeOrientation(orientation) else { return }
         control.async {
+            guard self.admission.permitsOrientation(observation) else { return }
             guard (self.preparedIntent?.profile ?? self.snapshot.profile).hasVideo else { return }
-            guard self.orientationPlan.desired != orientation else { return }
-            let token = self.orientationPlan.request(orientation, running: self.snapshot.running)
+            guard self.orientationPlan.desired != observation.orientation else { return }
+            let token = self.orientationPlan.request(observation.orientation, running: self.snapshot.running)
             if let token {
                 guard let intent = self.preparedIntent, let child = self.admission.beginRotation(intent) else {
                     self.orientationPlan.cancel(); return
@@ -356,7 +367,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 do {
                     let resumePreview = self.session.isRunning
                     if self.configured { try self.applyOrientation() }
-                    self.snapshot.orientation = orientation
+                    self.snapshot.orientation = observation.orientation
                     if resumePreview { self.setSampleDelivery(true); self.session.startRunning() }
                     if self.snapshot.canStart { self.snapshot.detail = self.orientationDescription }
                     self.publish()

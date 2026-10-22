@@ -424,6 +424,10 @@ saved destinations and reviewed JSON file import. QR and deep-link handling,
 physical document-provider behaviour and the remaining B4R controls retain
 their own implementation and acceptance gates.
 
+The [native orientation contract](capture-orientation.md) separates the default
+Automatic behaviour from a fixed mounting choice frozen before Prepare, and
+defines the physical preview, decoder and recording qualification still needed.
+
 ### B5 First release qualification
 
 Treat the following as initial acceptance targets. B0 may revise a target

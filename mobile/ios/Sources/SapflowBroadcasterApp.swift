@@ -13,6 +13,7 @@ final class BroadcasterModel: ObservableObject {
     @Published private(set) var selectedAudioInputID: String?
     @Published private(set) var captureProfile = CaptureIntent.defaultProfile
     @Published private(set) var continueAudioInBackground = false
+    @Published private(set) var orientationChoice = CaptureOrientationChoice.automatic
     @Published var destinationMode = BroadcasterDestinationMode.recording {
         didSet {
             guard destinationMode != oldValue else { return }
@@ -81,6 +82,11 @@ final class BroadcasterModel: ObservableObject {
     func selectBackgroundAudio(_ enabled: Bool) {
         guard canChangeCaptureProfile, engine.selectBackgroundAudio(enabled) else { return }
         continueAudioInBackground = enabled
+    }
+    func selectOrientationChoice(_ choice: CaptureOrientationChoice) {
+        guard canChangeCaptureProfile, engine.selectOrientationChoice(choice) else { return }
+        orientationChoice = choice
+        if choice == .automatic { updateOrientation() }
     }
     var captureBusy: Bool { snapshot.running || snapshot.phase == "Finalising" || snapshot.phase == "Preparing" }
     var canPrepare: Bool {
@@ -316,6 +322,13 @@ struct BroadcasterView: View {
                 Picker("Capture mode and quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
                     ForEach(model.captureProfiles, id: \.self) { Text($0.label).tag($0) }
                 }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.quality")
+                if model.captureProfile.hasVideo {
+                    Picker("Capture orientation", selection: Binding(get: { model.orientationChoice }, set: { model.selectOrientationChoice($0) })) {
+                        ForEach(CaptureOrientationChoice.allCases) { choice in Text(choice.label).tag(choice) }
+                    }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.orientationChoice")
+                    Text("Choose before Prepare. Top means the earpiece/front-camera edge, viewed from the screen. Fixed capture keeps that canvas when the phone moves; Auto starts a new recording segment and reconnects when its pose changes.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if model.destinationMode == .manual, let error = manual.error {
                     Text(error).font(.caption).foregroundStyle(.red)
                 }
@@ -329,7 +342,7 @@ struct BroadcasterView: View {
                 RecordingLibraryView(owner: recordings, canExport: model.engine.canChooseCaptureProfile) { entry, allowUnverified in
                     recordings.choose(entry: entry, allowUnverified: allowUnverified, canExport: { model.engine.canChooseCaptureProfile })
                 }
-                Text("Camera capture and audio without the locked-screen option require the foreground. Only an opted-in audio show already recording may continue when locked. Turning the phone saves a new camera segment and reconnects its broadcast. Audio interruptions still stop capture; return to Sapflow to Stop and save.")
+                Text("Camera capture and audio without the locked-screen option require the foreground. Only an opted-in audio show already recording may continue when locked. In Automatic orientation, turning the phone saves a new camera segment and reconnects its broadcast. Audio interruptions still stop capture; return to Sapflow to Stop and save.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(.vertical)
         }.scrollDismissesKeyboard(.interactively)

@@ -10,6 +10,10 @@ The selected platform encoder names are visible. Unsupported camera timestamp
 sources, surface combinations or hardware profiles produce explicit errors;
 there is no software-video fallback.
 
+The [orientation contract](capture-orientation.md) defines Automatic and fixed
+mounting choices, including the declared natural-landscape reference, immutable
+Prepare boundary and physical gates.
+
 ## Manual destination profiles
 
 The normal manual controls support explicit save, load and delete for up to 16

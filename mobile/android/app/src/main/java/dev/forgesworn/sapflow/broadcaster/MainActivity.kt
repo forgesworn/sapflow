@@ -72,7 +72,8 @@ class MainActivity : ComponentActivity() {
     private var preparedCapture: CaptureStartAdmission.Preparation? = null
     private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
     private class PreparationIntent(val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
-        val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?, val backgroundAudio: Boolean)
+        val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?, val backgroundAudio: Boolean,
+        val orientation: CaptureOrientationChoice.Selection?)
     private var pendingPreparation: PreparationIntent? = null
     private val permissionReplies = PendingPermissionReply<PreparationIntent>()
     private var permissionReplyOutstanding by mutableStateOf(false)
@@ -108,14 +109,13 @@ class MainActivity : ComponentActivity() {
     private fun displayRotation(): Int = captureDisplay().rotation
 
     private fun displayPose() = CardinalPose.fromDegrees((360 - displayRotation() * 90) % 360)
+    private fun naturalPortrait(): Boolean = captureDisplay().mode.let { it.physicalHeight >= it.physicalWidth }
 
     private fun updatePreview() {
         val degrees = displayRotation() * 90
         // Physical mode dimensions are independent of the Activity's current
         // viewport/configuration transition, unlike a transient window aspect.
-        val mode = captureDisplay().mode
-        val naturalPortrait = mode.physicalHeight >= mode.physicalWidth
-        capture.updatePreview(preview, previewWidth, previewHeight, degrees, naturalPortrait)
+        capture.updatePreview(preview, previewWidth, previewHeight, degrees, naturalPortrait())
     }
     private var snapshot by mutableStateOf<CaptureSnapshot?>(null)
     private var permissionMessage by mutableStateOf<String?>(null)
@@ -144,6 +144,7 @@ class MainActivity : ComponentActivity() {
     }
     private var recordLocally by mutableStateOf(true)
     private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
+    private var orientationChoice by mutableStateOf(CaptureOrientationChoice.AUTO)
     private var microphoneOnly by mutableStateOf(false)
     private var backgroundAudio by mutableStateOf(false)
     private var selectedAudioInputId by mutableStateOf<String?>(null)
@@ -178,7 +179,8 @@ class MainActivity : ComponentActivity() {
     internal fun requestQualificationPose(value: String?): PoseInputPolicy.Result {
         if (!poseTracking) return PoseInputPolicy.Result.INACTIVE
         val previous = poseSelector.pose
-        val capturing = capture.snapshot().stage == CaptureStage.CAPTURING
+        val capturing = capture.snapshot().stage == CaptureStage.CAPTURING &&
+            capture.currentPreparation()?.orientation?.automatic == true
         val result = poseSelector.request(value, capturing, System.nanoTime())
         if (result == PoseInputPolicy.Result.CLEARED && capturing && !poseSelector.captureStopped && poseSelector.pose != previous) {
             capture.orientationChanged(poseSelector.pose)
@@ -225,6 +227,7 @@ class MainActivity : ComponentActivity() {
             // Observe the exact process-owned intent; never reconstruct destination credentials.
             microphoneOnly = !retained.intent.hasVideo
             retained.intent.videoProfile?.let { captureProfile = it }
+            orientationChoice = retained.orientation?.choice ?: CaptureOrientationChoice.AUTO
             backgroundAudio = retained.backgroundAudio
         }
         audioOwner.continuingShow()?.let { retained ->
@@ -330,6 +333,19 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }) { Text(if (captureProfile == quality) "${quality.label} selected" else quality.label) }
                             }
+                        }
+                        if (!microphoneOnly) {
+                            Text("Capture orientation · choose before Prepare", style = MaterialTheme.typography.labelMedium)
+                            CaptureOrientationChoice.entries.forEach { choice ->
+                                OutlinedButton(enabled = qualityConfigurable, onClick = {
+                                    if (!preparationPending && !permissionReplies.outstanding && recordingLibrary.idle && capture.snapshot().canPrepare && orientationChoice != choice) {
+                                        manualEdited(); prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
+                                        orientationChoice = choice
+                                    }
+                                }) { Text(choice.label + if (orientationChoice == choice) " selected" else "") }
+                            }
+                            Text(if (naturalPortrait()) "Top means the phone's top edge, viewed from its screen. Fixed choices keep encoded orientation until Stop."
+                                else "On a natural-landscape display, Portrait is a clockwise quarter-turn from natural. Fixed choices keep that reference until Stop.", style = MaterialTheme.typography.bodySmall)
                         }
                         OutlinedButton(
                             onClick = { prepareWithPermissions() },
@@ -713,6 +729,7 @@ class MainActivity : ComponentActivity() {
 
     private fun currentPreparation(intent: PreparationIntent): Boolean = pendingPreparation === intent && intent.request == prepareRequest &&
         poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && (backgroundAudio && !intent.capture.hasVideo) == intent.backgroundAudio && recordLocally == intent.record && useV4v == intent.v4v &&
+        (!intent.capture.hasVideo || orientationChoice == intent.orientation?.choice) &&
         (intent.v4v || (useSrt == intent.srt && destinationUrl == intent.endpoint && destinationKey == intent.key && srtPassphrase == intent.passphrase &&
             srtPlaintextLab == intent.srtPlaintext && allowPlaintextDevelopment == intent.rtmpPlaintext))
 
@@ -726,7 +743,8 @@ class MainActivity : ComponentActivity() {
     private fun prepareWithPermissions() {
         if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
         manualEdited()
-        val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo)
+        val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo,
+            orientationChoice.freeze(selectedIntent.hasVideo, naturalPortrait(), poseSelector.pose))
         pendingPreparation = intent; preparationPending = true
         val needed = preparationPermissions(intent).toTypedArray()
         if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
@@ -800,8 +818,9 @@ class MainActivity : ComponentActivity() {
             updatePreview()
             // Explicit Prepare restores the stable physical pose even if no
             // further sensor callback followed qualification Stop/CLEAR.
-            if (intent.capture.hasVideo) capture.orientationChanged(poseSelector.prepareSession())
-            preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture, intent.audioInputId, intent.backgroundAudio)
+            val stablePose = if (intent.capture.hasVideo) poseSelector.prepareSession() else CardinalPose.NATURAL
+            preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture, intent.audioInputId, intent.backgroundAudio,
+                intent.orientation?.atPrepare(stablePose))
             if (intent.backgroundAudio) {
                 val prepared = checkNotNull(preparedCapture) { "Capture preparation was not admitted" }
                 require(audioOwner.arm(prepared, intent.v4v, intent.record)) { "Background audio service could not be admitted. Prepare again." }

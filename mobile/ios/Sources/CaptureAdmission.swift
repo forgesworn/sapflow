@@ -9,6 +9,13 @@ final class CaptureAdmission {
         let profile: CaptureIntent
         let audioInputID: String?
         let continuesAudioInBackground: Bool
+        let orientationChoice: CaptureOrientationChoice
+        let initialOrientation: CaptureOrientation?
+    }
+    struct OrientationObservation {
+        fileprivate let serial: UInt64
+        fileprivate let preparation: Preparation?
+        let orientation: CaptureOrientation
     }
     struct Start: Equatable {
         fileprivate let serial: UInt64
@@ -27,6 +34,9 @@ final class CaptureAdmission {
     private var serial: UInt64
     private var selectedAudioInputID: String?
     private var selectedBackgroundAudio = false
+    private var selectedOrientationChoice = CaptureOrientationChoice.automatic
+    private var latestAutoOrientation = CaptureOrientation.portrait
+    private var orientationObservation: UInt64?
     private var foreground = true
     private var phase: Phase = .idle
     private var preparation: Preparation?
@@ -52,6 +62,39 @@ final class CaptureAdmission {
     }
     var currentPhase: Phase { locked { phase } }
     var canChooseCaptureProfile: Bool { locked { phase == .idle } }
+    func selectOrientationChoice(_ choice: CaptureOrientationChoice) -> Bool {
+        locked {
+            guard phase == .idle, foreground else { return false }
+            selectedOrientationChoice = choice; orientationObservation = nil; return true
+        }
+    }
+    /// Sensor/display input is admitted synchronously, before queueing native
+    /// work. Latest-wins serials and exact preparation identity fence late work.
+    func observeOrientation(_ orientation: CaptureOrientation) -> OrientationObservation? {
+        locked {
+            guard foreground, phase != .stopping, phase != .retained,
+                  preparation.map({ $0.profile.hasVideo && $0.orientationChoice == .automatic }) ?? (phase == .idle && selectedOrientationChoice == .automatic),
+                  let serial = next() else { return nil }
+            latestAutoOrientation = orientation; orientationObservation = serial
+            return OrientationObservation(serial: serial, preparation: preparation, orientation: orientation)
+        }
+    }
+    func permitsOrientation(_ value: OrientationObservation) -> Bool {
+        locked {
+            guard foreground, orientationObservation == value.serial, preparation == value.preparation,
+                  phase != .stopping, phase != .retained else { return false }
+            if let preparation { return preparation.profile.hasVideo && preparation.orientationChoice == .automatic }
+            return phase == .idle && selectedOrientationChoice == .automatic
+        }
+    }
+    /// Auto may have a newer physical pose by the time its queued candidate is
+    /// attached. A fixed preparation always uses its immutable initial value.
+    func orientationAtAttachment(_ value: Preparation) -> CaptureOrientation? {
+        locked {
+            guard preparation == value, phase == .attached, value.profile.hasVideo else { return nil }
+            return value.orientationChoice == .automatic ? latestAutoOrientation : value.initialOrientation
+        }
+    }
     func selectBackgroundAudio(_ enabled: Bool) -> Bool {
         locked { guard phase == .idle, foreground else { return false }; selectedBackgroundAudio = enabled; return true }
     }
@@ -95,7 +138,10 @@ final class CaptureAdmission {
         locked {
             guard foreground, phase == .idle, let serial = next() else { return nil }
             let ticket = Preparation(serial: serial, profile: profile, audioInputID: selectedAudioInputID,
-                                     continuesAudioInBackground: selectedBackgroundAudio && !profile.hasVideo)
+                                     continuesAudioInBackground: selectedBackgroundAudio && !profile.hasVideo,
+                                     orientationChoice: profile.hasVideo ? selectedOrientationChoice : .automatic,
+                                     initialOrientation: profile.hasVideo ? (selectedOrientationChoice.fixedOrientation ?? latestAutoOrientation) : nil)
+            orientationObservation = nil
             preparation = ticket; candidatePending = true; hasCommittedRun = false; phase = .reserved
             timingPreparation = ticket
             captureBeganAtNs = nil; captureStoppedAtNs = nil
@@ -147,7 +193,7 @@ final class CaptureAdmission {
     }
     func beginRotation(_ ticket: Preparation) -> Rotation? {
         locked {
-            guard preparation == ticket, ticket.profile.hasVideo else { return nil }
+            guard preparation == ticket, ticket.profile.hasVideo, ticket.orientationChoice == .automatic else { return nil }
             if phase == .rotating { return rotation }
             guard phase == .running, let serial = next() else { return nil }
             let value = Rotation(serial: serial, preparation: ticket)

@@ -32,6 +32,8 @@ xcodebuild -project target/ios-app/SapflowBroadcaster.xcodeproj \
 The initial floor is iOS 16. Portrait and both landscape orientations are
 supported; upside-down portrait capture follows device orientation even where
 the system keeps the application's interface upright.
+The [orientation contract](capture-orientation.md) defines Automatic and the
+fixed mounting choices, their immutable Prepare boundary and physical gates.
 The bundle identifier is a development placeholder and no development team,
 signing identity, provisioning profile or distributable package is assumed.
 Generated projects, build products and DerivedData stay under `target/`.

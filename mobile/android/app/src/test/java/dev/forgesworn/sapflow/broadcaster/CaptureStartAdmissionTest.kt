@@ -191,4 +191,60 @@ class CaptureStartAdmissionTest {
         assertTrue(r.gate.elapsed(r.preparation, 12_000_000, true, 1).uncertain)
         assertEquals(2L, r.gate.elapsed(next, 12_000_000, true, null).broadcastMs)
     }
+    @Test fun fixedPreparationRemainsExactThroughPendingStartAndRotationCleanup() {
+        val gate = CaptureStartAdmission()
+        val selection = checkNotNull(CaptureOrientationChoice.LANDSCAPE_TOP_LEFT.freeze(true, false, CardinalPose.REVERSE))
+        val ticket = checkNotNull(gate.reserve(orientation = selection))
+        assertSame(selection, ticket.orientation)
+        assertNull(gate.reserve(orientation = CaptureOrientationChoice.PORTRAIT.freeze(true, true, CardinalPose.NATURAL)))
+        assertFalse(gate.permitsOrientation(ticket)) // Permission wait cannot admit a physical/qualification override.
+        assertTrue(gate.claim(ticket)); assertTrue(gate.beginEpoch(ticket, 1)); assertTrue(gate.prepared(ticket, 1))
+        val start = checkNotNull(gate.start(ticket))
+        assertFalse(gate.permitsOrientation(ticket)); assertTrue(gate.commit(start, 10))
+        gate.beginCleanup(ticket, true); gate.cleanup(ticket, true)
+        assertTrue(gate.beginEpoch(ticket, 2)); assertTrue(gate.prepared(ticket, 2))
+        assertTrue(gate.commit(checkNotNull(gate.start(ticket)), 20))
+        assertSame(selection, ticket.orientation)
+        assertEquals(CardinalPose.NATURAL, ticket.orientation?.initialPose)
+    }
+
+    @Test fun queuedAutomaticPoseCannotMutateFixedOrAutomaticSuccessor() {
+        for (nextChoice in listOf(CaptureOrientationChoice.PORTRAIT, CaptureOrientationChoice.AUTO)) {
+            val gate = CaptureStartAdmission(); val old = checkNotNull(gate.reserve())
+            assertTrue(gate.claim(old)); assertTrue(gate.beginEpoch(old, 1))
+            val restart = OrientationRestartPlan()
+            val delayed = { if (gate.permitsOrientation(old)) restart.request(CardinalPose.REVERSE, true, 10) else null }
+            assertTrue(gate.stop(old, 1)); gate.beginCleanup(old, false); gate.cleanup(old, true)
+            val frozen = checkNotNull(nextChoice.freeze(true, true, CardinalPose.CLOCKWISE_90))
+            val next = checkNotNull(gate.reserve(orientation = frozen)); assertTrue(gate.claim(next))
+            restart.request(frozen.initialPose, false, 2)
+            assertNull(delayed())
+            assertEquals(frozen.initialPose, restart.desiredPose); assertNull(restart.pending)
+            assertTrue(gate.owns(next)); assertSame(frozen, next.orientation)
+        }
+    }
+
+    @Test fun automaticCoalescesOnlyItsOwnPreservedRotationUntilSynchronousStop() {
+        val gate = CaptureStartAdmission(); val ticket = checkNotNull(gate.reserve())
+        assertTrue(gate.claim(ticket)); assertTrue(gate.beginEpoch(ticket, 1)); assertTrue(gate.prepared(ticket, 1))
+        assertTrue(gate.commit(checkNotNull(gate.start(ticket)), 1))
+        val restart = OrientationRestartPlan(); val first = checkNotNull(restart.request(CardinalPose.CLOCKWISE_90, true, 2))
+        gate.beginCleanup(ticket, true)
+        assertTrue(gate.permitsOrientation(ticket))
+        if (gate.permitsOrientation(ticket)) restart.request(CardinalPose.REVERSE, true, 3)
+        assertEquals(first, restart.pending); assertEquals(CardinalPose.REVERSE, restart.desiredPose)
+        assertTrue(gate.stop(ticket, 4)); assertFalse(gate.permitsOrientation(ticket))
+        val delayed = { if (gate.permitsOrientation(ticket)) restart.request(CardinalPose.CLOCKWISE_270, true, 5) }
+        delayed(); assertEquals(CardinalPose.REVERSE, restart.desiredPose)
+        gate.cleanup(ticket, false); assertNull(gate.reserve())
+        gate.cleanup(ticket, true); assertNotNull(gate.reserve())
+    }
+
+    @Test fun microphonePreparationDiscardsAnyVideoSelectionAndNeverAdmitsPose() {
+        val gate = CaptureStartAdmission()
+        val ticket = checkNotNull(gate.reserve(CaptureIntent.AudioOnly48kMono,
+            orientation = CaptureOrientationChoice.PORTRAIT.freeze(true, true, CardinalPose.NATURAL)))
+        assertNull(ticket.orientation); assertFalse(gate.permitsOrientation(ticket))
+        assertTrue(gate.claim(ticket)); assertTrue(gate.beginEpoch(ticket, 1)); assertFalse(gate.permitsOrientation(ticket))
+    }
 }

@@ -163,6 +163,8 @@ class CaptureController internal constructor(private val context: Context,
     private var previewHeight = 1
     private var displayDegrees = 0
     private var naturalPortrait = true
+    @Volatile private var observedNaturalPortrait = true
+    @Volatile private var observedPose = CardinalPose.NATURAL
     private var autoStart = false
     private var startPending = false
     private var shutdownRequested = false
@@ -241,9 +243,10 @@ class CaptureController internal constructor(private val context: Context,
     internal fun revalidatePublishingAuthority() { publishingSession?.revalidateAuthority() }
 
     internal fun prepare(previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
-        backgroundAudio: Boolean = false): CaptureStartAdmission.Preparation? {
+        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null): CaptureStartAdmission.Preparation? {
         val canPrepare = snapshot().canPrepare
-        val ticket = startAdmission.reserve(intent, audioInputId, backgroundAudio) ?: return null
+        val frozen = orientation ?: CaptureOrientationChoice.AUTO.freeze(intent.hasVideo, observedNaturalPortrait, observedPose)
+        val ticket = startAdmission.reserve(intent, audioInputId, backgroundAudio, frozen) ?: return null
         val admitted = try { prepareAdmission.submit(intent, canPrepare, { handler.post(it) }) admitted@{ requestedIntent ->
             if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) { startAdmission.abandon(ticket); return@admitted }
             if (videoEncoder != null || renderer != null || teardownStarted) {
@@ -253,6 +256,11 @@ class CaptureController internal constructor(private val context: Context,
             }
             if (!startAdmission.claim(ticket)) { startAdmission.abandon(ticket); return@admitted }
             preparation = ticket
+            ticket.orientation?.let {
+                check(restart.pending == null) { "Previous orientation cleanup is unfinished" }
+                naturalPortrait = it.naturalPortrait
+                restart.request(it.initialPose, false, System.nanoTime())
+            }
             audioPin = AudioInputPin(ticket.audioInputId); activeAudioInput = "Not verified"
             cleanupExpired = false; stopFailed = false
             publishingSession?.stopDestination(); publishingSession = null
@@ -326,18 +334,21 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     internal fun updatePreview(surface: Surface?, width: Int, height: Int, rotationDegrees: Int, naturalPortrait: Boolean) {
+        observedNaturalPortrait = naturalPortrait
         handler.post {
             preview = surface?.takeIf { it.isValid }
             previewWidth = maxOf(1, width); previewHeight = maxOf(1, height)
             displayDegrees = rotationDegrees
-            this.naturalPortrait = naturalPortrait
+            this.naturalPortrait = preparation?.orientation?.naturalPortrait ?: naturalPortrait
             renderer?.setPreview(preview, previewWidth, previewHeight, displayDegrees)
         }
     }
 
     internal fun orientationChanged(pose: CardinalPose) {
+        observedPose = pose // Shadow input for a future explicit Auto Prepare.
+        val owner = startAdmission.preparation ?: return
         handler.post {
-            if (shutdownRequested || !captureIntent.hasVideo) return@post
+            if (shutdownRequested || !startAdmission.permitsOrientation(owner)) return@post
             val active = videoEncoder != null || renderer != null
             val ticket = restart.request(pose, active, System.nanoTime())
             if (ticket != null) {
