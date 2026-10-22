@@ -19,6 +19,12 @@ final class CompressedRecorder {
     private var completion: ((Completion) -> Void)?
     private var joinedCompletion: ((Completion) -> Void)?
     private var completed: Completion?
+    private var audioLeading: UInt32?
+    private var audioExtent: AudioRecordingTiming.Extent?
+    private var audioFirstTime: CMTime?
+    private var audioSessionStart: CMTime?
+    private var audioUnits: UInt64 = 0
+    private var audioHeadWritten = false
     struct Completion {
         let fileURL: URL?
         let finalised: Bool
@@ -30,7 +36,11 @@ final class CompressedRecorder {
     /// receipt. The caller closes the receipt if AVAssetWriter creation throws.
     init(receipt: RecordingCatalogue.Writer, queue: DispatchQueue, hasVideo: Bool = true, onFailure: @escaping (Error) -> Void) throws {
         self.receipt = receipt; self.queue = queue; self.hasVideo = hasVideo; self.onFailure = onFailure
-        let created = try AVAssetWriter(outputURL: receipt.fileURL, fileType: .mov)
+        guard hasVideo ? receipt.identity.container != .m4a : receipt.identity.container == .m4a else {
+            throw CaptureFailure(message: "Recording container does not match its immutable tracks")
+        }
+        let created = try AVAssetWriter(outputURL: receipt.fileURL, fileType: hasVideo ? .mov : .m4a)
+        if !hasVideo { created.movieTimeScale = 48_000 }
         created.movieFragmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
         created.shouldOptimizeForNetworkUse = false
         writer = created
@@ -46,6 +56,10 @@ final class CompressedRecorder {
             guard !unit.isVideo || self.hasVideo else {
                 self.budget.release(reservation)
                 self.fail(CaptureFailure(message: "Video does not match this audio-only recording")); return
+            }
+            if !self.hasVideo {
+                do { try self.offerAudio(unit, reservation: reservation) } catch { self.fail(error) }
+                return
             }
             do {
                 if writer.status == .unknown {
@@ -68,6 +82,136 @@ final class CompressedRecorder {
                 }
             } catch { self.fail(error) }
         }
+    }
+
+    /// Cold metadata events are enqueued before first AAC and after codec EOF.
+    /// No publishing buffer or timestamp is modified by recording trims.
+    func audioTiming(_ event: AudioRecordingTiming.Event) {
+        guard !hasVideo else { return }
+        queue.async {
+            guard !self.finishing else { return }
+            switch event {
+            case let .began(leading):
+                do {
+                    _ = try AudioRecordingTiming.headUnits(leading)
+                    guard self.audioLeading == nil else { throw AudioRecordingTiming.Failure.inconsistent }
+                    self.audioLeading = leading
+                } catch { self.fail(error) }
+            case let .ended(extent):
+                guard self.audioExtent == nil else { self.fail(AudioRecordingTiming.Failure.inconsistent); return }
+                self.audioExtent = extent
+            }
+        }
+    }
+
+    private func offerAudio(_ unit: CompressedUnit, reservation: EncodedWorkBudget.Reservation) throws {
+        var retained = false
+        defer { if !retained { budget.release(reservation) } }
+        guard let leading = audioLeading, !unit.isVideo,
+              case let .aac(asc) = unit.configuration, asc == Data([0x11, 0x88]),
+              CMSampleBufferGetNumSamples(unit.buffer) == 1,
+              unit.duration == CMTime(value: 1024, timescale: 48_000), unit.time.isNumeric else {
+            throw CaptureFailure(message: "Audio recording requires exact native AAC timing")
+        }
+        if let first = audioFirstTime {
+            guard audioUnits < UInt64(Int64.max / 1024),
+                  CMTimeCompare(unit.time, CMTimeAdd(first, CMTime(value: Int64(audioUnits * 1024), timescale: 48_000))) == 0 else {
+                throw CaptureFailure(message: "Audio recording cadence changed")
+            }
+        } else { audioFirstTime = unit.time }
+        if audio == nil { audio = try makeInput(type: .audio, unit: unit) }
+        audioUnits += 1
+        staged.append((unit, reservation)); retained = true
+        let count = try AudioRecordingTiming.headUnits(leading)
+        if !audioHeadWritten && staged.count > count { try appendAudioHead(count: count, trailing: 0) }
+        if audioHeadWritten && staged.count > 1 { try appendAudioPending(trailing: 0) }
+    }
+
+    private func audioCopy(_ unit: CompressedUnit, trailing: UInt32) throws -> CMSampleBuffer {
+        if trailing == 0 { return unit.buffer }
+        var copied: CMSampleBuffer?
+        var timing = CMSampleTimingInfo(duration: unit.duration, presentationTimeStamp: unit.time, decodeTimeStamp: unit.time)
+        guard CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault, sampleBuffer: unit.buffer,
+            sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &copied) == noErr, let copied else {
+            throw CaptureFailure(message: "Audio recording tail metadata failed")
+        }
+        CMSetAttachment(copied, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd,
+            value: CMTimeCopyAsDictionary(CMTime(value: Int64(trailing), timescale: 48_000), allocator: kCFAllocatorDefault)!,
+            attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        return copied
+    }
+
+    private func appendAudioHead(count: Int, trailing: UInt32) throws {
+        guard !audioHeadWritten, (1...8).contains(count), staged.count >= count,
+              let leading = audioLeading, let first = audioFirstTime, let writer else { throw AudioRecordingTiming.Failure.inconsistent }
+        guard Int64(count * 1024) > Int64(leading) + Int64(trailing) else { throw AudioRecordingTiming.Failure.inconsistent }
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateEmpty(allocator: kCFAllocatorDefault, capacity: UInt32(count), flags: 0, blockBufferOut: &block) == noErr,
+              let block else { throw CaptureFailure(message: "Audio recording head reference failed") }
+        var sizes: [Int] = [], timings: [CMSampleTimingInfo] = []
+        for pending in staged.prefix(count) {
+            let unit = pending.unit
+            guard let bytes = CMSampleBufferGetDataBuffer(unit.buffer),
+                  CMBlockBufferAppendBufferReference(block, targetBBuf: bytes, offsetToData: 0, dataLength: unit.byteCount, flags: 0) == noErr else {
+                throw CaptureFailure(message: "Audio recording payload reference failed")
+            }
+            sizes.append(unit.byteCount)
+            timings.append(CMSampleTimingInfo(duration: unit.duration, presentationTimeStamp: unit.time, decodeTimeStamp: unit.time))
+        }
+        var combined: CMSampleBuffer?
+        let status = sizes.withUnsafeBufferPointer { size in timings.withUnsafeBufferPointer { timing in
+            CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block,
+                formatDescription: CMSampleBufferGetFormatDescription(staged[0].unit.buffer), sampleCount: count,
+                sampleTimingEntryCount: count, sampleTimingArray: timing.baseAddress!, sampleSizeEntryCount: count,
+                sampleSizeArray: size.baseAddress!, sampleBufferOut: &combined)
+        } }
+        guard status == noErr, let combined else { throw CaptureFailure(message: "Audio recording grouped header failed") }
+        CMSetAttachment(combined, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+            value: CMTimeCopyAsDictionary(CMTime(value: Int64(leading), timescale: 48_000), allocator: kCFAllocatorDefault)!,
+            attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        if trailing > 0 {
+            CMSetAttachment(combined, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd,
+                value: CMTimeCopyAsDictionary(CMTime(value: Int64(trailing), timescale: 48_000), allocator: kCFAllocatorDefault)!,
+                attachmentMode: kCMAttachmentMode_ShouldPropagate)
+        }
+        if writer.status == .unknown {
+            guard writer.startWriting() else { throw writer.error ?? CaptureFailure(message: "Audio recording could not start") }
+            audioSessionStart = CMTimeAdd(first, CMTime(value: Int64(leading), timescale: 48_000))
+            writer.startSession(atSourceTime: audioSessionStart!)
+        }
+        try appendAudioBuffer(combined)
+        for pending in staged.prefix(count) { budget.release(pending.reservation) }
+        staged.removeFirst(count); audioHeadWritten = true
+    }
+
+    private func appendAudioPending(trailing: UInt32) throws {
+        guard let pending = staged.first else { return }
+        try appendAudioBuffer(audioCopy(pending.unit, trailing: trailing))
+        budget.release(pending.reservation); staged.removeFirst()
+    }
+
+    private func appendAudioBuffer(_ sample: CMSampleBuffer) throws {
+        guard let start = audioSessionStart else { throw AudioRecordingTiming.Failure.inconsistent }
+        let end = CMTimeSubtract(CMTimeAdd(CMSampleBufferGetOutputPresentationTimeStamp(sample), CMSampleBufferGetOutputDuration(sample)), start)
+        guard end.isNumeric, end.seconds.isFinite, end.seconds > 0,
+              let writer, writer.status == .writing, let audio, audio.isReadyForMoreMediaData, audio.append(sample) else {
+            throw writer?.error ?? CaptureFailure(message: "Audio recording storage cannot keep up")
+        }
+        hasAcceptedMedia = true
+        if CMTimeCompare(end, endTime) > 0 { endTime = end }
+    }
+
+    private func flushAudioRecording(complete: Bool) throws {
+        guard !staged.isEmpty else { return }
+        guard let leading = audioLeading else { throw AudioRecordingTiming.Failure.inconsistent }
+        var trailing: UInt32 = 0
+        if complete {
+            guard let extent = audioExtent else { throw CaptureFailure(message: "Native AAC finish timing unavailable") }
+            _ = try AudioRecordingTiming.validFrames(extent, observedUnits: audioUnits, leadingFrames: leading)
+            trailing = extent.trailingFrames
+        }
+        if !audioHeadWritten { try appendAudioHead(count: staged.count, trailing: trailing) }
+        else { try appendAudioPending(trailing: trailing) }
     }
 
     private func makeInput(type: AVMediaType, unit: CompressedUnit) throws -> AVAssetWriterInput {
@@ -94,8 +238,12 @@ final class CompressedRecorder {
         guard failure == nil else { return }
         failure = error
         budget.close()
-        for pending in staged { budget.release(pending.reservation) }
-        staged.removeAll()
+        // The audio-only tail is a bounded accepted prefix, retained until its
+        // actual finish attempt. Closing the budget prevents further offers.
+        if hasVideo {
+            for pending in staged { budget.release(pending.reservation) }
+            staged.removeAll()
+        }
         onFailure(error)
     }
     func markIncomplete(_ error: Error) { queue.async { self.fail(error) } }
@@ -121,6 +269,10 @@ final class CompressedRecorder {
             }
             self.finishing = true; self.completion = completion
             if incomplete && self.failure == nil { self.failure = CaptureFailure(message: "Recording ended with missing encoded media") }
+            if !self.hasVideo {
+                do { try self.flushAudioRecording(complete: self.failure == nil) }
+                catch { self.fail(error); try? self.flushAudioRecording(complete: false) }
+            }
             for pending in self.staged { self.budget.release(pending.reservation) }
             self.staged.removeAll()
             guard let writer = self.writer else {

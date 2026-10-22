@@ -47,7 +47,7 @@ final class CaptureRun {
         if let camera = profile.videoProfile {
             video = try HardwareVideoEncoder(orientation: orientation, profile: camera, output: output, failure: failure)
         }
-        audio = try NativeAudioEncoder(output: output, meter: meter)
+        audio = try NativeAudioEncoder(output: output, meter: meter, recordingTiming: profile.hasVideo ? nil : { recorder.audioTiming($0) })
     }
 }
 

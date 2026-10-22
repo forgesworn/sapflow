@@ -118,17 +118,30 @@ production SRT Network.framework cancellation check also passes. No phone,
 USB/hot-unplug, Bluetooth, physical background/lock, process/service kill or
 sustained-performance qualification is claimed.
 
-The latest generated native AAC gate explicitly reads 48 kHz mono signed 16-bit
-packed PCM, emits 143 native AAC units from 144000 input frames, validates all
-143 through the packaged Rust ingress, and independently decodes all three
-recording cases. It still fails the unchanged exact stored-payload sequence
-oracle. Bounded cold-construction diagnostics were added but were not exercised
-by this run, so the reason an earlier byte-identical run returned nil remains
-unknown. Exact presentation and complete-show retention remain open; strict
-decoding alone does not establish them. A fresh read-only Apple/CoreDevice inventory still
-reports the primary iPhone unavailable. UI Automation was already enabled;
-no new physical runner, installation or camera test is claimed. The Pixel's
-current capture remains untouched.
+The 22 October 2026 generated native AAC checkpoint writes new audio-only
+recordings as M4A, while video-bearing and historical container-less recordings
+remain MOV. It uses the converter's observed priming and tail extents without
+changing shared publishing payloads, timestamps or AudioSpecificConfig. All 143
+native AAC access units from the 144000-frame case remain in their original
+stored order and pass the packaged Rust ingress. Native playback returns the
+exact 144000-, 143360-, 143123- and 511-frame input extents; the three
+non-periodic presentation comparisons have zero-lag correlations above 0.99994.
+FFmpeg may retain the declared dynamic trailing padding, so its decoded tail
+length is not treated as a universal exact-presentation assertion. The source
+checkpoint passed 38 catalogue/storage/timing and 35
+library/admission/destination/owner host tests with warnings as errors,
+typechecked 51 production Swift files against iOS 16 APIs, and preserved the
+unchanged A/V MOV path through three strict independent decodes. The frozen
+source and aggregate receipt are under
+`target/ios-audio-recording-retention/v1/source-v1/`; the final generated M4A
+receipt is
+`target/ios-audio-only-fixture/20261022T122618Z-50ecbe54/receipt.local.json`.
+This is generated macOS evidence only. Physical iPhone, background, lock-screen,
+route-change, long-show, crash, power-loss and thermal acceptance remain open.
+A fresh read-only Apple/CoreDevice inventory still reports the primary iPhone
+unavailable. UI Automation was already enabled; no new physical runner,
+installation or camera test is claimed. The Pixel's current capture remains
+untouched.
 
 Scoped origin recording completions now include non-empty immutable
 `recordingTracks` booleans captured from each writer's own initialization.

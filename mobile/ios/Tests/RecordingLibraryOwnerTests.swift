@@ -50,6 +50,17 @@ final class RecordingLibraryOwnerTests: XCTestCase {
         owner.pickerDismissed(selection)
         return selection
     }
+    func testAudioOnlyLibraryExportUsesFrozenM4ASelection() throws {
+        let (owner, store, queue, root) = try fixture()
+        let writer = try store.begin(identity: store.newShow(profile: .audioOnly48kMono).nextIdentity())
+        try Data([1, 2, 3]).write(to: writer.fileURL); try writer.complete(durationMs: 1, outcome: .finalised)
+        let entry = try XCTUnwrap(store.scan().first)
+        let output = root.appendingPathComponent("copies"); try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+        _ = select(owner, entry, folder: output); queue.drain()
+        let copy = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: output, includingPropertiesForKeys: nil).first)
+        XCTAssertEqual(copy.pathExtension, "m4a"); XCTAssertEqual(try Data(contentsOf: copy), Data([1, 2, 3]))
+        XCTAssertTrue(owner.captureAllowed)
+    }
     func testSetupIsColdAndCaptureWaitsForActualInstallerReceipt() throws {
         let root = try folder(), queue = Queue()
         let privateRoot = root.appendingPathComponent("private")

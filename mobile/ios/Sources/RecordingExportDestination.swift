@@ -25,7 +25,7 @@ final class RecordingExportDestination {
     init(folder: URL, filename: String, closeHandle: @escaping (FileHandle) throws -> Void = { try $0.close() },
          writeData: @escaping (FileHandle, Data) throws -> Void = { try $0.write(contentsOf: $1) }) throws {
         guard folder.isFileURL, !filename.isEmpty, filename.utf8.count <= 160,
-              filename != ".", filename != "..", filename.hasSuffix(".mov"),
+              filename != ".", filename != "..", (filename.hasSuffix(".mov") || filename.hasSuffix(".m4a")),
               filename.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || [45, 46, 95].contains($0) }) else {
             throw Failure(reason: .invalidDestination, cleanupUncertain: false)
         }

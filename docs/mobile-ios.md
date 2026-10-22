@@ -496,6 +496,27 @@ under `target/ios-recording-native/v3/` and `target/ios-recording-library/`.
 This does not establish document-provider/modal behaviour, physical iOS
 recording, seeking, thermal performance, crash recovery or power-loss bounds.
 
+The 22 October 2026 audio-only recording checkpoint writes new microphone-only
+recordings as M4A while video-bearing recordings remain MOV. The immutable
+catalogue identity and export destination preserve the selected extension, and
+historical receipts without a container continue to resolve to MOV. The encoder
+reports its actual AAC converter priming and tail extent to the recorder; no
+priming or padding count is hard-coded, and the shared publishing payloads,
+timestamps and AudioSpecificConfig are unchanged. The generated M4A retained all
+143 native AAC access units in their original order and passed the packaged Rust
+ingress. Native playback returned the exact 144000-, 143360-, 143123- and
+511-frame input extents; the three non-periodic comparison cases had zero-lag
+correlations above 0.99994. FFmpeg may retain the file's declared trailing
+padding, so its decoded tail length is not used as a universal exact-presentation
+assertion. The checkpoint passed 38 catalogue/storage/timing and 35
+library/admission/export host tests with warnings as errors, typechecked all 51
+production Swift files against iOS 16 APIs, and retained the unchanged generated
+A/V MOV path through three strict independent decodes. Evidence is under
+`target/ios-audio-recording-retention/v1/` and
+`target/ios-audio-only-fixture/20261022T122618Z-50ecbe54/`. This is generated
+macOS evidence; physical iPhone, background, lock-screen, route-change,
+long-show, crash, power-loss and thermal acceptance remain open.
+
 Verified on 21 October 2026 with Xcode 16.2 and the actual generated Sapflow
 XCFramework: the unsigned arm64 iOS application and XCTest bundle passed
 `xcodebuild ... -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO

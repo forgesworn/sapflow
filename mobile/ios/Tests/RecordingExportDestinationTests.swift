@@ -9,6 +9,12 @@ final class RecordingExportDestinationTests: XCTestCase {
         addTeardownBlock { try FileManager.default.removeItem(at: root) }
         return root
     }
+    func testAudioM4AExportRetainsItsActualExtension() throws {
+        let root = try folder(), file = try RecordingExportDestination(folder: root, filename: "Recording.m4a")
+        try file.write(Data([1, 2, 3])); try file.finish(); try file.close()
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("Recording.m4a")), Data([1, 2, 3]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Recording.mov").path))
+    }
     func testExclusiveCopyPersistsGeneratedBytesAndNeedsActualClose() throws {
         let root = try folder(), file = try RecordingExportDestination(folder: root, filename: "Recording.mov")
         let bytes = Data((0..<64000).map { UInt8($0 % 127) })

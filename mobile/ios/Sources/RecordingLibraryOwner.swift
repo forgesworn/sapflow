@@ -228,7 +228,7 @@ final class RecordingLibraryOwner: ObservableObject {
                     source = try self.requireCatalogue().openExport(entry: selection.entry, allowUnverified: selection.allowUnverified)
                     heldSource = source
                     guard !self.admission.shouldCancel(ticket), !cancellation.requested else { throw RecordingCatalogue.Failure.cancelled }
-                    let filename = "Recording-\(UUID().uuidString).mov"
+                    let filename = "Recording-\(UUID().uuidString).\(selection.entry.fileExtension)"
                     destination = try self.makeDestination(coordinated, filename)
                     heldDestination = destination
                     let bytes = try source!.copy(write: { try destination!.write($0) }, cancelled: { self.admission.shouldCancel(ticket) || cancellation.requested })

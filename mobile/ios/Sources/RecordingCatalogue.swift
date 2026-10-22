@@ -8,21 +8,25 @@ final class RecordingCatalogue {
     enum State: String { case writing, finalised, incomplete, orphanUnverified }
     enum Completion: String, Codable { case finalised, incomplete }
     enum Location: String { case privateRecording, legacyDocuments }
+    enum Container: String, Codable { case mov, m4a }
     struct Identity: Codable, Equatable {
         let segmentID: String
         let showID: String
         let segmentIndex: Int64
         let profileID: String
-        init(segmentID: String, showID: String, segmentIndex: Int64, profileID: String) throws {
+        // Missing in historical V1 receipts: those exact files remain MOV.
+        let container: Container?
+        init(segmentID: String, showID: String, segmentIndex: Int64, profileID: String, container: Container? = nil) throws {
             guard Self.uuid(segmentID), Self.uuid(showID), segmentIndex >= 0,
-                  CaptureIntent(rawValue: profileID) != nil else { throw Failure.unsafe }
+                  let profile = CaptureIntent(rawValue: profileID),
+                  container != .m4a || !profile.hasVideo else { throw Failure.unsafe }
             self.segmentID = segmentID; self.showID = showID
-            self.segmentIndex = segmentIndex; self.profileID = profileID
+            self.segmentIndex = segmentIndex; self.profileID = profileID; self.container = container
         }
         fileprivate static func uuid(_ text: String) -> Bool {
             text.count == 36 && UUID(uuidString: text)?.uuidString.lowercased() == text
         }
-        var filename: String { "Sapflow-\(segmentID).mov" }
+        var filename: String { "Sapflow-\(segmentID).\((container ?? .mov).rawValue)" }
     }
     final class Show {
         let showID = UUID().uuidString.lowercased()
@@ -35,7 +39,7 @@ final class RecordingCatalogue {
             guard index < Int64.max else { throw Failure.capacity }
             defer { index += 1 }
             return try Identity(segmentID: UUID().uuidString.lowercased(), showID: showID,
-                                segmentIndex: index, profileID: profile.rawValue)
+                                segmentIndex: index, profileID: profile.rawValue, container: profile.hasVideo ? nil : .m4a)
         }
     }
     /// Opaque exact selection. Metadata is not a claim that the media decodes.
@@ -51,6 +55,7 @@ final class RecordingCatalogue {
         fileprivate let file: Fingerprint?
         fileprivate let receipt: Data?
         fileprivate let receiptFile: Fingerprint?
+        var fileExtension: String { filename.hasSuffix(".m4a") ? "m4a" : "mov" }
         var id: String { location.rawValue + ":" + filename }
     }
     fileprivate struct Fingerprint: Codable, Equatable {
@@ -243,7 +248,7 @@ final class RecordingCatalogue {
     private func decode(_ bytes: Data, _ id: String) -> Receipt? {
         guard let receipt = try? JSONDecoder().decode(Receipt.self, from: bytes), receipt.version == 1,
               let validated = try? Identity(segmentID: receipt.identity.segmentID, showID: receipt.identity.showID,
-                                            segmentIndex: receipt.identity.segmentIndex, profileID: receipt.identity.profileID),
+                                            segmentIndex: receipt.identity.segmentIndex, profileID: receipt.identity.profileID, container: receipt.identity.container),
               validated.segmentID == id, receipt.createdAtMs > 0,
               ["writing", "finalised", "incomplete"].contains(receipt.state),
               receipt.durationMs.map({ $0 >= 0 }) ?? true,
@@ -287,7 +292,9 @@ final class RecordingCatalogue {
         let token = try reserve(.writer(identity.segmentID))
         do {
             guard try scan().count < Self.maxSegments else { throw Failure.capacity }
-            guard try info(root, identity.filename) == nil, try info(root, receiptName(identity)) == nil else { throw Failure.changed }
+            guard try info(root, "Sapflow-\(identity.segmentID).mov") == nil,
+                  try info(root, "Sapflow-\(identity.segmentID).m4a") == nil,
+                  try info(root, receiptName(identity)) == nil else { throw Failure.changed }
             try writeReceipt(Receipt(version: 1, identity: identity, state: "writing", createdAtMs: createdAtMs, durationMs: nil, file: nil))
             return Writer(catalogue: self, token: token, identity: identity, createdAtMs: createdAtMs)
         } catch { if !cleanupUncertain { try release(token) }; throw error }
@@ -368,7 +375,7 @@ final class RecordingCatalogue {
         try check(directory); return result
     }
     private static func mediaID(_ name: String) -> String? {
-        guard name.hasPrefix("Sapflow-"), name.hasSuffix(".mov") else { return nil }
+        guard name.hasPrefix("Sapflow-"), name.hasSuffix(".mov") || name.hasSuffix(".m4a") else { return nil }
         let text = String(name.dropFirst(8).dropLast(4))
         guard text.count == 36, UUID(uuidString: text)?.uuidString.lowercased() == text.lowercased() else { return nil }
         return text.lowercased()
@@ -379,7 +386,7 @@ final class RecordingCatalogue {
         let decoded = metadata.0.flatMap { decode($0, id) }
         // A known completed-file fingerprint cannot be adopted by a replaced
         // file, including an explicitly incomplete container.
-        let receipt = decoded?.file != nil && decoded?.file != file ? nil : decoded
+        let receipt = decoded?.identity.filename != name || (decoded?.file != nil && decoded?.file != file) ? nil : decoded
         lock.lock()
         let active: Bool
         if case .writer(let segment)? = owner?.kind { active = segment == id } else { active = false }
@@ -405,7 +412,10 @@ final class RecordingCatalogue {
                     guard media.insert(id).inserted else { throw Failure.unsafe }; files[id] = name
                 } else if location == .privateRecording, name.hasPrefix("Sapflow-"), name.hasSuffix(".receipt.json") {
                     let id = String(name.dropFirst(8).dropLast(13))
-                    if Identity.uuid(id), files[id] == nil { files[id] = "Sapflow-\(id).mov" }
+                    if Identity.uuid(id), files[id] == nil {
+                        let metadata = try readReceipt(directory, name).0.flatMap { decode($0, id) }
+                        files[id] = metadata?.identity.filename ?? "Sapflow-\(id).mov"
+                    }
                 }
             }
             for (id, name) in files.sorted(by: { $0.key < $1.key }) {

@@ -12,13 +12,17 @@ final class NativeAudioEncoder {
     private var compressedDescription: CMAudioFormatDescription?
     private let output: (CompressedUnit) -> Void
     private let meter: (Float) -> Void
+    private let recordingTiming: ((AudioRecordingTiming.Event) -> Void)?
+    private var recordingInputFrames: UInt64 = 0
+    private var recordingInputRate: UInt32 = 0
+    private var recordingTimingFinished = false
 
-    init(output: @escaping (CompressedUnit) -> Void, meter: @escaping (Float) -> Void) throws {
+    init(output: @escaping (CompressedUnit) -> Void, meter: @escaping (Float) -> Void, recordingTiming: ((AudioRecordingTiming.Event) -> Void)? = nil) throws {
         guard let format = AVAudioFormat(settings: [AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 96_000]) else {
             throw CaptureFailure(message: "Native AAC-LC format is unavailable")
         }
-        outputFormat = format; self.output = output; self.meter = meter
+        outputFormat = format; self.output = output; self.meter = meter; self.recordingTiming = recordingTiming
     }
 
     /// Cold construction diagnostics only. Scalar format facts contain no PCM,
@@ -51,6 +55,12 @@ final class NativeAudioEncoder {
             converter = created; inputFormat = source
             compressedBuffer = AVAudioCompressedBuffer(format: outputFormat, packetCapacity: 1, maximumPacketSize: max(2048, created.maximumOutputPacketSize))
             firstTime = CMTimeConvertScale(time, timescale: 48_000, method: .roundHalfAwayFromZero)
+            if let recordingTiming {
+                if source.sampleRate > 0, source.sampleRate <= 192_000, source.sampleRate.rounded() == source.sampleRate {
+                    recordingInputRate = UInt32(source.sampleRate)
+                }
+                recordingTiming(.began(leadingFrames: created.primeInfo.leadingFrames))
+            }
         }
         guard let converter, let compressed = compressedBuffer else { throw CaptureFailure(message: "AAC encoder is not ready") }
         // Wrap the platform PCM storage without copying it into Rust or Data.
@@ -78,7 +88,12 @@ final class NativeAudioEncoder {
             let result = withExtendedLifetime(retained) {
                 converter.convert(to: compressed, error: &error) { _, state in
                     if supplied { state.pointee = .noDataNow; return nil }
-                    supplied = true; state.pointee = .haveData; return pcm
+                    supplied = true
+                    if self.recordingTiming != nil {
+                        let next = self.recordingInputFrames.addingReportingOverflow(UInt64(pcm.frameLength))
+                        self.recordingInputFrames = next.overflow ? UInt64.max : next.partialValue
+                    }
+                    state.pointee = .haveData; return pcm
                 }
             }
             if let error { throw error }
@@ -103,11 +118,19 @@ final class NativeAudioEncoder {
             }
             if let error { throw error }
             if compressed.packetCount > 0 { try emit(compressed, converter: converter) }
-            if result == .endOfStream || result == .inputRanDry { return }
+            if result == .endOfStream || result == .inputRanDry { finishRecordingTiming(converter); return }
             if result == .error { throw CaptureFailure(message: "AAC finalisation failed") }
-            if compressed.packetCount == 0 { return }
+            if compressed.packetCount == 0 { finishRecordingTiming(converter); return }
         }
         throw CaptureFailure(message: "AAC finalisation exceeded its bounded packet allowance")
+    }
+
+    private func finishRecordingTiming(_ converter: AVAudioConverter) {
+        guard let recordingTiming, !recordingTimingFinished else { return }
+        recordingTimingFinished = true
+        let prime = converter.primeInfo
+        recordingTiming(.ended(AudioRecordingTiming.Extent(inputFrames: recordingInputFrames, inputRate: recordingInputRate,
+            encodedFrames: UInt64(max(0, emittedFrames)), leadingFrames: prime.leadingFrames, trailingFrames: prime.trailingFrames)))
     }
 
     private func updateMeter(_ pcm: AVAudioPCMBuffer) {

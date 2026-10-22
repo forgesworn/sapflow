@@ -29,6 +29,62 @@ final class RecordingCatalogueTests: XCTestCase {
     private func assertFailure(_ expected: RecordingCatalogue.Failure, _ body: () throws -> Void, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertThrowsError(try body(), file: file, line: line) { XCTAssertEqual($0 as? RecordingCatalogue.Failure, expected, file: file, line: line) }
     }
+    func testNewAudioOnlyM4AIdentityAndExactExportSurviveReopen() throws {
+        let catalogue = try RecordingCatalogue(root: directory())
+        let writer = try catalogue.begin(identity: catalogue.newShow(profile: .audioOnly48kMono).nextIdentity())
+        XCTAssertEqual(writer.identity.container, .m4a); XCTAssertEqual(writer.fileURL.pathExtension, "m4a")
+        let data = Data([1, 2, 3, 4]); try data.write(to: writer.fileURL, options: .withoutOverwriting)
+        try writer.complete(durationMs: 123, outcome: .finalised); try catalogue.close()
+        let reopened = try RecordingCatalogue(root: directory()); defer { try? reopened.close() }
+        let entry = try XCTUnwrap(reopened.scan().first)
+        XCTAssertEqual(entry.state, .finalised); XCTAssertEqual(entry.fileExtension, "m4a")
+        XCTAssertEqual(entry.identity?.container, .m4a)
+        let export = try reopened.openExport(entry: entry); defer { try? export.close() }
+        var result = Data(); XCTAssertEqual(try export.copy { result.append($0) }, 4); XCTAssertEqual(result, data)
+    }
+    func testHistoricalAudioOnlyMOVReceiptNeverChangesContainerOnReload() throws {
+        let catalogue = try RecordingCatalogue(root: directory())
+        let id = try RecordingCatalogue.Identity(segmentID: UUID().uuidString.lowercased(), showID: UUID().uuidString.lowercased(), segmentIndex: 0, profileID: CaptureIntent.audioOnly48kMono.rawValue)
+        let writer = try catalogue.begin(identity: id)
+        XCTAssertNil(id.container); XCTAssertEqual(writer.fileURL.pathExtension, "mov")
+        try Data([4, 5]).write(to: writer.fileURL); try writer.complete(durationMs: 12, outcome: .finalised)
+        try catalogue.close()
+        let reopened = try RecordingCatalogue(root: directory()); defer { try? reopened.close() }
+        let entry = try XCTUnwrap(reopened.scan().first)
+        XCTAssertEqual(entry.state, .finalised); XCTAssertEqual(entry.fileExtension, "mov"); XCTAssertNil(entry.identity?.container)
+    }
+    func testM4AReceiptWithNoFileAndUnverifiedM4AStayHonest() throws {
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let writer = try catalogue.begin(identity: catalogue.newShow(profile: .audioOnly48kMono).nextIdentity())
+        XCTAssertEqual(try catalogue.scan().first?.state, .writing)
+        writer.cancel(); try writer.ownersClosed()
+        XCTAssertEqual(try catalogue.scan().first?.state, .orphanUnverified)
+        XCTAssertEqual(try catalogue.scan().first?.fileExtension, "m4a")
+        try Data([1]).write(to: writer.fileURL)
+        try FileManager.default.removeItem(at: directory().appendingPathComponent("Sapflow-\(writer.identity.segmentID).receipt.json"))
+        let entry = try XCTUnwrap(catalogue.scan().first)
+        XCTAssertNil(entry.identity); XCTAssertEqual(entry.state, .orphanUnverified)
+        assertFailure(.ineligible) { _ = try catalogue.openExport(entry: entry) }
+        let export = try catalogue.openExport(entry: entry, allowUnverified: true); try export.close()
+    }
+    func testVideoCannotClaimM4AAndDuplicateMediaSuffixesAreRefused() throws {
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let show = catalogue.newShow(profile: .hd720p30), id = try show.nextIdentity()
+        assertFailure(.unsafe) { _ = try RecordingCatalogue.Identity(segmentID: id.segmentID, showID: id.showID, segmentIndex: 0, profileID: id.profileID, container: .m4a) }
+        let audio = try catalogue.newShow(profile: .audioOnly48kMono).nextIdentity()
+        try Data([1]).write(to: directory().appendingPathComponent("Sapflow-\(audio.segmentID).mov"))
+        assertFailure(.changed) { _ = try catalogue.begin(identity: audio) }
+        try Data([2]).write(to: directory().appendingPathComponent(audio.filename))
+        assertFailure(.unsafe) { _ = try catalogue.scan() }
+    }
+    func testChangedContainerReceiptCannotAdoptOtherSuffix() throws {
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let writer = try catalogue.begin(identity: catalogue.newShow(profile: .audioOnly48kMono).nextIdentity())
+        try Data([1, 2]).write(to: writer.fileURL); try writer.complete(durationMs: 1, outcome: .finalised)
+        try FileManager.default.moveItem(at: writer.fileURL, to: directory().appendingPathComponent("Sapflow-\(writer.identity.segmentID).mov"))
+        XCTAssertEqual(try catalogue.scan().first?.state, .orphanUnverified)
+        XCTAssertNil(try catalogue.scan().first?.identity)
+    }
     func testShowOrderAndImmutableProfileHaveDistinctSegmentIdentities() throws {
         let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
         let show = catalogue.newShow(profile: .sd480p30), a = try show.nextIdentity(), b = try show.nextIdentity()

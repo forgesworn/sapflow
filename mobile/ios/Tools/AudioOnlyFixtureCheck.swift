@@ -32,6 +32,29 @@ enum AudioOnlyFixtureCheck {
         let audio = try await asset.loadTracks(withMediaType: .audio)
         try requireAudioFixture(video.isEmpty && audio.count == 1 && duration.seconds > 0 && duration.seconds <= 3.01, "Expected at most three seconds of generated audio only")
         var summary = try run(root: root, asset: asset, track: audio[0])
+        summary = try await checkNativeViews(summary, root: root)
+        let markerInput = root.appendingPathComponent("generated-marker.wav")
+        let markerInfo = try markerInput.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        try requireAudioFixture(markerInfo.isRegularFile == true && markerInfo.isSymbolicLink != true && (markerInfo.fileSize ?? Int.max) < 512 * 1024, "Generated marker bound")
+        let markerAsset = AVURLAsset(url: markerInput)
+        let markerTracks = try await markerAsset.loadTracks(withMediaType: .audio)
+        let markerVideos = try await markerAsset.loadTracks(withMediaType: .video)
+        try requireAudioFixture(markerTracks.count == 1 && markerVideos.isEmpty, "Generated marker topology")
+        var regressions: [[String: Any]] = []
+        for (name, frames) in [("aligned", 143360), ("partial", 143123), ("tiny", 511)] {
+            let directory = root.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            var result = try run(root: directory, asset: markerAsset, track: markerTracks[0], inputLimit: frames, cases: ["finalised"])
+            result = try await checkNativeViews(result, root: directory)
+            result["relativeRoot"] = name
+            regressions.append(result)
+        }
+        summary["presentationRegressions"] = regressions
+        FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: summary, options: [.sortedKeys, .prettyPrinted]))
+        FileHandle.standardOutput.write(Data([10]))
+    }
+    static func checkNativeViews(_ summary: [String: Any], root: URL) async throws -> [String: Any] {
+        var summary = summary
         guard let rows = summary["cases"] as? [[String: Any]] else { throw CaptureFailure(message: "Generated cases unavailable") }
         var checked: [[String: Any]] = []
         for var row in rows {
@@ -41,12 +64,39 @@ enum AudioOnlyFixtureCheck {
                 let videos = try await recorded.loadTracks(withMediaType: .video)
                 try requireAudioFixture(audios.count == 1 && videos.isEmpty, "Native reader found unexpected recording topology")
                 row["nativeReader"] = try readEncodedPackets(asset: recorded, track: audios[0])
+                let pcmName = name + ".native.pcm"
+                row["nativePCMFrames"] = try readPCM(asset: recorded, track: audios[0], destination: root.appendingPathComponent(pcmName))
+                row["nativePCMFile"] = pcmName
             }
             checked.append(row)
         }
         summary["cases"] = checked
-        FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: summary, options: [.sortedKeys, .prettyPrinted]))
-        FileHandle.standardOutput.write(Data([10]))
+        return summary
+    }
+    static func readPCM(asset: AVAsset, track: AVAssetTrack, destination: URL) throws -> Int {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 48000, AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false])
+        reader.add(output); try requireAudioFixture(reader.startReading(), "Native PCM reader start")
+        defer { if reader.status == .reading { reader.cancelReading() } }
+        var bytes = Data(), frames = 0, empty = 0
+        let began = ProcessInfo.processInfo.systemUptime
+        while let sample = output.copyNextSampleBuffer() {
+            try requireAudioFixture(ProcessInfo.processInfo.systemUptime - began < 5, "Native PCM reader deadline")
+            let count = CMSampleBufferGetNumSamples(sample)
+            if count == 0 { empty += 1; try requireAudioFixture(empty <= 16, "Native PCM marker bound"); continue }
+            try requireAudioFixture(count > 0 && count <= 144000 && frames <= 144000 - count, "Native PCM frame bound")
+            guard let block = CMSampleBufferGetDataBuffer(sample), CMBlockBufferGetDataLength(block) == count * 2 else { throw CaptureFailure(message: "Native PCM storage shape") }
+            var chunk = Data(count: count * 2)
+            let length = chunk.count
+            let status = chunk.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }
+            try requireAudioFixture(status == noErr, "Native PCM copy")
+            bytes.append(chunk); frames += count
+        }
+        try requireAudioFixture(reader.status == .completed && frames > 0, "Native PCM decode incomplete")
+        try bytes.write(to: destination, options: .withoutOverwriting)
+        return frames
     }
     static func readEncodedPackets(asset: AVAsset, track: AVAssetTrack) throws -> [String: Any] {
         let reader = try AVAssetReader(asset: asset)
@@ -85,7 +135,7 @@ enum AudioOnlyFixtureCheck {
         let bytes = Data(bytesNoCopy: pointer, count: total, deallocator: .none)
         return ["size": total, "sha256": SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()]
     }
-    static func run(root: URL, asset: AVAsset, track: AVAssetTrack) throws -> [String: Any] {
+    static func run(root: URL, asset: AVAsset, track: AVAssetTrack, inputLimit: Int = 144000, cases: [String] = ["finalised", "prior_loss", "recording_only_stop", "empty"]) throws -> [String: Any] {
         let reader = try AVAssetReader(asset: asset)
         // Request a deterministic native PCM representation, rather than
         // inheriting a file container's implicit decoding/output defaults.
@@ -104,6 +154,7 @@ enum AudioOnlyFixtureCheck {
         var compressedBytes = 0
         var encodeFailure: Error?
         var meters = 0
+        var recordingTiming: [AudioRecordingTiming.Event] = []
         let encoder = try NativeAudioEncoder(output: { unit in
             do {
                 try requireAudioFixture(!unit.isVideo && !unit.keyframe, "Unexpected video/IDR in audio-only output")
@@ -115,7 +166,7 @@ enum AudioOnlyFixtureCheck {
                 units.append(unit); compressedBytes += unit.byteCount
                 try requireAudioFixture(units.count <= 160 && compressedBytes <= 128 * 1024, "Encoded fixture bound")
             } catch { if encodeFailure == nil { encodeFailure = error } }
-        }, meter: { _ in meters += 1 })
+        }, meter: { _ in meters += 1 }, recordingTiming: { recordingTiming.append($0) })
         var inputFrames = 0
         var callbacks = 0
         var emptyMarkers = 0
@@ -139,10 +190,11 @@ enum AudioOnlyFixtureCheck {
                 pcmFormat.mFormatFlags == (kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked), "Expected explicit generated signed-16 packed/interleaved 48 kHz mono PCM")
             // Match bounded microphone-sized input rather than passing an
             // entire file batch into the native converter in one callback.
-            for offset in stride(from: 0, to: count, by: 1024) {
+            let allowed = min(count, inputLimit - inputFrames)
+            for offset in stride(from: 0, to: allowed, by: 1024) {
                 var sample: CMSampleBuffer?
                 let status = CMSampleBufferCopySampleBufferForRange(allocator: kCFAllocatorDefault, sampleBuffer: batch,
-                    sampleRange: CFRange(location: offset, length: min(1024, count - offset)), sampleBufferOut: &sample)
+                    sampleRange: CFRange(location: offset, length: min(1024, allowed - offset)), sampleBufferOut: &sample)
                 guard status == noErr, let sample else { throw CaptureFailure(message: "Generated PCM slicing failed") }
                 let pts = CMSampleBufferGetPresentationTimeStamp(sample)
                 if firstTime == nil { firstTime = pts }
@@ -152,10 +204,10 @@ enum AudioOnlyFixtureCheck {
                 try requireAudioFixture(callbacks <= 160 && inputFrames <= 144_000, "PCM callback/frame bound")
             }
         }
-        try requireAudioFixture(reader.status == .completed && inputFrames == 144_000, "Generated PCM extraction incomplete")
+        try requireAudioFixture(reader.status == .completed && inputFrames == inputLimit, "Generated PCM extraction incomplete")
         try encoder.finish()
         if let encodeFailure { throw encodeFailure }
-        try requireAudioFixture(units.count >= 125 && ingress.accepted == UInt64(units.count) && meters == callbacks, "Actual native AAC/SDK output missing")
+        try requireAudioFixture(units.count >= (inputLimit == 144000 ? 125 : 1) && ingress.accepted == UInt64(units.count) && meters == callbacks, "Actual native AAC/SDK output missing")
         for (index, unit) in units.enumerated() {
             try requireAudioFixture(unit.time == CMTime(value: Int64(index * 1024), timescale: 48_000), "AAC timestamp cadence")
         }
@@ -164,10 +216,11 @@ enum AudioOnlyFixtureCheck {
         let exports = root.appendingPathComponent("exports", isDirectory: true)
         try FileManager.default.createDirectory(at: exports, withIntermediateDirectories: false)
         var results: [[String: Any]] = []
-        for name in ["finalised", "prior_loss", "recording_only_stop", "empty"] {
+        for name in cases {
             let show = catalogue.newShow(profile: .audioOnly48kMono)
             let receipt = try queue.sync { try catalogue.begin(identity: show.nextIdentity()) }
             let recorder = try queue.sync { try CompressedRecorder(receipt: receipt, queue: queue, hasVideo: false, onFailure: { _ in }) }
+            if let begin = recordingTiming.first { recorder.audioTiming(begin) }
             let selected = name == "empty" ? [] : units.filter { name == "finalised" || $0.time.seconds < 1.25 }
             let start = DispatchTime.now().uptimeNanoseconds
             for unit in selected {
@@ -176,6 +229,7 @@ enum AudioOnlyFixtureCheck {
                 if target > now { Thread.sleep(forTimeInterval: Double(target - now) / 1_000_000_000) }
                 recorder.offer(unit) // The very same native AAC output validated above, never re-encoded.
             }
+            if let end = recordingTiming.last { recorder.audioTiming(end) }
             queue.sync {}
             if name == "prior_loss" { recorder.markIncomplete(CaptureFailure(message: "Generated prior encoded loss")) }
             let hold = DispatchSemaphore(value: 0)
@@ -204,7 +258,7 @@ enum AudioOnlyFixtureCheck {
                 continue
             }
             try requireAudioFixture(entry.bytes > 0 && entry.state == (finalised ? .finalised : .incomplete), "Sticky recording state mismatch")
-            let destination = exports.appendingPathComponent(name + ".mov")
+            let destination = exports.appendingPathComponent(name + ".m4a")
             try requireAudioFixture(FileManager.default.createFile(atPath: destination.path, contents: nil), "Owned export creation")
             let file = try FileHandle(forWritingTo: destination)
             var maximumChunk = 0
@@ -223,9 +277,24 @@ enum AudioOnlyFixtureCheck {
                             "encodedOutputsUsed": selected.count, "encodedPayloadHashes": hashes, "actualCloseListeners": 2, "cachedRepeatStable": true,
                             "maxExportChunk": maximumChunk, "original": receipt.fileURL.lastPathComponent, "export": destination.lastPathComponent])
         }
+        // Recording-only grouped/copy buffers must never mutate the shared
+        // encoded objects already validated by the publishing ingress.
+        for unit in units {
+            try requireAudioFixture(CMSampleBufferGetPresentationTimeStamp(unit.buffer) == unit.time &&
+                CMSampleBufferGetDuration(unit.buffer) == unit.duration &&
+                CMGetAttachment(unit.buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart, attachmentModeOut: nil) == nil &&
+                CMGetAttachment(unit.buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd, attachmentModeOut: nil) == nil,
+                "Recording mutated the shared publishing sample")
+        }
         try queue.sync { try catalogue.close() }
         try requireAudioFixture(catalogue.cleanupComplete, "Catalogue actual close missing")
-        let summary: [String: Any] = ["generatedPCMFrames": inputFrames, "emptyReaderMarkersSkipped": emptyMarkers, "nativeEncodeCalls": callbacks, "nativeAACUnits": units.count,
+        let extents = recordingTiming.compactMap { event -> AudioRecordingTiming.Extent? in
+            if case let .ended(extent) = event { return extent }; return nil
+        }
+        try requireAudioFixture(extents.count == 1, "One native final timing receipt required")
+        let timing = extents[0]
+        let summary: [String: Any] = ["recordingTiming": ["inputFrames": timing.inputFrames, "inputRate": timing.inputRate,
+            "encodedFrames": timing.encodedFrames, "leadingFrames": timing.leadingFrames, "trailingFrames": timing.trailingFrames], "generatedPCMFrames": inputFrames, "emptyReaderMarkersSkipped": emptyMarkers, "nativeEncodeCalls": callbacks, "nativeAACUnits": units.count,
             "encodedBytes": compressedBytes, "rustValidatedSameAACUnits": ingress.accepted, "encodePasses": 1, "videoTracks": 0,
             "profile": CaptureIntent.audioOnly48kMono.rawValue, "actualCatalogueClosed": true, "cases": results,
             "scope": "Generated macOS native AAC + recording + SDK validation only; no mic, camera, sockets or device",
