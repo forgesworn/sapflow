@@ -11,9 +11,9 @@ and RTMP (the docs record the first two only); v4v's player fix for jumping back
 is merged and was checked in real Safari; our Android app does not
 reconnect by itself yet (Larix and OBS do); the wired Linux load test has
 not run. `readiness.md` still says the player fix is unmerged. Since then
-(2026-10-22): native reconnect for our Android and iOS apps is written on
-the broadcaster branch, not yet on `main` or tried on a phone, and the
-decisions below were taken.
+(2026-10-22): bounded reconnect for our own apps is on the broadcaster
+branch, not yet on `main`, with a short recovery test on a Pixel recorded
+there but no show-length run; and the decisions below were taken.
 
 Everything in angle brackets is a placeholder, filled in from the
 deployment and never committed.
@@ -40,7 +40,11 @@ deployment and never committed.
 - [ ] **The performer's encoder.** Our own app first, if two things hold
   by the dry run: the broadcaster branch, with its reconnect, is on `main`
   and in the build the performer's phone runs, and phase A shows it
-  resuming every drop inside the 90 s grace by itself. Otherwise Larix or
+  resuming every drop inside the 90 s grace by itself and lasting the soak
+  with its local recording intact. It publishes to a manual destination
+  (the RTMP or SRT URL below), as Larix does: its V4V mode uses per-session
+  scoped encryption, which needs sapflow's control mode, and that mode
+  turns RTMP and the shared publisher off, so it is not this trial. Otherwise Larix or
   OBS with auto-reconnect on. Either way Larix is installed on the
   performer's phone with the same settings, as the fallback encoder: the
   URL is the same for both (section 3).
@@ -175,7 +179,7 @@ the compose file in `<compose-dir>`, differing only in who publishes 1935:
 `compose.mediamtx-rtmp.yml` (as today: mediamtx has 1935, sapflow
 `<trial-rtmp-port>`) and `compose.sapflow-rtmp.yml` (sapflow has 1935,
 mediamtx publishes no RTMP port). Each move is then one command:
-`docker compose -f <file> up -d mediamtx sapflow`. Port lists in override
+`docker compose -f <file> up -d --no-deps mediamtx sapflow`. Port lists in override
 files are appended, not replaced, so whole copies are simpler than
 overrides.
 
@@ -409,9 +413,9 @@ The switch:
 2. [ ] Apply section 2.5 to `<env-file>`; restart the app by the normal deploy
    procedure; confirm it is up and a mediamtx-era stage page still loads.
 3. [ ] Move 1935 to sapflow:
-   `docker compose -f compose.sapflow-rtmp.yml up -d mediamtx sapflow`, then
+   `docker compose -f compose.sapflow-rtmp.yml up -d --no-deps mediamtx sapflow`, then
    `docker port sapflow` shows 1935 and `docker port mediamtx` does not. The
-   log shows `RTMP listening` and `SRT listening ... encrypted=true`.
+   log shows `RTMP listening` and `SRT listening ... encryption="optional"`.
 4. [ ] In `<caddyfile>`, replace the body of the `/live-hls/` handle with
    `import sapflow_hls`. `caddy validate`, then reload (graceful).
 5. [ ] `curl --http2 -sI https://<domain>/live-hls/live/<eventId>/index.m3u8`:
@@ -496,7 +500,7 @@ mediamtx is serving:
    and should reconnect by itself; if it gives up, restart it with the same
    settings. An SRT encoder switches to its RTMP connection.
 2. [ ] Move 1935 back to mediamtx:
-   `docker compose -f compose.mediamtx-rtmp.yml up -d mediamtx sapflow`, and
+   `docker compose -f compose.mediamtx-rtmp.yml up -d --no-deps mediamtx sapflow`, and
    `docker port mediamtx` shows 1935. This restarts sapflow, which ends its
    held stream. The encoder's next attempt reaches mediamtx, whose own hook
    sends `publish` for the same event path; v4v accepts it (same secret,
@@ -605,7 +609,7 @@ The outcome goes in [GOALS.md](../GOALS.md): widen, repeat or stop.
 | Risk | Mitigation on the night |
 |------|-------------------------|
 | Larix's first SRT attempt sometimes fails and a retry works (unexplained) | RTMP first. If SRT: connect at soundcheck, allow up to three tries, keep auto-reconnect on, keep the logs |
-| Our own app: reconnect is new and unmerged as of 2026-10-22, untried on a phone | Used only if it is on `main` and passes phase A's drops; Larix installed with the same settings as the fallback |
+| Our own app: reconnect is new and unmerged as of 2026-10-22; one short Pixel recovery test, no show-length run | Used only if it is on `main` and passes phase A's drops; Larix installed with the same settings as the fallback |
 | A rollback restarts sapflow and needs a command on the host | The command prepared and typed in before doors (section 3); timed in phase B; sapflow stops on SIGTERM at once |
 | mediamtx has SRT off: an SRT performer has no SRT fallback | RTMP first; an SRT encoder also holds the RTMP connection |
 | No wired Linux load test; the largest all-viewers-playing measurement through Caddy over HTTP/2 is 50 viewers (250 reached 0 failed requests with the pool at 1024, but on a shared Mac behind Docker Desktop, link-bound) | Planned peak 50 concurrent, closed beta only, the pool at 1024, watches for 5xx and CPU, R5 as the way out. The 750-viewer numbers are single-machine macOS |
