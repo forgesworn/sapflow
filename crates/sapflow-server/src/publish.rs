@@ -13,8 +13,10 @@ use sapflow_hls::MuxerConfig;
 use crate::App;
 use crate::callback::Callbacks;
 use crate::publish_sessions::ScopedLease;
+#[cfg(test)]
 use crate::recorder::Recorder;
-use crate::stream::{Claim, LiveStream, Source, SourceKind};
+use crate::recorder::RecorderFactory;
+use crate::stream::{Claim, LiveStream, Retirement, Source, SourceKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -187,8 +189,12 @@ impl Publication {
             .ok_or(Refusal::AlreadyLive)?;
         let recording = {
             let mut session = stream.session();
+            session.recorder_factory = Self::recorder_factory(app, &req.path, &callbacks);
             if claim == Claim::Fresh {
-                session.recorder = Self::recorder(app, &req.path, &callbacks);
+                session.recorder = session
+                    .recorder_factory
+                    .as_ref()
+                    .map(RecorderFactory::start);
             }
             session.recorder.is_some()
         };
@@ -217,13 +223,13 @@ impl Publication {
         })
     }
 
-    fn recorder(
+    fn recorder_factory(
         app: &Arc<App>,
         path: &sapflow_core::StreamPath,
         callbacks: &Callbacks,
-    ) -> Option<Recorder> {
+    ) -> Option<RecorderFactory> {
         match &app.config.recordings {
-            Some(dir) if app.config.record_policy.records(path) => Some(Recorder::start(
+            Some(dir) if app.config.record_policy.records(path) => Some(RecorderFactory::new(
                 dir,
                 path,
                 callbacks.clone(),
@@ -279,6 +285,9 @@ impl Publication {
         // Keep session ownership stable through ingest, the recovered callback
         // and recording rollover. Registry operations use session -> state too.
         let mut session = self.stream.session();
+        if !session.owns_connection(self.generation) {
+            return Err(sapflow_hls::IngestError::PresentationExpired);
+        }
         let mut discarded = false;
         let result = self.stream.apply(|source, now| {
             let before = source.dropped_packets();
@@ -320,7 +329,10 @@ impl Publication {
         if applied.restarted {
             // A new init segment: the old recording ends here (its file is
             // finished and reported) and a new one starts.
-            session.recorder = Self::recorder(&self.app, &self.stream.path, &self.callbacks);
+            session.recorder = session
+                .recorder_factory
+                .as_ref()
+                .map(RecorderFactory::start);
             // One ingest batch can both begin an epoch and discover loss.
             // Without sample-level attribution, conservatively taint both
             // files before feeding any parts into the successor recorder.
@@ -379,21 +391,28 @@ impl Publication {
 /// `reconnect_grace` so an encoder that comes back carries it on.
 impl Drop for Publication {
     fn drop(&mut self) {
+        let runtime = tokio::runtime::Handle::try_current();
+        let retirement =
+            self.app
+                .streams
+                .retire(&self.stream, self.generation, self.grace, runtime.is_ok());
+        if matches!(retirement, Retirement::Stale) {
+            if let Some(scope) = &self.scope {
+                scope.released(false);
+            }
+            return;
+        }
         if self.published {
             self.callbacks
                 .send(&self.stream.path, StreamEvent::Unpublish);
         }
-        let grace = self
-            .stream
-            .session()
-            .hold_remaining(self.grace, Instant::now());
-        let runtime = tokio::runtime::Handle::try_current();
-        let hold = !grace.is_zero() && runtime.is_ok() && self.stream.has_content();
-        let held = self.app.streams.detach(&self.stream, self.generation, hold);
+        // The last complete AAC PES can create the first servable part only
+        // at EOF. Registry decides whether to hold after draining it.
+        let held = matches!(retirement, Retirement::Held(_));
         if let Some(scope) = &self.scope {
             scope.released(held);
         }
-        if let (true, Ok(rt)) = (held, runtime) {
+        if let (Retirement::Held(grace), Ok(rt)) = (retirement, runtime) {
             let (app, stream, generation) =
                 (self.app.clone(), self.stream.clone(), self.generation);
             rt.spawn(async move {
@@ -414,6 +433,10 @@ impl Drop for Publication {
 }
 
 #[cfg(test)]
+#[path = "publish_terminal_tests.rs"]
+pub(crate) mod terminal_tests;
+
+#[cfg(test)]
 pub(crate) mod loss_tests {
     use super::*;
     use crate::publish_observer::{CallbackScope, fixture_scope};
@@ -427,7 +450,7 @@ pub(crate) mod loss_tests {
         pub app: Arc<App>,
         pub scope: Arc<CallbackScope>,
         pub callbacks: tokio::sync::mpsc::Receiver<crate::callback::Queued>,
-        root: PathBuf,
+        pub(super) root: PathBuf,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {

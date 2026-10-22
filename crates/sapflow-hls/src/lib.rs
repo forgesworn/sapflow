@@ -24,6 +24,9 @@ pub use tracks::TrackSet;
 #[cfg(test)]
 mod audio_only_tests;
 
+#[cfg(test)]
+mod terminal_ts_tests;
+
 /// `EXT-X-TARGETDURATION`, fixed for the life of a stream.
 ///
 /// RFC 8216bis 4.4.3.1: every segment's `EXTINF`, rounded to the nearest

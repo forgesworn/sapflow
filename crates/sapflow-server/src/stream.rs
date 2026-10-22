@@ -11,7 +11,7 @@ use sapflow_hls::{
     FlvIngest, IngestError, Muxer, MuxerConfig, PartLookup, TsIngest, Update, playlist,
 };
 
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, RecorderFactory};
 use tokio::sync::watch;
 
 pub struct LiveStream {
@@ -49,9 +49,9 @@ impl Tracks {
 /// Where the media comes from.
 pub enum Source {
     /// SRT carries MPEG-TS.
-    Ts(TsIngest),
+    Ts(Box<TsIngest>),
     /// RTMP carries FLV tags.
-    Flv(FlvIngest),
+    Flv(Box<FlvIngest>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -63,8 +63,8 @@ pub enum SourceKind {
 impl Source {
     fn new(kind: SourceKind, cfg: MuxerConfig) -> Self {
         match kind {
-            SourceKind::Ts => Self::Ts(TsIngest::new(cfg)),
-            SourceKind::Flv => Self::Flv(FlvIngest::new(cfg)),
+            SourceKind::Ts => Self::Ts(Box::new(TsIngest::new(cfg))),
+            SourceKind::Flv => Self::Flv(Box::new(FlvIngest::new(cfg))),
         }
     }
 
@@ -72,8 +72,8 @@ impl Source {
     fn resume(kind: SourceKind, cfg: MuxerConfig, muxer: Option<Muxer>) -> Self {
         match (kind, muxer) {
             (_, None) => Self::new(kind, cfg),
-            (SourceKind::Ts, Some(m)) => Self::Ts(TsIngest::resume(cfg, m)),
-            (SourceKind::Flv, Some(m)) => Self::Flv(FlvIngest::resume(cfg, m)),
+            (SourceKind::Ts, Some(m)) => Self::Ts(Box::new(TsIngest::resume(cfg, m))),
+            (SourceKind::Flv, Some(m)) => Self::Flv(Box::new(FlvIngest::resume(cfg, m))),
         }
     }
 
@@ -91,17 +91,21 @@ impl Source {
         }
     }
 
-    fn muxer_mut(&mut self) -> Option<&mut Muxer> {
-        match self {
-            Self::Ts(t) => t.muxer_mut(),
-            Self::Flv(f) => f.muxer_mut(),
-        }
-    }
-
     fn take_muxer(&mut self) -> Option<Muxer> {
         match self {
             Self::Ts(t) => t.take_muxer(),
             Self::Flv(f) => f.take_muxer(),
+        }
+    }
+
+    /// Drain only input already accepted by this connection. This is not a
+    /// media admission path and must also run after a scoped gate is revoked.
+    fn finish(&mut self, now: SystemTime) -> Result<Update, IngestError> {
+        match self {
+            Self::Ts(ts) => ts.finish(now),
+            Self::Flv(flv) => Ok(flv
+                .muxer_mut()
+                .map_or_else(Update::default, |m| m.interrupt(now))),
         }
     }
 }
@@ -128,10 +132,15 @@ pub struct Session {
     fresh_part_floor: u64,
     /// Kept across a reconnect: one recording per show.
     pub recorder: Option<Recorder>,
+    pub recorder_factory: Option<RecorderFactory>,
     outage_deadline: Option<Instant>,
 }
 
 impl Session {
+    pub fn owns_connection(&self, generation: u64) -> bool {
+        self.generation == generation && self.attached
+    }
+
     /// Ignore delayed notices from an older connection after replacement.
     pub fn mark_recording_incomplete(&self, generation: u64) {
         if self.generation == generation
@@ -209,6 +218,7 @@ impl LiveStream {
                 attached: true,
                 fresh_part_floor: 0,
                 recorder: None,
+                recorder_factory: None,
                 outage_deadline: None,
             }),
             version: watch::Sender::new(0),
@@ -337,18 +347,44 @@ impl LiveStream {
         ready
     }
 
-    /// The publisher left: end the current run so a reconnect starts a new
-    /// segment after a discontinuity, and publish what was closed.
-    fn interrupt(&self) {
-        let mut st = self.lock();
-        let changed = st
-            .ingest
-            .muxer_mut()
-            .is_some_and(|m| m.interrupt(SystemTime::now()).any());
-        if changed {
-            Self::render(&mut st);
+    /// Finalise only this session's accepted parser input, while its caller
+    /// holds the session (and registry) lock. No successor can change source or
+    /// recording policy before loss attribution, codec rollover and tail feed.
+    fn finish_connection(&self, session: &mut Session) {
+        let result = {
+            let mut state = self.lock();
+            if state.closed {
+                return;
+            }
+            let result = state.ingest.finish(SystemTime::now());
+            // finish can seal an accepted prefix before returning a semantic
+            // error. Its immutable media still needs rendering and feeding.
+            Self::render(&mut state);
+            result
+        };
+        let loss = match &result {
+            Ok(update) => update.media_loss,
+            Err(_) => true,
+        };
+        if loss {
+            session.mark_recording_incomplete(session.generation);
         }
-        drop(st);
+        if result.is_ok_and(|update| update.restarted) {
+            session.recorder = session
+                .recorder_factory
+                .as_ref()
+                .map(RecorderFactory::start);
+            if loss {
+                session.mark_recording_incomplete(session.generation);
+            }
+        }
+        if let Some(recorder) = &mut session.recorder
+            && let Some((tracks, parts)) = self.parts_after(recorder.last_part())
+        {
+            // Recorder additionally pins the immutable init identity. A
+            // failed epoch change cannot append AAC under an old video init.
+            recorder.feed(tracks, parts);
+        }
         self.version.send_modify(|v| *v += 1);
     }
 
@@ -381,6 +417,13 @@ pub enum Claim {
     Fresh,
     /// Taken over from a publisher that dropped within the grace period.
     Resumed,
+}
+
+/// An atomic end-of-connection decision, captured before a successor claim.
+pub enum Retirement {
+    Stale,
+    Ended,
+    Held(Duration),
 }
 
 /// The live streams, by event id.
@@ -442,27 +485,67 @@ impl Registry {
     /// for a reconnect and this returns true: the caller then calls
     /// [`Registry::expire`] when the grace period is over. Otherwise the
     /// stream ends now. Nothing happens if a newer publisher has taken over.
+    #[cfg(test)]
     pub fn detach(&self, stream: &Arc<LiveStream>, generation: u64, hold: bool) -> bool {
         let mut map = self.map();
+        if !map
+            .get(stream.path.event_id())
+            .is_some_and(|s| Arc::ptr_eq(s, stream))
+        {
+            return false;
+        }
         let mut session = stream.session();
         if session.generation != generation || !session.attached {
             return false;
         }
         session.attached = false;
+        stream.finish_connection(&mut session);
         if hold {
             // Keep claim() excluded until the previous run and recording tail
             // are closed. A new publisher must not race this interruption.
-            stream.interrupt();
-            if let Some(recorder) = &mut session.recorder
-                && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
-            {
-                recorder.feed(tracks, parts);
-            }
             return true;
         }
         drop(session);
         Self::end(&mut map, stream);
         false
+    }
+
+    /// Retire one accepted publisher under map -> session -> media order.
+    /// Already-ended exact ownership can still send its captured Unpublish;
+    /// stale ownership must not emit callbacks or mutate a successor's grace.
+    pub fn retire(
+        &self,
+        stream: &Arc<LiveStream>,
+        generation: u64,
+        grace: Duration,
+        can_hold: bool,
+    ) -> Retirement {
+        let mut map = self.map();
+        let mapped = map.get(stream.path.event_id());
+        let different = mapped.is_some_and(|current| !Arc::ptr_eq(current, stream));
+        let absent = mapped.is_none();
+        let mut session = stream.session();
+        if different || session.generation != generation {
+            return Retirement::Stale;
+        }
+        let closed = stream.lock().closed;
+        if absent && !closed {
+            return Retirement::Stale;
+        }
+        if !session.attached || closed {
+            return Retirement::Ended;
+        }
+        session.hold_remaining(grace, Instant::now());
+        session.attached = false;
+        stream.finish_connection(&mut session);
+        // Terminal parsing cannot extend the original reconnect deadline.
+        let remaining = session.hold_remaining(grace, Instant::now());
+        if can_hold && !remaining.is_zero() && stream.has_content() {
+            return Retirement::Held(remaining);
+        }
+        drop(session);
+        Self::end(&mut map, stream);
+        Retirement::Ended
     }
 
     /// The grace period for `generation`'s drop is over: ends the stream
@@ -496,12 +579,7 @@ impl Registry {
             return false;
         }
         session.attached = false;
-        stream.interrupt();
-        if let Some(recorder) = &mut session.recorder
-            && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
-        {
-            recorder.feed(tracks, parts);
-        }
+        stream.finish_connection(&mut session);
         drop(session);
         Self::end(&mut map, stream);
         true
@@ -516,17 +594,11 @@ impl Registry {
         {
             map.remove(stream.path.event_id());
         }
-        // A zero-grace normal end must seal the accepted tail too. The hold
-        // and explicit-revoke paths already interrupted it; repeating that
-        // operation is a no-op and cannot duplicate their final part.
+        // Repeating a terminal drain is harmless. This also covers expiry
+        // after a held connection, without duplicating its final AAC part.
         let recorder = {
             let mut session = stream.session();
-            stream.interrupt();
-            if let Some(recorder) = &mut session.recorder
-                && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
-            {
-                recorder.feed(tracks, parts);
-            }
+            stream.finish_connection(&mut session);
             stream.close();
             // Actual writer completion follows channel closure, not removal
             // from the registry or a requested transport shutdown.
@@ -625,6 +697,7 @@ mod grace_tests {
             attached: true,
             fresh_part_floor: 0,
             recorder: None,
+            recorder_factory: None,
             outage_deadline: None,
         };
         let grace = Duration::from_secs(90);

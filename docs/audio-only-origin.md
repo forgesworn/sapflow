@@ -1,8 +1,9 @@
 # Explicit AAC-only origin contract
 
 The B4R prerequisite is an audio-only origin path through our SRT/TS and RTMP
-implementations, HLS packaging, recording and status callbacks. Native audio-mode
-selection and physical background operation are separate, unfinished work.
+implementations, HLS packaging, recording and status callbacks. The native apps
+also implement the [foreground microphone-only prerequisite](audio-only-mobile.md).
+Physical capture and background operation remain unfinished qualification gates.
 
 ## Declare tracks before media
 
@@ -56,6 +57,34 @@ Each recording pins its initialization identity; a later epoch is refused and
 the old prefix is synced incomplete if ingest fails before reporting rollover.
 Normal zero-grace End seals the accepted tail before closing the writer.
 
+`TsIngest::finish` now supplies an explicit connection EOF, distinct from a live
+feed temporarily running out of bytes. It releases a complete, independently
+validated bounded AAC PES even when it occupies only one TS start packet. Empty
+pushes remain starvation. Repeated finish is harmless; further pushes return
+`IngestError::InputFinished`. A reconnect uses a fresh parser and the retained
+presentation. Raw PES header stuffing is included in advertised-length checks.
+
+Terminal processing rejects truncated bounded PES/TS and reports definite media
+loss, including AAC without a usable timestamp. An unbounded video tail is not
+guessed or emitted; its uncertain duration alone does not invalidate the accepted
+prefix. This remains an accepted-prefix recording policy, not a complete-show
+guarantee. Finish may seal that prefix before returning a semantic error; callers
+must preserve the incomplete-recording result before feeding its final parts.
+
+The server drains accepted input under registry, session and media ownership
+before closing or holding the connection. Revocation permits no new input, while
+already accepted data can still finish. Stale generations cannot drain a later
+parser or relabel its recording. A successful terminal codec change starts a
+distinct recording using the newly accepted connection's captured callback scope.
+Each file still pins its immutable initialization identity. EOF-created content
+can enter reconnect grace; old held parts cannot qualify a new connection's
+fresh-media receipt.
+
+Terminal recording rollover uses the runtime captured when the recording was
+created, including when connection Drop runs outside an ambient Tokio runtime.
+That originating runtime must remain alive until the writers complete. A runtime
+handle does not establish process-shutdown durability.
+
 ## API and observation
 
 The pre-release Rust API now returns `Option<&H264Config>` from `Muxer::video()`.
@@ -67,6 +96,7 @@ audio methods remain video-led compatibility paths.
 Rust consumers matching RTMP events must handle the new `Event::Tracks` variant.
 Update literals need `media_loss` or a default initializer; consumers must
 preserve that flag when merging updates and reporting recording completion.
+Exhaustive `IngestError` matches must also handle `InputFinished`.
 
 `Health.keyframe_interval_ms` is now `Option<u64>`: A/V JSON retains its numeric
 field, while audio-only JSON carries `keyframeIntervalMs: null`. Bitrate remains
@@ -88,16 +118,30 @@ frames. This isolates final short-input truncation by the black-box test sender
 in that controlled configuration. The original default-chunk/EOF run remains
 separate evidence. Neither run qualifies native shutdown or a complete show.
 
-Terminal TS coverage must also exercise a complete bounded PES contained in one
-TS start packet. Source inspection identifies a reader path that waits for the
-next PES or real EOF; current live-feed starvation supplies neither terminal
-policy nor an executed regression for that case.
+A separate 25-second default-chunk/EOF reproduction now isolates the same test
+sender problem: its captured wire input is the exact source prefix, missing
+1,448 bytes and ending with 56 partial TS bytes. The origin correctly marks
+that accepted recording incomplete and suppresses its complete callback.
+The smoke sender now validates whole generated TS packets, appends at most six
+valid null packets and explicitly selects a 1,316-byte chunk. A controlled
+corrected run transmits all 3,000,480 padded bytes with an identical wire hash,
+clean parser EOF, independent decoding and one recording-complete callback.
+The full SRT/RTMP/reconnect/encryption smoke passes with its assertions unchanged.
+This corrects synthetic test input; it does not relax production loss handling
+or qualify native encoder shutdown and complete-show retention.
 
-The native apps still need mic-only capture/permissions, audio-only recording
-and remote PCM observation, with no camera, video encoder or keyframe wait.
-The existing strict A/V observer and V4V profile admission need an explicit audio
-profile. Qualify background/lock behaviour, interruptions, routes and USB audio
-on each supported OS, plus scoped creator integration and sustained performance.
+Executed terminal tests now cover the single-start-packet case, exact fixture
+frame counts, truncation, stuffing, missing timestamps, idempotence, reconnect
+freshness, scoped revocation and actual writer finalisation. The per-PID terminal
+metadata is finite and contains no elementary payload copy. The maintained
+reader's pre-existing retained unbounded-PES payload needs separate memory-limit
+hardening; the unread-input `MAX_BUFFER` does not establish that bound.
+
+The native apps now select explicit foreground audio-only capture/permissions,
+recording and PCM-only observation without a camera, video encoder or keyframe
+wait. Qualify background/lock behaviour, interruptions, routes and USB audio
+on each supported OS, plus actual scoped creator integration, recording priming
+and presentation, complete-show retention and sustained performance.
 Generated loopback fixtures and host consumers do not establish these gates or
 performance superiority. See the [delivery status](mobile-delivery-status.md),
 [mobile plan](mobile-streaming-plan.md) and [library-quality plan](library-quality-plan.md).

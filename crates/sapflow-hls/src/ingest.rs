@@ -13,7 +13,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use mpeg2ts::es::StreamType;
-use mpeg2ts::pes::{PesPacketReader, ReadPesPacket};
+use mpeg2ts::pes::{PesHeader, PesPacket, PesPacketReader, ReadPesPacket};
 use mpeg2ts::ts::{Pid, ReadTsPacket, TsPacket, TsPacketReader, TsPayload};
 
 use crate::codec::{self, AAC_FRAME_SAMPLES, AacConfig, H264Config};
@@ -39,6 +39,8 @@ pub enum IngestError {
     TrackConflict,
     InvalidAudio,
     InvalidTimestamp,
+    /// This connection has explicitly finished; resume with a new ingest.
+    InputFinished,
 }
 
 impl std::fmt::Display for IngestError {
@@ -51,6 +53,7 @@ impl std::fmt::Display for IngestError {
             Self::TrackConflict => f.write_str("track set changed within a connection"),
             Self::InvalidAudio => f.write_str("unsupported or changed AAC configuration"),
             Self::InvalidTimestamp => f.write_str("audio timestamp outside supported range"),
+            Self::InputFinished => f.write_str("transport input already finished"),
         }
     }
 }
@@ -104,6 +107,17 @@ struct Input {
     program: Program,
     dropped: u64,
     reset_pes: bool,
+    terminal: bool,
+    ended: bool,
+}
+
+// Scalar/header metadata only: never a second copy of elementary payloads.
+// PID limits the table to the finite transport PID space. Completed multi-TS
+// bounded PES leave the table immediately; START-only PES await real EOF.
+struct PesBoundary {
+    header: PesHeader,
+    expected: Option<usize>,
+    received: usize,
 }
 
 struct Feed {
@@ -112,11 +126,107 @@ struct Feed {
     inner: TsPacketReader<SlotReader>,
     continuity: HashMap<Pid, (u8, [u8; TS_SIZE])>,
     pending: Option<Box<TsPacket>>,
+    boundaries: HashMap<Pid, PesBoundary>,
+}
+
+impl Feed {
+    fn normalize_pes_length(packet: &mut TsPacket, raw: &[u8; TS_SIZE]) -> bool {
+        let Some(TsPayload::PesStart(pes)) = &mut packet.payload else {
+            return true;
+        };
+        if !(0xc0..=0xef).contains(&pes.header.stream_id.as_u8()) {
+            return true;
+        }
+        // The maintained TS reader validates the optional header and consumes
+        // FF stuffing, but PesHeader does not retain header_data_length. Its
+        // PES reader reconstructs only the minimum header length. Preserve the
+        // advertised raw payload length by subtracting stuffing from the parsed
+        // packet_len before that reader assembles payloads. No payload parsing
+        // or copying is introduced here, and unbounded video stays unbounded.
+        let at = if raw[3] & 0x20 != 0 {
+            5 + usize::from(raw[4])
+        } else {
+            4
+        };
+        let Some(&length) = raw.get(at + 8) else {
+            return false;
+        };
+        let actual = 3 + u16::from(length);
+        let minimum = 3
+            + u16::from(pes.header.pts.is_some()) * 5
+            + u16::from(pes.header.dts.is_some()) * 5
+            + u16::from(pes.header.escr.is_some()) * 6;
+        let Some(stuffing) = actual.checked_sub(minimum) else {
+            return false;
+        };
+        if pes.pes_packet_len != 0 {
+            if pes.pes_packet_len < actual {
+                return false;
+            }
+            pes.pes_packet_len -= stuffing;
+        }
+        true
+    }
+
+    fn observe_boundary(&mut self, packet: &TsPacket) {
+        let pid = packet.header.pid;
+        match &packet.payload {
+            Some(TsPayload::PesStart(pes)) => {
+                // normalize_pes_length already accounts for raw stuffing;
+                // subtracting this retained minimum now gives the exact raw
+                // advertised payload length, not a guessed header extent.
+                let header_len = 3
+                    + usize::from(pes.header.pts.is_some()) * 5
+                    + usize::from(pes.header.dts.is_some()) * 5
+                    + usize::from(pes.header.escr.is_some()) * 6;
+                let expected = (pes.pes_packet_len != 0)
+                    .then(|| usize::from(pes.pes_packet_len).checked_sub(header_len))
+                    .flatten();
+                self.boundaries.insert(
+                    pid,
+                    PesBoundary {
+                        header: pes.header.clone(),
+                        expected,
+                        received: pes.data.len(),
+                    },
+                );
+            }
+            Some(TsPayload::PesContinuation(data)) => {
+                if let Some(boundary) = self.boundaries.get_mut(&pid) {
+                    boundary.received = boundary.received.saturating_add(data.len());
+                    if boundary.expected.is_some_and(|n| boundary.received >= n) {
+                        // The PES reader returns a complete bounded packet (or
+                        // rejects an overrun) in this very continuation call.
+                        self.boundaries.remove(&pid);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn terminal_aac(&self, pes: &PesPacket<Vec<u8>>) -> bool {
+        // The upstream EOF path also returns unbounded video. Only a pending,
+        // exactly bounded audio packet may cross our terminal boundary. Reject
+        // ambiguous same-header streams rather than guess their PID identity.
+        let mut matches = self
+            .boundaries
+            .iter()
+            .filter(|(_, b)| b.header == pes.header);
+        let Some((_, boundary)) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none()
+            && (0xc0..=0xdf).contains(&pes.header.stream_id.as_u8())
+            && boundary.expected == Some(pes.data.len())
+            && boundary.received == pes.data.len()
+    }
 }
 
 impl ReadTsPacket for Feed {
     fn read_ts_packet(&mut self) -> mpeg2ts::Result<Option<TsPacket>> {
         if let Some(packet) = self.pending.take() {
+            self.observe_boundary(&packet);
             return Ok(Some(*packet));
         }
         loop {
@@ -124,11 +234,29 @@ impl ReadTsPacket for Feed {
                 let mut input = self.input.lock().map_err(|_| starved())?;
                 let Input { buf, start, .. } = &mut *input;
                 // Resynchronise on the sync byte if the stream slipped.
+                let before = *start;
                 match buf[*start..].iter().position(|&b| b == SYNC) {
                     Some(skip) => *start += skip,
                     None => *start = buf.len(),
                 }
-                if buf.len() - *start < TS_SIZE {
+                let skipped = input.start != before;
+                if skipped {
+                    input.dropped = input.dropped.saturating_add(1);
+                    input.reset_pes = true;
+                    return Err(
+                        io::Error::new(io::ErrorKind::InvalidData, "transport sync lost").into(),
+                    );
+                }
+                let remaining = input.buf.len() - input.start;
+                if remaining < TS_SIZE {
+                    if input.terminal {
+                        if remaining != 0 {
+                            input.dropped = input.dropped.saturating_add(1);
+                            input.start = input.buf.len();
+                        }
+                        input.ended = true;
+                        return Ok(None);
+                    }
                     input.starved = true;
                     return Err(starved());
                 }
@@ -144,7 +272,18 @@ impl ReadTsPacket for Feed {
                 slot.pos = 0;
             }
             match self.inner.read_ts_packet() {
-                Ok(Some(p)) => {
+                Ok(Some(mut p)) => {
+                    if !Self::normalize_pes_length(&mut p, &packet) {
+                        if let Ok(mut input) = self.input.lock() {
+                            input.dropped = input.dropped.saturating_add(1);
+                            input.reset_pes = true;
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid PES header length",
+                        )
+                        .into());
+                    }
                     let pid = p.header.pid;
                     let carries_pes = matches!(
                         p.payload,
@@ -209,6 +348,7 @@ impl ReadTsPacket for Feed {
                         }
                         input.program = program;
                     }
+                    self.observe_boundary(&p);
                     return Ok(Some(p));
                 }
                 Ok(None) => {}
@@ -524,6 +664,7 @@ impl TsIngest {
             inner: TsPacketReader::new(slot),
             continuity: HashMap::new(),
             pending: None,
+            boundaries: HashMap::new(),
         };
         Self {
             input,
@@ -550,6 +691,9 @@ impl TsIngest {
             let Ok(mut input) = self.input.lock() else {
                 return Ok(Update::default());
             };
+            if input.terminal {
+                return Err(IngestError::InputFinished);
+            }
             if input.start > 0 {
                 let start = input.start;
                 input.buf.drain(..start);
@@ -562,6 +706,36 @@ impl TsIngest {
             input.starved = false;
         }
         self.pending = Update::default();
+        self.drain(now, false)?;
+        Ok(self.pending)
+    }
+
+    /// Ends this connection's input, as distinct from temporary starvation.
+    /// Releases only complete bounded AAC still held by the PES reader, then
+    /// seals accepted muxer media. An unbounded video tail is never emitted;
+    /// its uncertain duration alone is not definite transport loss. Truncated
+    /// bounded PES/TS or parser rejection sets `media_loss`. The retained muxer
+    /// can be resumed by a new ingest; this parser cannot accept more bytes.
+    /// Repeated finish calls are harmless and return an empty update.
+    pub fn finish(&mut self, now: SystemTime) -> Result<Update, IngestError> {
+        {
+            let mut input = self.input.lock().expect("input lock is private to ingest");
+            if input.terminal {
+                return Ok(Update::default());
+            }
+            input.terminal = true;
+            input.starved = false;
+        }
+        self.pending = Update::default();
+        let result = self.drain(now, true);
+        self.pending.media_loss |= self.dropped_packets() != 0;
+        if let Some(muxer) = self.es.muxer_mut() {
+            self.pending.merge(muxer.interrupt(now));
+        }
+        result.map(|()| self.pending)
+    }
+
+    fn drain(&mut self, now: SystemTime, terminal: bool) -> Result<(), IngestError> {
         loop {
             match self
                 .pes
@@ -569,7 +743,37 @@ impl TsIngest {
                 .expect("PES reader restored after reset")
                 .read_pes_packet()
             {
-                Ok(Some(pes)) => self.on_pes(pes, now)?,
+                Ok(Some(pes)) => {
+                    if terminal {
+                        let feed = self
+                            .pes
+                            .as_ref()
+                            .expect("PES reader present")
+                            .ts_packet_reader();
+                        // ReadPesPacket has now reached real EOF. All pending
+                        // returns, including unbounded video, need validation.
+                        let ended = feed.input.lock().map(|i| i.ended).unwrap_or(true);
+                        if ended && !feed.terminal_aac(&pes) {
+                            self.pending.media_loss |= (0xc0..=0xdf)
+                                .contains(&pes.header.stream_id.as_u8())
+                                && feed
+                                    .boundaries
+                                    .values()
+                                    .any(|b| b.header == pes.header && b.expected.is_some());
+                            continue;
+                        }
+                        if ended && !complete_adts(&pes.data) {
+                            // Keep any individually validated AAC prefix, but
+                            // never call a malformed/truncated ADTS tail clean.
+                            self.pending.media_loss = true;
+                        }
+                        if ended && pes.header.pts.is_none() {
+                            self.pending.media_loss = true;
+                            continue;
+                        }
+                    }
+                    self.on_pes(pes, now)?;
+                }
                 Ok(None) => break,
                 Err(_) => {
                     let reset = self
@@ -578,11 +782,12 @@ impl TsIngest {
                         .map(|mut input| std::mem::take(&mut input.reset_pes))
                         .unwrap_or(false);
                     if reset {
-                        let feed = self
+                        let mut feed = self
                             .pes
                             .take()
                             .expect("PES reader present")
                             .into_ts_packet_reader();
+                        feed.boundaries.clear();
                         self.pes = Some(PesPacketReader::new(feed));
                         self.waiting_keyframe = true;
                         continue;
@@ -598,7 +803,7 @@ impl TsIngest {
                 }
             }
         }
-        Ok(self.pending)
+        Ok(())
     }
 
     fn program(&self) -> Program {
@@ -680,6 +885,27 @@ impl TsIngest {
         }
         Ok(())
     }
+}
+
+fn complete_adts(mut data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    while !data.is_empty() {
+        let Ok(header) = adts_reader::AdtsHeader::from_bytes(data) else {
+            return false;
+        };
+        let length = usize::from(header.frame_length());
+        if length == 0
+            || length > data.len()
+            || header.number_of_raw_data_blocks_in_frame() != 1
+            || header.payload().is_err()
+        {
+            return false;
+        }
+        data = &data[length..];
+    }
+    true
 }
 
 /// Demuxes a clean TS buffer into elementary events, for other modules' tests.

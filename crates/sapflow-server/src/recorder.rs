@@ -30,6 +30,39 @@ enum Msg {
     Part(Arc<Part>),
 }
 
+/// Cold construction policy for the currently accepted connection. Keeping it
+/// on the session lets terminal-only codec changes start the right scoped
+/// recording without retaining an App or any elementary media.
+pub struct RecorderFactory {
+    dir: PathBuf,
+    path: StreamPath,
+    callbacks: Callbacks,
+    min_free: u64,
+    runtime: tokio::runtime::Handle,
+}
+
+impl RecorderFactory {
+    pub fn new(dir: &Path, path: &StreamPath, callbacks: Callbacks, min_free: u64) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            path: path.clone(),
+            callbacks,
+            min_free,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    pub fn start(&self) -> Recorder {
+        Recorder::start_on(
+            &self.runtime,
+            &self.dir,
+            &self.path,
+            self.callbacks.clone(),
+            self.min_free,
+        )
+    }
+}
+
 pub struct Recorder {
     tx: Option<mpsc::Sender<Msg>>,
     started: bool,
@@ -41,6 +74,26 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn start(dir: &Path, path: &StreamPath, callbacks: Callbacks, min_free: u64) -> Self {
+        Self::start_on(
+            &tokio::runtime::Handle::current(),
+            dir,
+            path,
+            callbacks,
+            min_free,
+        )
+    }
+
+    /// The factory retains the originating runtime handle. Terminal connection
+    /// Drop may run outside an ambient Tokio context; spawning on this handle
+    /// keeps writer ownership on that executor without creating another one.
+    /// The runtime itself must remain alive through actual writer completion.
+    pub fn start_on(
+        runtime: &tokio::runtime::Handle,
+        dir: &Path,
+        path: &StreamPath,
+        callbacks: Callbacks,
+        min_free: u64,
+    ) -> Self {
         let incomplete = Arc::new(AtomicBool::new(false));
         let Ok((callbacks, observation)) = callbacks.for_recording() else {
             return Self {
@@ -53,7 +106,7 @@ impl Recorder {
             };
         };
         let (tx, rx) = mpsc::channel(QUEUE);
-        tokio::spawn(write(
+        runtime.spawn(write(
             dir.to_owned(),
             path.clone(),
             rx,

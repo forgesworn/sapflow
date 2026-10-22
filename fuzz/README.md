@@ -2,7 +2,7 @@
 
 | Target | What it feeds |
 |--------|---------------|
-| `ts_ingest` | Arbitrary MPEG-TS in arbitrary chunks (SRT publisher) |
+| `ts_ingest` | Arbitrary MPEG-TS chunks, explicit terminal drain, playlist rules, repeated finish and post-EOF refusal (SRT publisher) |
 | `flv_ingest` | Arbitrary FLV video/audio tag bodies, with explicit track declarations in prefixed inputs (RTMP publisher) |
 | `muxer_timing` | Arbitrary video or declared AAC-only timing into the LL-HLS muxer (steps, stalls, steps back, interruptions and codec epochs); every rendered playlist must pass `playlist::RuleCheck`: fixed `TARGETDURATION` and `PART-TARGET`, `EXTINF` within the target, the part rules, consistent discontinuities |
 | `small_parsers` | Stream ids, RTMP keys, chunk names, HLS queries, ages, ASC, avcC, ADTS, Annex B, AVCC |
@@ -90,6 +90,12 @@ They contain no camera or microphone recording. `rtmp_session/declared-aac`
 adds explicit boolean metadata and AAC tag records after the existing synthetic
 publish prefix; `rtmp_client/declared-audio` enables the actual client's cold
 declaration before its existing peer fixture.
+
+The three `ts_ingest/terminal-*` seeds contain a chunk byte, generated fixture
+PAT/PMT and one original synthetic AAC start packet. They exercise complete
+bounded terminal input, a raw stuffed-header overrun and a truncated declared
+length. Their AAC payload placeholders establish parser/packaging behaviour,
+not PCM playability. They contain no camera or microphone recording.
 
 Historical FLV and video-timing regression formats remain unchanged. The `TRKS`
 prefix selects four FLV record kinds: video, audio, legacy audio hint and a

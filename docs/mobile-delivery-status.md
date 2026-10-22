@@ -19,6 +19,17 @@ connection EOF. Truncation, raw header stuffing, missing timestamps, codec epoch
 and stale generations have focused regressions. Local finite tests remain
 distinct from a complete native show and physical shutdown qualification.
 
+The current Rust source passes 582 workspace tests with four normally ignored,
+strict all-target Clippy and formatting. The full origin smoke passes SRT,
+RTMP, reconnect, encryption, independent decoding and recording callbacks.
+Its first run exposed a truncated final read in the black-box synthetic sender;
+controlled wire capture isolated that loss before origin ingest. The sender
+now validates complete TS packets and pads its final 1,316-byte block with
+at most six null packets. The corrected wire bytes match the generated input;
+production loss handling and smoke assertions remain unchanged. Terminal TS
+fuzz regressions and 61 seconds of AddressSanitizer/overflow mutation testing
+also pass. These finite local checks do not establish a complete physical show.
+
 App checks pass 316 Android unit tests in each of Debug and Qualification,
 with three APKs, build isolation, 16 KiB ZIP/ARM64 ELF alignment and Release
 lint at zero errors and six existing warnings. All three unsigned iOS app
