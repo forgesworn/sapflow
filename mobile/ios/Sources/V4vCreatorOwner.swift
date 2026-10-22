@@ -4,7 +4,7 @@ import Foundation
 /// permission/start boundary. Cancelling one ticket must never stop another mode.
 protocol V4vCreatorCapturePort: AnyObject {
     var canChooseCaptureProfile: Bool { get }
-    func reservePreparation(profile: CaptureProfile) -> CaptureAdmission.Preparation?
+    func reservePreparation(profile: CaptureIntent) -> CaptureAdmission.Preparation?
     func abandonPreparation(_ ticket: CaptureAdmission.Preparation)
     func setDestination(_ sink: EncodedPublishingSink?, preparation: CaptureAdmission.Preparation, completion: @escaping (Bool) -> Void)
     func prepare(_ ticket: CaptureAdmission.Preparation)
@@ -55,7 +55,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
                               @escaping () -> V4vClock, @escaping (V4vLoginResult) throws -> Void,
                               @escaping () -> Void) throws -> V4vCreatorLogin
     typealias PublisherFactory = (UInt64, V4vPublishingGrantPermit, V4vSessionEngine, DispatchQueue,
-                                  V4vObservationSlot, @escaping () -> V4vClock, CaptureProfile) throws -> V4vCreatorPublisher
+                                  V4vObservationSlot, @escaping () -> V4vClock, CaptureIntent) throws -> V4vCreatorPublisher
 
     /// Scalar admission only. No IO, callbacks, HTTP or camera work under lock.
     private let gate = NSLock()
@@ -88,7 +88,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private var window: Window?
     private var refreshAtNs: UInt64?
     private var capturePrepared = false, captureRunning = false, captureStopping = false
-    private var prepareIntent: (generation: UInt64, profile: CaptureProfile)?
+    private var prepareIntent: (generation: UInt64, profile: CaptureIntent)?
     private var ending = false
     private var slotClosed = false
     private var actorCommand: UInt64 = 0
@@ -236,7 +236,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         // actual capture cleanup barrier can release its preparation capacity.
         return free && capture.canChooseCaptureProfile
     }
-    @discardableResult func prepare(captureProfile: CaptureProfile = .defaultProfile, replacingAcknowledged: Bool = false) -> Bool {
+    @discardableResult func prepare(captureProfile: CaptureIntent = .defaultProfile, replacingAcknowledged: Bool = false) -> Bool {
         command { [self] token in
             guard let engine, binding == nil, !capturePrepared, !captureRunning, !captureStopping, engine.pending == nil,
                   let selected = value.selectedEvent else { throw V4vFailure.busy }
@@ -349,7 +349,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private var captureUpdateQueued = false
     private var captureActivityPending = false
 
-    private func attach(_ permit: V4vPublishingGrantPermit, token: UInt64, captureProfile: CaptureProfile) throws {
+    private func attach(_ permit: V4vPublishingGrantPermit, token: UInt64, captureProfile: CaptureIntent) throws {
         // Reject an insufficient grant before creating a camera or publisher
         // owner. The selected profile is never inferred from a service cap.
         try captureProfile.requireGrant(maxPublishBps: permit.grant.maxPublishBps)

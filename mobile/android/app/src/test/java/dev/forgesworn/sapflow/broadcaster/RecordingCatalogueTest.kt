@@ -231,4 +231,16 @@ class RecordingCatalogueTest {
         assertFalse(catalogue.cleanupRetained); assertFalse(catalogue.cleanupUncertain)
         assertEquals(256, catalogue.scan().size)
     }
+    @Test fun audioShowPersistsDistinctTopologyWithoutInventingVideoQuality() {
+        val root = directory(); val catalogue = RecordingCatalogue(root)
+        val show = catalogue.newShow(CaptureIntent.AudioOnly48kMono)
+        val identity = show.nextIdentity()
+        assertEquals("AUDIO_ONLY_48K_MONO", identity.profileId)
+        val writer = catalogue.begin(identity)
+        Files.write(root.resolve(identity.filename), byteArrayOf(1, 2, 3))
+        writer.finalised(1000)
+        val entry = catalogue.scan().single()
+        assertEquals(identity, entry.identity); assertEquals(RecordingCatalogue.State.FINALISED, entry.state)
+        assertEquals(identity.showId, show.nextIdentity().showId)
+    }
 }

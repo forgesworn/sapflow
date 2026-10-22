@@ -5,6 +5,27 @@ import AVFoundation
 #endif
 
 final class CaptureProfileTests: XCTestCase {
+    func testAudioOnlyIntentHasNoCameraAndRequiresItsExplicitGrantCeiling() {
+        let intent = CaptureIntent.audioOnly48kMono
+        XCTAssertNil(intent.videoProfile); XCTAssertFalse(intent.hasVideo)
+        XCTAssertTrue(intent.hasAudio); XCTAssertFalse(intent.requiresCameraPermission)
+        XCTAssertEqual(intent.audioBps, 96_000); XCTAssertEqual(intent.elementaryBps, 96_000)
+        XCTAssertEqual(intent.minimumPublishBps, 1_000_000)
+        XCTAssertNoThrow(try intent.requireGrant(maxPublishBps: 1_000_000))
+        XCTAssertThrowsError(try intent.requireGrant(maxPublishBps: 999_999))
+        XCTAssertEqual(intent, .audioOnly48kMono)
+        XCTAssertEqual(CaptureIntent.defaultProfile, .audioVideo(.hd720p30))
+    }
+    func testCaptureIntentPersistencePreservesCameraIDsAndRejectsAmbiguousAudioIDs() {
+        for intent in CaptureIntent.allCases {
+            XCTAssertEqual(CaptureIntent(rawValue: intent.rawValue), intent)
+        }
+        XCTAssertEqual(CaptureIntent.audioOnly48kMono.rawValue, "audio-48k-mono")
+        for invalid in ["audio", "audio-only", "audio-48k-stereo", "audio-48k-mono ", "AUDIO-48K-MONO"] {
+            XCTAssertNil(CaptureIntent(rawValue: invalid))
+        }
+        XCTAssertEqual(CaptureIntent(rawValue: "720p30"), .audioVideo(.hd720p30))
+    }
     func testCommonDefaultPreservesExisting720EncodingTargets() {
         let profile = CaptureProfile.defaultProfile
         XCTAssertEqual(profile, .hd720p30)

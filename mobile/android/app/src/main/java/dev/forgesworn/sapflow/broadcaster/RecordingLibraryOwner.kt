@@ -21,12 +21,13 @@ internal class RecordingLibraryOwner internal constructor(
     private enum class PreparationProblem { LOW_STORAGE, UNAVAILABLE }
     private class PreparationFailure(val reason: PreparationProblem) : IllegalStateException()
     data class Preparation(
-        val profile: CaptureProfile,
+        val intent: CaptureIntent,
         val checkedAtNs: Long,
         private val directory: Path,
         private val catalogue: RecordingCatalogue,
         private val show: RecordingCatalogue.Show,
     ) {
+        val profile: CaptureProfile? get() = intent.videoProfile
         fun recorder(): EncodedSink = PrivateRecordingSink(directory, catalogue, show)
         fun fresh(nowNs: Long): Boolean = nowNs >= checkedAtNs && nowNs - checkedAtNs <= 3_000_000_000L
     }
@@ -49,10 +50,13 @@ internal class RecordingLibraryOwner internal constructor(
         submit(RecordingLibraryAdmission.Kind.SCAN, { catalogue().scan() }, complete)
 
     fun prepare(profile: CaptureProfile, complete: (Result<Preparation>) -> Unit): RecordingLibraryAdmission.Ticket? =
+        prepare(CaptureIntent.AudioVideo(profile), complete)
+
+    fun prepare(intent: CaptureIntent, complete: (Result<Preparation>) -> Unit): RecordingLibraryAdmission.Ticket? =
         submit(RecordingLibraryAdmission.Kind.PREFLIGHT, {
             val store = catalogue()
             store.checkRecordingCapacity()
-            val check = RecordingStorage.check(RecordingStorage.budget(profile)) {
+            val check = RecordingStorage.check(RecordingStorage.budget(intent)) {
                 runCatching { Files.getFileStore(directory).usableSpace }.getOrNull()
             }
             when (check.state) {
@@ -60,7 +64,7 @@ internal class RecordingLibraryOwner internal constructor(
                 RecordingStorage.State.LOW -> throw PreparationFailure(PreparationProblem.LOW_STORAGE)
                 RecordingStorage.State.UNAVAILABLE -> throw PreparationFailure(PreparationProblem.UNAVAILABLE)
             }
-            Preparation(profile, System.nanoTime(), directory, store, store.newShow(profile))
+            Preparation(intent, System.nanoTime(), directory, store, store.newShow(intent))
         }, complete)
 
     private fun <T> submit(kind: RecordingLibraryAdmission.Kind, action: () -> T, complete: (Result<T>) -> Unit): RecordingLibraryAdmission.Ticket? {

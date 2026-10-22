@@ -51,7 +51,7 @@ final class RecordingCaptureAdmissionTests: XCTestCase {
         XCTAssertTrue(recording.permits(next)); XCTAssertFalse(recording.closed(work, cleanupComplete: false))
     }
     func testStorageKeepsStrictExistingFloorAndSelectedProfileBudget() throws {
-        for profile in CaptureProfile.allCases {
+        for profile in CaptureIntent.allCases {
             let budget = try RecordingStorage.budget(profile: profile)
             XCTAssertFalse(RecordingCaptureAdmission.storageAvailable(profile: profile, bytes: nil))
             XCTAssertFalse(RecordingCaptureAdmission.storageAvailable(profile: profile, bytes: 200 * 1024 * 1024))

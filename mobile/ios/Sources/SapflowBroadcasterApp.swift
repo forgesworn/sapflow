@@ -9,7 +9,7 @@ struct SapflowBroadcasterApp: App {
 
 final class BroadcasterModel: ObservableObject {
     @Published var snapshot = CaptureSnapshot()
-    @Published private(set) var captureProfile = CaptureProfile.defaultProfile
+    @Published private(set) var captureProfile = CaptureIntent.defaultProfile
     @Published var destinationMode = BroadcasterDestinationMode.recording {
         didSet {
             guard destinationMode != oldValue else { return }
@@ -63,11 +63,11 @@ final class BroadcasterModel: ObservableObject {
     deinit { creatorOwner?.close() }
     var recordingOnly: Bool { destinationMode == .recording }
     // 1080p has an engineering encoder path, pending physical qualification.
-    let captureProfiles = CaptureProfile.allCases.filter { !$0.isEngineeringOnly }
+    let captureProfiles = CaptureIntent.allCases.filter { !$0.isEngineeringOnly }
     var canChangeCaptureProfile: Bool {
         recordingLibrary.captureAllowed && engine.canChooseCaptureProfile && (destinationMode != .v4v || creatorOwner?.canChangeCaptureSettings != false)
     }
-    func selectCaptureProfile(_ profile: CaptureProfile) {
+    func selectCaptureProfile(_ profile: CaptureIntent) {
         guard canChangeCaptureProfile, captureProfiles.contains(profile) else { return }
         captureProfile = profile
     }
@@ -102,6 +102,7 @@ final class BroadcasterModel: ObservableObject {
         updateOrientation(); creatorOwner?.prepare(captureProfile: captureProfile, replacingAcknowledged: true)
     }
     func updateOrientation() {
+        guard captureProfile.hasVideo else { return }
         if let orientation = CaptureOrientation.device(UIDevice.current.orientation) {
             hasOrientation = true; engine.setOrientation(orientation)
         } else if !hasOrientation, let orientation = UIApplication.shared.connectedScenes
@@ -133,10 +134,10 @@ final class BroadcasterModel: ObservableObject {
             if recordingOnly { sink = nil }
             else if transport == .srt {
                 let destination = try srtDestination()
-                sink = try ReconnectingPublisher(source: .srtPeerAcknowledgedWatermark) { ManualSrtPublisher(destination: destination, observe: $0) }
+                sink = try ReconnectingPublisher(source: .srtPeerAcknowledgedWatermark, hasVideo: ticket.profile.hasVideo) { ManualSrtPublisher(destination: destination, hasVideo: ticket.profile.hasVideo, observe: $0) }
             } else {
                 let destination = try destination()
-                sink = try ReconnectingPublisher(source: .rtmpPeerAcknowledgedWatermark) { ManualRtmpPublisher(destination: destination, observe: $0) }
+                sink = try ReconnectingPublisher(source: .rtmpPeerAcknowledgedWatermark, hasVideo: ticket.profile.hasVideo) { ManualRtmpPublisher(destination: destination, hasVideo: ticket.profile.hasVideo, observe: $0) }
             }
             if let sink, !destinationSelection.installManual(ticket, end: { sink.endDestination() }) {
                 engine.cancelPendingPreparation(ticket)
@@ -263,10 +264,19 @@ struct BroadcasterView: View {
         }
     }
     private var preview: some View {
-        CameraPreview(session: model.engine.session, orientation: model.snapshot.orientation)
+        Group {
+            if model.captureProfile.hasVideo {
+                CameraPreview(session: model.engine.session, orientation: model.snapshot.orientation)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "mic.fill").font(.largeTitle)
+                    Text("Audio only · 48 kHz mono")
+                }.frame(maxWidth: .infinity, maxHeight: .infinity).foregroundStyle(.white)
+            }
+        }
             .background(Color.black)
             .overlay(alignment: .topLeading) {
-                Text("LOCAL PREVIEW").font(.caption.bold()).padding(8).background(.black.opacity(0.6)).foregroundStyle(.white).padding()
+                Text(model.captureProfile.hasVideo ? "LOCAL PREVIEW" : "MICROPHONE").font(.caption.bold()).padding(8).background(.black.opacity(0.6)).foregroundStyle(.white).padding()
             }
     }
     private func elapsed(_ nanoseconds: UInt64?) -> String {
@@ -291,7 +301,7 @@ struct BroadcasterView: View {
                 ProgressView(value: Double(model.snapshot.level + 60), total: 60).accessibilityLabel("Microphone level")
                 Text("Mic \(Int(model.snapshot.level)) dBFS · encoded \(model.snapshot.encoded) · capture drops \(model.snapshot.captureDrops)").font(.caption.monospacedDigit())
                 destinationForm
-                Picker("Capture quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
+                Picker("Capture mode and quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
                     ForEach(model.captureProfiles, id: \.self) { Text($0.label).tag($0) }
                 }.disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.quality")
                 if model.destinationMode == .manual, let error = model.destinationError {

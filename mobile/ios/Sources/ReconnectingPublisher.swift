@@ -46,11 +46,11 @@ private final class NativePublishingAttempt: ReconnectAttemptPort {
     let sink: EncodedPublishingSink
     let context: ReconnectAttemptContext
     var codecEpoch: UInt64 { context.codecEpoch }
-    private var codecs: (MediaCodec, MediaCodec)?
+    private var codecs: (MediaCodec?, MediaCodec)?
     private let admission = AttemptStartFence()
     private let deliver: (@escaping () -> Void) -> Void
     private let closed: (ReconnectAttemptContext, SocketOutboundSample?) -> Void
-    init(sink: EncodedPublishingSink, context: ReconnectAttemptContext, video: MediaCodec, audio: MediaCodec,
+    init(sink: EncodedPublishingSink, context: ReconnectAttemptContext, video: MediaCodec?, audio: MediaCodec,
          deliver: @escaping (@escaping () -> Void) -> Void, closed: @escaping (ReconnectAttemptContext, SocketOutboundSample?) -> Void) {
         self.sink = sink; self.context = context; codecs = (video, audio); self.deliver = deliver; self.closed = closed
     }
@@ -88,6 +88,7 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     private let epochClosed: (UInt64) -> Void
     private let destinationEnded: () -> Void
     private let policy: ReconnectPolicyPort
+    private let hasVideo: Bool
     private lazy var timer = NativeDeadlineTimer(queue: queue)
     private lazy var controller = ReconnectController(policy: policy, now: { DispatchTime.now().uptimeNanoseconds },
         activeChanged: { [weak self] value in self?.setActive(value as? NativePublishingAttempt) },
@@ -110,12 +111,13 @@ final class ReconnectingPublisher: EncodedPublishingSink {
     private var broadcastEndedAtNs: UInt64? // lock only
     private var broadcastEndObserver: ((UInt64) -> Void)? // lock only, one cold listener
 
-    convenience init(graceMs: UInt64 = 90_000, source: NativeTransportRecoverySource, factory: @escaping AttemptFactory) throws {
-        try self.init(graceMs: graceMs, source: source, contextualFactory: { _, observe in factory(observe) })
+    convenience init(graceMs: UInt64 = 90_000, source: NativeTransportRecoverySource, hasVideo: Bool = true, factory: @escaping AttemptFactory) throws {
+        try self.init(graceMs: graceMs, source: source, hasVideo: hasVideo, contextualFactory: { _, observe in factory(observe) })
     }
     /// All observer/controller SDK work shares this serial owner. Cold fence
     /// callbacks can arrive from any thread and must never perform IO or joins.
     init(graceMs: UInt64 = 90_000, source: NativeTransportRecoverySource,
+         hasVideo: Bool = true,
          ownerQueue: DispatchQueue = DispatchQueue(label: "sapflow.logical-publisher", qos: .userInitiated),
          attemptReady: @escaping (ReconnectAttemptContext, UInt64) -> Void = { _, _ in },
          attemptInvalidated: @escaping (ReconnectAttemptContext) -> Void = { _ in },
@@ -123,6 +125,7 @@ final class ReconnectingPublisher: EncodedPublishingSink {
          destinationEnded: @escaping () -> Void = {},
          contextualFactory: @escaping ContextualAttemptFactory) throws {
         policy = try NativeReconnectPolicy(graceMs: graceMs, source: source)
+        self.hasVideo = hasVideo
         queue = ownerQueue; factory = contextualFactory
         self.attemptReady = attemptReady; self.attemptInvalidated = attemptInvalidated
         self.epochClosed = epochClosed; self.destinationEnded = destinationEnded
@@ -171,9 +174,10 @@ final class ReconnectingPublisher: EncodedPublishingSink {
         lock.lock(); defer { lock.unlock() }
         guard !fenced, released, currentEpoch == nil, epochCounter < UInt64.max else { throw ReconnectFailure.cleanupRetained }
         epochCounter += 1; currentEpoch = epochCounter; configured = false; codecClosing = false; failedContext = nil
-        currentStatus = "Waiting for this epoch's immutable video/audio configuration"
+        currentStatus = hasVideo ? "Waiting for this epoch's immutable video/audio configuration" : "Waiting for this epoch's immutable audio configuration"
     }
-    func configure(video: MediaCodec, audio: MediaCodec) throws {
+    func configure(video: MediaCodec?, audio: MediaCodec) throws {
+        guard hasVideo == (video != nil) else { throw CaptureFailure(message: "Reconnect codecs do not match the prepared capture") }
         lock.lock()
         guard let epoch = currentEpoch, !fenced, !codecClosing, !configured else { lock.unlock(); return }
         configured = true; released = false
@@ -198,6 +202,7 @@ final class ReconnectingPublisher: EncodedPublishingSink {
         }
     }
     func offer(_ sample: MediaSample) throws {
+        guard hasVideo || !sample.isVideo() else { throw CaptureFailure(message: "Video is forbidden in this audio-only session") }
         lock.lock(); let attempt = !fenced && !codecClosing && currentEpoch != nil ? active : nil; lock.unlock()
         try attempt?.sink.offer(sample)
     }

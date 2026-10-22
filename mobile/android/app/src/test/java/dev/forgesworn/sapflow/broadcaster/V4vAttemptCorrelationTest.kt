@@ -112,13 +112,18 @@ internal class V4vAttemptCorrelationTest {
         assertThrows(IllegalArgumentException::class.java) { correlation.matchFreshMedia(scope, receipt(scope.nonce, epoch = 0)) }
         assertThrows(IllegalArgumentException::class.java) { correlation.matchFreshMedia(scope, receipt(scope.nonce, mutateOrigin = { it["connectionAttemptId"] = JsonPrimitive("F".repeat(32)) })) }
     }
-    @Test fun initializationZeroAndNoAudioAreMetadataRatherThanAnInventedAudioProof() {
-        val correlation = V4vAttemptCorrelation { "1".repeat(32) }; val scope = correlation.begin(context(), grant()).scope
-        val matched = checkNotNull(correlation.matchFreshMedia(scope, receipt(scope.nonce, mutateMedia = {
-            it["initializationId"] = JsonPrimitive(0); it["initPath"] = JsonPrimitive("/live/event-fixture/f_init.mp4");
-            it["partPath"] = JsonPrimitive("/live/event-fixture/f_part4.mp4"); it["hasAudio"] = JsonPrimitive(false)
-        })))
-        assertFalse(matched.hasAudio); assertEquals(0L, matched.initializationId)
+    @Test fun expectedTopologyIsImmutableAndNeverInferredFromMissingVideo() {
+        val correlation = V4vAttemptCorrelation { "1".repeat(32) }
+        val scope = correlation.begin(context(), grant(), CaptureIntent.AudioOnly48kMono).scope
+        val audio = receipt(scope.nonce, mutateMedia = { it["hasVideo"] = JsonPrimitive(false) })
+        val matched = checkNotNull(correlation.matchFreshMedia(scope, audio))
+        assertFalse(matched.hasVideo); assertTrue(matched.hasAudio); assertSame(CaptureIntent.AudioOnly48kMono, scope.intent)
+        assertThrows(IllegalArgumentException::class.java) { correlation.matchFreshMedia(scope, receipt(scope.nonce)) }
+        assertThrows(IllegalArgumentException::class.java) { correlation.matchFreshMedia(scope, receipt(scope.nonce, mutateMedia = { it.remove("hasVideo") })) }
+        assertThrows(IllegalArgumentException::class.java) { correlation.matchFreshMedia(scope, receipt(scope.nonce, mutateMedia = { it["hasVideo"] = JsonPrimitive(false); it["hasAudio"] = JsonPrimitive(false) })) }
+        correlation.clear(); assertNull(correlation.matchFreshMedia(scope, audio))
+        val av = V4vAttemptCorrelation { "2".repeat(32) }; val avScope = av.begin(context(), grant()).scope
+        assertThrows(IllegalArgumentException::class.java) { av.matchFreshMedia(avScope, receipt(avScope.nonce, mutateMedia = { it["hasAudio"] = JsonPrimitive(false) })) }
     }
     @Test fun retiredDestinationFactoryCannotReplaceTheNewDestinationsScope() {
         var oldNonce = 0

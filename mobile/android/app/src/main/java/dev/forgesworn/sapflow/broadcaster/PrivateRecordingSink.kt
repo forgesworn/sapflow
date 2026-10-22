@@ -26,6 +26,7 @@ internal class PrivateRecordingSink(private val directory: Path, private val cat
     // Legacy callers did not supply quality/show ownership. Never invent their
     // profile; the application passes one explicit Show across rotation epochs.
     private val identity = show?.nextIdentity() ?: RecordingCatalogue.Identity(UUID.randomUUID().toString(), UUID.randomUUID().toString(), 0, "UNSPECIFIED")
+    private val intent = show?.intent ?: CaptureIntent.DEFAULT
     private val filename = identity.filename
     private val receipt = AtomicReference<RecordingCatalogue.Writer?>()
 
@@ -40,7 +41,7 @@ internal class PrivateRecordingSink(private val directory: Path, private val cat
                     receipt.set((catalogue ?: RecordingCatalogue(directory)).begin(identity))
                     check(!closed.get()) { "Recording stopped during storage admission" }
                 }
-                val native = muxer ?: NativeRecordingMuxer(true, true, 0uL, 8uL * 1024uL * 1024uL, 1000u).also { muxer = it }
+                val native = muxer ?: NativeRecordingMuxer(intent.hasVideo, intent.hasAudio, 0uL, 8uL * 1024uL * 1024uL, 1000u).also { muxer = it }
                 native.push(sample)
                 if (drain(native)) {
                     message.set("Recording private MP4 · ${native.stats().durationMs / 1000uL}s")

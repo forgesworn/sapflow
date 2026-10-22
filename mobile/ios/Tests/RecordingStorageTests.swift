@@ -3,7 +3,7 @@ import XCTest
 
 final class RecordingStorageTests: XCTestCase {
     func testSelectedProfileBudgetUsesSixtySecondsAndHeadroomWithoutLimitingDuration() throws {
-        for profile in CaptureProfile.allCases {
+        for profile in CaptureIntent.allCases {
             let budget = try RecordingStorage.budget(profile: profile)
             XCTAssertEqual(budget.horizonSeconds, 60)
             XCTAssertEqual(budget.payloadBytes, profile.elementaryBps * 60 / 8)

@@ -46,7 +46,8 @@ internal class EncodedAudioEpoch(
         try {
             check(descriptor == null) { "AAC format changed; prepare a new epoch" }
             val asc = format.getByteBuffer("csd-0") ?: error("Encoder supplied no AAC configuration")
-            require(asc.remaining() == 2) { "Only indexed AAC-LC configuration is supported" }
+            require(format.getInteger(MediaFormat.KEY_SAMPLE_RATE) == 48_000 && format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) == 1)
+            require(asc.remaining() == 2 && (asc.get(asc.position()).toInt() and 255) == 0x11 && (asc.get(asc.position() + 1).toInt() and 255) == 0x88) { "Only indexed AAC-LC configuration is supported" }
             val direct = ByteBuffer.allocateDirect(2).apply { put(asc.duplicate()); flip() }
             val config = RustCodec.aac(direct)
             descriptor = config

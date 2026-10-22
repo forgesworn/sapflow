@@ -64,6 +64,44 @@ enum CaptureProfile: String, CaseIterable {
 
 enum CaptureProfileFailure: Error, Equatable { case insufficientPublishCap }
 
+/// Frozen before permission, grant admission or native owner construction.
+/// Audio-only has no video profile, dimensions or orientation epoch.
+enum CaptureIntent: Equatable, Hashable, CaseIterable, RawRepresentable {
+    case audioVideo(CaptureProfile)
+    case audioOnly48kMono
+
+    static let defaultProfile: Self = .audioVideo(.defaultProfile)
+    static let allCases: [Self] = CaptureProfile.allCases.map(Self.audioVideo) + [.audioOnly48kMono]
+    // Camera quality names remain convenient at existing typed call sites.
+    static let sd480p30: Self = .audioVideo(.sd480p30)
+    static let hd720p30: Self = .audioVideo(.hd720p30)
+    static let fullHD1080p30: Self = .audioVideo(.fullHD1080p30)
+
+    init?(rawValue: String) {
+        if rawValue == "audio-48k-mono" { self = .audioOnly48kMono }
+        else if let video = CaptureProfile(rawValue: rawValue) { self = .audioVideo(video) }
+        else { return nil }
+    }
+    var rawValue: String { videoProfile?.rawValue ?? "audio-48k-mono" }
+    var videoProfile: CaptureProfile? {
+        if case let .audioVideo(profile) = self { return profile }
+        return nil
+    }
+    var hasVideo: Bool { videoProfile != nil }
+    var hasAudio: Bool { true }
+    var audioBps: UInt64 { 96_000 }
+    var elementaryBps: UInt64 { (videoProfile?.videoBps ?? 0) + audioBps }
+    /// Existing engineering admission allowance, not an audio wire-rate claim.
+    /// Qualify lower caps with the actual native TS/pacing path separately.
+    var minimumPublishBps: UInt64 { videoProfile?.minimumPublishBps ?? 1_000_000 }
+    var isEngineeringOnly: Bool { videoProfile?.isEngineeringOnly ?? false }
+    var label: String { videoProfile?.label ?? "Audio only · 48 kHz mono" }
+    var requiresCameraPermission: Bool { hasVideo }
+    func requireGrant(maxPublishBps: UInt64) throws {
+        guard maxPublishBps >= minimumPublishBps else { throw CaptureProfileFailure.insufficientPublishCap }
+    }
+}
+
 #if canImport(AVFoundation)
 import AVFoundation
 

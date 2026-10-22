@@ -3,7 +3,7 @@ package dev.forgesworn.sapflow.broadcaster
 /** Cold scalar authority only. No callback, renderer, recorder or sink work is
  * performed under this lock. Actual native cleanup releases each preparation. */
 internal class CaptureStartAdmission {
-    class Preparation internal constructor(val id: Long)
+    class Preparation internal constructor(val id: Long, val intent: CaptureIntent)
     class Start internal constructor(val id: Long, val preparation: Preparation, val epoch: Long)
     private var serial = 0L
     private var current: Preparation? = null
@@ -21,9 +21,9 @@ internal class CaptureStartAdmission {
     val idle: Boolean @Synchronized get() = current == null
     val preparation: Preparation? @Synchronized get() = current
     val elapsedPreparation: Preparation? @Synchronized get() = timingPreparation
-    @Synchronized fun reserve(): Preparation? {
+    @Synchronized fun reserve(intent: CaptureIntent = CaptureIntent.DEFAULT): Preparation? {
         if (current != null || serial == Long.MAX_VALUE) return null
-        return Preparation(++serial).also {
+        return Preparation(++serial, intent).also {
             timingPreparation = it; elapsed.reset()
             current = it; epoch = -1; live = true; candidate = true; committed = false
             prepared = false; pending = null; preserve = false; cleaned = false; cleaning = false

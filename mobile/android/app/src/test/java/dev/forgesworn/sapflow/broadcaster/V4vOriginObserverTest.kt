@@ -157,4 +157,27 @@ internal class V4vOriginObserverTest {
             assertEquals(1, creates.get()); assertEquals(0, confirmations.get())
         } finally { observer.close(); assertTrue(observer.awaitStopped(2000)) }
     }
+    @Test fun audioOnlyConfirmsNativePcmAfterActualCleanupWithoutVideoEvidence() {
+        val original = scope(); val scope = V4vCapturedAttempt(original.context, identity, original.nonce, CaptureIntent.AudioOnly48kMono)
+        val confirmed = CountDownLatch(1); val io = Io(::receipt)
+        val observer = V4vOriginObserver(profile, { _, answer -> answer(V4vObservationPermit(identity, "synthetic", Long.MAX_VALUE)) },
+            { true }, { _, _ -> V4vMatchedMedia(scope, 1, 1, 0, "/live/event-fixture/abc_init.mp4", "/live/event-fixture/abc_part1.mp4", true, false) },
+            { _, evidence, _ -> assertNull(evidence.video); assertEquals(0L, io.closed.count); confirmed.countDown() },
+            OriginDecoder { _, _, expected, _ ->
+                assertSame(CaptureIntent.AudioOnly48kMono, expected)
+                val pcm = DecodedProbeProgress(false, 0); pcm.output(4096, 0)
+                NativeOriginEvidence(null, pcm.evidence("native-aac", true))
+            }, { io })
+        try { observer.accepted(scope, scope.intent); assertTrue(confirmed.await(2, TimeUnit.SECONDS)) }
+        finally { observer.close(); assertTrue(observer.awaitStopped(2000)) }
+    }
+    @Test fun audioOnlyRefusesAnUnexpectedDecodedVideoTrack() {
+        val original = scope(); val scope = V4vCapturedAttempt(original.context, identity, original.nonce, CaptureIntent.AudioOnly48kMono)
+        val confirms = AtomicInteger(); val io = Io(::receipt)
+        val observer = V4vOriginObserver(profile, { _, answer -> answer(V4vObservationPermit(identity, "synthetic", Long.MAX_VALUE)) },
+            { true }, { _, _ -> V4vMatchedMedia(scope, 1, 1, 0, "/live/event-fixture/abc_init.mp4", "/live/event-fixture/abc_part1.mp4", true, false) },
+            { _, _, _ -> confirms.incrementAndGet() }, OriginDecoder { _, _, _, _ -> proof() }, { io })
+        try { observer.accepted(scope, scope.intent); assertTrue(io.closed.await(2, TimeUnit.SECONDS)); assertEquals(0, confirms.get()) }
+        finally { observer.close(); assertTrue(observer.awaitStopped(2000)) }
+    }
 }

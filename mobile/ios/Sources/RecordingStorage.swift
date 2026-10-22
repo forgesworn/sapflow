@@ -14,7 +14,7 @@ enum RecordingStorage {
         let budget: Budget
         let availableBytes: UInt64?
     }
-    static func budget(profile: CaptureProfile, horizonSeconds: UInt64 = 60,
+    static func budget(profile: CaptureIntent, horizonSeconds: UInt64 = 60,
                        reserveBytes: UInt64 = 32 * 1024 * 1024) throws -> Budget {
         guard horizonSeconds > 0 else { throw Failure.invalidBudget }
         let (bits, overflow) = profile.elementaryBps.multipliedReportingOverflow(by: horizonSeconds)

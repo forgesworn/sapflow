@@ -1,5 +1,6 @@
 import XCTest
 import CoreMedia
+import AudioToolbox
 @testable import SapflowBroadcaster
 
 private func originAssertFailure(_ result: Result<OriginDecodedMedia, OriginObservationFailure>, file: StaticString = #filePath, line: UInt = #line) {
@@ -26,23 +27,54 @@ private final class OriginTestClock {
 }
 private enum OriginFixture {
     static let nonce = String(repeating: "c", count: 32)
-    static func scope() throws -> V4vObservedAttempt {
-        try V4vObservedAttempt(local: OriginAttemptIdentity(destination: 1, codecEpoch: 2, token: 3, sdkGeneration: 4, sdkAttempt: 5), grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), nonce: nonce)
+    static func scope(expectedMedia: OriginExpectedMedia = .audioVideo) throws -> V4vObservedAttempt {
+        try V4vObservedAttempt(local: OriginAttemptIdentity(destination: 1, codecEpoch: 2, token: 3, sdkGeneration: 4, sdkAttempt: 5), grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), nonce: nonce, expectedMedia: expectedMedia)
     }
-    static func receipt(part: UInt64 = 2, initialization: UInt64 = 0, epoch: UInt64 = 1, nonce: String = nonce) throws -> V4vSessionReceipt {
-        let fresh = V4vFixture.edit(V4vFixture.fresh(part, initId: initialization), ["connectionEpoch": .integer(epoch)])
+    static func receipt(part: UInt64 = 2, initialization: UInt64 = 0, epoch: UInt64 = 1, nonce: String = nonce, expectedMedia: OriginExpectedMedia = .audioVideo) throws -> V4vSessionReceipt {
+        let fresh = V4vFixture.edit(V4vFixture.fresh(part, initId: initialization), ["connectionEpoch": .integer(epoch), "hasVideo": .bool(expectedMedia.hasVideo)])
         let origin = V4vFixture.edit(V4vFixture.origin(state: "live"), ["connectionEpoch": .integer(epoch), "connectionAttemptId": .string(nonce), "freshMedia": fresh])
         return try V4vSessionReceipt(V4vFixture.session(origin: origin))
     }
-    static func gate(_ clock: OriginTestClock) throws -> OriginConfirmationGate {
+    static func gate(_ clock: OriginTestClock, expectedMedia: OriginExpectedMedia = .audioVideo) throws -> OriginConfirmationGate {
         let gate = OriginConfirmationGate()
-        try gate.stage(OriginCurrentAuthority(attempt: scope(), grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: clock.base + 60_000_000_000), clock: { clock.base })
-        XCTAssertTrue(try gate.activate(scope(), clock: { clock.base }))
+        try gate.stage(OriginCurrentAuthority(attempt: scope(expectedMedia: expectedMedia), grant: V4vGrant(V4vFixture.grant(), nowMs: V4vFixture.time), expiresAtNs: clock.base + 60_000_000_000), clock: { clock.base })
+        XCTAssertTrue(try gate.activate(scope(expectedMedia: expectedMedia), clock: { clock.base }))
         return gate
     }
 }
 
 final class OriginObservationPolicyTests: XCTestCase {
+    func testAudioOnlyNativeDescriptionRefusesContradictoryProfileAndFormat() throws {
+        for flags in [UInt32(0), 2] {
+            XCTAssertNoThrow(try OriginAACDescription.requireAudioOnly(formatID: kAudioFormatMPEG4AAC, objectFlags: flags, rate: 48000, channels: 1, framesPerPacket: 1024))
+        }
+        for flags in [UInt32(1), 3, 4, 5, .max] {
+            XCTAssertThrowsError(try OriginAACDescription.requireAudioOnly(formatID: kAudioFormatMPEG4AAC, objectFlags: flags, rate: 48000, channels: 1, framesPerPacket: 1024))
+        }
+        let malformed: [(UInt32, Double, UInt32, UInt32)] = [(kAudioFormatLinearPCM, 48000, 1, 1024), (kAudioFormatMPEG4AAC, 44100, 1, 1024), (kAudioFormatMPEG4AAC, 48000, 2, 1024), (kAudioFormatMPEG4AAC, 48000, 1, 960)]
+        for (format, rate, channels, frames) in malformed {
+            XCTAssertThrowsError(try OriginAACDescription.requireAudioOnly(formatID: format, objectFlags: 0, rate: rate, channels: channels, framesPerPacket: frames))
+        }
+    }
+    func testAudioOnlySelectionRequiresExactCapturedExpectationAndNonce() throws {
+        let audio = try OriginFixture.scope(expectedMedia: .audioOnly48kMono), video = try OriginFixture.scope()
+        XCTAssertNotEqual(audio, video)
+        XCTAssertNoThrow(try OriginMediaSelection.match(OriginFixture.receipt(expectedMedia: .audioOnly48kMono), attempt: audio, nowMs: V4vFixture.time))
+        XCTAssertThrowsError(try OriginMediaSelection.match(OriginFixture.receipt(), attempt: audio, nowMs: V4vFixture.time))
+        XCTAssertThrowsError(try OriginMediaSelection.match(OriginFixture.receipt(expectedMedia: .audioOnly48kMono), attempt: video, nowMs: V4vFixture.time))
+        XCTAssertThrowsError(try OriginMediaSelection.match(OriginFixture.receipt(nonce: String(repeating: "d", count: 32), expectedMedia: .audioOnly48kMono), attempt: audio, nowMs: V4vFixture.time))
+        let clock = OriginTestClock(), gate = try OriginFixture.gate(clock, expectedMedia: .audioOnly48kMono)
+        XCTAssertThrowsError(try gate.confirm(video, beforeNs: .max, clock: { clock.base }) { _, _ in XCTFail("Topology changed under same local scope") })
+        XCTAssertNoThrow(try gate.confirm(audio, beforeNs: .max, clock: { clock.base }) { _, _ in })
+    }
+    func testAudioOnlyProofCountsPCMWithoutFabricatingVideoOrHardware() {
+        let audio = OriginDecodedMedia(videoOutputs: 0, pcmFrames: 7104, pcmOutputs: 1, hardwareVideo: false)
+        XCTAssertTrue(audio.sufficient(for: .audioOnly48kMono)); XCTAssertFalse(audio.sufficient)
+        XCTAssertFalse(OriginDecodedMedia(videoOutputs: 0, pcmFrames: 2047, pcmOutputs: 1, hardwareVideo: false).sufficient(for: .audioOnly48kMono))
+        XCTAssertFalse(OriginDecodedMedia(videoOutputs: 0, pcmFrames: 7104, pcmOutputs: 1, hardwareVideo: true).sufficient(for: .audioOnly48kMono))
+        XCTAssertFalse(OriginDecodedMedia(videoOutputs: 2, pcmFrames: 7104, pcmOutputs: 1, hardwareVideo: true).sufficient(for: .audioOnly48kMono))
+        XCTAssertFalse(OriginDecodedMedia(videoOutputs: 0, pcmFrames: 7104, pcmOutputs: 0, hardwareVideo: false).sufficient(for: .audioOnly48kMono))
+    }
     func testStatusCompositionRejectsAnotherProfileBeforeAllocatingClient() throws {
         final class Store: V4vJournalStore { func load() -> V4vJSON? { nil }; func save(_ next: V4vJSON) {} }
         final class NeverClient: OriginStatusControlExecuting {
@@ -71,11 +103,11 @@ final class OriginObservationPolicyTests: XCTestCase {
         XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 1499, maxPublishBps: 4_000_000))
         XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 4_194_305, maxPublishBps: 4_000_000))
         XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 1500, maxPublishBps: 3_999_999))
-        let low = try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 1_000_007, captureProfile: .sd480p30)
+        let low = try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 1_000_007, captureProfile: .audioVideo(.sd480p30))
         XCTAssertEqual(low.bandwidthBytesPerSecond, 125_000); XCTAssertEqual(low.queueBytes, 65_536)
-        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 999_999, captureProfile: .sd480p30))
-        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 7_999_999, captureProfile: .fullHD1080p30))
-        XCTAssertEqual(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 8_000_007, captureProfile: .fullHD1080p30).bandwidthBytesPerSecond, 1_000_000)
+        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 999_999, captureProfile: .audioVideo(.sd480p30)))
+        XCTAssertThrowsError(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 7_999_999, captureProfile: .audioVideo(.fullHD1080p30)))
+        XCTAssertEqual(try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 8_000_007, captureProfile: .audioVideo(.fullHD1080p30)).bandwidthBytesPerSecond, 1_000_000)
     }
     func testPublishingExpiryUsesEffectiveClockAfterWallRollback() throws {
         final class Store: V4vJournalStore { var value: V4vJSON?; func load() -> V4vJSON? { value }; func save(_ next: V4vJSON) { value = next } }
@@ -146,6 +178,7 @@ final class OriginObservationPolicyTests: XCTestCase {
         XCTAssertThrowsError(try OriginMediaBody.response(status: 200, length: 5, mime: "video/mp4", limit: 4))
         XCTAssertThrowsError(try OriginMediaBody.response(status: 200, length: 1, mime: "text/html", limit: 4))
         XCTAssertNoThrow(try OriginMediaBody.response(status: 200, length: -1, mime: "application/mp4", limit: 4))
+        XCTAssertNoThrow(try OriginMediaBody.response(status: 200, length: 4, mime: "audio/mp4", limit: 4))
     }
     func testCoalescedPCMCountsNativeFramesAndExactTiming() throws {
         var pcm = OriginPCMProgress()
@@ -158,6 +191,40 @@ final class OriginObservationPolicyTests: XCTestCase {
             var pcm = OriginPCMProgress()
             XCTAssertThrowsError(try pcm.accept(frames: 2048, bytes: variant == 0 ? 2 : 4096, bytesPerFrame: 2, rate: 48000, first: .zero, last: CMTime(value: variant == 1 ? 4095 : 2047, timescale: 48000), firstDuration: CMTime(value: 1, timescale: 48000), lastDuration: CMTime(value: variant == 2 ? 2 : 1, timescale: 48000)))
         }
+    }
+    private func pcmBlock(_ progress: inout OriginPCMProgress, count: Int = 1024, start: CMTime = .zero) throws {
+        let frame = CMTime(value: 1, timescale: 48000)
+        try progress.accept(frames: count, bytes: count * 2, bytesPerFrame: 2, rate: 48000,
+            first: start, last: CMTimeAdd(start, CMTime(value: Int64(count - 1), timescale: 48000)),
+            firstDuration: frame, lastDuration: frame)
+    }
+    func testAudioOnlyPCMRequiresExactRationalContiguityOrOneCoalescedExtent() throws {
+        var split = OriginPCMProgress(requireContiguous: true)
+        try pcmBlock(&split)
+        // Equivalent rational times must compare equal without Double rounding.
+        try pcmBlock(&split, start: CMTime(value: 2048, timescale: 96000))
+        XCTAssertEqual(split.frames, 2048); XCTAssertEqual(split.outputs, 2)
+        var coalesced = OriginPCMProgress(requireContiguous: true)
+        try pcmBlock(&coalesced, count: 7104)
+        XCTAssertEqual(coalesced.frames, 7104); XCTAssertEqual(coalesced.outputs, 1)
+    }
+    func testAudioOnlyPCMGapsOverlapsAndRepeatsCannotAccumulateProof() throws {
+        // No one-frame quantisation allowance: native CMTime is rational.
+        for nextStart: Int64 in [0, 1023, 1025, 1072, 48000] {
+            var pcm = OriginPCMProgress(requireContiguous: true)
+            try pcmBlock(&pcm)
+            XCTAssertThrowsError(try pcmBlock(&pcm, start: CMTime(value: nextStart, timescale: 48000)))
+            XCTAssertEqual(pcm.frames, 1024); XCTAssertEqual(pcm.outputs, 1)
+            // A refused block must not advance or poison the accepted extent.
+            try pcmBlock(&pcm, start: CMTime(value: 1024, timescale: 48000))
+            XCTAssertEqual(pcm.frames, 2048)
+        }
+    }
+    func testLegacyAVPCMRetainsItsNonoverlapOnlyContract() throws {
+        var pcm = OriginPCMProgress()
+        try pcmBlock(&pcm)
+        try pcmBlock(&pcm, start: CMTime(value: 2048, timescale: 48000))
+        XCTAssertEqual(pcm.frames, 2048)
     }
     func testConfirmationUsesCapturedSDKFieldsAndRefusesFenceOrExpiry() throws {
         let clock = OriginTestClock(), gate = try OriginFixture.gate(clock), captured = try OriginFixture.scope()
@@ -326,10 +393,14 @@ private final class OriginFakeMedia: OriginMediaFetching {
 private final class OriginFakeDecoder: OriginMediaDecoding {
     let callbacks = OriginTestBox<[(Result<OriginDecodedMedia, OriginObservationFailure>) -> Void]>([])
     let cleaned = OriginTestBox(true)
+    let expectations = OriginTestBox<[OriginExpectedMedia]>([])
     private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { cleaned.value }
     func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func decode(_ data: Data, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) { callbacks.update { $0.append(completion) } }
+    func decode(_ data: Data, expectedMedia: OriginExpectedMedia, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
+        expectations.update { $0.append(expectedMedia) }; callbacks.update { $0.append(completion) }
+    }
     func close() { if cleaned.value { cleanup.complete() } }
     func completeCleanup() { cleaned.value = true; cleanup.complete() }
     func reply(_ result: Result<OriginDecodedMedia, OriginObservationFailure> = .success(OriginDecodedMedia(videoOutputs: 2, pcmFrames: 7104, pcmOutputs: 1, hardwareVideo: true))) { callbacks.value[0](result) }
@@ -346,11 +417,56 @@ final class OriginObservationPipelineTests: XCTestCase {
         let confirmations = OriginTestBox<[OriginAttemptIdentity]>([])
         let gate: OriginConfirmationGate
         let observer: V4vOriginObserver
-        init() throws {
-            gate = try OriginFixture.gate(clock)
+        init(expectedMedia: OriginExpectedMedia = .audioVideo) throws {
+            gate = try OriginFixture.gate(clock, expectedMedia: expectedMedia)
             let values = confirmations
-            observer = try V4vOriginObserver(attempt: OriginFixture.scope(), profile: V4vFixture.profile(), gate: gate, status: status, media: media, decoder: decoder, clock: clock.now, confirm: { value, _ in values.update { $0.append(value) } })
+            observer = try V4vOriginObserver(attempt: OriginFixture.scope(expectedMedia: expectedMedia), profile: V4vFixture.profile(), gate: gate, status: status, media: media, decoder: decoder, clock: clock.now, confirm: { value, _ in values.update { $0.append(value) } })
         }
+    }
+    func testAudioOnlyRequiresActualPCMAndFreshMatchingPostStatus() throws {
+        let h = try Harness(expectedMedia: .audioOnly48kMono), done = expectation(description: "PCM confirmed")
+        h.observer.start { result in originAssertSuccess(result); done.fulfill() }
+        until { h.status.pending.value.count == 1 }; h.status.reply(0, try OriginFixture.receipt(expectedMedia: .audioOnly48kMono))
+        until { h.decoder.callbacks.value.count == 1 }
+        XCTAssertEqual(h.decoder.expectations.value, [.audioOnly48kMono]); XCTAssertTrue(h.confirmations.value.isEmpty)
+        h.decoder.reply(.success(OriginDecodedMedia(videoOutputs: 0, pcmFrames: 7104, pcmOutputs: 1, hardwareVideo: false)))
+        until { h.status.pending.value.count == 2 }; XCTAssertTrue(h.confirmations.value.isEmpty)
+        h.status.reply(1, try OriginFixture.receipt(part: 5, expectedMedia: .audioOnly48kMono))
+        wait(for: [done], timeout: 1); XCTAssertEqual(h.confirmations.value.first?.sdkAttempt, 5)
+        XCTAssertEqual(h.confirmations.value.count, 1); XCTAssertTrue(h.observer.cleanupComplete)
+    }
+    func testAudioOnlyRejectsTopologyOrNonceChangeAfterPCM() throws {
+        for topologyChange in [false, true] {
+            let h = try Harness(expectedMedia: .audioOnly48kMono), done = expectation(description: "changed media refused")
+            h.observer.start { result in originAssertFailure(result); done.fulfill() }
+            until { h.status.pending.value.count == 1 }; h.status.reply(0, try OriginFixture.receipt(expectedMedia: .audioOnly48kMono))
+            until { h.decoder.callbacks.value.count == 1 }
+            h.decoder.reply(.success(OriginDecodedMedia(videoOutputs: 0, pcmFrames: 7104, pcmOutputs: 1, hardwareVideo: false)))
+            until { h.status.pending.value.count == 2 }
+            h.status.reply(1, try OriginFixture.receipt(part: 5, nonce: topologyChange ? OriginFixture.nonce : String(repeating: "d", count: 32), expectedMedia: topologyChange ? .audioVideo : .audioOnly48kMono))
+            wait(for: [done], timeout: 1); XCTAssertTrue(h.confirmations.value.isEmpty)
+        }
+    }
+    func testAudioOnlyStopAndExpiryRefuseLatePCM() throws {
+        for stop in [true, false] {
+            let h = try Harness(expectedMedia: .audioOnly48kMono), done = expectation(description: "cold fence refused PCM")
+            h.observer.start { result in originAssertFailure(result); done.fulfill() }
+            until { h.status.pending.value.count == 1 }
+            h.status.reply(0, try OriginFixture.receipt(expectedMedia: .audioOnly48kMono), expiry: h.clock.base + 1_000_000_000)
+            until { h.decoder.callbacks.value.count == 1 }
+            if stop { h.observer.cancel() } else { h.clock.offset.value = 2_000_000_000 }
+            h.decoder.reply(.success(OriginDecodedMedia(videoOutputs: 0, pcmFrames: 7104, pcmOutputs: 1, hardwareVideo: false)))
+            wait(for: [done], timeout: 1); XCTAssertTrue(h.confirmations.value.isEmpty)
+            XCTAssertEqual(h.status.pending.value.count, 1)
+        }
+    }
+    func testAudioOnlyCannotUseVideoProofAsFallback() throws {
+        let h = try Harness(expectedMedia: .audioOnly48kMono), done = expectation(description: "AV proof refused")
+        h.observer.start { result in originAssertFailure(result); done.fulfill() }
+        until { h.status.pending.value.count == 1 }; h.status.reply(0, try OriginFixture.receipt(expectedMedia: .audioOnly48kMono))
+        until { h.decoder.callbacks.value.count == 1 }; h.decoder.reply()
+        wait(for: [done], timeout: 1); XCTAssertTrue(h.confirmations.value.isEmpty)
+        XCTAssertEqual(h.status.pending.value.count, 1)
     }
     func testMetadataDoesNotConfirmBeforeNativeDecodeAndFreshPostStatus() throws {
         let h = try Harness(), done = expectation(description: "confirmed")

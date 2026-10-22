@@ -30,7 +30,7 @@ final class RecordingCaptureAdmission {
     private var serial: UInt64 = 0
     private var owner: (ticket: Ticket, phase: Phase, cancelled: Bool)?
     private func locked<T>(_ action: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return action() }
-    static func storageAvailable(profile: CaptureProfile, bytes: UInt64?) -> Bool {
+    static func storageAvailable(profile: CaptureIntent, bytes: UInt64?) -> Bool {
         guard let bytes, let budget = try? RecordingStorage.budget(profile: profile) else { return false }
         return bytes > 200 * 1024 * 1024 && bytes >= budget.requiredBytes
     }

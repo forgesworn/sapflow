@@ -39,10 +39,11 @@ final class V4vPublishingLifetime: @unchecked Sendable {
 /// existing reconnect, SRT and compressed-media path. Observer failures affect
 /// decoded confirmation only; independent capture/recording keep their owners.
 final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
-    typealias TransportFactory = (ManualSrtDestination, SrtPublishingLimits, @escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> EncodedPublishingSink
+    typealias TransportFactory = (ManualSrtDestination, SrtPublishingLimits, Bool, @escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> EncodedPublishingSink
     typealias ObserverFactory = (V4vObservedAttempt, OriginConfirmationGate, @escaping (OriginAttemptIdentity, UInt64) throws -> Void) throws -> V4vOriginObserver
     private let destination: UInt64
-    private let captureProfile: CaptureProfile
+    private let captureProfile: CaptureIntent
+    private let expectedMedia: OriginExpectedMedia
     private let owner: DispatchQueue
     private let clock: () -> V4vClock
     private let lifetime: V4vPublishingLifetime
@@ -57,13 +58,14 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
 
     init(destination: UInt64, permit: V4vPublishingGrantPermit, profile: V4vConnectorProfile,
          engine: V4vSessionEngine, owner: DispatchQueue, slot: V4vObservationSlot, clock: @escaping () -> V4vClock,
-         captureProfile: CaptureProfile = .defaultProfile,
-         transport: @escaping TransportFactory = { ManualSrtPublisher(destination: $0, limits: $1, observe: $2) },
+         captureProfile: CaptureIntent = .defaultProfile,
+         transport: @escaping TransportFactory = { ManualSrtPublisher(destination: $0, limits: $1, hasVideo: $2, observe: $3) },
          observation: ObserverFactory? = nil) throws {
         try engine.requireProfile(profile)
-        guard destination > 0 else { throw OriginObservationFailure.scope }
+        guard destination > 0, captureProfile.hasAudio else { throw OriginObservationFailure.scope }
         _ = try SrtPublishingLimits.scoped(maxQueueBytes: permit.grant.maxQueueBytes, maxPublishBps: permit.grant.maxPublishBps, captureProfile: captureProfile)
         self.captureProfile = captureProfile
+        expectedMedia = captureProfile.hasVideo ? .audioVideo : .audioOnly48kMono
         self.destination = destination; self.owner = owner; self.slot = slot; self.clock = clock; self.transport = transport
         lifetime = try V4vPublishingLifetime(permit, nowNs: clock().monotonicNs)
         expiryTimer = NativeDeadlineTimer(queue: expiryQueue)
@@ -72,7 +74,7 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
                 status: V4vOriginStatusHTTP(profile: profile, engine: engine, owner: owner, clock: clock),
                 owner: owner, clock: clock, confirm: confirm)
         }
-        logical = try ReconnectingPublisher(graceMs: permit.grant.graceMs, source: .srtPeerAcknowledgedWatermark, ownerQueue: owner,
+        logical = try ReconnectingPublisher(graceMs: permit.grant.graceMs, source: .srtPeerAcknowledgedWatermark, hasVideo: captureProfile.hasVideo, ownerQueue: owner,
             attemptReady: { [weak self] in self?.ready($0, nowNs: $1) },
             attemptInvalidated: { [weak self] in self?.invalidated($0) },
             epochClosed: { [weak self] in self?.epochClosed($0) },
@@ -90,13 +92,13 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
     private func make(_ context: ReconnectAttemptContext, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> EncodedPublishingSink {
         dispatchPrecondition(condition: .onQueue(owner))
         let permit = try lifetime.current(nowNs: clock().monotonicNs)
-        let attempt = try V4vObservedAttempt(local: local(context), grant: permit.grant, nonce: V4vObservedAttempt.randomNonce())
+        let attempt = try V4vObservedAttempt(local: local(context), grant: permit.grant, nonce: V4vObservedAttempt.randomNonce(), expectedMedia: expectedMedia)
         try gate.stage(OriginCurrentAuthority(attempt: attempt, grant: permit.grant, expiresAtNs: permit.expiresAtNs), clock: { self.clock().monotonicNs })
         do {
             let destination = try ManualSrtDestination(endpoint: permit.grant.endpoint, streamID: attempt.wireStreamID(grant: permit.grant), passphrase: permit.grant.passphrase, allowPlaintext: false)
             let limits = try SrtPublishingLimits.scoped(maxQueueBytes: permit.grant.maxQueueBytes, maxPublishBps: permit.grant.maxPublishBps, captureProfile: captureProfile)
             currentAttempt = attempt
-            return try transport(destination, limits, observe)
+            return try transport(destination, limits, captureProfile.hasVideo, observe)
         } catch { gate.invalidate(attempt: attempt); throw error }
     }
     private func ready(_ context: ReconnectAttemptContext, nowNs: UInt64) {
@@ -162,7 +164,10 @@ final class V4vObservedPublisher: EncodedPublishingSink, @unchecked Sendable {
     func observeBroadcastEnd(_ completion: @escaping (UInt64) -> Void) { logical.observeBroadcastEnd(completion) }
     func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) { logical.readSocketOutbound(completion: completion) }
     func start() throws { _ = try lifetime.current(nowNs: clock().monotonicNs); try logical.start() }
-    func configure(video: MediaCodec, audio: MediaCodec) throws { try logical.configure(video: video, audio: audio) }
+    func configure(video: MediaCodec?, audio: MediaCodec) throws {
+        guard captureProfile.hasVideo == (video != nil) else { throw OriginObservationFailure.scope }
+        try logical.configure(video: video, audio: audio)
+    }
     func offer(_ sample: MediaSample) throws { try logical.offer(sample) }
     func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void) { logical.finishEpoch(completion: completion) }
     func closeCodecEpoch() { logical.closeCodecEpoch() }

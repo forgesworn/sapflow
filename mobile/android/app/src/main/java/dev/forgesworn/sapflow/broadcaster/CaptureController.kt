@@ -147,6 +147,7 @@ class CaptureController(private val context: Context) {
     private var renderer: CameraGlRenderer? = null
     private var plan: OrientationPlan? = null
     private var captureProfile = CaptureProfile.DEFAULT
+    @Volatile private var captureIntent: CaptureIntent = CaptureIntent.DEFAULT
     private val prepareAdmission = CapturePrepareAdmission()
     private val startAdmission = CaptureStartAdmission()
     private var preparation: CaptureStartAdmission.Preparation? = null // codec owner only
@@ -221,10 +222,10 @@ class CaptureController(private val context: Context) {
             elapsed.captureMs, elapsed.broadcastMs, elapsed.uncertain, socket)
     }
 
-    internal fun prepare(previewSurface: Surface, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, profile: CaptureProfile = CaptureProfile.DEFAULT): CaptureStartAdmission.Preparation? {
+    internal fun prepare(previewSurface: Surface?, publisher: () -> EncodedSink?, recorder: () -> EncodedSink?, intent: CaptureIntent = CaptureIntent.DEFAULT): CaptureStartAdmission.Preparation? {
         val canPrepare = snapshot().canPrepare
-        val ticket = startAdmission.reserve() ?: return null
-        val admitted = try { prepareAdmission.submit(profile, canPrepare, { handler.post(it) }) admitted@{ requestedProfile ->
+        val ticket = startAdmission.reserve(intent) ?: return null
+        val admitted = try { prepareAdmission.submit(intent, canPrepare, { handler.post(it) }) admitted@{ requestedIntent ->
             if (shutdownRequested || stage !in listOf(CaptureStage.IDLE, CaptureStage.ERROR)) { startAdmission.abandon(ticket); return@admitted }
             if (videoEncoder != null || renderer != null || teardownStarted) {
                 message = lifecycle.message("Previous native cleanup is unfinished; capture cannot restart")
@@ -236,7 +237,8 @@ class CaptureController(private val context: Context) {
             cleanupExpired = false; stopFailed = false
             publishingSession?.stopDestination(); publishingSession = null
             telemetryDestination = TelemetryDestination(ticket, null, false)
-            captureProfile = requestedProfile // Retained through every orientation restart.
+            captureIntent = requestedIntent // Exact immutable ticket, including topology.
+            requestedIntent.videoProfile?.let { captureProfile = it }
             publishFactory = publisher
             recordFactory = recorder
             autoStart = false
@@ -246,12 +248,12 @@ class CaptureController(private val context: Context) {
         return ticket
     }
 
-    private fun prepareEpoch(previewSurface: Surface) {
+    private fun prepareEpoch(previewSurface: Surface?) {
         if (shutdownRequested || cleanupExpired) return
         val intent = preparation ?: return
         if (!startAdmission.beginEpoch(intent, generation + 1)) return
         stage = CaptureStage.PREPARING
-        message = "Preparing hardware pixel rotation and native audio"
+        message = if (captureIntent.hasVideo) "Preparing hardware pixel rotation and native audio" else "Preparing microphone and native AAC"
         generation++
         drainGeneration = generation
         captureEpoch = drainGeneration
@@ -286,9 +288,9 @@ class CaptureController(private val context: Context) {
                 telemetryDestination = TelemetryDestination(intent, (publishingSink as? SocketOutputProvider)?.socketOutput, publishingSink != null)
             }
             val publishingEpoch = generation
-            publishingSink?.setKeyframeRequester { handler.post {
+            if (captureIntent.hasVideo) publishingSink?.setKeyframeRequester { handler.post {
                 val now = System.nanoTime()
-                if (publishingEpoch == generation && stage == CaptureStage.CAPTURING &&
+                if (captureIntent.hasVideo && publishingEpoch == generation && stage == CaptureStage.CAPTURING &&
                     (lastTransportSyncNs == Long.MIN_VALUE || now - lastTransportSyncNs >= 1_000_000_000L)) {
                     lastTransportSyncNs = now
                     try {
@@ -314,7 +316,7 @@ class CaptureController(private val context: Context) {
 
     internal fun orientationChanged(pose: CardinalPose) {
         handler.post {
-            if (shutdownRequested) return@post
+            if (shutdownRequested || !captureIntent.hasVideo) return@post
             val active = videoEncoder != null || renderer != null
             val ticket = restart.request(pose, active, System.nanoTime())
             if (ticket != null) {
@@ -332,7 +334,23 @@ class CaptureController(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    private fun prepareOnHandler(previewSurface: Surface, token: Long) {
+    private fun prepareOnHandler(previewSurface: Surface?, token: Long) {
+        if (!captureIntent.hasVideo) {
+            plan = null; preview = null; recordingFailed = false
+            videoEncoderName = "Not used · microphone only"; rendererStatus = "No camera or GPU"
+            orientationStatus = "Microphone only · AAC-LC 48 kHz mono · 96 kbit/s"
+            rendererStopped = true; rendererClosed = true; cameraClosed = true
+            prepareAudio(token)
+            val intent = preparation
+            if (intent == null || !startAdmission.prepared(intent, token)) {
+                stopOnHandler("Capture approval ended before microphone preparation completed", false); return
+            }
+            stage = CaptureStage.PREPARED
+            traceLifecycle(CaptureLifecycleDiagnostics.Code.PREPARED)
+            message = "Ready: microphone and native AAC"
+            return
+        }
+        requireNotNull(previewSurface) { "Preview surface is unavailable" }
         require(previewSurface.isValid) { "Preview surface is unavailable" }
         preview = previewSurface
         recordingFailed = false
@@ -382,31 +400,8 @@ class CaptureController(private val context: Context) {
         }, null, null, PlatformCodec.CONFIGURE_FLAG_ENCODE)
         encoderSurface = video.createInputSurface()
 
-        val audio = PlatformCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-        audioEncoder = audio
-        audioEncoderName = audio.name
-        audioTailRequested = AtomicBoolean(false)
-        audioInputAdmission = AtomicBoolean(true)
-        encodedAudio = createAudioEpoch(token)
-        audio.setCallback(encodedAudio!!, audioHandler)
-        audio.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 48_000, 1).apply {
-            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-            setInteger(MediaFormat.KEY_BIT_RATE, captureProfile.audioBps)
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2048)
-        }, null, null, PlatformCodec.CONFIGURE_FLAG_ENCODE)
-        val minAudio = AudioRecord.getMinBufferSize(48_000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        require(minAudio > 0) { "48 kHz mono microphone capture is unavailable" }
-        audioRecord = AudioRecord.Builder()
-            .setAudioSource(MediaRecorder.AudioSource.MIC)
-            .setAudioFormat(AudioFormat.Builder().setSampleRate(48_000).setChannelMask(AudioFormat.CHANNEL_IN_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-            .setBufferSizeInBytes(maxOf(minAudio * 2, 8192)).build()
-        require(audioRecord?.state == AudioRecord.STATE_INITIALIZED) { "Microphone initialisation failed" }
-        require(audioRecord?.sampleRate == 48_000 && audioRecord?.channelCount == 1 && audioRecord?.audioFormat == AudioFormat.ENCODING_PCM_16BIT) { "Microphone changed the requested 48k mono PCM format" }
-        queues = NativeSampleFanout(4uL * 1024uL * 1024uL, 8uL * 1024uL * 1024uL, 2000u, true)
-        publishing = QueueDrainer(handler, queues!!, true, publishingSink, { fail(it) })
-        recording = QueueDrainer(handler, queues!!, false, recordingSink, ::failRecording)
+        prepareAudio(token)
         video.start()
-        audio.start()
         val mapper = if (Build.VERSION.SDK_INT >= 33) CameraTimestampMapper.monotonic() else CameraTimestampMapper.realtime()
         renderer = CameraGlRenderer(selected.cameraWidth, selected.cameraHeight, selected, mapper, token, handler,
             onReady = { input, diagnostic ->
@@ -473,6 +468,36 @@ class CaptureController(private val context: Context) {
             } })
     }
 
+    private fun prepareAudio(token: Long) {
+        if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            throw SecurityException("Microphone permission is no longer available. Prepare again.")
+        }
+        val audio = PlatformCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        audioEncoder = audio
+        audioEncoderName = audio.name
+        audioTailRequested = AtomicBoolean(false)
+        audioInputAdmission = AtomicBoolean(true)
+        encodedAudio = createAudioEpoch(token)
+        audio.setCallback(encodedAudio!!, audioHandler)
+        audio.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 48_000, 1).apply {
+            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, captureIntent.audioBps)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2048)
+        }, null, null, PlatformCodec.CONFIGURE_FLAG_ENCODE)
+        val minAudio = AudioRecord.getMinBufferSize(48_000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        require(minAudio > 0) { "48 kHz mono microphone capture is unavailable" }
+        audioRecord = AudioRecord.Builder()
+            .setAudioSource(MediaRecorder.AudioSource.MIC)
+            .setAudioFormat(AudioFormat.Builder().setSampleRate(48_000).setChannelMask(AudioFormat.CHANNEL_IN_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+            .setBufferSizeInBytes(maxOf(minAudio * 2, 8192)).build()
+        require(audioRecord?.state == AudioRecord.STATE_INITIALIZED) { "Microphone initialisation failed" }
+        require(audioRecord?.sampleRate == 48_000 && audioRecord?.channelCount == 1 && audioRecord?.audioFormat == AudioFormat.ENCODING_PCM_16BIT) { "Microphone changed the requested 48k mono PCM format" }
+        queues = NativeSampleFanout(4uL * 1024uL * 1024uL, 8uL * 1024uL * 1024uL, 2000u, captureIntent.hasVideo)
+        publishing = QueueDrainer(handler, queues!!, true, publishingSink, { fail(it) })
+        recording = QueueDrainer(handler, queues!!, false, recordingSink, ::failRecording)
+        audio.start()
+    }
+
     fun start() { startAdmission.preparation?.let(::start) }
     internal fun start(preparation: CaptureStartAdmission.Preparation) {
         val ticket = startAdmission.start(preparation) ?: return
@@ -485,10 +510,10 @@ class CaptureController(private val context: Context) {
         val token = generation
         try {
             clock.start()
-            renderer!!.startEncoding(encoderSurface!!, token) {
-                if (token != generation || stage != CaptureStage.PREPARED || !startAdmission.permits(ticket)) return@startEncoding
+            fun admit() {
+                if (token != generation || stage != CaptureStage.PREPARED || !startAdmission.permits(ticket)) return
                 try {
-                    check(plan?.pose == restart.desiredPose) { "Pose changed before encoder start" }
+                    check(!captureIntent.hasVideo || plan?.pose == restart.desiredPose) { "Pose changed before encoder start" }
                     restart.pending?.let { check(restart.complete(it.token, System.nanoTime()) != null) { "Orientation restart deadline expired" } }
                     restartDeadline?.let(handler::removeCallbacks); restartDeadline = null
                     recovery.begin(token)
@@ -501,7 +526,7 @@ class CaptureController(private val context: Context) {
                     if (!startAdmission.commit(ticket)) {
                         autoStart = false; restart.cancel()
                         stopOnHandler("Destination ended before capture admission; closing prepared recording owners", false)
-                        return@startEncoding
+                        return
                     }
                     publishingSink?.configure(videoCodec, audioCodec)
                     publishingSink?.start()
@@ -511,12 +536,13 @@ class CaptureController(private val context: Context) {
                     startPending = false
                     publishStatus = publishingSink?.status ?: "No publisher attached · SDK validation only"
                     recordStatus = recordingSink?.status ?: "No recorder attached · no file is being written"
-                    message = "Capturing upright hardware video into the shared SDK"
-                    videoEncoder!!.setParameters(android.os.Bundle().apply { putInt(PlatformCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+                    message = if (captureIntent.hasVideo) "Capturing upright hardware video into the shared SDK" else "Capturing microphone audio into the shared SDK"
+                    if (captureIntent.hasVideo) videoEncoder?.setParameters(android.os.Bundle().apply { putInt(PlatformCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
                     encodedAudio!!.begin()
                     startAudio()
                 } catch (error: Exception) { fail("Start failed: ${error.message ?: error.javaClass.simpleName}") }
             }
+            if (captureIntent.hasVideo) renderer!!.startEncoding(encoderSurface!!, token, ::admit) else admit()
         } catch (error: Exception) { fail("Start failed: ${error.message ?: error.javaClass.simpleName}") }
     }
 
@@ -685,7 +711,7 @@ class CaptureController(private val context: Context) {
     private fun submitSample(sample: MediaSample, token: Long) {
         val nowNs = SystemClock.elapsedRealtimeNanos()
         val result = queues!!.push(sample, nowNs.toULong())
-        if (recovery.observe(token, result.publishingWaitingKeyframe, result.publishingOverflows, nowNs)) {
+        if (captureIntent.hasVideo && recovery.observe(token, result.publishingWaitingKeyframe, result.publishingOverflows, nowNs)) {
             handler.post {
                 if (token == generation && stage == CaptureStage.CAPTURING && recovery.take(token)) {
                     try {
@@ -912,7 +938,7 @@ class CaptureController(private val context: Context) {
                 handler.postDelayed(tailDeadline, 500)
             } else tailDone = true
         }
-        if (videoEos && audioEos) { tailDone = true; handler.removeCallbacks(tailDeadline) }
+        if (captureIntent.tailComplete(videoEos, audioEos)) { tailDone = true; handler.removeCallbacks(tailDeadline) }
         if (tailDone && !audioQuiesceRequested) {
             audioQuiesceRequested = true
             val epoch = encodedAudio
@@ -922,7 +948,7 @@ class CaptureController(private val context: Context) {
                     if (token == drainGeneration) {
                         audioCodec = transferred
                         audioOwnerQuiesced = true
-                        epoch.finishHandoff(drain = !stopFailed && videoEos && audioEos)
+                        epoch.finishHandoff(drain = !stopFailed && captureIntent.tailComplete(videoEos, audioEos))
                         finishStoppedEpoch()
                     }
                 }

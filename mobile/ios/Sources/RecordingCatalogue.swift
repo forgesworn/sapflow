@@ -15,7 +15,7 @@ final class RecordingCatalogue {
         let profileID: String
         init(segmentID: String, showID: String, segmentIndex: Int64, profileID: String) throws {
             guard Self.uuid(segmentID), Self.uuid(showID), segmentIndex >= 0,
-                  CaptureProfile(rawValue: profileID) != nil else { throw Failure.unsafe }
+                  CaptureIntent(rawValue: profileID) != nil else { throw Failure.unsafe }
             self.segmentID = segmentID; self.showID = showID
             self.segmentIndex = segmentIndex; self.profileID = profileID
         }
@@ -26,10 +26,10 @@ final class RecordingCatalogue {
     }
     final class Show {
         let showID = UUID().uuidString.lowercased()
-        private let profile: CaptureProfile
+        private let profile: CaptureIntent
         private let lock = NSLock()
         private var index: Int64 = 0
-        fileprivate init(profile: CaptureProfile) { self.profile = profile }
+        fileprivate init(profile: CaptureIntent) { self.profile = profile }
         func nextIdentity() throws -> Identity {
             lock.lock(); defer { lock.unlock() }
             guard index < Int64.max else { throw Failure.capacity }
@@ -180,7 +180,7 @@ final class RecordingCatalogue {
         lock.lock(); closing = false; closed = !failed; lock.unlock()
         if failed { poison(); throw Failure.io }
     }
-    func newShow(profile: CaptureProfile) -> Show { Show(profile: profile) }
+    func newShow(profile: CaptureIntent) -> Show { Show(profile: profile) }
     func checkRecordingCapacity() throws {
         let token = try reserve(.preflight)
         do {

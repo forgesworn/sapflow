@@ -66,7 +66,7 @@ class MainActivity : ComponentActivity() {
     private var preparedV4v: V4vCaptureAdmission.Prepared? = null
     private var preparedCapture: CaptureStartAdmission.Preparation? = null
     private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
-    private class PreparationIntent(val request: Long, val profile: CaptureProfile, val record: Boolean, val v4v: Boolean,
+    private class PreparationIntent(val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
         val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean)
     private var pendingPreparation: PreparationIntent? = null
     private val permissionReplies = PendingPermissionReply<PreparationIntent>()
@@ -123,6 +123,8 @@ class MainActivity : ComponentActivity() {
     private var srtPlaintextLab by mutableStateOf(false)
     private var recordLocally by mutableStateOf(true)
     private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
+    private var microphoneOnly by mutableStateOf(false)
+    private val selectedIntent: CaptureIntent get() = if (microphoneOnly) CaptureIntent.AudioOnly48kMono else CaptureIntent.AudioVideo(captureProfile)
     private val ui = Handler(Looper.getMainLooper())
     private val settlePose = object : Runnable {
         override fun run() {
@@ -178,12 +180,12 @@ class MainActivity : ComponentActivity() {
         val intent = permissionReplies.receive()
         permissionReplyOutstanding = permissionReplies.outstanding
         if (intent != null && currentPreparation(intent)) {
-            if (result[Manifest.permission.CAMERA] == true && result[Manifest.permission.RECORD_AUDIO] == true) {
+            if (intent.capture.permissionsGranted { result[it] == true || checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
                 permissionMessage = null
                 prepareCapture(intent)
             } else {
                 cancelPreparation()
-                permissionMessage = "Camera and microphone permission are required. Enable them in system settings if permission was permanently denied."
+                permissionMessage = if (intent.capture.hasVideo) "Camera and microphone permission are required. Enable them in system settings if permission was permanently denied." else "Microphone permission is required. Enable it in system settings if permission was permanently denied."
             }
         } else if (pendingPreparation === intent && intent != null) cancelPreparation()
     }
@@ -224,7 +226,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun PreviewPane(modifier: Modifier) {
         Box(modifier, contentAlignment = Alignment.Center) {
-            AndroidView(factory = { context -> SurfaceView(context).apply {
+            if (!selectedIntent.hasVideo) Text("Microphone only · no camera preview")
+            else AndroidView(factory = { context -> SurfaceView(context).apply {
                 holder.addCallback(object : SurfaceHolder.Callback {
                     override fun surfaceCreated(holder: SurfaceHolder) { preview = holder.surface; surfaceReady = true; updatePreview() }
                     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -244,12 +247,23 @@ class MainActivity : ComponentActivity() {
                         Text("Free V4V in every build", color = MaterialTheme.colorScheme.primary)
                         val current = snapshot
                         Text(current?.stage?.name ?: "IDLE", style = MaterialTheme.typography.labelLarge)
-                        Text(permissionMessage ?: current?.message ?: "Prepare the camera and microphone")
-                        Text(current?.orientation ?: "${captureProfile.label}30 · H264 · AAC 48 kHz", style = MaterialTheme.typography.bodySmall)
+                        Text(permissionMessage ?: current?.message ?: if (microphoneOnly) "Prepare the microphone" else "Prepare the camera and microphone")
+                        Text(current?.orientation ?: if (microphoneOnly) "AAC-LC 48 kHz mono · 96 kbit/s" else "${captureProfile.label}30 · H264 · AAC 48 kHz", style = MaterialTheme.typography.bodySmall)
                         val qualityConfigurable = !preparationPending && !libraryBusy && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(false to "Video", true to "Microphone").forEach { (audioOnly, label) ->
+                                OutlinedButton(enabled = qualityConfigurable, onClick = {
+                                    if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare && microphoneOnly != audioOnly) {
+                                        prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
+                                        microphoneOnly = audioOnly
+                                    }
+                                }) { Text(if (microphoneOnly == audioOnly) "$label selected" else label) }
+                            }
+                        }
+                        if (microphoneOnly) Text("Foreground audio only. Capture stops when this screen leaves the foreground.", style = MaterialTheme.typography.bodySmall)
                         Text("Capture quality · choose before Prepare", style = MaterialTheme.typography.labelMedium)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CaptureProfile.entries.forEach { quality ->
+                            if (!microphoneOnly) CaptureProfile.entries.forEach { quality ->
                                 OutlinedButton(enabled = qualityConfigurable, onClick = {
                                     if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare && captureProfile != quality) {
                                         prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
@@ -260,7 +274,7 @@ class MainActivity : ComponentActivity() {
                         }
                         OutlinedButton(
                             onClick = { prepareWithPermissions() },
-                            enabled = !preparationPending && !permissionReplyOutstanding && !libraryBusy && surfaceReady && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR),
+                            enabled = !preparationPending && !permissionReplyOutstanding && !libraryBusy && (microphoneOnly || surfaceReady) && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR),
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Prepare") }
                         Button(
@@ -368,9 +382,9 @@ class MainActivity : ComponentActivity() {
         else {
             val request = prepareRequest
             val binding = preparedV4v ?: return
-            v4v?.grant(captureProfile) { permit, error ->
+            v4v?.grant(captureIntent.intent) { permit, error ->
                 if (request != prepareRequest || !useV4v || preparedV4v != binding || preparedCapture != captureIntent) return@grant
-                if (error == null && permit != null && v4v?.canStart(binding, permit, captureProfile) == true && poseTracking && capture.snapshot().stage == CaptureStage.PREPARED) start()
+                if (error == null && permit != null && v4v?.canStart(binding, permit, captureIntent.intent) == true && poseTracking && capture.snapshot().stage == CaptureStage.PREPARED) start()
                 else permissionMessage = error?.message?.take(160) ?: "V4V start permission no longer matches this prepared capture"
             }
         }
@@ -391,8 +405,8 @@ class MainActivity : ComponentActivity() {
         if (!useV4v) return
         Text(v4vState?.message ?: "Loading V4V journal", style = MaterialTheme.typography.bodySmall)
         v4vState?.maxPublishBps?.let { cap ->
-            Text("V4V cap $cap bits/s · ${captureProfile.label} needs ${captureProfile.minimumPublishBps} bits/s", style = MaterialTheme.typography.bodySmall)
-            if (cap < captureProfile.minimumPublishBps) Text("Select a supported quality before Prepare. The reserved session can still be ended.", style = MaterialTheme.typography.bodySmall)
+            Text("V4V cap $cap bits/s · ${selectedIntent.label} needs ${selectedIntent.minimumPublishBps} bits/s", style = MaterialTheme.typography.bodySmall)
+            if (cap < selectedIntent.minimumPublishBps) Text("Select a supported quality before Prepare. The reserved session can still be ended.", style = MaterialTheme.typography.bodySmall)
         }
         if (configurable) {
             val signers = remember(owner) { Nip55Login(this, owner.signerRelay).installed() }
@@ -479,7 +493,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentPreparation(intent: PreparationIntent): Boolean = pendingPreparation === intent && intent.request == prepareRequest &&
-        poseTracking && !isDestroyed && capture.snapshot().canPrepare && captureProfile == intent.profile && recordLocally == intent.record && useV4v == intent.v4v &&
+        poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && recordLocally == intent.record && useV4v == intent.v4v &&
         (intent.v4v || (useSrt == intent.srt && destinationUrl == intent.endpoint && destinationKey == intent.key && srtPassphrase == intent.passphrase &&
             srtPlaintextLab == intent.srtPlaintext && allowPlaintextDevelopment == intent.rtmpPlaintext))
 
@@ -489,9 +503,9 @@ class MainActivity : ComponentActivity() {
     }
     private fun prepareWithPermissions() {
         if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
-        val intent = PreparationIntent(++prepareRequest, captureProfile, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment)
+        val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment)
         pendingPreparation = intent; preparationPending = true
-        val needed = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+        val needed = intent.capture.requiredPermissions.toTypedArray()
         if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
             permissionMessage = null
             prepareCapture(intent)
@@ -509,7 +523,7 @@ class MainActivity : ComponentActivity() {
         if (!currentPreparation(intent)) { if (pendingPreparation === intent) cancelPreparation(); return }
         if (intent.v4v && approvedGrant == null) {
             val owner = v4v ?: run { cancelPreparation(); return }
-            owner.grant(intent.profile) { grant, error ->
+            owner.grant(intent.capture) { grant, error ->
                 if (!currentPreparation(intent)) { if (pendingPreparation === intent) cancelPreparation(); return@grant }
                 if (error != null || grant == null) {
                     cancelPreparation()
@@ -520,7 +534,7 @@ class MainActivity : ComponentActivity() {
         }
         if (intent.record && checkedRecording == null) {
             val screen = WeakReference(this)
-            val request = recordingLibrary.prepare(intent.profile) { result ->
+            val request = recordingLibrary.prepare(intent.capture) { result ->
                 val current = screen.get() ?: return@prepare
                 if (!current.currentPreparation(intent)) { if (current.pendingPreparation === intent) current.cancelPreparation(); return@prepare }
                 current.recordingPreflight = null
@@ -533,36 +547,36 @@ class MainActivity : ComponentActivity() {
             return
         }
         try {
-            val surface = preview?.takeIf { it.isValid } ?: run { cancelPreparation(); return }
+            val surface = if (intent.capture.hasVideo) preview?.takeIf { it.isValid } ?: run { cancelPreparation(); return } else null
             if (intent.record) {
                 val ready = checkNotNull(checkedRecording)
-                require(ready.profile == intent.profile && ready.fresh(System.nanoTime())) { "Recording storage check expired. Prepare again." }
+                require(ready.intent == intent.capture && ready.fresh(System.nanoTime())) { "Recording storage check expired. Prepare again." }
             }
             val key = intent.key
             val passphrase = intent.passphrase
             val plaintext = intent.srtPlaintext
             val publisher: () -> EncodedSink? = if (intent.v4v) {
-                require(approvedGrant?.profile == intent.profile) { "Capture quality changed; Prepare again" }
+                require(approvedGrant?.intent == intent.capture) { "Capture quality changed; Prepare again" }
                 val prepared = checkNotNull(v4v).captureFactory(checkNotNull(approvedGrant))
                 preparedV4v = prepared.binding
                 prepared.factory
             } else if (intent.endpoint.isBlank()) ({ null }) else if (intent.srt) {
                 SrtDestination.validateCredentials(key, passphrase, plaintext)
                 val destination = SrtDestination.parse(intent.endpoint.trim())
-                val coordinator = ReconnectingPublishingSink { events -> SrtPublishingSink(destination, key, passphrase, plaintext, events) }
+                val coordinator = ReconnectingPublishingSink { events -> SrtPublishingSink(destination, key, passphrase, plaintext, events, intent = intent.capture) }
                 ({ coordinator.newEpoch() })
             } else {
                 require(key.isNotEmpty()) { "A stream key is required" }
                 val destination = RtmpDestination.parse(intent.endpoint.trim(), intent.rtmpPlaintext)
-                val coordinator = ReconnectingPublishingSink { events -> RtmpPublishingSink(destination, key, events) }
+                val coordinator = ReconnectingPublishingSink { events -> RtmpPublishingSink(destination, key, events, intent.capture) }
                 ({ coordinator.newEpoch() })
             }
             val recorder: () -> EncodedSink? = if (intent.record) ({ checkNotNull(checkedRecording).recorder() }) else ({ null })
             updatePreview()
             // Explicit Prepare restores the stable physical pose even if no
             // further sensor callback followed qualification Stop/CLEAR.
-            capture.orientationChanged(poseSelector.prepareSession())
-            preparedCapture = capture.prepare(surface, publisher, recorder, intent.profile)
+            if (intent.capture.hasVideo) capture.orientationChanged(poseSelector.prepareSession())
+            preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture)
             if (intent.v4v) preparedV4vCapture = preparedCapture
             pendingPreparation = null; preparationPending = false
         } catch (error: Exception) {

@@ -84,7 +84,7 @@ final class CaptureAdmissionTests: XCTestCase {
         XCTAssertEqual(gate.currentPreparation?.profile, .hd720p30)
     }
     func testImmutableProfileSurvivesPreparationStartAndRepeatedRotation() {
-        for profile in CaptureProfile.allCases {
+        for profile in CaptureIntent.allCases.filter(\.hasVideo) {
             let gate = CaptureAdmission(), ticket = gate.reservePreparation(profile: profile)!
             XCTAssertEqual(ticket.profile, profile)
             XCTAssertTrue(gate.attached(ticket)); XCTAssertTrue(gate.beginPermissions(ticket))
@@ -101,6 +101,33 @@ final class CaptureAdmissionTests: XCTestCase {
             }
             XCTAssertEqual(gate.currentPreparation?.profile, profile)
         }
+    }
+    func testAudioOnlyIntentHasNoRotationEpochAndStopFencesItsLateStart() throws {
+        let gate = CaptureAdmission()
+        let ticket = try XCTUnwrap(gate.reservePreparation(profile: .audioOnly48kMono))
+        XCTAssertEqual(ticket.profile, .audioOnly48kMono)
+        XCTAssertTrue(gate.attached(ticket)); XCTAssertTrue(gate.beginPermissions(ticket))
+        XCTAssertTrue(gate.prepared(ticket))
+        let start = try XCTUnwrap(gate.reserveStart(ticket))
+        XCTAssertTrue(gate.started(start, nowNs: 100))
+        XCTAssertNil(gate.beginRotation(ticket)); XCTAssertEqual(gate.currentPhase, .running)
+        XCTAssertEqual(gate.elapsed(ticket, nowNs: 200).captureNs, 100)
+        let stop = gate.stop(nowNs: 300)
+        XCTAssertFalse(gate.started(start)); XCTAssertNil(gate.reservePreparation(profile: .hd720p30))
+        XCTAssertFalse(gate.completeStop(stop, cleanupComplete: false))
+        XCTAssertTrue(gate.completeStop(stop, cleanupComplete: true))
+        let successor = try XCTUnwrap(gate.reservePreparation(profile: .hd720p30))
+        XCTAssertFalse(gate.prepared(ticket)); XCTAssertFalse(gate.started(start))
+        XCTAssertNil(gate.beginRotation(ticket)); XCTAssertEqual(gate.currentPreparation, successor)
+    }
+    func testAudioOnlyStopDuringPermissionCannotPrepareOrStartLater() throws {
+        let gate = CaptureAdmission()
+        let ticket = try XCTUnwrap(gate.reservePreparation(profile: .audioOnly48kMono))
+        XCTAssertTrue(gate.attached(ticket)); XCTAssertTrue(gate.beginPermissions(ticket))
+        let stop = gate.stop()
+        XCTAssertFalse(gate.permitsPreparation(ticket)); XCTAssertFalse(gate.prepared(ticket))
+        XCTAssertNil(gate.reserveStart(ticket)); XCTAssertNil(gate.beginRotation(ticket))
+        XCTAssertTrue(gate.completeStop(stop, cleanupComplete: true))
     }
     func testOldProfileCallbacksCannotAdoptStartOrRotateNewProfile() {
         let gate = CaptureAdmission(), old = gate.reservePreparation(profile: .sd480p30)!

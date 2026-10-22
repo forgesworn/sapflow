@@ -9,6 +9,7 @@ import Sapflow
 final class ManualRtmpPublisher: EncodedPublishingSink {
     private let observe: (PublishingAttemptEvent, UInt64) -> Void
     private let destination: ManualDestination
+    private let hasVideo: Bool
     private let queue = DispatchQueue(label: "sapflow.manual-rtmp", qos: .userInitiated)
     private let lock = NSLock()
     // lock owns only admission/generation/status, never transport or FFI calls.
@@ -36,7 +37,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
     private var socketCounter = SocketCompletionCounter()
     private var finalCounters: SocketOutboundSample? // published under lock at actual close
 
-    init(destination: ManualDestination, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) { self.destination = destination; self.observe = observe }
+    init(destination: ManualDestination, hasVideo: Bool = true, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) { self.destination = destination; self.hasVideo = hasVideo; self.observe = observe }
     deinit { timer.cancel(); connection?.cancel(); try? publisher?.cancel() }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
     var status: String { lock.lock(); defer { lock.unlock() }; return currentStatus }
@@ -61,7 +62,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
         lock.unlock()
         queue.async {
             guard self.isCurrent(token), self.isAccepting() else { return }
-            self.stopping = false; self.waitingForKeyframe = true
+            self.stopping = false; self.waitingForKeyframe = self.hasVideo
             self.socketCounter = SocketCompletionCounter()
             self.connectDeadline = self.nowMs() + 15_000
             let parameters: NWParameters
@@ -94,7 +95,7 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
                     do {
                         self.publisher = try NativeRtmpPublisher(app: self.destination.app, streamKey: self.destination.streamKey,
                             tcUrl: self.destination.endpoint, mediaEpochNs: 0, nowMs: self.nowMs())
-                        try self.publisher?.declareTracks(hasVideo: true, hasAudio: true)
+                        try self.publisher?.declareTracks(hasVideo: self.hasVideo, hasAudio: true)
                         try self.updateProtocolStatus(token)
                         try self.pumpOutput(token)
                         self.receive(token)
@@ -112,7 +113,12 @@ final class ManualRtmpPublisher: EncodedPublishingSink {
         }
     }
 
+    func configure(video: MediaCodec?, audio: MediaCodec) throws {
+        guard hasVideo == (video != nil) else { throw CaptureFailure(message: "RTMP codecs do not match the prepared tracks") }
+    }
+
     func offer(_ sample: MediaSample) throws {
+        guard hasVideo || !sample.isVideo() else { throw CaptureFailure(message: "Video is forbidden in this audio-only RTMP attempt") }
         lock.lock()
         let active = accepting; let token = generation; let budget = admission
         lock.unlock()

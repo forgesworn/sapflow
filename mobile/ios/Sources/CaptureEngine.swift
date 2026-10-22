@@ -3,7 +3,7 @@ import UIKit
 
 struct CaptureSnapshot {
     var orientation = CaptureOrientation.portrait
-    var profile = CaptureProfile.defaultProfile
+    var profile = CaptureIntent.defaultProfile
     var phase = "Idle"
     var detail = "Prepare the camera and microphone to begin."
     var publisher = "Publisher not attached · local recording only"
@@ -21,23 +21,25 @@ struct CaptureSnapshot {
 extension CaptureEngine: V4vCreatorCapturePort {}
 
 final class CaptureRun {
-    let profile: CaptureProfile
+    let profile: CaptureIntent
     let recorder: CompressedRecorder
     let recordingTicket: RecordingCaptureAdmission.Ticket
     let worker: IngressWorker
-    var video: HardwareVideoEncoder!
+    var video: HardwareVideoEncoder?
     var audio: NativeAudioEncoder!
     var epoch: CMTime?
     var admitting = false
     var startup: [(sample: CMSampleBuffer, video: Bool)] = []
     var startupBytes = 0
-    init(recorder: CompressedRecorder, recordingTicket: RecordingCaptureAdmission.Ticket, orientation: CaptureOrientation, profile: CaptureProfile, ingress: RustEncodedIngress, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
+    init(recorder: CompressedRecorder, recordingTicket: RecordingCaptureAdmission.Ticket, orientation: CaptureOrientation, profile: CaptureIntent, ingress: RustEncodedIngress, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
         self.profile = profile
         self.recorder = recorder; self.recordingTicket = recordingTicket
         worker = IngressWorker(ingress: ingress, failure: publishingFailure, statistics: statistics)
         let recorder = self.recorder; let worker = self.worker
         let output: (CompressedUnit) -> Void = { unit in recorder.offer(unit); worker.offer(unit) }
-        video = try HardwareVideoEncoder(orientation: orientation, profile: profile, output: output, failure: failure)
+        if let camera = profile.videoProfile {
+            video = try HardwareVideoEncoder(orientation: orientation, profile: camera, output: output, failure: failure)
+        }
         audio = try NativeAudioEncoder(output: output, meter: meter)
     }
 }
@@ -74,7 +76,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var run: CaptureRun? // samples queue only
     private var captureGeneration: UInt64 = 0 // control queue only
     private var configured = false // control queue only
-    private var configuredProfile: CaptureProfile? // control queue only
+    private var configuredProfile: CaptureIntent? // control queue only
     private var orientationPlan = OrientationRestartPlan()
     private var rotationTimeout: DispatchWorkItem?
     private var rotationDeadline: RecordingCaptureAdmission.RotationDeadline?
@@ -141,7 +143,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             completion(accepted)
         }
     }
-    func reservePreparation(profile: CaptureProfile = .defaultProfile) -> CaptureAdmission.Preparation? {
+    func reservePreparation(profile: CaptureIntent = .defaultProfile) -> CaptureAdmission.Preparation? {
         guard let binding = recordings else { return nil }
         return binding.admission.withCaptureReservation {
             guard !self.recordingAdmission.hasOwner else { return nil }
@@ -218,6 +220,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
     func setOrientation(_ orientation: CaptureOrientation) {
         control.async {
+            guard (self.preparedIntent?.profile ?? self.snapshot.profile).hasVideo else { return }
             guard self.orientationPlan.desired != orientation else { return }
             let token = self.orientationPlan.request(orientation, running: self.snapshot.running)
             if let token {
@@ -257,11 +260,13 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
     private var orientationDescription: String {
         let profile = preparedIntent?.profile ?? snapshot.profile
-        let dimensions = profile.dimensions(for: orientationPlan.desired)
-        return "\(dimensions.width)×\(dimensions.height) at \(profile.frameRate) fps · hardware H.264 · AAC 48 kHz mono"
+        guard let camera = profile.videoProfile else { return "AAC-LC 48 kHz mono · 96 kbit/s · microphone only" }
+        let dimensions = camera.dimensions(for: orientationPlan.desired)
+        return "\(dimensions.width)×\(dimensions.height) at \(camera.frameRate) fps · hardware H.264 · AAC 48 kHz mono"
     }
     private func applyOrientation() throws {
         guard !snapshot.running, !stopping else { throw CaptureFailure(message: "Orientation requires a new encoder epoch") }
+        guard (preparedIntent?.profile ?? snapshot.profile).hasVideo else { return }
         setSampleDelivery(false)
         if session.isRunning { session.stopRunning() }
         guard let output = session.outputs.compactMap({ $0 as? AVCaptureVideoDataOutput }).first,
@@ -313,11 +318,11 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         control.async {
             guard self.admission.permitsPreparation(ticket) else { return }
             self.snapshot.phase = "Preparing"
-            self.snapshot.detail = "Checking camera and microphone permission."
+            self.snapshot.detail = ticket.profile.hasVideo ? "Checking camera and microphone permission." : "Checking microphone permission."
             self.snapshot.canStart = false; self.publish()
         }
         Task {
-            let camera = await AVCaptureDevice.requestAccess(for: .video)
+            let camera = ticket.profile.requiresCameraPermission ? await AVCaptureDevice.requestAccess(for: .video) : true
             guard self.admission.permitsPreparation(ticket) else { return }
             let microphone = await AVCaptureDevice.requestAccess(for: .audio)
             guard self.admission.permitsPreparation(ticket) else { return }
@@ -325,13 +330,13 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 guard self.admission.permitsPreparation(ticket), self.preparedIntent == ticket,
                       !self.snapshot.running, !self.stopping else { return }
                 guard camera && microphone else {
-                    self.stopOnControl(reason: "Camera and microphone permission are required. Enable them in Settings."); return
+                    self.stopOnControl(reason: ticket.profile.hasVideo ? "Camera and microphone permission are required. Enable them in Settings." : "Microphone permission is required. Enable it in Settings."); return
                 }
                 self.preflightRecording(ticket) {
                   do {
                     guard self.admission.permitsPreparation(ticket), self.preparedIntent == ticket else { return }
                     let audio = AVAudioSession.sharedInstance()
-                    try audio.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .allowBluetooth])
+                    try audio.setCategory(.playAndRecord, mode: ticket.profile.hasVideo ? .videoRecording : .measurement, options: [.defaultToSpeaker, .allowBluetooth])
                     try audio.setPreferredSampleRate(48_000)
                     try audio.setActive(true)
                     if !self.configured { try self.configure(profile: ticket.profile) }
@@ -369,38 +374,44 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
         }
     }
-    private func configure(profile: CaptureProfile) throws {
+    private func configure(profile: CaptureIntent) throws {
         session.beginConfiguration(); defer { session.commitConfiguration() }
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
         session.automaticallyConfiguresApplicationAudioSession = false
-        guard session.canSetSessionPreset(profile.sessionPreset) else { throw CaptureFailure(message: "\(profile.label) capture is unavailable") }
-        session.sessionPreset = profile.sessionPreset
-        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let microphone = AVCaptureDevice.default(for: .audio) else { throw CaptureFailure(message: "Camera or microphone unavailable") }
-        let cameraInput = try AVCaptureDeviceInput(device: camera)
+        guard let microphone = AVCaptureDevice.default(for: .audio) else { throw CaptureFailure(message: "Microphone unavailable") }
         let micInput = try AVCaptureDeviceInput(device: microphone)
-        guard session.canAddInput(cameraInput), session.canAddInput(micInput) else { throw CaptureFailure(message: "Capture inputs are unsupported") }
-        session.addInput(cameraInput); session.addInput(micInput)
-        try camera.lockForConfiguration()
-        defer { camera.unlockForConfiguration() }
-        let rate = Double(profile.frameRate)
-        guard camera.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= rate && $0.maxFrameRate >= rate }) else { throw CaptureFailure(message: "\(profile.label) is unsupported on this camera") }
-        camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: profile.frameRate)
-        camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: profile.frameRate)
-        let video = AVCaptureVideoDataOutput()
-        video.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
-        video.alwaysDiscardsLateVideoFrames = true
-        video.setSampleBufferDelegate(self, queue: samples)
+        if let cameraProfile = profile.videoProfile {
+            guard session.canSetSessionPreset(cameraProfile.sessionPreset) else { throw CaptureFailure(message: "\(profile.label) capture is unavailable") }
+            session.sessionPreset = cameraProfile.sessionPreset
+            guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { throw CaptureFailure(message: "Camera unavailable") }
+            let cameraInput = try AVCaptureDeviceInput(device: camera)
+            guard session.canAddInput(cameraInput) else { throw CaptureFailure(message: "Camera input is unsupported") }
+            session.addInput(cameraInput)
+            try camera.lockForConfiguration()
+            defer { camera.unlockForConfiguration() }
+            let rate = Double(cameraProfile.frameRate)
+            guard camera.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= rate && $0.maxFrameRate >= rate }) else { throw CaptureFailure(message: "\(profile.label) is unsupported on this camera") }
+            camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: cameraProfile.frameRate)
+            camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: cameraProfile.frameRate)
+            let video = AVCaptureVideoDataOutput()
+            video.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+            video.alwaysDiscardsLateVideoFrames = true
+            video.setSampleBufferDelegate(self, queue: samples)
+            guard session.canAddOutput(video) else { throw CaptureFailure(message: "Camera output unavailable") }
+            session.addOutput(video)
+            guard let connection = video.connection(with: .video), connection.isVideoOrientationSupported else {
+                throw CaptureFailure(message: "Camera cannot produce physically oriented video buffers")
+            }
+            connection.videoOrientation = orientationPlan.desired.capture
+            snapshot.orientation = orientationPlan.desired
+        }
+        guard session.canAddInput(micInput) else { throw CaptureFailure(message: "Microphone input is unsupported") }
+        session.addInput(micInput)
         let audio = AVCaptureAudioDataOutput()
         audio.setSampleBufferDelegate(self, queue: samples)
-        guard session.canAddOutput(video), session.canAddOutput(audio) else { throw CaptureFailure(message: "Capture outputs unavailable") }
-        session.addOutput(video); session.addOutput(audio)
-        guard let connection = video.connection(with: .video), connection.isVideoOrientationSupported else {
-            throw CaptureFailure(message: "Camera cannot produce physically oriented video buffers")
-        }
-        connection.videoOrientation = orientationPlan.desired.capture
-        snapshot.orientation = orientationPlan.desired
+        guard session.canAddOutput(audio) else { throw CaptureFailure(message: "Microphone output unavailable") }
+        session.addOutput(audio)
         configuredProfile = profile
         configured = true
     }
@@ -450,7 +461,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 show = selected
                 let created = try binding.catalogue.begin(identity: selected.nextIdentity())
                 receipt = created
-                recorder = try CompressedRecorder(receipt: created, queue: self.recordingIO) { [weak self] error in
+                recorder = try CompressedRecorder(receipt: created, queue: self.recordingIO, hasVideo: ticket.preparation.profile.hasVideo) { [weak self] error in
                     self?.control.async {
                         guard let self, self.preparedIntent == ticket.preparation, self.recordingAdmission.contains(work) else { return }
                         self.recordingFailureDescription = error.localizedDescription
@@ -500,7 +511,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         var constructedRun: CaptureRun?
         do {
             if keepSavedSegment { try self.applyOrientation() }
-            self.ingress.reset()
+            self.ingress.reset(hasVideo: ticket.preparation.profile.hasVideo)
             self.recordingFailureDescription = nil
             let run = try CaptureRun(recorder: recorder, recordingTicket: work, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress,
                 failure: { [weak self] error in
@@ -524,7 +535,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             guard self.admission.permitsStart(ticket),
                   !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true,
                   self.recordingAdmission.activate(work) else {
-                run.video.finish(); try? run.audio.finish()
+                run.video?.finish(); try? run.audio.finish()
                 self.closeRejectedRecorder(recorder, work: work)
                 if self.admission.permitsStart(ticket) { self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.") }
                 return
@@ -535,7 +546,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
             guard self.admission.permitsStart(ticket), self.recordingAdmission.isActive(work),
                   !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
-                run.video.finish(); try? run.audio.finish(); self.closeRejectedRecorder(recorder, work: work)
+                run.video?.finish(); try? run.audio.finish(); self.closeRejectedRecorder(recorder, work: work)
                 if self.admission.permitsStart(ticket) { self.stopOnControl(reason: "Rotation finalisation timed out; automatic restart cancelled.") }
                 return
             }
@@ -567,7 +578,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
             self.beginTelemetry(ticket.preparation)
             self.snapshot.phase = "Recording"
-            self.snapshot.detail = keepSavedSegment ? "Rotation began a new recording segment. Active publishing reconnects; the previous private segment is retained." : "Hardware encoder: \(run.video.implementation). Saving compressed video and audio locally."
+            self.snapshot.detail = keepSavedSegment ? "Rotation began a new recording segment. Active publishing reconnects; the previous private segment is retained." : run.video.map { "Hardware encoder: \($0.implementation). Saving compressed video and audio locally." } ?? "Saving microphone AAC locally. Keep Sapflow in the foreground."
             self.snapshot.encoded = 0; self.snapshot.captureDrops = 0; self.snapshot.level = -60
             self.snapshot.publisher = self.ingress.status
             self.publish()
@@ -579,13 +590,13 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 self.samples.async {
                     if self.run?.epoch == nil { self.control.async {
                         guard self.captureGeneration == captureToken, self.preparedIntent == ticket.preparation else { return }
-                        self.stopOnControl(reason: "Camera or microphone did not deliver its initial sample")
+                        self.stopOnControl(reason: run.profile.hasVideo ? "Camera or microphone did not deliver its initial sample" : "Microphone did not deliver its initial sample")
                     } }
                 }
             }
             self.storageTimer = timer; timer.resume()
         } catch {
-            constructedRun?.video.finish(); try? constructedRun?.audio.finish()
+            constructedRun?.video?.finish(); try? constructedRun?.audio.finish()
             self.closeRejectedRecorder(recorder, work: work)
             self.fencePublishing(); self.stopOnControl(reason: error.localizedDescription)
         }
@@ -659,7 +670,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 flushFailed = true
                 self.control.async { self.recordingFailureDescription = "AAC flush failed: \(error.localizedDescription)" }
             }
-            run.video.finish()
+            run.video?.finish()
             self.recordingAdmission.closing(run.recordingTicket)
             let state = RecordingRunStop(run: run, rotationToken: rotationToken, rotation: child)
             self.control.async { self.runStop = state }
@@ -728,7 +739,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
     /// All resource-values filesystem work runs only on recordingIO.
-    private func checkStorage(_ catalogue: RecordingCatalogue, profile: CaptureProfile) throws {
+    private func checkStorage(_ catalogue: RecordingCatalogue, profile: CaptureIntent) throws {
         let available = try catalogue.recordingRootURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage
         guard let available, available >= 0, RecordingCaptureAdmission.storageAvailable(profile: profile, bytes: UInt64(available)) else {
             throw CaptureFailure(message: "Recording storage is below its required reserve")
@@ -811,6 +822,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard let run, run.admitting else { return }
         do {
             let isVideo = output is AVCaptureVideoDataOutput
+            guard !isVideo || run.profile.hasVideo else { throw CaptureFailure(message: "Unexpected camera sample in audio-only capture") }
             if run.epoch == nil {
                 // Preserve early audio while waiting for the first camera
                 // callback. Dropping it would silently remove PCM from the
@@ -820,7 +832,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                     throw CaptureFailure(message: "Camera/microphone startup exceeded its native buffer bound")
                 }
                 run.startup.append((sampleBuffer, isVideo)); run.startupBytes += bytes
-                guard run.startup.contains(where: { $0.video }), run.startup.contains(where: { !$0.video }) else { return }
+                guard (!run.profile.hasVideo || run.startup.contains(where: { $0.video })), run.startup.contains(where: { !$0.video }) else { return }
                 let initial = run.startup.sorted {
                     CMTimeCompare(CMSampleBufferGetPresentationTimeStamp($0.sample), CMSampleBufferGetPresentationTimeStamp($1.sample)) < 0
                 }
@@ -838,7 +850,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard let epoch = run.epoch else { return }
         let time = CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(sample), epoch)
         guard time.isValid, time.seconds >= 0 else { throw CaptureFailure(message: "Capture clock moved before the session epoch") }
-        if video { try run.video.encode(sample, time: time) }
+        if video {
+            guard let encoder = run.video else { throw CaptureFailure(message: "Video encoder is absent for this capture") }
+            try encoder.encode(sample, time: time)
+        }
         else { try run.audio.encode(sample, time: time) }
     }
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {

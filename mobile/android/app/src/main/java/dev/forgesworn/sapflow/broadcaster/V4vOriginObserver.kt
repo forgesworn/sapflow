@@ -49,7 +49,7 @@ internal class V4vOriginObserver(private val profile: V4vProfile,
     private val confirmed: (V4vCapturedAttempt, NativeOriginEvidence, Long) -> Unit,
     private val decoder: OriginDecoder = FiniteNativeOriginDecoder(),
     private val resources: (V4vObservationPermit) -> OriginObservationResources = { PlatformObservationResources(profile, it) }) : AutoCloseable {
-    private class Job(val scope: V4vCapturedAttempt, val quality: CaptureProfile) {
+    private class Job(val scope: V4vCapturedAttempt, val intent: CaptureIntent) {
         val cancel = OriginProbeCancellation()
         val resources = AtomicReference<OriginObservationResources?>()
         val wake = CountDownLatch(1)
@@ -76,10 +76,10 @@ internal class V4vOriginObserver(private val profile: V4vProfile,
     private val reported = AtomicReference<PublishingAttemptContext?>()
     private val closed = java.util.concurrent.atomic.AtomicBoolean()
     val diagnostics: String get() = state.get()
-    @Synchronized fun accepted(scope: V4vCapturedAttempt, quality: CaptureProfile) {
+    @Synchronized fun accepted(scope: V4vCapturedAttempt, intent: CaptureIntent) {
         if (closed.get() || owner.get()?.scope === scope || pending.get()?.scope === scope) return
         reported.set(scope.context); state.set("Playback has not been verified")
-        val job = Job(scope, quality) // Deadline starts at Accepted, not deferred cleanup completion.
+        val job = Job(scope, intent) // Deadline starts at Accepted, not deferred cleanup completion.
         val old = owner.get()
         if (old != null) {
             pending.getAndSet(job)?.let(::cancelJob)
@@ -87,6 +87,7 @@ internal class V4vOriginObserver(private val profile: V4vProfile,
             state.set("Playback check waiting for previous cleanup")
         } else start(job)
     }
+    fun accepted(scope: V4vCapturedAttempt, quality: CaptureProfile) = accepted(scope, CaptureIntent.AudioVideo(quality))
     /** Called under this monitor. No IO or native operation runs here. */
     private fun start(job: Job) {
         if (closed.get() || !current(job.scope)) return
@@ -125,7 +126,7 @@ internal class V4vOriginObserver(private val profile: V4vProfile,
         if (proof != null && !job.invalidated.get() && !closed.get() && current(job.scope) &&
             System.nanoTime() < minOf(job.cancel.deadlineNs, job.authorityDeadline)) {
             runCatching { confirmed(job.scope, proof, minOf(job.cancel.deadlineNs, job.authorityDeadline)) }
-                .onSuccess { state.set("Origin video and audio decoded · ${proof.video.codec} hardware video · ${proof.audio.codec} software=${proof.audio.software} native AAC · PCM ${proof.audio.decodedBytes}B pts=${proof.audio.firstPtsUs}..${proof.audio.lastPtsUs}us") }
+                .onSuccess { state.set("Origin ${if (proof.video == null) "audio" else "video and audio"} decoded · ${proof.audio.codec} software=${proof.audio.software} native AAC · PCM ${proof.audio.decodedBytes}B pts=${proof.audio.firstPtsUs}..${proof.audio.lastPtsUs}us") }
                 .onFailure { state.set("Playback has not been verified") }
         }
         owner.compareAndSet(job, null)
@@ -170,12 +171,13 @@ internal class V4vOriginObserver(private val profile: V4vProfile,
             }
         }
         val boundary = checkNotNull(before) { "No fresh independent origin part" }
-        require(boundary.hasAudio) { "Prepared A/V capture requires actual origin AAC" }
+        require(job.intent == job.scope.intent && job.intent.matchesTracks(boundary.hasVideo, boundary.hasAudio)) { "Origin tracks differ from prepared capture" }
         val init = io.get(boundary.initPath, OriginProbeLimits.INIT_BYTES, job.cancel)
         val part = io.get(boundary.partPath, OriginProbeLimits.PART_BYTES, job.cancel)
         checkCurrent()
-        val evidence = decoder.decode(init, part, job.quality, job.cancel)
+        val evidence = decoder.decode(init, part, job.intent, job.cancel)
         checkCurrent()
+        require((evidence.video != null) == job.intent.hasVideo) { "Decoded tracks differ from capture intent" }
         val after = checkNotNull(match(job.scope, io.status()))
         require(sameDecodedBoundary(boundary, after))
         checkCurrent()

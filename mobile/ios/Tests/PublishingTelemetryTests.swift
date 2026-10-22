@@ -258,7 +258,7 @@ private final class TelemetryFixtureSink: EncodedPublishingSink {
     var status: String { "Synthetic socket completion fixture" }
     var finalSocketOutbound: SocketOutboundSample? { final.value }
     func start() {}
-    func configure(video: MediaCodec, audio: MediaCodec) { observe(.accepted, DispatchTime.now().uptimeNanoseconds); observe(.sending, DispatchTime.now().uptimeNanoseconds) }
+    func configure(video: MediaCodec?, audio: MediaCodec) { observe(.accepted, DispatchTime.now().uptimeNanoseconds); observe(.sending, DispatchTime.now().uptimeNanoseconds) }
     func offer(_ sample: MediaSample) {}
     func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) { readCallback.value = completion; reads.change { $0 += 1 } }
     func answer(_ bytes: UInt64) { readCallback.value?(SocketOutboundSample(completedBytes: bytes, measuredAtNs: DispatchTime.now().uptimeNanoseconds, available: true, complete: true)) }

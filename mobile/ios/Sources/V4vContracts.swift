@@ -144,14 +144,15 @@ struct V4vFreshMedia: Equatable {
     let initializationId: UInt64
     let initPath: String
     let partPath: String
+    let hasVideo: Bool
     let hasAudio: Bool
     init(_ json: V4vJSON, event: String, epoch: UInt64) throws {
         let f = try json.object(required: ["connectionEpoch", "partId", "initializationId", "initPath", "partPath", "hasVideo", "hasAudio"])
         connectionEpoch = try f.uint("connectionEpoch", min: 1)
         partId = try f.uint("partId"); initializationId = try f.uint("initializationId")
         initPath = try f.text("initPath", max: 256); partPath = try f.text("partPath", max: 256)
-        hasAudio = try f.flag("hasAudio")
-        guard connectionEpoch == epoch, try f.flag("hasVideo") else { throw V4vFailure.invalidContract }
+        hasVideo = try f.flag("hasVideo"); hasAudio = try f.flag("hasAudio")
+        guard connectionEpoch == epoch, hasVideo || hasAudio else { throw V4vFailure.invalidContract }
         let base = "/live/" + event + "/"
         guard initPath.hasPrefix(base), partPath.hasPrefix(base) else { throw V4vFailure.invalidContract }
         let initName = String(initPath.dropFirst(base.count)), partName = String(partPath.dropFirst(base.count))

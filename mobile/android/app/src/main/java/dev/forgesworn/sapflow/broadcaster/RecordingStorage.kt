@@ -11,7 +11,11 @@ internal object RecordingStorage {
 
     fun budget(profile: CaptureProfile, horizonSeconds: Long = 60, reserveBytes: Long = 32L * 1024 * 1024): Budget {
         require(horizonSeconds > 0 && reserveBytes >= 0)
-        val bits = Math.multiplyExact(profile.elementaryBps.toLong(), horizonSeconds)
+        return budget(CaptureIntent.AudioVideo(profile), horizonSeconds, reserveBytes)
+    }
+    fun budget(intent: CaptureIntent, horizonSeconds: Long = 60, reserveBytes: Long = 32L * 1024 * 1024): Budget {
+        require(horizonSeconds > 0 && reserveBytes >= 0)
+        val bits = Math.multiplyExact(intent.elementaryBps.toLong(), horizonSeconds)
         val payload = Math.addExact(bits / 8, if (bits % 8 == 0L) 0 else 1)
         // Account for mux/output writes and bitrate variation without claiming
         // that the target encoder bitrate bounds all future disk consumption.

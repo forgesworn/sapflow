@@ -30,7 +30,8 @@ import kotlin.concurrent.withLock
  * destination hostname; there is no trust override or plaintext fallback.
  * Failed attempts stop sending while independent capture/recording can continue. */
 internal class RtmpPublishingSink(private val destination: RtmpDestination, streamKey: String,
-    private val events: (PublishingAttemptEvent) -> Unit = {}) : EncodedSink, SocketOutputProvider {
+    private val events: (PublishingAttemptEvent) -> Unit = {},
+    private val intent: CaptureIntent = CaptureIntent.DEFAULT) : EncodedSink, SocketOutputProvider {
     private val outputCounter = SocketOutputCounter(if (destination.tls) SocketOutputAccounting.RTMPS_APPLICATION else SocketOutputAccounting.RTMP_APPLICATION)
     override val socketOutput: SocketOutputSource get() = outputCounter
     private val message = AtomicReference("Destination prepared · press Start to connect")
@@ -40,7 +41,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
     private val accepted = AtomicBoolean(false)
     private val startupReported = AtomicBoolean(false)
     private val peerReported = AtomicBoolean(false)
-    private val firstKeyframe = FirstKeyframeGate()
+    private val firstKeyframe = FirstKeyframeGate(intent.hasVideo)
     private val socket = AtomicReference<Socket?>()
     private val tcpSocket = AtomicReference<Socket?>()
     private val dnsCancellation = CancellationSignal()
@@ -67,9 +68,9 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         check(!closed.get()) { "Attempt closed" }
         startedMs = SystemClock.elapsedRealtime()
         publisher = NativeRtmpPublisher(destination.app, preparedKey, destination.tcUrl, 0uL, startedMs.toULong()).apply {
-            // The current hardware capture profile always declares H264 + AAC.
+            // Immutable declared topology, never inferred from first CSD arrival.
             // A partial first CSD arrival must never turn this into video-only.
-            declareTracks(true, true)
+            declareTracks(intent.hasVideo, intent.hasAudio)
         }
         preparedKey = ""
         lock.withLock { armNativeDeadline() }

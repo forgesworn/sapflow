@@ -52,7 +52,7 @@ internal enum class CaptureProfile(val label: String, val landscapeWidth: Int, v
 /** Reserves Prepare synchronously before its codec-owner task can run. UI
  * quality selection observes pending even while that Handler is busy. */
 internal class CapturePrepareAdmission {
-    private class Request(val profile: CaptureProfile) {
+    private class Request(val intent: CaptureIntent) {
         val live = java.util.concurrent.atomic.AtomicBoolean(true)
     }
     private val admitted = java.util.concurrent.atomic.AtomicReference<Request?>()
@@ -60,12 +60,14 @@ internal class CapturePrepareAdmission {
     // Retain the slot until its queued task drains. A cancelled old task cannot
     // release or adopt a newer Prepare's profile.
     fun cancelPending() { admitted.get()?.live?.set(false) }
-    fun submit(profile: CaptureProfile, canPrepare: Boolean, enqueue: (Runnable) -> Boolean,
-        prepare: (CaptureProfile) -> Unit): Boolean {
-        val request = Request(profile)
+    fun submit(profile: CaptureProfile, canPrepare: Boolean, enqueue: (Runnable) -> Boolean, prepare: (CaptureProfile) -> Unit): Boolean =
+        submit(CaptureIntent.AudioVideo(profile), canPrepare, enqueue) { prepare(checkNotNull(it.videoProfile)) }
+    fun submit(intent: CaptureIntent, canPrepare: Boolean, enqueue: (Runnable) -> Boolean,
+        prepare: (CaptureIntent) -> Unit): Boolean {
+        val request = Request(intent)
         if (!canPrepare || !admitted.compareAndSet(null, request)) return false
         val task = Runnable {
-            try { if (admitted.get() === request && request.live.get()) prepare(request.profile) }
+            try { if (admitted.get() === request && request.live.get()) prepare(request.intent) }
             finally { admitted.compareAndSet(request, null) }
         }
         try {

@@ -189,7 +189,7 @@ final class V4vOriginObserver: @unchecked Sendable {
             let data = try answer.get(), now = clock().monotonicNs
             guard now <= UInt64.max - 3_000_000_000 else { throw OriginObservationFailure.deadline }
             phase = 3
-            decoder.decode(data, deadlineNs: min(deadlineNs, authorityDeadlineNs, now + 3_000_000_000)) { [self] result in queue.async { [self] in decoded(result) } }
+            decoder.decode(data, expectedMedia: attempt.expectedMedia, deadlineNs: min(deadlineNs, authorityDeadlineNs, now + 3_000_000_000)) { [self] result in queue.async { [self] in decoded(result) } }
         } catch { finish(.failure((error as? OriginObservationFailure) ?? .unavailable)) }
     }
     private func decoded(_ answer: Result<OriginDecodedMedia, OriginObservationFailure>) {
@@ -197,7 +197,7 @@ final class V4vOriginObserver: @unchecked Sendable {
         do {
             guard permitted() else { throw OriginObservationFailure.scope }
             let proof = try answer.get()
-            guard proof.sufficient, decoder.cleanupComplete else { throw OriginObservationFailure.progress }
+            guard proof.sufficient(for: attempt.expectedMedia), decoder.cleanupComplete else { throw OriginObservationFailure.progress }
             phase = 4
             status.fresh(attempt) { [self] result in queue.async { [self] in after(result, proof: proof) } }
         } catch { finish(.failure((error as? OriginObservationFailure) ?? .unavailable)) }

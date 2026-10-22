@@ -7,6 +7,7 @@ final class CompressedRecorder {
     private let budget = EncodedWorkBudget()
     private var writer: AVAssetWriter?
     private let receipt: RecordingCatalogue.Writer
+    private let hasVideo: Bool
     private var video: AVAssetWriterInput?
     private var audio: AVAssetWriterInput?
     private var staged: [(unit: CompressedUnit, reservation: EncodedWorkBudget.Reservation)] = []
@@ -27,8 +28,8 @@ final class CompressedRecorder {
 
     /// Called only on the explicit recording IO owner, after its durable WRITING
     /// receipt. The caller closes the receipt if AVAssetWriter creation throws.
-    init(receipt: RecordingCatalogue.Writer, queue: DispatchQueue, onFailure: @escaping (Error) -> Void) throws {
-        self.receipt = receipt; self.queue = queue; self.onFailure = onFailure
+    init(receipt: RecordingCatalogue.Writer, queue: DispatchQueue, hasVideo: Bool = true, onFailure: @escaping (Error) -> Void) throws {
+        self.receipt = receipt; self.queue = queue; self.hasVideo = hasVideo; self.onFailure = onFailure
         let created = try AVAssetWriter(outputURL: receipt.fileURL, fileType: .mov)
         created.movieFragmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
         created.shouldOptimizeForNetworkUse = false
@@ -42,6 +43,10 @@ final class CompressedRecorder {
         }
         queue.async {
             guard !self.finishing, self.failure == nil, let writer = self.writer else { self.budget.release(reservation); return }
+            guard !unit.isVideo || self.hasVideo else {
+                self.budget.release(reservation)
+                self.fail(CaptureFailure(message: "Video does not match this audio-only recording")); return
+            }
             do {
                 if writer.status == .unknown {
                     self.staged.append((unit, reservation))
@@ -50,7 +55,7 @@ final class CompressedRecorder {
                     } else if !unit.isVideo && self.audio == nil {
                         self.audio = try self.makeInput(type: .audio, unit: unit)
                     }
-                    guard self.video != nil && self.audio != nil else { return }
+                    guard (!self.hasVideo || self.video != nil) && self.audio != nil else { return }
                     guard writer.startWriting() else { throw writer.error ?? CaptureFailure(message: "Recording could not start") }
                     writer.startSession(atSourceTime: .zero)
                     let initial = self.staged
@@ -94,7 +99,7 @@ final class CompressedRecorder {
         onFailure(error)
     }
     func markIncomplete(_ error: Error) { queue.async { self.fail(error) } }
-    func checkStorage(profile: CaptureProfile, _ completion: @escaping (Result<Void, Error>) -> Void) {
+    func checkStorage(profile: CaptureIntent, _ completion: @escaping (Result<Void, Error>) -> Void) {
         queue.async {
             do {
                 let available = try self.receipt.fileURL.deletingLastPathComponent().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
@@ -156,7 +161,7 @@ final class CompressedRecorder {
             } else {
                 receipt.cancel()
                 try receipt.ownersClosed()
-                if error == nil { error = CaptureFailure(message: "No finalised audio/video recording was captured") }
+                if error == nil { error = CaptureFailure(message: "No finalised recording was captured") }
             }
         } catch let persistenceError {
             receipt.retainUncertainCleanup()

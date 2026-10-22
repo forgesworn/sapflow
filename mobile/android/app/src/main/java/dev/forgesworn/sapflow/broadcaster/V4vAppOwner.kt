@@ -81,17 +81,17 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
     fun current(permit: V4vCapturePermit): Boolean = synchronized(expiry) {
         fenceExpiredOwner(); admission.current(permit.ticket)
     }
-    fun canStart(binding: V4vCaptureAdmission.Prepared, permit: V4vCapturePermit, profile: CaptureProfile): Boolean = synchronized(expiry) {
+    fun canStart(binding: V4vCaptureAdmission.Prepared, permit: V4vCapturePermit, intent: CaptureIntent): Boolean = synchronized(expiry) {
         fenceExpiredOwner()
         val old = preparedGrant
-        old != null && expiry.admits(binding.owner) && destination.get() != null && permit.profile == profile && admission.canStart(binding, permit.ticket, permit.grant.identity, profile) &&
+        old != null && expiry.admits(binding.owner) && destination.get() != null && permit.intent == intent && admission.canStart(binding, permit.ticket, permit.grant.identity, intent) &&
             permit.grant.permitsStartOf(old, System.nanoTime())
     }
     fun captureFactory(permit: V4vCapturePermit): V4vPreparedDestination {
         val result = synchronized(expiry) {
             // Reject insufficient quality BEFORE retiring an owner or consuming
             // approval. End/reconcile remain available on the control actor.
-            admission.consume(permit.ticket, permit.profile, permit.grant.maxPublishBps)
+            admission.consume(permit.ticket, permit.intent, permit.grant.maxPublishBps)
             observationAdmission.set(null); observer.cancel(); correlation.getAndSet(null)?.clear(); expiry.clear(); expiryAlarm?.cancel(false); preparedGrant = null; destination.getAndSet(null)?.stopDestination()
             val grant = permit.grant
             val ticket = expiry.begin(++captureSerial, grant.identity, grant.expiresAtMonotonicNs)
@@ -100,14 +100,14 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
             val attempts = V4vAttemptCorrelation()
             val coordinator = ReconnectingPublishingSink(graceMs = grant.graceMs,
                 observationChanged = { context, active ->
-                    if (active) attempts.currentFor(context)?.let { observer.accepted(it, permit.profile) }
+                    if (active) attempts.currentFor(context)?.let { observer.accepted(it, permit.intent) }
                     else observer.cancel(context)
                 }) { events ->
-                val wire = attempts.begin(this, grant)
-                SrtPublishingSink(numeric, wire.streamId, grant.passphrase, false, events, permit.profile.srtPacingBytesPerSecond(grant.maxPublishBps))
+                val wire = attempts.begin(this, grant, permit.intent)
+                SrtPublishingSink(numeric, wire.streamId, grant.passphrase, false, events, permit.intent.srtPacingBytesPerSecond(grant.maxPublishBps), permit.intent)
             }
             destination.set(coordinator); correlation.set(attempts); preparedGrant = grant; arm(ticket)
-            V4vPreparedDestination(admission.bind(captureSerial, grant.identity, permit.profile)) { coordinator.newEpoch() }
+            V4vPreparedDestination(admission.bind(captureSerial, grant.identity, permit.intent)) { coordinator.newEpoch() }
         }
         // Private bounded scalar lifecycle correlation only; no destination/event/credential/media data.
         Log.i("SapflowV4v", "explicitCapturePrepare serial=$captureSerial graceMs=${permit.grant.graceMs}")
@@ -134,11 +134,11 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
             } } catch (_: Exception) { complete(IllegalStateException("Signer unavailable")) }
         } }
     }
-    fun grant(profile: CaptureProfile, complete: (V4vCapturePermit?, Exception?) -> Unit) {
+    fun grant(intent: CaptureIntent, complete: (V4vCapturePermit?, Exception?) -> Unit) {
         val ticket = synchronized(expiry) { admission.snapshot() }
         var value: V4vGrant? = null
         control.submit({ value = captureGrant() }) { error -> ui.post {
-            complete(if (error == null) V4vCapturePermit(ticket, checkNotNull(value), profile) else null, error)
+            complete(if (error == null) V4vCapturePermit(ticket, checkNotNull(value), intent) else null, error)
         } }
     }
     companion object {

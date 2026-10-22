@@ -7,6 +7,17 @@ enum OriginObservationFailure: String, Error, CustomStringConvertible {
     var description: String { "Origin observation unconfirmed (\(rawValue))" }
 }
 
+/// Local immutable decode expectation, never inferred from status or the first
+/// arriving codec. Generic v1 grants remain transport authority only.
+enum OriginExpectedMedia: Equatable {
+    case audioVideo, audioOnly48kMono
+    var hasVideo: Bool { self == .audioVideo }
+    var hasAudio: Bool { true }
+    func matches(hasVideo: Bool, hasAudio: Bool) -> Bool {
+        self.hasVideo == hasVideo && self.hasAudio == hasAudio
+    }
+}
+
 /// Immutable local ownership, captured before constructing a transport. None
 /// of these fields may be reconstructed from a journal or a server reply.
 struct OriginAttemptIdentity: Equatable {
@@ -24,9 +35,11 @@ struct V4vObservedAttempt: Equatable, CustomStringConvertible, CustomDebugString
     let identity: V4vIdentity
     let policyDigest: String
     let nonce: String
-    init(local: OriginAttemptIdentity, grant: V4vGrant, nonce: String) throws {
+    let expectedMedia: OriginExpectedMedia
+    init(local: OriginAttemptIdentity, grant: V4vGrant, nonce: String, expectedMedia: OriginExpectedMedia = .audioVideo) throws {
         _ = try V4vIdentity.id(nonce)
         self.local = local; identity = grant.identity; policyDigest = grant.policyDigest; self.nonce = nonce
+        self.expectedMedia = expectedMedia
     }
     static func randomNonce() throws -> String {
         var bytes = [UInt8](repeating: 0, count: 16)
@@ -61,8 +74,10 @@ struct OriginCurrentAuthority {
 struct OriginMediaSelection: Equatable, CustomStringConvertible {
     let epoch: UInt64, initialization: UInt64, part: UInt64
     let initPath: String, partPath: String
-    private init(epoch: UInt64, initialization: UInt64, part: UInt64, initPath: String, partPath: String) {
+    let hasVideo: Bool, hasAudio: Bool
+    private init(epoch: UInt64, initialization: UInt64, part: UInt64, initPath: String, partPath: String, hasVideo: Bool, hasAudio: Bool) {
         self.epoch = epoch; self.initialization = initialization; self.part = part; self.initPath = initPath; self.partPath = partPath
+        self.hasVideo = hasVideo; self.hasAudio = hasAudio
     }
     static func match(_ receipt: V4vSessionReceipt, attempt: V4vObservedAttempt, nowMs: UInt64) throws -> Self {
         guard receipt.identity.sameSession(attempt.identity), receipt.identity.revision >= attempt.identity.revision,
@@ -70,11 +85,14 @@ struct OriginMediaSelection: Equatable, CustomStringConvertible {
         guard let origin = receipt.origin else { throw OriginObservationFailure.unavailable }
         guard origin.identity == receipt.identity, origin.admission == "open", origin.expiresMs == receipt.expiresMs else { throw OriginObservationFailure.scope }
         guard origin.state == "live", origin.proto == "active", origin.attempt == attempt.nonce, let media = origin.freshMedia,
-              media.connectionEpoch == origin.epoch, media.hasAudio else { throw OriginObservationFailure.unavailable }
-        return Self(epoch: origin.epoch, initialization: media.initializationId, part: media.partId, initPath: media.initPath, partPath: media.partPath)
+              media.connectionEpoch == origin.epoch,
+              attempt.expectedMedia.matches(hasVideo: media.hasVideo, hasAudio: media.hasAudio) else { throw OriginObservationFailure.unavailable }
+        return Self(epoch: origin.epoch, initialization: media.initializationId, part: media.partId, initPath: media.initPath, partPath: media.partPath,
+                    hasVideo: media.hasVideo, hasAudio: media.hasAudio)
     }
     func stillCurrent(_ newer: Self) -> Bool {
-        epoch == newer.epoch && initialization == newer.initialization && initPath == newer.initPath && newer.part >= part
+        epoch == newer.epoch && initialization == newer.initialization && initPath == newer.initPath && newer.part >= part &&
+            hasVideo == newer.hasVideo && hasAudio == newer.hasAudio
     }
     var description: String { "Correlated origin resources (not decoded)" }
 }
@@ -97,7 +115,7 @@ struct OriginApprovedResources: Equatable, CustomStringConvertible, CustomDebugS
         guard url == initialization || url == part, timeout > 0, timeout <= 8 else { throw OriginObservationFailure.scope }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         request.httpMethod = "GET"; request.httpShouldHandleCookies = false
-        request.setValue("video/mp4, application/mp4", forHTTPHeaderField: "Accept")
+        request.setValue("video/mp4, audio/mp4, application/mp4", forHTTPHeaderField: "Accept")
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         return request // No bearer, cookies, arbitrary headers or query parameters.
     }
@@ -114,7 +132,7 @@ struct OriginMediaBody {
         guard limit > 0, limit <= Self.totalLimit else { throw OriginObservationFailure.bounds }; self.limit = limit
     }
     static func response(status: Int, length: Int64, mime: String?, limit: Int) throws {
-        guard status == 200, ["video/mp4", "application/mp4"].contains(mime?.lowercased() ?? "") else { throw OriginObservationFailure.network }
+        guard status == 200, ["video/mp4", "audio/mp4", "application/mp4"].contains(mime?.lowercased() ?? "") else { throw OriginObservationFailure.network }
         guard length >= -1, length <= limit else { throw OriginObservationFailure.bounds }
     }
     mutating func append(_ data: Data) throws {

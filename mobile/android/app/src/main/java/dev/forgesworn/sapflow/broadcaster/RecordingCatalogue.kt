@@ -27,18 +27,19 @@ internal class RecordingCatalogue(directory: Path) {
     class CatalogueFailure(val reason: Failure) : IllegalStateException("Private recording unavailable: ${reason.name}")
     enum class State { WRITING, FINALISED, INCOMPLETE, ORPHAN_UNVERIFIED }
     data class Identity(val segmentId: String, val showId: String, val segmentIndex: Long, val profileId: String) {
-        init { requireUuid(segmentId); requireUuid(showId); require(segmentIndex >= 0); require(profileId == "UNSPECIFIED" || profileId in CaptureProfile.entries.map { it.name }) }
+        init { requireUuid(segmentId); requireUuid(showId); require(segmentIndex >= 0); require(profileId == "UNSPECIFIED" || profileId == "AUDIO_ONLY_48K_MONO" || profileId in CaptureProfile.entries.map { it.name }) }
         val filename: String get() = "session-$segmentId.mp4"
     }
-    class Show internal constructor(private val profile: CaptureProfile) {
+    class Show internal constructor(internal val intent: CaptureIntent) {
         val showId: String = UUID.randomUUID().toString()
         private val next = AtomicLong()
         fun nextIdentity(): Identity {
             val index = next.getAndUpdate { Math.addExact(it, 1) }
-            return Identity(UUID.randomUUID().toString(), showId, index, profile.name)
+            return Identity(UUID.randomUUID().toString(), showId, index, intent.profileId)
         }
     }
-    fun newShow(profile: CaptureProfile): Show = Show(profile)
+    fun newShow(profile: CaptureProfile): Show = newShow(CaptureIntent.AudioVideo(profile))
+    fun newShow(intent: CaptureIntent): Show = Show(intent)
     /** Opaque selection from a bounded scan. It grants no remote authority. */
     class Entry internal constructor(val segmentId: String, val identity: Identity?, val state: State,
         val bytes: Long, val durationMs: Long?, val createdAtMs: Long?, internal val stamp: String, internal val receiptStamp: String) {

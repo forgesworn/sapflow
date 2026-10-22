@@ -29,6 +29,7 @@ internal class SrtPublishingSink(
     private val plaintext: Boolean,
     private val events: (PublishingAttemptEvent) -> Unit = {},
     private val pacingBytesPerSecond: ULong = 1_250_000uL,
+    private val intent: CaptureIntent = CaptureIntent.DEFAULT,
 ) : EncodedSink, SocketOutputProvider {
     private val outputCounter = SocketOutputCounter(SocketOutputAccounting.SRT_DATAGRAM)
     override val socketOutput: SocketOutputSource get() = outputCounter
@@ -54,6 +55,7 @@ internal class SrtPublishingSink(
     }
 
     override fun configure(video: RustCodec?, audio: RustCodec?) {
+        require(intent.hasVideo || video == null) { "Audio-only attempt received video configuration" }
         if (!closed.get()) { codecs.set(Codecs(video, audio)); selector.get()?.wakeup() }
     }
 
@@ -80,7 +82,7 @@ internal class SrtPublishingSink(
         var alarm: ScheduledFuture<*>? = null
         var pendingWrite: ByteBuffer? = null
         var writeDeadlineUs: Long? = null
-        var waitingIdr = true
+        var waitingIdr = intent.hasVideo
         try {
             val readiness = Selector.open()
             selector.set(readiness)
@@ -96,7 +98,7 @@ internal class SrtPublishingSink(
                 if (native == null) {
                     check(now < configureDeadlineUs) { "SRT codec configuration deadline exceeded" }
                     val descriptors = codecs.get()
-                    if (descriptors.video != null && descriptors.audio != null) {
+                    if (intent.codecsReady(descriptors.video != null, descriptors.audio != null)) {
                         val config = NativeSrtConfig(
                             destination = destination.nativeAddress, streamId = streamId,
                             cipher = if (plaintext) null else NativeSrtCipher.AES256,
@@ -125,8 +127,8 @@ internal class SrtPublishingSink(
                 }
                 if (closed.get()) break
                 offered.process(nowUs()) { sample ->
-                    // Both tracks must be announced at construction, but no
-                    // pre-handshake media or non-IDR video is retained here.
+                    // Expected tracks are frozen at construction; no
+                    // pre-handshake media or required non-IDR video is retained here.
                     if (closed.get() || publisher == null || publisher.state() != NativeSrtState.CONNECTED) true
                     else if (waitingIdr && (!sample.isVideo() || !sample.isKeyframe())) true
                     else if (!publisher.isReady()) false

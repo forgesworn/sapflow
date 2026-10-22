@@ -6,7 +6,7 @@ import Foundation
 final class CaptureAdmission {
     struct Preparation: Equatable {
         fileprivate let serial: UInt64
-        let profile: CaptureProfile
+        let profile: CaptureIntent
     }
     struct Start: Equatable {
         fileprivate let serial: UInt64
@@ -51,7 +51,7 @@ final class CaptureAdmission {
     var currentPreparation: Preparation? {
         locked { [.stopping, .retained, .idle].contains(phase) ? nil : preparation }
     }
-    func reservePreparation(profile: CaptureProfile = .defaultProfile) -> Preparation? {
+    func reservePreparation(profile: CaptureIntent = .defaultProfile) -> Preparation? {
         locked {
             guard phase == .idle, let serial = next() else { return nil }
             let ticket = Preparation(serial: serial, profile: profile)
@@ -106,7 +106,7 @@ final class CaptureAdmission {
     }
     func beginRotation(_ ticket: Preparation) -> Rotation? {
         locked {
-            guard preparation == ticket else { return nil }
+            guard preparation == ticket, ticket.profile.hasVideo else { return nil }
             if phase == .rotating { return rotation }
             guard phase == .running, let serial = next() else { return nil }
             let value = Rotation(serial: serial, preparation: ticket)

@@ -3,8 +3,8 @@ import Network
 import Sapflow
 
 /// Network.framework owns one connected UDP socket. Rust owns MPEG-TS, SRT,
-/// encryption, pacing, ACK/retry windows and deadlines. The capture profile is
-/// currently fixed A/V; its immutable codec handles are configured once.
+/// encryption, pacing, ACK/retry windows and deadlines. The prepared track set
+/// and immutable codec handles are fixed for this attempt.
 final class ManualSrtPublisher: EncodedPublishingSink {
     private struct Pending {
         let sample: MediaSample
@@ -15,6 +15,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private let observe: (PublishingAttemptEvent, UInt64) -> Void
     private let destination: ManualSrtDestination
     private let limits: SrtPublishingLimits
+    private let hasVideo: Bool
     private let queue = DispatchQueue(label: "sapflow.manual-srt", qos: .userInitiated)
     private let lock = NSLock()
     private var generation: UInt64 = 0
@@ -44,8 +45,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private var socketCounter = SocketCompletionCounter()
     private var finalCounters: SocketOutboundSample? // published under lock at actual close
 
-    init(destination: ManualSrtDestination, limits: SrtPublishingLimits = .manual, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) {
-        self.destination = destination; self.limits = limits; self.observe = observe
+    init(destination: ManualSrtDestination, limits: SrtPublishingLimits = .manual, hasVideo: Bool = true, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) {
+        self.destination = destination; self.limits = limits; self.hasVideo = hasVideo; self.observe = observe
     }
     deinit { timer.cancel(); connection?.cancel(); try? publisher?.stop(nowUs: Self.nowUs()) }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
@@ -69,7 +70,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         lock.unlock()
         queue.async {
             guard self.isCurrent(token), self.isAccepting() else { return }
-            self.stopping = false; self.waitingForKeyframe = true
+            self.stopping = false; self.waitingForKeyframe = self.hasVideo
             self.connectDeadlineUs = Self.nowUs() + 15_000_000
             self.statusAtUs = 0
             self.socketCounter = SocketCompletionCounter()
@@ -105,7 +106,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
             self.armDeadline(token)
         }
     }
-    func configure(video: MediaCodec, audio: MediaCodec) throws {
+    func configure(video: MediaCodec?, audio: MediaCodec) throws {
+        guard hasVideo == (video != nil) else { throw CaptureFailure(message: "SRT codecs do not match the prepared tracks") }
         lock.lock(); let token = generation; let active = accepting; lock.unlock()
         guard active else { return }
         queue.async {
@@ -120,8 +122,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     }
     private func createPublisher(_ token: UInt64) throws {
         guard publisher == nil, socketReady else { return }
-        guard let video, let audio else {
-            setStatus(token, "Waiting for encoded video/audio configuration · local recording active"); return
+        guard let audio, !hasVideo || video != nil else {
+            setStatus(token, hasVideo ? "Waiting for encoded video/audio configuration · local recording active" : "Waiting for encoded audio configuration · local recording active"); return
         }
         let config = NativeSrtConfig(destination: destination.socketAddress, streamId: destination.streamID,
             cipher: destination.encrypted ? .aes256 : nil, latencyMs: 120,
@@ -135,6 +137,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         setStatus(token, "SRT handshake · playback unconfirmed")
     }
     func offer(_ sample: MediaSample) throws {
+        guard hasVideo || !sample.isVideo() else { throw CaptureFailure(message: "Video is forbidden in this audio-only SRT attempt") }
         lock.lock(); let active = accepting; let token = generation; let budget = admission; lock.unlock()
         guard active else { return }
         let bytes = sample.len()
@@ -245,7 +248,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
             case .connected:
                 connected = true
                 observe(.accepted, DispatchTime.now().uptimeNanoseconds)
-                setStatus(token, "SRT connected · waiting for video keyframe · playback unconfirmed")
+                setStatus(token, hasVideo ? "SRT connected · waiting for video keyframe · playback unconfirmed" : "SRT connected · waiting for audio · playback unconfirmed")
             case .sending: observe(.sending, DispatchTime.now().uptimeNanoseconds)
             case .peerMediaProgress: observe(.peerMediaProgress, DispatchTime.now().uptimeNanoseconds)
             case .failed, .closed:

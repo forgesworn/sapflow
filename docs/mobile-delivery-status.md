@@ -5,7 +5,47 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-The latest origin prerequisite adds [explicit AAC-only ingest](audio-only-origin.md)
+The current source adds the [native microphone-only foreground prerequisite](audio-only-mobile.md)
+on iOS and Android. Its immutable intent follows permissions, storage, grant
+admission, Start, reconnect, private recording and exact-topology observation.
+Audio-only creates no camera, video encoder or preview and waits for no video
+keyframe. Native output is AAC-LC 48 kHz mono at a 96 kbit/s target, with a separate
+1 Mbit/s engineering grant floor. Background/lock, external routes and the rest
+of B4R remain required; foreground mode does not complete that milestone.
+
+This source also adds explicit terminal TS input and actual recording drain.
+A complete bounded AAC PES held in one start packet is no longer stranded at
+connection EOF. Truncation, raw header stuffing, missing timestamps, codec epochs
+and stale generations have focused regressions. Local finite tests remain
+distinct from a complete native show and physical shutdown qualification.
+
+App checks pass 316 Android unit tests in each of Debug and Qualification,
+with three APKs, build isolation, 16 KiB ZIP/ARM64 ELF alignment and Release
+lint at zero errors and six existing warnings. All three unsigned iOS app
+configurations and its actual unit-test bundle compile with zero warnings;
+the iOS unit bundle was not executed. Focused Swift checks also pass
+121 capture/control, 26 catalogue/storage, 33 library/export and 33
+creator-owner tests. Observation has 49 host tests and 77 packaged Rust publisher
+tests; these suites overlap. An actual generated macOS decoder matrix accepts
+48 kHz mono AAC without video, rejects wrong profiles/topologies and passes the
+hardware A/V regression. Twelve provider and twelve loopback HTTP route tests
+also pass. Initial host checks used the preceding SDK packages. Fresh Apple
+and ARM64 Android SDK packages have since been built from the current library
+source, passed their installed consumers and supplied the final app gates.
+The 77 publisher and 33 creator host tests also pass against the fresh Swift
+package. These are local package/build results, not CI or phone acceptance.
+
+The native AAC recorder experiment preserves all encoded units in stored media,
+but priming and edit interpretation change the presented packet list. Exact
+presentation and complete-show retention remain open; strict decoding alone
+does not establish them. A fresh read-only Apple/CoreDevice inventory still
+reports the primary iPhone unavailable. UI Automation was already enabled;
+no new physical runner, installation or camera test is claimed. The Pixel's
+current capture remains untouched.
+
+The checkpoints below retain their original source/package context and counts.
+
+The preceding origin prerequisite adds [explicit AAC-only ingest](audio-only-origin.md)
 through our SRT/TS and RTMP paths, HLS and recording, without a video keyframe.
 Track declarations are bounded and immutable per connection. Canonical AAC-LC
 validation, rational 44.1 kHz timing, current-part track receipts and explicit
@@ -35,8 +75,9 @@ frames. Native shutdown, terminal PES cases and complete-show retention remain
 open. The earlier default-chunk/EOF run remains separately labelled evidence.
 No phone recording was accessed;
 all test media were generated and all owned runtime children/scratch removed.
-Native mic-only mode, audio-only V4V observation/profile admission, physical
-background/lock/routes and complete-show qualification remain unfinished.
+At that earlier checkpoint native mic-only mode and audio-only observation were
+unfinished. Physical background/lock/routes and complete-show qualification
+remain open in the current checkpoint too.
 
 The latest reviewed source adds Capture elapsed, Broadcast elapsed and measured
 Socket outbound to both native apps. Local write completion remains separate

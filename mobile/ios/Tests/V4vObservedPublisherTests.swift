@@ -31,7 +31,7 @@ private final class PublisherTransport: EncodedPublishingSink {
     var status: String { "Generated transport fixture" }
     init(_ observe: @escaping (PublishingAttemptEvent, UInt64) -> Void) { self.observe = observe }
     func start() {}
-    func configure(video: MediaCodec, audio: MediaCodec) throws { emit(.accepted); emit(.sending) }
+    func configure(video: MediaCodec?, audio: MediaCodec) throws { emit(.accepted); emit(.sending) }
     func offer(_ sample: MediaSample) {}
     func emit(_ event: PublishingAttemptEvent) { observe(event, DispatchTime.now().uptimeNanoseconds) }
     func endDestination() { closed.value = true }
@@ -51,7 +51,8 @@ private final class PublisherStatus: OriginSessionStatusFetching {
     func fresh(_ attempt: V4vObservedAttempt, completion: @escaping (Result<OriginStatusSnapshot, OriginObservationFailure>) -> Void) { pending.update { $0.append(completion) } }
     func close() { closed.value = true; cleanup.complete() }
     func reply(_ index: Int, scope: V4vObservedAttempt, expiry: UInt64, part: UInt64 = 2) throws {
-        let origin = V4vFixture.edit(V4vFixture.origin(state: "live"), ["connectionAttemptId": .string(scope.nonce), "freshMedia": V4vFixture.fresh(part)])
+        let fresh = V4vFixture.edit(V4vFixture.fresh(part), ["hasVideo": .bool(scope.expectedMedia.hasVideo)])
+        let origin = V4vFixture.edit(V4vFixture.origin(state: "live"), ["connectionAttemptId": .string(scope.nonce), "freshMedia": fresh])
         let receipt = try V4vSessionReceipt(V4vFixture.session(origin: origin))
         pending.value[index](.success(OriginStatusSnapshot(receipt: receipt, expiresAtNs: expiry)))
     }
@@ -66,12 +67,19 @@ private final class PublisherMedia: OriginMediaFetching {
 }
 private final class PublisherDecoder: OriginMediaDecoding {
     let pending = PublisherBox<[(Result<OriginDecodedMedia, OriginObservationFailure>) -> Void]>([])
+    let expected = PublisherBox<[OriginExpectedMedia]>([])
     private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { true }
     func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func decode(_ data: Data, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) { pending.update { $0.append(completion) } }
+    func decode(_ data: Data, expectedMedia: OriginExpectedMedia, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
+        expected.update { $0.append(expectedMedia) }; pending.update { $0.append(completion) }
+    }
     func close() { cleanup.complete() }
-    func reply() { pending.value[0](.success(OriginDecodedMedia(videoOutputs: 2, pcmFrames: 2048, pcmOutputs: 1, hardwareVideo: true))) }
+    func reply() {
+        let video = expected.value.first?.hasVideo ?? true
+        pending.value[0](.success(OriginDecodedMedia(videoOutputs: video ? 2 : 0, pcmFrames: 2048, pcmOutputs: 1, hardwareVideo: video)))
+    }
 }
 private final class PublisherObservation {
     let scope: V4vObservedAttempt
@@ -93,7 +101,9 @@ private final class PublisherHarness {
     let engine: V4vSessionEngine
     let slot: V4vObservationSlot
     let publisher: V4vObservedPublisher
-    init(captureProfile: CaptureProfile = .defaultProfile, maxPublishBps: UInt64 = 5_000_000) throws {
+    let captureProfile: CaptureIntent
+    init(captureProfile: CaptureIntent = .defaultProfile, maxPublishBps: UInt64 = 5_000_000) throws {
+        self.captureProfile = captureProfile
         let owner = owner, clock = clock, sinks = sinks, wires = wireIDs, observations = observations
         engine = try V4vSessionEngine(profile: V4vFixture.profile(), store: PublisherJournal(), clock: clock.now(), fencePublisher: {})
         try engine.installAuthenticatedSession(pubkey: String(repeating: "a", count: 64), token: "generated-fixture-bearer", maxAgeSeconds: 60, clock: clock.now())
@@ -102,8 +112,9 @@ private final class PublisherHarness {
         try engine.applyResponse(V4vFixture.answer(grant: grant), for: XCTUnwrap(engine.pending), clock: clock.now())
         slot = V4vObservationSlot(owner: owner, clock: clock.now)
         publisher = try V4vObservedPublisher(destination: 1, permit: engine.publishingGrant(clock: clock.now()), profile: V4vFixture.profile(), engine: engine,
-            owner: owner, slot: slot, clock: clock.now, captureProfile: captureProfile, transport: { destination, limits, observe in
+            owner: owner, slot: slot, clock: clock.now, captureProfile: captureProfile, transport: { destination, limits, hasVideo, observe in
                 XCTAssertEqual(limits.bandwidthBytesPerSecond, min(1_250_000, maxPublishBps / 8))
+                XCTAssertEqual(hasVideo, captureProfile.hasVideo)
                 XCTAssertTrue(destination.encrypted)
                 wires.update { $0.append(destination.streamID) }
                 let sink = PublisherTransport(observe); sinks.update { $0.append(sink) }; return sink
@@ -114,17 +125,43 @@ private final class PublisherHarness {
     }
     func startEpoch() throws {
         // Existing generated SPS/PPS used by sapflow-client's descriptor tests.
-        let video = try MediaCodec.h264(sps: Data([0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0, 0, 3, 0, 8, 0, 0, 3, 1, 0xe0, 0x78, 0xa1, 0x4c, 0xb0]), pps: Data([0x68, 0xef, 0xbc, 0x80]))
-        let audio = try MediaCodec.aac(asc: Data([0x11, 0x90]))
+        let video: MediaCodec?
+        if captureProfile.hasVideo {
+            video = try MediaCodec.h264(sps: Data([0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0, 0, 3, 0, 8, 0, 0, 3, 1, 0xe0, 0x78, 0xa1, 0x4c, 0xb0]), pps: Data([0x68, 0xef, 0xbc, 0x80]))
+        } else { video = nil }
+        let audio = try MediaCodec.aac(asc: Data(captureProfile.hasVideo ? [0x11, 0x90] : [0x11, 0x88]))
         try publisher.start(); try publisher.configure(video: video, audio: audio)
     }
     func stop() { publisher.endDestination(); for value in observations.value { value.observer.cancel() } }
 }
 
 final class V4vObservedPublisherTests: XCTestCase {
+    func testAudioOnlyUsesOneMegabitGrantAndActualAttemptScopedPCMConfirmation() throws {
+        XCTAssertThrowsError(try PublisherHarness(captureProfile: .audioOnly48kMono, maxPublishBps: 999_999))
+        let h = try PublisherHarness(captureProfile: .audioOnly48kMono, maxPublishBps: 1_000_000); defer { h.stop() }
+        try h.startEpoch(); until { h.observations.value.count == 1 }
+        let observed = h.observations.value[0]
+        XCTAssertEqual(observed.scope.expectedMedia, .audioOnly48kMono)
+        until { observed.status.pending.value.count == 1 }
+        try observed.status.reply(0, scope: observed.scope, expiry: h.clock.base + 60_000_000_000)
+        until { observed.decoder.pending.value.count == 1 }
+        XCTAssertEqual(observed.decoder.expected.value, [.audioOnly48kMono]); XCTAssertFalse(h.publisher.status.hasPrefix("Live"))
+        observed.decoder.reply(); until { observed.status.pending.value.count == 2 }
+        XCTAssertFalse(h.publisher.status.hasPrefix("Live"))
+        try observed.status.reply(1, scope: observed.scope, expiry: h.clock.base + 60_000_000_000, part: 3)
+        until { h.publisher.status.hasPrefix("Live") }
+        h.publisher.endDestination(); XCTAssertFalse(h.publisher.status.hasPrefix("Live"))
+    }
+    func testAVExpectationRejectsMissingVideoBeforeTransportOrObservation() throws {
+        let h = try PublisherHarness(); defer { h.stop() }
+        try h.publisher.start()
+        let audio = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+        XCTAssertThrowsError(try h.publisher.configure(video: nil, audio: audio))
+        h.owner.sync {}; XCTAssertTrue(h.sinks.value.isEmpty); XCTAssertTrue(h.observations.value.isEmpty)
+    }
     func testExplicit480RetainsOneMegabitLimitAcrossRecordingEpochs() throws {
         // The codec fixture exercises publishing ownership, not camera geometry.
-        let h = try PublisherHarness(captureProfile: .sd480p30, maxPublishBps: 1_000_000); defer { h.stop() }
+        let h = try PublisherHarness(captureProfile: .audioVideo(.sd480p30), maxPublishBps: 1_000_000); defer { h.stop() }
         for count in 1...2 {
             try h.startEpoch(); until { h.sinks.value.count == count }
             let closed = expectation(description: "real epoch closed")
@@ -139,8 +176,8 @@ final class V4vObservedPublisherTests: XCTestCase {
         XCTAssertThrowsError(try PublisherHarness(maxPublishBps: 1_000_000))
     }
     func testEngineering1080AdmissionNeedsEightMegabits() throws {
-        XCTAssertThrowsError(try PublisherHarness(captureProfile: .fullHD1080p30))
-        let h = try PublisherHarness(captureProfile: .fullHD1080p30, maxPublishBps: 8_000_000); defer { h.stop() }
+        XCTAssertThrowsError(try PublisherHarness(captureProfile: .audioVideo(.fullHD1080p30)))
+        let h = try PublisherHarness(captureProfile: .audioVideo(.fullHD1080p30), maxPublishBps: 8_000_000); defer { h.stop() }
         try h.startEpoch(); until { h.sinks.value.count == 1 }
     }
     func testPublishingStartsBeforeEarliestActivatedCodecDiscovery() throws {
@@ -198,7 +235,7 @@ final class V4vObservedPublisherTests: XCTestCase {
         let other = try V4vConnectorProfile(apiOrigin: "https://another.example.invalid", playbackOrigin: profile.playbackOrigin, playbackPrefix: profile.playbackPrefix)
         let slot = V4vObservationSlot(owner: owner, clock: clock.now)
         var transports = 0, observations = 0
-        XCTAssertThrowsError(try V4vObservedPublisher(destination: 1, permit: engine.publishingGrant(clock: clock.now()), profile: other, engine: engine, owner: owner, slot: slot, clock: clock.now, transport: { _, _, observe in
+        XCTAssertThrowsError(try V4vObservedPublisher(destination: 1, permit: engine.publishingGrant(clock: clock.now()), profile: other, engine: engine, owner: owner, slot: slot, clock: clock.now, transport: { _, _, _, observe in
             transports += 1; return PublisherTransport(observe)
         }, observation: { _, _, _ in observations += 1; throw OriginObservationFailure.scope }))
         XCTAssertEqual(transports, 0); XCTAssertEqual(observations, 0)

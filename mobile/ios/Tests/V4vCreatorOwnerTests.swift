@@ -30,7 +30,7 @@ private final class CreatorCapture: V4vCreatorCapturePort {
     var holdAttach = false
     var beforeAttachCompletion: (() -> Void)?
     var ticket: CaptureAdmission.Preparation?
-    func reservePreparation(profile: CaptureProfile) -> CaptureAdmission.Preparation? { reservations += 1; ticket = admission.reservePreparation(profile: profile); return ticket }
+    func reservePreparation(profile: CaptureIntent) -> CaptureAdmission.Preparation? { reservations += 1; ticket = admission.reservePreparation(profile: profile); return ticket }
     func abandonPreparation(_ ticket: CaptureAdmission.Preparation) { admission.candidateClosed(ticket, cleanupComplete: true); admission.failed(ticket, cleanupComplete: true) }
     func setDestination(_ sink: EncodedPublishingSink?, preparation: CaptureAdmission.Preparation, completion: @escaping (Bool) -> Void) {
         let result = admission.attached(preparation)
@@ -121,7 +121,7 @@ private final class CreatorFixture {
     let journal = CreatorJournal(), signerJournal = CreatorJournal(), capture = CreatorCapture()
     var client: CreatorHTTP!
     var publishers: [CreatorPublisher] = []
-    var publisherProfiles: [CaptureProfile] = []
+    var publisherProfiles: [CaptureIntent] = []
     var publisherError: V4vFailure?
     var login: CreatorLogin?
     var beforePublisherReturn: ((CreatorPublisher) -> Void)?
@@ -204,13 +204,30 @@ final class V4vCreatorOwnerTests: XCTestCase {
     }
     func testPendingPrepareRetainsExplicitProfileAcrossHTTPAndCallerChanges() throws {
         let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()
-        var selected = CaptureProfile.sd480p30
+        var selected = CaptureIntent.sd480p30
         XCTAssertTrue(f.owner.prepare(captureProfile: selected)); selected = .hd720p30
         f.flush(); XCTAssertFalse(f.owner.canChangeCaptureSettings)
         f.answer(.success(V4vFixture.answer()))
         XCTAssertEqual(selected, .hd720p30)
         XCTAssertEqual(f.capture.ticket?.profile, .sd480p30); XCTAssertEqual(f.publisherProfiles, [.sd480p30])
         XCTAssertEqual(f.capture.prepared, 1); XCTAssertEqual(f.capture.started, 0)
+    }
+    func testPendingAudioOnlyPrepareBindsSameIntentToPublisherAndCaptureAtLowCap() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()
+        var selected = CaptureIntent.audioOnly48kMono
+        XCTAssertTrue(f.owner.prepare(captureProfile: selected)); selected = .hd720p30
+        f.flush(); XCTAssertFalse(f.owner.canChangeCaptureSettings)
+        let grant = V4vFixture.edit(V4vFixture.grant(), ["limits": .object(["maxPublishBps": .integer(1_000_000), "maxQueueBytes": .integer(4_194_304)])])
+        f.answer(.success(V4vFixture.answer(grant: grant)))
+        XCTAssertEqual(selected, .hd720p30)
+        XCTAssertEqual(f.capture.ticket?.profile, .audioOnly48kMono)
+        XCTAssertEqual(f.publisherProfiles, [.audioOnly48kMono])
+        XCTAssertEqual(f.capture.prepared, 1); XCTAssertEqual(f.capture.started, 0)
+        f.owner.captureChanged(prepared: true, running: false, stopping: false); f.flush()
+        XCTAssertTrue(f.owner.start()); f.flush()
+        XCTAssertEqual(f.capture.started, 1)
+        XCTAssertEqual(f.capture.admission.currentPreparation?.profile, .audioOnly48kMono)
+        XCTAssertNil(f.capture.admission.beginRotation(try XCTUnwrap(f.capture.ticket)))
     }
     func testEngineering1080CannotConsumeDefaultGrantOrCreateOwners() throws {
         let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()

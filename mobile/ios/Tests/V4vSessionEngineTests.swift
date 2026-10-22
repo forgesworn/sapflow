@@ -59,7 +59,7 @@ final class V4vTypedContractsTests: XCTestCase {
     }
     func testFreshMediaRequiresExactCanonicalIdentityAndPaths() throws {
         XCTAssertNoThrow(try V4vFreshMedia(V4vFixture.fresh(), event: V4vFixture.event, epoch: 1))
-        for changes: [String: V4vJSON] in [["partPath": .string("https://evil.example.invalid/x")], ["initPath": .string("/live/\(V4vFixture.event)/abc_init0.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/abc_part02.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/def_part2.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/abc_part2.mp4?x")], ["hasVideo": .bool(false)], ["connectionEpoch": .integer(2)], ["decoded": .bool(true)]] {
+        for changes: [String: V4vJSON] in [["partPath": .string("https://evil.example.invalid/x")], ["initPath": .string("/live/\(V4vFixture.event)/abc_init0.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/abc_part02.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/def_part2.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/abc_part2.mp4?x")], ["hasVideo": .bool(false), "hasAudio": .bool(false)], ["connectionEpoch": .integer(2)], ["decoded": .bool(true)]] {
             XCTAssertThrowsError(try V4vFreshMedia(V4vFixture.edit(V4vFixture.fresh(), changes), event: V4vFixture.event, epoch: 1))
         }
     }

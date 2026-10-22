@@ -9,7 +9,7 @@ struct SrtPublishingLimits: Equatable {
         self.queueBytes = queueBytes; self.bandwidthBytesPerSecond = bandwidthBytesPerSecond
     }
     static let manual = SrtPublishingLimits(queueBytes: 4 * 1024 * 1024, bandwidthBytesPerSecond: 1_250_000)
-    static func scoped(maxQueueBytes: UInt64, maxPublishBps: UInt64, captureProfile: CaptureProfile = .defaultProfile) throws -> Self {
+    static func scoped(maxQueueBytes: UInt64, maxPublishBps: UInt64, captureProfile: CaptureIntent = .defaultProfile) throws -> Self {
         try captureProfile.requireGrant(maxPublishBps: maxPublishBps)
         guard (1500...4_194_304).contains(maxQueueBytes) else { throw SrtPublishingLimitFailure.invalid }
         return Self(queueBytes: UInt32(maxQueueBytes), bandwidthBytesPerSecond: min(manual.bandwidthBytesPerSecond, maxPublishBps / 8))

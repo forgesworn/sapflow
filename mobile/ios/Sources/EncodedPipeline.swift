@@ -31,7 +31,7 @@ protocol EncodedPublishingSink: AnyObject {
     func closeCodecEpoch()
     func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void)
     func start() throws
-    func configure(video: MediaCodec, audio: MediaCodec) throws
+    func configure(video: MediaCodec?, audio: MediaCodec) throws
     func offer(_ sample: MediaSample) throws
     func stop()
     func stop(completion: @escaping () -> Void)
@@ -45,7 +45,7 @@ extension EncodedPublishingSink {
     func endDestination() { stop() }
     func closeCodecEpoch() {}
     func finishEpoch(completion: @escaping (Result<Void, Error>) -> Void) { stop { completion(.success(())) } }
-    func configure(video: MediaCodec, audio: MediaCodec) throws {}
+    func configure(video: MediaCodec?, audio: MediaCodec) throws {}
     func stop(completion: @escaping () -> Void) { stop(); completion() }
     func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) { completion(nil) }
     var finalSocketOutbound: SocketOutboundSample? { nil }
@@ -55,6 +55,7 @@ extension EncodedPublishingSink {
 /// Connects native compressed data to the actual Rust descriptor validator.
 /// No attached destination means recording/SDK validation only, visibly so.
 final class RustEncodedIngress {
+    private var expectsVideo = true
     private var video: MediaCodec?
     private var audio: MediaCodec?
     private var previousVideoConfig: CodecDescription?
@@ -68,6 +69,7 @@ final class RustEncodedIngress {
         let codec: MediaCodec
         switch configuration {
         case let .h264(sps, pps):
+            guard expectsVideo else { throw CaptureFailure(message: "Video is forbidden in this audio-only capture") }
             if case let .h264(oldSps, oldPps) = previousVideoConfig, oldSps != sps || oldPps != pps {
                 throw CaptureFailure(message: "Video format changed. Stop and prepare a new recording.")
             }
@@ -86,19 +88,22 @@ final class RustEncodedIngress {
     }
     /// Allows a fixture or a platform with advance CSD to share the same codec
     /// handles before media arrives; ordinary capture discovers them in accept.
-    func prepare(video: CodecDescription, audio: CodecDescription) throws {
-        _ = try codec(for: video); _ = try codec(for: audio)
+    func prepare(video: CodecDescription?, audio: CodecDescription) throws {
+        guard expectsVideo == (video != nil) else { throw CaptureFailure(message: "Codec tracks do not match the prepared capture") }
+        if let video { _ = try codec(for: video) }
+        _ = try codec(for: audio)
         try configureDestination()
     }
     private func configureDestination() throws {
-        if !configuredDestination, let video, let audio {
-            // This capture profile always has both tracks. Freeze each shared
-            // codec once before SRT constructs its TS/transport epoch.
+        if !configuredDestination, let audio, !expectsVideo || video != nil {
+            // Track intent is frozen before capture, independently of which
+            // encoder happens to deliver configuration first.
             try destination?.configure(video: video, audio: audio)
             configuredDestination = true
         }
     }
     func accept(_ unit: CompressedUnit) throws {
+        guard !unit.isVideo || expectsVideo else { throw CaptureFailure(message: "Video is forbidden in this audio-only capture") }
         let codec = try codec(for: unit.configuration)
         try configureDestination()
         guard let block = CMSampleBufferGetDataBuffer(unit.buffer) else { throw CaptureFailure(message: "Compressed buffer has no payload") }
@@ -127,10 +132,11 @@ final class RustEncodedIngress {
         accepted += 1
     }
 
-    func reset() {
+    func reset(hasVideo: Bool = true) {
         // The old epoch barrier is owned by finishEpoch; resetting codec
         // discovery must not cancel the logical reconnect session.
         video = nil; audio = nil
+        expectsVideo = hasVideo
         previousVideoConfig = nil; previousAudioConfig = nil
         accepted = 0; configuredDestination = false
     }
