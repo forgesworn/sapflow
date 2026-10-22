@@ -14,47 +14,7 @@ struct CaptureSnapshot {
     var running = false
 }
 
-final class IngressWorker {
-    private let queue = DispatchQueue(label: "sapflow.encoded-ingress", qos: .userInitiated)
-    private let budget = EncodedWorkBudget(bytes: 4 * 1024 * 1024, count: 128, span: 1)
-    let ingress: RustEncodedIngress
-    private let failure: (Error) -> Void
-    private let statistics: (UInt64, String) -> Void
-    private var lastStatistics = 0.0
-    private var failed = false
-    init(ingress: RustEncodedIngress, failure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void) { self.ingress = ingress; self.failure = failure; self.statistics = statistics }
-    func offer(_ unit: CompressedUnit) {
-        guard let reservation = budget.reserve(bytes: unit.byteCount) else {
-            if budget.close() { queue.async { self.fail(CaptureFailure(message: "Encoded SDK ingress exceeded its bounded backlog")) } }
-            return
-        }
-        queue.async {
-            defer { self.budget.release(reservation) }
-            guard !self.failed else { return }
-            do {
-                try self.ingress.accept(unit)
-                let now = ProcessInfo.processInfo.systemUptime
-                if now - self.lastStatistics >= 0.5 {
-                    self.lastStatistics = now
-                    self.statistics(self.ingress.accepted, self.ingress.status)
-                }
-            } catch { if self.budget.close() { self.fail(error) } }
-        }
-    }
-    private func fail(_ error: Error) {
-        guard !failed else { return }
-        failed = true
-        ingress.destination?.endDestination()
-        failure(error)
-    }
-    func finish(_ completion: @escaping (Result<Void, Error>) -> Void) {
-        budget.close()
-        queue.async {
-            if let destination = self.ingress.destination { destination.finishEpoch(completion: completion) }
-            else { completion(.success(())) }
-        }
-    }
-}
+extension CaptureEngine: V4vCreatorCapturePort {}
 
 final class CaptureRun {
     let recorder: CompressedRecorder
@@ -129,6 +89,17 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     /// Attach a real bounded destination adapter before preparing. No endpoint
     /// or credential is inferred from a display label or bundled configuration.
     func reservePreparation() -> CaptureAdmission.Preparation? { admission.reservePreparation() }
+    /// The destination owner separately fences its captured publisher. This
+    /// exact camera fence cancels initial approval without stopping a recording
+    /// that already began, including its later orientation epochs.
+    func cancelPendingPreparation(_ preparation: CaptureAdmission.Preparation) {
+        guard let ticket = admission.stopIfPending(preparation) else { return }
+        control.async {
+            guard self.admission.permitsStop(ticket) else { return }
+            self.stopIntent = ticket
+            self.stopOnControl(reason: nil)
+        }
+    }
     /// A factory that failed before creating native owners can retire only its
     /// exact reservation. It cannot bypass an already requested Stop barrier.
     func abandonPreparation(_ ticket: CaptureAdmission.Preparation) {
@@ -376,9 +347,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 } }, meter: { [weak self] level in self?.meter(level) })
             // Once native owners exist, even a winning synchronous Stop must
             // reach their actual worker/recorder cleanup path before admission.
-            self.samples.sync { self.run = run }
-            self.snapshot.running = true; self.snapshot.canStart = false
-            try self.ingress.destination?.start()
+            run.worker.startPublishing {
+                self.samples.sync { self.run = run }
+                self.snapshot.running = true; self.snapshot.canStart = false
+            }
             guard self.admission.started(ticket) else { self.stopOnControl(reason: nil); return }
             self.snapshot.phase = "Recording"
             self.snapshot.detail = "Hardware encoder: \(run.video.implementation). Saving compressed video and audio locally."

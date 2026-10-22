@@ -29,6 +29,7 @@ final class CaptureAdmission {
     private var stopping: Stop?
     private var candidatePending = false
     private var stoppedOwnersClean = false
+    private var hasCommittedRun = false
 
     init(initialSerial: UInt64 = 0) { serial = initialSerial }
     private func locked<T>(_ body: () -> T) -> T {
@@ -47,7 +48,7 @@ final class CaptureAdmission {
         locked {
             guard phase == .idle, let serial = next() else { return nil }
             let ticket = Preparation(serial: serial)
-            preparation = ticket; candidatePending = true; phase = .reserved
+            preparation = ticket; candidatePending = true; hasCommittedRun = false; phase = .reserved
             return ticket
         }
     }
@@ -86,7 +87,7 @@ final class CaptureAdmission {
     func started(_ ticket: Start) -> Bool {
         locked {
             guard preparation == ticket.preparation, starting == ticket, phase == .starting else { return false }
-            starting = nil; phase = .running; return true
+            starting = nil; hasCommittedRun = true; phase = .running; return true
         }
     }
     func beginRotation(_ ticket: Preparation) -> Rotation? {
@@ -112,14 +113,23 @@ final class CaptureAdmission {
     /// Synchronous invalidation precedes queued cancellation. Duplicate Stop
     /// joins the same cleanup owner; it cannot release that owner's capacity.
     func stop() -> Stop {
+        locked { stopLocked() }
+    }
+    /// Ending a destination retires its initial camera approval, while an
+    /// existing recording keeps its intent through rotation and restart.
+    func stopIfPending(_ ticket: Preparation) -> Stop? {
         locked {
-            if let stopping { return stopping }
-            // At serial exhaustion no fresh preparation can ever be admitted.
-            // A saturated cleanup ticket still permits the current owner to stop.
-            let value = Stop(serial: next() ?? UInt64.max, preparation: preparation)
-            stopping = value; starting = nil; rotation = nil; phase = .stopping
-            return value
+            guard preparation == ticket, !hasCommittedRun, phase != .idle else { return nil }
+            return stopLocked()
         }
+    }
+    private func stopLocked() -> Stop {
+        if let stopping { return stopping }
+        // At serial exhaustion no fresh preparation can ever be admitted.
+        // A saturated cleanup ticket still permits the current owner to stop.
+        let value = Stop(serial: next() ?? UInt64.max, preparation: preparation)
+        stopping = value; starting = nil; rotation = nil; phase = .stopping
+        return value
     }
     func permitsStop(_ ticket: Stop) -> Bool {
         locked { stopping == ticket && (phase == .stopping || phase == .retained) }
@@ -140,7 +150,7 @@ final class CaptureAdmission {
     private func releaseStoppedIfReady() -> Bool {
         guard stopping != nil, stoppedOwnersClean, !candidatePending else { return false }
         preparation = nil; starting = nil; rotation = nil; stopping = nil
-        stoppedOwnersClean = false; phase = .idle
+        stoppedOwnersClean = false; hasCommittedRun = false; phase = .idle
         return true
     }
     /// False means cleanup ownership remains retained. A later real completion
@@ -158,10 +168,10 @@ final class CaptureAdmission {
     /// A racing Stop owns its own barrier and cannot be bypassed by this path.
     @discardableResult func failed(_ ticket: Preparation, cleanupComplete: Bool) -> Bool {
         locked {
-            guard preparation == ticket, stopping == nil else { return false }
+            guard preparation == ticket, stopping == nil, !hasCommittedRun else { return false }
             starting = nil; rotation = nil
             guard cleanupComplete else { phase = .retained; return false }
-            candidatePending = false; preparation = nil; phase = .idle; return true
+            candidatePending = false; preparation = nil; hasCommittedRun = false; phase = .idle; return true
         }
     }
 }

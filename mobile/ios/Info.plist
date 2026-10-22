@@ -11,6 +11,10 @@
 <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
 <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
 <key>LSRequiresIPhoneOS</key><true/>
+<key>SapflowV4vEnabled</key><string>$(SAPFLOW_V4V_ENABLED)</string>
+<key>SapflowV4vApiOrigin</key><string>$(SAPFLOW_V4V_API_ORIGIN)</string>
+<key>SapflowV4vPlaybackOrigin</key><string>$(SAPFLOW_V4V_PLAYBACK_ORIGIN)</string>
+<key>SapflowV4vPlaybackPrefix</key><string>$(SAPFLOW_V4V_PLAYBACK_PREFIX)</string>
 <key>NSCameraUsageDescription</key><string>Sapflow uses your camera for your foreground recording and broadcast.</string>
 <key>NSMicrophoneUsageDescription</key><string>Sapflow uses your microphone for your recording and broadcast audio.</string>
 <key>NSLocalNetworkUsageDescription</key><string>Sapflow connects to the streaming destination you choose on your local network.</string>

@@ -15,7 +15,7 @@ suite.addTest(OriginObservationPolicyTests.defaultTestSuite)
 suite.addTest(OriginObservationPipelineTests.defaultTestSuite)
 suite.addTest(OriginObservationSlotTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 36, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 39, result.hasSucceeded else { exit(1) }
 SWIFT
 sapflow_sources=(SrtDestination SrtPublishingLimits V4vContracts V4vSessionEngine V4vControlClient V4vLoginContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot)
 sapflow_files=()

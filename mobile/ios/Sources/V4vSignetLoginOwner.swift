@@ -57,6 +57,7 @@ final class V4vSignetLoginOwner: @unchecked Sendable {
     private let clock: () -> UInt64
     private let unixSeconds: () -> UInt64
     private let commit: (V4vLoginResult) throws -> Void
+    private let onCleanupComplete: () -> Void
     // Keep one bounded owner alive across a failed close receipt. A later real
     // HTTP invalidation must still reach it even if its caller drops the UI.
     private var retainedSelf: V4vSignetLoginOwner?
@@ -71,9 +72,11 @@ final class V4vSignetLoginOwner: @unchecked Sendable {
          delivery: DispatchQueue, makeSigner: @escaping SignerFactory, makeHTTP: @escaping HTTPFactory,
          clock: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
          unixSeconds: @escaping () -> UInt64 = { UInt64(max(0, Date().timeIntervalSince1970)) },
+         onCleanupComplete: @escaping () -> Void = {},
          commit: @escaping (V4vLoginResult) throws -> Void) {
         self.profile = profile; self.credentials = credentials; self.delivery = delivery
         self.makeSigner = makeSigner; self.makeHTTP = makeHTTP; self.clock = clock; self.unixSeconds = unixSeconds; self.commit = commit
+        self.onCleanupComplete = onCleanupComplete
     }
     /// Restore never silently generates a fresh client identity on a bad journal.
     @discardableResult func start(restoring: Bool, timeoutMs: UInt32 = 120_000, completion: @escaping (Result<Void, V4vFailure>) -> Void) -> Bool {
@@ -178,6 +181,10 @@ final class V4vSignetLoginOwner: @unchecked Sendable {
         timer?.setEventHandler {}; timer?.cancel(); timer = nil
         lock.unlock()
         delivery.async { [self] in
+            // Emitted once after the actual work-queue close transition, even
+            // if a prior failure consumed the result callback. The later
+            // registered unlock runs first, so this is outside the owner lock.
+            defer { onCleanupComplete() }
             lock.lock(); defer { lock.unlock() }
             guard let callback = completion else {
                 // A bounded cleanup-failure result may already have consumed

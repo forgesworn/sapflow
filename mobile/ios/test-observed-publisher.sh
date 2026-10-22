@@ -5,7 +5,7 @@ sapflow_root="$(cd "$(dirname "$0")/../.." && pwd)"
 sapflow_scratch="$(mktemp -d "$sapflow_root/target/sapflow-ios-observed-XXXXXX")"
 trap 'rm -rf "$sapflow_scratch"' EXIT
 mkdir -p "$sapflow_scratch/Sources/SapflowBroadcaster" "$sapflow_scratch/Tests/NativePublisherTests"
-for sapflow_source in EncodedPipeline EncodedWorkBudget DestinationProfile SrtDestination SrtPublishingLimits NativeDeadlineTimer ReconnectController ReconnectingPublisher ManualSrtPublisher V4vContracts V4vSessionEngine V4vControlClient V4vLoginContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot OriginSDKConfirmation V4vObservedPublisher; do
+for sapflow_source in EncodedPipeline EncodedIngressWorker EncodedWorkBudget DestinationProfile SrtDestination SrtPublishingLimits NativeDeadlineTimer ReconnectController ReconnectingPublisher ManualSrtPublisher V4vContracts V4vSessionEngine V4vControlClient V4vLoginContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot OriginSDKConfirmation V4vObservedPublisher; do
   cp "$sapflow_root/mobile/ios/Sources/$sapflow_source.swift" "$sapflow_scratch/Sources/SapflowBroadcaster/"
 done
 sed '/^final class V4vTypedContractsTests/,$d' "$sapflow_root/mobile/ios/Tests/V4vSessionEngineTests.swift" > "$sapflow_scratch/Tests/NativePublisherTests/Fixtures.swift"

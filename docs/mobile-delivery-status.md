@@ -41,9 +41,10 @@ not run on the Pixel; the owner's existing capture remains untouched.
 iOS commit `fdc731fc` provides typed V4V contracts, bounded URLSession control,
 durable session operations and encrypted journal storage. It passes 35 host
 Swift tests and an iOS 16 compile check with warnings treated as errors.
-Independent review is clear. It is a foundation separate from the installed
-app: creator sign-in, application wiring and real Keychain/network acceptance
-remain open.
+Independent review is clear. At that foundation checkpoint creator sign-in,
+application wiring and real Keychain/network acceptance remained open. The
+normal application source below extends that work; the installed app remains
+separate from these source gates.
 
 Further iOS source adds a finite production origin-observation component with
 36 passing host tests. The earlier component passes an iOS 16 compiler check.
@@ -60,8 +61,8 @@ tests against the actual packaged Rust session, using simulated transport and
 decode facts. A single app-owned observation slot retains uncertain cleanup
 without polling or admitting another decoder. Scoped queue/pacing limits,
 early codec-close fencing and an independent monotonic grant-expiry alarm are
-implemented in source. Normal creator application wiring remains open; the
-installed app has not been replaced by this work.
+implemented in source. The normal creator application wiring is described
+below; the installed app has not been replaced by this work.
 
 The separate maintained Signet authentication package now builds for ARM64
 macOS, iOS and iOS Simulator. The actual combined static consumer, iOS 16
@@ -70,22 +71,65 @@ dependency packet passes 512 workspace tests, strict Clippy, parser fuzz and
 ten packaging regressions. The generated app project declares both packages;
 the full unsigned iOS application builds and links both with zero warnings or
 errors. Authentication headers have their own module directory, avoiding a
-shared Xcode include destination. Creator
-sign-in UI, real remote-signer consent and physical app qualification remain
-open. No real account or relay was used by these build gates.
+shared Xcode include destination. The normal application now includes creator
+sign-in controls; real remote-signer consent and physical app qualification
+remain open. No real account or relay was used by these build gates.
 
 The creator-read packet passes 63 Foundation tests, including twelve new tests,
 and real-package macOS/iOS 16 compiler checks. Its event list is bounded and
 display-only. Fixed authenticated collection and exact-session reads preserve
 uncertain operations and terminal End intent; reads never recover a grant.
-The capture-admission fix passes 59 host tests, including twenty ticket tests.
-All 32 production Swift files typecheck for iOS 16 with both real native modules
-and no warnings. Prepare, permission replies, Start, Stop and rotation retain
+The earlier capture-admission fix passes 59 host tests, including twenty ticket
+tests. All 32 production Swift files at that checkpoint typecheck for iOS 16 with
+both real native modules and no warnings. Prepare, permission replies, Start, Stop and rotation retain
 their exact admitted intent. Stop waits for outstanding destination construction
 and actual rejected-destination cleanup before allowing another intent. These
-are source gates; physical capture and normal V4V creator UI remain open.
+are source gates; physical capture remains open.
 CI now includes source verification and the generated-only source and packaging
 regressions. Those commands pass locally; hosted CI has not run for this branch.
+
+The normal SwiftUI application now has explicit Record only, Manual destination
+and V4V modes. A single app-lifetime creator owner composes the real Signet
+adapter, separate encrypted publish and signer journals, typed event reads,
+durable session operations and the scoped publisher. Connect signer, Prepare
+and Start are explicit. An uncertain operation retains its original identity;
+inactive mode cannot attach a late grant or start capture. Refresh requires an
+acknowledged lease, and recovery acknowledgement and replacement are separate
+actions. V4V remains free, unlimited and without a watermark.
+
+End fences a delayed first Start while preserving a recording already in
+progress, including its orientation epochs. Publishing starts before the Run
+is exposed to initial samples; publishing startup failure closes only that
+worker. Leaving a manual destination fences its exact publisher independently
+of delayed display state. Closed creator owners retain the observation slot,
+HTTP, signer and journal ownership until actual cleanup. The fixed production
+journal lock prevents a replacement production owner overlapping that cleanup.
+
+V4V is unavailable by default in Debug and Release. A separate Qualification
+configuration requires explicit approved routing and native authentication.
+Qualification settings do not enable the ordinary configurations. These source
+and build boundaries do not establish a deployed native-session backend, real
+signer consent, Keychain acceptance or a physical V4V show. No installed app or
+active Android capture has been replaced by this work.
+
+The final generated-fixture checks pass 74 pure capture/destination tests,
+64 control/authentication tests, 28 creator-owner tests using both real native
+packages, 39 observation/cleanup tests, 46 publisher/observation tests using the
+real Rust policy, and 14 configuration tests. These suites overlap; the counts
+must not be added as unique coverage. The final creator source also passes
+all three actual-package iOS 16 compiler checks without warnings. Independent
+source review is clear, including the actual asynchronous Signet cleanup
+notification after a prior failure consumed its result callback.
+
+The complete unsigned app builds for Debug, Qualification and Release with zero
+warnings or errors, using identical current inputs and both real native
+packages. Actual built property lists confirm default Debug is disabled,
+Qualification expands its explicit example profile, and ordinary Release remains
+disabled even when qualification variables are supplied. All three binaries
+contain the expected authentication and attempt-scoped media-confirmation
+symbols. The actual iOS unit-test bundle also compiles and links without warnings;
+it was not run. No signing, installation, device capture or real account action
+was performed by these gates.
 
 Test commit `d0643ff` adds a generated-media-only macOS native reader gate.
 The current origin's exact init plus independent part passes independent FFmpeg

@@ -9,6 +9,8 @@ protocols over Network.framework TCP/TLS and UDP. Recording and publishing remai
 independent. A logical publisher now binds the shared Rust reconnect policy
 across socket attempts and orientation codec epochs. Physical iPhone recovery,
 remote decoded observation and sustained capture qualification remain open.
+The normal application also includes the explicit V4V creator flow below;
+real signer, service and phone acceptance remain separate gates.
 
 ## Build
 
@@ -35,6 +37,95 @@ signing identity, provisioning profile or distributable package is assumed.
 Generated projects, build products and DerivedData stay under `target/`.
 A simulator build proves compilation only: hardware/camera availability is
 checked at runtime and unsupported hardware must fail visibly.
+
+## V4V creator flow
+
+The application has three explicit destinations: Record only, Manual destination
+and V4V. Record only remains the launch default. One app-owned creator controller
+survives view updates and destination changes; camera callbacks never run its
+authentication, journal or HTTP work. V4V streaming is always unlimited, free
+and without a watermark. There is no subscription check in this path.
+
+V4V requires a reviewed build profile. Debug and Release default to
+`SAPFLOW_V4V_ENABLED=NO`, with empty API origin, playback origin and playback
+prefix. Disabled builds display an unavailable message and do not open creator
+journals, Keychain services or a signer runtime. An enabled profile requires
+literal `YES`, three valid routing values and the real SignetAuth module.
+Missing, partial or invalid configuration fails closed. A manual destination
+cannot supply this profile.
+
+The separate Qualification configuration maps
+`SAPFLOW_QUALIFICATION_V4V_ENABLED`, `SAPFLOW_QUALIFICATION_V4V_API_ORIGIN`,
+`SAPFLOW_QUALIFICATION_V4V_PLAYBACK_ORIGIN` and
+`SAPFLOW_QUALIFICATION_V4V_PLAYBACK_PREFIX` into those four settings. Debug and
+Release do not consume the qualification settings. Use approved, deployed
+backend and playback routing for a real qualification; example domains only
+establish build isolation. Do not put private routes or account data in source.
+
+In an enabled build, choose V4V, explicitly connect a remote signer or use its
+saved client, load the manageable events and choose one. Prepare obtains and
+durably acknowledges the session grant before attaching the exact camera
+preparation. Start broadcast remains a separate user action. Sign-in, an event
+read, restored state or a late HTTP reply cannot start capture. A remote
+session without matching local ownership is a visible conflict, not a grant
+to adopt it. Restored credentials require fresh authentication; a restored
+publish session requires a fresh acknowledged refresh before use.
+
+The control path admits one ordinary command and one primary HTTP request at
+a time. Session HTTP operations have an original 60-second window and at most
+four attempts. Explicit sign-in has a separate original 120-second limit that
+includes queueing, native connection, consent, HTTP and adoption. End can fence
+and reconcile independently of a cancelled sign-in's delayed cleanup.
+Retry saved action reconciles
+the existing durable operation rather than creating another Prepare. An
+acknowledged refresh updates the publisher's current lease; transport progress
+alone never extends it. Inactive mode cancels pending local approval and its
+captured publisher without stopping another destination. Only exact uncertain
+operations and terminal End reconciliation may continue while inactive.
+
+End broadcast synchronously fences the captured publisher and any first Start
+that has not committed. An existing local recording continues, including its
+later rotation segments, until Stop and save. A publishing startup failure is
+isolated from the recorder. The publisher starts before native sample delivery
+can discover its codec configuration. Remote End and Stop and save are distinct
+controls. Incomplete replay acknowledgement and replacement preparation are
+separate explicit actions; acknowledgement requires fresh exact-session status.
+An ended phase alone is labelled unconfirmed until the service returns the
+separate End-complete receipt. Leaving a manual destination also fences its
+captured publisher, even if Start committed before the UI received its running
+update; a local recording that already began can continue.
+
+The production factory uses distinct encrypted directories and Keychain services
+for publish/End state and remote-signer client credentials. It opens them on the
+same serial owner as the session engine and starts inactive. Corrupt or missing
+halves fail visibly without resetting or falling back to another session.
+Uncertain publisher, HTTP, signer and observation cleanup retain their actual
+owners until completion.
+
+Run the generated-fixture host checks without a phone or account:
+
+```sh
+bash mobile/ios/test-budget.sh
+bash mobile/ios/test-v4v.sh
+bash mobile/ios/test-origin-observation.sh
+bash mobile/ios/test-observed-publisher.sh
+bash mobile/ios/test-creator-owner.sh
+bash mobile/ios/test-config.sh
+```
+
+The publisher and creator-owner checks use the actual packaged native modules.
+They simulate transport, consent, journal and origin facts; they do not establish
+remote-signer consent, Keychain behaviour, a deployed V4V journey or physical
+camera/recording acceptance. Verify an actual built `Info.plist` using
+`test-config.sh --verify-info disabled PATH/Info.plist`, or `--verify-info enabled`
+followed by the path and the three expected routing values.
+
+The complete normal application currently passes unsigned Debug, Qualification
+and Release builds with both real packages and warnings treated as errors.
+Built-property-list checks verify default Debug, enabled example Qualification
+and disabled ordinary Release despite supplied qualification settings. The
+iOS unit-test bundle also compiles and links. These are compiler/configuration
+gates; no test runner, phone, signer, account or capture is exercised by them.
 
 ## Capture and ownership
 
@@ -160,8 +251,8 @@ Apple documents physical buffer rotation for
 
 ## Manual RTMPS publishing
 
-Local recording is the default. Turn off “Local recording only” to configure a
-manual destination. Enter the RTMPS application URL and stream key separately,
+Local recording is the default. Choose Manual destination to configure a
+destination. Enter the RTMPS application URL and stream key separately,
 then Prepare and explicitly Start broadcast. Destination editing freezes while
 prepared/running, so an edited field cannot silently change what Start sends to.
 Stop before changing destinations. The application URL must have an application

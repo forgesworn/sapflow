@@ -2,6 +2,73 @@ import XCTest
 @testable import SapflowBroadcaster
 
 final class CaptureAdmissionTests: XCTestCase {
+    func testEndRetiresEveryInitialPreparationPhaseBeforeStartCommits() {
+        for stage in 0...4 {
+            let gate = CaptureAdmission(), ticket = gate.reservePreparation()!
+            if stage >= 1 { XCTAssertTrue(gate.attached(ticket)) }
+            if stage >= 2 { XCTAssertTrue(gate.beginPermissions(ticket)) }
+            if stage >= 3 { XCTAssertTrue(gate.prepared(ticket)) }
+            let start = stage == 4 ? gate.reserveStart(ticket) : nil
+            let stop = gate.stopIfPending(ticket)!
+            XCTAssertFalse(gate.permitsPreparation(ticket)); XCTAssertNil(gate.reserveStart(ticket))
+            if let start { XCTAssertFalse(gate.started(start)) }
+            if stage == 0 {
+                XCTAssertFalse(gate.completeStop(stop, cleanupComplete: true))
+                XCTAssertTrue(gate.candidateClosed(ticket, cleanupComplete: true))
+            } else { XCTAssertTrue(gate.completeStop(stop, cleanupComplete: true)) }
+            XCTAssertNotNil(gate.reservePreparation())
+        }
+    }
+    func testEndWinningBeforeStartedRequiresAssignedRunCleanup() {
+        let gate = CaptureAdmission(), intent = preparing(gate)
+        XCTAssertTrue(gate.prepared(intent)); let start = gate.reserveStart(intent)!
+        let end = gate.stopIfPending(intent)!
+        XCTAssertFalse(gate.started(start))
+        XCTAssertFalse(gate.completeStop(end, cleanupComplete: false)); XCTAssertNil(gate.reservePreparation())
+        XCTAssertTrue(gate.completeStop(end, cleanupComplete: true))
+    }
+    func testStartedWinningBeforeEndPreservesIndependentRecording() {
+        let gate = CaptureAdmission(), intent = running(gate)
+        XCTAssertNil(gate.stopIfPending(intent)); XCTAssertEqual(gate.currentPhase, .running)
+        XCTAssertEqual(gate.currentPreparation, intent); XCTAssertNil(gate.reservePreparation())
+    }
+    func testEndPreservesExistingRecordingThroughRotationAndItsStartingPhase() {
+        let gate = CaptureAdmission(), intent = running(gate)
+        let child = gate.beginRotation(intent)!
+        XCTAssertNil(gate.stopIfPending(intent)); XCTAssertTrue(gate.permitsRotation(child))
+        let restart = gate.reserveRotationStart(child)!
+        XCTAssertNil(gate.stopIfPending(intent)); XCTAssertTrue(gate.permitsStart(restart))
+        XCTAssertTrue(gate.started(restart)); XCTAssertEqual(gate.currentPreparation, intent)
+    }
+    func testOldEndCannotRetireOrFenceSuccessorPreparation() {
+        let gate = CaptureAdmission(), old = preparing(gate)
+        let stopped = gate.stopIfPending(old)!
+        XCTAssertTrue(gate.completeStop(stopped, cleanupComplete: true))
+        let next = preparing(gate)
+        XCTAssertNil(gate.stopIfPending(old)); XCTAssertFalse(gate.permitsStop(stopped))
+        XCTAssertTrue(gate.permitsPreparation(next))
+    }
+    func testRepeatedEndJoinsFactoryAndActualCandidateCleanupBarrier() {
+        let gate = CaptureAdmission(), factory = gate.reservePreparation()!
+        let end = gate.stopIfPending(factory)!
+        XCTAssertEqual(gate.stopIfPending(factory), end)
+        XCTAssertFalse(gate.completeStop(end, cleanupComplete: true)); XCTAssertNil(gate.reservePreparation())
+        XCTAssertFalse(gate.candidateClosed(factory, cleanupComplete: false)); XCTAssertNil(gate.reservePreparation())
+        XCTAssertEqual(gate.stopIfPending(factory), end)
+        XCTAssertTrue(gate.candidateClosed(factory, cleanupComplete: true)); XCTAssertNil(gate.stopIfPending(factory))
+    }
+    func testLateCandidateCannotReleaseEndWithUnconfirmedNativeCleanup() {
+        let gate = CaptureAdmission(), factory = gate.reservePreparation()!, end = gate.stopIfPending(factory)!
+        XCTAssertFalse(gate.completeStop(end, cleanupComplete: false))
+        XCTAssertFalse(gate.candidateClosed(factory, cleanupComplete: true)); XCTAssertNil(gate.reservePreparation())
+        XCTAssertTrue(gate.completeStop(end, cleanupComplete: true)); XCTAssertNotNil(gate.reservePreparation())
+    }
+    func testPreparationFailureCannotRetireCommittedRecordingIntent() {
+        let gate = CaptureAdmission(), intent = running(gate)
+        XCTAssertFalse(gate.failed(intent, cleanupComplete: true)); XCTAssertEqual(gate.currentPhase, .running)
+        XCTAssertTrue(gate.completeStop(gate.stop(), cleanupComplete: true))
+        let next = preparing(gate); XCTAssertNotNil(gate.stopIfPending(next))
+    }
     private func preparing(_ gate: CaptureAdmission) -> CaptureAdmission.Preparation {
         let ticket = gate.reservePreparation()!
         XCTAssertTrue(gate.attached(ticket)); XCTAssertTrue(gate.beginPermissions(ticket))

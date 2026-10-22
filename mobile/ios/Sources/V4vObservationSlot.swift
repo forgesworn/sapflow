@@ -17,16 +17,38 @@ final class V4vObservationSlot {
     private var active: (attempt: V4vObservedAttempt, observer: V4vOriginObserver)?
     private var pending: V4vObservationRequest?
     private var pendingTimer: DispatchSourceTimer?
+    private var isClosed = false
+    private var closeCompletion: (() -> Void)?
+    private var retainedSelf: V4vObservationSlot?
     init(owner: DispatchQueue, clock: @escaping () -> V4vClock) { self.owner = owner; self.clock = clock }
 
     func submit(_ request: V4vObservationRequest) {
         dispatchPrecondition(condition: .onQueue(owner))
+        guard !isClosed else { discard(request, reason: .cancelled); return }
         let previous = pending
         pending = request
         if let previous { discard(previous, reason: .cancelled) }
         armPendingDeadline()
         if let active { active.observer.cancel() }
         else { advance() }
+    }
+    /// Owner-queue barrier for actual observer cleanup, not its semantic
+    /// timeout. One pending close listener is retained; duplicate closes
+    /// coalesce. After actual closure, callbacks run immediately.
+    func close(onClosed: @escaping () -> Void) {
+        dispatchPrecondition(condition: .onQueue(owner))
+        guard !isClosed else {
+            if active == nil { onClosed() }
+            return
+        }
+        isClosed = true
+        closeCompletion = onClosed
+        if active != nil { retainedSelf = self }
+        let previous = pending
+        pending = nil; cancelPendingTimer()
+        if let previous { discard(previous, reason: .cancelled) }
+        active?.observer.cancel()
+        finishCloseIfClean()
     }
     func cancel(_ local: OriginAttemptIdentity) {
         dispatchPrecondition(condition: .onQueue(owner))
@@ -49,7 +71,7 @@ final class V4vObservationSlot {
         request.completed(.failure(reason))
     }
     private func advance() {
-        guard active == nil, let request = pending else { return }; pending = nil; cancelPendingTimer()
+        guard !isClosed, active == nil, let request = pending else { return }; pending = nil; cancelPendingTimer()
         let now = clock().monotonicNs
         guard request.deadlineNs > now, request.deadlineNs - now <= 8_000_000_000 else { discard(request, reason: .deadline); return }
         guard request.gate.permits(request.attempt, nowNs: now) else { discard(request, reason: .scope); return }
@@ -65,7 +87,14 @@ final class V4vObservationSlot {
     }
     private func closed(_ attempt: V4vObservedAttempt) {
         guard active?.attempt == attempt else { return }
-        active = nil; advance()
+        active = nil
+        if isClosed { finishCloseIfClean() } else { advance() }
+    }
+    private func finishCloseIfClean() {
+        guard isClosed, active == nil else { return }
+        let callback = closeCompletion; closeCompletion = nil
+        retainedSelf = nil
+        callback?()
     }
     private func cancelPendingTimer() { pendingTimer?.setEventHandler {}; pendingTimer?.cancel(); pendingTimer = nil }
     private func armPendingDeadline() {

@@ -121,6 +121,51 @@ private final class PublisherHarness {
 }
 
 final class V4vObservedPublisherTests: XCTestCase {
+    func testPublishingStartsBeforeEarliestActivatedCodecDiscovery() throws {
+        let h = try PublisherHarness(); defer { h.stop() }
+        let ingress = RustEncodedIngress(); ingress.destination = h.publisher
+        let worker = IngressWorker(ingress: ingress, failure: { _ in XCTFail("Unexpected publishing failure") }, statistics: { _, _ in })
+        // Activation makes native callbacks eligible immediately. Discovering
+        // both codecs here must configure the already started logical epoch.
+        XCTAssertTrue(worker.startPublishing {
+            do {
+                try ingress.prepare(
+                    video: .h264(sps: Data([0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0, 0, 3, 0, 8, 0, 0, 3, 1, 0xe0, 0x78, 0xa1, 0x4c, 0xb0]), pps: Data([0x68, 0xef, 0xbc, 0x80])),
+                    audio: .aac(asc: Data([0x11, 0x90])))
+            } catch { XCTFail("Codec discovery failed") }
+        })
+        until { h.sinks.value.count == 1 && h.observations.value.count == 1 }
+        XCTAssertFalse(h.publisher.status.hasPrefix("Live"))
+        let closed = expectation(description: "actual epoch cleanup")
+        worker.finish { result in
+            if case .failure = result { XCTFail("Unexpected retained publisher") }
+            closed.fulfill()
+        }
+        wait(for: [closed], timeout: 1)
+    }
+    func testEndedPublisherStartupClosesOnlyIngressAcrossRecordingEpochs() throws {
+        let h = try PublisherHarness(); defer { h.stop() }
+        h.publisher.endDestination()
+        for _ in 0..<2 {
+            let ingress = RustEncodedIngress(); ingress.destination = h.publisher
+            let failed = expectation(description: "publishing failure reported once")
+            let failures = PublisherBox(0)
+            let worker = IngressWorker(ingress: ingress, failure: { _ in failures.update { $0 += 1 }; failed.fulfill() }, statistics: { _, _ in })
+            XCTAssertFalse(worker.startPublishing())
+            XCTAssertFalse(worker.startPublishing())
+            wait(for: [failed], timeout: 1)
+            XCTAssertEqual(failures.value, 1)
+            let closed = expectation(description: "actual publisher epoch cleanup")
+            worker.finish { result in
+                if case .failure = result { XCTFail("Unexpected retained publisher") }
+                closed.fulfill()
+            }
+            wait(for: [closed], timeout: 1)
+        }
+        h.owner.sync {}
+        XCTAssertTrue(h.sinks.value.isEmpty)
+        XCTAssertFalse(h.publisher.status.hasPrefix("Live"))
+    }
     func testPublisherRejectsAnotherProfileBeforeAllocatingTransportOrObserver() throws {
         let owner = DispatchQueue(label: "publisher.profile.binding"), clock = PublisherClock()
         let profile = try V4vFixture.profile()

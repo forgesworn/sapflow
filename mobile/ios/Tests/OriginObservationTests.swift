@@ -298,21 +298,25 @@ final class OriginObservationPolicyTests: XCTestCase {
 private final class OriginFakeStatus: OriginSessionStatusFetching {
     let pending = OriginTestBox<[(Result<OriginStatusSnapshot, OriginObservationFailure>) -> Void]>([])
     let closed = OriginTestBox(false)
+    var closesImmediately = true
     private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { closed.value }
     func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func fresh(_ attempt: V4vObservedAttempt, completion: @escaping (Result<OriginStatusSnapshot, OriginObservationFailure>) -> Void) { pending.update { $0.append(completion) } }
-    func close() { closed.value = true; cleanup.complete() }
+    func close() { if closesImmediately { completeCleanup() } }
+    func completeCleanup() { closed.value = true; cleanup.complete() }
     func reply(_ index: Int, _ receipt: V4vSessionReceipt, expiry: UInt64 = UInt64.max) { pending.value[index](.success(OriginStatusSnapshot(receipt: receipt, expiresAtNs: expiry))) }
 }
 private final class OriginFakeMedia: OriginMediaFetching {
     let closed = OriginTestBox(false)
     let calls = OriginTestBox(0)
+    var closesImmediately = true
     private let cleanup = OriginCleanupNotification()
     var cleanupComplete: Bool { closed.value }
     func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func fetch(_ resources: OriginApprovedResources, deadlineNs: UInt64, completion: @escaping (Result<Data, OriginObservationFailure>) -> Void) { calls.update { $0 += 1 }; completion(.success(Data([1]))) }
-    func close() { closed.value = true; cleanup.complete() }
+    func close() { if closesImmediately { completeCleanup() } }
+    func completeCleanup() { closed.value = true; cleanup.complete() }
 }
 private final class OriginFakeDecoder: OriginMediaDecoding {
     let callbacks = OriginTestBox<[(Result<OriginDecodedMedia, OriginObservationFailure>) -> Void]>([])
@@ -484,6 +488,70 @@ final class OriginObservationSlotTests: XCTestCase {
         until { candidate.status.pending.value.count == 1 }
         candidate.status.reply(0, try OriginFixture.receipt(nonce: candidate.scope.nonce))
         until { candidate.decoder.callbacks.value.count == 1 }
+    }
+    func testCloseOfCleanSlotIsImmediateAndPermanentlyRejectsRequests() throws {
+        let owner = DispatchQueue(label: "origin.slot.close.clean"), clock = OriginTestClock(), gate = OriginConfirmationGate()
+        let slot = V4vObservationSlot(owner: owner, clock: clock.now)
+        let calls = OriginTestBox(0), candidate = try OriginSlotCandidate(token: 3, gate: gate, clock: clock)
+        owner.sync {
+            slot.close { calls.update { $0 += 1 } }
+            XCTAssertEqual(calls.value, 1)
+            slot.close { calls.update { $0 += 1 } }
+            slot.submit(candidate.request(owner: owner))
+        }
+        XCTAssertEqual(calls.value, 2)
+        XCTAssertEqual(candidate.builds.value, 0)
+        XCTAssertEqual(candidate.results.value.count, 1)
+        XCTAssertFalse(gate.permits(candidate.scope, nowNs: clock.base))
+    }
+    func testCloseWaitsForNativeAndBothLateIOOwnersAndRejectsSuccessor() throws {
+        let owner = DispatchQueue(label: "origin.slot.close.owners"), clock = OriginTestClock(), gate = OriginConfirmationGate()
+        let slot = V4vObservationSlot(owner: owner, clock: clock.now)
+        let old = try OriginSlotCandidate(token: 3, gate: gate, clock: clock)
+        old.decoder.cleaned.value = false
+        old.status.closesImmediately = false; old.media.closesImmediately = false
+        try decodeStarted(old, slot: slot, owner: owner)
+        let next = try OriginSlotCandidate(token: 4, gate: gate, clock: clock)
+        let calls = OriginTestBox(0), closed = expectation(description: "all actual owners closed")
+        owner.sync {
+            slot.submit(next.request(owner: owner))
+            slot.close { calls.update { $0 += 1 }; closed.fulfill() }
+            slot.close { calls.update { $0 += 100 } }
+        }
+        XCTAssertEqual(next.results.value.count, 1); XCTAssertEqual(next.builds.value, 0)
+        old.decoder.reply(); old.status.reply(0, try OriginFixture.receipt())
+        old.decoder.completeCleanup(); owner.sync {}
+        XCTAssertEqual(calls.value, 0)
+        old.status.completeCleanup(); owner.sync {}
+        XCTAssertEqual(calls.value, 0)
+        old.media.completeCleanup()
+        wait(for: [closed], timeout: 1)
+        XCTAssertEqual(calls.value, 1); XCTAssertEqual(old.confirmations.value, 0)
+        XCTAssertEqual(old.results.value.count, 1)
+        owner.sync { slot.submit(next.request(owner: owner)); slot.close { calls.update { $0 += 1 } } }
+        XCTAssertEqual(next.builds.value, 0); XCTAssertEqual(calls.value, 2)
+    }
+    func testSemanticCleanupTimeoutDoesNotCompleteCloseOrReleaseSlot() throws {
+        let owner = DispatchQueue(label: "origin.slot.close.retention"), clock = OriginTestClock(), gate = OriginConfirmationGate()
+        var slot: V4vObservationSlot? = V4vObservationSlot(owner: owner, clock: clock.now)
+        weak var retained = slot
+        let candidate = try OriginSlotCandidate(token: 3, gate: gate, clock: clock)
+        candidate.decoder.cleaned.value = false
+        try decodeStarted(candidate, slot: slot!, owner: owner)
+        let calls = OriginTestBox(0), closed = expectation(description: "late actual cleanup")
+        owner.sync { slot!.close { calls.update { $0 += 1 }; closed.fulfill() } }
+        slot = nil
+        until { candidate.status.closed.value }
+        let semanticTimeout = expectation(description: "semantic cleanup failure")
+        owner.asyncAfter(deadline: .now() + 2.1) { semanticTimeout.fulfill() }
+        wait(for: [semanticTimeout], timeout: 3)
+        XCTAssertEqual(candidate.results.value.count, 1)
+        if case .failure(.cleanup) = candidate.results.value.first {} else { XCTFail("Expected cleanup failure") }
+        XCTAssertEqual(calls.value, 0); XCTAssertNotNil(retained)
+        candidate.decoder.reply(); candidate.decoder.completeCleanup()
+        wait(for: [closed], timeout: 1)
+        until { retained == nil }
+        XCTAssertEqual(calls.value, 1); XCTAssertEqual(candidate.confirmations.value, 0)
     }
     func testCoalescedLatestSuccessorWaitsForActualCleanupAfterFailure() throws {
         let owner = DispatchQueue(label: "origin.slot.coalesce"), clock = OriginTestClock(), gate = OriginConfirmationGate()
