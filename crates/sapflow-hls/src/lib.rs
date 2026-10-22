@@ -14,10 +14,15 @@ pub mod muxer;
 pub mod playlist;
 pub mod rtmp;
 pub mod time;
+pub mod tracks;
 
 pub use flv::FlvIngest;
 pub use ingest::{EsIngest, IngestError, TsIngest};
 pub use muxer::{Muxer, MuxerConfig, PartLookup, Readiness, Update};
+pub use tracks::TrackSet;
+
+#[cfg(test)]
+mod audio_only_tests;
 
 /// `EXT-X-TARGETDURATION`, fixed for the life of a stream.
 ///

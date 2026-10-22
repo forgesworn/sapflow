@@ -71,7 +71,22 @@ fuzz_target!(|data: &[u8]| {
                 Ok(Some(Event::Video { timestamp, data })) => {
                     let _ = ingest.video(timestamp, &data, SystemTime::UNIX_EPOCH);
                 }
-                Ok(Some(Event::Audio { timestamp, data })) => ingest.audio(timestamp, &data),
+                Ok(Some(Event::Audio { timestamp, data })) => {
+                    if ingest
+                        .audio_at(timestamp, &data, SystemTime::UNIX_EPOCH)
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(Some(Event::Tracks { tracks })) => {
+                    if ingest
+                        .declare_tracks(tracks, SystemTime::UNIX_EPOCH)
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 Ok(Some(Event::Metadata { audio })) => ingest.expect_audio(audio),
                 Ok(Some(Event::Finished)) | Ok(None) => break,
                 Err(_) => return,

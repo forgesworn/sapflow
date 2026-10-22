@@ -231,7 +231,7 @@ mod tests {
     fn health() -> StreamEvent {
         StreamEvent::Health(Health {
             bitrate_kbps: 1000,
-            keyframe_interval_ms: 1000,
+            keyframe_interval_ms: Some(1000),
             audio: true,
             breaks: 0,
         })

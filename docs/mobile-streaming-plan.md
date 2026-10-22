@@ -391,6 +391,10 @@ narrower connected/sending status honestly.
 
 ### B4R General-release creator essentials
 
+The [explicit AAC-only origin contract](audio-only-origin.md) defines the
+server/SDK prerequisite. Native mode selection, background operation and physical
+acceptance retain the requirements below.
+
 Qualify these additions before the general release; the first SRT engineering
 pilot remains a smaller vertical slice:
 

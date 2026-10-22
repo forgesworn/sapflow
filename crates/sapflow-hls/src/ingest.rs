@@ -19,6 +19,7 @@ use mpeg2ts::ts::{Pid, ReadTsPacket, TsPacket, TsPacketReader, TsPayload};
 use crate::codec::{self, AAC_FRAME_SAMPLES, AacConfig, H264Config};
 use crate::muxer::{MuxError, Muxer, MuxerConfig, Update};
 
+use crate::TrackSet;
 use crate::time::{Unwrapper, signed_delta};
 
 const TS_SIZE: usize = 188;
@@ -34,6 +35,10 @@ pub enum IngestError {
     PresentationExpired,
     /// No keyframe for too long, or a segment beyond the size limit.
     SegmentTooLarge,
+    InvalidTracks,
+    TrackConflict,
+    InvalidAudio,
+    InvalidTimestamp,
 }
 
 impl std::fmt::Display for IngestError {
@@ -42,14 +47,30 @@ impl std::fmt::Display for IngestError {
             Self::PresentationExpired => f.write_str("presentation reconnect deadline expired"),
             Self::UnsupportedVideo => f.write_str("video is not H.264"),
             Self::SegmentTooLarge => f.write_str("segment too large (keyframe interval?)"),
+            Self::InvalidTracks => f.write_str("invalid track set"),
+            Self::TrackConflict => f.write_str("track set changed within a connection"),
+            Self::InvalidAudio => f.write_str("unsupported or changed AAC configuration"),
+            Self::InvalidTimestamp => f.write_str("audio timestamp outside supported range"),
         }
     }
 }
 
 impl std::error::Error for IngestError {}
 
+impl From<MuxError> for IngestError {
+    fn from(value: MuxError) -> Self {
+        match value {
+            MuxError::SegmentTooLarge => Self::SegmentTooLarge,
+            MuxError::InvalidTracks => Self::InvalidTracks,
+            MuxError::InvalidAudio => Self::InvalidAudio,
+            MuxError::Timestamp => Self::InvalidTimestamp,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct Program {
+    seen: bool,
     h264: bool,
     other_video: bool,
     aac: bool,
@@ -171,7 +192,10 @@ impl ReadTsPacket for Feed {
                     if let Some(TsPayload::Pmt(pmt)) = &p.payload
                         && let Ok(mut input) = self.input.lock()
                     {
-                        let mut program = Program::default();
+                        let mut program = Program {
+                            seen: true,
+                            ..Program::default()
+                        };
                         for es in &pmt.es_info {
                             match es.stream_type {
                                 StreamType::H264 => program.h264 = true,
@@ -218,6 +242,7 @@ pub struct EsIngest {
     aac: Option<AacConfig>,
     /// Whether to hold the first keyframe until the audio config is known.
     expect_audio: bool,
+    declared: Option<TrackSet>,
     muxer: Option<Muxer>,
 }
 
@@ -230,6 +255,7 @@ impl EsIngest {
             pps: None,
             aac: None,
             expect_audio: true,
+            declared: None,
             muxer: None,
         }
     }
@@ -259,8 +285,31 @@ impl EsIngest {
         self.muxer.take()
     }
 
+    /// Only an authoritative PMT or explicit RTMP declaration may select
+    /// audio-only. Missing video metadata and early AAC do not imply radio.
+    pub fn declare_tracks(
+        &mut self,
+        tracks: TrackSet,
+        _now: SystemTime,
+    ) -> Result<Update, IngestError> {
+        if self.declared.is_some_and(|old| old != tracks)
+            || (self.origin.is_some() && self.muxer.as_ref().is_some_and(|m| m.tracks() != tracks))
+        {
+            return Err(IngestError::TrackConflict);
+        }
+        self.declared = Some(tracks);
+        self.expect_audio = tracks.has_audio();
+        Ok(Update::default())
+    }
+
+    pub fn declared_tracks(&self) -> Option<TrackSet> {
+        self.declared
+    }
+
     pub fn set_expect_audio(&mut self, expect: bool) {
-        self.expect_audio = expect;
+        if self.declared.is_none() {
+            self.expect_audio = expect;
+        }
     }
 
     /// Parameter sets from out of band (RTMP's sequence header) or in band.
@@ -268,7 +317,7 @@ impl EsIngest {
         if let Some(sps) = sps {
             if let Some(m) = &self.muxer
                 && self.origin.is_some()
-                && m.video().sps != sps
+                && m.video().is_some_and(|video| video.sps != sps)
                 && self.sps.as_ref() != Some(&sps)
             {
                 // The init segment is fixed at the first keyframe.
@@ -319,6 +368,9 @@ impl EsIngest {
         au: codec::AccessUnit,
         now: SystemTime,
     ) -> Result<Update, IngestError> {
+        if self.declared == Some(TrackSet::AudioOnly) {
+            return Err(IngestError::TrackConflict);
+        }
         self.parameter_sets(au.sps, au.pps);
         if au.data.is_empty() {
             return Ok(Update::default());
@@ -341,9 +393,7 @@ impl EsIngest {
             }
             let audio = if self.expect_audio { self.aac } else { None };
             if let Some(m) = &mut self.muxer
-                && (m.video().sps != video.sps
-                    || m.video().pps != video.pps
-                    || m.audio().copied() != audio)
+                && (m.video() != Some(&video) || m.audio().copied() != audio)
             {
                 tracing::warn!(
                     "reconnected encoder changed configuration; starting a new codec epoch on the existing timeline"
@@ -367,15 +417,67 @@ impl EsIngest {
                 Bytes::from(au.data),
                 now,
             )
-            .map_err(|e| match e {
-                MuxError::SegmentTooLarge => IngestError::SegmentTooLarge,
-            })?;
+            .map_err(IngestError::from)?;
         update.restarted |= restarted;
         Ok(update)
     }
 
-    /// One raw AAC frame.
+    /// One raw AAC frame plus caller-owned wall time. The returned update is
+    /// essential for waking audio-only playlists and beginning origin recording.
+    pub fn audio_at(
+        &mut self,
+        pts: i64,
+        config: AacConfig,
+        payload: &[u8],
+        now: SystemTime,
+    ) -> Result<Update, IngestError> {
+        if self.declared == Some(TrackSet::VideoOnly) {
+            return Err(IngestError::TrackConflict);
+        }
+        if (self.origin.is_some() || self.declared == Some(TrackSet::AudioOnly))
+            && self.aac.is_some_and(|old| old != config)
+        {
+            return Err(IngestError::InvalidAudio);
+        }
+        self.audio_config(config);
+        if payload.is_empty() {
+            return Ok(Update::default());
+        }
+        if self.declared != Some(TrackSet::AudioOnly) {
+            self.audio(pts, config, payload);
+            return Ok(Update::default());
+        }
+        let mut update = Update::default();
+        if self.origin.is_none() {
+            if let Some(muxer) = &mut self.muxer {
+                if muxer.tracks() != TrackSet::AudioOnly || muxer.audio() != Some(&config) {
+                    update.merge(muxer.reconfigure_tracks(None, Some(config), now)?);
+                    update.restarted = true;
+                }
+            } else {
+                self.muxer = Some(Muxer::audio_only(self.cfg, config)?);
+            }
+            self.origin = Some(pts);
+        }
+        let origin = self.origin.ok_or(IngestError::InvalidTimestamp)?;
+        let relative = pts
+            .checked_sub(origin)
+            .ok_or(IngestError::InvalidTimestamp)?;
+        update.merge(
+            self.muxer
+                .as_mut()
+                .ok_or(IngestError::InvalidTracks)?
+                .push_audio_at(relative, Bytes::copy_from_slice(payload), now)?,
+        );
+        Ok(update)
+    }
+
+    /// Legacy video-led AAC path. Audio-only consumers need `audio_at` and
+    /// must forward its updates to waiters/recorders.
     pub fn audio(&mut self, pts: i64, config: AacConfig, payload: &[u8]) {
+        if self.declared == Some(TrackSet::AudioOnly) {
+            return;
+        }
         self.audio_config(config);
         let (Some(muxer), Some(origin)) = (self.muxer.as_mut(), self.origin) else {
             return;
@@ -514,10 +616,7 @@ impl TsIngest {
         };
         match id {
             0xE0..=0xEF => self.on_video(pts, pes.header.dts.map(|t| t.as_u64()), &pes.data, now),
-            0xC0..=0xDF => {
-                self.on_audio(pts, &pes.data);
-                Ok(())
-            }
+            0xC0..=0xDF => self.on_audio(pts, &pes.data, now),
             _ => Ok(()),
         }
     }
@@ -530,9 +629,10 @@ impl TsIngest {
         now: SystemTime,
     ) -> Result<(), IngestError> {
         let program = self.program();
-        if program.other_video && !program.h264 {
+        if program.other_video {
             return Err(IngestError::UnsupportedVideo);
         }
+        self.declare_program(program, now)?;
         self.es.set_expect_audio(program.aac);
         let dts_raw = dts_raw.unwrap_or(pts_raw);
         let dts = self.clock.unwrap(dts_raw);
@@ -547,12 +647,38 @@ impl TsIngest {
         Ok(())
     }
 
-    fn on_audio(&mut self, pts_raw: u64, data: &[u8]) {
-        let pts = self.clock.unwrap(pts_raw);
-        for (i, (config, payload)) in codec::adts_frames(data).into_iter().enumerate() {
-            let step = i64::from(AAC_FRAME_SAMPLES) * 90_000 / i64::from(config.sample_rate.max(1));
-            self.es.audio(pts + step * i as i64, config, payload);
+    fn declare_program(&mut self, program: Program, now: SystemTime) -> Result<(), IngestError> {
+        if !program.seen {
+            return Ok(());
         }
+        if program.other_video {
+            return Err(IngestError::UnsupportedVideo);
+        }
+        let tracks = match (program.h264, program.aac) {
+            (true, true) => TrackSet::AudioVideo,
+            (true, false) => TrackSet::VideoOnly,
+            (false, true) => TrackSet::AudioOnly,
+            (false, false) => return Err(IngestError::InvalidTracks),
+        };
+        self.pending.merge(self.es.declare_tracks(tracks, now)?);
+        Ok(())
+    }
+
+    fn on_audio(&mut self, pts_raw: u64, data: &[u8], now: SystemTime) -> Result<(), IngestError> {
+        self.declare_program(self.program(), now)?;
+        let pts = self.clock.unwrap(pts_raw);
+        let mut elapsed_samples = 0i64;
+        for (config, payload) in codec::adts_frames(data) {
+            let offset =
+                i128::from(elapsed_samples) * 90_000 / i128::from(config.sample_rate.max(1));
+            let timestamp = pts
+                .checked_add(i64::try_from(offset).map_err(|_| IngestError::InvalidTimestamp)?)
+                .ok_or(IngestError::InvalidTimestamp)?;
+            self.pending
+                .merge(self.es.audio_at(timestamp, config, payload, now)?);
+            elapsed_samples += i64::from(AAC_FRAME_SAMPLES);
+        }
+        Ok(())
     }
 }
 
@@ -633,8 +759,8 @@ mod tests {
         let ing = ingest_in_chunks(1316);
         let m = ing.muxer().expect("muxer");
         assert!(m.has_content());
-        assert_eq!(m.video().width, 320);
-        assert_eq!(m.video().height, 180);
+        assert_eq!(m.video().expect("video").width, 320);
+        assert_eq!(m.video().expect("video").height, 180);
         assert_eq!(m.audio().map(|a| a.sample_rate), Some(48000));
         let seg = m.segment(LEADING_GAPS).expect("first segment");
         assert_eq!(seg.duration.as_millis(), 1000);
@@ -920,6 +1046,74 @@ mod epoch_window_tests {
                 .check(&latest.replace("fixed_seg", "changed_seg"))
                 .is_err(),
             "same MSN must never be relabelled"
+        );
+    }
+}
+
+#[cfg(test)]
+mod declared_topology_tests {
+    use super::*;
+
+    #[test]
+    fn no_pmt_is_not_an_audio_only_declaration() {
+        let mut ingest = TsIngest::new(MuxerConfig::default());
+        ingest
+            .declare_program(
+                Program {
+                    seen: false,
+                    aac: true,
+                    ..Program::default()
+                },
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("an unseen PMT leaves topology undeclared");
+        assert_eq!(ingest.es.declared_tracks(), None);
+    }
+
+    #[test]
+    fn known_unsupported_video_cannot_be_hidden_by_aac_or_supported_video() {
+        for h264 in [false, true] {
+            let mut ingest = TsIngest::new(MuxerConfig::default());
+            assert_eq!(
+                ingest.declare_program(
+                    Program {
+                        seen: true,
+                        aac: true,
+                        h264,
+                        other_video: true
+                    },
+                    SystemTime::UNIX_EPOCH
+                ),
+                Err(IngestError::UnsupportedVideo)
+            );
+            assert_eq!(ingest.es.declared_tracks(), None);
+        }
+    }
+
+    #[test]
+    fn a_second_pmt_cannot_change_connection_topology() {
+        let mut ingest = TsIngest::new(MuxerConfig::default());
+        ingest
+            .declare_program(
+                Program {
+                    seen: true,
+                    aac: true,
+                    ..Program::default()
+                },
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("first authoritative AAC-only PMT is accepted");
+        assert_eq!(
+            ingest.declare_program(
+                Program {
+                    seen: true,
+                    aac: true,
+                    h264: true,
+                    other_video: false
+                },
+                SystemTime::UNIX_EPOCH
+            ),
+            Err(IngestError::TrackConflict)
         );
     }
 }

@@ -3,8 +3,8 @@
 | Target | What it feeds |
 |--------|---------------|
 | `ts_ingest` | Arbitrary MPEG-TS in arbitrary chunks (SRT publisher) |
-| `flv_ingest` | Arbitrary FLV video/audio tag bodies (RTMP publisher) |
-| `muxer_timing` | Arbitrary frame timing into the LL-HLS muxer (steps, stalls, steps back, keyframes anywhere, audio between); every rendered playlist must pass `playlist::RuleCheck`: fixed `TARGETDURATION` and `PART-TARGET`, `EXTINF` within the target, the part rules, consistent discontinuities |
+| `flv_ingest` | Arbitrary FLV video/audio tag bodies, with explicit track declarations in prefixed inputs (RTMP publisher) |
+| `muxer_timing` | Arbitrary video or declared AAC-only timing into the LL-HLS muxer (steps, stalls, steps back, interruptions and codec epochs); every rendered playlist must pass `playlist::RuleCheck`: fixed `TARGETDURATION` and `PART-TARGET`, `EXTINF` within the target, the part rules, consistent discontinuities |
 | `small_parsers` | Stream ids, RTMP keys, chunk names, HLS queries, ages, ASC, avcC, ADTS, Annex B, AVCC |
 | `own_srt_packet` | Our SRT packet codec (`sapflow_srt::packet`): parse, then encode, parse again and encode again; both must agree |
 | `own_srt_listener` | Our SRT listener (`sapflow_srt::Listener`) as the server drives it: datagrams from three peers, time steps, accept or refuse, the application closing connections. Each peer echoes its SYN cookie and addresses the socket id it was given, so data, ACKACKs, drop requests and shutdowns reach open connections. Checks that everything sent parses and that a timer exists exactly while connections do. Seeded with recorded sessions (see below) |
@@ -80,6 +80,23 @@ RUSTC_BOOTSTRAP=1 cargo fuzz run -O -a publish_session seeds/publish_session -- 
 Use a temporary copy of these seeds for mutation runs so generated corpus files
 do not become source fixtures. Actual local execution and CI remain separate
 evidence from the presence of the target and seeds.
+
+The AAC-only seeds use original scalar framing and synthetic sample placeholders;
+they are parser/timing inputs, not independently decodable recordings. The two
+`ts_ingest/aac-*` seeds are a framing byte followed by the first 150 packets of
+the generated sine-wave fixtures documented in
+[`tests/fixtures/README.md`](../crates/sapflow-hls/tests/fixtures/README.md).
+They contain no camera or microphone recording. `rtmp_session/declared-aac`
+adds explicit boolean metadata and AAC tag records after the existing synthetic
+publish prefix; `rtmp_client/declared-audio` enables the actual client's cold
+declaration before its existing peer fixture.
+
+Historical FLV and video-timing regression formats remain unchanged. The `TRKS`
+prefix selects four FLV record kinds: video, audio, legacy audio hint and a
+nonempty explicit track set. The `AAC1` timing prefix selects 48 kHz mono or
+44.1 kHz stereo, followed by the existing three-byte step/flag records; flags
+also exercise interruption and codec changes. Real generated AAC decode,
+server playback and native-device acceptance remain separate gates.
 
 The own caller target uses a mode byte and records
 `[operation, step_ms, len_hi, len_lo, bytes]`. Without the high mode bit, it

@@ -5,6 +5,34 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The latest origin prerequisite adds [explicit AAC-only ingest](audio-only-origin.md)
+through our SRT/TS and RTMP paths, HLS and recording, without a video keyframe.
+Track declarations are bounded and immutable per connection. Canonical AAC-LC
+validation, rational 44.1 kHz timing, current-part track receipts and explicit
+audio-only health are implemented. Recording loss survives epoch rollover and
+protocol rejection; an ingest error cannot append a new codec under an old file
+header. Main `8f9d7de` is integrated locally by merge `160e505`.
+
+This source passes 552 workspace tests with four normally ignored, strict
+all-target Clippy and formatting. Actual generated Swift and Kotlin host
+consumers and eight status-lease checks pass against the current host library.
+The existing mobile packages remain unchanged and represent their preceding
+Rust snapshot. Five changed fuzz targets replay their historical regressions
+and seeds, then each pass 61 seconds with AddressSanitizer and overflow checks:
+1,569,357 mutation executions in total. These are local finite gates, not CI,
+phone, sustained-load or competitive performance acceptance.
+
+Generated loopback tests independently decode four AAC profiles through SRT or
+our production RTMP publisher, HLS parts/segments and recordings; an A/V SRT
+regression and nine negative cases also pass. Actual audio-only health carries
+a null keyframe interval; A/V remains numeric. RTMP recordings preserve all
+283/260 source frames. The SRT recordings contain 272/253, despite a complete
+source remux, so terminal SRT frame retention remains an explicit open gate.
+Those SRT results prove decodable prefixes. No phone recording was accessed;
+all test media were generated and all owned runtime children/scratch removed.
+Native mic-only mode, audio-only V4V observation/profile admission, physical
+background/lock/routes and complete-show qualification remain unfinished.
+
 The latest reviewed source adds Capture elapsed, Broadcast elapsed and measured
 Socket outbound to both native apps. Local write completion remains separate
 from remote delivery or decoded-media proof. Reconnect gaps have no fresh rate;

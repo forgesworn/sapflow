@@ -199,6 +199,12 @@ protocol interoperability and signed distribution acceptance remain open.
 
 ## MPEG-TS and SRT publishing
 
+The [explicit AAC-only origin contract](audio-only-origin.md) adds declared
+audio-only ingest, HLS and recording to the origin. Our existing RTMP
+`declareTracks` call now sends a bounded declaration before codec headers/media.
+Its public binding signature is unchanged. This does not add audio-only mode to
+the native app UI or qualify background operation.
+
 `srt::SrtPublisher` combines the existing bounded MPEG-TS muxer with our own
 sans-IO SRT caller. `PublisherConfig` supplies fixed AAC/H.264 track configuration,
 Caller packet/byte/age/pacing/crypto limits, and a separate sample residence cap

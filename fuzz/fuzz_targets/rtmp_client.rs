@@ -1,6 +1,7 @@
 //! Hostile receiver bytes before and after a valid publication exchange.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
+use sapflow_hls::TrackSet;
 use sapflow_hls::rtmp::client::{Publisher, PublisherConfig, PublisherState};
 use sapflow_hls::rtmp::{Connection, Event};
 
@@ -18,6 +19,16 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut client) = Publisher::new(config, u64::from(head), 0) else {
         return;
     };
+    if head & 0x80 != 0 {
+        let tracks = if head & 0x40 != 0 {
+            TrackSet::AudioVideo
+        } else {
+            TrackSet::AudioOnly
+        };
+        if client.declare_tracks(tracks).is_err() {
+            return;
+        }
+    }
     if head & 1 != 0 {
         let mut server = Connection::new(1);
         for _ in 0..8 {

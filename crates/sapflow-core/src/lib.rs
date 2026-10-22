@@ -253,9 +253,10 @@ pub enum StreamEvent {
 pub struct Health {
     /// Media received, audio and video, over the recent segments.
     pub bitrate_kbps: u64,
-    /// The typical segment length, which is the encoder's keyframe interval
-    /// once that is at least the segment target (1 s).
-    pub keyframe_interval_ms: u64,
+    /// The typical video segment length, which follows the encoder's keyframe
+    /// interval once that is at least the segment target (1 s). Absent for an
+    /// audio-only stream, which has no video keyframes.
+    pub keyframe_interval_ms: Option<u64>,
     /// Whether the stream carries audio.
     pub audio: bool,
     /// Breaks in the media (stalls, reconnects) since the publisher connected.
@@ -291,7 +292,10 @@ impl StreamEvent {
             )),
             Self::Health(h) => s.push_str(&format!(
                 ",\"health\":{{\"bitrateKbps\":{},\"keyframeIntervalMs\":{},\"audio\":{},\"breaks\":{}}}",
-                h.bitrate_kbps, h.keyframe_interval_ms, h.audio, h.breaks
+                h.bitrate_kbps,
+                h.keyframe_interval_ms.map_or_else(|| "null".to_owned(), |value| value.to_string()),
+                h.audio,
+                h.breaks
             )),
             Self::Publish | Self::Unpublish => {}
         }
@@ -507,7 +511,7 @@ mod tests {
         );
         let health = StreamEvent::Health(Health {
             bitrate_kbps: 2620,
-            keyframe_interval_ms: 1000,
+            keyframe_interval_ms: Some(1000),
             audio: true,
             breaks: 2,
         });
@@ -516,6 +520,21 @@ mod tests {
         assert_eq!(
             health.callback_body(&p),
             r#"{"event":"health","path":"live/event-a1","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":2}}"#
+        );
+    }
+
+    #[test]
+    fn audio_only_health_has_no_video_keyframe_measurement() {
+        let path = StreamPath::parse("live/event-audio").expect("fixture path");
+        let event = StreamEvent::Health(Health {
+            bitrate_kbps: 96,
+            keyframe_interval_ms: None,
+            audio: true,
+            breaks: 0,
+        });
+        assert_eq!(
+            event.callback_body(&path),
+            r#"{"event":"health","path":"live/event-audio","health":{"bitrateKbps":96,"keyframeIntervalMs":null,"audio":true,"breaks":0}}"#
         );
     }
 

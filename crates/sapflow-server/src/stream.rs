@@ -22,11 +22,29 @@ pub struct LiveStream {
     version: watch::Sender<u64>,
 }
 
-/// The track configs, for a recorder's own init segment.
-pub type Tracks = (
-    sapflow_hls::codec::H264Config,
-    Option<sapflow_hls::codec::AacConfig>,
-);
+/// Frozen nonempty track configs for one recorder initialization epoch.
+#[derive(Clone)]
+pub struct Tracks {
+    video: Option<sapflow_hls::codec::H264Config>,
+    audio: Option<sapflow_hls::codec::AacConfig>,
+}
+
+impl Tracks {
+    pub fn new(
+        video: Option<sapflow_hls::codec::H264Config>,
+        audio: Option<sapflow_hls::codec::AacConfig>,
+    ) -> Option<Self> {
+        (video.is_some() || audio.is_some()).then_some(Self { video, audio })
+    }
+
+    pub fn video(&self) -> Option<&sapflow_hls::codec::H264Config> {
+        self.video.as_ref()
+    }
+
+    pub fn audio(&self) -> Option<&sapflow_hls::codec::AacConfig> {
+        self.audio.as_ref()
+    }
+}
 
 /// Where the media comes from.
 pub enum Source {
@@ -161,6 +179,9 @@ pub struct Applied {
     /// A new codec initialization epoch: the HLS timeline continues, and a
     /// new recording begins at the epoch's first part.
     pub restarted: bool,
+    /// Accepted media crossed a definite input loss or repetition. This must
+    /// taint the matching recording before any newly sealed parts are fed.
+    pub media_loss: bool,
 }
 
 fn fresh_prefix() -> String {
@@ -258,7 +279,7 @@ impl LiveStream {
                         playlist::epoch_init_name(&state.prefix, init_id)
                     ),
                     part_path: format!("/{root}/{}", playlist::part_name(&state.prefix, id)),
-                    has_video: true,
+                    has_video: muxer.video().is_some(),
                     has_audio: muxer.audio().is_some(),
                 });
             }
@@ -297,6 +318,7 @@ impl LiveStream {
         Ok(Applied {
             ready,
             restarted: update.restarted,
+            media_loss: update.media_loss,
         })
     }
 
@@ -344,7 +366,7 @@ impl LiveStream {
             }
             id += 1;
         }
-        Some(((m.video().clone(), m.audio().copied()), parts))
+        Some((Tracks::new(m.video().cloned(), m.audio().copied())?, parts))
     }
 
     pub fn close(&self) {
@@ -494,10 +516,22 @@ impl Registry {
         {
             map.remove(stream.path.event_id());
         }
-        stream.close();
-        // Dropping the recorder closes its queue; the writer then finishes
-        // the file and sends recordSegmentComplete.
-        let recorder = stream.session().recorder.take();
+        // A zero-grace normal end must seal the accepted tail too. The hold
+        // and explicit-revoke paths already interrupted it; repeating that
+        // operation is a no-op and cannot duplicate their final part.
+        let recorder = {
+            let mut session = stream.session();
+            stream.interrupt();
+            if let Some(recorder) = &mut session.recorder
+                && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
+            {
+                recorder.feed(tracks, parts);
+            }
+            stream.close();
+            // Actual writer completion follows channel closure, not removal
+            // from the registry or a requested transport shutdown.
+            session.recorder.take()
+        };
         drop(recorder);
     }
 }

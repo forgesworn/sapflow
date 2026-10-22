@@ -15,7 +15,54 @@ const SPS: &[u8] = &[
 ];
 const PPS: &[u8] = &[0x68, 0xef, 0xbc, 0x80];
 
+fn audio_timing(data: &[u8]) {
+    let Some((&head, records)) = data.split_first() else {
+        return;
+    };
+    let config = |stereo: bool| AacConfig {
+        object_type: 2,
+        sample_rate_index: if stereo { 4 } else { 3 },
+        sample_rate: if stereo { 44_100 } else { 48_000 },
+        channels: if stereo { 2 } else { 1 },
+    };
+    let mut stereo = head & 1 != 0;
+    let mut muxer = Muxer::audio_only(MuxerConfig::default(), config(stereo))
+        .expect("fixed supported AAC profile");
+    let mut rules = playlist::RuleCheck::default();
+    let mut pts = 0i64;
+    for rec in records.chunks_exact(3) {
+        let flags = rec[2];
+        let step = i64::from(u16::from_le_bytes([rec[0], rec[1]]));
+        let step = if flags & 2 != 0 { step * 16 } else { step };
+        pts = pts.saturating_add(if flags & 4 != 0 { -step } else { step });
+        let result = muxer.push_audio_at(pts, Bytes::from_static(b"aac"), std::time::UNIX_EPOCH);
+        if flags & 8 != 0 {
+            muxer.interrupt(std::time::UNIX_EPOCH);
+        }
+        if flags & 16 != 0 {
+            stereo = !stereo;
+            let _ = muxer.reconfigure_tracks(None, Some(config(stereo)), std::time::UNIX_EPOCH);
+            pts = 0;
+        }
+        if muxer.has_content() {
+            let rendered = playlist::media(&muxer, "p");
+            if let Err(error) = rules.check(&rendered) {
+                panic!("{error}\n{rendered}");
+            }
+        }
+        if result.is_err() {
+            return;
+        }
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
+    // Preserve historical video-timing inputs. New prefixed seeds exercise
+    // exact AAC frame clocks, interruptions and retained codec epochs.
+    if let Some(records) = data.strip_prefix(b"AAC1") {
+        audio_timing(records);
+        return;
+    }
     let Some(video) = H264Config::new(SPS, PPS) else {
         return;
     };

@@ -1092,6 +1092,90 @@ fn next_part(publication: &crate::publish::Publication) -> u64 {
 }
 
 #[tokio::test]
+async fn audio_only_receipts_require_current_parts_across_track_and_codec_epochs() {
+    const MONO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/audio-48k-mono.ts");
+    const STEREO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/audio-44k1-stereo.ts");
+    const VIDEO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/testsrc-3s.ts");
+    let scratch = Scratch::new();
+    let manager = scratch.open(false).await;
+    prepare(&manager).await;
+    let (app, mut callbacks) = fresh_media_app(&manager);
+    let mut retained = None;
+    let mut previous = None;
+    for (index, data) in [MONO, STEREO, VIDEO, MONO].into_iter().enumerate() {
+        let mut publication = fresh_publication(&app).await;
+        let empty = manager.status(SID).await.expect("current connection");
+        assert_eq!(empty.connection_epoch, index as u64 + 1);
+        assert!(
+            empty.fresh_media.is_none(),
+            "retained parts cannot confirm a successor"
+        );
+        if let Some(stream) = &retained {
+            assert!(Arc::ptr_eq(stream, &publication.stream));
+        } else {
+            retained = Some(publication.stream.clone());
+        }
+        // A transport header is neither a completed media part nor decoded
+        // audio. It must not manufacture a ready receipt from retained media.
+        crate::srt::feed(&mut publication, &data[..188]).expect("generated first packet");
+        assert!(
+            manager
+                .status(SID)
+                .await
+                .expect("header status")
+                .fresh_media
+                .is_none()
+        );
+        feed_generated(&mut publication, &data[188..]);
+        let live = manager
+            .status(SID)
+            .await
+            .expect("actual current audio parts");
+        assert_eq!(live.state, "live");
+        let media = live.fresh_media.expect("current completed part");
+        assert_eq!(media.connection_epoch, index as u64 + 1);
+        assert_eq!(media.part.has_video, index == 2);
+        assert!(media.part.has_audio);
+        if let Some((part_id, initialization_id)) = previous {
+            assert!(media.part.part_id > part_id);
+            assert!(media.part.initialization_id > initialization_id);
+        }
+        {
+            let state = publication.stream.lock();
+            let muxer = state.ingest.muxer().expect("current muxer");
+            assert_eq!(muxer.video().is_some(), index == 2);
+            if index != 2 {
+                let master = sapflow_hls::playlist::multivariant(muxer);
+                assert!(master.contains("CODECS=\"mp4a.40.2\""));
+                assert!(!master.contains("RESOLUTION="));
+                assert!(!master.contains("FRAME-RATE="));
+            }
+        }
+        let (tracks, parts) = publication
+            .stream
+            .parts_after(None)
+            .expect("recording epoch");
+        assert_eq!(tracks.video().is_some(), index == 2);
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.initialization.id == media.part.initialization_id)
+        );
+        previous = Some((media.part.part_id, media.part.initialization_id));
+        publication.end();
+        assert!(
+            manager
+                .status(SID)
+                .await
+                .expect("held status")
+                .fresh_media
+                .is_none()
+        );
+        assert_eq!(fresh_events(&mut callbacks), ["publish", "unpublish"]);
+    }
+}
+
+#[tokio::test]
 async fn changed_codec_first_idr_cannot_announce_old_retained_media_as_current_ready() {
     const PORTRAIT: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-portrait.ts");
     const LANDSCAPE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/epoch-landscape.ts");

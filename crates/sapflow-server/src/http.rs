@@ -422,8 +422,9 @@ mod epoch_tests {
             {
                 let st = stream.lock();
                 let m = st.ingest.muxer().expect("valid epoch regression fixture");
+                let video = m.video().expect("AV regression has video");
                 assert_eq!(
-                    (m.video().width, m.video().height),
+                    (video.width, video.height),
                     if epoch == 1 { (1280, 720) } else { (720, 1280) }
                 );
                 assert_eq!(
