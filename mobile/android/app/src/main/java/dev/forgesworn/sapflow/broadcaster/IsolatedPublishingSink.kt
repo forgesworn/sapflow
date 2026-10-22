@@ -13,7 +13,13 @@ import java.util.concurrent.atomic.AtomicReference
  * independent. The controller owns asynchronous actual close on its usual path. */
 internal class IsolatedPublishingSink(private val delegate: EncodedSink, private val failed: (Exception) -> Unit) : EncodedSink, SocketOutputProvider {
     override val socketOutput: SocketOutputSource? get() = runCatching { (delegate as? SocketOutputProvider)?.socketOutput }.getOrNull()
+    private val terminal=TerminalAdmissionSignal()
+    private fun terminalAdmission()=terminal.closeAdmission()
+    override fun setTerminalAdmissionListener(listener: () -> Unit) {
+        terminal.listen(listener);delegate.setTerminalAdmissionListener { terminalAdmission() }
+    }
     private val unavailable = AtomicBoolean(false)
+    private val failureReported=AtomicBoolean(false)
     private val cleanupFailure = AtomicReference<Exception?>()
     private val closure = AtomicReference<CompletableFuture<Unit>?>()
     override val status: String get() = if (unavailable.get()) "Publisher unavailable · local recording continues" else delegate.status
@@ -24,16 +30,17 @@ internal class IsolatedPublishingSink(private val delegate: EncodedSink, private
     }
     private fun fail(error: Exception, fence: Boolean = true) {
         if (error.suppressed.isNotEmpty()) cleanupFailure.compareAndSet(null, error)
-        if (!unavailable.compareAndSet(false, true)) return
-        if (fence) runCatching { delegate.stopDestination() }.onFailure { cleanupFailure.compareAndSet(null, it as? Exception ?: error) }
-        runCatching { failed(error) } // Diagnostic delivery cannot fail local recording.
+        val newlyFenced=unavailable.compareAndSet(false,true)
+        terminalAdmission() // wrapper itself permanently refuses all future borrows
+        if (fence && newlyFenced) runCatching { delegate.stopDestination() }.onFailure { cleanupFailure.compareAndSet(null, it as? Exception ?: error) }
+        if(failureReported.compareAndSet(false,true))runCatching { failed(error) } // Diagnostic delivery cannot fail local recording.
     }
     override fun configure(video: RustCodec?, audio: RustCodec?) = publish { delegate.configure(video, audio) }
     override fun start() = publish { delegate.start() }
     override fun consume(sample: MediaSample) = publish { delegate.consume(sample) }
     override fun setKeyframeRequester(request: () -> Unit) = publish { delegate.setKeyframeRequester(request) }
     override fun revalidateAuthority() = publish { delegate.revalidateAuthority() }
-    override fun stopDestination() { runCatching { delegate.stopDestination() }.onFailure {
+    override fun stopDestination() { unavailable.set(true);terminalAdmission();runCatching { delegate.stopDestination() }.onFailure {
         val error = it as? Exception ?: IllegalStateException("Publisher fence failed")
         cleanupFailure.compareAndSet(null, error)
         fail(error, fence = false)

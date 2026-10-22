@@ -17,6 +17,9 @@ import android.os.SystemClock
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
+import android.widget.FrameLayout
+import android.widget.TextView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -74,7 +77,7 @@ class MainActivity : ComponentActivity() {
     private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
     private class PreparationIntent(val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
         val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?, val backgroundAudio: Boolean,
-        val orientation: CaptureOrientationChoice.Selection?, val cameraChoice: CameraSourceChoice)
+        val orientation: CaptureOrientationChoice.Selection?, val cameraChoice: CameraSourceChoice, val initialStandby:Boolean)
     private var pendingPreparation: PreparationIntent? = null
     private val permissionReplies = PendingPermissionReply<PreparationIntent>()
     private var permissionReplyOutstanding by mutableStateOf(false)
@@ -146,6 +149,8 @@ class MainActivity : ComponentActivity() {
     private var recordLocally by mutableStateOf(true)
     private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
     private var orientationChoice by mutableStateOf(CaptureOrientationChoice.AUTO)
+    private var initialStandby by mutableStateOf(false)
+    private var privacyCover:View?=null // Activity-owned; never retained by process capture.
     private var cameraChoice by mutableStateOf(CameraSourceChoice.REAR)
     private var cameraState by mutableStateOf(CameraSourceSnapshot())
     private var microphoneOnly by mutableStateOf(false)
@@ -199,6 +204,7 @@ class MainActivity : ComponentActivity() {
     private val refresh = object : Runnable {
         override fun run() {
             snapshot = capture.snapshot()
+            updatePrivacyCover(snapshot)
             cameraState = capture.cameraSnapshot()
             v4vState = v4v?.control?.view
             libraryBusy = !recordingLibrary.idle
@@ -234,6 +240,7 @@ class MainActivity : ComponentActivity() {
             orientationChoice = retained.orientation?.choice ?: CaptureOrientationChoice.AUTO
             cameraChoice = capture.cameraSnapshot().requested ?: retained.cameraChoice ?: CameraSourceChoice.REAR
             backgroundAudio = retained.backgroundAudio
+            initialStandby=retained.initialStandby
         }
         audioOwner.continuingShow()?.let { retained ->
             useV4v = retained.usesV4v
@@ -270,19 +277,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun updatePrivacyCover(value:CaptureSnapshot?) {
+        val cover=value?.standbyRequested==true || initialStandby && value?.stage in listOf(null,CaptureStage.IDLE,CaptureStage.ERROR)
+        privacyCover?.visibility=if(cover)View.VISIBLE else View.GONE
+    }
+
     @Composable
     private fun PreviewPane(modifier: Modifier) {
         Box(modifier, contentAlignment = Alignment.Center) {
             if (!selectedIntent.hasVideo) Text("Microphone only · no camera preview")
-            else AndroidView(factory = { context -> SurfaceView(context).apply {
-                holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(holder: SurfaceHolder) { preview = holder.surface; surfaceReady = true; updatePreview() }
-                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                        preview = holder.surface; previewWidth = width; previewHeight = height; updatePreview()
-                    }
-                    override fun surfaceDestroyed(holder: SurfaceHolder) { surfaceReady = false; preview = null; updatePreview() }
-                })
-            } }, modifier = Modifier.fillMaxSize())
+            else AndroidView(factory = { context -> FrameLayout(context).apply {
+                addView(SurfaceView(context).apply {
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(holder: SurfaceHolder) { preview = holder.surface; surfaceReady = true; updatePreview() }
+                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                            preview = holder.surface; previewWidth = width; previewHeight = height; updatePreview()
+                        }
+                        override fun surfaceDestroyed(holder: SurfaceHolder) { surfaceReady = false; preview = null; updatePreview() }
+                    })
+                },FrameLayout.LayoutParams(-1,-1))
+                addView(TextView(context).apply {
+                    text="STANDBY";gravity=android.view.Gravity.CENTER
+                    setTextColor(android.graphics.Color.WHITE);setBackgroundColor(android.graphics.Color.rgb(9,14,22))
+                    privacyCover=this
+                    visibility=if(capture.snapshot().standbyRequested || initialStandby)View.VISIBLE else View.GONE
+                },FrameLayout.LayoutParams(-1,-1))
+            } },update={updatePrivacyCover(snapshot)}, modifier = Modifier.fillMaxSize())
             Text("SAPFLOW  ·  NATIVE CAPTURE", Modifier.align(Alignment.TopStart).padding(16.dp), color = Color.White)
         }
     }
@@ -353,6 +373,15 @@ class MainActivity : ComponentActivity() {
                             Text(if (naturalPortrait()) "Top means the phone's top edge, viewed from its screen. Fixed choices keep encoded orientation until Stop."
                                 else "On a natural-landscape display, Portrait is a clockwise quarter-turn from natural. Fixed choices keep that reference until Stop.", style = MaterialTheme.typography.bodySmall)
                         }
+                        Row(verticalAlignment=Alignment.CenterVertically) {
+                            Checkbox(checked=initialStandby,enabled=qualityConfigurable,onCheckedChange={ value ->
+                                if(!preparationPending && !permissionReplies.outstanding && recordingLibrary.idle && capture.snapshot().canPrepare) {
+                                    manualEdited();prepareRequest++;initialStandby=value;updatePrivacyCover(snapshot)
+                                }
+                            })
+                            Text("Start in Standby")
+                        }
+                        Text((if(selectedIntent.hasVideo) "Standby sends a generated picture and silence." else "Standby sends generated silence.")+" Previously accepted media can remain in recordings or remote buffers.",style=MaterialTheme.typography.bodySmall)
                         OutlinedButton(
                             onClick = { prepareWithPermissions() },
                             enabled = !preparationPending && !permissionReplyOutstanding && !libraryBusy && (microphoneOnly || surfaceReady) && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR),
@@ -364,6 +393,22 @@ class MainActivity : ComponentActivity() {
                                 (preparedCapture?.backgroundAudio != true || current.backgroundAudioReady) && (!selectedIntent.hasVideo || !cameraState.busy),
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Start capture") }
+                        if(current?.stage==CaptureStage.CAPTURING || current?.stage==CaptureStage.STOPPING) {
+                            Text(current.privacyStatus,style=MaterialTheme.typography.bodySmall)
+                            Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(enabled=current.canRequestStandby,onClick={
+                                    val ticket=preparedCapture;val fresh=capture.snapshot()
+                                    if(ticket!=null && capture.standby(ticket,fresh.privacyEpoch)) {
+                                        privacyCover?.visibility=View.VISIBLE // same main call, before waiting for any owner queue
+                                        snapshot=capture.snapshot()
+                                    }
+                                }){Text("Standby")}
+                                OutlinedButton(enabled=current.canResumePrivacy,onClick={
+                                    val ticket=preparedCapture;val fresh=capture.snapshot()
+                                    if(ticket!=null && capture.resumePrivacy(ticket,fresh.privacyEpoch,fresh.privacyRevision))snapshot=capture.snapshot()
+                                }){Text("Resume live input")}
+                            }
+                        }
                         if (current?.stage == CaptureStage.PREPARED && preparedCapture?.backgroundAudio == true && !current.backgroundAudioReady) {
                             Text("Waiting for the microphone service", style = MaterialTheme.typography.bodySmall)
                         }
@@ -737,7 +782,7 @@ class MainActivity : ComponentActivity() {
     private fun cameraControls(idle: Boolean, current: CaptureSnapshot?) {
         val source = cameraState
         val displayedPreparation = preparedCapture
-        val live = current?.stage in listOf(CaptureStage.PREPARED, CaptureStage.CAPTURING) && !source.busy
+        val live = current?.stage in listOf(CaptureStage.PREPARED, CaptureStage.CAPTURING) && !source.busy && current?.standbyRequested != true
         Text("Camera source", style = MaterialTheme.typography.labelMedium)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             CameraSourceChoice.entries.forEach { choice ->
@@ -796,7 +841,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentPreparation(intent: PreparationIntent): Boolean = pendingPreparation === intent && intent.request == prepareRequest &&
-        poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && (backgroundAudio && !intent.capture.hasVideo) == intent.backgroundAudio && recordLocally == intent.record && useV4v == intent.v4v &&
+        poseTracking && !isDestroyed && capture.snapshot().canPrepare && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && (backgroundAudio && !intent.capture.hasVideo) == intent.backgroundAudio && initialStandby==intent.initialStandby && recordLocally == intent.record && useV4v == intent.v4v &&
         (!intent.capture.hasVideo || orientationChoice == intent.orientation?.choice && cameraChoice == intent.cameraChoice) &&
         (intent.v4v || (useSrt == intent.srt && destinationUrl == intent.endpoint && destinationKey == intent.key && srtPassphrase == intent.passphrase &&
             srtPlaintextLab == intent.srtPlaintext && allowPlaintextDevelopment == intent.rtmpPlaintext))
@@ -812,7 +857,7 @@ class MainActivity : ComponentActivity() {
         if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
         manualEdited()
         val intent = PreparationIntent(++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo,
-            orientationChoice.freeze(selectedIntent.hasVideo, naturalPortrait(), poseSelector.pose), cameraChoice)
+            orientationChoice.freeze(selectedIntent.hasVideo, naturalPortrait(), poseSelector.pose), cameraChoice,initialStandby)
         pendingPreparation = intent; preparationPending = true
         val needed = preparationPermissions(intent).toTypedArray()
         if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
@@ -888,7 +933,7 @@ class MainActivity : ComponentActivity() {
             // further sensor callback followed qualification Stop/CLEAR.
             val stablePose = if (intent.capture.hasVideo) poseSelector.prepareSession() else CardinalPose.NATURAL
             preparedCapture = capture.prepare(surface, publisher, recorder, intent.capture, intent.audioInputId, intent.backgroundAudio,
-                intent.orientation?.atPrepare(stablePose), intent.cameraChoice)
+                intent.orientation?.atPrepare(stablePose), intent.cameraChoice,intent.initialStandby)
             if (intent.backgroundAudio) {
                 val prepared = checkNotNull(preparedCapture) { "Capture preparation was not admitted" }
                 require(audioOwner.arm(prepared, intent.v4v, intent.record)) { "Background audio service could not be admitted. Prepare again." }
@@ -944,5 +989,5 @@ class MainActivity : ComponentActivity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
-    override fun onDestroy() { manualEdited(); libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); super.onDestroy() }
+    override fun onDestroy() { privacyCover=null;manualEdited(); libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); super.onDestroy() }
 }

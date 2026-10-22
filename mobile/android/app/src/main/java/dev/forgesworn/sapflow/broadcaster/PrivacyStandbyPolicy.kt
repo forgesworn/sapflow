@@ -1,6 +1,6 @@
 package dev.forgesworn.sapflow.broadcaster
 
-/** Pure owner policy, awaiting native integration. No codec/pixel/PCM proof is
+/** Owner policy. Native adapters supply actual receipts. No codec/pixel/PCM proof is
  * manufactured here: native adapters must call receipt methods only after the
  * named actual event. Old accepted compressed material remains old prefix.
  * Preparation and Run use identity, not a caller-selected numeric epoch alone.
@@ -18,6 +18,7 @@ internal class PrivacyStandbyPolicy(
     enum class Sink(val bit: Int) { PUBLISHING(1), RECORDING(2) }
     enum class Sinks(val mask: Int) { PUBLISHING_ONLY(1), RECORDING_ONLY(2), BOTH(3) }
     enum class Fault { DEADLINE, CLOCK, EXHAUSTED, NATIVE }
+    enum class NativeAdmission { SUBMIT, SUPERSEDED, RETIRING, STALE, WAIT_START, FAULT }
     class Run internal constructor(val epoch: Long, internal val descriptor: Any)
     class Command internal constructor(val run: Run, val revision: Long, val desired: Desired,
         val startedNs: Long, val deadlineNs: Long)
@@ -26,7 +27,7 @@ internal class PrivacyStandbyPolicy(
         val pts: Long, internal val audioGeneration: Long?)
     class Snapshot(val desired: Desired, val phase: Phase, val revision: Long,
         val run: Run?, val pending: Command?, val fault: Fault?, val requiredSinks: Int)
-    private class Published(val run: Run?, val revision: Long, val raw: Boolean, val pending: Command?, val replacement: Command?, val mediaStarted: Boolean)
+    private class Published(val run: Run?, val revision: Long, val raw: Boolean, val pending: Command?, val replacement: Command?, val mediaStarted: Boolean, val preview: Boolean, val sinks: Int, val tailRun: Run?, val outputBoundary:Command?, val ownerRun:Run?, val faulted:Boolean)
     private var desired = if (initialStandby) Desired.STANDBY else Desired.LIVE
     private var phase = if (initialStandby) Phase.ARMED else Phase.LIVE
     private var revision = initialRevision
@@ -35,6 +36,7 @@ internal class PrivacyStandbyPolicy(
     private var lastEpoch = -1L
     private var mediaStarted = false // Logical show, preserved through orientation children.
     private var command: Command? = null
+    private var stopBoundary:Command?=null
     private var activeReplacement: Command? = null
     private var mutation: SourceMutation? = null
     private var fault: Fault? = null
@@ -53,7 +55,7 @@ internal class PrivacyStandbyPolicy(
     private var audioProof: MediaProof? = null
     private var videoAccepted = 0
     private var audioAccepted = 0
-    @Volatile private var published = Published(null, revision, false, null, null, false)
+    @Volatile private var published = Published(null, revision, false, null, null, false,false,requiredSinks,null,null,null,false)
 
     init { require(budgetNs in 1..6_000_000_000L && initialRevision >= 0) }
 
@@ -63,14 +65,47 @@ internal class PrivacyStandbyPolicy(
         val view = published
         return view.run === value && view.revision == expectedRevision && view.raw
     }
-    /** Withheld owner timers cannot extend generated-input/output admission. */
-    fun permitsReplacement(value: Command, nowNs: Long): Boolean {
-        val view = published
-        if (!view.mediaStarted || view.run !== value.run || view.raw || value.desired != Desired.STANDBY || nowNs < value.startedNs) return false
-        val pending = view.pending
-        if (pending != null && (nowNs < pending.startedNs || nowNs >= pending.deadlineNs)) return false
-        return view.replacement === value || pending === value && nowNs < value.deadlineNs
+    fun permitsRaw(value: Run): Boolean { val view=published; return view.run === value && view.raw }
+    fun permitsPreview(value: Run): Boolean { val view=published;return view.run === value && view.preview }
+    fun branchesAccepted(publishing:Boolean,recording:Boolean):Boolean { val mask=published.sinks;return (mask and 1==0 || publishing) && (mask and 2==0 || recording) }
+    /** Final output admission, including queued native output when owner
+     * timers were withheld. Explicit Stop/Auto permits only its old tail; an
+     * expired privacy transaction never acquires that allowance. */
+    fun permitsOutput(value:Run,nowNs:Long):Boolean {
+        val view=published
+        if(!view.mediaStarted || nowNs<0)return false
+        val pending=view.outputBoundary
+        if(pending!=null && (nowNs<pending.startedNs || nowNs>=pending.deadlineNs))return false
+        return view.tailRun===value || view.run===value
     }
+    val cleanupDeadlineNs:Long? get()=published.outputBoundary?.deadlineNs
+    fun permitsResume(value:Command,nowNs:Long):Boolean { val view=published;return view.mediaStarted && view.run===value.run && view.pending===value && value.desired==Desired.LIVE && nowNs>=value.startedNs && nowNs<value.deadlineNs }
+    fun needsOutputProof(value: Command): Boolean = published.pending === value
+    /** One immutable state read distinguishes normal native work cancellation
+     * from an actual expiry/fault. Resume/Stop/Auto must not fault a held zero
+     * input or slate draw merely because its old replacement gate was closed. */
+    fun replacementAdmission(value:Command,nowNs:Long):NativeAdmission {
+        val view=published
+        return nativeAdmission(view,value,nowNs,false)
+    }
+    fun resumeAdmission(value:Command,nowNs:Long):NativeAdmission {
+        val view=published
+        return nativeAdmission(view,value,nowNs,true)
+    }
+    private fun nativeAdmission(view:Published,value:Command,nowNs:Long,resume:Boolean):NativeAdmission {
+        if(view.ownerRun!==value.run)return NativeAdmission.STALE
+        if(view.faulted || nowNs<value.startedNs)return NativeAdmission.FAULT
+        val boundary=view.outputBoundary
+        if(boundary!=null && (nowNs<boundary.startedNs || nowNs>=boundary.deadlineNs))return NativeAdmission.FAULT
+        if(!view.mediaStarted)return NativeAdmission.WAIT_START
+        if(view.tailRun===value.run)return NativeAdmission.RETIRING
+        if(view.run!==value.run)return NativeAdmission.STALE
+        if(resume)return if(view.pending===value && value.desired==Desired.LIVE) NativeAdmission.SUBMIT else NativeAdmission.SUPERSEDED
+        if(view.raw || value.desired!=Desired.STANDBY)return NativeAdmission.SUPERSEDED
+        return if(view.replacement===value || view.pending===value) NativeAdmission.SUBMIT else NativeAdmission.SUPERSEDED
+    }
+    /** Withheld timers cannot extend native input admission. */
+    fun permitsReplacement(value:Command,nowNs:Long):Boolean = replacementAdmission(value,nowNs)==NativeAdmission.SUBMIT
     @Synchronized fun snapshot() = Snapshot(desired, phase, revision, run, command, fault, requiredSinks)
 
     /** Call only once previous runClosed proved actual closure. Descriptor is
@@ -105,7 +140,7 @@ internal class PrivacyStandbyPolicy(
     /** Highest-priority privacy request. Source mutation and pending Resume do
      * not prevent its synchronous raw fence. Repeats keep the same deadline. */
     @Synchronized fun standby(value: Run, nowNs: Long): Command? {
-        if (!current(value)) return null
+        if (run !== value || stopped || fault != null) return null
         if (nowNs < 0) { fail(Fault.CLOCK); return null }
         val pending = command
         if (pending != null && !within(pending, nowNs)) return null
@@ -134,6 +169,14 @@ internal class PrivacyStandbyPolicy(
         if (!owns(value, nowNs) || value.desired != Desired.LIVE || generation != audioGeneration ||
             !microphoneReady || hasVideo && !cameraReady || mutation != null) return false
         command = null; activeReplacement = null; phase = Phase.LIVE; publish(); return true
+    }
+    /** Readiness callbacks share the same cold commit decision as production
+     * controller code. Urgent Standby/Stop winning this lock is a normal stale
+     * result; an exact current invalid readiness/expiry remains a fault. */
+    @Synchronized fun commitReadyResume(value:Command,generation:Long,microphoneReady:Boolean,cameraReady:Boolean,nowNs:Long):NativeAdmission {
+        val admission=resumeAdmission(value,nowNs)
+        if(admission!=NativeAdmission.SUBMIT)return admission
+        return if(resumed(value,generation,microphoneReady,cameraReady,nowNs))NativeAdmission.SUBMIT else NativeAdmission.FAULT
     }
     /** Camera and privacy mutations share this reservation before owner posts. */
     @Synchronized fun reserveSource(value: Run, expectedRevision: Long): SourceMutation? {
@@ -233,6 +276,7 @@ internal class PrivacyStandbyPolicy(
     }
     @Synchronized fun stop(owner: Any): Boolean {
         if (owner !== preparation || stopped) return false
+        stopBoundary=command
         stopped = true; closing = true; command = null; activeReplacement = null; phase = Phase.STOPPED; publish(); return true
     }
     private fun current(value: Run) = run === value && !closing && !stopped && fault == null
@@ -274,6 +318,14 @@ internal class PrivacyStandbyPolicy(
     private fun publish() {
         val live = !closing && !stopped && fault == null
         published = Published(if (live) run else null, revision, live && mediaStarted && phase == Phase.LIVE && desired == Desired.LIVE,
-            command.takeIf { live }, activeReplacement.takeIf { live }, mediaStarted)
+            command.takeIf { live }, activeReplacement.takeIf { live }, mediaStarted,live && desired==Desired.LIVE && phase==Phase.LIVE,requiredSinks,run.takeIf { fault==null && (closing || stopped) },command ?: stopBoundary,run,fault!=null)
     }
+}
+
+/** One posted transaction per immutable command. Urgent Standby may replace a
+ * queued Resume; that old continuation still has to pass the policy identity.
+ * No ordinary repeat extends time or queues another native retirement. */
+internal class PrivacyStandbyDispatch {
+    private val last=java.util.concurrent.atomic.AtomicReference<PrivacyStandbyPolicy.Command?>()
+    fun admit(value:PrivacyStandbyPolicy.Command):Boolean = last.getAndSet(value) !== value
 }

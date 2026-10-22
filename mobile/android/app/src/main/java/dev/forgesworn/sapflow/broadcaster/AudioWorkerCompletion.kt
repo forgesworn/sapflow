@@ -9,6 +9,7 @@ internal class AudioWorkerCompletion {
         private set
     val stopped get() = readerDone && pumpDone
     fun begin() { readerDone = false; pumpDone = false }
+    fun readerBegan() { readerDone = false }
     fun readerCompleted() { readerDone = true }
     fun pumpCompleted() { pumpDone = true }
     fun observeStopped(readerAlive: Boolean, pumpAlive: Boolean) {

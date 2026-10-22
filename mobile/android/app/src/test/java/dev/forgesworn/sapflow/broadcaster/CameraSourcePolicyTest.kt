@@ -293,4 +293,49 @@ class CameraSourcePolicyTest {
         assertFalse(worker.isAlive); assertFalse(confirmed.get()); assertNull(run.confirmed(op.serial))
         assertFalse(run.recordingCanFinalise); assertFalse(run.admit(18))
     }
+    @Test fun privacyRetiresOnlyActualExactSourceBudgetWithoutUndoingStopCancellation() {
+        val sources=CameraSourcePolicy();val a=checkNotNull(sources.begin(CameraSourceChoice.REAR,0))
+        val run=CameraRunAdmission(1);assertTrue(run.beginSource(a).admitted)
+        val foreign=checkNotNull(CameraSourcePolicy().begin(CameraSourceChoice.REAR,0))
+        assertFalse(run.retiredSource(foreign));assertTrue(run.retiredSource(a));assertTrue(run.admit(7_000_000_000))
+        sources.close();val b=checkNotNull(CameraSourcePolicy(initialSerial=a.serial).begin(CameraSourceChoice.FRONT,8_000_000_000))
+        assertTrue(run.beginSource(b).admitted);run.cancelSourceBudget()
+        assertFalse(run.retiredSource(b));assertEquals(CameraRunAdmission.SourceAdmission.CANCELLED,run.beginSource(b));assertTrue(run.admit(Long.MAX_VALUE))
+    }
+
+    @Test fun previewAbandonedBeforeSubmissionDetachesWithoutDrawingOrFaultingShow() {
+        var draws=0;var detached=0;var classifications=0
+        CameraGlRenderer.previewSubmission(false,{classifications++;false},{detached++}){draws++}
+        assertEquals(0,draws);assertEquals(1,detached);assertEquals(0,classifications)
+    }
+    @Test fun nativePreviewLossDuringSubmissionUsesActualValidityAndDetachesOnlyPreview() {
+        for(error in listOf(android.opengl.EGL14.EGL_BAD_SURFACE,android.opengl.EGL14.EGL_BAD_NATIVE_WINDOW,android.opengl.EGL14.EGL_SUCCESS)) {
+            var valid=true;var submitted=0;var detached=0
+            CameraGlRenderer.previewSubmission(valid,
+                {CameraGlRenderer.isExpectedPreviewLoss(valid,error)},{detached++}) {
+                submitted++;valid=false;throw IllegalStateException("Generated preview abandonment")
+            }
+            assertEquals(1,submitted);assertEquals(1,detached)
+        }
+    }
+    @Test fun previewContextDisplayAndAllocationFailuresRemainFatalEvenWhenWindowIsInvalid() {
+        for(error in listOf(android.opengl.EGL14.EGL_CONTEXT_LOST,android.opengl.EGL14.EGL_BAD_CONTEXT,android.opengl.EGL14.EGL_BAD_DISPLAY,android.opengl.EGL14.EGL_BAD_ALLOC)) {
+            val actual=IllegalStateException("Generated EGL failure");var detached=0
+            val thrown=assertThrows(IllegalStateException::class.java) {
+                CameraGlRenderer.previewSubmission(true,
+                    {CameraGlRenderer.isExpectedPreviewLoss(false,error)},{detached++}){throw actual}
+            }
+            assertSame(actual,thrown);assertEquals(0,detached)
+        }
+    }
+    @Test fun expectedPreviewLossNeverHidesActualDetachCleanupFailure() {
+        val actual=IllegalStateException("Generated detach failure")
+        for(valid in listOf(false,true)) {
+            val thrown=assertThrows(IllegalStateException::class.java) {
+                CameraGlRenderer.previewSubmission(valid,{true},{throw actual}){error("Generated preview loss")}
+            }
+            assertSame(actual,thrown)
+        }
+    }
+
 }

@@ -154,4 +154,26 @@ class IsolatedPublishingSinkTest {
         rotated.configure(null, null); rotated.start(); rotated.close(); recorder.close()
         assertEquals(1, recorder.starts); assertEquals(0, factories)
     }
+    @Test fun terminalReceiptFollowsActualWrapperAdmissionFenceAndIsNotCleanupProof() {
+        val delegate=Sink();val isolated=IsolatedPublishingSink(delegate){}
+        var receipts=0
+        isolated.setTerminalAdmissionListener {
+            receipts++
+            isolated.start() // The wrapper has already irreversibly fenced admission.
+            assertEquals(0,delegate.starts)
+        }
+        isolated.stopDestination();isolated.stopDestination()
+        assertEquals(1,receipts);assertEquals(0,delegate.closes.get())
+        isolated.configure(null,null);assertEquals(0,delegate.configures)
+        isolated.close();assertEquals(1,delegate.closes.get())
+    }
+    @Test fun exceptionClosesWrapperAdmissionBeforeTerminalCallbackEvenIfDelegateFenceFails() {
+        val delegate=Sink().apply { startError=IllegalStateException("synthetic");fenceError=IllegalStateException("retained") }
+        val isolated=IsolatedPublishingSink(delegate){}
+        var receipts=0
+        isolated.setTerminalAdmissionListener {receipts++;isolated.start()}
+        isolated.start();assertEquals(1,delegate.starts);assertEquals(1,receipts)
+        assertThrows(IllegalStateException::class.java){isolated.close()}
+    }
+
 }

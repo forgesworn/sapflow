@@ -5,7 +5,7 @@ package dev.forgesworn.sapflow.broadcaster
 internal class CaptureStartAdmission {
     class Preparation internal constructor(val id: Long, val intent: CaptureIntent, val audioInputId: String? = null,
         val backgroundAudio: Boolean = false, val orientation: CaptureOrientationChoice.Selection? = null,
-        val cameraChoice: CameraSourceChoice? = null)
+        val cameraChoice: CameraSourceChoice? = null, val initialStandby: Boolean = false)
     class Start internal constructor(val id: Long, val preparation: Preparation, val epoch: Long)
     private var serial = 0L
     private var current: Preparation? = null
@@ -26,12 +26,12 @@ internal class CaptureStartAdmission {
     val preparation: Preparation? @Synchronized get() = current
     val elapsedPreparation: Preparation? @Synchronized get() = timingPreparation
     @Synchronized fun reserve(intent: CaptureIntent = CaptureIntent.DEFAULT, audioInputId: String? = null,
-        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null, cameraChoice: CameraSourceChoice = CameraSourceChoice.REAR): Preparation? {
+        backgroundAudio: Boolean = false, orientation: CaptureOrientationChoice.Selection? = null, cameraChoice: CameraSourceChoice = CameraSourceChoice.REAR, initialStandby: Boolean = false): Preparation? {
         if (current != null || serial == Long.MAX_VALUE) return null
         if (audioInputId != null && !AudioInputOption.validId(audioInputId)) return null
         if (backgroundAudio && intent.hasVideo) return null
         val frozen = if (intent.hasVideo) orientation ?: CaptureOrientationChoice.AUTO.freeze(true, true, CardinalPose.NATURAL) else null
-        return Preparation(++serial, intent, audioInputId, backgroundAudio, frozen, cameraChoice.takeIf { intent.hasVideo }).also {
+        return Preparation(++serial, intent, audioInputId, backgroundAudio, frozen, cameraChoice.takeIf { intent.hasVideo },initialStandby).also {
             selectedCamera = it.cameraChoice
             timingPreparation = it; elapsed.reset()
             current = it; epoch = -1; live = true; candidate = true; committed = false

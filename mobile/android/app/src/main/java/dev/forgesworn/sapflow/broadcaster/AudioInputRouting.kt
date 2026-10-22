@@ -20,7 +20,7 @@ internal class AudioInputPin(requestedId: String?) {
         id = actual; return true
     }
 }
-internal data class AudioInputOwner(val preparation: CaptureStartAdmission.Preparation, val epoch: Long)
+internal data class AudioInputOwner(val preparation: CaptureStartAdmission.Preparation, val epoch: Long, val sourceSerial: Long = 0)
 
 /** Native getters only at startup and routing events; per-block work is a scalar gate. */
 internal class AudioInputRouting(

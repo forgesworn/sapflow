@@ -31,6 +31,7 @@ internal class ReconnectingPublishingSink(
     init { require(graceMs in 0..3_600_000) }
     private data class Codecs(val video: RustCodec?, val audio: RustCodec?)
     private data class Current(val epoch: Epoch, val token: Long, val context: PublishingAttemptContext, val admitted: AtomicBoolean, val failed: AtomicBoolean, val sink: EncodedSink, val report: (PublishingAttemptEvent) -> Unit)
+    private fun terminalAdmission() { epochs.values.forEach { it.terminalAdmission() } }
     private val fenced = AtomicBoolean(false)
     private val destinationId = destinations.incrementAndGet()
     private val sequence = AtomicLong()
@@ -153,7 +154,7 @@ internal class ReconnectingPublishingSink(
             action(); message.set(controller.status)
             if (controller.terminal) {
                 output.ended(System.nanoTime())
-                fenced.set(true); current.get()?.let { notifyObservation(it.context, false) }; alarm?.cancel(false)
+                fenced.set(true); terminalAdmission(); current.get()?.let { notifyObservation(it.context, false) }; alarm?.cancel(false)
                 releaseEpochDescriptors(); stopped.complete(Unit); executor.shutdown()
             } else arm()
         }
@@ -172,6 +173,7 @@ internal class ReconnectingPublishingSink(
     }
     fun stopDestination() {
         if (!observationGate.withGate { fenced.compareAndSet(false, true) }) return
+        terminalAdmission()
         output.ended(System.nanoTime())
         current.get()?.let { notifyObservation(it.context, false) }
         message.set("Stopping publisher")
@@ -187,6 +189,9 @@ internal class ReconnectingPublishingSink(
         } } catch (error: Exception) { stopped.completeExceptionally(error) }
     }
     private inner class Epoch(val id: Long) : EncodedSink, SocketOutputProvider {
+        private val terminal=TerminalAdmissionSignal()
+        fun terminalAdmission()=terminal.closeAdmission()
+        override fun setTerminalAdmissionListener(listener: () -> Unit) { terminal.listen(listener);if(fenced.get())terminalAdmission() }
         override val socketOutput: SocketOutputSource get() = output
         val closed = AtomicBoolean(false)
         val codecs = AtomicReference(Codecs(null, null))

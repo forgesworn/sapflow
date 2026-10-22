@@ -1,7 +1,8 @@
 # Native privacy standby
 
 This is the B4R implementation and qualification contract for pre-start standby
-and live privacy pause. The controls are not yet implemented in either app.
+and live privacy pause. An Android runtime candidate is under review; the iOS
+runtime control remains to be implemented and neither app is qualified.
 Source policy tests, native codec experiments, app builds and physical acceptance
 are separate gates. See the [delivery status](mobile-delivery-status.md).
 

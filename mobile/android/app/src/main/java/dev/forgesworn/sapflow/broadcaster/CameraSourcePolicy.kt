@@ -157,6 +157,16 @@ internal class CameraRunAdmission(val epoch: Long, private val beforeExpiry: (()
             } else if (state.compareAndSet(old, State.Live(token = token, confirmedNs = nowNs))) return true
         }
     }
+    /** Only the actual old hardware close may remove its source budget;
+     * ordinary Stop's permanent cancellation never becomes reusable. */
+    fun retiredSource(operation: CameraSourcePolicy.Operation): Boolean {
+        while(true) {
+            val old=state.get() as? State.Live ?: return false
+            if(old.pending!=null && old.pending !== operation)return false
+            if(old.pending==null && old.token!=operation.serial)return false
+            if(state.compareAndSet(old,State.Live()))return true
+        }
+    }
     fun confirmed(token: Long): Long? = (state.get() as? State.Live)?.let { if (it.token == token) it.confirmedNs else null }
     fun admit(nowNs: Long): Boolean {
         while (true) {
@@ -179,7 +189,7 @@ internal class CameraRunAdmission(val epoch: Long, private val beforeExpiry: (()
  * video-submission highwater. Preview does not hide a real publishing gap. */
 internal class CameraSourceTimeline(private val maxSourceGapNs: Long = 2_000_000_000L) {
     private var lastMappedNs = -1L
-    private var lastSubmittedNs = -1L
+    var lastSubmittedNs = -1L; private set
     private var failed = false
     fun frame(ptsNs: Long, firstSourceFrame: Boolean, encoding: Boolean): Boolean {
         if (failed) return false

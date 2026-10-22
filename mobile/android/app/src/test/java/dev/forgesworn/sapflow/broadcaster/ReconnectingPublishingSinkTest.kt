@@ -433,4 +433,16 @@ class ReconnectingPublishingSinkTest {
             observer.close(); assertTrue(observer.awaitStopped(2000))
         }
     }
+    @Test fun autoEpochClosureAndRetryDoNotEmitLogicalAdmissionTerminalButExplicitEndDoes() {
+        val h=Harness();val first=h.owner.newEpoch();val second=h.owner.newEpoch()
+        var oldTerminals=0;var newTerminals=0
+        first.setTerminalAdmissionListener{oldTerminals++};second.setTerminalAdmissionListener{newTerminals++}
+        first.start();val a=h.sink(0);first.close()
+        assertEquals(0,oldTerminals);assertEquals(0,newTerminals)
+        second.start();val b=h.sink(1);b.events(PublishingAttemptEvent.Failed());h.sink(2)
+        assertEquals(0,newTerminals);assertEquals(0,oldTerminals)
+        second.stopDestination();second.stopDestination();second.close()
+        assertEquals(1,newTerminals);assertEquals(0,oldTerminals);assertEquals(0L,a.closed.count)
+    }
+
 }

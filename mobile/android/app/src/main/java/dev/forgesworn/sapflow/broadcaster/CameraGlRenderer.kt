@@ -39,6 +39,8 @@ internal class CameraGlRenderer(
     initialLegacyMirror: Boolean = false,
     private val rawAdmission: CameraRunAdmission,
     private val onSourceFrame: (Long, Long) -> Unit = { _, _ -> },
+    private val rawAllowed: () -> Boolean = { true },
+    private val previewAllowed: () -> Boolean = { true },
 ) {
     private val thread = HandlerThread("sapflow-camera-gl").apply {
         require(inputWidth > 0 && inputHeight > 0) { "Invalid camera texture size" }
@@ -58,6 +60,7 @@ internal class CameraGlRenderer(
     private var front = initialFront
     private var legacyMirror = initialLegacyMirror
     private var firstFrame = true
+    private var firstRawSubmission = true
     private val sourceTimeline = CameraSourceTimeline()
     private val live = AtomicBoolean(true)
     private val failed = AtomicBoolean(false)
@@ -99,6 +102,76 @@ internal class CameraGlRenderer(
     private val vertices = floats(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
     private val coordinates = floats(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f))
     private val render = Runnable { renderLatest() }
+    @Volatile private var slateCommand: PrivacyStandbyPolicy.Command? = null
+    private var slatePolicy: PrivacyStandbyPolicy? = null
+    private var slateCadence: ReplacementCadence? = null
+    private var slateEpochNs=0L
+    private val slate = Runnable { renderSlate() }
+
+    /** One GL-owner clock, independent of camera callbacks. Cold command only;
+     * actual input and output admission recheck the same published policy. */
+    fun startSlate(command: PrivacyStandbyPolicy.Command, epochNs: Long, policy: PrivacyStandbyPolicy) {
+        slateCommand=command
+        owner.post {
+            if(!live.get() || slateCommand!==command)return@post
+            slatePolicy=policy;slateEpochNs=epochNs
+            val now=maxOf(System.nanoTime(),sourceTimeline.lastSubmittedNs+1)
+            val slot=Math.addExact(Math.multiplyExact((now-epochNs).coerceAtLeast(0),30)/1_000_000_000,1)
+            val first=Math.addExact(epochNs,Math.multiplyExact(slot,1_000_000_000)/30)
+            slateCadence=ReplacementCadence(first,1,30,skipObsolete=true)
+            owner.removeCallbacks(slate);owner.post(slate)
+        }
+    }
+    fun endSlate() { slateCommand=null;owner.post { owner.removeCallbacks(slate);slateCadence=null } }
+    fun concealPreview() { owner.post { if(live.get() && preview!=EGL14.EGL_NO_SURFACE) guarded("Privacy preview") { renderPreview(true) } } }
+    private fun slateAction(command:PrivacyStandbyPolicy.Command,policy:PrivacyStandbyPolicy)=PrivacyNativeWork.action(
+        policy.replacementAdmission(command,System.nanoTime()),live.get(),slateCommand===command && requestedEncoding.get()==encoderToken,failed.get() || !rawAdmission.admit(System.nanoTime()))
+    private fun admitSlate(command:PrivacyStandbyPolicy.Command,policy:PrivacyStandbyPolicy):Boolean = when(slateAction(command,policy)) {
+        PrivacyNativeWork.Action.SUBMIT -> true
+        PrivacyNativeWork.Action.FAULT -> { fail("Privacy picture authority expired or faulted");false }
+        else -> false // normal Resume/Stop/Auto superseded this held draw
+    }
+    private fun renderSlate() {
+        val command=slateCommand ?: return
+        val policy=slatePolicy ?: return
+        if(!admitSlate(command,policy))return
+        guarded("Generated privacy picture") {
+            val cadence=checkNotNull(slateCadence)
+            val pts=cadence.claim(System.nanoTime())
+            if(pts>=0 && encoder!=EGL14.EGL_NO_SURFACE && requestedEncoding.get()==encoderToken) {
+                if(!admitSlate(command,policy))return@guarded
+                drawSlate(encoder,plan.width,plan.height)
+                if(!admitSlate(command,policy))return@guarded
+                // A canceled held draw must not advance the shared camera
+                // timeline. This final reservation precedes the native swap.
+                check(sourceTimeline.frame(pts,true,true)) { "Replacement picture exceeds the live media gap" }
+                check(EGLExt.eglPresentationTimeANDROID(display,encoder,pts))
+                check(EGL14.eglSwapBuffers(display,encoder))
+                sourceTimeline.submitted(pts)
+                if(policy.needsOutputProof(command)) {
+                    val relative=pts/1000-slateEpochNs/1000
+                    val tick=Math.multiplyExact((Math.multiplyExact(relative,30)+500_000)/1_000_000,3000)
+                    policy.pictureSubmitted(command,tick,System.nanoTime())
+                }
+                if(preview!=EGL14.EGL_NO_SURFACE && slateAction(command,policy)==PrivacyNativeWork.Action.SUBMIT) {
+                    renderPreview(true)
+                }
+            }
+        }
+        if(slateAction(command,policy)==PrivacyNativeWork.Action.SUBMIT)
+            owner.postDelayed(slate,((checkNotNull(slateCadence).nextNs-System.nanoTime()).coerceAtLeast(0)+999_999)/1_000_000)
+    }
+    /** Original procedural geometric slate, no texture or camera sampling. */
+    private fun drawSlate(target:EGLSurface,width:Int,height:Int) {
+        makeCurrent(target);GLES20.glViewport(0,0,width,height)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST);GLES20.glClearColor(0.035f,0.055f,0.085f,1f);GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST);GLES20.glClearColor(0.26f,0.68f,0.72f,1f)
+        val unit=maxOf(1,minOf(width,height)/12)
+        GLES20.glScissor(width/2-unit*2,height/2-unit*2,unit,unit*4);GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glScissor(width/2+unit,height/2-unit*2,unit,unit*4);GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST);glCheck()
+    }
+
 
     init {
         owner.post { guarded("GPU initialisation", 3000) { initialise() } }
@@ -243,7 +316,7 @@ internal class CameraGlRenderer(
                 if (textureName != 0) { GLES20.glDeleteTextures(1, intArrayOf(textureName), 0); textureName = 0 }
                 sourcePlan = next; sourceWidth = next.cameraWidth; sourceHeight = next.cameraHeight
                 this.front = front; this.legacyMirror = legacyMirror; timestamps = mapper
-                sourceToken = token; lastTextureNs = -1; geometryLogged = false; firstFrame = true
+                sourceToken = token; lastTextureNs = -1; geometryLogged = false; firstFrame = true;firstRawSubmission=true
                 encoderMatrix = next.encoderPositionMatrix()
                 previewMatrix = next.previewPositionMatrix(previewDisplayDegrees, front)
                 admission = RenderAdmission(); requestedSource.set(token)
@@ -287,7 +360,7 @@ internal class CameraGlRenderer(
                 lastTextureNs = sourceNs
                 val pts = timestamps.map(sourceNs)
                 val encoding = encoder != EGL14.EGL_NO_SURFACE && requestedEncoding.get() == encoderToken
-                check(sourceTimeline.frame(pts, firstFrame, encoding)) { "Camera source regressed timing or exceeded the live video gap bound" }
+                check(!rawAllowed() || sourceTimeline.frame(pts, firstRawSubmission, encoding)) { "Camera source regressed timing or exceeded the live video gap bound" }
                 source.getTransformMatrix(textureMatrix)
                 if (!geometryLogged) {
                     geometryLogged = true
@@ -296,11 +369,12 @@ internal class CameraGlRenderer(
                 CameraTextureGeometry.normalise(textureMatrix, sourcePlan.sensorClockwiseDegrees, sourceWidth, sourceHeight, legacyMirror)
                 if (requestedSource.get() != sourceToken) return@guarded
                 if (!rawAdmission.admit(System.nanoTime())) { fail("Camera source deadline expired before frame submission"); return@guarded }
-                if (encoder != EGL14.EGL_NO_SURFACE && requestedEncoding.get() == encoderToken) {
+                if (rawAllowed() && encoder != EGL14.EGL_NO_SURFACE && requestedEncoding.get() == encoderToken) {
                     draw(encoder, plan.width, plan.height, encoderMatrix, encoderViewport)
+                    if(!rawAllowed())return@guarded
                     check(EGLExt.eglPresentationTimeANDROID(display, encoder, pts)) { "Encoder presentation timestamp rejected" }
                     check(EGL14.eglSwapBuffers(display, encoder)) { "Encoder EGL submission failed" }
-                    sourceTimeline.submitted(pts)
+                    sourceTimeline.submitted(pts);firstRawSubmission=false
                 }
                 // A live source is not confirmed until its actual encoder
                 // submission returns. PCM keeps the original source deadline
@@ -316,19 +390,24 @@ internal class CameraGlRenderer(
                     val observedAtNs = checkNotNull(rawAdmission.confirmed(confirmed))
                     callbacks.post { if (live.get() && requestedSource.get() == confirmed) onSourceFrame(confirmed, observedAtNs) }
                 }
-                if (preview != EGL14.EGL_NO_SURFACE && live.get() && requestedSource.get() == sourceToken) {
-                    val borrowed = previewSurface ?: error("Preview native window owner unavailable")
-                    if (!borrowed.isValid) detachPreview()
-                    else try {
-                        draw(preview, previewWidth, previewHeight, previewMatrix, previewViewport)
-                        check(EGL14.eglSwapBuffers(display, preview)) { "Preview EGL submission failed" }
-                    } catch (error: Exception) {
-                        if (expectedPreviewLoss(borrowed)) detachPreview() else throw error
-                    }
+                if (previewAllowed() && preview != EGL14.EGL_NO_SURFACE && live.get() && requestedSource.get() == sourceToken) {
+                    renderPreview(false)
                 }
             }
         } finally {
             if (admission.finish() && live.get()) owner.post(render)
+        }
+    }
+
+    /** Preview is a borrowed window independent of the encoder surface. A
+     * normal SurfaceView relayout may abandon it before queued detach runs. */
+    private fun renderPreview(slate:Boolean) {
+        if(preview==EGL14.EGL_NO_SURFACE)return
+        val borrowed=previewSurface ?:error("Preview native window owner unavailable")
+        previewSubmission(borrowed.isValid,{expectedPreviewLoss(borrowed)},{detachPreview()}) {
+            if(slate)drawSlate(preview,previewWidth,previewHeight)
+            else draw(preview,previewWidth,previewHeight,previewMatrix,previewViewport)
+            check(EGL14.eglSwapBuffers(display,preview)) { "Preview EGL submission failed" }
         }
     }
 
@@ -422,7 +501,7 @@ internal class CameraGlRenderer(
         var cleanupError = false
         fun attempt(action: () -> Unit) { try { action() } catch (_: Exception) { cleanupError = true } }
         attempt { cameraTexture?.setOnFrameAvailableListener(null) }
-        owner.removeCallbacks(render)
+        owner.removeCallbacks(render);owner.removeCallbacks(slate);slateCommand=null
         if (context != EGL14.EGL_NO_CONTEXT && scratch != EGL14.EGL_NO_SURFACE) {
             attempt { makeCurrent(scratch) }
             attempt { if (textureName != 0) GLES20.glDeleteTextures(1, intArrayOf(textureName), 0) }
@@ -497,6 +576,14 @@ internal class CameraGlRenderer(
         private const val NO_ENCODING = Long.MIN_VALUE
         private fun floats(values: FloatArray): FloatBuffer = ByteBuffer.allocateDirect(values.size * 4)
             .order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(values); position(0) }
+
+        /** Inline production-used preview-only exception boundary. Encoder
+         * calls never enter here. Unknown context/native cleanup still fails. */
+        internal inline fun previewSubmission(surfaceValid:Boolean,expectedLoss:()->Boolean,detach:()->Unit,render:()->Unit) {
+            if(!surfaceValid){detach();return}
+            try { render() }
+            catch(error:Exception){if(expectedLoss())detach() else throw error}
+        }
 
         internal fun isExpectedPreviewLoss(surfaceValid: Boolean, eglError: Int): Boolean =
             eglError == EGL14.EGL_BAD_SURFACE || eglError == EGL14.EGL_BAD_NATIVE_WINDOW ||

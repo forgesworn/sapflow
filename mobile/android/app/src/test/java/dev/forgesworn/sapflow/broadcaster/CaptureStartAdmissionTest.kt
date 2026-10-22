@@ -269,4 +269,14 @@ class CaptureStartAdmissionTest {
         assertNull(a.cameraChoice); assertNull(gate.cameraChoice(a)); assertFalse(gate.permitsCamera(a))
         assertFalse(gate.selectCamera(a, CameraSourceChoice.FRONT))
     }
+    @Test fun initialStandbyIsImmutableThroughPreparedStartAndOrientationChild() {
+        val admission=CaptureStartAdmission();val p=checkNotNull(admission.reserve(initialStandby=true))
+        assertTrue(p.initialStandby);assertTrue(admission.claim(p));assertTrue(admission.beginEpoch(p,1));assertTrue(admission.prepared(p,1))
+        assertTrue(admission.commit(checkNotNull(admission.start(p))))
+        admission.beginCleanup(p,true);admission.cleanup(p,true)
+        assertSame(p,admission.preparation);assertTrue(admission.beginEpoch(p,2));assertTrue(p.initialStandby)
+        admission.stop(p);admission.beginCleanup(p,false);admission.cleanup(p,true)
+        val successor=checkNotNull(admission.reserve());assertFalse(successor.initialStandby)
+    }
+
 }

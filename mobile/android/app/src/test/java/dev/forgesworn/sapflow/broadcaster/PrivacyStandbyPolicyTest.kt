@@ -287,4 +287,57 @@ class PrivacyStandbyPolicyTest {
         val source=Fixture();val mutation=checkNotNull(source.policy.reserveSource(source.run,0))
         assertFalse(source.policy.sourceClosed(mutation,true,-1));assertEquals(PrivacyStandbyPolicy.Fault.CLOCK,source.policy.snapshot().fault)
     }
+    @Test fun urgentStandbyDuringActualOrientationCleanupPersistsIntoChildWithoutOpeningRaw() {
+        val f=Fixture();f.start();assertTrue(f.policy.fenceRun(f.run))
+        val pending=f.pause(11)
+        assertFalse(f.policy.permitsRaw(f.run));assertFalse(f.policy.permitsReplacement(pending,12))
+        assertNull(f.policy.userResume(f.run,pending.revision,12))
+        assertTrue(f.policy.runClosed(f.run))
+        val child=checkNotNull(f.policy.attach(f.owner,2,Any(),null,12))
+        val inherited=checkNotNull(f.policy.snapshot().pending)
+        assertSame(child,inherited.run);assertEquals(pending.startedNs,inherited.startedNs);assertEquals(pending.deadlineNs,inherited.deadlineNs)
+        assertEquals(PrivacyStandbyPolicy.Desired.STANDBY,f.policy.snapshot().desired)
+        assertFalse(f.policy.permitsRaw(child));assertTrue(f.policy.permitsReplacement(inherited,12))
+        assertFalse(f.policy.tick(child,pending.deadlineNs))
+    }
+    @Test fun stoppedOrientationOwnerCannotChangeSuccessorPrivacyIntent() {
+        val f=Fixture();f.start();f.policy.fenceRun(f.run);f.policy.stop(f.owner)
+        assertNull(f.policy.standby(f.run,11));assertFalse(f.policy.permitsRaw(f.run))
+        assertNull(f.policy.attach(f.owner,2,Any(),null,12))
+    }
+
+    @Test fun ordinaryStandbyRepeatsDispatchOneRetirementButUrgentStandbySupersedesQueuedResume() {
+        val f=Fixture();val slot=PrivacyStandbyDispatch();val safe=f.confirmed()
+        assertTrue(slot.admit(safe));repeat(100){assertFalse(slot.admit(safe))}
+        val resume=checkNotNull(f.policy.userResume(f.run,safe.revision,13));assertTrue(slot.admit(resume))
+        val urgent=f.pause(14);assertTrue(slot.admit(urgent));repeat(100){assertFalse(slot.admit(urgent))}
+        assertFalse(f.policy.permitsResume(resume,14));assertFalse(f.policy.permitsRaw(f.run))
+        assertEquals(resume.deadlineNs,urgent.deadlineNs)
+    }
+
+    @Test fun withheldTimerCannotAdmitQueuedNativeOutputButExactNormalStopTailRemainsAllowed() {
+        val f=Fixture();assertFalse(f.policy.permitsOutput(f.run,10));f.start()
+        val c=f.pause();assertTrue(f.policy.permitsOutput(f.run,12))
+        // No tick, callback or owner timer runs: the actual fanout gate refuses.
+        assertFalse(f.policy.permitsOutput(f.run,c.deadlineNs))
+        assertFalse(f.policy.permitsReplacement(c,c.deadlineNs))
+        val live=Fixture();live.start();live.policy.stop(live.owner)
+        assertTrue(live.policy.permitsOutput(live.run,100)) // existing compressed/native tail only
+        assertFalse(live.policy.permitsRaw(live.run))
+        live.policy.runClosed(live.run);assertFalse(live.policy.permitsOutput(live.run,101))
+        val rotation=Fixture();rotation.start();rotation.policy.fenceRun(rotation.run)
+        assertTrue(rotation.policy.permitsOutput(rotation.run,100));rotation.policy.nativeFailed(rotation.run)
+        assertFalse(rotation.policy.permitsOutput(rotation.run,101))
+    }
+
+    @Test fun stopOrAutoTailCannotExtendAnAlreadyPendingPrivacyBoundary() {
+        for(stop in listOf(true,false)) {
+            val f=Fixture();f.start();val c=f.pause()
+            if(stop)f.policy.stop(f.owner) else f.policy.fenceRun(f.run)
+            assertEquals(c.deadlineNs,f.policy.cleanupDeadlineNs)
+            assertTrue(f.policy.permitsOutput(f.run,c.deadlineNs-1))
+            assertFalse(f.policy.permitsOutput(f.run,c.deadlineNs))
+        }
+    }
+
 }

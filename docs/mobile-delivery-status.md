@@ -8,10 +8,46 @@ or [native performance contract](native-performance-contract.md).
 Privacy standby is the next source packet. Its
 [contract](privacy-standby.md) requires synchronous raw-input fencing,
 independently paced replacement picture and silence, explicit Resume and
-matching recording. It is not yet an app control. Cold AAC replacement needs
+matching recording. Its app integration remains under qualification. Cold AAC replacement needs
 per-generation timing and recording proof before native integration.
 
-The current generated macOS AAC baseline passes the unchanged strict
+The reviewed Android runtime candidate passes the offline Debug and
+Qualification app suites: 521 tests in 62 suites each, with no failures, errors
+or skips. All three APK assemblies, lint, qualification isolation, exact native
+library matching and 16 KiB ZIP/ELF alignment pass. Independent source review
+clears the cancellation, stale Resume, native-fault fencing and preview-only
+surface-loss repairs. Sustained screen-lock standby still needs explicit power
+ownership after microphone capture closes. Native codec/GPU and physical
+acceptance remain open. Source and app receipts are retained under
+`target/camera-controls/android-standby-runtime-v3/`.
+
+The actual iOS encoder/recorder candidate exercises three AAC generations with
+explicit Resume, exact payload retention and independently pinned source
+markers. Mono 48 kHz and stereo 44.1 kHz input pass native timing and declared
+AAC-LC settling checks. Real converter experiments establish explicit resampling
+and EOF accounting; 27 timing tests pass with warnings as errors. Grouping the
+initial A/V AAC head preserves all 97 AAC and 63 H.264 packets, and eight short
+prefix cases retain their original media. These remain partial gates: the A/V
+MOV's independent decoded presentation disagrees with its native presentation.
+Container-header correction is still experimental; the source is not accepted
+on native decoding alone. The single-generation regression passed before the
+latest A/V tail changes and must be rerun against final source. Evidence is in
+`target/privacy-standby/ios-codec-v7-resampling/`,
+`target/ios-audio-standby-fixture/20261022T194601Z-b1c79a3a/` and
+`target/ios-audio-only-fixture/20261022T193050Z-a09efbc6/`.
+
+The SDK now supports independently closing publishing or recording admission.
+Each successful close is irreversible for that fanout, preserves its accepted
+prefix for ordinary draining and leaves the other branch usable. A busy call
+is not a closure receipt. Swift and Kotlin consumers exercise the real exported
+methods. The workspace passes 629 tests with four normally ignored, strict
+all-target Clippy and formatting; the bounded mobile-media fuzz target compiles.
+Apple, four-ABI Android and ARM64 development packages are rebuilt and their
+installed ownership consumers pass. These SDK gates do not qualify the pending
+native standby adapters or a physical phone. Evidence is retained under
+`target/privacy-standby/sdk-fences-v1/`.
+
+The preceding single-generation macOS AAC snapshot passes the unchanged strict
 stored-payload and presentation oracles for six recording cases. Native output
 is shared with actual packaged Rust validation and the real recording writer.
 The aligned, partial and 511-frame nonperiodic cases retain exact native PCM
@@ -25,8 +61,9 @@ An independently reviewed Android standby transaction model now passes 32
 warnings-as-errors JVM tests and the same 32 tests in the real Debug Gradle
 project. It covers priority privacy fencing, explicit Start/Resume, delayed
 callbacks, immutable retiring-AAC identity, sink admission and original
-deadlines. It is not connected to capture, codecs, the UI or the SDK queues;
-trusted native receipt adapters and terminal branch fences remain to be built.
+deadlines. That foundation did not connect capture, codecs, the UI or SDK queues;
+the subsequent candidate and its trusted receipt adapters remain to be qualified against the new SDK
+terminal branch fences.
 
 Generated macOS feasibility experiments expose why cold AAC needs separate
 recording accounting. Discarding the old encoder leaves one decoded access

@@ -35,4 +35,10 @@ class AudioWorkerCompletionTest {
         workers.observeStopped(readerAlive = false, pumpAlive = false)
         assertTrue(workers.stopped)
     }
+    @Test fun resumeStartsOnlyTheNewMicrophoneReaderWithoutLosingRunningZeroPumpOwnership() {
+        val owner=AudioWorkerCompletion();owner.begin();owner.readerCompleted()
+        assertFalse(owner.stopped);owner.readerBegan();assertFalse(owner.readerDone);assertFalse(owner.pumpDone)
+        owner.readerCompleted();assertFalse(owner.stopped);owner.pumpCompleted();assertTrue(owner.stopped)
+    }
+
 }
