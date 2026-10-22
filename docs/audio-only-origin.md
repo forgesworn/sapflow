@@ -85,6 +85,30 @@ created, including when connection Drop runs outside an ambient Tokio runtime.
 That originating runtime must remain alive until the writers complete. A runtime
 handle does not establish process-shutdown durability.
 
+## Parser resource limits
+
+TS ingest checks an 8 MiB unread-input limit before copying incoming bytes.
+Each assembled PES is limited to 8 MiB, and pending PES payload/reservation
+requests total at most 16 MiB. A bounded START charges its advertised payload
+reservation immediately, even when little data has arrived. A replacement on
+the same PID must fit both its old and new reservations while ownership overlaps.
+These are logical limits, not measurements or bounds on Vec capacity, allocator
+overhead, retained HLS data or total process RSS.
+
+`IngestError::InputLimitExceeded` releases parser-owned pending assemblies and
+unread input immediately. The failure is sticky: later pushes cannot admit more
+bytes. The first `finish()` still seals the accepted prefix with `media_loss`,
+so the server syncs it as incomplete. Repeated finish and post-finish refusal
+retain their existing behaviour; a reconnect uses a fresh parser budget.
+
+Three pre-fix regressions reproduced valid-continuity unbounded video growth,
+PMT-rotation reservation growth and an oversized raw push. They now pass.
+The first guard revision also failed three malformed special-stream-ID header
+tests: upstream retained an old allocation while accounting replaced its charge.
+The revised guard preserves that charge until the maintained reader actually
+replaces the owner. Independent V2 review and the passing regressions cover the
+repair, exact limits, same-PID overlap, reset accounting and fresh-parser recovery.
+
 ## API and observation
 
 The pre-release Rust API now returns `Option<&H264Config>` from `Muxer::video()`.
@@ -96,7 +120,8 @@ audio methods remain video-led compatibility paths.
 Rust consumers matching RTMP events must handle the new `Event::Tracks` variant.
 Update literals need `media_loss` or a default initializer; consumers must
 preserve that flag when merging updates and reporting recording completion.
-Exhaustive `IngestError` matches must also handle `InputFinished`.
+Exhaustive `IngestError` matches must also handle `InputFinished` and
+`InputLimitExceeded`.
 
 `Health.keyframe_interval_ms` is now `Option<u64>`: A/V JSON retains its numeric
 field, while audio-only JSON carries `keyframeIntervalMs: null`. Bitrate remains
@@ -133,9 +158,22 @@ or qualify native encoder shutdown and complete-show retention.
 Executed terminal tests now cover the single-start-packet case, exact fixture
 frame counts, truncation, stuffing, missing timestamps, idempotence, reconnect
 freshness, scoped revocation and actual writer finalisation. The per-PID terminal
-metadata is finite and contains no elementary payload copy. The maintained
-reader's pre-existing retained unbounded-PES payload needs separate memory-limit
-hardening; the unread-input `MAX_BUFFER` does not establish that bound.
+metadata is finite and contains no elementary payload copy. Pending payloads now
+have the separate logical limits described above; unread-input `MAX_BUFFER`
+alone never established those bounds.
+
+The repaired source passes 598 workspace tests with four ignored, strict
+all-target Clippy and formatting. The first sandboxed workspace run could not
+bind a loopback socket; the unrestricted loopback rerun passes. This was a test
+infrastructure restriction, not a product failure. Five generated `ts_ingest`
+seeds replay successfully, followed by a 62-second AddressSanitizer/overflow run
+with 13,298 executions. Exact resource thresholds are covered by the focused
+wire tests; finite mutation testing does not establish a process-memory or
+sustained-performance bound. Fresh Apple, ARM64 Android and four-ABI Android
+packages build from this source, and their host consumers pass. The unsigned
+iOS configurations and Android Debug, Qualification and Release applications
+also compile against those packages. Native shutdown and physical acceptance
+remain separate open gates.
 
 The native apps now select explicit foreground audio-only capture/permissions,
 recording and PCM-only observation without a camera, video encoder or keyframe

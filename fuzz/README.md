@@ -97,6 +97,13 @@ bounded terminal input, a raw stuffed-header overrun and a truncated declared
 length. Their AAC payload placeholders establish parser/packaging behaviour,
 not PCM playability. They contain no camera or microphone recording.
 
+After the TS/PES resource-limit repair, all five generated `ts_ingest` seeds
+replay successfully. A fresh local AddressSanitizer/overflow run completes
+13,298 executions over 62 seconds. The focused wire tests separately exercise
+the large payload/reservation thresholds and malformed-header accounting;
+the small seeds and this finite run do not establish a process-RSS bound,
+sustained performance, CI or native-device acceptance.
+
 Historical FLV and video-timing regression formats remain unchanged. The `TRKS`
 prefix selects four FLV record kinds: video, audio, legacy audio hint and a
 nonempty explicit track set. The `AAC1` timing prefix selects 48 kHz mono or

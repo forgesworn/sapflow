@@ -26,6 +26,14 @@ const TS_SIZE: usize = 188;
 const SYNC: u8 = 0x47;
 /// Cap on unconsumed input (a few seconds at stage bitrates).
 const MAX_BUFFER: usize = 8 * 1024 * 1024;
+// Limits on assembled payload lengths and bounded PES reservation requests,
+// not Vec capacity, allocator overhead, retained HLS data or whole-process RSS.
+const MAX_PES_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_PES_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "pes_limits_tests.rs"]
+mod pes_limits_tests;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestError {
@@ -41,6 +49,9 @@ pub enum IngestError {
     InvalidTimestamp,
     /// This connection has explicitly finished; resume with a new ingest.
     InputFinished,
+    /// Unread input or pending PES exceeds this parser's resource policy.
+    /// No more input is accepted; `finish` still seals the accepted prefix.
+    InputLimitExceeded,
 }
 
 impl std::fmt::Display for IngestError {
@@ -54,6 +65,7 @@ impl std::fmt::Display for IngestError {
             Self::InvalidAudio => f.write_str("unsupported or changed AAC configuration"),
             Self::InvalidTimestamp => f.write_str("audio timestamp outside supported range"),
             Self::InputFinished => f.write_str("transport input already finished"),
+            Self::InputLimitExceeded => f.write_str("TS input or PES retention limit exceeded"),
         }
     }
 }
@@ -109,6 +121,7 @@ struct Input {
     reset_pes: bool,
     terminal: bool,
     ended: bool,
+    limit_exceeded: bool,
 }
 
 // Scalar/header metadata only: never a second copy of elementary payloads.
@@ -118,6 +131,7 @@ struct PesBoundary {
     header: PesHeader,
     expected: Option<usize>,
     received: usize,
+    reserved: usize,
 }
 
 struct Feed {
@@ -127,6 +141,7 @@ struct Feed {
     continuity: HashMap<Pid, (u8, [u8; TS_SIZE])>,
     pending: Option<Box<TsPacket>>,
     boundaries: HashMap<Pid, PesBoundary>,
+    pending_bytes: usize,
 }
 
 impl Feed {
@@ -168,7 +183,11 @@ impl Feed {
         true
     }
 
-    fn observe_boundary(&mut self, packet: &TsPacket) {
+    // Check BEFORE handing a packet to PesPacketReader: bounded START allocates
+    // its advertised size immediately, while an unbounded continuation appends
+    // indefinitely. Only scalar accounting is added, never payload copies or a
+    // second parser. HashMap keys remain bounded by the transport PID space.
+    fn observe_boundary(&mut self, packet: &TsPacket) -> bool {
         let pid = packet.header.pid;
         match &packet.payload {
             Some(TsPayload::PesStart(pes)) => {
@@ -179,30 +198,75 @@ impl Feed {
                     + usize::from(pes.header.pts.is_some()) * 5
                     + usize::from(pes.header.dts.is_some()) * 5
                     + usize::from(pes.header.escr.is_some()) * 6;
+                if pes.pes_packet_len != 0 && usize::from(pes.pes_packet_len) < header_len {
+                    // Upstream rejects this START BEFORE allocating/inserting
+                    // its replacement. Special stream IDs omit the optional
+                    // wire header, so normalize_pes_length does not reject
+                    // them. Preserve the old owner's accounting exactly and
+                    // let the maintained reader report its existing error.
+                    return true;
+                }
                 let expected = (pes.pes_packet_len != 0)
                     .then(|| usize::from(pes.pes_packet_len).checked_sub(header_len))
                     .flatten();
-                self.boundaries.insert(
+                let reserved = expected.unwrap_or(0).max(pes.data.len());
+                let Some(transient) = self.pending_bytes.checked_add(reserved) else {
+                    return false;
+                };
+                // Upstream allocates the new packet BEFORE releasing the old
+                // packet on this PID. Both reservations must fit transiently.
+                if reserved > MAX_PES_BYTES || transient > MAX_PENDING_PES_BYTES {
+                    return false;
+                }
+                let old = self.boundaries.insert(
                     pid,
                     PesBoundary {
                         header: pes.header.clone(),
                         expected,
                         received: pes.data.len(),
+                        reserved,
                     },
                 );
+                self.pending_bytes = transient - old.map_or(0, |b| b.reserved);
             }
             Some(TsPayload::PesContinuation(data)) => {
                 if let Some(boundary) = self.boundaries.get_mut(&pid) {
-                    boundary.received = boundary.received.saturating_add(data.len());
+                    let Some(received) = boundary.received.checked_add(data.len()) else {
+                        return false;
+                    };
+                    let reserved = boundary.expected.unwrap_or(0).max(received);
+                    let Some(total) = self
+                        .pending_bytes
+                        .checked_sub(boundary.reserved)
+                        .and_then(|other| other.checked_add(reserved))
+                    else {
+                        return false;
+                    };
+                    if reserved > MAX_PES_BYTES || total > MAX_PENDING_PES_BYTES {
+                        return false;
+                    }
+                    boundary.received = received;
+                    boundary.reserved = reserved;
+                    self.pending_bytes = total;
                     if boundary.expected.is_some_and(|n| boundary.received >= n) {
                         // The PES reader returns a complete bounded packet (or
                         // rejects an overrun) in this very continuation call.
+                        self.pending_bytes -= reserved;
                         self.boundaries.remove(&pid);
                     }
                 }
             }
             _ => {}
         }
+        true
+    }
+
+    fn retention_limit(&self) -> mpeg2ts::Error {
+        if let Ok(mut input) = self.input.lock() {
+            input.limit_exceeded = true;
+            input.dropped = input.dropped.saturating_add(1);
+        }
+        io::Error::new(io::ErrorKind::InvalidData, "PES retention limit exceeded").into()
     }
 
     fn terminal_aac(&self, pes: &PesPacket<Vec<u8>>) -> bool {
@@ -226,7 +290,9 @@ impl Feed {
 impl ReadTsPacket for Feed {
     fn read_ts_packet(&mut self) -> mpeg2ts::Result<Option<TsPacket>> {
         if let Some(packet) = self.pending.take() {
-            self.observe_boundary(&packet);
+            if !self.observe_boundary(&packet) {
+                return Err(self.retention_limit());
+            }
             return Ok(Some(*packet));
         }
         loop {
@@ -348,7 +414,9 @@ impl ReadTsPacket for Feed {
                         }
                         input.program = program;
                     }
-                    self.observe_boundary(&p);
+                    if !self.observe_boundary(&p) {
+                        return Err(self.retention_limit());
+                    }
                     return Ok(Some(p));
                 }
                 Ok(None) => {}
@@ -630,6 +698,12 @@ impl EsIngest {
 }
 
 /// One publisher's stream: TS bytes in, LL-HLS muxer state out.
+///
+/// Unread input and each assembled PES are limited to 8 MiB. Pending PES
+/// payload/reservation requests total at most 16 MiB, including simultaneous
+/// old/new packets on one PID. These are not limits on Vec capacity or RSS.
+/// A limit failure releases pending assemblies and permanently refuses input;
+/// `finish` still seals accepted media with `media_loss` set.
 pub struct TsIngest {
     input: Arc<Mutex<Input>>,
     pes: Option<PesPacketReader<Feed>>,
@@ -665,6 +739,7 @@ impl TsIngest {
             continuity: HashMap::new(),
             pending: None,
             boundaries: HashMap::new(),
+            pending_bytes: 0,
         };
         Self {
             input,
@@ -687,23 +762,39 @@ impl TsIngest {
 
     /// Feeds raw TS bytes (any alignment). `now` stamps new segments.
     pub fn push(&mut self, data: &[u8], now: SystemTime) -> Result<Update, IngestError> {
-        {
+        let exceeded = {
             let Ok(mut input) = self.input.lock() else {
                 return Ok(Update::default());
             };
             if input.terminal {
                 return Err(IngestError::InputFinished);
             }
+            if input.limit_exceeded {
+                return Err(IngestError::InputLimitExceeded);
+            }
             if input.start > 0 {
                 let start = input.start;
                 input.buf.drain(..start);
                 input.start = 0;
             }
-            if input.buf.len() + data.len() > MAX_BUFFER {
-                input.buf.clear();
+            if input
+                .buf
+                .len()
+                .checked_add(data.len())
+                .is_none_or(|n| n > MAX_BUFFER)
+            {
+                input.limit_exceeded = true;
+                input.dropped = input.dropped.saturating_add(1);
+                true
+            } else {
+                input.buf.extend_from_slice(data);
+                input.starved = false;
+                false
             }
-            input.buf.extend_from_slice(data);
-            input.starved = false;
+        };
+        if exceeded {
+            self.release_failed_input();
+            return Err(IngestError::InputLimitExceeded);
         }
         self.pending = Update::default();
         self.drain(now, false)?;
@@ -718,21 +809,36 @@ impl TsIngest {
     /// can be resumed by a new ingest; this parser cannot accept more bytes.
     /// Repeated finish calls are harmless and return an empty update.
     pub fn finish(&mut self, now: SystemTime) -> Result<Update, IngestError> {
-        {
+        let failed = {
             let mut input = self.input.lock().expect("input lock is private to ingest");
             if input.terminal {
                 return Ok(Update::default());
             }
             input.terminal = true;
             input.starved = false;
-        }
+            input.limit_exceeded
+        };
         self.pending = Update::default();
-        let result = self.drain(now, true);
+        let result = if failed {
+            Ok(())
+        } else {
+            self.drain(now, true)
+        };
         self.pending.media_loss |= self.dropped_packets() != 0;
         if let Some(muxer) = self.es.muxer_mut() {
             self.pending.merge(muxer.interrupt(now));
         }
         result.map(|()| self.pending)
+    }
+
+    fn release_failed_input(&mut self) {
+        // Dropping the reader releases ALL private upstream PES Vecs at once,
+        // including previously advertised bounded reservations on other PIDs.
+        self.pes = None;
+        let mut input = self.input.lock().expect("input lock is private to ingest");
+        input.buf = Vec::new();
+        input.start = 0;
+        input.starved = false;
     }
 
     fn drain(&mut self, now: SystemTime, terminal: bool) -> Result<(), IngestError> {
@@ -776,6 +882,11 @@ impl TsIngest {
                 }
                 Ok(None) => break,
                 Err(_) => {
+                    let limited = self.input.lock().map(|i| i.limit_exceeded).unwrap_or(false);
+                    if limited {
+                        self.release_failed_input();
+                        return Err(IngestError::InputLimitExceeded);
+                    }
                     let reset = self
                         .input
                         .lock()
@@ -788,6 +899,7 @@ impl TsIngest {
                             .expect("PES reader present")
                             .into_ts_packet_reader();
                         feed.boundaries.clear();
+                        feed.pending_bytes = 0;
                         self.pes = Some(PesPacketReader::new(feed));
                         self.waiting_keyframe = true;
                         continue;

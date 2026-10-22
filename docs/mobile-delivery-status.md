@@ -19,20 +19,40 @@ connection EOF. Truncation, raw header stuffing, missing timestamps, codec epoch
 and stale generations have focused regressions. Local finite tests remain
 distinct from a complete native show and physical shutdown qualification.
 
-The current Rust source passes 582 workspace tests with four normally ignored,
-strict all-target Clippy and formatting. The full origin smoke passes SRT,
+TS ingest now checks 8 MiB of unread input before copying, limits each assembled
+PES to 8 MiB and caps aggregate pending logical payload/reservation requests at
+16 MiB. Bounded START preallocation is charged immediately; replacement on the
+same PID includes both old and new ownership. A sticky `InputLimitExceeded`
+releases pending parser input and assemblies, refuses further input and lets
+`finish()` seal the accepted prefix with `media_loss` for incomplete recording.
+These figures do not bound Vec capacity, allocator overhead, retained HLS data
+or total process RSS.
+
+Three original failing cases now pass: valid-continuity unbounded PES growth,
+rotated-PMT reservation growth and oversized raw input. Independent V2 review
+also confirms the malformed special-header accounting repair and its three
+red-to-green regressions, preserving the old allocation's charge when upstream
+rejects a replacement before insertion.
+
+The current Rust source passes 598 workspace tests with four normally ignored,
+strict all-target Clippy and formatting. The initial sandboxed run could not
+bind a loopback socket; the unrestricted loopback rerun passes, so that initial
+failure is an infrastructure limitation. The current source's full origin
+smoke passes SRT,
 RTMP, reconnect, encryption, independent decoding and recording callbacks.
 Its first run exposed a truncated final read in the black-box synthetic sender;
 controlled wire capture isolated that loss before origin ingest. The sender
 now validates complete TS packets and pads its final 1,316-byte block with
 at most six null packets. The corrected wire bytes match the generated input;
-production loss handling and smoke assertions remain unchanged. Terminal TS
-fuzz regressions and 61 seconds of AddressSanitizer/overflow mutation testing
-also pass. These finite local checks do not establish a complete physical show.
+production loss handling and smoke assertions remain unchanged. Five generated
+`ts_ingest` seeds replay, and the fresh AddressSanitizer/overflow run completes
+13,298 executions over 62 seconds. These finite local checks do not establish
+a complete physical show, a total-memory bound or sustained performance.
 
 App checks pass 316 Android unit tests in each of Debug and Qualification,
 with three APKs, build isolation, 16 KiB ZIP/ARM64 ELF alignment and Release
-lint at zero errors and six existing warnings. All three unsigned iOS app
+lint. The current Qualification report has 14 warnings and the Release report
+has 13, both with zero errors. All three unsigned iOS app
 configurations and its actual unit-test bundle compile with zero warnings;
 the iOS unit bundle was not executed. Focused Swift checks also pass
 121 capture/control, 26 catalogue/storage, 33 library/export and 33
@@ -40,11 +60,16 @@ creator-owner tests. Observation has 49 host tests and 77 packaged Rust publishe
 tests; these suites overlap. An actual generated macOS decoder matrix accepts
 48 kHz mono AAC without video, rejects wrong profiles/topologies and passes the
 hardware A/V regression. Twelve provider and twelve loopback HTTP route tests
-also pass. Initial host checks used the preceding SDK packages. Fresh Apple
-and ARM64 Android SDK packages have since been built from the current library
-source, passed their installed consumers and supplied the final app gates.
-The 77 publisher and 33 creator host tests also pass against the fresh Swift
-package. These are local package/build results, not CI or phone acceptance.
+also pass. Fresh Apple, ARM64 Android and four-ABI Android SDK packages now build
+from the PES-limit source and pass their installed ownership consumers. The 77
+publisher and 33 creator host tests continue to pass against the Apple package.
+Unsigned Debug, Qualification and Release iOS builds compile with warnings as
+errors. Android Debug and Qualification each pass 316 unit tests; their app
+assemblies, qualification isolation and lint pass, as do Release assembly and
+lint. An initial Android compile used the stale four-ABI AAR after only the
+separate ARM64 package had been refreshed; rebuilding the actual app dependency
+resolved the missing generated bindings without a source change. These are
+local package/build results, not CI or phone acceptance.
 
 The native AAC recorder experiment preserves all encoded units in stored media,
 but priming and edit interpretation change the presented packet list. Exact

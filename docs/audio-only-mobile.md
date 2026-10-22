@@ -102,11 +102,11 @@ Fresh Apple and ARM64 Android SDK packages now build from the current library
 source and pass their installed host consumers. All three unsigned iOS app
 configurations and the actual iOS unit-test bundle compile with no warnings;
 the iOS unit bundle was not executed. Android Debug and Qualification each pass
-316 unit tests, all three APKs assemble, build isolation passes, and Release lint
-reports zero errors with six existing warnings. ZIP and all four ARM64 libraries
-pass 16 KiB alignment checks. Publisher and creator host tests also pass against
-the refreshed Swift package. None of these checks installs an app or establishes
-physical phone, store or distribution acceptance.
+316 unit tests, all three APKs assemble and build isolation passes. Qualification
+lint has 14 warnings and Release lint has 13, both with zero errors. ZIP and all
+four ARM64 libraries pass 16 KiB alignment checks. Publisher and creator host
+tests also pass against the refreshed Swift package. None of these checks installs
+an app or establishes physical phone, store or distribution acceptance.
 
 ## Private recording and unfinished qualification
 
@@ -124,14 +124,24 @@ recording completion, incomplete prefixes, repeated finish and export. Its
 independent media checks do not establish physical capture, background behaviour,
 crash repair, real disk-pressure behaviour, thermal limits or battery performance.
 
-The current generated run passes those functional checks and strict AAC/PCM
-decoding, but the script exits 1 on its stronger exact packet-list oracle. All
-143 emitted AAC units are present in order after three leading silent packets
-in the raw stored view; native AVAssetReader exposes all units after one leading
-silent packet. FFmpeg's default presentation view omits two trailing native
-units. Priming/edit handling and intended presentation duration are unresolved;
-neither whole-list equality nor complete-show retention is claimed. The failed
-oracle is retained instead of accepting extra or missing packets implicitly.
+The production generated fixture passes those functional checks and strict
+AAC/PCM decoding, but its gate still exits 1. Separate controlled writer
+experiments store all 143 native AAC units in order. For our experimental
+grouped-trim file, native AVAssetReader presents the exact input duration at
+zero marker lag for both 144000-frame and 144123-frame sources. Default FFmpeg
+instead presents 144384 PCM frames with a real 2112-frame leading marker lag
+and exposes only the first 141 native packets.
+
+Independent references encoded by FFmpeg itself as valid AAC MP4 and MOV also
+decode to 144384 frames under default FFmpeg settings. Exact default decoded
+tail length is therefore not a universal criterion. Those references have zero
+marker lag and carry standard leading-delay metadata; our experimental file's
+leading delay remains a separate failure. Changing only AVAssetWriter's output
+from MOV to MP4 produced identical inspected media metadata and did not fix it.
+
+These experiments do not provide a production fix or pass the production
+fixture gate. Intended complete-show presentation remains open, and the failed
+receipts are retained without weakening the original checks.
 
 V4V replay adoption and audio MIME must eventually use immutable topology from
 the actual recording ID and writer initialization. Live fresh-media flags or

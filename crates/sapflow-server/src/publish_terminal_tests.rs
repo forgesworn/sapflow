@@ -139,6 +139,70 @@ async fn zero_grace_end_drains_the_only_start_packet_into_a_real_synced_recordin
 }
 
 #[tokio::test]
+async fn ts_resource_limit_syncs_only_the_accepted_prefix_as_incomplete() {
+    for failure in ["unbounded-pes", "raw-input"] {
+        let mut fixture = Fixture::new();
+        let mut publication = fixture.begin();
+        let (mut wire, pid) = tables();
+        wire.extend(start(pid, ADTS48, 18, 90_000, 0));
+        wire.extend(start(pid, ADTS48, 18, 91_920, 1));
+        feed(&mut publication, &wire);
+        let rejected = if failure == "raw-input" {
+            publication.push(|source, now| match source {
+                Source::Ts(ts) => ts.push(&vec![0; 8 * 1024 * 1024 + 1], now),
+                _ => unreachable!(),
+            })
+        } else {
+            // This START first returns the second accepted AAC frame. The new
+            // video PES never completes or reaches codec/muxer processing.
+            let mut first = start(pid, &[1], 0, 93_840, 2);
+            let at = 5 + usize::from(first[4]);
+            first[at + 3] = 0xe0;
+            feed(&mut publication, &first);
+            let mut total = 1;
+            let mut counter = 3;
+            loop {
+                let mut next = [0xa5; 188];
+                next[..4].copy_from_slice(&[0x47, (pid >> 8) as u8, pid as u8, 0x10 | counter]);
+                let result = publication.push(|source, now| match source {
+                    Source::Ts(ts) => ts.push(&next, now),
+                    _ => unreachable!(),
+                });
+                total += 184;
+                if result.is_err() {
+                    assert!(
+                        total > 8 * 1024 * 1024,
+                        "only the PES budget rejects this valid-CC stream"
+                    );
+                    break result;
+                }
+                assert!(
+                    total <= 8 * 1024 * 1024,
+                    "PES limit must reject before growing further"
+                );
+                counter = (counter + 1) & 15;
+            }
+        };
+        assert!(matches!(
+            rejected,
+            Err(PushError::Ingest(
+                sapflow_hls::IngestError::InputLimitExceeded
+            ))
+        ));
+        publication.end();
+        let body = completion(&mut fixture, "incomplete").await;
+        assert_eq!(
+            recording_samples(&body),
+            if failure == "raw-input" { 1 } else { 2 },
+            "never include the rejected/held payload"
+        );
+        let counts = fixture.scope.observations.counts();
+        assert_eq!(counts.recordings_incomplete, 1);
+        assert_eq!(counts.recordings_finalised, 0);
+    }
+}
+
+#[tokio::test]
 async fn held_start_only_tail_resumes_without_old_parts_becoming_fresh_or_duplicated() {
     let mut fixture = Fixture::new();
     let mut first = fixture.begin();
