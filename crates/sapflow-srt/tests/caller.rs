@@ -803,6 +803,81 @@ fn missing_and_wrong_secrets_never_connect_or_deliver() {
     }
 }
 
+/// Connects one caller to one listener and sends three packets: whether it
+/// connected and what the listener delivered.
+fn session(
+    caller_crypto: Option<sapflow_srt::crypto::CryptoConfig>,
+    config: Config,
+) -> (bool, Vec<Vec<u8>>) {
+    let now = Instant::now();
+    let mut c = caller(
+        CallerConfig {
+            crypto: caller_crypto,
+            ..CallerConfig::default()
+        },
+        now,
+    );
+    let mut listener = Listener::new(config, now);
+    let mut delivered = Vec::new();
+    let mut enqueued = false;
+    for ms in 0..1000 {
+        let at = now + Duration::from_millis(ms);
+        c.handle_timeout(at);
+        listener.handle_timeout(at);
+        while let Some((_, bytes)) = c.poll_transmit(at) {
+            listener.handle_datagram(at, source(), &bytes);
+        }
+        while let Some(e) = listener.poll_event() {
+            match e {
+                Event::Connect { id, .. } => {
+                    listener.accept(id, at);
+                }
+                Event::Data { payload, .. } => delivered.push(payload),
+                Event::Closed { .. } => {}
+            }
+        }
+        while let Some((_, bytes)) = listener.poll_transmit() {
+            c.handle_datagram(at, peer(), &bytes);
+        }
+        if c.is_connected() && !enqueued {
+            for n in 0..3 {
+                c.enqueue(at, vec![n; 188]).expect("enqueue");
+            }
+            enqueued = true;
+        }
+    }
+    (c.is_connected(), delivered)
+}
+
+#[test]
+fn optional_encryption_admits_plaintext_and_matching_callers_only() {
+    use sapflow_srt::crypto::{CryptoConfig, KeySize};
+    let good = CryptoConfig::new(b"test shared secret".to_vec(), KeySize::Aes128).expect("good");
+    let bad = CryptoConfig::new(b"wrong shared secret".to_vec(), KeySize::Aes128).expect("bad");
+    let sent: Vec<Vec<u8>> = (0..3).map(|n| vec![n; 188]).collect();
+    let optional = Config {
+        crypto: Some(good.clone()),
+        allow_plaintext: true,
+        ..Config::default()
+    };
+    // Plaintext and a matching secret both connect and deliver.
+    assert_eq!(session(None, optional.clone()), (true, sent.clone()));
+    assert_eq!(session(Some(good.clone()), optional.clone()), (true, sent));
+    // An encrypting caller is never downgraded: a wrong secret is refused.
+    assert_eq!(session(Some(bad), optional.clone()), (false, vec![]));
+    // Without the option, or when encryption is required, plaintext is refused.
+    let enforced = Config {
+        allow_plaintext: false,
+        ..optional.clone()
+    };
+    assert_eq!(session(None, enforced), (false, vec![]));
+    let required = Config {
+        require_encryption: true,
+        ..optional
+    };
+    assert_eq!(session(None, required), (false, vec![]));
+}
+
 #[test]
 fn encrypted_caller_refuses_missing_wrong_or_duplicate_key_confirmation() {
     use sapflow_srt::crypto::{CryptoConfig, KeySize};

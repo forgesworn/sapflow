@@ -56,6 +56,10 @@ the callback token, the recordings, and the host.
   passphrase. `SAPFLOW_SRT_PASSPHRASE` (our own receiver only) encrypts the
   media (AES-CTR, which does not authenticate it); every caller must then
   use it, and a wrong one is refused and counted as a failed login (T4).
+  `SAPFLOW_SRT_ENCRYPTION=optional` also admits callers that send no key
+  material, whose media then crosses the network in clear; an encrypting
+  caller still needs the right passphrase. Publish credentials, not the
+  passphrase, decide who may publish in either mode.
   Its salt and wrapped key travel in clear, so a weak passphrase can be
   guessed offline: use a long random one. Hiding the credential itself
   needs a VPN.

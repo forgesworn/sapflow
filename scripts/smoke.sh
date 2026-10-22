@@ -216,7 +216,7 @@ SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret \
 SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
 SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-enc.log" 2>&1 & pids+=($!)
 sleep 1
-grep -q 'encrypted=true' "$WORK/sapflow-enc.log" || fail "encrypted server did not start"
+grep -q 'encryption="required"' "$WORK/sapflow-enc.log" || fail "encrypted server did not start"
 epublish() { # streamid seconds extra-srt-options
   ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
     -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
@@ -240,4 +240,33 @@ done
 grep -Eq 'wrong passphrase or key length|passphrase, key length or admission handshake refused' "$WORK/sapflow-enc.log" || fail "wrong passphrase not logged as refused"
 grep -q 'not-the-passphrase' "$WORK/sapflow-enc.log" && fail "a passphrase reached the log"
 echo "ok   SRT passphrase: encrypted publish plays; none or a wrong one refused"
+
+# Optional encryption: a third server with the same passphrase that also
+# admits callers without one. Both play; a wrong passphrase is still refused.
+ESRT=18892 EHTTP=127.0.0.1:18886
+SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret SAPFLOW_SRT_ENCRYPTION=optional \
+SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
+SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-opt.log" 2>&1 & opt=$!; pids+=($opt)
+sleep 1
+grep -q 'encryption="optional"' "$WORK/sapflow-opt.log" || fail "optional-encryption server did not start"
+epublish "publish:live/event-optplain:pub:secret" 8 "" > /dev/null 2>&1 & pids+=($!)
+epublish "publish:live/event-optenc:pub:secret" 8 "&passphrase=$PASS_E" > /dev/null 2>&1 & pids+=($!)
+for e in event-optplain event-optenc; do
+  for _ in $(seq 1 60); do
+    curl -sf "http://$EHTTP/live/$e/stream.m3u8" -o "$WORK/$e.m3u8" && grep -q _seg "$WORK/$e.m3u8" && break; sleep 0.25
+  done
+  grep -qs _seg "$WORK/$e.m3u8" || { tail -20 "$WORK/sapflow-opt.log" >&2; fail "$e never became a stream"; }
+done
+epublish "publish:live/event-optwrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" > /dev/null 2>&1 || true
+[ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/event-optwrong/index.m3u8")" = 404 ] || fail "wrong passphrase accepted with optional encryption"
+echo "ok   SRT optional encryption: with and without the passphrase play; a wrong one refused"
+
+# SIGTERM (docker stop, systemd) is handled: a clean exit, not the signal's
+# default kill (status 143), which a container's first process would not get.
+kill -TERM "$opt"
+for _ in $(seq 1 30); do kill -0 "$opt" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$opt" 2>/dev/null && fail "SIGTERM did not stop the server within 3 s"
+rc=0; wait "$opt" || rc=$?
+[ "$rc" = 0 ] || fail "SIGTERM was not handled (exit status $rc)"
+echo "ok   SIGTERM stops the server cleanly"
 echo "PASS"

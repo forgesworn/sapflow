@@ -194,11 +194,9 @@ async fn run(config: Config) -> std::io::Result<()> {
     }
     let http_task: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>>>> =
         match http {
-            Some(http) => Box::pin(http::serve(http, http::router(app.clone()), async {
-                let _ = tokio::signal::ctrl_c().await;
-            })),
+            Some(http) => Box::pin(http::serve(http, http::router(app.clone()), stop_signal())),
             None => Box::pin(async {
-                let _ = tokio::signal::ctrl_c().await;
+                stop_signal().await;
                 Ok(())
             }),
         };
@@ -232,6 +230,23 @@ fn log_directives(rust_log: Option<&str>) -> String {
     } else {
         format!("{base},h264_reader::annexb=off")
     }
+}
+
+/// Ctrl-C, or SIGTERM from `docker stop` and systemd. As a container's first
+/// process, an unhandled SIGTERM is ignored and the stop waits for a kill.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

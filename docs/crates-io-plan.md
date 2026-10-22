@@ -1,6 +1,7 @@
 # Publishing the crates on crates.io
 
-A checklist for the maintainer. Nothing here has been published; every step
+A checklist for the maintainer. Published 2026-10-22: `sapflow-srt`,
+`sapflow-core`, `sapflow-hls`, `sapflow-rtmp` and `sapflow` 0.1.0. Every step
 that publishes, reserves a name or creates a credential is the maintainer's.
 The preparation (metadata, version, READMEs, docs, the rename) is done; what
 remains is the dry run, the credentials and the publish itself.
@@ -57,10 +58,14 @@ Publish in dependency order. Each internal `path` dependency needs a
 - [x] `cargo package -p <crate> --list`: check what ships. The test fixtures
       ship (SRT 240 KB, HLS 640 KB); every one is generated (ffmpeg test
       signal or solid colour), and the HLS tests include them at compile time.
-- [ ] `cargo publish --workspace --dry-run --exclude sapflow-bench --exclude
+- [x] `cargo publish --workspace --dry-run --exclude sapflow-bench --exclude
       sapflow-ffi --exclude sapflow-client` (passed 2026-10-22). Clear
       `target/package` first: a tarball left from an earlier layout made cargo
-      1.94.1 fail with "no hash listed".
+      1.94.1 fail with "no hash listed". If verification then fails with a
+      missing item that the source has, an earlier dry run's copy is being
+      reused: remove `sapflow-*` under the temporary registry's directory in
+      `~/.cargo/registry/src/` and run `cargo clean -p` for the published
+      crates.
 - [x] Each crate carries the MIT `LICENSE` (a link to the root file, which
       `cargo package` copies in). `THIRD_PARTY_LICENSES.txt` stays with the
       container image.
@@ -76,7 +81,7 @@ short expiry, and revoke it afterwards.
 
 ## After publishing
 
-- [ ] Replace the git dependency lines in `README.md`,
+- [x] Replace the git dependency lines in `README.md`,
       `crates/sapflow-srt/README.md` and `llms.txt` with `cargo add sapflow-srt`
       and `cargo install sapflow`.
 - [ ] Check the docs.rs pages build, and link them from the READMEs.

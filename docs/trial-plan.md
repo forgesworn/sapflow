@@ -10,11 +10,12 @@ our own Android app have published over SRT (with and without a passphrase)
 and RTMP (the docs record the first two only); v4v's player fix for jumping back to live after a drop (v4v #475)
 is merged and was checked in real Safari; our Android app does not
 reconnect by itself at that checkpoint (Larix and OBS did); the wired Linux
-load test had not run. Later native development adds bounded reconnect and
-records a finite Pixel recovery test in
+load test had not run. Later native development adds bounded reconnect on the
+broadcaster branch, not yet on `main`, and records a finite Pixel recovery test in
 [mobile delivery status](mobile-delivery-status.md). That evidence does not
-qualify the native app for this complete-show trial. Check current readiness
-and player/deployment evidence when choosing the frozen trial revision.
+qualify the native app for this complete-show trial. Since then (2026-10-22),
+the decisions below were taken. Check current readiness and player/deployment
+evidence when choosing the frozen trial revision.
 
 Everything in angle brackets is a placeholder, filled in from the
 deployment and never committed.
@@ -27,8 +28,7 @@ deployment and never committed.
 | `<app>`, `<app-port>` | v4v's app on the internal network, and its port |
 | `<mediamtx>`, `<mediamtx-hls-port>` | mediamtx on the internal network, and its HLS port |
 | `<sapflow>` | the sapflow service on the same internal network |
-| `<mediamtx-rtmp-port>`, `<mediamtx-srt-port>` | mediamtx's published ingest ports (`<mediamtx-srt-port>` only if SRT is on) |
-| `<trial-rtmp-port>`, `<trial-srt-port>` | sapflow's published ports on the media host, distinct from mediamtx's |
+| `<trial-rtmp-port>` | sapflow's RTMP port on the media host for phase A of the dry run only; from the switch sapflow has 1935 |
 | `<recordings-dir>` | the host directory v4v mounts read-only as `PULSEWIRE_LIVE_RECORDING_DIR` |
 | `<publisher>`, `<publisher-password>`, `<callback-secret>` | the existing values (section 2.3) |
 | `<eventId>` | the trial show's event id, `event-[a-z0-9-]+` |
@@ -39,13 +39,37 @@ deployment and never committed.
 - [ ] **The show and its audience.** A show with no other stage live in the
   switch window (the switch is deployment-wide, section 6), whose planned
   peak is 50 concurrent viewers or fewer, inside the closed beta.
-- [ ] **The performer's encoder.** Larix or OBS, with auto-reconnect on.
-  Our Android app remains outside this trial until its current build passes
-  complete-show qualification, including reconnect and local recording.
+- [ ] **The performer's encoder.** Our own app first, if two things hold
+  by the dry run: the broadcaster branch, with its reconnect, is on `main`
+  and in the build the performer's phone runs, and phase A shows it
+  resuming every drop inside the 90 s grace by itself and lasting the soak
+  with its local recording intact. This is a complete-show qualification
+  requirement, not acceptance from the finite Pixel test. It publishes to a
+  manual destination (the RTMP or SRT URL below), as Larix does: its V4V mode
+  uses per-session scoped encryption, which needs sapflow's control mode,
+  and that mode turns RTMP and the shared publisher off, so it is not this
+  trial. Otherwise Larix or OBS with auto-reconnect on. Either way Larix is
+  installed on the performer's phone with the same settings, as the fallback
+  encoder: the URL is the same for both (section 3).
 - [ ] **The performer's protocol.** RTMP is the first choice: it is what v4v's
-  reference mediamtx config serves (SRT is off there), and it has the longer record (Larix resumed seven
-  drops in six minutes). Use SRT only if the venue's uplink needs it, and
-  then only after the dry run has shown Larix or OBS connecting reliably.
+  reference mediamtx config serves (SRT is off there), it has the longer
+  record (Larix resumed seven drops in six minutes), and it is the only
+  protocol mediamtx can take back in a rollback. Use SRT only if the venue's
+  uplink needs it, and then only after the dry run has shown the encoder
+  connecting reliably.
+- [x] **Where sapflow runs, and its ports** (2026-10-22). The sapflow
+  container already on the host is the trial's sapflow, reconfigured as in
+  section 2.2. At the switch it takes RTMP port 1935 from mediamtx, so the
+  RTMP URL encoders use never changes; mediamtx keeps running without that
+  port, and a rollback gives it back (section 4). The cost: rolling back
+  restarts sapflow and needs a compose command on the host, rather than the
+  performer switching to a second saved connection.
+- [x] **SRT passphrase** (2026-10-22). Optional: `SAPFLOW_SRT_PASSPHRASE`
+  set and `SAPFLOW_SRT_ENCRYPTION=optional`, so encoders with and without
+  it both publish (section 2.3). Needs a `<commit>` that has the setting.
+- [x] **Viewer HTTP** (2026-10-22). hyper, the default, for the first show.
+  Our own event loop (`SAPFLOW_HTTP_IMPL=own`) is measured but has not
+  served a show; it is a candidate for the second.
 - [x] **Read production's live settings from the server.** They are not in
   the repository. On the production host, list the variable names and their
   scheme only, without printing secrets:
@@ -66,8 +90,8 @@ deployment and never committed.
   read-only to the app. Two things differ from the reference config:
   - mediamtx has SRT off, but `PULSEWIRE_LIVE_SRT_URL_TEMPLATE` is set, and a
     sapflow container already on the host takes SRT on 8890 with its HLS on a
-    loopback port. Before the trial, decide whether that container is the
-    trial's sapflow or is stopped, so two servers do not both claim 8890.
+    loopback port. Decided 2026-10-22: that container is the trial's
+    sapflow (section 2.2).
   - `PULSEWIRE_LIVE_PLAYBACK_PROBE_URL_TEMPLATE` is `https://`, not the
     internal `http://` form in section 2.5: read where it points before
     changing it.
@@ -109,7 +133,9 @@ and memory, and the host's load average.
 No release tag exists. The trial runs a commit, and the image and every log
 carry it.
 
-- [ ] Choose `<commit>` on `main`. Confirm CI is green on that exact commit
+- [ ] Choose `<commit>` on `main`, at or after the commits that add
+  `SAPFLOW_SRT_ENCRYPTION` and stop on SIGTERM (without the second, a
+  rollback waits 10 s for Docker to kill sapflow). Confirm CI is green on that exact commit
   (Ubuntu: fmt, clippy, tests, `scripts/smoke.sh`, fuzz regressions and 60 s
   per target).
 - [ ] On the build machine, at `<commit>`: `cargo test --workspace`,
@@ -128,10 +154,11 @@ carry it.
   (`--locked`, pinned toolchain) for the media host's platform; tag it
   `sapflow:<commit>`; record the image id and `sapflow --version`.
 
-### 2.2 Install beside mediamtx
+### 2.2 The existing container, beside mediamtx
 
-Run sapflow as a container on the same internal network as v4v's app, Caddy
-and mediamtx. The callback must be plain `http://` on the private network
+The sapflow container already on the host becomes the trial's: same name,
+new image and environment. It runs on the same internal network as v4v's
+app, Caddy and mediamtx. The callback must be plain `http://` on the private network
 (`SAPFLOW_CALLBACK_URL` refuses anything else), and in v4v's compose file the
 app only `expose`s its port, so a host process could not reach it. If the
 production layout differs, adapt, and keep the callback private.
@@ -142,23 +169,35 @@ production layout differs, adapt, and keep the callback private.
     restart: unless-stopped
     env_file: <sapflow-env-file>      # mode 600; section 2.3
     ports:
-      - "<trial-rtmp-port>:1935"
-      - "<trial-srt-port>:8890/udp"   # omit if SRT is not offered
+      - "<trial-rtmp-port>:1935"      # phase A; "1935:1935" from the switch
+      - "8890:8890/udp"               # as the container has it now
     volumes:
       - <recordings-dir>:/recordings
     ulimits:
       nofile: { soft: 65536, hard: 65536 }
 ```
 
-The HLS port (8888 inside the image) is not published: Caddy reaches it by
-service name. sapflow has no switch to turn its SRT listener off, so if SRT
-is not offered, leave the UDP port unpublished and closed in the firewall.
+The HLS port (8888 inside the image) need not be published: Caddy reaches it
+by service name. The existing container's loopback HLS port can stay.
 
-- [ ] mediamtx's container, config and ports stay as they are. Record the
-  image id and a checksum of its config so "untouched" is checkable later.
-- [ ] Open the firewall for `<trial-rtmp-port>` (TCP) and, if offered,
-  `<trial-srt-port>` (UDP). Docker-published ports can bypass host firewall
-  rules: check the listeners, not the rule set.
+Port 1935 moves between the two servers by recreating both containers, since
+Docker fixes a container's ports when it is created. Prepare two copies of
+the compose file in `<compose-dir>`, differing only in who publishes 1935:
+`compose.mediamtx-rtmp.yml` (as today: mediamtx has 1935, sapflow
+`<trial-rtmp-port>`) and `compose.sapflow-rtmp.yml` (sapflow has 1935,
+mediamtx publishes no RTMP port). Each move is then one command:
+`docker compose -f <file> up -d --no-deps mediamtx sapflow`. Port lists in override
+files are appended, not replaced, so whole copies are simpler than
+overrides.
+
+- [ ] mediamtx's image and config stay as they are; only its published RTMP
+  port moves. Record the image id and a checksum of its config so
+  "untouched" is checkable later.
+- [ ] Open the firewall for `<trial-rtmp-port>` (TCP) for phase A. 1935 and
+  8890/udp are open already. Docker-published ports can bypass host
+  firewall rules: check the listeners, not the rule set.
+- [ ] Time both moves in phase B, and check after each that the right
+  container holds 1935 (`docker port mediamtx`, `docker port sapflow`).
 - [ ] `<recordings-dir>` is writable by the image's non-root user (uid 65532),
   mediamtx can still write to it, and v4v's read-only mount can read what
   sapflow writes (the dry run proves the last).
@@ -182,8 +221,8 @@ line against this table before the dry run.
 |--------------------------|---------|-------------|
 | `authInternalUsers` publisher user and password, publish only on `~^live/event-[a-z0-9-]+$` | `SAPFLOW_PUBLISH_USER`, `SAPFLOW_PUBLISH_PASS`; the path rule is built in | The same `<publisher>` and `<publisher-password>` as mediamtx, so the stream key is valid on both servers. Letters and digits only: the SRT stream id splits on `:` and does not decode, and the RTMP key is split on `&` and `?` |
 | Anyone may read | HLS is always public | n/a |
-| `rtmp: yes`, `rtmpAddress` | `SAPFLOW_RTMP_ADDR` (default `0.0.0.0:1935`) | default inside the container; published as `<trial-rtmp-port>`. Plain RTMP only: sapflow has no RTMPS |
-| `srt: no` | `SAPFLOW_SRT_ADDR` (default `0.0.0.0:8890`) | default inside the container; published as `<trial-srt-port>` if offered. New capability |
+| `rtmp: yes`, `rtmpAddress` | `SAPFLOW_RTMP_ADDR` (default `0.0.0.0:1935`) | default inside the container; published as `<trial-rtmp-port>` in phase A and as 1935 from the switch. Plain RTMP only: sapflow has no RTMPS |
+| `srt: no` | `SAPFLOW_SRT_ADDR` (default `0.0.0.0:8890`) | default inside the container; published as 8890, as now. New capability |
 | `hls`, `hlsAddress` | `SAPFLOW_HTTP_ADDR` (default `0.0.0.0:8888`) | default; not published |
 | `hlsVariant: lowLatency`, 1 s segments, 200 ms parts | built in, not settable | Segments follow the encoder's keyframes: keep 1 s keyframes |
 | `hlsSegmentCount: 24` | `SAPFLOW_SEGMENT_COUNT` | 24 (default; minimum 7) |
@@ -197,7 +236,8 @@ line against this table before the dry run.
 | (none) | `SAPFLOW_HEALTH_INTERVAL` | 30 (default): `health` events v4v reads the bitrate from |
 | v4v's `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS` | `SAPFLOW_RECONNECT_GRACE` | 90, set explicitly on both sides: they must be equal |
 | `webrtc`, `rtsp`, the API and metrics | not offered | Check production does not use them. Any other `runOn*` hook (a simulcast relay, for one) cannot be carried over |
-| (none) | `SAPFLOW_SRT_PASSPHRASE` | unset. Enabling it changes the URL v4v hands out: a separate decision |
+| (none) | `SAPFLOW_SRT_PASSPHRASE`, `SAPFLOW_SRT_ENCRYPTION` | a long random passphrase (10 to 79 bytes) and `optional`: encoders without it still publish, so the URL v4v hands out need not change; one that sets it must match, at the default key length 16 (`docs/own-origin-encryption.md`). Give it to an encoder by hand, not in v4v's template |
+| (none) | `SAPFLOW_HTTP_IMPL` | unset (hyper), as decided above |
 | (none) | `SAPFLOW_OPEN_PUBLISH`, `SAPFLOW_SRT_IMPL` | never set (srt-rs is gone; any `SAPFLOW_SRT_IMPL` other than `own` stops startup) |
 | `logLevel: info` | `RUST_LOG` | `info` (default) |
 
@@ -253,15 +293,15 @@ mediamtx today, then:
 v4v needs no code change. It reaches the media server through these
 templates, and the callback. They take effect when the app restarts, and a
 show's Studio session stores the URLs they produced at the moment the
-session is prepared (see section 3, step 7). Back up `<env-file>` first and
+session is prepared (see section 3, step 8). Back up `<env-file>` first and
 never print it.
 
 | Variable | Now (reference form) | During the trial | Why |
 |----------|----------------------|------------------|-----|
 | `PULSEWIRE_LIVE_STREAM_ID_TEMPLATE` | `{eventId}` | unchanged | Both servers name the callback's event from the path's last segment, and sapflow needs `live/event-[a-z0-9-]+`. `.env.example`'s default `{eventId}-live` would not work; confirm production has the first form |
-| `PULSEWIRE_LIVE_RTMP_SERVER_URL_TEMPLATE` | `rtmp://<media-host>:<mediamtx-rtmp-port>/live` | `rtmp://<media-host>:<trial-rtmp-port>/live` | sapflow's published port. `.env.example` defaults to `rtmps://`, which sapflow cannot serve: confirm production's form |
+| `PULSEWIRE_LIVE_RTMP_SERVER_URL_TEMPLATE` | `rtmp://<media-host>:1935/live` | unchanged | Whoever holds 1935 receives it. Production's is plain `rtmp://` (read 2026-10-22) |
 | `PULSEWIRE_LIVE_STREAM_KEY_TEMPLATE` | `{streamId}?user=<publisher>&pass=<publisher-password>` | unchanged | Same credentials on both servers |
-| `PULSEWIRE_LIVE_SRT_URL_TEMPLATE` | unset, or `srt://<media-host>:<mediamtx-srt-port>?streamid=publish:...` | `srt://<media-host>:<trial-srt-port>?streamid=publish:live/{streamId}:<publisher>:<publisher-password>` (only if offered) | The `live/` prefix and the credentials are both required. Studio appends `&latency=2000000` for OBS; Larix has its own latency box (2000 ms). No `passphrase=` |
+| `PULSEWIRE_LIVE_SRT_URL_TEMPLATE` | set, to the existing sapflow container on 8890 | `srt://<media-host>:8890?streamid=publish:live/{streamId}:<publisher>:<publisher-password>`; check the current value has this form | The `live/` prefix and the credentials are both required. Studio appends `&latency=2000000` for OBS; Larix has its own latency box (2000 ms). No `passphrase=`: it is optional |
 | `PULSEWIRE_LIVE_HLS_URL_TEMPLATE` | `https://<domain>/live-hls/live/{streamId}/index.m3u8` | unchanged | Only Caddy's upstream behind that path changes |
 | `PULSEWIRE_LIVE_PLAYBACK_PROBE_URL_TEMPLATE` | `http://<mediamtx>:<mediamtx-hls-port>/live/{streamId}/index.m3u8` | `http://<sapflow>:8888/live/{streamId}/index.m3u8` | The app fetches this to open a stage and to feed its source stats every 5 s. Left on mediamtx it gets a 404, and the stage stays at `receiving` |
 | `PULSEWIRE_LIVE_CALLBACK_SECRET` | `<callback-secret>` | unchanged | Equal to `SAPFLOW_CALLBACK_SECRET` |
@@ -270,36 +310,40 @@ never print it.
 | `PULSEWIRE_LIVE_INGEST_PROVIDER`, `_PROTOCOL` | labels (`.env.example` defaults `_PROTOCOL` to `rtmps`) | `_PROTOCOL=rtmp` to match the RTMP template (or `srt`); `_PROVIDER` unchanged | Stored with each session, offered as a per-show Studio field and shown in the setup view. The server code does not branch on either; the client's display uses were not all traced, so set `_PROTOCOL` to the scheme the template really has. The templates are what encoders use |
 
 Studio's test signal dials whatever host the RTMP or SRT template names, so
-after this change it tests sapflow.
+once 1935 has moved it tests sapflow.
 
 ### 2.6 Dry run
 
 Two phases. Do not go to the night until both pass and section 4's blanks are
 filled in.
 
-**Phase A: sapflow on its own ports, v4v untouched.** No v4v change, so
+**Phase A: sapflow on `<trial-rtmp-port>` and 8890, v4v untouched.** No v4v change, so
 production is unaffected. Leave `SAPFLOW_CALLBACK_URL` unset here (events are
 only logged; a callback for an event v4v does not know would only be
 refused); the callback path is tested in phase B.
 
 - [ ] Publish a test signal from a different machine and network to
-  `<trial-rtmp-port>` and, if offered, `<trial-srt-port>`, on a path such as
+  `<trial-rtmp-port>` and to 8890 over SRT, with and without the passphrase,
+  on a path such as
   `live/event-dry-run`, with the real `<publisher>` credentials. Play it at
   `https://<domain>/live-hls-trial/live/event-dry-run/index.m3u8` in Safari on
   an iPhone and a Mac. Confirm `curl --http2` and the single CORS header.
 - [ ] Play it from a web client on another origin (hls.js on a different
   origin, or a web Nostr client). No such client has tried sapflow.
 - [ ] A real phone, the performer's encoder, from the venue's network (if it
-  can be reached) and from cellular: Larix and OBS over RTMP and, if offered, SRT, with 1 s
+  can be reached) and from cellular: our own app (if it is the candidate),
+  Larix and OBS over RTMP and, if offered, SRT, with 1 s
   keyframes, 2000 ms SRT latency, CBR 2,500 to 4,000 kbit/s. Many cold
   starts, keeping sapflow's log and the phone's for any that fail (Larix's
   first SRT attempt sometimes fails and a retry works; unexplained). Confirm
-  the venue network passes a non-standard RTMP port and UDP.
+  the venue network passes UDP (on the night RTMP is on 1935, as now).
 - [ ] With the phone locked or the app backgrounded: record what happens. It
   is untested (`readiness.md` section 3); the performer is told not to lock it.
 - [ ] Drop each encoder (network off, then on) and return within 90 s: same
   playlist and chunk names, a discontinuity, Safari carries on. Once, return
-  after 90 s: the stream ends and a new one starts.
+  after 90 s: the stream ends and a new one starts. Our own app is the
+  performer's encoder only if it resumes every drop here by itself, with
+  nobody touching the phone.
 - [ ] Delay against mediamtx through the same Caddy: the same ffmpeg stream to
   both servers, Safari on `/live-hls-trial/` and on the current `/live-hls/`,
   a clock in frame. This is the one comparison still missing (the only
@@ -319,8 +363,8 @@ live or scheduled. This is the one place the real v4v is changed, and it is
 restored at the end.
 
 - [ ] Back up `<env-file>` and `<caddyfile>` under dated names. Apply
-  section 2.5 and the Caddy switch, restart the app by the normal deploy
-  procedure, and reload Caddy.
+  section 2.5, restart the app by the normal deploy procedure, move 1935 to
+  sapflow (section 2.2), and apply the Caddy switch and reload.
 - [ ] Prepare a draft rehearsal event in Studio. Run the Studio test signal
   over RTMP (and SRT, if offered): the stage opens by the app's own probe,
   the `publish` and `health` callbacks appear in the integration feed, and
@@ -342,8 +386,9 @@ restored at the end.
   `publish` arrives with the app's probe still pointing at sapflow? Nothing in
   the repositories answers that.
 - [ ] Restore `<env-file>` and `<caddyfile>`, restart the app, reload Caddy,
-  and confirm a mediamtx stage works again with the original templates (a
-  Studio test signal). Production now matches its state before the window.
+  check 1935 is mediamtx's again, and confirm a mediamtx stage works with
+  the original templates (a Studio test signal). Production now matches its
+  state before the window.
 
 ## 3. The switch on the night
 
@@ -354,18 +399,18 @@ the night nobody edits anything not listed here.
 Before the window:
 
 - [ ] No other stage is live or scheduled until the show ends and section 5's
-  restore is done. Tell the performer the protocol, the encoder, and the
-  rollback profile (below).
-- [ ] The performer's encoder holds two saved connections with the same stream
-  key: **A**, sapflow
-  (`<media-host>:<trial-rtmp-port>`), and **B**, mediamtx
-  (`<media-host>:<mediamtx-rtmp-port>`). B is not used unless section 4 fires.
-  It is RTMP even when A is SRT, if mediamtx has SRT off. The key is
+  restore is done. Tell the performer the protocol and the encoder, and that
+  a rollback needs nothing from them unless the encoder gives up
+  reconnecting (section 4).
+- [ ] The performer's encoder holds the RTMP connection Studio shows
+  (`<media-host>:1935`), the same for both servers. If it is SRT, it also
+  holds the RTMP connection: mediamtx has SRT off, so a rollback means RTMP.
+  If the encoder is our own app, Larix holds the same settings. The key is
   `<eventId>?user=<publisher>&pass=<publisher-password>` while
   `PULSEWIRE_LIVE_STREAM_KEY_TEMPLATE` has no `{streamKey}` in it (the form
-  in section 2.5): it has no random part, so it can be saved before step 7.
+  in section 2.5): it has no random part, so it can be saved before step 8.
   If production's template does use `{streamKey}`, the key is random and
-  changes at step 7, so save the profiles after it.
+  changes at step 8, so save the settings after it.
 - [ ] Disk free for the show; sapflow and mediamtx containers up; the image
   and config ids match section 2.2; `docker inspect` shows `RestartCount` 0.
 
@@ -374,15 +419,19 @@ The switch:
 1. [ ] Back up `<env-file>` and `<caddyfile>` under dated names.
 2. [ ] Apply section 2.5 to `<env-file>`; restart the app by the normal deploy
    procedure; confirm it is up and a mediamtx-era stage page still loads.
-3. [ ] In `<caddyfile>`, replace the body of the `/live-hls/` handle with
+3. [ ] Move 1935 to sapflow:
+   `docker compose -f compose.sapflow-rtmp.yml up -d --no-deps mediamtx sapflow`, then
+   `docker port sapflow` shows 1935 and `docker port mediamtx` does not. The
+   log shows `RTMP listening` and `SRT listening ... encryption="optional"`.
+4. [ ] In `<caddyfile>`, replace the body of the `/live-hls/` handle with
    `import sapflow_hls`. `caddy validate`, then reload (graceful).
-4. [ ] `curl --http2 -sI https://<domain>/live-hls/live/<eventId>/index.m3u8`:
+5. [ ] `curl --http2 -sI https://<domain>/live-hls/live/<eventId>/index.m3u8`:
    `HTTP/2`, a 404 (no stream yet), one CORS header.
-5. [ ] Start the watches (table below), the `live:monitor` with
+6. [ ] Start the watches (table below), the `live:monitor` with
    `--all --interval 15 --heartbeat 30`, the Caddy access log for the path,
    and the `docker stats` sampler.
-6. [ ] Start `docker logs -f sapflow` and keep it where the watcher can see it.
-7. [ ] In Studio, prepare the show's session now. Its Prepare button always
+7. [ ] Start `docker logs -f sapflow` and keep it where the watcher can see it.
+8. [ ] In Studio, prepare the show's session now. Its Prepare button always
    rotates secrets (the client sends `rotateSecrets: true` and the server's
    default is the same); that is harmless with the key template of
    section 2.5, because the key and stream id do not change, only the stored
@@ -390,17 +439,17 @@ The switch:
    also resets the stage to standby and clears its playback state, and v4v
    refuses it while the stage is receiving media unless forced, so it is a
    before-the-show step only, never part of a rollback. Confirm Studio shows
-   `<media-host>:<trial-rtmp-port>` and, if offered, the SRT URL of section 2.5.
-   Copy the URLs to the performer (profile A).
-8. [ ] Studio test signal over RTMP until the stage is `live`; Safari
+   `<media-host>:1935` and the SRT URL of section 2.5. Copy them to the
+   performer.
+9. [ ] Studio test signal over RTMP until the stage is `live`; Safari
    `?stats=1` shows a latency in the band; the phone-and-clock measurement once.
    Stop it, then wait for `no reconnect within the grace period; stream ended`
    and the test's `recordSegmentComplete` before the performer connects
    (section 2.6, phase B).
-9. [ ] The performer connects with profile A at soundcheck, not at doors. If it
-   fails: one retry, then the other protocol once; the known Larix SRT
-   first-attempt failure may need up to three tries. Keep the failing attempt's
-   log lines.
+10. [ ] The performer connects at soundcheck, not at doors. If it fails: one
+   retry, then the other protocol once, then (if the encoder is our app)
+   Larix; the known Larix SRT first-attempt failure may need up to three
+   tries. Keep the failing attempt's log lines.
 
 What to watch:
 
@@ -423,11 +472,13 @@ What to watch:
 - [ ] One deliberate drop and return inside 90 s: `reconnecting` then `live`,
   Safari back in the band.
 - [ ] Caddy clean, resources inside criterion 6 at the current viewer count.
-- [ ] mediamtx up and its HLS port answering (a 404 is fine); the performer
-  has profile B ready; the decision owner and the channel are confirmed.
+- [ ] mediamtx up and its HLS port answering (a 404 is fine); the rollback
+  command (section 4, step 2) typed into a shell on the host, not run; the
+  decision owner and the channel are confirmed.
 
 Any item failing is a no-go. A no-go before the audience is a pre-audience
-rollback (section 4), which needs no performer action beyond profile B.
+rollback (section 4), which needs nothing from the performer but a
+reconnect.
 
 ## 4. Rollback
 
@@ -452,9 +503,14 @@ locally too, if it can.
 Steps during a show, in this order so viewers' playlist moves only once
 mediamtx is serving:
 
-1. [ ] Say "rolling back" on the performer channel.
-2. [ ] The performer stops the encoder and starts profile B. mediamtx's own
-   hook sends `publish` for the same event path; v4v accepts it (same secret,
+1. [ ] Say "rolling back" on the performer channel: the encoder will drop
+   and should reconnect by itself; if it gives up, restart it with the same
+   settings. An SRT encoder switches to its RTMP connection.
+2. [ ] Move 1935 back to mediamtx:
+   `docker compose -f compose.mediamtx-rtmp.yml up -d --no-deps mediamtx sapflow`, and
+   `docker port mediamtx` shows 1935. This restarts sapflow, which ends its
+   held stream. The encoder's next attempt reaches mediamtx, whose own hook
+   sends `publish` for the same event path; v4v accepts it (same secret,
    same path).
 3. [ ] Check mediamtx's manifest on its internal address:
    `curl -s http://<mediamtx>:<mediamtx-hls-port>/live/<eventId>/index.m3u8`
@@ -465,10 +521,11 @@ mediamtx is serving:
    Studio's source stats keep polling the probe, which still points at
    sapflow, so they will show a stopped playlist for the rest of the night:
    expected, not a second fault.
-6. [ ] Leave sapflow running. It held the dropped stream for 90 s, then sent
-   `recordSegmentComplete` for its partial file. v4v keeps the longer of the two
-   recordings, so the replay may be only the longer part. Both files are kept:
-   sapflow's under `<recordings-dir>`, mediamtx's in the same tree.
+6. [ ] sapflow's recording stopped at the restart and is readable up to
+   there, but it sent no `recordSegmentComplete` for it. v4v imports
+   mediamtx's recording as the replay; if sapflow's part is wanted, upload it
+   by hand. Both files are kept: sapflow's under `<recordings-dir>`,
+   mediamtx's in the same tree.
 7. [ ] After the show: restore `<env-file>` from its backup and restart the
    app (never during the show), then confirm a mediamtx stage works with the
    original templates.
@@ -480,15 +537,15 @@ still points at sapflow, so the stage will not reopen by itself: use Studio's
 If `playbackReady` does survive mediamtx's `publish`, none of that is needed;
 phase B found out.
 
-Before the audience (a no-go), the order is free: restore `<caddyfile>`, then
-`<env-file>` and the app restart, with no performer in the loop except for
-profile B.
+Before the audience (a no-go), the order is free: move 1935 back, restore
+`<caddyfile>`, then `<env-file>` and the app restart; the performer only
+reconnects.
 
 What people see during a mid-show rollback:
 
 | Who | Experience |
 |-----|------------|
-| Performer | Stops, switches profile, restarts the encoder. Nothing else |
+| Performer | Nothing, if the encoder reconnects by itself; otherwise restarts it with the same settings (RTMP, if it was on SRT) |
 | Viewers | The picture freezes at the drop (the held stream stops growing), then the playlist changes origin when Caddy is reloaded. hls.js clients (v4v's player, Chrome) recover by jumping to live; Safari's native player is expected to stall and may need a page reload. Chunk names and media sequence both change |
 | Stage | `reconnecting`, then `live`, if inside 90 s |
 | Replay | Possibly only the longer of two recordings |
@@ -497,7 +554,7 @@ Rehearsal result (fill in during phase B):
 
 | Measure | Seconds |
 |---------|---------|
-| Decision to the performer on profile B and mediamtx's `publish` seen by v4v | ____ |
+| Decision to 1935 back on mediamtx, the encoder reconnected and mediamtx's `publish` seen by v4v | ____ |
 | Caddy restored and reloaded after that | ____ |
 | Stage `live` and playing again in Safari | ____ |
 | Longest viewer-visible gap | ____ |
@@ -505,11 +562,11 @@ Rehearsal result (fill in during phase B):
 | Stage stayed `live` with the probe on sapflow? | yes / no |
 | Safari recovered without a reload? | yes / no |
 
-Not planned here: letting sapflow take mediamtx's ports (mediamtx stopped
-rather than running) so the performer's URL never changes and the way back is
-starting mediamtx. It trades the running fallback for a rollback that needs
-nothing from the performer; if the dry run shows the profile switch is the
-slow or error-prone step, consider it.
+This plan moves 1935 rather than giving the performer a second saved
+connection to mediamtx on its own port (the earlier draft): the URL never
+changes and the performer has nothing to switch, at the cost of a rollback
+that restarts sapflow and depends on a command on the host. If phase B shows
+the move is slow, or the encoder does not come back by itself, reconsider.
 
 ## 5. After the show
 
@@ -559,7 +616,9 @@ The outcome goes in [GOALS.md](../GOALS.md): widen, repeat or stop.
 | Risk | Mitigation on the night |
 |------|-------------------------|
 | Larix's first SRT attempt sometimes fails and a retry works (unexplained) | RTMP first. If SRT: connect at soundcheck, allow up to three tries, keep auto-reconnect on, keep the logs |
-| Our Android app does not reconnect by itself | Not used. Larix or OBS only |
+| Our own app: reconnect is new and unmerged as of 2026-10-22; one short Pixel recovery test, no show-length run | Used only if it is on `main` and passes phase A's drops; Larix installed with the same settings as the fallback |
+| A rollback restarts sapflow and needs a command on the host | The command prepared and typed in before doors (section 3); timed in phase B; sapflow stops on SIGTERM at once |
+| mediamtx has SRT off: an SRT performer has no SRT fallback | RTMP first; an SRT encoder also holds the RTMP connection |
 | No wired Linux load test; the largest all-viewers-playing measurement through Caddy over HTTP/2 is 50 viewers (250 reached 0 failed requests with the pool at 1024, but on a shared Mac behind Docker Desktop, link-bound) | Planned peak 50 concurrent, closed beta only, the pool at 1024, watches for 5xx and CPU, R5 as the way out. The 750-viewer numbers are single-machine macOS |
 | Nothing has run on Linux except CI's smoke test and the image serving a stream | Phase A's soak and phase B are the first Linux evidence; criterion 6 bounds are chosen, not measured |
 | No show-length run | The soak in phase A; RSS growth in criterion 6 |
@@ -569,7 +628,7 @@ The outcome goes in [GOALS.md](../GOALS.md): widen, repeat or stop.
 | Rollback mid-show is not free: it ends the stream for a moment, may need a Safari reload, and can leave a partial replay | Rehearsed with times in section 4; triggers are hard failures only; a pre-audience no-go costs nothing |
 | A test signal and the show sharing one recording (a publisher inside the grace takes over the held stream) | Wait for `stream ended` after the test signal, before the performer connects |
 | Callbacks are not durable (four tries over about 4 s, then dropped) | A lost `publish`: Studio "Set live" by hand. A lost `recordSegmentComplete`: the file is on disk; upload it as the replay by hand |
-| Plain RTMP, credentials in the clear (as in v4v's reference mediamtx config); SRT's stream id carries them in clear too | Confirm production does not use `rtmps://`; use a long random publisher password; keep `SAPFLOW_SRT_PASSPHRASE` unset |
+| Plain RTMP, credentials in the clear (as in v4v's reference mediamtx config); SRT's stream id carries them in clear too | Production uses `rtmp://` (read 2026-10-22); use a long random publisher password. The SRT passphrase is optional, so it protects the media of encoders that use it, not the credentials |
 | Features sapflow lacks: WebRTC monitor, hooks that run commands (a simulcast relay), the control API | Read the production mediamtx config for each before the dry run; do not trial a show that uses one |
 | Own protocol code, one maintainer, no upstream | Fuzzing, the loss comparison against libsrt, and mediamtx kept ready with a rehearsed way back |
 | The recordings directory: non-root writer, shared with mediamtx, expiry applies to both | Section 2.2 checks; the dry run proves v4v can read the file |
