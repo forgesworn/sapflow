@@ -591,6 +591,412 @@ CPU is a percentage of one core; the Mac has 16.
 - **Real players.** Viewers are the bench's model of hls.js; one rendition,
   one stream.
 
+## sapflow against mediamtx 1.21.2, one machine (2026-10-22)
+
+The 2026-10-20 comparison ran on an 8-core M1 against mediamtx 1.19.1, and
+the 2026-10-21 loopback run measured sapflow alone on a 16-core M4 and found
+its CPU and memory at about double the M1 figures, with no mediamtx control.
+This run puts both servers on the same M4 in the same hour, over loopback,
+fed and watched the same way, so the two can be compared without the machine
+in between. **It measures the servers' own cost on one shared Mac. It does
+not measure a network, Caddy, TLS, HTTP/2, Linux or real players.**
+
+Headline, medians of three runs, every viewer fetching media (the default of
+`scripts/bench.sh`, and what the 2026-10-20 table measured):
+
+| 250 and 750 viewers, all full | sapflow | mediamtx 1.21.2 | mediamtx / sapflow |
+|---------|---------|-----------------|--------------------|
+| Server CPU, 250 / 750 viewers | 17.6 / 62.0% of a core | 59.5 / 154.7% | 3.4x / 2.5x |
+| Server peak memory, 250 / 750 viewers | 69 / 216 MB | 161 / 274 MB | 2.3x / 1.3x |
+| Part fan-out p50, 250 / 750 viewers | 12.8 / 28.2 ms | 21.4 / 34.0 ms | 1.7x / 1.2x |
+| Binary size / idle memory | 3.3 MB / 3.4 MB | 52.2 MB / 32.4 MB | 15.8x / 9.5x |
+
+Failed requests: 0 of 3,554,083 for sapflow, 1 of 3,560,436 for mediamtx,
+over twelve loaded runs each. The full tables, ranges and conditions follow.
+
+### Setup
+
+- **Machine:** Apple M4 Max, 16 cores, 64 GB, macOS 26.6.2 (25G83), the same
+  Mac as the 2026-10-21 loopback run. Not dedicated: other sessions' builds,
+  Spotlight indexing and an Android emulator ran throughout (see Machine
+  state). Everything (server, publisher, viewers) over 127.0.0.1, plain
+  HTTP/1.1, no Caddy and no TLS; the test traffic never left the machine.
+- **sapflow:** current main, `eee669c`, release build in a throwaway
+  worktree (removed afterwards), arm64 (the only 1.94.1 Rust toolchain on that
+  Mac is x86_64, so the build named the target and `file` confirmed arm64).
+  Built as `scripts/bench.sh` does, in two separate cargo invocations, so the
+  viewers' HTTP/2 support is not unified into the server: `sapflow` is
+  3,480,704 bytes, sha256 `7d4974ff71f0...5df0a`.
+- **mediamtx:** v1.21.2 darwin/arm64 release binary, 54,724,098 bytes, sha256
+  `72f67f718cfe5f75f081db5b2f31d1664008b6b8ff8627cb2a8acf5d7e5e61be`
+  (matches the checksum recorded when it was downloaded; re-checked with
+  `shasum -a 256` after copying it to the M4). Run from that run's own output
+  directory, in its default session mode (cookie check, then a per-viewer session in
+  every URI), as v4v's reference config runs it.
+- **mediamtx configuration:** the file `scripts/bench.sh` writes, with local
+  ports. mediamtx 1.21.2 rejects unknown keys (checked: with an extra line it
+  exits at once with `json: unknown field`) and started on this file with
+  every key unchanged, so none that `scripts/bench.sh` uses has been renamed or
+  removed since 1.19.1. **One key was
+  added:** `moq: no`. MoQ is new, on by default, listened on `*:8892` (TCP and
+  UDP) and UDP 8893 and wrote `auto.key` and `auto.crt` into the working
+  directory. With it off, `lsof` showed only the two 127.0.0.1 listeners for
+  every run (recorded in each run's conditions). `scripts/bench.sh` itself
+  does not set it; its mediamtx config needs the line for 1.21.
+  ```
+  logLevel: warn
+  rtmp: yes
+  rtmpAddress: 127.0.0.1:38935
+  hls: yes
+  hlsAddress: 127.0.0.1:38888
+  hlsAlwaysRemux: yes
+  hlsVariant: lowLatency
+  hlsSegmentDuration: 1s
+  hlsPartDuration: 200ms
+  hlsSegmentCount: 24
+  hlsAllowOrigins: ["*"]
+  rtsp: no
+  webrtc: no
+  srt: no
+  moq: no
+  api: no
+  authInternalUsers:
+    - user: any
+      permissions:
+        - action: publish
+        - action: read
+  paths:
+    all_others:
+  ```
+- **Feed:** generated test signal only (ffmpeg 8.1.2, `lavfi`), exactly the
+  2026-10-20 Method: RTMP, 1280x720 at 30 fps, H.264 2.5 Mbit/s CBR, 1 s
+  keyframes (`-g 30 -keyint_min 30 -sc_threshold 0`), AAC 128 kbit/s.
+- **Viewers:** `sapflow-bench` from the same build as sapflow, HTTP/1.1, 10 s
+  ramp then 60 s, `ulimit -n 65536` for the viewers. Both servers were started
+  under the ssh session's 256 file limit and raised their own (no "too many
+  open files" in either log).
+- **Runs:** a fresh server and publisher for every run, 30 s of warm-up (every
+  run then checked that the media playlist held 24 segments and some parts),
+  both stopped afterwards, so each peak memory is that run's own. Before each
+  run the driver checked that the new process held the HTTP and RTMP ports.
+  The one-minute load average had to fall below 8 (up to 5 minutes' wait; it
+  never needed more than 40 s) and the run would have been abandoned at 12.
+  No run was abandoned or repeated: 30 of 30 matrix runs took their first
+  attempt.
+- **Order:** three rounds. In each round, for each row, sapflow and mediamtx
+  ran back to back, 10 s apart, and the order flipped each round (sapflow
+  first, mediamtx first, sapflow first), so a drift in the machine falls on
+  both. Rows in a round: footprint, 250 viewers with 10 full, 750 with 10
+  full, 250 all full, 750 all full. 08:38 to 09:39 local time.
+- **Sampled** as in the 2026-10-21 section: server CPU from `ps` time and
+  peak RSS each second over the window from 10 s into the viewers' run until
+  they exited (about 60 s), the viewers under `/usr/bin/time -l`, and
+  `uptime` and whole-machine CPU idle (`top`, 2 s samples) before, mid-run and
+  after, plus a `top` snapshot of the busiest processes mid-run. The bench's
+  counts and percentiles cover the whole 70 s, ramp included.
+- **Ratio column:** the median of mediamtx's three runs divided by the median
+  of sapflow's three, for each figure separately (so a ratio is not the ratio
+  of the two ranges beside it). Shown only where both servers have three runs.
+  Everything else is a range, lowest to highest across the three runs.
+- **What "10 full" and "all full" mean.** `scripts/bench.sh` does not pass
+  `--full`, and the bench makes every viewer full unless told otherwise, so
+  the 2026-10-20 table was all full. 10 full is the default of
+  `scripts/bench-remote.sh` (a Wi-Fi link cannot carry more). Both were run;
+  compare the all-full rows with 2026-10-20.
+
+```
+# build, in a throwaway worktree of origin/main on the M4
+cargo build --release --target aarch64-apple-darwin -p sapflow-server
+cargo build --release --target aarch64-apple-darwin -p sapflow-bench
+file target/aarch64-apple-darwin/release/sapflow     # Mach-O 64-bit executable arm64
+
+# per run: one server (the other is not running)
+SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:38888 \
+  SAPFLOW_RTMP_ADDR=127.0.0.1:38935 SAPFLOW_SRT_ADDR=127.0.0.1:38890 \
+  RUST_LOG=warn target/aarch64-apple-darwin/release/sapflow
+mediamtx mediamtx.yml                                 # the file above
+
+# then the publisher, the same for both
+ffmpeg -re -stream_loop -1 -f lavfi -i testsrc2=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=440:sample_rate=48000 -pix_fmt yuv420p \
+  -c:v libx264 -preset veryfast -tune zerolatency -g 30 -keyint_min 30 -sc_threshold 0 \
+  -b:v 2500k -maxrate 2500k -bufsize 2500k -c:a aac -b:a 128k \
+  -f flv rtmp://127.0.0.1:38935/live/event-loop
+
+# footprint: sample the server's RSS and CPU for 60 s, 30 s after the publisher starts
+# loaded: 10 s ramp then 60 s; --viewers 250 --full 250, 750 --full 750, 250 --full 10, 750 --full 10
+ulimit -n 65536
+/usr/bin/time -l sapflow-bench --url http://127.0.0.1:38888/live/event-loop/index.m3u8 \
+  --viewers 250 --full 250 --secs 60 --ramp 10
+```
+
+The driver (a shell script that starts and stops the above, samples, and
+writes each run's conditions) is not in the repository.
+
+### Footprint
+
+| Footprint | sapflow | mediamtx 1.21.2 | mediamtx / sapflow |
+|---------|---------|-----------------|--------------------|
+| Binary size (MB) | 3.3 | 52.2 | 15.8x |
+| Idle memory (MB) | 3.3 to 3.4 | 32.3 to 32.5 | 9.5x |
+| One stream, no viewers: memory at the start of the 60 s window (MB) | 23.2 to 23.3 | 61.7 to 62.2 | 2.7x |
+| One stream, no viewers: memory at the end of the window (MB) | 24.0 to 24.5 | 79.6 to 88.3 | 3.5x |
+| One stream, no viewers: CPU over the window (% of one core) | 0.53 to 0.56 | 1.08 to 1.34 | 2.2x |
+
+Idle is 3 s after start. The 60 s window starts about 30 s after the
+publisher connects, when the playlist window is full. mediamtx's memory was
+still rising through the window; sapflow's was nearly flat. Binary size is
+bytes divided by 1,048,576, as `scripts/bench.sh` computes it.
+
+### All viewers full
+
+| All viewers full | sapflow | mediamtx 1.21.2 | mediamtx / sapflow |
+|---------|---------|-----------------|--------------------|
+| **250 viewers** | | | |
+| Server CPU (% of one core) | 17.4 to 18.0 | 50.4 to 60.2 | 3.4x |
+| Server peak memory (MB) | 44 to 92 | 160 to 164 | 2.3x |
+| Playlist p50 / p95 / p99 (ms) | 4.5-4.8 / 8.6-9.4 / 12.0-12.9 | 6.8-7.5 / 15.9-18.1 / 20.7-23.2 | 1.6x / 2.0x / 1.8x |
+| Segment p50 / p95 / p99 (ms) | 3.4-3.5 / 6.6-6.7 / 8.7-9.4 | 4.6-4.8 / 7.5-7.9 / 11.1-11.6 | 1.4x / 1.1x / 1.2x |
+| Part fan-out p50 / p95 / max (ms) | 12.7-12.8 / 19.7-20.6 / 23.9-25.3 | 19.8-22.0 / 27.0-29.3 / 32.9-33.9 | 1.7x / 1.4x / 1.3x |
+| Playlist max / segment max (ms) | 20.2-21.5 / 14.9-34.2 | 30.1-31.3 / 21.0-23.1 | 1.5x / 1.4x |
+| Failed requests, three runs together | 0 of 195,988-195,990 per run | 0 of 196,236-196,240 per run | |
+| Requests per second / received Mbit/s (mean over 70 s) | 2,800 / 1,275 | 2,803 / 1,218 | |
+| Connections | 752 to 753 | 1,000 | |
+| Viewers (bench) CPU % / peak memory MB | 18.6 to 19.4 / 206 to 235 | 19.3 to 23.3 / 176 to 205 | |
+| **750 viewers** | | | |
+| Server CPU (% of one core) | 43.8 to 62.0 | 129.0 to 156.2 | 2.5x |
+| Server peak memory (MB) | 89 to 230 | 272 to 276 | 1.3x |
+| Playlist p50 / p95 / p99 (ms) | 8.7-9.7 / 17.6-21.0 / 21.0-27.6 | 13.5-14.3 / 26.2-26.6 / 32.3-33.5 | 1.4x / 1.3x / 1.3x |
+| Segment p50 / p95 / p99 (ms) | 5.0-5.4 / 9.3-9.4 / 12.8-15.5 | 7.7-7.8 / 11.1-11.8 / 15.2-16.5 | 1.5x / 1.2x / 1.1x |
+| Part fan-out p50 / p95 / max (ms) | 22.1-30.7 / 29.4-46.8 / 39.1-64.8 | 33.5-34.1 / 44.5-46.0 / 52.3-89.9 | 1.2x / 1.1x / 1.1x |
+| Playlist max / segment max (ms) | 29.0-48.3 / 23.4-46.0 | 44.4-69.9 / 30.8-53.3 | 1.1x / 1.0x |
+| Failed requests, three runs together | 0 of 587,842-587,860 per run | 1 of 588,618-588,798 per run | |
+| Requests per second / received Mbit/s (mean over 70 s) | 8,398 / 3,824 | 8,409 to 8,411 / 3,654 to 3,655 | |
+| Connections | 2,252 to 2,255 | 3,000 to 3,028 | |
+| Viewers (bench) CPU % / peak memory MB | 42.9 to 57.7 / 485 to 550 | 44.4 to 53.6 / 465 to 520 | |
+
+### 10 viewers full
+
+Same stream and viewers, but only 10 of them fetch parts and segments; the
+rest follow the playlist with blocking reloads.
+
+| 10 viewers full, the rest follow the playlist only | sapflow | mediamtx 1.21.2 | mediamtx / sapflow |
+|---------|---------|-----------------|--------------------|
+| **250 viewers** | | | |
+| Server CPU (% of one core) | 6.2 to 6.4 | 30.8 to 31.6 | 4.9x |
+| Server peak memory (MB) | 33 to 34 | 138 to 144 | 4.3x |
+| Playlist p50 / p95 / p99 (ms) | 2.4-2.6 / 5.8-6.7 / 7.4-9.1 | 6.9-7.0 / 17.5-18.0 / 21.0-21.2 | 2.8x / 2.7x / 2.5x |
+| Segment p50 / p95 / p99 (ms) | 0.9-1.0 / 2.7-3.1 / 3.7-5.0 | 0.9-1.0 / 2.7-2.8 / 3.9-4.6 | 1.0x / 0.9x / 0.8x |
+| Part fan-out p50 / p95 / max (ms) | 3.7-4.0 / 7.0-8.5 / 9.2-13.3 | 10.3-10.4 / 18.6-19.6 / 23.2-30.8 | 2.7x / 2.6x / 2.2x |
+| Playlist max / segment max (ms) | 11.6-14.8 / 4.4-11.4 | 26.8-33.0 / 7.0-11.4 | 1.9x / 1.1x |
+| Failed requests, three runs together | 0 of 102,321 per run | 0 of 102,571-102,572 per run | |
+| Requests per second / received Mbit/s (mean over 70 s) | 1,462 / 92 | 1,465 / 96 | |
+| Connections | 270 to 271 | 520 to 521 | |
+| Viewers (bench) CPU % / peak memory MB | 7.5 to 7.8 / 33 to 34 | 8.9 to 9.1 / 44 | |
+| **750 viewers** | | | |
+| Server CPU (% of one core) | 12.7 to 18.9 | 64.2 to 82.4 | 4.4x |
+| Server peak memory (MB) | 51 to 77 | 206 to 214 | 3.7x |
+| Playlist p50 / p95 / p99 (ms) | 3.9-5.7 / 10.9-12.5 / 14.1-16.6 | 11.2-13.1 / 24.0-27.7 / 28.2-33.1 | 2.5x / 2.2x / 2.0x |
+| Segment p50 / p95 / p99 (ms) | 1.3-1.8 / 4.0-5.6 / 5.5-7.1 | 0.6-1.2 / 4.7-5.3 / 5.8-6.7 | 0.6x / 0.9x / 1.0x |
+| Part fan-out p50 / p95 / max (ms) | 7.3-8.0 / 13.6-15.8 / 16.6-21.4 | 15.3-16.9 / 26.7-30.6 / 30.2-90.5 | 2.2x / 1.9x / 2.0x |
+| Playlist max / segment max (ms) | 22.0-24.5 / 9.1-11.9 | 35.0-94.1 / 7.5-13.8 | 2.0x / 1.2x |
+| Failed requests, three runs together | 0 of 298,511-298,563 per run | 0 of 299,255-299,352 per run | |
+| Requests per second / received Mbit/s (mean over 70 s) | 4,264 to 4,265 / 169 | 4,275 to 4,276 / 188 | |
+| Connections | 770 | 1,520 to 1,523 | |
+| Viewers (bench) CPU % / peak memory MB | 16.7 to 22.9 / 65 to 70 | 18.8 to 24.0 / 90 to 92 | |
+
+### Machine state
+
+| Machine state, three runs each | sapflow | mediamtx 1.21.2 |
+|---------|---------|-----------------|
+| **250 viewers, all full** | | |
+| One-minute load average: before / mid-run / after | 3.7 to 7.5 / 4.2 to 7.2 / 5.9 to 6.5 | 4.8 to 5.9 / 2.9 to 5.8 / 4.0 to 5.7 |
+| Whole-machine CPU idle %: before / mid-run / after | 88 to 91 / 76 to 86 / 78 to 88 | 91 to 92 / 66 to 82 / 76 to 89 |
+| Server open files mid-run / threads | 768 to 769 / 17 | 1,030 / 45 to 47 |
+| **750 viewers, all full** | | |
+| One-minute load average: before / mid-run / after | 4.2 to 5.9 / 6.2 to 9.6 / 5.0 to 7.9 | 4.8 to 7.5 / 4.3 to 7.5 / 3.7 to 8.0 |
+| Whole-machine CPU idle %: before / mid-run / after | 81 to 93 / 75 to 82 / 79 to 88 | 69 to 94 / 67 to 68 / 75 to 82 |
+| Server open files mid-run / threads | 2,268 to 2,270 / 17 | 3,022 to 3,030 / 76 to 96 |
+| **250 viewers, 10 full** | | |
+| One-minute load average: before / mid-run / after | 3.3 to 7.8 / 5.0 to 6.5 / 4.9 to 7.4 | 4.6 to 6.8 / 5.9 to 9.5 / 4.7 to 11.2 |
+| Whole-machine CPU idle %: before / mid-run / after | 80 to 85 / 77 to 87 / 81 to 89 | 84 to 90 / 82 to 87 / 75 to 89 |
+| Server open files mid-run / threads | 287 / 17 | 550 to 551 / 24 to 29 |
+| **750 viewers, 10 full** | | |
+| One-minute load average: before / mid-run / after | 4.4 to 7.1 / 5.5 to 12.1 / 4.9 to 8.4 | 5.3 to 7.5 / 6.7 to 8.8 / 5.1 to 10.2 |
+| Whole-machine CPU idle %: before / mid-run / after | 85 to 92 / 74 to 86 / 69 to 88 | 82 to 90 / 73 to 80 / 76 to 83 |
+| Server open files mid-run / threads | 787 / 17 | 1,550 / 34 to 37 |
+
+- **Not a quiet Mac, not a starved one.** Whole-machine CPU idle was at
+  least 65% in every sample, and the one-minute load average at the start of
+  every run was at most 7.8. Seen in the `top` snapshots at over 25% of a core
+  and spread over both servers' runs: Spotlight (`mds`, up to 105%), another
+  session's `rustc` and `clippy-driver` (about 65% each) and desktop apps (up
+  to 62%); `kernel_task` was at 18 to 36% in every snapshot and is not in the
+  per-process figures. The Android emulator and Docker's backend were left
+  alone. Swap in use was unchanged at 3.6 GB.
+- **One load reading above 12:** 12.1, mid-run, in the third sapflow run at
+  750 viewers with 10 full. The same snapshot shows nothing but the stack
+  itself busy (ffmpeg 28%, the viewers 15%, sapflow 12%) and the Mac 85% idle,
+  so it was the stack's own run queue and not other work; the run was kept.
+- **Drift between rounds is real.** At 750 viewers with 10 full, both servers
+  used 20 to 30% less CPU in round 1 (sapflow 12.7% against 18.2 and 18.9;
+  mediamtx 64.2% against 80.5 and 82.4) than in rounds 2 and 3. Per round,
+  mediamtx / sapflow CPU there was 5.1, 4.4 and 4.4. Compare the servers
+  within a round, which the interleaving allows; the absolute CPU figures move
+  by that much over an hour on this Mac.
+- **Memory when sapflow is busy.** At 750 all full, sapflow's first run of the
+  session peaked at 89 MB and 43.8% CPU; its other eight runs at that row
+  (two more of this commit here, and in the control below three of this commit
+  and three of `b92e735`) were 216 to 256 MB and 60.0 to 62.0%. The 2026-10-21 run on this Mac saw 183 to 234 MB and 54.7 to 62.6%.
+  So 216 to 256 MB is the usual figure here, the first run was the exception,
+  and the range in the table is wide for that reason. The cause of the
+  difference was not established.
+
+### Delay through the server
+
+Over RTMP only: no `srt-live-transmit` on the M4, and mediamtx's SRT was left
+disabled. The method is `docs/interop.md`'s: `scripts/ingest-lag.py rtmp`
+publishes ffmpeg's test signal in real time (720p30, 2 Mbit/s, 2 s keyframes),
+polls the media playlist every 20 ms, and for each new part compares the
+moment it appeared with the moment ffmpeg sent its last frame. 40 s per run,
+the first 8 parts skipped, three runs each, interleaved.
+
+| Over RTMP | Median | p90 | Parts per run |
+|---------|---------|---------|---------|
+| sapflow | -0.44 to -0.45 s | -0.43 s | 191-192 |
+| mediamtx 1.21.2 | -0.47 s | -0.45 to -0.46 s | 181 |
+
+- The script was copied and generalised for this, because it assumed
+  sapflow's playlist name and sends no cookies: it takes the master's first
+  variant as the media playlist, follows mediamtx's session redirect with a
+  cookie jar, and finds the init segment by its name with mediamtx's
+  `?session=` suffix. It reads mediamtx's video rendition only.
+- **mediamtx's media timeline starts at 10 s** (gohlslib's fixed
+  `fmp4StartDTS`, noted in `docs/reference.md`; the first part listed was at
+  12.02 s in all three runs), so 10 s was subtracted from its part times. With
+  that, the two servers agree to 0.02 to 0.03 s. Without it mediamtx reads
+  -10.5 s. The correction rests on that constant, not on a second clock.
+- Both are negative because ffmpeg's read burst at the start shifts every
+  sample early by the same amount (about 0.4 s here; `docs/interop.md` saw
+  about 0.3 s on another day). Read only the difference. At this method's
+  resolution there is **no measurable difference in delay through the server
+  over RTMP**: parts appear at about the same moment relative to the encoder
+  on both. It says nothing about SRT, the player, or glass to glass.
+
+### Does the rise from the M1 hold for mediamtx?
+
+CPU and peak memory, all viewers full. The M1 column is the 2026-10-20 table
+(8-core M1, macOS 14, mediamtx 1.19.1, sapflow of that day). The M4 columns
+are today's. "Earlier M4" is the 2026-10-21 sapflow-only run at `b92e735`.
+
+| All full | M1, 2026-10-20 | Earlier M4 run, sapflow `b92e735` | M4, today | M4 median / M1 range midpoint |
+|---------|---------|---------|---------|---------|
+| sapflow CPU, 250 / 750 | 10.2-11.5 / 26.0-29.7% | 11.5-18.6 / 54.7-62.6% | 17.4-18.0 / 43.8-62.0% | 1.6x / 2.2x |
+| mediamtx CPU, 250 / 750 | 34.6-37.5 / 103.1-107.0% | not run | 50.4-60.2 / 129.0-156.2% | 1.7x / 1.5x |
+| sapflow peak memory, 250 / 750 | 44.6-55.6 / 66.2-77.3 MB | 42-73 / 183-234 MB | 44-92 / 89-230 MB | 1.4x / 3.0x |
+| mediamtx peak memory, 250 / 750 | 132.6-142.1 / 263.3-266.5 MB | not run | 160-164 / 272-276 MB | 1.2x / 1.0x |
+
+The last column divides today's median by the middle of the M1 range, so it is
+approximate; the M1 runs have no per-run values here.
+
+**Control: is it the code or the machine?** Sapflow at `b92e735` (the commit
+of the 2026-10-21 run on this Mac; its `sapflow` built the same way is
+2,878,624 bytes, sha256 `7dadce180a54...cfffd`) and at `eee669c`, three runs
+each at 250 and 750 viewers all full, interleaved with the order flipping each
+round, the same current `sapflow-bench` for both, 09:55 to 10:20 on the same
+day. Same driver, same conditions checks (no run abandoned or repeated).
+
+| Control: sapflow at two commits, same machine, built the same way | b92e735 (the earlier loopback run) | eee669c (current main) |
+|---------|---------|---------|
+| **250 viewers, all full** | | |
+| Server CPU (% of one core) / peak memory (MB) | 17.7 to 18.0 / 82 to 100 | 17.1 to 18.1 / 43 to 82 |
+| Playlist p50 / p95 (ms) | 4.2-4.3 / 8.5-8.6 | 4.3-4.6 / 8.6-8.8 |
+| Part fan-out p50 / p95 / max (ms) | 12.9-13.6 / 20.1-20.9 / 22.5-25.0 | 13.0-13.1 / 19.8-21.3 / 23.8-26.1 |
+| Failed requests | 0 of 195,990 per run | 0 of 195,990 per run |
+| **750 viewers, all full** | | |
+| Server CPU (% of one core) / peak memory (MB) | 60.6 to 61.8 / 225 to 232 | 60.0 to 61.2 / 242 to 256 |
+| Playlist p50 / p95 (ms) | 9.4-10.1 / 19.4-20.3 | 9.5-9.8 / 19.1-19.9 |
+| Part fan-out p50 / p95 / max (ms) | 26.8-29.3 / 39.9-44.7 / 47.4-71.3 | 27.1-28.4 / 42.4-44.5 / 51.6-63.4 |
+| Failed requests | 0 of 587,766-587,876 per run | 0 of 587,504-587,980 per run |
+
+- **CPU: yes, mediamtx rose too.** At 250 viewers both servers needed about
+  1.6x the CPU on the M4 that they did on the M1, so most of that rise is the
+  machine, its OS, or (for mediamtx, which also moved from 1.19.1 to 1.21.2)
+  the version, and not something about sapflow. At 750 viewers sapflow rose
+  more (about 2.2x against 1.5x), so the gap to mediamtx narrowed: 3.8x on the
+  M1 (105 against 28, range midpoints), 2.5x here.
+- **It is not the commits since the earlier M4 run.** `b92e735`, the commit of the earlier M4 run,
+  built the same way and run interleaved with current main on the same Mac,
+  gave the same CPU and latency at both loads, and similar memory at 750
+  viewers (225 to 232 MB against 242 to 256) but a wide spread at 250 (82 to
+  100 against 43 to 82). The 42 commits between them did not change sapflow's
+  CPU or latency at these loads.
+- **Memory: no, only sapflow's rose.** mediamtx's peak memory is about 17%
+  above its M1 figure at 250 viewers and within 3% at 750; sapflow's is about
+  1.4x and 3x. Why sapflow holds more here was not established (the M4 has
+  twice the cores; nothing was tried to test whether that matters).
+- **What would separate machine from mediamtx version:** mediamtx 1.19.1 on
+  this M4. It was not run: the only mediamtx binary available and verified was
+  1.21.2. What would separate machine from OS: the same run on the M1 on
+  macOS 26, or on this M4 on macOS 14. Neither was done.
+
+### What it shows
+
+- On the same machine, feed and viewers, sapflow used less CPU and memory
+  than mediamtx at every load: in the all-full rows 3.4x and 2.5x less CPU,
+  2.3x and 1.3x less peak memory (250 and 750 viewers; at 750 sapflow's first
+  run peaked at 89 MB and the rest at 216 to 256, see Machine state), and a
+  15.8x smaller binary, 9.5x less idle memory, 3.5x less memory and 2.2x less
+  CPU with one stream and no viewers. The 2026-10-20 CPU ratio of about three
+  held at 250 viewers (3.3x then, 3.4x now) and narrowed at 750 (3.8x then,
+  2.5x now), from range midpoints then and medians now.
+- Playlist and part fan-out medians were lower for sapflow in every row (all
+  full: playlist p50 1.6x and 1.4x, part fan-out p50 1.7x and 1.2x); segment
+  medians 1.4x and 1.5x lower with all viewers full, but **equal or slightly
+  worse with 10 full** (segment p50 1.0x at 250, 0.6x at 750, meaning mediamtx
+  was faster; only about 700 segment requests per run there). At 750 all full
+  the tails were close: part fan-out p95 29 to 47 ms for sapflow against 45 to
+  46 for mediamtx, and maximum part fan-out 39 to 65 ms against 52 to 90.
+  sapflow's maxima were not above mediamtx's, as they were on the M1, but the
+  ranges overlap.
+- No failed request in 3,554,083 for sapflow; one in 3,560,436 for mediamtx
+  (a part request in its first 750 all-full run: "connection closed before
+  message completed"). Neither is evidence of reliability, only that nothing
+  broke at these loads in these runs.
+- mediamtx opened 4 connections per viewer (the cookie redirect and session)
+  against sapflow's 3, and at 750 viewers ran 76 to 96 threads against
+  sapflow's 17.
+
+### What it does not show
+
+- **The production path.** No network card, no Caddy, no TLS, no HTTP/2, no
+  Linux. Safari only takes low-latency positioning over HTTP/2, and the Wi-Fi
+  section found most of the time going into Caddy in Docker Desktop; none of
+  that is in these numbers.
+- **A fair per-viewer load on mediamtx.** The bench follows the master
+  playlist's first variant. mediamtx 1.21.2 lists audio as a separate
+  rendition (`audio2_stream.m3u8` and its own segments), which the bench does
+  not fetch; a real player would poll both. The viewers received 4 to 5% fewer
+  bytes from mediamtx (about the audio share, 128 of 2,628 kbit/s) and made no
+  audio playlist requests. mediamtx's playlist work per real viewer is
+  therefore understated here, and sapflow's, which muxes audio and video into
+  one playlist, is not. Whether 1.19.1 did the same in 2026-10-20 was not
+  checked.
+- **An impartial viewer.** `sapflow-bench` is this project's own tool and its
+  model of hls.js. It was the same for both servers, but it was written
+  against sapflow's behaviour first.
+- **A ceiling.** At 750 viewers mediamtx used up to 1.6 cores and sapflow 0.6
+  of 16, with the Mac mostly idle. Neither server's limit was reached or
+  looked for.
+- **The kernel's share.** `kernel_task` carried the loopback traffic; CPU here
+  is the server process's, not the whole cost of serving.
+- **Anything about SRT ingest, recording, glass-to-glass delay or the
+  callbacks.** Only RTMP in, one stream, one rendition.
+- **Small differences.** The run-to-run and round-to-round spread on this Mac
+  (sapflow's 750-viewer CPU 43.8% in its first run and 62.0% in the next two;
+  both servers' 10-full CPU 20 to 30% lower in round 1) is bigger than some of
+  the differences above, which is why they are given as ranges.
+
 ## Decision
 
 2026-10-20, the user: **keep experimenting.** Before any production
