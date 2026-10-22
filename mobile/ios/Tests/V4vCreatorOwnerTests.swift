@@ -81,8 +81,9 @@ private final class CreatorPublisher: V4vCreatorPublisher {
     var ends = 0, commits = 0
     var stopCallbacks: [() -> Void] = []
     var autoClose = true
+    var onFirstEnd: (() -> Void)?
     func committed(_ permit: V4vPublishingGrantPermit) throws { commits += 1 }
-    func endDestination() { ends += 1 }
+    func endDestination() { ends += 1; let hook = onFirstEnd; onFirstEnd = nil; hook?() }
     func start() throws {}
     func offer(_ sample: MediaSample) throws {}
     func stop() { stop(completion: {}) }
@@ -134,9 +135,30 @@ private final class CreatorActualSignetHTTP: V4vLoginHTTP {
     func execute(_ call: V4vHTTPCall, completion: @escaping (Result<V4vJSON, V4vFailure>) -> Void) { reply = completion; completion(.success(challenge)) }
     func close() {} // held until the test supplies actual invalidation
 }
+private final class CreatorAlarm: V4vCreatorAlarm {
+    private let lock = NSLock()
+    private var callback: ((UInt64) -> Void)?
+    private var generation: UInt64 = 0
+    private var afterFire: (() -> Void)?
+    private(set) var deadline: UInt64?
+    private(set) var schedules = 0
+    private(set) var cancellations = 0
+    func schedule(atNs deadline: UInt64?, generation: UInt64, fire: @escaping (UInt64) -> Void) {
+        lock.lock(); self.deadline = deadline; self.generation = generation; callback = fire; schedules += 1; lock.unlock()
+    }
+    func cancel() {
+        lock.lock(); deadline = nil; callback = nil; cancellations += 1; lock.unlock()
+    }
+    func fire(times: Int = 1) {
+        lock.lock(); let next = callback, token = generation, after = afterFire; afterFire = nil; lock.unlock()
+        for _ in 0..<times { next?(token) }
+        after?()
+    }
+    func afterNextFire(_ action: @escaping () -> Void) { lock.lock(); afterFire = action; lock.unlock() }
+}
 private final class CreatorFixture {
     let queue = DispatchQueue(label: "generated.creator.control")
-    let journal = CreatorJournal(), signerJournal = CreatorJournal(), capture = CreatorCapture()
+    let journal = CreatorJournal(), signerJournal = CreatorJournal(), capture = CreatorCapture(), alarm = CreatorAlarm()
     var client: CreatorHTTP!
     var publishers: [CreatorPublisher] = []
     var publisherProfiles: [CaptureIntent] = []
@@ -152,7 +174,14 @@ private final class CreatorFixture {
     var owner: V4vCreatorOwner!
     var elapsed: UInt64 = 0
     let base = DispatchTime.now().uptimeNanoseconds
-    func clock() -> V4vClock { V4vClock(wallMs: V4vFixture.time + elapsed, monotonicNs: base + elapsed * 1_000_000) }
+    private let clockHookLock = NSLock()
+    private var clockHook: (() -> Void)?
+    func beforeNextClock(_ action: @escaping () -> Void) { clockHookLock.lock(); clockHook = action; clockHookLock.unlock() }
+    func clock() -> V4vClock {
+        clockHookLock.lock(); let hook = clockHook; clockHook = nil; clockHookLock.unlock()
+        hook?()
+        return V4vClock(wallMs: V4vFixture.time + elapsed, monotonicNs: base + elapsed * 1_000_000)
+    }
     func seed(pending: Bool = false, active: Bool = false) throws {
         let e = try V4vSessionEngine(profile: V4vFixture.profile(), store: journal, clock: clock(), fencePublisher: {})
         try e.installAuthenticatedSession(pubkey: String(repeating: "d", count: 64), token: "generated-creator-token", maxAgeSeconds: 3600, clock: clock())
@@ -165,6 +194,7 @@ private final class CreatorFixture {
         owner = V4vCreatorOwner(profile: try V4vFixture.profile(), journal: journal,
             credentials: V4vSignetCredentialStore(journal: signerJournal), capture: capture, owner: queue,
             clock: { [unowned self] in clock() }, delivery: queue, changed: { [unowned self] in snapshots.append($0); onSnapshot?($0) },
+            alarm: alarm,
             makeHTTP: { [unowned self] closed in let c = CreatorHTTP(closed); client = c; return c },
             makeLogin: { [unowned self] uri, profile, credentials, queue, clock, commit, cleanup in
                 if let override = loginFactoryOverride { return try override(uri, profile, credentials, queue, clock, commit, cleanup) }
@@ -454,10 +484,7 @@ final class V4vCreatorOwnerTests: XCTestCase {
         f.queue.sync { f.elapsed = 58_000 }
         f.answer(.failure(.unavailable))
         f.queue.sync { f.elapsed = 59_000 }
-        let retryDeadline = Date().addingTimeInterval(2)
-        while f.calls.count == firstReadCount, Date() < retryDeadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
+        f.queue.sync { f.alarm.fire() }; f.flush()
         XCTAssertEqual(f.calls.count, firstReadCount + 1, "the bounded retry should issue a fresh exact-SID read")
         XCTAssertEqual(f.calls.last?.path, "/api/live-events/\(V4vFixture.event)/native-session/\(V4vFixture.sid)")
 
@@ -475,6 +502,139 @@ final class V4vCreatorOwnerTests: XCTestCase {
         f.queue.sync { f.journal.failSave = true }
         f.answer(.success(V4vFixture.answer(V4vFixture.session(2), grant: V4vFixture.grant(2))))
         XCTAssertEqual(f.publishers[0].commits, 0); XCTAssertGreaterThan(f.publishers[0].ends, 0)
+    }
+    func testDueAutomaticRefreshSurvivesStartContention() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
+        XCTAssertNotNil(f.alarm.deadline)
+        f.elapsed = 50_000
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        f.queue.async { entered.signal(); release.wait() }; entered.wait()
+        f.queue.async { f.alarm.fire() }
+        XCTAssertTrue(f.owner.start(), "Start should own cold admission before the queued alarm executes")
+        release.signal(); f.flush()
+        XCTAssertEqual(f.capture.started, 1)
+        XCTAssertEqual(f.calls.last?.method, "POST")
+        XCTAssertTrue(f.calls.last?.path.hasSuffix("/refresh") == true)
+        XCTAssertEqual(f.last.pending, "refresh")
+    }
+    func testForegroundReconcilesWithheldOverdueRefreshExactlyOnce() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
+        let requests = f.calls.count
+        XCTAssertFalse(f.owner.setSceneForeground(false, continuing: nil))
+        f.elapsed = 50_000
+        XCTAssertTrue(f.owner.setSceneForeground(true, continuing: nil)); f.flush()
+        XCTAssertEqual(f.calls.count, requests + 1)
+        XCTAssertTrue(f.calls.last?.path.hasSuffix("/refresh") == true)
+        XCTAssertEqual(f.last.pending, "refresh")
+        f.queue.sync { f.alarm.fire(times: 2) }; f.flush()
+        XCTAssertEqual(f.calls.count, requests + 1, "resume and duplicate stale alarm delivery must coalesce")
+    }
+    func testDuplicateAutomaticRefreshAlarmsStageOneExactOperation() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
+        f.elapsed = 50_000; let requests = f.calls.count
+        f.queue.sync { f.alarm.fire(times: 2) }; f.flush()
+        XCTAssertEqual(f.calls.count, requests + 1)
+        let first = try XCTUnwrap(f.calls.last?.body)
+        f.answer(.failure(.conflict)); XCTAssertEqual(f.last.pending, "refresh")
+        XCTAssertTrue(f.owner.retryPending()); f.flush()
+        XCTAssertEqual(f.calls.last?.body, first, "a lost automatic reply must retain its exact durable nonce")
+    }
+    func testEndFencesQueuedAutomaticRefreshAlarm() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
+        f.elapsed = 50_000
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        f.queue.async { entered.signal(); release.wait() }; entered.wait()
+        f.queue.async { f.alarm.fire() }
+        f.owner.end(); release.signal(); f.flush()
+        XCTAssertFalse(f.calls.contains(where: { $0.path.hasSuffix("/refresh") }))
+        XCTAssertTrue(f.calls.last?.path.hasSuffix("/end") == true)
+        XCTAssertGreaterThan(f.publishers[0].ends, 0)
+    }
+    func testExactStopBetweenAlarmFenceAndAdmissionCannotRefreshStoppedBinding() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
+        let ticket = try XCTUnwrap(f.capture.ticket)
+        f.elapsed = 50_000
+        let clockEntered = DispatchSemaphore(value: 0), releaseClock = DispatchSemaphore(value: 0)
+        let stopEntered = DispatchSemaphore(value: 0), releaseStop = DispatchSemaphore(value: 0)
+        let alarmReturned = DispatchSemaphore(value: 0), stopReturned = DispatchSemaphore(value: 0)
+        f.beforeNextClock {
+            clockEntered.signal()
+            _ = releaseClock.wait(timeout: .now() + 3)
+        }
+        f.alarm.afterNextFire { alarmReturned.signal() }
+        f.publishers[0].onFirstEnd = {
+            stopEntered.signal()
+            _ = releaseStop.wait(timeout: .now() + 3)
+        }
+        f.queue.async { f.alarm.fire() }
+        XCTAssertEqual(clockEntered.wait(timeout: .now() + 2), .success)
+        DispatchQueue.global().async {
+            _ = f.capture.stop(preparation: ticket)
+            f.owner.captureStopped(preparation: ticket)
+            stopReturned.signal()
+        }
+        XCTAssertEqual(stopEntered.wait(timeout: .now() + 2), .success)
+        releaseClock.signal()
+        XCTAssertEqual(alarmReturned.wait(timeout: .now() + 2), .success)
+        releaseStop.signal()
+        XCTAssertEqual(stopReturned.wait(timeout: .now() + 2), .success)
+        f.flush()
+        XCTAssertFalse(f.calls.contains(where: { $0.path.hasSuffix("/refresh") }))
+        XCTAssertGreaterThan(f.publishers[0].ends, 0)
+        XCTAssertNil(f.capture.admission.currentPreparation)
+    }
+    func testExactStopAfterAutomaticAdmissionBeforeQueuedActionCannotRearmStoppedBinding() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
+        let ticket = try XCTUnwrap(f.capture.ticket)
+        f.elapsed = 50_000
+        let ownerEntered = DispatchSemaphore(value: 0), releaseOwner = DispatchSemaphore(value: 0)
+        let admittedBlocked = DispatchSemaphore(value: 0), releaseAdmitted = DispatchSemaphore(value: 0)
+        let stopEntered = DispatchSemaphore(value: 0), releaseStop = DispatchSemaphore(value: 0)
+        let stopReturned = DispatchSemaphore(value: 0)
+        f.publishers[0].onFirstEnd = {
+            stopEntered.signal()
+            _ = releaseStop.wait(timeout: .now() + 3)
+        }
+        f.queue.async {
+            ownerEntered.signal()
+            _ = releaseOwner.wait(timeout: .now() + 3)
+        }
+        XCTAssertEqual(ownerEntered.wait(timeout: .now() + 2), .success)
+        f.queue.async { f.alarm.fire() }
+        // This block was queued before the alarm creates its command body, so
+        // reaching it proves the automatic refresh has cold-admitted while its
+        // owner-queue action remains behind this barrier.
+        f.queue.async {
+            admittedBlocked.signal()
+            _ = releaseAdmitted.wait(timeout: .now() + 3)
+        }
+        releaseOwner.signal()
+        XCTAssertEqual(admittedBlocked.wait(timeout: .now() + 2), .success)
+        DispatchQueue.global().async {
+            _ = f.capture.stop(preparation: ticket)
+            f.owner.captureStopped(preparation: ticket)
+            stopReturned.signal()
+        }
+        XCTAssertEqual(stopEntered.wait(timeout: .now() + 2), .success)
+        releaseAdmitted.signal()
+        f.queue.sync {}
+        releaseStop.signal()
+        XCTAssertEqual(stopReturned.wait(timeout: .now() + 2), .success)
+        f.flush()
+        XCTAssertFalse(f.calls.contains(where: { $0.path.hasSuffix("/refresh") }))
+        XCTAssertGreaterThan(f.publishers[0].ends, 0)
+        XCTAssertNil(f.capture.admission.currentPreparation)
+    }
+    func testExpiredWithheldRefreshFencesPublisherWithoutNetworkOrCapture() throws {
+        let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.prepared()
+        let requests = f.calls.count, reservations = f.capture.reservations
+        XCTAssertFalse(f.owner.setSceneForeground(false, continuing: nil))
+        f.elapsed = 60_001
+        XCTAssertTrue(f.owner.setSceneForeground(true, continuing: nil)); f.flush()
+        XCTAssertEqual(f.calls.count, requests)
+        XCTAssertEqual(f.capture.reservations, reservations)
+        XCTAssertGreaterThan(f.publishers[0].ends, 0)
+        XCTAssertNotNil(f.last.error)
     }
     func testFiniteWindowExpiredResponseCannotCreatePublisher() throws {
         let f = CreatorFixture(); try f.seed(); try f.open(); defer { f.close() }; try f.events()

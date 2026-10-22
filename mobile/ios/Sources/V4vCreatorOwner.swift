@@ -21,6 +21,11 @@ protocol V4vCreatorHTTP: AnyObject {
     var cleanupComplete: Bool { get }
 }
 extension V4vControlClient: V4vCreatorHTTP {}
+protocol V4vCreatorAlarm: AnyObject {
+    func schedule(atNs deadline: UInt64?, generation: UInt64, fire: @escaping (UInt64) -> Void)
+    func cancel()
+}
+extension NativeDeadlineTimer: V4vCreatorAlarm {}
 protocol V4vCreatorLogin: AnyObject {
     func start(restoring: Bool, timeoutMs: UInt32, completion: @escaping (Result<Void, V4vFailure>) -> Void) -> Bool
     func cancel()
@@ -78,7 +83,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private let owner: DispatchQueue, delivery: DispatchQueue
     private let clock: () -> V4vClock, changed: (Snapshot) -> Void
     private let makeHTTP: HTTPFactory, makeLogin: LoginFactory, makePublisher: PublisherFactory
-    private let timer: NativeDeadlineTimer
+    private let timer: V4vCreatorAlarm
     private let slot: V4vObservationSlot
     private var engine: V4vSessionEngine?
     private var http: V4vCreatorHTTP?
@@ -93,7 +98,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private var inflight: UInt64?
     private var requestSerial: UInt64 = 0
     private var window: Window?
-    private var refreshAtNs: UInt64?
+    private var refreshPlan: RefreshPlan?
     private var capturePrepared = false, captureRunning = false, captureStopping = false
     private var prepareIntent: (generation: UInt64, profile: CaptureIntent)?
     private var ending = false
@@ -104,9 +109,15 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private var lastFreshStatus: (V4vIdentity, UInt64)?
     private struct Binding {
         let ticket: CaptureAdmission.Preparation
+        let generation: UInt64
         let publisher: V4vCreatorPublisher
         var permit: V4vPublishingGrantPermit
         var sawCaptureActivity = false
+    }
+    private struct RefreshPlan: Equatable {
+        let due: UInt64
+        let generation: UInt64
+        let ticket: CaptureAdmission.Preparation
     }
     private struct Window { let end: UInt64; let command: UInt64; var attempts = 0 }
     private enum Read { case events, current(String), status(V4vIdentity), remoteEnd(V4vRemoteEndRead) }
@@ -115,6 +126,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     init(profile: V4vConnectorProfile, journal: V4vJournalStore, credentials: V4vSignetCredentialStore,
          capture: V4vCreatorCapturePort, owner: DispatchQueue, clock: @escaping () -> V4vClock,
          delivery: DispatchQueue = .main, changed: @escaping (Snapshot) -> Void,
+         alarm: V4vCreatorAlarm? = nil,
          makeHTTP: HTTPFactory? = nil, makeLogin: LoginFactory? = nil, makePublisher: PublisherFactory? = nil) {
         self.profile = profile; self.journal = journal; self.credentials = credentials; self.capture = capture
         self.owner = owner; self.clock = clock; self.delivery = delivery; self.changed = changed
@@ -135,7 +147,8 @@ final class V4vCreatorOwner: @unchecked Sendable {
             try V4vObservedPublisher(destination: destination, permit: permit, profile: profile,
                 engine: engine, owner: queue, slot: slot, clock: clock, captureProfile: captureProfile)
         }
-        timer = NativeDeadlineTimer(queue: owner, now: { clock().monotonicNs }); slot = V4vObservationSlot(owner: owner, clock: clock)
+        timer = alarm ?? NativeDeadlineTimer(queue: owner, now: { clock().monotonicNs })
+        slot = V4vObservationSlot(owner: owner, clock: clock)
         owner.async { [self] in bootstrap() }
     }
     private func bootstrap() {
@@ -176,6 +189,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private func releaseCommand(_ captured: UInt64? = nil) {
         let expected = captured ?? actorCommand
         gate.lock(); if busyCommand == expected { busy = false; busyCommand = nil }; gate.unlock(); publish()
+        armRefresh()
     }
     private func beginWindow() throws {
         let end = commandStartedNs.addingReportingOverflow(60_000_000_000)
@@ -321,7 +335,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         publisher?.endDestination(); login?.cancel()
         owner.async { [self] in
             gate.lock(); endNeedsStaging = false; gate.unlock()
-            prepareIntent = nil; refreshAtNs = nil; ending = true
+            prepareIntent = nil; refreshPlan = nil; ending = true
             commandStartedNs = started
             do { guard let engine else { throw V4vFailure.journal }; try engine.requestEnd(clock: clock()); if window == nil { try beginWindow() }; if inflight == nil { pump() } }
             catch { fail(error); completeWindow() }
@@ -345,7 +359,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         publisher?.endDestination()
         owner.async { [self] in
             guard binding?.ticket == ticket else { return }
-            prepareIntent = nil; refreshAtNs = nil; retireBinding(); publish()
+            prepareIntent = nil; refreshPlan = nil; retireBinding(); publish()
         }
     }
     func setActive(_ active: Bool) {
@@ -355,7 +369,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         owner.async { [self] in
             gate.lock(); modeUpdateQueued = false; let active = enabled; gate.unlock()
             prepareIntent = nil
-            if !active { refreshAtNs = nil; retireBinding() }
+            if !active { refreshPlan = nil; retireBinding() }
             else if engine?.pending != nil || engine?.terminalIntent == true { if window == nil { commandStartedNs = clock().monotonicNs; try? beginWindow() }; pump() }
             publish()
         }
@@ -374,6 +388,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         gate.unlock()
         signing?.cancel()
         publisher?.revalidateAuthority()
+        if awakening { owner.async { [weak self] in self?.armRefresh() } }
         return permitted
     }
     private func retireAuthority() {
@@ -445,7 +460,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
             capture.setDestination(publisher, preparation: ticket) { _ in }
             throw V4vFailure.closed
         }
-        binding = Binding(ticket: ticket, publisher: publisher, permit: permit)
+        binding = Binding(ticket: ticket, generation: token, publisher: publisher, permit: permit)
         capture.setDestination(publisher, preparation: ticket) { [weak self, weak publisher] accepted in
             guard let self else { return }
             self.owner.async {
@@ -459,6 +474,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
     }
     private func retireBinding() {
         guard let old = binding, !retiringBinding else { return }; retiringBinding = true
+        refreshPlan = nil
         old.publisher.endDestination()
         // Keep its borrowed/native owners until actual stop completion. No
         // successor can be attached while this binding still occupies capacity.
@@ -602,17 +618,59 @@ final class V4vCreatorOwner: @unchecked Sendable {
     private func scheduleRefresh(_ permit: V4vPublishingGrantPermit) {
         let remaining = permit.grant.expiresMs - permit.grant.refreshMs
         let reserve = remaining.multipliedReportingOverflow(by: 1_000_000)
-        guard !reserve.overflow, permit.expiresAtNs >= reserve.partialValue else { refreshAtNs = nil; return }
-        refreshAtNs = permit.expiresAtNs - reserve.partialValue
+        guard !reserve.overflow, permit.expiresAtNs >= reserve.partialValue, let binding else {
+            refreshPlan = nil; return
+        }
+        refreshPlan = RefreshPlan(due: permit.expiresAtNs - reserve.partialValue,
+                                  generation: binding.generation, ticket: binding.ticket)
         armRefresh()
     }
     private func armRefresh() {
-        guard window == nil, inflight == nil, let due = refreshAtNs, state().active, !state().closed, binding != nil else { return }
-        timer.schedule(atNs: due, generation: state().generation) { [weak self] token in
-            guard let self, self.live(token), self.window == nil, self.inflight == nil else { return }
-            self.timer.cancel(); self.refreshAtNs = nil
-            // Reuse ordinary bounded admission; no automatic signer or capture.
-            _ = self.refresh()
+        guard let plan = refreshPlan else { return }
+        let cold = state()
+        gate.lock()
+        let modePermitsRefresh = !closed && enabled && !endQueued &&
+            (sceneForeground || (continuingAudio != nil && continuingAudio == coldTicket))
+        gate.unlock()
+        guard cold.generation == plan.generation, binding?.ticket == plan.ticket else {
+            refreshPlan = nil; return
+        }
+        guard window == nil, inflight == nil, cold.active, !cold.closed, !cold.busy,
+              modePermitsRefresh, engine?.pending == nil, engine?.terminalIntent == false else { return }
+        if clock().monotonicNs >= plan.due {
+            beginAutomaticRefresh(plan)
+            return
+        }
+        timer.schedule(atNs: plan.due, generation: plan.generation) { [weak self] token in
+            guard let self else { return }
+            self.timer.cancel()
+            guard token == plan.generation else { return }
+            self.beginAutomaticRefresh(plan)
+        }
+    }
+    /// Keep the deadline until refresh is durably staged. If another command
+    /// won admission after the alarm was queued, its release re-enters
+    /// `armRefresh`; foreground activation does the same for a withheld alarm.
+    private func beginAutomaticRefresh(_ plan: RefreshPlan) {
+        guard refreshPlan == plan, live(plan.generation), window == nil, inflight == nil,
+              binding?.ticket == plan.ticket else { return }
+        _ = command(allowBackgroundRefresh: true) { [self] admitted in
+            do {
+                guard admitted == plan.generation, refreshPlan == plan, live(admitted), window == nil, inflight == nil,
+                      binding?.ticket == plan.ticket, let engine, engine.pending == nil, !engine.terminalIntent else {
+                    throw V4vFailure.conflict
+                }
+                _ = try engine.publishingGrant(clock: clock())
+                try engine.stageRefresh(key: nonce(), clock: clock())
+                refreshPlan = nil
+                try beginWindow(); pump()
+            } catch {
+                // A failed authority/journal/expiry check must not spin an
+                // overdue alarm. Command contention never enters this block,
+                // so it retains the deadline for release-time reconciliation.
+                refreshPlan = nil
+                throw error
+            }
         }
     }
     private func completeWindow() {
@@ -675,7 +733,7 @@ final class V4vCreatorOwner: @unchecked Sendable {
         gate.lock(); guard !closed else { gate.unlock(); return }; closed = true; generation &+= 1; gate.unlock()
         retireAuthority()
         owner.async { [self] in
-            retainedSelf = self; timer.cancel(); window = nil; prepareIntent = nil; refreshAtNs = nil
+            retainedSelf = self; timer.cancel(); window = nil; prepareIntent = nil; refreshPlan = nil
             slot.close { [weak self] in self?.slotClosed = true; self?.finishClose() }
             engine?.close(); http?.close(); login?.cancel(); retireBinding(); publish(); finishClose()
         }

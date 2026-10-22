@@ -94,6 +94,15 @@ alone never extends it. Inactive mode cancels pending local approval and its
 captured publisher without stopping another destination. Only exact uncertain
 operations and terminal End reconciliation may continue while inactive.
 
+An active publisher schedules its next refresh against a plan containing the
+lease deadline, the capture binding's original generation and its exact camera
+ticket. Command contention keeps that plan until the refresh is durably staged;
+returning to the foreground immediately reconciles an overdue plan. A lost
+reply retains the journaled refresh body and nonce for explicit retry. Stop,
+End, binding retirement, authority expiry and an exact-ticket or generation
+change discard the plan, so a delayed alarm or rejected queued command cannot
+refresh a stopped publisher or prepare a successor capture.
+
 End broadcast synchronously fences the captured publisher and any first Start
 that has not committed. An existing local recording continues, including its
 later rotation segments, until Stop and save. A publishing startup failure is

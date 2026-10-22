@@ -392,6 +392,20 @@ could otherwise adopt terminal ownership after the original command window.
 These are host and compiler gates; no service request, signer consent, signed
 installation or physical iPhone flow was exercised.
 
+The follow-on creator-owner continuity packet retains an automatic V4V grant
+refresh deadline while Start or another command owns admission, and reconciles
+an overdue deadline when the scene returns to the foreground. Each scheduled
+refresh is bound to the publisher binding's original generation and exact
+capture ticket. Stop, End, expiry and retirement therefore fence both delayed
+alarms and an already-admitted refresh whose queued action has not run. A
+durably staged refresh still uses the existing exact-body and nonce retry path.
+The focused creator-owner suite passes 47 tests, including deterministic Stop
+races on both sides of automatic command admission, duplicate-alarm coalescing,
+foreground reconciliation and expired-authority fencing. This is source and
+host-test evidence. The generic unsigned arm64 Debug app also builds with Swift
+warnings treated as errors. No service, signer, signed installation or physical
+show was exercised by this packet.
+
 V4V is unavailable by default in Debug and Release. A separate Qualification
 configuration requires explicit approved routing and native authentication.
 Qualification settings do not enable the ordinary configurations. These source
