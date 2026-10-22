@@ -187,7 +187,7 @@ three unsigned iOS app configurations and the actual iOS unit-test bundle with
 warnings as errors; the bundle was not executed on iOS. Focused host suites pass
 159 budget/lifecycle, 69 V4V, 50 observation, 86 publisher, 36 creator-owner and
 14 configuration tests. The production Network.framework cancellation check also
-passes. Android Debug and Qualification each pass 372 unit tests, all three APKs
+passes. Android Debug and Qualification each pass 385 unit tests, all three APKs
 assemble and package isolation passes. Qualification lint has 14 warnings and
 Release lint has 13, both with zero errors. All four packaged ARM64 libraries pass
 16 KiB load-alignment checks. None of these checks installs an app or establishes
@@ -209,16 +209,20 @@ recording completion, incomplete prefixes, repeated finish and export. Its
 independent media checks do not establish physical capture, background behaviour,
 crash repair, real disk-pressure behaviour, thermal limits or battery performance.
 
-The latest generated fixture run on this host exited before media production:
-`AVAudioConverter` refused the generated PCM-to-AAC conversion, so its retained
-receipt has no media result. Earlier retained runs of this production gate reached
-the functional recording and strict AAC/PCM checks, then still exited 1 at the
-presentation/retention oracle. Separate controlled writer experiments from that
-investigation store all 143 native AAC units in order. For our experimental
-grouped-trim file, native AVAssetReader presents the exact input duration at
-zero marker lag for both 144000-frame and 144123-frame sources. Default FFmpeg
-instead presents 144384 PCM frames with a real 2112-frame leading marker lag
-and exposes only the first 141 native packets.
+The latest generated fixture requests and verifies explicit 48 kHz mono signed
+16-bit packed PCM. It encoded 144000 input frames into 143 native AAC units in
+one pass; the packaged Rust ingress accepted all 143, and all three recording
+cases exported and independently decoded. The unchanged gate still exits 1
+because the stored AAC payload sequence differs from the native encoded output.
+Cold converter construction now reports bounded scalar ASBD and channel-layout
+facts when it fails, without retrying, but that path was not exercised by this
+run. An earlier byte-identical source/package run returned nil while constructing
+`AVAudioConverter`; the retained evidence does not establish why. Separate
+controlled writer experiments store all 143 native AAC units in order. For our
+experimental grouped-trim file, native AVAssetReader presents the exact input
+duration at zero marker lag for both 144000-frame and 144123-frame sources.
+Default FFmpeg instead presents 144384 PCM frames with a real 2112-frame leading
+marker lag and exposes only the first 141 native packets.
 
 Independent references encoded by FFmpeg itself as valid AAC MP4 and MOV also
 decode to 144384 frames under default FFmpeg settings. Exact default decoded

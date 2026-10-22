@@ -20,65 +20,48 @@ import android.os.Looper
  * A delivered Intent never creates a capture controller or reconstructs a show. */
 class AudioBroadcastService : Service() {
     private val main = Handler(Looper.getMainLooper())
-    private var lease: BackgroundAudioPolicy.Owner? = null
-    private var lastStart = 0
-    private val check = object : Runnable {
-        override fun run() {
-            val value = lease ?: return
-            val owner = AudioBroadcastOwner.existing()
-            if (owner == null || !owner.check(value)) finish(value)
-            else main.postDelayed(this, 1_000)
-        }
-    }
-    override fun onBind(intent: Intent?): IBinder? = null
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        lastStart = startId
-        val owner = AudioBroadcastOwner.existing()
-        val command = intent
-        if (owner == null || command == null) {
-            if (lease == null) stopSelfResult(startId)
-            return START_NOT_STICKY
-        }
-        val value = owner.match(command.getLongExtra(ID, -1), command.getStringExtra(CAPABILITY))
-        if (value == null) {
-            // A mismatched old notification must not stop the active successor.
-            if (lease == null) stopSelfResult(startId)
-            return START_NOT_STICKY
-        }
-        owner.revalidateAuthority()
-        when (command.action) {
-            STOP -> owner.stop(value, "Stopped from the background audio notification; saving recording")
-            ARM -> {
-                if (!owner.owns(value)) { if (lease == null) stopSelfResult(startId); return START_NOT_STICKY }
-                try {
-                    if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED || !owner.notificationsGranted()) {
-                        throw SecurityException("Background microphone permission unavailable")
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        startForeground(NOTIFICATION, notification(value), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-                    } else {
-                        // API29 has no microphone foreground-service type constant.
-                        // The notification and pre-granted microphone permission still apply.
-                        startForeground(NOTIFICATION, notification(value))
-                    }
-                    if (!owner.promoted(value)) {
-                        owner.stop(value, "Background service admission expired. Prepare again."); owner.retired(value)
-                        if (lease == null) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelfResult(startId) }
-                        return START_NOT_STICKY
-                    }
-                    lease = value
-                } catch (_: Exception) {
-                    owner.stop(value, "Background audio service permission or promotion failed. Prepare again.")
-                    owner.retired(value)
-                    if (lease == null) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelfResult(startId) }
-                    return START_NOT_STICKY
+    private val check: Runnable = Runnable { lifecycle.check() }
+    private val lifecycle: AudioBroadcastLifecycle<BackgroundAudioPolicy.Owner> = AudioBroadcastLifecycle(
+        object : AudioBroadcastLifecycle.Owners<BackgroundAudioPolicy.Owner> {
+            override fun match(id: Long, capability: String?) = AudioBroadcastOwner.existing()?.match(id, capability)
+            override fun owns(value: BackgroundAudioPolicy.Owner) = AudioBroadcastOwner.existing()?.owns(value) == true
+            override fun revalidateAuthority() { AudioBroadcastOwner.existing()?.revalidateAuthority() }
+            override fun promoted(value: BackgroundAudioPolicy.Owner) = AudioBroadcastOwner.existing()?.promoted(value) == true
+            override fun check(value: BackgroundAudioPolicy.Owner) = AudioBroadcastOwner.existing()?.check(value) == true
+            override fun stop(value: BackgroundAudioPolicy.Owner, reason: String) { AudioBroadcastOwner.existing()?.stop(value, reason) }
+            override fun retired(value: BackgroundAudioPolicy.Owner) { AudioBroadcastOwner.existing()?.retired(value) }
+            override fun serviceDestroyed(value: BackgroundAudioPolicy.Owner) { AudioBroadcastOwner.existing()?.serviceDestroyed(value) }
+        },
+        object : AudioBroadcastLifecycle.Platform<BackgroundAudioPolicy.Owner> {
+            override fun promote(value: BackgroundAudioPolicy.Owner) {
+                val owner = AudioBroadcastOwner.existing() ?: throw SecurityException("Background owner unavailable")
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED || !owner.notificationsGranted()) {
+                    throw SecurityException("Background microphone permission unavailable")
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    startForeground(NOTIFICATION, notification(value), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                } else {
+                    // API29 has no microphone foreground-service type constant.
+                    startForeground(NOTIFICATION, notification(value))
                 }
             }
-            else -> return START_NOT_STICKY
+            override fun removeNotification() { stopForeground(STOP_FOREGROUND_REMOVE) }
+            override fun stopService(startId: Int) { stopSelfResult(startId) }
+            override fun scheduleCheck(delayMs: Long) {
+                main.removeCallbacks(check)
+                main.postDelayed(check, delayMs)
+            }
+            override fun cancelCheck() { main.removeCallbacks(check) }
+        },
+    )
+    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val command = when (intent?.action) {
+            ARM -> AudioBroadcastLifecycle.Command.ARM
+            STOP -> AudioBroadcastLifecycle.Command.STOP
+            else -> null
         }
-        main.removeCallbacks(check)
-        if (lease != null) main.post(check)
-        else stopSelfResult(startId)
+        lifecycle.command(command, intent?.getLongExtra(ID, -1) ?: -1, intent?.getStringExtra(CAPABILITY), startId)
         return START_NOT_STICKY
     }
     private fun notification(value: BackgroundAudioPolicy.Owner): Notification {
@@ -96,20 +79,12 @@ class AudioBroadcastService : Service() {
             .setVisibility(Notification.VISIBILITY_PRIVATE).setOngoing(true).setOnlyAlertOnce(true)
             .setContentIntent(open).addAction(Notification.Action.Builder(null, "Stop and save", action).build()).build()
     }
-    private fun finish(value: BackgroundAudioPolicy.Owner) {
-        if (lease !== value) return
-        main.removeCallbacks(check); lease = null
-        AudioBroadcastOwner.existing()?.retired(value)
-        stopForeground(STOP_FOREGROUND_REMOVE); stopSelfResult(lastStart)
-    }
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Eligible committed owner remains service-owned; all other states are stopped.
-        lease?.let { AudioBroadcastOwner.existing()?.check(it) }
+        lifecycle.taskRemoved()
         super.onTaskRemoved(rootIntent)
     }
     override fun onDestroy() {
-        main.removeCallbacks(check)
-        lease?.let { AudioBroadcastOwner.existing()?.serviceDestroyed(it) }; lease = null
+        lifecycle.destroy()
         super.onDestroy()
     }
     companion object {

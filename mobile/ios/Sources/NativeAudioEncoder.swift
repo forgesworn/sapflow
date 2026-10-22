@@ -21,6 +21,18 @@ final class NativeAudioEncoder {
         outputFormat = format; self.output = output; self.meter = meter
     }
 
+    /// Cold construction diagnostics only. Scalar format facts contain no PCM,
+    /// device identity or channel-description payloads and have fixed size.
+    static func formatFacts(_ format: AVAudioFormat) -> String {
+        let value = format.streamDescription.pointee
+        let layout: String
+        if let channels = format.channelLayout {
+            let raw = channels.layout.pointee
+            layout = "tag=\(raw.mChannelLayoutTag),bitmap=\(raw.mChannelBitmap),descriptions=\(raw.mNumberChannelDescriptions),channels=\(channels.channelCount)"
+        } else { layout = "absent" }
+        return "ASBD{rate=\(value.mSampleRate),id=\(value.mFormatID),flags=\(value.mFormatFlags),bytesPerPacket=\(value.mBytesPerPacket),framesPerPacket=\(value.mFramesPerPacket),bytesPerFrame=\(value.mBytesPerFrame),channels=\(value.mChannelsPerFrame),bits=\(value.mBitsPerChannel),reserved=\(value.mReserved)} layout{\(layout)}"
+    }
+
     func encode(_ sample: CMSampleBuffer, time: CMTime) throws {
         guard let description = CMSampleBufferGetFormatDescription(sample),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description),
@@ -31,7 +43,9 @@ final class NativeAudioEncoder {
         expectedInputTime = CMTimeAdd(time, CMTime(seconds: Double(CMSampleBufferGetNumSamples(sample)) / source.sampleRate, preferredTimescale: 1_000_000_000))
         if let inputFormat, inputFormat != source { throw CaptureFailure(message: "Audio route changed its format; stop and prepare again") }
         if converter == nil {
-            guard let created = AVAudioConverter(from: source, to: outputFormat) else { throw CaptureFailure(message: "Native AAC conversion is unsupported") }
+            guard let created = AVAudioConverter(from: source, to: outputFormat) else {
+                throw CaptureFailure(message: "Native AAC conversion is unsupported; input \(Self.formatFacts(source)); output \(Self.formatFacts(outputFormat))")
+            }
             created.bitRate = 96_000
             created.primeMethod = .none
             converter = created; inputFormat = source

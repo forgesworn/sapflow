@@ -97,6 +97,10 @@ finally:
     same=inputs=={str(p.relative_to(root)):sha(p) for p in sources+package_files}
     shutil.rmtree(scratch)
     receipt={'createdUtc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'passed':passed and same,'sourceUnchanged':same,'inputManifestSHA256':sha(run/'input-hashes.local.json'),'generatedInputSHA256':locals().get('generated_sha'),'commands':commands,'media':media,'failure':failure,'childrenStopped':all(p.poll() is not None for p in children),'scratchAndAllGeneratedMediaRemoved':not scratch.exists(),'scope':'macOS generated PCM -> actual NativeAudioEncoder once -> sameAAC actual RustEncodedIngress(hasVideo:false) and actual CompressedRecorder/Catalogue. No mic/camera/socket/device/phone/private existing media. No iPhone/background/crash/powerloss qualification.','packageScope':'Existing pinned Apple package; the input manifest identifies its actual bytes. This check does not rebuild packages.','incompleteScope':'Prior-loss and explicit incomplete-finish seams; no actual disk-pressure or crash injection'}
+    # Retain cold format diagnostics on failure, bounded independently of logs.
+    runtime_log=run/'runtime.local.json'
+    if failure and runtime_log.exists():
+        with runtime_log.open('rb') as diagnostics:receipt['runtimeFailureDiagnostics']=diagnostics.read(4096).decode('utf-8',errors='replace')
     (run/'receipt.local.json').write_text(json.dumps(receipt,indent=2)+'\n')
     print(str(run.relative_to(root)));print(json.dumps({'passed':receipt['passed'],'childrenStopped':receipt['childrenStopped'],'scratchRemoved':receipt['scratchAndAllGeneratedMediaRemoved'],'failure':failure}))
 if not passed or not same:raise SystemExit(1)

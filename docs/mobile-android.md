@@ -473,15 +473,19 @@ No additional controls below are implemented or exposed by the current UI.
    fence old callbacks and request an IDR. Preserve the media clock across a
    supported switch; configuration changes instead require a new attempt/file.
    A seamless switch needs physical qualification.
-4. Freeze an audio-only track mode before Prepare. Skip camera/preview/permission,
-   set fanout `hasVideo=false`, remove IDR gating and pass the audio-only track
-   intent into both sinks. The shared recorder and SRT constructor already
-   support optional video; RTMP supports AAC-only wire output. The own-origin
-   HLS ingest currently creates its muxer from video, so end-to-end audio-only
-   requires a separate origin change and receiver proof.
+4. Audio-only mode now freezes its track intent before Prepare, skips camera,
+   preview and camera permission, sets fanout `hasVideo=false`, and avoids IDR
+   gating in both sinks. Own-origin HLS supports explicitly declared AAC-only
+   topology; native recording and receiver source paths are implemented. Physical
+   microphone, complete-show retention and receiver acceptance remain separate
+   qualification gates; see [audio-only mobile delivery](audio-only-mobile.md).
 5. The first background slice now moves only opted-in committed audio-only capture
    into an application-owned, non-exported microphone foreground service with an
-   exact notification Stop action. Physical privacy-toggle, screen-off, service
+   exact notification Stop action. A production-used cold lifecycle driver keeps
+   duplicate commands, promotion failure, retained cleanup, notification teardown
+   and stale successors ordered. An unpromoted service stops promptly while the
+   application retains exact cleanup ownership; a successfully promoted service
+   keeps its notification until closure. Physical privacy-toggle, screen-off, service
    kill, network-switch and storage-finalisation qualification remains open.
    Android's while-in-use restrictions remain applicable; no Google runtime is
    needed.

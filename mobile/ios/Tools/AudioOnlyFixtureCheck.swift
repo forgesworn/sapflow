@@ -87,7 +87,13 @@ enum AudioOnlyFixtureCheck {
     }
     static func run(root: URL, asset: AVAsset, track: AVAssetTrack) throws -> [String: Any] {
         let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        // Request a deterministic native PCM representation, rather than
+        // inheriting a file container's implicit decoding/output defaults.
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000,
+            AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false])
         output.alwaysCopiesSampleData = false
         reader.add(output)
         try requireAudioFixture(reader.startReading(), "Generated PCM reader start")
@@ -127,7 +133,10 @@ enum AudioOnlyFixtureCheck {
             guard let format = CMSampleBufferGetFormatDescription(batch), let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format) else {
                 throw CaptureFailure(message: "PCM format unavailable")
             }
-            try requireAudioFixture(asbd.pointee.mFormatID == kAudioFormatLinearPCM && asbd.pointee.mSampleRate == 48_000 && asbd.pointee.mChannelsPerFrame == 1, "Expected generated 48 kHz mono PCM")
+            let pcmFormat = asbd.pointee
+            try requireAudioFixture(pcmFormat.mFormatID == kAudioFormatLinearPCM && pcmFormat.mSampleRate == 48_000 && pcmFormat.mChannelsPerFrame == 1 &&
+                pcmFormat.mBitsPerChannel == 16 && pcmFormat.mFramesPerPacket == 1 && pcmFormat.mBytesPerFrame == 2 && pcmFormat.mBytesPerPacket == 2 &&
+                pcmFormat.mFormatFlags == (kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked), "Expected explicit generated signed-16 packed/interleaved 48 kHz mono PCM")
             // Match bounded microphone-sized input rather than passing an
             // entire file batch into the native converter in one callback.
             for offset in stride(from: 0, to: count, by: 1024) {

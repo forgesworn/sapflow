@@ -28,6 +28,15 @@ network switch, notification/privacy toggles, external routes, recording and
 sustained-show qualification remain open; this source/build packet does not
 complete B4R.
 
+The Android service now delegates its real command, foreground promotion,
+notification, timer and teardown ordering to a production-used cold lifecycle
+driver. Duplicate ARM or Stop cannot re-promote or retire a show whose native
+cleanup is still retained. Failed platform promotion stops the unpromoted
+service promptly while leaving exact application cleanup ownership intact;
+successful promotion followed by rejected capture admission retains its
+notification until actual closure. Thirteen driver regressions cover these
+seams, stale/successor commands, task removal and unexpected destruction.
+
 Foreground microphone selection now has native adapters and normal controls on
 both platforms: System Default plus bounded built-in/wired/USB inventory, frozen
 Prepare choice and actual-input verification before PCM admission. Default pins
@@ -95,10 +104,10 @@ separate ARM64 package had been refreshed; rebuilding the actual app dependency
 resolved the missing generated bindings without a source change. These are
 local package/build results, not CI or phone acceptance.
 
-The background-audio source has a source-matched final app gate: all three
+The current background-audio source has a source-matched app gate: all three
 unsigned iOS configurations and the actual unit-test bundle compile/link with
 zero warnings; the unit bundle was not executed. Android Debug and Qualification
-each pass 372 tests with no failures, errors or skips. All three APKs assemble;
+each pass 385 tests in 53 suites with no failures, errors or skips. All three APKs assemble;
 qualification/release isolation, native ARM64 and 16 KiB ZIP/ELF checks pass.
 Qualification/Release lint has 14/13 warnings and zero errors. Debug and
 Qualification use the existing debug certificate; Release is unsigned. These
@@ -109,10 +118,14 @@ production SRT Network.framework cancellation check also passes. No phone,
 USB/hot-unplug, Bluetooth, physical background/lock, process/service kill or
 sustained-performance qualification is claimed.
 
-The native AAC recorder experiment preserves all encoded units in stored media,
-but priming and edit interpretation change the presented packet list. Exact
-presentation and complete-show retention remain open; strict decoding alone
-does not establish them. A fresh read-only Apple/CoreDevice inventory still
+The latest generated native AAC gate explicitly reads 48 kHz mono signed 16-bit
+packed PCM, emits 143 native AAC units from 144000 input frames, validates all
+143 through the packaged Rust ingress, and independently decodes all three
+recording cases. It still fails the unchanged exact stored-payload sequence
+oracle. Bounded cold-construction diagnostics were added but were not exercised
+by this run, so the reason an earlier byte-identical run returned nil remains
+unknown. Exact presentation and complete-show retention remain open; strict
+decoding alone does not establish them. A fresh read-only Apple/CoreDevice inventory still
 reports the primary iPhone unavailable. UI Automation was already enabled;
 no new physical runner, installation or camera test is claimed. The Pixel's
 current capture remains untouched.
