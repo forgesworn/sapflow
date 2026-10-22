@@ -1,5 +1,29 @@
 # Fuzz targets
 
+The native iOS metadata-only QuickTime AAC priming parser has a separate Swift
+libFuzzer/AddressSanitizer target, `mobile/ios/Fuzz/QuickTimeAudioPrimingFuzz.swift`.
+Run `bash mobile/ios/fuzz-quicktime-priming.sh` from the repository root for a
+finite 20-second local run (1–60 seconds via `SAPFLOW_HEADER_FUZZ_SECONDS`). It
+also covers `QuickTimeMovieLayout` through contiguous and sparse 64-bit virtual
+file inputs. It checks that reads remain exactly eight bytes, total read count
+stays bounded, payloads are skipped and the sole movie is final. Focused sparse
+layout regressions run with `bash mobile/ios/test-quicktime-layout.sh`. The target
+uses synthetic v0/v1/extended-header seeds, optionally accepts payload-free
+headers from generated native fixtures, and checks bounded output, exact frame
+accounting and refusal of double application. Scratch binaries and mutated
+corpora are removed; scalar receipts, logs and any failing input remain under
+`target/ios-quicktime-priming-fuzz/`. This launcher is not yet a hosted CI gate
+or a production file-install/durability qualification. If Apple Swift rejects
+`-sanitize=fuzzer`, the launcher tries Swift edge/counter/PC/compare SanitizerCoverage plus
+AddressSanitizer, linked with an installed Clang or already-built worktree
+libFuzzer archive (or `SAPFLOW_LIBFUZZER_ARCHIVE`). It verifies actual coverage
+counter, PC and compare references and requires actual engine/corpus coverage
+statistics. The fallback targets the running macOS major version, records the
+runtime hash and retains any archive deployment-version linker warning; it does
+not change the app's deployment target. It never builds Rust, downloads
+a runtime or silently replaces coverage-guided fuzzing with random mutations;
+an unavailable compiler/runtime leaves this gate failing explicitly.
+
 | Target | What it feeds |
 |--------|---------------|
 | `ts_ingest` | Arbitrary MPEG-TS chunks, explicit terminal drain, playlist rules, repeated finish and post-EOF refusal (SRT publisher) |
