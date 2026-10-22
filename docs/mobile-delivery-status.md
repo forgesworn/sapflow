@@ -5,6 +5,23 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The first [publishing admission benchmark](sdk-publishing-benchmark.md) passes
+its predeclared paired Release host checks. The measured median added thread
+CPU is about 2.8 microseconds per AAC unit for the actual SDK queue receipt.
+This excludes capture, recording, worker dispatch and transport. Allocation,
+whole-SDK, phone power and competitor comparison gates remain open.
+
+The actual generated iOS recording process-kill spike exposes an unresolved B5
+gap. Its closed four-second control preserves all 190 AAC and 120 H.264 packets,
+with native and independent decoding and positive audio/video seeks. Killing
+the writer after 1.51 and 2.51 seconds leaves no movie header or completed
+fragment; neither Apple nor FFmpeg can open the files. Setting the writer's
+fragment interval to one second therefore does not establish recoverability.
+The at-most-two-second trailing-loss requirement remains unchanged. A
+recovery-safe writer or journal is required before catalogue recovery can be
+qualified. Generated media and child processes were removed; source and scalar
+evidence remain under `target/privacy-standby/interrupted-recording-spike/`.
+
 Privacy standby is the next source packet. Its
 [contract](privacy-standby.md) requires synchronous raw-input fencing,
 independently paced replacement picture and silence, explicit Resume and
