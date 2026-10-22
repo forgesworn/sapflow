@@ -113,7 +113,16 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
             "SRT receive buffer below the requested size; raise the OS limit (Linux net.core.rmem_max, macOS kern.ipc.maxsockbuf) if many publishers share this server"
         );
     }
-    tracing::info!(%addr,implementation="own",recv_buffer,scoped=app.publish_sessions.is_some(),encrypted=app.publish_sessions.is_some()||app.config.srt_crypto.is_some(),"SRT listening");
+    let encryption = if app.publish_sessions.is_some()
+        || (app.config.srt_crypto.is_some() && !app.config.srt_allow_plaintext)
+    {
+        "required"
+    } else if app.config.srt_crypto.is_some() {
+        "optional"
+    } else {
+        "off"
+    };
+    tracing::info!(%addr,implementation="own",recv_buffer,scoped=app.publish_sessions.is_some(),encryption,"SRT listening");
     let mut engine = Engine {
         listener: Listener::new(listener_config(&app.config), Instant::now()),
         publishers: HashMap::new(),

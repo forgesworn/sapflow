@@ -189,7 +189,7 @@ SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret \
 SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
 SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-enc.log" 2>&1 & pids+=($!)
 sleep 1
-grep -q 'encrypted=true' "$WORK/sapflow-enc.log" || fail "encrypted server did not start"
+grep -q 'encryption="required"' "$WORK/sapflow-enc.log" || fail "encrypted server did not start"
 epublish() { # streamid seconds extra-srt-options
   ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
     -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
@@ -221,6 +221,7 @@ SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret SAPFLOW_SRT_ENCRYPTION=opti
 SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
 SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-opt.log" 2>&1 & opt=$!; pids+=($opt)
 sleep 1
+grep -q 'encryption="optional"' "$WORK/sapflow-opt.log" || fail "optional-encryption server did not start"
 epublish "publish:live/event-optplain:pub:secret" 8 "" > /dev/null 2>&1 & pids+=($!)
 epublish "publish:live/event-optenc:pub:secret" 8 "&passphrase=$PASS_E" > /dev/null 2>&1 & pids+=($!)
 for e in event-optplain event-optenc; do
