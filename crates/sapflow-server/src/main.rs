@@ -67,10 +67,9 @@ fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_directives(
+            std::env::var("RUST_LOG").ok().as_deref(),
+        )))
         .init();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -193,5 +192,41 @@ async fn run(config: Config) -> std::io::Result<()> {
         },
         r = control_task => r.map_err(std::io::Error::other)?,
         r = expiry_task => r.map_err(std::io::Error::other)?,
+    }
+}
+
+/// The log filter: `RUST_LOG` if set, else `info`. h264-reader logs an error
+/// for every byte of a damaged or mid-frame Annex B stream and then carries
+/// on; a publisher that starts mid-frame produced thousands of lines a
+/// second. That source is off unless `RUST_LOG` names it.
+fn log_directives(rust_log: Option<&str>) -> String {
+    let base = match rust_log.map(str::trim) {
+        Some(v) if !v.is_empty() => v,
+        _ => "info",
+    };
+    if base.contains("h264_reader") {
+        base.to_string()
+    } else {
+        format!("{base},h264_reader::annexb=off")
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::log_directives;
+
+    #[test]
+    fn h264_reader_noise_is_off_by_default() {
+        assert_eq!(log_directives(None), "info,h264_reader::annexb=off");
+        assert_eq!(log_directives(Some("  ")), "info,h264_reader::annexb=off");
+        assert_eq!(log_directives(Some("warn")), "warn,h264_reader::annexb=off");
+    }
+
+    #[test]
+    fn naming_h264_reader_in_rust_log_keeps_it() {
+        assert_eq!(
+            log_directives(Some("debug,h264_reader=error")),
+            "debug,h264_reader=error"
+        );
     }
 }
