@@ -1616,6 +1616,45 @@ binary was tested only with the made-up key. The usage message no longer says
   decode messages from 3 s in), which changed what libsrt's output looked like
   more than any receiver difference did.
 
+## Viewer HTTP on our own event loop against tokio, hyper and axum (2026-10-22)
+
+The spike from `docs/runtime-plan.md`: the same sapflow binary, with
+`SAPFLOW_HTTP_IMPL=own` serving viewers from our own event loop (`mio` and
+`httparse`, one poller per core, `crates/sapflow-server/src/own_http.rs` on
+the `spike/own-event-loop` branch) instead of hyper and axum on tokio.
+Ingest, recording and callbacks run on tokio in both, so the difference is
+the viewer HTTP path alone.
+
+**Method.** The M4 (16 cores), `scripts/bench.sh sapflow` with its usual
+feed (ffmpeg test signal over RTMP, 720p30, 2.5 Mbit/s), 250 and 750 viewers
+for 60 s each, all fetching video. Three rounds, alternating tokio and our
+own loop within each round so background load (a system media-analysis
+process used one core throughout) falls on both. Medians of three:
+
+| | tokio, hyper, axum | own event loop | change |
+|---|---|---|---|
+| CPU, 250 viewers | 17.5% | 11.3% | -35% |
+| CPU, 750 viewers | 60.1% | 34.3% | -43% |
+| Peak memory, 250 viewers | 74.2 MB | 25.4 MB | -66% |
+| Peak memory, 750 viewers | 219.2 MB | 26.8 MB | -88% |
+| Part fan-out p50 / p95, 250 viewers | 15.5 / 20.3 ms | 13.2 / 17.2 ms | |
+| Part fan-out p50 / p95, 750 viewers | 34.1 / 45.4 ms | 23.1 / 42.7 ms | |
+| Playlist p50 / p99, 750 viewers | 8.7 / 29.0 ms | 8.5 / 25.4 ms | |
+| Requests at 750 viewers (60 s) | 587,524 | 588,290 | |
+| Failed requests (all runs) | 0 | 0 | |
+
+The three rounds agreed closely: our loop's CPU at 750 viewers was 33.8, 34.5
+and 34.3%; tokio's 60.9, 59.7 and 60.1%. tokio's peak memory varied (40 to
+244 MB) where ours stayed at 25 to 27 MB. The worst part fan-out was a little
+higher on our loop (58 to 60 ms against 54 to 59 ms). Both reached the same
+viewers with every part (the rest were between requests).
+
+**Caveats.** The spike is not production code: it has no idle timeout,
+connection cap or fuzzing yet, and those cost something, though little per
+request. One machine, loopback, macOS (kqueue); production is Linux
+(epoll). A first attempt was discarded because the benchmark client hit a
+256 open-file limit under `ssh`; the runner now raises it.
+
 ## Decision
 
 2026-10-20, the user: **keep experimenting.** Before any production

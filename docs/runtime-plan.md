@@ -92,6 +92,14 @@ A spike, kept off main, that answers whether B is worth it:
 750 viewers) with no failed requests, or if fewer dependencies alone is
 reason enough. **Stop** and do option A if the difference is within noise.
 
+### Result (2026-10-22)
+
+It passed the bar. On the M4 at 750 viewers our own loop used 43% less CPU
+(34% of a core against 60%) and 88% less memory (27 MB against 219 MB), with
+no failed requests and faster median part fan-out. Three alternating runs
+agreed to within a point. Details in `docs/benchmarks.md`, "Viewer HTTP on
+our own event loop".
+
 ## Step 2, if it goes ahead
 
 In order, each one landing behind a setting so the tokio path stays the
