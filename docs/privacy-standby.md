@@ -168,10 +168,15 @@ layout stays incomplete. Ambiguous write, sync or descriptor closure retains
 the recording owner and blocks another recording. Generated tests qualify this
 specific finalisation path, not physical storage durability after power loss.
 
-iOS background and locked-screen synthetic execution remains open. Its current
-timer does not establish an operating-system execution anchor after native
-capture owners park. Foreground build or generated-codec evidence cannot close
-that gate, and Standby adds no background authority.
+iOS background and locked-screen synthetic execution retains a separate physical
+gate. The [audio-only background contract](ios-background-audio.md) now retains
+the exact opted-in show's native microphone input and pinned route, using a
+discard delegate that does not inspect samples. The microphone remains active
+while independently generated silence feeds publishing and recording; disclose
+that behaviour before Start and in Standby. Ordinary A/V and audio-only shows
+without the option still park capture. Foreground builds and generated-codec
+evidence cannot qualify locked-screen cadence or power, and Standby adds no
+background authority.
 
 The experiment must exercise non-1024-aligned input lengths, old signal followed
 by fresh zero-only encoding, multiple Standby/Resume cycles and final partial

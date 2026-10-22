@@ -18,3 +18,12 @@ final class CaptureRawSource: NSObject, AVCaptureAudioDataOutputSampleBufferDele
     }
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) { drop() }
 }
+
+/// An opted-in audio-only show retains real native input I/O in Standby.
+/// The callback deliberately does not inspect even sample metadata. Synthetic
+/// zero cadence is independent of this callback, and no sample is retained.
+final class CaptureDiscardAudioSource: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    let run: CaptureAdmission.MediaRun
+    init(run: CaptureAdmission.MediaRun) { self.run = run }
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {}
+}

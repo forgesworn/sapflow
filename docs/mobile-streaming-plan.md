@@ -441,6 +441,11 @@ still open. The current [delivery status](mobile-delivery-status.md) identifies
 the exact source, package, app-build and acceptance evidence; implementation
 does not complete B4R or B5.
 
+The [iOS audio-only background contract](ios-background-audio.md) defines the
+opted-in show's retained native microphone, discard-before-read Standby path,
+independent synthetic cadence, active-microphone disclosure and joined cleanup.
+It preserves the separate physical locked-screen and sustained power gates.
+
 ### B5 First release qualification
 
 Treat the following as initial acceptance targets. B0 may revise a target

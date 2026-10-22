@@ -34,6 +34,7 @@ struct CaptureSnapshot {
     var stopControl: AudioShowStopControl?
     var socketKilobitsPerSecond: Double?
     var privacy: CaptureAdmission.PrivacyView?
+    var standbyMicrophoneActive = false
 }
 
 extension CaptureEngine: V4vCreatorCapturePort {}
@@ -48,6 +49,9 @@ final class CaptureRun {
     var video: HardwareVideoEncoder?
     var audio: NativeAudioEncoder!
     var audioRoute: AudioInputRouting?
+    var audioAnchor: CaptureAudioAnchor<CaptureAdmission.MediaRun>? // control owner only
+    var discardAudio: CaptureDiscardAudioSource? // samples owner
+    var retiringDiscardAudio: CaptureDiscardAudioSource?
     var epoch: CMTime?
     var videoTimeline = CameraVideoTimeline()
     var admitting = false
@@ -139,6 +143,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var audioRoute: AudioInputRouting? // control owner; immutable reference captured by CaptureRun
     private var audioPin: (CaptureAdmission.Preparation, AudioInputPin)?
     private var audioEpoch: UInt64 = 0
+    private var audioAnchorRun: CaptureRun? // real retained I/O, control owner only
     private var cameraDevice: CameraDeviceControls? // control only; immutable source delegate owns video callbacks
     private var cameraSwitchTimer: DispatchWorkItem?
     private var deferredOrientation: CaptureOrientation?
@@ -387,6 +392,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         samples.sync {
             guard self.run === run else { return }
             run.retiringRawSources = run.rawSources
+            run.retiringDiscardAudio = run.discardAudio; run.discardAudio = nil
             run.rawSources = [audio] + (video.map { [$0] } ?? [])
         }
         for output in session.outputs {
@@ -396,7 +402,26 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
         // The prior delegate was disabled before replacement. This barrier
         // joins its already queued callbacks before releasing the retained pair.
-        samples.sync { run.retiringRawSources.removeAll() }
+        samples.sync { run.retiringRawSources.removeAll(); run.retiringDiscardAudio = nil }
+    }
+    private func bindAudioRoute(_ route: AudioInputRouting, to run: CaptureRun) throws {
+        guard let token = admission.mediaToken(run.mediaRun, kind: .raw),
+              route.observeNativeFailure(run: run.mediaRun, { [admission] in _ = admission.nativeFault(token) }) else {
+            throw CaptureFailure(message: "Microphone route ownership was retired before native binding")
+        }
+    }
+    private func installDiscardDelivery(_ run: CaptureRun) throws {
+        guard !run.profile.hasVideo, cameraDevice == nil else { throw CaptureFailure(message: "Background audio cannot retain a camera owner") }
+        let outputs = session.outputs.compactMap { $0 as? AVCaptureAudioDataOutput }
+        guard outputs.count == 1 else { throw CaptureFailure(message: "Native audio-only output is unavailable") }
+        let discard = CaptureDiscardAudioSource(run: run.mediaRun)
+        samples.sync {
+            run.retiringRawSources = run.rawSources; run.rawSources.removeAll()
+            run.retiringDiscardAudio = run.discardAudio; run.discardAudio = discard
+        }
+        outputs[0].setSampleBufferDelegate(discard, queue: samples)
+        // Retain both delegates until actual previously queued callbacks return.
+        samples.sync { run.retiringRawSources.removeAll(); run.retiringDiscardAudio = nil }
     }
     private func beginPrivacy(_ request: CaptureAdmission.PrivacyRequest) {
         guard admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) else {
@@ -408,19 +433,45 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         if request.desired == .live { beginPrivacyResume(request); return }
         if samples.sync(execute: { self.run?.privacyRequest == request && self.run?.privacyDriver != nil }) { publish(); return }
         _ = admission.parkPrivacySources(request.preparation)
-        setSampleDelivery(false); cameraDevice?.pause()
-        let oldRoute = audioRoute
-        let retiringToken = samples.sync { () -> CaptureAdmission.MediaToken? in
-            guard let run = self.run, let oldRoute, run.audioRoute === oldRoute else { return nil }
-            return self.admission.mediaToken(run.mediaRun, kind: .raw)
+        let nativeRun = samples.sync { self.run }
+        let retainsAudio = nativeRun.flatMap { value -> Bool? in
+            guard audioAnchorRun === value, value.mediaRun == request.run else { return nil }
+            return value.audioAnchor?.retainForStandby(value.mediaRun, committed: admission.backgroundContinuation == request.preparation,
+                permissionGranted: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized)
+        } == true
+        if let nativeRun, audioAnchorRun === nativeRun, !retainsAudio {
+            if admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) {
+                privacyFailed(request, error: CaptureFailure(message: "Authorised background audio ownership was retired"))
+            }
+            return // Stop/newer request owns the actual retained I/O cleanup.
         }
-        let routeFailed = oldRoute.map { CapturePrivacyRouteRetirement.close($0, admission: admission, token: retiringToken) } ?? false
-        audioRoute = nil
-        if routeFailed {
-            privacyFailed(request, error: CaptureFailure(message: oldRoute?.failureDescription ?? "Microphone route failed before privacy retirement"))
-            return
+        if retainsAudio, let nativeRun {
+            do {
+                guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+                      session.isRunning, let route = audioRoute, route === nativeRun.audioRoute else {
+                    throw CaptureFailure(message: "Authorised background microphone input is no longer active")
+                }
+                try bindAudioRoute(route, to: nativeRun)
+                try installDiscardDelivery(nativeRun)
+                guard route.verify(), admission.permitsPrivacy(request, nowNs: DispatchTime.now().uptimeNanoseconds) else {
+                    throw CaptureFailure(message: "Retained microphone route failed during Standby")
+                }
+            } catch { privacyFailed(request, error: error); return }
+        } else {
+            setSampleDelivery(false); cameraDevice?.pause()
+            let oldRoute = audioRoute
+            let retiringToken = samples.sync { () -> CaptureAdmission.MediaToken? in
+                guard let run = self.run, let oldRoute, run.audioRoute === oldRoute else { return nil }
+                return self.admission.mediaToken(run.mediaRun, kind: .raw)
+            }
+            let routeFailed = oldRoute.map { CapturePrivacyRouteRetirement.close($0, admission: admission, token: retiringToken) } ?? false
+            audioRoute = nil
+            if routeFailed {
+                privacyFailed(request, error: CaptureFailure(message: oldRoute?.failureDescription ?? "Microphone route failed before privacy retirement"))
+                return
+            }
+            if session.isRunning { session.stopRunning() }
         }
-        if session.isRunning { session.stopRunning() }
         let format = try? observedPCMFormat()
         do {
             try samples.sync {
@@ -432,7 +483,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 run.retiringRawSources = run.rawSources; run.rawSources.removeAll()
                 run.resumeCutover = nil
                 run.startup.removeAll(); run.startupBytes = 0
-                run.audioRoute = nil
+                if !retainsAudio { run.audioRoute = nil }
                 var sealedVideoEnd: CMTime?
                 if let video = run.video, let duration = try video.sealForPrivacy() {
                     guard run.videoTimeline.beginSourceSwitch(sealedDuration: duration), let last = run.lastVideoTime else { throw CaptureFailure(message: "Privacy video boundary is unavailable") }
@@ -587,6 +638,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             publisher?.revalidateAuthority()
             let nativeRun = samples.sync { self.run }
             guard let nativeRun, nativeRun.mediaRun == request.run else { throw PrivacyCancellation.superseded }
+            let retainsAudio = audioAnchorRun === nativeRun && nativeRun.audioAnchor?.phase == .active
+            let retainedClock = samples.sync { nativeRun.sourceClock }
             let cutoff = CMClockGetTime(CMClockGetHostTimeClock())
             try samples.sync {
                 try self.requirePrivacy(request)
@@ -605,7 +658,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
             // Replacement is already running under the new exact request while
             // this cold native activation may block. No callback is its clock.
-            try AVAudioSession.sharedInstance().setActive(true)
+            if !retainsAudio { try AVAudioSession.sharedInstance().setActive(true) }
             try requirePrivacy(request)
             if let profile = request.preparation.profile.videoProfile {
                 let candidate = try CameraDeviceControls.preflight(position: admission.desiredCamera, profile: profile)
@@ -615,13 +668,26 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 try replaceCamera(candidate, source: source, orientation: orientationPlan.desired, profile: profile)
             }
             try requirePrivacy(request)
-            let route = try attachAudioRoute(request.preparation)
-            samples.sync { nativeRun.audioRoute = route }
+            let route: AudioInputRouting
+            if retainsAudio {
+                guard session.isRunning, let retained = audioRoute, retained === nativeRun.audioRoute else { throw CaptureFailure(message: "Retained background input ownership was lost") }
+                route = retained
+            } else {
+                route = try attachAudioRoute(request.preparation)
+                samples.sync { nativeRun.audioRoute = route }
+            }
+            try bindAudioRoute(route, to: nativeRun)
             try requirePrivacy(request)
             installRawDelivery(nativeRun)
-            session.startRunning()
+            try requirePrivacy(request) // The callback handoff may have been held past Stop/deadline.
+            if !retainsAudio { session.startRunning() }
             try requirePrivacy(request)
             guard route.verify(), let clock = session.synchronizationClock else { throw CaptureFailure(message: "Fresh Resume route/capture clock could not be verified") }
+            if retainsAudio {
+                guard let retainedClock, CFEqual(clock, retainedClock), nativeRun.audioAnchor?.resume(nativeRun.mediaRun) == true else {
+                    throw CaptureFailure(message: "Retained microphone source clock or ownership changed")
+                }
+            }
             samples.sync {
                 nativeRun.sourceClock = clock
                 nativeRun.resumeCutover?.sourceStarted()
@@ -630,7 +696,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         } catch is PrivacyCancellation {
             // A queued urgent Standby/Stop owns the actual subsequent teardown.
             // Disable this candidate immediately; never classify it as a fault.
-            setSampleDelivery(false); if session.isRunning { session.stopRunning() }
+            if audioAnchorRun?.audioAnchor?.phase != .active {
+                setSampleDelivery(false); if session.isRunning { session.stopRunning() }
+            }
         } catch { privacyFailed(request, error: error) }
     }
     private func resumeProbe(_ sample: CMSampleBuffer, video: Bool, token: CaptureAdmission.MediaToken, run: CaptureRun) throws {
@@ -1304,11 +1372,34 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             if !admission.requiredSinkMask(run: mediaRun).contains(.publishing) { _ = run.worker.closePublishingAdmission() }
             destinationLock.unlock()
             run.audioRoute = self.audioRoute
+            if let route = run.audioRoute { try bindAudioRoute(route, to: run) }
+            run.audioAnchor = CaptureAudioAnchor(owner: mediaRun, hasVideo: run.profile.hasVideo,
+                optedIn: ticket.preparation.continuesAudioInBackground)
+            if run.audioAnchor != nil {
+                audioAnchorRun = run
+                guard !admission.mediaHasFault(mediaRun),
+                      run.audioAnchor?.begin(mediaRun, exactStart: admission.permitsStart(ticket),
+                        permissionGranted: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized) == true else {
+                    throw CaptureFailure(message: "Background audio Start was retired")
+                }
+                if admission.privacyView?.desired == .standby {
+                    try installDiscardDelivery(run) // No raw data reaches the app before Start.
+                    guard !admission.mediaHasFault(mediaRun),
+                          run.audioAnchor?.permitsNativeStart(mediaRun, exactStart: admission.permitsStart(ticket),
+                            permissionGranted: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized) == true else {
+                        throw CaptureFailure(message: "Native microphone Start was cancelled during delegate retirement")
+                    }
+                    session.startRunning()
+                }
+                guard run.audioAnchor?.started(mediaRun, nativeRunning: session.isRunning,
+                    stillCurrent: admission.permitsStart(ticket) && !admission.mediaHasFault(mediaRun)) == true,
+                    let route = run.audioRoute, route.verify() else {
+                    throw CaptureFailure(message: "Authorised native audio input could not start")
+                }
+            }
             run.sourceClock = session.synchronizationClock
             run.slate = try run.video?.prepareSlate()
-            if admission.privacyView?.desired == .standby {
-                run.initialPCMFormat = try observedPCMFormat()
-            }
+            if admission.privacyView?.desired == .standby { run.initialPCMFormat = try observedPCMFormat() }
             // Once native owners exist, even a winning synchronous Stop must
             // reach their actual worker/recorder cleanup path before admission.
             guard self.admission.permitsStart(ticket),
@@ -1324,6 +1415,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }, start: {
                     if self.admission.privacyView?.desired != .standby { self.setSampleDelivery(true); self.session.startRunning() }
                 })
+                if let route = run.audioRoute { try bindAudioRoute(route, to: run) }
             }
             guard self.admission.permitsStart(ticket), self.recordingAdmission.isActive(work),
                   !keepSavedSegment || self.rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
@@ -1419,9 +1511,12 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         publish()
     }
     private func stopOnControl(reason requestedReason: String?) {
+        if let anchored = audioAnchorRun { _ = anchored.audioAnchor?.stop(anchored.mediaRun) }
         let retiringRoute = audioRoute
         let routeFailed = retiringRoute?.close() == true
         audioRoute = nil
+        if let anchored = audioAnchorRun,
+           retiringRoute?.owner == anchored.audioRoute?.owner { anchored.audioAnchor?.closedRoute(anchored.mediaRun) }
         let reason = routeFailed ? retiringRoute?.failureDescription : requestedReason
         if routeFailed, let retiringRoute {
             self.samples.sync {
@@ -1450,6 +1545,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         snapshot.cameraControl = nil; snapshot.cameraActive = nil; snapshot.cameraPending = false
         setSampleDelivery(false)
         if session.isRunning { session.stopRunning() }
+        if let anchored = audioAnchorRun { anchored.audioAnchor?.stoppedInput(anchored.mediaRun, confirmed: !session.isRunning) }
         if let device = cameraDevice {
             session.beginConfiguration()
             if session.outputs.contains(where: { $0 === device.output }) { session.removeOutput(device.output) }
@@ -1489,6 +1585,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             run.admitting = false; run.privacyDriver?.stop(); run.privacyDriver = nil
             run.resumeCutover = nil
             run.rawSources.removeAll(); run.retiringRawSources.removeAll()
+            run.discardAudio = nil; run.retiringDiscardAudio = nil
             var flushFailed = self.admission.mediaHasFault(run.mediaRun)
             do { try run.audio.finish() } catch {
                 flushFailed = true
@@ -1499,7 +1596,13 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
             self.recordingAdmission.closing(run.recordingTicket)
             let state = RecordingRunStop(run: run, rotationToken: rotationToken, rotation: child)
-            self.control.async { self.runStop = state }
+            self.control.async {
+                self.runStop = state
+                if self.audioAnchorRun === run {
+                    run.audioAnchor?.closedCallbacks(run.mediaRun)
+                    self.deactivateAudioAnchor(run)
+                }
+            }
             // All final native units AND EOF timing first pass the worker FIFO.
             // Its one barrier then starts file and network cleanup independently.
             if flushFailed { run.recorder.markIncomplete(CaptureFailure(message: "Native capture did not complete cleanly")) }
@@ -1514,13 +1617,29 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             } })
         }
     }
+    /// Called after stopped capture I/O and the actual samples/native codec
+    /// barrier. File and transport cleanup have independent queues/receipts.
+    private func deactivateAudioAnchor(_ run: CaptureRun) {
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            run.audioAnchor?.deactivated(run.mediaRun, outcome: .confirmed)
+        } catch {
+            let native = error as NSError
+            // Apple AVAudioSession.h: since iOS8 this exact deactivation error
+            // still means inactive. It never proves input/callback/route close.
+            let inactive = native.domain == NSOSStatusErrorDomain && native.code == AVAudioSession.ErrorCode.isBusy.rawValue
+            run.audioAnchor?.deactivated(run.mediaRun, outcome: inactive ? .inactiveWithBusy : .unknown)
+            stopReason = inactive ? "Audio session deactivated with an I/O lifecycle fault." : "Audio-session deactivation is unconfirmed; Prepare is blocked."
+        }
+    }
     private func finishRunStopIfReady(_ state: RecordingRunStop) {
         guard runStop === state, !state.completed, let recording = state.recording, let publishingResult = state.publishing else { return }
         state.completed = true; stopping = false
         let publishingClean: Bool
         if case .success = publishingResult { publishingClean = ingress.destination?.cleanupComplete != false }
         else { publishingClean = false }
-        let clean = recording.cleanupComplete && publishingClean && !recordingAdmission.hasOwner
+        let anchorClean = state.run.audioAnchor?.cleanupComplete ?? true
+        let clean = recording.cleanupComplete && publishingClean && !recordingAdmission.hasOwner && anchorClean
         if clean {
             admission.mediaRunClosed(state.run.mediaRun)
             destinationLock.lock()
@@ -1528,11 +1647,13 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             destinationLock.unlock()
         }
         if !publishingClean { stopReason = "Publisher cleanup unconfirmed; automatic restart blocked." }
+        if !anchorClean { stopReason = "Native microphone cleanup unconfirmed; Prepare is blocked." }
         snapshot.phase = stopReason == nil ? "Stopped" : "Interrupted"
         if !recording.cleanupComplete { snapshot.detail = "Recording cleanup unconfirmed; Prepare is blocked." }
         else if recording.finalised { snapshot.detail = stopReason ?? "Recording finalised. It has not been independently decoded." }
         else { snapshot.detail = "Recording is incomplete. The private original was retained for inspection." }
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        if state.run.audioAnchor == nil { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
+        if anchorClean, audioAnchorRun === state.run { audioAnchorRun = nil }
         if clean, recording.finalised, recordingFailureDescription == nil,
            let token = state.rotationToken, let child = state.rotation,
            admission.permitsRotation(child), orientationPlan.pending == token,
@@ -1647,6 +1768,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         snapshot.recordingIOBusy = recordingAdmission.isWorking || storageCheckPending
         snapshot.stopControl = admission.currentPreparation.map { AudioShowStopControl(preparation: $0, admission: admission) }
         snapshot.privacy = admission.privacyView
+        snapshot.standbyMicrophoneActive = audioAnchorRun?.audioAnchor?.standbyInputActive == true
         let value = snapshot
         DispatchQueue.main.async { UIApplication.shared.isIdleTimerDisabled = value.running; self.onChange?(value) }
     }

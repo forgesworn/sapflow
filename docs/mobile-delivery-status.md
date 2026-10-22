@@ -22,7 +22,7 @@ recovery-safe writer or journal is required before catalogue recovery can be
 qualified. Generated media and child processes were removed; source and scalar
 evidence remain under `target/privacy-standby/interrupted-recording-spike/`.
 
-Privacy standby is the next source packet. Its
+Privacy standby is integrated and remains under qualification. Its
 [contract](privacy-standby.md) requires synchronous raw-input fencing,
 independently paced replacement picture and silence, explicit Resume and
 matching recording. Its app integration remains under qualification. Cold AAC
@@ -94,9 +94,21 @@ The final independent review receipt is
 `target/privacy-standby/ios-final-composition-independent-review.local.json`.
 No transport call or absent handshake substitutes for a local queue receipt.
 
-iOS background and locked-screen synthetic execution remains a release blocker:
-the timer has no proven operating-system execution anchor after capture parks.
-The paired iPhone is currently disconnected. No phone or Pixel capture was
+The reviewed [iOS audio-only background packet](ios-background-audio.md)
+retains the exact opted-in show's native microphone input and pinned route in
+Standby. Its discard delegate reads no sample data; generated silence retains
+an independent cadence and fresh AAC generation. The UI discloses the active
+microphone before Start and in Standby. An exact-run native route-fault receipt
+fences media before queued diagnostics, and actual input, callback, route and
+audio-session receipts gate successor capture independently of file and network
+cleanup. The final candidate passes 255 focused tests, including eleven anchor
+and three new route regressions, with warnings as errors. Its 63-source iOS 16
+API check and independent source review pass. Evidence remains under
+`target/privacy-standby/ios-background-audio-v3/` and
+`target/privacy-standby/ios-background-audio-independent-review.local.json`.
+Physical locked-screen cadence, interruption, power and sustained operation
+remain release gates. The paired iPhone is reachable but currently reports a
+required passcode; Sapflow was not running. No phone or Pixel capture was
 changed during these checks.
 
 The SDK now supports independently closing publishing or recording admission.
@@ -126,10 +138,13 @@ as errors and zero warnings. Built required-reason resources and creator
 configuration verify in every app; the test bundle contains the byte-identical
 manual-profile corpus. Its two publisher worker tests now use real admission,
 an actual empty recorder and joined cleanup; 86 packaged host tests pass.
-The final 62-source iOS 16 API check also passes against the current packaged
+The final 63-source iOS 16 API check also passes against the current packaged
 libraries. Evidence is retained under
-`target/privacy-standby/ios-composition-app-v2/` and
-`target/privacy-standby/ios-runtime-v2/final-context-addendum.local.json`.
+`target/privacy-standby/ios-composition-app-v3/` and
+`target/privacy-standby/ios-background-audio-v3/`.
+The preceding worker test receipt remains under
+`target/privacy-standby/ios-runtime-v2/final-context-addendum.local.json`;
+the background-audio packet does not change its worker or recorder sources.
 These apps are unsigned and the device test bundle was compiled, not executed
 on a phone. No app or SDK package was published.
 

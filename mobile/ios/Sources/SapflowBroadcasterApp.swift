@@ -395,6 +395,7 @@ struct BroadcasterView: View {
                 if !model.captureProfile.hasVideo {
                     Toggle("Continue started audio with the screen locked", isOn: Binding(get: { model.continueAudioInBackground }, set: { model.selectBackgroundAudio($0) }))
                         .disabled(!model.canChangeCaptureProfile).accessibilityIdentifier("capture.backgroundAudio")
+                    Text("With this option, Standby sends silence while the microphone remains active for background streaming. The system microphone indicator may remain visible.").font(.caption)
                     Text("Only an audio show already recording can continue. Return to Sapflow to Stop and save; system recording controls are unavailable on this SDK. Calls, route faults and permission loss still interrupt capture. Background operation requires physical qualification.").font(.caption)
                 }
                 Picker("Capture mode and quality", selection: Binding(get: { model.captureProfile }, set: { model.selectCaptureProfile($0) })) {
@@ -430,6 +431,10 @@ struct BroadcasterView: View {
                             .accessibilityIdentifier("capture.resume")
                     }.buttonStyle(.bordered)
                     Text(privacyText(privacy)).font(.caption)
+                    if model.snapshot.standbyMicrophoneActive {
+                        Text("Standby sends silence; microphone remains active for background streaming.").font(.caption)
+                            .accessibilityIdentifier("capture.standbyMicrophoneActive")
+                    }
                 }
                 let stopControl = model.snapshot.stopControl
                 Button("Stop and save") { if let stopControl { model.stop(stopControl) } }

@@ -49,6 +49,8 @@ final class AudioInputRouting {
     private var failed = false
     private var failureText = "Microphone route changed, disconnected or is unsupported"
     private var notification: NSObjectProtocol?
+    private var nativeFailure: (run: CaptureAdmission.MediaRun, notify: () -> Void)?
+    private var nativeFailureNotified = false
 
     init(owner: AudioInputOwner, pin: AudioInputPin, available: [AudioInputOption],
          read: @escaping () -> String?, failure: @escaping () -> Void, changed: @escaping (String) -> Void,
@@ -116,7 +118,7 @@ final class AudioInputRouting {
         // Reservation closes PCM admission before the first event-lock release.
         let reservation = reserveLocked(); let notifyFailure = failed
         lock.unlock()
-        if notifyFailure { failure() }
+        if notifyFailure { reportFailure() }
         if let reservation { _ = perform(reservation) }
     }
     @discardableResult func verify() -> Bool {
@@ -124,7 +126,7 @@ final class AudioInputRouting {
         let wasFailed = failed
         let reservation = reserveLocked(); let notifyFailure = failed && !wasFailed
         lock.unlock()
-        if notifyFailure { failure() }
+        if notifyFailure { reportFailure() }
         guard let reservation else { return false }
         return perform(reservation)
     }
@@ -140,14 +142,14 @@ final class AudioInputRouting {
             if initial && pendingRoute {
                 pendingRoute = false
                 if pass == 0 { lock.unlock(); continue }
-                failLocked(); lock.unlock(); failure(); return false
+                failLocked(); lock.unlock(); reportFailure(); return false
             }
             let settlement = now()
             if let started = oldestWaitStart, settlement < started || settlement - started >= 250_000_000 {
-                failLocked("Microphone route verification exceeded 250 ms"); lock.unlock(); failure(); return false
+                failLocked("Microphone route verification exceeded 250 ms"); lock.unlock(); reportFailure(); return false
             }
             guard let actual, policy.observe(owner: owner, id: actual) == .accepted, pin.accept(actual) else {
-                failLocked(); lock.unlock(); failure(); return false
+                failLocked(); lock.unlock(); reportFailure(); return false
             }
             verified = true; armed = true; activating = false; checking = false
             settledAt = settlement
@@ -156,6 +158,27 @@ final class AudioInputRouting {
             return true
         }
         return false
+    }
+    /// One actual native route may bind only one exact run. If a native event
+    /// failed before binding, notify synchronously now; callbacks never look up
+    /// a mutable current Engine run. No callback runs under the route lock.
+    @discardableResult func observeNativeFailure(run: CaptureAdmission.MediaRun, _ observer: @escaping () -> Void) -> Bool {
+        lock.lock()
+        guard !closed, nativeFailure == nil || nativeFailure?.run == run else { lock.unlock(); return false }
+        if nativeFailure == nil { nativeFailure = (run, observer) }
+        let report = failed && !nativeFailureNotified
+        if report { nativeFailureNotified = true }
+        let callback = report ? nativeFailure?.notify : nil
+        lock.unlock(); callback?(); return true
+    }
+    private func reportFailure() {
+        lock.lock()
+        let report = failed && !nativeFailureNotified && nativeFailure != nil
+        if report { nativeFailureNotified = true }
+        let callback = report ? nativeFailure?.notify : nil
+        lock.unlock()
+        callback?() // Exact Admission scalar fault precedes the queued diagnostic.
+        failure()
     }
     var failureDescription: String { lock.lock(); defer { lock.unlock() }; return failureText }
     private func failLocked(_ reason: String? = nil) {
@@ -175,7 +198,7 @@ final class AudioInputRouting {
             lock.unlock(); return allowed
         }
         guard activeWaiters < 1 else {
-            failLocked("Microphone route wait capacity exceeded"); lock.unlock(); failure(); return false
+            failLocked("Microphone route wait capacity exceeded"); lock.unlock(); reportFailure(); return false
         }
         activeWaiters += 1
         let started = now()
@@ -197,7 +220,7 @@ final class AudioInputRouting {
         activeWaiters -= 1
         if activeWaiters == 0 { oldestWaitStart = nil }
         lock.unlock()
-        if timeoutFailure { failure() }
+        if timeoutFailure { reportFailure() }
         return allowed
     }
     /// Stop consumes a fault already observed by the native callback even when

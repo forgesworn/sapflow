@@ -240,6 +240,47 @@ final class AudioInputRoutingTests: XCTestCase {
         resumeWaiter.signal(); XCTAssertEqual(mediaDone.wait(timeout: .now() + 2), .success)
     }
 
+    private func mediaOwner() throws -> (CaptureAdmission, CaptureAdmission.MediaRun, CaptureAdmission.MediaToken) {
+        let admission = CaptureAdmission()
+        let prep = try XCTUnwrap(admission.reservePreparation(profile: .audioOnly48kMono))
+        XCTAssertTrue(admission.attached(prep)); XCTAssertTrue(admission.beginPermissions(prep)); XCTAssertTrue(admission.prepared(prep))
+        let start = try XCTUnwrap(admission.reserveStart(prep))
+        let run = try XCTUnwrap(admission.reserveMediaRun(start))
+        XCTAssertTrue(admission.commitMediaRun(run, start: start, nowNs: 0, broadcasting: false))
+        return (admission, run, try XCTUnwrap(admission.mediaToken(run, kind: .raw)))
+    }
+    func testActualRouteFaultFencesBoundRunBeforeWithheldDiagnostic() throws {
+        let (admission, run, token) = try mediaOwner(); var actual: String? = "a"
+        var queuedDiagnostic: (() -> Void)?; var delivered = false
+        let route = try AudioInputRouting(owner: .init(preparation: run.preparation, epoch: 1), pin: AudioInputPin(requestedID: nil), available: [a], read: { actual }, failure: { queuedDiagnostic = { delivered = true } }, changed: { _ in })
+        XCTAssertTrue(route.verify())
+        XCTAssertTrue(route.observeNativeFailure(run: run) { _ = admission.nativeFault(token) })
+        actual = nil; route.routeChanged()
+        XCTAssertFalse(delivered); XCTAssertNotNil(queuedDiagnostic)
+        XCTAssertTrue(admission.mediaHasFault(run)); XCTAssertEqual(admission.allowsInput(token), .failed)
+        queuedDiagnostic?(); XCTAssertTrue(delivered)
+        XCTAssertTrue(route.close())
+    }
+    func testFaultBeforeNativeBindingReplaysOnceButClosedOldRouteCannotBindSuccessor() throws {
+        let (admission, run, token) = try mediaOwner(); var actual: String? = "a", receipts = 0
+        let route = try AudioInputRouting(owner: .init(preparation: run.preparation, epoch: 1), pin: AudioInputPin(requestedID: nil), available: [a], read: { actual }, failure: {}, changed: { _ in })
+        XCTAssertTrue(route.verify()); actual = nil; route.routeChanged()
+        XCTAssertTrue(route.observeNativeFailure(run: run) { receipts += 1; _ = admission.nativeFault(token) })
+        XCTAssertTrue(route.observeNativeFailure(run: run) { receipts += 100 })
+        XCTAssertEqual(receipts, 1); XCTAssertTrue(admission.mediaHasFault(run))
+        _ = route.close()
+        let (other, next, raw) = try mediaOwner()
+        XCTAssertFalse(route.observeNativeFailure(run: next) { _ = other.nativeFault(raw) })
+        route.routeChanged(); XCTAssertFalse(other.mediaHasFault(next))
+    }
+    func testIntentionalNativeRouteCloseWinsBeforeLateEventWithoutFaultingRun() throws {
+        let (admission, run, token) = try mediaOwner(); var actual: String? = "a", faults = 0
+        let route = try AudioInputRouting(owner: .init(preparation: run.preparation, epoch: 1), pin: AudioInputPin(requestedID: nil), available: [a], read: { actual }, failure: { faults += 1 }, changed: { _ in })
+        XCTAssertTrue(route.verify()); XCTAssertTrue(route.observeNativeFailure(run: run) { _ = admission.nativeFault(token) })
+        XCTAssertFalse(route.close()); actual = nil; route.routeChanged()
+        XCTAssertEqual(faults, 0); XCTAssertFalse(admission.mediaHasFault(run))
+    }
+
 }
 
 private final class RoutingReadCounter {
@@ -274,4 +315,5 @@ private final class RoutingClock {
         if notify { waitRegistered.signal() }
         return snapshot
     }
+
 }

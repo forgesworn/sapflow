@@ -26,6 +26,7 @@ sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/Cam
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/CapturePrivacyAdmissionTests.swift" >> "$sapflow_scratch/main.swift"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/CapturePrivacyDriverTests.swift" >> "$sapflow_scratch/main.swift"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/CapturePCMFormatTests.swift" >> "$sapflow_scratch/main.swift"
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/CaptureAudioAnchorTests.swift" >> "$sapflow_scratch/main.swift"
 cat >> "$sapflow_scratch/main.swift" <<'SWIFT'
 let suite = XCTestSuite(name: "Native broadcaster invariants")
 suite.addTest(EncodedWorkBudgetTests.defaultTestSuite)
@@ -46,12 +47,13 @@ suite.addTest(CameraControlPolicyTests.defaultTestSuite)
 suite.addTest(CapturePrivacyAdmissionTests.defaultTestSuite)
 suite.addTest(CapturePrivacyDriverTests.defaultTestSuite)
 suite.addTest(CapturePCMFormatTests.defaultTestSuite)
+suite.addTest(CaptureAudioAnchorTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 241, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 255, result.hasSucceeded else { exit(1) }
 SWIFT
 swiftc -swift-version 5 -warnings-as-errors -module-cache-path "$sapflow_scratch/modules" -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
   -Xlinker -rpath -Xlinker "$sapflow_frameworks" \
   -Xlinker -rpath -Xlinker "$sapflow_testlibs" \
-  "$sapflow_root/mobile/ios/Sources/CameraControlPolicy.swift" "$sapflow_root/mobile/ios/Sources/CameraDeviceControls.swift" "$sapflow_root/mobile/ios/Sources/AudioShowLifecycle.swift" "$sapflow_root/mobile/ios/Sources/AudioShowControls.swift" "$sapflow_root/mobile/ios/Sources/PublishingTelemetry.swift" "$sapflow_root/mobile/ios/Sources/EncodedWorkBudget.swift" "$sapflow_root/mobile/ios/Sources/DestinationProfile.swift" "$sapflow_root/mobile/ios/Sources/SrtDestination.swift" "$sapflow_root/mobile/ios/Sources/NativeDeadlineTimer.swift" "$sapflow_root/mobile/ios/Sources/CaptureOrientation.swift" "$sapflow_root/mobile/ios/Sources/CaptureProfile.swift" "$sapflow_root/mobile/ios/Sources/ReconnectController.swift" "$sapflow_root/mobile/ios/Sources/AudioInputPolicy.swift" "$sapflow_root/mobile/ios/Sources/AudioInputRouting.swift" "$sapflow_root/mobile/ios/Sources/CaptureAdmission.swift" "$sapflow_root/mobile/ios/Sources/CapturePrivacyDriver.swift" "$sapflow_root/mobile/ios/Sources/CapturePCMFormat.swift" "$sapflow_root/mobile/ios/Sources/RecordingCaptureAdmission.swift" "$sapflow_root/mobile/ios/Sources/RecordingStorage.swift" "$sapflow_root/mobile/ios/Sources/BroadcasterDestinationSelection.swift" "$sapflow_scratch/main.swift" \
+  "$sapflow_root/mobile/ios/Sources/CameraControlPolicy.swift" "$sapflow_root/mobile/ios/Sources/CameraDeviceControls.swift" "$sapflow_root/mobile/ios/Sources/AudioShowLifecycle.swift" "$sapflow_root/mobile/ios/Sources/AudioShowControls.swift" "$sapflow_root/mobile/ios/Sources/PublishingTelemetry.swift" "$sapflow_root/mobile/ios/Sources/EncodedWorkBudget.swift" "$sapflow_root/mobile/ios/Sources/DestinationProfile.swift" "$sapflow_root/mobile/ios/Sources/SrtDestination.swift" "$sapflow_root/mobile/ios/Sources/NativeDeadlineTimer.swift" "$sapflow_root/mobile/ios/Sources/CaptureOrientation.swift" "$sapflow_root/mobile/ios/Sources/CaptureProfile.swift" "$sapflow_root/mobile/ios/Sources/ReconnectController.swift" "$sapflow_root/mobile/ios/Sources/AudioInputPolicy.swift" "$sapflow_root/mobile/ios/Sources/AudioInputRouting.swift" "$sapflow_root/mobile/ios/Sources/CaptureAdmission.swift" "$sapflow_root/mobile/ios/Sources/CapturePrivacyDriver.swift" "$sapflow_root/mobile/ios/Sources/CapturePCMFormat.swift" "$sapflow_root/mobile/ios/Sources/CaptureAudioAnchor.swift" "$sapflow_root/mobile/ios/Sources/RecordingCaptureAdmission.swift" "$sapflow_root/mobile/ios/Sources/RecordingStorage.swift" "$sapflow_root/mobile/ios/Sources/BroadcasterDestinationSelection.swift" "$sapflow_scratch/main.swift" \
   -o "$sapflow_scratch/budget-tests"
 "$sapflow_scratch/budget-tests"
