@@ -1,0 +1,10 @@
+| mediamtx | binary MB | idle RSS MB | one stream RSS MB | one stream CPU % |
+| mediamtx | 52.2 | 32.5 | 68.2 | 1.3 |
+--- mediamtx, 750 viewers: server CPU 160.1%  peak RSS 276.7 MB
+viewers 750  measured 60 s after a 10 s ramp
+requests 588248  errors 0  received 31942.4 MB
+responses HTTP/1.1 588248  connections 3058 (4.08 per viewer)
+playlist  n=49145  p50 13.4 ms  p95 26.8 ms  p99 32.8 ms  max 45.2 ms
+segment   n=49145  p50 8.0 ms  p95 11.5 ms  p99 15.3 ms  max 36.2 ms
+playlist update fan-out (first to last viewer) updates=351  p50 36.0 ms  p95 45.0 ms  max 51.1 ms
+part fan-out (first to last viewer) parts=351 reach 696/750  p50 36.0 ms  p95 45.0 ms  max 51.1 ms
