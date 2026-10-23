@@ -145,9 +145,12 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   recording begins. v4v still hears `unpublish` at the drop (its stage
   reads "reconnecting") and `publish` on the return; `recordSegmentComplete`
   comes once, when the stream finally ends. Keep `SAPFLOW_RECONNECT_GRACE`
-  equal to `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`. A publisher whose
-  socket is still open holds the path (`409`/`BadName`) until the timeouts
-  above notice it has gone.
+  equal to `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`. An encoder that
+  changes network reconnects before its old connection has timed out: the
+  new connection with the same credentials takes the stream over at once,
+  as mediamtx's `overridePublisher` (its default) does, and the old one is
+  closed on its next packet without sending `unpublish`. Scoped publish
+  sessions keep one owner and refuse a second (`409`).
 
 What players should do at a break (Safari on macOS seen to carry on
 through two Larix Wi-Fi drops of 3.1 and 4.4 s on 2026-10-21, judged by

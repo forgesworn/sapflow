@@ -448,17 +448,55 @@ impl Registry {
     /// Claims a path for a new publisher, with its generation. `None` if a
     /// publisher is connected to it. A stream held for a reconnect is taken
     /// over: same playlist, same recording.
+    #[cfg(test)]
     pub fn claim(
         &self,
         path: &StreamPath,
         cfg: MuxerConfig,
         kind: SourceKind,
     ) -> Option<(Arc<LiveStream>, u64, Claim)> {
+        self.claim_configured(path, cfg, kind, false, |_, _| {})
+    }
+
+    /// As [`Registry::claim`], but a stream with a publisher attached is taken
+    /// over rather than refused, as mediamtx's `overridePublisher` does. An
+    /// encoder that changes network reconnects before its old connection
+    /// times out; refusing it would stall viewers until the timeout. The old
+    /// run is closed as a drop would close it, and the old connection's next
+    /// push is refused ([`crate::publish::PushError::Superseded`]).
+    #[cfg(test)]
+    pub fn claim_or_take_over(
+        &self,
+        path: &StreamPath,
+        cfg: MuxerConfig,
+        kind: SourceKind,
+    ) -> Option<(Arc<LiveStream>, u64, Claim)> {
+        self.claim_configured(path, cfg, kind, true, |_, _| {})
+    }
+
+    /// Configure the accepted connection before another claim can observe it.
+    /// The cold setup runs under map -> session ownership; it must not re-enter
+    /// the registry or perform file IO. Ingest never calls this callback.
+    pub fn claim_configured(
+        &self,
+        path: &StreamPath,
+        cfg: MuxerConfig,
+        kind: SourceKind,
+        take_over: bool,
+        configure: impl FnOnce(&mut Session, Claim),
+    ) -> Option<(Arc<LiveStream>, u64, Claim)> {
         let mut map = self.map();
         if let Some(stream) = map.get(path.event_id()).cloned() {
             let mut session = stream.session();
             if session.attached {
-                return None;
+                if !take_over {
+                    return None;
+                }
+                // Preserve accepted terminal parser input and recorder loss
+                // attribution before replacing the source under this owner.
+                stream.finish_connection(&mut session);
+                session.attached = false;
+                tracing::info!(path = %path.as_path(), "publisher replaced by a new connection");
             }
             // A delayed expiry task cannot extend the original outage window.
             if session
@@ -477,10 +515,13 @@ impl Registry {
                 // floor, and cannot be completed by this connection's first IDR.
                 session.fresh_part_floor = muxer.as_ref().map_or(0, Muxer::next_part_id);
                 st.ingest = Source::resume(kind, stream.cfg, muxer);
+                drop(st);
+                configure(&mut session, Claim::Resumed);
                 return Some((stream.clone(), session.generation, Claim::Resumed));
             }
         }
         let stream = Arc::new(LiveStream::new(path.clone(), cfg, kind));
+        configure(&mut stream.session(), Claim::Fresh);
         map.insert(path.event_id().to_owned(), stream.clone());
         Some((stream, 0, Claim::Fresh))
     }
@@ -671,6 +712,110 @@ mod tests {
         assert!(again.lock().closed);
         assert!(reg.get("event-a").is_none());
         assert_eq!(claim(&reg, &p).expect("free").2, Claim::Fresh);
+    }
+
+    #[test]
+    fn a_live_stream_is_taken_over_only_when_asked() {
+        let reg = Registry::default();
+        let p = StreamPath::parse("live/event-a").expect("path");
+        let (first, g1, _) = claim(&reg, &p).expect("free");
+        assert!(claim(&reg, &p).is_none(), "plain claim still refused");
+        let (again, g2, c) = reg
+            .claim_or_take_over(&p, MuxerConfig::default(), SourceKind::Ts)
+            .expect("taken over");
+        assert_eq!(c, Claim::Resumed);
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(g2 > g1);
+        assert!(!first.session().owns_connection(g1));
+        assert!(again.session().owns_connection(g2));
+        // The replaced connection leaving later changes nothing.
+        assert!(!reg.detach(&first, g1, true));
+        assert!(!reg.expire(&first, g1));
+        assert!(!again.lock().closed);
+        assert!(again.session().owns_connection(g2));
+    }
+
+    #[tokio::test]
+    async fn recorder_setup_is_atomic_with_admission_before_a_real_takeover() {
+        use std::sync::mpsc;
+
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let path = StreamPath::parse("live/event-a").expect("path");
+        let factory = RecorderFactory::new(
+            fixture
+                .app
+                .config
+                .recordings
+                .as_ref()
+                .expect("recording root"),
+            &path,
+            fixture.app.callbacks.clone(),
+            0,
+        );
+        let registry = fixture.app.streams.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            registry
+                .claim_configured(
+                    &path,
+                    MuxerConfig::default(),
+                    SourceKind::Ts,
+                    true,
+                    |s, c| {
+                        assert_eq!(c, Claim::Fresh);
+                        entered_tx.send(()).expect("setup entered");
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("release setup");
+                        s.recorder_factory = Some(factory);
+                        s.recorder = s.recorder_factory.as_ref().map(RecorderFactory::start);
+                    },
+                )
+                .expect("first claim")
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("held setup");
+        assert!(matches!(
+            fixture.app.streams.streams.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        let app = fixture.app.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let _entered = runtime.enter();
+            attempt_tx.send(()).expect("takeover attempted");
+            let request = sapflow_core::PublishRequest::parse_srt_stream_id(
+                "publish:live/event-a:fixture:fixture",
+            )
+            .expect("request");
+            let publication = crate::publish::Publication::begin(
+                &app,
+                &request,
+                SourceKind::Ts,
+                "127.0.0.1".parse().expect("loopback"),
+            )
+            .expect("real takeover");
+            done_tx.send(()).expect("takeover completed");
+            publication
+        });
+        attempt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attempt");
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release_tx.send(()).expect("finish first setup");
+        let (stream, generation, _) = first.join().expect("first thread");
+        let mut publication = second.join().expect("second thread");
+        assert!(!stream.session().owns_connection(generation));
+        assert!(stream.session().recorder.is_some());
+        crate::publish::loss_tests::Fixture::feed(&mut publication);
+        publication.end();
+        fixture.completion("finalised").await;
+        assert_eq!(fixture.scope.observations.counts().recordings_finalised, 1);
+        assert_eq!(fixture.scope.observations.counts().recordings_incomplete, 0);
     }
 }
 

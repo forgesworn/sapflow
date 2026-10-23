@@ -239,6 +239,45 @@ async fn held_start_only_tail_resumes_without_old_parts_becoming_fresh_or_duplic
 }
 
 #[tokio::test]
+async fn live_takeover_drains_accepted_tail_before_replacing_the_parser() {
+    let mut fixture = Fixture::new();
+    let mut old = fixture.begin();
+    feed(&mut old, &one(ADTS48));
+    assert!(old.stream.lock().ingest.muxer().is_none());
+    let stream = old.stream.clone();
+
+    // The old connection has not dropped. Its accepted start-only PES must
+    // become a sealed part before the new parser takes the same stream over.
+    let mut next = fixture.begin();
+    assert!(Arc::ptr_eq(&stream, &next.stream));
+    assert!(stream.lock().ingest.muxer().is_some());
+    assert!(
+        stream
+            .connection_media(next.generation)
+            .expect("new attached owner")
+            .fresh_media
+            .is_none(),
+        "the drained old tail cannot confirm the new connection"
+    );
+    assert!(matches!(
+        old.push(|_, _| panic!("superseded parser must not run")),
+        Err(PushError::Superseded)
+    ));
+    feed(&mut next, &one(ADTS48));
+    old.end();
+    assert!(stream.connection_media(next.generation).is_some());
+    next.end();
+    let body = completion(&mut fixture, "finalised").await;
+    assert_eq!(
+        recording_samples(&body),
+        2,
+        "each accepted tail exactly once"
+    );
+    assert_eq!(fixture.scope.observations.counts().recordings_finalised, 1);
+    assert_eq!(fixture.scope.observations.counts().recordings_incomplete, 0);
+}
+
+#[tokio::test]
 async fn terminal_truncation_and_semantic_errors_taint_only_the_accepted_prefix() {
     for failure in ["pes", "ts", "asc"] {
         let mut fixture = Fixture::new();
