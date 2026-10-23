@@ -279,13 +279,15 @@ qualification and the aggregate two-second loss bound remain open.
 
 ## iOS submitted-input finalisation
 
-The concrete owner can now finish only the SDK inputs it actually accepted.
+The `finishStoredInputs()` entry point finishes only the SDK inputs it actually
+accepted.
 It retains the latest successfully installed real issued token, captures actual
 finish/drain/statistics before native cleanup, checks exact checkpoint/header
 and accepted-sample coverage, then queries shared presentation duration once.
 There is no caller-supplied upstream-complete flag or fabricated producer proof.
-Every current result is scoped to submitted SDK inputs, with application admission
-unknown and an explicitly incomplete catalogue receipt, even at complete AAC EOF.
+Every result from this entry point is scoped to submitted SDK inputs, with
+application admission unknown and an explicitly incomplete catalogue receipt,
+even at complete AAC EOF.
 
 The same append owner, catalogue lease and root flock remain held through actual
 append descriptor close, anchored reopen of the same file, fixed-length offset-zero
@@ -334,8 +336,10 @@ remain unchanged. Evidence is under
 `target/privacy-standby/ios-native-aac-full-receipts-gates-v1/` and the source-bound
 `target/ios-audio-only-fixture/` and `target/ios-audio-standby-fixture/` runs.
 
-The real app producer/ingress/recording closure chain, synchronous known-loss
-accounting, SDK recorder migration and physical Stop qualification remain open.
+At the full-receipt milestone, the real app producer/ingress/recording closure
+chain and synchronous known-loss accounting remained open. The later concrete
+producer closure and its completed generated gates are described below.
+Physical capture/Stop qualification remains open.
 The submitted-input result cannot substitute for those barriers or the aggregate
 two-second loss requirement.
 
@@ -353,14 +357,15 @@ media queue, encoded payload copy or per-unit validation.
 The adapter uses the real SDK's relative epoch-zero policy in the existing
 capture media clock, with 4 MiB fragments and a 500 ms fragment interval. These
 settings do not establish the aggregate two-second loss bound. Actual native
-full-generation AAC receipts are forwarded verbatim. Every SDK completion,
-including a successful complete SDK outcome and checked header rewrite, still
-returns a nil completion file URL, an incomplete app receipt and application
-admission unknown. After checked closure, the recording remains discoverable
+full-generation AAC receipts are forwarded verbatim. At that first composition,
+every SDK completion, including a successful complete SDK outcome and checked
+header rewrite, returned a nil completion file URL, an incomplete app receipt and
+application admission unknown. After checked closure, the recording remains discoverable
 through the existing catalogue as an incomplete entry. Only actual
 compound-owner cleanup releases its retained storage
-ownership. Packet B producer closure authority and finalised app admission are
-not implemented. Existing Stop/cancel and recorder/transport cleanup joins remain.
+ownership. That first composition does not implement producer closure authority
+or finalised app admission. Its original Stop/cancel and recorder/transport
+cleanup joins remain the compatibility baseline.
 
 The cold capacity query uses the same append owner's child/root lease and
 compound busy guard, checking actual media/end state, owned slots and absent
@@ -372,8 +377,8 @@ metadata-close handling. The strict 200 MiB plus
 256 KiB floor remains. This check is not a second reserve owner or a fabricated
 storage reservation.
 
-All six current platform commands pass: 89 filesystem tests, 38 library tests,
-16 real-SDK checkpoint-owner tests, both generated modules and the strict iOS 16
+At that milestone, all six platform commands passed: 89 filesystem tests,
+38 library tests, 16 real-SDK checkpoint-owner tests, both generated modules and the strict iOS 16
 API check of all 69 production source files. Compiler warnings are errors.
 Independent outcome review verifies the source/package bindings, six logs and
 retained cleanup receipts. Evidence is under
@@ -399,8 +404,8 @@ producer closure. Source and scalar evidence are under
 Independent platform and native outcome review is clear, including all current
 input, witness and command-log hashes.
 
-Both current legacy regression commands also pass: 86 observed-publisher tests
-and seven original native stored-payload/presentation controls, retaining both
+Both legacy regression commands at that milestone passed: 86 observed-publisher
+tests and seven original native stored-payload/presentation controls, retaining both
 expected historical negatives and their original assertions. Evidence is under
 `target/privacy-standby/ios-recorder-adoption-legacy-gates-v1/`. Independent
 outcome review is clear. Full Debug, Qualification and Release app builds also
@@ -416,10 +421,141 @@ execution, signing, publication, phone installation or physical capture is
 established.
 
 The earlier numerical presentation contract, strict historical failures and
-all numerical thresholds are unchanged. SDK default adoption, finalised app
-receipts, aggregate two-second loss, durable orphan recovery, power-loss storage
-behaviour and physical acceptance remain open. No Rust SDK, dependency or CI
-qualification change is part of this composition.
+all numerical thresholds are unchanged. That first composition did not supply
+producer-finalised app receipts; the later closure below has separate evidence.
+SDK default adoption, aggregate two-second loss, durable orphan recovery,
+power-loss storage behaviour and physical acceptance remain open. No Rust SDK,
+dependency or CI qualification change is part of that composition.
+
+## iOS producer and ingress finalisation
+
+The producer closure source is locally committed as `135b3cb`. It changes eight
+production Swift paths, including the new `CaptureRecordingProducer` in the
+actual `CaptureRun` composition. On the control owner, its concrete `stopInput()`
+detaches the real capture-output delegates and waits for the actual session to
+stop. The existing samples queue then joins already queued callbacks. The same
+concrete owner calls the actual `NativeAudioEncoder.finish()` and
+`HardwareVideoEncoder.finishChecked()` methods, including native EOF and video
+callback quiescence. An unclosed native input, failed codec close, uncommitted
+Start or held startup/Resume media cannot grant a clean capture closure.
+
+The privately constructed terminal closure binds the exact media run, committed
+Start, actual recording-admission owner and ticket, recorder, ingress worker and
+native producer objects. It advances once through the existing ingress FIFO,
+where callback attempts recorded before filtering must match successful
+recording forwards. Audio timing events share that conservation check. A native
+output or timing event arriving after this finalisation starts synchronously
+faults that exact run rather than silently becoming ordinary Stop cancellation.
+The original legacy cancellation behaviour is retained without this capability.
+
+Reported native `didDrop` loss is synchronously attributed before deferred UI
+work. A callback queued while live may arrive after Stop, privacy revision or
+camera replacement; its interval cannot be proved outside admitted capture, so
+it conservatively keeps that segment incomplete. Deliberate privacy discard
+delegates never report these drops. An old callback cannot fault a successor.
+Recording-only failure has a separate synchronous sticky latch. At the actual
+fixed-header commit decision, that latch and the run's native-loss state are
+checked under their scalar locks, independently of publishing success.
+
+The SDK/file compound owner still verifies actual complete native AAC EOF,
+installed checkpoint/header bytes, drained native stats, exact accepted-unit
+counts and current file ownership. Only the concrete capture closure can
+upgrade application admission to `completeCapture` at the same installed
+frontier. The trusted catalogue outcome hook classifies storage; it does not
+prove native capture itself. Actual receipt/metadata closure and lease release
+remain necessary before reporting completion. A finalised file URL is available
+only after that checked complete closure. The old `finishStoredInputs()` entry
+point remains explicitly incomplete with admission unknown.
+
+All seven current platform commands pass: 261 budget/admission tests, including
+six new ownership/loss controls, 89 filesystem tests, 38 library tests, 16
+real-SDK checkpoint-owner tests, both generated modules and the strict iOS 16
+API check across all 70 production Swift sources. All 275 recorded inputs remain
+unchanged. The source-only review and independent completed outcome audit are
+clear. The module log retains Xcode filesystem-event/cache fallback diagnostics;
+the module command exits successfully with no Swift warning or error.
+
+The actual native gate passes its five original incomplete stored-input controls
+and all ten producer controls through thirteen commands. The four original AAC
+payload probes still compare exact stored packet sizes and hashes with the native
+encoder's originals. The positive producer cases cover generated audio-only,
+ten-frame A/V and independent publishing failure. Each produces an actual
+finalised file, passes stream probing and independently decodes without errors;
+the A/V probe reads all ten submitted video frames. Seven negative controls
+remain incomplete: header-held native drop, recording-only loss, late encoded
+output, late timing, input not closed, wrong worker and a stale same-Start ticket.
+Normal Stop cancellation, repeated closure, unchanged bytes after duplicate
+finish and recorder closure before transport completion are checked.
+
+The first native attempt fails during AAC/H.264 codec discovery, including the
+original five controls. It is retained as `actual-v1`, with source and witness
+hashes unchanged and checked cleanup. The separately authorised `actual-v2` run
+uses macOS codec-service access and passes with the same source, SDK witnesses
+and oracle predicates. Its thirteen owned command groups stop and its generated
+media and scratch are removed. The earlier failure is not relabelled as a pass.
+
+Both legacy regression commands also pass: 86 observed-publisher tests and all
+seven original native stored-payload/presentation controls. Both expected
+historical bad-order/false-publishing-receipt failures and all original assertions
+remain intact. The two task-owned groups stop, new scratch is removed and the
+pre-existing ownership scratch is preserved. These legacy presentation results
+do not qualify the new SDK's presentation equivalence.
+
+Current Debug, Qualification and Release app builds pass through eleven commands
+with all 313 source/package inputs unchanged and zero compiler warnings or
+errors in each configuration. The three built privacy resources, creator
+configuration modes and manual-link schemes pass. The compiled Debug test bundle
+contains both exact corpora and all six new ownership/loss method symbols; it is
+not executed by this app gate. Actual unsigned-code-object readback passes for
+all three apps, with no `_CodeSignature` directory. The Debug loader is stable;
+its implementation dylib is separately bound to SHA-256
+`f11ba2d6a7e45013a37b8a35e943ab0a0988d2ba0d5668e8714274531f808813`.
+Task-owned working scratch is removed; shared DerivedData/caches are retained.
+
+Exact retained evidence is:
+
+- Source freeze, source commit and independent source review:
+  `target/privacy-standby/ios-recording-producer-closure-v1/author/manifest.json`,
+  `target/privacy-standby/ios-recording-producer-closure-v1/source-commit.local.json`
+  and
+  `target/privacy-standby/ios-recording-producer-closure-v1/review/independent-frozen-v1-review-receipt.local.json`.
+- Seven platform commands:
+  `target/privacy-standby/ios-recording-producer-closure-platform-v1/receipt.local.json`
+  and its sibling `independent-outcome-audit.local.json`.
+- Retained native discovery failure:
+  `target/privacy-standby/ios-recording-producer-closure-native-v1/actual-v1/receipt.local.json`
+  and its sibling `independent-failure-audit.local.json`.
+- Completed generated native gate:
+  `target/privacy-standby/ios-recording-producer-closure-native-v1/actual-v2/receipt.local.json`,
+  with `exact-payload-proofs.local.json`, `producer-finalisation-proofs.local.json`
+  and `independent-outcome-audit.local.json` in the same directory.
+- Legacy regressions:
+  `target/privacy-standby/ios-recording-producer-closure-legacy-v1/receipt.local.json`
+  and its sibling `independent-outcome-audit.local.json`; the actual ownership
+  child receipt is
+  `target/ios-output-ownership-fixture/20261023T095855Z-df5b56e6/receipt.local.json`.
+- Three app configurations:
+  `target/privacy-standby/ios-recording-producer-closure-app-v1/run-20261023T100048Z-de33b3d5/receipt.local.json`,
+  with `actual-product-signature-readback.local.json`,
+  `new-admission-test-symbol-readback.local.json` and
+  `independent-outcome-audit.local.json` in the same directory.
+
+All independent completed outcome reviews are clear. The source commit contains
+exactly the fifteen reviewed source/test/driver paths; the pre-commit gates keep
+their original `aa6fc765` HEAD, while the app gate binds the clean `135b3cb` commit.
+Earlier presentation, submitted-input and first-adoption evidence remains
+historical. The 2,875-byte numerical presentation contract and every original
+threshold are unchanged.
+
+The generated producer path uses actual native encoders and the same concrete
+close method as `CaptureEngine`, with an empty stopped capture session. It
+cannot establish camera permissions, real microphone/camera callback closure,
+physical Stop, power/thermal behaviour or creator acceptance. Legacy remains
+the product default. No extra queue, encoder, encoded payload copy or per-unit
+validation is introduced. Product/default adoption, orphan recovery, aggregate
+two-second source-presentation loss and new presentation equivalence remain
+open. No phone access, signing, installation, push or publication is part of
+this packet.
 
 ## Android AAC observation packet
 

@@ -23,7 +23,47 @@ remain ignored by the default workspace command. The unchanged parser's earlier
 Apple and four-ABI Android SDK packages pass their installed host consumers;
 Android native libraries also pass actual 16 KiB alignment checks.
 
-The iOS [first recorder adoption composition](recording-recovery.md#ios-first-recorder-adoption-composition)
+The iOS [producer and ingress finalisation](recording-recovery.md#ios-producer-and-ingress-finalisation)
+source is locally committed as `135b3cb`. A concrete native Stop path detaches
+capture delegates, stops the actual session, joins the samples FIFO and finishes
+the real audio/video encoders before ingress and recording closure. Its
+single-use authority binds the exact run, committed Start, recording ticket,
+recorder, worker and installed SDK frontier. Native drops and recording-only
+failures latch synchronously and are rechecked at receipt commit. Held startup
+or unfinished Resume media remains incomplete; ordinary Stop cancellation and
+publishing-only failure remain separate from recording loss.
+
+All seven platform commands pass: 261 budget/admission tests, 89 filesystem
+tests, 38 library tests, 16 real-SDK tests, two generated modules and the strict
+iOS 16 API check of all 70 production Swift files. The generated native gate
+passes its five original incomplete controls and ten producer controls through
+13 commands. Three generated files finalise and independently decode without
+errors, including all ten submitted A/V video frames. Seven negative producer
+controls remain incomplete. The first native attempt's codec-discovery failure
+is retained; a rerun with macOS codec-service access passes with identical
+source, SDK witnesses and oracles.
+
+Current legacy regressions pass 86 publisher tests and seven original native
+ownership controls, preserving both historical negatives. Full Debug,
+Qualification and Release app builds pass all eleven commands with 313 inputs
+unchanged, zero compiler warnings and zero errors. Built privacy/configuration
+and manual-link checks, both exact Debug corpora and the six new compiled test
+symbols pass. The Debug test bundle is compiled, not executed. Separate actual
+readback verifies all three app code objects are unsigned and binds the Debug
+implementation dylib separately from its loader. Independent source and all
+completed outcome reviews are clear; exact evidence paths are recorded in the
+linked finalisation section.
+
+The source commit changes eight production Swift files, including the new
+concrete producer owner. It reuses the existing queues, encoders and validated
+sample handles, with no extra media queue, encoder, encoded payload copy or
+per-unit validation. Legacy remains
+the product default. Physical capture/Stop, installed or default SDK adoption,
+crash recovery, presentation equivalence and the aggregate two-second loss bound
+remain open. No phone access, signing, installation, push or publication is part
+of this packet.
+
+The earlier iOS [first recorder adoption composition](recording-recovery.md#ios-first-recorder-adoption-composition)
 is locally committed as `928a616`. Legacy remains the default; an internal cold
 selection exposes the SDK adapter. It passes 89 actual host filesystem tests,
 38 library tests, 16 real-SDK tests and the strict iOS 16 API check across all
@@ -31,10 +71,10 @@ selection exposes the SDK adapter. It passes 89 actual host filesystem tests,
 commands. Five generated native adapter cases also pass, with four exact
 original-AAC payload probes. Their detailed input, prefix and refusal results
 are recorded below. These checks introduce no second encoder, media queue,
-encoded payload copy or per-unit validation. Every current SDK outcome still
+encoded payload copy or per-unit validation. Every SDK outcome at that milestone
 produces an incomplete app receipt with application admission unknown.
 
-The current legacy regression run passes 86 publisher tests and all seven
+That milestone's legacy regression run passes 86 publisher tests and all seven
 original native ownership controls while preserving both historical negative
 controls. Independent review of that completed outcome is clear. Full Debug,
 Qualification and Release app builds also pass, with signing disabled and all
@@ -44,8 +84,8 @@ tests; it has not executed on a phone. Separate product readback verifies all
 three app code objects are unsigned and binds the Debug implementation dylib
 as well as its launcher. Independent app outcome review is clear. The
 earlier submitted-input gate and its original test callback failure and repair
-remain retained. There is no producer-finalisation, default SDK switch,
-crash-recovery, aggregate-loss or physical acceptance claim.
+remain retained. Those receipts establish no producer-finalisation, default SDK
+switch, crash-recovery, aggregate-loss or physical acceptance claim.
 
 The optional [full native AAC receipt mode](recording-recovery.md#native-aac-generation-receipts)
 passes fourteen actual generated native cases and real SDK receipt acceptance,
