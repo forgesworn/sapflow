@@ -315,7 +315,9 @@ in every official build.
 ## Remaining work (2026-10-23)
 
 Where things stand after the trial preparation of 22 and 23 October, in the
-order to do them. Each item says what finishes it.
+order to do them. Each item says what finishes it. The
+[delivery plan](docs/delivery-plan.md) sequences them into phases with an
+owner, dependencies and a done-when for every task.
 
 ### 1. Broadcaster app reliability
 
