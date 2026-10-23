@@ -29,4 +29,22 @@ final class RecordingStorageTests: XCTestCase {
         XCTAssertEqual(long.payloadBytes, short.payloadBytes * 60)
         XCTAssertGreaterThan(long.requiredBytes, short.requiredBytes)
     }
+    func testCheckpointMetadataIsAnAdditional256KiBWithoutChangingLegacyBudget() throws {
+        for profile in CaptureIntent.allCases {
+            let base = try RecordingStorage.budget(profile: profile), checkpoint = try RecordingStorage.checkpointBudget(profile: profile)
+            XCTAssertEqual(checkpoint.requiredBytes, base.requiredBytes + 262_144)
+            XCTAssertEqual(checkpoint.payloadBytes, base.payloadBytes); XCTAssertEqual(checkpoint.horizonSeconds, base.horizonSeconds)
+            XCTAssertEqual(RecordingStorage.check(budget: checkpoint) { checkpoint.requiredBytes }.state, .available)
+            XCTAssertEqual(RecordingStorage.check(budget: checkpoint) { checkpoint.requiredBytes - 1 }.state, .low)
+            XCTAssertEqual(try RecordingStorage.budget(profile: profile), base)
+        }
+    }
+    func testCheckpointMetadataCheckedAdditionRefusesOnlyActualOverflow() throws {
+        let base = try RecordingStorage.budget(profile: .sd480p30, reserveBytes: 0)
+        let exactReserve = UInt64.max - base.requiredBytes - RecordingStorage.checkpointMetadataBytes
+        XCTAssertEqual(try RecordingStorage.checkpointBudget(profile: .sd480p30, reserveBytes: exactReserve).requiredBytes, UInt64.max)
+        XCTAssertThrowsError(try RecordingStorage.checkpointBudget(profile: .sd480p30, reserveBytes: exactReserve + 1))
+        XCTAssertThrowsError(try RecordingStorage.checkpointBudget(profile: .sd480p30, horizonSeconds: 0))
+        XCTAssertThrowsError(try RecordingStorage.checkpointBudget(profile: .fullHD1080p30, horizonSeconds: UInt64.max))
+    }
 }

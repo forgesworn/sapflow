@@ -26,6 +26,16 @@ enum RecordingStorage {
         guard !first, !second else { throw Failure.invalidBudget }
         return Budget(horizonSeconds: horizonSeconds, payloadBytes: payload, requiredBytes: required)
     }
+    static let checkpointMetadataBytes: UInt64 = 256 * 1024
+    /// Additional bounded slot/temp/receipt headroom. Existing budget stays
+    /// unchanged for the legacy AVAssetWriter path.
+    static func checkpointBudget(profile: CaptureIntent, horizonSeconds: UInt64 = 60,
+                                 reserveBytes: UInt64 = 32 * 1024 * 1024) throws -> Budget {
+        let base = try budget(profile: profile, horizonSeconds: horizonSeconds, reserveBytes: reserveBytes)
+        let (required, overflow) = base.requiredBytes.addingReportingOverflow(checkpointMetadataBytes)
+        guard !overflow else { throw Failure.invalidBudget }
+        return Budget(horizonSeconds: base.horizonSeconds, payloadBytes: base.payloadBytes, requiredBytes: required)
+    }
     static func check(budget: Budget, available: () throws -> UInt64?) -> Check {
         let bytes = try? available()
         let state: State = bytes.map { $0 >= budget.requiredBytes ? .available : .low } ?? .unavailable

@@ -540,4 +540,400 @@ final class RecordingCatalogueTests: XCTestCase {
         XCTAssertEqual(chmod(root.path, 0o700), 0)
         XCTAssertEqual(try catalogue.scan().count, 0)
     }
+    private func appendIO(write: @escaping (Int32, UnsafeRawPointer, Int) -> Int = { Darwin.write($0, $1, $2) },
+                          synchronize: @escaping (Int32) -> Int32 = Darwin.fsync,
+                          available: @escaping (Int32) throws -> UInt64? = { _ in 1024 * 1024 * 1024 }) -> RecordingCatalogue.AppendIO {
+        RecordingCatalogue.AppendIO(write: write, synchronize: synchronize, availableBytes: available)
+    }
+    private func appendIdentity(_ catalogue: RecordingCatalogue) throws -> RecordingCatalogue.Identity {
+        try catalogue.newShow(profile: .sd480p30).nextIdentity()
+    }
+    private func appendReceipt(_ root: URL, _ identity: RecordingCatalogue.Identity) throws -> [String: Any] {
+        let bytes = try Data(contentsOf: root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.json"))
+        XCTAssertLessThanOrEqual(bytes.count, 4096)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+    }
+    func testAppendExclusiveCreationPersistsActualBirthBeforeInitialAndClosesIncomplete() throws {
+        let root = directory(), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+        defer { try? catalogue.close() }
+        let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 4096)
+        let url = root.appendingPathComponent(identity.filename)
+        var actual = stat(), rootStat = stat()
+        XCTAssertEqual(lstat(url.path, &actual), 0); XCTAssertEqual(lstat(root.path, &rootStat), 0)
+        XCTAssertEqual(actual.st_mode & 0o777, 0o600); XCTAssertEqual(actual.st_size, 0)
+        let writing = try appendReceipt(root, identity), source = try XCTUnwrap(writing["appendSource"] as? [String: Any])
+        XCTAssertEqual(writing["state"] as? String, "writing")
+        XCTAssertEqual((source["inode"] as? NSNumber)?.uint64Value, actual.st_ino)
+        XCTAssertEqual((source["device"] as? NSNumber)?.int32Value, actual.st_dev)
+        XCTAssertEqual((source["rootInode"] as? NSNumber)?.uint64Value, rootStat.st_ino)
+        XCTAssertEqual((source["birthSeconds"] as? NSNumber)?.int64Value, Int64(actual.st_birthtimespec.tv_sec))
+        XCTAssertEqual((source["birthNanoseconds"] as? NSNumber)?.int64Value, Int64(actual.st_birthtimespec.tv_nsec))
+        XCTAssertGreaterThan(actual.st_birthtimespec.tv_sec, 0)
+        let bindings = try owner.bindings(), initial = try owner.writeInitial(Data("abc".utf8))
+        XCTAssertEqual(initial.bytes, 3)
+        XCTAssertEqual(initial.sha256.map { String(format: "%02x", $0) }.joined(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        XCTAssertEqual(try owner.appendFragment(Data([4, 5]), expectedEnd: 5).end, 5)
+        XCTAssertEqual(try owner.bindings(), bindings)
+        XCTAssertEqual(try owner.synchronizeMedia().end, 5)
+        assertFailure(.busy) { _ = try catalogue.begin(identity: self.appendIdentity(catalogue)) }
+        assertFailure(.busy) { try catalogue.close() }
+        XCTAssertEqual(try owner.closeIncomplete().bytes, 5); XCTAssertTrue(owner.cleanupComplete)
+        XCTAssertEqual(try Data(contentsOf: url), Data([97, 98, 99, 4, 5]))
+        let closed = try appendReceipt(root, identity)
+        XCTAssertEqual(closed["state"] as? String, "incomplete"); XCTAssertNil(closed["durationMs"])
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: XCTUnwrap(closed["appendSource"] as? [String: Any]), options: [.sortedKeys]),
+                       try JSONSerialization.data(withJSONObject: source, options: [.sortedKeys]))
+        let entry = try XCTUnwrap(catalogue.scan().first)
+        XCTAssertEqual(entry.state, .incomplete); XCTAssertNil(entry.durationMs)
+        let export = try catalogue.openExport(entry: entry, allowUnverified: true)
+        XCTAssertEqual(try export.copy(write: { XCTAssertEqual($0, Data([97, 98, 99, 4, 5])) }), 5)
+        try export.close()
+        XCTAssertFalse(catalogue.cleanupRetained)
+    }
+    func testAppendCallerDropRetainsExactLeaseAndStaleCloseCannotReleaseSuccessor() throws {
+        let catalogue = try RecordingCatalogue(root: directory(), appendIO: appendIO()); defer { try? catalogue.close() }
+        var owner: RecordingCatalogue.AppendWriter? = try catalogue.beginAppend(identity: appendIdentity(catalogue), payloadLimit: 1)
+        weak var retained = owner
+        owner = nil
+        XCTAssertNotNil(retained); XCTAssertTrue(catalogue.cleanupRetained)
+        assertFailure(.busy) { try catalogue.close() }
+        let old = try XCTUnwrap(retained)
+        XCTAssertEqual(try old.closeIncomplete().bytes, 0)
+        let next = try catalogue.beginAppend(identity: appendIdentity(catalogue), payloadLimit: 1)
+        XCTAssertEqual(try old.closeIncomplete().bytes, 0)
+        assertFailure(.closed) { _ = try old.writeInitial(Data([1])) }
+        assertFailure(.busy) { try catalogue.checkRecordingCapacity() }
+        XCTAssertFalse(next.cleanupComplete); _ = try next.closeIncomplete()
+    }
+    func testAppendRefusesEveryOccupiedReservedNameAndAlternateSuffix() throws {
+        for index in 0..<7 {
+            let root = directory("occupied\(index)"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+            defer { try? catalogue.close() }
+            let identity = try appendIdentity(catalogue), prefix = "Sapflow-\(identity.segmentID)"
+            let names = [prefix + ".mov", prefix + ".m4a", prefix + ".receipt.json", prefix + ".checkpoint.0",
+                         prefix + ".checkpoint.1", prefix + ".checkpoint.tmp", prefix + ".receipt.tmp"]
+            let occupied = root.appendingPathComponent(names[index]); try Data([7]).write(to: occupied)
+            assertFailure(.changed) { _ = try catalogue.beginAppend(identity: identity, payloadLimit: 1) }
+            XCTAssertFalse(catalogue.cleanupRetained); XCTAssertFalse(catalogue.cleanupUncertain)
+            XCTAssertEqual(try Data(contentsOf: occupied), Data([7]))
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [names[index]])
+        }
+    }
+    func testAppendRefusesReservedSymlinksAndHardlinksWithoutTouchingTargets() throws {
+        for index in 0..<2 {
+            let root = directory("append-link\(index)"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+            defer { try? catalogue.close() }
+            let identity = try appendIdentity(catalogue), target = scratch.appendingPathComponent("link-target\(index)")
+            let occupied = root.appendingPathComponent("Sapflow-\(identity.segmentID).checkpoint.tmp")
+            try Data([9]).write(to: target)
+            if index == 0 { try FileManager.default.createSymbolicLink(at: occupied, withDestinationURL: target) }
+            else { try FileManager.default.linkItem(at: target, to: occupied) }
+            assertFailure(.unsafe) { _ = try catalogue.beginAppend(identity: identity, payloadLimit: 1) }
+            XCTAssertEqual(try Data(contentsOf: target), Data([9])); XCTAssertFalse(catalogue.cleanupRetained)
+        }
+    }
+    func testAppendFragmentPureBoundsIncludeOutputOverheadRatherThanPerSampleCap() throws {
+        let maximum: UInt64 = 16_908_288
+        XCTAssertEqual(try RecordingCatalogue.AppendWriter.checkedFragmentEnd(position: 7, byteCount: maximum,
+                        expectedEnd: maximum + 7, outputLimit: maximum), maximum + 7)
+        XCTAssertEqual(try RecordingCatalogue.AppendWriter.checkedFragmentEnd(position: 7, byteCount: 4 * 1024 * 1024 + 1,
+                        expectedEnd: 4 * 1024 * 1024 + 8, outputLimit: maximum), 4 * 1024 * 1024 + 8)
+        for count in [UInt64(0), maximum + 1] {
+            assertFailure(.capacity) { _ = try RecordingCatalogue.AppendWriter.checkedFragmentEnd(position: 0, byteCount: count, expectedEnd: count, outputLimit: maximum) }
+        }
+        assertFailure(.capacity) { _ = try RecordingCatalogue.AppendWriter.checkedFragmentEnd(position: 0, byteCount: 131_137, expectedEnd: 131_137, outputLimit: 131_136) }
+        assertFailure(.unsafe) { _ = try RecordingCatalogue.AppendWriter.checkedFragmentEnd(position: UInt64(Int64.max), byteCount: 1, expectedEnd: UInt64(Int64.max) + 1, outputLimit: maximum) }
+        assertFailure(.unsafe) { _ = try RecordingCatalogue.AppendWriter.checkedFragmentEnd(position: UInt64.max, byteCount: 1, expectedEnd: 0, outputLimit: maximum) }
+        assertFailure(.changed) { _ = try RecordingCatalogue.AppendWriter.checkedFragmentEnd(position: 3, byteCount: 2, expectedEnd: 4, outputLimit: maximum) }
+    }
+    func testAppendRejectsWrongEndAndDuplicateBeforeAnyBytes() throws {
+        for (index, expected) in [UInt64(4), UInt64(9), UInt64(5)].enumerated() {
+            let root = directory("append-order\(index)"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+            defer { try? catalogue.close() }
+            let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 16)
+            _ = try owner.writeInitial(Data([1, 2, 3]))
+            if index == 2 { _ = try owner.appendFragment(Data([4, 5]), expectedEnd: 5) }
+            let before = try Data(contentsOf: root.appendingPathComponent(identity.filename))
+            assertFailure(.changed) { _ = try owner.appendFragment(Data([6, 7]), expectedEnd: expected) }
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(identity.filename)), before)
+            _ = try owner.closeIncomplete(); XCTAssertFalse(catalogue.cleanupUncertain)
+        }
+    }
+    func testAppendRequiresOneBoundedInitialBeforeAnyFragments() throws {
+        for index in 0..<4 {
+            let root = directory("append-initial\(index)"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+            defer { try? catalogue.close() }
+            let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 1)
+            switch index {
+            case 0: assertFailure(.unsafe) { _ = try owner.writeInitial(Data()) }
+            case 1: assertFailure(.unsafe) { _ = try owner.writeInitial(Data(repeating: 0, count: 65_537)) }
+            case 2: assertFailure(.ineligible) { _ = try owner.appendFragment(Data([1]), expectedEnd: 1) }
+            default:
+                _ = try owner.writeInitial(Data([1]))
+                assertFailure(.unsafe) { _ = try owner.writeInitial(Data([2])) }
+            }
+            XCTAssertEqual(try owner.closeIncomplete().bytes, index == 3 ? 1 : 0)
+        }
+    }
+    func testAppendRealWritesRetryInterruptedAndShortSyscalls() throws {
+        var writes = 0, synchronizations = 0
+        let io = appendIO(write: { fd, bytes, count in
+            writes += 1
+            if writes == 1 { errno = EINTR; return -1 }
+            return Darwin.write(fd, bytes, min(2, count))
+        }, synchronize: { fd in synchronizations += 1; return Darwin.fsync(fd) })
+        let root = directory(), catalogue = try RecordingCatalogue(root: root, appendIO: io); defer { try? catalogue.close() }
+        let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 16)
+        _ = try owner.writeInitial(Data("abc".utf8)); _ = try owner.appendFragment(Data("defgh".utf8), expectedEnd: 8)
+        XCTAssertGreaterThan(writes, 4); XCTAssertEqual(try owner.synchronizeMedia().end, 8)
+        XCTAssertEqual(try owner.closeIncomplete().bytes, 8); XCTAssertEqual(synchronizations, 2)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(identity.filename)), Data("abcdefgh".utf8))
+    }
+    func testAppendPartialNoSpaceAndZeroWritePreservePrefixUntilCheckedClose() throws {
+        for index in 0..<2 {
+            var fault = false, partial = false
+            let io = appendIO(write: { fd, bytes, count in
+                guard fault else { return Darwin.write(fd, bytes, count) }
+                if !partial { partial = true; return Darwin.write(fd, bytes, min(2, count)) }
+                errno = ENOSPC; return index == 0 ? -1 : 0
+            })
+            let root = directory("append-full\(index)"), catalogue = try RecordingCatalogue(root: root, appendIO: io)
+            defer { try? catalogue.close() }
+            let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 16)
+            _ = try owner.writeInitial(Data("abc".utf8)); fault = true
+            assertFailure(.io) { _ = try owner.appendFragment(Data("defgh".utf8), expectedEnd: 8) }
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(identity.filename)), Data("abcde".utf8))
+            XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupRetained)
+            assertFailure(.busy) { try catalogue.checkRecordingCapacity() }
+            assertFailure(.closed) { _ = try owner.appendFragment(Data([9]), expectedEnd: 6) }
+            XCTAssertEqual(try owner.closeIncomplete().bytes, 5)
+            XCTAssertEqual(try catalogue.scan().first?.state, .incomplete)
+        }
+    }
+    func testAppendSyncFailureCannotReleaseOwnerOrPromoteWritingReceipt() throws {
+        var fail = false
+        let io = appendIO(synchronize: { fd in if fail { errno = EIO; return -1 }; return Darwin.fsync(fd) })
+        let root = directory(), catalogue = try RecordingCatalogue(root: root, appendIO: io)
+        let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 16)
+        _ = try owner.writeInitial(Data([1])); _ = try owner.appendFragment(Data([2]), expectedEnd: 2); fail = true
+        assertFailure(.io) { _ = try owner.synchronizeMedia() }
+        XCTAssertTrue(catalogue.cleanupRetained); XCTAssertFalse(owner.cleanupComplete)
+        assertFailure(.busy) { try catalogue.checkRecordingCapacity() }
+        assertFailure(.io) { _ = try owner.closeIncomplete() }
+        XCTAssertTrue(catalogue.cleanupUncertain); XCTAssertFalse(owner.cleanupComplete)
+        XCTAssertEqual(try appendReceipt(root, identity)["state"] as? String, "writing")
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(identity.filename)), Data([1, 2]))
+    }
+    func testAppendPathReplacementTruncationAndRootReplacementNeverAdoptOtherBytes() throws {
+        for index in 0..<4 {
+            let root = directory("append-replaced\(index)"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+            let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 16)
+            _ = try owner.writeInitial(Data([1, 2, 3]))
+            var preserved = root.appendingPathComponent(identity.filename)
+            if index == 0 {
+                preserved = root.appendingPathComponent("preserved")
+                try FileManager.default.moveItem(at: root.appendingPathComponent(identity.filename), to: preserved)
+                try Data([8, 8, 8]).write(to: root.appendingPathComponent(identity.filename))
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: root.appendingPathComponent(identity.filename).path)
+                var replacement = stat()
+                XCTAssertEqual(lstat(root.appendingPathComponent(identity.filename).path, &replacement), 0)
+                XCTAssertEqual(replacement.st_mode & 0o777, 0o600)
+            } else if index == 1 {
+                let handle = try FileHandle(forWritingTo: preserved); try handle.truncate(atOffset: 1); try handle.close()
+            } else if index == 2 {
+                let moved = directory("append-preserved-root")
+                try FileManager.default.moveItem(at: root, to: moved)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+                preserved = moved.appendingPathComponent(identity.filename)
+            } else {
+                var before = stat(), after = stat()
+                XCTAssertEqual(lstat(preserved.path, &before), 0)
+                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: preserved.path)
+                XCTAssertEqual(lstat(preserved.path, &after), 0)
+                XCTAssertEqual(after.st_ino, before.st_ino); XCTAssertEqual(after.st_dev, before.st_dev)
+                XCTAssertEqual(after.st_mode & 0o777, 0o644)
+            }
+            assertFailure(index == 3 ? .unsafe : .changed) { _ = try owner.appendFragment(Data([4]), expectedEnd: 4) }
+            XCTAssertEqual(try Data(contentsOf: preserved), index == 1 ? Data([1]) : Data([1, 2, 3]))
+            XCTAssertThrowsError(try owner.closeIncomplete())
+            XCTAssertTrue(catalogue.cleanupUncertain); XCTAssertFalse(owner.cleanupComplete)
+        }
+    }
+    func testAppendCheckedCloseHeldFencesExactLeaseAndLibraryOwners() throws {
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0)
+        let flag = NSLock(); var hold = false
+        let root = directory(), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO(), closeFileDescriptor: { fd in
+            flag.lock(); let held = hold; flag.unlock()
+            if held { entered.signal(); guard release.wait(timeout: .now() + 3) == .success else { return -1 } }
+            return Darwin.close(fd)
+        })
+        defer { try? catalogue.close() }
+        let prior = try finished(catalogue), owner = try catalogue.beginAppend(identity: appendIdentity(catalogue), payloadLimit: 16)
+        _ = try owner.writeInitial(Data([1]))
+        flag.lock(); hold = true; flag.unlock()
+        DispatchQueue.global().async { do { _ = try owner.closeIncomplete() } catch { XCTFail("Checked append close failed: \(error)") }; done.signal() }
+        var joined = false
+        defer { flag.lock(); hold = false; flag.unlock(); release.signal(); if !joined { _ = done.wait(timeout: .now() + 3) } }
+        XCTAssertEqual(entered.wait(timeout: .now() + 3), .success)
+        XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupRetained)
+        assertFailure(.busy) { _ = try owner.closeIncomplete() }
+        assertFailure(.closed) { _ = try owner.appendFragment(Data([2]), expectedEnd: 2) }
+        owner.cancel()
+        assertFailure(.busy) { try catalogue.close() }
+        assertFailure(.busy) { _ = try catalogue.openExport(entry: prior) }
+        assertFailure(.busy) { _ = try catalogue.beginAppend(identity: self.appendIdentity(catalogue), payloadLimit: 16) }
+        assertFailure(.busy) { _ = try RecordingCatalogue(root: root) }
+        flag.lock(); hold = false; flag.unlock(); release.signal()
+        XCTAssertEqual(done.wait(timeout: .now() + 3), .success); joined = true
+        XCTAssertTrue(owner.cleanupComplete); XCTAssertFalse(catalogue.cleanupRetained)
+    }
+    func testAppendFailedCloseCannotRetryRecycledDescriptorAndKeepsRootFlock() throws {
+        let root = directory(), sentinel = scratch.appendingPathComponent("append-fd-sentinel")
+        try Data([9]).write(to: sentinel)
+        var armed = false, attempted = 0, recycled: Int32 = -1
+        let catalogue = try RecordingCatalogue(root: root, appendIO: appendIO(), closeFileDescriptor: { fd in
+            guard armed else { return Darwin.close(fd) }
+            armed = false; attempted += 1
+            XCTAssertEqual(Darwin.close(fd), 0)
+            recycled = Darwin.open(sentinel.path, O_RDONLY | O_CLOEXEC)
+            XCTAssertEqual(recycled, fd); errno = EIO; return -1
+        })
+        defer { if recycled >= 0 { XCTAssertEqual(Darwin.close(recycled), 0) } }
+        let owner = try catalogue.beginAppend(identity: appendIdentity(catalogue), payloadLimit: 1)
+        _ = try owner.writeInitial(Data([1])); armed = true
+        assertFailure(.io) { _ = try owner.closeIncomplete() }
+        XCTAssertEqual(attempted, 1); XCTAssertGreaterThanOrEqual(fcntl(recycled, F_GETFD), 0)
+        assertFailure(.closed) { _ = try owner.closeIncomplete() }
+        assertFailure(.closed) { _ = try owner.synchronizeMedia() }
+        XCTAssertEqual(attempted, 1); XCTAssertGreaterThanOrEqual(fcntl(recycled, F_GETFD), 0)
+        XCTAssertTrue(catalogue.cleanupUncertain); XCTAssertFalse(owner.cleanupComplete)
+        assertFailure(.busy) { _ = try RecordingCatalogue(root: root) }
+        assertFailure(.busy) { try catalogue.close() }
+    }
+    func testAppendSixEntryAdmissionCountsUnknownAndLegacyEntries() throws {
+        for total in [1018, 1019] {
+            let root = directory("append-count\(total)"), legacy = directory("append-legacy\(total)")
+            try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: false)
+            let catalogue = try RecordingCatalogue(root: root, legacyRoot: legacy, appendIO: appendIO()); defer { try? catalogue.close() }
+            for index in 0..<total { try Data().write(to: (index % 2 == 0 ? root : legacy).appendingPathComponent("unknown-\(index)")) }
+            let identity = try appendIdentity(catalogue)
+            if total == 1018 { let owner = try catalogue.beginAppend(identity: identity, payloadLimit: 1); _ = try owner.closeIncomplete() }
+            else {
+                assertFailure(.capacity) { _ = try catalogue.beginAppend(identity: identity, payloadLimit: 1) }
+                XCTAssertFalse(catalogue.cleanupRetained)
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).count + FileManager.default.contentsOfDirectory(atPath: legacy.path).count, total)
+            }
+            XCTAssertFalse(catalogue.cleanupUncertain)
+        }
+    }
+    func testAppend256thFourEntryRecordingMayRefuseWithoutRaisingCaps() throws {
+        let root = directory(), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO()); defer { try? catalogue.close() }
+        for _ in 0..<255 {
+            let prefix = "Sapflow-\(UUID().uuidString.lowercased())"
+            for suffix in [".mov", ".receipt.json", ".checkpoint.0", ".checkpoint.1"] { try Data([1]).write(to: root.appendingPathComponent(prefix + suffix)) }
+        }
+        XCTAssertEqual(try catalogue.scan().count, 255)
+        assertFailure(.capacity) { _ = try catalogue.beginAppend(identity: self.appendIdentity(catalogue), payloadLimit: 1) }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).count, 1020)
+        XCTAssertFalse(catalogue.cleanupRetained); XCTAssertFalse(catalogue.cleanupUncertain)
+    }
+    func testAppendAvailableBytesUsesRetainedRootAndChargesMetadataAboveExistingFloor() throws {
+        let profile = CaptureIntent.sd480p30, budget = try RecordingStorage.checkpointBudget(profile: profile)
+        let minimum = max(budget.requiredBytes, 200 * 1024 * 1024 + RecordingStorage.checkpointMetadataBytes + 1)
+        for index in 0..<3 {
+            let root = directory("append-available\(index)")
+            let io = appendIO(available: { fd in
+                var descriptor = stat(), path = stat()
+                XCTAssertEqual(fstat(fd, &descriptor), 0); XCTAssertEqual(lstat(root.path, &path), 0)
+                XCTAssertEqual(descriptor.st_ino, path.st_ino); XCTAssertEqual(descriptor.st_dev, path.st_dev)
+                return index == 2 ? nil : minimum - UInt64(index)
+            })
+            let catalogue = try RecordingCatalogue(root: root, appendIO: io); defer { try? catalogue.close() }
+            let identity = try appendIdentity(catalogue)
+            if index == 0 { let owner = try catalogue.beginAppend(identity: identity, payloadLimit: 1); _ = try owner.closeIncomplete() }
+            else { assertFailure(index == 1 ? .capacity : .io) { _ = try catalogue.beginAppend(identity: identity, payloadLimit: 1) } }
+            XCTAssertFalse(catalogue.cleanupUncertain); try catalogue.checkRecordingCapacity()
+        }
+    }
+    func testAppendBindingCanonicalVectorsIncludeEveryImmutableIdentityAndIncarnationField() throws {
+        let identity = try RecordingCatalogue.Identity(segmentID: "11111111-1111-4111-8111-111111111111", showID: "22222222-2222-4222-8222-222222222222",
+            segmentIndex: 7, profileID: "480p30", container: nil)
+        let source = RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 5, device: 7, inode: 11, birthSeconds: 13, birthNanoseconds: 17)
+        let value = try source.bindings(identity: identity)
+        XCTAssertEqual(value.recording.map { String(format: "%02x", $0) }.joined(), "5bfaa3cfdeb850cc85847bae65c6aebe1577681625296eda802deb7b16177e20")
+        XCTAssertEqual(value.sourceFile.map { String(format: "%02x", $0) }.joined(), "0770aae9c9c4b7428a7c87e6414d9eee2931feffa8f31e138a2d0a98ef0817ae")
+        let identityVariants = [
+            try RecordingCatalogue.Identity(segmentID: "33333333-3333-4333-8333-333333333333", showID: identity.showID, segmentIndex: 7, profileID: "480p30"),
+            try RecordingCatalogue.Identity(segmentID: identity.segmentID, showID: "33333333-3333-4333-8333-333333333333", segmentIndex: 7, profileID: "480p30"),
+            try RecordingCatalogue.Identity(segmentID: identity.segmentID, showID: identity.showID, segmentIndex: 8, profileID: "480p30"),
+            try RecordingCatalogue.Identity(segmentID: identity.segmentID, showID: identity.showID, segmentIndex: 7, profileID: "720p30"),
+            try RecordingCatalogue.Identity(segmentID: identity.segmentID, showID: identity.showID, segmentIndex: 7, profileID: "480p30", container: .mov)]
+        for next in identityVariants { let digest = try source.bindings(identity: next); XCTAssertNotEqual(digest.recording, value.recording); XCTAssertNotEqual(digest.sourceFile, value.sourceFile) }
+        let variants = [
+            RecordingCatalogue.AppendSource(rootDevice: 4, rootInode: 5, device: 7, inode: 11, birthSeconds: 13, birthNanoseconds: 17),
+            RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 6, device: 7, inode: 11, birthSeconds: 13, birthNanoseconds: 17),
+            RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 5, device: 8, inode: 11, birthSeconds: 13, birthNanoseconds: 17),
+            RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 5, device: 7, inode: 12, birthSeconds: 13, birthNanoseconds: 17),
+            RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 5, device: 7, inode: 11, birthSeconds: 14, birthNanoseconds: 17),
+            RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 5, device: 7, inode: 11, birthSeconds: 13, birthNanoseconds: 18)]
+        for next in variants { let digest = try next.bindings(identity: identity); XCTAssertEqual(digest.recording, value.recording); XCTAssertNotEqual(digest.sourceFile, value.sourceFile) }
+        for invalid in [RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 5, device: 7, inode: 11, birthSeconds: 0, birthNanoseconds: 17),
+                        RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 5, device: 7, inode: 11, birthSeconds: 13, birthNanoseconds: 1_000_000_000)] {
+            assertFailure(.unsafe) { _ = try invalid.bindings(identity: identity) }
+        }
+    }
+    func testAppendRejectsDecodedInvalidIdentityBeforePathUseOrUnsignedConversion() throws {
+        let bytes = Data("{\"segmentID\":\"../outside\",\"showID\":\"22222222-2222-4222-8222-222222222222\",\"segmentIndex\":-1,\"profileID\":\"480p30\"}".utf8)
+        let identity = try JSONDecoder().decode(RecordingCatalogue.Identity.self, from: bytes)
+        let root = directory(), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO()); defer { try? catalogue.close() }
+        assertFailure(.unsafe) { _ = try catalogue.beginAppend(identity: identity, payloadLimit: 1) }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).count, 0)
+        let source = RecordingCatalogue.AppendSource(rootDevice: 3, rootInode: 5, device: 7, inode: 11, birthSeconds: 13, birthNanoseconds: 17)
+        assertFailure(.unsafe) { _ = try source.bindings(identity: identity) }
+    }
+    func testAppendReceiptSourceRejectsReplacementAcrossReopen() throws {
+        let root = directory(), first = try RecordingCatalogue(root: root, appendIO: appendIO())
+        let identity = try appendIdentity(first), owner = try first.beginAppend(identity: identity, payloadLimit: 1)
+        _ = try owner.writeInitial(Data([1, 2, 3])); _ = try owner.closeIncomplete(); try first.close()
+        let url = root.appendingPathComponent(identity.filename), preserved = root.appendingPathComponent("preserved-original")
+        try FileManager.default.moveItem(at: url, to: preserved); try Data([8, 8, 8]).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        var replacement = stat()
+        XCTAssertEqual(lstat(url.path, &replacement), 0); XCTAssertEqual(replacement.st_mode & 0o777, 0o600)
+        let second = try RecordingCatalogue(root: root); defer { try? second.close() }
+        let entry = try XCTUnwrap(second.scan().first)
+        XCTAssertEqual(entry.state, .orphanUnverified); XCTAssertNil(entry.identity)
+        XCTAssertEqual(try Data(contentsOf: preserved), Data([1, 2, 3]))
+        XCTAssertEqual(try Data(contentsOf: url), Data([8, 8, 8]))
+    }
+    func testAppendOccupiedFixedReceiptTempAfterMediaCloseRetainsOriginalAndOwner() throws {
+        let root = directory(), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+        let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 1)
+        _ = try owner.writeInitial(Data([1]))
+        let temporary = root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.tmp")
+        try Data([7]).write(to: temporary)
+        assertFailure(.io) { _ = try owner.closeIncomplete() }
+        XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupUncertain)
+        XCTAssertEqual(try Data(contentsOf: temporary), Data([7]))
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(identity.filename)), Data([1]))
+        XCTAssertEqual(try appendReceipt(root, identity)["state"] as? String, "writing")
+        assertFailure(.busy) { _ = try RecordingCatalogue(root: root) }
+    }
+    func testAppendFailedWritingReceiptCloseKeepsFixedTempAndClosesRealMediaOnce() throws {
+        let root = directory(); var closes = 0
+        let catalogue = try RecordingCatalogue(root: root, appendIO: appendIO(), closeFileDescriptor: { fd in
+            closes += 1; let result = Darwin.close(fd)
+            if closes == 1 { errno = EIO; return -1 }; return result
+        })
+        let identity = try appendIdentity(catalogue)
+        assertFailure(.io) { _ = try catalogue.beginAppend(identity: identity, payloadLimit: 1) }
+        XCTAssertEqual(closes, 2); XCTAssertTrue(catalogue.cleanupUncertain); XCTAssertTrue(catalogue.cleanupRetained)
+        let media = root.appendingPathComponent(identity.filename), temporary = root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.tmp")
+        XCTAssertEqual(try Data(contentsOf: media).count, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.json").path))
+        assertFailure(.busy) { _ = try RecordingCatalogue(root: root) }
+        assertFailure(.closed) { _ = try catalogue.beginAppend(identity: identity, payloadLimit: 1) }
+        XCTAssertEqual(closes, 2)
+    }
 }

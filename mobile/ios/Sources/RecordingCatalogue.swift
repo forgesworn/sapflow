@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 /// App-private local metadata and bounded copies. All filesystem methods run
 /// on one cold IO owner. No deletion, repair, media decoding or publication.
@@ -72,6 +73,55 @@ final class RecordingCatalogue {
             changedSeconds = Int64(s.st_ctimespec.tv_sec); changedNanoseconds = Int64(s.st_ctimespec.tv_nsec)
         }
     }
+    /// Stable append incarnation, independent of changing size/mtime/ctime.
+    /// Only beginAppend creates an owner from actual retained-descriptor stat.
+    struct AppendSource: Codable, Equatable {
+        let rootDevice: Int32
+        let rootInode: UInt64
+        let device: Int32
+        let inode: UInt64
+        let birthSeconds: Int64
+        let birthNanoseconds: Int64
+        fileprivate var valid: Bool {
+            rootInode > 0 && inode > 0 && birthSeconds > 0 &&
+                birthNanoseconds >= 0 && birthNanoseconds < 1_000_000_000
+        }
+        /// Versioned, domain-separated, length-framed UTF8 and big-endian
+        /// integers. A digest is an equality binding, never authentication.
+        func bindings(identity: Identity) throws -> AppendBindings {
+            guard valid, (try? Identity(segmentID: identity.segmentID, showID: identity.showID,
+                                        segmentIndex: identity.segmentIndex, profileID: identity.profileID,
+                                        container: identity.container)) != nil else { throw Failure.unsafe }
+            var recording = Data()
+            Self.text("sapflow.checkpoint-recording.v1", into: &recording)
+            Self.text(identity.segmentID, into: &recording)
+            Self.text(identity.showID, into: &recording)
+            Self.integer(UInt64(identity.segmentIndex), into: &recording)
+            Self.text(identity.profileID, into: &recording)
+            // Preserve absence versus an explicitly declared MOV container.
+            Self.integer(identity.container == nil ? UInt8(0) : identity.container == .mov ? UInt8(1) : UInt8(2), into: &recording)
+            let recordingDigest = Data(SHA256.hash(data: recording))
+            var file = Data()
+            Self.text("sapflow.checkpoint-file.v1", into: &file)
+            file.append(recordingDigest)
+            Self.integer(UInt32(bitPattern: rootDevice), into: &file)
+            Self.integer(rootInode, into: &file)
+            Self.integer(UInt32(bitPattern: device), into: &file)
+            Self.integer(inode, into: &file)
+            Self.integer(UInt64(birthSeconds), into: &file)
+            Self.integer(UInt32(birthNanoseconds), into: &file)
+            return AppendBindings(recording: recordingDigest, sourceFile: Data(SHA256.hash(data: file)))
+        }
+        private static func text(_ value: String, into bytes: inout Data) {
+            let encoded = Data(value.utf8)
+            integer(UInt32(encoded.count), into: &bytes); bytes.append(encoded)
+        }
+        private static func integer<T: FixedWidthInteger>(_ value: T, into bytes: inout Data) {
+            var encoded = value.bigEndian
+            withUnsafeBytes(of: &encoded) { bytes.append(contentsOf: $0) }
+        }
+    }
+    struct AppendBindings: Equatable { let recording: Data; let sourceFile: Data }
     private struct Receipt: Codable {
         let version: Int
         let identity: Identity
@@ -79,6 +129,13 @@ final class RecordingCatalogue {
         let createdAtMs: Int64
         let durationMs: Int64?
         let file: Fingerprint?
+        let appendSource: AppendSource?
+        init(version: Int, identity: Identity, state: String, createdAtMs: Int64,
+             durationMs: Int64?, file: Fingerprint?, appendSource: AppendSource? = nil) {
+            self.version = version; self.identity = identity; self.state = state
+            self.createdAtMs = createdAtMs; self.durationMs = durationMs
+            self.file = file; self.appendSource = appendSource
+        }
     }
     private struct Directory {
         let url: URL
@@ -98,6 +155,24 @@ final class RecordingCatalogue {
         static let native = MediaUpdateIO(write: { Darwin.pwrite($0, $1, $2, $3) }, synchronize: Darwin.fsync)
     }
     private let mediaUpdateIO: MediaUpdateIO
+    /// Only syscall receipts are injected; all ownership/identity checks remain
+    /// real. This path uses anchored free blocks, not purgeable-volume estimates.
+    struct AppendIO {
+        let write: (Int32, UnsafeRawPointer, Int) -> Int
+        let synchronize: (Int32) -> Int32
+        let availableBytes: (Int32) throws -> UInt64?
+        static let native = AppendIO(write: { Darwin.write($0, $1, $2) }, synchronize: Darwin.fsync, availableBytes: { fd in
+            var volume = statfs()
+            guard fstatfs(fd, &volume) == 0, volume.f_bsize > 0 else { throw Failure.io }
+            guard let blocks = UInt64(exactly: volume.f_bavail) else { throw Failure.io }
+            let result = blocks.multipliedReportingOverflow(by: UInt64(volume.f_bsize))
+            guard !result.overflow else { throw Failure.capacity }; return result.partialValue
+        })
+    }
+    private let appendIO: AppendIO
+    // Strongly own the sole actual append child even if its caller drops it.
+    // Clear only after checked close and all receipt work, together with token.
+    private var appendOwner: AppendWriter?
     private let lock = NSLock()
     private var owner: (token: UUID, kind: Owner)?
     private var uncertain = false
@@ -112,9 +187,10 @@ final class RecordingCatalogue {
 
     init(root: URL, legacyRoot: URL? = nil,
          mediaUpdateIO: MediaUpdateIO = .native,
+         appendIO: AppendIO = .native,
          closeFileDescriptor: @escaping (Int32) -> Int32 = Darwin.close) throws {
         self.closeFileDescriptor = closeFileDescriptor
-        self.mediaUpdateIO = mediaUpdateIO
+        self.mediaUpdateIO = mediaUpdateIO; self.appendIO = appendIO
         guard root.isFileURL, !root.path.utf8.contains(0) else { throw Failure.unsafe }
         do { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         catch { throw Failure.io }
@@ -265,19 +341,22 @@ final class RecordingCatalogue {
               (receipt.file == nil) == (receipt.durationMs == nil),
               receipt.state != "finalised" || receipt.file != nil,
               receipt.file.map({ $0.size > 0 }) ?? true,
+              receipt.appendSource.map({ $0.valid }) ?? true,
               (try? encode(receipt)) == bytes else { return nil }
         return receipt
     }
     private func receiptName(_ identity: Identity) -> String { "Sapflow-\(identity.segmentID).receipt.json" }
-    private func writeReceipt(_ receipt: Receipt) throws {
+    private func writeReceipt(_ receipt: Receipt, fixedTemporary: String? = nil) throws {
         try check(root)
         let data = try encode(receipt), name = receiptName(receipt.identity)
         _ = try info(root, name) // Refuse unsafe existing destinations.
-        let temporary = ".recording-\(UUID().uuidString.lowercased()).tmp"
+        let temporary = fixedTemporary ?? ".recording-\(UUID().uuidString.lowercased()).tmp"
         let fd = openat(root.fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw Failure.io }
         var needsClose = true
-        defer { unlinkat(root.fd, temporary, 0) }
+        // Legacy receipt cleanup is unchanged. New append temps survive failed
+        // installation/unknown close; a later begin must refuse occupied names.
+        defer { if fixedTemporary == nil { unlinkat(root.fd, temporary, 0) } }
         do {
             try data.withUnsafeBytes { buffer in
                 var position = 0
@@ -308,6 +387,240 @@ final class RecordingCatalogue {
             try writeReceipt(Receipt(version: 1, identity: identity, state: "writing", createdAtMs: createdAtMs, durationMs: nil, file: nil))
             return Writer(catalogue: self, token: token, identity: identity, createdAtMs: createdAtMs)
         } catch { if !cleanupUncertain { try release(token) }; throw error }
+    }
+    /// Six flat entries are reserved under the single catalogue child token.
+    /// No slot exists yet and this primitive makes no durable-frontier claim.
+    func beginAppend(identity: Identity, createdAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000),
+                     payloadLimit: UInt64) throws -> AppendWriter {
+        guard createdAtMs > 0, payloadLimit > 0, payloadLimit <= 16 * 1024 * 1024,
+              (try? Identity(segmentID: identity.segmentID, showID: identity.showID, segmentIndex: identity.segmentIndex,
+                             profileID: identity.profileID, container: identity.container)) != nil,
+              let profile = CaptureIntent(rawValue: identity.profileID) else { throw Failure.unsafe }
+        let token = try reserve(.writer(identity.segmentID))
+        var child: AppendWriter?
+        do {
+            guard try scan().count < Self.maxSegments else { throw Failure.capacity }
+            var entries = 0
+            _ = try names(root, count: &entries)
+            if let legacy { _ = try names(legacy, count: &entries) }
+            guard entries <= Self.maxEntries - 6 else { throw Failure.capacity }
+            let budget = try RecordingStorage.checkpointBudget(profile: profile)
+            guard let available = try appendIO.availableBytes(root.fd) else { throw Failure.io }
+            guard available >= budget.requiredBytes,
+                  available > 200 * 1024 * 1024 + RecordingStorage.checkpointMetadataBytes else { throw Failure.capacity }
+            try check(root)
+            let prefix = "Sapflow-\(identity.segmentID)"
+            for name in [prefix + ".mov", prefix + ".m4a", receiptName(identity),
+                         prefix + ".checkpoint.0", prefix + ".checkpoint.1",
+                         prefix + ".checkpoint.tmp", prefix + ".receipt.tmp"] {
+                guard try info(root, name) == nil else { throw Failure.changed }
+            }
+            let fd = openat(root.fd, identity.filename, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            guard fd >= 0 else { throw errno == EEXIST ? Failure.changed : Failure.io }
+            let value = AppendWriter(catalogue: self, token: token, identity: identity,
+                                     createdAtMs: createdAtMs, fd: fd, outputLimit: payloadLimit + 131_072)
+            child = value
+            lock.lock(); appendOwner = value; lock.unlock()
+            try value.prepare()
+            return value
+        } catch {
+            let original = error
+            if let child { try child.abortBegin() }
+            else if !cleanupUncertain { try release(token) }
+            throw original
+        }
+    }
+    private func appendFile(_ s: stat) throws -> (source: AppendSource, file: Fingerprint) {
+        guard (s.st_mode & S_IFMT) == S_IFREG, s.st_nlink == 1, s.st_uid == getuid(),
+              s.st_mode & 0o777 == 0o600, s.st_size >= 0 else { throw Failure.unsafe }
+        let source = AppendSource(rootDevice: root.device, rootInode: root.inode, device: s.st_dev, inode: s.st_ino,
+                                  birthSeconds: Int64(s.st_birthtimespec.tv_sec), birthNanoseconds: Int64(s.st_birthtimespec.tv_nsec))
+        guard source.valid else { throw Failure.unsafe }
+        return (source, Fingerprint(s))
+    }
+    private func appendDescriptor(_ fd: Int32) throws -> (source: AppendSource, file: Fingerprint) {
+        var s = stat(); guard fstat(fd, &s) == 0 else { throw Failure.io }; return try appendFile(s)
+    }
+    private func appendPath(_ name: String) throws -> (source: AppendSource, file: Fingerprint) {
+        try check(root)
+        var s = stat()
+        guard fstatat(root.fd, name, &s, AT_SYMLINK_NOFOLLOW) == 0 else { throw Failure.changed }
+        return try appendFile(s)
+    }
+    private func releaseAppend(_ token: UUID, child: AppendWriter) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !uncertain, owner?.token == token, appendOwner === child else { throw Failure.closed }
+        owner = nil; appendOwner = nil
+    }
+    final class AppendWriter {
+        struct InitialAppend { let bytes: UInt64; let sha256: Data }
+        struct FragmentAppend { let end: UInt64 }
+        struct MediaSyncReceipt { let end: UInt64 }
+        struct ClosedAppend { let bytes: UInt64 }
+        private let catalogue: RecordingCatalogue
+        private let token: UUID
+        let identity: Identity
+        private let createdAtMs: Int64
+        private let outputLimit: UInt64
+        private var descriptor: Int32?
+        private var source: AppendSource?
+        private var initial: InitialAppend?
+        private var appendedEnd: UInt64 = 0
+        private let lock = NSLock()
+        private enum Phase { case open, closing, retained, closed }
+        private var phase = Phase.open
+        private var busy = false
+        private var admissionClosed = false
+        private var closedResult: ClosedAppend?
+        fileprivate init(catalogue: RecordingCatalogue, token: UUID, identity: Identity,
+                         createdAtMs: Int64, fd: Int32, outputLimit: UInt64) {
+            self.catalogue = catalogue; self.token = token; self.identity = identity
+            self.createdAtMs = createdAtMs; descriptor = fd; self.outputLimit = outputLimit
+        }
+        var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return phase == .closed }
+        func cancel() { lock.lock(); admissionClosed = true; lock.unlock() }
+        /// Immutable equality digests only. No descriptor/path escapes.
+        func bindings() throws -> AppendBindings {
+            try operation {
+                _ = try inspect(expected: appendedEnd)
+                guard let source else { throw Failure.closed }; return try source.bindings(identity: identity)
+            }
+        }
+        fileprivate func prepare() throws {
+            guard let descriptor else { throw Failure.closed }
+            source = try catalogue.appendDescriptor(descriptor).source
+            _ = try inspect(expected: 0)
+            try catalogue.writeReceipt(Receipt(version: 1, identity: identity, state: "writing", createdAtMs: createdAtMs,
+                                               durationMs: nil, file: nil, appendSource: source), fixedTemporary: temporaryName)
+            _ = try inspect(expected: 0)
+        }
+        private var temporaryName: String { "Sapflow-\(identity.segmentID).receipt.tmp" }
+        /// Pure bound check is also used by generated-byte boundary tests.
+        static func checkedFragmentEnd(position: UInt64, byteCount: UInt64, expectedEnd: UInt64, outputLimit: UInt64) throws -> UInt64 {
+            guard byteCount > 0, byteCount <= outputLimit, byteCount <= 16_908_288 else { throw Failure.capacity }
+            guard position <= UInt64(Int64.max), byteCount <= UInt64(Int64.max) - position else { throw Failure.unsafe }
+            let end = position + byteCount
+            guard end == expectedEnd else { throw Failure.changed }; return end
+        }
+        func writeInitial(_ bytes: Data) throws -> InitialAppend {
+            try operation {
+                guard initial == nil, !bytes.isEmpty, bytes.count <= 65_536 else { throw Failure.unsafe }
+                _ = try inspect(expected: 0)
+                try writeAll(bytes)
+                _ = try inspect(expected: UInt64(bytes.count))
+                let receipt = InitialAppend(bytes: UInt64(bytes.count), sha256: Data(SHA256.hash(data: bytes)))
+                initial = receipt; appendedEnd = receipt.bytes; return receipt
+            }
+        }
+        func appendFragment(_ bytes: Data, expectedEnd: UInt64) throws -> FragmentAppend {
+            try operation {
+                guard initial != nil else { throw Failure.ineligible }
+                let position = try inspect(expected: appendedEnd)
+                let end = try Self.checkedFragmentEnd(position: position, byteCount: UInt64(bytes.count), expectedEnd: expectedEnd, outputLimit: outputLimit)
+                try writeAll(bytes)
+                _ = try inspect(expected: end)
+                appendedEnd = end; return FragmentAppend(end: end)
+            }
+        }
+        func synchronizeMedia() throws -> MediaSyncReceipt {
+            try operation {
+                guard initial != nil, let descriptor else { throw Failure.ineligible }
+                _ = try inspect(expected: appendedEnd)
+                guard catalogue.appendIO.synchronize(descriptor) == 0 else { throw Failure.io }
+                _ = try inspect(expected: appendedEnd)
+                // fsync receipt only; checkpoint slots/readback do not exist yet.
+                return MediaSyncReceipt(end: appendedEnd)
+            }
+        }
+        private func operation<T>(_ body: () throws -> T) throws -> T {
+            lock.lock()
+            guard phase == .open, !admissionClosed else { lock.unlock(); throw Failure.closed }
+            guard !busy else { lock.unlock(); throw Failure.busy }
+            busy = true; lock.unlock()
+            defer { lock.lock(); busy = false; lock.unlock() }
+            do { return try body() }
+            catch { lock.lock(); admissionClosed = true; lock.unlock(); throw error }
+        }
+        private func inspect(expected: UInt64?) throws -> UInt64 {
+            guard let descriptor, let source else { throw Failure.closed }
+            try catalogue.check(catalogue.root)
+            let before = try catalogue.appendDescriptor(descriptor)
+            let position = lseek(descriptor, 0, SEEK_CUR)
+            guard position >= 0 else { throw Failure.io }
+            let after = try catalogue.appendDescriptor(descriptor), path = try catalogue.appendPath(identity.filename)
+            guard before.source == source, after.source == source, path.source == source,
+                  before.file == after.file, path.file == after.file, after.file.size == position,
+                  expected.map({ $0 == UInt64(position) }) ?? true else { throw Failure.changed }
+            try catalogue.check(catalogue.root); return UInt64(position)
+        }
+        private func writeAll(_ bytes: Data) throws {
+            guard let descriptor else { throw Failure.closed }
+            try bytes.withUnsafeBytes { buffer in
+                var position = 0
+                while position < buffer.count {
+                    let remaining = buffer.count - position
+                    let count = catalogue.appendIO.write(descriptor, buffer.baseAddress!.advanced(by: position), remaining)
+                    if count < 0 && errno == EINTR { continue }
+                    guard count > 0, count <= remaining else { throw Failure.io }; position += count
+                }
+            }
+        }
+        /// A cancelled/failed append can only close as explicitly incomplete.
+        /// All fallible work, including real close and receipt readback, precedes
+        /// token release. There is no offset-zero writer or finalised operation.
+        func closeIncomplete() throws -> ClosedAppend {
+            lock.lock()
+            if let closedResult { lock.unlock(); return closedResult }
+            guard phase == .open else { let active = phase == .closing; lock.unlock(); throw active ? Failure.busy : Failure.closed }
+            guard !busy else { lock.unlock(); throw Failure.busy }
+            phase = .closing; admissionClosed = true; lock.unlock()
+            do {
+                var problem: Error?
+                var end: UInt64 = 0
+                do {
+                    end = try inspect(expected: nil)
+                    guard let descriptor, catalogue.appendIO.synchronize(descriptor) == 0 else { throw Failure.io }
+                    _ = try inspect(expected: end)
+                } catch { problem = error }
+                // Consume this close attempt before invoking it: ambiguity must
+                // never let any later method retry a recycled descriptor number.
+                if let descriptor {
+                    self.descriptor = nil
+                    do { try catalogue.closeFD(descriptor) } catch { problem = error }
+                } else if problem == nil { problem = Failure.closed }
+                if let problem { throw problem }
+                try checkClosedSource(end: end)
+                try catalogue.writeReceipt(Receipt(version: 1, identity: identity, state: "incomplete", createdAtMs: createdAtMs,
+                                                   durationMs: nil, file: nil, appendSource: source), fixedTemporary: temporaryName)
+                try checkClosedSource(end: end)
+                try catalogue.releaseAppend(token, child: self)
+                let result = ClosedAppend(bytes: end)
+                lock.lock(); closedResult = result; phase = .closed; lock.unlock(); return result
+            } catch {
+                lock.lock(); phase = .retained; lock.unlock()
+                catalogue.poison(self); throw error
+            }
+        }
+        private func checkClosedSource(end: UInt64) throws {
+            let path = try catalogue.appendPath(identity.filename)
+            guard path.source == source, path.file.size >= 0, UInt64(path.file.size) == end else { throw Failure.changed }
+        }
+        fileprivate func abortBegin() throws {
+            // Not published to callers. Preserve any original/temp and close the
+            // one real media FD even if metadata installation poisoned the root.
+            if let descriptor {
+                self.descriptor = nil
+                do { try catalogue.closeFD(descriptor) }
+                catch { lock.lock(); phase = .retained; lock.unlock(); catalogue.poison(self); throw error }
+            }
+            guard !catalogue.cleanupUncertain else {
+                lock.lock(); phase = .retained; lock.unlock(); catalogue.poison(self); throw Failure.io
+            }
+            do {
+                try catalogue.releaseAppend(token, child: self)
+                lock.lock(); phase = .closed; lock.unlock()
+            } catch { catalogue.poison(self); throw error }
+        }
     }
     final class Writer {
         private let catalogue: RecordingCatalogue
@@ -517,7 +830,11 @@ final class RecordingCatalogue {
         let decoded = metadata.0.flatMap { decode($0, id) }
         // A known completed-file fingerprint cannot be adopted by a replaced
         // file, including an explicitly incomplete container.
-        let receipt = decoded?.identity.filename != name || (decoded?.file != nil && decoded?.file != file) ? nil : decoded
+        var receipt = decoded?.identity.filename != name || (decoded?.file != nil && decoded?.file != file) ? nil : decoded
+        if let source = receipt?.appendSource, file != nil {
+            guard location == .privateRecording else { throw Failure.unsafe }
+            if try appendPath(name).source != source { receipt = nil }
+        }
         lock.lock()
         let active: Bool
         if case .writer(let segment)? = owner?.kind { active = segment == id } else { active = false }

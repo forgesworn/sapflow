@@ -187,6 +187,39 @@ Both retain unchanged source bindings and verified package contents. Package
 and host checks do not establish a rebuilt app, phone installation or physical
 recording acceptance.
 
+## iOS append-file owner
+
+The additive `RecordingCatalogue.beginAppend` path now owns an exclusively
+created, anchored 0600 media descriptor and the existing catalogue writer lease.
+It binds the actual root/file device and inode plus file birth time; changing
+size or modification time does not change that incarnation. Existing receipts
+without this optional binding remain readable.
+
+The owner writes one bounded INITIAL header and sequential complete chunks,
+checking the actual position and expected end before writing. Partial writes
+close admission and preserve their bytes. A confirmed incomplete close can
+release the lease; uncertain closure or receipt installation retains the exact
+owner and root flock. Dropping the caller's wrapper cannot release an open file.
+There is no offset-zero rewrite or finalised-recording operation on this path.
+
+Admission charges six directory entries and an additional 256 KiB of metadata
+headroom within the existing caps. Available bytes come from the retained root
+descriptor. This is a conservative preflight, not a disk-space reservation.
+
+The actual host gate passes 71 recording lifecycle tests, 38 library tests and
+the strict iOS 16 API check across all 67 app source files. The initial run
+reported three failures across two replacement-file tests: their fixtures had
+0644 permissions and reached the permission guard before the intended
+incarnation checks. The reviewed repair sets and verifies 0600 replacements,
+keeps the original identity assertions and separately tests same-inode 0644
+refusal. Production code is unchanged between those two runs. Failed and passing
+receipts remain under `target/privacy-standby/ios-recording-append-gates-v1/`
+and `ios-recording-append-gates-v2/`.
+
+The app recorder still uses its existing writer. This primitive does not yet
+install checkpoint slots, publish a durable frontier, recover recordings or
+establish the aggregate two-second loss bound.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC
