@@ -23,14 +23,29 @@ remain ignored by the default workspace command. The unchanged parser's earlier
 Apple and four-ABI Android SDK packages pass their installed host consumers;
 Android native libraries also pass actual 16 KiB alignment checks.
 
-The iOS [submitted-input storage composition](recording-recovery.md#ios-submitted-input-finalisation)
-passes 86 actual host filesystem tests, 38 library tests, 16 real-SDK tests and
-the strict iOS 16 API check across all 68 app source files. One exact file owner
-survives append close, fixed-header replacement, sync/readback/checked close and
-receipt installation. Every current SDK result still has unknown app admission
-and an incomplete receipt. The initial test callback compile failure and its
-reviewed test-only repair remain retained. There is no whole-show finalisation,
-app recorder migration, crash-recovery or aggregate-loss acceptance claim.
+The iOS [first recorder adoption composition](recording-recovery.md#ios-first-recorder-adoption-composition)
+is locally committed as `928a616`. Legacy remains the default; an internal cold
+selection exposes the SDK adapter. It passes 89 actual host filesystem tests,
+38 library tests, 16 real-SDK tests and the strict iOS 16 API check across all
+69 production source files. Independent outcome review is clear for those six
+commands. Five generated native adapter cases also pass, with four exact
+original-AAC payload probes. Their detailed input, prefix and refusal results
+are recorded below. These checks introduce no second encoder, media queue,
+encoded payload copy or per-unit validation. Every current SDK outcome still
+produces an incomplete app receipt with application admission unknown.
+
+The current legacy regression run passes 86 publisher tests and all seven
+original native ownership controls while preserving both historical negative
+controls. Independent review of that completed outcome is clear. Full Debug,
+Qualification and Release app builds also pass, with signing disabled and all
+built resource, configuration and manual-link checks passing. The compiled
+Debug test bundle contains both exact profile corpora and the new capacity
+tests; it has not executed on a phone. Separate product readback verifies all
+three app code objects are unsigned and binds the Debug implementation dylib
+as well as its launcher. Independent app outcome review is clear. The
+earlier submitted-input gate and its original test callback failure and repair
+remain retained. There is no producer-finalisation, default SDK switch,
+crash-recovery, aggregate-loss or physical acceptance claim.
 
 The optional [full native AAC receipt mode](recording-recovery.md#native-aac-generation-receipts)
 passes fourteen actual generated native cases and real SDK receipt acceptance,
@@ -47,18 +62,31 @@ publisher/pending-capture fence; the actor rechecks the same owner before the
 durable End request. An active local recording continues. Independent source
 review is clear; evidence is under `target/v4v-end-confirmation-v1/`.
 
-The refreshed Android app gate uses the current extent-query SDK AAR. Debug and
-Qualification each reexecute all 597 JVM tests in 68 suites, including 22
-confirmation/shutdown tests and 15 session tests. All three app configurations
-build and pass lint with no errors; warnings remain. Actual APK checks pass
-current SDK byte identity, native and ZIP 16 KiB alignment, notices, manual
-routing and qualification isolation. Independent outcome review is clear. A
-separate direct ZIP/signing-block inspection verifies the Release APK is unsigned;
-the inherited app verifier alone does not establish that. No phone was installed
-or tested. Evidence is under
-`target/privacy-standby/recording-native-extent-android-app-v1/`; the prior
-`recording-checkpoint-android-app-v1/` run remains retained.
-The earlier End/shutdown gate remains retained under
+Android's first AAC generation observation packet is locally committed as
+`64e9521`. It records bounded diagnostic metadata only: API 29 trim metadata is
+explicitly unavailable; missing and reported zero remain distinct; raw and
+intentional-zero input counters advance only after the native input queue call
+succeeds. Output callback and handoff counters do not establish exact access
+units, recorder admission or EOF. There is no hot admission ledger, timing or
+priming-policy change, extra encoder, encoded payload copy or per-unit
+validation. Native codec facts and physical capture remain unqualified.
+
+The current Android app gate uses the unchanged extent-query SDK AAR. Debug and
+Qualification each genuinely execute all 616 JVM tests in 69 suites, including
+19 observation, 22 confirmation/shutdown and 15 session tests, with no failures,
+errors or skips. All three APK assemblies, lint and qualification isolation
+pass. Lint reports zero errors and 11/18/17 warnings for Debug, Qualification
+and Release respectively. Actual artefact checks pass current SDK byte
+identity, native and ZIP 16 KiB alignment, notices, QR decoder DEX, manual
+routing and qualification isolation. Independent source and outcome reviews
+are clear. Separate direct ZIP/signing-block readback establishes that this
+Release APK is unsigned; the inherited app verifier alone does not.
+Evidence is under
+`target/privacy-standby/android-aac-observation-app-gates-v1/run-20261023T062739Z-deeb42c4/`.
+No phone was installed or tested. The earlier extent-query gate's 597 tests in
+68 suites per variant remain retained under
+`target/privacy-standby/recording-native-extent-android-app-v1/`, alongside
+`recording-checkpoint-android-app-v1/` and the earlier End/shutdown gate under
 `target/v4v-end-shutdown-v2/app-gates/gate-v1/`.
 
 The initial run exposed two failures while awaiting control-actor shutdown.

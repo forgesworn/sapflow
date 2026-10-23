@@ -303,8 +303,9 @@ saved checkpoint header, concrete root/file birth binding and exact fragment
 hash, treating the current header as advisory. This operation does not implement
 recovery or adopt orphan slots.
 
-The current host gate passes 86 filesystem tests, 38 library tests, 16 real-SDK
-filesystem/API tests and the strict iOS 16 check of all 68 app source files.
+The earlier submitted-input host gate passes 86 filesystem tests, 38 library
+tests, 16 real-SDK filesystem/API tests and the strict iOS 16 check of all
+68 app source files.
 Synthetic SDK payloads and scalar EOF controls establish storage/API behaviour;
 they are separate from native AAC and decoding evidence. The first run's SDK
 test compile failure is retained: an XCTest assertion inferred a throwing syscall
@@ -337,6 +338,107 @@ The real app producer/ingress/recording closure chain, synchronous known-loss
 accounting, SDK recorder migration and physical Stop qualification remain open.
 The submitted-input result cannot substitute for those barriers or the aggregate
 two-second loss requirement.
+
+## iOS first recorder adoption composition
+
+The first bounded app composition is locally committed as `928a616`. Its twelve
+source paths preserve the current product default. The concrete `CaptureRecording`
+facade retains legacy recording as the default. An internal cold selection may
+choose the SDK adapter, which owns the existing `RecordingCheckpointOwner` on
+the existing `recordingIO` queue and `EncodedWorkBudget`. Ingress supplies the
+same immutable sample constructed by its sole existing validation, with the
+original validated payload byte count. There is no extra sample query, encoder,
+media queue, encoded payload copy or per-unit validation.
+
+The adapter uses the real SDK's relative epoch-zero policy in the existing
+capture media clock, with 4 MiB fragments and a 500 ms fragment interval. These
+settings do not establish the aggregate two-second loss bound. Actual native
+full-generation AAC receipts are forwarded verbatim. Every SDK completion,
+including a successful complete SDK outcome and checked header rewrite, still
+returns a nil completion file URL, an incomplete app receipt and application
+admission unknown. After checked closure, the recording remains discoverable
+through the existing catalogue as an incomplete entry. Only actual
+compound-owner cleanup releases its retained storage
+ownership. Packet B producer closure authority and finalised app admission are
+not implemented. Existing Stop/cancel and recorder/transport cleanup joins remain.
+
+The cold capacity query uses the same append owner's child/root lease and
+compound busy guard, checking actual media/end state, owned slots and absent
+fixed temporary names. Its private scan reserves still-missing names within
+the same six-name allowance and existing 1,024-entry/256-segment caps. Available
+bytes are queried from the actual retained root descriptor. Three new
+capacity/failure tests cover descriptor identity, namespace limits and unknown
+metadata-close handling. The strict 200 MiB plus
+256 KiB floor remains. This check is not a second reserve owner or a fabricated
+storage reservation.
+
+All six current platform commands pass: 89 filesystem tests, 38 library tests,
+16 real-SDK checkpoint-owner tests, both generated modules and the strict iOS 16
+API check of all 69 production source files. Compiler warnings are errors.
+Independent outcome review verifies the source/package bindings, six logs and
+retained cleanup receipts. Evidence is under
+`target/privacy-standby/ios-recorder-adoption-platform-gates-v1/`.
+
+The actual generated-input adapter gate passes five finite native cases through
+seven commands, including four independent exact-original-AAC payload probes:
+
+| Case | Actual retained result |
+|---|---|
+| Healthy | All 18 of 18 native AAC units stored. |
+| Mixed zero/raw | All 38 of 38 units stored; one generation contains 20,017 intentional-zero and 16,039 raw frames. |
+| Publishing-only failure | All 18 of 18 units stored independently of the refused publisher. |
+| Missing file EOF ordering | All 15 of 15 pre-close units stored; three late native output units refused. No complete EOF is invented. |
+| Recording queue exhaustion | A positive bounded prefix of 127 of 159 native units is stored, with recording refusal retained. |
+
+The four payload probes compare stored packet sizes and hashes against the
+original native AAC bytes for the first four cases. The queue-refusal control
+checks its positive bounded prefix separately. This establishes actual adapter
+storage and payload behaviour, not new SDK decoder presentation or real capture
+producer closure. Source and scalar evidence are under
+`target/privacy-standby/ios-recorder-adoption-native-gates-v1/actual-v1/`.
+Independent platform and native outcome review is clear, including all current
+input, witness and command-log hashes.
+
+Both current legacy regression commands also pass: 86 observed-publisher tests
+and seven original native stored-payload/presentation controls, retaining both
+expected historical negatives and their original assertions. Evidence is under
+`target/privacy-standby/ios-recorder-adoption-legacy-gates-v1/`. Independent
+outcome review is clear. Full Debug, Qualification and Release app builds also
+pass through eleven commands with all current source/package bindings unchanged.
+All three built privacy resources, creator configuration modes and manual-link
+schemes pass. The Debug test bundle contains both exact corpora and all three
+new capacity test symbols, without test execution. Separate actual product
+readback verifies each app code object is unsigned and records the Debug
+implementation dylib separately from its launcher. Evidence is under
+`target/privacy-standby/ios-recorder-adoption-app-gates-v1/run-20261023T064820Z-dbedb444/`.
+Independent app outcome review is clear. No XCTest device bundle
+execution, signing, publication, phone installation or physical capture is
+established.
+
+The earlier numerical presentation contract, strict historical failures and
+all numerical thresholds are unchanged. SDK default adoption, finalised app
+receipts, aggregate two-second loss, durable orphan recovery, power-loss storage
+behaviour and physical acceptance remain open. No Rust SDK, dependency or CI
+qualification change is part of this composition.
+
+## Android AAC observation packet
+
+The locally committed Android F0 packet (`64e9521`) adds scalar diagnostics only.
+Raw and intentional-zero counts commit after successful native input queuing;
+missing, explicit zero and unavailable API 29 trim metadata retain distinct
+states. Output callback counts, handoff events and a cold snapshot do not prove
+access-unit extents, recorder admission, native EOF or durable progress. There
+is no hot admission ledger or changed priming/timing policy. It does not supply
+the producer authority required for recorder migration or recovery.
+
+Debug and Qualification each execute 616 JVM tests in 69 suites with zero
+failures, errors or skips. The three APK/lint/isolation and actual native-byte,
+16 KiB ELF/ZIP, routing, QR DEX and notice checks pass; lint retains 11/18/17
+warnings and zero errors. Independent source/outcome reviews are clear, and
+separate direct ZIP/signing-block readback verifies this Release APK is unsigned.
+Evidence is under
+`target/privacy-standby/android-aac-observation-app-gates-v1/run-20261023T062739Z-deeb42c4/`.
+No codec, capture, decoder, physical-device or recovery qualification is implied.
 
 ## Implementation order
 
