@@ -1097,8 +1097,33 @@ whose decoder exits are the expected 183. The actual original coded start
 are retained observations under investigation, not a definitive specification
 diagnosis or a general Android verdict.
 
-Native owners, the task emulator and temporary directory close; the pre-existing
-AVD and private generated evidence remain preserved. Host inspection completes
+The subsequent host-only interoperability experiment tests exactly five metadata
+profiles across the same three generated sources, without another encoder or
+native replay. The profiles cover the byte-identical original, explicit
+`iTunSMPB` head/tail/programme metadata, a complete media-header extent and a full
+final coded-unit duration. All fifteen files retain the original packet bytes,
+order and coded clocks. The three original controls reproduce their preceding
+whole-PCM failures, and the independent reader recognises all nine intended
+custom metadata tags.
+
+None produces the required whole programme. Profiles without the custom trim
+metadata return 0, 39,936 and 0 frames; those with it return 3,072, 48,128 and
+3,072, against required lengths of 2,765, 48,000 and 2,765. All thirty probe and
+decoder commands exit normally and their owned process groups close. Independent
+review verifies the retained files, complete finite PCM, input hashes and cleanup.
+The experiment therefore stops before native replay. This conclusion covers
+these five profiles and three sources, not every possible reader or container.
+
+The next experiments use explicitly identified checked readers to pass verified
+head/tail and coded-to-movie mapping facts to existing decoder APIs before
+decoding. Whole returned PCM remains unmodified. This is additional reader
+qualification, not a repair to stock file-reader interoperability, paired native
+recorder authority or application admission. Original recording files, checkpoint
+bindings, stock-reader failures and the numerical contract remain unchanged.
+
+In the preceding native SDK experiment, owners, the task emulator and temporary
+directory close; the pre-existing AVD and private generated evidence remain
+preserved. Host inspection completes
 with its input and proof closure intact. This establishes actual SDK method,
 file and geometry observations in the selected emulator profile, while native
 window qualification and paired presentation remain failed or unsupported.
@@ -1109,6 +1134,9 @@ original numerical contract are unchanged.
 
 Private outcome evidence:
 
+- Fixed five-profile host metadata experiment:
+  `target/privacy-standby/aac-host-metadata-matrix-actual-v1/receipt.local.json`
+  and its `independent-outcome-review.local.json`.
 - Corrected-source full Android gate:
   `target/privacy-standby/android-native-aac-integration-v2/run-20261023T144411Z-2a10c497/receipt.local.json`.
 - Debug native attempt and strict generated-prefix inspection:

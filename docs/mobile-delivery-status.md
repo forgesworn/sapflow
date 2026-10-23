@@ -5,9 +5,14 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-The next delivery step is Android native AAC qualification and SDK recorder
-integration. Then qualify checked crash recovery and the aggregate two-second
-source-presentation loss bound, run a complete-show physical pilot on both
+The next recording step is reader interoperability. The actual Android SDK
+programme-file experiment exercises the new muxer, but its whole decoded audio
+does not match the required programme length in either tested reader. A subsequent
+fixed five-profile metadata experiment also fails exact length in all fifteen
+generated files. Checked native and independent decoder adapters are the next
+experiments; neither changes the original stock-reader failures or qualifies
+application adoption. Then qualify checked crash recovery and the aggregate
+two-second source-presentation loss bound, run a complete-show physical pilot on both
 phones, and perform matched competitor performance qualification. The existing
 origin-first, free-V4V scope remains unchanged.
 
