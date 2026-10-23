@@ -11,6 +11,43 @@ source-presentation loss bound, run a complete-show physical pilot on both
 phones, and perform matched competitor performance qualification. The existing
 origin-first, free-V4V scope remains unchanged.
 
+The latest Android work adds pre-filter AAC observations (`73df1bb`), the
+generated codec fixture (`a632095`) and the optional SDK recording owner
+(`578d5b5`). The owner passes seventeen controls against the real SDK and host
+filesystem. It composes the existing recorder worker and checked checkpoint
+storage; even SDK completion remains submitted-input scope with app admission
+unknown. Capture and the product default have not adopted this path.
+
+The exact seven drain/leading source paths are locally committed as `2ec0300`;
+the retained app and native gates keep their original `578d5b5` source binding.
+The combined app gate genuinely executes 658 Debug tests in 72 suites and
+650 Qualification tests in 71 suites, plus 35 Python verifier tests, with no
+failures, errors or skips. All three APK builds, lint, isolation and actual
+artefact checks pass with 362 inputs unchanged. Lint has zero errors and
+21/26/15 Debug/Qualification/Release warnings. Direct ZIP/signing-block
+readback verifies Release is unsigned. Debug and Qualification retain standard
+debug signing; signer identity was not cryptographically checked. The linked
+[Android drain and leading experiments](recording-recovery.md#android-native-aac-drain-and-leading-experiments)
+record the exact source, package, native observations and private receipts.
+
+All twenty generated emulator drain cases reach native EOS and confirmed
+cleanup. Eighty independent parser/container/decode commands retain every
+original AAC packet and measure the coded extent. Unaligned input still yields
+a coded extent shorter than the programme; aligned input and each drain
+treatment produce the measured physical queued extent. This does not establish
+which coded frames present the complete programme after native leading delay.
+
+The cold-leading experiment fails all four cases: two exceed its fixed 250 ms
+queue-to-Start budget, and two refuse an absent output PCM-format key. No Start,
+leading fact or production timing receipt is issued. The next step is correcting
+the documented PCM-format handling and measuring preparation costs without
+relaxing that budget, then qualifying the original coded programme window before
+capture integration. All four failed cases and the earlier native-container abort
+remain retained. Only generated media ran in a read-only emulator; the emulator
+was stopped, its task-owned temporary directory removed and the existing AVD
+preserved. No physical phone capture, Release signing, push or publication was
+part of these experiments.
+
 The fresh generated [recording presentation matrix](recording-recovery.md#fresh-registered-matrix-result)
 passes its separately registered numerical contract across five A/V and ten
 audio-only/short-prefix cases. Nine complete comparisons satisfy every exact
@@ -140,8 +177,8 @@ the Debug test bundle compiled rather than executed. Separate actual readback
 verifies all three app code objects are unsigned and binds the Debug loader and
 implementation dylib individually. The full-app independent review is clear.
 
-Android Debug and Qualification each genuinely execute 636 JVM tests across
-70 suites, including all twenty storage controls, with zero failures, errors or
+At that earlier SDK refresh, Android Debug and Qualification each genuinely
+execute 636 JVM tests across 70 suites, including all twenty storage controls, with zero failures, errors or
 skips. All 345 inputs and 140 XML reports are independently hash-verified. All
 three APK assemblies, lint, qualification isolation and actual artefact checks
 pass against the current AAR/native SDK bytes. Lint retains zero errors and

@@ -846,6 +846,100 @@ Evidence is under
 `target/privacy-standby/android-aac-observation-app-gates-v1/run-20261023T062739Z-deeb42c4/`.
 No codec, capture, decoder, physical-device or recovery qualification is implied.
 
+## Android native AAC drain and leading experiments
+
+The F1 observations are locally committed as `73df1bb`, the generated F2 fixture
+as `a632095`, and the optional SDK recording owner as `578d5b5`. Positive output
+buffers retain unknown AU cardinality until independently parsed. The production
+AAC configuration was extracted without changing its AAC-LC 48 kHz mono settings.
+The SDK owner uses the existing recorder worker and checked storage; it passes
+seventeen actual SDK/host-filesystem controls, including checkpoint readback,
+cancellation and uncertain closes. Its low-level native facts remain caller
+supplied. It does not grant concrete Android producer authority, a finalised app
+URL, recovery or default adoption.
+
+The seven F3/F4 source paths are locally committed as `2ec0300`. Their retained
+app gate runs at `578d5b5` with exactly seven changed candidate paths. Debug
+genuinely executes 658 tests in 72 suites, including eight new
+Debug-only alignment controls; Qualification executes 650 tests in 71 suites.
+Both have zero failures, errors and skips. The 35 Python verifier controls,
+all three APK assemblies, lint and isolation pass. Lint has zero errors and
+21/26/15 Debug/Qualification/Release warnings. All 362 inputs remain unchanged.
+Actual readback verifies four-ABI AAR and ARM64 APK native provenance, 16 KiB
+ELF/ZIP alignment, notices, routing, QR DEX and Release exclusion of the
+native experiment tools. Direct complete-ZIP/signing-block inspection verifies
+an unsigned Release APK; Debug and Qualification retain standard debug signing.
+
+The existing read-only emulator runs twenty generated drain cases: 48,000-frame
+raw and 2,765-frame mixed programmes, five padding/drain policies and two input
+EOS placements. Raw programme, intentional programme silence, block padding and
+codec-drain input have separate successful-queue accounting and hashes. All
+cases reach actual input/output EOS, native Stop/release, callback barriers and
+stream closure. Eighty independent commands parse the exact original raw AAC
+ranges and verify native MP4 packet identity and actual decoding. The retained
+traced decoder and its packed-unit, truncation and trailing-byte negative
+controls supply the raw parser; no ADTS header or callback-count inference is
+substituted for original-byte parsing.
+
+Unaligned input again yields 47,104 coded frames for 48,000 supplied frames,
+and 2,048 for the 2,765-frame programme. Alignment alone yields 48,128 and 3,072
+coded frames respectively. Every aligned/drain treatment's independently
+decoded coded extent equals its physical queued input; changing EOS placement
+does not change those extents. These are observations of the selected software
+codec and emulator. Neither coded extent nor native EOS proves the complete
+programme window after leading delay. No leading value or sub-1,024-frame final
+tail is inferred from these counts.
+
+The separate cold experiment is designed to keep one encoder across preparation
+and Start, with a bounded temporary decoder used only before Start. It fails all four
+generated cases. Two exceed the registered 250 ms budget from the first queued
+preparation sample through Start; two encounter an absent output PCM-encoding key and refuse before
+copying native preparation PCM. All four retain their original failure and
+confirmed cleanup; none issues Start or a candidate leading value. The host
+inspector records all four failures, starts no decoder children and returns
+failure for candidate qualification. The absent PCM key requires documented
+format-default handling;
+absent encoder delay/padding remains unknown. Preparation diagnostics and cost
+must be corrected without changing the fixed budget, two-anchor thresholds or
+the original presentation contract.
+
+These fixtures deliberately export generated PCM and original encoded bytes,
+and the cold experiment creates a temporary decoder. Those test costs are not
+production hot-path performance evidence. A genuine independently checked
+native programme window, exact source/generation/file EOF accounting, paired
+presentation and concrete capture ownership remain required before SDK recorder
+adoption. No second production encoder, media queue or per-unit revalidation is
+introduced by this packet. The 2,875-byte numerical contract remains unchanged.
+
+Private evidence, with generated media kept out of source control:
+
+- SDK owner host controls:
+  `target/android-sdk-recording-owner-host/run-20261023T133540Z-e3c6e8e0/receipt.local.json`
+  and its sibling independent outcome review.
+- Combined app build and artefact verification:
+  `target/privacy-standby/android-native-aac-integration-v1/run-20261023T140901Z-4dafb569/receipt.local.json`
+  with sibling `artifact-verification.local.json` and
+  `independent-outcome-review.local.json`.
+- Actual APK/source/OS/nonce/extraction and resource cleanup:
+  `target/privacy-standby/android-native-aac-runtime-v1/actual-v1/receipt.local.json`,
+  with sibling `independent-native-outcome-review.local.json` and
+  `drain-extracted/` and `leading-extracted/` containing the untouched generated
+  native evidence.
+- Independent drain parsing and native-container decoding:
+  `target/privacy-standby/android-native-aac-runtime-v1/actual-v1/drain-host-v1/receipt.local.json`.
+- Failed cold-leading qualification:
+  `target/privacy-standby/android-native-aac-runtime-v1/actual-v1/leading-host-v1/receipt.local.json`.
+- The original F2 native-container abort, safe-container successor and native
+  source deficits remain under
+  `target/privacy-standby/android-native-aac-qualification-v1/actual-native-v1/`
+  and `actual-native-v2/`; their original Debug APKs are preserved separately.
+
+The task-started emulator and temporary directory are closed and removed; the
+pre-existing AVD is preserved. The active physical broadcast was not changed.
+No real camera media, physical acceptance, Release signing, push or publication
+is part of these generated experiments. Crash recovery, durable bindings and
+the aggregate two-second source-presentation loss bound remain open.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC
