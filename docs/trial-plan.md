@@ -366,7 +366,20 @@ refused); the callback path is tested in phase B.
   the end, in small steps; the recording one 7,200 s file that decodes to
   its end, `complete=true`. `docker stats` rose and fell between 40 and
   50 MB: it counts the kernel's memory for the recording's writes, so read
-  `RssAnon` for criterion 6. Drops and viewers are still to run.
+  `RssAnon` for criterion 6.
+  Second run (2026-10-23, same host, two hours, the same signal with an
+  encoder drop of 1 s every 20 minutes and one of 30 s, three scripted
+  LL-HLS viewers polling the playlist every 100 ms and fetching every part
+  straight from sapflow): every drop resumed the same stream and recording
+  inside the grace (`resumed=true`, ready in 0.2 s after the long one); no
+  viewer went more than 3 s without a new part except across the 30 s drop
+  (30.9 s each); each viewer fetched 35,302 parts with 7 failed requests,
+  not yet explained; the process's memory 18.5 to 20.9 MB and back to
+  19.2 MB, 13 to 16 descriptors, about 2% CPU; one recording of 7,166 s
+  (on-air time less the drops) that decodes to its end, `complete=true`.
+  Not covered: real players, viewers through Caddy (a scripted client
+  through the CDN in front saw 7 s gaps that Safari and Chrome did not),
+  and the phone as the encoder.
 - [ ] The recording: one file, `ffprobe` length against on-air time,
   plays and seeks in Chrome and Safari.
 - [ ] If the wired Linux machine is free, run `scripts/bench-remote.sh` at
