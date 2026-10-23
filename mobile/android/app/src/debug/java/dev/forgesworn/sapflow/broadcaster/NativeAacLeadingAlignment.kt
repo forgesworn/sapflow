@@ -36,17 +36,47 @@ internal object NativeAacLeadingAlignment {
         require(source.size == PREAMBLE_FRAMES)
         require(decodedFrames in MIN_DECODED_FRAMES..MAX_DECODED_FRAMES && decodedFrames <= decoded.size)
         fun anchor(start: Int): Anchor {
-            var sourceEnergy = 0.0
-            repeat(ANCHOR_FRAMES) { i -> val x = source[start + i].toDouble(); sourceEnergy += x * x }
+            // PCM16 products fit Int; each 1024-term sum is at most 2^40.
+            // Thus Long accumulation and the original Double sums are exact.
+            var sourceEnergySum = 0L
+            for (i in 0 until ANCHOR_FRAMES) {
+                val x = source[start + i].toInt()
+                sourceEnergySum += (x * x).toLong()
+            }
+            val sourceEnergy = sourceEnergySum.toDouble()
             require(sourceEnergy > ANCHOR_FRAMES * 256.0 * 256.0) { "Unusable source anchor" }
+            var windowEnergy = 0L
+            for (i in 0 until ANCHOR_FRAMES) {
+                val y = decoded[start + i].toInt()
+                windowEnergy += (y * y).toLong()
+            }
             var best = -2.0; var next = -2.0; var bestLag = -1; var bestGain = 0.0
             for (lag in 0..MAX_LAG) {
-                var dot = 0.0; var energy = 0.0
-                repeat(ANCHOR_FRAMES) { i ->
-                    val x = source[start + i].toDouble()
-                    val y = decoded[start + lag + i].toDouble()
-                    dot += x * y; energy += y * y
+                if (lag != 0) {
+                    val leaving = decoded[start + lag - 1].toInt()
+                    val entering = decoded[start + lag + ANCHOR_FRAMES - 1].toInt()
+                    windowEnergy -= (leaving * leaving).toLong()
+                    windowEnergy += (entering * entering).toLong()
                 }
+                // Eight scalar Long lanes, with no per-lag scratch allocation.
+                var d0 = 0L; var d1 = 0L; var d2 = 0L; var d3 = 0L
+                var d4 = 0L; var d5 = 0L; var d6 = 0L; var d7 = 0L
+                var i = 0
+                while (i < ANCHOR_FRAMES) {
+                    val p = start + i
+                    val q = p + lag
+                    d0 += (source[p].toInt() * decoded[q].toInt()).toLong()
+                    d1 += (source[p + 1].toInt() * decoded[q + 1].toInt()).toLong()
+                    d2 += (source[p + 2].toInt() * decoded[q + 2].toInt()).toLong()
+                    d3 += (source[p + 3].toInt() * decoded[q + 3].toInt()).toLong()
+                    d4 += (source[p + 4].toInt() * decoded[q + 4].toInt()).toLong()
+                    d5 += (source[p + 5].toInt() * decoded[q + 5].toInt()).toLong()
+                    d6 += (source[p + 6].toInt() * decoded[q + 6].toInt()).toLong()
+                    d7 += (source[p + 7].toInt() * decoded[q + 7].toInt()).toLong()
+                    i += 8
+                }
+                val dot = (d0 + d1 + d2 + d3 + d4 + d5 + d6 + d7).toDouble()
+                val energy = windowEnergy.toDouble()
                 val score = if (energy > 0.0) dot / sqrt(sourceEnergy * energy) else -1.0
                 if (score > best) {
                     next = best; best = score; bestLag = lag; bestGain = dot / sourceEnergy
