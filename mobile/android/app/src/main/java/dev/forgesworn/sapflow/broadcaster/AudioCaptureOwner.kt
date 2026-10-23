@@ -261,6 +261,7 @@ internal class AudioCaptureOwner(
     private fun pump(g: Generation) {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
         var held: PcmBlockPool.Block?=null;var heldOffset=0;var borrowedInput=-1
+        var nativeQueueUnconfirmed=false;var submissionPending=false
         val cadence = ReplacementCadence(Math.addExact(epochNs,Math.multiplyExact(g.clock.inputStartUs,1000)),1024,48_000)
         try {
             while(g.pumping.get()) {
@@ -343,17 +344,29 @@ internal class AudioCaptureOwner(
                 }
                 check(!failed && runAdmission.admit(System.nanoTime())) { "Capture run failed before native AAC input" }
                 if(g.mode==Mode.RETIRING && !g.gracefulTail)break
-                codec.queueInputBuffer(index,0,bytes,ptsUs,0);borrowedInput=-1
+                // A throwing native queue call leaves index ownership unknown.
+                // Keep submissionPending through returned-call bookkeeping too:
+                // a real admitted tail must not lose its failure during Stop.
+                nativeQueueUnconfirmed=true;submissionPending=true
+                codec.queueInputBuffer(index,0,bytes,ptsUs,0)
+                nativeQueueUnconfirmed=false;borrowedInput=-1
+                g.acceptedFrames.addAndGet(bytes/2L)
                 g.observation.inputQueued(g.ticket.serial,submittedRawFrames,submittedZeroFrames)
-                held?.let { if(heldOffset==it.bytes){g.pool.release(it);held=null} }
-                g.acceptedFrames.addAndGet(bytes/2L);g.inputTick=Math.addExact(g.inputTick,bytes/2L)
+                g.inputTick=Math.addExact(g.inputTick,bytes/2L)
                 g.lastInputUs.set(ptsUs+bytes/2L*1_000_000/48_000)
+                held?.let { if(heldOffset==it.bytes){g.pool.release(it);held=null} }
+                submissionPending=false
             }
-        }catch(error:Exception){if(g.pumping.get() && g.mode!=Mode.RETIRING)report(g,"AAC input failed: ${error.message ?: error.javaClass.simpleName}")}
+        }catch(error:Exception){
+            if(AudioInputFailure.requiresFailure(submissionPending,g.pumping.get(),g.mode==Mode.RETIRING,error is InterruptedException))
+                report(g,"AAC input failed: ${error.message ?: error.javaClass.simpleName}")
+        }
         finally{
-            // Even an expected privacy/Stop fence must return a dequeued index
-            // so EOS can use a single-buffer native encoder without stalling.
-            if(borrowedInput>=0 && !g.inputs.offer(borrowedInput))report(g,"AAC input index return exceeded its bound")
+            // A pre-submission privacy/Stop fence returns its known borrow so
+            // a single-buffer encoder can send EOS. Never recycle an index
+            // whose native queue call threw; only actual stop invalidates it.
+            if(borrowedInput>=0 && AudioInputFailure.mayReturnBorrowedIndex(nativeQueueUnconfirmed) && !g.inputs.offer(borrowedInput))
+                report(g,"AAC input index return exceeded its bound")
             held?.let{runCatching{g.pool.release(it)}.onFailure{report(g,"PCM pump release failed")}}
             owner.post{if(active===g){g.workers.pumpCompleted();joinProducers(g)}}
         }
@@ -436,10 +449,10 @@ internal class AudioCaptureOwner(
         if(active!==g || lifecycle.currentStage()!=AudioGenerationLifecycle.Stage.PRODUCERS || !g.recordStopReturned || !g.workers.stopped || g.producerJoinStarted)return
         g.producerJoinStarted=true
         native.execute{
-            runCatching{g.reader?.join(1000);g.pump?.join(1000)}
-            val done=g.reader?.isAlive!=true && g.pump?.isAlive!=true
-            owner.post{if(active===g){if(!done){report(g,"Audio producer threads remain retained");closeReply?.invoke(false)}else {
-                g.observation.producersJoined(g.ticket.serial);act(g,lifecycle.producersClosed(g.ticket))}}}
+            val joinedInputFrames=g.workers.joinedInputFrames(g.reader,g.pump,g.acceptedFrames)
+            owner.post{if(active===g){if(joinedInputFrames==null){report(g,"Audio producer threads/input disposition remain unconfirmed");closeReply?.invoke(false)}else {
+                g.observation.producersJoined(g.ticket.serial)
+                act(g,lifecycle.producersClosed(g.ticket,joinedInputFrames>0))}}}
         }
     }
     private fun maybeSendEos(g:Generation){

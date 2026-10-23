@@ -187,4 +187,32 @@ class AudioGenerationLifecycleTest {
         assertNull(f.policy.snapshot().fault);assertFalse(f.policy.permitsRaw(f.run))
     }
 
+
+    @Test fun joinedFirstTailOverridesTheEarlierNoInputRetirementSnapshot() {
+        val p=AudioGenerationLifecycle();val g=checkNotNull(p.begin())
+        assertEquals(AudioGenerationLifecycle.Action.STOP_PRODUCERS,p.retire(g,false,10,100))
+        assertEquals(AudioGenerationLifecycle.Action.SEND_EOS,p.producersClosed(g,true))
+        assertEquals(AudioGenerationLifecycle.Stage.EOS,p.currentStage())
+        assertEquals(AudioGenerationLifecycle.Action.NONE,p.producersClosed(g,false))
+        assertEquals(AudioGenerationLifecycle.Action.NONE,p.callbacksClosed(g))
+        assertFalse(p.actualClosed(g));assertNull(p.begin())
+        assertEquals(AudioGenerationLifecycle.Action.QUIESCE,p.eos(g))
+        p.callbacksClosed(g);p.handoffIdle(g);p.released(g,true,20)
+        val next=checkNotNull(p.begin())
+        assertEquals(AudioGenerationLifecycle.Action.NONE,p.producersClosed(g,true))
+        assertTrue(p.owns(next))
+    }
+    @Test fun joinedZeroCannotEraseAnAlreadyObservedSuccessfulInput() {
+        val p=AudioGenerationLifecycle();val g=checkNotNull(p.begin());p.retire(g,true,10,100)
+        assertEquals(AudioGenerationLifecycle.Action.SEND_EOS,p.producersClosed(g,false))
+        assertEquals(AudioGenerationLifecycle.Stage.EOS,p.currentStage())
+    }
+    @Test fun firstTailMissingEosRemainsFailedAfterActualResourceRelease() {
+        val p=AudioGenerationLifecycle();val g=checkNotNull(p.begin());p.retire(g,false,10,100)
+        assertEquals(AudioGenerationLifecycle.Action.SEND_EOS,p.producersClosed(g,true))
+        assertEquals(AudioGenerationLifecycle.Action.QUIESCE,p.abortEos(g))
+        p.callbacksClosed(g);assertEquals(AudioGenerationLifecycle.Action.RELEASE,p.handoffIdle(g))
+        assertEquals(AudioGenerationLifecycle.Action.CLOSED,p.released(g,true,20))
+        assertTrue(p.actualClosed(g));assertTrue(p.isFailed());assertNull(p.begin())
+    }
 }

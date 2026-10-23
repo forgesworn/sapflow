@@ -28,8 +28,14 @@ internal class AudioGenerationLifecycle(initialSerial: Long = 0) {
         startedNs = nowNs; deadlineNs = originalDeadlineNs; hadInput = acceptedInput
         stage = Stage.PRODUCERS; return Action.STOP_PRODUCERS
     }
-    @Synchronized fun producersClosed(value: Generation): Action {
+    /** Preserve the scalar-driver entry point. The concrete native owner uses
+     * the explicit overload with input observed AFTER its actual joins. */
+    @Synchronized fun producersClosed(value: Generation): Action = producersClosed(value, hadInput)
+    @Synchronized fun producersClosed(value: Generation, joinedAcceptedInput: Boolean): Action {
         if (current !== value || stage != Stage.PRODUCERS) return Action.NONE
+        // Retirement may precede the first successful graceful-tail queue.
+        // A positive earlier observation can never be erased by a later one.
+        hadInput = hadInput || joinedAcceptedInput
         stage = if (hadInput) Stage.EOS else Stage.CALLBACKS
         return if (hadInput) Action.SEND_EOS else Action.QUIESCE
     }
@@ -116,4 +122,13 @@ internal class AudioNativeFailure(private val run:CameraRunAdmission,private val
             if(state.compareAndSet(old,State(owner,reason))){run.fail();return true}
         }
     }
+}
+
+/** Failure classification for the actual PCM pump. This grants no native
+ * completion authority. Its pending flag spans queue attempt through returned
+ * call bookkeeping; intentional interruption is safe only before that span. */
+internal object AudioInputFailure {
+    fun requiresFailure(submissionPending:Boolean,pumping:Boolean,retiring:Boolean,interrupted:Boolean):Boolean =
+        submissionPending || pumping && (!retiring || !interrupted)
+    fun mayReturnBorrowedIndex(nativeQueueUnconfirmed:Boolean):Boolean = !nativeQueueUnconfirmed
 }
