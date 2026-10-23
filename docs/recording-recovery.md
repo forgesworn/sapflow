@@ -110,6 +110,41 @@ payload provenance, raw-admission or settled-silence requirements. It does not
 qualify production recorder adoption, durable recovery, the aggregate loss bound,
 power loss, physical devices or sustained shows.
 
+## Portable checkpoint SDK
+
+The shared `sapflow_hls::recording_checkpoint` codec and typed Swift/Kotlin
+bindings now describe an exact serialised fragment prefix. The native muxer
+captures the original INITIAL header length/hash and stages the cumulative
+fragment byte count with each flush. Only committing that same output advances
+the byte frontier; held audio, rejected input and final header rewrites do not.
+An older issued checkpoint retains its own snapshot after later output or finish.
+
+One cold `encodeCheckpoint` call returns both the bounded slot bytes and typed
+information for the platform's append-position check. Decoded persisted data is
+a separate type and cannot act as a live muxer checkpoint. The portable V1 slot
+has a 512-byte prefix, a 1 to 65,536-byte opaque header and a SHA256 trailer,
+totalling at most 66,080 bytes. It checks exact supplied identity bindings,
+lengths, reserved fields, scalar media bounds and successor order. Checksum-valid
+contradictions are distinguished from corruption; a platform must not silently
+discard a contradictory slot in favour of an older one.
+
+These are metadata and serialisation guarantees. A checksum is not authenticity;
+neither decode nor a native byte frontier proves a file was appended, synchronised,
+closed, durably catalogued or independently decoded. The platform must retain
+its file identity, hash the actual fragment region and complete its own storage
+operations. No additional encoder, media queue or per-unit sample validation is
+introduced by this SDK change.
+
+The current source passes 700 workspace tests, strict Clippy and formatting,
+generated-stream smoke checks, four scalar seed replays and 522,636 ASan/overflow
+fuzz executions. Actual generated Swift and Kotlin host consumers pass frontier,
+hash, successor, foreign-owner and retained-token checks. These results qualify
+the SDK API and bounded parser; they do not establish installed recovery or the
+two-second loss bound. Evidence is retained under
+`target/recording-checkpoint-gates-v1/`,
+`target/privacy-standby/recording-checkpoint-fuzz-v1/` and
+`target/privacy-standby/recording-checkpoint-native-check/`.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC

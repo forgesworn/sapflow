@@ -23,3 +23,5 @@ adts-reader = "0.4.0"
 h264-reader = "0.9.0"
 mpeg2ts = "0.6.1"
 tracing = "0.1.44"
+
+sha2 = { version = "=0.11.1", default-features = false }

@@ -797,3 +797,357 @@ fn unknown_eof_preserves_nominal_last_duration_even_after_receiving_complete_met
     assert_eq!(facts.audio_container_end, facts.audio_end);
     assert!(!facts.complete_audio_eof);
 }
+
+fn encode_slot(
+    mux: &NativeRecordingMuxer,
+    token: Arc<NativeRecordingCheckpoint>,
+    hash: [u8; 32],
+) -> NativeRecordingCheckpointEncoding {
+    mux.encode_checkpoint(token, vec![7; 32], vec![9; 32], hash.to_vec())
+        .expect("exact issued snapshot encode")
+}
+#[test]
+fn portable_checkpoint_frontier_equals_actual_serialized_initial_and_fragments() {
+    let mux = native_mux(100);
+    let a = audio();
+    mux.begin_native_audio(2112).expect("measured head");
+    let mut initial = Vec::new();
+    let mut region = Vec::new();
+    let mut saved = None;
+    let mut decoded_prior = None;
+    for n in 0..17 {
+        let payload = vec![1; (n as usize % 5 + 1) * 7];
+        let pts = (n * 1024) as i64;
+        let unit = a
+            .sample(&payload, pts, pts, 1024, 48000, false)
+            .expect("validated variable AAC payload");
+        mux.push(unit).expect("bounded actual push");
+        for chunk in drain(&mux) {
+            match chunk.kind {
+                NativeRecordingChunkKind::Initial => {
+                    assert!(initial.is_empty());
+                    initial = chunk.bytes;
+                }
+                NativeRecordingChunkKind::Fragment => {
+                    region.extend_from_slice(&chunk.bytes);
+                    let token = chunk.checkpoint.expect("fragment issuer");
+                    let hash = checkpoint::metadata_sha256(&region);
+                    let encoded = encode_slot(&mux, token.clone(), hash);
+                    assert_eq!(encoded.info.initial_header_len as usize, initial.len());
+                    assert_eq!(
+                        encoded.info.initial_header_sha256,
+                        checkpoint::metadata_sha256(&initial)
+                    );
+                    assert_eq!(encoded.info.fragment_region_bytes, region.len() as u64);
+                    assert_eq!(
+                        encoded.info.committed_offset,
+                        (initial.len() + region.len()) as u64
+                    );
+                    let decoded = decode_recording_checkpoint(
+                        encoded.bytes.clone(),
+                        vec![7; 32],
+                        vec![9; 32],
+                    )
+                    .expect("same portable codec");
+                    assert_eq!(
+                        decoded.header(),
+                        mux.checkpoint_header(token.clone())
+                            .expect("same issuer header")
+                    );
+                    assert_eq!(
+                        decoded.info().committed_offset,
+                        encoded.info.committed_offset
+                    );
+                    if let Some(prior) = decoded_prior.take() {
+                        validate_recording_checkpoint_successor(prior, decoded.clone())
+                            .expect("real exact next chunk");
+                    }
+                    decoded_prior = Some(decoded);
+                    if saved.is_none() {
+                        saved = Some((token, hash, encoded.bytes));
+                    }
+                }
+                NativeRecordingChunkKind::FinalHeader => panic!("no early final header"),
+            }
+        }
+    }
+    let (old, hash, bytes) = saved.expect("several actual fragments");
+    let original_end = old.sealed_file_end;
+    assert!(mux.guard().expect("owner").native_sealed_fragment_bytes > old.fragment_region_bytes);
+    assert_eq!(
+        encode_slot(&mux, old.clone(), hash).bytes,
+        bytes,
+        "old token never uses new counters"
+    );
+    mux.finish_native(NativeRecordingCompletion::IncompletePrefix)
+        .expect("unknown EOF prefix");
+    let before = mux
+        .guard()
+        .expect("committed finish")
+        .native_sealed_fragment_bytes;
+    let chunks = drain(&mux);
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c.kind == NativeRecordingChunkKind::FinalHeader)
+    );
+    assert_eq!(
+        mux.guard()
+            .expect("no dequeue counter")
+            .native_sealed_fragment_bytes,
+        before
+    );
+    assert_eq!(
+        encode_slot(&mux, old.clone(), hash).info.committed_offset,
+        original_end
+    );
+    mux.cancel().expect("already sealed cancellation");
+    assert_eq!(
+        encode_slot(&mux, old, hash).bytes,
+        bytes,
+        "old accepted prefix survives cancel"
+    );
+}
+#[test]
+fn portable_checkpoint_foreign_owner_and_digest_refusal_do_not_mutate_output_or_state() {
+    let mux = native_mux(100);
+    let a = audio();
+    mux.begin_native_audio(0).expect("head");
+    let mut token = None;
+    for n in 0..5 {
+        mux.push(sample(&a, n)).expect("AU");
+        let chunks = drain(&mux);
+        token = token.or_else(|| chunks.into_iter().find_map(|x| x.checkpoint));
+    }
+    let token = token.expect("real issued chunk");
+    let other = native_mux(100);
+    let before = mux.stats().expect("before");
+    let frontier = mux.guard().expect("owner").native_sealed_fragment_bytes;
+    assert_eq!(
+        other
+            .encode_checkpoint(token.clone(), vec![7; 32], vec![9; 32], vec![13; 32])
+            .err(),
+        Some(RecordingCheckpointError::ForeignCheckpoint)
+    );
+    for length in [0, 31, 33, 128] {
+        assert_eq!(
+            mux.encode_checkpoint(token.clone(), vec![0; length], vec![9; 32], vec![13; 32])
+                .err(),
+            Some(RecordingCheckpointError::DigestLength)
+        );
+        assert_eq!(
+            mux.encode_checkpoint(token.clone(), vec![7; 32], vec![0; length], vec![13; 32])
+                .err(),
+            Some(RecordingCheckpointError::DigestLength)
+        );
+        assert_eq!(
+            mux.encode_checkpoint(token.clone(), vec![7; 32], vec![9; 32], vec![0; length])
+                .err(),
+            Some(RecordingCheckpointError::DigestLength)
+        );
+    }
+    let after = mux.stats().expect("after");
+    assert_eq!(after.accepted_samples, before.accepted_samples);
+    assert_eq!(after.queued_output_bytes, before.queued_output_bytes);
+    assert_eq!(
+        mux.guard()
+            .expect("unchanged native frontier")
+            .native_sealed_fragment_bytes,
+        frontier
+    );
+    assert!(drain(&mux).is_empty());
+}
+#[test]
+fn portable_checkpoint_held_and_rejected_input_cannot_advance_byte_frontier() {
+    let mux = native_mux(100);
+    let a = audio();
+    mux.begin_native_audio(0).expect("head");
+    mux.push(sample(&a, 0)).expect("first held AU");
+    drain(&mux);
+    {
+        let state = mux.guard().expect("owner");
+        assert_eq!(state.native_sealed_fragment_bytes, 0);
+        let plan = state
+            .plan_native_flush(NativeFlushMode::Live {
+                release_audio_tail: false,
+            })
+            .expect("empty seal plan");
+        assert!(plan.output.is_none());
+        assert_eq!(plan.sealed_fragment_bytes, 0);
+    }
+    for n in 1..5 {
+        mux.push(sample(&a, n)).expect("AAC");
+        drain(&mux);
+    }
+    let before = mux
+        .guard()
+        .expect("before refused successor")
+        .native_sealed_fragment_bytes;
+    assert_eq!(
+        mux.push(sample(&a, 4)),
+        Err(NativeRecordingError::InvalidMedia)
+    );
+    assert_eq!(
+        mux.guard()
+            .expect("after refused successor")
+            .native_sealed_fragment_bytes,
+        before
+    );
+    assert!(drain(&mux).is_empty());
+}
+#[test]
+fn portable_checkpoint_zero_audio_video_only_uses_actual_optional_topology_and_frontier() {
+    let mux =
+        NativeRecordingMuxer::with_native_aac_timing(true, true, 0, 1024, 100).expect("AV owner");
+    let a = audio();
+    let v = video_codec();
+    mux.begin_native_audio(2112).expect("actual leading");
+    let mut initial_len = 0;
+    let mut token = None;
+    let mut region_bytes = 0;
+    mux.push(video_sample(&v, 0, 5)).expect("IDR");
+    drain(&mux);
+    mux.push(sample(&a, 0)).expect("held AAC");
+    for c in drain(&mux) {
+        if c.kind == NativeRecordingChunkKind::Initial {
+            initial_len = c.bytes.len();
+        }
+    }
+    mux.push(video_sample(&v, 1, 700)).expect("video");
+    drain(&mux);
+    mux.push(video_sample(&v, 2, 700)).expect("video boundary");
+    for c in drain(&mux) {
+        region_bytes += c.bytes.len();
+        token = c.checkpoint;
+    }
+    let encoded = encode_slot(&mux, token.expect("actual video-only receipt"), [1; 32]);
+    assert_eq!(encoded.info.facts.audio_units, 0);
+    assert_eq!(encoded.info.facts.audio_end, 0);
+    assert_eq!(encoded.info.facts.completed_generation_count, 0);
+    assert_eq!(encoded.info.facts.video_units, 2);
+    assert_eq!(
+        encoded.info.committed_offset,
+        (initial_len + region_bytes) as u64
+    );
+    decode_recording_checkpoint(encoded.bytes, vec![7; 32], vec![9; 32])
+        .expect("zero AAC is not false empty media");
+}
+#[test]
+fn portable_checkpoint_complete_tail_and_final_rewrite_keep_coded_and_container_frontiers_distinct()
+{
+    let mux = native_mux(100);
+    let a = audio();
+    mux.begin_native_audio(2112).expect("head");
+    for n in 0..9 {
+        mux.push(sample(&a, n)).expect("actual AU");
+        drain(&mux);
+    }
+    mux.end_native_audio_generation(generation())
+        .expect("native generation EOF");
+    mux.complete_native_audio(file())
+        .expect("checked aggregate");
+    let prior = mux
+        .guard()
+        .expect("pre-EOF frontier")
+        .native_sealed_fragment_bytes;
+    mux.finish_native(NativeRecordingCompletion::Complete)
+        .expect("real EOF");
+    let chunks = drain(&mux);
+    let mut fragment_len = 0;
+    let mut token = None;
+    for c in chunks {
+        if c.kind == NativeRecordingChunkKind::Fragment {
+            fragment_len += c.bytes.len();
+            token = c.checkpoint;
+        }
+    }
+    let after = mux
+        .guard()
+        .expect("post-EOF frontier")
+        .native_sealed_fragment_bytes;
+    assert_eq!(
+        after,
+        prior + fragment_len as u64,
+        "offset-zero final rewrite adds no bytes"
+    );
+    let encoded = encode_slot(&mux, token.expect("actual final fragment"), [3; 32]);
+    assert_eq!(encoded.info.facts.audio_end, 9216);
+    assert_eq!(encoded.info.facts.audio_container_end, 8512);
+    assert!(encoded.info.facts.complete_audio_eof);
+    assert_eq!(encoded.info.facts.completed_generation_count, 1);
+    assert_eq!(encoded.info.facts.final_trailing_frames, 704);
+    decode_recording_checkpoint(encoded.bytes, vec![7; 32], vec![9; 32])
+        .expect("real complete EOF slot");
+}
+#[test]
+fn portable_checkpoint_frontier_arithmetic_refuses_before_commit_without_large_allocations() {
+    assert_eq!(sealed_byte_frontier(100, 0, 20), Ok((20, 120)));
+    assert_eq!(
+        sealed_byte_frontier(100, u64::MAX, 1),
+        Err(NativeRecordingError::Encoding)
+    );
+    assert_eq!(
+        sealed_byte_frontier(100, i64::MAX as u64 - 100, 1),
+        Err(NativeRecordingError::Encoding)
+    );
+}
+#[test]
+fn portable_checkpoint_existing_multi_generation_coverage_is_not_inferred_from_latest_eof() {
+    let mux =
+        NativeRecordingMuxer::with_native_aac_timing(true, true, 0, 1024, 100).expect("AV owner");
+    let a = audio();
+    let v = video_codec();
+    mux.begin_native_audio(0).expect("head");
+    mux.push(video_sample(&v, 0, 5)).expect("IDR");
+    drain(&mux);
+    for n in 0..3 {
+        mux.push(sample(&a, n)).expect("actual generation AU");
+        drain(&mux);
+        mux.end_native_audio_generation(NativeAudioGenerationReceipt {
+            generation: n + 1,
+            input_frames: 1024,
+            raw_frames: 1024,
+            zero_frames: 0,
+            input_rate: 48000,
+            encoded_frames: 1024,
+            leading_frames: 0,
+            trailing_frames: 0,
+            source_mapping: NativeRecordingSourceMapping::Nearest,
+        })
+        .expect("actual FIFO EOF");
+    }
+    mux.push(video_sample(&v, 1, 700)).expect("video");
+    drain(&mux);
+    mux.push(video_sample(&v, 2, 700)).expect("boundary");
+    let token = drain(&mux)
+        .into_iter()
+        .find_map(|x| x.checkpoint)
+        .expect("sealed old prefix");
+    let encoded = encode_slot(&mux, token, [4; 32]);
+    assert_eq!(encoded.info.facts.audio_units, 2);
+    assert_eq!(encoded.info.facts.completed_generation_count, 2);
+    assert!(!encoded.info.facts.complete_audio_eof);
+}
+
+#[test]
+fn portable_checkpoint_decode_refuses_oversize_input_and_nonexact_expected_digests() {
+    assert_eq!(
+        decode_recording_checkpoint(
+            vec![0; checkpoint::MAX_CHECKPOINT_BYTES + 1],
+            vec![7; 32],
+            vec![9; 32]
+        )
+        .err(),
+        Some(RecordingCheckpointError::Envelope)
+    );
+    for length in [0, 31, 33] {
+        assert_eq!(
+            decode_recording_checkpoint(Vec::new(), vec![7; length], vec![9; 32]).err(),
+            Some(RecordingCheckpointError::DigestLength)
+        );
+        assert_eq!(
+            decode_recording_checkpoint(Vec::new(), vec![7; 32], vec![9; length]).err(),
+            Some(RecordingCheckpointError::DigestLength)
+        );
+    }
+}

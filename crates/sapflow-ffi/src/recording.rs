@@ -9,7 +9,7 @@ use crate::MediaSample;
 use bytes::Bytes;
 use sapflow_client::{CodecConfig, SharedSample};
 use sapflow_hls::recording_timing::{self as timing, AudioLedger, RecordingPresentation};
-use sapflow_hls::{codec, fmp4};
+use sapflow_hls::{codec, fmp4, recording_checkpoint as checkpoint};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -154,6 +154,9 @@ pub struct NativeRecordingCheckpoint {
     owner: Arc<()>,
     header: Vec<u8>,
     facts: NativeRecordingCheckpointFacts,
+    initial_context: NativeInitialContext,
+    fragment_region_bytes: u64,
+    sealed_file_end: u64,
 }
 #[uniffi::export]
 impl NativeRecordingCheckpoint {
@@ -161,6 +164,188 @@ impl NativeRecordingCheckpoint {
     pub fn facts(&self) -> NativeRecordingCheckpointFacts {
         self.facts
     }
+}
+
+/// Codec/identity errors are separate from the existing media muxer API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Error)]
+pub enum RecordingCheckpointError {
+    Busy,
+    ForeignCheckpoint,
+    DigestLength,
+    Envelope,
+    Unsupported,
+    Checksum,
+    Binding,
+    Facts,
+    Successor,
+    Overflow,
+}
+impl std::fmt::Display for RecordingCheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "recording checkpoint: {self:?}")
+    }
+}
+impl std::error::Error for RecordingCheckpointError {}
+impl From<checkpoint::CheckpointError> for RecordingCheckpointError {
+    fn from(value: checkpoint::CheckpointError) -> Self {
+        match value {
+            checkpoint::CheckpointError::Envelope => Self::Envelope,
+            checkpoint::CheckpointError::Unsupported => Self::Unsupported,
+            checkpoint::CheckpointError::Checksum => Self::Checksum,
+            checkpoint::CheckpointError::Binding => Self::Binding,
+            checkpoint::CheckpointError::Facts => Self::Facts,
+            checkpoint::CheckpointError::Successor => Self::Successor,
+            checkpoint::CheckpointError::Overflow => Self::Overflow,
+        }
+    }
+}
+impl From<NativeRecordingCheckpointFacts> for checkpoint::CheckpointFacts {
+    fn from(f: NativeRecordingCheckpointFacts) -> Self {
+        Self {
+            sequence: f.sequence,
+            audio_units: f.audio_units,
+            video_units: f.video_units,
+            audio_start: f.audio_start,
+            audio_end: f.audio_end,
+            audio_container_end: f.audio_container_end,
+            final_trailing_frames: f.final_trailing_frames,
+            complete_audio_eof: f.complete_audio_eof,
+            video_start: f.video_start,
+            video_end: f.video_end,
+            first_leading_frames: f.first_leading_frames,
+            completed_generation_count: f.completed_generation_count,
+        }
+    }
+}
+impl From<checkpoint::CheckpointFacts> for NativeRecordingCheckpointFacts {
+    fn from(f: checkpoint::CheckpointFacts) -> Self {
+        Self {
+            sequence: f.sequence,
+            audio_units: f.audio_units,
+            video_units: f.video_units,
+            audio_start: f.audio_start,
+            audio_end: f.audio_end,
+            audio_container_end: f.audio_container_end,
+            final_trailing_frames: f.final_trailing_frames,
+            complete_audio_eof: f.complete_audio_eof,
+            video_start: f.video_start,
+            video_end: f.video_end,
+            first_leading_frames: f.first_leading_frames,
+            completed_generation_count: f.completed_generation_count,
+        }
+    }
+}
+// Distinct generated records prevent decoded outside data being named as live
+// issuer metadata. Neither record is an opaque native or filesystem capability.
+macro_rules! checkpoint_info_record {
+    ($name:ident) => {
+        #[derive(uniffi::Record)]
+        pub struct $name {
+            pub facts: NativeRecordingCheckpointFacts,
+            pub media_epoch_ns: u64,
+            pub initial_header_len: u32,
+            pub initial_header_sha256: Vec<u8>,
+            pub recording_binding: Vec<u8>,
+            pub source_file_binding: Vec<u8>,
+            pub committed_offset: u64,
+            pub fragment_region_bytes: u64,
+            pub fragment_region_sha256: Vec<u8>,
+        }
+        impl From<checkpoint::CheckpointInfo> for $name {
+            fn from(value: checkpoint::CheckpointInfo) -> Self {
+                Self {
+                    facts: value.facts.into(),
+                    media_epoch_ns: value.context.media_epoch_ns,
+                    initial_header_len: value.context.initial_header_len,
+                    initial_header_sha256: value.context.initial_header_sha256.to_vec(),
+                    recording_binding: value.context.binding.recording.to_vec(),
+                    source_file_binding: value.context.binding.source_file.to_vec(),
+                    committed_offset: value.committed_offset,
+                    fragment_region_bytes: value.fragment_region_bytes,
+                    fragment_region_sha256: value.fragment_region_sha256.to_vec(),
+                }
+            }
+        }
+    };
+}
+checkpoint_info_record!(EncodedRecordingCheckpointInfo);
+checkpoint_info_record!(DecodedRecordingCheckpointInfo);
+
+/// One cold encode result; the scalar frontier comes from the same live token.
+#[derive(uniffi::Record)]
+pub struct NativeRecordingCheckpointEncoding {
+    pub bytes: Vec<u8>,
+    pub info: EncodedRecordingCheckpointInfo,
+}
+/// Parsed outside data. Cannot be passed as a live checkpoint or pushed media.
+#[derive(uniffi::Object)]
+pub struct DecodedRecordingCheckpoint {
+    value: checkpoint::PersistedCheckpoint,
+}
+#[uniffi::export]
+impl DecodedRecordingCheckpoint {
+    /// Bounded syntax/semantic facts, not write/fsync/playback proof.
+    pub fn info(&self) -> DecodedRecordingCheckpointInfo {
+        self.value.info.into()
+    }
+    /// Copy the bounded recovery header; ordinary encode needs no round trip.
+    pub fn header(&self) -> Vec<u8> {
+        self.value.header.clone()
+    }
+    /// Independently supplied cumulative region hash, not a media rehash.
+    pub fn fragment_region_sha256(&self) -> Vec<u8> {
+        self.value.info.fragment_region_sha256.to_vec()
+    }
+}
+fn digest32(bytes: &[u8]) -> Result<[u8; 32], RecordingCheckpointError> {
+    bytes
+        .try_into()
+        .map_err(|_| RecordingCheckpointError::DigestLength)
+}
+/// Decode a bounded slot using independently retained expected identities.
+#[uniffi::export]
+pub fn decode_recording_checkpoint(
+    bytes: Vec<u8>,
+    expected_recording_binding: Vec<u8>,
+    expected_source_file_binding: Vec<u8>,
+) -> Result<Arc<DecodedRecordingCheckpoint>, RecordingCheckpointError> {
+    let expected = checkpoint::CheckpointBinding {
+        recording: digest32(&expected_recording_binding)?,
+        source_file: digest32(&expected_source_file_binding)?,
+    };
+    Ok(Arc::new(DecodedRecordingCheckpoint {
+        value: checkpoint::decode(&bytes, &expected)?,
+    }))
+}
+/// Check the exact next persisted snapshot, without file reads or authority.
+#[uniffi::export]
+pub fn validate_recording_checkpoint_successor(
+    prior: Arc<DecodedRecordingCheckpoint>,
+    next: Arc<DecodedRecordingCheckpoint>,
+) -> Result<(), RecordingCheckpointError> {
+    checkpoint::validate_successor(&prior.value.info, &next.value.info)?;
+    Ok(())
+}
+#[derive(Clone, Copy)]
+struct NativeInitialContext {
+    header_len: u32,
+    header_sha256: [u8; 32],
+    media_epoch_ns: u64,
+}
+fn sealed_byte_frontier(
+    initial: u32,
+    prior: u64,
+    chunk_len: usize,
+) -> Result<(u64, u64), NativeRecordingError> {
+    let chunk_len = u64::try_from(chunk_len).map_err(|_| NativeRecordingError::Encoding)?;
+    let region = prior
+        .checked_add(chunk_len)
+        .ok_or(NativeRecordingError::Encoding)?;
+    let end = region
+        .checked_add(u64::from(initial))
+        .filter(|n| *n <= i64::MAX as u64)
+        .ok_or(NativeRecordingError::Encoding)?;
+    Ok((region, end))
 }
 
 /// One native-mode container output and, for media, its exact sealed coverage.
@@ -235,6 +420,7 @@ struct NativeFlushPlan {
     audio_units: u64,
     video_units: u64,
     remaining_audio_ns: Option<(u64, u64)>,
+    sealed_fragment_bytes: u64,
 }
 struct NativeInput {
     sample: SharedSample,
@@ -276,6 +462,8 @@ struct State {
     native_completion: Option<NativeRecordingCompletion>,
     sealed_audio_units: u64,
     sealed_video_units: u64,
+    native_initial_context: Option<NativeInitialContext>,
+    native_sealed_fragment_bytes: u64,
 }
 impl State {
     fn ready(&self) -> bool {
@@ -438,6 +626,7 @@ impl State {
                 audio_units,
                 video_units,
                 remaining_audio_ns,
+                sealed_fragment_bytes: self.native_sealed_fragment_bytes,
             });
         }
         if self.init_len.is_none() {
@@ -501,9 +690,24 @@ impl State {
             && ledger
                 .final_receipt()
                 .is_some_and(|x| x.encoded_frames == coded);
+        let initial_context = self
+            .native_initial_context
+            .ok_or(NativeRecordingError::Encoding)?;
+        let header = self.native_header_at(audio_units, trailing)?;
+        if header.len() != initial_context.header_len as usize {
+            return Err(NativeRecordingError::Encoding);
+        }
+        let (sealed_fragment_bytes, sealed_file_end) = sealed_byte_frontier(
+            initial_context.header_len,
+            self.native_sealed_fragment_bytes,
+            bytes.len(),
+        )?;
         let checkpoint = Arc::new(NativeRecordingCheckpoint {
             owner: self.native_owner.clone(),
-            header: self.native_header_at(audio_units, trailing)?,
+            header,
+            initial_context,
+            fragment_region_bytes: sealed_fragment_bytes,
+            sealed_file_end,
             facts: NativeRecordingCheckpointFacts {
                 sequence: self.sequence,
                 audio_units,
@@ -537,12 +741,14 @@ impl State {
             audio_units,
             video_units,
             remaining_audio_ns,
+            sealed_fragment_bytes,
         })
     }
     fn commit_native_flush(&mut self, plan: NativeFlushPlan) {
         if let Some(output) = plan.output {
             self.output.push_back(output);
             self.sequence = plan.next_sequence;
+            self.native_sealed_fragment_bytes = plan.sealed_fragment_bytes;
             self.fragments = self.fragments.saturating_add(1);
         }
         self.audio.samples.drain(..plan.audio_take);
@@ -610,6 +816,17 @@ impl State {
         } else {
             None
         };
+        let initial_context = initial
+            .as_ref()
+            .map(|header| {
+                Ok::<_, NativeRecordingError>(NativeInitialContext {
+                    header_len: u32::try_from(header.len())
+                        .map_err(|_| NativeRecordingError::Encoding)?,
+                    header_sha256: checkpoint::metadata_sha256(header),
+                    media_epoch_ns: self.epoch_ns,
+                })
+            })
+            .transpose()?;
         let bytes = self
             .bytes
             .checked_add(input.sample.payload().len())
@@ -672,6 +889,7 @@ impl State {
             self.commit_native_flush(plan);
         }
         if let Some(header) = initial {
+            self.native_initial_context = initial_context;
             self.init_len = Some(header.len());
             self.output
                 .push_back(Output::new(header, NativeRecordingChunkKind::Initial, None));
@@ -956,6 +1174,8 @@ impl NativeRecordingMuxer {
                 native_completion: None,
                 sealed_audio_units: 0,
                 sealed_video_units: 0,
+                native_initial_context: None,
+                native_sealed_fragment_bytes: 0,
             }),
         }))
     }
@@ -1088,6 +1308,51 @@ impl NativeRecordingMuxer {
         }
         Ok(checkpoint.header.clone())
     }
+    /// Encode this exact issued sealed snapshot without caller-supplied offsets.
+    /// No file write/sync is implied by native serialization or this checksum.
+    pub fn encode_checkpoint(
+        &self,
+        token: Arc<NativeRecordingCheckpoint>,
+        recording_binding: Vec<u8>,
+        source_file_binding: Vec<u8>,
+        fragment_region_sha256: Vec<u8>,
+    ) -> Result<NativeRecordingCheckpointEncoding, RecordingCheckpointError> {
+        {
+            let state = self.guard().map_err(|_| RecordingCheckpointError::Busy)?;
+            if state.native.is_none()
+                || !Arc::ptr_eq(&state.native_owner, &token.owner)
+                || token.facts.sequence >= state.sequence
+            {
+                return Err(RecordingCheckpointError::ForeignCheckpoint);
+            }
+        }
+        // The exact old token remains immutable after successor output, finish
+        // or cancel. Never substitute the muxer's current byte frontier.
+        let info = checkpoint::CheckpointInfo {
+            context: checkpoint::CheckpointContext {
+                binding: checkpoint::CheckpointBinding {
+                    recording: digest32(&recording_binding)?,
+                    source_file: digest32(&source_file_binding)?,
+                },
+                media_epoch_ns: token.initial_context.media_epoch_ns,
+                initial_header_len: token.initial_context.header_len,
+                initial_header_sha256: token.initial_context.header_sha256,
+            },
+            facts: token.facts.into(),
+            committed_offset: token.sealed_file_end,
+            fragment_region_bytes: token.fragment_region_bytes,
+            fragment_region_sha256: digest32(&fragment_region_sha256)?,
+        };
+        let bytes = checkpoint::encode(checkpoint::CheckpointRef {
+            info: &info,
+            header: &token.header,
+        })?;
+        Ok(NativeRecordingCheckpointEncoding {
+            bytes,
+            info: info.into(),
+        })
+    }
+
     /// Drain ordinary tail and final rewrite-header output before closing the file.
     /// Call only after all accepted capture samples have reached this worker.
     pub fn finish(&self) -> Result<(), NativeRecordingError> {

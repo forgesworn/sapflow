@@ -194,3 +194,21 @@ client credential and escaped duplicate keys. The target never creates a native
 worker or connects to a relay. Use `-max_len=16384` for this cold-auth parser.
 
 Native recording follow-on SOURCE CANDIDATE: four generated `native-final-duration-*` NREC seeds exercise container final-duration acceptance/refusal and unchanged original entries/payloads. The target also reads completed-generation coverage without mutation. Actual FFI lookbehind ownership/byte budgets are direct unit-test scope, not modelled as fuzzed runtime ownership. No new replay/sanitizer run has been claimed until this source is compiled and executed.
+
+
+### Portable recording checkpoints
+
+`recording_checkpoint` exercises the shared bounded native-recording snapshot
+parser, canonical roundtrip, metadata hash, media scalar semantics and exact
+successor rules. It does not parse media atoms, touch files, validate a live FFI
+handle, measure decoder output or certify write/fsync/recovery ownership.
+Scalar-only seeds have no camera or private media provenance.
+
+The V1 envelope is545..66080bytes with an opaque1..65536byte header. Existing
+CI/nightly discover this target automatically. Their65536byte raw mutation
+limit is retained: structured arms also build and mutate the full66080byte
+valid envelope internally; direct unit controls exercise all size boundaries.
+Local finite runs may select `-max_len=66081` to include oversized raw inputs.
+Use the worktree target and the normal ASan/overflow flags; never set a fresh
+CARGO_TARGET_DIR. Candidate source preparation is not a compiled/replayed or
+fuzzed result. Record actual gates before claiming those outcomes.

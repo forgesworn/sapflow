@@ -4991,6 +4991,13 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
+sha2 0.11.1  (MIT OR Apache-2.0)
+https://github.com/RustCrypto/hashes
+==============================================================================
+--- LICENSE-APACHE: same text as aes LICENSE-APACHE
+--- LICENSE-MIT: same text as sha1 LICENSE-MIT
+
+==============================================================================
 sharded-slab 0.1.7  (MIT)
 https://github.com/hawkw/sharded-slab
 ==============================================================================

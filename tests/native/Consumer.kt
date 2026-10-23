@@ -1,5 +1,6 @@
 import dev.forgesworn.sapflow.*
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.util.Base64
 
 fun main() {
@@ -147,14 +148,82 @@ private fun checkNativeRecordingTimingBinding() {
             var finalSize = 0
             var sealed: NativeRecordingCheckpoint? = null
             var terminalFacts: NativeRecordingCheckpointFacts? = null
+            val recordingBinding = ByteArray(32) { 7 }
+            val sourceFileBinding = ByteArray(32) { 9 }
+            var initialHash = byteArrayOf()
+            val fragmentHash = MessageDigest.getInstance("SHA-256")
+            var regionBytes = 0uL
+            var serializedEnd = 0uL
+            var firstSlot: ByteArray? = null
+            var firstRegionHash: ByteArray? = null
+            var firstSealedEnd: ULong? = null
+            var previousDecoded: DecodedRecordingCheckpoint? = null
+            var fragmentCount = 0
             fun drain() {
                 while (true) {
                     val chunk = mux.takeNativeOutput() ?: break
                     check(chunk.bytes.isNotEmpty())
-                    if (chunk.kind == NativeRecordingChunkKind.INITIAL) firstSize = chunk.bytes.size
-                    if (chunk.kind == NativeRecordingChunkKind.FINAL_HEADER) finalSize = chunk.bytes.size
-                    chunk.checkpoint?.facts()?.let { if (it.completeAudioEof) terminalFacts = it }
-                    if (sealed == null) sealed = chunk.checkpoint else chunk.checkpoint?.close()
+                    val token = chunk.checkpoint
+                    if (chunk.kind == NativeRecordingChunkKind.INITIAL) {
+                        check(firstSize == 0 && serializedEnd == 0uL && token == null)
+                        firstSize = chunk.bytes.size
+                        serializedEnd = firstSize.toULong()
+                        initialHash = MessageDigest.getInstance("SHA-256").digest(chunk.bytes)
+                    }
+                    if (chunk.kind == NativeRecordingChunkKind.FINAL_HEADER) {
+                        // Offset-zero replacement contributes no region bytes/hash.
+                        finalSize = chunk.bytes.size
+                        check(previousDecoded?.info()?.committedOffset == serializedEnd)
+                    }
+                    token?.facts()?.let { if (it.completeAudioEof) terminalFacts = it }
+                    if (sealed == null) sealed = token
+                    try {
+                        if (chunk.kind == NativeRecordingChunkKind.FRAGMENT) {
+                            val exactToken = checkNotNull(token)
+                            check(firstSize > 0)
+                            fragmentCount += 1
+                            regionBytes += chunk.bytes.size.toULong()
+                            serializedEnd += chunk.bytes.size.toULong()
+                            fragmentHash.update(chunk.bytes)
+                            // The standard host SHA-256 provider's cloned state
+                            // finalises this prefix without resetting the owner.
+                            val regionHash = (fragmentHash.clone() as MessageDigest).digest()
+                            val encoded = mux.encodeCheckpoint(exactToken, recordingBinding, sourceFileBinding, regionHash)
+                            check(encoded.bytes.size in 545..66080)
+                            val info = encoded.info
+                            check(info.facts == exactToken.facts())
+                            check(info.initialHeaderLen == firstSize.toUInt() && info.mediaEpochNs == 0uL)
+                            check(info.initialHeaderSha256.contentEquals(initialHash))
+                            check(info.recordingBinding.contentEquals(recordingBinding) && info.sourceFileBinding.contentEquals(sourceFileBinding))
+                            check(info.committedOffset == serializedEnd && info.fragmentRegionBytes == regionBytes)
+                            check(info.fragmentRegionSha256.contentEquals(regionHash))
+                            val decoded = decodeRecordingCheckpoint(encoded.bytes, recordingBinding, sourceFileBinding)
+                            try {
+                                val parsed = decoded.info()
+                                check(parsed.facts == info.facts && parsed.mediaEpochNs == info.mediaEpochNs)
+                                check(parsed.initialHeaderLen == info.initialHeaderLen && parsed.initialHeaderSha256.contentEquals(initialHash))
+                                check(parsed.recordingBinding.contentEquals(recordingBinding) && parsed.sourceFileBinding.contentEquals(sourceFileBinding))
+                                check(parsed.committedOffset == serializedEnd && parsed.fragmentRegionBytes == regionBytes)
+                                check(parsed.fragmentRegionSha256.contentEquals(regionHash) && decoded.fragmentRegionSha256().contentEquals(regionHash))
+                                check(decoded.header().contentEquals(mux.checkpointHeader(exactToken)))
+                                previousDecoded?.let { prior ->
+                                    validateRecordingCheckpointSuccessor(prior, decoded)
+                                    prior.close()
+                                }
+                                previousDecoded = decoded
+                            } catch (failure: Throwable) {
+                                decoded.close()
+                                throw failure
+                            }
+                            if (firstSlot == null) {
+                                firstSlot = encoded.bytes
+                                firstRegionHash = regionHash
+                                firstSealedEnd = info.committedOffset
+                            }
+                        }
+                    } finally {
+                        if (token !== sealed) token?.close()
+                    }
                 }
             }
             try {
@@ -170,10 +239,29 @@ private fun checkNativeRecordingTimingBinding() {
                 check(facts.completedGenerationCount == 0uL)
                 check(facts.audioContainerEnd == facts.audioEnd && facts.finalTrailingFrames == 0u && !facts.completeAudioEof)
                 check(firstSize > 0 && mux.checkpointHeader(checkpoint).size == firstSize)
+                val beforeRejection = mux.stats()
                 NativeRecordingMuxer.withNativeAacTiming(false, true, 0uL, 4096uL, 100u).use { other ->
                     try { other.checkpointHeader(checkpoint); error("foreign recording checkpoint accepted") }
                     catch (_: NativeRecordingException.InvalidMedia) {}
+                    val savedHash = checkNotNull(firstRegionHash)
+                    try { other.encodeCheckpoint(checkpoint, recordingBinding, sourceFileBinding, savedHash); error("foreign live checkpoint encoded") }
+                    catch (_: RecordingCheckpointException.ForeignCheckpoint) {}
                 }
+                val savedSlot = checkNotNull(firstSlot)
+                val savedRegionHash = checkNotNull(firstRegionHash)
+                val savedEnd = checkNotNull(firstSealedEnd)
+                check(fragmentCount >= 2 && serializedEnd > savedEnd)
+                val oldAfterAdvance = mux.encodeCheckpoint(checkpoint, recordingBinding, sourceFileBinding, savedRegionHash)
+                check(oldAfterAdvance.bytes.contentEquals(savedSlot) && oldAfterAdvance.info.committedOffset == savedEnd)
+                try {
+                    decodeRecordingCheckpoint(savedSlot, ByteArray(32) { 8 }, sourceFileBinding).use { error("foreign persisted recording binding accepted") }
+                } catch (_: RecordingCheckpointException.Binding) {}
+                try {
+                    decodeRecordingCheckpoint(savedSlot, recordingBinding, ByteArray(32) { 8 }).use { error("foreign persisted file binding accepted") }
+                } catch (_: RecordingCheckpointException.Binding) {}
+                val afterRejection = mux.stats()
+                check(beforeRejection.acceptedSamples == afterRejection.acceptedSamples)
+                check(beforeRejection.queuedOutputBytes == afterRejection.queuedOutputBytes)
                 mux.endNativeAudioGeneration(NativeAudioGenerationReceipt(1uL, 6400uL, 6400uL,
                     0uL, 48_000u, 9216uL, 2112u, 704u, NativeRecordingSourceMapping.NEAREST))
                 mux.completeNativeAudio(NativeAudioFileReceipt(1uL, 6400uL, 0uL, 9216uL, 2112u, 704u))
@@ -186,9 +274,13 @@ private fun checkNativeRecordingTimingBinding() {
                 check(terminal.completeAudioEof && terminal.completedGenerationCount == 1uL)
                 val stats = mux.stats()
                 check(stats.finished && stats.acceptedSamples == 9uL)
+                check(fragmentCount == 3 && serializedEnd == firstSize.toULong() + regionBytes)
+                check(previousDecoded?.info()?.committedOffset == serializedEnd)
+                val oldAfterFinish = mux.encodeCheckpoint(checkpoint, recordingBinding, sourceFileBinding, savedRegionHash)
+                check(oldAfterFinish.bytes.contentEquals(savedSlot) && oldAfterFinish.info.committedOffset == savedEnd)
                 try { mux.takeOutput(); error("native recording used legacy output API") }
                 catch (_: NativeRecordingException.InvalidConfig) {}
-            } finally { sealed?.close() }
+            } finally { previousDecoded?.close(); sealed?.close() }
         }
     }
 }

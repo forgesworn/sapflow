@@ -133,3 +133,10 @@ bench = false
 nostr-connect = { path = "../vendor/nostr-connect" }
 nostr-sdk = { path = "../vendor/nostr-sdk" }
 async-wsocket = { path = "../vendor/async-wsocket" }
+
+[[bin]]
+name = "recording_checkpoint"
+path = "fuzz_targets/recording_checkpoint.rs"
+test = false
+doc = false
+bench = false

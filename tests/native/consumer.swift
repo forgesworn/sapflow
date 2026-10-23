@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 precondition(sdkAbiVersion() == 1)
 // Exercise actual generated lifecycle control; no network/capture is attached.
@@ -241,13 +242,74 @@ func checkNativeRecordingTimingBinding() throws {
     var finalSize = 0
     var sealed: NativeRecordingCheckpoint?
     var terminalFacts: NativeRecordingCheckpointFacts?
+    let recordingBinding = Data(repeating: 7, count: 32)
+    let sourceFileBinding = Data(repeating: 9, count: 32)
+    var initialHash = Data()
+    var fragmentHash = SHA256()
+    var regionBytes: UInt64 = 0
+    var serializedEnd: UInt64 = 0
+    var firstSlot: Data?
+    var firstRegionHash: Data?
+    var firstSealedEnd: UInt64?
+    var previousDecoded: DecodedRecordingCheckpoint?
+    var fragmentCount = 0
     func drain() throws {
         while let chunk = try mux.takeNativeOutput() {
             precondition(!chunk.bytes.isEmpty)
-            if chunk.kind == .initial { firstSize = chunk.bytes.count }
-            if chunk.kind == .finalHeader { finalSize = chunk.bytes.count }
+            if chunk.kind == .initial {
+                precondition(firstSize == 0 && serializedEnd == 0 && chunk.checkpoint == nil)
+                firstSize = chunk.bytes.count
+                serializedEnd = UInt64(firstSize)
+                initialHash = Data(SHA256.hash(data: chunk.bytes))
+            }
+            if chunk.kind == .finalHeader {
+                // Offset-zero replacement contributes no fragment bytes/hash.
+                finalSize = chunk.bytes.count
+                precondition(previousDecoded?.info().committedOffset == serializedEnd)
+            }
             if let facts = chunk.checkpoint?.facts(), facts.completeAudioEof { terminalFacts = facts }
             if sealed == nil { sealed = chunk.checkpoint }
+            if chunk.kind == .fragment {
+                guard let token = chunk.checkpoint else { fatalError("fragment missing exact token") }
+                precondition(firstSize > 0)
+                fragmentCount += 1
+                regionBytes += UInt64(chunk.bytes.count)
+                serializedEnd += UInt64(chunk.bytes.count)
+                fragmentHash.update(data: chunk.bytes)
+                // CryptoKit.finalize is nonmutating; update the retained hash
+                // only with original Fragment bytes, never the final rewrite.
+                let regionHash = Data(fragmentHash.finalize())
+                let encoded = try mux.encodeCheckpoint(token: token,
+                    recordingBinding: recordingBinding, sourceFileBinding: sourceFileBinding,
+                    fragmentRegionSha256: regionHash)
+                precondition((545...66080).contains(encoded.bytes.count))
+                let info = encoded.info
+                precondition(info.facts == token.facts())
+                precondition(info.initialHeaderLen == UInt32(firstSize) && info.mediaEpochNs == 0)
+                precondition(info.initialHeaderSha256 == initialHash)
+                precondition(info.recordingBinding == recordingBinding && info.sourceFileBinding == sourceFileBinding)
+                precondition(info.committedOffset == serializedEnd && info.fragmentRegionBytes == regionBytes)
+                precondition(info.fragmentRegionSha256 == regionHash)
+                let decoded = try decodeRecordingCheckpoint(bytes: encoded.bytes,
+                    expectedRecordingBinding: recordingBinding, expectedSourceFileBinding: sourceFileBinding)
+                let parsed = decoded.info()
+                precondition(parsed.facts == info.facts && parsed.mediaEpochNs == info.mediaEpochNs)
+                precondition(parsed.initialHeaderLen == info.initialHeaderLen && parsed.initialHeaderSha256 == initialHash)
+                precondition(parsed.recordingBinding == recordingBinding && parsed.sourceFileBinding == sourceFileBinding)
+                precondition(parsed.committedOffset == serializedEnd && parsed.fragmentRegionBytes == regionBytes)
+                precondition(parsed.fragmentRegionSha256 == regionHash && decoded.fragmentRegionSha256() == regionHash)
+                let exactHeader = try mux.checkpointHeader(checkpoint: token)
+                precondition(decoded.header() == exactHeader)
+                if let prior = previousDecoded {
+                    try validateRecordingCheckpointSuccessor(prior: prior, next: decoded)
+                }
+                previousDecoded = decoded
+                if firstSlot == nil {
+                    firstSlot = encoded.bytes
+                    firstRegionHash = regionHash
+                    firstSealedEnd = info.committedOffset
+                }
+            }
         }
     }
     for n in 0..<9 {
@@ -270,6 +332,32 @@ func checkNativeRecordingTimingBinding() throws {
         _ = try other.checkpointHeader(checkpoint: checkpoint)
         fatalError("foreign recording checkpoint accepted")
     } catch NativeRecordingError.InvalidMedia {}
+    guard let savedSlot = firstSlot, let savedRegionHash = firstRegionHash,
+          let savedEnd = firstSealedEnd else { fatalError("missing portable snapshot") }
+    precondition(fragmentCount >= 2 && serializedEnd > savedEnd)
+    let oldAfterAdvance = try mux.encodeCheckpoint(token: checkpoint,
+        recordingBinding: recordingBinding, sourceFileBinding: sourceFileBinding,
+        fragmentRegionSha256: savedRegionHash)
+    precondition(oldAfterAdvance.bytes == savedSlot && oldAfterAdvance.info.committedOffset == savedEnd)
+    let beforeRejection = try mux.stats()
+    do {
+        _ = try other.encodeCheckpoint(token: checkpoint, recordingBinding: recordingBinding,
+            sourceFileBinding: sourceFileBinding, fragmentRegionSha256: savedRegionHash)
+        fatalError("foreign live checkpoint encoded")
+    } catch RecordingCheckpointError.ForeignCheckpoint {}
+    do {
+        _ = try decodeRecordingCheckpoint(bytes: savedSlot,
+            expectedRecordingBinding: Data(repeating: 8, count: 32), expectedSourceFileBinding: sourceFileBinding)
+        fatalError("foreign persisted recording binding accepted")
+    } catch RecordingCheckpointError.Binding {}
+    do {
+        _ = try decodeRecordingCheckpoint(bytes: savedSlot,
+            expectedRecordingBinding: recordingBinding, expectedSourceFileBinding: Data(repeating: 8, count: 32))
+        fatalError("foreign persisted file binding accepted")
+    } catch RecordingCheckpointError.Binding {}
+    let afterRejection = try mux.stats()
+    precondition(beforeRejection.acceptedSamples == afterRejection.acceptedSamples)
+    precondition(beforeRejection.queuedOutputBytes == afterRejection.queuedOutputBytes)
     try mux.endNativeAudioGeneration(receipt: NativeAudioGenerationReceipt(generation: 1,
         inputFrames: 6400, rawFrames: 6400, zeroFrames: 0, inputRate: 48_000,
         encodedFrames: 9216, leadingFrames: 2112, trailingFrames: 704, sourceMapping: .nearest))
@@ -285,6 +373,12 @@ func checkNativeRecordingTimingBinding() throws {
     precondition(terminal.completeAudioEof && terminal.completedGenerationCount == 1)
     let stats = try mux.stats()
     precondition(stats.finished && stats.acceptedSamples == 9)
+    precondition(fragmentCount == 3 && serializedEnd == UInt64(firstSize) + regionBytes)
+    precondition(previousDecoded?.info().committedOffset == serializedEnd)
+    let oldAfterFinish = try mux.encodeCheckpoint(token: checkpoint,
+        recordingBinding: recordingBinding, sourceFileBinding: sourceFileBinding,
+        fragmentRegionSha256: savedRegionHash)
+    precondition(oldAfterFinish.bytes == savedSlot && oldAfterFinish.info.committedOffset == savedEnd)
     do {
         _ = try mux.takeOutput()
         fatalError("native recording used legacy output API")
