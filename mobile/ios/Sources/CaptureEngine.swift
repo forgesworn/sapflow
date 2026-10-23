@@ -43,7 +43,7 @@ final class CaptureRun {
     let mediaRun: CaptureAdmission.MediaRun
     let admission: CaptureAdmission
     let profile: CaptureIntent
-    let recorder: CompressedRecorder
+    let recorder: CaptureRecording
     let recordingTicket: RecordingCaptureAdmission.Ticket
     let worker: IngressWorker
     var video: HardwareVideoEncoder?
@@ -76,7 +76,7 @@ final class CaptureRun {
     var slateToken: CaptureAdmission.MediaToken?
     var zeroMediaToken: CaptureAdmission.MediaToken?
     var resumeCutoff: CMTime?
-    init(mediaRun: CaptureAdmission.MediaRun, admission: CaptureAdmission, recorder: CompressedRecorder, recordingTicket: RecordingCaptureAdmission.Ticket, orientation: CaptureOrientation, profile: CaptureIntent, ingress: RustEncodedIngress, boundary: @escaping (CaptureAdmission.MediaBoundary) -> Void, terminal: @escaping (CaptureAdmission.SinkToken) -> Void, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
+    init(mediaRun: CaptureAdmission.MediaRun, admission: CaptureAdmission, recorder: CaptureRecording, recordingTicket: RecordingCaptureAdmission.Ticket, orientation: CaptureOrientation, profile: CaptureIntent, ingress: RustEncodedIngress, boundary: @escaping (CaptureAdmission.MediaBoundary) -> Void, terminal: @escaping (CaptureAdmission.SinkToken) -> Void, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
         self.mediaRun = mediaRun; self.admission = admission
         self.profile = profile
         self.recorder = recorder; self.recordingTicket = recordingTicket
@@ -94,7 +94,7 @@ final class CaptureRun {
         }
         // All timing events, including generation EOF, follow the exact same
         // worker FIFO as the original encoded units. Never bypass the worker.
-        audio = try NativeAudioEncoder(output: { unit in
+        audio = try NativeAudioEncoder(receiptMode: recorder.audioReceiptMode, output: { unit in
             worker.offer(unit, token: binding.token, audioGeneration: binding.encoder?.lastOutputGeneration)
         }, meter: meter, recordingTiming: { worker.audioTiming($0) })
         binding.encoder = audio
@@ -114,7 +114,7 @@ private final class RecordingRunStop {
     let rotationToken: UInt64?
     let rotation: CaptureAdmission.Rotation?
     var publishing: Result<Void, Error>?
-    var recording: CompressedRecorder.Completion?
+    var recording: CaptureRecording.Completion?
     var completed = false
     init(run: CaptureRun, rotationToken: UInt64?, rotation: CaptureAdmission.Rotation?) {
         self.run = run; self.rotationToken = rotationToken; self.rotation = rotation
@@ -129,11 +129,12 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     let session = AVCaptureSession()
     private let control = DispatchQueue(label: "sapflow.capture-control", qos: .userInitiated)
     private let recordingIO = DispatchQueue(label: "sapflow.recording-io", qos: .utility)
+    private let recordingBackend: CaptureRecording.BackendSelection
     private let recordingAdmission = RecordingCaptureAdmission()
     private let recordingBindingLock = NSLock()
     private var recordingBinding: (catalogue: RecordingCatalogue, admission: RecordingLibraryAdmission)?
     private var recordingShow: (CaptureAdmission.Preparation, RecordingCatalogue.Show)? // control only
-    private var retainedRecorder: CompressedRecorder?
+    private var retainedRecorder: CaptureRecording?
     private var runStop: RecordingRunStop?
     private var preparedPublisherClosed: (CaptureAdmission.Stop, Bool)?
     private var storageCheckPending = false // one coalesced cold capacity query
@@ -177,7 +178,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var cleanupObservation: (CaptureAdmission.Preparation, () -> Void)? // control only, one exact show
     private var privacyTimeout: DispatchWorkItem?
 
-    override init() {
+    override convenience init() { self.init(recordingBackend: .legacy) }
+    /// Cold internal qualification seam; product/default callers remain legacy.
+    init(recordingBackend: CaptureRecording.BackendSelection) {
+        self.recordingBackend = recordingBackend
         super.init()
         let centre = NotificationCenter.default
         for name in [AVCaptureSession.wasInterruptedNotification, AVCaptureSession.runtimeErrorNotification,
@@ -1135,7 +1139,12 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         recordingIO.async {
             var failure: Error?
             if self.recordingAdmission.permits(work), self.admission.permitsPreparation(preparation) {
-                do { try binding.catalogue.checkRecordingCapacity(); try self.checkStorage(binding.catalogue, profile: preparation.profile) } catch { failure = error }
+                do {
+                    try binding.catalogue.checkRecordingCapacity()
+                    if self.recordingBackend == .legacy { try self.checkStorage(binding.catalogue, profile: preparation.profile) }
+                    // SDK Start performs anchored six-entry/free-byte preflight
+                    // in beginAppend, before any native capture owner is exposed.
+                } catch { failure = error }
             }
             let observedFailure = failure
             self.control.async {
@@ -1245,10 +1254,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         snapshot.phase = "Starting"; snapshot.canStart = false
         snapshot.detail = "Preparing the private recording segment."; publish()
         recordingIO.async {
-            var recorder: CompressedRecorder?
+            var recorder: CaptureRecording?
             var show: RecordingCatalogue.Show?
             var failure: Error?
-            var receipt: RecordingCatalogue.Writer?
             do {
                 guard self.recordingAdmission.permits(work), self.admission.permitsStart(ticket),
                       deadline.map({ $0.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) }) ?? true else {
@@ -1258,8 +1266,10 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                         else { self.finishPreparedStopIfReady() }
                     }; return
                 }
-                try binding.catalogue.checkRecordingCapacity()
-                try self.checkStorage(binding.catalogue, profile: ticket.preparation.profile)
+                if self.recordingBackend == .legacy {
+                    try binding.catalogue.checkRecordingCapacity()
+                    try self.checkStorage(binding.catalogue, profile: ticket.preparation.profile)
+                }
                 guard self.recordingAdmission.permits(work), self.admission.permitsStart(ticket),
                       deadline.map({ $0.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) }) ?? true else {
                     self.control.async {
@@ -1270,9 +1280,8 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
                 let selected = previousShow ?? binding.catalogue.newShow(profile: ticket.preparation.profile)
                 show = selected
-                let created = try binding.catalogue.begin(identity: selected.nextIdentity())
-                receipt = created
-                recorder = try CompressedRecorder(receipt: created, queue: self.recordingIO, hasVideo: ticket.preparation.profile.hasVideo) { [weak self] error in
+                recorder = try CaptureRecording.open(catalogue: binding.catalogue, identity: selected.nextIdentity(),
+                    queue: self.recordingIO, selection: self.recordingBackend) { [weak self] error in
                     self?.control.async {
                         guard let self, self.preparedIntent == ticket.preparation, self.recordingAdmission.contains(work) else { return }
                         self.recordingFailureDescription = error.localizedDescription
@@ -1281,13 +1290,12 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
             } catch {
                 failure = error
-                if let receipt { receipt.cancel(); do { try receipt.ownersClosed() } catch { receipt.retainUncertainCleanup() } }
             }
             let readyRecorder = recorder; let readyShow = show
-            let ownedReceipt = receipt; let creationFailure = failure
+            let creationFailure = failure
             self.control.async {
                 guard let recorder = readyRecorder, let show = readyShow else {
-                    let clean = ownedReceipt?.cleanupComplete ?? !binding.catalogue.cleanupUncertain
+                    let clean = !binding.catalogue.cleanupUncertain
                     self.recordingAdmission.closed(work, cleanupComplete: clean)
                     if self.admission.permitsStart(ticket) { self.stopOnControl(reason: creationFailure.map { "Recording could not be created: \($0.localizedDescription)" } ?? "Recording could not be created.") }
                     else { self.finishPreparedStopIfReady() }
@@ -1302,7 +1310,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             }
         }
     }
-    private func closeRejectedRecorder(_ recorder: CompressedRecorder, work: RecordingCaptureAdmission.Ticket) {
+    private func closeRejectedRecorder(_ recorder: CaptureRecording, work: RecordingCaptureAdmission.Ticket) {
         recordingAdmission.closing(work)
         recorder.finish { result in self.control.async {
             self.recordingAdmission.closed(work, cleanupComplete: result.cleanupComplete)
@@ -1310,7 +1318,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             self.finishPreparedStopIfReady()
         } }
     }
-    private func adoptRecording(_ recorder: CompressedRecorder, work: RecordingCaptureAdmission.Ticket, ticket: CaptureAdmission.Start, keepSavedSegment: Bool) {
+    private func adoptRecording(_ recorder: CaptureRecording, work: RecordingCaptureAdmission.Ticket, ticket: CaptureAdmission.Start, keepSavedSegment: Bool) {
         guard admission.permitsStart(ticket), recordingAdmission.permits(work), preparedIntent == ticket.preparation,
               snapshot.canStart, !snapshot.running, !stopping else { closeRejectedRecorder(recorder, work: work); return }
         guard !keepSavedSegment || rotationDeadline?.permits(ticket.preparation, nowNs: DispatchTime.now().uptimeNanoseconds) == true else {
@@ -1699,7 +1707,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             throw CaptureFailure(message: "Recording storage is below its required reserve")
         }
     }
-    private func checkActiveStorage(_ recorder: CompressedRecorder, work: RecordingCaptureAdmission.Ticket, preparation: CaptureAdmission.Preparation, generation: UInt64) {
+    private func checkActiveStorage(_ recorder: CaptureRecording, work: RecordingCaptureAdmission.Ticket, preparation: CaptureAdmission.Preparation, generation: UInt64) {
         guard !storageCheckPending else { return }
         storageCheckPending = true
         recorder.checkStorage(profile: preparation.profile) { result in self.control.async {

@@ -79,6 +79,8 @@ final class RecordingCheckpointOwner {
         lock.lock(); admissionClosed = true; cancelRequested = true; lock.unlock()
         file.cancel()
     }
+    /// Cold recordingIO query, covered by the same compound operation guard.
+    func checkStorage() throws { try perform { try file.checkStorage() } }
     func beginAudio(firstLeadingFrames: UInt32) throws {
         try perform { try muxer.beginNativeAudio(firstLeadingFrames: firstLeadingFrames); try drain() }
     }

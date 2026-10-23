@@ -1457,4 +1457,70 @@ final class RecordingCatalogueTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: receiptURL), originalReceipt)
         XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupUncertain)
     }
+    func testAppendActiveStorageUsesSameLeaseAndReservesMissingNamesAndSegmentCapacity() throws {
+        for kind in ["entries", "segments"] {
+            let root = directory("active-storage-" + kind), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+            defer { try? catalogue.close() }
+            let (identity, owner, _) = try storedInputsFixture(catalogue)
+            let original = try Data(contentsOf: root.appendingPathComponent(identity.filename))
+            if kind == "entries" {
+                // Media+receipt+slot1 are present. Three of the SIX reserved
+                // names remain missing, so1021 actual entries are the limit.
+                for index in 0..<1018 { try Data([1]).write(to: root.appendingPathComponent("other-\(index)"), options: .withoutOverwriting) }
+            } else {
+                for _ in 0..<255 {
+                    try Data([1]).write(to: root.appendingPathComponent("Sapflow-\(UUID().uuidString.lowercased()).m4a"), options: .withoutOverwriting)
+                }
+            }
+            try owner.checkStorage(); XCTAssertFalse(owner.cleanupComplete)
+            assertFailure(.busy) { try catalogue.close() }
+            let extra = kind == "entries" ? "one-entry-too-many" : "Sapflow-\(UUID().uuidString.lowercased()).m4a"
+            try Data([2]).write(to: root.appendingPathComponent(extra), options: .withoutOverwriting)
+            assertFailure(.capacity) { try owner.checkStorage() }
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(identity.filename)), original)
+            XCTAssertFalse(catalogue.cleanupUncertain); _ = try owner.closeIncomplete()
+        }
+    }
+    func testAppendActiveStorageChecksActualRootAvailableBytesAndStrictMetadataFloor() throws {
+        for unavailable in [false, true] {
+            let root = directory("active-bytes-\(unavailable)")
+            var available: UInt64? = 1024 * 1024 * 1024, checks = 0
+            let io = RecordingCatalogue.AppendIO(write: { Darwin.write($0, $1, $2) }, synchronize: Darwin.fsync, availableBytes: { fd in
+                var actual = stat(), named = stat()
+                XCTAssertEqual(fstat(fd, &actual), 0); XCTAssertEqual(lstat(root.path, &named), 0)
+                XCTAssertEqual(actual.st_dev, named.st_dev); XCTAssertEqual(actual.st_ino, named.st_ino)
+                XCTAssertEqual(actual.st_mode & S_IFMT, S_IFDIR); checks += 1; return available
+            })
+            let catalogue = try RecordingCatalogue(root: root, appendIO: io); defer { try? catalogue.close() }
+            let (_, owner, _) = try storedInputsFixture(catalogue)
+            available = 200 * 1024 * 1024 + RecordingStorage.checkpointMetadataBytes + 1
+            try owner.checkStorage()
+            available = unavailable ? nil : 200 * 1024 * 1024 + RecordingStorage.checkpointMetadataBytes
+            assertFailure(unavailable ? .io : .capacity) { try owner.checkStorage() }
+            XCTAssertEqual(checks, 3); XCTAssertTrue(catalogue.cleanupRetained); XCTAssertFalse(owner.cleanupComplete)
+            _ = try owner.closeIncomplete(); XCTAssertFalse(catalogue.cleanupRetained)
+        }
+    }
+    func testAppendActiveStorageUnknownMetadataCloseRetainsRootAndNeverRetriesRecycledFD() throws {
+        let root = directory(); var armed = false, closes = 0, recycled: Int32 = -1
+        let catalogue = try RecordingCatalogue(root: root, appendIO: appendIO(), closeFileDescriptor: { fd in
+            if armed {
+                closes += 1
+                if closes == 1 {
+                    XCTAssertEqual(Darwin.close(fd), 0); recycled = Darwin.open("/dev/null", O_RDONLY | O_CLOEXEC)
+                    XCTAssertEqual(recycled, fd); errno = EIO; return -1
+                }
+            }
+            return Darwin.close(fd)
+        })
+        defer { if recycled >= 0 { XCTAssertEqual(Darwin.close(recycled), 0) } }
+        let (_, owner, _) = try storedInputsFixture(catalogue)
+        armed = true
+        assertFailure(.io) { try owner.checkStorage() }
+        XCTAssertEqual(closes, 1); XCTAssertTrue(catalogue.cleanupUncertain)
+        XCTAssertThrowsError(try owner.closeIncomplete()) // Closes only its own media FD.
+        XCTAssertEqual(closes, 2); XCTAssertGreaterThanOrEqual(fcntl(recycled, F_GETFD), 0)
+        assertFailure(.closed) { _ = try owner.closeIncomplete() }
+        XCTAssertEqual(closes, 2); XCTAssertFalse(owner.cleanupComplete)
+    }
 }

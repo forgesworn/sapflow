@@ -551,6 +551,28 @@ final class RecordingCatalogue {
                 appendedEnd = end; return FragmentAppend(end: end)
             }
         }
+        /// Cold query on THIS exact child/root lease. Never reserve a second
+        /// Catalogue owner or expose a file path/descriptor for capacity checks.
+        func checkStorage() throws {
+            try operation {
+                guard let profile = CaptureIntent(rawValue: identity.profileID) else { throw Failure.unsafe }
+                _ = try inspect(expected: appendedEnd); try checkSlots()
+                _ = try catalogue.appendPath(catalogue.receiptName(identity))
+                guard try catalogue.info(catalogue.root, temporaryName) == nil,
+                      try catalogue.info(catalogue.root, "Sapflow-\(identity.segmentID).checkpoint.tmp") == nil else { throw Failure.changed }
+                var entries = 0
+                _ = try catalogue.names(catalogue.root, count: &entries)
+                if let legacy = catalogue.legacy { _ = try catalogue.names(legacy, count: &entries) }
+                let present = 2 + checkpointSlots.compactMap { $0 }.count
+                guard entries <= RecordingCatalogue.maxEntries - (6 - present),
+                      try catalogue.scanEntries().count <= RecordingCatalogue.maxSegments else { throw Failure.capacity }
+                let budget = try RecordingStorage.checkpointBudget(profile: profile)
+                guard let available = try catalogue.appendIO.availableBytes(catalogue.root.fd) else { throw Failure.io }
+                guard available >= budget.requiredBytes,
+                      available > 200 * 1024 * 1024 + RecordingStorage.checkpointMetadataBytes else { throw Failure.capacity }
+                _ = try inspect(expected: appendedEnd); try checkSlots()
+            }
+        }
         func synchronizeMedia() throws -> MediaSyncReceipt {
             try operation {
                 guard initial != nil, let descriptor else { throw Failure.ineligible }
@@ -1143,7 +1165,8 @@ final class RecordingCatalogue {
                      bytes: UInt64(file?.size ?? 0), durationMs: receipt?.durationMs, createdAtMs: receipt?.createdAtMs,
                      filename: name, file: file, receipt: metadata.0, receiptFile: metadata.1)
     }
-    func scan() throws -> [Entry] {
+    func scan() throws -> [Entry] { try scanEntries() }
+    private func scanEntries() throws -> [Entry] {
         var count = 0, result: [Entry] = []
         let locations: [(Location, Directory)] = [(.privateRecording, root)] + (legacy.map { [(.legacyDocuments, $0)] } ?? [])
         for (location, directory) in locations {

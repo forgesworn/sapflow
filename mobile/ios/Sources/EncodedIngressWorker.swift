@@ -2,7 +2,8 @@ import Foundation
 import Sapflow
 
 /// One bounded owner validates each native compressed unit once, then forwards
-/// the original native buffer to recording and the same Rust sample to transport.
+/// legacy native buffers or the SAME Rust sample to recording, and the same
+/// validated sample owner to transport. No second sample construction/copy.
 /// Terminal publishing closes only that branch; validation can keep recording.
 final class IngressWorker {
     private let queue: DispatchQueue
@@ -11,7 +12,7 @@ final class IngressWorker {
     let ingress: RustEncodedIngress
     private let run: CaptureAdmission.MediaRun
     private let admission: CaptureAdmission
-    private let recorder: CompressedRecorder
+    private let recorder: CaptureRecording
     private let publishingToken: CaptureAdmission.SinkToken
     private let recordingToken: CaptureAdmission.SinkToken
     private let fallbackToken: CaptureAdmission.MediaToken
@@ -39,7 +40,18 @@ final class IngressWorker {
     private var publishingResult: Result<Void, Error>?
     private var finishJoins: [FinishJoin] = []
 
-    init(run: CaptureAdmission.MediaRun, ingress: RustEncodedIngress, recorder: CompressedRecorder,
+    /// Existing tools/callers retain the exact legacy writer and queue path.
+    convenience init(run: CaptureAdmission.MediaRun, ingress: RustEncodedIngress, recorder: CompressedRecorder,
+         admission: CaptureAdmission, boundary: @escaping (CaptureAdmission.MediaBoundary) -> Void,
+         terminal: @escaping (CaptureAdmission.SinkToken) -> Void, mediaFailure: @escaping (Error) -> Void,
+         failure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void,
+         publishingQueueBytes: UInt64 = 4 * 1024 * 1024,
+         queue: DispatchQueue = DispatchQueue(label: "sapflow.encoded-ingress", qos: .userInitiated)) throws {
+        try self.init(run: run, ingress: ingress, recorder: CaptureRecording(legacy: recorder), admission: admission,
+            boundary: boundary, terminal: terminal, mediaFailure: mediaFailure, failure: failure,
+            statistics: statistics, publishingQueueBytes: publishingQueueBytes, queue: queue)
+    }
+    init(run: CaptureAdmission.MediaRun, ingress: RustEncodedIngress, recorder: CaptureRecording,
          admission: CaptureAdmission, boundary: @escaping (CaptureAdmission.MediaBoundary) -> Void,
          terminal: @escaping (CaptureAdmission.SinkToken) -> Void, mediaFailure: @escaping (Error) -> Void,
          failure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void,
@@ -99,7 +111,7 @@ final class IngressWorker {
 
             var accepted: CaptureAdmission.SinkMask = []
             self.state.lock(); let records = self.recordingOpen; self.state.unlock()
-            if records, self.recorder.offer(unit) != nil { accepted.insert(.recording) }
+            if records, self.recorder.offer(unit, validated: validated) != nil { accepted.insert(.recording) }
 
             // A void destination offer may drop during recovery. Confirmation
             // instead requires this exact validated sample's real local SDK

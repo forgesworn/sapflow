@@ -61,6 +61,8 @@ extension EncodedPublishingSink {
 final class RustEncodedIngress {
     struct ValidatedUnit {
         let sample: MediaSample
+        /// Actual contiguous validated payload size, no second FFI length query.
+        let payloadBytes: Int
         let pts: Int64
         let duration: UInt32
         /// MediaCodec.sample rejects a flag that differs from coded AVCC IDR.
@@ -139,12 +141,12 @@ final class RustEncodedIngress {
             return sample
         }
         accepted += 1
-        return ValidatedUnit(sample: sample, pts: pts, duration: duration, codedIdr: unit.isVideo && unit.keyframe)
+        return ValidatedUnit(sample: sample, payloadBytes: total, pts: pts, duration: duration, codedIdr: unit.isVideo && unit.keyframe)
     }
 
     /// Validation remains available after a terminal publishing End. Recording
-    /// uses the original native compressed buffer; transport gets this same
-    /// immutable Rust sample without a second payload validation or copy.
+    /// may retain this same immutable Rust sample (or the original native buffer
+    /// for legacy); transport needs no second payload validation or copy.
     func publish(_ validated: ValidatedUnit, sample: MediaSample? = nil) throws {
         try configureDestination()
         try destination?.offer(sample ?? validated.sample)
