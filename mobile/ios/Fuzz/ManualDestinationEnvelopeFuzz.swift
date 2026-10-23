@@ -11,6 +11,8 @@ public func manualDestinationEnvelopeFuzz(_ pointer: UnsafePointer<UInt8>?, _ co
         let document: Data
         if input[0] & 1 == 0 {
             guard let text = String(data: bytes, encoding: .utf8) else { return 0 }
+            let qr = ManualQrPolicy.validatedCandidate(text)
+            if qr { precondition(ManualQrPolicy.boundedASCII(text) && text.utf8.count <= 2048) }
             let envelope = try ManualDestinationEnvelope(text)
             precondition(envelope.document.count <= ManualDestinationEnvelope.maximumDocumentBytes)
             precondition(envelope.description == "Manual destination link (redacted)")

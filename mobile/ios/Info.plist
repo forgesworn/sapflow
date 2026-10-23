@@ -16,7 +16,7 @@
 <key>SapflowV4vApiOrigin</key><string>$(SAPFLOW_V4V_API_ORIGIN)</string>
 <key>SapflowV4vPlaybackOrigin</key><string>$(SAPFLOW_V4V_PLAYBACK_ORIGIN)</string>
 <key>SapflowV4vPlaybackPrefix</key><string>$(SAPFLOW_V4V_PLAYBACK_PREFIX)</string>
-<key>NSCameraUsageDescription</key><string>Sapflow uses your camera for your foreground recording and broadcast.</string>
+<key>NSCameraUsageDescription</key><string>Sapflow uses your camera for foreground recording, broadcasting, and QR scanning that you choose.</string>
 <key>NSMicrophoneUsageDescription</key><string>Sapflow uses your microphone for your recording and broadcast audio.</string>
 <key>UIBackgroundModes</key><array><string>audio</string></array>
 <key>NSLocalNetworkUsageDescription</key><string>Sapflow connects to the streaming destination you choose on your local network.</string>

@@ -413,6 +413,16 @@ load/save/delete use actual capture availability guards too; corrupt metadata
 fails visibly instead of appearing as an empty profile list. Physical provider
 and Keychain behaviour still require device qualification.
 
+Manual settings also offer camera QR scanning through native AVFoundation.
+The scanner accepts only the bounded
+[manual destination link](manual-destination-links.md#camera-qr-import-and-verification)
+and opens the same transient review workflow. Scanning reserves the actual
+capture/library owner before camera permission or opening. Cancellation does
+not release a pending OS permission request, native session or metadata callback
+owner. Only actual closure and modal dismissal release the reservation; the
+original 60-second deadline is checked again at UI delivery. A scan never
+prepares or starts a broadcast. Installed scanning remains a physical gate.
+
 `ReconnectingPublisher` implements the logical `EncodedPublishingSink` and
 creates a fresh `ManualRtmpPublisher` per attempt. `CaptureEngine.setDestination`
 installs it while stopped, before Prepare; replacement is refused while an old

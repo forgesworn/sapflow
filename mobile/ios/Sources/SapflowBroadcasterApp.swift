@@ -41,7 +41,16 @@ final class BroadcasterModel: ObservableObject {
     }, invitationReviewAvailable: { [weak self] in
         guard let self, self.destinationMode != .v4v else { return false }
         return self.foreground && self.recordingLibrary.captureAllowed && self.engine.canChooseCaptureProfile
+    }, scanContextAvailable: { [weak self] in
+        guard let self else { return false }
+        // The scanner owns the library gate here; do not ask that gate to be
+        // idle and mistake our own lease for a competing capture owner.
+        return self.foreground && self.destinationMode == .manual && self.recordingLibrary.ready && self.engine.canChooseCaptureProfile
     })
+    lazy var qrScanner = ManualQrScanner(library: recordingLibrary.admission, settings: manual) { [weak self] in
+        guard let self else { return false }
+        return self.foreground && self.destinationMode == .manual && self.recordingLibrary.ready && self.engine.canChooseCaptureProfile
+    }
     private lazy var destinationSelection = BroadcasterDestinationSelection { [weak engine] in engine?.cancelPendingPreparation($0) }
     private var hasOrientation = false
     private var foreground = false
@@ -271,6 +280,7 @@ struct BroadcasterView: View {
     @ObservedObject var model: BroadcasterModel
     @ObservedObject private var recordings: RecordingLibraryOwner
     @ObservedObject private var manual: ManualDestinationSettings
+    @ObservedObject private var qrScanner: ManualQrScanner
     @Environment(\.scenePhase) private var scenePhase
     @State private var confirmEnd = false
     @State private var confirmEndExisting = false
@@ -280,6 +290,7 @@ struct BroadcasterView: View {
         self.model = model
         _recordings = ObservedObject(wrappedValue: model.recordingLibrary)
         _manual = ObservedObject(wrappedValue: model.manual)
+        _qrScanner = ObservedObject(wrappedValue: model.qrScanner)
     }
     private var controlsLocked: Bool { model.captureBusy || model.snapshot.canStart || !recordings.captureAllowed }
     var body: some View {
@@ -298,6 +309,11 @@ struct BroadcasterView: View {
                 }
             }.padding()
         }.background(Color(.systemBackground))
+        .background {
+            if let selection = qrScanner.presentation {
+                ManualQrPresentation(scanner: qrScanner, selection: selection).id(selection.id)
+            }
+        }
         .onAppear {
             UIDevice.current.beginGeneratingDeviceOrientationNotifications(); model.updateOrientation()
             if let active = AudioShowLifecycle.sceneVisibility(active: scenePhase == .active, background: scenePhase == .background) {
@@ -600,6 +616,9 @@ struct BroadcasterView: View {
             Text("Manual destination · bounded automatic reconnect").font(.caption.bold())
             Button("Import destination JSON") { _ = manual.beginImport() }.disabled(!manual.canEdit)
                 .accessibilityIdentifier("destination.import")
+            Button("Scan destination QR") { qrScanner.begin() }.disabled(!qrScanner.canScan)
+                .accessibilityIdentifier("destination.scan-qr")
+            if let message = qrScanner.message { Text(message).font(.caption).foregroundStyle(.secondary) }
             if let ticket = manual.presentation { ManualDestinationFilePresentation(settings: manual, ticket: ticket).id(ticket.id) }
             if let review = manual.review { ManualDestinationImportReview(settings: manual, review: review).id(review.id) }
             if !manual.profiles.isEmpty {

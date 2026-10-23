@@ -4,7 +4,7 @@ import Foundation
 /// The only closures run under it read or reserve existing capture admission;
 /// they must perform no IO, dispatch, UI work or arbitrary completion callback.
 final class RecordingLibraryAdmission {
-    enum Kind { case setup, scan, export }
+    enum Kind { case setup, scan, export, cameraScan }
     struct Ticket: Equatable {
         fileprivate let serial: UInt64
         let kind: Kind
@@ -32,7 +32,7 @@ final class RecordingLibraryAdmission {
     }
     func reserve(_ kind: Kind) -> Ticket? {
         locked {
-            guard kind != .export else { return nil }
+            guard kind != .export, kind != .cameraScan else { return nil }
             return reserveLocked(kind, phase: .queued)
         }
     }
@@ -40,6 +40,14 @@ final class RecordingLibraryAdmission {
         locked {
             guard !closed, current == nil, canExport() else { return nil }
             return reserveLocked(.export, phase: .picker)
+        }
+    }
+    /// Unlike catalogue enumeration, a camera scan excludes every capture
+    /// reservation. The predicate reads scalar capture/recording ownership only.
+    func reserveCameraScan(canReserve: () -> Bool) -> Ticket? {
+        locked {
+            guard !closed, current == nil, canReserve() else { return nil }
+            return reserveLocked(.cameraScan, phase: .queued)
         }
     }
     private func reserveLocked(_ kind: Kind, phase: Phase) -> Ticket? {

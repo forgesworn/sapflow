@@ -2,6 +2,49 @@ import XCTest
 @testable import SapflowBroadcaster
 
 final class RecordingLibraryAdmissionTests: XCTestCase {
+    func testCameraScanIsDistinctFromCatalogueScanAndExcludesPrepare() throws {
+        let gate = RecordingLibraryAdmission()
+        XCTAssertNil(gate.reserve(.cameraScan))
+        XCTAssertNil(gate.reserveCameraScan { false })
+        let scan = try XCTUnwrap(gate.reserveCameraScan { true })
+        XCTAssertNil(gate.withCaptureReservation { "no camera sharing" })
+        XCTAssertNil(gate.reserve(.scan)); XCTAssertNil(gate.beginExport { true })
+        gate.cancel(scan)
+        XCTAssertNil(gate.withCaptureReservation { "cancel is not close" })
+        XCTAssertFalse(gate.finish(scan, cleanupComplete: false)); XCTAssertTrue(gate.cleanupRetained)
+        XCTAssertFalse(gate.finish(scan, cleanupComplete: true)); XCTAssertTrue(gate.idle)
+    }
+    func testStaleCameraCloseCannotReleaseNextCameraLease() throws {
+        let gate = RecordingLibraryAdmission()
+        let a = try XCTUnwrap(gate.reserveCameraScan { true })
+        XCTAssertTrue(gate.finish(a, cleanupComplete: true))
+        let b = try XCTUnwrap(gate.reserveCameraScan { true })
+        gate.cancel(a); XCTAssertFalse(gate.finish(a, cleanupComplete: true))
+        XCTAssertTrue(gate.owns(b)); XCTAssertNil(gate.withCaptureReservation { "still blocked" })
+    }
+    func testConcurrentCameraScanAndActualPreparationHaveOneWinner() {
+        final class State: @unchecked Sendable {
+            let gate = RecordingLibraryAdmission()
+            var idle = true // Shared only beneath the library lock.
+            var camera = false, capture = false // Independent writers, joined before read.
+        }
+        for _ in 0..<64 {
+            let state = State(), start = DispatchSemaphore(value: 0), group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global().async {
+                defer { group.leave() }; start.wait()
+                state.camera = state.gate.reserveCameraScan { state.idle } != nil
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                defer { group.leave() }; start.wait()
+                state.capture = state.gate.withCaptureReservation { state.idle = false; return true } == true
+            }
+            start.signal(); start.signal()
+            XCTAssertEqual(group.wait(timeout: .now() + 3), .success)
+            XCTAssertNotEqual(state.camera, state.capture)
+        }
+    }
     func testPickerBlocksNewPrepareUntilActualDismissal() {
         let gate = RecordingLibraryAdmission()
         let picker = gate.beginExport { true }!

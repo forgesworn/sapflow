@@ -26,6 +26,8 @@ swiftc -swift-version 5 -warnings-as-errors -F "$sapflow_frameworks" -I "$sapflo
   "$sapflow_root/mobile/ios/Sources/DestinationProfile.swift" \
   "$sapflow_root/mobile/ios/Sources/SrtDestination.swift" \
   "$sapflow_root/mobile/ios/Sources/V4vContracts.swift" \
+  "$sapflow_root/mobile/ios/Sources/RecordingLibraryAdmission.swift" \
   "$sapflow_root/mobile/ios/Sources/ManualDestinationImport.swift" \
-  "$sapflow_root/mobile/ios/Sources/ManualDestinationEnvelope.swift" "$sapflow_scratch/main.swift"
+  "$sapflow_root/mobile/ios/Sources/ManualDestinationEnvelope.swift" \
+  "$sapflow_root/mobile/ios/Sources/ManualQrPolicy.swift" "$sapflow_scratch/main.swift"
 "$sapflow_scratch/check"

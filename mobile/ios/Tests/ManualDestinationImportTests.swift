@@ -326,4 +326,97 @@ final class ManualDestinationImportTests: XCTestCase {
             catch { XCTAssertEqual(error.localizedDescription, ManualImportError.invalidFile.localizedDescription, "mutation \(index)") }
         }
     }
+    func testScanCreatesOnlyAnInvitationAfterExactCleanup() throws {
+        let fixture = try ManualImportFixture()
+        let settings = fixture.settings!
+        settings.sceneChanged(active: true)
+        let ticket = try XCTUnwrap(settings.beginScan())
+        XCTAssertFalse(settings.canEdit); XCTAssertNil(settings.beginImport())
+        let text = ManualDestinationEnvelope.prefix + Self.document().base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        XCTAssertFalse(settings.receiveInvitation(text))
+        XCTAssertTrue(settings.scanIsCurrent(ticket))
+        XCTAssertTrue(settings.completeScan(ticket, delivery: ManualQrDelivery(text: text, beganNs: 0, deadlineNs: UInt64.max)))
+        XCTAssertNotNil(settings.invitation); XCTAssertNil(settings.review)
+        XCTAssertEqual(settings.endpoint, ""); XCTAssertEqual(settings.streamKey, "")
+        XCTAssertEqual(fixture.store.saves, 0); XCTAssertEqual(fixture.store.secretReads, 0)
+    }
+    func testScanEditsAndBackgroundRetainOwnerButRejectLateResults() throws {
+        let fixture = try ManualImportFixture(), settings = fixture.settings!
+        settings.sceneChanged(active: true)
+        var cancelled: [ManualDestinationSettings.Ticket] = []
+        settings.onScanInvalidated = { cancelled.append($0) }
+        let old = try XCTUnwrap(settings.beginScan())
+        settings.endpoint = "locally edited"
+        XCTAssertEqual(cancelled, [old]); XCTAssertEqual(settings.scanning, old)
+        XCTAssertFalse(settings.scanIsCurrent(old)); XCTAssertNil(settings.beginScan())
+        XCTAssertFalse(settings.completeScan(old, delivery: ManualQrDelivery(text: "untrusted", beganNs: 0, deadlineNs: UInt64.max)))
+        let next = try XCTUnwrap(settings.beginScan())
+        XCTAssertFalse(settings.completeScan(old, delivery: ManualQrDelivery(text: "untrusted", beganNs: 0, deadlineNs: UInt64.max)))
+        XCTAssertEqual(settings.scanning, next)
+        settings.sceneChanged(active: false)
+        XCTAssertEqual(settings.scanning, next); XCTAssertFalse(settings.scanIsCurrent(next))
+        settings.sceneChanged(active: true)
+        XCTAssertFalse(settings.scanIsCurrent(next)); XCTAssertFalse(settings.completeScan(next, delivery: ManualQrDelivery(text: "untrusted", beganNs: 0, deadlineNs: UInt64.max)))
+        XCTAssertNil(settings.invitation); XCTAssertEqual(settings.endpoint, "locally edited")
+    }
+    func testOwnCameraLeaseDoesNotInvalidateExactSettingsContext() throws {
+        let store = ManualImportStore(), gate = RecordingLibraryAdmission()
+        let settings = ManualDestinationSettings(store: store, available: { gate.idle }, scanContextAvailable: { true })
+        settings.sceneChanged(active: true)
+        let edit = try XCTUnwrap(settings.beginScan())
+        let lease = try XCTUnwrap(gate.reserveCameraScan { true })
+        XCTAssertFalse(settings.canEdit)
+        settings.captureChanged()
+        XCTAssertTrue(settings.scanIsCurrent(edit))
+        gate.cancel(lease)
+        XCTAssertFalse(gate.idle); XCTAssertEqual(settings.scanning, edit)
+        _ = gate.finish(lease, cleanupComplete: true)
+        XCTAssertFalse(settings.completeScan(edit, delivery: nil))
+        XCTAssertTrue(settings.canEdit)
+    }
+
+    func testQueuedQrDeliveryChecksActualReceiverClockAndPreservesTimelyControl() throws {
+        let fixture = try ManualImportFixture(), settings = fixture.settings!
+        settings.sceneChanged(active: true)
+        let text = ManualDestinationEnvelope.prefix + Self.document().base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        var now: UInt64 = 1
+        func receipt(_ began: UInt64) throws -> ManualQrDelivery {
+            let policy = ManualQrPolicy(), owner = try XCTUnwrap(policy.begin(now: began))
+            XCTAssertTrue(policy.claimModal(owner)); XCTAssertTrue(policy.claimOpen(owner, now: began + 1))
+            XCTAssertTrue(policy.candidate(text, ticket: owner, now: began + 2))
+            policy.nativeClosed(owner, clean: true); policy.modalClosed(owner)
+            return try XCTUnwrap(XCTUnwrap(policy.takeCompletion(owner, now: began + 3)).delivery)
+        }
+        let a = try XCTUnwrap(settings.beginScan()), deliveryA = try receipt(0)
+        let heldUIReply = { settings.completeScan(a, delivery: deliveryA, nowNs: { now }) }
+        now = ManualQrPolicy.lifetimeNs
+        XCTAssertFalse(heldUIReply())
+        XCTAssertNil(settings.invitation); XCTAssertNil(settings.scanning)
+        XCTAssertEqual(settings.endpoint, ""); XCTAssertEqual(fixture.store.saves, 0)
+        let b = try XCTUnwrap(settings.beginScan()), deliveryB = try receipt(now)
+        now += 4
+        XCTAssertTrue(settings.completeScan(b, delivery: deliveryB, nowNs: { now }))
+        XCTAssertNotNil(settings.invitation); XCTAssertNil(settings.review)
+        XCTAssertEqual(settings.endpoint, ""); XCTAssertEqual(fixture.store.saves, 0)
+    }
+    func testQrReceiverRechecksDeadlineAfterParsingAndAvailability() throws {
+        let store = ManualImportStore()
+        var now: UInt64 = 1, invitationChecks = 0
+        let settings = ManualDestinationSettings(store: store, available: { true }, invitationAvailable: {
+            invitationChecks += 1
+            if invitationChecks == 2 { now = 60_000_000_000 }
+            return true
+        })
+        settings.sceneChanged(active: true)
+        let edit = try XCTUnwrap(settings.beginScan())
+        let text = ManualDestinationEnvelope.prefix + Self.document().base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        let delivery = ManualQrDelivery(text: text, beganNs: 0, deadlineNs: 60_000_000_000)
+        XCTAssertFalse(settings.completeScan(edit, delivery: delivery, nowNs: { now }))
+        XCTAssertEqual(invitationChecks, 2); XCTAssertNil(settings.invitation)
+        XCTAssertEqual(settings.endpoint, ""); XCTAssertEqual(store.saves, 0)
+    }
+
 }

@@ -2,6 +2,21 @@ import Foundation
 import Combine
 import Darwin
 
+/// Immutable original scan lifetime carried through cleanup and UI relays.
+/// The receiver rechecks its own current monotonic clock, never a sender stamp.
+struct ManualQrDelivery: CustomStringConvertible, CustomDebugStringConvertible {
+    private let text: String
+    let beganNs: UInt64, deadlineNs: UInt64
+    init(text: String, beganNs: UInt64, deadlineNs: UInt64) {
+        self.text = text; self.beganNs = beganNs; self.deadlineNs = deadlineNs
+    }
+    func textForDelivery(nowNs: UInt64) -> String? {
+        nowNs >= beganNs && nowNs < deadlineNs ? text : nil
+    }
+    var description: String { "Manual QR delivery (redacted)" }
+    var debugDescription: String { description }
+}
+
 /// A manual file conveys settings, never creator authority or plaintext consent.
 struct ImportedManualDestination: CustomStringConvertible, CustomDebugStringConvertible {
     static let maximumBytes = 16_384
@@ -114,9 +129,12 @@ final class ManualDestinationSettings: ObservableObject {
     @Published private(set) var reading = false
     /// Contains no imported label, endpoint, path or secret. One per app model.
     @Published private(set) var invitation: Ticket?
+    @Published private(set) var scanning: Ticket?
+    var onScanInvalidated: ((Ticket) -> Void)?
     private let available: () -> Bool
     private let invitationAvailable: () -> Bool
     private let invitationReviewAvailable: () -> Bool
+    private let scanContextAvailable: () -> Bool
     private let store: ManualDestinationProfileStoring
     private let reader: ManualDestinationFileReader
     private let work: (@escaping () -> Void) -> Void
@@ -132,22 +150,26 @@ final class ManualDestinationSettings: ObservableObject {
     init(store: ManualDestinationProfileStoring = DestinationProfileStore(), available: @escaping () -> Bool,
          reader: ManualDestinationFileReader = ManualDestinationFileReader(),
          invitationAvailable: (() -> Bool)? = nil, invitationReviewAvailable: (() -> Bool)? = nil,
+         scanContextAvailable: (() -> Bool)? = nil,
          work: ((@escaping () -> Void) -> Void)? = nil,
          delivery: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) }) {
         self.store = store; self.available = available; self.reader = reader; self.delivery = delivery
         self.invitationAvailable = invitationAvailable ?? available
         self.invitationReviewAvailable = invitationReviewAvailable ?? available
+        self.scanContextAvailable = scanContextAvailable ?? available
         let queue = DispatchQueue(label: "sapflow.manual-destination-import", qos: .utility)
         self.work = work ?? { queue.async(execute: $0) }
         do { profiles = try store.load() } catch { self.error = DestinationError.storage.localizedDescription }
     }
-    var canEdit: Bool { available() && !reading && !exhausted }
+    var canEdit: Bool { available() && !reading && scanning == nil && !exhausted }
     private func edited() { if !batching { invalidate() } }
     func invalidate() {
         if revision == UInt64.max { exhausted = true } else { revision += 1 }
         presentation = nil; pickerVisible = false; review = nil; pending = nil; invitation = nil; invited = nil
+        if let ticket = scanning { onScanInvalidated?(ticket) }
     }
     func captureChanged() {
+        if scanning != nil, !scanContextAvailable() { invalidate(); return }
         if invitation != nil { if !invitationAvailable() { invalidate() } }
         else if !available(), presentation != nil || review != nil { invalidate() }
     }
@@ -162,14 +184,14 @@ final class ManualDestinationSettings: ObservableObject {
         // or arrive after backgrounding. Becoming active never reviews it.
         if invitation == nil { invalidate() }
     }
-    @discardableResult func receiveInvitation(_ text: String) -> Bool {
+    @discardableResult func receiveInvitation(_ text: String, stillCurrent: () -> Bool = { true }) -> Bool {
         // Incoming links cannot displace a review, picker or its retained IO.
         guard invitation == nil, presentation == nil, review == nil,
-              !reading, !exhausted, invitationAvailable() else { return false }
+              !reading, scanning == nil, !exhausted, invitationAvailable(), stillCurrent() else { return false }
         invalidate()
         do {
             let profile = try ImportedManualDestination(ManualDestinationEnvelope(text).document)
-            guard invitationAvailable(), !reading else { return false }
+            guard invitationAvailable(), !reading, stillCurrent() else { return false }
             let ticket = Ticket(id: UUID(), revision: revision)
             invited = (ticket, profile); invitation = ticket; error = nil
             return true
@@ -196,6 +218,26 @@ final class ManualDestinationSettings: ObservableObject {
         review = Review(ticket: ticket, peer: peer,
             security: profile.requiresPlaintext ? "Plaintext: independent permission required" : (profile.transport == .rtmp ? "RTMPS (TLS)" : "SRT AES-256 media; control and stream ID are clear"),
             requiresPlaintext: profile.requiresPlaintext)
+    }
+    var canScan: Bool { active && canEdit && presentation == nil && review == nil && invitation == nil }
+    func beginScan() -> Ticket? {
+        guard canScan else { return nil }
+        invalidate()
+        let ticket = Ticket(id: UUID(), revision: revision)
+        scanning = ticket; error = nil; return ticket
+    }
+    func scanIsCurrent(_ ticket: Ticket) -> Bool {
+        active && scanning == ticket && ticket.revision == revision && !exhausted && scanContextAvailable()
+    }
+    /// Only after the matching camera, callback queue and modal actually close.
+    /// Settings edits cancel result authority but never release this IO owner.
+    @discardableResult func completeScan(_ ticket: Ticket, delivery: ManualQrDelivery?,
+                                       nowNs: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) -> Bool {
+        guard scanning == ticket else { return false }
+        let permitted = scanIsCurrent(ticket)
+        scanning = nil
+        guard permitted, let delivery, let text = delivery.textForDelivery(nowNs: nowNs()), available() else { return false }
+        return receiveInvitation(text, stillCurrent: { delivery.textForDelivery(nowNs: nowNs()) != nil })
     }
     @discardableResult func beginImport() -> Ticket? {
         guard canEdit, presentation == nil else { return nil }

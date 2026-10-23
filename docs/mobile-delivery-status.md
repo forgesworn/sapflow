@@ -22,9 +22,30 @@ resources and 16 KiB alignment. Evidence remains under
 and `android-qr-app-v2/`. The actual UI receiver rechecks the original scan
 deadline, so a withheld completion relay cannot offer an expired invitation.
 These checks do not establish installed Camera2 permissions, preview/readability,
-real callback cleanup or physical creator acceptance. iOS QR implementation
-and coverage-guided JVM fuzzing retain separate gates. No device or active
+real callback cleanup or physical creator acceptance. Coverage-guided JVM
+fuzzing retains a separate gate. No device or active
 capture was changed for this packet.
+
+iOS QR import is implemented with native AVFoundation metadata output. It
+retains the actual camera/library reservation through an outstanding OS
+permission callback, native session closure, metadata callback drainage and
+modal dismissal. A candidate carries its original deadline through cleanup;
+the actual settings receiver rechecks it before and after parsing/availability.
+Both initial review findings are repaired and independently source-reviewed.
+
+The iOS composition passes 66 focused host tests and 38 recording-library tests
+with warnings as errors, the 67-source iOS 16 API check, and unsigned Debug,
+Qualification and Release builds. The actual Debug test bundle contains the
+QR tests and both byte-identical profile corpora; it compiles but has not run
+on a phone. All variants pass built privacy/configuration and URL-scheme checks.
+The finite Swift ASan/libFuzzer run completes 17,072 executions without a
+finding. Evidence remains under `target/manual-destination-links/qr-ios-v3/`,
+`ios-qr-app-v2/` and
+`target/ios-manual-destination-fuzz/20261022T235008Z-760f4d4a/`.
+The first full app build timed out during test compilation; its cached retry
+passed the same checks with a longer compile allowance. Installed camera,
+permission, link routing and creator acceptance remain open. No phone, active
+capture, signing or publication was changed for this QR packet.
 
 Reviewed [manual destination links](manual-destination-links.md) are implemented
 in both native apps. The shared generated corpus has 98 envelope cases and all
@@ -82,6 +103,23 @@ presentation metadata before recorder migration or production recovery.
 Source and scalar evidence remain under
 `target/privacy-standby/recovery-muxer-spike/`. This does not close B5's
 source-presentation loss, durability or sustained resource gates.
+
+The opt-in native-AAC SDK candidate is now locally committed as `b8149ca`.
+It keeps the possible final AAC unit in the existing buffer, distinguishes
+accepted from serialised checkpoint coverage, and uses measured EOF padding
+only for the final recording container entry. The publishing sample and legacy
+wire output retain their original contract. Current full workspace checks pass
+671 tests with four existing ignored tests and strict all-targets Clippy.
+Generated Swift/Kotlin host consumers and the rebuilt Apple package also pass.
+Evidence remains under `target/privacy-standby/recording-lookbehind-workspace-v1/`
+and `recording-lookbehind-native-check/`. This is an opt-in library change;
+platform recorder adoption, source-matched native presentation, persisted
+recovery and the aggregate two-second loss bound remain open. Initial Swift
+fixture and Rust sanitiser builds timed out before their media or fuzz cases
+executed. The Rust retry passes ten seed replays and 2,922 ASan/overflow fuzz
+executions in 61 seconds on unchanged source; its evidence remains under
+`target/privacy-standby/recording-lookbehind-fuzz-v2/`. Failed initial runs remain
+retained. Native-media qualification is tracked separately.
 
 Privacy standby is integrated and remains under qualification. Its
 [contract](privacy-standby.md) requires synchronous raw-input fencing,
