@@ -890,19 +890,54 @@ codec and emulator. Neither coded extent nor native EOS proves the complete
 programme window after leading delay. No leading value or sub-1,024-frame final
 tail is inferred from these counts.
 
-The separate cold experiment is designed to keep one encoder across preparation
-and Start, with a bounded temporary decoder used only before Start. It fails all four
-generated cases. Two exceed the registered 250 ms budget from the first queued
-preparation sample through Start; two encounter an absent output PCM-encoding key and refuse before
-copying native preparation PCM. All four retain their original failure and
-confirmed cleanup; none issues Start or a candidate leading value. The host
-inspector records all four failures, starts no decoder children and returns
-failure for candidate qualification. The absent PCM key requires documented
-format-default handling;
-absent encoder delay/padding remains unknown. Preparation diagnostics and cost
-must be corrected without changing the fixed budget, two-anchor thresholds or
-the original presentation contract.
+The separate cold experiment keeps one encoder across preparation and Start,
+with a bounded temporary decoder used only before Start. Its original four-case
+run fails: two cases exceed the registered 250 ms queue-to-Start budget and two
+refuse an absent output PCM-encoding key. No case issues Start; those original
+failures remain retained.
 
+The successor source, locally committed as `629b72b`, uses Android's documented
+PCM16 default when that output key is absent, preserves the key's absence in the
+observations and records preparation-stage timings. Missing encoder delay and
+padding remain unknown. Its complete app gate passes 658 Debug tests, 650
+Qualification tests, the 35 Python verifier controls, all three APK builds, lint
+and isolation. The Debug native run still fails all four cold cases. Four actual
+independent decoder children validate the two available generated prefixes;
+this does not turn their failed native preparation into qualification.
+
+A subsequent run uses the same source in the non-debuggable Qualification APK.
+Three cases issue Start at 55.178, 55.910 and 80.425 ms. Independent original-AAC
+parsing, temporary-prefix decoding and full generated-programme holdout checks
+pass for those three candidates through eight actual decoder children. The
+first cold case takes 277.110 ms and never issues Start, so aggregate cold
+qualification still fails the unchanged 250 ms requirement. Its separately
+reported encoder setup cost is not hidden inside a claim about preparation.
+The observed 2,048-frame displacement is a generated diagnostic result, not a
+phone-wide delay constant or a native presentation certificate.
+
+The Qualification runner's original post-stop cleanup error remains recorded.
+A separate cleanup addendum records a current process inventory showing the
+task emulator absent and removal of its exact owned temporary directory; the
+original failed receipt is not rewritten as a passing run. All earlier failures
+and generated evidence remain private. The later Kotlin-only scorer optimisation preserves all alignment candidates,
+thresholds and refusal semantics. Its separate generated-fixture gate genuinely
+executes ten controls in one suite, including bit-for-bit comparisons with the
+original Double scorer, and builds the non-debuggable Qualification APK. APK
+alignment and isolation checks pass. This narrow gate uses the earlier prebuilt
+SDK package; it does not exercise the new Rust programme-window implementation.
+
+The fresh native run starts three cases at 94.349, 62.622 and 173.617 ms.
+Independent strict original-AAC parsing and full generated holdout checks pass
+for those three candidates. The first cold case measures 258.189 ms and refuses
+Start, so the aggregate still fails the unchanged 250 ms limit. Eight independent
+raw decoder children complete and close; no source arrays, decoded arrays or
+thresholds are altered. The first case's scorer takes 47.666 ms, but these
+emulator observations do not establish a matched performance advantage or phone
+qualification. The native runner again records an uncertain shutdown while a
+transient emulator helper remains; a later retained complete current process
+snapshot proves that group absent and the exact task directory removed. Both
+original failures and separate cleanup evidence remain unchanged. Cold timing
+qualification stays open while opt-in muxer/checkpoint integration proceeds.
 These fixtures deliberately export generated PCM and original encoded bytes,
 and the cold experiment creates a temporary decoder. Those test costs are not
 production hot-path performance evidence. A genuine independently checked
@@ -939,6 +974,55 @@ pre-existing AVD is preserved. The active physical broadcast was not changed.
 No real camera media, physical acceptance, Release signing, push or publication
 is part of these generated experiments. Crash recovery, durable bindings and
 the aggregate two-second source-presentation loss bound remain open.
+
+
+## Checked recording programme windows
+
+The scalar SDK foundation is locally committed as `b7aa36c`. It keeps successful
+queued preparation, raw programme, intentional programme silence, block padding
+and codec drain separate. A checked selection conserves the original coded
+prefix, retained window and suffix, while checking the actual submitted AU span,
+original coded clock, programme presentation and explicit movie delay. It does
+not infer coded output from queued input or certify native leading, consumed
+source, EOF, durable file progress or application admission.
+
+The explicit audio-only programme header retains original media coordinates;
+its movie delay is independent of discarded preparation. Twenty-five new tests
+cover boundaries, overflows, incomplete prefixes and header timing. The current
+workspace passes 745 tests with four ignored; formatting, strict Clippy and the
+default generated-stream smoke test pass. Eight legacy audio/video initial
+headers are byte-identical before and after the change.
+
+This is source-level geometry and header support. Existing SDK packages remain
+from the earlier shared-timing-view source; neither app has adopted this new
+programme mode. The next SDK step is integration into the existing muxer and
+portable checkpoints, followed by regenerated bindings, current-source packages,
+actual native programme presentation and concrete producer/file ownership.
+
+Private outcome evidence:
+
+- Corrected-source full Android gate:
+  `target/privacy-standby/android-native-aac-integration-v2/run-20261023T144411Z-2a10c497/receipt.local.json`.
+- Debug native attempt and strict generated-prefix inspection:
+  `target/privacy-standby/android-native-aac-runtime-v2/actual-v1/receipt.local.json`
+  and `leading-host-v1/receipt.local.json`.
+- Non-debuggable Qualification native attempt:
+  `target/privacy-standby/android-native-aac-runtime-v3/actual-v1/receipt.local.json`,
+  with sibling `independent-outcome-review.local.json` and
+  `leading-host-v1/receipt.local.json`. Its original cleanup error and separate
+  cleanup addendum remain retained.
+- Kotlin-only ten-control build and APK verification:
+  `target/privacy-standby/android-native-aac-kotlin-fixture-gates-v2/run-20261023T164843Z-169162d5/receipt.local.json`,
+  with sibling `artifact-verification.local.json` and independent outcome review.
+- Optimised native attempt and strict original-AAC/holdout inspection:
+  `target/privacy-standby/android-native-aac-runtime-v4/actual-v1/receipt.local.json`
+  and `leading-host-v1/receipt.local.json`; separate cleanup evidence is in
+  `root-cleanup-addendum-v2.local.json` with retained current inventory bytes.
+- Programme-window final Rust gates and independent outcome review:
+  `target/privacy-standby/android-recording-integration-plan-v1/root-clippy-fix-w1/final-gates.local.json`
+  and its sibling `independent-outcome-review.local.json`.
+- Eight actual legacy-header byte comparisons:
+  `target/privacy-standby/recording-programme-legacy-bytes-v1/`.
 
 ## Implementation order
 

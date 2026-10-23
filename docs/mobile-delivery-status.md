@@ -37,16 +37,39 @@ a coded extent shorter than the programme; aligned input and each drain
 treatment produce the measured physical queued extent. This does not establish
 which coded frames present the complete programme after native leading delay.
 
-The cold-leading experiment fails all four cases: two exceed its fixed 250 ms
-queue-to-Start budget, and two refuse an absent output PCM-format key. No Start,
-leading fact or production timing receipt is issued. The next step is correcting
-the documented PCM-format handling and measuring preparation costs without
-relaxing that budget, then qualifying the original coded programme window before
-capture integration. All four failed cases and the earlier native-container abort
-remain retained. Only generated media ran in a read-only emulator; the emulator
-was stopped, its task-owned temporary directory removed and the existing AVD
-preserved. No physical phone capture, Release signing, push or publication was
-part of these experiments.
+The original cold-leading experiment fails all four cases and remains retained.
+The corrected PCM-default/timing source is locally committed as `629b72b`; its
+full app gate passes, while its Debug native run still fails all four cases.
+The same source in the non-debuggable Qualification APK issues Start within
+250 ms in three cases, with strict original-AAC parsing and complete generated
+holdout checks passing. The first cold case takes 277.110 ms and never issues
+Start, so that aggregate remains failed. The subsequent Kotlin-only optimisation
+passes ten genuinely executed alignment controls, including bit-for-bit oracle
+comparisons, and its non-debuggable Qualification build and APK checks pass.
+The fresh native run starts three cases at 94.349, 62.622 and 173.617 ms; strict
+original-AAC and full generated holdout checks pass for those three candidates.
+Its first cold case still refuses Start at 258.189 ms, against the unchanged
+250 ms limit. Aggregate cold qualification remains failed. Eight independent
+raw decoder children close normally. These emulator observations do not prove
+physical codec qualification, paired native presentation or a matched performance
+advantage. The narrow Kotlin fixture uses the earlier prebuilt SDK, without
+exercising or promoting the new Rust source.
+
+The recording programme-window foundation is locally committed as `b7aa36c`.
+It separates queued preparation/programme/padding/drain and checks the retained
+original coded window and exact presentation geometry. All 745 workspace tests,
+formatting, strict Clippy and the default smoke test pass; four tests remain
+ignored. Eight legacy initial headers remain byte-identical. This source has
+not yet been packaged or adopted by either app. Real muxer/checkpoint integration,
+current-source packages, native presentation and producer/file ownership are
+next. The detailed [programme-window record](recording-recovery.md#checked-recording-programme-windows)
+retains the actual evidence and limits.
+
+Only generated media ran in the read-only emulator. The original cleanup errors
+remain recorded alongside separate current-inventory cleanup addenda. The emulator
+is stopped, its task temporary directory removed and the existing AVD preserved.
+The active physical capture was not changed; no Release signing, push or
+publication was part of these experiments.
 
 The fresh generated [recording presentation matrix](recording-recovery.md#fresh-registered-matrix-result)
 passes its separately registered numerical contract across five A/V and ten
