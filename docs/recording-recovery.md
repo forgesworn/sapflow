@@ -216,9 +216,48 @@ refusal. Production code is unchanged between those two runs. Failed and passing
 receipts remain under `target/privacy-standby/ios-recording-append-gates-v1/`
 and `ios-recording-append-gates-v2/`.
 
-The app recorder still uses its existing writer. This primitive does not yet
-install checkpoint slots, publish a durable frontier, recover recordings or
-establish the aggregate two-second loss bound.
+The app recorder still uses its existing writer. That append-only packet did
+not install checkpoint slots or publish storage progress. The later composition
+is described below; crash recovery and the aggregate two-second loss bound
+remain open.
+
+## iOS checkpoint installation
+
+The prefix-only SDK/file composition now installs two alternating, bounded
+checkpoint slots. One operation owns fragment append, media sync, exclusive
+temporary-slot write/sync/checked close, anchored rename, directory sync and
+exact bounded readback. It checks actual file incarnations throughout. Unexpected
+stable slots, replacements and occupied temporary names refuse further writes
+and preserve the originals.
+
+A private compound owner creates the real SDK muxer and consumes its outputs.
+It hashes each actual fragment buffer once, checks the issued snapshot against
+the original INITIAL and file bindings, and uses shared Rust decode/successor
+validation before installation and on installed bytes. Only a successful
+readback close can produce the filesystem receipt used for scalar publication;
+cancellation is checked again before publication. No Swift checkpoint parser,
+additional encoder or media queue is introduced.
+
+The actual host gate passes 80 filesystem tests, 38 library tests, nine real-SDK
+filesystem tests and the strict iOS 16 API check across all 68 app source files.
+The SDK tests use synthetic audio bytes and scalar receipts as API controls;
+they do not establish native AAC timing or decoder presentation. Their driver
+consumes explicit source-bound host-runtime and generated-binding receipts.
+Integration of this local qualification driver into CI remains open.
+
+Review added explicit unused/replaced stable-slot cases before execution.
+The harness's forced-cleanup control terminates an uncooperative Python child,
+removes its three new scratch directories and preserves pre-existing files.
+That control is separate from the six successful compiler/test commands.
+Source and scalar evidence remain under
+`target/privacy-standby/ios-recording-checkpoint-owner-source-v2/` and
+`ios-recording-checkpoint-owner-gates-v2/`.
+
+FINAL_HEADER remains bounded deferred metadata. Even a checkpoint with complete
+audio EOF closes as an explicitly incomplete file; normal final-header
+installation is a separate checked closed-file operation. Neither app recorder
+has adopted this composition. Crash recovery, physical storage qualification
+and the aggregate two-second loss bound remain open.
 
 ## Implementation order
 

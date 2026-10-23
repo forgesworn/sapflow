@@ -170,6 +170,19 @@ final class RecordingCatalogue {
         })
     }
     private let appendIO: AppendIO
+    /// Checkpoint syscalls only. No portable parser or native capability enters
+    /// this Foundation-only file; callback validation owns that separate gate.
+    struct CheckpointIO {
+        let write: (Int32, UnsafeRawPointer, Int) -> Int
+        let synchronize: (Int32) -> Int32
+        let rename: (Int32, String, String) -> Int32
+        let synchronizeDirectory: (Int32) -> Int32
+        let read: (Int32, UnsafeMutableRawPointer, Int) -> Int
+        static let native = CheckpointIO(write: { Darwin.write($0, $1, $2) }, synchronize: Darwin.fsync,
+            rename: { Darwin.renameat($0, $1, $0, $2) }, synchronizeDirectory: Darwin.fsync,
+            read: { Darwin.read($0, $1, $2) })
+    }
+    private let checkpointIO: CheckpointIO
     // Strongly own the sole actual append child even if its caller drops it.
     // Clear only after checked close and all receipt work, together with token.
     private var appendOwner: AppendWriter?
@@ -188,9 +201,10 @@ final class RecordingCatalogue {
     init(root: URL, legacyRoot: URL? = nil,
          mediaUpdateIO: MediaUpdateIO = .native,
          appendIO: AppendIO = .native,
+         checkpointIO: CheckpointIO = .native,
          closeFileDescriptor: @escaping (Int32) -> Int32 = Darwin.close) throws {
         self.closeFileDescriptor = closeFileDescriptor
-        self.mediaUpdateIO = mediaUpdateIO; self.appendIO = appendIO
+        self.mediaUpdateIO = mediaUpdateIO; self.appendIO = appendIO; self.checkpointIO = checkpointIO
         guard root.isFileURL, !root.path.utf8.contains(0) else { throw Failure.unsafe }
         do { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         catch { throw Failure.io }
@@ -389,7 +403,7 @@ final class RecordingCatalogue {
         } catch { if !cleanupUncertain { try release(token) }; throw error }
     }
     /// Six flat entries are reserved under the single catalogue child token.
-    /// No slot exists yet and this primitive makes no durable-frontier claim.
+    /// This primitive owns files, never native media/presentation authority.
     func beginAppend(identity: Identity, createdAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000),
                      payloadLimit: UInt64) throws -> AppendWriter {
         guard createdAtMs > 0, payloadLimit > 0, payloadLimit <= 16 * 1024 * 1024,
@@ -457,6 +471,21 @@ final class RecordingCatalogue {
         struct FragmentAppend { let end: UInt64 }
         struct MediaSyncReceipt { let end: UInt64 }
         struct ClosedAppend { let bytes: UInt64 }
+        /// Minted only after actual installed readback close. Scalar filesystem
+        /// observations only, not a native checkpoint or whole-show certificate.
+        final class InstalledMetadataReceipt {
+            fileprivate let owner: UUID
+            let sequence: UInt32
+            let end: UInt64
+            let slot: Int
+            fileprivate init(owner: UUID, sequence: UInt32, end: UInt64, slot: Int) {
+                self.owner = owner; self.sequence = sequence; self.end = end; self.slot = slot
+            }
+        }
+        private struct SlotSnapshot { let source: AppendSource; let file: Fingerprint }
+        private let checkpointOwner = UUID()
+        private var checkpointSequence: UInt32 = 0
+        private var checkpointSlots: [SlotSnapshot?] = [nil, nil]
         private let catalogue: RecordingCatalogue
         private let token: UUID
         let identity: Identity
@@ -528,8 +557,124 @@ final class RecordingCatalogue {
                 _ = try inspect(expected: appendedEnd)
                 guard catalogue.appendIO.synchronize(descriptor) == 0 else { throw Failure.io }
                 _ = try inspect(expected: appendedEnd)
-                // fsync receipt only; checkpoint slots/readback do not exist yet.
+                // fsync receipt only; this alone does not install a checkpoint.
                 return MediaSyncReceipt(end: appendedEnd)
+            }
+        }
+        /// One admission guard covers append through callback and actual close.
+        /// Neither caller scalars nor callback alone can publish native progress.
+        func appendCheckpointFragment(_ bytes: Data, expectedEnd: UInt64, sequence: UInt32,
+                                      checkpointBytes: Data, initialLength: UInt32, initialHash: Data,
+                                      expectedBindings: AppendBindings,
+                                      validateInstalled: (Data) throws -> Void) throws -> InstalledMetadataReceipt {
+            try operation {
+                guard let initial, let descriptor, let source,
+                      initial.bytes == UInt64(initialLength), initial.sha256 == initialHash,
+                      try source.bindings(identity: identity) == expectedBindings,
+                      (545...66_080).contains(checkpointBytes.count),
+                      sequence > 0, sequence < UInt32.max,
+                      UInt64(sequence) == UInt64(checkpointSequence) + 1 else { throw Failure.changed }
+                let position = try inspect(expected: appendedEnd)
+                let end = try Self.checkedFragmentEnd(position: position, byteCount: UInt64(bytes.count), expectedEnd: expectedEnd, outputLimit: outputLimit)
+                let slot = Int(sequence & 1), stable = checkpointName(slot)
+                let temporary = "Sapflow-\(identity.segmentID).checkpoint.tmp"
+                try checkSlots()
+                guard try catalogue.info(catalogue.root, temporary) == nil else { throw Failure.changed }
+                var temporaryFD: Int32?
+                var readbackFD: Int32?
+                do {
+                    try writeAll(bytes)
+                    _ = try inspect(expected: end); appendedEnd = end
+                    guard catalogue.appendIO.synchronize(descriptor) == 0 else { throw Failure.io }
+                    _ = try inspect(expected: end)
+                    let fd = openat(catalogue.root.fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                    guard fd >= 0 else { throw Failure.io }; temporaryFD = fd
+                    let created = try catalogue.appendDescriptor(fd)
+                    guard created.file.size == 0 else { throw Failure.changed }
+                    try checkpointBytes.withUnsafeBytes { buffer in
+                        var offset = 0
+                        while offset < buffer.count {
+                            let remaining = buffer.count - offset
+                            let count = catalogue.checkpointIO.write(fd, buffer.baseAddress!.advanced(by: offset), remaining)
+                            if count < 0 && errno == EINTR { continue }
+                            guard count > 0, count <= remaining else { throw Failure.io }; offset += count
+                        }
+                    }
+                    guard catalogue.checkpointIO.synchronize(fd) == 0 else { throw Failure.io }
+                    let written = try catalogue.appendDescriptor(fd), namedTemp = try catalogue.appendPath(temporary)
+                    guard written.source == created.source, written.source == namedTemp.source,
+                          written.file == namedTemp.file, written.file.size == Int64(checkpointBytes.count),
+                          lseek(fd, 0, SEEK_CUR) == written.file.size else { throw Failure.changed }
+                    // Retain actual temp incarnation BEFORE consuming its close.
+                    let installedSource = written.source
+                    temporaryFD = nil; try catalogue.closeFD(fd)
+                    try checkSlots(); try catalogue.check(catalogue.root)
+                    let stillTemp = try catalogue.appendPath(temporary)
+                    guard stillTemp.source == installedSource, stillTemp.file == written.file else { throw Failure.changed }
+                    guard catalogue.checkpointIO.rename(catalogue.root.fd, temporary, stable) == 0 else { throw Failure.io }
+                    let renamed = try catalogue.appendPath(stable)
+                    guard renamed.source == installedSource, renamed.file.size == Int64(checkpointBytes.count) else { throw Failure.changed }
+                    guard catalogue.checkpointIO.synchronizeDirectory(catalogue.root.fd) == 0 else { throw Failure.io }
+                    guard try catalogue.appendPath(stable).file == renamed.file else { throw Failure.changed }
+                    let readFD = openat(catalogue.root.fd, stable, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                    guard readFD >= 0 else { throw Failure.io }; readbackFD = readFD
+                    guard try catalogue.appendDescriptor(readFD).source == installedSource,
+                          try catalogue.descriptorInfo(readFD) == renamed.file else { throw Failure.changed }
+                    var readback = Data(count: checkpointBytes.count)
+                    try readback.withUnsafeMutableBytes { buffer in
+                        var offset = 0
+                        while offset < buffer.count {
+                            let remaining = buffer.count - offset
+                            let count = catalogue.checkpointIO.read(readFD, buffer.baseAddress!.advanced(by: offset), remaining)
+                            if count < 0 && errno == EINTR { continue }
+                            guard count > 0, count <= remaining else { throw Failure.io }; offset += count
+                        }
+                    }
+                    var suffix: UInt8 = 0
+                    var extra: Int
+                    repeat { extra = Darwin.read(readFD, &suffix, 1) } while extra < 0 && errno == EINTR
+                    guard extra == 0, readback == checkpointBytes,
+                          try catalogue.descriptorInfo(readFD) == renamed.file,
+                          try catalogue.appendPath(stable).file == renamed.file else { throw Failure.changed }
+                    try validateInstalled(readback)
+                    // Callback cannot release this busy owner or mint a receipt.
+                    guard try catalogue.descriptorInfo(readFD) == renamed.file,
+                          try catalogue.appendPath(stable).source == installedSource,
+                          try catalogue.appendPath(stable).file == renamed.file else { throw Failure.changed }
+                    readbackFD = nil; try catalogue.closeFD(readFD)
+                    guard try catalogue.appendPath(stable).source == installedSource,
+                          try catalogue.appendPath(stable).file == renamed.file else { throw Failure.changed }
+                    _ = try inspect(expected: end)
+                    try checkSlots(excluding: slot)
+                    checkpointSlots[slot] = SlotSnapshot(source: installedSource, file: renamed.file)
+                    checkpointSequence = sequence
+                    return InstalledMetadataReceipt(owner: checkpointOwner, sequence: sequence, end: end, slot: slot)
+                } catch {
+                    var problem = error
+                    if let fd = readbackFD { readbackFD = nil; do { try catalogue.closeFD(fd) } catch { problem = error } }
+                    if let fd = temporaryFD { temporaryFD = nil; do { try catalogue.closeFD(fd) } catch { problem = error } }
+                    if catalogue.cleanupUncertain { catalogue.poison(self) }
+                    // Preserve prior active slot, actual original and fixed temp.
+                    throw problem
+                }
+            }
+        }
+        /// Scalar acknowledgement, never IO/FFI under this lock.
+        func confirms(_ receipt: InstalledMetadataReceipt) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return phase == .open && !busy && !admissionClosed && receipt.owner == checkpointOwner &&
+                receipt.sequence == checkpointSequence && receipt.end == appendedEnd
+        }
+        private func checkpointName(_ slot: Int) -> String { "Sapflow-\(identity.segmentID).checkpoint.\(slot)" }
+        private func checkSlots(excluding omitted: Int? = nil) throws {
+            for slot in 0..<2 {
+                if slot == omitted { continue }
+                if let previous = checkpointSlots[slot] {
+                    let actual = try catalogue.appendPath(checkpointName(slot))
+                    guard actual.source == previous.source, actual.file == previous.file else { throw Failure.changed }
+                } else {
+                    guard try catalogue.info(catalogue.root, checkpointName(slot)) == nil else { throw Failure.changed }
+                }
             }
         }
         private func operation<T>(_ body: () throws -> T) throws -> T {

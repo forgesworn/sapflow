@@ -23,14 +23,17 @@ executions. Refreshed three-slice Apple and four-ABI Android packages pass their
 actual generated host consumers. These are library/package checks; the apps
 have not adopted the new append/checkpoint recovery path.
 
-The additive iOS append-file owner passes 71 actual host recording lifecycle
-tests, 38 library tests and the strict iOS 16 API check across all 67 app source
-files. It retains exact file/catalogue ownership through checked close and
-receipt installation, with bounded sequential writes and stable file-incarnation
-bindings. Two initial replacement fixtures hit the permission guard first;
-their reviewed correction preserves the identity assertions and adds a separate
-permissions control. The original failed run is retained. Checkpoint slots,
-recorder adoption and durable recovery remain open.
+The iOS [checkpoint composition](recording-recovery.md#ios-checkpoint-installation)
+passes 80 actual host filesystem tests, 38 library tests, nine real-SDK
+filesystem/API tests and the strict iOS 16 API check across all 68 app source
+files. It retains exact file/catalogue ownership through sync, alternating-slot
+installation, shared Rust validation and checked readback close. Scalar
+publication follows that close and a fresh cancellation check. The earlier
+append-only 71-test result and its initial fixture failures remain retained.
+The new SDK tests use synthetic audio bytes and scalar receipts, with no
+native decoder or physical acceptance claim. FINAL_HEADER is still deferred;
+normal finalisation, app recorder adoption, crash recovery and aggregate
+two-second loss qualification remain open.
 
 Android V4V End now requires an explicit confirmation bound to the exact saved
 session or pending Prepare and the Activity's local capture owner. Cancellation
