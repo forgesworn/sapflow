@@ -139,7 +139,7 @@ tasks.register("verifyQualificationIsolation") {
             check(debugJava !in sources.java.srcDirs.map { it.canonicalFile })
             check(debugResources !in sources.res.srcDirs.map { it.canonicalFile })
             check(sources.java.srcDirs.none { directory ->
-                directory.walkTopDown().any { it.name == "FfiBenchmarkActivity.kt" }
+                directory.walkTopDown().any { it.name in listOf("FfiBenchmarkActivity.kt", "NativeAacQualificationActivity.kt", "NativeAacQualificationProbe.kt") }
             })
         }
     }

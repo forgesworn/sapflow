@@ -182,6 +182,22 @@ class QualificationVerifierTest(unittest.TestCase):
                 VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"), expected_native="0" * 64)
 
 
+    def test_release_refuses_generated_native_aac_probe_markers_in_secondary_dex(self):
+        for marker in VERIFIER["AAC_PROBE_MARKERS"]:
+            self.dex(b"production classes")
+            with ZipFile(self.apk, "a") as archive:
+                archive.writestr("classes2.dex", marker)
+            with patch("subprocess.check_output", return_value=self.release_manifest()):
+                with self.assertRaisesRegex(ValueError, "present in release dex"):
+                    VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"), expected_native=self.native_hash)
+
+    def test_release_refuses_generated_native_aac_activity_in_manifest(self):
+        manifest = self.release_manifest().replace("OtherProductionActivity", "NativeAacQualificationActivity")
+        with patch("subprocess.check_output", return_value=manifest):
+            with self.assertRaisesRegex(ValueError, "components present in release"):
+                VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"), expected_native=self.native_hash)
+
+
 class ConnectorNativeVerifierTest(unittest.TestCase):
     @staticmethod
     def elf(align=16384):

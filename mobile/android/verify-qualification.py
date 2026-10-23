@@ -18,6 +18,9 @@ POSE_APPLICATION = "dev.forgesworn.sapflow.broadcaster.QualificationPoseApplicat
 POSE_MARKERS = (b"Ldev/forgesworn/sapflow/broadcaster/QualificationPoseApplication;",
                 b"dev.forgesworn.sapflow.broadcaster.QUALIFICATION_POSE")
 BENCHMARK_MARKER = b"Ldev/forgesworn/sapflow/broadcaster/FfiBenchmarkActivity;"
+AAC_PROBE_MARKERS = (b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificationActivity;",
+                     b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificationProbe;",
+                     b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC")
 FIXTURE_CA = "res/raw/sapflow_qualification_ca.der"
 FIXTURE_CONFIG = "res/xml/sapflow_qualification_network_security.xml"
 
@@ -186,20 +189,20 @@ def verify_release_isolation(apk, aapt2, *, expected_native=EXPECTED_NATIVE):
         raise ValueError("Qualification fixture resource present in release")
     if attribute(application, "debuggable") not in (None, "false", "0x00000000"):
         raise ValueError("Release APK is debuggable")
-    if POSE_APPLICATION in application or "FfiBenchmarkActivity" in application:
+    if POSE_APPLICATION in application or "FfiBenchmarkActivity" in application or "NativeAacQualification" in application:
         raise ValueError("Qualification components present in release manifest")
     if re.search(r"E: profileable(?:\s|$)", application) and attribute(node_block(application, "profileable"), "shell") in ("true", "0xffffffff"):
         raise ValueError("Release APK permits shell profiling")
     with ZipFile(apk) as archive:
         if any("sapflow_qualification_" in name for name in archive.namelist()):
             raise ValueError("Qualification fixture resource present in release")
-        if any(pose_markers(archive, POSE_MARKERS + (BENCHMARK_MARKER,))):
+        if any(pose_markers(archive, POSE_MARKERS + (BENCHMARK_MARKER,) + AAC_PROBE_MARKERS)):
             raise ValueError("Qualification pose hook present in release dex")
         native = archive.read("lib/arm64-v8a/libsapflow_ffi.so")
     if sha256(native) != expected_native:
         raise ValueError("Release Rust library differs from the frozen package")
     return {"apk_sha256": sha256(apk.read_bytes()), "qualification_hook_absent": True,
-            "offline_benchmark_absent": True, "profileable_shell": False,
+            "offline_benchmark_absent": True, "native_aac_probe_absent": True, "profileable_shell": False,
             "native_sha256": sha256(native)}
 
 

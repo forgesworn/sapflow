@@ -6,7 +6,6 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTimestamp
 import android.media.MediaCodec as PlatformCodec
-import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaRecorder
 import android.os.Handler
@@ -146,10 +145,7 @@ internal class AudioCaptureOwner(
                 } })
             g.encoded = encoded
             codec.setCallback(encoded,audioCallbacks)
-            codec.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC,48_000,1).apply {
-                setInteger(MediaFormat.KEY_AAC_PROFILE,MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-                setInteger(MediaFormat.KEY_BIT_RATE,bitrate);setInteger(MediaFormat.KEY_MAX_INPUT_SIZE,2048)
-            },null,null,PlatformCodec.CONFIGURE_FLAG_ENCODE)
+            AudioAacEncoderConfiguration.configure(codec,bitrate)
             codec.start()
             if (!zero) prepareMicrophone(g)
             if (started) beginGeneration(g)
