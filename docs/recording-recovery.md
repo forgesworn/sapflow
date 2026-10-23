@@ -1114,12 +1114,105 @@ review verifies the retained files, complete finite PCM, input hashes and cleanu
 The experiment therefore stops before native replay. This conclusion covers
 these five profiles and three sources, not every possible reader or container.
 
-The next experiments use explicitly identified checked readers to pass verified
-head/tail and coded-to-movie mapping facts to existing decoder APIs before
-decoding. Whole returned PCM remains unmodified. This is additional reader
-qualification, not a repair to stock file-reader interoperability, paired native
-recorder authority or application admission. Original recording files, checkpoint
-bindings, stock-reader failures and the numerical contract remain unchanged.
+### Explicit checked-reader observations
+
+The qualification-only Android reader source adds an explicit application reader
+policy to the existing synchronous decoder loop. It verifies the original file,
+final `SFCP0002`, work/file bindings, source generation, complete sealed frontier,
+H/T geometry and separate real source EOF/owner facts before configuring the
+same native decoder. Original encoder trim fields remain absent; the requested
+reader H/T are separately labelled facts. Invalid head/tail pure guards and an
+actual foreign-checkpoint SDK rejection run before decoder creation. Three
+eligible cases and one fresh unchanged-policy control are fixed in advance;
+there is no encoder or adaptive policy search.
+
+The fresh app gate runs at `75b1a5e` with exactly four changed Android source
+paths. Debug genuinely executes 660 tests in 72 suites and Qualification 650 in
+71 suites; 38 Python verifier controls make 1,348 checks, with zero failures,
+errors or skips. Three APK assemblies, lint, isolation and seven artefact commands
+pass. All 412 recorded inputs and 122 current SDK inputs retain their hashes.
+The W2 package build remains `9e01677`, with code `b2c10ca`; no Rust rebuild is
+inferred from the app gate. Lint has zero errors and 21/26/15 warnings for
+Debug/Qualification/Release. Actual AAR/APK native byte identity, four-ABI AAR
+and ARM64 APK ELF/ZIP 16 KiB alignment, notices, routing, QR DEX and qualification /
+release isolation pass. Release is structurally unsigned; Debug and Qualification
+retain standard debug signing without cryptographic signer qualification. The
+three prior W4 APKs remain preserved. Independent app and artefact review is clear.
+
+The actual non-debuggable Qualification replay reuses the original generated
+source, healthy SDK files, initial headers and complete sidecars. The bound input
+contains 42 byte-identical copied files and a new manifest, 43 files in total.
+Three real SDK checkpoint decode calls return and
+four actual `c2.android.aac.decoder` observations run. The first eligible source's
+unconfigured format/extractor-PTS control retains its 5,120-frame whole-output
+failure. The three explicitly configured H/T readers export exactly 2,765,
+48,000 and 2,765 frames through actual input/output EOS and checked native/file
+closure. Nine pure inspection controls also pass. Whole native PCM ranges are
+exported in order without application cropping, shifting, resampling or rewriting.
+Old/fresh baseline PCM hashes and their byte-exact comparison are diagnostics,
+not a stronger substitute for the registered paired numerical oracle.
+
+All original coded, extractor, explicitly queued and returned native timestamp
+axes remain recorded. Queue times use checked coded PTS minus the absolute edit,
+with floor microsecond conversion and actual nonzero remainders, not a lossless
+conversion claim. Every reader's first positive output PTS is zero. Nevertheless,
+the short case returns 717 frames at 0 microseconds followed by 1,024 at 21,333
+and 42,666; the long case starts with 896 at 0 followed by 1,024 at 21,333.
+Those buffer sizes and timestamps do not establish contiguous native PCM-frame
+timing. The native clock remains unqualified, beyond the conversion-precision
+gap. Exact N and an initial PTS0 do not qualify origin, endpoints, seeks or paired
+presentation.
+
+The pure inspector checks actual whole range/EOF/release facts and all 480
+runtime input hashes. Its first requested output path is rejected by the
+output/input disjointness guard before writing: a protected root `LICENSE` input
+makes the repository an immutable parent. The unchanged inspector then writes to
+a fresh private temporary directory; its report is copied byte-for-byte into
+retained evidence and the temporary directory is removed. There is no codec or
+emulator rerun and no predicate change. The original operational failure and
+corrected-output receipt remain separate. The owned emulator stops, its task
+scratch is removed and the existing AVD is preserved. Independent native outcome
+review is clear for the frame/range, source and cleanup scope; native clock and
+paired presentation remain unqualified.
+
+A separate checked independent C reader uses public libavcodec packet skip /
+discard metadata from checked source/window facts before decoding the same
+original payloads. Its first actual run returns exact N in three healthy cases
+and retains the head-plus-one, tail-plus-one and missing-decoder-EOS negatives.
+The later clock run adds a read-only public context-timebase observation; it does
+not change the decoder processing. One compiler and six decoder children close.
+All six whole Float32 arrays remain byte-identical to that preceding run. The
+three healthy returns have exact source and movie origin/endpoints, contiguous
+frame extents, durations and DTS/PTS under the configured and accepted public
+packet timebase of 1/48,000. Both one-frame trim mutations return 2,764 rather
+than 2,765 and fail the original programme-length and clock requirements, as
+the registered negative controls require. The missing-EOS case returns N but
+still fails EOF closure, preserving the distinction between frame count and
+completion.
+
+That context-derived clock proof is separately scoped: returned `AVFrame.time_base`
+values remain 0/1 and are never filled in. The original raw-frame endpoint gate
+and preceding verdict remain open and unchanged. Independent review clears this
+context API observation and byte readback. It is not a pass for the stock FFmpeg
+MOV demuxer, universal libavcodec/native wrapper semantics or the original native
+paired waveform oracle. Native queue microsecond precision, returned native
+buffer timestamps and full presentation qualification still need actual proof.
+
+These reader experiments preserve original recording files, packet bytes/order /
+counts/rational coded clocks, checkpoint bindings, stock-reader failures and the
+2,875-byte numerical contract. The W3 native MediaMuxer trim and same-clock pair
+remain `UNSUPPORTED_W3_NATIVE_TRIM_AND_CLOCK`. The first cold case's 258.189 ms
+failure against 250 ms remains failed and is not replayed as eligible. No result
+here establishes waveform/paired presentation, production/default adoption,
+physical capture, power/performance advantage or recovery.
+
+The concrete next work is native clock and paired presentation qualification,
+then source-generation/capture and ingress closure using actual native producers.
+Durable checkpoint installation/recovery and the aggregate two-second loss bound
+follow, then both-phone complete-show pilots, matched competitor performance and
+release. Existing delivery goals and legacy defaults are unchanged. Later source
+commits must keep these app/native receipts' original `75b1a5e` plus four-path dirty
+context; they do not relabel the earlier package or failed experiments.
 
 In the preceding native SDK experiment, owners, the task emulator and temporary
 directory close; the pre-existing AVD and private generated evidence remain
@@ -1134,6 +1227,25 @@ original numerical contract are unchanged.
 
 Private outcome evidence:
 
+- Explicit-reader four-source freeze and independent source review:
+  `target/privacy-standby/android-native-aac-sdk-window-v1/interoperability-native-reader-v1/author/source.manifest.local.json`
+  and `independent-source-review-v1/receipt.local.json` under the same reader root.
+- Fresh explicit-reader app build, seven artefact checks and independent outcome:
+  `target/privacy-standby/android-native-reader-app-gates-v1/run-20261023T220526Z-9ec671d3/receipt.local.json`,
+  `artifact-verification.local.json` and `independent-outcome-review.local.json`.
+- Actual native explicit reader and original generated output:
+  `target/privacy-standby/native-reader-runtime-v1/receipt.local.json`
+  and `explicit_reader-extracted/receipt.json`.
+- Pure whole-native result inspection and independent native outcome review:
+  `target/privacy-standby/native-reader-inspection-v1/receipt.local.json`
+  and its sibling `independent-outcome-review.local.json`.
+  The retained initial output-path failure and corrected pure invocation are in
+  `target/privacy-standby/android-native-aac-sdk-window-v1/interoperability-native-reader-v1/root-native-inspector-gates-v1/receipt.local.json`
+  and `root-native-inspector-gates-v2/receipt.local.json` under the same reader root.
+- Checked independent reader context-clock result and independent review:
+  `target/privacy-standby/aac-checked-independent-reader-clock-actual-v1/receipt.local.json`
+  and `independent-outcome-review.local.json`. That receipt retains the exact prior
+  reader result and audit hashes; the raw-frame endpoint gate stays open.
 - Fixed five-profile host metadata experiment:
   `target/privacy-standby/aac-host-metadata-matrix-actual-v1/receipt.local.json`
   and its `independent-outcome-review.local.json`.

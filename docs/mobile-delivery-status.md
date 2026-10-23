@@ -5,16 +5,47 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-The next recording step is reader interoperability. The actual Android SDK
-programme-file experiment exercises the new muxer, but its whole decoded audio
-does not match the required programme length in either tested reader. A subsequent
-fixed five-profile metadata experiment also fails exact length in all fifteen
-generated files. Checked native and independent decoder adapters are the next
-experiments; neither changes the original stock-reader failures or qualifies
-application adoption. Then qualify checked crash recovery and the aggregate
-two-second source-presentation loss bound, run a complete-show physical pilot on both
-phones, and perform matched competitor performance qualification. The existing
-origin-first, free-V4V scope remains unchanged.
+The next recording step is native clock and paired presentation qualification,
+then concrete source-generation and capture closure. Explicit native and checked
+independent readers now return the required 2,765, 48,000 and 2,765 programme
+frames from the original generated SDK files. Native buffer timestamps and
+microsecond conversion still do not satisfy the full clock requirements; the
+paired native recorder control remains unsupported. The original stock-reader
+and fifteen metadata-profile failures remain unchanged. Then qualify durable
+checkpoint installation and crash recovery, the aggregate two-second
+source-presentation loss bound, complete shows on both phones, matched competitor
+performance and release. The existing origin-first, always-free V4V scope and
+legacy recorder defaults remain unchanged.
+
+The latest qualification-only Android reader gate executes 660 Debug tests,
+650 Qualification tests and 38 Python verifier controls, totalling 1,348, with
+no failures, errors or skips. All three APK builds, lint and seven artefact checks
+pass with 412 recorded inputs unchanged. The same 122 SDK source inputs and W2
+packages are reused; the app gate does not rebuild Rust. Independent app and
+artefact review is clear. This proves the tested build scope, not reader or
+capture adoption.
+
+A fresh non-debuggable emulator run makes three real checkpoint decodes and four
+native decoder observations, with actual EOS and checked cleanup. Source-bound
+H/T requests return exactly the three programme lengths; the unchanged-policy
+control still returns 5,120 frames. The short reader's first positive ranges are
+717 frames at 0 microseconds, then 1,024 at 21,333 and 42,666; the long reader
+starts with 896 frames at 0, then 1,024 at 21,333. These reported ranges and times
+do not establish a continuous native PCM-frame clock. Nonzero conversion
+remainders also remain visible. The fixture retains each whole PCM range as
+returned; first positive PTS0 is not presentation qualification. Independent native
+review is clear for these frame/range, source and cleanup facts; native clock and presentation remain
+unqualified.
+
+The checked independent libavcodec reader separately returns exact programme
+lengths while preserving original packet bytes and coded clocks. Its public
+context-timebase proof checks source and movie intervals, continuity and
+endpoints in all three healthy cases; whole PCM matches its preceding reader
+run byte-for-byte. Raw returned frame timebases remain 0/1, so that earlier raw
+endpoint gate stays open. This is a checked reader API result, not a stock
+FFmpeg CLI, native paired waveform, physical or performance pass. The detailed
+[programme-window record](recording-recovery.md#checked-recording-programme-windows)
+retains the actual receipts and the remaining gates.
 
 The latest Android work adds pre-filter AAC observations (`73df1bb`), the
 generated codec fixture (`a632095`) and the optional SDK recording owner
@@ -78,8 +109,9 @@ The Apple archive contains three ARM64 platform slices; its installed Swift host
 consumer passes on macOS. The four-ABI Android AAR passes its installed Kotlin
 host consumer and actual ELF 16 KiB alignment checks.
 The new and old generated APIs and dependency notices are verified in the
-archives. Existing Android app APKs still use the earlier SDK; neither app has
-adopted the new programme mode. Native source/EOF facts, file durability, paired
+archives. At that milestone Android app APKs still used the earlier SDK; later
+generated Android qualification gates use these W2 packages. Neither app's
+capture/default recorder has adopted the new programme mode. Native source/EOF facts, file durability, paired
 presentation and app admission remain external requirements. The detailed [programme-window record](recording-recovery.md#checked-recording-programme-windows)
 retains the actual evidence and limits.
 
