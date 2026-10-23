@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * The Activity retains this concrete owner if any native/file close is unknown. */
 internal class NativeAacProgrammeWindowProbe(private val root: File, private val input: File,
     private val manifestSha256: String, private val cancelled: AtomicBoolean, private val mode: Mode = Mode.REFERENCE) {
-    enum class Mode { REFERENCE, SDK_WINDOW }
+    enum class Mode { REFERENCE, SDK_WINDOW, EXPLICIT_READER }
     private val retained = mutableListOf<Any>()
     private var cleanupKnown = true
     private val journal = JSONArray()
@@ -106,6 +106,7 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
 
     fun run(): JSONObject {
         if (mode == Mode.SDK_WINDOW) return runSdk()
+        if (mode == Mode.EXPLICIT_READER) return runReader()
         check(Build.HARDWARE in setOf("ranchu", "goldfish") && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN)
         check(manifestSha256.matches(Regex("[a-f0-9]{64}")))
         val bytes = read(input, "manifest.json", 512 * 1024)
@@ -533,7 +534,148 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
         return result
     }
 
-    private fun decode(directory: File, kind: String, signedPresentation: Boolean = false, omitInputEos: Boolean = false, outputName: String = kind): JSONObject {
+    /** Application reader policy, not native extractor metadata or source truth. */
+    private var readerDecoderCreates = 0
+    private var readerCheckpointDecodes = 0
+    private data class ReaderRequest(val head: Int, val tail: Int, val mediaTime: Long,
+        val packets: JSONArray, val decoderName: String)
+    private fun readerGeometry(head: Int, tail: Int, units: Long, programme: Long, first: Long, mediaTime: Long) {
+        check(head in 0..8191 && tail in 0..1023 && units in 1..128 && programme in 1..48000 && first >= 0)
+        check(Math.multiplyExact(units, 1024L) == Math.addExact(Math.addExact(head.toLong(), programme), tail.toLong()))
+        check(Math.addExact(first, head.toLong()) == mediaTime)
+    }
+    private fun hex32(value: String): ByteArray {
+        check(value.matches(Regex("[a-f0-9]{64}")))
+        return ByteArray(32) { value.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+    }
+    private fun checkedReader(sourceDir: File, source: JSONObject, reference: JSONObject, refusals: JSONArray): ReaderRequest {
+        val file = read(sourceDir, "healthy.mp4", 4 * 1024 * 1024)
+        val initial = read(sourceDir, "healthy.initial.bin", 65536)
+        val slot = read(sourceDir, "healthy.final.sfcp2", 66080)
+        val recording = hex32(reference.getString("recordingBindingHex")); val binding = hex32(reference.getString("fileBindingHex"))
+        val decoderCallsBefore = readerDecoderCreates
+        val decoded = acquire("reader.checkpoint.decode") { decodeProgrammeCheckpoint(slot, recording, binding) }; remember(decoded); readerCheckpointDecodes++
+        var request: ReaderRequest? = null
+        try {
+            val info = decoded.info(); val facts = info.facts; val start = info.start; val end = checkNotNull(info.windowEnd)
+            val q = source.getJSONObject("queued"); val generation = reference.getLong("sourceGeneration").toULong()
+            check(facts.windowGeometryComplete && start.generation == generation && end.generation == generation)
+            check(start.codedOrigin == source.getLong("codedOrigin").toULong() && start.preparationFrames == q.getLong("preparation").toULong())
+            check(start.measuredDisplacement == source.getLong("measuredDisplacement").toULong() && start.discardPrefixFrames == source.getLong("discardPrefixFrames").toULong() && start.movieDelayTicks == 0uL)
+            check(end.queued == NativeProgrammeQueuedFrames(q.getLong("preparation").toULong(), q.getLong("programmeRaw").toULong(), q.getLong("programmeIntentionalZero").toULong(), q.getLong("blockPadding").toULong(), q.getLong("codecDrain").toULong()))
+            check(end.codedFrames == source.getLong("observedCodedFrames").toULong())
+            check(initial.isNotEmpty() && info.initialHeaderLen.toInt() == initial.size && info.committedOffset == file.size.toULong())
+            check(info.initialHeaderSha256.contentEquals(MessageDigest.getInstance("SHA-256").digest(initial)))
+            check(info.fragmentRegionBytes == (file.size - initial.size).toULong() && file.size >= initial.size)
+            check(info.fragmentRegionSha256.contentEquals(MessageDigest.getInstance("SHA-256").digest(file.copyOfRange(initial.size, file.size))))
+            val header = decoded.header(); check(header.size == initial.size && file.copyOfRange(0, initial.size).contentEquals(header))
+            check(sha(header) == reference.getString("sealedHeaderSHA256") && sha(file) == reference.getString("fileSHA256"))
+            val all = source.getJSONArray("packets"); val first = source.getInt("selectedFirstPacket"); val last = source.getInt("selectedEndPacket")
+            check(first in 0 until last && last <= all.length() && last - first in 1..128)
+            val selected = JSONArray(); for (i in first until last) selected.put(JSONObject(all.getJSONObject(i).toString()))
+            val head = facts.leadingFrames.toInt(); val tail = facts.trailingFrames.toInt()
+            val n = Math.addExact(q.getLong("programmeRaw"), q.getLong("programmeIntentionalZero"))
+            val firstTicks = selected.getJSONObject(0).getLong("codedDts")
+            val mediaTime = Math.addExact(firstTicks, head.toLong())
+            readerGeometry(head, tail, selected.length().toLong(), n, firstTicks, mediaTime)
+            check(facts.audioUnits == selected.length().toULong() && facts.audioStart == firstTicks.toULong())
+            check(facts.audioEnd == Math.addExact(firstTicks, Math.multiplyExact(selected.length().toLong(), 1024L)).toULong())
+            check(facts.audioContainerEnd == (facts.audioEnd - facts.trailingFrames.toULong()))
+            check(head == source.getInt("derivedHeadFrames") && tail == source.getInt("derivedTailFrames"))
+            check(head.toLong() == Math.subtractExact(Math.addExact(q.getLong("preparation"), source.getLong("measuredDisplacement")), source.getLong("discardPrefixFrames")))
+            check(decoded.presentationExtent().durationTicks == Math.multiplyExact(n, 15L).toULong())
+            // These controls exercise the same pure guard used before configure.
+            var badHeadRefused = false
+            try { readerGeometry(-1, tail, selected.length().toLong(), n, firstTicks, mediaTime) } catch (_: IllegalStateException) { badHeadRefused = true }
+            check(badHeadRefused) { "Invalid head accepted" }
+            refusals.put(JSONObject().put("kind", "INVALID_HEAD_REFUSED_BEFORE_DECODER").put("refused", badHeadRefused).put("decoderCallsBefore", decoderCallsBefore).put("decoderCallsAfter", readerDecoderCreates))
+            var badTailRefused = false
+            try { readerGeometry(head, 1024, selected.length().toLong(), n, firstTicks, mediaTime) } catch (_: IllegalStateException) { badTailRefused = true }
+            check(badTailRefused) { "Invalid tail accepted" }
+            refusals.put(JSONObject().put("kind", "INVALID_TAIL_REFUSED_BEFORE_DECODER").put("refused", badTailRefused).put("decoderCallsBefore", decoderCallsBefore).put("decoderCallsAfter", readerDecoderCreates))
+            try {
+                val foreign = acquire("reader.foreign.checkpoint.decode") { decodeProgrammeCheckpoint(slot, ByteArray(32), binding) }; remember(foreign)
+                destroy(foreign, "reader.foreign"); check(cleanupKnown); error("Foreign checkpoint accepted")
+            } catch (_: RecordingCheckpointException.Binding) { refusals.put(JSONObject().put("kind", "FOREIGN_CHECKPOINT_REFUSED_BEFORE_DECODER").put("refused", true).put("decoderCallsBefore", decoderCallsBefore).put("decoderCallsAfter", readerDecoderCreates)) }
+            check(readerDecoderCreates == decoderCallsBefore)
+            val name = reference.getString("decoderName"); check(name == "c2.android.aac.decoder")
+            request = ReaderRequest(head, tail, mediaTime, selected, name)
+        } finally { destroy(decoded, "reader.checkpoint") }
+        check(cleanupKnown) { "Reader checkpoint close unknown; decoder fenced" }
+        return checkNotNull(request)
+    }
+    private fun runReader(): JSONObject {
+        check(Build.HARDWARE in setOf("ranchu", "goldfish") && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN)
+        val bytes = read(input, "manifest.json", 512 * 1024); check(sha(bytes) == manifestSha256)
+        val manifest = JSONObject(String(bytes, Charsets.UTF_8))
+        check(manifest.getString("schema") == "generated-native-aac-explicit-reader-input-v1" && manifest.getBoolean("generatedOnly"))
+        check(manifest.getString("pairedNativePresentation") == "UNSUPPORTED_W3_NATIVE_TRIM_AND_CLOCK")
+        val cases = manifest.getJSONArray("cases"); check(cases.length() == 4)
+        val results = JSONArray(); var failure: String? = null; var baselineDone = false
+        try {
+            for (i in 0 until cases.length()) {
+                active(); val source = cases.getJSONObject(i); val name = source.getString("name")
+                check(name.matches(Regex("seed-[0-9]+-programme-(48000|2765)")))
+                val sourceDir = File(input, name); check(sourceDir.canonicalFile.parentFile == input.canonicalFile && !Files.isSymbolicLink(sourceDir.toPath()))
+                val files = source.getJSONObject("files"); check(files.length() in 1..16)
+                for (key in files.keys()) check(sha(read(sourceDir, key, 4 * 1024 * 1024)) == files.getString(key))
+                val row = JSONObject().put("name", name).put("sourceManifestCase", source).put("sourceOutcome", source.getString("sourceOutcome"))
+                    .put("nativeWindowQualified", false).put("presentationEquivalent", false).put("appAdmission", false)
+                results.put(row)
+                if (!source.getBoolean("eligible")) { check(i == 0 && source.getString("sourceOutcome") == "FAILED"); row.put("classification", "RETAINED_FAILED_SOURCE_NO_REPLAY"); continue }
+                check(i > 0 && source.getString("sourceOutcome") == "CANDIDATE_QUALIFIED")
+                val observed = JSONObject(String(read(sourceDir, "receipt.json", 4 * 1024 * 1024), Charsets.UTF_8))
+                check(observed.getBoolean("generatedOnly") && observed.getBoolean("startIssued") && observed.getBoolean("inputEos") && observed.getBoolean("outputEos") && observed.getBoolean("cleanupConfirmed") && observed.isNull("failure"))
+                val closure = observed.getJSONObject("encoderClosure"); check(closure.getBoolean("stopReturned") && closure.getBoolean("releaseReturned"))
+                val q = source.getJSONObject("queued")
+                check(q.getLong("preparation") == observed.getLong("successfulPreambleFrames") && q.getLong("programmeRaw") == observed.getLong("generatedProgrammeRawFrames") && q.getLong("programmeIntentionalZero") == observed.getLong("intentionalProgrammeZeroFrames"))
+                check(q.getLong("blockPadding") == observed.getLong("successfulBlockPaddingFrames") && q.getLong("codecDrain") == observed.getLong("successfulCodecDrainFrames"))
+                val original = read(sourceDir, "buffers.bin", 4 * 1024 * 1024); val packets = source.getJSONArray("packets"); check(packets.length() in 1..128)
+                for (pi in 0 until packets.length()) {
+                    val p = packets.getJSONObject(pi); val at = p.getInt("offset"); val size = p.getInt("size")
+                    check(at >= 0 && size in 1..65536 && at.toLong() + size <= original.size && sha(original.copyOfRange(at, at + size)) == p.getString("sha256"))
+                    check(p.getLong("codedPts") == p.getLong("codedDts") && p.getInt("codedDuration") == 1024 && p.getInt("codedTimescale") == 48000)
+                    check(p.getLong("codedDts") == Math.addExact(source.getLong("codedOrigin"), Math.multiplyExact(pi.toLong(), 1024L)))
+                    Math.multiplyExact(p.getLong("codedPts"), 1_000_000L) // Refuse unrepresentable conversion before decoder creation.
+                    check(p.getInt("flags") and (MediaCodec.BUFFER_FLAG_CODEC_CONFIG or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME) == 0)
+                }
+                val reference = source.getJSONObject("readerFile"); check(reference.getLong("sourceGeneration") == (i + 1).toLong())
+                val refusals = JSONArray(); row.put("preDecoderRefusals", refusals)
+                val request = checkedReader(sourceDir, source, reference, refusals)
+                check(cleanupKnown)
+                val directory = File(root, name); check(directory.mkdir())
+                // Existing immutable private file, no header/packet/clock rewrite.
+                val copied = File(directory, "healthy.mp4"); check(copied.createNewFile())
+                val stream = acquire("reader.copy.open") { FileOutputStream(copied) }; retained.add(stream)
+                try { stream.write(read(sourceDir, "healthy.mp4", 4 * 1024 * 1024)); stream.fd.sync() }
+                finally { if (close("reader.copy.close") { stream.close() }) retained.remove(stream) }
+                check(cleanupKnown && sha(read(directory, "healthy.mp4", 4 * 1024 * 1024)) == reference.getString("fileSHA256"))
+                if (!baselineDone) {
+                    baselineDone = true
+                    row.put("unconfiguredControl", decode(directory, "healthy", signedPresentation = true, outputName = "unconfigured-control", expectedDecoderName = request.decoderName))
+                    check(cleanupKnown) { "Baseline decoder cleanup unknown" }
+                }
+                row.put("explicitReader", decode(directory, "healthy", signedPresentation = true, outputName = "explicit-reader", reader = request, expectedDecoderName = request.decoderName))
+                check(cleanupKnown) { "Explicit reader cleanup unknown" }
+                check(sha(read(directory, "healthy.mp4", 4 * 1024 * 1024)) == reference.getString("fileSHA256"))
+                row.put("classification", "EXPLICIT_READER_OBSERVATION_NOT_GENERIC_FILE_OR_PRESENTATION_ADMISSION")
+                writeJson(File(directory, "receipt.json"), row); check(cleanupKnown)
+            }
+        } catch (error: Exception) { failure = error.javaClass.simpleName + ": " + error.message?.take(512) }
+        return JSONObject().put("schema", "generated-native-aac-explicit-reader-v1").put("generatedOnly", true).put("emulatorOnly", true)
+            .put("hardware", Build.HARDWARE).put("sdk", Build.VERSION.SDK_INT).put("fingerprint", Build.FINGERPRINT)
+            .put("inputManifestSHA256", manifestSha256).put("sourceProofs", manifest.getJSONObject("sourceProofs")).put("cases", results)
+            .put("operations", journal).put("encoderCreated", false).put("sdkMuxerCreated", false).put("newSdkFileCreated", false)
+            .put("programmeModeExecutedOnDevice", false).put("currentRustWindowExercised", false).put("sdkCheckpointDecodeCallsReturned", readerCheckpointDecodes)
+            .put("baselineControlVisited", baselineDone).put("allCasesVisited", results.length() == 4)
+            .put("decoderCreateAttempts", readerDecoderCreates).put("plannedDecoderObservations", 4).put("cleanupConfirmed", cleanupKnown && retained.isEmpty())
+            .put("failure", failure ?: JSONObject.NULL).put("cancelled", cancelled.get()).put("nativeWindowQualified", false)
+            .put("presentationEquivalent", false).put("appAdmission", false).put("stockFileInteropRestored", false)
+            .put("pairedNativePresentation", "UNSUPPORTED_W3_NATIVE_TRIM_AND_CLOCK")
+    }
+
+    private fun decode(directory: File, kind: String, signedPresentation: Boolean = false, omitInputEos: Boolean = false, outputName: String = kind,
+        reader: ReaderRequest? = null, expectedDecoderName: String? = null): JSONObject {
         val result = JSONObject().put("inputEos", false).put("outputEos", false).put("cleanupConfirmed", false)
         val formats = JSONArray(); result.put("formats", formats)
         val rows = JSONArray(); result.put("buffers", rows)
@@ -545,6 +687,10 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
         var inputEosSuppressed = false; var suppressedInputIndex: Int? = null
         var suppressedObservationDeadline = Long.MAX_VALUE; var suppressedObservationExpired = false
         var outputDequeuesAfterSuppression = 0
+        var lastQueuedPts = 0L; var exactQueueMapping = true
+        result.put("readerPolicy", if (reader == null) "UNCHANGED_EXTRACTOR_FORMAT_AND_PTS" else "EXPLICIT_SDK_GEOMETRY_NATIVE_TRIM_AND_MOVIE_MAPPING")
+        if (reader != null) result.put("configuredReaderHead", reader.head).put("configuredReaderTail", reader.tail)
+            .put("absoluteEditMediaTime", reader.mediaTime).put("queueTimeMapping", "FLOOR((ORIGINAL_CODED_PTS_MINUS_ABSOLUTE_EDIT)*1000000/48000); REMAINDER_RECORDED")
         try {
             cleanupKnown = false
             val source = call("extractor.create:$kind") { MediaExtractor() }; extractor = source; retained.add(source); cleanupKnown = true
@@ -552,13 +698,20 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             check(source.trackCount == 1); val extracted = source.getTrackFormat(0)
             check(extracted.getString(MediaFormat.KEY_MIME) == MediaFormat.MIMETYPE_AUDIO_AAC)
             formats.put(format("extractor-original", extracted)); source.selectTrack(0)
-            // Only request PCM16. No delay/padding/PTS edits are injected.
+            // Original modes request PCM16 only. Explicit reader overrides are
+            // declared application policy, never reported native encoder truth.
             extracted.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+            if (reader != null) {
+                extracted.setInteger("encoder-delay", reader.head)
+                extracted.setInteger("encoder-padding", reader.tail)
+            }
             formats.put(format("decoder-requested", extracted))
             cleanupKnown = false
+            if (mode == Mode.EXPLICIT_READER) readerDecoderCreates++
             val codec = call("decoder.create:$kind") { MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC) }
             native = codec; retained.add(codec); cleanupKnown = true
             result.put("decoderName", codec.name)
+            if (expectedDecoderName != null) check(codec.name == expectedDecoderName) { "Selected native decoder component changed" }
             call("decoder.configure:$kind") { codec.configure(extracted, null, null, 0) }
             formats.put(format("decoder-accepted", codec.inputFormat))
             startAttempted = true; call("decoder.start:$kind") { codec.start() }; started = true
@@ -593,10 +746,30 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
                         if (!inputEosSuppressed) {
                         check(eos || inputPackets < 128)
                         val payload = if (eos) ByteArray(0) else ByteArray(size).also { buffer.duplicate().apply { position(0); limit(size) }.get(it) }
-                        call("decoder.queueInput:$kind") { codec.queueInputBuffer(index, 0, if (eos) 0 else size, pts, if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0) }
-                        rows.put(JSONObject().put("type", "INPUT").put("index", index).put("size", if (eos) 0 else size)
-                            .put("nativePtsUs", pts).put("sampleTrackIndex", sampleTrack).put("sampleSize", sampleSize).put("extractorFlags", sampleFlags).put("queuedCodecFlags", if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0)
-                            .put("sha256", sha(payload)).put("eos", eos).put("queueReturned", true))
+                        var queuedPts = if (eos && reader != null) lastQueuedPts else pts
+                        val inputRow = JSONObject().put("type", "INPUT").put("index", index).put("size", if (eos) 0 else size)
+                            .put("extractorPtsUs", pts).put("sampleTrackIndex", sampleTrack).put("sampleSize", sampleSize).put("extractorFlags", sampleFlags)
+                            .put("queuedCodecFlags", if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0).put("sha256", sha(payload)).put("eos", eos)
+                        if (reader != null) {
+                            if (eos) check(inputPackets == reader.packets.length()) { "Selected native packet set incomplete" }
+                            else {
+                                check(inputPackets < reader.packets.length())
+                                val original = reader.packets.getJSONObject(inputPackets)
+                                check(size == original.getInt("size") && sha(payload) == original.getString("sha256")) { "Actual file payload/index differs from checked original" }
+                                val ticks = Math.subtractExact(original.getLong("codedPts"), reader.mediaTime)
+                                val numerator = Math.multiplyExact(ticks, 1_000_000L)
+                                queuedPts = Math.floorDiv(numerator, 48_000L)
+                                val remainder = Math.floorMod(numerator, 48_000L); exactQueueMapping = exactQueueMapping && remainder == 0L
+                                inputRow.put("originalCodedPts", original.getLong("codedPts")).put("originalCodedDts", original.getLong("codedDts"))
+                                    .put("originalCodedTimescale", 48000).put("originalCodedDuration", original.getInt("codedDuration"))
+                                    .put("originalPacketSequence", original.getInt("originalSequence")).put("originalEncoderOutputFlags", original.getInt("flags"))
+                                    .put("moviePresentationTicks", ticks).put("microsecondNumerator", numerator).put("microsecondDenominator", 48000)
+                                    .put("microsecondFloorRemainder", remainder).put("queueMappingExactlyRepresentable", remainder == 0L)
+                            }
+                        }
+                        call("decoder.queueInput:$kind") { codec.queueInputBuffer(index, 0, if (eos) 0 else size, queuedPts, if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0) }
+                        lastQueuedPts = queuedPts
+                        rows.put(inputRow.put("nativePtsUs", queuedPts).put("queueReturned", true))
                         if (eos) inputEos = true else { inputPackets++; source.advance() }
                         }
                     }
@@ -657,6 +830,7 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             .put("suppressedObservationBoundNs", if (omitInputEos) 200_000_000L else JSONObject.NULL)
             .put("suppressedObservationDeadlineExpired", suppressedObservationExpired).put("actualOutputDequeuesAfterSuppression", outputDequeuesAfterSuppression)
             .put("signedPresentationAllowed", signedPresentation).put("deliberateMissingInputEos", omitInputEos).put("pcmFile", "$outputName.s16le")
+            .put("allMediaQueueMappingsExactlyRepresentable", if (reader != null) exactQueueMapping else JSONObject.NULL)
             .put("inputEos", inputEos).put("outputEos", outputEos).put("frames", frames).put("inputPackets", inputPackets)
             .put("releaseAttempts", releaseAttempts).put("releaseReturned", releaseReturned).put("stopReturned", stopReturned)
             .put("stopSkippedNotStarted", !started && !startAttempted).put("decoderReleased", decoderReleased).put("extractorReleased", extractorReleased).put("streamClosed", streamClosed)
