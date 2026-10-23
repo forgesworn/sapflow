@@ -557,6 +557,150 @@ two-second source-presentation loss and new presentation equivalence remain
 open. No phone access, signing, installation, push or publication is part of
 this packet.
 
+## Android checked checkpoint storage
+
+The four-path storage source is locally committed as `d2483b2`:
+`RecordingCatalogue.kt`, `RecordingCheckpointStorage.kt`,
+`AndroidRecordingStorageIO.kt` and `RecordingCheckpointStorageTest.kt`. The
+optional storage factory is a cold child of the exact existing catalogue
+`Writer`; no current recorder calls it. `PrivateRecordingSink`, `RecordingFile`,
+`QueueDrainer`, `CaptureController`, native codecs/F0 observation, Rust/SDK
+bindings and packages, and product defaults are unchanged.
+
+The child retains the same writer lease and single worker. Existing finalised
+or `ownersClosed` calls cannot release an active compound child. Cancellation
+fences new mutation without waiting for file IO. Metadata, media and root owners
+attempt checked close once; an uncertain close retains the actual resources and
+catalogue reservation without retrying a possibly recycled descriptor. A checked
+incomplete close releases the lease only after actual resource closure. Neither
+that close nor the optional fixed-length header rewrite grants finalised app
+admission.
+
+Original fragment byte arrays are written and hashed directly, without another
+encoded-payload clone, staging queue, encoder or per-unit validation. Container
+header/checkpoint metadata is bounded and may be copied. Two alternating slots
+and one fixed checkpoint temporary name retain exact owned-file/readback checks.
+The storage bounds are 65,536 header bytes, 16 MiB per fragment, 545 to 66,080
+checkpoint bytes, 1,024 entries and 256 segments, with a strict free-space floor
+above 200 MiB plus 256 KiB. Missing names remain reserved within the existing
+six-name allowance. These limits do not establish the aggregate loss bound.
+
+Checkpoint installation requires a cold validator before mutation and after
+readback. Its expected sequence, committed offset, initial-header length/hash,
+fragment-region length/hash and recording/source-file bindings come from the
+actual storage frontier. The current source does not supply an SDK token owner:
+a later adapter must compare the real encoded/decoded checkpoint and successor
+against every expected field. A sidecar, storage byte count or checked header
+alone is not an AAC receipt, producer EOF, finalised app admission or recovery
+certificate. A failed partial append may leave uncommitted file bytes; reported
+closure bytes cover accepted whole chunks only.
+
+The optional production backend uses Android public `Os` positional IO,
+no-follow/close-on-exec flags, retained descriptor identity and bounded names
+under a verified `/proc/self/fd` anchor. Root provisioning requests mode 0700 on
+the retained directory descriptor under the existing writer lease; media and
+metadata creation request 0600. The ParcelFileDescriptor bridge keeps ownership
+reachable through duplication/alias/detach checks and uses checked raw close;
+quiet wrapper close is not a cleanup receipt. Bounded directory enumeration
+uses the verified descriptor anchor. There is no original-path or NIO media-IO
+fallback. API 30+ flag inspection is a runtime prerequisite; the optional backend
+refuses API 29 before opening, while the existing app minimum and recorder path
+are unchanged. Actual bridge, proc, fdsan/SELinux, filesystem and provider
+semantics, including digest-copy support, are not established by host tests or
+source review.
+
+The existing catalogue now requests owner-read/owner-write permissions atomically
+when creating its receipt temporary file. This removes reliance on a process
+umask for that request. Unsupported POSIX attributes fail closed; there is no
+post-creation privacy window or permissive retry. The source change does not
+claim an observed Android umask or provider result. Existing receipt scan/read
+behaviour remains separate from the optional strict storage backend.
+
+The first actual V3 app attempt executed 635 Debug tests across 70 suites with
+27 failures, zero errors and zero skips; Qualification did not execute. Sixteen
+new filesystem tests failed root-identity verification. The retained host
+observation shows stable device/inode while adding an entry changed directory
+link count from two to three. Eleven later capacity failures, three new and
+eight existing library cases, followed retained owners filling the unchanged
+16-owner registry. The failure, XML and observation remain retained.
+
+Reviewed V4 removes only directory link count from directory identity;
+device/inode/type checks and all regular-file one-link safeguards remain.
+Its added real-filesystem regression creates a root entry, checks capacity and
+append, then creates a media hardlink and requires the next append to fail
+without changing earlier bytes. It does not reset the registry, weaken capacity
+or treat successful cleanup as permission to adopt that unsafe file. The other
+nineteen test bodies and assertions remain. All twenty storage tests now pass in
+both genuinely executed host variants.
+
+The corrected V4 gate genuinely executes both Debug and Qualification unit-test
+tasks: each runs 636 tests in 70 suites, including all twenty
+`RecordingCheckpointStorageTest` cases, with zero failures, errors or skips.
+The three APK assemblies, lint and qualification isolation pass with all 337
+recorded inputs unchanged. Lint reports zero errors and 11/16/15 warnings for
+Debug, Qualification and Release respectively; no issue is located on the four
+changed paths. The Gradle parent is terminal. This evidence does not claim
+independent descendant process-group cleanup.
+
+Actual artefact checks pass byte identity with the unchanged SDK AAR, all four
+AAR native ABI ELF alignments, and ARM64 native ELF/ZIP 16 KiB alignment in each
+of the three actual APKs. Source notices, QR decoder DEX, manual-link scheme and
+singleTask manifest entries pass. Qualification/release DEX and manifest
+isolation are independently read back; installed routing is not exercised.
+These ARM64 APK results do not qualify a four-ABI application release.
+
+Separate actual ZIP/EOCD/central-directory readback finds neither V1 signature
+entries nor an APK signing-block footer in the Release APK. Its SHA-256 is
+`5d98459866ac22886ebfd6517d88a641a20543b0e81ba81d1fe56bd68a4dbd6b`.
+This establishes the retained Release artefact's unsigned structure only;
+Debug and Qualification keep the standard debug signing configuration. There
+is no Release signing, installation or distribution in this packet. Independent
+build and artefact outcome reviews are clear. The host filesystem model remains
+a test backend only and never a production fallback.
+
+The recording and source-file bindings currently include a private run UUID
+which the existing writer receipt does not persist. After cold restart these
+bindings cannot be reconstructed from show/segment and device/inode alone.
+Future recovery requires sufficient checked, versioned persisted context or a
+reconstructible versioned binding scheme. This source packet does not implement
+that prerequisite, migrate existing recordings or adopt orphan sidecars.
+
+Exact retained source, failure and completed gate evidence is:
+
+- Four-path source freeze and independent source review:
+  `target/privacy-standby/android-native-recorder-adoption-v1/root-v4/manifest.local.json`
+  and
+  `target/privacy-standby/android-native-recorder-adoption-v1/independent-review-v4/receipt.local.json`.
+- Exact local source commit:
+  `target/privacy-standby/android-native-recorder-adoption-v1/root-v4/source-commit.local.json`.
+- First failed actual run:
+  `target/privacy-standby/android-checkpoint-storage-app-gates-v1/run-20261023T102302Z-305408b3/receipt.local.json`,
+  with retained failure details, XML, `root-link-observation.local.json` and
+  `independent-failure-review.local.json` in the same directory.
+- Completed V4 build and tests:
+  `target/privacy-standby/android-checkpoint-storage-app-gates-v2/run-20261023T103516Z-5327ef24/receipt.local.json`
+  and its sibling `independent-build-outcome-review.local.json`.
+- Actual artefact, isolation and Release signature readbacks:
+  `target/privacy-standby/android-checkpoint-storage-app-gates-v2/run-20261023T103516Z-5327ef24/artifact-verification.local.json`,
+  with `independent-isolation-readback.local.json`,
+  `release-signature-readback.local.json` and
+  `independent-artifact-outcome-review.local.json` in the same directory.
+- Final combined outcome and source-commit lineage review:
+  `target/privacy-standby/android-checkpoint-storage-app-gates-v2/run-20261023T103516Z-5327ef24/independent-final-outcome-review.local.json`.
+
+The completed gates keep their original `0dd4384` HEAD and exact four-path dirty
+source binding. The clean local `d2483b2` commit contains the same reviewed and
+tested bytes; historical receipts are not relabelled. The first V3 failure and
+all earlier iOS/Android evidence remain retained. The 2,875-byte numerical
+presentation contract and its thresholds are unchanged.
+
+Independent source, build and artefact reviews are clear. Actual Android
+descriptor/API-provider and physical storage qualification, native AAC/SDK
+adapter composition, producer closure, default adoption, decoder/presentation
+acceptance, recovery and the aggregate two-second loss bound remain open.
+No phone/device/camera/microphone access, installation, Release signing, push or
+publication is part of this storage packet.
+
 ## Android AAC observation packet
 
 The locally committed Android F0 packet (`64e9521`) adds scalar diagnostics only.

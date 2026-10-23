@@ -94,6 +94,26 @@ callbacks remain the default. Both original generated audio-only and standby
 recording/decoder gates also pass unchanged. These checks introduce no second
 encoder, payload copy, per-unit validation or media queue.
 
+Android [checked checkpoint storage](recording-recovery.md#android-checked-checkpoint-storage)
+is locally committed as `d2483b2`. It adds an optional, currently unused child of
+the existing catalogue Writer lease, bounded append/two-slot storage and an
+API 30+ public `Os` descriptor backend. It does not wire the current recorder,
+AAC path or SDK adapter, switch defaults, finalise app admission or establish
+recovery. Actual Android descriptor/proc, SELinux and provider semantics remain
+unqualified.
+
+Debug and Qualification each genuinely execute 636 JVM tests across 70 suites,
+including all twenty new host-filesystem storage tests, with zero failures,
+errors or skips. All three APK assemblies, lint and qualification isolation pass;
+lint retains zero errors and 11/16/15 warnings, with none on the four changed
+paths. Actual SDK bytes, four-ABI AAR and APK ARM64 ELF/ZIP 16 KiB alignment,
+notices, QR decoder DEX and manual-link manifest checks pass. Independent source,
+build and artefact reviews are clear. The actual Release APK is unsigned;
+Debug and Qualification retain the standard debug signing configuration.
+The first 635-test failed run remains retained, and the narrow directory-link
+identity correction now passes its host regression. No device, installation,
+release signing, default adoption, publication or recovery claim follows.
+
 Android V4V End now requires an explicit confirmation bound to the exact saved
 session or pending Prepare and the Activity's local capture owner. Cancellation
 and stale actions cannot stop a successor, save terminal intent or send End for
@@ -111,8 +131,8 @@ units, recorder admission or EOF. There is no hot admission ledger, timing or
 priming-policy change, extra encoder, encoded payload copy or per-unit
 validation. Native codec facts and physical capture remain unqualified.
 
-The current Android app gate uses the unchanged extent-query SDK AAR. Debug and
-Qualification each genuinely execute all 616 JVM tests in 69 suites, including
+The earlier AAC observation app gate uses the unchanged extent-query SDK AAR.
+Debug and Qualification each genuinely execute all 616 JVM tests in 69 suites, including
 19 observation, 22 confirmation/shutdown and 15 session tests, with no failures,
 errors or skips. All three APK assemblies, lint and qualification isolation
 pass. Lint reports zero errors and 11/18/17 warnings for Debug, Qualification
