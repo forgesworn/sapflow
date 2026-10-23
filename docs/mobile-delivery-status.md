@@ -5,6 +5,12 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The next delivery step is Android native AAC qualification and SDK recorder
+integration. Then qualify checked crash recovery and the aggregate two-second
+source-presentation loss bound, run a complete-show physical pilot on both
+phones, and perform matched competitor performance qualification. The existing
+origin-first, free-V4V scope remains unchanged.
+
 The fresh generated [recording presentation matrix](recording-recovery.md#fresh-registered-matrix-result)
 passes its separately registered numerical contract across five A/V and ten
 audio-only/short-prefix cases. Nine complete comparisons satisfy every exact
@@ -14,14 +20,16 @@ aggregates remain failed and retained. Independent review verifies current
 source/package bindings and 352 command logs. Production recorder migration,
 durable recovery, aggregate two-second loss and physical acceptance remain open.
 
-The shared [portable checkpoint SDK](recording-recovery.md#portable-checkpoint-sdk)
-now includes an immutable cold presentation query using the exact Rust header
-timing calculation. Current source passes 708 workspace tests, strict Clippy,
-formatting, generated-stream smoke and actual Swift/Kotlin consumers. Four tests
-remain ignored by the default workspace command. The unchanged parser's earlier
-522,636 sanitised fuzz executions remain separate evidence. Refreshed three-slice
-Apple and four-ABI Android SDK packages pass their installed host consumers;
-Android native libraries also pass actual 16 KiB alignment checks.
+The earlier [portable checkpoint SDK](recording-recovery.md#portable-checkpoint-sdk)
+milestone added an immutable cold presentation query using the exact Rust header
+timing calculation. That checkpoint/extent source passed 708 workspace tests,
+strict Clippy, formatting, generated-stream smoke and actual Swift/Kotlin
+consumers. Four tests remained ignored by the default workspace command. The
+unchanged parser's earlier 522,636 sanitised fuzz executions remain separate
+evidence. Those three-slice Apple and four-ABI Android SDK packages passed
+their installed host consumers; Android native libraries also passed actual
+16 KiB alignment checks. The later timing-view source and packages are recorded
+below.
 
 The iOS [producer and ingress finalisation](recording-recovery.md#ios-producer-and-ingress-finalisation)
 source is locally committed as `135b3cb`. A concrete native Stop path detaches
@@ -93,6 +101,67 @@ including mixed silence/raw input in one encoder generation. Existing legacy
 callbacks remain the default. Both original generated audio-only and standby
 recording/decoder gates also pass unchanged. These checks introduce no second
 encoder, payload copy, per-unit validation or media queue.
+
+The shared [AAC timing-view API](recording-recovery.md#shared-aac-timing-views)
+is locally committed as `c886419`. It derives explicit recording and optional
+publishing timing views from one existing validated AAC-LC 48 kHz mono sample.
+The recording view retains the supplied original coded PTS/DTS and 1,024-frame
+duration; the publishing view uses the supplied normalised clock. `None`
+deliberately withholds publishing for that input without inventing a drop or
+closing its branch. Both views share the original payload and codec Arcs. The
+reported producer generation and signed native PTS are caller observations,
+not native AU, trim or EOF attestations. Neither app uses this optional API yet.
+The two existing media queues, encoders and product defaults are unchanged.
+
+Current source passes all five serial SDK gates: 720 workspace tests, with four
+ignored by that command, strict Clippy, formatting, unchanged default-HTTP
+synthetic smoke and regenerated Swift/Kotlin consumers. All twelve new Rust
+tests and both new consumer helpers pass individually; the eight existing Kotlin
+status controls also pass. Current three-slice Apple and four-ABI Android
+packages pass their installed generated consumers, exact source/output checks
+and independent outcome reviews. Android's actual AAR libraries retain 16 KiB
+ELF alignment. Previous same-version packages and host runtime remain preserved.
+
+Against those current witnesses, the generated iOS native gate again passes its
+five original incomplete controls and ten producer controls through thirteen
+commands. Three finalised files independently decode, all ten submitted A/V
+video frames are read, four probes retain exact original AAC packets and seven
+negative producer controls remain incomplete. This is compatibility evidence
+for the existing adapter; it does not integrate or natively qualify timing views.
+Against these packages, all seven iOS platform commands pass: 261 budget tests,
+89 filesystem tests, 38 library tests, 16 actual SDK checkpoint tests, both
+generated modules and strict iOS16 API checking across all 70 production sources.
+All 309 inputs remain unchanged. Both legacy commands also pass: 86 publisher
+tests, seven original native ownership controls and both expected historical
+failures, with 318 unchanged inputs. Independent reviews of both outcomes are
+clear. All eleven Debug, Qualification and Release app commands pass with 327
+inputs unchanged, including built privacy/configuration/manual-link checks and
+the Debug test bundle compiled rather than executed. Separate actual readback
+verifies all three app code objects are unsigned and binds the Debug loader and
+implementation dylib individually. The full-app independent review is clear.
+
+Android Debug and Qualification each genuinely execute 636 JVM tests across
+70 suites, including all twenty storage controls, with zero failures, errors or
+skips. All 345 inputs and 140 XML reports are independently hash-verified. All
+three APK assemblies, lint, qualification isolation and actual artefact checks
+pass against the current AAR/native SDK bytes. Lint retains zero errors and
+11/16/15 warnings. Actual four-ABI AAR and APK ARM64 ELF/ZIP 16 KiB alignment,
+notices, QR DEX and manual routing pass. Independent outcome review is clear.
+Direct Release ZIP/signing-block readback establishes an unsigned APK; the
+inherited artefact verifier alone does not. Debug and Qualification retain the
+standard debug signing configuration. No installation or phone acceptance is
+claimed.
+
+The views introduce sample metadata Arcs, an FFI paired-object allocation and
+additional Arc references. The optional provenance field is also present in ordinary
+legacy sample metadata; exact target layout and cost remain unmeasured. Payload sharing proves no additional payload-byte copy
+from the validated handle; whole encoder-to-binding ingress copy costs,
+metadata/handle overhead, phone cost and performance acceptance remain
+unqualified. Android still needs actual full generation/head/tail and AU facts,
+original AAC routing before publishing normalisation and priming filters, and
+the SDK/file adapter with checked admission and producer closure. Missing native
+facts remain unknown; F0 diagnostic counters cannot grant them. Physical
+capture, default adoption, recovery and aggregate two-second loss remain open.
 
 Android [checked checkpoint storage](recording-recovery.md#android-checked-checkpoint-storage)
 is locally committed as `d2483b2`. It adds an optional, currently unused child of

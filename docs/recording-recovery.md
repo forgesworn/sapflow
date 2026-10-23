@@ -175,27 +175,27 @@ its file identity, hash the actual fragment region and complete its own storage
 operations. No additional encoder, media queue or per-unit sample validation is
 introduced by this SDK change.
 
-The current source passes 708 workspace tests, strict Clippy and formatting,
-generated-stream smoke checks and actual generated Swift/Kotlin consumers. Four
-workspace tests remain ignored by that default command. The unchanged bounded
-checkpoint parser previously passed four scalar seed replays and 522,636
-ASan/overflow fuzz executions. Host consumers cover frontier, hash, successor,
-foreign-owner, retained-token and exact presentation-query checks. These results qualify
-the SDK API and bounded parser; they do not establish installed recovery or the
-two-second loss bound. Evidence is retained under
+That earlier checkpoint/extent source passed 708 workspace tests, strict Clippy
+and formatting, generated-stream smoke checks and actual generated Swift/Kotlin
+consumers. Four workspace tests remained ignored by that default command. The
+unchanged bounded checkpoint parser previously passed four scalar seed replays
+and 522,636 ASan/overflow fuzz executions. Host consumers covered frontier, hash,
+successor, foreign-owner, retained-token and exact presentation-query checks.
+Those results qualified the SDK API and bounded parser; they did not establish
+installed recovery or the two-second loss bound. Evidence is retained under
 `target/recording-checkpoint-gates-v1/`,
 `target/privacy-standby/recording-checkpoint-fuzz-v1/` and
-`target/privacy-standby/recording-checkpoint-native-check/`. The current extent
-API and refreshed packages are recorded under
+`target/privacy-standby/recording-checkpoint-native-check/`. The then-current
+extent API and packages are recorded under
 `target/privacy-standby/recording-native-extent-gates-v2/` and
 `recording-native-extent-packages-v1/`.
 
-The refreshed Apple SDK package passes all three release slices and its
-installed Swift host consumer. The Android SDK package passes all four ABIs,
-actual 16 KiB ELF load alignment and its extracted-AAR Kotlin host consumer.
-Both retain unchanged source bindings and verified package contents. Package
-and host checks do not establish a rebuilt app, phone installation or physical
-recording acceptance.
+The Apple SDK package at that milestone passed all three release slices and its
+installed Swift host consumer. Its Android package passed all four ABIs, actual
+16 KiB ELF load alignment and its extracted-AAR Kotlin host consumer. Both
+retained unchanged source bindings and verified package contents. Those package
+and host checks did not establish a rebuilt app, phone installation or physical
+recording acceptance. The later timing-view package refresh is recorded below.
 
 The immutable issued checkpoint also exposes a cold `presentationExtent()` query
 in Swift and Kotlin. It uses the same shared Rust construction and movie-duration
@@ -556,6 +556,132 @@ validation is introduced. Product/default adoption, orphan recovery, aggregate
 two-second source-presentation loss and new presentation equivalence remain
 open. No phone access, signing, installation, push or publication is part of
 this packet.
+
+## Shared AAC timing views
+
+The shared routing seam is now locally committed as `c886419`. An explicit
+opt-in API derives two immutable timing choices from one existing validated
+AAC-LC 48 kHz mono sample, with the exact `[0x11, 0x88]` configuration and
+1,024-frame duration. Recording retains that supplied original coded PTS/DTS;
+publishing optionally receives a supplied normalised PTS/DTS. Integer bounds,
+profile and branch continuity are checked before either queue changes. The SDK
+does not infer a coded clock from the signed native PTS observation.
+
+A missing publishing view deliberately withholds that input. It does not close
+the branch or count a fabricated rejected input; existing accepted publishing
+backlog still ages under its unchanged queue policy. Both views retain the same
+original payload and codec Arcs. Provenance has constant depth one and cannot
+be built from another view. The producer generation and native PTS are explicit
+caller-reported, unattested context, not proof of one AU per callback, leading
+trim, generation completeness, admission or EOF. Cold provenance remains
+available after queue pop without requiring a new FFI query per input.
+
+There is no additional encoder, media queue, payload-byte copy from that
+validated sample or compressed-payload validation in view construction/fanout.
+There are new metadata allocations: one recording sample Arc, an optional
+publishing sample Arc and the FFI paired-object Arc, plus payload/config/original
+Arc references. The optional provenance field is also present in ordinary legacy sample
+metadata; exact target layout and cost remain unmeasured. Cold inspection can allocate handle wrappers, and
+transactional continuity previews clone bounded metadata references. Safe
+pointer-identity controls qualify sharing from the validated handle only.
+Complete encoder-to-UniFFI ingress copy cost, binding/SDK allocation and handle
+cost, sustained memory/CPU and phone power remain separate benchmark gates.
+
+All five actual serial SDK gates pass: formatting, 720 workspace tests with four
+ignored, strict workspace/all-target Clippy, unchanged default-HTTP generated
+smoke and freshly generated Swift/Kotlin consumers. All twelve added Rust tests
+are individually present as passed in the actual log. Both consumer helpers and
+all eight existing Kotlin status controls pass. The current host witness binds
+the completed build, its current exact 118-source input set and actual host
+library without another build. The new Apple package passes all three release
+slices and its installed Swift consumer; Android passes all four ABIs, actual
+16 KiB ELF load alignment and its extracted-AAR Kotlin consumer. Exact package,
+archive, source and installed-marker readback and independent reviews are clear.
+Previous same-version archives and host runtime remain retained separately.
+
+The unchanged generated iOS adapter/native gate passes again against these new
+witnesses: five original stored-input controls remain incomplete and all ten
+producer controls pass through thirteen commands. Four original AAC packet
+probes remain exact. Three generated finalised files independently decode,
+including all ten submitted A/V video frames; seven negative producer controls
+remain incomplete. These are compatibility controls for the existing adapter.
+Neither app adopts the new timing-view API, and this run establishes no new
+presentation-equivalence, camera/microphone or physical capture acceptance.
+The seven iOS platform commands pass against these new witnesses: 261 budget
+controls, 89 filesystem tests, 38 library tests, 16 real-SDK checkpoint tests,
+both generated modules and strict iOS16 API checking across all 70 production
+Swift sources. All 309 inputs remain unchanged. Both legacy commands pass 86
+publisher tests and seven original native ownership controls, retaining both
+expected historical failures and all 318 input hashes. Independent completed
+outcome reviews are clear for both scopes; owned groups stop, new scratch is
+removed and pre-existing scratch is preserved.
+
+All eleven full Debug, Qualification and Release app commands pass with all
+327 inputs unchanged. Built privacy resources, creator configuration modes and
+manual-link schemes pass, and the compiled Debug test bundle retains both exact
+profile corpora. That test bundle is not executed by the app gate. Separate
+actual code-object readback verifies all three apps are unsigned, with no
+`_CodeSignature` directory, and binds both the Debug loader and implementation
+dylib. The implementation dylib is SHA-256
+`5c2d9ea46ca99925526a899701fb2fb78444ef24531bdbf9cabac8f772e959ba`.
+Root-owned groups stop and working scratch is removed; shared DerivedData and
+caches remain. The full-app independent audit is clear, including absence of Mach-O signature
+load commands in all four actual code objects. Earlier completed app results
+above remain bound to their historical witnesses.
+
+Android Debug and Qualification each genuinely execute all 636 JVM tests in
+70 suites, including twenty storage and nineteen AAC observation controls, with
+zero failures, errors or skips. Both actual Gradle task states are executed in
+this run; no cached XML is presented as fresh execution. Independent readback
+verifies all 345 current inputs and 140 XML reports. All three APK assemblies,
+lint and qualification isolation pass. Lint retains zero errors/fatal findings
+and 11/16/15 warnings for Debug, Qualification and Release respectively.
+
+All APKs contain the exact current AAR ARM64 SDK bytes. Four-ABI AAR ELF and all
+APK native ELF/ZIP 16 KiB alignment, source notices, QR decoder DEX, manual-link
+scheme/singleTask and qualification/release isolation checks pass. Independent
+build and artefact review is clear. Separate direct Release readback checks the
+actual complete single-disk ZIP directory and its 150 entries, with no V1
+signature entries or APK signing-block footer before the central directory.
+It establishes an unsigned Release APK; the inherited artefact verifier alone
+does not. Debug and Qualification retain the standard debug configuration;
+the independent review records actual signing-block footer presence without
+claiming cryptographic signer verification. No release signing, installation,
+phone, native descriptor/SELinux or recorder/default adoption is established.
+
+Retained current evidence is under
+`target/privacy-standby/shared-sample-timing-view-v1/`,
+`shared-sample-timing-view-gates-v1/run-20261023T111300Z-219a651e/`,
+`shared-sample-timing-view-packages-v1/` and
+`shared-sample-timing-view-native-v1/actual-v1/`. The current app refresh is
+separately scoped under `shared-sample-timing-view-app-gates-v1/`: current
+platform and legacy receipts are `ios-platform/receipt.local.json` and
+`ios-legacy/receipt.local.json`, each with its sibling
+`independent-outcome-review.local.json`. The full-app receipt and unsigned
+readback are in `ios-app/run-20261023T114707Z-276df5fa/` as
+`receipt.local.json`, `actual-product-signature-readback.local.json` and
+`independent-outcome-review.local.json`. The current Android evidence is in
+`android/run-20261023T115051Z-de1e7f46/` as `receipt.local.json`,
+`artifact-verification.local.json`, `release-signature-readback.local.json` and
+`independent-outcome-review.local.json`.
+The original numerical contract, every original strict failure and all previous
+source/package receipts retain their original classifications.
+
+Android's next boundary still requires an authoritative generation receipt from
+successful native input/output ownership, actual eligible original AAC-unit
+packing/order/count and measured first leading/final EOF-tail facts. Capture
+must retain original coded AAC before the current publishing clock/priming
+filters, select publishing timing separately and reuse these exact shared
+handles and two queues. Missing or unsupported trim, ambiguous output packing,
+codec/queue/release failure or unknown EOF cannot be replaced by a zero, inferred
+unit count or fabricated full receipt. F0 remains diagnostic. The optional
+checked storage below still needs a real SDK recorder adapter on the existing
+recording worker/lease, exact generation conservation and concrete producer,
+ingress and checked file closure before complete app admission. The private
+runtime file/run bindings also need a checked persisted or versioned
+reconstruction contract before cold recovery can use them. None of these native,
+app-adoption or recovery prerequisites is completed by timing views. Legacy
+remains the default; the aggregate two-second loss and physical gates stay open.
 
 ## Android checked checkpoint storage
 
