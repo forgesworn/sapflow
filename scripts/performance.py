@@ -30,7 +30,7 @@ def command(*args, cwd=ROOT):
 
 
 def trial_order(variants, round_number):
-    """Rotate three or more treatments; reverse each paired round."""
+    """Rotate treatments so a full cycle balances every order position."""
     start = round_number % len(variants)
     return variants[start:] + variants[:start]
 
@@ -40,16 +40,21 @@ def parse_report(output, expected_viewers):
     for block in output.split("--- ")[1:]:
         match = re.search(r"^(\w+), (\d+) viewers: server CPU ([\d.]+)%  peak RSS ([\d.]+) MB", block)
         counts = re.search(r"^requests (\d+)  errors (\d+)  received ([\d.]+) MB$", block, re.M)
+        collection = "collection completed requests wholly within the fixed post-ramp window" in block
+        excluded = re.search(r"^excluded requests (\d+)  errors (\d+)$", block, re.M)
+        sampling = re.search(r"^server sampling ([\d.]+) s target (\d+) s$", block, re.M)
         playlist = re.search(r"^playlist\s+n=(\d+)\s+p50 ([\d.]+) ms  p95 ([\d.]+) ms  p99 ([\d.]+) ms", block, re.M)
         segment = re.search(r"^segment\s+n=(\d+)\s+p50 ([\d.]+) ms  p95 ([\d.]+) ms  p99 ([\d.]+) ms", block, re.M)
         fanout = re.search(r"^part fan-out .*parts=(\d+) reach ([\d.]+)/\d+  p50 ([\d.]+) ms  p95 ([\d.]+) ms  max ([\d.]+) ms", block, re.M)
-        if not all((match, counts, playlist, segment, fanout)):
+        if not all((match, counts, playlist, segment, fanout, collection, excluded, sampling)):
             raise ValueError("incomplete benchmark output")
         if int(counts[1]) == 0 or any(int(m[1]) == 0 for m in (playlist, segment, fanout)):
             raise ValueError("no requests or media samples")
         rows.append(dict(
             viewers=int(match[2]), cpu_percent=float(match[3]), peak_rss_mb=float(match[4]),
             requests=int(counts[1]), errors=int(counts[2]), received_mb=float(counts[3]),
+            excluded_requests=int(excluded[1]), excluded_errors=int(excluded[2]),
+            server_sample_seconds=float(sampling[1]),
             playlist_p99_ms=float(playlist[4]), segment_p99_ms=float(segment[4]),
             part_reach=float(fanout[2]), part_p50_ms=float(fanout[3]),
             part_p95_ms=float(fanout[4]), part_max_ms=float(fanout[5]),
@@ -111,16 +116,18 @@ def run_trial(env, server, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="new ignored directory for scalar results")
-    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=["hyper", "own", "own-1", "mediamtx"])
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=["hyper", "own", "own-1", "own-4", "mediamtx"])
     parser.add_argument("--viewers", nargs="+", type=int, default=[250, 750])
     parser.add_argument("--seconds", type=int, default=60)
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--rounds", type=int, default=5, help="a multiple of the treatment count balances order positions")
     parser.add_argument("--mediamtx", type=Path)
     args = parser.parse_args()
     if args.rounds < 1 or args.seconds < 10 or any(n < 1 for n in args.viewers):
         parser.error("positive rounds/viewers and at least ten measured seconds are required")
     if len(set(args.variants)) != len(args.variants) or len(set(args.viewers)) != len(args.viewers):
         parser.error("duplicate variants or viewer counts")
+    if args.rounds % len(args.variants):
+        parser.error("rounds must be a multiple of the treatment count for balanced ordering")
     if "mediamtx" in args.variants and not args.mediamtx:
         parser.error("--mediamtx is required for the mediamtx treatment")
     if platform.system() != "Darwin" or platform.machine() != "arm64":
@@ -155,6 +162,7 @@ def main():
         ffmpeg=command("ffmpeg", "-version").splitlines()[0], file_descriptor_limit=wanted,
         load_before=os.getloadavg(), measured_seconds=args.seconds, ramp_seconds=10,
         viewers=args.viewers, variants=args.variants, rounds=args.rounds,
+        collection="requests started and completed wholly inside a fixed post-ramp interval; excluded failures retained",
         notes="Loopback HTTP/1.1; full media viewers; generated 720p30 H.264/AAC. Server and encoder/load generator share the host. RSS excludes kernel memory. Existing workloads remain running. Separate server and viewer builds avoid feature unification. No recording, TLS, WAN, phone, energy or thermal qualification.",
         runs=[],
     )
@@ -197,7 +205,7 @@ def main():
                 data["summary"] = summary(data["runs"])
                 data["status"] = "running"
                 save(output, data)
-                if any(row["errors"] for row in rows):
+                if any(row["errors"] or row["excluded_errors"] for row in rows):
                     raise RuntimeError(raw.name + ": viewer request failures")
                 print(json.dumps(rows), flush=True)
         data["status"] = "complete"
