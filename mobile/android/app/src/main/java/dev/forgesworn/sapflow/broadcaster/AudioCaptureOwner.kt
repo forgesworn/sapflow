@@ -69,10 +69,14 @@ internal class AudioCaptureOwner(
     val actualClosed get() = active?.let { lifecycle.actualClosed(it.ticket) } != false
     val currentGeneration get() = active?.ticket?.serial ?: 0L
     val outstanding get() = active?.encoded?.outstanding ?: 0
+    /** Last cold diagnostic snapshot only; never a native timing/EOF receipt. */
+    @Volatile var lastGenerationObservation: AudioGenerationObservation.Snapshot? = null
+        private set
 
     private inner class Generation(val ticket: AudioGenerationLifecycle.Generation, val clock: AudioGenerationClock.Generation, zero: Boolean) {
         @Volatile var mode = if (zero) Mode.ZERO else Mode.RAW
         val beganZero = zero
+        val observation = AudioGenerationObservation(ticket.serial)
         val everRaw = AtomicBoolean(false)
         val reading = AtomicBoolean(false)
         val pumping = AtomicBoolean(false)
@@ -117,7 +121,7 @@ internal class AudioCaptureOwner(
         val g = Generation(ticket,clock,zero);check(nativeFailure.bind(g));active = g; zeroReadyDelivered = false
         try {
             val codec = PlatformCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC); g.codec = codec; encoderName = codec.name
-            val encoded = EncodedAudioEpoch(audioCallbacks,owner,descriptor,timeline,clock,ticket.serial,
+            val encoded = EncodedAudioEpoch(audioCallbacks,owner,descriptor,timeline,clock,ticket.serial,g.observation,
                 onInput = { index ->
                     if (active === g && lifecycle.owns(ticket)) {
                         if (!g.inputs.offer(index)) report(g,"AAC input buffer bound exceeded")
@@ -136,7 +140,10 @@ internal class AudioCaptureOwner(
                 onRawOutput = { g.outputUnits.incrementAndGet() },
                 onEos = { if (active === g) act(g,lifecycle.eos(ticket)) },
                 onFailure = { reason -> report(g,reason) },
-                onHandoffIdle = { if (active === g && g.handoffSealed && (g.encoded?.outstanding ?: 0) == 0) act(g,lifecycle.handoffIdle(ticket)) })
+                onHandoffIdle = { if (active === g && g.handoffSealed && (g.encoded?.outstanding ?: 0) == 0) {
+                    g.observation.handoffIdle(ticket.serial)
+                    act(g,lifecycle.handoffIdle(ticket))
+                } })
             g.encoded = encoded
             codec.setCallback(encoded,audioCallbacks)
             codec.configure(MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC,48_000,1).apply {
@@ -269,6 +276,7 @@ internal class AudioCaptureOwner(
                 val codec=checkNotNull(g.codec);val input=codec.getInputBuffer(index) ?: error("AAC input buffer unavailable")
                 require(input.capacity()>=2048);input.clear()
                 var bytes=0;var ptsUs=g.lastInputUs.get()
+                var submittedRawFrames=0L;var submittedZeroFrames=0L
                 if(mode==Mode.ZERO) {
                     val safe=checkNotNull(replacement) { "Silence has no exact privacy owner" }
                     when(zeroAction(g,safe)) {
@@ -281,6 +289,7 @@ internal class AudioCaptureOwner(
                     while(due<0 && g.pumping.get() && g.mode==Mode.ZERO){TimeUnit.NANOSECONDS.sleep(minOf(2_000_000L,(cadence.nextNs-System.nanoTime()).coerceAtLeast(1)));due=cadence.claim(System.nanoTime())}
                     if(!g.pumping.get() || g.mode!=Mode.ZERO) { check(g.inputs.offer(index));borrowedInput=-1;continue }
                     g.zeroBytes.position(0);g.zeroBytes.limit(2048);input.put(g.zeroBytes);level=0f;bytes=2048;ptsUs=AudioGenerationClock.microseconds(g.inputTick)
+                    submittedZeroFrames=1024
                     when(zeroAction(g,safe)) {
                         PrivacyNativeWork.Action.RETRY -> { check(g.inputs.offer(index));borrowedInput=-1;continue }
                         PrivacyNativeWork.Action.CANCEL -> { check(g.inputs.offer(index));borrowedInput=-1;break }
@@ -308,9 +317,11 @@ internal class AudioCaptureOwner(
                         val take=alignment.copyBytes
                         block.buffer.position(heldOffset);block.buffer.limit(heldOffset+take);input.put(block.buffer);heldOffset+=take
                         bytes=alignment.outputBytes;ptsUs=AudioGenerationClock.microseconds(g.inputTick)
+                        submittedRawFrames=take/2L;submittedZeroFrames=alignment.zeroFrames.toLong()
                     } else {
                         block.buffer.position(0);block.buffer.limit(block.bytes);input.put(block.buffer);bytes=block.bytes;ptsUs=block.ptsUs;heldOffset=block.bytes
                         g.inputTick=AudioGenerationClock.tick(ptsUs)
+                        submittedRawFrames=bytes/2L
                     }
                     var square=0.0;input.order(ByteOrder.nativeOrder());for(at in 0 until bytes step 2){val x=input.getShort(at)/32768.0;square+=x*x};level=sqrt(square/(bytes/2)).toFloat().coerceIn(0f,1f)
                     g.pool.checkAge(block,System.nanoTime())
@@ -337,6 +348,7 @@ internal class AudioCaptureOwner(
                 check(!failed && runAdmission.admit(System.nanoTime())) { "Capture run failed before native AAC input" }
                 if(g.mode==Mode.RETIRING && !g.gracefulTail)break
                 codec.queueInputBuffer(index,0,bytes,ptsUs,0);borrowedInput=-1
+                g.observation.inputQueued(g.ticket.serial,submittedRawFrames,submittedZeroFrames)
                 held?.let { if(heldOffset==it.bytes){g.pool.release(it);held=null} }
                 g.acceptedFrames.addAndGet(bytes/2L);g.inputTick=Math.addExact(g.inputTick,bytes/2L)
                 g.lastInputUs.set(ptsUs+bytes/2L*1_000_000/48_000)
@@ -393,10 +405,15 @@ internal class AudioCaptureOwner(
                 if(encoded==null){act(g,lifecycle.callbacksClosed(g.ticket));act(g,lifecycle.handoffIdle(g.ticket))}
                 else encoded.quiesce({g.codec?.stop()}){ stopped ->
                     if(active===g){if(!stopped && g.acceptedFrames.get()>0)report(g,"AAC native stop was not confirmed")
-                        act(g,lifecycle.callbacksClosed(g.ticket));g.handoffSealed=true;encoded.finishHandoff(true);if(encoded.outstanding==0)act(g,lifecycle.handoffIdle(g.ticket))}
+                        g.observation.callbackBarrier(g.ticket.serial,stopped)
+                        act(g,lifecycle.callbacksClosed(g.ticket));g.handoffSealed=true;encoded.finishHandoff(true)
+                        if(encoded.outstanding==0){g.observation.handoffIdle(g.ticket.serial);act(g,lifecycle.handoffIdle(g.ticket))}}
                 }
             }
             AudioGenerationLifecycle.Action.RELEASE->native.execute{
+                // RELEASE already requires actual producer/callback/handoff receipts.
+                // Publish diagnostics before native release, never as its success.
+                g.observation.freeze(g.ticket.serial)?.let { lastGenerationObservation=it }
                 var ok=true
                 runCatching{g.codec?.release()}.onFailure{ok=false}
                 runCatching{g.microphone?.release()}.onFailure{ok=false}
@@ -425,13 +442,15 @@ internal class AudioCaptureOwner(
         native.execute{
             runCatching{g.reader?.join(1000);g.pump?.join(1000)}
             val done=g.reader?.isAlive!=true && g.pump?.isAlive!=true
-            owner.post{if(active===g){if(!done){report(g,"Audio producer threads remain retained");closeReply?.invoke(false)}else act(g,lifecycle.producersClosed(g.ticket))}}
+            owner.post{if(active===g){if(!done){report(g,"Audio producer threads remain retained");closeReply?.invoke(false)}else {
+                g.observation.producersJoined(g.ticket.serial);act(g,lifecycle.producersClosed(g.ticket))}}}
         }
     }
     private fun maybeSendEos(g:Generation){
         if(active!==g || lifecycle.currentStage()!=AudioGenerationLifecycle.Stage.EOS || g.eosSent)return
         val index=g.inputs.poll() ?:return
         try{g.codec!!.queueInputBuffer(index,0,0,g.lastInputUs.get(),PlatformCodec.BUFFER_FLAG_END_OF_STREAM);g.eosSent=true
+            g.observation.inputEosQueued(g.ticket.serial)
             owner.postDelayed({if(active===g)act(g,lifecycle.abortEos(g.ticket))},500)
         }catch(error:Exception){report(g,"AAC EOS failed");act(g,lifecycle.abortEos(g.ticket))}
     }
