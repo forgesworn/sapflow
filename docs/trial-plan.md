@@ -312,6 +312,14 @@ never print it.
 Studio's test signal dials whatever host the RTMP or SRT template names, so
 once 1935 has moved it tests sapflow.
 
+Read production's probe template before planning the restart. If it already
+goes through the public `/live-hls/` path rather than to mediamtx's own
+port, the Caddy switch moves it too: phase B then needed no change to
+`<env-file>` and no app restart, only 1935 and Caddy. The test signal
+publishes over SRT when the SRT template is set, so it cannot follow a
+rollback to mediamtx (SRT off there); rehearse the rollback with an RTMP
+encoder.
+
 ### 2.6 Dry run
 
 Two phases. Do not go to the night until both pass and section 4's blanks are
@@ -546,18 +554,32 @@ What people see during a mid-show rollback:
 | Who | Experience |
 |-----|------------|
 | Performer | Nothing, if the encoder reconnects by itself; otherwise restarts it with the same settings (RTMP, if it was on SRT) |
-| Viewers | The picture freezes at the drop (the held stream stops growing), then the playlist changes origin when Caddy is reloaded. hls.js clients (v4v's player, Chrome) recover by jumping to live; Safari's native player is expected to stall and may need a page reload. Chunk names and media sequence both change |
-| Stage | `reconnecting`, then `live`, if inside 90 s |
+| Viewers | The picture freezes at the drop (the held stream stops growing), then the playlist changes origin when Caddy is reloaded. v4v's hls.js player did not recover by itself in the rehearsal: it stayed stalled for over a minute after mediamtx was serving, and a page reload brought it back. Expect every viewer to need a reload; say so on the stage if the chat is on. Chunk names and media sequence both change |
+| Stage | Stayed `live` throughout the rehearsal; v4v's source stats moved to mediamtx's feed by themselves |
 | Replay | Possibly only the longer of two recordings |
 
-Rehearsal result (fill in during phase B):
+Rehearsal result (phase B, an RTMP encoder stand-in that reconnects by
+itself, a Chrome viewer on the stage):
 
 | Measure | Seconds |
 |---------|---------|
-| Decision to 1935 back on mediamtx, the encoder reconnected and mediamtx's `publish` seen by v4v | ____ |
-| Caddy restored and reloaded after that | ____ |
-| Stage `live` and playing again in Safari | ____ |
-| Longest viewer-visible gap | ____ |
+| Decision to 1935 back on mediamtx | 2.1 |
+| Decision to the encoder reconnected | 2.9 |
+| Decision to mediamtx's `publish` hook run | 4.6 |
+| Caddy restored and reloaded (from the decision) | 5.3 |
+| Stage `live` and playing again | the stage never left `live`; the player needed a reload, then played 2.9 s behind |
+| Longest viewer-visible gap | the time until the viewer reloads |
+
+Before rehearsing, read the Caddy file for routes that name one event: a
+`/live-hls/live/<eventId>/*` handle left from earlier testing sends that
+event to sapflow even after the general route is restored, and the
+rehearsal looked like a failed rollback until it was taken out.
+
+Phase B also measured, with one test signal sent to both servers at once:
+the same frame became available on each within 2 ms (median of about 5,200
+frames). The player-visible difference is `PART-HOLD-BACK`: 0.70 s on
+sapflow (three times its 0.234 s part target, as Apple requires) against
+0.50 s on mediamtx.
 | Inside the 90 s grace? | yes / no |
 | Stage stayed `live` with the probe on sapflow? | yes / no |
 | Safari recovered without a reload? | yes / no |
