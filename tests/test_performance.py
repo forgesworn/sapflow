@@ -12,8 +12,9 @@ spec.loader.exec_module(performance)
 REPORT = """--- sapflow, 750 viewers: server CPU 34.6%  peak RSS 27.2 MB
 server sampling 60.010 s target 60 s
 viewers 750  measured 60 s after a 10 s ramp
-collection completed requests wholly within the fixed post-ramp window
+collection requests started within the fixed post-ramp window, including drain
 excluded requests 500  errors 0
+drained requests 2 max 0.030000 s
 requests 588290  errors 0  received 2000.0 MB
 playlist  n=45000  p50 8.5 ms  p95 20.0 ms  p99 26.9 ms  max 60.0 ms
 segment   n=9000   p50 5.0 ms  p95 15.0 ms  p99 22.0 ms  max 62.0 ms
@@ -40,9 +41,10 @@ class PerformanceTests(unittest.TestCase):
 
     def test_old_ramp_inclusive_reports_are_refused_and_excluded_errors_survive(self):
         with self.assertRaises(ValueError):
-            performance.parse_report(REPORT.replace("collection completed requests wholly within the fixed post-ramp window", ""), [750])
+            performance.parse_report(REPORT.replace("collection requests started within the fixed post-ramp window, including drain", "collection completed requests wholly within the fixed post-ramp window"), [750])
         row = performance.parse_report(REPORT.replace("excluded requests 500  errors 0", "excluded requests 500  errors 2"), [750])[0]
         self.assertEqual((row["errors"], row["excluded_errors"]), (0, 2))
+        self.assertEqual((row["drained_requests"], row["max_drain_seconds"]), (2, .03))
 
     def test_full_cycle_balances_every_treatment_position(self):
         treatments = ["hyper", "own-1", "own-4", "own", "mediamtx"]

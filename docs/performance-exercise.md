@@ -25,8 +25,13 @@ The initial screening used 750 full-media viewers, three rotating rounds and
 a 60-second full-load target per treatment.  The standard runner also measures idle
 RSS and twenty seconds of single-publisher CPU after a 25-second warm-up.
 That historical loader included ramp traffic in its counters and percentiles.
-The current loader accepts a request only if it starts and completes wholly
-inside a fixed post-ramp interval.  It retains excluded request/failure totals;
+The current loader admits requests by start time inside a fixed post-ramp
+interval.  It stops admitting at the deadline and retains those requests'
+completions during a drain bounded by the existing header/body timeouts.
+This keeps slow successful responses and late failures in the measured
+distribution, rather than clipping the latency tail at the deadline.  The
+receipt records drained request counts and maximum post-window completion
+time separately from the server CPU interval.  It retains excluded warm-up request/failure totals;
 the runner rejects failures in either collection.  Fan-out uses each response's
 actual completion time, rather than the time its concurrent partner finishes.
 The process sampler uses a monotonic deadline instead of accumulating polling
