@@ -5,6 +5,24 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+The fresh generated [recording presentation matrix](recording-recovery.md#fresh-registered-matrix-result)
+passes its separately registered numerical contract across five A/V and ten
+audio-only/short-prefix cases. Nine complete comparisons satisfy every exact
+hard check; two differ from paired native PCM at 22 Int16 positions each, by at
+most one unit. Both original strict aggregates remain failed and retained.
+Independent review verifies the results, source/package bindings and 352 command
+logs. This closes the generated presentation prerequisite; production recorder
+migration, durable checkpoint recovery, aggregate two-second loss and physical
+acceptance remain open.
+
+The shared [portable checkpoint SDK](recording-recovery.md#portable-checkpoint-sdk)
+now supplies bounded slot encoding/decoding and immutable serialised byte
+frontiers through Swift and Kotlin. Current source passes 700 workspace tests,
+strict Clippy, generated-stream smoke checks and 522,636 sanitised fuzz
+executions. Refreshed three-slice Apple and four-ABI Android packages pass their
+actual generated host consumers. These are library/package checks; the apps
+have not adopted the new append/checkpoint recovery path.
+
 Android V4V End now requires an explicit confirmation bound to the exact saved
 session or pending Prepare and the Activity's local capture owner. Cancellation
 and stale actions cannot stop a successor, save terminal intent or send End for
@@ -29,7 +47,7 @@ failed XML are retained without increasing the five-second limit.
 The fresh Android SDK package passes all four ABI builds, actual 16 KiB ELF
 LOAD-alignment checks and the extracted AAR-class host consumer. Its source-bound
 receipt is under
-`target/privacy-standby/recording-lookbehind-native-check/android-v1/readback-v2/`.
+`target/privacy-standby/recording-checkpoint-native-check/android-v1/`.
 This is package/host evidence; the app remains ARM64-only and physical/native
 recording acceptance remains separate.
 

@@ -61,9 +61,9 @@ its container duration. Publishing and the shared encoded sample retain their
 original duration and payload. Checkpoints distinguish accepted media from
 actually serialised coverage, and coded from container endpoints. Unknown EOF
 retains the original final duration. Source review, focused Rust tests, strict
-Clippy and generated Swift/Kotlin host consumers pass. Refreshed packages and
-the unchanged native presentation checks remain separate gates before a
-platform recorder adopts it.
+Clippy and generated Swift/Kotlin host consumers pass. The current package and
+generated presentation results are recorded below; platform recorder adoption
+remains separate.
 
 ## Native recording presentation qualification
 
@@ -110,6 +110,41 @@ payload provenance, raw-admission or settled-silence requirements. It does not
 qualify production recorder adoption, durable recovery, the aggregate loss bound,
 power loss, physical devices or sustained shows.
 
+## Fresh registered matrix result
+
+A fresh source-bound run completes all five A/V and ten audio-only/short-prefix
+cases and passes the separately registered numerical contract. Nine complete
+comparisons satisfy all 17 mandatory hard checks. Seven native PCM arrays are
+byte-identical; the mono A/V control and the 96,193-frame audio-only control each
+differ at 22 Int16 positions, with a maximum difference of one unit. Exact packet
+retention, rational timestamps, presentation counts, independent valid PCM and
+applicable positive seeks pass.
+
+Both original strict suite aggregates remain failed, with their original child
+exit codes preserved. The 18-frame resampled recording passes its separate tiny
+positive seek; the original fixed half-second seek remains failed. Earlier
+failed runs are unchanged. These results do not establish the cause of native
+read variation.
+
+Both actual process-killed A/V prefixes retain only pre-death sealed coverage
+and pass native and independent decoding and applicable seeks. Unknown-EOF and
+head-only cases retain their distinct classifications without invented final
+padding or positive presentation. Actual final tails observed across the two
+suites are 0, 64, 448, 840, 860, 942 and 1,023 frames. Tails of 1,024 or more
+remain unobserved.
+
+Three actual generated-file extraction negatives detect a changed AAC payload,
+a truncated box and a one-tick audio decode-time change. These are extraction
+checks, not mutant-decoder or full-gate qualification. Independent review verifies
+the retained 352 command-log hashes, source/package bindings, results and cleanup.
+Generated media and owned compiler scratch were removed. Source and scalar
+evidence remain under
+`target/privacy-standby/generated-recording-qualification-v3/`.
+
+This completes the registered generated presentation prerequisite. App recorder
+migration, synchronised checkpoint installation, durable orphan recovery, the
+aggregate two-second loss bound and physical acceptance remain open.
+
 ## Portable checkpoint SDK
 
 The shared `sapflow_hls::recording_checkpoint` codec and typed Swift/Kotlin
@@ -144,6 +179,13 @@ two-second loss bound. Evidence is retained under
 `target/recording-checkpoint-gates-v1/`,
 `target/privacy-standby/recording-checkpoint-fuzz-v1/` and
 `target/privacy-standby/recording-checkpoint-native-check/`.
+
+The refreshed Apple SDK package passes all three release slices and its
+installed Swift host consumer. The Android SDK package passes all four ABIs,
+actual 16 KiB ELF load alignment and its extracted-AAR Kotlin host consumer.
+Both retain unchanged source bindings and verified package contents. Package
+and host checks do not establish a rebuilt app, phone installation or physical
+recording acceptance.
 
 ## Implementation order
 
