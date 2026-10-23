@@ -65,6 +65,51 @@ Clippy and generated Swift/Kotlin host consumers pass. Refreshed packages and
 the unchanged native presentation checks remain separate gates before a
 platform recorder adopts it.
 
+## Native recording presentation qualification
+
+The subsequent five-case generated A/V run passes its original strict checks,
+including both actual SIGKILL prefixes. The ten-case audio-only and short-prefix
+run completes, but its original strict aggregate fails on two closed controls:
+their equal-length native Int16 arrays differ from the paired recorder by one
+least significant bit at 28 and 22 sample positions. Payloads, coded timestamps,
+presentation counts, valid independent-decoder PCM and applicable seeks pass.
+Fresh reads of the same unchanged files also produce differing native Int16 and
+Float32 results. The cause remains unresolved; this does not establish a
+dithering mechanism or a container corruption fix.
+
+For future generated qualification, `native-numeric-presentation-equivalence-v1`
+is a separately registered numerical contract. Compare the full, originally
+aligned, equal-length Int16 arrays: every sample must differ by at most one
+least significant bit, using arithmetic that cannot wrap. There is no crop,
+alignment search, normalisation or audio rewrite. A difference of two anywhere
+fails. RMS, correlation and mismatch density are diagnostic only. This accepts
+a difference of up to 1/32,768 of full scale at every position, including a
+constant one-unit bias; it is an explicit numerical tolerance, not proof of
+perceptual equivalence.
+
+Every exact content and presentation requirement remains mandatory: original
+encoded packet bytes, order, counts, coded durations and rational timestamps;
+actual generation, leading and EOF-tail receipts; native output format, lossless
+timestamp conversion, origin, endpoints and frame count; byte-exact independent
+valid PCM; applicable positive seeks; paired native recorder controls; and the
+required actual legacy-file negatives. Complete extents must satisfy the SDK's
+checked bounds, including leading frames at most 8,191, final tail below 1,024
+and positive generation count no greater than coded AAC-unit count. Unknown EOF
+and prefixes containing no positive presentation retain separate classifications.
+
+The original byte-exact result and original strict verdict remain reported
+alongside the new numerical result. Historical runs are not reclassified. Before
+adoption, a fresh generated A/V and audio-only matrix must extract the hard facts
+from actual recordings and decoder receipts; synthetic oracle tests alone do
+not prove file-corruption detection. The reviewed definition and 50 synthetic
+boundary controls are retained under
+`target/privacy-standby/native-presentation-acceptance-v1/source2/`.
+
+This recording comparison does not replace privacy standby's synthetic-only
+payload provenance, raw-admission or settled-silence requirements. It does not
+qualify production recorder adoption, durable recovery, the aggregate loss bound,
+power loss, physical devices or sustained shows.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC
@@ -73,8 +118,9 @@ platform recorder adopts it.
    generation facts and proven final EOF tail. Interior generation slots remain
    intentional media. Missing EOF produces an incomplete prefix with no invented
    final trim.
-2. Qualify exact native and independent audio presentation, packet retention,
-   timestamps and seeks against the unchanged generated experiment. Fixed-size
+2. Qualify native audio against the registered numerical contract while retaining
+   original strict verdicts, exact independent audio presentation, packet
+   retention, timestamps and seeks. Fixed-size
    recording headers and exact track/movie clocks must not shift fragment bytes.
    Candidate edit/roll metadata and the final container duration are subject to
    those decoder checks.
