@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 
 precondition(sdkAbiVersion() == 1)
+try checkSharedAacTimingViews()
 // Exercise actual generated lifecycle control; no network/capture is attached.
 let lifecycle = try NativeSession(graceMs: 90_000)
 let lifecycleGeneration = try lifecycle.start(nowNs: 0)
@@ -402,4 +403,51 @@ func checkNativeRecordingTimingBinding() throws {
     try mux.cancel()
     let extentAfterCancel = try checkpoint.presentationExtent()
     precondition(extentAfterCancel == prefixExtent)
+}
+
+// Generated API/ownership controls with synthetic bytes, never codec/AU proof.
+func checkSharedAacTimingViews() throws {
+    let codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+    var original: MediaSample? = try codec.sample(bytes: Data([1, 2, 3]), pts: 4096, dts: 4096,
+        duration: 1024, timescale: 48_000, keyframe: false)
+    precondition(original!.aacSourceInfo() == nil)
+    let views = try original!.aacTimingViews(producerGeneration: 17, nativePtsUs: -2112, publishingPts: 0)
+    let info = views.sourceInfo()
+    precondition(info.producerGeneration == 17 && info.nativePtsUs == -2112)
+    precondition(info.originalPts == 4096 && info.originalDts == 4096)
+    precondition(info.originalDuration == 1024 && info.originalTimescale == 48_000)
+    original = nil // Native views retain their original independently.
+    let queues = try NativeSampleFanout.withAacTimingViews(publishingBytes: 1024,
+        recordingBytes: 1024, maxMediaMs: 1000, hasVideo: false)
+    let first = try queues.pushAacTimingViews(views: views, nowNs: 0)
+    precondition(first.publishingQueued && first.recordingQueued)
+    let next = try codec.sample(bytes: Data([4, 5, 6]), pts: 5120, dts: 5120,
+        duration: 1024, timescale: 48_000, keyframe: false)
+    let withheld = try next.aacTimingViews(producerGeneration: 17, nativePtsUs: -1, publishingPts: nil)
+    precondition(withheld.publishingSample() == nil)
+    let second = try queues.pushAacTimingViews(views: withheld, nowNs: 1)
+    precondition(!second.publishingQueued && second.recordingQueued)
+    let stats = try queues.stats()
+    precondition(stats.publishingDrops == 0)
+    let publishing = try queues.popPublishing(nowNs: 2)!
+    let recording = try queues.popRecording(nowNs: 2)!
+    precondition(publishing.pts() == 0 && recording.pts() == 4096)
+    precondition(publishing.aacSourceInfo() == info && recording.aacSourceInfo() == info)
+    do {
+        _ = try recording.aacTimingViews(producerGeneration: 17, nativePtsUs: 0, publishingPts: 0)
+        fatalError("view-of-view accepted")
+    } catch BindingError.InvalidMedia {}
+    let tail = try queues.popRecording(nowNs: 2)!
+    precondition(tail.pts() == 5120 && tail.aacSourceInfo()?.originalPts == 5120)
+    let noPublishing = try queues.popPublishing(nowNs: 2)
+    let noRecording = try queues.popRecording(nowNs: 2)
+    precondition(noPublishing == nil && noRecording == nil)
+    let stereo = try MediaCodec.aac(asc: Data([0x11, 0x90]))
+    let unsupported = try stereo.sample(bytes: Data([1]), pts: 0, dts: 0,
+        duration: 1024, timescale: 48_000, keyframe: false)
+    do {
+        _ = try unsupported.aacTimingViews(producerGeneration: 1, nativePtsUs: 0, publishingPts: 0)
+        fatalError("stereo view accepted")
+    } catch BindingError.InvalidMedia {}
+    print("Sapflow Swift shared AAC timing views passed")
 }

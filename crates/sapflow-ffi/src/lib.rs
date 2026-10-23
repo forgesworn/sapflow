@@ -10,7 +10,10 @@ mod recording;
 mod rtmp;
 mod session;
 mod srt;
-pub use media::{FanoutOutcome, MediaCodec, MediaSample, NativeQueueStats, NativeSampleFanout};
+pub use media::{
+    FanoutOutcome, MediaCodec, MediaSample, NativeAacSampleSourceInfo, NativeAacTimingViews,
+    NativeQueueStats, NativeSampleFanout,
+};
 pub use recording::{
     DecodedRecordingCheckpoint, DecodedRecordingCheckpointInfo, EncodedRecordingCheckpointInfo,
     NativeAudioFileReceipt, NativeAudioGenerationReceipt, NativeRecordingCheckpoint,

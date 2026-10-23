@@ -9,6 +9,7 @@ fun main() {
     checkIntentionalTransportReplacement()
     checkNetworkRecoveryAxes()
     checkNativeRecordingTimingBinding()
+    checkSharedAacTimingViews()
     val input = ByteBuffer.allocateDirect(4)
     input.put(byteArrayOf(1, 2, 3, 4)).flip()
     EncodedBuffer(input).use { sample ->
@@ -379,4 +380,51 @@ private fun checkNetworkRecoveryAxes() {
         try { session.mediaConfirmedForAttempt(generation, uncertainAttempt, 1_000_013uL); error("decoded observation resurrected cancelled session") }
         catch (_: BindingException.StaleSession) {}
     }
+}
+
+/** Generated API/ownership controls with synthetic bytes, never codec/AU proof. */
+private fun checkSharedAacTimingViews() {
+    val asc = ByteBuffer.allocateDirect(2).put(byteArrayOf(0x11, 0x88.toByte())).flip()
+    MediaCodec.aac(asc).use { codec ->
+        val payload = ByteBuffer.allocateDirect(3).put(byteArrayOf(1, 2, 3)).flip()
+        val original = codec.sample(payload, 4096, 4096, 1024u, 48_000u, false)
+        check(original.aacSourceInfo() == null)
+        original.aacTimingViews(17uL, -2112L, 0L).use { views ->
+            val info = views.sourceInfo()
+            check(info.producerGeneration == 17uL && info.nativePtsUs == -2112L)
+            check(info.originalPts == 4096L && info.originalDts == 4096L)
+            check(info.originalDuration == 1024u && info.originalTimescale == 48_000u)
+            original.close() // Views retain their original ownership independently.
+            NativeSampleFanout.withAacTimingViews(1024uL, 1024uL, 1000u, false).use { queues ->
+                val first = queues.pushAacTimingViews(views, 0uL)
+                check(first.publishingQueued && first.recordingQueued)
+                codec.sample(payload, 5120, 5120, 1024u, 48_000u, false).use { next ->
+                    next.aacTimingViews(17uL, -1L, null).use { withheld ->
+                        check(withheld.publishingSample() == null)
+                        val result = queues.pushAacTimingViews(withheld, 1uL)
+                        check(!result.publishingQueued && result.recordingQueued)
+                    }
+                }
+                check(queues.stats().publishingDrops == 0uL)
+                queues.popPublishing(2uL)!!.use { publishing ->
+                    check(publishing.pts() == 0L && publishing.aacSourceInfo() == info)
+                }
+                queues.popRecording(2uL)!!.use { recording ->
+                    check(recording.pts() == 4096L && recording.aacSourceInfo() == info)
+                    try { recording.aacTimingViews(17uL, 0L, 0L).close(); error("view-of-view accepted") }
+                    catch (_: BindingException.InvalidMedia) {}
+                }
+                queues.popRecording(2uL)!!.use { check(it.pts() == 5120L && it.aacSourceInfo()!!.originalPts == 5120L) }
+                check(queues.popPublishing(2uL) == null && queues.popRecording(2uL) == null)
+            }
+        }
+        val stereo = ByteBuffer.allocateDirect(2).put(byteArrayOf(0x11, 0x90.toByte())).flip()
+        MediaCodec.aac(stereo).use { unsupported ->
+            unsupported.sample(payload, 0, 0, 1024u, 48_000u, false).use { sample ->
+                try { sample.aacTimingViews(1uL, 0L, 0L).close(); error("stereo view accepted") }
+                catch (_: BindingException.InvalidMedia) {}
+            }
+        }
+    }
+    println("Sapflow Kotlin shared AAC timing views passed")
 }

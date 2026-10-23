@@ -50,6 +50,188 @@ fn audio(n: i64) -> SharedSample {
     )
 }
 
+fn mono_timing_source(config: Arc<CodecConfig>, tick: i64) -> SharedSample {
+    Arc::new(
+        EncodedSample::new(
+            config,
+            SampleTiming::new(tick, tick, 1024, 48_000).expect("original coded timing"),
+            false,
+            Arc::from([0x21, 0x10]),
+        )
+        .expect("original ownership copy"),
+    )
+}
+fn mono_timing_config() -> Arc<CodecConfig> {
+    Arc::new(CodecConfig::Aac(
+        AacConfig::new(&[0x11, 0x88]).expect("AAC mono"),
+    ))
+}
+
+#[test]
+fn aac_timing_views_share_exact_original_payload_codec_and_depth_one_provenance() {
+    let original = mono_timing_source(mono_timing_config(), 4096);
+    let views = AacSampleTimingViews::new(original.clone(), 17, -2112, Some(0))
+        .expect("explicit timing choices");
+    let recording = views.recording();
+    let publishing = views.publishing().expect("selected publisher");
+    assert_eq!(recording.timing(), original.timing());
+    assert_eq!(publishing.timing().pts(), 0);
+    assert_eq!(original.timing().pts(), 4096);
+    assert!(original.aac_source().is_none());
+    for sample in [recording, publishing] {
+        assert!(Arc::ptr_eq(sample.payload(), original.payload()));
+        assert!(Arc::ptr_eq(sample.config(), original.config()));
+        let source = sample.aac_source().expect("retained source context");
+        assert!(Arc::ptr_eq(source.original(), &original));
+        assert!(source.original().aac_source().is_none());
+        assert_eq!(source.producer_generation(), 17);
+        assert_eq!(source.native_pts_us(), -2112);
+    }
+    assert!(matches!(
+        AacSampleTimingViews::new(recording.clone(), 17, 0, Some(0)),
+        Err(MediaError::InvalidAudioTiming)
+    ));
+}
+
+#[test]
+fn aac_timing_views_keep_payload_alive_after_original_and_pair_handles_drop() {
+    let original = mono_timing_source(mono_timing_config(), 0);
+    let weak = Arc::downgrade(original.payload());
+    let views = AacSampleTimingViews::new(original.clone(), 1, i64::MIN, Some(10_000))
+        .expect("signed source observation is not a media timestamp");
+    let recording = views.recording().clone();
+    drop(original);
+    drop(views);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(
+        recording.aac_source().expect("source").native_pts_us(),
+        i64::MIN
+    );
+    drop(recording);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn aac_timing_views_reject_unsupported_profiles_context_and_scalar_overflow() {
+    for source in [audio(0), video(0, true)] {
+        assert!(matches!(
+            AacSampleTimingViews::new(source, 1, 0, Some(0)),
+            Err(MediaError::InvalidAudioTiming)
+        ));
+    }
+    let rate = Arc::new(CodecConfig::Aac(
+        AacConfig::new(&[0x12, 0x08]).expect("44100 mono"),
+    ));
+    let source = Arc::new(
+        EncodedSample::new(
+            rate,
+            SampleTiming::new(0, 0, 1024, 44_100).expect("44100 timing"),
+            false,
+            Arc::from([1, 2]),
+        )
+        .expect("44100 original"),
+    );
+    assert!(AacSampleTimingViews::new(source, 1, 0, Some(0)).is_err());
+    let original = mono_timing_source(mono_timing_config(), 0);
+    assert!(AacSampleTimingViews::new(original.clone(), 0, 0, Some(0)).is_err());
+    assert!(matches!(
+        AacSampleTimingViews::new(original.clone(), 1, 0, Some(-1)),
+        Err(MediaError::InvalidTimestamp)
+    ));
+    assert!(matches!(
+        AacSampleTimingViews::new(original, 1, 0, Some(i64::MAX)),
+        Err(MediaError::TimestampOverflow)
+    ));
+}
+
+#[test]
+fn paired_queue_pop_preserves_distinct_timing_and_exact_shared_source() {
+    let original = mono_timing_source(mono_timing_config(), 8192);
+    let views = AacSampleTimingViews::new(original.clone(), 9, -5, Some(0)).expect("views");
+    let mut fanout = SampleFanout::new(limits(1024), limits(1024), false);
+    assert_eq!(
+        fanout.push_aac_timing_views(&views, 1).expect("queues"),
+        (Some(EnqueueOutcome::Queued), EnqueueOutcome::Queued)
+    );
+    let publishing = fanout
+        .publishing()
+        .pop(2)
+        .expect("clock")
+        .expect("publishing");
+    let recording = fanout
+        .recording()
+        .pop(2)
+        .expect("clock")
+        .expect("recording");
+    assert_eq!(publishing.timing().pts(), 0);
+    assert_eq!(recording.timing().pts(), 8192);
+    assert!(Arc::ptr_eq(recording.payload(), publishing.payload()));
+    assert!(Arc::ptr_eq(recording.payload(), original.payload()));
+    assert!(Arc::ptr_eq(
+        recording.aac_source().expect("record source").original(),
+        publishing.aac_source().expect("publish source").original()
+    ));
+}
+
+#[test]
+fn withheld_publishing_is_not_a_drop_or_closed_branch_but_old_backlog_ages() {
+    let config = mono_timing_config();
+    let withheld = AacSampleTimingViews::new(mono_timing_source(config.clone(), 0), 1, -1000, None)
+        .expect("recording-only original");
+    let mut fanout = SampleFanout::new(limits(1024), limits(1024), false);
+    assert_eq!(
+        fanout.push_aac_timing_views(&withheld, 0).expect("queue"),
+        (None, EnqueueOutcome::Queued)
+    );
+    assert_eq!(fanout.publishing().stats().dropped_samples, 0);
+    assert_eq!(fanout.publishing().stats().accepted_samples, 0);
+    assert!(!fanout.publishing().admission_closed());
+    let short = QueueLimits::new(1024, 64, 10_000_000_000, 1_000).expect("publisher age");
+    let long = QueueLimits::new(1024, 64, 10_000_000_000, 10_000).expect("recording age");
+    let mut ageing = SampleFanout::new(short, long, false);
+    let selected = AacSampleTimingViews::new(mono_timing_source(config.clone(), 0), 1, 0, Some(0))
+        .expect("selected");
+    ageing.push_aac_timing_views(&selected, 0).expect("first");
+    let next =
+        AacSampleTimingViews::new(mono_timing_source(config, 1024), 1, 1, None).expect("withheld");
+    ageing
+        .push_aac_timing_views(&next, 1000)
+        .expect("old backlog ages");
+    assert_eq!(ageing.publishing().stats().dropped_samples, 1);
+    assert_eq!(ageing.publishing().stats().overflow_residence, 1);
+    assert_eq!(ageing.recording().stats().queued_samples, 2);
+}
+
+#[test]
+fn paired_queue_clock_failure_is_atomic_and_recording_refusal_stays_independent() {
+    let source = mono_timing_source(mono_timing_config(), 0);
+    let views = AacSampleTimingViews::new(source, 1, 0, Some(0)).expect("views");
+    let mut fanout = SampleFanout::new(limits(1024), limits(1024), false);
+    fanout.recording().pop(10).expect("recording clock");
+    let before_publishing = fanout.publishing().stats();
+    let before_recording = fanout.recording().stats();
+    assert_eq!(
+        fanout.push_aac_timing_views(&views, 9),
+        Err(QueueError::ClockWentBackwards)
+    );
+    assert_eq!(fanout.publishing().stats(), before_publishing);
+    assert_eq!(fanout.recording().stats(), before_recording);
+    assert!(fanout.push_aac_timing_views(&views, 10).is_ok());
+    let mut small = SampleFanout::new(limits(1024), limits(1), false);
+    let (publishing, recording) = small
+        .push_aac_timing_views(&views, 0)
+        .expect("independent branches");
+    assert_eq!(publishing, Some(EnqueueOutcome::Queued));
+    assert!(matches!(
+        recording,
+        EnqueueOutcome::RecordingFailed {
+            reason: OverflowReason::Bytes
+        }
+    ));
+    assert_eq!(small.publishing().stats().queued_samples, 1);
+    assert_eq!(small.recording().stats().queued_samples, 0);
+}
+
 #[test]
 fn terminal_publishing_admission_keeps_the_accepted_prefix_and_recording() {
     let mut fanout = SampleFanout::new(limits(1024), limits(1024), true);

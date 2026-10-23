@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::SharedSample;
+use crate::media::AacSampleTimingViews;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueLimits {
@@ -353,6 +354,30 @@ impl SampleFanout {
         }
         let publishing = self.publishing.push(sample.clone(), now_ns)?;
         let recording = self.recording.push(sample, now_ns)?;
+        Ok((publishing, recording))
+    }
+    /// Explicit opt-in paired views use these same two bounded queues. The
+    /// opaque pair was derived from one validated original, never two payloads.
+    pub fn push_aac_timing_views(
+        &mut self,
+        views: &AacSampleTimingViews,
+        now_ns: u64,
+    ) -> Result<(Option<EnqueueOutcome>, EnqueueOutcome), QueueError> {
+        if [&self.publishing, &self.recording]
+            .iter()
+            .any(|q| q.last_now.is_some_and(|last| now_ns < last))
+        {
+            return Err(QueueError::ClockWentBackwards);
+        }
+        let publishing = if let Some(sample) = views.publishing() {
+            Some(self.publishing.push(sample.clone(), now_ns)?)
+        } else {
+            // Existing accepted backlog still ages. Withholding this input
+            // never manufactures AdmissionClosed or a dropped-input counter.
+            self.publishing.tick(now_ns)?;
+            None
+        };
+        let recording = self.recording.push(views.recording().clone(), now_ns)?;
         Ok((publishing, recording))
     }
     pub fn publishing(&mut self) -> &mut BoundedQueue {
