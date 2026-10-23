@@ -8,32 +8,36 @@ or [native performance contract](native-performance-contract.md).
 The fresh generated [recording presentation matrix](recording-recovery.md#fresh-registered-matrix-result)
 passes its separately registered numerical contract across five A/V and ten
 audio-only/short-prefix cases. Nine complete comparisons satisfy every exact
-hard check; two differ from paired native PCM at 22 Int16 positions each, by at
-most one unit. Both original strict aggregates remain failed and retained.
-Independent review verifies the results, source/package bindings and 352 command
-logs. This closes the generated presentation prerequisite; production recorder
-migration, durable checkpoint recovery, aggregate two-second loss and physical
-acceptance remain open.
+hard check. Seven paired native arrays are byte-identical; two differ at 11 and
+10 Int16 positions respectively, by at most one unit. Both original strict
+aggregates remain failed and retained. Independent review verifies current
+source/package bindings and 352 command logs. Production recorder migration,
+durable recovery, aggregate two-second loss and physical acceptance remain open.
 
 The shared [portable checkpoint SDK](recording-recovery.md#portable-checkpoint-sdk)
-now supplies bounded slot encoding/decoding and immutable serialised byte
-frontiers through Swift and Kotlin. Current source passes 700 workspace tests,
-strict Clippy, generated-stream smoke checks and 522,636 sanitised fuzz
-executions. Refreshed three-slice Apple and four-ABI Android packages pass their
-actual generated host consumers. These are library/package checks; the apps
-have not adopted the new append/checkpoint recovery path.
+now includes an immutable cold presentation query using the exact Rust header
+timing calculation. Current source passes 708 workspace tests, strict Clippy,
+formatting, generated-stream smoke and actual Swift/Kotlin consumers. Four tests
+remain ignored by the default workspace command. The unchanged parser's earlier
+522,636 sanitised fuzz executions remain separate evidence. Refreshed three-slice
+Apple and four-ABI Android SDK packages pass their installed host consumers;
+Android native libraries also pass actual 16 KiB alignment checks.
 
-The iOS [checkpoint composition](recording-recovery.md#ios-checkpoint-installation)
-passes 80 actual host filesystem tests, 38 library tests, nine real-SDK
-filesystem/API tests and the strict iOS 16 API check across all 68 app source
-files. It retains exact file/catalogue ownership through sync, alternating-slot
-installation, shared Rust validation and checked readback close. Scalar
-publication follows that close and a fresh cancellation check. The earlier
-append-only 71-test result and its initial fixture failures remain retained.
-The new SDK tests use synthetic audio bytes and scalar receipts, with no
-native decoder or physical acceptance claim. FINAL_HEADER is still deferred;
-normal finalisation, app recorder adoption, crash recovery and aggregate
-two-second loss qualification remain open.
+The iOS [submitted-input storage composition](recording-recovery.md#ios-submitted-input-finalisation)
+passes 86 actual host filesystem tests, 38 library tests, 16 real-SDK tests and
+the strict iOS 16 API check across all 68 app source files. One exact file owner
+survives append close, fixed-header replacement, sync/readback/checked close and
+receipt installation. Every current SDK result still has unknown app admission
+and an incomplete receipt. The initial test callback compile failure and its
+reviewed test-only repair remain retained. There is no whole-show finalisation,
+app recorder migration, crash-recovery or aggregate-loss acceptance claim.
+
+The optional [full native AAC receipt mode](recording-recovery.md#native-aac-generation-receipts)
+passes fourteen actual generated native cases and real SDK receipt acceptance,
+including mixed silence/raw input in one encoder generation. Existing legacy
+callbacks remain the default. Both original generated audio-only and standby
+recording/decoder gates also pass unchanged. These checks introduce no second
+encoder, payload copy, per-unit validation or media queue.
 
 Android V4V End now requires an explicit confirmation bound to the exact saved
 session or pending Prepare and the Activity's local capture owner. Cancellation
@@ -43,14 +47,17 @@ publisher/pending-capture fence; the actor rechecks the same owner before the
 durable End request. An active local recording continues. Independent source
 review is clear; evidence is under `target/v4v-end-confirmation-v1/`.
 
-The refreshed Android app gate uses the current checkpoint SDK AAR. Debug and
+The refreshed Android app gate uses the current extent-query SDK AAR. Debug and
 Qualification each reexecute all 597 JVM tests in 68 suites, including 22
-confirmation/shutdown tests and 15 existing session tests. All three app
-configurations build and pass lint with no errors; warnings remain. Actual APK
-checks pass current SDK byte identity, native and ZIP 16 KiB alignment, notices,
-manual routing and qualification isolation. Independent outcome review is clear.
-Release remains unsigned; no phone was installed or tested. Evidence is under
-`target/privacy-standby/recording-checkpoint-android-app-v1/`.
+confirmation/shutdown tests and 15 session tests. All three app configurations
+build and pass lint with no errors; warnings remain. Actual APK checks pass
+current SDK byte identity, native and ZIP 16 KiB alignment, notices, manual
+routing and qualification isolation. Independent outcome review is clear. A
+separate direct ZIP/signing-block inspection verifies the Release APK is unsigned;
+the inherited app verifier alone does not establish that. No phone was installed
+or tested. Evidence is under
+`target/privacy-standby/recording-native-extent-android-app-v1/`; the prior
+`recording-checkpoint-android-app-v1/` run remains retained.
 The earlier End/shutdown gate remains retained under
 `target/v4v-end-shutdown-v2/app-gates/gate-v1/`.
 

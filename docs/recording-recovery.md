@@ -112,18 +112,20 @@ power loss, physical devices or sustained shows.
 
 ## Fresh registered matrix result
 
-A fresh source-bound run completes all five A/V and ten audio-only/short-prefix
+The current source-bound run completes all five A/V and ten audio-only/short-prefix
 cases and passes the separately registered numerical contract. Nine complete
 comparisons satisfy all 17 mandatory hard checks. Seven native PCM arrays are
-byte-identical; the mono A/V control and the 96,193-frame audio-only control each
-differ at 22 Int16 positions, with a maximum difference of one unit. Exact packet
-retention, rational timestamps, presentation counts, independent valid PCM and
-applicable positive seeks pass.
+byte-identical. The mono A/V control differs at 11 Int16 positions and the
+96,192-frame audio-only control at 10 positions, each by at most one unit. The
+96,193-frame control is byte-identical in this run. Exact packet retention,
+rational timestamps, presentation counts, independent valid PCM and applicable
+positive seeks pass.
 
 Both original strict suite aggregates remain failed, with their original child
 exit codes preserved. The 18-frame resampled recording passes its separate tiny
 positive seek; the original fixed half-second seek remains failed. Earlier
-failed runs are unchanged. These results do not establish the cause of native
+failed runs are unchanged. The previous V3 run's two 22-position differences
+remain recorded separately. These results do not establish the cause of native
 read variation.
 
 Both actual process-killed A/V prefixes retain only pre-death sealed coverage
@@ -136,14 +138,17 @@ remain unobserved.
 Three actual generated-file extraction negatives detect a changed AAC payload,
 a truncated box and a one-tick audio decode-time change. These are extraction
 checks, not mutant-decoder or full-gate qualification. Independent review verifies
-the retained 352 command-log hashes, source/package bindings, results and cleanup.
+the retained 352 command-log hashes, current source/package bindings, results
+and cleanup. All fixtures, cases, strict predicates and registered numerical
+oracles remain unchanged from V3; only source/package evidence was rebound.
 Generated media and owned compiler scratch were removed. Source and scalar
 evidence remain under
-`target/privacy-standby/generated-recording-qualification-v3/`.
+`target/privacy-standby/generated-recording-qualification-v4/`; V3 is retained.
 
-This completes the registered generated presentation prerequisite. App recorder
-migration, synchronised checkpoint installation, durable orphan recovery, the
-aggregate two-second loss bound and physical acceptance remain open.
+This refreshes the registered generated presentation prerequisite. App recorder
+migration, durable orphan recovery, the aggregate two-second loss bound and
+physical acceptance remain open. The host checkpoint and closed-header storage
+composition below has separate evidence.
 
 ## Portable checkpoint SDK
 
@@ -170,15 +175,20 @@ its file identity, hash the actual fragment region and complete its own storage
 operations. No additional encoder, media queue or per-unit sample validation is
 introduced by this SDK change.
 
-The current source passes 700 workspace tests, strict Clippy and formatting,
-generated-stream smoke checks, four scalar seed replays and 522,636 ASan/overflow
-fuzz executions. Actual generated Swift and Kotlin host consumers pass frontier,
-hash, successor, foreign-owner and retained-token checks. These results qualify
+The current source passes 708 workspace tests, strict Clippy and formatting,
+generated-stream smoke checks and actual generated Swift/Kotlin consumers. Four
+workspace tests remain ignored by that default command. The unchanged bounded
+checkpoint parser previously passed four scalar seed replays and 522,636
+ASan/overflow fuzz executions. Host consumers cover frontier, hash, successor,
+foreign-owner, retained-token and exact presentation-query checks. These results qualify
 the SDK API and bounded parser; they do not establish installed recovery or the
 two-second loss bound. Evidence is retained under
 `target/recording-checkpoint-gates-v1/`,
 `target/privacy-standby/recording-checkpoint-fuzz-v1/` and
-`target/privacy-standby/recording-checkpoint-native-check/`.
+`target/privacy-standby/recording-checkpoint-native-check/`. The current extent
+API and refreshed packages are recorded under
+`target/privacy-standby/recording-native-extent-gates-v2/` and
+`recording-native-extent-packages-v1/`.
 
 The refreshed Apple SDK package passes all three release slices and its
 installed Swift host consumer. The Android SDK package passes all four ABIs,
@@ -186,6 +196,14 @@ actual 16 KiB ELF load alignment and its extracted-AAR Kotlin host consumer.
 Both retain unchanged source bindings and verified package contents. Package
 and host checks do not establish a rebuilt app, phone installation or physical
 recording acceptance.
+
+The immutable issued checkpoint also exposes a cold `presentationExtent()` query
+in Swift and Kotlin. It uses the same shared Rust construction and movie-duration
+calculation as native headers, returning exact ticks in the 720,000 Hz clock and
+checked ceiling milliseconds. Old tokens remain valid after advance, finish and
+cancel; the query takes no current muxer lock. Its AAC EOF bit does not certify
+upstream admission, a written file or whole-show completion. Untrimmed diagnostic
+`stats.durationMs` is not finalised presentation duration.
 
 ## iOS append-file owner
 
@@ -200,13 +218,14 @@ checking the actual position and expected end before writing. Partial writes
 close admission and preserve their bytes. A confirmed incomplete close can
 release the lease; uncertain closure or receipt installation retains the exact
 owner and root flock. Dropping the caller's wrapper cannot release an open file.
-There is no offset-zero rewrite or finalised-recording operation on this path.
+The first append-only packet had no offset-zero rewrite or finalised-recording
+operation. Its later submitted-input header installation is described below.
 
 Admission charges six directory entries and an additional 256 KiB of metadata
 headroom within the existing caps. Available bytes come from the retained root
 descriptor. This is a conservative preflight, not a disk-space reservation.
 
-The actual host gate passes 71 recording lifecycle tests, 38 library tests and
+That first host gate passed 71 recording lifecycle tests, 38 library tests and
 the strict iOS 16 API check across all 67 app source files. The initial run
 reported three failures across two replacement-file tests: their fixtures had
 0644 permissions and reached the permission guard before the intended
@@ -223,7 +242,7 @@ remain open.
 
 ## iOS checkpoint installation
 
-The prefix-only SDK/file composition now installs two alternating, bounded
+The initial SDK/file composition installed two alternating, bounded
 checkpoint slots. One operation owns fragment append, media sync, exclusive
 temporary-slot write/sync/checked close, anchored rename, directory sync and
 exact bounded readback. It checks actual file incarnations throughout. Unexpected
@@ -238,7 +257,7 @@ readback close can produce the filesystem receipt used for scalar publication;
 cancellation is checked again before publication. No Swift checkpoint parser,
 additional encoder or media queue is introduced.
 
-The actual host gate passes 80 filesystem tests, 38 library tests, nine real-SDK
+Its first host gate passed 80 filesystem tests, 38 library tests, nine real-SDK
 filesystem tests and the strict iOS 16 API check across all 68 app source files.
 The SDK tests use synthetic audio bytes and scalar receipts as API controls;
 they do not establish native AAC timing or decoder presentation. Their driver
@@ -253,11 +272,71 @@ Source and scalar evidence remain under
 `target/privacy-standby/ios-recording-checkpoint-owner-source-v2/` and
 `ios-recording-checkpoint-owner-gates-v2/`.
 
-FINAL_HEADER remains bounded deferred metadata. Even a checkpoint with complete
-audio EOF closes as an explicitly incomplete file; normal final-header
-installation is a separate checked closed-file operation. Neither app recorder
-has adopted this composition. Crash recovery, physical storage qualification
-and the aggregate two-second loss bound remain open.
+At that stage FINAL_HEADER remained deferred and every file closed as incomplete.
+The following operation adds checked header installation. Neither app recorder
+has adopted this composition by default. Crash recovery, physical storage
+qualification and the aggregate two-second loss bound remain open.
+
+## iOS submitted-input finalisation
+
+The concrete owner can now finish only the SDK inputs it actually accepted.
+It retains the latest successfully installed real issued token, captures actual
+finish/drain/statistics before native cleanup, checks exact checkpoint/header
+and accepted-sample coverage, then queries shared presentation duration once.
+There is no caller-supplied upstream-complete flag or fabricated producer proof.
+Every current result is scoped to submitted SDK inputs, with application admission
+unknown and an explicitly incomplete catalogue receipt, even at complete AAC EOF.
+
+The same append owner, catalogue lease and root flock remain held through actual
+append descriptor close, anchored reopen of the same file, fixed-length offset-zero
+header replacement, media sync/readback/checked close and canonical receipt
+installation/readback/checked close. Only then is the original lease released.
+Fragment bytes and offsets stay fixed. An uncertain descriptor close or partial
+terminal transaction retains the exact owner and original files; it cannot
+silently retry a recycled descriptor or report completion. Cancellation before
+the checked-header-close commit decision is recorded; later cancellation allows
+that already-authorised storage commit to finish.
+
+An interrupted header overwrite can invalidate the current INITIAL hash without
+changing the committed fragment region. Future explicit recovery must use the
+saved checkpoint header, concrete root/file birth binding and exact fragment
+hash, treating the current header as advisory. This operation does not implement
+recovery or adopt orphan slots.
+
+The current host gate passes 86 filesystem tests, 38 library tests, 16 real-SDK
+filesystem/API tests and the strict iOS 16 check of all 68 app source files.
+Synthetic SDK payloads and scalar EOF controls establish storage/API behaviour;
+they are separate from native AAC and decoding evidence. The first run's SDK
+test compile failure is retained: an XCTest assertion inferred a throwing syscall
+callback. The reviewed test-only nonthrowing helper preserves all three refusal
+assertions; production code is unchanged. Evidence is under
+`target/privacy-standby/ios-recording-normal-finish-gates-v1/` and
+`ios-recording-normal-finish-gates-v2/`.
+
+## Native AAC generation receipts
+
+`NativeAudioEncoder` now has an explicit full-generation receipt mode; legacy
+callbacks remain the default. Full mode forwards its existing measured generation
+and file receipts, including raw and silence counts within the same converter
+generation. It never reconstructs those counts from the legacy total-input event.
+No extra encoder, per-unit validation, payload copy or queue is introduced.
+
+Fourteen actual generated-PCM/native-AAC cases pass strict compilation and shared
+SDK acceptance, covering raw 48 kHz/44.1 kHz, initial silence, same-generation
+Resume, multiple generations, empty input, sticky failures and default legacy
+controls. The mixed-source case measures 20,017 silence and 16,039 raw frames in
+one generation. These tests do not decode audio or inject a native converter EOF
+fault. The unchanged existing audio-only and standby decoder/recording gates also
+pass against this source and current package, with all 82 command logs verified.
+Their declared 1,024-frame decoder settling guard and original strict assertions
+remain unchanged. Evidence is under
+`target/privacy-standby/ios-native-aac-full-receipts-gates-v1/` and the source-bound
+`target/ios-audio-only-fixture/` and `target/ios-audio-standby-fixture/` runs.
+
+The real app producer/ingress/recording closure chain, synchronous known-loss
+accounting, SDK recorder migration and physical Stop qualification remain open.
+The submitted-input result cannot substitute for those barriers or the aggregate
+two-second loss requirement.
 
 ## Implementation order
 
