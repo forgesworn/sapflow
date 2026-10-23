@@ -188,16 +188,27 @@ internal class RecordingCheckpointStorage private constructor(
     }
     fun checkCapacity() = operation { currentCapacity() }
 
+    /** Cold preparation from the actual appended descriptor frontier. This is
+     * not installed progress and cannot authorise recovery or later mutation. */
+    fun prepareCheckpoint(sequence: Long): ExpectedCheckpoint = operation {
+        val expected = expectedCheckpoint(sequence)
+        checkAdmission()
+        expected
+    }
+    private fun expectedCheckpoint(sequence: Long): ExpectedCheckpoint {
+        check(initialLength > 0 && regionBytes > 0 && sequence in 1..0xffff_ffffL &&
+            sequence == (installed?.expected?.sequence ?: 0L) + 1) { "Checkpoint sequence is not the next frontier" }
+        currentCapacity()
+        return ExpectedCheckpoint(sequence, offset, regionBytes, initialLength, initialHash,
+            prefixDigest(), recordingBinding, sourceFileBinding)
+    }
+
     /** Cold envelope validation is mandatory before mutation AND after readback.
      * This hook must be supplied by the future SDK token owner, not AU callbacks. */
     fun installCheckpoint(sequence: Long, bytes: ByteArray,
         validate: (ByteArray, ExpectedCheckpoint) -> Unit): InstalledCheckpoint = operation {
         require(bytes.size in MIN_CHECKPOINT..MAX_CHECKPOINT)
-        check(initialLength > 0 && regionBytes > 0 && sequence in 1..0xffff_ffffL &&
-            sequence == (installed?.expected?.sequence ?: 0L) + 1) { "Checkpoint sequence is not the next frontier" }
-        currentCapacity()
-        val expected = ExpectedCheckpoint(sequence, offset, regionBytes, initialLength, initialHash,
-            prefixDigest(), recordingBinding, sourceFileBinding)
+        val expected = expectedCheckpoint(sequence)
         val stable = bytes.copyOf() // Bounded checkpoint metadata only.
         val metadataHash = digest(stable)
         validate(stable, expected)

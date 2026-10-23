@@ -141,11 +141,12 @@ internal class RecordingCatalogue(directory: Path) {
         } finally { Files.deleteIfExists(temporary) }
     }
 
-    private class ProcessOwner(val label: String) { var channel: FileChannel? = null; @Volatile var closeFailed = false; var lockKey: String? = null; var retainedResource: Any? = null }
+    private class ProcessOwner(val label: String) { var channel: FileChannel? = null; @Volatile var closeFailed = false; var lockKey: String? = null; var retainedResource: Any? = null; @Volatile var compoundOwner: Any? = null }
     private class Lease(val channel: FileChannel, val lock: FileLock, private val key: String, private val process: ProcessOwner) : AutoCloseable {
         private var closeFailure: Exception? = null
         @Volatile private var closedReceipt = false
         val cleanupComplete: Boolean get() = closedReceipt
+        fun retainCompound(owner: Any) { process.compoundOwner = owner }
         fun markUncertain(resource: Any? = null) { process.closeFailed = true; if (resource != null) process.retainedResource = resource }
         @Synchronized override fun close() {
             if (closedReceipt) return
@@ -241,12 +242,13 @@ internal class RecordingCatalogue(directory: Path) {
             check(!Files.exists(path(identity.segmentId), NOFOLLOW_LINKS) && !Files.exists(receiptPath(identity.segmentId), NOFOLLOW_LINKS)) { "Recording identity already exists" }
             val receipt = Receipt(identity, "writing", createdAtMs, null, null)
             writeReceipt(receipt)
-            return Writer(identity, createdAtMs, { held.close() }, { held.cleanupComplete }, { held.markUncertain(it) })
+            return Writer(identity, createdAtMs, { held.close() }, { held.cleanupComplete }, { held.markUncertain(it) }, { held.retainCompound(it) })
         } catch (error: Exception) { held.close(); throw error }
     }
 
     inner class Writer internal constructor(identity: Identity, createdAtMs: Long,
-        private val release: () -> Unit, private val released: () -> Boolean, private val uncertain: (Any?) -> Unit) {
+        private val release: () -> Unit, private val released: () -> Boolean, private val uncertain: (Any?) -> Unit,
+        private val retainCompound: (Any) -> Unit) {
         private val receipt = Receipt(identity, "writing", createdAtMs, null, null)
         private val terminal = AtomicReference(Terminal.WRITING)
         private val compound = AtomicBoolean(false)
@@ -259,11 +261,15 @@ internal class RecordingCatalogue(directory: Path) {
         /** Optional cold child of THIS writer lease. The current recorder does
          * not call this; no independent reserve owner or worker is introduced. */
         internal fun checkpointStorage(
+            retainedOwner: Any? = null,
             factory: (Path, (Any) -> Unit) -> RecordingCheckpointStorage.Root = { path, retain -> AndroidRecordingStorageIO.open(path, retain) },
         ): RecordingCheckpointStorage {
             synchronized(compoundGuard) {
                 check(terminal.get() == Terminal.WRITING && compound.compareAndSet(false, true))
             }
+            // Root the actual compound SDK/file owner in this EXISTING lease.
+            // Separate unknown-FD retention remains independent and unchanged.
+            retainedOwner?.let(retainCompound)
             var io: RecordingCheckpointStorage.Root? = null
             var transferred = false
             try {
