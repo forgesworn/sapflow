@@ -1033,12 +1033,37 @@ alignment. Archive readback verifies the generated APIs, original APIs and
 unchanged dependency notices. Earlier same-version packages remain preserved
 as historical evidence.
 
-These are current-source package and host-consumer results. Existing Android
-app APKs still use the earlier SDK. Neither app has adopted the programme mode;
-actual Android programme calls, native paired presentation and concrete
-producer/file ownership remain next. No physical or performance acceptance
-follows. The cold-start failures above and original presentation contract remain
-unchanged.
+The subsequent full Android app gate rebuilds Debug, Qualification and Release
+with the current W2 AAR and exact ARM64 SDK bytes. It executes 660 Debug tests in
+72 suites, 650 Qualification tests in 71 suites and all 36 Python verifier tests,
+with no failures, errors or skips. All three APK, lint and isolation checks pass;
+archive readback also verifies native/ZIP 16 KiB alignment, notices, QR decoding
+and manual routing. Release remains structurally unsigned; Debug and
+Qualification retain their standard debug signing configuration. This replaces
+the earlier APKs' SDK dependency, without adopting the programme recording mode.
+
+The separate native REFERENCE phase replays retained generated AAC and creates
+no encoder. The first cold source's 258.189 ms failure remains failed and is not
+replayed. For the three eligible sources, full native MP4 sample tables retain
+original packet payloads/order on a 48,000 Hz clock with 1,024-frame durations.
+These are post-EOF laboratory observations, not a live callback clock policy.
+Nine fresh native decoders export whole PCM through genuine EOS without cropping.
+
+Selected baseline and derived head/tail requests produce identical whole PCM
+within each pair: 5,120 frames for each short case and 50,176 for the long case,
+rather than the 2,765 or 48,000 programme frames. All selected native containers
+rebase their coded start to zero and contain no edits; the corresponding full
+reference starts that selected range at 8,192. Requested native trim and the
+same-clock paired control are therefore unsupported for this tested API 35
+muxer/extractor/decoder profile. This is not a universal Android verdict or paired
+SDK presentation qualification.
+
+The native owners, owned emulator group and exact temporary directory close in
+the completed reference run. The preceding stat setup failure and its separate
+cleanup addendum remain retained. No Android programme method has executed, and
+neither app has adopted the programme mode. Concrete producer/file ownership,
+paired presentation, physical and performance acceptance remain open. The cold
+failures and original numerical presentation contract are unchanged.
 
 Private outcome evidence:
 
@@ -1073,6 +1098,18 @@ Private outcome evidence:
   `target/privacy-standby/recording-programme-w2-packages-v1/apple-build.local.json`,
   `android-build.local.json` and `artifact-verification.local.json`. The source
   map and build context retain the exact package build HEAD and code commit.
+- Full Android W3 app gates with current SDK bytes:
+  `target/privacy-standby/android-native-aac-window-integration-gates-v3/run-20261023T182226Z-f5ad4669/receipt.local.json`,
+  with sibling `artifact-verification.local.json` and
+  `independent-outcome-review.local.json`.
+- Native generated reference execution and independent byte/outcome readback:
+  `target/privacy-standby/android-native-aac-window-qualification-v1/actual-reference-v3/receipt.local.json`,
+  with siblings `independent-native-byte-readback.local.json` and
+  `independent-outcome-review.local.json`; pure inspection is at
+  `target/privacy-standby/android-native-aac-window-qualification-v1/inspection-reference-v3/receipt.local.json`.
+- Retained reference setup failure:
+  `target/privacy-standby/android-native-aac-window-qualification-v1/actual-reference-v2/receipt.local.json`
+  and its separate `root-cleanup-addendum-v1.local.json`.
 
 ## Implementation order
 
