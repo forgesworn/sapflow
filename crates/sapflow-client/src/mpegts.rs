@@ -319,6 +319,18 @@ impl MpegTsMuxer {
         if end - start > self.config.max_sample_duration.as_nanos() as u64 {
             return Err(MuxError::SampleTooLong);
         }
+        // A keyframe after a gap longer than the clock allows (a publishing
+        // queue that dropped its backlog) starts a discontinuity instead of
+        // failing the connection; anything else after such a gap still fails.
+        if sample.is_keyframe()
+            && (sample.is_video() || self.config.video.is_none())
+            && self.clock_last.is_some_and(|last| {
+                rescale(timing.dts(), timing.timescale()).saturating_sub(last)
+                    > duration_ticks(self.config.max_clock_gap)
+            })
+        {
+            self.reset(self.config.clone())?;
+        }
         let video = sample.is_video();
         let previous = if video {
             self.video_end
