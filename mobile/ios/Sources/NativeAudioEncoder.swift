@@ -20,6 +20,8 @@ final class NativeAudioEncoder {
     private let output: (CompressedUnit) -> Void
     private let meter: (Float) -> Void
     private let recordingTiming: ((AudioRecordingTiming.Event) -> Void)?
+    enum ReceiptMode { case legacy, fullGenerationLedger }
+    private let receiptMode: ReceiptMode
     typealias InputToken = AudioRecordingTiming.InputToken
     struct StandbyPlan {
         let additionalSourceFrames: UInt64
@@ -60,12 +62,13 @@ final class NativeAudioEncoder {
             nativeLeadingFrames: generationLeading, failed: terminalError != nil, finished: closed)
     }
 
-    init(output: @escaping (CompressedUnit) -> Void, meter: @escaping (Float) -> Void, recordingTiming: ((AudioRecordingTiming.Event) -> Void)? = nil) throws {
+    init(receiptMode: ReceiptMode = .legacy, output: @escaping (CompressedUnit) -> Void, meter: @escaping (Float) -> Void, recordingTiming: ((AudioRecordingTiming.Event) -> Void)? = nil) throws {
         guard let format = AVAudioFormat(settings: [AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 96_000]) else {
             throw CaptureFailure(message: "Native AAC-LC format is unavailable")
         }
         outputFormat = format; self.output = output; self.meter = meter; self.recordingTiming = recordingTiming
+        self.receiptMode = receiptMode
     }
 
     /// Cold construction diagnostics only. Scalar format facts contain no PCM,
@@ -306,7 +309,7 @@ final class NativeAudioEncoder {
             let mapped = receipt.sourceExtent.map { String(describing: $0) } ?? "unavailable"
             throw CaptureFailure(message: "Native AAC EOF accounting was rejected (\(error)); sourceMapping=\(receipt.sourceMapping),sourceExtent=\(mapped),attempted=\(receipt)")
         }
-        if hasTransitions { recordingTiming?(.generationEnded(receipt)) }
+        if receiptMode == .fullGenerationLedger || hasTransitions { recordingTiming?(.generationEnded(receipt)) }
     }
     private func retireConverter() {
         converter = nil; compressedBuffer = nil; nativeToken = nil; generationLeading = nil
@@ -321,7 +324,7 @@ final class NativeAudioEncoder {
             try self.endGeneration()
             guard !self.timingFinished, let extent = self.ledger.extent else { return }
             self.timingFinished = true
-            if self.hasTransitions { self.recordingTiming?(.endedGenerations(extent)) }
+            if self.receiptMode == .fullGenerationLedger || self.hasTransitions { self.recordingTiming?(.endedGenerations(extent)) }
             else if let last = self.ledger.last {
                 self.recordingTiming?(.ended(.init(inputFrames: last.inputFrames, inputRate: last.inputRate,
                     encodedFrames: extent.encodedFrames, leadingFrames: extent.leadingFrames, trailingFrames: extent.trailingFrames,

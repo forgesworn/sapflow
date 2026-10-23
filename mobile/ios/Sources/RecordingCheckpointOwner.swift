@@ -2,8 +2,8 @@ import Foundation
 import CryptoKit
 import Sapflow
 
-/// Prefix-only SDK/file compound owner. No encoder, queue, capture or normal Stop
-/// adoption. Every SDK/hasher/file operation shares the same non-reentrant guard.
+/// SDK/file compound owner scoped only to submitted SDK inputs. No capture or
+/// normal Stop adoption. Every SDK/hasher/file operation shares one busy guard.
 final class RecordingCheckpointOwner {
     enum Failure: Error, Equatable { case busy, closed, context, sequence, finalHeader }
     struct Frontier: Equatable {
@@ -28,9 +28,15 @@ final class RecordingCheckpointOwner {
     private var regionBytes: UInt64 = 0
     private var installed: DecodedRecordingCheckpoint?
     private var deferredFinalHeader: Data?
-    private var nativeFinished = false
+    private var nativeFinishOutcome: NativeRecordingCompletion?
+    private var installedToken: NativeRecordingCheckpoint?
+    private var installedReceipt: RecordingCatalogue.AppendWriter.InstalledMetadataReceipt?
+    private var outputDrainedAfterFinish = false
+    private var earlierFailure = false
+    private var cancelRequested = false
+    private var storedInputsResult: StoredInputsClosure?
     private let lock = NSLock()
-    private enum Phase { case active, closing, retained, closed }
+    private enum Phase { case active, closing, committing, retained, closed }
     private var phase = Phase.active
     private var busy = false
     private var admissionClosed = false
@@ -66,11 +72,11 @@ final class RecordingCheckpointOwner {
     }
     var frontier: Frontier? { lock.lock(); defer { lock.unlock() }; return progress }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return phase == .closed }
-    /// No final-header installer exists in this packet, even at checked AAC EOF.
+    /// App admission/drain evidence does not yet exist, even at checked AAC EOF.
     var normalStopAvailable: Bool { false }
     /// Scalar fencing only, safe during a held real filesystem/native operation.
     func cancel() {
-        lock.lock(); admissionClosed = true; lock.unlock()
+        lock.lock(); admissionClosed = true; cancelRequested = true; lock.unlock()
         file.cancel()
     }
     func beginAudio(firstLeadingFrames: UInt32) throws {
@@ -91,9 +97,95 @@ final class RecordingCheckpointOwner {
     /// FINAL_HEADER remains bounded deferred metadata, with no offset-zero IO.
     func finishPrefix(outcome: NativeRecordingCompletion) throws {
         try perform {
-            guard !nativeFinished else { throw Failure.closed }
+            guard nativeFinishOutcome == nil else { throw Failure.closed }
             try muxer.finishNative(outcome: outcome)
-            try drain(); nativeFinished = true
+            nativeFinishOutcome = outcome
+            try drain()
+        }
+    }
+    enum StoredInputsScope: Equatable { case submittedSDKInputsOnly }
+    enum ApplicationAdmission: Equatable { case unknown }
+    struct StoredInputsClosure {
+        let scope: StoredInputsScope
+        let applicationAdmission: ApplicationAdmission
+        let sdkOutcome: NativeRecordingCompletion
+        let bytes: UInt64
+        let movieTimescale: UInt32
+        let durationTicks: UInt64
+        let durationMsCeil: UInt64
+        let completeAudioEOF: Bool
+        let cancelledBeforeCommit: Bool
+        fileprivate init(outcome: NativeRecordingCompletion, bytes: UInt64,
+                         extent: NativeRecordingPresentationExtent, cancelledBeforeCommit: Bool) {
+            scope = .submittedSDKInputsOnly; applicationAdmission = .unknown; sdkOutcome = outcome
+            self.bytes = bytes; movieTimescale = extent.movieTimescale; durationTicks = extent.durationTicks
+            durationMsCeil = extent.durationMsCeil; completeAudioEOF = extent.completeAudioEof
+            self.cancelledBeforeCommit = cancelledBeforeCommit
+        }
+    }
+    /// Complete only the inputs this private SDK owner actually accepted.
+    /// There is NO app/capture admission proof parameter or finalised branch.
+    /// Even checked native EOF and installed FINAL_HEADER yield incomplete.
+    func finishStoredInputs(outcome: NativeRecordingCompletion = .incompletePrefix) throws -> StoredInputsClosure {
+        lock.lock()
+        if let storedInputsResult {
+            lock.unlock()
+            guard storedInputsResult.sdkOutcome == outcome else { throw Failure.closed }
+            return storedInputsResult
+        }
+        guard phase == .active, !admissionClosed else { lock.unlock(); throw Failure.closed }
+        guard !busy else { lock.unlock(); throw Failure.busy }
+        busy = true; lock.unlock()
+        var terminalBegan = false
+        defer { lock.lock(); busy = false; lock.unlock() }
+        do {
+            if let previous = nativeFinishOutcome {
+                guard previous == outcome else { throw Failure.closed }
+            } else {
+                try muxer.finishNative(outcome: outcome)
+                nativeFinishOutcome = outcome // Preserve the actual successful call.
+            }
+            try drain()
+            guard let initial, let installed, let token = installedToken,
+                  let installedReceipt, let header = deferredFinalHeader,
+                  outputDrainedAfterFinish, !earlierFailure else { throw Failure.context }
+            let info = installed.info(), facts = token.facts(), stats = try muxer.stats()
+            let (accepted, overflow) = facts.audioUnits.addingReportingOverflow(facts.videoUnits)
+            guard !overflow, facts == info.facts, stats.finished, stats.bufferedSamples == 0,
+                  stats.bufferedBytes == 0, stats.queuedOutputBytes == 0,
+                  stats.acceptedSamples == accepted, stats.fragments == UInt64(facts.sequence),
+                  UInt64(header.count) == initial.bytes, header == installed.header(),
+                  installedReceipt.sequence == facts.sequence, installedReceipt.end == info.committedOffset else { throw Failure.context }
+            let extent = try token.presentationExtent() // Once, on exact installed token.
+            guard extent.movieTimescale == 720_000, extent.completeAudioEof == facts.completeAudioEof,
+                  let duration = Int64(exactly: extent.durationMsCeil),
+                  outcome != .complete || facts.completeAudioEof else { throw Failure.context }
+            try requireAdmission()
+            lock.lock(); phase = .closing; admissionClosed = true; lock.unlock(); terminalBegan = true
+            // Capture actual finish/drain/stats BEFORE cancellation clears state.
+            try muxer.cancel()
+            var cancelledBeforeCommit = false
+            let closed = try file.finishStoredInputs(header: header, durationMs: duration, checkpoint: installedReceipt) {
+                self.lock.lock()
+                guard self.phase == .closing, self.busy else { self.lock.unlock(); throw Failure.closed }
+                cancelledBeforeCommit = self.cancelRequested
+                self.phase = .committing; self.lock.unlock()
+                // No scalar success/publication here. Header close has returned,
+                // but receipt IO and every actual metadata close are still due.
+            }
+            let result = StoredInputsClosure(outcome: outcome, bytes: closed.bytes,
+                extent: extent, cancelledBeforeCommit: cancelledBeforeCommit)
+            // Drop Rust objects outside the scalar lock, after actual file close.
+            installedToken = nil; self.installedReceipt = nil
+            lock.lock(); storedInputsResult = result; phase = .closed
+            let retained = retainedSelf; retainedSelf = nil; lock.unlock()
+            withExtendedLifetime(retained) {}
+            return result
+        } catch {
+            earlierFailure = true
+            lock.lock(); admissionClosed = true
+            if terminalBegan { phase = .retained; retainedSelf = self }
+            lock.unlock(); file.cancel(); throw error
         }
     }
     private func perform<T>(_ body: () throws -> T) throws -> T {
@@ -104,6 +196,7 @@ final class RecordingCheckpointOwner {
         defer { lock.lock(); busy = false; lock.unlock() }
         do { return try body() }
         catch {
+            earlierFailure = true
             lock.lock(); admissionClosed = true; lock.unlock()
             file.cancel(); throw error
         }
@@ -115,7 +208,10 @@ final class RecordingCheckpointOwner {
     private func drain() throws {
         while true {
             try requireAdmission()
-            guard let chunk = try muxer.takeNativeOutput() else { return }
+            guard let chunk = try muxer.takeNativeOutput() else {
+                if nativeFinishOutcome != nil { outputDrainedAfterFinish = true }
+                return
+            }
             switch chunk.kind {
             case .initial:
                 guard initial == nil, chunk.checkpoint == nil else { throw Failure.context }
@@ -159,6 +255,7 @@ final class RecordingCheckpointOwner {
                 // Guard still covers these worker-only fields; ARC dropping an
                 // older Rust object occurs OUTSIDE the scalar publication lock.
                 regionHasher = preview; regionBytes = nextRegion; installed = readback
+                installedToken = token; installedReceipt = receipt
                 let next = Frontier(owner: owner, sequence: info.facts.sequence, fileEnd: end,
                     fragmentBytes: nextRegion, audioUnits: info.facts.audioUnits, videoUnits: info.facts.videoUnits,
                     audioContainerEnd: info.facts.audioContainerEnd, videoEnd: info.facts.videoEnd,
@@ -169,8 +266,8 @@ final class RecordingCheckpointOwner {
             case .finalHeader:
                 guard let initial, chunk.checkpoint == nil, deferredFinalHeader == nil,
                       chunk.bytes.count == Int(initial.bytes), chunk.bytes.count <= 65_536 else { throw Failure.finalHeader }
-                // Intentionally uninstalled prefix-only metadata. Do not append,
-                // hash, rewrite offset zero, advance sequence or mark finalised.
+                // Remains deferred until explicit submitted-input storage finish.
+                // Never append/hash this header or advance fragment sequence.
                 deferredFinalHeader = chunk.bytes
             }
         }

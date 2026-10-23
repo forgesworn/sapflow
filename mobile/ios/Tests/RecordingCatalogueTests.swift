@@ -1219,4 +1219,242 @@ final class RecordingCatalogueTests: XCTestCase {
         }
         _ = try a.closeIncomplete(); _ = try b.closeIncomplete()
     }
+    private func storedInputsFixture(_ catalogue: RecordingCatalogue) throws -> (RecordingCatalogue.Identity, RecordingCatalogue.AppendWriter, RecordingCatalogue.AppendWriter.InstalledMetadataReceipt) {
+        let identity = try appendIdentity(catalogue), owner = try catalogue.beginAppend(identity: identity, payloadLimit: 1024)
+        let initial = try owner.writeInitial(Data([9, 8, 7, 6]))
+        let receipt = try owner.appendCheckpointFragment(Data([1]), expectedEnd: 5, sequence: 1,
+            checkpointBytes: Data(repeating: 3, count: 545), initialLength: UInt32(initial.bytes), initialHash: initial.sha256,
+            expectedBindings: owner.bindings(), validateInstalled: { _ in })
+        return (identity, owner, receipt)
+    }
+    private func privateStat(_ path: URL) throws -> stat {
+        var value = stat()
+        guard lstat(path.path, &value) == 0 else { throw RecordingCatalogue.Failure.io }
+        XCTAssertEqual(value.st_mode & S_IFMT, S_IFREG); XCTAssertEqual(value.st_mode & 0o777, 0o600)
+        XCTAssertEqual(value.st_uid, getuid()); XCTAssertEqual(value.st_nlink, 1)
+        XCTAssertGreaterThan(value.st_ino, 0); XCTAssertGreaterThan(value.st_birthtimespec.tv_sec, 0)
+        return value
+    }
+    func testStoredInputsActualAppendClosePrecedesFixedHeaderAndReleaseFollowsAllCloses() throws {
+        var armed = false, closes = 0, writes = 0, committed = false
+        var store: RecordingCatalogue?
+        let io = RecordingCatalogue.MediaUpdateIO(write: { fd, buffer, count, offset in
+            if armed {
+                XCTAssertEqual(closes, 1); XCTAssertTrue(store?.cleanupRetained == true); writes += 1
+                if writes == 1 { errno = EINTR; return -1 }
+            }
+            return Darwin.pwrite(fd, buffer, min(count, 2), offset)
+        }, synchronize: Darwin.fsync)
+        let root = directory(), catalogue = try RecordingCatalogue(root: root, mediaUpdateIO: io, appendIO: appendIO(), closeFileDescriptor: { fd in
+            if armed { closes += 1; XCTAssertTrue(store?.cleanupRetained == true) }
+            return Darwin.close(fd)
+        })
+        store = catalogue; defer { armed = false; try? catalogue.close() }
+        let (identity, owner, checkpoint) = try storedInputsFixture(catalogue)
+        let sourceBefore = try owner.bindings(), mediaURL = root.appendingPathComponent(identity.filename)
+        let before = try privateStat(mediaURL)
+        armed = true
+        let result = try owner.finishStoredInputs(header: Data([4, 3, 2, 1]), durationMs: 1, checkpoint: checkpoint) {
+            XCTAssertEqual(closes, 2); XCTAssertFalse(owner.cleanupComplete)
+            self.assertFailure(.busy) { try catalogue.close() }
+            self.assertFailure(.closed) { _ = try owner.appendFragment(Data([7]), expectedEnd: 6) }
+            committed = true
+        }
+        armed = false
+        XCTAssertEqual(closes, 4); XCTAssertEqual(writes, 3); XCTAssertTrue(committed)
+        XCTAssertEqual(result.bytes, 5); XCTAssertEqual(result.durationMs, 1)
+        XCTAssertTrue(owner.cleanupComplete); XCTAssertFalse(catalogue.cleanupRetained)
+        XCTAssertEqual(try Data(contentsOf: mediaURL), Data([4, 3, 2, 1, 1]))
+        let after = try privateStat(mediaURL)
+        XCTAssertEqual(before.st_ino, after.st_ino)
+        XCTAssertEqual(before.st_birthtimespec.tv_sec, after.st_birthtimespec.tv_sec)
+        let data = try Data(contentsOf: root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.json"))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["state"] as? String, "incomplete"); XCTAssertNotNil(object["file"]); XCTAssertNotNil(object["appendSource"])
+        let entry = try XCTUnwrap(catalogue.scan().first)
+        XCTAssertEqual(entry.state, .incomplete); XCTAssertEqual(entry.durationMs, 1)
+        let rootStat = try directoryStat(root)
+        let afterBindings = try RecordingCatalogue.AppendSource(rootDevice: rootStat.st_dev,
+            rootInode: rootStat.st_ino, device: after.st_dev, inode: after.st_ino,
+            birthSeconds: Int64(after.st_birthtimespec.tv_sec), birthNanoseconds: Int64(after.st_birthtimespec.tv_nsec)).bindings(identity: identity)
+        XCTAssertEqual(sourceBefore, afterBindings)
+        XCTAssertEqual(try owner.finishStoredInputs(header: Data([4, 3, 2, 1]), durationMs: 1, checkpoint: checkpoint, willCommit: {}).bytes, 5)
+    }
+    private func directoryStat(_ root: URL) throws -> stat {
+        var value = stat(); guard lstat(root.path, &value) == 0 else { throw RecordingCatalogue.Failure.io }; return value
+    }
+    func testStoredInputsUnknownActualClosesNeverRetryOrReleaseRecycledDescriptor() throws {
+        for failAt in 1...4 {
+            let root = directory("stored-close\(failAt)")
+            var armed = false, closes = 0, writes = 0, recycled: Int32 = -1
+            let io = RecordingCatalogue.MediaUpdateIO(write: { fd, bytes, count, offset in
+                writes += 1; return Darwin.pwrite(fd, bytes, count, offset)
+            }, synchronize: Darwin.fsync)
+            let catalogue = try RecordingCatalogue(root: root, mediaUpdateIO: io, appendIO: appendIO(), closeFileDescriptor: { fd in
+                if armed {
+                    closes += 1
+                    if closes == failAt {
+                        XCTAssertEqual(Darwin.close(fd), 0); recycled = Darwin.open("/dev/null", O_RDONLY | O_CLOEXEC)
+                        XCTAssertEqual(recycled, fd); errno = EIO; return -1
+                    }
+                }
+                return Darwin.close(fd)
+            })
+            defer { if recycled >= 0 { XCTAssertEqual(Darwin.close(recycled), 0) } }
+            let (identity, owner, receipt) = try storedInputsFixture(catalogue)
+            let stable = root.appendingPathComponent("Sapflow-\(identity.segmentID).checkpoint.1"), saved = try Data(contentsOf: stable)
+            armed = true
+            XCTAssertThrowsError(try owner.finishStoredInputs(header: Data([4, 3, 2, 1]), durationMs: 1, checkpoint: receipt, willCommit: {}))
+            XCTAssertEqual(closes, failAt); XCTAssertEqual(writes, failAt == 1 ? 0 : 1)
+            XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupUncertain)
+            assertFailure(.closed) { _ = try owner.closeIncomplete() }
+            XCTAssertEqual(closes, failAt); XCTAssertGreaterThanOrEqual(fcntl(recycled, F_GETFD), 0)
+            XCTAssertEqual(try Data(contentsOf: stable), saved)
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(identity.filename)).suffix(1), Data([1]))
+            assertFailure(.busy) { _ = try RecordingCatalogue(root: root) }
+        }
+    }
+    func testStoredInputsHeaderAndReceiptFailuresRetainOriginalSlotsAndFragmentRegion() throws {
+        for stage in ["partial", "header-sync", "header-read", "receipt-write", "receipt-sync", "rename", "directory-sync", "receipt-read", "commit"] {
+            var armed = false, headerWrites = 0, reads = 0
+            let io = RecordingCatalogue.MediaUpdateIO(write: { fd, buffer, count, offset in
+                headerWrites += 1
+                if armed && stage == "partial" {
+                    if headerWrites == 1 { return Darwin.pwrite(fd, buffer, 2, offset) }
+                    errno = EIO; return -1
+                }
+                return Darwin.pwrite(fd, buffer, count, offset)
+            }, synchronize: { fd in if armed && stage == "header-sync" { errno = EIO; return -1 }; return Darwin.fsync(fd) })
+            let metadata = RecordingCatalogue.CheckpointIO(write: { fd, buffer, count in
+                if armed && stage == "receipt-write" { errno = EIO; return -1 }; return Darwin.write(fd, buffer, count)
+            }, synchronize: { fd in if armed && stage == "receipt-sync" { errno = EIO; return -1 }; return Darwin.fsync(fd) },
+            rename: { fd, from, to in if armed && stage == "rename" { errno = EIO; return -1 }; return Darwin.renameat(fd, from, fd, to) },
+            synchronizeDirectory: { fd in if armed && stage == "directory-sync" { errno = EIO; return -1 }; return Darwin.fsync(fd) },
+            read: { fd, buffer, count in
+                if armed { reads += 1 }
+                let read = Darwin.read(fd, buffer, count)
+                if armed && read > 0 && ((stage == "header-read" && reads == 2) || (stage == "receipt-read" && reads == 3)) {
+                    buffer.storeBytes(of: UInt8(255), as: UInt8.self)
+                }
+                return read
+            })
+            let root = directory("stored-failure-" + stage), catalogue = try RecordingCatalogue(root: root, mediaUpdateIO: io, appendIO: appendIO(), checkpointIO: metadata)
+            let (identity, owner, receipt) = try storedInputsFixture(catalogue)
+            let stable = root.appendingPathComponent("Sapflow-\(identity.segmentID).checkpoint.1"), slot = try Data(contentsOf: stable)
+            armed = true
+            XCTAssertThrowsError(try owner.finishStoredInputs(header: Data([4, 3, 2, 1]), durationMs: 1, checkpoint: receipt, willCommit: {
+                if stage == "commit" { throw RecordingCatalogue.Failure.cancelled }
+            }), stage)
+            XCTAssertTrue(catalogue.cleanupUncertain); XCTAssertFalse(owner.cleanupComplete)
+            XCTAssertEqual(try Data(contentsOf: stable), slot)
+            let actual = try Data(contentsOf: root.appendingPathComponent(identity.filename))
+            XCTAssertEqual(actual.count, 5); XCTAssertEqual(actual.suffix(1), Data([1]))
+            if stage == "partial" { XCTAssertEqual(actual, Data([4, 3, 7, 6, 1])) }
+            assertFailure(.closed) { _ = try owner.closeIncomplete() }
+        }
+    }
+    func testStoredInputsPreflightRefusalsNeverWriteOffsetZero() throws {
+        for kind in ["length", "duration", "initial", "slot", "temp", "foreign"] {
+            var writes = 0
+            let io = RecordingCatalogue.MediaUpdateIO(write: { fd, bytes, count, offset in writes += 1; return Darwin.pwrite(fd, bytes, count, offset) }, synchronize: Darwin.fsync)
+            let root = directory("stored-preflight-" + kind), catalogue = try RecordingCatalogue(root: root, mediaUpdateIO: io, appendIO: appendIO())
+            let (identity, owner, receipt) = try storedInputsFixture(catalogue)
+            let mediaURL = root.appendingPathComponent(identity.filename)
+            var expected = Data([9, 8, 7, 6, 1]), header = Data([4, 3, 2, 1]), duration: Int64 = 1
+            var proof = receipt
+            var foreign: RecordingCatalogue?, foreignOwner: RecordingCatalogue.AppendWriter?
+            if kind == "length" { header = Data([4]) }
+            if kind == "duration" { duration = -1 }
+            if kind == "initial" {
+                let fd = Darwin.open(mediaURL.path, O_WRONLY | O_NOFOLLOW | O_CLOEXEC); XCTAssertGreaterThanOrEqual(fd, 0)
+                var byte: UInt8 = 77; XCTAssertEqual(Darwin.pwrite(fd, &byte, 1, 0), 1); XCTAssertEqual(Darwin.close(fd), 0)
+                expected[0] = 77
+            }
+            if kind == "slot" {
+                let path = root.appendingPathComponent("Sapflow-\(identity.segmentID).checkpoint.1")
+                try FileManager.default.moveItem(at: path, to: root.appendingPathComponent("preserved-slot"))
+                try Data(repeating: 88, count: 545).write(to: path, options: .withoutOverwriting); XCTAssertEqual(chmod(path.path, 0o600), 0)
+                _ = try privateStat(path)
+            }
+            if kind == "temp" {
+                let path = root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.tmp")
+                try Data([88]).write(to: path, options: .withoutOverwriting); XCTAssertEqual(chmod(path.path, 0o600), 0); _ = try privateStat(path)
+            }
+            if kind == "foreign" {
+                let other = try RecordingCatalogue(root: directory("stored-foreign"), appendIO: appendIO())
+                let (_, child, token) = try storedInputsFixture(other); foreign = other; foreignOwner = child; proof = token
+            }
+            XCTAssertThrowsError(try owner.finishStoredInputs(header: header, durationMs: duration, checkpoint: proof, willCommit: { XCTFail("Preflight reached commit") }))
+            XCTAssertEqual(writes, 0); XCTAssertEqual(try Data(contentsOf: mediaURL), expected)
+            if kind == "slot" {
+                let path = root.appendingPathComponent("Sapflow-\(identity.segmentID).checkpoint.1")
+                XCTAssertEqual(try Data(contentsOf: path), Data(repeating: 88, count: 545))
+                XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("preserved-slot")), Data(repeating: 3, count: 545))
+                _ = try privateStat(path)
+            }
+            if kind == "temp" {
+                let path = root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.tmp")
+                XCTAssertEqual(try Data(contentsOf: path), Data([88])); _ = try privateStat(path)
+            }
+            XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupUncertain)
+            if let foreignOwner { _ = try foreignOwner.closeIncomplete() }; try foreign?.close()
+        }
+    }
+    func testStoredInputsSameModeReplacementAfterAppendCloseRefusesBeforeHeaderWrite() throws {
+        let root = directory(); var armed = false, replaced = false, writes = 0
+        var mediaURL: URL!, preservedURL: URL!
+        let io = RecordingCatalogue.MediaUpdateIO(write: { fd, bytes, count, offset in writes += 1; return Darwin.pwrite(fd, bytes, count, offset) }, synchronize: Darwin.fsync)
+        let catalogue = try RecordingCatalogue(root: root, mediaUpdateIO: io, appendIO: appendIO(), closeFileDescriptor: { fd in
+            let result = Darwin.close(fd)
+            if armed && !replaced {
+                replaced = true
+                do {
+                    try FileManager.default.moveItem(at: mediaURL, to: preservedURL)
+                    try Data([51, 52, 53, 54, 55]).write(to: mediaURL, options: .withoutOverwriting)
+                    XCTAssertEqual(chmod(mediaURL.path, 0o600), 0)
+                } catch { XCTFail("Replacement fixture failed: \(error)") }
+            }
+            return result
+        })
+        let (identity, owner, receipt) = try storedInputsFixture(catalogue)
+        mediaURL = root.appendingPathComponent(identity.filename); preservedURL = root.appendingPathComponent("preserved-media")
+        let original = try privateStat(mediaURL); armed = true
+        assertFailure(.changed) { _ = try owner.finishStoredInputs(header: Data([4, 3, 2, 1]), durationMs: 1, checkpoint: receipt, willCommit: {}) }
+        XCTAssertEqual(writes, 0); XCTAssertTrue(replaced)
+        XCTAssertEqual(try Data(contentsOf: preservedURL), Data([9, 8, 7, 6, 1]))
+        XCTAssertEqual(try Data(contentsOf: mediaURL), Data([51, 52, 53, 54, 55]))
+        XCTAssertEqual(try privateStat(preservedURL).st_ino, original.st_ino)
+        XCTAssertNotEqual(try privateStat(mediaURL).st_ino, original.st_ino)
+        XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupUncertain)
+    }
+    func testStoredInputsReceiptTempSubstitutionRefusesRenameAndPreservesForeignBytes() throws {
+        let root = directory(); var armed = false, closes = 0, renamed = false
+        var temporary: URL!, preserved: URL!
+        let metadata = RecordingCatalogue.CheckpointIO(write: { Darwin.write($0, $1, $2) }, synchronize: Darwin.fsync,
+            rename: { fd, from, to in if armed { renamed = true }; return Darwin.renameat(fd, from, fd, to) },
+            synchronizeDirectory: Darwin.fsync, read: { Darwin.read($0, $1, $2) })
+        let catalogue = try RecordingCatalogue(root: root, appendIO: appendIO(), checkpointIO: metadata, closeFileDescriptor: { fd in
+            let result = Darwin.close(fd)
+            if armed {
+                closes += 1
+                if closes == 3 {
+                    do {
+                        try FileManager.default.moveItem(at: temporary, to: preserved)
+                        try Data([99]).write(to: temporary, options: .withoutOverwriting); XCTAssertEqual(chmod(temporary.path, 0o600), 0)
+                    } catch { XCTFail("Temp replacement fixture failed: \(error)") }
+                }
+            }
+            return result
+        })
+        let (identity, owner, receipt) = try storedInputsFixture(catalogue)
+        temporary = root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.tmp"); preserved = root.appendingPathComponent("preserved-receipt-temp")
+        let receiptURL = root.appendingPathComponent("Sapflow-\(identity.segmentID).receipt.json"), originalReceipt = try Data(contentsOf: receiptURL)
+        armed = true
+        assertFailure(.changed) { _ = try owner.finishStoredInputs(header: Data([4, 3, 2, 1]), durationMs: 1, checkpoint: receipt, willCommit: {}) }
+        XCTAssertEqual(closes, 3); XCTAssertFalse(renamed)
+        XCTAssertEqual(try Data(contentsOf: temporary), Data([99])); _ = try privateStat(temporary)
+        XCTAssertGreaterThan(try Data(contentsOf: preserved).count, 1); _ = try privateStat(preserved)
+        XCTAssertEqual(try Data(contentsOf: receiptURL), originalReceipt)
+        XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupUncertain)
+    }
 }

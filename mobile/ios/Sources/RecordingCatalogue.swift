@@ -710,9 +710,158 @@ final class RecordingCatalogue {
                 }
             }
         }
+        /// Closed-header installation is still only submitted-input storage.
+        /// Every receipt in this path remains explicitly incomplete.
+        struct StoredInputsClosure { let bytes: UInt64; let durationMs: Int64 }
+        private var storedInputsResult: StoredInputsClosure?
+        func finishStoredInputs(header: Data, durationMs: Int64, checkpoint: InstalledMetadataReceipt,
+                                willCommit: () throws -> Void) throws -> StoredInputsClosure {
+            lock.lock()
+            if let storedInputsResult { lock.unlock(); return storedInputsResult }
+            guard phase == .open else { let active = phase == .closing; lock.unlock(); throw active ? Failure.busy : Failure.closed }
+            guard !busy else { lock.unlock(); throw Failure.busy }
+            phase = .closing; admissionClosed = true; busy = true; lock.unlock()
+            var headerFD: Int32?
+            defer { lock.lock(); busy = false; lock.unlock() }
+            do {
+                guard let initial, let source, durationMs >= 0,
+                      header.count == Int(initial.bytes), !header.isEmpty, header.count <= 65_536,
+                      checkpoint.owner == checkpointOwner, checkpoint.sequence == checkpointSequence,
+                      checkpoint.sequence > 0, checkpoint.end == appendedEnd else { throw Failure.ineligible }
+                let end = appendedEnd
+                _ = try inspect(expected: end); try checkSlots()
+                guard try catalogue.info(catalogue.root, temporaryName) == nil,
+                      try catalogue.info(catalogue.root, "Sapflow-\(identity.segmentID).checkpoint.tmp") == nil else { throw Failure.changed }
+                let receiptBefore = try catalogue.appendPath(catalogue.receiptName(identity))
+                guard let descriptor, catalogue.appendIO.synchronize(descriptor) == 0 else { throw Failure.io }
+                _ = try inspect(expected: end)
+                // A failed actual close must NEVER permit anchored reopen/pwrite.
+                self.descriptor = nil; try catalogue.closeFD(descriptor)
+                try checkClosedSource(end: end); try checkSlots()
+                let fd = openat(catalogue.root.fd, identity.filename, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+                guard fd >= 0 else { throw Failure.io }; headerFD = fd
+                let before = try catalogue.appendDescriptor(fd), path = try catalogue.appendPath(identity.filename)
+                guard before.source == source, path.source == source, before.file == path.file,
+                      UInt64(before.file.size) == end else { throw Failure.changed }
+                // Only this first in-process rewrite checks current INITIAL.
+                // Future explicit recovery uses the saved slot header instead.
+                guard Data(SHA256.hash(data: try readHeader(fd, count: header.count))) == initial.sha256 else { throw Failure.changed }
+                let ready = try catalogue.appendDescriptor(fd), readyPath = try catalogue.appendPath(identity.filename)
+                guard ready.source == source, readyPath.source == source,
+                      ready.file == before.file, readyPath.file == before.file else { throw Failure.changed }
+                try checkSlots()
+                try header.withUnsafeBytes { buffer in
+                    var offset = 0
+                    while offset < buffer.count {
+                        let remaining = buffer.count - offset
+                        let written = catalogue.mediaUpdateIO.write(fd, buffer.baseAddress!.advanced(by: offset), remaining, off_t(offset))
+                        if written < 0 && errno == EINTR { continue }
+                        guard written > 0, written <= remaining else { throw Failure.io }; offset += written
+                    }
+                }
+                guard catalogue.mediaUpdateIO.synchronize(fd) == 0,
+                      try readHeader(fd, count: header.count) == header else { throw Failure.io }
+                let installed = try catalogue.appendDescriptor(fd), installedPath = try catalogue.appendPath(identity.filename)
+                guard installed.source == source, installedPath.source == source, installed.file == installedPath.file,
+                      UInt64(installed.file.size) == end else { throw Failure.changed }
+                headerFD = nil; try catalogue.closeFD(fd)
+                try checkClosedSource(end: end)
+                guard try catalogue.appendPath(identity.filename).file == installed.file else { throw Failure.changed }
+                try checkSlots()
+                // Scalar decision only. No publication, SDK or IO in callback.
+                try willCommit()
+                try installStoredReceipt(Receipt(version: 1, identity: identity, state: "incomplete", createdAtMs: createdAtMs,
+                    durationMs: durationMs, file: installed.file, appendSource: source), previous: receiptBefore)
+                try checkClosedSource(end: end); try checkSlots()
+                guard try catalogue.appendPath(identity.filename).file == installed.file else { throw Failure.changed }
+                try catalogue.releaseAppend(token, child: self) // LAST fallible action.
+                let result = StoredInputsClosure(bytes: end, durationMs: durationMs)
+                lock.lock(); storedInputsResult = result; closedResult = ClosedAppend(bytes: end); phase = .closed; lock.unlock()
+                return result
+            } catch {
+                var problem = error
+                if let fd = headerFD { headerFD = nil; do { try catalogue.closeFD(fd) } catch { problem = error } }
+                if let fd = descriptor { descriptor = nil; do { try catalogue.closeFD(fd) } catch { problem = error } }
+                lock.lock(); phase = .retained; lock.unlock(); catalogue.poison(self); throw problem
+            }
+        }
+        private func readHeader(_ fd: Int32, count: Int) throws -> Data {
+            guard count > 0, count <= 65_536, lseek(fd, 0, SEEK_SET) == 0 else { throw Failure.io }
+            var bytes = Data(count: count)
+            try bytes.withUnsafeMutableBytes { buffer in
+                var offset = 0
+                while offset < count {
+                    let remaining = count - offset
+                    let read = catalogue.checkpointIO.read(fd, buffer.baseAddress!.advanced(by: offset), remaining)
+                    if read < 0 && errno == EINTR { continue }
+                    guard read > 0, read <= remaining else { throw Failure.io }; offset += read
+                }
+            }
+            return bytes
+        }
+        private func installStoredReceipt(_ receipt: Receipt, previous: (source: AppendSource, file: Fingerprint)) throws {
+            let bytes = try catalogue.encode(receipt), name = catalogue.receiptName(identity)
+            var temporaryFD: Int32?, readbackFD: Int32?
+            do {
+                try catalogue.check(catalogue.root)
+                let current = try catalogue.appendPath(name)
+                guard current.source == previous.source, current.file == previous.file,
+                      try catalogue.info(catalogue.root, temporaryName) == nil else { throw Failure.changed }
+                let fd = openat(catalogue.root.fd, temporaryName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                guard fd >= 0 else { throw Failure.io }; temporaryFD = fd
+                try bytes.withUnsafeBytes { buffer in
+                    var offset = 0
+                    while offset < buffer.count {
+                        let remaining = buffer.count - offset
+                        let written = catalogue.checkpointIO.write(fd, buffer.baseAddress!.advanced(by: offset), remaining)
+                        if written < 0 && errno == EINTR { continue }
+                        guard written > 0, written <= remaining else { throw Failure.io }; offset += written
+                    }
+                }
+                guard catalogue.checkpointIO.synchronize(fd) == 0 else { throw Failure.io }
+                let written = try catalogue.appendDescriptor(fd)
+                guard written.file.size == Int64(bytes.count) else { throw Failure.changed }
+                temporaryFD = nil; try catalogue.closeFD(fd)
+                let closedTemporary = try catalogue.appendPath(temporaryName), destination = try catalogue.appendPath(name)
+                guard closedTemporary.source == written.source, closedTemporary.file == written.file,
+                      destination.source == previous.source, destination.file == previous.file else { throw Failure.changed }
+                guard catalogue.checkpointIO.rename(catalogue.root.fd, temporaryName, name) == 0 else { throw Failure.io }
+                let renamed = try catalogue.appendPath(name)
+                guard renamed.source == written.source, renamed.file.size == Int64(bytes.count) else { throw Failure.changed }
+                guard catalogue.checkpointIO.synchronizeDirectory(catalogue.root.fd) == 0 else { throw Failure.io }
+                guard try catalogue.appendPath(name).file == renamed.file else { throw Failure.changed }
+                let readFD = openat(catalogue.root.fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                guard readFD >= 0 else { throw Failure.io }; readbackFD = readFD
+                guard try catalogue.appendDescriptor(readFD).source == written.source,
+                      try catalogue.descriptorInfo(readFD) == renamed.file else { throw Failure.changed }
+                var actual = Data(count: bytes.count)
+                try actual.withUnsafeMutableBytes { buffer in
+                    var offset = 0
+                    while offset < buffer.count {
+                        let remaining = buffer.count - offset
+                        let read = catalogue.checkpointIO.read(readFD, buffer.baseAddress!.advanced(by: offset), remaining)
+                        if read < 0 && errno == EINTR { continue }
+                        guard read > 0, read <= remaining else { throw Failure.io }; offset += read
+                    }
+                }
+                var suffix: UInt8 = 0
+                var extra: Int
+                repeat { extra = Darwin.read(readFD, &suffix, 1) } while extra < 0 && errno == EINTR
+                guard extra == 0, actual == bytes, catalogue.decode(actual, identity.segmentID) != nil,
+                      try catalogue.descriptorInfo(readFD) == renamed.file else { throw Failure.changed }
+                readbackFD = nil; try catalogue.closeFD(readFD)
+                let installed = try catalogue.appendPath(name)
+                guard installed.source == written.source, installed.file == renamed.file else { throw Failure.changed }
+            } catch {
+                var problem = error
+                if let fd = readbackFD { readbackFD = nil; do { try catalogue.closeFD(fd) } catch { problem = error } }
+                if let fd = temporaryFD { temporaryFD = nil; do { try catalogue.closeFD(fd) } catch { problem = error } }
+                throw problem // Fixed temp/originals and exact owner are preserved.
+            }
+        }
         /// A cancelled/failed append can only close as explicitly incomplete.
         /// All fallible work, including real close and receipt readback, precedes
-        /// token release. There is no offset-zero writer or finalised operation.
+        /// token release. This close does not rewrite a header or mark finalised.
         func closeIncomplete() throws -> ClosedAppend {
             lock.lock()
             if let closedResult { lock.unlock(); return closedResult }

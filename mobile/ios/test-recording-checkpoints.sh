@@ -29,7 +29,7 @@ shutil.rmtree(scratch)
 removed=not scratch.exists()
 logs={p.name:sha(p) for p in evidence.glob('*.log')}
 result={'passed':exit_code==0 and same and head_same and removed,'exit':exit_code,'sourceUnchanged':same,'headUnchangedDuringRun':head_same,
- 'taskOwnedScratchRemoved':removed,'logs':logs,'failure':problem,'expectedRealSdkTests':9,
+ 'taskOwnedScratchRemoved':removed,'logs':logs,'failure':problem,'expectedRealSdkTests':16,
  'scope':'Real shared SDK + generated-byte checkpoint installation/ownership only; no decoder/native AAC/device/recovery/normal Stop/2s proof.'}
 (evidence/'receipt.local.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result))
 if not result['passed']:raise SystemExit(1)
@@ -67,7 +67,7 @@ used=['mobile/ios/Sources/CaptureOrientation.swift','mobile/ios/Sources/CaptureP
 for name in used:inputs[name]=sha(root/name)
 value={'head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
  'hostWitnessSHA256':sha(witness),'appleReceiptSHA256':sha(apple),'proofs':{str(witness):sha(witness),str(apple):sha(apple)},'allInputs':inputs,
- 'hostRuntimeSHA256':inputs['target/debug/libsapflow_ffi.dylib'],'expectedRealSdkTests':9}
+ 'hostRuntimeSHA256':inputs['target/debug/libsapflow_ffi.dylib'],'expectedRealSdkTests':16}
 (evidence/'before.local.json').write_text(json.dumps(value,indent=2)+'\n')
 PY
 sapflow_developer="$(xcode-select -p)"
@@ -85,7 +85,7 @@ cat >> "$sapflow_scratch/main.swift" <<'SWIFT'
 let suite = XCTestSuite(name: "Real shared SDK checkpoint file ownership")
 suite.addTest(RecordingCheckpointOwnerTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 9, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 16, result.hasSucceeded else { exit(1) }
 SWIFT
 swiftc -swift-version 5 -warnings-as-errors -module-cache-path "$sapflow_scratch/modules" \
     -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \

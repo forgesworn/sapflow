@@ -217,4 +217,155 @@ final class RecordingCheckpointOwnerTests: XCTestCase {
         XCTAssertThrowsError(try catalogue.close()) { XCTAssertEqual($0 as? RecordingCatalogue.Failure, .busy) }
         XCTAssertFalse(next.cleanupComplete); _ = try next.closeIncomplete()
     }
+    /// Synthetic EOF scalar controls only; not actual encoder measurements.
+    private func complete(_ owner: RecordingCheckpointOwner, units: Int, tail: UInt32 = 0) throws {
+        let frames = UInt64(units * 1024), valid = frames - UInt64(tail)
+        try owner.generationEnded(NativeAudioGenerationReceipt(generation: 1, inputFrames: valid, rawFrames: valid,
+            zeroFrames: 0, inputRate: 48_000, encodedFrames: frames, leadingFrames: 0, trailingFrames: tail, sourceMapping: .nearest))
+        try owner.completeAudio(NativeAudioFileReceipt(generationCount: 1, sourceFramesAt48k: valid,
+            intentionalStandbyFrames: 0, encodedFrames: frames, firstLeadingFrames: 0, lastTrailingFrames: tail))
+    }
+    private func assertInstalledHeader(_ root: URL, _ identity: RecordingCatalogue.Identity) throws -> DecodedRecordingCheckpoint {
+        let checkpoint = try XCTUnwrap(slots(root, identity).last), info = checkpoint.info()
+        let physical = try Data(contentsOf: root.appendingPathComponent(identity.filename))
+        XCTAssertEqual(UInt64(physical.count), info.committedOffset)
+        XCTAssertEqual(Data(physical.prefix(Int(info.initialHeaderLen))), checkpoint.header())
+        XCTAssertEqual(Data(SHA256.hash(data: physical.dropFirst(Int(info.initialHeaderLen)))), info.fragmentRegionSha256)
+        return checkpoint
+    }
+    func testStoredCompleteInputsInstallRealFinalHeaderButKeepUnknownAppAdmissionIncomplete() throws {
+        let root = scratch.appendingPathComponent("recordings"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+        defer { try? catalogue.close() }
+        let (identity, owner) = try open(catalogue), codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+        try feed(owner, codec, 0..<1); try complete(owner, units: 1, tail: 1023)
+        let result = try owner.finishStoredInputs(outcome: .complete)
+        XCTAssertEqual(result.scope, .submittedSDKInputsOnly); XCTAssertEqual(result.applicationAdmission, .unknown)
+        XCTAssertEqual(result.sdkOutcome, .complete); XCTAssertEqual(result.movieTimescale, 720_000)
+        XCTAssertEqual(result.durationTicks, 15); XCTAssertEqual(result.durationMsCeil, 1)
+        XCTAssertTrue(result.completeAudioEOF); XCTAssertFalse(result.cancelledBeforeCommit)
+        XCTAssertTrue(owner.cleanupComplete); XCTAssertFalse(catalogue.cleanupRetained); XCTAssertFalse(owner.normalStopAvailable)
+        let checkpoint = try assertInstalledHeader(root, identity)
+        XCTAssertTrue(checkpoint.info().facts.completeAudioEof)
+        XCTAssertEqual(result.bytes, checkpoint.info().committedOffset)
+        let entry = try XCTUnwrap(catalogue.scan().first)
+        XCTAssertEqual(entry.state, .incomplete); XCTAssertEqual(entry.durationMs, 1)
+        XCTAssertEqual(try receiptState(root, identity), "incomplete")
+        let (_, successor) = try open(catalogue)
+        XCTAssertEqual(try owner.finishStoredInputs(outcome: .complete).bytes, result.bytes)
+        XCTAssertFalse(successor.cleanupComplete); XCTAssertThrowsError(try catalogue.close())
+        XCTAssertThrowsError(try owner.finishStoredInputs()) // Different actual outcome is not an idempotent repeat.
+        _ = try successor.closeIncomplete()
+    }
+    func testStoredInputsDefaultUsesIncompleteSDKOutcomeAndExactSavedHeader() throws {
+        let root = scratch.appendingPathComponent("recordings"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+        defer { try? catalogue.close() }
+        let (identity, owner) = try open(catalogue), codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+        try feed(owner, codec, 0..<12)
+        let result = try owner.finishStoredInputs()
+        XCTAssertEqual(result.sdkOutcome, .incompletePrefix); XCTAssertFalse(result.completeAudioEOF)
+        XCTAssertEqual(result.scope, .submittedSDKInputsOnly); XCTAssertEqual(result.applicationAdmission, .unknown)
+        XCTAssertEqual(result.durationTicks, 184_320); XCTAssertEqual(result.durationMsCeil, 256)
+        let checkpoint = try assertInstalledHeader(root, identity)
+        XCTAssertFalse(checkpoint.info().facts.completeAudioEof)
+        XCTAssertEqual(try receiptState(root, identity), "incomplete"); XCTAssertTrue(owner.cleanupComplete)
+    }
+    func testStoredInputsReuseActualPreviouslyFinishedOutcomeAndDrainEvidence() throws {
+        let root = scratch.appendingPathComponent("recordings"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+        defer { try? catalogue.close() }
+        let (identity, owner) = try open(catalogue), codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+        try feed(owner, codec, 0..<9); try complete(owner, units: 9, tail: 704)
+        try owner.finishPrefix(outcome: .complete)
+        let before = try XCTUnwrap(slots(root, identity).last).info()
+        let result = try owner.finishStoredInputs(outcome: .complete)
+        let checkpoint = try assertInstalledHeader(root, identity)
+        XCTAssertEqual(checkpoint.info(), before)
+        XCTAssertEqual(result.durationTicks, 127_680); XCTAssertEqual(result.durationMsCeil, 178)
+        XCTAssertTrue(result.completeAudioEOF); XCTAssertEqual(try receiptState(root, identity), "incomplete")
+    }
+    func testStoredInputsCancellationDuringHeaderWriteFencesCallsAndStillChecksCleanup() throws {
+        var heldOwner: RecordingCheckpointOwner?, attempted = false
+        var catalogue: RecordingCatalogue?
+        func requireRefusal(_ action: () throws -> Void) {
+            do { try action(); XCTFail("Concurrent operation must refuse the closing owner") }
+            catch { }
+        }
+        let io = RecordingCatalogue.MediaUpdateIO(write: { fd, bytes, count, offset in
+            if !attempted {
+                attempted = true
+                XCTAssertFalse(heldOwner?.cleanupComplete ?? true)
+                requireRefusal { _ = try heldOwner?.finishStoredInputs() }
+                requireRefusal { _ = try heldOwner?.closeIncomplete() }
+                requireRefusal { try catalogue?.close() }
+                heldOwner?.cancel()
+            }
+            return Darwin.pwrite(fd, bytes, count, offset)
+        }, synchronize: Darwin.fsync)
+        let root = scratch.appendingPathComponent("recordings"), store = try RecordingCatalogue(root: root, mediaUpdateIO: io, appendIO: appendIO())
+        catalogue = store; defer { try? store.close() }
+        let (identity, owner) = try open(store), codec = try MediaCodec.aac(asc: Data([0x11, 0x88])); heldOwner = owner
+        try feed(owner, codec, 0..<9)
+        let result = try owner.finishStoredInputs()
+        XCTAssertTrue(attempted); XCTAssertTrue(result.cancelledBeforeCommit)
+        XCTAssertTrue(owner.cleanupComplete); XCTAssertEqual(result.applicationAdmission, .unknown)
+        XCTAssertEqual(try receiptState(root, identity), "incomplete"); _ = try assertInstalledHeader(root, identity)
+        XCTAssertThrowsError(try owner.push(sample: sample(codec, 99)))
+    }
+    func testStoredInputsCancellationAfterCommitDecisionDoesNotRetroactivelyChangeClosedInputs() throws {
+        var heldOwner: RecordingCheckpointOwner?, armed = false, attempted = false
+        let metadata = RecordingCatalogue.CheckpointIO(write: { fd, bytes, count in
+            if armed && !attempted { attempted = true; heldOwner?.cancel(); XCTAssertFalse(heldOwner?.cleanupComplete ?? true) }
+            return Darwin.write(fd, bytes, count)
+        }, synchronize: Darwin.fsync, rename: { Darwin.renameat($0, $1, $0, $2) },
+        synchronizeDirectory: Darwin.fsync, read: { Darwin.read($0, $1, $2) })
+        let root = scratch.appendingPathComponent("recordings"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO(), checkpointIO: metadata)
+        defer { try? catalogue.close() }
+        let (identity, owner) = try open(catalogue), codec = try MediaCodec.aac(asc: Data([0x11, 0x88])); heldOwner = owner
+        try feed(owner, codec, 0..<9); try owner.finishPrefix(outcome: .incompletePrefix)
+        armed = true
+        let result = try owner.finishStoredInputs()
+        XCTAssertTrue(attempted); XCTAssertFalse(result.cancelledBeforeCommit)
+        XCTAssertTrue(owner.cleanupComplete); XCTAssertEqual(try receiptState(root, identity), "incomplete")
+        _ = try assertInstalledHeader(root, identity)
+    }
+    func testStoredInputsInterruptedInitialOverwritePreservesRealSavedHeaderAndExactFragmentAuthority() throws {
+        var writes = 0
+        let io = RecordingCatalogue.MediaUpdateIO(write: { fd, bytes, count, offset in
+            writes += 1
+            if writes == 1 { return Darwin.pwrite(fd, bytes, min(256, count - 1), offset) }
+            errno = EIO; return -1
+        }, synchronize: Darwin.fsync)
+        let root = scratch.appendingPathComponent("recordings"), catalogue = try RecordingCatalogue(root: root, mediaUpdateIO: io, appendIO: appendIO())
+        let (identity, owner) = try open(catalogue), codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+        try feed(owner, codec, 0..<9); try owner.finishPrefix(outcome: .incompletePrefix)
+        let saved = try XCTUnwrap(slots(root, identity).last), info = saved.info()
+        let mediaURL = root.appendingPathComponent(identity.filename), before = try Data(contentsOf: mediaURL)
+        let birthBindings = try bindings(root, identity)
+        XCTAssertThrowsError(try owner.finishStoredInputs())
+        XCTAssertEqual(writes, 2); XCTAssertFalse(owner.cleanupComplete); XCTAssertTrue(catalogue.cleanupUncertain)
+        XCTAssertThrowsError(try owner.closeIncomplete()); XCTAssertThrowsError(try catalogue.close())
+        let actual = try Data(contentsOf: mediaURL)
+        XCTAssertEqual(actual.count, before.count)
+        XCTAssertEqual(actual.dropFirst(Int(info.initialHeaderLen)), before.dropFirst(Int(info.initialHeaderLen)))
+        XCTAssertNotEqual(Data(SHA256.hash(data: actual.prefix(Int(info.initialHeaderLen)))), info.initialHeaderSha256)
+        XCTAssertEqual(Data(SHA256.hash(data: actual.dropFirst(Int(info.initialHeaderLen)))), info.fragmentRegionSha256)
+        XCTAssertEqual(try bindings(root, identity), birthBindings)
+        let stillSaved = try XCTUnwrap(slots(root, identity).last)
+        XCTAssertEqual(stillSaved.header(), saved.header()); XCTAssertEqual(stillSaved.info(), info)
+        XCTAssertEqual(try receiptState(root, identity), "writing")
+        // This proves recovery INPUTS survive partial rewrite, not that any
+        // recovery API/file is implemented or a current header can be trusted.
+    }
+    func testStoredInputsMissingEOFOrMissingInitialNeverManufacturesCompletion() throws {
+        for count in [0, 9] {
+            let root = scratch.appendingPathComponent("recordings-\(count)"), catalogue = try RecordingCatalogue(root: root, appendIO: appendIO())
+            defer { try? catalogue.close() }
+            let (identity, owner) = try open(catalogue), codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+            try feed(owner, codec, 0..<count)
+            XCTAssertThrowsError(try owner.finishStoredInputs(outcome: .complete))
+            XCTAssertFalse(owner.cleanupComplete); XCTAssertThrowsError(try owner.finishStoredInputs())
+            _ = try owner.closeIncomplete()
+            XCTAssertTrue(owner.cleanupComplete); XCTAssertEqual(try receiptState(root, identity), "incomplete")
+            XCTAssertFalse(owner.normalStopAvailable)
+        }
+    }
 }
