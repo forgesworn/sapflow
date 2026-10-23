@@ -42,6 +42,8 @@ struct Stats {
     window: Option<CollectionWindow>,
     excluded_requests: u64,
     excluded_errors: u64,
+    drained_requests: u64,
+    max_drain: Duration,
     playlist: Vec<Duration>,
     segment: Vec<Duration>,
     /// When each viewer finished each part, by part URI.
@@ -60,7 +62,7 @@ struct Stats {
     connections: HashSet<SocketAddr>,
 }
 
-/// Only requests wholly inside this fixed interval contribute to the report.
+/// Admit by request start; retain completions after the interval to avoid clipping tails.
 #[derive(Clone, Copy)]
 struct CollectionWindow {
     start: Instant,
@@ -68,8 +70,8 @@ struct CollectionWindow {
 }
 
 impl CollectionWindow {
-    fn contains(self, started: Instant, finished: Instant) -> bool {
-        started >= self.start && started <= finished && finished <= self.end
+    fn admits(self, started: Instant) -> bool {
+        started >= self.start && started < self.end
     }
 }
 
@@ -343,12 +345,16 @@ fn record_request(
     failure: Option<(&str, &str)>,
 ) -> bool {
     let mut st = lock(stats);
-    let measured = st
-        .window
-        .is_none_or(|window| window.contains(started, finished));
+    let measured = st.window.is_none_or(|window| window.admits(started));
     if measured {
         st.requests += 1;
         st.bytes += bytes;
+        if let Some(window) = st.window
+            && finished > window.end
+        {
+            st.drained_requests += 1;
+            st.max_drain = st.max_drain.max(finished.duration_since(window.end));
+        }
         if let Some(response) = response {
             note_response(&mut st, response);
         }
@@ -616,10 +622,15 @@ fn report(a: &Args, st: &Stats) {
         "viewers {}  measured {} s after a {} s ramp",
         a.viewers, a.secs, a.ramp
     );
-    println!("collection completed requests wholly within the fixed post-ramp window");
+    println!("collection requests started within the fixed post-ramp window, including drain");
     println!(
         "excluded requests {}  errors {}",
         st.excluded_requests, st.excluded_errors
+    );
+    println!(
+        "drained requests {} max {:.6} s",
+        st.drained_requests,
+        st.max_drain.as_secs_f64()
     );
     println!(
         "requests {}  errors {}  received {:.1} MB",
@@ -669,7 +680,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collection_excludes_ramp_boundary_and_late_requests_from_all_metrics() {
+    fn collection_excludes_ramp_and_post_deadline_starts_but_retains_slow_completions() {
         let start = Instant::now() + Duration::from_secs(10);
         let end = start + Duration::from_secs(60);
         let stats = Mutex::new(Stats {
@@ -689,10 +700,7 @@ mod tests {
                 start - Duration::from_millis(1),
                 start + Duration::from_millis(1),
             ),
-            (
-                end - Duration::from_millis(1),
-                end + Duration::from_millis(1),
-            ),
+            (end, end + Duration::from_millis(1)),
         ] {
             assert!(!record_request(
                 &stats,
@@ -711,9 +719,50 @@ mod tests {
             200,
             None
         ));
+        assert!(record_request(
+            &stats,
+            end - Duration::from_millis(1),
+            end + Duration::from_secs(2),
+            Some(&response),
+            100,
+            None
+        ));
         let st = lock(&stats);
-        assert_eq!((st.requests, st.bytes, st.excluded_requests), (1, 200, 3));
-        assert_eq!(protocols(&st), "HTTP/2 1");
+        assert_eq!((st.requests, st.bytes, st.excluded_requests), (2, 300, 3));
+        assert_eq!(
+            (st.drained_requests, st.max_drain),
+            (1, Duration::from_secs(2))
+        );
+        assert_eq!(protocols(&st), "HTTP/2 2");
+    }
+
+    #[test]
+    fn an_admitted_request_failing_after_the_window_is_a_measured_failure() {
+        let start = Instant::now();
+        let end = start + Duration::from_secs(1);
+        let stats = Mutex::new(Stats {
+            window: Some(CollectionWindow { start, end }),
+            ..Stats::default()
+        });
+        assert!(record_request(
+            &stats,
+            end - Duration::from_millis(1),
+            end + Duration::from_secs(1),
+            None,
+            0,
+            Some(("http://test/part.mp4", "body timeout"))
+        ));
+        let st = lock(&stats);
+        assert_eq!(
+            (
+                st.requests,
+                st.errors,
+                st.excluded_errors,
+                st.drained_requests
+            ),
+            (1, 1, 0, 1)
+        );
+        assert_eq!(st.error_kinds["part: body timeout"], 1);
     }
 
     #[test]

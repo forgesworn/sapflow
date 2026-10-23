@@ -40,13 +40,14 @@ def parse_report(output, expected_viewers):
     for block in output.split("--- ")[1:]:
         match = re.search(r"^(\w+), (\d+) viewers: server CPU ([\d.]+)%  peak RSS ([\d.]+) MB", block)
         counts = re.search(r"^requests (\d+)  errors (\d+)  received ([\d.]+) MB$", block, re.M)
-        collection = "collection completed requests wholly within the fixed post-ramp window" in block
+        collection = "collection requests started within the fixed post-ramp window, including drain" in block
         excluded = re.search(r"^excluded requests (\d+)  errors (\d+)$", block, re.M)
         sampling = re.search(r"^server sampling ([\d.]+) s target (\d+) s$", block, re.M)
+        drain = re.search(r"^drained requests (\d+) max ([\d.]+) s$", block, re.M)
         playlist = re.search(r"^playlist\s+n=(\d+)\s+p50 ([\d.]+) ms  p95 ([\d.]+) ms  p99 ([\d.]+) ms", block, re.M)
         segment = re.search(r"^segment\s+n=(\d+)\s+p50 ([\d.]+) ms  p95 ([\d.]+) ms  p99 ([\d.]+) ms", block, re.M)
         fanout = re.search(r"^part fan-out .*parts=(\d+) reach ([\d.]+)/\d+  p50 ([\d.]+) ms  p95 ([\d.]+) ms  max ([\d.]+) ms", block, re.M)
-        if not all((match, counts, playlist, segment, fanout, collection, excluded, sampling)):
+        if not all((match, counts, playlist, segment, fanout, collection, excluded, sampling, drain)):
             raise ValueError("incomplete benchmark output")
         if int(counts[1]) == 0 or any(int(m[1]) == 0 for m in (playlist, segment, fanout)):
             raise ValueError("no requests or media samples")
@@ -55,6 +56,7 @@ def parse_report(output, expected_viewers):
             requests=int(counts[1]), errors=int(counts[2]), received_mb=float(counts[3]),
             excluded_requests=int(excluded[1]), excluded_errors=int(excluded[2]),
             server_sample_seconds=float(sampling[1]),
+            drained_requests=int(drain[1]), max_drain_seconds=float(drain[2]),
             playlist_p99_ms=float(playlist[4]), segment_p99_ms=float(segment[4]),
             part_reach=float(fanout[2]), part_p50_ms=float(fanout[3]),
             part_p95_ms=float(fanout[4]), part_max_ms=float(fanout[5]),
@@ -72,11 +74,12 @@ def summary(runs):
     result = []
     for (variant, viewers), rows in sorted(groups.items()):
         record = dict(variant=variant, viewers=viewers, runs=len(rows))
-        for key in ("cpu_percent", "peak_rss_mb", "playlist_p99_ms", "segment_p99_ms", "part_p50_ms", "part_p95_ms", "part_max_ms"):
+        for key in ("cpu_percent", "peak_rss_mb", "playlist_p99_ms", "segment_p99_ms", "part_p50_ms", "part_p95_ms", "part_max_ms", "max_drain_seconds"):
             values = [row[key] for row in rows]
             record[key] = dict(median=statistics.median(values), minimum=min(values), maximum=max(values))
         record["requests"] = sum(row["requests"] for row in rows)
         record["errors"] = sum(row["errors"] for row in rows)
+        record["drained_requests"] = sum(row["drained_requests"] for row in rows)
         result.append(record)
     return result
 
@@ -162,7 +165,7 @@ def main():
         ffmpeg=command("ffmpeg", "-version").splitlines()[0], file_descriptor_limit=wanted,
         load_before=os.getloadavg(), measured_seconds=args.seconds, ramp_seconds=10,
         viewers=args.viewers, variants=args.variants, rounds=args.rounds,
-        collection="requests started and completed wholly inside a fixed post-ramp interval; excluded failures retained",
+        collection="requests started inside a fixed post-ramp interval, with bounded completion drain; warm-up failures retained",
         notes="Loopback HTTP/1.1; full media viewers; generated 720p30 H.264/AAC. Server and encoder/load generator share the host. RSS excludes kernel memory. Existing workloads remain running. Separate server and viewer builds avoid feature unification. No recording, TLS, WAN, phone, energy or thermal qualification.",
         runs=[],
     )
