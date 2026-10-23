@@ -21,7 +21,9 @@ class NativeAacQualificationActivity : Activity() {
         val view = TextView(this).apply { text = "Generated native AAC probe is dormant" }
         setContentView(view)
         val runId = intent.getStringExtra("runId")
-        if (intent.action != ACTION || intent.data != null || intent.clipData != null ||
+        val drainMode = intent.action == DRAIN_ACTION
+        val leadingMode = intent.action == LEADING_ACTION
+        if (intent.action !in setOf(ACTION, DRAIN_ACTION, LEADING_ACTION) || intent.data != null || intent.clipData != null ||
             intent.extras?.keySet() != setOf("runId", "generatedOnly") ||
             !intent.getBooleanExtra("generatedOnly", false) || runId == null ||
             !runId.matches(Regex("[a-f0-9]{32}")) || Build.HARDWARE !in setOf("ranchu", "goldfish")) {
@@ -32,7 +34,7 @@ class NativeAacQualificationActivity : Activity() {
             view.text = "Previous native owner is retained or still running"
             return
         }
-        val parent = File(filesDir, "native-aac-qualification")
+        val parent = File(filesDir, if (leadingMode) "native-aac-leading" else if (drainMode) "native-aac-drain" else "native-aac-qualification")
         if (!parent.exists()) check(parent.mkdir())
         check(parent.isDirectory && !Files.isSymbolicLink(parent.toPath()) && parent.canonicalFile.parentFile == filesDir.canonicalFile)
         val directory = File(parent, runId)
@@ -40,7 +42,8 @@ class NativeAacQualificationActivity : Activity() {
             view.text = "Preserve an earlier run; use a fresh runId"
             return
         }
-        val probe = NativeAacQualificationProbe(directory, cancelled)
+        val probe: Any = if (leadingMode) NativeAacLeadingProbe(directory, cancelled)
+            else NativeAacQualificationProbe(directory, cancelled, if (drainMode) NativeAacQualificationProbe.Mode.DRAIN_EXPERIMENTS else NativeAacQualificationProbe.Mode.ORIGINAL)
         if (!active.compareAndSet(null, probe)) {
             check(directory.delete()) // Only this newly created, still empty directory.
             view.text = "Previous native owner is retained or still running"
@@ -50,7 +53,11 @@ class NativeAacQualificationActivity : Activity() {
         worker = Thread({
             var confirmed = false
             try {
-                val result = probe.run().put("runId", runId)
+                val result = when (probe) {
+                    is NativeAacLeadingProbe -> probe.run()
+                    is NativeAacQualificationProbe -> probe.run()
+                    else -> error("Unsupported generated probe owner")
+                }.put("runId", runId)
                 confirmed = result.getBoolean("cleanupConfirmed")
                 File(directory, "receipt.json").writeText(result.toString(2) + "\n")
                 runOnUiThread { if (!isDestroyed) view.text = result.toString(2) }
@@ -75,6 +82,8 @@ class NativeAacQualificationActivity : Activity() {
 
     companion object {
         const val ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC"
-        private val active = AtomicReference<NativeAacQualificationProbe?>()
+        const val DRAIN_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_DRAIN"
+        const val LEADING_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_LEADING"
+        private val active = AtomicReference<Any?>()
     }
 }

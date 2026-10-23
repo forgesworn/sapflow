@@ -23,10 +23,21 @@ import java.util.concurrent.atomic.AtomicReference
  * copies below are outside capture. No microphone, camera, Rust sample/muxer,
  * timing authority or complete-AU assumption is used. Each case owns one real
  * encoder and its serial callback/index lifetime, never a mocked callback. */
-internal class NativeAacQualificationProbe(private val root: File, private val cancelled: AtomicBoolean) {
+internal class NativeAacQualificationProbe(private val root: File, private val cancelled: AtomicBoolean,
+                                           private val mode: Mode = Mode.ORIGINAL) {
+    enum class Mode { ORIGINAL, DRAIN_EXPERIMENTS }
     private data class Case(val name: String, val raw: IntArray, val zero: IntArray,
-                            val originUs: Long = 0, val omitInputEos: Boolean = false) {
-        val frames = raw.sum() + zero.sum()
+                            val originUs: Long = 0, val omitInputEos: Boolean = false,
+                            val blockPad: Boolean = false, val codecDrain: Int = 0,
+                            val eosOnLastNonempty: Boolean = false) {
+        val programmeFrames = raw.sum() + zero.sum()
+        val paddingFrames = if (blockPad) (1024 - programmeFrames % 1024) % 1024 else 0
+        val frames = programmeFrames + paddingFrames + codecDrain
+        init {
+            require(raw.size == zero.size && raw.all { it >= 0 } && zero.all { it >= 0 })
+            require(programmeFrames > 0 && frames < 64 * 1024 && codecDrain in 0..4096)
+            require(!(omitInputEos && eosOnLastNonempty))
+        }
         fun isZero(frame: Int): Boolean {
             var at = 0
             for (index in raw.indices) {
@@ -38,13 +49,24 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
             error("Generated source cursor exceeded its fixed plan")
         }
     }
-    private val cases = listOf(
+    private val originalCases = listOf(
         Case("raw-one-second", intArrayOf(48_000), intArrayOf(0)),
         Case("mixed-short", intArrayOf(700, 800, 17), intArrayOf(1024, 224, 0)),
         Case("generated-zero", intArrayOf(0), intArrayOf(9600)),
         Case("signed-origin", intArrayOf(4096), intArrayOf(0), -100_000),
         Case("missing-input-eos", intArrayOf(4096), intArrayOf(0), omitInputEos = true),
     )
+    private val cases: List<Case> = if (mode == Mode.ORIGINAL) originalCases else buildList {
+        for (short in listOf(false, true)) for (policy in 0..4) for (lastEos in listOf(false, true)) {
+            val programme = if (short) "mixed-short" else "raw-one-second"
+            val treatment = when (policy) { 0 -> "no-pad"; 1 -> "block-pad"; else -> "drain-${listOf(0, 0, 1024, 2048, 4096)[policy]}" }
+            val placement = if (lastEos) "last-nonempty-eos" else "empty-eos"
+            add(Case("$programme-$treatment-$placement",
+                if (short) intArrayOf(700, 800, 17) else intArrayOf(48_000),
+                if (short) intArrayOf(1024, 224, 0) else intArrayOf(0),
+                blockPad = policy > 0, codecDrain = listOf(0, 0, 1024, 2048, 4096)[policy], eosOnLastNonempty = lastEos))
+        }
+    }
     // Retained if native shutdown or owner-thread closure is unconfirmed.
     private var retained: NativeCase? = null
 
@@ -63,7 +85,8 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
             if (!cleanupConfirmed) break
             retained = null
         }
-        return JSONObject().put("schema", "generated-native-aac-observation-v1")
+        return JSONObject().put("schema", if (mode == Mode.ORIGINAL) "generated-native-aac-observation-v1" else "generated-native-aac-drain-experiment-v1")
+            .put("mode", mode.name)
             .put("generatedOnly", true).put("emulatorOnly", true).put("hardware", Build.HARDWARE)
             .put("sdk", Build.VERSION.SDK_INT).put("model", Build.MODEL).put("fingerprint", Build.FINGERPRINT)
             .put("cases", results).put("allCasesVisited", results.length() == cases.size)
@@ -83,6 +106,7 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
         private var source: FileOutputStream? = null
         private var rows: FileOutputStream? = null
         private var inputRows: FileOutputStream? = null
+        private var programmeSource: FileOutputStream? = null
         private val formats = JSONArray()
         private var codec: MediaCodec? = null
         private var muxer: MediaMuxer? = null
@@ -101,6 +125,8 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
         private var inputFrames = 0
         private var rawFrames = 0
         private var zeroFrames = 0
+        private var paddingFrames = 0
+        private var codecDrainFrames = 0
         private var inputBuffers = 0
         private var inputEos = false
         private var outputEos = false
@@ -124,6 +150,9 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
             problem.compareAndSet(null, error.javaClass.simpleName + ": " + error.message?.take(512))
             terminal.countDown(); sourceQueued.countDown()
         }
+        private fun shaRange(bytes: ByteArray, offset: Int, count: Int): String = MessageDigest.getInstance("SHA-256").apply {
+            update(bytes, offset, count)
+        }.digest().joinToString("") { "%02x".format(it) }
         private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
         fun run(): JSONObject {
@@ -136,12 +165,18 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                         source = FileOutputStream(File(directory, "source.s16le"))
                         rows = FileOutputStream(File(directory, "outputs.jsonl"))
                         inputRows = FileOutputStream(File(directory, "inputs.jsonl"))
+                        if (mode == Mode.DRAIN_EXPERIMENTS) programmeSource = FileOutputStream(File(directory, "programme.s16le"))
                         val native = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
                         codec = native; codecName = native.name
                         native.setCallback(this, handler)
                         AudioAacEncoderConfiguration.configure(native, 96_000)
                         formats.put(format("input-configured", native.inputFormat))
                         native.start(); codecStarted = true
+                        if (mode == Mode.DRAIN_EXPERIMENTS) {
+                            try { formats.put(format("input-after-start", native.inputFormat)) }
+                            catch (error: Exception) { formats.put(missingFormat("input-after-start", "READ_FAILED").put("reason", error.javaClass.simpleName)) }
+                            formats.put(vendorParameters(native))
+                        }
                     } catch (error: Exception) { fail(error) }
                 })
                 val remaining = { ((deadlineNs - System.nanoTime()) / 1_000_000).coerceAtLeast(1) }
@@ -161,7 +196,11 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
             }
             val observed = JSONObject().put("name", plan.name).put("generation", generation)
                 .put("codec", codecName).put("requestedProfile", "AAC-LC 48000Hz mono 96000bps max-input2048")
-                .put("inputOriginUs", plan.originUs).put("plannedFrames", plan.frames)
+                .put("inputOriginUs", plan.originUs).put("plannedFrames", plan.frames).put("plannedProgrammeFrames", plan.programmeFrames)
+                .put("plannedBlockPaddingFrames", plan.paddingFrames).put("plannedCodecDrainFrames", plan.codecDrain)
+                .put("programmeFrames", rawFrames + zeroFrames).put("blockPaddingFrames", paddingFrames).put("codecDrainFrames", codecDrainFrames)
+                .put("inputEosPlacement", if (plan.omitInputEos) "OMITTED" else if (plan.eosOnLastNonempty) "LAST_NONEMPTY" else "SEPARATE_EMPTY")
+                .put("nativeQueuedFramesConserved", inputFrames == rawFrames + zeroFrames + paddingFrames + codecDrainFrames)
                 .put("plannedRawFrames", plan.raw.sum()).put("plannedZeroFrames", plan.zero.sum())
                 .put("sourcePlan", JSONArray(plan.raw.indices.map { JSONObject().put("rawFrames", plan.raw[it]).put("zeroFrames", plan.zero[it]) }))
                 .put("inputFrames", inputFrames).put("rawFrames", rawFrames).put("zeroFrames", zeroFrames)
@@ -218,23 +257,37 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                 val frames = minOf(1024, plan.frames - inputFrames)
                 val bytes = ByteArray(frames * 2)
                 val pcm = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-                var raw = 0; var zero = 0
+                var raw = 0; var zero = 0; var padding = 0; var drain = 0
                 repeat(frames) { offset ->
                     val frame = inputFrames + offset
-                    if (plan.isZero(frame)) { pcm.putShort(0); zero++ }
-                    else { pcm.putShort(rawSample(frame)); raw++ }
+                    when {
+                        frame >= plan.programmeFrames + plan.paddingFrames -> { pcm.putShort(0); drain++ }
+                        frame >= plan.programmeFrames -> { pcm.putShort(0); padding++ }
+                        plan.isZero(frame) -> { pcm.putShort(0); zero++ }
+                        else -> { pcm.putShort(rawSample(frame)); raw++ }
+                    }
                 }
                 val buffer = checkNotNull(native.getInputBuffer(index))
                 check(buffer.capacity() >= 2048); buffer.clear(); buffer.put(bytes)
                 val pts = plan.originUs + inputFrames.toLong() * 1_000_000 / 48_000
-                native.queueInputBuffer(index, 0, bytes.size, pts, 0)
-                // These are successful native submissions, not requested/read frames.
-                inputFrames += frames; rawFrames += raw; zeroFrames += zero; inputBuffers++
+                val flags = if (plan.eosOnLastNonempty && inputFrames + frames == plan.frames) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+                native.queueInputBuffer(index, 0, bytes.size, pts, flags)
+                // Programme, alignment padding and codec drain are distinct
+                // successful native inputs. Drain never becomes show audio.
+                inputFrames += frames; rawFrames += raw; zeroFrames += zero
+                paddingFrames += padding; codecDrainFrames += drain; inputBuffers++
+                if (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) inputEos = true
                 checkNotNull(source).write(bytes)
+                programmeSource?.write(bytes, 0, (raw + zero) * 2)
                 val row = JSONObject().put("sequence", inputBuffers).put("type", "SOURCE")
                     .put("sourceByteOffset", (inputFrames - frames) * 2).put("frames", frames)
                     .put("rawFrames", raw).put("zeroFrames", zero).put("nativePtsUs", pts)
-                    .put("flags", 0).put("queueReturned", true).put("sourceSha256", sha(bytes))
+                    .put("flags", flags).put("queueReturned", true).put("sourceSha256", sha(bytes))
+                    .put("programmeByteOffset", (rawFrames + zeroFrames - raw - zero) * 2)
+                    .put("programmeFrames", raw + zero).put("blockPaddingFrames", padding).put("codecDrainFrames", drain)
+                    .put("programmeSha256", shaRange(bytes, 0, (raw + zero) * 2))
+                    .put("blockPaddingSha256", shaRange(bytes, (raw + zero) * 2, padding * 2))
+                    .put("codecDrainSha256", shaRange(bytes, (raw + zero + padding) * 2, drain * 2))
                 checkNotNull(inputRows).write((row.toString() + "\n").toByteArray(Charsets.UTF_8))
                 if (inputFrames == plan.frames) sourceQueued.countDown()
             } catch (error: Exception) { fail(error) }
@@ -265,11 +318,15 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
             val config = flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
             if (eos) {
                 outputEos = true
-                if (formats.length() < 4) {
+                if (formats.length() < (if (mode == Mode.DRAIN_EXPERIMENTS) 8 else 4)) {
                     if (Build.VERSION.SDK_INT >= 30) {
                         try { formats.put(format("output-eos", native.getOutputFormat(index))) }
                         catch (error: Exception) { formats.put(missingFormat("output-eos", "READ_FAILED").put("reason", error.javaClass.simpleName)) }
                     } else formats.put(missingFormat("output-eos", "API_UNAVAILABLE"))
+                }
+                if (mode == Mode.DRAIN_EXPERIMENTS && formats.length() < 8) {
+                    try { formats.put(format("input-at-output-eos", native.inputFormat)) }
+                    catch (error: Exception) { formats.put(missingFormat("input-at-output-eos", "READ_FAILED").put("reason", error.javaClass.simpleName)) }
                 }
             }
             val row = JSONObject().put("index", index).put("sequence", outputCallbacks)
@@ -369,7 +426,7 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                     if (control != null && !muxerCleanupUnconfirmed) try { control.release(); muxerReleaseReturned = true }
                     catch (error: Exception) { muxerCleanupUnconfirmed = true; controlCleanupIssue.set("CONTAINER_RELEASE_UNCONFIRMED"); fail(error) }
                     var closedStreams = true
-                    for (stream in listOfNotNull(outputs, source, rows, inputRows)) {
+                    for (stream in listOfNotNull(outputs, source, rows, inputRows, programmeSource)) {
                         try { stream.flush(); stream.fd.sync() } catch (error: Exception) { fail(error) }
                         try { stream.close() } catch (error: Exception) { closedStreams = false; fail(error) }
                     }
@@ -382,6 +439,26 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
             thread.quitSafely()
             try { thread.join(2000) } catch (_: InterruptedException) { return false }
             return !thread.isAlive && releaseReturned && !muxerCleanupUnconfirmed && (muxer == null || muxerReleaseReturned) && streamsClosed
+        }
+
+        /** Cold public API inventory only. No subscriptions/configuration or
+         * inferred latency authority is introduced into this experiment. */
+        private fun vendorParameters(native: MediaCodec): JSONObject {
+            val result = JSONObject().put("phase", "vendor-parameters-after-start").put("subscriptionsAttempted", false)
+            if (Build.VERSION.SDK_INT < 31) return result.put("state", "API_UNAVAILABLE")
+            return try {
+                val names = native.supportedVendorParameters
+                val descriptors = JSONArray()
+                for (name in names.take(16)) {
+                    val row = JSONObject().put("name", name.take(256)).put("nameTruncated", name.length > 256)
+                    if (name.length <= 256) try {
+                        val description = native.getParameterDescriptor(name)
+                        row.put("descriptorName", description?.name?.take(256) ?: JSONObject.NULL).put("type", description?.type ?: JSONObject.NULL)
+                    } catch (error: Exception) { row.put("state", "READ_FAILED").put("reason", error.javaClass.simpleName) }
+                    descriptors.put(row)
+                }
+                result.put("state", "OBSERVED").put("totalNames", names.size).put("truncated", names.size > 16).put("descriptors", descriptors)
+            } catch (error: Exception) { result.put("state", "READ_FAILED").put("reason", error.javaClass.simpleName) }
         }
 
         private fun missingFormat(phase: String, state: String): JSONObject = JSONObject()
