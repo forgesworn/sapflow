@@ -169,6 +169,20 @@ impl Callbacks {
     }
 }
 
+/// A queue without a publish-session scope: the legacy, global-publisher mode.
+#[cfg(test)]
+pub(crate) fn legacy_test_queue(capacity: usize) -> (Callbacks, mpsc::Receiver<Queued>) {
+    let (tx, rx) = mpsc::channel(capacity);
+    (
+        Callbacks {
+            tx: Some(tx),
+            scope: None,
+            recording: None,
+        },
+        rx,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn test_queue(
     scope: Arc<CallbackScope>,

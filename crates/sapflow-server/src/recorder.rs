@@ -356,12 +356,11 @@ async fn write(
         }
     }
     receipt.completed = true;
-    tracing::info!(file = %file_path.display(), secs = duration.as_secs_f64(), "recording finished");
-    // Legacy completion has no incomplete discriminator. Do not advertise a
-    // partial file as complete to an older consumer; scoped callbacks carry it.
-    if !complete && observation.is_none() {
-        return;
-    }
+    tracing::info!(file = %file_path.display(), secs = duration.as_secs_f64(), complete, "recording finished");
+    // Scoped callbacks say whether the file is complete (`recordingState`).
+    // The legacy event means only that the file is finished, as mediamtx's
+    // does: an encoder drop leaves a gap, and v4v still takes the file as the
+    // replay, judging it by its duration.
     callbacks.send(
         &path,
         StreamEvent::RecordSegmentComplete {
@@ -736,6 +735,40 @@ mod tests {
         assert_eq!(recorder.last_part(), Some(first_id));
         assert_eq!(scope.observations.recording_state(), "incomplete");
         assert_eq!(scope.observations.counts().recordings_finalised, 0);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_recording_with_a_gap_still_reports_it_finished() {
+        let scratch = ScopedScratch::new("legacy-gap");
+        let path = StreamPath::parse("live/event-a").expect("path");
+        let (callbacks, mut receiver) = crate::callback::legacy_test_queue(2);
+        let (sender, input) = mpsc::channel(2);
+        let (tracks, mut parts) = fixture_parts();
+        assert!(sender.try_send(Msg::Init(tracks)).is_ok());
+        assert!(sender.try_send(Msg::Part(parts.remove(0))).is_ok());
+        drop(sender);
+        // An SRT timeout or dropped packets mark the recording incomplete.
+        let incomplete = Arc::new(AtomicBool::new(true));
+        write(
+            scratch.0.clone(),
+            path,
+            input,
+            callbacks,
+            0,
+            None,
+            incomplete,
+        )
+        .await;
+        let queued = receiver.try_recv().expect("recordSegmentComplete");
+        let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
+        assert_eq!(body["event"], "recordSegmentComplete");
+        assert!(body.get("recordingState").is_none());
+        assert!(
+            std::fs::metadata(body["segmentPath"].as_str().expect("path"))
+                .expect("file")
+                .len()
+                > 0
+        );
     }
 
     #[tokio::test]
