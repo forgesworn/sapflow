@@ -77,6 +77,7 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
     }
 
     private inner class Case(private val seed: Int, private val programmeFrames: Int) {
+        private val caseConstructNs = System.nanoTime()
         private val directory = File(root, "seed-$seed-programme-$programmeFrames").apply { check(mkdir()) }
         private val encoder = Handle()
         private val decoder = Handle()
@@ -90,6 +91,16 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
         private var outputLog: FileOutputStream? = null
         private var prepPcmFile: FileOutputStream? = null
         private var decoderLog: FileOutputStream? = null
+        // Fixed scalar buckets only. No extra media/event queue or hot JSON trace.
+        private val timingNs = LongArray(11)
+        private val timingCalls = LongArray(11)
+        private val timingLabels = arrayOf("encoderSetup", "decoderSetup", "encoderQueue",
+            "encoderDequeue", "decoderQueue", "decoderDequeue", "shaAndHex", "fileExport",
+            "codecClosure", "anchorScoring", "formatSnapshot")
+        private var currentStage = "CASE_CONSTRUCT"
+        private var failureStage: String? = null
+        private var failureObservedNs = 0L
+        private var decoderPcmEncodingInterpretation = "UNOBSERVED"
         private val formats = JSONArray()
         private var codecName = "UNCREATED"
         private var decoderName = "UNCREATED"
@@ -135,22 +146,43 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
             }
         }
         private fun open(name: String) = FileOutputStream(File(directory, name)).also { streams.add(it) }
-        private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
-        private fun line(file: FileOutputStream?, value: JSONObject) = checkNotNull(file).write((value.toString() + "\n").toByteArray(Charsets.UTF_8))
+        private inline fun <T> timed(slot: Int, stage: String, operation: () -> T): T {
+            currentStage = stage
+            val began = System.nanoTime()
+            try { return operation() }
+            finally { timingNs[slot] += System.nanoTime() - began; timingCalls[slot]++ }
+        }
+        private fun sha(bytes: ByteArray): String = timed(6, "SHA256_AND_HEX") {
+            val hash = MessageDigest.getInstance("SHA-256").digest(bytes)
+            val chars = CharArray(hash.size * 2)
+            val digits = "0123456789abcdef"
+            for (i in hash.indices) {
+                val value = hash[i].toInt() and 255
+                chars[i * 2] = digits[value ushr 4]
+                chars[i * 2 + 1] = digits[value and 15]
+            }
+            String(chars)
+        }
+        private fun write(file: FileOutputStream?, bytes: ByteArray) = timed(7, "FILE_EXPORT") {
+            checkNotNull(file).write(bytes)
+        }
+        private fun line(file: FileOutputStream?, value: JSONObject) = write(file, (value.toString() + "\n").toByteArray(Charsets.UTF_8))
 
         fun run(): JSONObject {
+            val runEnteredNs = System.nanoTime()
             var failure: String? = null
+            var failureLocations: List<String> = emptyList()
             try {
                 live()
                 encoded = open("buffers.bin"); source = open("source.s16le"); programme = open("programme.s16le")
                 inputLog = open("inputs.jsonl"); outputLog = open("outputs.jsonl")
                 prepPcmFile = open("prep-native.s16le"); decoderLog = open("prep-decoder.jsonl")
                 encoder.createAttempted = true
-                val native = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                val native = timed(0, "ENCODER_CREATE") { MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC) }
                 encoder.codec = native; codecName = native.name
-                AudioAacEncoderConfiguration.configure(native, 96_000)
+                timed(0, "ENCODER_CONFIGURE") { AudioAacEncoderConfiguration.configure(native, 96_000) }
                 formats.put(format("encoder-input-configured", native.inputFormat))
-                encoder.startAttempted = true; native.start()
+                encoder.startAttempted = true; timed(0, "ENCODER_START") { native.start() }
                 formats.put(format("encoder-input-after-start", native.inputFormat))
                 while (!outputEos) {
                     live(); prepDeadline()
@@ -162,20 +194,36 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
                 formats.put(format("encoder-input-at-output-eos", native.inputFormat))
                 check(outputReleaseAttempts == outputReleaseReturned)
             } catch (error: Exception) {
+                failureObservedNs = System.nanoTime()
+                failureStage = currentStage
+                failureLocations = error.stackTrace.take(8).map { "${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})" }
                 failure = error.javaClass.simpleName + ": " + error.message?.take(512)
             }
-            val decoderClosed = decoder.close()
-            val encoderClosed = encoder.close()
+            val decoderClosed = timed(8, "FINAL_DECODER_CLOSE") { decoder.close() }
+            val encoderClosed = timed(8, "FINAL_ENCODER_CLOSE") { encoder.close() }
             if (!streamCloseAttempted) {
                 streamCloseAttempted = true
                 var all = true
                 for (stream in streams) try { stream.close() } catch (_: Exception) { all = false }
                 streamsClosed = all
             }
+            val caseClosedNs = System.nanoTime()
+            val timings = JSONObject()
+            for (i in timingLabels.indices) timings.put(timingLabels[i], JSONObject().put("calls", timingCalls[i]).put("wallNs", timingNs[i]))
             val cleanup = decoderClosed && encoderClosed && streamsClosed
             val result = JSONObject().put("name", directory.name).put("seed", seed)
                 .put("generatedOnly", true).put("cleanupConfirmed", cleanup)
-                .put("failure", failure ?: JSONObject.NULL).put("nativeAacQualified", false).put("sdkReceiptIssued", false)
+                .put("failure", failure ?: JSONObject.NULL).put("nativeAacQualified", false)
+                .put("failureStage", failureStage ?: JSONObject.NULL).put("failureObservedNs", failureObservedNs)
+                .put("failureLocations", JSONArray(failureLocations))
+                .put("caseConstructNs", caseConstructNs).put("runEnteredNs", runEnteredNs).put("caseClosedNs", caseClosedNs)
+                .put("wholeCaseOwnerWallNs", caseClosedNs - caseConstructNs)
+                .put("wholeCaseTimingMeaning", "CONSTRUCT_TO_CHECKED_CLOSE; FINAL_RECEIPT_SERIALISATION_EXCLUDED")
+                .put("constructUntilRunWallNs", runEnteredNs - caseConstructNs)
+                .put("setupUntilFirstPrepQueueWallNs", if (firstPrepQueueNs == 0L) JSONObject.NULL else firstPrepQueueNs - caseConstructNs)
+                .put("failureColdElapsedNs", if (failureObservedNs == 0L || firstPrepQueueNs == 0L) JSONObject.NULL else failureObservedNs - firstPrepQueueNs)
+                .put("operationTimings", timings).put("operationTimingsMeaning", "NESTED_WALL_BUCKETS_NOT_ADDITIVE; ALL_WORK_REMAINS_IN_ORIGINAL_BUDGET")
+                .put("decoderPcmEncodingInterpretation", decoderPcmEncodingInterpretation).put("sdkReceiptIssued", false)
                 .put("encoderName", codecName).put("decoderName", decoderName).put("formats", formats)
                 .put("sameEncoderAcrossStart", startIssued).put("encoderFlushOrRestartAttempted", false)
                 .put("preambleFrames", 8192).put("programmeFrames", programmeFrames).put("blockPaddingFrames", pad)
@@ -211,7 +259,7 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
         }
 
         private fun queueEncoder(native: MediaCodec) {
-            val index = native.dequeueInputBuffer(0)
+            val index = timed(2, "ENCODER_DEQUEUE_INPUT") { native.dequeueInputBuffer(0) }
             if (index < 0) return
             val limit = if (startIssued) totalInput else 8192
             if (inputCursor == limit && !startIssued) return // Not reached: caller only queues while below prep limit.
@@ -244,12 +292,12 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
             val pts = inputCursor.toLong() * 1_000_000 / 48_000
             val flags = if (inputCursor == totalInput) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
             val proposedQueueNs = System.nanoTime()
-            native.queueInputBuffer(index, 0, bytes.size, pts, flags)
+            timed(2, "ENCODER_QUEUE_INPUT") { native.queueInputBuffer(index, 0, bytes.size, pts, flags) }
             if (firstPrepQueueNs == 0L) firstPrepQueueNs = proposedQueueNs
             val previous = inputCursor; inputCursor += frames; inputSequence++
             if (flags != 0) inputEos = true
-            checkNotNull(source).write(bytes)
-            if (phase == "PROGRAMME") checkNotNull(programme).write(bytes)
+            write(source, bytes)
+            if (phase == "PROGRAMME") write(programme, bytes)
             line(inputLog, JSONObject().put("sequence", inputSequence).put("phase", if (flags != 0) "EOS" else phase)
                 .put("sourceByteOffset", previous * 2).put("frames", frames).put("nativePtsUs", pts)
                 .put("flags", flags).put("queueReturned", true).put("sha256", sha(bytes)))
@@ -257,7 +305,7 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
 
         private fun drainEncoder(native: MediaCodec) {
             val info = MediaCodec.BufferInfo()
-            val index = native.dequeueOutputBuffer(info, 1000)
+            val index = timed(3, "ENCODER_DEQUEUE_OUTPUT") { native.dequeueOutputBuffer(info, 1000) }
             if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 check(!formatSeen); formatSeen = true
                 val value = native.outputFormat
@@ -283,7 +331,7 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
                     check(info.offset.toLong() + info.size <= buffer.capacity().toLong())
                     buffer.position(info.offset); buffer.limit(info.offset + info.size); buffer.get(bytes)
                     check(encodedBytes + bytes.size <= 1_048_576)
-                    checkNotNull(encoded).write(bytes); encodedBytes += bytes.size
+                    write(encoded, bytes); encodedBytes += bytes.size
                 }
                 val feed = !config && bytes.isNotEmpty() && !startIssued && decoderInputBuffers < 6
                 if (feed) {
@@ -305,7 +353,7 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
         private fun startDecoder() {
             check(decoder.codec == null)
             decoder.createAttempted = true
-            val native = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            val native = timed(1, "DECODER_CREATE") { MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC) }
             decoder.codec = native; decoderName = native.name
             val value = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 48000, 1)
             value.setByteBuffer("csd-0", ByteBuffer.wrap(byteArrayOf(0x11, 0x88.toByte())))
@@ -313,7 +361,7 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
             // Decoder policy requests no *external* gapless trim. These zeroes
             // are not a claim about encoder delay or decoder intrinsic delay.
             value.setInteger("encoder-delay", 0); value.setInteger("encoder-padding", 0)
-            native.configure(value, null, null, 0)
+            timed(1, "DECODER_CONFIGURE") { native.configure(value, null, null, 0) }
             val accepted = native.inputFormat
             formats.put(format("decoder-input-configured", accepted))
             requireNoContradictoryExternalTrim(accepted)
@@ -322,18 +370,18 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
                 val csd = checkNotNull(accepted.getByteBuffer("csd-0")).duplicate()
                 check(csd.remaining() == 2 && (csd.get().toInt() and 255) == 0x11 && (csd.get().toInt() and 255) == 0x88)
             }
-            decoder.startAttempted = true; native.start()
+            decoder.startAttempted = true; timed(1, "DECODER_START") { native.start() }
         }
 
         private fun queueDecoder(bytes: ByteArray, pts: Long, eos: Boolean) {
             val native = checkNotNull(decoder.codec)
             while (true) {
                 prepDeadline()
-                val index = native.dequeueInputBuffer(0)
+                val index = timed(4, "DECODER_DEQUEUE_INPUT") { native.dequeueInputBuffer(0) }
                 if (index >= 0) {
                     val buffer = checkNotNull(native.getInputBuffer(index)); buffer.clear()
                     check(buffer.remaining() >= bytes.size); buffer.put(bytes)
-                    native.queueInputBuffer(index, 0, bytes.size, pts, if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0)
+                    timed(4, "DECODER_QUEUE_INPUT") { native.queueInputBuffer(index, 0, bytes.size, pts, if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0) }
                     if (eos) decoderInputEos = true
                     else {
                         decoderInputBuffers++; decoderInputBytes += bytes.size; prepDiscardBytes += bytes.size
@@ -349,14 +397,20 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
 
         private fun drainDecoder(native: MediaCodec) {
             val info = MediaCodec.BufferInfo()
-            val index = native.dequeueOutputBuffer(info, 1000)
+            val index = timed(5, "DECODER_DEQUEUE_OUTPUT") { native.dequeueOutputBuffer(info, 1000) }
             if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 check(!decoderOutputFormatSeen); decoderOutputFormatSeen = true
                 val value = native.outputFormat
                 formats.put(format("decoder-output", value))
                 requireNoContradictoryExternalTrim(value)
                 check(value.getInteger(MediaFormat.KEY_SAMPLE_RATE) == 48000 && value.getInteger(MediaFormat.KEY_CHANNEL_COUNT) == 1)
-                check(value.containsKey(MediaFormat.KEY_PCM_ENCODING) && value.getInteger(MediaFormat.KEY_PCM_ENCODING) == AudioFormat.ENCODING_PCM_16BIT)
+                currentStage = "DECODER_OUTPUT_PCM_ENCODING"
+                // MediaFormat's documented absent-key default is signed PCM16.
+                // Preserve ABSENT in formats; this says nothing about encoder trim.
+                val explicitEncoding = value.containsKey(MediaFormat.KEY_PCM_ENCODING)
+                val encoding = if (explicitEncoding) value.getInteger(MediaFormat.KEY_PCM_ENCODING) else AudioFormat.ENCODING_PCM_16BIT
+                check(encoding == AudioFormat.ENCODING_PCM_16BIT) { "Decoder output is not signed PCM16: $encoding" }
+                decoderPcmEncodingInterpretation = if (explicitEncoding) "PRESENT_PCM16" else "ABSENT_DOCUMENTED_PCM16_DEFAULT"
                 return
             }
             if (index < 0) return
@@ -375,7 +429,7 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
                     buffer.position(info.offset); buffer.limit(info.offset + info.size); buffer.get(bytes)
                     val pcm = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
                     repeat(info.size / 2) { decoded[decodedFrames++] = pcm.short }
-                    checkNotNull(prepPcmFile).write(bytes)
+                    write(prepPcmFile, bytes)
                 }
                 line(decoderLog, JSONObject().put("kind", "output").put("size", info.size)
                     .put("nativePtsUs", info.presentationTimeUs).put("flags", info.flags).put("eos", eos)
@@ -393,9 +447,9 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
             val native = checkNotNull(decoder.codec)
             while (!decoderOutputEos) { prepDeadline(); drainDecoder(native) }
             check(decoderReleaseAttempts == decoderReleaseReturned)
-            check(decoder.close()) { "Temporary decoder close unconfirmed; Start forbidden" }
+            check(timed(8, "TEMP_DECODER_CLOSE") { decoder.close() }) { "Temporary decoder close unconfirmed; Start forbidden" }
             prepDeadline()
-            candidate = NativeAacLeadingAlignment.measure(preamble, decoded, decodedFrames)
+            candidate = timed(9, "ANCHOR_SCORING") { NativeAacLeadingAlignment.measure(preamble, decoded, decodedFrames) }
             measuredNs = System.nanoTime()
             prepDeadline()
             // This scalar precedes Start, while the same encoder is still live.
@@ -416,7 +470,7 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
 
         private fun anchor(value: NativeAacLeadingAlignment.Anchor) = JSONObject().put("sourceStart", value.sourceStart)
             .put("lag", value.lag).put("correlation", value.correlation).put("runnerUp", value.runnerUp).put("gain", value.gain)
-        private fun format(phase: String, value: MediaFormat): JSONObject {
+        private fun format(phase: String, value: MediaFormat): JSONObject = timed(10, "FORMAT_" + phase) {
             val result = JSONObject().put("phase", phase)
             for (key in listOf(MediaFormat.KEY_SAMPLE_RATE, MediaFormat.KEY_CHANNEL_COUNT, MediaFormat.KEY_PCM_ENCODING, "encoder-delay", "encoder-padding")) {
                 val row = JSONObject()
@@ -432,12 +486,18 @@ internal class NativeAacLeadingProbe(private val root: File, private val cancell
                 else {
                     val bytes = checkNotNull(value.getByteBuffer("csd-0")).duplicate()
                     check(bytes.remaining() <= 64)
-                    val hex = buildString { while (bytes.hasRemaining()) append("%02x".format(bytes.get().toInt() and 255)) }
+                    val digits = "0123456789abcdef"
+                    val hex = buildString(bytes.remaining() * 2) {
+                        while (bytes.hasRemaining()) {
+                            val octet = bytes.get().toInt() and 255
+                            append(digits[octet ushr 4]); append(digits[octet and 15])
+                        }
+                    }
                     csd.put("state", "PRESENT_BYTES").put("hex", hex)
                 }
             } catch (error: Exception) { csd.put("state", "READ_FAILED_OR_UNSUPPORTED").put("reason", error.javaClass.simpleName) }
             result.put("csd-0", csd)
-            return result
+            result
         }
     }
 }
