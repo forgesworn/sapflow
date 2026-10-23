@@ -12,6 +12,7 @@ use mp4_atom::{
 };
 
 use crate::codec::{AacConfig, H264Config};
+use crate::recording_programme::ProgrammeRecordingPresentation;
 use crate::recording_timing::{MOVIE_TIMESCALE, RecordingPresentation, TimingError};
 
 /// `track_ID` of the video track.
@@ -97,6 +98,76 @@ pub fn init_segment_for_native_recording(
     {
         return Err(TimingError::Unsupported);
     }
+    native_recording_init(
+        video,
+        audio,
+        NativeInitPresentation {
+            movie_duration: presentation.movie_duration()?,
+            audio: NativeAudioPresentation {
+                delay: presentation
+                    .audio_start
+                    .checked_mul(15)
+                    .ok_or(TimingError::Overflow)?,
+                media_time: presentation
+                    .audio_start
+                    .checked_add(u64::from(presentation.leading_frames))
+                    .ok_or(TimingError::Overflow)?,
+                duration: presentation
+                    .valid_audio_frames()
+                    .checked_mul(15)
+                    .ok_or(TimingError::Overflow)?,
+            },
+            video: presentation.video_start.zip(presentation.video_end),
+        },
+    )
+}
+
+/// Audio-only programme header with independent original media and movie origins.
+/// Checked scalar window geometry is not native EOF, file or source authority.
+/// Original fragment timestamps/payloads are never rewritten by this function.
+/// Legacy native-recording headers retain their existing public semantics.
+pub fn init_segment_for_programme_recording(
+    audio: &AacConfig,
+    presentation: &ProgrammeRecordingPresentation,
+) -> Result<Bytes, TimingError> {
+    if audio.audio_specific_config() != [0x11, 0x88] {
+        return Err(TimingError::Unsupported);
+    }
+    native_recording_init(
+        None,
+        audio,
+        NativeInitPresentation {
+            movie_duration: presentation.movie_extent()?.duration_ticks,
+            audio: NativeAudioPresentation {
+                delay: presentation.movie_delay_ticks(),
+                media_time: presentation.media_time(),
+                duration: presentation
+                    .presented_frames()
+                    .checked_mul(15)
+                    .ok_or(TimingError::Overflow)?,
+            },
+            video: None,
+        },
+    )
+}
+
+struct NativeAudioPresentation {
+    delay: u64,
+    media_time: u64,
+    duration: u64,
+}
+
+struct NativeInitPresentation {
+    movie_duration: u64,
+    audio: NativeAudioPresentation,
+    video: Option<(u64, u64)>,
+}
+
+fn native_recording_init(
+    video: Option<&H264Config>,
+    audio: &AacConfig,
+    presentation: NativeInitPresentation,
+) -> Result<Bytes, TimingError> {
     let encode = |result: mp4_atom::Result<()>| result.map_err(|_| TimingError::Unsupported);
     let mut output = Vec::new();
     encode(
@@ -108,7 +179,7 @@ pub fn init_segment_for_native_recording(
         .encode(&mut output),
     )?;
     let mut movie = Vec::new();
-    let duration = presentation.movie_duration()?;
+    let duration = presentation.movie_duration;
     encode(
         Mvhd {
             timescale: MOVIE_TIMESCALE,
@@ -123,8 +194,7 @@ pub fn init_segment_for_native_recording(
     let mut trex = Vec::with_capacity(2);
     if let Some(config) = video {
         let mut track = video_trak(config);
-        let first = presentation.video_start.ok_or(TimingError::Inconsistent)?;
-        let end = presentation.video_end.ok_or(TimingError::Inconsistent)?;
+        let (first, end) = presentation.video.ok_or(TimingError::Inconsistent)?;
         track.tkhd.duration = end.checked_mul(8).ok_or(TimingError::Overflow)?;
         track.mdia.mdhd.duration = 0; // Empty fragmented init: media duration comes from truns.
         native_track(
@@ -144,14 +214,8 @@ pub fn init_segment_for_native_recording(
         });
     }
     let mut track = audio_trak(audio);
-    let delay = presentation
-        .audio_start
-        .checked_mul(15)
-        .ok_or(TimingError::Overflow)?;
-    let audio_duration = presentation
-        .valid_audio_frames()
-        .checked_mul(15)
-        .ok_or(TimingError::Overflow)?;
+    let delay = presentation.audio.delay;
+    let audio_duration = presentation.audio.duration;
     track.tkhd.duration = delay
         .checked_add(audio_duration)
         .ok_or(TimingError::Overflow)?;
@@ -174,10 +238,7 @@ pub fn init_segment_for_native_recording(
     native_track(
         &track,
         delay,
-        presentation
-            .audio_start
-            .checked_add(u64::from(presentation.leading_frames))
-            .ok_or(TimingError::Overflow)?,
+        presentation.audio.media_time,
         audio_duration,
         &mut movie,
     )?;
