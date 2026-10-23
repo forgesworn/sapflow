@@ -359,6 +359,14 @@ refused); the callback path is tested in phase B.
 - [ ] A soak as long as the planned show, with the planned drops and a few
   viewers, sampling `docker stats`, descriptors and the recording. No run
   longer than minutes exists. Judge criteria 1, 6 and 7 against it.
+  First run (2026-10-23, the media host, two hours of a generated
+  2.5 Mbit/s RTMP signal, no viewers, no drops): every 30 s playlist poll
+  answered 200; CPU under 1% of a core; the process's own memory
+  (`RssAnon` in `/proc/<pid>/status`) 36.8 MB at 23 minutes and 38.6 MB at
+  the end, in small steps; the recording one 7,200 s file that decodes to
+  its end, `complete=true`. `docker stats` rose and fell between 40 and
+  50 MB: it counts the kernel's memory for the recording's writes, so read
+  `RssAnon` for criterion 6. Drops and viewers are still to run.
 - [ ] The recording: one file, `ffprobe` length against on-air time,
   plays and seeks in Chrome and Safari.
 - [ ] If the wired Linux machine is free, run `scripts/bench-remote.sh` at
