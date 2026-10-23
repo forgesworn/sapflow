@@ -1023,10 +1023,21 @@ actual ASan runtime linked, a 66,080-byte input cap and no observed crash. Its
 This finite fuzz run does not establish native presentation or exhaustive
 parser correctness.
 
-Current mobile SDK packages are still from `c886419`; no current-source mobile package
-or app adoption is claimed. Packaging and installed-consumer readback, actual
-native programme presentation and concrete producer/file ownership remain next.
-The cold-start failures above and the original presentation contract remain
+The programme muxer/checkpoint source is locally committed as `b2c10ca`.
+Fresh SDK packages are built at `9e01677`, with all 122 recorded source inputs
+unchanged. The Apple XCFramework contains ARM64 macOS, iOS and iOS Simulator
+slices, and its installed Swift package consumer passes the new programme and
+existing ownership controls. The four-ABI Android AAR passes its installed
+Kotlin host consumer; all four actual native ELF files satisfy 16 KiB load
+alignment. Archive readback verifies the generated APIs, original APIs and
+unchanged dependency notices. Earlier same-version packages remain preserved
+as historical evidence.
+
+These are current-source package and host-consumer results. Existing Android
+app APKs still use the earlier SDK. Neither app has adopted the programme mode;
+actual Android programme calls, native paired presentation and concrete
+producer/file ownership remain next. No physical or performance acceptance
+follows. The cold-start failures above and original presentation contract remain
 unchanged.
 
 Private outcome evidence:
@@ -1057,7 +1068,11 @@ Private outcome evidence:
   `target/privacy-standby/android-recording-integration-plan-v1/root-w2-v1/final-gates.local.json`
   and its sibling `independent-outcome-review.local.json`. The same directory
   retains the original sandbox/Clippy failures, fuzz corpus and smoke cleanup
-  readback. Current-source mobile packages remain pending.
+  readback.
+- Current-source SDK package builds, installed consumers and archive/ELF readback:
+  `target/privacy-standby/recording-programme-w2-packages-v1/apple-build.local.json`,
+  `android-build.local.json` and `artifact-verification.local.json`. The source
+  map and build context retain the exact package build HEAD and code commit.
 
 ## Implementation order
 

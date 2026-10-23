@@ -67,10 +67,15 @@ timing and immutable sealed frontiers; legacy APIs, `SFCP0001` and defaults stay
 unchanged. Forty-seven focused tests and 767 workspace tests pass, with four
 workspace tests ignored. Strict Clippy and actual generated Swift/Kotlin
 consumers also pass, alongside the default smoke test and 206,639 sanitised
-checkpoint fuzz executions. Current mobile SDK packages are still from
-`c886419`; neither app has adopted the new mode. Native
-source/EOF facts, file durability, paired presentation and app admission remain
-external requirements. The detailed [programme-window record](recording-recovery.md#checked-recording-programme-windows)
+checkpoint fuzz executions. The source is locally committed as `b2c10ca`.
+Fresh SDK packages are built at `9e01677` from the same 122 source inputs.
+The Apple archive contains three ARM64 platform slices; its installed Swift host
+consumer passes on macOS. The four-ABI Android AAR passes its installed Kotlin
+host consumer and actual ELF 16 KiB alignment checks.
+The new and old generated APIs and dependency notices are verified in the
+archives. Existing Android app APKs still use the earlier SDK; neither app has
+adopted the new programme mode. Native source/EOF facts, file durability, paired
+presentation and app admission remain external requirements. The detailed [programme-window record](recording-recovery.md#checked-recording-programme-windows)
 retains the actual evidence and limits.
 
 Only generated media ran in the read-only emulator. The original cleanup errors
