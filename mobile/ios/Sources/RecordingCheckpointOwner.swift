@@ -2,8 +2,9 @@ import Foundation
 import CryptoKit
 import Sapflow
 
-/// SDK/file compound owner scoped only to submitted SDK inputs. No capture or
-/// normal Stop adoption. Every SDK/hasher/file operation shares one busy guard.
+/// SDK/file compound owner. Stored inputs alone remain incomplete; finalised
+/// capture requires the concrete native producer/ingress authority at commit.
+/// Every SDK/hasher/file operation shares one busy guard.
 final class RecordingCheckpointOwner {
     enum Failure: Error, Equatable { case busy, closed, context, sequence, finalHeader }
     struct Frontier: Equatable {
@@ -72,8 +73,8 @@ final class RecordingCheckpointOwner {
     }
     var frontier: Frontier? { lock.lock(); defer { lock.unlock() }; return progress }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return phase == .closed }
-    /// App admission/drain evidence does not yet exist, even at checked AAC EOF.
-    var normalStopAvailable: Bool { false }
+    /// True only after an actual concrete producer/ingress closure committed.
+    var normalStopAvailable: Bool { lock.lock(); defer { lock.unlock() }; return storedInputsResult?.applicationAdmission == .completeCapture }
     /// Scalar fencing only, safe during a held real filesystem/native operation.
     func cancel() {
         lock.lock(); admissionClosed = true; cancelRequested = true; lock.unlock()
@@ -105,8 +106,8 @@ final class RecordingCheckpointOwner {
             try drain()
         }
     }
-    enum StoredInputsScope: Equatable { case submittedSDKInputsOnly }
-    enum ApplicationAdmission: Equatable { case unknown }
+    enum StoredInputsScope: Equatable { case submittedSDKInputsOnly, captureProducerAndIngress }
+    enum ApplicationAdmission: Equatable { case unknown, completeCapture }
     struct StoredInputsClosure {
         let scope: StoredInputsScope
         let applicationAdmission: ApplicationAdmission
@@ -118,17 +119,29 @@ final class RecordingCheckpointOwner {
         let completeAudioEOF: Bool
         let cancelledBeforeCommit: Bool
         fileprivate init(outcome: NativeRecordingCompletion, bytes: UInt64,
-                         extent: NativeRecordingPresentationExtent, cancelledBeforeCommit: Bool) {
-            scope = .submittedSDKInputsOnly; applicationAdmission = .unknown; sdkOutcome = outcome
+                         extent: NativeRecordingPresentationExtent, cancelledBeforeCommit: Bool, admission: ApplicationAdmission = .unknown) {
+            scope = admission == .completeCapture ? .captureProducerAndIngress : .submittedSDKInputsOnly; applicationAdmission = admission; sdkOutcome = outcome
             self.bytes = bytes; movieTimescale = extent.movieTimescale; durationTicks = extent.durationTicks
             durationMsCeil = extent.durationMsCeil; completeAudioEOF = extent.completeAudioEof
             self.cancelledBeforeCommit = cancelledBeforeCommit
         }
     }
     /// Complete only the inputs this private SDK owner actually accepted.
-    /// There is NO app/capture admission proof parameter or finalised branch.
-    /// Even checked native EOF and installed FINAL_HEADER yield incomplete.
+    /// This entry point has no capture authority. Even checked native EOF and
+    /// installed FINAL_HEADER yield incomplete.
     func finishStoredInputs(outcome: NativeRecordingCompletion = .incompletePrefix) throws -> StoredInputsClosure {
+        try finishInputs(outcome: outcome, capture: nil)
+    }
+    var fileURL: URL? {
+        lock.lock()
+        let finalised = phase == .closed && storedInputsResult?.applicationAdmission == .completeCapture
+        lock.unlock()
+        return finalised ? file.finalisedURL : nil
+    }
+    func finishCaptureInputs(_ capture: CaptureRecordingClosure) throws -> StoredInputsClosure {
+        try finishInputs(outcome: .complete, capture: capture)
+    }
+    private func finishInputs(outcome: NativeRecordingCompletion, capture: CaptureRecordingClosure?) throws -> StoredInputsClosure {
         lock.lock()
         if let storedInputsResult {
             lock.unlock()
@@ -167,16 +180,22 @@ final class RecordingCheckpointOwner {
             // Capture actual finish/drain/stats BEFORE cancellation clears state.
             try muxer.cancel()
             var cancelledBeforeCommit = false
-            let closed = try file.finishStoredInputs(header: header, durationMs: duration, checkpoint: installedReceipt) {
+            var captureAccepted = false
+            let closed = try file.finishCaptureInputs(header: header, durationMs: duration, checkpoint: installedReceipt) {
                 self.lock.lock()
                 guard self.phase == .closing, self.busy else { self.lock.unlock(); throw Failure.closed }
                 cancelledBeforeCommit = self.cancelRequested
                 self.phase = .committing; self.lock.unlock()
-                // No scalar success/publication here. Header close has returned,
-                // but receipt IO and every actual metadata close are still due.
+                // Header close has returned; receipt IO/metadata closes remain.
+                // Exact native/ingress closure is consumed only at this frontier.
+                if !cancelledBeforeCommit, outcome == .complete, let capture, let frontier = self.frontier {
+                    captureAccepted = capture.consume(owner: self, frontier: frontier)
+                }
+                return captureAccepted ? .finalised : .incomplete
             }
             let result = StoredInputsClosure(outcome: outcome, bytes: closed.bytes,
-                extent: extent, cancelledBeforeCommit: cancelledBeforeCommit)
+                extent: extent, cancelledBeforeCommit: cancelledBeforeCommit,
+                admission: captureAccepted ? .completeCapture : .unknown)
             // Drop Rust objects outside the scalar lock, after actual file close.
             installedToken = nil; self.installedReceipt = nil
             lock.lock(); storedInputsResult = result; phase = .closed

@@ -28,7 +28,7 @@ final class RecordingCaptureAdmission {
     private enum Phase { case pending, active, closing, retained }
     private let lock = NSLock()
     private var serial: UInt64 = 0
-    private var owner: (ticket: Ticket, phase: Phase, cancelled: Bool)?
+    private var owner: (ticket: Ticket, phase: Phase, cancelled: Bool, recorder: ObjectIdentifier?)?
     private func locked<T>(_ action: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return action() }
     static func storageAvailable(profile: CaptureIntent, bytes: UInt64?) -> Bool {
         guard let bytes, let budget = try? RecordingStorage.budget(profile: profile) else { return false }
@@ -43,9 +43,19 @@ final class RecordingCaptureAdmission {
             guard owner == nil, serial < UInt64.max else { return nil }
             serial += 1
             let ticket = Ticket(serial: serial, request: request)
-            owner = (ticket, .pending, false)
+            owner = (ticket, .pending, false, nil)
             return ticket
         }
+    }
+    func bindRecorder(_ ticket: Ticket, recorder: AnyObject) -> Bool {
+        locked {
+            guard owner?.ticket == ticket, owner?.recorder == nil, owner?.cancelled == false,
+                  case .segment = ticket.request else { return false }
+            owner?.recorder = ObjectIdentifier(recorder); return true
+        }
+    }
+    func ownsRecorder(_ ticket: Ticket, recorder: AnyObject) -> Bool {
+        locked { owner?.ticket == ticket && owner?.recorder == ObjectIdentifier(recorder) }
     }
     func isActive(_ ticket: Ticket) -> Bool {
         locked { owner?.ticket == ticket && owner?.cancelled == false && owner?.phase == .active }
@@ -81,3 +91,17 @@ final class RecordingCaptureAdmission {
         }
     }
 }
+
+/// Recording-only failure is distinct from an ordinary admission close. Commit
+/// holds this scalar lock while the exact run admission makes its own decision.
+final class CaptureRecordingLoss {
+    private let lock = NSLock()
+    private var failed = false, committed = false
+    func mark() { lock.lock(); failed = true; lock.unlock() }
+    func commit(admission: CaptureAdmission, run: CaptureAdmission.MediaRun, start: CaptureAdmission.Start? = nil) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !failed, !committed, admission.commitRecordingClosure(run, start: start) else { return false }
+        committed = true; return true
+    }
+}
+

@@ -30,6 +30,10 @@ final class IngressWorker {
     private var nativePublishingCloseFailure: Error?
     private var recordingOpen: Bool
     private var failed = false
+    private var attemptedSamples: UInt64 = 0, attemptedEvents: UInt64 = 0
+    private var forwardedSamples: UInt64 = 0, forwardedEvents: UInt64 = 0
+    private var countOverflow = false
+    private var producerClosureActive = false // state lock; late output is loss, not Stop cancellation
     private var lastStatistics = 0.0 // Encoded queue only.
     private struct FinishJoin {
         var recording: ((CompressedRecorder.Completion) -> Void)?
@@ -95,6 +99,12 @@ final class IngressWorker {
 
     @discardableResult func offer(_ unit: CompressedUnit, token: CaptureAdmission.MediaToken,
                                  audioGeneration: UInt64? = nil) -> Bool {
+        state.lock()
+        let attempt = attemptedSamples.addingReportingOverflow(1)
+        attemptedSamples = attempt.partialValue; countOverflow = countOverflow || attempt.overflow
+        let late = producerClosureActive
+        state.unlock()
+        if late, token.run == run { _ = admission.nativeFault(token) }
         guard permitsOutput(token) else { return false }
         let validKind = token.kind == .raw || (unit.isVideo ? token.kind == .slate : token.kind == .zero)
         guard validKind, unit.isVideo || audioGeneration.map({ $0 > 0 }) == true else {
@@ -111,7 +121,13 @@ final class IngressWorker {
 
             var accepted: CaptureAdmission.SinkMask = []
             self.state.lock(); let records = self.recordingOpen; self.state.unlock()
-            if records, self.recorder.offer(unit, validated: validated) != nil { accepted.insert(.recording) }
+            if records, self.recorder.offer(unit, validated: validated) != nil {
+                accepted.insert(.recording)
+                self.state.lock()
+                let next = self.forwardedSamples.addingReportingOverflow(1)
+                self.forwardedSamples = next.partialValue; self.countOverflow = self.countOverflow || next.overflow
+                self.state.unlock()
+            }
 
             // A void destination offer may drop during recovery. Confirmation
             // instead requires this exact validated sample's real local SDK
@@ -166,10 +182,22 @@ final class IngressWorker {
     /// Codec timing events share the unit FIFO, including generation EOF. The
     /// recorder cannot observe a completed generation before its original AUs.
     func audioTiming(_ event: AudioRecordingTiming.Event) {
+        state.lock()
+        let attempt = attemptedEvents.addingReportingOverflow(1)
+        attemptedEvents = attempt.partialValue; countOverflow = countOverflow || attempt.overflow
+        let late = producerClosureActive
+        state.unlock()
+        if late { _ = admission.nativeFault(fallbackToken) }
         let reservation = budget.enqueue(bytes: 1, on: queue) { ticket in
             defer { self.budget.release(ticket) }
             self.state.lock(); let records = self.recordingOpen; self.state.unlock()
-            if records { self.recorder.audioTiming(event) }
+            if records {
+                self.recorder.audioTiming(event)
+                self.state.lock()
+                let next = self.forwardedEvents.addingReportingOverflow(1)
+                self.forwardedEvents = next.partialValue; self.countOverflow = self.countOverflow || next.overflow
+                self.state.unlock()
+            }
         }
         if reservation == nil {
             let first = budget.close(enqueueOn: queue, firstOnly: true) {}
@@ -239,8 +267,9 @@ final class IngressWorker {
     }
     /// Join validation/forwarding before closing the recorder's own queue.
     /// Its finish starts independently of transport drain or remote handshake.
-    func finish(recording: @escaping (CompressedRecorder.Completion) -> Void,
+    func finish(producers: CaptureRecordingClosure? = nil, recording: @escaping (CompressedRecorder.Completion) -> Void,
                 publishing: @escaping (Result<Void, Error>) -> Void) {
+        if producers != nil { state.lock(); producerClosureActive = true; state.unlock() }
         budget.close(enqueueOn: queue) {
             if let result = self.recordingResult { recording(result) }
             if let result = self.publishingResult { publishing(result) }
@@ -258,7 +287,14 @@ final class IngressWorker {
             guard !self.finishStarted else { return }
             self.finishStarted = true
             _ = self.closeNativePublishing()
-            self.recorder.finish { result in self.queue.async {
+            self.state.lock()
+            let clean = !self.failed && !self.countOverflow && self.recordingOpen
+            let offered = self.attemptedSamples, forwarded = self.forwardedSamples
+            let events = self.attemptedEvents, forwardedEvents = self.forwardedEvents
+            self.state.unlock()
+            let closure = clean && producers?.closeIngress(run: self.run, worker: self, recorder: self.recorder,
+                offered: offered, forwarded: forwarded, events: events, forwardedEvents: forwardedEvents) == true ? producers : nil
+            self.recorder.finish(producers: closure) { result in self.queue.async {
                 guard self.recordingResult == nil else { return }
                 self.recordingResult = result
                 let callbacks = self.finishJoins.compactMap(\.recording)

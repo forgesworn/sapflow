@@ -60,7 +60,7 @@ selected=['target/native-packages/apple/Sources/Sapflow/Sapflow.swift',
  'target/native-packages/apple/SapflowFFI.xcframework/macos-arm64/Headers/module.modulemap']
 for name in selected:inputs[name]=package['outputHashes'][name]
 for name,value in inputs.items():assert sha(root/name)==value,'Stale source/runtime: '+name
-used=['mobile/ios/Sources/CaptureOrientation.swift','mobile/ios/Sources/CaptureProfile.swift','mobile/ios/Sources/RecordingStorage.swift',
+used=['mobile/ios/Sources/CaptureRecordingProducer.swift','mobile/ios/Sources/HardwareVideoEncoder.swift','mobile/ios/Sources/VideoEncodingPolicy.swift','mobile/ios/Sources/PreparedVideoSlate.swift','mobile/ios/Sources/NativeAudioEncoder.swift','mobile/ios/Sources/AudioRecordingTiming.swift','mobile/ios/Sources/QuickTimeAudioPriming.swift','mobile/ios/Sources/AudioShowLifecycle.swift','mobile/ios/Sources/AudioInputPolicy.swift','mobile/ios/Sources/CameraControlPolicy.swift','mobile/ios/Sources/CaptureAdmission.swift','mobile/ios/Sources/RecordingCaptureAdmission.swift','mobile/ios/Sources/EncodedPipeline.swift','mobile/ios/Sources/PublishingTelemetry.swift','mobile/ios/Sources/CaptureOrientation.swift','mobile/ios/Sources/CaptureProfile.swift','mobile/ios/Sources/RecordingStorage.swift',
  'mobile/ios/Sources/RecordingCatalogue.swift','mobile/ios/Sources/RecordingCheckpointOwner.swift',
  'mobile/ios/Tests/RecordingCatalogueTests.swift','mobile/ios/Tests/RecordingCheckpointOwnerTests.swift',
  'mobile/ios/test-recordings.sh','mobile/ios/test-recording-checkpoints.sh']
@@ -95,6 +95,7 @@ swiftc -swift-version 5 -warnings-as-errors -module-cache-path "$sapflow_scratch
     -Xlinker -rpath -Xlinker "$sapflow_root/target/debug" \
     "$sapflow_root/mobile/ios/Sources/CaptureOrientation.swift" "$sapflow_root/mobile/ios/Sources/CaptureProfile.swift" \
     "$sapflow_root/mobile/ios/Sources/RecordingStorage.swift" "$sapflow_root/mobile/ios/Sources/RecordingCatalogue.swift" \
+    "$sapflow_root/mobile/ios/Sources/CaptureRecordingProducer.swift" "$sapflow_root/mobile/ios/Sources/HardwareVideoEncoder.swift" "$sapflow_root/mobile/ios/Sources/VideoEncodingPolicy.swift" "$sapflow_root/mobile/ios/Sources/PreparedVideoSlate.swift" "$sapflow_root/mobile/ios/Sources/NativeAudioEncoder.swift" "$sapflow_root/mobile/ios/Sources/AudioRecordingTiming.swift" "$sapflow_root/mobile/ios/Sources/QuickTimeAudioPriming.swift" "$sapflow_root/mobile/ios/Sources/AudioShowLifecycle.swift" "$sapflow_root/mobile/ios/Sources/AudioInputPolicy.swift" "$sapflow_root/mobile/ios/Sources/CameraControlPolicy.swift" "$sapflow_root/mobile/ios/Sources/CaptureAdmission.swift" "$sapflow_root/mobile/ios/Sources/RecordingCaptureAdmission.swift" "$sapflow_root/mobile/ios/Sources/EncodedPipeline.swift" "$sapflow_root/mobile/ios/Sources/PublishingTelemetry.swift" \
     "$sapflow_root/mobile/ios/Sources/RecordingCheckpointOwner.swift" "$sapflow_scratch/main.swift" "$sapflow_scratch/Sapflow.o" \
     -o "$sapflow_scratch/checkpoint-owner-tests" > "$SAPFLOW_CHECKPOINT_EVIDENCE/test-compile.log" 2>&1
 TMPDIR="$sapflow_scratch/tmp" "$sapflow_scratch/checkpoint-owner-tests" > "$SAPFLOW_CHECKPOINT_EVIDENCE/test-run.log" 2>&1

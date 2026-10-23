@@ -108,6 +108,9 @@ final class CaptureAdmission {
     private var privacyRequest: PrivacyRequest?
     private var mediaRun: MediaRun?
     private var closingMediaRun: MediaRun?
+    private var committedMediaRun: MediaRun?
+    private var committedMediaStart: Start?
+    private var recordingClosureRun: MediaRun?
     private var rawToken: MediaToken?
     private var slateToken: MediaToken?
     private var zeroToken: MediaToken?
@@ -315,7 +318,7 @@ final class CaptureAdmission {
             publishingSink = SinkToken(run: value, sink: .publishing, serial: publishingID)
             recordingSink = SinkToken(run: value, sink: .recording, serial: recordingID)
             if !publishing { terminalBranches |= Sink.publishing.rawValue }
-            mediaRun = value; mediaStarted = false
+            mediaRun = value; mediaStarted = false; committedMediaRun = nil; committedMediaStart = nil; recordingClosureRun = nil
             expectedZeroGeneration = nil; slateConfirmed = false; zeroThrough = nil; zeroFrames = 0
             if privacyDesired == .standby {
                 guard let command = next() else { privacyFaultLocked(); return nil }
@@ -350,7 +353,7 @@ final class CaptureAdmission {
                     deadlineNs: deadline, serial: prior.serial)
             }
             guard startedLocked(start, nowNs: nowNs, broadcasting: broadcasting) else { return false }
-            mediaStarted = true
+            mediaStarted = true; committedMediaRun = run; committedMediaStart = start; recordingClosureRun = nil
             if let activation {
                 privacyRequest = activation
                 privacyPhase = .enteringStandby
@@ -536,6 +539,32 @@ final class CaptureAdmission {
             privacyFaultLocked(); return true
         }
     }
+    /// A reported native drop may have queued while live before Stop or a
+    /// privacy/source fence. Its interval is unknown, so retain loss for THIS
+    /// segment. Deliberate discard delegates never invoke this method.
+    @discardableResult func nativeDrop(_ token: MediaToken, camera source: CameraSource? = nil) -> Bool {
+        locked {
+            guard token.kind == .raw, preparation == token.run.preparation,
+                  mediaRun == token.run || closingMediaRun == token.run,
+                  source.map({ $0.owner == token.run.preparation }) ?? true, !mediaFailed else { return false }
+            privacyFaultLocked(); return true
+        }
+    }
+    func hasCommittedMediaRun(_ value: MediaRun, start: Start? = nil) -> Bool {
+        locked { committedMediaRun == value && (start.map { committedMediaStart == $0 } ?? true) && (mediaRun == value || closingMediaRun == value) }
+    }
+    /// Sole scalar finalisation decision for a concrete closed producer run.
+    /// Ordinary Stop cancellation does not imply media loss. The native owner
+    /// and recorder locks have already fenced callbacks and recording faults.
+    func commitRecordingClosure(_ value: MediaRun, start: Start? = nil) -> Bool {
+        locked {
+            guard committedMediaRun == value, preparation == value.preparation,
+                  start.map({ committedMediaStart == $0 }) ?? true,
+                  mediaRun == value || closingMediaRun == value, !mediaFailed,
+                  recordingClosureRun == nil else { return false }
+            recordingClosureRun = value; return true
+        }
+    }
     func mediaHasFault(_ value: MediaRun) -> Bool {
         locked { preparation == value.preparation && (mediaRun == value || closingMediaRun == value) && mediaFailed }
     }
@@ -544,6 +573,8 @@ final class CaptureAdmission {
         locked {
             if mediaRun == value { mediaRun = nil; mediaStarted = false }
             if closingMediaRun == value { closingMediaRun = nil }
+            if committedMediaRun == value { committedMediaRun = nil; committedMediaStart = nil }
+            if recordingClosureRun == value { recordingClosureRun = nil }
         }
     }
     /// nil Stop means this exact committed audio show may continue, or the
@@ -595,6 +626,7 @@ final class CaptureAdmission {
             privacyDesired = ticket.initialStandby ? .standby : .live
             privacyPhase = ticket.initialStandby ? .armed : .live
             privacyRevision = 0; privacyRequest = nil; mediaRun = nil; closingMediaRun = nil
+            committedMediaRun = nil; committedMediaStart = nil; recordingClosureRun = nil
             rawToken = nil; slateToken = nil; zeroToken = nil; mediaStarted = false; mediaFailed = false; terminalBranches = 0
             mediaOperationDeadlineNs = nil
             mediaOperationBeganAtNs = nil

@@ -46,6 +46,7 @@ final class CaptureRun {
     let recorder: CaptureRecording
     let recordingTicket: RecordingCaptureAdmission.Ticket
     let worker: IngressWorker
+    var producers: CaptureRecordingProducer!
     var video: HardwareVideoEncoder?
     var audio: NativeAudioEncoder!
     var audioRoute: AudioInputRouting?
@@ -76,7 +77,7 @@ final class CaptureRun {
     var slateToken: CaptureAdmission.MediaToken?
     var zeroMediaToken: CaptureAdmission.MediaToken?
     var resumeCutoff: CMTime?
-    init(mediaRun: CaptureAdmission.MediaRun, admission: CaptureAdmission, recorder: CaptureRecording, recordingTicket: RecordingCaptureAdmission.Ticket, orientation: CaptureOrientation, profile: CaptureIntent, ingress: RustEncodedIngress, boundary: @escaping (CaptureAdmission.MediaBoundary) -> Void, terminal: @escaping (CaptureAdmission.SinkToken) -> Void, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
+    init(mediaRun: CaptureAdmission.MediaRun, admission: CaptureAdmission, recorder: CaptureRecording, recordingTicket: RecordingCaptureAdmission.Ticket, recordingAdmission: RecordingCaptureAdmission, orientation: CaptureOrientation, profile: CaptureIntent, ingress: RustEncodedIngress, session: AVCaptureSession, samples: DispatchQueue, boundary: @escaping (CaptureAdmission.MediaBoundary) -> Void, terminal: @escaping (CaptureAdmission.SinkToken) -> Void, failure: @escaping (Error) -> Void, publishingFailure: @escaping (Error) -> Void, statistics: @escaping (UInt64, String) -> Void, meter: @escaping (Float) -> Void) throws {
         self.mediaRun = mediaRun; self.admission = admission
         self.profile = profile
         self.recorder = recorder; self.recordingTicket = recordingTicket
@@ -98,6 +99,8 @@ final class CaptureRun {
             worker.offer(unit, token: binding.token, audioGeneration: binding.encoder?.lastOutputGeneration)
         }, meter: meter, recordingTiming: { worker.audioTiming($0) })
         binding.encoder = audio
+        producers = CaptureRecordingProducer(run: mediaRun, ticket: recordingTicket, recorder: recorder,
+            worker: worker, audio: audio, video: video, session: session, samples: samples, admission: admission, recordingAdmission: recordingAdmission)
     }
 }
 
@@ -387,11 +390,17 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard let token = admission.mediaToken(run.mediaRun, kind: .raw) else { return }
         let audio = CaptureRawSource(token: token, frame: { [weak self] sample, token, _ in
             self?.processCapture(sample, isVideo: false, token: token)
+        }, drop: { [weak self, admission] in
+            _ = admission.nativeDrop(token)
+            self?.control.async { self?.snapshot.captureDrops += 1 }
         })
         let video: CaptureRawSource? = cameraDevice.map { device in
             CaptureRawSource(token: token, camera: device.source, frame: { [weak self] sample, token, source in
                 guard let source else { return }; self?.cameraFrame(source, sample: sample, token: token)
-            }, drop: { [weak self] in self?.control.async { self?.snapshot.captureDrops += 1 } })
+            }, drop: { [weak self, admission] in
+                _ = admission.nativeDrop(token, camera: device.source)
+                self?.control.async { self?.snapshot.captureDrops += 1 }
+            })
         }
         samples.sync {
             guard self.run === run else { return }
@@ -1334,7 +1343,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         do {
             self.ingress.reset(hasVideo: ticket.preparation.profile.hasVideo)
             self.recordingFailureDescription = nil
-            let run = try CaptureRun(mediaRun: mediaRun, admission: admission, recorder: recorder, recordingTicket: work, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress,
+            let run = try CaptureRun(mediaRun: mediaRun, admission: admission, recorder: recorder, recordingTicket: work, recordingAdmission: self.recordingAdmission, orientation: self.orientationPlan.desired, profile: ticket.preparation.profile, ingress: self.ingress, session: self.session, samples: self.samples,
                 boundary: { [weak self] value in
                     guard let self else { return }
                     if self.admission.recordBoundary(value, nowNs: DispatchTime.now().uptimeNanoseconds) {
@@ -1551,8 +1560,9 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         cameraSwitchTimer?.cancel(); cameraSwitchTimer = nil; deferredOrientation = nil
         cameraCommands.invalidate(); snapshot.cameraControlPending = false
         snapshot.cameraControl = nil; snapshot.cameraActive = nil; snapshot.cameraPending = false
-        setSampleDelivery(false)
-        if session.isRunning { session.stopRunning() }
+        let producer = samples.sync { self.run?.producers }
+        if let producer { producer.stopInput() }
+        else { setSampleDelivery(false); if session.isRunning { session.stopRunning() } }
         if let anchored = audioAnchorRun { anchored.audioAnchor?.stoppedInput(anchored.mediaRun, confirmed: !session.isRunning) }
         if let device = cameraDevice {
             session.beginConfiguration()
@@ -1590,17 +1600,21 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 self.snapshot.detail = "Capture cleanup unconfirmed; Prepare is blocked."; self.publish()
             }; return }
             self.run = nil
+            // Startup buffers and an unfinished Resume have no proved terminal
+            // disposition. Never silently clear them into a complete receipt.
+            if !run.startup.isEmpty || run.resumeCutover != nil {
+                run.recorder.markIncomplete(CaptureFailure(message: "Capture stopped with held source media"))
+                if let token = run.rawSources.first?.token { _ = self.admission.nativeFault(token) }
+            }
             run.admitting = false; run.privacyDriver?.stop(); run.privacyDriver = nil
             run.resumeCutover = nil
             run.rawSources.removeAll(); run.retiringRawSources.removeAll()
             run.discardAudio = nil; run.retiringDiscardAudio = nil
+            var closure: CaptureRecordingClosure?
             var flushFailed = self.admission.mediaHasFault(run.mediaRun)
-            do { try run.audio.finish() } catch {
-                flushFailed = true
-                self.control.async { self.recordingFailureDescription = "AAC flush failed: \(error.localizedDescription)" }
-            }
-            do { try run.video?.finishChecked() } catch {
+            do { closure = try run.producers.finish() } catch {
                 flushFailed = true; run.recorder.markIncomplete(error)
+                self.control.async { self.recordingFailureDescription = "Native flush failed: \(error.localizedDescription)" }
             }
             self.recordingAdmission.closing(run.recordingTicket)
             let state = RecordingRunStop(run: run, rotationToken: rotationToken, rotation: child)
@@ -1614,7 +1628,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             // All final native units AND EOF timing first pass the worker FIFO.
             // Its one barrier then starts file and network cleanup independently.
             if flushFailed { run.recorder.markIncomplete(CaptureFailure(message: "Native capture did not complete cleanly")) }
-            run.worker.finish(recording: { result in self.control.async {
+            run.worker.finish(producers: closure, recording: { result in self.control.async {
                 state.recording = result
                 self.recordingAdmission.closed(run.recordingTicket, cleanupComplete: result.cleanupComplete)
                 if !result.cleanupComplete { self.retainedRecorder = run.recorder }

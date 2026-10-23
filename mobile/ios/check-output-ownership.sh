@@ -14,7 +14,7 @@ import array,datetime,hashlib,json,math,os,shutil,signal,subprocess,sys,tarfile,
 root=Path(sys.argv[1]);scratch=Path(sys.argv[2]);base=root/'target/ios-output-ownership-fixture'
 run=base/(datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ-')+uuid.uuid4().hex[:8]);run.mkdir(mode=0o700)
 sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
-names=['AudioRecordingTiming','AudioShowLifecycle','NativeAudioEncoder','CompressedRecorder','QuickTimeAudioPriming','QuickTimeAudioPrimingFile','QuickTimeMovieLayout','RecordingCatalogue','RecordingStorage','RecordingCaptureAdmission','AudioInputPolicy','CameraControlPolicy','CaptureAdmission','CaptureProfile','CaptureOrientation','PublishingTelemetry','EncodedWorkBudget','EncodedPipeline','EncodedIngressWorker','CaptureRecording','RecordingCheckpointOwner']
+names=['CaptureRecordingProducer','HardwareVideoEncoder','VideoEncodingPolicy','PreparedVideoSlate','AudioRecordingTiming','AudioShowLifecycle','NativeAudioEncoder','CompressedRecorder','QuickTimeAudioPriming','QuickTimeAudioPrimingFile','QuickTimeMovieLayout','RecordingCatalogue','RecordingStorage','RecordingCaptureAdmission','AudioInputPolicy','CameraControlPolicy','CaptureAdmission','CaptureProfile','CaptureOrientation','PublishingTelemetry','EncodedWorkBudget','EncodedPipeline','EncodedIngressWorker','CaptureRecording','RecordingCheckpointOwner']
 sources=[root/('mobile/ios/Sources/'+n+'.swift') for n in names]
 sources += [root/'mobile/ios/Tools/StandbyOutputOwnershipCheck.swift',root/'mobile/ios/Tools/AudioOnlyFixtureCheck.swift',root/'mobile/ios/check-output-ownership.sh']
 package=root/'target/native-packages/apple';packages=sorted(p for p in package.rglob('*') if p.is_file())

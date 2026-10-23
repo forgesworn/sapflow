@@ -2,6 +2,63 @@ import XCTest
 @testable import SapflowBroadcaster
 
 final class CaptureAdmissionTests: XCTestCase {
+    private func committedDropRun(_ gate: CaptureAdmission) throws -> CaptureAdmission.MediaRun {
+        let preparation = try XCTUnwrap(gate.reservePreparation(profile: .audioOnly48kMono))
+        XCTAssertTrue(gate.attached(preparation)); XCTAssertTrue(gate.beginPermissions(preparation)); XCTAssertTrue(gate.prepared(preparation))
+        let start = try XCTUnwrap(gate.reserveStart(preparation)), run = try XCTUnwrap(gate.reserveMediaRun(start))
+        XCTAssertTrue(gate.commitMediaRun(run, start: start, nowNs: 1, broadcasting: false))
+        return run
+    }
+    func testNativeDropQueuedBeforeStopStillLatchesExactClosingRun() throws {
+        let gate = CaptureAdmission(), run = try committedDropRun(gate)
+        let token = try XCTUnwrap(gate.mediaToken(run, kind: .raw))
+        _ = gate.stop(nowNs: 2)
+        XCTAssertNotEqual(gate.allowsInput(token), .allow)
+        XCTAssertTrue(gate.nativeDrop(token)); XCTAssertTrue(gate.mediaHasFault(run))
+        XCTAssertFalse(gate.commitRecordingClosure(run))
+    }
+    func testOldNativeDropCannotFaultSuccessorAfterActualRunClose() throws {
+        let gate = CaptureAdmission(), old = try committedDropRun(gate)
+        let token = try XCTUnwrap(gate.mediaToken(old, kind: .raw)), stopped = gate.stop(nowNs: 2)
+        gate.mediaRunClosed(old); XCTAssertTrue(gate.completeStop(stopped, cleanupComplete: true))
+        let next = try committedDropRun(gate)
+        XCTAssertFalse(gate.nativeDrop(token)); XCTAssertFalse(gate.mediaHasFault(next))
+    }
+    func testNormalStopCancellationPreservesSingleExactRecordingDecision() throws {
+        let gate = CaptureAdmission(), run = try committedDropRun(gate)
+        _ = gate.stop(nowNs: 2)
+        XCTAssertTrue(gate.hasCommittedMediaRun(run)); XCTAssertFalse(gate.mediaHasFault(run))
+        XCTAssertTrue(gate.commitRecordingClosure(run)); XCTAssertFalse(gate.commitRecordingClosure(run))
+    }
+    func testUncommittedRunCannotGrantRecordingDecision() throws {
+        let gate = CaptureAdmission(), preparation = try XCTUnwrap(gate.reservePreparation(profile: .audioOnly48kMono))
+        XCTAssertTrue(gate.attached(preparation)); XCTAssertTrue(gate.beginPermissions(preparation)); XCTAssertTrue(gate.prepared(preparation))
+        let start = try XCTUnwrap(gate.reserveStart(preparation)), run = try XCTUnwrap(gate.reserveMediaRun(start))
+        XCTAssertFalse(gate.hasCommittedMediaRun(run)); XCTAssertFalse(gate.commitRecordingClosure(run))
+    }
+    func testSameStartOldRecordingTicketCannotBorrowSuccessorRecorderBinding() throws {
+        let gate = CaptureAdmission(), prep = try XCTUnwrap(gate.reservePreparation(profile: .audioOnly48kMono))
+        XCTAssertTrue(gate.attached(prep)); XCTAssertTrue(gate.beginPermissions(prep)); XCTAssertTrue(gate.prepared(prep))
+        let start = try XCTUnwrap(gate.reserveStart(prep)), admission = RecordingCaptureAdmission()
+        let old = try XCTUnwrap(admission.begin(.segment(start))), oldRecorder = NSObject()
+        XCTAssertTrue(admission.bindRecorder(old, recorder: oldRecorder))
+        XCTAssertTrue(admission.closed(old, cleanupComplete: true))
+        let current = try XCTUnwrap(admission.begin(.segment(start))), currentRecorder = NSObject()
+        XCTAssertNotEqual(old, current)
+        XCTAssertFalse(admission.bindRecorder(old, recorder: currentRecorder))
+        XCTAssertTrue(admission.bindRecorder(current, recorder: currentRecorder))
+        admission.cancel(prep)
+        XCTAssertTrue(admission.ownsRecorder(current, recorder: currentRecorder))
+        XCTAssertFalse(admission.ownsRecorder(old, recorder: currentRecorder))
+        XCTAssertFalse(admission.ownsRecorder(current, recorder: oldRecorder))
+    }
+    func testRecordingLossLatchDoesNotTreatOrdinaryStopAsFailure() throws {
+        let gate = CaptureAdmission(), run = try committedDropRun(gate), loss = CaptureRecordingLoss()
+        _ = gate.stop(nowNs: 2)
+        loss.mark(); XCTAssertFalse(loss.commit(admission: gate, run: run))
+        XCTAssertFalse(gate.mediaHasFault(run))
+    }
+
     func testFixedOrientationChoiceIsImmutableAcrossEveryPreparedAndCleanupPhase() throws {
         let gate = CaptureAdmission()
         XCTAssertTrue(gate.selectOrientationChoice(.landscapeTopLeft))

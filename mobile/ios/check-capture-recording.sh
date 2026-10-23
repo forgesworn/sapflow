@@ -122,7 +122,7 @@ try:
     for name in selected:inputs[name]=package['outputHashes'][name]
     for name,value in inputs.items():
         path=root/name;assert path.is_file() and not path.is_symlink() and sha(path)==value,'Stale source/runtime: '+name
-    names=['AudioRecordingTiming','AudioShowLifecycle','NativeAudioEncoder','CompressedRecorder',
+    names=['CaptureRecordingProducer','HardwareVideoEncoder','VideoEncodingPolicy','PreparedVideoSlate','AudioRecordingTiming','AudioShowLifecycle','NativeAudioEncoder','CompressedRecorder',
       'QuickTimeAudioPriming','QuickTimeAudioPrimingFile','QuickTimeMovieLayout','RecordingCatalogue','RecordingStorage',
       'RecordingCaptureAdmission','AudioInputPolicy','CameraControlPolicy','CaptureAdmission','CaptureProfile','CaptureOrientation',
       'PublishingTelemetry','EncodedWorkBudget','EncodedPipeline','EncodedIngressWorker','CaptureRecording','RecordingCheckpointOwner']
@@ -169,6 +169,26 @@ try:
         packet_proofs.append({'name':case['name'],'actualOriginalNativePackets':len(actual),'mediaSHA256':sha(media)})
     assert len(packet_proofs)==4 and len(commands)==7,'Expected three native commands and four exact-payload probes'
     (evidence/'exact-payload-proofs.local.json').write_text(json.dumps(packet_proofs,indent=2)+'\n')
+    expected_producers=['producer-audio','producer-av','producer-publishing-failure','producer-late-native-drop',
+       'producer-recording-loss','producer-input-not-closed','producer-wrong-worker','producer-late-encoded-output','producer-late-timing','producer-wrong-ticket']
+    producer_cases=summary['producerCases']
+    assert [c['name'] for c in producer_cases]==expected_producers and all(c['passed'] is True for c in producer_cases)
+    assert all(c['finalised']==(i<3) and c['normalStopCancellationPresent'] and c['producerCapabilitySingleUse'] and
+       c['duplicateFinishPreservedBytes'] and c['recordingClosedBeforeTransport'] for i,c in enumerate(producer_cases))
+    ffmpeg=shutil.which('ffmpeg');assert ffmpeg,'Existing native decoder oracle ffmpeg is required'
+    producer_proofs=[]
+    for case in producer_cases[:3]:
+        media=fixture/case['name']/case['file']
+        assert media.is_file() and not media.is_symlink() and media.resolve().parent==(fixture/case['name']).resolve()
+        probe=invoke([ffprobe,'-v','error','-count_frames','-show_streams','-of','json',str(media)],case['name']+'-streams.local.json',15)
+        streams=json.loads(probe.read_text())['streams'];audio=[x for x in streams if x['codec_type']=='audio'];video=[x for x in streams if x['codec_type']=='video']
+        assert len(audio)==1 and audio[0]['codec_name']=='aac' and int(audio[0]['sample_rate'])==48000 and int(audio[0]['nb_read_frames'])>0
+        assert len(video)==int(case['hasVideo'])
+        if video:assert video[0]['codec_name']=='h264' and int(video[0]['nb_read_frames'])==10
+        invoke([ffmpeg,'-nostdin','-v','error','-xerror','-threads','1','-i',str(media),'-map','0','-f','null','-'],case['name']+'-decode.local.log',20)
+        producer_proofs.append({'name':case['name'],'mediaSHA256':sha(media),'bytes':media.stat().st_size,'streams':streams,'decodedWithoutErrors':True})
+    assert len(commands)==13
+    (evidence/'producer-finalisation-proofs.local.json').write_text(json.dumps(producer_proofs,indent=2)+'\n')
     passed=True
 except BaseException as error:failure=type(error).__name__+': '+str(error)
 finally:
@@ -193,9 +213,9 @@ finally:
        'unconfirmedOwnedGroupPID':active['child'].pid if active is not None else None,
        'pendingDeferredSignal':pending_signal,'launchGuardCleared':not launch_in_progress,
        'scratchPreservedForUnconfirmedCleanup':scratch is not None and not groups_stopped and scratch.exists(),
-       'scratchRemoved':scratch is None or not scratch.exists(),'expectedCommands':7,'expectedCases':5,'actualCases':len(summary['cases']) if summary else None,
+       'scratchRemoved':scratch is None or not scratch.exists(),'expectedCommands':13,'expectedCases':5,'expectedProducerCases':10,'actualCases':len(summary['cases']) if summary else None,
        'mediaFilesCreated':True,'generatedOnly':True,'deviceActions':False,'networkActions':False,
-       'scope':'Actual generated native AAC through original ingress validated sample to SDK adapter/FS; all receipts incomplete and app admission unknown. Exact stored payload hashes, not decoder/native presentation, actual CaptureEngine admission, default switch, crash durability/recovery, aggregate2s or physical acceptance.'}
+       'scope':'Actual generated native AAC through original ingress validated sample to SDK adapter/FS; original5 stored-input controls incomplete. Separate10 concrete native producer cases include3 checked finalised files with actual decoder success; same native close method as CaptureEngine with empty stopped session. No new presentation equivalence, camera/device, default switch, crash durability/recovery, aggregate2s or physical acceptance.'}
     (evidence/'receipt.local.json').write_text(json.dumps(receipt,indent=2)+'\n');print(json.dumps(receipt),flush=True)
 if not receipt['passed']:raise SystemExit(1)
 PY

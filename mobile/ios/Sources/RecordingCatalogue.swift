@@ -489,6 +489,11 @@ final class RecordingCatalogue {
         private let catalogue: RecordingCatalogue
         private let token: UUID
         let identity: Identity
+        var finalisedURL: URL? {
+            lock.lock(); defer { lock.unlock() }
+            guard phase == .closed, storedInputsResult?.outcome == .finalised else { return nil }
+            return catalogue.root.url.appendingPathComponent(identity.filename)
+        }
         private let createdAtMs: Int64
         private let outputLimit: UInt64
         private var descriptor: Int32?
@@ -734,10 +739,24 @@ final class RecordingCatalogue {
         }
         /// Closed-header installation is still only submitted-input storage.
         /// Every receipt in this path remains explicitly incomplete.
-        struct StoredInputsClosure { let bytes: UInt64; let durationMs: Int64 }
+        struct StoredInputsClosure { let bytes: UInt64; let durationMs: Int64; let outcome: Completion }
         private var storedInputsResult: StoredInputsClosure?
         func finishStoredInputs(header: Data, durationMs: Int64, checkpoint: InstalledMetadataReceipt,
                                 willCommit: () throws -> Void) throws -> StoredInputsClosure {
+            try finishInputs(header: header, durationMs: durationMs, checkpoint: checkpoint) {
+                try willCommit(); return .incomplete
+            }
+        }
+        /// Trusted storage classification primitive, not capture proof. The
+        /// sole production compound-owner caller consumes its concrete native
+        /// authority at this callback. Like legacy ReceiptOwner.complete, this
+        /// filesystem layer does not inspect codecs or mint app authority.
+        func finishCaptureInputs(header: Data, durationMs: Int64, checkpoint: InstalledMetadataReceipt,
+                                 willCommit: () throws -> Completion) throws -> StoredInputsClosure {
+            try finishInputs(header: header, durationMs: durationMs, checkpoint: checkpoint, willCommit: willCommit)
+        }
+        private func finishInputs(header: Data, durationMs: Int64, checkpoint: InstalledMetadataReceipt,
+                                  willCommit: () throws -> Completion) throws -> StoredInputsClosure {
             lock.lock()
             if let storedInputsResult { lock.unlock(); return storedInputsResult }
             guard phase == .open else { let active = phase == .closing; lock.unlock(); throw active ? Failure.busy : Failure.closed }
@@ -791,13 +810,13 @@ final class RecordingCatalogue {
                 guard try catalogue.appendPath(identity.filename).file == installed.file else { throw Failure.changed }
                 try checkSlots()
                 // Scalar decision only. No publication, SDK or IO in callback.
-                try willCommit()
-                try installStoredReceipt(Receipt(version: 1, identity: identity, state: "incomplete", createdAtMs: createdAtMs,
+                let outcome = try willCommit()
+                try installStoredReceipt(Receipt(version: 1, identity: identity, state: outcome.rawValue, createdAtMs: createdAtMs,
                     durationMs: durationMs, file: installed.file, appendSource: source), previous: receiptBefore)
                 try checkClosedSource(end: end); try checkSlots()
                 guard try catalogue.appendPath(identity.filename).file == installed.file else { throw Failure.changed }
                 try catalogue.releaseAppend(token, child: self) // LAST fallible action.
-                let result = StoredInputsClosure(bytes: end, durationMs: durationMs)
+                let result = StoredInputsClosure(bytes: end, durationMs: durationMs, outcome: outcome)
                 lock.lock(); storedInputsResult = result; closedResult = ClosedAppend(bytes: end); phase = .closed; lock.unlock()
                 return result
             } catch {

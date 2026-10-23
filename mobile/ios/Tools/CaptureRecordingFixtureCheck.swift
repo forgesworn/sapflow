@@ -27,6 +27,7 @@ private final class RecordingTrace {
     private var packets: [[String: Any]] = []
     private var recordingErrors = 0, publishingErrors = 0, mediaErrors = 0, refused = 0
     private var callbackError: Error?
+    private var originalUnit: CompressedUnit?
     private var generations: [AudioRecordingTiming.GenerationExtent] = []
     func packet(_ unit: CompressedUnit) {
         do {
@@ -40,6 +41,7 @@ private final class RecordingTrace {
             let hash = SHA256.hash(data: view).map { String(format: "%02x", $0) }.joined()
             lock.lock(); defer { lock.unlock() }
             guard packets.count < 512 else { throw CaptureFailure(message: "Generated packet retention bound") }
+            if originalUnit == nil { originalUnit = unit }
             packets.append(["size": total, "sha256": hash])
         } catch { lock.lock(); callbackError = callbackError ?? error; lock.unlock() }
     }
@@ -52,6 +54,7 @@ private final class RecordingTrace {
     }
     func refusal() { lock.lock(); refused += 1; lock.unlock() }
     func check() throws { lock.lock(); let error = callbackError; lock.unlock(); if let error { throw error } }
+    var firstUnit: CompressedUnit? { lock.lock(); defer { lock.unlock() }; return originalUnit }
     var packetSnapshot: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return packets }
     var counters: (recording: Int, publishing: Int, media: Int, refused: Int) {
         lock.lock(); defer { lock.unlock() }; return (recordingErrors, publishingErrors, mediaErrors, refused)
@@ -235,6 +238,122 @@ enum CaptureRecordingFixtureCheck {
             "mixedGeneration": mixed ? trace.receiptSnapshot.map { ["generation": $0.generation,
                 "rawFrames": $0.rawFrames, "zeroFrames": $0.zeroFrames, "inputFrames": $0.inputFrames] } : []]
     }
+    /// Generated native sources exercise the SAME concrete producer close as
+    /// CaptureEngine. The real session is empty/stopped; no camera proof.
+    private static func producer(_ name: String, root: URL) throws -> [String: Any] {
+        let av = name == "producer-av", publishFailure = name == "producer-publishing-failure"
+        let lateDrop = name == "producer-late-native-drop", recordingLoss = name == "producer-recording-loss"
+        let early = name == "producer-input-not-closed", wrong = name == "producer-wrong-worker"
+        let wrongTicket = name == "producer-wrong-ticket"
+        let lateEncoded = name == "producer-late-encoded-output", lateTiming = name == "producer-late-timing"
+        let holdCommit = lateDrop || recordingLoss || lateEncoded || lateTiming
+        let expectedComplete = !holdCommit && !early && !wrong && !wrongTicket
+        let gate = CaptureAdmission(), profile: CaptureIntent = av ? .audioVideo(.sd480p30) : .audioOnly48kMono
+        let prep = try unwrap(gate.reservePreparation(profile: profile))
+        try requireCaptureRecording(gate.attached(prep) && gate.beginPermissions(prep) && gate.prepared(prep), "Producer preparation")
+        let start = try unwrap(gate.reserveStart(prep)), run = try unwrap(gate.reserveMediaRun(start))
+        let captureAdmission = RecordingCaptureAdmission()
+        let staleTicket = try unwrap(captureAdmission.begin(.segment(start)))
+        try requireCaptureRecording(captureAdmission.closed(staleTicket, cleanupComplete: true), "Old ticket cleanup")
+        let ticket = try unwrap(captureAdmission.begin(.segment(start)))
+        try requireCaptureRecording(captureAdmission.activate(ticket), "Actual recording ticket activation")
+        try requireCaptureRecording(gate.commitMediaRun(run, start: start, nowNs: DispatchTime.now().uptimeNanoseconds, broadcasting: true), "Producer commit")
+        let token = try unwrap(gate.mediaToken(run, kind: .raw))
+        let capacity = RecordingCatalogue.AppendIO(write: { Darwin.write($0, $1, $2) }, synchronize: Darwin.fsync,
+            availableBytes: { _ in 1024 * 1024 * 1024 })
+        let headerEntered = DispatchSemaphore(value: 0), releaseHeader = DispatchSemaphore(value: 0)
+        var heldHeader = false // actual recordingIO owner only
+        let updates = RecordingCatalogue.MediaUpdateIO(write: { fd, buffer, count, offset in
+            if holdCommit && !heldHeader {
+                heldHeader = true; headerEntered.signal()
+                if releaseHeader.wait(timeout: .now() + 8) != .success { errno = ETIMEDOUT; return -1 }
+            }
+            return Darwin.pwrite(fd, buffer, count, offset)
+        }, synchronize: Darwin.fsync)
+        let catalogue = try RecordingCatalogue(root: root, mediaUpdateIO: updates, appendIO: capacity)
+        defer { releaseHeader.signal() }
+        defer { try? catalogue.close() }
+        let identity = try catalogue.newShow(profile: profile).nextIdentity()
+        let io = DispatchQueue(label: "fixture.producer.recording"), samples = DispatchQueue(label: "fixture.producer.samples")
+        let trace = RecordingTrace(), recorder = try io.sync {
+            try CaptureRecording.open(catalogue: catalogue, identity: identity, queue: io, selection: .sdkCheckpointed) { _ in trace.error("recording") }
+        }
+        let ingress = RustEncodedIngress(); ingress.reset(hasVideo: av)
+        let transport = RecordingTransportSpy(failOffer: publishFailure); ingress.destination = transport
+        defer { transport.releaseClose() }
+        let encoded = DispatchQueue(label: "fixture.producer.ingress")
+        let worker = try IngressWorker(run: run, ingress: ingress, recorder: recorder, admission: gate,
+            boundary: { _ in }, terminal: { _ in }, mediaFailure: { _ in trace.error("media") },
+            failure: { _ in trace.error("publishing") }, statistics: { _, _ in }, queue: encoded)
+        try requireCaptureRecording(worker.startPublishing(), "Producer publishing start")
+        weak var callback: NativeAudioEncoder?
+        let audio = try NativeAudioEncoder(receiptMode: recorder.audioReceiptMode, output: { unit in
+            trace.packet(unit)
+            if !worker.offer(unit, token: token, audioGeneration: callback?.lastOutputGeneration) { trace.refusal() }
+        }, meter: { _ in }, recordingTiming: { worker.audioTiming($0) })
+        callback = audio
+        let video: HardwareVideoEncoder?
+        if av {
+            video = try HardwareVideoEncoder(orientation: .landscapeRight, profile: .sd480p30,
+                output: { unit, source in _ = worker.offer(unit, token: source) },
+                fault: { source, _ in _ = gate.nativeFault(source ?? token) },
+                permitsInput: { gate.allowsInput($0) == .allow })
+        } else { video = nil }
+        let session = AVCaptureSession(), wrongOwner = NSObject()
+        let expectedWorker: AnyObject = wrong ? wrongOwner : worker
+        let producer = CaptureRecordingProducer(run: run, ticket: wrongTicket ? staleTicket : ticket, recorder: recorder,
+            worker: expectedWorker, audio: audio, video: video, session: session, samples: samples, admission: gate, recordingAdmission: captureAdmission)
+        let source = try format(), input = try unwrap(audio.inputToken)
+        try samples.sync {
+            try feed(audio, token: input, source: source, start: 0, frames: 16_137, ingress: encoded)
+            if let video {
+                let slate = try video.prepareSlate()
+                for index in 0..<10 {
+                    try requireCaptureRecording(try slate.withImage { try video.encode($0, time: CMTime(value: Int64(index), timescale: 30), token: token) }, "Generated video submission")
+                }
+            }
+        }
+        // Real normal Stop cancellation is deliberately present. It must not
+        // stand in for media loss or prevent a genuine clean close.
+        _ = gate.stop(); captureAdmission.cancel(prep)
+        if !early { producer.stopInput() }
+        let closure = try samples.sync { try producer.finish() }
+        try requireCaptureRecording(try samples.sync { try producer.finish() } == nil, "Native producer closure minted twice")
+        encoded.sync {}; io.sync {}
+        let result = RecordingReply<CaptureRecording.Completion>(), published = RecordingReply<Result<Void, Error>>()
+        worker.finish(producers: closure, recording: { result.put($0) }, publishing: { published.put($0) })
+        if holdCommit {
+            try requireCaptureRecording(headerEntered.wait(timeout: .now() + 8) == .success, "Actual final-header IO was not held")
+            if lateDrop { try requireCaptureRecording(gate.nativeDrop(token), "Queued native drop did not latch after Stop") }
+            if recordingLoss { recorder.markIncomplete(CaptureFailure(message: "Deliberate recording-only terminal loss")) }
+            if lateEncoded {
+                let unit = try unwrap(trace.firstUnit)
+                try requireCaptureRecording(!worker.offer(unit, token: token, audioGeneration: 1), "Late native output was accepted")
+            }
+            if lateTiming { worker.audioTiming(.failed) }
+            releaseHeader.signal()
+        }
+        let completed = try result.wait()
+        try requireCaptureRecording(completed.cleanupComplete && completed.finalised == expectedComplete &&
+            (completed.fileURL != nil) == expectedComplete, "Incorrect concrete producer finalisation outcome")
+        try requireCaptureRecording(!published.ready && !transport.cleanupComplete, "Producer recording waited for transport")
+        transport.releaseClose(); try published.wait().get()
+        let media = root.appendingPathComponent(identity.filename), before = try Data(contentsOf: media)
+        let repeated = RecordingReply<CaptureRecording.Completion>()
+        worker.finish(producers: closure, recording: { repeated.put($0) }, publishing: { _ in })
+        let joined = try repeated.wait()
+        try requireCaptureRecording(joined.finalised == expectedComplete && joined.cleanupComplete &&
+            (try Data(contentsOf: media)) == before && transport.counts.finishes == 1, "Duplicate finish repeated terminal IO")
+        let entry = try unwrap(try catalogue.scan().first { $0.segmentID == identity.segmentID })
+        try requireCaptureRecording(entry.state == (expectedComplete ? .finalised : .incomplete), "Producer catalogue classification")
+        try trace.check()
+        return ["name": name, "passed": true, "finalised": completed.finalised, "file": identity.filename,
+            "sourceAudioUnits": trace.packetSnapshot.count, "hasVideo": av, "nativeVideoFramesSubmitted": av ? 10 : 0,
+            "recordingClosedBeforeTransport": true, "normalStopCancellationPresent": true,
+            "producerCapabilitySingleUse": true, "duplicateFinishPreservedBytes": true,
+            "publishingFailures": trace.counters.publishing, "bytes": before.count,
+            "scope": "Generated native audio/video producer closure and real SDK file, empty stopped session, no camera/device acceptance"]
+    }
     private static func unwrap<T>(_ value: T?) throws -> T {
         guard let value else { throw CaptureFailure(message: "Generated fixture missing actual value") }; return value
     }
@@ -295,10 +414,19 @@ enum CaptureRecordingFixtureCheck {
                 rows.append(try run(name, root: folder))
             } catch { rows.append(["name": name, "passed": false, "error": String(describing: error)]) }
         }
+        var producerRows: [[String: Any]] = []
+        for name in ["producer-audio", "producer-av", "producer-publishing-failure", "producer-late-native-drop", "producer-recording-loss", "producer-input-not-closed", "producer-wrong-worker", "producer-late-encoded-output", "producer-late-timing", "producer-wrong-ticket"] {
+            do {
+                let folder = root.appendingPathComponent(name, isDirectory: true)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                producerRows.append(try producer(name, root: folder))
+            } catch { producerRows.append(["name": name, "passed": false, "error": String(describing: error)]) }
+        }
         let passed = rows.count == 5 && rows.allSatisfy { $0["passed"] as? Bool == true }
+            && producerRows.count == 10 && producerRows.allSatisfy { $0["passed"] as? Bool == true }
         do {
-            let result: [String: Any] = ["passed": passed, "cases": rows, "generatedOnly": true,
-                "scope": "Actual native AAC, existing ingress validated handles, SDK adapter/FS and fake transport only. Every receipt incomplete; no CaptureEngine producer proof, native decoder, app/default switch, physical acceptance or aggregate2s proof."]
+            let result: [String: Any] = ["passed": passed, "cases": rows, "producerCases": producerRows, "generatedOnly": true,
+                "scope": "Actual native AAC, existing ingress validated handles, SDK adapter/FS and fake transport only. Five stored-input controls remain incomplete. Separate producer cases execute the same concrete native close as CaptureEngine; no camera/device, app/default switch, presentation-equivalence or aggregate2s proof."]
             FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]))
             FileHandle.standardOutput.write(Data([10]))
         } catch { exit(2) }

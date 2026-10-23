@@ -2,7 +2,8 @@ import Foundation
 import Sapflow
 
 /// Closed concrete selection, frozen before CaptureRun/native construction.
-/// Legacy remains the product default; SDK stored inputs are always incomplete.
+/// Legacy remains the product default. SDK finalisation requires the concrete
+/// native producer and ingress closure; submitted-input-only finish is incomplete.
 final class CaptureRecording {
     enum BackendSelection: Equatable { case legacy, sdkCheckpointed }
     typealias Completion = CompressedRecorder.Completion
@@ -62,10 +63,10 @@ final class CaptureRecording {
         case let .sdk(value): value.checkStorage(completion)
         }
     }
-    func finish(incomplete: Bool = false, _ completion: @escaping (Completion) -> Void) {
+    func finish(incomplete: Bool = false, producers: CaptureRecordingClosure? = nil, _ completion: @escaping (Completion) -> Void) {
         switch backend {
         case let .legacy(value): value.finish(incomplete: incomplete, completion)
-        case let .sdk(value): value.finish(incomplete: incomplete, completion)
+        case let .sdk(value): value.finish(incomplete: incomplete, producers: producers, recorder: self, completion)
         }
     }
 }
@@ -79,6 +80,7 @@ private final class SDKCaptureRecorder {
     private let onFailure: (Error) -> Void
     private let terminalLock = NSLock()
     private var terminalAdmission = false
+    private let loss = CaptureRecordingLoss()
     private var terminalObserverBound = false
     private var terminalObserver: (() -> Void)?
     private var failure: Error?
@@ -99,6 +101,7 @@ private final class SDKCaptureRecorder {
         terminalLock.unlock(); if now { closed() }; return true
     }
     private func closeFailedAdmission() {
+        loss.mark()
         budget.close()
         terminalLock.lock()
         guard !terminalAdmission else { terminalLock.unlock(); return }
@@ -163,7 +166,7 @@ private final class SDKCaptureRecorder {
             catch { self.fail(error); completion(.failure(error)) }
         }
     }
-    func finish(incomplete: Bool, _ completion: @escaping (CaptureRecording.Completion) -> Void) {
+    func finish(incomplete: Bool, producers: CaptureRecordingClosure?, recorder: CaptureRecording, _ completion: @escaping (CaptureRecording.Completion) -> Void) {
         budget.close(enqueueOn: queue) {
             if let result = self.completed { completion(result); return }
             guard !self.finishing else { if self.joinedCompletion == nil { self.joinedCompletion = completion }; return }
@@ -171,7 +174,12 @@ private final class SDKCaptureRecorder {
             if incomplete && self.failure == nil { self.failure = CaptureFailure(message: "Recording ended with missing encoded media") }
             if !self.fileEOF && self.failure == nil { self.failure = CaptureFailure(message: "Native AAC file EOF receipt is unavailable") }
             let outcome: NativeRecordingCompletion = self.failure == nil && self.fileEOF ? .complete : .incompletePrefix
-            do { _ = try self.owner.finishStoredInputs(outcome: outcome) }
+            var closed: RecordingCheckpointOwner.StoredInputsClosure?
+            do {
+                if let producers, self.failure == nil, producers.closeRecorder(recorder, owner: self.owner, loss: self.loss) {
+                    closed = try self.owner.finishCaptureInputs(producers)
+                } else { closed = try self.owner.finishStoredInputs(outcome: outcome) }
+            }
             catch {
                 if self.failure == nil { self.failure = error }
                 // A pre-terminal SDK failure may still checked-close incomplete.
@@ -179,7 +187,8 @@ private final class SDKCaptureRecorder {
                 do { _ = try self.owner.closeIncomplete() }
                 catch { if self.failure == nil { self.failure = error } }
             }
-            let result = CaptureRecording.Completion(fileURL: nil, finalised: false,
+            let finalised = closed?.applicationAdmission == .completeCapture && self.failure == nil
+            let result = CaptureRecording.Completion(fileURL: finalised ? self.owner.fileURL : nil, finalised: finalised,
                 cleanupComplete: self.owner.cleanupComplete, failure: self.failure)
             self.completed = result
             let joined = self.joinedCompletion; self.joinedCompletion = nil
