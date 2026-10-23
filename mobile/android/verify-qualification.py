@@ -26,7 +26,8 @@ AAC_PROBE_MARKERS = (b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificatio
                      b"Ldev/forgesworn/sapflow/broadcaster/NativeAacLeadingAlignment;",
                      b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_LEADING",
                      b"Ldev/forgesworn/sapflow/broadcaster/NativeAacProgrammeWindowProbe;",
-                     b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_WINDOW_REFERENCE")
+                     b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_WINDOW_REFERENCE",
+                     b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_SDK_WINDOW")
 FIXTURE_CA = "res/raw/sapflow_qualification_ca.der"
 FIXTURE_CONFIG = "res/xml/sapflow_qualification_network_security.xml"
 
