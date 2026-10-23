@@ -3,6 +3,8 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use sapflow_hls::recording_checkpoint::*;
+use sapflow_hls::recording_programme as programme;
+use sapflow_hls::recording_programme_checkpoint as programme_checkpoint;
 
 fn scalar(data: &[u8], at: usize) -> u64 {
     let mut out = [0; 8];
@@ -17,6 +19,99 @@ fn decode_invariant(bytes: &[u8], expected: &CheckpointBinding) {
         let canonical = encode(value.as_ref()).expect("decoded facts encode canonically");
         assert_eq!(canonical, bytes);
     }
+    if let Ok(value) = programme_checkpoint::decode(bytes, expected) {
+        assert_eq!(value.info.context.base.binding, *expected);
+        let canonical = programme_checkpoint::encode(value.as_ref())
+            .expect("V2 decoded facts encode canonically");
+        assert_eq!(canonical, bytes);
+    }
+}
+// Supplied scalar geometry only; no native/source/storage authority is simulated.
+fn programme_invariants(data: &[u8], binding: CheckpointBinding, header: &[u8]) {
+    let selector = scalar(data, 0);
+    let origin = scalar(data, 16) % 48_000;
+    let units = selector % 4 + 1;
+    let first = origin + 8192;
+    let mut info = programme_checkpoint::ProgrammeCheckpointInfo {
+        context: programme_checkpoint::ProgrammeCheckpointContext {
+            base: CheckpointContext {
+                binding,
+                media_epoch_ns: scalar(data, 24),
+                initial_header_len: header.len() as u32,
+                initial_header_sha256: metadata_sha256(header),
+            },
+            start: programme::ProgrammeWindowStart {
+                generation: 7,
+                coded_origin: origin,
+                preparation_frames: 8192,
+                measured_displacement: 2048,
+                discard_prefix_frames: 8192,
+                movie_delay_ticks: scalar(data, 8) % 720_000,
+            },
+        },
+        facts: programme_checkpoint::ProgrammeCheckpointFacts {
+            sequence: 1,
+            span: programme::ObservedProgrammeSpan {
+                first_dts: first,
+                end_dts: first + units * 1024,
+                access_units: units,
+            },
+            container_end: first + units * 1024,
+            leading_frames: 2048,
+            trailing_frames: 0,
+            window_end: None,
+        },
+        committed_offset: header.len() as u64 + 100,
+        fragment_region_bytes: 100,
+        fragment_region_sha256: [13; 32],
+    };
+    let bytes = programme_checkpoint::encode(programme_checkpoint::ProgrammeCheckpointRef {
+        info: &info,
+        header,
+    })
+    .expect("structured V2 incomplete prefix");
+    decode_invariant(&bytes, &binding);
+    let prior = info;
+    info.facts.sequence = 2;
+    info.facts.span.access_units = 5;
+    info.facts.span.end_dts = first + 5120;
+    info.facts.trailing_frames = 307;
+    info.facts.container_end = info.facts.span.end_dts - 307;
+    info.facts.window_end = Some(programme::ProgrammeGenerationEnd {
+        generation: 7,
+        coded_frames: 13_312 + selector % 4 * 1024,
+        queued: programme::QueuedProgrammeFrames {
+            preparation: 8192,
+            programme_raw: 1517,
+            programme_zero: 1248,
+            block_padding: 307,
+            codec_drain: 4096,
+        },
+    });
+    info.committed_offset += 123;
+    info.fragment_region_bytes += 123;
+    programme_checkpoint::validate_successor(&prior, &info)
+        .expect("structured V2 terminal next prefix");
+    let complete = programme_checkpoint::encode(programme_checkpoint::ProgrammeCheckpointRef {
+        info: &info,
+        header,
+    })
+    .expect("structured V2 complete geometry");
+    decode_invariant(&complete, &binding);
+    assert!(
+        programme_checkpoint::validate_successor(&info, &prior).is_err(),
+        "V2 complete geometry is terminal"
+    );
+    let mut changed = if selector & 1 == 0 { bytes } else { complete };
+    for (n, record) in data.chunks(3).take(64).enumerate() {
+        let at = (usize::from(record[0]) + n * 257) % changed.len();
+        changed[at] ^= record.get(1).copied().unwrap_or(1);
+    }
+    decode_invariant(&changed, &binding);
+    let end = changed.len() - 32;
+    let checksum = metadata_sha256(&changed[..end]);
+    changed[end..].copy_from_slice(&checksum);
+    decode_invariant(&changed, &binding);
 }
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_CHECKPOINT_BYTES * 2 {
@@ -112,6 +207,7 @@ fuzz_target!(|data: &[u8]| {
     let hash = metadata_sha256(&changed[..end]);
     changed[end..].copy_from_slice(&hash);
     decode_invariant(&changed, &binding);
+    programme_invariants(data, binding, &header);
     let prior = info;
     info.facts.sequence = 2;
     info.facts.audio_units += 1;

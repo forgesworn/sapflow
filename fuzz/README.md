@@ -212,3 +212,13 @@ Local finite runs may select `-max_len=66081` to include oversized raw inputs.
 Use the worktree target and the normal ASan/overflow flags; never set a fresh
 CARGO_TARGET_DIR. Candidate source preparation is not a compiled/replayed or
 fuzzed result. Record actual gates before claiming those outcomes.
+
+The same `recording_checkpoint` target also exercises the separately typed
+`recording_programme_checkpoint` SFCP0002 decoder and canonical encoder. It keeps
+every V1 arm and adds structured V2 unknown-tail prefixes, complete submitted
+window geometry, exact successors/terminal rejection and checksum-valid field
+mutations. Source/coded/movie origins and queued input components remain scalar
+claims, not native or storage proof. Both codecs reject the other version; V1
+reserved bytes and wire semantics are unchanged. The V2 maximum remains66,080
+bytes and structured arms reach it without changing the existing CI raw-input
+cap or adding a target/dependency.

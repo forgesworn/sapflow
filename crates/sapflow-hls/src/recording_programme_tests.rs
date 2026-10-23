@@ -581,3 +581,49 @@ fn programme_header_refuses_otherwise_valid_stereo_configuration() {
         Err(TimingError::Unsupported)
     );
 }
+
+#[test]
+fn completed_window_can_describe_immutable_incomplete_prefix_without_reopening() {
+    let mut ledger = begun(start());
+    let old = ledger.prefix_presentation(observed()).expect("live prefix");
+    let window = ledger
+        .complete(end(), observed())
+        .expect("closed scalar geometry");
+    let prefix = window
+        .prefix_presentation(observed())
+        .expect("read-only closed-window prefix");
+    assert_eq!(prefix, old);
+    assert_eq!(prefix.trailing_frames(), 0);
+    assert_eq!(
+        prefix.completion(),
+        ProgrammePresentationCompletion::IncompletePrefix
+    );
+    assert_eq!(window.presentation().trailing_frames(), 307);
+    assert_eq!(
+        ledger.prefix_presentation(observed()),
+        Err(TimingError::Closed)
+    );
+    assert_eq!(ledger.completed(), Some(&window));
+}
+
+#[test]
+fn completed_window_prefix_rejects_future_or_foreign_original_spans() {
+    let window = complete();
+    for span in [
+        ObservedProgrammeSpan {
+            first_dts: 56_192,
+            end_dts: 62_336,
+            access_units: 6,
+        },
+        ObservedProgrammeSpan {
+            first_dts: 56_193,
+            end_dts: 61_313,
+            access_units: 5,
+        },
+    ] {
+        assert_eq!(
+            window.prefix_presentation(span),
+            Err(TimingError::Inconsistent)
+        );
+    }
+}

@@ -185,6 +185,18 @@ impl CheckedProgrammeWindow {
             completion: ProgrammePresentationCompletion::CompleteWindow,
         }
     }
+
+    /// Read-only unknown-tail prefix of this exact completed scalar window.
+    /// This does not reopen the ledger or issue another complete window.
+    pub fn prefix_presentation(
+        self,
+        observed: ObservedProgrammeSpan,
+    ) -> Result<ProgrammeRecordingPresentation, TimingError> {
+        if checked_span(self.start, observed)? > self.selected_frames {
+            return Err(TimingError::Inconsistent);
+        }
+        prefix_presentation(self.start, observed)
+    }
 }
 
 /// Scalar-only, constant-space ledger for one native generation per segment.
@@ -222,17 +234,7 @@ impl ProgrammeWindowLedger {
             return Err(TimingError::Closed);
         }
         let start = self.start.ok_or(TimingError::Inconsistent)?;
-        let frames = checked_span(start, observed)?;
-        let value = ProgrammeRecordingPresentation {
-            coded_start: start.coded_start,
-            coded_frames: frames,
-            leading_frames: start.head,
-            trailing_frames: 0,
-            movie_delay_ticks: start.value.movie_delay_ticks,
-            completion: ProgrammePresentationCompletion::IncompletePrefix,
-        };
-        value.movie_extent()?;
-        Ok(value)
+        prefix_presentation(start, observed)
     }
 
     /// Check source/window conservation against the actually retained span.
@@ -309,6 +311,22 @@ impl ProgrammeWindowLedger {
     pub fn completed(&self) -> Option<&CheckedProgrammeWindow> {
         self.complete.as_ref()
     }
+}
+
+fn prefix_presentation(
+    start: CheckedStart,
+    observed: ObservedProgrammeSpan,
+) -> Result<ProgrammeRecordingPresentation, TimingError> {
+    let value = ProgrammeRecordingPresentation {
+        coded_start: start.coded_start,
+        coded_frames: checked_span(start, observed)?,
+        leading_frames: start.head,
+        trailing_frames: 0,
+        movie_delay_ticks: start.value.movie_delay_ticks,
+        completion: ProgrammePresentationCompletion::IncompletePrefix,
+    };
+    value.movie_extent()?;
+    Ok(value)
 }
 
 fn checked_span(start: CheckedStart, observed: ObservedProgrammeSpan) -> Result<u64, TimingError> {

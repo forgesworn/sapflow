@@ -10,6 +10,7 @@ fun main() {
     checkNetworkRecoveryAxes()
     checkNativeRecordingTimingBinding()
     checkSharedAacTimingViews()
+    checkProgrammeWindowCheckpoints()
     val input = ByteBuffer.allocateDirect(4)
     input.put(byteArrayOf(1, 2, 3, 4)).flip()
     EncodedBuffer(input).use { sample ->
@@ -137,6 +138,124 @@ fun main() {
         }
     }
     println("Sapflow Kotlin direct-buffer ownership consumer passed")
+}
+
+/** Real generated SDK container calls over synthetic compressed bytes only.
+ * Supplied source/end scalars certify no native codec, source or file closure. */
+private fun checkProgrammeWindowCheckpoints() {
+    val asc = ByteBuffer.allocateDirect(2).put(byteArrayOf(0x11, 0x88.toByte())).apply { flip() }
+    val start = NativeProgrammeWindowStart(7uL, 48_000uL, 8192uL, 2048uL, 8192uL, 0uL)
+    val end = NativeProgrammeGenerationEnd(7uL, NativeProgrammeQueuedFrames(8192uL, 1517uL, 1248uL, 307uL, 4096uL), 15_360uL)
+    val recording = ByteArray(32) { 7 }; val file = ByteArray(32) { 9 }
+    MediaCodec.aac(asc).use { codec ->
+        NativeRecordingMuxer.withProgrammeAacTiming(0uL, 4096uL, 100u).use { mux ->
+            mux.beginProgrammeWindow(start)
+            var first: NativeProgrammeCheckpoint? = null
+            var firstSlot: ByteArray? = null
+            var firstRegion: ByteArray? = null
+            var previous: DecodedProgrammeCheckpoint? = null
+            var initialSize = 0
+            var initialHash = byteArrayOf()
+            var regionBytes = 0uL
+            var terminal = false
+            val hash = MessageDigest.getInstance("SHA-256")
+            fun drain() {
+                while (true) {
+                    val chunk = mux.takeProgrammeOutput() ?: break
+                    check(chunk.bytes.isNotEmpty())
+                    if (chunk.kind == NativeRecordingChunkKind.INITIAL) {
+                        check(initialSize == 0 && chunk.checkpoint == null)
+                        initialSize = chunk.bytes.size
+                        initialHash = MessageDigest.getInstance("SHA-256").digest(chunk.bytes)
+                    }
+                    if (chunk.kind == NativeRecordingChunkKind.FINAL_HEADER) check(chunk.bytes.size == initialSize)
+                    val token = chunk.checkpoint
+                    if (first == null && token != null) first = token
+                    try {
+                        if (chunk.kind == NativeRecordingChunkKind.FRAGMENT) {
+                            val issued = checkNotNull(token)
+                            regionBytes += chunk.bytes.size.toULong(); hash.update(chunk.bytes)
+                            val regionHash = (hash.clone() as MessageDigest).digest()
+                            val encoded = mux.encodeProgrammeCheckpoint(issued, recording, file, regionHash)
+                            check(encoded.bytes.copyOfRange(0, 8).contentEquals("SFCP0002".toByteArray()))
+                            check(encoded.info.facts == issued.facts() && encoded.info.start == start)
+                            check(encoded.info.initialHeaderLen == initialSize.toUInt())
+                            check(encoded.info.initialHeaderSha256.contentEquals(initialHash))
+                            check(encoded.info.fragmentRegionBytes == regionBytes)
+                            check(encoded.info.committedOffset == initialSize.toULong() + regionBytes)
+                            check(encoded.info.fragmentRegionSha256.contentEquals(regionHash))
+                            val decoded = decodeProgrammeCheckpoint(encoded.bytes, recording, file)
+                            try {
+                                check(decoded.info().facts == encoded.info.facts && decoded.info().start == start)
+                                check(decoded.header().contentEquals(mux.programmeCheckpointHeader(issued)))
+                                check(decoded.presentationExtent() == issued.presentationExtent())
+                                previous?.let { validateProgrammeCheckpointSuccessor(it, decoded) }
+                                previous?.close(); previous = decoded
+                            } catch (failure: Throwable) { decoded.close(); throw failure }
+                            if (firstSlot == null) { firstSlot = encoded.bytes; firstRegion = regionHash }
+                            terminal = issued.facts().windowGeometryComplete
+                            if (terminal) {
+                                check(issued.facts().audioUnits == 5uL && issued.facts().audioStart == 56_192uL)
+                                check(issued.facts().audioEnd == 61_312uL && issued.facts().audioContainerEnd == 61_005uL)
+                                check(issued.facts().trailingFrames == 307u)
+                                check(issued.windowEnd() == end)
+                                check(issued.presentationExtent().durationTicks == 41_475uL)
+                            }
+                        }
+                    } finally { if (token !== first) token?.close() }
+                }
+            }
+            try {
+                repeat(5) { n ->
+                    val tick = 56_192L + n * 1024L
+                    val bytes = ByteBuffer.allocateDirect(2).put(byteArrayOf(0x21, n.toByte())).apply { flip() }
+                    codec.sample(bytes, tick, tick, 1024u, 48_000u, false).use { mux.push(it) }; drain()
+                }
+                val issued = checkNotNull(first)
+                check(issued.facts().audioUnits == 4uL && !issued.facts().windowGeometryComplete)
+                check(issued.facts().audioStart == 56_192uL && issued.presentationExtent().durationTicks == 30_720uL)
+                try { mux.takeNativeOutput(); error("programme output used converter API") }
+                catch (_: NativeRecordingException.InvalidConfig) {}
+                NativeRecordingMuxer.withProgrammeAacTiming(0uL, 4096uL, 100u).use { other ->
+                    other.beginProgrammeWindow(start)
+                    repeat(5) { n ->
+                        val tick = 56_192L + n * 1024L
+                        codec.sample(ByteBuffer.allocateDirect(1).put(1).apply { flip() }, tick, tick, 1024u, 48_000u, false).use { other.push(it) }
+                        while (true) { val output = other.takeProgrammeOutput() ?: break; output.checkpoint?.close() }
+                    }
+                    try { other.encodeProgrammeCheckpoint(issued, recording, file, checkNotNull(firstRegion)); error("foreign programme token") }
+                    catch (_: RecordingCheckpointException.ForeignCheckpoint) {}
+                }
+                try { decodeRecordingCheckpoint(checkNotNull(firstSlot), recording, file).close(); error("V2 reinterpreted as V1") }
+                catch (_: RecordingCheckpointException.Unsupported) {}
+                val prefixExtent = issued.presentationExtent()
+                mux.closeProgrammeWindow(end)
+                mux.finishProgramme(NativeProgrammeCompletion.COMPLETE_SUBMITTED_WINDOW)
+                drain(); check(terminal)
+                check(mux.stats().durationMs == 58uL && mux.stats().acceptedSamples == 5uL)
+                mux.cancel()
+                val old = mux.encodeProgrammeCheckpoint(issued, recording, file, checkNotNull(firstRegion))
+                check(old.bytes.contentEquals(checkNotNull(firstSlot)) && issued.presentationExtent() == prefixExtent)
+            } finally { previous?.close(); first?.close() }
+        }
+        NativeRecordingMuxer.withProgrammeAacTiming(0uL, 4096uL, 100u).use { incomplete ->
+            incomplete.beginProgrammeWindow(start)
+            repeat(5) { n ->
+                val tick = 56_192L + n * 1024L
+                codec.sample(ByteBuffer.allocateDirect(1).put(1).apply { flip() }, tick, tick, 1024u, 48_000u, false).use { incomplete.push(it) }
+                while (true) { val chunk = incomplete.takeProgrammeOutput() ?: break; chunk.checkpoint?.close() }
+            }
+            incomplete.closeProgrammeWindow(end)
+            incomplete.finishProgramme(NativeProgrammeCompletion.INCOMPLETE_PREFIX)
+            var checked = false
+            while (true) {
+                val chunk = incomplete.takeProgrammeOutput() ?: break
+                chunk.checkpoint?.use { token -> check(!token.facts().windowGeometryComplete && token.facts().trailingFrames == 0u); checked = true }
+            }
+            check(checked)
+        }
+    }
+    println("Sapflow Kotlin programme window checkpoints passed")
 }
 
 /** Synthetic compressed bytes check generated ownership/API, not AAC decoding. */

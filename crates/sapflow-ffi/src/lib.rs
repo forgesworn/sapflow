@@ -15,6 +15,13 @@ pub use media::{
     NativeQueueStats, NativeSampleFanout,
 };
 pub use recording::{
+    DecodedProgrammeCheckpoint, DecodedProgrammeCheckpointInfo, EncodedProgrammeCheckpointInfo,
+    NativeProgrammeCheckpoint, NativeProgrammeCheckpointEncoding, NativeProgrammeCheckpointFacts,
+    NativeProgrammeChunk, NativeProgrammeCompletion, NativeProgrammeGenerationEnd,
+    NativeProgrammePresentationExtent, NativeProgrammeQueuedFrames, NativeProgrammeWindowStart,
+    decode_programme_checkpoint, validate_programme_checkpoint_successor,
+};
+pub use recording::{
     DecodedRecordingCheckpoint, DecodedRecordingCheckpointInfo, EncodedRecordingCheckpointInfo,
     NativeAudioFileReceipt, NativeAudioGenerationReceipt, NativeRecordingCheckpoint,
     NativeRecordingCheckpointEncoding, NativeRecordingCheckpointFacts, NativeRecordingChunk,

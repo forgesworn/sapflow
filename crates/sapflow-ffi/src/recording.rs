@@ -8,6 +8,8 @@
 use crate::MediaSample;
 use bytes::Bytes;
 use sapflow_client::{CodecConfig, SharedSample};
+use sapflow_hls::recording_programme as programme;
+use sapflow_hls::recording_programme_checkpoint as programme_checkpoint;
 use sapflow_hls::recording_timing::{self as timing, AudioLedger, RecordingPresentation};
 use sapflow_hls::{codec, fmp4, recording_checkpoint as checkpoint};
 use std::collections::VecDeque;
@@ -204,6 +206,279 @@ impl NativeRecordingCheckpoint {
             complete_audio_eof: facts.complete_audio_eof,
         })
     }
+}
+
+/// Caller-reported successful queue acceptance, never converter consumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct NativeProgrammeQueuedFrames {
+    pub preparation: u64,
+    pub programme_raw: u64,
+    pub programme_zero: u64,
+    pub block_padding: u64,
+    pub codec_drain: u64,
+}
+impl From<NativeProgrammeQueuedFrames> for programme::QueuedProgrammeFrames {
+    fn from(value: NativeProgrammeQueuedFrames) -> Self {
+        Self {
+            preparation: value.preparation,
+            programme_raw: value.programme_raw,
+            programme_zero: value.programme_zero,
+            block_padding: value.block_padding,
+            codec_drain: value.codec_drain,
+        }
+    }
+}
+impl From<programme::QueuedProgrammeFrames> for NativeProgrammeQueuedFrames {
+    fn from(value: programme::QueuedProgrammeFrames) -> Self {
+        Self {
+            preparation: value.preparation,
+            programme_raw: value.programme_raw,
+            programme_zero: value.programme_zero,
+            block_padding: value.block_padding,
+            codec_drain: value.codec_drain,
+        }
+    }
+}
+/// Frozen supplied programme mapping in the muxer's relative 48-kHz coded clock.
+/// The separate movie delay uses 720-kHz ticks. No native truth is certified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct NativeProgrammeWindowStart {
+    pub generation: u64,
+    pub coded_origin: u64,
+    pub preparation_frames: u64,
+    pub measured_displacement: u64,
+    pub discard_prefix_frames: u64,
+    pub movie_delay_ticks: u64,
+}
+impl From<NativeProgrammeWindowStart> for programme::ProgrammeWindowStart {
+    fn from(value: NativeProgrammeWindowStart) -> Self {
+        Self {
+            generation: value.generation,
+            coded_origin: value.coded_origin,
+            preparation_frames: value.preparation_frames,
+            measured_displacement: value.measured_displacement,
+            discard_prefix_frames: value.discard_prefix_frames,
+            movie_delay_ticks: value.movie_delay_ticks,
+        }
+    }
+}
+impl From<programme::ProgrammeWindowStart> for NativeProgrammeWindowStart {
+    fn from(value: programme::ProgrammeWindowStart) -> Self {
+        Self {
+            generation: value.generation,
+            coded_origin: value.coded_origin,
+            preparation_frames: value.preparation_frames,
+            measured_displacement: value.measured_displacement,
+            discard_prefix_frames: value.discard_prefix_frames,
+            movie_delay_ticks: value.movie_delay_ticks,
+        }
+    }
+}
+/// Supplied whole-generation end facts, not a native EOF/file capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct NativeProgrammeGenerationEnd {
+    pub generation: u64,
+    pub queued: NativeProgrammeQueuedFrames,
+    pub coded_frames: u64,
+}
+impl From<NativeProgrammeGenerationEnd> for programme::ProgrammeGenerationEnd {
+    fn from(value: NativeProgrammeGenerationEnd) -> Self {
+        Self {
+            generation: value.generation,
+            queued: value.queued.into(),
+            coded_frames: value.coded_frames,
+        }
+    }
+}
+impl From<programme::ProgrammeGenerationEnd> for NativeProgrammeGenerationEnd {
+    fn from(value: programme::ProgrammeGenerationEnd) -> Self {
+        Self {
+            generation: value.generation,
+            queued: value.queued.into(),
+            coded_frames: value.coded_frames,
+        }
+    }
+}
+/// Container interpretation of actually submitted selected media only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NativeProgrammeCompletion {
+    CompleteSubmittedWindow,
+    IncompletePrefix,
+}
+/// Exact sealed output geometry, distinct from old native-EOF receipt facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct NativeProgrammeCheckpointFacts {
+    pub sequence: u32,
+    pub audio_units: u64,
+    pub audio_start: u64,
+    pub audio_end: u64,
+    pub audio_container_end: u64,
+    pub leading_frames: u32,
+    pub trailing_frames: u32,
+    pub window_geometry_complete: bool,
+}
+impl From<programme_checkpoint::ProgrammeCheckpointFacts> for NativeProgrammeCheckpointFacts {
+    fn from(value: programme_checkpoint::ProgrammeCheckpointFacts) -> Self {
+        Self {
+            sequence: value.sequence,
+            audio_units: value.span.access_units,
+            audio_start: value.span.first_dts,
+            audio_end: value.span.end_dts,
+            audio_container_end: value.container_end,
+            leading_frames: value.leading_frames,
+            trailing_frames: value.trailing_frames,
+            window_geometry_complete: value.window_end.is_some(),
+        }
+    }
+}
+/// Movie metadata only; neither complete geometry nor this query grants EOF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct NativeProgrammePresentationExtent {
+    pub movie_timescale: u32,
+    pub duration_ticks: u64,
+    pub duration_ms_ceil: u64,
+    pub window_geometry_complete: bool,
+}
+fn programme_extent(
+    value: programme::ProgrammeRecordingPresentation,
+    complete: bool,
+) -> Result<NativeProgrammePresentationExtent, NativeRecordingError> {
+    let extent = value.movie_extent().map_err(presentation_query_error)?;
+    Ok(NativeProgrammePresentationExtent {
+        movie_timescale: extent.movie_timescale,
+        duration_ticks: extent.duration_ticks,
+        duration_ms_ceil: extent.duration_ms_ceil,
+        window_geometry_complete: complete,
+    })
+}
+/// Exact-owner live submitted-output token; native/source/file authority is external.
+#[derive(uniffi::Object)]
+pub struct NativeProgrammeCheckpoint {
+    owner: Arc<()>,
+    header: Vec<u8>,
+    initial_context: NativeInitialContext,
+    start: programme::ProgrammeWindowStart,
+    facts: programme_checkpoint::ProgrammeCheckpointFacts,
+    presentation: programme::ProgrammeRecordingPresentation,
+    fragment_region_bytes: u64,
+    sealed_file_end: u64,
+}
+#[uniffi::export]
+impl NativeProgrammeCheckpoint {
+    pub fn facts(&self) -> NativeProgrammeCheckpointFacts {
+        self.facts.into()
+    }
+    pub fn start(&self) -> NativeProgrammeWindowStart {
+        self.start.into()
+    }
+    pub fn window_end(&self) -> Option<NativeProgrammeGenerationEnd> {
+        self.facts.window_end.map(Into::into)
+    }
+    /// Cold immutable metadata, valid even after successor output/finish/cancel.
+    pub fn presentation_extent(
+        &self,
+    ) -> Result<NativeProgrammePresentationExtent, NativeRecordingError> {
+        programme_extent(self.presentation, self.facts.window_end.is_some())
+    }
+}
+/// Actual bytes from the same bounded output deque, with programme-specific token.
+#[derive(uniffi::Record)]
+pub struct NativeProgrammeChunk {
+    pub bytes: Vec<u8>,
+    pub kind: NativeRecordingChunkKind,
+    pub checkpoint: Option<Arc<NativeProgrammeCheckpoint>>,
+}
+macro_rules! programme_info_record {
+    ($name:ident) => {
+        #[derive(uniffi::Record)]
+        pub struct $name {
+            pub facts: NativeProgrammeCheckpointFacts,
+            pub start: NativeProgrammeWindowStart,
+            pub window_end: Option<NativeProgrammeGenerationEnd>,
+            pub media_epoch_ns: u64,
+            pub initial_header_len: u32,
+            pub initial_header_sha256: Vec<u8>,
+            pub recording_binding: Vec<u8>,
+            pub source_file_binding: Vec<u8>,
+            pub committed_offset: u64,
+            pub fragment_region_bytes: u64,
+            pub fragment_region_sha256: Vec<u8>,
+        }
+        impl From<programme_checkpoint::ProgrammeCheckpointInfo> for $name {
+            fn from(value: programme_checkpoint::ProgrammeCheckpointInfo) -> Self {
+                let base = value.context.base;
+                Self {
+                    facts: value.facts.into(),
+                    start: value.context.start.into(),
+                    window_end: value.facts.window_end.map(Into::into),
+                    media_epoch_ns: base.media_epoch_ns,
+                    initial_header_len: base.initial_header_len,
+                    initial_header_sha256: base.initial_header_sha256.to_vec(),
+                    recording_binding: base.binding.recording.to_vec(),
+                    source_file_binding: base.binding.source_file.to_vec(),
+                    committed_offset: value.committed_offset,
+                    fragment_region_bytes: value.fragment_region_bytes,
+                    fragment_region_sha256: value.fragment_region_sha256.to_vec(),
+                }
+            }
+        }
+    };
+}
+programme_info_record!(EncodedProgrammeCheckpointInfo);
+programme_info_record!(DecodedProgrammeCheckpointInfo);
+/// Canonical V2 envelope and its exact live-token scalar metadata, not file proof.
+#[derive(uniffi::Record)]
+pub struct NativeProgrammeCheckpointEncoding {
+    pub bytes: Vec<u8>,
+    pub info: EncodedProgrammeCheckpointInfo,
+}
+/// Parsed V2 outside data; cannot stand in for a live programme token.
+#[derive(uniffi::Object)]
+pub struct DecodedProgrammeCheckpoint {
+    value: programme_checkpoint::PersistedProgrammeCheckpoint,
+}
+#[uniffi::export]
+impl DecodedProgrammeCheckpoint {
+    pub fn info(&self) -> DecodedProgrammeCheckpointInfo {
+        self.value.info.into()
+    }
+    pub fn header(&self) -> Vec<u8> {
+        self.value.header.clone()
+    }
+    pub fn fragment_region_sha256(&self) -> Vec<u8> {
+        self.value.info.fragment_region_sha256.to_vec()
+    }
+    pub fn presentation_extent(
+        &self,
+    ) -> Result<NativeProgrammePresentationExtent, NativeRecordingError> {
+        let value = programme_checkpoint::presentation(&self.value.info)
+            .map_err(|_| NativeRecordingError::InvalidMedia)?;
+        programme_extent(value, self.value.info.facts.window_end.is_some())
+    }
+}
+/// Decode only V2 against independent identities; grants no live/file authority.
+#[uniffi::export]
+pub fn decode_programme_checkpoint(
+    bytes: Vec<u8>,
+    expected_recording_binding: Vec<u8>,
+    expected_source_file_binding: Vec<u8>,
+) -> Result<Arc<DecodedProgrammeCheckpoint>, RecordingCheckpointError> {
+    let expected = checkpoint::CheckpointBinding {
+        recording: digest32(&expected_recording_binding)?,
+        source_file: digest32(&expected_source_file_binding)?,
+    };
+    Ok(Arc::new(DecodedProgrammeCheckpoint {
+        value: programme_checkpoint::decode(&bytes, &expected)?,
+    }))
+}
+/// V2 scalar successor validation only; old V1 remains separately typed.
+#[uniffi::export]
+pub fn validate_programme_checkpoint_successor(
+    prior: Arc<DecodedProgrammeCheckpoint>,
+    next: Arc<DecodedProgrammeCheckpoint>,
+) -> Result<(), RecordingCheckpointError> {
+    programme_checkpoint::validate_successor(&prior.value.info, &next.value.info)?;
+    Ok(())
 }
 
 fn presentation_query_error(error: timing::TimingError) -> NativeRecordingError {
@@ -403,9 +678,27 @@ pub struct NativeRecordingChunk {
     pub checkpoint: Option<Arc<NativeRecordingCheckpoint>>,
 }
 
+enum IssuedSnapshot {
+    Converter(Arc<NativeRecordingCheckpoint>),
+    Programme(Arc<NativeProgrammeCheckpoint>),
+}
+impl IssuedSnapshot {
+    fn converter(self) -> Result<Arc<NativeRecordingCheckpoint>, NativeRecordingError> {
+        match self {
+            Self::Converter(value) => Ok(value),
+            Self::Programme(_) => Err(NativeRecordingError::InvalidMedia),
+        }
+    }
+    fn programme(self) -> Result<Arc<NativeProgrammeCheckpoint>, NativeRecordingError> {
+        match self {
+            Self::Programme(value) => Ok(value),
+            Self::Converter(_) => Err(NativeRecordingError::InvalidMedia),
+        }
+    }
+}
 struct Output {
     write: RecordingWrite,
-    checkpoint: Option<Arc<NativeRecordingCheckpoint>>,
+    checkpoint: Option<IssuedSnapshot>,
     kind: NativeRecordingChunkKind,
 }
 impl Output {
@@ -420,7 +713,21 @@ impl Output {
                 rewrite_header: kind == NativeRecordingChunkKind::FinalHeader,
             },
             kind,
-            checkpoint,
+            checkpoint: checkpoint.map(IssuedSnapshot::Converter),
+        }
+    }
+    fn programme(
+        bytes: Vec<u8>,
+        kind: NativeRecordingChunkKind,
+        checkpoint: Arc<NativeProgrammeCheckpoint>,
+    ) -> Self {
+        Self {
+            write: RecordingWrite {
+                bytes,
+                rewrite_header: kind == NativeRecordingChunkKind::FinalHeader,
+            },
+            checkpoint: Some(IssuedSnapshot::Programme(checkpoint)),
+            kind,
         }
     }
 }
@@ -441,6 +748,123 @@ struct EncodedPayload(SharedSample);
 impl AsRef<[u8]> for EncodedPayload {
     fn as_ref(&self) -> &[u8] {
         self.0.payload().as_ref()
+    }
+}
+#[derive(Default)]
+struct ProgrammeTiming {
+    ledger: programme::ProgrammeWindowLedger,
+    start: Option<programme::ProgrammeWindowStart>,
+    initial: Option<programme::ProgrammeRecordingPresentation>,
+    completion: Option<NativeProgrammeCompletion>,
+}
+impl ProgrammeTiming {
+    fn begin(
+        &mut self,
+        start: programme::ProgrammeWindowStart,
+        observed: u64,
+    ) -> Result<(), NativeRecordingError> {
+        let mut staged = self.ledger.clone();
+        staged
+            .begin(start, observed)
+            .map_err(presentation_query_error)?;
+        let first = start
+            .coded_origin
+            .checked_add(start.discard_prefix_frames)
+            .ok_or(NativeRecordingError::Encoding)?;
+        let initial = staged
+            .prefix_presentation(programme::ObservedProgrammeSpan {
+                first_dts: first,
+                end_dts: first,
+                access_units: 0,
+            })
+            .map_err(presentation_query_error)?;
+        self.ledger = staged;
+        self.start = Some(start);
+        self.initial = Some(initial);
+        Ok(())
+    }
+    fn presentation(
+        &self,
+        span: programme::ObservedProgrammeSpan,
+        complete: bool,
+    ) -> Result<programme::ProgrammeRecordingPresentation, NativeRecordingError> {
+        if complete {
+            let window = self
+                .ledger
+                .completed()
+                .ok_or(NativeRecordingError::InvalidMedia)?;
+            let value = window.presentation();
+            if value.coded_start() != span.first_dts
+                || value.coded_frames().checked_add(span.first_dts) != Some(span.end_dts)
+                || span.access_units.checked_mul(1024) != Some(value.coded_frames())
+            {
+                return Err(NativeRecordingError::InvalidMedia);
+            }
+            Ok(value)
+        } else if let Some(window) = self.ledger.completed() {
+            window
+                .prefix_presentation(span)
+                .map_err(presentation_query_error)
+        } else {
+            self.ledger
+                .prefix_presentation(span)
+                .map_err(presentation_query_error)
+        }
+    }
+    fn end(&self) -> Option<programme::ProgrammeGenerationEnd> {
+        self.ledger
+            .completed()
+            .map(|window| programme::ProgrammeGenerationEnd {
+                generation: window.generation(),
+                queued: window.queued(),
+                coded_frames: window.coded_frames(),
+            })
+    }
+}
+enum NativeAudioTiming {
+    Converter(AudioLedger),
+    Programme(Box<ProgrammeTiming>),
+}
+impl NativeAudioTiming {
+    fn converter(&self) -> Option<&AudioLedger> {
+        if let Self::Converter(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
+    fn converter_mut(&mut self) -> Option<&mut AudioLedger> {
+        if let Self::Converter(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
+    fn programme(&self) -> Option<&ProgrammeTiming> {
+        if let Self::Programme(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
+    fn programme_mut(&mut self) -> Option<&mut ProgrammeTiming> {
+        if let Self::Programme(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
+    fn leading(&self) -> Option<u32> {
+        match self {
+            Self::Converter(value) => value.leading(),
+            Self::Programme(value) => value.initial.map(|x| x.leading_frames()),
+        }
+    }
+    fn closed(&self) -> bool {
+        match self {
+            Self::Converter(value) => value.final_receipt().is_some(),
+            Self::Programme(value) => value.ledger.completed().is_some(),
+        }
     }
 }
 #[derive(Default)]
@@ -503,7 +927,7 @@ struct State {
     fragments: u64,
     duration_ns: u64,
     finished: bool,
-    native: Option<AudioLedger>,
+    native: Option<NativeAudioTiming>,
     native_owner: Arc<()>,
     native_failed: bool,
     native_completion: Option<NativeRecordingCompletion>,
@@ -585,14 +1009,56 @@ impl State {
         self.fragment_end_ns = None;
         Ok(())
     }
+    fn programme_span_at(
+        &self,
+        units: u64,
+    ) -> Result<programme::ObservedProgrammeSpan, NativeRecordingError> {
+        if units > self.audio.count {
+            return Err(NativeRecordingError::InvalidMedia);
+        }
+        let first = self
+            .audio
+            .first_time
+            .ok_or(NativeRecordingError::MissingTracks)?;
+        let frames = units
+            .checked_mul(1024)
+            .ok_or(NativeRecordingError::Encoding)?;
+        let end = first
+            .checked_add(frames)
+            .ok_or(NativeRecordingError::Encoding)?;
+        if units == self.audio.count && self.audio.end != Some(end) {
+            return Err(NativeRecordingError::InvalidMedia);
+        }
+        Ok(programme::ObservedProgrammeSpan {
+            first_dts: first,
+            end_dts: end,
+            access_units: units,
+        })
+    }
     fn native_header_at(
         &self,
         audio_units: u64,
         trailing: u32,
+        complete: bool,
     ) -> Result<Vec<u8>, NativeRecordingError> {
-        let ledger = self
+        let mode = self
             .native
             .as_ref()
+            .ok_or(NativeRecordingError::InvalidConfig)?;
+        if let Some(value) = mode.programme() {
+            let span = self.programme_span_at(audio_units)?;
+            let presentation = value.presentation(span, complete)?;
+            return fmp4::init_segment_for_programme_recording(
+                self.audio_config
+                    .as_ref()
+                    .ok_or(NativeRecordingError::MissingTracks)?,
+                &presentation,
+            )
+            .map(Vec::from)
+            .map_err(|_| NativeRecordingError::Encoding);
+        }
+        let ledger = mode
+            .converter()
             .ok_or(NativeRecordingError::InvalidConfig)?;
         let value = RecordingPresentation::from_coded_audio_units(
             self.audio
@@ -731,14 +1197,11 @@ impl State {
         let audio_container_end = audio_end
             .checked_sub(u64::from(trailing))
             .ok_or(NativeRecordingError::InvalidMedia)?;
-        let complete_audio_eof = matches!(mode, NativeFlushMode::Complete { .. })
-            && ledger
-                .final_receipt()
-                .is_some_and(|x| x.encoded_frames == coded);
+        let complete = matches!(mode, NativeFlushMode::Complete { .. });
         let initial_context = self
             .native_initial_context
             .ok_or(NativeRecordingError::Encoding)?;
-        let header = self.native_header_at(audio_units, trailing)?;
+        let header = self.native_header_at(audio_units, trailing, complete)?;
         if header.len() != initial_context.header_len as usize {
             return Err(NativeRecordingError::Encoding);
         }
@@ -747,39 +1210,83 @@ impl State {
             self.native_sealed_fragment_bytes,
             bytes.len(),
         )?;
-        let checkpoint = Arc::new(NativeRecordingCheckpoint {
-            owner: self.native_owner.clone(),
-            header,
-            initial_context,
-            fragment_region_bytes: sealed_fragment_bytes,
-            sealed_file_end,
-            facts: NativeRecordingCheckpointFacts {
-                sequence: self.sequence,
-                audio_units,
-                video_units,
-                audio_start,
-                audio_end,
-                audio_container_end,
-                final_trailing_frames: trailing,
-                complete_audio_eof,
-                video_start: self.video.first_time,
-                video_end: self.has_video.then_some(self.video.presentation_end),
-                first_leading_frames: ledger.leading().ok_or(NativeRecordingError::InvalidMedia)?,
-                completed_generation_count: ledger
-                    .completed_generations_through(coded)
-                    .map_err(|_| NativeRecordingError::InvalidMedia)?,
-            },
-        });
+        let output = match ledger {
+            NativeAudioTiming::Converter(ledger) => {
+                let checkpoint = Arc::new(NativeRecordingCheckpoint {
+                    owner: self.native_owner.clone(),
+                    header,
+                    initial_context,
+                    fragment_region_bytes: sealed_fragment_bytes,
+                    sealed_file_end,
+                    facts: NativeRecordingCheckpointFacts {
+                        sequence: self.sequence,
+                        audio_units,
+                        video_units,
+                        audio_start,
+                        audio_end,
+                        audio_container_end,
+                        final_trailing_frames: trailing,
+                        complete_audio_eof: complete
+                            && ledger
+                                .final_receipt()
+                                .is_some_and(|x| x.encoded_frames == coded),
+                        video_start: self.video.first_time,
+                        video_end: self.has_video.then_some(self.video.presentation_end),
+                        first_leading_frames: ledger
+                            .leading()
+                            .ok_or(NativeRecordingError::InvalidMedia)?,
+                        completed_generation_count: ledger
+                            .completed_generations_through(coded)
+                            .map_err(|_| NativeRecordingError::InvalidMedia)?,
+                    },
+                });
+                Output::new(
+                    Vec::from(bytes),
+                    NativeRecordingChunkKind::Fragment,
+                    Some(checkpoint),
+                )
+            }
+            NativeAudioTiming::Programme(programme) => {
+                if video_units != 0 || self.has_video {
+                    return Err(NativeRecordingError::InvalidMedia);
+                }
+                let span = self.programme_span_at(audio_units)?;
+                let presentation = programme.presentation(span, complete)?;
+                let window_end = if complete {
+                    Some(programme.end().ok_or(NativeRecordingError::InvalidMedia)?)
+                } else {
+                    None
+                };
+                let checkpoint = Arc::new(NativeProgrammeCheckpoint {
+                    owner: self.native_owner.clone(),
+                    header,
+                    initial_context,
+                    start: programme.start.ok_or(NativeRecordingError::InvalidMedia)?,
+                    facts: programme_checkpoint::ProgrammeCheckpointFacts {
+                        sequence: self.sequence,
+                        span,
+                        container_end: audio_container_end,
+                        leading_frames: presentation.leading_frames(),
+                        trailing_frames: trailing,
+                        window_end,
+                    },
+                    presentation,
+                    fragment_region_bytes: sealed_fragment_bytes,
+                    sealed_file_end,
+                });
+                Output::programme(
+                    Vec::from(bytes),
+                    NativeRecordingChunkKind::Fragment,
+                    checkpoint,
+                )
+            }
+        };
         let next_sequence = self
             .sequence
             .checked_add(1)
             .ok_or(NativeRecordingError::Encoding)?;
         Ok(NativeFlushPlan {
-            output: Some(Output::new(
-                Vec::from(bytes),
-                NativeRecordingChunkKind::Fragment,
-                Some(checkpoint),
-            )),
+            output: Some(output),
             audio_take,
             video_take,
             next_sequence,
@@ -839,26 +1346,43 @@ impl State {
             let leading = self
                 .native
                 .as_ref()
-                .and_then(AudioLedger::leading)
+                .and_then(NativeAudioTiming::leading)
                 .ok_or(NativeRecordingError::InvalidMedia)?;
-            let value = RecordingPresentation::from_coded_audio_units(
-                first_audio.ok_or(NativeRecordingError::InvalidMedia)?,
-                0,
-                leading,
-                0,
-                first_video,
-                first_video,
-            )
-            .map_err(|_| NativeRecordingError::Encoding)?;
-            Some(
-                fmp4::init_segment_for_native_recording(
-                    video_config,
-                    audio_config.ok_or(NativeRecordingError::InvalidMedia)?,
-                    &value,
+            if let Some(programme) = self.native.as_ref().and_then(NativeAudioTiming::programme) {
+                let value = programme
+                    .initial
+                    .ok_or(NativeRecordingError::InvalidMedia)?;
+                if first_audio != Some(value.coded_start()) {
+                    return Err(NativeRecordingError::InvalidMedia);
+                }
+                Some(
+                    fmp4::init_segment_for_programme_recording(
+                        audio_config.ok_or(NativeRecordingError::InvalidMedia)?,
+                        &value,
+                    )
+                    .map(Vec::from)
+                    .map_err(|_| NativeRecordingError::Encoding)?,
                 )
-                .map(Vec::from)
-                .map_err(|_| NativeRecordingError::Encoding)?,
-            )
+            } else {
+                let value = RecordingPresentation::from_coded_audio_units(
+                    first_audio.ok_or(NativeRecordingError::InvalidMedia)?,
+                    0,
+                    leading,
+                    0,
+                    first_video,
+                    first_video,
+                )
+                .map_err(|_| NativeRecordingError::Encoding)?;
+                Some(
+                    fmp4::init_segment_for_native_recording(
+                        video_config,
+                        audio_config.ok_or(NativeRecordingError::InvalidMedia)?,
+                        &value,
+                    )
+                    .map(Vec::from)
+                    .map_err(|_| NativeRecordingError::Encoding)?,
+                )
+            }
         } else {
             None
         };
@@ -992,12 +1516,7 @@ impl State {
             return Err(NativeRecordingError::InvalidMedia);
         }
         let timing = sample.timing();
-        if !is_video
-            && self
-                .native
-                .as_ref()
-                .is_some_and(|x| x.final_receipt().is_some())
-        {
+        if !is_video && self.native.as_ref().is_some_and(NativeAudioTiming::closed) {
             return Err(NativeRecordingError::InvalidMedia);
         }
         if self.native.is_some()
@@ -1006,7 +1525,7 @@ impl State {
                     && (self
                         .native
                         .as_ref()
-                        .and_then(AudioLedger::leading)
+                        .and_then(NativeAudioTiming::leading)
                         .is_none()
                         || !matches!(sample.config().as_ref(), CodecConfig::Aac(config) if config.audio_specific_config() == [0x11, 0x88])
                         || timing.timescale() != 48_000
@@ -1046,6 +1565,19 @@ impl State {
         let track = if is_video { &self.video } else { &self.audio };
         if self.native.is_some() && !is_video && track.end.is_some_and(|previous| previous != dts) {
             return Err(NativeRecordingError::InvalidMedia);
+        }
+        if let Some(programme) = self.native.as_ref().and_then(NativeAudioTiming::programme) {
+            if self.audio.count == 0 && programme.initial.map(|x| x.coded_start()) != Some(dts) {
+                return Err(NativeRecordingError::InvalidMedia);
+            }
+            // Existing timing-view provenance is caller-reported, not native proof.
+            // When present it must not contradict this generation/original clock.
+            if let Some(source) = sample.aac_source()
+                && (programme.start.map(|x| x.generation) != Some(source.producer_generation())
+                    || timing != source.original().timing())
+            {
+                return Err(NativeRecordingError::InvalidMedia);
+            }
         }
         let next_count = track
             .count
@@ -1244,8 +1776,264 @@ impl NativeRecordingMuxer {
             max_fragment_bytes,
             max_fragment_ms,
         )?;
-        mux.guard()?.native = Some(AudioLedger::default());
+        mux.guard()?.native = Some(NativeAudioTiming::Converter(AudioLedger::default()));
         Ok(mux)
+    }
+    /// Explicit audio-only programme container over actually submitted coded AUs.
+    /// Queue/source/native EOF/window fidelity and file/application truth remain external.
+    #[uniffi::constructor]
+    pub fn with_programme_aac_timing(
+        media_epoch_ns: u64,
+        max_fragment_bytes: u64,
+        max_fragment_ms: u32,
+    ) -> Result<Arc<Self>, NativeRecordingError> {
+        let mux = Self::new(
+            false,
+            true,
+            media_epoch_ns,
+            max_fragment_bytes,
+            max_fragment_ms,
+        )?;
+        mux.guard()?.native = Some(NativeAudioTiming::Programme(Box::default()));
+        Ok(mux)
+    }
+    /// Freeze scalar programme geometry before the first accepted original AU.
+    pub fn begin_programme_window(
+        &self,
+        start: NativeProgrammeWindowStart,
+    ) -> Result<(), NativeRecordingError> {
+        let mut state = self.guard()?;
+        if state.finished || state.native_failed {
+            return Err(NativeRecordingError::Closed);
+        }
+        let observed = state.audio.count;
+        let result = state
+            .native
+            .as_mut()
+            .and_then(NativeAudioTiming::programme_mut)
+            .ok_or(NativeRecordingError::InvalidConfig)?
+            .begin(start.into(), observed);
+        if result.is_err() {
+            state.native_failed = true;
+        }
+        result
+    }
+    /// Check supplied end geometry against ONLY this muxer's actual accepted track.
+    /// This cannot certify the supplied native facts, file closure or app admission.
+    pub fn close_programme_window(
+        &self,
+        end: NativeProgrammeGenerationEnd,
+    ) -> Result<(), NativeRecordingError> {
+        let mut state = self.guard()?;
+        if state.finished || state.native_failed {
+            return Err(NativeRecordingError::Closed);
+        }
+        if state
+            .native
+            .as_ref()
+            .and_then(NativeAudioTiming::programme)
+            .is_none()
+        {
+            return Err(NativeRecordingError::InvalidConfig);
+        }
+        if !state.output.is_empty() {
+            return Err(NativeRecordingError::Backpressure);
+        }
+        let span = match state.programme_span_at(state.audio.count) {
+            Ok(span) => span,
+            Err(error) => {
+                state.native_failed = true;
+                return Err(error);
+            }
+        };
+        let result = state
+            .native
+            .as_mut()
+            .and_then(NativeAudioTiming::programme_mut)
+            .ok_or(NativeRecordingError::InvalidConfig)?
+            .ledger
+            .complete(end.into(), span)
+            .map(|_| ())
+            .map_err(presentation_query_error);
+        if result.is_err() {
+            state.native_failed = true;
+        }
+        result
+    }
+    /// Drain the same bounded native output deque using programme-specific tokens.
+    pub fn take_programme_output(
+        &self,
+    ) -> Result<Option<NativeProgrammeChunk>, NativeRecordingError> {
+        let mut state = self.guard()?;
+        if state
+            .native
+            .as_ref()
+            .and_then(NativeAudioTiming::programme)
+            .is_none()
+        {
+            return Err(NativeRecordingError::InvalidConfig);
+        }
+        state
+            .output
+            .pop_front()
+            .map(|output| {
+                Ok(NativeProgrammeChunk {
+                    bytes: output.write.bytes,
+                    kind: output.kind,
+                    checkpoint: output
+                        .checkpoint
+                        .map(IssuedSnapshot::programme)
+                        .transpose()?,
+                })
+            })
+            .transpose()
+    }
+    /// Immutable exact issued header; no storage or EOF authority is returned.
+    pub fn programme_checkpoint_header(
+        &self,
+        checkpoint: Arc<NativeProgrammeCheckpoint>,
+    ) -> Result<Vec<u8>, NativeRecordingError> {
+        let state = self.guard()?;
+        if state
+            .native
+            .as_ref()
+            .and_then(NativeAudioTiming::programme)
+            .is_none()
+            || !Arc::ptr_eq(&state.native_owner, &checkpoint.owner)
+            || checkpoint.facts.sequence >= state.sequence
+        {
+            return Err(NativeRecordingError::InvalidMedia);
+        }
+        Ok(checkpoint.header.clone())
+    }
+    /// Encode only this exact issued V2 byte frontier, without a caller override.
+    pub fn encode_programme_checkpoint(
+        &self,
+        token: Arc<NativeProgrammeCheckpoint>,
+        recording_binding: Vec<u8>,
+        source_file_binding: Vec<u8>,
+        fragment_region_sha256: Vec<u8>,
+    ) -> Result<NativeProgrammeCheckpointEncoding, RecordingCheckpointError> {
+        {
+            let state = self.guard().map_err(|_| RecordingCheckpointError::Busy)?;
+            if state
+                .native
+                .as_ref()
+                .and_then(NativeAudioTiming::programme)
+                .is_none()
+                || !Arc::ptr_eq(&state.native_owner, &token.owner)
+                || token.facts.sequence >= state.sequence
+            {
+                return Err(RecordingCheckpointError::ForeignCheckpoint);
+            }
+        }
+        let info = programme_checkpoint::ProgrammeCheckpointInfo {
+            context: programme_checkpoint::ProgrammeCheckpointContext {
+                base: checkpoint::CheckpointContext {
+                    binding: checkpoint::CheckpointBinding {
+                        recording: digest32(&recording_binding)?,
+                        source_file: digest32(&source_file_binding)?,
+                    },
+                    media_epoch_ns: token.initial_context.media_epoch_ns,
+                    initial_header_len: token.initial_context.header_len,
+                    initial_header_sha256: token.initial_context.header_sha256,
+                },
+                start: token.start,
+            },
+            facts: token.facts,
+            committed_offset: token.sealed_file_end,
+            fragment_region_bytes: token.fragment_region_bytes,
+            fragment_region_sha256: digest32(&fragment_region_sha256)?,
+        };
+        let bytes = programme_checkpoint::encode(programme_checkpoint::ProgrammeCheckpointRef {
+            info: &info,
+            header: &token.header,
+        })?;
+        Ok(NativeProgrammeCheckpointEncoding {
+            bytes,
+            info: info.into(),
+        })
+    }
+    /// Finalise container geometry only, never a producer/file/app completion token.
+    pub fn finish_programme(
+        &self,
+        outcome: NativeProgrammeCompletion,
+    ) -> Result<(), NativeRecordingError> {
+        let mut state = self.guard()?;
+        let programme = state
+            .native
+            .as_ref()
+            .and_then(NativeAudioTiming::programme)
+            .ok_or(NativeRecordingError::InvalidConfig)?;
+        if state.finished {
+            return if programme.completion == Some(outcome) {
+                Ok(())
+            } else {
+                Err(NativeRecordingError::Closed)
+            };
+        }
+        if !state.output.is_empty() {
+            return Err(NativeRecordingError::Backpressure);
+        }
+        if state.init_len.is_none() {
+            return Err(NativeRecordingError::MissingTracks);
+        }
+        let complete = outcome == NativeProgrammeCompletion::CompleteSubmittedWindow;
+        let complete_tail = programme
+            .ledger
+            .completed()
+            .map(|window| window.trailing_frames());
+        let trailing = if complete {
+            if state.native_failed || complete_tail.is_none() {
+                state.native_failed = true;
+                return Err(NativeRecordingError::InvalidMedia);
+            }
+            complete_tail.ok_or(NativeRecordingError::InvalidMedia)?
+        } else {
+            0
+        };
+        let prepared = (|| {
+            let header = state.native_header_at(state.audio.count, trailing, complete)?;
+            if Some(header.len()) != state.init_len {
+                return Err(NativeRecordingError::Encoding);
+            }
+            let plan = state.plan_native_flush(if complete {
+                NativeFlushMode::Complete { trailing }
+            } else {
+                NativeFlushMode::Incomplete
+            })?;
+            state
+                .output
+                .try_reserve(2)
+                .map_err(|_| NativeRecordingError::Encoding)?;
+            Ok((header, plan))
+        })();
+        let (header, plan) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                if matches!(
+                    error,
+                    NativeRecordingError::InvalidMedia | NativeRecordingError::Encoding
+                ) {
+                    state.native_failed = true;
+                }
+                return Err(error);
+            }
+        };
+        state.commit_native_flush(plan);
+        state.output.push_back(Output::new(
+            header,
+            NativeRecordingChunkKind::FinalHeader,
+            None,
+        ));
+        state.finished = true;
+        state
+            .native
+            .as_mut()
+            .and_then(NativeAudioTiming::programme_mut)
+            .ok_or(NativeRecordingError::InvalidConfig)?
+            .completion = Some(outcome);
+        Ok(())
     }
     /// Cold first-head fact. Failure is sticky but preserves the accepted prefix.
     pub fn begin_native_audio(
@@ -1260,6 +2048,7 @@ impl NativeRecordingMuxer {
         let result = state
             .native
             .as_mut()
+            .and_then(NativeAudioTiming::converter_mut)
             .ok_or(NativeRecordingError::InvalidConfig)?
             .begin(first_leading_frames, observed);
         if result.is_err() {
@@ -1280,6 +2069,7 @@ impl NativeRecordingMuxer {
         let result = state
             .native
             .as_mut()
+            .and_then(NativeAudioTiming::converter_mut)
             .ok_or(NativeRecordingError::InvalidConfig)?
             .append(receipt.into(), observed);
         if result.is_err() {
@@ -1300,6 +2090,7 @@ impl NativeRecordingMuxer {
         let result = state
             .native
             .as_mut()
+            .and_then(NativeAudioTiming::converter_mut)
             .ok_or(NativeRecordingError::InvalidConfig)?
             .complete(receipt.into(), observed);
         if result.is_err() {
@@ -1330,14 +2121,28 @@ impl NativeRecordingMuxer {
     /// Drain native-mode output on its sole owner, before the next sample push.
     pub fn take_native_output(&self) -> Result<Option<NativeRecordingChunk>, NativeRecordingError> {
         let mut state = self.guard()?;
-        if state.native.is_none() {
+        if state
+            .native
+            .as_ref()
+            .and_then(NativeAudioTiming::converter)
+            .is_none()
+        {
             return Err(NativeRecordingError::InvalidConfig);
         }
-        Ok(state.output.pop_front().map(|x| NativeRecordingChunk {
-            bytes: x.write.bytes,
-            kind: x.kind,
-            checkpoint: x.checkpoint,
-        }))
+        state
+            .output
+            .pop_front()
+            .map(|output| {
+                Ok(NativeRecordingChunk {
+                    bytes: output.write.bytes,
+                    kind: output.kind,
+                    checkpoint: output
+                        .checkpoint
+                        .map(IssuedSnapshot::converter)
+                        .transpose()?,
+                })
+            })
+            .transpose()
     }
     /// Return a fixed-size incomplete-prefix header for this exact sealed receipt.
     /// File durability remains the platform owner's responsibility.
@@ -1346,7 +2151,11 @@ impl NativeRecordingMuxer {
         checkpoint: Arc<NativeRecordingCheckpoint>,
     ) -> Result<Vec<u8>, NativeRecordingError> {
         let state = self.guard()?;
-        if state.native.is_none()
+        if state
+            .native
+            .as_ref()
+            .and_then(NativeAudioTiming::converter)
+            .is_none()
             || !Arc::ptr_eq(&state.native_owner, &checkpoint.owner)
             || checkpoint.facts.sequence >= state.sequence
         {
@@ -1365,7 +2174,11 @@ impl NativeRecordingMuxer {
     ) -> Result<NativeRecordingCheckpointEncoding, RecordingCheckpointError> {
         {
             let state = self.guard().map_err(|_| RecordingCheckpointError::Busy)?;
-            if state.native.is_none()
+            if state
+                .native
+                .as_ref()
+                .and_then(NativeAudioTiming::converter)
+                .is_none()
                 || !Arc::ptr_eq(&state.native_owner, &token.owner)
                 || token.facts.sequence >= state.sequence
             {
@@ -1437,6 +2250,7 @@ impl NativeRecordingMuxer {
         let ledger = state
             .native
             .as_ref()
+            .and_then(NativeAudioTiming::converter)
             .ok_or(NativeRecordingError::InvalidConfig)?;
         if state.finished {
             return if state.native_completion == Some(outcome) {
@@ -1464,7 +2278,11 @@ impl NativeRecordingMuxer {
         // Stage the original-AU EOF interpretation, wire bytes and exact checkpoint
         // before publishing any output or releasing the possibly-final AAC owner.
         let prepared = (|| {
-            let header = state.native_header_at(state.audio.count, trailing)?;
+            let header = state.native_header_at(
+                state.audio.count,
+                trailing,
+                outcome == NativeRecordingCompletion::Complete,
+            )?;
             if Some(header.len()) != state.init_len {
                 return Err(NativeRecordingError::Encoding);
             }
@@ -1514,6 +2332,24 @@ impl NativeRecordingMuxer {
     }
     pub fn stats(&self) -> Result<NativeRecordingStats, NativeRecordingError> {
         let state = self.guard()?;
+        let duration_ms = if let Some(programme) =
+            state.native.as_ref().and_then(NativeAudioTiming::programme)
+        {
+            if state.audio.count == 0 {
+                0
+            } else {
+                let complete = programme.ledger.completed().is_some()
+                    && !state.native_failed
+                    && programme.completion != Some(NativeProgrammeCompletion::IncompletePrefix);
+                programme
+                    .presentation(state.programme_span_at(state.audio.count)?, complete)?
+                    .movie_extent()
+                    .map_err(presentation_query_error)?
+                    .duration_ms_ceil
+            }
+        } else {
+            state.duration_ns.div_ceil(1_000_000)
+        };
         Ok(NativeRecordingStats {
             buffered_bytes: state.bytes as u64,
             buffered_samples: state.samples as u64,
@@ -1524,7 +2360,7 @@ impl NativeRecordingMuxer {
                 .sum(),
             accepted_samples: state.accepted,
             fragments: state.fragments,
-            duration_ms: state.duration_ns.div_ceil(1_000_000),
+            duration_ms,
             finished: state.finished,
         })
     }
@@ -1533,6 +2369,10 @@ impl NativeRecordingMuxer {
 #[cfg(test)]
 #[path = "native_recording_tests.rs"]
 mod native_recording_tests;
+
+#[cfg(test)]
+#[path = "recording_programme_tests.rs"]
+mod recording_programme_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

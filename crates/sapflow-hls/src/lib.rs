@@ -16,6 +16,7 @@ pub mod muxer;
 pub mod playlist;
 pub mod recording_checkpoint;
 pub mod recording_programme;
+pub mod recording_programme_checkpoint;
 pub mod recording_timing;
 pub mod time;
 pub mod tracks;
@@ -39,6 +40,9 @@ mod recording_checkpoint_tests;
 
 #[cfg(test)]
 mod recording_programme_tests;
+
+#[cfg(test)]
+mod recording_programme_checkpoint_tests;
 
 /// `EXT-X-TARGETDURATION`, fixed for the life of a stream.
 ///

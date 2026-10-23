@@ -3,6 +3,7 @@ import CryptoKit
 
 precondition(sdkAbiVersion() == 1)
 try checkSharedAacTimingViews()
+try checkProgrammeWindowCheckpoints()
 // Exercise actual generated lifecycle control; no network/capture is attached.
 let lifecycle = try NativeSession(graceMs: 90_000)
 let lifecycleGeneration = try lifecycle.start(nowNs: 0)
@@ -234,6 +235,142 @@ precondition(finalStats.bufferedBytes == 0)
 print("Sapflow Swift ownership consumer passed")
 
 // Synthetic compressed bytes exercise the generated API, not AAC decoding.
+func checkProgrammeWindowCheckpoints() throws {
+    // Synthetic compressed bytes and supplied scalars prove SDK container calls
+    // only. Native source/EOF, a file and application admission remain external.
+    let codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+    let mux = try NativeRecordingMuxer.withProgrammeAacTiming(mediaEpochNs: 0,
+        maxFragmentBytes: 4096, maxFragmentMs: 100)
+    let start = NativeProgrammeWindowStart(generation: 7, codedOrigin: 48_000,
+        preparationFrames: 8192, measuredDisplacement: 2048, discardPrefixFrames: 8192, movieDelayTicks: 0)
+    let end = NativeProgrammeGenerationEnd(generation: 7,
+        queued: NativeProgrammeQueuedFrames(preparation: 8192, programmeRaw: 1517,
+            programmeZero: 1248, blockPadding: 307, codecDrain: 4096), codedFrames: 15_360)
+    try mux.beginProgrammeWindow(start: start)
+    let recording = Data(repeating: 7, count: 32)
+    let file = Data(repeating: 9, count: 32)
+    var first: NativeProgrammeCheckpoint?
+    var firstSlot: Data?
+    var firstRegion: Data?
+    var previous: DecodedProgrammeCheckpoint?
+    var initialSize = 0
+    var initialHash = Data()
+    var regionBytes: UInt64 = 0
+    var hash = SHA256()
+    var terminal = false
+    func drain() throws {
+        while let chunk = try mux.takeProgrammeOutput() {
+            precondition(!chunk.bytes.isEmpty)
+            if chunk.kind == .initial {
+                precondition(initialSize == 0 && chunk.checkpoint == nil)
+                initialSize = chunk.bytes.count
+                initialHash = Data(SHA256.hash(data: chunk.bytes))
+            }
+            if chunk.kind == .finalHeader { precondition(chunk.bytes.count == initialSize) }
+            if let issued = chunk.checkpoint {
+                if first == nil { first = issued }
+                precondition(chunk.kind == .fragment)
+                regionBytes += UInt64(chunk.bytes.count); hash.update(data: chunk.bytes)
+                let regionHash = Data(hash.finalize())
+                let encoded = try mux.encodeProgrammeCheckpoint(token: issued, recordingBinding: recording,
+                    sourceFileBinding: file, fragmentRegionSha256: regionHash)
+                precondition(encoded.bytes.prefix(8) == Data("SFCP0002".utf8))
+                precondition(encoded.info.facts == issued.facts() && encoded.info.start == start)
+                precondition(encoded.info.initialHeaderLen == UInt32(initialSize))
+                precondition(encoded.info.initialHeaderSha256 == initialHash)
+                precondition(encoded.info.fragmentRegionBytes == regionBytes)
+                precondition(encoded.info.committedOffset == UInt64(initialSize) + regionBytes)
+                precondition(encoded.info.fragmentRegionSha256 == regionHash)
+                let decoded = try decodeProgrammeCheckpoint(bytes: encoded.bytes,
+                    expectedRecordingBinding: recording, expectedSourceFileBinding: file)
+                precondition(decoded.info().facts == encoded.info.facts && decoded.info().start == start)
+                let header = try mux.programmeCheckpointHeader(checkpoint: issued)
+                precondition(decoded.header() == header)
+                let decodedExtent = try decoded.presentationExtent()
+                let issuedExtent = try issued.presentationExtent()
+                precondition(decodedExtent == issuedExtent)
+                if let previous { try validateProgrammeCheckpointSuccessor(prior: previous, next: decoded) }
+                previous = decoded
+                if firstSlot == nil { firstSlot = encoded.bytes; firstRegion = regionHash }
+                terminal = issued.facts().windowGeometryComplete
+                if terminal {
+                    let facts = issued.facts()
+                    precondition(facts.audioUnits == 5 && facts.audioStart == 56_192)
+                    precondition(facts.audioEnd == 61_312 && facts.audioContainerEnd == 61_005)
+                    precondition(facts.trailingFrames == 307 && issued.windowEnd() == end)
+                    precondition(issuedExtent.durationTicks == 41_475)
+                }
+            }
+        }
+    }
+    for n in 0..<5 {
+        let tick = Int64(56_192 + n * 1024)
+        let sample = try codec.sample(bytes: Data([0x21, UInt8(n)]), pts: tick, dts: tick,
+            duration: 1024, timescale: 48_000, keyframe: false)
+        try mux.push(sample: sample); try drain()
+    }
+    guard let issued = first, let savedSlot = firstSlot, let savedRegion = firstRegion else {
+        fatalError("programme fragment did not issue exact token")
+    }
+    precondition(issued.facts().audioUnits == 4 && !issued.facts().windowGeometryComplete)
+    let prefixExtent = try issued.presentationExtent()
+    precondition(prefixExtent.durationTicks == 30_720)
+    do { _ = try mux.takeNativeOutput(); fatalError("programme used converter output API") }
+    catch NativeRecordingError.InvalidConfig {}
+    let other = try NativeRecordingMuxer.withProgrammeAacTiming(mediaEpochNs: 0,
+        maxFragmentBytes: 4096, maxFragmentMs: 100)
+    try other.beginProgrammeWindow(start: start)
+    for n in 0..<5 {
+        let tick = Int64(56_192 + n * 1024)
+        let sample = try codec.sample(bytes: Data([1]), pts: tick, dts: tick,
+            duration: 1024, timescale: 48_000, keyframe: false)
+        try other.push(sample: sample)
+        while let _ = try other.takeProgrammeOutput() {}
+    }
+    do {
+        _ = try other.encodeProgrammeCheckpoint(token: issued, recordingBinding: recording,
+            sourceFileBinding: file, fragmentRegionSha256: savedRegion)
+        fatalError("foreign programme token accepted")
+    } catch RecordingCheckpointError.ForeignCheckpoint {}
+    do {
+        _ = try decodeRecordingCheckpoint(bytes: savedSlot,
+            expectedRecordingBinding: recording, expectedSourceFileBinding: file)
+        fatalError("V2 reinterpreted as V1")
+    } catch RecordingCheckpointError.Unsupported {}
+    try mux.closeProgrammeWindow(end: end)
+    try mux.finishProgramme(outcome: .completeSubmittedWindow)
+    try drain(); precondition(terminal)
+    let stats = try mux.stats()
+    precondition(stats.durationMs == 58 && stats.acceptedSamples == 5)
+    try mux.cancel()
+    let old = try mux.encodeProgrammeCheckpoint(token: issued, recordingBinding: recording,
+        sourceFileBinding: file, fragmentRegionSha256: savedRegion)
+    let oldExtent = try issued.presentationExtent()
+    precondition(old.bytes == savedSlot && oldExtent == prefixExtent)
+
+    let incomplete = try NativeRecordingMuxer.withProgrammeAacTiming(mediaEpochNs: 0,
+        maxFragmentBytes: 4096, maxFragmentMs: 100)
+    try incomplete.beginProgrammeWindow(start: start)
+    for n in 0..<5 {
+        let tick = Int64(56_192 + n * 1024)
+        let sample = try codec.sample(bytes: Data([1]), pts: tick, dts: tick,
+            duration: 1024, timescale: 48_000, keyframe: false)
+        try incomplete.push(sample: sample)
+        while let _ = try incomplete.takeProgrammeOutput() {}
+    }
+    try incomplete.closeProgrammeWindow(end: end)
+    try incomplete.finishProgramme(outcome: .incompletePrefix)
+    var incompleteChecked = false
+    while let chunk = try incomplete.takeProgrammeOutput() {
+        if let token = chunk.checkpoint {
+            precondition(!token.facts().windowGeometryComplete && token.facts().trailingFrames == 0)
+            incompleteChecked = true
+        }
+    }
+    precondition(incompleteChecked)
+    print("Sapflow Swift programme window checkpoints passed")
+}
+
 func checkNativeRecordingTimingBinding() throws {
     let codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
     let mux = try NativeRecordingMuxer.withNativeAacTiming(hasVideo: false, hasAudio: true,
