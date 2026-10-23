@@ -131,6 +131,11 @@ impl Session {
         deadline.saturating_duration_since(now)
     }
 
+    /// Whether the connection of `generation` is the attached publisher.
+    pub fn owned_by(&self, generation: u64) -> bool {
+        self.generation == generation && self.attached
+    }
+
     pub fn recovered(&mut self) {
         self.outage_deadline = None;
     }
@@ -389,11 +394,41 @@ impl Registry {
         cfg: MuxerConfig,
         kind: SourceKind,
     ) -> Option<(Arc<LiveStream>, u64, Claim)> {
+        self.claim_with(path, cfg, kind, false)
+    }
+
+    /// As [`Registry::claim`], but a stream with a publisher attached is taken
+    /// over rather than refused, as mediamtx's `overridePublisher` does. An
+    /// encoder that changes network reconnects before its old connection
+    /// times out; refusing it would stall viewers until the timeout. The old
+    /// run is closed as a drop would close it, and the old connection's next
+    /// push is refused ([`crate::publish::PushError::Superseded`]).
+    pub fn claim_or_take_over(
+        &self,
+        path: &StreamPath,
+        cfg: MuxerConfig,
+        kind: SourceKind,
+    ) -> Option<(Arc<LiveStream>, u64, Claim)> {
+        self.claim_with(path, cfg, kind, true)
+    }
+
+    fn claim_with(
+        &self,
+        path: &StreamPath,
+        cfg: MuxerConfig,
+        kind: SourceKind,
+        take_over: bool,
+    ) -> Option<(Arc<LiveStream>, u64, Claim)> {
         let mut map = self.map();
         if let Some(stream) = map.get(path.event_id()).cloned() {
             let mut session = stream.session();
             if session.attached {
-                return None;
+                if !take_over {
+                    return None;
+                }
+                Self::close_run(&stream, &mut session);
+                session.attached = false;
+                tracing::info!(path = %path.as_path(), "publisher replaced by a new connection");
             }
             // A delayed expiry task cannot extend the original outage window.
             if session
@@ -438,17 +473,23 @@ impl Registry {
         if hold {
             // Keep claim() excluded until the previous run and recording tail
             // are closed. A new publisher must not race this interruption.
-            stream.interrupt();
-            if let Some(recorder) = &mut session.recorder
-                && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
-            {
-                recorder.feed(tracks, parts);
-            }
+            Self::close_run(stream, &mut session);
             return true;
         }
         drop(session);
         Self::end(&mut map, stream);
         false
+    }
+
+    /// Ends the current run: interrupts it and hands the recorder the parts
+    /// it has not yet written.
+    fn close_run(stream: &Arc<LiveStream>, session: &mut Session) {
+        stream.interrupt();
+        if let Some(recorder) = &mut session.recorder
+            && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
+        {
+            recorder.feed(tracks, parts);
+        }
     }
 
     /// The grace period for `generation`'s drop is over: ends the stream
@@ -565,6 +606,27 @@ mod tests {
         assert!(again.lock().closed);
         assert!(reg.get("event-a").is_none());
         assert_eq!(claim(&reg, &p).expect("free").2, Claim::Fresh);
+    }
+
+    #[test]
+    fn a_live_stream_is_taken_over_only_when_asked() {
+        let reg = Registry::default();
+        let p = StreamPath::parse("live/event-a").expect("path");
+        let (first, g1, _) = claim(&reg, &p).expect("free");
+        assert!(claim(&reg, &p).is_none(), "plain claim still refused");
+        let (again, g2, c) = reg
+            .claim_or_take_over(&p, MuxerConfig::default(), SourceKind::Ts)
+            .expect("taken over");
+        assert_eq!(c, Claim::Resumed);
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(g2 > g1);
+        assert!(!first.session().owned_by(g1));
+        assert!(again.session().owned_by(g2));
+        // The replaced connection leaving later changes nothing.
+        assert!(!reg.detach(&first, g1, true));
+        assert!(!reg.expire(&first, g1));
+        assert!(!again.lock().closed);
+        assert!(again.session().owned_by(g2));
     }
 }
 

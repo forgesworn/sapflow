@@ -76,12 +76,15 @@ impl PublicationLoss {
 pub enum PushError {
     Ingest(sapflow_hls::IngestError),
     Revoked,
+    /// A newer connection has taken this stream over.
+    Superseded,
 }
 impl std::fmt::Display for PushError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ingest(e) => e.fmt(f),
             Self::Revoked => f.write_str("publish-session admission closed"),
+            Self::Superseded => f.write_str("a newer connection took this stream over"),
         }
     }
 }
@@ -181,10 +184,14 @@ impl Publication {
             segment_count: app.config.segment_count,
             ..MuxerConfig::default()
         };
-        let (stream, generation, claim) = app
-            .streams
-            .claim(&req.path, cfg, kind)
-            .ok_or(Refusal::AlreadyLive)?;
+        // Global-publisher mode: the one authorised publisher may replace its
+        // own stale connection. Scoped sessions keep their single owner.
+        let claimed = if scope.is_none() {
+            app.streams.claim_or_take_over(&req.path, cfg, kind)
+        } else {
+            app.streams.claim(&req.path, cfg, kind)
+        };
+        let (stream, generation, claim) = claimed.ok_or(Refusal::AlreadyLive)?;
         let recording = {
             let mut session = stream.session();
             if claim == Claim::Fresh {
@@ -263,10 +270,14 @@ impl Publication {
         match scope {
             Some(scope) => scope
                 .with_open(|| self.push_open(f))
-                .map_err(|_| PushError::Revoked)?
-                .map_err(PushError::Ingest),
-            None => self.push_open(f).map_err(PushError::Ingest),
+                .map_err(|_| PushError::Revoked)?,
+            None => self.push_open(f),
         }
+    }
+
+    /// Whether this connection still owns its stream.
+    fn owns(&self, session: &crate::stream::Session) -> bool {
+        session.owned_by(self.generation)
     }
 
     fn push_open(
@@ -275,10 +286,13 @@ impl Publication {
             &mut Source,
             std::time::SystemTime,
         ) -> Result<sapflow_hls::Update, sapflow_hls::IngestError>,
-    ) -> Result<(), sapflow_hls::IngestError> {
+    ) -> Result<(), PushError> {
         // Keep session ownership stable through ingest, the recovered callback
         // and recording rollover. Registry operations use session -> state too.
         let mut session = self.stream.session();
+        if !self.owns(&session) {
+            return Err(PushError::Superseded);
+        }
         let mut discarded = false;
         let result = self.stream.apply(|source, now| {
             let before = source.dropped_packets();
@@ -293,7 +307,7 @@ impl Publication {
             Ok(applied) => applied,
             Err(error) => {
                 session.mark_recording_incomplete(self.generation);
-                return Err(error);
+                return Err(PushError::Ingest(error));
             }
         };
         let ready = !self.published
@@ -370,6 +384,12 @@ impl Publication {
 /// `reconnect_grace` so an encoder that comes back carries it on.
 impl Drop for Publication {
     fn drop(&mut self) {
+        if !self.owns(&self.stream.session()) && self.scope.is_none() {
+            // Taken over: the newer connection owns the stream, its callbacks
+            // and its outage window. Leave them alone.
+            tracing::info!(path = %self.stream.path.as_path(), "replaced publisher closed");
+            return;
+        }
         if self.published {
             self.callbacks
                 .send(&self.stream.path, StreamEvent::Unpublish);
@@ -536,6 +556,38 @@ pub(crate) mod loss_tests {
             fixture.completion("incomplete").await;
             assert_eq!(fixture.scope.observations.counts().recordings_finalised, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn a_new_connection_takes_over_and_the_old_one_stays_quiet() {
+        let mut fixture = Fixture::new();
+        let mut old = fixture.begin();
+        Fixture::feed(&mut old);
+        // A second connection with the same authority, before the first has
+        // timed out, as when an encoder changes network.
+        let mut new = fixture.begin();
+        assert!(matches!(
+            crate::srt::feed(&mut old, &[0x47; 188]).map_err(|e| e.contains("newer connection")),
+            Err(true)
+        ));
+        let events = |fixture: &mut Fixture| {
+            let mut names = Vec::new();
+            while let Ok(item) = fixture.callbacks.try_recv() {
+                let body: serde_json::Value = serde_json::from_slice(&item.body).expect("JSON");
+                names.push(body["event"].as_str().unwrap_or_default().to_owned());
+            }
+            names
+        };
+        let before = events(&mut fixture);
+        drop(old);
+        assert!(
+            !events(&mut fixture).contains(&"unpublish".to_owned()),
+            "the replaced connection sent unpublish (before: {before:?})"
+        );
+        Fixture::feed(&mut new);
+        assert!(new.stream.session().owned_by(new.generation));
+        new.end();
+        fixture.completion("finalised").await;
     }
 
     #[tokio::test]

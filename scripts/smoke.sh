@@ -81,13 +81,11 @@ grep -q '"event":"publish","path":"live/event-smoke"' "$WORK/cb.log" || fail "no
 grep -q 'token=tok' "$WORK/cb.log" || fail "callback without token"
 echo "ok   publish callback"
 
-out=$(publish "publish:live/$EVENT:pub:secret" 2 2>&1 || true)
-echo "$out" | grep -q 409 || fail "second publisher not refused: $out"
 out=$(publish "publish:live/event-other:pub:wrong" 2 2>&1 || true)
 echo "$out" | grep -q 401 || fail "wrong password not refused: $out"
 out=$(publish "read:live/$EVENT" 2 2>&1 || true)
 echo "$out" | grep -q 400 || fail "read request not refused: $out"
-echo "ok   refusals (409 live path, 401 credentials, 400 read)"
+echo "ok   refusals (401 credentials, 400 read)"
 
 sleep 4
 curl -s "$BASE/stream.m3u8" -o "$WORK/stream.m3u8"
@@ -152,11 +150,14 @@ for _ in $(seq 1 40); do
 done
 curl -sf "http://$HTTP/live/event-norec/index.m3u8" -o /dev/null || fail "RTMP stream never appeared"
 rtmp "event-other?user=pub&pass=wrong" 2 > /dev/null 2>&1 && fail "RTMP wrong password accepted"
-rtmp "event-norec?user=pub&pass=secret" 2 > /dev/null 2>&1 && fail "second RTMP publisher accepted"
+# The same publisher again takes the stream over (see the SRT check below).
+rtmp "event-norec?user=pub&pass=secret" 2 > /dev/null 2>&1 || fail "RTMP takeover refused"
+grep -q 'publisher replaced by a new connection path=live/event-norec' "$WORK/sapflow.log" \
+  || fail "second RTMP connection did not take the stream over"
 for _ in $(seq 1 40); do grep -q '"unpublish","path":"live/event-norec"' "$WORK/cb.log" && break; sleep 0.5; done
 grep -q '"unpublish","path":"live/event-norec"' "$WORK/cb.log" || fail "no RTMP unpublish"
 [ ! -e "$WORK/rec/live/event-norec" ] || fail "skipped path was recorded"
-echo "ok   RTMP publish, refusals, callbacks; skipped path not recorded"
+echo "ok   RTMP publish, refusal, takeover, callbacks; skipped path not recorded"
 
 # An encoder that drops and comes back within the grace period carries on
 # the same playlist (same chunk names, after a discontinuity) and the same
@@ -181,6 +182,20 @@ secs=$(grep "live/$R" "$WORK/cb.log" | grep -o '"segmentDuration":"[0-9.]*"' | c
 awk "BEGIN { exit !($secs > 12) }" || fail "recording too short across the reconnect ($secs s)"
 ffmpeg -hide_banner -v error -xerror -i "$rec" -f null - || fail "resumed recording does not decode"
 echo "ok   reconnect within grace: same playlist, discontinuity, one recording (${secs}s)"
+
+# The same publisher connecting again takes its stream over, as mediamtx's
+# overridePublisher does: an encoder that changed network must not wait for
+# its old connection to time out.
+publish "publish:live/event-take:pub:secret" 10 > /dev/null 2>&1 & pids+=($!)
+for _ in $(seq 1 40); do
+  curl -sf "http://$HTTP/live/event-take/index.m3u8" -o /dev/null && break; sleep 0.25
+done
+publish "publish:live/event-take:pub:secret" 3 > /dev/null 2>&1 || true
+grep -q 'path=live/event-take.*publisher replaced by a new connection\|publisher replaced by a new connection path=live/event-take' "$WORK/sapflow.log" \
+  || fail "second connection did not take the stream over"
+grep -q 'replaced publisher closed path=live/event-take' "$WORK/sapflow.log" \
+  || fail "the replaced connection was not closed"
+echo "ok   the same publisher reconnecting takes its stream over"
 
 # SRT passphrase encryption: a second server that requires it. The right
 # passphrase plays; none, or a wrong one, is refused.
