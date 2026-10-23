@@ -197,6 +197,18 @@ class QualificationVerifierTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "components present in release"):
                 VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"), expected_native=self.native_hash)
 
+    def test_window_reference_class_and_action_remain_release_excluded(self):
+        markers = (b"Ldev/forgesworn/sapflow/broadcaster/NativeAacProgrammeWindowProbe;",
+                   b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_WINDOW_REFERENCE")
+        for marker in markers:
+            self.assertIn(marker, VERIFIER["AAC_PROBE_MARKERS"])
+            self.dex(b"production classes")
+            with ZipFile(self.apk, "a") as archive:
+                archive.writestr("classes3.dex", marker)
+            with patch("subprocess.check_output", return_value=self.release_manifest()):
+                with self.assertRaisesRegex(ValueError, "present in release dex"):
+                    VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"), expected_native=self.native_hash)
+
 
 class ConnectorNativeVerifierTest(unittest.TestCase):
     @staticmethod

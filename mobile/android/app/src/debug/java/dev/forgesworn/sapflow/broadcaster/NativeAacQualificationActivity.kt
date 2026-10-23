@@ -23,8 +23,12 @@ class NativeAacQualificationActivity : Activity() {
         val runId = intent.getStringExtra("runId")
         val drainMode = intent.action == DRAIN_ACTION
         val leadingMode = intent.action == LEADING_ACTION
-        if (intent.action !in setOf(ACTION, DRAIN_ACTION, LEADING_ACTION) || intent.data != null || intent.clipData != null ||
-            intent.extras?.keySet() != setOf("runId", "generatedOnly") ||
+        val referenceMode = intent.action == WINDOW_REFERENCE_ACTION
+        val inputId = intent.getStringExtra("inputId")
+        val inputSha = intent.getStringExtra("inputManifestSHA256")
+        if (intent.action !in setOf(ACTION, DRAIN_ACTION, LEADING_ACTION, WINDOW_REFERENCE_ACTION) || intent.data != null || intent.clipData != null ||
+            intent.extras?.keySet() != (if (referenceMode) setOf("runId", "generatedOnly", "inputId", "inputManifestSHA256") else setOf("runId", "generatedOnly")) ||
+            (referenceMode && (inputId == null || !inputId.matches(Regex("[a-f0-9]{32}")) || inputSha == null || !inputSha.matches(Regex("[a-f0-9]{64}")))) ||
             !intent.getBooleanExtra("generatedOnly", false) || runId == null ||
             !runId.matches(Regex("[a-f0-9]{32}")) || Build.HARDWARE !in setOf("ranchu", "goldfish")) {
             view.text = "Explicit generated-only Android Emulator invocation required"
@@ -34,7 +38,7 @@ class NativeAacQualificationActivity : Activity() {
             view.text = "Previous native owner is retained or still running"
             return
         }
-        val parent = File(filesDir, if (leadingMode) "native-aac-leading" else if (drainMode) "native-aac-drain" else "native-aac-qualification")
+        val parent = File(filesDir, if (referenceMode) "native-aac-window-reference" else if (leadingMode) "native-aac-leading" else if (drainMode) "native-aac-drain" else "native-aac-qualification")
         if (!parent.exists()) check(parent.mkdir())
         check(parent.isDirectory && !Files.isSymbolicLink(parent.toPath()) && parent.canonicalFile.parentFile == filesDir.canonicalFile)
         val directory = File(parent, runId)
@@ -42,7 +46,13 @@ class NativeAacQualificationActivity : Activity() {
             view.text = "Preserve an earlier run; use a fresh runId"
             return
         }
-        val probe: Any = if (leadingMode) NativeAacLeadingProbe(directory, cancelled)
+        val probe: Any = if (referenceMode) {
+            val inputs = File(filesDir, "native-aac-window-inputs")
+            check(inputs.isDirectory && !Files.isSymbolicLink(inputs.toPath()) && inputs.canonicalFile.parentFile == filesDir.canonicalFile)
+            val source = File(inputs, checkNotNull(inputId))
+            check(source.isDirectory && !Files.isSymbolicLink(source.toPath()) && source.canonicalFile.parentFile == inputs.canonicalFile)
+            NativeAacProgrammeWindowProbe(directory, source, checkNotNull(inputSha), cancelled)
+        } else if (leadingMode) NativeAacLeadingProbe(directory, cancelled)
             else NativeAacQualificationProbe(directory, cancelled, if (drainMode) NativeAacQualificationProbe.Mode.DRAIN_EXPERIMENTS else NativeAacQualificationProbe.Mode.ORIGINAL)
         if (!active.compareAndSet(null, probe)) {
             check(directory.delete()) // Only this newly created, still empty directory.
@@ -54,6 +64,7 @@ class NativeAacQualificationActivity : Activity() {
             var confirmed = false
             try {
                 val result = when (probe) {
+                    is NativeAacProgrammeWindowProbe -> probe.run()
                     is NativeAacLeadingProbe -> probe.run()
                     is NativeAacQualificationProbe -> probe.run()
                     else -> error("Unsupported generated probe owner")
@@ -83,6 +94,7 @@ class NativeAacQualificationActivity : Activity() {
     companion object {
         const val ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC"
         const val DRAIN_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_DRAIN"
+        const val WINDOW_REFERENCE_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_WINDOW_REFERENCE"
         const val LEADING_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_LEADING"
         private val active = AtomicReference<Any?>()
     }
