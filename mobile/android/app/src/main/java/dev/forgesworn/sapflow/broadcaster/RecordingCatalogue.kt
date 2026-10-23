@@ -8,10 +8,14 @@ import java.nio.channels.OverlappingFileLockException
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
+import java.nio.file.OpenOption
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.StandardOpenOption.*
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.PosixFilePermission.OWNER_READ
+import java.nio.file.attribute.PosixFilePermission.OWNER_WRITE
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
@@ -124,7 +128,11 @@ internal class RecordingCatalogue(directory: Path) {
         val temporary = root.resolve(".receipt-${UUID.randomUUID()}.tmp")
         try {
             val bytes = encode(r); check(bytes.size <= MAX_RECEIPT)
-            FileChannel.open(temporary, CREATE_NEW, WRITE, NOFOLLOW_LINKS).use { c ->
+            // Request private permissions atomically at creation, independent
+            // of whether the process umask would remove group/other access.
+            // An unsupported provider fails closed; there is no weaker open.
+            val privateMode = PosixFilePermissions.asFileAttribute(setOf(OWNER_READ, OWNER_WRITE))
+            FileChannel.open(temporary, setOf<OpenOption>(CREATE_NEW, WRITE, NOFOLLOW_LINKS), privateMode).use { c ->
                 val b = ByteBuffer.wrap(bytes); while (b.hasRemaining()) check(c.write(b) > 0); c.force(true)
             }
             Files.move(temporary, target, ATOMIC_MOVE, REPLACE_EXISTING)
@@ -133,12 +141,12 @@ internal class RecordingCatalogue(directory: Path) {
         } finally { Files.deleteIfExists(temporary) }
     }
 
-    private class ProcessOwner(val label: String) { var channel: FileChannel? = null; @Volatile var closeFailed = false; var lockKey: String? = null }
+    private class ProcessOwner(val label: String) { var channel: FileChannel? = null; @Volatile var closeFailed = false; var lockKey: String? = null; var retainedResource: Any? = null }
     private class Lease(val channel: FileChannel, val lock: FileLock, private val key: String, private val process: ProcessOwner) : AutoCloseable {
         private var closeFailure: Exception? = null
         @Volatile private var closedReceipt = false
         val cleanupComplete: Boolean get() = closedReceipt
-        fun markUncertain() { process.closeFailed = true }
+        fun markUncertain(resource: Any? = null) { process.closeFailed = true; if (resource != null) process.retainedResource = resource }
         @Synchronized override fun close() {
             if (closedReceipt) return
             closeFailure?.let { throw it }
@@ -233,23 +241,65 @@ internal class RecordingCatalogue(directory: Path) {
             check(!Files.exists(path(identity.segmentId), NOFOLLOW_LINKS) && !Files.exists(receiptPath(identity.segmentId), NOFOLLOW_LINKS)) { "Recording identity already exists" }
             val receipt = Receipt(identity, "writing", createdAtMs, null, null)
             writeReceipt(receipt)
-            return Writer(identity, createdAtMs, { held.close() }, { held.cleanupComplete }, { held.markUncertain() })
+            return Writer(identity, createdAtMs, { held.close() }, { held.cleanupComplete }, { held.markUncertain(it) })
         } catch (error: Exception) { held.close(); throw error }
     }
 
     inner class Writer internal constructor(identity: Identity, createdAtMs: Long,
-        private val release: () -> Unit, private val released: () -> Boolean, private val uncertain: () -> Unit) {
+        private val release: () -> Unit, private val released: () -> Boolean, private val uncertain: (Any?) -> Unit) {
         private val receipt = Receipt(identity, "writing", createdAtMs, null, null)
         private val terminal = AtomicReference(Terminal.WRITING)
+        private val compound = AtomicBoolean(false)
+        private val compoundGuard = Any()
         val filename: String get() = receipt.identity.filename
         val cleanupComplete: Boolean get() = terminal.get() == Terminal.CLOSED && released()
         /** Nonblocking cancellation. The caller separately proves file/mux owner closure. */
         fun cancel() { terminal.compareAndSet(Terminal.WRITING, Terminal.CANCELLED) }
-        fun retainUncertainCleanup() { uncertain() }
+        fun retainUncertainCleanup() { uncertain(null) }
+        /** Optional cold child of THIS writer lease. The current recorder does
+         * not call this; no independent reserve owner or worker is introduced. */
+        internal fun checkpointStorage(
+            factory: (Path, (Any) -> Unit) -> RecordingCheckpointStorage.Root = { path, retain -> AndroidRecordingStorageIO.open(path, retain) },
+        ): RecordingCheckpointStorage {
+            synchronized(compoundGuard) {
+                check(terminal.get() == Terminal.WRITING && compound.compareAndSet(false, true))
+            }
+            var io: RecordingCheckpointStorage.Root? = null
+            var transferred = false
+            try {
+                checkRoot()
+                val opened = factory(root) { resource -> uncertain(resource) }; io = opened
+                checkRoot(); check(terminal.get() == Terminal.WRITING)
+                transferred = true
+                return RecordingCheckpointStorage.open(receipt.identity, opened,
+                    checkLease = { check(terminal.get() == Terminal.WRITING); checkRoot() },
+                    checkAdmission = { check(terminal.get() == Terminal.WRITING) },
+                    releaseLease = {
+                        synchronized(compoundGuard) {
+                            check(compound.compareAndSet(true, false)); cancel()
+                        }
+                        ownersClosed()
+                    },
+                    retainUncertain = { resource -> uncertain(resource) })
+            } catch (error: Exception) {
+                if (!transferred) {
+                    var safe = !cleanupUncertain
+                    try { io?.close() } catch (cleanup: Exception) { error.addSuppressed(cleanup); uncertain(io); safe = false }
+                    if (safe) {
+                        synchronized(compoundGuard) { compound.set(false); cancel() }
+                        try { ownersClosed() } catch (cleanup: Exception) { error.addSuppressed(cleanup) }
+                    }
+                }
+                throw error
+            }
+        }
         /** Called only after actual mux finish/drain and file force/close. */
         fun finalised(durationMs: Long) {
             require(durationMs >= 0)
-            check(terminal.compareAndSet(Terminal.WRITING, Terminal.COMMITTING)) { "Recording was cancelled" }
+            synchronized(compoundGuard) {
+                check(!compound.get()) { "Checkpoint child still owns this lease" }
+                check(terminal.compareAndSet(Terminal.WRITING, Terminal.COMMITTING)) { "Recording was cancelled" }
+            }
             try {
                 val file = stamp(path(receipt.identity.segmentId)); check(file.first > 0)
                 writeReceipt(receipt.copy(state = "finalised", bytes = file.first, durationMs = durationMs, fileFingerprint = digest(file.second.toByteArray(Charsets.UTF_8))))
@@ -258,8 +308,12 @@ internal class RecordingCatalogue(directory: Path) {
         /** No metadata rewrite on the abort path. A released writing receipt
          * scans as incomplete; an uncertain owner must retain this lease. */
         fun ownersClosed() {
-            cancel()
-            if (terminal.compareAndSet(Terminal.CANCELLED, Terminal.CLOSED) || terminal.get() == Terminal.CLOSED) release()
+            val shouldRelease = synchronized(compoundGuard) {
+                check(!compound.get()) { "Checkpoint child still owns this lease" }
+                cancel()
+                terminal.compareAndSet(Terminal.CANCELLED, Terminal.CLOSED) || terminal.get() == Terminal.CLOSED
+            }
+            if (shouldRelease) release()
         }
     }
 
