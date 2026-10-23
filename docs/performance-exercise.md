@@ -21,14 +21,18 @@ using fewer workers.  The first comparison covers the unchanged Hyper path,
 the own loop at its default, the own loop with one worker, and MediaMTX 1.21.2.
 This changes a documented setting, not protocol limits or the default backend.
 
-The initial screening uses 750 full-media viewers, three alternating rounds and
+The initial screening used 750 full-media viewers, three rotating rounds and
 a 60-second full-load target per treatment.  The standard runner also measures idle
 RSS and twenty seconds of single-publisher CPU after a 25-second warm-up.
-The existing loader accumulates client counters and latencies during its
-ten-second ramp as well as the following sixty seconds; the shell starts its
-server CPU sampling after the ramp.  Treat these as screening distributions,
-not strictly steady-state client percentiles.  Separating the loader
-measurement window is a prerequisite for a percentile acceptance run.
+That historical loader included ramp traffic in its counters and percentiles.
+The current loader accepts a request only if it starts and completes wholly
+inside a fixed post-ramp interval.  It retains excluded request/failure totals;
+the runner rejects failures in either collection.  Fan-out uses each response's
+actual completion time, rather than the time its concurrent partner finishes.
+The process sampler uses a monotonic deadline instead of accumulating polling
+overhead, and retains its actual interval in the receipt.  The CPU interval starts
+after the shell's ramp sleep; process startup and sampling still introduce a small
+offset relative to the loader's own interval.  Keep that limit with the results.
 Keep failed trials and their logs.  A zero exit status without viewer output
 or with request errors is not a passing measurement.
 
@@ -37,18 +41,18 @@ or with request errors is not a passing measurement.
 # Set this only if the installed compiler's default target is x86_64.
 export CARGO_BUILD_TARGET=aarch64-apple-darwin
 python3 -B tests/test_performance.py
+python3 -B tests/test_measure_process.py
 python3 scripts/performance.py \
   --output scratch/performance-<run-id> \
-  --viewers 750 --seconds 60 --rounds 3 \
-  --variants hyper own own-1 mediamtx \
+  --viewers 250 750 --seconds 60 --rounds 5 \
+  --variants hyper own own-1 own-4 mediamtx \
   --mediamtx <verified-arm64-mediamtx-binary>
 ```
 
-For the full two-load follow-up, use `--viewers 250 750`.  `own-4` is also
-available for a worker-count sweep.  Don't tune the settings between repeat
-rounds.  Rotation reduces ordering bias; three rounds with four treatments
-doesn't fully balance all positions, so a small apparent gain needs a longer,
-balanced follow-up.
+Five rotating rounds put every treatment in each order position once.  The
+runner requires a whole number of cycles.  Don't tune settings between repeat
+rounds.  New measurements supersede the historical method only for their own
+source/binary receipt; they are not evidence of a server implementation gain.
 
 The runner retains binary hashes and architecture, source revision and tracked
 diff hash, runner and benchmark script hashes, lockfile hash, toolchain, macOS,
