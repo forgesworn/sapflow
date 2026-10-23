@@ -28,7 +28,7 @@ an unavailable compiler/runtime leaves this gate failing explicitly.
 |--------|---------------|
 | `ts_ingest` | Arbitrary MPEG-TS chunks, explicit terminal drain, playlist rules, repeated finish and post-EOF refusal (SRT publisher) |
 | `flv_ingest` | Arbitrary FLV video/audio tag bodies, with explicit track declarations in prefixed inputs (RTMP publisher) |
-| `muxer_timing` | Arbitrary video or declared AAC-only timing into the LL-HLS muxer (steps, stalls, steps back, interruptions and codec epochs); every rendered playlist must pass `playlist::RuleCheck`: fixed `TARGETDURATION` and `PART-TARGET`, `EXTINF` within the target, the part rules, consistent discontinuities |
+| `muxer_timing` | Arbitrary video or declared AAC-only timing into the LL-HLS muxer (steps, stalls, steps back, interruptions and codec epochs), plus opted-in native recording ledger/header/fragment metadata via `NREC`; rendered playlists must pass `playlist::RuleCheck` |
 | `small_parsers` | Stream ids, RTMP keys, chunk names, HLS queries, ages, ASC, avcC, ADTS, Annex B, AVCC |
 | `own_srt_packet` | Our SRT packet codec (`sapflow_srt::packet`): parse, then encode, parse again and encode again; both must agree |
 | `own_srt_listener` | Our SRT listener (`sapflow_srt::Listener`) as the server drives it: datagrams from three peers, time steps, accept or refuse, the application closing connections. Each peer echoes its SYN cookie and addresses the socket id it was given, so data, ACKACKs, drop requests and shutdowns reach open connections. Checks that everything sent parses and that a timer exists exactly while connections do. Seeded with recorded sessions (see below) |
@@ -136,6 +136,27 @@ nonempty explicit track set. The `AAC1` timing prefix selects 48 kHz mono or
 also exercise interruption and codec changes. Real generated AAC decode,
 server playback and native-device acceptance remain separate gates.
 
+The `NREC` prefix in `muxer_timing` exercises the production native recording
+timing ledger and the recording-only fMP4 header/fragment helpers. At most 64
+32-byte records from at most 4096 bytes select valid generation EOF, mutated
+generation facts, matching or conflicting final EOF, duplicate first-head,
+reset, rational source conversion, hostile presentation metadata or original
+fragment payload preservation. Every successful ledger fold checks the coded
+extent; a rejected event must leave metadata unchanged. Known valid commands
+reach final EOF and fixed initial/final header layouts without requiring random
+mutation to guess an entire valid receipt. The three `native-recording-*` seeds
+are original scalar controls, not media or historical crash inputs. Historical
+non-prefixed and `AAC1` cases keep their prior paths.
+
+The local recording-header gate compiled this target with AddressSanitizer and
+overflow checks, replayed all six timing seeds, and completed 9,047 executions
+in 61 seconds without a failure. This finite run does not exercise `sapflow-ffi`'s opaque checkpoint owner identity, native output
+drain or actual file durability; the fuzz crate has no FFI dependency. Those
+boundaries have separate direct recording tests, and native AAC decoder/seek
+and B5 recovery qualification remain separate gates. Pure header snapshots here
+only exercise the same covered-frame arithmetic, never stand in for actual
+sealed SDK checkpoint receipts. No package/dependency change is required.
+
 The own caller target uses a mode byte and records
 `[operation, step_ms, len_hi, len_lo, bytes]`. Without the high mode bit, it
 preserves the original plaintext handshake/admission format. With that bit,
@@ -171,3 +192,5 @@ listener target, removed 2026-10-21; the format is the same).
 `seeds/signet_auth/` contains generated-only fixed login fields, a synthetic
 client credential and escaped duplicate keys. The target never creates a native
 worker or connects to a relay. Use `-max_len=16384` for this cold-auth parser.
+
+Native recording follow-on SOURCE CANDIDATE: four generated `native-final-duration-*` NREC seeds exercise container final-duration acceptance/refusal and unchanged original entries/payloads. The target also reads completed-generation coverage without mutation. Actual FFI lookbehind ownership/byte budgets are direct unit-test scope, not modelled as fuzzed runtime ownership. No new replay/sanitizer run has been claimed until this source is compiled and executed.

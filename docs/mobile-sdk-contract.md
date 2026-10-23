@@ -279,8 +279,8 @@ The test stops its receiver and removes its own temporary files.
 
 `crates/sapflow-ffi/src/recording.rs` implements the recording mux boundary.
 It reuses the existing HLS fMP4 writer and already-resolved
-`bytes = "=1.12.1"`. The generated native packages need regeneration before a
-consumer can use these newly exported types. Focused validation passed on
+`bytes = "=1.12.1"`. Consumers must use a source-matched generated native package
+for the exported recording types. Initial focused validation passed on
 21 October 2026: 18 FFI tests, 95 HLS tests and strict Clippy; the explicit
 fixture test is normally ignored and was executed for each check below.
 
@@ -339,6 +339,45 @@ also sought to 2.2 seconds and decoded the expected source frame. Duration staye
 are under `target/native-recording-check/`; owned fixture/build-input scratch was
 removed and no server was started. These desktop mux/IO checks do not qualify
 Android FileChannel lifecycle, physical codecs, storage failure or durability.
+
+### Opt-in native AAC recording candidate
+
+`withNativeAacTiming` selects a separate recording contract for measured native
+48 kHz mono AAC-LC output. It requires `beginNativeAudio`; any received
+`endNativeAudioGeneration` receipts must be actual, ordered and validated.
+Complete output requires every generation EOF and the checked
+`completeNativeAudio` file receipt. Unknown-EOF incomplete output can omit those
+EOF receipts. These facts come from the real encoder and
+source conversion; a codec profile or another platform's priming value cannot
+substitute for them. The legacy constructor and HLS output retain their existing
+wire behaviour.
+
+Native mode retains the possible final AAC unit in the existing sample buffer.
+A successfully admitted successor proves older audio non-final; checked complete
+EOF permits only the final recording container entry to declare `1024 - T`
+frames, where the measured trailing padding `T` is below 1024. Shared samples,
+publishing, payloads and original timestamps remain unchanged. Interior encoder
+generation slots retain their original duration. `finishNative(outcome: .incompletePrefix)`
+retains all accepted units at their original duration without guessing a tail.
+Unsupported timing or an impossible retained-buffer budget refuses the incoming
+operation before partial output and prevents complete finalisation; an explicit
+incomplete finish remains available. Busy and queued-output backpressure remain
+transient. Drain output before retrying an operation.
+
+Use `takeNativeOutput` for typed chunks. A fragment's opaque checkpoint belongs
+to that muxer and carries its exact immutable `checkpointHeader`. Facts count
+only serialised media, excluding held or future units. `audioEnd` is the original
+coded endpoint; `audioContainerEnd` subtracts only the verified final tail.
+`finalTrailingFrames` and `completeAudioEof` distinguish checked final EOF from
+an unknown tail. Completed-generation coverage requires actual receipts whose
+entire coded extent is sealed. Initial headers have no fragment checkpoint.
+
+These checkpoints prove serialisation coverage, not a file write, synchronisation
+or crash-safe recovery. A platform owner must persist bounded, independently
+checked recovery facts with the matching complete file prefix. The native
+candidate has focused Rust, strict Clippy and generated Swift/Kotlin consumer
+proof; decoder, platform adoption and durability gates are tracked separately
+in the [recovery plan](recording-recovery.md).
 
 ## Native live telemetry
 

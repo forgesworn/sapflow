@@ -12,7 +12,10 @@ mod session;
 mod srt;
 pub use media::{FanoutOutcome, MediaCodec, MediaSample, NativeQueueStats, NativeSampleFanout};
 pub use recording::{
-    NativeRecordingError, NativeRecordingMuxer, NativeRecordingStats, RecordingWrite,
+    NativeAudioFileReceipt, NativeAudioGenerationReceipt, NativeRecordingCheckpoint,
+    NativeRecordingCheckpointFacts, NativeRecordingChunk, NativeRecordingChunkKind,
+    NativeRecordingCompletion, NativeRecordingError, NativeRecordingMuxer,
+    NativeRecordingSourceMapping, NativeRecordingStats, RecordingWrite,
 };
 pub use rtmp::{
     NativeRtmpError, NativeRtmpEvent, NativeRtmpPublisher, NativeRtmpSendOutput, NativeRtmpState,

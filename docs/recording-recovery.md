@@ -34,6 +34,37 @@ Readable coded prefixes do not prove the source-presentation loss bound, storage
 durability or a production recovery path. Both experiments used generated media
 on a host. Their children, media and compiler scratch were removed.
 
+The subsequent native-header experiment preserves exact coded prefixes after
+both kills, but Apple still presents final padding in all three closed cases.
+Additional reader observations find no hidden trim attachment that would justify
+changing the presentation oracle. A bounded diagnostic identifies two separate
+container issues: non-zero media-header durations with empty sample tables
+double the video duration, and the final AAC entry still declares its coded
+padding as presentation time. Clearing only the media-header durations fixes the
+first issue but leaves the audio failure intact.
+
+A further four-second mono diagnostic clears those durations and shortens only
+the final AAC container entry from 1,024 to 576 frames, using the actual checked
+448-frame EOF padding. Apple then returns exactly 192,000 frames, byte-identical
+to the native recorder. All 190 AAC and 120 video payloads and their original
+timestamps remain unchanged. The independent decoder retains the existing
+allowed-padding convention and exact valid prefix. This is a narrow causal
+result, not production recovery or multi-generation qualification. Historical
+failures and generated scalar evidence remain under
+`target/privacy-standby/recovery-muxer-spike-v2/`,
+`recording-tail-metadata-v1/`, `recording-mdhd-zero-v1/` and
+`recording-final-trun-v1/`.
+
+The opt-in SDK candidate therefore retains one possibly final AAC unit in its
+existing buffer until a validated successor or checked final EOF establishes
+its container duration. Publishing and the shared encoded sample retain their
+original duration and payload. Checkpoints distinguish accepted media from
+actually serialised coverage, and coded from container endpoints. Unknown EOF
+retains the original final duration. Source review, focused Rust tests, strict
+Clippy and generated Swift/Kotlin host consumers pass. Refreshed packages and
+the unchanged native presentation checks remain separate gates before a
+platform recorder adopts it.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC
@@ -45,7 +76,8 @@ on a host. Their children, media and compiler scratch were removed.
 2. Qualify exact native and independent audio presentation, packet retention,
    timestamps and seeks against the unchanged generated experiment. Fixed-size
    recording headers and exact track/movie clocks must not shift fragment bytes.
-   Candidate edit/roll metadata is subject to those decoder checks.
+   Candidate edit/roll metadata and the final container duration are subject to
+   those decoder checks.
 3. Add anchored append-only media and bounded checkpoint ownership to the
    platform recorder. A checkpoint covers only complete written and synchronised
    fragments. Keep recoverable configuration/header facts independent of any

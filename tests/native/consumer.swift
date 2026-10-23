@@ -214,6 +214,7 @@ while let write = try recorder.takeOutput() {
     finalHeader = finalHeader || write.rewriteHeader
 }
 precondition(finalHeader)
+try checkNativeRecordingTimingBinding()
 let srtConfig = NativeSrtConfig(destination: "127.0.0.1:9000", streamId: "synthetic",
     cipher: nil, latencyMs: 120, maxBufferedPackets: 64, maxBufferedBytes: 84_224,
     maxPacketAgeMs: 3000, maxSampleResidenceMs: 1000, bandwidthBytesPerSecond: 1_250_000)
@@ -229,3 +230,63 @@ let finalStats = try srt.stats()
 precondition(finalState == .closed)
 precondition(finalStats.bufferedBytes == 0)
 print("Sapflow Swift ownership consumer passed")
+
+// Synthetic compressed bytes exercise the generated API, not AAC decoding.
+func checkNativeRecordingTimingBinding() throws {
+    let codec = try MediaCodec.aac(asc: Data([0x11, 0x88]))
+    let mux = try NativeRecordingMuxer.withNativeAacTiming(hasVideo: false, hasAudio: true,
+        mediaEpochNs: 0, maxFragmentBytes: 4096, maxFragmentMs: 100)
+    try mux.beginNativeAudio(firstLeadingFrames: 2112)
+    var firstSize = 0
+    var finalSize = 0
+    var sealed: NativeRecordingCheckpoint?
+    var terminalFacts: NativeRecordingCheckpointFacts?
+    func drain() throws {
+        while let chunk = try mux.takeNativeOutput() {
+            precondition(!chunk.bytes.isEmpty)
+            if chunk.kind == .initial { firstSize = chunk.bytes.count }
+            if chunk.kind == .finalHeader { finalSize = chunk.bytes.count }
+            if let facts = chunk.checkpoint?.facts(), facts.completeAudioEof { terminalFacts = facts }
+            if sealed == nil { sealed = chunk.checkpoint }
+        }
+    }
+    for n in 0..<9 {
+        let pts = Int64(n * 1024)
+        let sample = try codec.sample(bytes: Data([1, 2, 3]), pts: pts, dts: pts,
+            duration: 1024, timescale: 48_000, keyframe: false)
+        try mux.push(sample: sample)
+        try drain()
+    }
+    guard let checkpoint = sealed else { fatalError("missing sealed binding receipt") }
+    let facts = checkpoint.facts()
+    precondition(facts.audioUnits == 4 && facts.audioEnd == 4096)
+    precondition(facts.completedGenerationCount == 0)
+    precondition(facts.audioContainerEnd == facts.audioEnd && facts.finalTrailingFrames == 0 && !facts.completeAudioEof)
+    let prefixHeader = try mux.checkpointHeader(checkpoint: checkpoint)
+    precondition(firstSize > 0 && prefixHeader.count == firstSize)
+    let other = try NativeRecordingMuxer.withNativeAacTiming(hasVideo: false, hasAudio: true,
+        mediaEpochNs: 0, maxFragmentBytes: 4096, maxFragmentMs: 100)
+    do {
+        _ = try other.checkpointHeader(checkpoint: checkpoint)
+        fatalError("foreign recording checkpoint accepted")
+    } catch NativeRecordingError.InvalidMedia {}
+    try mux.endNativeAudioGeneration(receipt: NativeAudioGenerationReceipt(generation: 1,
+        inputFrames: 6400, rawFrames: 6400, zeroFrames: 0, inputRate: 48_000,
+        encodedFrames: 9216, leadingFrames: 2112, trailingFrames: 704, sourceMapping: .nearest))
+    try mux.completeNativeAudio(receipt: NativeAudioFileReceipt(generationCount: 1,
+        sourceFramesAt48k: 6400, intentionalStandbyFrames: 0, encodedFrames: 9216,
+        firstLeadingFrames: 2112, lastTrailingFrames: 704))
+    try mux.finishNative(outcome: .complete)
+    try drain()
+    precondition(finalSize == firstSize)
+    guard let terminal = terminalFacts else { fatalError("missing checked audio EOF checkpoint") }
+    precondition(terminal.audioUnits == 9 && terminal.audioEnd == 9216)
+    precondition(terminal.audioContainerEnd == 8512 && terminal.finalTrailingFrames == 704)
+    precondition(terminal.completeAudioEof && terminal.completedGenerationCount == 1)
+    let stats = try mux.stats()
+    precondition(stats.finished && stats.acceptedSamples == 9)
+    do {
+        _ = try mux.takeOutput()
+        fatalError("native recording used legacy output API")
+    } catch NativeRecordingError.InvalidConfig {}
+}

@@ -14,6 +14,7 @@ pub mod fmp4;
 pub mod ingest;
 pub mod muxer;
 pub mod playlist;
+pub mod recording_timing;
 pub mod time;
 pub mod tracks;
 
@@ -27,6 +28,9 @@ mod audio_only_tests;
 
 #[cfg(test)]
 mod terminal_ts_tests;
+
+#[cfg(test)]
+mod recording_timing_tests;
 
 /// `EXT-X-TARGETDURATION`, fixed for the life of a stream.
 ///

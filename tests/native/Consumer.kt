@@ -7,6 +7,7 @@ fun main() {
     checkPackagedStatusLeaseCache()
     checkIntentionalTransportReplacement()
     checkNetworkRecoveryAxes()
+    checkNativeRecordingTimingBinding()
     val input = ByteBuffer.allocateDirect(4)
     input.put(byteArrayOf(1, 2, 3, 4)).flip()
     EncodedBuffer(input).use { sample ->
@@ -134,6 +135,62 @@ fun main() {
         }
     }
     println("Sapflow Kotlin direct-buffer ownership consumer passed")
+}
+
+/** Synthetic compressed bytes check generated ownership/API, not AAC decoding. */
+private fun checkNativeRecordingTimingBinding() {
+    val asc = ByteBuffer.allocateDirect(2).put(byteArrayOf(0x11, 0x88.toByte())).flip()
+    MediaCodec.aac(asc).use { codec ->
+        NativeRecordingMuxer.withNativeAacTiming(false, true, 0uL, 4096uL, 100u).use { mux ->
+            mux.beginNativeAudio(2112u)
+            var firstSize = 0
+            var finalSize = 0
+            var sealed: NativeRecordingCheckpoint? = null
+            var terminalFacts: NativeRecordingCheckpointFacts? = null
+            fun drain() {
+                while (true) {
+                    val chunk = mux.takeNativeOutput() ?: break
+                    check(chunk.bytes.isNotEmpty())
+                    if (chunk.kind == NativeRecordingChunkKind.INITIAL) firstSize = chunk.bytes.size
+                    if (chunk.kind == NativeRecordingChunkKind.FINAL_HEADER) finalSize = chunk.bytes.size
+                    chunk.checkpoint?.facts()?.let { if (it.completeAudioEof) terminalFacts = it }
+                    if (sealed == null) sealed = chunk.checkpoint else chunk.checkpoint?.close()
+                }
+            }
+            try {
+                repeat(9) { n ->
+                    val pts = (n * 1024).toLong()
+                    val payload = ByteBuffer.allocateDirect(3).put(byteArrayOf(1, 2, 3)).flip()
+                    codec.sample(payload, pts, pts, 1024u, 48_000u, false).use { mux.push(it) }
+                    drain()
+                }
+                val checkpoint = checkNotNull(sealed)
+                val facts = checkpoint.facts()
+                check(facts.audioUnits == 4uL && facts.audioEnd == 4096uL)
+                check(facts.completedGenerationCount == 0uL)
+                check(facts.audioContainerEnd == facts.audioEnd && facts.finalTrailingFrames == 0u && !facts.completeAudioEof)
+                check(firstSize > 0 && mux.checkpointHeader(checkpoint).size == firstSize)
+                NativeRecordingMuxer.withNativeAacTiming(false, true, 0uL, 4096uL, 100u).use { other ->
+                    try { other.checkpointHeader(checkpoint); error("foreign recording checkpoint accepted") }
+                    catch (_: NativeRecordingException.InvalidMedia) {}
+                }
+                mux.endNativeAudioGeneration(NativeAudioGenerationReceipt(1uL, 6400uL, 6400uL,
+                    0uL, 48_000u, 9216uL, 2112u, 704u, NativeRecordingSourceMapping.NEAREST))
+                mux.completeNativeAudio(NativeAudioFileReceipt(1uL, 6400uL, 0uL, 9216uL, 2112u, 704u))
+                mux.finishNative(NativeRecordingCompletion.COMPLETE)
+                drain()
+                check(finalSize == firstSize)
+                val terminal = checkNotNull(terminalFacts)
+                check(terminal.audioUnits == 9uL && terminal.audioEnd == 9216uL)
+                check(terminal.audioContainerEnd == 8512uL && terminal.finalTrailingFrames == 704u)
+                check(terminal.completeAudioEof && terminal.completedGenerationCount == 1uL)
+                val stats = mux.stats()
+                check(stats.finished && stats.acceptedSamples == 9uL)
+                try { mux.takeOutput(); error("native recording used legacy output API") }
+                catch (_: NativeRecordingException.InvalidConfig) {}
+            } finally { sealed?.close() }
+        }
+    }
 }
 
 /** Reflection checks the actual compiled binding classes, including when this
