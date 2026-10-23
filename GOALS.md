@@ -312,6 +312,85 @@ in every official build.
 - relayswarm's signed segment commitments produced at the origin.
 - A second rendition.
 
+## Remaining work (2026-10-23)
+
+Where things stand after the trial preparation of 22 and 23 October, in the
+order to do them. Each item says what finishes it.
+
+### 1. Broadcaster app reliability
+
+Done on 23 October: a keyframe after a dropped publish backlog no longer
+fails the connection (`fafbd0d`), and the SRT sender drops media past its age
+budget instead of closing the session (`132a910`). On a Pixel over a link
+resending about 10% of packets, five minutes held one connection, and a
+15 s Wi-Fi drop resumed the same stream 7.6 s after Wi-Fi returned.
+
+- [ ] Fold in the Android failure logging (local branch
+  `diag/srt-fail-reason`: `c322d21`, `75650fc`, `a4c721e`, `da9c86a`): every
+  SRT attempt end and capture failure logged with its reason, and the SRT
+  caller's own close reason reported instead of a generic one. These touch
+  files the broadcaster branch also edits, so they go in there.
+- [ ] Explain the one audio encoder failure (16:21 UTC, 1.4 s into a
+  stream). Done when the new logging names its cause or a long run shows
+  none.
+- [ ] Run the app for the length of a show with scheduled drops (Wi-Fi,
+  mobile data, a locked screen) on a phone no other session is driving. Done
+  when it holds one stream throughout, resumes every drop within the grace
+  and leaves one complete recording on both ends.
+- [ ] Bring iOS to the same point: the same fixes, the same run.
+
+### 2. The first show on sapflow
+
+The switch and rollback are rehearsed (`docs/trial-plan.md`, phase B), and
+the server has run two hours with encoder drops and viewers.
+
+- [ ] The 250 and 750 full-viewer run on Linux behind Caddy, and Safari's
+  delay through Caddy over HTTP/2.
+- [ ] One real show on sapflow with Larix as the encoder, mediamtx kept
+  ready, and the rollback steps in `docs/trial-plan.md`.
+- [ ] Viewers need a reload after a rollback today; decide whether v4v's
+  player should recover by itself.
+
+### 3. The app replaces Larix
+
+Milestones B3R to B5 in `docs/mobile-streaming-plan.md`.
+
+- [ ] RTMPS with certificate validation.
+- [ ] Bitrate that adapts to the link.
+- [ ] Audio-only shows that survive a locked screen and the background.
+- [ ] External and USB microphones; camera controls; pause, mute and
+  standby; saved profiles; QR destination import (in testing).
+- [ ] Signed builds on Zapstore and the app stores, with free, unlimited
+  v4v broadcasting in every build.
+- [ ] Then point v4v's encoder guidance at our app instead of Larix.
+
+### 4. Libraries for other developers
+
+Work queue LQ1 to LQ8 in `docs/library-quality-plan.md`.
+
+- [ ] Release `sapflow-srt` 0.2.0: `SendStats` gained `expired_packets` and
+  `expired_bytes`, which is a breaking change for 0.1.
+- [ ] A documented Swift and Kotlin SDK contract, compiling examples and
+  installable packages.
+- [ ] Repeatable interoperability tests against OBS and FFmpeg, and a
+  performance scorecard.
+- [ ] A second real consumer of the libraries besides our own app.
+- [ ] Decisions on an OBS adapter, then scenes, mixing and a desktop studio.
+
+### 5. Later
+
+- [ ] RelaySwarm peer playback in the apps (B6), then a second rendition
+  and wider formats (B7).
+- [ ] Server features left out on purpose until a show needs them: RTMPS
+  ingest, HEVC and AV1, delta playlists, a metrics endpoint, a config file,
+  release binaries (`docs/comparison.md`, "Gaps sapflow has today").
+
+### Owed by the maintainer
+
+- [ ] Change the publisher password on the media host: it appeared in a
+  chat. It means mediamtx's settings, sapflow's, v4v's stream-key and SRT
+  templates, restarts in a quiet window, and re-preparing saved encoders.
+
 ## Decisions made
 
 - **2026-10-20, M4:** keep experimenting; separate-machine testing before any
