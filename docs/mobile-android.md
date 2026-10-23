@@ -48,6 +48,15 @@ JNA 5.19.1, with metadata checks enabled. Build from the repository root:
 mobile/android/build-debug.sh
 ```
 
+The current four-ABI Android SDK refresh passes its extracted AAR-class host
+consumer and actual ELF 16 KiB LOAD-alignment checks for ARM64, ARMv7, x86_64
+and x86. The AAR SHA-256 is
+`a08d2e2a844d4c85bcbf76f6fb8f6b854854fda5bf328abe2bc0b4c918a21066`;
+source-bound package/readback evidence is under
+`target/privacy-standby/recording-lookbehind-native-check/android-v1/readback-v2/`.
+The broadcaster APK remains ARM64-only. This package gate does not qualify a
+phone or native recording recovery.
+
 A development-only device package can be selected with
 `-PsapflowAar=/absolute/path/to/a/real-device-package.aar`. The override must be
 absolute and must contain the real generated bindings and matching native
@@ -982,11 +991,31 @@ Keystore AES-GCM/AtomicFile journal in no-backup app storage. A missing existing
 key/ciphertext, corruption or failed write blocks the connector and fences its
 publisher. It never resets an existing journal to an empty identity. Exact
 Prepare/Refresh/End/recovery operations and idempotency keys are saved before
-sending; uncertain responses retain that request. End has one reserved control
-admission behind an in-flight request, fences publishing immediately, and retains
-terminal intent before reconciliation. It never implies recording/callback
-completion merely because the local socket closed. Restoring a grant requires a
-fresh acknowledged higher-revision refresh before capture can start.
+sending; uncertain responses retain that request. End now opens an explicit
+confirmation bound to the exact saved session or its pending Prepare, Activity
+and local capture preparation. Cancellation has no capture, publishing, journal
+or End-request effect. A stale dialog cannot affect a successor, including a
+new session for the same event or a newer manual preparation. Confirmation
+claims that owner before any fence; the control actor checks it again before
+saving terminal intent and reconciling the original request. Only the matching
+pending V4V capture preparation is cancelled; an active local recording continues.
+End never implies recording/callback completion merely because the local socket
+closed. Restoring a grant requires a fresh acknowledged higher-revision refresh
+before capture can start.
+
+Debug and Qualification each pass 597 JVM tests in 68 suites, including 22
+confirmation/shutdown tests and the 15 existing session tests. All three app
+configurations build and pass lint with no errors; built APK checks confirm
+SDK byte identity, native and ZIP 16 KiB alignment, notices, manual routing and
+qualification isolation. Release remains unsigned. These are local build and
+host-test results; device confirmation and sustained acceptance remain open.
+Evidence is under `target/v4v-end-shutdown-v2/app-gates/gate-v1/`.
+
+The control actor cancels delayed alarms during shutdown, including an alarm
+scheduled after Close's earlier cancellation. A regression forces that actual
+scheduler race and checks both cancellation and real executor termination.
+The original failing tests are retained; their five-second assertions were
+not increased.
 
 Sign-in uses an installed NIP-55 signer for kind 21236 only. The returned event
 must match every requested field, canonical SHA-256 ID and BIP-340 signature.

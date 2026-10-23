@@ -78,6 +78,12 @@ internal class V4vAppOwner private constructor(context: Context, val profile: V4
     fun stopPublisher() {
         synchronized(expiry) { observationAdmission.set(null); observer.cancel(); admission.invalidate(); correlation.getAndSet(null)?.clear(); preparedGrant = null; expiry.clear(); expiryAlarm?.cancel(false); expiryAlarm = null; destination.getAndSet(null)?.stopDestination() }
     }
+    fun endInvitation(): V4vEndAdmission.Ticket? = control.endInvitation()
+    fun cancelEndInvitation(ticket: V4vEndAdmission.Ticket) = control.cancelEndInvitation(ticket)
+    /** No local recording Stop is reachable here. Stale/cancelled tickets never
+     * execute either pending-capture cancellation or the publisher fence. */
+    fun confirmEnd(ticket: V4vEndAdmission.Ticket, cancelPendingCapture: () -> Unit, completed: (Exception?) -> Unit): Boolean =
+        control.endDestination(ticket, onAdmitted = { try { cancelPendingCapture() } finally { stopPublisher() } }, completed = completed)
     fun current(permit: V4vCapturePermit): Boolean = synchronized(expiry) {
         fenceExpiredOwner(); admission.current(permit.ticket)
     }

@@ -134,7 +134,8 @@ internal class V4vSessionTest {
         try {
             actor.submit({ status() }) { assertNull(it); statusDone.countDown() }
             assertTrue(h.entered.await(2, TimeUnit.SECONDS))
-            actor.endDestination { assertNull(it); endDone.countDown() }
+            val ticket = checkNotNull(actor.endInvitation())
+            assertTrue(actor.endDestination(ticket, completed = { assertNull(it); endDone.countDown() }))
             h.blockStatus!!.countDown()
             assertTrue(statusDone.await(2, TimeUnit.SECONDS)); assertTrue(endDone.await(2, TimeUnit.SECONDS))
             assertTrue(actor.view.endComplete)

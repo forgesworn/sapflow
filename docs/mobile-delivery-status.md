@@ -5,6 +5,34 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
+Android V4V End now requires an explicit confirmation bound to the exact saved
+session or pending Prepare and the Activity's local capture owner. Cancellation
+and stale actions cannot stop a successor, save terminal intent or send End for
+it, even when the event ID is unchanged. Synchronous admission precedes the
+publisher/pending-capture fence; the actor rechecks the same owner before the
+durable End request. An active local recording continues. Independent source
+review is clear; evidence is under `target/v4v-end-confirmation-v1/`.
+
+The completed Android gate passes 597 JVM tests in 68 suites for each of Debug
+and Qualification, including 22 confirmation/shutdown tests and 15 existing
+session tests. All three configurations build and pass lint with no errors.
+Actual APK checks pass native SDK byte identity, native and ZIP 16 KiB alignment,
+notices, manual routing and qualification isolation. Release remains unsigned;
+no phone was installed or tested. Evidence is under
+`target/v4v-end-shutdown-v2/app-gates/gate-v1/`.
+
+The initial run exposed two failures while awaiting control-actor shutdown.
+The repair cancels delayed alarms at shutdown even when scheduling races with
+Close. A real-executor regression forces that race; the original assertions and
+failed XML are retained without increasing the five-second limit.
+
+The fresh Android SDK package passes all four ABI builds, actual 16 KiB ELF
+LOAD-alignment checks and the extracted AAR-class host consumer. Its source-bound
+receipt is under
+`target/privacy-standby/recording-lookbehind-native-check/android-v1/readback-v2/`.
+This is package/host evidence; the app remains ARM64-only and physical/native
+recording acceptance remains separate.
+
 Android [QR camera import](manual-destination-links.md#camera-qr-import-and-verification)
 is implemented and independently source-reviewed. It shares the actual capture
 reservation before permissions or destination/storage preparation, with an
@@ -93,7 +121,7 @@ recovery-safe writer or journal is required before catalogue recovery can be
 qualified. Generated media and child processes were removed; source and scalar
 evidence remain under `target/privacy-standby/interrupted-recording-spike/`.
 
-A second five-case generated experiment uses the installed SDK's existing
+An earlier five-case generated experiment uses the installed SDK's existing
 fragmented-MP4 recording muxer. Its unchanged init and complete output fragments
 remain decodable and seekable after both actual kills, retaining exact original
 coded prefixes. Its strict native and independent AAC presentation checks fail:
@@ -119,7 +147,32 @@ fixture and Rust sanitiser builds timed out before their media or fuzz cases
 executed. The Rust retry passes ten seed replays and 2,922 ASan/overflow fuzz
 executions in 61 seconds on unchanged source; its evidence remains under
 `target/privacy-standby/recording-lookbehind-fuzz-v2/`. Failed initial runs remain
-retained. Native-media qualification is tracked separately.
+retained.
+
+A later source-bound V4 generated A/V run passes all five original strict cases:
+the closed mono control, mono/stereo three-generation recordings and two actual
+process-killed sealed prefixes. Original packet bytes/order and source PTS remain
+checked, with native presentation and independent decoding/valid-prefix and seek
+oracles. Supplemental reads of the same files still show Int16 and Float32 sample
+variations; the run does not establish their cause, always-stable Float32 or an
+explanation for the historical native refusal. Earlier failed evidence remains
+retained. Evidence is under
+`target/privacy-standby/recording-native-pcm-diff-v4/`.
+All ten subsequent audio-only/short-prefix cases completed. Packet retention,
+source clocks, native frame counts, exact independent valid PCM and applicable
+seeks pass, including actual EOF tails of zero and 1,023 frames and an 18-frame
+resampled recording. The original strict aggregate remains failed: the two
+residue controls differ from their paired native recorder by one Int16 value at
+28 and 22 sample positions respectively. Full-array metrics and every previous
+failure are retained under
+`target/privacy-standby/recovery-audio-only-lookbehind-v3/`. The earlier
+scientific-notation seek argument failure was corrected without changing its
+numeric value or accepting the failed exit code.
+
+Platform recorder adoption, durable orphan recovery, the aggregate two-second
+loss bound and physical acceptance remain open. These host experiments do not
+qualify a production recovery path or establish the cause of native read
+variation.
 
 Privacy standby is integrated and remains under qualification. Its
 [contract](privacy-standby.md) requires synchronous raw-input fencing,

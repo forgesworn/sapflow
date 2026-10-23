@@ -94,6 +94,47 @@ class MainActivity : ComponentActivity() {
     private var v4vEvents by mutableStateOf<List<Pair<String, String>>>(emptyList())
     private var v4vEvent by mutableStateOf("")
     private var acknowledgeLoss by mutableStateOf(false)
+    private class EndPrompt(val owner: V4vAppOwner, val ticket: V4vEndAdmission.Ticket,
+        val scope: V4vEndUiScope, val pending: PreparationIntent?, val capture: CaptureStartAdmission.Preparation?)
+    private var endPrompt by mutableStateOf<EndPrompt?>(null)
+    private fun dismissEndPrompt(selected: EndPrompt? = endPrompt) {
+        selected ?: return
+        selected.owner.cancelEndInvitation(selected.ticket)
+        if (endPrompt === selected) endPrompt = null
+    }
+    private fun requestEndPrompt(owner: V4vAppOwner) {
+        if (v4v !== owner || !useV4v || !manualForeground || !poseTracking || isDestroyed) return
+        dismissEndPrompt()
+        val pending = pendingPreparation
+        if (pending != null && !pending.v4v) return
+        val localCapture = capture.currentPreparation()
+        owner.endInvitation()?.let {
+            endPrompt = EndPrompt(owner, it, V4vEndUiScope(runtimeClient, prepareRequest, pending, localCapture),
+                pending, pending?.ticket ?: preparedV4vCapture)
+        }
+    }
+    private fun confirmEndPrompt(selected: EndPrompt) {
+        if (endPrompt !== selected || v4v !== selected.owner) return
+        var admittedRequest: Long? = null
+        val admitted = selected.scope.confirmIfCurrent(runtimeClient, prepareRequest, pendingPreparation,
+            capture.currentPreparation(), useV4v, manualForeground && poseTracking, !isDestroyed) {
+            selected.owner.confirmEnd(selected.ticket, cancelPendingCapture = {
+                prepareRequest++; admittedRequest = prepareRequest
+                // Only the exact V4V intent captured by this prompt can be abandoned.
+                if (selected.pending != null && pendingPreparation === selected.pending && selected.pending.v4v) cancelPreparation()
+                capture.cancelPendingPrepare(selected.capture)
+            }) { error -> ui.post {
+                if (isDestroyed || v4v !== selected.owner || admittedRequest != prepareRequest) return@post
+                if (error != null) permissionMessage = "V4V End intent not confirmed; retry the saved operation."
+                v4vState = selected.owner.control.view
+            } }
+        }
+        if (endPrompt === selected) endPrompt = null
+        if (!admitted) {
+            selected.owner.cancelEndInvitation(selected.ticket)
+            permissionMessage = "This V4V End confirmation is no longer current. Review the current session."
+        }
+    }
     private val signerResult = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         v4v?.signerRelay?.deliver(it.resultCode == Activity.RESULT_OK, it.data)
     }
@@ -889,7 +930,7 @@ class MainActivity : ComponentActivity() {
         val owner = v4v
         if (owner == null) { Text("V4V sign-in is unavailable in this build", style = MaterialTheme.typography.bodySmall); return }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(useV4v, { manualEdited(); prepareRequest++; useV4v = it }, enabled = configurable)
+            Checkbox(useV4v, { dismissEndPrompt(); manualEdited(); prepareRequest++; useV4v = it }, enabled = configurable)
             Text("Use approved V4V connector", style = MaterialTheme.typography.bodySmall)
         }
         if (!useV4v) return
@@ -916,7 +957,14 @@ class MainActivity : ComponentActivity() {
         OutlinedButton(enabled = configurable && v4vEvent.isNotBlank() && v4vState?.signedIn == true && v4vState?.pending != true,
             onClick = { val selected = v4vEvent; v4vCommand { prepare(selected) } }) { Text("Prepare V4V session") }
         OutlinedButton(enabled = v4vState?.pending == true, onClick = { v4vCommand { retry() } }) { Text("Retry saved operation") }
-        OutlinedButton(enabled = v4vState?.eventId != null, onClick = { prepareRequest++; cancelPreparation(); capture.cancelPendingPrepare(preparedV4vCapture); owner.stopPublisher(); owner.control.endDestination { error -> ui.post { if (error != null) permissionMessage = "V4V End intent not confirmed"; v4vState = owner.control.view } } }) { Text("End V4V destination") }
+        OutlinedButton(enabled = v4vState?.eventId != null || v4vState?.pending == true,
+            onClick = { requestEndPrompt(owner) }) { Text("End V4V destination") }
+        endPrompt?.takeIf { it.owner === owner }?.let { selected ->
+            AlertDialog(onDismissRequest = { dismissEndPrompt(selected) }, title = { Text("End this V4V destination?") },
+                text = { Text("Ends this V4V session and stops publishing. Local recording continues. The server may need time to finish its recording.") },
+                confirmButton = { Button(onClick = { confirmEndPrompt(selected) }) { Text("End destination") } },
+                dismissButton = { OutlinedButton(onClick = { dismissEndPrompt(selected) }) { Text("Cancel") } })
+        }
         OutlinedButton(enabled = v4vState?.eventId != null, onClick = { v4vCommand { status() } }) { Text("Check origin finalisation") }
         if (v4vState?.recoveryOffered == true) {
             Row { Checkbox(acknowledgeLoss, { acknowledgeLoss = it }); Text("Abandon failed automatic recording", style = MaterialTheme.typography.bodySmall) }
@@ -1176,6 +1224,7 @@ class MainActivity : ComponentActivity() {
         manualScanTicket?.let(::openManualScanner)
     }
     override fun onPause() {
+        dismissEndPrompt()
         manualLinks.pause(runtimeClient, manualInvitation != null || manualActions.review != null || manualActions.busy || manualPicker.hasOutstanding)
         manualForeground = false
         invalidateManualLink()
@@ -1188,6 +1237,7 @@ class MainActivity : ComponentActivity() {
         super.onSaveInstanceState(outState)
     }
     override fun onStop() {
+        dismissEndPrompt()
         manualLinks.stopped(runtimeClient)
         if (!manualPicker.expectedDeparture(runtimeClient)) manualEdited()
         poseTracking = false
@@ -1207,5 +1257,5 @@ class MainActivity : ComponentActivity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
-    override fun onDestroy() { privacyCover=null;manualEdited(); libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); super.onDestroy() }
+    override fun onDestroy() { dismissEndPrompt(); privacyCover=null;manualEdited(); libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); super.onDestroy() }
 }
