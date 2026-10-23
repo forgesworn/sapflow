@@ -1060,10 +1060,52 @@ SDK presentation qualification.
 
 The native owners, owned emulator group and exact temporary directory close in
 the completed reference run. The preceding stat setup failure and its separate
-cleanup addendum remain retained. No Android programme method has executed, and
-neither app has adopted the programme mode. Concrete producer/file ownership,
-paired presentation, physical and performance acceptance remain open. The cold
-failures and original numerical presentation contract are unchanged.
+cleanup addendum remain retained. That reference phase does not call the Android
+SDK programme methods; the subsequent SDK experiment below does. Neither app
+has adopted programme mode. The cold failures and original numerical
+presentation contract are unchanged.
+
+The W4 Android fixture source is locally committed as `ffe3572`. Its actual app
+checks execute 660 Debug tests in 72 suites, 650 Qualification tests in 71 suites
+and 37 Python controls, totalling 1,347 checks, with no failures, errors or skips.
+All three variants build, and lint and isolation checks pass. The original
+global receipt remains failed because an unrelated performance document changes
+during the run. A separately typed build-scope addendum and independent audit
+verify all 400 relevant app inputs without rewriting that failure or relabelling
+the historical build HEAD. Seven subsequent artefact checks use the frozen
+actual APKs and verify the current AAR and ARM64 SDK dependency, notices,
+alignment, routing and isolation. Release remains structurally unsigned; Debug
+and Qualification retain their standard debug signing configuration.
+
+The generated-only, non-debuggable Qualification experiment now calls the actual
+Android SDK programme mode: 11 begins and 89 pushes return. It reuses the three
+eligible sources without creating an encoder or replaying the first cold
+258.189 ms failure. Actual original payloads and clocks, generated SDK files,
+sealed `SFCP0002` prefixes, byte frontiers and submitted-window geometry are
+checked. The supplied generation and window scalars remain laboratory inputs;
+these returned calls do not certify native source authority or live producer
+closure.
+
+All three healthy files close and carry complete submitted-window geometry,
+but whole presentation fails. Native decoders export 5,120, 50,176 and 5,120
+frames against programmes of 2,765, 48,000 and 2,765. Independent whole-file
+decoding exports 0, 39,936 and 0 frames. No output is cropped, shifted or padded
+to qualify. Nineteen registered negative controls pass, and all 14 host decoder
+and probe children close, including the three deliberately truncated files
+whose decoder exits are the expected 183. The actual original coded start
+`tfdt=8192`, edit `media_time=10240` and independent demux `skip_samples=10240`
+are retained observations under investigation, not a definitive specification
+diagnosis or a general Android verdict.
+
+Native owners, the task emulator and temporary directory close; the pre-existing
+AVD and private generated evidence remain preserved. Host inspection completes
+with its input and proof closure intact. This establishes actual SDK method,
+file and geometry observations in the selected emulator profile, while native
+window qualification and paired presentation remain failed or unsupported.
+Complete capture producer ownership, durable checkpoint installation and crash
+recovery, export and audio/video integration, app adoption, physical and
+performance acceptance, and release readiness remain open. The aggregate two-second loss bound and the
+original numerical contract are unchanged.
 
 Private outcome evidence:
 
@@ -1110,6 +1152,20 @@ Private outcome evidence:
 - Retained reference setup failure:
   `target/privacy-standby/android-native-aac-window-qualification-v1/actual-reference-v2/receipt.local.json`
   and its separate `root-cleanup-addendum-v1.local.json`.
+- W4 original app aggregate, retaining the unrelated-context failure:
+  `target/privacy-standby/android-native-aac-window-w4-integration-gates-v2/run-20261023T195752Z-3ab40277/receipt.local.json`
+  and its sibling `independent-app-build-outcome-review.local.json`.
+- Typed W4 app scope and seven frozen-APK checks:
+  `target/privacy-standby/android-native-aac-w4-app-scope-v1/app-build-scope.local.json`
+  and `actual-artifacts-v1/artifact-verification.local.json`, with sibling
+  `independent-outcome-review.local.json` in the artefact directory.
+- Actual Android SDK programme calls, native files, whole PCM and cleanup:
+  `target/privacy-standby/android-native-aac-sdk-window-v1/actual-sdk-typed-v1/receipt.local.json`,
+  `sdk_window-extracted/receipt.json` and sibling
+  `independent-outcome-review.local.json` in the run directory.
+- Independent SDK file, checkpoint and whole-decoder inspection:
+  `target/privacy-standby/android-native-aac-sdk-window-v1/inspection-sdk-typed-v1/receipt.local.json`
+  and its sibling `independent-outcome-review.local.json`.
 
 ## Implementation order
 
