@@ -5,19 +5,46 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-The next recording step is native clock and paired presentation qualification,
-then concrete source-generation and capture closure. Explicit native and checked
-independent readers now return the required 2,765, 48,000 and 2,765 programme
-frames from the original generated SDK files. Native buffer timestamps and
-microsecond conversion still do not satisfy the full clock requirements; the
-paired native recorder control remains unsupported. The original stock-reader
-and fifteen metadata-profile failures remain unchanged. Then qualify durable
-checkpoint installation and crash recovery, the aggregate two-second
-source-presentation loss bound, complete shows on both phones, matched competitor
-performance and release. The existing origin-first, always-free V4V scope and
-legacy recorder defaults remain unchanged.
+The owner has approved `checked-sdk-playback-clock-v1`, a separate clock profile
+for application-controlled decoded PCM playback. Its [registered criteria](recording-recovery.md#checked-sdk-playback-clock-profile)
+use a checked rational source/movie schedule from whole returned frame ranges;
+implementation and qualification remain pending. Raw native timestamps and their
+original failed clock gates remain unchanged. Next implement and qualify that
+profile alongside concrete source-generation and capture closure, then complete
+paired presentation qualification. Explicit native and checked independent
+readers already return the required 2,765, 48,000 and 2,765 programme frames from
+the original generated SDK files, but the paired native recorder control remains
+unsupported. The original stock-reader and fifteen metadata-profile failures
+remain unchanged. Durable checkpoint installation and crash recovery, the
+aggregate two-second source-presentation loss bound, complete shows on both
+phones, matched competitor performance and release still follow. The existing
+origin-first, always-free V4V scope and legacy recorder defaults remain unchanged.
 
-The latest qualification-only Android reader gate executes 660 Debug tests,
+The new profile records an approved policy, not a test or integration pass.
+Schedule completion requires exact returned and whole-range sink-accepted N,
+actual input/output EOS, one-use native releases and known owner/sink closure,
+with no loss, fault or unknown. It cannot detect same-sized duplicated content or
+supply waveform, producer, paired presentation or app-admission authority. Raw
+native buffer times and conversion remainders stay separate. The original
+2,875-byte numerical contract and all previous verdicts remain intact; the
+profile does not enable recording or playback by default.
+
+The audio retirement regression gate now passes 674 Debug tests, 664
+Qualification tests and 38 Python controls, totalling 1,376, with no failures,
+errors or skips. Its 14 new regressions cover successful audio input arriving
+during Stop, real thread joins, and queue/bookkeeping failures during retirement.
+All three APK variants, lint, qualification isolation and seven package checks
+pass. This is host and package evidence; the active phone capture was untouched.
+
+The approved clock prototype separately passes 26 standalone synthetic checks.
+An offline metadata replay completes all three explicit-reader schedules at
+2,765, 48,000 and 2,765 frames and refuses the retained 5,120-frame wrong-length
+control. Original PCM hashes and raw timestamps remain unchanged. This replay
+uses saved observations, supplies no new native callbacks and grants no
+presentation or application admission. Real decoder/sink integration remains
+the next implementation step.
+
+The earlier qualification-only Android reader gate executes 660 Debug tests,
 650 Qualification tests and 38 Python verifier controls, totalling 1,348, with
 no failures, errors or skips. All three APK builds, lint and seven artefact checks
 pass with 412 recorded inputs unchanged. The same 122 SDK source inputs and W2

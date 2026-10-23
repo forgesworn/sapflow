@@ -1198,6 +1198,87 @@ MOV demuxer, universal libavcodec/native wrapper semantics or the original nativ
 paired waveform oracle. Native queue microsecond precision, returned native
 buffer timestamps and full presentation qualification still need actual proof.
 
+### Checked SDK playback clock profile
+
+`checked-sdk-playback-clock-v1` is a separately registered, owner-approved clock
+profile for application-controlled decoded PCM playback. Its status is
+`OWNER_APPROVED_SEPARATE_PROFILE_PENDING_IMPLEMENTATION`. The owner selected a
+checked application-owned rational schedule as the alternative presentation-clock
+criterion for this playback path. Registration records that policy choice; it
+reports no implementation, test, replay, integration or adoption pass. The
+original `native-numeric-presentation-equivalence-v1` definition and its
+2,875-byte block remain byte-identical, with their mandatory gates and historical
+verdicts unchanged. This profile does not relabel a failed native-clock result.
+
+For the initial 48,000 Hz mono PCM16 scope, use the actual whole returned frame
+ranges without cropping, shifting, normalising, resampling or inspecting their
+samples. Given checked source origin S in 48,000 Hz frames, movie delay M in
+720,000 Hz ticks, actual returned prefix q and whole range length f, the source
+interval is `[S+q, S+q+f)` and the movie interval is
+`[M+15q, M+15(q+f))`. Declared N must be positive. Validate the format, byte
+alignment, bounds, counters and both endpoints with checked arithmetic; overflow
+or inconsistent geometry refuses schedule completion. The origins and programme
+extent are external checked facts, not native source authority manufactured by
+the cursor. Original encoded packet bytes, order, counts and rational coded
+DTS/PTS remain unchanged. Raw returned BufferInfo times, explicitly queued times
+and microsecond quotient/remainders remain recorded separately; the new schedule
+never makes that conversion lossless or corrects those native fields.
+
+Schedule completion requires all of the following:
+
+- The same concrete owner by reference, generation and owner thread; exactly one
+  active borrowed range, with a one-use acquisition ticket independent of a
+  reusable native buffer index.
+- Actual aligned returned-frame counts latched before external I/O, including an
+  observed overrun or a later coordinate failure; exact returned N and exact
+  whole-range sink-accepted N. Do not hide extra returned rows or trim them into N.
+- One-use sink and native-release permissions before their respective external
+  calls, and actual returned outcomes recorded afterwards. Owner close cannot
+  begin while either call is pending, and an owner-close attempt fences new I/O.
+- Real input-EOS queue return, observed output EOS, successful one-use native
+  releases, no active borrow and known owner and sink closure. Missing, duplicate
+  or inconsistent EOS, known loss, fault or unknown ownership cannot become a
+  completed schedule by closing resources.
+
+A sink-acceptance uncertainty alone still permits release of its known native
+borrow. Native release uncertainty retains the ticket and refuses a retry or new
+borrow; it is never repaired by a later close report. If invalid metadata stops
+clock admission, the concrete adapter must still account for and safely release
+its actual native borrow. These rules describe real operation order, not success
+Booleans supplied by a manifest or an offline replay.
+
+A completed schedule proves scheduling and accounting only. A same-sized
+repeated waveform could satisfy its frame counters. The cursor cannot establish
+content fidelity, native source/leading/tail facts, a hardware clock, paired
+presentation or app admission. Its `rawNativeClockGatePassed`, `contentQualified`,
+`nativeSourceQualified`, `presentationEquivalent` and `appAdmission` properties
+therefore remain false even when its derived schedule completes. Full unchanged
+PCM/format and numerical comparison, independent valid decoding, actual producer
+and generation closure, paired native controls and applicable seeks remain
+separate requirements. The W3 native pair stays unsupported; the first cold
+258.189 ms result still fails the unchanged 250 ms limit.
+
+After independent source review, the ignored clock prototype passed all 26
+standalone synthetic checks using the installed Kotlin compiler and JVM. Its
+fixed offline metadata replay completed the three explicit-reader schedules at
+2,765, 48,000 and 2,765 frames. The retained 5,120-frame unconfigured control
+latched its first overrun at 3,072 observed frames and refused completion; every
+remaining historical row and the whole PCM hash remain visible separately.
+All six tool/test process groups closed, and source, tool and original PCM hashes
+remained unchanged. The private actual receipt is
+`target/privacy-standby/checked-playback-clock-actual-v1/receipt.local.json`.
+
+That replay uses new replay owners and saved observations, with separately
+labelled sink/release acknowledgements. It starts no codec and is not a
+reconstruction or rerun of live native callbacks. The raw native-clock gate and
+all content/source/presentation/admission flags remain false. A real decoder/sink
+qualification adapter, A/V origin and seek integration, metadata-allocation and
+sustained-resource measurements, source closure, durable recovery, aggregate
+loss, physical shows and release admission remain pending. The existing recorder
+and playback defaults remain unchanged.
+The reviewed proposal is retained under
+`target/privacy-standby/android-native-aac-sdk-window-v1/interoperability-native-reader-v1/presentation-clock-candidate-v1/`.
+
 These reader experiments preserve original recording files, packet bytes/order /
 counts/rational coded clocks, checkpoint bindings, stock-reader failures and the
 2,875-byte numerical contract. The W3 native MediaMuxer trim and same-clock pair
@@ -1206,8 +1287,10 @@ failure against 250 ms remains failed and is not replayed as eligible. No result
 here establishes waveform/paired presentation, production/default adoption,
 physical capture, power/performance advantage or recovery.
 
-The concrete next work is native clock and paired presentation qualification,
-then source-generation/capture and ingress closure using actual native producers.
+The concrete next work is implementation and qualification of the separate
+checked SDK playback clock profile alongside source-generation/capture and
+ingress closure using actual native producers, followed by paired presentation
+qualification. Raw native-clock results remain separately unqualified.
 Durable checkpoint installation/recovery and the aggregate two-second loss bound
 follow, then both-phone complete-show pilots, matched competitor performance and
 release. Existing delivery goals and legacy defaults are unchanged. Later source
