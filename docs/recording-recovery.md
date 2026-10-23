@@ -988,16 +988,46 @@ source, EOF, durable file progress or application admission.
 
 The explicit audio-only programme header retains original media coordinates;
 its movie delay is independent of discarded preparation. Twenty-five new tests
-cover boundaries, overflows, incomplete prefixes and header timing. The current
-workspace passes 745 tests with four ignored; formatting, strict Clippy and the
-default generated-stream smoke test pass. Eight legacy audio/video initial
-headers are byte-identical before and after the change.
+cover boundaries, overflows, incomplete prefixes and header timing. That
+foundation passed 745 workspace tests with four ignored; formatting, strict
+Clippy and the default generated-stream smoke test passed. Eight legacy
+audio/video initial headers were byte-identical before and after the change.
 
-This is source-level geometry and header support. Existing SDK packages remain
-from the earlier shared-timing-view source; neither app has adopted this new
-programme mode. The next SDK step is integration into the existing muxer and
-portable checkpoints, followed by regenerated bindings, current-source packages,
-actual native programme presentation and concrete producer/file ownership.
+The follow-on source integrates that geometry into an explicitly selected
+programme mode of the existing SDK muxer. Original coded timestamps, payload
+handles, fragment assembly and the existing output queue remain shared. Frozen
+checkpoint tokens describe their exact sealed header and byte frontier after
+later media, finish or cancellation. Unknown-tail prefixes remain incomplete;
+complete submitted-window geometry does not certify native EOF or source
+consumption. Legacy APIs, default behaviour and `SFCP0001` remain separate and
+unchanged.
+
+The separately typed `SFCP0002` envelope retains recording/file bindings, the
+original INITIAL hash, coded span and programme/movie mapping. Its maximum is
+66,080 bytes, including a bounded opaque header and checksum. It checks geometry,
+reserved fields and exact successors; a complete submitted window is terminal.
+Checksums and scalar validation do not authenticate facts, certify durable bytes
+or grant file ownership or app admission.
+
+The completed checks are 47 focused tests and 767 workspace tests, with four
+workspace tests ignored, strict Clippy, and actual generated Swift/Kotlin
+consumers. Both new programme-checkpoint consumer controls pass alongside the
+old ownership/timing-view controls and all eight Kotlin status-lease checks.
+These host consumers exercise generated SDK calls and synthetic compressed
+fixtures; they are not native presentation qualification. The initial Clippy
+failure remains retained alongside its reviewed single-condition repair.
+The fresh default generated-stream smoke test passes its 16 controls. The
+checkpoint fuzz target completes 206,639 executions over 61 seconds with the
+actual ASan runtime linked, a 66,080-byte input cap and no observed crash. Its
+196 active engine entries and 205 retained corpus files are separate counts.
+This finite fuzz run does not establish native presentation or exhaustive
+parser correctness.
+
+Current mobile SDK packages are still from `c886419`; no current-source mobile package
+or app adoption is claimed. Packaging and installed-consumer readback, actual
+native programme presentation and concrete producer/file ownership remain next.
+The cold-start failures above and the original presentation contract remain
+unchanged.
 
 Private outcome evidence:
 
@@ -1023,6 +1053,11 @@ Private outcome evidence:
   and its sibling `independent-outcome-review.local.json`.
 - Eight actual legacy-header byte comparisons:
   `target/privacy-standby/recording-programme-legacy-bytes-v1/`.
+- Programme muxer/checkpoint final source and host gates:
+  `target/privacy-standby/android-recording-integration-plan-v1/root-w2-v1/final-gates.local.json`
+  and its sibling `independent-outcome-review.local.json`. The same directory
+  retains the original sandbox/Clippy failures, fuzz corpus and smoke cleanup
+  readback. Current-source mobile packages remain pending.
 
 ## Implementation order
 

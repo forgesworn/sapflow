@@ -57,12 +57,20 @@ exercising or promoting the new Rust source.
 
 The recording programme-window foundation is locally committed as `b7aa36c`.
 It separates queued preparation/programme/padding/drain and checks the retained
-original coded window and exact presentation geometry. All 745 workspace tests,
-formatting, strict Clippy and the default smoke test pass; four tests remain
-ignored. Eight legacy initial headers remain byte-identical. This source has
-not yet been packaged or adopted by either app. Real muxer/checkpoint integration,
-current-source packages, native presentation and producer/file ownership are
-next. The detailed [programme-window record](recording-recovery.md#checked-recording-programme-windows)
+original coded window and exact presentation geometry. That foundation passed
+745 workspace tests, formatting, strict Clippy and the default smoke test, with
+four tests ignored. Eight legacy initial headers remained byte-identical.
+
+The follow-on source now exposes an opt-in programme mode in the existing SDK
+muxer and separately typed `SFCP0002` checkpoints. It preserves original coded
+timing and immutable sealed frontiers; legacy APIs, `SFCP0001` and defaults stay
+unchanged. Forty-seven focused tests and 767 workspace tests pass, with four
+workspace tests ignored. Strict Clippy and actual generated Swift/Kotlin
+consumers also pass, alongside the default smoke test and 206,639 sanitised
+checkpoint fuzz executions. Current mobile SDK packages are still from
+`c886419`; neither app has adopted the new mode. Native
+source/EOF facts, file durability, paired presentation and app admission remain
+external requirements. The detailed [programme-window record](recording-recovery.md#checked-recording-programme-windows)
 retains the actual evidence and limits.
 
 Only generated media ran in the read-only emulator. The original cleanup errors
