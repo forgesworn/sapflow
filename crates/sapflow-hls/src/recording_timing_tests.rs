@@ -587,3 +587,123 @@ fn generation_coverage_retains_actual_previous_eof_while_current_last_au_is_held
     assert_eq!(value, before);
     assert_eq!(value.completed_generations_through(17408), Ok(1));
 }
+
+#[test]
+fn cold_movie_extent_matches_native_header_offsets_video_and_submilliseconds() {
+    let video = crate::codec::H264Config::new(
+        &[
+            0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0, 0, 3, 0, 8, 0, 0,
+            3, 1, 0xe0, 0x78, 0xa1, 0x4c, 0xb0,
+        ],
+        &[0x68, 0xef, 0xbc, 0x80],
+    )
+    .expect("existing generated SPS/PPS");
+    for (start, units, head, tail, first, end, ticks, milliseconds) in [
+        (0, 9, 2112, 704, None, None, 96_000, 134),
+        (1440, 97, 2112, 860, None, None, 1_466_940, 2038),
+        (
+            0,
+            97,
+            2112,
+            860,
+            Some(27_000),
+            Some(270_001),
+            2_160_008,
+            3001,
+        ),
+        (0, 1, 1023, 0, None, None, 15, 1),
+    ] {
+        let value =
+            RecordingPresentation::from_coded_audio_units(start, units, head, tail, first, end)
+                .expect("bounded coded-unit construction");
+        let extent = value.movie_extent().expect("checked cold extent");
+        assert_eq!(extent.movie_timescale, 720_000);
+        assert_eq!(extent.duration_ticks, ticks);
+        assert_eq!(extent.duration_ms_ceil, milliseconds);
+        assert_eq!(
+            extent.duration_ticks,
+            value.movie_duration().expect("same header duration")
+        );
+        let header =
+            fmp4::init_segment_for_native_recording(first.map(|_| &video), &audio(), &value)
+                .expect("same native header");
+        let encoded = movie(&header);
+        assert_eq!(encoded.mvhd.timescale, extent.movie_timescale);
+        assert_eq!(encoded.mvhd.duration, extent.duration_ticks);
+        assert_eq!(
+            encoded
+                .mvex
+                .expect("native movie extends")
+                .mehd
+                .expect("native duration box")
+                .fragment_duration,
+            extent.duration_ticks
+        );
+    }
+}
+
+#[test]
+fn cold_movie_extent_keeps_short_head_and_interior_standby_semantics() {
+    let head = RecordingPresentation::from_coded_audio_units(0, 0, 2112, 0, None, None)
+        .expect("initial empty coded head");
+    assert_eq!(
+        head.movie_extent()
+            .expect("empty coded head extent")
+            .duration_ticks,
+        0
+    );
+    assert_eq!(
+        head.movie_extent()
+            .expect("empty coded head extent")
+            .duration_ms_ceil,
+        0
+    );
+    // Two 9216-frame coded generations retain their interior 704+2112 slot.
+    let complete = RecordingPresentation::from_coded_audio_units(0, 18, 2112, 704, None, None)
+        .expect("two-generation coded extent");
+    let extent = complete
+        .movie_extent()
+        .expect("complete multi-generation extent");
+    assert_eq!(extent.duration_ticks, 15_616 * 15);
+    assert_eq!(extent.duration_ms_ceil, 326);
+    assert_eq!(15_616, 2 * 6400 + 704 + 2112);
+}
+
+#[test]
+fn cold_movie_extent_ceil_handles_maximum_ticks_without_rounding_add_overflow() {
+    let value =
+        RecordingPresentation::from_coded_audio_units(u64::MAX / 15 - 1024, 1, 0, 0, None, None)
+            .expect("largest exact audio endpoint");
+    let extent = value.movie_extent().expect("ceiling must not add719");
+    assert_eq!(extent.duration_ticks, u64::MAX);
+    assert_eq!(extent.duration_ms_ceil, u64::MAX / 720 + 1);
+    let exact =
+        RecordingPresentation::from_coded_audio_units(0, 3, 0, 0, None, None).expect("exact64ms");
+    assert_eq!(
+        exact
+            .movie_extent()
+            .expect("exact-millisecond extent")
+            .duration_ms_ceil,
+        64
+    );
+}
+
+#[test]
+fn cold_movie_extent_refuses_constructor_clock_and_scalar_overflow() {
+    assert_eq!(
+        RecordingPresentation::from_coded_audio_units(0, u64::MAX, 0, 0, None, None),
+        Err(TimingError::Overflow)
+    );
+    for value in [
+        RecordingPresentation::from_coded_audio_units(u64::MAX / 15, 1, 0, 0, None, None)
+            .expect("constructor defers audio-clock overflow"),
+        RecordingPresentation::from_coded_audio_units(0, 1, 0, 0, Some(0), Some(u64::MAX))
+            .expect("constructor defers video-clock overflow"),
+        RecordingPresentation::from_coded_audio_units(0, 1, 8192, 0, None, None)
+            .expect("constructor defers unsupported head validation"),
+        RecordingPresentation::from_coded_audio_units(0, 1, 0, 1024, None, None)
+            .expect("constructor defers invalid tail validation"),
+    ] {
+        assert!(value.movie_extent().is_err());
+    }
+}

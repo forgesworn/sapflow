@@ -242,6 +242,7 @@ func checkNativeRecordingTimingBinding() throws {
     var finalSize = 0
     var sealed: NativeRecordingCheckpoint?
     var terminalFacts: NativeRecordingCheckpointFacts?
+    var terminalExtent: NativeRecordingPresentationExtent?
     let recordingBinding = Data(repeating: 7, count: 32)
     let sourceFileBinding = Data(repeating: 9, count: 32)
     var initialHash = Data()
@@ -267,7 +268,13 @@ func checkNativeRecordingTimingBinding() throws {
                 finalSize = chunk.bytes.count
                 precondition(previousDecoded?.info().committedOffset == serializedEnd)
             }
-            if let facts = chunk.checkpoint?.facts(), facts.completeAudioEof { terminalFacts = facts }
+            if let token = chunk.checkpoint {
+                let extent = try token.presentationExtent()
+                precondition(extent.movieTimescale == 720_000)
+                if token.facts().completeAudioEof {
+                    terminalFacts = token.facts(); terminalExtent = extent
+                }
+            }
             if sealed == nil { sealed = chunk.checkpoint }
             if chunk.kind == .fragment {
                 guard let token = chunk.checkpoint else { fatalError("fragment missing exact token") }
@@ -321,6 +328,9 @@ func checkNativeRecordingTimingBinding() throws {
     }
     guard let checkpoint = sealed else { fatalError("missing sealed binding receipt") }
     let facts = checkpoint.facts()
+    let prefixExtent = try checkpoint.presentationExtent()
+    precondition(prefixExtent.movieTimescale == 720_000 && prefixExtent.durationTicks == 29_760)
+    precondition(prefixExtent.durationMsCeil == 42 && !prefixExtent.completeAudioEof)
     precondition(facts.audioUnits == 4 && facts.audioEnd == 4096)
     precondition(facts.completedGenerationCount == 0)
     precondition(facts.audioContainerEnd == facts.audioEnd && facts.finalTrailingFrames == 0 && !facts.completeAudioEof)
@@ -339,6 +349,8 @@ func checkNativeRecordingTimingBinding() throws {
         recordingBinding: recordingBinding, sourceFileBinding: sourceFileBinding,
         fragmentRegionSha256: savedRegionHash)
     precondition(oldAfterAdvance.bytes == savedSlot && oldAfterAdvance.info.committedOffset == savedEnd)
+    let extentAfterAdvance = try checkpoint.presentationExtent()
+    precondition(extentAfterAdvance == prefixExtent)
     let beforeRejection = try mux.stats()
     do {
         _ = try other.encodeCheckpoint(token: checkpoint, recordingBinding: recordingBinding,
@@ -367,7 +379,9 @@ func checkNativeRecordingTimingBinding() throws {
     try mux.finishNative(outcome: .complete)
     try drain()
     precondition(finalSize == firstSize)
-    guard let terminal = terminalFacts else { fatalError("missing checked audio EOF checkpoint") }
+    guard let terminal = terminalFacts, let measured = terminalExtent else { fatalError("missing checked audio EOF checkpoint") }
+    precondition(measured.movieTimescale == 720_000 && measured.durationTicks == 96_000)
+    precondition(measured.durationMsCeil == 134 && measured.completeAudioEof)
     precondition(terminal.audioUnits == 9 && terminal.audioEnd == 9216)
     precondition(terminal.audioContainerEnd == 8512 && terminal.finalTrailingFrames == 704)
     precondition(terminal.completeAudioEof && terminal.completedGenerationCount == 1)
@@ -379,8 +393,13 @@ func checkNativeRecordingTimingBinding() throws {
         recordingBinding: recordingBinding, sourceFileBinding: sourceFileBinding,
         fragmentRegionSha256: savedRegionHash)
     precondition(oldAfterFinish.bytes == savedSlot && oldAfterFinish.info.committedOffset == savedEnd)
+    let extentAfterFinish = try checkpoint.presentationExtent()
+    precondition(extentAfterFinish == prefixExtent)
     do {
         _ = try mux.takeOutput()
         fatalError("native recording used legacy output API")
     } catch NativeRecordingError.InvalidConfig {}
+    try mux.cancel()
+    let extentAfterCancel = try checkpoint.presentationExtent()
+    precondition(extentAfterCancel == prefixExtent)
 }

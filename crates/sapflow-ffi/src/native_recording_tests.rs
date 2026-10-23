@@ -1151,3 +1151,216 @@ fn portable_checkpoint_decode_refuses_oversize_input_and_nonexact_expected_diges
         );
     }
 }
+
+#[test]
+fn cold_presentation_query_old_token_is_immutable_without_muxer_lock() {
+    let mux = native_mux(100);
+    let a = audio();
+    mux.begin_native_audio(2112).expect("synthetic native head");
+    let mut first = None;
+    for n in 0..9 {
+        mux.push(sample(&a, n)).expect("same validated handle");
+        for chunk in drain(&mux) {
+            if first.is_none() {
+                first = chunk.checkpoint;
+            }
+        }
+    }
+    let first = first.expect("actual issued first fragment token");
+    let before = first.presentation_extent().expect("cold metadata");
+    assert_eq!(before.movie_timescale, 720_000);
+    assert_eq!(before.duration_ticks, 29_760);
+    assert_eq!(before.duration_ms_ceil, 42);
+    assert!(!before.complete_audio_eof);
+    {
+        let _held = mux.guard().expect("hold actual muxer lock");
+        assert_eq!(
+            first.presentation_extent().expect("retained prefix extent"),
+            before
+        );
+    }
+    let stats_before = mux.stats().expect("actual muxer statistics");
+    mux.end_native_audio_generation(generation())
+        .expect("measured generation EOF");
+    mux.complete_native_audio(file())
+        .expect("measured file EOF");
+    mux.finish_native(NativeRecordingCompletion::Complete)
+        .expect("complete submitted SDK inputs");
+    let terminal = drain(&mux)
+        .into_iter()
+        .rev()
+        .find_map(|chunk| chunk.checkpoint)
+        .expect("actual complete fragment token");
+    let complete = terminal
+        .presentation_extent()
+        .expect("retained complete extent");
+    assert_eq!(complete.duration_ticks, 96_000);
+    assert_eq!(complete.duration_ms_ceil, 134);
+    assert!(complete.complete_audio_eof);
+    assert_eq!(
+        first.presentation_extent().expect("retained prefix extent"),
+        before
+    );
+    assert_eq!(
+        mux.stats().expect("actual muxer statistics").duration_ms,
+        192,
+        "untrimmed legacy stats"
+    );
+    assert_eq!(
+        mux.stats()
+            .expect("actual muxer statistics")
+            .accepted_samples,
+        stats_before.accepted_samples
+    );
+    mux.cancel()
+        .expect("cancel does not invalidate issued snapshots");
+    assert_eq!(
+        first.presentation_extent().expect("retained prefix extent"),
+        before
+    );
+    assert_eq!(
+        terminal
+            .presentation_extent()
+            .expect("retained complete extent"),
+        complete
+    );
+    assert_eq!(
+        mux.stats()
+            .expect("actual muxer statistics")
+            .queued_output_bytes,
+        0
+    );
+}
+
+#[test]
+fn cold_presentation_query_keeps_epoch_offset_and_actual_longer_video() {
+    let mux = NativeRecordingMuxer::with_native_aac_timing(true, true, 1_000_000_000, 4096, 5000)
+        .expect("fixed one-second media epoch");
+    let a = audio();
+    let v = video_codec();
+    mux.begin_native_audio(2112)
+        .expect("measured first leading frames");
+    mux.push(video_sample(&v, 39, 5))
+        .expect("delayed video sample");
+    drain(&mux);
+    for n in 1..=9 {
+        let pts = 48_000 + n * 1024;
+        let input = a
+            .sample(&[1, 2, 3], pts, pts, 1024, 48_000, false)
+            .expect("delayed validated audio sample");
+        mux.push(input).expect("accepted delayed audio");
+        drain(&mux);
+    }
+    mux.end_native_audio_generation(generation())
+        .expect("measured generation EOF");
+    mux.complete_native_audio(file())
+        .expect("measured file EOF");
+    mux.finish_native(NativeRecordingCompletion::Complete)
+        .expect("complete submitted SDK inputs");
+    let chunks = drain(&mux);
+    let token = chunks
+        .iter()
+        .find_map(|c| c.checkpoint.clone())
+        .expect("actual sealed A/V token");
+    let facts = token.facts();
+    assert_eq!(facts.audio_start, 1024);
+    assert_eq!(facts.video_start, Some(27_000));
+    assert_eq!(facts.video_end, Some(30_000));
+    let extent = token.presentation_extent().expect("issued token extent");
+    assert_eq!(extent.movie_timescale, 720_000);
+    assert_eq!(extent.duration_ticks, 240_000);
+    assert_eq!(extent.duration_ms_ceil, 334);
+    assert!(extent.complete_audio_eof);
+    let final_header = chunks
+        .iter()
+        .find(|c| c.kind == NativeRecordingChunkKind::FinalHeader)
+        .expect("actual final header");
+    assert_eq!(
+        mux.checkpoint_header(token)
+            .expect("same-owner reconstruction header"),
+        final_header.bytes
+    );
+}
+
+#[test]
+fn cold_presentation_query_distinguishes_one_frame_eof_and_incomplete_finish() {
+    for (count, head, tail, outcome, expected_ticks, expected_ms, complete) in [
+        (1, 0, 1023, NativeRecordingCompletion::Complete, 15, 1, true),
+        (
+            9,
+            2112,
+            704,
+            NativeRecordingCompletion::IncompletePrefix,
+            106_560,
+            148,
+            false,
+        ),
+    ] {
+        let mux = native_mux(100);
+        let a = audio();
+        mux.begin_native_audio(head).expect("known short head");
+        for n in 0..count {
+            mux.push(sample(&a, n))
+                .expect("accepted validated audio sample");
+            drain(&mux);
+        }
+        let (generation, file) = small_receipts(count, head, tail);
+        mux.end_native_audio_generation(generation)
+            .expect("known short generation EOF");
+        mux.complete_native_audio(file)
+            .expect("known short file EOF");
+        mux.finish_native(outcome)
+            .expect("requested SDK completion");
+        let token = drain(&mux)
+            .into_iter()
+            .rev()
+            .find_map(|c| c.checkpoint)
+            .expect("actual final sealed token");
+        let extent = token.presentation_extent().expect("issued token extent");
+        assert_eq!(extent.duration_ticks, expected_ticks);
+        assert_eq!(extent.duration_ms_ceil, expected_ms);
+        assert_eq!(extent.complete_audio_eof, complete);
+    }
+}
+
+#[test]
+fn cold_presentation_query_defensive_scalar_boundary_returns_existing_errors() {
+    let mux = native_mux(100);
+    let a = audio();
+    mux.begin_native_audio(0)
+        .expect("synthetic zero leading frames");
+    let mut token = None;
+    for n in 0..5 {
+        mux.push(sample(&a, n))
+            .expect("accepted validated audio sample");
+        for chunk in drain(&mux) {
+            if token.is_none() {
+                token = chunk.checkpoint;
+            }
+        }
+    }
+    let mut token = token.expect("actual unique issued token");
+    // Private Rust test corruption only. No public token mutation/injection API.
+    let original = token.facts();
+    Arc::get_mut(&mut token)
+        .expect("test owns the sole issued-token reference")
+        .facts
+        .audio_units = u64::MAX;
+    assert_eq!(
+        token.presentation_extent().err(),
+        Some(NativeRecordingError::Encoding)
+    );
+    let unique = Arc::get_mut(&mut token).expect("test owns the sole issued-token reference");
+    unique.facts = original;
+    unique.facts.first_leading_frames = 8192;
+    assert_eq!(
+        token.presentation_extent().err(),
+        Some(NativeRecordingError::InvalidMedia)
+    );
+    assert_eq!(
+        mux.stats()
+            .expect("actual muxer statistics")
+            .accepted_samples,
+        5
+    );
+}

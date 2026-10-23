@@ -148,6 +148,7 @@ private fun checkNativeRecordingTimingBinding() {
             var finalSize = 0
             var sealed: NativeRecordingCheckpoint? = null
             var terminalFacts: NativeRecordingCheckpointFacts? = null
+            var terminalExtent: NativeRecordingPresentationExtent? = null
             val recordingBinding = ByteArray(32) { 7 }
             val sourceFileBinding = ByteArray(32) { 9 }
             var initialHash = byteArrayOf()
@@ -175,7 +176,11 @@ private fun checkNativeRecordingTimingBinding() {
                         finalSize = chunk.bytes.size
                         check(previousDecoded?.info()?.committedOffset == serializedEnd)
                     }
-                    token?.facts()?.let { if (it.completeAudioEof) terminalFacts = it }
+                    token?.let { actual ->
+                        val extent = actual.presentationExtent()
+                        check(extent.movieTimescale == 720_000u)
+                        actual.facts().let { if (it.completeAudioEof) { terminalFacts = it; terminalExtent = extent } }
+                    }
                     if (sealed == null) sealed = token
                     try {
                         if (chunk.kind == NativeRecordingChunkKind.FRAGMENT) {
@@ -235,6 +240,9 @@ private fun checkNativeRecordingTimingBinding() {
                 }
                 val checkpoint = checkNotNull(sealed)
                 val facts = checkpoint.facts()
+                val prefixExtent = checkpoint.presentationExtent()
+                check(prefixExtent.movieTimescale == 720_000u && prefixExtent.durationTicks == 29_760uL)
+                check(prefixExtent.durationMsCeil == 42uL && !prefixExtent.completeAudioEof)
                 check(facts.audioUnits == 4uL && facts.audioEnd == 4096uL)
                 check(facts.completedGenerationCount == 0uL)
                 check(facts.audioContainerEnd == facts.audioEnd && facts.finalTrailingFrames == 0u && !facts.completeAudioEof)
@@ -253,6 +261,7 @@ private fun checkNativeRecordingTimingBinding() {
                 check(fragmentCount >= 2 && serializedEnd > savedEnd)
                 val oldAfterAdvance = mux.encodeCheckpoint(checkpoint, recordingBinding, sourceFileBinding, savedRegionHash)
                 check(oldAfterAdvance.bytes.contentEquals(savedSlot) && oldAfterAdvance.info.committedOffset == savedEnd)
+                check(checkpoint.presentationExtent() == prefixExtent)
                 try {
                     decodeRecordingCheckpoint(savedSlot, ByteArray(32) { 8 }, sourceFileBinding).use { error("foreign persisted recording binding accepted") }
                 } catch (_: RecordingCheckpointException.Binding) {}
@@ -269,6 +278,9 @@ private fun checkNativeRecordingTimingBinding() {
                 drain()
                 check(finalSize == firstSize)
                 val terminal = checkNotNull(terminalFacts)
+                val measured = checkNotNull(terminalExtent)
+                check(measured.movieTimescale == 720_000u && measured.durationTicks == 96_000uL)
+                check(measured.durationMsCeil == 134uL && measured.completeAudioEof)
                 check(terminal.audioUnits == 9uL && terminal.audioEnd == 9216uL)
                 check(terminal.audioContainerEnd == 8512uL && terminal.finalTrailingFrames == 704u)
                 check(terminal.completeAudioEof && terminal.completedGenerationCount == 1uL)
@@ -278,8 +290,11 @@ private fun checkNativeRecordingTimingBinding() {
                 check(previousDecoded?.info()?.committedOffset == serializedEnd)
                 val oldAfterFinish = mux.encodeCheckpoint(checkpoint, recordingBinding, sourceFileBinding, savedRegionHash)
                 check(oldAfterFinish.bytes.contentEquals(savedSlot) && oldAfterFinish.info.committedOffset == savedEnd)
+                check(checkpoint.presentationExtent() == prefixExtent)
                 try { mux.takeOutput(); error("native recording used legacy output API") }
                 catch (_: NativeRecordingException.InvalidConfig) {}
+                mux.cancel()
+                check(checkpoint.presentationExtent() == prefixExtent)
             } finally { previousDecoded?.close(); sealed?.close() }
         }
     }

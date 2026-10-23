@@ -16,8 +16,8 @@ pub use recording::{
     NativeAudioFileReceipt, NativeAudioGenerationReceipt, NativeRecordingCheckpoint,
     NativeRecordingCheckpointEncoding, NativeRecordingCheckpointFacts, NativeRecordingChunk,
     NativeRecordingChunkKind, NativeRecordingCompletion, NativeRecordingError,
-    NativeRecordingMuxer, NativeRecordingSourceMapping, NativeRecordingStats,
-    RecordingCheckpointError, RecordingWrite, decode_recording_checkpoint,
+    NativeRecordingMuxer, NativeRecordingPresentationExtent, NativeRecordingSourceMapping,
+    NativeRecordingStats, RecordingCheckpointError, RecordingWrite, decode_recording_checkpoint,
     validate_recording_checkpoint_successor,
 };
 pub use rtmp::{

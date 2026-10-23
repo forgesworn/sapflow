@@ -148,6 +148,20 @@ pub struct NativeRecordingCheckpointFacts {
     pub completed_generation_count: u64,
 }
 
+/// Cold exact presentation metadata for one immutable issued snapshot.
+/// This is not a whole-recording EOF, admission, file or playability certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct NativeRecordingPresentationExtent {
+    /// Explicit movie clock, currently 720000 ticks per second.
+    pub movie_timescale: u32,
+    /// Exact header presentation extent, including offsets and intentional gaps.
+    pub duration_ticks: u64,
+    /// Shared checked ceiling milliseconds, not a durable-progress clock.
+    pub duration_ms_ceil: u64,
+    /// Checked AAC EOF coverage only; no file or whole-recording completion.
+    pub complete_audio_eof: bool,
+}
+
 /// Opaque exact-owner checkpoint. It cannot describe buffered future samples.
 #[derive(uniffi::Object)]
 pub struct NativeRecordingCheckpoint {
@@ -163,6 +177,39 @@ impl NativeRecordingCheckpoint {
     /// Copy bounded scalar metadata after a real complete output chunk.
     pub fn facts(&self) -> NativeRecordingCheckpointFacts {
         self.facts
+    }
+    /// Query this exact snapshot without consulting the current muxer state.
+    /// Old tokens retain their metadata after advance, finish or cancel. This
+    /// performs no IO, header parsing, sample validation or completion control.
+    pub fn presentation_extent(
+        &self,
+    ) -> Result<NativeRecordingPresentationExtent, NativeRecordingError> {
+        let facts = self.facts;
+        let presentation = RecordingPresentation::from_coded_audio_units(
+            facts.audio_start,
+            facts.audio_units,
+            facts.first_leading_frames,
+            facts.final_trailing_frames,
+            facts.video_start,
+            facts.video_end,
+        )
+        .map_err(presentation_query_error)?;
+        let extent = presentation
+            .movie_extent()
+            .map_err(presentation_query_error)?;
+        Ok(NativeRecordingPresentationExtent {
+            movie_timescale: extent.movie_timescale,
+            duration_ticks: extent.duration_ticks,
+            duration_ms_ceil: extent.duration_ms_ceil,
+            complete_audio_eof: facts.complete_audio_eof,
+        })
+    }
+}
+
+fn presentation_query_error(error: timing::TimingError) -> NativeRecordingError {
+    match error {
+        timing::TimingError::Overflow => NativeRecordingError::Encoding,
+        _ => NativeRecordingError::InvalidMedia,
     }
 }
 
@@ -547,19 +594,17 @@ impl State {
             .native
             .as_ref()
             .ok_or(NativeRecordingError::InvalidConfig)?;
-        let value = RecordingPresentation {
-            audio_start: self
-                .audio
+        let value = RecordingPresentation::from_coded_audio_units(
+            self.audio
                 .first_time
                 .ok_or(NativeRecordingError::MissingTracks)?,
-            audio_frames: audio_units
-                .checked_mul(1024)
-                .ok_or(NativeRecordingError::Encoding)?,
-            leading_frames: ledger.leading().ok_or(NativeRecordingError::InvalidMedia)?,
-            trailing_frames: trailing,
-            video_start: self.video.first_time,
-            video_end: self.has_video.then_some(self.video.presentation_end),
-        };
+            audio_units,
+            ledger.leading().ok_or(NativeRecordingError::InvalidMedia)?,
+            trailing,
+            self.video.first_time,
+            self.has_video.then_some(self.video.presentation_end),
+        )
+        .map_err(|_| NativeRecordingError::Encoding)?;
         fmp4::init_segment_for_native_recording(
             self.video_config.as_ref(),
             self.audio_config
@@ -796,14 +841,15 @@ impl State {
                 .as_ref()
                 .and_then(AudioLedger::leading)
                 .ok_or(NativeRecordingError::InvalidMedia)?;
-            let value = RecordingPresentation {
-                audio_start: first_audio.ok_or(NativeRecordingError::InvalidMedia)?,
-                audio_frames: 0,
-                leading_frames: leading,
-                trailing_frames: 0,
-                video_start: first_video,
-                video_end: first_video,
-            };
+            let value = RecordingPresentation::from_coded_audio_units(
+                first_audio.ok_or(NativeRecordingError::InvalidMedia)?,
+                0,
+                leading,
+                0,
+                first_video,
+                first_video,
+            )
+            .map_err(|_| NativeRecordingError::Encoding)?;
             Some(
                 fmp4::init_segment_for_native_recording(
                     video_config,

@@ -304,7 +304,54 @@ pub struct RecordingPresentation {
     pub video_end: Option<u64>,
 }
 
+/// Exact movie extent and rounded catalogue metadata, never an EOF certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingPresentationExtent {
+    /// Explicit shared movie clock, currently 720000 ticks per second.
+    pub movie_timescale: u32,
+    /// Exact duration in that movie clock, including initial track offsets.
+    pub duration_ticks: u64,
+    /// Ceiling milliseconds for catalogue display; exact ticks remain authoritative.
+    pub duration_ms_ceil: u64,
+}
+
 impl RecordingPresentation {
+    /// Map the same coded-unit inputs for native headers and immutable snapshots.
+    /// Validation remains at each metadata consumer, not per access unit.
+    pub fn from_coded_audio_units(
+        audio_start: u64,
+        audio_units: u64,
+        leading_frames: u32,
+        trailing_frames: u32,
+        video_start: Option<u64>,
+        video_end: Option<u64>,
+    ) -> Result<Self, TimingError> {
+        Ok(Self {
+            audio_start,
+            audio_frames: audio_units
+                .checked_mul(AAC_FRAMES)
+                .ok_or(TimingError::Overflow)?,
+            leading_frames,
+            trailing_frames,
+            video_start,
+            video_end,
+        })
+    }
+    /// Checked metadata for the same exact extent used by the native header.
+    /// Integer rounding is centralised here, never repeated in platform code.
+    pub fn movie_extent(&self) -> Result<RecordingPresentationExtent, TimingError> {
+        self.validate()?;
+        let duration_ticks = self.movie_duration()?;
+        let ticks_per_ms = u64::from(MOVIE_TIMESCALE / 1000);
+        let duration_ms_ceil = (duration_ticks / ticks_per_ms)
+            .checked_add(u64::from(!duration_ticks.is_multiple_of(ticks_per_ms)))
+            .ok_or(TimingError::Overflow)?;
+        Ok(RecordingPresentationExtent {
+            movie_timescale: MOVIE_TIMESCALE,
+            duration_ticks,
+            duration_ms_ceil,
+        })
+    }
     /// Check native format-independent bounds before serialising metadata.
     pub fn validate(&self) -> Result<(), TimingError> {
         checked_leading(self.leading_frames)?;
