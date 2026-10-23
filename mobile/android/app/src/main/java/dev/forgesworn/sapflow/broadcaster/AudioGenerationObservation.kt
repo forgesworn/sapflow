@@ -24,6 +24,12 @@ internal class AudioGenerationObservation(private val generation: Long) {
         val overflow: Boolean, val invalidDiagnostic: Boolean, val trimConflict: Boolean,
         val producersJoined: Boolean, val callbackBarrier: Boolean, val nativeStopReturned: Boolean,
         val handoffIdle: Boolean,
+        // Buffer observations only, including malformed/partial/early data.
+        // No counter is an AU count, coded extent or completeness authority.
+        val cardinalityUnknownBuffers: Long, val partialOutputBuffers: Long,
+        val otherOutputFlagsBuffers: Long, val invalidOutputRanges: Long,
+        val earlyDataBuffers: Long, val nonemptyOutputEosBuffers: Long,
+        val checkedBorrowedOutputRanges: Long, val invalidBorrowedOutputRanges: Long,
     )
     private class Slot {
         var api = 0
@@ -68,6 +74,14 @@ internal class AudioGenerationObservation(private val generation: Long) {
     private var callbackBarrier = false
     private var stopReturned = false
     private var handoffIdle = false
+    private var cardinalityUnknownBuffers = 0L
+    private var partialOutputBuffers = 0L
+    private var otherOutputFlagsBuffers = 0L
+    private var invalidOutputRanges = 0L
+    private var earlyDataBuffers = 0L
+    private var nonemptyOutputEosBuffers = 0L
+    private var checkedBorrowedOutputRanges = 0L
+    private var invalidBorrowedOutputRanges = 0L
 
     private fun active(value: Long) = value == generation && frozen == null
     private fun add(value: Long, amount: Long): Long {
@@ -121,9 +135,22 @@ internal class AudioGenerationObservation(private val generation: Long) {
 
     /** Original callback observations precede legacy priming/timestamp policy.
      * A buffer count is not an AU count, decoded frames or encoded extent. */
-    @Synchronized fun output(value: Long, bytes: Int, ptsUs: Long, flags: Int, config: Boolean, eos: Boolean, started: Boolean) {
+    @Synchronized fun output(value: Long, bytes: Int, ptsUs: Long, flags: Int, config: Boolean, eos: Boolean, started: Boolean, offset: Int = 0) {
         if (!active(value)) return
         if (callbackBarrier) { invalid = true; return }
+        // This scalar classification precedes the legacy priming/stale filter.
+        // No classification result controls capture or recording admission.
+        val disposition = AudioAacOutputDisposition.classify(offset, bytes, flags, started)
+        if (AudioAacOutputDisposition.has(disposition, AudioAacOutputDisposition.CARDINALITY_UNKNOWN)) {
+            cardinalityUnknownBuffers = add(cardinalityUnknownBuffers, 1)
+            if (!started) earlyDataBuffers = add(earlyDataBuffers, 1)
+            if (AudioAacOutputDisposition.has(disposition, AudioAacOutputDisposition.EOS)) nonemptyOutputEosBuffers = add(nonemptyOutputEosBuffers, 1)
+        }
+        if (AudioAacOutputDisposition.has(disposition, AudioAacOutputDisposition.PARTIAL_FLAG)) partialOutputBuffers = add(partialOutputBuffers, 1)
+        if (AudioAacOutputDisposition.has(disposition, AudioAacOutputDisposition.OTHER_FLAGS)) otherOutputFlagsBuffers = add(otherOutputFlagsBuffers, 1)
+        if (AudioAacOutputDisposition.has(disposition, AudioAacOutputDisposition.RANGE_INVALID)) {
+            invalidOutputRanges = add(invalidOutputRanges, 1); invalid = true
+        }
         outputBuffers = add(outputBuffers, 1); flagsOr = flagsOr or flags
         if (!started) preStartBuffers = add(preStartBuffers, 1)
         if (eos) outputEosBuffers = add(outputEosBuffers, 1)
@@ -135,6 +162,17 @@ internal class AudioGenerationObservation(private val generation: Long) {
             if (!hasPts) { firstPts = ptsUs; hasPts = true }
             else if (ptsUs < lastPts) ptsWentBackwards = true
             lastPts = ptsUs
+        }
+    }
+    /** Only an already borrowed native buffer supplies capacity. No extra
+     * native lookup, throw, admission decision or compressed-byte validation. */
+    @Synchronized fun borrowedOutputRange(value: Long, offset: Int, bytes: Int, capacity: Int) {
+        if (!active(value)) return
+        if (callbackBarrier) { invalid = true; return }
+        checkedBorrowedOutputRanges = add(checkedBorrowedOutputRanges, 1)
+        val disposition = AudioAacOutputDisposition.classify(offset, bytes, 0, true, capacity)
+        if (capacity < 0 || AudioAacOutputDisposition.has(disposition, AudioAacOutputDisposition.RANGE_INVALID)) {
+            invalidBorrowedOutputRanges = add(invalidBorrowedOutputRanges, 1); invalid = true
         }
     }
     @Synchronized fun constructed(value: Long) {
@@ -181,7 +219,9 @@ internal class AudioGenerationObservation(private val generation: Long) {
             outputBuffers, dataBuffers, configBuffers, emptyBuffers, preStartBuffers, dataBytes,
             flagsOr, outputEosBuffers, if (hasPts) firstPts else null, if (hasPts) lastPts else null, ptsWentBackwards,
             constructedSamples, primingFiltered, staleFiltered, handoffAttempts, handoffReturns, callbackEntries, callbackReturns,
-            overflow, invalid, trimConflict, producersJoined, callbackBarrier, stopReturned, handoffIdle)
+            overflow, invalid, trimConflict, producersJoined, callbackBarrier, stopReturned, handoffIdle,
+            cardinalityUnknownBuffers, partialOutputBuffers, otherOutputFlagsBuffers, invalidOutputRanges,
+            earlyDataBuffers, nonemptyOutputEosBuffers, checkedBorrowedOutputRanges, invalidBorrowedOutputRanges)
         frozen = result
         return result
     }

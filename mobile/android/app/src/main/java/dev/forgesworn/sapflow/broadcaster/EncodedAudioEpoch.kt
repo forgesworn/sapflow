@@ -77,7 +77,7 @@ internal class EncodedAudioEpoch(
         val startNs = System.nanoTime()
         val isEos = info.flags and PlatformCodec.BUFFER_FLAG_END_OF_STREAM != 0
         observation.output(nativeGeneration,info.size,info.presentationTimeUs,info.flags,
-            info.flags and PlatformCodec.BUFFER_FLAG_CODEC_CONFIG != 0,isEos,started)
+            info.flags and PlatformCodec.BUFFER_FLAG_CODEC_CONFIG != 0,isEos,started,info.offset)
         if (isEos) {
             // One terminal format observation while this exact native output
             // index is still owned. No per-buffer metadata query or inferred EOF.
@@ -97,6 +97,7 @@ internal class EncodedAudioEpoch(
                 }
                 else if (tick != AudioGenerationClock.STALE) {
                     val buffer = codec.getOutputBuffer(index) ?: error("AAC output buffer unavailable")
+                    observation.borrowedOutputRange(nativeGeneration,info.offset,info.size,buffer.capacity())
                     buffer.position(info.offset); buffer.limit(info.offset + info.size)
                     val encoded = codecDescriptor.sample(buffer.slice(),tick,tick,1024u,48_000u,false)
                     observation.constructed(nativeGeneration)
