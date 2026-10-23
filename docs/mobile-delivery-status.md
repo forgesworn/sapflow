@@ -40,12 +40,15 @@ publisher/pending-capture fence; the actor rechecks the same owner before the
 durable End request. An active local recording continues. Independent source
 review is clear; evidence is under `target/v4v-end-confirmation-v1/`.
 
-The completed Android gate passes 597 JVM tests in 68 suites for each of Debug
-and Qualification, including 22 confirmation/shutdown tests and 15 existing
-session tests. All three configurations build and pass lint with no errors.
-Actual APK checks pass native SDK byte identity, native and ZIP 16 KiB alignment,
-notices, manual routing and qualification isolation. Release remains unsigned;
-no phone was installed or tested. Evidence is under
+The refreshed Android app gate uses the current checkpoint SDK AAR. Debug and
+Qualification each reexecute all 597 JVM tests in 68 suites, including 22
+confirmation/shutdown tests and 15 existing session tests. All three app
+configurations build and pass lint with no errors; warnings remain. Actual APK
+checks pass current SDK byte identity, native and ZIP 16 KiB alignment, notices,
+manual routing and qualification isolation. Independent outcome review is clear.
+Release remains unsigned; no phone was installed or tested. Evidence is under
+`target/privacy-standby/recording-checkpoint-android-app-v1/`.
+The earlier End/shutdown gate remains retained under
 `target/v4v-end-shutdown-v2/app-gates/gate-v1/`.
 
 The initial run exposed two failures while awaiting control-actor shutdown.
