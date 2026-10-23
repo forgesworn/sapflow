@@ -1,0 +1,10 @@
+| sapflow | binary MB | idle RSS MB | one stream RSS MB | one stream CPU % |
+| sapflow | 3.4 | 3.4 | 23.0 | 0.6 |
+--- sapflow, 750 viewers: server CPU 20.3%  peak RSS 24.8 MB
+viewers 750  measured 60 s after a 10 s ramp
+requests 587966  errors 0  received 33458.7 MB
+responses HTTP/1.1 587966  connections 1582 (2.11 per viewer)
+playlist  n=49185  p50 9.7 ms  p95 27.5 ms  p99 34.7 ms  max 45.7 ms
+segment   n=49185  p50 5.9 ms  p95 8.4 ms  p99 9.7 ms  max 41.7 ms
+playlist update fan-out (first to last viewer) updates=351  p50 35.8 ms  p95 42.6 ms  max 46.3 ms
+part fan-out (first to last viewer) parts=351 reach 696/750  p50 35.8 ms  p95 42.6 ms  max 46.3 ms

@@ -4,6 +4,10 @@ M4 in `GOALS.md`. Same machine, same encoder input, same simulated viewers.
 Reproduce with `scripts/bench.sh sapflow` and
 `MEDIAMTX=<path> scripts/bench.sh mediamtx`.
 
+For the newer native-branch HTTP worker screening, see
+[23 October M4 results](performance-results-2026-10-23.md).  It retains full
+scalar receipts and records the client ramp-window limitation.
+
 ## Method
 
 - **Machine:** Apple silicon Mac, 8 cores, 16 GB, macOS 14. Server, encoder
