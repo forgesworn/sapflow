@@ -1313,8 +1313,9 @@ buffer timestamps and full presentation qualification still need actual proof.
 
 `checked-sdk-playback-clock-v1` is a separately registered, owner-approved clock
 profile for application-controlled decoded PCM playback. The approved policy is
-unchanged; its internal qualification owner is now implemented, with actual
-native qualification still unrun. The owner selected a checked application-owned
+unchanged; its internal qualification owner is implemented and has completed
+the bounded native schedule checks described below. Whole-content and production
+qualification remain separate. The owner selected a checked application-owned
 rational schedule as the alternative presentation-clock criterion for this
 playback path. Registration alone grants no native qualification or adoption;
 implementation and host evidence are recorded below. The
@@ -1481,17 +1482,64 @@ failure against 250 ms remains failed and is not replayed as eligible. No result
 here establishes waveform/paired presentation, production/default adoption,
 physical capture, power/performance advantage or recovery.
 
-The concrete next work is fresh SDK packages and full source/package/artefact
-verification once concurrent SDK work is stable, followed by actual native
-qualification of the implemented checked playback-clock owner. Source-generation /
-capture and ingress closure using actual native producers and paired
-presentation remain required. Raw native-clock results remain separately
-unqualified.
+### Later native schedule and current-source build results
+
+A later generated emulator run uses the actual `NativeRecordingReader`, sink and
+clock owners. All three eligible explicit-reader cases complete their checked
+schedules at 2,765, 48,000 and 2,765 frames. Actual input EOS, output EOS, whole
+sink writes, native releases and known owner/file closure are observed. The
+unconfigured control still returns 5,120 frames instead of the required 2,765;
+the first cold failed source is not replayed. Raw native timestamps and their failed clock
+checks remain unchanged. Independent review accepts only this schedule and
+accounting scope. It does not establish whole-content equivalence, producer
+source authority, seeks, A/V presentation or production adoption.
+
+That run belongs to source `4722209`. Its SDK inputs are preserved separately
+before later package builds; its receipts are not relabelled as current-source
+proof. Private evidence is under
+`target/privacy-standby/managed-reader-native-runtime-actual-v1/` and
+`managed-reader-native-inspection-actual-v1/`, with the byte-preserving input
+relocation under `native-clock-sdk-inputs-preserved-v1/`.
+
+At source `9d7d944`, fresh SDK packages and all eight host/package stages pass,
+including 797 Rust tests and 24 real-SDK Swift checkpoint tests. The Android app
+then passes 703 Debug tests, 683 Qualification tests and 39 Python verifier
+controls. Both unit tasks execute; all three APK assemblies, lint, qualification
+isolation and seven artefact checks pass with unchanged source and package
+inputs. Independent review verifies the resulting APKs, native bytes and Release
+isolation. These are build and package results, not physical or presentation
+acceptance. Private receipts and reviews are under
+`target/privacy-standby/native-pair-sdk-builds-actual-v1/` and
+`native-pair-android-app-gates-actual-v1/`.
+
+The separate paired-file action retains three original native-recorder files
+and the corresponding SDK recordings. Its first emulator attempt is cancelled
+when the activity is relaunched, before any decoder is created. The failed
+receipt retains one actual SDK checkpoint decode and no paired PCM result. A
+prelaunch successor refuses an incorrect help-advertisement condition; the
+corrected successor reaches its actual broadcast-idle command but exceeds the
+registered 60-second startup deadline before launching the activity. All three
+attempts remain failed, with their source bindings, logs and cleanup evidence
+preserved. Their owned emulator groups and temporary directories close; the
+pre-existing AVD remains. No physical phone is accessed. Evidence is under
+`target/privacy-standby/native-file-pair-runtime-actual-v1/`,
+`target/privacy-standby/native-file-pair-runtime-actual-v2/` and
+`target/privacy-standby/native-file-pair-runtime-actual-v3/`. No six-decoder paired run or
+independent paired Float32 comparison has completed. Neither the Int16 tolerance
+nor the exact independent-PCM requirement is relaxed.
+
+The next production change is to carry the real audio producer's terminal
+closure through the existing recording drain, and make recording-loss admission
+atomic with the catalogue's final commit. Source-owned leading/tail facts,
+paired content, applicable seeks and A/V checks remain required for adoption.
+The approved SDK schedule is an alternative clock criterion for its registered
+playback path; repairing the old raw native timestamps is not an extra condition
+for that new profile. Raw native-clock results remain separately unqualified.
 Durable checkpoint installation/recovery and the aggregate two-second loss bound
 follow, then both-phone complete-show pilots, matched competitor performance and
-release. Existing delivery goals and legacy defaults are unchanged. Later source
-commits must keep these app/native receipts' original `75b1a5e` plus four-path dirty
-context; they do not relabel the earlier package or failed experiments.
+release. Existing delivery goals and legacy defaults are unchanged. Earlier
+app/native receipts retain their original `75b1a5e` plus four-path dirty context;
+later source commits do not relabel their package or failed experiments.
 
 In the preceding native SDK experiment, owners, the task emulator and temporary
 directory close; the pre-existing AVD and private generated evidence remain
