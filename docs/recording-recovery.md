@@ -1821,6 +1821,60 @@ presentation checks to the same fresh per-file source receipts remains required
 before adoption. Production defaults, durable recovery, the aggregate loss
 bound and physical-show acceptance remain unchanged.
 
+## Same-file producer timing and content checks
+
+The generated recorder fixture now observes each original compressed sample
+before the existing ingress validation. It retains bounded payload hashes and
+actual coded PTS, DTS and duration fields, with explicit clock authority. Audio
+uses the application-assigned coded CMSampleBuffer clock. Video uses the adapter
+output after the VideoToolbox callback and existing 90 kHz retiming, not raw
+VideoToolbox timestamps. The existing ingress counter is read at its existing
+queue barrier. Production capture, encoder and recorder defaults are unchanged.
+
+The fresh original 22-case matrix completes all 17 commands. Its 17 producer
+cases retain 306 audio timing rows, 40 video timing rows and 346 actual accepted
+ingress samples in total. The original packet-preservation and whole-file decode
+checks pass. The same four finalised audio-only and A/V files are then joined to
+their own completed producer ledger, actual EOF, original packet witnesses,
+container metadata and native and independent reader observations.
+
+All four files preserve their original encoded payloads and rational coded
+clocks. Native audio returns exactly 16,137 frames and both full recorder pairs
+are byte-identical. The four native audio seeks return the exact 4,096-frame
+whole-output interval beginning at frame 8,000. Independent whole decodes return
+16,320 frames, including the actual 183-frame trailing allowance. Their unchanged
+whole outputs are byte-identical across both pairs, and the fixed valid
+16,137-frame prefixes satisfy the existing registered independent-PCM policy.
+This uses each file's actual leading/tail receipts; it does not infer trimming
+from the decoder-length difference.
+
+The new native video duration-sensitive diagnostic fails and retains exit 1.
+All 26 returned whole/seek pictures have valid exact PTS but unavailable raw and
+output durations. A separate pure comparison matches all ten whole-picture PTS
+and the three seek-picture PTS to their authenticated original source rows in
+both A/V files. These intervals remain explicitly source-derived; no native
+duration is invented and the failed native verdict is unchanged. Independent
+whole-video reads return ten frames and both video seeks match whole frames
+five through seven.
+
+All four independent audio seeks return positive output totalling 4,096 frames.
+An additional exact seek-content diagnostic fails for the first 128-frame block
+of the native audio-only reference file; its other four blocks match. The SDK
+audio-only, SDK A/V and native A/V seek blocks all match their respective whole
+output intervals. Positive read completion and exact seek content are reported
+separately. The cause of the audio-only reference mismatch remains unresolved.
+
+Private source-bound runs and supplementary comparisons are retained under
+`target/ios-default-native-coded-witness-v1/`,
+`target/ios-joined-source-presentation-actual-v1/`,
+`target/ios-joined-source-independent-actual-v1/` and
+`target/privacy-standby/ios-joined-source-content-actual-v1/`.
+These checks do not establish the full registered 17-gate presentation profile:
+its actual untreated-legacy-file negatives are absent from this four-file join.
+The original numerical contract and raw-clock failures remain unchanged.
+Recorder adoption, durable recovery, the aggregate two-second loss bound,
+physical shows, performance and release remain open.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC

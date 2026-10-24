@@ -25,6 +25,8 @@ private final class RecordingReply<Value> {
 private final class RecordingTrace {
     private let lock = NSLock()
     private var packets: [[String: Any]] = []
+    private var packetTimings: [[String: Any]] = [] // Same <=512 bound and index as packets; test tool only.
+    private var videoPackets: [[String: Any]] = [] // Bounded <=64 adapter-output callbacks; test tool only.
     private var recordingErrors = 0, publishingErrors = 0, mediaErrors = 0, refused = 0
     private var callbackError: Error?
     private var originalUnit: CompressedUnit?
@@ -39,11 +41,47 @@ private final class RecordingTrace {
                 contiguous == total, (1...65_536).contains(total) else { throw CaptureFailure(message: "Native AAC payload shape") }
             let view = Data(bytesNoCopy: pointer, count: total, deallocator: .none)
             let hash = SHA256.hash(data: view).map { String(format: "%02x", $0) }.joined()
+            // Observe the actual original CMSampleBuffer before worker validation.
+            // These are application-assigned coded times, not converter timestamps.
+            var timing: [String: Any] = ["size": total, "sha256": hash,
+                "sampleCount": CMSampleBufferGetNumSamples(unit.buffer),
+                "pts": Self.timeFacts(CMSampleBufferGetPresentationTimeStamp(unit.buffer)),
+                "dts": Self.timeFacts(CMSampleBufferGetDecodeTimeStamp(unit.buffer)),
+                "duration": Self.timeFacts(CMSampleBufferGetDuration(unit.buffer))]
             lock.lock(); defer { lock.unlock() }
             guard packets.count < 512 else { throw CaptureFailure(message: "Generated packet retention bound") }
+            guard packetTimings.count == packets.count else { throw CaptureFailure(message: "Generated parallel timing retention diverged") }
             if originalUnit == nil { originalUnit = unit }
+            timing["index"] = packets.count
             packets.append(["size": total, "sha256": hash])
+            packetTimings.append(timing)
         } catch { lock.lock(); callbackError = callbackError ?? error; lock.unlock() }
+    }
+    func observeVideo(_ unit: CompressedUnit) {
+        do {
+            guard unit.isVideo, let block = CMSampleBufferGetDataBuffer(unit.buffer) else {
+                throw CaptureFailure(message: "Adapter video payload absent")
+            }
+            var contiguous = 0, total = 0
+            var pointer: UnsafeMutablePointer<Int8>?
+            guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: &contiguous,
+                totalLengthOut: &total, dataPointerOut: &pointer) == noErr, let pointer,
+                contiguous == total, (1...4_194_304).contains(total) else { throw CaptureFailure(message: "Adapter video payload shape") }
+            let view = Data(bytesNoCopy: pointer, count: total, deallocator: .none)
+            let hash = SHA256.hash(data: view).map { String(format: "%02x", $0) }.joined()
+            var observed: [String: Any] = ["size": total, "sha256": hash, "keyframe": unit.keyframe,
+                "sampleCount": CMSampleBufferGetNumSamples(unit.buffer),
+                "pts": Self.timeFacts(CMSampleBufferGetPresentationTimeStamp(unit.buffer)),
+                "dts": Self.timeFacts(CMSampleBufferGetDecodeTimeStamp(unit.buffer)),
+                "duration": Self.timeFacts(CMSampleBufferGetDuration(unit.buffer))]
+            lock.lock(); defer { lock.unlock() }
+            guard videoPackets.count < 64 else { throw CaptureFailure(message: "Generated video witness retention bound") }
+            observed["index"] = videoPackets.count; videoPackets.append(observed)
+        } catch { lock.lock(); callbackError = callbackError ?? error; lock.unlock() }
+    }
+    private static func timeFacts(_ value: CMTime) -> [String: Any] {
+        ["value": value.value, "timescale": value.timescale, "flags": value.flags.rawValue,
+            "epoch": value.epoch, "numeric": value.isNumeric]
     }
     func timing(_ event: AudioRecordingTiming.Event) {
         if case let .generationEnded(value) = event { lock.lock(); generations.append(value); lock.unlock() }
@@ -56,6 +94,8 @@ private final class RecordingTrace {
     func check() throws { lock.lock(); let error = callbackError; lock.unlock(); if let error { throw error } }
     var firstUnit: CompressedUnit? { lock.lock(); defer { lock.unlock() }; return originalUnit }
     var packetSnapshot: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return packets }
+    var packetTimingSnapshot: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return packetTimings }
+    var videoPacketSnapshot: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return videoPackets }
     var counters: (recording: Int, publishing: Int, media: Int, refused: Int) {
         lock.lock(); defer { lock.unlock() }; return (recordingErrors, publishingErrors, mediaErrors, refused)
     }
@@ -305,7 +345,7 @@ enum CaptureRecordingFixtureCheck {
         let video: HardwareVideoEncoder?
         if av {
             video = try HardwareVideoEncoder(orientation: .landscapeRight, profile: .sd480p30,
-                output: { unit, source in _ = worker.offer(unit, token: source) },
+                output: { unit, source in trace.observeVideo(unit); _ = worker.offer(unit, token: source) },
                 fault: { source, _ in _ = gate.nativeFault(source ?? token) },
                 permitsInput: { gate.allowsInput($0) == .allow })
         } else { video = nil }
@@ -335,7 +375,7 @@ enum CaptureRecordingFixtureCheck {
         }
         let nativeLedger = try samples.sync { try nativeLedgerFacts(audio.generationLedger) }
         try requireCaptureRecording(try samples.sync { try producer.finish() } == nil, "Native producer closure minted twice")
-        encoded.sync {}; io.sync {}
+        let actualValidatedIngressSamples = encoded.sync { ingress.accepted }; io.sync {}
         let result = RecordingReply<CaptureRecording.Completion>(), published = RecordingReply<Result<Void, Error>>()
         worker.finish(producers: closure, recording: { result.put($0) }, publishing: { published.put($0) })
         if holdCommit {
@@ -366,6 +406,12 @@ enum CaptureRecordingFixtureCheck {
         try trace.check()
         return ["name": name, "passed": true, "finalised": completed.finalised, "file": identity.filename, "actualNativeEOF": nativeEOF,
             "actualNativeAudioLedger": nativeLedger, "originalAudioPackets": trace.packetSnapshot,
+            "originalAudioPacketTimings": trace.packetTimingSnapshot,
+            "originalAudioPacketClock": "APPLICATION_ASSIGNED_CODED_CMSAMPLEBUFFER; NOT_CONVERTER_NATIVE_TIMESTAMP",
+            "originalVideoPackets": trace.videoPacketSnapshot,
+            "originalVideoPacketClock": "ADAPTER_OUTPUT_CMSAMPLEBUFFER_AFTER_VT_CALLBACK_AND_90K_RETIMING",
+            "actualValidatedIngressSamples": actualValidatedIngressSamples,
+            "actualVideoImplementation": (video?.implementation as Any?) ?? NSNull(),
             "sourceAudioUnits": trace.packetSnapshot.count, "hasVideo": av, "nativeVideoFramesSubmitted": av ? 10 : 0,
             "recordingClosedBeforeTransport": true, "normalStopCancellationPresent": true,
             "producerCapabilitySingleUse": true, "duplicateFinishPreservedBytes": true,
