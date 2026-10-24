@@ -1875,6 +1875,73 @@ The original numerical contract and raw-clock failures remain unchanged.
 Recorder adoption, durable recovery, the aggregate two-second loss bound,
 physical shows, performance and release remain open.
 
+## Native audio-only seek metadata
+
+The native audio-only recorder now adds its checked source edit and AAC roll
+metadata after the native writer closes. The original coded samples, timestamps,
+sample descriptions and chunk offsets are preserved. Installation uses the
+existing catalogue media-update lease, append/readback/synchronisation and
+retired-header protocol. Capture, publishing, encoders, queues and SDK backend
+selection are unchanged.
+
+Generated-file comparisons establish why both metadata elements are needed.
+Roll alone leaves the original independent decoder's first 128 seek samples
+incorrect. An edit alone fixes that seek but makes Apple's whole read 2,112
+frames short. The combined source edit and roll preserves Apple's exact 16,137
+frames, its original waveform and the registered seek interval, while also
+fixing the independent seek. These results use actual native leading and EOF
+receipts; no padding is inferred from decoder lengths and no PCM is rewritten.
+
+The new audio-only entry also recognises the observed native M4A version-zero
+sample description: its legacy channel field is two while its AAC configuration
+is mono `0x1188`. This allowance requires the checked single-audio/no-edit layout
+and direct codec descriptor. Original description bytes and strict A/V parsing
+are preserved. Invalid source facts, layouts and repeated edits still refuse.
+Metadata work precedes the final producer permit: a later permit refusal may
+leave a correctly edited file catalogued as incomplete. Final publication still
+requires the original real producer, ingress, writer and loss checks.
+
+All 32 priming and 14 file-layout tests pass. The existing metadata fuzzer completes
+253,781 AddressSanitizer and counter-coverage executions in 21 seconds using an
+existing runtime. The original 22-case native matrix passes all 17 commands,
+including packet retention, five independent decodes and incomplete-state
+controls. Four fresh finalised files are bound to their own producer ledgers,
+EOF, packet witnesses and source identities before readback.
+
+All eight native audio whole/seek observations pass their original format,
+frame-count, raw/output clock and owner-completion checks. The repaired audio-only
+whole pair and fixed 4,096-frame seek are byte-exact. All 18 independent readback
+commands complete; the unchanged 16,320-frame whole outputs match across both
+pairs, and their source-checked 16,137-frame valid prefixes satisfy the existing
+exact independent-PCM policy. Every independent audio seek block now matches its
+registered whole-output interval, including the previously failing audio-only
+reference. Independent video whole/seek checks retain ten and three frames.
+
+The native A/V whole pair differs at seven sample positions by one Int16 unit,
+within the original numerical contract. Its separate seek differs from its whole
+interval at three positions by one unit. The original byte-exact whole result and
+the stronger all-native-seeks byte-exact diagnostic remain failed. No new seek
+tolerance or historical reclassification is applied. Actual untreated SDK files
+also retain their strict count failures: native reads return 16,320 and independent
+reads 18,432 frames against the genuine source count of 16,137.
+
+Debug, Qualification and Release unsigned iOS app builds pass, together with
+Debug XCTest bundle compilation and all three privacy-resource checks. The
+XCTest bundle is compiled only; it has not run on a physical device. These app
+checks use the existing SDK packages and do not refresh whole-SDK CI or signing
+qualification.
+
+Private code, source bindings, failed experiments, reviews and fresh readback
+results are retained under
+`target/privacy-standby/ios-audio-only-recorder-edit-v1/`,
+`target/ios-default-native-audio-edit-v2/`,
+`target/ios-audio-recorder-edit-native-readback-v1/` and
+`target/ios-audio-recorder-edit-independent-readback-v1/`.
+The original numerical contract and historical raw-clock/video-duration failures
+are unchanged. Full registered presentation qualification, SDK recorder adoption,
+durable recovery, the aggregate two-second loss bound, physical shows,
+performance and release remain open.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC

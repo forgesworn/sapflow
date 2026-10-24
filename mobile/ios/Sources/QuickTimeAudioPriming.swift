@@ -162,7 +162,7 @@ enum QuickTimeAudioPriming {
             return found
         }
 
-        func aacDescription(_ table: Box) throws {
+        func aacDescription(_ table: Box, allowNativeV0MonoDefault: Bool = false) throws {
             let descriptions = try table.one(tag("stsd"))
             _ = try full(descriptions, minimum: 8)
             guard try integer(descriptions.payload + 4, 4) == 1 else { throw Failure.unsupportedLayout }
@@ -206,8 +206,18 @@ enum QuickTimeAudioPriming {
                 throw Failure.unsupportedLayout
             }
             let specific = try descriptors(decoder.start + 13, decoder.end).filter { $0.tag == 5 }
-            guard specific.count == 1, specific[0].end - specific[0].start == 2,
-                  try integer(specific[0].start, 2) == (channels == 1 ? 0x1188 : 0x1190) else {
+            guard specific.count == 1, specific[0].end - specific[0].start == 2 else {
+                throw Failure.unsupportedLayout
+            }
+            let asc = try integer(specific[0].start, 2)
+            let canonical = asc == (channels == 1 ? 0x1188 : 0x1190)
+            // Observed native M4A v0 entries retain the default channelcount=2
+            // while their authoritative AAC configuration is actual mono1188.
+            // Admit only through the checked one-audio/no-edit entry; preserve
+            // every sample-description byte and the strict existing A/V path.
+            let directESDS = extensions.contains { $0.kind == tag("esds") && $0.start == esds.start }
+            let nativeMonoDefault = allowNativeV0MonoDefault && version == 0 && channels == 2 && asc == 0x1188 && directESDS
+            guard canonical || nativeMonoDefault else {
                 throw Failure.unsupportedLayout
             }
         }
@@ -268,8 +278,56 @@ enum QuickTimeAudioPriming {
         Data((0..<width).reversed().map { UInt8(truncatingIfNeeded: value >> ($0 * 8)) })
     }
 
+    /// A native audio-only writer can omit edts despite a measured trimmed
+    /// session. Add only the missing neutral edit, then use the same validated
+    /// priming transform. Existing A/V preparation and its bytes stay unchanged.
+    static func prepareAudioOnly(moov: Data, facts: Facts) throws -> Prepared {
+        guard moov.count <= maximumHeaderBytes - 90 else { throw Failure.capacity }
+        guard facts.accessUnits > 0, facts.accessUnits <= maximumAccessUnits,
+              facts.leadingFrames > 0, facts.leadingFrames <= UInt32(Int32.max),
+              facts.validFrames > 0, facts.validFrames <= UInt64(UInt32.max),
+              UInt64(facts.leadingFrames) < facts.accessUnits * 1024,
+              facts.validFrames <= facts.accessUnits * 1024 - UInt64(facts.leadingFrames),
+              facts.audioTrackID != 0 else { throw Failure.mismatchedFacts }
+        var reader = Reader(data: moov)
+        let roots = try reader.boxes(0, moov.count)
+        guard roots.count == 1, roots[0].kind == tag("moov") else { throw Failure.invalidHeader }
+        let movie = roots[0], clock = try reader.clock(movie.one(tag("mvhd")))
+        guard clock.scale == 48_000 else { throw Failure.unsupportedLayout }
+        guard clock.duration == facts.validFrames else { throw Failure.mismatchedFacts }
+        let tracks = movie.children.filter { $0.kind == tag("trak") }
+        guard tracks.count == 1 else { throw Failure.ambiguousTrack }
+        let track = tracks[0], id = try reader.trackID(track)
+        guard facts.audioTrackID == nil || facts.audioTrackID == id else { throw Failure.mismatchedFacts }
+        guard !track.children.contains(where: { $0.kind == tag("edts") }) else { throw Failure.alreadyApplied }
+        let media = try track.one(tag("mdia")), handler = try media.one(tag("hdlr"))
+        _ = try reader.full(handler, minimum: 12)
+        guard try reader.integer(handler.payload + 8, 4) == UInt64(tag("soun")) else { throw Failure.unsupportedLayout }
+        let trackHeader = try track.one(tag("tkhd"))
+        let version = try reader.integer(trackHeader.payload, 1)
+        let trackDuration = try reader.integer(trackHeader.payload + (version == 0 ? 20 : 28), version == 0 ? 4 : 8)
+        guard trackDuration == facts.validFrames else { throw Failure.mismatchedFacts }
+        var edit = be(36, width: 4) + Data("edts".utf8) + be(28, width: 4) + Data("elst".utf8)
+        edit += be(0, width: 4) + be(1, width: 4) + be(facts.validFrames, width: 4)
+        edit += be(0, width: 4) + be(65_536, width: 4)
+        var augmented = Data(moov)
+        augmented.insert(contentsOf: edit, at: track.end)
+        for ancestor in [movie, track] {
+            let width = ancestor.header == 8 ? 4 : 8
+            let at = ancestor.start + (ancestor.header == 8 ? 0 : 8)
+            augmented.replaceSubrange(at..<(at + width), with: be(UInt64(ancestor.size + edit.count), width: width))
+        }
+        // The original validator checks AAC configuration, tables, media M,
+        // facts, edit rate/duration, no prior roll, then applies H and roll once.
+        return try prepare(moov: augmented, facts: facts, allowNativeV0MonoDefault: true)
+    }
+
     /// Refuses an already edited header rather than guessing or double-applying.
     static func prepare(moov: Data, facts: Facts) throws -> Prepared {
+        try prepare(moov: moov, facts: facts, allowNativeV0MonoDefault: false)
+    }
+
+    private static func prepare(moov: Data, facts: Facts, allowNativeV0MonoDefault: Bool) throws -> Prepared {
         guard moov.count <= maximumHeaderBytes else { throw Failure.capacity }
         guard facts.accessUnits > 0, facts.accessUnits <= maximumAccessUnits,
               facts.leadingFrames > 0, facts.validFrames > 0,
@@ -305,7 +363,7 @@ enum QuickTimeAudioPriming {
         guard mediaClock.scale == 48_000, mediaClock.duration == facts.accessUnits * 1024 else {
             throw Failure.mismatchedFacts
         }
-        try reader.aacDescription(table)
+        try reader.aacDescription(table, allowNativeV0MonoDefault: allowNativeV0MonoDefault)
         try reader.sampleTables(table, units: facts.accessUnits)
         for field in table.children where field.kind == tag("sgpd") || field.kind == tag("sbgp") {
             _ = try reader.full(field, minimum: 8, versions: [0, 1, 2])

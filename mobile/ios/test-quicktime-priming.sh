@@ -11,7 +11,7 @@ sed '/@testable import SapflowBroadcaster/d' "$root/mobile/ios/Tests/QuickTimeAu
 cat >> "$scratch/main.swift" <<'SWIFT'
 let suite = QuickTimeAudioPrimingTests.defaultTestSuite
 suite.run()
-guard let result = suite.testRun, result.executionCount == 20, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 32, result.hasSucceeded else { exit(1) }
 if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--write-fuzz-seeds" {
     let directory = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
     let samples = [QuickTimeAudioPrimingTests.header(), QuickTimeAudioPrimingTests.header(version: 1, wide: true),
@@ -21,6 +21,12 @@ if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--write-fuzz-s
     for (index, sample) in samples.enumerated() {
         try (Data([0]) + sample).write(to: directory.appendingPathComponent("generated-\(index)"))
     }
+    for (index, sample) in [QuickTimeAudioPrimingTests.audioOnlyHeader(),
+                            QuickTimeAudioPrimingTests.audioOnlyHeader(version: 1, wide: true)].enumerated() {
+        try (Data([4]) + sample).write(to: directory.appendingPathComponent("audio-only-no-edit-\(index)"))
+    }
+    try (Data([4]) + QuickTimeAudioPrimingTests.nativeV0AudioOnlyHeader())
+        .write(to: directory.appendingPathComponent("audio-only-native-v0-default-channels-mono-asc"))
     try Data([0]).write(to: directory.appendingPathComponent("empty"))
     exit(0)
 }

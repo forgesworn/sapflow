@@ -477,7 +477,7 @@ final class CompressedRecorder {
         var saved: URL?
         do {
             if containerCompleted {
-                if hasVideo, let leading = audioLeading,
+                if (hasVideo || finalised), let leading = audioLeading,
                    storedAudioUnits > 0, storedAudioUnits * 1024 > UInt64(leading) {
                     do {
                         if finalised && storedAudioUnits != audioUnits { throw AudioRecordingTiming.Failure.inconsistent }
@@ -487,12 +487,15 @@ final class CompressedRecorder {
                         let facts = QuickTimeAudioPriming.Facts(accessUnits: storedAudioUnits,
                             leadingFrames: leading, validFrames: coded - UInt64(leading) - UInt64(trailing))
                         try receipt.updateClosedMedia { file in
-                            try QuickTimeAudioPrimingFile.finalise(file, facts: facts)
+                            try QuickTimeAudioPrimingFile.finalise(file, facts: facts, hasVideo: hasVideo)
                         }
                     } catch let metadataError {
                         finalised = false
                         if error == nil { error = metadataError }
                     }
+                } else if !hasVideo && finalised {
+                    finalised = false
+                    if error == nil { error = AudioRecordingTiming.Failure.inconsistent }
                 }
                 let milliseconds = endTime.seconds * 1_000
                 guard milliseconds.isFinite, milliseconds >= 0, milliseconds < Double(Int64.max) else {

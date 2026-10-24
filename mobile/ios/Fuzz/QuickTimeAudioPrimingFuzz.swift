@@ -19,15 +19,19 @@ public func quickTimeAudioPrimingFuzz(_ pointer: UnsafePointer<UInt8>?, _ count:
         offset = 25
     }
     let original = input.subdata(in: offset..<input.count)
+    let audioOnly = input[0] & 4 != 0
     do {
-        let prepared = try QuickTimeAudioPriming.prepare(moov: original, facts: facts)
-        precondition(prepared.moov.count == original.count + 54)
+        let prepared: QuickTimeAudioPriming.Prepared
+        if audioOnly { prepared = try QuickTimeAudioPriming.prepareAudioOnly(moov: original, facts: facts) }
+        else { prepared = try QuickTimeAudioPriming.prepare(moov: original, facts: facts) }
+        precondition(prepared.moov.count == original.count + (audioOnly ? 90 : 54))
         precondition(prepared.moov.count <= QuickTimeAudioPriming.maximumHeaderBytes)
         precondition(prepared.accessUnits == facts.accessUnits && prepared.leadingFrames == facts.leadingFrames
             && prepared.validFrames == facts.validFrames)
         precondition(prepared.accessUnits * 1024 == UInt64(prepared.leadingFrames) + prepared.validFrames + prepared.trailingFrames)
         do {
-            _ = try QuickTimeAudioPriming.prepare(moov: prepared.moov, facts: facts)
+            if audioOnly { _ = try QuickTimeAudioPriming.prepareAudioOnly(moov: prepared.moov, facts: facts) }
+            else { _ = try QuickTimeAudioPriming.prepare(moov: prepared.moov, facts: facts) }
             preconditionFailure("A transformed header was applied twice")
         } catch { /* Explicit double-apply refusal. */ }
     } catch { /* Invalid, conflicting or unsupported headers must refuse. */ }
