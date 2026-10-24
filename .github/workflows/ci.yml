@@ -18,6 +18,31 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  realtime-wasm:
+    name: Opaque real-time browser scheduler
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain and browser target
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: "true"
+      - name: Install matching safe browser bindings
+        run: |
+          if [ "$(wasm-bindgen --version 2>/dev/null || true)" != "wasm-bindgen 0.2.129" ]; then
+            cargo install wasm-bindgen-cli --version 0.2.129 --locked --force
+          fi
+      - name: Build and test the actual compiled WASM boundary
+        run: |
+          scripts/build-realtime-wasm.sh
+          node --test tests/realtime-wasm.test.mjs
+
   checks:
     name: Format, clippy, tests
     runs-on: ubuntu-latest

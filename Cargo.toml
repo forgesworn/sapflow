@@ -10,6 +10,7 @@ members = [
     "crates/sapflow-ffi",
     "crates/sapflow-client",
     "crates/sapflow-signet-ffi",
+    "crates/sapflow-realtime-wasm",
 ]
 exclude = ["fuzz", "vendor/nostr-connect", "vendor/nostr-sdk", "vendor/async-wsocket"]
 

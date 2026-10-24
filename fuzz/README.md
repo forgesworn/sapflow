@@ -1,5 +1,17 @@
 # Fuzz targets
 
+`realtime_queue` exercises the opaque real-time frame scheduler, its scalar
+limits, per-stream sequence/dependency recovery, audio priority, deadlines,
+backwards clocks and ciphertext ownership release. It interprets at most 256
+twenty-byte records from at most 8192 input bytes. The host model checks every
+drop/pop/close releases an owned frame exactly once and retains at most 4096
+claimed ciphertext bytes, 16 frames and eight stream lifetimes. Its generated
+seeds are scheduling metadata, not encoded media or historical crashes. The
+target does not decrypt media, parse codec payloads, use a browser or establish
+network performance. CI discovers the target automatically. Run the finite
+gate with the ordinary shared target and ASan/overflow options, retaining a
+separate execution receipt from source preparation.
+
 The native iOS metadata-only QuickTime AAC priming parser has a separate Swift
 libFuzzer/AddressSanitizer target, `mobile/ios/Fuzz/QuickTimeAudioPrimingFuzz.swift`.
 Run `bash mobile/ios/fuzz-quicktime-priming.sh` from the repository root for a

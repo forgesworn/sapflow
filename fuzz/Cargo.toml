@@ -140,3 +140,10 @@ path = "fuzz_targets/recording_checkpoint.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "realtime_queue"
+path = "fuzz_targets/realtime_queue.rs"
+test = false
+doc = false
+bench = false
