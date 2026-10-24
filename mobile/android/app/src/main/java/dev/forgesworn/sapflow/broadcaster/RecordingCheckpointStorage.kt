@@ -69,7 +69,11 @@ internal class RecordingCheckpointStorage private constructor(
     private val receiptName = "$prefix.receipt.json"
     private val slots = arrayOf("$prefix.checkpoint.0", "$prefix.checkpoint.1")
     private val temporary = "$prefix.checkpoint.tmp"
-    private val reserved = setOf(mediaName, receiptName, slots[0], slots[1], temporary, "$prefix.receipt.tmp")
+    private val contextName = "$prefix.append-context"
+    private val contextTemporary = "$contextName.tmp"
+    private val reserved = setOf(mediaName, receiptName, slots[0], slots[1], temporary, "$prefix.receipt.tmp",
+        contextName, contextTemporary)
+    private var contextNode: Node? = null
     private val slotNodes = arrayOfNulls<Node>(2)
     private var media: File? = null
     private var mediaIdentity: Node? = null
@@ -92,7 +96,11 @@ internal class RecordingCheckpointStorage private constructor(
     private fun onWorker() { check(Thread.currentThread() === worker) { "Checkpoint storage has another worker" } }
     private fun active() {
         onWorker(); check(!closeAttempted && !failed && !rewritten) { "Checkpoint storage is not accepting writes" }
-        checkLease(); root.verify()
+        checkLease(); root.verify(); verifyMedia()
+        checkNotNull(contextNode) { "Append context is not installed" }
+        checkContext()
+    }
+    private fun verifyMedia() {
         mediaIdentity?.let { expected ->
             val actual = checkNotNull(media).stat()
             check(expected.sameFile(actual) && actual.bytes == offset) { "Owned media descriptor changed" }
@@ -123,7 +131,15 @@ internal class RecordingCheckpointStorage private constructor(
         check(segments.size <= MAX_SEGMENTS) { "Checkpoint segment capacity exceeded" }
         check(root.availableBytes() > STORAGE_FLOOR) { "Checkpoint storage is unavailable or below its floor" }
         checkSlots()
-        check(root.inspect(temporary) == null && root.inspect("$prefix.receipt.tmp") == null) { "Checkpoint temporary name exists" }
+        check(root.inspect(temporary) == null && root.inspect("$prefix.receipt.tmp") == null &&
+            root.inspect(contextTemporary) == null) { "Checkpoint temporary name exists" }
+        checkContext()
+    }
+    private fun checkContext(expected: Node? = contextNode) {
+        val named = root.inspect(contextName)
+        check(if (expected == null) named == null else named != null && expected.sameFile(named) &&
+            expected.bytes == named.bytes) { "Append context changed" }
+        if (named != null) regular(named)
     }
     private fun checkSlots(publishedIndex: Int? = null, publishedNode: Node? = null) {
         for (index in slots.indices) {
@@ -300,8 +316,49 @@ internal class RecordingCheckpointStorage private constructor(
             closeFailure = error; retainUncertain(this); throw error
         }
     }
+    /** Bootstrap stays inside this exact Writer's existing lease. No public
+     * progress is issued before context sync, checked closes and readback. */
+    private fun opening(publishedContext: Node? = null) {
+        onWorker(); check(!failed && !closeAttempted)
+        checkLease(); root.verify(); verifyMedia(); checkSlots(); checkContext(publishedContext)
+    }
+    private fun installContext(context: RecordingAppendContext) {
+        val stable = context.encode()
+        opening(); checkAdmission(); checkNotNull(media).sync()
+        opening(); checkAdmission()
+        val temp = root.create(contextTemporary); metadata = temp
+        regular(temp.stat(), 0)
+        writeAll(temp, stable, 0); checkAdmission(); temp.sync()
+        val created = temp.stat(); regular(created, stable.size.toLong())
+        temp.close(); metadata = null // Throwing close retains this exact owner.
+        opening()
+        val namedTemp = root.inspect(contextTemporary)
+        check(namedTemp != null && created.sameFile(namedTemp) && created.bytes == namedTemp.bytes)
+        // The existing exclusive catalogue lease excludes other legitimate
+        // writers; checked rename retains the same namespace-race threat model.
+        checkAdmission(); root.replace(contextTemporary, contextName)
+        checkAdmission(); root.sync()
+        opening(created); checkAdmission()
+        val readback = root.openRead(contextName); metadata = readback
+        val actual = readback.stat(); regular(actual, stable.size.toLong())
+        check(created.sameFile(actual)) { "Installed append context is not our descriptor" }
+        val bytes = readExact(readback, stable.size)
+        check(bytes.contentEquals(stable)) { "Append context readback changed" }
+        val checked = RecordingAppendContext.decode(bytes, identity, root.identity, checkNotNull(media).stat())
+        val bindings = checked.bindings(identity, root.identity, checkNotNull(media).stat())
+        check(bindings.recording == recordingBinding && bindings.sourceFile == sourceFileBinding)
+        opening(actual)
+        check(readExact(readback, stable.size).contentEquals(stable)) { "Append context changed during readback" }
+        readback.close(); metadata = null
+        opening(actual)
+        check(root.inspect(contextTemporary) == null)
+        // Linearisation: no IO/callback follows this scalar admission check.
+        checkAdmission(); contextNode = actual
+    }
     private fun open() {
+        onWorker(); check(!busy); busy = true
         try {
+            checkLease(); checkAdmission(); root.verify()
             check(root.identity.directory && !root.identity.regular)
             // A copyable digest is a runtime prerequisite, never assumed from a host test.
             check(prefixDigest() == digest(ByteArray(0)))
@@ -309,17 +366,21 @@ internal class RecordingCheckpointStorage private constructor(
             root.inspect(receiptName)?.let { regular(it); check(it.bytes in 1..4096) }
                 ?: error("Existing writer receipt is unavailable")
             check(root.inspect(mediaName) == null)
-            media = root.create(mediaName)
+            checkAdmission(); media = root.create(mediaName)
             val node = checkNotNull(media).stat(); regular(node, 0)
             val named = root.inspect(mediaName)
             check(named != null && node.sameFile(named) && named.bytes == 0L)
             mediaIdentity = node
-            sourceFileBinding = digest("sapflow.android.checkpoint.file.v1\n${root.identity.device}\n${root.identity.inode}\n${node.device}\n${node.inode}\n$run".toByteArray(Charsets.UTF_8))
+            val context = RecordingAppendContext.create(identity, run, root.identity, node)
+            val bindings = context.bindings(identity, root.identity, node)
+            check(bindings.recording == recordingBinding)
+            sourceFileBinding = bindings.sourceFile
+            installContext(context)
         } catch (error: Exception) {
-            failed = true
+            failed = true; busy = false
             try { closeIncomplete() } catch (cleanup: Exception) { error.addSuppressed(cleanup) }
             throw error
-        }
+        } finally { busy = false }
     }
     companion object {
         const val MAX_HEADER = 65_536

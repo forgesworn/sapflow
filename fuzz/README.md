@@ -36,6 +36,27 @@ not change the app's deployment target. It never builds Rust, downloads
 a runtime or silently replaces coverage-guided fuzzing with random mutations;
 an unavailable compiler/runtime leaves this gate failing explicitly.
 
+The Android append-context binary parser has a separate JVM target,
+`mobile/android/fuzz/RecordingAppendContextFuzz.kt`. Its Jazzer-compatible
+`@JvmStatic fuzzerTestOneInput(ByteArray)` compiles in the same Kotlin module as
+actual `RecordingAppendContext`, with no Jazzer API/dependency or SDK/FFI import.
+It caps input at 265 bytes, exercises original bytes and a separately generated
+valid envelope with bounded field mutations and a repaired checksum. Accepted
+contexts must canonically re-encode exactly and refuse independently wrong
+recording identity, descriptor identities or hardlinks. Only the parser's
+expected `IllegalArgumentException` is caught; underflow/assertion/other failures
+surface. Original input bytes remain unchanged.
+
+`fuzz/seeds/android_append_context/` contains two synthetic 219-byte metadata
+seeds using fixed fake IDs and signed stat extremes, not media or device facts.
+The target's standalone `main` verifies and replays exactly those two generated
+seed hashes. Run it with `java -cp "$APPEND_CONTEXT_CLASSPATH"
+dev.forgesworn.sapflow.broadcaster.RecordingAppendContextFuzz` after compiling the
+actual codec/source closure and target. This deterministic seed replay is not
+coverage-guided fuzzing. Jazzer execution, coverage statistics and hosted CI
+integration remain pending; no native Android IO, codec, interop, recovery or
+source-EOF qualification follows from replay. No Rust build is involved.
+
 | Target | What it feeds |
 |--------|---------------|
 | `ts_ingest` | Arbitrary MPEG-TS chunks, explicit terminal drain, playlist rules, repeated finish and post-EOF refusal (SRT publisher) |
