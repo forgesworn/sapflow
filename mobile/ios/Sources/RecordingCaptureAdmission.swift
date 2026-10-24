@@ -98,6 +98,19 @@ final class CaptureRecordingLoss {
     private let lock = NSLock()
     private var failed = false, committed = false
     func mark() { lock.lock(); failed = true; lock.unlock() }
+    func bindLegacy(_ writer: RecordingCatalogue.Writer) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !failed, !committed else { throw RecordingCatalogue.Failure.cancelled }
+        try writer.bindCapture(owner: self, sourceGuard: lock)
+    }
+    func commitLegacy(admission: CaptureAdmission, run: CaptureAdmission.MediaRun, start: CaptureAdmission.Start,
+                      writer: RecordingCatalogue.Writer) -> RecordingCatalogue.Writer.CapturePermit? {
+        lock.lock(); defer { lock.unlock() }
+        guard !failed, !committed,
+              let permit = admission.commitRecordingClosure(run, start: start, writer: writer, loss: self, sourceGuard: lock) else { return nil }
+        committed = true
+        return permit
+    }
     func commit(admission: CaptureAdmission, run: CaptureAdmission.MediaRun, start: CaptureAdmission.Start? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard !failed, !committed, admission.commitRecordingClosure(run, start: start) else { return false }

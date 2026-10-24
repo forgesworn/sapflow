@@ -1550,6 +1550,37 @@ app/SDK/head qualification. Private source and results are under
 `android-recording-producer-integration-actual-v1/` and
 `android-recording-producer-artifacts-actual-v1/`.
 
+
+The default iOS AVAssetWriter recorder now consumes the existing concrete
+producer closure instead of discarding it. Finalisation requires the exact
+recorder, ingress worker, ticket, run and processed FIFO sample count. Recording
+loss and actual native drops meet the catalogue transition at one scalar cut;
+file, codec and callback work stay outside these locks. The catalogue issues a
+one-use permit to that bound writer and refuses its untyped finalised-completion
+API. Missing or invalid closure and late loss retain an incomplete recording.
+The backend default, native encoders and existing queues are unchanged.
+
+The focused portable suites pass 107 recording tests and 263 budget tests,
+including five new regressions. The generated native host run preserves the
+original five stored-input and ten SDK producer cases and adds seven default
+recorder controls. Both positives finalise; all five loss or invalid-closure
+controls retain actual nonempty incomplete files. Four independent packet probes
+verify original AAC bytes and order, and all five positive files pass whole-file
+FFmpeg decoding. Independent review confirms these results and unchanged inputs.
+Debug, Qualification and Release unsigned app builds, Debug XCTest compilation
+and all three privacy-resource checks also pass. The XCTest bundle was compiled,
+not executed on a device. Private results are under
+`target/privacy-standby/ios-recording-producer-portable-actual-v1/`,
+`target/ios-default-native-v2/` and
+`target/privacy-standby/ios-default-producer-app-builds-v2/`.
+
+These iOS checks use the byte-matched SDK libraries and Apple packages from
+`9d7d944`; they do not refresh whole-workspace SDK qualification. The generated
+host uses synthetic media and a stopped capture session. It does not establish
+physical capture, source-owned leading/tail or programme facts, paired waveform
+or presentation equivalence, durable recovery, the aggregate loss bound,
+sustained-show performance or release readiness.
+
 Actual native producer qualification, source-owned leading/tail facts, paired
 content, applicable seeks and A/V checks remain required for adoption.
 The approved SDK schedule is an alternative clock criterion for its registered

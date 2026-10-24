@@ -1523,4 +1523,60 @@ final class RecordingCatalogueTests: XCTestCase {
         assertFailure(.closed) { _ = try owner.closeIncomplete() }
         XCTAssertEqual(closes, 2); XCTAssertFalse(owner.cleanupComplete)
     }
+    func testBoundLegacyWriterRefusesUntypedFinalisedAndForeignRebinding() throws {
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let writer = try metadataWriter(catalogue), owner = NSObject(), guardLock = NSLock()
+        try writer.bindCapture(owner: owner, sourceGuard: guardLock)
+        assertFailure(.ineligible) { try writer.complete(durationMs: 1, outcome: .finalised) }
+        assertFailure(.busy) { try writer.bindCapture(owner: NSObject(), sourceGuard: NSLock()) }
+        XCTAssertNil(writer.admitCaptureUnderSourceLocks(owner: NSObject(), sourceGuard: guardLock))
+        XCTAssertNil(writer.admitCaptureUnderSourceLocks(owner: owner, sourceGuard: NSLock()))
+        try writer.complete(durationMs: 1, outcome: .incomplete)
+        XCTAssertTrue(writer.cleanupComplete)
+        XCTAssertEqual(try catalogue.scan().first?.state, .incomplete)
+    }
+    func testExactLegacyWriterPermitCommitsRealFileOnceAndCannotCrossWriter() throws {
+        // Scalar storage primitive only; real producer authority is tested by
+        // the existing generated native producer fixture, never these bytes.
+        let catalogue = try RecordingCatalogue(root: directory()); defer { try? catalogue.close() }
+        let writer = try metadataWriter(catalogue), owner = NSObject(), guardLock = NSLock()
+        try writer.bindCapture(owner: owner, sourceGuard: guardLock)
+        guardLock.lock()
+        let permit = writer.admitCaptureUnderSourceLocks(owner: owner, sourceGuard: guardLock)
+        guardLock.unlock()
+        let issued = try XCTUnwrap(permit)
+        XCTAssertNil(writer.admitCaptureUnderSourceLocks(owner: owner, sourceGuard: guardLock))
+        let otherCatalogue = try RecordingCatalogue(root: directory("foreign")); defer { try? otherCatalogue.close() }
+        let other = try metadataWriter(otherCatalogue)
+        assertFailure(.cancelled) { try other.complete(durationMs: 1, capture: issued) }
+        try writer.complete(durationMs: 1, capture: issued)
+        XCTAssertTrue(writer.cleanupComplete)
+        XCTAssertEqual(try catalogue.scan().first?.state, .finalised)
+        assertFailure(.cancelled) { try writer.complete(durationMs: 1, capture: issued) }
+        other.cancel(); try other.ownersClosed()
+    }
+    func testLegacyTypedPublicationUnknownCloseRetainsOwnerAndCannotRetryPermit() throws {
+        var armed = false, attempts = 0
+        let catalogue = try RecordingCatalogue(root: directory(), closeFileDescriptor: { fd in
+            if armed {
+                armed = false; attempts += 1
+                _ = Darwin.close(fd); errno = EIO; return -1
+            }
+            return Darwin.close(fd)
+        })
+        let writer = try metadataWriter(catalogue), owner = NSObject(), guardLock = NSLock()
+        try writer.bindCapture(owner: owner, sourceGuard: guardLock)
+        guardLock.lock()
+        let permit = writer.admitCaptureUnderSourceLocks(owner: owner, sourceGuard: guardLock)
+        guardLock.unlock()
+        armed = true
+        let issued = try XCTUnwrap(permit)
+        assertFailure(.io) { try writer.complete(durationMs: 1, capture: issued) }
+        XCTAssertEqual(attempts, 1); XCTAssertFalse(writer.cleanupComplete)
+        XCTAssertTrue(catalogue.cleanupUncertain)
+        assertFailure(.cancelled) { try writer.complete(durationMs: 1, capture: issued) }
+        XCTAssertEqual(attempts, 1)
+        XCTAssertThrowsError(try catalogue.close())
+    }
+
 }

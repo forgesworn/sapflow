@@ -967,6 +967,31 @@ final class RecordingCatalogue {
         private enum Phase { case writing, updating, cancelled, finishing, closed }
         private var phase = Phase.writing
         private var cancelAfterUpdate = false
+        private var captureOwner: ObjectIdentifier?
+        private var captureGuard: NSLock?
+        private var capturePermit: CapturePermit?
+        /// Opaque once-only phase-cut token. No source facts, media or callback.
+        final class CapturePermit {
+            fileprivate let writer: ObjectIdentifier
+            fileprivate init(_ writer: Writer) { self.writer = ObjectIdentifier(writer) }
+        }
+        /// Actual legacy capture binds once. Unbound filesystem callers retain
+        /// their existing completion API; a bound writer cannot use it to finalise.
+        func bindCapture(owner: AnyObject, sourceGuard: NSLock) throws {
+            lock.lock(); defer { lock.unlock() }
+            guard phase == .writing, captureOwner == nil else { throw Failure.busy }
+            captureOwner = ObjectIdentifier(owner); captureGuard = sourceGuard
+        }
+        /// Concrete CaptureAdmission calls this under source loss -> admission
+        /// locks. Only scalar identity/phase work occurs under these locks.
+        func admitCaptureUnderSourceLocks(owner: AnyObject, sourceGuard: NSLock) -> CapturePermit? {
+            lock.lock(); defer { lock.unlock() }
+            guard phase == .writing, captureOwner == ObjectIdentifier(owner),
+                  captureGuard === sourceGuard, capturePermit == nil else { return nil }
+            let permit = CapturePermit(self)
+            capturePermit = permit; phase = .finishing
+            return permit
+        }
         fileprivate init(catalogue: RecordingCatalogue, token: UUID, identity: Identity, createdAtMs: Int64) {
             self.catalogue = catalogue; self.token = token; self.identity = identity; self.createdAtMs = createdAtMs
         }
@@ -1097,10 +1122,24 @@ final class RecordingCatalogue {
         /// Invoke only after the real writer completed and owns no further IO.
         /// Prior append/backlog loss must select incomplete even if it completed.
         func complete(durationMs: Int64, outcome: Completion) throws {
+            try completeOwned(durationMs: durationMs, outcome: outcome, capture: nil)
+        }
+        func complete(durationMs: Int64, capture: CapturePermit) throws {
+            try completeOwned(durationMs: durationMs, outcome: .finalised, capture: capture)
+        }
+        private func completeOwned(durationMs: Int64, outcome: Completion, capture: CapturePermit?) throws {
             guard durationMs >= 0 else { throw Failure.unsafe }
             lock.lock()
-            guard phase == .writing else { lock.unlock(); throw Failure.cancelled }
-            phase = .finishing; lock.unlock()
+            if let capture {
+                guard phase == .finishing, capture.writer == ObjectIdentifier(self),
+                      capturePermit === capture else { lock.unlock(); throw Failure.cancelled }
+                capturePermit = nil
+            } else {
+                guard phase == .writing else { lock.unlock(); throw Failure.cancelled }
+                guard outcome != .finalised || captureOwner == nil else { lock.unlock(); throw Failure.ineligible }
+                phase = .finishing
+            }
+            lock.unlock()
             do {
                 let root = catalogue.root
                 guard let before = try catalogue.info(root, identity.filename), before.size > 0 else { throw Failure.ineligible }

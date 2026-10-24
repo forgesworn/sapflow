@@ -19,7 +19,7 @@ final class CaptureRecording {
             let receipt = try catalogue.begin(identity: identity)
             do {
                 let recorder = try CompressedRecorder(receipt: receipt, queue: queue,
-                    hasVideo: CaptureIntent(rawValue: identity.profileID)?.hasVideo ?? true, onFailure: onFailure)
+                    hasVideo: CaptureIntent(rawValue: identity.profileID)?.hasVideo ?? true, captureBound: true, onFailure: onFailure)
                 return CaptureRecording(legacy: recorder)
             } catch {
                 let original = error
@@ -65,7 +65,7 @@ final class CaptureRecording {
     }
     func finish(incomplete: Bool = false, producers: CaptureRecordingClosure? = nil, _ completion: @escaping (Completion) -> Void) {
         switch backend {
-        case let .legacy(value): value.finish(incomplete: incomplete, completion)
+        case let .legacy(value): value.finish(incomplete: incomplete, producers: producers, recorder: self, completion)
         case let .sdk(value): value.finish(incomplete: incomplete, producers: producers, recorder: self, completion)
         }
     }

@@ -240,13 +240,18 @@ enum CaptureRecordingFixtureCheck {
     }
     /// Generated native sources exercise the SAME concrete producer close as
     /// CaptureEngine. The real session is empty/stopped; no camera proof.
-    private static func producer(_ name: String, root: URL) throws -> [String: Any] {
-        let av = name == "producer-av", publishFailure = name == "producer-publishing-failure"
+    private static func producer(_ name: String, root: URL, selection: CaptureRecording.BackendSelection = .sdkCheckpointed) throws -> [String: Any] {
+        let publishFailure = name == "producer-publishing-failure"
         let lateDrop = name == "producer-late-native-drop", recordingLoss = name == "producer-recording-loss"
         let early = name == "producer-input-not-closed", wrong = name == "producer-wrong-worker"
         let wrongTicket = name == "producer-wrong-ticket"
         let lateEncoded = name == "producer-late-encoded-output", lateTiming = name == "producer-late-timing"
         let holdCommit = lateDrop || recordingLoss || lateEncoded || lateTiming
+        // Legacy A/V already updates its closed native movie through this real
+        // descriptor seam before the source cut. Hold it to exercise a late
+        // loss while actual AVAssetWriter finish has returned but publication
+        // has not. No new production callback or writer/encoder is introduced.
+        let av = name == "producer-av" || selection == .legacy && holdCommit
         let expectedComplete = !holdCommit && !early && !wrong && !wrongTicket
         let gate = CaptureAdmission(), profile: CaptureIntent = av ? .audioVideo(.sd480p30) : .audioOnly48kMono
         let prep = try unwrap(gate.reservePreparation(profile: profile))
@@ -276,7 +281,7 @@ enum CaptureRecordingFixtureCheck {
         let identity = try catalogue.newShow(profile: profile).nextIdentity()
         let io = DispatchQueue(label: "fixture.producer.recording"), samples = DispatchQueue(label: "fixture.producer.samples")
         let trace = RecordingTrace(), recorder = try io.sync {
-            try CaptureRecording.open(catalogue: catalogue, identity: identity, queue: io, selection: .sdkCheckpointed) { _ in trace.error("recording") }
+            try CaptureRecording.open(catalogue: catalogue, identity: identity, queue: io, selection: selection) { _ in trace.error("recording") }
         }
         let ingress = RustEncodedIngress(); ingress.reset(hasVideo: av)
         let transport = RecordingTransportSpy(failOffer: publishFailure); ingress.destination = transport
@@ -334,8 +339,9 @@ enum CaptureRecordingFixtureCheck {
             releaseHeader.signal()
         }
         let completed = try result.wait()
+        let expectedVisibleFile = selection == .legacy || expectedComplete
         try requireCaptureRecording(completed.cleanupComplete && completed.finalised == expectedComplete &&
-            (completed.fileURL != nil) == expectedComplete, "Incorrect concrete producer finalisation outcome")
+            (completed.fileURL != nil) == expectedVisibleFile, "Incorrect concrete producer finalisation outcome")
         try requireCaptureRecording(!published.ready && !transport.cleanupComplete, "Producer recording waited for transport")
         transport.releaseClose(); try published.wait().get()
         let media = root.appendingPathComponent(identity.filename), before = try Data(contentsOf: media)
@@ -352,7 +358,8 @@ enum CaptureRecordingFixtureCheck {
             "recordingClosedBeforeTransport": true, "normalStopCancellationPresent": true,
             "producerCapabilitySingleUse": true, "duplicateFinishPreservedBytes": true,
             "publishingFailures": trace.counters.publishing, "bytes": before.count,
-            "scope": "Generated native audio/video producer closure and real SDK file, empty stopped session, no camera/device acceptance"]
+            "backend": selection == .legacy ? "legacy" : "sdkCheckpointed",
+            "scope": "Generated native audio/video producer closure and selected real recorder file, empty stopped session, no camera/device acceptance"]
     }
     private static func unwrap<T>(_ value: T?) throws -> T {
         guard let value else { throw CaptureFailure(message: "Generated fixture missing actual value") }; return value
@@ -422,10 +429,19 @@ enum CaptureRecordingFixtureCheck {
                 producerRows.append(try producer(name, root: folder))
             } catch { producerRows.append(["name": name, "passed": false, "error": String(describing: error)]) }
         }
+        var legacyRows: [[String: Any]] = []
+        for name in ["producer-audio", "producer-av", "producer-recording-loss", "producer-late-native-drop", "producer-input-not-closed", "producer-wrong-worker", "producer-wrong-ticket"] {
+            do {
+                let folder = root.appendingPathComponent("legacy-" + name, isDirectory: true)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                legacyRows.append(try producer(name, root: folder, selection: .legacy))
+            } catch { legacyRows.append(["name": name, "passed": false, "error": String(describing: error)]) }
+        }
         let passed = rows.count == 5 && rows.allSatisfy { $0["passed"] as? Bool == true }
             && producerRows.count == 10 && producerRows.allSatisfy { $0["passed"] as? Bool == true }
+            && legacyRows.count == 7 && legacyRows.allSatisfy { $0["passed"] as? Bool == true }
         do {
-            let result: [String: Any] = ["passed": passed, "cases": rows, "producerCases": producerRows, "generatedOnly": true,
+            let result: [String: Any] = ["passed": passed, "cases": rows, "producerCases": producerRows, "legacyProducerCases": legacyRows, "generatedOnly": true,
                 "scope": "Actual native AAC, existing ingress validated handles, SDK adapter/FS and fake transport only. Five stored-input controls remain incomplete. Separate producer cases execute the same concrete native close as CaptureEngine; no camera/device, app/default switch, presentation-equivalence or aggregate2s proof."]
             FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]))
             FileHandle.standardOutput.write(Data([10]))

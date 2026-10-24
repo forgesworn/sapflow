@@ -20,7 +20,7 @@ suite.addTest(RecordingStorageTests.defaultTestSuite)
 suite.addTest(AudioRecordingTimingTests.defaultTestSuite)
 suite.addTest(RecordingCheckpointReadTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 104, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 107, result.hasSucceeded else { exit(1) }
 SWIFT
 swiftc -swift-version 5 -warnings-as-errors -module-cache-path "$sapflow_scratch/modules" \
   -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
