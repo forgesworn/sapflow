@@ -54,7 +54,7 @@ class PackagingReceiptTests(unittest.TestCase):
         p.write_text('#!'+sys.executable+'\n'+FAKE); p.chmod(0o700)
         for name in ['LICENSE','tests/native/SignetConsumer.swift','crates/sapflow-signet-ffi/THIRD_PARTY_LICENSES.txt']:
             p = self.root/name; p.parent.mkdir(parents=True, exist_ok=True); p.write_text('generated fixture')
-        for name in ['V4vContracts','SrtDestination','V4vSessionEngine','V4vJournal','V4vControlClient','V4vLoginContracts','V4vSignetLoginOwner','V4vNativeSignet','OriginObservationPolicy','OriginSDKConfirmation']:
+        for name in ['V4vContracts','V4vCreatorContracts','SrtDestination','V4vSessionEngine','V4vJournal','V4vControlClient','V4vLoginContracts','V4vSignetLoginOwner','V4vNativeSignet','OriginObservationPolicy','OriginSDKConfirmation']:
             p = self.root/'mobile/ios/Sources'/ (name+'.swift'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('generated fixture')
 
     def invoke(self, mode, fail=''):
