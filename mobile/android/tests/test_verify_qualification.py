@@ -231,6 +231,18 @@ class QualificationVerifierTest(unittest.TestCase):
                 VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"), expected_native=self.native_hash)
 
 
+    def test_native_pair_action_and_parser_remain_release_excluded(self):
+        for marker in (b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_NATIVE_PAIR",
+                       b"Ldev/forgesworn/sapflow/broadcaster/NativeAacRecorderFileAdmission;"):
+            self.assertIn(marker, VERIFIER["AAC_PROBE_MARKERS"])
+            self.dex(b"production classes")
+            with ZipFile(self.apk, "a") as archive:
+                archive.writestr("classes3.dex", marker)
+            with patch("subprocess.check_output", return_value=self.release_manifest()):
+                with self.assertRaisesRegex(ValueError, "present in release dex"):
+                    VERIFIER["verify_release_isolation"](self.apk, Path("aapt2"), expected_native=self.native_hash)
+
+
 class ConnectorNativeVerifierTest(unittest.TestCase):
     @staticmethod
     def elf(align=16384):

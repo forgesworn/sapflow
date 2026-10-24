@@ -26,10 +26,11 @@ class NativeAacQualificationActivity : Activity() {
         val referenceMode = intent.action == WINDOW_REFERENCE_ACTION
         val sdkWindowMode = intent.action == SDK_WINDOW_ACTION
         val explicitReaderMode = intent.action == EXPLICIT_READER_ACTION
-        val savedInputMode = referenceMode || sdkWindowMode || explicitReaderMode
+        val nativePairMode = intent.action == NATIVE_PAIR_ACTION
+        val savedInputMode = referenceMode || sdkWindowMode || explicitReaderMode || nativePairMode
         val inputId = intent.getStringExtra("inputId")
         val inputSha = intent.getStringExtra("inputManifestSHA256")
-        if (intent.action !in setOf(ACTION, DRAIN_ACTION, LEADING_ACTION, WINDOW_REFERENCE_ACTION, SDK_WINDOW_ACTION, EXPLICIT_READER_ACTION) || intent.data != null || intent.clipData != null ||
+        if (intent.action !in setOf(ACTION, DRAIN_ACTION, LEADING_ACTION, WINDOW_REFERENCE_ACTION, SDK_WINDOW_ACTION, EXPLICIT_READER_ACTION, NATIVE_PAIR_ACTION) || intent.data != null || intent.clipData != null ||
             intent.extras?.keySet() != (if (savedInputMode) setOf("runId", "generatedOnly", "inputId", "inputManifestSHA256") else setOf("runId", "generatedOnly")) ||
             (savedInputMode && (inputId == null || !inputId.matches(Regex("[a-f0-9]{32}")) || inputSha == null || !inputSha.matches(Regex("[a-f0-9]{64}")))) ||
             !intent.getBooleanExtra("generatedOnly", false) || runId == null ||
@@ -41,7 +42,7 @@ class NativeAacQualificationActivity : Activity() {
             view.text = "Previous native owner is retained or still running"
             return
         }
-        val parent = File(filesDir, if (explicitReaderMode) "native-aac-explicit-reader" else if (sdkWindowMode) "native-aac-sdk-window" else if (referenceMode) "native-aac-window-reference" else if (leadingMode) "native-aac-leading" else if (drainMode) "native-aac-drain" else "native-aac-qualification")
+        val parent = File(filesDir, if (nativePairMode) "native-aac-native-pair" else if (explicitReaderMode) "native-aac-explicit-reader" else if (sdkWindowMode) "native-aac-sdk-window" else if (referenceMode) "native-aac-window-reference" else if (leadingMode) "native-aac-leading" else if (drainMode) "native-aac-drain" else "native-aac-qualification")
         if (!parent.exists()) check(parent.mkdir())
         check(parent.isDirectory && !Files.isSymbolicLink(parent.toPath()) && parent.canonicalFile.parentFile == filesDir.canonicalFile)
         val directory = File(parent, runId)
@@ -55,7 +56,7 @@ class NativeAacQualificationActivity : Activity() {
             val source = File(inputs, checkNotNull(inputId))
             check(source.isDirectory && !Files.isSymbolicLink(source.toPath()) && source.canonicalFile.parentFile == inputs.canonicalFile)
             NativeAacProgrammeWindowProbe(directory, source, checkNotNull(inputSha), cancelled,
-                if (explicitReaderMode) NativeAacProgrammeWindowProbe.Mode.EXPLICIT_READER else if (sdkWindowMode) NativeAacProgrammeWindowProbe.Mode.SDK_WINDOW else NativeAacProgrammeWindowProbe.Mode.REFERENCE)
+                if (nativePairMode) NativeAacProgrammeWindowProbe.Mode.NATIVE_PAIR else if (explicitReaderMode) NativeAacProgrammeWindowProbe.Mode.EXPLICIT_READER else if (sdkWindowMode) NativeAacProgrammeWindowProbe.Mode.SDK_WINDOW else NativeAacProgrammeWindowProbe.Mode.REFERENCE)
         } else if (leadingMode) NativeAacLeadingProbe(directory, cancelled)
             else NativeAacQualificationProbe(directory, cancelled, if (drainMode) NativeAacQualificationProbe.Mode.DRAIN_EXPERIMENTS else NativeAacQualificationProbe.Mode.ORIGINAL)
         if (!active.compareAndSet(null, probe)) {
@@ -98,6 +99,7 @@ class NativeAacQualificationActivity : Activity() {
     companion object {
         const val ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC"
         const val DRAIN_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_DRAIN"
+        const val NATIVE_PAIR_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_NATIVE_PAIR"
         const val EXPLICIT_READER_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_EXPLICIT_READER"
         const val SDK_WINDOW_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_SDK_WINDOW"
         const val WINDOW_REFERENCE_ACTION = "dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_WINDOW_REFERENCE"

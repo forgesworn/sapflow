@@ -264,3 +264,15 @@ claims, not native or storage proof. Both codecs reject the other version; V1
 reserved bytes and wire semantics are unchanged. The V2 maximum remains66,080
 bytes and structured arms reach it without changing the existing CI raw-input
 cap or adding a target/dependency.
+
+### Generated native recorder segment-file parser (JVM)
+
+The qualification-only Android debug parser has a dependency-free Jazzer entry
+`dev.forgesworn.sapflow.broadcaster.NativeAacRecorderFileAdmissionFuzz.fuzzerTestOneInput(byte[])`
+in `app/src/testDebug/.../NativeAacRecorderFileAdmissionTest.kt`. Compile it with
+the real debug parser and the existing JUnit test classpath; no Jazzer API import
+is required. The target bounds input at 65,536 bytes, preserves the supplied
+bytes and catches only expected `IllegalArgumentException` refusals. Seed with
+the synthetic short/long fragment layout used by its ten JUnit controls; do not
+use camera or private source identities. A coverage-guided campaign and replay
+are pending. Parser/host checks do not qualify native codecs or presentation.
