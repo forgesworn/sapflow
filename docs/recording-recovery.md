@@ -784,12 +784,12 @@ is no Release signing, installation or distribution in this packet. Independent
 build and artefact outcome reviews are clear. The host filesystem model remains
 a test backend only and never a production fallback.
 
-The recording and source-file bindings currently include a private run UUID
-which the existing writer receipt does not persist. After cold restart these
-bindings cannot be reconstructed from show/segment and device/inode alone.
-Future recovery requires sufficient checked, versioned persisted context or a
-reconstructible versioned binding scheme. This source packet does not implement
-that prerequisite, migrate existing recordings or adopt orphan sidecars.
+At that milestone the recording and source-file bindings include a private run
+UUID which the writer receipt does not persist. Those bindings cannot be
+reconstructed from show/segment and device/inode alone after restart. The
+persisted append context below addresses this prerequisite for newly opened
+checked storage; existing recordings without that context remain unverified.
+No orphan sidecar is automatically adopted or migrated.
 
 Exact retained source, failure and completed gate evidence is:
 
@@ -826,6 +826,39 @@ adapter composition, producer closure, default adoption, decoder/presentation
 acceptance, recovery and the aggregate two-second loss bound remain open.
 No phone/device/camera/microphone access, installation, Release signing, push or
 publication is part of this storage packet.
+
+## Android persisted append context
+
+Commit `17c397a` adds a bounded `SFAC0001` context beside each new checked
+recording, using the existing catalogue lease and descriptor owner. The
+201-to-264-byte context retains the run UUID, recording identity, binding-domain
+version and root/media device and inode values. Decoding requires independently
+expected identity and actual descriptor observations. It reconstructs the exact
+existing binding digests; the checksum detects corruption and grants no file,
+native-source or checkpoint authority. Legacy receipt and SFCP0001/SFCP0002
+formats remain unchanged.
+
+Before returning an append owner, storage synchronises the media file, writes
+and synchronises an exclusive context temporary file, checks its close, renames
+it, synchronises the directory and checks a descriptor-bound readback and close.
+Existing context names are refused. Failure fences admission and preserves the
+original files; uncertain closes retain the exact owner and lease without a
+native close retry. The context is written once per recording, with no added
+encoded-media copy, encoder, media queue or per-AU validation.
+
+The focused SDK-free JVM gate passes 51 controls: 28 storage, six context-codec
+and 17 legacy catalogue tests. It also verifies the compiled fuzz entry and
+replays two synthetic metadata seeds. This is deterministic replay, not
+coverage-guided fuzzing. Independent outcome review verifies all six closed
+process groups, historical input stability and the installed candidate bytes.
+The private evidence is under
+`target/privacy-standby/android-append-context-focused-actual-v1/`.
+
+These are host filesystem and metadata results. Full app builds, coverage-guided
+JVM fuzzing, actual Android descriptor/provider behaviour, a cold read owner,
+two-slot selection, recover-to-new-file, playable recovery, physical power loss
+and the aggregate two-second loss bound remain open. Capture/default recorder
+selection is unchanged.
 
 ## Android AAC observation packet
 
@@ -1307,6 +1340,23 @@ on every Apple writer configuration. The private actual result is under
 `target/privacy-standby/macos-native-fragmented-aac-actual-v3/`. Its inputs remain
 unchanged and both child process groups close. Earlier compile and format-sample
 acquisition failures remain retained separately; neither reached the writer.
+
+A separate fixed case uses Apple's documented segment-output constructor,
+MPEG4 Apple HLS profile and segment delegate. It passes eight parser controls,
+seven collector controls and one actual writer run. All five original AAC
+payloads, their order and count, 1,024-frame durations and exact 48 kHz DTS/PTS
+8,192 through 12,288 are preserved. The native output is a 600-byte initialisation
+and five fragments, totalling 2,374 bytes. Independent readback accounts for every
+callback chunk and payload byte. Actual writer weak deallocation, zero pending
+application copies, collector sealing and file synchronisation/close are
+observed; no documented delegate-EOF or producer authority is inferred.
+
+This establishes one necessary original-clock recorder-control capability.
+No decoder runs, so trim, waveform, paired presentation, seeks and application
+admission remain unqualified. The control's explicit segment copies establish
+no production performance claim. The earlier URL-writer negative is unchanged.
+Actual evidence and independent review are under
+`target/privacy-standby/macos-native-aac-segment-output-actual-v1/`.
 
 After independent source review, the ignored clock prototype passed all 26
 standalone synthetic checks using the installed Kotlin compiler and JVM. Its

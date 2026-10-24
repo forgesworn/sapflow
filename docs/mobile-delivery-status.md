@@ -43,6 +43,16 @@ unqualified. Seven artefact checks and the actual native profile run are unrun,
 pending fresh SDK qualification. No cached-runtime exception or default change
 is authorised by these retained build/test results.
 
+The checked Android store now persists the append context needed to reconstruct
+its existing checkpoint bindings after restart (`17c397a`). A focused SDK-free
+host run passes 51 filesystem/metadata controls and two synthetic fuzz-seed
+replays, with independent outcome review. Full app and Android-native checks,
+coverage-guided fuzzing and the cold recovery transaction remain open. Separately,
+one actual Apple segment-output control preserves all five original AAC packets
+and their exact coded clocks. This clears a file-format prerequisite for that
+case; it does not qualify decoding, paired presentation or application admission.
+Both results are detailed in the [recording recovery record](recording-recovery.md).
+
 The earlier audio retirement regression gate passes 674 Debug tests, 664
 Qualification tests and 38 Python controls, totalling 1,376, with no failures,
 errors or skips. Its 14 new regressions cover successful audio input arriving
