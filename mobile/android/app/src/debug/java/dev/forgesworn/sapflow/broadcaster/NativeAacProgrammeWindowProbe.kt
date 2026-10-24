@@ -538,7 +538,8 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
     private var readerDecoderCreates = 0
     private var readerCheckpointDecodes = 0
     private data class ReaderRequest(val head: Int, val tail: Int, val mediaTime: Long,
-        val packets: JSONArray, val decoderName: String)
+        val packets: JSONArray, val decoderName: String, val generation: Long,
+        val expectedFrames: Long, val provenance: JSONObject)
     private fun readerGeometry(head: Int, tail: Int, units: Long, programme: Long, first: Long, mediaTime: Long) {
         check(head in 0..8191 && tail in 0..1023 && units in 1..128 && programme in 1..48000 && first >= 0)
         check(Math.multiplyExact(units, 1024L) == Math.addExact(Math.addExact(head.toLong(), programme), tail.toLong()))
@@ -599,11 +600,41 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             } catch (_: RecordingCheckpointException.Binding) { refusals.put(JSONObject().put("kind", "FOREIGN_CHECKPOINT_REFUSED_BEFORE_DECODER").put("refused", true).put("decoderCallsBefore", decoderCallsBefore).put("decoderCallsAfter", readerDecoderCreates)) }
             check(readerDecoderCreates == decoderCallsBefore)
             val name = reference.getString("decoderName"); check(name == "c2.android.aac.decoder")
-            request = ReaderRequest(head, tail, mediaTime, selected, name)
+            val provenance = JSONObject().put("scope", "CHECKED_SFCP2_GENERATED_FILE_PAIRING_NOT_NATIVE_SOURCE_AUTHORITY")
+                .put("sourceGeneration", generation.toLong()).put("recordingBindingHex", reference.getString("recordingBindingHex"))
+                .put("fileBindingHex", reference.getString("fileBindingHex")).put("fileSHA256", sha(file))
+                .put("sealedHeaderSHA256", sha(header)).put("checkpointSHA256", sha(slot))
+                .put("initialHeaderSHA256", sha(initial)).put("fragmentRegionSHA256", info.fragmentRegionSha256.hexLower())
+                .put("committedOffset", info.committedOffset.toLong()).put("audioUnits", facts.audioUnits.toLong())
+                .put("originalCodedStart48k", firstTicks).put("sourceMediaOrigin48k", mediaTime)
+                .put("originalCodedEnd48k", facts.audioEnd.toLong()).put("containerEnd48k", facts.audioContainerEnd.toLong())
+                .put("leadingFrames", head).put("trailingFrames", tail)
+                .put("sourceContextSHA256", sha(source.toString().toByteArray(Charsets.UTF_8)))
+                .put("movieDelay720k", 0).put("expectedFrames", n)
+            request = ReaderRequest(head, tail, mediaTime, selected, name, generation.toLong(), n, provenance)
         } finally { destroy(decoded, "reader.checkpoint") }
         check(cleanupKnown) { "Reader checkpoint close unknown; decoder fenced" }
         return checkNotNull(request)
     }
+    private fun ByteArray.hexLower(): String {
+        val chars = "0123456789abcdef"
+        return buildString { for (b in this@hexLower) { val v = b.toInt() and 255; append(chars[v ushr 4]); append(chars[v and 15]) } }
+    }
+    private fun scheduleSnapshot(value: ReturnedPcmClock.Snapshot): JSONObject = JSONObject()
+        .put("contract", value.contract).put("scheduleComplete", value.scheduleComplete)
+        .put("returnedFrames", value.returnedFrames).put("sinkAcceptedFrames", value.sinkAcceptedFrames)
+        .put("returnedRanges", value.returnedRanges).put("releaseAttempts", value.releaseAttempts).put("releasesReturned", value.releasesReturned)
+        .put("inputEosQueueReturned", value.inputEosQueueReturned).put("outputEosObserved", value.outputEosObserved)
+        .put("ownerCloseAttempted", value.ownerCloseAttempted).put("ownerCloseReturned", value.ownerCloseReturned)
+        .put("sinkCloseAttempted", value.sinkCloseAttempted).put("sinkCloseReturned", value.sinkCloseReturned)
+        .put("activeSerial", value.activeSerial ?: JSONObject.NULL).put("knownFault", value.knownFault ?: JSONObject.NULL)
+        .put("unknownOwnership", value.unknownOwnership).put("sinkAcceptanceUnknown", value.sinkAcceptanceUnknown)
+        .put("nativeOwnershipUnknown", value.nativeOwnershipUnknown).put("rawNativeClockGatePassed", value.rawNativeClockGatePassed)
+        .put("contentQualified", value.contentQualified).put("nativeSourceQualified", value.nativeSourceQualified)
+        .put("presentationEquivalent", value.presentationEquivalent).put("appAdmission", "UNKNOWN")
+    private fun schedulePosition(value: ReturnedPcmClock.Position?): Any = value?.let { JSONObject()
+        .put("prefixFrames", it.prefixFrames).put("frames", it.frames).put("sourceStart48k", it.sourceStart48k).put("sourceEnd48k", it.sourceEnd48k)
+        .put("movieStart720k", it.movieStart720k).put("movieEnd720k", it.movieEnd720k) } ?: JSONObject.NULL
     private fun runReader(): JSONObject {
         check(Build.HARDWARE in setOf("ranchu", "goldfish") && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN)
         val bytes = read(input, "manifest.json", 512 * 1024); check(sha(bytes) == manifestSha256)
@@ -684,6 +715,7 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
         var inputPackets = 0; var releaseAttempts = 0; var releaseReturned = 0; var formatSeen = false
         var stopReturned = false; var decoderReleased = false; var extractorReleased = false; var streamClosed = false
         var nativeIndexUncertain = false
+        var checkedOutputOwner: NativeRecordingReader? = null
         var inputEosSuppressed = false; var suppressedInputIndex: Int? = null
         var suppressedObservationDeadline = Long.MAX_VALUE; var suppressedObservationExpired = false
         var outputDequeuesAfterSuppression = 0
@@ -716,6 +748,16 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             formats.put(format("decoder-accepted", codec.inputFormat))
             startAttempted = true; call("decoder.start:$kind") { codec.start() }; started = true
             stream = FileOutputStream(File(directory, "$outputName.s16le")); retained.add(checkNotNull(stream))
+            if (reader != null) {
+                val owner = NativeRecordingReader(codec, source, checkNotNull(stream), reader.generation,
+                    ReturnedPcmClock.Geometry(reader.mediaTime, 0, reader.expectedFrames), ::event, kind)
+                checkedOutputOwner = owner; retained.add(owner)
+                result.put("checkedSdkPlaybackClock", JSONObject().put("profile", "checked-sdk-playback-clock-v1")
+                    .put("admission", "UNKNOWN").put("provenance", reader.provenance).put("rawNativeClockGatePassed", false)
+                    .put("ownershipHandoff", "AFTER_SUCCESSFUL_CODEC_START_AND_STREAM_OPEN_ON_SAME_WORKER")
+                    .put("ownerScope", "ACTUAL_INPUT_QUEUE_OUTPUT_AND_TERMINAL_HANDLES; CONFIGURATION_INPUT_PREPARATION_AND_FORMAT_OBSERVATION_REMAIN_CALLER_OWNED")
+                    .put("ownerBinding", "STRONG_CODEC_REFERENCE_AND_SOURCE_GENERATION").put("actualDecoderName", result.getString("decoderName")))
+            }
             var loops = 0; var lastPts = 0L
             val until = System.nanoTime() + 12_000_000_000L
             while (!outputEos) {
@@ -767,10 +809,21 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
                                     .put("microsecondFloorRemainder", remainder).put("queueMappingExactlyRepresentable", remainder == 0L)
                             }
                         }
+                        val owner = checkedOutputOwner
+                        if (owner != null) {
+                            active()
+                            owner.queueInput(index, 0, if (eos) 0 else size, queuedPts, if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0)
+                            lastQueuedPts = queuedPts
+                            // The real queue returned before any caller JSON work.
+                            if (eos) inputEos = true else inputPackets++
+                            rows.put(inputRow.put("nativePtsUs", queuedPts).put("queueReturned", true))
+                            if (!eos) source.advance()
+                        } else {
                         call("decoder.queueInput:$kind") { codec.queueInputBuffer(index, 0, if (eos) 0 else size, queuedPts, if (eos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0) }
                         lastQueuedPts = queuedPts
                         rows.put(inputRow.put("nativePtsUs", queuedPts).put("queueReturned", true))
                         if (eos) inputEos = true else { inputPackets++; source.advance() }
+                        }
                         }
                     }
                 }
@@ -783,8 +836,21 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
                     val explicit = output.containsKey("pcm-encoding")
                     check(!explicit || output.getInteger("pcm-encoding") == AudioFormat.ENCODING_PCM_16BIT)
                     result.put("pcmEncodingInterpretation", if (explicit) "PRESENT_PCM16" else "ABSENT_DOCUMENTED_PCM16_DEFAULT")
+                    checkedOutputOwner?.acceptOutputFormat(output)
                     formatSeen = true
                 } else if (index >= 0) {
+                    val owner = checkedOutputOwner
+                    if (owner != null) {
+                        val output = owner.consumeOutput(index, info)
+                        check(rows.length() < 384 && formatSeen)
+                        frames += info.size / 2
+                        outputEos = output.eos
+                        rows.put(JSONObject().put("type", "OUTPUT").put("index", index).put("capacity", output.capacity ?: JSONObject.NULL)
+                            .put("offset", info.offset).put("size", info.size).put("nativePtsUs", info.presentationTimeUs).put("flags", info.flags)
+                            .put("sha256", output.sha256).put("eos", outputEos).put("cumulativeFrames", frames)
+                            .put("checkedSdkPlaybackPosition", schedulePosition(output.position)).put("checkedSdkPlaybackBorrowSerial", output.borrowSerial)
+                            .put("sinkBytesReturned", output.sinkBytesReturned).put("sinkWriteReturns", output.sinkWriteReturns))
+                    } else {
                     try {
                         check(rows.length() < 384 && formatSeen && info.offset >= 0 && info.size >= 0 && info.size % 2 == 0)
                         check(info.flags and (MediaCodec.BUFFER_FLAG_CODEC_CONFIG or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME) == 0)
@@ -807,10 +873,32 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
                         else nativeIndexUncertain = true
                     }
                     check(!nativeIndexUncertain) { "Native output index release unknown; owner retained" }
+                    }
                 }
             }
         } catch (error: Exception) { result.put("failure", error.javaClass.simpleName + ": " + error.message?.take(512)) }
         finally {
+            val owner = checkedOutputOwner
+            if (owner != null) {
+                owner.closeOwned()
+                releaseAttempts = owner.releaseAttempts; releaseReturned = owner.releaseReturned
+                stopReturned = owner.stopReturned; decoderReleased = owner.decoderReleased
+                extractorReleased = owner.extractorReleased; streamClosed = owner.streamClosed
+                nativeIndexUncertain = owner.nativeIndexUncertain
+                if (decoderReleased) native?.let { retained.remove(it) }
+                if (extractorReleased) extractor?.let { retained.remove(it) }
+                if (streamClosed) stream?.let { retained.remove(it) }
+                if (owner.cleanupConfirmed && owner.streamSynced && owner.observationFailure == null && owner.clockBookkeepingFailure == null) retained.remove(owner) else cleanupKnown = false
+                val profile = result.getJSONObject("checkedSdkPlaybackClock")
+                profile.put("schedule", scheduleSnapshot(owner.snapshot()))
+                    .put("sinkBytesReturned", owner.sinkBytesReturned).put("sinkWriteReturns", owner.sinkWriteReturns)
+                    .put("actualInputEosQueueReturned", owner.inputEosReturned).put("inputQueueUncertain", owner.inputQueueUncertain)
+                    .put("actualInputQueueAttempts", owner.inputQueueAttempts).put("actualInputQueueReturns", owner.inputQueueReturns)
+                    .put("actualInputMediaQueueReturns", owner.inputMediaQueueReturns)
+                    .put("actualNativeOwnershipUnknown", owner.actualNativeOwnershipUnknown)
+                    .put("clockBookkeepingFailure", owner.clockBookkeepingFailure?.let { it.javaClass.simpleName + ": " + it.message?.take(256) } ?: JSONObject.NULL)
+                    .put("journalFailure", owner.observationFailure?.let { it.javaClass.simpleName + ": " + it.message?.take(256) } ?: JSONObject.NULL)
+            } else {
             val codec = native
             if (codec != null && !nativeIndexUncertain && !(startAttempted && !started)) {
                 stopReturned = started && close("decoder.stop:$kind") { codec.stop() }
@@ -825,6 +913,7 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
                 if (streamClosed) retained.remove(owned)
                 if (!synced) cleanupKnown = false
             }
+            }
         }
         result.put("inputEosSuppressed", inputEosSuppressed).put("suppressedBorrowedInputIndex", suppressedInputIndex ?: JSONObject.NULL)
             .put("suppressedObservationBoundNs", if (omitInputEos) 200_000_000L else JSONObject.NULL)
@@ -836,7 +925,14 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             .put("stopSkippedNotStarted", !started && !startAttempted).put("decoderReleased", decoderReleased).put("extractorReleased", extractorReleased).put("streamClosed", streamClosed)
             .put("cleanupConfirmed", decoderReleased && extractorReleased && streamClosed && !nativeIndexUncertain)
         val pcm = File(directory, "$outputName.s16le")
-        if (pcm.isFile && pcm.length() <= 131072) result.put("pcmBytes", pcm.length()).put("pcmSHA256", sha(pcm.readBytes()))
+        if (checkedOutputOwner == null || streamClosed) {
+            if (pcm.isFile && pcm.length() <= 131072) result.put("pcmBytes", pcm.length()).put("pcmSHA256", sha(pcm.readBytes()))
+            if (checkedOutputOwner != null) result.getJSONObject("checkedSdkPlaybackClock").put("pcmReadback", "AFTER_KNOWN_STREAM_CLOSE")
+        } else {
+            // Keep the exact stream and owner retained; no stat/hash/readback IO
+            // is authorised by an unconfirmed close.
+            result.getJSONObject("checkedSdkPlaybackClock").put("pcmReadback", "UNKNOWN_STREAM_CLOSE_NO_FILE_READBACK")
+        }
         return result
     }
 }
