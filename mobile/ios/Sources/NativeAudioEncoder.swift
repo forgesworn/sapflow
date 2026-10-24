@@ -52,6 +52,7 @@ final class NativeAudioEncoder {
     private var closed = false
     private(set) var lastOutputGeneration: UInt64?
     private var lastAttemptedGeneration: AudioRecordingTiming.GenerationExtent?
+    private(set) var lastNativeEOFObservation: AudioRecordingTiming.NativeEOFObservation?
     var inputToken: InputToken? { admission.token }
     var nextInputTime: CMTime? { expectedInputTime }
     var generationLedger: AudioRecordingTiming.LedgerSnapshot {
@@ -285,15 +286,28 @@ final class NativeAudioEncoder {
     private func endGeneration() throws {
         guard let converter, let compressed = compressedBuffer, let token = nativeToken else { return }
         guard generationInput > 0 else { return }
-        var completed = false
+        var eof = AudioRecordingTiming.NativeEOFObservation(generation: token.generation)
+        lastNativeEOFObservation = eof
         for _ in 0..<16 {
             compressed.packetCount = 0; compressed.byteLength = 0
             var error: NSError?
-            let result = converter.convert(to: compressed, error: &error) { _, state in state.pointee = .endOfStream; return nil }
+            let result = converter.convert(to: compressed, error: &error) { _, state in
+                state.pointee = .endOfStream; eof.deliveredInputEOS(); return nil
+            }
+            let status: AudioRecordingTiming.NativeEOFObservation.OutputStatus
+            switch result {
+            case .haveData: status = .haveData
+            case .inputRanDry: status = .inputRanDry
+            case .endOfStream: status = .endOfStream
+            case .error: status = .error
+            @unknown default: status = .unknown
+            }
+            try eof.returned(status, packetCount: compressed.packetCount, byteLength: compressed.byteLength)
+            lastNativeEOFObservation = eof // Actual facts survive later emit/ledger failure.
             if let error { throw error }
             if compressed.packetCount > 0 { try emit(compressed, converter: converter) }
             if result == .error { throw CaptureFailure(message: "AAC finalisation failed") }
-            if result == .endOfStream || result == .inputRanDry || compressed.packetCount == 0 { completed = true; break }
+            if result == .endOfStream { break }
         }
         let prime = converter.primeInfo
         let receipt = AudioRecordingTiming.GenerationExtent(generation: token.generation, inputFrames: generationInput,
@@ -301,8 +315,8 @@ final class NativeAudioEncoder {
             encodedFrames: UInt64(emittedFrames) - generationCodedStart,
             leadingFrames: prime.leadingFrames, trailingFrames: prime.trailingFrames, sourceMapping: generationMapping)
         lastAttemptedGeneration = receipt
-        guard completed, generationLeading == prime.leadingFrames else {
-            throw CaptureFailure(message: "Native AAC EOF did not close; completed=\(completed),initialLeading=\(String(describing: generationLeading)),attempted=\(receipt)")
+        guard eof.complete, generationLeading == prime.leadingFrames else {
+            throw CaptureFailure(message: "Native AAC EOF did not close; actualEOF=\(eof),initialLeading=\(String(describing: generationLeading)),attempted=\(receipt)")
         }
         do { try ledger.append(receipt) }
         catch {

@@ -162,6 +162,11 @@ enum CaptureRecordingFixtureCheck {
                 frames: queueFailure ? 160_137 : 16_137, ingress: ingressQueue)
         }
         if !missingEOF { try encoder.finish(); ingressQueue.sync {} }
+        if !missingEOF {
+            try requireCaptureRecording(encoder.lastNativeEOFObservation?.complete == true,
+                "Actual converter EOS input delivery and terminal output status were not observed")
+        }
+        let nativeEOF = nativeEOFFacts(encoder.lastNativeEOFObservation)
         try trace.check()
         let originalPackets = trace.packetSnapshot
         try requireCaptureRecording(ingress.accepted == UInt64(originalPackets.count), "Ingress did not validate each original native AU exactly once")
@@ -228,7 +233,7 @@ enum CaptureRecordingFixtureCheck {
             try requireCaptureRecording(value.generation == 1 && value.rawFrames == 16_039 && value.zeroFrames == 20_017 && value.inputFrames == 36_056,
                 "Actual mixed generation provenance changed")
         }
-        return ["name": name, "passed": true, "generatedOnly": true, "sdkReceiptState": "incomplete",
+        return ["name": name, "passed": true, "generatedOnly": true, "sdkReceiptState": "incomplete", "actualNativeEOF": nativeEOF,
             "appAdmission": "unknown", "nativeUnitsBeforeClose": originalPackets.count, "validatedExactlyOnce": true,
             "storedAudioUnits": info.facts.audioUnits, "sdkCompleteAudioEOF": info.facts.completeAudioEof,
             "actualCheckedCleanup": result.cleanupComplete, "recordingClosedBeforeTransport": true,
@@ -323,6 +328,11 @@ enum CaptureRecordingFixtureCheck {
         _ = gate.stop(); captureAdmission.cancel(prep)
         if !early { producer.stopInput() }
         let closure = try samples.sync { try producer.finish() }
+        let nativeEOF = try samples.sync { () throws -> [String: Any] in
+            try requireCaptureRecording(audio.lastNativeEOFObservation?.complete == true,
+                "Producer finalisation did not observe actual converter EOS")
+            return nativeEOFFacts(audio.lastNativeEOFObservation)
+        }
         try requireCaptureRecording(try samples.sync { try producer.finish() } == nil, "Native producer closure minted twice")
         encoded.sync {}; io.sync {}
         let result = RecordingReply<CaptureRecording.Completion>(), published = RecordingReply<Result<Void, Error>>()
@@ -353,13 +363,20 @@ enum CaptureRecordingFixtureCheck {
         let entry = try unwrap(try catalogue.scan().first { $0.segmentID == identity.segmentID })
         try requireCaptureRecording(entry.state == (expectedComplete ? .finalised : .incomplete), "Producer catalogue classification")
         try trace.check()
-        return ["name": name, "passed": true, "finalised": completed.finalised, "file": identity.filename,
+        return ["name": name, "passed": true, "finalised": completed.finalised, "file": identity.filename, "actualNativeEOF": nativeEOF,
             "sourceAudioUnits": trace.packetSnapshot.count, "hasVideo": av, "nativeVideoFramesSubmitted": av ? 10 : 0,
             "recordingClosedBeforeTransport": true, "normalStopCancellationPresent": true,
             "producerCapabilitySingleUse": true, "duplicateFinishPreservedBytes": true,
             "publishingFailures": trace.counters.publishing, "bytes": before.count,
             "backend": selection == .legacy ? "legacy" : "sdkCheckpointed",
             "scope": "Generated native audio/video producer closure and selected real recorder file, empty stopped session, no camera/device acceptance"]
+    }
+    private static func nativeEOFFacts(_ value: AudioRecordingTiming.NativeEOFObservation?) -> [String: Any] {
+        guard let value else { return ["observed": false] }
+        return ["observed": true, "generation": value.generation, "inputEOSDelivered": value.inputEOSDelivered,
+            "converterCalls": value.calls, "lastOutputStatus": value.lastOutputStatus?.rawValue ?? "UNSEEN",
+            "lastPacketCount": value.lastPacketCount, "lastByteLength": value.lastByteLength,
+            "nativeEOFComplete": value.complete]
     }
     private static func unwrap<T>(_ value: T?) throws -> T {
         guard let value else { throw CaptureFailure(message: "Generated fixture missing actual value") }; return value

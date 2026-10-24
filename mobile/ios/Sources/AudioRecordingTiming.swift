@@ -4,6 +4,30 @@ import Foundation
 /// timestamps. No observed device-specific priming value is a constant here.
 enum AudioRecordingTiming {
     enum Failure: Error { case unsupported, overflow, inconsistent, stale, closed }
+    /// Cold observations from the real converter drain only. An empty buffer
+    /// or temporary lack of input cannot stand in for its terminal status.
+    struct NativeEOFObservation: Equatable {
+        enum OutputStatus: String { case haveData, inputRanDry, endOfStream, error, unknown }
+        let generation: UInt64
+        private(set) var inputEOSDelivered = false
+        private(set) var calls = 0
+        private(set) var lastOutputStatus: OutputStatus?
+        private(set) var lastPacketCount: UInt32 = 0
+        private(set) var lastByteLength: UInt32 = 0
+        private var terminalReturnHadInputEOS = false
+        init(generation: UInt64) { self.generation = generation }
+        mutating func deliveredInputEOS() { inputEOSDelivered = true }
+        mutating func returned(_ status: OutputStatus, packetCount: UInt32, byteLength: UInt32) throws {
+            guard calls < 16 else { throw Failure.unsupported }
+            calls += 1; lastOutputStatus = status
+            lastPacketCount = packetCount; lastByteLength = byteLength
+            terminalReturnHadInputEOS = inputEOSDelivered
+        }
+        var complete: Bool {
+            generation > 0 && terminalReturnHadInputEOS && lastOutputStatus == .endOfStream &&
+                lastPacketCount == 0 && lastByteLength == 0
+        }
+    }
     enum Event {
         case began(leadingFrames: UInt32)
         case ended(Extent)

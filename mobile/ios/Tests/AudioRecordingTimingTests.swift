@@ -2,6 +2,52 @@ import XCTest
 @testable import SapflowBroadcaster
 
 final class AudioRecordingTimingTests: XCTestCase {
+    func testNativeEOFDoesNotAcceptInputRanDryOrEmptyOutput() throws {
+        var observed = AudioRecordingTiming.NativeEOFObservation(generation: 1)
+        observed.deliveredInputEOS()
+        for status: AudioRecordingTiming.NativeEOFObservation.OutputStatus in [.inputRanDry, .haveData, .unknown] {
+            try observed.returned(status, packetCount: 0, byteLength: 0)
+            XCTAssertFalse(observed.complete)
+            XCTAssertEqual(observed.lastOutputStatus, status)
+        }
+        XCTAssertTrue(observed.inputEOSDelivered)
+        XCTAssertEqual(observed.calls, 3)
+    }
+    func testNativeEOFRequiresInputDeliveryBeforeTerminalReturn() throws {
+        var observed = AudioRecordingTiming.NativeEOFObservation(generation: 7)
+        try observed.returned(.endOfStream, packetCount: 0, byteLength: 0)
+        XCTAssertFalse(observed.complete)
+        observed.deliveredInputEOS()
+        XCTAssertFalse(observed.complete) // A later callback cannot rewrite the earlier return.
+        try observed.returned(.endOfStream, packetCount: 0, byteLength: 0)
+        XCTAssertTrue(observed.complete)
+        XCTAssertEqual(observed.generation, 7)
+    }
+    func testNativeEOFRejectsTerminalDataAndError() throws {
+        var observed = AudioRecordingTiming.NativeEOFObservation(generation: 1)
+        observed.deliveredInputEOS()
+        let malformed: [(AudioRecordingTiming.NativeEOFObservation.OutputStatus, UInt32, UInt32)] = [
+            (.endOfStream, 1, 12), (.endOfStream, 0, 12), (.error, 0, 0)]
+        for (status, packets, bytes) in malformed {
+            try observed.returned(status, packetCount: packets, byteLength: bytes)
+            XCTAssertFalse(observed.complete)
+        }
+        var invalid = AudioRecordingTiming.NativeEOFObservation(generation: 0)
+        invalid.deliveredInputEOS()
+        try invalid.returned(.endOfStream, packetCount: 0, byteLength: 0)
+        XCTAssertFalse(invalid.complete)
+    }
+    func testNativeEOFClosesAtSixteenthReturnButNeverExceedsBound() throws {
+        var observed = AudioRecordingTiming.NativeEOFObservation(generation: 2)
+        observed.deliveredInputEOS()
+        for _ in 0..<15 { try observed.returned(.inputRanDry, packetCount: 0, byteLength: 0) }
+        XCTAssertFalse(observed.complete)
+        try observed.returned(.endOfStream, packetCount: 0, byteLength: 0)
+        XCTAssertTrue(observed.complete)
+        XCTAssertEqual(observed.calls, 16)
+        XCTAssertThrowsError(try observed.returned(.endOfStream, packetCount: 0, byteLength: 0))
+        XCTAssertEqual(observed.calls, 16)
+    }
     func testLeadingGroupUsesObservedValueAndHasFiniteCapacity() throws {
         XCTAssertEqual(try AudioRecordingTiming.headUnits(0), 1)
         XCTAssertEqual(try AudioRecordingTiming.headUnits(1023), 1)

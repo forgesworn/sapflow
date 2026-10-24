@@ -1735,6 +1735,51 @@ Private outcome evidence:
   `target/privacy-standby/android-native-aac-sdk-window-v1/inspection-sdk-typed-v1/receipt.local.json`
   and its sibling `independent-outcome-review.local.json`.
 
+## Native EOF authority and paired-reader failure reports
+
+The iOS encoder now requires the actual converter input callback to supply EOS
+and the converter to return `endOfStream` with no terminal packets or bytes.
+Temporary `inputRanDry` and an empty output buffer cannot complete a generation.
+The existing 16-call drain bound and incomplete-recording failure path remain.
+Four new regression tests bring the portable recording suite to 111 passing
+tests; the separate 263 broadcaster tests also pass.
+
+The fresh generated native run retains the original 22-case matrix, exact AAC
+payload checks and five independent whole-file decodes. All 21 completed drains
+observe actual input EOS and terminal output after four converter calls. The
+missing-EOF control remains unobserved. Its 17 commands and owned process groups
+finish successfully, with unchanged used inputs and scratch removed. Private
+results are in `target/ios-default-native-strict-eof-v1/receipt.local.json`, with
+independent review in
+`target/privacy-standby/ios-native-eof-actual-review-v1/receipt.local.json`.
+Historical results are not reclassified as having recorded these new facts.
+
+All three generic unsigned iOS app configurations also build, as does the Debug
+test bundle. The three privacy-resource checks pass. Test-bundle compilation
+does not mean the phone tests ran. Those seven commands retain their own
+source/package snapshot in
+`target/privacy-standby/ios-native-eof-app-builds-v1/receipt.local.json`.
+
+Android's internal paired-reader probe now reports acquired-resource closure
+separately from completion of each decoder observation. A decoder failure stays
+visible at the aggregate level even when its resources close and later cases
+succeed. All six ordered observations must complete. Unknown acquisition or
+closure stops further observations and forbids PCM file stat, read and hash
+operations. This reporting fix adds no retry and does not change the production
+reader, native call order, numerical contract or approved SDK playback clock.
+
+The five focused Android host tests and 39 existing verifier controls pass.
+Debug, Qualification and Release APKs build; Debug/Qualification lint, source
+isolation and the seven existing APK artefact commands pass. The new helper is
+present only in Debug/Qualification, and Release APK bytes are unchanged. The
+run uses the existing pinned SDK AAR and does not refresh whole-SDK coverage.
+Its source-bound results and retained APKs are in
+`target/privacy-standby/paired-reporting-build-actual-v1/receipt.local.json`.
+
+These checks do not establish source leading/tail authority, production recorder
+adoption, durable recovery, the aggregate loss bound, physical devices,
+sustained-show performance or release readiness.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC
