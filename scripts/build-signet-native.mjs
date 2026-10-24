@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, writeFileSync, cpSync, rmSync, existsSync } fr
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
+const consumerSources = ['V4vContracts', 'V4vCreatorContracts', 'SrtDestination', 'V4vSessionEngine', 'V4vJournal', 'V4vControlClient', 'V4vLoginContracts', 'V4vSignetLoginOwner', 'V4vNativeSignet', 'OriginObservationPolicy', 'OriginSDKConfirmation'];
 const mode = process.argv[2];
 if (!['check', 'apple'].includes(mode) || process.argv.length !== 3) throw new Error('choose check or apple; native slices require a separate reviewed build gate');
 const apple = join(root, 'target/native-packages/signet-apple');
@@ -70,14 +71,14 @@ try {
    for (const [name, source, headers] of [['SignetAuth', join(pkg, 'Sources/SignetAuth/SignetAuth.swift'), authHeaders], ['Sapflow', join(root, 'target/native-packages/apple/Sources/Sapflow/Sapflow.swift'), mediaHeaders]]) {
      run('swiftc', [...flags, '-parse-as-library', '-emit-module', '-emit-object', '-module-name', name, '-I', headers, '-emit-module-path', join(modules, name+'.swiftmodule'), '-o', join(modules, name+'.o'), source], iosOptions);
    }
-   run('swiftc', [...flags, '-typecheck', '-I', modules, '-I', authHeaders, '-I', mediaHeaders, ...['V4vContracts', 'SrtDestination', 'V4vSessionEngine', 'V4vJournal', 'V4vControlClient', 'V4vLoginContracts', 'V4vSignetLoginOwner', 'V4vNativeSignet', 'OriginObservationPolicy', 'OriginSDKConfirmation'].map(name => join(root, 'mobile/ios/Sources', name+'.swift'))], iosOptions);
+   run('swiftc', [...flags, '-typecheck', '-I', modules, '-I', authHeaders, '-I', mediaHeaders, ...consumerSources.map(name => join(root, 'mobile/ios/Sources', name+'.swift'))], iosOptions);
    const probe = join(modules, 'LinkProbe.swift');
    writeFileSync(probe, 'import Sapflow\nimport SignetAuth\npublic func coldAuthAndMediaLinkProbe() throws -> UInt32 { let owner = try NativeSignet.pairBunker(uri: "bunker://79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798?relay=wss://relay.example.invalid", deadlineMs: 1000); owner.requestClose(); return sdkAbiVersion() }\n');
    run('swiftc', [...flags, '-emit-library', '-I', modules, '-I', authHeaders, '-I', mediaHeaders, probe, join(modules, 'SignetAuth.o'), join(modules, 'Sapflow.o'), join(pkg, 'SignetAuthFFI.xcframework/ios-arm64/libsapflow_signet_ffi.a'), join(mediaFramework, 'libsapflow_ffi.a'), '-o', join(modules, 'libAuthMediaLinkProbe.dylib')], iosOptions);
  }
  const consumer = join(staging, 'Consumer'); mkdirSync(join(consumer, 'Sources/Consumer'), { recursive: true });
  cpSync(join(root, 'tests/native/SignetConsumer.swift'), join(consumer, 'Sources/Consumer/main.swift'));
- for (const name of ['V4vContracts', 'SrtDestination', 'V4vSessionEngine', 'V4vJournal', 'V4vControlClient', 'V4vLoginContracts', 'V4vSignetLoginOwner', 'V4vNativeSignet', 'OriginObservationPolicy', 'OriginSDKConfirmation']) {
+ for (const name of consumerSources) {
    cpSync(join(root, 'mobile/ios/Sources', name+'.swift'), join(consumer, 'Sources/Consumer', name+'.swift'));
  }
  writeFileSync(join(consumer, 'Package.swift'), `// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name: "Consumer", platforms: [.macOS(.v12)], dependencies: [.package(path: ${JSON.stringify(pkg)}), .package(path: ${JSON.stringify(join(root, 'target/native-packages/apple'))})], targets: [.executableTarget(name: "Consumer", dependencies: [.product(name: "SignetAuth", package: ${JSON.stringify(mode === 'apple' ? 'signet-apple' : 'SignetAuth')}), .product(name: "Sapflow", package: "apple")])])\n`);
