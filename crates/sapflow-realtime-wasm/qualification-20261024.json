@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "date": "2026-10-24",
+  "scope": "Opaque scheduling only; not media decoding, service discovery, NAT, performance or production acceptance",
+  "toolchain": "1.94.1",
+  "wasm_bindgen": "0.2.129",
+  "forbid_unsafe_preserved": true,
+  "gates": {
+    "cargo_test_workspace_locked": "passed",
+    "cargo_clippy_workspace_all_targets_locked_D_warnings": "passed",
+    "focused_core_tests": 64,
+    "focused_abi_tests": 3,
+    "compiled_wasm_node_tests": 4,
+    "new_core_behaviour_tests": 18,
+    "third_party_licences": "generated for browser boundary",
+    "cargo_fmt_all_check": "passed"
+  },
+  "fuzz": {
+    "target": "realtime_queue",
+    "sanitizer": "AddressSanitizer",
+    "overflow_checks": true,
+    "seed_files": 2,
+    "seed_replay_exit": 0,
+    "finite_run_exit": 0,
+    "executions": 3173582,
+    "seconds": 61,
+    "maximum_input_bytes": 8192,
+    "network": false,
+    "ciphertext_payload_allocation": false
+  },
+  "sha256": {
+    "sapflow_realtime_bg.wasm": "3630befcd25cd83b454bf7e1775bdd00239e38abdd93056b81006029f1987be3",
+    "sapflow_realtime.js": "8a43619f7f2c348d3a03e19a28d052bec2fdf7a539b31e1b2da05a405f3de4e6",
+    "browser.mjs": "c43dc0c29ca059380826ea7b378ab876bbe0e1bf87a0910344be63a302c7362f"
+  },
+  "hosted_ci": "not run",
+  "native_device": "not run",
+  "camera_or_microphone_fixtures": false,
+  "generated_mutation_corpus_removed": true
+}

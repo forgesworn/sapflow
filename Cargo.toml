@@ -9,6 +9,7 @@ members = [
     "crates/sapflow-bench",
     "crates/sapflow-ffi",
     "crates/sapflow-client",
+    "crates/sapflow-realtime-wasm",
 ]
 exclude = ["fuzz"]
 

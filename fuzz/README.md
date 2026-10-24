@@ -1,5 +1,10 @@
 # Fuzz targets
 
+`realtime_queue` exercises opaque frame scheduling, audio priority, bounded
+residence, dependency recovery and exact ciphertext ownership release. It
+uses generated metadata, with no media capture, decryption or networking.
+CI discovers it automatically alongside the existing targets.
+
 | Target | What it feeds |
 |--------|---------------|
 | `ts_ingest` | Arbitrary MPEG-TS in arbitrary chunks (SRT publisher) |
