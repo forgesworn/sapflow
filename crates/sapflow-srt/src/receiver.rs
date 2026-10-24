@@ -210,6 +210,8 @@ pub struct Receiver {
     deliver: VecDeque<Vec<u8>>,
     crypto: Option<Decryptor>,
     next_km: i64,
+    /// One distinct KM attempt after a decrypted forward key-slot change.
+    early_km: bool,
 }
 
 impl Receiver {
@@ -253,6 +255,7 @@ impl Receiver {
             deliver: VecDeque::new(),
             crypto: None,
             next_km: 0,
+            early_km: false,
         }
     }
 
@@ -338,9 +341,15 @@ impl Receiver {
         }
         let mut payload = p.payload.to_vec();
         if let Some(crypto) = &mut self.crypto {
+            let previous_key = crypto.active_key();
             if crypto.decrypt(p.key, p.seq, &mut payload).is_err() {
                 self.stats.encrypted += 1;
                 return;
+            }
+            // Existing staged/highest guards fence slot progression. CTR
+            // does not authenticate the data or its key flag.
+            if crypto.active_key() != previous_key {
+                self.early_km = true;
             }
             self.stats.decrypted += 1;
         }
@@ -537,8 +546,10 @@ impl Receiver {
 
     /// Takes a control packet that arrived at `now`. An ACKACK gives an RTT
     /// sample, SHUTDOWN flushes and closes, a drop request stops asking for
-    /// those packets and a key material refresh is answered (at most one per
-    /// 100 ms). Any other control packet only shows the caller is alive.
+    /// those packets and a key material refresh is answered. KM work is
+    /// limited to one attempt per 100 ms, plus one distinct attempt after
+    /// successfully decrypting a forward key-slot change. Any other control
+    /// packet only shows the caller is alive.
     pub fn on_control(&mut self, now: i64, c: &Control) {
         self.now = self.now.max(now);
         if self.closed.is_some() {
@@ -551,10 +562,19 @@ impl Receiver {
             cif,
         } = c
         {
-            // One bounded unwrap and response per 100ms per connection;
-            // repeated or hostile KM cannot drive KDF work or queue growth.
-            if now < self.next_km {
+            let cached = self
+                .crypto
+                .as_ref()
+                .is_some_and(|crypto| crypto.matches_last_km(cif));
+            // Packet-count refreshes can legitimately arrive less than
+            // 100 ms apart. Only a decrypted forward key-slot transition
+            // grants an early distinct attempt, including a malformed one.
+            // Cached retries neither bypass the timer nor consume credit.
+            if now < self.next_km && (!self.early_km || cached) {
                 return;
+            }
+            if !cached {
+                self.early_km = false;
             }
             self.next_km = now.saturating_add(100_000);
             if self
@@ -651,6 +671,7 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{CryptoConfig, Encryptor, KeySize};
     use crate::packet::{Packet, Position};
 
     const MS: i64 = 1000;
@@ -700,6 +721,244 @@ mod tests {
 
     fn delivered(r: &mut Receiver) -> Vec<Vec<u8>> {
         std::iter::from_fn(|| r.take_delivery()).collect()
+    }
+
+    fn km_request(bytes: &[u8]) -> Control {
+        Control::Other {
+            control_type: 0x7fff,
+            subtype: 3,
+            info: 0,
+            cif: bytes.to_vec(),
+        }
+    }
+
+    fn km_responses(r: &mut Receiver) -> Vec<Vec<u8>> {
+        sent(r)
+            .into_iter()
+            .filter_map(|control| match control {
+                Control::Other {
+                    control_type: 0x7fff,
+                    subtype: 4,
+                    info: 0,
+                    cif,
+                } => Some(cif),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Hold the last even-key packet, then decrypt the first odd-key one.
+    fn key_transition(size: KeySize) -> (Encryptor, Receiver, Vec<u8>, Vec<u8>) {
+        let mut config = CryptoConfig::new(b"scoped receiver test secret".to_vec(), size)
+            .expect("crypto config");
+        config.refresh_packets = 32;
+        config.preannounce_packets = 8;
+        let mut tx = Encryptor::new(&config).expect("encryptor");
+        let mut r = rx();
+        r.set_crypto(Some(
+            Decryptor::new(&config, &tx.initial().expect("initial KM")).expect("decryptor"),
+        ));
+        let mut cached = None;
+        let mut old = None;
+        for n in 0..=32 {
+            let mut payload = vec![n as u8; 23];
+            let key = tx
+                .encrypt(Seq::new(ISN + n), &mut payload, 0)
+                .expect("valid packet");
+            if n == 31 {
+                old = Some(payload);
+            } else {
+                let mut p = data(ISN + n, n * MS as u32, &payload);
+                p.key = key;
+                r.on_data(i64::from(n) * MS, &p);
+            }
+            if let Some(km) = tx.poll_km(i64::from(n) * MS) {
+                r.on_control(i64::from(n) * MS, &km_request(&km));
+                assert_eq!(km_responses(&mut r), vec![km.clone()]);
+                assert!(tx.confirm(&km));
+                cached = Some(km);
+            }
+        }
+        sent(&mut r);
+        assert!(r.early_km, "forward slot transition grants one attempt");
+        (tx, r, cached.expect("first KM"), old.expect("held packet"))
+    }
+
+    #[test]
+    fn key_transition_credit_survives_cached_km_and_old_slot_reordering() {
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let (mut tx, mut r, cached, old) = key_transition(size);
+            for _ in 0..1000 {
+                r.on_control(33 * MS, &km_request(&cached));
+            }
+            assert!(km_responses(&mut r).is_empty(), "cached flood stays timed");
+            assert!(r.early_km);
+            // Recover old ciphertext before its slot is replaced, as the
+            // sender's retained-key rule requires.
+            let mut p = data(ISN + 31, 31 * MS as u32, &old);
+            p.key = 1;
+            p.retransmitted = true;
+            r.on_data(34 * MS, &p);
+            // A timed cached response also leaves the distinct attempt available.
+            r.on_control(124 * MS, &km_request(&cached));
+            assert_eq!(km_responses(&mut r), vec![cached.clone()]);
+            assert!(r.early_km);
+            let mut replacement = None;
+            for n in 33..=56 {
+                let now = i64::from(n + 92) * MS;
+                let mut payload = vec![n as u8; 23];
+                let key = tx
+                    .encrypt(Seq::new(ISN + n), &mut payload, 0)
+                    .expect("valid packet");
+                let mut p = data(ISN + n, now as u32, &payload);
+                p.key = key;
+                r.on_data(now, &p);
+                if let Some(km) = tx.poll_km(now) {
+                    r.on_control(now, &km_request(&km));
+                    assert_eq!(km_responses(&mut r), vec![km.clone()]);
+                    assert!(tx.confirm(&km));
+                    replacement = Some(km);
+                }
+            }
+            assert!(!r.early_km, "one distinct attempt consumed the credit");
+            r.on_data(149 * MS, &p);
+            assert_eq!(r.stats().decrypted, 57, "duplicate refused before decrypt");
+            assert_eq!(r.stats().duplicates, 1);
+            assert!(!r.early_km, "duplicate old slot cannot grant new credit");
+            r.on_control(150 * MS, &km_request(&cached));
+            assert!(km_responses(&mut r).is_empty());
+            r.on_control(248 * MS, &km_request(&cached));
+            assert!(
+                km_responses(&mut r).is_empty(),
+                "stale distinct KM rejected"
+            );
+            assert_eq!(r.stats().km_rejected, 1);
+            let replacement = replacement.expect("second KM");
+            r.on_control(348 * MS, &km_request(&replacement));
+            assert_eq!(km_responses(&mut r), vec![replacement]);
+            r.on_timer(500 * MS);
+            assert_eq!(
+                delivered(&mut r),
+                (0..=56).map(|n| vec![n; 23]).collect::<Vec<_>>()
+            );
+            assert_eq!(r.stats().dropped, 0);
+        }
+    }
+
+    #[test]
+    fn malformed_km_consumes_only_one_transition_credit_then_stays_timed() {
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let (_, mut r, cached, old) = key_transition(size);
+            let bad = km_request(&[0; 104]);
+            for _ in 0..1000 {
+                r.on_control(33 * MS, &bad);
+            }
+            assert_eq!(r.stats().km_rejected, 1);
+            assert!(!r.early_km, "malformed attempt spends the same credit");
+            assert!(km_responses(&mut r).is_empty());
+            let mut p = data(ISN + 31, 31 * MS as u32, &old);
+            p.key = 1;
+            p.retransmitted = true;
+            r.on_data(34 * MS, &p);
+            assert_eq!(r.stats().decrypted, 33, "reordered old slot decrypted");
+            assert!(!r.early_km, "valid reordered old data cannot replenish");
+            let mut p = data(ISN + 100, 35 * MS as u32, &old);
+            p.key = 1;
+            r.on_data(35 * MS, &p);
+            assert_eq!(r.stats().encrypted, 1, "unstaged forward slot refused");
+            assert!(!r.early_km, "failed decryption cannot grant credit");
+            let mut invalid_wrap = cached.clone();
+            *invalid_wrap.last_mut().expect("KM wrap") ^= 1;
+            let invalid_wrap = km_request(&invalid_wrap);
+            for _ in 0..1000 {
+                r.on_control(132 * MS, &invalid_wrap);
+                r.on_control(132 * MS, &km_request(&cached));
+            }
+            assert_eq!(r.stats().km_rejected, 1);
+            assert!(km_responses(&mut r).is_empty());
+            for _ in 0..1000 {
+                r.on_control(133 * MS, &invalid_wrap);
+            }
+            assert_eq!(r.stats().km_rejected, 2, "ordinary 100ms limit remains");
+            assert_eq!(r.next_km, 233 * MS);
+        }
+    }
+
+    #[test]
+    fn unauthenticated_staged_key_bit_flip_cannot_replenish_spent_km_credit() {
+        let mut config = CryptoConfig::new(
+            b"generated key-bit control secret".to_vec(),
+            KeySize::Aes128,
+        )
+        .expect("valid key-bit control configuration");
+        config.refresh_packets = 32;
+        config.preannounce_packets = 8;
+        let mut tx = Encryptor::new(&config).expect("key-bit control encryptor");
+        let mut r = rx();
+        r.set_crypto(Some(
+            Decryptor::new(&config, &tx.initial().expect("initial key material"))
+                .expect("key-bit control decryptor"),
+        ));
+        for n in 0..=24 {
+            let mut payload = vec![n as u8; 23];
+            let key = tx
+                .encrypt(Seq::new(ISN + n), &mut payload, 0)
+                .expect("original encryption");
+            let mut packet = data(ISN + n, n * MS as u32, &payload);
+            packet.key = key;
+            r.on_data(i64::from(n) * MS, &packet);
+            if let Some(km) = tx.poll_km(i64::from(n) * MS) {
+                r.on_control(i64::from(n) * MS, &km_request(&km));
+                assert_eq!(km_responses(&mut r), vec![km.clone()]);
+                assert!(tx.confirm(&km));
+            }
+        }
+        assert!(!r.early_km, "valid KM staging alone grants no credit");
+        let mut payload = vec![25; 23];
+        let original_key = tx
+            .encrypt(Seq::new(ISN + 25), &mut payload, 0)
+            .expect("even original");
+        assert_eq!(original_key, 1);
+        let mut forged = data(ISN + 25, 25 * MS as u32, &payload);
+        forged.key = 2;
+        r.on_data(25 * MS, &forged);
+        // CTR provides no authenticity: an altered flag can consume an
+        // already staged slot. This checks work bounds, not valid media.
+        assert!(
+            r.early_km,
+            "one credit after the existing staged transition"
+        );
+        let bad = km_request(&[0; 104]);
+        for _ in 0..1000 {
+            r.on_control(26 * MS, &bad);
+        }
+        assert_eq!(r.stats().km_rejected, 1);
+        assert!(!r.early_km);
+        for n in 26..=31 {
+            let mut packet = data(ISN + n, n * MS as u32, b"not authenticated");
+            packet.key = 1;
+            r.on_data(i64::from(n) * MS, &packet);
+            packet.key = 2;
+            r.on_data(i64::from(n) * MS, &packet);
+            r.on_control(i64::from(n) * MS, &bad);
+            assert!(!r.early_km, "alternating flags cannot stage another key");
+        }
+        r.on_data(32 * MS, &forged);
+        assert!(!r.early_km, "duplicate altered packet cannot renew credit");
+        assert_eq!(
+            r.stats().km_rejected,
+            1,
+            "no additional unwrap attempt inside the timer"
+        );
+        assert_eq!(r.next_km, 126 * MS);
+        assert!(km_responses(&mut r).is_empty());
+        r.on_control(126 * MS, &bad);
+        assert_eq!(
+            r.stats().km_rejected,
+            2,
+            "ordinary timed attempt remains available"
+        );
+        assert!(!r.early_km);
     }
 
     #[test]
