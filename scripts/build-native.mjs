@@ -47,8 +47,9 @@ try {
   if(mode==='check') {
     const jar=await jnaJar();
     if(process.platform==='darwin') {
+      const macosSDK=run('/usr/bin/xcrun',['--sdk','macosx','--show-sdk-path'],{stdio:'pipe',encoding:'utf8'}).trim();
       copyFileSync(join(root,'tests/native/consumer.swift'),join(staging,'main.swift'));
-      run('swiftc',[join(staging,'Sapflow.swift'),join(staging,'main.swift'),'-I',staging,'-Xcc',`-fmodule-map-file=${join(staging,'SapflowFFI.modulemap')}`,'-L',join(root,'target/debug'),'-lsapflow_ffi','-Xlinker','-rpath','-Xlinker',join(root,'target/debug'),'-o',join(staging,'swift-consumer')]);
+      run('/usr/bin/xcrun',['--sdk','macosx','swiftc',join(staging,'Sapflow.swift'),join(staging,'main.swift'),'-sdk',macosSDK,'-I',staging,'-Xcc',`-fmodule-map-file=${join(staging,'SapflowFFI.modulemap')}`,'-L',join(root,'target/debug'),'-lsapflow_ffi','-Xlinker','-rpath','-Xlinker',join(root,'target/debug'),'-o',join(staging,'swift-consumer')],{env:{...process.env,SDKROOT:macosSDK}});
       run(join(staging,'swift-consumer'),[]);
     }
     run('kotlinc',['-language-version','2.2','-api-version','2.2',kotlin,join(root,'tests/native/Consumer.kt'),join(root,'tests/native/StatusLeases.kt'),'-cp',jar,'-include-runtime','-jvm-target','1.8','-d',join(staging,'kotlin-consumer.jar')]);
