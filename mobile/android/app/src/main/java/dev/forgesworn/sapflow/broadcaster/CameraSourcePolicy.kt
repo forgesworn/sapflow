@@ -132,10 +132,21 @@ internal class CameraRunAdmission(val epoch: Long, private val beforeExpiry: (()
         data object Cancelled : State
     }
     private val state = java.util.concurrent.atomic.AtomicReference<State>(State.Live())
+    internal val recordingSource = RecordingSourceGate(epoch)
     val failure: Fault? get() = (state.get() as? State.Failed)?.fault
     val recordingCanFinalise: Boolean get() = failure == null
+    private fun failExpected(old: State, reason: Fault): Boolean = synchronized(recordingSource.guard) {
+        if (!state.compareAndSet(old, State.Failed(reason))) false
+        else { recordingSource.failLocked(); true }
+    }
     fun fail(reason: Fault = Fault.CAMERA_SOURCE) {
-        while (true) { val old = state.get(); if (old is State.Failed || state.compareAndSet(old, State.Failed(reason))) return }
+        synchronized(recordingSource.guard) {
+            while (true) {
+                val old = state.get()
+                if (old is State.Failed) return
+                if (state.compareAndSet(old, State.Failed(reason))) { recordingSource.failLocked(); return }
+            }
+        }
     }
     fun beginSource(operation: CameraSourcePolicy.Operation): SourceAdmission {
         while (true) {
@@ -153,7 +164,7 @@ internal class CameraRunAdmission(val epoch: Long, private val beforeExpiry: (()
             if (pending.serial != token) return false
             if (nowNs < pending.startedNs || nowNs >= pending.deadlineNs) {
                 val reason = if (nowNs < pending.startedNs) Fault.TIMING else Fault.SOURCE_DEADLINE
-                if (state.compareAndSet(old, State.Failed(reason))) return false
+                if (failExpected(old, reason)) return false
             } else if (state.compareAndSet(old, State.Live(token = token, confirmedNs = nowNs))) return true
         }
     }
@@ -177,7 +188,7 @@ internal class CameraRunAdmission(val epoch: Long, private val beforeExpiry: (()
             if (nowNs >= pending.startedNs && nowNs < pending.deadlineNs) return true
             beforeExpiry?.invoke() // Optional deterministic cold expiry-race scheduling port.
             val reason = if (nowNs < pending.startedNs) Fault.TIMING else Fault.SOURCE_DEADLINE
-            if (state.compareAndSet(old, State.Failed(reason))) return false
+            if (failExpected(old, reason)) return false
         }
     }
     fun cancelSourceBudget() {

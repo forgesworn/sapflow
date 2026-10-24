@@ -52,6 +52,8 @@ internal class AudioCaptureOwner(
     @Volatile private var active: Generation? = null
     @Volatile private var stopped = false
     private val nativeFailure=AudioNativeFailure(runAdmission)
+    private val recordingSource = runAdmission.recordingSource
+    private val sourceKey = recordingSource.bindProducer(this, preparation, epoch)
     private var started = false
     private var epochNs = 0L
     private var replacement: PrivacyStandbyPolicy.Command? = null
@@ -99,6 +101,8 @@ internal class AudioCaptureOwner(
         @Volatile var wantsEos=false
         val eosWakePosted=AtomicBoolean(false)
         var eosSent = false
+        var outputEosObserved = false
+        var joinedInputFrames: Long? = null
         var quiescing = false
         var handoffSealed = false
         var gracefulTail = false
@@ -118,7 +122,12 @@ internal class AudioCaptureOwner(
         check(serials.compareAndSet(ticket.serial-1,ticket.serial)) { "AAC generation serial changed" }
         val clock = timeline.begin(ticket.serial,originUs,zero)
         val g = Generation(ticket,clock,zero);check(nativeFailure.bind(g));active = g; zeroReadyDelivered = false
+        val sourceTracked = recordingSource.generationStarted(sourceKey, g)
         try {
+            if (!sourceTracked && !recordingSource.publishingOnlyAfterLoss(sourceKey)) {
+                recordingSource.fail()
+                error("Native AAC generation refused after source closure")
+            }
             val codec = PlatformCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC); g.codec = codec; encoderName = codec.name
             val encoded = EncodedAudioEpoch(audioCallbacks,owner,descriptor,timeline,clock,ticket.serial,g.observation,
                 onInput = { index ->
@@ -137,7 +146,7 @@ internal class AudioCaptureOwner(
                 },
                 onValidated = onValidated,onPriming = onPriming,
                 onRawOutput = { g.outputUnits.incrementAndGet() },
-                onEos = { if (active === g) act(g,lifecycle.eos(ticket)) },
+                onEos = { if (active === g) { g.outputEosObserved = true; act(g,lifecycle.eos(ticket)) } },
                 onFailure = { reason -> report(g,reason) },
                 onHandoffIdle = { if (active === g && g.handoffSealed && (g.encoded?.outstanding ?: 0) == 0) {
                     g.observation.handoffIdle(ticket.serial)
@@ -384,6 +393,14 @@ internal class AudioCaptureOwner(
         if(lifecycle.actualClosed(g.ticket)){complete(true);native.shutdown();return}
         retire(g,graceful,deadlineNs)
     }
+    /** Opaque actual-closure receipt, available only after final Stop and
+     * native CLOSED. It certifies accepted-input EOF/resources, not programme
+     * leading/tail, coded samples, playback or application admission. */
+    internal fun recordingTerminal(): RecordingSourceGate.Terminal? {
+        val g = active ?: return null
+        if (!stopped || failed || !lifecycle.actualClosed(g.ticket)) return null
+        return recordingSource.terminal(sourceKey, this, preparation, epoch)
+    }
     private fun retire(g:Generation,graceful:Boolean,deadlineNs:Long){
         if(active!==g || lifecycle.currentStage()!=AudioGenerationLifecycle.Stage.ACTIVE)return
         g.gracefulTail=graceful && !failed
@@ -429,6 +446,12 @@ internal class AudioCaptureOwner(
                 owner.post{if(active===g)act(g,lifecycle.released(g.ticket,ok,System.nanoTime()))}
             }
             AudioGenerationLifecycle.Action.CLOSED->{
+                // This action follows the actual native/microphone release
+                // result. The diagnostic snapshot was frozen earlier and is
+                // never used as a completion capability.
+                val joined = g.joinedInputFrames
+                if (failed || joined == null) recordingSource.fail()
+                else recordingSource.generationClosed(sourceKey, g, joined, g.eosSent, g.outputEosObserved)
                 timeline.closed(g.clock)
                 if(stopped){closeReply?.invoke(true);native.shutdown()}
                 else{
@@ -451,6 +474,7 @@ internal class AudioCaptureOwner(
         native.execute{
             val joinedInputFrames=g.workers.joinedInputFrames(g.reader,g.pump,g.acceptedFrames)
             owner.post{if(active===g){if(joinedInputFrames==null){report(g,"Audio producer threads/input disposition remain unconfirmed");closeReply?.invoke(false)}else {
+                g.joinedInputFrames = joinedInputFrames
                 g.observation.producersJoined(g.ticket.serial)
                 act(g,lifecycle.producersClosed(g.ticket,joinedInputFrames>0))}}}
         }

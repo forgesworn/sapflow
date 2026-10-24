@@ -21,6 +21,7 @@ internal class QueueDrainer(
     private val publishing: Boolean,
     private val sink: EncodedSink?,
     private val failure: (String) -> Unit,
+    private val recordingSource: RecordingSourceGate.Recorder? = null,
 ) {
     private val executor = if (sink == null) null else ThreadPoolExecutor(
         // One fixed batch task plus a reserved control/finalisation task.
@@ -53,6 +54,13 @@ internal class QueueDrainer(
         if (completed != 0L) handlerDelay.record(System.nanoTime() - completed)
         admission.resumed()
         available()
+    }
+
+    /** Source FIFO acceptance is observed on its actual handler immediately
+     * after queues.push reports recordingQueued. No media lookup or copy. */
+    fun recordingAccepted() {
+        check(!publishing && handler.looper.isCurrentThread)
+        recordingSource?.accepted()
     }
 
     fun available() {
@@ -89,15 +97,18 @@ internal class QueueDrainer(
                     val owned = handoff.take()
                     activeBatch.set(owned)
                     try {
-                        owned?.use {
+                        recordingSource.fenceFailure {
+                            owned?.use {
                             while (!aborted.get() && it.consumeNext { sample ->
                                 val consumeStartedNs = System.nanoTime()
-                                try { if (!aborted.get()) sink.consume(sample) }
+                                try { if (!aborted.get()) { sink.consume(sample); recordingSource?.consumed() } }
                                 finally { consumeDelay.record(System.nanoTime() - consumeStartedNs) }
                             }) { /* At most eight synchronous borrows, in FIFO order. */ }
+                            }
                         }
                     }
-                    catch (error: Exception) {
+                    catch (error: Throwable) {
+                        recordingSource?.failed() // Before deferred controller work.
                         admission.close()
                         if (!closed.getAndSet(true)) handler.post { failure("Sink failed: ${error.javaClass.simpleName}") }
                     }
@@ -113,11 +124,13 @@ internal class QueueDrainer(
                         }
                     }
                 }
-            } catch (error: Exception) {
-                handoff.cancel()
+            } catch (error: Throwable) {
+                recordingSource?.failed()
+                try { handoff.cancel() } catch (cleanup: Throwable) { error.addSuppressed(cleanup) }
                 throw error
             }
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
+            recordingSource?.failed()
             admission.empty()
             admission.close()
             closed.set(true)
@@ -136,12 +149,12 @@ internal class QueueDrainer(
         val done = CountDownLatch(1)
         var cancelled = false
         var sample: MediaSample? = null
-        var failure: Exception? = null
+        var failure: Throwable? = null
         val request = Runnable {
             synchronized(guard) {
                 if (!cancelled) {
                     try { sample = queues.popRecording(SystemClock.elapsedRealtimeNanos().toULong()) }
-                    catch (error: Exception) { failure = error }
+                    catch (error: Throwable) { recordingSource?.failed(); failure = error }
                 }
                 done.countDown()
             }
@@ -159,7 +172,14 @@ internal class QueueDrainer(
         }
     }
 
-    fun close(graceful: Boolean = false, drainQueued: Boolean = false, drainViaHandler: Boolean = false): Boolean {
+    fun close(graceful: Boolean = false, drainQueued: Boolean = false, drainViaHandler: Boolean = false): Boolean =
+        closeOwned(graceful, drainQueued, drainViaHandler, null)
+
+    fun closeWithSource(graceful: Boolean, drainQueued: Boolean, drainViaHandler: Boolean,
+        source: RecordingSourceGate.Terminal?): Boolean = closeOwned(graceful, drainQueued, drainViaHandler, source)
+
+    private fun closeOwned(graceful: Boolean, drainQueued: Boolean, drainViaHandler: Boolean,
+        source: RecordingSourceGate.Terminal?): Boolean {
         closed.set(true)
         admission.close()
         handler.removeCallbacks(request)
@@ -168,24 +188,38 @@ internal class QueueDrainer(
         if (graceful && sink != null) {
             val deadlineNs = SystemClock.elapsedRealtimeNanos() + 3_000_000_000L
             return worker.finishWithin(3000, finish = {
-                if (drainQueued) {
-                    // Capture/publishing have stopped. This is the sole
-                    // fanout owner until finalisation, not a second queue.
-                    while (true) {
-                        check(SystemClock.elapsedRealtimeNanos() < deadlineNs) { "Recording drain deadline exceeded" }
-                        val sample = if (drainViaHandler) popRecordingOnHandler(deadlineNs)
-                            else queues.popRecording(SystemClock.elapsedRealtimeNanos().toULong())
-                        if (sample == null) break
-                        sample.use { sink.consume(it) }
+                recordingSource.fenceFailure {
+                    if (drainQueued) {
+                        // Capture/publishing have stopped. This is the sole
+                        // fanout owner until finalisation, not a second queue.
+                        while (true) {
+                            check(SystemClock.elapsedRealtimeNanos() < deadlineNs) { "Recording drain deadline exceeded" }
+                            val sample = if (drainViaHandler) popRecordingOnHandler(deadlineNs)
+                                else queues.popRecording(SystemClock.elapsedRealtimeNanos().toULong())
+                            if (sample == null) break
+                            sample.use { sink.consume(it); recordingSource?.consumed() }
+                        }
+                    }
+                    val sourceRecorder = recordingSource
+                    if (sourceRecorder == null) sink.finish()
+                    else {
+                        check(sink is PrivateRecordingSink) { "Source-bound recorder changed" }
+                        val permit = sourceRecorder.drained(source)
+                        if (permit == null) {
+                            sink.finishIncompletePrefix()
+                            error("Source admission is incomplete; accepted prefix closed without FINALISED receipt")
+                        }
+                        sink.finish(permit)
                     }
                 }
-                sink.finish()
             }, abort = {
+                recordingSource?.failed()
                 aborted.set(true)
                 cancelBatch()
                 sink.close()
             })
         }
+        recordingSource?.failed()
         aborted.set(true)
         cancelBatch()
         // Invoked on a control worker by CaptureController, outside callbacks.

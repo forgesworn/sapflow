@@ -119,7 +119,12 @@ internal class AudioNativeFailure(private val run:CameraRunAdmission,private val
             val old=state.get() ?:return false
             if(old.owner!==owner || old.reason!=null)return false
             beforeFence?.invoke()
-            if(state.compareAndSet(old,State(owner,reason))){run.fail();return true}
+            // The scheduling hook above is outside this guard. Exact-owner
+            // CAS, run loss and recording commit share one scalar cut; no
+            // callback/native/file IO executes while it is held.
+            synchronized(run.recordingSource.guard) {
+                if(state.compareAndSet(old,State(owner,reason))){run.fail();return true}
+            }
         }
     }
 }

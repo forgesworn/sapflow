@@ -53,7 +53,7 @@ assert package['outputHashes'][str(aar.relative_to(root))]==sha(aar)
 tools={name:checked(name) for name in ('jna','serializationCore','serializationJson','androidJar')}
 assert sha(tools['jna'])=='4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae'
 production='mobile/android/app/src/main/java/dev/forgesworn/sapflow/broadcaster/'
-sources=[production+n for n in ('CaptureProfile.kt','CaptureIntent.kt','RecordingCatalogue.kt','RecordingCheckpointStorage.kt','AndroidRecordingStorageIO.kt','RecordingCheckpointOwner.kt')]
+sources=[production+n for n in ('CaptureProfile.kt','CaptureIntent.kt','RecordingSourceGate.kt','RecordingCatalogue.kt','RecordingCheckpointStorage.kt','AndroidRecordingStorageIO.kt','RecordingCheckpointOwner.kt')]
 sources+=['mobile/android/host-tests/RecordingCheckpointOwnerHostTest.kt']
 assert set(proof['compiledSources'])==set(sources)
 assert all((root/p).is_file() and not (root/p).is_symlink() and sha(root/p)==h for p,h in proof['compiledSources'].items())

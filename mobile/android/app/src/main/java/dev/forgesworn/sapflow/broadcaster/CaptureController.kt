@@ -687,6 +687,8 @@ class CaptureController internal constructor(private val context: Context,
             onFailure = { reason -> if(token==drainGeneration) fail(reason) },
             onRoute = { name -> if(token==drainGeneration) activeAudioInput=name })
         audioOwner=audio;audioCodec=audio.descriptor
+        val exactRecordingSink = recordingSink
+        val sourceRecorder = (exactRecordingSink as? PrivateRecordingSink)?.bindCaptureSource(rawRun.recordingSource)
         branchClosePending.fill(false)
         audio.prepare(zero)
         val run=checkNotNull(policy.attach(prepared,token,audio.descriptor,if(zero)null else audio.currentGeneration,System.nanoTime())) { "Privacy owner is unavailable" }
@@ -697,7 +699,8 @@ class CaptureController internal constructor(private val context: Context,
         check(!audio.failed) { "Native AAC preparation failed" }
         queues = NativeSampleFanout(4uL * 1024uL * 1024uL, 8uL * 1024uL * 1024uL, 2000u, captureIntent.hasVideo)
         publishing = QueueDrainer(handler, queues!!, true, publishingSink, { fail(it) })
-        recording = QueueDrainer(handler, queues!!, false, recordingSink, ::failRecording)
+        recording = QueueDrainer(handler, queues!!, false, exactRecordingSink,
+            { reason -> if (token == drainGeneration && recordingSink === exactRecordingSink) failRecording(reason) }, sourceRecorder)
         if(publishingSink==null) closePrivacyBranch(run,PrivacyStandbyPolicy.Sink.PUBLISHING)
         else publishingSink?.setTerminalAdmissionListener { handler.post { closePrivacyBranch(run,PrivacyStandbyPolicy.Sink.PUBLISHING) } }
         if(recordingSink==null) closePrivacyBranch(run,PrivacyStandbyPolicy.Sink.RECORDING)
@@ -888,7 +891,9 @@ class CaptureController internal constructor(private val context: Context,
             return
         }
         val nowNs = SystemClock.elapsedRealtimeNanos()
-        val result = queues!!.push(sample, nowNs.toULong())
+        val result = try { queues!!.push(sample, nowNs.toULong()) }
+        catch (error: Throwable) { runAdmission.recordingSource.fail(); throw error }
+        if (result.recordingQueued) recording?.recordingAccepted()
         val command=privacyCommand;val policy=privacy
         if(command!=null && policy!=null && policy.needsOutputProof(command) && policy.permitsReplacement(command,System.nanoTime())) {
             if(policy.branchesAccepted(result.publishingQueued,result.recordingQueued)) {
@@ -995,6 +1000,9 @@ class CaptureController internal constructor(private val context: Context,
         return true
     }
     private fun stopAdmitted(intent: CaptureStartAdmission.Preparation, reason: String, failed: Boolean = false) {
+        // This runs before the deferred stop task. A stale preparation cannot
+        // poison the replacement owner; ordinary Stop remains non-loss.
+        if (failed && preparation === intent && startAdmission.owns(intent)) runAdmission.recordingSource.fail()
         privacy?.stop(intent)
         sourcePolicy.close(); sourceRequests.close(); controlMailbox.close(); runAdmission.cancelSourceBudget(); renderer?.fenceSource()
         publishingSession?.stopDestination() // Fence even while codec-handler work is queued.
@@ -1007,6 +1015,7 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     private fun fail(reason: String, code: CaptureLifecycleDiagnostics.Code = CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE) {
+        runAdmission.recordingSource.fail() // AudioOnly faults also fence recording.
         privacyRun?.let{privacy?.nativeFailed(it)}
         if (captureIntent.hasVideo) runAdmission.fail()
         if (stage == CaptureStage.STOPPING || stage == CaptureStage.ERROR || stage == CaptureStage.IDLE) return
@@ -1020,6 +1029,7 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     private fun failRecording(reason: String) {
+        runAdmission.recordingSource.fail() // Recording loss, not publishing failure.
         if (recordingFailed) return
         privacyRun?.let{closePrivacyBranch(it,PrivacyStandbyPolicy.Sink.RECORDING)}
         recordingFailed = true
@@ -1155,11 +1165,12 @@ class CaptureController internal constructor(private val context: Context,
         val oldPublishingSink = publishingSink; val oldRecordingSink = recordingSink
         val recordingRun = runAdmission
         val canFinaliseRecording = audioOwner?.failed!=true && recordingRun.recordingCanFinalise && !stopFailed
+        val recordingSourceTerminal = audioOwner?.recordingTerminal()
         controls.execute {
             cleanupPhase = "publisher close"
             val publishingStopped = runCatching { oldPublishing?.close() != false }.getOrDefault(false)
             cleanupPhase = "recording drain/finalisation"
-            val recordingFinalised = runCatching { oldRecording?.close(graceful = canFinaliseRecording, drainQueued = canFinaliseRecording, drainViaHandler = canFinaliseRecording) != false }.getOrDefault(false)
+            val recordingFinalised = runCatching { oldRecording?.closeWithSource(graceful = canFinaliseRecording, drainQueued = canFinaliseRecording, drainViaHandler = canFinaliseRecording, source = recordingSourceTerminal) != false }.getOrDefault(false)
             val recordingStopped = recordingFinalised || runCatching { oldRecording?.close() != false }.getOrDefault(false)
             runCatching { oldRecordCleanup?.join(1000) }
             val stopped = publishingStopped && recordingStopped && oldRecordCleanup?.isAlive != true
@@ -1249,6 +1260,7 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     private fun markFailure(code: CaptureLifecycleDiagnostics.Code, reason: String, cleanupTimedOut: Boolean = false) {
+        runAdmission.recordingSource.fail()
         startAdmission.freezeElapsed()
         stopFailed = true
         cleanupExpired = cleanupExpired || cleanupTimedOut

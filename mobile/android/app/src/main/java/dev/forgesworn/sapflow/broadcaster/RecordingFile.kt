@@ -11,6 +11,10 @@ import java.util.concurrent.atomic.AtomicReference
  * control work to interrupt a blocked write/force; it never flushes to disk. */
 internal class RecordingFile(directory: Path, val filename: String) {
     private val channel: AtomicReference<FileChannel?>
+    private enum class CloseDisposition { OPEN, IN_FLIGHT, CLOSED, UNKNOWN }
+    private val coldCloseDisposition = AtomicReference(CloseDisposition.OPEN)
+    // Exact channel retained after an unconfirmed physical close; no retry.
+    private val retainedChannel = AtomicReference<FileChannel?>()
     private var headerBytes: Int? = null
 
     init {
@@ -37,5 +41,22 @@ internal class RecordingFile(directory: Path, val filename: String) {
         try { target.force(true) } finally { abort() }
     }
 
-    fun abort() { channel.getAndSet(null)?.close() }
+    fun abort() {
+        val disposition = coldCloseDisposition.get()
+        if (disposition == CloseDisposition.CLOSED) return
+        check(disposition == CloseDisposition.OPEN &&
+            coldCloseDisposition.compareAndSet(CloseDisposition.OPEN, CloseDisposition.IN_FLIGHT)) {
+            "Recording file close is in flight or its ownership is unknown"
+        }
+        val target = channel.getAndSet(null)
+        retainedChannel.set(target)
+        try {
+            target?.close()
+            retainedChannel.set(null)
+            coldCloseDisposition.set(CloseDisposition.CLOSED)
+        } catch (error: Throwable) {
+            coldCloseDisposition.set(CloseDisposition.UNKNOWN)
+            throw error
+        }
+    }
 }

@@ -1528,10 +1528,30 @@ pre-existing AVD remains. No physical phone is accessed. Evidence is under
 independent paired Float32 comparison has completed. Neither the Int16 tolerance
 nor the exact independent-PCM requirement is relaxed.
 
-The next production change is to carry the real audio producer's terminal
-closure through the existing recording drain, and make recording-loss admission
-atomic with the catalogue's final commit. Source-owned leading/tail facts,
-paired content, applicable seeks and A/V checks remain required for adoption.
+The Android production recorder now carries an opaque terminal receipt from
+the actual audio owner through its existing recording drain. Issuance requires
+final Stop and joined producer/resource closure for every AAC generation, with
+actual input and output EOS for each nonempty generation. The recorder counts successful queue acceptance and sink consumption
+before its one-use, exact-writer permit reaches the catalogue's commit cut.
+Run, native and recording loss share that scalar cut; file and native I/O remain
+outside it. A failed source can close a readable incomplete prefix without a
+finalised receipt. The file owner also distinguishes an in-flight close from a
+confirmed or unknown close, retaining the exact channel after an unconfirmed
+result and refusing a second physical close.
+
+Source review and host tests cover this admission policy and file ownership.
+Both Android unit tasks execute successfully: 732 Debug tests and 712
+Qualification tests, including 29 new regressions. All three APK builds, lint,
+qualification isolation and the seven APK artefact checks pass. Independent
+review verifies the functional build and its retained results. These checks use
+the existing pinned SDK package from `9d7d944`; they do not refresh whole
+app/SDK/head qualification. Private source and results are under
+`target/privacy-standby/android-recording-producer-closure-v1/`,
+`android-recording-producer-integration-actual-v1/` and
+`android-recording-producer-artifacts-actual-v1/`.
+
+Actual native producer qualification, source-owned leading/tail facts, paired
+content, applicable seeks and A/V checks remain required for adoption.
 The approved SDK schedule is an alternative clock criterion for its registered
 playback path; repairing the old raw native timestamps is not an extra condition
 for that new profile. Raw native-clock results remain separately unqualified.

@@ -215,4 +215,20 @@ class AudioGenerationLifecycleTest {
         assertEquals(AudioGenerationLifecycle.Action.CLOSED,p.released(g,true,20))
         assertTrue(p.actualClosed(g));assertTrue(p.isFailed());assertNull(p.begin())
     }
+    @Test fun exactNativeLossInvalidatesAnAlreadyPreparedRecordingPermit() {
+        val run = CameraRunAdmission(7); val gate = run.recordingSource; val owner = Any(); val prepared = Any(); val generation = Any()
+        val key = gate.bindProducer(owner, prepared, 7); val recorder = gate.bindRecorder(Any()); val writer = Any()
+        gate.generationStarted(key, generation); gate.generationClosed(key, generation, 1024, true, true)
+        recorder.writerOpened(writer); recorder.accepted(); recorder.consumed()
+        val permit = checkNotNull(recorder.drained(gate.terminal(key, owner, prepared, 7)))
+        val failure = AudioNativeFailure(run); assertTrue(failure.bind(owner)); assertTrue(run.recordingCanFinalise)
+        assertTrue(failure.fail(owner, "actual native loss before UI delivery"))
+        synchronized(gate.guard) { assertThrows(IllegalStateException::class.java) { gate.requireCommitLocked(permit, writer) } }
+    }
+    @Test fun nativeFailureSchedulingHookRunsOutsideThePublicationGuard() {
+        val run = CameraRunAdmission(7); val owner = Any(); var called = false
+        val failure = AudioNativeFailure(run) { assertFalse(Thread.holdsLock(run.recordingSource.guard)); called = true }
+        assertTrue(failure.bind(owner)); assertTrue(failure.fail(owner, "actual loss")); assertTrue(called)
+    }
+
 }
