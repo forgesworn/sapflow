@@ -61,6 +61,7 @@ pub struct NativeSrtConfig {
     pub latency_ms: u32,
     pub max_buffered_packets: u32,
     pub max_buffered_bytes: u32,
+    /// Media older than this is dropped (too-late drop); the session stays open.
     pub max_packet_age_ms: u32,
     pub max_sample_residence_ms: u32,
     /// SRT packet bytes per second, including originals and retransmissions.

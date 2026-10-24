@@ -1,8 +1,10 @@
 //! Bounded live sending window (SRT draft sections 4.8 and 5.1).
 //!
-//! This first sender uses an explicit bandwidth ceiling. It fails the
-//! session when retained media reaches its age budget; negotiated late
-//! dropping and automatic bitrate adaptation are subsequent milestones.
+//! This first sender uses an explicit bandwidth ceiling. Media older than
+//! its age budget is dropped, as live SRT does: unsent packets are
+//! discarded and sent ones are announced to the receiver with a drop
+//! request. The session stays open. Automatic bitrate adaptation is a
+//! subsequent milestone.
 
 use std::collections::VecDeque;
 
@@ -20,7 +22,8 @@ pub struct SendConfig {
     pub max_packets: usize,
     /// Sum of retained payload allocation capacities (metadata is packet-bounded).
     pub max_bytes: usize,
-    /// Maximum age since enqueue, in microseconds. Expiry closes the session.
+    /// Maximum age since enqueue, in microseconds. Older media is dropped
+    /// (too-late drop); the session stays open.
     pub max_age_us: u64,
     /// One complete live message per datagram (1316 fits seven TS packets).
     pub max_payload: usize,
@@ -122,6 +125,10 @@ pub struct SendStats {
     /// Packets queued for retransmission by the retransmission timeout rather
     /// than by a NAK.
     pub timeout_retransmissions: u64,
+    /// Packets dropped for exceeding [`SendConfig::max_age_us`], sent or not.
+    pub expired_packets: u64,
+    /// Payload bytes in those packets.
+    pub expired_bytes: u64,
     /// Smoothed round-trip time, in microseconds.
     pub rtt_us: u64,
     /// New data packets encrypted; retransmissions reuse the ciphertext and
@@ -135,7 +142,6 @@ pub struct SendStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Failure {
-    MediaExpired,
     Crypto,
     RetryLimit,
     PeerClosed,
@@ -176,6 +182,9 @@ pub(crate) struct Sender {
     rtt: Rtt,
     peer_variance: i64,
     ack_ack: Option<u32>,
+    /// Sent packets dropped for age and not yet announced: first message,
+    /// first and last sequence.
+    drop_request: Option<(u32, Seq, Seq)>,
     stats: SendStats,
     failure: Option<Failure>,
     crypto: Option<Encryptor>,
@@ -209,6 +218,7 @@ impl Sender {
             rtt: Rtt::new(),
             peer_variance: 50_000,
             ack_ack: None,
+            drop_request: None,
             stats: SendStats::default(),
             failure: None,
             crypto: None,
@@ -297,6 +307,7 @@ impl Sender {
         self.flight = VecDeque::new();
         self.retries = VecDeque::new();
         self.ack_ack = None;
+        self.drop_request = None;
         self.next_rto = None;
     }
 
@@ -436,13 +447,7 @@ impl Sender {
         if self.failure.is_some() {
             return;
         }
-        if self
-            .oldest()
-            .is_some_and(|born| now.saturating_sub(born) >= self.config.max_age_us as i64)
-        {
-            self.failure = Some(Failure::MediaExpired);
-            return;
-        }
+        self.drop_expired(now);
         if self.next_rto.is_some_and(|deadline| now >= deadline) {
             self.rto_count = self.rto_count.saturating_add(1);
             for f in &mut self.flight {
@@ -455,6 +460,55 @@ impl Sender {
             self.next_rto =
                 Some(now.saturating_add(self.rto().saturating_mul(i64::from(self.rto_count + 1))));
         }
+    }
+
+    /// Too-late drop: media at or past its age budget will not play on time,
+    /// so stop holding it. Sent packets are announced with one drop request
+    /// covering the range; unsent ones are discarded (they have no sequence
+    /// number yet).
+    fn drop_expired(&mut self, now: i64) {
+        let cutoff = now.saturating_sub(self.config.max_age_us as i64);
+        let mut dropped: Option<(u32, Seq, Seq)> = None;
+        while self.flight.front().is_some_and(|f| f.data.born <= cutoff) {
+            let Some(f) = self.flight.pop_front() else {
+                break;
+            };
+            if let Some(count) = f
+                .key
+                .checked_sub(1)
+                .and_then(|k| self.key_counts.get_mut(k as usize))
+            {
+                *count = count.saturating_sub(1);
+            }
+            self.expired(f.data.payload.len(), f.data.payload.capacity());
+            dropped = Some(match dropped {
+                Some((message, first, _)) => (message, first, f.seq),
+                None => (f.message, f.seq, f.seq),
+            });
+        }
+        if let Some((message, first, last)) = dropped {
+            self.retries.retain(|seq| last.distance_to(*seq) > 0);
+            self.drop_request = Some(match self.drop_request {
+                Some((m, f, _)) => (m, f, last),
+                None => (message, first, last),
+            });
+            if self.flight.is_empty() {
+                self.next_rto = None;
+                self.rto_count = 0;
+            }
+        }
+        while self.pending.front().is_some_and(|p| p.born <= cutoff) {
+            if let Some(p) = self.pending.pop_front() {
+                self.expired(p.payload.len(), p.payload.capacity());
+            }
+        }
+    }
+
+    fn expired(&mut self, len: usize, capacity: usize) {
+        self.stats.expired_packets += 1;
+        self.stats.expired_bytes += len as u64;
+        self.stats.buffered_packets = self.stats.buffered_packets.saturating_sub(1);
+        self.stats.buffered_bytes = self.stats.buffered_bytes.saturating_sub(capacity);
     }
 
     fn oldest(&self) -> Option<i64> {
@@ -470,6 +524,9 @@ impl Sender {
         let mut next = self.last_send.saturating_add(1_000_000);
         if self.ack_ack.is_some() {
             next = next.min(self.last_receive);
+        }
+        if self.drop_request.is_some() {
+            next = next.min(self.last_send);
         }
         if !self.retries.is_empty()
             || (!self.pending.is_empty()
@@ -509,6 +566,16 @@ impl Sender {
         }
         if let Some(number) = self.ack_ack.take() {
             return Some(self.control(now, Control::AckAck { number }));
+        }
+        if let Some((message, first, last)) = self.drop_request.take() {
+            return Some(self.control(
+                now,
+                Control::DropRequest {
+                    message,
+                    first,
+                    last,
+                },
+            ));
         }
         if now >= self.next_send {
             while let Some(seq) = self.retries.pop_front() {

@@ -25,7 +25,8 @@ use crate::seq::Seq;
 /// CRYPT is the specification's mandatory legacy KK-understanding flag,
 /// NOT a claim of encryption. Configured sessions require verified KM.
 /// We are send-only: do not advertise receiving or periodic NAK capability.
-const FLAGS: u32 = srt_flags::TSBPDSND | srt_flags::CRYPT | srt_flags::REXMITFLG;
+const FLAGS: u32 =
+    srt_flags::TSBPDSND | srt_flags::TLPKTDROP | srt_flags::CRYPT | srt_flags::REXMITFLG;
 
 /// Settings for a [`Caller`]; [`Caller::new`] checks them and fails with a
 /// [`ConfigError`] if any is invalid.
@@ -119,7 +120,8 @@ pub enum CallerCloseReason {
     /// Encryption failed: the listener's key material response did not match,
     /// or a key could not be used or rotated safely.
     Crypto,
-    /// Queued media reached `send.max_age_us` before it was acknowledged.
+    /// No longer produced: media past `send.max_age_us` is now dropped and
+    /// the session stays open. Kept so matches on this enum still compile.
     MediaExpired,
     /// A packet was retransmitted `send.max_retransmits` times.
     RetryLimit,
@@ -414,7 +416,6 @@ impl Caller {
                     .failure()
                     .map(|failure| match failure {
                         Failure::Crypto => CallerCloseReason::Crypto,
-                        Failure::MediaExpired => CallerCloseReason::MediaExpired,
                         Failure::RetryLimit => CallerCloseReason::RetryLimit,
                         Failure::PeerClosed => CallerCloseReason::PeerClosed,
                         Failure::PeerError(code) => CallerCloseReason::PeerError(code),
