@@ -53,9 +53,18 @@ The target's standalone `main` verifies and replays exactly those two generated
 seed hashes. Run it with `java -cp "$APPEND_CONTEXT_CLASSPATH"
 dev.forgesworn.sapflow.broadcaster.RecordingAppendContextFuzz` after compiling the
 actual codec/source closure and target. This deterministic seed replay is not
-coverage-guided fuzzing. Jazzer execution, coverage statistics and hosted CI
-integration remain pending; no native Android IO, codec, interop, recovery or
-source-EOF qualification follows from replay. No Rust build is involved.
+coverage-guided fuzzing.
+
+A separate local Jazzer 0.30.0 run instruments the actual parser and completes
+1,779,234 coverage-guided executions in 61 reported seconds, with no findings
+(`cov: 199`, `ft: 330`). The official macOS tool archive is digest-verified;
+the tested source/JAR/dependencies and 23 protected inputs remain unchanged.
+Its owned process exits successfully and closes without cleanup errors. Actual
+logs, corpus and independent outcome review are retained privately under
+`target/privacy-standby/append-context-jazzer-actual-v1/`.
+This is a finite parser campaign. Longer campaigns and hosted CI integration
+remain open; it establishes no native Android IO, codec, interop, recovery or
+source-EOF qualification. No Rust build is involved.
 
 | Target | What it feeds |
 |--------|---------------|

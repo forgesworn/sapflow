@@ -854,11 +854,20 @@ process groups, historical input stability and the installed candidate bytes.
 The private evidence is under
 `target/privacy-standby/android-append-context-focused-actual-v1/`.
 
-These are host filesystem and metadata results. Full app builds, coverage-guided
-JVM fuzzing, actual Android descriptor/provider behaviour, a cold read owner,
-two-slot selection, recover-to-new-file, playable recovery, physical power loss
-and the aggregate two-second loss bound remain open. Capture/default recorder
-selection is unchanged.
+A separate Jazzer 0.30.0 campaign instruments the actual context parser and
+completes 1,779,234 coverage-guided executions in 61 reported seconds, with no
+findings (`cov: 199`, `ft: 330`). Independent review verifies the official tool
+archive digest, tested JAR/source bindings, actual instrumentation and campaign
+statistics, 23 unchanged protected inputs and closed process ownership. This
+finite campaign is separate from the two-seed replay; it proves no native IO or
+recovery behaviour. Its logs, corpus and review are retained privately under
+`target/privacy-standby/append-context-jazzer-actual-v1/`.
+
+These are host filesystem and metadata results. Full app builds, hosted JVM fuzz
+CI, longer fuzz campaigns, actual Android descriptor/provider behaviour, a cold
+read owner, two-slot selection, recover-to-new-file, playable recovery, physical
+power loss and the aggregate two-second loss bound remain open. Capture/default
+recorder selection is unchanged.
 
 ## Android AAC observation packet
 
@@ -1351,11 +1360,26 @@ callback chunk and payload byte. Actual writer weak deallocation, zero pending
 application copies, collector sealing and file synchronisation/close are
 observed; no documented delegate-EOF or producer authority is inferred.
 
-This establishes one necessary original-clock recorder-control capability.
+The remaining two registered cases now pass the same native segment-output
+control: 49 original AAC packets for the 48,000-frame programme and five for the
+second 2,765-frame programme. Their 18,037-byte and 2,368-byte files preserve
+every original payload, order, count, exact 48 kHz DTS/PTS and 1,024-frame coded
+duration. Independent parsing accounts for all payload bytes and all 50 and six
+callback chunks. Both writers finish, weak deallocation is observed, pending
+application copies reach zero, collectors seal and file synchronisation/close
+return. All four owned compile/control/writer processes close; 65 protected
+inputs remain unchanged. Ten parser tests and 11 collector/control groups pass.
+The first passed file is reused without rerunning its writer. The private
+results and independent review are under
+`target/privacy-standby/macos-native-aac-segment-pair-controls-actual-v2/`.
+
+This establishes the necessary original-clock recorder-control capability for
+all three registered cases. Their native movie duration is zero and no edit
+list supplies programme trimming; these files do not certify head/tail geometry.
 No decoder runs, so trim, waveform, paired presentation, seeks and application
-admission remain unqualified. The control's explicit segment copies establish
+admission remain unqualified. The controls' explicit segment copies establish
 no production performance claim. The earlier URL-writer negative is unchanged.
-Actual evidence and independent review are under
+The first case's actual evidence and independent review remain under
 `target/privacy-standby/macos-native-aac-segment-output-actual-v1/`.
 
 After independent source review, the ignored clock prototype passed all 26

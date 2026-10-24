@@ -46,11 +46,14 @@ is authorised by these retained build/test results.
 The checked Android store now persists the append context needed to reconstruct
 its existing checkpoint bindings after restart (`17c397a`). A focused SDK-free
 host run passes 51 filesystem/metadata controls and two synthetic fuzz-seed
-replays, with independent outcome review. Full app and Android-native checks,
-coverage-guided fuzzing and the cold recovery transaction remain open. Separately,
-one actual Apple segment-output control preserves all five original AAC packets
-and their exact coded clocks. This clears a file-format prerequisite for that
-case; it does not qualify decoding, paired presentation or application admission.
+replays, with independent outcome review. A separate coverage-guided JVM campaign
+instruments the actual parser and completes 1,779,234 executions in 61 reported
+seconds with no findings, unchanged protected inputs and independent review.
+Full app and Android-native checks, hosted fuzz CI and the cold recovery
+transaction remain open. Separately, actual Apple segment-output controls now
+preserve the original AAC packets and exact coded clocks in all three registered
+cases (five, 49 and five packets). This clears their file-format prerequisite;
+it does not qualify decoding, paired presentation or application admission.
 Both results are detailed in the [recording recovery record](recording-recovery.md).
 
 The earlier audio retirement regression gate passes 674 Debug tests, 664
