@@ -1,0 +1,612 @@
+{
+  "status": "complete",
+  "source": "2d20835ef246740ab42ca810df7c51fd43bf9ff6",
+  "tracked_changes": "M mobile/android/gradlew.bat",
+  "tracked_diff_sha256": "34e6dd425c01aef2490bbc12c3e41fbd3ca7d67b6e45ae439ccc1b49aa90f9ed",
+  "runner_sha256": "a6837042d52202972b75d4d16da9f0c441ef0a3a2e5e1f7eb9d9abd38345a5ef",
+  "bench_script_sha256": "36df7336ac5aec4ef213204d12756c583be5cce0f137791ab83f10441309b1a5",
+  "lock_sha256": "27824db0ff5e7b400fb23ba0d83f423226f2893956c20ce3a682c12579ca6f1a",
+  "cpu": "Apple M4 Max",
+  "logical_cpus": 16,
+  "macos": "26.6.2",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-apple-darwin\nrelease: 1.94.1\nLLVM version: 21.1.8",
+  "ffmpeg": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "file_descriptor_limit": 4096,
+  "load_before": [
+    5.36669921875,
+    4.80615234375,
+    3.115234375
+  ],
+  "measured_seconds": 60,
+  "ramp_seconds": 10,
+  "viewers": [
+    750
+  ],
+  "variants": [
+    "hyper",
+    "own",
+    "own-1",
+    "mediamtx"
+  ],
+  "rounds": 3,
+  "notes": "Loopback HTTP/1.1; full media viewers; generated 720p30 H.264/AAC. Server and encoder/load generator share the host. RSS excludes kernel memory. Existing workloads remain running. Separate server and viewer builds avoid feature unification. No recording, TLS, WAN, phone, energy or thermal qualification.",
+  "runs": [
+    {
+      "round": 1,
+      "variant": "hyper",
+      "raw": "round-1-hyper.txt",
+      "wall_seconds": 121.85828204220161,
+      "load_before": [
+        5.36669921875,
+        4.80615234375,
+        3.115234375
+      ],
+      "load_after": [
+        6.0634765625,
+        4.78955078125,
+        3.302734375
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 60.6,
+          "peak_rss_mb": 246.5,
+          "requests": 587432,
+          "errors": 0,
+          "received_mb": 33430.1,
+          "playlist_p99_ms": 29.3,
+          "segment_p99_ms": 16.2,
+          "part_reach": 696.0,
+          "part_p50_ms": 34.8,
+          "part_p95_ms": 45.6,
+          "part_max_ms": 57.1
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "variant": "own",
+      "raw": "round-1-own.txt",
+      "wall_seconds": 121.09767487505451,
+      "load_before": [
+        6.0634765625,
+        4.78955078125,
+        3.302734375
+      ],
+      "load_after": [
+        4.08349609375,
+        4.27001953125,
+        3.2763671875
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 34.9,
+          "peak_rss_mb": 26.4,
+          "requests": 587724,
+          "errors": 0,
+          "received_mb": 33447.1,
+          "playlist_p99_ms": 29.1,
+          "segment_p99_ms": 14.3,
+          "part_reach": 696.0,
+          "part_p50_ms": 29.2,
+          "part_p95_ms": 47.7,
+          "part_max_ms": 60.4
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "variant": "own-1",
+      "raw": "round-1-own-1.txt",
+      "wall_seconds": 121.09590404201299,
+      "load_before": [
+        4.08349609375,
+        4.27001953125,
+        3.2763671875
+      ],
+      "load_after": [
+        3.1416015625,
+        3.740234375,
+        3.1875
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 19.9,
+          "peak_rss_mb": 25.2,
+          "requests": 587952,
+          "errors": 0,
+          "received_mb": 33459.0,
+          "playlist_p99_ms": 33.7,
+          "segment_p99_ms": 8.9,
+          "part_reach": 696.0,
+          "part_p50_ms": 36.1,
+          "part_p95_ms": 42.2,
+          "part_max_ms": 46.8
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "variant": "mediamtx",
+      "raw": "round-1-mediamtx.txt",
+      "wall_seconds": 121.08552216598764,
+      "load_before": [
+        3.1416015625,
+        3.740234375,
+        3.1875
+      ],
+      "load_after": [
+        4.72998046875,
+        4.4658203125,
+        3.56787109375
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 167.8,
+          "peak_rss_mb": 274.0,
+          "requests": 588364,
+          "errors": 0,
+          "received_mb": 31948.9,
+          "playlist_p99_ms": 33.2,
+          "segment_p99_ms": 15.8,
+          "part_reach": 696.0,
+          "part_p50_ms": 36.5,
+          "part_p95_ms": 44.3,
+          "part_max_ms": 61.3
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "variant": "own",
+      "raw": "round-2-own.txt",
+      "wall_seconds": 121.4327986673452,
+      "load_before": [
+        4.72998046875,
+        4.4658203125,
+        3.56787109375
+      ],
+      "load_after": [
+        3.53564453125,
+        4.337890625,
+        3.65087890625
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 36.1,
+          "peak_rss_mb": 26.3,
+          "requests": 587860,
+          "errors": 0,
+          "received_mb": 33453.7,
+          "playlist_p99_ms": 26.0,
+          "segment_p99_ms": 15.2,
+          "part_reach": 696.0,
+          "part_p50_ms": 24.4,
+          "part_p95_ms": 44.0,
+          "part_max_ms": 56.6
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "variant": "own-1",
+      "raw": "round-2-own-1.txt",
+      "wall_seconds": 121.37737512495369,
+      "load_before": [
+        3.53564453125,
+        4.337890625,
+        3.65087890625
+      ],
+      "load_after": [
+        4.20263671875,
+        4.52197265625,
+        3.8251953125
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 20.5,
+          "peak_rss_mb": 25.0,
+          "requests": 587410,
+          "errors": 0,
+          "received_mb": 33429.5,
+          "playlist_p99_ms": 32.8,
+          "segment_p99_ms": 9.0,
+          "part_reach": 696.0,
+          "part_p50_ms": 35.6,
+          "part_p95_ms": 43.0,
+          "part_max_ms": 47.2
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "variant": "mediamtx",
+      "raw": "round-2-mediamtx.txt",
+      "wall_seconds": 121.43922454072163,
+      "load_before": [
+        4.20263671875,
+        4.52197265625,
+        3.8251953125
+      ],
+      "load_after": [
+        9.67431640625,
+        5.92236328125,
+        4.4296875
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 169.5,
+          "peak_rss_mb": 278.2,
+          "requests": 588786,
+          "errors": 0,
+          "received_mb": 31971.9,
+          "playlist_p99_ms": 35.3,
+          "segment_p99_ms": 16.4,
+          "part_reach": 696.0,
+          "part_p50_ms": 37.8,
+          "part_p95_ms": 47.8,
+          "part_max_ms": 58.2
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "variant": "hyper",
+      "raw": "round-2-hyper.txt",
+      "wall_seconds": 121.3422519583255,
+      "load_before": [
+        9.67431640625,
+        5.92236328125,
+        4.4296875
+      ],
+      "load_after": [
+        5.84228515625,
+        5.8642578125,
+        4.6044921875
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 61.1,
+          "peak_rss_mb": 250.2,
+          "requests": 587550,
+          "errors": 0,
+          "received_mb": 33436.6,
+          "playlist_p99_ms": 27.8,
+          "segment_p99_ms": 15.9,
+          "part_reach": 696.0,
+          "part_p50_ms": 34.6,
+          "part_p95_ms": 44.5,
+          "part_max_ms": 60.0
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "variant": "own-1",
+      "raw": "round-3-own-1.txt",
+      "wall_seconds": 121.11092495825142,
+      "load_before": [
+        5.84228515625,
+        5.8642578125,
+        4.6044921875
+      ],
+      "load_after": [
+        6.07177734375,
+        5.78564453125,
+        4.7294921875
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 20.3,
+          "peak_rss_mb": 24.8,
+          "requests": 587966,
+          "errors": 0,
+          "received_mb": 33458.7,
+          "playlist_p99_ms": 34.7,
+          "segment_p99_ms": 9.7,
+          "part_reach": 696.0,
+          "part_p50_ms": 35.8,
+          "part_p95_ms": 42.6,
+          "part_max_ms": 46.3
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "variant": "mediamtx",
+      "raw": "round-3-mediamtx.txt",
+      "wall_seconds": 121.11752945790067,
+      "load_before": [
+        6.07177734375,
+        5.78564453125,
+        4.7294921875
+      ],
+      "load_after": [
+        3.5107421875,
+        5.11328125,
+        4.61328125
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 160.1,
+          "peak_rss_mb": 276.7,
+          "requests": 588248,
+          "errors": 0,
+          "received_mb": 31942.4,
+          "playlist_p99_ms": 32.8,
+          "segment_p99_ms": 15.3,
+          "part_reach": 696.0,
+          "part_p50_ms": 36.0,
+          "part_p95_ms": 45.0,
+          "part_max_ms": 51.1
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "variant": "hyper",
+      "raw": "round-3-hyper.txt",
+      "wall_seconds": 121.12228295812383,
+      "load_before": [
+        3.5107421875,
+        5.11328125,
+        4.61328125
+      ],
+      "load_after": [
+        3.3544921875,
+        4.52001953125,
+        4.439453125
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 60.9,
+          "peak_rss_mb": 255.5,
+          "requests": 588474,
+          "errors": 0,
+          "received_mb": 33489.1,
+          "playlist_p99_ms": 30.7,
+          "segment_p99_ms": 15.9,
+          "part_reach": 697.0,
+          "part_p50_ms": 35.2,
+          "part_p95_ms": 48.3,
+          "part_max_ms": 57.4
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "variant": "own",
+      "raw": "round-3-own.txt",
+      "wall_seconds": 121.38505708379671,
+      "load_before": [
+        3.3544921875,
+        4.52001953125,
+        4.439453125
+      ],
+      "load_after": [
+        2.60302734375,
+        3.998046875,
+        4.24609375
+      ],
+      "measurements": [
+        {
+          "viewers": 750,
+          "cpu_percent": 35.0,
+          "peak_rss_mb": 26.5,
+          "requests": 587608,
+          "errors": 0,
+          "received_mb": 33439.4,
+          "playlist_p99_ms": 28.0,
+          "segment_p99_ms": 16.2,
+          "part_reach": 696.0,
+          "part_p50_ms": 26.1,
+          "part_p95_ms": 49.9,
+          "part_max_ms": 62.2
+        }
+      ]
+    }
+  ],
+  "binaries": {
+    "sapflow": {
+      "sha256": "04af5e358f08f0920dbd5a552b675a6a3979fd0846c3588621a645c2b6809249",
+      "bytes": 3547664,
+      "architecture": "Mach-O 64-bit executable arm64"
+    },
+    "sapflow-bench": {
+      "sha256": "a866d62d97708f8fe055930a3542e53f2df42d70569505f260e10ab482cd57da",
+      "bytes": 2800288,
+      "architecture": "Mach-O 64-bit executable arm64"
+    },
+    "mediamtx": {
+      "sha256": "72f67f718cfe5f75f081db5b2f31d1664008b6b8ff8627cb2a8acf5d7e5e61be",
+      "bytes": 54724098,
+      "architecture": "Mach-O 64-bit executable arm64"
+    }
+  },
+  "mediamtx_version": "v1.21.2",
+  "summary": [
+    {
+      "variant": "hyper",
+      "viewers": 750,
+      "runs": 3,
+      "cpu_percent": {
+        "median": 60.9,
+        "minimum": 60.6,
+        "maximum": 61.1
+      },
+      "peak_rss_mb": {
+        "median": 250.2,
+        "minimum": 246.5,
+        "maximum": 255.5
+      },
+      "playlist_p99_ms": {
+        "median": 29.3,
+        "minimum": 27.8,
+        "maximum": 30.7
+      },
+      "segment_p99_ms": {
+        "median": 15.9,
+        "minimum": 15.9,
+        "maximum": 16.2
+      },
+      "part_p50_ms": {
+        "median": 34.8,
+        "minimum": 34.6,
+        "maximum": 35.2
+      },
+      "part_p95_ms": {
+        "median": 45.6,
+        "minimum": 44.5,
+        "maximum": 48.3
+      },
+      "part_max_ms": {
+        "median": 57.4,
+        "minimum": 57.1,
+        "maximum": 60.0
+      },
+      "requests": 1763456,
+      "errors": 0
+    },
+    {
+      "variant": "mediamtx",
+      "viewers": 750,
+      "runs": 3,
+      "cpu_percent": {
+        "median": 167.8,
+        "minimum": 160.1,
+        "maximum": 169.5
+      },
+      "peak_rss_mb": {
+        "median": 276.7,
+        "minimum": 274.0,
+        "maximum": 278.2
+      },
+      "playlist_p99_ms": {
+        "median": 33.2,
+        "minimum": 32.8,
+        "maximum": 35.3
+      },
+      "segment_p99_ms": {
+        "median": 15.8,
+        "minimum": 15.3,
+        "maximum": 16.4
+      },
+      "part_p50_ms": {
+        "median": 36.5,
+        "minimum": 36.0,
+        "maximum": 37.8
+      },
+      "part_p95_ms": {
+        "median": 45.0,
+        "minimum": 44.3,
+        "maximum": 47.8
+      },
+      "part_max_ms": {
+        "median": 58.2,
+        "minimum": 51.1,
+        "maximum": 61.3
+      },
+      "requests": 1765398,
+      "errors": 0
+    },
+    {
+      "variant": "own",
+      "viewers": 750,
+      "runs": 3,
+      "cpu_percent": {
+        "median": 35.0,
+        "minimum": 34.9,
+        "maximum": 36.1
+      },
+      "peak_rss_mb": {
+        "median": 26.4,
+        "minimum": 26.3,
+        "maximum": 26.5
+      },
+      "playlist_p99_ms": {
+        "median": 28.0,
+        "minimum": 26.0,
+        "maximum": 29.1
+      },
+      "segment_p99_ms": {
+        "median": 15.2,
+        "minimum": 14.3,
+        "maximum": 16.2
+      },
+      "part_p50_ms": {
+        "median": 26.1,
+        "minimum": 24.4,
+        "maximum": 29.2
+      },
+      "part_p95_ms": {
+        "median": 47.7,
+        "minimum": 44.0,
+        "maximum": 49.9
+      },
+      "part_max_ms": {
+        "median": 60.4,
+        "minimum": 56.6,
+        "maximum": 62.2
+      },
+      "requests": 1763192,
+      "errors": 0
+    },
+    {
+      "variant": "own-1",
+      "viewers": 750,
+      "runs": 3,
+      "cpu_percent": {
+        "median": 20.3,
+        "minimum": 19.9,
+        "maximum": 20.5
+      },
+      "peak_rss_mb": {
+        "median": 25.0,
+        "minimum": 24.8,
+        "maximum": 25.2
+      },
+      "playlist_p99_ms": {
+        "median": 33.7,
+        "minimum": 32.8,
+        "maximum": 34.7
+      },
+      "segment_p99_ms": {
+        "median": 9.0,
+        "minimum": 8.9,
+        "maximum": 9.7
+      },
+      "part_p50_ms": {
+        "median": 35.8,
+        "minimum": 35.6,
+        "maximum": 36.1
+      },
+      "part_p95_ms": {
+        "median": 42.6,
+        "minimum": 42.2,
+        "maximum": 43.0
+      },
+      "part_max_ms": {
+        "median": 46.8,
+        "minimum": 46.3,
+        "maximum": 47.2
+      },
+      "requests": 1763328,
+      "errors": 0
+    }
+  ],
+  "load_after": [
+    2.60302734375,
+    3.998046875,
+    4.24609375
+  ]
+}

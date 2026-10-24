@@ -327,6 +327,42 @@ fn intertrack_skew_does_not_regress_video_pcr_and_track_changes_are_refused() {
 }
 
 #[test]
+fn a_keyframe_after_a_dropped_backlog_starts_a_discontinuity() {
+    let mut mux = MpegTsMuxer::new(config()).expect("mux");
+    mux.push(video_at(0, 0, true, 2)).expect("first");
+    drain(&mut mux);
+    mux.push(audio_at(1024, &[1])).expect("audio");
+    drain(&mut mux);
+    // About 2.5 s of media was dropped upstream; the next frame is an IDR.
+    mux.push(video_at(225_000, 225_000, true, 2))
+        .expect("a keyframe after the gap carries on");
+    assert_eq!(mux.stats().resets, 1);
+    let packets = packets(&drain(&mut mux));
+    let Some(TsPayload::Pat(pat)) = &packets[0].payload else {
+        panic!("PAT")
+    };
+    assert_eq!(pat.version_number.as_u8(), 1);
+    let video = packets
+        .iter()
+        .find(|p| matches!(p.payload, Some(TsPayload::PesStart(_))))
+        .expect("video PES");
+    assert!(
+        video
+            .adaptation_field
+            .as_ref()
+            .is_some_and(|a| a.discontinuity_indicator)
+    );
+    // Audio continues on the new clock without a regression error.
+    mux.push(audio_at(225_000 * 48 / 90, &[1]))
+        .expect("audio after");
+    drain(&mut mux);
+    assert_eq!(
+        mux.push(video_at(500_000, 500_000, false, 2)),
+        Err(MuxError::ClockGap)
+    );
+}
+
+#[test]
 fn pts_dts_and_pcr_wrap_at_33_bits_without_resetting_track_clock() {
     let mut mux = MpegTsMuxer::new(config()).expect("mux");
     let dts = (1i64 << 33) - 1500;

@@ -126,7 +126,7 @@ fn independent_induction_and_conclusion_vectors() {
         hex("80000000 00000000 00000000 00000016
         00000005 00000005 00000064 000005dc 00001000 ffffffff
         0000000b 12345678 0100007f 00000000 00000000 00000000
-        00010003 00010500 00000025 00000078
+        00010003 00010500 0000002d 00000078
         00050003 6c627570 3a687369 00000078")
     );
 }
@@ -378,20 +378,46 @@ fn lost_ack_has_rto_recovery_then_bounded_retry_failure() {
 }
 
 #[test]
-fn media_age_budget_applies_to_pending_and_sent_data() {
+fn media_past_its_age_budget_is_dropped_and_the_session_stays_open() {
     let now = Instant::now();
     for sent in [false, true] {
         let mut config = CallerConfig::default();
         config.send.max_age_us = 50_000;
         let mut c = open(config, now);
         c.enqueue(now, vec![1]).expect("queue");
+        let mut seq = None;
         if sent {
-            c.poll_transmit(now);
+            let (_, bytes) = c.poll_transmit(now).expect("original");
+            seq = Some(data(&bytes).seq);
         }
         c.handle_timeout(time(now, 50_000));
-        assert_eq!(reason(&mut c), CallerCloseReason::MediaExpired);
-        assert_eq!(c.stats().send.abandoned_bytes, 1);
-        assert_eq!(c.stats().send.buffered_bytes, 0);
+        assert!(!c.is_closed(), "a late packet must not end the session");
+        assert!(c.poll_event().is_none());
+        let s = c.stats().send;
+        assert_eq!((s.expired_packets, s.expired_bytes), (1, 1));
+        assert_eq!((s.buffered_packets, s.buffered_bytes), (0, 0));
+        if let Some(seq) = seq {
+            // Sent media is announced so the receiver stops asking for it.
+            let (_, bytes) = c.poll_transmit(time(now, 50_000)).expect("drop request");
+            assert!(matches!(
+                Packet::parse(&bytes),
+                Ok(Packet::Control(ControlPacket {
+                    body: Control::DropRequest { first, last, .. },
+                    ..
+                })) if first == seq && last == seq
+            ));
+            // A NAK for the dropped packet is ignored, not retransmitted.
+            control(&mut c, time(now, 50_000), Control::Nak(vec![(seq, seq)]));
+        }
+        assert!(
+            c.poll_transmit(time(now, 50_000)).is_none(),
+            "nothing left to send or announce"
+        );
+        // Fresh media still flows on the same session.
+        c.enqueue(time(now, 60_000), vec![2])
+            .expect("queue after drop");
+        let (_, bytes) = c.poll_transmit(time(now, 60_000)).expect("new data");
+        assert_eq!(data(&bytes).payload, &[2]);
     }
 }
 

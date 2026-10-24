@@ -373,7 +373,20 @@ refused); the callback path is tested in phase B.
   the end, in small steps; the recording one 7,200 s file that decodes to
   its end, `complete=true`. `docker stats` rose and fell between 40 and
   50 MB: it counts the kernel's memory for the recording's writes, so read
-  `RssAnon` for criterion 6. Drops and viewers are still to run.
+  `RssAnon` for criterion 6.
+  Second run (2026-10-23, same host, two hours, the same signal with an
+  encoder drop of 1 s every 20 minutes and one of 30 s, three scripted
+  LL-HLS viewers polling the playlist every 100 ms and fetching every part
+  straight from sapflow): every drop resumed the same stream and recording
+  inside the grace (`resumed=true`, ready in 0.2 s after the long one); no
+  viewer went more than 3 s without a new part except across the 30 s drop
+  (30.9 s each); each viewer fetched 35,302 parts with 7 failed requests,
+  not yet explained; the process's memory 18.5 to 20.9 MB and back to
+  19.2 MB, 13 to 16 descriptors, about 2% CPU; one recording of 7,166 s
+  (on-air time less the drops) that decodes to its end, `complete=true`.
+  Not covered: real players, viewers through Caddy (a scripted client
+  through the CDN in front saw 7 s gaps that Safari and Chrome did not),
+  and the phone as the encoder.
 - [ ] The recording: one file, `ffprobe` length against on-air time,
   plays and seeks in Chrome and Safari.
 - [ ] If the wired Linux machine is free, run `scripts/bench-remote.sh` at
@@ -653,7 +666,7 @@ The outcome goes in [GOALS.md](../GOALS.md): widen, repeat or stop.
 | Risk | Mitigation on the night |
 |------|-------------------------|
 | Larix's first SRT attempt sometimes fails and a retry works (unexplained) | RTMP first. If SRT: connect at soundcheck, allow up to three tries, keep auto-reconnect on, keep the logs |
-| Our own app: reconnect is new and unmerged as of 2026-10-22. Phase B (2026-10-23): it streamed to a real stage through sapflow and survived Wi-Fi drops (new connection ready in 0.5 s), but after a drop it kept opening new connections by itself every 20 to 60 s on a clean link (zero loss on each abandoned connection), and each one stalled the viewers' player. After a long outage it also waits up to 8 s between retries | Not for the first show until the self-reconnects are fixed and a show-length run passes; Larix with the same settings |
+| Our own app: reconnect is new and unmerged as of 2026-10-22. Phase B (2026-10-23): it streamed to a real stage through sapflow and survived Wi-Fi drops (new connection ready in 0.5 s), but after a drop it kept opening new connections by itself every 20 to 60 s on a clean link (zero loss on each abandoned connection), and each one stalled the viewers' player. After a long outage it also waits up to 8 s between retries. Cause: when 2 s of media backs up, the publish queue drops it and the next keyframe arrives more than 2 s after the last frame sent, which the MPEG-TS muxer refused as a clock gap; the app treated that as a failed connection. Fixed by starting a discontinuity instead; retest on the Pixel the same day: after a 15 s Wi-Fi drop the app had two more queue resets and kept its one connection for 6 minutes. The queue still backs up to 2 s on home Wi-Fi, which adds delay | Not for the first show until the fix is merged and a show-length run with drops passes; Larix with the same settings |
 | A rollback restarts sapflow and needs a command on the host | The command prepared and typed in before doors (section 3); timed in phase B; sapflow stops on SIGTERM at once |
 | mediamtx has SRT off: an SRT performer has no SRT fallback | RTMP first; an SRT encoder also holds the RTMP connection |
 | No wired Linux load test; the largest all-viewers-playing measurement through Caddy over HTTP/2 is 50 viewers (250 reached 0 failed requests with the pool at 1024, but on a shared Mac behind Docker Desktop, link-bound) | Planned peak 50 concurrent, closed beta only, the pool at 1024, watches for 5xx and CPU, R5 as the way out. The 750-viewer numbers are single-machine macOS |

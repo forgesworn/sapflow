@@ -145,6 +145,7 @@ qualification.
 
 - [Goals and milestones](GOALS.md)
 - [Benchmarks against mediamtx, libsrt and gosrt](docs/benchmarks.md)
+- [M4 performance exercise and library measurement gates](docs/performance-exercise.md)
 - [Feature comparison with mediamtx and the libraries we replace](docs/comparison.md)
 - [Standalone mobile broadcaster and SDK delivery plan](docs/mobile-streaming-plan.md)
 - [Native performance and ForgeSworn library reuse](docs/native-performance-contract.md)
