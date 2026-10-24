@@ -143,7 +143,7 @@ final class RecordingCatalogue {
         let device: Int32
         let inode: UInt64
     }
-    private enum Owner { case writer(String), export(String), preflight }
+    private enum Owner { case writer(String), export(String), checkpointRead(String), preflight }
     private let root: Directory
     private let legacy: Directory?
     private let closeFileDescriptor: (Int32) -> Int32
@@ -185,6 +185,7 @@ final class RecordingCatalogue {
     private let checkpointIO: CheckpointIO
     // Strongly own the sole actual append child even if its caller drops it.
     // Clear only after checked close and all receipt work, together with token.
+    private var checkpointReadOwner: CheckpointRead?
     private var appendOwner: AppendWriter?
     private let lock = NSLock()
     private var owner: (token: UUID, kind: Owner)?
@@ -1231,6 +1232,251 @@ final class RecordingCatalogue {
             if let export { do { try export.close() } catch { poison(export) } }
             else if !cleanupUncertain { try release(token) }
             throw error
+        }
+    }
+    /// Explicit cold observation only. No pathname/descriptor or export right
+    /// escapes. The exact child remains rooted through SDK work and closes.
+    func beginCheckpointRead(selected: Entry) throws -> CheckpointRead {
+        guard selected.location == .privateRecording, selected.state == .incomplete,
+              let identity = selected.identity, selected.file != nil,
+              selected.receipt != nil, selected.receiptFile != nil else { throw Failure.ineligible }
+        let token = try reserve(.checkpointRead(selected.segmentID))
+        let child = CheckpointRead(catalogue: self, token: token, selected: selected, identity: identity)
+        lock.lock(); checkpointReadOwner = child; lock.unlock()
+        return child
+    }
+    private func releaseCheckpointRead(_ token: UUID, child: CheckpointRead) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !uncertain, owner?.token == token, checkpointReadOwner === child else { throw Failure.closed }
+        checkpointReadOwner = nil; owner = nil
+    }
+    final class CheckpointRead {
+        /// Exact single worker use, held across real SDK decode and hash calls.
+        final class Use { fileprivate init() {} }
+        final class Snapshot {
+            let identity: Identity
+            let bindings: AppendBindings
+            let slots: [Data?] // Outside bytes, NOT parsed checkpoint authority.
+            let mediaBytes: UInt64
+            fileprivate init(identity: Identity, bindings: AppendBindings, slots: [Data?], mediaBytes: UInt64) {
+                self.identity = identity; self.bindings = bindings; self.slots = slots; self.mediaBytes = mediaBytes
+            }
+        }
+        struct HashFacts { let currentHeaderSHA256: Data; let fragmentHashes: [Data] }
+        private final class Resource {
+            let name: String; let fd: Int32; let source: AppendSource; let file: Fingerprint
+            var closeAttempted = false
+            init(name: String, fd: Int32, source: AppendSource, file: Fingerprint) {
+                self.name = name; self.fd = fd; self.source = source; self.file = file
+            }
+        }
+        private let catalogue: RecordingCatalogue
+        private let token: UUID
+        private let selected: Entry
+        private let identity: Identity
+        private let worker = Thread.current
+        private let lock = NSLock()
+        private enum Phase { case open, closing, retained, closed }
+        private var phase = Phase.open
+        private var cancelled = false
+        private var inFlight = false
+        private var use: Use?
+        private var snapshotValue: Snapshot?
+        private var resources: [Resource] = [] // At most receipt + media + two slots.
+        private var metadata: [String: Data] = [:]
+        private var absentSlots: [String] = []
+        private var media: Resource?
+        fileprivate init(catalogue: RecordingCatalogue, token: UUID, selected: Entry, identity: Identity) {
+            self.catalogue = catalogue; self.token = token; self.selected = selected; self.identity = identity
+        }
+        var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return phase == .closed }
+        func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+        private func onWorker() throws { guard Thread.current === worker else { throw Failure.busy } }
+        // Lifetime Use reserves the child across SDK work. This separate
+        // scalar guard forbids reentrant retirement/nested IO while a read or
+        // close is actually on the stack. No callback or IO runs under lock.
+        private func enterOperation() throws {
+            try onWorker(); lock.lock(); defer { lock.unlock() }
+            guard !inFlight else { throw Failure.busy }; inFlight = true
+        }
+        private func leaveOperation() { lock.lock(); inFlight = false; lock.unlock() }
+        private func admission() throws {
+            lock.lock(); let stopped = cancelled; lock.unlock()
+            guard !stopped else { throw Failure.cancelled }
+        }
+        private func checkUse(_ value: Use, snapshot: Snapshot? = nil) throws {
+            try onWorker()
+            lock.lock(); let active = phase == .open && use === value; lock.unlock()
+            guard active, snapshot == nil || snapshotValue === snapshot else { throw Failure.closed }
+            try admission()
+        }
+        func start() throws -> Use {
+            try enterOperation(); defer { leaveOperation() }
+            lock.lock(); defer { lock.unlock() }
+            guard phase == .open, !cancelled else { throw Failure.closed }
+            guard use == nil else { throw Failure.busy }
+            let value = Use(); use = value; return value
+        }
+        private func checkRoot() throws {
+            try catalogue.check(catalogue.root)
+            let actual = try RecordingCatalogue.directory(catalogue.root.url, catalogue.root.fd, privateRoot: true)
+            guard actual.device == catalogue.root.device, actual.inode == catalogue.root.inode else { throw Failure.changed }
+        }
+        private var temporaryNames: [String] {
+            ["Sapflow-\(identity.segmentID).checkpoint.tmp", "Sapflow-\(identity.segmentID).receipt.tmp"]
+        }
+        private func checkTemporaries() throws {
+            for name in temporaryNames { guard try catalogue.info(catalogue.root, name) == nil else { throw Failure.changed } }
+        }
+        private func open(_ name: String, limit: Int) throws -> Resource {
+            try admission(); try checkRoot()
+            let before = try catalogue.appendPath(name)
+            guard before.file.size >= 0, before.file.size <= Int64(limit), resources.count < 4 else { throw Failure.capacity }
+            let fd = openat(catalogue.root.fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { throw Failure.io }
+            // Retain actual FD BEFORE fstat or any later throwing check.
+            let value = Resource(name: name, fd: fd, source: before.source, file: before.file); resources.append(value)
+            let actual = try catalogue.appendDescriptor(fd), named = try catalogue.appendPath(name)
+            guard actual.source == value.source, actual.file == value.file,
+                  named.source == actual.source, named.file == actual.file else { throw Failure.changed }
+            try admission(); return value
+        }
+        private func read(_ value: Resource, count: Int, offset: UInt64 = 0) throws -> Data {
+            guard !value.closeAttempted, count >= 0, offset <= UInt64(Int64.max),
+                  UInt64(count) <= UInt64(value.file.size), offset <= UInt64(value.file.size) - UInt64(count),
+                  lseek(value.fd, off_t(offset), SEEK_SET) == off_t(offset) else { throw Failure.changed }
+            var bytes = Data(count: count), position = 0
+            while position < count {
+                try admission()
+                let n = bytes.withUnsafeMutableBytes { catalogue.checkpointIO.read(value.fd, $0.baseAddress!.advanced(by: position), count - position) }
+                if n < 0 && errno == EINTR { continue }
+                guard n > 0, n <= count - position else { throw Failure.io }; position += n
+                try admission()
+            }
+            return bytes
+        }
+        /// Untrusted snapshots only. Actual SDK composition retains this Use.
+        func snapshot(_ value: Use) throws -> Snapshot {
+            try enterOperation(); defer { leaveOperation() }
+            try checkUse(value); guard snapshotValue == nil, resources.isEmpty else { throw Failure.busy }
+            try checkRoot(); try checkTemporaries()
+            let receiptName = catalogue.receiptName(identity)
+            let receipt = try open(receiptName, limit: RecordingCatalogue.maxReceipt)
+            guard receipt.file == selected.receiptFile else { throw Failure.changed }
+            let bytes = try read(receipt, count: Int(receipt.file.size)); metadata[receiptName] = bytes
+            guard bytes == selected.receipt, let decoded = catalogue.decode(bytes, identity.segmentID),
+                  decoded.identity == identity, let source = decoded.appendSource else { throw Failure.ineligible }
+            // Media length is bounded by signed actual IO, never a metadata claim.
+            let file = try open(identity.filename, limit: Int.max); media = file
+            guard file.file == selected.file, file.source == source,
+                  source.rootDevice == catalogue.root.device, source.rootInode == catalogue.root.inode else { throw Failure.changed }
+            var slots: [Data?] = []
+            for slot in 0..<2 {
+                let name = "Sapflow-\(identity.segmentID).checkpoint.\(slot)"
+                if try catalogue.info(catalogue.root, name) == nil { absentSlots.append(name); slots.append(nil) }
+                else {
+                    let descriptor = try open(name, limit: 66_080)
+                    let data = try read(descriptor, count: Int(descriptor.file.size)); metadata[name] = data; slots.append(data)
+                }
+            }
+            let result = Snapshot(identity: identity, bindings: try source.bindings(identity: identity), slots: slots,
+                                  mediaBytes: UInt64(file.file.size))
+            try recheck(); try checkUse(value); snapshotValue = result; return result
+        }
+        /// Caller scalars select bounded reads only; these are NOT SDK facts.
+        func hashPrefixes(_ value: Use, snapshot: Snapshot, initialLength: UInt32,
+                          committedOffsets: [UInt64], maximumFragmentBytes: UInt64) throws -> HashFacts {
+            try enterOperation(); defer { leaveOperation() }
+            try checkUse(value, snapshot: snapshot)
+            guard let media, (1...65_536).contains(initialLength), (1...2).contains(committedOffsets.count),
+                  committedOffsets == committedOffsets.sorted(), Set(committedOffsets).count == committedOffsets.count,
+                  let last = committedOffsets.last, UInt64(initialLength) < committedOffsets[0],
+                  last <= snapshot.mediaBytes, last <= UInt64(Int64.max),
+                  last - UInt64(initialLength) <= maximumFragmentBytes else { throw Failure.capacity }
+            try recheck()
+            let header = try read(media, count: Int(initialLength))
+            guard lseek(media.fd, off_t(initialLength), SEEK_SET) == off_t(initialLength) else { throw Failure.io }
+            var hasher = SHA256(), scratch = Data(count: 65_536), position = UInt64(initialLength), hashes: [Data] = []
+            for end in committedOffsets {
+                while position < end {
+                    try checkUse(value, snapshot: snapshot)
+                    let count = Int(min(65_536, end - position))
+                    let n = scratch.withUnsafeMutableBytes { catalogue.checkpointIO.read(media.fd, $0.baseAddress!, count) }
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0, n <= count else { throw Failure.io }
+                    hasher.update(data: scratch.prefix(n)); position += UInt64(n)
+                    try checkUse(value, snapshot: snapshot)
+                }
+                let prefix = hasher; hashes.append(Data(prefix.finalize()))
+            }
+            try recheck(); try checkUse(value, snapshot: snapshot)
+            return HashFacts(currentHeaderSHA256: Data(SHA256.hash(data: header)), fragmentHashes: hashes)
+        }
+        private func recheckNamespace() throws {
+            try checkRoot(); try checkTemporaries()
+            for value in resources {
+                let named = try catalogue.appendPath(value.name)
+                guard named.source == value.source, named.file == value.file else { throw Failure.changed }
+            }
+            for name in absentSlots { guard try catalogue.info(catalogue.root, name) == nil else { throw Failure.changed } }
+        }
+        private func recheck() throws {
+            try recheckNamespace()
+            for value in resources {
+                guard !value.closeAttempted else { throw Failure.closed }
+                let actual = try catalogue.appendDescriptor(value.fd)
+                guard actual.source == value.source, actual.file == value.file else { throw Failure.changed }
+            }
+        }
+        /// Successful close is still only an observation, not a recovery right.
+        func finish(_ value: Use, snapshot: Snapshot) throws {
+            try enterOperation(); defer { leaveOperation() }
+            guard snapshotValue === snapshot else { throw Failure.closed }
+            try terminate(value, checked: true)
+        }
+        func abort(_ value: Use) throws {
+            try enterOperation(); defer { leaveOperation() }
+            try terminate(value, checked: false)
+        }
+        func close() throws {
+            try enterOperation(); defer { leaveOperation() }
+            lock.lock(); let active = use != nil; let done = phase == .closed; lock.unlock()
+            if done { return }; guard !active else { throw Failure.busy }
+            try terminate(nil, checked: false)
+        }
+        private func terminate(_ value: Use?, checked: Bool) throws {
+            try onWorker(); lock.lock()
+            if phase == .closed {
+                lock.unlock()
+                if checked { throw Failure.closed } // Abort is not a checked finish.
+                return
+            }
+            guard phase == .open, use === value else { lock.unlock(); throw Failure.closed }
+            phase = .closing; lock.unlock()
+            var failure: Error?, unknown: Error?
+            if checked {
+                do {
+                    try admission(); try recheck()
+                    for item in resources where metadata[item.name] != nil {
+                        guard try read(item, count: Int(item.file.size)) == metadata[item.name] else { throw Failure.changed }
+                    }
+                    try recheck(); try admission()
+                } catch { failure = error }
+            }
+            for item in resources.reversed() where !item.closeAttempted {
+                item.closeAttempted = true
+                do { try catalogue.closeFD(item.fd) } catch { if unknown == nil { unknown = error } }
+            }
+            if let unknown {
+                lock.lock(); phase = .retained; lock.unlock(); catalogue.poison(self); throw unknown
+            }
+            if checked && failure == nil {
+                do { try recheckNamespace(); try admission() } catch { failure = error }
+            }
+            do { try catalogue.releaseCheckpointRead(token, child: self) }
+            catch { lock.lock(); phase = .retained; lock.unlock(); catalogue.poison(self); throw error }
+            lock.lock(); phase = .closed; use = nil; lock.unlock()
+            if let failure { throw failure }
         }
     }
     final class Export {

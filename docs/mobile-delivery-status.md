@@ -14,8 +14,8 @@ packages from stable current sources, then qualify that decoder/sink path
 alongside concrete source-generation and capture closure and paired presentation.
 Raw native timestamps and their original failed clock gates remain unchanged. Explicit native and checked independent
 readers already return the required 2,765, 48,000 and 2,765 programme frames from
-the original generated SDK files, but the paired native recorder control remains
-unsupported. The original stock-reader and fifteen metadata-profile failures
+the original generated SDK files, but paired native recorder presentation remains
+unqualified. The original stock-reader and fifteen metadata-profile failures
 remain unchanged. Durable checkpoint installation and crash recovery, the
 aggregate two-second source-presentation loss bound, complete shows on both
 phones, matched competitor performance and release still follow. The existing
@@ -55,6 +55,15 @@ preserve the original AAC packets and exact coded clocks in all three registered
 cases (five, 49 and five packets). This clears their file-format prerequisite;
 it does not qualify decoding, paired presentation or application admission.
 Both results are detailed in the [recording recovery record](recording-recovery.md).
+
+The iOS catalogue now has a read-only checkpoint child that retains actual file
+descriptors and the existing library lease across metadata reads, bounded prefix
+hashing and checked close. Its SDK-free host gate passes 104 tests, including 15
+new ownership and refusal controls, with unchanged inputs and clean process /
+scratch closure. Its slot snapshots remain untrusted; actual SDK decoding,
+successor selection, recover-to-new-file and physical acceptance remain open.
+The [read-owner record](recording-recovery.md#ios-cold-checkpoint-read-owner)
+retains the exact scope and private evidence location.
 
 The earlier audio retirement regression gate passes 674 Debug tests, 664
 Qualification tests and 38 Python controls, totalling 1,376, with no failures,

@@ -277,6 +277,40 @@ The following operation adds checked header installation. Neither app recorder
 has adopted this composition by default. Crash recovery, physical storage
 qualification and the aggregate two-second loss bound remain open.
 
+## iOS cold checkpoint read owner
+
+`RecordingCatalogue.beginCheckpointRead` adds a read-only child under the
+existing catalogue lease and root flock. It opens the selected incomplete
+recording, canonical receipt and two optional checkpoint slots through retained
+private descriptors. Actual root/media identities and persisted `AppendSource`
+derive the external bindings. Replacements, unsafe modes or links, occupied
+temporary names and changed present or absent slot names refuse completion.
+
+One worker use spans metadata reads, future SDK work, hashing and checked close.
+The child returns bounded untrusted slot bytes, never a decoded checkpoint or
+recovery capability. Up to two requested fragment-prefix hashes share one
+64 KiB streaming pass with an explicit byte budget. The current header hash is
+diagnostic: an interrupted final-header overwrite need not match the original
+INITIAL. Descriptors and names are rechecked and metadata is reread before
+checked completion. Reentrant retirement is fenced while IO is active; an
+unchecked abort cannot later report a checked finish. Uncertain closes retain
+the exact aggregate child and catalogue lease without retrying numeric FDs.
+
+The SDK-free host gate passes 104 XCTest controls: the unchanged 89 catalogue,
+storage and timing tests plus 15 new read-owner tests. These exercise real
+partial reads and hashes, replacements, links, cancellation, reentrant abort /
+finish, stale observations and ambiguous close ownership. All 23 protected
+inputs remain unchanged, both compiler/test process groups close, and task
+scratch is removed. Actual logs and independent review are retained privately
+under `target/privacy-standby/ios-cold-checkpoint-host-actual-v3/`.
+
+These are host filesystem results using deliberately untrusted metadata bytes.
+Actual shared-SDK slot decoding, conservative successor selection and positive
+recovery eligibility remain unimplemented here and require a fresh matching SDK
+gate. This child creates no recovered file and changes no recorder default.
+Playable recovery, process/power-loss durability and the aggregate two-second
+source-presentation loss bound remain open.
+
 ## iOS submitted-input finalisation
 
 The `finishStoredInputs()` entry point finishes only the SDK inputs it actually

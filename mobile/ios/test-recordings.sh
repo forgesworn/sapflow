@@ -12,13 +12,15 @@ mkdir "$sapflow_scratch/tmp"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/RecordingCatalogueTests.swift" > "$sapflow_scratch/main.swift"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/RecordingStorageTests.swift" >> "$sapflow_scratch/main.swift"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/AudioRecordingTimingTests.swift" >> "$sapflow_scratch/main.swift"
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/RecordingCheckpointReadTests.swift" >> "$sapflow_scratch/main.swift"
 cat >> "$sapflow_scratch/main.swift" <<'SWIFT'
 let suite = XCTestSuite(name: "Private recording filesystem lifecycle")
 suite.addTest(RecordingCatalogueTests.defaultTestSuite)
 suite.addTest(RecordingStorageTests.defaultTestSuite)
 suite.addTest(AudioRecordingTimingTests.defaultTestSuite)
+suite.addTest(RecordingCheckpointReadTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 89, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 104, result.hasSucceeded else { exit(1) }
 SWIFT
 swiftc -swift-version 5 -warnings-as-errors -module-cache-path "$sapflow_scratch/modules" \
   -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \
