@@ -1942,6 +1942,40 @@ are unchanged. Full registered presentation qualification, SDK recorder adoption
 durable recovery, the aggregate two-second loss bound, physical shows,
 performance and release remain open.
 
+### Android source preservation before publishing
+
+The internal `PRESERVE_SOURCE_UNATTESTED` mode now connects the real Android
+audio callback, existing sixteen transfer slots and coalesced handoff to the
+SDK's paired AAC timing views. It validates one original compressed sample and
+shares its payload between recording and publishing. Signed native timestamps
+remain separate from the declared nonnegative application-coded ordinal.
+Negative or early replacement output can reach recording while publishing is
+intentionally withheld, without counting a publishing drop or privacy readiness.
+Existing callers retain `LEGACY_PUBLISHING` by default.
+
+An uncertain SDK acquisition or sample close quarantines its exact transfer
+slot. The actual audio-owner and controller retirement gates include these
+slots even after queue accounting reaches zero. A queue becoming empty cannot
+make an owner with uncertain cleanup safe to discard or replace.
+
+The current Android check passed 760 debug and 731 qualification JVM tests,
+including all 19 new source, queue and retirement regressions in both
+configurations. Debug, qualification and release APK builds, all three lint
+checks and qualification isolation passed. A synthetic host control compiled
+the production transfer/clock/handoff with the installed SDK classes and checked
+five recording samples, three publishing samples, two generations, signed
+timestamp provenance, no publishing drops and known owner closure. These
+synthetic bytes are not playable AAC or native encoder observations. The
+existing SDK packages were reused; this is not a fresh whole-SDK build.
+
+This mode does not establish native AU packing, input frame counts, leading or
+trailing frames, source EOF, waveform equivalence or recorder adoption. The
+existing private recording backend remains unchanged. Recovery, the aggregate
+two-second loss bound, physical-device and performance qualification remain
+separate requirements. The approved checked playback clock and all original
+native-clock failures remain unchanged.
+
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC

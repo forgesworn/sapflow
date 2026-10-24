@@ -25,6 +25,7 @@ import android.view.Surface
 import dev.forgesworn.sapflow.MediaCodec as RustCodec
 import dev.forgesworn.sapflow.NativeSampleFanout
 import dev.forgesworn.sapflow.MediaSample
+import dev.forgesworn.sapflow.NativeAacTimingViews
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -76,6 +77,7 @@ data class CaptureSnapshot(
 /** Native surfaces carry raw video. PCM stays in AudioRecord/MediaCodec input.
  * Only compressed direct buffers cross the synchronous borrowed-byte FFI. */
 class CaptureController internal constructor(private val context: Context,
+    private val audioSampleMode: AudioSampleMode = AudioSampleMode.LEGACY_PUBLISHING,
     private val backgroundStartAllowed: (CaptureStartAdmission.Preparation) -> Boolean = { false }) {
     private val thread = HandlerThread("sapflow-codecs").apply { start() }
     private val handler = Handler(thread.looper)
@@ -683,6 +685,9 @@ class CaptureController internal constructor(private val context: Context,
             onFormat = { config -> if(token==drainGeneration) publishingSink?.configure(videoCodec,config) },
             onSample = { sample,tick,nativeGeneration,zeroOnly -> if(token==drainGeneration) {
                 acceptedAudio.incrementAndGet(); submitSample(sample,token,rawRun,tick,nativeGeneration,zeroOnly)
+            } },sampleMode = audioSampleMode,
+            onTimingViews = { views,tick,nativeGeneration,zeroOnly -> if(token==drainGeneration) {
+                acceptedAudio.incrementAndGet(); submitSample(null,token,rawRun,tick,nativeGeneration,zeroOnly,timingViews=views)
             } },onValidated = {},onPriming = { audioPrimingRejects.incrementAndGet() },
             onFailure = { reason -> if(token==drainGeneration) fail(reason) },
             onRoute = { name -> if(token==drainGeneration) activeAudioInput=name })
@@ -697,7 +702,9 @@ class CaptureController internal constructor(private val context: Context,
         // A live owner is registered only after real native construction. A
         // zero-only initial owner must be admitted through zeroAudioReady.
         check(!audio.failed) { "Native AAC preparation failed" }
-        queues = NativeSampleFanout(4uL * 1024uL * 1024uL, 8uL * 1024uL * 1024uL, 2000u, captureIntent.hasVideo)
+        queues = if (audioSampleMode == AudioSampleMode.PRESERVE_SOURCE_UNATTESTED)
+            NativeSampleFanout.withAacTimingViews(4uL * 1024uL * 1024uL, 8uL * 1024uL * 1024uL, 2000u, captureIntent.hasVideo)
+        else NativeSampleFanout(4uL * 1024uL * 1024uL, 8uL * 1024uL * 1024uL, 2000u, captureIntent.hasVideo)
         publishing = QueueDrainer(handler, queues!!, true, publishingSink, { fail(it) })
         recording = QueueDrainer(handler, queues!!, false, exactRecordingSink,
             { reason -> if (token == drainGeneration && recordingSink === exactRecordingSink) failRecording(reason) }, sourceRecorder)
@@ -871,7 +878,7 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     /** Borrowed immutable owner; all fanout calls remain on this handler. */
-    private fun submitSample(sample: MediaSample, token: Long, rawRun: CameraRunAdmission, tick: Long, audioGeneration: Long? = null, zeroOnly: Boolean = false, independentIdr: Boolean = false) {
+    private fun submitSample(sample: MediaSample?, token: Long, rawRun: CameraRunAdmission, tick: Long, audioGeneration: Long? = null, zeroOnly: Boolean = false, independentIdr: Boolean = false, timingViews: NativeAacTimingViews? = null) {
         val mediaNow=System.nanoTime()
         val outputRun=privacyRun
         if(outputRun!=null && privacy?.permitsOutput(outputRun,mediaNow)==false) {
@@ -891,11 +898,16 @@ class CaptureController internal constructor(private val context: Context,
             return
         }
         val nowNs = SystemClock.elapsedRealtimeNanos()
-        val result = try { queues!!.push(sample, nowNs.toULong()) }
+        val result = try {
+            if (timingViews != null) {
+                check(sample == null && audioGeneration != null && audioSampleMode == AudioSampleMode.PRESERVE_SOURCE_UNATTESTED)
+                queues!!.pushAacTimingViews(timingViews, nowNs.toULong())
+            } else queues!!.push(checkNotNull(sample), nowNs.toULong())
+        }
         catch (error: Throwable) { runAdmission.recordingSource.fail(); throw error }
         if (result.recordingQueued) recording?.recordingAccepted()
         val command=privacyCommand;val policy=privacy
-        if(command!=null && policy!=null && policy.needsOutputProof(command) && policy.permitsReplacement(command,System.nanoTime())) {
+        if(!AudioSourceAdmission.publishingWithheld(timingViews != null, tick) && command!=null && policy!=null && policy.needsOutputProof(command) && policy.permitsReplacement(command,System.nanoTime())) {
             if(policy.branchesAccepted(result.publishingQueued,result.recordingQueued)) {
                 val proof=if(audioGeneration!=null && zeroOnly) policy.zeroAudioEncoded(command,audioGeneration,tick,1024,System.nanoTime())
                     else if(audioGeneration==null) policy.pictureEncoded(command,tick,independentIdr,System.nanoTime()) else null
@@ -915,7 +927,7 @@ class CaptureController internal constructor(private val context: Context,
                 }
             }
         }
-        if (!result.publishingQueued) {
+        if (AudioSourceAdmission.countPublishingDrop(timingViews != null, tick, result.publishingQueued)) {
             drops.incrementAndGet()
             if (result.publishingWaitingKeyframe) waitingKeyframeRejects.incrementAndGet() else queueRejects.incrementAndGet()
         }

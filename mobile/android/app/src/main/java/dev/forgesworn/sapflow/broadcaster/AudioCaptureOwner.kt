@@ -11,6 +11,7 @@ import android.media.MediaRecorder
 import android.os.Handler
 import dev.forgesworn.sapflow.MediaCodec as RustCodec
 import dev.forgesworn.sapflow.MediaSample
+import dev.forgesworn.sapflow.NativeAacTimingViews
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ArrayBlockingQueue
@@ -38,6 +39,8 @@ internal class AudioCaptureOwner(
     private val replacementAdmission: (PrivacyStandbyPolicy.Command,Long) -> PrivacyStandbyPolicy.NativeAdmission,
     private val onFormat: (RustCodec) -> Unit,
     private val onSample: (MediaSample, Long, Long, Boolean) -> Unit,
+    private val sampleMode: AudioSampleMode,
+    private val onTimingViews: (NativeAacTimingViews, Long, Long, Boolean) -> Unit,
     private val onValidated: () -> Unit,
     private val onPriming: () -> Unit,
     private val onFailure: (String) -> Unit,
@@ -46,6 +49,7 @@ internal class AudioCaptureOwner(
     private enum class Mode { RAW, ZERO, ALIGNED_RAW, RETIRING }
     private val lifecycle = AudioGenerationLifecycle(serials.get())
     private val timeline = AudioGenerationClock()
+    private val sourceCursor = AudioSourceCursor()
     val descriptor: RustCodec = RustCodec.aac(ByteBuffer.allocateDirect(2).apply { put(0x11); put(0x88.toByte()); flip() })
     private val native = ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,ArrayBlockingQueue(3),
         { work -> Thread(work,"sapflow-audio-native-close") },ThreadPoolExecutor.AbortPolicy())
@@ -151,7 +155,10 @@ internal class AudioCaptureOwner(
                 onHandoffIdle = { if (active === g && g.handoffSealed && (g.encoded?.outstanding ?: 0) == 0) {
                     g.observation.handoffIdle(ticket.serial)
                     act(g,lifecycle.handoffIdle(ticket))
-                } })
+                } }, sampleMode = sampleMode, sourceCursor = sourceCursor,
+                onTimingViews = { views, tick, generation ->
+                    if (active === g && !lifecycle.actualClosed(ticket)) onTimingViews(views, tick, generation, g.beganZero && !g.everRaw.get())
+                })
             g.encoded = encoded
             codec.setCallback(encoded,audioCallbacks)
             AudioAacEncoderConfiguration.configure(codec,bitrate)
