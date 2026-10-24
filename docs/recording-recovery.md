@@ -2030,10 +2030,30 @@ excluded it from the recovered copy. Observed unrecovered source spans were:
 | Audio/video, drained prefix | 288015 / 720000 seconds, about 0.400 seconds |
 | Audio, interrupted partial append | 52801 / 48000 seconds, about 1.100 seconds |
 
-These are finite host process-interruption results. They establish neither a
-sustained recording's two-second guarantee nor physical power-loss durability.
-Recovered native and independent playback, fixed positive seeks, paired waveform
-qualification, device shows, resource use and default-backend adoption remain
+Native readers subsequently decoded all three recovered prefixes and returned
+their source-declared audio lengths: 186,304, 172,992 and 139,200 frames. All
+whole and fixed positive audio reads had the actual signed 16-bit mono 48 kHz
+format, exact raw and output clocks, and known completed readers. Each fixed
+seek returned exactly 24,000 frames from the declared interval beginning at
+24,000; its bytes also matched that interval in the unchanged whole native read.
+The A/V file returned all 108 pictures and the expected 15-picture seek window
+with exact raw and output presentation timestamps. Native picture durations and
+decode timestamps remained invalid; the original duration and combined-clock
+strict diagnostics remain false. No duration was substituted.
+
+A separate 17-command FFprobe/FFmpeg check retained every sealed AAC and H.264
+packet's payload hash, size, per-track order, count and exact coded timestamps
+and durations. Independent whole audio counts matched the same declared prefix
+extents. All three fixed independent audio seeks were byte-exact against their
+unchanged whole-read intervals. Whole and seek video frame counts, timestamps,
+durations and corresponding frame hashes matched. Normal-reader metadata and
+all native strict diagnostics remain separately retained. This check did not
+repeat native decoding or compare lossy AAC output against raw source PCM.
+
+These are finite host process-interruption and recovered-prefix readback results.
+They establish neither a sustained recording's two-second guarantee nor physical
+power-loss durability. Paired waveform qualification, complete programme EOF and
+tail authority, device shows, resource use and default-backend adoption remain
 separate gates. The original numerical contract, raw timestamp evidence and
 earlier failed strict checks remain unchanged.
 
