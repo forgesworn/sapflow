@@ -20,11 +20,37 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Read only the workspace package table, never a dependency/crate version.
+// Native packaging uses this same double-quoted Cargo version as its filename.
+fun workspacePackageVersion(manifest: String): String {
+    var packageTable = false
+    var tables = 0
+    val versions = mutableListOf<String>()
+    for (line in manifest.lineSequence()) {
+        val value = line.trim()
+        if (value.startsWith("[")) {
+            packageTable = Regex("""^\[workspace\.package]\s*(?:#.*)?$""").matches(value)
+            if (packageTable) tables++
+        } else if (packageTable && Regex("""^version\s*=""").containsMatchIn(value)) {
+            val match = Regex("""^version\s*=\s*"([^"]+)"\s*(?:#.*)?$""").matchEntire(value)
+                ?: error("Expected a double-quoted workspace.package.version")
+            versions += match.groupValues[1]
+        }
+    }
+    require(tables == 1 && versions.size == 1) { "Expected one workspace.package.version" }
+    val version = versions.single()
+    require(version.length <= 128 && Regex("""[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?""").matches(version)) {
+        "Expected a filename-safe workspace.package.version"
+    }
+    return version
+}
+
 // Development-only override for a real package built from the same generated
 // bindings and device ABI. Default remains the complete four-ABI SDK package.
 val sapflowAarOverride = providers.gradleProperty("sapflowAar").orNull
 val sapflowAarFile = if (sapflowAarOverride == null) {
-    file("../../../target/native-packages/android/sapflow-0.0.0.aar")
+    val version = workspacePackageVersion(providers.fileContents(rootProject.layout.projectDirectory.file("../../Cargo.toml")).asText.get())
+    file("../../../target/native-packages/android/sapflow-$version.aar")
 } else {
     require(File(sapflowAarOverride).isAbsolute) { "sapflowAar must be an absolute path" }
     file(sapflowAarOverride)
@@ -113,7 +139,7 @@ tasks.register("verifyQualificationIsolation") {
             check(debugJava !in sources.java.srcDirs.map { it.canonicalFile })
             check(debugResources !in sources.res.srcDirs.map { it.canonicalFile })
             check(sources.java.srcDirs.none { directory ->
-                directory.walkTopDown().any { it.name == "FfiBenchmarkActivity.kt" }
+                directory.walkTopDown().any { it.name in listOf("FfiBenchmarkActivity.kt", "NativeAacQualificationActivity.kt", "NativeAacQualificationProbe.kt") }
             })
         }
     }
@@ -131,6 +157,8 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    // Pure Apache-2.0 QR core, no Play services, MLKit, model or external scanner app.
+    implementation("com.google.zxing:core:3.5.4")
     // Newest Kotlin 2.2-metadata compatible release. 0.23/0.24 require Kotlin 2.3.
     implementation("fr.acinq.secp256k1:secp256k1-kmp-jvm:0.22.0")
     implementation("fr.acinq.secp256k1:secp256k1-kmp-jni-android:0.22.0")

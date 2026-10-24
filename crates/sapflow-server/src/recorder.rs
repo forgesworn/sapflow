@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sapflow_core::recording::{is_recording_name, recording_file, scoped_recording_file};
-use sapflow_core::{StreamEvent, StreamPath};
-use sapflow_hls::fmp4::{init_segment_for_file, rebase_part_for_file};
+use sapflow_core::{RecordingTracks, StreamEvent, StreamPath};
+use sapflow_hls::fmp4::{init_segment_for_tracks, rebase_part_for_file};
 use sapflow_hls::muxer::Part;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -30,9 +30,43 @@ enum Msg {
     Part(Arc<Part>),
 }
 
+/// Cold construction policy for the currently accepted connection. Keeping it
+/// on the session lets terminal-only codec changes start the right scoped
+/// recording without retaining an App or any elementary media.
+pub struct RecorderFactory {
+    dir: PathBuf,
+    path: StreamPath,
+    callbacks: Callbacks,
+    min_free: u64,
+    runtime: tokio::runtime::Handle,
+}
+
+impl RecorderFactory {
+    pub fn new(dir: &Path, path: &StreamPath, callbacks: Callbacks, min_free: u64) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            path: path.clone(),
+            callbacks,
+            min_free,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    pub fn start(&self) -> Recorder {
+        Recorder::start_on(
+            &self.runtime,
+            &self.dir,
+            &self.path,
+            self.callbacks.clone(),
+            self.min_free,
+        )
+    }
+}
+
 pub struct Recorder {
     tx: Option<mpsc::Sender<Msg>>,
     started: bool,
+    initialization_id: Option<u64>,
     last_part: Option<u64>,
     observation: Option<RecordingObservation>,
     incomplete: Arc<AtomicBool>,
@@ -40,18 +74,39 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn start(dir: &Path, path: &StreamPath, callbacks: Callbacks, min_free: u64) -> Self {
+        Self::start_on(
+            &tokio::runtime::Handle::current(),
+            dir,
+            path,
+            callbacks,
+            min_free,
+        )
+    }
+
+    /// The factory retains the originating runtime handle. Terminal connection
+    /// Drop may run outside an ambient Tokio context; spawning on this handle
+    /// keeps writer ownership on that executor without creating another one.
+    /// The runtime itself must remain alive through actual writer completion.
+    pub fn start_on(
+        runtime: &tokio::runtime::Handle,
+        dir: &Path,
+        path: &StreamPath,
+        callbacks: Callbacks,
+        min_free: u64,
+    ) -> Self {
         let incomplete = Arc::new(AtomicBool::new(false));
         let Ok((callbacks, observation)) = callbacks.for_recording() else {
             return Self {
                 tx: None,
                 started: false,
+                initialization_id: None,
                 last_part: None,
                 observation: None,
                 incomplete,
             };
         };
         let (tx, rx) = mpsc::channel(QUEUE);
-        tokio::spawn(write(
+        runtime.spawn(write(
             dir.to_owned(),
             path.clone(),
             rx,
@@ -63,6 +118,7 @@ impl Recorder {
         Self {
             tx: Some(tx),
             started: false,
+            initialization_id: None,
             last_part: None,
             observation,
             incomplete,
@@ -94,10 +150,18 @@ impl Recorder {
         let mut ok = true;
         if !self.started {
             self.started = true;
+            self.initialization_id = parts.first().map(|part| part.initialization.id);
             ok = tx.try_send(Msg::Init(tracks)).is_ok();
         }
         for p in parts {
             if !ok {
+                break;
+            }
+            // Ingest can seal a changed epoch and then fail later in the
+            // same batch, before its restart update reaches Publication.
+            // Never append that codec's samples under this file's old init.
+            if self.initialization_id != Some(p.initialization.id) {
+                ok = false;
                 break;
             }
             let id = p.id;
@@ -108,7 +172,7 @@ impl Recorder {
         }
         if !ok {
             self.mark_incomplete();
-            tracing::error!("recording fell behind the stream; stopping this recording");
+            tracing::error!("recording cannot accept another part; stopping this recording");
             self.tx = None;
         }
     }
@@ -187,14 +251,21 @@ async fn write(
     incomplete: Arc<AtomicBool>,
 ) {
     // Wait for the first part before creating anything on disk.
-    let Some(Msg::Init((video, audio))) = rx.recv().await else {
+    let Some(Msg::Init(tracks)) = rx.recv().await else {
+        return;
+    };
+    let Some(recording_tracks) =
+        RecordingTracks::new(tracks.video().is_some(), tracks.audio().is_some())
+    else {
         return;
     };
     let mut receipt = WriteReceipt {
         observation: observation.clone(),
         completed: false,
     };
-    let init = init_segment_for_file(&video, audio.as_ref(), Duration::ZERO);
+    let Some(init) = init_segment_for_tracks(tracks.video(), tracks.audio(), Duration::ZERO) else {
+        return;
+    };
     let start = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -242,7 +313,7 @@ async fn write(
             }
             let output = match rebase_part_for_file(
                 &p.data,
-                audio.as_ref().map(|a| a.sample_rate),
+                tracks.audio().map(|a| a.sample_rate),
                 &mut origin,
             ) {
                 Ok(output) => output,
@@ -264,7 +335,10 @@ async fn write(
         observation.finalising();
     }
     // Now the length is known: rewrite the init in place (same size).
-    let final_init = init_segment_for_file(&video, audio.as_ref(), duration);
+    let Some(final_init) = init_segment_for_tracks(tracks.video(), tracks.audio(), duration) else {
+        tracing::error!(file = %file_path.display(), "recording header is invalid");
+        return;
+    };
     if failed
         || finalise_file(&mut file, init.len(), &final_init)
             .await
@@ -292,6 +366,7 @@ async fn write(
         StreamEvent::RecordSegmentComplete {
             segment_path: file_path.display().to_string(),
             duration_secs: (duration.as_secs_f64() * 1000.0).round() / 1000.0,
+            recording_tracks,
         },
     );
 }
@@ -419,15 +494,21 @@ mod tests {
         }
     }
     fn fixture_parts() -> (Tracks, Vec<Arc<Part>>) {
+        parts_from_generated(include_bytes!(
+            "../../sapflow-hls/tests/fixtures/testsrc-3s.ts"
+        ))
+    }
+    fn parts_from_generated(data: &[u8]) -> (Tracks, Vec<Arc<Part>>) {
         let mut ingest = sapflow_hls::TsIngest::new(sapflow_hls::MuxerConfig::default());
-        for bytes in include_bytes!("../../sapflow-hls/tests/fixtures/testsrc-3s.ts").chunks(1316) {
+        for bytes in data.chunks(1316) {
             ingest
                 .push(bytes, SystemTime::UNIX_EPOCH)
                 .expect("generated fixture");
         }
         let mut muxer = ingest.take_muxer().expect("muxer");
         muxer.interrupt(SystemTime::UNIX_EPOCH);
-        let tracks = (muxer.video().clone(), muxer.audio().copied());
+        let tracks = Tracks::new(muxer.video().cloned(), muxer.audio().copied())
+            .expect("generated nonempty tracks");
         let parts = (0..muxer.next_part_id())
             .map(|id| match muxer.part(id) {
                 sapflow_hls::PartLookup::Found(part) => part,
@@ -436,6 +517,63 @@ mod tests {
             .collect();
         (tracks, parts)
     }
+
+    #[test]
+    fn recording_track_identity_refuses_an_empty_initialization() {
+        assert!(Tracks::new(None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn audio_only_recordings_sync_without_video_and_preserve_incomplete_status() {
+        const MONO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/audio-48k-mono.ts");
+        const STEREO: &[u8] =
+            include_bytes!("../../sapflow-hls/tests/fixtures/audio-44k1-stereo.ts");
+        for (data, rate, channels) in [(MONO, 48_000, 1), (STEREO, 44_100, 2)] {
+            for incomplete in [false, true] {
+                let scratch = ScopedScratch::new("generated-audio");
+                let scope = crate::publish_observer::fixture_scope("audio", 1, 1, 1);
+                let (callbacks, mut receiver) = crate::callback::test_queue(scope.clone(), 2);
+                let (tracks, parts) = parts_from_generated(data);
+                assert!(tracks.video().is_none());
+                let audio = tracks.audio().expect("AAC track");
+                assert_eq!((audio.sample_rate, audio.channels), (rate, channels));
+                assert!(parts.len() > 10, "real independently written audio parts");
+                let duration = parts.iter().fold(Duration::ZERO, |d, part| d + part.span);
+                assert!(duration > Duration::from_secs(5));
+                let header = init_segment_for_tracks(tracks.video(), tracks.audio(), duration)
+                    .expect("nonempty audio initialization");
+                let mut recorder = Recorder::start(&scratch.0, &scope.key().path, callbacks, 0);
+                recorder.feed(tracks, parts);
+                if incomplete {
+                    recorder.mark_incomplete();
+                }
+                drop(recorder);
+                let queued = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+                    .await
+                    .expect("actual writer completion deadline")
+                    .expect("completion callback");
+                let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
+                let expected = if incomplete {
+                    "incomplete"
+                } else {
+                    "finalised"
+                };
+                assert_eq!(body["recordingState"], expected);
+                assert_eq!(
+                    body["recordingTracks"],
+                    serde_json::json!({"hasVideo": false, "hasAudio": true})
+                );
+                assert_eq!(scope.observations.recording_state(), expected);
+                let bytes = tokio::fs::read(body["segmentPath"].as_str().expect("file path"))
+                    .await
+                    .expect("synced generated file");
+                assert!(bytes.len() > header.len());
+                assert_eq!(&bytes[..header.len()], header.as_ref());
+                assert_eq!(receiver.len(), 0, "one completion per actual writer");
+            }
+        }
+    }
+
     async fn await_recording_state(scope: &crate::publish_observer::CallbackScope, expected: &str) {
         tokio::time::timeout(Duration::from_secs(3), async {
             while scope.observations.recording_state() != expected {
@@ -461,6 +599,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_refuses_missing_or_out_of_order_initialization_without_completion() {
+        for part_before_init in [false, true] {
+            let scratch = ScopedScratch::new("missing-init");
+            let scope = crate::publish_observer::fixture_scope("a", 1, 1, 1);
+            let (callbacks, receiver) = crate::callback::test_queue(scope.clone(), 1);
+            let (callbacks, observation) = callbacks.for_recording().expect("writer");
+            let (tx, rx) = mpsc::channel(2);
+            if part_before_init {
+                let (_, parts) = fixture_parts();
+                tx.send(Msg::Part(parts[0].clone()))
+                    .await
+                    .expect("first part");
+            }
+            drop(tx);
+            write(
+                scratch.0.clone(),
+                scope.key().path.clone(),
+                rx,
+                callbacks,
+                0,
+                observation,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+            assert_eq!(receiver.len(), 0);
+            assert_eq!(scope.observations.recording_state(), "never-started");
+            assert!(!scratch.0.join("live").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn real_file_completion_is_synced_before_scoped_callback_and_keeps_old_identity() {
         let scratch = ScopedScratch::new("complete");
         let scope = crate::publish_observer::fixture_scope("a", 1, 11, 3);
@@ -469,7 +638,8 @@ mod tests {
         let duration = parts
             .iter()
             .fold(Duration::ZERO, |duration, part| duration + part.span);
-        let expected_header = init_segment_for_file(&tracks.0, tracks.1.as_ref(), duration);
+        let expected_header = init_segment_for_tracks(tracks.video(), tracks.audio(), duration)
+            .expect("generated recording header");
         let mut recorder = Recorder::start(&scratch.0, &scope.key().path, callbacks.clone(), 0);
         recorder.feed(tracks, parts);
         assert_ne!(scope.observations.recording_state(), "finalised");
@@ -485,6 +655,10 @@ mod tests {
         assert_eq!(scope.observations.callback_state(), "pending");
         assert_eq!(body["event"], "recordSegmentComplete");
         assert_eq!(body["recordingState"], "finalised");
+        assert_eq!(
+            body["recordingTracks"],
+            serde_json::json!({"hasVideo": true, "hasAudio": true})
+        );
         assert_eq!(body["sessionId"], scope.key().session_id.as_str());
         assert_eq!(body["eventGeneration"], 1);
         assert_eq!(body["connectionEpoch"], 3);
@@ -547,6 +721,7 @@ mod tests {
         let mut recorder = Recorder {
             tx: Some(sender),
             started: false,
+            initialization_id: None,
             last_part: None,
             observation,
             incomplete: Arc::new(AtomicBool::new(false)),
@@ -646,6 +821,10 @@ mod tests {
                 let body: serde_json::Value =
                     serde_json::from_slice(&receiver.try_recv().expect("partial completion").body)
                         .expect("JSON");
+                assert_eq!(
+                    body["recordingTracks"],
+                    serde_json::json!({"hasVideo": true, "hasAudio": true})
+                );
                 assert_eq!(body["recordingState"], "incomplete");
                 assert_eq!(scope.observations.recording_state(), "incomplete");
                 assert_eq!(scope.observations.counts().recordings_finalised, 0);
@@ -765,6 +944,7 @@ mod tests {
                 StreamEvent::RecordSegmentComplete {
                     segment_path: "/fixture/recording.mp4".into(),
                     duration_secs: 1.0,
+                    recording_tracks: RecordingTracks::AudioVideo,
                 },
             );
             if fault == "none" {

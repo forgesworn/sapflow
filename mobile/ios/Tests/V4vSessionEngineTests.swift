@@ -59,7 +59,7 @@ final class V4vTypedContractsTests: XCTestCase {
     }
     func testFreshMediaRequiresExactCanonicalIdentityAndPaths() throws {
         XCTAssertNoThrow(try V4vFreshMedia(V4vFixture.fresh(), event: V4vFixture.event, epoch: 1))
-        for changes: [String: V4vJSON] in [["partPath": .string("https://evil.example.invalid/x")], ["initPath": .string("/live/\(V4vFixture.event)/abc_init0.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/abc_part02.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/def_part2.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/abc_part2.mp4?x")], ["hasVideo": .bool(false)], ["connectionEpoch": .integer(2)], ["decoded": .bool(true)]] {
+        for changes: [String: V4vJSON] in [["partPath": .string("https://evil.example.invalid/x")], ["initPath": .string("/live/\(V4vFixture.event)/abc_init0.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/abc_part02.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/def_part2.mp4")], ["partPath": .string("/live/\(V4vFixture.event)/abc_part2.mp4?x")], ["hasVideo": .bool(false), "hasAudio": .bool(false)], ["connectionEpoch": .integer(2)], ["decoded": .bool(true)]] {
             XCTAssertThrowsError(try V4vFreshMedia(V4vFixture.edit(V4vFixture.fresh(), changes), event: V4vFixture.event, epoch: 1))
         }
     }
@@ -125,6 +125,16 @@ final class V4vSessionEngineTests: XCTestCase {
         let op = try XCTUnwrap(e.pending)
         try e.applyResponse(V4vFixture.answer(), for: op, clock: V4vFixture.clock()); return op
     }
+    func testSmallPositiveGrantRetainsAuthorityWithoutChoosingCaptureQuality() throws {
+        let e = try engine(V4vMemoryJournal()); try login(e)
+        try e.stagePrepare(event: V4vFixture.event, expectedGeneration: 0, key: V4vFixture.key, clock: V4vFixture.clock())
+        let grant = V4vFixture.edit(V4vFixture.grant(), ["limits": .object(["maxPublishBps": .integer(1_000_000), "maxQueueBytes": .integer(65_536)])])
+        try e.applyResponse(V4vFixture.answer(grant: grant), for: XCTUnwrap(e.pending), clock: V4vFixture.clock())
+        XCTAssertNil(e.pending)
+        XCTAssertEqual(try e.captureGrant(clock: V4vFixture.clock()).maxPublishBps, 1_000_000)
+        XCTAssertEqual(try e.publishingGrant(clock: V4vFixture.clock()).grant.maxQueueBytes, 65_536)
+        XCTAssertThrowsError(try V4vGrant(V4vFixture.edit(grant, ["limits": .object(["maxPublishBps": .integer(0), "maxQueueBytes": .integer(65_536)])]), nowMs: V4vFixture.time))
+    }
     func testPrepareIsDurableBeforeAnyRequestAndFailurePoisonsAdmission() throws {
         let store = V4vMemoryJournal(); var fences = 0; let e = try engine(store, fence: { fences += 1 }); try login(e)
         store.fails = true
@@ -167,6 +177,64 @@ final class V4vSessionEngineTests: XCTestCase {
         XCTAssertEqual(try fields.uint("revision"), 2)
         let restored = try engine(store)
         XCTAssertTrue(restored.terminalIntent); XCTAssertEqual(restored.pending, e.pending)
+    }
+    func testRemoteEndReadCommitsTerminalOnlyScopeAtomicallyAndSurvivesRestart() throws {
+        let store = V4vMemoryJournal(); var fences = 0
+        let e = try engine(store, fence: { fences += 1 }); try login(e)
+        let requested = try V4vIdentity(V4vFixture.identity())
+        let read = try e.remoteEndStatusRequest(identity: requested, clock: V4vFixture.clock())
+        XCTAssertEqual(read.call.path, "/api/live-events/\(V4vFixture.event)/native-session/\(V4vFixture.sid)")
+        XCTAssertNil(e.session); XCTAssertFalse(e.terminalIntent)
+        try e.commitRemoteEnd(V4vFixture.answer(V4vFixture.session(2), grant: nil), for: read, clock: V4vFixture.clock(1))
+        XCTAssertGreaterThan(fences, 0); XCTAssertTrue(e.terminalIntent)
+        XCTAssertEqual(e.session?.identity.revision, 2); XCTAssertNil(e.pending)
+        XCTAssertThrowsError(try e.captureGrant(clock: V4vFixture.clock(1)))
+        XCTAssertThrowsError(try e.stageRefresh(key: String(repeating: "c", count: 32), clock: V4vFixture.clock(1)))
+        let saved = try XCTUnwrap(store.value).object(required: ["version", "apiOrigin", "clockFloorMs", "terminalIntent"],
+                                                      optional: ["pubkey", "bearer", "bearerExpiresMs", "session"])
+        XCTAssertTrue(try saved.flag("terminalIntent")); XCTAssertNotNil(saved["session"])
+        XCTAssertNil(saved["grant"]); XCTAssertNil(saved["grantPolicy"]); XCTAssertNil(saved["grantExpiryMs"])
+
+        let restored = try engine(store, clock: V4vFixture.clock(1))
+        XCTAssertTrue(restored.terminalIntent); XCTAssertEqual(restored.session?.identity.revision, 2); XCTAssertNil(restored.pending)
+        try restored.continueEnd(key: String(repeating: "e", count: 32), clock: V4vFixture.clock(1))
+        XCTAssertEqual(restored.pending?.kind, .end)
+        let body = try XCTUnwrap(restored.pending).body.object(required: ["revision", "idempotencyKey"])
+        XCTAssertEqual(try body.uint("revision"), 2)
+    }
+    func testRemoteEndRejectsLateWrongOrNonactiveStatusWithoutAdoption() throws {
+        func fresh() throws -> (V4vMemoryJournal, V4vSessionEngine, V4vRemoteEndRead) {
+            let store = V4vMemoryJournal(), e = try engine(store); try login(e)
+            let read = try e.remoteEndStatusRequest(identity: V4vIdentity(V4vFixture.identity()), clock: V4vFixture.clock())
+            return (store, e, read)
+        }
+        do {
+            let (store, e, read) = try fresh(); let saved = store.value
+            XCTAssertThrowsError(try e.commitRemoteEnd(V4vFixture.answer(V4vFixture.session(phase: "preparing"), grant: nil), for: read, clock: V4vFixture.clock(1)))
+            XCTAssertNil(e.session); XCTAssertFalse(e.terminalIntent); XCTAssertEqual(store.value, saved)
+        }
+        do {
+            let (store, e, read) = try fresh(); let saved = store.value
+            let other = V4vFixture.session(generation: 2, sid: String(repeating: "c", count: 32))
+            XCTAssertThrowsError(try e.commitRemoteEnd(V4vFixture.answer(other, grant: nil), for: read, clock: V4vFixture.clock(1)))
+            XCTAssertNil(e.session); XCTAssertFalse(e.terminalIntent); XCTAssertEqual(store.value, saved)
+        }
+        do {
+            let (store, e, read) = try fresh(); let saved = store.value
+            XCTAssertThrowsError(try e.commitRemoteEnd(V4vFixture.answer(grant: nil), for: read, clock: V4vFixture.clock(8_001)))
+            XCTAssertNil(e.session); XCTAssertFalse(e.terminalIntent); XCTAssertEqual(store.value, saved)
+        }
+    }
+    func testRemoteEndSaveFailureCannotExposeNonterminalSession() throws {
+        let store = V4vMemoryJournal(); var fences = 0
+        let e = try engine(store, fence: { fences += 1 }); try login(e)
+        let read = try e.remoteEndStatusRequest(identity: V4vIdentity(V4vFixture.identity()), clock: V4vFixture.clock())
+        let saved = store.value; store.fails = true
+        XCTAssertThrowsError(try e.commitRemoteEnd(V4vFixture.answer(V4vFixture.session(2), grant: nil), for: read, clock: V4vFixture.clock(1)))
+        XCTAssertGreaterThan(fences, 0); XCTAssertNil(e.session); XCTAssertFalse(e.terminalIntent)
+        store.fails = false; XCTAssertEqual(store.value, saved)
+        let restored = try engine(store, clock: V4vFixture.clock(1))
+        XCTAssertNil(restored.session); XCTAssertFalse(restored.terminalIntent)
     }
     func testExpiredOwnerCannotBeRevivedByLateRefreshAndImmutablePinSurvivesGrantRemoval() throws {
         let store = V4vMemoryJournal(); var fences = 0; let e = try engine(store, fence: { fences += 1 }); try prepared(e)

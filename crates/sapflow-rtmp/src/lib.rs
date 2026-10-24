@@ -28,6 +28,7 @@ pub mod handshake;
 pub mod session;
 
 pub use handshake::{Form, HandshakeError};
+pub use sapflow_core::TrackSet;
 pub use session::{Event, Session, SessionError};
 
 use handshake::{Handshake, Progress};

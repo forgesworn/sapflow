@@ -2,5 +2,6 @@
     <application android:name=".QualificationPoseApplication">
         <profileable android:shell="true" />
         <activity android:name=".FfiBenchmarkActivity" android:exported="true" android:label="@string/ffi_benchmark_label" />
+        <activity android:name=".NativeAacQualificationActivity" android:exported="true" android:permission="android.permission.DUMP" />
     </application>
 </manifest>

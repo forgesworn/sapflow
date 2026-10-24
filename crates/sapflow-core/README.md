@@ -14,7 +14,7 @@ Most people want one of the other crates:
 - [`sapflow-hls`](https://crates.io/crates/sapflow-hls): LL-HLS packaging
   and RTMP ingest.
 
-This crate is published because the server depends on it. Its types follow
-what sapflow's host application expects (stream paths are
+This crate is prepared for publication because the server depends on it.
+Its types follow what sapflow's host application expects (stream paths are
 `live/event-<id>`); they are not a general media vocabulary. Version 0.1:
 the API may change.

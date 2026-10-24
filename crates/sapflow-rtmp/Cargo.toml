@@ -16,6 +16,7 @@ categories = ["network-programming", "multimedia::video"]
 workspace = true
 
 [dependencies]
+sapflow-core = { path = "../sapflow-core", version = "0.1.0" }
 # The digest handshake.
 hmac = "0.12.1"
 sha2 = "0.10.9"

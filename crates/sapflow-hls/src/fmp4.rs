@@ -12,6 +12,8 @@ use mp4_atom::{
 };
 
 use crate::codec::{AacConfig, H264Config};
+use crate::recording_programme::ProgrammeRecordingPresentation;
+use crate::recording_timing::{MOVIE_TIMESCALE, RecordingPresentation, TimingError};
 
 /// `track_ID` of the video track.
 pub const VIDEO_TRACK: u32 = 1;
@@ -81,6 +83,227 @@ pub fn init_segment_for_tracks(
     let duration_ms = u64::try_from(duration.as_millis()).ok()?;
     let bytes = init(video, audio, Some(duration_ms));
     (!bytes.is_empty()).then_some(bytes)
+}
+
+/// Explicit native-AAC recording header. Streaming and legacy defaults are unchanged.
+/// The layout has fixed-width duration/edit sections from its first output.
+pub fn init_segment_for_native_recording(
+    video: Option<&H264Config>,
+    audio: &AacConfig,
+    presentation: &RecordingPresentation,
+) -> Result<Bytes, TimingError> {
+    presentation.validate()?;
+    if audio.audio_specific_config() != [0x11, 0x88]
+        || video.is_some() != presentation.video_start.is_some()
+    {
+        return Err(TimingError::Unsupported);
+    }
+    native_recording_init(
+        video,
+        audio,
+        NativeInitPresentation {
+            movie_duration: presentation.movie_duration()?,
+            audio: NativeAudioPresentation {
+                delay: presentation
+                    .audio_start
+                    .checked_mul(15)
+                    .ok_or(TimingError::Overflow)?,
+                media_time: presentation
+                    .audio_start
+                    .checked_add(u64::from(presentation.leading_frames))
+                    .ok_or(TimingError::Overflow)?,
+                duration: presentation
+                    .valid_audio_frames()
+                    .checked_mul(15)
+                    .ok_or(TimingError::Overflow)?,
+            },
+            video: presentation.video_start.zip(presentation.video_end),
+        },
+    )
+}
+
+/// Audio-only programme header with independent original media and movie origins.
+/// Checked scalar window geometry is not native EOF, file or source authority.
+/// Original fragment timestamps/payloads are never rewritten by this function.
+/// Legacy native-recording headers retain their existing public semantics.
+pub fn init_segment_for_programme_recording(
+    audio: &AacConfig,
+    presentation: &ProgrammeRecordingPresentation,
+) -> Result<Bytes, TimingError> {
+    if audio.audio_specific_config() != [0x11, 0x88] {
+        return Err(TimingError::Unsupported);
+    }
+    native_recording_init(
+        None,
+        audio,
+        NativeInitPresentation {
+            movie_duration: presentation.movie_extent()?.duration_ticks,
+            audio: NativeAudioPresentation {
+                delay: presentation.movie_delay_ticks(),
+                media_time: presentation.media_time(),
+                duration: presentation
+                    .presented_frames()
+                    .checked_mul(15)
+                    .ok_or(TimingError::Overflow)?,
+            },
+            video: None,
+        },
+    )
+}
+
+struct NativeAudioPresentation {
+    delay: u64,
+    media_time: u64,
+    duration: u64,
+}
+
+struct NativeInitPresentation {
+    movie_duration: u64,
+    audio: NativeAudioPresentation,
+    video: Option<(u64, u64)>,
+}
+
+fn native_recording_init(
+    video: Option<&H264Config>,
+    audio: &AacConfig,
+    presentation: NativeInitPresentation,
+) -> Result<Bytes, TimingError> {
+    let encode = |result: mp4_atom::Result<()>| result.map_err(|_| TimingError::Unsupported);
+    let mut output = Vec::new();
+    encode(
+        Ftyp {
+            major_brand: b"iso5".into(),
+            minor_version: 1,
+            compatible_brands: vec![b"iso5".into(), b"iso6".into(), b"mp41".into()],
+        }
+        .encode(&mut output),
+    )?;
+    let mut movie = Vec::new();
+    let duration = presentation.movie_duration;
+    encode(
+        Mvhd {
+            timescale: MOVIE_TIMESCALE,
+            duration,
+            rate: 1.into(),
+            volume: 1.into(),
+            next_track_id: 3,
+            ..Default::default()
+        }
+        .encode(&mut movie),
+    )?;
+    let mut trex = Vec::with_capacity(2);
+    if let Some(config) = video {
+        let mut track = video_trak(config);
+        let (first, end) = presentation.video.ok_or(TimingError::Inconsistent)?;
+        track.tkhd.duration = end.checked_mul(8).ok_or(TimingError::Overflow)?;
+        track.mdia.mdhd.duration = 0; // Empty fragmented init: media duration comes from truns.
+        native_track(
+            &track,
+            first.checked_mul(8).ok_or(TimingError::Overflow)?,
+            first,
+            end.checked_sub(first)
+                .ok_or(TimingError::Inconsistent)?
+                .checked_mul(8)
+                .ok_or(TimingError::Overflow)?,
+            &mut movie,
+        )?;
+        trex.push(Trex {
+            track_id: VIDEO_TRACK,
+            default_sample_description_index: 1,
+            ..Default::default()
+        });
+    }
+    let mut track = audio_trak(audio);
+    let delay = presentation.audio.delay;
+    let audio_duration = presentation.audio.duration;
+    track.tkhd.duration = delay
+        .checked_add(audio_duration)
+        .ok_or(TimingError::Overflow)?;
+    track.mdia.mdhd.duration = 0; // Do not add the fragment coded extent twice in Apple readers.
+    track.mdia.minf.stbl.sgpd = vec![mp4_atom::Sgpd {
+        grouping_type: b"roll".into(),
+        default_length: Some(2),
+        default_group_description_index: None,
+        static_group_description: false,
+        static_mapping: false,
+        essential: false,
+        entries: vec![mp4_atom::SgpdEntry {
+            description_length: Some(2),
+            entry: mp4_atom::AnySampleGroupEntry::UnknownGroupingType(
+                b"roll".into(),
+                vec![255, 255],
+            ),
+        }],
+    }];
+    native_track(
+        &track,
+        delay,
+        presentation.audio.media_time,
+        audio_duration,
+        &mut movie,
+    )?;
+    trex.push(Trex {
+        track_id: AUDIO_TRACK,
+        default_sample_description_index: 1,
+        ..Default::default()
+    });
+    encode(
+        Mvex {
+            trex,
+            mehd: Some(mp4_atom::Mehd {
+                fragment_duration: duration,
+            }),
+        }
+        .encode(&mut movie),
+    )?;
+    native_box(b"moov", &movie, &mut output)?;
+    Ok(Bytes::from(output))
+}
+
+// Only serialises metadata we construct, not a parser or another media muxer.
+// mp4-atom chooses elst v0 for small values; explicit v1 avoids later layout growth.
+fn native_track(
+    track: &Trak,
+    delay: u64,
+    media_time: u64,
+    duration: u64,
+    output: &mut Vec<u8>,
+) -> Result<(), TimingError> {
+    if media_time > i64::MAX as u64 {
+        return Err(TimingError::Overflow);
+    }
+    let mut body = Vec::new();
+    track
+        .tkhd
+        .encode(&mut body)
+        .map_err(|_| TimingError::Unsupported)?;
+    track
+        .mdia
+        .encode(&mut body)
+        .map_err(|_| TimingError::Unsupported)?;
+    let mut edits = vec![1, 0, 0, 0];
+    edits.extend_from_slice(&(if delay == 0 { 1_u32 } else { 2 }).to_be_bytes());
+    if delay > 0 {
+        edits.extend_from_slice(&delay.to_be_bytes());
+        edits.extend_from_slice(&(-1_i64).to_be_bytes());
+        edits.extend_from_slice(&65536_u32.to_be_bytes());
+    }
+    edits.extend_from_slice(&duration.to_be_bytes());
+    edits.extend_from_slice(&media_time.to_be_bytes());
+    edits.extend_from_slice(&65536_u32.to_be_bytes());
+    let mut edts = Vec::new();
+    native_box(b"elst", &edits, &mut edts)?;
+    native_box(b"edts", &edts, &mut body)?;
+    native_box(b"trak", &body, output)
+}
+
+fn native_box(kind: &[u8; 4], body: &[u8], output: &mut Vec<u8>) -> Result<(), TimingError> {
+    let length = u32::try_from(body.len().checked_add(8).ok_or(TimingError::Overflow)?)
+        .map_err(|_| TimingError::Overflow)?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(kind);
+    output.extend_from_slice(body);
+    Ok(())
 }
 
 fn init(video: Option<&H264Config>, audio: Option<&AacConfig>, duration_ms: Option<u64>) -> Bytes {
@@ -276,6 +499,41 @@ fn audio_trak(a: &AacConfig) -> Trak {
 
 /// Builds one `moof` + `mdat` holding every run, in order.
 pub fn encode_part(sequence_number: u32, runs: &[TrackRun<'_>]) -> Bytes {
+    encode_part_inner(sequence_number, runs, false, None)
+}
+
+/// Same original media runs, adding only recording roll-group references.
+/// The native and independent decoder proof for this grouping is a separate gate.
+pub fn encode_native_recording_part(sequence_number: u32, runs: &[TrackRun<'_>]) -> Bytes {
+    encode_part_inner(sequence_number, runs, true, None)
+}
+
+/// Native COMPLETE EOF only: shorten the final container entry, never the shared sample.
+/// Unknown EOF and every interior generation retain their original 1024-frame cadence.
+pub fn encode_native_recording_part_with_final_audio_duration(
+    sequence_number: u32,
+    runs: &[TrackRun<'_>],
+    final_audio_duration: u32,
+) -> Bytes {
+    let mut audio = runs.iter().filter(|r| r.track_id == AUDIO_TRACK);
+    let Some(track) = audio.next() else {
+        return Bytes::new();
+    };
+    if !(1..=1024).contains(&final_audio_duration)
+        || audio.next().is_some()
+        || track.samples.last().is_none_or(|s| s.duration != 1024)
+    {
+        return Bytes::new();
+    }
+    encode_part_inner(sequence_number, runs, true, Some(final_audio_duration))
+}
+
+fn encode_part_inner(
+    sequence_number: u32,
+    runs: &[TrackRun<'_>],
+    native_recording: bool,
+    final_audio_duration: Option<u32>,
+) -> Bytes {
     let runs: Vec<&TrackRun<'_>> = runs.iter().filter(|r| !r.samples.is_empty()).collect();
 
     let build = |offsets: &[i32]| Moof {
@@ -297,14 +555,33 @@ pub fn encode_part(sequence_number: u32, runs: &[TrackRun<'_>]) -> Bytes {
                     entries: run
                         .samples
                         .iter()
-                        .map(|s| TrunEntry {
-                            duration: Some(s.duration),
+                        .enumerate()
+                        .map(|(index, s)| TrunEntry {
+                            duration: Some(
+                                if run.track_id == AUDIO_TRACK && index + 1 == run.samples.len() {
+                                    final_audio_duration.unwrap_or(s.duration)
+                                } else {
+                                    s.duration
+                                },
+                            ),
                             size: Some(s.data.len() as u32),
                             flags: Some(if s.sync { FLAGS_SYNC } else { FLAGS_NON_SYNC }),
                             cts: Some(s.cts),
                         })
                         .collect(),
                 }],
+                sbgp: if native_recording && run.track_id == AUDIO_TRACK {
+                    vec![mp4_atom::Sbgp {
+                        grouping_type: b"roll".into(),
+                        grouping_type_parameter: None,
+                        entries: vec![mp4_atom::SbgpEntry {
+                            sample_count: run.samples.len() as u32,
+                            group_description_index: 1,
+                        }],
+                    }]
+                } else {
+                    Vec::new()
+                },
                 ..Default::default()
             })
             .collect(),

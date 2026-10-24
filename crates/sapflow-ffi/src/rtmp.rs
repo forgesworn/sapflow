@@ -7,6 +7,7 @@ use sapflow_client::{
     CodecConfig,
     transport_progress::{StartupProgressEvent, StartupWatermark},
 };
+use sapflow_rtmp::TrackSet;
 use sapflow_rtmp::client::{ClientError, Publisher, PublisherConfig, PublisherState};
 
 use crate::{MAX_ENCODED_BUFFER_BYTES, MediaSample};
@@ -187,12 +188,18 @@ impl NativeRtmpPublisher {
         let mut state = self.state_guard()?;
         let candidate =
             StartupWatermark::new(has_video, has_audio).ok_or(NativeRtmpError::InvalidConfig)?;
+        let tracks = match (has_video, has_audio) {
+            (true, true) => TrackSet::AudioVideo,
+            (true, false) => TrackSet::VideoOnly,
+            (false, true) => TrackSet::AudioOnly,
+            (false, false) => return Err(NativeRtmpError::InvalidConfig),
+        };
         if let Some(current) = &state.startup {
-            return if current.tracks() == candidate.tracks() {
-                Ok(())
-            } else {
-                Err(NativeRtmpError::InvalidConfig)
-            };
+            if current.tracks() != candidate.tracks() {
+                return Err(NativeRtmpError::InvalidConfig);
+            }
+            state.publisher.declare_tracks(tracks)?;
+            return Ok(());
         }
         if state.video.end_ns.is_some()
             || state.audio.end_ns.is_some()
@@ -203,6 +210,10 @@ impl NativeRtmpPublisher {
         {
             return Err(NativeRtmpError::InvalidConfig);
         }
+        // A full output queue must not commit a progress declaration that the
+        // protocol could not announce. Repeated identical calls keep its prior
+        // one-shot progress, rather than resetting an existing watermark.
+        state.publisher.declare_tracks(tracks)?;
         state.startup = Some(candidate);
         Ok(())
     }
@@ -457,6 +468,10 @@ mod tests {
             0,
         )
         .expect("publisher");
+        accept(publisher)
+    }
+
+    fn accept(publisher: Arc<NativeRtmpPublisher>) -> (Arc<NativeRtmpPublisher>, Connection) {
         let mut server = Connection::new(91);
         let mut accepted = false;
         for _ in 0..12 {
@@ -488,6 +503,122 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    #[test]
+    fn declared_audio_only_wire_precedes_aac_and_sends_without_any_keyframe() {
+        let (publisher, mut server) = ready(0);
+        publisher
+            .declare_tracks(false, true)
+            .expect("audio-only topology");
+        let codec = MediaCodec::aac(&[0x11, 0x88]).expect("AAC-LC");
+        let audio = codec
+            .sample(&[1, 2, 3], 0, 0, 1024, 48_000, false)
+            .expect("audio sample");
+        publisher.send(audio).expect("no video keyframe required");
+        let wire = events(&mut server, &publisher);
+        assert!(
+            matches!(wire.as_slice(), [Event::Tracks { tracks: TrackSet::AudioOnly }, Event::Audio { data: config, .. }, Event::Audio { data: media, .. }] if config == &[0xaf, 0, 0x11, 0x88] && media == &[0xaf, 1, 1, 2, 3])
+        );
+        assert_eq!(
+            publisher.poll_event().expect("sending"),
+            Some(NativeRtmpEvent::Sending)
+        );
+        publisher
+            .declare_tracks(false, true)
+            .expect("same declaration after audio");
+        assert!(
+            publisher
+                .take_output()
+                .expect("idempotent output")
+                .is_empty()
+        );
+        assert_eq!(publisher.poll_event().expect("no repeated sending"), None);
+        assert_eq!(
+            publisher.declare_tracks(true, true),
+            Err(NativeRtmpError::InvalidConfig)
+        );
+        let target = publisher
+            .state_guard()
+            .expect("state")
+            .publisher
+            .output_end_position()
+            .expect("wire boundary");
+        // The conservative ACK-domain margin needs real additional transferred
+        // bytes. Never acknowledge beyond the caller's taken output.
+        let next = codec
+            .sample(&vec![0x55; 4096], 1024, 1024, 1024, 48_000, false)
+            .expect("next AAC");
+        publisher.send(next).expect("additional wire");
+        assert!(matches!(
+            events(&mut server, &publisher).as_slice(),
+            [Event::Audio { .. }]
+        ));
+        publisher
+            .feed(&peer_ack(target + RTMP_ACK_HANDSHAKE_MARGIN), 2)
+            .expect("current peer progress");
+        assert_eq!(
+            publisher.poll_event().expect("peer watermark"),
+            Some(NativeRtmpEvent::PeerMediaProgress)
+        );
+    }
+
+    #[test]
+    fn failed_wire_declaration_cannot_commit_native_watermark_or_track_state() {
+        let mut config = PublisherConfig::new(
+            "live".into(),
+            "fixture".into(),
+            "rtmp://origin.invalid/live".into(),
+        );
+        config.max_output_bytes = 8192;
+        let publisher = Arc::new(NativeRtmpPublisher {
+            state: Mutex::new(State {
+                publisher: Publisher::new(config, 42, 0).expect("bounded client"),
+                epoch_ns: 0,
+                video: Track::default(),
+                audio: Track::default(),
+                startup: None,
+            }),
+        });
+        let (publisher, _) = accept(publisher);
+        // Each ping queues one 18-byte pong. 8118 retained bytes leave less
+        // than one declaration, without configuring a track or failing feed.
+        let mut ping = vec![2, 0, 0, 0, 0, 0, 6, 4, 0, 0, 0, 0];
+        ping.extend_from_slice(&[0, 6, 0, 0, 0, 1]);
+        publisher
+            .feed(&ping.repeat(451), 2)
+            .expect("bounded control fill");
+        let before = publisher.queued_output_bytes().expect("queued");
+        assert_eq!(before, 8118);
+        assert_eq!(
+            publisher.declare_tracks(false, true),
+            Err(NativeRtmpError::Backpressure)
+        );
+        assert_eq!(publisher.queued_output_bytes().expect("same queue"), before);
+        {
+            let state = publisher.state_guard().expect("state");
+            assert!(state.startup.is_none());
+            assert!(state.video.end_ns.is_none() && state.audio.end_ns.is_none());
+        }
+        publisher.take_output().expect("drain controls");
+        publisher
+            .declare_tracks(true, false)
+            .expect("failed candidate did not freeze audio");
+        assert_eq!(
+            publisher
+                .state_guard()
+                .expect("state")
+                .startup
+                .as_ref()
+                .expect("committed watermark")
+                .tracks(),
+            (true, false)
+        );
+        let audio = MediaCodec::aac(&[0x11, 0x88])
+            .expect("AAC")
+            .sample(&[1], 0, 0, 1024, 48_000, false)
+            .expect("sample");
+        assert_eq!(publisher.send(audio), Err(NativeRtmpError::InvalidMedia));
     }
 
     #[test]

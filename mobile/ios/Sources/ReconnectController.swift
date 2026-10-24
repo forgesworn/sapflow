@@ -4,7 +4,16 @@ enum ReconnectAction: Equatable {
     case none, connect, retryAt(UInt64), awaitDeadline(UInt64), exhausted, expired, end
 }
 enum PublishingAttemptEvent { case accepted, sending, peerMediaProgress, failed }
+/// Captured on the policy owner before constructing any socket. Never replace
+/// these fields with a later SDK snapshot when a decoder finishes.
+struct ReconnectAttemptContext: Equatable {
+    let codecEpoch: UInt64
+    let token: UInt64
+    let sdkGeneration: UInt64
+    let sdkAttempt: UInt64
+}
 protocol ReconnectPolicyPort: AnyObject {
+    var generation: UInt64 { get }
     var attemptEpoch: UInt64 { get }
     var nextDeadlineNs: UInt64? { get }
     var exhausted: Bool { get }
@@ -13,6 +22,7 @@ protocol ReconnectPolicyPort: AnyObject {
     func connected(_ now: UInt64) throws
     func sending(_ epoch: UInt64, _ now: UInt64) throws -> ReconnectAction
     func recovered(_ epoch: UInt64, _ now: UInt64) throws -> ReconnectAction
+    func confirmed(_ context: ReconnectAttemptContext, _ now: UInt64) throws
     func failed(_ now: UInt64) throws -> ReconnectAction
     func tick(_ now: UInt64) throws -> ReconnectAction
     func stop() throws
@@ -27,10 +37,11 @@ protocol ReconnectAttemptPort: AnyObject {
 /// Caller-driven serial control owner. No media, socket, file, timer or SDK
 /// runtime lives here. A single old attempt is retained until actual cleanup.
 final class ReconnectController {
-    typealias Factory = (@escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> ReconnectAttemptPort
+    typealias Factory = (ReconnectAttemptContext, @escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> ReconnectAttemptPort
     private let policy: ReconnectPolicyPort
     private let now: () -> UInt64
     private let changed: () -> Void
+    private let attemptReady: (ReconnectAttemptContext, UInt64) -> Void
     private let activeChanged: (ReconnectAttemptPort?) -> Void
     private var factory: Factory?
     private var owner: ReconnectAttemptPort?
@@ -49,16 +60,25 @@ final class ReconnectController {
     private var peerProgress = false
     private var sendingApplied = false
     private var recoveryApplied = false
+    private var readyApplied = false
+    private var decodedApplied = false
+    private var context: ReconnectAttemptContext?
     private(set) var status = "Destination prepared · explicit Start required"
+    private(set) var terminalAtNs: UInt64?
     var cleanupComplete: Bool { owner == nil && !closing }
     var nextDeadlineNs: UInt64? {
         [terminal || stopped ? nil : policy.nextDeadlineNs, cleanupDeadline].compactMap { $0 }.min()
     }
     init(policy: ReconnectPolicyPort, now: @escaping () -> UInt64,
-         activeChanged: @escaping (ReconnectAttemptPort?) -> Void, changed: @escaping () -> Void) {
-        self.policy = policy; self.now = now; self.activeChanged = activeChanged; self.changed = changed
+         activeChanged: @escaping (ReconnectAttemptPort?) -> Void, changed: @escaping () -> Void,
+         attemptReady: @escaping (ReconnectAttemptContext, UInt64) -> Void = { _, _ in }) {
+        self.policy = policy; self.now = now; self.activeChanged = activeChanged; self.changed = changed; self.attemptReady = attemptReady
     }
-    func attach(epoch: UInt64, factory: @escaping Factory) {
+    /// Compatibility entry for generic destinations that do not observe output.
+    func attach(epoch: UInt64, factory: @escaping (@escaping (PublishingAttemptEvent, UInt64) -> Void) throws -> ReconnectAttemptPort) {
+        attach(epoch: epoch, contextualFactory: { _, observe in try factory(observe) })
+    }
+    func attach(epoch: UInt64, contextualFactory factory: @escaping Factory) {
         guard !stopped, self.epoch == nil, cleanupComplete else { return }
         self.epoch = epoch
         if terminal { changed(); return } // recording-only epoch after publishing ended
@@ -74,7 +94,8 @@ final class ReconnectController {
             completion(cleanupComplete && (stopped || terminal) ? .success(()) : .failure(ReconnectFailure.invalidEpoch)); return
         }
         guard detachCompletion == nil else { completion(.failure(ReconnectFailure.cleanupRetained)); return }
-        self.epoch = nil; factory = nil
+        self.epoch = nil; factory = nil; decodedApplied = false
+        status = "Publisher epoch closing · playback unconfirmed"
         detachCompletion = completion
         activeChanged(nil)
         if owner != nil { beginClose() }
@@ -84,6 +105,7 @@ final class ReconnectController {
     func stop() {
         guard !stopped else { return }
         stopped = true; terminal = true; pendingConnect = false; factory = nil
+        if terminalAtNs == nil { terminalAtNs = now() }
         activeChanged(nil)
         try? policy.stop()
         status = "Publisher stopping · playback unconfirmed"
@@ -117,8 +139,13 @@ final class ReconnectController {
         token += 1; let current = token
         policyAttempt = policy.attemptEpoch
         accepted = false; startup = false; peerProgress = false; sendingApplied = false; recoveryApplied = false
+        readyApplied = false; decodedApplied = false
+        guard let epoch, policy.generation > 0, policyAttempt > 0 else { throw ReconnectFailure.invalidEpoch }
+        let captured = ReconnectAttemptContext(codecEpoch: epoch, token: current,
+            sdkGeneration: policy.generation, sdkAttempt: policyAttempt)
+        context = captured
         pendingConnect = false
-        let attempt = try factory { [weak self] event, time in self?.event(current, event, time) }
+        let attempt = try factory(captured, { [weak self] event, time in self?.event(current, event, time) })
         owner = attempt; activeChanged(attempt)
         status = "Connecting · decoded playback unconfirmed"
         do { try attempt.start() }
@@ -147,16 +174,31 @@ final class ReconnectController {
                 sendingApplied = true
                 try apply(policy.sending(policyAttempt, instant))
             }
+            if accepted && sendingApplied && !readyApplied && !terminal, let context {
+                readyApplied = true
+                attemptReady(context, instant)
+            }
             if accepted && sendingApplied && peerProgress && !recoveryApplied && !policy.exhausted && !terminal {
                 recoveryApplied = true
                 try apply(policy.recovered(policyAttempt, instant))
             }
-            if !terminal {
+            if !terminal && !decodedApplied {
                 status = !accepted ? "Connecting · decoded playback unconfirmed" : policy.exhausted ? "Sending · peer progress unverified · automatic retries exhausted" :
                     (recoveryApplied ? "Sending · peer transport progress observed · decoded playback unconfirmed" :
                         (sendingApplied ? "Sending · peer progress and decoded playback unconfirmed" : "Destination accepted · waiting for complete startup media"))
             }
         } catch { failClosed("Publisher policy failed · local recording continues") }
+        changed()
+    }
+    /// Must run on the same serial owner as policy events. The app's cold
+    /// confirmation gate must linearise this call with synchronous invalidation.
+    func confirmObservedMedia(_ captured: ReconnectAttemptContext, nowNs: UInt64) throws {
+        guard context == captured, owner != nil, epoch == captured.codecEpoch,
+              !closing, !terminal, !stopped, accepted, sendingApplied, readyApplied,
+              !decodedApplied else { throw ReconnectFailure.invalidEpoch }
+        try policy.confirmed(captured, nowNs)
+        decodedApplied = true
+        status = "Live · native decoded playback verified"
         changed()
     }
     private func apply(_ action: ReconnectAction) throws {
@@ -197,6 +239,7 @@ final class ReconnectController {
         let completion = detachCompletion; detachCompletion = nil; completion?(result)
     }
     private func failClosed(_ message: String) {
+        if terminalAtNs == nil { terminalAtNs = now() }
         terminal = true; pendingConnect = false; factory = nil
         activeChanged(nil); try? policy.stop(); status = message
         if owner != nil { beginClose() }

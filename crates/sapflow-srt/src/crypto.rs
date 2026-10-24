@@ -456,8 +456,14 @@ impl Decryptor {
             last_km: bytes.to_vec(),
         })
     }
+    pub(crate) fn active_key(&self) -> u8 {
+        self.active
+    }
+    pub(crate) fn matches_last_km(&self, bytes: &[u8]) -> bool {
+        bytes == self.last_km
+    }
     pub(crate) fn refresh(&mut self, bytes: &[u8]) -> Result<(), CryptoError> {
-        if bytes == self.last_km {
+        if self.matches_last_km(bytes) {
             return Ok(());
         }
         let km = Km::parse(bytes)?;

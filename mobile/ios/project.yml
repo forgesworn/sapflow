@@ -3,9 +3,15 @@ options:
   deploymentTarget:
     iOS: '16.0'
   createIntermediateGroups: true
+configs:
+  Debug: debug
+  Release: release
+  Qualification: release
 packages:
   Sapflow:
     path: ../../target/native-packages/apple
+  SignetAuth:
+    path: ../../target/native-packages/signet-apple
 settings:
   base:
     SWIFT_VERSION: '5.0'
@@ -18,14 +24,33 @@ settings:
     TARGETED_DEVICE_FAMILY: '1'
     PRODUCT_BUNDLE_IDENTIFIER: dev.forgesworn.sapflow.broadcaster
     SWIFT_EMIT_LOC_STRINGS: NO
+    SAPFLOW_V4V_ENABLED: "NO"
+    SAPFLOW_V4V_API_ORIGIN: ''
+    SAPFLOW_V4V_PLAYBACK_ORIGIN: ''
+    SAPFLOW_V4V_PLAYBACK_PREFIX: ''
+    SAPFLOW_QUALIFICATION_V4V_ENABLED: "NO"
+    SAPFLOW_QUALIFICATION_V4V_API_ORIGIN: ''
+    SAPFLOW_QUALIFICATION_V4V_PLAYBACK_ORIGIN: ''
+    SAPFLOW_QUALIFICATION_V4V_PLAYBACK_PREFIX: ''
+  configs:
+    Qualification:
+      SAPFLOW_V4V_ENABLED: $(SAPFLOW_QUALIFICATION_V4V_ENABLED)
+      SAPFLOW_V4V_API_ORIGIN: $(SAPFLOW_QUALIFICATION_V4V_API_ORIGIN)
+      SAPFLOW_V4V_PLAYBACK_ORIGIN: $(SAPFLOW_QUALIFICATION_V4V_PLAYBACK_ORIGIN)
+      SAPFLOW_V4V_PLAYBACK_PREFIX: $(SAPFLOW_QUALIFICATION_V4V_PLAYBACK_PREFIX)
 targets:
   SapflowBroadcaster:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources:
+      - path: Sources
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - package: Sapflow
         product: Sapflow
+      - package: SignetAuth
+        product: SignetAuth
     settings:
       base:
         PRODUCT_NAME: SapflowBroadcaster
@@ -35,7 +60,12 @@ targets:
   SapflowBroadcasterTests:
     type: bundle.unit-test
     platform: iOS
-    sources: [Tests]
+    sources:
+      - path: Tests
+      - path: ../../tests/fixtures/manual-destination-v1.json
+        buildPhase: resources
+      - path: ../../tests/fixtures/manual-destination-link-v1.json
+        buildPhase: resources
     dependencies:
       - target: SapflowBroadcaster
     settings:

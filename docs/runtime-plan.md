@@ -1,13 +1,18 @@
 # Replacing tokio: a plan
 
-A plan, not a decision. It sets out what replacing the async runtime would
-take, what it could gain, and a measurement that decides whether to go on.
-No code changes yet.
+The initial plan below sets out what replacing the async runtime would take
+and what measurements decide whether to continue. An optional viewer prototype
+has since landed: `SAPFLOW_HTTP_IMPL=own` uses Sapflow's HTTP event loop;
+Hyper/Tokio remains the default. Ingest, callbacks, private publish control and
+recording still use their existing runtime. See the measurements in
+[benchmarks](benchmarks.md) and the implementation gates in
+[readiness](readiness.md). This does not replace the whole server runtime or
+establish a mobile performance improvement.
 
 ## Where tokio is today
 
 Only the server (`crates/sapflow-server`) and the bench tool use tokio. The
-libraries (`sapflow-srt`, `sapflow-hls`, `sapflow-core`, `sapflow-client`,
+media libraries (`sapflow-srt`, `sapflow-rtmp`, `sapflow-hls`, `sapflow-core`, `sapflow-client`,
 `sapflow-ffi`) are sans-IO and runtime-free already, so nothing here touches
 them or the mobile apps.
 

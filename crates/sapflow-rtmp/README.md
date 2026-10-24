@@ -41,6 +41,8 @@ while let Some(event) = conn.poll()? {
         // Check the key, then accept_publish() or refuse_publish(code, why).
         Event::Publish { app, key } => conn.accept_publish(),
         Event::Metadata { audio } => { /* onMetaData: whether audio is coming */ }
+        // Explicit non-empty topology, including audio-only publishers.
+        Event::Tracks { tracks } => {}
         // FLV tag bodies with millisecond timestamps.
         Event::Video { timestamp, data } => {}
         Event::Audio { timestamp, data } => {}

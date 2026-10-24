@@ -7,14 +7,14 @@ import kotlinx.serialization.json.*
 /** Correlation metadata only: no admission/encryption authority or decode proof.
  * The SDK identity is captured before this attempt's transport is constructed. */
 internal class V4vCapturedAttempt internal constructor(val context: PublishingAttemptContext,
-    val identity: V4vIdentity, val nonce: String) {
+    val identity: V4vIdentity, val nonce: String, val intent: CaptureIntent = CaptureIntent.DEFAULT) {
     override fun toString() = "Captured V4V attempt (redacted)"
 }
 internal class V4vWireAttempt(val scope: V4vCapturedAttempt, val streamId: String) {
     override fun toString() = "V4V attempt wire credentials (redacted)"
 }
 internal class V4vMatchedMedia(val scope: V4vCapturedAttempt, val connectionEpoch: Long,
-    val partId: Long, val initializationId: Long, val initPath: String, val partPath: String, val hasAudio: Boolean) {
+    val partId: Long, val initializationId: Long, val initPath: String, val partPath: String, val hasAudio: Boolean, val hasVideo: Boolean = true) {
     override fun toString() = "Correlated encoded-media boundary (not decoded)"
 }
 
@@ -26,12 +26,12 @@ internal class V4vAttemptCorrelation(private val nonce: () -> String = ::randomN
     private val current = AtomicReference<V4vCapturedAttempt?>()
     private var previousNonce: String? = null // Serial reconnect owner calls begin.
 
-    fun begin(context: PublishingAttemptContext, grant: V4vGrant): V4vWireAttempt {
+    fun begin(context: PublishingAttemptContext, grant: V4vGrant, intent: CaptureIntent = CaptureIntent.DEFAULT): V4vWireAttempt {
         val value = nonce()
         V4vJson.id(value)
         check(value != previousNonce) { "Attempt randomness repeated" }
         val wire = canonicalStreamId(grant, value) // Revalidate before emitting credentials.
-        val scope = V4vCapturedAttempt(context, grant.identity, value)
+        val scope = V4vCapturedAttempt(context, grant.identity, value, intent)
         previousNonce = value
         current.set(scope)
         return V4vWireAttempt(scope, wire)
@@ -56,14 +56,14 @@ internal class V4vAttemptCorrelation(private val nonce: () -> String = ::randomN
         if (mediaValue == JsonNull) return@with null
         val media = mediaValue.jsonObject
         require(media.keys == setOf("connectionEpoch", "partId", "initializationId", "initPath", "partPath", "hasVideo", "hasAudio"))
-        require(media.number("connectionEpoch", 1) == epoch && media.flag("hasVideo"))
+        require(media.number("connectionEpoch", 1) == epoch && scope.intent.matchesTracks(media.flag("hasVideo"), media.flag("hasAudio")))
         val part = media.number("partId"); val initialization = media.number("initializationId")
         val initPath = media.text("initPath", 256); val partPath = media.text("partPath", 256)
         val suffix = if (initialization == 0L) "" else initialization.toString()
         val pattern = Regex("/live/${Regex.escape(scope.identity.eventId)}/([0-9a-f]{1,12})_init$suffix\\.mp4")
         val prefix = requireNotNull(pattern.matchEntire(initPath)).groupValues[1]
         require(partPath == "/live/${scope.identity.eventId}/${prefix}_part$part.mp4")
-        val result = V4vMatchedMedia(scope, epoch, part, initialization, initPath, partPath, media.flag("hasAudio"))
+        val result = V4vMatchedMedia(scope, epoch, part, initialization, initPath, partPath, media.flag("hasAudio"), media.flag("hasVideo"))
         if (current.get() === scope) result else null
     }
 

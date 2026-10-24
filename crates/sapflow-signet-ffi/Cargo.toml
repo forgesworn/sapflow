@@ -1,0 +1,40 @@
+[package]
+name = "sapflow-signet-ffi"
+description = "Cold, bounded creator login through the ForgeSworn NIP-46 client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = []
+bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+
+[[bin]]
+name = "sapflow-signet-bindgen"
+path = "src/bin/bindgen.rs"
+required-features = ["bindgen"]
+
+[lints]
+workspace = true
+
+[dependencies]
+signet-nip46-client = { path = "../../vendor/signet-nip46-client", features = ["bounded-client"] }
+nostr = "=0.45.5"
+nostr-sdk = { version = "=0.45.4", default-features = false }
+tokio = { version = "=1.54.1", features = ["rt", "net", "time", "sync"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+zeroize = "=1.9.1"
+tracing = "=0.1.44"
+uniffi = { version = "=0.32.2", default-features = false }
+
+[dev-dependencies]
+async-wsocket = { version = "=0.17.0", default-features = false }
+futures-util = { version = "=0.3.34", features = ["sink"] }
+tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }

@@ -10,9 +10,25 @@ mod recording;
 mod rtmp;
 mod session;
 mod srt;
-pub use media::{FanoutOutcome, MediaCodec, MediaSample, NativeQueueStats, NativeSampleFanout};
+pub use media::{
+    FanoutOutcome, MediaCodec, MediaSample, NativeAacSampleSourceInfo, NativeAacTimingViews,
+    NativeQueueStats, NativeSampleFanout,
+};
 pub use recording::{
-    NativeRecordingError, NativeRecordingMuxer, NativeRecordingStats, RecordingWrite,
+    DecodedProgrammeCheckpoint, DecodedProgrammeCheckpointInfo, EncodedProgrammeCheckpointInfo,
+    NativeProgrammeCheckpoint, NativeProgrammeCheckpointEncoding, NativeProgrammeCheckpointFacts,
+    NativeProgrammeChunk, NativeProgrammeCompletion, NativeProgrammeGenerationEnd,
+    NativeProgrammePresentationExtent, NativeProgrammeQueuedFrames, NativeProgrammeWindowStart,
+    decode_programme_checkpoint, validate_programme_checkpoint_successor,
+};
+pub use recording::{
+    DecodedRecordingCheckpoint, DecodedRecordingCheckpointInfo, EncodedRecordingCheckpointInfo,
+    NativeAudioFileReceipt, NativeAudioGenerationReceipt, NativeRecordingCheckpoint,
+    NativeRecordingCheckpointEncoding, NativeRecordingCheckpointFacts, NativeRecordingChunk,
+    NativeRecordingChunkKind, NativeRecordingCompletion, NativeRecordingError,
+    NativeRecordingMuxer, NativeRecordingPresentationExtent, NativeRecordingSourceMapping,
+    NativeRecordingStats, RecordingCheckpointError, RecordingWrite, decode_recording_checkpoint,
+    validate_recording_checkpoint_successor,
 };
 pub use rtmp::{
     NativeRtmpError, NativeRtmpEvent, NativeRtmpPublisher, NativeRtmpSendOutput, NativeRtmpState,

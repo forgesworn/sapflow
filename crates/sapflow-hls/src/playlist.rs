@@ -393,17 +393,22 @@ impl RuleCheck {
 /// The multivariant playlist pointing at the one media playlist.
 pub fn multivariant(m: &Muxer) -> String {
     let (peak, avg) = m.bandwidth();
-    let v = m.video();
-    let mut codecs = v.codec_string();
+    let mut codecs = m.video().map_or_else(String::new, |v| v.codec_string());
     if let Some(a) = m.audio() {
-        codecs.push(',');
+        if !codecs.is_empty() {
+            codecs.push(',');
+        }
         codecs.push_str(&a.codec_string());
     }
     let mut s = format!(
         "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-INDEPENDENT-SEGMENTS\n\n\
          #EXT-X-STREAM-INF:BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg},CODECS=\"{codecs}\""
     );
-    if let Some(fps) = v.fps.filter(|f| f.is_finite() && *f > 0.0) {
+    if let Some(fps) = m
+        .video()
+        .and_then(|v| v.fps)
+        .filter(|f| f.is_finite() && *f > 0.0)
+    {
         let _ = write!(s, ",FRAME-RATE={fps:.3}");
     }
     let _ = write!(s, "\n{MEDIA_PLAYLIST}\n");

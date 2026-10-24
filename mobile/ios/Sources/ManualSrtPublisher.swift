@@ -3,8 +3,8 @@ import Network
 import Sapflow
 
 /// Network.framework owns one connected UDP socket. Rust owns MPEG-TS, SRT,
-/// encryption, pacing, ACK/retry windows and deadlines. The capture profile is
-/// currently fixed A/V; its immutable codec handles are configured once.
+/// encryption, pacing, ACK/retry windows and deadlines. The prepared track set
+/// and immutable codec handles are fixed for this attempt.
 final class ManualSrtPublisher: EncodedPublishingSink {
     private struct Pending {
         let sample: MediaSample
@@ -14,6 +14,9 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     }
     private let observe: (PublishingAttemptEvent, UInt64) -> Void
     private let destination: ManualSrtDestination
+    private let limits: SrtPublishingLimits
+    private let hasVideo: Bool
+    private let outputAuthority: AudioShowOutputAuthority?
     private let queue = DispatchQueue(label: "sapflow.manual-srt", qos: .userInitiated)
     private let lock = NSLock()
     private var generation: UInt64 = 0
@@ -40,11 +43,23 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private var writeDeadlineUs: UInt64?
     private var stopDeadlineUs: UInt64?
     private var statusAtUs: UInt64 = 0
+    private var socketCounter = SocketCompletionCounter()
+    private var finalCounters: SocketOutboundSample? // published under lock at actual close
 
-    init(destination: ManualSrtDestination, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) { self.destination = destination; self.observe = observe }
+    init(destination: ManualSrtDestination, limits: SrtPublishingLimits = .manual, hasVideo: Bool = true,
+         outputAuthority: AudioShowOutputAuthority? = nil, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) {
+        self.destination = destination; self.limits = limits; self.hasVideo = hasVideo; self.observe = observe; self.outputAuthority = outputAuthority
+    }
     deinit { timer.cancel(); connection?.cancel(); try? publisher?.stop(nowUs: Self.nowUs()) }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
     var status: String { lock.lock(); defer { lock.unlock() }; return currentStatus }
+    var finalSocketOutbound: SocketOutboundSample? { lock.lock(); defer { lock.unlock() }; return finalCounters }
+    func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) {
+        queue.async {
+            completion(self.socketCounter.sample(nowNs: DispatchTime.now().uptimeNanoseconds,
+                available: self.socketReady && self.connection != nil && !self.cancelling && !self.stopping))
+        }
+    }
 
     func start() throws {
         lock.lock()
@@ -52,14 +67,16 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         guard generation < UInt64.max else { lock.unlock(); throw CaptureFailure(message: "Publisher generation exhausted") }
         generation += 1
         let token = generation
-        admission.close(); admission = EncodedWorkBudget(bytes: 4 * 1024 * 1024, count: 128, span: 1)
-        accepting = true; released = false; currentStatus = "Preparing SRT UDP caller · single attempt"
+        admission.close(); admission = EncodedWorkBudget(bytes: Int(limits.queueBytes), count: 128, span: 1)
+        accepting = true; released = false; finalCounters = nil; currentStatus = "Preparing SRT UDP caller · single attempt"
         lock.unlock()
         queue.async {
             guard self.isCurrent(token), self.isAccepting() else { return }
-            self.stopping = false; self.waitingForKeyframe = true
+            guard self.authorized(token) else { return }
+            self.stopping = false; self.waitingForKeyframe = self.hasVideo
             self.connectDeadlineUs = Self.nowUs() + 15_000_000
             self.statusAtUs = 0
+            self.socketCounter = SocketCompletionCounter()
             guard let port = NWEndpoint.Port(rawValue: self.destination.port) else {
                 self.fail(token, "Invalid SRT destination port"); return
             }
@@ -73,6 +90,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
                 guard !self.cancelling else { return }
                 switch state {
                 case .ready:
+                    guard self.authorized(token) else { return }
                     guard !self.cancelling else { return }
                     guard !self.stopping else { self.finishStop(token); return }
                     if self.socketReady {
@@ -92,7 +110,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
             self.armDeadline(token)
         }
     }
-    func configure(video: MediaCodec, audio: MediaCodec) throws {
+    func configure(video: MediaCodec?, audio: MediaCodec) throws {
+        guard hasVideo == (video != nil) else { throw CaptureFailure(message: "SRT codecs do not match the prepared tracks") }
         lock.lock(); let token = generation; let active = accepting; lock.unlock()
         guard active else { return }
         queue.async {
@@ -107,13 +126,14 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     }
     private func createPublisher(_ token: UInt64) throws {
         guard publisher == nil, socketReady else { return }
-        guard let video, let audio else {
-            setStatus(token, "Waiting for encoded video/audio configuration · local recording active"); return
+        guard authorized(token) else { return }
+        guard let audio, !hasVideo || video != nil else {
+            setStatus(token, hasVideo ? "Waiting for encoded video/audio configuration · local recording active" : "Waiting for encoded audio configuration · local recording active"); return
         }
         let config = NativeSrtConfig(destination: destination.socketAddress, streamId: destination.streamID,
             cipher: destination.encrypted ? .aes256 : nil, latencyMs: 120,
-            maxBufferedPackets: 128, maxBufferedBytes: 4 * 1024 * 1024,
-            maxPacketAgeMs: 1000, maxSampleResidenceMs: 1000, bandwidthBytesPerSecond: 1_250_000)
+            maxBufferedPackets: 128, maxBufferedBytes: limits.queueBytes,
+            maxPacketAgeMs: 1000, maxSampleResidenceMs: 1000, bandwidthBytesPerSecond: limits.bandwidthBytesPerSecond)
         // Foreign String/Data copies cannot promise zeroisation. The Rust key
         // owner zeroises its transferred secret; no credential is logged here.
         publisher = try NativeSrtPublisher(config: config, video: video, audio: audio,
@@ -122,11 +142,13 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         setStatus(token, "SRT handshake · playback unconfirmed")
     }
     func offer(_ sample: MediaSample) throws {
+        guard outputAuthority?.permits() != false else { return }
+        guard hasVideo || !sample.isVideo() else { throw CaptureFailure(message: "Video is forbidden in this audio-only SRT attempt") }
         lock.lock(); let active = accepting; let token = generation; let budget = admission; lock.unlock()
         guard active else { return }
         let bytes = sample.len()
         guard bytes <= UInt64(Int.max), let reservation = budget.reserve(bytes: Int(bytes)) else {
-            if budget.close() { queue.async { self.fail(token, "SRT ingress exceeded 4 MiB / 128 samples / 1 s · local recording continues") } }
+            if budget.close() { queue.async { self.fail(token, "SRT publishing queue exceeded its limits · local recording continues") } }
             return
         }
         let admitted = Self.nowUs()
@@ -138,9 +160,10 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         }
     }
     private func receive(_ token: UInt64) {
-        guard let connection, isCurrent(token) else { return }
+        guard let connection, isCurrent(token), !stopping, !cancelling, authorized(token) else { return }
         connection.receiveMessage { [weak self] data, _, _, error in
             guard let self, self.isCurrent(token), self.connection != nil, !self.stopping, !self.cancelling else { return }
+            guard self.authorized(token) else { return }
             if error != nil { self.fail(token, "SRT UDP receive failed · local recording continues"); return }
             do {
                 if let data, data.count <= 1500, let publisher = self.publisher {
@@ -157,6 +180,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     }
     private func drive(_ token: UInt64) throws {
         guard isCurrent(token), connection != nil, !stopping, !cancelling else { return }
+        guard authorized(token) else { return }
         defer { armDeadline(token) }
         guard let publisher else { return }
         let now = Self.nowUs()
@@ -175,8 +199,10 @@ final class ManualSrtPublisher: EncodedPublishingSink {
                     guard first.sample.isVideo(), first.sample.isKeyframe() else { continue }
                     waitingForKeyframe = false
                 }
+                guard authorized(token) else { return }
                 try publisher.push(sample: first.sample, nowUs: Self.nowUs())
             }
+            guard authorized(token) else { return }
             if let datagram = try publisher.pollDatagram(nowUs: Self.nowUs()) {
                 guard !datagram.bytes.isEmpty, datagram.bytes.count <= 1500 else {
                     fail(token, "SRT returned an invalid UDP packet · local recording continues"); return
@@ -209,9 +235,13 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     }
     private func send(_ bytes: Data, _ token: UInt64) {
         guard let connection else { return }
+        guard authorized(token) else { return } // Last owned boundary, including control/retransmit packets.
         writing = true; writeDeadlineUs = Self.nowUs() + 100_000
+        let write = socketCounter.begin(bytes: bytes.count)
         connection.send(content: bytes, completion: .contentProcessed { [weak self] error in
-            guard let self, self.isCurrent(token), self.connection != nil, !self.cancelling else { return }
+            guard let self, self.isCurrent(token) else { return }
+            guard self.socketCounter.completed(write, success: error == nil) != .stale else { return }
+            guard self.connection != nil, !self.cancelling, self.writing else { return }
             self.writing = false; self.writeDeadlineUs = nil
             if error != nil {
                 try? self.publisher?.socketSendFailed(nowUs: Self.nowUs())
@@ -229,7 +259,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
             case .connected:
                 connected = true
                 observe(.accepted, DispatchTime.now().uptimeNanoseconds)
-                setStatus(token, "SRT connected · waiting for video keyframe · playback unconfirmed")
+                setStatus(token, hasVideo ? "SRT connected · waiting for video keyframe · playback unconfirmed" : "SRT connected · waiting for audio · playback unconfirmed")
             case .sending: observe(.sending, DispatchTime.now().uptimeNanoseconds)
             case .peerMediaProgress: observe(.peerMediaProgress, DispatchTime.now().uptimeNanoseconds)
             case .failed, .closed:
@@ -283,6 +313,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
             if self.cancelling { return }
             if self.stopping && self.connection != nil { return }
             self.stopping = true; self.clearPending()
+            guard self.authorized(token) else { return }
             do {
                 try self.publisher?.stop(nowUs: Self.nowUs())
                 if !self.writing, let datagram = try self.publisher?.pollDatagram(nowUs: Self.nowUs()) {
@@ -297,6 +328,16 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private func finishStop(_ token: UInt64) {
         guard isCurrent(token) else { return }
         releaseTransport(); setStatus(token, "SRT publisher stopped · destination end unconfirmed")
+    }
+    /// Runs on the network owner. Denial closes queued/native output, never
+    /// reports a network failure or starts a retry. Actual cancel still owns
+    /// cleanup; an OS-submitted datagram may complete after this boundary.
+    private func authorized(_ token: UInt64) -> Bool {
+        guard outputAuthority?.permits() == false else { return true }
+        lock.lock()
+        if generation == token { accepting = false; admission.close(); currentStatus = "Publishing authority ended · local recording continues" }
+        lock.unlock()
+        releaseTransport(); return false
     }
     private func failProtocol(_ token: UInt64, _ error: Error) {
         if let error = error as? NativeSrtError, error == .Backpressure {
@@ -328,7 +369,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     }
     private func completeRelease() {
         connection?.stateUpdateHandler = nil; connection = nil; cancelling = false
-        lock.lock(); released = true; accepting = false; lock.unlock()
+        let final = socketCounter.seal(nowNs: DispatchTime.now().uptimeNanoseconds)
+        lock.lock(); finalCounters = final; released = true; accepting = false; lock.unlock()
         let completions = stopCompletions; stopCompletions.removeAll()
         for completion in completions { completion() }
     }

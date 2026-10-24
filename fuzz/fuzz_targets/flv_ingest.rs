@@ -1,11 +1,14 @@
 //! Arbitrary RTMP video and audio tag bodies, as an RTMP publisher sends them.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use sapflow_hls::{FlvIngest, MuxerConfig};
+use sapflow_hls::{FlvIngest, MuxerConfig, TrackSet};
 
 fuzz_target!(|data: &[u8]| {
     let mut ing = FlvIngest::new(MuxerConfig::default());
-    let mut rest = data;
+    // Keep historical three-kind crash inputs unchanged. The explicit prefix
+    // adds track-declaration records for new seeds without reinterpreting them.
+    let declarations = data.starts_with(b"TRKS");
+    let mut rest = if declarations { &data[4..] } else { data };
     // Each record: kind (1), timestamp (4), length (2), body.
     while rest.len() >= 7 {
         let kind = rest[0];
@@ -13,14 +16,37 @@ fuzz_target!(|data: &[u8]| {
         let len = usize::from(u16::from_be_bytes([rest[5], rest[6]])).min(rest.len() - 7);
         let body = &rest[7..7 + len];
         rest = &rest[7 + len..];
-        match kind % 3 {
+        match kind % if declarations { 4 } else { 3 } {
             0 => {
-                if ing.video(ms, body, std::time::SystemTime::UNIX_EPOCH).is_err() {
+                if ing
+                    .video(ms, body, std::time::SystemTime::UNIX_EPOCH)
+                    .is_err()
+                {
                     return;
                 }
             }
-            1 => ing.audio(ms, body),
-            _ => ing.expect_audio(body.first().is_some_and(|b| b & 1 == 1)),
+            1 => {
+                if ing
+                    .audio_at(ms, body, std::time::SystemTime::UNIX_EPOCH)
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            2 => ing.expect_audio(body.first().is_some_and(|b| b & 1 == 1)),
+            _ => {
+                let tracks = match body.first().copied().unwrap_or(0) % 3 {
+                    0 => TrackSet::AudioOnly,
+                    1 => TrackSet::VideoOnly,
+                    _ => TrackSet::AudioVideo,
+                };
+                if ing
+                    .declare_tracks(tracks, std::time::SystemTime::UNIX_EPOCH)
+                    .is_err()
+                {
+                    return;
+                }
+            }
         }
     }
 });

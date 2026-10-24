@@ -13,8 +13,10 @@ use sapflow_hls::MuxerConfig;
 use crate::App;
 use crate::callback::Callbacks;
 use crate::publish_sessions::ScopedLease;
+#[cfg(test)]
 use crate::recorder::Recorder;
-use crate::stream::{Claim, LiveStream, Source, SourceKind};
+use crate::recorder::RecorderFactory;
+use crate::stream::{Claim, LiveStream, Retirement, Source, SourceKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -186,19 +188,21 @@ impl Publication {
         };
         // Global-publisher mode: the one authorised publisher may replace its
         // own stale connection. Scoped sessions keep their single owner.
-        let claimed = if scope.is_none() {
-            app.streams.claim_or_take_over(&req.path, cfg, kind)
-        } else {
-            app.streams.claim(&req.path, cfg, kind)
-        };
-        let (stream, generation, claim) = claimed.ok_or(Refusal::AlreadyLive)?;
-        let recording = {
-            let mut session = stream.session();
-            if claim == Claim::Fresh {
-                session.recorder = Self::recorder(app, &req.path, &callbacks);
-            }
-            session.recorder.is_some()
-        };
+        let recorder_factory = Self::recorder_factory(app, &req.path, &callbacks);
+        let mut recording = false;
+        let (stream, generation, claim) = app
+            .streams
+            .claim_configured(&req.path, cfg, kind, scope.is_none(), |session, claim| {
+                session.recorder_factory = recorder_factory;
+                if claim == Claim::Fresh {
+                    session.recorder = session
+                        .recorder_factory
+                        .as_ref()
+                        .map(RecorderFactory::start);
+                }
+                recording = session.recorder.is_some();
+            })
+            .ok_or(Refusal::AlreadyLive)?;
         tracing::info!(
             path = %req.path.as_path(),
             ?kind,
@@ -224,13 +228,13 @@ impl Publication {
         })
     }
 
-    fn recorder(
+    fn recorder_factory(
         app: &Arc<App>,
         path: &sapflow_core::StreamPath,
         callbacks: &Callbacks,
-    ) -> Option<Recorder> {
+    ) -> Option<RecorderFactory> {
         match &app.config.recordings {
-            Some(dir) if app.config.record_policy.records(path) => Some(Recorder::start(
+            Some(dir) if app.config.record_policy.records(path) => Some(RecorderFactory::new(
                 dir,
                 path,
                 callbacks.clone(),
@@ -277,7 +281,7 @@ impl Publication {
 
     /// Whether this connection still owns its stream.
     fn owns(&self, session: &crate::stream::Session) -> bool {
-        session.owned_by(self.generation)
+        session.owns_connection(self.generation)
     }
 
     fn push_open(
@@ -310,6 +314,9 @@ impl Publication {
                 return Err(PushError::Ingest(error));
             }
         };
+        if applied.media_loss {
+            session.mark_recording_incomplete(self.generation);
+        }
         let ready = !self.published
             && if self.scope.is_some() {
                 self.stream
@@ -331,7 +338,16 @@ impl Publication {
         if applied.restarted {
             // A new init segment: the old recording ends here (its file is
             // finished and reported) and a new one starts.
-            session.recorder = Self::recorder(&self.app, &self.stream.path, &self.callbacks);
+            session.recorder = session
+                .recorder_factory
+                .as_ref()
+                .map(RecorderFactory::start);
+            // One ingest batch can both begin an epoch and discover loss.
+            // Without sample-level attribution, conservatively taint both
+            // files before feeding any parts into the successor recorder.
+            if applied.media_loss || discarded {
+                session.mark_recording_incomplete(self.generation);
+            }
         }
         if let Some(rec) = &mut session.recorder
             && let Some((init, parts)) = self.stream.parts_after(rec.last_part())
@@ -358,7 +374,7 @@ impl Publication {
             };
             Health {
                 bitrate_kbps: bps / 1000,
-                keyframe_interval_ms: keyframe.as_millis() as u64,
+                keyframe_interval_ms: m.video().map(|_| keyframe.as_millis() as u64),
                 audio: m.audio().is_some(),
                 breaks: m.breaks(),
             }
@@ -384,27 +400,30 @@ impl Publication {
 /// `reconnect_grace` so an encoder that comes back carries it on.
 impl Drop for Publication {
     fn drop(&mut self) {
-        if !self.owns(&self.stream.session()) && self.scope.is_none() {
-            // Taken over: the newer connection owns the stream, its callbacks
-            // and its outage window. Leave them alone.
-            tracing::info!(path = %self.stream.path.as_path(), "replaced publisher closed");
+        let runtime = tokio::runtime::Handle::try_current();
+        let retirement =
+            self.app
+                .streams
+                .retire(&self.stream, self.generation, self.grace, runtime.is_ok());
+        if matches!(retirement, Retirement::Stale) {
+            if let Some(scope) = &self.scope {
+                scope.released(false);
+            } else {
+                tracing::info!(path = %self.stream.path.as_path(), "replaced publisher closed");
+            }
             return;
         }
         if self.published {
             self.callbacks
                 .send(&self.stream.path, StreamEvent::Unpublish);
         }
-        let grace = self
-            .stream
-            .session()
-            .hold_remaining(self.grace, Instant::now());
-        let runtime = tokio::runtime::Handle::try_current();
-        let hold = !grace.is_zero() && runtime.is_ok() && self.stream.has_content();
-        let held = self.app.streams.detach(&self.stream, self.generation, hold);
+        // The last complete AAC PES can create the first servable part only
+        // at EOF. Registry decides whether to hold after draining it.
+        let held = matches!(retirement, Retirement::Held(_));
         if let Some(scope) = &self.scope {
             scope.released(held);
         }
-        if let (true, Ok(rt)) = (held, runtime) {
+        if let (Retirement::Held(grace), Ok(rt)) = (retirement, runtime) {
             let (app, stream, generation) =
                 (self.app.clone(), self.stream.clone(), self.generation);
             rt.spawn(async move {
@@ -425,6 +444,10 @@ impl Drop for Publication {
 }
 
 #[cfg(test)]
+#[path = "publish_terminal_tests.rs"]
+pub(crate) mod terminal_tests;
+
+#[cfg(test)]
 pub(crate) mod loss_tests {
     use super::*;
     use crate::publish_observer::{CallbackScope, fixture_scope};
@@ -438,7 +461,7 @@ pub(crate) mod loss_tests {
         pub app: Arc<App>,
         pub scope: Arc<CallbackScope>,
         pub callbacks: tokio::sync::mpsc::Receiver<crate::callback::Queued>,
-        root: PathBuf,
+        pub(super) root: PathBuf,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -489,12 +512,15 @@ pub(crate) mod loss_tests {
             }
         }
         pub fn begin(&self) -> Publication {
+            self.begin_kind(SourceKind::Ts)
+        }
+        fn begin_kind(&self, kind: SourceKind) -> Publication {
             let req = PublishRequest::parse_srt_stream_id("publish:live/event-a:fixture:fixture")
                 .expect("request");
             Publication::begin(
                 &self.app,
                 &req,
-                SourceKind::Ts,
+                kind,
                 "127.0.0.1".parse().expect("loopback"),
             )
             .expect("begin")
@@ -524,6 +550,191 @@ pub(crate) mod loss_tests {
             .await
             .expect("bounded completion")
         }
+    }
+
+    #[tokio::test]
+    async fn error_after_epoch_mutation_preserves_only_the_prior_recording_prefix() {
+        let mut fixture = Fixture::new();
+        let mut old = fixture.begin();
+        Fixture::feed(&mut old);
+        let stream = old.stream.clone();
+        old.grace = Duration::from_secs(1);
+        old.end();
+        let (tracks, parts) = stream.parts_after(None).expect("sealed old epoch");
+        let duration = parts
+            .iter()
+            .fold(Duration::ZERO, |sum, part| sum + part.span);
+        let mut expected =
+            sapflow_hls::fmp4::init_segment_for_tracks(tracks.video(), tracks.audio(), duration)
+                .expect("old codec header")
+                .to_vec();
+        let mut origin = None;
+        for part in parts {
+            expected.extend_from_slice(
+                &sapflow_hls::fmp4::rebase_part_for_file(
+                    &part.data,
+                    tracks.audio().map(|a| a.sample_rate),
+                    &mut origin,
+                )
+                .expect("old accepted part"),
+            );
+        }
+        let mut replacement = fixture.begin_kind(SourceKind::Flv);
+        let mut restarted = false;
+        assert!(
+            replacement
+                .push(|source, now| {
+                    let Source::Flv(flv) = source else {
+                        unreachable!()
+                    };
+                    flv.declare_tracks(sapflow_hls::TrackSet::AudioOnly, now)?;
+                    flv.audio_at(0, &[0xaf, 0, 0x12, 0x10], now)?;
+                    let mut sample = vec![0x5a; 66];
+                    sample[..2].copy_from_slice(&[0xaf, 1]);
+                    for frame in 0..120u32 {
+                        let ms = (u64::from(frame) * 1024 * 1000 / 44_100) as u32;
+                        restarted |= flv.audio_at(ms, &sample, now)?.restarted;
+                    }
+                    Err(sapflow_hls::IngestError::InvalidAudio)
+                })
+                .is_err()
+        );
+        assert!(
+            restarted,
+            "actual muxer changed before the later batch error"
+        );
+        replacement.end();
+        let body = fixture.completion("incomplete").await;
+        let actual = std::fs::read(body["segmentPath"].as_str().expect("prefix path"))
+            .expect("synced old prefix");
+        assert_eq!(
+            actual, expected,
+            "new-epoch samples cannot enter the old-codec file"
+        );
+        assert_eq!(fixture.scope.observations.counts().recordings_finalised, 0);
+    }
+
+    #[tokio::test]
+    async fn one_batch_codec_rollover_and_audio_loss_taints_the_successor_recording() {
+        let mut fixture = Fixture::new();
+        let mut old = fixture.begin();
+        Fixture::feed(&mut old);
+        old.grace = Duration::from_secs(1);
+        old.end();
+        let mut replacement = fixture.begin_kind(SourceKind::Flv);
+        let mut observed = sapflow_hls::Update::default();
+        replacement
+            .push(|source, now| {
+                let Source::Flv(flv) = source else {
+                    unreachable!()
+                };
+                let mut update = flv.declare_tracks(sapflow_hls::TrackSet::AudioOnly, now)?;
+                update.merge(flv.audio_at(0, &[0xaf, 0, 0x12, 0x10], now)?);
+                let mut sample = vec![0x5a; 66];
+                sample[..2].copy_from_slice(&[0xaf, 1]);
+                for frame in 0..120u32 {
+                    let index = if frame >= 50 { frame + 3 } else { frame };
+                    let ms = (u64::from(index) * 1024 * 1000 / 44_100) as u32;
+                    update.merge(flv.audio_at(ms, &sample, now)?);
+                }
+                observed = update;
+                Ok(update)
+            })
+            .expect("one real codec-change and timestamp-gap batch");
+        assert!(observed.restarted && observed.media_loss);
+        replacement.end();
+        let first = fixture.completion("incomplete").await;
+        let second = fixture.completion("incomplete").await;
+        assert_ne!(first["segmentPath"], second["segmentPath"]);
+        assert_eq!(fixture.scope.observations.counts().recordings_finalised, 0);
+    }
+
+    #[tokio::test]
+    async fn declared_rtmp_audio_timestamp_loss_cannot_report_a_finalised_recording() {
+        for timing in ["clean", "missing", "repeated"] {
+            let mut fixture = Fixture::new();
+            let mut publication = fixture.begin_kind(SourceKind::Flv);
+            publication
+                .push(|source, now| match source {
+                    Source::Flv(flv) => flv.declare_tracks(sapflow_hls::TrackSet::AudioOnly, now),
+                    _ => unreachable!(),
+                })
+                .expect("explicit AAC topology");
+            publication
+                .push(|source, now| match source {
+                    Source::Flv(flv) => flv.audio_at(0, &[0xaf, 0, 0x11, 0x88], now),
+                    _ => unreachable!(),
+                })
+                .expect("canonical 48 kHz mono ASC");
+            // Original placeholders exercise real ingest, loss propagation and
+            // writer completion, not independent decoding of AAC payloads.
+            let mut sample = vec![0x5a; 66];
+            sample[..2].copy_from_slice(&[0xaf, 1]);
+            for frame in 0..120u32 {
+                let index = match timing {
+                    "missing" if frame >= 50 => frame + 3,
+                    "repeated" if frame == 50 => frame - 1,
+                    _ => frame,
+                };
+                let ms = (u64::from(index) * 1024 * 1000 / 48_000) as u32;
+                publication
+                    .push(|source, now| match source {
+                        Source::Flv(flv) => flv.audio_at(ms, &sample, now),
+                        _ => unreachable!(),
+                    })
+                    .expect("bounded timestamp recovery");
+            }
+            publication.end();
+            let expected = if timing == "clean" {
+                "finalised"
+            } else {
+                "incomplete"
+            };
+            fixture.completion(expected).await;
+            assert_eq!(
+                fixture.scope.observations.counts().recordings_finalised,
+                u64::from(timing == "clean")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_grace_audio_end_seals_the_known_tail_before_recording_completion() {
+        let mut fixture = Fixture::new();
+        let mut publication = fixture.begin();
+        for packet in
+            include_bytes!("../../sapflow-hls/tests/fixtures/audio-48k-mono.ts").chunks(1316)
+        {
+            crate::srt::feed(&mut publication, packet).expect("generated AAC fixture");
+        }
+        let stream = publication.stream.clone();
+        let before = stream
+            .lock()
+            .ingest
+            .muxer()
+            .expect("AAC muxer")
+            .next_part_id();
+        publication.end();
+        let after = stream
+            .lock()
+            .ingest
+            .muxer()
+            .expect("retained AAC state")
+            .next_part_id();
+        assert!(
+            after > before,
+            "normal end must seal the final accepted AAC part"
+        );
+        let body = fixture.completion("finalised").await;
+        let seconds: f64 = body["segmentDuration"]
+            .as_str()
+            .expect("duration")
+            .parse()
+            .expect("seconds");
+        assert!(
+            seconds >= 6.0,
+            "the last accepted audio frame must reach the recording"
+        );
     }
 
     #[tokio::test]
@@ -585,7 +796,7 @@ pub(crate) mod loss_tests {
             "the replaced connection sent unpublish (before: {before:?})"
         );
         Fixture::feed(&mut new);
-        assert!(new.stream.session().owned_by(new.generation));
+        assert!(new.stream.session().owns_connection(new.generation));
         new.end();
         fixture.completion("finalised").await;
     }

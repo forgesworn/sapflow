@@ -36,10 +36,10 @@ internal class ProbeMediaSource(private val init: ByteArray, private val part: B
  * playback. Hardware classification is the platform/vendor report (API29),
  * not a physical performance certification. Native AAC software is permitted. */
 internal class FiniteNativeOriginDecoder : OriginDecoder {
-    override fun decode(init: ByteArray, part: ByteArray, profile: CaptureProfile, cancel: OriginProbeCancellation): NativeOriginEvidence {
+    override fun decode(init: ByteArray, part: ByteArray, intent: CaptureIntent, cancel: OriginProbeCancellation): NativeOriginEvidence {
         validateProbeMp4(init, true); validateProbeMp4(part, false)
-        val deadline = minOf(cancel.deadlineNs, System.nanoTime() + OriginProbeLimits.DECODE_NS)
-        fun checkDeadline() { cancel.check(); check(System.nanoTime() < deadline) { "Native origin decode timed out" } }
+        val deadline = minOf(cancel.deadlineNs, cancel.nowNs() + OriginProbeLimits.DECODE_NS)
+        fun checkDeadline() { cancel.check(); check(cancel.nowNs() < deadline) { "Native origin decode timed out" } }
         fun track(video: Boolean): NativeTrackEvidence {
             val source = ProbeMediaSource(init, part)
             val extractor = MediaExtractor()
@@ -47,13 +47,14 @@ internal class FiniteNativeOriginDecoder : OriginDecoder {
             var started = false
             try {
                 checkDeadline(); extractor.setDataSource(source); checkDeadline()
-                require(extractor.trackCount == 2) { "Origin check requires exactly H264 and AAC tracks" }
-                val tracks = (0 until extractor.trackCount).map { extractor.getTrackFormat(it) }
-                require(tracks.count { it.getString(MediaFormat.KEY_MIME) == "video/avc" } == 1 &&
-                    tracks.count { it.getString(MediaFormat.KEY_MIME) == "audio/mp4a-latm" } == 1)
+                val trackCount = extractor.trackCount
+                require(trackCount == if (intent.hasVideo) 2 else 1) { "Origin track count differs from prepared capture" }
+                val tracks = (0 until trackCount).map { extractor.getTrackFormat(it) }
+                intent.requireTrackMimes(tracks.map { it.getString(MediaFormat.KEY_MIME) })
                 val index = tracks.indexOfFirst { it.getString(MediaFormat.KEY_MIME) == if (video) "video/avc" else "audio/mp4a-latm" }
                 val format = tracks[index]
                 if (video) {
+                    val profile = checkNotNull(intent.videoProfile)
                     val w = format.getInteger(MediaFormat.KEY_WIDTH); val h = format.getInteger(MediaFormat.KEY_HEIGHT)
                     require((w == profile.landscapeWidth && h == profile.landscapeHeight) ||
                         (h == profile.landscapeWidth && w == profile.landscapeHeight)) { "Origin dimensions differ from prepared profile" }
@@ -79,7 +80,7 @@ internal class FiniteNativeOriginDecoder : OriginDecoder {
                 extractor.selectTrack(index)
                 var inputEnded = false; var outputEnded = false; var inputs = 0
                 var previousInput = -1L
-                val progress = DecodedProbeProgress(video, profile.landscapeWidth * profile.landscapeHeight * 4)
+                val progress = DecodedProbeProgress(video, intent.videoProfile?.let { it.landscapeWidth * it.landscapeHeight * 4 } ?: 0)
                 val output = MediaCodec.BufferInfo()
                 while (!outputEnded && if (video) progress.count < 2 else progress.bytes < 4096) {
                     checkDeadline()
@@ -129,10 +130,10 @@ internal class FiniteNativeOriginDecoder : OriginDecoder {
                 failure?.let { throw OriginProbeCleanupFailure(it, listOfNotNull(codec, extractor, source)) }
             }
         }
-        val video = track(true); val audio = track(false)
+        val video = if (intent.hasVideo) track(true) else null; val audio = track(false)
         // Same completed part must yield overlapping A/V media, not merely two
         // unrelated valid tracks. Allow one 30fps frame plus AAC framing.
-        require(maxOf(video.firstPtsUs, audio.firstPtsUs) <= minOf(video.lastPtsUs, audio.lastPtsUs) + 60_000)
+        if (video != null) require(maxOf(video.firstPtsUs, audio.firstPtsUs) <= minOf(video.lastPtsUs, audio.lastPtsUs) + 60_000)
         checkDeadline()
         return NativeOriginEvidence(video, audio)
     }

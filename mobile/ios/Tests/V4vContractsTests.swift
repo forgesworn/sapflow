@@ -2,6 +2,19 @@ import XCTest
 @testable import SapflowBroadcaster
 
 final class V4vContractsTests: XCTestCase {
+    func testFreshMediaRetainsExplicitTrackSetWithoutInventingVideo() throws {
+        let base: [String: V4vJSON] = ["connectionEpoch": .integer(1), "partId": .integer(2), "initializationId": .integer(0),
+            "initPath": .string("/live/event-fixture/abc_init.mp4"), "partPath": .string("/live/event-fixture/abc_part2.mp4"),
+            "hasVideo": .bool(false), "hasAudio": .bool(true)]
+        let audio = try V4vFreshMedia(.object(base), event: "event-fixture", epoch: 1)
+        XCTAssertFalse(audio.hasVideo); XCTAssertTrue(audio.hasAudio)
+        let malformed: [[String: V4vJSON]] = [["hasAudio": .bool(false)], ["hasVideo": .integer(0)], ["hasVideo": .string("false")], ["hasAudio": .null]]
+        for changes in malformed {
+            XCTAssertThrowsError(try V4vFreshMedia(.object(base.merging(changes, uniquingKeysWith: { _, new in new })), event: "event-fixture", epoch: 1))
+        }
+        var missing = base; missing.removeValue(forKey: "hasVideo")
+        XCTAssertThrowsError(try V4vFreshMedia(.object(missing), event: "event-fixture", epoch: 1))
+    }
     private func parse(_ text: String) throws -> V4vJSON { try V4vJSON.parse(Data(text.utf8)) }
     func testEscapedAndNestedDuplicateKeysRejectedBeforeNormalisation() throws {
         for text in [#"{"a":1,"\u0061":2}"#, #"{"x":{"a":1,"a":1}}"#, #"{"x":[{"s":"secret","\u0073":"other"}]}"#] {

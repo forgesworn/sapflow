@@ -6,6 +6,7 @@ substitute bindings is performed. Android hardware acceptance is separate.
 from pathlib import Path
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -22,8 +23,30 @@ def run(*arguments, **kwargs):
     return subprocess.run(arguments, check=True, capture_output=True, text=True, **kwargs)
 
 
+def workspace_package_version(manifest):
+    """Match native packaging's quoted workspace version without running Cargo."""
+    package_table, tables, versions = False, 0, []
+    for line in manifest.splitlines():
+        value = line.strip()
+        if value.startswith("["):
+            package_table = re.fullmatch(r"\[workspace\.package]\s*(?:#.*)?", value) is not None
+            tables += int(package_table)
+        elif package_table and re.match(r"version\s*=", value):
+            match = re.fullmatch(r'version\s*=\s*"([^"]+)"\s*(?:#.*)?', value)
+            if match is None:
+                raise ValueError("Expected a double-quoted workspace.package.version")
+            versions.append(match[1])
+    if tables != 1 or len(versions) != 1:
+        raise ValueError("Expected one workspace.package.version")
+    version = versions[0]
+    if len(version) > 128 or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", version) is None:
+        raise ValueError("Expected a filename-safe workspace.package.version")
+    return version
+
+
 def main():
-    aar = ROOT / "target/native-packages/android-arm64-v8a/sapflow-0.0.0.aar"
+    version = workspace_package_version((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    aar = ROOT / f"target/native-packages/android-arm64-v8a/sapflow-{version}.aar"
     native = ROOT / "target/debug/libsapflow_ffi.dylib"
     jna = ROOT / "target/native-tooling/jna-5.19.1.jar"
     assert aar.is_file() and native.is_file() and jna.is_file(), "Actual packages/native check must be built first"

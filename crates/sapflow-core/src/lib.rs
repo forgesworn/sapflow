@@ -14,6 +14,9 @@ pub mod limits;
 pub mod publish_session;
 pub mod realtime;
 pub mod recording;
+pub mod tracks;
+
+pub use tracks::TrackSet;
 
 /// The prefix every stage stream lives under, matching the v4v contract.
 pub const STREAM_PREFIX: &str = "live/";
@@ -251,6 +254,40 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Non-empty track topology captured from a recording's own initialization.
+/// This describes tracks, not playability or complete-show coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingTracks {
+    /// The recording initialization contains audio and no video track.
+    AudioOnly,
+    /// The recording initialization contains video and no audio track.
+    VideoOnly,
+    /// The recording initialization contains both video and audio tracks.
+    AudioVideo,
+}
+
+impl RecordingTracks {
+    /// Refuses an initialization with no tracks.
+    pub fn new(has_video: bool, has_audio: bool) -> Option<Self> {
+        match (has_video, has_audio) {
+            (false, true) => Some(Self::AudioOnly),
+            (true, false) => Some(Self::VideoOnly),
+            (true, true) => Some(Self::AudioVideo),
+            (false, false) => None,
+        }
+    }
+
+    /// Whether the captured recording initialization contains video.
+    pub fn has_video(self) -> bool {
+        self != Self::AudioOnly
+    }
+
+    /// Whether the captured recording initialization contains audio.
+    pub fn has_audio(self) -> bool {
+        self != Self::VideoOnly
+    }
+}
+
 /// What the server reports to v4v's stream-health callback.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
@@ -265,6 +302,10 @@ pub enum StreamEvent {
         /// Length of the recording in seconds, sent as the string
         /// `segmentDuration`.
         duration_secs: f64,
+        /// Immutable topology captured from this recording's first init, not
+        /// inferred from the latest live stream. Legacy callback bytes omit it;
+        /// the scoped callback serializer may include it as `recordingTracks`.
+        recording_tracks: RecordingTracks,
     },
     /// Measured from the encoder's media, every so often while it publishes.
     /// v4v reads `bitrateKbps`; the rest is for Studio's encoder check.
@@ -276,9 +317,10 @@ pub enum StreamEvent {
 pub struct Health {
     /// Media received, audio and video, over the recent segments.
     pub bitrate_kbps: u64,
-    /// The typical segment length, which is the encoder's keyframe interval
-    /// once that is at least the segment target (1 s).
-    pub keyframe_interval_ms: u64,
+    /// The typical video segment length, which follows the encoder's keyframe
+    /// interval once that is at least the segment target (1 s). Absent for an
+    /// audio-only stream, which has no video keyframes.
+    pub keyframe_interval_ms: Option<u64>,
     /// Whether the stream carries audio.
     pub audio: bool,
     /// Breaks in the media (stalls, reconnects) since the publisher connected.
@@ -307,6 +349,7 @@ impl StreamEvent {
             Self::RecordSegmentComplete {
                 segment_path,
                 duration_secs,
+                ..
             } => s.push_str(&format!(
                 ",\"segmentPath\":\"{}\",\"segmentDuration\":\"{}\"",
                 json_escape(segment_path),
@@ -314,7 +357,10 @@ impl StreamEvent {
             )),
             Self::Health(h) => s.push_str(&format!(
                 ",\"health\":{{\"bitrateKbps\":{},\"keyframeIntervalMs\":{},\"audio\":{},\"breaks\":{}}}",
-                h.bitrate_kbps, h.keyframe_interval_ms, h.audio, h.breaks
+                h.bitrate_kbps,
+                h.keyframe_interval_ms.map_or_else(|| "null".to_owned(), |value| value.to_string()),
+                h.audio,
+                h.breaks
             )),
             Self::Publish | Self::Unpublish => {}
         }
@@ -394,6 +440,25 @@ fn percent_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_topology_is_nonempty_and_does_not_change_legacy_callback_bytes() {
+        assert_eq!(RecordingTracks::new(false, false), None);
+        let path = StreamPath::parse("live/event-a1").expect("path");
+        for (video, audio) in [(false, true), (true, false), (true, true)] {
+            let tracks = RecordingTracks::new(video, audio).expect("nonempty");
+            assert_eq!((tracks.has_video(), tracks.has_audio()), (video, audio));
+            let event = StreamEvent::RecordSegmentComplete {
+                segment_path: "/fixture.mp4".into(),
+                duration_secs: 1.0,
+                recording_tracks: tracks,
+            };
+            assert_eq!(
+                event.callback_body(&path),
+                r#"{"event":"recordSegmentComplete","path":"live/event-a1","segmentPath":"/fixture.mp4","segmentDuration":"1"}"#
+            );
+        }
+    }
 
     #[test]
     fn accepts_v4v_event_paths() {
@@ -515,6 +580,7 @@ mod tests {
         let rec = StreamEvent::RecordSegmentComplete {
             segment_path: "/recordings/live/event-a1/1792500000.mp4".into(),
             duration_secs: 3723.5,
+            recording_tracks: RecordingTracks::AudioVideo,
         };
         assert_eq!(
             rec.callback_body(&p),
@@ -523,6 +589,7 @@ mod tests {
         let odd = StreamEvent::RecordSegmentComplete {
             segment_path: "a\"b\\c\n".into(),
             duration_secs: 1.0,
+            recording_tracks: RecordingTracks::AudioOnly,
         };
         assert!(
             odd.callback_body(&p)
@@ -530,7 +597,7 @@ mod tests {
         );
         let health = StreamEvent::Health(Health {
             bitrate_kbps: 2620,
-            keyframe_interval_ms: 1000,
+            keyframe_interval_ms: Some(1000),
             audio: true,
             breaks: 2,
         });
@@ -539,6 +606,21 @@ mod tests {
         assert_eq!(
             health.callback_body(&p),
             r#"{"event":"health","path":"live/event-a1","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":2}}"#
+        );
+    }
+
+    #[test]
+    fn audio_only_health_has_no_video_keyframe_measurement() {
+        let path = StreamPath::parse("live/event-audio").expect("fixture path");
+        let event = StreamEvent::Health(Health {
+            bitrate_kbps: 96,
+            keyframe_interval_ms: None,
+            audio: true,
+            breaks: 0,
+        });
+        assert_eq!(
+            event.callback_body(&path),
+            r#"{"event":"health","path":"live/event-audio","health":{"bitrateKbps":96,"keyframeIntervalMs":null,"audio":true,"breaks":0}}"#
         );
     }
 
@@ -567,6 +649,7 @@ mod tests {
         let rec = StreamEvent::RecordSegmentComplete {
             segment_path: "/r/x.mp4".into(),
             duration_secs: 1.0,
+            recording_tracks: RecordingTracks::VideoOnly,
         };
         assert_eq!(rec.name(), "recordSegmentComplete");
     }

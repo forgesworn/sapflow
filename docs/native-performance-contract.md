@@ -92,7 +92,7 @@ or mobile performance measurements already exist.
 | Existing component | Adopt or evaluate | Performance contract |
 | --- | --- | --- |
 | sapflow-srt | Extend the current sans-IO receiver's protocol layers with the caller/sender required by B3 | Reuse packet, sequence, timing and bounded protocol machinery; independent sender interop and pacing remain required |
-| sapflow-hls::rtmp | Extend our chunk/AMF/handshake code with a publishing client for B3R | Bounded TCP queues, measured FLV packaging and TLS costs; existing server support is not a completed client |
+| sapflow-rtmp | Reuse our chunk/AMF/handshake and publishing-client implementation for B3R | Bounded TCP queues, measured FLV packaging and TLS costs; source and finite interoperability checks remain separate from physical publishing acceptance |
 | sapflow-hls | Reuse codec configuration, encoded-sample handling, fragmented MP4 and HLS packaging | Share immutable payloads; benchmark muxing/assembly copies and keep a recording sink independent of uplink stalls |
 | sapflow-core | Reuse compatible pure policy/types behind the appropriate adapter | Keep V4V-specific paths and callbacks out of the general client interface |
 | RelaySwarm and RelaySwarmKit | Reuse signed-media/session contracts and the existing Swift implementation in B6 | Hash/cache once per immutable object where valid; bounded verification and fallback; prove native/browser compatibility |

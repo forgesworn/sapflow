@@ -8,6 +8,14 @@ protocol V4vJournalKeySource: AnyObject {
     func create() throws -> Data
 }
 
+/// Only the publishing journal participates. The foreground app owner captures
+/// one unguessable show identity; neither a signer store nor a restored process
+/// implicitly acquires permission to use a key while the device is locked.
+protocol V4vJournalShowLeasing: AnyObject {
+    func acquireShowLease(owner: UUID) throws
+    func releaseShowLease(owner: UUID)
+}
+
 /// An app journal encryption key, not a creator Nostr key or signer. Tests use
 /// an injected key source and never access a user's Keychain.
 final class V4vKeychainJournalKey: V4vJournalKeySource {
@@ -38,7 +46,7 @@ final class V4vKeychainJournalKey: V4vJournalKeySource {
 /// Bounded encrypted file in a caller-provided app-private directory. Atomic
 /// rename is followed by directory fsync and exact readback BEFORE success.
 /// No repair/reset/import API: missing halves and corruption fail closed.
-final class V4vEncryptedJournal: V4vJournalStore {
+final class V4vEncryptedJournal: V4vJournalStore, V4vJournalShowLeasing {
     private let directory: URL
     private let keys: V4vJournalKeySource
     private let aad: Data
@@ -46,6 +54,20 @@ final class V4vEncryptedJournal: V4vJournalStore {
     private var poisoned = false
     private let maxFile = 262_144
     private let name = "session.v1.sealed"
+    private var showLease: (owner: UUID, key: Data)? // same serial journal owner, at most 32 key bytes
+    func acquireShowLease(owner: UUID) throws {
+        guard !poisoned else { throw V4vFailure.journal }
+        if let showLease { guard showLease.owner == owner else { throw V4vFailure.busy }; return }
+        // Foreground acquisition validates the existing encrypted halves. A
+        // lease never creates a key or repairs a missing/corrupt journal.
+        guard try load() != nil, let key = try keys.load(), key.count == 32 else { throw V4vFailure.journal }
+        showLease = (owner, key)
+    }
+    func releaseShowLease(owner: UUID) {
+        guard showLease?.owner == owner else { return }
+        showLease = nil // Data lifetime release, not a byte-zeroisation claim.
+    }
+    private func currentKey() throws -> Data? { try showLease?.key ?? keys.load() }
     init(directory: URL, profile: V4vConnectorProfile, keys: V4vJournalKeySource) throws {
         guard directory.isFileURL else { throw V4vFailure.journal }
         self.directory = directory; self.keys = keys
@@ -93,7 +115,7 @@ final class V4vEncryptedJournal: V4vJournalStore {
         guard !poisoned else { throw V4vFailure.journal }
         do {
             let fd = try openDirectory(); defer { Darwin.close(fd) }
-            let bytes = try read(fd), key = try keys.load()
+            let bytes = try read(fd), key = try currentKey()
             if bytes == nil && key == nil { return nil }
             guard let bytes, let key, key.count == 32 else { throw V4vFailure.journal }
             let clear = try AES.GCM.open(AES.GCM.SealedBox(combined: bytes), using: SymmetricKey(data: key), authenticating: aad)
@@ -107,7 +129,7 @@ final class V4vEncryptedJournal: V4vJournalStore {
         do {
             let clear = try document.encoded()
             dir = try openDirectory(); defer { Darwin.close(dir) }
-            let old = try read(dir), existingKey = try keys.load()
+            let old = try read(dir), existingKey = try currentKey()
             guard (old == nil) == (existingKey == nil) else { throw V4vFailure.journal }
             if let old, let existingKey {
                 let previous = try AES.GCM.open(AES.GCM.SealedBox(combined: old), using: SymmetricKey(data: existingKey), authenticating: aad)

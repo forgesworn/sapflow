@@ -63,7 +63,8 @@ pub fn parse(buf: &[u8]) -> Parsed {
     };
     // HTTP/1.0 closes unless asked to keep alive; HTTP/1.1 stays open unless
     // asked to close.
-    let mut close = version == 0;
+    let mut requested_close = false;
+    let mut requested_keep_alive = false;
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("transfer-encoding") {
             return Parsed::Invalid;
@@ -76,13 +77,14 @@ pub fn parse(buf: &[u8]) -> Parsed {
             for token in h.value.split(|&b| b == b',') {
                 let token = token.trim_ascii();
                 if token.eq_ignore_ascii_case(b"close") {
-                    close = true;
-                } else if token.eq_ignore_ascii_case(b"keep-alive") && version == 0 {
-                    close = false;
+                    requested_close = true;
+                } else if token.eq_ignore_ascii_case(b"keep-alive") {
+                    requested_keep_alive = true;
                 }
             }
         }
     }
+    let close = requested_close || (version == 0 && !requested_keep_alive);
     let keep_alive_10 = version == 0 && !close;
     let method = match method {
         "GET" => Method::Get,
@@ -206,6 +208,22 @@ mod tests {
                 .0
                 .close
         );
+    }
+
+    #[test]
+    fn connection_close_dominates_every_token_and_header_order() {
+        for version in ["1.0", "1.1"] {
+            for headers in [
+                "Connection: close, keep-alive\r\n",
+                "Connection: keep-alive, close\r\n",
+                "Connection: close\r\nConnection: keep-alive\r\n",
+                "Connection: keep-alive\r\nConnection: close\r\n",
+            ] {
+                let (req, _) = request(&format!("GET / HTTP/{version}\r\n{headers}\r\n"));
+                assert!(req.close, "{version}: {headers}");
+                assert!(!req.keep_alive_10, "close must not advertise keep-alive");
+            }
+        }
     }
 
     #[test]

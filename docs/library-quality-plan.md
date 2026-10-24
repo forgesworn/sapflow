@@ -144,6 +144,11 @@ recording, current-attempt origin observation and a complete V4V show. Track
 library gaps discovered there against LQ1 to LQ5 instead of hiding them in app
 workarounds. Preserve LQ6 to LQ8 as visible follow-on work.
 
+The first [encoded publishing admission benchmark](sdk-publishing-benchmark.md)
+measures one synchronous SDK boundary on generated host AAC. Its paired Release
+measurements and queue correctness controls contribute to LQ4; they do not close
+the complete-path, allocation, physical power or competitor comparison gates.
+
 ## Decisions to recover or settle
 
 - Append any additional earlier OBS requests if their discussion is recovered;

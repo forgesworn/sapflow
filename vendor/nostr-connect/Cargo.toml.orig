@@ -1,0 +1,46 @@
+[package]
+name = "nostr-connect"
+version = "0.45.2"
+edition.workspace = true
+description = "Nostr Remote Signing (NIP46)"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+keywords = ["nostr", "signer", "nip46", "nostr-connect"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["ring", "rustls-tls-webpki-roots"]
+aws_lc_rs = ["nostr-sdk/aws_lc_rs"]
+native-tls = ["nostr-sdk/native-tls"]
+native-tls-vendored = ["nostr-sdk/native-tls-vendored"]
+ring = ["nostr-sdk/ring"]
+rustls-tls-native-roots = ["nostr-sdk/rustls-tls-native-roots"]
+rustls-tls-webpki-roots = ["nostr-sdk/rustls-tls-webpki-roots"]
+
+[dependencies]
+async-utility.workspace = true
+futures-core = "0.3"
+nostr = { workspace = true, features = ["std", "rand", "nip04", "nip44", "nip46"] }
+nostr-sdk.workspace = true
+opaquerr.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+dialoguer = "0.12"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+webbrowser = "1.1"
+nostr-sdk = { path = "../../nostr-sdk", features = ["local-relay"] }
+
+[[example]]
+name = "handle-auth-url"
+
+[[example]]
+name = "nostr-connect-signer"

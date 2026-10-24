@@ -30,7 +30,11 @@ import kotlin.concurrent.withLock
  * destination hostname; there is no trust override or plaintext fallback.
  * Failed attempts stop sending while independent capture/recording can continue. */
 internal class RtmpPublishingSink(private val destination: RtmpDestination, streamKey: String,
-    private val events: (PublishingAttemptEvent) -> Unit = {}) : EncodedSink {
+    private val events: (PublishingAttemptEvent) -> Unit = {},
+    private val intent: CaptureIntent = CaptureIntent.DEFAULT,
+    private val authority: PublishingAuthority? = null) : EncodedSink, SocketOutputProvider {
+    private val outputCounter = SocketOutputCounter(if (destination.tls) SocketOutputAccounting.RTMPS_APPLICATION else SocketOutputAccounting.RTMP_APPLICATION)
+    override val socketOutput: SocketOutputSource get() = outputCounter
     private val message = AtomicReference("Destination prepared · press Start to connect")
     override val status: String get() = message.get()
     private val closed = AtomicBoolean(false)
@@ -38,7 +42,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
     private val accepted = AtomicBoolean(false)
     private val startupReported = AtomicBoolean(false)
     private val peerReported = AtomicBoolean(false)
-    private val firstKeyframe = FirstKeyframeGate()
+    private val firstKeyframe = FirstKeyframeGate(intent.hasVideo)
     private val socket = AtomicReference<Socket?>()
     private val tcpSocket = AtomicReference<Socket?>()
     private val dnsCancellation = CancellationSignal()
@@ -63,11 +67,12 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
 
     private fun startNetwork() {
         check(!closed.get()) { "Attempt closed" }
+        authority?.requireValid()
         startedMs = SystemClock.elapsedRealtime()
         publisher = NativeRtmpPublisher(destination.app, preparedKey, destination.tcUrl, 0uL, startedMs.toULong()).apply {
-            // The current hardware capture profile always declares H264 + AAC.
+            // Immutable declared topology, never inferred from first CSD arrival.
             // A partial first CSD arrival must never turn this into video-only.
-            declareTracks(true, true)
+            declareTracks(intent.hasVideo, intent.hasAudio)
         }
         preparedKey = ""
         lock.withLock { armNativeDeadline() }
@@ -79,13 +84,14 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         if (closed.get() || !ready.get()) return
         val startedNs = System.nanoTime()
         try {
+            authority?.requireValid()
             if (!firstKeyframe.admit(sample::isVideo, sample::isKeyframe)) return
             lock.withLock {
                 lockDelay.record(System.nanoTime() - startedNs)
                 if (closed.get() || !ready.get()) return
                 // The origin may be silent after publication. Refresh the
                 // transport clock before assigning owned wire-media deadlines.
-                val snapshot = publisher!!.sendAndTakeOutput(sample, nowMs())
+                val snapshot = withPublishingAuthority(authority) { publisher!!.sendAndTakeOutput(sample, nowMs()) }
                 check(snapshot.state == NativeRtmpState.PUBLISHING) { "Origin stopped publication" }
                 reportProgress(snapshot.startupSubmitted, snapshot.peerMediaProgress)
                 queuedWireBytes.set(snapshot.queuedOutputBytes.toLong())
@@ -116,6 +122,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                 tcpSocket.set(candidate)
                 socket.set(candidate)
                 try {
+                    authority?.requireValid()
                     candidate.connect(InetSocketAddress(address, destination.port), remaining.toInt())
                     candidate.tcpNoDelay = true
                     connected = candidate
@@ -130,7 +137,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                 tls.sslParameters = tls.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
                 tls.soTimeout = 5000
                 val handshakeDeadline = timers.schedule(Runnable { abortTransport() }, 5, TimeUnit.SECONDS)
-                try { tls.startHandshake() } finally { handshakeDeadline.cancel(false) }
+                try { withPublishingAuthority(authority) { tls.startHandshake() } } finally { handshakeDeadline.cancel(false) }
                 transport = tls
             }
             if (closed.get()) return
@@ -149,7 +156,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                     bytes.clear(); bytes.put(input, 0, count); bytes.flip()
                     lock.withLock {
                         if (closed.get()) return
-                        publisher!!.feed(bytes, nowMs())
+                        withPublishingAuthority(authority) { publisher!!.feed(bytes, nowMs()) }
                         flushOutput()
                         updateState()
                         pollProgress()
@@ -157,7 +164,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
                 } catch (_: SocketTimeoutException) {
                     lock.withLock {
                         if (closed.get()) return
-                        publisher!!.tick(nowMs())
+                        withPublishingAuthority(authority) { publisher!!.tick(nowMs()) }
                         flushOutput()
                         updateState()
                         pollProgress()
@@ -173,6 +180,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
     }
 
     private fun updateState() {
+        authority?.requireValid()
         when (publisher!!.state()) {
             NativeRtmpState.PUBLISHING -> {
                 ready.set(true)
@@ -204,7 +212,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
 
     /** Called under lock by a control/network worker, never a codec callback. */
     private fun flushOutput() {
-        val output = publisher!!.takeOutput()
+        val output = withPublishingAuthority(authority) { publisher!!.takeOutput() }
         queuedWireBytes.set(publisher!!.queuedOutputBytes().toLong())
         // Cancel a stale queue timer before a possibly blocking socket write.
         // Taken bytes are now protected by the separate write watchdog.
@@ -217,7 +225,9 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         val transport = socket.get() ?: error("Transport unavailable")
         val deadline = timers.schedule(Runnable { abortTransport() }, 2, TimeUnit.SECONDS)
         val writeStartedNs = System.nanoTime()
-        try { transport.getOutputStream().write(output) }
+        try { outputCounter.write(output.size) {
+            withPublishingAuthority(authority) { transport.getOutputStream().write(output); output.size }
+        } }
         finally { writeDelay.record(System.nanoTime() - writeStartedNs); deadline.cancel(false) }
     }
 
@@ -239,7 +249,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
             }
             try {
                 if (closed.get() || deadlineGeneration.get() != generation) return@Runnable
-                publisher!!.tick(nowMs())
+                withPublishingAuthority(authority) { publisher!!.tick(nowMs()) }
                 updateState()
                 pollProgress()
                 armNativeDeadline()
@@ -290,6 +300,7 @@ internal class RtmpPublishingSink(private val destination: RtmpDestination, stre
         val released = releasePublisher()
         preparedKey = ""
         check(reader?.isAlive != true && released) { "RTMP worker cleanup exceeded its deadline" }
+        outputCounter.seal()
         message.set("RTMP attempt stopped")
     }
 

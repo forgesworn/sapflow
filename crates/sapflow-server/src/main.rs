@@ -5,6 +5,8 @@ mod config;
 mod fdlimit;
 mod http;
 mod http1;
+#[cfg(test)]
+mod http_backend_tests;
 mod own_http;
 mod publish;
 mod publish_control;

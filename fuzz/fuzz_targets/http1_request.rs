@@ -22,8 +22,20 @@ fuzz_target!(|data: &[u8]| {
                 let mut longer = rest.to_vec();
                 longer.extend_from_slice(b"GET / HTTP/1.1\r\n");
                 assert_eq!(http1::parse(&longer), Parsed::Request(req.clone(), used));
-                let head = http1::head("200 OK", "", Some(used), http1::Persist::Default);
+                let persistence = if req.close {
+                    http1::Persist::Close
+                } else if req.keep_alive_10 {
+                    http1::Persist::KeepAlive
+                } else {
+                    http1::Persist::Default
+                };
+                let head = http1::head("200 OK", "", Some(used), persistence);
                 assert!(head.ends_with("\r\n\r\n"));
+                assert_eq!(head.contains("connection: close\r\n"), req.close);
+                assert_eq!(
+                    head.contains("connection: keep-alive\r\n"),
+                    req.keep_alive_10
+                );
                 rest = rest.get(used..).unwrap_or_default();
             }
             // A partial head is never longer than the limit.

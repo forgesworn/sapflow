@@ -10,6 +10,7 @@
 
 use super::amf0::{self, Amf0Error, Value};
 use super::chunk::{ChunkError, ChunkReader, ChunkWriter, Read};
+use crate::TrackSet;
 
 /// Bytes a connection may hold (unparsed input plus partial messages)
 /// before its publish is accepted. Commands are small.
@@ -64,6 +65,12 @@ pub enum Event {
     Metadata {
         /// Whether `audiocodecid` is present as a number or a string.
         audio: bool,
+    },
+    /// An explicit immutable topology, never inferred from missing metadata or
+    /// from which encoder happens to emit first.
+    Tracks {
+        /// The declared tracks, validated against any codec identifiers.
+        tracks: TrackSet,
     },
     /// An FLV video tag body and its timestamp in milliseconds.
     Video {
@@ -160,6 +167,8 @@ pub struct Session {
     peer_window: Option<u32>,
     received: u64,
     since_ack: u64,
+    tracks: Option<TrackSet>,
+    media_started: bool,
 }
 
 impl Default for Session {
@@ -185,6 +194,8 @@ impl Session {
             peer_window: None,
             received: 0,
             since_ack: 0,
+            tracks: None,
+            media_started: false,
         };
         s.control(SET_CHUNK_SIZE, &OUT_CHUNK_SIZE.to_be_bytes());
         s.writer.set_chunk_size(OUT_CHUNK_SIZE);
@@ -330,12 +341,22 @@ impl Session {
             }
             ACKNOWLEDGEMENT | SET_PEER_BANDWIDTH => {}
             AUDIO if publishing => {
+                if self.tracks.is_some_and(|tracks| !tracks.has_audio()) {
+                    self.state = State::Done;
+                    return Err(SessionError::Malformed(type_id));
+                }
+                self.media_started = true;
                 return Ok(Some(Event::Audio {
                     timestamp,
                     data: payload,
                 }));
             }
             VIDEO if publishing => {
+                if self.tracks.is_some_and(|tracks| !tracks.has_video()) {
+                    self.state = State::Done;
+                    return Err(SessionError::Malformed(type_id));
+                }
+                self.media_started = true;
                 return Ok(Some(Event::Video {
                     timestamp,
                     data: payload,
@@ -343,14 +364,43 @@ impl Session {
             }
             AMF0_DATA | AMF3_DATA if publishing => {
                 let body = if type_id == AMF3_DATA {
+                    if payload.first() != Some(&0) {
+                        self.state = State::Done;
+                        return Err(SessionError::Malformed(type_id));
+                    }
                     payload.get(1..).unwrap_or_default()
                 } else {
                     &payload[..]
                 };
-                // Bad metadata is not worth ending a show over.
-                if let Ok(values) = amf0::decode_all(body) {
-                    return Ok(metadata(&values));
+                // Invalid AMF data can hide a partial declaration. Reject it
+                // rather than downgrade an intended topology to legacy hints.
+                let event = amf0::decode_all(body)
+                    .map_err(SessionError::Amf0)
+                    .and_then(|values| metadata(&values));
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        self.state = State::Done;
+                        return Err(error);
+                    }
+                };
+                if let Some(Event::Tracks { tracks }) = event {
+                    if let Some(current) = self.tracks {
+                        if current == tracks {
+                            return Ok(None);
+                        }
+                    } else if !self.media_started {
+                        self.tracks = Some(tracks);
+                        return Ok(Some(Event::Tracks { tracks }));
+                    }
+                    self.state = State::Done;
+                    return Err(SessionError::Malformed(type_id));
                 }
+                // Legacy hints can neither alter nor reopen an explicit set.
+                if self.tracks.is_some() && matches!(event, Some(Event::Metadata { .. })) {
+                    return Ok(None);
+                }
+                return Ok(event);
             }
             AMF0_COMMAND | AMF3_COMMAND => {
                 let body = if type_id == AMF3_COMMAND {
@@ -523,25 +573,66 @@ fn be32(b: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes([a, b, c, d]))
 }
 
-/// `[@setDataFrame,] onMetaData, {...}`: whether it names an audio codec
-/// (a number from OBS and ffmpeg, a string such as "mp4a" from some).
-fn metadata(values: &[Value]) -> Option<Event> {
+/// Explicit flags select topology only as one complete, unambiguous pair.
+/// Without either flag, preserve the legacy audio-codec hint, including absent
+/// video fields. Unsupported codecs never become a positive declaration.
+fn metadata(values: &[Value]) -> Result<Option<Event>, SessionError> {
     let values = match values.first().and_then(Value::as_str) {
-        Some("@setDataFrame") => values.get(1..)?,
+        Some("@setDataFrame") => &values[1..],
         _ => values,
     };
     let [name, props, ..] = values else {
-        return None;
+        return Ok(None);
     };
     if name.as_str() != Some("onMetaData") {
-        return None;
+        return Ok(None);
     }
-    props.properties()?;
+    let Some(properties) = props.properties() else {
+        return Ok(None);
+    };
+    let has_flag = properties
+        .iter()
+        .any(|(key, _)| key == "hasVideo" || key == "hasAudio");
+    if has_flag {
+        let bad = || SessionError::Malformed(AMF0_DATA);
+        if values.len() != 2 {
+            return Err(bad());
+        }
+        for key in ["hasVideo", "hasAudio", "videocodecid", "audiocodecid"] {
+            if properties.iter().filter(|(name, _)| name == key).count() > 1 {
+                return Err(bad());
+            }
+        }
+        let (Some(Value::Boolean(video)), Some(Value::Boolean(audio))) =
+            (props.get("hasVideo"), props.get("hasAudio"))
+        else {
+            return Err(bad());
+        };
+        let tracks = match (*video, *audio) {
+            (true, true) => TrackSet::AudioVideo,
+            (true, false) => TrackSet::VideoOnly,
+            (false, true) => TrackSet::AudioOnly,
+            (false, false) => return Err(bad()),
+        };
+        for (key, enabled, id, alias) in [
+            ("videocodecid", *video, 7.0, "avc1"),
+            ("audiocodecid", *audio, 10.0, "mp4a"),
+        ] {
+            if let Some(value) = props.get(key)
+                && (!enabled
+                    || !matches!(value, Value::Number(n) if *n == id)
+                        && !matches!(value, Value::String(s) if s == alias))
+            {
+                return Err(bad());
+            }
+        }
+        return Ok(Some(Event::Tracks { tracks }));
+    }
     let audio = matches!(
         props.get("audiocodecid"),
         Some(Value::Number(_) | Value::String(_))
     );
-    Some(Event::Metadata { audio })
+    Ok(Some(Event::Metadata { audio }))
 }
 
 #[cfg(test)]
@@ -941,8 +1032,178 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn explicit_metadata_needs_both_unique_boolean_flags_and_matching_codecs() {
+        let parse = |properties| metadata(&[s("onMetaData"), Value::Object(properties)]);
+        for (video, audio, tracks) in [
+            (false, true, TrackSet::AudioOnly),
+            (true, false, TrackSet::VideoOnly),
+            (true, true, TrackSet::AudioVideo),
+        ] {
+            assert_eq!(
+                parse(vec![
+                    ("hasVideo".into(), Value::Boolean(video)),
+                    ("hasAudio".into(), Value::Boolean(audio))
+                ]),
+                Ok(Some(Event::Tracks { tracks }))
+            );
+        }
+        let base = || {
+            vec![
+                ("hasVideo".into(), Value::Boolean(false)),
+                ("hasAudio".into(), Value::Boolean(true)),
+            ]
+        };
+        let mut cases = vec![
+            vec![("hasVideo".into(), Value::Boolean(false))],
+            vec![("hasAudio".into(), Value::Boolean(true))],
+            vec![
+                ("hasVideo".into(), n(0.0)),
+                ("hasAudio".into(), Value::Boolean(true)),
+            ],
+            vec![
+                ("hasVideo".into(), Value::Boolean(false)),
+                ("hasAudio".into(), Value::Null),
+            ],
+            vec![
+                ("hasVideo".into(), Value::Boolean(false)),
+                ("hasAudio".into(), Value::Boolean(false)),
+            ],
+        ];
+        for extra in [
+            vec![("hasVideo".into(), Value::Boolean(false))],
+            vec![("hasAudio".into(), Value::Boolean(false))],
+            vec![
+                ("audiocodecid".into(), n(10.0)),
+                ("audiocodecid".into(), n(10.0)),
+            ],
+            vec![("audiocodecid".into(), n(f64::NAN))],
+            vec![("audiocodecid".into(), n(2.0))],
+            vec![("audiocodecid".into(), Value::Null)],
+            vec![("videocodecid".into(), n(7.0))],
+            vec![("videocodecid".into(), n(0.0))],
+        ] {
+            let mut invalid = base();
+            invalid.extend(extra);
+            cases.push(invalid);
+        }
+        for properties in cases {
+            assert_eq!(parse(properties), Err(SessionError::Malformed(AMF0_DATA)));
+        }
+        let mut valid = base();
+        valid.push(("audiocodecid".into(), s("mp4a")));
+        assert_eq!(
+            parse(valid),
+            Ok(Some(Event::Tracks {
+                tracks: TrackSet::AudioOnly
+            }))
+        );
+        // Missing video fields and AAC sequence headers remain legacy hints,
+        // never positive evidence that this publisher has no video track.
+        assert_eq!(
+            parse(vec![("audiocodecid".into(), n(10.0))]),
+            Ok(Some(Event::Metadata { audio: true }))
+        );
+    }
+
+    fn metadata_body(properties: Vec<(&str, Value)>) -> Vec<u8> {
+        let mut body = Vec::new();
+        for value in [
+            s("@setDataFrame"),
+            s("onMetaData"),
+            Value::Object(
+                properties
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value))
+                    .collect(),
+            ),
+        ] {
+            amf0::encode(&value, &mut body);
+        }
+        body
+    }
+
+    #[test]
+    fn topology_is_cold_idempotent_and_cannot_be_changed_or_overridden_by_legacy_hints() {
+        let mut client = Client::new();
+        let mut sess = up_to_publish(&mut client);
+        sess.accept_publish();
+        let body = metadata_body(vec![
+            ("hasVideo", Value::Boolean(false)),
+            ("hasAudio", Value::Boolean(true)),
+            ("audiocodecid", n(10.0)),
+        ]);
+        // Metadata for an unrelated message stream cannot freeze this one.
+        sess.feed(&client.message(AMF0_DATA, 2, 0, &body))
+            .expect("other stream");
+        assert!(all(&mut sess).is_empty());
+        assert_eq!(sess.tracks, None);
+        sess.feed(&client.message(AMF0_DATA, 1, 0, &body))
+            .expect("declaration");
+        assert_eq!(
+            all(&mut sess),
+            vec![Event::Tracks {
+                tracks: TrackSet::AudioOnly
+            }]
+        );
+        sess.feed(&client.message(AUDIO, 1, 0, &[0xaf, 0, 0x11, 0x88]))
+            .expect("audio configuration");
+        assert!(matches!(
+            sess.poll().expect("AAC config event"),
+            Some(Event::Audio { .. })
+        ));
+        sess.feed(&client.message(AMF0_DATA, 1, 0, &body))
+            .expect("identical metadata");
+        assert!(all(&mut sess).is_empty());
+        let legacy = metadata_body(vec![("videocodecid", n(7.0))]);
+        sess.feed(&client.message(AMF0_DATA, 1, 0, &legacy))
+            .expect("legacy metadata");
+        assert!(all(&mut sess).is_empty());
+        sess.feed(&client.message(VIDEO, 1, 0, &[0x17, 0]))
+            .expect("forbidden video");
+        assert_eq!(sess.poll(), Err(SessionError::Malformed(VIDEO)));
+        assert!(matches!(sess.state, State::Done));
+        assert_eq!(sess.poll(), Ok(None));
+    }
+
+    #[test]
+    fn late_conflicting_partial_or_truncated_declaration_closes_the_session() {
+        let valid = metadata_body(vec![
+            ("hasVideo", Value::Boolean(false)),
+            ("hasAudio", Value::Boolean(true)),
+        ]);
+        let conflict = metadata_body(vec![
+            ("hasVideo", Value::Boolean(true)),
+            ("hasAudio", Value::Boolean(true)),
+        ]);
+        let partial = metadata_body(vec![("hasVideo", Value::Boolean(false))]);
+        for invalid in [&conflict[..], &partial[..], &valid[..valid.len() - 1]] {
+            let mut client = Client::new();
+            let mut sess = up_to_publish(&mut client);
+            sess.accept_publish();
+            sess.feed(&client.message(AMF0_DATA, 1, 0, &valid))
+                .expect("first declaration");
+            all(&mut sess);
+            sess.feed(&client.message(AMF0_DATA, 1, 0, invalid))
+                .expect("invalid declaration");
+            assert!(sess.poll().is_err());
+            assert!(matches!(sess.state, State::Done));
+        }
+        let mut client = Client::new();
+        let mut sess = up_to_publish(&mut client);
+        sess.accept_publish();
+        sess.feed(&client.message(AUDIO, 1, 0, &[0xaf, 0, 0x11, 0x88]))
+            .expect("early legacy AAC");
+        all(&mut sess);
+        assert_eq!(sess.tracks, None);
+        sess.feed(&client.message(AMF0_DATA, 1, 0, &valid))
+            .expect("late declaration");
+        assert_eq!(sess.poll(), Err(SessionError::Malformed(AMF0_DATA)));
+        assert!(matches!(sess.state, State::Done));
+    }
+
+    #[test]
     fn metadata_forms() {
-        let meta = |vals: Vec<Value>| metadata(&vals);
+        let meta = |vals: Vec<Value>| metadata(&vals).expect("valid legacy metadata");
         let obj = |k: &str, v: Value| Value::Object(vec![(k.into(), v)]);
         assert_eq!(
             meta(vec![s("onMetaData"), obj("audiocodecid", s("mp4a"))]),

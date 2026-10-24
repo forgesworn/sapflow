@@ -1,6 +1,7 @@
 package dev.forgesworn.sapflow.broadcaster
 
 import dev.forgesworn.sapflow.MediaSample
+import dev.forgesworn.sapflow.NoHandle
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
@@ -37,7 +38,9 @@ class ReconnectingPublishingSinkTest {
         override fun tick(nowNs: Long) = if (deadlineNs?.let { nowNs >= it } == true) ReconnectAction.Expired else ReconnectAction.None
         override fun stop() { stops.incrementAndGet() }
     }
-    private class Sink(val events: (PublishingAttemptEvent) -> Unit) : EncodedSink {
+    private class Sink(val events: (PublishingAttemptEvent) -> Unit) : EncodedSink, SocketOutputProvider {
+        val output = SocketOutputCounter(SocketOutputAccounting.SRT_DATAGRAM)
+        override val socketOutput: SocketOutputSource get() = output
         val started = CountDownLatch(1)
         val controlThread = java.util.concurrent.atomic.AtomicReference<Thread?>()
         val closing = CountDownLatch(1)
@@ -45,19 +48,27 @@ class ReconnectingPublishingSinkTest {
         var releaseClose: CountDownLatch? = null
         var failClose = false
         var failedStartupCleanup = false
+        var startRelease: CountDownLatch? = null
+        var acceptsSamples = false
+        val samples = AtomicInteger()
         override val status = "synthetic transport"
         override fun start() {
             controlThread.set(Thread.currentThread())
             started.countDown()
+            startRelease?.let { check(it.await(2, TimeUnit.SECONDS)) }
             if (failedStartupCleanup) throw IllegalStateException("synthetic setup failure").apply {
                 addSuppressed(IllegalStateException("synthetic partial cleanup failure"))
             }
         }
-        override fun consume(sample: MediaSample) { error("No media expected in control tests") }
+        override fun consume(sample: MediaSample) {
+            check(acceptsSamples) { "No media expected in control tests" }
+            samples.incrementAndGet()
+        }
         override fun close() {
             closing.countDown()
             releaseClose?.let { check(it.await(2, TimeUnit.SECONDS)) { "bounded synthetic close" } }
             if (failClose) error("synthetic retained owner")
+            output.seal()
             closed.countDown()
         }
     }
@@ -87,6 +98,68 @@ class ReconnectingPublishingSinkTest {
         assertEquals(1, h.sinks.size)
         assertEquals(1, h.policy.stops.get())
         assertNull(h.owner.observationScope)
+    }
+
+    @Test fun firstResumedSampleExpiresBeforeTransportWhenWakeTickIsWithheldAndRefreshStaysSameOwner() {
+        val boot = java.util.concurrent.atomic.AtomicLong(1)
+        data class Grant(val owner: Long, val deadline: Long)
+        val grant = java.util.concurrent.atomic.AtomicReference(Grant(1, 100))
+        val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val policy = Policy()
+        var transport: Sink? = null
+        val coordinator = ReconnectingPublishingSink(policyFactory = { policy }, authorityNowNs = boot::get,
+            sampleAuthority = PublishingAuthority { val current = grant.get(); current.owner == 1L && boot.get() < current.deadline }) { events ->
+            Sink(events).also { transport = it; it.acceptsSamples = true; it.startRelease = release; entered.countDown() }
+        }
+        val epoch = coordinator.newEpoch()
+        epoch.start()
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            val sink = checkNotNull(transport); assertTrue(sink.started.await(2, TimeUnit.SECONDS))
+            // The actual control executor is blocked inside transport start.
+            // Neither a scheduled alarm nor this explicit wake tick can run.
+            epoch.revalidateAuthority()
+            MediaSample(NoHandle).use { sample ->
+                epoch.consume(sample); assertEquals(1, sink.samples.get())
+                boot.set(50); grant.set(Grant(1, 200)) // Valid committed same-owner refresh.
+                boot.set(150); epoch.consume(sample); assertEquals(2, sink.samples.get())
+                boot.set(200) // Suspension advances BOOTTIME, not a media timestamp.
+                assertThrows(IllegalStateException::class.java) { epoch.consume(sample) }
+                assertEquals(2, sink.samples.get()); assertFalse(sample.uniffiIsDestroyed)
+                // Late refresh cannot resurrect an already fenced coordinator.
+                grant.set(Grant(1, 300)); epoch.consume(sample)
+                assertEquals(2, sink.samples.get())
+            }
+        } finally { release.countDown(); epoch.close() }
+        assertEquals(1, policy.starts.get()); assertEquals(0, policy.failures.get())
+    }
+    @Test fun logicalSocketBytesSurviveActualEpochCloseAndOldCounterCannotCountTwice() {
+        val h = Harness(); val a = h.owner.newEpoch(); a.start(); val first = h.sink(0)
+        val source = checkNotNull((a as SocketOutputProvider).socketOutput)
+        first.output.completed(100); a.close()
+        assertNull(source.socketSnapshot(System.nanoTime()).endedAtNs) // Codec rotation is not logical End.
+        val b = h.owner.newEpoch(); b.start(); val second = h.sink(1)
+        assertSame(source, (b as SocketOutputProvider).socketOutput)
+        second.output.completed(200); first.output.completed(100) // First real writer is sealed.
+        assertEquals(300L, source.socketSnapshot(System.nanoTime()).completedBytes)
+        b.stopDestination(); b.close()
+        val final = source.socketSnapshot(System.nanoTime())
+        assertEquals(300L, final.completedBytes); assertEquals(SocketOutputPhase.CLOSED, final.phase)
+        assertNotNull(final.endedAtNs); assertFalse(final.incomplete)
+    }
+    @Test fun blockedActualCloseRetainsClosingCounterAndUnknownCleanupNeverRetiresItAsComplete() {
+        val h = Harness(); val release = CountDownLatch(1)
+        h.configure = { it.releaseClose = release; it.failClose = true }
+        val epoch = h.owner.newEpoch(); epoch.start(); val sink = h.sink(0)
+        val source = checkNotNull((epoch as SocketOutputProvider).socketOutput)
+        sink.output.completed(100); epoch.stopDestination()
+        assertTrue(sink.closing.await(2, TimeUnit.SECONDS)); sink.output.completed(16)
+        assertEquals(116L, source.socketSnapshot(System.nanoTime()).completedBytes)
+        assertEquals(SocketOutputPhase.CLOSING, source.socketSnapshot(System.nanoTime()).phase)
+        release.countDown(); assertThrows(ExecutionException::class.java) { epoch.close() }
+        val final = source.socketSnapshot(System.nanoTime())
+        assertEquals(116L, final.completedBytes); assertTrue(final.incomplete)
+        assertEquals(1, h.sinks.size)
     }
     @Test fun failedAttemptMustFinishCleanupBeforeFreshFactoryAndEventsAreCoalesced() {
         val h = Harness(); val release = CountDownLatch(1)
@@ -360,4 +433,16 @@ class ReconnectingPublishingSinkTest {
             observer.close(); assertTrue(observer.awaitStopped(2000))
         }
     }
+    @Test fun autoEpochClosureAndRetryDoNotEmitLogicalAdmissionTerminalButExplicitEndDoes() {
+        val h=Harness();val first=h.owner.newEpoch();val second=h.owner.newEpoch()
+        var oldTerminals=0;var newTerminals=0
+        first.setTerminalAdmissionListener{oldTerminals++};second.setTerminalAdmissionListener{newTerminals++}
+        first.start();val a=h.sink(0);first.close()
+        assertEquals(0,oldTerminals);assertEquals(0,newTerminals)
+        second.start();val b=h.sink(1);b.events(PublishingAttemptEvent.Failed());h.sink(2)
+        assertEquals(0,newTerminals);assertEquals(0,oldTerminals)
+        second.stopDestination();second.stopDestination();second.close()
+        assertEquals(1,newTerminals);assertEquals(0,oldTerminals);assertEquals(0L,a.closed.count)
+    }
+
 }

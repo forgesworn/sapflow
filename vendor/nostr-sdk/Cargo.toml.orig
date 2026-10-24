@@ -1,0 +1,119 @@
+[package]
+name = "nostr-sdk"
+version = "0.45.4"
+edition.workspace = true
+description = "A full-featured SDK for building high-performance and reliable nostr applications."
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+keywords = ["nostr", "sdk"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["ring", "rustls-tls-webpki-roots"]
+aws_lc_rs = ["async-wsocket/aws_lc_rs"]
+native-tls = ["async-wsocket/native-tls"]
+native-tls-vendored = ["async-wsocket/native-tls-vendored"]
+ring = ["async-wsocket/ring"]
+rustls-tls-native-roots = ["async-wsocket/rustls-tls-native-roots"]
+rustls-tls-webpki-roots = ["async-wsocket/rustls-tls-webpki-roots"]
+local-relay = ["dep:nostr-memory", "tokio/net"]
+
+[dependencies]
+async-utility.workspace = true
+async-wsocket = { version = "0.17", features = ["socks"] }
+faster-hex = { workspace = true, features = ["std"] }
+futures = "0.3"
+lru.workspace = true
+negentropy = { workspace = true, features = ["std"] }
+nostr = { workspace = true, features = ["std", "rand", "os-rng"] }
+nostr-database.workspace = true
+nostr-gossip.workspace = true
+nostr-memory = { workspace = true, optional = true }
+opaquerr = { workspace = true, features = ["alloc"] }
+rand = { workspace = true, features = ["std", "sys_rng"] }
+tokio = { workspace = true, features = ["macros", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = { workspace = true, features = ["std"] }
+universal-time = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+base64 = { workspace = true, features = ["std"] }
+bitcoin_hashes.workspace = true
+hyper = { version = "1.9", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+nostr = { path = "../nostr", default-features = false, features = ["all-nips"] }
+nostr-connect = { path = "../signer/nostr-connect", default-features = false }
+nostr-lmdb = { path = "../database/nostr-lmdb", default-features = false }
+nostr-ndb = { path = "../database/nostr-ndb", default-features = false }
+nostr-memory = { path = "../database/nostr-memory", default-features = false }
+nostr-gossip-memory = { path = "../gossip/nostr-gossip-memory", default-features = false }
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[[example]]
+name = "blacklist"
+
+[[example]]
+name = "client"
+
+[[example]]
+name = "comment"
+
+[[example]]
+name = "fetch-events"
+
+[[example]]
+name = "gossip"
+
+[[example]]
+name = "monitor"
+
+[[example]]
+name = "nostr-connect"
+
+[[example]]
+name = "bot"
+
+[[example]]
+name = "nostrdb"
+
+[[example]]
+name = "stream-events"
+
+[[example]]
+name = "subscriptions"
+
+[[example]]
+name = "tor"
+
+[[example]]
+name = "lmdb"
+
+[[example]]
+name = "whitelist"
+
+[[example]]
+name = "local-relay-hyper"
+required-features = ["local-relay"]
+
+[[example]]
+name = "local-relay-mock"
+required-features = ["local-relay"]
+
+[[example]]
+name = "local-relay-policy"
+required-features = ["local-relay"]
+
+[[example]]
+name = "local-relay-simple"
+required-features = ["local-relay"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bench)'] }

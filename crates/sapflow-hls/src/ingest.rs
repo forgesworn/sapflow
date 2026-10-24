@@ -13,18 +13,27 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use mpeg2ts::es::StreamType;
-use mpeg2ts::pes::{PesPacketReader, ReadPesPacket};
+use mpeg2ts::pes::{PesHeader, PesPacket, PesPacketReader, ReadPesPacket};
 use mpeg2ts::ts::{Pid, ReadTsPacket, TsPacket, TsPacketReader, TsPayload};
 
 use crate::codec::{self, AAC_FRAME_SAMPLES, AacConfig, H264Config};
 use crate::muxer::{MuxError, Muxer, MuxerConfig, Update};
 
+use crate::TrackSet;
 use crate::time::{Unwrapper, signed_delta};
 
 const TS_SIZE: usize = 188;
 const SYNC: u8 = 0x47;
 /// Cap on unconsumed input (a few seconds at stage bitrates).
 const MAX_BUFFER: usize = 8 * 1024 * 1024;
+// Limits on assembled payload lengths and bounded PES reservation requests,
+// not Vec capacity, allocator overhead, retained HLS data or whole-process RSS.
+const MAX_PES_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_PES_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "pes_limits_tests.rs"]
+mod pes_limits_tests;
 
 /// Why an ingest cannot carry on with the publisher's media.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +44,19 @@ pub enum IngestError {
     PresentationExpired,
     /// No keyframe for too long, or a segment beyond the size limit.
     SegmentTooLarge,
+    /// No supported non-empty track topology can be initialized.
+    InvalidTracks,
+    /// Media contradicts this connection's explicit immutable declaration.
+    TrackConflict,
+    /// The AAC configuration is unsupported or changes within the connection.
+    InvalidAudio,
+    /// An AAC timestamp cannot be represented on the supported timeline.
+    InvalidTimestamp,
+    /// This connection has explicitly finished; resume with a new ingest.
+    InputFinished,
+    /// Unread input or pending PES exceeds this parser's resource policy.
+    /// No more input is accepted; `finish` still seals the accepted prefix.
+    InputLimitExceeded,
 }
 
 impl std::fmt::Display for IngestError {
@@ -43,14 +65,32 @@ impl std::fmt::Display for IngestError {
             Self::PresentationExpired => f.write_str("presentation reconnect deadline expired"),
             Self::UnsupportedVideo => f.write_str("video is not H.264"),
             Self::SegmentTooLarge => f.write_str("segment too large (keyframe interval?)"),
+            Self::InvalidTracks => f.write_str("invalid track set"),
+            Self::TrackConflict => f.write_str("track set changed within a connection"),
+            Self::InvalidAudio => f.write_str("unsupported or changed AAC configuration"),
+            Self::InvalidTimestamp => f.write_str("audio timestamp outside supported range"),
+            Self::InputFinished => f.write_str("transport input already finished"),
+            Self::InputLimitExceeded => f.write_str("TS input or PES retention limit exceeded"),
         }
     }
 }
 
 impl std::error::Error for IngestError {}
 
+impl From<MuxError> for IngestError {
+    fn from(value: MuxError) -> Self {
+        match value {
+            MuxError::SegmentTooLarge => Self::SegmentTooLarge,
+            MuxError::InvalidTracks => Self::InvalidTracks,
+            MuxError::InvalidAudio => Self::InvalidAudio,
+            MuxError::Timestamp => Self::InvalidTimestamp,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct Program {
+    seen: bool,
     h264: bool,
     other_video: bool,
     aac: bool,
@@ -84,6 +124,19 @@ struct Input {
     program: Program,
     dropped: u64,
     reset_pes: bool,
+    terminal: bool,
+    ended: bool,
+    limit_exceeded: bool,
+}
+
+// Scalar/header metadata only: never a second copy of elementary payloads.
+// PID limits the table to the finite transport PID space. Completed multi-TS
+// bounded PES leave the table immediately; START-only PES await real EOF.
+struct PesBoundary {
+    header: PesHeader,
+    expected: Option<usize>,
+    received: usize,
+    reserved: usize,
 }
 
 struct Feed {
@@ -92,11 +145,159 @@ struct Feed {
     inner: TsPacketReader<SlotReader>,
     continuity: HashMap<Pid, (u8, [u8; TS_SIZE])>,
     pending: Option<Box<TsPacket>>,
+    boundaries: HashMap<Pid, PesBoundary>,
+    pending_bytes: usize,
+}
+
+impl Feed {
+    fn normalize_pes_length(packet: &mut TsPacket, raw: &[u8; TS_SIZE]) -> bool {
+        let Some(TsPayload::PesStart(pes)) = &mut packet.payload else {
+            return true;
+        };
+        if !(0xc0..=0xef).contains(&pes.header.stream_id.as_u8()) {
+            return true;
+        }
+        // The maintained TS reader validates the optional header and consumes
+        // FF stuffing, but PesHeader does not retain header_data_length. Its
+        // PES reader reconstructs only the minimum header length. Preserve the
+        // advertised raw payload length by subtracting stuffing from the parsed
+        // packet_len before that reader assembles payloads. No payload parsing
+        // or copying is introduced here, and unbounded video stays unbounded.
+        let at = if raw[3] & 0x20 != 0 {
+            5 + usize::from(raw[4])
+        } else {
+            4
+        };
+        let Some(&length) = raw.get(at + 8) else {
+            return false;
+        };
+        let actual = 3 + u16::from(length);
+        let minimum = 3
+            + u16::from(pes.header.pts.is_some()) * 5
+            + u16::from(pes.header.dts.is_some()) * 5
+            + u16::from(pes.header.escr.is_some()) * 6;
+        let Some(stuffing) = actual.checked_sub(minimum) else {
+            return false;
+        };
+        if pes.pes_packet_len != 0 {
+            if pes.pes_packet_len < actual {
+                return false;
+            }
+            pes.pes_packet_len -= stuffing;
+        }
+        true
+    }
+
+    // Check BEFORE handing a packet to PesPacketReader: bounded START allocates
+    // its advertised size immediately, while an unbounded continuation appends
+    // indefinitely. Only scalar accounting is added, never payload copies or a
+    // second parser. HashMap keys remain bounded by the transport PID space.
+    fn observe_boundary(&mut self, packet: &TsPacket) -> bool {
+        let pid = packet.header.pid;
+        match &packet.payload {
+            Some(TsPayload::PesStart(pes)) => {
+                // normalize_pes_length already accounts for raw stuffing;
+                // subtracting this retained minimum now gives the exact raw
+                // advertised payload length, not a guessed header extent.
+                let header_len = 3
+                    + usize::from(pes.header.pts.is_some()) * 5
+                    + usize::from(pes.header.dts.is_some()) * 5
+                    + usize::from(pes.header.escr.is_some()) * 6;
+                if pes.pes_packet_len != 0 && usize::from(pes.pes_packet_len) < header_len {
+                    // Upstream rejects this START BEFORE allocating/inserting
+                    // its replacement. Special stream IDs omit the optional
+                    // wire header, so normalize_pes_length does not reject
+                    // them. Preserve the old owner's accounting exactly and
+                    // let the maintained reader report its existing error.
+                    return true;
+                }
+                let expected = (pes.pes_packet_len != 0)
+                    .then(|| usize::from(pes.pes_packet_len).checked_sub(header_len))
+                    .flatten();
+                let reserved = expected.unwrap_or(0).max(pes.data.len());
+                let Some(transient) = self.pending_bytes.checked_add(reserved) else {
+                    return false;
+                };
+                // Upstream allocates the new packet BEFORE releasing the old
+                // packet on this PID. Both reservations must fit transiently.
+                if reserved > MAX_PES_BYTES || transient > MAX_PENDING_PES_BYTES {
+                    return false;
+                }
+                let old = self.boundaries.insert(
+                    pid,
+                    PesBoundary {
+                        header: pes.header.clone(),
+                        expected,
+                        received: pes.data.len(),
+                        reserved,
+                    },
+                );
+                self.pending_bytes = transient - old.map_or(0, |b| b.reserved);
+            }
+            Some(TsPayload::PesContinuation(data)) => {
+                if let Some(boundary) = self.boundaries.get_mut(&pid) {
+                    let Some(received) = boundary.received.checked_add(data.len()) else {
+                        return false;
+                    };
+                    let reserved = boundary.expected.unwrap_or(0).max(received);
+                    let Some(total) = self
+                        .pending_bytes
+                        .checked_sub(boundary.reserved)
+                        .and_then(|other| other.checked_add(reserved))
+                    else {
+                        return false;
+                    };
+                    if reserved > MAX_PES_BYTES || total > MAX_PENDING_PES_BYTES {
+                        return false;
+                    }
+                    boundary.received = received;
+                    boundary.reserved = reserved;
+                    self.pending_bytes = total;
+                    if boundary.expected.is_some_and(|n| boundary.received >= n) {
+                        // The PES reader returns a complete bounded packet (or
+                        // rejects an overrun) in this very continuation call.
+                        self.pending_bytes -= reserved;
+                        self.boundaries.remove(&pid);
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn retention_limit(&self) -> mpeg2ts::Error {
+        if let Ok(mut input) = self.input.lock() {
+            input.limit_exceeded = true;
+            input.dropped = input.dropped.saturating_add(1);
+        }
+        io::Error::new(io::ErrorKind::InvalidData, "PES retention limit exceeded").into()
+    }
+
+    fn terminal_aac(&self, pes: &PesPacket<Vec<u8>>) -> bool {
+        // The upstream EOF path also returns unbounded video. Only a pending,
+        // exactly bounded audio packet may cross our terminal boundary. Reject
+        // ambiguous same-header streams rather than guess their PID identity.
+        let mut matches = self
+            .boundaries
+            .iter()
+            .filter(|(_, b)| b.header == pes.header);
+        let Some((_, boundary)) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none()
+            && (0xc0..=0xdf).contains(&pes.header.stream_id.as_u8())
+            && boundary.expected == Some(pes.data.len())
+            && boundary.received == pes.data.len()
+    }
 }
 
 impl ReadTsPacket for Feed {
     fn read_ts_packet(&mut self) -> mpeg2ts::Result<Option<TsPacket>> {
         if let Some(packet) = self.pending.take() {
+            if !self.observe_boundary(&packet) {
+                return Err(self.retention_limit());
+            }
             return Ok(Some(*packet));
         }
         loop {
@@ -104,11 +305,29 @@ impl ReadTsPacket for Feed {
                 let mut input = self.input.lock().map_err(|_| starved())?;
                 let Input { buf, start, .. } = &mut *input;
                 // Resynchronise on the sync byte if the stream slipped.
+                let before = *start;
                 match buf[*start..].iter().position(|&b| b == SYNC) {
                     Some(skip) => *start += skip,
                     None => *start = buf.len(),
                 }
-                if buf.len() - *start < TS_SIZE {
+                let skipped = input.start != before;
+                if skipped {
+                    input.dropped = input.dropped.saturating_add(1);
+                    input.reset_pes = true;
+                    return Err(
+                        io::Error::new(io::ErrorKind::InvalidData, "transport sync lost").into(),
+                    );
+                }
+                let remaining = input.buf.len() - input.start;
+                if remaining < TS_SIZE {
+                    if input.terminal {
+                        if remaining != 0 {
+                            input.dropped = input.dropped.saturating_add(1);
+                            input.start = input.buf.len();
+                        }
+                        input.ended = true;
+                        return Ok(None);
+                    }
                     input.starved = true;
                     return Err(starved());
                 }
@@ -124,7 +343,18 @@ impl ReadTsPacket for Feed {
                 slot.pos = 0;
             }
             match self.inner.read_ts_packet() {
-                Ok(Some(p)) => {
+                Ok(Some(mut p)) => {
+                    if !Self::normalize_pes_length(&mut p, &packet) {
+                        if let Ok(mut input) = self.input.lock() {
+                            input.dropped = input.dropped.saturating_add(1);
+                            input.reset_pes = true;
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid PES header length",
+                        )
+                        .into());
+                    }
                     let pid = p.header.pid;
                     let carries_pes = matches!(
                         p.payload,
@@ -172,7 +402,10 @@ impl ReadTsPacket for Feed {
                     if let Some(TsPayload::Pmt(pmt)) = &p.payload
                         && let Ok(mut input) = self.input.lock()
                     {
-                        let mut program = Program::default();
+                        let mut program = Program {
+                            seen: true,
+                            ..Program::default()
+                        };
                         for es in &pmt.es_info {
                             match es.stream_type {
                                 StreamType::H264 => program.h264 = true,
@@ -185,6 +418,9 @@ impl ReadTsPacket for Feed {
                             }
                         }
                         input.program = program;
+                    }
+                    if !self.observe_boundary(&p) {
+                        return Err(self.retention_limit());
                     }
                     return Ok(Some(p));
                 }
@@ -219,6 +455,7 @@ pub struct EsIngest {
     aac: Option<AacConfig>,
     /// Whether to hold the first keyframe until the audio config is known.
     expect_audio: bool,
+    declared: Option<TrackSet>,
     muxer: Option<Muxer>,
 }
 
@@ -233,12 +470,13 @@ impl EsIngest {
             pps: None,
             aac: None,
             expect_audio: true,
+            declared: None,
             muxer: None,
         }
     }
 
     /// Carries on another connection's stream (see [`Muxer::interrupt`]).
-    /// The first keyframe decides: with the same parameter sets and audio
+    /// The first supported media decides: with the same parameter sets and audio
     /// config, its media continues the stream after a discontinuity;
     /// otherwise it starts a new initialization epoch on the retained muxer
     /// and the update says `restarted` (for recording rollover).
@@ -249,12 +487,13 @@ impl EsIngest {
         }
     }
 
-    /// The muxer, once the first keyframe has created one.
+    /// The muxer, once a video keyframe or explicitly declared audio-only frame
+    /// has created one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.muxer.as_ref()
     }
 
-    /// The muxer, mutably, once the first keyframe has created one.
+    /// Mutable access to the muxer after the first supported media creates it.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.muxer.as_mut()
     }
@@ -266,10 +505,35 @@ impl EsIngest {
         self.muxer.take()
     }
 
-    /// Sets whether the first keyframe waits for an AAC configuration before
-    /// the init segment is fixed.
+    /// Only an authoritative PMT or explicit RTMP declaration may select
+    /// audio-only. Missing video metadata and early AAC do not imply radio.
+    /// A declaration alone creates no muxer or servable media.
+    pub fn declare_tracks(
+        &mut self,
+        tracks: TrackSet,
+        _now: SystemTime,
+    ) -> Result<Update, IngestError> {
+        if self.declared.is_some_and(|old| old != tracks)
+            || (self.origin.is_some() && self.muxer.as_ref().is_some_and(|m| m.tracks() != tracks))
+        {
+            return Err(IngestError::TrackConflict);
+        }
+        self.declared = Some(tracks);
+        self.expect_audio = tracks.has_audio();
+        Ok(Update::default())
+    }
+
+    /// The explicitly declared topology, or `None` for legacy video-led ingest.
+    pub fn declared_tracks(&self) -> Option<TrackSet> {
+        self.declared
+    }
+
+    /// Sets whether the first video keyframe waits for AAC configuration before
+    /// fixing the init segment. An explicit track declaration takes precedence.
     pub fn set_expect_audio(&mut self, expect: bool) {
-        self.expect_audio = expect;
+        if self.declared.is_none() {
+            self.expect_audio = expect;
+        }
     }
 
     /// Parameter sets from out of band (RTMP's sequence header) or in band.
@@ -277,7 +541,7 @@ impl EsIngest {
         if let Some(sps) = sps {
             if let Some(m) = &self.muxer
                 && self.origin.is_some()
-                && m.video().sps != sps
+                && m.video().is_some_and(|video| video.sps != sps)
                 && self.sps.as_ref() != Some(&sps)
             {
                 // The init segment is fixed at the first keyframe.
@@ -332,6 +596,9 @@ impl EsIngest {
         au: codec::AccessUnit,
         now: SystemTime,
     ) -> Result<Update, IngestError> {
+        if self.declared == Some(TrackSet::AudioOnly) {
+            return Err(IngestError::TrackConflict);
+        }
         self.parameter_sets(au.sps, au.pps);
         if au.data.is_empty() {
             return Ok(Update::default());
@@ -354,9 +621,7 @@ impl EsIngest {
             }
             let audio = if self.expect_audio { self.aac } else { None };
             if let Some(m) = &mut self.muxer
-                && (m.video().sps != video.sps
-                    || m.video().pps != video.pps
-                    || m.audio().copied() != audio)
+                && (m.video() != Some(&video) || m.audio().copied() != audio)
             {
                 tracing::warn!(
                     "reconnected encoder changed configuration; starting a new codec epoch on the existing timeline"
@@ -380,15 +645,67 @@ impl EsIngest {
                 Bytes::from(au.data),
                 now,
             )
-            .map_err(|e| match e {
-                MuxError::SegmentTooLarge => IngestError::SegmentTooLarge,
-            })?;
+            .map_err(IngestError::from)?;
         update.restarted |= restarted;
         Ok(update)
     }
 
-    /// One raw AAC frame.
+    /// One raw AAC frame plus caller-owned wall time. The returned update is
+    /// essential for waking audio-only playlists and beginning origin recording.
+    pub fn audio_at(
+        &mut self,
+        pts: i64,
+        config: AacConfig,
+        payload: &[u8],
+        now: SystemTime,
+    ) -> Result<Update, IngestError> {
+        if self.declared == Some(TrackSet::VideoOnly) {
+            return Err(IngestError::TrackConflict);
+        }
+        if (self.origin.is_some() || self.declared == Some(TrackSet::AudioOnly))
+            && self.aac.is_some_and(|old| old != config)
+        {
+            return Err(IngestError::InvalidAudio);
+        }
+        self.audio_config(config);
+        if payload.is_empty() {
+            return Ok(Update::default());
+        }
+        if self.declared != Some(TrackSet::AudioOnly) {
+            self.audio(pts, config, payload);
+            return Ok(Update::default());
+        }
+        let mut update = Update::default();
+        if self.origin.is_none() {
+            if let Some(muxer) = &mut self.muxer {
+                if muxer.tracks() != TrackSet::AudioOnly || muxer.audio() != Some(&config) {
+                    update.merge(muxer.reconfigure_tracks(None, Some(config), now)?);
+                    update.restarted = true;
+                }
+            } else {
+                self.muxer = Some(Muxer::audio_only(self.cfg, config)?);
+            }
+            self.origin = Some(pts);
+        }
+        let origin = self.origin.ok_or(IngestError::InvalidTimestamp)?;
+        let relative = pts
+            .checked_sub(origin)
+            .ok_or(IngestError::InvalidTimestamp)?;
+        update.merge(
+            self.muxer
+                .as_mut()
+                .ok_or(IngestError::InvalidTracks)?
+                .push_audio_at(relative, Bytes::copy_from_slice(payload), now)?,
+        );
+        Ok(update)
+    }
+
+    /// Legacy video-led AAC path. Audio-only consumers need `audio_at` and
+    /// must forward its updates to waiters/recorders.
     pub fn audio(&mut self, pts: i64, config: AacConfig, payload: &[u8]) {
+        if self.declared == Some(TrackSet::AudioOnly) {
+            return;
+        }
         self.audio_config(config);
         let (Some(muxer), Some(origin)) = (self.muxer.as_mut(), self.origin) else {
             return;
@@ -401,6 +718,12 @@ impl EsIngest {
 }
 
 /// One publisher's stream: TS bytes in, LL-HLS muxer state out.
+///
+/// Unread input and each assembled PES are limited to 8 MiB. Pending PES
+/// payload/reservation requests total at most 16 MiB, including simultaneous
+/// old/new packets on one PID. These are not limits on Vec capacity or RSS.
+/// A limit failure releases pending assemblies and permanently refuses input;
+/// `finish` still seals accepted media with `media_loss` set.
 pub struct TsIngest {
     input: Arc<Mutex<Input>>,
     pes: Option<PesPacketReader<Feed>>,
@@ -418,7 +741,8 @@ impl TsIngest {
         ts
     }
 
-    /// The muxer, mutably, once a keyframe has created one.
+    /// The muxer, mutably, once a video keyframe or declared audio-only frame
+    /// has created one.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.es.muxer_mut()
     }
@@ -429,8 +753,8 @@ impl TsIngest {
         self.es.take_muxer()
     }
 
-    /// An ingest with no input yet. `cfg` configures the muxer that the first
-    /// keyframe creates.
+    /// An ingest with no input yet. `cfg` configures the muxer created by the
+    /// first supported media after the program's topology is known.
     pub fn new(cfg: MuxerConfig) -> Self {
         let input = Arc::new(Mutex::new(Input::default()));
         let slot = SlotReader::default();
@@ -440,6 +764,8 @@ impl TsIngest {
             inner: TsPacketReader::new(slot),
             continuity: HashMap::new(),
             pending: None,
+            boundaries: HashMap::new(),
+            pending_bytes: 0,
         };
         Self {
             input,
@@ -451,7 +777,8 @@ impl TsIngest {
         }
     }
 
-    /// The muxer, once a keyframe has created one.
+    /// The muxer, once a keyframe or explicitly declared audio-only frame has
+    /// created one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.es.muxer()
     }
@@ -462,23 +789,94 @@ impl TsIngest {
     }
 
     /// Feeds raw TS bytes (any alignment). `now` stamps new segments.
+    ///
+    /// Unread input is checked against 8 MiB before copying. Pending assembled
+    /// PES payload/reservation requests are limited to 8 MiB per PES and 16 MiB
+    /// in aggregate, including same-PID transient replacement. These are logical
+    /// limits, not allocator capacity or whole-process memory bounds. Exceeding
+    /// one releases pending assemblies and permanently refuses further input;
+    /// [`TsIngest::finish`] can still seal the accepted prefix with media loss.
     pub fn push(&mut self, data: &[u8], now: SystemTime) -> Result<Update, IngestError> {
-        {
+        let exceeded = {
             let Ok(mut input) = self.input.lock() else {
                 return Ok(Update::default());
             };
+            if input.terminal {
+                return Err(IngestError::InputFinished);
+            }
+            if input.limit_exceeded {
+                return Err(IngestError::InputLimitExceeded);
+            }
             if input.start > 0 {
                 let start = input.start;
                 input.buf.drain(..start);
                 input.start = 0;
             }
-            if input.buf.len() + data.len() > MAX_BUFFER {
-                input.buf.clear();
+            if input
+                .buf
+                .len()
+                .checked_add(data.len())
+                .is_none_or(|n| n > MAX_BUFFER)
+            {
+                input.limit_exceeded = true;
+                input.dropped = input.dropped.saturating_add(1);
+                true
+            } else {
+                input.buf.extend_from_slice(data);
+                input.starved = false;
+                false
             }
-            input.buf.extend_from_slice(data);
-            input.starved = false;
+        };
+        if exceeded {
+            self.release_failed_input();
+            return Err(IngestError::InputLimitExceeded);
         }
         self.pending = Update::default();
+        self.drain(now, false)?;
+        Ok(self.pending)
+    }
+
+    /// Ends this connection's input, as distinct from temporary starvation.
+    /// Releases only complete bounded AAC still held by the PES reader, then
+    /// seals accepted muxer media. An unbounded video tail is never emitted;
+    /// its uncertain duration alone is not definite transport loss. Truncated
+    /// bounded PES/TS or parser rejection sets `media_loss`. The retained muxer
+    /// can be resumed by a new ingest; this parser cannot accept more bytes.
+    /// Repeated finish calls are harmless and return an empty update.
+    pub fn finish(&mut self, now: SystemTime) -> Result<Update, IngestError> {
+        let failed = {
+            let mut input = self.input.lock().expect("input lock is private to ingest");
+            if input.terminal {
+                return Ok(Update::default());
+            }
+            input.terminal = true;
+            input.starved = false;
+            input.limit_exceeded
+        };
+        self.pending = Update::default();
+        let result = if failed {
+            Ok(())
+        } else {
+            self.drain(now, true)
+        };
+        self.pending.media_loss |= self.dropped_packets() != 0;
+        if let Some(muxer) = self.es.muxer_mut() {
+            self.pending.merge(muxer.interrupt(now));
+        }
+        result.map(|()| self.pending)
+    }
+
+    fn release_failed_input(&mut self) {
+        // Dropping the reader releases ALL private upstream PES Vecs at once,
+        // including previously advertised bounded reservations on other PIDs.
+        self.pes = None;
+        let mut input = self.input.lock().expect("input lock is private to ingest");
+        input.buf = Vec::new();
+        input.start = 0;
+        input.starved = false;
+    }
+
+    fn drain(&mut self, now: SystemTime, terminal: bool) -> Result<(), IngestError> {
         loop {
             match self
                 .pes
@@ -486,20 +884,57 @@ impl TsIngest {
                 .expect("PES reader restored after reset")
                 .read_pes_packet()
             {
-                Ok(Some(pes)) => self.on_pes(pes, now)?,
+                Ok(Some(pes)) => {
+                    if terminal {
+                        let feed = self
+                            .pes
+                            .as_ref()
+                            .expect("PES reader present")
+                            .ts_packet_reader();
+                        // ReadPesPacket has now reached real EOF. All pending
+                        // returns, including unbounded video, need validation.
+                        let ended = feed.input.lock().map(|i| i.ended).unwrap_or(true);
+                        if ended && !feed.terminal_aac(&pes) {
+                            self.pending.media_loss |= (0xc0..=0xdf)
+                                .contains(&pes.header.stream_id.as_u8())
+                                && feed
+                                    .boundaries
+                                    .values()
+                                    .any(|b| b.header == pes.header && b.expected.is_some());
+                            continue;
+                        }
+                        if ended && !complete_adts(&pes.data) {
+                            // Keep any individually validated AAC prefix, but
+                            // never call a malformed/truncated ADTS tail clean.
+                            self.pending.media_loss = true;
+                        }
+                        if ended && pes.header.pts.is_none() {
+                            self.pending.media_loss = true;
+                            continue;
+                        }
+                    }
+                    self.on_pes(pes, now)?;
+                }
                 Ok(None) => break,
                 Err(_) => {
+                    let limited = self.input.lock().map(|i| i.limit_exceeded).unwrap_or(false);
+                    if limited {
+                        self.release_failed_input();
+                        return Err(IngestError::InputLimitExceeded);
+                    }
                     let reset = self
                         .input
                         .lock()
                         .map(|mut input| std::mem::take(&mut input.reset_pes))
                         .unwrap_or(false);
                     if reset {
-                        let feed = self
+                        let mut feed = self
                             .pes
                             .take()
                             .expect("PES reader present")
                             .into_ts_packet_reader();
+                        feed.boundaries.clear();
+                        feed.pending_bytes = 0;
                         self.pes = Some(PesPacketReader::new(feed));
                         self.waiting_keyframe = true;
                         continue;
@@ -515,7 +950,7 @@ impl TsIngest {
                 }
             }
         }
-        Ok(self.pending)
+        Ok(())
     }
 
     fn program(&self) -> Program {
@@ -533,10 +968,7 @@ impl TsIngest {
         };
         match id {
             0xE0..=0xEF => self.on_video(pts, pes.header.dts.map(|t| t.as_u64()), &pes.data, now),
-            0xC0..=0xDF => {
-                self.on_audio(pts, &pes.data);
-                Ok(())
-            }
+            0xC0..=0xDF => self.on_audio(pts, &pes.data, now),
             _ => Ok(()),
         }
     }
@@ -549,9 +981,10 @@ impl TsIngest {
         now: SystemTime,
     ) -> Result<(), IngestError> {
         let program = self.program();
-        if program.other_video && !program.h264 {
+        if program.other_video {
             return Err(IngestError::UnsupportedVideo);
         }
+        self.declare_program(program, now)?;
         self.es.set_expect_audio(program.aac);
         let dts_raw = dts_raw.unwrap_or(pts_raw);
         let dts = self.clock.unwrap(dts_raw);
@@ -566,13 +999,60 @@ impl TsIngest {
         Ok(())
     }
 
-    fn on_audio(&mut self, pts_raw: u64, data: &[u8]) {
-        let pts = self.clock.unwrap(pts_raw);
-        for (i, (config, payload)) in codec::adts_frames(data).into_iter().enumerate() {
-            let step = i64::from(AAC_FRAME_SAMPLES) * 90_000 / i64::from(config.sample_rate.max(1));
-            self.es.audio(pts + step * i as i64, config, payload);
+    fn declare_program(&mut self, program: Program, now: SystemTime) -> Result<(), IngestError> {
+        if !program.seen {
+            return Ok(());
         }
+        if program.other_video {
+            return Err(IngestError::UnsupportedVideo);
+        }
+        let tracks = match (program.h264, program.aac) {
+            (true, true) => TrackSet::AudioVideo,
+            (true, false) => TrackSet::VideoOnly,
+            (false, true) => TrackSet::AudioOnly,
+            (false, false) => return Err(IngestError::InvalidTracks),
+        };
+        self.pending.merge(self.es.declare_tracks(tracks, now)?);
+        Ok(())
     }
+
+    fn on_audio(&mut self, pts_raw: u64, data: &[u8], now: SystemTime) -> Result<(), IngestError> {
+        self.declare_program(self.program(), now)?;
+        let pts = self.clock.unwrap(pts_raw);
+        let mut elapsed_samples = 0i64;
+        for (config, payload) in codec::adts_frames(data) {
+            let offset =
+                i128::from(elapsed_samples) * 90_000 / i128::from(config.sample_rate.max(1));
+            let timestamp = pts
+                .checked_add(i64::try_from(offset).map_err(|_| IngestError::InvalidTimestamp)?)
+                .ok_or(IngestError::InvalidTimestamp)?;
+            self.pending
+                .merge(self.es.audio_at(timestamp, config, payload, now)?);
+            elapsed_samples += i64::from(AAC_FRAME_SAMPLES);
+        }
+        Ok(())
+    }
+}
+
+fn complete_adts(mut data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    while !data.is_empty() {
+        let Ok(header) = adts_reader::AdtsHeader::from_bytes(data) else {
+            return false;
+        };
+        let length = usize::from(header.frame_length());
+        if length == 0
+            || length > data.len()
+            || header.number_of_raw_data_blocks_in_frame() != 1
+            || header.payload().is_err()
+        {
+            return false;
+        }
+        data = &data[length..];
+    }
+    true
 }
 
 /// Demuxes a clean TS buffer into elementary events, for other modules' tests.
@@ -652,8 +1132,8 @@ mod tests {
         let ing = ingest_in_chunks(1316);
         let m = ing.muxer().expect("muxer");
         assert!(m.has_content());
-        assert_eq!(m.video().width, 320);
-        assert_eq!(m.video().height, 180);
+        assert_eq!(m.video().expect("video").width, 320);
+        assert_eq!(m.video().expect("video").height, 180);
         assert_eq!(m.audio().map(|a| a.sample_rate), Some(48000));
         let seg = m.segment(LEADING_GAPS).expect("first segment");
         assert_eq!(seg.duration.as_millis(), 1000);
@@ -939,6 +1419,74 @@ mod epoch_window_tests {
                 .check(&latest.replace("fixed_seg", "changed_seg"))
                 .is_err(),
             "same MSN must never be relabelled"
+        );
+    }
+}
+
+#[cfg(test)]
+mod declared_topology_tests {
+    use super::*;
+
+    #[test]
+    fn no_pmt_is_not_an_audio_only_declaration() {
+        let mut ingest = TsIngest::new(MuxerConfig::default());
+        ingest
+            .declare_program(
+                Program {
+                    seen: false,
+                    aac: true,
+                    ..Program::default()
+                },
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("an unseen PMT leaves topology undeclared");
+        assert_eq!(ingest.es.declared_tracks(), None);
+    }
+
+    #[test]
+    fn known_unsupported_video_cannot_be_hidden_by_aac_or_supported_video() {
+        for h264 in [false, true] {
+            let mut ingest = TsIngest::new(MuxerConfig::default());
+            assert_eq!(
+                ingest.declare_program(
+                    Program {
+                        seen: true,
+                        aac: true,
+                        h264,
+                        other_video: true
+                    },
+                    SystemTime::UNIX_EPOCH
+                ),
+                Err(IngestError::UnsupportedVideo)
+            );
+            assert_eq!(ingest.es.declared_tracks(), None);
+        }
+    }
+
+    #[test]
+    fn a_second_pmt_cannot_change_connection_topology() {
+        let mut ingest = TsIngest::new(MuxerConfig::default());
+        ingest
+            .declare_program(
+                Program {
+                    seen: true,
+                    aac: true,
+                    ..Program::default()
+                },
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("first authoritative AAC-only PMT is accepted");
+        assert_eq!(
+            ingest.declare_program(
+                Program {
+                    seen: true,
+                    aac: true,
+                    h264: true,
+                    other_video: false
+                },
+                SystemTime::UNIX_EPOCH
+            ),
+            Err(IngestError::TrackConflict)
         );
     }
 }

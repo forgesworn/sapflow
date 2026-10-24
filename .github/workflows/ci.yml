@@ -50,6 +50,36 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  ios-checkpoint-sdk:
+    name: iOS SDK checkpoint tests
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build host SDK and run checkpoint tests
+        run: python3 -B mobile/ios/test-recording-checkpoints-sdk.py
+      - name: Prepare the existing lock-pinned Swift fuzz runtime
+        # The workspace config shares target/; build only the existing runtime.
+        run: cargo build --locked --manifest-path fuzz/Cargo.toml -p libfuzzer-sys -j1
+      - name: Replay and fuzz canonical recovery receipts with ASan
+        env:
+          SAPFLOW_RECOVERY_RECEIPT_FUZZ_SECONDS: "20"
+        run: bash mobile/ios/fuzz-recording-recovery-receipt.sh
+      - name: Retain synthetic recovery receipt fuzz evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-recovery-receipt-fuzz
+          path: target/ios-recovery-receipt-fuzz
+          if-no-files-found: ignore
+
   checks:
     name: Format, clippy, tests
     runs-on: ubuntu-latest
@@ -68,6 +98,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Native package output regressions
+        run: node --test scripts/native-build-options.test.mjs
+      - name: Native authentication source and packaging regressions
+        run: |
+          node --check scripts/build-signet-native.mjs
+          python3 -B scripts/verify-signet-sources.py
+          python3 -B tests/test_signet_source_verifier.py
+          python3 -B tests/test_signet_packaging_receipt.py
+      - name: iOS privacy resource regressions (generated bundles)
+        run: |
+          python3 -B tests/test_ios_privacy_resources.py
+          python3 -B tests/test_ios_xctest_runtime.py
       - name: Performance receipt regressions
         run: |
           python3 -B tests/test_performance.py

@@ -15,7 +15,8 @@ internal data class V4vView(val message: String, val eventId: String?, val phase
  * A save failure permanently fences this instance; an uncertain HTTP result retains exactly its saved operation. */
 internal class V4vSessionEngine(private val profile: V4vProfile, private val api: V4vApi,
     private val store: V4vJournalStore, private val clock: () -> Long, private val nonce: () -> String,
-    private val fencePublisher: () -> Unit, private val committedGrant: (V4vGrant) -> Unit = {}) {
+    private val fencePublisher: () -> Unit, private val committedGrant: (V4vGrant) -> Unit = {},
+    private val authorityNowNs: () -> Long = System::nanoTime) {
     private var document: JsonObject = store.load()?.also(::validateDocument) ?: buildJsonObject {
         put("version", 1); put("apiOrigin", profile.apiOrigin); put("clockFloorMs", 0)
     }
@@ -35,6 +36,7 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
     private fun operation(): V4vOperation? = (document["pending"] as? JsonObject)?.let { with(V4vJson) {
         V4vOperation(V4vOperationKind.valueOf(it.text("kind")), it.text("eventId"), (it["sessionId"] as? JsonPrimitive)?.content, it.getValue("body").jsonObject)
     } }
+    internal val endAdmission = V4vEndAdmission(session != null || operation()?.kind == V4vOperationKind.PREPARE)
     private fun validateDocument(d: JsonObject) = with(V4vJson) {
         require(d.number("version", 1, 1) == 1L && d.text("apiOrigin") == profile.apiOrigin)
         d.number("clockFloorMs", 0, MAX_EPOCH)
@@ -49,7 +51,7 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
         for ((key, value) in fields) if (value == null) entries.remove(key) else entries[key] = value
         val next = JsonObject(entries)
         try { store.save(next); document = next }
-        catch (error: Exception) { unusable = true; fencePublisher(); message = "V4V journal unavailable; publishing fenced"; throw error }
+        catch (error: Exception) { unusable = true; endAdmission.close(); fencePublisher(); message = "V4V journal unavailable; publishing fenced"; throw error }
     }
     private fun authenticated(): String {
         check(!unusable && !stopped)
@@ -74,23 +76,32 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
         authenticated(); V4vJson.event(eventId); check(operation() == null)
         val old = session
         if (old != null) check(old.endComplete || (replaceAcknowledged && old.recoveryState == "acknowledged")) { "End or explicitly acknowledge the previous failure first" }
-        val current = api.request("GET", "/api/live-events/$eventId/native-session", authenticated()).getValue("session").jsonObject
-        val generation = with(V4vJson) { require(current.text("eventId") == eventId); current.number("eventGeneration") }
-        val body = buildJsonObject {
-            put("expectedEventGeneration", generation); put("idempotencyKey", nonce())
-            if (replaceAcknowledged) {
-                require(old != null && old.identity.eventId == eventId && old.identity.generation == generation && old.recoveryState == "acknowledged")
-                put("replaces", buildJsonObject { put("sessionId", old.identity.sessionId); put("revision", old.identity.revision); put("acknowledgementKey", requireNotNull(old.acknowledgementKey)) })
+        val replacement = checkNotNull(endAdmission.beginReplacement()) { "A confirmed End owns this session" }
+        try {
+            val current = api.request("GET", "/api/live-events/$eventId/native-session", authenticated()).getValue("session").jsonObject
+            val generation = with(V4vJson) { require(current.text("eventId") == eventId); current.number("eventGeneration") }
+            val body = buildJsonObject {
+                put("expectedEventGeneration", generation); put("idempotencyKey", nonce())
+                if (replaceAcknowledged) {
+                    require(old != null && old.identity.eventId == eventId && old.identity.generation == generation && old.recoveryState == "acknowledged")
+                    put("replaces", buildJsonObject { put("sessionId", old.identity.sessionId); put("revision", old.identity.revision); put("acknowledgementKey", requireNotNull(old.acknowledgementKey)) })
+                }
             }
-        }
-        begin(V4vOperation(V4vOperationKind.PREPARE, eventId, null, body), false)
+            begin(V4vOperation(V4vOperationKind.PREPARE, eventId, null, body), false, replacement)
+        } finally { endAdmission.settle(replacement, !unusable && (session != null || operation()?.kind == V4vOperationKind.PREPARE)) }
     }
     fun refresh() {
-        authenticated(); check(!terminalIntent && operation() == null)
+        authenticated(); check(!terminalIntent && !endAdmission.ending() && operation() == null)
         val old = checkNotNull(session); check(old.phase == "active" && old.expiresMs > now)
         begin(V4vOperation(V4vOperationKind.REFRESH, old.identity.eventId, old.identity.sessionId,
             buildJsonObject { put("revision", old.identity.revision); put("idempotencyKey", nonce()) }), false)
     }
+    /** Exact actor-side revalidation precedes both publisher fencing and the durable intent. */
+    internal fun endConfirmed(claim: V4vEndAdmission.Claim) {
+        check(endAdmission.current(claim)) { "The confirmed V4V session is no longer current" }
+        end()
+    }
+    // Existing durable retry machinery. Production UI enters through endConfirmed.
     fun end() {
         // Fence first even when the network/auth/journal is unavailable.
         fencePublisher()
@@ -111,9 +122,10 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
             put("eventGeneration", old.identity.generation); put("revision", old.identity.revision); put("idempotencyKey", nonce()); put("acknowledgement", "abandon-automatic-recording")
         }), true)
     }
-    private fun begin(op: V4vOperation, ending: Boolean) {
+    private fun begin(op: V4vOperation, ending: Boolean, replacement: V4vEndAdmission.Replacement? = null) {
         save("pending" to buildJsonObject { put("kind", op.kind.name); put("eventId", op.eventId); op.sessionId?.let { put("sessionId", it) }; put("body", op.body) },
             "terminalIntent" to JsonPrimitive(ending || (terminalIntent && op.kind != V4vOperationKind.PREPARE)))
+        replacement?.let { endAdmission.settle(it, true) }
         failures = 0; retryAt = now; retry()
     }
     fun retry() {
@@ -127,16 +139,16 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
             if (prior != null && op.kind != V4vOperationKind.PREPARE) require(receipt.identity.sameSession(prior.identity) && receipt.identity.revision >= prior.identity.revision)
             val grantJson = answer["grant"] as? JsonObject
             if (grantJson != null) {
-                val grant = V4vGrant.read(grantJson, now); require(grant.identity == receipt.identity)
+                val grant = V4vGrant.read(grantJson, now, authorityNowNs()); require(grant.identity == receipt.identity)
                 (document["grant"] as? JsonObject)?.takeIf { op.kind == V4vOperationKind.REFRESH }?.let { old ->
                     require(with(V4vJson) { grantJson.number("expiresAtUnixMs") >= old.number("expiresAtUnixMs") })
                     for (key in listOf("endpoint", "streamId", "encryption", "limits", "reconnectGraceMs", "destination", "transport")) require(old[key] == grantJson[key])
                 }
             }
             save("session" to receipt.raw, "pending" to null, "grant" to if (terminalIntent || op.kind in setOf(V4vOperationKind.END, V4vOperationKind.ACKNOWLEDGE)) null else grantJson)
-            if (grantJson != null && !terminalIntent && op.kind in setOf(V4vOperationKind.PREPARE, V4vOperationKind.REFRESH)) {
+            if (grantJson != null && !terminalIntent && !endAdmission.ending() && op.kind in setOf(V4vOperationKind.PREPARE, V4vOperationKind.REFRESH)) {
                 restoredRequiresRefresh = false
-                committedGrant(V4vGrant.read(grantJson, now))
+                committedGrant(V4vGrant.read(grantJson, now, authorityNowNs()))
             }
             retryAt = Long.MAX_VALUE; failures = 0; statusAt = now + 5000
             message = when { receipt.endComplete -> "V4V End completed"; receipt.recoveryState != null -> "Recording failure acknowledged · explicit Prepare required"; terminalIntent -> "V4V End pending confirmation"; grantJson != null -> "V4V grant prepared · explicit capture Start required"; else -> "V4V operation confirmed without a publishing grant" }
@@ -163,17 +175,18 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
     fun observationPermit(identity: V4vIdentity): V4vObservationPermit {
         val grant = captureGrant()
         require(identity.sameSession(grant.identity) && grant.identity.revision >= identity.revision)
-        val deadline = minOf(grant.expiresAtMonotonicNs, System.nanoTime() + (bearerExpiry - now).coerceAtLeast(0) * 1_000_000)
-        return V4vObservationPermit(grant.identity, authenticated(), deadline)
+        val deadline = minOf(grant.expiresAtMonotonicNs, Math.addExact(authorityNowNs(), Math.multiplyExact((bearerExpiry - now).coerceAtLeast(0), 1_000_000)))
+        return V4vObservationPermit(grant.identity, authenticated(), deadline, authorityNowNs)
     }
     fun captureGrant(): V4vGrant {
-        authenticated(); check(!restoredRequiresRefresh) { "Refresh the restored V4V grant before capture" }; check(!terminalIntent && operation() == null)
-        val grant = V4vGrant.read(checkNotNull(document["grant"] as? JsonObject), now)
+        authenticated(); check(!endAdmission.ending()) { "A confirmed V4V End is pending" }; check(!restoredRequiresRefresh) { "Refresh the restored V4V grant before capture" }; check(!terminalIntent && operation() == null)
+        val grant = V4vGrant.read(checkNotNull(document["grant"] as? JsonObject), now, authorityNowNs())
         require(session?.identity == grant.identity && session?.phase == "active" && grant.expiresMs > now) { "V4V grant expired" }
         return grant
     }
     fun tick() {
         check(!unusable && !stopped)
+        if (endAdmission.ending()) return
         val old = session
         if (old?.endComplete == true && operation() == null) { statusAt = Long.MAX_VALUE; return }
         if (old != null && now >= old.expiresMs && document["grant"] is JsonObject) { fencePublisher(); message = "V4V grant expired · capture/recording may continue"; save("grant" to null) }
@@ -189,7 +202,7 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
         return with(V4vJson) { origin.text("admission") == "denied" && origin.text("protocol") in setOf("none", "stopped") && (origin.text("recording") in setOf("incomplete", "failed") || origin.text("callbacks") == "failed") }
     }
     fun view() = V4vView(message, session?.identity?.eventId, session?.phase, signedIn(), operation() != null, session?.endComplete == true, session?.recoveryState,
-        !terminalIntent && !unusable && !restoredRequiresRefresh && operation() == null && signedIn() && session?.phase == "active" && (session?.expiresMs ?: 0) > now && document["grant"] is JsonObject,
+        !terminalIntent && !endAdmission.ending() && !unusable && !restoredRequiresRefresh && operation() == null && signedIn() && session?.phase == "active" && (session?.expiresMs ?: 0) > now && document["grant"] is JsonObject,
         recoveryOffered(session), (document["grant"] as? JsonObject)?.let { with(V4vJson) { it.getValue("limits").jsonObject.number("maxPublishBps") } })
     fun loginChallenge(): V4vLoginChallenge = with(V4vJson) {
         val answer = api.request("GET", "/api/auth/nostr/challenge", null)
@@ -203,7 +216,7 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
         installLogin(expected, answer.text("sessionToken", 8192), answer.number("sessionTokenMaxAgeSec", 1, 86_400))
     }
     fun nextDelayMs(): Long? {
-        if (unusable || stopped) return null
+        if (unusable || stopped || endAdmission.ending()) return null
         val old = session ?: return if (operation() != null && signedIn()) (retryAt - now).coerceAtLeast(1) else null
         if (old.endComplete && operation() == null) return null
         val times = mutableListOf<Long>()
@@ -219,19 +232,32 @@ internal class V4vSessionEngine(private val profile: V4vProfile, private val api
         }
         return times.filter { it != Long.MAX_VALUE }.minOrNull()?.let { (it - now).coerceAtLeast(100) }
     }
-    fun stop() { stopped = true; fencePublisher(); api.close() }
+    fun stop() { stopped = true; endAdmission.close(); fencePublisher(); api.close() }
 }
 
 /** App-owned executor. No media work, no UI thread HTTP/FS; queue admission is one command. */
-internal class V4vDestinationSession(engineFactory: () -> V4vSessionEngine) : AutoCloseable {
-    private val executor = ScheduledThreadPoolExecutor(1) { Thread(it, "sapflow-v4v-control") }.apply { removeOnCancelPolicy = true }
+internal class V4vDestinationSession(controlExecutor: ScheduledThreadPoolExecutor? = null,
+    engineFactory: () -> V4vSessionEngine) : AutoCloseable {
+    // The optional real executor is a cold test seam; this owner always applies
+    // its shutdown policy, including when an alarm races with close().
+    private val executor = (controlExecutor ?: ScheduledThreadPoolExecutor(1) { Thread(it, "sapflow-v4v-control") }).apply {
+        // Ownership transfers exclusively, including rejection cleanup. Never
+        // accept a used, shut-down or multi-threaded engine executor.
+        if (corePoolSize != 1 || isShutdown || taskCount != 0L) {
+            shutdownNow()
+            throw IllegalArgumentException("V4V control requires a fresh single-thread executor")
+        }
+        removeOnCancelPolicy = true
+        executeExistingDelayedTasksAfterShutdownPolicy = false
+        continueExistingPeriodicTasksAfterShutdownPolicy = false
+    }
     private val closed = AtomicBoolean()
     private val busy = AtomicBoolean()
-    private val endRequested = AtomicBoolean()
+    private val endAdmission = AtomicReference<V4vEndAdmission?>()
     private val snapshot = AtomicReference(V4vView("Loading encrypted V4V journal", null, null, false, false, false, null, false))
     private var engine: V4vSessionEngine? = null
     private var alarm: ScheduledFuture<*>? = null
-    init { executor.execute { try { engine = engineFactory(); snapshot.set(checkNotNull(engine).view()); arm() } catch (_: Exception) { snapshot.set(V4vView("V4V journal unavailable · connector blocked", null, null, false, false, false, null, false)) } } }
+    init { executor.execute { try { engine = engineFactory(); endAdmission.set(checkNotNull(engine).endAdmission); if (closed.get()) checkNotNull(engine).endAdmission.close(); snapshot.set(checkNotNull(engine).view()); arm() } catch (_: Exception) { snapshot.set(V4vView("V4V journal unavailable · connector blocked", null, null, false, false, false, null, false)) } } }
     val view: V4vView get() = snapshot.get()
     fun submit(action: V4vSessionEngine.() -> Unit, completed: (Exception?) -> Unit = {}) {
         if (closed.get() || !busy.compareAndSet(false, true)) { completed(IllegalStateException("V4V control busy")); return }
@@ -241,14 +267,32 @@ internal class V4vDestinationSession(engineFactory: () -> V4vSessionEngine) : Au
             finally { engine?.let { snapshot.set(it.view()) }; busy.set(false); completed(error); arm() }
         }
     }
-    /** One reserved End admission survives an in-flight refresh/status request. */
-    fun endDestination(completed: (Exception?) -> Unit = {}) {
-        if (closed.get() || !endRequested.compareAndSet(false, true)) return
-        executor.execute {
-            var error: Exception? = null
-            try { checkNotNull(engine).end() } catch (caught: Exception) { error = caught }
-            finally { engine?.let { snapshot.set(it.view()) }; endRequested.set(false); completed(error); arm() }
+    /** Prompt creation/cancellation have no publisher, capture, journal or HTTP effect. */
+    fun endInvitation(): V4vEndAdmission.Ticket? = if (closed.get()) null else endAdmission.get()?.invitation()
+    fun cancelEndInvitation(ticket: V4vEndAdmission.Ticket) { endAdmission.get()?.cancel(ticket) }
+    /** Reserves the exact owner synchronously BEFORE any caller fence. The actor
+     * rechecks this same claim before durable End; busy refresh/status never drops it. */
+    fun endDestination(ticket: V4vEndAdmission.Ticket, onAdmitted: () -> Unit = {}, completed: (Exception?) -> Unit = {}): Boolean {
+        if (closed.get()) return false
+        val admission = endAdmission.get() ?: return false
+        val claim = admission.confirm(ticket) ?: return false
+        var fenceError: Exception? = null
+        try { onAdmitted() } catch (error: Exception) { fenceError = error }
+        try {
+            executor.execute {
+                var error: Exception? = fenceError
+                try { check(!closed.get()); checkNotNull(engine).endConfirmed(claim) }
+                catch (caught: Exception) { error = caught }
+                finally {
+                    admission.complete(claim)
+                    engine?.let { snapshot.set(it.view()) }
+                    completed(error); arm()
+                }
+            }
+        } catch (error: java.util.concurrent.RejectedExecutionException) {
+            admission.complete(claim); completed(error)
         }
+        return true
     }
     private fun arm() {
         alarm?.cancel(false)
@@ -257,6 +301,7 @@ internal class V4vDestinationSession(engineFactory: () -> V4vSessionEngine) : Au
     fun awaitClosed(timeoutMs: Long): Boolean = executor.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        endAdmission.get()?.close()
         alarm?.cancel(false)
         executor.execute { try { engine?.stop() } finally { executor.shutdown() } }
     }

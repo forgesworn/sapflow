@@ -13,6 +13,8 @@
 
 use std::collections::VecDeque;
 
+use crate::TrackSet;
+
 use super::amf0::{self, Amf0Error, Value};
 use super::chunk::{ChunkError, ChunkReader, ChunkWriter, MAX_HEADER, Message, Read};
 use super::handshake::PACKET;
@@ -216,6 +218,7 @@ pub struct Publisher {
     peer_acknowledgement: u32,
     avc_configured: bool,
     aac_configured: bool,
+    tracks: Option<TrackSet>,
 }
 
 struct PendingOutput {
@@ -280,12 +283,70 @@ impl Publisher {
             peer_acknowledgement: 0,
             avc_configured: false,
             aac_configured: false,
+            tracks: None,
         })
     }
 
     /// Where the publish has got to.
     pub fn state(&self) -> PublisherState {
         self.state
+    }
+
+    /// One immutable, explicit track set, before any codec configuration or
+    /// media. Omitting this call preserves the legacy wire output. A declaration
+    /// made before acceptance is emitted immediately after Publish.Start; one
+    /// made after acceptance is committed only after its bounded output fits.
+    pub fn declare_tracks(&mut self, tracks: TrackSet) -> Result<(), ClientError> {
+        if matches!(
+            self.state,
+            PublisherState::Closed | PublisherState::Failed | PublisherState::Finishing
+        ) {
+            return Err(ClientError::Closed);
+        }
+        if let Some(current) = self.tracks {
+            return if current == tracks {
+                Ok(())
+            } else {
+                Err(ClientError::InvalidConfig)
+            };
+        }
+        if self.avc_configured || self.aac_configured {
+            return Err(ClientError::InvalidConfig);
+        }
+        if self.state == PublisherState::Publishing {
+            self.track_metadata(tracks)?;
+        }
+        self.tracks = Some(tracks);
+        Ok(())
+    }
+
+    fn track_metadata(&mut self, tracks: TrackSet) -> Result<(), ClientError> {
+        let mut properties = vec![
+            ("hasVideo".into(), Value::Boolean(tracks.has_video())),
+            ("hasAudio".into(), Value::Boolean(tracks.has_audio())),
+        ];
+        if tracks.has_video() {
+            properties.push(("videocodecid".into(), Value::Number(7.0)));
+        }
+        if tracks.has_audio() {
+            properties.push(("audiocodecid".into(), Value::Number(10.0)));
+        }
+        // Only fixed keys/scalars enter this cold message. No caller strings,
+        // credentials or payloads are copied into metadata.
+        let mut body = Vec::with_capacity(128);
+        for value in [
+            Value::String("@setDataFrame".into()),
+            Value::String("onMetaData".into()),
+            Value::Object(properties),
+        ] {
+            amf0::encode(&value, &mut body);
+        }
+        if body.len() > 256 {
+            return Err(ClientError::InvalidConfig);
+        }
+        self.write(5, 18, self.stream_id, 0, &body)?;
+        self.media_output_since_ms.get_or_insert(self.last_now_ms);
+        Ok(())
     }
 
     /// Bytes queued for the transport that [`Publisher::take_output`] has not
@@ -610,7 +671,7 @@ impl Publisher {
     /// Resend a changed/repeated AVC configuration at the current wrapping DTS,
     /// before the next access unit using it. The client does not rewrite timestamps.
     pub fn send_avc_config_at(&mut self, timestamp: u32, data: &[u8]) -> Result<(), ClientError> {
-        self.require_publishing()?;
+        self.require_track(true)?;
         if data.is_empty() {
             return Err(ClientError::InvalidMedia);
         }
@@ -627,7 +688,7 @@ impl Publisher {
     /// Resend AudioSpecificConfig at the current wrapping timestamp before the
     /// next access unit using it. The platform owns codec-change detection.
     pub fn send_aac_config_at(&mut self, timestamp: u32, data: &[u8]) -> Result<(), ClientError> {
-        self.require_publishing()?;
+        self.require_track(false)?;
         if data.is_empty() {
             return Err(ClientError::InvalidMedia);
         }
@@ -645,7 +706,7 @@ impl Publisher {
         keyframe: bool,
         data: &[u8],
     ) -> Result<(), ClientError> {
-        self.require_publishing()?;
+        self.require_track(true)?;
         if !self.avc_configured
             || data.is_empty()
             || !(-8_388_608..=8_388_607).contains(&composition_ms)
@@ -670,11 +731,25 @@ impl Publisher {
 
     /// A raw AAC access unit without ADTS framing.
     pub fn send_aac(&mut self, timestamp: u32, data: &[u8]) -> Result<(), ClientError> {
-        self.require_publishing()?;
+        self.require_track(false)?;
         if !self.aac_configured || data.is_empty() {
             return Err(ClientError::InvalidMedia);
         }
         self.media(4, 8, timestamp, &[0xaf, 1], data)
+    }
+
+    fn require_track(&self, video: bool) -> Result<(), ClientError> {
+        self.require_publishing()?;
+        if self.tracks.is_some_and(|tracks| {
+            if video {
+                !tracks.has_video()
+            } else {
+                !tracks.has_audio()
+            }
+        }) {
+            return Err(ClientError::InvalidMedia);
+        }
+        Ok(())
     }
 
     fn require_publishing(&self) -> Result<(), ClientError> {
@@ -885,6 +960,9 @@ impl Publisher {
                     return Err(ClientError::UnexpectedResponse);
                 }
                 self.state = PublisherState::Publishing;
+                if let Some(tracks) = self.tracks {
+                    self.track_metadata(tracks)?;
+                }
                 self.config.stream_key = String::new();
             }
             ("onStatus", PublisherState::Publishing | PublisherState::Finishing)
@@ -1118,6 +1196,174 @@ mod tests {
             assert_eq!(client.state(), expected);
             client.take_output();
         }
+    }
+
+    fn ready_with_tracks(tracks: Option<TrackSet>) -> (Publisher, Connection) {
+        let mut publisher = client();
+        if let Some(tracks) = tracks {
+            publisher.declare_tracks(tracks).expect("cold declaration");
+        }
+        let mut server = Connection::new(73);
+        for _ in 0..12 {
+            server.feed(&publisher.take_output()).expect("peer input");
+            while let Some(event) = server.poll().expect("peer event") {
+                if matches!(event, Event::Publish { .. }) {
+                    server.accept_publish();
+                }
+            }
+            publisher
+                .feed(&server.take_output(), 1)
+                .expect("accepted exchange");
+            if publisher.state() == PublisherState::Publishing {
+                return (publisher, server);
+            }
+        }
+        panic!("publish did not finish");
+    }
+
+    #[test]
+    fn explicit_tracks_emit_once_before_codecs_for_early_and_late_declarations() {
+        for tracks in [
+            TrackSet::AudioOnly,
+            TrackSet::VideoOnly,
+            TrackSet::AudioVideo,
+        ] {
+            for early in [false, true] {
+                let (mut publisher, mut peer) = ready_with_tracks(early.then_some(tracks));
+                publisher
+                    .declare_tracks(tracks)
+                    .expect("idempotent or late cold declaration");
+                let metadata = publisher.take_output();
+                assert!(metadata.len() <= 256 + 12);
+                assert_eq!(metadata[0], 5);
+                assert_eq!(metadata[7], 18);
+                assert_eq!(&metadata[8..12], &1u32.to_le_bytes());
+                let values =
+                    amf0::decode_all(&metadata[12..]).expect("bounded single-chunk metadata");
+                assert_eq!(values[0], Value::String("@setDataFrame".into()));
+                assert_eq!(values[1], Value::String("onMetaData".into()));
+                assert_eq!(
+                    values[2].get("hasVideo"),
+                    Some(&Value::Boolean(tracks.has_video()))
+                );
+                assert_eq!(
+                    values[2].get("hasAudio"),
+                    Some(&Value::Boolean(tracks.has_audio()))
+                );
+                assert_eq!(
+                    values[2].get("videocodecid"),
+                    tracks.has_video().then_some(&Value::Number(7.0))
+                );
+                assert_eq!(
+                    values[2].get("audiocodecid"),
+                    tracks.has_audio().then_some(&Value::Number(10.0))
+                );
+                peer.feed(&metadata).expect("metadata input");
+                assert_eq!(
+                    peer.poll().expect("metadata event"),
+                    Some(Event::Tracks { tracks })
+                );
+                publisher.declare_tracks(tracks).expect("same declaration");
+                assert!(publisher.take_output().is_empty(), "no duplicate metadata");
+                if tracks.has_video() {
+                    publisher
+                        .send_avc_config(&[1])
+                        .expect("declared video config");
+                    publisher.send_avc(0, 0, true, &[1]).expect("declared IDR");
+                } else {
+                    assert_eq!(
+                        publisher.send_avc_config(&[1]),
+                        Err(ClientError::InvalidMedia)
+                    );
+                    assert_eq!(
+                        publisher.send_avc(0, 0, true, &[1]),
+                        Err(ClientError::InvalidMedia)
+                    );
+                }
+                if tracks.has_audio() {
+                    publisher
+                        .send_aac_config(&[0x11, 0x88])
+                        .expect("declared AAC config");
+                    publisher
+                        .send_aac(0, &[1])
+                        .expect("AAC needs no video keyframe");
+                } else {
+                    assert_eq!(
+                        publisher.send_aac_config(&[0x11, 0x88]),
+                        Err(ClientError::InvalidMedia)
+                    );
+                    assert_eq!(publisher.send_aac(0, &[1]), Err(ClientError::InvalidMedia));
+                }
+                peer.feed(&publisher.take_output()).expect("media input");
+                assert!(peer.poll().expect("first media").is_some());
+                publisher
+                    .declare_tracks(tracks)
+                    .expect("same topology remains idempotent after media");
+                assert!(publisher.take_output().is_empty());
+                assert_eq!(
+                    publisher.declare_tracks(if tracks == TrackSet::AudioOnly {
+                        TrackSet::VideoOnly
+                    } else {
+                        TrackSet::AudioOnly
+                    }),
+                    Err(ClientError::InvalidConfig)
+                );
+                assert!(publisher.take_output().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn full_output_cannot_commit_or_partially_write_a_late_track_declaration() {
+        let (mut publisher, _) = ready_with_tracks(None);
+        publisher.config.max_output_bytes = 8192;
+        publisher
+            .write(2, 5, 0, 0, &vec![0; 8179])
+            .expect("exact bounded queue fill");
+        assert_eq!(publisher.queued_output_bytes(), 8192);
+        let before = publisher.output.clone();
+        let deadline = publisher.next_deadline_ms();
+        assert_eq!(
+            publisher.declare_tracks(TrackSet::AudioOnly),
+            Err(ClientError::Backpressure)
+        );
+        assert_eq!(publisher.tracks, None);
+        assert_eq!(publisher.output, before);
+        assert_eq!(publisher.next_deadline_ms(), deadline);
+        publisher.take_output();
+        publisher
+            .declare_tracks(TrackSet::VideoOnly)
+            .expect("failed declaration left no topology");
+        assert_eq!(publisher.tracks, Some(TrackSet::VideoOnly));
+    }
+
+    #[test]
+    fn legacy_omission_emits_no_metadata_and_cannot_be_redeclared_after_configuration() {
+        let (mut publisher, mut peer) = ready_with_tracks(None);
+        assert!(publisher.take_output().is_empty());
+        publisher
+            .send_aac_config(&[0x11, 0x88])
+            .expect("legacy AAC");
+        let before = publisher.output.clone();
+        assert_eq!(
+            publisher.declare_tracks(TrackSet::AudioOnly),
+            Err(ClientError::InvalidConfig)
+        );
+        assert_eq!(publisher.output, before);
+        assert_eq!(
+            before[7], 8,
+            "first message stays the legacy AAC sequence header"
+        );
+        peer.feed(&publisher.take_output()).expect("legacy media");
+        assert!(matches!(
+            peer.poll().expect("legacy event"),
+            Some(Event::Audio { .. })
+        ));
+        publisher.cancel();
+        assert_eq!(
+            publisher.declare_tracks(TrackSet::AudioOnly),
+            Err(ClientError::Closed)
+        );
     }
 
     #[test]

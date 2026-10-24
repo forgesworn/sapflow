@@ -8,6 +8,9 @@ struct V4vHTTPCall: CustomStringConvertible, CustomDebugStringConvertible {
     init(_ request: V4vControlRequest) {
         method = "POST"; path = request.operation.path; bearer = request.bearer; body = request.operation.bytes
     }
+    init(creatorEvents: Void, bearer: String) {
+        method = "GET"; path = "/api/live-events"; self.bearer = bearer; body = nil
+    }
     init(status identity: V4vIdentity, bearer: String) {
         method = "GET"; path = "/api/live-events/\(identity.eventId)/native-session/\(identity.sessionId)"; self.bearer = bearer; body = nil
     }

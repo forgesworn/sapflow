@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::SharedSample;
+use crate::media::AacSampleTimingViews;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueLimits {
@@ -62,6 +63,9 @@ pub enum OverflowReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueOutcome {
+    /// This branch has irreversibly stopped accepting new samples. Its
+    /// previously accepted prefix remains available under ordinary drain rules.
+    AdmissionClosed,
     Queued,
     QueuedAfterReset {
         discarded: usize,
@@ -117,6 +121,7 @@ pub struct BoundedQueue {
     last_now: Option<u64>,
     waiting_for_keyframe: bool,
     recording_failure: Option<OverflowReason>,
+    admission_closed: bool,
 }
 
 impl BoundedQueue {
@@ -129,6 +134,7 @@ impl BoundedQueue {
             last_now: None,
             waiting_for_keyframe: matches!(policy, OverflowPolicy::Publishing { has_video: true }),
             recording_failure: None,
+            admission_closed: false,
         }
     }
     pub fn stats(&self) -> QueueStats {
@@ -139,6 +145,17 @@ impl BoundedQueue {
     }
     pub fn waiting_for_keyframe(&self) -> bool {
         self.waiting_for_keyframe
+    }
+
+    /// Stop only future ingress. This is idempotent and does not clear the
+    /// accepted prefix, reset clocks or convert intentional closure to loss.
+    /// Construct a new queue to begin a new admission lifetime.
+    pub fn close_admission(&mut self) {
+        self.admission_closed = true;
+    }
+
+    pub fn admission_closed(&self) -> bool {
+        self.admission_closed
     }
 
     fn check_clock(&mut self, now_ns: u64) -> Result<(), QueueError> {
@@ -202,6 +219,10 @@ impl BoundedQueue {
         now_ns: u64,
     ) -> Result<EnqueueOutcome, QueueError> {
         self.check_clock(now_ns)?;
+        if self.admission_closed {
+            self.stats.dropped_samples = self.stats.dropped_samples.saturating_add(1);
+            return Ok(EnqueueOutcome::AdmissionClosed);
+        }
         if self.recording_failure.is_some() {
             self.stats.dropped_samples = self.stats.dropped_samples.saturating_add(1);
             return Ok(EnqueueOutcome::RecordingAlreadyFailed);
@@ -333,6 +354,30 @@ impl SampleFanout {
         }
         let publishing = self.publishing.push(sample.clone(), now_ns)?;
         let recording = self.recording.push(sample, now_ns)?;
+        Ok((publishing, recording))
+    }
+    /// Explicit opt-in paired views use these same two bounded queues. The
+    /// opaque pair was derived from one validated original, never two payloads.
+    pub fn push_aac_timing_views(
+        &mut self,
+        views: &AacSampleTimingViews,
+        now_ns: u64,
+    ) -> Result<(Option<EnqueueOutcome>, EnqueueOutcome), QueueError> {
+        if [&self.publishing, &self.recording]
+            .iter()
+            .any(|q| q.last_now.is_some_and(|last| now_ns < last))
+        {
+            return Err(QueueError::ClockWentBackwards);
+        }
+        let publishing = if let Some(sample) = views.publishing() {
+            Some(self.publishing.push(sample.clone(), now_ns)?)
+        } else {
+            // Existing accepted backlog still ages. Withholding this input
+            // never manufactures AdmissionClosed or a dropped-input counter.
+            self.publishing.tick(now_ns)?;
+            None
+        };
+        let recording = self.recording.push(views.recording().clone(), now_ns)?;
         Ok((publishing, recording))
     }
     pub fn publishing(&mut self) -> &mut BoundedQueue {

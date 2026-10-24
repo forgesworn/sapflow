@@ -47,6 +47,7 @@ internal class ApprovedPlaybackRoute(private val profile: V4vProfile) {
 internal class OriginProbeCancellation(private val now: () -> Long = System::nanoTime,
     val deadlineNs: Long = now() + OriginProbeLimits.TOTAL_NS) {
     private val cancelled = AtomicBoolean()
+    fun nowNs(): Long = now()
     fun cancel() { cancelled.set(true) }
     fun check() { check(!cancelled.get() && now() < deadlineNs) { "Origin check cancelled or timed out" } }
     fun remainingNs(): Long { check(); return deadlineNs - now() }
@@ -54,7 +55,7 @@ internal class OriginProbeCancellation(private val now: () -> Long = System::nan
 
 internal data class NativeTrackEvidence(val codec: String, val software: Boolean, val outputs: Int,
     val firstPtsUs: Long, val lastPtsUs: Long, val decodedBytes: Long)
-internal data class NativeOriginEvidence(val video: NativeTrackEvidence, val audio: NativeTrackEvidence)
+internal data class NativeOriginEvidence(val video: NativeTrackEvidence?, val audio: NativeTrackEvidence)
 /** Retain the actual platform wrappers when release cannot be proved. No new
  * native probe may be admitted in this process after this terminal failure. */
 internal class OriginProbeCleanupFailure(cause: Exception, private val retainedOwners: List<Any>) :
@@ -90,12 +91,13 @@ internal class DecodedProbeProgress(private val video: Boolean, private val maxV
 }
 internal fun interface OriginDecoder {
     /** Success is returned only after actual extractor/codec cleanup. */
-    fun decode(init: ByteArray, part: ByteArray, profile: CaptureProfile, cancel: OriginProbeCancellation): NativeOriginEvidence
+    fun decode(init: ByteArray, part: ByteArray, intent: CaptureIntent, cancel: OriginProbeCancellation): NativeOriginEvidence
 }
 
 /** A post-decode status may advance revision/part, but never scope, connection
  * or initialization. Availability still is not a decoder result. */
 internal fun sameDecodedBoundary(before: V4vMatchedMedia, after: V4vMatchedMedia): Boolean =
-    before.scope === after.scope && before.hasAudio && after.hasAudio &&
+    before.scope === after.scope && before.scope.intent.matchesTracks(before.hasVideo, before.hasAudio) &&
+        before.hasVideo == after.hasVideo && before.hasAudio == after.hasAudio &&
         before.connectionEpoch == after.connectionEpoch && before.initializationId == after.initializationId &&
         before.initPath == after.initPath && after.partId >= before.partId

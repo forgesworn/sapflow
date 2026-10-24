@@ -9,14 +9,19 @@ protocols over Network.framework TCP/TLS and UDP. Recording and publishing remai
 independent. A logical publisher now binds the shared Rust reconnect policy
 across socket attempts and orientation codec epochs. Physical iPhone recovery,
 remote decoded observation and sustained capture qualification remain open.
+The normal application also includes the explicit V4V creator flow below;
+real signer, service and phone acceptance remain separate gates.
 
 ## Build
 
-The app uses XcodeGen and the parent-generated Sapflow Swift package. From the
-repository root, build the package first, then generate outside the source tree:
+The app uses XcodeGen and the generated Sapflow and SignetAuth Swift packages.
+From the repository root, build both packages, then generate outside the source
+tree. SignetAuth has a separate bounded authentication runtime; it is never
+created by camera or media callbacks.
 
 ```sh
 node scripts/build-native.mjs apple
+node scripts/build-signet-native.mjs apple
 mkdir -p target/ios-app
 xcodegen --spec mobile/ios/project.yml --project target/ios-app --cache-path target/ios-app/xcodegen-cache
 xcodebuild -project target/ios-app/SapflowBroadcaster.xcodeproj \
@@ -27,24 +32,207 @@ xcodebuild -project target/ios-app/SapflowBroadcaster.xcodeproj \
 The initial floor is iOS 16. Portrait and both landscape orientations are
 supported; upside-down portrait capture follows device orientation even where
 the system keeps the application's interface upright.
+The [orientation contract](capture-orientation.md) defines Automatic and the
+fixed mounting choices, their immutable Prepare boundary and physical gates.
+The [camera contract](native-camera-controls.md) covers Front/Rear selection,
+live input replacement within one encoder/show, supported zoom/focus/exposure/
+white-balance controls and preview-only front mirroring. Source checks and
+unsigned builds remain separate from physical switching and recording acceptance.
 The bundle identifier is a development placeholder and no development team,
 signing identity, provisioning profile or distributable package is assumed.
 Generated projects, build products and DerivedData stay under `target/`.
 A simulator build proves compilation only: hardware/camera availability is
 checked at runtime and unsupported hardware must fail visibly.
 
+## V4V creator flow
+
+The application has three explicit destinations: Record only, Manual destination
+and V4V. Record only remains the launch default. One app-owned creator controller
+survives view updates and destination changes; camera callbacks never run its
+authentication, journal or HTTP work. V4V streaming is always unlimited, free
+and without a watermark. There is no subscription check in this path.
+
+V4V requires a reviewed build profile. Debug and Release default to
+`SAPFLOW_V4V_ENABLED=NO`, with empty API origin, playback origin and playback
+prefix. Disabled builds display an unavailable message and do not open creator
+journals, Keychain services or a signer runtime. An enabled profile requires
+literal `YES`, three valid routing values and the real SignetAuth module.
+Missing, partial or invalid configuration fails closed. A manual destination
+cannot supply this profile.
+
+The separate Qualification configuration maps
+`SAPFLOW_QUALIFICATION_V4V_ENABLED`, `SAPFLOW_QUALIFICATION_V4V_API_ORIGIN`,
+`SAPFLOW_QUALIFICATION_V4V_PLAYBACK_ORIGIN` and
+`SAPFLOW_QUALIFICATION_V4V_PLAYBACK_PREFIX` into those four settings. Debug and
+Release do not consume the qualification settings. Use approved, deployed
+backend and playback routing for a real qualification; example domains only
+establish build isolation. Do not put private routes or account data in source.
+
+In an enabled build, choose V4V, explicitly connect a remote signer or use its
+saved client, load the manageable events and choose one. Prepare obtains and
+durably acknowledges the session grant before attaching the exact camera
+preparation. Start broadcast remains a separate user action. Sign-in, an event
+read, restored state or a late HTTP reply cannot start capture. A remote
+session without matching local ownership is a visible conflict, not a grant
+to adopt it. Restored credentials require fresh authentication; a restored
+publish session requires a fresh acknowledged refresh before use.
+
+An authenticated event may also show an active broadcast for which this app
+has no local journal. Its separate **End existing broadcast** action freezes the
+exact event, session, generation and revision shown by the confirmation dialog,
+then performs a fresh exact-session status read. The read permit lasts at most
+eight seconds and remains inside the command's original 60-second window. Only
+an exact, still-active response can atomically save terminal-only ownership and
+End intent before the ordinary durable End pump runs. This path never accepts a
+publishing grant, constructs a publisher, prepares the camera or adopts capture.
+A changed identity, late response, non-active phase or journal failure leaves
+the journal without that session and sends no End mutation.
+
+The control path admits one ordinary command and one primary HTTP request at
+a time. Session HTTP operations have an original 60-second window and at most
+four attempts. Explicit sign-in has a separate original 120-second limit that
+includes queueing, native connection, consent, HTTP and adoption. End can fence
+and reconcile independently of a cancelled sign-in's delayed cleanup.
+Retry saved action reconciles
+the existing durable operation rather than creating another Prepare. An
+acknowledged refresh updates the publisher's current lease; transport progress
+alone never extends it. Inactive mode cancels pending local approval and its
+captured publisher without stopping another destination. Only exact uncertain
+operations and terminal End reconciliation may continue while inactive.
+
+An active publisher schedules its next refresh against a plan containing the
+lease deadline, the capture binding's original generation and its exact camera
+ticket. Command contention keeps that plan until the refresh is durably staged;
+returning to the foreground immediately reconciles an overdue plan. A lost
+reply retains the journaled refresh body and nonce for explicit retry. Stop,
+End, binding retirement, authority expiry and an exact-ticket or generation
+change discard the plan, so a delayed alarm or rejected queued command cannot
+refresh a stopped publisher or prepare a successor capture.
+
+End broadcast synchronously fences the captured publisher and any first Start
+that has not committed. An existing local recording continues, including its
+later rotation segments, until Stop and save. A publishing startup failure is
+isolated from the recorder. The publisher starts before native sample delivery
+can discover its codec configuration. Remote End and Stop and save are distinct
+controls. Incomplete replay acknowledgement and replacement preparation are
+separate explicit actions; acknowledgement requires fresh exact-session status.
+An ended phase alone is labelled unconfirmed until the service returns the
+separate End-complete receipt. Leaving a manual destination also fences its
+captured publisher, even if Start committed before the UI received its running
+update; a local recording that already began can continue.
+
+The production factory uses distinct encrypted directories and Keychain services
+for publish/End state and remote-signer client credentials. It opens them on the
+same serial owner as the session engine and starts inactive. Corrupt or missing
+halves fail visibly without resetting or falling back to another session.
+Uncertain publisher, HTTP, signer and observation cleanup retain their actual
+owners until completion.
+
+Run the generated-fixture host checks without a phone or account:
+
+```sh
+bash mobile/ios/test-budget.sh
+bash mobile/ios/test-v4v.sh
+bash mobile/ios/test-origin-observation.sh
+bash mobile/ios/test-observed-publisher.sh
+bash mobile/ios/test-creator-owner.sh
+bash mobile/ios/test-config.sh
+```
+
+The publisher and creator-owner checks use the actual packaged native modules.
+They simulate transport, consent, journal and origin facts; they do not establish
+remote-signer consent, Keychain behaviour, a deployed V4V journey or physical
+camera/recording acceptance. Verify an actual built `Info.plist` using
+`test-config.sh --verify-info disabled PATH/Info.plist`, or `--verify-info enabled`
+followed by the path and the three expected routing values.
+
+The complete normal application currently passes unsigned Debug, Qualification
+and Release builds with both real packages and warnings treated as errors.
+Built-property-list checks verify that the retained Debug, Qualification and
+Release outputs are all connector-disabled. The separate configuration suite
+checks enabled routing validation without claiming that this retained
+Qualification app is enabled. The iOS unit-test bundle also compiles and links.
+These are compiler/configuration gates; no test runner, phone, signer, account
+or capture is exercised by them.
+
 ## Capture and ownership
 
 The capture-control queue owns session configuration and state. A separate
 serial sample queue receives native camera buffers and microphone PCM. The
 raw media never crosses FFI. Camera preview uses AVCaptureVideoPreviewLayer.
-The app keeps the screen awake during an active run; an explicit phone lock,
-background transition or capture/audio interruption ends the current run.
-There is no background-camera claim or silent capture resumption.
+The app keeps the screen awake during an active video run. Lock/background ends
+video and any audio-only show whose Start has not committed. An explicitly
+opted-in, already committed audio-only show may continue under the declared
+`audio` background mode while its authorised transport connects or reconnects;
+it never starts or resumes capture silently. Capture/audio
+interruption still ends the exact run. There is no background-camera claim.
 
-The profile is 720×1280 in portrait or 1280×720 in landscape at 30 fps,
-2.5 Mbit/s Main-profile H.264, no frame
-reordering, a maximum one-second/30-frame GOP, and 48 kHz mono 96 kbit/s AAC-LC.
+Choose capture quality before Prepare. The ordinary picker offers native
+640×480 at 600 kbit/s video, or the default 1280×720 at 2.5 Mbit/s video.
+Portrait swaps those dimensions. Both use 30 fps, Main-profile H.264, no frame
+reordering, a maximum one-second/30-frame GOP and 48 kHz mono 96 kbit/s AAC-LC.
+The 480p option is native 4:3 on iOS; Android's 848×480 option has a different
+aspect ratio. There is no software rescale or automatic quality fallback.
+A 1920×1080, 5 Mbit/s engineering path is excluded from the ordinary picker
+until physical qualification. Its source and compile checks are not a claim
+that the phone can sustain it.
+
+Each preparation ticket carries immutable quality through permission replies,
+first Start, recording segments, orientation epochs and publishing retries.
+Changing the next selection requires actual camera cleanup, rather than a
+possibly delayed UI snapshot. V4V grant admission happens before camera or
+publisher creation: 480p requires at least 1 Mbit/s, 720p requires 4 Mbit/s,
+and engineering 1080p requires 8 Mbit/s. An insufficient grant remains durable;
+the user can explicitly select a lower quality and Prepare again without
+repeating the acknowledged server mutation. A local publisher construction
+failure also cannot retry that acknowledged HTTP mutation.
+
+The native camera preset, frame rate, VideoToolbox target bitrate and GOP use
+that exact profile. Both incoming pixel buffers and compressed H.264 format
+dimensions must match its current orientation. The admission allowance above
+the H.264/AAC targets is budgeting, not proof of peak bitrate or retransmission
+capacity. Scoped SRT pacing still converts the granted bits per second to
+bytes per second and cannot increase the manual ceiling. Physical hardware,
+quality, pacing and sustained resource qualification remain separate gates.
+The finite iOS origin probe confirms actual audio/video decode and the current
+publishing attempt; it does not yet compare remote dimensions with the selected
+capture profile.
+
+### Elapsed time and socket outbound telemetry
+
+The normal capture screen displays Capture elapsed, Broadcast elapsed and Socket
+outbound. These are separate from transport acknowledgement and native decoded
+playback readiness. Capture elapsed starts at the first committed Start, never
+Prepare or a grant response. It includes orientation/reconnection gaps in the
+same foreground logical capture, and freezes at Stop or interruption. It is not
+an encoded-media or written-file duration. A local-only capture has no broadcast
+clock. Destination End/expiry freezes Broadcast elapsed while independent local
+capture and recording can continue; rotation cannot restart an ended clock.
+
+Socket outbound counts successful existing Network.framework `contentProcessed`
+completions: bytes consumed by the local network stack, not bytes delivered to a
+NIC, peer or decoder. RTMP includes submitted protocol bytes; RTMPS excludes TLS
+and TCP/IP overhead. SRT includes submitted UDP protocol/control/retransmission
+bytes but excludes UDP/IP headers. The metric does not alter SDK readiness or
+admission, and Rust's pre-submission counters are not used for it.
+
+The counter adds only scalar work to existing completions, without another
+packet callback, dispatch, clock read, FFI call, payload copy, allocation or
+timer. One capture-owned 1 Hz reader spans reconnect and orientation epochs,
+with at most one outstanding cold read. Two complete, monotonic samples within
+three seconds are required for a rate; fresh no-delta samples produce zero.
+Warmup, missing/stale/unsupported samples, counter overflow or rollback remain
+unavailable. End does not leave a historical number labelled as current.
+
+The logical destination retains only current and closing counter baselines.
+Its exact attempt context fences reads and final reports. Final accounting is
+folded before the existing actual-close completion can create a successor.
+Cancellation ordering is not assumed: a failed or unresolved final send is marked
+incomplete and breaks rate continuity, without delaying capture/transport
+cleanup or fabricating completed bytes. Sealed totals cannot grow from a late
+callback. These source/host checks are not an installed-phone throughput or
+performance qualification.
+
 The encoder is selected from VTCopyVideoEncoderList entries explicitly marked
 hardware accelerated and the session's actual EncoderID must match. On iOS
 17.4 and later the app additionally requires and verifies hardware acceleration
@@ -88,18 +276,48 @@ run outside the locks and capture callbacks. Reservation identity handles
 out-of-order completion correctly. Overflow closes admission once, so error
 notifications cannot themselves grow an unbounded callback backlog.
 Recording overflow/storage backpressure closes new recording ingress and retains
-its accepted prefix for finalisation when Stop is requested. It does not block
-publishing. The app reports recording failure explicitly. SDK ingress overflow or validation failure closes only publishing admission and
+its accepted prefix as incomplete. A low-space result requests finalisation on
+the recording worker while publishing continues. The app reports recording
+failure explicitly. SDK ingress overflow or validation failure closes only publishing admission and
 reports the failure while local recording continues. Capture/encoder failure
 stops the common session and closes its recording.
 
-Successful stop flushes native AAC and hardware video, stops the publisher, drains accepted
-recording work and waits for AVAssetWriter finalisation. Files are retained in
-the app's Documents directory; successful finalisation offers ShareLink export.
-Files sharing is enabled for recovery/export through Files. Capture refuses to
-start with 200 MiB or less free capacity and checks capacity every five seconds
-on the control queue. A failed or interrupted file is never labelled complete.
-Fragment configuration alone does not establish process-kill recovery.
+Successful stop flushes native AAC and hardware video, stops the publisher, drains
+accepted recording work and waits for actual AVAssetWriter finalisation. New
+files live in private `Library/Application Support/Recordings`. The inline
+recording library groups orientation segments by show and distinguishes writing,
+recorder-finalised, incomplete and unverified files. Old Documents recordings
+remain in place and are listed as unverified; they are not silently adopted.
+Recorder-finalised does not establish decoded playback or a complete show.
+
+Prepare and actual Start/rotation check catalogue capacity and selected-profile
+storage on a cold IO worker before admitting media. The budget is a 60-second
+bitrate horizon plus headroom and reserve, with the existing strict greater-than
+200 MiB floor retained. This is a preflight estimate, not a future-space promise.
+At most one five-second storage read is outstanding. Directory scans, storage
+reads, writer construction/finalisation and receipt writes run off camera,
+sample, UI and capture-control callbacks. Low or unavailable storage refuses
+initial admission. After a recording fails or stops for low space, a later
+rotation can still stop publishing because automatic restart requires successful
+segment finalisation. Recording-optional restart policy remains follow-on work.
+
+Reloading metadata is permitted during capture. Export requires capture to be
+idle and opens a folder picker without passing it a private recording URL.
+The exact selection reserves capture until the modal actually dismisses and
+the cold worker finishes. Incomplete, orphaned and legacy files require explicit
+confirmation. Export revalidates the selected file and receipt, creates a new
+exclusive copy in the coordinated folder and copies in at most 64 KiB chunks.
+It checks the created file's identity and byte count, synchronises it and closes
+actual owners before releasing security-scoped access or admitting capture.
+Cancellation preserves the private original; a partial destination copy may
+remain. Unconfirmed cleanup retains ownership and blocks new work.
+
+The catalogue bounds scans to 256 segments, 1024 directory entries and 4 KiB
+receipts. A lifetime directory lock prevents a fresh local owner bypassing
+pending cleanup. File/receipt identity checks detect replacement and changes;
+they are not content-authenticity hashes. No automatic deletion, migration,
+repair or replay publication occurs. Fragment configuration alone does not
+establish process-kill recovery. Catalogue management and pagination remain open.
 
 ## Upright capture and rotation
 
@@ -119,15 +337,18 @@ delivery, stop capture, flush the encoders, await bounded publisher teardown and
 finalise the current recording. A fresh hardware encoder, AAC encoder, recording
 file and publisher then start at the latest requested pose, with a new shared
 A/V timestamp epoch. Rapid turns coalesce during finalisation. Each successfully
-finished segment remains in Files. The latest finished segment remains exportable
-while the next records. This applies to local-only capture, RTMP/RTMPS and SRT.
+finished segment remains in the private recording library. Metadata may be
+reloaded while the next records; export requires capture to be stopped. This
+applies to local-only capture, RTMP/RTMPS and SRT.
 
 This introduces a visible media gap and a fresh destination connection while
 retaining the same logical reconnect policy. Continuous playback across an
 aspect change has not been qualified on iPhone. It does
 not send replacement codec configuration into an existing immutable session.
 Automatic restart is cancelled if finalisation has not completed within six
-seconds. This fences resumption rather than forcibly interrupting an AVFoundation
+seconds. The original monotonic deadline is rechecked after blocking stages
+and before adoption, even if its timer callback was delayed. This fences
+resumption rather than forcibly interrupting an AVFoundation
 driver or file operation; cleanup may finish later. Network stop retains its
 existing three-second RTMP or 100 ms SRT drain bound. Completion additionally
 requires Network.framework's actual `.cancelled` state. A separate logical-owner
@@ -157,8 +378,8 @@ Apple documents physical buffer rotation for
 
 ## Manual RTMPS publishing
 
-Local recording is the default. Turn off “Local recording only” to configure a
-manual destination. Enter the RTMPS application URL and stream key separately,
+Local recording is the default. Choose Manual destination to configure a
+destination. Enter the RTMPS application URL and stream key separately,
 then Prepare and explicitly Start broadcast. Destination editing freezes while
 prepared/running, so an edited field cannot silently change what Start sends to.
 Stop before changing destinations. The application URL must have an application
@@ -181,6 +402,26 @@ exported, included in diagnostic errors or embedded in the application URL.
 Delete removes that profile and its Keychain item. Selecting a saved profile
 fills the form; it does not start a connection. A locked/unavailable Keychain
 fails visibly rather than using an old key silently.
+
+Manual settings also accept a
+[reviewed version 1 JSON destination file](manual-destination-profiles.md).
+The bounded cold reader retains document access through actual close, then
+offers a redacted host/port/security review. Apply fills the form only, with
+independent permission for plaintext. Destination edits, leaving the foreground
+and capture preparation invalidate the original import ticket. Saved-profile
+load/save/delete use actual capture availability guards too; corrupt metadata
+fails visibly instead of appearing as an empty profile list. Physical provider
+and Keychain behaviour still require device qualification.
+
+Manual settings also offer camera QR scanning through native AVFoundation.
+The scanner accepts only the bounded
+[manual destination link](manual-destination-links.md#camera-qr-import-and-verification)
+and opens the same transient review workflow. Scanning reserves the actual
+capture/library owner before camera permission or opening. Cancellation does
+not release a pending OS permission request, native session or metadata callback
+owner. Only actual closure and modal dismissal release the reservation; the
+original 60-second deadline is checked again at UI delivery. A scan never
+prepares or starts a broadcast. Installed scanning remains a physical gate.
 
 `ReconnectingPublisher` implements the logical `EncodedPublishingSink` and
 creates a fresh `ManualRtmpPublisher` per attempt. `CaptureEngine.setDestination`
@@ -276,6 +517,51 @@ to require certificate-handshake failure before publication, without overriding
 trust. It does not install a root certificate or change Keychain trust settings.
 
 ## Evidence and remaining acceptance
+
+The private recording library checkpoint on 22 October 2026 passes 117 pure
+capture/budget tests, 26 generated-file catalogue/storage tests and 33
+library/export tests on macOS with warnings treated as errors. The independent
+subprocess lock test is macOS-only; it is not an executed iOS test. Seventeen
+generated-bundle Python tests exercise the privacy-resource verifier. All three
+complete unsigned app configurations compile and link with zero warnings using
+the same 84 source/package inputs. The actual 109-input iOS XCTest bundle also
+compiles and links with zero warnings; it was not executed on iOS. The actual
+root `PrivacyInfo.xcprivacy` is
+verified in each normal app archive, separately from source and generated
+bundles. This is a required-reason packaging checkpoint; collection/tracking
+assessment and App Store readiness remain open.
+
+A generated-only macOS check uses the actual production CompressedRecorder,
+AVAssetWriter and catalogue with compressed H.264/AAC samples. Its finalised
+3.02-second file and two incomplete 1.26-second prefixes independently decode
+with video and audio. Exports match their originals, bounded copy chunks stay
+within 64 KiB and repeated finish listeners receive actual completion. The
+recording-only stop uses the explicit incomplete-finish seam, not real disk
+pressure. All generated media and build scratch were removed. Receipts remain
+under `target/ios-recording-native/v3/` and `target/ios-recording-library/`.
+This does not establish document-provider/modal behaviour, physical iOS
+recording, seeking, thermal performance, crash recovery or power-loss bounds.
+
+The 22 October 2026 audio-only recording checkpoint writes new microphone-only
+recordings as M4A while video-bearing recordings remain MOV. The immutable
+catalogue identity and export destination preserve the selected extension, and
+historical receipts without a container continue to resolve to MOV. The encoder
+reports its actual AAC converter priming and tail extent to the recorder; no
+priming or padding count is hard-coded, and the shared publishing payloads,
+timestamps and AudioSpecificConfig are unchanged. The generated M4A retained all
+143 native AAC access units in their original order and passed the packaged Rust
+ingress. Native playback returned the exact 144000-, 143360-, 143123- and
+511-frame input extents; the three non-periodic comparison cases had zero-lag
+correlations above 0.99994. FFmpeg may retain the file's declared trailing
+padding, so its decoded tail length is not used as a universal exact-presentation
+assertion. The checkpoint passed 38 catalogue/storage/timing and 35
+library/admission/export host tests with warnings as errors, typechecked all 51
+production Swift files against iOS 16 APIs, and retained the unchanged generated
+A/V MOV path through three strict independent decodes. Evidence is under
+`target/ios-audio-recording-retention/v1/` and
+`target/ios-audio-only-fixture/20261022T122618Z-50ecbe54/`. This is generated
+macOS evidence; physical iPhone, background, lock-screen, route-change,
+long-show, crash, power-loss and thermal acceptance remain open.
 
 Verified on 21 October 2026 with Xcode 16.2 and the actual generated Sapflow
 XCFramework: the unsigned arm64 iOS application and XCTest bundle passed
@@ -506,3 +792,28 @@ and install/launch receipts identify that artefact separately. Neither that
 application nor the separate UI qualification runner was rebuilt, re-signed or
 reinstalled for this wording change. Physical acceptance must follow the frozen
 artefact's recorded identity rather than the newer source wording.
+
+## Foreground input routing checkpoint
+
+The normal controls now expose System Default plus bounded built-in, wired and
+USB input choices. An idle refresh reads `AVAudioSession.availableInputs` under
+the capture category without activating capture. Prepare freezes the input UID,
+sets `preferredInput` and verifies `currentRoute.inputs` after capture starts and
+before first PCM. Route notifications recheck the exact native epoch's input;
+unchanged input/output-only events do not stop capture. Default pins the actual
+input across orientation epochs of the same preparation. Mismatch or removal
+stops recording and publishing without fallback. Listeners are removed before
+deliberate deactivation; stale owners cannot stop later preparations.
+
+A cold route transition closes PCM admission while its native lookup runs
+outside the state lock. The existing sample owner can wait up to 250 ms on a
+relative, monotonic condition; success/Stop/failure wakes it without polling or
+a new timer. Timeout is a sticky route failure. Initial events coalesce before
+pinning, and late verification cannot reopen a closed or newer owner.
+
+The active microphone label is separate from the selected preference. Bluetooth
+and other routes outside this built-in/wired/USB profile are unsupported, even
+under Default. Actual USB microphones, hot-unplug, route callback timing and
+physical background/locked-screen behaviour remain B4R gates. The implemented
+ownership and app-only Stop contract are described in the
+[audio-only mobile scope](audio-only-mobile.md#background-ownership-and-controls).

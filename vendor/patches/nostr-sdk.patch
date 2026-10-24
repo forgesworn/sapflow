@@ -1,0 +1,116 @@
+--- a/src/transport/websocket.rs
++++ b/src/transport/websocket.rs
+@@ -84,37 +84,84 @@
+         url: &'a Url,
+         proxy: Option<SocketAddr>,
+     ) -> BoxedFuture<'a, Result<(WebSocketSink, WebSocketStream), Error>> {
+-        Box::pin(async move {
+-            let mode: ConnectionMode = match proxy {
+-                #[cfg(not(target_arch = "wasm32"))]
+-                Some(proxy) => ConnectionMode::Proxy(proxy),
+-                #[cfg(target_arch = "wasm32")]
+-                Some(_) => ConnectionMode::Direct,
+-                None => ConnectionMode::Direct,
+-            };
+-
++        connect_with_config(url, proxy, None)
++    }
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++pub use async_wsocket::native::WebSocketConfig;
++
++/// Native buffer/frame/message limits on the default maintained transport.
++/// Existing DefaultWebsocketTransport construction remains unchanged.
++#[cfg(not(target_arch = "wasm32"))]
++#[derive(Debug, Clone)]
++pub struct ConfiguredWebsocketTransport {
++    config: async_wsocket::native::WebSocketConfig,
++}
++#[cfg(not(target_arch = "wasm32"))]
++impl ConfiguredWebsocketTransport {
++    /// Select native WebSocket buffering and message/frame limits.
++    pub fn new(config: async_wsocket::native::WebSocketConfig) -> Self {
++        Self { config }
++    }
++}
++#[cfg(not(target_arch = "wasm32"))]
++impl WebSocketTransport for ConfiguredWebsocketTransport {
++    fn support_ping(&self) -> bool {
++        true
++    }
++    fn connect<'a>(
++        &'a self,
++        url: &'a Url,
++        proxy: Option<SocketAddr>,
++    ) -> BoxedFuture<'a, Result<(WebSocketSink, WebSocketStream), Error>> {
++        connect_with_config(url, proxy, Some(self.config.clone()))
++    }
++}
++// The same helper serves old defaults and explicit native bounds. Wasm does
++// not expose a native WebSocketConfig; its default path remains untouched.
++#[cfg(not(target_arch = "wasm32"))]
++type NativeConfig = async_wsocket::native::WebSocketConfig;
++#[cfg(target_arch = "wasm32")]
++type NativeConfig = ();
++fn connect_with_config<'a>(
++    url: &'a Url,
++    proxy: Option<SocketAddr>,
++    config: Option<NativeConfig>,
++) -> BoxedFuture<'a, Result<(WebSocketSink, WebSocketStream), Error>> {
++    Box::pin(async move {
++        let mode: ConnectionMode = match proxy {
+             #[cfg(not(target_arch = "wasm32"))]
+-            let connection = {
+-                let mut headers = HeaderMap::new();
+-                headers.insert("user-agent", HeaderValue::from_static(USER_AGENT));
+-                WebSocket::connect_with_headers(url, &mode, headers)
+-            };
++            Some(proxy) => ConnectionMode::Proxy(proxy),
+             #[cfg(target_arch = "wasm32")]
+-            let connection = WebSocket::connect(url, &mode);
+-
+-            let socket: WebSocket = connection.await.map_err(Error::transport)?;
+-
+-            // Split sink and stream
+-            let (tx, rx) = socket.split();
+-
+-            // NOTE: don't use sink_map_err here, as it may cause panics!
+-            // Issue: https://github.com/nostrdevkit/nostr/issues/984
+-            let sink: WebSocketSink = Box::pin(TransportSink(tx)) as WebSocketSink;
+-            let stream: WebSocketStream = Box::pin(rx.map_err(Error::transport)) as WebSocketStream;
+-
+-            Ok((sink, stream))
+-        })
+-    }
++            Some(_) => ConnectionMode::Direct,
++            None => ConnectionMode::Direct,
++        };
++
++        #[cfg(not(target_arch = "wasm32"))]
++        let connection = {
++            let mut headers = HeaderMap::new();
++            headers.insert("user-agent", HeaderValue::from_static(USER_AGENT));
++            WebSocket::connect_with_headers_and_config(url, &mode, headers, config)
++        };
++        #[cfg(target_arch = "wasm32")]
++        let connection = {
++            let _ = config;
++            WebSocket::connect(url, &mode)
++        };
++
++        let socket: WebSocket = connection.await.map_err(Error::transport)?;
++
++        // Split sink and stream
++        let (tx, rx) = socket.split();
++
++        // NOTE: don't use sink_map_err here, as it may cause panics!
++        // Issue: https://github.com/nostrdevkit/nostr/issues/984
++        let sink: WebSocketSink = Box::pin(TransportSink(tx)) as WebSocketSink;
++        let stream: WebSocketStream = Box::pin(rx.map_err(Error::transport)) as WebSocketStream;
++
++        Ok((sink, stream))
++    })
+ }
+ 
+ struct TransportSink(SplitSink<WebSocket, Message>);

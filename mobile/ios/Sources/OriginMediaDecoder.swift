@@ -5,18 +5,37 @@ import CoreMedia
 import CoreVideo
 import VideoToolbox
 
+/// Validate what native CoreMedia actually exposes. Zero object flags mean
+/// unspecified; explicit flags must identify AAC-LC (CoreAudio MPEG4ObjectID2).
+/// This does not claim to recover or validate the raw two-byte ASC cookie.
+enum OriginAACDescription {
+    static func requireAudioOnly(formatID: UInt32, objectFlags: UInt32, rate: Double, channels: UInt32, framesPerPacket: UInt32) throws {
+        let aacLCObjectType: UInt32 = 2
+        guard formatID == kAudioFormatMPEG4AAC, objectFlags == 0 || objectFlags == aacLCObjectType,
+              rate == 48_000, channels == 1, framesPerPacket == 1024 else { throw OriginObservationFailure.unsupported }
+    }
+}
+
 struct OriginDecodedMedia: Equatable {
     let videoOutputs: Int, pcmFrames: Int, pcmOutputs: Int
     let hardwareVideo: Bool
     var sufficient: Bool { hardwareVideo && videoOutputs >= 2 && pcmFrames >= 2048 && pcmOutputs > 0 }
+    func sufficient(for expected: OriginExpectedMedia) -> Bool {
+        switch expected {
+        case .audioVideo: return sufficient
+        case .audioOnly48kMono: return !hardwareVideo && videoOutputs == 0 && pcmFrames >= 2048 && pcmOutputs > 0
+        }
+    }
 }
 
 /// Counts native PCM frames and their exact temporal extent, not callbacks.
 /// AVAssetReader can coalesce several AAC units into a single PCM buffer.
 struct OriginPCMProgress {
     private(set) var frames = 0, outputs = 0
+    private let requireContiguous: Bool
     private var rate: Int32?
     private var end: CMTime?
+    init(requireContiguous: Bool = false) { self.requireContiguous = requireContiguous }
     mutating func accept(frames count: Int, bytes: Int, bytesPerFrame: Int, rate: Int32,
                          first: CMTime, last: CMTime, firstDuration: CMTime, lastDuration: CMTime) throws {
         guard (8000...96000).contains(rate), count > 0, count <= Int(rate), bytesPerFrame == 2 || bytesPerFrame == 4,
@@ -25,14 +44,28 @@ struct OriginPCMProgress {
         guard first.isNumeric, last.isNumeric, CMTimeCompare(firstDuration, frame) == 0, CMTimeCompare(lastDuration, frame) == 0,
               CMTimeCompare(last, CMTimeAdd(first, CMTime(value: Int64(count - 1), timescale: rate))) == 0,
               end == nil || CMTimeCompare(first, end!) >= 0 else { throw OriginObservationFailure.progress }
+        // AO proves one contiguous PCM extent. CoreMedia supplies rational
+        // sample times, so no microsecond rounding allowance is needed here.
+        // Preserve the earlier AV observation's nonoverlap-only behaviour.
+        if requireContiguous, let end, CMTimeCompare(first, end) != 0 { throw OriginObservationFailure.progress }
         self.rate = rate; end = CMTimeAdd(last, lastDuration); frames += count; outputs += 1
     }
 }
 
 protocol OriginMediaDecoding: AnyObject {
     var cleanupComplete: Bool { get }
+    func whenCleanupComplete(_ completion: @escaping () -> Void)
     func decode(_ data: Data, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void)
+    func decode(_ data: Data, expectedMedia: OriginExpectedMedia, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void)
     func close()
+}
+
+extension OriginMediaDecoding {
+    /// Existing AV-only injected adapters cannot silently claim AO support.
+    func decode(_ data: Data, expectedMedia: OriginExpectedMedia, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
+        guard expectedMedia == .audioVideo else { completion(.failure(.unsupported)); return }
+        decode(data, deadlineNs: deadlineNs, completion: completion)
+    }
 }
 
 /// One finite native worker. Timeout fences its result immediately but does
@@ -43,14 +76,23 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
     private let lock = NSLock()
     private var job: Job?
     private var closed = false
+    private let cleanup = OriginCleanupNotification()
+    private let now: () -> UInt64
+    init(now: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }) { self.now = now }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return job == nil }
+    func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func decode(_ data: Data, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
+        decode(data, expectedMedia: .audioVideo, deadlineNs: deadlineNs, completion: completion)
+    }
+    func decode(_ data: Data, expectedMedia: OriginExpectedMedia, deadlineNs: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
         lock.lock()
         guard !closed, job == nil else { let error: OriginObservationFailure = closed ? .cancelled : .busy; lock.unlock(); completion(.failure(error)); return }
-        let now = DispatchTime.now().uptimeNanoseconds
+        let now = self.now()
         guard !data.isEmpty, data.count <= OriginMediaBody.totalLimit, deadlineNs > now, deadlineNs - now <= 3_000_000_000 else { lock.unlock(); completion(.failure(.bounds)); return }
-        guard #available(iOS 17, macOS 12, *) else { lock.unlock(); completion(.failure(.unsupported)); return }
-        let current = Job(deadline: deadlineNs, completion: completion); job = current; lock.unlock()
+        if expectedMedia.hasVideo {
+            guard #available(iOS 17, macOS 12, *) else { lock.unlock(); completion(.failure(.unsupported)); return }
+        }
+        let current = Job(expectedMedia: expectedMedia, deadline: deadlineNs, now: self.now, completion: completion); job = current; lock.unlock()
         current.startDeadline()
         Task.detached(priority: .utility) { [self, current] in
             let result: Result<OriginDecodedMedia, OriginObservationFailure>
@@ -63,18 +105,25 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
                 do { try current.cleanup(); result = .failure((error as? OriginObservationFailure) ?? .decode) }
                 catch { current.report(.failure(.cleanup)); return } // Retain the uncertain owner.
             }
-            lock.withLock { if job === current { job = nil } }
+            let fullyClosed = lock.withLock { () -> Bool in
+                if job === current { job = nil }
+                return closed && job == nil
+            }
+            if fullyClosed { cleanup.complete() }
             current.report(result)
         }
     }
     func close() {
         lock.lock(); closed = true; let old = job; lock.unlock()
         old?.cancel(.cancelled)
+        if old == nil { cleanup.complete() }
     }
 
     private final class Job: @unchecked Sendable {
         private let lock = NSLock()
         private let deadline: UInt64
+        private let now: () -> UInt64
+        private let expectedMedia: OriginExpectedMedia
         private var callback: ((Result<OriginDecodedMedia, OriginObservationFailure>) -> Void)?
         private var timer: DispatchSourceTimer?
         private var failure: OriginObservationFailure?
@@ -86,18 +135,23 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
         private let cancellations = DispatchGroup()
         private var videoCount = 0
         private var videoPTS: CMTime?
-        private var pcm = OriginPCMProgress()
-        init(deadline: UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) { self.deadline = deadline; callback = completion }
+        private var pcm: OriginPCMProgress
+        init(expectedMedia: OriginExpectedMedia, deadline: UInt64, now: @escaping () -> UInt64, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
+            self.expectedMedia = expectedMedia; self.deadline = deadline; self.now = now; callback = completion
+            pcm = OriginPCMProgress(requireContiguous: expectedMedia == .audioOnly48kMono)
+        }
         func startDeadline() {
             let next = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "sapflow.origin.decode.deadline"))
-            next.schedule(deadline: DispatchTime(uptimeNanoseconds: deadline))
+            let instant = now()
+            let remaining = deadline > instant ? deadline - instant : 0
+            next.schedule(deadline: .now() + .nanoseconds(Int(min(remaining, 3_000_000_000))))
             next.setEventHandler { [weak self] in self?.cancel(.deadline) }
             lock.withLock { timer = next }; next.resume()
         }
         func check() throws {
             try lock.withLock {
                 if let failure { throw failure }
-                guard DispatchTime.now().uptimeNanoseconds < deadline else { throw OriginObservationFailure.deadline }
+                guard now() < deadline else { throw OriginObservationFailure.deadline }
             }
         }
         func report(_ result: Result<OriginDecodedMedia, OriginObservationFailure>) {
@@ -131,7 +185,6 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
             if let directory = owned.3 { try FileManager.default.removeItem(at: directory) }
             lock.withLock { asset = nil; readers = []; videoSession = nil; scratch = nil }
         }
-        @available(iOS 17, macOS 12, *)
         func run(_ data: Data) async throws -> OriginDecodedMedia {
             try check()
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("sapflow-origin-probe-" + UUID().uuidString, isDirectory: true)
@@ -145,46 +198,60 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
             let asset = AVURLAsset(url: input); lock.withLock { self.asset = asset }; try check()
             let tracks = try await asset.load(.tracks)
             let videos = tracks.filter { $0.mediaType == .video }, audios = tracks.filter { $0.mediaType == .audio }
-            guard tracks.count == 2, videos.count == 1, audios.count == 1 else { throw OriginObservationFailure.decode }
-            let videoFormats = try await videos[0].load(.formatDescriptions), audioFormats = try await audios[0].load(.formatDescriptions)
+            guard tracks.count == (expectedMedia.hasVideo ? 2 : 1), videos.count == (expectedMedia.hasVideo ? 1 : 0), audios.count == 1 else { throw OriginObservationFailure.decode }
+            let audioFormats = try await audios[0].load(.formatDescriptions)
             try check()
-            guard videoFormats.count == 1, audioFormats.count == 1,
-                  CMFormatDescriptionGetMediaSubType(videoFormats[0]) == kCMVideoCodecType_H264,
+            guard audioFormats.count == 1,
                   CMFormatDescriptionGetMediaSubType(audioFormats[0]) == kAudioFormatMPEG4AAC,
                   let audio = CMAudioFormatDescriptionGetStreamBasicDescription(audioFormats[0]),
                   audio.pointee.mFramesPerPacket == 1024, (1...2).contains(audio.pointee.mChannelsPerFrame),
                   audio.pointee.mSampleRate >= 8000, audio.pointee.mSampleRate <= 96000 else { throw OriginObservationFailure.unsupported }
-            let size = CMVideoFormatDescriptionGetDimensions(videoFormats[0])
-            guard size.width > 0, size.height > 0, size.width <= 1920, size.height <= 1920 else { throw OriginObservationFailure.bounds }
+            if expectedMedia == .audioOnly48kMono {
+                let native = audio.pointee
+                try OriginAACDescription.requireAudioOnly(formatID: native.mFormatID, objectFlags: native.mFormatFlags,
+                    rate: native.mSampleRate, channels: native.mChannelsPerFrame, framesPerPacket: native.mFramesPerPacket)
+            }
+            var size = CMVideoDimensions(width: 0, height: 0)
             var video: VTDecompressionSession?
-            let specification = [kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true] as CFDictionary
-            let destination = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange] as CFDictionary
-            guard VTDecompressionSessionCreate(allocator: nil, formatDescription: videoFormats[0], decoderSpecification: specification, imageBufferAttributes: destination, outputCallback: nil, decompressionSessionOut: &video) == noErr, let video else { throw OriginObservationFailure.unsupported }
-            lock.withLock { videoSession = video }; try check()
-            var hardware: Unmanaged<CFTypeRef>?
-            guard VTSessionCopyProperty(video, key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, allocator: nil, valueOut: &hardware) == noErr,
-                  (hardware?.takeRetainedValue() as? NSNumber)?.boolValue == true else { throw OriginObservationFailure.unsupported }
+            if expectedMedia.hasVideo {
+                guard #available(iOS 17, macOS 12, *) else { throw OriginObservationFailure.unsupported }
+                let videoFormats = try await videos[0].load(.formatDescriptions)
+                try check()
+                guard videoFormats.count == 1, CMFormatDescriptionGetMediaSubType(videoFormats[0]) == kCMVideoCodecType_H264 else { throw OriginObservationFailure.unsupported }
+                size = CMVideoFormatDescriptionGetDimensions(videoFormats[0])
+                guard size.width > 0, size.height > 0, size.width <= 1920, size.height <= 1920 else { throw OriginObservationFailure.bounds }
+                let specification = [kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true] as CFDictionary
+                let destination = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange] as CFDictionary
+                guard VTDecompressionSessionCreate(allocator: nil, formatDescription: videoFormats[0], decoderSpecification: specification, imageBufferAttributes: destination, outputCallback: nil, decompressionSessionOut: &video) == noErr, let video else { throw OriginObservationFailure.unsupported }
+                lock.withLock { videoSession = video }; try check()
+                var hardware: Unmanaged<CFTypeRef>?
+                guard VTSessionCopyProperty(video, key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, allocator: nil, valueOut: &hardware) == noErr,
+                      (hardware?.takeRetainedValue() as? NSNumber)?.boolValue == true else { throw OriginObservationFailure.unsupported }
+            }
             var outputs: [AVAssetReaderTrackOutput] = []
             let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
-            for (index, track) in [videos[0], audios[0]].enumerated() {
+            let selected = (expectedMedia.hasVideo ? [videos[0]] : []) + [audios[0]]
+            for (index, track) in selected.enumerated() {
                 try check()
                 let reader = try AVAssetReader(asset: asset)
                 lock.withLock { readers.append(reader) }; try check()
-                let output = AVAssetReaderTrackOutput(track: track, outputSettings: index == 0 ? nil : audioSettings)
+                let output = AVAssetReaderTrackOutput(track: track, outputSettings: expectedMedia.hasVideo && index == 0 ? nil : audioSettings)
                 output.alwaysCopiesSampleData = false
                 guard reader.canAdd(output) else { throw OriginObservationFailure.decode }
                 reader.add(output)
                 guard reader.startReading() else { throw OriginObservationFailure.decode }; outputs.append(output)
             }
-            var ended = [false, false], examined = [0, 0]
+            var ended = Array(repeating: false, count: selected.count), examined = Array(repeating: 0, count: selected.count)
             while !ended.allSatisfy({ $0 }) {
-                for index in 0..<2 where !ended[index] {
+                for index in selected.indices where !ended[index] {
                     try check(); examined[index] += 1
                     guard examined[index] <= 128 else { throw OriginObservationFailure.bounds }
                     let available = try autoreleasepool { () throws -> Bool in
                         guard let sample = outputs[index].copyNextSampleBuffer() else { return false }
                         guard CMSampleBufferGetNumSamples(sample) > 0 else { return true }
-                        if index == 0 {
+                        if expectedMedia.hasVideo && index == 0 {
+                            guard #available(iOS 17, macOS 12, *) else { throw OriginObservationFailure.unsupported }
+                            guard let video else { throw OriginObservationFailure.decode }
                             var callbackFailure: OriginObservationFailure?
                             let result = VTDecompressionSessionDecodeFrame(video, sampleBuffer: sample, flags: [], infoFlagsOut: nil) { status, flags, image, pts, _ in
                                 do {
@@ -207,8 +274,8 @@ final class OriginMediaDecoder: OriginMediaDecoding, @unchecked Sendable {
                     }
                 }
             }
-            let result = OriginDecodedMedia(videoOutputs: videoCount, pcmFrames: pcm.frames, pcmOutputs: pcm.outputs, hardwareVideo: true)
-            guard result.sufficient else { throw OriginObservationFailure.progress }; return result
+            let result = OriginDecodedMedia(videoOutputs: videoCount, pcmFrames: pcm.frames, pcmOutputs: pcm.outputs, hardwareVideo: video != nil)
+            guard result.sufficient(for: expectedMedia) else { throw OriginObservationFailure.progress }; return result
         }
         private func observePCM(_ sample: CMSampleBuffer, sourceRate: Double, sourceChannels: UInt32) throws {
             guard let format = CMSampleBufferGetFormatDescription(sample), let raw = CMAudioFormatDescriptionGetStreamBasicDescription(format), raw.pointee.mFormatID == kAudioFormatLinearPCM else { throw OriginObservationFailure.decode }

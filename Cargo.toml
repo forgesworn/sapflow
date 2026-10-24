@@ -9,9 +9,10 @@ members = [
     "crates/sapflow-bench",
     "crates/sapflow-ffi",
     "crates/sapflow-client",
+    "crates/sapflow-signet-ffi",
     "crates/sapflow-realtime-wasm",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor/nostr-connect", "vendor/nostr-sdk", "vendor/async-wsocket"]
 
 [workspace.package]
 version = "0.1.0"
@@ -48,3 +49,9 @@ panic = "unwind"
 inherits = "release"
 strip = false
 debug = "line-tables-only"
+
+# Exact maintained sources with narrow bounded-client/configuration seams.
+[patch.crates-io]
+nostr-connect = { path = "vendor/nostr-connect" }
+nostr-sdk = { path = "vendor/nostr-sdk" }
+async-wsocket = { path = "vendor/async-wsocket" }

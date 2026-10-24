@@ -204,6 +204,7 @@ pub struct EncodedSample {
     timing: SampleTiming,
     keyframe: bool,
     payload: Arc<[u8]>,
+    aac_source: Option<AacSourceProvenance>,
 }
 
 impl EncodedSample {
@@ -241,6 +242,7 @@ impl EncodedSample {
             timing,
             keyframe,
             payload,
+            aac_source: None,
         })
     }
     pub fn config(&self) -> &Arc<CodecConfig> {
@@ -257,6 +259,90 @@ impl EncodedSample {
     }
     pub fn payload(&self) -> &Arc<[u8]> {
         &self.payload
+    }
+    pub fn aac_source(&self) -> Option<&AacSourceProvenance> {
+        self.aac_source.as_ref()
+    }
+}
+
+/// Caller-reported native context tied to the original validated ownership
+/// handle. This is not an AU cardinality, trim, EOF or codec qualification fact.
+/// The original never has provenance itself, so retention depth is exactly one.
+#[derive(Debug, Clone)]
+pub struct AacSourceProvenance {
+    original: SharedSample,
+    producer_generation: u64,
+    native_pts_us: i64,
+}
+impl AacSourceProvenance {
+    pub fn original(&self) -> &SharedSample {
+        &self.original
+    }
+    pub fn producer_generation(&self) -> u64 {
+        self.producer_generation
+    }
+    pub fn native_pts_us(&self) -> i64 {
+        self.native_pts_us
+    }
+}
+
+/// Two explicit immutable timing choices over one existing validated payload.
+/// No additional payload clone or compressed-payload validation is performed
+/// from that handle. End-to-end binding/ingress copy cost is a separate gate.
+#[derive(Debug)]
+pub struct AacSampleTimingViews {
+    recording: SharedSample,
+    publishing: Option<SharedSample>,
+}
+impl AacSampleTimingViews {
+    pub fn new(
+        original: SharedSample,
+        producer_generation: u64,
+        native_pts_us: i64,
+        publishing_pts: Option<i64>,
+    ) -> Result<Self, MediaError> {
+        if producer_generation == 0
+            || original.aac_source.is_some()
+            || original.keyframe
+            || !matches!(original.config.as_ref(), CodecConfig::Aac(config)
+                if config.audio_specific_config() == [0x11, 0x88])
+            || original.timing.timescale() != 48_000
+            || original.timing.duration() != 1024
+            || original.timing.pts() != original.timing.dts()
+        {
+            return Err(MediaError::InvalidAudioTiming);
+        }
+        // Check every supplied scalar BEFORE allocating either view. The
+        // signed native observation is preserved verbatim, never rebased here.
+        let publishing_timing = publishing_pts
+            .map(|pts| SampleTiming::new(pts, pts, 1024, 48_000))
+            .transpose()?;
+        let provenance = AacSourceProvenance {
+            original: original.clone(),
+            producer_generation,
+            native_pts_us,
+        };
+        let view = |timing| {
+            Arc::new(EncodedSample {
+                config: original.config.clone(),
+                timing,
+                keyframe: false,
+                payload: original.payload.clone(),
+                aac_source: Some(provenance.clone()),
+            })
+        };
+        Ok(Self {
+            recording: view(original.timing),
+            publishing: publishing_timing.map(view),
+        })
+    }
+    pub fn recording(&self) -> &SharedSample {
+        &self.recording
+    }
+    /// None deliberately withholds this original buffer from publishing. It
+    /// does not close that branch or count a rejected publishing sample.
+    pub fn publishing(&self) -> Option<&SharedSample> {
+        self.publishing.as_ref()
     }
 }
 
@@ -303,7 +389,7 @@ fn validate_avcc(mut rest: &[u8], keyframe: bool) -> Result<(), MediaError> {
 /// Per-track continuity within one explicitly configured encoder epoch.
 /// Configuration replacement requires a new validator and queue discontinuity;
 /// pointer identity makes an accidental mid-GOP reconfiguration explicit.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SampleContinuity {
     video: Option<(Arc<CodecConfig>, u64)>,
     audio: Option<(Arc<CodecConfig>, u64)>,

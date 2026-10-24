@@ -3,6 +3,8 @@ package dev.forgesworn.sapflow.broadcaster
 import android.Manifest
 import android.content.Intent
 import android.app.Activity
+import android.net.Uri
+import java.lang.ref.WeakReference
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.hardware.display.DisplayManager
@@ -10,9 +12,14 @@ import android.view.OrientationEventListener
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.CancellationSignal
+import android.os.SystemClock
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
+import android.widget.FrameLayout
+import android.widget.TextView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -35,6 +42,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.LinearProgressIndicator
@@ -42,6 +50,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.Slider
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -58,14 +67,74 @@ import androidx.compose.ui.viewinterop.AndroidView
 
 class MainActivity : ComponentActivity() {
     private lateinit var capture: CaptureController
+    private lateinit var audioOwner: AudioBroadcastOwner
+    private val runtimeClient = Any()
     private var v4v: V4vAppOwner? = null
     private var useV4v by mutableStateOf(false)
     private var prepareRequest = 0L
     private var preparedV4v: V4vCaptureAdmission.Prepared? = null
+    private var preparedCapture: CaptureStartAdmission.Preparation? = null
+    private var preparedV4vCapture: CaptureStartAdmission.Preparation? = null
+    private class PreparationIntent(val ticket: CaptureStartAdmission.Preparation, val request: Long, val capture: CaptureIntent, val record: Boolean, val v4v: Boolean,
+        val srt: Boolean, val endpoint: String, val key: String, val passphrase: String, val srtPlaintext: Boolean, val rtmpPlaintext: Boolean, val audioInputId: String?, val backgroundAudio: Boolean,
+        val orientation: CaptureOrientationChoice.Selection?, val cameraChoice: CameraSourceChoice, val initialStandby:Boolean)
+    private var pendingPreparation: PreparationIntent? = null
+    private val permissionReplies = PendingPermissionReply<PreparationIntent>()
+    private var permissionReplyOutstanding by mutableStateOf(false)
+    private var preparationPending by mutableStateOf(false)
+    private var recordingPreflight: RecordingLibraryAdmission.Ticket? = null
+    private lateinit var recordingLibrary: RecordingLibraryOwner
+    private var libraryVisible by mutableStateOf(false)
+    private var libraryEntries by mutableStateOf<List<RecordingCatalogue.Entry>>(emptyList())
+    private var libraryBusy by mutableStateOf(false)
+    private var libraryMessage by mutableStateOf<String?>(null)
+    private var libraryScan: RecordingLibraryAdmission.Ticket? = null
+    private val exportDocument = registerForActivityResult(ActivityResultContracts.CreateDocument("video/mp4")) { finishDocumentExport(it) }
     private var v4vState by mutableStateOf<V4vView?>(null)
     private var v4vEvents by mutableStateOf<List<Pair<String, String>>>(emptyList())
     private var v4vEvent by mutableStateOf("")
     private var acknowledgeLoss by mutableStateOf(false)
+    private class EndPrompt(val owner: V4vAppOwner, val ticket: V4vEndAdmission.Ticket,
+        val scope: V4vEndUiScope, val pending: PreparationIntent?, val capture: CaptureStartAdmission.Preparation?)
+    private var endPrompt by mutableStateOf<EndPrompt?>(null)
+    private fun dismissEndPrompt(selected: EndPrompt? = endPrompt) {
+        selected ?: return
+        selected.owner.cancelEndInvitation(selected.ticket)
+        if (endPrompt === selected) endPrompt = null
+    }
+    private fun requestEndPrompt(owner: V4vAppOwner) {
+        if (v4v !== owner || !useV4v || !manualForeground || !poseTracking || isDestroyed) return
+        dismissEndPrompt()
+        val pending = pendingPreparation
+        if (pending != null && !pending.v4v) return
+        val localCapture = capture.currentPreparation()
+        owner.endInvitation()?.let {
+            endPrompt = EndPrompt(owner, it, V4vEndUiScope(runtimeClient, prepareRequest, pending, localCapture),
+                pending, pending?.ticket ?: preparedV4vCapture)
+        }
+    }
+    private fun confirmEndPrompt(selected: EndPrompt) {
+        if (endPrompt !== selected || v4v !== selected.owner) return
+        var admittedRequest: Long? = null
+        val admitted = selected.scope.confirmIfCurrent(runtimeClient, prepareRequest, pendingPreparation,
+            capture.currentPreparation(), useV4v, manualForeground && poseTracking, !isDestroyed) {
+            selected.owner.confirmEnd(selected.ticket, cancelPendingCapture = {
+                prepareRequest++; admittedRequest = prepareRequest
+                // Only the exact V4V intent captured by this prompt can be abandoned.
+                if (selected.pending != null && pendingPreparation === selected.pending && selected.pending.v4v) cancelPreparation()
+                capture.cancelPendingPrepare(selected.capture)
+            }) { error -> ui.post {
+                if (isDestroyed || v4v !== selected.owner || admittedRequest != prepareRequest) return@post
+                if (error != null) permissionMessage = "V4V End intent not confirmed; retry the saved operation."
+                v4vState = selected.owner.control.view
+            } }
+        }
+        if (endPrompt === selected) endPrompt = null
+        if (!admitted) {
+            selected.owner.cancelEndInvitation(selected.ticket)
+            permissionMessage = "This V4V End confirmation is no longer current. Review the current session."
+        }
+    }
     private val signerResult = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         v4v?.signerRelay?.deliver(it.resultCode == Activity.RESULT_OK, it.data)
     }
@@ -85,14 +154,13 @@ class MainActivity : ComponentActivity() {
     private fun displayRotation(): Int = captureDisplay().rotation
 
     private fun displayPose() = CardinalPose.fromDegrees((360 - displayRotation() * 90) % 360)
+    private fun naturalPortrait(): Boolean = captureDisplay().mode.let { it.physicalHeight >= it.physicalWidth }
 
     private fun updatePreview() {
         val degrees = displayRotation() * 90
         // Physical mode dimensions are independent of the Activity's current
         // viewport/configuration transition, unlike a transient window aspect.
-        val mode = captureDisplay().mode
-        val naturalPortrait = mode.physicalHeight >= mode.physicalWidth
-        capture.updatePreview(preview, previewWidth, previewHeight, degrees, naturalPortrait)
+        capture.updatePreview(preview, previewWidth, previewHeight, degrees, naturalPortrait())
     }
     private var snapshot by mutableStateOf<CaptureSnapshot?>(null)
     private var permissionMessage by mutableStateOf<String?>(null)
@@ -103,8 +171,53 @@ class MainActivity : ComponentActivity() {
     private var useSrt by mutableStateOf(false)
     private var srtPassphrase by mutableStateOf("")
     private var srtPlaintextLab by mutableStateOf(false)
+    private val manualActions = ManualProfileActions()
+    private lateinit var manualIO: ManualDestinationProfileIO
+    private var manualBusy by mutableStateOf(false)
+    private var manualName by mutableStateOf("")
+    private var manualSaved by mutableStateOf<List<ManualDestinationProfiles.Saved>>(emptyList())
+    private var manualSelected: String? = null
+    private var manualReview by mutableStateOf<ManualProfileActions.Review?>(null)
+    private var manualReviewSaved: String? = null
+    private var manualConsent by mutableStateOf(false)
+    private var manualMessage by mutableStateOf<String?>(null)
+    private val manualPicker: ManualProfilePicker<Uri> get() = manualIO.picker
+    private var manualForeground = false
+    private val manualLinks = ManualLinkInbox.application
+    private var manualInvitation by mutableStateOf<ManualLinkInbox.Invitation?>(null)
+    private var manualScanTicket: CaptureStartAdmission.ScannerTicket? = null
+    private var manualScanAction: ManualProfileActions.Ticket? = null
+    private var manualScanDialog: android.app.Dialog? = null
+    private var manualScanPreview: android.view.TextureView? = null
+    private class QrPreviewTransfer { var owned: android.graphics.SurfaceTexture? = null }
+    private var manualScanTransfer: QrPreviewTransfer? = null
+    private var manualScanNativeClosed = false
+    private var manualScanGeometry: ManualQrScanner.Event.Geometry? = null
+    private val scanPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (::capture.isInitialized) {
+            val ticket = capture.receiveScannerPermission()
+            if (ticket != null && manualScanTicket === ticket && ticket.client === runtimeClient) {
+                if (granted && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) openManualScanner(ticket)
+                else { manualMessage = "Camera permission is required to scan. File and link import remain available."; cancelManualScanner(ticket) }
+            } else if (ticket != null) capture.cancelScanner(ticket)
+        }
+    }
+    private val importManualDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        manualPicker.returned(runtimeClient, uri)
+        if (manualForeground) resumeManualDocument()
+    }
     private var recordLocally by mutableStateOf(true)
     private var captureProfile by mutableStateOf(CaptureProfile.DEFAULT)
+    private var orientationChoice by mutableStateOf(CaptureOrientationChoice.AUTO)
+    private var initialStandby by mutableStateOf(false)
+    private var privacyCover:View?=null // Activity-owned; never retained by process capture.
+    private var cameraChoice by mutableStateOf(CameraSourceChoice.REAR)
+    private var cameraState by mutableStateOf(CameraSourceSnapshot())
+    private var microphoneOnly by mutableStateOf(false)
+    private var backgroundAudio by mutableStateOf(false)
+    private var selectedAudioInputId by mutableStateOf<String?>(null)
+    private var audioInputOptions by mutableStateOf<List<AudioInputOption>>(emptyList())
+    private val selectedIntent: CaptureIntent get() = if (microphoneOnly) CaptureIntent.AudioOnly48kMono else CaptureIntent.AudioVideo(captureProfile)
     private val ui = Handler(Looper.getMainLooper())
     private val settlePose = object : Runnable {
         override fun run() {
@@ -134,7 +247,8 @@ class MainActivity : ComponentActivity() {
     internal fun requestQualificationPose(value: String?): PoseInputPolicy.Result {
         if (!poseTracking) return PoseInputPolicy.Result.INACTIVE
         val previous = poseSelector.pose
-        val capturing = capture.snapshot().stage == CaptureStage.CAPTURING
+        val capturing = capture.snapshot().stage == CaptureStage.CAPTURING &&
+            capture.currentPreparation()?.orientation?.automatic == true
         val result = poseSelector.request(value, capturing, System.nanoTime())
         if (result == PoseInputPolicy.Result.CLEARED && capturing && !poseSelector.captureStopped && poseSelector.pose != previous) {
             capture.orientationChanged(poseSelector.pose)
@@ -145,27 +259,56 @@ class MainActivity : ComponentActivity() {
     private val displayChanges = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
         override fun onDisplayRemoved(displayId: Int) = Unit
-        override fun onDisplayChanged(displayId: Int) { if (poseTracking && displayId == captureDisplay().displayId) updatePreview() }
+        override fun onDisplayChanged(displayId: Int) { if (poseTracking && displayId == captureDisplay().displayId) { updatePreview(); updateManualScannerPreview() } }
     }
     private val refresh = object : Runnable {
         override fun run() {
             snapshot = capture.snapshot()
+            updatePrivacyCover(snapshot)
+            cameraState = capture.cameraSnapshot()
             v4vState = v4v?.control?.view
+            libraryBusy = !recordingLibrary.idle
+            if (recordingLibrary.cleanupRetained) libraryMessage = "File cleanup was not confirmed. Existing recordings are preserved; further file operations are blocked."
             ui.postDelayed(this, 200)
         }
     }
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-        if (result.values.all { it }) {
-            permissionMessage = null
-            prepareCapture()
-        } else {
-            permissionMessage = "Camera and microphone permission are required. Enable them in system settings if permission was permanently denied."
-        }
+        val intent = permissionReplies.receive()
+        permissionReplyOutstanding = permissionReplies.outstanding
+        if (intent != null && currentPreparation(intent)) {
+            if (preparationPermissions(intent).all { result[it] == true || checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
+                permissionMessage = null
+                prepareCapture(intent)
+            } else {
+                cancelPreparation()
+                permissionMessage = if (intent.capture.hasVideo) "Camera and microphone permission are required. Enable them in system settings if permission was permanently denied." else "Microphone and, for background mode, notification permission are required. Enable them in system settings if denied."
+            }
+        } else if (pendingPreparation === intent && intent != null) cancelPreparation()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        capture = CaptureController(applicationContext)
+        manualIO = ManualDestinationProfileIO.application(applicationContext)
+        if (savedInstanceState?.getBoolean("sapflow.manual-picker.discard") == true) manualPicker.restoreDiscard(runtimeClient)
+        audioOwner = AudioBroadcastOwner.application(applicationContext)
+        capture = audioOwner.capture
+        if (savedInstanceState?.getBoolean("sapflow.qr-permission.discard") == true) capture.restoreScannerPermissionDiscard()
+        preparedCapture = capture.currentPreparation()
+        preparedCapture?.let { retained ->
+            // Observe the exact process-owned intent; never reconstruct destination credentials.
+            microphoneOnly = !retained.intent.hasVideo
+            retained.intent.videoProfile?.let { captureProfile = it }
+            orientationChoice = retained.orientation?.choice ?: CaptureOrientationChoice.AUTO
+            cameraChoice = capture.cameraSnapshot().requested ?: retained.cameraChoice ?: CameraSourceChoice.REAR
+            backgroundAudio = retained.backgroundAudio
+            initialStandby=retained.initialStandby
+        }
+        audioOwner.continuingShow()?.let { retained ->
+            useV4v = retained.usesV4v
+            recordLocally = retained.recordsLocally
+            if (retained.usesV4v) preparedV4vCapture = retained.preparation
+        }
+        recordingLibrary = RecordingLibraryOwner.application(applicationContext)
         try { v4v = V4vAppOwner.configured(applicationContext); v4v?.signerRelay?.attach(launchSigner) }
         catch (_: Exception) { permissionMessage = "Approved V4V configuration is invalid; connector disabled" }
         poseSelector = PoseInputPolicy(displayPose(), qualificationPoseControlEnabled)
@@ -179,6 +322,7 @@ class MainActivity : ComponentActivity() {
                 schedulePoseSettlement()
             }
         }
+        receiveManualLink(intent, newDelivery = savedInstanceState == null)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFFFFAA62), background = Color(0xFF111416))) {
                 BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -188,22 +332,40 @@ class MainActivity : ComponentActivity() {
                         Column(Modifier.fillMaxSize()) { PreviewPane(Modifier.weight(1f).fillMaxWidth()); Controls(Modifier.weight(1f).fillMaxWidth()) }
                     }
                 }
+                ManualLinkInvitation()
+                RecordingLibraryPanel(libraryVisible, libraryEntries, libraryBusy, libraryMessage, captureIdleForFiles(),
+                    onDismiss = { libraryVisible = false }, onRefresh = { loadRecordings() },
+                    onExport = ::chooseRecordingExport, onCancelExport = ::cancelLibraryOperation)
             }
         }
+    }
+
+    private fun updatePrivacyCover(value:CaptureSnapshot?) {
+        val cover=value?.standbyRequested==true || initialStandby && value?.stage in listOf(null,CaptureStage.IDLE,CaptureStage.ERROR)
+        privacyCover?.visibility=if(cover)View.VISIBLE else View.GONE
     }
 
     @Composable
     private fun PreviewPane(modifier: Modifier) {
         Box(modifier, contentAlignment = Alignment.Center) {
-            AndroidView(factory = { context -> SurfaceView(context).apply {
-                holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(holder: SurfaceHolder) { preview = holder.surface; surfaceReady = true; updatePreview() }
-                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                        preview = holder.surface; previewWidth = width; previewHeight = height; updatePreview()
-                    }
-                    override fun surfaceDestroyed(holder: SurfaceHolder) { surfaceReady = false; preview = null; updatePreview() }
-                })
-            } }, modifier = Modifier.fillMaxSize())
+            if (!selectedIntent.hasVideo) Text("Microphone only · no camera preview")
+            else AndroidView(factory = { context -> FrameLayout(context).apply {
+                addView(SurfaceView(context).apply {
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(holder: SurfaceHolder) { preview = holder.surface; surfaceReady = true; updatePreview() }
+                        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                            preview = holder.surface; previewWidth = width; previewHeight = height; updatePreview()
+                        }
+                        override fun surfaceDestroyed(holder: SurfaceHolder) { surfaceReady = false; preview = null; updatePreview() }
+                    })
+                },FrameLayout.LayoutParams(-1,-1))
+                addView(TextView(context).apply {
+                    text="STANDBY";gravity=android.view.Gravity.CENTER
+                    setTextColor(android.graphics.Color.WHITE);setBackgroundColor(android.graphics.Color.rgb(9,14,22))
+                    privacyCover=this
+                    visibility=if(capture.snapshot().standbyRequested || initialStandby)View.VISIBLE else View.GONE
+                },FrameLayout.LayoutParams(-1,-1))
+            } },update={updatePrivacyCover(snapshot)}, modifier = Modifier.fillMaxSize())
             Text("SAPFLOW  ·  NATIVE CAPTURE", Modifier.align(Alignment.TopStart).padding(16.dp), color = Color.White)
         }
     }
@@ -215,52 +377,142 @@ class MainActivity : ComponentActivity() {
                         Text("Free V4V in every build", color = MaterialTheme.colorScheme.primary)
                         val current = snapshot
                         Text(current?.stage?.name ?: "IDLE", style = MaterialTheme.typography.labelLarge)
-                        Text(permissionMessage ?: current?.message ?: "Prepare the camera and microphone")
-                        Text(current?.orientation ?: "${captureProfile.label}30 · H264 · AAC 48 kHz", style = MaterialTheme.typography.bodySmall)
-                        val qualityConfigurable = current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)
+                        Text(permissionMessage ?: current?.message ?: if (microphoneOnly) "Prepare the microphone" else "Prepare the camera and microphone")
+                        Text(current?.orientation ?: if (microphoneOnly) "AAC-LC 48 kHz mono · 96 kbit/s" else "${captureProfile.label}30 · H264 · AAC 48 kHz", style = MaterialTheme.typography.bodySmall)
+                        val qualityConfigurable = !preparationPending && !libraryBusy && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(false to "Video", true to "Microphone").forEach { (audioOnly, label) ->
+                                OutlinedButton(enabled = qualityConfigurable, onClick = {
+                                    if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare && microphoneOnly != audioOnly) {
+                                        manualEdited(); prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
+                                        microphoneOnly = audioOnly
+                                    }
+                                }) { Text(if (microphoneOnly == audioOnly) "$label selected" else label) }
+                            }
+                        }
+                        Text("Microphone input", style = MaterialTheme.typography.labelLarge)
+                        OutlinedButton(enabled = qualityConfigurable, onClick = {
+                            if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) { manualEdited(); selectedAudioInputId = null }
+                        }) { Text(if (selectedAudioInputId == null) "System Default selected" else "System Default") }
+                        audioInputOptions.forEach { input ->
+                            OutlinedButton(enabled = qualityConfigurable, onClick = {
+                                if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) { manualEdited(); selectedAudioInputId = input.id }
+                            }) { Text("${input.name} · ${input.kind}" + if (selectedAudioInputId == input.id) " selected" else "") }
+                        }
+                        OutlinedButton(enabled = qualityConfigurable, onClick = {
+                            if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare) audioInputOptions = AudioInputRouting.inventory(this@MainActivity)
+                        }) { Text("Refresh microphone inputs") }
+                        if (selectedAudioInputId != null && audioInputOptions.none { it.id == selectedAudioInputId }) Text("Selected microphone unavailable")
+                        Text("Active microphone: ${current?.activeAudioInput ?: "Not verified"}", style = MaterialTheme.typography.bodySmall)
+                        if (microphoneOnly) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(backgroundAudio, { manualEdited(); backgroundAudio = it }, enabled = qualityConfigurable)
+                                Text("Continue microphone capture when locked", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Text("Choose before Prepare. Background capture requires notifications and provides Stop and save.", style = MaterialTheme.typography.bodySmall)
+                        }
                         Text("Capture quality · choose before Prepare", style = MaterialTheme.typography.labelMedium)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            CaptureProfile.entries.forEach { quality ->
+                            if (!microphoneOnly) CaptureProfile.entries.forEach { quality ->
                                 OutlinedButton(enabled = qualityConfigurable, onClick = {
-                                    if (capture.snapshot().canPrepare && captureProfile != quality) {
-                                        prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
+                                    if (!preparationPending && recordingLibrary.idle && capture.snapshot().canPrepare && captureProfile != quality) {
+                                        manualEdited(); prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
                                         captureProfile = quality
                                     }
                                 }) { Text(if (captureProfile == quality) "${quality.label} selected" else quality.label) }
                             }
                         }
+                        if (!microphoneOnly) {
+                            cameraControls(qualityConfigurable, current)
+                            Text("Capture orientation · choose before Prepare", style = MaterialTheme.typography.labelMedium)
+                            CaptureOrientationChoice.entries.forEach { choice ->
+                                OutlinedButton(enabled = qualityConfigurable, onClick = {
+                                    if (!preparationPending && !permissionReplies.outstanding && recordingLibrary.idle && capture.snapshot().canPrepare && orientationChoice != choice) {
+                                        manualEdited(); prepareRequest++; preparedV4v = null; v4v?.stopPublisher()
+                                        orientationChoice = choice
+                                    }
+                                }) { Text(choice.label + if (orientationChoice == choice) " selected" else "") }
+                            }
+                            Text(if (naturalPortrait()) "Top means the phone's top edge, viewed from its screen. Fixed choices keep encoded orientation until Stop."
+                                else "On a natural-landscape display, Portrait is a clockwise quarter-turn from natural. Fixed choices keep that reference until Stop.", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Row(verticalAlignment=Alignment.CenterVertically) {
+                            Checkbox(checked=initialStandby,enabled=qualityConfigurable,onCheckedChange={ value ->
+                                if(!preparationPending && !permissionReplies.outstanding && recordingLibrary.idle && capture.snapshot().canPrepare) {
+                                    manualEdited();prepareRequest++;initialStandby=value;updatePrivacyCover(snapshot)
+                                }
+                            })
+                            Text("Start in Standby")
+                        }
+                        Text((if(selectedIntent.hasVideo) "Standby sends a generated picture and silence." else "Standby sends generated silence.")+" Previously accepted media can remain in recordings or remote buffers.",style=MaterialTheme.typography.bodySmall)
                         OutlinedButton(
                             onClick = { prepareWithPermissions() },
-                            enabled = surfaceReady && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR),
+                            enabled = !preparationPending && !permissionReplyOutstanding && !libraryBusy && (microphoneOnly || surfaceReady) && current?.canPrepare != false && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR),
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Prepare") }
                         Button(
                             onClick = { startWithAuth() },
-                            enabled = current?.stage == CaptureStage.PREPARED,
+                            enabled = current?.stage == CaptureStage.PREPARED &&
+                                (preparedCapture?.backgroundAudio != true || current.backgroundAudioReady) && (!selectedIntent.hasVideo || !cameraState.busy),
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Start capture") }
+                        if(current?.stage==CaptureStage.CAPTURING || current?.stage==CaptureStage.STOPPING) {
+                            Text(current.privacyStatus,style=MaterialTheme.typography.bodySmall)
+                            Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(enabled=current.canRequestStandby,onClick={
+                                    val ticket=preparedCapture;val fresh=capture.snapshot()
+                                    if(ticket!=null && capture.standby(ticket,fresh.privacyEpoch)) {
+                                        privacyCover?.visibility=View.VISIBLE // same main call, before waiting for any owner queue
+                                        snapshot=capture.snapshot()
+                                    }
+                                }){Text("Standby")}
+                                OutlinedButton(enabled=current.canResumePrivacy,onClick={
+                                    val ticket=preparedCapture;val fresh=capture.snapshot()
+                                    if(ticket!=null && capture.resumePrivacy(ticket,fresh.privacyEpoch,fresh.privacyRevision))snapshot=capture.snapshot()
+                                }){Text("Resume live input")}
+                            }
+                        }
+                        if (current?.stage == CaptureStage.PREPARED && preparedCapture?.backgroundAudio == true && !current.backgroundAudioReady) {
+                            Text("Waiting for the microphone service", style = MaterialTheme.typography.bodySmall)
+                        }
                         Button(
                             onClick = {
                                 ui.removeCallbacks(settlePose)
                                 poseSelector.stopCapture()
                                 prepareRequest++
+                                cancelPreparation()
                                 v4v?.stopPublisher()
                                 capture.stop()
                                 schedulePoseSettlement()
                                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                             },
-                            enabled = current?.stage in listOf(CaptureStage.PREPARING, CaptureStage.PREPARED, CaptureStage.CAPTURING, CaptureStage.STOPPING),
+                            enabled = preparationPending || current?.stage in listOf(CaptureStage.PREPARING, CaptureStage.PREPARED, CaptureStage.CAPTURING, CaptureStage.STOPPING),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF833D38)),
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Stop") }
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(checked = recordLocally, onCheckedChange = { recordLocally = it },
-                                enabled = current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR))
+                            Checkbox(checked = recordLocally, onCheckedChange = { manualEdited(); recordLocally = it },
+                                enabled = !preparationPending && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR))
                             Text("Record private MP4 on this device", style = MaterialTheme.typography.bodySmall)
                         }
+                        if (preparationPending) Text("Checking capture preparation", style = MaterialTheme.typography.bodySmall)
+                        else if (permissionReplyOutstanding) Text("Finish the permission request before preparing again.", style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(enabled = !preparationPending && !libraryBusy && !manualBusy, onClick = { libraryVisible = true; loadRecordings() }, modifier = Modifier.fillMaxWidth()) { Text("Private recordings") }
                         Text("Microphone", style = MaterialTheme.typography.labelMedium)
                         LinearProgressIndicator(progress = { current?.audioLevel ?: 0f }, modifier = Modifier.fillMaxWidth())
                         Text("Video ${current?.videoSamples ?: 0} · Audio ${current?.audioSamples ?: 0} · Ingress rejects ${current?.drops ?: 0}", style = MaterialTheme.typography.bodySmall)
+                        fun elapsed(value: Long?): String = value?.let { val seconds = it / 1000; "${seconds / 3600}:${((seconds / 60) % 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}" } ?: "Not measured"
+                        Text("Capture elapsed ${elapsed(current?.captureElapsedMs)} · Broadcast elapsed ${elapsed(current?.broadcastElapsedMs)}", style = MaterialTheme.typography.bodySmall)
+                        val output = current?.socketOutput
+                        val rate = when {
+                            output == null || output.availability == SocketOutputAvailability.NOT_ATTACHED -> "Not attached"
+                            output.ended -> "Ended · rate unavailable"
+                            output.bitsPerSecond != null -> if (output.bitsPerSecond in 1..999) "<1 kbit/s" else "${output.bitsPerSecond / 1000} kbit/s"
+                            else -> "Unknown (${output.availability.name.lowercase().replace('_', ' ')})"
+                        }
+                        Text("Socket outbound $rate", style = MaterialTheme.typography.bodySmall)
+                        Text("Completed writes ${output?.completedBytes?.let { "$it B" } ?: "Unknown"}${if (output?.incomplete == true) " · incomplete accounting" else ""} · sample age ${output?.sampleAgeMs?.let { "${it}ms" } ?: "Unknown"}", style = MaterialTheme.typography.bodySmall)
+                        Text("Measured locally; delivery and playback are unconfirmed. Capture elapsed is not saved recording duration.", style = MaterialTheme.typography.bodySmall)
                         Text("Video timing/IDR ${current?.videoRejects ?: 0} · AAC priming ${current?.audioPrimingRejects ?: 0} · Wait IDR ${current?.waitingKeyframeRejects ?: 0} · Other ingress rejects ${current?.queueRejects ?: 0}", style = MaterialTheme.typography.bodySmall)
                         Text(current?.queueDiagnostics ?: "Queue diagnostics not sampled", style = MaterialTheme.typography.bodySmall)
                         Text(current?.cleanupDiagnostics ?: "", style = MaterialTheme.typography.bodySmall)
@@ -270,61 +522,400 @@ class MainActivity : ComponentActivity() {
                         Text("Encoded video capture age ${current?.videoCaptureAgeMs?.let { "${it}ms" } ?: "Not measured"}", style = MaterialTheme.typography.bodySmall)
                         Text(current?.publishingStatus ?: "No publisher attached", style = MaterialTheme.typography.bodySmall)
                         Text(current?.recordingStatus ?: "No recorder attached", style = MaterialTheme.typography.bodySmall)
-                        val configurable = current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)
+                        val configurable = !preparationPending && current?.stage in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)
                         V4vControls(configurable)
                         Text("Manual destination · bounded reconnect", style = MaterialTheme.typography.labelMedium)
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(checked = useSrt, onCheckedChange = { useSrt = it }, enabled = configurable)
+                            Checkbox(checked = useSrt, onCheckedChange = { manualEdited(); useSrt = it }, enabled = configurable && !useV4v)
                             Text("Use SRT over UDP", style = MaterialTheme.typography.bodySmall)
                         }
                         OutlinedTextField(
-                            value = destinationUrl, onValueChange = { destinationUrl = it.take(4096) },
+                            value = destinationUrl, onValueChange = { manualEdited(); destinationUrl = it.take(4096) },
                             label = { Text(if (useSrt) "SRT numeric address and port" else "RTMPS application URL") },
                             placeholder = { Text(if (useSrt) "srt://192.0.2.1:8890" else "rtmps://origin.invalid/live") },
-                            enabled = configurable, singleLine = true,
+                            enabled = configurable && !useV4v, singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
                         OutlinedTextField(
-                            value = destinationKey, onValueChange = { destinationKey = it.take(4096) },
+                            value = destinationKey, onValueChange = { manualEdited(); destinationKey = it.take(4096) },
                             label = { Text(if (useSrt) "SRT stream ID (optional)" else "Stream key") }, visualTransformation = PasswordVisualTransformation(),
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                            enabled = configurable, singleLine = true,
+                            enabled = configurable && !useV4v, singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
                         if (useSrt) {
                             OutlinedTextField(
-                                value = srtPassphrase, onValueChange = { srtPassphrase = it.take(79) },
+                                value = srtPassphrase, onValueChange = { manualEdited(); srtPassphrase = it.take(79) },
                                 label = { Text("AES-256 passphrase · 10 to 79 bytes") },
                                 visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                                enabled = configurable, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                                enabled = configurable && !useV4v, singleLine = true, modifier = Modifier.fillMaxWidth(),
                             )
                             Row {
-                                Checkbox(checked = srtPlaintextLab, onCheckedChange = { srtPlaintextLab = it }, enabled = configurable)
+                                Checkbox(checked = srtPlaintextLab, onCheckedChange = { manualEdited(); srtPlaintextLab = it }, enabled = configurable && !useV4v)
                                 Text("Plaintext SRT lab only · clear passphrase", style = MaterialTheme.typography.bodySmall)
                             }
                         } else {
                             Row {
-                                Checkbox(checked = allowPlaintextDevelopment, onCheckedChange = { allowPlaintextDevelopment = it }, enabled = configurable)
+                                Checkbox(checked = allowPlaintextDevelopment, onCheckedChange = { manualEdited(); allowPlaintextDevelopment = it }, enabled = configurable && !useV4v)
                                 Text("Allow plaintext RTMP for development", style = MaterialTheme.typography.bodySmall)
                             }
                         }
+                        ManualProfileControls(configurable && !useV4v)
                         Text("Leave blank for SDK validation only. No transport downgrade.", style = MaterialTheme.typography.bodySmall)
                         Text("Video: ${current?.videoEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
                         Text("Audio: ${current?.audioEncoder ?: "Not selected"}", style = MaterialTheme.typography.bodySmall)
-                        Text("Capture stops when this screen leaves the foreground.", style = MaterialTheme.typography.bodySmall)
+                        Text("Only an opted-in, started microphone show can continue when this screen closes.", style = MaterialTheme.typography.bodySmall)
         }
     }
 
 
+    // Actual process-owned admission, not the delayed Compose capture snapshot.
+    // V4V mode is deliberately not changed by an untrusted native delivery.
+    private fun manualLinkAllowed(foreground: Boolean): Boolean = !useV4v && !isDestroyed &&
+        (!foreground || manualForeground && poseTracking) && !preparationPending && !permissionReplies.outstanding &&
+        ::capture.isInitialized && capture.snapshot().canPrepare && ::recordingLibrary.isInitialized && recordingLibrary.idle &&
+        !libraryVisible && !manualActions.busy && manualActions.review == null && !manualIO.busy && !manualPicker.hasOutstanding
+
+    private fun invalidateManualLink() {
+        manualLinks.invalidate(runtimeClient); manualInvitation = null
+    }
+    private fun receiveManualLink(delivery: Intent?, newDelivery: Boolean = true) {
+        // Never retain an Intent/Uri or put the secret-bearing link in restoration.
+        // singleTask routes subsequent native deliveries to this same owner.
+        val text = try {
+            if (delivery?.action == Intent.ACTION_VIEW) delivery.dataString?.takeIf { it.length <= ManualDestinationEnvelope.MAX_URL_BYTES } else null
+        } finally { delivery?.data = null; intent?.data = null }
+        if (text == null) return
+        // A fresh singleTask delivery can precede onStart/onResume. It may
+        // wait only as an untrusted invitation; restored launch data is refused.
+        val selected = manualLinks.offer(runtimeClient, text, manualLinkAllowed(foreground = false), newDelivery)
+        if (selected == null) {
+            permissionMessage = "The manual destination link was refused. Stop capture and finish any private operation before opening a new link."
+            return
+        }
+        if (manualForeground) manualInvitation = manualLinks.foreground(runtimeClient, manualLinkAllowed(foreground = true))
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        receiveManualLink(intent)
+    }
+    private fun reviewManualLink(selected: ManualLinkInbox.Invitation) {
+        val text = manualLinks.consume(runtimeClient, selected, manualLinkAllowed(foreground = true)) ?: run {
+            if (manualInvitation === selected) manualInvitation = null
+            return
+        }
+        // Consume first, then invalidate old drafts and obtain fresh Apply authority.
+        manualEdited()
+        val ticket = manualTicket() ?: return
+        val deadline = Math.addExact(SystemClock.elapsedRealtimeNanos(), 5_000_000_000L)
+        manualSubmit(ticket, { _ ->
+            val bytes = ManualDestinationEnvelope.decode(text)
+            try { ManualDestinationProfile.parse(bytes) } finally { bytes.fill(0) }
+        }, deadline) { current, active, result ->
+            result.fold(onSuccess = { profile ->
+                if (current.manualActions.reviewed(active, profile, current.manualAllowed())) current.manualReview = current.manualActions.review
+            }, onFailure = {
+                current.manualActions.finish(active, false)
+                current.manualMessage = "The manual destination link could not be validated. Existing fields were preserved."
+            })
+        }
+    }
+    @Composable private fun ManualLinkInvitation() {
+        manualInvitation?.let { selected ->
+            AlertDialog(onDismissRequest = {
+                if (manualInvitation === selected) invalidateManualLink()
+            }, title = { Text("Manual destination received") }, text = {
+                Text("Review the destination before applying it. This does not save a profile or prepare or start capture.")
+            }, confirmButton = {
+                Button(onClick = { reviewManualLink(selected) }) { Text("Review") }
+            }, dismissButton = {
+                OutlinedButton(onClick = { if (manualInvitation === selected) invalidateManualLink() }) { Text("Discard") }
+            })
+        }
+    }
+
+    private fun manualAllowed(): Boolean = !useV4v && manualForeground && poseTracking && !isDestroyed && !preparationPending && !permissionReplies.outstanding &&
+        ::capture.isInitialized && ::recordingLibrary.isInitialized && recordingLibrary.idle && capture.snapshot().canPrepare
+
+    private fun manualEdited() {
+        manualScanTicket?.let(::cancelManualScanner)
+        invalidateManualLink()
+        manualPicker.invalidate(runtimeClient)
+        manualActions.invalidate(); manualReview = null; manualConsent = false; manualReviewSaved = null
+    }
+    private fun dismissManualReview(selected: ManualProfileActions.Review) {
+        if (manualActions.cancel(selected)) {
+            manualReview = null; manualConsent = false; manualReviewSaved = null
+        }
+    }
+    private fun manualTicket(): ManualProfileActions.Ticket? {
+        val ticket = manualActions.begin(manualAllowed()) ?: return null
+        invalidateManualLink()
+        manualReview = null; manualConsent = false; manualReviewSaved = null; manualMessage = null; manualBusy = true
+        return ticket
+    }
+    private fun <T> manualSubmit(ticket: ManualProfileActions.Ticket, action: (ManualDestinationProfiles) -> T,
+        deadlineNs: Long? = null, cancel: (() -> Unit)? = null,
+        reply: (MainActivity, ManualProfileActions.Ticket, Result<T>) -> Unit) {
+        val screen = WeakReference(this)
+        val actions = manualActions
+        if (!manualIO.submit({ store -> check(actions.current(ticket, true)); action(store) }, deadlineNs, cancel) { result ->
+            val current = screen.get() ?: return@submit
+            if (current.manualActions.current(ticket, current.manualAllowed())) reply(current, ticket, result)
+            else current.manualActions.finish(ticket, false)
+            current.manualBusy = current.manualActions.busy
+        }) {
+            manualActions.finish(ticket, false); manualBusy = false
+            manualMessage = "A destination file operation is still finishing. Wait before trying again."
+        }
+    }
+    private fun refreshManualProfiles() {
+        val ticket = manualTicket() ?: return
+        manualSubmit(ticket, { it.list() }) { current, active, result ->
+            if (current.manualActions.finish(active, current.manualAllowed())) result.fold(
+                onSuccess = { current.manualSaved = it }, onFailure = { current.manualMessage = "Saved destinations could not be read. Existing data was preserved." })
+        }
+    }
+    private fun saveManualProfile() {
+        if (!manualAllowed()) return
+        val profile = try { ManualDestinationProfile.fields(manualName, if (useSrt) "srt" else "rtmp", destinationUrl,
+            if (useSrt) "" else destinationKey, if (useSrt) destinationKey else "", if (useSrt) srtPassphrase else "",
+            if (useSrt) srtPlaintextLab else allowPlaintextDevelopment) }
+        catch (_: Exception) { manualMessage = "Check the profile name, destination and separate credentials before saving."; return }
+        val selected = manualSelected
+        val ticket = manualTicket() ?: return
+        manualSubmit(ticket, { store -> val id = store.save(selected, profile); id to store.list() }) { current, active, result ->
+            if (current.manualActions.finish(active, current.manualAllowed())) result.fold(onSuccess = {
+                current.manualSelected = it.first; current.manualSaved = it.second; current.manualMessage = "Destination saved on this device."
+            }, onFailure = { current.manualMessage = "The saved action could not be confirmed. Check saved profiles before retrying." })
+        }
+    }
+    private fun loadManualProfile(id: String) {
+        val ticket = manualTicket() ?: return
+        manualSubmit(ticket, { it.load(id) }) { current, active, result ->
+            result.fold(onSuccess = { profile ->
+                if (current.manualActions.reviewed(active, profile, current.manualAllowed())) {
+                    current.manualReview = current.manualActions.review; current.manualReviewSaved = id
+                }
+            }, onFailure = {
+                current.manualActions.finish(active, false); current.manualMessage = "The saved destination could not be loaded. Existing data was preserved."
+            })
+        }
+    }
+    private fun deleteManualProfile() {
+        val selected = manualSelected ?: return
+        val ticket = manualTicket() ?: return
+        manualSubmit(ticket, { store -> store.delete(selected); store.list() }) { current, active, result ->
+            if (current.manualActions.finish(active, current.manualAllowed())) result.fold(onSuccess = {
+                current.manualSelected = null; current.manualSaved = it; current.manualMessage = "Saved destination deleted."
+            }, onFailure = { current.manualMessage = "The delete action could not be confirmed. Check saved profiles before retrying." })
+        }
+    }
+    private fun beginManualScanner() {
+        if (!manualLinkAllowed(foreground = true) || manualInvitation != null) return
+        val action = manualTicket() ?: return
+        val screen = WeakReference(this)
+        val delivery = ui
+        val ticket = capture.reserveScanner(runtimeClient) { owned, event ->
+            delivery.post { screen.get()?.scannerEvent(owned, event) }
+        }
+        if (ticket == null) {
+            manualActions.finish(action, false); manualBusy = false
+            manualMessage = "Capture or another camera operation is still finishing. Wait before scanning."
+            return
+        }
+        manualScanTicket = ticket; manualScanAction = action; manualScanNativeClosed = false; manualScanGeometry = null
+        val transfer = QrPreviewTransfer(); manualScanTransfer = transfer
+        val dialog = android.app.Dialog(this)
+        val content = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(20, 20, 20, 20)
+            addView(TextView(this@MainActivity).apply { text = "Scan a Sapflow manual destination QR. Review and Apply remain separate." })
+            addView(android.view.TextureView(this@MainActivity).apply {
+                manualScanPreview = this
+                surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
+                    override fun onSurfaceTextureAvailable(texture: android.graphics.SurfaceTexture, width: Int, height: Int) { openManualScanner(ticket) }
+                    override fun onSurfaceTextureSizeChanged(texture: android.graphics.SurfaceTexture, width: Int, height: Int) { updateManualScannerPreview() }
+                    override fun onSurfaceTextureDestroyed(texture: android.graphics.SurfaceTexture): Boolean {
+                        if (manualScanTicket === ticket) {
+                            manualScanPreview = null
+                            if (!manualScanNativeClosed) capture.cancelScanner(ticket)
+                        }
+                        // A transferred native producer is released only by its actual owner.
+                        return transfer.owned !== texture
+                    }
+                    override fun onSurfaceTextureUpdated(texture: android.graphics.SurfaceTexture) = Unit
+                }
+            }, android.widget.LinearLayout.LayoutParams(720.coerceAtMost(resources.displayMetrics.widthPixels - 40), 600.coerceAtMost(resources.displayMetrics.heightPixels / 2)))
+            addView(android.widget.Button(this@MainActivity).apply { text = "Cancel scan"; setOnClickListener { cancelManualScanner(ticket) } })
+        }
+        dialog.setContentView(content)
+        dialog.setOnCancelListener { cancelManualScanner(ticket) }
+        dialog.setOnDismissListener {
+            if (!manualScanNativeClosed) capture.cancelScanner(ticket)
+            capture.scannerPresentationClosed(ticket)
+            if (manualScanDialog === dialog) { manualScanDialog = null; manualScanPreview = null }
+        }
+        manualScanDialog = dialog
+        try {
+            dialog.show()
+            if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) openManualScanner(ticket)
+            else if (capture.reserveScannerPermission(ticket)) {
+                try { scanPermission.launch(Manifest.permission.CAMERA) }
+                catch (_: Exception) { capture.receiveScannerPermission(); cancelManualScanner(ticket) }
+            } else cancelManualScanner(ticket)
+        } catch (_: Exception) {
+            capture.cancelScanner(ticket); capture.scannerPresentationClosed(ticket)
+            manualMessage = "The QR camera view could not open. Existing fields were preserved."
+        }
+    }
+    private fun openManualScanner(ticket: CaptureStartAdmission.ScannerTicket) {
+        if (manualScanTicket !== ticket || ticket.client !== runtimeClient || !manualForeground || !poseTracking || isDestroyed || !capture.ownsScanner(ticket) || manualScanTransfer?.owned != null) return
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
+        val view = manualScanPreview?.takeIf { it.isAvailable } ?: return
+        val texture = view.surfaceTexture ?: return
+        if (capture.openScanner(ticket, texture)) manualScanTransfer?.owned = texture
+    }
+    private fun updateManualScannerPreview() {
+        val view = manualScanPreview ?: return
+        val geometry = manualScanGeometry ?: return
+        if (view.width <= 0 || view.height <= 0) return
+        val rotation = (geometry.sensorOrientation - displayRotation() * 90 + 360) % 360
+        val rotatedWidth = if (rotation % 180 == 0) geometry.width else geometry.height
+        val rotatedHeight = if (rotation % 180 == 0) geometry.height else geometry.width
+        val scale = minOf(view.width.toFloat() / rotatedWidth, view.height.toFloat() / rotatedHeight)
+        val x = view.width / 2f; val y = view.height / 2f
+        view.setTransform(android.graphics.Matrix().apply {
+            setScale(geometry.width * scale / view.width, geometry.height * scale / view.height, x, y)
+            postRotate(rotation.toFloat(), x, y)
+        })
+    }
+    private fun cancelManualScanner(ticket: CaptureStartAdmission.ScannerTicket) {
+        if (manualScanTicket !== ticket) return
+        manualActions.invalidate()
+        capture.cancelScanner(ticket)
+        manualScanDialog?.dismiss()
+    }
+    private fun scannerEvent(ticket: CaptureStartAdmission.ScannerTicket, event: ManualQrScanner.Event) {
+        if (manualScanTicket !== ticket || ticket.client !== runtimeClient) return
+        when (event) {
+            is ManualQrScanner.Event.Geometry -> { manualScanGeometry = event; updateManualScannerPreview() }
+            ManualQrScanner.Event.CameraClosed -> {
+                manualScanNativeClosed = true
+                val dialog = manualScanDialog
+                if (dialog != null) dialog.dismiss() else capture.scannerPresentationClosed(ticket)
+            }
+            ManualQrScanner.Event.Retained -> {
+                manualMessage = "QR camera cleanup was not confirmed. Capture and further scanning remain blocked. Existing fields were preserved."
+                manualScanDialog?.dismiss()
+            }
+            is ManualQrScanner.Event.Finished -> {
+                val action = manualScanAction
+                manualScanTicket = null; manualScanAction = null; manualScanTransfer = null; manualScanGeometry = null
+                val allowed = manualAllowed() && !manualIO.busy && !manualPicker.hasOutstanding && !libraryVisible
+                val valid = action != null && manualActions.finish(action, allowed)
+                manualBusy = manualActions.busy
+                val text = event.reply.textForDelivery(SystemClock.elapsedRealtimeNanos())
+                if (valid && text != null) {
+                    val invitation = manualLinks.offer(runtimeClient, text, manualLinkAllowed(foreground = true))
+                    if (invitation != null) manualInvitation = manualLinks.foreground(runtimeClient, manualLinkAllowed(foreground = true))
+                } else if (manualForeground) manualMessage = "Scan ended. Existing destination fields were preserved."
+            }
+        }
+    }
+
+    private fun chooseManualDocument() {
+        val ticket = manualTicket() ?: return
+        if (!manualPicker.begin(runtimeClient, ticket)) {
+            manualActions.finish(ticket, false); manualBusy = false; manualMessage = "An earlier document picker is still pending. Close it before importing again."; return
+        }
+        try { importManualDocument.launch(arrayOf("application/json")) }
+        catch (_: Exception) { manualPicker.returned(runtimeClient, null); manualPicker.resume(runtimeClient, false); manualActions.finish(ticket, false); manualBusy = false; manualMessage = "The document picker could not open." }
+    }
+    private fun resumeManualDocument() {
+        val delivery = manualPicker.resume(runtimeClient, manualAllowed()) ?: return
+        val ticket = delivery.ticket ?: return
+        val uri = delivery.value
+        if (!delivery.valid || uri == null || uri.scheme != "content" || !manualActions.current(ticket, manualAllowed())) {
+            manualActions.finish(ticket, false); manualBusy = manualActions.busy; return
+        }
+        val io = manualIO
+        val deadline = Math.addExact(SystemClock.elapsedRealtimeNanos(), 5_000_000_000L)
+        val signal = CancellationSignal()
+        manualSubmit(ticket, { io.readDocument(uri, deadline, signal) }, deadline, { signal.cancel() }) { current, active, result ->
+            result.fold(onSuccess = { profile ->
+                if (current.manualActions.reviewed(active, profile, current.manualAllowed())) current.manualReview = current.manualActions.review
+            }, onFailure = {
+                current.manualActions.finish(active, false); current.manualMessage = "The selected document could not be validated. Wait for any pending file cleanup before trying again."
+            })
+        }
+    }
+    @Composable private fun ManualProfileControls(configurable: Boolean) {
+        OutlinedTextField(value = manualName, onValueChange = { manualEdited(); manualName = it.take(48) }, label = { Text("Profile name") },
+            enabled = configurable, singleLine = true, modifier = Modifier.fillMaxWidth())
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(enabled = configurable && !manualBusy, onClick = { saveManualProfile() }) { Text("Save") }
+            OutlinedButton(enabled = configurable && !manualBusy && manualSelected != null, onClick = { deleteManualProfile() }) { Text("Delete saved") }
+        }
+        OutlinedButton(enabled = configurable && !manualBusy, onClick = { refreshManualProfiles() }) { Text("Load saved destinations") }
+        manualSaved.forEach { saved -> OutlinedButton(enabled = configurable && !manualBusy, onClick = { loadManualProfile(saved.id) }) { Text("Load ${saved.name}") } }
+        OutlinedButton(enabled = configurable && !manualBusy, onClick = { chooseManualDocument() }) { Text("Import reviewed JSON file") }
+        OutlinedButton(enabled = configurable && !manualBusy && !capture.scannerPermissionOutstanding, onClick = { beginManualScanner() }) { Text("Scan manual destination QR") }
+        manualMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        if (manualBusy) Text("Destination file operation pending", style = MaterialTheme.typography.bodySmall)
+        manualReview?.let { selected ->
+            val review = selected.profile.review
+            AlertDialog(onDismissRequest = { dismissManualReview(selected) }, title = { Text("Review manual destination") }, text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${if (review.transport == "srt") "SRT" else "RTMP"} · ${review.security}")
+                    Text("${if (review.host.contains(':')) "[${review.host}]" else review.host}:${review.port}")
+                    Text("Apply changes fields only. Save and Prepare remain separate actions.")
+                    if (review.plaintext) Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(manualConsent, { if (manualActions.setConsent(selected, it)) manualConsent = it }); Text("I allow this unencrypted destination")
+                    }
+                }
+            }, confirmButton = {
+                Button(enabled = configurable && (!review.plaintext || manualConsent), onClick = {
+                    val saved = manualReviewSaved
+                    val applied = manualActions.apply(selected, manualAllowed()) { profile ->
+                        useSrt = profile.transport == "srt"; destinationUrl = profile.endpoint
+                        destinationKey = if (useSrt) profile.streamID else profile.streamKey
+                        srtPassphrase = if (useSrt) profile.passphrase else ""
+                        // A secure imported endpoint never grants future plaintext consent.
+                        srtPlaintextLab = useSrt && profile.review.plaintext
+                        allowPlaintextDevelopment = !useSrt && profile.review.plaintext
+                        manualName = if (saved == null) "" else profile.name
+                        manualSelected = saved
+                    }
+                    if (applied && manualReview === selected) { manualReview = null; manualConsent = false; manualReviewSaved = null }
+                }) { Text("Apply") }
+            }, dismissButton = { OutlinedButton(onClick = { dismissManualReview(selected) }) { Text("Cancel") } })
+        }
+    }
+
     private fun startWithAuth() {
-        fun start() { capture.start(); window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        val captureIntent = preparedCapture ?: return
+        fun start() {
+            audioOwner.revalidateAuthority()
+            if (audioOwner.awaitingPromotion(captureIntent)) {
+                permissionMessage = "Waiting for the microphone service. Start will be available when it is ready."
+                return
+            }
+            if (!audioOwner.canStart(captureIntent)) {
+                if (capture.stop(captureIntent, "Background audio service is not ready or permission changed. Prepare again.")) v4v?.stopPublisher()
+                permissionMessage = "Background service and notification permission are required before Start. Prepare again."
+                return
+            }
+            capture.start(captureIntent)
+            if (!captureIntent.backgroundAudio) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         if (!useV4v) start()
         else {
             val request = prepareRequest
             val binding = preparedV4v ?: return
-            v4v?.grant(captureProfile) { permit, error ->
-                if (request != prepareRequest || !useV4v || preparedV4v != binding) return@grant
-                if (error == null && permit != null && v4v?.canStart(binding, permit, captureProfile) == true && poseTracking && capture.snapshot().stage == CaptureStage.PREPARED) start()
+            v4v?.grant(captureIntent.intent) { permit, error ->
+                if (request != prepareRequest || !useV4v || preparedV4v != binding || preparedCapture != captureIntent) return@grant
+                if (error == null && permit != null && v4v?.canStart(binding, permit, captureIntent.intent) == true && poseTracking && capture.snapshot().stage == CaptureStage.PREPARED) start()
                 else permissionMessage = error?.message?.take(160) ?: "V4V start permission no longer matches this prepared capture"
             }
         }
@@ -339,14 +930,14 @@ class MainActivity : ComponentActivity() {
         val owner = v4v
         if (owner == null) { Text("V4V sign-in is unavailable in this build", style = MaterialTheme.typography.bodySmall); return }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(useV4v, { prepareRequest++; useV4v = it }, enabled = configurable)
+            Checkbox(useV4v, { dismissEndPrompt(); manualEdited(); prepareRequest++; useV4v = it }, enabled = configurable)
             Text("Use approved V4V connector", style = MaterialTheme.typography.bodySmall)
         }
         if (!useV4v) return
         Text(v4vState?.message ?: "Loading V4V journal", style = MaterialTheme.typography.bodySmall)
         v4vState?.maxPublishBps?.let { cap ->
-            Text("V4V cap $cap bits/s · ${captureProfile.label} needs ${captureProfile.minimumPublishBps} bits/s", style = MaterialTheme.typography.bodySmall)
-            if (cap < captureProfile.minimumPublishBps) Text("Select a supported quality before Prepare. The reserved session can still be ended.", style = MaterialTheme.typography.bodySmall)
+            Text("V4V cap $cap bits/s · ${selectedIntent.label} needs ${selectedIntent.minimumPublishBps} bits/s", style = MaterialTheme.typography.bodySmall)
+            if (cap < selectedIntent.minimumPublishBps) Text("Select a supported quality before Prepare. The reserved session can still be ended.", style = MaterialTheme.typography.bodySmall)
         }
         if (configurable) {
             val signers = remember(owner) { Nip55Login(this, owner.signerRelay).installed() }
@@ -366,7 +957,14 @@ class MainActivity : ComponentActivity() {
         OutlinedButton(enabled = configurable && v4vEvent.isNotBlank() && v4vState?.signedIn == true && v4vState?.pending != true,
             onClick = { val selected = v4vEvent; v4vCommand { prepare(selected) } }) { Text("Prepare V4V session") }
         OutlinedButton(enabled = v4vState?.pending == true, onClick = { v4vCommand { retry() } }) { Text("Retry saved operation") }
-        OutlinedButton(enabled = v4vState?.eventId != null, onClick = { prepareRequest++; capture.cancelPendingPrepare(); owner.stopPublisher(); owner.control.endDestination { error -> ui.post { if (error != null) permissionMessage = "V4V End intent not confirmed"; v4vState = owner.control.view } } }) { Text("End V4V destination") }
+        OutlinedButton(enabled = v4vState?.eventId != null || v4vState?.pending == true,
+            onClick = { requestEndPrompt(owner) }) { Text("End V4V destination") }
+        endPrompt?.takeIf { it.owner === owner }?.let { selected ->
+            AlertDialog(onDismissRequest = { dismissEndPrompt(selected) }, title = { Text("End this V4V destination?") },
+                text = { Text("Ends this V4V session and stops publishing. Local recording continues. The server may need time to finish its recording.") },
+                confirmButton = { Button(onClick = { confirmEndPrompt(selected) }) { Text("End destination") } },
+                dismissButton = { OutlinedButton(onClick = { dismissEndPrompt(selected) }) { Text("Cancel") } })
+        }
         OutlinedButton(enabled = v4vState?.eventId != null, onClick = { v4vCommand { status() } }) { Text("Check origin finalisation") }
         if (v4vState?.recoveryOffered == true) {
             Row { Checkbox(acknowledgeLoss, { acknowledgeLoss = it }); Text("Abandon failed automatic recording", style = MaterialTheme.typography.bodySmall) }
@@ -376,63 +974,241 @@ class MainActivity : ComponentActivity() {
         Text("Playback has not been verified", style = MaterialTheme.typography.bodySmall)
     }
 
-    private fun prepareWithPermissions() {
-        val needed = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
-        if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
-            permissionMessage = null
-            prepareCapture()
-        } else permissions.launch(needed)
+    private fun captureIdleForFiles(): Boolean = !preparationPending && ::capture.isInitialized && capture.snapshot().canPrepare
+
+    private fun loadRecordings() {
+        if (manualScanTicket != null) { libraryMessage = "Finish camera scanning and its cleanup before opening recordings."; return }
+        manualEdited()
+        if (preparationPending) { libraryMessage = "Wait for capture preparation to finish before refreshing."; return }
+        val screen = WeakReference(this)
+        libraryMessage = null
+        val ticket = recordingLibrary.scan { result ->
+            val current = screen.get() ?: return@scan
+            if (current.isDestroyed) return@scan
+            current.libraryScan = null; current.libraryBusy = !current.recordingLibrary.idle
+            result.fold(onSuccess = { current.libraryEntries = it }, onFailure = { current.libraryMessage = RecordingLibraryOwner.message(it) })
+        }
+        libraryScan = ticket; libraryBusy = !recordingLibrary.idle
+        if (ticket == null) libraryMessage = "A private file operation is still finishing. Wait before refreshing."
+    }
+    private fun chooseRecordingExport(entry: RecordingCatalogue.Entry, allowUnverified: Boolean) {
+        if (manualScanTicket != null) { libraryMessage = "Finish camera scanning and its cleanup before exporting."; return }
+        manualEdited()
+        if (!captureIdleForFiles()) { libraryMessage = "Stop and save capture before opening the document picker."; return }
+        val selected = recordingLibrary.select(entry, allowUnverified)
+        if (selected == null) { libraryMessage = "Another private file operation is still finishing."; return }
+        libraryBusy = true; libraryMessage = "Choose where to save a copy."
+        try { exportDocument.launch("Sapflow-${entry.segmentId.take(8)}.mp4") }
+        catch (_: Exception) { recordingLibrary.cancel(selected); libraryBusy = !recordingLibrary.idle; libraryMessage = "The document picker could not open. Your private original is unchanged." }
+    }
+    private fun finishDocumentExport(uri: Uri?) {
+        if (!::recordingLibrary.isInitialized) return
+        val selected = recordingLibrary.pendingSelection ?: return
+        if (uri == null || uri.scheme != "content" || !captureIdleForFiles()) {
+            recordingLibrary.cancel(selected); libraryBusy = !recordingLibrary.idle
+            libraryMessage = "Export cancelled. Your private original is unchanged."
+            return
+        }
+        val resolver = applicationContext.contentResolver
+        val screen = WeakReference(this)
+        libraryMessage = "Exporting a copy; the private original stays on this device."
+        val queued = recordingLibrary.export(selected, { resolver.openOutputStream(uri, "wt") }) { result ->
+            val current = screen.get() ?: return@export
+            if (current.isDestroyed) return@export
+            current.libraryBusy = !current.recordingLibrary.idle
+            current.libraryMessage = result.fold(onSuccess = { "Exported $it bytes. Your private original is unchanged." }, onFailure = {
+                RecordingLibraryOwner.message(it) + " The selected document may be incomplete."
+            })
+        }
+        libraryBusy = !recordingLibrary.idle
+        if (!queued) libraryMessage = "Export could not start. Your private original is unchanged."
+    }
+    private fun cancelLibraryOperation() {
+        if (recordingLibrary.pendingSelection != null) {
+            libraryMessage = "Cancel in the document picker to finish that selection."
+            return
+        }
+        libraryScan?.let(recordingLibrary::cancel); libraryScan = null
+        recordingLibrary.cancelCopy()
+        libraryMessage = "Cancellation requested. The private original is preserved; the selected document may be incomplete."
+        libraryBusy = !recordingLibrary.idle
     }
 
-    private fun prepareCapture(approvedGrant: V4vCapturePermit? = null) {
-        if (!capture.snapshot().canPrepare) return
-        if (useV4v && approvedGrant == null) {
-            val owner = v4v ?: return
-            val request = ++prepareRequest
-            val requestedProfile = captureProfile
-            owner.grant(requestedProfile) { grant, error ->
-                if (request != prepareRequest || !useV4v || captureProfile != requestedProfile) return@grant
-                if (error != null) permissionMessage = error.message?.take(160) ?: "V4V grant unavailable"
-                else if (poseTracking && capture.snapshot().canPrepare) prepareCapture(checkNotNull(grant))
+    @Composable
+    private fun cameraControls(idle: Boolean, current: CaptureSnapshot?) {
+        val source = cameraState
+        val displayedPreparation = preparedCapture
+        val live = current?.stage in listOf(CaptureStage.PREPARED, CaptureStage.CAPTURING) && !source.busy && current?.standbyRequested != true
+        Text("Camera source", style = MaterialTheme.typography.labelMedium)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            CameraSourceChoice.entries.forEach { choice ->
+                OutlinedButton(enabled = idle || live, onClick = {
+                    if (idle) {
+                        if (!preparationPending && !permissionReplies.outstanding && recordingLibrary.idle && capture.snapshot().canPrepare && cameraChoice != choice) {
+                            manualEdited(); prepareRequest++; cameraChoice = choice
+                        }
+                    } else displayedPreparation?.let { ticket -> if (capture.switchCamera(ticket, choice, source.sourceToken)) cameraChoice = choice }
+                }) { Text(choice.label + if ((source.active ?: cameraChoice) == choice) " selected" else "") }
+            }
+        }
+        if (current?.stage !in listOf(null, CaptureStage.IDLE, CaptureStage.ERROR)) Text(source.status, style = MaterialTheme.typography.bodySmall)
+        val caps = source.capabilities ?: return
+        var requested by remember(source.sourceToken) { mutableStateOf(source.requestedSettings ?: CameraControlSettings()) }
+        fun change(value: CameraControlSettings) {
+            val ticket = displayedPreparation ?: return
+            if (capture.adjustCamera(ticket, source.sourceToken, value)) requested = value
+        }
+        if (caps.maxZoom > caps.minZoom) {
+            Text("Zoom ${"%.1f".format(requested.zoom)}×", style = MaterialTheme.typography.bodySmall)
+            Slider(value = requested.zoom.coerceIn(caps.minZoom, caps.maxZoom), onValueChange = { change(requested.copy(zoom = it)) },
+                valueRange = caps.minZoom..caps.maxZoom, enabled = live)
+        }
+        if (caps.focusLock) Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(requested.focusLocked, { change(requested.copy(focusLocked = it)) }, enabled = live)
+            Text("Request focus lock")
+        } else Text(if (caps.focusContinuous) "Continuous focus" else "Fixed focus", style = MaterialTheme.typography.bodySmall)
+        if (caps.maxExposure > caps.minExposure) {
+            Text("Exposure compensation ${"%.1f".format(requested.exposure * caps.exposureStep)} EV", style = MaterialTheme.typography.bodySmall)
+            Slider(value = requested.exposure.toFloat(), onValueChange = { change(requested.copy(exposure = kotlin.math.round(it).toInt())) },
+                valueRange = caps.minExposure.toFloat()..caps.maxExposure.toFloat(), enabled = live)
+        }
+        if (caps.exposureLock) Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(requested.exposureLocked, { change(requested.copy(exposureLocked = it)) }, enabled = live); Text("Request exposure lock")
+        }
+        Text("White balance", style = MaterialTheme.typography.labelMedium)
+        val labels = listOf("", "Automatic", "Incandescent", "Fluorescent", "Warm fluorescent", "Daylight", "Cloudy", "Twilight", "Shade")
+        caps.whiteBalanceModes.forEach { mode ->
+            OutlinedButton(enabled = live, onClick = { change(requested.copy(whiteBalance = mode, whiteBalanceLocked = false)) }) {
+                Text(labels[mode] + if (requested.whiteBalance == mode) " selected" else "")
+            }
+        }
+        if (caps.whiteBalanceLock) Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(requested.whiteBalanceLocked, { change(requested.copy(whiteBalanceLocked = it)) }, enabled = live && requested.whiteBalance == 1); Text("Request automatic white balance lock")
+        }
+        Text(if (!source.controlsPending && source.requestedSettings == requested && source.confirmedRevision > 0 && source.confirmedRevision == source.requestedRevision) "Native camera request acknowledged" else "Waiting for native camera acknowledgement", style = MaterialTheme.typography.bodySmall)
+        OutlinedButton(enabled = live, onClick = { change(requested) }) { Text("Refresh camera status") }
+        Text("Native values are from the last requested camera observation.", style = MaterialTheme.typography.bodySmall)
+        source.nativeZoom?.let { Text("Native zoom ${"%.1f".format(it)}×", style = MaterialTheme.typography.bodySmall) }
+        source.nativeExposure?.let { Text("Native exposure compensation ${"%.1f".format(it * caps.exposureStep)} EV", style = MaterialTheme.typography.bodySmall) }
+        source.nativeWhiteBalance?.let { mode -> labels.getOrNull(mode)?.let { Text("Native white balance $it", style = MaterialTheme.typography.bodySmall) } }
+        Text(when (source.exposureState) { 1 -> "Exposure adjusting"; 2 -> "Exposure settled"; 3 -> "Exposure locked"; else -> "Exposure state unavailable" }, style = MaterialTheme.typography.bodySmall)
+        Text(when (source.whiteBalanceState) { 1 -> "White balance adjusting"; 2 -> "White balance settled"; 3 -> "White balance locked"; else -> "White balance state unavailable" }, style = MaterialTheme.typography.bodySmall)
+        Text(when (source.focusState) { 4 -> "Focus locked"; 5 -> "Focus lock did not converge"; 2 -> "Focus settled"; 1, 3 -> "Focusing"; 6 -> "Focus not settled"; 0 -> "Focus inactive"; else -> "Focus state unavailable" }, style = MaterialTheme.typography.bodySmall)
+    }
+
+    private fun currentPreparation(intent: PreparationIntent): Boolean = pendingPreparation === intent && intent.request == prepareRequest &&
+        poseTracking && !isDestroyed && capture.pendingPreparation(intent.ticket) && selectedIntent == intent.capture && selectedAudioInputId == intent.audioInputId && (backgroundAudio && !intent.capture.hasVideo) == intent.backgroundAudio && initialStandby==intent.initialStandby && recordLocally == intent.record && useV4v == intent.v4v &&
+        (!intent.capture.hasVideo || orientationChoice == intent.orientation?.choice && cameraChoice == intent.cameraChoice) &&
+        (intent.v4v || (useSrt == intent.srt && destinationUrl == intent.endpoint && destinationKey == intent.key && srtPassphrase == intent.passphrase &&
+            srtPlaintextLab == intent.srtPlaintext && allowPlaintextDevelopment == intent.rtmpPlaintext))
+
+    private fun cancelPreparation() {
+        pendingPreparation?.ticket?.let(capture::abandonPreparation)
+        pendingPreparation = null; preparationPending = false
+        recordingPreflight?.let(recordingLibrary::cancel); recordingPreflight = null
+    }
+    private fun preparationPermissions(intent: PreparationIntent): List<String> =
+        intent.capture.requiredPermissions + if (intent.backgroundAudio && android.os.Build.VERSION.SDK_INT >= 33) listOf(Manifest.permission.POST_NOTIFICATIONS) else emptyList()
+
+    private fun prepareWithPermissions() {
+        if (preparationPending || permissionReplies.outstanding || !recordingLibrary.idle || !poseTracking || !capture.snapshot().canPrepare || prepareRequest == Long.MAX_VALUE) return
+        manualEdited()
+        val frozen = orientationChoice.freeze(selectedIntent.hasVideo, naturalPortrait(), poseSelector.pose)
+        val ticket = capture.reservePreparation(selectedIntent, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo, frozen, cameraChoice, initialStandby) ?: return
+        val intent = PreparationIntent(ticket, ++prepareRequest, selectedIntent, recordLocally, useV4v, useSrt, destinationUrl, destinationKey, srtPassphrase, srtPlaintextLab, allowPlaintextDevelopment, selectedAudioInputId, backgroundAudio && !selectedIntent.hasVideo,
+            frozen, cameraChoice,initialStandby)
+        pendingPreparation = intent; preparationPending = true
+        val needed = preparationPermissions(intent).toTypedArray()
+        if (needed.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
+            permissionMessage = null
+            prepareCapture(intent)
+        } else {
+            check(permissionReplies.reserve(intent))
+            permissionReplyOutstanding = true
+            try { permissions.launch(needed) } catch (_: Exception) {
+                permissionReplies.receive(); permissionReplyOutstanding = false
+                cancelPreparation(); permissionMessage = "The permission request could not open. Try Prepare again."
+            }
+        }
+    }
+
+    private fun prepareCapture(intent: PreparationIntent, approvedGrant: V4vCapturePermit? = null, checkedRecording: RecordingLibraryOwner.Preparation? = null) {
+        if (!currentPreparation(intent)) { if (pendingPreparation === intent) cancelPreparation(); return }
+        if (intent.v4v && approvedGrant == null) {
+            val owner = v4v ?: run { cancelPreparation(); return }
+            owner.grant(intent.capture) { grant, error ->
+                if (!currentPreparation(intent)) { if (pendingPreparation === intent) cancelPreparation(); return@grant }
+                if (error != null || grant == null) {
+                    cancelPreparation()
+                    permissionMessage = error?.message?.take(160) ?: "V4V grant unavailable"
+                } else prepareCapture(intent, grant)
             }
             return
         }
+        if (intent.record && checkedRecording == null) {
+            val screen = WeakReference(this)
+            val request = recordingLibrary.prepare(intent.capture) { result ->
+                val current = screen.get() ?: return@prepare
+                if (!current.currentPreparation(intent)) { if (current.pendingPreparation === intent) current.cancelPreparation(); return@prepare }
+                current.recordingPreflight = null
+                result.fold(onSuccess = { current.prepareCapture(intent, approvedGrant, it) }, onFailure = {
+                    current.cancelPreparation(); current.permissionMessage = RecordingLibraryOwner.message(it)
+                })
+            }
+            recordingPreflight = request
+            if (request == null) { cancelPreparation(); permissionMessage = "A private file operation is still finishing. Try Prepare again when it completes." }
+            return
+        }
         try {
-            val surface = preview?.takeIf { it.isValid } ?: return
-            val key = destinationKey
-            val passphrase = srtPassphrase
-            val plaintext = srtPlaintextLab
-            val publisher: () -> EncodedSink? = if (useV4v) {
-                require(approvedGrant?.profile == captureProfile) { "Capture quality changed; Prepare again" }
+            require(preparationPermissions(intent).all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) { "Capture permissions changed. Prepare again." }
+            require(!intent.backgroundAudio || audioOwner.notificationsGranted()) { "Enable microphone-capture notifications before Prepare." }
+            val surface = if (intent.capture.hasVideo) preview?.takeIf { it.isValid } ?: run { cancelPreparation(); return } else null
+            if (intent.record) {
+                val ready = checkNotNull(checkedRecording)
+                require(ready.intent == intent.capture && ready.fresh(System.nanoTime())) { "Recording storage check expired. Prepare again." }
+            }
+            val key = intent.key
+            val passphrase = intent.passphrase
+            val plaintext = intent.srtPlaintext
+            val publisher: () -> EncodedSink? = if (intent.v4v) {
+                require(approvedGrant?.intent == intent.capture) { "Capture quality changed; Prepare again" }
                 val prepared = checkNotNull(v4v).captureFactory(checkNotNull(approvedGrant))
                 preparedV4v = prepared.binding
                 prepared.factory
-            } else if (destinationUrl.isBlank()) ({ null }) else if (useSrt) {
+            } else if (intent.endpoint.isBlank()) ({ null }) else if (intent.srt) {
                 SrtDestination.validateCredentials(key, passphrase, plaintext)
-                val destination = SrtDestination.parse(destinationUrl.trim())
-                val coordinator = ReconnectingPublishingSink { events -> SrtPublishingSink(destination, key, passphrase, plaintext, events) }
+                val destination = SrtDestination.parse(intent.endpoint.trim())
+                val coordinator = ReconnectingPublishingSink(authorityNowNs = AndroidAuthorityClock::nowNs) { events -> SrtPublishingSink(destination, key, passphrase, plaintext, events, intent = intent.capture) }
                 ({ coordinator.newEpoch() })
             } else {
                 require(key.isNotEmpty()) { "A stream key is required" }
-                val destination = RtmpDestination.parse(destinationUrl.trim(), allowPlaintextDevelopment)
-                val coordinator = ReconnectingPublishingSink { events -> RtmpPublishingSink(destination, key, events) }
+                val destination = RtmpDestination.parse(intent.endpoint.trim(), intent.rtmpPlaintext)
+                val coordinator = ReconnectingPublishingSink(authorityNowNs = AndroidAuthorityClock::nowNs) { events -> RtmpPublishingSink(destination, key, events, intent.capture) }
                 ({ coordinator.newEpoch() })
             }
-            val directory = filesDir.toPath().resolve("recordings")
-            val recorder: () -> EncodedSink? = if (recordLocally) ({ PrivateRecordingSink(directory) }) else ({ null })
+            val recorder: () -> EncodedSink? = if (intent.record) ({ checkNotNull(checkedRecording).recorder() }) else ({ null })
             updatePreview()
             // Explicit Prepare restores the stable physical pose even if no
             // further sensor callback followed qualification Stop/CLEAR.
-            capture.orientationChanged(poseSelector.prepareSession())
-            capture.prepare(surface, publisher, recorder, captureProfile)
+            if (intent.capture.hasVideo) capture.orientationChanged(poseSelector.prepareSession())
+            require(capture.prepare(intent.ticket, surface, publisher, recorder)) { "Capture preparation was not admitted" }
+            preparedCapture = intent.ticket
+            if (intent.backgroundAudio) {
+                val prepared = checkNotNull(preparedCapture) { "Capture preparation was not admitted" }
+                require(audioOwner.arm(prepared, intent.v4v, intent.record)) { "Background audio service could not be admitted. Prepare again." }
+            }
+            if (intent.v4v) preparedV4vCapture = preparedCapture
+            pendingPreparation = null; preparationPending = false
         } catch (error: Exception) {
+            cancelPreparation()
             permissionMessage = error.message?.take(240) ?: "Destination configuration failed"
         }
     }
 
-    override fun onConfigurationChanged(newConfig: Configuration) { super.onConfigurationChanged(newConfig); updatePreview() }
+    override fun onConfigurationChanged(newConfig: Configuration) { super.onConfigurationChanged(newConfig); updatePreview(); updateManualScannerPreview() }
     override fun onStart() {
         super.onStart()
+        audioOwner.enterForeground(runtimeClient)
         poseSelector = PoseInputPolicy(displayPose(), qualificationPoseControlEnabled)
         capture.orientationChanged(poseSelector.pose)
         poseTracking = true
@@ -441,18 +1217,45 @@ class MainActivity : ComponentActivity() {
         if (orientation.canDetectOrientation()) orientation.enable()
         ui.post(refresh)
     }
+    override fun onResume() {
+        super.onResume(); manualForeground = true
+        manualInvitation = manualLinks.foreground(runtimeClient, manualLinkAllowed(foreground = true))
+        resumeManualDocument()
+        manualScanTicket?.let(::openManualScanner)
+    }
+    override fun onPause() {
+        dismissEndPrompt()
+        manualLinks.pause(runtimeClient, manualInvitation != null || manualActions.review != null || manualActions.busy || manualPicker.hasOutstanding)
+        manualForeground = false
+        invalidateManualLink()
+        if (!manualPicker.expectedDeparture(runtimeClient) && !capture.scannerPermissionFor(runtimeClient)) manualEdited()
+        super.onPause()
+    }
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("sapflow.manual-picker.discard", manualPicker.outstandingFor(runtimeClient))
+        outState.putBoolean("sapflow.qr-permission.discard", capture.scannerPermissionFor(runtimeClient) || capture.scannerPermissionOutstanding)
+        super.onSaveInstanceState(outState)
+    }
     override fun onStop() {
+        dismissEndPrompt()
+        manualLinks.stopped(runtimeClient)
+        if (!manualPicker.expectedDeparture(runtimeClient)) manualEdited()
         poseTracking = false
         prepareRequest++
+        cancelPreparation()
         enableQualificationPoseControl(false)
         orientation.disable()
         ui.removeCallbacks(settlePose); poseSelector.cancelPending()
         getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayChanges)
         ui.removeCallbacks(refresh)
-        v4v?.stopPublisher()
-        capture.stop("Capture interrupted: the app left the foreground. Prepare again to resume.")
+        if (audioOwner.leaveForeground(runtimeClient) == CaptureForegroundClients.Departure.STOP) {
+            // An old Activity's delayed onStop must not retire any newer publisher.
+            preparedCapture?.let {
+                if (capture.stop(it, "Capture interrupted: the app left the foreground. Prepare again to resume.")) v4v?.stopPublisher()
+            }
+        }
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
-    override fun onDestroy() { v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); capture.close(); super.onDestroy() }
+    override fun onDestroy() { dismissEndPrompt(); privacyCover=null;manualEdited(); libraryScan?.let(recordingLibrary::cancel); cancelPreparation(); v4v?.signerRelay?.detach(launchSigner); enableQualificationPoseControl(false); super.onDestroy() }
 }

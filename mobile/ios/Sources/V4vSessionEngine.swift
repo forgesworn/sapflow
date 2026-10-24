@@ -23,6 +23,24 @@ struct V4vObservationStatusPermit: CustomStringConvertible, CustomDebugStringCon
     var debugDescription: String { description }
 }
 
+/// One short-lived exact-session read used only to end a remotely discovered
+/// session. It cannot provide a publishing grant or become a general adoption
+/// path; the response and terminal intent are committed together.
+struct V4vRemoteEndRead: CustomStringConvertible, CustomDebugStringConvertible {
+    let call: V4vHTTPCall
+    let identity: V4vIdentity
+    let expiresAtNs: UInt64
+    var description: String { "Ephemeral V4V remote End read (redacted)" }
+    var debugDescription: String { description }
+}
+
+struct V4vPublishingGrantPermit: CustomStringConvertible, CustomDebugStringConvertible {
+    let grant: V4vGrant
+    let expiresAtNs: UInt64
+    var description: String { "V4V publishing authority (redacted)" }
+    var debugDescription: String { description }
+}
+
 /// Runtime-free, single serial owner. It stages exact durable requests; the
 /// caller runs HTTP asynchronously and returns the captured operation. No timer,
 /// automatic capture start, signer, socket or camera is owned here.
@@ -43,6 +61,13 @@ final class V4vSessionEngine {
     private(set) var pending: V4vOperation?
     private(set) var session: V4vSessionReceipt?
     private var grant: V4vGrant?
+
+    /// Immutable composition check, safe before allocating another client.
+    /// A bearer owned by this engine must never be routed by a different
+    /// control or playback profile, even if that profile is otherwise valid.
+    func requireProfile(_ candidate: V4vConnectorProfile) throws {
+        guard candidate == profile else { throw V4vFailure.invalidProfile }
+    }
 
     init(profile: V4vConnectorProfile, store: V4vJournalStore, clock: V4vClock, fencePublisher: @escaping () -> Void) throws {
         guard clock.wallMs > 0, clock.wallMs <= V4vJSON.maxEpoch else { throw V4vFailure.bounds }
@@ -173,6 +198,54 @@ final class V4vSessionEngine {
         let bearer = try auth(clock)
         return pending.map { V4vControlRequest(operation: $0, bearer: bearer) }
     }
+    /// Cold creator reads only: these do not adopt a receipt or grant, clear an
+    /// uncertain operation, or change terminal End intent. Existing tick still
+    /// fences an expired grant. Collection metadata is not fresh origin proof.
+    func creatorEventsRequest(clock: V4vClock) throws -> V4vHTTPCall {
+        try tick(clock: clock)
+        return V4vHTTPCall(creatorEvents: (), bearer: try auth(clock))
+    }
+    func currentRequest(event: String, clock: V4vClock) throws -> V4vHTTPCall {
+        try tick(clock: clock)
+        return try V4vHTTPCall(current: event, bearer: auth(clock))
+    }
+    /// No caller-provided SID: status can target only the engine's existing
+    /// durable session, including pending or terminal operations needing review.
+    func sessionStatusRequest(clock: V4vClock) throws -> V4vHTTPCall {
+        try tick(clock: clock)
+        let bearer = try auth(clock)
+        guard let session else { throw V4vFailure.terminal }
+        return V4vHTTPCall(status: session.identity, bearer: bearer)
+    }
+    /// A collection response never reaches the journal. This issues a fresh
+    /// exact-SID GET only while there is no local scope to reconcile.
+    func remoteEndStatusRequest(identity: V4vIdentity, clock: V4vClock) throws -> V4vRemoteEndRead {
+        try tick(clock: clock)
+        let bearer = try auth(clock)
+        guard session == nil, pending == nil, !terminalIntent, grant == nil, expiredScope == nil,
+              clock.monotonicNs <= UInt64.max - 8_000_000_000 else { throw V4vFailure.conflict }
+        return V4vRemoteEndRead(call: V4vHTTPCall(status: identity, bearer: bearer), identity: identity,
+                               expiresAtNs: clock.monotonicNs + 8_000_000_000)
+    }
+    /// Commits only terminal ownership. The fresh receipt and terminal intent
+    /// share one durable write, so a crash can never expose it as capture scope.
+    func commitRemoteEnd(_ answer: V4vJSON, for read: V4vRemoteEndRead, clock: V4vClock) throws {
+        fencePublisher()
+        guard clock.monotonicNs <= read.expiresAtNs else { throw V4vFailure.unavailable }
+        _ = try auth(clock)
+        guard session == nil, pending == nil, !terminalIntent, grant == nil, expiredScope == nil else { throw V4vFailure.conflict }
+        let receipt = try V4vCreatorSessionStatus(answer, requested: read.identity).receipt
+        guard receipt.phase == "active", !receipt.terminal, !receipt.endComplete, receipt.expiresMs > lastMs else { throw V4vFailure.terminal }
+        var d = document
+        d["session"] = receipt.raw
+        d["terminalIntent"] = .bool(true)
+        d.removeValue(forKey: "grant")
+        d.removeValue(forKey: "expiredScope")
+        d.removeValue(forKey: "grantPolicy")
+        d.removeValue(forKey: "grantExpiryMs")
+        try save(d)
+        session = receipt; terminalIntent = true; grant = nil; expiredScope = nil; restoredRequiresRefresh = true
+    }
     /// Fresh exact-session GET for the observer's separate control client.
     /// Neither the journal nor a collection lookup is an observation receipt.
     func observationStatusRequest(clock: V4vClock) throws -> V4vObservationStatusPermit {
@@ -254,13 +327,21 @@ final class V4vSessionEngine {
             try save(d)
         }
     }
-    /// Cold admission query only. Capture must also retain a separate monotonic
-    /// expiry alarm outside the HTTP owner; a blocked request cannot extend it.
+    /// Cold authority query only. The immutable capture profile separately
+    /// admits this grant's bandwidth. Capture also retains a monotonic expiry
+    /// alarm outside the HTTP owner; a blocked request cannot extend it.
     func captureGrant(clock: V4vClock) throws -> V4vGrant {
         try tick(clock: clock); _ = try auth(clock)
         guard !restoredRequiresRefresh, !terminalIntent, pending == nil, expiredScope == nil, let grant, session?.identity == grant.identity,
-              session?.permitsGrant == true, grant.expiresMs > lastMs, grant.maxPublishBps >= 4_000_000 else { throw V4vFailure.terminal }
+              session?.permitsGrant == true, grant.expiresMs > lastMs else { throw V4vFailure.terminal }
         return grant
+    }
+    /// Use this effective, rollback-resistant deadline for the independent
+    /// publishing expiry alarm. Raw wall time must never extend a grant.
+    func publishingGrant(clock: V4vClock) throws -> V4vPublishingGrantPermit {
+        let grant = try captureGrant(clock: clock)
+        guard grant.expiresMs > lastMs, grant.expiresMs - lastMs <= (UInt64.max - clock.monotonicNs) / 1_000_000 else { throw V4vFailure.bounds }
+        return V4vPublishingGrantPermit(grant: grant, expiresAtNs: clock.monotonicNs + (grant.expiresMs - lastMs) * 1_000_000)
     }
     func close() { if !closed { closed = true; fencePublisher() } }
     private static func identityJSON(_ id: V4vIdentity) -> V4vJSON {

@@ -7,6 +7,17 @@ enum OriginObservationFailure: String, Error, CustomStringConvertible {
     var description: String { "Origin observation unconfirmed (\(rawValue))" }
 }
 
+/// Local immutable decode expectation, never inferred from status or the first
+/// arriving codec. Generic v1 grants remain transport authority only.
+enum OriginExpectedMedia: Equatable {
+    case audioVideo, audioOnly48kMono
+    var hasVideo: Bool { self == .audioVideo }
+    var hasAudio: Bool { true }
+    func matches(hasVideo: Bool, hasAudio: Bool) -> Bool {
+        self.hasVideo == hasVideo && self.hasAudio == hasAudio
+    }
+}
+
 /// Immutable local ownership, captured before constructing a transport. None
 /// of these fields may be reconstructed from a journal or a server reply.
 struct OriginAttemptIdentity: Equatable {
@@ -24,9 +35,11 @@ struct V4vObservedAttempt: Equatable, CustomStringConvertible, CustomDebugString
     let identity: V4vIdentity
     let policyDigest: String
     let nonce: String
-    init(local: OriginAttemptIdentity, grant: V4vGrant, nonce: String) throws {
+    let expectedMedia: OriginExpectedMedia
+    init(local: OriginAttemptIdentity, grant: V4vGrant, nonce: String, expectedMedia: OriginExpectedMedia = .audioVideo) throws {
         _ = try V4vIdentity.id(nonce)
         self.local = local; identity = grant.identity; policyDigest = grant.policyDigest; self.nonce = nonce
+        self.expectedMedia = expectedMedia
     }
     static func randomNonce() throws -> String {
         var bytes = [UInt8](repeating: 0, count: 16)
@@ -61,8 +74,10 @@ struct OriginCurrentAuthority {
 struct OriginMediaSelection: Equatable, CustomStringConvertible {
     let epoch: UInt64, initialization: UInt64, part: UInt64
     let initPath: String, partPath: String
-    private init(epoch: UInt64, initialization: UInt64, part: UInt64, initPath: String, partPath: String) {
+    let hasVideo: Bool, hasAudio: Bool
+    private init(epoch: UInt64, initialization: UInt64, part: UInt64, initPath: String, partPath: String, hasVideo: Bool, hasAudio: Bool) {
         self.epoch = epoch; self.initialization = initialization; self.part = part; self.initPath = initPath; self.partPath = partPath
+        self.hasVideo = hasVideo; self.hasAudio = hasAudio
     }
     static func match(_ receipt: V4vSessionReceipt, attempt: V4vObservedAttempt, nowMs: UInt64) throws -> Self {
         guard receipt.identity.sameSession(attempt.identity), receipt.identity.revision >= attempt.identity.revision,
@@ -70,11 +85,14 @@ struct OriginMediaSelection: Equatable, CustomStringConvertible {
         guard let origin = receipt.origin else { throw OriginObservationFailure.unavailable }
         guard origin.identity == receipt.identity, origin.admission == "open", origin.expiresMs == receipt.expiresMs else { throw OriginObservationFailure.scope }
         guard origin.state == "live", origin.proto == "active", origin.attempt == attempt.nonce, let media = origin.freshMedia,
-              media.connectionEpoch == origin.epoch, media.hasAudio else { throw OriginObservationFailure.unavailable }
-        return Self(epoch: origin.epoch, initialization: media.initializationId, part: media.partId, initPath: media.initPath, partPath: media.partPath)
+              media.connectionEpoch == origin.epoch,
+              attempt.expectedMedia.matches(hasVideo: media.hasVideo, hasAudio: media.hasAudio) else { throw OriginObservationFailure.unavailable }
+        return Self(epoch: origin.epoch, initialization: media.initializationId, part: media.partId, initPath: media.initPath, partPath: media.partPath,
+                    hasVideo: media.hasVideo, hasAudio: media.hasAudio)
     }
     func stillCurrent(_ newer: Self) -> Bool {
-        epoch == newer.epoch && initialization == newer.initialization && initPath == newer.initPath && newer.part >= part
+        epoch == newer.epoch && initialization == newer.initialization && initPath == newer.initPath && newer.part >= part &&
+            hasVideo == newer.hasVideo && hasAudio == newer.hasAudio
     }
     var description: String { "Correlated origin resources (not decoded)" }
 }
@@ -97,7 +115,7 @@ struct OriginApprovedResources: Equatable, CustomStringConvertible, CustomDebugS
         guard url == initialization || url == part, timeout > 0, timeout <= 8 else { throw OriginObservationFailure.scope }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         request.httpMethod = "GET"; request.httpShouldHandleCookies = false
-        request.setValue("video/mp4, application/mp4", forHTTPHeaderField: "Accept")
+        request.setValue("video/mp4, audio/mp4, application/mp4", forHTTPHeaderField: "Accept")
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         return request // No bearer, cookies, arbitrary headers or query parameters.
     }
@@ -114,11 +132,32 @@ struct OriginMediaBody {
         guard limit > 0, limit <= Self.totalLimit else { throw OriginObservationFailure.bounds }; self.limit = limit
     }
     static func response(status: Int, length: Int64, mime: String?, limit: Int) throws {
-        guard status == 200, ["video/mp4", "application/mp4"].contains(mime?.lowercased() ?? "") else { throw OriginObservationFailure.network }
+        guard status == 200, ["video/mp4", "audio/mp4", "application/mp4"].contains(mime?.lowercased() ?? "") else { throw OriginObservationFailure.network }
         guard length >= -1, length <= limit else { throw OriginObservationFailure.bounds }
     }
     mutating func append(_ data: Data) throws {
         guard data.count <= limit - bytes.count else { throw OriginObservationFailure.bounds }; bytes.append(data)
+    }
+}
+
+/// One cold listener, fired only by actual owner cleanup. Registering after
+/// completion is safe; neither registration nor delivery waits or polls.
+final class OriginCleanupNotification: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false, registered = false
+    private var listener: (() -> Void)?
+    func observe(_ listener: @escaping () -> Void) {
+        lock.lock()
+        guard !registered else { lock.unlock(); return }
+        registered = true
+        if completed { lock.unlock(); listener() }
+        else { self.listener = listener; lock.unlock() }
+    }
+    func complete() {
+        lock.lock()
+        guard !completed else { lock.unlock(); return }
+        completed = true; let saved = listener; listener = nil; lock.unlock()
+        saved?()
     }
 }
 
@@ -129,18 +168,56 @@ final class OriginConfirmationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var authority: OriginCurrentAuthority?
     private var closed = false
-    func replace(_ next: OriginCurrentAuthority) throws {
+    private var active = false
+    private var destination: UInt64?
+    private var sdkGeneration: UInt64?
+    private var newestToken: UInt64 = 0, newestSDKAttempt: UInt64 = 0, newestCodecEpoch: UInt64 = 0, closedCodecEpoch: UInt64 = 0
+    /// Stage before constructing a transport. Reusing a failed token or SDK
+    /// attempt cannot reopen it, including after a delayed queued callback.
+    func stage(_ next: OriginCurrentAuthority, clock: () -> UInt64) throws {
         lock.lock(); defer { lock.unlock() }
-        guard !closed else { throw OriginObservationFailure.cancelled }; authority = next
+        let local = next.attempt.local
+        guard !closed, local.codecEpoch > closedCodecEpoch, local.codecEpoch >= newestCodecEpoch,
+              local.token > newestToken, local.sdkAttempt > newestSDKAttempt,
+              destination == nil || destination == local.destination,
+              sdkGeneration == nil || sdkGeneration == local.sdkGeneration,
+              next.permits(next.attempt, nowNs: clock()) else { throw OriginObservationFailure.scope }
+        destination = local.destination; sdkGeneration = local.sdkGeneration
+        newestToken = local.token; newestSDKAttempt = local.sdkAttempt; newestCodecEpoch = local.codecEpoch
+        authority = next; active = false
     }
-    func invalidate() { lock.lock(); authority = nil; lock.unlock() }
+    /// Accepted plus complete startup Sending is a one-shot admission to
+    /// observation. It cannot reconstruct authority cleared by a cold fence.
+    func activate(_ attempt: V4vObservedAttempt, clock: () -> UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, !active, authority?.permits(attempt, nowNs: clock()) == true else { return false }
+        active = true; return true
+    }
+    func refresh(_ next: OriginCurrentAuthority, clock: () -> UInt64) throws {
+        lock.lock(); defer { lock.unlock() }
+        let now = clock()
+        guard !closed, let current = authority, current.permits(next.attempt, nowNs: now),
+              next.permits(current.attempt, nowNs: now), next.grant.identity.revision >= current.grant.identity.revision,
+              next.expiresAtNs >= current.expiresAtNs else { throw OriginObservationFailure.scope }
+        authority = next // Preserve staged/active state; refresh never activates.
+    }
+    func invalidate() { lock.lock(); authority = nil; active = false; lock.unlock() }
     func invalidate(attempt: V4vObservedAttempt) {
         lock.lock(); defer { lock.unlock() }
-        if authority?.attempt == attempt { authority = nil }
+        if authority?.attempt == attempt { authority = nil; active = false }
     }
-    func close() { lock.lock(); closed = true; authority = nil; lock.unlock() }
+    func invalidate(local: OriginAttemptIdentity) {
+        lock.lock(); defer { lock.unlock() }
+        if authority?.attempt.local == local { authority = nil; active = false }
+    }
+    func closeEpoch(_ epoch: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        closedCodecEpoch = max(closedCodecEpoch, epoch)
+        if let current = authority, current.attempt.local.codecEpoch <= closedCodecEpoch { authority = nil; active = false }
+    }
+    func close() { lock.lock(); closed = true; authority = nil; active = false; lock.unlock() }
     func permits(_ attempt: V4vObservedAttempt, nowNs: UInt64) -> Bool {
-        lock.lock(); defer { lock.unlock() }; return !closed && authority?.permits(attempt, nowNs: nowNs) == true
+        lock.lock(); defer { lock.unlock() }; return !closed && active && authority?.permits(attempt, nowNs: nowNs) == true
     }
     func confirm(_ attempt: V4vObservedAttempt, beforeNs: UInt64, clock: () -> UInt64,
                  apply: (OriginAttemptIdentity, UInt64) throws -> Void) throws {
@@ -148,7 +225,7 @@ final class OriginConfirmationGate: @unchecked Sendable {
         // The lock may have waited across expiry. Sample after acquisition,
         // including the original observation and bearer-permit deadline.
         let nowNs = clock()
-        guard !closed, nowNs < beforeNs, authority?.permits(attempt, nowNs: nowNs) == true else { throw OriginObservationFailure.scope }
+        guard !closed, active, nowNs < beforeNs, authority?.permits(attempt, nowNs: nowNs) == true else { throw OriginObservationFailure.scope }
         // The caller invokes only mediaConfirmedForAttempt with these captured
         // SDK fields. It must not fetch a newer SDK snapshot to replace them.
         try apply(attempt.local, nowNs)

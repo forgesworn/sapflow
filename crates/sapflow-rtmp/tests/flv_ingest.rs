@@ -16,6 +16,10 @@ fn recorded_ffmpeg_publish_makes_segments() {
         match ev {
             Event::Publish { .. } => conn.accept_publish(),
             Event::Metadata { audio } => ing.expect_audio(audio),
+            Event::Tracks { tracks } => {
+                ing.declare_tracks(tracks, SystemTime::UNIX_EPOCH)
+                    .expect("declared tracks");
+            }
             Event::Video { timestamp, data } => {
                 assert!(timestamp >= last_video, "video timestamps rise");
                 last_video = timestamp;
@@ -29,6 +33,7 @@ fn recorded_ffmpeg_publish_makes_segments() {
     assert!(last_video > 2800, "last video at {last_video} ms");
     let m = ing.muxer().expect("muxer");
     assert!(m.has_content());
-    assert_eq!((m.video().width, m.video().height), (160, 90));
+    let video = m.video().expect("AV regression has video");
+    assert_eq!((video.width, video.height), (160, 90));
     assert_eq!(m.audio().map(|a| a.sample_rate), Some(48000));
 }

@@ -391,6 +391,10 @@ narrower connected/sending status honestly.
 
 ### B4R General-release creator essentials
 
+The [explicit AAC-only origin contract](audio-only-origin.md) defines the
+server/SDK prerequisite. Native mode selection, background operation and physical
+acceptance retain the requirements below.
+
 Qualify these additions before the general release; the first SRT engineering
 pilot remains a smaller vertical slice:
 
@@ -414,6 +418,37 @@ pilot remains a smaller vertical slice:
 
 Test advertised 1080p30 profiles against the same sustained quality and resource
 requirements. Engineering capacity results alone do not add a supported preset.
+
+The [version 1 manual profile contract](manual-destination-profiles.md) covers
+saved destinations and reviewed JSON file import. The
+[manual link contract](manual-destination-links.md) adds implemented native
+invitations using the same explicit Review and Apply flow. Android QR camera
+scanning is implemented with the same reviewed envelope and shared capture
+admission; iOS scanning remains under development. Installed camera and link
+routing, physical document-provider behaviour and the remaining B4R controls
+retain their own acceptance gates.
+
+The [native orientation contract](capture-orientation.md) separates the default
+Automatic behaviour from a fixed mounting choice frozen before Prepare, and
+defines the physical preview, decoder and recording qualification still needed.
+
+The [native camera contract](native-camera-controls.md) defines source ownership,
+live Front/Rear switching within one encoder/show, unmirrored transmitted pixels,
+capability-bound controls and the source and physical gates for that B4R packet.
+
+The [privacy standby contract](privacy-standby.md) defines the implemented packet:
+immediate raw-input fencing, independently paced replacement media, explicit
+Resume and matching recording. Both native adapters are source-reviewed. iOS
+AAC generation changes, recording presentation and publishing admission pass
+generated native checks, with separate physical and background execution gates
+still open. The current [delivery status](mobile-delivery-status.md) identifies
+the exact source, package, app-build and acceptance evidence; implementation
+does not complete B4R or B5.
+
+The [iOS audio-only background contract](ios-background-audio.md) defines the
+opted-in show's retained native microphone, discard-before-read Standby path,
+independent synthetic cadence, active-microphone disclosure and joined cleanup.
+It preserves the separate physical locked-screen and sustained power gates.
 
 ### B5 First release qualification
 
@@ -445,6 +480,11 @@ Loss profiles must also pass their frozen quality and recovery criteria.
 Keep degraded-network allowances separate from the no-loss stall requirement.
 Record charging, screen brightness, radios, OS, firmware, ambient temperature,
 bitrate, codec profile and actual media duration for power comparisons.
+
+The [recording recovery plan](recording-recovery.md) records actual process-kill
+failures, the existing SDK muxer's readable fragments and its unresolved AAC
+presentation prerequisite. Neither a nominal fragment interval nor a readable
+coded prefix substitutes for the source-presentation and durability checks above.
 
 Run the origin on Linux behind its intended TLS proxy. Measure 250 and 750
 full media consumers on a separate load machine with enough link capacity.

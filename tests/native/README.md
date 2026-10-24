@@ -5,6 +5,26 @@ and Kotlin bindings against the actual host library and runs both consumers.
 The build reuses the checkout target; it removes its own staging directory and
 does not replace Apple/Android packages in check mode.
 
+For a fresh Apple or Android package location, add
+`--output-root=/absolute/checkout/target/native-packages-run1` to the corresponding
+build command. The destination must be a new canonical direct child of `target/`
+with a `native-packages-` prefix and a safe suffix. It is reserved before building;
+existing package outputs are preserved. Cargo continues to reuse the checkout's
+`target/`. Run `node --test scripts/native-build-options.test.mjs` to check option,
+path and output-preservation behaviour.
+
+Both consumers also exercise selective fanout admission closure.
+`closePublishingAdmission` and `closeRecordingAdmission` stop new admission to
+one branch without cancelling the other or clearing already accepted samples.
+The existing drain and residence rules still apply. Closure is irreversible for
+that queue, including after `clear`; a new show needs a new queue. Successful
+native return is a local fence receipt, not transport completion or remote
+erasure. A `Busy` error is not a successful receipt.
+
+Rust callers matching `EnqueueOutcome` exhaustively must handle the new
+`AdmissionClosed` variant. This pre-1.0 addition leaves the native
+`FanoutOutcome` record and existing queue limits unchanged.
+
 The Kotlin generation step applies
 [`native-kotlin-status-leases.mjs`](../../scripts/native-kotlin-status-leases.mjs)
 to the exact pinned UniFFI 0.32.2 Rust-call helper. The implementation is in

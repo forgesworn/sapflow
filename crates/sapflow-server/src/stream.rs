@@ -11,7 +11,7 @@ use sapflow_hls::{
     FlvIngest, IngestError, Muxer, MuxerConfig, PartLookup, TsIngest, Update, playlist,
 };
 
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, RecorderFactory};
 use tokio::sync::watch;
 
 pub struct LiveStream {
@@ -22,18 +22,36 @@ pub struct LiveStream {
     version: watch::Sender<u64>,
 }
 
-/// The track configs, for a recorder's own init segment.
-pub type Tracks = (
-    sapflow_hls::codec::H264Config,
-    Option<sapflow_hls::codec::AacConfig>,
-);
+/// Frozen nonempty track configs for one recorder initialization epoch.
+#[derive(Clone)]
+pub struct Tracks {
+    video: Option<sapflow_hls::codec::H264Config>,
+    audio: Option<sapflow_hls::codec::AacConfig>,
+}
+
+impl Tracks {
+    pub fn new(
+        video: Option<sapflow_hls::codec::H264Config>,
+        audio: Option<sapflow_hls::codec::AacConfig>,
+    ) -> Option<Self> {
+        (video.is_some() || audio.is_some()).then_some(Self { video, audio })
+    }
+
+    pub fn video(&self) -> Option<&sapflow_hls::codec::H264Config> {
+        self.video.as_ref()
+    }
+
+    pub fn audio(&self) -> Option<&sapflow_hls::codec::AacConfig> {
+        self.audio.as_ref()
+    }
+}
 
 /// Where the media comes from.
 pub enum Source {
     /// SRT carries MPEG-TS.
-    Ts(TsIngest),
+    Ts(Box<TsIngest>),
     /// RTMP carries FLV tags.
-    Flv(FlvIngest),
+    Flv(Box<FlvIngest>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45,8 +63,8 @@ pub enum SourceKind {
 impl Source {
     fn new(kind: SourceKind, cfg: MuxerConfig) -> Self {
         match kind {
-            SourceKind::Ts => Self::Ts(TsIngest::new(cfg)),
-            SourceKind::Flv => Self::Flv(FlvIngest::new(cfg)),
+            SourceKind::Ts => Self::Ts(Box::new(TsIngest::new(cfg))),
+            SourceKind::Flv => Self::Flv(Box::new(FlvIngest::new(cfg))),
         }
     }
 
@@ -54,8 +72,8 @@ impl Source {
     fn resume(kind: SourceKind, cfg: MuxerConfig, muxer: Option<Muxer>) -> Self {
         match (kind, muxer) {
             (_, None) => Self::new(kind, cfg),
-            (SourceKind::Ts, Some(m)) => Self::Ts(TsIngest::resume(cfg, m)),
-            (SourceKind::Flv, Some(m)) => Self::Flv(FlvIngest::resume(cfg, m)),
+            (SourceKind::Ts, Some(m)) => Self::Ts(Box::new(TsIngest::resume(cfg, m))),
+            (SourceKind::Flv, Some(m)) => Self::Flv(Box::new(FlvIngest::resume(cfg, m))),
         }
     }
 
@@ -73,17 +91,21 @@ impl Source {
         }
     }
 
-    fn muxer_mut(&mut self) -> Option<&mut Muxer> {
-        match self {
-            Self::Ts(t) => t.muxer_mut(),
-            Self::Flv(f) => f.muxer_mut(),
-        }
-    }
-
     fn take_muxer(&mut self) -> Option<Muxer> {
         match self {
             Self::Ts(t) => t.take_muxer(),
             Self::Flv(f) => f.take_muxer(),
+        }
+    }
+
+    /// Drain only input already accepted by this connection. This is not a
+    /// media admission path and must also run after a scoped gate is revoked.
+    fn finish(&mut self, now: SystemTime) -> Result<Update, IngestError> {
+        match self {
+            Self::Ts(ts) => ts.finish(now),
+            Self::Flv(flv) => Ok(flv
+                .muxer_mut()
+                .map_or_else(Update::default, |m| m.interrupt(now))),
         }
     }
 }
@@ -110,10 +132,15 @@ pub struct Session {
     fresh_part_floor: u64,
     /// Kept across a reconnect: one recording per show.
     pub recorder: Option<Recorder>,
+    pub recorder_factory: Option<RecorderFactory>,
     outage_deadline: Option<Instant>,
 }
 
 impl Session {
+    pub fn owns_connection(&self, generation: u64) -> bool {
+        self.generation == generation && self.attached
+    }
+
     /// Ignore delayed notices from an older connection after replacement.
     pub fn mark_recording_incomplete(&self, generation: u64) {
         if self.generation == generation
@@ -129,11 +156,6 @@ impl Session {
         }
         let deadline = *self.outage_deadline.get_or_insert(now + grace);
         deadline.saturating_duration_since(now)
-    }
-
-    /// Whether the connection of `generation` is the attached publisher.
-    pub fn owned_by(&self, generation: u64) -> bool {
-        self.generation == generation && self.attached
     }
 
     pub fn recovered(&mut self) {
@@ -166,6 +188,9 @@ pub struct Applied {
     /// A new codec initialization epoch: the HLS timeline continues, and a
     /// new recording begins at the epoch's first part.
     pub restarted: bool,
+    /// Accepted media crossed a definite input loss or repetition. This must
+    /// taint the matching recording before any newly sealed parts are fed.
+    pub media_loss: bool,
 }
 
 fn fresh_prefix() -> String {
@@ -193,6 +218,7 @@ impl LiveStream {
                 attached: true,
                 fresh_part_floor: 0,
                 recorder: None,
+                recorder_factory: None,
                 outage_deadline: None,
             }),
             version: watch::Sender::new(0),
@@ -263,7 +289,7 @@ impl LiveStream {
                         playlist::epoch_init_name(&state.prefix, init_id)
                     ),
                     part_path: format!("/{root}/{}", playlist::part_name(&state.prefix, id)),
-                    has_video: true,
+                    has_video: muxer.video().is_some(),
                     has_audio: muxer.audio().is_some(),
                 });
             }
@@ -308,6 +334,7 @@ impl LiveStream {
         Ok(Applied {
             ready,
             restarted: update.restarted,
+            media_loss: update.media_loss,
         })
     }
 
@@ -326,18 +353,44 @@ impl LiveStream {
         ready
     }
 
-    /// The publisher left: end the current run so a reconnect starts a new
-    /// segment after a discontinuity, and publish what was closed.
-    fn interrupt(&self) {
-        let mut st = self.lock();
-        let changed = st
-            .ingest
-            .muxer_mut()
-            .is_some_and(|m| m.interrupt(SystemTime::now()).any());
-        if changed {
-            Self::render(&mut st);
+    /// Finalise only this session's accepted parser input, while its caller
+    /// holds the session (and registry) lock. No successor can change source or
+    /// recording policy before loss attribution, codec rollover and tail feed.
+    fn finish_connection(&self, session: &mut Session) {
+        let result = {
+            let mut state = self.lock();
+            if state.closed {
+                return;
+            }
+            let result = state.ingest.finish(SystemTime::now());
+            // finish can seal an accepted prefix before returning a semantic
+            // error. Its immutable media still needs rendering and feeding.
+            Self::render(&mut state);
+            result
+        };
+        let loss = match &result {
+            Ok(update) => update.media_loss,
+            Err(_) => true,
+        };
+        if loss {
+            session.mark_recording_incomplete(session.generation);
         }
-        drop(st);
+        if result.is_ok_and(|update| update.restarted) {
+            session.recorder = session
+                .recorder_factory
+                .as_ref()
+                .map(RecorderFactory::start);
+            if loss {
+                session.mark_recording_incomplete(session.generation);
+            }
+        }
+        if let Some(recorder) = &mut session.recorder
+            && let Some((tracks, parts)) = self.parts_after(recorder.last_part())
+        {
+            // Recorder additionally pins the immutable init identity. A
+            // failed epoch change cannot append AAC under an old video init.
+            recorder.feed(tracks, parts);
+        }
         self.version.send_modify(|v| *v += 1);
         crate::own_http::notify();
     }
@@ -356,7 +409,7 @@ impl LiveStream {
             }
             id += 1;
         }
-        Some(((m.video().clone(), m.audio().copied()), parts))
+        Some((Tracks::new(m.video().cloned(), m.audio().copied())?, parts))
     }
 
     pub fn close(&self) {
@@ -374,6 +427,13 @@ pub enum Claim {
     Resumed,
 }
 
+/// An atomic end-of-connection decision, captured before a successor claim.
+pub enum Retirement {
+    Stale,
+    Ended,
+    Held(Duration),
+}
+
 /// The live streams, by event id.
 #[derive(Default)]
 pub struct Registry {
@@ -388,13 +448,14 @@ impl Registry {
     /// Claims a path for a new publisher, with its generation. `None` if a
     /// publisher is connected to it. A stream held for a reconnect is taken
     /// over: same playlist, same recording.
+    #[cfg(test)]
     pub fn claim(
         &self,
         path: &StreamPath,
         cfg: MuxerConfig,
         kind: SourceKind,
     ) -> Option<(Arc<LiveStream>, u64, Claim)> {
-        self.claim_with(path, cfg, kind, false)
+        self.claim_configured(path, cfg, kind, false, |_, _| {})
     }
 
     /// As [`Registry::claim`], but a stream with a publisher attached is taken
@@ -403,21 +464,26 @@ impl Registry {
     /// times out; refusing it would stall viewers until the timeout. The old
     /// run is closed as a drop would close it, and the old connection's next
     /// push is refused ([`crate::publish::PushError::Superseded`]).
+    #[cfg(test)]
     pub fn claim_or_take_over(
         &self,
         path: &StreamPath,
         cfg: MuxerConfig,
         kind: SourceKind,
     ) -> Option<(Arc<LiveStream>, u64, Claim)> {
-        self.claim_with(path, cfg, kind, true)
+        self.claim_configured(path, cfg, kind, true, |_, _| {})
     }
 
-    fn claim_with(
+    /// Configure the accepted connection before another claim can observe it.
+    /// The cold setup runs under map -> session ownership; it must not re-enter
+    /// the registry or perform file IO. Ingest never calls this callback.
+    pub fn claim_configured(
         &self,
         path: &StreamPath,
         cfg: MuxerConfig,
         kind: SourceKind,
         take_over: bool,
+        configure: impl FnOnce(&mut Session, Claim),
     ) -> Option<(Arc<LiveStream>, u64, Claim)> {
         let mut map = self.map();
         if let Some(stream) = map.get(path.event_id()).cloned() {
@@ -426,7 +492,9 @@ impl Registry {
                 if !take_over {
                     return None;
                 }
-                Self::close_run(&stream, &mut session);
+                // Preserve accepted terminal parser input and recorder loss
+                // attribution before replacing the source under this owner.
+                stream.finish_connection(&mut session);
                 session.attached = false;
                 tracing::info!(path = %path.as_path(), "publisher replaced by a new connection");
             }
@@ -447,10 +515,13 @@ impl Registry {
                 // floor, and cannot be completed by this connection's first IDR.
                 session.fresh_part_floor = muxer.as_ref().map_or(0, Muxer::next_part_id);
                 st.ingest = Source::resume(kind, stream.cfg, muxer);
+                drop(st);
+                configure(&mut session, Claim::Resumed);
                 return Some((stream.clone(), session.generation, Claim::Resumed));
             }
         }
         let stream = Arc::new(LiveStream::new(path.clone(), cfg, kind));
+        configure(&mut stream.session(), Claim::Fresh);
         map.insert(path.event_id().to_owned(), stream.clone());
         Some((stream, 0, Claim::Fresh))
     }
@@ -463,17 +534,24 @@ impl Registry {
     /// for a reconnect and this returns true: the caller then calls
     /// [`Registry::expire`] when the grace period is over. Otherwise the
     /// stream ends now. Nothing happens if a newer publisher has taken over.
+    #[cfg(test)]
     pub fn detach(&self, stream: &Arc<LiveStream>, generation: u64, hold: bool) -> bool {
         let mut map = self.map();
+        if !map
+            .get(stream.path.event_id())
+            .is_some_and(|s| Arc::ptr_eq(s, stream))
+        {
+            return false;
+        }
         let mut session = stream.session();
         if session.generation != generation || !session.attached {
             return false;
         }
         session.attached = false;
+        stream.finish_connection(&mut session);
         if hold {
             // Keep claim() excluded until the previous run and recording tail
             // are closed. A new publisher must not race this interruption.
-            Self::close_run(stream, &mut session);
             return true;
         }
         drop(session);
@@ -481,15 +559,42 @@ impl Registry {
         false
     }
 
-    /// Ends the current run: interrupts it and hands the recorder the parts
-    /// it has not yet written.
-    fn close_run(stream: &Arc<LiveStream>, session: &mut Session) {
-        stream.interrupt();
-        if let Some(recorder) = &mut session.recorder
-            && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
-        {
-            recorder.feed(tracks, parts);
+    /// Retire one accepted publisher under map -> session -> media order.
+    /// Already-ended exact ownership can still send its captured Unpublish;
+    /// stale ownership must not emit callbacks or mutate a successor's grace.
+    pub fn retire(
+        &self,
+        stream: &Arc<LiveStream>,
+        generation: u64,
+        grace: Duration,
+        can_hold: bool,
+    ) -> Retirement {
+        let mut map = self.map();
+        let mapped = map.get(stream.path.event_id());
+        let different = mapped.is_some_and(|current| !Arc::ptr_eq(current, stream));
+        let absent = mapped.is_none();
+        let mut session = stream.session();
+        if different || session.generation != generation {
+            return Retirement::Stale;
         }
+        let closed = stream.lock().closed;
+        if absent && !closed {
+            return Retirement::Stale;
+        }
+        if !session.attached || closed {
+            return Retirement::Ended;
+        }
+        session.hold_remaining(grace, Instant::now());
+        session.attached = false;
+        stream.finish_connection(&mut session);
+        // Terminal parsing cannot extend the original reconnect deadline.
+        let remaining = session.hold_remaining(grace, Instant::now());
+        if can_hold && !remaining.is_zero() && stream.has_content() {
+            return Retirement::Held(remaining);
+        }
+        drop(session);
+        Self::end(&mut map, stream);
+        Retirement::Ended
     }
 
     /// The grace period for `generation`'s drop is over: ends the stream
@@ -523,12 +628,7 @@ impl Registry {
             return false;
         }
         session.attached = false;
-        stream.interrupt();
-        if let Some(recorder) = &mut session.recorder
-            && let Some((tracks, parts)) = stream.parts_after(recorder.last_part())
-        {
-            recorder.feed(tracks, parts);
-        }
+        stream.finish_connection(&mut session);
         drop(session);
         Self::end(&mut map, stream);
         true
@@ -543,10 +643,16 @@ impl Registry {
         {
             map.remove(stream.path.event_id());
         }
-        stream.close();
-        // Dropping the recorder closes its queue; the writer then finishes
-        // the file and sends recordSegmentComplete.
-        let recorder = stream.session().recorder.take();
+        // Repeating a terminal drain is harmless. This also covers expiry
+        // after a held connection, without duplicating its final AAC part.
+        let recorder = {
+            let mut session = stream.session();
+            stream.finish_connection(&mut session);
+            stream.close();
+            // Actual writer completion follows channel closure, not removal
+            // from the registry or a requested transport shutdown.
+            session.recorder.take()
+        };
         drop(recorder);
     }
 }
@@ -620,13 +726,96 @@ mod tests {
         assert_eq!(c, Claim::Resumed);
         assert!(Arc::ptr_eq(&first, &again));
         assert!(g2 > g1);
-        assert!(!first.session().owned_by(g1));
-        assert!(again.session().owned_by(g2));
+        assert!(!first.session().owns_connection(g1));
+        assert!(again.session().owns_connection(g2));
         // The replaced connection leaving later changes nothing.
         assert!(!reg.detach(&first, g1, true));
         assert!(!reg.expire(&first, g1));
         assert!(!again.lock().closed);
-        assert!(again.session().owned_by(g2));
+        assert!(again.session().owns_connection(g2));
+    }
+
+    #[tokio::test]
+    async fn recorder_setup_is_atomic_with_admission_before_a_real_takeover() {
+        use std::sync::mpsc;
+
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let path = StreamPath::parse("live/event-a").expect("path");
+        let factory = RecorderFactory::new(
+            fixture
+                .app
+                .config
+                .recordings
+                .as_ref()
+                .expect("recording root"),
+            &path,
+            fixture.app.callbacks.clone(),
+            0,
+        );
+        let registry = fixture.app.streams.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            registry
+                .claim_configured(
+                    &path,
+                    MuxerConfig::default(),
+                    SourceKind::Ts,
+                    true,
+                    |s, c| {
+                        assert_eq!(c, Claim::Fresh);
+                        entered_tx.send(()).expect("setup entered");
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("release setup");
+                        s.recorder_factory = Some(factory);
+                        s.recorder = s.recorder_factory.as_ref().map(RecorderFactory::start);
+                    },
+                )
+                .expect("first claim")
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("held setup");
+        assert!(matches!(
+            fixture.app.streams.streams.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        let app = fixture.app.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let _entered = runtime.enter();
+            attempt_tx.send(()).expect("takeover attempted");
+            let request = sapflow_core::PublishRequest::parse_srt_stream_id(
+                "publish:live/event-a:fixture:fixture",
+            )
+            .expect("request");
+            let publication = crate::publish::Publication::begin(
+                &app,
+                &request,
+                SourceKind::Ts,
+                "127.0.0.1".parse().expect("loopback"),
+            )
+            .expect("real takeover");
+            done_tx.send(()).expect("takeover completed");
+            publication
+        });
+        attempt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attempt");
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release_tx.send(()).expect("finish first setup");
+        let (stream, generation, _) = first.join().expect("first thread");
+        let mut publication = second.join().expect("second thread");
+        assert!(!stream.session().owns_connection(generation));
+        assert!(stream.session().recorder.is_some());
+        crate::publish::loss_tests::Fixture::feed(&mut publication);
+        publication.end();
+        fixture.completion("finalised").await;
+        assert_eq!(fixture.scope.observations.counts().recordings_finalised, 1);
+        assert_eq!(fixture.scope.observations.counts().recordings_incomplete, 0);
     }
 }
 
@@ -661,6 +850,7 @@ mod grace_tests {
             attached: true,
             fresh_part_floor: 0,
             recorder: None,
+            recorder_factory: None,
             outage_deadline: None,
         };
         let grace = Duration::from_secs(90);

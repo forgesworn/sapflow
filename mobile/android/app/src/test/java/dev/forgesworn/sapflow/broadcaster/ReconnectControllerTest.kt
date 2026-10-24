@@ -80,6 +80,20 @@ class ReconnectControllerTest {
         fun accepted() = controller.event(controller.token, PublishingAttemptEvent.Accepted)
         fun failed() = controller.event(controller.token, PublishingAttemptEvent.Failed())
     }
+    @Test fun wakeBeforeStartDoesNotConstructOrStartPolicyAndSuspensionKeepsOriginalOutageDeadline() {
+        val h = Harness()
+        h.controller.tick() // Foreground service wake while Prepare is still dormant.
+        assertEquals(0, h.policy.starts); assertEquals(0, h.attempts.size)
+        h.controller.attach(1); h.accepted(); h.now = 10; h.failed()
+        assertEquals(100L, h.policy.deadlineNs)
+        // BOOTTIME advanced while both the media clock and scheduled task slept.
+        h.now = 101; h.controller.tick()
+        assertTrue(h.controller.terminal)
+        assertEquals(1, h.attempts.size)
+        h.controller.event(1, PublishingAttemptEvent.Accepted)
+        h.controller.tick()
+        assertEquals(1, h.attempts.size); assertEquals(1, h.policy.starts)
+    }
     @Test fun prepareIsDormantAndRetryCreatesFreshTransportAfterOldOwnerCloses() {
         val h = Harness()
         assertEquals(0, h.attempts.size)

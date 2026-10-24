@@ -47,11 +47,38 @@ sleep 1
 grep 'SRT listening' "$WORK/sapflow.log" | grep -q 'implementation="own"' || fail "SRT is not served by our own receiver"
 echo "ok   SRT served by our own receiver"
 
+pad_generated_ts() {
+  # file://con can discard its last short read. Keep synthetic fixture input
+  # whole TS packets and pad only with NULL packets to one 1316-byte chunk.
+  python3 -c '
+import os, sys
+pending = b""
+packets = 0
+while True:
+    chunk = os.read(sys.stdin.fileno(), 65536)
+    if not chunk:
+        break
+    pending += chunk
+    complete = len(pending) // 188 * 188
+    for at in range(0, complete, 188):
+        if pending[at] != 0x47:
+            raise SystemExit("generated fixture has invalid TS alignment")
+    sys.stdout.buffer.write(pending[:complete])
+    packets += complete // 188
+    pending = pending[complete:]
+if pending or not packets:
+    raise SystemExit("generated fixture ended without whole TS packets")
+for counter in range((-packets) % 7):
+    sys.stdout.buffer.write(bytes([0x47, 0x1f, 0xff, 0x10 | counter]) + b"\xff" * 184)
+sys.stdout.buffer.flush()
+'
+}
+
 publish() { # streamid seconds
   ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
     -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
     -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -c:a aac -b:a 128k \
-    -f mpegts - | srt-live-transmit -q -a:no file://con "srt://127.0.0.1:$SRT_PORT?streamid=$1&latency=2000"
+    -f mpegts - | pad_generated_ts | srt-live-transmit -q -a:no -chunk:1316 file://con "srt://127.0.0.1:$SRT_PORT?streamid=$1&latency=2000"
 }
 
 publish "publish:live/$EVENT:pub:secret" 25 > /dev/null 2>&1 & pids+=($!)
@@ -209,7 +236,7 @@ epublish() { # streamid seconds extra-srt-options
   ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
     -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
     -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -c:a aac -b:a 128k \
-    -f mpegts - | srt-live-transmit -q -a:no file://con "srt://127.0.0.1:$ESRT?streamid=$1&latency=2000$3"
+    -f mpegts - | pad_generated_ts | srt-live-transmit -q -a:no -chunk:1316 file://con "srt://127.0.0.1:$ESRT?streamid=$1&latency=2000$3"
 }
 epublish "publish:live/event-enc:pub:secret" 10 "&passphrase=$PASS_E&pbkeylen=16" > /dev/null 2>&1 & pids+=($!)
 for _ in $(seq 1 60); do

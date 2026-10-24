@@ -70,4 +70,15 @@ internal class V4vCaptureAdmissionTest {
         policy.invalidate() // End is not gated by quality admission.
         assertFalse(policy.canStart(old, ticket, identity, CaptureProfile.SD_480))
     }
+    @Test fun audioGrantAndStartCannotBeReusedForVideoOrSuccessor() {
+        val policy = V4vCaptureAdmission(); val id = V4vIdentity("event-fixture", 1, "a".repeat(32), 1)
+        val approval = policy.snapshot()
+        assertThrows(IllegalArgumentException::class.java) { policy.consume(approval, CaptureIntent.AudioOnly48kMono, 999999) }
+        assertTrue(policy.current(approval))
+        policy.consume(approval, CaptureIntent.AudioOnly48kMono, 1000000)
+        val prepared = policy.bind(1, id, CaptureIntent.AudioOnly48kMono)
+        assertTrue(policy.canStart(prepared, policy.snapshot(), id, CaptureIntent.AudioOnly48kMono))
+        assertFalse(policy.canStart(prepared, policy.snapshot(), id, CaptureIntent.DEFAULT))
+        policy.invalidate(); assertFalse(policy.canStart(prepared, policy.snapshot(), id, CaptureIntent.AudioOnly48kMono))
+    }
 }

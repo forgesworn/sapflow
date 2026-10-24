@@ -234,7 +234,33 @@ after any asynchronous copy. A replaced session/generation never becomes current
 again through an old callback.
 
 Recording completion additionally includes a 32-character `recordingId` and
-`recordingState: "finalised" | "incomplete"`. Completion requires successful
+`recordingState: "finalised" | "incomplete"`, and the additive field
+`recordingTracks: {"hasVideo": boolean, "hasAudio": boolean}`. Both track keys
+are present and at least one is true. The producer captures this non-empty
+topology once from that recording's first initialization, using the same tracks
+for its initial and final file headers. A later live codec epoch or requested
+phone profile cannot relabel the recording. Only scoped completion callbacks
+include this field; legacy callback bytes are unchanged.
+
+This is a pre-1.0 Rust source-API migration: code constructing
+`StreamEvent::RecordSegmentComplete` must supply the new required typed
+`recording_tracks: RecordingTracks` field. Exhaustive field patterns must include
+it or use `..`. `RecordingTracks::new` refuses both flags false. The Rust source
+change does not alter legacy JSON bytes, the creator grant/status schema or
+native binding APIs.
+
+Receivers may map audio-only to `audio/mp4`, and any video-bearing recording to
+`video/mp4`. Missing or malformed topology is unknown, not permission to infer
+tracks from current live metadata. New automatic topology-dependent adoption
+requires the field. Keep the exact recording identity, path, state and topology
+immutable across callback retries and any asynchronous copy; recheck the current
+prepared session/generation after copying. A matching older connection epoch
+within the same session can finish later, but replacement or abandonment cannot
+be undone by that callback. Already adopted replay metadata is not relabelled.
+Topology describes the stored file's tracks, not decoding, complete-show
+coverage or permission to publish an incomplete recording.
+
+Completion requires successful
 header finalisation, flush and file sync. An interrupted accepted prefix can be
 reported incomplete; it must never advertise a complete-show replay. Orientation
 or reconnect can produce multiple files. A finalised epoch file alone does not

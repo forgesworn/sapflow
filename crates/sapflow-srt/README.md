@@ -101,7 +101,10 @@ How it compares with libsrt and gosrt under loss, with measurements, is in
   must deliver what `srt-protocol` delivered for the same trace (its
   output recorded before it was removed), and under
   loss exactly what libsrt's receiver delivered in the recorded session.
-- `tests/caller.rs`: the caller and sender against our listener.
+- `tests/caller.rs`: the caller and sender against our listener, including
+  AES-128/256 packet-count key refresh every 32 packets at 1 ms spacing.
+  Receiver controls check that cached or malformed KM floods, old-slot
+  reordering and altered key flags cannot replenish spent refresh credit.
 - `tests/black_box_sender.py`, `tests/black_box_crypto.py`: our sender and
   encryption against libsrt's tools, as black boxes.
 - Fuzz targets `own_srt_packet`, `own_srt_listener` and `own_srt_caller`

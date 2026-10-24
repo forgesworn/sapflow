@@ -29,7 +29,11 @@ internal class SrtPublishingSink(
     private val plaintext: Boolean,
     private val events: (PublishingAttemptEvent) -> Unit = {},
     private val pacingBytesPerSecond: ULong = 1_250_000uL,
-) : EncodedSink {
+    private val intent: CaptureIntent = CaptureIntent.DEFAULT,
+    private val authority: PublishingAuthority? = null,
+) : EncodedSink, SocketOutputProvider {
+    private val outputCounter = SocketOutputCounter(SocketOutputAccounting.SRT_DATAGRAM)
+    override val socketOutput: SocketOutputSource get() = outputCounter
     private data class Codecs(val video: RustCodec?, val audio: RustCodec?)
     private val codecs = AtomicReference(Codecs(null, null))
     private val secret = AtomicReference(if (plaintext) null else passphrase.toByteArray(Charsets.UTF_8))
@@ -52,6 +56,7 @@ internal class SrtPublishingSink(
     }
 
     override fun configure(video: RustCodec?, audio: RustCodec?) {
+        require(intent.hasVideo || video == null) { "Audio-only attempt received video configuration" }
         if (!closed.get()) { codecs.set(Codecs(video, audio)); selector.get()?.wakeup() }
     }
 
@@ -59,6 +64,7 @@ internal class SrtPublishingSink(
 
     private fun startNetwork() {
         check(!closed.get()) { "SRT attempt closed" }
+        authority?.requireValid()
         val configureDeadlineUs = nowUs() + 15_000_000
         message.set("Starting one ${if (plaintext) "plaintext lab" else "AES-256"} SRT attempt")
         worker = Thread({ runNetwork(configureDeadlineUs) }, "sapflow-srt-udp").apply { start() }
@@ -67,6 +73,7 @@ internal class SrtPublishingSink(
     override fun consume(sample: MediaSample) {
         if (closed.get()) return
         try {
+            authority?.requireValid()
             val ticket = offered.offer(sample, nowUs() + 1_000_000)
             selector.get()?.wakeup()
             if (!offered.await(ticket, 1000) && !closed.get()) fail("SRT sample admission exceeded one second · capture can continue")
@@ -78,7 +85,7 @@ internal class SrtPublishingSink(
         var alarm: ScheduledFuture<*>? = null
         var pendingWrite: ByteBuffer? = null
         var writeDeadlineUs: Long? = null
-        var waitingIdr = true
+        var waitingIdr = intent.hasVideo
         try {
             val readiness = Selector.open()
             selector.set(readiness)
@@ -89,12 +96,13 @@ internal class SrtPublishingSink(
             val key = socket.register(readiness, SelectionKey.OP_READ)
             val input = ByteBuffer.allocateDirect(1501)
             while (!closed.get()) {
+                authority?.requireValid()
                 alarm?.cancel(false); alarm = null
                 val now = nowUs()
                 if (native == null) {
                     check(now < configureDeadlineUs) { "SRT codec configuration deadline exceeded" }
                     val descriptors = codecs.get()
-                    if (descriptors.video != null && descriptors.audio != null) {
+                    if (intent.codecsReady(descriptors.video != null, descriptors.audio != null)) {
                         val config = NativeSrtConfig(
                             destination = destination.nativeAddress, streamId = streamId,
                             cipher = if (plaintext) null else NativeSrtCipher.AES256,
@@ -123,13 +131,13 @@ internal class SrtPublishingSink(
                 }
                 if (closed.get()) break
                 offered.process(nowUs()) { sample ->
-                    // Both tracks must be announced at construction, but no
-                    // pre-handshake media or non-IDR video is retained here.
+                    // Expected tracks are frozen at construction; no
+                    // pre-handshake media or required non-IDR video is retained here.
                     if (closed.get() || publisher == null || publisher.state() != NativeSrtState.CONNECTED) true
                     else if (waitingIdr && (!sample.isVideo() || !sample.isKeyframe())) true
                     else if (!publisher.isReady()) false
                     else {
-                        publisher.push(sample, nowUs().toULong())
+                        withPublishingAuthority(authority) { publisher.push(sample, nowUs().toULong()) }
                         if (sample.isVideo() && sample.isKeyframe()) waitingIdr = false
                         true
                     }
@@ -152,7 +160,9 @@ internal class SrtPublishingSink(
                             error("SRT UDP write deadline exceeded")
                         }
                         val size = datagram.remaining()
-                        val sent = try { socket.write(datagram) } catch (error: Exception) {
+                        val sent = try { outputCounter.write(size) {
+                            withPublishingAuthority(authority) { socket.write(datagram) }
+                        } } catch (error: Exception) {
                             publisher.socketSendFailed(nowUs().toULong()); throw error
                         }
                         if (sent == 0) break
@@ -210,12 +220,15 @@ internal class SrtPublishingSink(
             shutdownResult.set(shutdown.finish(::nowUs,
                 stopNative = { native?.stop(nowUs().toULong()) },
                 takeControl = { native?.pollDatagram(nowUs().toULong())?.bytes },
-                write = { bytes -> channel.get()?.write(bytes) ?: 0 }))
+                write = { bytes -> outputCounter.write(bytes.remaining()) {
+                    withPublishingAuthority(authority) { channel.get()?.write(bytes) ?: 0 }
+                } }))
             runCatching { native?.close() }
             secret.getAndSet(null)?.fill(0)
             runCatching { channel.getAndSet(null)?.close() }
             runCatching { selector.getAndSet(null)?.close() }
             timers.shutdownNow()
+            outputCounter.seal() // This sole writer has completed, including shutdown.
         }
     }
 
@@ -253,6 +266,7 @@ internal class SrtPublishingSink(
             if (running == null) {
                 shutdown.abort()
                 offered.cancel()
+                outputCounter.seal()
             } else {
                 // No early interrupt: interrupting an interruptible UDP channel
                 // can close it before its owner submits the shutdown control.

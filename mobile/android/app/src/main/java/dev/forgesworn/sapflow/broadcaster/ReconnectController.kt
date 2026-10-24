@@ -156,7 +156,7 @@ internal class ReconnectController(
             status = "Origin confirmed playable media"
         }
     }
-    fun tick() { if (!stopped && permitted()) apply(policy.tick(now())) }
+    fun tick() { if (started && !stopped && permitted()) apply(policy.tick(now())) }
     private fun apply(action: ReconnectAction) {
         when (action) {
             ReconnectAction.Connect -> { nextWakeNs = policy.nextDeadlineNs; pendingConnect = true; connect() }

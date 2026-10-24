@@ -1,0 +1,552 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,8 +1,8 @@
+ [package]
+ name = "signet-nip46-client"
+-version = "0.1.0"
++version = "0.2.0"
+ edition = "2021"
+-rust-version = "1.75"
++rust-version = "1.85"
+ description = "Thin NIP-46 bunker signer for Rust — pair / sign / restore over nostr-connect. Generic; ships sensible defaults for the Signet/Heartwood bunker flow."
+ license = "MIT"
+ repository = "https://github.com/forgesworn/signet-nip46-client"
+@@ -12,13 +12,21 @@
+ keywords = ["nostr", "nip46", "signer", "bunker", "signet"]
+ categories = ["cryptography", "authentication", "api-bindings"]
+ 
++[features]
++default = []
++# Temporary opt-in until maintained NostrConnect publishes its client-builder
++# seam. Sapflow pins the complete reviewed source patch group.
++bounded-client = []
++
+ [dependencies]
+-# rust-nostr family, pinned in lockstep (see the AxeNStax S0 spike). NIP-46 bunker
+-# client + the NostrSigner trait this crate re-exposes.
+-nostr = "=0.44.3"
+-nostr-connect = "=0.44.1"
++# 0.2 exposes the maintained rust-nostr 0.45 trait family. This is a public
++# Rust API break from 0.1 (nostr 0.44), not a wire/credential format change.
++nostr = "=0.45.5"
++nostr-connect = "=0.45.2"
++nostr-sdk = { version = "=0.45.4", default-features = false }
+ serde = { version = "1", features = ["derive"] }
+ 
+ [dev-dependencies]
++bitcoin_hashes = "=1.2.0"
+ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+ serde_json = "1"
+--- a/README.md
++++ b/README.md
+@@ -8,7 +8,7 @@
+ nsec.app / Amber / any compliant signer); this crate is the **client** half. It never
+ holds the user's key — only a throwaway per-session app keypair used to talk to the bunker.
+ 
+-A paired [`BunkerSession`] implements [`nostr::signer::NostrSigner`], so it is a **drop-in
++A paired [`BunkerSession`] implements [`nostr::prelude::AsyncSignEvent`], so it is a **drop-in
+ signer** anywhere rust-nostr wants one: `EventBuilder::sign`, `nostr-blossom` uploads, or a
+ save-sync layer like [`stash-rs`](https://github.com/forgesworn/stash-rs).
+ 
+@@ -28,7 +28,7 @@
+ 
+ // 1. Pair — the user approves on their phone on first use.
+ let session = BunkerSession::pair(
+-    "bunker://<remote-pubkey>?relay=wss://relay.trotters.cc&secret=...",
++    "bunker://<remote-pubkey>?relay=wss://relay.example.invalid&secret=...",
+     SessionOptions::default(),
+ )?;
+ let persona = session.user_public_key().await?;     // round-trips to the bunker
+@@ -40,7 +40,7 @@
+ let session = BunkerSession::restore(persisted, SessionOptions::default())?;
+ 
+ // 4. Use it as a signer anywhere.
+-let event = EventBuilder::text_note("gm").sign(&session).await?;
++let event = EventBuilder::new(Kind::TextNote, "gm").finalize_async(&session).await?;
+ ```
+ 
+ `PersistedSession` holds only the throwaway NIP-46 *client* secret + the bunker URI (with
+@@ -50,16 +50,39 @@
+ 
+ - **Solo-verified:** construction from a valid URI, malformed-URI rejection, the
+   persist/restore app-key round-trip, secret-stripping on restore, `PersistedSession`
+-  serde, and the `NostrSigner` contract (against a local-key signer). `cargo test` green.
++  serde, and the `0.45 async signer` contract (against a local-key signer). `cargo test` green.
+ - **Boundary (needs a device):** the live relay handshake with a real bunker — pairing,
+   approval, and signing through the phone. Exercise it with the AxeNStax spike harness
+   (`tools/native-build-spike/src/bin/bunker_pair.rs`) or any NIP-46 bunker.
+ 
+ ## Pinned versions
+ 
+-`nostr = 0.44.3`, `nostr-connect = 0.44.1` (rust-nostr family, lockstep). Native-only — in
++`nostr = 0.45.5`, `nostr-connect = 0.45.2`, `nostr-sdk = 0.45.4` (rust-nostr family, lockstep). Native-only — in
+ a dual-target consumer, gate behind `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`.
+ 
+ ## Licence
+ 
+ MIT © ForgeSworn
++
++## 0.2 migration
++
++Version 0.2 deliberately breaks Rust source compatibility with the 0.44 Nostr
++trait family. It implements `AsyncGetPublicKey`, `AsyncSignEvent`, `AsyncNip04`
++and `AsyncNip44`; use `finalize_async` for event builders. The persisted JSON
++fields and stable client key remain unchanged, and restore never silently
++creates a replacement client identity. The required Rust version is 1.85.
++
++`pair_with_relay_options` and `restore_with_relay_options` pass the maintained
++SDK's `RelayOptions` to NostrConnect. The ordinary constructors retain default
++relay settings. Callers with bounded runtimes should choose their own limits;
++this wrapper does not fork or replace the maintained relay transport.
++
++`PersistedSession` and `BunkerSession` debug output is redacted. Serialisation
++still contains the client credential and must go into encrypted private storage.
++
++The optional `bounded-client` API is enabled by Sapflow's exact reviewed source
++patch group: NostrConnect accepts a fresh SDK client builder, and the maintained
++SDK/WebSocket path forwards native buffer/frame/message settings. Default
++Signet methods keep their public 0.45 constructors and do not require those
++new seams. Do not publish the bounded feature as standalone registry support
++until the maintained upstream option APIs have been released and repinned.
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2,9 +2,9 @@
+ //!
+ //! A thin, **generic** NIP-46 bunker signer for Rust. It wraps
+ //! [`nostr_connect::prelude::NostrConnect`] and exposes a small **pair / sign / restore**
+-//! surface plus an implementation of [`nostr::signer::NostrSigner`], so a paired session
++//! surface plus an implementation of [`nostr::prelude::AsyncSignEvent`], so a paired session
+ //! is a drop-in signer anywhere rust-nostr wants one — `EventBuilder::sign`,
+-//! `nostr-blossom`, or a save-sync layer like `stash-rs`.
++//! `other 0.45 clients`, or a save-sync layer like `stash-rs`.
+ //!
+ //! The "key stays on your phone" model: the user's secret key lives in a remote NIP-46
+ //! bunker (Signet / Heartwood / nsec.app / Amber / a self-hosted signer). This crate is
+@@ -24,7 +24,7 @@
+ //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+ //! // 1. Pair (the user approves on their phone on first use).
+ //! let session = BunkerSession::pair(
+-//!     "bunker://<remote-pubkey>?relay=wss://relay.trotters.cc&secret=...",
++//!     "bunker://<remote-pubkey>?relay=wss://relay.example.invalid&secret=...",
+ //!     SessionOptions::default(),
+ //! )?;
+ //! let _persona = session.user_public_key().await?;       // round-trips to the bunker
+@@ -41,18 +41,20 @@
+ //!
+ //! The **live pairing handshake needs the user's device** — it is the one part that can't
+ //! be exercised headlessly. Construction, persistence round-tripping, and the
+-//! `NostrSigner` delegation are unit-tested with local keys.
++//! `AsyncSignEvent` delegation are unit-tested with local keys.
+ 
+ mod error;
+ 
+ pub use error::Error;
++pub use nostr_sdk::prelude::{ClientBuilder, RelayOptions};
+ 
+ use std::time::Duration;
+ 
++use nostr::nips::{nip04::AsyncNip04, nip44::AsyncNip44};
+ use nostr::prelude::*;
+-use nostr::signer::{NostrSigner, SignerBackend, SignerError};
+ use nostr_connect::prelude::NostrConnect;
+ use serde::{Deserialize, Serialize};
++use std::{future::Future, pin::Pin};
+ 
+ /// Tunables for a bunker session.
+ #[derive(Clone, Debug)]
+@@ -77,7 +79,7 @@
+ /// `bunker_uri` carries the remote signer's pubkey + relays. Persist it somewhere the app
+ /// controls (an OS keystore, an app-private file). Treat `app_secret_key` as a secret —
+ /// it identifies this client session to the bunker.
+-#[derive(Clone, Debug, Serialize, Deserialize)]
++#[derive(Clone, Serialize, Deserialize)]
+ pub struct PersistedSession {
+     /// Hex secret key of the per-session NIP-46 **client** keypair (not the persona).
+     pub app_secret_key: String,
+@@ -85,13 +87,24 @@
+     pub bunker_uri: String,
+ }
+ 
+-/// A live NIP-46 bunker session. Implements [`nostr::signer::NostrSigner`].
+-#[derive(Debug)]
++impl std::fmt::Debug for PersistedSession {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("PersistedSession(redacted)")
++    }
++}
++
++/// A live NIP-46 bunker session. Implements [`nostr::prelude::AsyncSignEvent`].
+ pub struct BunkerSession {
+     inner: NostrConnect,
+     /// The URI this session was paired/restored from, kept for a secret-less persist
+     /// fallback when the canonical post-handshake `bunker_uri()` isn't reachable yet.
+     original_uri: String,
++}
++
++impl std::fmt::Debug for BunkerSession {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("BunkerSession(redacted)")
++    }
+ }
+ 
+ impl BunkerSession {
+@@ -100,10 +113,45 @@
+     /// [`user_public_key`](Self::user_public_key) / sign call performs the relay handshake
+     /// and triggers the bunker's approval prompt.
+     pub fn pair(uri: &str, opts: SessionOptions) -> Result<Self, Error> {
+-        let parsed = NostrConnectURI::parse(uri).map_err(|e| Error::Uri(e.to_string()))?;
++        Self::pair_with_relay_options(uri, opts, RelayOptions::default())
++    }
++
++    /// Pair using caller-selected relay limits. Existing pairing semantics and
++    /// signer authority are unchanged; no extra transport implementation.
++    pub fn pair_with_relay_options(
++        uri: &str,
++        opts: SessionOptions,
++        relay_options: RelayOptions,
++    ) -> Result<Self, Error> {
++        let parsed = NostrConnectUri::parse(uri).map_err(|e| Error::Uri(e.to_string()))?;
+         let app_keys = Keys::generate();
+-        let inner = NostrConnect::new(parsed, app_keys, opts.timeout, None)
++        let inner = NostrConnect::new(parsed, app_keys, opts.timeout, Some(relay_options))
+             .map_err(|e| Error::Connect(e.to_string()))?;
++        Ok(Self {
++            inner,
++            original_uri: uri.to_owned(),
++        })
++    }
++
++    /// Pair on a fresh bounded SDK client. Requires the reviewed maintained
++    /// NostrConnect client-builder seam; no protocol implementation is replaced.
++    #[cfg(feature = "bounded-client")]
++    pub fn pair_with_client_builder(
++        uri: &str,
++        opts: SessionOptions,
++        relay_options: RelayOptions,
++        builder: ClientBuilder,
++    ) -> Result<Self, Error> {
++        let parsed = NostrConnectUri::parse(uri).map_err(|e| Error::Uri(e.to_string()))?;
++        let app_keys = Keys::generate();
++        let inner = NostrConnect::new_with_client_builder(
++            parsed,
++            app_keys,
++            opts.timeout,
++            Some(relay_options),
++            builder,
++        )
++        .map_err(|e| Error::Connect(e.to_string()))?;
+         Ok(Self {
+             inner,
+             original_uri: uri.to_string(),
+@@ -113,12 +161,47 @@
+     /// Reconnect a previously-paired session by reusing its stored app keypair + bunker
+     /// URI. Re-uses the existing NIP-46 grant, so a well-behaved bunker does not re-prompt.
+     pub fn restore(persisted: PersistedSession, opts: SessionOptions) -> Result<Self, Error> {
++        Self::restore_with_relay_options(persisted, opts, RelayOptions::default())
++    }
++
++    /// Restore the same client identity with caller-selected relay limits.
++    pub fn restore_with_relay_options(
++        persisted: PersistedSession,
++        opts: SessionOptions,
++        relay_options: RelayOptions,
++    ) -> Result<Self, Error> {
+         let parsed =
+-            NostrConnectURI::parse(&persisted.bunker_uri).map_err(|e| Error::Uri(e.to_string()))?;
++            NostrConnectUri::parse(&persisted.bunker_uri).map_err(|e| Error::Uri(e.to_string()))?;
+         let app_keys =
+             Keys::parse(&persisted.app_secret_key).map_err(|e| Error::Key(e.to_string()))?;
+-        let inner = NostrConnect::new(parsed, app_keys, opts.timeout, None)
++        let inner = NostrConnect::new(parsed, app_keys, opts.timeout, Some(relay_options))
+             .map_err(|e| Error::Connect(e.to_string()))?;
++        Ok(Self {
++            inner,
++            original_uri: persisted.bunker_uri,
++        })
++    }
++
++    /// Restore the same credential on a fresh caller-bounded SDK client.
++    #[cfg(feature = "bounded-client")]
++    pub fn restore_with_client_builder(
++        persisted: PersistedSession,
++        opts: SessionOptions,
++        relay_options: RelayOptions,
++        builder: ClientBuilder,
++    ) -> Result<Self, Error> {
++        let parsed =
++            NostrConnectUri::parse(&persisted.bunker_uri).map_err(|e| Error::Uri(e.to_string()))?;
++        let app_keys =
++            Keys::parse(&persisted.app_secret_key).map_err(|e| Error::Key(e.to_string()))?;
++        let inner = NostrConnect::new_with_client_builder(
++            parsed,
++            app_keys,
++            opts.timeout,
++            Some(relay_options),
++            builder,
++        )
++        .map_err(|e| Error::Connect(e.to_string()))?;
+         Ok(Self {
+             inner,
+             original_uri: persisted.bunker_uri,
+@@ -150,7 +233,7 @@
+     /// The persona pubkey this session signs as. Round-trips to the bunker on first call.
+     pub async fn user_public_key(&self) -> Result<PublicKey, Error> {
+         self.inner
+-            .get_public_key()
++            .get_public_key_async()
+             .await
+             .map_err(|e| Error::Signer(e.to_string()))
+     }
+@@ -166,19 +249,19 @@
+     /// would silently re-pair on restore.
+     fn secretless_original(&self) -> Result<String, Error> {
+         let parsed =
+-            NostrConnectURI::parse(&self.original_uri).map_err(|e| Error::Uri(e.to_string()))?;
++            NostrConnectUri::parse(&self.original_uri).map_err(|e| Error::Uri(e.to_string()))?;
+         match parsed {
+-            NostrConnectURI::Bunker {
++            NostrConnectUri::Bunker {
+                 remote_signer_public_key,
+                 relays,
+                 ..
+-            } => Ok(NostrConnectURI::Bunker {
++            } => Ok(NostrConnectUri::Bunker {
+                 remote_signer_public_key,
+                 relays,
+                 secret: None,
+             }
+             .to_string()),
+-            NostrConnectURI::Client { .. } => Err(Error::Connect(
++            NostrConnectUri::Client { .. } => Err(Error::Connect(
+                 "cannot persist a nostrconnect:// session before its handshake completes \
+                  (no stable reconnect URI yet — call user_public_key() first)"
+                     .to_string(),
+@@ -187,52 +270,57 @@
+     }
+ }
+ 
+-// A BunkerSession IS a signer — every method delegates to the wrapped NostrConnect, which
+-// drives the NIP-46 round-trip to the remote bunker. This is what makes a paired session
+-// drop-in for `stash-rs`, `nostr-blossom`, and `EventBuilder::sign`.
+-impl NostrSigner for BunkerSession {
+-    fn backend(&self) -> SignerBackend<'_> {
+-        self.inner.backend()
+-    }
+-
+-    fn get_public_key(&self) -> BoxedFuture<'_, Result<PublicKey, SignerError>> {
+-        self.inner.get_public_key()
+-    }
+-
+-    fn sign_event(&self, unsigned: UnsignedEvent) -> BoxedFuture<'_, Result<Event, SignerError>> {
+-        self.inner.sign_event(unsigned)
+-    }
+-
+-    fn nip04_encrypt<'a>(
++// Delegate the maintained 0.45 async capabilities. Each associated error is
++// the upstream error, preserving typed protocol failures for generic callers.
++impl AsyncGetPublicKey for BunkerSession {
++    type Error = nostr_connect::error::Error;
++    fn get_public_key_async(
++        &self,
++    ) -> Pin<Box<dyn Future<Output = Result<PublicKey, Self::Error>> + Send + '_>> {
++        self.inner.get_public_key_async()
++    }
++}
++impl AsyncSignEvent for BunkerSession {
++    type Error = nostr_connect::error::Error;
++    fn sign_event_async(
++        &self,
++        unsigned: UnsignedEvent,
++    ) -> Pin<Box<dyn Future<Output = Result<Event, Self::Error>> + Send + '_>> {
++        self.inner.sign_event_async(unsigned)
++    }
++}
++impl AsyncNip04 for BunkerSession {
++    type Error = nostr_connect::error::Error;
++    fn nip04_encrypt_async<'a>(
+         &'a self,
+         public_key: &'a PublicKey,
+         content: &'a str,
+-    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+-        self.inner.nip04_encrypt(public_key, content)
+-    }
+-
+-    fn nip04_decrypt<'a>(
+-        &'a self,
+-        public_key: &'a PublicKey,
+-        encrypted_content: &'a str,
+-    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+-        self.inner.nip04_decrypt(public_key, encrypted_content)
+-    }
+-
+-    fn nip44_encrypt<'a>(
++    ) -> Pin<Box<dyn Future<Output = Result<String, Self::Error>> + Send + 'a>> {
++        self.inner.nip04_encrypt_async(public_key, content)
++    }
++    fn nip04_decrypt_async<'a>(
+         &'a self,
+         public_key: &'a PublicKey,
+         content: &'a str,
+-    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+-        self.inner.nip44_encrypt(public_key, content)
+-    }
+-
+-    fn nip44_decrypt<'a>(
++    ) -> Pin<Box<dyn Future<Output = Result<String, Self::Error>> + Send + 'a>> {
++        self.inner.nip04_decrypt_async(public_key, content)
++    }
++}
++impl AsyncNip44 for BunkerSession {
++    type Error = nostr_connect::error::Error;
++    fn nip44_encrypt_async<'a>(
+         &'a self,
+         public_key: &'a PublicKey,
+-        payload: &'a str,
+-    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+-        self.inner.nip44_decrypt(public_key, payload)
++        content: &'a str,
++    ) -> Pin<Box<dyn Future<Output = Result<String, Self::Error>> + Send + 'a>> {
++        self.inner.nip44_encrypt_async(public_key, content)
++    }
++    fn nip44_decrypt_async<'a>(
++        &'a self,
++        public_key: &'a PublicKey,
++        content: &'a str,
++    ) -> Pin<Box<dyn Future<Output = Result<String, Self::Error>> + Send + 'a>> {
++        self.inner.nip44_decrypt_async(public_key, content)
+     }
+ }
+ 
+@@ -241,12 +329,53 @@
+     use super::*;
+ 
+     // A well-formed bunker URI for construction tests (random pubkey; never connected).
+-    const BUNKER_URI: &str = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.trotters.cc&secret=abc123";
++    const BUNKER_URI: &str = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.example.invalid&secret=abc123";
++
++    #[test]
++    fn persisted_debug_never_exposes_identity_uri_or_secret() {
++        let persisted = PersistedSession {
++            app_secret_key: "generated-secret".into(),
++            bunker_uri: "generated-private-uri".into(),
++        };
++        assert_eq!(format!("{persisted:?}"), "PersistedSession(redacted)");
++        let json = serde_json::to_value(&persisted).unwrap();
++        assert_eq!(json["app_secret_key"], "generated-secret");
++        assert_eq!(json["bunker_uri"], "generated-private-uri");
++    }
++
++    #[test]
++    fn caller_relay_limits_and_default_constructors_preserve_same_restore_identity() {
++        let keys = Keys::generate();
++        let options = RelayOptions::new()
++            .notification_channel_size(16)
++            .reconnect(false);
++        let persisted = PersistedSession {
++            app_secret_key: keys.secret_key().to_secret_hex(),
++            bunker_uri: BUNKER_URI.into(),
++        };
++        let session = BunkerSession::restore_with_relay_options(
++            persisted,
++            SessionOptions::default(),
++            options,
++        )
++        .unwrap();
++        assert_eq!(session.inner.local_keys().public_key(), keys.public_key());
++        assert!(BunkerSession::pair_with_relay_options(
++            BUNKER_URI,
++            SessionOptions::default(),
++            RelayOptions::default()
++        )
++        .is_ok());
++    }
+ 
+     #[test]
+     fn pair_constructs_from_a_valid_bunker_uri() {
+         let s = BunkerSession::pair(BUNKER_URI, SessionOptions::default());
+-        assert!(s.is_ok(), "pairing should construct (no live connection yet)");
++        assert!(
++            s.is_ok(),
++            "pairing should construct (no live connection yet)"
++        );
++        assert_eq!(format!("{:?}", s.unwrap()), "BunkerSession(redacted)");
+     }
+ 
+     #[test]
+@@ -306,22 +435,29 @@
+             "the single-use connect secret must not survive into a restore URI: {stripped}"
+         );
+         // Round-trips back to a parseable bunker URI.
+-        assert!(NostrConnectURI::parse(&stripped).is_ok());
+-    }
+-
+-    // The `NostrSigner` delegation pattern, exercised with a local Keys signer (the same
+-    // trait a BunkerSession implements) — proves the contract `stash-rs`/`nostr-blossom`
++        assert!(NostrConnectUri::parse(&stripped).is_ok());
++    }
++
++    // The `AsyncSignEvent` delegation pattern, exercised with a local Keys signer (the same
++    // trait a BunkerSession implements) — proves the contract `stash-rs`/`other 0.45 clients`
+     // rely on holds. The live bunker delegation is the boundary (needs a device).
+     #[tokio::test]
+     async fn nostr_signer_contract_holds_for_a_local_key_signer() {
+         let keys = Keys::generate();
+         let pk = keys.public_key();
+         // encrypt-to-self round-trip (the exact path stash-rs uses for blobs).
+-        let ct = NostrSigner::nip44_encrypt(&keys, &pk, "payload").await.unwrap();
+-        let pt = NostrSigner::nip44_decrypt(&keys, &pk, &ct).await.unwrap();
++        let ct = AsyncNip44::nip44_encrypt_async(&keys, &pk, "payload")
++            .await
++            .unwrap();
++        let pt = AsyncNip44::nip44_decrypt_async(&keys, &pk, &ct)
++            .await
++            .unwrap();
+         assert_eq!(pt, "payload");
+         // sign + verify.
+-        let event = EventBuilder::text_note("hi").sign(&keys).await.unwrap();
++        let event = EventBuilder::new(Kind::TextNote, "hi")
++            .finalize_async(&keys)
++            .await
++            .unwrap();
+         assert!(event.verify_signature());
+     }
+ }
+--- /dev/null
++++ b/tests/dependency_regression.rs
+@@ -0,0 +1,36 @@
++//! Generated hostile payloads exercise the security-fixed dependency path.
++//! No relay, account or user key is used.
++use bitcoin_hashes::{hmac::HmacEngine, sha256, Hash, HashEngine};
++use nostr::nips::nip44::v2::{decrypt_to_bytes, ConversationKey};
++
++fn mac(key: &[u8], pieces: &[&[u8]]) -> [u8; 32] {
++    let mut engine = HmacEngine::<sha256::HashEngine>::new(key);
++    for piece in pieces {
++        engine.input(piece);
++    }
++    engine.finalize().to_byte_array()
++}
++
++#[test]
++fn authenticated_zero_and_one_byte_ciphertexts_reject_without_panic() {
++    // Independent RFC5869 expand using public hash APIs, not the private NIP44
++    // message-key helper. A legitimate peer can authenticate these short frames.
++    let key = ConversationKey::new([0x19; 32]);
++    let nonce = [0x42; 32];
++    let mut expanded = Vec::new();
++    let mut previous = Vec::new();
++    for counter in 1..=3_u8 {
++        previous = mac(key.as_bytes(), &[&previous, &nonce, &[counter]]).to_vec();
++        expanded.extend_from_slice(&previous);
++    }
++    for count in [0, 1] {
++        let ciphertext = vec![0_u8; count];
++        let tag = mac(&expanded[44..76], &[&nonce, &ciphertext]);
++        let mut payload = vec![2];
++        payload.extend_from_slice(&nonce);
++        payload.extend_from_slice(&ciphertext);
++        payload.extend_from_slice(&tag);
++        assert_eq!(payload.len(), 65 + count);
++        assert!(decrypt_to_bytes(&key, &payload).is_err());
++    }
++}

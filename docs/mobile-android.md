@@ -2,7 +2,7 @@
 
 `mobile/android` is the standalone Kotlin/Compose application consuming the
 actual generated Sapflow AAR. Its initial qualified profile is still pending:
-the implementation requests rear-camera 720p at 30 fps, hardware H264
+the implementation requests a 720p camera source at 30 fps (Rear by default), hardware H264
 baseline without B frames, a one-second GOP, and mono 48 kHz AAC-LC at 96 kbit/s.
 The orientation candidate uses upright 720x1280 portrait or 1280x720 landscape
 coded pixels, with a bounded GPU surface transform and no rotation-tag dependency.
@@ -10,15 +10,52 @@ The selected platform encoder names are visible. Unsupported camera timestamp
 sources, surface combinations or hardware profiles produce explicit errors;
 there is no software-video fallback.
 
+The [orientation contract](capture-orientation.md) defines Automatic and fixed
+mounting choices, including the declared natural-landscape reference, immutable
+Prepare boundary and physical gates.
+The [camera contract](native-camera-controls.md) covers initial Front/Rear choice,
+live input replacement within one GL context/encoder/show, capability-bound
+controls and unmirrored transmitted pixels with mirrored front preview. Native
+settings acknowledgement is separate from autofocus/exposure convergence;
+Refresh camera status requests a new observation without continuous polling.
+Physical front/rear geometry, switching and recording acceptance remain open.
+
+## Manual destination profiles
+
+The normal manual controls support explicit save, load and delete for up to 16
+destinations, plus [reviewed version 1 JSON file import](manual-destination-profiles.md).
+The local collection uses a separate Android Keystore key and AES-GCM encrypted
+document in app-private no-backup storage. A missing existing key, damaged file
+or unconfirmed write fails visibly; it does not reset the collection.
+
+Document reading and storage run away from capture callbacks and UI work.
+Import presents a redacted host/port/security review with independent plaintext
+permission before Apply. Applying only fills the manual fields; Save, Prepare
+and Start are separate actions. The original action generation and actual
+capture availability fence stale replies across edits, foreground transitions
+and preparation. V4V configuration and scoped grants are outside this format.
+Physical document-provider and Keystore acceptance remain open.
+
 ## Build
 
-The parent native-package build must first produce
-`target/native-packages/android/sapflow-0.0.0.aar`. The app uses that AAR and
+The parent native-package build must first produce the AAR named for
+`[workspace.package].version`, currently
+`target/native-packages/android/sapflow-0.1.0.aar`. The app derives that filename
+from the workspace manifest and uses that AAR and
 JNA 5.19.1, with metadata checks enabled. Build from the repository root:
 
 ```sh
 mobile/android/build-debug.sh
 ```
+
+The current four-ABI Android SDK refresh passes its extracted AAR-class host
+consumer and actual ELF 16 KiB LOAD-alignment checks for ARM64, ARMv7, x86_64
+and x86. The AAR SHA-256 is
+`a08d2e2a844d4c85bcbf76f6fb8f6b854854fda5bf328abe2bc0b4c918a21066`;
+source-bound package/readback evidence is under
+`target/privacy-standby/recording-lookbehind-native-check/android-v1/readback-v2/`.
+The broadcaster APK remains ARM64-only. This package gate does not qualify a
+phone or native recording recovery.
 
 A development-only device package can be selected with
 `-PsapflowAar=/absolute/path/to/a/real-device-package.aar`. The override must be
@@ -379,13 +416,19 @@ remain open. Recreate closed sink adapters before preparing another session.
 
 ## Interruption and evidence gates
 
-Camera/microphone permissions are requested together before preparation.
-Capture is foreground-only: leaving the Activity, losing its preview surface,
-camera disconnection, microphone silencing, codec/configuration rejection or
-shared-ingress failure stops the session. Resumption requires preparation and an
-explicit start. No foreground service or background-capture claim exists yet.
-Cleanup stops the camera, audio input and codecs, cancels Rust queues, closes
-sinks and immutable handles, and stops owned workers on Activity destruction.
+Camera/microphone permissions are requested according to the selected intent
+before preparation. Leaving the Activity stops video and any audio-only show
+whose Start has not committed. An explicitly opted-in, already committed
+audio-only show can continue through the non-exported microphone foreground
+service while its authorised transport connects or reconnects, after notification
+and microphone authority are rechecked. Losing the video preview surface, camera
+disconnection, microphone silencing, codec/configuration rejection or
+shared-ingress failure stops the exact session. Resumption requires preparation
+and an explicit Start; the service is `START_NOT_STICKY` and reconstructs no show.
+When the exact capture stops, cleanup stops the camera, audio input and codecs,
+cancels Rust queues, closes sinks and immutable handles, and joins its owned
+workers. Activity destruction detaches the UI; only an eligible committed
+audio-only capture remains owned by the application/service.
 
 Unit tests cover independent Annex-B/AVCC fixtures, parameter-set extraction,
 borrowed direct views, buffer reuse, priming/cadence/restart timing, strict
@@ -467,19 +510,22 @@ No additional controls below are implemented or exposed by the current UI.
    fence old callbacks and request an IDR. Preserve the media clock across a
    supported switch; configuration changes instead require a new attempt/file.
    A seamless switch needs physical qualification.
-4. Freeze an audio-only track mode before Prepare. Skip camera/preview/permission,
-   set fanout `hasVideo=false`, remove IDR gating and pass the audio-only track
-   intent into both sinks. The shared recorder and SRT constructor already
-   support optional video; RTMP supports AAC-only wire output. The own-origin
-   HLS ingest currently creates its muxer from video, so end-to-end audio-only
-   requires a separate origin change and receiver proof.
-5. Move capture ownership into a bound foreground service before permitting
-   background/screen-off operation, with optional preview and a notification
-   Stop action. Declare camera/microphone service types and their permissions,
-   start from visible UI after runtime permission, and test privacy toggles,
-   screen-off, service kill and storage finalisation. Current Activity/surface
-   loss intentionally stops capture. Android's while-in-use restrictions remain
-   applicable; no Google runtime is needed.
+4. Audio-only mode now freezes its track intent before Prepare, skips camera,
+   preview and camera permission, sets fanout `hasVideo=false`, and avoids IDR
+   gating in both sinks. Own-origin HLS supports explicitly declared AAC-only
+   topology; native recording and receiver source paths are implemented. Physical
+   microphone, complete-show retention and receiver acceptance remain separate
+   qualification gates; see [audio-only mobile delivery](audio-only-mobile.md).
+5. The first background slice now moves only opted-in committed audio-only capture
+   into an application-owned, non-exported microphone foreground service with an
+   exact notification Stop action. A production-used cold lifecycle driver keeps
+   duplicate commands, promotion failure, retained cleanup, notification teardown
+   and stale successors ordered. An unpromoted service stops promptly while the
+   application retains exact cleanup ownership; a successfully promoted service
+   keeps its notification until closure. Physical privacy-toggle, screen-off, service
+   kill, network-switch and storage-finalisation qualification remains open.
+   Android's while-in-use restrictions remain applicable; no Google runtime is
+   needed.
    [Foreground service types](https://developer.android.com/develop/background-work/services/fgs/service-types),
    [background-start restrictions](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start).
 
@@ -945,11 +991,31 @@ Keystore AES-GCM/AtomicFile journal in no-backup app storage. A missing existing
 key/ciphertext, corruption or failed write blocks the connector and fences its
 publisher. It never resets an existing journal to an empty identity. Exact
 Prepare/Refresh/End/recovery operations and idempotency keys are saved before
-sending; uncertain responses retain that request. End has one reserved control
-admission behind an in-flight request, fences publishing immediately, and retains
-terminal intent before reconciliation. It never implies recording/callback
-completion merely because the local socket closed. Restoring a grant requires a
-fresh acknowledged higher-revision refresh before capture can start.
+sending; uncertain responses retain that request. End now opens an explicit
+confirmation bound to the exact saved session or its pending Prepare, Activity
+and local capture preparation. Cancellation has no capture, publishing, journal
+or End-request effect. A stale dialog cannot affect a successor, including a
+new session for the same event or a newer manual preparation. Confirmation
+claims that owner before any fence; the control actor checks it again before
+saving terminal intent and reconciling the original request. Only the matching
+pending V4V capture preparation is cancelled; an active local recording continues.
+End never implies recording/callback completion merely because the local socket
+closed. Restoring a grant requires a fresh acknowledged higher-revision refresh
+before capture can start.
+
+Debug and Qualification each pass 597 JVM tests in 68 suites, including 22
+confirmation/shutdown tests and the 15 existing session tests. All three app
+configurations build and pass lint with no errors; built APK checks confirm
+SDK byte identity, native and ZIP 16 KiB alignment, notices, manual routing and
+qualification isolation. Release remains unsigned. These are local build and
+host-test results; device confirmation and sustained acceptance remain open.
+Evidence is under `target/v4v-end-shutdown-v2/app-gates/gate-v1/`.
+
+The control actor cancels delayed alarms during shutdown, including an alarm
+scheduled after Close's earlier cancellation. A regression forces that actual
+scheduler race and checks both cancellation and real executor termination.
+The original failing tests are retained; their five-second assertions were
+not increased.
 
 Sign-in uses an installed NIP-55 signer for kind 21236 only. The returned event
 must match every requested field, canonical SHA-256 ID and BIP-340 signature.
@@ -1332,3 +1398,78 @@ single-use daemon terminated; no unrelated daemon was stopped. This packet
 performed no extra signing, install, device, network fixture or native decoder
 execution. Default V4V configuration remains disabled, and native Android
 fragment/codec/cleanup/causal-confirmation acceptance remains open.
+
+### Live readouts and private recording library
+
+The capture screen now displays Capture elapsed, Broadcast elapsed and measured
+Socket outbound. Capture time begins only at committed Start, includes rotation
+and retry gaps, and freezes on Stop/interruption. Destination End freezes its
+broadcast clock while independent recording can continue. Socket accounting is
+local successful write completion, with fresh current-socket rates separated
+from potentially incomplete historical totals. Reconnect backoff, partial
+writes and stale samples never become false zero-throughput measurements.
+The detailed accounting and ownership contract is in the
+[SDK contract](mobile-sdk-contract.md#native-live-telemetry).
+
+Private recordings are grouped by show and ordered segment. Finalised means
+the recorder completed its mux/file lifecycle; incomplete and orphaned files
+remain visibly unverified. Preparing local recording checks catalogue capacity
+and free space off the UI/codec threads for the selected immutable profile.
+The check does not promise a recording duration. Recording is never silently
+disabled because storage is low. Late permissions, grants or storage replies
+cannot restart a cancelled Prepare or choose a different destination.
+
+Export uses the system document picker only when capture is stopped. An
+application-owned single IO slot keeps the exact file selection through
+Activity recreation, revalidates it before opening the document provider, then
+copies bounded chunks and closes actual owners. Cancel or failure keeps the
+private original; a partial provider document may remain. Unverified files
+require explicit confirmation, without repair or automatic completion claims.
+Healthy live ownership and ordinary busy refusals are distinct from uncertain
+cleanup. Unconfirmed actual closure blocks replacement work. The current
+catalogue is bounded to 256 segments; capacity failure preserves files, and
+management/pagination remain follow-on work.
+
+The combined local gate passes 305 JVM tests in 46 suites in each of Debug and
+Qualification, with no failures, errors or skips. All three application
+configurations assemble; qualification isolation and both lint tasks pass.
+These actual Gradle suites include separate production/test Kotlin modules,
+real generated-byte file tests, close/cancel/export ownership, storage
+preflight, stale permission replies and telemetry retry continuity. Earlier
+focused gates are overlapping subsets, not additional unique test totals.
+
+The separate macOS native proof uses only generated H.264/AAC and the actual
+packaged mux/recorder classes. Completed and clean-abort segments independently
+decode, demonstrating that particular accepted prefix. It does not prove
+torn-file repair, complete-show recovery, Android filesystem/SAF behaviour or
+physical playback. This work has not replaced the owner's Pixel app or capture.
+
+## Foreground input routing checkpoint
+
+The normal controls now expose System Default plus a bounded AudioManager input
+inventory of built-in, wired and USB devices. Prepare freezes the selected local
+device ID before permission, storage and destination work. `setPreferredDevice`
+is a request: only the captured AudioRecord's actual `routedDevice`, checked
+after `startRecording` and before the first read is admitted, establishes routing.
+Routing and removal callbacks close the exact epoch's scalar media gate before
+queued cleanup. Cached checks also fence queued PCM before AAC admission.
+Default retains its first verified input across orientation epochs; a change or
+disconnect stops capture without fallback or automatic restart. Device IDs are
+ephemeral and names never authorise routing.
+
+Cold route transitions close PCM admission before querying outside the state
+lock. Existing reader/pump owners can wait on a condition up to 250 ms; current
+success reopens the gate, Stop wakes cleanly and timeout/mismatch remains failed.
+Accepted queued PCM can drain on ordinary Stop; a latched route fault instead
+uses the existing incomplete recording close and cancels rotation. No route
+timer or new thread is created for this transition. The route budget does not
+extend the PCM pool's existing 200 ms maximum age: queued blocks are checked
+after the wait and immediately before codec submission. Stale PCM stops the
+epoch and retains an incomplete recording instead of being queued as fresh.
+
+No route enumeration, timer, additional payload copy or FFI poll was added per
+PCM block. The existing 48 kHz mono path and actual-close barriers remain.
+Bluetooth and other unqualified Default routes are unsupported. Actual
+USB/hot-unplug, locked-screen and sustained routing behaviour remain physical
+B4R gates; the implemented source contract is recorded in the
+[audio-only mobile scope](audio-only-mobile.md#background-ownership-and-controls).

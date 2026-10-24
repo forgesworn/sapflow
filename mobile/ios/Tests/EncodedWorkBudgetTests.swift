@@ -30,4 +30,44 @@ final class EncodedWorkBudgetTests: XCTestCase {
         budget.release(third); budget.release(third)
         XCTAssertEqual(budget.pendingCount, 0)
     }
+    func testReservationFromAnotherOwnerCannotReleaseCapacity() throws {
+        let first = EncodedWorkBudget(bytes: 1, count: 1)
+        let second = EncodedWorkBudget(bytes: 1, count: 1)
+        let a = try XCTUnwrap(first.reserve(bytes: 1))
+        let b = try XCTUnwrap(second.reserve(bytes: 1))
+        first.release(b)
+        XCTAssertEqual(first.pendingCount, 1)
+        XCTAssertNil(first.reserve(bytes: 1))
+        first.release(a); second.release(b)
+        XCTAssertEqual(first.pendingCount, 0)
+        XCTAssertEqual(second.pendingCount, 0)
+    }
+    func testHeldOwnerDrainsAcceptedPrefixBeforeFinishAndRejectsLateWork() throws {
+        let budget = EncodedWorkBudget()
+        let queue = DispatchQueue(label: "test.encoded-held-owner")
+        let finished = expectation(description: "Actual close barrier")
+        var events: [Int] = [] // The exact serial owner reads and writes this.
+        queue.suspend()
+        XCTAssertNotNil(budget.enqueue(bytes: 1, on: queue) { ticket in
+            events.append(1); budget.release(ticket)
+        })
+        XCTAssertTrue(budget.close(enqueueOn: queue) {
+            events.append(2)
+            XCTAssertEqual(budget.pendingCount, 0)
+            XCTAssertEqual(events, [1, 2])
+            finished.fulfill()
+        })
+        XCTAssertNil(budget.enqueue(bytes: 1, on: queue) { _ in XCTFail("Late work ran") })
+        queue.resume()
+        wait(for: [finished], timeout: 2)
+    }
+    func testRepeatedJoinDoesNotQueueANewFaultAfterOrdinaryStop() {
+        let budget = EncodedWorkBudget()
+        let queue = DispatchQueue(label: "test.encoded-close-joins")
+        let finished = expectation(description: "Repeated close joins")
+        XCTAssertTrue(budget.close(enqueueOn: queue) {})
+        XCTAssertFalse(budget.close(enqueueOn: queue, firstOnly: true) { XCTFail("Stop became a fault") })
+        XCTAssertFalse(budget.close(enqueueOn: queue) { finished.fulfill() })
+        wait(for: [finished], timeout: 2)
+    }
 }

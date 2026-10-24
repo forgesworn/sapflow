@@ -109,6 +109,7 @@ async fn connection(app: &Arc<App>, mut sock: TcpStream, from: IpAddr) -> Result
         publication: None,
     };
     let setup_until = Instant::now() + SETUP;
+    let mut protocol_failed = false;
     let result = loop {
         let mut finished = false;
         let mut failed = None;
@@ -133,6 +134,8 @@ async fn connection(app: &Arc<App>, mut sock: TcpStream, from: IpAddr) -> Result
                 }
             }
         }
+        // A failed reply write must not hide an earlier parser rejection.
+        protocol_failed |= matches!(failed, Some(End::Protocol(_)));
         // Replies first (a refusal is sent before closing).
         let out = rtmp.take_output();
         if !out.is_empty()
@@ -166,6 +169,11 @@ async fn connection(app: &Arc<App>, mut sock: TcpStream, from: IpAddr) -> Result
         }
     };
     if let Some(p) = conn.publication.take() {
+        // The strict wire parser can reject media or metadata before a push
+        // reaches ingest. Its already accepted recording prefix is incomplete.
+        if protocol_failed || matches!(result, Err(End::Protocol(_))) {
+            p.loss_notice().mark_incomplete();
+        }
         p.end();
     }
     result
@@ -215,6 +223,16 @@ impl Conn<'_> {
                 }
                 Ok(false)
             }
+            Event::Tracks { tracks } => {
+                if let Some(p) = &mut self.publication {
+                    p.push(|src, now| match src {
+                        Source::Flv(f) => f.declare_tracks(tracks, now),
+                        Source::Ts(_) => Ok(Default::default()),
+                    })
+                    .map_err(|e| End::Protocol(e.to_string()))?;
+                }
+                Ok(false)
+            }
             Event::Video { timestamp, data } => {
                 let Some(p) = &mut self.publication else {
                     return Ok(false);
@@ -228,12 +246,11 @@ impl Conn<'_> {
             }
             Event::Audio { timestamp, data } => {
                 if let Some(p) = &mut self.publication {
-                    let _ = p.push(|src, _| {
-                        if let Source::Flv(f) = src {
-                            f.audio(timestamp, &data);
-                        }
-                        Ok(Default::default())
-                    });
+                    p.push(|src, now| match src {
+                        Source::Flv(f) => f.audio_at(timestamp, &data, now),
+                        Source::Ts(_) => Ok(Default::default()),
+                    })
+                    .map_err(|e| End::Protocol(e.to_string()))?;
                 }
                 Ok(false)
             }
@@ -245,6 +262,112 @@ impl Conn<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sapflow_hls::TrackSet;
+    use sapflow_rtmp::amf0::{self, Value};
+    use sapflow_rtmp::chunk::ChunkWriter;
+    use sapflow_rtmp::client::{Publisher, PublisherConfig, PublisherState};
+
+    #[tokio::test]
+    async fn protocol_rejection_after_accepted_audio_preserves_an_incomplete_prefix() {
+        for ending in ["finished", "partial-topology", "forbidden-video"] {
+            let mut fixture = crate::publish::loss_tests::Fixture::new();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("owned loopback listener");
+            let address = listener.local_addr().expect("owned address");
+            let mut socket = TcpStream::connect(address).await.expect("connect fixture");
+            let (server, peer) = listener.accept().await.expect("accept fixture");
+            drop(listener);
+            let app = fixture.app.clone();
+            let server = tokio::spawn(async move { connection(&app, server, peer.ip()).await });
+            let mut publisher = Publisher::new(
+                PublisherConfig::new(
+                    "live".into(),
+                    "event-a".into(),
+                    "rtmp://localhost/live".into(),
+                ),
+                1,
+                0,
+            )
+            .expect("bounded publisher");
+            publisher
+                .declare_tracks(TrackSet::AudioOnly)
+                .expect("AAC topology");
+            let started = Instant::now();
+            let mut bytes = [0; 16 * 1024];
+            while publisher.state() != PublisherState::Publishing {
+                socket
+                    .write_all(&publisher.take_output())
+                    .await
+                    .expect("setup write");
+                let count = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut bytes))
+                    .await
+                    .expect("bounded setup read")
+                    .expect("setup read");
+                assert!(count > 0);
+                publisher
+                    .feed(&bytes[..count], started.elapsed().as_millis() as u64)
+                    .expect("actual production handshake");
+            }
+            publisher
+                .send_aac_config(&[0x11, 0x88])
+                .expect("48 kHz mono ASC");
+            for frame in 0..120u32 {
+                // Original placeholders check recording status, not AAC decode.
+                publisher
+                    .send_aac(
+                        (u64::from(frame) * 1024 * 1000 / 48_000) as u32,
+                        &[0x5a; 64],
+                    )
+                    .expect("bounded AAC frame");
+            }
+            socket
+                .write_all(&publisher.take_output())
+                .await
+                .expect("accepted audio write");
+            match ending {
+                "finished" => {
+                    publisher.finish().expect("normal finish");
+                    socket
+                        .write_all(&publisher.take_output())
+                        .await
+                        .expect("finish write");
+                }
+                _ => {
+                    let mut bad = Vec::new();
+                    let (kind, body) = if ending == "forbidden-video" {
+                        (9, vec![0x17, 1, 0, 0, 0])
+                    } else {
+                        let mut body = Vec::new();
+                        amf0::encode(&Value::String("onMetaData".into()), &mut body);
+                        amf0::encode(
+                            &Value::Object(vec![("hasAudio".into(), Value::Boolean(true))]),
+                            &mut body,
+                        );
+                        (18, body)
+                    };
+                    assert!(body.len() < 128);
+                    ChunkWriter::default().write(&mut bad, 19, kind, 1, 3000, &body);
+                    socket
+                        .write_all(&bad)
+                        .await
+                        .expect("strict parser rejection input");
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .expect("bounded connection exit")
+                .expect("connection task");
+            if ending == "finished" {
+                assert!(result.is_ok());
+                fixture.completion("finalised").await;
+            } else {
+                assert!(matches!(result, Err(End::Protocol(_))));
+                fixture.completion("incomplete").await;
+                assert_eq!(fixture.scope.observations.counts().recordings_finalised, 0);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn a_panicking_connection_frees_its_slot() {

@@ -28,9 +28,9 @@ Publish in dependency order. Each internal `path` dependency needs a
 | Order | Crate | Publish? | Notes |
 |-------|-------|----------|-------|
 | 1 | `sapflow-srt` | yes | No internal dependencies. The crate with the clearest audience: pure-Rust SRT with no libsrt |
-| 2 | `sapflow-core` | yes | Needed by the server |
-| 3 | `sapflow-hls` | yes | FLV and MPEG-TS ingest and LL-HLS packaging |
-| 3a | `sapflow-rtmp` | yes | RTMP publishing, server side and client. Its dev-dependency on `sapflow-hls` (one integration test) is path-only, so `cargo publish` drops it |
+| 2 | `sapflow-core` | yes | Shared track declarations needed by HLS and RTMP, plus server types |
+| 3 | `sapflow-hls` | yes | FLV and MPEG-TS ingest and LL-HLS packaging; normal dependency on `sapflow-core` |
+| 3a | `sapflow-rtmp` | yes | RTMP publishing, server side and client; normal dependency on `sapflow-core`. Its dev-dependency on `sapflow-hls` (one integration test) is path-only, so `cargo publish` drops it |
 | 4 | `sapflow-client` | later | Depends on `sapflow-srt`; its API is still moving with the mobile work |
 | 5 | `sapflow-ffi` | no | A Swift/Kotlin binding, shipped as native packages, not as a Rust library |
 | 6 | `sapflow` | yes | The server; the package was renamed from `sapflow-server` (its directory keeps the old name) so `cargo install sapflow` gives the `sapflow` binary |

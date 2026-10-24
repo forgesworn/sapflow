@@ -14,11 +14,35 @@ pub mod fmp4;
 pub mod ingest;
 pub mod muxer;
 pub mod playlist;
+pub mod recording_checkpoint;
+pub mod recording_programme;
+pub mod recording_programme_checkpoint;
+pub mod recording_timing;
 pub mod time;
+pub mod tracks;
 
 pub use flv::FlvIngest;
 pub use ingest::{EsIngest, IngestError, TsIngest};
 pub use muxer::{Muxer, MuxerConfig, PartLookup, Readiness, Update};
+pub use tracks::TrackSet;
+
+#[cfg(test)]
+mod audio_only_tests;
+
+#[cfg(test)]
+mod terminal_ts_tests;
+
+#[cfg(test)]
+mod recording_timing_tests;
+
+#[cfg(test)]
+mod recording_checkpoint_tests;
+
+#[cfg(test)]
+mod recording_programme_tests;
+
+#[cfg(test)]
+mod recording_programme_checkpoint_tests;
 
 /// `EXT-X-TARGETDURATION`, fixed for the life of a stream.
 ///

@@ -5,6 +5,7 @@
 
 use std::time::SystemTime;
 
+use crate::TrackSet;
 use crate::codec::{self, AacConfig};
 use crate::ingest::{EsIngest, IngestError};
 use crate::muxer::{Muxer, MuxerConfig, Update};
@@ -19,11 +20,15 @@ pub struct FlvIngest {
     last_ms: Option<u32>,
     /// Milliseconds on a 64-bit timeline (RTMP timestamps wrap at 2^32).
     base: i64,
+    /// Whether all accepted raw ASC headers can safely describe 1024-sample
+    /// AAC-only frames. A late declaration cannot erase unsupported flags.
+    audio_only_asc_compatible: Option<bool>,
 }
 
 impl FlvIngest {
-    /// An ingest with no muxer yet: the first keyframe, once its parameter sets
-    /// are known, creates one from `cfg`. No audio is expected until
+    /// An ingest with no muxer yet: normally the first keyframe, once its
+    /// parameter sets are known, creates one from `cfg`. Explicit audio-only
+    /// declarations instead initialize on their first AAC frame. No audio is expected until
     /// [`FlvIngest::expect_audio`] or an AAC sequence header says there is
     /// some.
     pub fn new(cfg: MuxerConfig) -> Self {
@@ -37,10 +42,12 @@ impl FlvIngest {
             nal_length_size: 4,
             last_ms: None,
             base: 0,
+            audio_only_asc_compatible: None,
         }
     }
 
-    /// The muxer, once a keyframe has started one.
+    /// The muxer, once a keyframe or explicitly declared audio-only frame has
+    /// started one.
     pub fn muxer(&self) -> Option<&Muxer> {
         self.es.muxer()
     }
@@ -57,7 +64,7 @@ impl FlvIngest {
         ingest
     }
 
-    /// The muxer, mutably, once a keyframe has started one.
+    /// Mutable access to the muxer after the first supported media starts it.
     pub fn muxer_mut(&mut self) -> Option<&mut Muxer> {
         self.es.muxer_mut()
     }
@@ -74,6 +81,20 @@ impl FlvIngest {
         self.es.set_expect_audio(expect);
     }
 
+    /// Accepts the publisher's explicit immutable topology. Audio-only is never
+    /// inferred from early AAC; declaring it also checks previously seen AAC
+    /// headers for the supported canonical 1024-sample AAC-LC profile.
+    pub fn declare_tracks(
+        &mut self,
+        tracks: TrackSet,
+        now: SystemTime,
+    ) -> Result<Update, IngestError> {
+        if tracks == TrackSet::AudioOnly && self.audio_only_asc_compatible == Some(false) {
+            return Err(IngestError::InvalidAudio);
+        }
+        self.es.declare_tracks(tracks, now)
+    }
+
     fn timeline(&mut self, ms: u32) -> i64 {
         if let Some(last) = self.last_ms
             && ms < last
@@ -87,6 +108,9 @@ impl FlvIngest {
 
     /// A video tag body. Only AVC is accepted.
     pub fn video(&mut self, ms: u32, tag: &[u8], now: SystemTime) -> Result<Update, IngestError> {
+        if self.es.declared_tracks() == Some(TrackSet::AudioOnly) {
+            return Err(IngestError::TrackConflict);
+        }
         let [head, packet_type, c0, c1, c2, body @ ..] = tag else {
             return Ok(Update::default());
         };
@@ -113,7 +137,55 @@ impl FlvIngest {
         }
     }
 
-    /// An audio tag body. Only AAC is used; anything else is ignored.
+    /// AAC media with explicit caller wall time and playlist/recording updates.
+    pub fn audio_at(
+        &mut self,
+        ms: u32,
+        tag: &[u8],
+        now: SystemTime,
+    ) -> Result<Update, IngestError> {
+        if self.es.declared_tracks() == Some(TrackSet::VideoOnly) {
+            return Err(IngestError::TrackConflict);
+        }
+        let [head, packet_type, body @ ..] = tag else {
+            return Ok(Update::default());
+        };
+        if head >> 4 != SOUND_AAC {
+            return Ok(Update::default());
+        }
+        match packet_type {
+            0 => {
+                if let Some(config) = AacConfig::from_audio_specific_config(body) {
+                    let compatible = self.audio_only_header_compatible(config, body);
+                    if self.es.declared_tracks() == Some(TrackSet::AudioOnly) && !compatible {
+                        return Err(IngestError::InvalidAudio);
+                    }
+                    let update = self.es.audio_at(0, config, &[], now)?;
+                    self.audio_only_asc_compatible = Some(compatible);
+                    self.es.set_expect_audio(true);
+                    Ok(update)
+                } else {
+                    Err(IngestError::InvalidAudio)
+                }
+            }
+            1 => {
+                let t = self
+                    .timeline(ms)
+                    .checked_mul(90)
+                    .ok_or(IngestError::InvalidTimestamp)?;
+                if let Some(config) = self.audio_config() {
+                    self.es.audio_at(t, config, body, now)
+                } else {
+                    Ok(Update::default())
+                }
+            }
+            _ => Ok(Update::default()),
+        }
+    }
+
+    /// Legacy video-led audio entry point. New consumers use `audio_at` to
+    /// receive audio-only updates and supply the run's wall-clock association.
+    /// Only AAC is used; anything else is ignored.
     pub fn audio(&mut self, ms: u32, tag: &[u8]) {
         let [head, packet_type, body @ ..] = tag else {
             return;
@@ -124,6 +196,8 @@ impl FlvIngest {
         match packet_type {
             0 => {
                 if let Some(c) = AacConfig::from_audio_specific_config(body) {
+                    self.audio_only_asc_compatible =
+                        Some(self.audio_only_header_compatible(c, body));
                     self.es.audio_config(c);
                     self.es.set_expect_audio(true);
                 }
@@ -136,6 +210,15 @@ impl FlvIngest {
             }
             _ => {}
         }
+    }
+
+    fn audio_only_header_compatible(&self, config: AacConfig, bytes: &[u8]) -> bool {
+        self.audio_only_asc_compatible != Some(false)
+            && config.object_type == 2
+            && (1..=2).contains(&config.channels)
+            && config.sample_rate <= u32::from(u16::MAX)
+            && bytes == config.audio_specific_config()
+            && self.es.known_audio().is_none_or(|old| old == config)
     }
 
     fn audio_config(&self) -> Option<AacConfig> {
@@ -256,7 +339,10 @@ mod tests {
                     muxer.audio().expect("valid RTMP epoch fixture").sample_rate,
                     48_000
                 );
-                assert_eq!(muxer.video().width, if epoch == 1 { 1280 } else { 720 });
+                assert_eq!(
+                    muxer.video().expect("video").width,
+                    if epoch == 1 { 1280 } else { 720 }
+                );
                 assert!(
                     muxer
                         .open_parts()
@@ -288,7 +374,13 @@ mod tests {
         }
         let m = ing.muxer().expect("muxer");
         assert!(m.has_content());
-        assert_eq!((m.video().width, m.video().height), (320, 180));
+        assert_eq!(
+            (
+                m.video().expect("video").width,
+                m.video().expect("video").height
+            ),
+            (320, 180)
+        );
         assert_eq!(m.audio().map(|a| a.sample_rate), Some(48000));
         let seg = m.segment(LEADING_GAPS).expect("segment");
         assert_eq!(seg.duration.as_millis(), 1000);

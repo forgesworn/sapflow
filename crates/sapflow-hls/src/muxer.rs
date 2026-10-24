@@ -1,7 +1,7 @@
 //! The LL-HLS segmenter: samples in, parts and segments out.
 //!
-//! Follows gohlslib v2.4.0 (`muxer_segmenter.go`, `muxer_stream.go`) where
-//! it keeps Apple's rules: video leads, segments are cut on a keyframe once
+//! For video-led streams, follows gohlslib v2.4.0 (`muxer_segmenter.go`,
+//! `muxer_stream.go`) where it keeps Apple's rules: segments are cut on a keyframe once
 //! the minimum duration has passed, parts are cut on the video timeline.
 //! Each sample is held until the next one on its track arrives, which gives
 //! its duration. Unlike gohlslib, `PART-TARGET` is fixed once the first
@@ -12,6 +12,9 @@
 //! (a break): video waits for the next keyframe, output timestamps are
 //! rebased so they carry on where the last segment ended, and the next
 //! segment is marked as a discontinuity.
+//!
+//! Explicit AAC-only streams instead use complete 1024-sample frames to cut
+//! independent parts and segments on a rational audio sample clock.
 //!
 //! No I/O and no clock: the caller passes the wall-clock time for
 //! `EXT-X-PROGRAM-DATE-TIME`.
@@ -25,7 +28,7 @@ use bytes::{Bytes, BytesMut};
 use crate::codec::{AacConfig, H264Config};
 use crate::fmp4::{self, AUDIO_TRACK, Sample, TrackRun, VIDEO_TIMESCALE, VIDEO_TRACK};
 use crate::time::{duration_to_ticks, ticks_to_duration};
-use crate::{PartTiming, TargetDuration};
+use crate::{PartTiming, TargetDuration, TrackSet};
 
 /// fMP4 decode times must not be negative. gohlslib shifts everything by
 /// 10 s (`fmp4StartDTS`) because its timeline can start before the first
@@ -57,8 +60,8 @@ const AAC_FRAME: i64 = 1024;
 /// Settings for a [`Muxer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxerConfig {
-    /// A segment is cut at the first keyframe after it has lasted this long.
-    /// Default 1 s.
+    /// A segment is cut at the first keyframe after it has lasted this long,
+    /// or at a complete AAC frame boundary for audio-only. Default 1 s.
     pub segment_min: Duration,
     /// The shortest nominal part, from which `PART-TARGET` is derived (see
     /// [`PartTiming`]). Default 200 ms.
@@ -102,7 +105,8 @@ pub struct Part {
     /// which case it includes the gap that left before the next frame. The
     /// spans of a segment's parts add up to the segment's duration.
     pub span: Duration,
-    /// Whether the part holds a keyframe (`INDEPENDENT=YES`).
+    /// Whether the part can be decoded independently (`INDEPENDENT=YES`): a
+    /// video keyframe or complete audio-only AAC frames.
     pub independent: bool,
     /// The part's `moof` + `mdat` fragment.
     pub data: Bytes,
@@ -163,12 +167,16 @@ pub struct Update {
     /// A reconnected encoder starts a new initialization/recording epoch.
     /// The presentation's numbering, timing targets and retained media persist.
     pub restarted: bool,
+    /// Definite input continuity failure within a run. Intentional detach or
+    /// codec-epoch replacement is not loss; a file containing a failed run
+    /// must not later be presented as a complete recording.
+    pub media_loss: bool,
 }
 
 impl Update {
     /// Whether anything changed.
     pub fn any(self) -> bool {
-        self.part || self.segment || self.restarted
+        self.part || self.segment || self.restarted || self.media_loss
     }
 
     /// Folds `other` in: each flag is set if it is set in either.
@@ -176,6 +184,7 @@ impl Update {
         self.part |= other.part;
         self.segment |= other.segment;
         self.restarted |= other.restarted;
+        self.media_loss |= other.media_loss;
     }
 }
 
@@ -209,6 +218,12 @@ pub enum MuxError {
     /// The open segment passed 64 MiB: no keyframe in time, or a hostile
     /// stream.
     SegmentTooLarge,
+    /// The requested topology has no supported media tracks.
+    InvalidTracks,
+    /// The AAC configuration or resulting part timing is unsupported.
+    InvalidAudio,
+    /// An AAC timestamp or decode-time calculation is outside its valid range.
+    Timestamp,
 }
 
 #[derive(Debug)]
@@ -270,13 +285,26 @@ impl OpenPart {
     }
 }
 
-/// The segmenter for one stream: video and audio samples in, parts and segments
-/// out, with a window of recent ones kept for playlists and HTTP.
+/// Audio decode time is an exact count of 1024-sample AAC-LC frames. Input
+/// timestamps only detect a break; rounding a 90 kHz timestamp on every frame
+/// must not accumulate drift at 44.1 kHz.
+#[derive(Debug)]
+struct AudioRun {
+    input_origin: i64,
+    frames: i64,
+    next_sample: i64,
+}
+
+/// The segmenter for one stream: media samples in, parts and segments out, with
+/// a bounded recent window retained for playlists and HTTP. Audio-only requires
+/// the explicit checked [`Muxer::audio_only`] constructor.
 #[derive(Debug)]
 pub struct Muxer {
     cfg: MuxerConfig,
-    video: H264Config,
+    video: Option<H264Config>,
     audio: Option<AacConfig>,
+    audio_run: Option<AudioRun>,
+    audio_end: Option<i64>,
     init: Arc<Initialization>,
     epoch_first_part_id: u64,
 
@@ -319,6 +347,35 @@ impl Muxer {
     /// [`LEADING_GAPS`].
     pub fn new(cfg: MuxerConfig, video: H264Config, audio: Option<AacConfig>) -> Self {
         let init = fmp4::init_segment(&video, audio.as_ref());
+        Self::with_tracks(cfg, Some(video), audio, init)
+    }
+
+    /// An explicit AAC-only declaration is required at ingest; an AAC sequence
+    /// header alone must not turn an ordinary video publication into radio.
+    pub fn audio_only(cfg: MuxerConfig, audio: AacConfig) -> Result<Self, MuxError> {
+        Self::validate_audio(audio)?;
+        let init = fmp4::init_segment_for_tracks(None, Some(&audio), Duration::ZERO)
+            .ok_or(MuxError::InvalidTracks)?;
+        Ok(Self::with_tracks(cfg, None, Some(audio), init))
+    }
+
+    fn validate_audio(audio: AacConfig) -> Result<(), MuxError> {
+        if audio.object_type != 2
+            || !(1..=2).contains(&audio.channels)
+            || audio.sample_rate > u32::from(u16::MAX)
+            || AacConfig::from_audio_specific_config(&audio.audio_specific_config()) != Some(audio)
+        {
+            return Err(MuxError::InvalidAudio);
+        }
+        Ok(())
+    }
+
+    fn with_tracks(
+        cfg: MuxerConfig,
+        video: Option<H264Config>,
+        audio: Option<AacConfig>,
+        init: Bytes,
+    ) -> Self {
         Self {
             cfg: MuxerConfig {
                 segment_count: cfg.segment_count.max(LEADING_GAPS as usize),
@@ -326,6 +383,8 @@ impl Muxer {
             },
             video,
             audio,
+            audio_run: None,
+            audio_end: None,
             init: Arc::new(Initialization { id: 0, data: init }),
             epoch_first_part_id: 0,
             pending_video: None,
@@ -348,9 +407,20 @@ impl Muxer {
         }
     }
 
-    /// The video track's configuration in the current codec epoch.
-    pub fn video(&self) -> &H264Config {
-        &self.video
+    /// The current video configuration, or `None` for an audio-only epoch.
+    pub fn video(&self) -> Option<&H264Config> {
+        self.video.as_ref()
+    }
+
+    /// The non-empty track topology represented by the current initialization.
+    pub fn tracks(&self) -> TrackSet {
+        if self.video.is_none() {
+            TrackSet::AudioOnly
+        } else if self.audio.is_some() {
+            TrackSet::AudioVideo
+        } else {
+            TrackSet::VideoOnly
+        }
     }
 
     /// The audio track's configuration in the current codec epoch, or `None`
@@ -368,15 +438,55 @@ impl Muxer {
     /// decode-time identities. Old initializations live only while referenced
     /// by the bounded segment/part window (or an in-flight response).
     pub fn reconfigure(&mut self, video: H264Config, audio: Option<AacConfig>, now: SystemTime) {
-        self.interrupt(now);
+        // Existing H.264 constructor semantics remain unchanged.
+        let init = fmp4::init_segment(&video, audio.as_ref());
+        self.replace_tracks(Some(video), audio, init, now);
+    }
+
+    /// Replaces topology at a connection boundary, preserving playlist and
+    /// decode-time identities while sealing accepted media under its old init.
+    /// Audio-only configuration and part timing are checked before mutation;
+    /// neither track may be absent simultaneously. Forward the returned update
+    /// so recorders consume the sealed old parts before a new codec epoch.
+    pub fn reconfigure_tracks(
+        &mut self,
+        video: Option<H264Config>,
+        audio: Option<AacConfig>,
+        now: SystemTime,
+    ) -> Result<Update, MuxError> {
+        if video.is_none() {
+            let audio = audio.ok_or(MuxError::InvalidTracks)?;
+            Self::validate_audio(audio)?;
+            self.check_audio_part_timing(audio)?;
+        }
+        let init = if let Some(video) = &video {
+            fmp4::init_segment(video, audio.as_ref())
+        } else {
+            fmp4::init_segment_for_tracks(None, audio.as_ref(), Duration::ZERO)
+                .ok_or(MuxError::InvalidTracks)?
+        };
+        Ok(self.replace_tracks(video, audio, init, now))
+    }
+
+    fn replace_tracks(
+        &mut self,
+        video: Option<H264Config>,
+        audio: Option<AacConfig>,
+        data: Bytes,
+        now: SystemTime,
+    ) -> Update {
+        let update = self.interrupt(now);
         self.pending_audio = None;
+        self.audio_run = None;
+        self.audio_end = None;
         self.epoch_first_part_id = self.next_part_id;
         self.init = Arc::new(Initialization {
             id: self.init.id.checked_add(1).expect("codec epoch exhausted"),
-            data: fmp4::init_segment(&video, audio.as_ref()),
+            data,
         });
         self.video = video;
         self.audio = audio;
+        update
     }
 
     /// The id of the first part cut under the current init segment (zero until
@@ -412,6 +522,9 @@ impl Muxer {
         data: Bytes,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        if self.video.is_none() {
+            return Err(MuxError::InvalidTracks);
+        }
         if self.pending_video.is_none() && self.next_segment.is_none() && !sync {
             return Ok(Update::default());
         }
@@ -561,7 +674,22 @@ impl Muxer {
     /// dropped, its duration unknown): whatever video arrives next, from
     /// any clock, waits for a keyframe, is moved to carry straight on in
     /// output time, and opens a segment marked as a discontinuity.
+    /// Audio-only seals every accepted complete AAC frame, whose duration is
+    /// known, then rebases the next run after a discontinuity.
     pub fn interrupt(&mut self, now: SystemTime) -> Update {
+        if self.video.is_none() {
+            self.audio_run = None;
+            let Some(end) = self.audio_end.take() else {
+                return Update::default();
+            };
+            let closed = self.close_run(end, now);
+            self.rebase_to = Some(end);
+            return Update {
+                part: closed,
+                segment: closed,
+                ..Update::default()
+            };
+        }
         let Some(cur) = self.pending_video.take() else {
             return Update::default();
         };
@@ -584,7 +712,11 @@ impl Muxer {
     /// and marks the next segment as a discontinuity. Returns whether a
     /// segment was closed.
     fn close_run(&mut self, end: i64, now: SystemTime) -> bool {
-        if self.part.as_ref().is_some_and(|p| !p.video.is_empty()) {
+        if self
+            .part
+            .as_ref()
+            .is_some_and(|p| !p.video.is_empty() || (self.video.is_none() && !p.audio.is_empty()))
+        {
             self.rotate_part(end, end);
         }
         // An open part with no video (audio alone) is dropped.
@@ -680,8 +812,156 @@ impl Muxer {
         false
     }
 
+    fn check_audio_part_timing(&self, audio: AacConfig) -> Result<PartTiming, MuxError> {
+        let rate = i64::from(audio.sample_rate);
+        let frame = (AAC_FRAME * i64::from(VIDEO_TIMESCALE) + rate - 1) / rate;
+        let timing = self
+            .timing
+            .unwrap_or_else(|| PartTiming::new(self.cfg.part_min, &[frame as u32]));
+        // AAC frames cannot be split or shortened to fit an inherited target.
+        let frame_ticks = i128::from(AAC_FRAME) * i128::from(VIDEO_TIMESCALE);
+        let count = (i128::from(timing.cut) * i128::from(rate) + frame_ticks - 1) / frame_ticks;
+        let end = (count * frame_ticks + i128::from(rate) - 1) / i128::from(rate);
+        if end + 1 > i128::from(timing.target) {
+            return Err(MuxError::InvalidAudio);
+        }
+        Ok(timing)
+    }
+
+    /// Explicit audio-only mode. Each accepted AAC-LC frame contributes exactly
+    /// 1024 sample ticks; no rounded per-frame 90 kHz increment is accumulated.
+    /// The wall clock is supplied only for run anchoring, as on the video path.
+    pub fn push_audio_at(
+        &mut self,
+        pts: i64,
+        data: Bytes,
+        now: SystemTime,
+    ) -> Result<Update, MuxError> {
+        if self.video.is_some() {
+            self.push_audio(pts, data);
+            return Ok(Update::default());
+        }
+        let audio = self.audio.ok_or(MuxError::InvalidTracks)?;
+        Self::validate_audio(audio)?;
+        if pts < 0 || data.is_empty() {
+            return Err(MuxError::Timestamp);
+        }
+        let rate = i64::from(audio.sample_rate);
+        let timing = self.check_audio_part_timing(audio)?;
+        let mut update = Update::default();
+        if let Some(run) = &self.audio_run {
+            let expected = i128::from(run.input_origin)
+                + i128::from(run.frames) * i128::from(AAC_FRAME) * i128::from(VIDEO_TIMESCALE)
+                    / i128::from(rate);
+            // TS tick rounding and RTMP's millisecond timestamps are tolerated;
+            // missing/repeated AAC frames start a discontinuous new run.
+            if (i128::from(pts) - expected).abs() > 180 {
+                update.merge(self.interrupt(now));
+                update.media_loss = true;
+            }
+        }
+        if self.audio_run.is_none() {
+            let at = self
+                .rebase_to
+                .take()
+                .unwrap_or(pts.checked_add(self.offset).ok_or(MuxError::Timestamp)?);
+            if at < 0 {
+                return Err(MuxError::Timestamp);
+            }
+            let next_sample = i64::try_from(
+                (i128::from(at) * i128::from(rate) + i128::from(VIDEO_TIMESCALE) - 1)
+                    / i128::from(VIDEO_TIMESCALE),
+            )
+            .map_err(|_| MuxError::Timestamp)?;
+            self.audio_run = Some(AudioRun {
+                input_origin: pts,
+                frames: 0,
+                next_sample,
+            });
+        }
+        let run = self.audio_run.as_ref().ok_or(MuxError::Timestamp)?;
+        let sample = run.next_sample;
+        let next_sample = sample.checked_add(AAC_FRAME).ok_or(MuxError::Timestamp)?;
+        let frames = run.frames.checked_add(1).ok_or(MuxError::Timestamp)?;
+        let ticks = |n: i64| -> Result<i64, MuxError> {
+            i64::try_from(i128::from(n) * i128::from(VIDEO_TIMESCALE) / i128::from(rate))
+                .map_err(|_| MuxError::Timestamp)
+        };
+        let at = ticks(sample)?;
+        let end = ticks(next_sample)?;
+        if sample < 0 {
+            return Err(MuxError::Timestamp);
+        }
+        if self.next_segment.is_none() {
+            let id = if self.entries.is_empty() {
+                LEADING_GAPS
+            } else {
+                self.next_segment_id()
+            };
+            let start = match self.entries.back() {
+                Some(Entry::Segment(previous)) => now.max(previous.start + previous.duration),
+                _ => now,
+            };
+            self.next_segment = Some(OpenSegment {
+                initialization: self.init.clone(),
+                id,
+                start_dts: at,
+                start,
+                wall_origin: (at, start),
+                parts: Vec::new(),
+                bytes: 0,
+                discontinuity: std::mem::take(&mut self.discontinuity_next),
+            });
+        }
+        if self.part.is_none() {
+            self.part = Some(OpenPart::new(self.next_part_id, at));
+        }
+        let seg = self.next_segment.as_mut().ok_or(MuxError::Timestamp)?;
+        let bytes = seg
+            .bytes
+            .checked_add(data.len())
+            .ok_or(MuxError::SegmentTooLarge)?;
+        if bytes > MAX_SEGMENT_BYTES {
+            return Err(MuxError::SegmentTooLarge);
+        }
+        let part = self.part.as_mut().ok_or(MuxError::Timestamp)?;
+        if end - part.start_dts > timing.target {
+            return Err(MuxError::InvalidAudio);
+        }
+        seg.bytes = bytes;
+        part.independent = true;
+        part.audio_times.push((at, sample as u64));
+        part.audio.push(Sample {
+            duration: AAC_FRAME as u32,
+            cts: 0,
+            sync: true,
+            data,
+        });
+        self.timing = Some(timing);
+        self.audio_end = Some(end);
+        let run = self.audio_run.as_mut().ok_or(MuxError::Timestamp)?;
+        run.next_sample = next_sample;
+        run.frames = frames;
+        let end_segment =
+            ticks_to_duration(end - seg.start_dts, VIDEO_TIMESCALE) >= self.cfg.segment_min;
+        if end_segment || end - part.start_dts >= timing.cut {
+            self.rotate_part(end, end);
+            update.part = true;
+        }
+        if end_segment {
+            self.rotate_segment(end, now, true);
+            update.segment = true;
+        }
+        Ok(update)
+    }
+
     /// Feeds one AAC frame. `pts` is 90 kHz on the same timeline as video.
     pub fn push_audio(&mut self, pts: i64, data: Bytes) {
+        // This compatibility path needs video to supply cuts and wall time.
+        // Audio-only callers must use the checked, updating `push_audio_at`.
+        if self.video.is_none() {
+            return;
+        }
         let Some(audio) = self.audio else { return };
         if pts < 0 {
             return;

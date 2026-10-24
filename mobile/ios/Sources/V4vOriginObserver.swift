@@ -7,6 +7,7 @@ struct OriginStatusSnapshot {
 
 protocol OriginSessionStatusFetching: AnyObject {
     var cleanupComplete: Bool { get }
+    func whenCleanupComplete(_ completion: @escaping () -> Void)
     func fresh(_ attempt: V4vObservedAttempt, completion: @escaping (Result<OriginStatusSnapshot, OriginObservationFailure>) -> Void)
     func close()
 }
@@ -24,15 +25,20 @@ extension V4vControlClient: OriginStatusControlExecuting {}
 final class V4vOriginStatusHTTP: OriginSessionStatusFetching, @unchecked Sendable {
     private let engine: V4vSessionEngine
     private let client: OriginStatusControlExecuting
+    private let cleanup: OriginCleanupNotification
     private let owner: DispatchQueue
     private let clock: () -> V4vClock
     private let lock = NSLock()
     private var busy = false, closed = false
     init(profile: V4vConnectorProfile, engine: V4vSessionEngine, owner: DispatchQueue, clock: @escaping () -> V4vClock,
-         client: OriginStatusControlExecuting? = nil) {
-        self.engine = engine; self.owner = owner; self.clock = clock; self.client = client ?? V4vControlClient(profile: profile)
+         makeClient: ((@escaping () -> Void) -> OriginStatusControlExecuting)? = nil) throws {
+        try engine.requireProfile(profile)
+        let cleanup = OriginCleanupNotification(); self.cleanup = cleanup
+        self.engine = engine; self.owner = owner; self.clock = clock
+        client = makeClient?({ cleanup.complete() }) ?? V4vControlClient(profile: profile, onClosed: { cleanup.complete() })
     }
     var cleanupComplete: Bool { client.cleanupComplete }
+    func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
     func fresh(_ attempt: V4vObservedAttempt, completion: @escaping (Result<OriginStatusSnapshot, OriginObservationFailure>) -> Void) {
         lock.lock()
         guard !closed, !busy else { let error: OriginObservationFailure = closed ? .cancelled : .busy; lock.unlock(); completion(.failure(error)); return }
@@ -87,25 +93,37 @@ final class V4vOriginObserver: @unchecked Sendable {
     private let decoder: OriginMediaDecoding
     private let clock: () -> V4vClock
     private let confirm: (OriginAttemptIdentity, UInt64) throws -> Void
-    private let queue = DispatchQueue(label: "sapflow.origin.observer")
+    private let queue: DispatchQueue
     private let lock = NSLock()
     private var used = false, closed = false
     private var phase = 0
     private var deadlineNs: UInt64 = 0
     private var authorityDeadlineNs: UInt64 = UInt64.max
     private var timer: DispatchSourceTimer?
+    private var cleanupTimer: DispatchSourceTimer?
+    private let cleanup = OriginCleanupNotification()
+    private var outcome: Result<OriginDecodedMedia, OriginObservationFailure>?
     private var completion: ((Result<OriginDecodedMedia, OriginObservationFailure>) -> Void)?
     private var selection: OriginMediaSelection?
     private var beforeRequests = 0
     var cleanupComplete: Bool { status.cleanupComplete && media.cleanupComplete && decoder.cleanupComplete }
 
     init(attempt: V4vObservedAttempt, profile: V4vConnectorProfile, gate: OriginConfirmationGate,
-         status: OriginSessionStatusFetching, media: OriginMediaFetching = OriginMediaHTTP(), decoder: OriginMediaDecoding = OriginMediaDecoder(),
+         status: OriginSessionStatusFetching, media: OriginMediaFetching? = nil, decoder: OriginMediaDecoding? = nil,
+         owner: DispatchQueue = DispatchQueue(label: "sapflow.origin.observer"),
          clock: @escaping () -> V4vClock, confirm: @escaping (OriginAttemptIdentity, UInt64) throws -> Void) {
-        self.attempt = attempt; self.profile = profile; self.gate = gate; self.status = status; self.media = media; self.decoder = decoder
-        self.clock = clock; self.confirm = confirm
+        self.attempt = attempt; self.profile = profile; self.gate = gate; self.status = status
+        self.media = media ?? OriginMediaHTTP(now: { clock().monotonicNs })
+        self.decoder = decoder ?? OriginMediaDecoder(now: { clock().monotonicNs })
+        queue = owner; self.clock = clock; self.confirm = confirm
+        let changed = { [weak self] in
+            guard let self else { return }
+            self.queue.async { [weak self] in self?.cleanupChanged() }
+        }
+        status.whenCleanupComplete(changed); self.media.whenCleanupComplete(changed); self.decoder.whenCleanupComplete(changed)
     }
-    func start(completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
+    func whenCleanupComplete(_ completion: @escaping () -> Void) { cleanup.observe(completion) }
+    func start(deadlineNs originalDeadlineNs: UInt64? = nil, completion: @escaping (Result<OriginDecodedMedia, OriginObservationFailure>) -> Void) {
         lock.lock()
         guard !closed, !used else { let error: OriginObservationFailure = closed ? .cancelled : .busy; lock.unlock(); completion(.failure(error)); return }
         used = true; lock.unlock()
@@ -113,9 +131,10 @@ final class V4vOriginObserver: @unchecked Sendable {
             self.completion = completion
             let now = clock().monotonicNs
             guard now <= UInt64.max - 8_000_000_000 else { finish(.failure(.deadline)); return }
-            deadlineNs = now + 8_000_000_000
+            deadlineNs = originalDeadlineNs ?? now + 8_000_000_000
+            guard deadlineNs > now, deadlineNs - now <= 8_000_000_000 else { finish(.failure(.deadline)); return }
             let deadline = DispatchSource.makeTimerSource(queue: queue)
-            deadline.schedule(deadline: DispatchTime(uptimeNanoseconds: deadlineNs))
+            deadline.schedule(deadline: .now() + .nanoseconds(Int(deadlineNs - now)))
             deadline.setEventHandler { [weak self] in self?.cancel(.deadline) }
             timer = deadline; deadline.resume()
             guard permitted() else { finish(.failure(.scope)); return }
@@ -128,7 +147,10 @@ final class V4vOriginObserver: @unchecked Sendable {
     func cancel() { cancel(.cancelled) }
     private func cancel(_ reason: OriginObservationFailure) {
         gate.invalidate(attempt: attempt)
-        lock.withLock { closed = true }
+        let first = lock.withLock { () -> Bool in
+            guard !closed else { return false }; closed = true; return true
+        }
+        guard first else { return }
         status.close(); media.close(); decoder.close()
         queue.async { [self] in finish(.failure(reason)) }
     }
@@ -169,7 +191,7 @@ final class V4vOriginObserver: @unchecked Sendable {
             let data = try answer.get(), now = clock().monotonicNs
             guard now <= UInt64.max - 3_000_000_000 else { throw OriginObservationFailure.deadline }
             phase = 3
-            decoder.decode(data, deadlineNs: min(deadlineNs, authorityDeadlineNs, now + 3_000_000_000)) { [self] result in queue.async { [self] in decoded(result) } }
+            decoder.decode(data, expectedMedia: attempt.expectedMedia, deadlineNs: min(deadlineNs, authorityDeadlineNs, now + 3_000_000_000)) { [self] result in queue.async { [self] in decoded(result) } }
         } catch { finish(.failure((error as? OriginObservationFailure) ?? .unavailable)) }
     }
     private func decoded(_ answer: Result<OriginDecodedMedia, OriginObservationFailure>) {
@@ -177,7 +199,7 @@ final class V4vOriginObserver: @unchecked Sendable {
         do {
             guard permitted() else { throw OriginObservationFailure.scope }
             let proof = try answer.get()
-            guard proof.sufficient, decoder.cleanupComplete else { throw OriginObservationFailure.progress }
+            guard proof.sufficient(for: attempt.expectedMedia), decoder.cleanupComplete else { throw OriginObservationFailure.progress }
             phase = 4
             status.fresh(attempt) { [self] result in queue.async { [self] in after(result, proof: proof) } }
         } catch { finish(.failure((error as? OriginObservationFailure) ?? .unavailable)) }
@@ -196,26 +218,40 @@ final class V4vOriginObserver: @unchecked Sendable {
     }
     private func finish(_ result: Result<OriginDecodedMedia, OriginObservationFailure>) {
         guard phase < 5, completion != nil else { return }; phase = 5
+        if case .failure = result { gate.invalidate(attempt: attempt) }
+        outcome = result
         status.close(); media.close(); decoder.close()
-        let now = clock().monotonicNs
-        let cleanupLimit = now > UInt64.max - 2_000_000_000 ? UInt64.max : now + 2_000_000_000
-        awaitCleanup(result, limit: cleanupLimit)
+        if cleanupComplete { cleanupChanged(); return }
+        let deadline = DispatchSource.makeTimerSource(queue: queue)
+        deadline.schedule(deadline: .now() + .seconds(2))
+        deadline.setEventHandler { [weak self] in
+            guard let self, self.phase == 5 else { return }
+            if self.cleanupComplete { self.cleanupChanged(); return }
+            self.phase = 6; self.stopTimers(); self.outcome = nil
+            self.gate.invalidate(attempt: self.attempt)
+            let callback = self.completion; self.completion = nil; callback?(.failure(.cleanup))
+            // Late actual cleanup can still notify the retained app slot,
+            // but can never adopt a proof after this failure was reported.
+        }
+        cleanupTimer = deadline; deadline.resume()
     }
-    private func awaitCleanup(_ result: Result<OriginDecodedMedia, OriginObservationFailure>, limit: UInt64) {
-        guard phase == 5 else { return }
-        if cleanupComplete {
-            phase = 6; timer?.setEventHandler {}; timer?.cancel(); timer = nil
+    private func stopTimers() {
+        timer?.setEventHandler {}; timer?.cancel(); timer = nil
+        cleanupTimer?.setEventHandler {}; cleanupTimer?.cancel(); cleanupTimer = nil
+    }
+    private func cleanupChanged() {
+        guard cleanupComplete else { return }
+        if phase == 5, let outcome {
+            phase = 6; stopTimers(); self.outcome = nil
             let final: Result<OriginDecodedMedia, OriginObservationFailure>
             do {
-                let proof = try result.get()
+                let proof = try outcome.get()
                 guard !lock.withLock({ closed }) else { throw OriginObservationFailure.cancelled }
                 try gate.confirm(attempt, beforeNs: min(deadlineNs, authorityDeadlineNs), clock: { self.clock().monotonicNs }, apply: confirm)
                 final = .success(proof)
             } catch { final = .failure((error as? OriginObservationFailure) ?? .scope) }
             let callback = completion; completion = nil; callback?(final)
-        } else if clock().monotonicNs >= limit {
-            phase = 6; timer?.setEventHandler {}; timer?.cancel(); timer = nil
-            let callback = completion; completion = nil; callback?(.failure(.cleanup))
-        } else { queue.asyncAfter(deadline: .now() + .milliseconds(20)) { [self] in awaitCleanup(result, limit: limit) } }
+            cleanup.complete()
+        } else if phase == 6 { cleanup.complete() }
     }
 }

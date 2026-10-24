@@ -1076,6 +1076,203 @@ async fn fresh_publication_request(
     publication.scoped_lease().expect("scope").accepted();
     publication
 }
+
+#[tokio::test]
+async fn revoked_terminal_drain_uses_exact_successor_scope_and_marks_both_epochs_on_loss() {
+    use crate::publish::terminal_tests::{ADTS44, one, recording_samples};
+    for truncated in [false, true] {
+        let scratch = Scratch::new();
+        let manager = scratch.open(true).await;
+        prepare(&manager).await;
+        let (mut app, mut callbacks) = fresh_media_app(&manager);
+        let config = &mut Arc::get_mut(&mut app).expect("unshared app fixture").config;
+        config.recordings = Some(scratch.0.join("recordings"));
+        config.record_min_free = 0;
+        let mut old = fresh_publication(&app).await;
+        let old_lease = old.scoped_lease().expect("old scope");
+        let first_epoch = manager
+            .status(SID)
+            .await
+            .expect("first receipt")
+            .connection_epoch;
+        feed_generated(
+            &mut old,
+            include_bytes!("../../sapflow-hls/tests/fixtures/testsrc-3s.ts"),
+        );
+        old.end();
+        old_lease.protocol_stopped();
+        let mut next = fresh_publication(&app).await;
+        let next_lease = next.scoped_lease().expect("successor scope");
+        let second_epoch = manager
+            .status(SID)
+            .await
+            .expect("next receipt")
+            .connection_epoch;
+        assert_eq!(second_epoch, first_epoch + 1);
+        let mut wire = one(ADTS44);
+        if truncated {
+            wire.extend(&one(ADTS44)[376..426]);
+        }
+        feed_generated(&mut next, &wire);
+        assert!(
+            manager
+                .status(SID)
+                .await
+                .expect("not yet fresh")
+                .fresh_media
+                .is_none()
+        );
+        manager
+            .revoke(SID, revoke(SID, 1, 2))
+            .await
+            .expect("End closes gate then drains accepted tail");
+        assert!(
+            next.push(|_, _| panic!("no new media accepted after revoke"))
+                .is_err()
+        );
+        next.end();
+        next_lease.protocol_stopped();
+        let mut recordings = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while recordings.len() != 2 {
+                let item = callbacks.recv().await.expect("real writer callback");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&item.body).expect("scoped JSON");
+                if body["event"] == "recordSegmentComplete" {
+                    recordings.push(body);
+                }
+            }
+        })
+        .await
+        .expect("bounded actual writer cleanup");
+        recordings.sort_by_key(|body| body["connectionEpoch"].as_u64().expect("captured epoch"));
+        assert_eq!(recordings[0]["connectionEpoch"], first_epoch);
+        assert_eq!(recordings[1]["connectionEpoch"], second_epoch);
+        for body in &recordings {
+            assert_eq!(body["sessionId"], SID);
+            assert_eq!(body["eventGeneration"], 1);
+            assert_eq!(
+                body["recordingState"],
+                if truncated { "incomplete" } else { "finalised" }
+            );
+        }
+        assert_ne!(recordings[0]["recordingId"], recordings[1]["recordingId"]);
+        assert_eq!(
+            recording_samples(&recordings[1]),
+            1,
+            "one terminal AAC in new file only"
+        );
+        let bytes = fs::read(
+            recordings[1]["segmentPath"]
+                .as_str()
+                .expect("AAC recording"),
+        )
+        .expect("synced file");
+        assert!(!bytes.windows(4).any(|word| word == b"avc1"));
+        let ended = manager.status(SID).await.expect("terminal receipt");
+        assert_eq!(ended.admission, "denied");
+        assert!(ended.fresh_media.is_none());
+    }
+}
+
+#[tokio::test]
+async fn stale_publication_drop_cannot_release_or_drain_the_new_scoped_owner() {
+    use crate::publish::terminal_tests::{ADTS44, one};
+    let scratch = Scratch::new();
+    let manager = scratch.open(false).await;
+    prepare(&manager).await;
+    let (app, _callbacks) = fresh_media_app(&manager);
+    let mut old = fresh_publication(&app).await;
+    feed_generated(&mut old, &one(ADTS44));
+    let lease = old.scoped_lease().expect("old lease");
+    let generation = lease
+        .owner
+        .binding
+        .lock()
+        .expect("binding")
+        .as_ref()
+        .expect("bound stream")
+        .generation;
+    assert!(app.streams.detach(&old.stream, generation, true));
+    lease.released(true);
+    lease.protocol_stopped();
+    let mut next = fresh_publication(&app).await;
+    let current = next.scoped_lease().expect("new lease");
+    let epoch = manager
+        .status(SID)
+        .await
+        .expect("new receipt")
+        .connection_epoch;
+    feed_generated(&mut next, &one(ADTS44));
+    let before = next_part(&next);
+    old.end();
+    assert!(
+        current.with_open(|| ()).is_ok(),
+        "old released(false) cannot cancel successor"
+    );
+    assert_eq!(
+        next_part(&next),
+        before,
+        "old drop cannot EOF-drain new parser"
+    );
+    let status = manager
+        .status(SID)
+        .await
+        .expect("new identity stays attached");
+    assert_eq!(status.connection_epoch, epoch);
+    assert_eq!(status.protocol, "active");
+    assert!(
+        status.fresh_media.is_none(),
+        "old media cannot confirm this attempt"
+    );
+    manager
+        .revoke(SID, revoke(SID, 1, 2))
+        .await
+        .expect("clean up new grant");
+    next.end();
+    current.protocol_stopped();
+}
+
+#[tokio::test]
+async fn already_revoked_published_owner_emits_one_captured_unpublish_without_grace() {
+    let scratch = Scratch::new();
+    let manager = scratch.open(true).await;
+    prepare(&manager).await;
+    let (app, mut callbacks) = fresh_media_app(&manager);
+    let mut publication = fresh_publication(&app).await;
+    let lease = publication.scoped_lease().expect("current scope");
+    feed_generated(
+        &mut publication,
+        include_bytes!("../../sapflow-hls/tests/fixtures/testsrc-3s.ts"),
+    );
+    assert_eq!(fresh_events(&mut callbacks), ["publish"]);
+    let epoch = manager.status(SID).await.expect("live").connection_epoch;
+    manager
+        .revoke(SID, revoke(SID, 1, 2))
+        .await
+        .expect("explicit terminal End");
+    publication.end();
+    lease.protocol_stopped();
+    let item = callbacks
+        .try_recv()
+        .expect("one captured Unpublish after revoke");
+    let body: serde_json::Value = serde_json::from_slice(&item.body).expect("scoped callback");
+    assert_eq!(body["event"], "unpublish");
+    assert_eq!(body["sessionId"], SID);
+    assert_eq!(body["eventGeneration"], 1);
+    assert_eq!(body["connectionEpoch"], epoch);
+    assert!(
+        callbacks.try_recv().is_err(),
+        "no duplicate lifecycle callback"
+    );
+    assert!(app.streams.get(EVENT).is_none(), "revoke cannot arm a hold");
+    let status = manager
+        .status(SID)
+        .await
+        .expect("no authority resurrection");
+    assert_eq!(status.admission, "denied");
+    assert_eq!(status.state, "revoked");
+}
 fn feed_generated(publication: &mut crate::publish::Publication, data: &[u8]) {
     for packet in data.chunks(188) {
         crate::srt::feed(publication, packet).expect("generated feed");
@@ -1089,6 +1286,90 @@ fn next_part(publication: &crate::publish::Publication) -> u64 {
         .muxer()
         .expect("muxer")
         .next_part_id()
+}
+
+#[tokio::test]
+async fn audio_only_receipts_require_current_parts_across_track_and_codec_epochs() {
+    const MONO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/audio-48k-mono.ts");
+    const STEREO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/audio-44k1-stereo.ts");
+    const VIDEO: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/testsrc-3s.ts");
+    let scratch = Scratch::new();
+    let manager = scratch.open(false).await;
+    prepare(&manager).await;
+    let (app, mut callbacks) = fresh_media_app(&manager);
+    let mut retained = None;
+    let mut previous = None;
+    for (index, data) in [MONO, STEREO, VIDEO, MONO].into_iter().enumerate() {
+        let mut publication = fresh_publication(&app).await;
+        let empty = manager.status(SID).await.expect("current connection");
+        assert_eq!(empty.connection_epoch, index as u64 + 1);
+        assert!(
+            empty.fresh_media.is_none(),
+            "retained parts cannot confirm a successor"
+        );
+        if let Some(stream) = &retained {
+            assert!(Arc::ptr_eq(stream, &publication.stream));
+        } else {
+            retained = Some(publication.stream.clone());
+        }
+        // A transport header is neither a completed media part nor decoded
+        // audio. It must not manufacture a ready receipt from retained media.
+        crate::srt::feed(&mut publication, &data[..188]).expect("generated first packet");
+        assert!(
+            manager
+                .status(SID)
+                .await
+                .expect("header status")
+                .fresh_media
+                .is_none()
+        );
+        feed_generated(&mut publication, &data[188..]);
+        let live = manager
+            .status(SID)
+            .await
+            .expect("actual current audio parts");
+        assert_eq!(live.state, "live");
+        let media = live.fresh_media.expect("current completed part");
+        assert_eq!(media.connection_epoch, index as u64 + 1);
+        assert_eq!(media.part.has_video, index == 2);
+        assert!(media.part.has_audio);
+        if let Some((part_id, initialization_id)) = previous {
+            assert!(media.part.part_id > part_id);
+            assert!(media.part.initialization_id > initialization_id);
+        }
+        {
+            let state = publication.stream.lock();
+            let muxer = state.ingest.muxer().expect("current muxer");
+            assert_eq!(muxer.video().is_some(), index == 2);
+            if index != 2 {
+                let master = sapflow_hls::playlist::multivariant(muxer);
+                assert!(master.contains("CODECS=\"mp4a.40.2\""));
+                assert!(!master.contains("RESOLUTION="));
+                assert!(!master.contains("FRAME-RATE="));
+            }
+        }
+        let (tracks, parts) = publication
+            .stream
+            .parts_after(None)
+            .expect("recording epoch");
+        assert_eq!(tracks.video().is_some(), index == 2);
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.initialization.id == media.part.initialization_id)
+        );
+        previous = Some((media.part.part_id, media.part.initialization_id));
+        publication.end();
+        assert!(
+            manager
+                .status(SID)
+                .await
+                .expect("held status")
+                .fresh_media
+                .is_none()
+        );
+        assert_eq!(fresh_events(&mut callbacks), ["publish", "unpublish"]);
+    }
 }
 
 #[tokio::test]

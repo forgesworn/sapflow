@@ -5,15 +5,17 @@ turns the staged rollout in [readiness.md](readiness.md) into steps. The
 trial is one non-critical show of the v4v live stage with mediamtx left
 ready, and it ends in a decision (section 5), not a switch.
 
-Facts from 2026-10-21 that `main`'s docs do not carry yet: OBS, Larix and
+Historical checkpoint from 2026-10-21: OBS, Larix and
 our own Android app have published over SRT (with and without a passphrase)
 and RTMP (the docs record the first two only); v4v's player fix for jumping back to live after a drop (v4v #475)
 is merged and was checked in real Safari; our Android app does not
-reconnect by itself yet (Larix and OBS do); the wired Linux load test has
-not run. `readiness.md` still says the player fix is unmerged. Since then
-(2026-10-22): bounded reconnect for our own apps is on the broadcaster
-branch, not yet on `main`, with a short recovery test on a Pixel recorded
-there but no show-length run; and the decisions below were taken.
+reconnect by itself at that checkpoint (Larix and OBS did); the wired Linux
+load test had not run. Later native development adds bounded reconnect on the
+broadcaster branch, not yet on `main`, and records a finite Pixel recovery test in
+[mobile delivery status](mobile-delivery-status.md). That evidence does not
+qualify the native app for this complete-show trial. Since then (2026-10-22),
+the decisions below were taken. Check current readiness and player/deployment
+evidence when choosing the frozen trial revision.
 
 Everything in angle brackets is a placeholder, filled in from the
 deployment and never committed.
@@ -41,13 +43,14 @@ deployment and never committed.
   by the dry run: the broadcaster branch, with its reconnect, is on `main`
   and in the build the performer's phone runs, and phase A shows it
   resuming every drop inside the 90 s grace by itself and lasting the soak
-  with its local recording intact. It publishes to a manual destination
-  (the RTMP or SRT URL below), as Larix does: its V4V mode uses per-session
-  scoped encryption, which needs sapflow's control mode, and that mode
-  turns RTMP and the shared publisher off, so it is not this trial. Otherwise Larix or
-  OBS with auto-reconnect on. Either way Larix is installed on the
-  performer's phone with the same settings, as the fallback encoder: the
-  URL is the same for both (section 3).
+  with its local recording intact. This is a complete-show qualification
+  requirement, not acceptance from the finite Pixel test. It publishes to a
+  manual destination (the RTMP or SRT URL below), as Larix does: its V4V mode
+  uses per-session scoped encryption, which needs sapflow's control mode,
+  and that mode turns RTMP and the shared publisher off, so it is not this
+  trial. Otherwise Larix or OBS with auto-reconnect on. Either way Larix is
+  installed on the performer's phone with the same settings, as the fallback
+  encoder: the URL is the same for both (section 3).
 - [ ] **The performer's protocol.** RTMP is the first choice: it is what v4v's
   reference mediamtx config serves (SRT is off there), it has the longer
   record (Larix resumed seven drops in six minutes), and it is the only
@@ -92,6 +95,10 @@ deployment and never committed.
   - `PULSEWIRE_LIVE_PLAYBACK_PROBE_URL_TEMPLATE` is `https://`, not the
     internal `http://` form in section 2.5: read where it points before
     changing it.
+
+  These observations describe the legacy trial deployment. They do not
+  configure native V4V clients or replace their scoped destination grants,
+  per-session encryption or approved playback origins.
 - [ ] **Who decides a rollback on the night**, and the channel to the
   performer that stays open throughout (a call or a chat, not Studio).
 

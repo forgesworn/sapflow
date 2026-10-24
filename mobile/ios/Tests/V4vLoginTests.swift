@@ -182,6 +182,33 @@ final class V4vLoginTests: XCTestCase {
         XCTAssertThrowsError(try result.remaining(postStartedNs: 10, nowNs: 9))
         XCTAssertEqual(try result.remaining(postStartedNs: 10, nowNs: 10).maxAgeSeconds, 86399)
     }
+    func testActualCleanupNotificationWaitsForQueuedHTTPTransitionAfterConsumedFailure() throws {
+        let failed = expectation(description: "failure consumed"), blocked = expectation(description: "login work withheld")
+        let cleaned = expectation(description: "actual queued close"), release = DispatchSemaphore(value: 0)
+        let signer = LoginSigner()
+        var held: LoginHTTP?, reply: ((Result<V4vJSON, V4vFailure>) -> Void)?
+        var notifications = 0, callbacks = 0, owner: V4vSignetLoginOwner!
+        let challenge: V4vJSON = .object(["ok": .bool(true), "enabled": .bool(true), "registration": .string("closed"), "appName": .string("Generated test"), "challenge": .string(String(repeating: "b", count: 64))])
+        owner = V4vSignetLoginOwner(profile: try V4vFixture.profile(), credentials: V4vSignetCredentialStore(journal: V4vMemoryJournal()), delivery: .main, makeSigner: { _, _ in signer }, makeHTTP: { closed in
+            let http = LoginHTTP(closed); http.delayClose = true; held = http
+            http.responder = { count, callback in
+                if count == 1 { reply = callback; callback(.success(challenge)) }
+                else { callback(.success(generatedLogin())) }
+            }; return http
+        }, onCleanupComplete: {
+            XCTAssertTrue(owner.cleanupComplete); notifications += 1; cleaned.fulfill()
+        }, commit: { _ in XCTFail("consumed failure cannot adopt") })
+        XCTAssertTrue(owner.start(restoring: false) { _ in callbacks += 1; failed.fulfill() })
+        wait(for: [failed], timeout: 4)
+        // A duplicate dependency callback occupies the REAL private login work
+        // queue outside its lock, without adding a production test hook.
+        signer.onSign = { blocked.fulfill(); _ = release.wait(timeout: .now() + 3) }
+        reply?(.success(challenge)); wait(for: [blocked], timeout: 2)
+        held?.onClosed() // queues httpClosed behind the withheld work
+        XCTAssertEqual(notifications, 0); XCTAssertFalse(owner.cleanupComplete)
+        release.signal(); wait(for: [cleaned], timeout: 3)
+        XCTAssertTrue(owner.cleanupComplete); XCTAssertEqual(callbacks, 1); XCTAssertEqual(notifications, 1)
+    }
     func testShortRemoteTokenExpiresDuringActualCloseAndCannotGainFreshLifetime() throws {
         let closing = expectation(description: "close pending"), done = expectation(description: "expired token")
         var now: UInt64 = 10_000_000_000, held: LoginHTTP?

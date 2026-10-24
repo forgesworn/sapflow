@@ -1,2 +1,4 @@
 mobile/android/gradlew.bat text eol=crlf
 mobile/android/gradle/wrapper/gradle-wrapper.properties text eol=lf
+# Raw HTTP wire seeds retain CRLF and arbitrary framing bytes.
+fuzz/seeds/http1_request/* -text -diff

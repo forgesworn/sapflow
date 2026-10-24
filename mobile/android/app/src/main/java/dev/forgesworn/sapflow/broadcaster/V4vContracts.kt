@@ -85,7 +85,7 @@ internal class V4vGrant(val identity: V4vIdentity, val endpoint: String, val str
         graceMs == prepared.graceMs && maxPublishBps == prepared.maxPublishBps && maxQueueBytes == prepared.maxQueueBytes
     companion object {
         // Parse the negotiated ceiling independently of local quality selection.
-        fun read(o: JsonObject, nowMs: Long): V4vGrant = with(V4vJson) {
+        fun read(o: JsonObject, nowMs: Long, authorityNowNs: Long = System.nanoTime()): V4vGrant = with(V4vJson) {
             val identity = V4vIdentity.read(o)
             val policy = o.getValue("destination").jsonObject
             require(policy.text("kind") == "v4v" && policy.text("connector") == "sapflow" && policy.flag("unlimited") && !policy.flag("watermark") && !policy.flag("subscriptionRequired"))
@@ -103,7 +103,7 @@ internal class V4vGrant(val identity: V4vIdentity, val endpoint: String, val str
             require(expires - nowMs <= 900_000 && refresh < expires)
             val limits = o.getValue("limits").jsonObject
             val bps = limits.number("maxPublishBps", 1)
-            V4vGrant(identity, endpoint, streamId, passphrase, expires, refresh, o.number("reconnectGraceMs", 0, 3_600_000), bps, limits.number("maxQueueBytes", 1500, 4_194_304), System.nanoTime() + (expires - nowMs).coerceAtLeast(0) * 1_000_000)
+            V4vGrant(identity, endpoint, streamId, passphrase, expires, refresh, o.number("reconnectGraceMs", 0, 3_600_000), bps, limits.number("maxQueueBytes", 1500, 4_194_304), Math.addExact(authorityNowNs, Math.multiplyExact((expires - nowMs).coerceAtLeast(0), 1_000_000)))
         }
     }
 }

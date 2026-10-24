@@ -5,7 +5,1142 @@ tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)
 or [native performance contract](native-performance-contract.md).
 
-Latest local checkpoint, 21 October: the requested origin-main integration is
+The owner has approved `checked-sdk-playback-clock-v1`, a separate clock profile
+for application-controlled decoded PCM playback. Its [registered criteria](recording-recovery.md#checked-sdk-playback-clock-profile)
+use a checked rational source/movie schedule from whole returned frame ranges.
+Its internal Android qualification owner is implemented in `f9e6830`; actual
+native profile qualification remains unrun. Next build and verify fresh SDK
+packages from stable current sources, then qualify that decoder/sink path
+alongside concrete source-generation and capture closure and paired presentation.
+Raw native timestamps and their original failed clock gates remain unchanged. Explicit native and checked independent
+readers already return the required 2,765, 48,000 and 2,765 programme frames from
+the original generated SDK files, but paired native recorder presentation remains
+unqualified. The original stock-reader and fifteen metadata-profile failures
+remain unchanged. Durable checkpoint installation and crash recovery, the
+aggregate two-second source-presentation loss bound, complete shows on both
+phones, matched competitor performance and release still follow. The existing
+origin-first, always-free V4V scope and legacy recorder defaults remain unchanged.
+
+The new profile records an approved policy, not a test or integration pass.
+Schedule completion requires exact returned and whole-range sink-accepted N,
+actual input/output EOS, one-use native releases and known owner/sink closure,
+with no loss, fault or unknown. It cannot detect same-sized duplicated content or
+supply waveform, producer, paired presentation or app-admission authority. Raw
+native buffer times and conversion remainders stay separate. The original
+2,875-byte numerical contract and all previous verdicts remain intact; the
+profile does not enable recording or playback by default.
+
+The implemented internal reader, clock cursor and file-backed PCM sink are wired
+into the generated qualification path. Five new app JUnit tests run in the normal
+Debug and Qualification suites. The actual build executes 679 Debug tests in
+74 suites, 669 Qualification tests in 73 suites and 38 Python controls, totalling
+1,386, with no failures, errors or skips. APK assembly, lint and qualification
+isolation complete successfully. The original global receipt remains failed with
+`sourceUnchanged=false` because concurrent SDK/Cargo/host changes invalidate its
+full source binding. The five Android candidate files remain unchanged and the
+APKs contain the previously built SDK package; current SDK freshness is
+unqualified. Seven artefact checks and the actual native profile run are unrun,
+pending fresh SDK qualification. No cached-runtime exception or default change
+is authorised by these retained build/test results.
+
+The checked Android store now persists the append context needed to reconstruct
+its existing checkpoint bindings after restart (`17c397a`). A focused SDK-free
+host run passes 51 filesystem/metadata controls and two synthetic fuzz-seed
+replays, with independent outcome review. A separate coverage-guided JVM campaign
+instruments the actual parser and completes 1,779,234 executions in 61 reported
+seconds with no findings, unchanged protected inputs and independent review.
+Full app and Android-native checks, hosted fuzz CI and the cold recovery
+transaction remain open. Separately, actual Apple segment-output controls now
+preserve the original AAC packets and exact coded clocks in all three registered
+cases (five, 49 and five packets). This clears their file-format prerequisite;
+it does not qualify decoding, paired presentation or application admission.
+Both results are detailed in the [recording recovery record](recording-recovery.md).
+
+The iOS catalogue now has a read-only checkpoint child that retains actual file
+descriptors and the existing library lease across metadata reads, bounded prefix
+hashing and checked close. Its SDK-free host gate passes 104 tests, including 15
+new ownership and refusal controls, with unchanged inputs and clean process /
+scratch closure. Its slot snapshots remain untrusted; actual SDK decoding,
+successor selection, recover-to-new-file and physical acceptance remain open.
+The [read-owner record](recording-recovery.md#ios-cold-checkpoint-read-owner)
+retains the exact scope and private evidence location.
+
+The earlier audio retirement regression gate passes 674 Debug tests, 664
+Qualification tests and 38 Python controls, totalling 1,376, with no failures,
+errors or skips. Its 14 new regressions cover successful audio input arriving
+during Stop, real thread joins, and queue/bookkeeping failures during retirement.
+All three APK variants, lint, qualification isolation and seven package checks
+pass. This is host and package evidence; the active phone capture was untouched.
+
+The approved clock prototype separately passes 26 standalone synthetic checks.
+An offline metadata replay completes all three explicit-reader schedules at
+2,765, 48,000 and 2,765 frames and refuses the retained 5,120-frame wrong-length
+control. Original PCM hashes and raw timestamps remain unchanged. This replay
+uses saved observations, supplies no new native callbacks and grants no
+presentation or application admission. The implemented decoder/sink owner still
+requires actual native qualification after fresh SDK packages are verified.
+
+The earlier qualification-only Android reader gate executes 660 Debug tests,
+650 Qualification tests and 38 Python verifier controls, totalling 1,348, with
+no failures, errors or skips. All three APK builds, lint and seven artefact checks
+pass with 412 recorded inputs unchanged. The same 122 SDK source inputs and W2
+packages are reused; the app gate does not rebuild Rust. Independent app and
+artefact review is clear. This proves the tested build scope, not reader or
+capture adoption.
+
+A fresh non-debuggable emulator run makes three real checkpoint decodes and four
+native decoder observations, with actual EOS and checked cleanup. Source-bound
+H/T requests return exactly the three programme lengths; the unchanged-policy
+control still returns 5,120 frames. The short reader's first positive ranges are
+717 frames at 0 microseconds, then 1,024 at 21,333 and 42,666; the long reader
+starts with 896 frames at 0, then 1,024 at 21,333. These reported ranges and times
+do not establish a continuous native PCM-frame clock. Nonzero conversion
+remainders also remain visible. The fixture retains each whole PCM range as
+returned; first positive PTS0 is not presentation qualification. Independent native
+review is clear for these frame/range, source and cleanup facts; native clock and presentation remain
+unqualified.
+
+The checked independent libavcodec reader separately returns exact programme
+lengths while preserving original packet bytes and coded clocks. Its public
+context-timebase proof checks source and movie intervals, continuity and
+endpoints in all three healthy cases; whole PCM matches its preceding reader
+run byte-for-byte. Raw returned frame timebases remain 0/1, so that earlier raw
+endpoint gate stays open. This is a checked reader API result, not a stock
+FFmpeg CLI, native paired waveform, physical or performance pass. The detailed
+[programme-window record](recording-recovery.md#checked-recording-programme-windows)
+retains the actual receipts and the remaining gates.
+
+The latest Android work adds pre-filter AAC observations (`73df1bb`), the
+generated codec fixture (`a632095`) and the optional SDK recording owner
+(`578d5b5`). The owner passes seventeen controls against the real SDK and host
+filesystem. It composes the existing recorder worker and checked checkpoint
+storage; even SDK completion remains submitted-input scope with app admission
+unknown. Capture and the product default have not adopted this path.
+
+The exact seven drain/leading source paths are locally committed as `2ec0300`;
+the retained app and native gates keep their original `578d5b5` source binding.
+The combined app gate genuinely executes 658 Debug tests in 72 suites and
+650 Qualification tests in 71 suites, plus 35 Python verifier tests, with no
+failures, errors or skips. All three APK builds, lint, isolation and actual
+artefact checks pass with 362 inputs unchanged. Lint has zero errors and
+21/26/15 Debug/Qualification/Release warnings. Direct ZIP/signing-block
+readback verifies Release is unsigned. Debug and Qualification retain standard
+debug signing; signer identity was not cryptographically checked. The linked
+[Android drain and leading experiments](recording-recovery.md#android-native-aac-drain-and-leading-experiments)
+record the exact source, package, native observations and private receipts.
+
+All twenty generated emulator drain cases reach native EOS and confirmed
+cleanup. Eighty independent parser/container/decode commands retain every
+original AAC packet and measure the coded extent. Unaligned input still yields
+a coded extent shorter than the programme; aligned input and each drain
+treatment produce the measured physical queued extent. This does not establish
+which coded frames present the complete programme after native leading delay.
+
+The original cold-leading experiment fails all four cases and remains retained.
+The corrected PCM-default/timing source is locally committed as `629b72b`; its
+full app gate passes, while its Debug native run still fails all four cases.
+The same source in the non-debuggable Qualification APK issues Start within
+250 ms in three cases, with strict original-AAC parsing and complete generated
+holdout checks passing. The first cold case takes 277.110 ms and never issues
+Start, so that aggregate remains failed. The subsequent Kotlin-only optimisation
+passes ten genuinely executed alignment controls, including bit-for-bit oracle
+comparisons, and its non-debuggable Qualification build and APK checks pass.
+The fresh native run starts three cases at 94.349, 62.622 and 173.617 ms; strict
+original-AAC and full generated holdout checks pass for those three candidates.
+Its first cold case still refuses Start at 258.189 ms, against the unchanged
+250 ms limit. Aggregate cold qualification remains failed. Eight independent
+raw decoder children close normally. These emulator observations do not prove
+physical codec qualification, paired native presentation or a matched performance
+advantage. The narrow Kotlin fixture uses the earlier prebuilt SDK, without
+exercising or promoting the new Rust source.
+
+The recording programme-window foundation is locally committed as `b7aa36c`.
+It separates queued preparation/programme/padding/drain and checks the retained
+original coded window and exact presentation geometry. That foundation passed
+745 workspace tests, formatting, strict Clippy and the default smoke test, with
+four tests ignored. Eight legacy initial headers remained byte-identical.
+
+The follow-on source now exposes an opt-in programme mode in the existing SDK
+muxer and separately typed `SFCP0002` checkpoints. It preserves original coded
+timing and immutable sealed frontiers; legacy APIs, `SFCP0001` and defaults stay
+unchanged. Forty-seven focused tests and 767 workspace tests pass, with four
+workspace tests ignored. Strict Clippy and actual generated Swift/Kotlin
+consumers also pass, alongside the default smoke test and 206,639 sanitised
+checkpoint fuzz executions. The source is locally committed as `b2c10ca`.
+Fresh SDK packages are built at `9e01677` from the same 122 source inputs.
+The Apple archive contains three ARM64 platform slices; its installed Swift host
+consumer passes on macOS. The four-ABI Android AAR passes its installed Kotlin
+host consumer and actual ELF 16 KiB alignment checks.
+The new and old generated APIs and dependency notices are verified in the
+archives. At that milestone Android app APKs still used the earlier SDK; later
+generated Android qualification gates use these W2 packages. Neither app's
+capture/default recorder has adopted the new programme mode. Native source/EOF facts, file durability, paired
+presentation and app admission remain external requirements. The detailed [programme-window record](recording-recovery.md#checked-recording-programme-windows)
+retains the actual evidence and limits.
+
+Only generated media ran in the read-only emulator. The original cleanup errors
+remain recorded alongside separate current-inventory cleanup addenda. The emulator
+is stopped, its task temporary directory removed and the existing AVD preserved.
+The active physical capture was not changed; no Release signing, push or
+publication was part of these experiments.
+
+The fresh generated [recording presentation matrix](recording-recovery.md#fresh-registered-matrix-result)
+passes its separately registered numerical contract across five A/V and ten
+audio-only/short-prefix cases. Nine complete comparisons satisfy every exact
+hard check. Seven paired native arrays are byte-identical; two differ at 11 and
+10 Int16 positions respectively, by at most one unit. Both original strict
+aggregates remain failed and retained. Independent review verifies current
+source/package bindings and 352 command logs. Production recorder migration,
+durable recovery, aggregate two-second loss and physical acceptance remain open.
+
+The earlier [portable checkpoint SDK](recording-recovery.md#portable-checkpoint-sdk)
+milestone added an immutable cold presentation query using the exact Rust header
+timing calculation. That checkpoint/extent source passed 708 workspace tests,
+strict Clippy, formatting, generated-stream smoke and actual Swift/Kotlin
+consumers. Four tests remained ignored by the default workspace command. The
+unchanged parser's earlier 522,636 sanitised fuzz executions remain separate
+evidence. Those three-slice Apple and four-ABI Android SDK packages passed
+their installed host consumers; Android native libraries also passed actual
+16 KiB alignment checks. The later timing-view source and packages are recorded
+below.
+
+The iOS [producer and ingress finalisation](recording-recovery.md#ios-producer-and-ingress-finalisation)
+source is locally committed as `135b3cb`. A concrete native Stop path detaches
+capture delegates, stops the actual session, joins the samples FIFO and finishes
+the real audio/video encoders before ingress and recording closure. Its
+single-use authority binds the exact run, committed Start, recording ticket,
+recorder, worker and installed SDK frontier. Native drops and recording-only
+failures latch synchronously and are rechecked at receipt commit. Held startup
+or unfinished Resume media remains incomplete; ordinary Stop cancellation and
+publishing-only failure remain separate from recording loss.
+
+All seven platform commands pass: 261 budget/admission tests, 89 filesystem
+tests, 38 library tests, 16 real-SDK tests, two generated modules and the strict
+iOS 16 API check of all 70 production Swift files. The generated native gate
+passes its five original incomplete controls and ten producer controls through
+13 commands. Three generated files finalise and independently decode without
+errors, including all ten submitted A/V video frames. Seven negative producer
+controls remain incomplete. The first native attempt's codec-discovery failure
+is retained; a rerun with macOS codec-service access passes with identical
+source, SDK witnesses and oracles.
+
+Current legacy regressions pass 86 publisher tests and seven original native
+ownership controls, preserving both historical negatives. Full Debug,
+Qualification and Release app builds pass all eleven commands with 313 inputs
+unchanged, zero compiler warnings and zero errors. Built privacy/configuration
+and manual-link checks, both exact Debug corpora and the six new compiled test
+symbols pass. The Debug test bundle is compiled, not executed. Separate actual
+readback verifies all three app code objects are unsigned and binds the Debug
+implementation dylib separately from its loader. Independent source and all
+completed outcome reviews are clear; exact evidence paths are recorded in the
+linked finalisation section.
+
+The source commit changes eight production Swift files, including the new
+concrete producer owner. It reuses the existing queues, encoders and validated
+sample handles, with no extra media queue, encoder, encoded payload copy or
+per-unit validation. Legacy remains
+the product default. Physical capture/Stop, installed or default SDK adoption,
+crash recovery, presentation equivalence and the aggregate two-second loss bound
+remain open. No phone access, signing, installation, push or publication is part
+of this packet.
+
+The earlier iOS [first recorder adoption composition](recording-recovery.md#ios-first-recorder-adoption-composition)
+is locally committed as `928a616`. Legacy remains the default; an internal cold
+selection exposes the SDK adapter. It passes 89 actual host filesystem tests,
+38 library tests, 16 real-SDK tests and the strict iOS 16 API check across all
+69 production source files. Independent outcome review is clear for those six
+commands. Five generated native adapter cases also pass, with four exact
+original-AAC payload probes. Their detailed input, prefix and refusal results
+are recorded below. These checks introduce no second encoder, media queue,
+encoded payload copy or per-unit validation. Every SDK outcome at that milestone
+produces an incomplete app receipt with application admission unknown.
+
+That milestone's legacy regression run passes 86 publisher tests and all seven
+original native ownership controls while preserving both historical negative
+controls. Independent review of that completed outcome is clear. Full Debug,
+Qualification and Release app builds also pass, with signing disabled and all
+built resource, configuration and manual-link checks passing. The compiled
+Debug test bundle contains both exact profile corpora and the new capacity
+tests; it has not executed on a phone. Separate product readback verifies all
+three app code objects are unsigned and binds the Debug implementation dylib
+as well as its launcher. Independent app outcome review is clear. The
+earlier submitted-input gate and its original test callback failure and repair
+remain retained. Those receipts establish no producer-finalisation, default SDK
+switch, crash-recovery, aggregate-loss or physical acceptance claim.
+
+The optional [full native AAC receipt mode](recording-recovery.md#native-aac-generation-receipts)
+passes fourteen actual generated native cases and real SDK receipt acceptance,
+including mixed silence/raw input in one encoder generation. Existing legacy
+callbacks remain the default. Both original generated audio-only and standby
+recording/decoder gates also pass unchanged. These checks introduce no second
+encoder, payload copy, per-unit validation or media queue.
+
+The shared [AAC timing-view API](recording-recovery.md#shared-aac-timing-views)
+is locally committed as `c886419`. It derives explicit recording and optional
+publishing timing views from one existing validated AAC-LC 48 kHz mono sample.
+The recording view retains the supplied original coded PTS/DTS and 1,024-frame
+duration; the publishing view uses the supplied normalised clock. `None`
+deliberately withholds publishing for that input without inventing a drop or
+closing its branch. Both views share the original payload and codec Arcs. The
+reported producer generation and signed native PTS are caller observations,
+not native AU, trim or EOF attestations. Neither app uses this optional API yet.
+The two existing media queues, encoders and product defaults are unchanged.
+
+Current source passes all five serial SDK gates: 720 workspace tests, with four
+ignored by that command, strict Clippy, formatting, unchanged default-HTTP
+synthetic smoke and regenerated Swift/Kotlin consumers. All twelve new Rust
+tests and both new consumer helpers pass individually; the eight existing Kotlin
+status controls also pass. Current three-slice Apple and four-ABI Android
+packages pass their installed generated consumers, exact source/output checks
+and independent outcome reviews. Android's actual AAR libraries retain 16 KiB
+ELF alignment. Previous same-version packages and host runtime remain preserved.
+
+Against those current witnesses, the generated iOS native gate again passes its
+five original incomplete controls and ten producer controls through thirteen
+commands. Three finalised files independently decode, all ten submitted A/V
+video frames are read, four probes retain exact original AAC packets and seven
+negative producer controls remain incomplete. This is compatibility evidence
+for the existing adapter; it does not integrate or natively qualify timing views.
+Against these packages, all seven iOS platform commands pass: 261 budget tests,
+89 filesystem tests, 38 library tests, 16 actual SDK checkpoint tests, both
+generated modules and strict iOS16 API checking across all 70 production sources.
+All 309 inputs remain unchanged. Both legacy commands also pass: 86 publisher
+tests, seven original native ownership controls and both expected historical
+failures, with 318 unchanged inputs. Independent reviews of both outcomes are
+clear. All eleven Debug, Qualification and Release app commands pass with 327
+inputs unchanged, including built privacy/configuration/manual-link checks and
+the Debug test bundle compiled rather than executed. Separate actual readback
+verifies all three app code objects are unsigned and binds the Debug loader and
+implementation dylib individually. The full-app independent review is clear.
+
+At that earlier SDK refresh, Android Debug and Qualification each genuinely
+execute 636 JVM tests across 70 suites, including all twenty storage controls, with zero failures, errors or
+skips. All 345 inputs and 140 XML reports are independently hash-verified. All
+three APK assemblies, lint, qualification isolation and actual artefact checks
+pass against the current AAR/native SDK bytes. Lint retains zero errors and
+11/16/15 warnings. Actual four-ABI AAR and APK ARM64 ELF/ZIP 16 KiB alignment,
+notices, QR DEX and manual routing pass. Independent outcome review is clear.
+Direct Release ZIP/signing-block readback establishes an unsigned APK; the
+inherited artefact verifier alone does not. Debug and Qualification retain the
+standard debug signing configuration. No installation or phone acceptance is
+claimed.
+
+The views introduce sample metadata Arcs, an FFI paired-object allocation and
+additional Arc references. The optional provenance field is also present in ordinary
+legacy sample metadata; exact target layout and cost remain unmeasured. Payload sharing proves no additional payload-byte copy
+from the validated handle; whole encoder-to-binding ingress copy costs,
+metadata/handle overhead, phone cost and performance acceptance remain
+unqualified. Android still needs actual full generation/head/tail and AU facts,
+original AAC routing before publishing normalisation and priming filters, and
+the SDK/file adapter with checked admission and producer closure. Missing native
+facts remain unknown; F0 diagnostic counters cannot grant them. Physical
+capture, default adoption, recovery and aggregate two-second loss remain open.
+
+Android [checked checkpoint storage](recording-recovery.md#android-checked-checkpoint-storage)
+is locally committed as `d2483b2`. It adds an optional, currently unused child of
+the existing catalogue Writer lease, bounded append/two-slot storage and an
+API 30+ public `Os` descriptor backend. It does not wire the current recorder,
+AAC path or SDK adapter, switch defaults, finalise app admission or establish
+recovery. Actual Android descriptor/proc, SELinux and provider semantics remain
+unqualified.
+
+Debug and Qualification each genuinely execute 636 JVM tests across 70 suites,
+including all twenty new host-filesystem storage tests, with zero failures,
+errors or skips. All three APK assemblies, lint and qualification isolation pass;
+lint retains zero errors and 11/16/15 warnings, with none on the four changed
+paths. Actual SDK bytes, four-ABI AAR and APK ARM64 ELF/ZIP 16 KiB alignment,
+notices, QR decoder DEX and manual-link manifest checks pass. Independent source,
+build and artefact reviews are clear. The actual Release APK is unsigned;
+Debug and Qualification retain the standard debug signing configuration.
+The first 635-test failed run remains retained, and the narrow directory-link
+identity correction now passes its host regression. No device, installation,
+release signing, default adoption, publication or recovery claim follows.
+
+Android V4V End now requires an explicit confirmation bound to the exact saved
+session or pending Prepare and the Activity's local capture owner. Cancellation
+and stale actions cannot stop a successor, save terminal intent or send End for
+it, even when the event ID is unchanged. Synchronous admission precedes the
+publisher/pending-capture fence; the actor rechecks the same owner before the
+durable End request. An active local recording continues. Independent source
+review is clear; evidence is under `target/v4v-end-confirmation-v1/`.
+
+Android's first AAC generation observation packet is locally committed as
+`64e9521`. It records bounded diagnostic metadata only: API 29 trim metadata is
+explicitly unavailable; missing and reported zero remain distinct; raw and
+intentional-zero input counters advance only after the native input queue call
+succeeds. Output callback and handoff counters do not establish exact access
+units, recorder admission or EOF. There is no hot admission ledger, timing or
+priming-policy change, extra encoder, encoded payload copy or per-unit
+validation. Native codec facts and physical capture remain unqualified.
+
+The earlier AAC observation app gate uses the unchanged extent-query SDK AAR.
+Debug and Qualification each genuinely execute all 616 JVM tests in 69 suites, including
+19 observation, 22 confirmation/shutdown and 15 session tests, with no failures,
+errors or skips. All three APK assemblies, lint and qualification isolation
+pass. Lint reports zero errors and 11/18/17 warnings for Debug, Qualification
+and Release respectively. Actual artefact checks pass current SDK byte
+identity, native and ZIP 16 KiB alignment, notices, QR decoder DEX, manual
+routing and qualification isolation. Independent source and outcome reviews
+are clear. Separate direct ZIP/signing-block readback establishes that this
+Release APK is unsigned; the inherited app verifier alone does not.
+Evidence is under
+`target/privacy-standby/android-aac-observation-app-gates-v1/run-20261023T062739Z-deeb42c4/`.
+No phone was installed or tested. The earlier extent-query gate's 597 tests in
+68 suites per variant remain retained under
+`target/privacy-standby/recording-native-extent-android-app-v1/`, alongside
+`recording-checkpoint-android-app-v1/` and the earlier End/shutdown gate under
+`target/v4v-end-shutdown-v2/app-gates/gate-v1/`.
+
+The initial run exposed two failures while awaiting control-actor shutdown.
+The repair cancels delayed alarms at shutdown even when scheduling races with
+Close. A real-executor regression forces that race; the original assertions and
+failed XML are retained without increasing the five-second limit.
+
+The fresh Android SDK package passes all four ABI builds, actual 16 KiB ELF
+LOAD-alignment checks and the extracted AAR-class host consumer. Its source-bound
+receipt is under
+`target/privacy-standby/recording-checkpoint-native-check/android-v1/`.
+This is package/host evidence; the app remains ARM64-only and physical/native
+recording acceptance remains separate.
+
+Android [QR camera import](manual-destination-links.md#camera-qr-import-and-verification)
+is implemented and independently source-reviewed. It shares the actual capture
+reservation before permissions or destination/storage preparation, with an
+original 60-second deadline and separate permission, Camera2 closure, decoder
+and dialog receipts. Checked Y-plane copies close each native Image before
+serial decoding. The pinned pure ZXing core has no Play service or model runtime;
+its exact licence and notice bytes are present in all three APK variants.
+
+The Android QR composition passes 87 focused JVM tests with warnings as errors,
+then 575 tests in each of Debug and Qualification, all three actual APK builds,
+Qualification/Release lint and qualification isolation. Built APK checks verify
+the QR decoder in DEX, native SDK byte identity, manifest registration, licence
+resources and 16 KiB alignment. Evidence remains under
+`target/manual-destination-links/android-qr-v1/`, `android-qr-deadline-v2/`
+and `android-qr-app-v2/`. The actual UI receiver rechecks the original scan
+deadline, so a withheld completion relay cannot offer an expired invitation.
+These checks do not establish installed Camera2 permissions, preview/readability,
+real callback cleanup or physical creator acceptance. Coverage-guided JVM
+fuzzing retains a separate gate. No device or active
+capture was changed for this packet.
+
+iOS QR import is implemented with native AVFoundation metadata output. It
+retains the actual camera/library reservation through an outstanding OS
+permission callback, native session closure, metadata callback drainage and
+modal dismissal. A candidate carries its original deadline through cleanup;
+the actual settings receiver rechecks it before and after parsing/availability.
+Both initial review findings are repaired and independently source-reviewed.
+
+The iOS composition passes 66 focused host tests and 38 recording-library tests
+with warnings as errors, the 67-source iOS 16 API check, and unsigned Debug,
+Qualification and Release builds. The actual Debug test bundle contains the
+QR tests and both byte-identical profile corpora; it compiles but has not run
+on a phone. All variants pass built privacy/configuration and URL-scheme checks.
+The finite Swift ASan/libFuzzer run completes 17,072 executions without a
+finding. Evidence remains under `target/manual-destination-links/qr-ios-v3/`,
+`ios-qr-app-v2/` and
+`target/ios-manual-destination-fuzz/20261022T235008Z-760f4d4a/`.
+The first full app build timed out during test compilation; its cached retry
+passed the same checks with a longer compile allowance. Installed camera,
+permission, link routing and creator acceptance remain open. No phone, active
+capture, signing or publication was changed for this QR packet.
+
+Reviewed [manual destination links](manual-destination-links.md) are implemented
+in both native apps. The shared generated corpus has 98 envelope cases and all
+64 existing strict JSON profile vectors. Explicit Review, independent plaintext
+consent and fields-only Apply remain required; receipt cannot prepare or start
+capture. Both paths refuse selected V4V mode and conflicting capture or import
+owners. Independent source reviews cover the original-owner, repeated-delivery,
+foreground and stale-callback rules.
+
+The earlier link-only composition passes 39 focused iOS host tests with warnings as
+errors, the 64-source iOS 16 API check, and unsigned Debug, Qualification and
+Release app builds. The actual Debug test bundle compiles and contains both
+byte-identical corpora; it has not executed on a phone. Built URL scheme,
+privacy and creator configuration checks pass in all three variants. Android
+passes 549 tests in each of Debug and Qualification, all three APK assemblies,
+Qualification and Release lint, isolation checks and actual APK manifest/native
+byte/16 KiB alignment verification. The finite Swift ASan/libFuzzer parser run
+completes 65,317 executions without a finding. Kotlin corpus and deterministic
+mutation checks do not establish coverage-guided JVM fuzzing.
+
+Exact local receipts are under `target/manual-destination-links/` (iOS
+`ios-app-v2`, Android `android-app-v3`), with the Swift fuzz receipt under
+`target/ios-manual-destination-fuzz/20261022T220444Z-5359ab2f/`. Failed initial
+checks remain retained: the Android run timed out during final Release lint,
+and Xcode reported stale signed-product paths when switching to unsigned
+outputs. The complete Android retry and stable unsigned iOS retry passed the
+same required checks. Installed OS routing, physical creator acceptance and QR
+camera scanning remain open. No phone, active capture, signing, publication or
+native SDK package changes were made for this link packet.
+
+The first [publishing admission benchmark](sdk-publishing-benchmark.md) passes
+its predeclared paired Release host checks. The measured median added thread
+CPU is about 2.8 microseconds per AAC unit for the actual SDK queue receipt.
+This excludes capture, recording, worker dispatch and transport. Allocation,
+whole-SDK, phone power and competitor comparison gates remain open.
+
+The actual generated iOS recording process-kill spike exposes an unresolved B5
+gap. Its closed four-second control preserves all 190 AAC and 120 H.264 packets,
+with native and independent decoding and positive audio/video seeks. Killing
+the writer after 1.51 and 2.51 seconds leaves no movie header or completed
+fragment; neither Apple nor FFmpeg can open the files. Setting the writer's
+fragment interval to one second therefore does not establish recoverability.
+The at-most-two-second trailing-loss requirement remains unchanged. A
+recovery-safe writer or journal is required before catalogue recovery can be
+qualified. Generated media and child processes were removed; source and scalar
+evidence remain under `target/privacy-standby/interrupted-recording-spike/`.
+
+An earlier five-case generated experiment uses the installed SDK's existing
+fragmented-MP4 recording muxer. Its unchanged init and complete output fragments
+remain decodable and seekable after both actual kills, retaining exact original
+coded prefixes. Its strict native and independent AAC presentation checks fail:
+leading and final padding are incorrect despite unchanged packets. The
+[recovery plan](recording-recovery.md) therefore requires checked recording
+presentation metadata before recorder migration or production recovery.
+Source and scalar evidence remain under
+`target/privacy-standby/recovery-muxer-spike/`. This does not close B5's
+source-presentation loss, durability or sustained resource gates.
+
+The opt-in native-AAC SDK candidate is now locally committed as `b8149ca`.
+It keeps the possible final AAC unit in the existing buffer, distinguishes
+accepted from serialised checkpoint coverage, and uses measured EOF padding
+only for the final recording container entry. The publishing sample and legacy
+wire output retain their original contract. Current full workspace checks pass
+671 tests with four existing ignored tests and strict all-targets Clippy.
+Generated Swift/Kotlin host consumers and the rebuilt Apple package also pass.
+Evidence remains under `target/privacy-standby/recording-lookbehind-workspace-v1/`
+and `recording-lookbehind-native-check/`. This is an opt-in library change;
+platform recorder adoption, source-matched native presentation, persisted
+recovery and the aggregate two-second loss bound remain open. Initial Swift
+fixture and Rust sanitiser builds timed out before their media or fuzz cases
+executed. The Rust retry passes ten seed replays and 2,922 ASan/overflow fuzz
+executions in 61 seconds on unchanged source; its evidence remains under
+`target/privacy-standby/recording-lookbehind-fuzz-v2/`. Failed initial runs remain
+retained.
+
+A later source-bound V4 generated A/V run passes all five original strict cases:
+the closed mono control, mono/stereo three-generation recordings and two actual
+process-killed sealed prefixes. Original packet bytes/order and source PTS remain
+checked, with native presentation and independent decoding/valid-prefix and seek
+oracles. Supplemental reads of the same files still show Int16 and Float32 sample
+variations; the run does not establish their cause, always-stable Float32 or an
+explanation for the historical native refusal. Earlier failed evidence remains
+retained. Evidence is under
+`target/privacy-standby/recording-native-pcm-diff-v4/`.
+All ten subsequent audio-only/short-prefix cases completed. Packet retention,
+source clocks, native frame counts, exact independent valid PCM and applicable
+seeks pass, including actual EOF tails of zero and 1,023 frames and an 18-frame
+resampled recording. The original strict aggregate remains failed: the two
+residue controls differ from their paired native recorder by one Int16 value at
+28 and 22 sample positions respectively. Full-array metrics and every previous
+failure are retained under
+`target/privacy-standby/recovery-audio-only-lookbehind-v3/`. The earlier
+scientific-notation seek argument failure was corrected without changing its
+numeric value or accepting the failed exit code.
+
+Platform recorder adoption, durable orphan recovery, the aggregate two-second
+loss bound and physical acceptance remain open. These host experiments do not
+qualify a production recovery path or establish the cause of native read
+variation.
+
+Privacy standby is integrated and remains under qualification. Its
+[contract](privacy-standby.md) requires synchronous raw-input fencing,
+independently paced replacement picture and silence, explicit Resume and
+matching recording. Its app integration remains under qualification. Cold AAC
+replacement now has per-generation timing and generated recording proof; native
+runtime composition and physical acceptance remain separate gates.
+
+The reviewed Android runtime candidate now includes a timed partial wake lease
+for the existing, explicitly authorised microphone-only background service.
+Only the exact promoted capture owner may acquire it; the existing cold service
+check renews it against its original BOOTTIME deadline. Stop, authority loss,
+expiry and destruction close it separately from retained recorder/publisher
+cleanup. Standby grants no additional background authority.
+
+Debug and Qualification each pass 535 tests in 63 suites with no failures,
+errors or skips. All three APK assemblies, lint, qualification isolation, exact
+native library matching and 16 KiB ZIP/ELF alignment pass. Independent source
+review is clear for the runtime and wake lease. Actual locked-screen, Doze,
+codec/GPU, sustained power/thermal and physical acceptance remain open. Source
+and app receipts are retained under
+`target/camera-controls/android-standby-runtime-v3/` and
+`target/camera-controls/android-audio-wake-v1/`.
+
+The iOS encoder/recorder candidate now passes both native and independent
+presentation checks for three AAC generations, explicit Resume, mono 48 kHz
+and stereo 44.1 kHz source input. Full A/V cases retain all 97 AAC and 63 H.264
+packets, including incomplete recording. Eight short-prefix cases retain their
+original accepted media. A delayed first audio track retains its declared 30 ms empty edit,
+exact native silence and unchanged following waveform. Closed-writer MOV
+metadata correction resolves the earlier decoder disagreement without changing
+encoded media or chunk offsets. The unchanged single-generation regression also
+passes against the current recorder. These are generated host-native checks,
+not microphone or phone acceptance. Evidence is retained under
+`target/ios-audio-standby-fixture/20261022T212016Z-5a5d2fbb/` and
+`target/ios-audio-only-fixture/20261022T205929Z-6f09bb95/`.
+
+The metadata parsers pass 20 priming and 14 layout tests with compiler warnings
+as errors, plus 203,981 coverage-guided ASan fuzz executions. The anchored cold
+file lease passes 48 recording lifecycle tests, including partial writes,
+failed syncs, ambiguous close, cancellation and file substitution. Independent
+review is clear. Evidence is retained under
+`target/privacy-standby/quicktime-priming-layout-v2/` and
+`target/privacy-standby/ios-cold-metadata-independent-review.local.json`.
+
+A generated native VT check selects an actual hardware H.264 implementation,
+retains one encoder for source-to-slate, preserves original callback tokens and
+timestamps, and verifies an actual slate IDR with unchanged SPS/PPS and canvas.
+Independent decoding verifies the procedural slate. The real ingress/recorder
+fixture also reproduces the old lost-tail Stop bug and proves corrected EOF
+ordering, independent recording completion and retained validation after End.
+These results do not qualify the continuous app driver or an iPhone. Evidence
+is retained under
+`target/ios-video-ownership-fixture/20261022T212152Z-1ee027cf/` and
+`target/privacy-standby/output-ownership-v3/`.
+
+The first iOS runtime composition was held on five review findings: stale
+failure arbitration, held Resume probes, lost route-fault receipts, off-grid
+video cutover and a premature first AAC timer slot. The second candidate repairs
+these paths and passes 241 focused tests with warnings as errors. Independent
+review is clear for the ten runtime files. Publishing confirmation requires an actual SDK
+queue admission and dequeue for the same validated sample, with independent
+recording admission. Seven generated native integration cases and two historical
+negative controls pass, including a one-byte publishing queue refusal,
+pre-IDR audio refusal followed by valid IDR recovery, and End with continued
+recording and validation. Independent review of the final source and these
+proofs is clear. Evidence is retained under
+`target/privacy-standby/ios-runtime-v2/` and
+`target/privacy-standby/output-ownership-v3/`.
+The final independent review receipt is
+`target/privacy-standby/ios-final-composition-independent-review.local.json`.
+No transport call or absent handshake substitutes for a local queue receipt.
+
+The reviewed [iOS audio-only background packet](ios-background-audio.md)
+retains the exact opted-in show's native microphone input and pinned route in
+Standby. Its discard delegate reads no sample data; generated silence retains
+an independent cadence and fresh AAC generation. The UI discloses the active
+microphone before Start and in Standby. An exact-run native route-fault receipt
+fences media before queued diagnostics, and actual input, callback, route and
+audio-session receipts gate successor capture independently of file and network
+cleanup. The final candidate passes 255 focused tests, including eleven anchor
+and three new route regressions, with warnings as errors. Its 63-source iOS 16
+API check and independent source review pass. Evidence remains under
+`target/privacy-standby/ios-background-audio-v3/` and
+`target/privacy-standby/ios-background-audio-independent-review.local.json`.
+Physical locked-screen cadence, interruption, power and sustained operation
+remain release gates. The paired iPhone is reachable but currently reports a
+required passcode; Sapflow was not running. No phone or Pixel capture was
+changed during these checks.
+
+The SDK now supports independently closing publishing or recording admission.
+Each successful close is irreversible for that fanout, preserves its accepted
+prefix for ordinary draining and leaves the other branch usable. A busy call
+is not a closure receipt. Swift and Kotlin consumers exercise the real exported
+methods. The workspace passes 629 tests with four normally ignored, strict
+all-target Clippy and formatting; the bounded mobile-media fuzz target compiles.
+Apple, four-ABI Android and ARM64 development packages are rebuilt and their
+installed ownership consumers pass. These SDK gates do not qualify the pending
+native standby adapters or a physical phone. Evidence is retained under
+`target/privacy-standby/sdk-fences-v1/`.
+
+The latest upstream merge is pinned to `9f75eaa`, adding optional SRT encryption
+and clean SIGTERM shutdown. The merged workspace passes 631 tests with four
+normally ignored, strict all-target Clippy, formatting and locked compilation of
+all fuzz targets. The generated SRT/RTMP smoke passes independent HLS decoding,
+callbacks, retained reconnect recording, encrypted/unencrypted optional SRT,
+wrong-passphrase refusal and SIGTERM. The trial plan retains complete-show
+qualification before selecting our app. Evidence is retained under
+`target/mobile-origin-integration/v4/`; this merge did not rebuild the earlier
+native SDK packages or qualify a phone or deployment.
+
+The reviewed background-audio iOS composition compiles Debug, Qualification and Release
+unsigned apps and the actual Debug device test bundle with compiler warnings
+as errors and zero warnings. Built required-reason resources and creator
+configuration verify in every app; the test bundle contains the byte-identical
+manual-profile corpus. Its two publisher worker tests now use real admission,
+an actual empty recorder and joined cleanup; 86 packaged host tests pass.
+The final 63-source iOS 16 API check also passes against the current packaged
+libraries. Evidence is retained under
+`target/privacy-standby/ios-composition-app-v3/` and
+`target/privacy-standby/ios-background-audio-v3/`.
+The preceding worker test receipt remains under
+`target/privacy-standby/ios-runtime-v2/final-context-addendum.local.json`;
+the background-audio packet does not change its worker or recorder sources.
+These apps are unsigned and the device test bundle was compiled, not executed
+on a phone. No app or SDK package was published.
+
+The preceding single-generation macOS AAC snapshot passes the unchanged strict
+stored-payload and presentation oracles for six recording cases. Native output
+is shared with actual packaged Rust validation and the real recording writer.
+The aligned, partial and 511-frame nonperiodic cases retain exact native PCM
+extents and exceed 0.99994 zero-lag correlation in both native and independent
+decoding. This supersedes the older pre-repair payload failure for this exact
+source; it does not qualify a cold encoder transition or a physical phone.
+Evidence is retained at
+`target/ios-audio-only-fixture/20261022T175340Z-9c5c8319/receipt.local.json`.
+
+An independently reviewed Android standby transaction model now passes 32
+warnings-as-errors JVM tests and the same 32 tests in the real Debug Gradle
+project. It covers priority privacy fencing, explicit Start/Resume, delayed
+callbacks, immutable retiring-AAC identity, sink admission and original
+deadlines. That foundation did not connect capture, codecs, the UI or SDK queues;
+the subsequent candidate and its trusted receipt adapters remain to be qualified against the new SDK
+terminal branch fences.
+
+Generated macOS feasibility experiments expose why cold AAC needs separate
+recording accounting. Discarding the old encoder leaves one decoded access
+unit of old overlap in the tested continuous decoder; applying another file
+head trim at an interior join fails the prototype writer. A second prototype
+preserves all coded units, accounts for interior transition slots against the
+requested standby interval and applies only the initial file trim and final
+tail trim. One, two and three joins retain exact native decoded frame counts
+and payload sequences, with independently decoded silence at each predetermined
+fresh-generation boundary; an insufficient interval is refused. This is an
+offline generated feasibility result, not actual app integration, real-time
+pacing, independently verified native PCM timestamp continuity, Resume-to-live
+testing, Android codec proof or physical qualification.
+Receipts are retained under `target/privacy-standby/ios-feasibility/`.
+
+The [native camera packet](native-camera-controls.md) now implements Front/Rear
+selection before Prepare, live source replacement and capability-bound zoom,
+focus, exposure and white-balance controls on both apps. A successful source
+change retains one hardware encoder, canvas, audio path, recording, publisher
+and grant. Front preview is mirrored separately from unmirrored encoded output;
+Android uses the facing-aware sensor/pose convention and complete producer crop.
+Requested settings and native acknowledgement remain distinct from optical
+convergence or remote playback. Microphone-only remains camera-free.
+
+Source retirement, first-frame deadlines, true video timestamp gaps, delayed
+callbacks, Stop and incomplete recordings have explicit ownership gates. The
+six-second operation ceiling retains the existing sub-two-second successful
+video-gap requirement and MPEG-TS limits. A source fault fences new camera/audio
+admission on its exact run. Normal Stop cannot rearm an old switch deadline or
+turn a successfully cancelled switch into an incomplete recording.
+
+The reviewed iOS V3 and Android V4 snapshots pass 205 Swift host tests and 67
+focused JVM tests with warnings as errors. All three unsigned iOS configurations
+and the actual Debug test bundle compile with compiler warnings as errors;
+the packaged creator-owner consumer passes 47 tests. The actual products pass
+required-reason privacy and byte-identical manual-profile corpus checks. The
+iOS device test bundle was compiled, not executed on a phone.
+
+Android Debug and Qualification each pass 449 tests in 57 suites with no failures,
+errors or skips. All three APK assemblies, lint and isolation pass. The actual
+ARM64 media library matches the current AAR, with 16 KiB ZIP and ELF alignment
+verified. Lint has 15/14 warnings and zero errors, including a cosmetic Compose
+function-naming warning in the new controls. Receipts are retained under
+`target/camera-controls/`, with final app gates in `delivery-v2/`. No device
+installation, capture interruption, private media, signer or live service was
+used. Physical source switching, preview/decoded geometry, controls, audio and
+recording continuity remain open, alongside standby, QR/deep-link and other
+B4R/B5 work. This does not claim a performance advantage over another app.
+
+The preceding upstream integration is pinned to `004be18`. RTMP now lives in
+`sapflow-rtmp`; its publishing client and receiver retain this branch's bounded
+queues, explicit audio-only topology and terminal semantics. `TrackSet` lives
+in runtime-free `sapflow-core`, with the existing HLS exports retained, avoiding
+a production dependency cycle. Both lock files were regenerated with Cargo;
+external package identities are unchanged, and the licence notice regenerates
+without a change.
+
+The optional `SAPFLOW_HTTP_IMPL=own` viewer loop is integrated while Hyper/Tokio
+remains the default. The merged workspace passes 624 tests with four normally
+ignored, strict all-target Clippy, formatting and locked compilation of every
+fuzz target. No long fuzz run is claimed. New real-socket parity coverage checks AAC live playback, terminal-part
+wake-up, retained A/V-to-AAC initialization/part/segment bytes, GET/HEAD metadata,
+closed and replaced presentations, public control/API refusal and malformed or
+future blocking requests. Connection-close handling now honours `close`
+regardless of token/header order. Both backends pass the generated SRT/RTMP
+smoke, independent HLS decoding, callbacks, reconnect with one recording and
+encrypted passphrase acceptance/refusal. Receipts are retained under
+`target/mobile-origin-integration/v3/`; these remain local synthetic gates.
+
+The `0.1.0` Apple, four-ABI Android and ARM64 development media SDKs are rebuilt
+and pass their installed ownership consumers. Their previous same-version
+archives are preserved with the `v2` receipts. The native app results and SDK
+hashes in that earlier record below belong to its exact prior source snapshot;
+the camera packet's current app results are recorded above. No phone capture,
+signer, private media or live service was used by this integration.
+
+The source also integrates upstream library publication preparation at
+`efea332`, including workspace version `0.1.0`, public Rust API documentation
+and the server Cargo package name `sapflow`. The server's directory and binary
+paths remain unchanged. Both lock files were regenerated with Cargo, preserving
+all external dependency entries and the Signet patches. Merge resolution keeps
+the feature branch's executable Rust behaviour; additive audio-only/topology
+documentation now passes the new strict documentation lint.
+
+Apple, four-ABI Android and ARM64 development media SDK packages build as
+`0.1.0` and pass their installed host ownership consumers. Android's normal
+default and SRT qualification helper derive the AAR filename from the workspace
+version; the explicit absolute override and independent app marketing version
+are retained. Earlier SDK archives remain available. The merged workspace
+passes 605 tests with four normally ignored, strict Clippy, formatting and
+locked compilation of all fuzz targets. The synthetic origin smoke passes
+SRT/RTMP, independent HLS decoding, reconnect with one recording and encrypted
+passphrase acceptance/refusal. Finite compilation and generated loopback checks
+remain separate from long fuzzing, physical shows and publication. No crate,
+app or branch has been published by this integration. Receipts remain under
+`target/mobile-origin-integration/v2/`.
+
+Against those rebuilt media packages, all three unsigned iOS app configurations
+and the actual Debug unit-test bundle compile with compiler warnings as errors;
+the 47-test packaged creator-owner regression passes. Android Debug and
+Qualification each pass 419 tests in 55 suites with no failures, errors or
+skips. All three APK assemblies, Qualification/Release lint and isolation,
+actual ARM64 native equality and 16 KiB ZIP/ELF checks pass. Lint retains 14/13
+warnings and zero errors. Required-reason iOS privacy resources and the bundled manual
+profile corpus are verified in the actual products. The separate reviewed
+SignetAuth package is retained. No phone capture was interrupted. This integration
+did not install an app, execute the iOS unit bundle or exercise a live service.
+
+The source now adds [pre-Prepare orientation selection](capture-orientation.md)
+on both apps: Automatic remains the default, with fixed Portrait and landscape
+mounting choices. The exact preparation retains fixed geometry through
+permissions, Start and later sensor/display events. Exact ownership rejects
+delayed Automatic events from a retired preparation. Microphone-only ignores
+the setting. The adapters reuse the existing rear-camera transform and one
+hardware video encoder; fixed mode does not track the horizon.
+
+This packet passes 166 Swift host tests and the 47-test creator-owner regression,
+all-production-source iOS 16 typechecking, all three unsigned iOS app builds
+with compiler warnings as errors, and actual Debug test-bundle compilation.
+The iOS bundle was not executed on a device. Android passes 37 focused host
+tests, 48 selected Gradle tests and 419 tests in 55 suites in each of Debug and
+Qualification, with zero failures, errors or skips. All three APK assemblies,
+Qualification/Release lint and isolation, actual ARM64 native bytes and 16 KiB
+ZIP/ELF checks pass. Lint retains 14/13 warnings and zero errors. Independent
+source review is clear on both exact source snapshots. Local receipts remain
+under `target/orientation-choice/`. Physical decoded pixels, preview fit,
+fixed-mode epoch/recording continuity and Automatic viewer recovery remain open.
+No phone installation, capture, private media or live service was used.
+
+The current source adds
+[saved manual destinations and reviewed JSON file import](manual-destination-profiles.md)
+on both platforms. Android stores up to 16 profiles in a separate Keystore-backed
+encrypted document. Both importers enforce one 16 KiB versioned format, present
+only validated host/port/security for review, require independent plaintext
+permission and keep Apply separate from Save, Prepare and Start. Exact import
+tickets and actual capture availability reject stale replies. Android retains
+its own document picker's ticket through the expected external-activity
+departure, defers reading until foreground return and prevents an old result
+from being adopted by a recreated activity. V4V configuration and scoped grants
+remain outside manual imports.
+
+Independent review also exposed and this packet repairs two existing iOS
+credential-pairing seams. New Keychain values bind the secret to its exact
+profile identity, endpoint, transport and plaintext setting, so interrupted
+metadata/protected writes cannot pair an old peer with a new secret. Resolution
+also checks the exact cached profile selected by the caller against fresh
+metadata. Historical raw secrets remain readable until their next explicit
+Save upgrades them; their original endpoint binding cannot be reconstructed.
+Corrupt profile metadata now fails visibly instead of becoming an empty list.
+QR/deep-link import, physical document providers, Keychain/Keystore, crash
+durability and the remaining B4R controls retain separate gates.
+
+The reviewed profile packet passes 25 focused Swift tests and the existing
+159-test capture/control suite, with an iOS 16 typecheck and all three unsigned
+app configurations built with Swift warnings treated as errors. The actual
+Debug unit-test bundle compiles and contains a byte-identical copy of the
+64-case shared profile corpus; the iOS bundle was not executed. Android passes
+25 focused host and actual Gradle tests, then 410 tests in 54 suites in each of
+Debug and Qualification, with zero failures, errors or skips. All three APKs,
+qualification/release isolation, actual ARM64 native libraries, 16 KiB ZIP/ELF
+alignment and required iOS privacy resources pass. Qualification/Release lint
+has zero errors and the existing 14/13 warnings. Finite seeded mutation checks
+cover 1,024 Swift and 2,048 Kotlin inputs; these are not long-fuzz acceptance.
+
+The first full Android lint run correctly refused two calls requiring API 30.
+The repaired implementation keeps API 29, uses a five-second logical timeout
+and retains its IO slot until real read/close and any begun cancellation finish.
+Independent review is clear on the final source. Receipts remain under
+`target/manual-destination-ios/v2/` and
+`target/manual-destination-profiles/android-v3/`; the original lint failure is
+retained under `android-v2/`. No device installation, app launch, private media,
+real provider, live service or signer action was exercised by these gates.
+
+The branch subsequently integrates `origin/main` at `7a3435f` through merge
+`422fd5b`, including receive-buffer hardening, default parser-log filtering and
+the standalone listener example. The combined workspace passes 605
+unit/integration/doc tests with four normally ignored, strict all-target Clippy
+and formatting. The new upstream example needed formatting only. Regenerating
+the 136-crate licence notice produces no tracked change. The generated loopback
+smoke passes SRT/RTMP ingest, independent HLS decode, callbacks, reconnect with
+one recording and encrypted passphrase acceptance/refusal. Its fixture servers
+and generated media are cleaned by the harness. These remain local origin
+gates, separate from physical phones or a deployed V4V show.
+
+The current source adds the first background slice of the
+[native microphone-only mode](audio-only-mobile.md) on iOS and Android. Its
+immutable intent follows permissions, storage, grant admission, Start, reconnect,
+private recording and exact-topology observation. Audio-only creates no camera,
+video encoder or preview and waits for no video keyframe. Native output is AAC-LC
+48 kHz mono at a 96 kbit/s target, with a separate 1 Mbit/s engineering grant
+floor. Background continuation is off by default and is limited to an opted-in,
+already committed audio-only show. Video and any audio-only show whose Start has
+not committed stop on foreground departure. An eligible committed show may still
+be establishing or re-establishing its authorised transport.
+
+Android uses an application-owned, non-exported, `START_NOT_STICKY` microphone
+foreground service and an exact per-show notification **Stop and save** action.
+Notification and microphone authority are required before Start. iOS uses the
+declared `audio` background mode and an exact in-app Stop action; SDK 18.2 has no
+truthful locked-screen microphone Stop facility, so no playback/Now Playing state
+is fabricated. Both platforms keep V4V End distinct from Stop and save, retain
+exact journal/owner leases through real cleanup and recheck grant authority at
+native transport submission. Physical lock/background, process/service kill,
+network switch, notification/privacy toggles, external routes, recording and
+sustained-show qualification remain open; this source/build packet does not
+complete B4R.
+
+The Android service now delegates its real command, foreground promotion,
+notification, timer and teardown ordering to a production-used cold lifecycle
+driver. Duplicate ARM or Stop cannot re-promote or retire a show whose native
+cleanup is still retained. Failed platform promotion stops the unpromoted
+service promptly while leaving exact application cleanup ownership intact;
+successful promotion followed by rejected capture admission retains its
+notification until actual closure. Thirteen driver regressions cover these
+seams, stale/successor commands, task removal and unexpected destruction.
+
+Foreground microphone selection now has native adapters and normal controls on
+both platforms: System Default plus bounded built-in/wired/USB inventory, frozen
+Prepare choice and actual-input verification before PCM admission. Default pins
+its first verified input through rotation; mismatch/disconnect stops the current
+capture without fallback or restart. Bluetooth/unqualified routes remain
+unsupported. Physical USB, hot-unplug, background/lock and sustained performance
+are open; source tests and app builds do not complete B4R. Routing
+source tests and source-matched app builds are separate from those physical gates.
+
+This source also adds explicit terminal TS input and actual recording drain.
+A complete bounded AAC PES held in one start packet is no longer stranded at
+connection EOF. Truncation, raw header stuffing, missing timestamps, codec epochs
+and stale generations have focused regressions. Local finite tests remain
+distinct from a complete native show and physical shutdown qualification.
+
+TS ingest now checks 8 MiB of unread input before copying, limits each assembled
+PES to 8 MiB and caps aggregate pending logical payload/reservation requests at
+16 MiB. Bounded START preallocation is charged immediately; replacement on the
+same PID includes both old and new ownership. A sticky `InputLimitExceeded`
+releases pending parser input and assemblies, refuses further input and lets
+`finish()` seal the accepted prefix with `media_loss` for incomplete recording.
+These figures do not bound Vec capacity, allocator overhead, retained HLS data
+or total process RSS.
+
+Three original failing cases now pass: valid-continuity unbounded PES growth,
+rotated-PMT reservation growth and oversized raw input. Independent V2 review
+also confirms the malformed special-header accounting repair and its three
+red-to-green regressions, preserving the old allocation's charge when upstream
+rejects a replacement before insertion.
+
+The earlier PES-limit snapshot passed 598 workspace tests with four normally ignored,
+strict all-target Clippy and formatting. The initial sandboxed run could not
+bind a loopback socket; the unrestricted loopback rerun passes, so that initial
+failure is an infrastructure limitation. The current source's full origin
+smoke passes SRT,
+RTMP, reconnect, encryption, independent decoding and recording callbacks.
+Its first run exposed a truncated final read in the black-box synthetic sender;
+controlled wire capture isolated that loss before origin ingest. The sender
+now validates complete TS packets and pads its final 1,316-byte block with
+at most six null packets. The corrected wire bytes match the generated input;
+production loss handling and smoke assertions remain unchanged. Five generated
+`ts_ingest` seeds replay, and the fresh AddressSanitizer/overflow run completes
+13,298 executions over 62 seconds. These finite local checks do not establish
+a complete physical show, a total-memory bound or sustained performance.
+
+App checks pass 347 Android unit tests in each of Debug and Qualification,
+with three APKs, build isolation, 16 KiB ZIP/ARM64 ELF alignment and Release
+lint. The current Qualification report has 14 warnings and the Release report
+has 13, both with zero errors. All three unsigned iOS app
+configurations and its actual unit-test bundle compile with zero warnings;
+the iOS unit bundle was not executed. Focused Swift checks also pass
+149 capture/control/routing, 26 catalogue/storage, 33 library/export and 33
+creator-owner tests. Observation has 49 host tests and 77 packaged Rust publisher
+tests; these suites overlap. An actual generated macOS decoder matrix accepts
+48 kHz mono AAC without video, rejects wrong profiles/topologies and passes the
+hardware A/V regression. Twelve provider and twelve loopback HTTP route tests
+also pass. Fresh Apple, ARM64 Android and four-ABI Android SDK packages now build
+from the PES-limit source and pass their installed ownership consumers. The 77
+publisher and 33 creator host tests continue to pass against the Apple package.
+Unsigned Debug, Qualification and Release iOS builds compile with warnings as
+errors. Android Debug and Qualification each pass 347 unit tests; their app
+assemblies, qualification isolation and lint pass, as do Release assembly and
+lint. An initial Android compile used the stale four-ABI AAR after only the
+separate ARM64 package had been refreshed; rebuilding the actual app dependency
+resolved the missing generated bindings without a source change. These are
+local package/build results, not CI or phone acceptance.
+
+The current background-audio source has a source-matched app gate: all three
+unsigned iOS configurations and the actual unit-test bundle compile/link with
+zero warnings; the unit bundle was not executed. Android Debug and Qualification
+each pass 385 tests in 53 suites with no failures, errors or skips. All three APKs assemble;
+qualification/release isolation, native ARM64 and 16 KiB ZIP/ELF checks pass.
+Qualification/Release lint has 14/13 warnings and zero errors. Debug and
+Qualification use the existing debug certificate; Release is unsigned. These
+builds reuse the existing native SDK packages unchanged. Focused routing checks
+remain green; final Swift host gates pass 159 budget/lifecycle, 69 V4V, 50
+observation, 86 publisher, 36 creator-owner and 14 configuration tests. The
+production SRT Network.framework cancellation check also passes. No phone,
+USB/hot-unplug, Bluetooth, physical background/lock, process/service kill or
+sustained-performance qualification is claimed.
+
+The 22 October 2026 generated native AAC checkpoint writes new audio-only
+recordings as M4A, while video-bearing and historical container-less recordings
+remain MOV. It uses the converter's observed priming and tail extents without
+changing shared publishing payloads, timestamps or AudioSpecificConfig. All 143
+native AAC access units from the 144000-frame case remain in their original
+stored order and pass the packaged Rust ingress. Native playback returns the
+exact 144000-, 143360-, 143123- and 511-frame input extents; the three
+non-periodic presentation comparisons have zero-lag correlations above 0.99994.
+FFmpeg may retain the declared dynamic trailing padding, so its decoded tail
+length is not treated as a universal exact-presentation assertion. The source
+checkpoint passed 38 catalogue/storage/timing and 35
+library/admission/destination/owner host tests with warnings as errors,
+typechecked 51 production Swift files against iOS 16 APIs, and preserved the
+unchanged A/V MOV path through three strict independent decodes. The frozen
+source and aggregate receipt are under
+`target/ios-audio-recording-retention/v1/source-v1/`; the final generated M4A
+receipt is
+`target/ios-audio-only-fixture/20261022T122618Z-50ecbe54/receipt.local.json`.
+This is generated macOS evidence only. Physical iPhone, background, lock-screen,
+route-change, long-show, crash, power-loss and thermal acceptance remain open.
+A fresh read-only Apple/CoreDevice inventory still reports the primary iPhone
+unavailable. UI Automation was already enabled; no new physical runner,
+installation or camera test is claimed. The Pixel's current capture remains
+untouched.
+
+Scoped origin recording completions now include non-empty immutable
+`recordingTracks` booleans captured from each writer's own initialization.
+Legacy callback bytes remain unchanged, codec epochs retain their distinct
+topologies and synced incomplete prefixes stay labelled incomplete. This is the
+producer half of replay classification. The V4V receiver still needs to persist
+and fence the topology with the exact recording receipt before selecting
+`audio/mp4` or `video/mp4`; current acceptance does not prove replay adoption,
+decoding or complete-show aggregation.
+
+The checkpoints below retain their original source/package context and counts.
+
+The preceding origin prerequisite adds [explicit AAC-only ingest](audio-only-origin.md)
+through our SRT/TS and RTMP paths, HLS and recording, without a video keyframe.
+Track declarations are bounded and immutable per connection. Canonical AAC-LC
+validation, rational 44.1 kHz timing, current-part track receipts and explicit
+audio-only health are implemented. Recording loss survives epoch rollover and
+protocol rejection; an ingest error cannot append a new codec under an old file
+header. Main `8f9d7de` is integrated locally by merge `160e505`.
+
+This source passes 552 workspace tests with four normally ignored, strict
+all-target Clippy and formatting. Actual generated Swift and Kotlin host
+consumers and eight status-lease checks pass against the current host library.
+The existing mobile packages remain unchanged and represent their preceding
+Rust snapshot. Five changed fuzz targets replay their historical regressions
+and seeds, then each pass 61 seconds with AddressSanitizer and overflow checks:
+1,569,357 mutation executions in total. These are local finite gates, not CI,
+phone, sustained-load or competitive performance acceptance.
+
+Generated loopback tests independently decode four AAC profiles through SRT or
+our production RTMP publisher, HLS parts/segments and recordings; an A/V SRT
+regression and nine negative cases also pass. Actual audio-only health carries
+a null keyframe interval; A/V remains numeric. RTMP recordings preserve all
+283/260 source frame counts. Initial SRT recordings contain 272/253. A separate
+controlled test with an explicit 1,316-byte chunk and nine-second sender timer
+captures the exact TS wire bytes: the unpadded test sender omits the final
+1,128/188 bytes before the origin. Valid null-TS padding completes its last
+block; captured bytes/hash then match the input and recordings contain 283/260
+frames. Native shutdown, terminal PES cases and complete-show retention remain
+open. The earlier default-chunk/EOF run remains separately labelled evidence.
+No phone recording was accessed;
+all test media were generated and all owned runtime children/scratch removed.
+At that earlier checkpoint native mic-only mode and audio-only observation were
+unfinished. Physical background/lock/routes and complete-show qualification
+remain open in the current checkpoint too.
+
+The latest reviewed source adds Capture elapsed, Broadcast elapsed and measured
+Socket outbound to both native apps. Local write completion remains separate
+from remote delivery or decoded-media proof. Reconnect gaps have no fresh rate;
+incomplete historical totals remain labelled while a healthy successor warms
+up its own rate. End freezes the broadcast clock without stopping independent
+capture/recording. iOS telemetry is committed locally as `0a92e51`.
+
+Android commit `7a50c0d` adds a private show/segment catalogue, cold profile-specific capacity
+and storage checks, and explicit export through the system document picker.
+Unfinished and orphaned files remain visibly unverified. Export revalidates its
+original selected file, preserves the private original and retains capacity
+until actual owners close. The picker is unavailable during capture. Late
+permission/storage replies cannot revive a cancelled Prepare; healthy live
+file ownership and uncertain cleanup are distinct. The catalogue currently
+bounds scans to 256 segments; management and pagination remain open. There is
+no automatic crash repair, deletion or replay publication.
+This builds on `1e9b031`, which preserves recording across queued Start/End,
+rotation and publisher-failure races with exact intent and actual cleanup fences.
+
+The combined Android gate passes 305 tests across 46 suites in each of Debug
+and Qualification, with zero failures/errors/skips. Three APKs assemble,
+qualification/release isolation and all ARM64 libraries' 16 KiB alignment pass.
+Lint has zero errors and seven/six warnings. Debug/Qualification use only the
+existing debug certificate; Release is unsigned. The separate generated-media
+macOS native mux/recorder test independently decodes finalised and clean-abort
+segments. This does not qualify Android storage/providers or torn-file repair.
+
+The preceding iOS telemetry snapshot passes 109 pure tests, 65 packaged control/authentication tests
+and 32 creator-owner tests. These suites overlap. All three complete unsigned
+app configurations compile and link with zero warnings, using identical source
+and both existing native packages. The actual 94-input unit-test bundle also
+compiles and links; it was not executed. Independent source and artefact reviews
+are clear. No app was installed and the owner's Pixel capture was untouched.
+A fresh read-only Apple device inventory still reports the primary iPhone
+unavailable; the owner's confirmation that UI Automation was already enabled
+does not establish a new runner or camera result.
+
+The subsequent iOS implementation adds a private show/segment catalogue,
+selected-profile storage admission, legacy unverified-file listing and explicit
+folder export. Capture and export share a reservation gate; actual modal
+dismissal and checked worker cleanup precede new capture. Unknown close retains
+the file owners, permission scope and directory lock. Storage work runs on cold
+workers; low space finalises an incomplete recording prefix while current
+publishing continues. A later rotation can still stop publishing because restart
+requires successful segment finalisation. This limitation remains open.
+
+Focused checks pass 117 pure capture/budget tests, 26 catalogue/storage tests,
+33 library/export tests and 17 generated privacy-resource tests. A generated
+macOS check uses the production native recorder: a 3.02-second finalised file
+and two 1.26-second incomplete prefixes independently decode with video and
+audio; exported copies match their originals. These are generated fixtures,
+not phone recordings, real disk-pressure or process-kill recovery evidence.
+The required-reason privacy resource is a partial packaging checkpoint;
+collection/tracking assessment and App Store readiness remain open.
+All three complete unsigned iOS app configurations compile and link with zero
+warnings, using identical 84-file source/package contexts. Each actual normal
+app archive contains the verified root privacy resource and the expected
+configuration. The actual 109-input iOS test bundle compiles and links with
+zero warnings after restricting its subprocess lock test to macOS; no iOS
+tests were executed. No app was installed, signed for distribution or published.
+
+These are local source/build checkpoints. Physical profiles, current app
+recording/export, real creator/signer consent, sustained performance, store and
+owner acceptance remain open. The [OBS and library-quality work](library-quality-plan.md)
+continues alongside these app gates; performance superiority is not established.
+
+The preceding iOS quality commit `0710256` adds an explicit native 640×480 option beside
+720p30, retaining the selected profile through Prepare, Start, rotation and
+reconnects. Native camera output and compressed H.264 dimensions are checked;
+1080p remains an engineering path excluded from the ordinary picker. V4V
+quality admission precedes camera/publisher construction, accepts an explicit
+480p choice with a 1 Mbit/s grant and refuses insufficient capacity without
+changing quality. Acknowledged server operations cannot be retried merely
+because local publisher construction failed. Settings reopen only after the
+actual capture cleanup barrier, including rejected late candidates.
+
+Its generated-fixture checks pass 88 pure capture/profile/destination tests,
+65 control/authentication tests, 32 creator-owner tests, 39 observation tests
+and 48 publisher/observation tests. These suites overlap. All three complete
+unsigned iOS configurations and the actual unit-test bundle compile and link
+with zero warnings or errors, using both existing native packages. The unit
+bundle was not executed. This is source/build evidence; physical per-profile
+capture, real service/signer acceptance, sustained performance and distribution
+remain open. The iOS origin probe still confirms actual A/V decode for the
+current attempt without comparing remote dimensions to the chosen profile.
+
+Latest local checkpoint, 22 October: the requested origin-main integration is
 complete as `1485ec0`; the later main documentation changes are merged as
 `8116361`. SDK commit `1634a809` separates transport recovery from decoded
 readiness. The full workspace gate at that checkpoint passes 475 tests, with
@@ -41,18 +1176,127 @@ not run on the Pixel; the owner's existing capture remains untouched.
 iOS commit `fdc731fc` provides typed V4V contracts, bounded URLSession control,
 durable session operations and encrypted journal storage. It passes 35 host
 Swift tests and an iOS 16 compile check with warnings treated as errors.
-Independent review is clear. It is a foundation separate from the installed
-app: creator sign-in, application wiring and real Keychain/network acceptance
-remain open.
+Independent review is clear. At that foundation checkpoint creator sign-in,
+application wiring and real Keychain/network acceptance remained open. The
+normal application source below extends that work; the installed app remains
+separate from these source gates.
 
 Further iOS source adds a finite production origin-observation component with
-23 passing host tests and an iOS 16 compiler check. It requires hardware H264
+36 passing host tests. The earlier component passes an iOS 16 compiler check.
+It requires hardware H264
 decode on iOS 17 or later, real PCM progress, fresh status on both sides of
 decode and a final attempt-scoped SDK confirmation. The generated-media macOS
 gate produces six hardware video outputs and 7,104 PCM frames, rejects
 header-only input and confirms cleanup. Delayed observer replies cannot mutate
 the creator's refreshed grant. This component is separate from application
 wiring, physical iPhone decoding, real creator sign-in and sustained performance.
+The new scoped publisher composes the existing reconnect owner, captured SDK
+attempt, fresh nonce and origin observer. Its combined host gate passes 41
+tests against the actual packaged Rust session, using simulated transport and
+decode facts. A single app-owned observation slot retains uncertain cleanup
+without polling or admitting another decoder. Scoped queue/pacing limits,
+early codec-close fencing and an independent monotonic grant-expiry alarm are
+implemented in source. The normal creator application wiring is described
+below; the installed app has not been replaced by this work.
+
+The separate maintained Signet authentication package now builds for ARM64
+macOS, iOS and iOS Simulator. The actual combined static consumer, iOS 16
+module/typecheck and combined iOS static link pass. The scoped worker and
+dependency packet passes 512 workspace tests, strict Clippy, parser fuzz and
+ten packaging regressions. The generated app project declares both packages;
+the full unsigned iOS application builds and links both with zero warnings or
+errors. Authentication headers have their own module directory, avoiding a
+shared Xcode include destination. The normal application now includes creator
+sign-in controls; real remote-signer consent and physical app qualification
+remain open. No real account or relay was used by these build gates.
+
+The creator-read packet passes 63 Foundation tests, including twelve new tests,
+and real-package macOS/iOS 16 compiler checks. Its event list is bounded and
+display-only. Fixed authenticated collection and exact-session reads preserve
+uncertain operations and terminal End intent; reads never recover a grant.
+The earlier capture-admission fix passes 59 host tests, including twenty ticket
+tests. All 32 production Swift files at that checkpoint typecheck for iOS 16 with
+both real native modules and no warnings. Prepare, permission replies, Start, Stop and rotation retain
+their exact admitted intent. Stop waits for outstanding destination construction
+and actual rejected-destination cleanup before allowing another intent. These
+are source gates; physical capture remains open.
+CI now includes source verification and the generated-only source and packaging
+regressions. Those commands pass locally; hosted CI has not run for this branch.
+
+The normal SwiftUI application now has explicit Record only, Manual destination
+and V4V modes. A single app-lifetime creator owner composes the real Signet
+adapter, separate encrypted publish and signer journals, typed event reads,
+durable session operations and the scoped publisher. Connect signer, Prepare
+and Start are explicit. An uncertain operation retains its original identity;
+inactive mode cannot attach a late grant or start capture. Refresh requires an
+acknowledged lease, and recovery acknowledgement and replacement are separate
+actions. V4V remains free, unlimited and without a watermark.
+
+End fences a delayed first Start while preserving a recording already in
+progress, including its orientation epochs. Publishing starts before the Run
+is exposed to initial samples; publishing startup failure closes only that
+worker. Leaving a manual destination fences its exact publisher independently
+of delayed display state. Closed creator owners retain the observation slot,
+HTTP, signer and journal ownership until actual cleanup. The fixed production
+journal lock prevents a replacement production owner overlapping that cleanup.
+
+The current iOS source also gives an authenticated creator an explicit way to
+end an active event broadcast that has no local journal. The destructive
+confirmation carries the exact displayed event/session/generation/revision into
+the owner. A fresh exact-session GET must complete within both its eight-second
+permit and the original 60-second command window. Only an exact active receipt
+is atomically persisted with terminal End intent; no grant, publisher, camera
+preparation or capture authority is adopted. Identity changes, contradictory or
+late replies and journal-save failure send no End. The resulting terminal scope
+then uses the existing durable End request and restart/retry rules.
+
+This packet passes 72 Foundation control/authentication tests and 40 creator-owner
+tests against the actual Apple packages. The generic unsigned arm64 Debug app
+also builds with warnings treated as errors. Independent review found and the
+implementation closed both a stale confirmation identity race and a retry that
+could otherwise adopt terminal ownership after the original command window.
+These are host and compiler gates; no service request, signer consent, signed
+installation or physical iPhone flow was exercised.
+
+The follow-on creator-owner continuity packet retains an automatic V4V grant
+refresh deadline while Start or another command owns admission, and reconciles
+an overdue deadline when the scene returns to the foreground. Each scheduled
+refresh is bound to the publisher binding's original generation and exact
+capture ticket. Stop, End, expiry and retirement therefore fence both delayed
+alarms and an already-admitted refresh whose queued action has not run. A
+durably staged refresh still uses the existing exact-body and nonce retry path.
+The focused creator-owner suite passes 47 tests, including deterministic Stop
+races on both sides of automatic command admission, duplicate-alarm coalescing,
+foreground reconciliation and expired-authority fencing. This is source and
+host-test evidence. The generic unsigned arm64 Debug app also builds with Swift
+warnings treated as errors. No service, signer, signed installation or physical
+show was exercised by this packet.
+
+V4V is unavailable by default in Debug and Release. A separate Qualification
+configuration requires explicit approved routing and native authentication.
+Qualification settings do not enable the ordinary configurations. These source
+and build boundaries do not establish a deployed native-session backend, real
+signer consent, Keychain acceptance or a physical V4V show. No installed app or
+active Android capture has been replaced by this work.
+
+The earlier creator-wiring checks passed 74 pure capture/destination tests,
+64 control/authentication tests, 28 creator-owner tests using both real native
+packages, 39 observation/cleanup tests, 46 publisher/observation tests using the
+real Rust policy, and 14 configuration tests. These suites overlap; the counts
+must not be added as unique coverage. The final creator source also passes
+all three actual-package iOS 16 compiler checks without warnings. Independent
+source review is clear, including the actual asynchronous Signet cleanup
+notification after a prior failure consumed its result callback.
+
+The complete unsigned app builds for Debug, Qualification and Release with zero
+warnings or errors, using identical current inputs and both real native
+packages. Actual built property lists confirm default Debug is disabled,
+Qualification expands its explicit example profile, and ordinary Release remains
+disabled even when qualification variables are supplied. All three binaries
+contain the expected authentication and attempt-scoped media-confirmation
+symbols. The actual iOS unit-test bundle also compiles and links without warnings;
+it was not run. No signing, installation, device capture or real account action
+was performed by these gates.
 
 Test commit `d0643ff` adds a generated-media-only macOS native reader gate.
 The current origin's exact init plus independent part passes independent FFmpeg
@@ -751,7 +1995,9 @@ exists. In particular:
 - B3/B3R: complete our encrypted SRT and RTMPS publishing paths, independent
   interoperability, hostile-input fuzzing and impaired-network acceptance.
 - B4/B4R: attach real publishers; complete manual/V4V creator flows, observed
-  media status, audio-only/external audio, controls, standby and safe profiles.
+  media status, audio-only/external audio, controls, standby and safe profiles;
+  physically qualify elapsed/socket readouts, storage preflight and exact
+  recording export and the implemented iOS recording catalogue/export UI.
 - B5: sustained physical/network/thermal/storage tests, SDK consumption,
   route-specific signed packages, upgrade and free-V4V behaviour, owner
   acceptance, release readback and any production decision at its own gate.
