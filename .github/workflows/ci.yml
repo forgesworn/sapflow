@@ -61,6 +61,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Native package output regressions
+        run: node --test scripts/native-build-options.test.mjs
       - name: Native authentication source and packaging regressions
         run: |
           node --check scripts/build-signet-native.mjs

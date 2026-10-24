@@ -5,6 +5,14 @@ and Kotlin bindings against the actual host library and runs both consumers.
 The build reuses the checkout target; it removes its own staging directory and
 does not replace Apple/Android packages in check mode.
 
+For a fresh Apple or Android package location, add
+`--output-root=/absolute/checkout/target/native-packages-run1` to the corresponding
+build command. The destination must be a new canonical direct child of `target/`
+with a `native-packages-` prefix and a safe suffix. It is reserved before building;
+existing package outputs are preserved. Cargo continues to reuse the checkout's
+`target/`. Run `node --test scripts/native-build-options.test.mjs` to check option,
+path and output-preservation behaviour.
+
 Both consumers also exercise selective fanout admission closure.
 `closePublishingAdmission` and `closeRecordingAdmission` stop new admission to
 one branch without cancelling the other or clearing already accepted samples.
