@@ -7,11 +7,12 @@ or [native performance contract](native-performance-contract.md).
 
 The owner has approved `checked-sdk-playback-clock-v1`, a separate clock profile
 for application-controlled decoded PCM playback. Its [registered criteria](recording-recovery.md#checked-sdk-playback-clock-profile)
-use a checked rational source/movie schedule from whole returned frame ranges;
-implementation and qualification remain pending. Raw native timestamps and their
-original failed clock gates remain unchanged. Next implement and qualify that
-profile alongside concrete source-generation and capture closure, then complete
-paired presentation qualification. Explicit native and checked independent
+use a checked rational source/movie schedule from whole returned frame ranges.
+Its internal Android qualification owner is implemented in `f9e6830`; actual
+native profile qualification remains unrun. Next build and verify fresh SDK
+packages from stable current sources, then qualify that decoder/sink path
+alongside concrete source-generation and capture closure and paired presentation.
+Raw native timestamps and their original failed clock gates remain unchanged. Explicit native and checked independent
 readers already return the required 2,765, 48,000 and 2,765 programme frames from
 the original generated SDK files, but the paired native recorder control remains
 unsupported. The original stock-reader and fifteen metadata-profile failures
@@ -29,7 +30,20 @@ native buffer times and conversion remainders stay separate. The original
 2,875-byte numerical contract and all previous verdicts remain intact; the
 profile does not enable recording or playback by default.
 
-The audio retirement regression gate now passes 674 Debug tests, 664
+The implemented internal reader, clock cursor and file-backed PCM sink are wired
+into the generated qualification path. Five new app JUnit tests run in the normal
+Debug and Qualification suites. The actual build executes 679 Debug tests in
+74 suites, 669 Qualification tests in 73 suites and 38 Python controls, totalling
+1,386, with no failures, errors or skips. APK assembly, lint and qualification
+isolation complete successfully. The original global receipt remains failed with
+`sourceUnchanged=false` because concurrent SDK/Cargo/host changes invalidate its
+full source binding. The five Android candidate files remain unchanged and the
+APKs contain the previously built SDK package; current SDK freshness is
+unqualified. Seven artefact checks and the actual native profile run are unrun,
+pending fresh SDK qualification. No cached-runtime exception or default change
+is authorised by these retained build/test results.
+
+The earlier audio retirement regression gate passes 674 Debug tests, 664
 Qualification tests and 38 Python controls, totalling 1,376, with no failures,
 errors or skips. Its 14 new regressions cover successful audio input arriving
 during Stop, real thread joins, and queue/bookkeeping failures during retirement.
@@ -41,8 +55,8 @@ An offline metadata replay completes all three explicit-reader schedules at
 2,765, 48,000 and 2,765 frames and refuses the retained 5,120-frame wrong-length
 control. Original PCM hashes and raw timestamps remain unchanged. This replay
 uses saved observations, supplies no new native callbacks and grants no
-presentation or application admission. Real decoder/sink integration remains
-the next implementation step.
+presentation or application admission. The implemented decoder/sink owner still
+requires actual native qualification after fresh SDK packages are verified.
 
 The earlier qualification-only Android reader gate executes 660 Debug tests,
 650 Qualification tests and 38 Python verifier controls, totalling 1,348, with

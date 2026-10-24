@@ -1201,11 +1201,12 @@ buffer timestamps and full presentation qualification still need actual proof.
 ### Checked SDK playback clock profile
 
 `checked-sdk-playback-clock-v1` is a separately registered, owner-approved clock
-profile for application-controlled decoded PCM playback. Its status is
-`OWNER_APPROVED_SEPARATE_PROFILE_PENDING_IMPLEMENTATION`. The owner selected a
-checked application-owned rational schedule as the alternative presentation-clock
-criterion for this playback path. Registration records that policy choice; it
-reports no implementation, test, replay, integration or adoption pass. The
+profile for application-controlled decoded PCM playback. The approved policy is
+unchanged; its internal qualification owner is now implemented, with actual
+native qualification still unrun. The owner selected a checked application-owned
+rational schedule as the alternative presentation-clock criterion for this
+playback path. Registration alone grants no native qualification or adoption;
+implementation and host evidence are recorded below. The
 original `native-numeric-presentation-equivalence-v1` definition and its
 2,875-byte block remain byte-identical, with their mandatory gates and historical
 verdicts unchanged. This profile does not relabel a failed native-clock result.
@@ -1258,6 +1259,42 @@ and generation closure, paired native controls and applicable seeks remain
 separate requirements. The W3 native pair stays unsupported; the first cold
 258.189 ms result still fails the unchanged 250 ms limit.
 
+The internal `NativeRecordingReader`, `ReturnedPcmClock` and `RecordingPcmSink`
+are locally committed in `f9e6830`. The generated reader qualification path now
+uses this concrete owner for native input submission, output borrows, whole-range
+sink writes and checked terminal cleanup. Five shared app JUnit tests cover
+partial writes, failed writes, zero progress, reentrancy and release of a known
+native borrow after sink failure. They run in the normal Debug and Qualification
+suites. Live capture and the product recorder/player defaults have not adopted
+this path.
+
+The actual host build executes 679 Debug tests in 74 suites, 669 Qualification
+tests in 73 suites and 38 Python controls, totalling 1,386. All tests pass; the
+APK assemblies, lint and qualification isolation complete successfully. The
+original global receipt remains failed with `sourceUnchanged=false`: concurrent
+Rust/Cargo/host changes invalidate its full source binding. Independent review
+retains the Android build/test facts, the unchanged five-file candidate and APK
+native-byte readback against the previously built `b2c10ca` SDK package. Its
+initial SDK-match snapshot is not a current-tree qualification. The seven
+artefact checks and actual managed-owner native profile run are unrun. No cached
+SDK runtime waiver is authorised. Fresh packages from stable current SDK sources
+and their full checks are required before that native qualification advances.
+Private source/commit evidence is under
+`target/privacy-standby/android-native-aac-sdk-window-v1/interoperability-native-reader-v1/presentation-clock-integration-v1/`;
+the retained build and independent scope review are under
+`target/privacy-standby/android-checked-playback-clock-app-gates-v1/run-20261023T235332Z-386c59aa/`.
+
+A separate offline diagnostic compares every originally aligned sample in the
+three old 2,765 / 48,000 / 2,765-frame native S16 and checked independent Float32
+arrays. With the fixed representation-unit residual `S16 - Float32 * 32768`,
+maximum absolute errors are respectively 1,839/2,048, 1,093/1,024 and 1,819/2,048
+PCM16 amplitude units. No sample is rounded, cropped, shifted, clipped or
+rewritten, and no tolerance is applied. Independent arithmetic review is clear.
+These are cross-format diagnostics, not a paired native Int16 comparison, an
+independent valid-PCM byte-exact pass or presentation/admission qualification.
+All original files, hashes and raw clocks remain unchanged; the private result
+and review are under `target/privacy-standby/pcm-fullarray-crossformat-actual-v1/`.
+
 After independent source review, the ignored clock prototype passed all 26
 standalone synthetic checks using the installed Kotlin compiler and JVM. Its
 fixed offline metadata replay completed the three explicit-reader schedules at
@@ -1271,10 +1308,11 @@ remained unchanged. The private actual receipt is
 That replay uses new replay owners and saved observations, with separately
 labelled sink/release acknowledgements. It starts no codec and is not a
 reconstruction or rerun of live native callbacks. The raw native-clock gate and
-all content/source/presentation/admission flags remain false. A real decoder/sink
-qualification adapter, A/V origin and seek integration, metadata-allocation and
-sustained-resource measurements, source closure, durable recovery, aggregate
-loss, physical shows and release admission remain pending. The existing recorder
+all content/source/presentation/admission flags remain false. Actual native
+qualification of the implemented decoder/sink owner, A/V origin and seek
+integration, metadata-allocation and sustained-resource measurements, source
+closure, durable recovery, aggregate loss, physical shows and release admission
+remain pending. The existing recorder
 and playback defaults remain unchanged.
 The reviewed proposal is retained under
 `target/privacy-standby/android-native-aac-sdk-window-v1/interoperability-native-reader-v1/presentation-clock-candidate-v1/`.
@@ -1287,10 +1325,12 @@ failure against 250 ms remains failed and is not replayed as eligible. No result
 here establishes waveform/paired presentation, production/default adoption,
 physical capture, power/performance advantage or recovery.
 
-The concrete next work is implementation and qualification of the separate
-checked SDK playback clock profile alongside source-generation/capture and
-ingress closure using actual native producers, followed by paired presentation
-qualification. Raw native-clock results remain separately unqualified.
+The concrete next work is fresh SDK packages and full source/package/artefact
+verification once concurrent SDK work is stable, followed by actual native
+qualification of the implemented checked playback-clock owner. Source-generation /
+capture and ingress closure using actual native producers and paired
+presentation remain required. Raw native-clock results remain separately
+unqualified.
 Durable checkpoint installation/recovery and the aggregate two-second loss bound
 follow, then both-phone complete-show pilots, matched competitor performance and
 release. Existing delivery goals and legacy defaults are unchanged. Later source
