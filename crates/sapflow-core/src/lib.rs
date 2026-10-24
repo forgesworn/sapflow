@@ -12,6 +12,7 @@
 
 pub mod limits;
 pub mod publish_session;
+pub mod realtime;
 pub mod recording;
 
 /// The prefix every stage stream lives under, matching the v4v contract.

@@ -120,3 +120,10 @@ path = "fuzz_targets/http1_request.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "realtime_queue"
+path = "fuzz_targets/realtime_queue.rs"
+test = false
+doc = false
+bench = false
