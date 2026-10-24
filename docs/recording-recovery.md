@@ -1295,6 +1295,19 @@ independent valid-PCM byte-exact pass or presentation/admission qualification.
 All original files, hashes and raw clocks remain unchanged; the private result
 and review are under `target/privacy-standby/pcm-fullarray-crossformat-actual-v1/`.
 
+A fixed macOS native-writer experiment obtains the actual AAC format from
+`AVAssetTrack.load(.formatDescriptions)` and submits the five original short-case
+packets at their original 48 kHz timestamps, without encoding or trim attachments.
+Apple accepts all five appends and completes the file with a confirmed finish
+callback and no writer error. Despite the requested 1,024/48,000-second fragment
+interval, the 3,408-byte output contains no movie fragments. The frozen
+fragmented-axis inspector therefore stops before decoding; this case does not
+qualify the original coded axis or a paired native recorder. It is not a verdict
+on every Apple writer configuration. The private actual result is under
+`target/privacy-standby/macos-native-fragmented-aac-actual-v3/`. Its inputs remain
+unchanged and both child process groups close. Earlier compile and format-sample
+acquisition failures remain retained separately; neither reached the writer.
+
 After independent source review, the ignored clock prototype passed all 26
 standalone synthetic checks using the installed Kotlin compiler and JVM. Its
 fixed offline metadata replay completed the three explicit-reader schedules at
