@@ -305,11 +305,43 @@ scratch is removed. Actual logs and independent review are retained privately
 under `target/privacy-standby/ios-cold-checkpoint-host-actual-v3/`.
 
 These are host filesystem results using deliberately untrusted metadata bytes.
-Actual shared-SDK slot decoding, conservative successor selection and positive
-recovery eligibility remain unimplemented here and require a fresh matching SDK
-gate. This child creates no recovered file and changes no recorder default.
-Playable recovery, process/power-loss durability and the aggregate two-second
-source-presentation loss bound remain open.
+The child leaves shared-SDK decoding and selection to the composition below;
+it creates no recovered file and changes no recorder default. Positive recovery
+eligibility, playable recovery, process/power-loss durability and the aggregate
+two-second source-presentation loss bound remain open.
+
+## iOS cold checkpoint SDK observation
+
+`RecordingCheckpointProbe.inspect` now keeps the cold read child alive across
+actual shared-Rust checkpoint decoding, successor validation, physical-prefix
+hashing and checked completion. It accepts only a lone sequence-one slot or an
+adjacent, context-matching pair in the correct slots. Every present slot must
+pass the real decoder and its physical prefix hash; a present refusal blocks
+selection and preserves the SDK error. There is no older-slot fallback after a
+present corrupt or foreign slot.
+
+The returned closed observation preserves the selected saved recovery header
+separately from the current header hash. An interrupted current header and an
+uncommitted tail remain diagnostic. The observation grants no file-writing,
+recovery or native EOF authority. An uncertain final close preserves the actual
+IO error and retains the catalogue lease without aborting or retrying that
+possibly recycled descriptor.
+
+The fresh-SDK host gate passes all 24 XCTest cases: the unchanged 16 checkpoint
+owner tests and eight new observation tests. They cover actual SDK bytes and
+filesystem operations, including checksum-valid foreign metadata, corrupted
+fragments, wrong slot parity, nonadjacent snapshots, readback mutation and
+uncertain final close. The audio payloads are synthetic API controls, not native
+AAC or presentation evidence. Independent review confirms the source bindings,
+compiler results and all three process-group closures. Private evidence is under
+`target/privacy-standby/ios-cold-checkpoint-sdk-actual-v4/`.
+
+The test uses freshly built packages and an actual loaded-host-library witness.
+All selected SDK build inputs remain unchanged; the separately recorded server
+body edit prevents a current whole-workspace verdict. Historical complete-source
+results are preserved. Portable public test-driver and CI integration remain
+open, along with production recovery, native presentation, physical storage,
+recorder adoption and the two-second loss bound.
 
 ## iOS submitted-input finalisation
 
