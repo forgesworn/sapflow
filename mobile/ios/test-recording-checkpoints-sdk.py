@@ -26,6 +26,15 @@ TESTS = (("RecordingCheckpointOwnerTests", 16), ("RecordingCheckpointProbeTests"
 TEST_COUNT = sum(count for _, count in TESTS)
 
 
+def xcode_shared_frameworks(sdk):
+    """Locate XCTest's private runtime in the bundle owning the selected SDK."""
+    for ancestor in sdk.parents:
+        if ancestor.name == "Contents":
+            shared = ancestor / "SharedFrameworks"
+            return shared if shared.is_dir() else None
+    return None
+
+
 def main():
     if sys.platform != "darwin" or platform.machine() not in ("arm64", "x86_64"):
         raise RuntimeError("Requires macOS with the full Xcode developer tools")
@@ -104,6 +113,10 @@ def main():
         developer = sdk.parent.parent
         frameworks = developer / "Library/Frameworks"
         testlibs = developer / "usr/lib"
+        shared = xcode_shared_frameworks(sdk)
+        # Xcode 16.4's XCTest Swift support loads XCTestCore from this bundle
+        # directory. Keep the selected platform's public framework search first.
+        shared_rpath = ["-Xlinker", "-rpath", "-Xlinker", shared] if shared else []
         temporary = scratch / "tmp"
         temporary.mkdir()
         swift_env = {**os.environ, "SDKROOT": str(sdk), "TMPDIR": str(temporary)}
@@ -135,6 +148,7 @@ def main():
         run("test-compile", [*common, "-F", frameworks, "-I", testlibs, "-L", testlibs,
             "-L", library.parent, "-lsapflow_ffi", "-Xlinker", "-rpath", "-Xlinker", frameworks,
             "-Xlinker", "-rpath", "-Xlinker", testlibs, "-Xlinker", "-rpath", "-Xlinker", library.parent,
+            *shared_rpath,
             *(ROOT / "mobile/ios/Sources" / (name + ".swift") for name in SOURCES),
             scratch / "main.swift", scratch / "Sapflow.o", "-o", scratch / "checkpoint-tests"], 1800, swift_env)
         text = run("test-run", [scratch / "checkpoint-tests"], 180, swift_env)
