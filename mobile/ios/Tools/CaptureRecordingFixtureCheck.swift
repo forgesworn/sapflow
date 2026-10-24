@@ -333,6 +333,7 @@ enum CaptureRecordingFixtureCheck {
                 "Producer finalisation did not observe actual converter EOS")
             return nativeEOFFacts(audio.lastNativeEOFObservation)
         }
+        let nativeLedger = try samples.sync { try nativeLedgerFacts(audio.generationLedger) }
         try requireCaptureRecording(try samples.sync { try producer.finish() } == nil, "Native producer closure minted twice")
         encoded.sync {}; io.sync {}
         let result = RecordingReply<CaptureRecording.Completion>(), published = RecordingReply<Result<Void, Error>>()
@@ -364,12 +365,33 @@ enum CaptureRecordingFixtureCheck {
         try requireCaptureRecording(entry.state == (expectedComplete ? .finalised : .incomplete), "Producer catalogue classification")
         try trace.check()
         return ["name": name, "passed": true, "finalised": completed.finalised, "file": identity.filename, "actualNativeEOF": nativeEOF,
+            "actualNativeAudioLedger": nativeLedger, "originalAudioPackets": trace.packetSnapshot,
             "sourceAudioUnits": trace.packetSnapshot.count, "hasVideo": av, "nativeVideoFramesSubmitted": av ? 10 : 0,
             "recordingClosedBeforeTransport": true, "normalStopCancellationPresent": true,
             "producerCapabilitySingleUse": true, "duplicateFinishPreservedBytes": true,
             "publishingFailures": trace.counters.publishing, "bytes": before.count,
             "backend": selection == .legacy ? "legacy" : "sdkCheckpointed",
             "scope": "Generated native audio/video producer closure and selected real recorder file, empty stopped session, no camera/device acceptance"]
+    }
+    /// Cold inspection of the same real encoder after producer finalisation.
+    /// Values come from its native prime/input/EOF ledger, never file duration,
+    /// decoder length differences or fixture parameters. No receipt is minted.
+    private static func nativeLedgerFacts(_ value: AudioRecordingTiming.LedgerSnapshot) throws -> [String: Any] {
+        try requireCaptureRecording(value.finished && !value.failed && value.activeGeneration == nil,
+            "Actual native producer ledger did not close")
+        guard let file = value.completed, let generation = value.lastGeneration else {
+            throw CaptureFailure(message: "Actual completed native ledger is unavailable")
+        }
+        return ["finished": value.finished, "failed": value.failed,
+            "completedFile": ["generationCount": file.generationCount,
+                "sourceFramesAt48k": file.sourceFramesAt48k, "intentionalStandbyFrames": file.intentionalStandbyFrames,
+                "encodedFrames": file.encodedFrames, "firstLeadingFrames": file.leadingFrames,
+                "lastTrailingFrames": file.trailingFrames],
+            "lastGeneration": ["generation": generation.generation, "inputFrames": generation.inputFrames,
+                "rawFrames": generation.rawFrames, "zeroFrames": generation.zeroFrames, "inputRate": generation.inputRate,
+                "encodedFrames": generation.encodedFrames, "leadingFrames": generation.leadingFrames,
+                "trailingFrames": generation.trailingFrames, "sourceMapping": generation.sourceMapping.rawValue],
+            "scope": "Actual closed encoder ledger only; application admission and decoder presentation remain separate"]
     }
     private static func nativeEOFFacts(_ value: AudioRecordingTiming.NativeEOFObservation?) -> [String: Any] {
         guard let value else { return ["observed": false] }

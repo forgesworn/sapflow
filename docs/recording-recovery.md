@@ -1780,6 +1780,47 @@ These checks do not establish source leading/tail authority, production recorder
 adoption, durable recovery, the aggregate loss bound, physical devices,
 sustained-show performance or release readiness.
 
+## Readback of producer-owned recordings
+
+A subsequent native readback checks four generated finalised files from the
+strict-EOF matrix: SDK and native-recorder controls for audio-only and A/V.
+All four return exactly 16,137 PCM16 mono frames at 48 kHz. Their original raw
+and output timestamps are identical, losslessly represented in the 48 kHz
+clock, contiguous from zero and end at the expected frame. The two full
+SDK/control waveform pairs are byte-identical. All four separate native
+seek reads return 4,096 frames at frame 8,000 and are byte-identical to that interval
+of their whole-file output. The full paired arrays are never cropped or shifted.
+Different reported container duration fields did not produce a native playback
+length or seek defect in these four files.
+
+Four independent whole-file FFmpeg decodes also complete and produce identical
+finite Float32 bytes across both pairs. Each returns 16,320 frames, 183 more than
+the native read. These whole outputs remain unchanged. That difference does
+not supply a native padding receipt or qualify independently decoded valid
+programme audio.
+
+The fixture now retains the same encoder's actual closed generation/file ledger
+and existing original AAC packet hashes after real producer finalisation. A
+fresh run of the original 22 cases passes all 17 commands, four packet-preservation
+probes and five whole-file decodes. All 17 producer cases record one completed
+native generation with 16,137 raw input frames, no zero input, 18,432 coded
+frames, 2,112 native leading frames and 183 native trailing frames at 48 kHz.
+The values come from the encoder's real input, prime and EOF observations. They
+are not inferred from decoder lengths or fixture parameters. The original 18
+packet hashes are retained for each producer case. These new facts belong to
+the fresh files; earlier recordings and verdicts are not reclassified.
+
+Private native readback, whole-array comparisons and independent decode evidence
+are under `target/ios-current-recorder-presentation-actual-v1/`,
+`target/privacy-standby/ios-current-recorder-presentation-content-v1/` and
+`target/ios-current-recorder-independent-actual-v1/`. The fresh source-ledger
+run is `target/ios-default-native-ledger-v1/receipt.local.json`. Each execution
+retains its own source/input identities and checked process closure; reviews
+are in sibling private directories. Rebinding the native and independent
+presentation checks to the same fresh per-file source receipts remains required
+before adoption. Production defaults, durable recovery, the aggregate loss
+bound and physical-show acceptance remain unchanged.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC
