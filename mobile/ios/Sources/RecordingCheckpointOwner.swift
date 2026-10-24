@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import CoreMedia
 import Sapflow
 
 /// SDK/file compound owner. Stored inputs alone remain incomplete; finalised
@@ -14,7 +15,10 @@ final class RecordingCheckpointOwner {
         let fragmentBytes: UInt64
         let audioUnits: UInt64
         let videoUnits: UInt64
+        let audioStart: UInt64
+        let firstLeadingFrames: UInt32
         let audioContainerEnd: UInt64
+        let videoStart: UInt64?
         let videoEnd: UInt64?
         let completeAudioEOF: Bool
     }
@@ -42,6 +46,7 @@ final class RecordingCheckpointOwner {
     private var busy = false
     private var admissionClosed = false
     private var progress: Frontier?
+    private var frontierObserver: ((Frontier) -> Bool)?
     private var closedResult: PrefixClosure?
     private var retainedSelf: RecordingCheckpointOwner?
 
@@ -70,6 +75,13 @@ final class RecordingCheckpointOwner {
         // Native/metadata ownership also survives caller loss until explicit
         // checked closure, matching Catalogue's retained real append child.
         retainedSelf = self
+    }
+    var durableBudgetOwner: UUID { owner }
+    /// One cold scalar consumer, bound before native input/any filesystem work.
+    func observeInstalledFrontier(_ observer: @escaping (Frontier) -> Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard phase == .active, !admissionClosed, !busy, progress == nil, frontierObserver == nil else { return false }
+        frontierObserver = observer; return true
     }
     var frontier: Frontier? { lock.lock(); defer { lock.unlock() }; return progress }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return phase == .closed }
@@ -279,10 +291,16 @@ final class RecordingCheckpointOwner {
                 installedToken = token; installedReceipt = receipt
                 let next = Frontier(owner: owner, sequence: info.facts.sequence, fileEnd: end,
                     fragmentBytes: nextRegion, audioUnits: info.facts.audioUnits, videoUnits: info.facts.videoUnits,
-                    audioContainerEnd: info.facts.audioContainerEnd, videoEnd: info.facts.videoEnd,
+                    audioStart: info.facts.audioStart, firstLeadingFrames: info.facts.firstLeadingFrames,
+                    audioContainerEnd: info.facts.audioContainerEnd, videoStart: info.facts.videoStart, videoEnd: info.facts.videoEnd,
                     completeAudioEOF: info.facts.completeAudioEof)
                 lock.lock()
                 guard phase == .active, !admissionClosed, busy else { lock.unlock(); throw Failure.closed }
+                // Cancellation and publication share the same cut. The callback
+                // only updates bounded scalars; it MUST NOT call this owner/IO.
+                guard frontierObserver?(next) ?? true else {
+                    admissionClosed = true; lock.unlock(); throw Failure.context
+                }
                 progress = next; lock.unlock() // AFTER actual installed readback close.
             case .finalHeader:
                 guard let initial, chunk.checkpoint == nil, deferredFinalHeader == nil,
@@ -320,5 +338,171 @@ final class RecordingCheckpointOwner {
             // Never report cleanup after an unknown native or actual FD close.
             lock.lock(); phase = .retained; retainedSelf = self; lock.unlock(); throw error
         }
+    }
+}
+
+
+/// Per-real-recorder aggregate media-loss bound. Native input and installed file
+/// checkpoints share the declared source presentation axis. This is neither a
+/// queue residence timer nor an extra fragment allowance. Locks hold scalars
+/// only; no native/FFI/file/payload work runs under this lock.
+final class RecordingDurableInputBudget {
+    enum Track: Equatable { case audio, video }
+    private let owner: UUID
+    private let hasVideo: Bool
+    private let lock = NSLock()
+    private var closed = false
+    private var violated = false
+    private var announced = false
+    private var sourceOrigin: CMTime?
+    private var acceptedEnd: CMTime?
+    private var audioSupportedEnd: CMTime?
+    private var videoSupportedEnd: CMTime?
+    private var startupOrigin: CMTime?
+    private var startupEnd: CMTime?
+    private var startupBound = false
+    private var common: CMTime?
+    private var sequence: UInt32 = 0
+    private var fileEnd: UInt64 = 0
+    private var fragmentBytes: UInt64 = 0
+    private var lastAudioUnits: UInt64 = 0
+    private var lastVideoUnits: UInt64 = 0
+    private var lastAudioEnd: UInt64 = 0
+    private var lastVideoEnd: UInt64?
+    private var audioContext: (start: UInt64, leading: UInt32)?
+    private var videoStart: UInt64?
+    init(owner: UUID, hasVideo: Bool) { self.owner = owner; self.hasVideo = hasVideo }
+    private func refuse() -> Bool { closed = true; violated = true; return false }
+    private func numeric(_ value: CMTime) -> Bool { value.isNumeric && value.epoch == 0 }
+    private func maximum(_ a: CMTime, _ b: CMTime) -> CMTime { CMTimeCompare(a, b) >= 0 ? a : b }
+    private func minimum(_ a: CMTime, _ b: CMTime) -> CMTime { CMTimeCompare(a, b) <= 0 ? a : b }
+    private func fits(_ end: CMTime, after frontier: CMTime) -> Bool {
+        let delta = CMTimeSubtract(end, frontier)
+        return numeric(delta) && CMTimeCompare(delta, CMTime(value: 2, timescale: 1)) <= 0
+    }
+    /// BEFORE the engine retains its first/every startup CMSampleBuffer. All
+    /// original PTS here come from one session synchronizationClock. Starting
+    /// a codec or emptying a queue cannot restart this allowance.
+    func admitStartup(start: CMTime, duration: CMTime, track: Track) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed else { return false }
+        guard !startupBound, sourceOrigin == nil, numeric(start), numeric(duration),
+              CMTimeCompare(duration, .zero) > 0, track != .video || hasVideo else { return refuse() }
+        guard let span = RecordingNativePCMSpan.conservativeSpan(start: start, duration: duration) else { return refuse() }
+        let end = span.end
+        let origin = startupOrigin.map { minimum($0, start) } ?? start
+        let through = startupEnd.map { maximum($0, end) } ?? end
+        let lowerOrigin = CMTimeConvertScale(origin, timescale: 720_000, method: .roundTowardZero)
+        guard numeric(lowerOrigin), fits(through, after: lowerOrigin) else { return refuse() }
+        startupOrigin = origin; startupEnd = through; return true
+    }
+    /// The actual CaptureMediaClock epoch is the earliest original retained
+    /// PTS. It is checked, not used to rewrite any source/checkpoint timestamp.
+    func bindStartup(epoch: CMTime) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed else { return false }
+        guard !startupBound, sourceOrigin == nil, let start = startupOrigin, let end = startupEnd,
+              numeric(epoch), CMTimeCompare(epoch, start) == 0 else { return refuse() }
+        let lowerEpoch = CMTimeConvertScale(epoch, timescale: 720_000, method: .roundTowardZero)
+        let span = CMTimeSubtract(end, lowerEpoch)
+        guard numeric(span), fits(span, after: .zero) else { return refuse() }
+        sourceOrigin = .zero; acceptedEnd = span; startupBound = true; return true
+    }
+    /// BEFORE native PCM consumption or VT frame reservation. The callback
+    /// only fences the recording branch; original publishing proceeds unchanged.
+    func admit(start: CMTime, end: CMTime, supportedEnd: CMTime, track: Track) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed else { return false }
+        guard numeric(start), numeric(end), numeric(supportedEnd), CMTimeCompare(start, .zero) >= 0,
+              CMTimeCompare(supportedEnd, .zero) >= 0, CMTimeCompare(supportedEnd, end) <= 0,
+              CMTimeCompare(end, start) > 0, track != .video || hasVideo,
+              startupOrigin == nil || startupBound else { return refuse() }
+        // A nonzero part begins at its actual first accepted source START,
+        // never its latest end or an invented zero. Published PTS stays intact.
+        let origin = sourceOrigin.map { minimum($0, start) } ?? start
+        let through = acceptedEnd.map { maximum($0, end) } ?? end
+        let durable = common.map { maximum(origin, $0) } ?? origin
+        guard fits(through, after: durable) else { return refuse() }
+        let priorSupport = track == .audio ? audioSupportedEnd : videoSupportedEnd
+        guard priorSupport.map({ CMTimeCompare(supportedEnd, $0) >= 0 }) ?? true else { return refuse() }
+        sourceOrigin = origin; acceptedEnd = through
+        if track == .audio { audioSupportedEnd = supportedEnd } else { videoSupportedEnd = supportedEnd }
+        return true
+    }
+    /// Called ONLY by the exact owner's installed/readback publication cut.
+    /// Sequence/file successors come from real SDK checkpoint facts, not AU
+    /// counting. Source input may be concurrent; one scalar lock orders both.
+    func install(_ value: RecordingCheckpointOwner.Frontier) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        // Previously accepted queued units may still form a useful incomplete
+        // prefix after loss. They can finish real IO, but grant NO new budget
+        // and never clear the sticky failed sustained-run status.
+        guard !closed else { return value.owner == owner }
+        guard let admittedThrough = acceptedEnd, sourceOrigin != nil else { return refuse() }
+        let next = sequence.addingReportingOverflow(1)
+        guard value.owner == owner, !next.overflow, value.sequence == next.partialValue,
+              value.fileEnd > fileEnd, value.fragmentBytes > fragmentBytes,
+              value.audioContainerEnd >= value.audioStart,
+              value.audioContainerEnd >= lastAudioEnd,
+              value.audioUnits >= lastAudioUnits, value.videoUnits >= lastVideoUnits,
+              value.audioUnits > lastAudioUnits || value.videoUnits > lastVideoUnits,
+              value.firstLeadingFrames <= 8191,
+              value.audioContainerEnd <= UInt64(Int64.max),
+              value.videoStart == nil || value.videoEnd != nil,
+              value.videoEnd == nil || value.videoStart != nil else { return refuse() }
+        if let context = audioContext {
+            guard value.audioStart == context.start, value.firstLeadingFrames == context.leading else { return refuse() }
+        }
+        if let start = videoStart { guard value.videoStart == start else { return refuse() } }
+        if let priorEnd = lastVideoEnd { guard value.videoEnd.map({ $0 >= priorEnd }) == true else { return refuse() } }
+        if let start = value.videoStart, let end = value.videoEnd {
+            guard hasVideo, start <= end, end <= UInt64(Int64.max),
+                  value.videoUnits == 0 || start < end else { return refuse() }
+        } else if value.videoUnits != 0 { return refuse() }
+        let leading = UInt64(value.firstLeadingFrames)
+        let audioFrames = value.audioContainerEnd - value.audioStart
+        var candidate: CMTime?
+        var coverageStart = CMTime(value: Int64(value.audioStart), timescale: 48_000)
+        // A head containing only native priming is not durable presentation.
+        if value.audioUnits > 0, audioFrames > leading, let audioSupportedEnd {
+            var end = minimum(CMTime(value: Int64(value.audioContainerEnd - leading), timescale: 48_000), audioSupportedEnd)
+            if hasVideo {
+                if value.videoUnits > 0, let videoStart = value.videoStart, let videoEnd = value.videoEnd, let videoSupportedEnd {
+                    coverageStart = maximum(coverageStart, CMTime(value: Int64(videoStart), timescale: 90_000))
+                    let video = minimum(CMTime(value: Int64(videoEnd), timescale: 90_000), videoSupportedEnd)
+                    end = minimum(end, video)
+                    if CMTimeCompare(end, coverageStart) > 0 { candidate = end }
+                }
+            } else { candidate = end }
+        }
+        if let end = candidate {
+            // Native coded start is rounded nearest at 48/90 kHz. One 48k
+            // source frame conservatively covers that declared bridge's
+            // half-tick residual; this never enlarges the 2-second allowance.
+            // File/container coverage cannot certify source that this exact
+            // bound native owner has not admitted. Clamp BEFORE withholding
+            // rounding guard so even a rounded source upper bound grants less.
+            let supported = minimum(end, admittedThrough)
+            let safe = CMTimeSubtract(supported, CMTime(value: 1, timescale: 48_000))
+            guard numeric(safe), common.map({ CMTimeCompare(safe, $0) >= 0 }) ?? true else { return refuse() }
+            if CMTimeCompare(safe, coverageStart) > 0 { common = safe }
+        }
+        sequence = value.sequence; fileEnd = value.fileEnd; fragmentBytes = value.fragmentBytes
+        audioContext = (value.audioStart, value.firstLeadingFrames)
+        lastAudioUnits = value.audioUnits; lastVideoUnits = value.videoUnits
+        lastAudioEnd = value.audioContainerEnd; lastVideoEnd = value.videoEnd
+        if let start = value.videoStart { videoStart = start }
+        return true
+    }
+    func failSourceClock() { lock.lock(); _ = refuse(); lock.unlock() }
+    func close() { lock.lock(); closed = true; lock.unlock() }
+    func takeFailure() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard violated, !announced else { return false }; announced = true; return true
+    }
+    struct Snapshot { let failed: Bool; let sequence: UInt32; let acceptedEnd: CMTime?; let common: CMTime? }
+    var snapshot: Snapshot {
+        lock.lock(); defer { lock.unlock() }
+        return Snapshot(failed: violated, sequence: sequence, acceptedEnd: acceptedEnd, common: common)
     }
 }

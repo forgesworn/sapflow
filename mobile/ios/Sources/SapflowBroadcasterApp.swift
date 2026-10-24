@@ -58,7 +58,12 @@ final class BroadcasterModel: ObservableObject {
     private var creatorOwner: V4vCreatorOwner?
     let creatorConfiguration = V4vCreatorConfiguration.load()
     let engine = CaptureEngine()
-    let recordingLibrary = RecordingLibraryOwner()
+    let recordingLibrary = RecordingLibraryOwner(recoverCheckpoint: { catalogue, entry, limit, cancelled, publish in
+        try RecordingCheckpointProbe.recover(catalogue: catalogue, selected: entry, maximumFragmentBytes: limit,
+            cancelled: cancelled, willPublish: {
+                guard publish() else { throw RecordingCatalogue.Failure.cancelled }
+            })
+    })
     init() {
         _ = manual
         engine.onChange = { [weak self] snapshot in
@@ -480,7 +485,9 @@ struct BroadcasterView: View {
                 let stopControl = model.snapshot.stopControl
                 Button("Stop and save") { if let stopControl { model.stop(stopControl) } }
                     .buttonStyle(.bordered).disabled(stopControl == nil).accessibilityIdentifier("capture.stop")
-                RecordingLibraryView(owner: recordings, canExport: model.engine.canChooseCaptureProfile) { entry, allowUnverified in
+                RecordingLibraryView(owner: recordings, canExport: model.engine.canChooseCaptureProfile, beginRecovery: { entry in
+                    recordings.recover(entry: entry, canRecover: { model.engine.canChooseCaptureProfile })
+                }) { entry, allowUnverified in
                     recordings.choose(entry: entry, allowUnverified: allowUnverified, canExport: { model.engine.canChooseCaptureProfile })
                 }
                 Text("Camera capture and audio without the locked-screen option require the foreground. Only an opted-in audio show already recording may continue when locked. In Automatic orientation, turning the phone saves a new camera segment and reconnects its broadcast. Audio interruptions still stop capture; return to Sapflow to Stop and save.")

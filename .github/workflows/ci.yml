@@ -58,6 +58,20 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build host SDK and run checkpoint tests
         run: python3 -B mobile/ios/test-recording-checkpoints-sdk.py
+      - name: Prepare the existing lock-pinned Swift fuzz runtime
+        # The workspace config shares target/; build only the existing runtime.
+        run: cargo build --locked --manifest-path fuzz/Cargo.toml -p libfuzzer-sys -j1
+      - name: Replay and fuzz canonical recovery receipts with ASan
+        env:
+          SAPFLOW_RECOVERY_RECEIPT_FUZZ_SECONDS: "20"
+        run: bash mobile/ios/fuzz-recording-recovery-receipt.sh
+      - name: Retain synthetic recovery receipt fuzz evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-recovery-receipt-fuzz
+          path: target/ios-recovery-receipt-fuzz
+          if-no-files-found: ignore
 
   checks:
     name: Format, clippy, tests

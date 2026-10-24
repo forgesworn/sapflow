@@ -185,6 +185,7 @@ enum CaptureRecordingFixtureCheck {
             if !worker.offer(unit, token: token, audioGeneration: callbackEncoder?.lastOutputGeneration) { trace.refusal() }
         }, meter: { _ in }, recordingTiming: { event in trace.timing(event); worker.audioTiming(event) })
         callbackEncoder = encoder
+        try recorder.bindNativeInputs(audio: encoder, video: nil)
         defer { try? encoder.finish() }
         let source = try format(), nativeToken = try unwrap(encoder.inputToken)
         if mixed {
@@ -211,6 +212,10 @@ enum CaptureRecordingFixtureCheck {
         let originalPackets = trace.packetSnapshot
         try requireCaptureRecording(ingress.accepted == UInt64(originalPackets.count), "Ingress did not validate each original native AU exactly once")
         if queueFailure {
+            let bound = try unwrap(recorder.nativeInputBudgetSnapshot)
+            try requireCaptureRecording(bound.failed && bound.sequence == 0 &&
+                bound.acceptedEnd.map { CMTimeCompare($0, CMTime(value: 2, timescale: 1)) == 0 } == true,
+                "Actual native input bypassed the aggregate budget while recordingIO was held")
             try requireCaptureRecording(terminalRecording.wait(timeout: .now() + 5) == .success, "Real recording admission did not exhaust")
         } else {
             let capacity = RecordingReply<Result<Void, Error>>()
@@ -349,6 +354,7 @@ enum CaptureRecordingFixtureCheck {
                 fault: { source, _ in _ = gate.nativeFault(source ?? token) },
                 permitsInput: { gate.allowsInput($0) == .allow })
         } else { video = nil }
+        try recorder.bindNativeInputs(audio: audio, video: video)
         let session = AVCaptureSession(), wrongOwner = NSObject()
         let expectedWorker: AnyObject = wrong ? wrongOwner : worker
         let producer = CaptureRecordingProducer(run: run, ticket: wrongTicket ? staleTicket : ticket, recorder: recorder,

@@ -99,6 +99,7 @@ final class CaptureRun {
             worker.offer(unit, token: binding.token, audioGeneration: binding.encoder?.lastOutputGeneration)
         }, meter: meter, recordingTiming: { worker.audioTiming($0) })
         binding.encoder = audio
+        try recorder.bindNativeInputs(audio: audio, video: video)
         producers = CaptureRecordingProducer(run: mediaRun, ticket: recordingTicket, recorder: recorder,
             worker: worker, audio: audio, video: video, session: session, samples: samples, admission: admission, recordingAdmission: recordingAdmission)
     }
@@ -1838,6 +1839,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 guard run.startup.count < 8, bytes <= 12 * 1024 * 1024 - run.startupBytes else {
                     throw CaptureFailure(message: "Camera/microphone startup exceeded its native buffer bound")
                 }
+                run.recorder.observeStartupInput(sampleBuffer, video: isVideo, videoFrameRate: run.profile.videoProfile?.frameRate)
                 run.startup.append((sampleBuffer, isVideo, token, audioToken)); run.startupBytes += bytes
                 guard (!run.profile.hasVideo || run.startup.contains(where: { $0.video })), run.startup.contains(where: { !$0.video }) else { return }
                 let initial = run.startup.sorted {
@@ -1845,6 +1847,7 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
                 guard let sourceClock = run.sourceClock else { throw CaptureFailure(message: "Native capture synchronization clock is unavailable") }
                 let epoch = CMSampleBufferGetPresentationTimeStamp(initial[0].sample)
+                run.recorder.bindStartupEpoch(epoch)
                 run.epoch = epoch
                 let host = CMClockGetHostTimeClock()
                 run.mediaClock = try CaptureMediaClock(clock: host, epoch: CMSyncConvertTime(epoch, from: sourceClock, to: host))

@@ -25,11 +25,12 @@ final class RecordingLibraryOwnerTests: XCTestCase {
         return root
     }
     private func fixture(access: RecordingExportAccess? = nil,
-                         makeDestination: ((URL, String) throws -> RecordingExportDestination)? = nil) throws -> (RecordingLibraryOwner, RecordingCatalogue, Queue, URL) {
+                         makeDestination: ((URL, String) throws -> RecordingExportDestination)? = nil,
+                         recovery: RecordingLibraryOwner.RecoveryAction? = nil) throws -> (RecordingLibraryOwner, RecordingCatalogue, Queue, URL) {
         let root = try folder(), queue = Queue()
         let access = access ?? RecordingExportAccess(begin: { _ in {} }, coordinate: { url, _, block in block(url) })
         let owner = RecordingLibraryOwner(root: root.appendingPathComponent("private"), schedule: { queue.jobs.append($0) },
-            deliver: { queue.replies.append($0) }, access: access,
+            deliver: { queue.replies.append($0) }, access: access, recoverCheckpoint: recovery,
             makeDestination: makeDestination ?? { try RecordingExportDestination(folder: $0, filename: $1) })
         var store: RecordingCatalogue?
         owner.initialise { value, _, complete in store = value; complete(true) }
@@ -239,6 +240,45 @@ final class RecordingLibraryOwnerTests: XCTestCase {
         XCTAssertTrue(owner.ready); XCTAssertEqual(attempts, 2)
         owner.close(); queue.drain()
     }
+    private func incomplete(_ store: RecordingCatalogue) throws -> RecordingCatalogue.Entry {
+        let writer = try store.begin(identity: store.newShow(profile: .audioOnly48kMono).nextIdentity())
+        try Data([1, 2, 3, 4]).write(to: writer.fileURL); try writer.complete(durationMs: 0, outcome: .incomplete)
+        return try XCTUnwrap(store.scan().first { $0.segmentID == writer.identity.segmentID })
+    }
+    func testRecoveryRechecksCaptureAndAcknowledgesQueuedCancellationWithoutCallingSdkAction() throws {
+        var calls = 0
+        let (owner, store, queue, _) = try fixture(recovery: { _, _, _, _, _ in calls += 1; throw RecordingCatalogue.Failure.ineligible })
+        let entry = try incomplete(store)
+        owner.recover(entry: entry, canRecover: { false }); XCTAssertFalse(owner.busy); XCTAssertEqual(calls, 0)
+        owner.recover(entry: entry, canRecover: { true }); XCTAssertTrue(owner.busy); XCTAssertFalse(owner.captureAllowed)
+        owner.cancelOperation(); XCTAssertFalse(owner.captureAllowed)
+        queue.drain(); XCTAssertEqual(calls, 0); XCTAssertTrue(owner.captureAllowed); XCTAssertFalse(owner.busy)
+        XCTAssertEqual(try store.scan().first?.state, .incomplete)
+    }
+    func testRecoveryRefusalKeepsOriginalAndHoldsGateUntilActualWorkerAcknowledgement() throws {
+        var calls = 0
+        var ownerReference: RecordingLibraryOwner?
+        let (owner, store, queue, _) = try fixture(recovery: { _, _, _, cancelled, publish in
+            calls += 1; XCTAssertFalse(cancelled()); XCTAssertFalse(ownerReference!.captureAllowed)
+            XCTAssertTrue(publish()); XCTAssertFalse(publish())
+            throw RecordingCatalogue.Failure.changed
+        })
+        ownerReference = owner
+        let entry = try incomplete(store)
+        owner.recover(entry: entry, canRecover: { true }); queue.run()
+        // Worker cleanup acknowledged, delivery still queued: no fabricated result.
+        XCTAssertEqual(calls, 1); queue.reply(); XCTAssertFalse(owner.busy); XCTAssertTrue(owner.captureAllowed)
+        XCTAssertEqual(try store.scan().count, 1); XCTAssertEqual(try store.scan().first?.state, .incomplete)
+        XCTAssertTrue(try XCTUnwrap(owner.message).contains("preserved"))
+    }
+    func testLibraryWithoutRealRecoveryCompositionCannotScheduleRecovery() throws {
+        let (owner, store, queue, _) = try fixture(); let entry = try incomplete(store)
+        XCTAssertFalse(owner.recoveryAvailable)
+        owner.recover(entry: entry, canRecover: { true })
+        XCTAssertTrue(queue.jobs.isEmpty); XCTAssertFalse(owner.busy); XCTAssertTrue(owner.captureAllowed)
+        XCTAssertEqual(try store.scan().count, 1)
+    }
+
 }
 
 private extension Array {

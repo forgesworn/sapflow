@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Build the current host Rust SDK and run all 16+8 iOS checkpoint tests."""
+"""Build the current host Rust SDK and run the complete iOS checkpoint suites."""
 from pathlib import Path
 import os
 import platform
@@ -21,7 +21,9 @@ SOURCES = (
     "AudioInputPolicy", "CameraControlPolicy", "CaptureAdmission", "RecordingCaptureAdmission",
     "EncodedPipeline", "PublishingTelemetry", "RecordingCheckpointOwner", "RecordingCheckpointProbe",
 )
-TESTS = (("RecordingCheckpointOwnerTests", 16), ("RecordingCheckpointProbeTests", 8))
+TESTS = (("RecordingCheckpointOwnerTests", 16), ("RecordingCheckpointProbeTests", 12),
+         ("RecordingDurableInputBudgetTests", 18))
+TEST_COUNT = sum(count for _, count in TESTS)
 
 
 def main():
@@ -127,7 +129,8 @@ def main():
             main_source.append("\n")
         main_source.append('let suite = XCTestSuite(name: "Real SDK checkpoint owner and cold observation")\n')
         main_source.extend("suite.addTest(" + test + ".defaultTestSuite)\n" for test, _ in TESTS)
-        main_source.append("suite.run()\nguard let result = suite.testRun, result.executionCount == 24, result.hasSucceeded else { exit(1) }\n")
+        main_source.append("suite.run()\nguard let result = suite.testRun, result.executionCount == " +
+                           str(TEST_COUNT) + ", result.hasSucceeded else { exit(1) }\n")
         (scratch / "main.swift").write_text("".join(main_source))
         run("test-compile", [*common, "-F", frameworks, "-I", testlibs, "-L", testlibs,
             "-L", library.parent, "-lsapflow_ffi", "-Xlinker", "-rpath", "-Xlinker", frameworks,
@@ -139,9 +142,9 @@ def main():
         for name in names:
             if len(re.findall(r"Test Case '[^\n']*\b" + re.escape(name) + r"\b[^\n']*' passed", text)) != 1:
                 raise RuntimeError("Expected actual test pass once: " + name)
-        if re.search(r"Executed 24 tests?, with 0 failures", text) is None:
-            raise RuntimeError("Missing complete XCTest24 result")
-        print("checkpoint-sdk: all 24 real-SDK filesystem tests passed; no native/recovery/release qualification")
+        if re.search(r"Executed " + str(TEST_COUNT) + r" tests?, with 0 failures", text) is None:
+            raise RuntimeError("Missing complete XCTest" + str(TEST_COUNT) + " result")
+        print("checkpoint-sdk: all " + str(TEST_COUNT) + " real-SDK filesystem tests passed; no native/recovery/release qualification")
     except BaseException as error:
         failure = error
         raise

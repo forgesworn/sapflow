@@ -8,14 +8,17 @@ struct RecordingLibraryView: View {
     @ObservedObject var owner: RecordingLibraryOwner
     let canExport: Bool
     let beginExport: (RecordingCatalogue.Entry, Bool) -> Void
+    let beginRecovery: (RecordingCatalogue.Entry) -> Void
     @State private var expanded = false
     @State private var unverified: RecordingCatalogue.Entry?
+    @State private var recovery: RecordingCatalogue.Entry?
     @State private var groups: [ShowGroup] = []
 
     init(owner: RecordingLibraryOwner, canExport: Bool,
+         beginRecovery: @escaping (RecordingCatalogue.Entry) -> Void,
          beginExport: @escaping (RecordingCatalogue.Entry, Bool) -> Void) {
         _owner = ObservedObject(wrappedValue: owner)
-        self.canExport = canExport; self.beginExport = beginExport
+        self.canExport = canExport; self.beginExport = beginExport; self.beginRecovery = beginRecovery
     }
 
     private struct ShowGroup: Identifiable {
@@ -82,6 +85,13 @@ struct RecordingLibraryView: View {
         } message: { _ in
             Text("This segment may be incomplete or unplayable. Copying preserves its unverified status and does not repair the original.")
         }
+        .confirmationDialog("Create a recovery copy?", isPresented: recoveryPresented, titleVisibility: .visible, presenting: recovery) { entry in
+            Button("Create unverified recovery copy") { recovery = nil; beginRecovery(entry) }
+                .disabled(!canExport || owner.busy || !owner.ready)
+            Button("Cancel", role: .cancel) { recovery = nil }
+        } message: { _ in
+            Text("Creates a new copy from the last stored recovery point. The original stays unchanged. The copy may be incomplete and playback is not verified.")
+        }
         .background {
             // The host survives both a nil visible picker and a collapsed
             // DisclosureGroup until this exact presentation actually dismisses.
@@ -93,6 +103,9 @@ struct RecordingLibraryView: View {
     }
     private var unverifiedPresented: Binding<Bool> {
         Binding(get: { unverified != nil }, set: { if !$0 { unverified = nil } })
+    }
+    private var recoveryPresented: Binding<Bool> {
+        Binding(get: { recovery != nil }, set: { if !$0 { recovery = nil } })
     }
     private static func makeGroups(_ entries: [RecordingCatalogue.Entry]) -> [ShowGroup] {
         guard entries.count <= 256 else { return [] }
@@ -127,6 +140,11 @@ struct RecordingLibraryView: View {
             Text("\(size(entry.bytes)) · \(duration(entry.durationMs))")
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             if let profile = entry.identity?.profileID { Text(profile).font(.caption).foregroundStyle(.secondary) }
+            if owner.recoveryAvailable, entry.location == .privateRecording, entry.state == .incomplete, entry.identity != nil {
+                Button("Recover a new copy") { recovery = entry }
+                    .disabled(!canExport || !owner.ready || owner.busy || entry.bytes == 0)
+                    .accessibilityIdentifier("recordings.recover.\(entry.id)")
+            }
             Button(requiresConfirmation(entry) ? "Export unverified segment" : "Export segment") {
                 if requiresConfirmation(entry) { unverified = entry }
                 else { beginExport(entry, false) }
@@ -138,6 +156,7 @@ struct RecordingLibraryView: View {
     }
     private func segmentTitle(_ entry: RecordingCatalogue.Entry) -> String {
         let suffix = String(entry.segmentID.prefix(8))
+        if entry.state == .recovered { return "Recovery copy \(suffix)" }
         guard let index = entry.identity?.segmentIndex, index < Int64.max else { return "Segment \(suffix)" }
         return "Segment \(index + 1) · \(suffix)"
     }
@@ -149,6 +168,7 @@ struct RecordingLibraryView: View {
         case .writing: return "Recording in progress"
         case .finalised: return "Recorder finalised"
         case .incomplete: return "Incomplete · unverified"
+        case .recovered: return "Recovered checkpoint prefix · playback unverified"
         case .orphanUnverified: return "Unverified file"
         }
     }

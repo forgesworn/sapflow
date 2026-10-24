@@ -1976,6 +1976,71 @@ separate requirements. The approved checked playback clock and all original
 native-clock failures remain unchanged.
 
 
+## iOS explicit prefix recovery and durable source budget
+
+The explicitly selected SDK checkpoint recorder now supports recovery into a
+separate app-private file. The production probe retains the same checked source
+lease while validating every present SDK checkpoint, selecting its sealed
+fragment prefix and hashing the physical bytes. Recovery streams the saved
+header and sealed prefix into an exclusive output, checks its synchronisation
+and readback, then closes source and output owners before publishing its receipt.
+Receipt publication cannot overwrite an occupied destination. A successful retry
+verifies the existing result's provenance and full hash before returning it.
+Failed, partial or changed attempts remain visible and preserve the original.
+
+The library exposes recovery through its capture exclusion and explicit
+confirmation flow. A recovered entry remains unverified, has no final duration,
+and grants no source EOF or producer-finalisation authority. Recovery neither
+starts capture nor uploads the result. The legacy recorder remains the default.
+
+Native audio and video input now share one aggregate source-to-durable budget.
+It charges retained startup input, raw timestamp spans and actual counted native
+input before accepting more work. A codec replacement cannot reset the allowance.
+Only an installed, synchronised and read-back checkpoint can advance durable
+coverage. Each track is capped by its own actual accepted source support; the
+common audio/video frontier is the minimum, with leading audio removed once and
+a conservative one-audio-frame guard. Pending input and another track's longer
+horizon cannot certify coverage. Exceeding two seconds fails recording admission
+before more source is accepted, independently of publishing. There is no extra
+fragment-interval allowance.
+
+Recovery receipts have a 4096-byte limit before any byte traversal, strict
+standard-library UTF-8 validation, a JSON object syntax check, typed decoding of
+the original bytes and exact sorted canonical re-encoding. This also applies to
+legacy receipts. Actual fuzzing exposed Foundation fatal traps on malformed raw
+UTF-8 keys and unpaired escaped surrogate keys. Both exact generated crash inputs
+and escaped-key controls remain regressions. The current ten controls, fixed
+replay and 155,376 ASan/libFuzzer executions passed. This finite run does not prove
+the absence of every parser differential.
+
+The current host checks passed 124 filesystem/parser tests, 44 library tests and
+46 real SDK tests. The unchanged 22-case generated native matrix and its 17
+compiler, packet and decode commands passed against the integrated sources.
+
+Three generated four-second source experiments then terminated their recording
+processes with SIGKILL and recovered from fresh processes. All retained healthy
+source observations, preserved original bytes, reproduced the exact saved-header
+and sealed-prefix output, and returned the same verified result on retry. The
+partial-write case retained its physical uncommitted tail in the original and
+excluded it from the recovered copy. Observed unrecovered source spans were:
+
+| Generated case | Observed unrecovered span |
+| --- | --- |
+| Audio, drained prefix | 5697 / 48000 seconds, about 0.119 seconds |
+| Audio/video, drained prefix | 288015 / 720000 seconds, about 0.400 seconds |
+| Audio, interrupted partial append | 52801 / 48000 seconds, about 1.100 seconds |
+
+These are finite host process-interruption results. They establish neither a
+sustained recording's two-second guarantee nor physical power-loss durability.
+Recovered native and independent playback, fixed positive seeks, paired waveform
+qualification, device shows, resource use and default-backend adoption remain
+separate gates. The original numerical contract, raw timestamp evidence and
+earlier failed strict checks remain unchanged.
+
+Unsigned Debug, Qualification and Release app builds, test-bundle compilation
+and all three privacy-resource checks passed after regenerating the iOS project
+to include the new tests. The test bundle was compiled without device execution.
+
 ## Implementation order
 
 1. Extend the existing SDK muxer with an explicitly selected native-AAC

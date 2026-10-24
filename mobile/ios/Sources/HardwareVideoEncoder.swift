@@ -21,6 +21,15 @@ final class HardwareVideoEncoder {
     private let output: (CompressedUnit, CaptureAdmission.MediaToken?) -> Void
     private let fault: (CaptureAdmission.MediaToken?, Error) -> Void
     private let permitsInput: (CaptureAdmission.MediaToken) -> Bool
+    private var recordingSupportedEnd: CMTime? // prior successful native submission, samples owner
+    private var recordingInputStarted = false // samples owner
+    private var recordingInputObserver: ((CMTime, CMTime, CMTime) -> Void)?
+    /// Bound once before input by the concrete SDK recorder; native payload and
+    /// the established publishing path are unchanged if recording is fenced.
+    func observeRecordingInput(_ observer: @escaping (CMTime, CMTime, CMTime) -> Void) -> Bool {
+        guard recordingInputObserver == nil, !recordingInputStarted, session != nil else { return false }
+        recordingInputObserver = observer; return true
+    }
     private let strict: Bool
     private(set) var implementation = "Hardware H.264"
 
@@ -185,6 +194,30 @@ final class HardwareVideoEncoder {
             guard CVPixelBufferGetWidth(image) == width, CVPixelBufferGetHeight(image) == height else {
                 throw CaptureFailure(message: "Video no longer matches its prepared canvas or sealed timeline")
             }
+            recordingInputStarted = true
+            var recordingCandidateSupportedEnd: CMTime?
+            // This duration is the existing declared native adapter/profile
+            // clock; no assertion about physical camera exposure is introduced.
+            if let observe = recordingInputObserver {
+                // Directed conversion of scalar native profile time: no
+                // dependency on recorder/audio ownership or extra media owner.
+                let lower = CMTimeConvertScale(time, timescale: 720_000, method: .roundTowardZero)
+                let upper = CMTimeConvertScale(time, timescale: 720_000, method: .roundAwayFromZero)
+                let duration = CMTimeConvertScale(CMTime(value: 1, timescale: profile.frameRate),
+                                                  timescale: 720_000, method: .roundAwayFromZero)
+                let end = CMTimeAdd(upper, duration)
+                let lowerDuration = CMTimeConvertScale(CMTime(value: 1, timescale: profile.frameRate),
+                                                       timescale: 720_000, method: .roundTowardZero)
+                let supportedEnd = CMTimeAdd(lower, lowerDuration)
+                if time.isNumeric, time.epoch == 0, CMTimeCompare(time, .zero) >= 0,
+                   lower.isNumeric, upper.isNumeric, duration.isNumeric, end.isNumeric,
+                   lowerDuration.isNumeric, supportedEnd.isNumeric {
+                    // Current frame is only pending admission here. Only a
+                    // prior successful native submission supports a file grant.
+                    observe(lower, end, recordingSupportedEnd ?? lower)
+                    recordingCandidateSupportedEnd = supportedEnd
+                } else { observe(.invalid, .invalid, .invalid) }
+            }
             state.lock()
             let submission: Policy.Submission
             do { submission = try callbacks.reserve(token: token, time: time) }
@@ -201,6 +234,7 @@ final class HardwareVideoEncoder {
                 let error = CaptureFailure(message: "Hardware video submission failed or dropped (\(status))")
                 latchFault(token, error); throw error
             }
+            if let supported = recordingCandidateSupportedEnd { recordingSupportedEnd = supported }
             keyframeRequested = false
             return true
         } catch { latchFault(token, error); throw error }

@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import Sapflow
 
 /// Closed concrete selection, frozen before CaptureRun/native construction.
@@ -30,11 +31,43 @@ final class CaptureRecording {
             }
         case .sdkCheckpointed:
             // Real SDK creation precedes actual AppendWriter creation inside
-            // open. All following adapter initialisation is nonthrowing.
+            // open. A refused scalar consumer still checked-closes this owner.
             let owner = try RecordingCheckpointOwner.open(catalogue: catalogue, identity: identity,
                 mediaEpochNs: 0, maxFragmentBytes: 4 * 1024 * 1024, maxFragmentMs: 500)
-            return CaptureRecording(sdk: SDKCaptureRecorder(owner: owner, queue: queue, onFailure: onFailure))
+            do {
+                return CaptureRecording(sdk: try SDKCaptureRecorder(owner: owner, queue: queue,
+                    hasVideo: CaptureIntent(rawValue: identity.profileID)?.hasVideo ?? true, onFailure: onFailure))
+            } catch {
+                let original = error; _ = try owner.closeIncomplete(); throw original
+            }
         }
+    }
+    /// One exact recorder/native-source binding, before either encoder accepts
+    /// input. No new encoder, queue, AU validation or payload copy is involved.
+    func bindNativeInputs(audio: NativeAudioEncoder, video: HardwareVideoEncoder?) throws {
+        if case let .sdk(value) = backend { try value.bindNativeInputs(audio: audio, video: video) }
+    }
+    func observeStartupInput(_ sample: CMSampleBuffer, video: Bool, videoFrameRate: Int32?) {
+        guard case let .sdk(value) = backend else { return }
+        let duration: CMTime
+        if video, let rate = videoFrameRate, rate > 0 {
+            duration = CMTime(value: 1, timescale: rate)
+        } else if !video, let description = CMSampleBufferGetFormatDescription(sample),
+                  let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description),
+                  asbd.pointee.mSampleRate.isFinite, asbd.pointee.mSampleRate > 0,
+                  asbd.pointee.mSampleRate <= 192_000,
+                  asbd.pointee.mSampleRate.rounded() == asbd.pointee.mSampleRate,
+                  CMSampleBufferGetNumSamples(sample) > 0 {
+            duration = CMTime(value: Int64(CMSampleBufferGetNumSamples(sample)), timescale: Int32(asbd.pointee.mSampleRate))
+        } else { value.inputClockFailed(); return }
+        value.observeStartup(start: CMSampleBufferGetPresentationTimeStamp(sample), duration: duration, video: video)
+    }
+    func bindStartupEpoch(_ epoch: CMTime) {
+        if case let .sdk(value) = backend { value.bindStartupEpoch(epoch) }
+    }
+    /// Cold qualification snapshot, scalar only; no FFI/native/payload query.
+    var nativeInputBudgetSnapshot: RecordingDurableInputBudget.Snapshot? {
+        if case let .sdk(value) = backend { return value.nativeInputBudgetSnapshot }; return nil
     }
     var audioReceiptMode: NativeAudioEncoder.ReceiptMode {
         switch backend { case .legacy: return .legacy; case .sdk: return .fullGenerationLedger }
@@ -78,6 +111,9 @@ private final class SDKCaptureRecorder {
     private let queue: DispatchQueue
     private let budget = EncodedWorkBudget()
     private let onFailure: (Error) -> Void
+    private let durableInput: RecordingDurableInputBudget
+    private let hasVideo: Bool
+    private var nativeInputsBound = false // samples owner, before admission
     private let terminalLock = NSLock()
     private var terminalAdmission = false
     private let loss = CaptureRecordingLoss()
@@ -89,9 +125,45 @@ private final class SDKCaptureRecorder {
     private var completed: CaptureRecording.Completion?
     private var joinedCompletion: ((CaptureRecording.Completion) -> Void)?
     private var retainedSelf: SDKCaptureRecorder?
-    init(owner: RecordingCheckpointOwner, queue: DispatchQueue, onFailure: @escaping (Error) -> Void) {
-        self.owner = owner; self.queue = queue; self.onFailure = onFailure; retainedSelf = self
+    init(owner: RecordingCheckpointOwner, queue: DispatchQueue, hasVideo: Bool, onFailure: @escaping (Error) -> Void) throws {
+        self.owner = owner; self.queue = queue; self.onFailure = onFailure; self.hasVideo = hasVideo
+        let durableInput = RecordingDurableInputBudget(owner: owner.durableBudgetOwner, hasVideo: hasVideo)
+        self.durableInput = durableInput
+        guard owner.observeInstalledFrontier({ durableInput.install($0) }) else { throw RecordingCheckpointOwner.Failure.context }
+        retainedSelf = self
     }
+    func bindNativeInputs(audio: NativeAudioEncoder, video: HardwareVideoEncoder?) throws {
+        guard !nativeInputsBound, (video != nil) == hasVideo else { throw RecordingCheckpointOwner.Failure.context }
+        guard audio.observeRecordingInput({ [self] start, end, support in observeInput(start: start, end: end, supportedEnd: support, video: false) }) else {
+            throw RecordingCheckpointOwner.Failure.context
+        }
+        if let video {
+            guard video.observeRecordingInput({ [self] start, end, support in observeInput(start: start, end: end, supportedEnd: support, video: true) }) else {
+                markIncomplete(CaptureFailure(message: "SDK native recording source ownership changed"))
+                throw RecordingCheckpointOwner.Failure.context
+            }
+        }
+        nativeInputsBound = true
+    }
+    private func announceInputFailure() {
+        guard durableInput.takeFailure() else { return }
+        // Synchronous loss/sink fence BEFORE returning to the original native
+        // acceptance path. Only error reporting/storage cleanup uses recordingIO.
+        markIncomplete(CaptureFailure(message: "SDK recording exceeded its aggregate 2 s source-to-durable-common-presentation bound"))
+    }
+    func inputClockFailed() {
+        durableInput.failSourceClock(); announceInputFailure()
+    }
+    private func observeInput(start: CMTime, end: CMTime, supportedEnd: CMTime, video: Bool) {
+        if !durableInput.admit(start: start, end: end, supportedEnd: supportedEnd, track: video ? .video : .audio) { announceInputFailure() }
+    }
+    func observeStartup(start: CMTime, duration: CMTime, video: Bool) {
+        if !durableInput.admitStartup(start: start, duration: duration, track: video ? .video : .audio) { announceInputFailure() }
+    }
+    func bindStartupEpoch(_ epoch: CMTime) {
+        if !durableInput.bindStartup(epoch: epoch) { announceInputFailure() }
+    }
+    var nativeInputBudgetSnapshot: RecordingDurableInputBudget.Snapshot { durableInput.snapshot }
     func observeTerminalAdmission(_ closed: @escaping () -> Void) -> Bool {
         terminalLock.lock()
         guard !terminalObserverBound else { terminalLock.unlock(); return false }
@@ -101,6 +173,7 @@ private final class SDKCaptureRecorder {
         terminalLock.unlock(); if now { closed() }; return true
     }
     private func closeFailedAdmission() {
+        durableInput.close()
         loss.mark()
         budget.close()
         terminalLock.lock()
