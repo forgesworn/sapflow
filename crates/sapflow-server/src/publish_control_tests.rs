@@ -53,6 +53,9 @@ impl Fixture {
             .await
             .expect("authority");
         let app = Arc::new(App {
+            recording_limits: Arc::new(crate::recorder::RecordingLimits::new(
+                config.max_publishers,
+            )),
             config,
             publish_sessions: Some(sessions),
             streams: Arc::new(Registry::default()),

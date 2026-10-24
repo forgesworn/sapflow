@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 use mp4_atom::{
-    Audio, Avc1, Avcc, Dinf, Dref, Encode, Esds, Ftyp, Hdlr, Mdat, Mdhd, Mdia, Mfhd, Minf, Moof,
+    Audio, Avc1, Avcc, BufMut, Dinf, Dref, Encode, Esds, Ftyp, Hdlr, Mdhd, Mdia, Mfhd, Minf, Moof,
     Moov, Mp4a, Mvex, Mvhd, Smhd, Stbl, Stco, Stsc, Stsd, Stsz, Stts, Tfdt, Tfhd, Tkhd, Traf, Trak,
     Trex, Trun, TrunEntry, Url, Visual, Vmhd, esds,
 };
@@ -21,6 +21,9 @@ pub const VIDEO_TRACK: u32 = 1;
 pub const AUDIO_TRACK: u32 = 2;
 /// Ticks per second on the video track: 90 kHz, the MPEG-TS clock.
 pub const VIDEO_TIMESCALE: u32 = 90_000;
+/// Largest generated fragment accepted by [`rebase_part_for_file`]. Recording
+/// admission can apply this same limit before retaining a fragment for writing.
+pub const MAX_FILE_FRAGMENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Sample flags (ISO/IEC 14496-12 8.8.3.1): a sync sample depends on
 /// nothing; any other sample depends on others and is not a sync sample.
@@ -498,6 +501,8 @@ fn audio_trak(a: &AacConfig) -> Trak {
 }
 
 /// Builds one `moof` + `mdat` holding every run, in order.
+/// Returns empty bytes if the fragment cannot use 32-bit box sizes and signed
+/// 32-bit track data offsets. Payloads are copied once into the final fragment.
 pub fn encode_part(sequence_number: u32, runs: &[TrackRun<'_>]) -> Bytes {
     encode_part_inner(sequence_number, runs, false, None)
 }
@@ -593,21 +598,52 @@ fn encode_part_inner(
     if build(&vec![0; runs.len()]).encode(&mut probe).is_err() {
         return Bytes::new();
     }
-    let header = probe.len() + 8;
-    let mut offsets = Vec::with_capacity(runs.len());
-    let mut data = Vec::new();
-    for run in &runs {
-        offsets.push((header + data.len()) as i32);
-        for s in run.samples {
-            data.extend_from_slice(&s.data);
-        }
+    let lengths = runs.iter().map(|run| {
+        run.samples.iter().try_fold(0usize, |length, sample| {
+            length.checked_add(sample.data.len())
+        })
+    });
+    let Some((offsets, capacity)) = checked_part_layout(probe.len(), lengths) else {
+        return Bytes::new();
+    };
+    let mut buf = Vec::with_capacity(capacity);
+    if build(&offsets).encode(&mut buf).is_err() {
+        return Bytes::new();
     }
-
-    let mut buf = Vec::with_capacity(header + data.len());
-    if build(&offsets).encode(&mut buf).is_err() || (Mdat { data }).encode(&mut buf).is_err() {
+    // Write shared sample payloads directly into the final fragment. Keep the
+    // same mp4-atom box framing without a temporary payload Vec, its growth
+    // reallocations, or a second copy of every compressed sample.
+    if buf
+        .encode_atom(b"mdat", |output| {
+            for run in &runs {
+                for sample in run.samples {
+                    output.extend_from_slice(&sample.data);
+                }
+            }
+            Ok(())
+        })
+        .is_err()
+    {
         return Bytes::new();
     }
     Bytes::from(buf)
+}
+
+// mp4-atom's Atom encoder supports 32-bit sizes, not extended mdat boxes.
+// Validate representability before allocating the final payload-sized buffer.
+fn checked_part_layout(
+    moof_len: usize,
+    lengths: impl Iterator<Item = Option<usize>>,
+) -> Option<(Vec<i32>, usize)> {
+    let header = moof_len.checked_add(8)?;
+    let mut offsets = Vec::with_capacity(lengths.size_hint().0);
+    let mut data_len = 0usize;
+    for length in lengths {
+        offsets.push(i32::try_from(header.checked_add(data_len)?).ok()?);
+        data_len = data_len.checked_add(length?)?;
+    }
+    u32::try_from(data_len.checked_add(8)?).ok()?;
+    Some((offsets, header.checked_add(data_len)?))
 }
 
 /// Shared rational origin for a standalone recording. Each track subtracts
@@ -631,8 +667,7 @@ pub fn rebase_part_for_file(
     audio_rate: Option<u32>,
     origin: &mut Option<FileTimeBase>,
 ) -> Result<Bytes, InvalidFileFragment> {
-    const MAX: usize = 64 * 1024 * 1024;
-    if data.len() > MAX {
+    if data.len() > MAX_FILE_FRAGMENT_BYTES {
         return Err(InvalidFileFragment);
     }
     fn u32_at(data: &[u8], at: usize) -> Result<u32, InvalidFileFragment> {
@@ -893,6 +928,237 @@ mod tests {
         assert_eq!(moov.mvhd.next_track_id, 3);
         assert_eq!(moov.mvex.expect("mvex").trex[0].track_id, AUDIO_TRACK);
         assert!(init_segment_for_tracks(None, None, Duration::ZERO).is_none());
+    }
+}
+
+#[cfg(test)]
+#[path = "../examples/support/fmp4_reference.rs"]
+mod fmp4_reference;
+
+#[cfg(test)]
+mod direct_mdat_tests {
+    use super::*;
+    use mp4_atom::{Decode, Mdat};
+
+    use super::fmp4_reference::before_direct_mdat;
+
+    fn assert_layout(
+        bytes: &Bytes,
+        runs: &[TrackRun<'_>],
+        native_recording: bool,
+        final_audio_duration: Option<u32>,
+    ) {
+        let mut input = bytes.as_ref();
+        let moof = Moof::decode(&mut input).expect("moof");
+        let moof_len = bytes.len() - input.len();
+        let mdat = Mdat::decode(&mut input).expect("mdat");
+        assert!(input.is_empty(), "exactly one moof and mdat");
+        let nonempty: Vec<_> = runs.iter().filter(|r| !r.samples.is_empty()).collect();
+        assert_eq!(moof.traf.len(), nonempty.len());
+        let mut offset = moof_len + 8;
+        let mut expected_payload = Vec::new();
+        for (traf, run) in moof.traf.iter().zip(nonempty) {
+            assert_eq!(traf.tfhd.track_id, run.track_id);
+            assert_eq!(
+                traf.tfdt
+                    .as_ref()
+                    .expect("decode time")
+                    .base_media_decode_time,
+                run.base_time
+            );
+            assert_eq!(traf.trun.len(), 1);
+            assert_eq!(traf.trun[0].data_offset, Some(offset as i32));
+            assert_eq!(traf.trun[0].entries.len(), run.samples.len());
+            for (index, (entry, sample)) in traf.trun[0].entries.iter().zip(run.samples).enumerate()
+            {
+                let duration = if run.track_id == AUDIO_TRACK && index + 1 == run.samples.len() {
+                    final_audio_duration.unwrap_or(sample.duration)
+                } else {
+                    sample.duration
+                };
+                assert_eq!(entry.duration, Some(duration));
+                assert_eq!(entry.cts, Some(sample.cts));
+                assert_eq!(entry.size, Some(sample.data.len() as u32));
+                assert_eq!(&bytes[offset..offset + sample.data.len()], sample.data);
+                expected_payload.extend_from_slice(&sample.data);
+                offset += sample.data.len();
+            }
+            assert_eq!(
+                traf.sbgp.len(),
+                usize::from(native_recording && run.track_id == AUDIO_TRACK)
+            );
+        }
+        assert_eq!(offset, bytes.len());
+        assert_eq!(mdat.data, expected_payload);
+    }
+
+    #[test]
+    fn fragment_layout_checks_box_offset_and_machine_integer_boundaries() {
+        let layout =
+            |moof, lengths: &[Option<usize>]| checked_part_layout(moof, lengths.iter().copied());
+        let header = 32;
+        let offset_limit = i32::MAX as usize - header;
+        assert_eq!(
+            layout(24, &[Some(offset_limit), Some(0)]),
+            Some((vec![header as i32, i32::MAX], i32::MAX as usize))
+        );
+        assert!(layout(24, &[Some(offset_limit + 1), Some(0)]).is_none());
+        let mdat_limit = u32::MAX as usize - 8;
+        if usize::BITS > 32 {
+            assert_eq!(
+                layout(24, &[Some(mdat_limit)]),
+                Some((vec![header as i32], header + mdat_limit)),
+                "one run can extend beyond signed offsets if its start fits"
+            );
+        }
+        assert!(layout(24, &[Some(mdat_limit + 1)]).is_none());
+        assert!(layout(usize::MAX, &[]).is_none());
+        assert!(layout(24, &[Some(usize::MAX)]).is_none());
+        let overflowing_run = [usize::MAX, 1]
+            .into_iter()
+            .try_fold(0usize, usize::checked_add);
+        assert!(layout(24, &[overflowing_run]).is_none());
+    }
+
+    #[test]
+    fn unrepresentable_fragments_are_refused_without_allocating_their_payload() {
+        // One actual MiB shared by every sample describes a 4 GiB payload.
+        // Any attempted fragment allocation would make this test impractical.
+        let sample = Sample {
+            duration: 3000,
+            cts: 0,
+            sync: true,
+            data: Bytes::from(vec![0x67; 1024 * 1024]),
+        };
+        let samples = vec![sample.clone(); 4096];
+        let oversized_mdat = [TrackRun {
+            track_id: VIDEO_TRACK,
+            base_time: 0,
+            samples: &samples,
+        }];
+        assert!(encode_part(1, &oversized_mdat).is_empty());
+        assert!(encode_native_recording_part(1, &oversized_mdat).is_empty());
+        let audio = [Sample {
+            duration: 1024,
+            ..sample
+        }];
+        let oversized_offset = [
+            TrackRun {
+                samples: &samples[..2048],
+                ..oversized_mdat[0]
+            },
+            TrackRun {
+                track_id: AUDIO_TRACK,
+                base_time: 0,
+                samples: &audio,
+            },
+        ];
+        assert!(encode_part(1, &oversized_offset).is_empty());
+        assert!(encode_native_recording_part(1, &oversized_offset).is_empty());
+        assert!(
+            encode_native_recording_part_with_final_audio_duration(1, &oversized_offset, 576)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn direct_mdat_matches_frozen_writer_for_streaming_and_native_layouts() {
+        let video: Vec<_> = [0, 1, 17, 4096, 131_071, 13]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| Sample {
+                duration: 3000 + i as u32,
+                cts: [0, 3000, -3000][i % 3],
+                sync: i % 2 == 0,
+                data: Bytes::from(vec![i as u8 + 1; len]),
+            })
+            .collect();
+        let audio: Vec<_> = [0, 1, 193, 4097]
+            .into_iter()
+            .enumerate()
+            .map(|(i, len)| Sample {
+                duration: 1024,
+                cts: 0,
+                sync: true,
+                data: Bytes::from(vec![i as u8 + 17; len]),
+            })
+            .collect();
+        let v = TrackRun {
+            track_id: VIDEO_TRACK,
+            base_time: u64::from(u32::MAX) + 90_000,
+            samples: &video,
+        };
+        let a = TrackRun {
+            track_id: AUDIO_TRACK,
+            base_time: 480_000,
+            samples: &audio,
+        };
+        let empty_v = TrackRun { samples: &[], ..v };
+        let empty_a = TrackRun { samples: &[], ..a };
+        let layouts = [
+            vec![],
+            vec![empty_v.clone(), empty_a.clone()],
+            vec![v.clone()],
+            vec![a.clone()],
+            vec![v.clone(), a.clone()],
+            vec![a.clone(), v.clone()],
+            vec![empty_a.clone(), v.clone(), empty_v.clone()],
+            vec![empty_v, a.clone(), empty_a],
+            vec![
+                TrackRun {
+                    samples: &video[..1],
+                    ..v
+                },
+                TrackRun {
+                    samples: &audio[..1],
+                    ..a
+                },
+            ],
+        ];
+        for runs in &layouts {
+            for sequence in [0, 7, u32::MAX] {
+                for native in [false, true] {
+                    let actual = if native {
+                        encode_native_recording_part(sequence, runs)
+                    } else {
+                        encode_part(sequence, runs)
+                    };
+                    let before = before_direct_mdat(sequence, runs, native, None);
+                    assert_eq!(actual, before, "sequence {sequence}, native {native}");
+                    assert_layout(&actual, runs, native, None);
+                    if !native {
+                        let mut old_origin = None;
+                        let mut new_origin = None;
+                        assert_eq!(
+                            rebase_part_for_file(&actual, Some(48_000), &mut new_origin)
+                                .map_err(|_| ()),
+                            rebase_part_for_file(&before, Some(48_000), &mut old_origin)
+                                .map_err(|_| ()),
+                            "standalone recording rebase"
+                        );
+                        assert_eq!(new_origin, old_origin);
+                    }
+                }
+                if runs.iter().filter(|r| r.track_id == AUDIO_TRACK).count() == 1
+                    && runs
+                        .iter()
+                        .find(|r| r.track_id == AUDIO_TRACK)
+                        .is_some_and(|r| !r.samples.is_empty())
+                {
+                    for duration in [1, 576, 1024] {
+                        let actual = encode_native_recording_part_with_final_audio_duration(
+                            sequence, runs, duration,
+                        );
+                        assert_eq!(
+                            actual,
+                            before_direct_mdat(sequence, runs, true, Some(duration)),
+                            "final native duration {duration}"
+                        );
+                        assert_layout(&actual, runs, true, Some(duration));
+                    }
+                }
+            }
+        }
     }
 }
 

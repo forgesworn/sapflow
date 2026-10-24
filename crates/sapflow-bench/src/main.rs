@@ -39,6 +39,11 @@ use hyper_util::rt::TokioExecutor;
 
 #[derive(Default)]
 struct Stats {
+    window: Option<CollectionWindow>,
+    excluded_requests: u64,
+    excluded_errors: u64,
+    drained_requests: u64,
+    max_drain: Duration,
     playlist: Vec<Duration>,
     segment: Vec<Duration>,
     /// When each viewer finished each part, by part URI.
@@ -55,6 +60,27 @@ struct Stats {
     /// Local addresses of the connections responses arrived on: one per
     /// connection used, so how many connections the viewers needed.
     connections: HashSet<SocketAddr>,
+}
+
+/// Admit by request start; retain completions after the interval to avoid clipping tails.
+#[derive(Clone, Copy)]
+struct CollectionWindow {
+    start: Instant,
+    end: Instant,
+}
+
+impl CollectionWindow {
+    fn admits(self, started: Instant) -> bool {
+        started >= self.start && started < self.end
+    }
+}
+
+struct Download {
+    body: Bytes,
+    took: Duration,
+    url: String,
+    finished: Instant,
+    measured: bool,
 }
 
 #[derive(Debug)]
@@ -97,6 +123,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--ca" => a.ca = Some(v),
             _ => return Err(format!("unknown option {k}")),
         }
+    }
+    if a.viewers == 0 || a.secs == 0 {
+        return Err("--viewers and --secs must be positive".into());
     }
     let tls = a.url.starts_with("https://");
     if !tls && !a.url.starts_with("http://") {
@@ -141,15 +170,27 @@ async fn main() {
 
 /// Runs the viewers to the end of the measurement and returns what they saw.
 async fn run(a: &Args) -> Result<Stats, String> {
-    let stats = Arc::new(Mutex::new(Stats::default()));
+    let start = Instant::now()
+        .checked_add(Duration::from_secs(a.ramp))
+        .ok_or("ramp is too long")?;
+    let window = CollectionWindow {
+        start,
+        end: start
+            .checked_add(Duration::from_secs(a.secs))
+            .ok_or("measurement is too long")?,
+    };
+    let stats = Arc::new(Mutex::new(Stats {
+        window: Some(window),
+        ..Stats::default()
+    }));
     let tasks = match &a.ca {
         Some(path) => {
             let pem = std::fs::read(path).map_err(|e| format!("cannot read --ca {path}: {e}"))?;
             let config = tls::client_config(&pem).map_err(|e| format!("--ca {path}: {e}"))?;
             let http2 = a.http2;
-            spawn_viewers(a, &stats, move || tls::https_client(&config, http2))
+            spawn_viewers(a, &stats, window, move || tls::https_client(&config, http2))
         }
-        None => spawn_viewers(a, &stats, plain_client),
+        None => spawn_viewers(a, &stats, window, plain_client),
     };
     for t in tasks {
         let _ = t.await;
@@ -170,12 +211,13 @@ fn plain_client() -> Client<HttpConnector, Empty<Bytes>> {
 fn spawn_viewers<C>(
     a: &Args,
     stats: &Arc<Mutex<Stats>>,
+    window: CollectionWindow,
     make_client: impl Fn() -> Client<C, Empty<Bytes>>,
 ) -> Vec<tokio::task::JoinHandle<()>>
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
-    let deadline = Instant::now() + Duration::from_secs(a.ramp + a.secs);
+    let deadline = window.end;
     let mut tasks = Vec::new();
     for i in 0..a.viewers {
         let stats = stats.clone();
@@ -199,7 +241,7 @@ async fn get<C>(
     client: &Client<C, Empty<Bytes>>,
     url: &str,
     stats: &Mutex<Stats>,
-) -> Option<(Bytes, Duration, String)>
+) -> Option<Download>
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
@@ -207,42 +249,127 @@ where
     // Follow at most one redirect (mediamtx's session check).
     for _ in 0..2 {
         let start = Instant::now();
+        if lock(stats).window.is_some_and(|window| start >= window.end) {
+            return None;
+        }
         let req = Request::get(&url).body(Empty::new()).ok()?;
         let resp = tokio::time::timeout(Duration::from_secs(15), client.request(req)).await;
-        lock(stats).requests += 1;
         let resp = match resp {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                fail(stats, &url, &format!("client error: {}", describe(&e)));
+                record_request(
+                    stats,
+                    start,
+                    Instant::now(),
+                    None,
+                    0,
+                    Some((&url, &format!("client error: {}", describe(&e)))),
+                );
                 return None;
             }
             Err(_) => {
-                fail(stats, &url, "timeout");
+                record_request(
+                    stats,
+                    start,
+                    Instant::now(),
+                    None,
+                    0,
+                    Some((&url, "timeout")),
+                );
                 return None;
             }
         };
-        note_response(stats, &resp);
+        let (parts, body) = resp.into_parts();
+        let resp = Response::from_parts(parts, ());
         if resp.status().is_redirection() {
+            record_request(stats, start, Instant::now(), Some(&resp), 0, None);
             let loc = resp.headers().get("location")?.to_str().ok()?.to_owned();
             url = join(&url, &loc);
             continue;
         }
         if resp.status() != StatusCode::OK {
-            fail(stats, &url, &format!("HTTP {}", resp.status().as_u16()));
+            record_request(
+                stats,
+                start,
+                Instant::now(),
+                Some(&resp),
+                0,
+                Some((&url, &format!("HTTP {}", resp.status().as_u16()))),
+            );
             return None;
         }
-        let body = match resp.into_body().collect().await {
-            Ok(b) => b.to_bytes(),
-            Err(e) => {
-                fail(stats, &url, &format!("body error: {}", describe(&e)));
+        let body = match tokio::time::timeout(Duration::from_secs(15), body.collect()).await {
+            Ok(Ok(b)) => b.to_bytes(),
+            Ok(Err(e)) => {
+                record_request(
+                    stats,
+                    start,
+                    Instant::now(),
+                    Some(&resp),
+                    0,
+                    Some((&url, &format!("body error: {}", describe(&e)))),
+                );
+                return None;
+            }
+            Err(_) => {
+                record_request(
+                    stats,
+                    start,
+                    Instant::now(),
+                    Some(&resp),
+                    0,
+                    Some((&url, "body timeout")),
+                );
                 return None;
             }
         };
-        let took = start.elapsed();
-        lock(stats).bytes += body.len() as u64;
-        return Some((body, took, url));
+        let finished = Instant::now();
+        let measured = record_request(stats, start, finished, Some(&resp), body.len() as u64, None);
+        return Some(Download {
+            body,
+            took: finished.duration_since(start),
+            url,
+            finished,
+            measured,
+        });
     }
     None
+}
+
+fn record_request(
+    stats: &Mutex<Stats>,
+    started: Instant,
+    finished: Instant,
+    response: Option<&Response<()>>,
+    bytes: u64,
+    failure: Option<(&str, &str)>,
+) -> bool {
+    let mut st = lock(stats);
+    let measured = st.window.is_none_or(|window| window.admits(started));
+    if measured {
+        st.requests += 1;
+        st.bytes += bytes;
+        if let Some(window) = st.window
+            && finished > window.end
+        {
+            st.drained_requests += 1;
+            st.max_drain = st.max_drain.max(finished.duration_since(window.end));
+        }
+        if let Some(response) = response {
+            note_response(&mut st, response);
+        }
+    } else {
+        st.excluded_requests += 1;
+    }
+    if let Some((url, kind)) = failure {
+        if measured {
+            st.errors += 1;
+        } else {
+            st.excluded_errors += 1;
+        }
+        fail(&mut st, url, kind, measured);
+    }
+    measured
 }
 
 /// An error with its causes, innermost last: hyper's own text for a failed
@@ -268,8 +395,7 @@ fn version_label(v: Version) -> &'static str {
 }
 
 /// Counts the HTTP version and connection a response arrived on.
-fn note_response<T>(stats: &Mutex<Stats>, resp: &Response<T>) {
-    let mut st = lock(stats);
+fn note_response<T>(st: &mut Stats, resp: &Response<T>) {
     *st.versions
         .entry(version_label(resp.version()))
         .or_default() += 1;
@@ -278,7 +404,7 @@ fn note_response<T>(stats: &Mutex<Stats>, resp: &Response<T>) {
     }
 }
 
-fn fail(stats: &Mutex<Stats>, url: &str, kind: &str) {
+fn fail(st: &mut Stats, url: &str, kind: &str, measured: bool) {
     let what = if url.contains("_HLS_msn") {
         "blocking playlist"
     } else if url.contains(".m3u8") {
@@ -288,9 +414,10 @@ fn fail(stats: &Mutex<Stats>, url: &str, kind: &str) {
     } else {
         "segment"
     };
-    let mut st = lock(stats);
-    st.errors += 1;
-    *st.error_kinds.entry(format!("{what}: {kind}")).or_default() += 1;
+    let prefix = if measured { "" } else { "outside window: " };
+    *st.error_kinds
+        .entry(format!("{prefix}{what}: {kind}"))
+        .or_default() += 1;
 }
 
 /// Resolves a playlist URI against the playlist's own URL.
@@ -365,17 +492,17 @@ async fn viewer<C>(
 ) where
     C: Connect + Clone + Send + Sync + 'static,
 {
-    let Some((master, _, index_url)) = get(client, index_url, stats).await else {
+    let Some(master) = get(client, index_url, stats).await else {
         return;
     };
-    let Some(variant) = String::from_utf8_lossy(&master)
+    let Some(variant) = String::from_utf8_lossy(&master.body)
         .lines()
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .map(str::to_owned)
     else {
         return;
     };
-    let media_url = join(&index_url, &variant);
+    let media_url = join(&master.url, &variant);
     let sep = if media_url.contains('?') { '&' } else { '?' };
 
     let mut loops = 0u64;
@@ -384,19 +511,22 @@ async fn viewer<C>(
         // Every fifth reload, and at the start: a plain playlist request and
         // the newest whole segment.
         if loops.is_multiple_of(5) || media.is_none() {
-            let Some((body, took, _)) = get(client, &media_url, stats).await else {
+            let Some(download) = get(client, &media_url, stats).await else {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 media = None;
                 loops += 1;
                 continue;
             };
-            lock(stats).playlist.push(took);
-            let m = parse_media(&String::from_utf8_lossy(&body));
+            if download.measured {
+                lock(stats).playlist.push(download.took);
+            }
+            let m = parse_media(&String::from_utf8_lossy(&download.body));
             if full
                 && let Some(seg) = &m.last_segment
-                && let Some((_, took, _)) = get(client, &join(&media_url, seg), stats).await
+                && let Some(download) = get(client, &join(&media_url, seg), stats).await
+                && download.measured
             {
-                lock(stats).segment.push(took);
+                lock(stats).segment.push(download.took);
             }
             media = Some(m);
         }
@@ -420,24 +550,28 @@ async fn viewer<C>(
             }
         };
         let (pl, part) = tokio::join!(get(client, &pl_url, stats), fetch_part);
-        if pl.is_some() {
+        if let Some(download) = &pl
+            && download.measured
+        {
             // When each viewer learned of the new part (all viewers).
             lock(stats)
                 .playlist_updates
                 .entry((m.next.0, m.next.1))
                 .or_default()
-                .push(Instant::now());
+                .push(download.finished);
         }
-        if part.is_some() {
+        if let Some(download) = &part
+            && download.measured
+        {
             // Key by path: mediamtx gives every viewer its own session query.
             let key = hint.split('?').next().unwrap_or(&hint).to_owned();
             lock(stats)
                 .parts
                 .entry(key)
                 .or_default()
-                .push(Instant::now());
+                .push(download.finished);
         }
-        media = pl.map(|(body, _, _)| parse_media(&String::from_utf8_lossy(&body)));
+        media = pl.map(|download| parse_media(&String::from_utf8_lossy(&download.body)));
     }
 }
 
@@ -488,6 +622,16 @@ fn report(a: &Args, st: &Stats) {
         "viewers {}  measured {} s after a {} s ramp",
         a.viewers, a.secs, a.ramp
     );
+    println!("collection requests started within the fixed post-ramp window, including drain");
+    println!(
+        "excluded requests {}  errors {}",
+        st.excluded_requests, st.excluded_errors
+    );
+    println!(
+        "drained requests {} max {:.6} s",
+        st.drained_requests,
+        st.max_drain.as_secs_f64()
+    );
     println!(
         "requests {}  errors {}  received {:.1} MB",
         st.requests,
@@ -534,6 +678,124 @@ fn report(a: &Args, st: &Stats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_excludes_ramp_and_post_deadline_starts_but_retains_slow_completions() {
+        let start = Instant::now() + Duration::from_secs(10);
+        let end = start + Duration::from_secs(60);
+        let stats = Mutex::new(Stats {
+            window: Some(CollectionWindow { start, end }),
+            ..Stats::default()
+        });
+        let response = Response::builder()
+            .version(Version::HTTP_2)
+            .body(())
+            .expect("response");
+        for (begin, finish) in [
+            (
+                start - Duration::from_secs(2),
+                start - Duration::from_secs(1),
+            ),
+            (
+                start - Duration::from_millis(1),
+                start + Duration::from_millis(1),
+            ),
+            (end, end + Duration::from_millis(1)),
+        ] {
+            assert!(!record_request(
+                &stats,
+                begin,
+                finish,
+                Some(&response),
+                100,
+                None
+            ));
+        }
+        assert!(record_request(
+            &stats,
+            start,
+            end,
+            Some(&response),
+            200,
+            None
+        ));
+        assert!(record_request(
+            &stats,
+            end - Duration::from_millis(1),
+            end + Duration::from_secs(2),
+            Some(&response),
+            100,
+            None
+        ));
+        let st = lock(&stats);
+        assert_eq!((st.requests, st.bytes, st.excluded_requests), (2, 300, 3));
+        assert_eq!(
+            (st.drained_requests, st.max_drain),
+            (1, Duration::from_secs(2))
+        );
+        assert_eq!(protocols(&st), "HTTP/2 2");
+    }
+
+    #[test]
+    fn an_admitted_request_failing_after_the_window_is_a_measured_failure() {
+        let start = Instant::now();
+        let end = start + Duration::from_secs(1);
+        let stats = Mutex::new(Stats {
+            window: Some(CollectionWindow { start, end }),
+            ..Stats::default()
+        });
+        assert!(record_request(
+            &stats,
+            end - Duration::from_millis(1),
+            end + Duration::from_secs(1),
+            None,
+            0,
+            Some(("http://test/part.mp4", "body timeout"))
+        ));
+        let st = lock(&stats);
+        assert_eq!(
+            (
+                st.requests,
+                st.errors,
+                st.excluded_errors,
+                st.drained_requests
+            ),
+            (1, 1, 0, 1)
+        );
+        assert_eq!(st.error_kinds["part: body timeout"], 1);
+    }
+
+    #[test]
+    fn failures_outside_collection_remain_visible_without_polluting_percentiles() {
+        let start = Instant::now() + Duration::from_secs(1);
+        let stats = Mutex::new(Stats {
+            window: Some(CollectionWindow {
+                start,
+                end: start + Duration::from_secs(1),
+            }),
+            ..Stats::default()
+        });
+        assert!(!record_request(
+            &stats,
+            start - Duration::from_secs(1),
+            start,
+            None,
+            0,
+            Some(("http://test/stream.m3u8", "timeout"))
+        ));
+        let st = lock(&stats);
+        assert_eq!(
+            (
+                st.requests,
+                st.errors,
+                st.excluded_requests,
+                st.excluded_errors
+            ),
+            (0, 0, 1, 1)
+        );
+        assert_eq!(st.error_kinds["outside window: playlist: timeout"], 1);
+        assert!(st.playlist.is_empty() && st.segment.is_empty() && st.parts.is_empty());
+    }
 
     #[test]
     fn joins_relative_uris() {
@@ -613,9 +875,9 @@ mod tests {
         assert_eq!(protocols(&st), "none");
         let resp = |v| Response::builder().version(v).body(()).expect("response");
         let stats = Mutex::new(std::mem::take(&mut st));
-        note_response(&stats, &resp(Version::HTTP_2));
-        note_response(&stats, &resp(Version::HTTP_2));
-        note_response(&stats, &resp(Version::HTTP_11));
+        note_response(&mut lock(&stats), &resp(Version::HTTP_2));
+        note_response(&mut lock(&stats), &resp(Version::HTTP_2));
+        note_response(&mut lock(&stats), &resp(Version::HTTP_11));
         assert_eq!(protocols(&lock(&stats)), "HTTP/1.1 1, HTTP/2 2");
         // No connection information on a hand-made response.
         assert!(lock(&stats).connections.is_empty());

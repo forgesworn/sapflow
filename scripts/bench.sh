@@ -2,6 +2,8 @@
 # M4 measurements for one server, the same way for sapflow and mediamtx.
 #
 #   scripts/bench.sh sapflow
+#   SAPFLOW_HTTP_IMPL=hyper scripts/bench.sh sapflow
+#   SAPFLOW_HTTP_IMPL=own SAPFLOW_HTTP_THREADS=1 scripts/bench.sh sapflow
 #   MEDIAMTX=/path/to/mediamtx scripts/bench.sh mediamtx    # 1.19.1 or 1.21.x
 #
 # Feed: ffmpeg test signal over RTMP, 720p30, 2.5 Mbit/s, 1 s keyframes, AAC
@@ -16,13 +18,33 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SERVER=${1:?usage: scripts/bench.sh sapflow|mediamtx}
+# The caller provides a new directory under ignored/private scratch. Retain
+# diagnostics on success and failure; never overwrite an earlier trial's logs.
+if [ -n "${BENCH_ARTIFACTS:-}" ]; then mkdir -m 700 "$BENCH_ARTIFACTS"; fi
 VIEWERS=${VIEWERS:-"250 750"}
 SECS=${SECS:-60}
 HTTP=127.0.0.1:8888
 EVENT=event-bench
 WORK=$(mktemp -d)
 pids=()
-cleanup() { { for p in "${pids[@]}"; do kill "$p"; done; wait; } 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() {
+  local result=$? log
+  trap - EXIT
+  { if [ "${#pids[@]}" -gt 0 ]; then for p in "${pids[@]}"; do kill "$p"; done; fi; wait; } 2>/dev/null || true
+  if [ -n "${BENCH_ARTIFACTS:-}" ]; then
+    for log in "$WORK"/*.log "$WORK"/bench-*.txt; do
+      if [ -f "$log" ] && ! cp "$log" "$BENCH_ARTIFACTS/"; then
+        echo "could not retain benchmark diagnostic $log" >&2
+        if [ "$result" -eq 0 ]; then result=1; fi
+      fi
+    done
+    if ! printf '%s\n' "$result" > "$BENCH_ARTIFACTS/exit-status.txt"; then
+      if [ "$result" -eq 0 ]; then result=1; fi
+    fi
+  fi
+  rm -rf "$WORK"
+  exit "$result"
+}
 trap cleanup EXIT
 
 # Two builds, not one: cargo unifies features across the packages of one build,
@@ -37,6 +59,14 @@ BENCH=$REL/sapflow-bench
 case "$SERVER" in
   sapflow)
     BIN=$REL/sapflow
+    # Pin the selected implementation, independently of the binary's default.
+    export SAPFLOW_HTTP_IMPL=${SAPFLOW_HTTP_IMPL:-own}
+    if [ "$SAPFLOW_HTTP_IMPL" = own ]; then
+      export SAPFLOW_HTTP_THREADS=${SAPFLOW_HTTP_THREADS:-$(python3 -c 'import os; print(min(256, os.cpu_count() or 4))')}
+    else
+      unset SAPFLOW_HTTP_THREADS
+    fi
+    echo "viewer HTTP: $SAPFLOW_HTTP_IMPL${SAPFLOW_HTTP_THREADS:+, threads $SAPFLOW_HTTP_THREADS}"
     SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:8890 \
     SAPFLOW_RTMP_ADDR=127.0.0.1:1935 RUST_LOG=warn "$BIN" > "$WORK/server.log" 2>&1 &
     ;;
@@ -95,20 +125,9 @@ SPID=$!; pids+=("$SPID")
 sleep 1
 kill -0 "$SPID" || { cat "$WORK/server.log"; exit 1; }
 
-# Cumulative CPU seconds of a process (ps time is [[dd-]hh:]mm:ss.cc).
-cpu_secs() {
-  ps -o time= -p "$1" | awk '{ n=split($1,a,/[-:]/); s=0; for(i=1;i<=n;i++) s=s*60+a[i]; print s }'
-}
 rss_mb() { ps -o rss= -p "$1" | awk '{ printf "%.1f", $1/1024 }'; }
-now() { python3 -c 'import time; print(time.time())'; }
 # CPU % of one core over the next N seconds, and peak RSS meanwhile.
-measure() { # pid secs -> "cpu% peakMB"
-  local c0 t0 c1 t1 peak=0 r
-  c0=$(cpu_secs "$1"); t0=$(now)
-  for _ in $(seq 1 "$2"); do r=$(rss_mb "$1"); peak=$(awk -v a="$peak" -v b="$r" 'BEGIN{print (b>a)?b:a}'); sleep 1; done
-  c1=$(cpu_secs "$1"); t1=$(now)
-  awk -v c0="$c0" -v c1="$c1" -v t0="$t0" -v t1="$t1" -v p="$peak" 'BEGIN { printf "%.1f %.1f\n", 100*(c1-c0)/(t1-t0), p }'
-}
+measure() { python3 scripts/measure-process.py "$1" "$2"; }
 
 size_mb=$(ls -l "$BIN" | awk '{ printf "%.1f", $5/1048576 }')
 sleep 2
@@ -124,16 +143,19 @@ for _ in $(seq 1 60); do curl -sf -o /dev/null "$URL" && break; sleep 0.5; done
 curl -sf -o /dev/null "$URL" || { echo "stream never became ready" >&2; tail "$WORK/server.log" >&2; exit 1; }
 # Let the playlist window fill (24 s) before measuring.
 sleep 25
-read -r cpu_one loaded_mb < <(measure "$SPID" 20)
+read -r cpu_one loaded_mb sample_one < <(measure "$SPID" 20)
 
 echo "| $SERVER | binary MB | idle RSS MB | one stream RSS MB | one stream CPU % |"
 echo "| $SERVER | $size_mb | $idle_mb | $loaded_mb | $cpu_one |"
 for n in $VIEWERS; do
-  "$BENCH" --url "$URL" --viewers "$n" --secs "$SECS" --ramp 10 > "$WORK/bench-$n.txt" &
+  "$BENCH" --url "$URL" --viewers "$n" --secs "$SECS" --ramp 10 > "$WORK/bench-$n.txt" 2>&1 &
   bp=$!
+  pids+=("$bp")
   sleep 10
-  read -r cpu_n peak_n < <(measure "$SPID" "$SECS")
-  wait "$bp" || true
+  read -r cpu_n peak_n sample_n < <(measure "$SPID" "$SECS")
+  wait "$bp"
+  unset 'pids[${#pids[@]}-1]'
   echo "--- $SERVER, $n viewers: server CPU ${cpu_n}%  peak RSS ${peak_n} MB"
+  echo "server sampling ${sample_n} s target ${SECS} s"
   cat "$WORK/bench-$n.txt"
 done

@@ -11,17 +11,20 @@
 //! (Apache-2.0 OR MIT), getrandom 0.4.3 (MIT OR Apache-2.0).
 //! Primary algorithm references: RFC3394, RFC8018, NIST SP800-38A.
 //! The KDF uses SHA-1/2048 iterations because this is SRT's wire profile.
-//! Retained keys/passphrase and temporary key arrays are zeroised on drop;
-//! Keys occupy at most two 32-byte buffers plus a 32-byte KEK. KM messages
-//! are at most 104 bytes; parsing never derives a key until shape validation.
+//! Retained keys/passphrase, cached schedules and temporary key arrays are
+//! zeroised on drop. Raw keys occupy at most two 32-byte buffers plus a
+//! 32-byte KEK, with one boxed raw-key/encryption-schedule owner per occupied
+//! slot. Empty slots retain only optional box metadata, never AES schedules.
+//! Schedule storage depends on the cipher backend. KM messages are at most
+//! 104 bytes; parsing never derives a key until shape validation.
 //! Data encrypts/decrypts in place without extra per-payload allocations;
-//! AES schedules are expanded per packet (profiling/optimisation pending).
+//! each packet borrows its slot's schedule with a fresh sequence-derived IV.
 //! This does not promise locked memory, crash-dump exclusion or erasure of
 //! copies held by the application or KDF's internal stack temporaries.
 
 use crate::seq::Seq;
 use aes_kw::{KeyInit, KwAes128, KwAes256};
-use ctr::cipher::{KeyIvInit, StreamCipher};
+use ctr::cipher::{InnerIvInit, StreamCipher};
 use std::{fmt, sync::Arc};
 use zeroize::Zeroizing;
 
@@ -126,11 +129,49 @@ impl fmt::Display for CryptoError {
 impl std::error::Error for CryptoError {}
 
 type Secret = Zeroizing<Vec<u8>>;
+// Keep the schedule inside its single boxed key owner, rather than allocating
+// the cipher variant separately from the raw-key/schedule pair.
+#[allow(clippy::large_enum_variant)]
+enum PacketCipher {
+    Aes128(aes::Aes128Enc),
+    Aes256(aes::Aes256Enc),
+}
+struct PacketKey {
+    secret: Secret,
+    cipher: PacketCipher,
+}
+impl PacketKey {
+    fn new(size: KeySize, secret: Secret) -> Result<Box<Self>, CryptoError> {
+        let cipher = match size {
+            KeySize::Aes128 => PacketCipher::Aes128(
+                aes::Aes128Enc::new_from_slice(&secret).map_err(|_| CryptoError::Config)?,
+            ),
+            KeySize::Aes256 => PacketCipher::Aes256(
+                aes::Aes256Enc::new_from_slice(&secret).map_err(|_| CryptoError::Config)?,
+            ),
+        };
+        Ok(Box::new(Self { secret, cipher }))
+    }
+    fn crypt(&self, iv: &[u8; 16], bytes: &mut [u8]) {
+        match &self.cipher {
+            PacketCipher::Aes128(cipher) => {
+                let core =
+                    ctr::CtrCore::<_, ctr::flavors::Ctr128BE>::inner_iv_init(cipher, &(*iv).into());
+                ctr::Ctr128BE::<&aes::Aes128Enc>::from_core(core).apply_keystream(bytes);
+            }
+            PacketCipher::Aes256(cipher) => {
+                let core =
+                    ctr::CtrCore::<_, ctr::flavors::Ctr128BE>::inner_iv_init(cipher, &(*iv).into());
+                ctr::Ctr128BE::<&aes::Aes256Enc>::from_core(core).apply_keystream(bytes);
+            }
+        }
+    }
+}
 struct Material {
     size: KeySize,
     salt: [u8; 16],
     kek: Secret,
-    keys: [Option<Secret>; 2],
+    keys: [Option<Box<PacketKey>>; 2],
 }
 fn index(kk: u8) -> Result<usize, CryptoError> {
     match kk {
@@ -259,7 +300,7 @@ impl Material {
         for (i, key) in self.keys.iter().enumerate() {
             if let Some(key) = key {
                 kk |= 1 << i;
-                plain.extend_from_slice(key);
+                plain.extend_from_slice(&key.secret);
             }
         }
         let mut out = vec![
@@ -293,15 +334,7 @@ impl Material {
             .get(index(kk)?)
             .and_then(Option::as_ref)
             .ok_or(CryptoError::KeyExpired)?;
-        let iv = iv(&self.salt, seq);
-        match self.size {
-            KeySize::Aes128 => ctr::Ctr128BE::<aes::Aes128>::new_from_slices(key, &iv)
-                .map_err(|_| CryptoError::Config)?
-                .apply_keystream(bytes),
-            KeySize::Aes256 => ctr::Ctr128BE::<aes::Aes256>::new_from_slices(key, &iv)
-                .map_err(|_| CryptoError::Config)?
-                .apply_keystream(bytes),
-        }
+        key.crypt(&iv(&self.salt, seq), bytes);
         Ok(())
     }
 }
@@ -337,7 +370,13 @@ impl Encryptor {
             size: config.key_size,
             salt,
             kek: derive(config, &salt),
-            keys: [Some(random_key(config.key_size)?), None],
+            keys: [
+                Some(PacketKey::new(
+                    config.key_size,
+                    random_key(config.key_size)?,
+                )?),
+                None,
+            ],
         };
         Ok(Self {
             material,
@@ -383,7 +422,10 @@ impl Encryptor {
                 .keys
                 .get_mut(index(other)?)
                 .ok_or(CryptoError::Malformed)?;
-            *slot = Some(random_key(self.material.size)?);
+            *slot = Some(PacketKey::new(
+                self.material.size,
+                random_key(self.material.size)?,
+            )?);
             self.pending = Some(self.material.message()?);
             self.next_km = 0;
         }
@@ -432,13 +474,14 @@ impl Decryptor {
         }
         let kek = derive(config, &km.salt);
         let plain = unwrap(km.size, &kek, km.wrapped)?;
-        let mut keys: [Option<Secret>; 2] = [None, None];
+        let mut keys = [None, None];
         let mut chunks = plain.chunks_exact(km.size.len());
         for (i, slot) in keys.iter_mut().enumerate() {
             if km.kk & (1 << i) != 0 {
-                *slot = Some(Zeroizing::new(
-                    chunks.next().ok_or(CryptoError::Malformed)?.to_vec(),
-                ));
+                *slot = Some(PacketKey::new(
+                    km.size,
+                    Zeroizing::new(chunks.next().ok_or(CryptoError::Malformed)?.to_vec()),
+                )?);
             }
         }
         Ok(Self {
@@ -456,8 +499,14 @@ impl Decryptor {
             last_km: bytes.to_vec(),
         })
     }
+    pub(crate) fn active_key(&self) -> u8 {
+        self.active
+    }
+    pub(crate) fn matches_last_km(&self, bytes: &[u8]) -> bool {
+        bytes == self.last_km
+    }
     pub(crate) fn refresh(&mut self, bytes: &[u8]) -> Result<(), CryptoError> {
-        if bytes == self.last_km {
+        if self.matches_last_km(bytes) {
             return Ok(());
         }
         let km = Km::parse(bytes)?;
@@ -478,17 +527,20 @@ impl Decryptor {
             }
             let key = chunks.next().ok_or(CryptoError::Malformed)?;
             if 1 << i == self.active {
-                if slot.as_ref().is_none_or(|old| old.as_slice() != key) {
+                if slot.as_ref().is_none_or(|old| old.secret.as_slice() != key) {
                     return Err(CryptoError::Replay);
                 }
             } else {
-                if slot.as_ref().is_some_and(|old| old.as_slice() == key) {
+                if slot
+                    .as_ref()
+                    .is_some_and(|old| old.secret.as_slice() == key)
+                {
                     return Err(CryptoError::Replay);
                 }
                 replacement = Some(Zeroizing::new(key.to_vec()));
             }
         }
-        let key = replacement.ok_or(CryptoError::Replay)?;
+        let key = PacketKey::new(km.size, replacement.ok_or(CryptoError::Replay)?)?;
         *self
             .material
             .keys
@@ -534,6 +586,53 @@ impl Decryptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ctr::cipher::KeyIvInit;
+
+    // Keep the old per-packet path independent of the cached cipher. The
+    // unused KEK preserves the original Material layout for the benchmark.
+    struct PerPacketMaterial {
+        size: KeySize,
+        salt: [u8; 16],
+        _kek: Secret,
+        keys: [Option<Secret>; 2],
+    }
+    impl From<&Material> for PerPacketMaterial {
+        fn from(material: &Material) -> Self {
+            Self {
+                size: material.size,
+                salt: material.salt,
+                _kek: Zeroizing::new(material.kek.to_vec()),
+                keys: std::array::from_fn(|i| {
+                    material.keys[i]
+                        .as_ref()
+                        .map(|key| Zeroizing::new(key.secret.to_vec()))
+                }),
+            }
+        }
+    }
+    impl PerPacketMaterial {
+        fn crypt(&self, kk: u8, seq: Seq, bytes: &mut [u8]) -> Result<(), CryptoError> {
+            if bytes.len() > 1456 {
+                return Err(CryptoError::Malformed);
+            }
+            let key = self
+                .keys
+                .get(index(kk)?)
+                .and_then(Option::as_ref)
+                .ok_or(CryptoError::KeyExpired)?;
+            let iv = iv(&self.salt, seq);
+            match self.size {
+                KeySize::Aes128 => ctr::Ctr128BE::<aes::Aes128>::new_from_slices(key, &iv)
+                    .map_err(|_| CryptoError::Config)?
+                    .apply_keystream(bytes),
+                KeySize::Aes256 => ctr::Ctr128BE::<aes::Aes256>::new_from_slices(key, &iv)
+                    .map_err(|_| CryptoError::Config)?
+                    .apply_keystream(bytes),
+            }
+            Ok(())
+        }
+    }
+
     fn hex(s: &str) -> Vec<u8> {
         s.as_bytes()
             .chunks_exact(2)
@@ -548,12 +647,386 @@ mod tests {
             .expect("valid crypto fixture")
     }
     fn fixture() -> Material {
+        fixture_for(KeySize::Aes128)
+    }
+    fn fixture_for(size: KeySize) -> Material {
+        let mut config = config();
+        config.key_size = size;
         let salt = std::array::from_fn(|i| 16 + i as u8);
         Material {
-            size: KeySize::Aes128,
+            size,
             salt,
-            kek: derive(&config(), &salt),
-            keys: [Some(Zeroizing::new((0..16).collect())), None],
+            kek: derive(&config, &salt),
+            keys: [
+                Some(
+                    PacketKey::new(size, Zeroizing::new((0..size.len() as u8).collect()))
+                        .expect("fixture key"),
+                ),
+                None,
+            ],
+        }
+    }
+    fn fixed_key(size: KeySize, byte: u8) -> Box<PacketKey> {
+        PacketKey::new(size, Zeroizing::new(vec![byte; size.len()])).expect("fixture key")
+    }
+    fn key_probes(material: &Material) -> [[u8; 32]; 2] {
+        let mut out = [[42; 32]; 2];
+        for (i, bytes) in out.iter_mut().enumerate() {
+            material
+                .crypt(i as u8 + 1, Seq::new(17), bytes)
+                .expect("installed key");
+        }
+        out
+    }
+    fn rejected_refresh_preserves_keys(rx: &mut Decryptor, km: &[u8], error: CryptoError) {
+        let before = (
+            key_probes(&rx.material),
+            rx.material.message().expect("installed keys"),
+            rx.last_km.clone(),
+            rx.active,
+            rx.staged,
+            rx.highest,
+            rx.transition,
+            rx.active_start,
+        );
+        assert_eq!(rx.refresh(km), Err(error));
+        assert_eq!(
+            (
+                key_probes(&rx.material),
+                rx.material.message().expect("installed keys"),
+                rx.last_km.clone(),
+                rx.active,
+                rx.staged,
+                rx.highest,
+                rx.transition,
+                rx.active_start,
+            ),
+            before
+        );
+    }
+    #[test]
+    fn cached_schedules_match_per_packet_schedules_at_payload_and_sequence_boundaries() {
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let mut material = fixture_for(size);
+            material.keys[1] = Some(fixed_key(size, 64));
+            let reference = PerPacketMaterial::from(&material);
+            for kk in [1, 2] {
+                for seq in [0, 1, 0x1234_5678, 0x7fff_fffe, 0x7fff_ffff, 0] {
+                    for len in [0, 1, 15, 16, 17, 31, 32, 1316, 1456] {
+                        let plain: Vec<u8> = (0..len).map(|n| n as u8).collect();
+                        let mut expected = plain.clone();
+                        let mut actual = plain.clone();
+                        reference
+                            .crypt(kk, Seq::new(seq), &mut expected)
+                            .expect("reference");
+                        material
+                            .crypt(kk, Seq::new(seq), &mut actual)
+                            .expect("cached");
+                        assert_eq!(actual, expected, "{size:?} slot={kk} seq={seq} len={len}");
+                        material
+                            .crypt(kk, Seq::new(seq), &mut actual)
+                            .expect("fresh IV");
+                        assert_eq!(actual, plain);
+                    }
+                }
+            }
+            let mut oversized = [42; 1457];
+            assert_eq!(
+                material.crypt(1, Seq::new(0), &mut oversized),
+                Err(CryptoError::Malformed)
+            );
+            assert_eq!(oversized, [42; 1457]);
+            let mut payload = [42; 17];
+            for kk in [0, 3] {
+                assert_eq!(
+                    material.crypt(kk, Seq::new(0), &mut payload),
+                    Err(CryptoError::Malformed)
+                );
+                assert_eq!(payload, [42; 17]);
+            }
+            material.keys[1] = None;
+            assert_eq!(
+                material.crypt(2, Seq::new(0), &mut payload),
+                Err(CryptoError::KeyExpired)
+            );
+            assert_eq!(payload, [42; 17]);
+        }
+    }
+    #[test]
+    fn cached_slot_replacement_is_atomic_and_preserves_old_key_reordering() {
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let mut config = config();
+            config.key_size = size;
+            let mut tx = fixture_for(size);
+            let mut rx =
+                Decryptor::new(&config, &tx.message().expect("initial KM")).expect("receiver");
+            let mut first = [1; 17];
+            tx.crypt(1, Seq::new(0x7fff_fffd), &mut first)
+                .expect("encrypt");
+            rx.decrypt(1, Seq::new(0x7fff_fffd), &mut first)
+                .expect("decrypt");
+            assert_eq!(first, [1; 17]);
+            let mut old = [2; 17];
+            tx.crypt(1, Seq::new(0x7fff_fffe), &mut old)
+                .expect("held old slot");
+            tx.keys[1] = Some(fixed_key(size, 64));
+            let km = tx.message().expect("refresh KM");
+            rx.refresh(&km).expect("install both raw key and schedule");
+            let installed = key_probes(&rx.material);
+            for _ in 0..3 {
+                rx.refresh(&km).expect("cached KM");
+                assert_eq!(key_probes(&rx.material), installed);
+            }
+            let mut next = [3; 17];
+            tx.crypt(2, Seq::new(0x7fff_ffff), &mut next)
+                .expect("new slot");
+            rx.decrypt(2, Seq::new(0x7fff_ffff), &mut next)
+                .expect("switch slot");
+            assert_eq!(next, [3; 17]);
+            rx.decrypt(1, Seq::new(0x7fff_fffe), &mut old)
+                .expect("reordered old slot");
+            assert_eq!(old, [2; 17]);
+            assert_eq!(rx.active_key(), 2);
+            assert!(!rx.staged);
+
+            // With slot 2 active, refresh sees the tentative slot 1 replacement
+            // before it rejects the contradictory active key in slot 2.
+            let mut invalid = fixture_for(size);
+            invalid.keys[0] = Some(fixed_key(size, 128));
+            invalid.keys[1] = Some(fixed_key(size, 96));
+            rejected_refresh_preserves_keys(
+                &mut rx,
+                &invalid.message().expect("KM"),
+                CryptoError::Replay,
+            );
+            let mut corrupt = km.clone();
+            *corrupt.last_mut().expect("wrapped bytes") ^= 1;
+            rejected_refresh_preserves_keys(&mut rx, &corrupt, CryptoError::BadSecret);
+
+            tx.keys[0] = Some(fixed_key(size, 128));
+            rx.refresh(&tx.message().expect("second refresh"))
+                .expect("replace old slot");
+            let replaced = key_probes(&rx.material);
+            assert_ne!(replaced[0], installed[0]);
+            assert_eq!(replaced[1], installed[1]);
+            assert_eq!(replaced, key_probes(&tx));
+            let mut wrapped = [4; 17];
+            tx.crypt(1, Seq::new(0), &mut wrapped)
+                .expect("wrapped sequence");
+            rx.decrypt(1, Seq::new(0), &mut wrapped)
+                .expect("new slot across wrap");
+            assert_eq!(wrapped, [4; 17]);
+            assert_eq!(rx.active_key(), 1);
+            assert!(!rx.staged);
+        }
+    }
+    #[test]
+    fn cached_key_owners_keep_zeroising_drop_guarantees() {
+        fn zeroises_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        zeroises_on_drop::<Secret>();
+        zeroises_on_drop::<aes::Aes128Enc>();
+        zeroises_on_drop::<aes::Aes256Enc>();
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            assert_eq!(
+                PacketKey::new(size, Zeroizing::new(vec![0; size.len() - 1])).err(),
+                Some(CryptoError::Config)
+            );
+        }
+    }
+    #[test]
+    fn empty_packet_slots_do_not_embed_key_schedule_storage() {
+        use std::mem::size_of;
+        const _: () = assert!(size_of::<Option<Box<PacketKey>>>() == size_of::<usize>());
+        const _: () = assert!(size_of::<Material>() <= size_of::<PerPacketMaterial>());
+        let slots: [Option<Box<PacketKey>>; 2] = [None, None];
+        assert_eq!(std::mem::size_of_val(&slots), 2 * size_of::<usize>());
+        assert!(slots.iter().all(Option::is_none));
+    }
+    #[test]
+    #[ignore = "bounded manual microbenchmark; run in release with --ignored --nocapture"]
+    fn cached_aes_schedule_microbenchmark() {
+        use std::{
+            hint::black_box,
+            mem::{align_of, size_of, size_of_val},
+            time::{Duration, Instant},
+        };
+        const ITERATIONS: u32 = 4096;
+        const ROUNDS: u32 = 4;
+
+        fn setup_time(mut setup: impl FnMut()) -> Duration {
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                setup();
+            }
+            start.elapsed()
+        }
+        fn packet_time(
+            mut crypt: impl FnMut(u8, Seq, &mut [u8]) -> Result<(), CryptoError>,
+            len: usize,
+        ) -> (Duration, u64) {
+            let input: [u8; 1456] = std::array::from_fn(|i| i as u8);
+            let mut output = [0; 1456];
+            let mut checksum = 0u64;
+            let start = Instant::now();
+            for n in 0..ITERATIONS {
+                // Both paths reset the same preallocated input. No allocation
+                // or key/KDF setup occurs in the cached packet loop.
+                output[..len].copy_from_slice(black_box(&input[..len]));
+                crypt(
+                    black_box(1 + (n & 1) as u8),
+                    black_box(Seq::new(0x7fff_f800).add(n)),
+                    black_box(&mut output[..len]),
+                )
+                .expect("benchmark packet");
+                let _ = black_box(&output[..len]);
+                checksum = checksum
+                    .wrapping_add(u64::from(output[0]))
+                    .wrapping_add(u64::from(output[len - 1]));
+            }
+            (start.elapsed(), black_box(checksum))
+        }
+
+        eprintln!(
+            "aes-cache sizes bytes: full128={} enc128={} full256={} enc256={} cipher={} key={} boxed_slot={} empty_slots={} raw_option={} legacy_material={} cached_material={} material_align={} key_align={} encryptor={} decryptor={} optional_encryptor={} optional_decryptor={} caller={} sender={}",
+            size_of::<aes::Aes128>(),
+            size_of::<aes::Aes128Enc>(),
+            size_of::<aes::Aes256>(),
+            size_of::<aes::Aes256Enc>(),
+            size_of::<PacketCipher>(),
+            size_of::<PacketKey>(),
+            size_of::<Option<Box<PacketKey>>>(),
+            size_of::<[Option<Box<PacketKey>>; 2]>(),
+            size_of::<Option<Secret>>(),
+            size_of::<PerPacketMaterial>(),
+            size_of::<Material>(),
+            align_of::<Material>(),
+            align_of::<PacketKey>(),
+            size_of::<Encryptor>(),
+            size_of::<Decryptor>(),
+            size_of::<Option<Encryptor>>(),
+            size_of::<Option<Decryptor>>(),
+            size_of::<crate::Caller>(),
+            size_of::<crate::sender::Sender>()
+        );
+        eprintln!(
+            "aes-cache scope: debug_assertions={} hardware={} iterations={} rounds={}; setup includes AES construction/drop; install separately includes raw Vec allocation/drop versus raw Vec plus boxed cached key construction/drop; packet includes identical buffer reset, IV, output black_box and checksum but no allocation; excludes KDF, refresh and network",
+            cfg!(debug_assertions),
+            aes::hardware_accelerated(),
+            ITERATIONS,
+            ROUNDS
+        );
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let mut material = fixture_for(size);
+            material.keys[1] = Some(fixed_key(size, 64));
+            let legacy = PerPacketMaterial::from(&material);
+            let key = legacy.keys[0].as_ref().expect("benchmark key").as_slice();
+            let full_setup = || match size {
+                KeySize::Aes128 => {
+                    drop(black_box(
+                        aes::Aes128::new_from_slice(black_box(key)).expect("key"),
+                    ));
+                }
+                KeySize::Aes256 => {
+                    drop(black_box(
+                        aes::Aes256::new_from_slice(black_box(key)).expect("key"),
+                    ));
+                }
+            };
+            let cached_setup = || match size {
+                KeySize::Aes128 => {
+                    drop(black_box(
+                        aes::Aes128Enc::new_from_slice(black_box(key)).expect("key"),
+                    ));
+                }
+                KeySize::Aes256 => {
+                    drop(black_box(
+                        aes::Aes256Enc::new_from_slice(black_box(key)).expect("key"),
+                    ));
+                }
+            };
+            let raw_install = || {
+                drop(black_box(Zeroizing::new(black_box(key).to_vec())));
+            };
+            let boxed_install = || {
+                drop(black_box(
+                    PacketKey::new(size, Zeroizing::new(black_box(key).to_vec()))
+                        .expect("boxed key install"),
+                ));
+            };
+            let raw_heap_capacity = material.kek.capacity()
+                + material
+                    .keys
+                    .iter()
+                    .flatten()
+                    .map(|key| key.secret.capacity())
+                    .sum::<usize>();
+            let occupied = material.keys.iter().flatten().count();
+            let boxed_key_payload_bytes = material
+                .keys
+                .iter()
+                .flatten()
+                .map(|key| size_of_val(key.as_ref()))
+                .sum::<usize>();
+            eprintln!(
+                "aes-cache size={size:?} occupied_slots={occupied} boxed_key_payload_bytes={boxed_key_payload_bytes} raw_vec_capacity={raw_heap_capacity}; box payload includes key Vec descriptors/ciphers, raw Vec bytes include SEK/KEK buffers without double counting; excludes allocator metadata and shared passphrase"
+            );
+            for len in [16, 1316, 1456] {
+                let mut expected = [42; 1456];
+                let mut actual = expected;
+                legacy
+                    .crypt(2, Seq::new(0x7fff_ffff), &mut expected[..len])
+                    .expect("reference");
+                material
+                    .crypt(2, Seq::new(0x7fff_ffff), &mut actual[..len])
+                    .expect("cached");
+                assert_eq!(black_box(actual), black_box(expected));
+            }
+            for round in 0..ROUNDS {
+                let (full, cached) = if round % 2 == 0 {
+                    (setup_time(full_setup), setup_time(cached_setup))
+                } else {
+                    let cached = setup_time(cached_setup);
+                    (setup_time(full_setup), cached)
+                };
+                eprintln!(
+                    "aes-cache phase=setup size={size:?} round={round} full_ns={} cached_enc_ns={} count={ITERATIONS}",
+                    full.as_nanos(),
+                    cached.as_nanos()
+                );
+                for len in [16, 1316, 1456] {
+                    let run_full =
+                        || packet_time(|kk, seq, bytes| legacy.crypt(kk, seq, bytes), len);
+                    let run_cached =
+                        || packet_time(|kk, seq, bytes| material.crypt(kk, seq, bytes), len);
+                    let ((full, full_sum), (cached, cached_sum)) = if round % 2 == 0 {
+                        (run_full(), run_cached())
+                    } else {
+                        let cached = run_cached();
+                        (run_full(), cached)
+                    };
+                    assert_eq!(full_sum, cached_sum, "{size:?} len={len} round={round}");
+                    eprintln!(
+                        "aes-cache phase=packet size={size:?} len={len} round={round} full_ns={} cached_ns={} count={ITERATIONS} checksum={full_sum}",
+                        full.as_nanos(),
+                        cached.as_nanos()
+                    );
+                }
+            }
+            // Run allocation/drop lifecycle work after the unchanged paired
+            // AES-constructor and packet phases, outside their timed windows.
+            for round in 0..ROUNDS {
+                let (raw, boxed) = if round % 2 == 0 {
+                    (setup_time(raw_install), setup_time(boxed_install))
+                } else {
+                    let boxed = setup_time(boxed_install);
+                    (setup_time(raw_install), boxed)
+                };
+                eprintln!(
+                    "aes-cache phase=install size={size:?} round={round} raw_secret_ns={} boxed_cached_key_ns={} count={ITERATIONS}",
+                    raw.as_nanos(),
+                    boxed.as_nanos()
+                );
+            }
         }
     }
     #[test]
@@ -643,6 +1116,11 @@ mod tests {
                 let seq = Seq::new(0x7fff_fff8).add(n);
                 let mut data = vec![n as u8; 23];
                 let kk = tx.encrypt(seq, &mut data, 0).expect("valid crypto fixture");
+                let mut expected = vec![n as u8; 23];
+                PerPacketMaterial::from(&tx.material)
+                    .crypt(kk, seq, &mut expected)
+                    .expect("reference after key refresh");
+                assert_eq!(data, expected);
                 if n == 9 {
                     old = Some((kk, seq, data.clone()));
                 }
@@ -669,27 +1147,32 @@ mod tests {
     }
     #[test]
     fn unconfirmed_or_retained_key_expiry_fails_closed() {
-        let mut cfg = config();
-        cfg.refresh_packets = 6;
-        cfg.preannounce_packets = 2;
-        let mut tx = Encryptor::new(&cfg).expect("valid crypto fixture");
-        for n in 0..6 {
-            tx.encrypt(Seq::new(n), &mut [1], 0)
-                .expect("valid crypto fixture");
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let mut cfg = config();
+            cfg.key_size = size;
+            cfg.refresh_packets = 6;
+            cfg.preannounce_packets = 2;
+            let mut tx = Encryptor::new(&cfg).expect("valid crypto fixture");
+            for n in 0..6 {
+                tx.encrypt(Seq::new(n), &mut [1], 0)
+                    .expect("valid crypto fixture");
+            }
+            assert_eq!(
+                tx.encrypt(Seq::new(6), &mut [1], 0),
+                Err(CryptoError::KeyExpired)
+            );
+            let mut tx = Encryptor::new(&cfg).expect("valid crypto fixture");
+            for n in 0..4 {
+                tx.encrypt(Seq::new(n), &mut [1], 0)
+                    .expect("valid crypto fixture");
+            }
+            let before = tx.material.message().expect("current key");
+            assert_eq!(
+                tx.encrypt(Seq::new(4), &mut [1], 2),
+                Err(CryptoError::KeyExpired)
+            );
+            assert_eq!(tx.material.message().expect("same key"), before);
         }
-        assert_eq!(
-            tx.encrypt(Seq::new(6), &mut [1], 0),
-            Err(CryptoError::KeyExpired)
-        );
-        let mut tx = Encryptor::new(&cfg).expect("valid crypto fixture");
-        for n in 0..4 {
-            tx.encrypt(Seq::new(n), &mut [1], 0)
-                .expect("valid crypto fixture");
-        }
-        assert_eq!(
-            tx.encrypt(Seq::new(4), &mut [1], 2),
-            Err(CryptoError::KeyExpired)
-        );
     }
     #[test]
     fn lost_km_response_is_retried_without_burst_or_key_regeneration() {

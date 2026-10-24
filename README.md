@@ -80,6 +80,11 @@ macOS. The crates are version 0.1.0 on [crates.io](https://crates.io/crates/sapf
 | `sapflow-ffi` | Typed Swift/Kotlin boundary for the shared core |
 | `sapflow` | The server binary (`crates/sapflow-server`): ingest, HTTP, callbacks, recording |
 
+The server defaults to our Mio HTTP viewer backend. Select
+`SAPFLOW_HTTP_IMPL=hyper` to use Hyper explicitly. The shared protocol and
+compressed media libraries have no async runtime. The server still uses Tokio
+for ingest adapters, control and callbacks, timers and recording.
+
 `cargo add sapflow-srt` (or `sapflow-rtmp`, `sapflow-hls`) for a library,
 `cargo install sapflow` for the server. API docs are on
 [docs.rs](https://docs.rs/sapflow-srt). Rust 1.94, edition 2024. A complete SRT listener is
@@ -118,6 +123,25 @@ glass to glass through it, against about 10 s over HTTP/1.1; see
 advertising. Use it when a delivery path cannot fetch parts quickly enough;
 the default remains `low-latency`. Both modes serve the same encoded media,
 segment timeline and codec changes.
+
+Recording limits retained encoded originals to 512 MiB across the server and
+64 MiB per stream path, including queued and active parts from draining codec
+epochs and old connections. These byte ceilings are reduced if the platform's
+semaphore cannot represent them. Each path allows two writers; the server allows
+`10 * SAPFLOW_MAX_PUBLISHERS`, capped at 1,024 writers (160 by default). This
+allows draining predecessors alongside current writers, subject to those caps.
+Each writer also retains its 256-message queue cap. Empty epochs start no task
+or file. Refusing the first part reports failure without a completion; refusing
+later backlog drains and syncs the accepted prefix as incomplete. Oversized
+inputs, malformed admitted fragments and write failures publish no recording
+completion. Recording refusal leaves ingest and HLS running.
+
+These limits count part lengths conservatively even when bytes share HLS cache
+storage. Active rebased copies can add up to the charged original lengths;
+Tokio file buffers, task/channel metadata and the HLS cache are additional.
+Writer slots remain charged through file finalisation and drop. These are
+recording resource bounds, not a cap on total process memory or a throughput
+qualification.
 
 - [Goals and milestones](GOALS.md)
 - [Benchmarks against mediamtx, libsrt and gosrt](docs/benchmarks.md)

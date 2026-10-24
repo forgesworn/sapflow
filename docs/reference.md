@@ -185,7 +185,8 @@ Pinned in the crates' `Cargo.toml`. These are decisions the user may revisit.
 
 | Need | Crate | Notes |
 |------|-------|-------|
-| Async runtime, HTTP | `tokio` 1.54, `axum` 0.8.9 | `hyper-util` legacy client for the callback, no `reqwest` |
+| Viewer HTTP | Our `own_http` backend on `mio` 1.2.4 | Default; Hyper remains explicitly selectable for comparison |
+| Server runtime and control HTTP | `tokio` 1.54, `axum` 0.8.9 | Ingest adapters, timers, recording and control/callback paths; `hyper-util` legacy callback client, no `reqwest` |
 | SRT | `sapflow-srt`, our own | Live-mode receiver and sender, sans-IO, MIT; written from draft-sharabayko-srt-01 and recorded sessions (findings below). Serves the port alone since 2026-10-21. Passphrase encryption (M6b) uses RustCrypto's `aes`, `aes-kw`, `ctr`, `pbkdf2` and `sha1`, plus `getrandom` and `zeroize`; nothing else. |
 | SRT until 2026-10-21 (removed) | `srt-tokio` 0.4.4 with `srt-protocol` 0.4.4, vendored and patched | Last release 2024-05. Fuzzing found that one unauthenticated datagram crashed the server; we patched our copy. Removed once OBS and Larix had published to our own receiver, with and without a passphrase (M6c). The patches are in the history before that date. |
 | MPEG-TS demux | `mpeg2ts` 0.6.1 | Fed one 188-byte packet at a time from our buffer (`sapflow_hls::ingest`), because its reader treats some stream errors as fatal and stops at end of input. |

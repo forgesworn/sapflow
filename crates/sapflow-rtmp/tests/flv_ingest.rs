@@ -26,7 +26,7 @@ fn recorded_ffmpeg_publish_makes_segments() {
                 ing.video(timestamp, &data, SystemTime::UNIX_EPOCH)
                     .expect("video");
             }
-            Event::Audio { timestamp, data } => ing.audio(timestamp, &data),
+            Event::Audio { timestamp, data } => ing.audio(timestamp, &data).expect("bounded AAC"),
             Event::Finished => {}
         }
     }

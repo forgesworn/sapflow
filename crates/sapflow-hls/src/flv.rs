@@ -185,13 +185,14 @@ impl FlvIngest {
 
     /// Legacy video-led audio entry point. New consumers use `audio_at` to
     /// receive audio-only updates and supply the run's wall-clock association.
-    /// Only AAC is used; anything else is ignored.
-    pub fn audio(&mut self, ms: u32, tag: &[u8]) {
+    /// Only AAC is used; anything else is ignored. This pre-release
+    /// entry point now returns resource refusal; callers must handle it.
+    pub fn audio(&mut self, ms: u32, tag: &[u8]) -> Result<(), IngestError> {
         let [head, packet_type, body @ ..] = tag else {
-            return;
+            return Ok(());
         };
         if head >> 4 != SOUND_AAC {
-            return;
+            return Ok(());
         }
         match packet_type {
             0 => {
@@ -205,11 +206,12 @@ impl FlvIngest {
             1 => {
                 let t = self.timeline(ms) * 90;
                 if let Some(c) = self.audio_config() {
-                    self.es.audio(t, c, body);
+                    self.es.audio(t, c, body)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn audio_only_header_compatible(&self, config: AacConfig, bytes: &[u8]) -> bool {
@@ -325,7 +327,7 @@ mod tests {
                             .video(ms, &tag, SystemTime::UNIX_EPOCH)
                             .expect("valid RTMP epoch fixture");
                     } else {
-                        ingest.audio(ms, &tag);
+                        ingest.audio(ms, &tag).expect("bounded fixture AAC");
                     }
                     if let Some(muxer) = ingest.muxer().filter(|m| m.has_content()) {
                         check
@@ -369,7 +371,7 @@ mod tests {
             if video {
                 ing.video(ms, &tag, SystemTime::UNIX_EPOCH).expect("video");
             } else {
-                ing.audio(ms, &tag);
+                ing.audio(ms, &tag).expect("bounded fixture AAC");
             }
         }
         let m = ing.muxer().expect("muxer");
@@ -392,7 +394,7 @@ mod tests {
             if *video {
                 up.merge(ing.video(*ms, tag, SystemTime::UNIX_EPOCH).expect("video"));
             } else {
-                ing.audio(*ms, tag);
+                ing.audio(*ms, tag).expect("bounded fixture AAC");
             }
         }
         up
@@ -478,7 +480,7 @@ mod tests {
                     saw_provisional = true;
                 }
             } else {
-                ing.audio(ms, &tag);
+                ing.audio(ms, &tag).expect("bounded fixture AAC");
                 if tag[1] == 0 {
                     assert!(saw_provisional);
                     assert!(ing.muxer().is_none(), "unpublished init may be discarded");
@@ -509,7 +511,8 @@ mod tests {
         let muxer = ing.muxer().expect("video-only muxer");
         assert!(muxer.has_content());
         let init = muxer.init().clone();
-        ing.audio(3000, &audio_sequence);
+        ing.audio(3000, &audio_sequence)
+            .expect("bounded fixture AAC");
         let muxer = ing.muxer().expect("existing muxer retained");
         assert!(muxer.has_content());
         assert!(muxer.audio().is_none());
@@ -532,7 +535,7 @@ mod tests {
             let _ = ing.video(0, junk, SystemTime::UNIX_EPOCH);
         }
         for junk in [&[][..], &[0xaf], &[0xaf, 0, 0xff], &[0xaf, 1, 1, 2, 3]] {
-            ing.audio(0, junk);
+            ing.audio(0, junk).expect("bounded fixture AAC");
         }
         assert!(ing.muxer().is_none());
     }

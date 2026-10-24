@@ -204,6 +204,9 @@ impl Conn<'_> {
                         self.app.log_refusal("rtmp", &r);
                         let (code, text) = match r {
                             Refusal::AlreadyLive => ("NetStream.Publish.BadName", "already live"),
+                            Refusal::PublisherLimit => {
+                                ("NetStream.Publish.Denied", "publisher limit")
+                            }
                             _ => ("NetStream.Publish.Denied", "refused"),
                         };
                         // Send the refusal, then close.
@@ -380,5 +383,108 @@ mod tests {
         });
         assert!(task.await.is_err());
         assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    fn negotiate_capacity_fixture(
+        conn: &mut Conn<'_>,
+        key: &str,
+    ) -> (Result<(), sapflow_rtmp::client::ClientError>, Vec<u8>, bool) {
+        let mut server = Connection::new(7);
+        let mut client = Publisher::new(
+            PublisherConfig::new("live".into(), key.into(), "rtmp://localhost/live".into()),
+            11,
+            0,
+        )
+        .expect("bounded client");
+        let mut wire = Vec::new();
+        for step in 0..32 {
+            server
+                .feed(&client.take_output())
+                .expect("generated client bytes");
+            let mut done = false;
+            while let Some(event) = server.poll().expect("actual server parser") {
+                done = conn
+                    .event(&mut server, event)
+                    .expect("actual connection policy");
+                if done {
+                    break;
+                }
+            }
+            let output = server.take_output();
+            wire.extend_from_slice(&output);
+            if let Err(error) = client.feed(&output, step) {
+                return (Err(error), wire, done);
+            }
+            if client.state() == PublisherState::Publishing {
+                return (Ok(()), wire, done);
+            }
+            assert!(
+                !done,
+                "refused onStatus must reach the client before closing"
+            );
+        }
+        panic!("bounded 32-exchange handshake did not terminate");
+    }
+
+    #[test]
+    fn setup_slots_remain_independent_and_publication_capacity_is_visible_on_the_wire() {
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.recordings = None;
+        app.config.max_publishers = 2;
+        app.streams = Arc::new(crate::stream::Registry::default());
+        let active = Arc::new(AtomicUsize::new(0));
+        // Keep the existing 4N connection bookkeeping occupied. These slots
+        // model accepted setup sockets; they must not reserve publication credit.
+        let setup = (0..app.config.max_publishers * 4)
+            .map(|_| Slot::take(&active))
+            .collect::<Vec<_>>();
+        assert_eq!(active.load(Ordering::Relaxed), 8);
+        assert_eq!(fixture.app.streams.active_rtmp_publishers(), 0);
+        let from = "127.0.0.1".parse().expect("loopback");
+        let mut first = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        let mut second = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        let mut refused = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        assert!(
+            negotiate_capacity_fixture(&mut first, "event-one")
+                .0
+                .is_ok()
+        );
+        assert!(
+            negotiate_capacity_fixture(&mut second, "event-two")
+                .0
+                .is_ok()
+        );
+        let (result, wire, done) = negotiate_capacity_fixture(&mut refused, "event-three");
+        assert!(
+            matches!(result, Err(sapflow_rtmp::client::ClientError::Refused(code))
+            if code == "NetStream.Publish.Denied")
+        );
+        assert!(done && refused.publication.is_none());
+        assert!(
+            wire.windows(b"publisher limit".len())
+                .any(|s| s == b"publisher limit")
+        );
+        assert!(fixture.app.streams.get("event-three").is_none());
+        assert_eq!(fixture.app.streams.active_rtmp_publishers(), 2);
+        assert_eq!(active.load(Ordering::Relaxed), 8);
+        first.publication.take().expect("first accepted").end();
+        second.publication.take().expect("second accepted").end();
+        assert_eq!(fixture.app.streams.active_rtmp_publishers(), 0);
+        drop(setup);
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+        assert!(fixture.callbacks.is_empty());
     }
 }

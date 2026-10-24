@@ -120,11 +120,11 @@ pub struct MuxStats {
     pub emitted_packets: u64,
     pub emitted_bytes: u64,
     pub output_allocations: u64,
-    /// Input/parameter-set bytes copied into the small elementary scratch.
+    /// Boundary-crossing bytes copied into the small elementary scratch.
     pub elementary_staging_copy_bytes: u64,
-    /// Same bytes copied from scratch into mpeg2ts::payload::Bytes.
+    /// Elementary bytes copied into mpeg2ts::payload::Bytes, directly or via scratch.
     pub packet_payload_copy_bytes: u64,
-    /// Same bytes copied by the dependency into its TS payload scratch.
+    /// The same elementary bytes copied by the dependency into its TS payload scratch.
     /// Its final serialisation copy is counted separately in emitted_bytes.
     pub writer_payload_copy_bytes: u64,
     pub buffered_sample_bytes: usize,
@@ -209,43 +209,78 @@ impl Elementary {
             remaining: total,
         })
     }
+    fn front(&self) -> Result<Option<&[u8]>, MuxError> {
+        let Some(piece) = self.pieces.front() else {
+            return Ok(None);
+        };
+        let bytes: &[u8] = match piece {
+            Piece::Literal(bytes) => bytes,
+            Piece::Header(bytes) => bytes,
+            Piece::Sample { start, len } => self
+                .sample
+                .payload()
+                .get(*start..start + len)
+                .ok_or(MuxError::InvalidAvcc)?,
+            Piece::Sps => match self.sample.config().as_ref() {
+                CodecConfig::H264(c) => c.sps(),
+                _ => return Err(MuxError::InvalidAvcc),
+            },
+            Piece::Pps => match self.sample.config().as_ref() {
+                CodecConfig::H264(c) => c.pps(),
+                _ => return Err(MuxError::InvalidAvcc),
+            },
+        };
+        Ok(Some(bytes.get(self.offset..).ok_or(MuxError::InvalidAvcc)?))
+    }
+
+    fn advance(&mut self, count: usize) -> Result<(), MuxError> {
+        let rest_len = self.front()?.ok_or(MuxError::InvalidAvcc)?.len();
+        if count > rest_len || count > self.remaining {
+            return Err(MuxError::InvalidAvcc);
+        }
+        let piece_len = self
+            .offset
+            .checked_add(rest_len)
+            .ok_or(MuxError::InvalidAvcc)?;
+        self.offset += count;
+        self.remaining -= count;
+        if self.offset == piece_len {
+            self.pieces.pop_front();
+            self.offset = 0;
+        }
+        Ok(())
+    }
+
     fn copy(&mut self, out: &mut [u8]) -> Result<usize, MuxError> {
         let mut written = 0;
         while written < out.len() {
-            let Some(piece) = self.pieces.front() else {
+            let Some(rest) = self.front()? else {
                 break;
             };
-            let bytes: &[u8] = match piece {
-                Piece::Literal(bytes) => bytes,
-                Piece::Header(bytes) => bytes,
-                Piece::Sample { start, len } => self
-                    .sample
-                    .payload()
-                    .get(*start..start + len)
-                    .ok_or(MuxError::InvalidAvcc)?,
-                Piece::Sps => match self.sample.config().as_ref() {
-                    CodecConfig::H264(c) => c.sps(),
-                    _ => return Err(MuxError::InvalidAvcc),
-                },
-                Piece::Pps => match self.sample.config().as_ref() {
-                    CodecConfig::H264(c) => c.pps(),
-                    _ => return Err(MuxError::InvalidAvcc),
-                },
-            };
-            let rest = bytes.get(self.offset..).ok_or(MuxError::InvalidAvcc)?;
             let count = rest.len().min(out.len() - written);
             out.get_mut(written..written + count)
                 .ok_or(MuxError::InvalidAvcc)?
                 .copy_from_slice(rest.get(..count).ok_or(MuxError::InvalidAvcc)?);
+            self.advance(count)?;
             written += count;
-            self.offset += count;
-            self.remaining -= count;
-            if self.offset == bytes.len() {
-                self.pieces.pop_front();
-                self.offset = 0;
-            }
         }
         Ok(written)
+    }
+
+    fn packet_bytes(&mut self, max: usize) -> Result<(Bytes, bool), MuxError> {
+        let max = max.min(self.remaining);
+        if let Some(rest) = self.front()?
+            && rest.len() >= max
+        {
+            let data = Bytes::new(rest.get(..max).ok_or(MuxError::InvalidAvcc)?)?;
+            self.advance(max)?;
+            return Ok((data, false));
+        }
+        let mut scratch = [0u8; 184];
+        let out = scratch.get_mut(..max).ok_or(MuxError::Writer)?;
+        let len = self.copy(out)?;
+        let data = Bytes::new(out.get(..len).ok_or(MuxError::Writer)?)?;
+        Ok((data, true))
     }
 }
 
@@ -507,14 +542,13 @@ impl MpegTsMuxer {
         let pes_header_len = if dts.is_some() { 19 } else { 14 };
         let max =
             184 - (if adp.is_some() { 2 } else { 0 }) - (if first { pes_header_len } else { 0 });
-        let mut scratch = [0u8; 184];
-        let len = p
-            .elementary
-            .copy(scratch.get_mut(..max).ok_or(MuxError::Writer)?)?;
-        self.stats.elementary_staging_copy_bytes += len as u64;
-        self.stats.packet_payload_copy_bytes += len as u64;
-        self.stats.writer_payload_copy_bytes += len as u64;
-        let data = Bytes::new(scratch.get(..len).ok_or(MuxError::Writer)?)?;
+        let (data, staged) = p.elementary.packet_bytes(max)?;
+        let len = data.as_ref().len() as u64;
+        if staged {
+            self.stats.elementary_staging_copy_bytes += len;
+        }
+        self.stats.packet_payload_copy_bytes += len;
+        self.stats.writer_payload_copy_bytes += len;
         let payload = if first {
             TsPayload::PesStart(Pes {
                 header: PesHeader {

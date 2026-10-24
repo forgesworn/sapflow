@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 use crate::codec::{AacConfig, H264Config};
 use crate::fmp4::{self, AUDIO_TRACK, Sample, TrackRun, VIDEO_TIMESCALE, VIDEO_TRACK};
@@ -39,8 +39,18 @@ const START_OFFSET: Duration = Duration::ZERO;
 /// iOS needs the playlist to open with this many gap segments.
 pub const LEADING_GAPS: u64 = 7;
 
-/// Refuse to buffer a segment larger than this (no keyframes, or abuse).
+/// Charged open-segment video plus retained AAC payload, including pending
+/// AAC. Pending video, Bytes backing capacity and TS/PES allocations are
+/// separate; this is not a whole-process or allocator/RSS limit.
 const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Pending AAC plus samples in the current unsealed video-led part.
+/// A count bound also covers tiny payloads and repeated timestamps.
+const MAX_OPEN_AUDIO_SAMPLES: usize = 16_384;
+
+/// Pending video plus duration-known frames in learning or the open part.
+/// A count bound also covers empty payloads and repeated DTS.
+const MAX_LIVE_VIDEO_SAMPLES: usize = 16_384;
 
 /// Frame durations kept for choosing the part timing.
 const MAX_LEARNED_FRAMES: usize = 1024;
@@ -112,7 +122,49 @@ pub struct Part {
     pub data: Bytes,
 }
 
-/// One complete segment: its parts, joined.
+/// Immutable segment bytes in fragment order, sharing each part's allocation.
+/// Cloning this value shares the chunk-handle array and copies no payloads.
+/// Consumers stream the chunks in order, using [`Self::len`] for the full body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentData {
+    chunks: Arc<[Bytes]>,
+    len: usize,
+}
+
+impl SegmentData {
+    /// Retains existing chunks, including empty chunks, in order. Returns
+    /// `None` if their combined byte length cannot be represented by `usize`.
+    /// Only chunk metadata is moved; no encoded payload is copied or joined.
+    pub fn from_chunks(chunks: Vec<Bytes>) -> Option<Self> {
+        let len = checked_segment_len(chunks.iter().map(Bytes::len))?;
+        Some(Self {
+            chunks: chunks.into(),
+            len,
+        })
+    }
+
+    /// Total encoded bytes across every chunk, suitable for Content-Length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the complete body has no encoded bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Immutable fragment handles in wire order. Empty chunks are permitted;
+    /// streaming consumers must skip them without emitting extra body bytes.
+    pub fn chunks(&self) -> &[Bytes] {
+        &self.chunks
+    }
+}
+
+fn checked_segment_len(mut lengths: impl Iterator<Item = usize>) -> Option<usize> {
+    lengths.try_fold(0usize, usize::checked_add)
+}
+
+/// One complete segment: immutable parts and their shared fragmented body.
 #[derive(Debug)]
 pub struct Segment {
     /// The init segment of the codec epoch this segment belongs to.
@@ -129,8 +181,10 @@ pub struct Segment {
     pub discontinuity: bool,
     /// The segment's parts, in order.
     pub parts: Vec<Arc<Part>>,
-    /// The whole segment: its parts' fragments, concatenated.
-    pub data: Bytes,
+    /// The whole segment in wire order, sharing the parts' payload storage.
+    /// This pre-release API replaces a joined Bytes allocation. Consumers must
+    /// stream the chunks; constructing a flat buffer per viewer defeats sharing.
+    pub data: SegmentData,
 }
 
 /// One slot in the playlist window.
@@ -215,8 +269,9 @@ pub enum PartLookup {
 /// Why the muxer refused media.
 #[derive(Debug, Clone)]
 pub enum MuxError {
-    /// The open segment passed 64 MiB: no keyframe in time, or a hostile
-    /// stream.
+    /// The charged open media passed 64 MiB, live AAC or video entries
+    /// exceeded their separate 16,384 limits, or fragment lengths cannot
+    /// be represented.
     SegmentTooLarge,
     /// The requested topology has no supported media tracks.
     InvalidTracks,
@@ -255,6 +310,9 @@ struct OpenSegment {
     wall_origin: (i64, SystemTime),
     parts: Vec<Arc<Part>>,
     bytes: usize,
+    /// AAC staged in this video-led segment, including carried samples.
+    /// The pending AAC frame is reserved separately before admission.
+    audio_bytes: usize,
     discontinuity: bool,
 }
 
@@ -512,8 +570,161 @@ impl Muxer {
         self.init.id
     }
 
+    fn open_video_part(&mut self, dts: i64, now: SystemTime) {
+        if self.next_segment.is_some() {
+            return;
+        }
+        let id = if self.entries.is_empty() {
+            LEADING_GAPS
+        } else {
+            self.next_segment_id()
+        };
+        // A true break/reconnect establishes a new wall-clock association.
+        // Retain its real outage gap, but never overlap the preceding run
+        // if the host clock stepped backwards or input time ran ahead.
+        let start = match self.entries.back() {
+            Some(Entry::Segment(previous)) => now.max(previous.start + previous.duration),
+            _ => now,
+        };
+        self.next_segment = Some(OpenSegment {
+            initialization: self.init.clone(),
+            id,
+            start_dts: dts,
+            start,
+            wall_origin: (dts, start),
+            parts: Vec::new(),
+            bytes: 0,
+            audio_bytes: 0,
+            discontinuity: std::mem::take(&mut self.discontinuity_next),
+        });
+        self.part = Some(OpenPart::new(self.next_part_id, dts));
+    }
+
+    fn pending_audio_frontier(&self) -> Option<i64> {
+        let pending = self.pending_audio.as_ref()?;
+        let rate = self.audio?.sample_rate;
+        i64::try_from(i128::from(pending.dts) * 90_000 / i128::from(rate)).ok()
+    }
+
+    /// Effective sample-clock frontier, including offset and backward-PTS
+    /// clamp. The next video AU only supplies duration up to this point.
+    pub(crate) fn startup_video_replayable(&self, dts: i64) -> bool {
+        let at = dts.saturating_add(self.offset);
+        dts >= 0
+            && self
+                .pending_video
+                .as_ref()
+                .is_some_and(|pending| at >= pending.dts)
+            && self
+                .pending_audio_frontier()
+                .is_some_and(|frontier| at <= frontier)
+    }
+
+    /// Project the logical AAC payload/count before copying the next frame.
+    /// The current pending frame becomes staged; its successor is pending.
+    pub(crate) fn startup_audio_projection(&self, pts: i64, bytes: usize) -> (usize, usize) {
+        if pts < 0 || pts.saturating_add(self.offset) < 0 {
+            return (0, 0); // Existing pre-IDR policy drops this input outright.
+        }
+        let pending = self.pending_audio.as_ref();
+        let part = self.part.as_ref();
+        let retained = pending.map_or(0, |p| p.data.len())
+            + part.map_or(0, |p| p.audio.iter().map(|a| a.data.len()).sum::<usize>());
+        let frames = usize::from(pending.is_some()) + part.map_or(0, |p| p.audio.len());
+        (retained.saturating_add(bytes), frames.saturating_add(1))
+    }
+
+    /// Retained effective AAC start span after one admission/replay step.
+    pub(crate) fn startup_audio_span(&self) -> Option<i64> {
+        self.pending_audio.as_ref()?;
+        let Some(latest) = self.pending_audio_frontier() else {
+            return Some(i64::MAX);
+        };
+        let first = self
+            .part
+            .as_ref()
+            .and_then(|p| p.audio_times.first())
+            .map_or(latest, |at| at.0);
+        Some(latest.saturating_sub(first))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn staged_audio_for_test(&self) -> (usize, usize, Option<i64>) {
+        // Logical AAC payload lower bound, frame count and effective span;
+        // no allocator/capacity or RSS claim. Includes the pending AAC frame.
+        let pending = self.pending_audio.as_ref();
+        let part = self.part.as_ref();
+        let bytes = pending.map_or(0, |p| p.data.len())
+            + part.map_or(0, |p| p.audio.iter().map(|a| a.data.len()).sum::<usize>());
+        let frames = usize::from(pending.is_some()) + part.map_or(0, |p| p.audio.len());
+        let span = self.audio.and_then(|config| {
+            let latest = pending?.dts * 90_000 / i64::from(config.sample_rate);
+            let first = part
+                .and_then(|p| p.audio_times.first())
+                .map_or(latest, |a| a.0);
+            Some(latest - first)
+        });
+        (bytes, frames, span)
+    }
+
+    /// TS startup has a real pending IDR and immutable A/V configuration,
+    /// but must stage its first AAC batch before replay can close parts.
+    /// This opens metadata only: the second video AU still supplies duration,
+    /// and normal callers continue to open the run in push_video as before.
+    pub(crate) fn prepare_startup_audio(&mut self, now: SystemTime) {
+        if self.video.is_some()
+            && self.audio.is_some()
+            && let Some(dts) = self.pending_video.as_ref().map(|frame| frame.dts)
+        {
+            self.open_video_part(dts, now);
+        }
+    }
+
+    /// Read-only projection before any video state mutation. Existing real
+    /// timestamp/target breaks release the previous run before retaining at
+    /// most one new pending frame, so they remain available at a full budget.
+    fn check_video_entry_admission(&self, dts: i64) -> Result<(), MuxError> {
+        let next_dts = if self.pending_video.is_none() && self.next_segment.is_none() {
+            self.rebase_to
+                .unwrap_or_else(|| dts.saturating_add(self.offset))
+        } else {
+            dts.saturating_add(self.offset)
+        };
+        if next_dts < 0 {
+            return Ok(()); // Existing ignored input does not consume an entry.
+        }
+        if let Some(current) = &self.pending_video {
+            let gap = (i128::from(next_dts) - i128::from(current.dts)).abs();
+            let segment_start = self
+                .next_segment
+                .as_ref()
+                .map_or(current.dts, |seg| seg.start_dts);
+            let target_break = self.target.is_some_and(|target| {
+                i128::from(next_dts.max(current.dts)) - i128::from(segment_start)
+                    > i128::from(target.limit_ticks())
+            });
+            if gap > i128::from(BREAK_GAP) || target_break {
+                return Ok(());
+            }
+        }
+        let entries = self
+            .learning
+            .len()
+            .checked_add(self.part.as_ref().map_or(0, |part| part.video.len()))
+            .and_then(|n| n.checked_add(usize::from(self.pending_video.is_some())))
+            .and_then(|n| n.checked_add(1))
+            .ok_or(MuxError::SegmentTooLarge)?;
+        if entries > MAX_LIVE_VIDEO_SAMPLES {
+            return Err(MuxError::SegmentTooLarge);
+        }
+        Ok(())
+    }
+
     /// Feeds one video access unit. `dts` and `pts` are 90 kHz, relative to
-    /// the first keyframe (never negative for real streams).
+    /// the first keyframe (never negative for real streams). Refuses a new
+    /// retained entry before mutation when pending + learning + open-part
+    /// video would exceed 16,384. Existing ignored input and real break
+    /// recovery retain their original behaviour.
     pub fn push_video(
         &mut self,
         dts: i64,
@@ -528,6 +739,7 @@ impl Muxer {
         if self.pending_video.is_none() && self.next_segment.is_none() && !sync {
             return Ok(Update::default());
         }
+        self.check_video_entry_admission(dts)?;
         let cts = (pts - dts).clamp(0, i64::from(i32::MAX)) as i32;
         let mut dts = dts.saturating_add(self.offset);
         if self.pending_video.is_none() && self.next_segment.is_none() {
@@ -546,12 +758,13 @@ impl Muxer {
         if next.dts < 0 {
             return Ok(Update::default());
         }
-        let Some(cur) = self.pending_video.take() else {
+        let Some(cur) = self.pending_video.as_ref() else {
             self.pending_video = Some(next);
             return Ok(Update::default());
         };
         if (next.dts - cur.dts).abs() > BREAK_GAP {
-            return Ok(self.break_stream(cur.dts, next, now));
+            let end = cur.dts;
+            return self.break_stream(end, next, now);
         }
         if next.dts < cur.dts {
             next.dts = cur.dts;
@@ -559,48 +772,36 @@ impl Muxer {
         let next_dts = next.dts;
         let next_sync = next.sync;
 
-        if self.next_segment.is_none() {
-            let id = if self.entries.is_empty() {
-                LEADING_GAPS
-            } else {
-                self.next_segment_id()
-            };
-            // A true break/reconnect establishes a new wall-clock association.
-            // Retain its real outage gap, but never overlap the preceding run
-            // if the host clock stepped backwards or input time ran ahead.
-            let start = match self.entries.back() {
-                Some(Entry::Segment(previous)) => now.max(previous.start + previous.duration),
-                _ => now,
-            };
-            self.next_segment = Some(OpenSegment {
-                initialization: self.init.clone(),
-                id,
-                start_dts: cur.dts,
-                start,
-                wall_origin: (cur.dts, start),
-                parts: Vec::new(),
-                bytes: 0,
-                discontinuity: std::mem::take(&mut self.discontinuity_next),
-            });
-            self.part = Some(OpenPart::new(self.next_part_id, cur.dts));
-        }
+        let current_dts = cur.dts;
+        let current_bytes = cur.data.len();
+        self.open_video_part(current_dts, now);
         // Never let a segment run past the target duration: with no
         // keyframe in time, end it here.
         if let (Some(t), Some(seg)) = (self.target, self.next_segment.as_ref())
             && next_dts - seg.start_dts > t.limit_ticks()
         {
-            return Ok(self.break_stream(cur.dts, next, now));
+            let end = current_dts;
+            return self.break_stream(end, next, now);
         }
-        self.pending_video = Some(next);
-
+        let pending_audio_bytes = self.pending_audio.as_ref().map_or(0, |p| p.data.len());
         let seg = self
             .next_segment
             .as_mut()
             .ok_or(MuxError::SegmentTooLarge)?;
-        seg.bytes += cur.data.len();
-        if seg.bytes > MAX_SEGMENT_BYTES {
+        let video_bytes = seg
+            .bytes
+            .checked_add(current_bytes)
+            .ok_or(MuxError::SegmentTooLarge)?;
+        let total = video_bytes
+            .checked_add(seg.audio_bytes)
+            .and_then(|n| n.checked_add(pending_audio_bytes))
+            .ok_or(MuxError::SegmentTooLarge)?;
+        if total > MAX_SEGMENT_BYTES {
             return Err(MuxError::SegmentTooLarge);
         }
+        seg.bytes = video_bytes;
+        let cur = self.pending_video.take().expect("checked pending video");
+        self.pending_video = Some(next);
         let since_segment = ticks_to_duration(next_dts - seg.start_dts, VIDEO_TIMESCALE);
         let ends_segment = next_sync && since_segment >= self.cfg.segment_min;
         let frame = Frame {
@@ -621,7 +822,7 @@ impl Muxer {
             }
         }
         if ends_segment {
-            self.rotate_segment(next_dts, now, true);
+            self.rotate_segment(next_dts, now, true)?;
             update.part = true;
             update.segment = true;
         }
@@ -637,7 +838,13 @@ impl Muxer {
     /// discontinuity, since media was lost. A segment cannot be cut on a
     /// frame that is not a keyframe: the multivariant playlist promises
     /// `EXT-X-INDEPENDENT-SEGMENTS`.
-    fn break_stream(&mut self, end: i64, next: Pending, now: SystemTime) -> Update {
+    fn break_stream(
+        &mut self,
+        end: i64,
+        next: Pending,
+        now: SystemTime,
+    ) -> Result<Update, MuxError> {
+        self.pending_video = None;
         if self.timing.is_none() {
             // Nothing is served before the first segment completes: start
             // over, so the targets come from a whole segment.
@@ -646,14 +853,14 @@ impl Muxer {
             self.next_segment = None;
             self.part = None;
             self.pending_video = next.sync.then_some(next);
-            return Update::default();
+            return Ok(Update::default());
         }
         tracing::warn!(
             gap_ms = (next.dts - end) / 90,
             keyframe = next.sync,
             "media broke off (stall, late keyframe or jump in time); new segment from the next keyframe, marked as a discontinuity"
         );
-        let closed = self.close_run(end, now);
+        let closed = self.close_run(end, now)?;
         if next.sync {
             let mut next = next;
             self.rebase(next.dts, end);
@@ -662,11 +869,11 @@ impl Muxer {
         } else {
             self.rebase_to = Some(end);
         }
-        Update {
+        Ok(Update {
             part: closed,
             segment: closed,
             ..Update::default()
-        }
+        })
     }
 
     /// The encoder went away; another connection may carry on the stream.
@@ -682,11 +889,15 @@ impl Muxer {
             let Some(end) = self.audio_end.take() else {
                 return Update::default();
             };
-            let closed = self.close_run(end, now);
+            let (closed, media_loss) = match self.close_run(end, now) {
+                Ok(closed) => (closed, false),
+                Err(_) => (false, true),
+            };
             self.rebase_to = Some(end);
             return Update {
                 part: closed,
                 segment: closed,
+                media_loss,
                 ..Update::default()
             };
         }
@@ -699,11 +910,15 @@ impl Muxer {
             self.part = None;
             return Update::default();
         }
-        let closed = self.close_run(cur.dts, now);
+        let (closed, media_loss) = match self.close_run(cur.dts, now) {
+            Ok(closed) => (closed, false),
+            Err(_) => (false, true),
+        };
         self.rebase_to = Some(cur.dts);
         Update {
             part: closed,
             segment: closed,
+            media_loss,
             ..Update::default()
         }
     }
@@ -711,7 +926,7 @@ impl Muxer {
     /// Closes the open part and segment at `end`, drops the held frame,
     /// and marks the next segment as a discontinuity. Returns whether a
     /// segment was closed.
-    fn close_run(&mut self, end: i64, now: SystemTime) -> bool {
+    fn close_run(&mut self, end: i64, now: SystemTime) -> Result<bool, MuxError> {
         if self
             .part
             .as_ref()
@@ -725,15 +940,16 @@ impl Muxer {
             .next_segment
             .as_ref()
             .is_some_and(|s| !s.parts.is_empty());
-        if closed {
-            self.rotate_segment(end, now, false);
+        let result = if closed {
+            self.rotate_segment(end, now, false)
         } else {
             self.next_segment = None;
-        }
+            Ok(())
+        };
         self.pending_video = None;
         self.discontinuity_next = true;
         self.breaks += 1;
-        closed
+        result.map(|()| closed)
     }
 
     /// Moves output time so that input now at output `from` lands at `to`.
@@ -838,7 +1054,7 @@ impl Muxer {
         now: SystemTime,
     ) -> Result<Update, MuxError> {
         if self.video.is_some() {
-            self.push_audio(pts, data);
+            self.push_audio(pts, data)?;
             return Ok(Update::default());
         }
         let audio = self.audio.ok_or(MuxError::InvalidTracks)?;
@@ -910,6 +1126,7 @@ impl Muxer {
                 wall_origin: (at, start),
                 parts: Vec::new(),
                 bytes: 0,
+                audio_bytes: 0,
                 discontinuity: std::mem::take(&mut self.discontinuity_next),
             });
         }
@@ -949,27 +1166,77 @@ impl Muxer {
             update.part = true;
         }
         if end_segment {
-            self.rotate_segment(end, now, true);
+            self.rotate_segment(end, now, true)?;
             update.segment = true;
         }
         Ok(update)
     }
 
+    /// Checks video-led AAC before a borrowed payload is copied by ingest.
+    /// Pending video and payload backing capacity remain separately scoped.
+    pub(crate) fn check_audio_admission(&self, pts: i64, bytes: usize) -> Result<(), MuxError> {
+        let Some(audio) = self.audio else {
+            return Ok(());
+        };
+        if self.video.is_none() || pts < 0 || pts.saturating_add(self.offset) < 0 {
+            return Ok(());
+        }
+        if audio.sample_rate == 0 {
+            return Err(MuxError::InvalidAudio);
+        }
+        let staged = self.pending_audio.as_ref().filter(|pending| {
+            self.part.is_some()
+                && i128::from(pending.dts) * i128::from(VIDEO_TIMESCALE)
+                    / i128::from(audio.sample_rate)
+                    >= i128::from(self.audio_floor)
+        });
+        let samples = self
+            .part
+            .as_ref()
+            .map_or(0, |part| part.audio.len())
+            .checked_add(usize::from(staged.is_some()))
+            .and_then(|n| n.checked_add(1))
+            .ok_or(MuxError::SegmentTooLarge)?;
+        if samples > MAX_OPEN_AUDIO_SAMPLES {
+            return Err(MuxError::SegmentTooLarge);
+        }
+        let total = self
+            .next_segment
+            .as_ref()
+            .map_or(Some(0), |segment| {
+                segment.bytes.checked_add(segment.audio_bytes)
+            })
+            .and_then(|n| n.checked_add(staged.map_or(0, |pending| pending.data.len())))
+            .and_then(|n| n.checked_add(bytes))
+            .ok_or(MuxError::SegmentTooLarge)?;
+        if total > MAX_SEGMENT_BYTES {
+            return Err(MuxError::SegmentTooLarge);
+        }
+        Ok(())
+    }
+
     /// Feeds one AAC frame. `pts` is 90 kHz on the same timeline as video.
-    pub fn push_audio(&mut self, pts: i64, data: Bytes) {
+    /// Refuses the new frame before mutation when payload or live AAC sample
+    /// bounds are exhausted. This pre-release API now returns the refusal;
+    /// callers must propagate it and mark any accepted recording incomplete.
+    /// Use `push_audio_at` for an entry point that also supports audio-only.
+    pub fn push_audio(&mut self, pts: i64, data: Bytes) -> Result<(), MuxError> {
+        self.check_audio_admission(pts, data.len())?;
         // This compatibility path needs video to supply cuts and wall time.
         // Audio-only callers must use the checked, updating `push_audio_at`.
         if self.video.is_none() {
-            return;
+            return Ok(());
         }
-        let Some(audio) = self.audio else { return };
+        let Some(audio) = self.audio else {
+            return Ok(());
+        };
         if pts < 0 {
-            return;
+            return Ok(());
         }
         let rate = audio.sample_rate;
         let pts = pts.saturating_add(self.offset);
         if pts < 0 {
-            return;
+            return Ok(());
         }
         let mut next = Pending {
             dts: pts.saturating_mul(i64::from(rate)) / i64::from(VIDEO_TIMESCALE),
@@ -979,7 +1246,7 @@ impl Muxer {
         };
         let Some(cur) = self.pending_audio.take() else {
             self.pending_audio = Some(next);
-            return;
+            return Ok(());
         };
         if next.dts < cur.dts {
             next.dts = cur.dts;
@@ -994,12 +1261,22 @@ impl Muxer {
 
         // Audio waits for video to open the first part.
         let Some(part) = self.part.as_mut() else {
-            return;
+            return Ok(());
         };
-        let at = cur.dts * i64::from(VIDEO_TIMESCALE) / i64::from(rate);
+        let at =
+            i64::try_from(i128::from(cur.dts) * i128::from(VIDEO_TIMESCALE) / i128::from(rate))
+                .expect("nonnegative AAC input converted within the 90 kHz input range");
         if at < self.audio_floor {
-            return;
+            return Ok(());
         }
+        let segment = self
+            .next_segment
+            .as_mut()
+            .expect("open video part has a segment");
+        segment.audio_bytes = segment
+            .audio_bytes
+            .checked_add(cur.data.len())
+            .expect("AAC byte projection checked before mutation");
         part.audio_times.push((at, cur.dts as u64));
         part.audio.push(Sample {
             duration,
@@ -1007,6 +1284,7 @@ impl Muxer {
             sync: true,
             data: cur.data,
         });
+        Ok(())
     }
 
     /// Closes the open part at `end_dts` and opens the next at `next_start`
@@ -1059,15 +1337,18 @@ impl Muxer {
 
     /// Closes the open segment at `end_dts` and, unless the stream broke,
     /// opens the next. Its last part is already closed.
-    fn rotate_segment(&mut self, end_dts: i64, _now: SystemTime, open_next: bool) {
+    fn rotate_segment(
+        &mut self,
+        end_dts: i64,
+        _now: SystemTime,
+        open_next: bool,
+    ) -> Result<(), MuxError> {
         let Some(open) = self.next_segment.take() else {
-            return;
+            return Ok(());
         };
         let duration = ticks_to_duration(end_dts - open.start_dts, VIDEO_TIMESCALE);
-        let mut data = BytesMut::with_capacity(open.parts.iter().map(|p| p.data.len()).sum());
-        for p in &open.parts {
-            data.extend_from_slice(&p.data);
-        }
+        let data = SegmentData::from_chunks(open.parts.iter().map(|p| p.data.clone()).collect())
+            .ok_or(MuxError::SegmentTooLarge)?;
         let seg = Arc::new(Segment {
             initialization: open.initialization,
             id: open.id,
@@ -1075,7 +1356,7 @@ impl Muxer {
             start: open.start,
             discontinuity: open.discontinuity,
             parts: open.parts,
-            data: data.freeze(),
+            data,
         });
 
         if self.entries.is_empty() {
@@ -1104,6 +1385,15 @@ impl Muxer {
             self.target = Some(t);
         }
 
+        let carried_audio_bytes = self
+            .part
+            .as_ref()
+            .map_or(Some(0), |part| {
+                part.audio
+                    .iter()
+                    .try_fold(0usize, |total, sample| total.checked_add(sample.data.len()))
+            })
+            .ok_or(MuxError::SegmentTooLarge)?;
         self.next_segment = open_next.then(|| OpenSegment {
             initialization: self.init.clone(),
             id: open.id + 1,
@@ -1115,8 +1405,10 @@ impl Muxer {
             wall_origin: open.wall_origin,
             parts: Vec::new(),
             bytes: 0,
+            audio_bytes: carried_audio_bytes,
             discontinuity: false,
         });
+        Ok(())
     }
 
     // ---- the window, for playlists and HTTP ----
@@ -1318,6 +1610,83 @@ impl Muxer {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn checked_aac_accounting_overflow_refuses_without_retaining_input() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        m.push_video(0, 0, true, Bytes::from_static(&[1]), SystemTime::UNIX_EPOCH)
+            .expect("IDR");
+        m.push_video(
+            3000,
+            3000,
+            false,
+            Bytes::from_static(&[1]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect("successor");
+        m.next_segment.as_mut().expect("segment").audio_bytes = usize::MAX;
+        assert!(matches!(
+            m.push_audio(0, Bytes::from_static(&[1])),
+            Err(MuxError::SegmentTooLarge)
+        ));
+        assert!(m.pending_audio.is_none());
+        assert!(m.part.as_ref().expect("part").audio.is_empty());
+        assert!(matches!(
+            m.push_video(
+                6000,
+                6000,
+                false,
+                Bytes::from_static(&[1]),
+                SystemTime::UNIX_EPOCH
+            ),
+            Err(MuxError::SegmentTooLarge)
+        ));
+        assert_eq!(
+            m.pending_video
+                .as_ref()
+                .expect("accepted pending video")
+                .dts,
+            3000
+        );
+    }
+
+    #[test]
+    fn live_aac_sample_credit_returns_after_real_video_part_rotation() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        m.push_video(0, 0, true, Bytes::from_static(&[1]), SystemTime::UNIX_EPOCH)
+            .expect("IDR");
+        m.push_video(
+            3000,
+            3000,
+            false,
+            Bytes::from_static(&[1]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect("successor");
+        for _ in 0..MAX_OPEN_AUDIO_SAMPLES {
+            m.push_audio(0, Bytes::from_static(&[1]))
+                .expect("within sample limit");
+        }
+        assert!(matches!(
+            m.push_audio(0, Bytes::from_static(&[1])),
+            Err(MuxError::SegmentTooLarge)
+        ));
+        for frame in 2..=30 {
+            m.push_video(
+                frame * 3000,
+                frame * 3000,
+                frame == 30,
+                Bytes::from_static(&[1]),
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("real duration and part cuts");
+        }
+        assert!(m.timing.is_some());
+        assert!(m.part.as_ref().expect("next part").audio.is_empty());
+        m.push_audio(90_000, Bytes::from_static(&[1]))
+            .expect("released sample credit");
+        assert!(m.part.as_ref().expect("next part").audio.len() <= 1);
+    }
+
     pub fn video() -> H264Config {
         H264Config::new(
             &[
@@ -1346,7 +1715,8 @@ pub(crate) mod tests {
         for i in frames {
             let dts = i * 3000;
             while next_audio <= dts {
-                m.push_audio(next_audio, Bytes::from_static(b"aac"));
+                m.push_audio(next_audio, Bytes::from_static(b"aac"))
+                    .expect("bounded test AAC");
                 next_audio += 1920; // 1024 samples at 48 kHz in 90 kHz ticks
             }
             let up = m
@@ -1520,7 +1890,8 @@ pub(crate) mod tests {
             }
             prev = dts;
             while next_audio <= dts {
-                m.push_audio(next_audio, Bytes::from_static(b"aac"));
+                m.push_audio(next_audio, Bytes::from_static(b"aac"))
+                    .expect("bounded test AAC");
                 next_audio += 1920;
             }
             m.push_video(
@@ -1990,7 +2361,173 @@ pub(crate) mod tests {
         }
         assert_eq!(m.part_target(), Duration::from_millis(234));
         let joined: Vec<u8> = seg.parts.iter().flat_map(|p| p.data.to_vec()).collect();
-        assert_eq!(&seg.data[..], &joined[..]);
+        let wire: Vec<u8> = seg
+            .data
+            .chunks()
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert_eq!(wire, joined);
+        assert_eq!(seg.data.len(), wire.len());
+    }
+
+    #[test]
+    fn segment_data_keeps_chunk_order_empty_chunks_and_shared_metadata() {
+        let first = Bytes::from(vec![1, 2, 3]);
+        let second = Bytes::from(vec![4, 5]);
+        let data = SegmentData::from_chunks(vec![first.clone(), Bytes::new(), second.clone()])
+            .expect("representable fragment lengths");
+        assert_eq!(data.len(), 5);
+        assert!(!data.is_empty());
+        assert_eq!(
+            data.chunks(),
+            &[first.clone(), Bytes::new(), second.clone()]
+        );
+        assert_eq!(data.chunks()[0].as_ptr(), first.as_ptr());
+        assert_eq!(data.chunks()[2].as_ptr(), second.as_ptr());
+        let cloned = data.clone();
+        assert_eq!(cloned.chunks().as_ptr(), data.chunks().as_ptr());
+        drop(data);
+        assert_eq!(cloned.chunks()[0], first);
+        assert_eq!(cloned.chunks()[2], second);
+        for chunks in [vec![], vec![Bytes::new(), Bytes::new()]] {
+            let empty = SegmentData::from_chunks(chunks).expect("empty body");
+            assert!(empty.is_empty());
+            assert_eq!(empty.len(), 0);
+        }
+        assert_eq!(
+            checked_segment_len([usize::MAX - 1, 1].into_iter()),
+            Some(usize::MAX)
+        );
+        assert_eq!(checked_segment_len([usize::MAX, 1].into_iter()), None);
+    }
+
+    #[test]
+    fn segment_data_preserves_part_granular_backing_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Payload {
+            bytes: Vec<u8>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl AsRef<[u8]> for Payload {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let body = SegmentData::from_chunks(vec![
+            Bytes::from_owner(Payload {
+                bytes: vec![1; 4096],
+                drops: first_drops.clone(),
+            }),
+            Bytes::from_owner(Payload {
+                bytes: vec![2; 8192],
+                drops: second_drops.clone(),
+            }),
+        ])
+        .expect("bounded generated fragments");
+        let narrow_part_response = body.chunks()[0].clone();
+        let whole_segment_response = body.clone();
+        drop(body);
+        assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(second_drops.load(Ordering::SeqCst), 0);
+        drop(whole_segment_response);
+        assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(second_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(narrow_part_response.as_ref(), &[1; 4096]);
+        drop(narrow_part_response);
+        assert_eq!(first_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn segment_rotation_shares_original_part_backings_and_indexes() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        feed(&mut m, 0..49, 30);
+        let before = m.open_parts().to_vec();
+        assert!(
+            !before.is_empty(),
+            "second segment has published open parts"
+        );
+        let pointers: Vec<_> = before.iter().map(|part| part.data.as_ptr()).collect();
+        feed(&mut m, 49..61, 30);
+        let segment = m.segment(LEADING_GAPS + 1).expect("second segment");
+        assert_eq!(segment.data.chunks().len(), segment.parts.len());
+        for (index, part) in segment.parts.iter().enumerate() {
+            let chunk = &segment.data.chunks()[index];
+            assert_eq!(chunk.as_ptr(), part.data.as_ptr());
+            assert_eq!(chunk, &part.data);
+            let PartLookup::Found(indexed) = m.part(part.id) else {
+                panic!("the same part remains in the lookup index");
+            };
+            assert!(Arc::ptr_eq(part, &indexed));
+            if let Some(old) = before.get(index) {
+                assert!(Arc::ptr_eq(part, old), "published Part Arc is unchanged");
+                assert_eq!(part.data.as_ptr(), pointers[index]);
+            }
+        }
+        assert_eq!(
+            segment.data.len(),
+            segment
+                .parts
+                .iter()
+                .map(|part| part.data.len())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn segment_and_part_owners_survive_eviction_and_codec_replacement() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        feed(&mut m, 0..61, 30);
+        let segment = m.segment(LEADING_GAPS).expect("original segment");
+        let body = segment.data.clone();
+        let held_part = segment.parts[0].clone();
+        let part_id = held_part.id;
+        let original_pointer = held_part.data.as_ptr();
+        let weak_part = Arc::downgrade(&held_part);
+        let expected: Vec<_> = body
+            .chunks()
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        drop(segment);
+        m.reconfigure(
+            video(),
+            Some(aac()),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3),
+        );
+        feed(&mut m, 0..(40 * 30 + 1), 30);
+        assert!(m.segment(LEADING_GAPS).is_none());
+        assert!(matches!(m.part(part_id), PartLookup::Missing));
+        assert!(m.initialization(0).is_none());
+        assert_eq!(held_part.initialization.id, 0);
+        assert_eq!(held_part.data.as_ptr(), original_pointer);
+        assert_eq!(body.chunks()[0].as_ptr(), original_pointer);
+        assert!(weak_part.upgrade().is_some());
+        drop(held_part);
+        assert!(
+            weak_part.upgrade().is_none(),
+            "body retains bytes, not Part metadata"
+        );
+        assert!(
+            body.chunks()[0].is_unique(),
+            "only shared body metadata owns this allocation"
+        );
+        assert_eq!(body.len(), expected.len());
+        assert_eq!(
+            body.chunks()
+                .iter()
+                .flat_map(|chunk| chunk.iter().copied())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -2072,3 +2609,11 @@ pub(crate) mod tests {
         assert_eq!(a, Some(1024));
     }
 }
+
+#[cfg(test)]
+#[path = "audio_resource_tests.rs"]
+mod audio_resource_tests;
+
+#[cfg(test)]
+#[path = "video_resource_tests.rs"]
+mod video_resource_tests;
