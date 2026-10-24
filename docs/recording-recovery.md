@@ -1528,6 +1528,23 @@ pre-existing AVD remains. No physical phone is accessed. Evidence is under
 independent paired Float32 comparison has completed. Neither the Int16 tolerance
 nor the exact independent-PCM requirement is relaxed.
 
+
+A later startup-only emulator diagnostic records four matching local readiness
+and configuration snapshots and a resumed unsupported-action Activity, while
+its global broadcast-idle observation times out after 20 seconds. It requests
+no valid media probe; native call counters are unobserved. The qualification
+Activity now retains the exact run and worker only after a real framework
+configuration handoff. The replacement Activity validates the same invocation;
+genuine destruction or a mismatch cancels it, and uncertain cleanup still
+fences a fresh worker. Four focused host regressions, 39 verifier controls,
+the three APK builds, Debug/Qualification lint and seven APK artefact checks
+pass. The new owner is present only in Debug and Qualification. This uses the
+unchanged pinned SDK AAR; it does not refresh the full unit or SDK qualification.
+The six-decoder paired replay and whole-array comparison remain outstanding,
+and all three earlier failed attempts retain their original verdicts. Private
+results are under `target/privacy-standby/paired-startup-diagnostic-actual-v1/`
+and `target/privacy-standby/paired-lifecycle-build-actual-v1/`.
+
 The Android production recorder now carries an opaque terminal receipt from
 the actual audio owner through its existing recording drain. Issuance requires
 final Stop and joined producer/resource closure for every AAC generation, with

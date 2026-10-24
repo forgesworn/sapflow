@@ -19,6 +19,7 @@ POSE_MARKERS = (b"Ldev/forgesworn/sapflow/broadcaster/QualificationPoseApplicati
                 b"dev.forgesworn.sapflow.broadcaster.QUALIFICATION_POSE")
 BENCHMARK_MARKER = b"Ldev/forgesworn/sapflow/broadcaster/FfiBenchmarkActivity;"
 AAC_PROBE_MARKERS = (b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificationActivity;",
+                     b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificationRunOwner;",
                      b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificationProbe;",
                      b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC",
                      b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_DRAIN",
