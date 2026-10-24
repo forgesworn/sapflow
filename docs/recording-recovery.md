@@ -1540,10 +1540,43 @@ fences a fresh worker. Four focused host regressions, 39 verifier controls,
 the three APK builds, Debug/Qualification lint and seven APK artefact checks
 pass. The new owner is present only in Debug and Qualification. This uses the
 unchanged pinned SDK AAR; it does not refresh the full unit or SDK qualification.
-The six-decoder paired replay and whole-array comparison remain outstanding,
-and all three earlier failed attempts retain their original verdicts. Private
-results are under `target/privacy-standby/paired-startup-diagnostic-actual-v1/`
+Those focused build checks did not execute the paired decoder matrix. Its later
+result is recorded below; all earlier failed attempts retain their original
+verdicts. Private results are under `target/privacy-standby/paired-startup-diagnostic-actual-v1/`
 and `target/privacy-standby/paired-lifecycle-build-actual-v1/`.
+
+
+The subsequent explicit lab profile consumes the focused APK build directly and
+rechecks its compiled Android source content, the unchanged SDK source and all
+package bytes. It preserves the APK's original compiled context and separately
+records the observed checkout; it does not refresh whole-workspace SDK
+qualification. Its first two-CPU emulator run collects six attempts, but the
+long SDK reader fails after Android's codec allocation watchdog fires, producing
+no PCM. That failed media result is preserved, and the independent-reader
+preflight refuses it without launching any decoder. Resource closure alone is
+not treated as six healthy observations.
+
+A separate four-CPU emulator experiment keeps the same codec, media, deadlines
+and numerical rules and verifies the guest CPU range. All six readers then
+complete with real EOS and cleanup: each side returns 2,765, 48,000 and 2,765
+frames. All three originally aligned whole native Int16 pairs are byte-identical,
+with maximum pointwise difference zero. The unchanged pinned independent reader
+runs six decoder children without compilation, and all three whole Float32 pairs
+are also byte-identical. Final pure readback passes the necessary content gates
+with unchanged inputs, all 18 predecoder refusals and three actual SDK checkpoint
+returns; the native counterparts make no checkpoint calls. One worker runs for
+the nonce; no configuration reattachment occurs in this experiment.
+
+This is generated-file content evidence, not proof that the CPU change alone
+caused the different result. The original cold failure, W3 unsupported case,
+raw native-clock failures and preceding startup failures retain their verdicts.
+Native source authority, full presentation equivalence and app admission remain
+false; the source, seek/A/V, recovery, device, performance and release requirements
+below remain open. Private results are under
+`target/privacy-standby/native-file-pair-runtime-lifecycle-actual-v2/`,
+`native-file-pair-independent-lifecycle-actual-v2/` and
+`native-file-pair-inspection-lifecycle-actual-v2/`. The failed two-CPU result is
+retained separately under `native-file-pair-runtime-lifecycle-actual-v1/`.
 
 The Android production recorder now carries an opaque terminal receipt from
 the actual audio owner through its existing recording drain. Issuance requires
