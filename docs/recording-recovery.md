@@ -339,9 +339,12 @@ compiler results and all three process-group closures. Private evidence is under
 The test uses freshly built packages and an actual loaded-host-library witness.
 All selected SDK build inputs remain unchanged; the separately recorded server
 body edit prevents a current whole-workspace verdict. Historical complete-source
-results are preserved. Portable public test-driver and CI integration remain
-open, along with production recovery, native presentation, physical storage,
-recorder adoption and the two-second loss bound.
+results are preserved. The portable public entrypoint,
+`python3 -B mobile/ios/test-recording-checkpoints-sdk.py`, builds the current host
+Rust SDK and fresh Swift bindings without private receipts. Its merged-main host
+run passes all 24 tests, and the macOS CI job is configured to run the same
+command. Hosted CI, production recovery, native presentation, physical storage,
+recorder adoption and the two-second loss bound still require their own evidence.
 
 ## iOS submitted-input finalisation
 
