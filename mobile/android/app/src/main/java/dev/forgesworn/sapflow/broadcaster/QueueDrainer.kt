@@ -22,7 +22,15 @@ internal class QueueDrainer(
     private val sink: EncodedSink?,
     private val failure: (String) -> Unit,
     private val recordingSource: RecordingSourceGate.Recorder? = null,
+    private val nativeRun: AudioNativeAacRun? = null,
+    private val nativeWorker: AudioNativeAacWorker? = null,
 ) {
+    init {
+        // Refuse invalid wiring before creating a worker or any other owner.
+        require(!publishing || nativeRun == null && nativeWorker == null)
+        require((nativeRun == null) == (nativeWorker == null))
+        require(nativeWorker == null || nativeWorker === sink && recordingSource == null)
+    }
     private val executor = if (sink == null) null else ThreadPoolExecutor(
         // One fixed batch task plus a reserved control/finalisation task.
         // Admission prevents another batch until all its owners have closed.
@@ -33,6 +41,7 @@ internal class QueueDrainer(
     private val closed = AtomicBoolean(false)
     private val aborted = AtomicBoolean(false)
     private val closing = AtomicBoolean(false)
+    private val nativeClose = NativeCloseOnce()
     private val admission = DrainAdmission()
     private val handoff = OwnedHandoff<OwnedBatch<MediaSample>>()
     private val activeBatch = AtomicReference<OwnedBatch<MediaSample>?>()
@@ -58,9 +67,49 @@ internal class QueueDrainer(
 
     /** Source FIFO acceptance is observed on its actual handler immediately
      * after queues.push reports recordingQueued. No media lookup or copy. */
-    fun recordingAccepted() {
+    fun recordingAccepted(nativeGeneration: Any? = null, nativeAudio: Boolean = false) {
         check(!publishing && handler.looper.isCurrentThread)
         recordingSource?.accepted()
+        if (nativeRun != null) {
+            val accounted = if (nativeAudio) nativeGeneration != null && nativeRun.accepted(nativeGeneration)
+                else nativeRun.acceptedVideo()
+            if (!accounted) {
+                nativeRun.fail()
+                recordingSource?.failed()
+            }
+        }
+    }
+
+    /** Known loss must fence both recording protocols before asynchronous
+     * prefix cleanup. Rejected video is absent from accepted-AU counters. */
+    fun recordingLost() {
+        check(!publishing)
+        nativeRun?.fail()
+        recordingSource?.failed()
+    }
+
+    private fun consumeOwned(sample: MediaSample) {
+        val run = nativeRun
+        if (run == null) {
+            checkNotNull(sink).consume(sample)
+            recordingSource?.consumed()
+            return
+        }
+        val worker = checkNotNull(nativeWorker)
+        run.beforeSample(worker)
+        checkNotNull(sink).consume(sample)
+        run.afterSample(worker)
+        recordingSource?.consumed()
+    }
+
+    private fun closeSink() {
+        if (nativeRun == null) sink?.close()
+        else nativeClose.close { checkNotNull(sink).close() }
+    }
+
+    private fun finishSink() {
+        if (nativeRun == null) sink?.finish()
+        else nativeClose.close { checkNotNull(sink).finish() }
     }
 
     fun available() {
@@ -70,6 +119,9 @@ internal class QueueDrainer(
 
     private fun drainOne() {
         if (closed.get()) { admission.empty(); return }
+        // Retain early video in the existing bounded fanout until the first
+        // accepted original audio establishes H. Its ingress wakes us again.
+        if (nativeRun?.awaitingFirstAudio() == true) { admission.empty(); return }
         try {
             val batch = OwnedBatch.collect(if (publishing) 4L * 1024 * 1024 else 8L * 1024 * 1024,
                 pop = {
@@ -101,13 +153,14 @@ internal class QueueDrainer(
                             owned?.use {
                             while (!aborted.get() && it.consumeNext { sample ->
                                 val consumeStartedNs = System.nanoTime()
-                                try { if (!aborted.get()) { sink.consume(sample); recordingSource?.consumed() } }
+                                try { if (!aborted.get()) consumeOwned(sample) }
                                 finally { consumeDelay.record(System.nanoTime() - consumeStartedNs) }
                             }) { /* At most eight synchronous borrows, in FIFO order. */ }
                             }
                         }
                     }
                     catch (error: Throwable) {
+                        nativeRun?.fail()
                         recordingSource?.failed() // Before deferred controller work.
                         admission.close()
                         if (!closed.getAndSet(true)) handler.post { failure("Sink failed: ${error.javaClass.simpleName}") }
@@ -125,11 +178,13 @@ internal class QueueDrainer(
                     }
                 }
             } catch (error: Throwable) {
+                nativeRun?.fail()
                 recordingSource?.failed()
                 try { handoff.cancel() } catch (cleanup: Throwable) { error.addSuppressed(cleanup) }
                 throw error
             }
         } catch (error: Throwable) {
+            nativeRun?.fail()
             recordingSource?.failed()
             admission.empty()
             admission.close()
@@ -154,7 +209,7 @@ internal class QueueDrainer(
             synchronized(guard) {
                 if (!cancelled) {
                     try { sample = queues.popRecording(SystemClock.elapsedRealtimeNanos().toULong()) }
-                    catch (error: Throwable) { recordingSource?.failed(); failure = error }
+                    catch (error: Throwable) { nativeRun?.fail(); recordingSource?.failed(); failure = error }
                 }
                 done.countDown()
             }
@@ -183,7 +238,9 @@ internal class QueueDrainer(
         closed.set(true)
         admission.close()
         handler.removeCallbacks(request)
-        if (!closing.compareAndSet(false, true)) return executor?.isTerminated ?: true
+        if (!closing.compareAndSet(false, true)) {
+            return if (nativeClose.closeUnknown) false else executor?.isTerminated ?: true
+        }
         val worker = executor ?: return true
         if (graceful && sink != null) {
             val deadlineNs = SystemClock.elapsedRealtimeNanos() + 3_000_000_000L
@@ -197,12 +254,16 @@ internal class QueueDrainer(
                             val sample = if (drainViaHandler) popRecordingOnHandler(deadlineNs)
                                 else queues.popRecording(SystemClock.elapsedRealtimeNanos().toULong())
                             if (sample == null) break
-                            sample.use { sink.consume(it); recordingSource?.consumed() }
+                            sample.use { consumeOwned(it) }
                         }
                     }
                     val sourceRecorder = recordingSource
-                    if (sourceRecorder == null) sink.finish()
-                    else {
+                    if (sourceRecorder == null) {
+                        when (nativeRun?.finish(checkNotNull(nativeWorker))) {
+                            null, AudioNativeAacFinish.FILE_RECEIPT -> finishSink()
+                            AudioNativeAacFinish.EMPTY -> closeSink()
+                        }
+                    } else {
                         check(sink is PrivateRecordingSink) { "Source-bound recorder changed" }
                         val permit = sourceRecorder.drained(source)
                         if (permit == null) {
@@ -213,17 +274,19 @@ internal class QueueDrainer(
                     }
                 }
             }, abort = {
+                nativeRun?.fail()
                 recordingSource?.failed()
                 aborted.set(true)
                 cancelBatch()
-                sink.close()
+                closeSink()
             })
         }
+        nativeRun?.fail()
         recordingSource?.failed()
         aborted.set(true)
         cancelBatch()
         // Invoked on a control worker by CaptureController, outside callbacks.
-        val sinkClosed = runCatching { sink?.close() }.isSuccess
+        val sinkClosed = runCatching { closeSink() }.isSuccess
         worker.shutdownNow()
         return worker.awaitTermination(1, TimeUnit.SECONDS) && sinkClosed && !graceful
     }

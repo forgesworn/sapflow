@@ -18,7 +18,7 @@ internal object AudioAacProfile {
         val csd0: Fact<String>, val batchMaximum: Fact<Int>, val batchThreshold: Fact<Int>)
     data class Setup(val selection: Selection, val input: Format, val output: Format)
     enum class Phase { OUTPUT_FORMAT, OUTPUT_EOS }
-    enum class Eligibility { UNKNOWN, SINGLE_AU_CAPABILITY, SINGLE_AU_API35_DEFAULT }
+    enum class Eligibility { UNKNOWN, SINGLE_AU_CAPABILITY, SINGLE_AU_API35_DEFAULT, SINGLE_AU_API35_EFFECTIVE_ZERO }
     enum class Output { EXCLUDED, UNKNOWN, SINGLE_AU_ELIGIBLE }
     data class Snapshot(val generation: Long, val setup: Setup?, val output: Format?,
         val terminalOutput: Format?, val conflict: Boolean, val eligibility: Eligibility) {
@@ -31,9 +31,10 @@ internal object AudioAacProfile {
     private fun Fact<Int>.unset() = state == State.ABSENT && value == null
     private fun Format.aac() = mime.isValue("audio/mp4a-latm") && rate.isValue(48000) &&
         channels.isValue(1) && csd0.isValue("1188")
-    private fun Format.noBatchContradiction(api: Int) =
+    private fun Format.effectiveZero(api: Int) = api >= 35 && batchMaximum.isValue(0) && batchThreshold.isValue(0)
+    private fun Format.noBatchContradiction(api: Int) = effectiveZero(api) || (
         (batchMaximum.unset() || api < 35 && batchMaximum.state == State.API_UNAVAILABLE && batchMaximum.value == null) &&
-        (batchThreshold.unset() || api < 35 && batchThreshold.state == State.API_UNAVAILABLE && batchThreshold.value == null)
+        (batchThreshold.unset() || api < 35 && batchThreshold.state == State.API_UNAVAILABLE && batchThreshold.value == null))
 
     private fun <T> contradicts(first: Fact<T>, last: Fact<T>): Boolean = when (last.state) {
         State.VALUE -> first.state != State.VALUE || first.value != last.value
@@ -46,7 +47,8 @@ internal object AudioAacProfile {
         contradicts(first.batchThreshold,last.batchThreshold)
 
     /** Both capability fields must have actually returned; read failure is not
-     * false. A returned nondefault batch size is not guessed into an AU limit. */
+     * false. API35 effective zero/zero cannot hold two nonempty AUs. Keep that
+     * returned configuration distinct from absent keys and other byte limits. */
     fun evaluate(selection: Selection?, output: Format?): Eligibility {
         if (selection == null || output == null || selection.api < 29 || !selection.name.identity() ||
             !selection.canonicalName.identity() || !selection.encoder.isValue(true) || !output.aac()) return Eligibility.UNKNOWN
@@ -58,6 +60,7 @@ internal object AudioAacProfile {
         if (selection.multipleSupported.isValue(false)) return Eligibility.SINGLE_AU_CAPABILITY
         if (selection.api >= 35 && output.batchMaximum.unset() && output.batchThreshold.unset())
             return Eligibility.SINGLE_AU_API35_DEFAULT
+        if (output.effectiveZero(selection.api)) return Eligibility.SINGLE_AU_API35_EFFECTIVE_ZERO
         return Eligibility.UNKNOWN
     }
 

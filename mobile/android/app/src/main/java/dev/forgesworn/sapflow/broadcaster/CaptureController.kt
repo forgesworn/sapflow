@@ -677,6 +677,11 @@ class CaptureController internal constructor(private val context: Context,
         val policy = checkNotNull(privacy)
         val rawRun = runAdmission
         val zero = policy.snapshot().desired == PrivacyStandbyPolicy.Desired.STANDBY
+        val exactRecordingSink = recordingSink
+        val nativeWorker = if (audioSampleMode == AudioSampleMode.PRESERVE_SOURCE_UNATTESTED)
+            exactRecordingSink as? AudioNativeAacWorker else null
+        val nativeRun = if (nativeWorker != null)
+            AudioNativeAacRun(rawRun, token) else null
         var audioRun:PrivacyStandbyPolicy.Run?=null
         val audio = AudioCaptureOwner(context,prepared,token,captureIntent.audioBps,checkNotNull(audioPin),handler,audioHandler,
             audioGenerations,rawRun,
@@ -686,13 +691,13 @@ class CaptureController internal constructor(private val context: Context,
             onSample = { sample,tick,nativeGeneration,zeroOnly -> if(token==drainGeneration) {
                 acceptedAudio.incrementAndGet(); submitSample(sample,token,rawRun,tick,nativeGeneration,zeroOnly)
             } },sampleMode = audioSampleMode,
-            onTimingViews = { views,tick,nativeGeneration,zeroOnly -> if(token==drainGeneration) {
-                acceptedAudio.incrementAndGet(); submitSample(null,token,rawRun,tick,nativeGeneration,zeroOnly,timingViews=views)
+            onTimingViews = { views,tick,nativeGeneration,zeroOnly,generationOwner -> if(token==drainGeneration) {
+                acceptedAudio.incrementAndGet(); submitSample(null,token,rawRun,tick,nativeGeneration,zeroOnly,
+                    audioGenerationOwner=generationOwner,timingViews=views)
             } },onValidated = {},onPriming = { audioPrimingRejects.incrementAndGet() },
             onFailure = { reason -> if(token==drainGeneration) fail(reason) },
-            onRoute = { name -> if(token==drainGeneration) activeAudioInput=name })
+            onRoute = { name -> if(token==drainGeneration) activeAudioInput=name }, nativeRun = nativeRun)
         audioOwner=audio;audioCodec=audio.descriptor
-        val exactRecordingSink = recordingSink
         val sourceRecorder = (exactRecordingSink as? PrivateRecordingSink)?.bindCaptureSource(rawRun.recordingSource)
         branchClosePending.fill(false)
         audio.prepare(zero)
@@ -707,7 +712,8 @@ class CaptureController internal constructor(private val context: Context,
         else NativeSampleFanout(4uL * 1024uL * 1024uL, 8uL * 1024uL * 1024uL, 2000u, captureIntent.hasVideo)
         publishing = QueueDrainer(handler, queues!!, true, publishingSink, { fail(it) })
         recording = QueueDrainer(handler, queues!!, false, exactRecordingSink,
-            { reason -> if (token == drainGeneration && recordingSink === exactRecordingSink) failRecording(reason) }, sourceRecorder)
+            { reason -> if (token == drainGeneration && recordingSink === exactRecordingSink) failRecording(reason) }, sourceRecorder,
+            nativeRun, nativeWorker)
         if(publishingSink==null) closePrivacyBranch(run,PrivacyStandbyPolicy.Sink.PUBLISHING)
         else publishingSink?.setTerminalAdmissionListener { handler.post { closePrivacyBranch(run,PrivacyStandbyPolicy.Sink.PUBLISHING) } }
         if(recordingSink==null) closePrivacyBranch(run,PrivacyStandbyPolicy.Sink.RECORDING)
@@ -878,7 +884,7 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     /** Borrowed immutable owner; all fanout calls remain on this handler. */
-    private fun submitSample(sample: MediaSample?, token: Long, rawRun: CameraRunAdmission, tick: Long, audioGeneration: Long? = null, zeroOnly: Boolean = false, independentIdr: Boolean = false, timingViews: NativeAacTimingViews? = null) {
+    private fun submitSample(sample: MediaSample?, token: Long, rawRun: CameraRunAdmission, tick: Long, audioGeneration: Long? = null, zeroOnly: Boolean = false, independentIdr: Boolean = false, timingViews: NativeAacTimingViews? = null, audioGenerationOwner: Any? = null) {
         val mediaNow=System.nanoTime()
         val outputRun=privacyRun
         if(outputRun!=null && privacy?.permitsOutput(outputRun,mediaNow)==false) {
@@ -905,7 +911,8 @@ class CaptureController internal constructor(private val context: Context,
             } else queues!!.push(checkNotNull(sample), nowNs.toULong())
         }
         catch (error: Throwable) { runAdmission.recordingSource.fail(); throw error }
-        if (result.recordingQueued) recording?.recordingAccepted()
+        if (result.recordingQueued) recording?.recordingAccepted(
+            if (timingViews != null) audioGenerationOwner else null, timingViews != null)
         val command=privacyCommand;val policy=privacy
         if(!AudioSourceAdmission.publishingWithheld(timingViews != null, tick) && command!=null && policy!=null && policy.needsOutputProof(command) && policy.permitsReplacement(command,System.nanoTime())) {
             if(policy.branchesAccepted(result.publishingQueued,result.recordingQueued)) {
@@ -1041,6 +1048,7 @@ class CaptureController internal constructor(private val context: Context,
     }
 
     private fun failRecording(reason: String) {
+        recording?.recordingLost() // Scalar fence before detach or worker cleanup.
         runAdmission.recordingSource.fail() // Recording loss, not publishing failure.
         if (recordingFailed) return
         privacyRun?.let{closePrivacyBranch(it,PrivacyStandbyPolicy.Sink.RECORDING)}
