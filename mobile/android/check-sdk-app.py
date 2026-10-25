@@ -17,6 +17,12 @@ NATIVE_TEST_SUITES = {
     'dev.forgesworn.sapflow.broadcaster.AudioSourcePreservationTest':
         ('mobile/android/app/src/test/java/dev/forgesworn/sapflow/broadcaster/AudioSourcePreservationTest.kt', 21),
 }
+HOST_OWNER_SOURCES = tuple('mobile/android/app/src/main/java/dev/forgesworn/sapflow/broadcaster/' + name for name in (
+    'CaptureProfile.kt', 'CaptureIntent.kt', 'RecordingSourceGate.kt', 'AudioAacOutputDisposition.kt',
+    'AudioAacProfile.kt', 'AudioNativeAacGeneration.kt', 'AudioNativeAacRun.kt', 'RecordingCatalogue.kt',
+    'RecordingAppendContext.kt', 'RecordingCheckpointStorage.kt', 'AndroidRecordingStorageIO.kt', 'RecordingCheckpointOwner.kt',
+)) + ('mobile/android/host-tests/RecordingCheckpointOwnerHostTest.kt',)
+JNA_SHA256 = '4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae'
 MAX_METADATA = 16 * 1024 * 1024
 
 def need(value, message):
@@ -97,6 +103,40 @@ def check_junit(paths, methods, minimum_tests=17, required_suites=None):
     result = dict(totals, suites=len(paths), profileMethods=profile[0])
     if required: result['requiredSuiteMethods'] = required_seen
     return result
+
+def host_test_methods(source):
+    need(type(source) is str and len(source) <= MAX_METADATA, 'Bounded host control source required')
+    lists = re.findall(r'\bval tests = listOf\(([^)]*)\)', source)
+    need(len(lists) == 1 and re.fullmatch(r'\s*::[A-Za-z][A-Za-z0-9_]*(?:\s*,\s*::[A-Za-z][A-Za-z0-9_]*)*\s*', lists[0]),
+         'One explicit host control function list required')
+    methods = re.findall(r'::([A-Za-z][A-Za-z0-9_]*)', lists[0])
+    need(len(methods) == len(set(methods)) == 20, 'All twenty unique host controls required')
+    return methods
+
+
+def check_host_controls(text, methods):
+    need(type(text) is str and len(text) <= MAX_METADATA and type(methods) is list and
+         len(methods) == 20 and all(type(name) is str and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', name) for name in methods) and
+         len(set(methods)) == 20, 'Bounded output and exact twenty host methods required')
+    expected = ['SDK recording owner host control passed: ' + name for name in methods]
+    expected.append('SDK recording owner host controls passed: 20')
+    observed = [line for line in text.splitlines() if line.startswith('SDK recording owner host control')]
+    need(observed == expected, 'Missing, duplicated, skipped, reordered or false host control result')
+    return dict(scope='SDK_HOST_FILESYSTEM_ONLY', passed=True, controls=list(methods), count=20,
+                nativeEncoderQualified=False, presentationQualified=False, deviceActions=False)
+
+
+def host_serialization_jars(gradle_home):
+    result = []
+    for module in ('kotlinx-serialization-core-jvm', 'kotlinx-serialization-json-jvm'):
+        parent = gradle_home / 'caches/modules-2/files-2.1/org.jetbrains.kotlinx' / module / '1.7.3'
+        paths = sorted(parent.glob('*/' + module + '-1.7.3.jar'))
+        need(len(paths) == 1 and re.fullmatch(r'[0-9a-f]{40}', paths[0].parent.name) and
+             paths[0].is_file() and not paths[0].is_symlink() and paths[0].resolve() == paths[0],
+             'One canonical already resolved serialization1.7.3 JAR required: ' + module)
+        result.append(paths[0])
+    return result
+
 
 def check_fresh_tasks(text):
     for task in ('testDebugUnitTest', 'testQualificationUnitTest'):
@@ -235,7 +275,7 @@ def main():
     spec = importlib.util.spec_from_file_location('android_owned', root / 'mobile/ios/checkpoint_test_processes.py')
     owner = importlib.util.module_from_spec(spec); spec.loader.exec_module(owner)
     active = None; launching = retiring = finalising = False; pending = None; unknown = False
-    commands = []; cleanup_errors = []; failure = None; after = None; bracket = None; stable = False; package = None; tests = {}; lint = {}; apks = {}; isolation = None; generated = {}; package_captured = False
+    commands = []; cleanup_errors = []; failure = None; after = None; bracket = None; stable = False; package = None; tests = {}; lint = {}; apks = {}; isolation = None; host_controls = None; generated = {}; package_captured = False
     env = {**os.environ, 'JAVA_HOME': str(jdk), 'ANDROID_HOME': str(sdk), 'ANDROID_SDK_ROOT': str(sdk), 'ANDROID_NDK_HOME': str(ndk), 'KOTLIN_HOME': str(kotlin), 'PYTHONDONTWRITEBYTECODE': '1', 'PATH': str(jdk / 'bin') + os.pathsep + str(kotlin / 'bin') + os.pathsep + os.environ.get('PATH', '')}
     def caught(number, frame):
         nonlocal pending
@@ -301,6 +341,11 @@ def main():
         need(re.search(r'kotlinc-jvm\s+2\.2\.20\b', run('kotlin-version', [tools['kotlinc'], '-version'], 60)), 'Select the pinned Kotlin2.2.20 compiler')
         run('sdk-build', [tools['node'], 'scripts/build-native.mjs', 'android', '--abis=arm64-v8a', '--output-root=' + str(package_root)], 1800)
         generated = capture_package_files(package_root); package_captured = True
+        host_library = target / ('debug/libsapflow_ffi.' + ('dylib' if sys.platform == 'darwin' else 'so'))
+        jna = target / 'native-tooling/jna-5.19.1.jar'
+        need(all(path.is_file() and not path.is_symlink() and path.resolve() == path for path in (host_library, jna)), 'Current SDK builder host library and JNA required')
+        need(sha(jna) == JNA_SHA256, 'Existing SDK builder JNA checksum')
+        generated.update({str(path): fact(path) for path in (host_library, jna)})
         folder = package_root / 'android-arm64-v8a'; aar = folder / ('sapflow-' + version + '.aar')
         package = inspect_aar(aar)
         need(package['notices']['META-INF/LICENSE'] == sha(root / 'LICENSE') and package['notices']['META-INF/THIRD_PARTY_LICENSES.txt'] == sha(folder / 'THIRD_PARTY_LICENSES.txt'), 'Actual AAR/source dependency notices')
@@ -333,6 +378,35 @@ def main():
             paths = list((target / 'mobile-android/app/outputs/apk' / variant).glob('*.apk')); need(len(paths) == 1, 'One APK per variant')
             apks[variant] = dict(path=str(paths[0]), **inspect_apk(paths[0], package['nativeSHA256']))
             generated[str(paths[0])] = fact(paths[0])
+        host_source = None
+        for name in HOST_OWNER_SOURCES:
+            source = (root / name).read_bytes()
+            need(hashlib.sha256(source).hexdigest() == before['source'][name]['sha256'], 'Host owner source differs from captured input: ' + name)
+            if name == HOST_OWNER_SOURCES[-1]: host_source = source.decode('utf-8')
+        host_methods = host_test_methods(host_source)
+        gradle_home = Path(os.environ.get('GRADLE_USER_HOME') or Path.home() / '.gradle').resolve()
+        serialization = host_serialization_jars(gradle_home)
+        generated.update({str(path): fact(path) for path in serialization})
+        host_root = scratch / 'recording-owner-host'; host_root.mkdir(mode=0o700)
+        host_tmp = host_root / 'tmp'; host_tmp.mkdir(mode=0o700)
+        host_data = host_root / 'data'; host_data.mkdir(mode=0o700)
+        host_classes = host_root / 'classes.jar'; host_binary = host_root / 'controls.jar'
+        with ZipFile(aar) as archive:
+            with host_classes.open('xb') as stream: stream.write(zip_read(archive, 'classes.jar', 32 * 1024 * 1024))
+        need(sha(host_classes) == package['classesSHA256'], 'Host controls must use the actual fresh AAR classes')
+        generated[str(host_classes)] = fact(host_classes)
+        classpath = os.pathsep.join(str(path) for path in (host_classes, jna, *serialization, sdk / 'platforms/android-36/android.jar'))
+        run('host-owner-compile', [tools['kotlinc'], '-language-version', '2.2', '-api-version', '2.2', '-jvm-target', '17',
+            '-J-Djava.io.tmpdir=' + str(host_tmp), *[root / name for name in HOST_OWNER_SOURCES], '-cp', classpath,
+            '-include-runtime', '-d', host_binary], 180)
+        need(host_binary.is_file() and not host_binary.is_symlink(), 'Actual compiled host controls required')
+        generated[str(host_binary)] = fact(host_binary)
+        output = run('host-owner-controls', [jdk / 'bin/java', '-Djava.io.tmpdir=' + str(host_tmp),
+            '-Djna.library.path=' + str(host_library.parent), '-Duniffi.component.sapflow_ffi.libraryOverride=' + str(host_library),
+            '-cp', str(host_binary) + os.pathsep + classpath,
+            'dev.forgesworn.sapflow.broadcaster.RecordingCheckpointOwnerHostTestKt', host_data], 180)
+        host_controls = check_host_controls(output, host_methods)
+        host_controls['compiledSources'] = list(HOST_OWNER_SOURCES)
         controls = run('python-controls', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'mobile/android/tests', '-p', 'test_verify_qualification.py', '-v'], 120)
         need(re.findall(r'Ran (\d+) tests?', controls) == ['39'] and re.search(r'(?m)^OK$', controls), 'All39 artifact-verifier controls must pass')
         result = run('native-isolation', [sys.executable, '-B', 'mobile/android/verify-qualification.py', apks['qualification']['path'], aar, '--aapt2', aapt2, '--expected-aar-sha256', package['aarSHA256'], '--expected-native-sha256', package['nativeSHA256'], '--expect-pose-hook', '--release-apk', apks['release']['path'], '--expect-v4v-connector'], 120)
@@ -361,8 +435,8 @@ def main():
                 need(scratch.parent == target and scratch.name.startswith('sapflow-android-sdk-app-') and not scratch.is_symlink(), 'Owned raw-log scratch boundary')
                 shutil.rmtree(scratch)
             except BaseException as error: cleanup_errors.append('Scratch cleanup: ' + str(error))
-        passed = failure is None and stable and stopped and not cleanup_errors and pending is None and len(commands) == 9 and len(tests) == 2 and len(lint) == 3 and len(apks) == 3 and isolation is not None and not scratch.exists()
-        result = dict(schema='android-current-sdk-app-gate-v1', passed=passed, failure=failure, sourceUnchanged=stable, inputsBefore=before, inputsAtFinalReadbackStart=bracket, inputsAfter=after, generatedInputsBefore=generated, generatedInputsAfter=generated_after, package=package, tests=tests, lint=lint, apks=apks, nativeIsolation=isolation, commands=commands, cleanupErrors=cleanup_errors, childrenStopped=stopped, unconfirmedLaunchAttempt=unknown, activeOwnedPID=active['child'].pid if active else None, pendingSignal=pending, scratchRemoved=not scratch.exists(), actualStages=len(commands), expectedStages=9, expectedBuildStages=8, sdkBuiltFromCurrentSource=package is not None and any(row['label'] == 'sdk-build' and row['exit'] == 0 and row['closed'] for row in commands), allAbiSdkQualified=False, nativeEncoderQualified=False, presentationQualified=False, deviceActions=False, recorderAdoption=False, releaseQualified=False)
+        passed = failure is None and stable and stopped and not cleanup_errors and pending is None and len(commands) == 11 and host_controls is not None and len(tests) == 2 and len(lint) == 3 and len(apks) == 3 and isolation is not None and not scratch.exists()
+        result = dict(schema='android-current-sdk-app-gate-v1', passed=passed, failure=failure, sourceUnchanged=stable, inputsBefore=before, inputsAtFinalReadbackStart=bracket, inputsAfter=after, generatedInputsBefore=generated, generatedInputsAfter=generated_after, package=package, tests=tests, lint=lint, apks=apks, nativeIsolation=isolation, hostOwnerControls=host_controls, commands=commands, cleanupErrors=cleanup_errors, childrenStopped=stopped, unconfirmedLaunchAttempt=unknown, activeOwnedPID=active['child'].pid if active else None, pendingSignal=pending, scratchRemoved=not scratch.exists(), actualStages=len(commands), expectedStages=11, expectedBuildStages=10, sdkBuiltFromCurrentSource=package is not None and any(row['label'] == 'sdk-build' and row['exit'] == 0 and row['closed'] for row in commands), allAbiSdkQualified=False, nativeEncoderQualified=False, presentationQualified=False, deviceActions=False, recorderAdoption=False, releaseQualified=False)
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
         try:
             result['terminalPublication'] = dict(protocol='MASKED_PENDING_INSPECTION_AND_ATOMIC_PUBLICATION_V1', committed=True)

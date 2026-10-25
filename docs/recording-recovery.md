@@ -2052,8 +2052,11 @@ unqualified. Raw returned facts are retained.
 
 The public Android build gate requires all 84 named profile, generation, run and
 transfer controls in both JVM variants, alongside the complete app-test floors,
-package checks and 56 generated verifier controls. These are synthetic event and
-build checks. A concrete capture sink implementing both `EncodedSink` and
+package checks and 68 generated verifier controls. The same gate compiles and
+runs all 20 recording-owner controls against its fresh host SDK library and
+actual AAR classes, using synthetic compressed bytes and event facts with real
+host filesystem operations. These are host/event and build checks. A concrete
+capture sink implementing both `EncodedSink` and
 `AudioNativeAacWorker`, installed-component H/T and content qualification,
 application admission, presentation, durable recovery, sustained loss and device
 acceptance remain open. The legacy backend remains the default; none of the

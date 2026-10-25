@@ -332,4 +332,66 @@ class AndroidNativeSuiteBindingTests(unittest.TestCase):
             with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check(self.matrix(), required=required)
 
 
+class AndroidHostOwnerControlBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.methods = ['hostControl' + str(index) for index in range(20)]
+
+    def source(self, methods=None):
+        return 'val tests = listOf(' + ', '.join('::' + name for name in (self.methods if methods is None else methods)) + ')\n'
+
+    def output(self, methods=None, summary='SDK recording owner host controls passed: 20'):
+        rows = ['SDK recording owner host control passed: ' + name for name in (self.methods if methods is None else methods)]
+        if summary is not None: rows.append(summary)
+        return '\n'.join(rows) + '\n'
+
+    def test_host_source_requires_all_twenty_unique_named_controls(self):
+        self.assertEqual(driver.host_test_methods(self.source()), self.methods)
+
+    def test_missing_host_source_control_is_refused(self):
+        with self.assertRaises(RuntimeError): driver.host_test_methods(self.source(self.methods[:-1]))
+
+    def test_duplicate_host_source_control_is_refused(self):
+        with self.assertRaises(RuntimeError): driver.host_test_methods(self.source(self.methods[:-1] + [self.methods[0]]))
+
+    def test_multiple_or_computed_host_source_lists_are_refused(self):
+        for source in (self.source() + self.source(), 'val tests = listOf(*unboundControls)\n', 'val tests = listOf()\n'):
+            with self.subTest(source=source), self.assertRaises(RuntimeError): driver.host_test_methods(source)
+
+    def test_exact_real_host_control_output_preserves_host_only_scope(self):
+        result = driver.check_host_controls(self.output() + 'Harmless JVM diagnostic\n', driver.host_test_methods(self.source()))
+        self.assertEqual(result['controls'], self.methods); self.assertEqual(result['count'], 20)
+        self.assertEqual(result['scope'], 'SDK_HOST_FILESYSTEM_ONLY'); self.assertIs(result['passed'], True)
+        for field in ('nativeEncoderQualified', 'presentationQualified', 'deviceActions'): self.assertIs(result[field], False)
+
+    def test_missing_printed_control_cannot_be_repaired_by_twenty_summary(self):
+        for index in range(20):
+            methods = self.methods[:index] + self.methods[index + 1:]
+            with self.subTest(index=index), self.assertRaises(RuntimeError): driver.check_host_controls(self.output(methods), self.methods)
+
+    def test_replayed_printed_control_cannot_inflate_the_count(self):
+        for index in range(20):
+            methods = self.methods[:index] + [self.methods[index]] + self.methods[index:]
+            with self.subTest(index=index), self.assertRaises(RuntimeError): driver.check_host_controls(self.output(methods), self.methods)
+
+    def test_foreign_printed_control_with_unchanged_total_is_refused(self):
+        with self.assertRaises(RuntimeError): driver.check_host_controls(self.output(self.methods[:-1] + ['foreignControl']), self.methods)
+
+    def test_reordered_host_controls_are_refused(self):
+        with self.assertRaises(RuntimeError): driver.check_host_controls(self.output(list(reversed(self.methods))), self.methods)
+
+    def test_missing_duplicate_or_false_host_summary_is_refused(self):
+        for summary in (None, 'SDK recording owner host controls passed: 0', 'SDK recording owner host controls passed: 19',
+                        'SDK recording owner host controls passed: 20\nSDK recording owner host controls passed: 20'):
+            with self.subTest(summary=summary), self.assertRaises(RuntimeError): driver.check_host_controls(self.output(summary=summary), self.methods)
+
+    def test_skipped_or_failed_host_result_cannot_hide_behind_valid_output(self):
+        for outcome in ('skipped', 'failed', 'error'):
+            extra = 'SDK recording owner host control ' + outcome + ': ' + self.methods[0] + '\n'
+            with self.subTest(outcome=outcome), self.assertRaises(RuntimeError): driver.check_host_controls(self.output() + extra, self.methods)
+
+    def test_missing_or_repeated_expected_host_method_is_refused(self):
+        for methods in (self.methods[:-1], self.methods[:-1] + [self.methods[0]]):
+            with self.subTest(methods=methods), self.assertRaises(RuntimeError): driver.check_host_controls(self.output(), methods)
+
+
 if __name__ == '__main__': unittest.main()

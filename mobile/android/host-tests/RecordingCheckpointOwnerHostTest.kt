@@ -239,7 +239,7 @@ private fun prematureCheckedRunCannotReachRealSdkPush(base: Path) {
     f.owner.closeIncomplete(); assertEmptyUnverified(f)
     val video = fixture(base, intent = CaptureIntent.AudioVideo())
     val videoRun = AudioNativeAacRun(runOwner, 0)
-    refused { videoRun.beforeSample(video.owner, true) }
+    refused { videoRun.beforeSample(video.owner) }
     video.owner.closeIncomplete(); assertEmptyUnverified(video)
 }
 private fun oldFrontierAndClosedResultRemainImmutable(base: Path) {
