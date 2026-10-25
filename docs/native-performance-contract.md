@@ -142,7 +142,7 @@ The equivalent separate tick/send/output/queue/deadline/state sequence needs
 
 This changes call overhead rather than payload ownership. Direct encoder
 input makes one copy into Rust-owned sample storage; fanout shares immutable
-handles. RTMP copies the payload into FLV scratch and then chunked wire output.
+handles. RTMP writes the FLV prefix and payload directly into chunked wire output.
 Serialising the owned return and lifting it into a Kotlin byte array add two
 wire-byte copies. Partial acknowledgement-window assembly can add another,
 as can Android Annex-B to AVCC conversion when required. Reallocations, TLS

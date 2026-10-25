@@ -373,6 +373,59 @@ impl ChunkWriter {
             out.extend_from_slice(part);
         }
     }
+
+    pub(crate) fn write_parts(
+        &self,
+        out: &mut Vec<u8>,
+        csid: u8,
+        type_id: u8,
+        stream_id: u32,
+        timestamp: u32,
+        (first, second): (&[u8], &[u8]),
+    ) {
+        let csid = csid.clamp(2, 63);
+        let first = first.get(..EXTENDED as usize).unwrap_or(first);
+        let second_limit = EXTENDED as usize - first.len();
+        let second = second.get(..second_limit).unwrap_or(second);
+        let payload_len = first.len() + second.len();
+        let ts_field = timestamp.min(EXTENDED);
+        out.push(csid);
+        out.extend_from_slice(&ts_field.to_be_bytes()[1..]);
+        out.extend_from_slice(&(payload_len as u32).to_be_bytes()[1..]);
+        out.push(type_id);
+        out.extend_from_slice(&stream_id.to_le_bytes());
+        if ts_field == EXTENDED {
+            out.extend_from_slice(&timestamp.to_be_bytes());
+        }
+        let size = usize::try_from(self.chunk_size).unwrap_or(usize::MAX);
+        let mut first = first;
+        let mut second = second;
+        let mut remaining = payload_len;
+        let mut chunk_index = 0;
+        while remaining > 0 {
+            if chunk_index > 0 {
+                out.push(0xc0 | csid);
+                if ts_field == EXTENDED {
+                    out.extend_from_slice(&timestamp.to_be_bytes());
+                }
+            }
+            let mut chunk_remaining = remaining.min(size);
+            while chunk_remaining > 0 {
+                let from_first = !first.is_empty();
+                let part = if from_first { first } else { second };
+                let count = part.len().min(chunk_remaining);
+                out.extend_from_slice(&part[..count]);
+                if from_first {
+                    first = &first[count..];
+                } else {
+                    second = &second[count..];
+                }
+                remaining -= count;
+                chunk_remaining -= count;
+            }
+            chunk_index += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +464,42 @@ mod tests {
                     (ts, 9, 1)
                 );
                 assert_eq!(r.buffered(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn two_slice_writer_matches_concatenated_bytes() {
+        let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        for size in [1usize, 2, 3, 127, 128, 129, 4096] {
+            for prefix_len in [
+                0,
+                1,
+                2,
+                size - 1,
+                size,
+                size + 1,
+                size * 2 - 1,
+                size * 2,
+                size * 2 + 1,
+            ] {
+                let prefix: Vec<u8> = (0..prefix_len).map(|i| i as u8).collect();
+                for data_len in [0, data.len()] {
+                    let mut joined = prefix.clone();
+                    joined.extend_from_slice(&data[..data_len]);
+                    for ts in [0, 1, EXTENDED - 1, EXTENDED, u32::MAX] {
+                        let mut w = ChunkWriter::default();
+                        w.set_chunk_size(size as u32);
+                        let mut expected = Vec::new();
+                        w.write(&mut expected, 6, 9, 1, ts, &joined);
+                        let mut actual = Vec::new();
+                        w.write_parts(&mut actual, 6, 9, 1, ts, (&prefix, &data[..data_len]));
+                        assert_eq!(
+                            actual, expected,
+                            "size {size} prefix {prefix_len} data {data_len} ts {ts}"
+                        );
+                    }
+                }
             }
         }
     }

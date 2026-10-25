@@ -922,6 +922,162 @@ fn encrypted_fast_packet_count_refresh_aes256() {
 }
 
 #[test]
+fn encrypted_packet_count_refresh_bursts_and_lost_or_stale_responses() {
+    use sapflow_srt::crypto::{CryptoConfig, KeySize};
+    for size in [KeySize::Aes128, KeySize::Aes256] {
+        for (packet_gap_us, lose_first_response) in
+            [(1000, false), (100_000, false), (100_000, true)]
+        {
+            let now = Instant::now();
+            let mut crypto = CryptoConfig::new(b"scoped rotation test secret".to_vec(), size)
+                .expect("crypto config");
+            crypto.refresh_packets = 32;
+            crypto.preannounce_packets = 8;
+            let mut config = CallerConfig {
+                crypto: Some(crypto.clone()),
+                latency: Duration::from_millis(1),
+                ..CallerConfig::default()
+            };
+            config.send.bandwidth = 1_000_000;
+            let mut c = caller(config, now);
+            let mut listener = Listener::new(
+                Config {
+                    crypto: Some(crypto),
+                    require_encryption: true,
+                    latency: Duration::from_millis(1),
+                    ..Config::default()
+                },
+                now,
+            );
+            let mut enqueued = 0;
+            let mut next_payload_us = 0;
+            let mut delivered = Vec::new();
+            let mut requests: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut responses = Vec::new();
+            let mut key_flags = 0;
+            let mut id = None;
+            let mut lost = false;
+            let mut stale_response: Option<Vec<u8>> = None;
+            // Service timers every millisecond even in the slower control.
+            for us in (0..20_000_000).step_by(1000) {
+                let at = time(now, us);
+                c.handle_timeout(at);
+                listener.handle_timeout(at);
+                if c.is_connected() && enqueued < 128 && us >= next_payload_us {
+                    c.enqueue(at, vec![enqueued as u8; 188]).expect("queue");
+                    enqueued += 1;
+                    next_payload_us = us + packet_gap_us;
+                }
+                for _ in 0..8 {
+                    while let Some((_, bytes)) = c.poll_transmit(at) {
+                        match Packet::parse(&bytes).expect("own packet") {
+                            Packet::Control(ControlPacket {
+                                body:
+                                    Control::Other {
+                                        control_type: 0x7fff,
+                                        subtype: 3,
+                                        info: 0,
+                                        cif,
+                                    },
+                                ..
+                            }) => {
+                                if lose_first_response
+                                    && requests.last().is_some_and(|(_, old)| *old != cif)
+                                    && let Some(stale) = &stale_response
+                                {
+                                    c.handle_datagram(at, peer(), stale);
+                                }
+                                requests.push((us, cif));
+                            }
+                            Packet::Data(p) => {
+                                assert_ne!(p.key, 0, "no plaintext fallback");
+                                key_flags |= p.key;
+                            }
+                            _ => {}
+                        }
+                        listener.handle_datagram(at, source(), &bytes);
+                    }
+                    while let Some(event) = listener.poll_event() {
+                        match event {
+                            Event::Connect { id: conn, .. } => {
+                                id = Some(conn);
+                                assert!(listener.accept(conn, at));
+                            }
+                            Event::Data { payload, .. } => delivered.push(payload),
+                            Event::Closed { reason, .. } => panic!("closed: {reason:?}"),
+                        }
+                    }
+                    while let Some((_, bytes)) = listener.poll_transmit() {
+                        if let Packet::Control(ControlPacket {
+                            body:
+                                Control::Other {
+                                    control_type: 0x7fff,
+                                    subtype: 4,
+                                    info: 0,
+                                    cif,
+                                },
+                            ..
+                        }) = Packet::parse(&bytes).expect("own packet")
+                        {
+                            responses.push(cif);
+                            stale_response = Some(bytes.clone());
+                            if lose_first_response && !lost {
+                                lost = true;
+                                continue;
+                            }
+                        }
+                        c.handle_datagram(at, peer(), &bytes);
+                    }
+                    while let Some(event) = c.poll_event() {
+                        assert!(matches!(event, CallerEvent::Connected { .. }), "{event:?}");
+                    }
+                }
+                if delivered.len() == 128 && c.stats().send.acknowledged_packets == 128 {
+                    break;
+                }
+            }
+            assert_eq!(enqueued, 128);
+            assert_eq!(
+                delivered,
+                (0..128).map(|n| vec![n; 188]).collect::<Vec<_>>()
+            );
+            assert_eq!(key_flags, 3, "both key slots used");
+            assert!(requests.len() >= 4);
+            assert_eq!(requests.len(), responses.len());
+            assert!(
+                responses
+                    .iter()
+                    .all(|response| requests.iter().any(|(_, request)| request == response))
+            );
+            if packet_gap_us == 1000 {
+                assert_ne!(requests[0].1, requests[1].1);
+                assert!(requests[1].0 - requests[0].0 < 100_000);
+            }
+            if lose_first_response {
+                assert!(lost);
+                assert_eq!(requests[0].1, requests[1].1, "lost KM response retried");
+                assert!(requests[1].0 - requests[0].0 >= 100_000);
+                assert!(
+                    c.stats().send.invalid_controls > 0,
+                    "stale responses ignored"
+                );
+            }
+            assert_eq!(c.stats().send.encrypted_packets, 128);
+            assert_eq!(c.stats().send.acknowledged_packets, 128);
+            assert_eq!(c.stats().send.retransmitted_packets, 0);
+            assert!(c.stats().send.km_responses >= 4);
+            assert_eq!(c.stats().send.buffered_bytes, 0);
+            let stats = listener
+                .connection_stats(id.expect("connection"))
+                .expect("open");
+            assert_eq!(stats.decrypted, 128);
+            assert_eq!(stats.km_rejected, 0);
+            assert_eq!(stats.dropped, 0);
+        }
+    }
+}
+
+#[test]
 fn missing_and_wrong_secrets_never_connect_or_deliver() {
     use sapflow_srt::crypto::{CryptoConfig, KeySize};
     for case in 0..3 {

@@ -17,6 +17,7 @@ use sapflow_hls::playlist::{self, Chunk};
 use sapflow_hls::{PartLookup, Readiness};
 
 use crate::App;
+use crate::media_body::MediaBody;
 use crate::stream::LiveStream;
 
 /// Apple: hold a blocking request at most three target durations.
@@ -124,15 +125,21 @@ fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
-fn body(bytes: Bytes, content_type: &'static str, cache: &'static str) -> Response {
-    (
+fn body(bytes: impl Into<MediaBody>, content_type: &'static str, cache: &'static str) -> Response {
+    let bytes = bytes.into();
+    let length = bytes.len();
+    let mut response = (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, cache),
         ],
-        Body::from(bytes),
+        Body::new(bytes),
     )
-        .into_response()
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    response
 }
 
 fn stream_for(app: &App, event: &str) -> Option<Arc<LiveStream>> {
@@ -322,6 +329,9 @@ pub(crate) mod epoch_tests {
         }
         (
             Arc::new(App {
+                recording_limits: Arc::new(crate::recorder::RecordingLimits::new(
+                    config.max_publishers,
+                )),
                 publish_sessions: None,
                 config,
                 streams: Arc::new(Registry::default()),

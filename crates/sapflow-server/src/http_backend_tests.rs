@@ -80,6 +80,28 @@ impl Backends {
             }
         }
     }
+
+    fn full_range(&self, path: &str, expected: &Bytes) {
+        // Both HLS backends currently ignore Range and return the full 200.
+        for address in self.addresses {
+            for method in ["GET", "HEAD"] {
+                let response = Pending::with_headers(address, method, path, "Range: bytes=1-3\r\n")
+                    .response(method == "HEAD");
+                assert_eq!(response.status, 200);
+                assert_eq!(
+                    response.header("content-length"),
+                    expected.len().to_string()
+                );
+                assert!(!response.headers.contains_key("content-range"));
+                assert!(!response.headers.contains_key("transfer-encoding"));
+                if method == "GET" {
+                    assert_eq!(response.body.as_slice(), expected.as_ref());
+                } else {
+                    assert!(response.body.is_empty());
+                }
+            }
+        }
+    }
 }
 
 impl Drop for Backends {
@@ -104,6 +126,10 @@ struct Pending(BufReader<TcpStream>);
 
 impl Pending {
     fn new(address: SocketAddr, method: &str, path: &str) -> Self {
+        Self::with_headers(address, method, path, "")
+    }
+
+    fn with_headers(address: SocketAddr, method: &str, path: &str, headers: &str) -> Self {
         let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(2))
             .expect("bounded viewer connect");
         socket
@@ -114,7 +140,7 @@ impl Pending {
             .expect("write deadline");
         write!(
             socket,
-            "{method} {path} HTTP/1.1\r\nHost: fixture.invalid\r\nConnection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: fixture.invalid\r\nConnection: close\r\n{headers}\r\n"
         )
         .expect("viewer request");
         Self(BufReader::new(socket))
@@ -318,7 +344,17 @@ async fn both_http_backends_preserve_aac_terminal_and_retained_codec_epoch_bytes
             state.prefix.clone(),
             muxer.init().clone(),
             (part.id, part.data.clone()),
-            (segment.id, segment.data.clone()),
+            (segment.id, {
+                assert!(
+                    segment.data.chunks().len() > 1,
+                    "multi-part segment fixture"
+                );
+                let mut joined = Vec::with_capacity(segment.data.len());
+                for chunk in segment.data.chunks() {
+                    joined.extend_from_slice(chunk);
+                }
+                Bytes::from(joined) // Test oracle only; neither server joins media.
+            }),
         )
     };
     video.end();
@@ -344,6 +380,13 @@ async fn both_http_backends_preserve_aac_terminal_and_retained_codec_epoch_bytes
             .expect("AAC epoch part");
         (init_id, muxer.init().clone(), (part.id, part.data.clone()))
     };
+    backends.full_range(
+        &format!(
+            "/live/{EVENT}/{}",
+            playlist::segment_name(&prefix, av_segment.0)
+        ),
+        &av_segment.1,
+    );
     for (file, bytes) in [
         (playlist::init_name(&prefix), av_init),
         (playlist::part_name(&prefix, av_part.0), av_part.1),

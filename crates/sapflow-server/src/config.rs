@@ -43,9 +43,9 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            has no {token})
   SAPFLOW_SEGMENT_COUNT    segments kept in the playlist (default 24, min 7)
   SAPFLOW_HLS_MODE         low-latency (default) or whole; whole omits parts
-  SAPFLOW_HTTP_IMPL        hyper (default) or own: serve viewers from sapflow's
-                           own event loop instead of hyper on tokio
-  SAPFLOW_HTTP_THREADS     own event loop threads (default: one per core, 1..256)
+  SAPFLOW_HTTP_IMPL        own (default) or hyper: choose the viewer HTTP backend
+  SAPFLOW_HTTP_THREADS     own event loop threads (default: one per core, max 256)
+                           explicit values: 1..256
   SAPFLOW_RECORDINGS       record every show to this directory (unset: off)
   SAPFLOW_RECORD_SKIP      paths not to record, comma-separated; a trailing *
                            matches a prefix (live/event-loop-*)
@@ -392,9 +392,9 @@ impl Config {
         };
 
         let own_http_threads = match vals.get("SAPFLOW_HTTP_IMPL").map(String::as_str) {
-            None | Some("hyper") => None,
-            Some("own") => Some(match vals.get("SAPFLOW_HTTP_THREADS") {
-                None => std::thread::available_parallelism().map_or(4, |n| n.get()),
+            Some("hyper") => None,
+            None | Some("own") => Some(match vals.get("SAPFLOW_HTTP_THREADS") {
+                None => std::thread::available_parallelism().map_or(4, |n| n.get().min(256)),
                 Some(v) => v
                     .parse::<usize>()
                     .ok()
@@ -448,9 +448,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_impl_defaults_to_hyper_and_own_takes_a_thread_count() {
+    fn http_impl_defaults_to_own_and_hyper_is_explicit() {
         let open = ("SAPFLOW_OPEN_PUBLISH", "1");
-        assert_eq!(load(&[open], &[]).expect("default").own_http_threads, None);
+        assert!(
+            load(&[open], &[])
+                .expect("default")
+                .own_http_threads
+                .is_some_and(|n| (1..=256).contains(&n))
+        );
         assert_eq!(
             load(&[open, ("SAPFLOW_HTTP_IMPL", "hyper")], &[])
                 .expect("hyper")
@@ -476,15 +481,31 @@ mod tests {
             .own_http_threads,
             Some(3)
         );
-        assert!(load(&[open, ("SAPFLOW_HTTP_IMPL", "tokio")], &[]).is_err());
-        // Empty means unset, as for every setting.
         assert_eq!(
-            load(&[open, ("SAPFLOW_HTTP_IMPL", "")], &[])
-                .expect("empty")
+            load(&[open, ("SAPFLOW_HTTP_THREADS", "3")], &[])
+                .expect("default backend, explicit thread count")
                 .own_http_threads,
+            Some(3)
+        );
+        assert_eq!(
+            load(
+                &[open, ("SAPFLOW_HTTP_IMPL", "own")],
+                &["--http-impl=hyper"]
+            )
+            .expect("explicit reference backend overrides environment")
+            .own_http_threads,
             None
         );
+        assert!(load(&[open, ("SAPFLOW_HTTP_IMPL", "tokio")], &[]).is_err());
+        // Empty means unset, as for every setting.
+        assert!(
+            load(&[open, ("SAPFLOW_HTTP_IMPL", "")], &[])
+                .expect("empty")
+                .own_http_threads
+                .is_some_and(|n| (1..=256).contains(&n))
+        );
         for threads in ["0", "257", "many"] {
+            assert!(load(&[open, ("SAPFLOW_HTTP_THREADS", threads)], &[]).is_err());
             assert!(
                 load(
                     &[

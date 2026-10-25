@@ -3,8 +3,8 @@
 # recording.
 #
 # Needs ffmpeg and srt-live-transmit (Homebrew's ffmpeg has no SRT, so
-# ffmpeg encodes to stdout and srt-live-transmit, which is libsrt, sends it).
-# Builds sapflow, publishes a test signal, checks the playlists, decodes the
+# ffmpeg emits whole TS datagrams to srt-live-transmit's verified UDP input).
+# Builds sapflow unless SAPFLOW_BIN is supplied, checks playlists, decodes the
 # segments and parts, checks the publish and unpublish callbacks.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -13,6 +13,15 @@ for bin in ffmpeg ffprobe srt-live-transmit python3 curl; do
   command -v "$bin" >/dev/null || { echo "missing $bin" >&2; exit 1; }
 done
 
+# Test the preferred backend unless the caller explicitly selects Hyper.
+# Export once so the primary, encrypted and opt-in server launches agree.
+export SAPFLOW_HTTP_IMPL=${SAPFLOW_HTTP_IMPL:-own}
+if [ "$SAPFLOW_HTTP_IMPL" = own ]; then
+  export SAPFLOW_HTTP_THREADS=${SAPFLOW_HTTP_THREADS:-$(python3 -c 'import os; print(min(256, os.cpu_count() or 4))')}
+else
+  unset SAPFLOW_HTTP_THREADS
+fi
+
 HTTP=127.0.0.1:18888
 SRT_PORT=18890
 RTMP_PORT=11935
@@ -20,11 +29,47 @@ CB_PORT=18899
 EVENT=event-smoke
 WORK=$(mktemp -d)
 pids=()
-cleanup() { { for p in "${pids[@]}"; do kill "$p"; done; wait; } 2>/dev/null || true; rm -rf "$WORK"; }
+retire_child() {
+  local finished=$1 slot
+  for slot in "${!pids[@]}"; do [ "${pids[$slot]}" != "$finished" ] || unset 'pids[slot]'; done
+}
+wait_child() {
+  local finished=$1 code=0
+  wait "$finished" || code=$?
+  retire_child "$finished"
+  return "$code"
+}
+child_owned() { [ -n "$1" ] && [ "$(ps -o ppid= -p "$1" 2>/dev/null | tr -d ' ')" = "$$" ]; }
+cleanup() {
+  code=$?; trap - EXIT; set +e
+  owned=("${pids[@]:-}")
+  for ((slot=${#owned[@]}-1; slot>=0; slot--)); do
+    p=${owned[$slot]}; child_owned "$p" && kill -TERM "$p" 2>/dev/null
+  done
+  for _ in $(seq 1 50); do
+    alive=0
+    for p in "${owned[@]}"; do child_owned "$p" && alive=1; done
+    [ "$alive" = 1 ] || break
+    sleep 0.1
+  done
+  for p in "${owned[@]}"; do
+    [ -n "$p" ] || continue
+    child_owned "$p" && kill -KILL "$p" 2>/dev/null
+    wait_child "$p" 2>/dev/null
+  done
+  [ -n "${SMOKE_KEEP:-}" ] || rm -rf "$WORK"
+  exit "$code"
+}
 trap cleanup EXIT
-fail() { echo "FAIL: $*" >&2; echo "--- sapflow log" >&2; tail -20 "$WORK/sapflow.log" >&2; exit 1; }
+trap 'exit 130' INT
+trap 'exit 143' TERM
+fail() { echo "FAIL: $*" >&2; echo "--- sapflow log" >&2; [ ! -f "$WORK/sapflow.log" ] || tail -20 "$WORK/sapflow.log" >&2; exit 1; }
+echo "smoke work: $WORK"
+python3 scripts/srt-loss-udp.py free --udp 18890 18891 18892 $(seq 18900 18912)
+python3 -B scripts/smoke-media.py ports --tcp 18888 18887 18886 11935 18899
 
-cargo build -q
+if [ -z "${SAPFLOW_BIN:-}" ]; then cargo build -q; SAPFLOW_BIN=./target/debug/sapflow; fi
+[ -x "$SAPFLOW_BIN" ] || fail "SAPFLOW_BIN is not executable"
 cat > "$WORK/cb.py" <<'EOF'
 import http.server, sys
 class H(http.server.BaseHTTPRequestHandler):
@@ -42,46 +87,19 @@ SAPFLOW_CALLBACK_URL="http://127.0.0.1:$CB_PORT/api/public/live-events/{eventId}
 SAPFLOW_CALLBACK_SECRET=tok SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:$SRT_PORT \
 SAPFLOW_RTMP_ADDR=127.0.0.1:$RTMP_PORT SAPFLOW_RECORDINGS="$WORK/rec" SAPFLOW_RECORD_SKIP='live/event-norec' \
 SAPFLOW_RECONNECT_GRACE=4 SAPFLOW_HEALTH_INTERVAL=2 \
-./target/debug/sapflow > "$WORK/sapflow.log" 2>&1 & pids+=($!)
+"$SAPFLOW_BIN" > "$WORK/sapflow.log" 2>&1 & pids+=($!)
 sleep 1
 grep 'SRT listening' "$WORK/sapflow.log" | grep -q 'implementation="own"' || fail "SRT is not served by our own receiver"
 echo "ok   SRT served by our own receiver"
 
-pad_generated_ts() {
-  # file://con can discard its last short read. Keep synthetic fixture input
-  # whole TS packets and pad only with NULL packets to one 1316-byte chunk.
-  python3 -c '
-import os, sys
-pending = b""
-packets = 0
-while True:
-    chunk = os.read(sys.stdin.fileno(), 65536)
-    if not chunk:
-        break
-    pending += chunk
-    complete = len(pending) // 188 * 188
-    for at in range(0, complete, 188):
-        if pending[at] != 0x47:
-            raise SystemExit("generated fixture has invalid TS alignment")
-    sys.stdout.buffer.write(pending[:complete])
-    packets += complete // 188
-    pending = pending[complete:]
-if pending or not packets:
-    raise SystemExit("generated fixture ended without whole TS packets")
-for counter in range((-packets) % 7):
-    sys.stdout.buffer.write(bytes([0x47, 0x1f, 0xff, 0x10 | counter]) + b"\xff" * 184)
-sys.stdout.buffer.flush()
-'
+start_publish() { # streamid seconds UDP-input-port [SRT-port] [extra-options]
+  python3 -B scripts/smoke-media.py publish --seconds "$2" --port "$3" \
+    --uri "srt://127.0.0.1:${4:-$SRT_PORT}?streamid=$1&latency=2000${5:-}" &
+  publisher=$!; pids+=("$publisher")
 }
+publish() { start_publish "$@"; wait_child "$publisher"; }
 
-publish() { # streamid seconds
-  ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
-    -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
-    -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -c:a aac -b:a 128k \
-    -f mpegts - | pad_generated_ts | srt-live-transmit -q -a:no -chunk:1316 file://con "srt://127.0.0.1:$SRT_PORT?streamid=$1&latency=2000"
-}
-
-publish "publish:live/$EVENT:pub:secret" 25 > /dev/null 2>&1 & pids+=($!)
+start_publish "publish:live/$EVENT:pub:secret" 25 18900 > /dev/null 2>&1
 BASE="http://$HTTP/live/$EVENT"
 for _ in $(seq 1 40); do
   curl -sf "$BASE/index.m3u8" -o "$WORK/index.m3u8" && break; sleep 0.25
@@ -108,9 +126,11 @@ grep -q '"event":"publish","path":"live/event-smoke"' "$WORK/cb.log" || fail "no
 grep -q 'token=tok' "$WORK/cb.log" || fail "callback without token"
 echo "ok   publish callback"
 
-out=$(publish "publish:live/event-other:pub:wrong" 2 2>&1 || true)
+publish "publish:live/event-other:pub:wrong" 2 18901 > "$WORK/refusal.out" 2>&1 || true
+out=$(cat "$WORK/refusal.out")
 echo "$out" | grep -q 401 || fail "wrong password not refused: $out"
-out=$(publish "read:live/$EVENT" 2 2>&1 || true)
+publish "read:live/$EVENT" 2 18902 > "$WORK/refusal.out" 2>&1 || true
+out=$(cat "$WORK/refusal.out")
 echo "$out" | grep -q 400 || fail "read request not refused: $out"
 echo "ok   refusals (401 credentials, 400 read)"
 
@@ -130,6 +150,7 @@ for p in $(grep -o '[0-9a-f]*_part[0-9]*\.mp4' "$WORK/stream.m3u8"); do curl -s 
 ffmpeg -hide_banner -v error -xerror -i "$WORK/segs.mp4" -f null - || fail "segments do not decode"
 ffmpeg -hide_banner -v error -xerror -i "$WORK/parts.mp4" -f null - || fail "parts do not decode"
 for media in "$WORK/segs.mp4" "$WORK/parts.mp4"; do
+  python3 -B scripts/smoke-media.py cadence "$media" || fail "decoded video cadence"
   ffprobe -v error -show_streams -of json "$media" | python3 -c '
 import json, sys
 streams = json.load(sys.stdin)["streams"]
@@ -165,13 +186,15 @@ grep -q '"segmentDuration":"[0-9.]*"' "$WORK/cb.log" || fail "no segmentDuration
 ffmpeg -hide_banner -v error -xerror -i "$rec" -f null - || fail "recording does not decode"
 echo "ok   recording ($(basename "$rec"), recordSegmentComplete)"
 
-rtmp() { # key seconds
+start_rtmp() { # key seconds
   ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
     -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
     -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -c:a aac -b:a 128k \
-    -f flv "rtmp://127.0.0.1:$RTMP_PORT/live/$1"
+    -f flv "rtmp://127.0.0.1:$RTMP_PORT/live/$1" &
+  publisher=$!; pids+=("$publisher")
 }
-rtmp "event-norec?user=pub&pass=secret" 8 > /dev/null 2>&1 & pids+=($!)
+rtmp() { start_rtmp "$@"; wait_child "$publisher"; }
+start_rtmp "event-norec?user=pub&pass=secret" 8 > /dev/null 2>&1
 for _ in $(seq 1 40); do
   curl -sf "http://$HTTP/live/event-norec/index.m3u8" -o /dev/null && break; sleep 0.25
 done
@@ -190,17 +213,18 @@ echo "ok   RTMP publish, refusal, takeover, callbacks; skipped path not recorded
 # the same playlist (same chunk names, after a discontinuity) and the same
 # recording; v4v still hears unpublish and publish.
 R=event-resume
-publish "publish:live/$R:pub:secret" 8 > /dev/null 2>&1
+publish "publish:live/$R:pub:secret" 8 18903 > /dev/null 2>&1
 for _ in $(seq 1 20); do grep -q "\"unpublish\",\"path\":\"live/$R\"" "$WORK/cb.log" && break; sleep 0.25; done
 grep -q "\"unpublish\",\"path\":\"live/$R\"" "$WORK/cb.log" || fail "no unpublish at the drop"
 curl -sf "http://$HTTP/live/$R/stream.m3u8" -o "$WORK/held.m3u8" || fail "held stream not served"
 init=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/held.m3u8")
 python3 -I scripts/check-playlist.py "http://$HTTP/live/$R/stream.m3u8" 12 > "$WORK/resume-check.log" 2>&1 & check=$!
-publish "publish:live/$R:pub:secret" 8 > /dev/null 2>&1
+pids+=("$check")
+publish "publish:live/$R:pub:secret" 8 18904 > /dev/null 2>&1
 curl -sf "http://$HTTP/live/$R/stream.m3u8" -o "$WORK/resumed.m3u8" || fail "resumed stream not served"
 grep -q "$init" "$WORK/resumed.m3u8" || fail "reconnect did not keep the chunk names"
 grep -q '^#EXT-X-DISCONTINUITY$' "$WORK/resumed.m3u8" || fail "no discontinuity at the reconnect"
-wait $check || { cat "$WORK/resume-check.log" >&2; fail "playlist rules broken across the reconnect"; }
+wait_child "$check" || { cat "$WORK/resume-check.log" >&2; fail "playlist rules broken across the reconnect"; }
 [ "$(grep -c "\"publish\",\"path\":\"live/$R\"" "$WORK/cb.log")" = 2 ] || fail "expected two publish callbacks"
 for _ in $(seq 1 30); do grep -q "recordSegmentComplete\",\"path\":\"live/$R\"" "$WORK/cb.log" && break; sleep 0.5; done
 [ "$(grep -c "recordSegmentComplete\",\"path\":\"live/$R\"" "$WORK/cb.log")" = 1 ] || fail "expected one recording across the reconnect"
@@ -213,11 +237,11 @@ echo "ok   reconnect within grace: same playlist, discontinuity, one recording (
 # The same publisher connecting again takes its stream over, as mediamtx's
 # overridePublisher does: an encoder that changed network must not wait for
 # its old connection to time out.
-publish "publish:live/event-take:pub:secret" 10 > /dev/null 2>&1 & pids+=($!)
+start_publish "publish:live/event-take:pub:secret" 10 18905 > /dev/null 2>&1
 for _ in $(seq 1 40); do
   curl -sf "http://$HTTP/live/event-take/index.m3u8" -o /dev/null && break; sleep 0.25
 done
-publish "publish:live/event-take:pub:secret" 3 > /dev/null 2>&1 || true
+publish "publish:live/event-take:pub:secret" 3 18906 > /dev/null 2>&1 || true
 grep -q 'path=live/event-take.*publisher replaced by a new connection\|publisher replaced by a new connection path=live/event-take' "$WORK/sapflow.log" \
   || fail "second connection did not take the stream over"
 grep -q 'replaced publisher closed path=live/event-take' "$WORK/sapflow.log" \
@@ -229,16 +253,12 @@ echo "ok   the same publisher reconnecting takes its stream over"
 ESRT=18891 EHTTP=127.0.0.1:18887 PASS_E=smoke-passphrase-1
 SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret \
 SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
-SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-enc.log" 2>&1 & pids+=($!)
+SAPFLOW_RTMP_ADDR=off "$SAPFLOW_BIN" > "$WORK/sapflow-enc.log" 2>&1 & pids+=($!)
 sleep 1
 grep -q 'encryption="required"' "$WORK/sapflow-enc.log" || fail "encrypted server did not start"
-epublish() { # streamid seconds extra-srt-options
-  ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=1280x720:rate=30 \
-    -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$2" -pix_fmt yuv420p \
-    -c:v libx264 -preset veryfast -tune zerolatency -g 30 -b:v 2500k -c:a aac -b:a 128k \
-    -f mpegts - | pad_generated_ts | srt-live-transmit -q -a:no -chunk:1316 file://con "srt://127.0.0.1:$ESRT?streamid=$1&latency=2000$3"
-}
-epublish "publish:live/event-enc:pub:secret" 10 "&passphrase=$PASS_E&pbkeylen=16" > /dev/null 2>&1 & pids+=($!)
+epublish() { publish "$1" "$2" "$4" "$ESRT" "$3"; }
+start_epublish() { start_publish "$1" "$2" "$4" "$ESRT" "$3"; }
+start_epublish "publish:live/event-enc:pub:secret" 10 "&passphrase=$PASS_E&pbkeylen=16" 18907 > /dev/null 2>&1
 for _ in $(seq 1 60); do
   curl -sf "http://$EHTTP/live/event-enc/stream.m3u8" -o "$WORK/enc.m3u8" && grep -q _seg "$WORK/enc.m3u8" && break; sleep 0.25
 done
@@ -247,8 +267,8 @@ einit=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/enc.m3u8")
 curl -s "http://$EHTTP/live/event-enc/$einit" > "$WORK/enc.mp4"
 for s in $(grep '_seg' "$WORK/enc.m3u8"); do curl -s "http://$EHTTP/live/event-enc/$s" >> "$WORK/enc.mp4"; done
 ffmpeg -hide_banner -v error -xerror -i "$WORK/enc.mp4" -f null - || fail "encrypted stream does not decode"
-epublish "publish:live/event-plain:pub:secret" 3 "" > /dev/null 2>&1 || true
-epublish "publish:live/event-wrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" > /dev/null 2>&1 || true
+epublish "publish:live/event-plain:pub:secret" 3 "" 18908 > /dev/null 2>&1 || true
+epublish "publish:live/event-wrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" 18909 > /dev/null 2>&1 || true
 for e in event-plain event-wrong; do
   [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/$e/index.m3u8")" = 404 ] || fail "$e was accepted"
 done
@@ -261,27 +281,27 @@ echo "ok   SRT passphrase: encrypted publish plays; none or a wrong one refused"
 ESRT=18892 EHTTP=127.0.0.1:18886
 SAPFLOW_PUBLISH_USER=pub SAPFLOW_PUBLISH_PASS=secret SAPFLOW_SRT_ENCRYPTION=optional \
 SAPFLOW_SRT_PASSPHRASE="$PASS_E" SAPFLOW_HTTP_ADDR=$EHTTP SAPFLOW_SRT_ADDR=127.0.0.1:$ESRT \
-SAPFLOW_RTMP_ADDR=off ./target/debug/sapflow > "$WORK/sapflow-opt.log" 2>&1 & opt=$!; pids+=($opt)
+SAPFLOW_RTMP_ADDR=off "$SAPFLOW_BIN" > "$WORK/sapflow-opt.log" 2>&1 & opt=$!; pids+=($opt)
 sleep 1
 grep -q 'encryption="optional"' "$WORK/sapflow-opt.log" || fail "optional-encryption server did not start"
-epublish "publish:live/event-optplain:pub:secret" 8 "" > /dev/null 2>&1 & pids+=($!)
-epublish "publish:live/event-optenc:pub:secret" 8 "&passphrase=$PASS_E" > /dev/null 2>&1 & pids+=($!)
+start_epublish "publish:live/event-optplain:pub:secret" 8 "" 18910 > /dev/null 2>&1
+start_epublish "publish:live/event-optenc:pub:secret" 8 "&passphrase=$PASS_E" 18911 > /dev/null 2>&1
 for e in event-optplain event-optenc; do
   for _ in $(seq 1 60); do
     curl -sf "http://$EHTTP/live/$e/stream.m3u8" -o "$WORK/$e.m3u8" && grep -q _seg "$WORK/$e.m3u8" && break; sleep 0.25
   done
   grep -qs _seg "$WORK/$e.m3u8" || { tail -20 "$WORK/sapflow-opt.log" >&2; fail "$e never became a stream"; }
 done
-epublish "publish:live/event-optwrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" > /dev/null 2>&1 || true
+epublish "publish:live/event-optwrong:pub:secret" 3 "&passphrase=not-the-passphrase&pbkeylen=16" 18912 > /dev/null 2>&1 || true
 [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$EHTTP/live/event-optwrong/index.m3u8")" = 404 ] || fail "wrong passphrase accepted with optional encryption"
 echo "ok   SRT optional encryption: with and without the passphrase play; a wrong one refused"
 
 # SIGTERM (docker stop, systemd) is handled: a clean exit, not the signal's
 # default kill (status 143), which a container's first process would not get.
 kill -TERM "$opt"
-for _ in $(seq 1 30); do kill -0 "$opt" 2>/dev/null || break; sleep 0.1; done
-kill -0 "$opt" 2>/dev/null && fail "SIGTERM did not stop the server within 3 s"
-rc=0; wait "$opt" || rc=$?
+for _ in $(seq 1 30); do child_owned "$opt" || break; sleep 0.1; done
+child_owned "$opt" && fail "SIGTERM did not stop the server within 3 s"
+rc=0; wait_child "$opt" || rc=$?
 [ "$rc" = 0 ] || fail "SIGTERM was not handled (exit status $rc)"
 echo "ok   SIGTERM stops the server cleanly"
 echo "PASS"

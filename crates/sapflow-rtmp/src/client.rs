@@ -25,9 +25,8 @@ const MAX_CONFIG_STRING: usize = 4096;
 const MIN_ACK_WINDOW: u32 = 4096;
 
 /// Per-connection payload bounds, excluding output transferred to the caller.
-/// Input includes incomplete chunks and all partially assembled messages. A
-/// reusable FLV assembly buffer additionally retains at most `max_media_bytes`
-/// of payload. Allocator capacities and chunk-header state are additional costs.
+/// Input includes incomplete chunks and all partially assembled messages.
+/// Allocator capacities and chunk-header state are additional costs.
 #[derive(Clone)]
 pub struct PublisherConfig {
     /// The RTMP application name (the `app` property of `connect`).
@@ -205,7 +204,6 @@ pub struct Publisher {
     peer_limit_type: Option<u8>,
     blocked_since_ms: Option<u64>,
     media_output_since_ms: Option<u64>,
-    flv_scratch: Vec<u8>,
     c1: Option<Box<[u8; PACKET]>>,
     stream_id: u32,
     started_ms: u64,
@@ -270,7 +268,6 @@ impl Publisher {
             peer_limit_type: None,
             blocked_since_ms: None,
             media_output_since_ms: None,
-            flv_scratch: Vec::new(),
             c1: Some(c1),
             stream_id: 0,
             started_ms: now_ms,
@@ -772,7 +769,6 @@ impl Publisher {
         self.handshake_output_bytes = 0;
         self.blocked_since_ms = None;
         self.media_output_since_ms = None;
-        self.flv_scratch = Vec::new();
         self.c1 = None;
         self.reader = ChunkReader::new(self.config.max_input_bytes);
         self.config.stream_key = String::new();
@@ -1047,21 +1043,13 @@ impl Publisher {
         {
             return Err(ClientError::Backpressure);
         }
-        // One reusable FLV assembly and one chunk-output copy. Native performance
-        // qualification must account for both; no zero-copy claim is made here.
-        self.flv_scratch.clear();
-        if self.flv_scratch.capacity() < size {
-            self.flv_scratch.reserve_exact(size);
-        }
-        self.flv_scratch.extend_from_slice(prefix);
-        self.flv_scratch.extend_from_slice(data);
-        self.writer.write(
+        self.writer.write_parts(
             &mut self.output,
             csid,
             kind,
             self.stream_id,
             timestamp,
-            &self.flv_scratch,
+            (prefix, data),
         );
         self.media_output_since_ms.get_or_insert(self.last_now_ms);
         Ok(())
@@ -2093,12 +2081,131 @@ mod tests {
         let capacity = output.capacity();
         assert!(publisher.recycle_output(output));
         assert_eq!(publisher.output.capacity(), capacity);
-        let scratch_capacity = publisher.flv_scratch.capacity();
         publisher.send_avc(21, 0, false, &[1, 2]).expect("reuse");
-        assert_eq!(publisher.flv_scratch.capacity(), scratch_capacity);
         assert_eq!(publisher.output.capacity(), capacity);
         publisher.cancel();
-        assert_eq!(publisher.flv_scratch.capacity(), 0);
+        assert_eq!(publisher.output.capacity(), 0);
         assert!(!publisher.recycle_output(Vec::with_capacity(16)));
+    }
+
+    #[test]
+    #[ignore = "bounded manual microbenchmark; run in release with --ignored --nocapture"]
+    fn publisher_media_microbenchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        const ITERATIONS: u32 = 10_000;
+
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Aac,
+            Avc { keyframe: bool },
+        }
+        #[derive(Clone, Copy)]
+        struct Workload {
+            name: &'static str,
+            kind: Kind,
+            payload_bytes: usize,
+        }
+        struct Measurement {
+            elapsed_ns: u128,
+            output_bytes: u64,
+            checksum: u64,
+        }
+
+        fn checksum(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            })
+        }
+
+        fn measure(workload: Workload, iterations: u32) -> Measurement {
+            let mut publisher = client();
+            publish_independently(&mut publisher, 7);
+            publisher.send_avc_config(&[1, 2]).expect("AVC config");
+            publisher
+                .send_aac_config(&[0x12, 0x10])
+                .expect("AAC config");
+            let setup = publisher.take_output();
+            assert!(publisher.recycle_output(setup));
+            let payload: Vec<u8> = (0..workload.payload_bytes)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                .collect();
+            let message_size = payload.len()
+                + match workload.kind {
+                    Kind::Aac => 2,
+                    Kind::Avc { .. } => 5,
+                };
+            let expected_wire = publisher.wire_size(message_size, iterations - 1);
+            let started = Instant::now();
+            let mut output_bytes = 0u64;
+            let mut last = Vec::new();
+            for sequence in 0..iterations {
+                match workload.kind {
+                    Kind::Aac => publisher
+                        .send_aac(black_box(sequence), black_box(&payload))
+                        .expect("AAC media"),
+                    Kind::Avc { keyframe } => publisher
+                        .send_avc(black_box(sequence), 0, keyframe, black_box(&payload))
+                        .expect("AVC media"),
+                }
+                let output = publisher.take_output();
+                output_bytes += black_box(output.len()) as u64;
+                if sequence + 1 == iterations {
+                    last = output;
+                } else {
+                    assert!(publisher.recycle_output(output));
+                }
+            }
+            let elapsed_ns = started.elapsed().as_nanos();
+            assert_eq!(last.len(), expected_wire, "complete final wire message");
+            assert_eq!(
+                output_bytes,
+                expected_wire as u64 * u64::from(iterations),
+                "all wire messages"
+            );
+            let checksum = checksum(&last);
+            assert!(publisher.recycle_output(last));
+            Measurement {
+                elapsed_ns,
+                output_bytes,
+                checksum,
+            }
+        }
+
+        println!(
+            "{{\"kind\":\"method\",\"synthetic_payloads\":true,\"architecture\":\"{}\",\"debug_assertions\":{},\"iterations\":{},\"timing\":\"send, take and recycle; excludes setup, payload generation, warm-up and checksum\"}}",
+            std::env::consts::ARCH,
+            cfg!(debug_assertions),
+            ITERATIONS,
+        );
+        for workload in [
+            Workload {
+                name: "aac-32",
+                kind: Kind::Aac,
+                payload_bytes: 32,
+            },
+            Workload {
+                name: "avc-8500",
+                kind: Kind::Avc { keyframe: false },
+                payload_bytes: 8_500,
+            },
+            Workload {
+                name: "avc-idr-524288",
+                kind: Kind::Avc { keyframe: true },
+                payload_bytes: 512 * 1024,
+            },
+        ] {
+            black_box(measure(workload, 16));
+            let measured = measure(workload, ITERATIONS);
+            println!(
+                "{{\"workload\":\"{}\",\"iterations\":{},\"elapsed_ns\":{},\"ns_per_message\":{:.3},\"output_bytes\":{},\"last_fnv1a64\":\"{:016x}\"}}",
+                workload.name,
+                ITERATIONS,
+                measured.elapsed_ns,
+                measured.elapsed_ns as f64 / f64::from(ITERATIONS),
+                measured.output_bytes,
+                measured.checksum,
+            );
+        }
     }
 }
