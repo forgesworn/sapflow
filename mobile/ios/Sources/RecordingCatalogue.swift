@@ -3,10 +3,11 @@ import Darwin
 import CryptoKit
 
 /// App-private local metadata and bounded copies. All filesystem methods run
-/// on one cold IO owner. No deletion, repair, media decoding or publication.
+/// on one cold IO owner. Explicit checkpoint recovery creates a separate,
+/// unverified prefix; it never deletes originals or decodes media.
 final class RecordingCatalogue {
     enum Failure: Error, Equatable { case busy, capacity, unsafe, changed, ineligible, cancelled, io, closed }
-    enum State: String { case writing, finalised, incomplete, orphanUnverified }
+    enum State: String { case writing, finalised, incomplete, recovered, orphanUnverified }
     enum Completion: String, Codable { case finalised, incomplete }
     enum Location: String { case privateRecording, legacyDocuments }
     enum Container: String, Codable { case mov, m4a }
@@ -122,6 +123,47 @@ final class RecordingCatalogue {
         }
     }
     struct AppendBindings: Equatable { let recording: Data; let sourceFile: Data }
+    /// Persistent storage provenance, never source EOF or producer finalisation.
+    struct RecoveryOrigin: Codable, Equatable {
+        let version: Int
+        let source: Identity
+        let recordingBinding: Data
+        let sourceFileBinding: Data
+        let sequence: UInt32
+        let checkpointSHA256: Data
+        let headerBytes: UInt32
+        let fragmentBytes: UInt64
+        let headerSHA256: Data
+        let fragmentSHA256: Data
+        let outputSHA256: Data
+        fileprivate var valid: Bool {
+            version == 1 && sequence > 0 && (1...65_536).contains(headerBytes) && fragmentBytes > 0 &&
+                fragmentBytes <= UInt64(Int64.max) - UInt64(headerBytes) &&
+                [recordingBinding, sourceFileBinding, checkpointSHA256, headerSHA256, fragmentSHA256, outputSHA256].allSatisfy { $0.count == 32 } &&
+                (try? Identity(segmentID: source.segmentID, showID: source.showID, segmentIndex: source.segmentIndex,
+                               profileID: source.profileID, container: source.container)) != nil
+        }
+    }
+    struct RecoveredPrefix {
+        let entry: Entry
+        let reused: Bool
+    }
+    private static func recoveryID(sourceFileBinding: Data, checkpointSHA256: Data) -> String {
+        var key = Data("sapflow.recovered-prefix.v1\0".utf8)
+        key.append(sourceFileBinding); key.append(checkpointSHA256)
+        let text = SHA256.hash(data: key).prefix(16).map { String(format: "%02x", $0) }.joined()
+        return String(text.prefix(8)) + "-" + String(text.dropFirst(8).prefix(4)) + "-" +
+            String(text.dropFirst(12).prefix(4)) + "-" + String(text.dropFirst(16).prefix(4)) + "-" + String(text.suffix(12))
+    }
+    /// Storage recipe supplied by the real SDK composition. These scalars do
+    /// not constitute a public eligibility/EOF or producer-completion token.
+    struct RecoveryRecipe {
+        let sequence: UInt32
+        let checkpointSHA256: Data
+        let header: Data
+        let fragmentBytes: UInt64
+        let fragmentSHA256: Data
+    }
     private struct Receipt: Codable {
         let version: Int
         let identity: Identity
@@ -130,11 +172,12 @@ final class RecordingCatalogue {
         let durationMs: Int64?
         let file: Fingerprint?
         let appendSource: AppendSource?
+        let recovery: RecoveryOrigin?
         init(version: Int, identity: Identity, state: String, createdAtMs: Int64,
-             durationMs: Int64?, file: Fingerprint?, appendSource: AppendSource? = nil) {
+             durationMs: Int64?, file: Fingerprint?, appendSource: AppendSource? = nil, recovery: RecoveryOrigin? = nil) {
             self.version = version; self.identity = identity; self.state = state
             self.createdAtMs = createdAtMs; self.durationMs = durationMs
-            self.file = file; self.appendSource = appendSource
+            self.file = file; self.appendSource = appendSource; self.recovery = recovery
         }
     }
     private struct Directory {
@@ -178,6 +221,11 @@ final class RecordingCatalogue {
         let rename: (Int32, String, String) -> Int32
         let synchronizeDirectory: (Int32) -> Int32
         let read: (Int32, UnsafeMutableRawPointer, Int) -> Int
+        // Checkpoints replace their alternating slots. Recovery publication is
+        // different: another occupied name must never be overwritten.
+        var renameExclusive: (Int32, String, String) -> Int32 = {
+            Darwin.renameatx_np($0, $1, $0, $2, UInt32(RENAME_EXCL))
+        }
         static let native = CheckpointIO(write: { Darwin.write($0, $1, $2) }, synchronize: Darwin.fsync,
             rename: { Darwin.renameat($0, $1, $0, $2) }, synchronizeDirectory: Darwin.fsync,
             read: { Darwin.read($0, $1, $2) })
@@ -347,18 +395,53 @@ final class RecordingCatalogue {
         guard data.count <= Self.maxReceipt else { throw Failure.capacity }; return data
     }
     private func decode(_ bytes: Data, _ id: String) -> Receipt? {
-        guard let receipt = try? JSONDecoder().decode(Receipt.self, from: bytes), receipt.version == 1,
+        Self.decodeReceipt(bytes, expectedID: id)
+    }
+    private static func decodeReceipt(_ bytes: Data, expectedID: String? = nil) -> Receipt? {
+        // Foundation's keyed decoder can trap on invalid UTF-8 or unpaired
+        // escaped key surrogates. Bound direct input before any byte
+        // traversal: the disk reader's cap must not be this entry's only work
+        // bound. Then validate the bounded UTF-8 JSON object before typed
+        // decoding, without repairing or replacing the original bytes.
+        // Foundation accepts some malformed UTF-8 here, then its keyed decoder
+        // can trap while materialising a nested key. Validate with the standard
+        // library's strict transcoder before either Foundation parser sees it.
+        guard bytes.count <= maxReceipt else { return nil }
+        let malformedUTF8 = transcode(bytes.makeIterator(), from: UTF8.self, to: UTF8.self,
+                                      stoppingOnError: true, into: { _ in })
+        guard !malformedUTF8,
+              let syntax = try? JSONSerialization.jsonObject(with: bytes), syntax is [String: Any],
+              let receipt = try? JSONDecoder().decode(Receipt.self, from: bytes),
               let validated = try? Identity(segmentID: receipt.identity.segmentID, showID: receipt.identity.showID,
                                             segmentIndex: receipt.identity.segmentIndex, profileID: receipt.identity.profileID, container: receipt.identity.container),
-              validated.segmentID == id, receipt.createdAtMs > 0,
-              ["writing", "finalised", "incomplete"].contains(receipt.state),
+              expectedID == nil || validated.segmentID == expectedID, receipt.createdAtMs > 0,
               receipt.durationMs.map({ $0 >= 0 }) ?? true,
-              (receipt.file == nil) == (receipt.durationMs == nil),
-              receipt.state != "finalised" || receipt.file != nil,
               receipt.file.map({ $0.size > 0 }) ?? true,
-              receipt.appendSource.map({ $0.valid }) ?? true,
-              (try? encode(receipt)) == bytes else { return nil }
+              receipt.appendSource.map({ $0.valid }) ?? true else { return nil }
+        if receipt.version == 1 {
+            guard receipt.recovery == nil, ["writing", "finalised", "incomplete"].contains(receipt.state),
+                  (receipt.file == nil) == (receipt.durationMs == nil),
+                  receipt.state != "finalised" || receipt.file != nil else { return nil }
+        } else if receipt.version == 2 {
+            guard receipt.state == "recovered", receipt.durationMs == nil, receipt.file != nil,
+                  receipt.appendSource == nil, let origin = receipt.recovery, origin.valid,
+                  origin.source.segmentID != receipt.identity.segmentID,
+                  receipt.identity.segmentID == recoveryID(sourceFileBinding: origin.sourceFileBinding, checkpointSHA256: origin.checkpointSHA256),
+                  origin.source.showID == receipt.identity.showID,
+                  origin.source.segmentIndex == receipt.identity.segmentIndex,
+                  origin.source.profileID == receipt.identity.profileID,
+                  origin.source.container == receipt.identity.container,
+                  UInt64(receipt.file!.size) == UInt64(origin.headerBytes) + origin.fragmentBytes else { return nil }
+        } else { return nil }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard (try? encoder.encode(receipt)) == bytes else { return nil }
         return receipt
+    }
+    /// Pure bounded outside-receipt parser entry used by the metadata fuzzer.
+    /// It returns no file, eligibility or recovery capability.
+    static func checkRecoveryReceiptBytes(_ bytes: Data) -> Bool {
+        guard let receipt = decodeReceipt(bytes), receipt.version == 2 else { return false }
+        return receipt.recovery?.valid == true
     }
     private func receiptName(_ identity: Identity) -> String { "Sapflow-\(identity.segmentID).receipt.json" }
     private func writeReceipt(_ receipt: Receipt, fixedTemporary: String? = nil) throws {
@@ -967,6 +1050,31 @@ final class RecordingCatalogue {
         private enum Phase { case writing, updating, cancelled, finishing, closed }
         private var phase = Phase.writing
         private var cancelAfterUpdate = false
+        private var captureOwner: ObjectIdentifier?
+        private var captureGuard: NSLock?
+        private var capturePermit: CapturePermit?
+        /// Opaque once-only phase-cut token. No source facts, media or callback.
+        final class CapturePermit {
+            fileprivate let writer: ObjectIdentifier
+            fileprivate init(_ writer: Writer) { self.writer = ObjectIdentifier(writer) }
+        }
+        /// Actual legacy capture binds once. Unbound filesystem callers retain
+        /// their existing completion API; a bound writer cannot use it to finalise.
+        func bindCapture(owner: AnyObject, sourceGuard: NSLock) throws {
+            lock.lock(); defer { lock.unlock() }
+            guard phase == .writing, captureOwner == nil else { throw Failure.busy }
+            captureOwner = ObjectIdentifier(owner); captureGuard = sourceGuard
+        }
+        /// Concrete CaptureAdmission calls this under source loss -> admission
+        /// locks. Only scalar identity/phase work occurs under these locks.
+        func admitCaptureUnderSourceLocks(owner: AnyObject, sourceGuard: NSLock) -> CapturePermit? {
+            lock.lock(); defer { lock.unlock() }
+            guard phase == .writing, captureOwner == ObjectIdentifier(owner),
+                  captureGuard === sourceGuard, capturePermit == nil else { return nil }
+            let permit = CapturePermit(self)
+            capturePermit = permit; phase = .finishing
+            return permit
+        }
         fileprivate init(catalogue: RecordingCatalogue, token: UUID, identity: Identity, createdAtMs: Int64) {
             self.catalogue = catalogue; self.token = token; self.identity = identity; self.createdAtMs = createdAtMs
         }
@@ -1097,10 +1205,24 @@ final class RecordingCatalogue {
         /// Invoke only after the real writer completed and owns no further IO.
         /// Prior append/backlog loss must select incomplete even if it completed.
         func complete(durationMs: Int64, outcome: Completion) throws {
+            try completeOwned(durationMs: durationMs, outcome: outcome, capture: nil)
+        }
+        func complete(durationMs: Int64, capture: CapturePermit) throws {
+            try completeOwned(durationMs: durationMs, outcome: .finalised, capture: capture)
+        }
+        private func completeOwned(durationMs: Int64, outcome: Completion, capture: CapturePermit?) throws {
             guard durationMs >= 0 else { throw Failure.unsafe }
             lock.lock()
-            guard phase == .writing else { lock.unlock(); throw Failure.cancelled }
-            phase = .finishing; lock.unlock()
+            if let capture {
+                guard phase == .finishing, capture.writer == ObjectIdentifier(self),
+                      capturePermit === capture else { lock.unlock(); throw Failure.cancelled }
+                capturePermit = nil
+            } else {
+                guard phase == .writing else { lock.unlock(); throw Failure.cancelled }
+                guard outcome != .finalised || captureOwner == nil else { lock.unlock(); throw Failure.ineligible }
+                phase = .finishing
+            }
+            lock.unlock()
             do {
                 let root = catalogue.root
                 guard let before = try catalogue.info(root, identity.filename), before.size > 0 else { throw Failure.ineligible }
@@ -1180,6 +1302,7 @@ final class RecordingCatalogue {
         else if receipt?.state == "writing" && active { state = .writing }
         else if file == nil || file?.size == 0 { state = .orphanUnverified }
         else if receipt?.state == "finalised" { state = receipt?.file == file ? .finalised : .orphanUnverified }
+        else if receipt?.state == "recovered" { state = receipt?.file == file ? .recovered : .orphanUnverified }
         else { state = .incomplete }
         return Entry(segmentID: id, identity: receipt?.identity, state: state, location: location,
                      bytes: UInt64(file?.size ?? 0), durationMs: receipt?.durationMs, createdAtMs: receipt?.createdAtMs,
@@ -1270,6 +1393,12 @@ final class RecordingCatalogue {
                 self.name = name; self.fd = fd; self.source = source; self.file = file
             }
         }
+        private final class RecoveryResource {
+            var name: String
+            let fd: Int32
+            var closeAttempted = false
+            init(name: String, fd: Int32) { self.name = name; self.fd = fd }
+        }
         private let catalogue: RecordingCatalogue
         private let token: UUID
         private let selected: Entry
@@ -1282,10 +1411,12 @@ final class RecordingCatalogue {
         private var inFlight = false
         private var use: Use?
         private var snapshotValue: Snapshot?
-        private var resources: [Resource] = [] // At most receipt + media + two slots.
+        private var resources: [Resource] = [] // Source4; a verified success retry adds its target/receipt2.
         private var metadata: [String: Data] = [:]
         private var absentSlots: [String] = []
         private var media: Resource?
+        private var recoveryResources: [RecoveryResource] = [] // At most target, receipt temp and receipt readback.
+        private var recoveryCloseUnknown = false
         fileprivate init(catalogue: RecordingCatalogue, token: UUID, selected: Entry, identity: Identity) {
             self.catalogue = catalogue; self.token = token; self.selected = selected; self.identity = identity
         }
@@ -1328,10 +1459,10 @@ final class RecordingCatalogue {
         private func checkTemporaries() throws {
             for name in temporaryNames { guard try catalogue.info(catalogue.root, name) == nil else { throw Failure.changed } }
         }
-        private func open(_ name: String, limit: Int) throws -> Resource {
+        private func open(_ name: String, limit: Int, maximumResources: Int = 4) throws -> Resource {
             try admission(); try checkRoot()
             let before = try catalogue.appendPath(name)
-            guard before.file.size >= 0, before.file.size <= Int64(limit), resources.count < 4 else { throw Failure.capacity }
+            guard before.file.size >= 0, before.file.size <= Int64(limit), resources.count < maximumResources else { throw Failure.capacity }
             let fd = openat(catalogue.root.fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
             guard fd >= 0 else { throw Failure.io }
             // Retain actual FD BEFORE fstat or any later throwing check.
@@ -1411,6 +1542,258 @@ final class RecordingCatalogue {
             }
             try recheck(); try checkUse(value, snapshot: snapshot)
             return HashFacts(currentHeaderSHA256: Data(SHA256.hash(data: header)), fragmentHashes: hashes)
+        }
+
+        private func closeRecovery(_ item: RecoveryResource) throws {
+            guard !item.closeAttempted else { throw Failure.closed }
+            item.closeAttempted = true
+            do { try catalogue.closeFD(item.fd) }
+            catch { recoveryCloseUnknown = true; throw error }
+        }
+        private func closeRecoveryOwners() throws {
+            var unknown: Error?
+            for item in recoveryResources.reversed() where !item.closeAttempted {
+                do { try closeRecovery(item) } catch { unknown = unknown ?? error }
+            }
+            for item in resources.reversed() where !item.closeAttempted {
+                item.closeAttempted = true
+                do { try catalogue.closeFD(item.fd) }
+                catch { recoveryCloseUnknown = true; unknown = unknown ?? error }
+            }
+            if let unknown { throw unknown }
+            if recoveryCloseUnknown { throw Failure.io }
+        }
+        private func endRecoveryLease() throws {
+            try catalogue.releaseCheckpointRead(token, child: self)
+            lock.lock(); phase = .closed; use = nil; lock.unlock()
+        }
+        private func recoveryEntry(identity: Identity, receipt: Receipt, bytes: Data,
+                                   receiptFile: Fingerprint, file: Fingerprint) -> Entry {
+            Entry(segmentID: identity.segmentID, identity: identity, state: .recovered,
+                  location: .privateRecording, bytes: UInt64(file.size), durationMs: nil,
+                  createdAtMs: receipt.createdAtMs, filename: identity.filename, file: file,
+                  receipt: bytes, receiptFile: receiptFile)
+        }
+        /// Concrete new-file operation on this SAME retained source Use/root
+        /// lease. The production front door is RecordingCheckpointProbe.recover,
+        /// which supplies real decoded/checksummed/physically verified facts.
+        /// This Foundation layer certifies storage/provenance only. Recovered
+        /// prefixes remain explicitly unverified and never producer-finalised.
+        func recover(_ value: Use, snapshot: Snapshot, recipe: RecoveryRecipe,
+                     maximumFragmentBytes: UInt64, cancelled: () -> Bool = { false },
+                     willPublish: () throws -> Void = {}) throws -> RecoveredPrefix {
+            try enterOperation(); defer { leaveOperation() }
+            lock.lock(); let exact = phase == .open && use === value && snapshotValue === snapshot; lock.unlock()
+            guard exact else { throw Failure.closed }
+            var publicationBegan = false
+            var publicationCut = false
+            func checkCancellation() throws {
+                guard !cancelled() else { self.cancel(); throw Failure.cancelled }
+                try admission()
+            }
+            func closeAndCheckSources() throws {
+                try checkCancellation(); try recheck()
+                for item in resources where metadata[item.name] != nil {
+                    guard try read(item, count: Int(item.file.size)) == metadata[item.name] else { throw Failure.changed }
+                }
+                try recheck(); try checkCancellation()
+                try closeRecoveryOwners() // Target AND all source/slot/receipt FDs, once.
+                try recheckNamespace(); try checkCancellation()
+            }
+            do {
+                try checkCancellation(); try recheck()
+                guard let media, recipe.sequence > 0, recipe.checkpointSHA256.count == 32,
+                      (1...65_536).contains(recipe.header.count), recipe.fragmentSHA256.count == 32,
+                      recipe.fragmentBytes > 0, recipe.fragmentBytes <= maximumFragmentBytes,
+                      recipe.fragmentBytes <= UInt64(Int64.max) - UInt64(recipe.header.count) else { throw Failure.capacity }
+                guard let selectedSlot = snapshot.slots[Int(recipe.sequence & 1)],
+                      Data(SHA256.hash(data: selectedSlot)) == recipe.checkpointSHA256 else { throw Failure.ineligible }
+                let length = UInt64(recipe.header.count) + recipe.fragmentBytes
+                guard length <= snapshot.mediaBytes else { throw Failure.capacity }
+                let headerHash = Data(SHA256.hash(data: recipe.header))
+                let id = RecordingCatalogue.recoveryID(sourceFileBinding: snapshot.bindings.sourceFile, checkpointSHA256: recipe.checkpointSHA256)
+                let destination = try Identity(segmentID: id, showID: identity.showID, segmentIndex: identity.segmentIndex,
+                                               profileID: identity.profileID, container: identity.container)
+                guard destination.segmentID != identity.segmentID else { throw Failure.changed }
+                let receiptName = catalogue.receiptName(destination)
+                let temporary = "Sapflow-\(id).receipt.tmp"
+                func origin(_ output: Data) -> RecoveryOrigin {
+                    RecoveryOrigin(version: 1, source: identity, recordingBinding: snapshot.bindings.recording,
+                        sourceFileBinding: snapshot.bindings.sourceFile, sequence: recipe.sequence,
+                        checkpointSHA256: recipe.checkpointSHA256, headerBytes: UInt32(recipe.header.count),
+                        fragmentBytes: recipe.fragmentBytes, headerSHA256: headerHash,
+                        fragmentSHA256: recipe.fragmentSHA256, outputSHA256: output)
+                }
+                for suffix in ["checkpoint.0", "checkpoint.1", "checkpoint.tmp", "receipt.tmp"] {
+                    guard try catalogue.info(catalogue.root, "Sapflow-\(id).\(suffix)") == nil else { throw Failure.changed }
+                }
+                let existingMedia = try catalogue.info(catalogue.root, destination.filename)
+                let existingReceipt = try catalogue.info(catalogue.root, receiptName)
+                let otherExtension = destination.filename.hasSuffix(".mov") ? "m4a" : "mov"
+                guard try catalogue.info(catalogue.root, "Sapflow-\(id).\(otherExtension)") == nil else { throw Failure.changed }
+                if existingMedia != nil || existingReceipt != nil {
+                    // Successful retries revalidate the actual same destination.
+                    // An interrupted, changed or occupied attempt is not adopted.
+                    guard existingMedia != nil, existingReceipt != nil else { throw Failure.changed }
+                    let stored = try open(receiptName, limit: RecordingCatalogue.maxReceipt, maximumResources: 6)
+                    let data = try read(stored, count: Int(stored.file.size)); metadata[receiptName] = data
+                    guard let receipt = catalogue.decode(data, id), receipt.version == 2, let saved = receipt.recovery,
+                          saved == origin(saved.outputSHA256), receipt.identity == destination else { throw Failure.changed }
+                    let output = try open(destination.filename, limit: Int.max, maximumResources: 6)
+                    guard output.file == receipt.file, UInt64(output.file.size) == length else { throw Failure.changed }
+                    var full = SHA256(), fragments = SHA256(), position: UInt64 = 0
+                    while position < length {
+                        try checkCancellation()
+                        let chunk = try read(output, count: Int(min(65_536, length - position)), offset: position)
+                        full.update(data: chunk)
+                        let from = Int(min(UInt64(chunk.count), UInt64(recipe.header.count) > position ? UInt64(recipe.header.count) - position : 0))
+                        if from < chunk.count { fragments.update(data: chunk.dropFirst(from)) }
+                        position += UInt64(chunk.count)
+                    }
+                    guard try read(output, count: recipe.header.count) == recipe.header,
+                          Data(full.finalize()) == saved.outputSHA256,
+                          Data(fragments.finalize()) == recipe.fragmentSHA256 else { throw Failure.changed }
+                    try closeAndCheckSources()
+                    let result = RecoveredPrefix(entry: recoveryEntry(identity: destination, receipt: receipt, bytes: data,
+                        receiptFile: stored.file, file: output.file), reused: true)
+                    try endRecoveryLease(); return result
+                }
+                guard try catalogue.scanEntries().count < RecordingCatalogue.maxSegments,
+                      let available = try catalogue.appendIO.availableBytes(catalogue.root.fd),
+                      available >= length + 262_144 else { throw Failure.capacity }
+                let createdAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                guard createdAtMs > 0 else { throw Failure.unsafe }
+                let fd = openat(catalogue.root.fd, destination.filename, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                guard fd >= 0 else { throw Failure.io }
+                let output = RecoveryResource(name: destination.filename, fd: fd); recoveryResources.append(output)
+                let created = try catalogue.appendDescriptor(fd)
+                guard created.file.size == 0, try catalogue.appendPath(output.name) == created else { throw Failure.changed }
+                var written: UInt64 = 0
+                func writeMedia(_ bytes: Data) throws {
+                    try bytes.withUnsafeBytes { buffer in
+                        var position = 0
+                        while position < buffer.count {
+                            try checkCancellation()
+                            let n = catalogue.appendIO.write(fd, buffer.baseAddress!.advanced(by: position), buffer.count - position)
+                            if n < 0 && errno == EINTR { continue }
+                            guard n > 0, n <= buffer.count - position else { throw Failure.io }
+                            position += n; written += UInt64(n)
+                        }
+                    }
+                    guard lseek(fd, 0, SEEK_CUR) == off_t(written) else { throw Failure.changed }
+                }
+                try writeMedia(recipe.header)
+                guard lseek(media.fd, off_t(recipe.header.count), SEEK_SET) == off_t(recipe.header.count) else { throw Failure.io }
+                var copied: UInt64 = 0, fragmentHasher = SHA256(), outputHasher = SHA256(), scratch = Data(count: 65_536)
+                outputHasher.update(data: recipe.header)
+                while copied < recipe.fragmentBytes {
+                    try checkCancellation(); try recheck()
+                    let count = Int(min(65_536, recipe.fragmentBytes - copied))
+                    let n = scratch.withUnsafeMutableBytes { catalogue.checkpointIO.read(media.fd, $0.baseAddress!, count) }
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0, n <= count else { throw Failure.io }
+                    try checkCancellation(); try recheck()
+                    let chunk = scratch.prefix(n); fragmentHasher.update(data: chunk); outputHasher.update(data: chunk)
+                    try writeMedia(chunk); copied += UInt64(n)
+                }
+                guard copied == recipe.fragmentBytes, written == length,
+                      Data(fragmentHasher.finalize()) == recipe.fragmentSHA256,
+                      catalogue.appendIO.synchronize(fd) == 0 else { throw Failure.changed }
+                let expectedOutput = Data(outputHasher.finalize()), completed = try catalogue.appendDescriptor(fd)
+                guard completed.source == created.source, completed.file.size == Int64(length),
+                      try catalogue.appendPath(output.name) == completed, lseek(fd, 0, SEEK_SET) == 0 else { throw Failure.changed }
+                var readback = SHA256(), checked: UInt64 = 0
+                while checked < length {
+                    try checkCancellation()
+                    let count = Int(min(65_536, length - checked))
+                    let n = scratch.withUnsafeMutableBytes { catalogue.checkpointIO.read(fd, $0.baseAddress!, count) }
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0, n <= count else { throw Failure.io }
+                    readback.update(data: scratch.prefix(n)); checked += UInt64(n)
+                }
+                guard Data(readback.finalize()) == expectedOutput, try catalogue.appendDescriptor(fd) == completed,
+                      try catalogue.appendPath(output.name) == completed else { throw Failure.changed }
+                try closeAndCheckSources() // Both data owners close BEFORE recovered metadata publication.
+                guard try catalogue.appendPath(output.name) == completed else { throw Failure.changed }
+                let receipt = Receipt(version: 2, identity: destination, state: "recovered", createdAtMs: createdAtMs,
+                    durationMs: nil, file: completed.file, recovery: origin(expectedOutput))
+                let encoded = try catalogue.encode(receipt)
+                try checkCancellation(); try recheckNamespace()
+                guard try catalogue.info(catalogue.root, receiptName) == nil,
+                      try catalogue.info(catalogue.root, temporary) == nil else { throw Failure.changed }
+                let metadataFD = openat(catalogue.root.fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                guard metadataFD >= 0 else { throw Failure.io }
+                let pending = RecoveryResource(name: temporary, fd: metadataFD); recoveryResources.append(pending)
+                let fresh = try catalogue.appendDescriptor(metadataFD)
+                guard fresh.file.size == 0, try catalogue.appendPath(temporary) == fresh else { throw Failure.changed }
+                try encoded.withUnsafeBytes { buffer in
+                    var at = 0
+                    while at < buffer.count {
+                        try checkCancellation()
+                        let n = catalogue.checkpointIO.write(metadataFD, buffer.baseAddress!.advanced(by: at), buffer.count - at)
+                        if n < 0 && errno == EINTR { continue }
+                        guard n > 0, n <= buffer.count - at else { throw Failure.io }; at += n
+                    }
+                }
+                guard catalogue.checkpointIO.synchronize(metadataFD) == 0 else { throw Failure.io }
+                let prepared = try catalogue.appendDescriptor(metadataFD)
+                guard prepared.source == fresh.source, prepared.file.size == Int64(encoded.count),
+                      try catalogue.appendPath(temporary) == prepared else { throw Failure.changed }
+                try closeRecovery(pending)
+                try checkCancellation(); try recheckNamespace()
+                guard try catalogue.info(catalogue.root, receiptName) == nil,
+                      try catalogue.appendPath(output.name) == completed,
+                      try catalogue.appendPath(temporary) == prepared else { throw Failure.changed }
+                try checkCancellation()
+                // The UI front door atomically reserves this scalar cut on its
+                // existing capture/library gate. This callback performs no IO.
+                try willPublish()
+                // Last scalar cancellation cut. IO stays outside the lock.
+                // A later UI cancellation suppresses delivery, never deletes a
+                // correctly published copy or grants stale capture admission.
+                lock.lock(); let stopped = self.cancelled; if !stopped { publicationCut = true }; lock.unlock()
+                guard publicationCut else { throw Failure.cancelled }
+                publicationBegan = true // Any rename/post-rename failure has an unknown publication outcome.
+                guard catalogue.checkpointIO.renameExclusive(catalogue.root.fd, temporary, receiptName) == 0,
+                      catalogue.checkpointIO.synchronizeDirectory(catalogue.root.fd) == 0 else { throw Failure.io }
+                pending.name = receiptName
+                let named = try catalogue.appendPath(receiptName)
+                // Rename can legitimately change ctime. Same incarnation and
+                // exact size precede canonical content readback below.
+                guard named.source == prepared.source, named.file.size == prepared.file.size else { throw Failure.changed }
+                let verifyFD = openat(catalogue.root.fd, receiptName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                guard verifyFD >= 0 else { throw Failure.io }
+                let verify = RecoveryResource(name: receiptName, fd: verifyFD); recoveryResources.append(verify)
+                guard try catalogue.appendDescriptor(verifyFD) == named else { throw Failure.changed }
+                var actual = Data(count: encoded.count), at = 0
+                while at < actual.count {
+                    let remaining = actual.count - at
+                    let n = actual.withUnsafeMutableBytes { catalogue.checkpointIO.read(verifyFD, $0.baseAddress!.advanced(by: at), remaining) }
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0, n <= actual.count - at else { throw Failure.io }; at += n
+                }
+                guard actual == encoded, try catalogue.appendDescriptor(verifyFD) == named,
+                      try catalogue.appendPath(receiptName) == named, catalogue.decode(actual, id)?.recovery == receipt.recovery else { throw Failure.changed }
+                try closeRecovery(verify)
+                try recheckNamespace()
+                guard try catalogue.appendPath(output.name) == completed,
+                      try catalogue.appendPath(receiptName) == named else { throw Failure.changed }
+                let result = RecoveredPrefix(entry: recoveryEntry(identity: destination, receipt: receipt, bytes: actual,
+                    receiptFile: named.file, file: completed.file), reused: false)
+                try endRecoveryLease(); return result
+            } catch {
+                let original = error
+                do { try closeRecoveryOwners() }
+                catch {
+                    lock.lock(); phase = .retained; lock.unlock(); catalogue.poison(self); throw error
+                }
+                if publicationBegan {
+                    lock.lock(); phase = .retained; lock.unlock(); catalogue.poison(self); throw original
+                }
+                do { try endRecoveryLease() }
+                catch { lock.lock(); phase = .retained; lock.unlock(); catalogue.poison(self); throw error }
+                throw original
+            }
         }
         private func recheckNamespace() throws {
             try checkRoot(); try checkTemporaries()

@@ -779,6 +779,148 @@ fn encrypted_session_selection_rotation_loss_and_no_plaintext_downgrade() {
     }
 }
 
+fn fast_packet_count_refresh(size: sapflow_srt::crypto::KeySize) {
+    use sapflow_srt::crypto::CryptoConfig;
+    let now = Instant::now();
+    let mut crypto = CryptoConfig::new(b"generated fast rekey secret".to_vec(), size)
+        .expect("valid fast-rekey test secret");
+    crypto.refresh_packets = 32;
+    crypto.preannounce_packets = 8;
+    let mut config = CallerConfig {
+        crypto: Some(crypto.clone()),
+        latency: Duration::from_millis(1),
+        ..CallerConfig::default()
+    };
+    config.send.bandwidth = 1_000_000;
+    let mut c = caller(config, now);
+    let mut listener = Listener::new(
+        Config {
+            crypto: Some(crypto),
+            require_encryption: true,
+            latency: Duration::from_millis(1),
+            ..Config::default()
+        },
+        now,
+    );
+    let mut enqueued = 0u8;
+    let mut delivered = Vec::new();
+    let mut requests: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut responses = Vec::new();
+    let mut key_flags = 0;
+    let mut connection = None;
+    // Synthetic monotonic time: one original each millisecond. The second
+    // distinct KM is due32ms after the first, inside the old100ms gate.
+    for us in (0..1_000_000).step_by(1000) {
+        let at = time(now, us);
+        c.handle_timeout(at);
+        listener.handle_timeout(at);
+        if c.is_connected() && enqueued < 128 {
+            c.enqueue(at, vec![enqueued; 188])
+                .expect("fast-rekey original accepted");
+            enqueued += 1;
+        }
+        for _ in 0..8 {
+            while let Some((_, bytes)) = c.poll_transmit(at) {
+                match Packet::parse(&bytes).expect("actual caller datagram") {
+                    Packet::Control(ControlPacket {
+                        body:
+                            Control::Other {
+                                control_type: 0x7fff,
+                                subtype: 3,
+                                info: 0,
+                                cif,
+                            },
+                        ..
+                    }) => requests.push((us, cif)),
+                    Packet::Data(p) => {
+                        assert_ne!(p.key, 0, "no plaintext fallback");
+                        key_flags |= p.key;
+                    }
+                    _ => {}
+                }
+                listener.handle_datagram(at, source(), &bytes);
+            }
+            while let Some(event) = listener.poll_event() {
+                match event {
+                    Event::Connect { id, .. } => {
+                        connection = Some(id);
+                        assert!(listener.accept(id, at));
+                    }
+                    Event::Data { payload, .. } => delivered.push(payload),
+                    Event::Closed { reason, .. } => {
+                        panic!("fast-rekey listener closed: {reason:?}")
+                    }
+                }
+            }
+            while let Some((_, bytes)) = listener.poll_transmit() {
+                if let Packet::Control(ControlPacket {
+                    body:
+                        Control::Other {
+                            control_type: 0x7fff,
+                            subtype: 4,
+                            info: 0,
+                            cif,
+                        },
+                    ..
+                }) = Packet::parse(&bytes).expect("actual listener datagram")
+                {
+                    responses.push(cif);
+                }
+                c.handle_datagram(at, peer(), &bytes);
+            }
+            while let Some(event) = c.poll_event() {
+                assert!(
+                    matches!(event, CallerEvent::Connected { .. }),
+                    "fast-rekey caller must remain open: {event:?}"
+                );
+            }
+        }
+        if delivered.len() == 128 && c.stats().send.acknowledged_packets == 128 {
+            break;
+        }
+    }
+    assert_eq!(enqueued, 128);
+    assert_eq!(
+        delivered,
+        (0u8..128).map(|n| vec![n; 188]).collect::<Vec<_>>()
+    );
+    assert_eq!(key_flags, 3, "both key slots delivered");
+    assert!(requests.len() >= 4, "multiple actual KM exchanges");
+    assert_ne!(requests[0].1, requests[1].1, "distinct refresh material");
+    assert!(
+        requests[1].0 - requests[0].0 < 100_000,
+        "exercise the old timer conflict"
+    );
+    assert_eq!(requests.len(), responses.len());
+    assert!(
+        requests
+            .iter()
+            .zip(&responses)
+            .all(|((_, request), response)| request == response)
+    );
+    assert_eq!(c.stats().send.encrypted_packets, 128);
+    assert_eq!(c.stats().send.acknowledged_packets, 128);
+    assert_eq!(c.stats().send.retransmitted_packets, 0);
+    assert!(c.stats().send.km_responses >= 4);
+    assert_eq!(c.stats().send.buffered_bytes, 0);
+    let stats = listener
+        .connection_stats(connection.expect("accepted encrypted connection"))
+        .expect("encrypted receiver remains open");
+    assert_eq!(stats.decrypted, 128);
+    assert_eq!(stats.km_rejected, 0);
+    assert_eq!(stats.dropped, 0);
+}
+
+#[test]
+fn encrypted_fast_packet_count_refresh_aes128() {
+    fast_packet_count_refresh(sapflow_srt::crypto::KeySize::Aes128);
+}
+
+#[test]
+fn encrypted_fast_packet_count_refresh_aes256() {
+    fast_packet_count_refresh(sapflow_srt::crypto::KeySize::Aes256);
+}
+
 #[test]
 fn encrypted_packet_count_refresh_bursts_and_lost_or_stale_responses() {
     use sapflow_srt::crypto::{CryptoConfig, KeySize};

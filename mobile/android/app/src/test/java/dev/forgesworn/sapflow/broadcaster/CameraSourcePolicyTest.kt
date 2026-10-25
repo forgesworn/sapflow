@@ -338,4 +338,23 @@ class CameraSourcePolicyTest {
         }
     }
 
+    private fun sourcePermit(run: CameraRunAdmission): Pair<RecordingSourceGate.FinishPermit, Any> {
+        val gate = run.recordingSource; val owner = Any(); val prepared = Any(); val generation = Any()
+        val key = gate.bindProducer(owner, prepared, run.epoch); val recorder = gate.bindRecorder(Any()); val writer = Any()
+        gate.generationStarted(key, generation); gate.generationClosed(key, generation, 1024, true, true)
+        recorder.writerOpened(writer); recorder.accepted(); recorder.consumed()
+        return checkNotNull(recorder.drained(gate.terminal(key, owner, prepared, run.epoch))) to writer
+    }
+    @Test fun realSourceExpiryRefusesTheRecordingPublicationCutWithoutATimer() {
+        val run = CameraRunAdmission(7); val (permit, writer) = sourcePermit(run)
+        val policy = CameraSourcePolicy(); val operation = checkNotNull(policy.begin(CameraSourceChoice.REAR, 10))
+        assertTrue(run.beginSource(operation).admitted); assertFalse(run.admit(operation.deadlineNs))
+        synchronized(run.recordingSource.guard) { assertThrows(IllegalStateException::class.java) { run.recordingSource.requireCommitLocked(permit, writer) } }
+    }
+    @Test fun ordinaryStopBudgetCancellationDoesNotBecomeARecordingLoss() {
+        val run = CameraRunAdmission(7); val (permit, writer) = sourcePermit(run)
+        run.cancelSourceBudget(); assertTrue(run.admit(Long.MAX_VALUE))
+        synchronized(run.recordingSource.guard) { run.recordingSource.commitLocked(permit, writer) }
+    }
+
 }

@@ -243,4 +243,59 @@ class RecordingCatalogueTest {
         assertEquals(identity, entry.identity); assertEquals(RecordingCatalogue.State.FINALISED, entry.state)
         assertEquals(identity.showId, show.nextIdentity().showId)
     }
+    private fun sourcePermit(writer: RecordingCatalogue.Writer, gate: RecordingSourceGate): RecordingSourceGate.FinishPermit {
+        val owner = Any(); val prepared = Any(); val generation = Any()
+        val key = gate.bindProducer(owner, prepared, 7); val recorder = gate.bindRecorder(Any())
+        gate.generationStarted(key, generation); gate.generationClosed(key, generation, 1024, true, true)
+        writer.bindSource(recorder); recorder.accepted(); recorder.consumed()
+        return checkNotNull(recorder.drained(gate.terminal(key, owner, prepared, 7)))
+    }
+    @Test fun delayedSourceLossCannotPromoteAnActualForcedAndClosedFile() {
+        val root = directory(); val catalogue = RecordingCatalogue(root); val writer = catalogue.begin(id()); val gate = RecordingSourceGate(7)
+        val permit = sourcePermit(writer, gate); val oldCanFinish = true
+        val file = RecordingFile(root, writer.filename); file.write(byteArrayOf(1, 2, 3, 4), false); file.finish()
+        gate.fail(); assertTrue(oldCanFinish)
+        assertThrows(IllegalStateException::class.java) { writer.finalised(10, permit) }
+        writer.ownersClosed(); assertTrue(writer.cleanupComplete)
+        assertEquals(RecordingCatalogue.State.INCOMPLETE, catalogue.scan().single().state)
+    }
+    @Test fun exactSourceAndDrainedFrontierAuthoriseOneRealCatalogueCommit() {
+        val root = directory(); val catalogue = RecordingCatalogue(root); val writer = catalogue.begin(id()); val gate = RecordingSourceGate(7)
+        val permit = sourcePermit(writer, gate)
+        val file = RecordingFile(root, writer.filename); file.write(byteArrayOf(5, 6, 7, 8), false); file.finish()
+        writer.finalised(10, permit); assertTrue(writer.cleanupComplete)
+        assertEquals(RecordingCatalogue.State.FINALISED, catalogue.scan().single().state)
+        assertThrows(IllegalStateException::class.java) { writer.finalised(10, permit) }
+        assertEquals(RecordingCatalogue.State.FINALISED, catalogue.scan().single().state)
+    }
+
+    @Test fun failedSourceCanCloseAnIncompletePrefixWithoutConsumingItsPermit() {
+        val root = directory(); val catalogue = RecordingCatalogue(root); val writer = catalogue.begin(id()); val gate = RecordingSourceGate(7)
+        val permit = sourcePermit(writer, gate); val bytes = byteArrayOf(9, 10, 11, 12)
+        val file = RecordingFile(root, writer.filename); file.write(bytes, false)
+        gate.fail() // Source loss precedes the distinct prefix-only force/close.
+        file.finish(); writer.cancel(); writer.ownersClosed()
+        assertTrue(writer.cleanupComplete); assertArrayEquals(bytes, Files.readAllBytes(root.resolve(writer.filename)))
+        assertEquals(RecordingCatalogue.State.INCOMPLETE, catalogue.scan().single().state)
+        assertThrows(IllegalStateException::class.java) { writer.finalised(10, permit) }
+        assertEquals(RecordingCatalogue.State.INCOMPLETE, catalogue.scan().single().state)
+    }
+
+    @Test fun boundWriterRefusesUntypedFinalisationAndForeignRebinding() {
+        val root = directory(); val catalogue = RecordingCatalogue(root)
+        val writer = catalogue.begin(id()); val gate = RecordingSourceGate(7)
+        val permit = sourcePermit(writer, gate)
+        val file = RecordingFile(root, writer.filename); file.write(byteArrayOf(1, 3, 5), false); file.finish()
+        assertThrows(IllegalStateException::class.java) { writer.finalised(10) }
+        val foreign = RecordingSourceGate(7).bindRecorder(Any())
+        assertThrows(IllegalStateException::class.java) { writer.bindSource(foreign) }
+        val foreignRoot = directory(); val foreignCatalogue = RecordingCatalogue(foreignRoot)
+        val foreignWriter = foreignCatalogue.begin(id())
+        val foreignPermit = sourcePermit(foreignWriter, RecordingSourceGate(7))
+        assertThrows(IllegalStateException::class.java) { writer.finalised(10, foreignPermit) }
+        writer.finalised(10, permit)
+        assertEquals(RecordingCatalogue.State.FINALISED, catalogue.scan().single().state)
+        foreignWriter.cancel(); foreignWriter.ownersClosed()
+    }
+
 }

@@ -19,6 +19,8 @@ POSE_MARKERS = (b"Ldev/forgesworn/sapflow/broadcaster/QualificationPoseApplicati
                 b"dev.forgesworn.sapflow.broadcaster.QUALIFICATION_POSE")
 BENCHMARK_MARKER = b"Ldev/forgesworn/sapflow/broadcaster/FfiBenchmarkActivity;"
 AAC_PROBE_MARKERS = (b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificationActivity;",
+                     b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificationRunOwner;",
+                     b"Ldev/forgesworn/sapflow/broadcaster/NativeAacPairObservationStatus;",
                      b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificationProbe;",
                      b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC",
                      b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_DRAIN",
@@ -28,7 +30,9 @@ AAC_PROBE_MARKERS = (b"Ldev/forgesworn/sapflow/broadcaster/NativeAacQualificatio
                      b"Ldev/forgesworn/sapflow/broadcaster/NativeAacProgrammeWindowProbe;",
                      b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_WINDOW_REFERENCE",
                      b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_SDK_WINDOW",
-                     b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_EXPLICIT_READER")
+                     b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_EXPLICIT_READER",
+                     b"dev.forgesworn.sapflow.broadcaster.QUALIFY_GENERATED_AAC_NATIVE_PAIR",
+                     b"Ldev/forgesworn/sapflow/broadcaster/NativeAacRecorderFileAdmission;")
 FIXTURE_CA = "res/raw/sapflow_qualification_ca.der"
 FIXTURE_CONFIG = "res/xml/sapflow_qualification_network_security.xml"
 

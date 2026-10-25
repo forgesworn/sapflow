@@ -7,6 +7,9 @@ import android.os.Build
 import android.os.SystemClock
 import dev.forgesworn.sapflow.MediaCodec as RustCodec
 import dev.forgesworn.sapflow.MediaSample
+import dev.forgesworn.sapflow.NativeAacTimingViews
+import dev.forgesworn.sapflow.BindingException
+import java.nio.ByteBuffer
 import java.util.ArrayDeque
 
 /** One actual platform AAC generation. The run owns the Rust descriptor and
@@ -30,31 +33,50 @@ internal class EncodedAudioEpoch(
     private val onEos: () -> Unit,
     private val onFailure: (String) -> Unit,
     private val onHandoffIdle: () -> Unit,
+    private val sampleMode: AudioSampleMode = AudioSampleMode.LEGACY_PUBLISHING,
+    private val sourceCursor: AudioSourceCursor? = null,
+    private val onTimingViews: (NativeAacTimingViews, Long, Long) -> Unit = { _, _, _ -> error("Source-preserving AAC consumer is absent") },
 ) : PlatformCodec.Callback() {
     private var formatConfirmed = false
     private var started = false
     private var closed = false
     private val conversion = DelayDiagnostics()
     private val slotGuard = Any()
-    private inner class Transfer : AutoCloseable {
-        var sample: MediaSample? = null
-        var tick = 0L
+    private val originalFactory: (ByteBuffer, Long) -> MediaSample = { bytes, sourceTick ->
+        codecDescriptor.sample(bytes, sourceTick, sourceTick, 1024u, 48_000u, false)
+    }
+    private val viewsFactory: (MediaSample, Long, Long?) -> NativeAacTimingViews = { original, nativePtsUs, publishingTick ->
+        original.aacTimingViews(nativeGeneration.toULong(), nativePtsUs, publishingTick)
+    }
+    private val noHandleRejection: (Throwable) -> Boolean = { it is BindingException }
+    private val originalReturned: () -> Unit = { observation.constructed(nativeGeneration) }
+    private inner class Transfer : AudioTimingTransfer<MediaSample, NativeAacTimingViews, ByteBuffer>(
+        originalFactory, viewsFactory, noHandleRejection, originalReturned) {
         override fun close() {
-            val old = synchronized(slotGuard) { sample.also { check(it != null); sample = null } }
-            try { old!!.close() } finally { synchronized(slotGuard) { free.addLast(this) } }
+            super.close()
+            synchronized(slotGuard) { free.addLast(this) }
         }
     }
-    private val free = ArrayDeque<Transfer>().apply { repeat(16) { addLast(Transfer()) } }
+    // Keep quarantined owners reachable even when they cannot rejoin free.
+    private val slots = Array(16) { Transfer() }
+    private val free = ArrayDeque<Transfer>().apply { slots.forEach { addLast(it) } }
+    private fun discard(slot: Transfer, problem: Exception) {
+        if (slot.ownershipUnknown) return // Failure fences this generation, never guess a native retry.
+        try {
+            if (slot.reusable) synchronized(slotGuard) { free.addLast(slot) } else slot.close()
+        } catch (cleanup: Throwable) { problem.addSuppressed(cleanup) }
+    }
     private val handoff = CoalescedOwnedQueue<Transfer>(16, 64 * 1024, 250_000_000,
         SystemClock::elapsedRealtimeNanos, callbacks::post,
         {
             observation.handoffEntered(nativeGeneration)
-            onSample(requireNotNull(it.sample), it.tick, nativeGeneration)
+            if (sampleMode == AudioSampleMode.PRESERVE_SOURCE_UNATTESTED) onTimingViews(it.timingViews, it.tick, nativeGeneration)
+            else onSample(it.sample, it.tick, nativeGeneration)
             observation.handoffReturned(nativeGeneration)
         },
         { onFailure("Encoded audio handoff failed: ${it.message}") },
         { callbacks.post { onHandoffIdle() } })
-    val outstanding get() = handoff.outstanding
+    val outstanding get() = AudioSourceRetirement.outstanding(handoff.outstanding, slots)
     val diagnostics get() = "AAC generation $nativeGeneration conversion ${conversion.text()} · handoff ${handoff.diagnostics}"
 
     fun begin() { check(owner.post { if (!closed) started = true }) { "AAC owner stopped" } }
@@ -91,7 +113,18 @@ internal class EncodedAudioEpoch(
                 onRawOutput(info.presentationTimeUs)
                 require(info.size in 1..4096) { "Mono AAC access unit exceeded 4096 bytes" }
                 val tick = sampleClock.output(clockGeneration,info.presentationTimeUs)
-                if (tick == AudioGenerationClock.PRIMING) {
+                if (sampleMode == AudioSampleMode.PRESERVE_SOURCE_UNATTESTED && tick != AudioGenerationClock.STALE) {
+                    val buffer = codec.getOutputBuffer(index) ?: error("AAC output buffer unavailable")
+                    observation.borrowedOutputRange(nativeGeneration, info.offset, info.size, buffer.capacity())
+                    buffer.position(info.offset); buffer.limit(info.offset + info.size)
+                    val slot = synchronized(slotGuard) { free.pollFirst() } ?: error("AAC scalar handoff capacity exhausted")
+                    transfer = slot
+                    slot.preserve(buffer.slice(), checkNotNull(sourceCursor).reserve(tick), info.presentationTimeUs, tick)
+                    onValidated()
+                    // Negative/early native output was retained for recording.
+                    // It is deliberately absent from publishing and readiness.
+                }
+                else if (tick == AudioGenerationClock.PRIMING) {
                     observation.primingFiltered(nativeGeneration)
                     onPriming()
                 }
@@ -103,18 +136,19 @@ internal class EncodedAudioEpoch(
                     observation.constructed(nativeGeneration)
                     try {
                         val slot = synchronized(slotGuard) { free.pollFirst() } ?: error("AAC scalar handoff capacity exhausted")
-                        slot.tick = tick; slot.sample = encoded; transfer = slot
+                        slot.attachLegacy(encoded, tick); transfer = slot
                     } catch (error: Exception) { encoded.close(); throw error }
                     onValidated()
                 } else observation.staleFiltered(nativeGeneration)
             }
         } catch (error: Exception) {
-            transfer?.close(); transfer = null; report("AAC sample rejected",error)
+            transfer?.let { discard(it,error) }; transfer = null; report("AAC sample rejected",error)
         } finally {
             val released = runCatching { codec.releaseOutputBuffer(index,false) }
             if (released.isFailure && !closed) {
-                transfer?.close(); transfer = null
-                report("AAC output release failed",released.exceptionOrNull() as? Exception ?: IllegalStateException("AAC release failed"))
+                val problem = released.exceptionOrNull() as? Exception ?: IllegalStateException("AAC release failed",released.exceptionOrNull())
+                transfer?.let { discard(it,problem) }; transfer = null
+                report("AAC output release failed",problem)
             }
             conversion.record(System.nanoTime()-startNs)
         }

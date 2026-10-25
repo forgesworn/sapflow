@@ -19,6 +19,13 @@ final class NativeAudioEncoder {
     private(set) var verifiedConfigurationGenerations: UInt64 = 0
     private let output: (CompressedUnit) -> Void
     private let meter: (Float) -> Void
+    private var recordingInputObserver: ((CMTime, CMTime, CMTime) -> Void)?
+    /// Bound once before input by the concrete SDK recorder; native payload and
+    /// the established publishing path are unchanged if recording is fenced.
+    func observeRecordingInput(_ observer: @escaping (CMTime, CMTime, CMTime) -> Void) -> Bool {
+        guard recordingInputObserver == nil, converter == nil, firstTime == nil, !closed else { return false }
+        recordingInputObserver = observer; return true
+    }
     private let recordingTiming: ((AudioRecordingTiming.Event) -> Void)?
     enum ReceiptMode { case legacy, fullGenerationLedger }
     private let receiptMode: ReceiptMode
@@ -52,6 +59,7 @@ final class NativeAudioEncoder {
     private var closed = false
     private(set) var lastOutputGeneration: UInt64?
     private var lastAttemptedGeneration: AudioRecordingTiming.GenerationExtent?
+    private(set) var lastNativeEOFObservation: AudioRecordingTiming.NativeEOFObservation?
     var inputToken: InputToken? { admission.token }
     var nextInputTime: CMTime? { expectedInputTime }
     var generationLedger: AudioRecordingTiming.LedgerSnapshot {
@@ -127,6 +135,7 @@ final class NativeAudioEncoder {
                 throw CaptureFailure(message: "Microphone PCM storage could not be read (\(status)); providedListBytes=\(listBytes),requiredListBytes=\(requiredSize),frames=\(count),interleaved=\(source.isInterleaved); source \(Self.formatFacts(source))")
             }
             pcm.frameLength = AVAudioFrameCount(count)
+            self.observeRecordingPCM(frames: UInt32(count), rawTime: time)
             self.updateMeter(pcm)
             try withExtendedLifetime(retained) { try self.consume(pcm, token: token) }
             self.expectedInputTime = CMTimeAdd(time, CMTime(value: Int64(count), timescale: Int32(self.generationRate)))
@@ -184,6 +193,7 @@ final class NativeAudioEncoder {
         try guarded {
             guard frames > 0, frames <= 4096, let pcm = self.zeroStorage, let time = self.expectedInputTime else { throw AudioRecordingTiming.Failure.unsupported }
             pcm.frameLength = frames
+            self.observeRecordingPCM(frames: frames, rawTime: time)
             try self.consume(pcm, token: token)
             self.expectedInputTime = CMTimeAdd(time, CMTime(value: Int64(frames), timescale: Int32(self.generationRate)))
             self.meter(-60)
@@ -259,6 +269,17 @@ final class NativeAudioEncoder {
             recordingTiming?(.began(leadingFrames: created.primeInfo.leadingFrames))
         }
     }
+    private func observeRecordingPCM(frames: UInt32, rawTime: CMTime) {
+        guard let observe = recordingInputObserver else { return }
+        guard let firstTime, let leading = generationLeading, let fileLeading,
+              let span = RecordingNativePCMSpan.make(firstTime: firstTime,
+                codedGenerationStart: generationCodedStart, generationLeading: leading, fileLeading: fileLeading,
+                consumedSourceFrames: generationInput, pendingSourceFrames: frames,
+                sourceRate: generationRate, rawTime: rawTime) else {
+            observe(.invalid, .invalid, .invalid); return
+        }
+        observe(span.start, span.end, span.supportedEnd)
+    }
     private func consume(_ pcm: AVAudioPCMBuffer, token: InputToken) throws {
         guard admission.permits(token, source: token.source), let converter, let compressed = compressedBuffer else { throw AudioRecordingTiming.Failure.stale }
         let next = generationInput.addingReportingOverflow(UInt64(pcm.frameLength))
@@ -285,15 +306,28 @@ final class NativeAudioEncoder {
     private func endGeneration() throws {
         guard let converter, let compressed = compressedBuffer, let token = nativeToken else { return }
         guard generationInput > 0 else { return }
-        var completed = false
+        var eof = AudioRecordingTiming.NativeEOFObservation(generation: token.generation)
+        lastNativeEOFObservation = eof
         for _ in 0..<16 {
             compressed.packetCount = 0; compressed.byteLength = 0
             var error: NSError?
-            let result = converter.convert(to: compressed, error: &error) { _, state in state.pointee = .endOfStream; return nil }
+            let result = converter.convert(to: compressed, error: &error) { _, state in
+                state.pointee = .endOfStream; eof.deliveredInputEOS(); return nil
+            }
+            let status: AudioRecordingTiming.NativeEOFObservation.OutputStatus
+            switch result {
+            case .haveData: status = .haveData
+            case .inputRanDry: status = .inputRanDry
+            case .endOfStream: status = .endOfStream
+            case .error: status = .error
+            @unknown default: status = .unknown
+            }
+            try eof.returned(status, packetCount: compressed.packetCount, byteLength: compressed.byteLength)
+            lastNativeEOFObservation = eof // Actual facts survive later emit/ledger failure.
             if let error { throw error }
             if compressed.packetCount > 0 { try emit(compressed, converter: converter) }
             if result == .error { throw CaptureFailure(message: "AAC finalisation failed") }
-            if result == .endOfStream || result == .inputRanDry || compressed.packetCount == 0 { completed = true; break }
+            if result == .endOfStream { break }
         }
         let prime = converter.primeInfo
         let receipt = AudioRecordingTiming.GenerationExtent(generation: token.generation, inputFrames: generationInput,
@@ -301,8 +335,8 @@ final class NativeAudioEncoder {
             encodedFrames: UInt64(emittedFrames) - generationCodedStart,
             leadingFrames: prime.leadingFrames, trailingFrames: prime.trailingFrames, sourceMapping: generationMapping)
         lastAttemptedGeneration = receipt
-        guard completed, generationLeading == prime.leadingFrames else {
-            throw CaptureFailure(message: "Native AAC EOF did not close; completed=\(completed),initialLeading=\(String(describing: generationLeading)),attempted=\(receipt)")
+        guard eof.complete, generationLeading == prime.leadingFrames else {
+            throw CaptureFailure(message: "Native AAC EOF did not close; actualEOF=\(eof),initialLeading=\(String(describing: generationLeading)),attempted=\(receipt)")
         }
         do { try ledger.append(receipt) }
         catch {
@@ -422,5 +456,61 @@ final class NativeAudioEncoder {
         emittedFrames += 1024
         lastOutputGeneration = token.generation
         output(CompressedUnit(buffer: sample, isVideo: false, keyframe: false, time: pts, duration: duration, configuration: .aac(asc: Data([0x11, 0x88]))))
+    }
+}
+
+
+/// Scalar source clock of the concrete native audio producer. The coded
+/// generation start and both H values are actual existing native fields. The
+/// rational input count includes PCM about to enter the converter. Raw PTS can
+/// accumulate jitter under the old 5ms continuity rule, so recording charges
+/// the larger of both extents rather than pretending a one-tick bridge fixes
+/// that drift. No input timestamp or coded output is rebased here.
+struct RecordingNativePCMSpan {
+    let start: CMTime
+    let end: CMTime
+    /// Already consumed native source only. Pending frames belong to the
+    /// admission charge, never this grant cap. One-block support lag is safe.
+    let supportedEnd: CMTime
+    static func make(firstTime: CMTime, codedGenerationStart: UInt64,
+                     generationLeading: UInt32, fileLeading: UInt32,
+                     consumedSourceFrames: UInt64, pendingSourceFrames: UInt32,
+                     sourceRate: UInt32, rawTime: CMTime) -> Self? {
+        guard firstTime.isNumeric, rawTime.isNumeric, firstTime.epoch == 0, rawTime.epoch == 0,
+              sourceRate > 0, sourceRate <= 192_000, pendingSourceFrames > 0 else { return nil }
+        let base = codedGenerationStart.addingReportingOverflow(UInt64(generationLeading))
+        let through = consumedSourceFrames.addingReportingOverflow(UInt64(pendingSourceFrames))
+        guard !base.overflow, base.partialValue >= UInt64(fileLeading), !through.overflow,
+              base.partialValue - UInt64(fileLeading) <= UInt64(Int64.max),
+              through.partialValue <= UInt64(Int64.max) else { return nil }
+        let origin = CMTimeAdd(firstTime, CMTime(value: Int64(base.partialValue - UInt64(fileLeading)), timescale: 48_000))
+        let canonicalOrigin = CMTimeConvertScale(origin, timescale: 720_000, method: .roundAwayFromZero)
+        let lowerCount = CMTimeConvertScale(CMTime(value: Int64(consumedSourceFrames), timescale: Int32(sourceRate)),
+                                           timescale: 720_000, method: .roundTowardZero)
+        let upperCount = CMTimeConvertScale(CMTime(value: Int64(through.partialValue), timescale: Int32(sourceRate)),
+                                           timescale: 720_000, method: .roundAwayFromZero)
+        let countedStart = CMTimeAdd(canonicalOrigin, lowerCount)
+        let countedEnd = CMTimeAdd(canonicalOrigin, upperCount)
+        guard origin.isNumeric, canonicalOrigin.isNumeric, countedStart.isNumeric, countedEnd.isNumeric,
+              let raw = conservativeSpan(start: rawTime, duration: CMTime(value: Int64(pendingSourceFrames), timescale: Int32(sourceRate))) else { return nil }
+        return Self(start: CMTimeCompare(raw.start, countedStart) <= 0 ? raw.start : countedStart,
+                    end: CMTimeCompare(raw.end, countedEnd) >= 0 ? raw.end : countedEnd,
+                    supportedEnd: countedStart)
+    }
+    /// Directed integer rounding cannot undercount a rational native source
+    /// duration even when its least-common timebase exceeds Int32. It only
+    /// tightens admission; it never adds quantisation to the allowed loss.
+    static func conservativeSpan(start: CMTime, duration: CMTime) -> Self? {
+        guard start.isNumeric, duration.isNumeric, start.epoch == 0, duration.epoch == 0,
+              CMTimeCompare(start, .zero) >= 0, CMTimeCompare(duration, .zero) > 0 else { return nil }
+        let lower = CMTimeConvertScale(start, timescale: 720_000, method: .roundTowardZero)
+        let upper = CMTimeConvertScale(start, timescale: 720_000, method: .roundAwayFromZero)
+        let length = CMTimeConvertScale(duration, timescale: 720_000, method: .roundAwayFromZero)
+        let end = CMTimeAdd(upper, length)
+        guard lower.isNumeric, upper.isNumeric, length.isNumeric, end.isNumeric else { return nil }
+        let lowerLength = CMTimeConvertScale(duration, timescale: 720_000, method: .roundTowardZero)
+        let supportedEnd = CMTimeAdd(lower, lowerLength)
+        guard lowerLength.isNumeric, supportedEnd.isNumeric else { return nil }
+        return Self(start: lower, end: end, supportedEnd: supportedEnd)
     }
 }

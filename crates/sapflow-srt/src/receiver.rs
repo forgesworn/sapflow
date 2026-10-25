@@ -357,6 +357,8 @@ impl Receiver {
                 self.stats.encrypted += 1;
                 return;
             }
+            // Existing staged/highest guards fence slot progression. CTR
+            // does not authenticate the data or its key flag.
             if crypto.active_key() != previous_key {
                 self.early_km = true;
             }
@@ -993,6 +995,83 @@ mod tests {
                 .1,
             2500
         );
+    }
+
+    #[test]
+    fn unauthenticated_staged_key_bit_flip_cannot_replenish_spent_km_credit() {
+        let mut config = CryptoConfig::new(
+            b"generated key-bit control secret".to_vec(),
+            KeySize::Aes128,
+        )
+        .expect("valid key-bit control configuration");
+        config.refresh_packets = 32;
+        config.preannounce_packets = 8;
+        let mut tx = Encryptor::new(&config).expect("key-bit control encryptor");
+        let mut r = rx();
+        r.set_crypto(Some(
+            Decryptor::new(&config, &tx.initial().expect("initial key material"))
+                .expect("key-bit control decryptor"),
+        ));
+        for n in 0..=24 {
+            let mut payload = vec![n as u8; 23];
+            let key = tx
+                .encrypt(Seq::new(ISN + n), &mut payload, 0)
+                .expect("original encryption");
+            let mut packet = data(ISN + n, n * MS as u32, &payload);
+            packet.key = key;
+            r.on_data(i64::from(n) * MS, &packet);
+            if let Some(km) = tx.poll_km(i64::from(n) * MS) {
+                r.on_control(i64::from(n) * MS, &km_request(&km));
+                assert_eq!(km_responses(&mut r), vec![km.clone()]);
+                assert!(tx.confirm(&km));
+            }
+        }
+        assert!(!r.early_km, "valid KM staging alone grants no credit");
+        let mut payload = vec![25; 23];
+        let original_key = tx
+            .encrypt(Seq::new(ISN + 25), &mut payload, 0)
+            .expect("even original");
+        assert_eq!(original_key, 1);
+        let mut forged = data(ISN + 25, 25 * MS as u32, &payload);
+        forged.key = 2;
+        r.on_data(25 * MS, &forged);
+        // CTR provides no authenticity: an altered flag can consume an
+        // already staged slot. This checks work bounds, not valid media.
+        assert!(
+            r.early_km,
+            "one credit after the existing staged transition"
+        );
+        let bad = km_request(&[0; 104]);
+        for _ in 0..1000 {
+            r.on_control(26 * MS, &bad);
+        }
+        assert_eq!(r.stats().km_rejected, 1);
+        assert!(!r.early_km);
+        for n in 26..=31 {
+            let mut packet = data(ISN + n, n * MS as u32, b"not authenticated");
+            packet.key = 1;
+            r.on_data(i64::from(n) * MS, &packet);
+            packet.key = 2;
+            r.on_data(i64::from(n) * MS, &packet);
+            r.on_control(i64::from(n) * MS, &bad);
+            assert!(!r.early_km, "alternating flags cannot stage another key");
+        }
+        r.on_data(32 * MS, &forged);
+        assert!(!r.early_km, "duplicate altered packet cannot renew credit");
+        assert_eq!(
+            r.stats().km_rejected,
+            1,
+            "no additional unwrap attempt inside the timer"
+        );
+        assert_eq!(r.next_km, 126 * MS);
+        assert!(km_responses(&mut r).is_empty());
+        r.on_control(126 * MS, &bad);
+        assert_eq!(
+            r.stats().km_rejected,
+            2,
+            "ordinary timed attempt remains available"
+        );
+        assert!(!r.early_km);
     }
 
     #[test]

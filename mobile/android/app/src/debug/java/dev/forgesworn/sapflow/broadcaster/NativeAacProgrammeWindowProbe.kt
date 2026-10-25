@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * The Activity retains this concrete owner if any native/file close is unknown. */
 internal class NativeAacProgrammeWindowProbe(private val root: File, private val input: File,
     private val manifestSha256: String, private val cancelled: AtomicBoolean, private val mode: Mode = Mode.REFERENCE) {
-    enum class Mode { REFERENCE, SDK_WINDOW, EXPLICIT_READER }
+    enum class Mode { REFERENCE, SDK_WINDOW, EXPLICIT_READER, NATIVE_PAIR }
     private val retained = mutableListOf<Any>()
     private var cleanupKnown = true
     private val journal = JSONArray()
@@ -107,6 +107,7 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
     fun run(): JSONObject {
         if (mode == Mode.SDK_WINDOW) return runSdk()
         if (mode == Mode.EXPLICIT_READER) return runReader()
+        if (mode == Mode.NATIVE_PAIR) return runNativePair()
         check(Build.HARDWARE in setOf("ranchu", "goldfish") && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN)
         check(manifestSha256.matches(Regex("[a-f0-9]{64}")))
         val bytes = read(input, "manifest.json", 512 * 1024)
@@ -705,6 +706,160 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             .put("pairedNativePresentation", "UNSUPPORTED_W3_NATIVE_TRIM_AND_CLOCK")
     }
 
+    /** Separate qualification action. Native counterparts never enter the SDK
+     * checkpoint decoder. Their original AU geometry is bound to the partner's
+     * real decoded SFCP2 and the actual retained native file/table bytes. */
+    private fun nativeReader(sourceDir: File, source: JSONObject, sdk: ReaderRequest, refusals: JSONArray): ReaderRequest {
+        val reference = source.getJSONObject("nativeRecorderFile")
+        val expectedKeys = setOf("filename", "fileSHA256", "sdkFileSHA256", "sourceGeneration", "writerReceiptSHA256", "writerAuditSHA256")
+        check(reference.keys().asSequence().toSet() == expectedKeys)
+        check(reference.getString("filename") == "native-recorder.mp4")
+        hex32(reference.getString("writerReceiptSHA256")); hex32(reference.getString("writerAuditSHA256"))
+        val bytes = read(sourceDir, "native-recorder.mp4", NativeAacRecorderFileAdmission.MAX_BYTES)
+        val packets = (0 until sdk.packets.length()).map { index ->
+            val packet = sdk.packets.getJSONObject(index)
+            NativeAacRecorderFileAdmission.OriginalPacket(packet.getInt("size"), packet.getLong("codedDts"),
+                packet.getLong("codedPts"), packet.getInt("codedDuration"), packet.getString("sha256"))
+        }
+        val checkedSource = NativeAacRecorderFileAdmission.Source(sdk.provenance.getString("fileSHA256"), sdk.generation,
+            sdk.head, sdk.tail, sdk.expectedFrames, sdk.mediaTime, packets)
+        val registration = NativeAacRecorderFileAdmission.Registration(reference.getString("fileSHA256"),
+            reference.getString("sdkFileSHA256"), reference.getLong("sourceGeneration"))
+        val before = readerDecoderCreates
+        val actual = NativeAacRecorderFileAdmission.admit(bytes, registration, checkedSource)
+        fun refused(kind: String, operation: () -> Unit) {
+            var rejected = false
+            try { operation() } catch (_: IllegalArgumentException) { rejected = true }
+            check(rejected && before == readerDecoderCreates) { "Native file refusal bypassed" }
+            refusals.put(JSONObject().put("kind", kind).put("refused", rejected)
+                .put("decoderCallsBefore", before).put("decoderCallsAfter", readerDecoderCreates))
+        }
+        refused("FOREIGN_NATIVE_SOURCE_REFUSED_BEFORE_DECODER") {
+            NativeAacRecorderFileAdmission.admit(bytes, registration.copy(sdkFileSHA256 = "00".repeat(32)), checkedSource)
+        }
+        // This is the actual valid SDK partner token, not a fabricated native
+        // token. The native-file admission seam categorically refuses it.
+        val foreign = read(sourceDir, "healthy.final.sfcp2", 66080)
+        refused("FOREIGN_NATIVE_CHECKPOINT_REFUSED_BEFORE_DECODER") {
+            NativeAacRecorderFileAdmission.admit(bytes, registration, checkedSource, foreign)
+        }
+        val malformed = bytes.copyOf().also { it[0] = 0; it[1] = 0; it[2] = 0; it[3] = 0 }
+        refused("MALFORMED_NATIVE_BOX_REFUSED_BEFORE_DECODER") {
+            NativeAacRecorderFileAdmission.admit(malformed, registration.copy(fileSHA256 = sha(malformed)), checkedSource)
+        }
+        check(cleanupKnown && readerDecoderCreates == before)
+        val observedPackets = JSONArray()
+        for (packet in actual.packets) observedPackets.put(JSONObject().put("offset", packet.offset).put("size", packet.size)
+            .put("codedDts", packet.dts).put("codedPts", packet.pts).put("codedDuration", packet.duration)
+            .put("codedTimescale", 48000).put("sha256", packet.sha256))
+        val provenance = JSONObject().put("scope", "CHECKED_NATIVE_RECORDER_FILE_AND_SEPARATE_SDK_GEOMETRY; NOT_NATIVE_SOURCE_AUTHORITY")
+            .put("sdkPartner", JSONObject(sdk.provenance.toString())).put("nativeFileSHA256", actual.sha256)
+            .put("nativeFileMovieDuration", actual.movieDuration).put("nativeFileEdits", actual.edits)
+            .put("nativeFileHasSFCP2", false).put("nativeCheckpointDecodeCallsReturned", 0)
+            .put("sourceGeneration", sdk.generation).put("nativeSourceQualified", false)
+            .put("actualNativePackets", observedPackets).put("registeredWriter", reference)
+        return sdk.copy(provenance = provenance)
+    }
+
+    private fun copyPairFile(sourceDir: File, directory: File, name: String, expectedHash: String) {
+        val file = File(directory, name); check(file.createNewFile())
+        val stream = acquire("pair.copy.open:$name") { FileOutputStream(file) }; retained.add(stream)
+        try { stream.write(read(sourceDir, name, 4 * 1024 * 1024)); stream.fd.sync() }
+        finally { if (close("pair.copy.close:$name") { stream.close() }) retained.remove(stream) }
+        check(cleanupKnown) { "Pair file close unknown" }
+        check(sha(read(directory, name, 4 * 1024 * 1024)) == expectedHash)
+    }
+
+    private fun runNativePair(): JSONObject {
+        check(Build.HARDWARE in setOf("ranchu", "goldfish") && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN)
+        val bytes = read(input, "manifest.json", 512 * 1024); check(sha(bytes) == manifestSha256)
+        val manifest = JSONObject(String(bytes, Charsets.UTF_8))
+        check(manifest.getString("schema") == "generated-native-aac-paired-reader-input-v1" && manifest.getBoolean("generatedOnly"))
+        check(manifest.getString("pairedNativePresentation") == "UNSUPPORTED_W3_NATIVE_TRIM_AND_CLOCK")
+        val names = listOf("seed-79225-programme-48000", "seed-79225-programme-2765", "seed-149120-programme-48000", "seed-149120-programme-2765")
+        val cases = manifest.getJSONArray("cases"); check(cases.length() == names.size)
+        val results = JSONArray(); var failure: String? = null
+        val observations = NativeAacPairObservationStatus(names.drop(1).flatMap { name ->
+            listOf("$name:sdkFileReader", "$name:nativeFileReader")
+        })
+        fun observe(name: String, role: String, value: JSONObject) {
+            observations.record("$name:$role", NativeAacPairObservationStatus.Observation(
+                acquiredResourcesClosed = value.getBoolean("acquiredResourcesClosed"),
+                failure = value.opt("failure") as? String,
+                inputEos = value.getBoolean("inputEos"), outputEos = value.getBoolean("outputEos"),
+                streamClosed = value.getBoolean("streamClosed"), pcmAvailable = value.has("pcmSHA256"),
+            ))
+            failure = failure ?: observations.firstFailure
+        }
+        try {
+            for (i in 0 until cases.length()) {
+                active(); val source = cases.getJSONObject(i); val name = source.getString("name"); check(name == names[i])
+                val sourceDir = File(input, name); check(sourceDir.canonicalFile.parentFile == input.canonicalFile && !Files.isSymbolicLink(sourceDir.toPath()))
+                val files = source.getJSONObject("files"); check(files.length() in 1..16)
+                for (key in files.keys()) check(sha(read(sourceDir, key, 4 * 1024 * 1024)) == files.getString(key))
+                val row = JSONObject().put("name", name).put("sourceManifestCase", source).put("sourceOutcome", source.getString("sourceOutcome"))
+                    .put("nativeSourceQualified", false).put("nativeWindowQualified", false).put("presentationEquivalent", false).put("appAdmission", false)
+                results.put(row)
+                if (!source.getBoolean("eligible")) { check(i == 0 && source.getString("sourceOutcome") == "FAILED"); row.put("classification", "RETAINED_FAILED_SOURCE_NO_REPLAY"); continue }
+                check(i > 0 && source.getString("sourceOutcome") == "CANDIDATE_QUALIFIED")
+                val observed = JSONObject(String(read(sourceDir, "receipt.json", 4 * 1024 * 1024), Charsets.UTF_8))
+                check(observed.getBoolean("generatedOnly") && observed.getBoolean("startIssued") && observed.getBoolean("inputEos") && observed.getBoolean("outputEos") && observed.getBoolean("cleanupConfirmed") && observed.isNull("failure"))
+                val closure = observed.getJSONObject("encoderClosure"); check(closure.getBoolean("stopReturned") && closure.getBoolean("releaseReturned"))
+                val q = source.getJSONObject("queued")
+                check(q.getLong("preparation") == observed.getLong("successfulPreambleFrames") && q.getLong("programmeRaw") == observed.getLong("generatedProgrammeRawFrames") && q.getLong("programmeIntentionalZero") == observed.getLong("intentionalProgrammeZeroFrames"))
+                check(q.getLong("blockPadding") == observed.getLong("successfulBlockPaddingFrames") && q.getLong("codecDrain") == observed.getLong("successfulCodecDrainFrames"))
+                val original = read(sourceDir, "buffers.bin", 4 * 1024 * 1024); val packets = source.getJSONArray("packets"); check(packets.length() in 1..128)
+                for (pi in 0 until packets.length()) {
+                    val p = packets.getJSONObject(pi); val at = p.getInt("offset"); val size = p.getInt("size")
+                    check(at >= 0 && size in 1..65536 && at.toLong() + size <= original.size && sha(original.copyOfRange(at, at + size)) == p.getString("sha256"))
+                    check(p.getLong("codedPts") == p.getLong("codedDts") && p.getInt("codedDuration") == 1024 && p.getInt("codedTimescale") == 48000)
+                    check(p.getLong("codedDts") == Math.addExact(source.getLong("codedOrigin"), Math.multiplyExact(pi.toLong(), 1024L)))
+                    Math.multiplyExact(p.getLong("codedPts"), 1_000_000L)
+                    check(p.getInt("flags") and (MediaCodec.BUFFER_FLAG_CODEC_CONFIG or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME) == 0)
+                }
+                val reference = source.getJSONObject("readerFile"); check(reference.getLong("sourceGeneration") == (i + 1).toLong())
+                val sdkRefusals = JSONArray(); val nativeRefusals = JSONArray()
+                row.put("sdkPreDecoderRefusals", sdkRefusals).put("nativePreDecoderRefusals", nativeRefusals)
+                val beforeSdkCheckpoint = readerCheckpointDecodes
+                val sdk = checkedReader(sourceDir, source, reference, sdkRefusals)
+                val sdkCheckpointReturns = readerCheckpointDecodes - beforeSdkCheckpoint
+                check(sdkCheckpointReturns == 1)
+                val beforeNativeCheckpoint = readerCheckpointDecodes
+                val native = nativeReader(sourceDir, source, sdk, nativeRefusals)
+                val nativeCheckpointReturns = readerCheckpointDecodes - beforeNativeCheckpoint
+                check(cleanupKnown && nativeCheckpointReturns == 0)
+                val directory = File(root, name); check(directory.mkdir())
+                copyPairFile(sourceDir, directory, "healthy.mp4", reference.getString("fileSHA256"))
+                copyPairFile(sourceDir, directory, "native-recorder.mp4", source.getJSONObject("nativeRecorderFile").getString("fileSHA256"))
+                row.put("sdkCheckpointDecodeCallsReturned", sdkCheckpointReturns).put("nativeCheckpointDecodeCallsReturned", nativeCheckpointReturns)
+                val sdkObservation = decode(directory, "healthy", signedPresentation = true, outputName = "sdk-file", reader = sdk, expectedDecoderName = sdk.decoderName)
+                row.put("sdkFileReader", sdkObservation); observe(name, "sdkFileReader", sdkObservation)
+                check(cleanupKnown && observations.mayContinue) { "SDK pair acquired decoder/file closure unknown" }
+                val nativeObservation = decode(directory, "native-recorder", signedPresentation = true, outputName = "native-file", reader = native, expectedDecoderName = sdk.decoderName)
+                row.put("nativeFileReader", nativeObservation); observe(name, "nativeFileReader", nativeObservation)
+                check(cleanupKnown && observations.mayContinue) { "Native pair acquired decoder/file closure unknown" }
+                check(sha(read(directory, "healthy.mp4", 4 * 1024 * 1024)) == reference.getString("fileSHA256"))
+                check(sha(read(directory, "native-recorder.mp4", 4 * 1024 * 1024)) == source.getJSONObject("nativeRecorderFile").getString("fileSHA256"))
+                row.put("classification", if (sdkObservation.getBoolean("observationCompleted") && nativeObservation.getBoolean("observationCompleted"))
+                    "PAIRED_DECODER_OBSERVATIONS_PENDING_EXTERNAL_WHOLE_ARRAY_AND_EXACT_GATES" else "FAILED_DECODER_OBSERVATION")
+                writeJson(File(directory, "receipt.json"), row); check(cleanupKnown)
+            }
+        } catch (error: Exception) { failure = failure ?: (error.javaClass.simpleName + ": " + error.message?.take(512)) }
+        return JSONObject().put("schema", "generated-native-aac-paired-reader-v1").put("generatedOnly", true).put("emulatorOnly", true)
+            .put("hardware", Build.HARDWARE).put("sdk", Build.VERSION.SDK_INT).put("fingerprint", Build.FINGERPRINT)
+            .put("inputManifestSHA256", manifestSha256).put("sourceProofs", manifest.getJSONObject("sourceProofs")).put("cases", results)
+            .put("operations", journal).put("encoderCreated", false).put("sdkMuxerCreated", false).put("newSdkFileCreated", false)
+            .put("programmeModeExecutedOnDevice", false).put("currentRustWindowExercised", false)
+            .put("sdkCheckpointDecodeCallsReturned", readerCheckpointDecodes).put("nativeCheckpointDecodeCallsReturned", 0)
+            .put("allCasesVisited", results.length() == 4).put("decoderCreateAttempts", readerDecoderCreates).put("plannedDecoderObservations", 6)
+            .put("decoderObservationsRecorded", observations.observationsRecorded).put("completedDecoderObservations", observations.completedObservations)
+            .put("allDecoderObservationsComplete", observations.allDecoderObservationsComplete && failure == null)
+            .put("cleanupConfirmed", cleanupKnown && retained.isEmpty()).put("failure", failure ?: JSONObject.NULL).put("cancelled", cancelled.get())
+            .put("rawNativeClockGatePassed", false).put("nativeSourceQualified", false).put("contentQualified", false)
+            .put("nativeWindowQualified", false).put("presentationEquivalent", false).put("appAdmission", false).put("stockFileInteropRestored", false)
+            .put("pairedNativePresentation", "UNQUALIFIED_NEW_NATIVE_FILE_PAIR; W3_UNSUPPORTED_RETAINED")
+    }
+
     private fun decode(directory: File, kind: String, signedPresentation: Boolean = false, omitInputEos: Boolean = false, outputName: String = kind,
         reader: ReaderRequest? = null, expectedDecoderName: String? = null): JSONObject {
         val result = JSONObject().put("inputEos", false).put("outputEos", false).put("cleanupConfirmed", false)
@@ -739,7 +894,7 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             }
             formats.put(format("decoder-requested", extracted))
             cleanupKnown = false
-            if (mode == Mode.EXPLICIT_READER) readerDecoderCreates++
+            if (mode == Mode.EXPLICIT_READER || mode == Mode.NATIVE_PAIR) readerDecoderCreates++
             val codec = call("decoder.create:$kind") { MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC) }
             native = codec; retained.add(codec); cleanupKnown = true
             result.put("decoderName", codec.name)
@@ -747,7 +902,8 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             call("decoder.configure:$kind") { codec.configure(extracted, null, null, 0) }
             formats.put(format("decoder-accepted", codec.inputFormat))
             startAttempted = true; call("decoder.start:$kind") { codec.start() }; started = true
-            stream = FileOutputStream(File(directory, "$outputName.s16le")); retained.add(checkNotNull(stream))
+            cleanupKnown = false // A throwing stream acquisition has no confirmed returned owner.
+            stream = FileOutputStream(File(directory, "$outputName.s16le")); retained.add(checkNotNull(stream)); cleanupKnown = true
             if (reader != null) {
                 val owner = NativeRecordingReader(codec, source, checkNotNull(stream), reader.generation,
                     ReturnedPcmClock.Geometry(reader.mediaTime, 0, reader.expectedFrames), ::event, kind)
@@ -925,14 +1081,28 @@ internal class NativeAacProgrammeWindowProbe(private val root: File, private val
             .put("stopSkippedNotStarted", !started && !startAttempted).put("decoderReleased", decoderReleased).put("extractorReleased", extractorReleased).put("streamClosed", streamClosed)
             .put("cleanupConfirmed", decoderReleased && extractorReleased && streamClosed && !nativeIndexUncertain)
         val pcm = File(directory, "$outputName.s16le")
-        if (checkedOutputOwner == null || streamClosed) {
+        val pcmReadbackAllowed = NativeAacPairObservationStatus.pcmReadbackAllowed(
+            acquisitionsKnown = cleanupKnown, streamAcquired = stream != null, streamClosed = streamClosed)
+        result.put("pcmReadback", if (pcmReadbackAllowed) "ACQUISITION_KNOWN_AND_NO_STREAM_OR_CHECKED_CLOSE" else "NO_FILE_READBACK")
+        if (pcmReadbackAllowed) {
             if (pcm.isFile && pcm.length() <= 131072) result.put("pcmBytes", pcm.length()).put("pcmSHA256", sha(pcm.readBytes()))
             if (checkedOutputOwner != null) result.getJSONObject("checkedSdkPlaybackClock").put("pcmReadback", "AFTER_KNOWN_STREAM_CLOSE")
         } else {
-            // Keep the exact stream and owner retained; no stat/hash/readback IO
-            // is authorised by an unconfirmed close.
-            result.getJSONObject("checkedSdkPlaybackClock").put("pcmReadback", "UNKNOWN_STREAM_CLOSE_NO_FILE_READBACK")
+            // Unknown acquisition or stream close forbids even stat/read/hash.
+            // There need not be a returned stream/output owner to retain.
+            if (checkedOutputOwner != null) result.getJSONObject("checkedSdkPlaybackClock").put("pcmReadback", "NO_FILE_READBACK")
         }
+        val acquiredResourcesClosed = NativeAacPairObservationStatus.acquiredResourcesClosed(
+            acquisitionsKnown = cleanupKnown,
+            decoderAcquired = native != null, decoderReleased = decoderReleased,
+            extractorAcquired = extractor != null, extractorReleased = extractorReleased,
+            streamAcquired = stream != null, streamClosed = streamClosed,
+            nativeIndexUncertain = nativeIndexUncertain,
+        )
+        val observation = NativeAacPairObservationStatus.Observation(acquiredResourcesClosed,
+            result.opt("failure") as? String, inputEos, outputEos, streamClosed, result.has("pcmSHA256"))
+        result.put("streamAcquired", stream != null).put("acquiredResourcesClosed", acquiredResourcesClosed)
+            .put("observationCompleted", observation.completed)
         return result
     }
 }

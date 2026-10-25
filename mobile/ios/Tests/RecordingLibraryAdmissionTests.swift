@@ -155,4 +155,35 @@ final class RecordingLibraryAdmissionTests: XCTestCase {
         XCTAssertFalse(gate.dismissPicker(picker, selected: true))
         XCTAssertFalse(gate.canDeliver(picker)); XCTAssertNil(gate.reserve(.scan))
     }
+    func testRecoveryRequiresLiveCapturePredicateAndOwnsFileAndCaptureReservation() {
+        let gate = RecordingLibraryAdmission()
+        XCTAssertNil(gate.reserve(.recovery)); XCTAssertNil(gate.beginRecovery { false })
+        XCTAssertTrue(gate.idle)
+        let ticket = gate.beginRecovery { true }!
+        XCTAssertNil(gate.withCaptureReservation { "capture" }); XCTAssertNil(gate.reserve(.scan))
+        XCTAssertNil(gate.beginExport { true }); XCTAssertNil(gate.beginRecovery { true })
+        XCTAssertTrue(gate.begin(ticket)); XCTAssertTrue(gate.beginRecoveryPublication(ticket))
+        XCTAssertFalse(gate.beginRecoveryPublication(ticket)); XCTAssertNil(gate.withCaptureReservation { "capture" })
+        XCTAssertTrue(gate.finish(ticket, cleanupComplete: true)); XCTAssertTrue(gate.canDeliver(ticket))
+        XCTAssertEqual(gate.withCaptureReservation { "capture" }, "capture")
+    }
+    func testRecoveryPublicationRejectsCancelledForeignAndStaleTickets() {
+        let gate = RecordingLibraryAdmission(), other = RecordingLibraryAdmission()
+        let cancelled = gate.beginRecovery { true }!, foreign = other.beginRecovery { true }!
+        XCTAssertTrue(gate.begin(cancelled)); XCTAssertFalse(gate.beginRecoveryPublication(foreign))
+        gate.cancel(cancelled); XCTAssertFalse(gate.beginRecoveryPublication(cancelled))
+        XCTAssertFalse(gate.finish(cancelled, cleanupComplete: true))
+        let successor = gate.beginRecovery { true }!
+        XCTAssertTrue(gate.begin(successor)); XCTAssertFalse(gate.beginRecoveryPublication(cancelled))
+        XCTAssertTrue(gate.beginRecoveryPublication(successor)); XCTAssertTrue(gate.finish(successor, cleanupComplete: true))
+    }
+    func testRecoveryUnknownCleanupAndPostCutCancellationNeverReleaseEarly() {
+        let gate = RecordingLibraryAdmission(), ticket = gate.beginRecovery { true }!
+        XCTAssertTrue(gate.begin(ticket)); XCTAssertTrue(gate.beginRecoveryPublication(ticket))
+        gate.cancel(ticket); XCTAssertFalse(gate.canDeliver(ticket))
+        XCTAssertFalse(gate.finish(ticket, cleanupComplete: false)); XCTAssertTrue(gate.cleanupRetained)
+        XCTAssertNil(gate.withCaptureReservation { "capture" }); XCTAssertNil(gate.beginRecovery { true })
+        gate.close(); XCTAssertFalse(gate.finish(ticket, cleanupComplete: true)); XCTAssertFalse(gate.canDeliver(ticket))
+    }
+
 }

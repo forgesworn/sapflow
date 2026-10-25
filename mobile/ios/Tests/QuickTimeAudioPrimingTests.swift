@@ -218,6 +218,179 @@ final class QuickTimeAudioPrimingTests: XCTestCase {
             XCTAssertThrowsError(try prepare(header))
         }
     }
+
+    /// Synthetic native audio-only shape: measured movie/track N and no edts.
+    /// Existing fixture builders and all twenty previous test bodies stay exact.
+    static func audioOnlyHeader(version: UInt8 = 0, wide: Bool = false, asc: UInt16 = 0x1188,
+                                unknown: Data = Data()) -> Data {
+        var data = header(version: version, wide: wide, video: false, asc: asc, unknown: unknown)
+        let marker = data.range(of: Data("edts".utf8))!.lowerBound
+        let start = marker - 4
+        let length = data[start..<marker].reduce(0) { ($0 << 8) | Int($1) }
+        let track = data.range(of: Data("trak".utf8))!.lowerBound - 4
+        data.removeSubrange(start..<(start + length))
+        for at in [0, track] {
+            let width = wide ? 8 : 4, field = at + (wide ? 8 : 0)
+            let size = data[field..<(field + width)].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            data.replaceSubrange(field..<(field + width), with: be(size - UInt64(length), width))
+        }
+        let clock = data.range(of: Data("mvhd".utf8))!.lowerBound
+        let at = clock + (version == 0 ? 20 : 28), width = version == 0 ? 4 : 8
+        data.replaceSubrange(at..<(at + width), with: be(facts.validFrames, width))
+        return data
+    }
+
+    func testAudioOnlyMissingEditProducesMeasuredEditAndRoll() throws {
+        let original = Self.audioOnlyHeader()
+        let result = try Priming.prepareAudioOnly(moov: original, facts: Self.facts)
+        XCTAssertEqual(result.moov.count, original.count + 90)
+        XCTAssertEqual(result.audioTrackID, 2); XCTAssertEqual(result.validFrames, 96356)
+        XCTAssertEqual(result.leadingFrames, 2112); XCTAssertEqual(result.trailingFrames, 860)
+        XCTAssertEqual(result.emptyEditDuration, 0)
+        let edit = Self.box("edts", Self.box("elst", Self.full(Self.be(1) + Self.be(96356) + Self.be(2112) + Self.be(65536))))
+        XCTAssertNotNil(result.moov.range(of: edit))
+        XCTAssertEqual(result.moov.ranges(of: Data("sgpd".utf8)).count, 1)
+        XCTAssertEqual(result.moov.ranges(of: Data("sbgp".utf8)).count, 1)
+    }
+
+    func testAudioOnlyPreservesExistingClocksSamplesOffsetsAndUnknownMetadata() throws {
+        let unknown = Self.box("uuid", Data(repeating: 0x91, count: 31)) + Self.box("zzzz", Data([0, 1, 2, 3]))
+        let original = Self.audioOnlyHeader(unknown: unknown)
+        let result = try Priming.prepareAudioOnly(moov: original, facts: Self.facts)
+        for kind in ["mvhd", "tkhd", "mdhd", "stts", "stsz", "stco"] {
+            let marker = try XCTUnwrap(original.range(of: Data(kind.utf8))).lowerBound
+            let start = marker - 4, size = original[start..<marker].reduce(0) { ($0 << 8) | Int($1) }
+            XCTAssertNotNil(result.moov.range(of: original.subdata(in: start..<(start + size))))
+        }
+        XCTAssertNotNil(result.moov.range(of: unknown))
+    }
+
+    func testAudioOnlyRefusesExistingEditAndDoubleApply() throws {
+        XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: Self.header(video: false), facts: Self.facts))
+        let first = try Priming.prepareAudioOnly(moov: Self.audioOnlyHeader(), facts: Self.facts)
+        XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: first.moov, facts: Self.facts))
+    }
+
+    func testAudioOnlyRefusesVideoAndAdditionalTrack() throws {
+        XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: Self.header(), facts: Self.facts))
+        let only = Self.audioOnlyHeader()
+        let extra = Self.box("moov", Data(only.dropFirst(8)) + Self.track(id: 3, audio: true))
+        XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: extra, facts: Self.facts))
+        let wrong = Self.box("moov", Data(only.dropFirst(8)) + Self.track(id: 3, audio: false))
+        XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: wrong, facts: Self.facts))
+    }
+
+    func testAudioOnlyRefusesWrongMovieTrackDurationAndScale() throws {
+        let original = Self.audioOnlyHeader()
+        for (marker, offset, value) in [("mvhd", 20, UInt64(96355)), ("tkhd", 24, 96355), ("mvhd", 16, 44100)] {
+            XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: altered(original, marker: marker, offset: offset, value: value), facts: Self.facts))
+        }
+    }
+
+    func testAudioOnlyRefusesMissingOrUnrepresentableFacts() throws {
+        let original = Self.audioOnlyHeader()
+        for facts in [Priming.Facts(accessUnits: 0, leadingFrames: 2112, validFrames: 96356),
+                      .init(accessUnits: 97, leadingFrames: 0, validFrames: 96356),
+                      .init(accessUnits: 97, leadingFrames: 2112, validFrames: 0),
+                      .init(accessUnits: 4_000_000, leadingFrames: UInt32(Int32.max) + 1, validFrames: 1),
+                      .init(accessUnits: 97, leadingFrames: 2112, validFrames: UInt64(UInt32.max) + 1)] {
+            XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: original, facts: facts))
+        }
+        XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: original, facts: .init(audioTrackID: 3, accessUnits: 97, leadingFrames: 2112, validFrames: 96356)))
+    }
+
+    func testAudioOnlyStillValidatesAACDescriptionsAndSampleTables() throws {
+        XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: Self.audioOnlyHeader(asc: 0x1210), facts: Self.facts))
+        for (marker, offset, value) in [("stts", 16, UInt64(960)), ("stsz", 12, 96), ("alis", 4, 0)] {
+            XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: altered(Self.audioOnlyHeader(), marker: marker, offset: offset, value: value), facts: Self.facts))
+        }
+    }
+
+    func testAudioOnlyVersionOneWideAncestorsAndSliceRemainSupported() throws {
+        let original = Self.audioOnlyHeader(version: 1, wide: true, asc: 0x1190)
+        var padded = Data([9, 9, 9]); padded.append(original)
+        let result = try Priming.prepareAudioOnly(moov: padded.dropFirst(3), facts: Self.facts)
+        XCTAssertEqual(result.moov.count, original.count + 90); XCTAssertEqual(result.moov.prefix(4), Self.be(1))
+        XCTAssertEqual(result.moov, try Priming.prepareAudioOnly(moov: original, facts: Self.facts).moov)
+        XCTAssertEqual(original, Self.audioOnlyHeader(version: 1, wide: true, asc: 0x1190))
+    }
+
+    func testAudioOnlyRefusesEveryTruncationAndOversizedHeader() {
+        let original = Self.audioOnlyHeader()
+        for count in 0..<original.count { XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: original.prefix(count), facts: Self.facts)) }
+        XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: Data(repeating: 0, count: Priming.maximumHeaderBytes), facts: Self.facts))
+    }
+
+    /// Native M4A grammar: 28-byte v0 mp4a, default channels2, direct esds with
+    /// native four-byte descriptor lengths and mono ASC. No v1 extension/wave.
+    static func nativeV0AudioOnlyHeader(channels: UInt16 = 2, asc: UInt16 = 0x1188,
+                                        sampleRate: UInt32 = 48000, entryVersion: UInt16 = 0,
+                                        neutralEdit: Bool = false, wrappedESDS: Bool = false) -> Data {
+        func nativeDescriptor(_ tag: UInt8, _ body: Data) -> Data {
+            Data([tag, 0x80, 0x80, 0x80, UInt8(body.count)]) + body
+        }
+        let specific = nativeDescriptor(5, be(UInt64(asc), 2))
+        let decoder = nativeDescriptor(4, Data([0x40, 0x14, 0, 0x18, 0, 0, 0, 0, 0, 0, 1, 0x77, 0]) + specific)
+        let esds = full(nativeDescriptor(3, Data([0, 0, 0]) + decoder + nativeDescriptor(6, Data([2]))))
+        var entry = Data(repeating: 0, count: 28)
+        entry.replaceSubrange(6..<8, with: be(1, 2))
+        entry.replaceSubrange(8..<10, with: be(UInt64(entryVersion), 2))
+        entry.replaceSubrange(16..<18, with: be(UInt64(channels), 2))
+        entry.replaceSubrange(18..<20, with: be(16, 2))
+        entry.replaceSubrange(24..<28, with: be(UInt64(sampleRate) << 16))
+        if entryVersion == 1 { entry += be(1024) + Data(repeating: 0, count: 12) }
+        entry += wrappedESDS ? box("wave", box("esds", esds)) : box("esds", esds)
+        var tables = box("stsd", full(be(1) + box("mp4a", entry)))
+        tables += box("stsz", full(be(7) + be(97))) + box("stts", full(be(1) + be(97) + be(1024)))
+        tables += box("stsc", full(be(1) + be(1) + be(97) + be(1))) + box("stco", full(be(1) + be(4096)))
+        let references = box("dinf", box("dref", full(be(1) + box("url ", be(1)))))
+        let media = box("mdia", box("mdhd", clock(48000, 97 * 1024, version: 0))
+            + box("hdlr", full(be(0) + Data("soun".utf8) + Data(repeating: 0, count: 12)))
+            + box("minf", references + box("stbl", tables)))
+        var trackHeader = Data(repeating: 0, count: 84)
+        trackHeader.replaceSubrange(12..<16, with: be(2))
+        trackHeader.replaceSubrange(20..<24, with: be(facts.validFrames))
+        var movieClock = clock(48000, facts.validFrames, version: 0)
+        movieClock += Data(repeating: 0, count: 100 - movieClock.count)
+        let edit = neutralEdit ? box("edts", box("elst", full(be(1) + be(facts.validFrames) + be(0) + be(65536)))) : Data()
+        return box("moov", box("mvhd", movieClock) + box("trak", box("tkhd", trackHeader) + edit + media))
+    }
+
+    func testNativeV0DefaultChannelCountMonoIsOnlyAdmittedByAudioOnlyEntry() throws {
+        let original = Self.nativeV0AudioOnlyHeader()
+        let result = try Priming.prepareAudioOnly(moov: original, facts: Self.facts)
+        XCTAssertEqual(result.moov.count, original.count + 90)
+        XCTAssertEqual(result.leadingFrames, 2112); XCTAssertEqual(result.validFrames, 96356)
+        let marker = try XCTUnwrap(original.range(of: Data("mp4a".utf8))).lowerBound
+        let start = marker - 4, length = original[start..<marker].reduce(0) { ($0 << 8) | Int($1) }
+        XCTAssertNotNil(result.moov.range(of: original.subdata(in: start..<(start + length))))
+        XCTAssertEqual(original[marker + 20..<marker + 22], Self.be(2, 2))
+        XCTAssertThrowsError(try prepare(Self.nativeV0AudioOnlyHeader(neutralEdit: true))) { error in
+            XCTAssertEqual(error as? Priming.Failure, .unsupportedLayout)
+        }
+    }
+
+    func testNativeV0MonoAllowanceRefusesOtherRatesChannelsASCAndVersions() {
+        let unsupported = [Self.nativeV0AudioOnlyHeader(channels: 0), Self.nativeV0AudioOnlyHeader(channels: 3),
+            Self.nativeV0AudioOnlyHeader(asc: 0x1210), Self.nativeV0AudioOnlyHeader(asc: 0x118c),
+            Self.nativeV0AudioOnlyHeader(sampleRate: 44100), Self.nativeV0AudioOnlyHeader(entryVersion: 1),
+            Self.nativeV0AudioOnlyHeader(entryVersion: 2), Self.nativeV0AudioOnlyHeader(channels: 1, asc: 0x1190),
+            Self.nativeV0AudioOnlyHeader(wrappedESDS: true)]
+        for header in unsupported { XCTAssertThrowsError(try Priming.prepareAudioOnly(moov: header, facts: Self.facts)) }
+    }
+
+    func testNativeV0CanonicalMonoAndStereoDescriptionsStayByteExact() throws {
+        let configurations: [(UInt16, UInt16)] = [(1, 0x1188), (2, 0x1190)]
+        for (channels, asc) in configurations {
+            let original = Self.nativeV0AudioOnlyHeader(channels: channels, asc: asc)
+            let result = try Priming.prepareAudioOnly(moov: original, facts: Self.facts)
+            let at = try XCTUnwrap(original.range(of: Data("stsd".utf8))).lowerBound
+            let start = at - 4, length = original[start..<at].reduce(0) { ($0 << 8) | Int($1) }
+            XCTAssertNotNil(result.moov.range(of: original.subdata(in: start..<(start + length))))
+            XCTAssertEqual(try prepare(Self.nativeV0AudioOnlyHeader(channels: channels, asc: asc, neutralEdit: true)).moov.count,
+                           Self.nativeV0AudioOnlyHeader(channels: channels, asc: asc, neutralEdit: true).count + 54)
+        }
+    }
 }
 
 private extension Data {

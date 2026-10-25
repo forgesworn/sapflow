@@ -33,6 +33,24 @@ final class CaptureRecordingClosure {
         guard phase == .ingress, self.recorder === recorder else { phase = .refused; return false }
         self.owner = ObjectIdentifier(owner); self.loss = loss; phase = .recorder; return true
     }
+    func closeLegacyRecorder(_ recorder: AnyObject, writer: RecordingCatalogue.Writer, loss: CaptureRecordingLoss) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard phase == .ingress, self.recorder === recorder else { phase = .refused; return false }
+        owner = ObjectIdentifier(writer); self.loss = loss; phase = .recorder; return true
+    }
+    /// Original successfully processed offer count, before any existing native
+    /// head grouping/tail treatment. This does not derive programme H/T facts.
+    func consumeLegacy(writer: RecordingCatalogue.Writer, processedSamples: UInt64) -> RecordingCatalogue.Writer.CapturePermit? {
+        lock.lock(); defer { lock.unlock() }
+        guard phase == .recorder, owner == ObjectIdentifier(writer), samples == processedSamples,
+              case let .segment(start) = ticket.request, start.preparation == run.preparation,
+              recordingAdmission.ownsRecorder(ticket, recorder: recorder), let loss,
+              let permit = loss.commitLegacy(admission: admission, run: run, start: start, writer: writer) else {
+            phase = .refused; return nil
+        }
+        phase = .consumed
+        return permit
+    }
     /// Called only at the SDK/file owner's final-header commit boundary, after
     /// its exact installed checkpoint and actual drained native stats agree.
     func consume(owner: RecordingCheckpointOwner, frontier: RecordingCheckpointOwner.Frontier) -> Bool {

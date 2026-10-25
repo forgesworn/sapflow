@@ -12,6 +12,9 @@ final class CompressedRecorder {
     private var writer: AVAssetWriter?
     private let receipt: RecordingCatalogue.Writer
     private let hasVideo: Bool
+    private let captureBound: Bool
+    private let loss = CaptureRecordingLoss()
+    private var processedSamples: UInt64 = 0 // Existing recording FIFO only.
     private var video: AVAssetWriterInput?
     private var audio: AVAssetWriterInput?
     private var staged: [(unit: CompressedUnit, reservation: EncodedWorkBudget.Reservation)] = []
@@ -54,6 +57,7 @@ final class CompressedRecorder {
     /// A failed branch closes its real queue before notifying the logical show.
     /// Ordinary part finish, including Auto, is not a terminal branch detach.
     private func closeFailedAdmission() {
+        loss.mark() // Synchronous, before deferred failure notification/IO.
         budget.close()
         terminalLock.lock()
         guard !terminalAdmission else { terminalLock.unlock(); return }
@@ -66,8 +70,9 @@ final class CompressedRecorder {
 
     /// Called only on the explicit recording IO owner, after its durable WRITING
     /// receipt. The caller closes the receipt if AVAssetWriter creation throws.
-    init(receipt: RecordingCatalogue.Writer, queue: DispatchQueue, hasVideo: Bool = true, onFailure: @escaping (Error) -> Void) throws {
-        self.receipt = receipt; self.queue = queue; self.hasVideo = hasVideo; self.onFailure = onFailure
+    init(receipt: RecordingCatalogue.Writer, queue: DispatchQueue, hasVideo: Bool = true, captureBound: Bool = false, onFailure: @escaping (Error) -> Void) throws {
+        self.receipt = receipt; self.queue = queue; self.hasVideo = hasVideo; self.captureBound = captureBound; self.onFailure = onFailure
+        if captureBound { try loss.bindLegacy(receipt) }
         guard hasVideo ? receipt.identity.container != .m4a : receipt.identity.container == .m4a else {
             throw CaptureFailure(message: "Recording container does not match its immutable tracks")
         }
@@ -85,12 +90,12 @@ final class CompressedRecorder {
                 self.budget.release(reservation)
                 self.fail(CaptureFailure(message: "Video does not match this audio-only recording")); return
             }
-            if !self.hasVideo {
-                do { try self.offerAudio(unit, reservation: reservation) } catch { self.fail(error) }
-                return
-            }
-            do { try self.offerAudioVideo(unit, reservation: reservation, writer: writer) }
-            catch { self.fail(error) }
+            do {
+                if !self.hasVideo { try self.offerAudio(unit, reservation: reservation) }
+                else { try self.offerAudioVideo(unit, reservation: reservation, writer: writer) }
+                guard self.processedSamples < UInt64.max else { throw AudioRecordingTiming.Failure.overflow }
+                self.processedSamples += 1
+            } catch { self.fail(error) }
         }
         if admitted == nil {
             let first = budget.close(enqueueOn: queue, firstOnly: true) {
@@ -183,6 +188,7 @@ final class CompressedRecorder {
     /// Cold metadata events are enqueued before first AAC and after codec EOF.
     /// No publishing buffer or timestamp is modified by recording trims.
     func audioTiming(_ event: AudioRecordingTiming.Event) {
+        if case .failed = event { closeFailedAdmission() }
         queue.async {
             guard !self.finishing else { return }
             switch event {
@@ -412,7 +418,9 @@ final class CompressedRecorder {
     /// One recording-only failure may begin finish before capture Stop. Retain
     /// at most those two listeners; all further duplicates coalesce. Completed
     /// results replay without repeating native/file IO.
-    func finish(incomplete: Bool = false, _ completion: @escaping (Completion) -> Void) {
+    func finish(incomplete: Bool = false, producers: CaptureRecordingClosure? = nil, recorder: AnyObject? = nil,
+                _ completion: @escaping (Completion) -> Void) {
+        if incomplete { closeFailedAdmission() }
         budget.close(enqueueOn: queue) {
             if let completed = self.completed { completion(completed); return }
             guard !self.finishing else {
@@ -441,35 +449,35 @@ final class CompressedRecorder {
             self.staged.removeAll()
             if let tail = self.avAudioTail { self.budget.release(tail.reservation); self.avAudioTail = nil }
             guard let writer = self.writer else {
-                self.finishNativeWriter(containerCompleted: false); return
+                self.finishNativeWriter(containerCompleted: false, producers: producers, recorder: recorder); return
             }
             if writer.status == .writing && self.hasAcceptedMedia {
                 // All appends use this same queue. Preserve a positive accepted
                 // prefix: cancelWriting would block and delete the original.
                 self.video?.markAsFinished(); self.audio?.markAsFinished()
-                writer.finishWriting { self.queue.async { self.finishNativeWriter(containerCompleted: self.writer?.status == .completed) } }
+                writer.finishWriting { self.queue.async { self.finishNativeWriter(containerCompleted: self.writer?.status == .completed, producers: producers, recorder: recorder) } }
             } else {
                 // Public API permits cancellation only after appends have
                 // returned; it can delete this never-started/empty output.
                 if writer.status == .unknown || writer.status == .writing { writer.cancelWriting() }
-                self.finishNativeWriter(containerCompleted: writer.status == .completed && self.hasAcceptedMedia)
+                self.finishNativeWriter(containerCompleted: writer.status == .completed && self.hasAcceptedMedia, producers: producers, recorder: recorder)
             }
         }
     }
-    private func finishNativeWriter(containerCompleted: Bool) {
+    private func finishNativeWriter(containerCompleted: Bool, producers: CaptureRecordingClosure?, recorder: AnyObject?) {
         let nativeFailure = writer?.error
         video = nil; audio = nil; writer = nil
         // The preceding native callback/cancel queue turn may still have a
         // local strong writer reference. Its return precedes this metadata turn.
-        queue.async { self.finishReceipt(containerCompleted: containerCompleted, nativeFailure: nativeFailure) }
+        queue.async { self.finishReceipt(containerCompleted: containerCompleted, nativeFailure: nativeFailure, producers: producers, recorder: recorder) }
     }
-    private func finishReceipt(containerCompleted: Bool, nativeFailure: Error?) {
+    private func finishReceipt(containerCompleted: Bool, nativeFailure: Error?, producers: CaptureRecordingClosure?, recorder: AnyObject?) {
         var error = failure ?? nativeFailure
         var finalised = containerCompleted && error == nil
         var saved: URL?
         do {
             if containerCompleted {
-                if hasVideo, let leading = audioLeading,
+                if (hasVideo || finalised), let leading = audioLeading,
                    storedAudioUnits > 0, storedAudioUnits * 1024 > UInt64(leading) {
                     do {
                         if finalised && storedAudioUnits != audioUnits { throw AudioRecordingTiming.Failure.inconsistent }
@@ -479,18 +487,33 @@ final class CompressedRecorder {
                         let facts = QuickTimeAudioPriming.Facts(accessUnits: storedAudioUnits,
                             leadingFrames: leading, validFrames: coded - UInt64(leading) - UInt64(trailing))
                         try receipt.updateClosedMedia { file in
-                            try QuickTimeAudioPrimingFile.finalise(file, facts: facts)
+                            try QuickTimeAudioPrimingFile.finalise(file, facts: facts, hasVideo: hasVideo)
                         }
                     } catch let metadataError {
                         finalised = false
                         if error == nil { error = metadataError }
                     }
+                } else if !hasVideo && finalised {
+                    finalised = false
+                    if error == nil { error = AudioRecordingTiming.Failure.inconsistent }
                 }
                 let milliseconds = endTime.seconds * 1_000
                 guard milliseconds.isFinite, milliseconds >= 0, milliseconds < Double(Int64.max) else {
                     throw CaptureFailure(message: "Recording duration is outside its supported bound")
                 }
-                try receipt.complete(durationMs: Int64(milliseconds), outcome: finalised ? .finalised : .incomplete)
+                if finalised && captureBound {
+                    if let producers, let recorder,
+                       producers.closeLegacyRecorder(recorder, writer: receipt, loss: loss),
+                       let permit = producers.consumeLegacy(writer: receipt, processedSamples: processedSamples) {
+                        try receipt.complete(durationMs: Int64(milliseconds), capture: permit)
+                    } else {
+                        finalised = false
+                        if error == nil { error = CaptureFailure(message: "Real producer/ingress closure or recording loss refused final publication") }
+                        try receipt.complete(durationMs: Int64(milliseconds), outcome: .incomplete)
+                    }
+                } else {
+                    try receipt.complete(durationMs: Int64(milliseconds), outcome: finalised ? .finalised : .incomplete)
+                }
                 saved = receipt.fileURL
             } else {
                 receipt.cancel()

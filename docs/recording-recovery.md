@@ -339,9 +339,12 @@ compiler results and all three process-group closures. Private evidence is under
 The test uses freshly built packages and an actual loaded-host-library witness.
 All selected SDK build inputs remain unchanged; the separately recorded server
 body edit prevents a current whole-workspace verdict. Historical complete-source
-results are preserved. Portable public test-driver and CI integration remain
-open, along with production recovery, native presentation, physical storage,
-recorder adoption and the two-second loss bound.
+results are preserved. The portable public entrypoint,
+`python3 -B mobile/ios/test-recording-checkpoints-sdk.py`, builds the current host
+Rust SDK and fresh Swift bindings without private receipts. Its merged-main host
+run passes all 24 tests, and the macOS CI job is configured to run the same
+command. Hosted CI, production recovery, native presentation, physical storage,
+recorder adoption and the two-second loss bound still require their own evidence.
 
 ## iOS submitted-input finalisation
 
@@ -1310,8 +1313,9 @@ buffer timestamps and full presentation qualification still need actual proof.
 
 `checked-sdk-playback-clock-v1` is a separately registered, owner-approved clock
 profile for application-controlled decoded PCM playback. The approved policy is
-unchanged; its internal qualification owner is now implemented, with actual
-native qualification still unrun. The owner selected a checked application-owned
+unchanged; its internal qualification owner is implemented and has completed
+the bounded native schedule checks described below. Whole-content and production
+qualification remain separate. The owner selected a checked application-owned
 rational schedule as the alternative presentation-clock criterion for this
 playback path. Registration alone grants no native qualification or adoption;
 implementation and host evidence are recorded below. The
@@ -1478,17 +1482,165 @@ failure against 250 ms remains failed and is not replayed as eligible. No result
 here establishes waveform/paired presentation, production/default adoption,
 physical capture, power/performance advantage or recovery.
 
-The concrete next work is fresh SDK packages and full source/package/artefact
-verification once concurrent SDK work is stable, followed by actual native
-qualification of the implemented checked playback-clock owner. Source-generation /
-capture and ingress closure using actual native producers and paired
-presentation remain required. Raw native-clock results remain separately
-unqualified.
+### Later native schedule and current-source build results
+
+A later generated emulator run uses the actual `NativeRecordingReader`, sink and
+clock owners. All three eligible explicit-reader cases complete their checked
+schedules at 2,765, 48,000 and 2,765 frames. Actual input EOS, output EOS, whole
+sink writes, native releases and known owner/file closure are observed. The
+unconfigured control still returns 5,120 frames instead of the required 2,765;
+the first cold failed source is not replayed. Raw native timestamps and their failed clock
+checks remain unchanged. Independent review accepts only this schedule and
+accounting scope. It does not establish whole-content equivalence, producer
+source authority, seeks, A/V presentation or production adoption.
+
+That run belongs to source `4722209`. Its SDK inputs are preserved separately
+before later package builds; its receipts are not relabelled as current-source
+proof. Private evidence is under
+`target/privacy-standby/managed-reader-native-runtime-actual-v1/` and
+`managed-reader-native-inspection-actual-v1/`, with the byte-preserving input
+relocation under `native-clock-sdk-inputs-preserved-v1/`.
+
+At source `9d7d944`, fresh SDK packages and all eight host/package stages pass,
+including 797 Rust tests and 24 real-SDK Swift checkpoint tests. The Android app
+then passes 703 Debug tests, 683 Qualification tests and 39 Python verifier
+controls. Both unit tasks execute; all three APK assemblies, lint, qualification
+isolation and seven artefact checks pass with unchanged source and package
+inputs. Independent review verifies the resulting APKs, native bytes and Release
+isolation. These are build and package results, not physical or presentation
+acceptance. Private receipts and reviews are under
+`target/privacy-standby/native-pair-sdk-builds-actual-v1/` and
+`native-pair-android-app-gates-actual-v1/`.
+
+The separate paired-file action retains three original native-recorder files
+and the corresponding SDK recordings. Its first emulator attempt is cancelled
+when the activity is relaunched, before any decoder is created. The failed
+receipt retains one actual SDK checkpoint decode and no paired PCM result. A
+prelaunch successor refuses an incorrect help-advertisement condition; the
+corrected successor reaches its actual broadcast-idle command but exceeds the
+registered 60-second startup deadline before launching the activity. All three
+attempts remain failed, with their source bindings, logs and cleanup evidence
+preserved. Their owned emulator groups and temporary directories close; the
+pre-existing AVD remains. No physical phone is accessed. Evidence is under
+`target/privacy-standby/native-file-pair-runtime-actual-v1/`,
+`target/privacy-standby/native-file-pair-runtime-actual-v2/` and
+`target/privacy-standby/native-file-pair-runtime-actual-v3/`. No six-decoder paired run or
+independent paired Float32 comparison has completed. Neither the Int16 tolerance
+nor the exact independent-PCM requirement is relaxed.
+
+
+A later startup-only emulator diagnostic records four matching local readiness
+and configuration snapshots and a resumed unsupported-action Activity, while
+its global broadcast-idle observation times out after 20 seconds. It requests
+no valid media probe; native call counters are unobserved. The qualification
+Activity now retains the exact run and worker only after a real framework
+configuration handoff. The replacement Activity validates the same invocation;
+genuine destruction or a mismatch cancels it, and uncertain cleanup still
+fences a fresh worker. Four focused host regressions, 39 verifier controls,
+the three APK builds, Debug/Qualification lint and seven APK artefact checks
+pass. The new owner is present only in Debug and Qualification. This uses the
+unchanged pinned SDK AAR; it does not refresh the full unit or SDK qualification.
+Those focused build checks did not execute the paired decoder matrix. Its later
+result is recorded below; all earlier failed attempts retain their original
+verdicts. Private results are under `target/privacy-standby/paired-startup-diagnostic-actual-v1/`
+and `target/privacy-standby/paired-lifecycle-build-actual-v1/`.
+
+
+The subsequent explicit lab profile consumes the focused APK build directly and
+rechecks its compiled Android source content, the unchanged SDK source and all
+package bytes. It preserves the APK's original compiled context and separately
+records the observed checkout; it does not refresh whole-workspace SDK
+qualification. Its first two-CPU emulator run collects six attempts, but the
+long SDK reader fails after Android's codec allocation watchdog fires, producing
+no PCM. That failed media result is preserved, and the independent-reader
+preflight refuses it without launching any decoder. Resource closure alone is
+not treated as six healthy observations.
+
+A separate four-CPU emulator experiment keeps the same codec, media, deadlines
+and numerical rules and verifies the guest CPU range. All six readers then
+complete with real EOS and cleanup: each side returns 2,765, 48,000 and 2,765
+frames. All three originally aligned whole native Int16 pairs are byte-identical,
+with maximum pointwise difference zero. The unchanged pinned independent reader
+runs six decoder children without compilation, and all three whole Float32 pairs
+are also byte-identical. Final pure readback passes the necessary content gates
+with unchanged inputs, all 18 predecoder refusals and three actual SDK checkpoint
+returns; the native counterparts make no checkpoint calls. One worker runs for
+the nonce; no configuration reattachment occurs in this experiment.
+
+This is generated-file content evidence, not proof that the CPU change alone
+caused the different result. The original cold failure, W3 unsupported case,
+raw native-clock failures and preceding startup failures retain their verdicts.
+Native source authority, full presentation equivalence and app admission remain
+false; the source, seek/A/V, recovery, device, performance and release requirements
+below remain open. Private results are under
+`target/privacy-standby/native-file-pair-runtime-lifecycle-actual-v2/`,
+`native-file-pair-independent-lifecycle-actual-v2/` and
+`native-file-pair-inspection-lifecycle-actual-v2/`. The failed two-CPU result is
+retained separately under `native-file-pair-runtime-lifecycle-actual-v1/`.
+
+The Android production recorder now carries an opaque terminal receipt from
+the actual audio owner through its existing recording drain. Issuance requires
+final Stop and joined producer/resource closure for every AAC generation, with
+actual input and output EOS for each nonempty generation. The recorder counts successful queue acceptance and sink consumption
+before its one-use, exact-writer permit reaches the catalogue's commit cut.
+Run, native and recording loss share that scalar cut; file and native I/O remain
+outside it. A failed source can close a readable incomplete prefix without a
+finalised receipt. The file owner also distinguishes an in-flight close from a
+confirmed or unknown close, retaining the exact channel after an unconfirmed
+result and refusing a second physical close.
+
+Source review and host tests cover this admission policy and file ownership.
+Both Android unit tasks execute successfully: 732 Debug tests and 712
+Qualification tests, including 29 new regressions. All three APK builds, lint,
+qualification isolation and the seven APK artefact checks pass. Independent
+review verifies the functional build and its retained results. These checks use
+the existing pinned SDK package from `9d7d944`; they do not refresh whole
+app/SDK/head qualification. Private source and results are under
+`target/privacy-standby/android-recording-producer-closure-v1/`,
+`android-recording-producer-integration-actual-v1/` and
+`android-recording-producer-artifacts-actual-v1/`.
+
+
+The default iOS AVAssetWriter recorder now consumes the existing concrete
+producer closure instead of discarding it. Finalisation requires the exact
+recorder, ingress worker, ticket, run and processed FIFO sample count. Recording
+loss and actual native drops meet the catalogue transition at one scalar cut;
+file, codec and callback work stay outside these locks. The catalogue issues a
+one-use permit to that bound writer and refuses its untyped finalised-completion
+API. Missing or invalid closure and late loss retain an incomplete recording.
+The backend default, native encoders and existing queues are unchanged.
+
+The focused portable suites pass 107 recording tests and 263 budget tests,
+including five new regressions. The generated native host run preserves the
+original five stored-input and ten SDK producer cases and adds seven default
+recorder controls. Both positives finalise; all five loss or invalid-closure
+controls retain actual nonempty incomplete files. Four independent packet probes
+verify original AAC bytes and order, and all five positive files pass whole-file
+FFmpeg decoding. Independent review confirms these results and unchanged inputs.
+Debug, Qualification and Release unsigned app builds, Debug XCTest compilation
+and all three privacy-resource checks also pass. The XCTest bundle was compiled,
+not executed on a device. Private results are under
+`target/privacy-standby/ios-recording-producer-portable-actual-v1/`,
+`target/ios-default-native-v2/` and
+`target/privacy-standby/ios-default-producer-app-builds-v2/`.
+
+These iOS checks use the byte-matched SDK libraries and Apple packages from
+`9d7d944`; they do not refresh whole-workspace SDK qualification. The generated
+host uses synthetic media and a stopped capture session. It does not establish
+physical capture, source-owned leading/tail or programme facts, paired waveform
+or presentation equivalence, durable recovery, the aggregate loss bound,
+sustained-show performance or release readiness.
+
+Actual native producer qualification, source-owned leading/tail facts, paired
+content, applicable seeks and A/V checks remain required for adoption.
+The approved SDK schedule is an alternative clock criterion for its registered
+playback path; repairing the old raw native timestamps is not an extra condition
+for that new profile. Raw native-clock results remain separately unqualified.
 Durable checkpoint installation/recovery and the aggregate two-second loss bound
 follow, then both-phone complete-show pilots, matched competitor performance and
-release. Existing delivery goals and legacy defaults are unchanged. Later source
-commits must keep these app/native receipts' original `75b1a5e` plus four-path dirty
-context; they do not relabel the earlier package or failed experiments.
+release. Existing delivery goals and legacy defaults are unchanged. Earlier
+app/native receipts retain their original `75b1a5e` plus four-path dirty context;
+later source commits do not relabel their package or failed experiments.
 
 In the preceding native SDK experiment, owners, the task emulator and temporary
 directory close; the pre-existing AVD and private generated evidence remain
@@ -1582,6 +1734,332 @@ Private outcome evidence:
 - Independent SDK file, checkpoint and whole-decoder inspection:
   `target/privacy-standby/android-native-aac-sdk-window-v1/inspection-sdk-typed-v1/receipt.local.json`
   and its sibling `independent-outcome-review.local.json`.
+
+## Native EOF authority and paired-reader failure reports
+
+The iOS encoder now requires the actual converter input callback to supply EOS
+and the converter to return `endOfStream` with no terminal packets or bytes.
+Temporary `inputRanDry` and an empty output buffer cannot complete a generation.
+The existing 16-call drain bound and incomplete-recording failure path remain.
+Four new regression tests bring the portable recording suite to 111 passing
+tests; the separate 263 broadcaster tests also pass.
+
+The fresh generated native run retains the original 22-case matrix, exact AAC
+payload checks and five independent whole-file decodes. All 21 completed drains
+observe actual input EOS and terminal output after four converter calls. The
+missing-EOF control remains unobserved. Its 17 commands and owned process groups
+finish successfully, with unchanged used inputs and scratch removed. Private
+results are in `target/ios-default-native-strict-eof-v1/receipt.local.json`, with
+independent review in
+`target/privacy-standby/ios-native-eof-actual-review-v1/receipt.local.json`.
+Historical results are not reclassified as having recorded these new facts.
+
+All three generic unsigned iOS app configurations also build, as does the Debug
+test bundle. The three privacy-resource checks pass. Test-bundle compilation
+does not mean the phone tests ran. Those seven commands retain their own
+source/package snapshot in
+`target/privacy-standby/ios-native-eof-app-builds-v1/receipt.local.json`.
+
+Android's internal paired-reader probe now reports acquired-resource closure
+separately from completion of each decoder observation. A decoder failure stays
+visible at the aggregate level even when its resources close and later cases
+succeed. All six ordered observations must complete. Unknown acquisition or
+closure stops further observations and forbids PCM file stat, read and hash
+operations. This reporting fix adds no retry and does not change the production
+reader, native call order, numerical contract or approved SDK playback clock.
+
+The five focused Android host tests and 39 existing verifier controls pass.
+Debug, Qualification and Release APKs build; Debug/Qualification lint, source
+isolation and the seven existing APK artefact commands pass. The new helper is
+present only in Debug/Qualification, and Release APK bytes are unchanged. The
+run uses the existing pinned SDK AAR and does not refresh whole-SDK coverage.
+Its source-bound results and retained APKs are in
+`target/privacy-standby/paired-reporting-build-actual-v1/receipt.local.json`.
+
+These checks do not establish source leading/tail authority, production recorder
+adoption, durable recovery, the aggregate loss bound, physical devices,
+sustained-show performance or release readiness.
+
+## Readback of producer-owned recordings
+
+A subsequent native readback checks four generated finalised files from the
+strict-EOF matrix: SDK and native-recorder controls for audio-only and A/V.
+All four return exactly 16,137 PCM16 mono frames at 48 kHz. Their original raw
+and output timestamps are identical, losslessly represented in the 48 kHz
+clock, contiguous from zero and end at the expected frame. The two full
+SDK/control waveform pairs are byte-identical. All four separate native
+seek reads return 4,096 frames at frame 8,000 and are byte-identical to that interval
+of their whole-file output. The full paired arrays are never cropped or shifted.
+Different reported container duration fields did not produce a native playback
+length or seek defect in these four files.
+
+Four independent whole-file FFmpeg decodes also complete and produce identical
+finite Float32 bytes across both pairs. Each returns 16,320 frames, 183 more than
+the native read. These whole outputs remain unchanged. That difference does
+not supply a native padding receipt or qualify independently decoded valid
+programme audio.
+
+The fixture now retains the same encoder's actual closed generation/file ledger
+and existing original AAC packet hashes after real producer finalisation. A
+fresh run of the original 22 cases passes all 17 commands, four packet-preservation
+probes and five whole-file decodes. All 17 producer cases record one completed
+native generation with 16,137 raw input frames, no zero input, 18,432 coded
+frames, 2,112 native leading frames and 183 native trailing frames at 48 kHz.
+The values come from the encoder's real input, prime and EOF observations. They
+are not inferred from decoder lengths or fixture parameters. The original 18
+packet hashes are retained for each producer case. These new facts belong to
+the fresh files; earlier recordings and verdicts are not reclassified.
+
+Private native readback, whole-array comparisons and independent decode evidence
+are under `target/ios-current-recorder-presentation-actual-v1/`,
+`target/privacy-standby/ios-current-recorder-presentation-content-v1/` and
+`target/ios-current-recorder-independent-actual-v1/`. The fresh source-ledger
+run is `target/ios-default-native-ledger-v1/receipt.local.json`. Each execution
+retains its own source/input identities and checked process closure; reviews
+are in sibling private directories. Rebinding the native and independent
+presentation checks to the same fresh per-file source receipts remains required
+before adoption. Production defaults, durable recovery, the aggregate loss
+bound and physical-show acceptance remain unchanged.
+
+## Same-file producer timing and content checks
+
+The generated recorder fixture now observes each original compressed sample
+before the existing ingress validation. It retains bounded payload hashes and
+actual coded PTS, DTS and duration fields, with explicit clock authority. Audio
+uses the application-assigned coded CMSampleBuffer clock. Video uses the adapter
+output after the VideoToolbox callback and existing 90 kHz retiming, not raw
+VideoToolbox timestamps. The existing ingress counter is read at its existing
+queue barrier. Production capture, encoder and recorder defaults are unchanged.
+
+The fresh original 22-case matrix completes all 17 commands. Its 17 producer
+cases retain 306 audio timing rows, 40 video timing rows and 346 actual accepted
+ingress samples in total. The original packet-preservation and whole-file decode
+checks pass. The same four finalised audio-only and A/V files are then joined to
+their own completed producer ledger, actual EOF, original packet witnesses,
+container metadata and native and independent reader observations.
+
+All four files preserve their original encoded payloads and rational coded
+clocks. Native audio returns exactly 16,137 frames and both full recorder pairs
+are byte-identical. The four native audio seeks return the exact 4,096-frame
+whole-output interval beginning at frame 8,000. Independent whole decodes return
+16,320 frames, including the actual 183-frame trailing allowance. Their unchanged
+whole outputs are byte-identical across both pairs, and the fixed valid
+16,137-frame prefixes satisfy the existing registered independent-PCM policy.
+This uses each file's actual leading/tail receipts; it does not infer trimming
+from the decoder-length difference.
+
+The new native video duration-sensitive diagnostic fails and retains exit 1.
+All 26 returned whole/seek pictures have valid exact PTS but unavailable raw and
+output durations. A separate pure comparison matches all ten whole-picture PTS
+and the three seek-picture PTS to their authenticated original source rows in
+both A/V files. These intervals remain explicitly source-derived; no native
+duration is invented and the failed native verdict is unchanged. Independent
+whole-video reads return ten frames and both video seeks match whole frames
+five through seven.
+
+All four independent audio seeks return positive output totalling 4,096 frames.
+An additional exact seek-content diagnostic fails for the first 128-frame block
+of the native audio-only reference file; its other four blocks match. The SDK
+audio-only, SDK A/V and native A/V seek blocks all match their respective whole
+output intervals. Positive read completion and exact seek content are reported
+separately. The cause of the audio-only reference mismatch remains unresolved.
+
+Private source-bound runs and supplementary comparisons are retained under
+`target/ios-default-native-coded-witness-v1/`,
+`target/ios-joined-source-presentation-actual-v1/`,
+`target/ios-joined-source-independent-actual-v1/` and
+`target/privacy-standby/ios-joined-source-content-actual-v1/`.
+These checks do not establish the full registered 17-gate presentation profile:
+its actual untreated-legacy-file negatives are absent from this four-file join.
+The original numerical contract and raw-clock failures remain unchanged.
+Recorder adoption, durable recovery, the aggregate two-second loss bound,
+physical shows, performance and release remain open.
+
+## Native audio-only seek metadata
+
+The native audio-only recorder now adds its checked source edit and AAC roll
+metadata after the native writer closes. The original coded samples, timestamps,
+sample descriptions and chunk offsets are preserved. Installation uses the
+existing catalogue media-update lease, append/readback/synchronisation and
+retired-header protocol. Capture, publishing, encoders, queues and SDK backend
+selection are unchanged.
+
+Generated-file comparisons establish why both metadata elements are needed.
+Roll alone leaves the original independent decoder's first 128 seek samples
+incorrect. An edit alone fixes that seek but makes Apple's whole read 2,112
+frames short. The combined source edit and roll preserves Apple's exact 16,137
+frames, its original waveform and the registered seek interval, while also
+fixing the independent seek. These results use actual native leading and EOF
+receipts; no padding is inferred from decoder lengths and no PCM is rewritten.
+
+The new audio-only entry also recognises the observed native M4A version-zero
+sample description: its legacy channel field is two while its AAC configuration
+is mono `0x1188`. This allowance requires the checked single-audio/no-edit layout
+and direct codec descriptor. Original description bytes and strict A/V parsing
+are preserved. Invalid source facts, layouts and repeated edits still refuse.
+Metadata work precedes the final producer permit: a later permit refusal may
+leave a correctly edited file catalogued as incomplete. Final publication still
+requires the original real producer, ingress, writer and loss checks.
+
+All 32 priming and 14 file-layout tests pass. The existing metadata fuzzer completes
+253,781 AddressSanitizer and counter-coverage executions in 21 seconds using an
+existing runtime. The original 22-case native matrix passes all 17 commands,
+including packet retention, five independent decodes and incomplete-state
+controls. Four fresh finalised files are bound to their own producer ledgers,
+EOF, packet witnesses and source identities before readback.
+
+All eight native audio whole/seek observations pass their original format,
+frame-count, raw/output clock and owner-completion checks. The repaired audio-only
+whole pair and fixed 4,096-frame seek are byte-exact. All 18 independent readback
+commands complete; the unchanged 16,320-frame whole outputs match across both
+pairs, and their source-checked 16,137-frame valid prefixes satisfy the existing
+exact independent-PCM policy. Every independent audio seek block now matches its
+registered whole-output interval, including the previously failing audio-only
+reference. Independent video whole/seek checks retain ten and three frames.
+
+The native A/V whole pair differs at seven sample positions by one Int16 unit,
+within the original numerical contract. Its separate seek differs from its whole
+interval at three positions by one unit. The original byte-exact whole result and
+the stronger all-native-seeks byte-exact diagnostic remain failed. No new seek
+tolerance or historical reclassification is applied. Actual untreated SDK files
+also retain their strict count failures: native reads return 16,320 and independent
+reads 18,432 frames against the genuine source count of 16,137.
+
+Debug, Qualification and Release unsigned iOS app builds pass, together with
+Debug XCTest bundle compilation and all three privacy-resource checks. The
+XCTest bundle is compiled only; it has not run on a physical device. These app
+checks use the existing SDK packages and do not refresh whole-SDK CI or signing
+qualification.
+
+Private code, source bindings, failed experiments, reviews and fresh readback
+results are retained under
+`target/privacy-standby/ios-audio-only-recorder-edit-v1/`,
+`target/ios-default-native-audio-edit-v2/`,
+`target/ios-audio-recorder-edit-native-readback-v1/` and
+`target/ios-audio-recorder-edit-independent-readback-v1/`.
+The original numerical contract and historical raw-clock/video-duration failures
+are unchanged. Full registered presentation qualification, SDK recorder adoption,
+durable recovery, the aggregate two-second loss bound, physical shows,
+performance and release remain open.
+
+### Android source preservation before publishing
+
+The internal `PRESERVE_SOURCE_UNATTESTED` mode now connects the real Android
+audio callback, existing sixteen transfer slots and coalesced handoff to the
+SDK's paired AAC timing views. It validates one original compressed sample and
+shares its payload between recording and publishing. Signed native timestamps
+remain separate from the declared nonnegative application-coded ordinal.
+Negative or early replacement output can reach recording while publishing is
+intentionally withheld, without counting a publishing drop or privacy readiness.
+Existing callers retain `LEGACY_PUBLISHING` by default.
+
+An uncertain SDK acquisition or sample close quarantines its exact transfer
+slot. The actual audio-owner and controller retirement gates include these
+slots even after queue accounting reaches zero. A queue becoming empty cannot
+make an owner with uncertain cleanup safe to discard or replace.
+
+The current Android check passed 760 debug and 731 qualification JVM tests,
+including all 19 new source, queue and retirement regressions in both
+configurations. Debug, qualification and release APK builds, all three lint
+checks and qualification isolation passed. A synthetic host control compiled
+the production transfer/clock/handoff with the installed SDK classes and checked
+five recording samples, three publishing samples, two generations, signed
+timestamp provenance, no publishing drops and known owner closure. These
+synthetic bytes are not playable AAC or native encoder observations. The
+existing SDK packages were reused; this is not a fresh whole-SDK build.
+
+This mode does not establish native AU packing, input frame counts, leading or
+trailing frames, source EOF, waveform equivalence or recorder adoption. The
+existing private recording backend remains unchanged. Recovery, the aggregate
+two-second loss bound, physical-device and performance qualification remain
+separate requirements. The approved checked playback clock and all original
+native-clock failures remain unchanged.
+
+
+## iOS explicit prefix recovery and durable source budget
+
+The explicitly selected SDK checkpoint recorder now supports recovery into a
+separate app-private file. The production probe retains the same checked source
+lease while validating every present SDK checkpoint, selecting its sealed
+fragment prefix and hashing the physical bytes. Recovery streams the saved
+header and sealed prefix into an exclusive output, checks its synchronisation
+and readback, then closes source and output owners before publishing its receipt.
+Receipt publication cannot overwrite an occupied destination. A successful retry
+verifies the existing result's provenance and full hash before returning it.
+Failed, partial or changed attempts remain visible and preserve the original.
+
+The library exposes recovery through its capture exclusion and explicit
+confirmation flow. A recovered entry remains unverified, has no final duration,
+and grants no source EOF or producer-finalisation authority. Recovery neither
+starts capture nor uploads the result. The legacy recorder remains the default.
+
+Native audio and video input now share one aggregate source-to-durable budget.
+It charges retained startup input, raw timestamp spans and actual counted native
+input before accepting more work. A codec replacement cannot reset the allowance.
+Only an installed, synchronised and read-back checkpoint can advance durable
+coverage. Each track is capped by its own actual accepted source support; the
+common audio/video frontier is the minimum, with leading audio removed once and
+a conservative one-audio-frame guard. Pending input and another track's longer
+horizon cannot certify coverage. Exceeding two seconds fails recording admission
+before more source is accepted, independently of publishing. There is no extra
+fragment-interval allowance.
+
+Recovery receipts have a 4096-byte limit before any byte traversal, strict
+standard-library UTF-8 validation, a JSON object syntax check, typed decoding of
+the original bytes and exact sorted canonical re-encoding. This also applies to
+legacy receipts. Actual fuzzing exposed Foundation fatal traps on malformed raw
+UTF-8 keys and unpaired escaped surrogate keys. Both exact generated crash inputs
+and escaped-key controls remain regressions. The current ten controls, fixed
+replay and 155,376 ASan/libFuzzer executions passed. This finite run does not prove
+the absence of every parser differential.
+
+The current host checks passed 124 filesystem/parser tests, 44 library tests and
+46 real SDK tests. The unchanged 22-case generated native matrix and its 17
+compiler, packet and decode commands passed against the integrated sources.
+
+Three generated four-second source experiments then terminated their recording
+processes with SIGKILL and recovered from fresh processes. All retained healthy
+source observations, preserved original bytes, reproduced the exact saved-header
+and sealed-prefix output, and returned the same verified result on retry. The
+partial-write case retained its physical uncommitted tail in the original and
+excluded it from the recovered copy. Observed unrecovered source spans were:
+
+| Generated case | Observed unrecovered span |
+| --- | --- |
+| Audio, drained prefix | 5697 / 48000 seconds, about 0.119 seconds |
+| Audio/video, drained prefix | 288015 / 720000 seconds, about 0.400 seconds |
+| Audio, interrupted partial append | 52801 / 48000 seconds, about 1.100 seconds |
+
+Native readers subsequently decoded all three recovered prefixes and returned
+their source-declared audio lengths: 186,304, 172,992 and 139,200 frames. All
+whole and fixed positive audio reads had the actual signed 16-bit mono 48 kHz
+format, exact raw and output clocks, and known completed readers. Each fixed
+seek returned exactly 24,000 frames from the declared interval beginning at
+24,000; its bytes also matched that interval in the unchanged whole native read.
+The A/V file returned all 108 pictures and the expected 15-picture seek window
+with exact raw and output presentation timestamps. Native picture durations and
+decode timestamps remained invalid; the original duration and combined-clock
+strict diagnostics remain false. No duration was substituted.
+
+A separate 17-command FFprobe/FFmpeg check retained every sealed AAC and H.264
+packet's payload hash, size, per-track order, count and exact coded timestamps
+and durations. Independent whole audio counts matched the same declared prefix
+extents. All three fixed independent audio seeks were byte-exact against their
+unchanged whole-read intervals. Whole and seek video frame counts, timestamps,
+durations and corresponding frame hashes matched. Normal-reader metadata and
+all native strict diagnostics remain separately retained. This check did not
+repeat native decoding or compare lossy AAC output against raw source PCM.
+
+These are finite host process-interruption and recovered-prefix readback results.
+They establish neither a sustained recording's two-second guarantee nor physical
+power-loss durability. Paired waveform qualification, complete programme EOF and
+tail authority, device shows, resource use and default-backend adoption remain
+separate gates. The original numerical contract, raw timestamp evidence and
+earlier failed strict checks remain unchanged.
+
+Unsigned Debug, Qualification and Release app builds, test-bundle compilation
+and all three privacy-resource checks passed after regenerating the iOS project
+to include the new tests. The test bundle was compiled without device execution.
 
 ## Implementation order
 

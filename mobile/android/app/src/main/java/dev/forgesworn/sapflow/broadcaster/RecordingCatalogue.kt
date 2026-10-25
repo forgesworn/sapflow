@@ -253,11 +253,24 @@ internal class RecordingCatalogue(directory: Path) {
         private val terminal = AtomicReference(Terminal.WRITING)
         private val compound = AtomicBoolean(false)
         private val compoundGuard = Any()
+        private var boundSource: RecordingSourceGate? = null
+        /** Cold, once-only source binding. Same source -> compound lock order
+         * as finalisation; no file or native calls while either is held. */
+        internal fun bindSource(recorder: RecordingSourceGate.Recorder) {
+            synchronized(recorder.issuer.guard) {
+                synchronized(compoundGuard) {
+                    check(boundSource == null && !compound.get() && terminal.get() == Terminal.WRITING)
+                    recorder.writerOpened(this)
+                    boundSource = recorder.issuer
+                }
+            }
+        }
         val filename: String get() = receipt.identity.filename
         val cleanupComplete: Boolean get() = terminal.get() == Terminal.CLOSED && released()
         /** Nonblocking cancellation. The caller separately proves file/mux owner closure. */
         fun cancel() { terminal.compareAndSet(Terminal.WRITING, Terminal.CANCELLED) }
         fun retainUncertainCleanup() { uncertain(null) }
+        internal fun retainUncertainCleanup(owner: Any) { uncertain(owner) }
         /** Optional cold child of THIS writer lease. The current recorder does
          * not call this; no independent reserve owner or worker is introduced. */
         internal fun checkpointStorage(
@@ -300,11 +313,24 @@ internal class RecordingCatalogue(directory: Path) {
             }
         }
         /** Called only after actual mux finish/drain and file force/close. */
-        fun finalised(durationMs: Long) {
+        fun finalised(durationMs: Long) = finalisedOwned(durationMs, null)
+        internal fun finalised(durationMs: Long, source: RecordingSourceGate.FinishPermit) = finalisedOwned(durationMs, source)
+        private fun finalisedOwned(durationMs: Long, source: RecordingSourceGate.FinishPermit?) {
             require(durationMs >= 0)
-            synchronized(compoundGuard) {
+            if (source == null) synchronized(compoundGuard) {
+                check(boundSource == null) { "Bound recording requires an exact source finish permit" }
                 check(!compound.get()) { "Checkpoint child still owns this lease" }
                 check(terminal.compareAndSet(Terminal.WRITING, Terminal.COMMITTING)) { "Recording was cancelled" }
+            } else synchronized(source.issuer.guard) {
+                // Lock order: source scalar guard, then this scalar lease
+                // guard. Actual stamp/receipt IO remains outside both locks.
+                source.issuer.requireCommitLocked(source, this)
+                synchronized(compoundGuard) {
+                    check(boundSource === source.issuer) { "Foreign source finish permit" }
+                    check(!compound.get()) { "Checkpoint child still owns this lease" }
+                    check(terminal.compareAndSet(Terminal.WRITING, Terminal.COMMITTING)) { "Recording was cancelled" }
+                    source.issuer.commitLocked(source, this)
+                }
             }
             try {
                 val file = stamp(path(receipt.identity.segmentId)); check(file.first > 0)

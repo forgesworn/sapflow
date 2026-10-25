@@ -25,6 +25,8 @@ private final class RecordingReply<Value> {
 private final class RecordingTrace {
     private let lock = NSLock()
     private var packets: [[String: Any]] = []
+    private var packetTimings: [[String: Any]] = [] // Same <=512 bound and index as packets; test tool only.
+    private var videoPackets: [[String: Any]] = [] // Bounded <=64 adapter-output callbacks; test tool only.
     private var recordingErrors = 0, publishingErrors = 0, mediaErrors = 0, refused = 0
     private var callbackError: Error?
     private var originalUnit: CompressedUnit?
@@ -39,11 +41,47 @@ private final class RecordingTrace {
                 contiguous == total, (1...65_536).contains(total) else { throw CaptureFailure(message: "Native AAC payload shape") }
             let view = Data(bytesNoCopy: pointer, count: total, deallocator: .none)
             let hash = SHA256.hash(data: view).map { String(format: "%02x", $0) }.joined()
+            // Observe the actual original CMSampleBuffer before worker validation.
+            // These are application-assigned coded times, not converter timestamps.
+            var timing: [String: Any] = ["size": total, "sha256": hash,
+                "sampleCount": CMSampleBufferGetNumSamples(unit.buffer),
+                "pts": Self.timeFacts(CMSampleBufferGetPresentationTimeStamp(unit.buffer)),
+                "dts": Self.timeFacts(CMSampleBufferGetDecodeTimeStamp(unit.buffer)),
+                "duration": Self.timeFacts(CMSampleBufferGetDuration(unit.buffer))]
             lock.lock(); defer { lock.unlock() }
             guard packets.count < 512 else { throw CaptureFailure(message: "Generated packet retention bound") }
+            guard packetTimings.count == packets.count else { throw CaptureFailure(message: "Generated parallel timing retention diverged") }
             if originalUnit == nil { originalUnit = unit }
+            timing["index"] = packets.count
             packets.append(["size": total, "sha256": hash])
+            packetTimings.append(timing)
         } catch { lock.lock(); callbackError = callbackError ?? error; lock.unlock() }
+    }
+    func observeVideo(_ unit: CompressedUnit) {
+        do {
+            guard unit.isVideo, let block = CMSampleBufferGetDataBuffer(unit.buffer) else {
+                throw CaptureFailure(message: "Adapter video payload absent")
+            }
+            var contiguous = 0, total = 0
+            var pointer: UnsafeMutablePointer<Int8>?
+            guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: &contiguous,
+                totalLengthOut: &total, dataPointerOut: &pointer) == noErr, let pointer,
+                contiguous == total, (1...4_194_304).contains(total) else { throw CaptureFailure(message: "Adapter video payload shape") }
+            let view = Data(bytesNoCopy: pointer, count: total, deallocator: .none)
+            let hash = SHA256.hash(data: view).map { String(format: "%02x", $0) }.joined()
+            var observed: [String: Any] = ["size": total, "sha256": hash, "keyframe": unit.keyframe,
+                "sampleCount": CMSampleBufferGetNumSamples(unit.buffer),
+                "pts": Self.timeFacts(CMSampleBufferGetPresentationTimeStamp(unit.buffer)),
+                "dts": Self.timeFacts(CMSampleBufferGetDecodeTimeStamp(unit.buffer)),
+                "duration": Self.timeFacts(CMSampleBufferGetDuration(unit.buffer))]
+            lock.lock(); defer { lock.unlock() }
+            guard videoPackets.count < 64 else { throw CaptureFailure(message: "Generated video witness retention bound") }
+            observed["index"] = videoPackets.count; videoPackets.append(observed)
+        } catch { lock.lock(); callbackError = callbackError ?? error; lock.unlock() }
+    }
+    private static func timeFacts(_ value: CMTime) -> [String: Any] {
+        ["value": value.value, "timescale": value.timescale, "flags": value.flags.rawValue,
+            "epoch": value.epoch, "numeric": value.isNumeric]
     }
     func timing(_ event: AudioRecordingTiming.Event) {
         if case let .generationEnded(value) = event { lock.lock(); generations.append(value); lock.unlock() }
@@ -56,6 +94,8 @@ private final class RecordingTrace {
     func check() throws { lock.lock(); let error = callbackError; lock.unlock(); if let error { throw error } }
     var firstUnit: CompressedUnit? { lock.lock(); defer { lock.unlock() }; return originalUnit }
     var packetSnapshot: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return packets }
+    var packetTimingSnapshot: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return packetTimings }
+    var videoPacketSnapshot: [[String: Any]] { lock.lock(); defer { lock.unlock() }; return videoPackets }
     var counters: (recording: Int, publishing: Int, media: Int, refused: Int) {
         lock.lock(); defer { lock.unlock() }; return (recordingErrors, publishingErrors, mediaErrors, refused)
     }
@@ -145,6 +185,7 @@ enum CaptureRecordingFixtureCheck {
             if !worker.offer(unit, token: token, audioGeneration: callbackEncoder?.lastOutputGeneration) { trace.refusal() }
         }, meter: { _ in }, recordingTiming: { event in trace.timing(event); worker.audioTiming(event) })
         callbackEncoder = encoder
+        try recorder.bindNativeInputs(audio: encoder, video: nil)
         defer { try? encoder.finish() }
         let source = try format(), nativeToken = try unwrap(encoder.inputToken)
         if mixed {
@@ -162,10 +203,19 @@ enum CaptureRecordingFixtureCheck {
                 frames: queueFailure ? 160_137 : 16_137, ingress: ingressQueue)
         }
         if !missingEOF { try encoder.finish(); ingressQueue.sync {} }
+        if !missingEOF {
+            try requireCaptureRecording(encoder.lastNativeEOFObservation?.complete == true,
+                "Actual converter EOS input delivery and terminal output status were not observed")
+        }
+        let nativeEOF = nativeEOFFacts(encoder.lastNativeEOFObservation)
         try trace.check()
         let originalPackets = trace.packetSnapshot
         try requireCaptureRecording(ingress.accepted == UInt64(originalPackets.count), "Ingress did not validate each original native AU exactly once")
         if queueFailure {
+            let bound = try unwrap(recorder.nativeInputBudgetSnapshot)
+            try requireCaptureRecording(bound.failed && bound.sequence == 0 &&
+                bound.acceptedEnd.map { CMTimeCompare($0, CMTime(value: 2, timescale: 1)) == 0 } == true,
+                "Actual native input bypassed the aggregate budget while recordingIO was held")
             try requireCaptureRecording(terminalRecording.wait(timeout: .now() + 5) == .success, "Real recording admission did not exhaust")
         } else {
             let capacity = RecordingReply<Result<Void, Error>>()
@@ -228,7 +278,7 @@ enum CaptureRecordingFixtureCheck {
             try requireCaptureRecording(value.generation == 1 && value.rawFrames == 16_039 && value.zeroFrames == 20_017 && value.inputFrames == 36_056,
                 "Actual mixed generation provenance changed")
         }
-        return ["name": name, "passed": true, "generatedOnly": true, "sdkReceiptState": "incomplete",
+        return ["name": name, "passed": true, "generatedOnly": true, "sdkReceiptState": "incomplete", "actualNativeEOF": nativeEOF,
             "appAdmission": "unknown", "nativeUnitsBeforeClose": originalPackets.count, "validatedExactlyOnce": true,
             "storedAudioUnits": info.facts.audioUnits, "sdkCompleteAudioEOF": info.facts.completeAudioEof,
             "actualCheckedCleanup": result.cleanupComplete, "recordingClosedBeforeTransport": true,
@@ -240,13 +290,18 @@ enum CaptureRecordingFixtureCheck {
     }
     /// Generated native sources exercise the SAME concrete producer close as
     /// CaptureEngine. The real session is empty/stopped; no camera proof.
-    private static func producer(_ name: String, root: URL) throws -> [String: Any] {
-        let av = name == "producer-av", publishFailure = name == "producer-publishing-failure"
+    private static func producer(_ name: String, root: URL, selection: CaptureRecording.BackendSelection = .sdkCheckpointed) throws -> [String: Any] {
+        let publishFailure = name == "producer-publishing-failure"
         let lateDrop = name == "producer-late-native-drop", recordingLoss = name == "producer-recording-loss"
         let early = name == "producer-input-not-closed", wrong = name == "producer-wrong-worker"
         let wrongTicket = name == "producer-wrong-ticket"
         let lateEncoded = name == "producer-late-encoded-output", lateTiming = name == "producer-late-timing"
         let holdCommit = lateDrop || recordingLoss || lateEncoded || lateTiming
+        // Legacy A/V already updates its closed native movie through this real
+        // descriptor seam before the source cut. Hold it to exercise a late
+        // loss while actual AVAssetWriter finish has returned but publication
+        // has not. No new production callback or writer/encoder is introduced.
+        let av = name == "producer-av" || selection == .legacy && holdCommit
         let expectedComplete = !holdCommit && !early && !wrong && !wrongTicket
         let gate = CaptureAdmission(), profile: CaptureIntent = av ? .audioVideo(.sd480p30) : .audioOnly48kMono
         let prep = try unwrap(gate.reservePreparation(profile: profile))
@@ -276,7 +331,7 @@ enum CaptureRecordingFixtureCheck {
         let identity = try catalogue.newShow(profile: profile).nextIdentity()
         let io = DispatchQueue(label: "fixture.producer.recording"), samples = DispatchQueue(label: "fixture.producer.samples")
         let trace = RecordingTrace(), recorder = try io.sync {
-            try CaptureRecording.open(catalogue: catalogue, identity: identity, queue: io, selection: .sdkCheckpointed) { _ in trace.error("recording") }
+            try CaptureRecording.open(catalogue: catalogue, identity: identity, queue: io, selection: selection) { _ in trace.error("recording") }
         }
         let ingress = RustEncodedIngress(); ingress.reset(hasVideo: av)
         let transport = RecordingTransportSpy(failOffer: publishFailure); ingress.destination = transport
@@ -295,10 +350,11 @@ enum CaptureRecordingFixtureCheck {
         let video: HardwareVideoEncoder?
         if av {
             video = try HardwareVideoEncoder(orientation: .landscapeRight, profile: .sd480p30,
-                output: { unit, source in _ = worker.offer(unit, token: source) },
+                output: { unit, source in trace.observeVideo(unit); _ = worker.offer(unit, token: source) },
                 fault: { source, _ in _ = gate.nativeFault(source ?? token) },
                 permitsInput: { gate.allowsInput($0) == .allow })
         } else { video = nil }
+        try recorder.bindNativeInputs(audio: audio, video: video)
         let session = AVCaptureSession(), wrongOwner = NSObject()
         let expectedWorker: AnyObject = wrong ? wrongOwner : worker
         let producer = CaptureRecordingProducer(run: run, ticket: wrongTicket ? staleTicket : ticket, recorder: recorder,
@@ -318,8 +374,14 @@ enum CaptureRecordingFixtureCheck {
         _ = gate.stop(); captureAdmission.cancel(prep)
         if !early { producer.stopInput() }
         let closure = try samples.sync { try producer.finish() }
+        let nativeEOF = try samples.sync { () throws -> [String: Any] in
+            try requireCaptureRecording(audio.lastNativeEOFObservation?.complete == true,
+                "Producer finalisation did not observe actual converter EOS")
+            return nativeEOFFacts(audio.lastNativeEOFObservation)
+        }
+        let nativeLedger = try samples.sync { try nativeLedgerFacts(audio.generationLedger) }
         try requireCaptureRecording(try samples.sync { try producer.finish() } == nil, "Native producer closure minted twice")
-        encoded.sync {}; io.sync {}
+        let actualValidatedIngressSamples = encoded.sync { ingress.accepted }; io.sync {}
         let result = RecordingReply<CaptureRecording.Completion>(), published = RecordingReply<Result<Void, Error>>()
         worker.finish(producers: closure, recording: { result.put($0) }, publishing: { published.put($0) })
         if holdCommit {
@@ -334,8 +396,9 @@ enum CaptureRecordingFixtureCheck {
             releaseHeader.signal()
         }
         let completed = try result.wait()
+        let expectedVisibleFile = selection == .legacy || expectedComplete
         try requireCaptureRecording(completed.cleanupComplete && completed.finalised == expectedComplete &&
-            (completed.fileURL != nil) == expectedComplete, "Incorrect concrete producer finalisation outcome")
+            (completed.fileURL != nil) == expectedVisibleFile, "Incorrect concrete producer finalisation outcome")
         try requireCaptureRecording(!published.ready && !transport.cleanupComplete, "Producer recording waited for transport")
         transport.releaseClose(); try published.wait().get()
         let media = root.appendingPathComponent(identity.filename), before = try Data(contentsOf: media)
@@ -347,12 +410,47 @@ enum CaptureRecordingFixtureCheck {
         let entry = try unwrap(try catalogue.scan().first { $0.segmentID == identity.segmentID })
         try requireCaptureRecording(entry.state == (expectedComplete ? .finalised : .incomplete), "Producer catalogue classification")
         try trace.check()
-        return ["name": name, "passed": true, "finalised": completed.finalised, "file": identity.filename,
+        return ["name": name, "passed": true, "finalised": completed.finalised, "file": identity.filename, "actualNativeEOF": nativeEOF,
+            "actualNativeAudioLedger": nativeLedger, "originalAudioPackets": trace.packetSnapshot,
+            "originalAudioPacketTimings": trace.packetTimingSnapshot,
+            "originalAudioPacketClock": "APPLICATION_ASSIGNED_CODED_CMSAMPLEBUFFER; NOT_CONVERTER_NATIVE_TIMESTAMP",
+            "originalVideoPackets": trace.videoPacketSnapshot,
+            "originalVideoPacketClock": "ADAPTER_OUTPUT_CMSAMPLEBUFFER_AFTER_VT_CALLBACK_AND_90K_RETIMING",
+            "actualValidatedIngressSamples": actualValidatedIngressSamples,
+            "actualVideoImplementation": (video?.implementation as Any?) ?? NSNull(),
             "sourceAudioUnits": trace.packetSnapshot.count, "hasVideo": av, "nativeVideoFramesSubmitted": av ? 10 : 0,
             "recordingClosedBeforeTransport": true, "normalStopCancellationPresent": true,
             "producerCapabilitySingleUse": true, "duplicateFinishPreservedBytes": true,
             "publishingFailures": trace.counters.publishing, "bytes": before.count,
-            "scope": "Generated native audio/video producer closure and real SDK file, empty stopped session, no camera/device acceptance"]
+            "backend": selection == .legacy ? "legacy" : "sdkCheckpointed",
+            "scope": "Generated native audio/video producer closure and selected real recorder file, empty stopped session, no camera/device acceptance"]
+    }
+    /// Cold inspection of the same real encoder after producer finalisation.
+    /// Values come from its native prime/input/EOF ledger, never file duration,
+    /// decoder length differences or fixture parameters. No receipt is minted.
+    private static func nativeLedgerFacts(_ value: AudioRecordingTiming.LedgerSnapshot) throws -> [String: Any] {
+        try requireCaptureRecording(value.finished && !value.failed && value.activeGeneration == nil,
+            "Actual native producer ledger did not close")
+        guard let file = value.completed, let generation = value.lastGeneration else {
+            throw CaptureFailure(message: "Actual completed native ledger is unavailable")
+        }
+        return ["finished": value.finished, "failed": value.failed,
+            "completedFile": ["generationCount": file.generationCount,
+                "sourceFramesAt48k": file.sourceFramesAt48k, "intentionalStandbyFrames": file.intentionalStandbyFrames,
+                "encodedFrames": file.encodedFrames, "firstLeadingFrames": file.leadingFrames,
+                "lastTrailingFrames": file.trailingFrames],
+            "lastGeneration": ["generation": generation.generation, "inputFrames": generation.inputFrames,
+                "rawFrames": generation.rawFrames, "zeroFrames": generation.zeroFrames, "inputRate": generation.inputRate,
+                "encodedFrames": generation.encodedFrames, "leadingFrames": generation.leadingFrames,
+                "trailingFrames": generation.trailingFrames, "sourceMapping": generation.sourceMapping.rawValue],
+            "scope": "Actual closed encoder ledger only; application admission and decoder presentation remain separate"]
+    }
+    private static func nativeEOFFacts(_ value: AudioRecordingTiming.NativeEOFObservation?) -> [String: Any] {
+        guard let value else { return ["observed": false] }
+        return ["observed": true, "generation": value.generation, "inputEOSDelivered": value.inputEOSDelivered,
+            "converterCalls": value.calls, "lastOutputStatus": value.lastOutputStatus?.rawValue ?? "UNSEEN",
+            "lastPacketCount": value.lastPacketCount, "lastByteLength": value.lastByteLength,
+            "nativeEOFComplete": value.complete]
     }
     private static func unwrap<T>(_ value: T?) throws -> T {
         guard let value else { throw CaptureFailure(message: "Generated fixture missing actual value") }; return value
@@ -422,10 +520,19 @@ enum CaptureRecordingFixtureCheck {
                 producerRows.append(try producer(name, root: folder))
             } catch { producerRows.append(["name": name, "passed": false, "error": String(describing: error)]) }
         }
+        var legacyRows: [[String: Any]] = []
+        for name in ["producer-audio", "producer-av", "producer-recording-loss", "producer-late-native-drop", "producer-input-not-closed", "producer-wrong-worker", "producer-wrong-ticket"] {
+            do {
+                let folder = root.appendingPathComponent("legacy-" + name, isDirectory: true)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                legacyRows.append(try producer(name, root: folder, selection: .legacy))
+            } catch { legacyRows.append(["name": name, "passed": false, "error": String(describing: error)]) }
+        }
         let passed = rows.count == 5 && rows.allSatisfy { $0["passed"] as? Bool == true }
             && producerRows.count == 10 && producerRows.allSatisfy { $0["passed"] as? Bool == true }
+            && legacyRows.count == 7 && legacyRows.allSatisfy { $0["passed"] as? Bool == true }
         do {
-            let result: [String: Any] = ["passed": passed, "cases": rows, "producerCases": producerRows, "generatedOnly": true,
+            let result: [String: Any] = ["passed": passed, "cases": rows, "producerCases": producerRows, "legacyProducerCases": legacyRows, "generatedOnly": true,
                 "scope": "Actual native AAC, existing ingress validated handles, SDK adapter/FS and fake transport only. Five stored-input controls remain incomplete. Separate producer cases execute the same concrete native close as CaptureEngine; no camera/device, app/default switch, presentation-equivalence or aggregate2s proof."]
             FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]))
             FileHandle.standardOutput.write(Data([10]))

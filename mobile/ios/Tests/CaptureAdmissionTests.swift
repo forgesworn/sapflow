@@ -551,4 +551,46 @@ final class CaptureAdmissionTests: XCTestCase {
         XCTAssertNil(gate.reserveStart(ticket)); XCTAssertTrue(gate.completeStop(gate.stop(), cleanupComplete: true))
         XCTAssertNil(gate.reservePreparation())
     }
+    func testLegacyNativeLossAndRecordingLossRefuseExactWriterPhaseCut() throws {
+        for native in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("sapflow-legacy-cut-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let catalogue = try RecordingCatalogue(root: root); defer { try? catalogue.close() }
+            let gate = CaptureAdmission(), preparation = try XCTUnwrap(gate.reservePreparation(profile: .audioOnly48kMono))
+            XCTAssertTrue(gate.attached(preparation)); XCTAssertTrue(gate.beginPermissions(preparation)); XCTAssertTrue(gate.prepared(preparation))
+            let start = try XCTUnwrap(gate.reserveStart(preparation)), run = try XCTUnwrap(gate.reserveMediaRun(start))
+            XCTAssertTrue(gate.commitMediaRun(run, start: start, nowNs: 1, broadcasting: false))
+            let writer = try catalogue.begin(identity: catalogue.newShow(profile: .audioOnly48kMono).nextIdentity())
+            try Data([1, 2, 3]).write(to: writer.fileURL)
+            let loss = CaptureRecordingLoss(); try loss.bindLegacy(writer)
+            let sourceToken = try XCTUnwrap(gate.mediaToken(run, kind: .raw))
+            _ = gate.stop(nowNs: 2)
+            if native { XCTAssertTrue(gate.nativeDrop(sourceToken)) }
+            else { loss.mark() }
+            XCTAssertNil(loss.commitLegacy(admission: gate, run: run, start: start, writer: writer))
+            XCTAssertThrowsError(try writer.complete(durationMs: 1, outcome: .finalised))
+            try writer.complete(durationMs: 1, outcome: .incomplete)
+            XCTAssertEqual(try catalogue.scan().first?.state, .incomplete)
+        }
+    }
+    func testLegacyExactRunWriterCutIsSingleUseAndOldLossCannotOwnAnotherWriter() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("sapflow-legacy-exact-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let catalogue = try RecordingCatalogue(root: root); defer { try? catalogue.close() }
+        let gate = CaptureAdmission(), preparation = try XCTUnwrap(gate.reservePreparation(profile: .audioOnly48kMono))
+        XCTAssertTrue(gate.attached(preparation)); XCTAssertTrue(gate.beginPermissions(preparation)); XCTAssertTrue(gate.prepared(preparation))
+        let start = try XCTUnwrap(gate.reserveStart(preparation)), run = try XCTUnwrap(gate.reserveMediaRun(start))
+        XCTAssertTrue(gate.commitMediaRun(run, start: start, nowNs: 1, broadcasting: false))
+        let writer = try catalogue.begin(identity: catalogue.newShow(profile: .audioOnly48kMono).nextIdentity())
+        try Data([4, 5, 6]).write(to: writer.fileURL)
+        let loss = CaptureRecordingLoss(); try loss.bindLegacy(writer)
+        XCTAssertNil(CaptureRecordingLoss().commitLegacy(admission: gate, run: run, start: start, writer: writer))
+        _ = gate.stop(nowNs: 2)
+        let permit = try XCTUnwrap(loss.commitLegacy(admission: gate, run: run, start: start, writer: writer))
+        XCTAssertNil(loss.commitLegacy(admission: gate, run: run, start: start, writer: writer))
+        loss.mark() // A failure after the exact atomic cut cannot replay it.
+        try writer.complete(durationMs: 1, capture: permit)
+        XCTAssertEqual(try catalogue.scan().first?.state, .finalised)
+    }
+
 }

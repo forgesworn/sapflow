@@ -52,6 +52,10 @@ final class RecordingLibraryOwner: ObservableObject {
     typealias Job = () -> Void
     typealias Schedule = (@escaping Job) -> Void
     typealias Installer = (RecordingCatalogue, RecordingLibraryAdmission, @escaping (Bool) -> Void) -> Void
+    /// Entire concrete operation, not a checkpoint-validator callback. The app
+    /// supplies RecordingCheckpointProbe.recover; SDK-free UI tests may exercise
+    /// scheduling/refusal without claiming actual SDK eligibility.
+    typealias RecoveryAction = (RecordingCatalogue, RecordingCatalogue.Entry, UInt64, () -> Bool, () -> Bool) throws -> RecordingCatalogue.RecoveredPrefix
     final class Selection: Identifiable {
         let id = UUID()
         let entry: RecordingCatalogue.Entry
@@ -74,6 +78,7 @@ final class RecordingLibraryOwner: ObservableObject {
     private let configuredLegacyRoot: URL?
     private let access: RecordingExportAccess
     private let makeDestination: (URL, String) throws -> RecordingExportDestination
+    private let recoverCheckpoint: RecoveryAction?
     private var catalogue: RecordingCatalogue? // Worker only.
     private var pendingPicker: Selection? // Main only; remains until actual dismissal.
     private var folderReply: URL?
@@ -95,14 +100,16 @@ final class RecordingLibraryOwner: ObservableObject {
     init(root: URL? = nil, legacyRoot: URL? = nil,
          schedule: Schedule? = nil, deliver: @escaping Schedule = { DispatchQueue.main.async(execute: $0) },
          access: RecordingExportAccess = .live,
+         recoverCheckpoint: RecoveryAction? = nil,
          makeDestination: @escaping (URL, String) throws -> RecordingExportDestination = { try RecordingExportDestination(folder: $0, filename: $1) }) {
         let queue = DispatchQueue(label: "sapflow.recording-library", qos: .utility)
         self.schedule = schedule ?? { queue.async(execute: $0) }
         self.deliver = deliver; configuredRoot = root; configuredLegacyRoot = legacyRoot
-        self.access = access; self.makeDestination = makeDestination
+        self.access = access; self.makeDestination = makeDestination; self.recoverCheckpoint = recoverCheckpoint
     }
     var captureAllowed: Bool { ready && admission.withCaptureReservation { true } == true }
     var cleanupRetained: Bool { admission.cleanupRetained }
+    var recoveryAvailable: Bool { recoverCheckpoint != nil }
 
     func initialise(install: @escaping Installer) {
         guard !closed, !ready, let ticket = admission.reserve(.setup) else { return }
@@ -173,6 +180,58 @@ final class RecordingLibraryOwner: ObservableObject {
         let selection = Selection(entry: entry, allowUnverified: allowUnverified, ticket: ticket)
         pendingPicker = selection; folderReply = nil; operation = ticket
         presentation = selection; picker = selection; busy = true; message = "Choose a folder for a new copy. The private original stays here."
+    }
+    func recover(entry: RecordingCatalogue.Entry, canRecover: () -> Bool) {
+        guard ready, !closed, let recoverCheckpoint,
+              entry.location == .privateRecording, entry.state == .incomplete,
+              entry.identity != nil, entry.bytes > 0 else {
+            message = "This recording has no supported private recovery source."; return
+        }
+        guard let ticket = admission.beginRecovery(canRecover: canRecover) else {
+            message = "Stop and save capture, then wait for file cleanup before recovering a copy."; return
+        }
+        let cancellation = RecordingExportCancellation()
+        self.cancellation = cancellation; operation = ticket; busy = true
+        message = "Creating an unverified recovery copy. The original stays unchanged."
+        schedule {
+            guard self.admission.begin(ticket) else {
+                self.finishRecovery(ticket, result: .failure(RecordingCatalogue.Failure.cancelled), clean: true); return
+            }
+            var result: Result<(RecordingCatalogue.RecoveredPrefix, [RecordingCatalogue.Entry]), Error>
+            do {
+                let store = try self.requireCatalogue()
+                let recovered = try recoverCheckpoint(store, entry, entry.bytes,
+                    { self.admission.shouldCancel(ticket) || cancellation.requested },
+                    { self.admission.beginRecoveryPublication(ticket) })
+                result = .success((recovered, try store.scan()))
+            } catch { result = .failure(error) }
+            self.finishRecovery(ticket, result: result, clean: self.catalogue?.cleanupUncertain != true)
+        }
+    }
+    private func finishRecovery(_ ticket: RecordingLibraryAdmission.Ticket,
+                                result: Result<(RecordingCatalogue.RecoveredPrefix, [RecordingCatalogue.Entry]), Error>, clean: Bool) {
+        let allowed = admission.finish(ticket, cleanupComplete: clean)
+        if !clean { retainedSelf = self }
+        deliver {
+            self.busy = !self.admission.idle
+            let currentOperation = self.operation == ticket
+            if currentOperation { self.operation = nil; self.cancellation = nil }
+            if !clean, self.admission.cleanupRetained, self.admission.owns(ticket) {
+                self.message = "Recovery cleanup is unconfirmed. Originals and new copies are preserved; capture and file work are blocked."
+                return
+            }
+            guard allowed, self.admission.canDeliver(ticket), !self.closed else {
+                if currentOperation, !self.closed, clean { self.message = "Recovery cancelled. The original is unchanged; a new copy may remain." }
+                return
+            }
+            switch result {
+            case let .success((recovered, entries)):
+                self.entries = entries
+                self.message = recovered.reused ? "Existing recovery copy verified. Playback remains unverified." : "Recovery copy created. The original is unchanged; playback remains unverified."
+            case .failure:
+                self.message = "Recovery refused or could not finish. Originals and any partial copy are preserved. Refresh to inspect them."
+            }
+        }
     }
     func receivedFolder(_ selection: Selection, folder: URL?) {
         guard pendingPicker === selection, picker === selection else { return }

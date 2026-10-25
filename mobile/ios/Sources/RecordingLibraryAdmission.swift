@@ -4,13 +4,15 @@ import Foundation
 /// The only closures run under it read or reserve existing capture admission;
 /// they must perform no IO, dispatch, UI work or arbitrary completion callback.
 final class RecordingLibraryAdmission {
-    enum Kind { case setup, scan, export, cameraScan }
+    enum Kind { case setup, scan, export, cameraScan, recovery }
     struct Ticket: Equatable {
+        fileprivate let owner: UUID
         fileprivate let serial: UInt64
         let kind: Kind
     }
-    private enum Phase { case picker, queued, running, retained }
+    private enum Phase { case picker, queued, running, committing, retained }
     private let lock = NSLock()
+    private let owner = UUID()
     private var serial: UInt64
     private var current: Ticket?
     private var phase: Phase?
@@ -32,7 +34,7 @@ final class RecordingLibraryAdmission {
     }
     func reserve(_ kind: Kind) -> Ticket? {
         locked {
-            guard kind != .export, kind != .cameraScan else { return nil }
+            guard kind != .export, kind != .cameraScan, kind != .recovery else { return nil }
             return reserveLocked(kind, phase: .queued)
         }
     }
@@ -40,6 +42,22 @@ final class RecordingLibraryAdmission {
         locked {
             guard !closed, current == nil, canExport() else { return nil }
             return reserveLocked(.export, phase: .picker)
+        }
+    }
+    func beginRecovery(canRecover: () -> Bool) -> Ticket? {
+        locked {
+            guard !closed, current == nil, canRecover() else { return nil }
+            return reserveLocked(.recovery, phase: .queued)
+        }
+    }
+    /// Scalar commit cut only; no IO/callback while held. Cancellation before
+    /// this transition refuses publication; later cancellation hides delivery
+    /// and never deletes a correctly stored copy or releases an active owner.
+    func beginRecoveryPublication(_ ticket: Ticket) -> Bool {
+        locked {
+            guard current == ticket, ticket.kind == .recovery, phase == .running,
+                  !cancelled, !closed else { return false }
+            phase = .committing; return true
         }
     }
     /// Unlike catalogue enumeration, a camera scan excludes every capture
@@ -53,7 +71,7 @@ final class RecordingLibraryAdmission {
     private func reserveLocked(_ kind: Kind, phase: Phase) -> Ticket? {
         guard !closed, current == nil, serial < UInt64.max else { return nil }
         serial += 1
-        let ticket = Ticket(serial: serial, kind: kind)
+        let ticket = Ticket(owner: owner, serial: serial, kind: kind)
         current = ticket; self.phase = phase; cancelled = false; delivery = nil
         return ticket
     }

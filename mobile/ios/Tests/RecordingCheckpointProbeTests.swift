@@ -236,4 +236,71 @@ final class RecordingCheckpointProbeTests: XCTestCase {
         XCTAssertFalse(f.catalogue.cleanupRetained); XCTAssertFalse(f.catalogue.cleanupUncertain)
     }
 
+    func testActualSdkRecoveryCopiesCheckedHeaderAndPrefixThenVerifiesIdempotentResult() throws {
+        let f = try fixture(sequence: 3); defer { try? f.catalogue.close() }
+        let selection = try selected(f), latest = try decoded(f, 1), info = latest.info()
+        let originalPath = f.root.appendingPathComponent(f.identity.filename), original = try Data(contentsOf: originalPath)
+        let recovered = try RecordingCheckpointProbe.recover(catalogue: f.catalogue, selected: selection, maximumFragmentBytes: 1024 * 1024)
+        let result = try Data(contentsOf: f.root.appendingPathComponent(try XCTUnwrap(recovered.entry.identity).filename))
+        XCTAssertFalse(recovered.reused); XCTAssertEqual(recovered.entry.state, .recovered); XCTAssertNil(recovered.entry.durationMs)
+        XCTAssertEqual(result, latest.header() + original.subdata(in: Int(info.initialHeaderLen)..<Int(info.committedOffset)))
+        XCTAssertEqual(try Data(contentsOf: originalPath), original)
+        let originalEntry = try XCTUnwrap(f.catalogue.scan().first { $0.segmentID == f.identity.segmentID })
+        XCTAssertEqual(originalEntry.state, .incomplete)
+        let retry = try RecordingCheckpointProbe.recover(catalogue: f.catalogue, selected: selection, maximumFragmentBytes: 1024 * 1024)
+        XCTAssertTrue(retry.reused); XCTAssertEqual(retry.entry.segmentID, recovered.entry.segmentID)
+        XCTAssertEqual(try f.catalogue.scan().count, 2); XCTAssertFalse(f.catalogue.cleanupRetained)
+    }
+
+    func testActualSdkRecoveryRefusesAnyPresentInvalidSlotBeforeCreatingOutput() throws {
+        let f = try fixture(sequence: 3); defer { try? f.catalogue.close() }
+        var corrupt = try Data(contentsOf: slot(f, 0)); corrupt[corrupt.count - 1] ^= 1
+        try replace(corrupt, at: slot(f, 0))
+        let before = try FileManager.default.contentsOfDirectory(atPath: f.root.path).sorted()
+        XCTAssertThrowsError(try RecordingCheckpointProbe.recover(catalogue: f.catalogue, selected: selected(f), maximumFragmentBytes: 1024 * 1024)) {
+            guard case RecordingCheckpointProbe.Failure.decoderRefusal(slot: 0, actual: _) = $0 else { return XCTFail("Wrong real SDK refusal: \($0)") }
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.root.path).sorted(), before)
+        XCTAssertEqual(try Data(contentsOf: slot(f, 0)), corrupt); XCTAssertFalse(f.catalogue.cleanupRetained)
+    }
+
+    func testActualSdkRecoveryCancellationAtPublicationKeepsUnpublishedCopyAndOriginal() throws {
+        let f = try fixture(sequence: 3); defer { try? f.catalogue.close() }
+        let selection = try selected(f), original = try Data(contentsOf: f.root.appendingPathComponent(f.identity.filename))
+        var cuts = 0
+        XCTAssertThrowsError(try RecordingCheckpointProbe.recover(catalogue: f.catalogue, selected: selection, maximumFragmentBytes: 1024 * 1024,
+            willPublish: { cuts += 1; throw RecordingCatalogue.Failure.cancelled })) { XCTAssertEqual($0 as? RecordingCatalogue.Failure, .cancelled) }
+        XCTAssertEqual(cuts, 1); XCTAssertFalse(f.catalogue.cleanupRetained)
+        let entries = try f.catalogue.scan()
+        XCTAssertEqual(entries.count, 2); XCTAssertFalse(entries.contains { $0.state == .recovered })
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: f.root.path).contains { $0.hasSuffix(".receipt.tmp") })
+        XCTAssertEqual(try Data(contentsOf: f.root.appendingPathComponent(f.identity.filename)), original)
+    }
+
+    func testActualSdkRecoveryUnknownTargetClosePropagatesIoOnceAndRetainsCatalogue() throws {
+        var armed = false, targetAttempts = 0
+        var originalInodes = Set<UInt64>()
+        let f = try fixture(sequence: 3, closeFileDescriptor: { fd in
+            var actual = stat()
+            let target = armed && fstat(fd, &actual) == 0 && !originalInodes.contains(actual.st_ino)
+            let result = Darwin.close(fd)
+            if target { targetAttempts += 1; errno = EIO; return -1 }
+            return result
+        })
+        let selection = try selected(f)
+        for path in try FileManager.default.contentsOfDirectory(at: f.root, includingPropertiesForKeys: nil) {
+            var actual = stat(); XCTAssertEqual(lstat(path.path, &actual), 0); originalInodes.insert(actual.st_ino)
+        }
+        armed = true
+        XCTAssertThrowsError(try RecordingCheckpointProbe.recover(catalogue: f.catalogue, selected: selection, maximumFragmentBytes: 1024 * 1024)) {
+            XCTAssertEqual($0 as? RecordingCatalogue.Failure, .io)
+        }
+        XCTAssertEqual(targetAttempts, 1); XCTAssertTrue(f.catalogue.cleanupRetained); XCTAssertTrue(f.catalogue.cleanupUncertain)
+        XCTAssertThrowsError(try RecordingCheckpointProbe.recover(catalogue: f.catalogue, selected: selection, maximumFragmentBytes: 1024 * 1024)) {
+            XCTAssertEqual($0 as? RecordingCatalogue.Failure, .closed)
+        }
+        XCTAssertEqual(targetAttempts, 1)
+        XCTAssertThrowsError(try f.catalogue.close()) { XCTAssertEqual($0 as? RecordingCatalogue.Failure, .busy) }
+    }
+
 }

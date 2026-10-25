@@ -565,6 +565,20 @@ final class CaptureAdmission {
             recordingClosureRun = value; return true
         }
     }
+    /// Legacy final publication uses the SAME native-loss decision and actual
+    /// Writer phase cut atomically. Lock order: recording loss -> this lock ->
+    /// Writer lock. No file/native IO or callback is invoked in this section.
+    func commitRecordingClosure(_ value: MediaRun, start: Start, writer: RecordingCatalogue.Writer,
+                                loss: AnyObject, sourceGuard: NSLock) -> RecordingCatalogue.Writer.CapturePermit? {
+        locked {
+            guard committedMediaRun == value, preparation == value.preparation,
+                  committedMediaStart == start, mediaRun == value || closingMediaRun == value,
+                  !mediaFailed, recordingClosureRun == nil,
+                  let permit = writer.admitCaptureUnderSourceLocks(owner: loss, sourceGuard: sourceGuard) else { return nil }
+            recordingClosureRun = value
+            return permit
+        }
+    }
     func mediaHasFault(_ value: MediaRun) -> Bool {
         locked { preparation == value.preparation && (mediaRun == value || closingMediaRun == value) && mediaFailed }
     }

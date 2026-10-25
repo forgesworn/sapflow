@@ -2,8 +2,9 @@ import Foundation
 import CryptoKit
 import Sapflow
 
-/// Cold V1 metadata + actual-file observation. No recovery/export capability,
-/// live checkpoint, native EOF, decoded presentation or application admission.
+/// Cold V1 SDK selection. Closed observations grant no recovery capability;
+/// explicit recovery retains the source owner through the actual new-file job.
+/// Neither operation grants native EOF, decoded presentation or app admission.
 enum RecordingCheckpointProbe {
     enum Failure: Error {
         case noCheckpoint
@@ -31,18 +32,27 @@ enum RecordingCheckpointProbe {
         let slot: Int; let bytes: Data; let decoded: DecodedRecordingCheckpoint
         let info: DecodedRecordingCheckpointInfo; let header: Data
     }
-    static func inspect(catalogue: RecordingCatalogue, selected: RecordingCatalogue.Entry,
-                        maximumFragmentBytes: UInt64) throws -> Observation {
+    private struct HeldSelection {
+        let reader: RecordingCatalogue.CheckpointRead
+        let use: RecordingCatalogue.CheckpointRead.Use
+        let snapshot: RecordingCatalogue.CheckpointRead.Snapshot
+        let latest: Row
+        let currentHeaderSHA256: Data
+    }
+    /// SDK decoding and BOTH physical prefixes remain inside this same live
+    /// source Use. A closed Observation cannot be converted into this owner.
+    private static func select(catalogue: RecordingCatalogue, selected: RecordingCatalogue.Entry,
+                               maximumFragmentBytes: UInt64, cancelled: () -> Bool = { false }) throws -> HeldSelection {
         let reader = try catalogue.beginCheckpointRead(selected: selected)
         let use: RecordingCatalogue.CheckpointRead.Use
         do { use = try reader.start() }
         catch { let original = error; try reader.close(); throw original }
-        let snapshot: RecordingCatalogue.CheckpointRead.Snapshot
-        let result: Observation
         do {
-            snapshot = try reader.snapshot(use)
+            if cancelled() { reader.cancel(); throw RecordingCatalogue.Failure.cancelled }
+            let snapshot = try reader.snapshot(use)
             var rows: [Row] = []
             for slot in 0..<2 {
+                if cancelled() { reader.cancel(); throw RecordingCatalogue.Failure.cancelled }
                 guard let bytes = snapshot.slots[slot] else { continue }
                 let decoded: DecodedRecordingCheckpoint
                 do {
@@ -76,20 +86,46 @@ enum RecordingCheckpointProbe {
             let hashes = try reader.hashPrefixes(use, snapshot: snapshot, initialLength: first.info.initialHeaderLen,
                 committedOffsets: rows.map { $0.info.committedOffset }, maximumFragmentBytes: maximumFragmentBytes)
             guard hashes.fragmentHashes == rows.map({ $0.info.fragmentRegionSha256 }) else { throw Failure.physicalPrefix }
-            result = Observation(identity: snapshot.identity, sequence: latest.info.facts.sequence,
-                committedOffset: latest.info.committedOffset, fragmentRegionBytes: latest.info.fragmentRegionBytes,
-                selectedSlotSHA256: Data(SHA256.hash(data: latest.bytes)), savedRecoveryHeader: latest.header,
-                observedCurrentHeaderSHA256: hashes.currentHeaderSHA256)
+            if cancelled() { reader.cancel(); throw RecordingCatalogue.Failure.cancelled }
+            return HeldSelection(reader: reader, use: use, snapshot: snapshot, latest: latest,
+                                 currentHeaderSHA256: hashes.currentHeaderSHA256)
         } catch {
             let original = error
             // Unknown close supersedes semantic refusal and retains exact owners.
             try reader.abort(use)
             throw original
         }
+    }
+
+    static func inspect(catalogue: RecordingCatalogue, selected: RecordingCatalogue.Entry,
+                        maximumFragmentBytes: UInt64) throws -> Observation {
+        let held = try select(catalogue: catalogue, selected: selected, maximumFragmentBytes: maximumFragmentBytes)
+        let latest = held.latest
+        let result = Observation(identity: held.snapshot.identity, sequence: latest.info.facts.sequence,
+            committedOffset: latest.info.committedOffset, fragmentRegionBytes: latest.info.fragmentRegionBytes,
+            selectedSlotSHA256: Data(SHA256.hash(data: latest.bytes)), savedRecoveryHeader: latest.header,
+            observedCurrentHeaderSHA256: held.currentHeaderSHA256)
         // Saved recovery-duration header is NOT the original INITIAL hash.
         // Final checked closure has its own outcome. Do not mask an uncertain
         // close by trying to abort the now-retained exact child a second time.
-        try reader.finish(use, snapshot: snapshot)
+        try held.reader.finish(held.use, snapshot: held.snapshot)
         return result
+    }
+
+    /// Sole production recovery front door. Native source EOF, full recording
+    /// completion and decoded playback are NOT inferred from a recovered prefix.
+    static func recover(catalogue: RecordingCatalogue, selected: RecordingCatalogue.Entry,
+                        maximumFragmentBytes: UInt64, cancelled: () -> Bool = { false },
+                        willPublish: () throws -> Void = {}) throws -> RecordingCatalogue.RecoveredPrefix {
+        let held = try select(catalogue: catalogue, selected: selected,
+                              maximumFragmentBytes: maximumFragmentBytes, cancelled: cancelled)
+        let latest = held.latest
+        let recipe = RecordingCatalogue.RecoveryRecipe(sequence: latest.info.facts.sequence,
+            checkpointSHA256: Data(SHA256.hash(data: latest.bytes)), header: latest.header,
+            fragmentBytes: latest.info.fragmentRegionBytes, fragmentSHA256: latest.info.fragmentRegionSha256)
+        // recover owns every subsequent close/publication result; never mask an
+        // uncertain close by aborting this exact source child a second time.
+        return try held.reader.recover(held.use, snapshot: held.snapshot, recipe: recipe,
+            maximumFragmentBytes: maximumFragmentBytes, cancelled: cancelled, willPublish: willPublish)
     }
 }
