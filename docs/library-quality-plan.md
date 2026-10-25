@@ -162,3 +162,33 @@ the complete-path, allocation, physical power or competitor comparison gates.
 
 These open questions preserve the wider ambition without converting proposals
 into completed work or blocking the currently authorised mobile work.
+
+## Reproduce the current-source Android package and app gate
+
+With full JDK 21, Kotlin 2.2.20, Node 18+, the repository's pinned Rust toolchain,
+Android platform 36, Build Tools 35.0.0/36.1.0 and NDK 27.1.12297006 selected in
+`JAVA_HOME`, `KOTLIN_HOME`, `ANDROID_HOME` and `ANDROID_NDK_HOME`, run:
+
+```sh
+python3 -B mobile/android/check-sdk-app.py
+```
+
+Use a clean checkout without ignored `local.properties` or global Gradle
+properties/init scripts; the command reuses the existing Gradle cache and pins
+the selected JDK explicitly. Extra Gradle project environment properties are
+refused rather than silently changing the build profile.
+
+The same command runs on standard Ubuntu 24.04 in CI. It builds a fresh ARM64
+AAR from current Rust sources in the checkout's existing `target/`, runs its
+installed Kotlin host consumer and supplies that exact package to both JVM
+variants and all three app builds. The gate requires the full JVM suites, all
+seventeen selected AAC profile controls in each variant, clean lint, qualification
+and release isolation, exact packaged JNI identity and 16 KiB ELF/ZIP alignment.
+First-run Gradle dependency acquisition is online; all tests execute freshly.
+
+Only redacted scalar receipts, command/group observations, JUnit XML and lint XML
+are retained under `target/android-sdk-app/` and uploaded by CI. Generated SDKs
+and development APKs remain ignored build output and are not store releases.
+The package is ARM64-only; other SDK ABIs retain their own qualification gates.
+This checks the library/app build boundary, not an Android encoder component,
+H/T/EOF or waveform authority, device behaviour, recorder adoption or performance.

@@ -94,6 +94,57 @@ jobs:
           path: target/ios-native-recording
           if-no-files-found: ignore
 
+  android-sdk-app:
+    name: Android current SDK and app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust and Android target
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: android-sdk-app-arm64-v1
+      - name: Select JDK 21 and the Android build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          export JAVA_HOME="${JAVA_HOME_21_X64:?JDK 21 is required}"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          printf '%s\n' "JAVA_HOME=$JAVA_HOME" "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
+          printf '%s\n' "$JAVA_HOME/bin" >> "$GITHUB_PATH"
+          sapflow_sdkmanager="${ANDROID_HOME:?Android SDK is required}/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sapflow_sdkmanager"
+          "$sapflow_sdkmanager" --install "platforms;android-36" "build-tools;35.0.0" "build-tools;36.1.0" "ndk;27.1.12297006"
+      - name: Prepare the checksum-pinned Kotlin 2.2 compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/native-tooling
+          sapflow_kotlin="$(mktemp -d "$GITHUB_WORKSPACE/target/native-tooling/kotlin-2.2.20-XXXXXX")"
+          curl --fail --location --retry 3 --output "$sapflow_kotlin/compiler.zip" https://github.com/JetBrains/kotlin/releases/download/v2.2.20/kotlin-compiler-2.2.20.zip
+          printf '%s  %s\n' 81f0264c9073b5cbbdb3ff8418cf2c5dac076879fc156fa1a6462f5a5acc4420 "$sapflow_kotlin/compiler.zip" | sha256sum --check
+          unzip -q "$sapflow_kotlin/compiler.zip" -d "$sapflow_kotlin"
+          rm "$sapflow_kotlin/compiler.zip"
+          printf '%s\n' "KOTLIN_HOME=$sapflow_kotlin/kotlinc" >> "$GITHUB_ENV"
+          printf '%s\n' "$sapflow_kotlin/kotlinc/bin" >> "$GITHUB_PATH"
+      - name: Build the fresh ARM64 SDK and check the app
+        run: python3 -B mobile/android/check-sdk-app.py
+      - name: Retain scalar Android SDK and app evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-current-sdk-app
+          path: target/android-sdk-app
+          if-no-files-found: ignore
+          retention-days: 14
+
   checks:
     name: Format, clippy, tests
     runs-on: ubuntu-latest
@@ -112,6 +163,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Android build gate regressions
+        run: python3 -B tests/test_android_sdk_app.py
       - name: Performance receipt regressions
         run: |
           python3 -B tests/test_performance.py

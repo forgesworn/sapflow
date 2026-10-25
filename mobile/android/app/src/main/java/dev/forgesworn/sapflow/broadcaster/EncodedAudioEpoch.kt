@@ -162,6 +162,8 @@ internal class EncodedAudioEpoch(
     /** Optional scalar diagnostics only: every failure stays unknown and
      * cannot enter the existing capture failure path. Called at format/EOS. */
     private fun observeTrims(format: MediaFormat?, phase: AudioGenerationObservation.Phase) {
+        observation.profileFormat(nativeGeneration, phase, AudioAacEncoderConfiguration.format(format,
+            if (phase == AudioGenerationObservation.Phase.OUTPUT_EOS && Build.VERSION.SDK_INT < 30) AudioAacProfile.State.API_UNAVAILABLE else AudioAacProfile.State.READ_FAILED))
         if (Build.VERSION.SDK_INT < 30) {
             observation.trim(nativeGeneration,phase,AudioGenerationObservation.Trim.LEADING,Build.VERSION.SDK_INT,AudioGenerationObservation.State.API_UNAVAILABLE)
             observation.trim(nativeGeneration,phase,AudioGenerationObservation.Trim.PADDING,Build.VERSION.SDK_INT,AudioGenerationObservation.State.API_UNAVAILABLE)
