@@ -65,6 +65,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build host SDK and run checkpoint tests
         run: python3 -B mobile/ios/test-recording-checkpoints-sdk.py
+      - name: Prepare native recording readback tools
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            brew install ffmpeg
+          fi
+      - name: Check the generated SDK and legacy recording matrix
+        run: bash mobile/ios/check-capture-recording.sh
       - name: Prepare the existing lock-pinned Swift fuzz runtime
         # The workspace config shares target/; build only the existing runtime.
         run: cargo build --locked --manifest-path fuzz/Cargo.toml -p libfuzzer-sys -j1
@@ -78,6 +85,13 @@ jobs:
         with:
           name: ios-recovery-receipt-fuzz
           path: target/ios-recovery-receipt-fuzz
+          if-no-files-found: ignore
+      - name: Retain generated native recording checks
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-native-recording
+          path: target/ios-native-recording
           if-no-files-found: ignore
 
   checks:
@@ -110,6 +124,7 @@ jobs:
         run: |
           python3 -B tests/test_ios_privacy_resources.py
           python3 -B tests/test_ios_xctest_runtime.py
+          python3 -B tests/test_ios_capture_recording.py
       - name: Performance receipt regressions
         run: |
           python3 -B tests/test_performance.py

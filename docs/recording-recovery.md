@@ -1976,6 +1976,27 @@ separate requirements. The approved checked playback clock and all original
 native-clock failures remain unchanged.
 
 
+### Next Android encoder profile
+
+The next source qualification needs the actual selected component's capability
+and configuration, rather than treating every Android callback as permanently
+unattestable. Android documents
+[`FEATURE_MultipleFrames`](https://developer.android.com/reference/android/media/MediaCodecInfo.CodecCapabilities#FEATURE_MultipleFrames)
+for single versus multiple access units, including encoders. API 35 also documents
+single-access-unit operation when
+[`KEY_BUFFER_BATCH_MAX_OUTPUT_SIZE`](https://developer.android.com/reference/android/media/MediaFormat#KEY_BUFFER_BATCH_MAX_OUTPUT_SIZE)
+is unset, as in the current shared AAC configuration. Neither observation has
+yet been recorded for a selected installed encoder by this application.
+
+A qualified profile must bind those actual facts to its original callback
+ranges and exclude config, empty, partial or invalid output. Nonempty EOS output
+must be accounted for before closure. Encoder delay and padding retain their
+[decoded-frame trim semantics](https://developer.android.com/reference/android/media/MediaFormat#KEY_ENCODER_DELAY),
+but reporting is optional: missing values cannot become zero, nor can timestamps
+or a decoded-length difference supply missing trim authority. Actual generation,
+release, original extent, paired content and seek checks remain required before
+the recorder consumes a native timing receipt.
+
 ## iOS explicit prefix recovery and durable source budget
 
 The explicitly selected SDK checkpoint recorder now supports recovery into a
@@ -2060,6 +2081,34 @@ earlier failed strict checks remain unchanged.
 Unsigned Debug, Qualification and Release app builds, test-bundle compilation
 and all three privacy-resource checks passed after regenerating the iOS project
 to include the new tests. The test bundle was compiled without device execution.
+
+## Reproducing the generated native recording matrix
+
+On macOS with full Xcode, the pinned Rust toolchain and `ffmpeg` / `ffprobe`
+installed, run:
+
+```sh
+bash mobile/ios/check-capture-recording.sh
+```
+
+The public command builds the current host SDK in the checkout's existing
+`target/`, generates its Swift bindings and runs the native fixture. It requires
+no private build receipts. Three preparation commands precede the 17 native
+compile, fixture, packet-probe and decode commands. The matrix requires all five
+stored-input controls, ten SDK producer cases and seven legacy producer cases.
+Four stored controls retain exact original AAC packet hashes; three completed
+SDK files and two completed legacy files require successful whole-file decoding.
+
+Scalar receipts, source bindings, command logs and current process-group closure
+evidence are retained under `target/ios-native-recording/`. Generated media and
+compiler scratch are removed only after every owned process group is known
+closed. CI runs the same public command and retains its evidence. The old private
+witness environment variables are rejected explicitly rather than ignored.
+
+This is a generated host recording regression gate. It does not qualify paired
+waveforms, native presentation clocks, recovery, sustained loss, physical capture,
+performance or default-backend adoption. The numerical contract and historical
+strict failures above remain unchanged.
 
 ## Implementation order
 
