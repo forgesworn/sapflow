@@ -30,6 +30,10 @@ mediamtx in production before the numbers favour it and the user decides.
   can be built for iOS and Android with UniFFI later.
 - **Measure, do not assert.** "Faster" and "smaller" are claims milestone 4
   checks against mediamtx 1.19.1.
+- **Prefer our existing libraries.** Where we have our own implementation,
+  it takes priority. Use measured delivery quality, CPU and memory results to
+  improve it. Third-party implementations are comparison references or supply
+  capabilities we have not implemented.
 
 ## Milestones
 
@@ -128,6 +132,15 @@ buffer and segment caps, free disk for recording, rate-limited refusal logs.
 `docs/threat-model.md` covers each threat and lists follow-ups (longer
 fuzzing, SRT after the handshake). The `Dockerfile` builds a
 38.5 MB arm64 image that runs and serves a stream.
+
+**Resource follow-up (2026-10-24):** active connection limits do not bound
+reconnect-held HLS paths or fragments retained by slow responses. C9 now adds
+the separate `N` RTMP publication gate alongside its `4N` connection cap,
+with takeover, retirement and recording regressions. The
+[retained-media contract](docs/retained-media-contract.md) records the current
+owners, proposed admission limits and executable acceptance cases. These
+global-retention gates remain open; recorder and muxer bounds do not establish
+a whole-process memory limit.
 
 ### M6 Our own SRT (MIT)
 

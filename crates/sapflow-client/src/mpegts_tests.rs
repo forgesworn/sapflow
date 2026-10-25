@@ -125,10 +125,71 @@ fn idr_annexb_parameter_sets_and_timestamps_round_trip() {
     expected.extend(vec![0x80; 499]);
     assert_eq!(pes.data, expected);
     let stats = mux.stats();
-    assert_eq!(stats.elementary_staging_copy_bytes, expected.len() as u64);
+    assert_eq!(stats.elementary_staging_copy_bytes, 184 - 2 - 19);
     assert_eq!(stats.packet_payload_copy_bytes, expected.len() as u64);
     assert_eq!(stats.writer_payload_copy_bytes, expected.len() as u64);
     assert_eq!(stats.buffered_sample_bytes, 0);
+}
+
+#[test]
+fn multi_nal_sample_advances_beyond_a_partially_consumed_piece() {
+    fn nal(header: u8, len: usize, fill: u8) -> Vec<u8> {
+        let mut nal = vec![header];
+        nal.resize(len, fill);
+        nal
+    }
+
+    let first = nal(0x65, 400, 0x80);
+    let second = nal(0x41, 100, 0x81);
+    let mut payload = Vec::new();
+    for nal in [&first, &second] {
+        payload.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        payload.extend_from_slice(nal);
+    }
+    let sample = Arc::new(
+        EncodedSample::new(
+            Arc::new(CodecConfig::H264(video_config())),
+            SampleTiming::new(9000, 6000, 3000, 90000).expect("time"),
+            true,
+            Arc::from(payload),
+        )
+        .expect("multi-NAL sample"),
+    );
+    let mut mux = MpegTsMuxer::new(config()).expect("mux");
+    mux.push(sample).expect("push");
+    let bytes = drain(&mut mux);
+    assert!(mux.is_idle());
+    let mut reader = PesPacketReader::new(TsPacketReader::new(&bytes[..]));
+    let pes = reader.read_pes_packet().expect("PES").expect("video");
+    let mut expected = vec![0, 0, 0, 1, 9, 0xf0, 0, 0, 0, 1];
+    expected.extend(video_config().sps());
+    expected.extend([0, 0, 0, 1]);
+    expected.extend(video_config().pps());
+    expected.extend([0, 0, 0, 1]);
+    expected.extend(first);
+    expected.extend([0, 0, 0, 1]);
+    expected.extend(second);
+    assert_eq!(pes.data, expected);
+}
+
+#[test]
+fn contiguous_audio_payload_skips_staging_after_header_boundary() {
+    let mut mux = MpegTsMuxer::new(config()).expect("mux");
+    let payload: Vec<u8> = (0..320).map(|i| i as u8).collect();
+    mux.push(audio_at(48000, &payload)).expect("push");
+    let bytes = drain(&mut mux);
+    let mut reader = PesPacketReader::new(TsPacketReader::new(&bytes[..]));
+    let pes = reader.read_pes_packet().expect("PES").expect("AAC");
+    let mut expected = adts_header(audio_config(), payload.len())
+        .expect("ADTS")
+        .to_vec();
+    expected.extend_from_slice(&payload);
+    assert_eq!(pes.data, expected);
+    let stats = mux.stats();
+    assert_eq!(stats.elementary_staging_copy_bytes, 184 - 2 - 14);
+    assert_eq!(stats.packet_payload_copy_bytes, expected.len() as u64);
+    assert_eq!(stats.writer_payload_copy_bytes, expected.len() as u64);
+    assert!(stats.elementary_staging_copy_bytes < stats.packet_payload_copy_bytes);
 }
 
 #[test]

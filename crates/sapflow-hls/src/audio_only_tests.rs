@@ -487,7 +487,9 @@ fn a_late_audio_only_declaration_cannot_hide_prior_unsupported_asc_flags() {
     for legacy in [false, true] {
         let mut ingest = FlvIngest::new(MuxerConfig::default());
         if legacy {
-            ingest.audio(0, &[0xaf, 0, 0x11, 0x8c]);
+            ingest
+                .audio(0, &[0xaf, 0, 0x11, 0x8c])
+                .expect("legacy audio-only no-op");
         } else {
             ingest
                 .audio_at(0, &[0xaf, 0, 0x11, 0x8c], now())

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use sapflow_core::StreamPath;
+use sapflow_core::limits::{PublicationPermit, PublicationQuota};
 use sapflow_hls::muxer::Part;
 use sapflow_hls::{
     FlvIngest, IngestError, Muxer, MuxerConfig, PartLookup, TsIngest, Update, playlist,
@@ -127,6 +128,8 @@ pub struct Session {
     /// from an earlier one changes nothing.
     generation: u64,
     attached: bool,
+    /// Credit belongs to this exact attached RTMP generation, not its TCP task.
+    publication_permit: Option<PublicationPermit>,
     /// All completed parts below this floor belong to the previous connection.
     /// detach seals its pending run before claim can advance this floor.
     fresh_part_floor: u64,
@@ -202,7 +205,12 @@ fn fresh_prefix() -> String {
 }
 
 impl LiveStream {
-    fn new(path: StreamPath, cfg: MuxerConfig, kind: SourceKind) -> Self {
+    fn new(
+        path: StreamPath,
+        cfg: MuxerConfig,
+        kind: SourceKind,
+        publication_permit: Option<PublicationPermit>,
+    ) -> Self {
         Self {
             path,
             cfg,
@@ -216,6 +224,7 @@ impl LiveStream {
             session: Mutex::new(Session {
                 generation: 0,
                 attached: true,
+                publication_permit,
                 fresh_part_floor: 0,
                 recorder: None,
                 recorder_factory: None,
@@ -385,6 +394,7 @@ impl LiveStream {
             }
         }
         if let Some(recorder) = &mut session.recorder
+            && recorder.is_accepting()
             && let Some((tracks, parts)) = self.parts_after(recorder.last_part())
         {
             // Recorder additionally pins the immutable init identity. A
@@ -434,13 +444,26 @@ pub enum Retirement {
     Held(Duration),
 }
 
-/// The live streams, by event id.
+/// A claim refused before ownership, media or recorder policy changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimError {
+    AlreadyLive,
+    PublisherLimit,
+}
+
+/// The live streams, by event id, and current RTMP publication admission.
 #[derive(Default)]
 pub struct Registry {
     streams: Mutex<HashMap<String, Arc<LiveStream>>>,
+    rtmp_publications: Arc<PublicationQuota>,
 }
 
 impl Registry {
+    #[cfg(test)]
+    pub(crate) fn active_rtmp_publishers(&self) -> usize {
+        self.rtmp_publications.active()
+    }
+
     fn map(&self) -> MutexGuard<'_, HashMap<String, Arc<LiveStream>>> {
         self.streams.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -455,7 +478,8 @@ impl Registry {
         cfg: MuxerConfig,
         kind: SourceKind,
     ) -> Option<(Arc<LiveStream>, u64, Claim)> {
-        self.claim_configured(path, cfg, kind, false, |_, _| {})
+        self.claim_configured(path, cfg, kind, false, 16, |_, _| {})
+            .ok()
     }
 
     /// As [`Registry::claim`], but a stream with a publisher attached is taken
@@ -471,7 +495,8 @@ impl Registry {
         cfg: MuxerConfig,
         kind: SourceKind,
     ) -> Option<(Arc<LiveStream>, u64, Claim)> {
-        self.claim_configured(path, cfg, kind, true, |_, _| {})
+        self.claim_configured(path, cfg, kind, true, 16, |_, _| {})
+            .ok()
     }
 
     /// Configure the accepted connection before another claim can observe it.
@@ -483,21 +508,38 @@ impl Registry {
         cfg: MuxerConfig,
         kind: SourceKind,
         take_over: bool,
+        max_rtmp_publishers: usize,
         configure: impl FnOnce(&mut Session, Claim),
-    ) -> Option<(Arc<LiveStream>, u64, Claim)> {
+    ) -> Result<(Arc<LiveStream>, u64, Claim), ClaimError> {
         let mut map = self.map();
+        let mut publication_permit = None;
         if let Some(stream) = map.get(path.event_id()).cloned() {
             let mut session = stream.session();
+            if session.attached && !take_over {
+                return Err(ClaimError::AlreadyLive);
+            }
+            // Admission precedes any terminal parsing, generation change or
+            // recorder configuration. A refused cross-protocol takeover must
+            // leave its current SRT owner completely unchanged.
+            if matches!(kind, SourceKind::Flv) {
+                publication_permit = Some(match session.publication_permit.take() {
+                    Some(permit) => permit,
+                    None => self
+                        .rtmp_publications
+                        .try_acquire(max_rtmp_publishers)
+                        .map_err(|_| ClaimError::PublisherLimit)?,
+                });
+            }
             if session.attached {
-                if !take_over {
-                    return None;
-                }
                 // Preserve accepted terminal parser input and recorder loss
                 // attribution before replacing the source under this owner.
                 stream.finish_connection(&mut session);
                 session.attached = false;
                 tracing::info!(path = %path.as_path(), "publisher replaced by a new connection");
             }
+            // RTMP-to-SRT replacement retires the old RTMP credit now. A
+            // same-protocol replacement moved it above, without a transient N+1.
+            session.publication_permit = None;
             // A delayed expiry task cannot extend the original outage window.
             if session
                 .outage_deadline
@@ -508,6 +550,7 @@ impl Registry {
             } else {
                 session.generation += 1;
                 session.attached = true;
+                session.publication_permit = publication_permit;
                 let mut st = stream.lock();
                 let muxer = st.ingest.take_muxer();
                 // detach() held the same map/session locks while interrupting
@@ -517,13 +560,20 @@ impl Registry {
                 st.ingest = Source::resume(kind, stream.cfg, muxer);
                 drop(st);
                 configure(&mut session, Claim::Resumed);
-                return Some((stream.clone(), session.generation, Claim::Resumed));
+                return Ok((stream.clone(), session.generation, Claim::Resumed));
             }
         }
-        let stream = Arc::new(LiveStream::new(path.clone(), cfg, kind));
+        if matches!(kind, SourceKind::Flv) && publication_permit.is_none() {
+            publication_permit = Some(
+                self.rtmp_publications
+                    .try_acquire(max_rtmp_publishers)
+                    .map_err(|_| ClaimError::PublisherLimit)?,
+            );
+        }
+        let stream = Arc::new(LiveStream::new(path.clone(), cfg, kind, publication_permit));
         configure(&mut stream.session(), Claim::Fresh);
         map.insert(path.event_id().to_owned(), stream.clone());
-        Some((stream, 0, Claim::Fresh))
+        Ok((stream, 0, Claim::Fresh))
     }
 
     pub fn get(&self, event_id: &str) -> Option<Arc<LiveStream>> {
@@ -549,6 +599,7 @@ impl Registry {
         }
         session.attached = false;
         stream.finish_connection(&mut session);
+        session.publication_permit = None;
         if hold {
             // Keep claim() excluded until the previous run and recording tail
             // are closed. A new publisher must not race this interruption.
@@ -582,11 +633,14 @@ impl Registry {
             return Retirement::Stale;
         }
         if !session.attached || closed {
+            session.attached = false;
+            session.publication_permit = None;
             return Retirement::Ended;
         }
         session.hold_remaining(grace, Instant::now());
         session.attached = false;
         stream.finish_connection(&mut session);
+        session.publication_permit = None;
         // Terminal parsing cannot extend the original reconnect deadline.
         let remaining = session.hold_remaining(grace, Instant::now());
         if can_hold && !remaining.is_zero() && stream.has_content() {
@@ -629,6 +683,7 @@ impl Registry {
         }
         session.attached = false;
         stream.finish_connection(&mut session);
+        session.publication_permit = None;
         drop(session);
         Self::end(&mut map, stream);
         true
@@ -648,6 +703,8 @@ impl Registry {
         let recorder = {
             let mut session = stream.session();
             stream.finish_connection(&mut session);
+            session.attached = false;
+            session.publication_permit = None;
             stream.close();
             // Actual writer completion follows channel closure, not removal
             // from the registry or a requested transport shutdown.
@@ -751,6 +808,7 @@ mod tests {
             &path,
             fixture.app.callbacks.clone(),
             0,
+            fixture.app.recording_limits.clone(),
         );
         let registry = fixture.app.streams.clone();
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -762,6 +820,7 @@ mod tests {
                     MuxerConfig::default(),
                     SourceKind::Ts,
                     true,
+                    16,
                     |s, c| {
                         assert_eq!(c, Claim::Fresh);
                         entered_tx.send(()).expect("setup entered");
@@ -848,6 +907,7 @@ mod grace_tests {
         let mut session = Session {
             generation: 0,
             attached: true,
+            publication_permit: None,
             fresh_part_floor: 0,
             recorder: None,
             recorder_factory: None,
@@ -866,5 +926,290 @@ mod grace_tests {
             grace
         );
         assert_eq!(session.hold_remaining(Duration::ZERO, now), Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod publication_capacity_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn path(id: &str) -> StreamPath {
+        StreamPath::parse(&format!("live/event-{id}")).expect("generated path")
+    }
+
+    fn attach(
+        registry: &Registry,
+        limit: usize,
+        id: &str,
+        kind: SourceKind,
+    ) -> Result<(Arc<LiveStream>, u64, Claim), ClaimError> {
+        registry.claim_configured(
+            &path(id),
+            MuxerConfig::default(),
+            kind,
+            true,
+            limit,
+            |_, _| {},
+        )
+    }
+
+    #[test]
+    fn exact_publisher_cap_refuses_before_configuration_and_releases_on_retire() {
+        let registry = Registry::default();
+        let limit = 2;
+        let (first, g1, _) = attach(&registry, limit, "first", SourceKind::Flv).expect("first");
+        let (second, _, _) = attach(&registry, limit, "second", SourceKind::Flv).expect("second");
+        let configured = Cell::new(false);
+        assert!(matches!(
+            registry.claim_configured(
+                &path("third"),
+                MuxerConfig::default(),
+                SourceKind::Flv,
+                true,
+                limit,
+                |_, _| configured.set(true)
+            ),
+            Err(ClaimError::PublisherLimit)
+        ));
+        assert!(!configured.get());
+        assert!(registry.get("event-third").is_none());
+        assert!(matches!(
+            registry.claim_configured(
+                &path("first"),
+                MuxerConfig::default(),
+                SourceKind::Flv,
+                false,
+                limit,
+                |_, _| configured.set(true)
+            ),
+            Err(ClaimError::AlreadyLive)
+        ));
+        assert!(!configured.get());
+        assert_eq!(registry.active_rtmp_publishers(), 2);
+        assert!(matches!(
+            registry.retire(&first, g1, Duration::ZERO, false),
+            Retirement::Ended
+        ));
+        assert!(first.lock().closed, "retained old Arc is still present");
+        assert_eq!(registry.active_rtmp_publishers(), 1);
+        let _third =
+            attach(&registry, limit, "third", SourceKind::Flv).expect("freed owner credit");
+        assert_eq!(registry.active_rtmp_publishers(), 2);
+        assert!(!second.lock().closed);
+    }
+
+    #[test]
+    fn same_path_takeover_at_capacity_transfers_credit_and_all_stale_retirements_are_inert() {
+        let registry = Registry::default();
+        let limit = 1;
+        let (old, old_generation, _) =
+            attach(&registry, limit, "same", SourceKind::Flv).expect("old");
+        let (new, generation, claim) =
+            attach(&registry, limit, "same", SourceKind::Flv).expect("full-cap takeover");
+        assert_eq!(claim, Claim::Resumed);
+        assert!(Arc::ptr_eq(&old, &new));
+        assert!(generation > old_generation);
+        assert_eq!(registry.active_rtmp_publishers(), 1);
+        assert!(matches!(
+            registry.retire(&old, old_generation, Duration::ZERO, false),
+            Retirement::Stale
+        ));
+        assert!(!registry.detach(&old, old_generation, false));
+        assert!(!registry.terminate(&old, old_generation));
+        assert!(!registry.expire(&old, old_generation));
+        assert_eq!(registry.active_rtmp_publishers(), 1);
+        assert!(new.session().owns_connection(generation));
+        assert!(matches!(
+            attach(&registry, limit, "other", SourceKind::Flv),
+            Err(ClaimError::PublisherLimit)
+        ));
+        assert!(registry.terminate(&new, generation));
+        assert_eq!(registry.active_rtmp_publishers(), 0);
+    }
+
+    #[test]
+    fn cross_protocol_refusal_is_atomic_and_rtmp_to_srt_releases_credit() {
+        let registry = Registry::default();
+        let limit = 1;
+        let (srt, srt_generation, _) =
+            attach(&registry, limit, "srt", SourceKind::Ts).expect("SRT");
+        let (rtmp, _, _) = attach(&registry, limit, "rtmp", SourceKind::Flv).expect("RTMP");
+        let before_prefix = srt.lock().prefix.clone();
+        let before_version = srt.version();
+        let configured = Cell::new(false);
+        assert!(matches!(
+            registry.claim_configured(
+                &path("srt"),
+                MuxerConfig::default(),
+                SourceKind::Flv,
+                true,
+                limit,
+                |_, _| configured.set(true)
+            ),
+            Err(ClaimError::PublisherLimit)
+        ));
+        assert!(!configured.get());
+        assert!(srt.session().owns_connection(srt_generation));
+        assert!(matches!(srt.lock().ingest, Source::Ts(_)));
+        assert_eq!(srt.lock().prefix, before_prefix);
+        assert_eq!(srt.version(), before_version);
+        let (as_srt, _, _) =
+            attach(&registry, limit, "rtmp", SourceKind::Ts).expect("SRT replacement");
+        assert!(Arc::ptr_eq(&rtmp, &as_srt));
+        assert_eq!(registry.active_rtmp_publishers(), 0);
+        let (as_rtmp, _, _) =
+            attach(&registry, limit, "srt", SourceKind::Flv).expect("now capacity");
+        assert!(Arc::ptr_eq(&srt, &as_rtmp));
+        assert_eq!(registry.active_rtmp_publishers(), 1);
+    }
+
+    #[test]
+    fn detached_grace_reconnect_reacquires_only_available_actual_owner_capacity() {
+        let registry = Registry::default();
+        let limit = 1;
+        let (held, old_generation, _) =
+            attach(&registry, limit, "held", SourceKind::Flv).expect("first");
+        assert!(registry.detach(&held, old_generation, true));
+        assert_eq!(registry.active_rtmp_publishers(), 0);
+        let (other, generation, _) =
+            attach(&registry, limit, "other", SourceKind::Flv).expect("other");
+        assert!(matches!(
+            attach(&registry, limit, "held", SourceKind::Flv),
+            Err(ClaimError::PublisherLimit)
+        ));
+        assert!(
+            !held.lock().closed,
+            "refusal does not destroy the held presentation"
+        );
+        assert!(!held.session().attached);
+        registry.retire(&other, generation, Duration::ZERO, false);
+        let (resumed, current, claim) =
+            attach(&registry, limit, "held", SourceKind::Flv).expect("freed credit");
+        assert!(Arc::ptr_eq(&held, &resumed));
+        assert_eq!(claim, Claim::Resumed);
+        assert!(!registry.expire(&held, old_generation));
+        assert!(resumed.session().owns_connection(current));
+        assert_eq!(registry.active_rtmp_publishers(), 1);
+    }
+
+    #[test]
+    fn actual_held_retirement_releases_credit_before_cache_and_expiry_owners() {
+        let registry = Registry::default();
+        let limit = 1;
+        let (stream, generation, _) =
+            attach(&registry, limit, "held-media", SourceKind::Flv).expect("owner");
+        stream
+            .apply(|source, now| {
+                let Source::Flv(flv) = source else {
+                    panic!("FLV")
+                };
+                flv.declare_tracks(sapflow_hls::TrackSet::AudioOnly, now)?;
+                flv.audio_at(0, &[0xaf, 0, 0x11, 0x88], now)?;
+                let mut update = Default::default();
+                for frame in 0..64u64 {
+                    // Storage/retirement fixture, not decode-quality media.
+                    update = flv.audio_at(
+                        (frame * 1024 * 1000 / 48_000) as u32,
+                        &[0xaf, 1, 0x5a, 0x5a, 0x5a],
+                        now,
+                    )?;
+                }
+                Ok(update)
+            })
+            .expect("accepted bounded audio");
+        assert!(stream.has_content());
+        assert!(matches!(
+            registry.retire(&stream, generation, Duration::from_secs(60), true),
+            Retirement::Held(_)
+        ));
+        assert_eq!(registry.active_rtmp_publishers(), 0);
+        assert!(!stream.lock().closed);
+        let (_other, _, _) =
+            attach(&registry, limit, "other", SourceKind::Flv).expect("credit already freed");
+        assert_eq!(registry.active_rtmp_publishers(), 1);
+        assert!(registry.expire(&stream, generation));
+        assert_eq!(
+            registry.active_rtmp_publishers(),
+            1,
+            "expiry cannot free a different owner"
+        );
+    }
+
+    #[test]
+    fn expired_same_path_takeover_moves_the_full_cap_credit_into_the_fresh_object() {
+        let registry = Registry::default();
+        let limit = 1;
+        let (old, old_generation, _) =
+            attach(&registry, limit, "expired", SourceKind::Flv).expect("old");
+        old.session().hold_remaining(
+            Duration::from_secs(1),
+            Instant::now() - Duration::from_secs(2),
+        );
+        let (fresh, current, claim) =
+            attach(&registry, limit, "expired", SourceKind::Flv).expect("full-cap fresh successor");
+        assert_eq!(claim, Claim::Fresh);
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert!(old.lock().closed);
+        assert_eq!(registry.active_rtmp_publishers(), 1);
+        assert!(matches!(
+            registry.retire(&old, old_generation, Duration::ZERO, false),
+            Retirement::Stale
+        ));
+        assert!(fresh.session().owns_connection(current));
+        assert_eq!(registry.active_rtmp_publishers(), 1);
+    }
+
+    #[test]
+    fn concurrent_distinct_path_claims_count_only_two_real_owners() {
+        let registry = Arc::new(Registry::default());
+        let limit = 2;
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut threads = Vec::new();
+        for i in 0..4 {
+            let (registry, barrier) = (registry.clone(), barrier.clone());
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                attach(&registry, limit, &format!("parallel-{i}"), SourceKind::Flv)
+            }));
+        }
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|t| t.join().expect("bounded claim worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(ClaimError::PublisherLimit)))
+                .count(),
+            2
+        );
+        assert_eq!(registry.active_rtmp_publishers(), 2);
+        for (stream, generation, _) in results.into_iter().flatten() {
+            registry.retire(&stream, generation, Duration::ZERO, false);
+        }
+        assert_eq!(registry.active_rtmp_publishers(), 0);
+    }
+
+    #[test]
+    fn unpublished_fresh_configuration_unwind_rolls_back_owner_credit() {
+        let registry = Registry::default();
+        let limit = 1;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = registry.claim_configured(
+                &path("unpublished"),
+                MuxerConfig::default(),
+                SourceKind::Flv,
+                true,
+                limit,
+                |_, _| panic!("test-only fresh setup failure"),
+            );
+        }));
+        assert!(failed.is_err());
+        assert!(registry.get("event-unpublished").is_none());
+        assert_eq!(registry.active_rtmp_publishers(), 0);
+        assert!(attach(&registry, limit, "accepted", SourceKind::Flv).is_ok());
     }
 }

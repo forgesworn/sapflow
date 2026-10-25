@@ -7,6 +7,7 @@ mod http;
 mod http1;
 #[cfg(test)]
 mod http_backend_tests;
+mod media_body;
 mod own_http;
 mod publish;
 mod publish_control;
@@ -49,6 +50,7 @@ pub struct App {
     pub refusal_log: std::sync::Mutex<sapflow_core::limits::LogLimiter>,
     pub streams: Arc<Registry>,
     pub callbacks: Callbacks,
+    pub recording_limits: Arc<recorder::RecordingLimits>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -123,6 +125,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         None => None,
     };
     let app = Arc::new(App {
+        recording_limits: Arc::new(recorder::RecordingLimits::new(config.max_publishers)),
         publish_sessions,
         callbacks: Callbacks::start(config.callback_url.clone(), config.callback_secret.clone()),
         streams: Arc::new(Registry::default()),
@@ -137,7 +140,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         config,
     });
 
-    // SAPFLOW_HTTP_IMPL=own serves viewers from our own event loop.
+    // Viewers use our event loop by default; Hyper is explicitly selectable.
     let http = match app.config.own_http_threads {
         Some(threads) => {
             let l = std::net::TcpListener::bind(app.config.http_addr)?;

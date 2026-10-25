@@ -303,7 +303,9 @@ fuzz_target!(|data: &[u8]| {
         let step = if flags & 2 != 0 { step * 16 } else { step };
         dts += if flags & 4 != 0 { -step } else { step };
         for _ in 0..(flags >> 3) & 7 {
-            m.push_audio(audio, Bytes::from_static(b"aac"));
+            if m.push_audio(audio, Bytes::from_static(b"aac")).is_err() {
+                return;
+            }
             audio += 1920;
         }
         let pts = dts + i64::from(flags >> 6) * 3000;
