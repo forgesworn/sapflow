@@ -18,13 +18,13 @@ import java.nio.file.Path
 import java.util.UUID
 
 /** Optional SDK/file compound owner on the EXISTING recording worker/Writer.
- * No capture/default wiring, second reservation, media queue or native facts.
- * Supplied head/generation/file values are trusted caller input, not F0 proof.
- * Even COMPLETE SDK output is submitted-input scope with UNKNOWN app admission. */
+ * No capture/default wiring, second reservation or media queue. Its low-level
+ * methods still trust supplied facts; AudioNativeAacRun is the checked producer
+ * bridge. Even COMPLETE SDK output is submitted-input scope with UNKNOWN admission. */
 internal class RecordingCheckpointOwner private constructor(
     private val writer: RecordingCatalogue.Writer,
     private val epoch: ULong,
-) {
+) : AudioNativeAacWorker {
     enum class ApplicationAdmission { UNKNOWN }
     enum class Scope { SUBMITTED_SDK_INPUTS_ONLY }
     @ConsistentCopyVisibility
@@ -117,7 +117,7 @@ internal class RecordingCheckpointOwner private constructor(
     fun checkStorage() = perform { checkNotNull(storage).checkCapacity(); requireAdmission() }
 
     /** Explicit low-level trusted input. Never call with an inferred zero. */
-    fun beginAudio(firstLeadingFrames: UInt) = perform {
+    override fun beginAudio(firstLeadingFrames: UInt) = perform {
         check(!leadingSupplied) { "First native leading fact was already supplied" }
         requireAdmission()
         checkNotNull(muxer).value.beginNativeAudio(firstLeadingFrames)
@@ -132,13 +132,13 @@ internal class RecordingCheckpointOwner private constructor(
         checkNotNull(muxer).value.push(sample); drain()
     }
     /** Must be ordered on the SAME FIFO as all original recording samples. */
-    fun generationEnded(receipt: NativeAudioGenerationReceipt) = perform {
+    override fun generationEnded(receipt: NativeAudioGenerationReceipt) = perform {
         check(leadingSupplied && !fileReceiptSupplied && finishOutcome == null)
         requireAdmission()
         checkNotNull(muxer).value.endNativeAudioGeneration(receipt.copy()); drain()
     }
     /** Supplied receipt is not a concrete Android producer-closure authority. */
-    fun completeAudio(receipt: NativeAudioFileReceipt) = perform {
+    override fun completeAudio(receipt: NativeAudioFileReceipt) = perform {
         check(leadingSupplied && !fileReceiptSupplied && finishOutcome == null)
         requireAdmission()
         checkNotNull(muxer).value.completeNativeAudio(receipt.copy())

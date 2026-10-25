@@ -9,6 +9,14 @@ from zipfile import ZipFile, ZIP_STORED
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE_CLASS = 'dev.forgesworn.sapflow.broadcaster.AudioAacProfileTest'
 PROFILE_TEST = 'mobile/android/app/src/test/java/dev/forgesworn/sapflow/broadcaster/AudioAacProfileTest.kt'
+NATIVE_TEST_SUITES = {
+    'dev.forgesworn.sapflow.broadcaster.AudioNativeAacGenerationTest':
+        ('mobile/android/app/src/test/java/dev/forgesworn/sapflow/broadcaster/AudioNativeAacGenerationTest.kt', 24),
+    'dev.forgesworn.sapflow.broadcaster.AudioNativeAacRunTest':
+        ('mobile/android/app/src/test/java/dev/forgesworn/sapflow/broadcaster/AudioNativeAacRunTest.kt', 22),
+    'dev.forgesworn.sapflow.broadcaster.AudioSourcePreservationTest':
+        ('mobile/android/app/src/test/java/dev/forgesworn/sapflow/broadcaster/AudioSourcePreservationTest.kt', 21),
+}
 MAX_METADATA = 16 * 1024 * 1024
 
 def need(value, message):
@@ -29,16 +37,37 @@ def profile_test_methods(source):
     need(len(methods) == len(set(methods)) == 17, 'Expected all seventeen selected AAC profile controls')
     return methods
 
+def native_test_methods(sources):
+    need(type(sources) is dict and set(sources) == {path for path, count in NATIVE_TEST_SUITES.values()},
+         'Exact captured native AAC test sources required')
+    required = {}
+    for classname, (path, count) in NATIVE_TEST_SUITES.items():
+        source = sources[path]
+        need(type(source) is str, 'Native AAC test source text required')
+        methods = re.findall(r'@Test\s+fun\s+(\w+)\s*\(\s*\)', source)
+        need(len(methods) == len(set(methods)) == count, 'Complete unique native AAC controls required: ' + classname)
+        required[classname] = methods
+    return required
+
+
 def xml_root(path):
     need(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= MAX_METADATA, 'Bounded generated XML required')
     data = path.read_bytes()
     need(b'<!DOCTYPE' not in data and b'<!ENTITY' not in data, 'XML declarations with external/custom entities refused')
     return ET.fromstring(data)
 
-def check_junit(paths, methods, minimum_tests=17):
+def check_junit(paths, methods, minimum_tests=17, required_suites=None):
     need(paths and len(paths) <= 1024 and len(methods) == len(set(methods)) == 17 and type(minimum_tests) is int and minimum_tests >= 17, 'Complete bounded JUnit reports/profile methods required')
+    required = {} if required_suites is None else required_suites
+    need(type(required) is dict and len(required) <= 32 and (required_suites is None or required),
+         'Bounded nonempty exact required suite map')
+    for classname, expected in required.items():
+        need(type(classname) is str and 0 < len(classname) <= 1024 and classname != PROFILE_CLASS and
+             type(expected) is list and 0 < len(expected) <= 256 and
+             all(type(name) is str and 0 < len(name) <= 1024 for name in expected) and
+             len(expected) == len(set(expected)), 'Unique named required suite methods')
     totals = dict(tests=0, errors=0, failures=0, skipped=0)
-    profile = []; suites_seen = set(); cases_seen = set()
+    profile = []; suites_seen = set(); cases_seen = set(); required_seen = {}
     for path in paths:
         suite = xml_root(path); need(suite.tag == 'testsuite', 'Expected Gradle JUnit testsuite')
         suite_name = suite.get('name')
@@ -53,13 +82,21 @@ def check_junit(paths, methods, minimum_tests=17):
         for case in cases:
             identity = (case.get('classname'), case.get('name'))
             need(all(type(value) is str and 0 < len(value) <= 1024 for value in identity) and identity not in cases_seen, 'Expected unique named/classed JUnit cases')
+            need(identity[0] not in required or identity[0] == suite_name, 'Required methods must remain in their actual suite')
             cases_seen.add(identity)
         for name in totals: totals[name] += counts[name]
         if suite.get('name') == PROFILE_CLASS:
             need(all(case.get('classname') == PROFILE_CLASS for case in cases), 'Profile methods must belong to the actual profile class')
             profile.append([case.get('name') for case in cases])
+        if suite_name in required:
+            need(all(case.get('classname') == suite_name for case in cases), 'Required methods must belong to the actual required class')
+            required_seen[suite_name] = [case.get('name') for case in cases]
     need(totals['tests'] >= minimum_tests and len(profile) == 1 and sorted(profile[0]) == sorted(methods), 'Missing, duplicated or incomplete AAC profile suite')
-    return dict(totals, suites=len(paths), profileMethods=profile[0])
+    need(set(required_seen) == set(required) and all(sorted(required_seen[name]) == sorted(expected) for name, expected in required.items()),
+         'Missing, duplicated or incomplete native AAC suite')
+    result = dict(totals, suites=len(paths), profileMethods=profile[0])
+    if required: result['requiredSuiteMethods'] = required_seen
+    return result
 
 def check_fresh_tasks(text):
     for task in ('testDebugUnitTest', 'testQualificationUnitTest'):
@@ -273,11 +310,17 @@ def main():
         need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,254}', verification['archive']) and sha(package_root / verification['archive']) == verification['sha256'], 'Actual packaged SDK archive checksum')
         package['archiveSHA256'] = verification['sha256']
         methods = profile_test_methods((root / PROFILE_TEST).read_text())
+        native_sources = {}
+        for path, count in NATIVE_TEST_SUITES.values():
+            source = (root / path).read_bytes()
+            need(hashlib.sha256(source).hexdigest() == before['source'][path]['sha256'], 'Native AAC test source differs from captured input: ' + path)
+            native_sources[path] = source.decode('utf-8')
+        required_suites = native_test_methods(native_sources)
         text = run('gradle', ['mobile/android/build-debug.sh', '--max-workers=1', '--rerun-tasks', '-Dorg.gradle.jvmargs=-Xmx1024m', '-Dorg.gradle.java.home=' + str(jdk), '-PsapflowAar=' + str(aar), ':app:testQualificationUnitTest', ':app:assembleQualification', ':app:assembleRelease', ':app:lintDebug', ':app:lintQualification', ':app:lintRelease', ':app:verifyQualificationIsolation'], 1800)
         check_fresh_tasks(text)
         for task in ('testDebugUnitTest', 'testQualificationUnitTest'):
             paths = sorted((target / 'mobile-android/app/test-results' / task).glob('TEST-*.xml'))
-            tests[task] = check_junit(paths, methods, {'testDebugUnitTest': 777, 'testQualificationUnitTest': 748}[task])
+            tests[task] = check_junit(paths, methods, {'testDebugUnitTest': 825, 'testQualificationUnitTest': 796}[task], required_suites=required_suites)
             tests[task]['reports'] = {}
             for path in paths:
                 destination = evidence / 'xml' / task / path.name; destination.parent.mkdir(parents=True, exist_ok=True)

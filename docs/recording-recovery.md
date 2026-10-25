@@ -2019,6 +2019,46 @@ the source-preservation mode's unattested status and legacy recorder defaults
 remain unchanged. An installed component still needs the complete native
 source, content and presentation qualification described above.
 
+### Checked Android native generation and worker boundary
+
+`AudioNativeAacGeneration` binds one private generation owner, actual codec and
+callback instance. Its sixteen scalar slot records distinguish returned sample
+and timing-view acquisition, output-buffer release, handoff entry/return and
+checked transfer closure. The acquisition hook reads the current reused slot
+serial after construction, before a later original-wrapper close can fail.
+It retains no payload, adds no media queue and makes no native metadata query.
+
+A native generation receipt can be issued only after actual producer joins,
+input/output EOS, callback stop and codec/microphone release. It requires eligible
+original units, observed leading trim before the first unit, actual terminal
+padding, known transfer closure and checked input/head/tail conservation. Unknown
+trim cannot be supplied by a decoded length or inferred zero. Receipt identity
+is checked against its actual issuer; the diagnostic observation stays separate.
+
+`AudioNativeAacRun` carries those receipts to an explicitly bound timing-aware
+recording worker. It checks per-generation accepted audio counts and the common
+accepted/consumed media frontier, with one pending consume at a time. Early video
+waits in the existing bounded fanout until the first accepted audio establishes
+leading trim. Timing calls run outside the scalar guard. Callback return cannot
+override a recording failure, and known loss is latched before asynchronous
+prefix cleanup, including rejected video absent from the accepted counters.
+Invalid worker wiring is refused before an executor is created. Consumption adds
+no per-sample `isVideo` query.
+
+API35's exact returned batching pair `0/0` has separate single-unit eligibility
+provenance. The shared request still leaves both keys unset. Positive, mixed,
+malformed or unknown batching facts and known startup contradictions remain
+unqualified. Raw returned facts are retained.
+
+The public Android build gate requires all 84 named profile, generation, run and
+transfer controls in both JVM variants, alongside the complete app-test floors,
+package checks and 56 generated verifier controls. These are synthetic event and
+build checks. A concrete capture sink implementing both `EncodedSink` and
+`AudioNativeAacWorker`, installed-component H/T and content qualification,
+application admission, presentation, durable recovery, sustained loss and device
+acceptance remain open. The legacy backend remains the default; none of the
+historical numerical or native-clock failures is reclassified.
+
 ## iOS explicit prefix recovery and durable source budget
 
 The explicitly selected SDK checkpoint recorder now supports recovery into a

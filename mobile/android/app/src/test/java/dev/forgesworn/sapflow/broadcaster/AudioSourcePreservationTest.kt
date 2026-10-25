@@ -301,4 +301,36 @@ class AudioSourcePreservationTest {
         assertTrue(lifecycle.actualClosed(generation)); assertTrue(lifecycle.isFailed())
         assertEquals(1, f.lastSample!!.closes); assertTrue(slot.reusable)
     }
+
+    @Test fun acquisitionIsLatchedAfterBothReturnsBeforeOriginalCloseCanThrow() {
+        val f = Fixture(); f.sampleCloseUnknown = true
+        var acquisitions = 0
+        val slot = AudioTimingTransfer(f.originalFactory, f.viewsFactory, { it is Rejected }, {}, {
+            acquisitions++
+            assertEquals(0, f.lastSample!!.closes)
+            assertEquals(0, f.lastViews!!.closes)
+        })
+        assertThrows(IllegalStateException::class.java) { slot.preserve(byteArrayOf(1, 2), 0, -1, -1) }
+        assertEquals(1, acquisitions)
+        assertEquals(1, f.lastSample!!.closes)
+        assertEquals(0, f.lastViews!!.closes)
+        assertTrue(slot.ownershipUnknown)
+        assertThrows(IllegalStateException::class.java) { slot.close() }
+        assertEquals(1, f.lastSample!!.closes)
+    }
+
+    @Test fun reusedTransferHookReadsItsCurrentSerialAfterConstruction() {
+        val f = Fixture(); val observed = mutableListOf<Long>()
+        class Transfer(var serial: Long = 0L) : AudioTimingTransfer<Sample, Views, ByteArray>(
+            f.originalFactory, f.viewsFactory, { it is Rejected }) {
+            override fun acquisitionsReturned() { observed.add(serial) }
+        }
+        val slot = Transfer()
+        for (serial in listOf(7L, 19L)) {
+            slot.serial = serial
+            slot.preserve(byteArrayOf(1), 0, -1, -1)
+            slot.close()
+        }
+        assertEquals(listOf(7L, 19L), observed)
+    }
 }

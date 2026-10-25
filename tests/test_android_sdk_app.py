@@ -211,4 +211,125 @@ class AndroidSdkAppTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): driver.capture_package_files(folder)
 
 
+class AndroidNativeSuiteBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='android-native-suite-metadata-')
+        self.addCleanup(self.temp.cleanup); self.root = Path(self.temp.name).resolve()
+        self.profile = ['profileControl' + str(index) for index in range(17)]
+        self.required = {name: ['nativeControl' + str(serial) + '_' + str(index) for index in range(count)]
+                         for serial, (name, (path, count)) in enumerate(driver.NATIVE_TEST_SUITES.items())}
+
+    def matrix(self):
+        paths = []
+        for serial, (name, methods) in enumerate([(driver.PROFILE_CLASS, self.profile), *self.required.items()]):
+            suite = ET.Element('testsuite', name=name, tests=str(len(methods)), failures='0', errors='0', skipped='0')
+            for method in methods: ET.SubElement(suite, 'testcase', name=method, classname=name)
+            path = self.root / (str(serial) + '.xml'); ET.ElementTree(suite).write(path, encoding='utf-8'); paths.append(path)
+        return paths
+
+    def selected(self, paths, name):
+        return next(path for path in paths if ET.parse(path).getroot().get('name') == name)
+
+    def check(self, paths, minimum_tests=17, required=None):
+        return driver.check_junit(paths, self.profile, minimum_tests, required_suites=self.required if required is None else required)
+
+    def sources(self):
+        return {path: '\n'.join('@Test fun ' + method + '() {}' for method in self.required[name])
+                for name, (path, count) in driver.NATIVE_TEST_SUITES.items()}
+
+    def test_source_bound_native_matrix_has_all_24_22_21_controls(self):
+        self.assertEqual(driver.native_test_methods(self.sources()), self.required)
+        self.assertEqual([len(methods) for methods in self.required.values()], [24, 22, 21])
+
+    def test_missing_native_source_method_is_refused(self):
+        for name, (path, count) in driver.NATIVE_TEST_SUITES.items():
+            source = self.sources(); source[path] = '\n'.join(source[path].splitlines()[:-1])
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): driver.native_test_methods(source)
+
+    def test_duplicated_native_source_method_is_refused(self):
+        for name, (path, count) in driver.NATIVE_TEST_SUITES.items():
+            source = self.sources(); rows = source[path].splitlines(); rows[-1] = rows[0]; source[path] = '\n'.join(rows)
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): driver.native_test_methods(source)
+
+    def test_incomplete_or_foreign_native_source_namespace_is_refused(self):
+        for mutation in ('missing', 'foreign'):
+            source = self.sources()
+            if mutation == 'missing': source.pop(next(iter(source)))
+            else: source['foreign.kt'] = '@Test fun unrelated() {}'
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError): driver.native_test_methods(source)
+
+    def test_complete_exact_native_suite_matrix_is_accepted(self):
+        result = self.check(self.matrix(), minimum_tests=84)
+        self.assertEqual(result['tests'], 84); self.assertEqual(result['requiredSuiteMethods'], self.required)
+        self.assertEqual(result['profileMethods'], self.profile)
+
+    def test_missing_native_suite_cannot_be_replaced_by_other_tests(self):
+        for name in self.required:
+            paths = self.matrix(); path = self.selected(paths, name)
+            tree = ET.parse(path); suite = tree.getroot(); suite.set('name', 'Other')
+            for case in suite.findall('testcase'): case.set('classname', 'Other')
+            tree.write(path)
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check(paths, minimum_tests=84)
+
+    def test_native_suite_methods_from_foreign_class_are_refused(self):
+        for name in self.required:
+            paths = self.matrix(); path = self.selected(paths, name); tree = ET.parse(path)
+            tree.getroot().find('testcase').set('classname', 'Other'); tree.write(path)
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check(paths)
+
+    def test_missing_native_method_with_honest_header_is_refused(self):
+        for name in self.required:
+            paths = self.matrix(); path = self.selected(paths, name); tree = ET.parse(path); suite = tree.getroot()
+            suite.remove(suite.findall('testcase')[-1]); suite.set('tests', str(len(suite.findall('testcase')))); tree.write(path)
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check(paths)
+
+    def test_duplicate_native_method_with_unchanged_total_is_refused(self):
+        for name in self.required:
+            paths = self.matrix(); path = self.selected(paths, name); tree = ET.parse(path); cases = tree.getroot().findall('testcase')
+            cases[-1].set('name', cases[0].get('name')); tree.write(path)
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check(paths)
+
+    def test_foreign_method_replayed_under_required_class_is_refused(self):
+        for name in self.required:
+            foreign = next(methods[0] for other, methods in self.required.items() if other != name)
+            paths = self.matrix(); path = self.selected(paths, name); tree = ET.parse(path)
+            tree.getroot().find('testcase').set('name', foreign); tree.write(path)
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check(paths)
+
+    def test_required_case_replayed_inside_foreign_suite_is_refused(self):
+        for name, methods in self.required.items():
+            paths = self.matrix(); path = self.root / 'replay.xml'
+            suite = ET.Element('testsuite', name='Other', tests='1', errors='0', failures='0', skipped='0')
+            ET.SubElement(suite, 'testcase', classname=name, name=methods[0]); ET.ElementTree(suite).write(path)
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check([path, *paths])
+
+    def test_hidden_native_failure_error_or_skip_is_refused(self):
+        for name in self.required:
+            for child in ('failure', 'error', 'skipped'):
+                paths = self.matrix(); path = self.selected(paths, name); tree = ET.parse(path)
+                ET.SubElement(tree.getroot().find('testcase'), child); tree.write(path)
+                with self.subTest(suite=name, child=child), self.assertRaises(RuntimeError): self.check(paths)
+
+    def test_duplicate_native_suite_is_refused(self):
+        for name in self.required:
+            paths = self.matrix(); duplicate = self.root / 'duplicate.xml'
+            duplicate.write_bytes(self.selected(paths, name).read_bytes())
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check([*paths, duplicate])
+
+    def test_native_matrix_does_not_weaken_whole_suite_floor(self):
+        with self.assertRaises(RuntimeError): self.check(self.matrix(), minimum_tests=85)
+
+    def test_missing_native_standard_header_is_refused(self):
+        for name in self.required:
+            paths = self.matrix(); path = self.selected(paths, name); tree = ET.parse(path)
+            del tree.getroot().attrib['skipped']; tree.write(path)
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check(paths)
+
+    def test_empty_or_duplicate_required_method_map_is_refused(self):
+        with self.assertRaises(RuntimeError): self.check(self.matrix(), required={})
+        for name in self.required:
+            required = {key: list(methods) for key, methods in self.required.items()}; required[name][-1] = required[name][0]
+            with self.subTest(suite=name), self.assertRaises(RuntimeError): self.check(self.matrix(), required=required)
+
+
 if __name__ == '__main__': unittest.main()

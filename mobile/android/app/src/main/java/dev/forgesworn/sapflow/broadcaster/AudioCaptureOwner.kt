@@ -40,11 +40,12 @@ internal class AudioCaptureOwner(
     private val onFormat: (RustCodec) -> Unit,
     private val onSample: (MediaSample, Long, Long, Boolean) -> Unit,
     private val sampleMode: AudioSampleMode,
-    private val onTimingViews: (NativeAacTimingViews, Long, Long, Boolean) -> Unit,
+    private val onTimingViews: (NativeAacTimingViews, Long, Long, Boolean, Any) -> Unit,
     private val onValidated: () -> Unit,
     private val onPriming: () -> Unit,
     private val onFailure: (String) -> Unit,
     private val onRoute: (String) -> Unit,
+    private val nativeRun: AudioNativeAacRun? = null,
 ) {
     private enum class Mode { RAW, ZERO, ALIGNED_RAW, RETIRING }
     private val lifecycle = AudioGenerationLifecycle(serials.get())
@@ -95,7 +96,10 @@ internal class AudioCaptureOwner(
         val workers = AudioWorkerCompletion()
         var codec: PlatformCodec? = null
         var encoded: EncodedAudioEpoch? = null
+        var nativeAac: AudioNativeAacGeneration? = null
         var microphone: AudioRecord? = null
+        var codecReleaseReturned = false
+        var microphoneReleaseReturned = false
         @Volatile var route: AudioInputRouting? = null
         var reader: Thread? = null
         var pump: Thread? = null
@@ -133,6 +137,10 @@ internal class AudioCaptureOwner(
                 error("Native AAC generation refused after source closure")
             }
             val codec = PlatformCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC); g.codec = codec; encoderName = codec.name
+            val collector = if (nativeRun != null && sampleMode == AudioSampleMode.PRESERVE_SOURCE_UNATTESTED)
+                AudioNativeAacGeneration(g, codec, ticket.serial, true) else null
+            g.nativeAac = collector
+            if (collector != null) nativeRun?.started(runAdmission, g, ticket.serial, collector)
             val encoded = EncodedAudioEpoch(audioCallbacks,owner,descriptor,timeline,clock,ticket.serial,g.observation,
                 onInput = { index ->
                     if (active === g && lifecycle.owns(ticket)) {
@@ -157,11 +165,15 @@ internal class AudioCaptureOwner(
                     act(g,lifecycle.handoffIdle(ticket))
                 } }, sampleMode = sampleMode, sourceCursor = sourceCursor,
                 onTimingViews = { views, tick, generation ->
-                    if (active === g && !lifecycle.actualClosed(ticket)) onTimingViews(views, tick, generation, g.beganZero && !g.everRaw.get())
-                })
+                    if (active === g && !lifecycle.actualClosed(ticket)) onTimingViews(views, tick, generation, g.beganZero && !g.everRaw.get(), g)
+                }, nativeAac = collector, nativeRun = nativeRun, generationOwner = g,
+                nativeRunOwner = runAdmission, actualCodec = codec)
             g.encoded = encoded
+            collector?.bindCallback(g, codec, encoded)
             codec.setCallback(encoded,audioCallbacks)
-            g.observation.profileConfigured(ticket.serial, AudioAacEncoderConfiguration.configure(codec,bitrate))
+            val facts = AudioAacEncoderConfiguration.configure(codec,bitrate)
+            g.observation.profileConfigured(ticket.serial, facts)
+            collector?.configured(g, codec, facts)
             codec.start()
             if (!zero) prepareMicrophone(g)
             if (started) beginGeneration(g)
@@ -368,6 +380,7 @@ internal class AudioCaptureOwner(
                 nativeQueueUnconfirmed=false;borrowedInput=-1
                 g.acceptedFrames.addAndGet(bytes/2L)
                 g.observation.inputQueued(g.ticket.serial,submittedRawFrames,submittedZeroFrames)
+                g.nativeAac?.inputQueued(g, codec, submittedRawFrames, submittedZeroFrames)
                 g.inputTick=Math.addExact(g.inputTick,bytes/2L)
                 g.lastInputUs.set(ptsUs+bytes/2L*1_000_000/48_000)
                 held?.let { if(heldOffset==it.bytes){g.pool.release(it);held=null} }
@@ -406,7 +419,9 @@ internal class AudioCaptureOwner(
     internal fun recordingTerminal(): RecordingSourceGate.Terminal? {
         val g = active ?: return null
         if (!stopped || failed || !lifecycle.actualClosed(g.ticket)) return null
-        return recordingSource.terminal(sourceKey, this, preparation, epoch)
+        val terminal = recordingSource.terminal(sourceKey, this, preparation, epoch)
+        if (terminal != null) nativeRun?.seal(runAdmission)
+        return terminal
     }
     private fun retire(g:Generation,graceful:Boolean,deadlineNs:Long){
         if(active!==g || lifecycle.currentStage()!=AudioGenerationLifecycle.Stage.ACTIVE)return
@@ -438,6 +453,7 @@ internal class AudioCaptureOwner(
                 if(encoded==null){act(g,lifecycle.callbacksClosed(g.ticket));act(g,lifecycle.handoffIdle(g.ticket))}
                 else encoded.quiesce({g.codec?.stop()}){ stopped ->
                     if(active===g){if(!stopped && g.acceptedFrames.get()>0)report(g,"AAC native stop was not confirmed")
+                        g.codec?.let { codec -> g.nativeAac?.callbacksStopped(g, codec, encoded, stopped) }
                         g.observation.callbackBarrier(g.ticket.serial,stopped)
                         act(g,lifecycle.callbacksClosed(g.ticket));g.handoffSealed=true;encoded.finishHandoff(true)
                         if(encoded.outstanding==0){g.observation.handoffIdle(g.ticket.serial);act(g,lifecycle.handoffIdle(g.ticket))}}
@@ -447,16 +463,21 @@ internal class AudioCaptureOwner(
                 // RELEASE already requires actual producer/callback/handoff receipts.
                 // Publish diagnostics before native release, never as its success.
                 g.observation.freeze(g.ticket.serial)?.let { lastGenerationObservation=it }
-                var ok=true
-                runCatching{g.codec?.release()}.onFailure{ok=false}
-                runCatching{g.microphone?.release()}.onFailure{ok=false}
-                owner.post{if(active===g)act(g,lifecycle.released(g.ticket,ok,System.nanoTime()))}
+                var codecReleased=true
+                runCatching{g.codec?.release()}.onFailure{codecReleased=false}
+                var microphoneReleased=true
+                runCatching{g.microphone?.release()}.onFailure{microphoneReleased=false}
+                g.codecReleaseReturned=codecReleased;g.microphoneReleaseReturned=microphoneReleased
+                owner.post{if(active===g)act(g,lifecycle.released(g.ticket,codecReleased && microphoneReleased,System.nanoTime()))}
             }
             AudioGenerationLifecycle.Action.CLOSED->{
-                // This action follows the actual native/microphone release
-                // result. The diagnostic snapshot was frozen earlier and is
-                // never used as a completion capability.
+                // Native issuance and accepted-recording delivery are separate.
+                // The frozen diagnostic snapshot is never a completion input.
                 val joined = g.joinedInputFrames
+                val codec = g.codec
+                val receipt = if (g.nativeAac != null && codec != null)
+                    g.nativeAac?.closed(g, codec, g.codecReleaseReturned, g.microphoneReleaseReturned) else null
+                nativeRun?.nativeClosed(runAdmission, g, joined ?: -1, receipt)
                 if (failed || joined == null) recordingSource.fail()
                 else recordingSource.generationClosed(sourceKey, g, joined, g.eosSent, g.outputEosObserved)
                 timeline.closed(g.clock)
@@ -483,6 +504,7 @@ internal class AudioCaptureOwner(
             owner.post{if(active===g){if(joinedInputFrames==null){report(g,"Audio producer threads/input disposition remain unconfirmed");closeReply?.invoke(false)}else {
                 g.joinedInputFrames = joinedInputFrames
                 g.observation.producersJoined(g.ticket.serial)
+                g.codec?.let { codec -> g.nativeAac?.producersJoined(g, codec, joinedInputFrames) }
                 act(g,lifecycle.producersClosed(g.ticket,joinedInputFrames>0))}}}
         }
     }
@@ -491,11 +513,15 @@ internal class AudioCaptureOwner(
         val index=g.inputs.poll() ?:return
         try{g.codec!!.queueInputBuffer(index,0,0,g.lastInputUs.get(),PlatformCodec.BUFFER_FLAG_END_OF_STREAM);g.eosSent=true
             g.observation.inputEosQueued(g.ticket.serial)
+            g.nativeAac?.inputEosReturned(g, g.codec!!)
             owner.postDelayed({if(active===g)act(g,lifecycle.abortEos(g.ticket))},500)
         }catch(error:Exception){report(g,"AAC EOS failed");act(g,lifecycle.abortEos(g.ticket))}
     }
     private fun report(g:Generation,reason:String){
-        if(active!==g || !nativeFailure.fail(g,reason))return
+        if(active!==g)return
+        g.codec?.let { codec -> g.nativeAac?.fault(g, codec) }
+        nativeRun?.fail()
+        if(!nativeFailure.fail(g,reason))return
         lifecycle.fail(g.ticket);g.reading.set(false)
         owner.post{if(active===g)onFailure(reason)}
     }

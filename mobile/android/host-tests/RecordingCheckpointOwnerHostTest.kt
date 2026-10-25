@@ -60,6 +60,65 @@ private fun suppliedComplete(f: Fixture) {
         48_000u, 9216uL, 2112u, 704u, NativeRecordingSourceMapping.NEAREST))
     f.owner.completeAudio(NativeAudioFileReceipt(1uL, 6400uL, 0uL, 9216uL, 2112u, 704u))
 }
+
+private fun checkedFormat() = AudioAacProfile.Format(AudioAacProfile.known("audio/mp4a-latm"),
+    AudioAacProfile.known(48000), AudioAacProfile.known(1), AudioAacProfile.known("1188"),
+    AudioAacProfile.missing(AudioAacProfile.State.ABSENT), AudioAacProfile.missing(AudioAacProfile.State.ABSENT))
+private fun checkedSetup() = AudioAacProfile.Setup(AudioAacProfile.Selection(35,
+    AudioAacProfile.known("synthetic.alias"), AudioAacProfile.known("synthetic.canonical"),
+    AudioAacProfile.known(true), AudioAacProfile.known(false), AudioAacProfile.known(false),
+    AudioAacProfile.Request(96000)), checkedFormat(), checkedFormat())
+
+/** Synthetic event authority plus real SDK/filesystem calls, never codec evidence. */
+private class CheckedGeneration(val run: AudioNativeAacRun, val runOwner: Any, val serial: Long) {
+    val owner = Any()
+    private val nativeCodec = Any()
+    private val callback = Any()
+    private val collector = AudioNativeAacGeneration(owner, nativeCodec, serial, true)
+    init {
+        check(collector.bindCallback(owner, nativeCodec, callback))
+        check(collector.configured(owner, nativeCodec, checkedSetup()))
+        check(collector.format(owner, nativeCodec, callback, AudioAacProfile.Phase.OUTPUT_FORMAT,
+            checkedFormat(), AudioAacProfile.known(1024), AudioAacProfile.missing(AudioAacProfile.State.ABSENT)))
+        check(run.started(runOwner, owner, serial, collector))
+        check(run.leading(runOwner, owner, 1024))
+    }
+    fun receipt(): AudioNativeAacGeneration.Receipt {
+        check(collector.inputQueued(owner, nativeCodec, 512, 0))
+        check(collector.producersJoined(owner, nativeCodec, 512))
+        check(collector.inputEosReturned(owner, nativeCodec))
+        repeat(2) { index ->
+            val eos = index == 1
+            val output = collector.output(owner, nativeCodec, callback, 0, 3, if (eos) 4 else 0, true, 3)
+            check(output > 0)
+            if (eos) check(collector.format(owner, nativeCodec, callback, AudioAacProfile.Phase.OUTPUT_EOS,
+                checkedFormat(), AudioAacProfile.known(1024), AudioAacProfile.known(512)))
+            check(collector.acquired(owner, nativeCodec, callback, output, 0))
+            check(collector.outputReleased(owner, nativeCodec, callback, output))
+            check(collector.handoffEntered(owner, nativeCodec, callback, output, 0))
+            check(collector.handoffReturned(owner, nativeCodec, callback, output, 0))
+            check(collector.transferClosed(owner, nativeCodec, callback, output, 0))
+        }
+        check(collector.callbacksStopped(owner, nativeCodec, callback, true))
+        return checkNotNull(collector.closed(owner, nativeCodec, true, true))
+    }
+    fun closeEmpty() {
+        check(collector.producersJoined(owner, nativeCodec, 0))
+        check(collector.callbacksStopped(owner, nativeCodec, callback, true))
+        check(collector.closed(owner, nativeCodec, true, true) == null)
+        check(run.nativeClosed(runOwner, owner, 0, null))
+    }
+}
+private fun pushChecked(f: Fixture, run: AudioNativeAacRun, runOwner: Any,
+    generation: CheckedGeneration, codec: MediaCodec, tick: Long) {
+    check(run.accepted(runOwner, generation.owner))
+    run.beforeSample(f.owner)
+    codec.sample(payload(), tick, tick, 1024u, 48_000u, false).use { sample ->
+        f.owner.push(sample)
+        run.afterSample(f.owner)
+    }
+}
+
 private fun assertIncomplete(f: Fixture) {
     check(f.owner.cleanupComplete && !f.catalogue.cleanupRetained)
     check(f.catalogue.scan().single().state == RecordingCatalogue.State.INCOMPLETE)
@@ -139,6 +198,49 @@ private fun originalTimingViewsUseExistingQueuesAndHandle(base: Path) {
         check(queues.stats().publishingDrops == 0uL && queues.stats().recordingDrops == 0uL)
     } }
     suppliedComplete(f); f.owner.finishStoredInputs(NativeRecordingCompletion.COMPLETE); assertIncomplete(f)
+}
+private fun checkedRunUsesRealSdkAtAcceptedFrontier(base: Path) {
+    val f = fixture(base)
+    val runOwner = Any(); val run = AudioNativeAacRun(runOwner, 0)
+    CheckedGeneration(run, runOwner, 7).closeEmpty()
+    val first = CheckedGeneration(run, runOwner, 9)
+    codec().use { c ->
+        pushChecked(f, run, runOwner, first, c, 0)
+        pushChecked(f, run, runOwner, first, c, 1024)
+        check(run.nativeClosed(runOwner, first.owner, 512, first.receipt()))
+        val second = CheckedGeneration(run, runOwner, 11)
+        pushChecked(f, run, runOwner, second, c, 2048)
+        pushChecked(f, run, runOwner, second, c, 3072)
+        check(run.nativeClosed(runOwner, second.owner, 512, second.receipt()))
+    }
+    check(run.seal(runOwner)); run.finish(f.owner)
+    val result = f.owner.finishStoredInputs(NativeRecordingCompletion.COMPLETE)
+    check(result.sdkOutcome == NativeRecordingCompletion.COMPLETE && result.completeAudioEof)
+    check(result.applicationAdmission == RecordingCheckpointOwner.ApplicationAdmission.UNKNOWN)
+    check(f.owner.frontier!!.audioUnits == 4uL && f.owner.frontier!!.completeAudioEof)
+    assertIncomplete(f)
+}
+private fun allEmptyCheckedRunClosesWithoutNativeReceipt(base: Path) {
+    val f = fixture(base)
+    val runOwner = Any(); val run = AudioNativeAacRun(runOwner, 0)
+    CheckedGeneration(run, runOwner, 7).closeEmpty()
+    check(run.seal(runOwner))
+    check(run.finish(f.owner) == AudioNativeAacFinish.EMPTY)
+    check(run.finish(f.owner) == AudioNativeAacFinish.EMPTY)
+    f.owner.closeIncomplete(); assertEmptyUnverified(f)
+}
+private fun prematureCheckedRunCannotReachRealSdkPush(base: Path) {
+    val f = fixture(base)
+    val runOwner = Any(); val run = AudioNativeAacRun(runOwner, 0)
+    val generation = CheckedGeneration(run, runOwner, 7)
+    check(run.accepted(runOwner, generation.owner))
+    check(!run.nativeClosed(runOwner, generation.owner, 512, generation.receipt()))
+    refused { run.beforeSample(f.owner) }
+    f.owner.closeIncomplete(); assertEmptyUnverified(f)
+    val video = fixture(base, intent = CaptureIntent.AudioVideo())
+    val videoRun = AudioNativeAacRun(runOwner, 0)
+    refused { videoRun.beforeSample(video.owner, true) }
+    video.owner.closeIncomplete(); assertEmptyUnverified(video)
 }
 private fun oldFrontierAndClosedResultRemainImmutable(base: Path) {
     val f = fixture(base); f.owner.beginAudio(2112u); pushNine(f)
@@ -243,7 +345,9 @@ fun main(args: Array<String>) {
     val tests = listOf(::completeSdkInputsRemainUnknownAppAdmission, ::unknownLeadingNeverAdmitsMedia,
         ::unknownFileReceiptCannotRequestComplete, ::missingGenerationCannotGrantFileReceipt,
         ::contradictoryGenerationIsSticky, ::unknownEofProducesExplicitUntrimmedPrefix,
-        ::originalTimingViewsUseExistingQueuesAndHandle, ::oldFrontierAndClosedResultRemainImmutable,
+        ::originalTimingViewsUseExistingQueuesAndHandle, ::checkedRunUsesRealSdkAtAcceptedFrontier,
+        ::allEmptyCheckedRunClosesWithoutNativeReceipt, ::prematureCheckedRunCannotReachRealSdkPush,
+        ::oldFrontierAndClosedResultRemainImmutable,
         ::corruptSidecarReadbackNeverPublishes, ::cancellationDuringReadbackNeverPublishes,
         ::wrongWorkerAndReentryAreRejectedWithoutPoisoning, ::realSdkConstructorFailureClosesExactStorageLease,
         ::unknownMediaCloseRetainsLeaseWithoutRetry, ::unknownRootCloseRetainsLeaseWithoutRetry,
