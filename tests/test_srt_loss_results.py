@@ -31,20 +31,25 @@ GOOD = {"metrics": dict(video=100, audio=200, decode_msgs=0, data_orig=80,
 # These executable fixtures only write text and wait for owned signals. They
 # exercise the real shell orchestration without a codec or network process.
 FAKE_TOOL = r'''#!PYTHON
+import sys
+import time
+
+args = sys.argv[1:]
+# POSIX executable fixture names are generated as commands/<role>.
+# Keep the exact sleep payload without importing unrelated fake-tool support.
+if sys.argv[0].rsplit("/", 1)[-1] == "sleep":
+    time.sleep(min(float(args[0]), 0.08))
+    sys.exit(0)
+
 import os
 from pathlib import Path
 import signal
 import socket
-import sys
-import time
 from urllib.parse import urlsplit
 
 role = Path(sys.argv[0]).name
-args = sys.argv[1:]
 case = os.environ.get("FIXTURE_CASE", "pass")
-if role == "sleep":
-    time.sleep(min(float(args[0]), 0.08))
-elif role == "pkill":
+if role == "pkill":
     with open(os.environ["FIXTURE_SIGNAL_TRACE"], "a") as trace:
         trace.write("pkill\t" + " ".join(args) + "\n")
     os.execv(os.environ["FIXTURE_REAL_PKILL"], [os.environ["FIXTURE_REAL_PKILL"], *args])
