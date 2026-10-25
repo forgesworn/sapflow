@@ -182,9 +182,17 @@ The same command runs on standard Ubuntu 24.04 in CI. It builds a fresh ARM64
 AAR from current Rust sources in the checkout's existing `target/`, runs its
 installed Kotlin host consumer and supplies that exact package to both JVM
 variants and all three app builds. The gate requires the full JVM suites, all
-seventeen selected AAC profile controls in each variant, clean lint, qualification
+84 named AAC profile/generation/run/transfer controls in each variant, clean lint, qualification
 and release isolation, exact packaged JNI identity and 16 KiB ELF/ZIP alignment.
 First-run Gradle dependency acquisition is online; all tests execute freshly.
+
+The same command also compiles the 13 recording-owner host sources and executes
+all 20 controls against that fresh host SDK library, the exact AAR classes and
+the already resolved JVM dependencies. These use synthetic compressed bytes and
+supplied native-event facts with real host filesystem operations. No private
+witness, additional SDK build or camera input is required. Eleven owned command
+stages must close; generated control binaries and synthetic data are removed
+with the existing scratch after process closure is known.
 
 Only redacted scalar receipts, command/group observations, JUnit XML and lint XML
 are retained under `target/android-sdk-app/` and uploaded by CI. Generated SDKs
