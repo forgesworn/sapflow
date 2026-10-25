@@ -1032,6 +1032,9 @@ fn fresh_media_app(
         crate::callback::test_queue(crate::publish_observer::fixture_scope("fresh", 1, 1, 1), 32);
     (
         Arc::new(crate::App {
+            recording_limits: Arc::new(crate::recorder::RecordingLimits::new(
+                config.max_publishers,
+            )),
             config,
             publish_sessions: Some(manager.clone()),
             streams: Arc::new(Registry::default()),

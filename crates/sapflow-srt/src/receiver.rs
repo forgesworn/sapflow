@@ -31,6 +31,8 @@ const DRIFT_MAX: i64 = 500_000;
 const MAX_HOLD_BEYOND_LATENCY: i64 = 1_000_000;
 /// Unanswered full ACKs remembered for RTT measurement.
 const ACKS_REMEMBERED: usize = 64;
+/// Consecutive-original arrival gaps used for the link-capacity median.
+const PACKET_PAIR_GAPS: usize = 16;
 
 /// Per-connection receiver settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +123,9 @@ impl RateMeter {
 #[derive(Debug, Default)]
 struct PacketPairs {
     last: Option<(Seq, i64)>,
-    gaps: VecDeque<i64>,
+    gaps: [i64; PACKET_PAIR_GAPS],
+    len: usize,
+    next: usize,
 }
 
 impl PacketPairs {
@@ -129,10 +133,11 @@ impl PacketPairs {
         if let Some((s, t)) = self.last
             && s.next() == seq
         {
-            if self.gaps.len() >= 16 {
-                self.gaps.pop_front();
+            if let Some(gap) = self.gaps.get_mut(self.next) {
+                *gap = (now - t).max(1);
             }
-            self.gaps.push_back((now - t).max(1));
+            self.next = (self.next + 1) % PACKET_PAIR_GAPS;
+            self.len = (self.len + 1).min(PACKET_PAIR_GAPS);
         }
         self.last = Some((seq, now));
     }
@@ -140,10 +145,16 @@ impl PacketPairs {
     /// Packets per second; 1000 before there is anything to go on (as
     /// libsrt reports at first, observed).
     fn capacity(&self) -> u32 {
-        if self.gaps.is_empty() {
+        if self.len == 0 {
             return 1000;
         }
-        let mut g: Vec<i64> = self.gaps.iter().copied().collect();
+        // Full ACKs can run every 10 ms per receiver. Keep the rolling history
+        // inline and median scratch on the stack, without a heap allocation
+        // for every estimate. Ring order does not affect the median.
+        let mut g = self.gaps;
+        let Some(g) = g.get_mut(..self.len) else {
+            return 1000;
+        };
         g.sort_unstable();
         let median = g.get(g.len() / 2).copied().unwrap_or(1).max(1);
         u32::try_from(1_000_000 / median).unwrap_or(u32::MAX)
@@ -882,6 +893,108 @@ mod tests {
             assert_eq!(r.stats().km_rejected, 2, "ordinary 100ms limit remains");
             assert_eq!(r.next_km, 233 * MS);
         }
+    }
+
+    #[test]
+    fn packet_pair_capacity_uses_the_upper_median_and_expires_old_gaps() {
+        let mut pairs = PacketPairs::default();
+        assert_eq!(pairs.capacity(), 1000, "no arrivals yet");
+        let mut seq = Seq::new(Seq::MAX - 4);
+        let mut now = 0;
+        pairs.add(seq, now);
+        assert_eq!(pairs.capacity(), 1000, "one arrival has no gap");
+        for gap in [100, 400] {
+            seq = seq.next();
+            now += gap;
+            pairs.add(seq, now);
+        }
+        assert_eq!(pairs.capacity(), 2500, "upper median of two gaps");
+        for _ in 0..PACKET_PAIR_GAPS {
+            seq = seq.next();
+            now += 100;
+            pairs.add(seq, now);
+        }
+        assert_eq!(pairs.capacity(), 10_000, "old 400 us gap has expired");
+        for _ in 0..PACKET_PAIR_GAPS {
+            seq = seq.next();
+            now += 400;
+            pairs.add(seq, now);
+        }
+        assert_eq!(pairs.capacity(), 2500, "all earlier gaps have expired");
+        assert_eq!(pairs.len, PACKET_PAIR_GAPS);
+    }
+
+    #[test]
+    fn packet_pair_capacity_matches_arrival_history_through_wrap_and_reordering() {
+        let mut pairs = PacketPairs::default();
+        let mut history = VecDeque::new();
+        let mut previous: Option<(Seq, i64)> = None;
+        let mut seq = Seq::new(Seq::MAX - 7);
+        let mut now = 0;
+        let mut random = 7u64;
+        for i in 0..2048 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // Consecutive originals, holes, duplicates and out-of-order
+            // arrivals all occur across both sequence and history wraps.
+            seq = match random >> 60 {
+                0 => seq,
+                1 => seq.prev(),
+                2 => seq.add(3),
+                _ => seq.next(),
+            };
+            // Include same-time and backward-clock spacing, which the
+            // estimator historically clamps to one microsecond.
+            now += match random >> 56 & 7 {
+                0 => 0,
+                1 => -1,
+                _ => ((random >> 32) % 10_000) as i64 + 1,
+            };
+            if let Some((last_seq, last_time)) = previous
+                && last_seq.next() == seq
+            {
+                history.push_back((now - last_time).max(1));
+                while history.len() > 16 {
+                    history.pop_front();
+                }
+            }
+            previous = Some((seq, now));
+            pairs.add(seq, now);
+            let mut sorted: Vec<_> = history.iter().copied().collect();
+            sorted.sort_unstable();
+            let expected = if sorted.is_empty() {
+                1000
+            } else {
+                (1_000_000 / sorted[sorted.len() / 2]) as u32
+            };
+            assert_eq!(pairs.capacity(), expected, "arrival {i}");
+        }
+    }
+
+    #[test]
+    fn full_ack_advertises_packet_pair_capacity_after_history_wrap() {
+        let mut r = rx();
+        let mut now = 0;
+        for i in 0..40 {
+            now += if i < 20 { 100 } else { 400 };
+            r.on_data(now, &data(ISN + i, now as u32, b"x"));
+        }
+        r.on_timer(ACK_INTERVAL);
+        let controls = sent(&mut r);
+        let ack = controls
+            .into_iter()
+            .find_map(|c| match c {
+                Control::Ack(a) => Some(a),
+                _ => None,
+            })
+            .expect("full ACK");
+        assert_eq!(
+            ack.stats
+                .expect("full ACK stats")
+                .rates
+                .expect("full ACK rates")
+                .1,
+            2500
+        );
     }
 
     #[test]

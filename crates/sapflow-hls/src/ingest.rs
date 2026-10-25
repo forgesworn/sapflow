@@ -6,7 +6,7 @@
 //! and the next one parsed, and running out of input is reported as an error
 //! that leaves the reader's state intact for the next push.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -30,10 +30,40 @@ const MAX_BUFFER: usize = 8 * 1024 * 1024;
 // not Vec capacity, allocator overhead, retained HLS data or whole-process RSS.
 const MAX_PES_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PENDING_PES_BYTES: usize = 16 * 1024 * 1024;
+// Separate from the optional video/parameter queue and TS/PES allocations.
+const STARTUP_AUDIO_BYTES: usize = 64 * 1024;
+const STARTUP_AUDIO_FRAMES: usize = 64;
+const STARTUP_AUDIO_TICKS: i64 = 90_000;
 
 #[cfg(test)]
 #[path = "pes_limits_tests.rs"]
 mod pes_limits_tests;
+
+#[cfg(test)]
+#[path = "startup_ts_tests.rs"]
+mod startup_ts_tests;
+
+#[derive(Clone, Copy)]
+struct StartupLimits {
+    aus: usize,
+    bytes: usize,
+    ticks: i64,
+}
+impl Default for StartupLimits {
+    fn default() -> Self {
+        Self {
+            aus: 64,
+            bytes: 1024 * 1024,
+            ticks: 90_000,
+        }
+    }
+}
+struct StartupVideo {
+    dts: i64,
+    pts: i64,
+    au: codec::AccessUnit,
+    now: SystemTime,
+}
 
 /// Why an ingest cannot carry on with the publisher's media.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +72,7 @@ pub enum IngestError {
     UnsupportedVideo,
     /// The held presentation expired before new media recovered it.
     PresentationExpired,
-    /// No keyframe for too long, or a segment beyond the size limit.
+    /// A segment or unsealed media retention exceeded a resource limit.
     SegmentTooLarge,
     /// No supported non-empty track topology can be initialized.
     InvalidTracks,
@@ -54,7 +84,7 @@ pub enum IngestError {
     InvalidTimestamp,
     /// This connection has explicitly finished; resume with a new ingest.
     InputFinished,
-    /// Unread input or pending PES exceeds this parser's resource policy.
+    /// Unread transport input or pending PES exceeds policy.
     /// No more input is accepted; `finish` still seals the accepted prefix.
     InputLimitExceeded,
 }
@@ -64,7 +94,7 @@ impl std::fmt::Display for IngestError {
         match self {
             Self::PresentationExpired => f.write_str("presentation reconnect deadline expired"),
             Self::UnsupportedVideo => f.write_str("video is not H.264"),
-            Self::SegmentTooLarge => f.write_str("segment too large (keyframe interval?)"),
+            Self::SegmentTooLarge => f.write_str("segment or unsealed media exceeds media limit"),
             Self::InvalidTracks => f.write_str("invalid track set"),
             Self::TrackConflict => f.write_str("track set changed within a connection"),
             Self::InvalidAudio => f.write_str("unsupported or changed AAC configuration"),
@@ -672,7 +702,7 @@ impl EsIngest {
             return Ok(Update::default());
         }
         if self.declared != Some(TrackSet::AudioOnly) {
-            self.audio(pts, config, payload);
+            self.audio(pts, config, payload)?;
             return Ok(Update::default());
         }
         let mut update = Update::default();
@@ -700,20 +730,30 @@ impl EsIngest {
         Ok(update)
     }
 
-    /// Legacy video-led AAC path. Audio-only consumers need `audio_at` and
-    /// must forward its updates to waiters/recorders.
-    pub fn audio(&mut self, pts: i64, config: AacConfig, payload: &[u8]) {
+    /// Checked video-led AAC path. This pre-release entry point now returns
+    /// resource refusal; consumers must propagate it and preserve incomplete
+    /// recording status. Audio-only consumers need the updating `audio_at`.
+    pub fn audio(
+        &mut self,
+        pts: i64,
+        config: AacConfig,
+        payload: &[u8],
+    ) -> Result<(), IngestError> {
         if self.declared == Some(TrackSet::AudioOnly) {
-            return;
+            return Ok(());
         }
         self.audio_config(config);
         let (Some(muxer), Some(origin)) = (self.muxer.as_mut(), self.origin) else {
-            return;
+            return Ok(());
         };
-        let t = pts - origin;
+        let t = pts
+            .checked_sub(origin)
+            .ok_or(IngestError::InvalidTimestamp)?;
         if t >= 0 {
-            muxer.push_audio(t, Bytes::copy_from_slice(payload));
+            muxer.check_audio_admission(t, payload.len())?;
+            muxer.push_audio(t, Bytes::copy_from_slice(payload))?;
         }
+        Ok(())
     }
 }
 
@@ -724,6 +764,13 @@ impl EsIngest {
 /// old/new packets on one PID. These are not limits on Vec capacity or RSS.
 /// A limit failure releases pending assemblies and permanently refuses input;
 /// `finish` still seals accepted media with `media_loss` set.
+/// A startup-prefix budget overflow discards that optional GOP with media
+/// loss and waits for a fresh IDR; it does not fail the transport/PES input.
+/// Before an authoritative A/V startup knows AAC, complete video AUs from its
+/// first valid IDR wait in a separate queue: at most 64 AUs, 1 MiB summed AU
+/// and parameter-set capacities, and one second of DTS span. Supplied wall
+/// timestamps affect wall association only, never startup admission. There is
+/// no wall-time/idle expiry. Refusal/drop releases held payloads.
 pub struct TsIngest {
     input: Arc<Mutex<Input>>,
     pes: Option<PesPacketReader<Feed>>,
@@ -731,6 +778,13 @@ pub struct TsIngest {
     es: EsIngest,
     pending: Update,
     waiting_keyframe: bool,
+    startup: VecDeque<StartupVideo>,
+    startup_bytes: usize,
+    startup_limits: StartupLimits,
+    startup_error: Option<IngestError>,
+    startup_replaying: bool,
+    startup_has_successor: bool,
+    startup_now: Option<SystemTime>,
 }
 
 impl TsIngest {
@@ -774,6 +828,13 @@ impl TsIngest {
             es: EsIngest::new(cfg),
             pending: Update::default(),
             waiting_keyframe: false,
+            startup: VecDeque::new(),
+            startup_bytes: 0,
+            startup_limits: StartupLimits::default(),
+            startup_error: None,
+            startup_replaying: false,
+            startup_has_successor: false,
+            startup_now: None,
         }
     }
 
@@ -804,6 +865,9 @@ impl TsIngest {
             if input.terminal {
                 return Err(IngestError::InputFinished);
             }
+            if let Some(error) = &self.startup_error {
+                return Err(error.clone());
+            }
             if input.limit_exceeded {
                 return Err(IngestError::InputLimitExceeded);
             }
@@ -828,11 +892,25 @@ impl TsIngest {
             }
         };
         if exceeded {
+            if self.waiting_for_startup_audio() {
+                return Err(self.refuse_startup(IngestError::InputLimitExceeded));
+            }
+            if self.startup_replaying {
+                self.discard_startup_catchup(now);
+            }
             self.release_failed_input();
             return Err(IngestError::InputLimitExceeded);
         }
         self.pending = Update::default();
-        self.drain(now, false)?;
+        if let Err(error) = self.drain(now, false) {
+            return Err(
+                if self.waiting_for_startup_audio() || self.startup_replaying {
+                    self.refuse_startup(error)
+                } else {
+                    error
+                },
+            );
+        }
         Ok(self.pending)
     }
 
@@ -854,16 +932,260 @@ impl TsIngest {
             input.limit_exceeded
         };
         self.pending = Update::default();
-        let result = if failed {
+        let result = if let Some(error) = &self.startup_error {
+            Err(error.clone())
+        } else if failed {
             Ok(())
         } else {
             self.drain(now, true)
         };
+        let program = self.program();
+        let missing_declared_audio = self.es.origin.is_none()
+            && self.es.known_audio().is_none()
+            && program.seen
+            && program.h264
+            && program.aac;
+        let result = match result {
+            Ok(()) if !failed && (self.waiting_for_startup_audio() || missing_declared_audio) => {
+                Err(self.refuse_startup(IngestError::InvalidTracks))
+            }
+            Err(error) if self.waiting_for_startup_audio() || self.startup_replaying => {
+                Err(self.refuse_startup(error))
+            }
+            other => other,
+        };
         self.pending.media_loss |= self.dropped_packets() != 0;
+        self.pending.media_loss |= self.startup_error.is_some();
+        self.pending.media_loss |= !self.startup.is_empty();
+        self.startup = VecDeque::new();
+        self.startup_bytes = 0;
+        self.startup_replaying = false;
+        self.startup_has_successor = false;
+        self.startup_now = None;
         if let Some(muxer) = self.es.muxer_mut() {
             self.pending.merge(muxer.interrupt(now));
         }
         result.map(|()| self.pending)
+    }
+
+    fn waiting_for_startup_audio(&self) -> bool {
+        self.es.origin.is_none()
+            && self.es.declared == Some(TrackSet::AudioVideo)
+            && self.es.known_audio().is_none()
+    }
+
+    fn refuse_startup(&mut self, error: IngestError) -> IngestError {
+        if let Some(now) = self.startup_now {
+            self.discard_startup_catchup(now);
+        }
+        self.startup = VecDeque::new();
+        self.startup_bytes = 0;
+        self.es.sps = None;
+        self.es.pps = None;
+        self.startup_error = Some(error.clone());
+        self.release_failed_input();
+        error
+    }
+
+    fn restart_startup(&mut self) {
+        // The held GOP cannot be published after loss or a configuration
+        // change. Keep the bounded known parameter sets, as the original
+        // resynchronisation path did, and require a fresh complete IDR.
+        // Parameter replacement and its capacity bound are checked below.
+        self.startup = VecDeque::new();
+        self.startup_bytes = 0;
+        self.waiting_keyframe = true;
+        self.pending.media_loss = true;
+    }
+
+    fn discard_startup_catchup(&mut self, now: SystemTime) {
+        self.restart_startup();
+        if self.startup_replaying {
+            if let Some(muxer) = self.es.muxer_mut() {
+                self.pending.merge(muxer.interrupt(now));
+            }
+            if self.es.muxer().is_some_and(|m| !m.has_content()) {
+                self.es.muxer = None;
+            }
+            self.es.origin = None;
+        }
+        self.startup_replaying = false;
+        self.startup_has_successor = false;
+        self.startup_now = None;
+    }
+
+    fn replay_startup_video(&mut self) -> Result<(), IngestError> {
+        while let Some(frame) = self.startup.front() {
+            let ready = self
+                .es
+                .origin
+                .zip(self.es.muxer())
+                .is_some_and(|(origin, muxer)| {
+                    frame
+                        .dts
+                        .checked_sub(origin)
+                        .is_some_and(|at| muxer.startup_video_replayable(at))
+                });
+            if !ready {
+                break;
+            }
+            let frame = self.startup.pop_front().expect("checked replay head");
+            self.startup_bytes -= frame.au.data.capacity();
+            match self.es.video(frame.dts, frame.pts, frame.au, frame.now) {
+                Ok(update) => self.pending.merge(update),
+                Err(error) => return Err(self.refuse_startup(error)),
+            }
+            self.startup_has_successor = true;
+        }
+        if self.startup.is_empty() && self.startup_has_successor {
+            self.startup_replaying = false;
+            self.startup_now = None;
+        }
+        Ok(())
+    }
+
+    fn startup_video(
+        &mut self,
+        dts: i64,
+        pts: i64,
+        mut au: codec::AccessUnit,
+        now: SystemTime,
+    ) -> Result<Update, IngestError> {
+        if !self.waiting_for_startup_audio() && !self.startup_replaying {
+            return self.es.video(dts, pts, au, now);
+        }
+        if self.es.origin.is_none()
+            && !self.startup.is_empty()
+            && (au
+                .sps
+                .as_ref()
+                .is_some_and(|sps| Some(sps) != self.es.sps.as_ref())
+                || au
+                    .pps
+                    .as_ref()
+                    .is_some_and(|pps| Some(pps) != self.es.pps.as_ref()))
+        {
+            // Nothing has been initialised yet. Discard the old GOP rather
+            // than disconnecting an encoder that supplies new parameters.
+            // A complete IDR with supported parameters can start over now;
+            // other AUs only update bounded parameters and await that IDR.
+            self.restart_startup();
+        }
+        let (sps, pps) = (
+            au.sps.as_ref().or(self.es.sps.as_ref()),
+            au.pps.as_ref().or(self.es.pps.as_ref()),
+        );
+        let parameter_bytes = sps
+            .map_or(0, Vec::capacity)
+            .checked_add(pps.map_or(0, Vec::capacity));
+        let Some(parameter_bytes) = parameter_bytes.filter(|n| *n <= self.startup_limits.bytes)
+        else {
+            self.discard_startup_catchup(now);
+            self.es.sps = None;
+            self.es.pps = None;
+            return Ok(Update::default());
+        };
+        self.es.parameter_sets(au.sps.take(), au.pps.take());
+        if au.data.is_empty() {
+            return Ok(Update::default());
+        }
+        if self.startup.is_empty() && self.es.origin.is_none() {
+            if !au.idr {
+                return Ok(Update::default());
+            }
+            let (Some(sps), Some(pps)) = (&self.es.sps, &self.es.pps) else {
+                return Ok(Update::default());
+            };
+            if H264Config::new(sps, pps).is_none() {
+                return Ok(Update::default());
+            }
+            self.waiting_keyframe = false;
+        }
+        let span_exceeded =
+            if let (Some(first), Some(last)) = (self.startup.front(), self.startup.back()) {
+                if dts < last.dts {
+                    return Err(self.refuse_startup(IngestError::InvalidTimestamp));
+                }
+                dts.checked_sub(first.dts)
+                    .is_none_or(|span| span > self.startup_limits.ticks)
+            } else {
+                false
+            };
+        let bytes = self.startup_bytes.checked_add(au.data.capacity());
+        if span_exceeded
+            || self.startup.len() >= self.startup_limits.aus
+            || bytes
+                .and_then(|n| n.checked_add(parameter_bytes))
+                .is_none_or(|n| n > self.startup_limits.bytes)
+        {
+            // This optional prefix queue is not the transport/PES budget.
+            // Late AAC can still recover at a valid IDR without disconnecting.
+            self.discard_startup_catchup(now);
+            if au.idr
+                && self.startup_limits.aus != 0
+                && au
+                    .data
+                    .capacity()
+                    .checked_add(parameter_bytes)
+                    .is_some_and(|n| n <= self.startup_limits.bytes)
+            {
+                // One bounded retry: an empty queue and a fitting single IDR
+                // cannot hit the count, span or byte condition again.
+                return self.startup_video(dts, pts, au, now);
+            }
+            return Ok(Update::default());
+        }
+        self.startup_bytes = bytes.expect("checked startup byte sum");
+        self.startup.push_back(StartupVideo { dts, pts, au, now });
+        if self.startup_replaying {
+            self.replay_startup_video()?;
+        }
+        Ok(Update::default())
+    }
+
+    #[cfg(test)]
+    fn release_startup_video(&mut self) -> Result<(), IngestError> {
+        while let Some(frame) = self.startup.pop_front() {
+            self.startup_bytes -= frame.au.data.capacity();
+            match self.es.video(frame.dts, frame.pts, frame.au, frame.now) {
+                Ok(update) => self.pending.merge(update),
+                Err(error) => return Err(self.refuse_startup(error)),
+            }
+        }
+        self.startup = VecDeque::new();
+        Ok(())
+    }
+
+    fn startup_audio(&mut self, config: AacConfig) -> Result<(), IngestError> {
+        // Match the muxer's supported AAC-LC profile before constructing an
+        // immutable A/V init from a held IDR. This is configuration policy,
+        // not another ADTS parser.
+        if config.object_type != 2
+            || !(1..=2).contains(&config.channels)
+            || config.sample_rate > u32::from(u16::MAX)
+            || AacConfig::from_audio_specific_config(&config.audio_specific_config())
+                != Some(config)
+        {
+            return Err(self.refuse_startup(IngestError::InvalidAudio));
+        }
+        self.es.audio_config(config);
+        if let Some(frame) = self.startup.pop_front() {
+            self.startup_replaying = true;
+            self.startup_has_successor = false;
+            self.startup_now = Some(frame.now);
+            self.startup_bytes -= frame.au.data.capacity();
+            match self.es.video(frame.dts, frame.pts, frame.au, frame.now) {
+                Ok(update) => self.pending.merge(update),
+                Err(error) => return Err(self.refuse_startup(error)),
+            }
+            if let Some(muxer) = self.es.muxer_mut() {
+                // The immutable A/V config and one real IDR are known. Open
+                // metadata only, so AAC can precede replayed video cuts. No
+                // duration or servable part is produced by this preparation.
+                muxer.prepare_startup_audio(frame.now);
+            }
+        }
+        Ok(())
     }
 
     fn release_failed_input(&mut self) {
@@ -919,6 +1241,9 @@ impl TsIngest {
                 Err(_) => {
                     let limited = self.input.lock().map(|i| i.limit_exceeded).unwrap_or(false);
                     if limited {
+                        if self.startup_replaying {
+                            self.discard_startup_catchup(now);
+                        }
                         self.release_failed_input();
                         return Err(IngestError::InputLimitExceeded);
                     }
@@ -928,6 +1253,9 @@ impl TsIngest {
                         .map(|mut input| std::mem::take(&mut input.reset_pes))
                         .unwrap_or(false);
                     if reset {
+                        if self.waiting_for_startup_audio() || self.startup_replaying {
+                            self.discard_startup_catchup(now);
+                        }
                         let mut feed = self
                             .pes
                             .take()
@@ -944,6 +1272,9 @@ impl TsIngest {
                         break;
                     }
                     // A malformed PES: its data is gone, the next one is fine.
+                    if self.waiting_for_startup_audio() || self.startup_replaying {
+                        self.discard_startup_catchup(now);
+                    }
                     if let Ok(mut input) = self.input.lock() {
                         input.dropped += 1;
                     }
@@ -994,7 +1325,7 @@ impl TsIngest {
             return Ok(());
         }
         self.waiting_keyframe = false;
-        let up = self.es.video(dts, pts, au, now)?;
+        let up = self.startup_video(dts, pts, au, now)?;
         self.pending.merge(up);
         Ok(())
     }
@@ -1019,16 +1350,62 @@ impl TsIngest {
     fn on_audio(&mut self, pts_raw: u64, data: &[u8], now: SystemTime) -> Result<(), IngestError> {
         self.declare_program(self.program(), now)?;
         let pts = self.clock.unwrap(pts_raw);
-        let mut elapsed_samples = 0i64;
-        for (config, payload) in codec::adts_frames(data) {
-            let offset =
-                i128::from(elapsed_samples) * 90_000 / i128::from(config.sample_rate.max(1));
-            let timestamp = pts
-                .checked_add(i64::try_from(offset).map_err(|_| IngestError::InvalidTimestamp)?)
-                .ok_or(IngestError::InvalidTimestamp)?;
-            self.pending
-                .merge(self.es.audio_at(timestamp, config, payload, now)?);
-            elapsed_samples += i64::from(AAC_FRAME_SAMPLES);
+        let mut touched_startup = self.startup_replaying;
+        let result = (|| {
+            let mut elapsed_samples = 0i64;
+            for (config, payload) in codec::adts_frames(data) {
+                if self.waiting_for_startup_audio() {
+                    self.startup_audio(config)?;
+                    touched_startup |= self.startup_replaying;
+                }
+                let offset =
+                    i128::from(elapsed_samples) * 90_000 / i128::from(config.sample_rate.max(1));
+                let timestamp = pts
+                    .checked_add(i64::try_from(offset).map_err(|_| IngestError::InvalidTimestamp)?)
+                    .ok_or(IngestError::InvalidTimestamp)?;
+                if self.startup_replaying {
+                    let fits =
+                        self.es
+                            .origin
+                            .zip(self.es.muxer())
+                            .is_some_and(|(origin, muxer)| {
+                                timestamp.checked_sub(origin).is_some_and(|relative| {
+                                    let (bytes, frames) =
+                                        muxer.startup_audio_projection(relative, payload.len());
+                                    bytes <= STARTUP_AUDIO_BYTES && frames <= STARTUP_AUDIO_FRAMES
+                                })
+                            });
+                    if !fits {
+                        self.discard_startup_catchup(now);
+                    }
+                }
+                self.pending
+                    .merge(self.es.audio_at(timestamp, config, payload, now)?);
+                if self.startup_replaying {
+                    // The real successor AAC timestamp finalises its preceding
+                    // frame. Replay immediately before checking the remaining
+                    // retained span; no guessed video duration is introduced.
+                    self.replay_startup_video()?;
+                    if self.startup_replaying
+                        && self
+                            .es
+                            .muxer()
+                            .and_then(Muxer::startup_audio_span)
+                            .is_some_and(|span| span > STARTUP_AUDIO_TICKS)
+                    {
+                        self.discard_startup_catchup(now);
+                    }
+                }
+                elapsed_samples += i64::from(AAC_FRAME_SAMPLES);
+            }
+            Ok::<(), IngestError>(())
+        })();
+        if let Err(error) = result {
+            return Err(if touched_startup {
+                self.refuse_startup(error)
+            } else {
+                error
+            });
         }
         Ok(())
     }

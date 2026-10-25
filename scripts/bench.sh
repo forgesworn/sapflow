@@ -2,6 +2,8 @@
 # M4 measurements for one server, the same way for sapflow and mediamtx.
 #
 #   scripts/bench.sh sapflow
+#   SAPFLOW_HTTP_IMPL=hyper scripts/bench.sh sapflow
+#   SAPFLOW_HTTP_IMPL=own SAPFLOW_HTTP_THREADS=1 scripts/bench.sh sapflow
 #   MEDIAMTX=/path/to/mediamtx scripts/bench.sh mediamtx    # 1.19.1 or 1.21.x
 #
 # Feed: ffmpeg test signal over RTMP, 720p30, 2.5 Mbit/s, 1 s keyframes, AAC
@@ -16,13 +18,33 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SERVER=${1:?usage: scripts/bench.sh sapflow|mediamtx}
+# The caller provides a new directory under ignored/private scratch. Retain
+# diagnostics on success and failure; never overwrite an earlier trial's logs.
+if [ -n "${BENCH_ARTIFACTS:-}" ]; then mkdir -m 700 "$BENCH_ARTIFACTS"; fi
 VIEWERS=${VIEWERS:-"250 750"}
 SECS=${SECS:-60}
 HTTP=127.0.0.1:8888
 EVENT=event-bench
 WORK=$(mktemp -d)
 pids=()
-cleanup() { { for p in "${pids[@]}"; do kill "$p"; done; wait; } 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() {
+  local result=$? log
+  trap - EXIT
+  { if [ "${#pids[@]}" -gt 0 ]; then for p in "${pids[@]}"; do kill "$p"; done; fi; wait; } 2>/dev/null || true
+  if [ -n "${BENCH_ARTIFACTS:-}" ]; then
+    for log in "$WORK"/*.log "$WORK"/bench-*.txt; do
+      if [ -f "$log" ] && ! cp "$log" "$BENCH_ARTIFACTS/"; then
+        echo "could not retain benchmark diagnostic $log" >&2
+        if [ "$result" -eq 0 ]; then result=1; fi
+      fi
+    done
+    if ! printf '%s\n' "$result" > "$BENCH_ARTIFACTS/exit-status.txt"; then
+      if [ "$result" -eq 0 ]; then result=1; fi
+    fi
+  fi
+  rm -rf "$WORK"
+  exit "$result"
+}
 trap cleanup EXIT
 
 # Two builds, not one: cargo unifies features across the packages of one build,
@@ -37,6 +59,14 @@ BENCH=$REL/sapflow-bench
 case "$SERVER" in
   sapflow)
     BIN=$REL/sapflow
+    # Pin the selected implementation, independently of the binary's default.
+    export SAPFLOW_HTTP_IMPL=${SAPFLOW_HTTP_IMPL:-own}
+    if [ "$SAPFLOW_HTTP_IMPL" = own ]; then
+      export SAPFLOW_HTTP_THREADS=${SAPFLOW_HTTP_THREADS:-$(python3 -c 'import os; print(min(256, os.cpu_count() or 4))')}
+    else
+      unset SAPFLOW_HTTP_THREADS
+    fi
+    echo "viewer HTTP: $SAPFLOW_HTTP_IMPL${SAPFLOW_HTTP_THREADS:+, threads $SAPFLOW_HTTP_THREADS}"
     SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:8890 \
     SAPFLOW_RTMP_ADDR=127.0.0.1:1935 RUST_LOG=warn "$BIN" > "$WORK/server.log" 2>&1 &
     ;;
@@ -118,7 +148,7 @@ read -r cpu_one loaded_mb sample_one < <(measure "$SPID" 20)
 echo "| $SERVER | binary MB | idle RSS MB | one stream RSS MB | one stream CPU % |"
 echo "| $SERVER | $size_mb | $idle_mb | $loaded_mb | $cpu_one |"
 for n in $VIEWERS; do
-  "$BENCH" --url "$URL" --viewers "$n" --secs "$SECS" --ramp 10 > "$WORK/bench-$n.txt" &
+  "$BENCH" --url "$URL" --viewers "$n" --secs "$SECS" --ramp 10 > "$WORK/bench-$n.txt" 2>&1 &
   bp=$!
   pids+=("$bp")
   sleep 10

@@ -36,6 +36,7 @@ use sapflow_hls::{PartLookup, Readiness};
 
 use crate::App;
 use crate::http1::{self, Method, Parsed, Persist};
+use crate::media_body::MediaBody;
 use crate::stream::LiveStream;
 
 const LISTENER: Token = Token(0);
@@ -117,7 +118,7 @@ pub fn spawn(
 struct Response {
     status: &'static str,
     headers: String,
-    body: Bytes,
+    body: MediaBody,
     /// `false` for a 204, which carries no content-length.
     has_length: bool,
 }
@@ -127,20 +128,68 @@ impl Response {
         Self {
             status,
             headers: String::new(),
-            body: Bytes::new(),
+            body: MediaBody::default(),
             has_length: true,
         }
     }
-    fn ok(body: Bytes, content_type: &str, cache: &str) -> Self {
+    fn ok(body: impl Into<MediaBody>, content_type: &str, cache: &str) -> Self {
         Self {
             status: "200 OK",
             headers: format!("content-type: {content_type}\r\ncache-control: {cache}\r\n"),
-            body,
+            body: body.into(),
             has_length: true,
         }
     }
     fn not_found() -> Self {
         Self::empty("404 Not Found")
+    }
+}
+
+/// One framed response. Chunk handles stay in their shared segment metadata;
+/// advancing a slow viewer changes only these cursors.
+#[derive(Default)]
+struct Output {
+    head: Bytes,
+    written: usize,
+    body: MediaBody,
+}
+
+/// Bound stack usage independently of the number of parts in a segment.
+const WRITE_SLICES: usize = 8;
+
+impl Output {
+    fn is_empty(&self) -> bool {
+        self.head.is_empty() && self.body.is_empty()
+    }
+
+    fn write_to(&mut self, writer: &mut impl Write) -> io::Result<usize> {
+        let mut slices = [IoSlice::new(&[]); WRITE_SLICES];
+        let header = &self.head[self.written..];
+        let mut count = 0;
+        if !header.is_empty() {
+            slices[0] = IoSlice::new(header);
+            count = 1;
+        }
+        count += self.body.slices(&mut slices[count..]);
+        if count == 0 {
+            return Ok(0);
+        }
+        let offered: usize = slices[..count].iter().map(|slice| slice.len()).sum();
+        let written = writer.write_vectored(&slices[..count])?;
+        if written > offered {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "write exceeded offered response bytes",
+            ));
+        }
+        let header_bytes = written.min(header.len());
+        self.written += header_bytes;
+        if self.written == self.head.len() {
+            self.head = Bytes::new();
+            self.written = 0;
+        }
+        self.body.advance(written - header_bytes)?;
+        Ok(written)
     }
 }
 
@@ -170,9 +219,8 @@ struct Parked {
 struct Conn {
     sock: TcpStream,
     input: Vec<u8>,
-    /// Response bytes still to write, and how much of the front is written.
-    output: VecDeque<Bytes>,
-    written: usize,
+    /// One response still to write, sharing its media chunks with the muxer.
+    output: Output,
     parked: Option<Parked>,
     /// Close once the output is written.
     close_after: bool,
@@ -344,8 +392,7 @@ impl Worker {
                     let conn = Conn {
                         sock,
                         input: Vec::new(),
-                        output: VecDeque::new(),
-                        written: 0,
+                        output: Output::default(),
                         parked: None,
                         close_after: false,
                         keep_alive_10: false,
@@ -605,42 +652,23 @@ fn respond(conn: &mut Conn, r: Response, head_only: bool) {
     };
     let length = r.has_length.then_some(r.body.len());
     let head = http1::head(r.status, &r.headers, length, persist);
-    conn.output.push_back(Bytes::from(head));
-    if !head_only && !r.body.is_empty() {
-        conn.output.push_back(r.body);
-    }
+    conn.output = Output {
+        head: Bytes::from(head),
+        written: 0,
+        body: if head_only {
+            MediaBody::default()
+        } else {
+            r.body
+        },
+    };
 }
 
 fn flush(conn: &mut Conn, now: Instant) -> io::Result<()> {
     while !conn.output.is_empty() {
-        let slices: Vec<IoSlice<'_>> = conn
-            .output
-            .iter()
-            .take(4)
-            .enumerate()
-            .map(|(i, b)| {
-                let from = if i == 0 { conn.written } else { 0 };
-                IoSlice::new(b.get(from..).unwrap_or_default())
-            })
-            .collect();
-        match conn.sock.write_vectored(&slices) {
+        match conn.output.write_to(&mut conn.sock) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(mut n) => {
+            Ok(_) => {
                 conn.last_progress = now;
-                while n > 0 {
-                    let Some(front) = conn.output.front() else {
-                        break;
-                    };
-                    let left = front.len().saturating_sub(conn.written);
-                    if n >= left {
-                        n -= left;
-                        conn.output.pop_front();
-                        conn.written = 0;
-                    } else {
-                        conn.written += n;
-                        n = 0;
-                    }
-                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -807,6 +835,117 @@ mod tests {
     use crate::stream::Source;
     use std::io::{BufRead, BufReader};
     use std::net::TcpStream as StdStream;
+
+    #[test]
+    fn scatter_output_keeps_partial_offsets_across_would_block_and_interrupts() {
+        enum Action {
+            Write(usize),
+            Block,
+            Interrupt,
+        }
+        struct Writer {
+            actions: VecDeque<Action>,
+            bytes: Vec<u8>,
+            largest_batch: usize,
+        }
+        impl Write for Writer {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("the output must use scatter writes");
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> io::Result<usize> {
+                assert!(slices.len() <= WRITE_SLICES);
+                assert!(slices.iter().all(|slice| !slice.is_empty()));
+                self.largest_batch = self.largest_batch.max(slices.len());
+                let limit = match self.actions.pop_front() {
+                    Some(Action::Block) => return Err(io::ErrorKind::WouldBlock.into()),
+                    Some(Action::Interrupt) => return Err(io::ErrorKind::Interrupted.into()),
+                    Some(Action::Write(limit)) => limit,
+                    None => usize::MAX,
+                };
+                let written = limit.min(slices.iter().map(|slice| slice.len()).sum());
+                let mut remaining = written;
+                for slice in slices {
+                    let take = remaining.min(slice.len());
+                    self.bytes.extend_from_slice(&slice[..take]);
+                    remaining -= take;
+                }
+                Ok(written)
+            }
+        }
+
+        let chunks: Vec<_> = (0..24)
+            .flat_map(|index| {
+                [
+                    Bytes::new(),
+                    Bytes::from(vec![b'A' + index as u8; index + 1]),
+                ]
+            })
+            .collect();
+        let data = sapflow_hls::muxer::SegmentData::from_chunks(chunks).expect("bounded fixture");
+        let head = Bytes::from_static(b"head\r\n\r\n");
+        let mut expected = head.to_vec();
+        for chunk in data.chunks() {
+            expected.extend_from_slice(chunk);
+        }
+        let mut output = Output {
+            head,
+            written: 0,
+            body: data.into(),
+        };
+        let mut writer = Writer {
+            actions: VecDeque::from([
+                Action::Write(3),
+                Action::Block,
+                Action::Interrupt,
+                Action::Write(7),
+                Action::Block,
+                Action::Write(0),
+                Action::Write(1),
+                Action::Write(23),
+            ]),
+            bytes: Vec::new(),
+            largest_batch: 0,
+        };
+        assert_eq!(output.write_to(&mut writer).expect("short header write"), 3);
+        assert_eq!(output.written, 3);
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+            assert_eq!(
+                output.write_to(&mut writer).expect_err("retry").kind(),
+                kind
+            );
+            assert_eq!(output.written, 3);
+            assert_eq!(output.body.len(), expected.len() - 8);
+        }
+        assert_eq!(output.write_to(&mut writer).expect("header/body split"), 7);
+        assert!(output.head.is_empty());
+        assert_eq!(output.body.len(), expected.len() - 10);
+        assert_eq!(
+            output
+                .write_to(&mut writer)
+                .expect_err("body blocked")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let left = output.body.len();
+        assert_eq!(output.write_to(&mut writer).expect("zero write"), 0);
+        assert_eq!(output.body.len(), left);
+        for _ in 0..128 {
+            if output.is_empty() {
+                break;
+            }
+            output
+                .write_to(&mut writer)
+                .expect("remaining scatter write");
+        }
+        assert!(output.is_empty());
+        assert_eq!(writer.bytes, expected);
+        assert_eq!(writer.largest_batch, WRITE_SLICES);
+    }
 
     /// One response off a blocking socket: status, headers, body.
     fn response(r: &mut BufReader<StdStream>) -> (String, Vec<String>, Vec<u8>) {

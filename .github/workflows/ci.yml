@@ -112,6 +112,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Performance receipt regressions
+        run: |
+          python3 -B tests/test_performance.py
+          python3 -B tests/test_measure_process.py
+          python3 -B tests/test_srt_loss_results.py
+          python3 -B tests/test_smoke_media.py
       - name: Native package output regressions
         run: node --test scripts/native-build-options.test.mjs
       - name: Native authentication source and packaging regressions
@@ -125,10 +131,6 @@ jobs:
           python3 -B tests/test_ios_privacy_resources.py
           python3 -B tests/test_ios_xctest_runtime.py
           python3 -B tests/test_ios_capture_recording.py
-      - name: Performance receipt regressions
-        run: |
-          python3 -B tests/test_performance.py
-          python3 -B tests/test_measure_process.py
 
   fuzz:
     name: Fuzz regressions and 60 s per target
@@ -196,9 +198,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg srt-tools curl python3
           command -v srt-live-transmit ffmpeg ffprobe
-      - name: Smoke
+      - name: Smoke, viewers on Hyper
+        env:
+          SAPFLOW_HTTP_IMPL: hyper
         run: scripts/smoke.sh
       - name: Smoke, viewers on the own event loop
         env:
           SAPFLOW_HTTP_IMPL: own
+          SAPFLOW_HTTP_THREADS: 1
         run: scripts/smoke.sh
