@@ -161,7 +161,7 @@ internal class AudioCaptureOwner(
                 })
             g.encoded = encoded
             codec.setCallback(encoded,audioCallbacks)
-            AudioAacEncoderConfiguration.configure(codec,bitrate)
+            g.observation.profileConfigured(ticket.serial, AudioAacEncoderConfiguration.configure(codec,bitrate))
             codec.start()
             if (!zero) prepareMicrophone(g)
             if (started) beginGeneration(g)

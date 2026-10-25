@@ -1997,6 +1997,28 @@ or a decoded-length difference supply missing trim authority. Actual generation,
 release, original extent, paired content and seek checks remain required before
 the recorder consumes a native timing receipt.
 
+The Android source now records the selected codec's name, canonical identity,
+encoder capability, request and returned formats at configuration, format change
+and EOS. These cold observations add no per-buffer metadata query, payload copy
+or media queue. The existing generation owner freezes them after its producer,
+callback and handoff barriers; that snapshot still precedes native release and
+does not certify release.
+
+The packing evaluator checks both configured formats as well as the later AAC
+output format. Known batching or geometry contradictions cannot be erased by a
+callback that omits the field. Missing initial CSD remains distinct from a
+contradictory value; raw input MIME and CSD are not mistaken for AAC output.
+Foreign owners, wrong generations and conflicting later observations cannot
+inherit or replace a profile. The generated qualification probe reports the
+profile and per-output eligibility alongside its original observations.
+
+This is a documented single-access-unit eligibility premise, not an actual
+access-unit count, H/T measurement, source EOF, SDK timing receipt or recorder
+admission. Original unknown-cardinality observations, raw native timestamps,
+the source-preservation mode's unattested status and legacy recorder defaults
+remain unchanged. An installed component still needs the complete native
+source, content and presentation qualification described above.
+
 ## iOS explicit prefix recovery and durable source budget
 
 The explicitly selected SDK checkpoint recorder now supports recovery into a
