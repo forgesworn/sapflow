@@ -119,7 +119,9 @@ jobs:
           export PATH="$JAVA_HOME/bin:$PATH"
           printf '%s\n' "JAVA_HOME=$JAVA_HOME" "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
           printf '%s\n' "$JAVA_HOME/bin" >> "$GITHUB_PATH"
-          sdkmanager --install "platforms;android-36" "build-tools;35.0.0" "build-tools;36.1.0" "ndk;27.1.12297006"
+          sapflow_sdkmanager="${ANDROID_HOME:?Android SDK is required}/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sapflow_sdkmanager"
+          "$sapflow_sdkmanager" --install "platforms;android-36" "build-tools;35.0.0" "build-tools;36.1.0" "ndk;27.1.12297006"
       - name: Prepare the checksum-pinned Kotlin 2.2 compiler
         shell: bash
         run: |
