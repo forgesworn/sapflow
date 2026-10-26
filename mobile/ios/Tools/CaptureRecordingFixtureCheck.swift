@@ -502,7 +502,7 @@ enum CaptureRecordingFixtureCheck {
         guard CommandLine.arguments.count == 2 else { exit(2) }
         let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true).standardizedFileURL
         guard root == root.resolvingSymlinksInPath(),
-              (try? String(contentsOf: root.appendingPathComponent(".sapflow-sdk-recorder-fixture"))) == "generated-sdk-recorder-v1\n" else { exit(2) }
+              (try? String(contentsOf: root.appendingPathComponent(".sapflow-sdk-recorder-fixture"), encoding: .utf8)) == "generated-sdk-recorder-v1\n" else { exit(2) }
         var rows: [[String: Any]] = []
         for name in ["healthy", "mixed-zero-raw", "publishing-independent-failure", "missing-file-EOF", "recording-queue-failure"] {
             do {

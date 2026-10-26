@@ -118,6 +118,7 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
         private val controlCleanupIssue = AtomicReference<String?>()
         private var controlProblem: String? = null
         private var codecName = "UNCREATED"
+        private val selectedProfile = AudioAacProfile.Observation(this, generation.toLong())
         private var codecStarted = false
         private var muxerStarted = false
         private var track = -1
@@ -169,7 +170,7 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                         val native = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
                         codec = native; codecName = native.name
                         native.setCallback(this, handler)
-                        AudioAacEncoderConfiguration.configure(native, 96_000)
+                        selectedProfile.configured(this, generation.toLong(), AudioAacEncoderConfiguration.configure(native, 96_000))
                         formats.put(format("input-configured", native.inputFormat))
                         native.start(); codecStarted = true
                         if (mode == Mode.DRAIN_EXPERIMENTS) {
@@ -187,10 +188,12 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                 } else check(terminal.await(remaining(), TimeUnit.MILLISECONDS)) { "Native output EOS deadline" }
             } catch (error: Exception) { fail(error) }
             val cleanup = retire()
+            val profile = checkNotNull(selectedProfile.freeze(this, generation.toLong()))
             if (!cleanup) {
                 return JSONObject().put("name", plan.name).put("generation", generation)
                     .put("cleanupConfirmed", false).put("failure", problem.get() ?: "Native owner cleanup unconfirmed")
                     .put("filesPreserved", true).put("nativeAacQualified", false)
+                    .put("selectedEncoderProfile", profileJSON(profile))
                     .put("nativeMuxerCleanupIssue", controlCleanupIssue.get() ?: "OWNER_ACK_OR_DRAIN_UNCONFIRMED")
                     .also { File(directory, "receipt.json").writeText(it.toString(2) + "\n") }
             }
@@ -218,6 +221,7 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                 .put("sourceWaveform", "per-frame integer mix v1; exact queued source.s16le")
                 .put("cleanupConfirmed", true).put("failure", problem.get() ?: JSONObject.NULL)
                 .put("formats", formats).put("auCardinality", "UNKNOWN")
+                .put("selectedEncoderProfile", profileJSON(profile))
                 .put("nativeAacQualified", false).put("sdkReceiptIssued", false)
                 .put("classification", if (problem.get() != null) "FAILED_OBSERVATION" else if (plan.omitInputEos) "INCOMPLETE_NO_INPUT_EOS" else if (inputEos && outputEos) "OBSERVED_NATIVE_EOS" else "INCOMPLETE")
             File(directory, "receipt.json").writeText(observed.toString(2) + "\n")
@@ -298,6 +302,7 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
             if (closed) { lateCallbacks++; return }
             try {
                 active(); check(native === codec && controlFormat == null)
+                selectedProfile.format(this, generation.toLong(), AudioAacProfile.Phase.OUTPUT_FORMAT, AudioAacEncoderConfiguration.format(value))
                 formats.put(format("output-format", value))
                 check(value.getInteger(MediaFormat.KEY_SAMPLE_RATE) == 48_000 && value.getInteger(MediaFormat.KEY_CHANNEL_COUNT) == 1)
                 val csd = checkNotNull(value.getByteBuffer("csd-0")).duplicate()
@@ -320,9 +325,20 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                 outputEos = true
                 if (formats.length() < (if (mode == Mode.DRAIN_EXPERIMENTS) 8 else 4)) {
                     if (Build.VERSION.SDK_INT >= 30) {
-                        try { formats.put(format("output-eos", native.getOutputFormat(index))) }
-                        catch (error: Exception) { formats.put(missingFormat("output-eos", "READ_FAILED").put("reason", error.javaClass.simpleName)) }
-                    } else formats.put(missingFormat("output-eos", "API_UNAVAILABLE"))
+                        try {
+                            val terminalFormat = native.getOutputFormat(index)
+                            if (native === codec) selectedProfile.format(this, generation.toLong(), AudioAacProfile.Phase.OUTPUT_EOS, AudioAacEncoderConfiguration.format(terminalFormat))
+                            formats.put(format("output-eos", terminalFormat))
+                        }
+                        catch (error: Exception) {
+                            if (native === codec) selectedProfile.format(this, generation.toLong(), AudioAacProfile.Phase.OUTPUT_EOS, AudioAacEncoderConfiguration.format(null))
+                            formats.put(missingFormat("output-eos", "READ_FAILED").put("reason", error.javaClass.simpleName))
+                        }
+                    } else {
+                        if (native === codec) selectedProfile.format(this, generation.toLong(), AudioAacProfile.Phase.OUTPUT_EOS,
+                            AudioAacEncoderConfiguration.format(null, AudioAacProfile.State.API_UNAVAILABLE))
+                        formats.put(missingFormat("output-eos", "API_UNAVAILABLE"))
+                    }
                 }
                 if (mode == Mode.DRAIN_EXPERIMENTS && formats.length() < 8) {
                     try { formats.put(format("input-at-output-eos", native.inputFormat)) }
@@ -338,6 +354,8 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                 if (size > 0) {
                     val buffer = checkNotNull(native.getOutputBuffer(index))
                     row.put("capacity", buffer.capacity())
+                    row.put("singleAuEligibility", AudioAacProfile.output(selectedProfile.eligibility(this, generation.toLong()),
+                        offset, size, flags, true, buffer.capacity()).name)
                     row.put("disposition", AudioAacOutputDisposition.classify(offset, size, flags, true, buffer.capacity()))
                     check(offset >= 0 && size <= 65_536 && offset.toLong() + size <= buffer.capacity())
                     check(outputBytes + size <= 1024 * 1024)
@@ -371,6 +389,8 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
                 } else {
                     check(size == 0 && offset >= 0)
                     row.put("disposition", AudioAacOutputDisposition.classify(offset, size, flags, true))
+                    row.put("singleAuEligibility", AudioAacProfile.output(selectedProfile.eligibility(this, generation.toLong()),
+                        offset, size, flags, true, 0).name)
                 }
             } catch (error: Exception) { row.put("failure", error.javaClass.simpleName + ": " + error.message?.take(512)); fail(error) }
             finally {
@@ -465,6 +485,27 @@ internal class NativeAacQualificationProbe(private val root: File, private val c
             .put("phase", phase).put("state", state)
             .put(MediaFormat.KEY_ENCODER_DELAY, JSONObject().put("state", state))
             .put(MediaFormat.KEY_ENCODER_PADDING, JSONObject().put("state", state))
+
+        private fun profileJSON(snapshot: AudioAacProfile.Snapshot): JSONObject {
+            fun fact(value: AudioAacProfile.Fact<*>) = JSONObject().put("state", value.state.name).put("value", value.value ?: JSONObject.NULL)
+            fun format(value: AudioAacProfile.Format?): Any = value?.let { JSONObject()
+                .put("mime", fact(it.mime)).put("rate", fact(it.rate)).put("channels", fact(it.channels))
+                .put("csd0", fact(it.csd0)).put("batchMaximum", fact(it.batchMaximum)).put("batchThreshold", fact(it.batchThreshold)) } ?: JSONObject.NULL
+            val setup = snapshot.setup; val selection = setup?.selection
+            return JSONObject().put("generation", snapshot.generation).put("eligibility", snapshot.eligibility.name)
+                .put("conflict", snapshot.conflict).put("api", selection?.api ?: JSONObject.NULL)
+                .put("name", selection?.let { fact(it.name) } ?: JSONObject.NULL)
+                .put("canonicalName", selection?.let { fact(it.canonicalName) } ?: JSONObject.NULL)
+                .put("encoder", selection?.let { fact(it.encoder) } ?: JSONObject.NULL)
+                .put("multipleSupported", selection?.let { fact(it.multipleSupported) } ?: JSONObject.NULL)
+                .put("multipleRequired", selection?.let { fact(it.multipleRequired) } ?: JSONObject.NULL)
+                .put("request", selection?.request?.let { JSONObject().put("rate", it.rate).put("channels", it.channels)
+                    .put("aacProfile", it.aacProfile).put("bitrate", it.bitrate).put("maxInputBytes", it.maxInputBytes)
+                    .put("batchMaximum", fact(it.batchMaximum)).put("batchThreshold", fact(it.batchThreshold)) } ?: JSONObject.NULL)
+                .put("configuredInput", format(setup?.input)).put("configuredOutput", format(setup?.output))
+                .put("outputFormat", format(snapshot.output)).put("terminalOutput", format(snapshot.terminalOutput))
+                .put("nativeSourceQualified", false).put("sdkReceiptIssued", false).put("appAdmission", false)
+        }
 
         private fun format(phase: String, value: MediaFormat): JSONObject {
             val result = JSONObject().put("phase", phase).put("reported", value.toString().take(4096))

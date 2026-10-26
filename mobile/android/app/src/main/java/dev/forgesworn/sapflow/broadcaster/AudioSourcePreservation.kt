@@ -32,6 +32,7 @@ internal open class AudioTimingTransfer<S : AutoCloseable, V : AutoCloseable, B>
     private val makeViews: (S, Long, Long?) -> V,
     private val knownRejection: (Throwable) -> Boolean,
     private val onOriginalReturned: () -> Unit = {},
+    private val onAcquisitionsReturned: () -> Unit = {},
 ) : AutoCloseable {
     private var original: S? = null
     private var legacy: S? = null
@@ -72,8 +73,13 @@ internal open class AudioTimingTransfer<S : AutoCloseable, V : AutoCloseable, B>
             }
             throw error
         }
+        acquisitionsReturned() // Both handles returned; the original close is still pending.
         closeOriginal() // Views retain the original shared payload, not this wrapper.
     }
+
+    /** Called after construction, so a fixed transfer slot can read its current
+     * serial rather than capture an initial constructor argument in a lambda. */
+    protected open fun acquisitionsReturned() { onAcquisitionsReturned() }
 
     private fun closeOriginal() {
         val handle = checkNotNull(original)

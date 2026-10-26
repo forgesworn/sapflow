@@ -30,6 +30,7 @@ internal class AudioGenerationObservation(private val generation: Long) {
         val otherOutputFlagsBuffers: Long, val invalidOutputRanges: Long,
         val earlyDataBuffers: Long, val nonemptyOutputEosBuffers: Long,
         val checkedBorrowedOutputRanges: Long, val invalidBorrowedOutputRanges: Long,
+        val selectedProfile: AudioAacProfile.Snapshot? = null,
     )
     private class Slot {
         var api = 0
@@ -43,6 +44,7 @@ internal class AudioGenerationObservation(private val generation: Long) {
     private val eosLeading = Slot()
     private val eosPadding = Slot()
     private var frozen: Snapshot? = null
+    private val profile = AudioAacProfile.Observation(this, generation)
     private var submittedBuffers = 0L
     private var submittedFrames = 0L
     private var rawFrames = 0L
@@ -93,6 +95,12 @@ internal class AudioGenerationObservation(private val generation: Long) {
         Phase.FORMAT -> if (trim == Trim.LEADING) formatLeading else formatPadding
         Phase.OUTPUT_EOS -> if (trim == Trim.LEADING) eosLeading else eosPadding
     }
+
+    @Synchronized fun profileConfigured(value: Long, facts: AudioAacProfile.Setup): Boolean =
+        if (!active(value) || callbackBarrier) false else profile.configured(this, value, facts)
+    @Synchronized fun profileFormat(value: Long, phase: Phase, facts: AudioAacProfile.Format): Boolean =
+        if (!active(value) || callbackBarrier) false else profile.format(this, value,
+            if (phase == Phase.FORMAT) AudioAacProfile.Phase.OUTPUT_FORMAT else AudioAacProfile.Phase.OUTPUT_EOS, facts)
 
     /** Cold optional metadata only. Missing and malformed remain distinct;
      * a reported zero is never substituted for either. No effective trim is
@@ -221,7 +229,7 @@ internal class AudioGenerationObservation(private val generation: Long) {
             constructedSamples, primingFiltered, staleFiltered, handoffAttempts, handoffReturns, callbackEntries, callbackReturns,
             overflow, invalid, trimConflict, producersJoined, callbackBarrier, stopReturned, handoffIdle,
             cardinalityUnknownBuffers, partialOutputBuffers, otherOutputFlagsBuffers, invalidOutputRanges,
-            earlyDataBuffers, nonemptyOutputEosBuffers, checkedBorrowedOutputRanges, invalidBorrowedOutputRanges)
+            earlyDataBuffers, nonemptyOutputEosBuffers, checkedBorrowedOutputRanges, invalidBorrowedOutputRanges, profile.freeze(this, value))
         frozen = result
         return result
     }

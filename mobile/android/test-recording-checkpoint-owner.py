@@ -53,13 +53,15 @@ assert package['outputHashes'][str(aar.relative_to(root))]==sha(aar)
 tools={name:checked(name) for name in ('jna','serializationCore','serializationJson','androidJar')}
 assert sha(tools['jna'])=='4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae'
 production='mobile/android/app/src/main/java/dev/forgesworn/sapflow/broadcaster/'
-sources=[production+n for n in ('CaptureProfile.kt','CaptureIntent.kt','RecordingSourceGate.kt','RecordingCatalogue.kt','RecordingCheckpointStorage.kt','AndroidRecordingStorageIO.kt','RecordingCheckpointOwner.kt')]
+sources=[production+n for n in ('CaptureProfile.kt','CaptureIntent.kt','RecordingSourceGate.kt',
+    'AudioAacOutputDisposition.kt','AudioAacProfile.kt','AudioNativeAacGeneration.kt','AudioNativeAacRun.kt',
+    'RecordingCatalogue.kt','RecordingAppendContext.kt','RecordingCheckpointStorage.kt','AndroidRecordingStorageIO.kt','RecordingCheckpointOwner.kt')]
 sources+=['mobile/android/host-tests/RecordingCheckpointOwnerHostTest.kt']
 assert set(proof['compiledSources'])==set(sources)
 assert all((root/p).is_file() and not (root/p).is_symlink() and sha(root/p)==h for p,h in proof['compiledSources'].items())
 assert proof['driverSHA256']==sha(Path(__file__))
 test_names=re.findall(r'::([A-Za-z][A-Za-z0-9_]*)',(root/sources[-1]).read_text().split('val tests = listOf(',1)[1].split(')\n',1)[0])
-assert len(test_names)==len(set(test_names))==17
+assert len(test_names)==len(set(test_names))==20
 tool_paths={p:sha(p) for p in tools.values()}
 context={**sdk,**proof['compiledSources'],str(Path(__file__).relative_to(root)):sha(Path(__file__))}
 for p in [proof_path,host_path,sdk_map,package_path,package_path.parent/'source-hashes.local.json',package_path.parent/'build.local.log',audit_path,aar,library]:context[str(p.relative_to(root))]=sha(p)
@@ -165,7 +167,7 @@ try:
         text=run(name,command,timeout)
         if name=='controls':
             observed=re.findall(r'^SDK recording owner host control passed: (\w+)$',text,re.M)
-            assert observed==test_names and text.splitlines().count('SDK recording owner host controls passed: 17')==1
+            assert observed==test_names and text.splitlines().count('SDK recording owner host controls passed: 20')==1
 except BaseException as error:failure=type(error).__name__+': '+str(error)
 finally:
     if active is not None and not active['attempted']:retire()

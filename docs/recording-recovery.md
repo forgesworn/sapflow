@@ -1976,6 +1976,92 @@ separate requirements. The approved checked playback clock and all original
 native-clock failures remain unchanged.
 
 
+### Next Android encoder profile
+
+The next source qualification needs the actual selected component's capability
+and configuration, rather than treating every Android callback as permanently
+unattestable. Android documents
+[`FEATURE_MultipleFrames`](https://developer.android.com/reference/android/media/MediaCodecInfo.CodecCapabilities#FEATURE_MultipleFrames)
+for single versus multiple access units, including encoders. API 35 also documents
+single-access-unit operation when
+[`KEY_BUFFER_BATCH_MAX_OUTPUT_SIZE`](https://developer.android.com/reference/android/media/MediaFormat#KEY_BUFFER_BATCH_MAX_OUTPUT_SIZE)
+is unset, as in the current shared AAC configuration. Neither observation has
+yet been recorded for a selected installed encoder by this application.
+
+A qualified profile must bind those actual facts to its original callback
+ranges and exclude config, empty, partial or invalid output. Nonempty EOS output
+must be accounted for before closure. Encoder delay and padding retain their
+[decoded-frame trim semantics](https://developer.android.com/reference/android/media/MediaFormat#KEY_ENCODER_DELAY),
+but reporting is optional: missing values cannot become zero, nor can timestamps
+or a decoded-length difference supply missing trim authority. Actual generation,
+release, original extent, paired content and seek checks remain required before
+the recorder consumes a native timing receipt.
+
+The Android source now records the selected codec's name, canonical identity,
+encoder capability, request and returned formats at configuration, format change
+and EOS. These cold observations add no per-buffer metadata query, payload copy
+or media queue. The existing generation owner freezes them after its producer,
+callback and handoff barriers; that snapshot still precedes native release and
+does not certify release.
+
+The packing evaluator checks both configured formats as well as the later AAC
+output format. Known batching or geometry contradictions cannot be erased by a
+callback that omits the field. Missing initial CSD remains distinct from a
+contradictory value; raw input MIME and CSD are not mistaken for AAC output.
+Foreign owners, wrong generations and conflicting later observations cannot
+inherit or replace a profile. The generated qualification probe reports the
+profile and per-output eligibility alongside its original observations.
+
+This is a documented single-access-unit eligibility premise, not an actual
+access-unit count, H/T measurement, source EOF, SDK timing receipt or recorder
+admission. Original unknown-cardinality observations, raw native timestamps,
+the source-preservation mode's unattested status and legacy recorder defaults
+remain unchanged. An installed component still needs the complete native
+source, content and presentation qualification described above.
+
+### Checked Android native generation and worker boundary
+
+`AudioNativeAacGeneration` binds one private generation owner, actual codec and
+callback instance. Its sixteen scalar slot records distinguish returned sample
+and timing-view acquisition, output-buffer release, handoff entry/return and
+checked transfer closure. The acquisition hook reads the current reused slot
+serial after construction, before a later original-wrapper close can fail.
+It retains no payload, adds no media queue and makes no native metadata query.
+
+A native generation receipt can be issued only after actual producer joins,
+input/output EOS, callback stop and codec/microphone release. It requires eligible
+original units, observed leading trim before the first unit, actual terminal
+padding, known transfer closure and checked input/head/tail conservation. Unknown
+trim cannot be supplied by a decoded length or inferred zero. Receipt identity
+is checked against its actual issuer; the diagnostic observation stays separate.
+
+`AudioNativeAacRun` carries those receipts to an explicitly bound timing-aware
+recording worker. It checks per-generation accepted audio counts and the common
+accepted/consumed media frontier, with one pending consume at a time. Early video
+waits in the existing bounded fanout until the first accepted audio establishes
+leading trim. Timing calls run outside the scalar guard. Callback return cannot
+override a recording failure, and known loss is latched before asynchronous
+prefix cleanup, including rejected video absent from the accepted counters.
+Invalid worker wiring is refused before an executor is created. Consumption adds
+no per-sample `isVideo` query.
+
+API35's exact returned batching pair `0/0` has separate single-unit eligibility
+provenance. The shared request still leaves both keys unset. Positive, mixed,
+malformed or unknown batching facts and known startup contradictions remain
+unqualified. Raw returned facts are retained.
+
+The public Android build gate requires all 84 named profile, generation, run and
+transfer controls in both JVM variants, alongside the complete app-test floors,
+package checks and 68 generated verifier controls. The same gate compiles and
+runs all 20 recording-owner controls against its fresh host SDK library and
+actual AAR classes, using synthetic compressed bytes and event facts with real
+host filesystem operations. These are host/event and build checks. A concrete
+capture sink implementing both `EncodedSink` and
+`AudioNativeAacWorker`, installed-component H/T and content qualification,
+application admission, presentation, durable recovery, sustained loss and device
+acceptance remain open. The legacy backend remains the default; none of the
+historical numerical or native-clock failures is reclassified.
+
 ## iOS explicit prefix recovery and durable source budget
 
 The explicitly selected SDK checkpoint recorder now supports recovery into a
@@ -2060,6 +2146,34 @@ earlier failed strict checks remain unchanged.
 Unsigned Debug, Qualification and Release app builds, test-bundle compilation
 and all three privacy-resource checks passed after regenerating the iOS project
 to include the new tests. The test bundle was compiled without device execution.
+
+## Reproducing the generated native recording matrix
+
+On macOS with full Xcode, the pinned Rust toolchain and `ffmpeg` / `ffprobe`
+installed, run:
+
+```sh
+bash mobile/ios/check-capture-recording.sh
+```
+
+The public command builds the current host SDK in the checkout's existing
+`target/`, generates its Swift bindings and runs the native fixture. It requires
+no private build receipts. Three preparation commands precede the 17 native
+compile, fixture, packet-probe and decode commands. The matrix requires all five
+stored-input controls, ten SDK producer cases and seven legacy producer cases.
+Four stored controls retain exact original AAC packet hashes; three completed
+SDK files and two completed legacy files require successful whole-file decoding.
+
+Scalar receipts, source bindings, command logs and current process-group closure
+evidence are retained under `target/ios-native-recording/`. Generated media and
+compiler scratch are removed only after every owned process group is known
+closed. CI runs the same public command and retains its evidence. The old private
+witness environment variables are rejected explicitly rather than ignored.
+
+This is a generated host recording regression gate. It does not qualify paired
+waveforms, native presentation clocks, recovery, sustained loss, physical capture,
+performance or default-backend adoption. The numerical contract and historical
+strict failures above remain unchanged.
 
 ## Implementation order
 
