@@ -24,6 +24,12 @@
 	{$CADDY_SITE_EXTRA}
 	handle_path /live-hls/* {
 		reverse_proxy {$SAPFLOW_UPSTREAM} {
+			# Caddy keeps 32 idle upstream connections by default. At a few
+			# hundred viewers it then churns connections until local ports
+			# run out and viewers get 502s. Keep this when copying the block.
+			transport http {
+				keepalive_idle_conns_per_host 1024
+			}
 			{$CADDY_PROXY_EXTRA}
 		}
 	}
