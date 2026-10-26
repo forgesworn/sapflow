@@ -258,16 +258,7 @@ open class MediaCodec: NativeHandle, MediaCodecProtocol, @unchecked Sendable {
     open func sample(bytes: Data, pts: Int64, dts: Int64, duration: UInt32, timescale: UInt32, keyframe: Bool) throws -> MediaSample {
         let handle = try withData(bytes) { ptr, len in try hotHandle(.binding) { out, error in sapflow_media_codec_sample(raw, ptr, len, pts, dts, duration, timescale, keyframe, out, error) } }
         guard let video else { return MediaSample(unsafeFromHandle: UInt64(UInt(bitPattern: handle))) }
-        var result = SapflowMediaSampleResult()
-        result.handle = handle
-        result.len = UInt64(bytes.count)
-        result.pts = pts
-        result.dts = dts
-        result.duration = duration
-        result.timescale = timescale
-        result.is_video = video
-        result.is_keyframe = keyframe
-        return MediaSample(result: result)
+        return MediaSample(handle: handle, length: UInt64(bytes.count), pts: pts, dts: dts, duration: duration, timescale: timescale, isVideo: video, isKeyframe: keyframe)
     }
 }
 public protocol MediaSampleProtocol: AnyObject, Sendable {
@@ -277,26 +268,50 @@ public protocol MediaSampleProtocol: AnyObject, Sendable {
 }
 open class MediaSample: NativeHandle, MediaSampleProtocol, @unchecked Sendable {
     public struct NoHandle { public init() {} }
-    private let metadata: SapflowMediaSampleResult
-    required public init(unsafeFromHandle handle: UInt64) {
+    private let length: UInt64
+    private let presentation: Int64
+    private let decode: Int64
+    private let sampleDuration: UInt32
+    private let sampleTimescale: UInt32
+    private let video: Bool
+    private let keyframe: Bool
+    required public convenience init(unsafeFromHandle handle: UInt64) {
         let raw = UnsafeMutableRawPointer(bitPattern: UInt(handle))
-        metadata = raw == nil ? SapflowMediaSampleResult() : try! sampleMetadata(raw)
-        super.init(kind: 3, raw: raw)
+        self.init(result: raw == nil ? SapflowMediaSampleResult() : try! sampleMetadata(raw))
     }
-    public init(noHandle: NoHandle) { metadata = SapflowMediaSampleResult(); super.init(kind: 3, raw: nil) }
-    fileprivate init(result: SapflowMediaSampleResult) { metadata = result; super.init(kind: 3, raw: result.handle) }
+    public convenience init(noHandle: NoHandle) { self.init(result: SapflowMediaSampleResult()) }
+    fileprivate init(result: SapflowMediaSampleResult) {
+        length = result.len
+        presentation = result.pts
+        decode = result.dts
+        sampleDuration = result.duration
+        sampleTimescale = result.timescale
+        video = result.is_video
+        keyframe = result.is_keyframe
+        super.init(kind: 3, raw: result.handle)
+    }
+    fileprivate init(handle: UnsafeMutableRawPointer, length: UInt64, pts: Int64, dts: Int64, duration: UInt32, timescale: UInt32, isVideo: Bool, isKeyframe: Bool) {
+        self.length = length
+        presentation = pts
+        decode = dts
+        sampleDuration = duration
+        sampleTimescale = timescale
+        video = isVideo
+        keyframe = isKeyframe
+        super.init(kind: 3, raw: handle)
+    }
     open func aacTimingViews(producerGeneration: UInt64, nativePtsUs: Int64, publishingPts: Int64?) throws -> NativeAacTimingViews {
         NativeAacTimingViews(unsafeFromHandle: try response(try invoke(9, .binding, raw, request { $0.u64(producerGeneration);$0.i64(nativePtsUs);$0.optional(publishingPts) })) { try $0.handle() })
     }
     open func aacSourceInfo() -> NativeAacSampleSourceInfo? { try! response(try! invoke(10, .binding, raw)) { try $0.bool() ? .init(producerGeneration: $0.u64(), nativePtsUs: $0.i64(), originalPts: $0.i64(), originalDts: $0.i64(), originalDuration: $0.u32(), originalTimescale: $0.u32()) : nil } }
-    open func len() -> UInt64 { metadata.len }
-    open func isEmpty() -> Bool { metadata.len == 0 }
-    open func isVideo() -> Bool { metadata.is_video }
-    open func isKeyframe() -> Bool { metadata.is_keyframe }
-    open func pts() -> Int64 { metadata.pts }
-    open func dts() -> Int64 { metadata.dts }
-    open func duration() -> UInt32 { metadata.duration }
-    open func timescale() -> UInt32 { metadata.timescale }
+    open func len() -> UInt64 { length }
+    open func isEmpty() -> Bool { length == 0 }
+    open func isVideo() -> Bool { video }
+    open func isKeyframe() -> Bool { keyframe }
+    open func pts() -> Int64 { presentation }
+    open func dts() -> Int64 { decode }
+    open func duration() -> UInt32 { sampleDuration }
+    open func timescale() -> UInt32 { sampleTimescale }
 }
 public protocol NativeAacTimingViewsProtocol: AnyObject, Sendable { func sourceInfo() -> NativeAacSampleSourceInfo; func recordingSample() -> MediaSample; func publishingSample() -> MediaSample? }
 open class NativeAacTimingViews: NativeHandle, NativeAacTimingViewsProtocol, @unchecked Sendable {
