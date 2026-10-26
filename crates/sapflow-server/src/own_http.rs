@@ -1,14 +1,16 @@
 //! The viewer HTTP path on our own event loop (mio), without tokio, hyper or
-//! axum: `SAPFLOW_HTTP_IMPL=own`. Ingest, callbacks and recording still run
-//! on tokio. On the M4 at 750 viewers it used 43% less CPU and 88% less
-//! memory than the hyper path (`docs/benchmarks.md`).
+//! axum. It is the only viewer backend: it replaced a Hyper one that used
+//! about twice the CPU and several times the memory (`docs/benchmarks.md`).
+//! Ingest, callbacks and recording still run on tokio.
+//!
+//! Every viewer gets the same bytes: no sessions, no cookies, no query strings
+//! in URIs. Viewer addresses are not logged.
 //!
 //! Each worker thread owns a poller and the connections it accepts from a
 //! shared listener. Requests that must wait (blocking playlist reload, the
 //! preload-hinted part) park on their connection. A stream change wakes
 //! every worker ([`notify`]), and each re-checks the parked requests whose
-//! stream changed. Request framing is `http1.rs`; routing and answers make
-//! the same decisions as `http.rs`.
+//! stream changed. Request framing is `http1.rs`.
 //!
 //! Limits:
 //! - At most [`MAX_CONNECTIONS`] connections; past it, new ones wait in the
@@ -43,14 +45,15 @@ const LISTENER: Token = Token(0);
 const WAKE: Token = Token(1);
 const PLAYLIST_TYPE: &str = "application/vnd.apple.mpegurl";
 const CHUNK_CACHE: &str = "public, max-age=3600";
-/// Concurrent connections across all workers, as in `http.rs`.
+/// Concurrent connections across all workers.
 pub const MAX_CONNECTIONS: usize = 20_000;
-/// Time allowed for a request head to arrive once its first byte has, as
-/// hyper's header read timeout in `http.rs` (slow-loris).
+/// Time allowed for a request head to arrive once its first byte has
+/// (slow-loris).
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 /// A connection with nothing parked is closed after this long without
-/// reading a byte or writing one. As in `http.rs`, it must outlast clients'
-/// idle keep-alive reuse.
+/// reading a byte or writing one. It must outlast clients' idle keep-alive
+/// reuse: at 10 s, viewers that reused a connection just as it closed saw
+/// failed requests.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Requests one connection may have answered before the worker turns to the
 /// others; the rest wait their turn on the ready queue.
@@ -695,9 +698,9 @@ fn block_limit(stream: &LiveStream) -> Duration {
     Duration::from_secs(3 * target)
 }
 
-/// The routes of `http.rs`: `/live/{event}/index.m3u8`, the media playlist
-/// and `/live/{event}/{file}`, each answering GET, HEAD and OPTIONS. Anything
-/// else is 404 whatever the method; another method on a route is 405.
+/// The routes: `/live/{event}/index.m3u8`, the media playlist and
+/// `/live/{event}/{file}`, each answering GET, HEAD and OPTIONS. Anything else
+/// is 404 whatever the method; another method on a route is 405.
 fn route(app: &App, method: Method, target: &str) -> Result<Request, Response> {
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p, Some(q)),
@@ -727,7 +730,7 @@ fn route(app: &App, method: Method, target: &str) -> Result<Request, Response> {
         return Ok(Request::Multivariant(stream));
     }
     if file == playlist::MEDIA_PLAYLIST {
-        // As in http.rs: the query is checked before the stream is looked up.
+        // The query is checked before the stream is looked up.
         let (msn, part) = playlist::parse_blocking_query(query)
             .map_err(|_| Response::empty("400 Bad Request"))?;
         // Without parts or CAN-BLOCK-RELOAD, the client reloads completed
@@ -831,8 +834,8 @@ fn answer(app: &App, request: &Request) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::epoch_tests::{LANDSCAPE, PORTRAIT, app, begin};
     use crate::stream::Source;
+    use crate::test_support::{LANDSCAPE, PORTRAIT, app, begin};
     use std::io::{BufRead, BufReader};
     use std::net::TcpStream as StdStream;
 
@@ -979,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn serves_parks_and_wakes_like_the_hyper_path() {
+    async fn serves_parks_and_wakes() {
         let (app, _scratch) = app(false);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -1097,7 +1100,7 @@ mod tests {
         let (status, headers, _) = response(&mut r);
         assert_eq!(status, "HTTP/1.1 405 Method Not Allowed");
         assert!(headers.contains(&"allow: get,head,options".to_string()));
-        // As in http.rs: off the routes, every method is 404.
+        // Off the routes, every method is 404.
         for raw in [
             "POST /elsewhere HTTP/1.1\r\n\r\n",
             "OPTIONS /elsewhere HTTP/1.1\r\n\r\n",

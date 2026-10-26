@@ -251,10 +251,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg srt-tools curl python3
           command -v srt-live-transmit ffmpeg ffprobe
-      - name: Smoke, viewers on Hyper
-        env:
-          SAPFLOW_HTTP_IMPL: hyper
-        run: scripts/smoke.sh
       - name: Smoke, viewers on the own event loop
         env:
           SAPFLOW_HTTP_IMPL: own

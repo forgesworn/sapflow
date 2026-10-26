@@ -2,8 +2,7 @@
 # M4 measurements for one server, the same way for sapflow and mediamtx.
 #
 #   scripts/bench.sh sapflow
-#   SAPFLOW_HTTP_IMPL=hyper scripts/bench.sh sapflow
-#   SAPFLOW_HTTP_IMPL=own SAPFLOW_HTTP_THREADS=1 scripts/bench.sh sapflow
+#   SAPFLOW_HTTP_THREADS=1 scripts/bench.sh sapflow
 #   MEDIAMTX=/path/to/mediamtx scripts/bench.sh mediamtx    # 1.19.1 or 1.21.x
 #
 # Feed: ffmpeg test signal over RTMP, 720p30, 2.5 Mbit/s, 1 s keyframes, AAC
@@ -59,14 +58,12 @@ BENCH=$REL/sapflow-bench
 case "$SERVER" in
   sapflow)
     BIN=$REL/sapflow
-    # Pin the selected implementation, independently of the binary's default.
+    # Pin the viewer event loop and its worker count, independently of the
+    # binary's defaults. A stale SAPFLOW_HTTP_IMPL=hyper is passed on so the
+    # server refuses it.
     export SAPFLOW_HTTP_IMPL=${SAPFLOW_HTTP_IMPL:-own}
-    if [ "$SAPFLOW_HTTP_IMPL" = own ]; then
-      export SAPFLOW_HTTP_THREADS=${SAPFLOW_HTTP_THREADS:-$(python3 -c 'import os; print(min(256, os.cpu_count() or 4))')}
-    else
-      unset SAPFLOW_HTTP_THREADS
-    fi
-    echo "viewer HTTP: $SAPFLOW_HTTP_IMPL${SAPFLOW_HTTP_THREADS:+, threads $SAPFLOW_HTTP_THREADS}"
+    export SAPFLOW_HTTP_THREADS=${SAPFLOW_HTTP_THREADS:-$(python3 -c 'import os; print(min(256, os.cpu_count() or 4))')}
+    echo "viewer HTTP: $SAPFLOW_HTTP_IMPL, threads $SAPFLOW_HTTP_THREADS"
     SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=$HTTP SAPFLOW_SRT_ADDR=127.0.0.1:8890 \
     SAPFLOW_RTMP_ADDR=127.0.0.1:1935 RUST_LOG=warn "$BIN" > "$WORK/server.log" 2>&1 &
     ;;

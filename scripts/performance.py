@@ -19,7 +19,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
-VARIANTS = ("hyper", "own", "own-1", "own-4", "mediamtx")
+VARIANTS = ("own", "own-1", "own-4", "mediamtx")
 
 
 def sha256(path):
@@ -143,10 +143,10 @@ def run_trial(env, server, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="new ignored directory for scalar results")
-    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=["hyper", "own", "own-1", "own-4", "mediamtx"])
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
     parser.add_argument("--viewers", nargs="+", type=int, default=[250, 750])
     parser.add_argument("--seconds", type=int, default=60)
-    parser.add_argument("--rounds", type=int, default=5, help="a multiple of the treatment count balances order positions")
+    parser.add_argument("--rounds", type=int, default=4, help="a multiple of the treatment count balances order positions")
     parser.add_argument("--mediamtx", type=Path)
     args = parser.parse_args()
     if args.rounds < 1 or args.seconds < 10 or any(n < 1 for n in args.viewers):
@@ -184,9 +184,8 @@ def main():
     for variant in args.variants:
         settings = {}
         if variant != "mediamtx":
-            settings["SAPFLOW_HTTP_IMPL"] = "hyper" if variant == "hyper" else "own"
-            if variant != "hyper":
-                settings["SAPFLOW_HTTP_THREADS"] = str(own_threads if variant == "own" else int(variant.split("-")[1]))
+            settings["SAPFLOW_HTTP_IMPL"] = "own"
+            settings["SAPFLOW_HTTP_THREADS"] = str(own_threads if variant == "own" else int(variant.split("-")[1]))
         http_settings[variant] = settings
     data = dict(
         status="preparing", source=command("git", "rev-parse", "HEAD"),

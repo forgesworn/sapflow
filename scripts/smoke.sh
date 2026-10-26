@@ -13,14 +13,11 @@ for bin in ffmpeg ffprobe srt-live-transmit python3 curl; do
   command -v "$bin" >/dev/null || { echo "missing $bin" >&2; exit 1; }
 done
 
-# Test the preferred backend unless the caller explicitly selects Hyper.
-# Export once so the primary, encrypted and opt-in server launches agree.
+# Viewers run on the own event loop. Export once so the primary, encrypted and
+# opt-in server launches agree. A stale SAPFLOW_HTTP_IMPL=hyper is passed on
+# so the server refuses it, rather than being overridden here.
 export SAPFLOW_HTTP_IMPL=${SAPFLOW_HTTP_IMPL:-own}
-if [ "$SAPFLOW_HTTP_IMPL" = own ]; then
-  export SAPFLOW_HTTP_THREADS=${SAPFLOW_HTTP_THREADS:-$(python3 -c 'import os; print(min(256, os.cpu_count() or 4))')}
-else
-  unset SAPFLOW_HTTP_THREADS
-fi
+export SAPFLOW_HTTP_THREADS=${SAPFLOW_HTTP_THREADS:-$(python3 -c 'import os; print(min(256, os.cpu_count() or 4))')}
 
 HTTP=127.0.0.1:18888
 SRT_PORT=18890

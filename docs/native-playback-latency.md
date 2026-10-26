@@ -61,8 +61,9 @@ restarted and no capture or server state was changed by this review.
 defines the omitted regular HOLD-BACK as three target durations. Six seconds
 therefore fits regular-latency fallback. [Appendix B.1](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-22#appendix-B.1)
 requires HTTP/2 or HTTP/3 and gzip playlist delivery for its low-latency profile.
-The origin uses an explicit HTTP/1.1 builder and has no compression layer
-(`crates/sapflow-server/src/http.rs`). This supports the fallback hypothesis;
+The origin speaks HTTP/1.1 only and has no compression layer
+(`crates/sapflow-server/src/own_http.rs`; the sampled build used Hyper's
+HTTP/1.1 builder). This supports the fallback hypothesis;
 it does not establish Safari's internal decision or explain all 10.5 seconds.
 The sampled 0.585-second part hold-back meets the HLS draft's mandatory
 two-part-target minimum, but violates [Apple authoring specification

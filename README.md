@@ -80,10 +80,11 @@ macOS. The crates are version 0.1.0 on [crates.io](https://crates.io/crates/sapf
 | `sapflow-ffi` | Typed Swift/Kotlin boundary for the shared core |
 | `sapflow` | The server binary (`crates/sapflow-server`): ingest, HTTP, callbacks, recording |
 
-The server defaults to our Mio HTTP viewer backend. Select
-`SAPFLOW_HTTP_IMPL=hyper` to use Hyper explicitly. The shared protocol and
-compressed media libraries have no async runtime. The server still uses Tokio
-for ingest adapters, control and callbacks, timers and recording.
+The server serves viewers from our own Mio HTTP event loop; the Hyper viewer
+backend was removed, and `SAPFLOW_HTTP_IMPL=hyper` now stops startup. The
+shared protocol and compressed media libraries have no async runtime. The
+server still uses Tokio, with Axum and Hyper, for ingest adapters, the private
+control API and callbacks, timers and recording.
 
 `cargo add sapflow-srt` (or `sapflow-rtmp`, `sapflow-hls`) for a library,
 `cargo install sapflow` for the server. API docs are on
