@@ -254,10 +254,15 @@ struct Cohorts {
     slow: Arc<Mutex<Stats>>,
 }
 
+/// Drop pooled connections before the server's 60 second idle close, as
+/// browsers do, so a reuse never races the server closing the connection.
+pub(crate) const POOL_IDLE: Duration = Duration::from_secs(50);
+
 /// HTTP/1.1 over plain TCP, as the benchmarks have always run.
 fn plain_client() -> Client<HttpConnector, Empty<Bytes>> {
     Client::builder(TokioExecutor::new())
         .pool_max_idle_per_host(4)
+        .pool_idle_timeout(POOL_IDLE)
         .build_http()
 }
 
