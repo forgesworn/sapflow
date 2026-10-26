@@ -32,6 +32,37 @@ int main(void) {
     assert(byte.len == 1 && byte.ptr[0] == 2);
     sapflow_buffer_free(byte);
     sapflow_object_free(SAPFLOW_OBJECT_ENCODED_BUFFER, handle);
+
+    uint8_t direct_input[5] = {9, 1, 2, 3, 9};
+    assert(sapflow_encoded_buffer_new(direct_input + 1, 3, &handle, &error) == 0);
+    memset(direct_input, 0, sizeof(direct_input));
+    assert(sapflow_encoded_buffer_scalar(handle, SAPFLOW_OP_ENCODED_BUFFER_LEN, 0,
+        &value, &error) == 0);
+    assert(value == 3);
+    assert(sapflow_encoded_buffer_scalar(handle, SAPFLOW_OP_ENCODED_BUFFER_BYTE_AT, 1,
+        &value, &error) == 0);
+    assert(value == 2);
+    sapflow_object_free(SAPFLOW_OBJECT_ENCODED_BUFFER, handle);
+
+    uint8_t codec_input[10] = {2, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x88};
+    assert(sapflow_call(SAPFLOW_OP_MEDIA_CODEC_AAC, NULL, codec_input,
+        sizeof(codec_input), &created, &error) == 0);
+    memcpy(&raw, created.ptr, 8);
+    sapflow_buffer_free(created);
+    void *codec = (void *)(uintptr_t)raw;
+    uint8_t payload[5] = {9, 1, 2, 3, 9};
+    void *sample = NULL;
+    SapflowMediaSampleResult metadata = {0};
+    assert(sapflow_media_codec_sample(codec, payload + 1, 3, 0, 0, 1024,
+        48000, false, &sample, &error) == 0);
+    memset(payload, 0, sizeof(payload));
+    assert(sample != NULL);
+    assert(sapflow_media_sample_metadata(sample, &metadata, &error) == 0);
+    assert(metadata.len == 3 && metadata.pts == 0 && metadata.dts == 0);
+    assert(metadata.duration == 1024 && metadata.timescale == 48000);
+    assert(!metadata.is_video && !metadata.is_keyframe);
+    sapflow_object_free(SAPFLOW_OBJECT_MEDIA_SAMPLE, sample);
+    sapflow_object_free(SAPFLOW_OBJECT_MEDIA_CODEC, codec);
     puts("C ABI smoke passed");
     return 0;
 }

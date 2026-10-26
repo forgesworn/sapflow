@@ -55,6 +55,72 @@ static jlong handle_result(JNIEnv *env, int32_t rc, void *out, SapflowBuffer err
     return (jlong)(intptr_t)out;
 }
 
+static jlong scalar_result(JNIEnv *env, int32_t rc, uint64_t out, SapflowBuffer error) {
+    if (rc != 0) {
+        throw_native(env, error);
+        return 0;
+    }
+    return (jlong)out;
+}
+
+static int unit_result(JNIEnv *env, int32_t rc, SapflowBuffer error) {
+    if (rc == 0) return 1;
+    throw_native(env, error);
+    return 0;
+}
+
+static jbyteArray byte_array_result(JNIEnv *env, SapflowBuffer out) {
+    if (out.len > INT32_MAX) {
+        sapflow_buffer_free(out);
+        (*env)->ThrowNew(env, (*env)->FindClass(env, "java/lang/IllegalStateException"), "native response is too large");
+        return NULL;
+    }
+    jbyteArray result = (*env)->NewByteArray(env, (jsize)out.len);
+    if (result != NULL && out.len != 0) {
+        (*env)->SetByteArrayRegion(env, result, 0, (jsize)out.len, (const jbyte *)out.ptr);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->DeleteLocalRef(env, result);
+            result = NULL;
+        }
+    }
+    sapflow_buffer_free(out);
+    return result;
+}
+
+static jlongArray long_array_result(JNIEnv *env, const jlong *values, jsize len) {
+    jlongArray result = (*env)->NewLongArray(env, len);
+    if (result != NULL) {
+        (*env)->SetLongArrayRegion(env, result, 0, len, values);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->DeleteLocalRef(env, result);
+            result = NULL;
+        }
+    }
+    return result;
+}
+
+static jlongArray sample_result(JNIEnv *env, int32_t rc,
+    SapflowMediaSampleResult out, SapflowBuffer error, int owned_handle) {
+    if (rc != 0) {
+        throw_native(env, error);
+        return NULL;
+    }
+    if (out.handle == NULL && owned_handle) return NULL;
+    jlong values[] = {(jlong)(intptr_t)out.handle, (jlong)out.len,
+        (jlong)out.pts, (jlong)out.dts, (jlong)out.duration,
+        (jlong)out.timescale, out.is_video, out.is_keyframe};
+    jlongArray result = long_array_result(env, values, 8);
+    if (result == NULL && owned_handle && out.handle != NULL) {
+        sapflow_object_free(SAPFLOW_OBJECT_MEDIA_SAMPLE, out.handle);
+    }
+    return result;
+}
+
+static jlongArray optional_result(JNIEnv *env, SapflowOptionalU64 out) {
+    jlong values[] = {(jlong)out.value, out.present};
+    return long_array_result(env, values, 2);
+}
+
 JNIEXPORT jlong JNICALL JNI_NAME(directBufferAddress)(JNIEnv *env, jclass cls, jobject buffer) {
     (void)cls;
     return (jlong)(intptr_t)(*env)->GetDirectBufferAddress(env, buffer);
@@ -83,6 +149,20 @@ JNIEXPORT jlong JNICALL JNI_NAME(encodedBufferScalar)(JNIEnv *env, jclass cls,
     return (jlong)out;
 }
 
+JNIEXPORT jlong JNICALL JNI_NAME(mediaSampleScalar)(JNIEnv *env, jclass cls,
+    jlong sample, jint operation) {
+    (void)cls;
+    uint64_t out = 0;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_media_sample_scalar((const void *)(intptr_t)sample,
+        (uint32_t)operation, &out, &error);
+    if (rc != 0) {
+        throw_native(env, error);
+        return 0;
+    }
+    return (jlong)out;
+}
+
 JNIEXPORT jlong JNICALL JNI_NAME(mediaCodecSample)(JNIEnv *env, jclass cls,
     jlong codec, jlong address, jlong len, jlong pts, jlong dts,
     jint duration, jint timescale, jboolean keyframe) {
@@ -96,18 +176,23 @@ JNIEXPORT jlong JNICALL JNI_NAME(mediaCodecSample)(JNIEnv *env, jclass cls,
     return handle_result(env, rc, out, error);
 }
 
-JNIEXPORT jlong JNICALL JNI_NAME(mediaSampleScalar)(JNIEnv *env, jclass cls,
-    jlong sample, jint operation) {
+JNIEXPORT jlongArray JNICALL JNI_NAME(mediaSampleMetadata)(JNIEnv *env, jclass cls,
+    jlong sample) {
     (void)cls;
-    uint64_t out = 0;
+    SapflowMediaSampleResult out = {0};
     SapflowBuffer error = {0};
-    int32_t rc = sapflow_media_sample_scalar((const void *)(intptr_t)sample,
-        (uint32_t)operation, &out, &error);
-    if (rc != 0) {
-        throw_native(env, error);
-        return 0;
-    }
-    return (jlong)out;
+    int32_t rc = sapflow_media_sample_metadata((const void *)(intptr_t)sample, &out, &error);
+    return sample_result(env, rc, out, error, 0);
+}
+
+JNIEXPORT jlongArray JNICALL JNI_NAME(aacTimingViewsSample)(JNIEnv *env, jclass cls,
+    jlong views, jboolean publishing) {
+    (void)cls;
+    SapflowMediaSampleResult out = {0};
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_aac_timing_views_sample((const void *)(intptr_t)views,
+        publishing, &out, &error);
+    return sample_result(env, rc, out, error, 1);
 }
 
 JNIEXPORT jlongArray JNICALL JNI_NAME(sampleFanoutPush)(JNIEnv *env, jclass cls,
@@ -140,14 +225,285 @@ JNIEXPORT jlongArray JNICALL JNI_NAME(sampleFanoutPush)(JNIEnv *env, jclass cls,
     return result;
 }
 
-JNIEXPORT jlong JNICALL JNI_NAME(sampleFanoutPop)(JNIEnv *env, jclass cls,
+JNIEXPORT jlongArray JNICALL JNI_NAME(sampleFanoutPop)(JNIEnv *env, jclass cls,
     jlong fanout, jboolean recording, jlong now_ns) {
     (void)cls;
-    void *out = NULL;
+    SapflowMediaSampleResult out = {0};
     SapflowBuffer error = {0};
     int32_t rc = sapflow_sample_fanout_pop((const void *)(intptr_t)fanout,
         recording, (uint64_t)now_ns, &out, &error);
-    return handle_result(env, rc, out, error);
+    return sample_result(env, rc, out, error, 1);
+}
+
+static int valid_metadata(JNIEnv *env, jlongArray metadata, jsize required) {
+    if (metadata == NULL || (*env)->GetArrayLength(env, metadata) < required) {
+        (*env)->ThrowNew(env, (*env)->FindClass(env, "java/lang/IllegalArgumentException"), "invalid native metadata output");
+        return 0;
+    }
+    return 1;
+}
+
+JNIEXPORT void JNICALL JNI_NAME(recordingPush)(JNIEnv *env, jclass cls,
+    jlong muxer, jlong sample) {
+    (void)cls;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_recording_muxer_push((const void *)(intptr_t)muxer,
+        (const void *)(intptr_t)sample, &error);
+    (void)unit_result(env, rc, error);
+}
+
+static jbyteArray recording_result(JNIEnv *env, int32_t rc,
+    SapflowRecordingOutput out, SapflowBuffer error, jlongArray metadata,
+    uint32_t checkpoint_kind) {
+    if (rc != 0) {
+        throw_native(env, error);
+        return NULL;
+    }
+    if (!out.present) {
+        sapflow_buffer_free(out.bytes);
+        return NULL;
+    }
+    jlong values[] = {(jlong)(intptr_t)out.checkpoint, out.kind, out.rewrite_header};
+    (*env)->SetLongArrayRegion(env, metadata, 0, 3, values);
+    if ((*env)->ExceptionCheck(env)) {
+        sapflow_buffer_free(out.bytes);
+        if (out.checkpoint != NULL) sapflow_object_free(checkpoint_kind, out.checkpoint);
+        return NULL;
+    }
+    jbyteArray result = byte_array_result(env, out.bytes);
+    if (out.checkpoint != NULL) {
+        if (result == NULL) sapflow_object_free(checkpoint_kind, out.checkpoint);
+        /* A non-null checkpoint is returned through metadata and owned by Kotlin. */
+    }
+    return result;
+}
+
+JNIEXPORT jbyteArray JNICALL JNI_NAME(recordingTakeOutput)(JNIEnv *env, jclass cls,
+    jlong muxer, jint mode, jlongArray metadata) {
+    (void)cls;
+    if (!valid_metadata(env, metadata, 3) || mode < 0 || mode > 2) return NULL;
+    SapflowRecordingOutput out = {0};
+    SapflowBuffer error = {0};
+    const void *handle = (const void *)(intptr_t)muxer;
+    int32_t rc;
+    uint32_t kind;
+    if (mode == 0) {
+        rc = sapflow_recording_muxer_take_output(handle, &out, &error);
+        kind = SAPFLOW_OBJECT_RECORDING_CHECKPOINT;
+    } else if (mode == 1) {
+        rc = sapflow_recording_muxer_take_native_output(handle, &out, &error);
+        kind = SAPFLOW_OBJECT_RECORDING_CHECKPOINT;
+    } else {
+        rc = sapflow_recording_muxer_take_programme_output(handle, &out, &error);
+        kind = SAPFLOW_OBJECT_PROGRAMME_CHECKPOINT;
+    }
+    return recording_result(env, rc, out, error, metadata, kind);
+}
+
+JNIEXPORT void JNICALL JNI_NAME(rtmpFeed)(JNIEnv *env, jclass cls,
+    jlong publisher, jlong address, jlong len, jlong now_ms) {
+    (void)cls;
+    if (!valid_input(env, address, len)) return;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_rtmp_publisher_feed((const void *)(intptr_t)publisher,
+        (const uint8_t *)(intptr_t)address, (size_t)len, (uint64_t)now_ms, &error);
+    (void)unit_result(env, rc, error);
+}
+
+JNIEXPORT void JNICALL JNI_NAME(rtmpSend)(JNIEnv *env, jclass cls,
+    jlong publisher, jlong sample) {
+    (void)cls;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_rtmp_publisher_send((const void *)(intptr_t)publisher,
+        (const void *)(intptr_t)sample, &error);
+    (void)unit_result(env, rc, error);
+}
+
+JNIEXPORT jbyteArray JNICALL JNI_NAME(rtmpTakeOutput)(JNIEnv *env, jclass cls,
+    jlong publisher) {
+    (void)cls;
+    SapflowBuffer out = {0}, error = {0};
+    int32_t rc = sapflow_rtmp_publisher_take_output((const void *)(intptr_t)publisher,
+        &out, &error);
+    if (rc != 0) {
+        throw_native(env, error);
+        return NULL;
+    }
+    return byte_array_result(env, out);
+}
+
+JNIEXPORT jbyteArray JNICALL JNI_NAME(rtmpSendAndTakeOutput)(JNIEnv *env, jclass cls,
+    jlong publisher, jlong sample, jlong now_ms, jlongArray metadata) {
+    (void)cls;
+    if (!valid_metadata(env, metadata, 6)) return NULL;
+    SapflowRtmpSendOutput out = {0};
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_rtmp_publisher_send_and_take_output(
+        (const void *)(intptr_t)publisher, (const void *)(intptr_t)sample,
+        (uint64_t)now_ms, &out, &error);
+    if (rc != 0) {
+        throw_native(env, error);
+        return NULL;
+    }
+    jlong values[] = {(jlong)out.queued_output_bytes, (jlong)out.next_deadline_ms,
+        out.has_next_deadline, out.state, out.startup_submitted, out.peer_media_progress};
+    (*env)->SetLongArrayRegion(env, metadata, 0, 6, values);
+    if ((*env)->ExceptionCheck(env)) {
+        sapflow_buffer_free(out.output);
+        return NULL;
+    }
+    return byte_array_result(env, out.output);
+}
+
+JNIEXPORT jlongArray JNICALL JNI_NAME(rtmpNextDeadlineMs)(JNIEnv *env, jclass cls,
+    jlong publisher) {
+    (void)cls;
+    SapflowOptionalU64 out = {0};
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_rtmp_publisher_next_deadline_ms((const void *)(intptr_t)publisher,
+        &out, &error);
+    if (rc != 0) {
+        throw_native(env, error);
+        return NULL;
+    }
+    return optional_result(env, out);
+}
+
+JNIEXPORT jlong JNICALL JNI_NAME(rtmpQueuedOutputBytes)(JNIEnv *env, jclass cls,
+    jlong publisher) {
+    (void)cls;
+    uint64_t out = 0;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_rtmp_publisher_queued_output_bytes((const void *)(intptr_t)publisher,
+        &out, &error);
+    return scalar_result(env, rc, out, error);
+}
+
+JNIEXPORT jlong JNICALL JNI_NAME(rtmpState)(JNIEnv *env, jclass cls, jlong publisher) {
+    (void)cls;
+    uint64_t out = 0;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_rtmp_publisher_state((const void *)(intptr_t)publisher, &out, &error);
+    return scalar_result(env, rc, out, error);
+}
+
+JNIEXPORT void JNICALL JNI_NAME(srtPush)(JNIEnv *env, jclass cls,
+    jlong publisher, jlong sample, jlong now_us) {
+    (void)cls;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_srt_publisher_push((const void *)(intptr_t)publisher,
+        (const void *)(intptr_t)sample, (uint64_t)now_us, &error);
+    (void)unit_result(env, rc, error);
+}
+
+JNIEXPORT void JNICALL JNI_NAME(srtFeed)(JNIEnv *env, jclass cls,
+    jlong publisher, jbyteArray source, jlong address, jlong len, jlong now_us) {
+    (void)cls;
+    if (source == NULL || !valid_input(env, address, len)) return;
+    jsize source_len = (*env)->GetArrayLength(env, source);
+    jbyte *source_bytes = source_len == 0 ? NULL : (*env)->GetByteArrayElements(env, source, NULL);
+    if (source_len != 0 && source_bytes == NULL) return;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_srt_publisher_feed((const void *)(intptr_t)publisher,
+        (const uint8_t *)source_bytes, (size_t)source_len,
+        (const uint8_t *)(intptr_t)address, (size_t)len, (uint64_t)now_us, &error);
+    if (source_bytes != NULL) (*env)->ReleaseByteArrayElements(env, source, source_bytes, JNI_ABORT);
+    (void)unit_result(env, rc, error);
+}
+
+static void free_srt_datagram(SapflowSrtDatagram out) {
+    sapflow_buffer_free(out.destination);
+    sapflow_buffer_free(out.bytes);
+}
+
+JNIEXPORT jobjectArray JNICALL JNI_NAME(srtPollDatagram)(JNIEnv *env, jclass cls,
+    jlong publisher, jlong now_us) {
+    (void)cls;
+    SapflowSrtDatagram out = {0};
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_srt_publisher_poll_datagram((const void *)(intptr_t)publisher,
+        (uint64_t)now_us, &out, &error);
+    if (rc != 0) {
+        throw_native(env, error);
+        return NULL;
+    }
+    if (!out.present) {
+        free_srt_datagram(out);
+        return NULL;
+    }
+    char *destination = malloc(out.destination.len + 1);
+    if (destination == NULL) {
+        free_srt_datagram(out);
+        (*env)->ThrowNew(env, (*env)->FindClass(env, "java/lang/OutOfMemoryError"), "cannot allocate SRT destination");
+        return NULL;
+    }
+    for (size_t i = 0; i < out.destination.len; i++) destination[i] = (char)out.destination.ptr[i];
+    destination[out.destination.len] = '\0';
+    jstring address = (*env)->NewStringUTF(env, destination);
+    free(destination);
+    sapflow_buffer_free(out.destination);
+    if (address == NULL) {
+        sapflow_buffer_free(out.bytes);
+        return NULL;
+    }
+    jbyteArray bytes = byte_array_result(env, out.bytes);
+    if (bytes == NULL) {
+        (*env)->DeleteLocalRef(env, address);
+        return NULL;
+    }
+    jclass object_class = (*env)->FindClass(env, "java/lang/Object");
+    jobjectArray result = object_class == NULL ? NULL : (*env)->NewObjectArray(env, 2, object_class, NULL);
+    if (result != NULL) {
+        (*env)->SetObjectArrayElement(env, result, 0, address);
+        (*env)->SetObjectArrayElement(env, result, 1, bytes);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->DeleteLocalRef(env, result);
+            result = NULL;
+        }
+    }
+    (*env)->DeleteLocalRef(env, address);
+    (*env)->DeleteLocalRef(env, bytes);
+    if (object_class != NULL) (*env)->DeleteLocalRef(env, object_class);
+    return result;
+}
+
+JNIEXPORT jlong JNICALL JNI_NAME(srtIsReady)(JNIEnv *env, jclass cls, jlong publisher) {
+    (void)cls;
+    uint64_t out = 0;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_srt_publisher_is_ready((const void *)(intptr_t)publisher, &out, &error);
+    return scalar_result(env, rc, out, error);
+}
+
+JNIEXPORT jlong JNICALL JNI_NAME(srtHasImmediateWork)(JNIEnv *env, jclass cls, jlong publisher) {
+    (void)cls;
+    uint64_t out = 0;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_srt_publisher_has_immediate_work((const void *)(intptr_t)publisher,
+        &out, &error);
+    return scalar_result(env, rc, out, error);
+}
+
+JNIEXPORT jlongArray JNICALL JNI_NAME(srtNextDeadlineUs)(JNIEnv *env, jclass cls,
+    jlong publisher) {
+    (void)cls;
+    SapflowOptionalU64 out = {0};
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_srt_publisher_next_deadline_us((const void *)(intptr_t)publisher,
+        &out, &error);
+    if (rc != 0) {
+        throw_native(env, error);
+        return NULL;
+    }
+    return optional_result(env, out);
+}
+
+JNIEXPORT jlong JNICALL JNI_NAME(srtState)(JNIEnv *env, jclass cls, jlong publisher) {
+    (void)cls;
+    uint64_t out = 0;
+    SapflowBuffer error = {0};
+    int32_t rc = sapflow_srt_publisher_state((const void *)(intptr_t)publisher, &out, &error);
+    return scalar_result(env, rc, out, error);
 }
 
 JNIEXPORT jbyteArray JNICALL JNI_NAME(call)(JNIEnv *env, jclass cls,
@@ -168,21 +524,7 @@ JNIEXPORT jbyteArray JNICALL JNI_NAME(call)(JNIEnv *env, jclass cls,
         throw_native(env, error);
         return NULL;
     }
-    if (out.len > INT32_MAX) {
-        sapflow_buffer_free(out);
-        (*env)->ThrowNew(env, (*env)->FindClass(env, "java/lang/IllegalStateException"), "native response is too large");
-        return NULL;
-    }
-    jbyteArray result = (*env)->NewByteArray(env, (jsize)out.len);
-    if (result != NULL && out.len != 0) {
-        (*env)->SetByteArrayRegion(env, result, 0, (jsize)out.len, (const jbyte *)out.ptr);
-        if ((*env)->ExceptionCheck(env)) {
-            (*env)->DeleteLocalRef(env, result);
-            result = NULL;
-        }
-    }
-    sapflow_buffer_free(out);
-    return result;
+    return byte_array_result(env, out);
 }
 
 JNIEXPORT void JNICALL JNI_NAME(objectFree)(JNIEnv *env, jclass cls, jint kind, jlong handle) {

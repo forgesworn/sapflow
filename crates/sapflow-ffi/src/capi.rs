@@ -27,6 +27,117 @@ pub struct SapflowFanoutOutcome {
     pub recording_failed: bool,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SapflowMediaSampleResult {
+    pub handle: *mut c_void,
+    pub len: u64,
+    pub pts: i64,
+    pub dts: i64,
+    pub duration: u32,
+    pub timescale: u32,
+    pub is_video: bool,
+    pub is_keyframe: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SapflowOptionalU64 {
+    pub value: u64,
+    pub present: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SapflowRecordingOutput {
+    pub bytes: SapflowBuffer,
+    pub checkpoint: *mut c_void,
+    pub kind: u8,
+    pub rewrite_header: bool,
+    pub present: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SapflowRtmpSendOutput {
+    pub output: SapflowBuffer,
+    pub queued_output_bytes: u64,
+    pub next_deadline_ms: u64,
+    pub state: u8,
+    pub has_next_deadline: bool,
+    pub startup_submitted: bool,
+    pub peer_media_progress: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SapflowSrtDatagram {
+    pub destination: SapflowBuffer,
+    pub bytes: SapflowBuffer,
+    pub present: bool,
+}
+
+fn media_sample_metadata(sample: &MediaSample) -> SapflowMediaSampleResult {
+    SapflowMediaSampleResult {
+        handle: std::ptr::null_mut(),
+        len: sample.len(),
+        pts: sample.pts(),
+        dts: sample.dts(),
+        duration: sample.duration(),
+        timescale: sample.timescale(),
+        is_video: sample.is_video(),
+        is_keyframe: sample.is_keyframe(),
+    }
+}
+
+fn media_sample_result(sample: Arc<MediaSample>) -> SapflowMediaSampleResult {
+    let metadata = media_sample_metadata(&sample);
+    SapflowMediaSampleResult {
+        handle: Arc::into_raw(sample) as *mut c_void,
+        ..metadata
+    }
+}
+
+fn optional_sample_result(sample: Option<Arc<MediaSample>>) -> SapflowMediaSampleResult {
+    sample.map_or_else(Default::default, media_sample_result)
+}
+
+fn recording_output<T>(
+    bytes: Vec<u8>,
+    kind: NativeRecordingChunkKind,
+    rewrite_header: bool,
+    checkpoint: Option<Arc<T>>,
+) -> Result<SapflowRecordingOutput, String> {
+    let bytes = owned(bytes)?;
+    Ok(SapflowRecordingOutput {
+        bytes,
+        checkpoint: checkpoint.map_or(std::ptr::null_mut(), |value| {
+            Arc::into_raw(value) as *mut c_void
+        }),
+        kind: kind as u8,
+        rewrite_header,
+        present: true,
+    })
+}
+
+fn srt_datagram_result(value: Option<NativeSrtDatagram>) -> Result<SapflowSrtDatagram, String> {
+    let Some(value) = value else {
+        return Ok(SapflowSrtDatagram::default());
+    };
+    let destination = owned(value.destination.into_bytes())?;
+    match owned(value.bytes) {
+        Ok(bytes) => Ok(SapflowSrtDatagram {
+            destination,
+            bytes,
+            present: true,
+        }),
+        Err(error) => {
+            sapflow_buffer_free(destination);
+            Err(error)
+        }
+    }
+}
+
 fn owned(mut bytes: Vec<u8>) -> Result<SapflowBuffer, String> {
     if bytes.len() > MAX_OUTPUT_BYTES {
         return Err("BufferTooLarge".into());
@@ -661,6 +772,14 @@ fn hot<T>(out: *mut T, error: *mut SapflowBuffer, call: impl FnOnce() -> Result<
             1
         }
     }
+}
+
+fn hot_unit(error: *mut SapflowBuffer, call: impl FnOnce() -> Result<(), String>) -> i32 {
+    let mut out = 0u8;
+    hot(&mut out, error, || {
+        call()?;
+        Ok(0)
+    })
 }
 
 fn call(operation: u32, handle: *const c_void, bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -1406,6 +1525,36 @@ pub unsafe extern "C" fn sapflow_media_sample_scalar(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_media_sample_metadata(
+    sample: *const c_void,
+    out: *mut SapflowMediaSampleResult,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        Ok(media_sample_metadata(unsafe {
+            object::<MediaSample>(sample)?
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_aac_timing_views_sample(
+    views: *const c_void,
+    publishing: bool,
+    out: *mut SapflowMediaSampleResult,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        let views = unsafe { object::<NativeAacTimingViews>(views)? };
+        Ok(if publishing {
+            optional_sample_result(views.publishing_sample())
+        } else {
+            media_sample_result(views.recording_sample())
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sapflow_sample_fanout_push(
     fanout: *const c_void,
     sample: *const c_void,
@@ -1454,7 +1603,7 @@ pub unsafe extern "C" fn sapflow_sample_fanout_pop(
     fanout: *const c_void,
     recording: bool,
     now_ns: u64,
-    out: *mut *mut c_void,
+    out: *mut SapflowMediaSampleResult,
     error: *mut SapflowBuffer,
 ) -> i32 {
     hot(out, error, || {
@@ -1465,9 +1614,303 @@ pub unsafe extern "C" fn sapflow_sample_fanout_pop(
             fanout.pop_publishing(now_ns)
         }
         .map_err(debug_error)?;
-        Ok(sample.map_or(std::ptr::null_mut(), |value| {
-            Arc::into_raw(value) as *mut c_void
-        }))
+        Ok(optional_sample_result(sample))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_recording_muxer_push(
+    muxer: *const c_void,
+    sample: *const c_void,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot_unit(error, || {
+        unsafe { object::<NativeRecordingMuxer>(muxer)? }
+            .push(unsafe { clone_object(sample)? })
+            .map_err(debug_error)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_recording_muxer_take_output(
+    muxer: *const c_void,
+    out: *mut SapflowRecordingOutput,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        let value = unsafe { object::<NativeRecordingMuxer>(muxer)? }
+            .take_output()
+            .map_err(debug_error)?;
+        value.map_or_else(
+            || Ok(SapflowRecordingOutput::default()),
+            |value| {
+                let kind = if value.rewrite_header {
+                    NativeRecordingChunkKind::FinalHeader
+                } else {
+                    NativeRecordingChunkKind::Fragment
+                };
+                recording_output(
+                    value.bytes,
+                    kind,
+                    value.rewrite_header,
+                    None::<Arc<NativeRecordingCheckpoint>>,
+                )
+            },
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_recording_muxer_take_native_output(
+    muxer: *const c_void,
+    out: *mut SapflowRecordingOutput,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        let value = unsafe { object::<NativeRecordingMuxer>(muxer)? }
+            .take_native_output()
+            .map_err(debug_error)?;
+        value.map_or_else(
+            || Ok(SapflowRecordingOutput::default()),
+            |value| recording_output(value.bytes, value.kind, false, value.checkpoint),
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_recording_muxer_take_programme_output(
+    muxer: *const c_void,
+    out: *mut SapflowRecordingOutput,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        let value = unsafe { object::<NativeRecordingMuxer>(muxer)? }
+            .take_programme_output()
+            .map_err(debug_error)?;
+        value.map_or_else(
+            || Ok(SapflowRecordingOutput::default()),
+            |value| recording_output(value.bytes, value.kind, false, value.checkpoint),
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_rtmp_publisher_feed(
+    publisher: *const c_void,
+    bytes: *const u8,
+    len: usize,
+    now_ms: u64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot_unit(error, || {
+        unsafe { object::<NativeRtmpPublisher>(publisher)? }
+            .feed(unsafe { input(bytes, len)? }, now_ms)
+            .map_err(debug_error)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_rtmp_publisher_send(
+    publisher: *const c_void,
+    sample: *const c_void,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot_unit(error, || {
+        unsafe { object::<NativeRtmpPublisher>(publisher)? }
+            .send(unsafe { clone_object(sample)? })
+            .map_err(debug_error)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_rtmp_publisher_take_output(
+    publisher: *const c_void,
+    out: *mut SapflowBuffer,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        owned(
+            unsafe { object::<NativeRtmpPublisher>(publisher)? }
+                .take_output()
+                .map_err(debug_error)?,
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_rtmp_publisher_send_and_take_output(
+    publisher: *const c_void,
+    sample: *const c_void,
+    now_ms: u64,
+    out: *mut SapflowRtmpSendOutput,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        let value = unsafe { object::<NativeRtmpPublisher>(publisher)? }
+            .send_and_take_output(unsafe { clone_object(sample)? }, now_ms)
+            .map_err(debug_error)?;
+        Ok(SapflowRtmpSendOutput {
+            output: owned(value.output)?,
+            queued_output_bytes: value.queued_output_bytes,
+            next_deadline_ms: value.next_deadline_ms.unwrap_or(0),
+            state: value.state as u8,
+            has_next_deadline: value.next_deadline_ms.is_some(),
+            startup_submitted: value.startup_submitted,
+            peer_media_progress: value.peer_media_progress,
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_rtmp_publisher_next_deadline_ms(
+    publisher: *const c_void,
+    out: *mut SapflowOptionalU64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        let value = unsafe { object::<NativeRtmpPublisher>(publisher)? }
+            .next_deadline_ms()
+            .map_err(debug_error)?;
+        Ok(SapflowOptionalU64 {
+            value: value.unwrap_or(0),
+            present: value.is_some(),
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_rtmp_publisher_queued_output_bytes(
+    publisher: *const c_void,
+    out: *mut u64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        unsafe { object::<NativeRtmpPublisher>(publisher)? }
+            .queued_output_bytes()
+            .map_err(debug_error)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_rtmp_publisher_state(
+    publisher: *const c_void,
+    out: *mut u64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        Ok(unsafe { object::<NativeRtmpPublisher>(publisher)? }
+            .state()
+            .map_err(debug_error)? as u64)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_srt_publisher_push(
+    publisher: *const c_void,
+    sample: *const c_void,
+    now_us: u64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot_unit(error, || {
+        unsafe { object::<NativeSrtPublisher>(publisher)? }
+            .push(unsafe { clone_object(sample)? }, now_us)
+            .map_err(debug_error)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_srt_publisher_feed(
+    publisher: *const c_void,
+    source: *const u8,
+    source_len: usize,
+    bytes: *const u8,
+    len: usize,
+    now_us: u64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot_unit(error, || {
+        let source = std::str::from_utf8(unsafe { input(source, source_len)? })
+            .map_err(|_| "Argument")?
+            .to_owned();
+        unsafe { object::<NativeSrtPublisher>(publisher)? }
+            .feed(source, unsafe { input(bytes, len)? }, now_us)
+            .map_err(debug_error)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_srt_publisher_poll_datagram(
+    publisher: *const c_void,
+    now_us: u64,
+    out: *mut SapflowSrtDatagram,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        srt_datagram_result(
+            unsafe { object::<NativeSrtPublisher>(publisher)? }
+                .poll_datagram(now_us)
+                .map_err(debug_error)?,
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_srt_publisher_is_ready(
+    publisher: *const c_void,
+    out: *mut u64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        Ok(u64::from(
+            unsafe { object::<NativeSrtPublisher>(publisher)? }
+                .is_ready()
+                .map_err(debug_error)?,
+        ))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_srt_publisher_has_immediate_work(
+    publisher: *const c_void,
+    out: *mut u64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        Ok(u64::from(
+            unsafe { object::<NativeSrtPublisher>(publisher)? }
+                .has_immediate_work()
+                .map_err(debug_error)?,
+        ))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_srt_publisher_next_deadline_us(
+    publisher: *const c_void,
+    out: *mut SapflowOptionalU64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        let value = unsafe { object::<NativeSrtPublisher>(publisher)? }
+            .next_deadline_us()
+            .map_err(debug_error)?;
+        Ok(SapflowOptionalU64 {
+            value: value.unwrap_or(0),
+            present: value.is_some(),
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sapflow_srt_publisher_state(
+    publisher: *const c_void,
+    out: *mut u64,
+    error: *mut SapflowBuffer,
+) -> i32 {
+    hot(out, error, || {
+        Ok(unsafe { object::<NativeSrtPublisher>(publisher)? }
+            .state()
+            .map_err(debug_error)? as u64)
     })
 }
 
@@ -1630,6 +2073,292 @@ mod tests {
             )
         };
         assert_eq!(status, 1);
+    }
+
+    unsafe fn copied(buffer: SapflowBuffer) -> Vec<u8> {
+        let bytes = if buffer.ptr.is_null() {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec()
+        };
+        sapflow_buffer_free(buffer);
+        bytes
+    }
+
+    #[test]
+    fn direct_media_results_cache_metadata_and_own_caller_bytes() {
+        let mut encoded = [9, 1, 2, 3, 9];
+        let mut handle = std::ptr::null_mut();
+        let mut error = SapflowBuffer::default();
+        assert_eq!(
+            unsafe {
+                sapflow_encoded_buffer_new(encoded[1..4].as_ptr(), 3, &mut handle, &mut error)
+            },
+            0
+        );
+        encoded.fill(0);
+        let mut value = 0;
+        assert_eq!(
+            unsafe { sapflow_encoded_buffer_scalar(handle, 5, 1, &mut value, &mut error) },
+            0
+        );
+        assert_eq!(value, 2);
+        unsafe { sapflow_object_free(1, handle) };
+
+        let codec = Arc::into_raw(MediaCodec::aac(&[0x11, 0x88]).unwrap()) as *const c_void;
+        let mut payload = [9, 1, 2, 3, 9];
+        let mut created: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                sapflow_media_codec_sample(
+                    codec,
+                    payload[1..4].as_ptr(),
+                    3,
+                    12,
+                    12,
+                    1024,
+                    48_000,
+                    false,
+                    &mut created,
+                    &mut error,
+                )
+            },
+            0
+        );
+        payload.fill(0);
+        let mut metadata = SapflowMediaSampleResult::default();
+        assert_eq!(
+            unsafe { sapflow_media_sample_metadata(created, &mut metadata, &mut error) },
+            0
+        );
+        assert_eq!(metadata.len, 3);
+        assert_eq!((metadata.pts, metadata.dts), (12, 12));
+        assert_eq!((metadata.duration, metadata.timescale), (1024, 48_000));
+        assert!(!metadata.is_video && !metadata.is_keyframe);
+        let sample = unsafe { object::<MediaSample>(created) }.unwrap();
+        assert_eq!(sample.sample.payload().as_ref(), &[1, 2, 3]);
+
+        let fanout = Arc::into_raw(NativeSampleFanout::new(1024, 1024, 1000, false).unwrap())
+            as *const c_void;
+        let mut outcome = SapflowFanoutOutcome::default();
+        assert_eq!(
+            unsafe { sapflow_sample_fanout_push(fanout, created, 0, &mut outcome, &mut error) },
+            0
+        );
+        let mut popped = SapflowMediaSampleResult::default();
+        assert_eq!(
+            unsafe { sapflow_sample_fanout_pop(fanout, false, 1, &mut popped, &mut error) },
+            0
+        );
+        assert!(!popped.handle.is_null());
+        assert_eq!(popped.len, 3);
+        assert_eq!((popped.pts, popped.dts), (12, 12));
+        unsafe {
+            sapflow_object_free(3, popped.handle);
+            sapflow_object_free(3, created);
+            sapflow_object_free(5, fanout as *mut c_void);
+            sapflow_object_free(2, codec as *mut c_void);
+        }
+    }
+
+    #[test]
+    fn direct_recording_outputs_move_bytes_and_preserve_optional_checkpoints() {
+        let sample = MediaCodec::aac(&[0x11, 0x88])
+            .unwrap()
+            .sample(&[1, 2, 3], 0, 0, 1024, 48_000, false)
+            .unwrap();
+        let sample = Arc::into_raw(sample) as *const c_void;
+        let ordinary = NativeRecordingMuxer::new(false, true, 0, 4096, 100).unwrap();
+        let generic = NativeRecordingMuxer::new(false, true, 0, 4096, 100).unwrap();
+        generic
+            .push(unsafe { clone_object(sample) }.unwrap())
+            .unwrap();
+        let ordinary = Arc::into_raw(ordinary) as *const c_void;
+        let generic = Arc::into_raw(generic) as *const c_void;
+        let mut error = SapflowBuffer::default();
+        assert_eq!(
+            unsafe { sapflow_recording_muxer_push(ordinary, sample, &mut error) },
+            0
+        );
+        let mut output = SapflowRecordingOutput::default();
+        assert_eq!(
+            unsafe { sapflow_recording_muxer_take_output(ordinary, &mut output, &mut error) },
+            0
+        );
+        assert!(output.present && output.checkpoint.is_null());
+        let direct = unsafe { copied(output.bytes) };
+        let expected = invoke(58, generic, vec![]).unwrap();
+        let mut reader = Reader::new(&expected);
+        assert!(reader.bool().unwrap());
+        assert_eq!(direct, reader.bytes().unwrap());
+        assert!(!reader.bool().unwrap());
+        reader.finish().unwrap();
+        unsafe { sapflow_object_free(10, generic as *mut c_void) };
+        assert_eq!(
+            unsafe { sapflow_recording_muxer_take_output(ordinary, &mut output, &mut error) },
+            0
+        );
+        assert!(!output.present);
+
+        let native =
+            NativeRecordingMuxer::with_native_aac_timing(false, true, 0, 4096, 100).unwrap();
+        native.begin_native_audio(0).unwrap();
+        let native = Arc::into_raw(native) as *const c_void;
+        assert_eq!(
+            unsafe { sapflow_recording_muxer_push(native, sample, &mut error) },
+            0
+        );
+        assert_eq!(
+            unsafe { sapflow_recording_muxer_take_native_output(native, &mut output, &mut error) },
+            0
+        );
+        assert!(output.present && output.checkpoint.is_null());
+        sapflow_buffer_free(output.bytes);
+        assert_eq!(invoke(63, native, vec![1]).unwrap(), Vec::<u8>::new());
+        let mut checkpoints = 0;
+        loop {
+            assert_eq!(
+                unsafe {
+                    sapflow_recording_muxer_take_native_output(native, &mut output, &mut error)
+                },
+                0
+            );
+            if !output.present {
+                break;
+            }
+            sapflow_buffer_free(output.bytes);
+            if !output.checkpoint.is_null() {
+                checkpoints += 1;
+                unsafe { sapflow_object_free(6, output.checkpoint) };
+            }
+        }
+        assert_eq!(checkpoints, 1);
+        unsafe {
+            sapflow_object_free(10, ordinary as *mut c_void);
+            sapflow_object_free(10, native as *mut c_void);
+            sapflow_object_free(3, sample as *mut c_void);
+        }
+    }
+
+    #[test]
+    fn direct_protocol_scalars_and_owned_outputs_match_generic_calls() {
+        let direct = Arc::into_raw(
+            NativeRtmpPublisher::new(
+                "live".into(),
+                "key".into(),
+                "rtmp://origin.invalid/live".into(),
+                0,
+                0,
+            )
+            .unwrap(),
+        ) as *const c_void;
+        let generic = Arc::into_raw(
+            NativeRtmpPublisher::new(
+                "live".into(),
+                "key".into(),
+                "rtmp://origin.invalid/live".into(),
+                0,
+                0,
+            )
+            .unwrap(),
+        ) as *const c_void;
+        let mut error = SapflowBuffer::default();
+        let mut scalar = 0;
+        assert_eq!(
+            unsafe { sapflow_rtmp_publisher_queued_output_bytes(direct, &mut scalar, &mut error) },
+            0
+        );
+        assert_eq!(invoke(77, generic, vec![]).unwrap(), scalar.to_le_bytes());
+        assert_eq!(
+            unsafe { sapflow_rtmp_publisher_state(direct, &mut scalar, &mut error) },
+            0
+        );
+        assert_eq!(invoke(78, generic, vec![]).unwrap(), [scalar as u8]);
+        let mut output = SapflowBuffer::default();
+        assert_eq!(
+            unsafe { sapflow_rtmp_publisher_take_output(direct, &mut output, &mut error) },
+            0
+        );
+        assert_eq!(
+            unsafe { copied(output) },
+            invoke(76, generic, vec![]).unwrap()
+        );
+        unsafe {
+            sapflow_object_free(11, direct as *mut c_void);
+            sapflow_object_free(11, generic as *mut c_void);
+        }
+
+        let config = || NativeSrtConfig {
+            destination: "127.0.0.1:9000".into(),
+            stream_id: "publish:test".into(),
+            ..NativeSrtConfig::default()
+        };
+        let direct = Arc::into_raw(
+            NativeSrtPublisher::new(
+                config(),
+                None,
+                Some(MediaCodec::aac(&[0x11, 0x88]).unwrap()),
+                None,
+                1_000_000,
+            )
+            .unwrap(),
+        ) as *const c_void;
+        let generic = Arc::into_raw(
+            NativeSrtPublisher::new(
+                config(),
+                None,
+                Some(MediaCodec::aac(&[0x11, 0x88]).unwrap()),
+                None,
+                1_000_000,
+            )
+            .unwrap(),
+        ) as *const c_void;
+        let mut datagram = SapflowSrtDatagram::default();
+        assert_eq!(
+            unsafe {
+                sapflow_srt_publisher_poll_datagram(direct, 1_000_000, &mut datagram, &mut error)
+            },
+            0
+        );
+        assert!(datagram.present);
+        assert_eq!(unsafe { copied(datagram.destination) }, b"127.0.0.1:9000");
+        let direct_bytes = unsafe { copied(datagram.bytes) };
+        let expected = invoke(103, generic, 1_000_000u64.to_le_bytes().to_vec()).unwrap();
+        let mut reader = Reader::new(&expected);
+        assert!(reader.bool().unwrap());
+        assert_eq!(reader.string().unwrap(), "127.0.0.1:9000");
+        assert_eq!(direct_bytes.len(), reader.bytes().unwrap().len());
+        assert_eq!(&direct_bytes[..4], &[128, 0, 0, 0]);
+        reader.finish().unwrap();
+        for len in [1316, 1500] {
+            let bytes = vec![0; len];
+            assert_eq!(
+                unsafe {
+                    sapflow_srt_publisher_feed(
+                        direct,
+                        b"127.0.0.1:9001".as_ptr(),
+                        14,
+                        bytes.as_ptr(),
+                        len,
+                        1_000_000,
+                        &mut error,
+                    )
+                },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { object::<NativeSrtPublisher>(direct) }
+                .unwrap()
+                .stats()
+                .unwrap()
+                .stray_datagrams,
+            2
+        );
+        unsafe {
+            sapflow_object_free(13, direct as *mut c_void);
+            sapflow_object_free(13, generic as *mut c_void);
+        }
     }
 
     #[test]

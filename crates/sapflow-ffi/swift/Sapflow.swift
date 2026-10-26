@@ -35,11 +35,17 @@ private func hotHandle(_ kind: ErrorKind, _ body: (UnsafeMutablePointer<UnsafeMu
     guard let out else { throw CapiFailure(code: "Argument") }
     return out
 }
-private func hotScalar(_ raw: UnsafeRawPointer?, _ operation: UInt32) throws -> UInt64 {
-    var out: UInt64 = 0, error = SapflowBuffer()
-    let status = sapflow_media_sample_scalar(raw, operation, &out, &error)
-    if status != 0 { throw nativeError(.binding, String(decoding: take(error), as: UTF8.self)) }
+private func hotSample(_ kind: ErrorKind, _ body: (UnsafeMutablePointer<SapflowMediaSampleResult>, UnsafeMutablePointer<SapflowBuffer>) -> Int32) throws -> SapflowMediaSampleResult {
+    var out = SapflowMediaSampleResult(), error = SapflowBuffer()
+    let status = body(&out, &error)
+    if status != 0 { throw nativeError(kind, String(decoding: take(error), as: UTF8.self)) }
     return out
+}
+private func sampleMetadata(_ raw: UnsafeRawPointer?) throws -> SapflowMediaSampleResult {
+    try hotSample(.binding) { out, error in sapflow_media_sample_metadata(raw, out, error) }
+}
+private func check(_ status: Int32, _ kind: ErrorKind, _ error: SapflowBuffer) throws {
+    if status != 0 { throw nativeError(kind, String(decoding: take(error), as: UTF8.self)) }
 }
 private func encodedScalar(_ raw: UnsafeRawPointer?, _ operation: UInt32, _ index: UInt64 = 0) throws -> UInt64 {
     var out: UInt64 = 0, error = SapflowBuffer()
@@ -222,14 +228,20 @@ private extension Writer {
 public protocol EncodedBufferProtocol: AnyObject, Sendable { func len() -> UInt64; func isEmpty() -> Bool; func byteAt(index: UInt64) throws -> UInt8 }
 open class EncodedBuffer: NativeHandle, EncodedBufferProtocol, @unchecked Sendable {
     public struct NoHandle { public init() {} }
-    required public init(unsafeFromHandle handle: UInt64) { super.init(kind: 1, raw: UnsafeMutableRawPointer(bitPattern: UInt(handle))) }
-    public init(noHandle: NoHandle) { super.init(kind: 1, raw: nil) }
+    private let length: UInt64
+    required public init(unsafeFromHandle handle: UInt64) {
+        let raw = UnsafeMutableRawPointer(bitPattern: UInt(handle))
+        length = raw == nil ? 0 : try! encodedScalar(raw, 3)
+        super.init(kind: 1, raw: raw)
+    }
+    public init(noHandle: NoHandle) { length = 0; super.init(kind: 1, raw: nil) }
+    private init(handle: UnsafeMutableRawPointer, length: UInt64) { self.length = length; super.init(kind: 1, raw: handle) }
     public convenience init(bytes: Data) throws {
         let handle = try withData(bytes) { ptr, len in try hotHandle(.binding) { out, error in sapflow_encoded_buffer_new(ptr, len, out, error) } }
-        self.init(unsafeFromHandle: UInt64(UInt(bitPattern: handle)))
+        self.init(handle: handle, length: UInt64(bytes.count))
     }
-    open func len() -> UInt64 { try! encodedScalar(raw, 3) }
-    open func isEmpty() -> Bool { (try! encodedScalar(raw, 4)) != 0 }
+    open func len() -> UInt64 { length }
+    open func isEmpty() -> Bool { length == 0 }
     open func byteAt(index: UInt64) throws -> UInt8 { try UInt8(encodedScalar(raw, 5, index)) }
 }
 public func sdkAbiVersion() -> UInt32 { try! response(try! invoke(1, .binding)) { try $0.u32() } }
@@ -237,13 +249,25 @@ public func sdkAbiVersion() -> UInt32 { try! response(try! invoke(1, .binding)) 
 public protocol MediaCodecProtocol: AnyObject, Sendable { func sample(bytes: Data, pts: Int64, dts: Int64, duration: UInt32, timescale: UInt32, keyframe: Bool) throws -> MediaSample }
 open class MediaCodec: NativeHandle, MediaCodecProtocol, @unchecked Sendable {
     public struct NoHandle { public init() {} }
-    required public init(unsafeFromHandle handle: UInt64) { super.init(kind: 2, raw: UnsafeMutableRawPointer(bitPattern: UInt(handle))) }
-    public init(noHandle: NoHandle) { super.init(kind: 2, raw: nil) }
-    public static func h264(sps: Data, pps: Data) throws -> MediaCodec { MediaCodec(unsafeFromHandle: UInt64(UInt(bitPattern: try newHandle(6, .binding, request { $0.bytes(sps);$0.bytes(pps) })))) }
-    public static func aac(asc: Data) throws -> MediaCodec { MediaCodec(unsafeFromHandle: UInt64(UInt(bitPattern: try newHandle(7, .binding, request { $0.bytes(asc) })))) }
+    private let video: Bool?
+    required public init(unsafeFromHandle handle: UInt64) { video = nil; super.init(kind: 2, raw: UnsafeMutableRawPointer(bitPattern: UInt(handle))) }
+    public init(noHandle: NoHandle) { video = nil; super.init(kind: 2, raw: nil) }
+    private init(handle: UnsafeMutableRawPointer, video: Bool) { self.video = video; super.init(kind: 2, raw: handle) }
+    public static func h264(sps: Data, pps: Data) throws -> MediaCodec { MediaCodec(handle: try newHandle(6, .binding, request { $0.bytes(sps);$0.bytes(pps) }), video: true) }
+    public static func aac(asc: Data) throws -> MediaCodec { MediaCodec(handle: try newHandle(7, .binding, request { $0.bytes(asc) }), video: false) }
     open func sample(bytes: Data, pts: Int64, dts: Int64, duration: UInt32, timescale: UInt32, keyframe: Bool) throws -> MediaSample {
         let handle = try withData(bytes) { ptr, len in try hotHandle(.binding) { out, error in sapflow_media_codec_sample(raw, ptr, len, pts, dts, duration, timescale, keyframe, out, error) } }
-        return MediaSample(unsafeFromHandle: UInt64(UInt(bitPattern: handle)))
+        guard let video else { return MediaSample(unsafeFromHandle: UInt64(UInt(bitPattern: handle))) }
+        var result = SapflowMediaSampleResult()
+        result.handle = handle
+        result.len = UInt64(bytes.count)
+        result.pts = pts
+        result.dts = dts
+        result.duration = duration
+        result.timescale = timescale
+        result.is_video = video
+        result.is_keyframe = keyframe
+        return MediaSample(result: result)
     }
 }
 public protocol MediaSampleProtocol: AnyObject, Sendable {
@@ -253,20 +277,26 @@ public protocol MediaSampleProtocol: AnyObject, Sendable {
 }
 open class MediaSample: NativeHandle, MediaSampleProtocol, @unchecked Sendable {
     public struct NoHandle { public init() {} }
-    required public init(unsafeFromHandle handle: UInt64) { super.init(kind: 3, raw: UnsafeMutableRawPointer(bitPattern: UInt(handle))) }
-    public init(noHandle: NoHandle) { super.init(kind: 3, raw: nil) }
+    private let metadata: SapflowMediaSampleResult
+    required public init(unsafeFromHandle handle: UInt64) {
+        let raw = UnsafeMutableRawPointer(bitPattern: UInt(handle))
+        metadata = raw == nil ? SapflowMediaSampleResult() : try! sampleMetadata(raw)
+        super.init(kind: 3, raw: raw)
+    }
+    public init(noHandle: NoHandle) { metadata = SapflowMediaSampleResult(); super.init(kind: 3, raw: nil) }
+    fileprivate init(result: SapflowMediaSampleResult) { metadata = result; super.init(kind: 3, raw: result.handle) }
     open func aacTimingViews(producerGeneration: UInt64, nativePtsUs: Int64, publishingPts: Int64?) throws -> NativeAacTimingViews {
         NativeAacTimingViews(unsafeFromHandle: try response(try invoke(9, .binding, raw, request { $0.u64(producerGeneration);$0.i64(nativePtsUs);$0.optional(publishingPts) })) { try $0.handle() })
     }
     open func aacSourceInfo() -> NativeAacSampleSourceInfo? { try! response(try! invoke(10, .binding, raw)) { try $0.bool() ? .init(producerGeneration: $0.u64(), nativePtsUs: $0.i64(), originalPts: $0.i64(), originalDts: $0.i64(), originalDuration: $0.u32(), originalTimescale: $0.u32()) : nil } }
-    open func len() -> UInt64 { try! hotScalar(raw, 11) }
-    open func isEmpty() -> Bool { (try! hotScalar(raw, 12)) != 0 }
-    open func isVideo() -> Bool { (try! hotScalar(raw, 13)) != 0 }
-    open func isKeyframe() -> Bool { (try! hotScalar(raw, 14)) != 0 }
-    open func pts() -> Int64 { Int64(bitPattern: try! hotScalar(raw, 15)) }
-    open func dts() -> Int64 { Int64(bitPattern: try! hotScalar(raw, 16)) }
-    open func duration() -> UInt32 { UInt32(try! hotScalar(raw, 17)) }
-    open func timescale() -> UInt32 { UInt32(try! hotScalar(raw, 18)) }
+    open func len() -> UInt64 { metadata.len }
+    open func isEmpty() -> Bool { metadata.len == 0 }
+    open func isVideo() -> Bool { metadata.is_video }
+    open func isKeyframe() -> Bool { metadata.is_keyframe }
+    open func pts() -> Int64 { metadata.pts }
+    open func dts() -> Int64 { metadata.dts }
+    open func duration() -> UInt32 { metadata.duration }
+    open func timescale() -> UInt32 { metadata.timescale }
 }
 public protocol NativeAacTimingViewsProtocol: AnyObject, Sendable { func sourceInfo() -> NativeAacSampleSourceInfo; func recordingSample() -> MediaSample; func publishingSample() -> MediaSample? }
 open class NativeAacTimingViews: NativeHandle, NativeAacTimingViewsProtocol, @unchecked Sendable {
@@ -274,8 +304,11 @@ open class NativeAacTimingViews: NativeHandle, NativeAacTimingViewsProtocol, @un
     required public init(unsafeFromHandle handle: UInt64) { super.init(kind: 4, raw: UnsafeMutableRawPointer(bitPattern: UInt(handle))) }
     public init(noHandle: NoHandle) { super.init(kind: 4, raw: nil) }
     open func sourceInfo() -> NativeAacSampleSourceInfo { try! response(try! invoke(19, .binding, raw)) { try .init(producerGeneration: $0.u64(), nativePtsUs: $0.i64(), originalPts: $0.i64(), originalDts: $0.i64(), originalDuration: $0.u32(), originalTimescale: $0.u32()) } }
-    open func recordingSample() -> MediaSample { MediaSample(unsafeFromHandle: try! response(try! invoke(20, .binding, raw)) { try $0.handle() }) }
-    open func publishingSample() -> MediaSample? { try! response(try! invoke(21, .binding, raw)) { try $0.optionalHandle().map(MediaSample.init(unsafeFromHandle:)) } }
+    open func recordingSample() -> MediaSample { MediaSample(result: try! hotSample(.binding) { out, error in sapflow_aac_timing_views_sample(raw, false, out, error) }) }
+    open func publishingSample() -> MediaSample? {
+        let result = try! hotSample(.binding) { out, error in sapflow_aac_timing_views_sample(raw, true, out, error) }
+        return result.handle.map { _ in MediaSample(result: result) }
+    }
 }
 public protocol NativeSampleFanoutProtocol: AnyObject, Sendable {
     func pushAacTimingViews(views: NativeAacTimingViews, nowNs: UInt64) throws -> FanoutOutcome
@@ -296,10 +329,8 @@ open class NativeSampleFanout: NativeHandle, NativeSampleFanoutProtocol, @unchec
         return FanoutOutcome(publishingQueued: out.publishing_queued, recordingQueued: out.recording_queued, publishingWaitingKeyframe: out.publishing_waiting_keyframe, publishingOverflows: out.publishing_overflows, recordingFailed: out.recording_failed)
     }
     private func pop(recording: Bool, nowNs: UInt64) throws -> MediaSample? {
-        var out: UnsafeMutableRawPointer?, error = SapflowBuffer()
-        let status = sapflow_sample_fanout_pop(raw, recording, nowNs, &out, &error)
-        if status != 0 { throw nativeError(.binding, String(decoding: take(error), as: UTF8.self)) }
-        return out.map { MediaSample(unsafeFromHandle: UInt64(UInt(bitPattern: $0))) }
+        let result = try hotSample(.binding) { out, error in sapflow_sample_fanout_pop(raw, recording, nowNs, out, error) }
+        return result.handle.map { _ in MediaSample(result: result) }
     }
     open func pushAacTimingViews(views: NativeAacTimingViews, nowNs: UInt64) throws -> FanoutOutcome { try outcome(views.raw, nowNs, aacViews: true) }
     open func push(sample: MediaSample, nowNs: UInt64) throws -> FanoutOutcome { try outcome(sample.raw, nowNs, aacViews: false) }
@@ -380,11 +411,34 @@ open class NativeRecordingMuxer: NativeHandle, NativeRecordingMuxerProtocol, @un
     open func finishNative(outcome: NativeRecordingCompletion) throws { _ = try invoke(63, .recording, raw, request { $0.u8(outcome == .complete ? 0 : 1) }) }
     open func finishProgramme(outcome: NativeProgrammeCompletion) throws { _ = try invoke(53, .recording, raw, request { $0.u8(outcome == .completeSubmittedWindow ? 0 : 1) }) }
     open func programmeCheckpointHeader(checkpoint: NativeProgrammeCheckpoint) throws -> Data { try invoke(51, .recording, raw, request { $0.handle(checkpoint) }) }
-    open func push(sample: MediaSample) throws { _ = try invoke(57, .recording, raw, request { $0.handle(sample) }) }
+    open func push(sample: MediaSample) throws {
+        var error = SapflowBuffer()
+        try check(sapflow_recording_muxer_push(raw, sample.raw, &error), .recording, error)
+    }
     open func stats() throws -> NativeRecordingStats { try response(try invoke(65, .recording, raw)) { try .init(bufferedBytes: $0.u64(), bufferedSamples: $0.u64(), queuedOutputBytes: $0.u64(), acceptedSamples: $0.u64(), fragments: $0.u64(), durationMs: $0.u64(), finished: $0.bool()) } }
-    open func takeNativeOutput() throws -> NativeRecordingChunk? { try response(try invoke(59, .recording, raw)) { r in try r.bool() ? .init(bytes: r.bytes(), kind: indexed(chunkKinds, r.u8()), checkpoint: r.optionalHandle().map(NativeRecordingCheckpoint.init(unsafeFromHandle:))) : nil } }
-    open func takeOutput() throws -> RecordingWrite? { try response(try invoke(58, .recording, raw)) { try $0.bool() ? .init(bytes: $0.bytes(), rewriteHeader: $0.bool()) : nil } }
-    open func takeProgrammeOutput() throws -> NativeProgrammeChunk? { try response(try invoke(50, .recording, raw)) { r in try r.bool() ? .init(bytes: r.bytes(), kind: indexed(chunkKinds, r.u8()), checkpoint: r.optionalHandle().map(NativeProgrammeCheckpoint.init(unsafeFromHandle:))) : nil } }
+    private func takeChunk(_ mode: Int) throws -> (Data, SapflowRecordingOutput)? {
+        var out = SapflowRecordingOutput(), error = SapflowBuffer()
+        let status = switch mode {
+        case 0: sapflow_recording_muxer_take_output(raw, &out, &error)
+        case 1: sapflow_recording_muxer_take_native_output(raw, &out, &error)
+        default: sapflow_recording_muxer_take_programme_output(raw, &out, &error)
+        }
+        try check(status, .recording, error)
+        guard out.present else { return nil }
+        return (take(out.bytes), out)
+    }
+    open func takeNativeOutput() throws -> NativeRecordingChunk? {
+        guard let (bytes, out) = try takeChunk(1) else { return nil }
+        return NativeRecordingChunk(bytes: bytes, kind: try indexed(chunkKinds, Int(out.kind)), checkpoint: out.checkpoint.map { NativeRecordingCheckpoint(unsafeFromHandle: UInt64(UInt(bitPattern: $0))) })
+    }
+    open func takeOutput() throws -> RecordingWrite? {
+        guard let (bytes, out) = try takeChunk(0) else { return nil }
+        return RecordingWrite(bytes: bytes, rewriteHeader: out.rewrite_header)
+    }
+    open func takeProgrammeOutput() throws -> NativeProgrammeChunk? {
+        guard let (bytes, out) = try takeChunk(2) else { return nil }
+        return NativeProgrammeChunk(bytes: bytes, kind: try indexed(chunkKinds, Int(out.kind)), checkpoint: out.checkpoint.map { NativeProgrammeCheckpoint(unsafeFromHandle: UInt64(UInt(bitPattern: $0))) })
+    }
 }
 public func decodeRecordingCheckpoint(bytes: Data, expectedRecordingBinding: Data, expectedSourceFileBinding: Data) throws -> DecodedRecordingCheckpoint { DecodedRecordingCheckpoint(unsafeFromHandle: UInt64(UInt(bitPattern: try newHandle(66, .checkpoint, request { $0.bytes(bytes);$0.bytes(expectedRecordingBinding);$0.bytes(expectedSourceFileBinding) })))) }
 public func validateRecordingCheckpointSuccessor(prior: DecodedRecordingCheckpoint, next: DecodedRecordingCheckpoint) throws { _ = try invoke(67, .checkpoint, nil, request { $0.handle(prior);$0.handle(next) }) }
@@ -405,14 +459,40 @@ open class NativeRtmpPublisher: NativeHandle, NativeRtmpPublisherProtocol, @unch
     public init(app: String, streamKey: String, tcUrl: String, mediaEpochNs: UInt64, nowMs: UInt64) throws { super.init(kind: 11, raw: try newHandle(70, .rtmp, request { $0.string(app);$0.string(streamKey);$0.string(tcUrl);$0.u64(mediaEpochNs);$0.u64(nowMs) })) }
     open func declareTracks(hasVideo: Bool, hasAudio: Bool) throws { _ = try invoke(71, .rtmp, raw, request { $0.bool(hasVideo);$0.bool(hasAudio) }) }
     open func pollEvent() throws -> NativeRtmpEvent? { try response(try invoke(72, .rtmp, raw)) { try $0.bool() ? (try indexed([NativeRtmpEvent.sending, .peerMediaProgress], $0.u8())) : nil } }
-    open func feed(bytes: Data, nowMs: UInt64) throws { _ = try invoke(73, .rtmp, raw, request { $0.bytes(bytes);$0.u64(nowMs) }) }
+    open func feed(bytes: Data, nowMs: UInt64) throws {
+        var error = SapflowBuffer()
+        try withData(bytes) { ptr, len in try check(sapflow_rtmp_publisher_feed(raw, ptr, len, nowMs, &error), .rtmp, error) }
+    }
     open func tick(nowMs: UInt64) throws { _ = try invoke(74, .rtmp, raw, request { $0.u64(nowMs) }) }
-    open func nextDeadlineMs() throws -> UInt64? { try response(try invoke(75, .rtmp, raw)) { try $0.optionalU64() } }
-    open func takeOutput() throws -> Data { try invoke(76, .rtmp, raw) }
-    open func queuedOutputBytes() throws -> UInt64 { try response(try invoke(77, .rtmp, raw)) { try $0.u64() } }
-    open func state() throws -> NativeRtmpState { try response(try invoke(78, .rtmp, raw)) { try indexed(rtmpStates, $0.u8()) } }
-    open func send(sample: MediaSample) throws { _ = try invoke(79, .rtmp, raw, request { $0.handle(sample) }) }
-    open func sendAndTakeOutput(sample: MediaSample, nowMs: UInt64) throws -> NativeRtmpSendOutput { try response(try invoke(80, .rtmp, raw, request { $0.handle(sample);$0.u64(nowMs) })) { try .init(output: $0.bytes(), queuedOutputBytes: $0.u64(), nextDeadlineMs: $0.optionalU64(), state: indexed(rtmpStates, $0.u8()), startupSubmitted: $0.bool(), peerMediaProgress: $0.bool()) } }
+    open func nextDeadlineMs() throws -> UInt64? {
+        var out = SapflowOptionalU64(), error = SapflowBuffer()
+        try check(sapflow_rtmp_publisher_next_deadline_ms(raw, &out, &error), .rtmp, error)
+        return out.present ? out.value : nil
+    }
+    open func takeOutput() throws -> Data {
+        var out = SapflowBuffer(), error = SapflowBuffer()
+        try check(sapflow_rtmp_publisher_take_output(raw, &out, &error), .rtmp, error)
+        return take(out)
+    }
+    open func queuedOutputBytes() throws -> UInt64 {
+        var out: UInt64 = 0, error = SapflowBuffer()
+        try check(sapflow_rtmp_publisher_queued_output_bytes(raw, &out, &error), .rtmp, error)
+        return out
+    }
+    open func state() throws -> NativeRtmpState {
+        var out: UInt64 = 0, error = SapflowBuffer()
+        try check(sapflow_rtmp_publisher_state(raw, &out, &error), .rtmp, error)
+        return try indexed(rtmpStates, Int(out))
+    }
+    open func send(sample: MediaSample) throws {
+        var error = SapflowBuffer()
+        try check(sapflow_rtmp_publisher_send(raw, sample.raw, &error), .rtmp, error)
+    }
+    open func sendAndTakeOutput(sample: MediaSample, nowMs: UInt64) throws -> NativeRtmpSendOutput {
+        var out = SapflowRtmpSendOutput(), error = SapflowBuffer()
+        try check(sapflow_rtmp_publisher_send_and_take_output(raw, sample.raw, nowMs, &out, &error), .rtmp, error)
+        return NativeRtmpSendOutput(output: take(out.output), queuedOutputBytes: out.queued_output_bytes, nextDeadlineMs: out.has_next_deadline ? out.next_deadline_ms : nil, state: try indexed(rtmpStates, Int(out.state)), startupSubmitted: out.startup_submitted, peerMediaProgress: out.peer_media_progress)
+    }
     open func finish() throws { _ = try invoke(81, .rtmp, raw) }
     open func cancel() throws { _ = try invoke(82, .rtmp, raw) }
 }
@@ -461,14 +541,46 @@ open class NativeSrtPublisher: NativeHandle, NativeSrtPublisherProtocol, @unchec
     required public init(unsafeFromHandle handle: UInt64) { super.init(kind: 13, raw: UnsafeMutableRawPointer(bitPattern: UInt(handle))) }
     public init(noHandle: NoHandle) { super.init(kind: 13, raw: nil) }
     public init(config: NativeSrtConfig, video: MediaCodec?, audio: MediaCodec?, passphrase: Data?, nowUs: UInt64) throws { super.init(kind: 13, raw: try newHandle(99, .srt, request { $0.srtConfig(config);$0.optional(video);$0.optional(audio);$0.bool(passphrase != nil);if let passphrase { $0.bytes(passphrase) };$0.u64(nowUs) })) }
-    open func push(sample: MediaSample, nowUs: UInt64) throws { _ = try invoke(100, .srt, raw, request { $0.handle(sample);$0.u64(nowUs) }) }
-    open func feed(source: String, bytes: Data, nowUs: UInt64) throws { _ = try invoke(101, .srt, raw, request { $0.string(source);$0.bytes(bytes);$0.u64(nowUs) }) }
+    open func push(sample: MediaSample, nowUs: UInt64) throws {
+        var error = SapflowBuffer()
+        try check(sapflow_srt_publisher_push(raw, sample.raw, nowUs, &error), .srt, error)
+    }
+    open func feed(source: String, bytes: Data, nowUs: UInt64) throws {
+        var error = SapflowBuffer()
+        let source = Data(source.utf8)
+        try withData(source) { sourcePtr, sourceLen in
+            try withData(bytes) { ptr, len in
+                try check(sapflow_srt_publisher_feed(raw, sourcePtr, sourceLen, ptr, len, nowUs, &error), .srt, error)
+            }
+        }
+    }
     open func tick(nowUs: UInt64) throws { _ = try invoke(102, .srt, raw, request { $0.u64(nowUs) }) }
-    open func pollDatagram(nowUs: UInt64) throws -> NativeSrtDatagram? { try response(try invoke(103, .srt, raw, request { $0.u64(nowUs) })) { try $0.bool() ? .init(destination: $0.string(), bytes: $0.bytes()) : nil } }
-    open func isReady() throws -> Bool { try response(try invoke(104, .srt, raw)) { try $0.bool() } }
-    open func hasImmediateWork() throws -> Bool { try response(try invoke(105, .srt, raw)) { try $0.bool() } }
-    open func nextDeadlineUs() throws -> UInt64? { try response(try invoke(106, .srt, raw)) { try $0.optionalU64() } }
-    open func state() throws -> NativeSrtState { try response(try invoke(107, .srt, raw)) { try indexed(srtStates, $0.u8()) } }
+    open func pollDatagram(nowUs: UInt64) throws -> NativeSrtDatagram? {
+        var out = SapflowSrtDatagram(), error = SapflowBuffer()
+        try check(sapflow_srt_publisher_poll_datagram(raw, nowUs, &out, &error), .srt, error)
+        guard out.present else { return nil }
+        return NativeSrtDatagram(destination: String(decoding: take(out.destination), as: UTF8.self), bytes: take(out.bytes))
+    }
+    open func isReady() throws -> Bool {
+        var out: UInt64 = 0, error = SapflowBuffer()
+        try check(sapflow_srt_publisher_is_ready(raw, &out, &error), .srt, error)
+        return out != 0
+    }
+    open func hasImmediateWork() throws -> Bool {
+        var out: UInt64 = 0, error = SapflowBuffer()
+        try check(sapflow_srt_publisher_has_immediate_work(raw, &out, &error), .srt, error)
+        return out != 0
+    }
+    open func nextDeadlineUs() throws -> UInt64? {
+        var out = SapflowOptionalU64(), error = SapflowBuffer()
+        try check(sapflow_srt_publisher_next_deadline_us(raw, &out, &error), .srt, error)
+        return out.present ? out.value : nil
+    }
+    open func state() throws -> NativeSrtState {
+        var out: UInt64 = 0, error = SapflowBuffer()
+        try check(sapflow_srt_publisher_state(raw, &out, &error), .srt, error)
+        return try indexed(srtStates, Int(out))
+    }
     open func pollEvent() throws -> NativeSrtEvent? { try response(try invoke(108, .srt, raw)) { r -> NativeSrtEvent? in
         if try !r.bool() { return nil }
         return switch try r.u8() { case 0: NativeSrtEvent.sending;case 1: NativeSrtEvent.peerMediaProgress

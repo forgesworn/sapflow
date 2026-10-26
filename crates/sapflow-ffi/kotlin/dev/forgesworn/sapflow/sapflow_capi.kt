@@ -36,10 +36,28 @@ internal object Native {
     @JvmStatic external fun directBufferAddress(buffer: ByteBuffer): Long
     @JvmStatic external fun encodedBufferNew(address: Long, len: Long): Long
     @JvmStatic external fun encodedBufferScalar(buffer: Long, operation: Int, index: Long): Long
-    @JvmStatic external fun mediaCodecSample(codec: Long, address: Long, len: Long, pts: Long, dts: Long, duration: Int, timescale: Int, keyframe: Boolean): Long
     @JvmStatic external fun mediaSampleScalar(sample: Long, operation: Int): Long
+    @JvmStatic external fun mediaCodecSample(codec: Long, address: Long, len: Long, pts: Long, dts: Long, duration: Int, timescale: Int, keyframe: Boolean): Long
+    @JvmStatic external fun mediaSampleMetadata(sample: Long): LongArray
+    @JvmStatic external fun aacTimingViewsSample(views: Long, publishing: Boolean): LongArray?
     @JvmStatic external fun sampleFanoutPush(fanout: Long, sample: Long, nowNs: Long, aacViews: Boolean): LongArray
-    @JvmStatic external fun sampleFanoutPop(fanout: Long, recording: Boolean, nowNs: Long): Long
+    @JvmStatic external fun sampleFanoutPop(fanout: Long, recording: Boolean, nowNs: Long): LongArray?
+    @JvmStatic external fun recordingPush(muxer: Long, sample: Long)
+    @JvmStatic external fun recordingTakeOutput(muxer: Long, mode: Int, metadata: LongArray): ByteArray?
+    @JvmStatic external fun rtmpFeed(publisher: Long, address: Long, len: Long, nowMs: Long)
+    @JvmStatic external fun rtmpSend(publisher: Long, sample: Long)
+    @JvmStatic external fun rtmpTakeOutput(publisher: Long): ByteArray
+    @JvmStatic external fun rtmpSendAndTakeOutput(publisher: Long, sample: Long, nowMs: Long, metadata: LongArray): ByteArray
+    @JvmStatic external fun rtmpNextDeadlineMs(publisher: Long): LongArray
+    @JvmStatic external fun rtmpQueuedOutputBytes(publisher: Long): Long
+    @JvmStatic external fun rtmpState(publisher: Long): Long
+    @JvmStatic external fun srtPush(publisher: Long, sample: Long, nowUs: Long)
+    @JvmStatic external fun srtFeed(publisher: Long, source: ByteArray, address: Long, len: Long, nowUs: Long)
+    @JvmStatic external fun srtPollDatagram(publisher: Long, nowUs: Long): Array<Any>?
+    @JvmStatic external fun srtIsReady(publisher: Long): Long
+    @JvmStatic external fun srtHasImmediateWork(publisher: Long): Long
+    @JvmStatic external fun srtNextDeadlineUs(publisher: Long): LongArray
+    @JvmStatic external fun srtState(publisher: Long): Long
 }
 
 internal class Writer {
@@ -116,7 +134,7 @@ abstract class HandleObject internal constructor(private val kind: Int, private 
         if (handle == 0L) throw IllegalStateException("Sapflow object is closed")
         handle
     }
-    internal fun <T> withHandle(block: (Long) -> T): T = synchronized(this) { block(rawHandle()) }
+    internal inline fun <T> withHandle(block: (Long) -> T): T = synchronized(this) { block(rawHandle()) }
     @Synchronized override fun destroy() {
         if (destroyed) return
         destroyed = true
@@ -289,25 +307,31 @@ private fun Writer.fileReceipt(v: NativeAudioFileReceipt) { u64(v.generationCoun
 private fun Writer.srtConfig(v: NativeSrtConfig) { string(v.destination); string(v.streamId); val cipher = v.cipher; bool(cipher != null); if (cipher != null) u8(cipher.ordinal); u32(v.latencyMs); u32(v.maxBufferedPackets); u32(v.maxBufferedBytes); u32(v.maxPacketAgeMs); u32(v.maxSampleResidenceMs); u64(v.bandwidthBytesPerSecond) }
 
 public interface EncodedBufferInterface { fun len(): ULong; fun isEmpty(): Boolean; fun byteAt(index: ULong): UByte; companion object }
-open class EncodedBuffer internal constructor(handle: Long) : HandleObject(1, handle), EncodedBufferInterface {
-    @Suppress("UNUSED_PARAMETER") constructor(noHandle: NoHandle) : this(0L)
-    constructor(bytes: ByteBuffer) : this(if (bytes.isDirect) hot(ErrorKind.BINDING) { bytes.borrowDirect(Native::encodedBufferNew) } else newHandle(2, 1, ErrorKind.BINDING, request { bytes(bytes.toOwnedArray()) }))
-    override fun len() = withHandle { hot(ErrorKind.BINDING) { Native.encodedBufferScalar(it, 3, 0).toULong() } }
-    override fun isEmpty() = withHandle { hot(ErrorKind.BINDING) { Native.encodedBufferScalar(it, 4, 0) != 0L } }
+open class EncodedBuffer internal constructor(handle: Long, private val length: ULong) : HandleObject(1, handle), EncodedBufferInterface {
+    @Suppress("UNUSED_PARAMETER") constructor(noHandle: NoHandle) : this(0L, 0uL)
+    constructor(bytes: ByteBuffer) : this(
+        if (bytes.isDirect) hot(ErrorKind.BINDING) { bytes.borrowDirect(Native::encodedBufferNew) }
+        else newHandle(2, 1, ErrorKind.BINDING, request { bytes(bytes.toOwnedArray()) }),
+        bytes.remaining().toULong(),
+    )
+    override fun len() = withHandle { length }
+    override fun isEmpty() = withHandle { length == 0uL }
     @Throws(BindingException::class) override fun byteAt(index: ULong) = withHandle { hot(ErrorKind.BINDING) { Native.encodedBufferScalar(it, 5, index.toLong()).toUByte() } }
 }
 fun sdkAbiVersion(): UInt = response(invoke(1, ErrorKind.BINDING)) { u32() }
 
 public interface MediaCodecInterface { fun sample(bytes: ByteBuffer, pts: Long, dts: Long, duration: UInt, timescale: UInt, keyframe: Boolean): MediaSample; companion object }
-open class MediaCodec internal constructor(handle: Long) : HandleObject(2, handle), MediaCodecInterface {
+open class MediaCodec internal constructor(handle: Long, private val video: Boolean? = null) : HandleObject(2, handle), MediaCodecInterface {
     @Suppress("UNUSED_PARAMETER") constructor(noHandle: NoHandle) : this(0L)
     @Throws(BindingException::class) override fun sample(bytes: ByteBuffer, pts: Long, dts: Long, duration: UInt, timescale: UInt, keyframe: Boolean) = withHandle { codec ->
-        if (bytes.isDirect) MediaSample(hot(ErrorKind.BINDING) { bytes.borrowDirect { address, len -> Native.mediaCodecSample(codec, address, len, pts, dts, duration.toInt(), timescale.toInt(), keyframe) } })
-        else MediaSample(response(invoke(8, ErrorKind.BINDING, codec, request { bytes(bytes.toOwnedArray()); i64(pts); i64(dts); u32(duration); u32(timescale); bool(keyframe) })) { handle() })
+        val handle = if (bytes.isDirect) hot(ErrorKind.BINDING) { bytes.borrowDirect { address, len -> Native.mediaCodecSample(codec, address, len, pts, dts, duration.toInt(), timescale.toInt(), keyframe) } }
+        else response(invoke(8, ErrorKind.BINDING, codec, request { bytes(bytes.toOwnedArray()); i64(pts); i64(dts); u32(duration); u32(timescale); bool(keyframe) })) { handle() }
+        if (video == null) MediaSample(handle)
+        else MediaSample(handle, bytes.remaining().toULong(), pts, dts, duration, timescale, video, keyframe)
     }
     companion object {
-        @JvmStatic fun h264(sps: ByteBuffer, pps: ByteBuffer) = MediaCodec(newHandle(6, 2, ErrorKind.BINDING, request { bytes(sps.toOwnedArray()); bytes(pps.toOwnedArray()) }))
-        @JvmStatic fun aac(asc: ByteBuffer) = MediaCodec(newHandle(7, 2, ErrorKind.BINDING, request { bytes(asc.toOwnedArray()) }))
+        @JvmStatic fun h264(sps: ByteBuffer, pps: ByteBuffer) = MediaCodec(newHandle(6, 2, ErrorKind.BINDING, request { bytes(sps.toOwnedArray()); bytes(pps.toOwnedArray()) }), true)
+        @JvmStatic fun aac(asc: ByteBuffer) = MediaCodec(newHandle(7, 2, ErrorKind.BINDING, request { bytes(asc.toOwnedArray()) }), false)
     }
 }
 public interface MediaSampleInterface {
@@ -316,27 +340,38 @@ public interface MediaSampleInterface {
     fun isVideo(): Boolean; fun isKeyframe(): Boolean; fun pts(): Long; fun dts(): Long
     fun duration(): UInt; fun timescale(): UInt; companion object
 }
-open class MediaSample internal constructor(handle: Long) : HandleObject(3, handle), MediaSampleInterface {
-    @Suppress("UNUSED_PARAMETER") constructor(noHandle: NoHandle) : this(0L)
+open class MediaSample internal constructor(
+    handle: Long,
+    private val length: ULong,
+    private val presentation: Long,
+    private val decode: Long,
+    private val sampleDuration: UInt,
+    private val sampleTimescale: UInt,
+    private val video: Boolean,
+    private val keyframe: Boolean,
+) : HandleObject(3, handle), MediaSampleInterface {
+    internal constructor(handle: Long) : this(hot(ErrorKind.BINDING) { Native.mediaSampleMetadata(handle) })
+    internal constructor(values: LongArray) : this(values[0], values[1].toULong(), values[2], values[3], values[4].toUInt(), values[5].toUInt(), values[6] != 0L, values[7] != 0L)
+    @Suppress("UNUSED_PARAMETER") constructor(noHandle: NoHandle) : this(0L, 0uL, 0L, 0L, 0u, 0u, false, false)
     @Throws(BindingException::class) override fun aacTimingViews(producerGeneration: ULong, nativePtsUs: Long, publishingPts: Long?) = withHandle {
         NativeAacTimingViews(response(invoke(9, ErrorKind.BINDING, it, request { u64(producerGeneration); i64(nativePtsUs); optional(publishingPts) })) { handle() })
     }
     override fun aacSourceInfo() = withHandle { response(invoke(10, ErrorKind.BINDING, it)) { if (bool()) NativeAacSampleSourceInfo(u64(), i64(), i64(), i64(), u32(), u32()) else null } }
-    override fun len() = withHandle { hot(ErrorKind.BINDING) { Native.mediaSampleScalar(it, 11).toULong() } }
-    override fun isEmpty() = withHandle { hot(ErrorKind.BINDING) { Native.mediaSampleScalar(it, 12) != 0L } }
-    override fun isVideo() = withHandle { hot(ErrorKind.BINDING) { Native.mediaSampleScalar(it, 13) != 0L } }
-    override fun isKeyframe() = withHandle { hot(ErrorKind.BINDING) { Native.mediaSampleScalar(it, 14) != 0L } }
-    override fun pts() = withHandle { hot(ErrorKind.BINDING) { Native.mediaSampleScalar(it, 15) } }
-    override fun dts() = withHandle { hot(ErrorKind.BINDING) { Native.mediaSampleScalar(it, 16) } }
-    override fun duration() = withHandle { hot(ErrorKind.BINDING) { Native.mediaSampleScalar(it, 17).toUInt() } }
-    override fun timescale() = withHandle { hot(ErrorKind.BINDING) { Native.mediaSampleScalar(it, 18).toUInt() } }
+    override fun len() = withHandle { length }
+    override fun isEmpty() = withHandle { length == 0uL }
+    override fun isVideo() = withHandle { video }
+    override fun isKeyframe() = withHandle { keyframe }
+    override fun pts() = withHandle { presentation }
+    override fun dts() = withHandle { decode }
+    override fun duration() = withHandle { sampleDuration }
+    override fun timescale() = withHandle { sampleTimescale }
 }
 public interface NativeAacTimingViewsInterface { fun sourceInfo(): NativeAacSampleSourceInfo; fun recordingSample(): MediaSample; fun publishingSample(): MediaSample?; companion object }
 open class NativeAacTimingViews internal constructor(handle: Long) : HandleObject(4, handle), NativeAacTimingViewsInterface {
     @Suppress("UNUSED_PARAMETER") constructor(noHandle: NoHandle) : this(0L)
     override fun sourceInfo() = withHandle { response(invoke(19, ErrorKind.BINDING, it)) { NativeAacSampleSourceInfo(u64(), i64(), i64(), i64(), u32(), u32()) } }
-    override fun recordingSample() = withHandle { MediaSample(response(invoke(20, ErrorKind.BINDING, it)) { handle() }) }
-    override fun publishingSample() = withHandle { response(invoke(21, ErrorKind.BINDING, it)) { optionalHandle()?.let(::MediaSample) } }
+    override fun recordingSample() = withHandle { MediaSample(hot(ErrorKind.BINDING) { Native.aacTimingViewsSample(it, false) }!!) }
+    override fun publishingSample() = withHandle { hot(ErrorKind.BINDING) { Native.aacTimingViewsSample(it, true) }?.let(::MediaSample) }
 }
 public interface NativeSampleFanoutInterface {
     fun pushAacTimingViews(views: NativeAacTimingViews, nowNs: ULong): FanoutOutcome
@@ -350,8 +385,8 @@ open class NativeSampleFanout internal constructor(handle: Long) : HandleObject(
     private fun outcome(values: LongArray) = FanoutOutcome(values[0] != 0L, values[1] != 0L, values[2] != 0L, values[3].toULong(), values[4] != 0L)
     @Throws(BindingException::class) override fun pushAacTimingViews(views: NativeAacTimingViews, nowNs: ULong) = withHandle { h -> views.withHandle { outcome(hot(ErrorKind.BINDING) { Native.sampleFanoutPush(h, it, nowNs.toLong(), true) }) } }
     @Throws(BindingException::class) override fun push(sample: MediaSample, nowNs: ULong) = withHandle { h -> sample.withHandle { outcome(hot(ErrorKind.BINDING) { Native.sampleFanoutPush(h, it, nowNs.toLong(), false) }) } }
-    @Throws(BindingException::class) override fun popPublishing(nowNs: ULong) = withHandle { hot(ErrorKind.BINDING) { Native.sampleFanoutPop(it, false, nowNs.toLong()) }.let { handle -> if (handle == 0L) null else MediaSample(handle) } }
-    @Throws(BindingException::class) override fun popRecording(nowNs: ULong) = withHandle { hot(ErrorKind.BINDING) { Native.sampleFanoutPop(it, true, nowNs.toLong()) }.let { handle -> if (handle == 0L) null else MediaSample(handle) } }
+    @Throws(BindingException::class) override fun popPublishing(nowNs: ULong) = withHandle { hot(ErrorKind.BINDING) { Native.sampleFanoutPop(it, false, nowNs.toLong()) }?.let(::MediaSample) }
+    @Throws(BindingException::class) override fun popRecording(nowNs: ULong) = withHandle { hot(ErrorKind.BINDING) { Native.sampleFanoutPop(it, true, nowNs.toLong()) }?.let(::MediaSample) }
     @Throws(BindingException::class) override fun stats() = withHandle { response(invoke(28, ErrorKind.BINDING, it)) { NativeQueueStats(u64(), u64(), u64(), u64(), u64(), u64(), u64(), u64(), u64(), u64(), u64(), u64(), u64(), bool(), bool()) } }
     @Throws(BindingException::class) override fun closePublishingAdmission() = withHandle { invoke(29, ErrorKind.BINDING, it); Unit }
     @Throws(BindingException::class) override fun closeRecordingAdmission() = withHandle { invoke(30, ErrorKind.BINDING, it); Unit }
@@ -422,11 +457,20 @@ open class NativeRecordingMuxer internal constructor(handle: Long) : HandleObjec
     @Throws(NativeRecordingException::class) override fun finishNative(outcome: NativeRecordingCompletion) = withHandle { invoke(63, ErrorKind.RECORDING, it, request { u8(outcome.ordinal) }); Unit }
     @Throws(NativeRecordingException::class) override fun finishProgramme(outcome: NativeProgrammeCompletion) = withHandle { invoke(53, ErrorKind.RECORDING, it, request { u8(outcome.ordinal) }); Unit }
     @Throws(NativeRecordingException::class) override fun programmeCheckpointHeader(checkpoint: NativeProgrammeCheckpoint) = withHandle { h -> checkpoint.withHandle { invoke(51, ErrorKind.RECORDING, h, request { u64(it.toULong()) }) } }
-    @Throws(NativeRecordingException::class) override fun push(sample: MediaSample) = withHandle { h -> sample.withHandle { invoke(57, ErrorKind.RECORDING, h, request { u64(it.toULong()) }); Unit } }
+    @Throws(NativeRecordingException::class) override fun push(sample: MediaSample) = withHandle { h -> sample.withHandle { hot(ErrorKind.RECORDING) { Native.recordingPush(h, it) } } }
     @Throws(NativeRecordingException::class) override fun stats() = withHandle { response(invoke(65, ErrorKind.RECORDING, it)) { NativeRecordingStats(u64(), u64(), u64(), u64(), u64(), u64(), bool()) } }
-    @Throws(NativeRecordingException::class) override fun takeNativeOutput() = withHandle { response(invoke(59, ErrorKind.RECORDING, it)) { if (bool()) NativeRecordingChunk(bytes(), NativeRecordingChunkKind.entries[u8()], optionalHandle()?.let(::NativeRecordingCheckpoint)) else null } }
-    @Throws(NativeRecordingException::class) override fun takeOutput() = withHandle { response(invoke(58, ErrorKind.RECORDING, it)) { if (bool()) RecordingWrite(bytes(), bool()) else null } }
-    @Throws(NativeRecordingException::class) override fun takeProgrammeOutput() = withHandle { response(invoke(50, ErrorKind.RECORDING, it)) { if (bool()) NativeProgrammeChunk(bytes(), NativeRecordingChunkKind.entries[u8()], optionalHandle()?.let(::NativeProgrammeCheckpoint)) else null } }
+    @Throws(NativeRecordingException::class) override fun takeNativeOutput() = withHandle {
+        val metadata = LongArray(3)
+        hot(ErrorKind.RECORDING) { Native.recordingTakeOutput(it, 1, metadata) }?.let { bytes -> NativeRecordingChunk(bytes, NativeRecordingChunkKind.entries[metadata[1].toInt()], if (metadata[0] == 0L) null else NativeRecordingCheckpoint(metadata[0])) }
+    }
+    @Throws(NativeRecordingException::class) override fun takeOutput() = withHandle {
+        val metadata = LongArray(3)
+        hot(ErrorKind.RECORDING) { Native.recordingTakeOutput(it, 0, metadata) }?.let { bytes -> RecordingWrite(bytes, metadata[2] != 0L) }
+    }
+    @Throws(NativeRecordingException::class) override fun takeProgrammeOutput() = withHandle {
+        val metadata = LongArray(3)
+        hot(ErrorKind.RECORDING) { Native.recordingTakeOutput(it, 2, metadata) }?.let { bytes -> NativeProgrammeChunk(bytes, NativeRecordingChunkKind.entries[metadata[1].toInt()], if (metadata[0] == 0L) null else NativeProgrammeCheckpoint(metadata[0])) }
+    }
     companion object {
         @JvmStatic fun withNativeAacTiming(hasVideo: Boolean, hasAudio: Boolean, mediaEpochNs: ULong, maxFragmentBytes: ULong, maxFragmentMs: UInt) = NativeRecordingMuxer(newHandle(46, 10, ErrorKind.RECORDING, request { bool(hasVideo); bool(hasAudio); u64(mediaEpochNs); u64(maxFragmentBytes); u32(maxFragmentMs) }))
         @JvmStatic fun withProgrammeAacTiming(mediaEpochNs: ULong, maxFragmentBytes: ULong, maxFragmentMs: UInt) = NativeRecordingMuxer(newHandle(47, 10, ErrorKind.RECORDING, request { u64(mediaEpochNs); u64(maxFragmentBytes); u32(maxFragmentMs) }))
@@ -449,15 +493,20 @@ open class NativeRtmpPublisher internal constructor(handle: Long) : HandleObject
     constructor(app: String, streamKey: String, tcUrl: String, mediaEpochNs: ULong, nowMs: ULong) : this(newHandle(70, 11, ErrorKind.RTMP, request { string(app); string(streamKey); string(tcUrl); u64(mediaEpochNs); u64(nowMs) }))
     @Throws(NativeRtmpException::class) override fun declareTracks(hasVideo: Boolean, hasAudio: Boolean) = withHandle { invoke(71, ErrorKind.RTMP, it, request { bool(hasVideo); bool(hasAudio) }); Unit }
     @Throws(NativeRtmpException::class) override fun pollEvent() = withHandle { response(invoke(72, ErrorKind.RTMP, it)) { if (bool()) NativeRtmpEvent.entries[u8()] else null } }
-    @Throws(NativeRtmpException::class) override fun feed(bytes: ByteBuffer, nowMs: ULong) = withHandle { invoke(73, ErrorKind.RTMP, it, request { bytes(bytes.toOwnedArray()); u64(nowMs) }); Unit }
+    @Throws(NativeRtmpException::class) override fun feed(bytes: ByteBuffer, nowMs: ULong) = withHandle {
+        if (bytes.isDirect) hot(ErrorKind.RTMP) { bytes.borrowDirect { address, len -> Native.rtmpFeed(it, address, len, nowMs.toLong()) } }
+        else invoke(73, ErrorKind.RTMP, it, request { bytes(bytes.toOwnedArray()); u64(nowMs) }); Unit
+    }
     @Throws(NativeRtmpException::class) override fun tick(nowMs: ULong) = withHandle { invoke(74, ErrorKind.RTMP, it, request { u64(nowMs) }); Unit }
-    @Throws(NativeRtmpException::class) override fun nextDeadlineMs() = withHandle { response(invoke(75, ErrorKind.RTMP, it)) { optionalU64() } }
-    @Throws(NativeRtmpException::class) override fun takeOutput() = withHandle { invoke(76, ErrorKind.RTMP, it) }
-    @Throws(NativeRtmpException::class) override fun queuedOutputBytes() = withHandle { response(invoke(77, ErrorKind.RTMP, it)) { u64() } }
-    @Throws(NativeRtmpException::class) override fun state() = withHandle { response(invoke(78, ErrorKind.RTMP, it)) { NativeRtmpState.entries[u8()] } }
-    @Throws(NativeRtmpException::class) override fun send(sample: MediaSample) = withHandle { h -> sample.withHandle { invoke(79, ErrorKind.RTMP, h, request { u64(it.toULong()) }); Unit } }
+    @Throws(NativeRtmpException::class) override fun nextDeadlineMs() = withHandle { hot(ErrorKind.RTMP) { Native.rtmpNextDeadlineMs(it) }.let { value -> if (value[1] != 0L) value[0].toULong() else null } }
+    @Throws(NativeRtmpException::class) override fun takeOutput() = withHandle { hot(ErrorKind.RTMP) { Native.rtmpTakeOutput(it) } }
+    @Throws(NativeRtmpException::class) override fun queuedOutputBytes() = withHandle { hot(ErrorKind.RTMP) { Native.rtmpQueuedOutputBytes(it).toULong() } }
+    @Throws(NativeRtmpException::class) override fun state() = withHandle { hot(ErrorKind.RTMP) { NativeRtmpState.entries[Native.rtmpState(it).toInt()] } }
+    @Throws(NativeRtmpException::class) override fun send(sample: MediaSample) = withHandle { h -> sample.withHandle { hot(ErrorKind.RTMP) { Native.rtmpSend(h, it) } } }
     @Throws(NativeRtmpException::class) override fun sendAndTakeOutput(sample: MediaSample, nowMs: ULong) = withHandle { h -> sample.withHandle {
-        response(invoke(80, ErrorKind.RTMP, h, request { u64(it.toULong()); u64(nowMs) })) { NativeRtmpSendOutput(bytes(), u64(), optionalU64(), NativeRtmpState.entries[u8()], bool(), bool()) }
+        val metadata = LongArray(6)
+        val output = hot(ErrorKind.RTMP) { Native.rtmpSendAndTakeOutput(h, it, nowMs.toLong(), metadata) }
+        NativeRtmpSendOutput(output, metadata[0].toULong(), if (metadata[2] != 0L) metadata[1].toULong() else null, NativeRtmpState.entries[metadata[3].toInt()], metadata[4] != 0L, metadata[5] != 0L)
     } }
     @Throws(NativeRtmpException::class) override fun finish() = withHandle { invoke(81, ErrorKind.RTMP, it); Unit }
     @Throws(NativeRtmpException::class) override fun cancel() = withHandle { invoke(82, ErrorKind.RTMP, it); Unit }
@@ -508,14 +557,17 @@ open class NativeSrtPublisher internal constructor(handle: Long) : HandleObject(
     constructor(config: NativeSrtConfig, video: MediaCodec?, audio: MediaCodec?, passphrase: ByteArray?, nowUs: ULong) : this(newHandle(99, 13, ErrorKind.SRT, request {
         srtConfig(config); optional(video); optional(audio); bool(passphrase != null); if (passphrase != null) bytes(passphrase); u64(nowUs)
     }))
-    @Throws(NativeSrtException::class) override fun push(sample: MediaSample, nowUs: ULong) = withHandle { h -> sample.withHandle { invoke(100, ErrorKind.SRT, h, request { u64(it.toULong()); u64(nowUs) }); Unit } }
-    @Throws(NativeSrtException::class) override fun feed(source: String, bytes: ByteBuffer, nowUs: ULong) = withHandle { invoke(101, ErrorKind.SRT, it, request { string(source); bytes(bytes.toOwnedArray()); u64(nowUs) }); Unit }
+    @Throws(NativeSrtException::class) override fun push(sample: MediaSample, nowUs: ULong) = withHandle { h -> sample.withHandle { hot(ErrorKind.SRT) { Native.srtPush(h, it, nowUs.toLong()) } } }
+    @Throws(NativeSrtException::class) override fun feed(source: String, bytes: ByteBuffer, nowUs: ULong) = withHandle {
+        if (bytes.isDirect) hot(ErrorKind.SRT) { bytes.borrowDirect { address, len -> Native.srtFeed(it, source.toByteArray(Charsets.UTF_8), address, len, nowUs.toLong()) } }
+        else invoke(101, ErrorKind.SRT, it, request { string(source); bytes(bytes.toOwnedArray()); u64(nowUs) }); Unit
+    }
     @Throws(NativeSrtException::class) override fun tick(nowUs: ULong) = withHandle { invoke(102, ErrorKind.SRT, it, request { u64(nowUs) }); Unit }
-    @Throws(NativeSrtException::class) override fun pollDatagram(nowUs: ULong) = withHandle { response(invoke(103, ErrorKind.SRT, it, request { u64(nowUs) })) { if (bool()) NativeSrtDatagram(string(), bytes()) else null } }
-    @Throws(NativeSrtException::class) override fun isReady() = withHandle { response(invoke(104, ErrorKind.SRT, it)) { bool() } }
-    @Throws(NativeSrtException::class) override fun hasImmediateWork() = withHandle { response(invoke(105, ErrorKind.SRT, it)) { bool() } }
-    @Throws(NativeSrtException::class) override fun nextDeadlineUs() = withHandle { response(invoke(106, ErrorKind.SRT, it)) { optionalU64() } }
-    @Throws(NativeSrtException::class) override fun state() = withHandle { response(invoke(107, ErrorKind.SRT, it)) { NativeSrtState.entries[u8()] } }
+    @Throws(NativeSrtException::class) override fun pollDatagram(nowUs: ULong) = withHandle { hot(ErrorKind.SRT) { Native.srtPollDatagram(it, nowUs.toLong()) }?.let { value -> NativeSrtDatagram(value[0] as String, value[1] as ByteArray) } }
+    @Throws(NativeSrtException::class) override fun isReady() = withHandle { hot(ErrorKind.SRT) { Native.srtIsReady(it) != 0L } }
+    @Throws(NativeSrtException::class) override fun hasImmediateWork() = withHandle { hot(ErrorKind.SRT) { Native.srtHasImmediateWork(it) != 0L } }
+    @Throws(NativeSrtException::class) override fun nextDeadlineUs() = withHandle { hot(ErrorKind.SRT) { Native.srtNextDeadlineUs(it) }.let { value -> if (value[1] != 0L) value[0].toULong() else null } }
+    @Throws(NativeSrtException::class) override fun state() = withHandle { hot(ErrorKind.SRT) { NativeSrtState.entries[Native.srtState(it).toInt()] } }
     @Throws(NativeSrtException::class) override fun pollEvent() = withHandle { response(invoke(108, ErrorKind.SRT, it)) {
         if (!bool()) null else when (u8()) {
             0 -> NativeSrtEvent.Sending; 1 -> NativeSrtEvent.PeerMediaProgress

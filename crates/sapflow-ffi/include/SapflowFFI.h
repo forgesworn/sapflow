@@ -160,8 +160,49 @@ typedef struct {
     bool recording_failed;
 } SapflowFanoutOutcome;
 
+typedef struct {
+    void *handle;
+    uint64_t len;
+    int64_t pts;
+    int64_t dts;
+    uint32_t duration;
+    uint32_t timescale;
+    bool is_video;
+    bool is_keyframe;
+} SapflowMediaSampleResult;
+
+typedef struct {
+    uint64_t value;
+    bool present;
+} SapflowOptionalU64;
+
+typedef struct {
+    SapflowBuffer bytes;
+    void *checkpoint;
+    uint8_t kind;
+    bool rewrite_header;
+    bool present;
+} SapflowRecordingOutput;
+
+typedef struct {
+    SapflowBuffer output;
+    uint64_t queued_output_bytes;
+    uint64_t next_deadline_ms;
+    uint8_t state;
+    bool has_next_deadline;
+    bool startup_submitted;
+    bool peer_media_progress;
+} SapflowRtmpSendOutput;
+
+typedef struct {
+    SapflowBuffer destination;
+    SapflowBuffer bytes;
+    bool present;
+} SapflowSrtDatagram;
+
 /* Hot calls borrow input only for the synchronous call. Rust performs the
- * existing single compressed ownership copy. No serialised payload is made. */
+ * existing single compressed ownership copy. No serialised payload is made.
+ * Result buffers and handles are caller-owned, including on adapter failures. */
 int32_t sapflow_encoded_buffer_new(const uint8_t *bytes, size_t len,
     void **out, SapflowBuffer *error);
 int32_t sapflow_encoded_buffer_scalar(const void *buffer, uint32_t operation,
@@ -172,13 +213,55 @@ int32_t sapflow_media_codec_sample(const void *codec,
     void **out, SapflowBuffer *error);
 int32_t sapflow_media_sample_scalar(const void *sample, uint32_t operation,
     uint64_t *out, SapflowBuffer *error);
+int32_t sapflow_media_sample_metadata(const void *sample,
+    SapflowMediaSampleResult *out, SapflowBuffer *error);
+int32_t sapflow_aac_timing_views_sample(const void *views, bool publishing,
+    SapflowMediaSampleResult *out, SapflowBuffer *error);
 int32_t sapflow_sample_fanout_push(const void *fanout, const void *sample,
     uint64_t now_ns, SapflowFanoutOutcome *out, SapflowBuffer *error);
 int32_t sapflow_sample_fanout_push_aac_timing_views(const void *fanout,
     const void *views, uint64_t now_ns, SapflowFanoutOutcome *out,
     SapflowBuffer *error);
 int32_t sapflow_sample_fanout_pop(const void *fanout, bool recording,
-    uint64_t now_ns, void **out, SapflowBuffer *error);
+    uint64_t now_ns, SapflowMediaSampleResult *out, SapflowBuffer *error);
+int32_t sapflow_recording_muxer_push(const void *muxer, const void *sample,
+    SapflowBuffer *error);
+int32_t sapflow_recording_muxer_take_output(const void *muxer,
+    SapflowRecordingOutput *out, SapflowBuffer *error);
+int32_t sapflow_recording_muxer_take_native_output(const void *muxer,
+    SapflowRecordingOutput *out, SapflowBuffer *error);
+int32_t sapflow_recording_muxer_take_programme_output(const void *muxer,
+    SapflowRecordingOutput *out, SapflowBuffer *error);
+int32_t sapflow_rtmp_publisher_feed(const void *publisher,
+    const uint8_t *bytes, size_t len, uint64_t now_ms, SapflowBuffer *error);
+int32_t sapflow_rtmp_publisher_send(const void *publisher, const void *sample,
+    SapflowBuffer *error);
+int32_t sapflow_rtmp_publisher_take_output(const void *publisher,
+    SapflowBuffer *out, SapflowBuffer *error);
+int32_t sapflow_rtmp_publisher_send_and_take_output(const void *publisher,
+    const void *sample, uint64_t now_ms, SapflowRtmpSendOutput *out,
+    SapflowBuffer *error);
+int32_t sapflow_rtmp_publisher_next_deadline_ms(const void *publisher,
+    SapflowOptionalU64 *out, SapflowBuffer *error);
+int32_t sapflow_rtmp_publisher_queued_output_bytes(const void *publisher,
+    uint64_t *out, SapflowBuffer *error);
+int32_t sapflow_rtmp_publisher_state(const void *publisher, uint64_t *out,
+    SapflowBuffer *error);
+int32_t sapflow_srt_publisher_push(const void *publisher, const void *sample,
+    uint64_t now_us, SapflowBuffer *error);
+int32_t sapflow_srt_publisher_feed(const void *publisher,
+    const uint8_t *source, size_t source_len, const uint8_t *bytes, size_t len,
+    uint64_t now_us, SapflowBuffer *error);
+int32_t sapflow_srt_publisher_poll_datagram(const void *publisher,
+    uint64_t now_us, SapflowSrtDatagram *out, SapflowBuffer *error);
+int32_t sapflow_srt_publisher_is_ready(const void *publisher, uint64_t *out,
+    SapflowBuffer *error);
+int32_t sapflow_srt_publisher_has_immediate_work(const void *publisher,
+    uint64_t *out, SapflowBuffer *error);
+int32_t sapflow_srt_publisher_next_deadline_us(const void *publisher,
+    SapflowOptionalU64 *out, SapflowBuffer *error);
+int32_t sapflow_srt_publisher_state(const void *publisher, uint64_t *out,
+    SapflowBuffer *error);
 
 #ifdef __cplusplus
 }
