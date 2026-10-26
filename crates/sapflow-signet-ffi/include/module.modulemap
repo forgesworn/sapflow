@@ -1,0 +1,4 @@
+module SignetAuthFFI {
+    header "SignetAuthFFI.h"
+    export *
+}

@@ -120,10 +120,11 @@ def main():
         temporary = scratch / "tmp"
         temporary.mkdir()
         swift_env = {**os.environ, "SDKROOT": str(sdk), "TMPDIR": str(temporary)}
-        run("rust-sdk", ["cargo", "build", "--locked", "-p", "sapflow-ffi", "--features", "bindgen", "-j", "1"], 1800)
+        run("rust-sdk", ["cargo", "build", "--locked", "-p", "sapflow-ffi", "-j", "1"], 1800)
         library = target / "debug/libsapflow_ffi.dylib"
-        run("swift-bindings", [target / "debug/sapflow-bindgen", "generate", library,
-            "-l", "swift", "-o", scratch, "--no-format"], 180)
+        shutil.copyfile(ROOT / "crates/sapflow-ffi/swift/Sapflow.swift", scratch / "Sapflow.swift")
+        shutil.copyfile(ROOT / "crates/sapflow-ffi/include/SapflowFFI.h", scratch / "SapflowFFI.h")
+        shutil.copyfile(ROOT / "crates/sapflow-ffi/include/module.modulemap", scratch / "SapflowFFI.modulemap")
         common = ["/usr/bin/xcrun", "--sdk", "macosx", "swiftc", "-swift-version", "5", "-warnings-as-errors",
             "-target", platform.machine() + "-apple-macos14.0", "-sdk", sdk, "-module-cache-path", modules,
             "-I", scratch, "-Xcc", "-fmodule-map-file=" + str(scratch / "SapflowFFI.modulemap")]

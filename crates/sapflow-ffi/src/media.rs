@@ -7,7 +7,6 @@ use sapflow_client::{
 };
 use std::sync::{Arc, Mutex, MutexGuard};
 
-#[derive(uniffi::Object)]
 pub struct MediaCodec {
     config: Arc<CodecConfig>,
 }
@@ -18,16 +17,13 @@ impl MediaCodec {
     }
 }
 
-#[uniffi::export]
 impl MediaCodec {
-    #[uniffi::constructor]
     pub fn h264(sps: &[u8], pps: &[u8]) -> Result<Arc<Self>, BindingError> {
         let config = H264Config::new(sps, pps).map_err(|_| BindingError::InvalidMedia)?;
         Ok(Arc::new(Self {
             config: Arc::new(CodecConfig::H264(config)),
         }))
     }
-    #[uniffi::constructor]
     pub fn aac(asc: &[u8]) -> Result<Arc<Self>, BindingError> {
         let config = AacConfig::new(asc).map_err(|_| BindingError::InvalidMedia)?;
         Ok(Arc::new(Self {
@@ -60,14 +56,13 @@ impl MediaCodec {
     }
 }
 
-#[derive(uniffi::Object)]
 pub struct MediaSample {
     pub(crate) sample: SharedSample,
 }
 
 /// Unattested caller observations plus the unchanged original validated timing.
 /// This is not a native AU count, timing/trim receipt, EOF or codec certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeAacSampleSourceInfo {
     pub producer_generation: u64,
     pub native_pts_us: i64,
@@ -91,12 +86,10 @@ impl From<&AacSourceProvenance> for NativeAacSampleSourceInfo {
 }
 
 /// Opaque paired timing views from ONE existing validated original AAC handle.
-#[derive(uniffi::Object)]
 pub struct NativeAacTimingViews {
     views: AacSampleTimingViews,
     source: NativeAacSampleSourceInfo,
 }
-#[uniffi::export]
 impl NativeAacTimingViews {
     /// Cold inspection only. Opt-in fanout does not require per-unit FFI queries.
     pub fn source_info(&self) -> NativeAacSampleSourceInfo {
@@ -116,7 +109,6 @@ impl NativeAacTimingViews {
     }
 }
 
-#[uniffi::export]
 impl MediaSample {
     /// Narrow AAC-LC48kmono1024 scalar timing views. Source context is reported
     /// by the caller; output packing/head/tail facts still need qualification.
@@ -179,7 +171,6 @@ impl MediaSample {
     }
 }
 
-#[derive(uniffi::Record)]
 pub struct FanoutOutcome {
     pub publishing_queued: bool,
     pub recording_queued: bool,
@@ -188,7 +179,6 @@ pub struct FanoutOutcome {
     pub recording_failed: bool,
 }
 
-#[derive(uniffi::Record)]
 pub struct NativeQueueStats {
     pub publishing_bytes: u64,
     pub recording_bytes: u64,
@@ -332,7 +322,6 @@ impl State {
     }
 }
 
-#[derive(uniffi::Object)]
 pub struct NativeSampleFanout {
     state: Mutex<State>,
 }
@@ -347,9 +336,7 @@ impl NativeSampleFanout {
     }
 }
 
-#[uniffi::export]
 impl NativeSampleFanout {
-    #[uniffi::constructor]
     pub fn new(
         publishing_bytes: u64,
         recording_bytes: u64,
@@ -390,7 +377,6 @@ impl NativeSampleFanout {
     /// Explicit mode: paired AAC views share the EXISTING two queues. Ordinary
     /// push remains available for shared video; every AAC input requires views.
     /// The default constructor retains its existing shared-timing queue policy.
-    #[uniffi::constructor]
     pub fn with_aac_timing_views(
         publishing_bytes: u64,
         recording_bytes: u64,

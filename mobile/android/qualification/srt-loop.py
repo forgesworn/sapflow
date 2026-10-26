@@ -48,8 +48,8 @@ def main():
     version = workspace_package_version((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     aar = ROOT / f"target/native-packages/android-arm64-v8a/sapflow-{version}.aar"
     native = ROOT / "target/debug/libsapflow_ffi.dylib"
-    jna = ROOT / "target/native-tooling/jna-5.19.1.jar"
-    assert aar.is_file() and native.is_file() and jna.is_file(), "Actual packages/native check must be built first"
+    jni = ROOT / "target/debug/libsapflow_jni.dylib"
+    assert aar.is_file() and native.is_file() and jni.is_file(), "Actual packages/native check must be built first"
     for tool in ("kotlinc", "java", "srt-live-transmit", "ffmpeg", "ffprobe"):
         assert shutil.which(tool), f"{tool} required"
     with tempfile.TemporaryDirectory(prefix="srt-jvm-loop-", dir=ROOT / "target/mobile-android") as temporary:
@@ -58,8 +58,9 @@ def main():
         with zipfile.ZipFile(aar) as archive:
             classes.write_bytes(archive.read("classes.jar"))
         source = ROOT / "mobile/android/app/src/main/java/dev/forgesworn/sapflow/broadcaster"
-        run("kotlinc", "-language-version", "2.2", "-api-version", "2.2", "-cp", f"{classes}:{jna}",
-            *[str(source / name) for name in ("EncodedSink.kt", "SrtPublishingSink.kt", "SrtDestination.kt", "SingleSampleOffer.kt", "ExplicitAttempt.kt", "SrtShutdown.kt")],
+        run("kotlinc", "-language-version", "2.2", "-api-version", "2.2", "-cp", str(classes),
+            *[str(source / name) for name in ("EncodedSink.kt", "SrtPublishingSink.kt", "SrtDestination.kt", "SingleSampleOffer.kt", "ExplicitAttempt.kt", "SrtShutdown.kt",
+                "ReconnectController.kt", "PublishingAuthority.kt", "CaptureIntent.kt", "CaptureProfile.kt", "SocketOutputTelemetry.kt")],
             str(ROOT / "mobile/android/qualification/SrtLoop.kt"), "-include-runtime", "-d", str(consumer))
         fixture, received = scratch / "source.flv", scratch / "received.ts"
         run("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30", "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000",
@@ -73,7 +74,7 @@ def main():
             try:
                 time.sleep(0.2)
                 try:
-                    result = run("java", f"-Djna.library.path={native.parent}", "-cp", f"{consumer}:{classes}:{jna}",
+                    result = run("java", f"-Djava.library.path={native.parent}", "-cp", f"{consumer}:{classes}",
                         "dev.forgesworn.sapflow.broadcaster.SrtLoopKt", f"srt://127.0.0.1:{port}", str(fixture), SECRET, timeout=25)
                 except subprocess.CalledProcessError as error:
                     log.flush(); log.seek(0)

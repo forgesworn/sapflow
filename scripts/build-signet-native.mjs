@@ -29,13 +29,12 @@ function run(cmd, args, options = {}) {
 let success = false;
 try {
  run('python3', ['scripts/verify-signet-sources.py']);
- run('cargo', ['build', '--offline', '-j2', '-p', 'sapflow-signet-ffi', '--features', 'bindgen']);
- const generated = join(staging, 'generated'); mkdirSync(generated);
- run(join(root, 'target/debug/sapflow-signet-bindgen'), ['generate', '--library', join(root, 'target/debug/libsapflow_signet_ffi.dylib'), '--language', 'swift', '--out-dir', generated]);
+ run('cargo', ['build', '--offline', '-j2', '-p', 'sapflow-signet-ffi']);
+ const transport = join(root, 'crates/sapflow-signet-ffi');
  const pkg = mode === 'apple' ? apple : join(staging, 'SignetAuth');
  mkdirSync(join(pkg, 'Sources/SignetAuthFFI'), { recursive: true }); mkdirSync(join(pkg, 'Sources/SignetAuth'));
- cpSync(join(generated, 'SignetAuth.swift'), join(pkg, 'Sources/SignetAuth/SignetAuth.swift'));
- cpSync(join(generated, 'SignetAuthFFI.h'), join(pkg, 'Sources/SignetAuthFFI/SignetAuthFFI.h'));
+ cpSync(join(transport, 'swift/SignetAuth.swift'), join(pkg, 'Sources/SignetAuth/SignetAuth.swift'));
+ cpSync(join(transport, 'include/SignetAuthFFI.h'), join(pkg, 'Sources/SignetAuthFFI/SignetAuthFFI.h'));
  writeFileSync(join(pkg, 'Sources/SignetAuthFFI/module.modulemap'), 'module SignetAuthFFI { header "SignetAuthFFI.h" export * link "sapflow_signet_ffi" }\n');
  writeFileSync(join(pkg, 'Package.swift'), '// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name: "SignetAuth", platforms: [.macOS(.v12)], products: [.library(name: "SignetAuth", targets: ["SignetAuth"])], targets: [.systemLibrary(name: "SignetAuthFFI"), .target(name: "SignetAuth", dependencies: ["SignetAuthFFI"])])\n');
  if (mode === 'apple') {
@@ -44,8 +43,8 @@ try {
    // directory so another SDK's flat module.modulemap remains untouched.
    const headersRoot = join(staging, 'headers');
    const headers = join(headersRoot, 'SignetAuthFFI'); mkdirSync(headers, {recursive: true});
-   cpSync(join(generated, 'SignetAuthFFI.h'), join(headers, 'SignetAuthFFI.h'));
-   cpSync(join(generated, 'SignetAuthFFI.modulemap'), join(headers, 'module.modulemap'));
+   cpSync(join(transport, 'include/SignetAuthFFI.h'), join(headers, 'SignetAuthFFI.h'));
+   cpSync(join(transport, 'include/module.modulemap'), join(headers, 'module.modulemap'));
    const libraries = [];
    for (const target of ['aarch64-apple-darwin', 'aarch64-apple-ios', 'aarch64-apple-ios-sim']) {
      run('cargo', ['build', '--offline', '--release', '-j2', '-p', 'sapflow-signet-ffi', '--target', target], {env: {...process.env, CARGO_BUILD_JOBS: '2', MACOSX_DEPLOYMENT_TARGET: '12.0', IPHONEOS_DEPLOYMENT_TARGET: '16.0'}});
@@ -83,7 +82,6 @@ try {
  }
  writeFileSync(join(consumer, 'Package.swift'), `// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name: "Consumer", platforms: [.macOS(.v12)], dependencies: [.package(path: ${JSON.stringify(pkg)}), .package(path: ${JSON.stringify(join(root, 'target/native-packages/apple'))})], targets: [.executableTarget(name: "Consumer", dependencies: [.product(name: "SignetAuth", package: ${JSON.stringify(mode === 'apple' ? 'signet-apple' : 'SignetAuth')}), .product(name: "Sapflow", package: "apple")])])\n`);
  run('swift', ['run', '--package-path', consumer, '--scratch-path', join(output, 'swift-build'), '-j', '2', ...(mode === 'apple' ? [] : ['-Xlinker', '-L'+join(root, 'target/debug'), '-Xlinker', '-rpath', '-Xlinker', join(root, 'target/debug')]), 'Consumer']);
- cpSync(generated, join(output, 'generated'), { recursive: true });
  if (mode === 'apple') {
    writeFileSync(join(pkg, 'README.md'), 'Separate cold SignetAuth Swift package, ARM64 macOS/iOS/iOS Simulator. Clang headers use Headers/SignetAuthFFI/ to coexist with other static XCFrameworks. Existing Sapflow media package unchanged. Real signer consent/site authority/Keychain/app/device qualification remain open.\n');
    run('zip', ['-q', '-r', appleArchive, 'signet-apple'], {cwd: join(root, 'target/native-packages')});

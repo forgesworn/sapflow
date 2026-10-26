@@ -423,18 +423,34 @@ private fun checkNativeRecordingTimingBinding() {
 /** Reflection checks the actual compiled binding classes, including when this
  * consumer is compiled separately against the extracted AAR classes.jar. */
 private fun checkPackagedStatusLeaseCache() {
-    val pool = Class.forName("dev.forgesworn.sapflow.SapflowRustCallStatusPool")
-    val instance = pool.getField("INSTANCE").get(null)
-    val current = pool.declaredMethods.single { it.name.startsWith("current") && it.parameterCount == 0 }
-    current.isAccessible = true
-    val stack = current.invoke(instance)
-    val cached = stack.javaClass.getDeclaredField("cached").apply { isAccessible = true }
-    val depth = stack.javaClass.getDeclaredField("depth").apply { isAccessible = true }
-    val slots = cached.get(stack) as Array<*>
-    check(slots.size == 4 && depth.getInt(stack) == 0)
-    val first = slots[0] ?: error("SDK call did not populate the generated status cache")
-    repeat(100) { check(sdkAbiVersion() == 1u) }
-    check((cached.get(stack) as Array<*>)[0] === first && depth.getInt(stack) == 0)
+    val legacy = runCatching { Class.forName("dev.forgesworn.sapflow.SapflowRustCallStatusPool") }
+    if (legacy.isSuccess) {
+        val pool = legacy.getOrThrow()
+        val instance = pool.getField("INSTANCE").get(null)
+        val current = pool.declaredMethods.single { it.name.startsWith("current") && it.parameterCount == 0 }
+        current.isAccessible = true
+        val stack = current.invoke(instance)
+        val cached = stack.javaClass.getDeclaredField("cached").apply { isAccessible = true }
+        val depth = stack.javaClass.getDeclaredField("depth").apply { isAccessible = true }
+        val slots = cached.get(stack) as Array<*>
+        check(slots.size == 4 && depth.getInt(stack) == 0)
+        val first = slots[0] ?: error("SDK call did not populate the generated status cache")
+        repeat(100) { check(sdkAbiVersion() == 1u) }
+        check((cached.get(stack) as Array<*>)[0] === first && depth.getInt(stack) == 0)
+        return
+    }
+    val native = Class.forName("dev.forgesworn.sapflow.Native")
+    val methods = native.declaredMethods.map { it.name }.toSet()
+    check("directBufferAddress" in methods && "encodedBufferNew" in methods)
+    check("mediaCodecSample" in methods && "mediaSampleScalar" in methods)
+    check("sampleFanoutPush" in methods && "sampleFanoutPop" in methods)
+    val bytes = ByteBuffer.allocateDirect(8)
+    bytes.position(3).limit(7)
+    bytes.put(3, 9)
+    EncodedBuffer(bytes).use {
+        check(it.len() == 4uL && it.byteAt(0uL) == 9.toUByte())
+        check(bytes.position() == 3 && bytes.limit() == 7)
+    }
 }
 
 /** Real generated control bindings; no sockets, capture or timers are started. */

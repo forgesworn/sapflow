@@ -17,11 +17,6 @@ import os, pathlib, shutil, sys
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 if name == 'cargo' and os.environ.get('FAIL_TOOL') == 'cargo': sys.exit(19)
-if name == 'sapflow-signet-bindgen':
-    dest = pathlib.Path(args[args.index('--out-dir')+1]); dest.mkdir(exist_ok=True)
-    (dest/'SignetAuth.swift').write_text('generated fault fixture')
-    (dest/'SignetAuthFFI.h').write_text('int generated_signet_fixture(void);')
-    (dest/'SignetAuthFFI.modulemap').write_text('module SignetAuthFFI { header \"SignetAuthFFI.h\" export * }')
 if name == 'xcrun': print('/generated/sdk')
 if name == 'xcodebuild':
     dest = pathlib.Path(args[args.index('-output')+1]); dest.mkdir(parents=True)
@@ -50,10 +45,12 @@ class PackagingReceiptTests(unittest.TestCase):
         self.bin = self.root/'fake-bin'; self.bin.mkdir()
         for name in ['cargo','python3','xcrun','xcodebuild','swift','swiftc','zip']:
             p = self.bin/name; p.write_text('#!'+sys.executable+'\n'+FAKE); p.chmod(0o700)
-        p = self.root/'target/debug/sapflow-signet-bindgen'; p.parent.mkdir(parents=True)
-        p.write_text('#!'+sys.executable+'\n'+FAKE); p.chmod(0o700)
         for name in ['LICENSE','tests/native/SignetConsumer.swift','crates/sapflow-signet-ffi/THIRD_PARTY_LICENSES.txt']:
             p = self.root/name; p.parent.mkdir(parents=True, exist_ok=True); p.write_text('generated fixture')
+        for name in ['swift/SignetAuth.swift','include/SignetAuthFFI.h','include/module.modulemap']:
+            p = self.root/'crates/sapflow-signet-ffi'/name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT/'crates/sapflow-signet-ffi'/name, p)
         for name in ['V4vContracts','V4vCreatorContracts','SrtDestination','V4vSessionEngine','V4vJournal','V4vControlClient','V4vLoginContracts','V4vSignetLoginOwner','V4vNativeSignet','OriginObservationPolicy','OriginSDKConfirmation']:
             p = self.root/'mobile/ios/Sources'/ (name+'.swift'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('generated fixture')
 
@@ -104,8 +101,8 @@ class PackagingReceiptTests(unittest.TestCase):
         self.assertEqual(self.invoke('apple'), 0)
         headers = self.root/'target/header-snapshot'
         self.assertFalse((headers/'module.modulemap').exists())
-        self.assertTrue((headers/'SignetAuthFFI/SignetAuthFFI.h').is_file())
-        self.assertEqual((headers/'SignetAuthFFI/module.modulemap').read_text(), 'module SignetAuthFFI { header "SignetAuthFFI.h" export * }')
+        self.assertEqual((headers/'SignetAuthFFI/SignetAuthFFI.h').read_bytes(), (ROOT/'crates/sapflow-signet-ffi/include/SignetAuthFFI.h').read_bytes())
+        self.assertEqual((headers/'SignetAuthFFI/module.modulemap').read_text(), (ROOT/'crates/sapflow-signet-ffi/include/module.modulemap').read_text())
 
     def test_actual_script_headers_merge_without_overwriting_other_sdk_map(self):
         self.assertEqual(self.invoke('apple'), 0)

@@ -12,12 +12,6 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
 default = []
-bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
-
-[[bin]]
-name = "sapflow-bindgen"
-path = "src/bin/bindgen.rs"
-required-features = ["bindgen"]
 
 [lints]
 workspace = true
@@ -28,4 +22,3 @@ sapflow-client = { path = "../sapflow-client" }
 sapflow-hls = { path = "../sapflow-hls" }
 sapflow-rtmp = { path = "../sapflow-rtmp" }
 sapflow-srt = { path = "../sapflow-srt" }
-uniffi = { version = "=0.32.2", default-features = false }
