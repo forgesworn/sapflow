@@ -22,7 +22,7 @@ HOST_OWNER_SOURCES = tuple('mobile/android/app/src/main/java/dev/forgesworn/sapf
     'AudioAacProfile.kt', 'AudioNativeAacGeneration.kt', 'AudioNativeAacRun.kt', 'RecordingCatalogue.kt',
     'RecordingAppendContext.kt', 'RecordingCheckpointStorage.kt', 'AndroidRecordingStorageIO.kt', 'RecordingCheckpointOwner.kt',
 )) + ('mobile/android/host-tests/RecordingCheckpointOwnerHostTest.kt',)
-JNA_SHA256 = '4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae'
+NATIVE_LIBRARIES = ('libsapflow_ffi.so', 'libsapflow_jni.so')
 MAX_METADATA = 16 * 1024 * 1024
 
 def need(value, message):
@@ -166,13 +166,20 @@ def zip_read(archive, name, limit):
 def inspect_aar(path):
     with ZipFile(path) as archive:
         names = [name for name in archive.namelist() if name.startswith('jni/') and name.endswith('.so')]
-        need(names == ['jni/arm64-v8a/libsapflow_ffi.so'], 'Expected fresh single-ABI ARM64 SDK package')
-        native = zip_read(archive, names[0], 128 * 1024 * 1024)
+        need(len(names) == len(NATIVE_LIBRARIES) and set(names) == {'jni/arm64-v8a/' + name for name in NATIVE_LIBRARIES},
+             'Expected fresh single-ABI ARM64 Rust and JNI SDK libraries')
+        libraries = {}
+        for name in NATIVE_LIBRARIES:
+            data = zip_read(archive, 'jni/arm64-v8a/' + name, 128 * 1024 * 1024)
+            libraries[name] = dict(sha256=hashlib.sha256(data).hexdigest(), loadAlignments=elf_alignments(data))
         classes = zip_read(archive, 'classes.jar', 32 * 1024 * 1024)
         notices = {name: hashlib.sha256(zip_read(archive, name, MAX_METADATA)).hexdigest() for name in ('META-INF/LICENSE', 'META-INF/THIRD_PARTY_LICENSES.txt')}
-    return dict(aarSHA256=sha(path), nativeSHA256=hashlib.sha256(native).hexdigest(), classesSHA256=hashlib.sha256(classes).hexdigest(), nativeLoadAlignments=elf_alignments(native), notices=notices, abis=['arm64-v8a'])
+    native = libraries['libsapflow_ffi.so']
+    return dict(aarSHA256=sha(path), nativeSHA256=native['sha256'], classesSHA256=hashlib.sha256(classes).hexdigest(),
+                nativeLoadAlignments=native['loadAlignments'], nativeLibraries=libraries, notices=notices, abis=['arm64-v8a'])
 
-def inspect_apk(path, expected_native):
+def inspect_apk(path, expected_libraries):
+    need(set(expected_libraries) == set(NATIVE_LIBRARIES), 'Both fresh SDK library identities required')
     libraries = {}
     with ZipFile(path) as archive:
         names = [name for name in archive.namelist() if name.startswith('lib/') and name.endswith('.so')]
@@ -186,7 +193,9 @@ def inspect_apk(path, expected_native):
             filename, extra = struct.unpack_from('<HH', header, 26)
             need((info.header_offset + 30 + filename + extra) % 16384 == 0, 'APK native ZIP data requires 16 KiB alignment')
             libraries[name] = dict(sha256=hashlib.sha256(data).hexdigest(), loadAlignments=elf_alignments(data))
-    need(libraries.get('lib/arm64-v8a/libsapflow_ffi.so', {}).get('sha256') == expected_native, 'APK JNI differs from this run\'s fresh SDK')
+    for name, expected in expected_libraries.items():
+        need(libraries.get('lib/arm64-v8a/' + name, {}).get('sha256') == expected['sha256'],
+             'APK library differs from this run\'s fresh SDK: ' + name)
     return dict(apkSHA256=sha(path), libraries=libraries, abis=['arm64-v8a'])
 
 def fact(path):
@@ -341,11 +350,11 @@ def main():
         need(re.search(r'kotlinc-jvm\s+2\.2\.20\b', run('kotlin-version', [tools['kotlinc'], '-version'], 60)), 'Select the pinned Kotlin2.2.20 compiler')
         run('sdk-build', [tools['node'], 'scripts/build-native.mjs', 'android', '--abis=arm64-v8a', '--output-root=' + str(package_root)], 1800)
         generated = capture_package_files(package_root); package_captured = True
-        host_library = target / ('debug/libsapflow_ffi.' + ('dylib' if sys.platform == 'darwin' else 'so'))
-        jna = target / 'native-tooling/jna-5.19.1.jar'
-        need(all(path.is_file() and not path.is_symlink() and path.resolve() == path for path in (host_library, jna)), 'Current SDK builder host library and JNA required')
-        need(sha(jna) == JNA_SHA256, 'Existing SDK builder JNA checksum')
-        generated.update({str(path): fact(path) for path in (host_library, jna)})
+        host_libraries = tuple(target / ('debug/' + name.removesuffix('.so') + ('.dylib' if sys.platform == 'darwin' else '.so'))
+                               for name in NATIVE_LIBRARIES)
+        need(all(path.is_file() and not path.is_symlink() and path.resolve() == path for path in host_libraries),
+             'Current SDK builder host Rust and JNI libraries required')
+        generated.update({str(path): fact(path) for path in host_libraries})
         folder = package_root / 'android-arm64-v8a'; aar = folder / ('sapflow-' + version + '.aar')
         package = inspect_aar(aar)
         need(package['notices']['META-INF/LICENSE'] == sha(root / 'LICENSE') and package['notices']['META-INF/THIRD_PARTY_LICENSES.txt'] == sha(folder / 'THIRD_PARTY_LICENSES.txt'), 'Actual AAR/source dependency notices')
@@ -376,7 +385,7 @@ def main():
             lint[variant]['originalXMLSHA256'] = lint[variant]['sha256']
             lint[variant]['sha256'] = retain_log(report, destination, MAX_METADATA)
             paths = list((target / 'mobile-android/app/outputs/apk' / variant).glob('*.apk')); need(len(paths) == 1, 'One APK per variant')
-            apks[variant] = dict(path=str(paths[0]), **inspect_apk(paths[0], package['nativeSHA256']))
+            apks[variant] = dict(path=str(paths[0]), **inspect_apk(paths[0], package['nativeLibraries']))
             generated[str(paths[0])] = fact(paths[0])
         host_source = None
         for name in HOST_OWNER_SOURCES:
@@ -395,14 +404,14 @@ def main():
             with host_classes.open('xb') as stream: stream.write(zip_read(archive, 'classes.jar', 32 * 1024 * 1024))
         need(sha(host_classes) == package['classesSHA256'], 'Host controls must use the actual fresh AAR classes')
         generated[str(host_classes)] = fact(host_classes)
-        classpath = os.pathsep.join(str(path) for path in (host_classes, jna, *serialization, sdk / 'platforms/android-36/android.jar'))
+        classpath = os.pathsep.join(str(path) for path in (host_classes, *serialization, sdk / 'platforms/android-36/android.jar'))
         run('host-owner-compile', [tools['kotlinc'], '-language-version', '2.2', '-api-version', '2.2', '-jvm-target', '17',
             '-J-Djava.io.tmpdir=' + str(host_tmp), *[root / name for name in HOST_OWNER_SOURCES], '-cp', classpath,
             '-include-runtime', '-d', host_binary], 180)
         need(host_binary.is_file() and not host_binary.is_symlink(), 'Actual compiled host controls required')
         generated[str(host_binary)] = fact(host_binary)
         output = run('host-owner-controls', [jdk / 'bin/java', '-Djava.io.tmpdir=' + str(host_tmp),
-            '-Djna.library.path=' + str(host_library.parent), '-Duniffi.component.sapflow_ffi.libraryOverride=' + str(host_library),
+            '-Djava.library.path=' + str(host_libraries[0].parent),
             '-cp', str(host_binary) + os.pathsep + classpath,
             'dev.forgesworn.sapflow.broadcaster.RecordingCheckpointOwnerHostTestKt', host_data], 180)
         host_controls = check_host_controls(output, host_methods)

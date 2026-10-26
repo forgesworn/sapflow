@@ -129,5 +129,39 @@ class NativeMatrixValidationTests(unittest.TestCase):
                 driver.fixture_media(base, "producer-audio", "alias.m4a")
 
 
+class NativeCommandValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.commands = [dict(log=name, exit=0, groupStopped=True, error=None)
+                         for name in driver.COMMAND_LOGS]
+
+    def test_current_direct_binding_build_and_all_media_oracles_pass(self):
+        self.assertEqual(len(self.commands), 19)
+        driver.validate_commands(self.commands)
+
+    def test_each_missing_stage_is_refused(self):
+        for index in range(len(self.commands)):
+            with self.subTest(stage=index), self.assertRaises(RuntimeError):
+                driver.validate_commands(self.commands[:index] + self.commands[index + 1:])
+
+    def test_duplicate_or_reordered_stage_is_refused(self):
+        for commands in (self.commands + [self.commands[-1]], list(reversed(self.commands))):
+            with self.assertRaises(RuntimeError):
+                driver.validate_commands(commands)
+
+    def test_failed_or_unclosed_stage_is_refused(self):
+        for name, value in [('exit', 1), ('groupStopped', False), ('error', 'failed')]:
+            commands = copy.deepcopy(self.commands)
+            commands[2][name] = value
+            with self.subTest(field=name), self.assertRaises(RuntimeError):
+                driver.validate_commands(commands)
+
+    def test_payload_and_producer_checkpoints_require_the_exact_prefix(self):
+        for stage, count in [('missing-file-EOF-packets.local.json', 9),
+                             ('producer-publishing-failure-decode.local.log', 15)]:
+            driver.validate_commands(self.commands[:count], stage)
+            with self.assertRaises(RuntimeError):
+                driver.validate_commands(self.commands[:count - 1], stage)
+
+
 if __name__ == "__main__":
     unittest.main()

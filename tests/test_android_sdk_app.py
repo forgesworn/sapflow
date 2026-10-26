@@ -1,5 +1,6 @@
 """Generated XML/ZIP/ELF gate regressions; no build, JVM, SDK or device."""
 import importlib.util
+import hashlib
 from pathlib import Path
 import struct
 import tempfile
@@ -39,25 +40,33 @@ class AndroidSdkAppTests(unittest.TestCase):
         path = self.root / name; ET.ElementTree(suite).write(path, encoding='utf-8')
         return path
 
-    def aar(self, *, abi='arm64-v8a', data=None, classes=True, notices=True):
+    def aar(self, *, abi='arm64-v8a', data=None, classes=True, notices=True, jni=True, jni_data=None):
         path = self.root / 'sdk.aar'
         with ZipFile(path, 'w') as archive:
             archive.writestr('jni/' + abi + '/libsapflow_ffi.so', native_elf() if data is None else data)
+            if jni: archive.writestr('jni/' + abi + '/libsapflow_jni.so', native_elf() if jni_data is None else jni_data)
             if classes: archive.writestr('classes.jar', b'generated-class-bytes')
             if notices:
                 archive.writestr('META-INF/LICENSE', 'generated MIT notice')
                 archive.writestr('META-INF/THIRD_PARTY_LICENSES.txt', 'generated dependency notice')
         return path
 
-    def apk(self, *, align=True, data=None, compressed=False, abi='arm64-v8a'):
-        path = self.root / 'app.apk'; name = 'lib/' + abi + '/libsapflow_ffi.so'
-        info = ZipInfo(name); info.compress_type = ZIP_DEFLATED if compressed else ZIP_STORED
-        if align:
-            padding = (-(30 + len(name.encode()))) % 16384
-            if padding < 4: padding += 16384
-            info.extra = struct.pack('<HH', 0xffff, padding - 4) + bytes(padding - 4)
-        with ZipFile(path, 'w') as archive: archive.writestr(info, native_elf() if data is None else data)
+    def apk(self, *, align=True, data=None, compressed=False, abi='arm64-v8a', jni=True, jni_data=None):
+        path = self.root / 'app.apk'
+        with ZipFile(path, 'w') as archive:
+            for library in driver.NATIVE_LIBRARIES if jni else driver.NATIVE_LIBRARIES[:1]:
+                name = 'lib/' + abi + '/' + library
+                info = ZipInfo(name); info.compress_type = ZIP_DEFLATED if compressed else ZIP_STORED
+                if align:
+                    padding = (-(archive.fp.tell() + 30 + len(name.encode()))) % 16384
+                    if padding < 4: padding += 16384
+                    info.extra = struct.pack('<HH', 0xffff, padding - 4) + bytes(padding - 4)
+                payload = jni_data if library == 'libsapflow_jni.so' else data
+                archive.writestr(info, native_elf() if payload is None else payload)
         return path
+
+    def library_hashes(self):
+        return {name: dict(sha256=hashlib.sha256(native_elf()).hexdigest()) for name in driver.NATIVE_LIBRARIES}
 
     def test_profile_method_selection_is_complete(self):
         source = '\n'.join('@Test fun ' + name + '() {}' for name in self.methods)
@@ -173,6 +182,14 @@ class AndroidSdkAppTests(unittest.TestCase):
     def test_missing_dependency_notices_are_refused(self):
         with self.assertRaises(RuntimeError): driver.inspect_aar(self.aar(notices=False))
 
+    def test_missing_jni_bridge_in_aar_is_refused(self):
+        with self.assertRaises(RuntimeError): driver.inspect_aar(self.aar(jni=False))
+
+    def test_jni_bridge_requires_arm64_and_sixteen_kib_alignment(self):
+        for data in (native_elf(4096), native_elf(machine=62)):
+            with self.subTest(data=data), self.assertRaises(RuntimeError):
+                driver.inspect_aar(self.aar(jni_data=data))
+
     def test_four_kib_elf_is_refused(self):
         with self.assertRaises(RuntimeError): driver.elf_alignments(native_elf(4096))
 
@@ -183,21 +200,24 @@ class AndroidSdkAppTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): driver.elf_alignments(native_elf()[:-1])
 
     def test_aligned_apk_original_jni_is_accepted(self):
-        import hashlib
-        expected = hashlib.sha256(native_elf()).hexdigest()
-        self.assertEqual(driver.inspect_apk(self.apk(), expected)['abis'], ['arm64-v8a'])
+        self.assertEqual(driver.inspect_apk(self.apk(), self.library_hashes())['abis'], ['arm64-v8a'])
 
     def test_unaligned_apk_jni_is_refused(self):
-        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(align=False), 'a' * 64)
+        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(align=False), self.library_hashes())
 
     def test_compressed_apk_jni_is_refused(self):
-        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(compressed=True), 'a' * 64)
+        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(compressed=True), self.library_hashes())
 
     def test_changed_apk_jni_is_refused(self):
-        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(), 'a' * 64)
+        expected = self.library_hashes(); expected['libsapflow_ffi.so']['sha256'] = 'a' * 64
+        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(), expected)
 
     def test_other_apk_abi_is_refused(self):
-        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(abi='x86_64'), 'a' * 64)
+        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(abi='x86_64'), self.library_hashes())
+
+    def test_missing_or_changed_jni_bridge_in_apk_is_refused(self):
+        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(jni=False), self.library_hashes())
+        with self.assertRaises(RuntimeError): driver.inspect_apk(self.apk(jni_data=native_elf() + b'changed'), self.library_hashes())
 
     def test_new_hidden_package_file_is_not_omitted(self):
         folder = self.root / 'package'; folder.mkdir(); (folder / 'sdk.aar').write_bytes(b'generated')
