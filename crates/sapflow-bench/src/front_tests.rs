@@ -151,6 +151,18 @@ async fn run_against(
     viewers: usize,
     trust_pem: impl FnOnce(&Pki) -> String,
 ) -> (Stats, Arc<Seen>) {
+    let (out, seen) = run_cohorts(alpn, http2, viewers, None, trust_pem).await;
+    (out.normal, seen)
+}
+
+/// As `run_against`, with `slow` of the viewers paced to `rate` bytes a second.
+async fn run_cohorts(
+    alpn: &[&[u8]],
+    http2: bool,
+    viewers: usize,
+    slow: Option<(usize, u64)>,
+    trust_pem: impl FnOnce(&Pki) -> String,
+) -> (Outcome, Arc<Seen>) {
     let pki = pki(alpn);
     let trusted = trust_pem(&pki);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -172,6 +184,8 @@ async fn run_against(
         full: None,
         ca: Some(ca.to_string_lossy().into_owned()),
         http2,
+        slow: slow.map_or(0, |(n, _)| n),
+        slow_rate: slow.map(|(_, rate)| rate),
     };
     let stats = run(&a).await;
     let _ = std::fs::remove_file(&ca);
@@ -258,7 +272,39 @@ async fn a_missing_ca_file_is_an_error_not_a_panic() {
         full: None,
         ca: Some("/nonexistent/ca.pem".into()),
         http2: true,
+        slow: 0,
+        slow_rate: None,
     };
     let e = run(&a).await.err().expect("no such file");
     assert!(e.contains("--ca"), "{e}");
+}
+
+#[tokio::test]
+async fn slow_viewers_read_paced_and_are_counted_apart_from_the_others() {
+    // The front sends 20 000 bytes for a part or segment: 0.2 s at this rate.
+    let (out, seen) = run_cohorts(&[b"h2"], true, 3, Some((1, 100_000)), own_ca).await;
+    let (normal, slow) = (out.normal, out.slow);
+    assert_eq!(normal.errors, 0, "{:?}", normal.error_kinds);
+    assert_eq!(slow.errors, 0, "{:?}", slow.error_kinds);
+    // One connection per viewer: two ordinary, one slow, none shared.
+    assert_eq!(seen.connections.load(Ordering::SeqCst), 3);
+    assert_eq!((normal.connections.len(), slow.connections.len()), (2, 1));
+    assert!(normal.requests > 0 && slow.requests > 0);
+    // The slow viewer got its media, no faster than the rate allows.
+    assert!(!slow.segment.is_empty() && !slow.parts.is_empty());
+    assert!(
+        slow.segment
+            .iter()
+            .all(|t| *t >= Duration::from_millis(200)),
+        "{:?}",
+        slow.segment
+    );
+    assert!(
+        normal
+            .segment
+            .iter()
+            .all(|t| *t < Duration::from_millis(200)),
+        "{:?}",
+        normal.segment
+    );
 }
