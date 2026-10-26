@@ -725,6 +725,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_successful_heads_exhaust_retries_without_false_delivery() {
+        let receiver = Receiver::start(|hit| {
+            Some(match hit % 4 {
+                0 => b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n".to_vec(),
+                1 => b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n".to_vec(),
+                2 => b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n".to_vec(),
+                _ => b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+            })
+        })
+        .await;
+        let scope = fixture_scope("a", 1, 1, 1);
+        let callbacks = Callbacks::start(Some(receiver.url()), None).scoped(scope.clone());
+        callbacks.send(&scope.key().path, StreamEvent::Publish);
+        state_is(&scope, "failed", Duration::from_secs(6)).await;
+        assert_eq!(receiver.count(), 4);
+        assert_eq!(scope.observations.counts().callbacks_delivered, 0);
+        assert_eq!(scope.observations.counts().callbacks_failed, 1);
+        drop(callbacks);
+    }
+
+    #[tokio::test]
     async fn a_redirect_is_a_failed_attempt_and_is_never_followed() {
         let elsewhere = Receiver::start(|_| answer_status(200)).await;
         let location = elsewhere.url();

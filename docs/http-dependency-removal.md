@@ -49,7 +49,8 @@ invalid URLs, interim limits, unbounded heads, silent peers and closed ports.
 
 ## Validation, 26 October 2026
 
-- `cargo test --workspace`: 954 passed, six ignored, zero failures.
+- `cargo test --workspace`: 957 passed, six ignored, zero failures after the
+  response-framing review correction below.
 - Workspace clippy with warnings denied, format check and the full SRT/RTMP,
   LL-HLS, reconnect, callback, encryption and recording smoke test pass.
 - All 221 pre-existing Python regressions pass. The updated mobile gate
@@ -60,10 +61,19 @@ invalid URLs, interim limits, unbounded heads, silent peers and closed ports.
   that tree. The distribution licence inventory was regenerated.
 - The production parser and callback URL writer have a new `http_lite` fuzz
   target with generated HTTP/URL seeds, automatically discovered by CI.
-  An AddressSanitizer run with debug assertions and overflow checks completed
+  The initial AddressSanitizer run with debug assertions and overflow checks completed
   11,942,254 executions in 61 seconds with no finding, at maximum input length
   65,536 bytes. This is a finite parser campaign, not internet-exposure or
-  independent security approval.
+  independent security approval. CI reruns the target on the final source.
+
+Independent review found that malformed successful callback responses could
+be acknowledged despite conflicting or invalid Content-Length headers. The
+correction restores the prior client's framing precedence and numeric checks,
+while preserving valid duplicate lengths, chunked/close-delimited responses and
+no-body statuses. A raw receiver regression requires four attempts, zero
+deliveries and one failure. The reviewer re-read the focused correction and
+reported no remaining merge-blocking finding; broader production acceptance is
+still separate.
 
 The mobile gate fixes are a separate preceding commit. The generated iOS
 matrix and full Android SDK/app gate were run in their own checkout; they are

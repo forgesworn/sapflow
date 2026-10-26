@@ -3,12 +3,13 @@
 //! (`callback.rs`). Bytes in, values out, no I/O, so it is unit-tested here and
 //! fuzzed by `fuzz/fuzz_targets/http_lite.rs`, which includes this file.
 //!
-//! Deliberately small. A message is one head plus a body framed by a single
-//! `content-length`. Chunked bodies, repeated or non-numeric lengths, bare line
+//! Deliberately small. A control request is one head plus a body framed by a single
+//! `content-length`. Chunked requests, repeated or non-numeric lengths, bare line
 //! feeds, obsolete line folding and absolute-form targets are refused rather
 //! than interpreted, so no second parser in front of or behind this one can
 //! disagree about where a message ends. Every exchange is one request and one
-//! response on a connection that then closes (`connection: close`).
+//! response on a connection that then closes (`connection: close`). Callback
+//! responses retain the previous client's framing checks but read only the head.
 
 use std::fmt;
 
@@ -227,7 +228,7 @@ pub enum ParsedResponse {
         used: usize,
     },
     Partial,
-    /// Not a response, or a head over `MAX_HEAD`.
+    /// Not a response, invalid body framing, or a head over `MAX_HEAD`.
     Malformed,
 }
 
@@ -236,16 +237,66 @@ pub enum ParsedResponse {
 pub fn parse_response(buf: &[u8]) -> ParsedResponse {
     let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
     let mut res = httparse::Response::new(&mut headers);
-    match res.parse(buf) {
-        Ok(httparse::Status::Complete(used)) if used <= MAX_HEAD => match res.code {
-            Some(status) if (100..600).contains(&status) => {
-                ParsedResponse::Complete { status, used }
-            }
-            _ => ParsedResponse::Malformed,
-        },
-        Ok(httparse::Status::Partial) if buf.len() < MAX_HEAD => ParsedResponse::Partial,
+    let used = match res.parse(buf) {
+        Ok(httparse::Status::Complete(used)) if used <= MAX_HEAD => used,
+        Ok(httparse::Status::Partial) if buf.len() < MAX_HEAD => return ParsedResponse::Partial,
+        _ => return ParsedResponse::Malformed,
+    };
+    match res.code {
+        Some(status)
+            if (100..600).contains(&status)
+                && valid_response_framing(res.version, status, res.headers) =>
+        {
+            ParsedResponse::Complete { status, used }
+        }
         _ => ParsedResponse::Malformed,
     }
+}
+
+/// Preserve the previous client's response-head checks before acknowledging a
+/// callback. No-body statuses ignore framing; otherwise Transfer-Encoding takes
+/// precedence on HTTP/1.1 only. Without it, all Content-Length values (including
+/// comma lists) must be valid and identical. Closing each connection does not
+/// make a malformed successful response an acknowledgement.
+fn valid_response_framing(
+    version: Option<u8>,
+    status: u16,
+    headers: &[httparse::Header<'_>],
+) -> bool {
+    if status < 200 || matches!(status, 204 | 304) {
+        return true;
+    }
+    if headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return version == Some(1);
+    }
+    let mut agreed = None;
+    for header in headers {
+        if !header.name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        for value in header.value.split(|byte| *byte == b',') {
+            let value = value.trim_ascii();
+            if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                return false;
+            }
+            let length = std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok());
+            // The previous decoder reserved the two largest u64 values for
+            // unknown lengths. Keep its accepted numeric range unchanged.
+            let Some(length) = length.filter(|length| *length <= u64::MAX - 2) else {
+                return false;
+            };
+            if agreed.is_some_and(|previous| previous != length) {
+                return false;
+            }
+            agreed = Some(length);
+        }
+    }
+    true
 }
 
 /// Where a callback goes, from an `http://` URL.
@@ -614,6 +665,53 @@ mod tests {
         }
         many.push_str("\r\n");
         assert_eq!(parse_response(many.as_bytes()), ParsedResponse::Malformed);
+    }
+
+    #[test]
+    fn malformed_response_framing_cannot_acknowledge_a_callback() {
+        for headers in [
+            "Content-Length: 0\r\nContent-Length: 1\r\n",
+            "Content-Length: 0, 1\r\n",
+            "Content-Length: nope\r\n",
+            "Content-Length: +1\r\n",
+            "Content-Length: \r\n",
+            "Content-Length: 18446744073709551616\r\n",
+            "Content-Length: 18446744073709551615\r\n",
+            "Content-Length: 18446744073709551614\r\n",
+        ] {
+            let raw = format!("HTTP/1.1 200 OK\r\n{headers}\r\n");
+            assert_eq!(
+                parse_response(raw.as_bytes()),
+                ParsedResponse::Malformed,
+                "{headers}"
+            );
+        }
+        assert_eq!(
+            parse_response(b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"),
+            ParsedResponse::Malformed
+        );
+    }
+
+    #[test]
+    fn valid_response_framing_retains_status_only_acknowledgements() {
+        for raw in [
+            "HTTP/1.1 200 OK\r\n\r\n",
+            "HTTP/1.0 200 OK\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 3, 03\r\nContent-Length: 3\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551613\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: nope\r\n\r\n",
+            "HTTP/1.1 204 No Content\r\nContent-Length: nope\r\n\r\n",
+            "HTTP/1.1 100 Continue\r\nContent-Length: nope\r\n\r\n",
+        ] {
+            assert!(
+                matches!(parse_response(raw.as_bytes()), ParsedResponse::Complete { used, .. } if used == raw.len()),
+                "{raw}"
+            );
+        }
     }
 
     fn endpoint(url: &str) -> Endpoint {
