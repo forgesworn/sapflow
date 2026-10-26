@@ -102,7 +102,6 @@ struct Shared {
 /// retains that permit; a replacement never bypasses it. Methods never perform
 /// protocol work on the calling thread. Only wait_event/wait_closed may wait,
 /// and must run on a dedicated cold Swift auth queue, never main/capture.
-#[derive(uniffi::Object)]
 pub struct NativeSignet {
     shared: Arc<Shared>,
     tx: mpsc::Sender<Command>,
@@ -163,17 +162,14 @@ fn real(config: Config) -> Response<Box<dyn Port>> {
     }))
 }
 
-#[uniffi::export]
 impl NativeSignet {
     /// Offline validation/construction. Only explicit connect starts pairing.
-    #[uniffi::constructor]
     pub fn pair_bunker(uri: String, deadline_ms: u32) -> Response<Arc<Self>> {
         let uri = Zeroizing::new(uri);
         contract::bunker_uri(&uri, false)?;
         Self::spawn(Config::Pair(uri), deadline_ms)
     }
     /// Reuse exactly the stored client identity; never silently re-pair.
-    #[uniffi::constructor]
     pub fn restore(credential: Arc<SignetCredential>, deadline_ms: u32) -> Response<Arc<Self>> {
         contract::decode_credential(&credential.bytes)?;
         Self::spawn(Config::Restore(credential), deadline_ms)
@@ -477,10 +473,10 @@ async fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
-    static SERIAL: Mutex<()> = Mutex::new(());
+    pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
     struct Gates {
         connect: Notify,
         shutdown: Notify,
@@ -556,6 +552,10 @@ mod tests {
             }),
             gates,
         )
+    }
+    pub(crate) fn capi_owner() -> Arc<NativeSignet> {
+        let (port, _) = test_port(false, false, false);
+        NativeSignet::spawn_port(2_000, move || Ok(port)).expect("C API test owner")
     }
     fn ready(owner: &NativeSignet) -> Arc<SignetCredential> {
         owner.connect(1).expect("connect admitted");

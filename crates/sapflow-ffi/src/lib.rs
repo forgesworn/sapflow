@@ -1,10 +1,11 @@
 //! Native ownership boundary. Raw frames and PCM never cross this API.
 //!
-//! UniFFI borrows the encoder's compressed bytes for the synchronous call.
+//! The C ABI borrows the encoder's compressed bytes for the synchronous call.
 //! `EncodedBuffer` makes one bounded ownership copy and can be shared by
 //! Rust recording and publishing consumers after the foreign call returns.
 
 use std::sync::Arc;
+mod capi;
 mod media;
 mod recording;
 mod rtmp;
@@ -42,11 +43,9 @@ pub use srt::{
     NativeSrtEvent, NativeSrtPublisher, NativeSrtState, NativeSrtStats,
 };
 
-uniffi::setup_scaffolding!();
-
 pub const MAX_ENCODED_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, uniffi::Error)]
+#[derive(Debug)]
 pub enum BindingError {
     EmptyBuffer,
     BufferTooLarge,
@@ -79,14 +78,11 @@ impl std::fmt::Display for BindingError {
 
 impl std::error::Error for BindingError {}
 
-#[derive(uniffi::Object)]
 pub struct EncodedBuffer {
     bytes: Arc<[u8]>,
 }
 
-#[uniffi::export]
 impl EncodedBuffer {
-    #[uniffi::constructor]
     pub fn new(bytes: &[u8]) -> Result<Arc<Self>, BindingError> {
         if bytes.is_empty() {
             return Err(BindingError::EmptyBuffer);
@@ -117,7 +113,6 @@ impl EncodedBuffer {
     }
 }
 
-#[uniffi::export]
 pub fn sdk_abi_version() -> u32 {
     1
 }

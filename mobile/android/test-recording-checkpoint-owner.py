@@ -34,7 +34,7 @@ assert host['newBuildPerformedByRecorder'] is False
 sdk_map=checked('sdkSourceManifest');sdk=json.loads(sdk_map.read_text())
 assert len(sdk)==118 and sdk==host['inputs']
 assert sha(sdk_map)==host['inputManifestSHA256']
-sdk_paths=sorted(set(p for p in [*root.glob('crates/**/src/**/*.rs'),*root.glob('crates/*/Cargo.toml'),*root.glob('crates/*/uniffi.toml'),*root.glob('crates/**/build.rs'),*root.glob('.cargo/*'),root/'THIRD_PARTY_LICENSES.txt',root/'Cargo.toml',root/'Cargo.lock',root/'.cargo/config.toml',root/'scripts/build-native.mjs',root/'scripts/native-kotlin-status-leases.mjs',root/'scripts/third-party-licences.py',root/'rust-toolchain.toml',root/'LICENSE',*root.glob('tests/native/*')] if p.is_file()))
+sdk_paths=sorted(set(p for p in [*root.glob('crates/**/src/**/*.rs'),*root.glob('crates/*/Cargo.toml'),*root.glob('crates/**/build.rs'),*root.glob('.cargo/*'),root/'THIRD_PARTY_LICENSES.txt',root/'Cargo.toml',root/'Cargo.lock',root/'.cargo/config.toml',root/'scripts/build-native.mjs',root/'scripts/third-party-licences.py',root/'rust-toolchain.toml',root/'LICENSE',*root.glob('tests/native/*')] if p.is_file()))
 assert set(sdk)=={str(p.relative_to(root)) for p in sdk_paths}
 assert all(sha(root/p)==h for p,h in sdk.items())
 assert len(host['outputs'])==1 and all(sha(root/p)==h for p,h in host['outputs'].items())
@@ -160,8 +160,7 @@ try:
     commands=[('compile',['kotlinc','-language-version','2.2','-api-version','2.2','-jvm-target','17',
         '-J-Djava.io.tmpdir='+str(working/'tmp'),*[str(root/p) for p in sources],'-cp',classpath,
         '-include-runtime','-d',str(working/'controls.jar')],180),
-        ('controls',['java','-Djava.io.tmpdir='+str(working/'tmp'),'-Djna.library.path='+str(library.parent),
-        '-Duniffi.component.sapflow_ffi.libraryOverride='+str(library),
+        ('controls',['java','-Djava.io.tmpdir='+str(working/'tmp'),'-Djava.library.path='+str(library.parent),
         '-cp',str(working/'controls.jar')+os.pathsep+classpath,
         'dev.forgesworn.sapflow.broadcaster.RecordingCheckpointOwnerHostTestKt',str(working/'data')],180)]
     for name,command,timeout in commands:

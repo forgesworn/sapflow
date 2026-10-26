@@ -1,14 +1,14 @@
 //! Creator authentication is separate from capture and the runtime-free media SDK.
+mod capi;
 mod contract;
 mod owner;
 pub use owner::NativeSignet;
 use std::fmt;
 use std::sync::Arc;
 use zeroize::Zeroizing;
-uniffi::setup_scaffolding!();
 
 /// Fixed redacted failures. Never export upstream URI, signer or relay messages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignetError {
     InvalidInput,
     InvalidCredential,
@@ -28,7 +28,6 @@ impl fmt::Display for SignetError {
 impl std::error::Error for SignetError {}
 
 /// Only the client credential, never the creator key. Encrypt before persistence.
-#[derive(uniffi::Object)]
 pub struct SignetCredential {
     bytes: Zeroizing<Vec<u8>>,
 }
@@ -37,10 +36,8 @@ impl fmt::Debug for SignetCredential {
         f.write_str("SignetCredential(redacted)")
     }
 }
-#[uniffi::export]
 impl SignetCredential {
     /// Validate a previously encrypted-and-restored client credential.
-    #[uniffi::constructor]
     pub fn restore(bytes: Vec<u8>) -> Result<Arc<Self>, SignetError> {
         let bytes = Zeroizing::new(bytes);
         contract::decode_credential(&bytes)?;
@@ -53,7 +50,6 @@ impl SignetCredential {
 }
 
 /// One bounded completion slot, tagged by the caller's monotonically rising ID.
-#[derive(uniffi::Enum)]
 pub enum SignetEvent {
     Ready {
         request_id: u64,

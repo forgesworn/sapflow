@@ -7,7 +7,7 @@ use sapflow_client::session::{
 };
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum NativeSessionAction {
     None,
     Connect,
@@ -31,7 +31,7 @@ impl From<SessionAction> for NativeSessionAction {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum NativeSessionState {
     Idle,
     Preparing,
@@ -61,7 +61,7 @@ impl From<SessionState> for NativeSessionState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeMediaReadiness {
     Unknown,
     Confirmed,
@@ -74,7 +74,7 @@ impl From<MediaReadiness> for NativeMediaReadiness {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeRetryBudgetState {
     Available,
     WindowOpen,
@@ -89,7 +89,7 @@ impl From<RetryBudgetState> for NativeRetryBudgetState {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeTransportRecoverySource {
     SrtPeerAcknowledgedWatermark,
     RtmpPeerAcknowledgedWatermark,
@@ -119,7 +119,6 @@ impl From<TransportRecoverySource> for NativeTransportRecoverySource {
     }
 }
 
-#[derive(uniffi::Record)]
 pub struct NativeSessionSnapshot {
     pub generation: u64,
     pub attempt_epoch: u64,
@@ -139,7 +138,6 @@ pub struct NativeSessionSnapshot {
     pub media_confirmations: u64,
     pub stale_callbacks: u64,
 }
-#[derive(uniffi::Record)]
 pub struct NativeStopResult {
     pub generation: u64,
     pub action: NativeSessionAction,
@@ -149,7 +147,6 @@ struct Control {
     session: Session,
     stale_callbacks: u64,
 }
-#[derive(uniffi::Object)]
 pub struct NativeSession {
     control: Mutex<Control>,
 }
@@ -185,11 +182,9 @@ impl NativeSession {
         })
     }
 }
-#[uniffi::export]
 impl NativeSession {
     /// Consume the actual destination grace, 0..=3_600_000 milliseconds.
     /// Zero explicitly disables retry; larger values are refused, never clamped.
-    #[uniffi::constructor]
     pub fn new(grace_ms: u64) -> Result<Arc<Self>, BindingError> {
         if grace_ms > 60 * 60 * 1000 {
             return Err(BindingError::InvalidSession);

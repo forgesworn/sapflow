@@ -108,9 +108,9 @@ try:
     assert isinstance(witness['inputs'],dict) and 1<=len(witness['inputs'])<=512
     # New source files must not escape an older witness's known-file map.
     build_paths=sorted(set(x for x in [*root.glob('crates/**/src/**/*.rs'),*root.glob('crates/*/Cargo.toml'),
-        *root.glob('crates/*/uniffi.toml'),*root.glob('crates/**/build.rs'),*root.glob('.cargo/*'),
+        *root.glob('crates/**/build.rs'),*root.glob('.cargo/*'),
         root/'THIRD_PARTY_LICENSES.txt',root/'Cargo.toml',root/'Cargo.lock',root/'.cargo/config.toml',
-        root/'scripts/build-native.mjs',root/'scripts/native-kotlin-status-leases.mjs',root/'scripts/third-party-licences.py',
+        root/'scripts/build-native.mjs',root/'scripts/third-party-licences.py',
         root/'rust-toolchain.toml',root/'LICENSE',*root.glob('tests/native/*')] if x.is_file()))
     assert {str(x.relative_to(root)) for x in build_paths}==set(witness['inputs'])
     inputs.update(witness['inputs']);inputs.update(witness['outputs'])

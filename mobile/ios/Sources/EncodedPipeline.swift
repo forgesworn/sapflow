@@ -126,7 +126,7 @@ final class RustEncodedIngress {
         guard result == kCMBlockBufferNoErr, contiguous == total, let pointer else {
             throw CaptureFailure(message: "Encoder output is not contiguous; zero-copy ingress unavailable")
         }
-        // UniFFI's borrowed Data call completes synchronously. The only payload
+        // The C ABI's borrowed Data call completes synchronously. The only payload
         // ownership copy is Rust's Arc allocation, not a preliminary Data copy.
         let view = Data(bytesNoCopy: pointer, count: total, deallocator: .none)
         let scale: Int32 = unit.isVideo ? 90_000 : 48_000

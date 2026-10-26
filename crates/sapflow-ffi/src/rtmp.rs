@@ -15,7 +15,7 @@ use crate::{MAX_ENCODED_BUFFER_BYTES, MediaSample};
 // Existing peer-window accounting remains post-handshake and is unchanged.
 const RTMP_ACK_HANDSHAKE_MARGIN: u64 = 3073;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeRtmpState {
     Handshaking,
     Connecting,
@@ -45,7 +45,7 @@ impl From<PublisherState> for NativeRtmpState {
 
 /// Snapshot taken after a successful send and output ownership transfer.
 /// Output can be empty while the peer acknowledgement window is full.
-#[derive(Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct NativeRtmpSendOutput {
     /// At most 8 MiB of owned wire bytes, including any previously queued bytes.
     /// Adds no copy beyond `Publisher::take_output`: partial window takes can
@@ -62,13 +62,13 @@ pub struct NativeRtmpSendOutput {
     pub peer_media_progress: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeRtmpEvent {
     Sending,
     PeerMediaProgress,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeRtmpError {
     InvalidConfig,
     Busy,
@@ -131,7 +131,6 @@ struct State {
     startup: Option<StartupWatermark>,
 }
 
-#[derive(uniffi::Object)]
 pub struct NativeRtmpPublisher {
     state: Mutex<State>,
 }
@@ -154,12 +153,10 @@ impl NativeRtmpPublisher {
     }
 }
 
-#[uniffi::export]
 impl NativeRtmpPublisher {
     /// `media_epoch_ns` is shared by audio and video. Native adapters which have
     /// already rebased compressed timestamps to their common capture epoch use
     /// zero. `now_ms` is monotonic transport time, not media presentation time.
-    #[uniffi::constructor]
     pub fn new(
         app: String,
         stream_key: String,

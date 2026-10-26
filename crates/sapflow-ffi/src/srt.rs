@@ -8,11 +8,11 @@
 //! Input MediaSample handles share compressed payloads. This boundary adds one
 //! Arc clone per submission, plus the SDK validation handle clone. TS staging,
 //! serialisation and transport wire copies remain visible in statistics.
-//! UniFFI output serialisation and native socket submission add platform copies.
+//! C ABI output serialisation and native socket submission add platform copies.
 //!
 //! Passphrase Vec ownership enters the core's zeroising storage immediately,
 //! including invalid configuration paths. Neither this object nor its config
-//! implements Debug for secrets. Foreign arrays, UniFFI conversion buffers and
+//! implements Debug for secrets. Foreign arrays, C ABI conversion buffers and
 //! platform crash dumps are outside this erasure guarantee. AES-CTR does not
 //! authenticate packets or peers; SRT controls and stream IDs remain clear.
 
@@ -37,7 +37,7 @@ use crate::{MediaCodec, MediaSample};
 const MAX_DATAGRAM: usize = 1500;
 const MAX_ADDRESS: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeSrtCipher {
     Aes128,
     Aes256,
@@ -53,7 +53,7 @@ impl From<NativeSrtCipher> for KeySize {
 
 /// The secret is deliberately a separate constructor argument. None for both
 /// cipher and passphrase explicitly selects plaintext; any mismatch is refused.
-#[derive(Clone, uniffi::Record)]
+#[derive(Clone)]
 pub struct NativeSrtConfig {
     pub destination: String,
     pub stream_id: String,
@@ -83,7 +83,7 @@ impl Default for NativeSrtConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeSrtError {
     InvalidConfig,
     InvalidMedia,
@@ -114,14 +114,14 @@ impl std::fmt::Display for NativeSrtError {
 }
 impl std::error::Error for NativeSrtError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeSrtState {
     Connecting,
     /// Handshake complete, not destination-observed playback.
     Connected,
     Closed,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeSrtCloseReason {
     Cancelled,
     SocketSendFailed,
@@ -138,7 +138,7 @@ pub enum NativeSrtCloseReason {
     PeerError,
     PackagingFailed,
 }
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeSrtEvent {
     /// Complete declared startup media entered bounded transport ownership.
     Sending,
@@ -156,13 +156,12 @@ pub enum NativeSrtEvent {
         peer_code: Option<u32>,
     },
 }
-#[derive(uniffi::Record)]
 pub struct NativeSrtDatagram {
     /// The same numeric peer fixed at construction; no DNS is performed.
     pub destination: String,
     pub bytes: Vec<u8>,
 }
-#[derive(Debug, Default, uniffi::Record)]
+#[derive(Debug, Default)]
 pub struct NativeSrtStats {
     pub accepted_samples: u64,
     pub accepted_sample_bytes: u64,
@@ -235,7 +234,6 @@ impl State {
     }
 }
 
-#[derive(uniffi::Object)]
 pub struct NativeSrtPublisher {
     state: Mutex<State>,
 }
@@ -283,11 +281,9 @@ fn close_reason(reason: CallerCloseReason) -> (NativeSrtCloseReason, Option<u32>
     }
 }
 
-#[uniffi::export]
 impl NativeSrtPublisher {
     /// Native timestamps must already share their capture epoch; no A/V
     /// retiming is performed. Codec configurations are frozen for this object.
-    #[uniffi::constructor]
     pub fn new(
         config: NativeSrtConfig,
         video: Option<Arc<MediaCodec>>,

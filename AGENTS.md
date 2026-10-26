@@ -63,7 +63,8 @@ The Mac's disk is nearly full and Rust builds are large.
   maintainer's instruction.
 - No real hostnames, IPs or personal names in committed files; use
   placeholders. Private notes go in `*.local.md` (gitignored).
-- `unsafe` is forbidden workspace-wide.
+- `unsafe` is denied workspace-wide. The only exception is the reviewed
+  `capi.rs` C ABI module in each FFI crate; every other module keeps the deny.
 - Every new behaviour gets a test. Pure logic belongs in `sapflow-hls` or
   `sapflow-core`, not in the server crate.
 - Before adding a crate, check it is maintained and pin the current version;

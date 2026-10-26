@@ -202,11 +202,12 @@ def main():
         metadata = [compiler.resolve(), contents / 'Info.plist', sdk / 'SDKSettings.plist', sdk / 'SDKSettings.json']
         compiler_inputs = {str(path): file_fact(path, True) for path in metadata}
         selection = dict(reportedSDKPath=str(reported), macOSSDKPath=str(sdk), developerPath=str(developer), compilerArgvPath=str(compiler), compilerResolvedPath=str(compiler.resolve()), compilerEntry=entry_fact(compiler), cargoCommandPath=str(cargo_command), cargoEntry=cargo_entry)
-        invoke([str(cargo_command), 'build', '--locked', '-p', 'sapflow-ffi', '--features', 'bindgen', '-j', '1'], 'rust-sdk.log', 1800)
-        library = target / 'debug/libsapflow_ffi.dylib'; bindgen = target / 'debug/sapflow-bindgen'
-        generated_before = {str(path): file_fact(path) for path in (library, bindgen)}
-        invoke([str(bindgen), 'generate', str(library), '-l', 'swift', '-o', str(scratch), '--no-format'], 'swift-bindings.log', 180)
-        for name in ('Sapflow.swift', 'SapflowFFI.h', 'SapflowFFI.modulemap'): generated_before[str(scratch / name)] = file_fact(scratch / name)
+        invoke([str(cargo_command), 'build', '--locked', '-p', 'sapflow-ffi', '-j', '1'], 'rust-sdk.log', 1800)
+        library = target / 'debug/libsapflow_ffi.dylib'
+        generated_before = {str(library): file_fact(library)}
+        for name, relative in [('Sapflow.swift', 'crates/sapflow-ffi/swift/Sapflow.swift'), ('SapflowFFI.h', 'crates/sapflow-ffi/include/SapflowFFI.h'), ('SapflowFFI.modulemap', 'crates/sapflow-ffi/include/module.modulemap')]:
+            shutil.copyfile(root / relative, scratch / name)
+            generated_before[str(scratch / name)] = file_fact(scratch / name)
         headers = scratch
         common = [str(compiler), '-sdk', str(sdk), '-swift-version', '5', '-warnings-as-errors', '-parse-as-library', '-j', '1', '-module-cache-path', str(scratch / 'modules'), '-I', str(headers), '-Xcc', '-fmodule-map-file=' + str(headers / 'SapflowFFI.modulemap')]
         names = NAMES

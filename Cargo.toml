@@ -24,7 +24,9 @@ repository = "https://github.com/forgesworn/sapflow"
 homepage = "https://github.com/forgesworn/sapflow"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Only the reviewed C ABI modules in sapflow-ffi and sapflow-signet-ffi may
+# override this with unsafe_code = "allow".
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
