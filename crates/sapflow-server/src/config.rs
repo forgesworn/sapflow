@@ -43,8 +43,7 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            has no {token})
   SAPFLOW_SEGMENT_COUNT    segments kept in the playlist (default 24, min 7)
   SAPFLOW_HLS_MODE         low-latency (default) or whole; whole omits parts
-  SAPFLOW_HTTP_IMPL        own (default) or hyper: choose the viewer HTTP backend
-  SAPFLOW_HTTP_THREADS     own event loop threads (default: one per core, max 256)
+  SAPFLOW_HTTP_THREADS     viewer event loop threads (default: one per core, max 256)
                            explicit values: 1..256
   SAPFLOW_RECORDINGS       record every show to this directory (unset: off)
   SAPFLOW_RECORD_SKIP      paths not to record, comma-separated; a trailing *
@@ -121,9 +120,8 @@ pub struct Config {
     pub callback_secret: Option<String>,
     pub segment_count: usize,
     pub low_latency: bool,
-    /// Threads for the own event loop (`own_http.rs`); `None` serves viewers
-    /// with hyper on tokio.
-    pub own_http_threads: Option<usize>,
+    /// Threads for the viewer event loop (`own_http.rs`).
+    pub http_threads: usize,
     pub recordings: Option<PathBuf>,
     pub record_policy: RecordPolicy,
     pub record_delete_after: Duration,
@@ -391,25 +389,35 @@ impl Config {
             }
         };
 
-        let own_http_threads = match vals.get("SAPFLOW_HTTP_IMPL").map(String::as_str) {
-            Some("hyper") => None,
-            None | Some("own") => Some(match vals.get("SAPFLOW_HTTP_THREADS") {
-                None => std::thread::available_parallelism().map_or(4, |n| n.get().min(256)),
-                Some(v) => v
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| (1..=256).contains(n))
-                    .ok_or_else(|| ConfigError::Invalid("SAPFLOW_HTTP_THREADS: 1 to 256".into()))?,
-            }),
-            Some(_) => {
+        // Keep recognising the removed viewer backend switch so obsolete
+        // deployments fail explicitly rather than silently changing backend.
+        match vals.get("SAPFLOW_HTTP_IMPL").map(String::as_str) {
+            None | Some("own") => {}
+            Some("hyper") => {
                 return Err(ConfigError::Invalid(
-                    "SAPFLOW_HTTP_IMPL: hyper or own".into(),
+                    "SAPFLOW_HTTP_IMPL=hyper: the Hyper viewer backend was removed; \
+                     viewers are served by the own event loop, so unset SAPFLOW_HTTP_IMPL"
+                        .into(),
                 ));
             }
+            Some(v) => {
+                return Err(ConfigError::Invalid(format!(
+                    "SAPFLOW_HTTP_IMPL={v}: unknown; the Hyper viewer backend was removed, \
+                     so unset SAPFLOW_HTTP_IMPL"
+                )));
+            }
+        }
+        let http_threads = match vals.get("SAPFLOW_HTTP_THREADS") {
+            None => std::thread::available_parallelism().map_or(4, |n| n.get().min(256)),
+            Some(v) => v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| (1..=256).contains(n))
+                .ok_or_else(|| ConfigError::Invalid("SAPFLOW_HTTP_THREADS: 1 to 256".into()))?,
         };
 
         Ok(Self {
-            own_http_threads,
+            http_threads,
             low_latency: match vals.get("SAPFLOW_HLS_MODE").map(String::as_str) {
                 None | Some("low-latency") => true,
                 Some("whole") => false,
@@ -448,25 +456,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_impl_defaults_to_own_and_hyper_is_explicit() {
+    fn viewer_backend_is_the_own_event_loop_and_hyper_is_refused() {
         let open = ("SAPFLOW_OPEN_PUBLISH", "1");
-        assert!(
-            load(&[open], &[])
-                .expect("default")
-                .own_http_threads
-                .is_some_and(|n| (1..=256).contains(&n))
-        );
-        assert_eq!(
-            load(&[open, ("SAPFLOW_HTTP_IMPL", "hyper")], &[])
-                .expect("hyper")
-                .own_http_threads,
-            None
-        );
+        assert!((1..=256).contains(&load(&[open], &[]).expect("default").http_threads));
         assert!(
             load(&[open, ("SAPFLOW_HTTP_IMPL", "own")], &[])
                 .expect("own")
-                .own_http_threads
-                .is_some_and(|n| n >= 1)
+                .http_threads
+                >= 1
         );
         assert_eq!(
             load(
@@ -478,32 +475,53 @@ mod tests {
                 &[]
             )
             .expect("own, 3 threads")
-            .own_http_threads,
-            Some(3)
+            .http_threads,
+            3
         );
         assert_eq!(
             load(&[open, ("SAPFLOW_HTTP_THREADS", "3")], &[])
                 .expect("default backend, explicit thread count")
-                .own_http_threads,
-            Some(3)
+                .http_threads,
+            3
         );
-        assert_eq!(
+        assert!(load(&[open], &["--http-impl=own"]).is_ok());
+        // The removed backend stops startup and says why, from either source.
+        for config in [
+            load(&[open, ("SAPFLOW_HTTP_IMPL", "hyper")], &[]),
+            load(&[open], &["--http-impl=hyper"]),
             load(
                 &[open, ("SAPFLOW_HTTP_IMPL", "own")],
-                &["--http-impl=hyper"]
-            )
-            .expect("explicit reference backend overrides environment")
-            .own_http_threads,
-            None
-        );
-        assert!(load(&[open, ("SAPFLOW_HTTP_IMPL", "tokio")], &[]).is_err());
+                &["--http-impl=hyper"],
+            ),
+            // Not excused by a valid thread count.
+            load(
+                &[
+                    open,
+                    ("SAPFLOW_HTTP_IMPL", "hyper"),
+                    ("SAPFLOW_HTTP_THREADS", "3"),
+                ],
+                &[],
+            ),
+        ] {
+            assert!(matches!(
+                config,
+                Err(ConfigError::Invalid(m)) if m.contains("SAPFLOW_HTTP_IMPL=hyper") && m.contains("removed")
+            ));
+        }
+        assert!(matches!(
+            load(&[open, ("SAPFLOW_HTTP_IMPL", "tokio")], &[]),
+            Err(ConfigError::Invalid(m)) if m.contains("SAPFLOW_HTTP_IMPL=tokio") && m.contains("removed")
+        ));
         // Empty means unset, as for every setting.
         assert!(
             load(&[open, ("SAPFLOW_HTTP_IMPL", "")], &[])
                 .expect("empty")
-                .own_http_threads
-                .is_some_and(|n| (1..=256).contains(&n))
+                .http_threads
+                >= 1
         );
+        // The removed switch is not advertised.
+        assert!(!HELP.contains("SAPFLOW_HTTP_IMPL"));
+        assert!(HELP.contains("SAPFLOW_HTTP_THREADS"));
         for threads in ["0", "257", "many"] {
             assert!(load(&[open, ("SAPFLOW_HTTP_THREADS", threads)], &[]).is_err());
             assert!(

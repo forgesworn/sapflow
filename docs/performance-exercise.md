@@ -17,9 +17,10 @@ the wider protocol, binding and field gates below remain separate work.
 
 The own HTTP path defaults to one worker per logical core.  Test the hypothesis
 that waking and scheduling sixteen workers for a single stream costs more than
-using fewer workers.  The first comparison covers the unchanged Hyper path,
-the own loop at its default, the own loop with one worker, and MediaMTX 1.21.2.
-This changes a documented setting, not protocol limits or the default backend.
+using fewer workers.  The first comparison covered the then-unchanged Hyper
+path (since removed), the own loop at its default, the own loop with one
+worker, and MediaMTX 1.21.2.  The runner now offers `own`, `own-1`, `own-4` and
+`mediamtx`.  This changes a documented setting, not protocol limits.
 
 The initial screening used 750 full-media viewers, three rotating rounds and
 a 60-second full-load target per treatment.  The standard runner also measures idle
@@ -49,12 +50,12 @@ python3 -B tests/test_performance.py
 python3 -B tests/test_measure_process.py
 python3 scripts/performance.py \
   --output scratch/performance-<run-id> \
-  --viewers 250 750 --seconds 60 --rounds 5 \
-  --variants hyper own own-1 own-4 mediamtx \
+  --viewers 250 750 --seconds 60 --rounds 4 \
+  --variants own own-1 own-4 mediamtx \
   --mediamtx <verified-arm64-mediamtx-binary>
 ```
 
-Five rotating rounds put every treatment in each order position once.  The
+Four rotating rounds put every treatment in each order position once.  The
 runner requires a whole number of cycles.  Don't tune settings between repeat
 rounds.  New measurements supersede the historical method only for their own
 source/binary receipt; they are not evidence of a server implementation gain.
@@ -115,7 +116,7 @@ stack sampler that counts blocked threads cannot establish on-CPU shares.
 
 | Layer | Experiment | Measures and acceptance |
 | --- | --- | --- |
-| Server HTTP | Hyper, own loop, 1/4/default workers; 250/750 full viewers | CPU per delivered byte/request, RSS, p50/p95/p99, fan-out reach, errors and descriptors; separate proxy/load-generator cost |
+| Server HTTP | Own loop, 1/4/default workers; 250/750 full viewers | CPU per delivered byte/request, RSS, p50/p95/p99, fan-out reach, errors and descriptors; separate proxy/load-generator cost |
 | SRT library | Sender and receiver separately; plain, AES-128/256, key refresh; frozen RTT/loss seeds and 200/2000 ms budgets | Useful bytes, unrecovered/late packets, retransmission overhead, CPU, queues, allocations and deadlines; use libsrt/gosrt executables as references |
 | RTMP library | Publisher and acceptor separately; 1/10/50 streams; partial writes and acknowledgement windows | CPU per useful byte/sample, allocations, copies, bounded backlog, sustained delivery; separate RTMPS/TLS adapter cost |
 | HLS/MP4 | Generated 720p30 and 1080p30/60 compressed input; audio-only; part rotation and segment assembly | CPU per media second, allocated bytes, payload copies, retained parts/segments, correct timestamps and playlist rules; no browser/network in the pure-library timing |

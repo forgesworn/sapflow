@@ -68,8 +68,8 @@ deployment and never committed.
   set and `SAPFLOW_SRT_ENCRYPTION=optional`, so encoders with and without
   it both publish (section 2.3). Needs a `<commit>` that has the setting.
 - [x] **Viewer HTTP** (2026-10-22). hyper, the default, for the first show.
-  Our own event loop (`SAPFLOW_HTTP_IMPL=own`) is measured but has not
-  served a show; it is a candidate for the second.
+  Superseded: the Hyper viewer backend has since been removed, so viewers are
+  served by our own event loop and `SAPFLOW_HTTP_IMPL=hyper` stops startup.
 - [x] **Read production's live settings from the server.** They are not in
   the repository. On the production host, list the variable names and their
   scheme only, without printing secrets:
@@ -244,7 +244,7 @@ copy it to the host as `<sapflow-env-file>` and fill it in there.
 | v4v's `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS` | `SAPFLOW_RECONNECT_GRACE` | 90, set explicitly on both sides: they must be equal |
 | `webrtc`, `rtsp`, the API and metrics | not offered | Check production does not use them. Any other `runOn*` hook (a simulcast relay, for one) cannot be carried over |
 | (none) | `SAPFLOW_SRT_PASSPHRASE`, `SAPFLOW_SRT_ENCRYPTION` | a long random passphrase (10 to 79 bytes) and `optional`: encoders without it still publish, so the URL v4v hands out need not change; one that sets it must match, at the default key length 16 (`docs/own-origin-encryption.md`). Give it to an encoder by hand, not in v4v's template |
-| (none) | `SAPFLOW_HTTP_IMPL` | unset (hyper), as decided above |
+| (none) | `SAPFLOW_HTTP_IMPL` | unset (the own event loop is the only viewer backend; `hyper` stops startup) |
 | (none) | `SAPFLOW_OPEN_PUBLISH`, `SAPFLOW_SRT_IMPL` | never set (srt-rs is gone; any `SAPFLOW_SRT_IMPL` other than `own` stops startup) |
 | `logLevel: info` | `RUST_LOG` | `info` (default) |
 

@@ -8,10 +8,23 @@ ROOT = Path(__file__).resolve().parents[2]
 STORED = ['healthy', 'mixed-zero-raw', 'publishing-independent-failure', 'missing-file-EOF', 'recording-queue-failure']
 SDK = ['producer-audio', 'producer-av', 'producer-publishing-failure', 'producer-late-native-drop', 'producer-recording-loss', 'producer-input-not-closed', 'producer-wrong-worker', 'producer-late-encoded-output', 'producer-late-timing', 'producer-wrong-ticket']
 LEGACY = ['producer-audio', 'producer-av', 'producer-recording-loss', 'producer-late-native-drop', 'producer-input-not-closed', 'producer-wrong-worker', 'producer-wrong-ticket']
+COMMAND_LOGS = (
+    'sdk-path.log', 'rust-sdk.log', 'sdk-compile.log', 'fixture-compile.log', 'native-run.local.json',
+    *(name + '-packets.local.json' for name in STORED[:4]),
+    *(name + suffix for name in SDK[:3] for suffix in ('-streams.local.json', '-decode.local.log')),
+    *('legacy-' + name + suffix for name in LEGACY[:2] for suffix in ('-streams.local.json', '-decode.local.log')),
+)
 NAMES = ['CaptureRecordingProducer', 'HardwareVideoEncoder', 'VideoEncodingPolicy', 'PreparedVideoSlate', 'AudioRecordingTiming', 'AudioShowLifecycle', 'NativeAudioEncoder', 'CompressedRecorder', 'QuickTimeAudioPriming', 'QuickTimeAudioPrimingFile', 'QuickTimeMovieLayout', 'RecordingCatalogue', 'RecordingStorage', 'RecordingCaptureAdmission', 'AudioInputPolicy', 'CameraControlPolicy', 'CaptureAdmission', 'CaptureProfile', 'CaptureOrientation', 'PublishingTelemetry', 'EncodedWorkBudget', 'EncodedPipeline', 'EncodedIngressWorker', 'CaptureRecording', 'RecordingCheckpointOwner']
 
 def need(ok, message):
     if not ok: raise RuntimeError(message)
+
+def validate_commands(commands, through=None):
+    """Require each actual build/oracle stage once, in order and successful."""
+    expected = COMMAND_LOGS if through is None else COMMAND_LOGS[:COMMAND_LOGS.index(through) + 1]
+    need(tuple(row['log'] for row in commands) == expected, 'Exact ordered current-host SDK and media oracle stages required')
+    need(all(row['exit'] == 0 and row['groupStopped'] is True and row['error'] is None for row in commands),
+         'Every current-host SDK and media oracle stage must succeed and stop')
 
 def sha(path):
     value = hashlib.sha256()
@@ -240,7 +253,8 @@ def main():
             actual=[{'size':int(p['size']),'sha256':p['data_hash'].removeprefix('SHA256:').lower()} for p in packets]
             assert actual==case['originalPackets'],case['name']+' original native AAC payload changed'
             packet_proofs.append({'name':case['name'],'actualOriginalNativePackets':len(actual),'mediaSHA256':sha(media)})
-        assert len(packet_proofs)==4 and len(commands)==10,'Expected three preparation plus three native commands and four exact-payload probes'
+        need(len(packet_proofs) == 4, 'Four exact-payload probes required')
+        validate_commands(commands, 'missing-file-EOF-packets.local.json')
         (evidence/'exact-payload-proofs.local.json').write_text(json.dumps(packet_proofs,indent=2)+'\n')
         expected_producers=['producer-audio','producer-av','producer-publishing-failure','producer-late-native-drop',
            'producer-recording-loss','producer-input-not-closed','producer-wrong-worker','producer-late-encoded-output','producer-late-timing','producer-wrong-ticket']
@@ -260,7 +274,7 @@ def main():
             if video:assert video[0]['codec_name']=='h264' and int(video[0]['nb_read_frames'])==10
             invoke([ffmpeg,'-nostdin','-v','error','-xerror','-threads','1','-i',str(media),'-map','0','-f','null','-'],case['name']+'-decode.local.log',20)
             producer_proofs.append({'name':case['name'],'mediaSHA256':sha(media),'bytes':media.stat().st_size,'streams':streams,'decodedWithoutErrors':True})
-        assert len(commands)==16
+        validate_commands(commands, 'producer-publishing-failure-decode.local.log')
         (evidence/'producer-finalisation-proofs.local.json').write_text(json.dumps(producer_proofs,indent=2)+'\n')
         expected_legacy=['producer-audio','producer-av','producer-recording-loss','producer-late-native-drop','producer-input-not-closed','producer-wrong-worker','producer-wrong-ticket']
         legacy_cases=summary['legacyProducerCases']
@@ -282,7 +296,7 @@ def main():
                 invoke([ffmpeg,'-nostdin','-v','error','-xerror','-threads','1','-i',str(media),'-map','0','-f','null','-'],'legacy-'+case['name']+'-decode.local.log',20)
                 proof.update(streams=streams,decodedWithoutErrors=True)
             legacy_proofs.append(proof)
-        need(len(commands)==20,'Three preparation commands, two compiles/native run, four payload probes and five positive whole decodes')
+        validate_commands(commands)
         (evidence/'legacy-producer-finalisation-proofs.local.json').write_text(json.dumps(legacy_proofs,indent=2)+'\n')
         passed = True
     except BaseException as error: failure = type(error).__name__ + ': ' + str(error)
@@ -304,8 +318,8 @@ def main():
                 need(scratch.parent == target and scratch.name.startswith('sapflow-capture-recording-') and not scratch.is_symlink(), 'Owned scratch boundary')
                 shutil.rmtree(scratch)
             except BaseException as error: cleanup_errors.append(type(error).__name__ + ': ' + str(error))
-        passed = passed and source_unchanged and stopped_all and not cleanup_errors and pending is None and len(commands) == 20
-        result = dict(schema='ios-current-host-native-recording-outcome-v1', passed=passed, startedUTC=started, endedUTC=now(), failure=failure, sourceUnchanged=source_unchanged, inputsBefore=before, inputsAfter=after, compileSelection=selection, compilerInputsBefore=compiler_inputs, compilerInputsAfter=compiler_after, generatedInputsBefore=generated_before, generatedInputsAfter=generated_after, commands=commands, terminalProcessGroups=groups, childrenStopped=stopped_all, cleanupErrors=cleanup_errors, unconfirmedLaunchAttempt=unknown_launch, activeOwnedPID=active['child'].pid if active else None, pendingDeferredSignal=pending, scratchRemoved=scratch is None or not scratch.exists(), generatedFilesRetained=scratch is not None and scratch.exists(), expectedCommands=20, expectedStoredCases=5, expectedSDKProducerCases=10, expectedLegacyProducerCases=7, expectedSDKPositiveDecodes=3, expectedLegacyPositiveDecodes=2, generatedOnly=True, hostArchitecture=platform.machine(), deviceActions=False, productionNetworkActions=False, dependencyAcquisitionPossible=True, physicalDeviceQualified=False, presentationQualified=False, recoveryQualified=False, aggregateTwoSecondQualified=False, releaseQualified=False, scope='Fresh current-host SDK and generated native encoder/ingress/SDK+legacy recorder matrix. Legacy default unchanged. Empty stopped session is not camera capture, paired programme H/T/presentation/recovery/sustained2s/performance/release proof. Native clock/duration diagnostics are not repaired or substituted.')
+        passed = passed and source_unchanged and stopped_all and not cleanup_errors and pending is None and len(commands) == len(COMMAND_LOGS)
+        result = dict(schema='ios-current-host-native-recording-outcome-v1', passed=passed, startedUTC=started, endedUTC=now(), failure=failure, sourceUnchanged=source_unchanged, inputsBefore=before, inputsAfter=after, compileSelection=selection, compilerInputsBefore=compiler_inputs, compilerInputsAfter=compiler_after, generatedInputsBefore=generated_before, generatedInputsAfter=generated_after, commands=commands, terminalProcessGroups=groups, childrenStopped=stopped_all, cleanupErrors=cleanup_errors, unconfirmedLaunchAttempt=unknown_launch, activeOwnedPID=active['child'].pid if active else None, pendingDeferredSignal=pending, scratchRemoved=scratch is None or not scratch.exists(), generatedFilesRetained=scratch is not None and scratch.exists(), expectedCommands=len(COMMAND_LOGS), expectedStoredCases=5, expectedSDKProducerCases=10, expectedLegacyProducerCases=7, expectedSDKPositiveDecodes=3, expectedLegacyPositiveDecodes=2, generatedOnly=True, hostArchitecture=platform.machine(), deviceActions=False, productionNetworkActions=False, dependencyAcquisitionPossible=True, physicalDeviceQualified=False, presentationQualified=False, recoveryQualified=False, aggregateTwoSecondQualified=False, releaseQualified=False, scope='Fresh current-host SDK and generated native encoder/ingress/SDK+legacy recorder matrix. Legacy default unchanged. Empty stopped session is not camera capture, paired programme H/T/presentation/recovery/sustained2s/performance/release proof. Native clock/duration diagnostics are not repaired or substituted.')
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
         try:
             result['terminalPublication'] = dict(protocol='MASKED_PENDING_INSPECTION_AND_ATOMIC_PUBLICATION_V1', committed=True)
