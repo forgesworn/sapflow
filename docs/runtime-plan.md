@@ -2,9 +2,12 @@
 
 The initial plan below sets out what replacing the async runtime would take
 and what measurements decide whether to continue. An optional viewer prototype
-has since landed: `SAPFLOW_HTTP_IMPL=own` uses Sapflow's HTTP event loop;
-Hyper/Tokio remains the default. Ingest, callbacks, private publish control and
-recording still use their existing runtime. See the measurements in
+has since landed and is now the only viewer backend: Sapflow's HTTP event loop
+serves viewers, and the Hyper viewer path was removed (`SAPFLOW_HTTP_IMPL=hyper`
+stops startup). Ingest, callbacks, private publish control and recording still
+use their existing runtime, with axum and hyper for the control API and
+callbacks. The inventory below is the original 2026-10-22 snapshot. See the
+measurements in
 [benchmarks](benchmarks.md) and the implementation gates in
 [readiness](readiness.md). This does not replace the whole server runtime or
 establish a mobile performance improvement.
@@ -20,10 +23,10 @@ In the server (about 10,000 lines), tokio does:
 
 | Job | Uses | Where |
 |-----|------|-------|
-| Sockets: SRT (UDP), RTMP (TCP), HTTP (TCP) | `tokio::net` (11) | `srt_own.rs`, `rtmp.rs`, `http.rs` |
+| Sockets: SRT (UDP), RTMP (TCP), HTTP (TCP) | `tokio::net` (11) | `srt_own.rs`, `rtmp.rs`, `http.rs` (since removed; viewers are on `own_http.rs`) |
 | Timers and timeouts | `tokio::time` (38) | almost everywhere |
 | Tasks: one per connection, viewer and stream | `tokio::spawn` (29), `tokio::task` (8) | `stream.rs`, `publish.rs`, `recorder.rs` |
-| Channels and notification (waking blocked playlist requests) | `tokio::sync` (16), `select!` (6) | `stream.rs`, `http.rs` |
+| Channels and notification (waking blocked playlist requests) | `tokio::sync` (16), `select!` (6) | `stream.rs`, `http.rs` (since removed; `own_http::notify`) |
 | Recording files | `tokio::fs` (13), `tokio::io` (6) | `recorder.rs` |
 | Shutdown on SIGTERM | `tokio::signal` (1) | `main.rs` |
 
@@ -113,9 +116,9 @@ default until the new one matches it in `scripts/smoke.sh` and the benchmarks:
 1. The HTTP server, with fuzz targets for request parsing. Done
    (2026-10-22): `SAPFLOW_HTTP_IMPL=own` (`own_http.rs`, framing in
    `http1.rs`, fuzz target `http1_request`), with a connection cap, an idle
-   timeout and one response in flight per connection. CI runs the smoke test
-   on it as well as on hyper; hyper stays the default until a production
-   show has run on the own loop.
+   timeout and one response in flight per connection. It became the default,
+   and the Hyper viewer path was then removed; CI runs the smoke test on the
+   own loop.
 2. SRT ingest (UDP; the listener is sans-IO already).
 3. RTMP ingest (TCP; `sapflow_rtmp::Connection` is sans-IO already).
 4. The callback client.

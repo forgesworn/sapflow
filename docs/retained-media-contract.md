@@ -11,7 +11,7 @@ muxer input limits cover different owners.
 | Resident stream paths | No registry count or byte admission limit |
 | HLS window | Default 24 entries per path, configurable from 7 through 1,000, plus open media |
 | Reconnect hold | Default 90 seconds, configurable up to 3,600 seconds per useful path |
-| HTTP connections | 20,000 per backend; this is not a media-byte limit |
+| HTTP connections | 20,000; this is not a media-byte limit |
 
 The relevant owners are in [the registry and stream](../crates/sapflow-server/src/stream.rs),
 [publication retirement](../crates/sapflow-server/src/publish.rs),
@@ -25,10 +25,10 @@ without immediately releasing its cached ingest state.
 
 An incomplete segment response retains its shared chunk array, including
 consumed prefix chunks. Evicting that segment from the playlist does not free
-payloads retained by responses. Hyper frames may outlive their body object.
-The own backend's 60-second idle timeout resets on successful progress; the
-Hyper adapter sets no absolute response-body deadline. Recording queues are
-another owner, independently covered by recording admission.
+payloads retained by responses. The own backend's 60-second idle timeout
+resets on successful progress; it sets no absolute response-body deadline.
+Recording queues are another owner, independently covered by recording
+admission.
 
 The proposed contract has one App-owned residency manager with two limits:
 
@@ -64,8 +64,7 @@ Qualification uses generated media and small injected limits:
    Drop counters must distinguish consumed-prefix retention from payload
    release.
 3. Exercise exact byte capacity, one-over refusal, arithmetic overflow, cached
-   aliases, codec changes, reconnects, stalled own responses and Hyper frames
-   retained after body completion. Charges must survive every alias and
+   aliases, codec changes, reconnects and stalled own responses. Charges must survive every alias and
    return exactly once.
 4. Prove recording status, publisher admission and recovery under exhaustion.
    Repeat matched nominal and adverse-load measurements with all configured

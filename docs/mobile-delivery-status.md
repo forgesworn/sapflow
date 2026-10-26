@@ -744,14 +744,15 @@ a production dependency cycle. Both lock files were regenerated with Cargo;
 external package identities are unchanged, and the licence notice regenerates
 without a change.
 
-The optional `SAPFLOW_HTTP_IMPL=own` viewer loop is integrated while Hyper/Tokio
-remains the default. The merged workspace passes 624 tests with four normally
+The `SAPFLOW_HTTP_IMPL=own` viewer loop was integrated while Hyper/Tokio was
+still the default; the Hyper viewer backend has since been removed and the own
+loop is the only one. At that integration the merged workspace passed 624 tests with four normally
 ignored, strict all-target Clippy, formatting and locked compilation of every
 fuzz target. No long fuzz run is claimed. New real-socket parity coverage checks AAC live playback, terminal-part
 wake-up, retained A/V-to-AAC initialization/part/segment bytes, GET/HEAD metadata,
 closed and replaced presentations, public control/API refusal and malformed or
 future blocking requests. Connection-close handling now honours `close`
-regardless of token/header order. Both backends pass the generated SRT/RTMP
+regardless of token/header order. Both backends passed the generated SRT/RTMP
 smoke, independent HLS decoding, callbacks, reconnect with one recording and
 encrypted passphrase acceptance/refusal. Receipts are retained under
 `target/mobile-origin-integration/v3/`; these remain local synthetic gates.
