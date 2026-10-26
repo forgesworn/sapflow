@@ -87,15 +87,19 @@ try {
         '-Wl,-z,max-page-size=16384','-o',join(destination,'libsapflow_jni.so')]);
     }
     writeFileSync(join(aar,'AndroidManifest.xml'),'<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.forgesworn.sapflow"><uses-sdk android:minSdkVersion="23"/></manifest>\n');
+    // JNI resolves the native entry-point class and methods by name.
+    const consumerRules='-keep class dev.forgesworn.sapflow.** { *; }\n';
+    writeFileSync(join(aar,'proguard.txt'),consumerRules);
     const meta=join(aar,'META-INF');mkdirSync(meta);copyFileSync(join(root,'LICENSE'),join(meta,'LICENSE'));run('python3',['scripts/third-party-licences.py','--package','sapflow-ffi','--output',join(meta,'THIRD_PARTY_LICENSES.txt')]);
     const outputAar=join(output,`sapflow-${version}.aar`),packedAar=customOutputRoot?join(staging,`sapflow-${version}.aar`):outputAar;
     run('zip',['-q','-r',packedAar,'.'],{cwd:aar});
     if(customOutputRoot)copyFileSync(packedAar,outputAar,constants.COPYFILE_EXCL);
+    if(run('unzip',['-p',outputAar,'proguard.txt'],{stdio:'pipe',encoding:'utf8'})!==consumerRules)throw Error('AAR consumer JNI rules differ');
     const packedClasses=run('unzip',['-p',join(output,`sapflow-${version}.aar`),'classes.jar'],{stdio:'pipe'});const installedClasses=join(staging,'installed-classes.jar');writeFileSync(installedClasses,packedClasses);
     run('kotlinc',['-language-version','2.2','-api-version','2.2',join(root,'tests/native/Consumer.kt'),'-cp',installedClasses,'-include-runtime','-jvm-target','1.8','-d',join(staging,'installed-consumer.jar')]);
     run('java',[`-Djava.library.path=${staging}:${join(root,'target/debug')}`,'-cp',`${join(staging,'installed-consumer.jar')}:${installedClasses}`,'ConsumerKt']);
     copyFileSync(kotlin,join(output,'sapflow_ffi.kt'));
-    writeFileSync(join(output,'README.md'),`Sapflow Android AAR, API 23+, ABIs: ${selectedTargets.map(x=>x[1]).join(', ')}. Add the AAR to your application; no JNA dependency is required. Rust and JNI libraries are included for each ABI with 16 KiB page alignment. Broadcaster integration and physical-device qualification remain in progress. Actual Android devices are a separate qualification gate.\n`);
+    writeFileSync(join(output,'README.md'),`Sapflow Android AAR, API 23+, ABIs: ${selectedTargets.map(x=>x[1]).join(', ')}. Add the AAR to your application; no JNA dependency is required. Rust and JNI libraries are included for each ABI with 16 KiB page alignment. Consumer ProGuard/R8 rules preserve the JNI facade. Broadcaster integration and physical-device qualification remain in progress. Actual Android devices are a separate qualification gate.\n`);
   }
   if(output) {
     run('python3',['scripts/third-party-licences.py','--package','sapflow-ffi','--output',join(output,'THIRD_PARTY_LICENSES.txt')]);

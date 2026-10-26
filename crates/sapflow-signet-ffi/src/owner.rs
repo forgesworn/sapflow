@@ -18,6 +18,8 @@ use tokio::sync::{Notify, mpsc};
 use zeroize::Zeroizing;
 
 static OWNER: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_SPAWN_FAILURE: AtomicBool = AtomicBool::new(false);
 type Response<T> = Result<T, SignetError>;
 type Work<'a, T> = Pin<Box<dyn Future<Output = Response<T>> + Send + 'a>>;
 
@@ -97,6 +99,12 @@ struct Shared {
     notify: Notify,
     done: AtomicBool,
 }
+type MakePort = Box<dyn FnOnce() -> Response<Box<dyn Port>> + Send + 'static>;
+struct Lifecycle {
+    make_port: Option<MakePort>,
+    sender: Option<mpsc::Sender<Command>>,
+    started: bool,
+}
 
 /// At most one auth runtime per process. An owner whose native cleanup stalls
 /// retains that permit; a replacement never bypasses it. Methods never perform
@@ -104,7 +112,7 @@ struct Shared {
 /// and must run on a dedicated cold Swift auth queue, never main/capture.
 pub struct NativeSignet {
     shared: Arc<Shared>,
-    tx: mpsc::Sender<Command>,
+    lifecycle: Mutex<Lifecycle>,
     deadline: Instant,
 }
 
@@ -205,25 +213,45 @@ impl NativeSignet {
         template.fresh()?;
         self.submit(Command::Sign(request_id, template), request_id, true)
     }
-    /// One bounded result slot, with no foreign callback retaining the worker.
-    /// Blocking wait is capped at one second and wakes immediately on completion.
-    pub fn wait_event(&self, timeout_ms: u32) -> Response<Option<SignetEvent>> {
-        if timeout_ms > 1000 {
-            return Err(SignetError::InvalidInput);
+    fn finish_unstarted(&self, error: Option<SignetError>) {
+        let Ok(mut lifecycle) = self.lifecycle.try_lock() else {
+            return;
+        };
+        if lifecycle.started || self.shared.done.load(Ordering::Acquire) {
+            return;
         }
-        let state = self
+        lifecycle.make_port = None;
+        if let Some(error) = error {
+            fail(&self.shared, 0, error);
+        } else {
+            self.shared.stop.store(true, Ordering::Release);
+        }
+        self.shared.done.store(true, Ordering::Release);
+        OWNER.store(false, Ordering::Release);
+        self.shared.wake.notify_all();
+    }
+    fn expire_unstarted(&self) {
+        if Instant::now() >= self.deadline {
+            self.finish_unstarted(Some(SignetError::Deadline));
+        }
+    }
+    fn wait_timeout(&self, timeout_ms: u32) -> Duration {
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let unstarted = self
+            .lifecycle
+            .try_lock()
+            .is_ok_and(|lifecycle| !lifecycle.started);
+        if !unstarted {
+            return timeout;
+        }
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        timeout.min(remaining)
+    }
+    fn take_event(&self) -> Response<Option<SignetEvent>> {
+        let mut state = self
             .shared
             .state
             .lock()
-            .map_err(|_| SignetError::Unavailable)?;
-        let (mut state, _) = self
-            .shared
-            .wake
-            .wait_timeout_while(state, Duration::from_millis(u64::from(timeout_ms)), |s| {
-                s.event.is_none()
-                    && !self.shared.done.load(Ordering::Acquire)
-                    && !self.shared.stop.load(Ordering::Acquire)
-            })
             .map_err(|_| SignetError::Unavailable)?;
         if self.shared.stop.load(Ordering::Acquire)
             && !matches!(state.event, Some(SignetEvent::Failed { .. }))
@@ -233,10 +261,40 @@ impl NativeSignet {
         }
         Ok(state.event.take())
     }
+    /// One bounded result slot, with no foreign callback retaining the worker.
+    /// Blocking wait is capped at one second and wakes immediately on completion.
+    pub fn wait_event(&self, timeout_ms: u32) -> Response<Option<SignetEvent>> {
+        if timeout_ms > 1000 {
+            return Err(SignetError::InvalidInput);
+        }
+        if self.shared.done.load(Ordering::Acquire) {
+            return self.take_event();
+        }
+        self.expire_unstarted();
+        let timeout = self.wait_timeout(timeout_ms);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| SignetError::Unavailable)?;
+        let (state, _) = self
+            .shared
+            .wake
+            .wait_timeout_while(state, timeout, |s| {
+                s.event.is_none()
+                    && !self.shared.done.load(Ordering::Acquire)
+                    && !self.shared.stop.load(Ordering::Acquire)
+            })
+            .map_err(|_| SignetError::Unavailable)?;
+        drop(state);
+        self.expire_unstarted();
+        self.take_event()
+    }
     /// Immediate atomic fence, independent of an in-flight operation or waiter.
     pub fn request_close(&self) {
         self.shared.stop.store(true, Ordering::Release);
         self.shared.notify.notify_one();
+        self.finish_unstarted(None);
         self.shared.wake.notify_all();
     }
     /// Actual runtime destruction, not a cancel request. On false retain owner,
@@ -245,6 +303,11 @@ impl NativeSignet {
         if timeout_ms > 2000 {
             return Err(SignetError::InvalidInput);
         }
+        if self.shared.done.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        self.expire_unstarted();
+        let timeout = self.wait_timeout(timeout_ms);
         let state = self
             .shared
             .state
@@ -253,10 +316,12 @@ impl NativeSignet {
         let _guard = self
             .shared
             .wake
-            .wait_timeout_while(state, Duration::from_millis(u64::from(timeout_ms)), |_| {
+            .wait_timeout_while(state, timeout, |_| {
                 !self.shared.done.load(Ordering::Acquire)
             })
             .map_err(|_| SignetError::Unavailable)?;
+        drop(_guard);
+        self.expire_unstarted();
         Ok(self.shared.done.load(Ordering::Acquire))
     }
     pub fn is_closed(&self) -> bool {
@@ -282,21 +347,38 @@ impl NativeSignet {
         {
             return Err(SignetError::Busy);
         }
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                last: 0,
-                pending: None,
-                event: None,
-                persona: None,
+        Ok(Arc::new(Self {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State {
+                    last: 0,
+                    pending: None,
+                    event: None,
+                    persona: None,
+                }),
+                wake: Condvar::new(),
+                stop: AtomicBool::new(false),
+                notify: Notify::new(),
+                done: AtomicBool::new(false),
             }),
-            wake: Condvar::new(),
-            stop: AtomicBool::new(false),
-            notify: Notify::new(),
-            done: AtomicBool::new(false),
-        });
-        let (tx, rx) = mpsc::channel(1);
-        let worker = shared.clone();
-        let spawn = std::thread::Builder::new()
+            lifecycle: Mutex::new(Lifecycle {
+                make_port: Some(Box::new(make_port)),
+                sender: None,
+                started: false,
+            }),
+            deadline,
+        }))
+    }
+    fn start_worker(
+        worker: Arc<Shared>,
+        deadline: Instant,
+        make_port: MakePort,
+        rx: mpsc::Receiver<Command>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        #[cfg(test)]
+        if FORCE_SPAWN_FAILURE.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("generated spawn refusal"));
+        }
+        std::thread::Builder::new()
             .name("sapflow-signet".into())
             .spawn(move || {
                 // No global tracing feature/subscriber changes. Maintained NIP46
@@ -326,16 +408,7 @@ impl NativeSignet {
                     worker.done.store(true, Ordering::Release);
                     worker.wake.notify_all();
                 }
-            });
-        if spawn.is_err() {
-            OWNER.store(false, Ordering::Release);
-            return Err(SignetError::Unavailable);
-        }
-        Ok(Arc::new(Self {
-            shared,
-            tx,
-            deadline,
-        }))
+            })
     }
     fn submit(&self, command: Command, id: u64, connected: bool) -> Response<()> {
         if id == 0 || id > 9_007_199_254_740_991 {
@@ -345,7 +418,7 @@ impl NativeSignet {
             return Err(SignetError::Closed);
         }
         if Instant::now() >= self.deadline {
-            self.request_close();
+            self.expire_unstarted();
             return Err(SignetError::Deadline);
         }
         let mut state = self
@@ -360,9 +433,34 @@ impl NativeSignet {
             return Err(SignetError::InvalidInput);
         }
         let previous = state.last;
+        let mut lifecycle = self.lifecycle.try_lock().map_err(|_| SignetError::Busy)?;
+        if self.shared.stop.load(Ordering::Acquire) || self.shared.done.load(Ordering::Acquire) {
+            return Err(SignetError::Closed);
+        }
+        if Instant::now() >= self.deadline {
+            drop(lifecycle);
+            drop(state);
+            self.expire_unstarted();
+            return Err(SignetError::Deadline);
+        }
+        if !lifecycle.started {
+            let (sender, receiver) = mpsc::channel(1);
+            let worker = self.shared.clone();
+            let make_port = lifecycle.make_port.take().ok_or(SignetError::Closed)?;
+            if Self::start_worker(worker, self.deadline, make_port, receiver).is_err() {
+                lifecycle.make_port = None;
+                drop(lifecycle);
+                drop(state);
+                self.finish_unstarted(Some(SignetError::Unavailable));
+                return Err(SignetError::Unavailable);
+            }
+            lifecycle.sender = Some(sender);
+            lifecycle.started = true;
+        }
         state.last = id;
         state.pending = Some(id);
-        if self.tx.try_send(command).is_err() {
+        let sender = lifecycle.sender.as_ref().ok_or(SignetError::Closed)?;
+        if sender.try_send(command).is_err() {
             state.pending = None;
             state.last = previous;
             return Err(SignetError::Busy);
@@ -609,6 +707,7 @@ pub(crate) mod tests {
     fn panic_destroys_runtime_then_releases_permit_and_exports_fixed_error() {
         let _serial = SERIAL.lock().expect("serial");
         let owner = NativeSignet::spawn_port(2000, || panic!("generated fault")).expect("owner");
+        owner.connect(1).expect("submit starts panicking worker");
         assert!(matches!(
             owner.wait_event(1000).expect("event"),
             Some(SignetEvent::Failed {
@@ -667,6 +766,207 @@ pub(crate) mod tests {
         let next = NativeSignet::pair_bunker(uri, 1000).expect("new actual owner after cleanup");
         closed(&next);
     }
+    #[test]
+    fn unused_pair_and_restore_close_do_not_start_worker_and_release_permit() {
+        let _serial = SERIAL.lock().expect("serial");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner = NativeSignet::spawn_port(2000, {
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                let (port, _) = test_port(false, false, false);
+                Ok(port)
+            }
+        })
+        .expect("unused owner");
+        assert!(matches!(
+            NativeSignet::spawn_port(1000, || panic!("second owner must wait")),
+            Err(SignetError::Busy)
+        ));
+        closed(&owner);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let (port, _) = test_port(false, false, false);
+        let issuer = NativeSignet::spawn_port(2000, move || Ok(port)).expect("credential issuer");
+        let credential = ready(&issuer);
+        closed(&issuer);
+        let restored = NativeSignet::restore(credential, 1000).expect("unused restore");
+        closed(&restored);
+        let uri = format!(
+            "bunker://{}?relay=wss://relay.example.invalid",
+            Keys::generate().public_key().to_hex()
+        );
+        let pair = NativeSignet::pair_bunker(uri.clone(), 1000).expect("unused pair");
+        closed(&pair);
+        let successor = NativeSignet::pair_bunker(uri, 1000).expect("permit released");
+        closed(&successor);
+    }
+
+    #[test]
+    fn first_valid_submit_starts_once_but_invalid_calls_do_not_start() {
+        let _serial = SERIAL.lock().expect("serial");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner = NativeSignet::spawn_port(2000, {
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                let (port, _) = test_port(false, false, false);
+                Ok(port)
+            }
+        })
+        .expect("lazy owner");
+        assert!(matches!(owner.connect(0), Err(SignetError::InvalidInput)));
+        assert!(matches!(
+            owner.sign_login(
+                1,
+                "a".repeat(64),
+                "https://api.example.invalid".into(),
+                "Test".into(),
+                1
+            ),
+            Err(SignetError::InvalidInput)
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        let _ = ready(&owner);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        closed(&owner);
+    }
+
+    #[test]
+    fn concurrent_submit_and_close_never_leak_worker_or_permit() {
+        let _serial = SERIAL.lock().expect("serial");
+        for iteration in 0..32 {
+            let owner = NativeSignet::spawn_port(2000, {
+                let (port, _) = test_port(false, false, false);
+                move || Ok(port)
+            })
+            .expect("race owner");
+            let submitting = owner.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let start = barrier.clone();
+            let thread = std::thread::spawn(move || {
+                start.wait();
+                submitting.connect(1)
+            });
+            barrier.wait();
+            owner.request_close();
+            let submitted = thread.join().expect("submit panic containment");
+            assert!(
+                owner.wait_closed(2000).expect("actual close"),
+                "iteration {iteration} submitted {submitted:?}"
+            );
+            if submitted.is_ok() {
+                drop(owner.wait_event(0).expect("event drain"));
+            } else {
+                assert!(matches!(
+                    submitted,
+                    Err(SignetError::Closed
+                        | SignetError::Cancelled
+                        | SignetError::Deadline
+                        | SignetError::Busy)
+                ));
+            }
+        }
+        let (port, _) = test_port(false, false, false);
+        let successor = NativeSignet::spawn_port(1000, move || Ok(port)).expect("permit released");
+        closed(&successor);
+    }
+
+    #[test]
+    fn unstarted_deadline_is_delivered_without_runtime_startup() {
+        let _serial = SERIAL.lock().expect("serial");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner = NativeSignet::spawn_port(30, {
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                let (port, _) = test_port(false, false, false);
+                Ok(port)
+            }
+        })
+        .expect("expiring owner");
+        assert!(matches!(
+            owner.wait_event(1000).expect("deadline"),
+            Some(SignetEvent::Failed {
+                request_id: 0,
+                error: SignetError::Deadline
+            })
+        ));
+        assert!(owner.wait_closed(2000).expect("actual close"));
+        assert!(owner.wait_event(0).expect("no replay").is_none());
+        assert!(matches!(owner.connect(1), Err(SignetError::Closed)));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn fractional_millisecond_deadline_is_delivered_and_closed() {
+        let _serial = SERIAL.lock().expect("serial");
+        for iteration in 0..64 {
+            let mut owner = NativeSignet::spawn_port(1000, || panic!("worker must not start"))
+                .expect("fractional deadline owner");
+            Arc::get_mut(&mut owner)
+                .expect("unstarted owner is unique")
+                .deadline = Instant::now() + Duration::from_micros(1500);
+            let event = owner.wait_event(1000).expect("deadline wait");
+            assert!(
+                matches!(
+                    event,
+                    Some(SignetEvent::Failed {
+                        request_id: 0,
+                        error: SignetError::Deadline
+                    })
+                ),
+                "iteration {iteration} did not deliver deadline"
+            );
+            assert!(owner.is_closed(), "iteration {iteration} did not close");
+            assert!(owner.wait_closed(2000).expect("actual close"));
+        }
+    }
+
+    #[test]
+    fn started_shutdown_finishes_before_done_and_replacement() {
+        let _serial = SERIAL.lock().expect("serial");
+        let (port, gates) = test_port(false, true, false);
+        let owner = NativeSignet::spawn_port(2000, move || Ok(port)).expect("started owner");
+        let _ = ready(&owner);
+        owner.request_close();
+        let until = Instant::now() + Duration::from_secs(1);
+        while !gates.stopping.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert!(gates.stopping.load(Ordering::Acquire));
+        assert!(!owner.wait_closed(10).expect("shutdown still running"));
+        gates.shutdown.notify_one();
+        assert!(owner.wait_closed(2000).expect("actual shutdown"));
+        let (port, _) = test_port(false, false, false);
+        let successor = NativeSignet::spawn_port(1000, move || Ok(port)).expect("replacement");
+        closed(&successor);
+    }
+
+    #[test]
+    fn failed_spawn_reports_unavailable_and_releases_permit() {
+        let _serial = SERIAL.lock().expect("serial");
+        FORCE_SPAWN_FAILURE.store(true, Ordering::Release);
+        let owner = NativeSignet::spawn_port(2000, {
+            let (port, _) = test_port(false, false, false);
+            move || Ok(port)
+        })
+        .expect("owner before refused spawn");
+        assert!(matches!(owner.connect(1), Err(SignetError::Unavailable)));
+        FORCE_SPAWN_FAILURE.store(false, Ordering::Release);
+        assert!(matches!(
+            owner.wait_event(0).expect("spawn failure"),
+            Some(SignetEvent::Failed {
+                error: SignetError::Unavailable,
+                ..
+            })
+        ));
+        assert!(owner.wait_closed(2000).expect("failed spawn cleanup"));
+        let (port, _) = test_port(false, false, false);
+        let successor = NativeSignet::spawn_port(1000, move || Ok(port)).expect("permit released");
+        closed(&successor);
+    }
+
     #[test]
     fn exact_native_worker_signs_fixed_proof_and_enforces_one_completion_slot() {
         let _serial = SERIAL.lock().expect("serial");
