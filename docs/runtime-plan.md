@@ -5,9 +5,10 @@ and what measurements decide whether to continue. An optional viewer prototype
 has since landed and is now the only viewer backend: Sapflow's HTTP event loop
 serves viewers, and the Hyper viewer path was removed (`SAPFLOW_HTTP_IMPL=hyper`
 stops startup). Ingest, callbacks, private publish control and recording still
-use their existing runtime, with axum and hyper for the control API and
-callbacks. The inventory below is the original 2026-10-22 snapshot. See the
-measurements in
+run on tokio. The control API and the callback client are our own small
+HTTP/1.1 code on tokio sockets and `httparse` (`http_lite.rs`); axum, hyper and
+hyper-util are no longer dependencies of the server. The inventory below is the
+original 2026-10-22 snapshot. See the measurements in
 [benchmarks](benchmarks.md) and the implementation gates in
 [readiness](readiness.md). This does not replace the whole server runtime or
 establish a mobile performance improvement.
@@ -33,7 +34,8 @@ In the server (about 10,000 lines), tokio does:
 tokio is not alone. `axum` (the HTTP routes) and `hyper` / `hyper-util` (the
 HTTP/1.1 server and the callback client) are built on it. Replacing tokio
 means replacing the HTTP server and client too, and that is most of the
-work.
+work. (Since then the control API and the callback client no longer use axum or
+hyper: see `http_lite.rs`, `publish_control.rs` and `callback.rs`.)
 
 ## What it could gain
 
@@ -121,10 +123,13 @@ default until the new one matches it in `scripts/smoke.sh` and the benchmarks:
    own loop.
 2. SRT ingest (UDP; the listener is sans-IO already).
 3. RTMP ingest (TCP; `sapflow_rtmp::Connection` is sans-IO already).
-4. The callback client.
+4. The callback client. Done for the HTTP part: a small HTTP/1.1 client on
+   tokio sockets replaced hyper-util, and the control API likewise replaced
+   axum (`http_lite.rs`, fuzz target `http_lite`). Both still run on tokio.
 5. Recording on a writer thread.
 6. Signals and shutdown.
-7. Remove tokio, axum and hyper; regenerate `THIRD_PARTY_LICENSES.txt`.
+7. Remove tokio; regenerate `THIRD_PARTY_LICENSES.txt` (axum and hyper are
+   already out).
 
 ## Not before the trial
 

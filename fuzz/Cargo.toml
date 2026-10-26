@@ -129,6 +129,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "http_lite"
+path = "fuzz_targets/http_lite.rs"
+test = false
+doc = false
+bench = false
+
 [patch.crates-io]
 nostr-connect = { path = "../vendor/nostr-connect" }
 nostr-sdk = { path = "../vendor/nostr-sdk" }

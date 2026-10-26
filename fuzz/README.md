@@ -82,6 +82,7 @@ source-EOF qualification. No Rust build is involved.
 | `signet_auth` | Bounded cold-auth credential/URI and fixed kind-21236 contract parsers; no runtime, relay, signer or account |
 | `publish_session` | Production scoped-session JSON and checksummed metadata parsers, plus bounded pure authority commands, durable snapshots, connection claims and stale lease/restart/terminal fences; no I/O |
 | `http1_request` | HTTP/1.1 request framing for the viewer event loop (`own_http.rs`): arbitrary bytes taken one request at a time; progress, the head limit, refusal of bodies, and that later bytes never change an earlier request |
+| `http_lite` | The private control API's request heads and the callback client's response heads and URLs (`http_lite.rs`): progress and the head, target and header limits, CRLF lines throughout, a head that never changes with later bytes, and that every accepted callback URL is sent as exactly one request head the server side reads back as the same `POST` |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's

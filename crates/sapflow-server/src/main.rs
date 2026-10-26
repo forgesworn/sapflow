@@ -6,6 +6,7 @@ mod config;
 mod epoch_tests;
 mod fdlimit;
 mod http1;
+mod http_lite;
 mod media_body;
 mod own_http;
 mod publish;

@@ -1,0 +1,6 @@
+POST /v1/publish-sessions/0123456789abcdef0123456789abcdef/revoke HTTP/1.1
+Authorization: Bearer token
+Content-Length: 1
+Content-Length: 1
+
+{

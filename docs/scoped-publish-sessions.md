@@ -41,7 +41,12 @@ reset to an empty authority.
 
 Every request uses `Authorization: Bearer <control-token>`. JSON bodies are
 limited to 16 KiB, reject unknown fields and use camel-case names. The listener
-bounds connections, headers, header time and request time. Mutations that have
+bounds connections (16 at once), the request head (16 KiB, 32 headers, a 2 KiB
+target), the time to receive the head (5 s) and the body and handler (10 s
+together). It serves one request per connection and closes it
+(`connection: close`), takes only origin-form targets with a single
+`content-length` body (no chunked or repeated lengths) and checks the bearer
+token before it reads any body. Mutations that have
 started retain a bounded owned task through durable completion if the HTTP
 caller disconnects or times out. A timeout is not proof that the mutation failed;
 retry the identical request or query status.
@@ -93,9 +98,13 @@ secret-free receipt:
 | `callbacks` | `disabled`, `none`, `pending`, `delivered`, `failed` |
 | `observations` | Optional aggregate scalar counters; no media, history or credentials |
 
-HTTP errors use static codes: 400 invalid request, 401 missing/wrong bearer,
-403 denied session, 404 unknown session, 409 conflicting identity/revision,
-413 oversized body, 429 capacity, 503 unusable authority and 504 request timeout.
+HTTP errors use static codes in `{"ok":false,"error":<code>}` bodies, with
+`cache-control: no-store`: 400 invalid request (including chunked or repeated
+length framing), 401 missing/wrong bearer, 403 denied session, 404 unknown
+session or unknown path, 405 wrong method (with `allow`), 408 request head not
+received in time, 409 conflicting identity/revision, 413 oversized body, 414
+oversized target, 429 capacity, 431 oversized head or too many headers, 503
+unusable authority and 504 request timeout.
 Neither an acknowledged End nor a stopped socket alone proves recording or
 callback completion. Poll the independent receipts to determine completion.
 

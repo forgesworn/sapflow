@@ -7,17 +7,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::{Method, Request};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use sapflow_core::{StreamEvent, StreamPath, callback_url};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::http_lite::{self, Endpoint, ParsedResponse};
 use crate::publish_observer::{CallbackScope, CallbackTicket, RecordingObservation};
 
 const QUEUE: usize = 512;
 const MAX_BODY: usize = 16 * 1024;
+/// Connect, send and read the answer's head, per attempt.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Interim `1xx` answers skipped before a final one; more is a broken peer.
+const MAX_INTERIM: usize = 4;
 
 pub(crate) struct Queued {
     path: StreamPath,
@@ -199,46 +202,116 @@ pub(crate) fn test_queue(
     )
 }
 
+/// Why an attempt got no status. Neither carries the error text: it may
+/// contain the secret-bearing URL.
+#[derive(Debug, PartialEq, Eq)]
+enum Failure {
+    Timeout,
+    Transport,
+}
+
+/// One `POST`, then the answer's status. The connection is plain HTTP/1.1 and
+/// used once (`connection: close`). Only the status line and headers are read,
+/// within `MAX_HEAD`; the body is never read. A redirect is a status like any
+/// other: the `location` is never followed.
+async fn post(endpoint: &Endpoint, body: &[u8]) -> std::io::Result<u16> {
+    let mut socket = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+    // A receiver may answer, and close, before it has read the whole body.
+    // Keep a write error to report only if no answer arrives.
+    let wrote = socket
+        .write_all(&endpoint.post("application/json", body))
+        .await;
+    let mut buf = Vec::with_capacity(512);
+    let mut interim = 0;
+    loop {
+        match http_lite::parse_response(&buf) {
+            ParsedResponse::Complete { status, used }
+                if (100..200).contains(&status) && status != 101 =>
+            {
+                interim += 1;
+                if interim > MAX_INTERIM {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                buf.drain(..used);
+                continue;
+            }
+            ParsedResponse::Complete { status, .. } => return Ok(status),
+            ParsedResponse::Malformed => return Err(std::io::ErrorKind::InvalidData.into()),
+            ParsedResponse::Partial => {}
+        }
+        let mut chunk = [0u8; 2048];
+        let room = http_lite::MAX_HEAD
+            .saturating_sub(buf.len())
+            .min(chunk.len());
+        match socket.read(&mut chunk[..room]).await {
+            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            Ok(_) => {
+                return Err(wrote
+                    .err()
+                    .unwrap_or(std::io::ErrorKind::UnexpectedEof.into()));
+            }
+            Err(e) => return Err(wrote.err().unwrap_or(e)),
+        }
+    }
+}
+
+async fn attempt(endpoint: &Endpoint, body: &[u8], limit: Duration) -> Result<u16, Failure> {
+    match tokio::time::timeout(limit, post(endpoint, body)).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(_)) => Err(Failure::Transport),
+        Err(_) => Err(Failure::Timeout),
+    }
+}
+
 async fn run(template: String, secret: Option<String>, mut rx: mpsc::Receiver<Queued>) {
-    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
     while let Some(mut queued) = rx.recv().await {
         let url = callback_url(&template, &queued.path, secret.as_deref());
         let mut delay = Duration::from_millis(500);
         let mut delivered = false;
-        for attempt in 1..=4 {
-            let req = Request::builder()
-                .method(Method::POST)
-                .uri(&url)
-                .header("content-type", "application/json")
-                .body(Full::new(queued.body.clone()));
-            let Ok(req) = req else {
-                tracing::error!(event = queued.name, "callback URL is not valid");
-                break;
-            };
-            match tokio::time::timeout(Duration::from_secs(5), client.request(req)).await {
-                Ok(Ok(resp)) if resp.status().is_success() => {
-                    delivered = true;
-                    tracing::debug!(event = queued.name, "callback delivered");
-                    break;
+        // The URL carries the secret: it is parsed here and never logged.
+        if let Some(endpoint) = Endpoint::parse(&url) {
+            for attempt_number in 1..=4 {
+                match attempt(&endpoint, &queued.body, ATTEMPT_TIMEOUT).await {
+                    Ok(status) if (200..300).contains(&status) => {
+                        delivered = true;
+                        tracing::debug!(event = queued.name, "callback delivered");
+                        break;
+                    }
+                    Ok(status) if (400..500).contains(&status) => {
+                        // v4v refused it (wrong token or path): retrying won't help.
+                        tracing::warn!(event = queued.name, status, "callback refused");
+                        break;
+                    }
+                    Ok(status) => {
+                        tracing::warn!(
+                            event = queued.name,
+                            status,
+                            attempt = attempt_number,
+                            "callback failed"
+                        );
+                    }
+                    Err(Failure::Transport) => {
+                        tracing::warn!(
+                            event = queued.name,
+                            attempt = attempt_number,
+                            "callback transport failed"
+                        );
+                    }
+                    Err(Failure::Timeout) => {
+                        tracing::warn!(
+                            event = queued.name,
+                            attempt = attempt_number,
+                            "callback timed out"
+                        );
+                    }
                 }
-                Ok(Ok(resp)) if resp.status().is_client_error() => {
-                    // v4v refused it (wrong token or path): retrying won't help.
-                    tracing::warn!(event = queued.name, status = %resp.status(), "callback refused");
-                    break;
+                if attempt_number < 4 {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
                 }
-                Ok(Ok(resp)) => {
-                    tracing::warn!(event = queued.name, status = %resp.status(), attempt, "callback failed");
-                }
-                Ok(Err(_)) => {
-                    // Client errors may contain the secret-bearing URL.
-                    tracing::warn!(event = queued.name, attempt, "callback transport failed");
-                }
-                Err(_) => tracing::warn!(event = queued.name, attempt, "callback timed out"),
             }
-            if attempt < 4 {
-                tokio::time::sleep(delay).await;
-                delay *= 2;
-            }
+        } else {
+            tracing::error!(event = queued.name, "callback URL is not valid");
         }
         if let Some(ticket) = queued.ticket.take() {
             ticket.finish(delivered);
@@ -475,100 +548,316 @@ mod tests {
         );
     }
 
+    /// What a receiver saw: one complete `POST`.
+    struct Seen {
+        method: String,
+        target: String,
+        host: Option<String>,
+        content_type: Option<String>,
+        connection: Option<String>,
+        declared_length: Option<usize>,
+        body: Vec<u8>,
+    }
+
+    /// A plain-socket stand-in for v4v, parsing requests with `httparse`
+    /// separately from the client's own code. `answer` gets the index of each
+    /// request and returns the raw bytes to send, or `None` to stay silent.
+    struct Receiver {
+        addr: std::net::SocketAddr,
+        seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Receiver {
+        async fn start(answer: impl Fn(usize) -> Option<Vec<u8>> + Send + Sync + 'static) -> Self {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("listener");
+            let addr = listener.local_addr().expect("addr");
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let answer = Arc::new(answer);
+            let log = seen.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (log, answer) = (log.clone(), answer.clone());
+                    tokio::spawn(async move {
+                        let Some(request) = Self::read(&mut socket).await else {
+                            return;
+                        };
+                        let index = {
+                            let mut log = log.lock().expect("log");
+                            log.push(request);
+                            log.len() - 1
+                        };
+                        match answer(index) {
+                            Some(bytes) => {
+                                let _ = socket.write_all(&bytes).await;
+                                let _ = socket.shutdown().await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    });
+                }
+            });
+            Self { addr, seen, task }
+        }
+
+        async fn read(socket: &mut TcpStream) -> Option<Seen> {
+            let mut buf = Vec::new();
+            loop {
+                let mut headers = [httparse::EMPTY_HEADER; 32];
+                let mut req = httparse::Request::new(&mut headers);
+                if let Ok(httparse::Status::Complete(used)) = req.parse(&buf) {
+                    let header = |name: &str| {
+                        req.headers
+                            .iter()
+                            .find(|h| h.name.eq_ignore_ascii_case(name))
+                            .map(|h| String::from_utf8_lossy(h.value).into_owned())
+                    };
+                    let declared_length = header("content-length").and_then(|v| v.parse().ok());
+                    let mut body = buf[used..].to_vec();
+                    while body.len() < declared_length.unwrap_or(0) {
+                        let mut chunk = [0u8; 4096];
+                        let n = socket.read(&mut chunk).await.ok()?;
+                        if n == 0 {
+                            return None;
+                        }
+                        body.extend_from_slice(&chunk[..n]);
+                    }
+                    return Some(Seen {
+                        method: req.method?.to_owned(),
+                        target: req.path?.to_owned(),
+                        host: header("host"),
+                        content_type: header("content-type"),
+                        connection: header("connection"),
+                        declared_length,
+                        body,
+                    });
+                }
+                let mut chunk = [0u8; 4096];
+                let n = socket.read(&mut chunk).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.seen.lock().expect("log").len()
+        }
+        fn url(&self) -> String {
+            format!("http://{}/callback", self.addr)
+        }
+        fn endpoint(&self) -> Endpoint {
+            Endpoint::parse(&self.url()).expect("receiver URL")
+        }
+    }
+
+    impl Drop for Receiver {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn answer_status(code: u16) -> Option<Vec<u8>> {
+        Some(http_lite::response(code, &[], b""))
+    }
+
+    async fn state_is(scope: &CallbackScope, state: &str, limit: Duration) {
+        tokio::time::timeout(limit, async {
+            while scope.observations.callback_state() != state {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("callback state {state}"));
+    }
+
     #[tokio::test]
     async fn real_http_ack_updates_receipts_and_client_refusal_is_terminal() {
-        use axum::{Router, routing::post};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let received = Arc::new(AtomicUsize::new(0));
-        let count = received.clone();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("listener");
-        let addr = listener.local_addr().expect("addr");
-        let router = Router::new().route(
-            "/callback",
-            post(move || {
-                let count = count.clone();
-                async move {
-                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                        axum::http::StatusCode::NO_CONTENT
-                    } else {
-                        axum::http::StatusCode::FORBIDDEN
-                    }
-                }
-            }),
-        );
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("serve");
-        });
+        let receiver = Receiver::start(|hit| answer_status(if hit == 0 { 204 } else { 403 })).await;
         let scope = fixture_scope("a", 1, 1, 1);
-        let callbacks = Callbacks::start(
-            Some(format!("http://{addr}/callback")),
-            Some("fixture-token".into()),
-        )
-        .scoped(scope.clone());
+        let callbacks = Callbacks::start(Some(receiver.url()), Some("fixture-token".into()))
+            .scoped(scope.clone());
         callbacks.send(&scope.key().path, StreamEvent::Publish);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while scope.observations.callback_state() != "delivered" {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("HTTP acknowledgement");
+        state_is(&scope, "delivered", Duration::from_secs(2)).await;
         callbacks.send(&scope.key().path, StreamEvent::Unpublish);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while scope.observations.callback_state() != "failed" {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("terminal refusal");
-        assert_eq!(received.load(Ordering::SeqCst), 2);
+        state_is(&scope, "failed", Duration::from_secs(2)).await;
+        assert_eq!(receiver.count(), 2);
         assert_eq!(scope.observations.counts().callbacks_delivered, 1);
         assert_eq!(scope.observations.counts().callbacks_failed, 1);
+        // The request on the wire: what v4v has always been sent.
+        let seen = receiver.seen.lock().expect("log");
+        let first = &seen[0];
+        assert_eq!(first.method, "POST");
+        assert_eq!(first.target, "/callback?token=fixture-token");
+        assert_eq!(
+            first.host.as_deref(),
+            Some(format!("{}", receiver.addr).as_str())
+        );
+        assert_eq!(first.content_type.as_deref(), Some("application/json"));
+        assert_eq!(first.connection.as_deref(), Some("close"));
+        assert_eq!(first.declared_length, Some(first.body.len()));
+        let body: serde_json::Value = serde_json::from_slice(&first.body).expect("JSON body");
+        assert_eq!(body["event"], "publish");
+        assert_eq!(body["eventSequence"], 1);
+        let second: serde_json::Value = serde_json::from_slice(&seen[1].body).expect("JSON body");
+        assert_eq!(second["event"], "unpublish");
+        assert_eq!(second["eventSequence"], 2);
+        drop(seen);
         drop(callbacks);
-        server.abort();
-        let _ = server.await;
     }
 
     #[tokio::test]
     async fn real_http_server_failure_exhausts_four_attempts_without_false_delivery() {
-        use axum::{Router, routing::post};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let received = Arc::new(AtomicUsize::new(0));
-        let count = received.clone();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("listener");
-        let addr = listener.local_addr().expect("addr");
-        let router = Router::new().route(
-            "/callback",
-            post(move || {
-                let count = count.clone();
-                async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE
-                }
-            }),
-        );
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("serve");
-        });
+        let receiver = Receiver::start(|_| answer_status(503)).await;
         let scope = fixture_scope("a", 1, 1, 1);
-        let callbacks =
-            Callbacks::start(Some(format!("http://{addr}/callback")), None).scoped(scope.clone());
+        let callbacks = Callbacks::start(Some(receiver.url()), None).scoped(scope.clone());
         callbacks.send(&scope.key().path, StreamEvent::Publish);
-        tokio::time::timeout(Duration::from_secs(6), async {
-            while scope.observations.callback_state() != "failed" {
+        state_is(&scope, "failed", Duration::from_secs(6)).await;
+        assert_eq!(receiver.count(), 4);
+        assert_eq!(scope.observations.counts().callbacks_delivered, 0);
+        drop(callbacks);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_a_failed_attempt_and_is_never_followed() {
+        let elsewhere = Receiver::start(|_| answer_status(200)).await;
+        let location = elsewhere.url();
+        let receiver = Receiver::start(move |_| {
+            Some(http_lite::response(
+                302,
+                &[("location", location.as_str())],
+                b"",
+            ))
+        })
+        .await;
+        let scope = fixture_scope("a", 1, 1, 1);
+        let callbacks = Callbacks::start(Some(receiver.url()), None).scoped(scope.clone());
+        callbacks.send(&scope.key().path, StreamEvent::Publish);
+        state_is(&scope, "failed", Duration::from_secs(6)).await;
+        assert_eq!(receiver.count(), 4);
+        assert_eq!(elsewhere.count(), 0);
+        assert_eq!(scope.observations.counts().callbacks_delivered, 0);
+        drop(callbacks);
+    }
+
+    #[tokio::test]
+    async fn events_are_delivered_one_at_a_time_in_order() {
+        let receiver = Receiver::start(|_| answer_status(204)).await;
+        let scope = fixture_scope("a", 1, 1, 1);
+        let callbacks = Callbacks::start(Some(receiver.url()), None).scoped(scope.clone());
+        let events = [
+            StreamEvent::Publish,
+            health(),
+            health(),
+            StreamEvent::Unpublish,
+        ];
+        for event in events {
+            callbacks.send(&scope.key().path, event);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.count() < 4 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("bounded retry exhaustion");
-        assert_eq!(received.load(Ordering::SeqCst), 4);
+        .expect("all four delivered");
+        let sequences: Vec<u64> = receiver
+            .seen
+            .lock()
+            .expect("log")
+            .iter()
+            .map(|seen| {
+                serde_json::from_slice::<serde_json::Value>(&seen.body).expect("JSON")["eventSequence"]
+                    .as_u64()
+                    .expect("sequence")
+            })
+            .collect();
+        assert_eq!(sequences, [1, 2, 3, 4]);
+        state_is(&scope, "delivered", Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_callback_url_fails_at_once_without_connecting() {
+        let scope = fixture_scope("a", 1, 1, 1);
+        let callbacks =
+            Callbacks::start(Some("http://127.0.0.1:9/a b".into()), None).scoped(scope.clone());
+        callbacks.send(&scope.key().path, StreamEvent::Publish);
+        // No retry delays: the first backoff alone is 500 ms.
+        state_is(&scope, "failed", Duration::from_millis(400)).await;
         assert_eq!(scope.observations.counts().callbacks_delivered, 0);
-        drop(callbacks);
-        server.abort();
-        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn interim_answers_are_skipped_but_not_without_limit() {
+        let interim = || b"HTTP/1.1 100 Continue\r\n\r\n".to_vec();
+        let receiver = Receiver::start(move |hit| {
+            let mut bytes = interim();
+            if hit == 0 {
+                bytes.extend_from_slice(&http_lite::response(204, &[], b""));
+            } else {
+                for _ in 0..MAX_INTERIM {
+                    bytes.extend_from_slice(&interim());
+                }
+                bytes.extend_from_slice(&http_lite::response(204, &[], b""));
+            }
+            Some(bytes)
+        })
+        .await;
+        let limit = Duration::from_secs(2);
+        assert_eq!(attempt(&receiver.endpoint(), b"{}", limit).await, Ok(204));
+        assert_eq!(
+            attempt(&receiver.endpoint(), b"{}", limit).await,
+            Err(Failure::Transport)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_response_head_is_cut_off() {
+        let receiver = Receiver::start(|_| {
+            let mut bytes = b"HTTP/1.1 200 OK\r\nx-junk: ".to_vec();
+            bytes.resize(256 * 1024, b'a');
+            Some(bytes)
+        })
+        .await;
+        assert_eq!(
+            attempt(&receiver.endpoint(), b"{}", Duration::from_secs(2)).await,
+            Err(Failure::Transport)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_receiver_times_out_and_a_closed_port_is_a_transport_failure() {
+        let receiver = Receiver::start(|_| None).await;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            attempt(&receiver.endpoint(), b"{}", Duration::from_millis(150)).await,
+            Err(Failure::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let closed = {
+            let listener =
+                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("listener");
+            let addr = listener.local_addr().expect("addr");
+            Endpoint::parse(&format!("http://{addr}/callback")).expect("URL")
+        };
+        assert_eq!(
+            attempt(&closed, b"{}", Duration::from_secs(2)).await,
+            Err(Failure::Transport)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_http_is_a_transport_failure() {
+        let receiver = Receiver::start(|_| Some(b"SSH-2.0-not-http\r\n".to_vec())).await;
+        assert_eq!(
+            attempt(&receiver.endpoint(), b"{}", Duration::from_secs(2)).await,
+            Err(Failure::Transport)
+        );
     }
 }
