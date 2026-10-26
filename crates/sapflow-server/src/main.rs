@@ -2,11 +2,10 @@
 
 mod callback;
 mod config;
-mod fdlimit;
-mod http;
-mod http1;
 #[cfg(test)]
-mod http_backend_tests;
+mod epoch_tests;
+mod fdlimit;
+mod http1;
 mod media_body;
 mod own_http;
 mod publish;
@@ -20,6 +19,10 @@ mod rtmp;
 mod srt;
 mod srt_own;
 mod stream;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod viewer_tests;
 
 use std::sync::Arc;
 
@@ -140,20 +143,16 @@ async fn run(config: Config) -> std::io::Result<()> {
         config,
     });
 
-    // Viewers use our event loop by default; Hyper is explicitly selectable.
-    let http = match app.config.own_http_threads {
-        Some(threads) => {
-            let l = std::net::TcpListener::bind(app.config.http_addr)?;
-            own_http::spawn(app.clone(), l, threads, own_http::Timeouts::default())?;
-            tracing::info!(addr = %app.config.http_addr, threads, "HLS listening (own event loop)");
-            None
-        }
-        None => {
-            let l = tokio::net::TcpListener::bind(app.config.http_addr).await?;
-            tracing::info!(addr = %app.config.http_addr, "HLS listening");
-            Some(l)
-        }
-    };
+    // Viewers are served on our own event loop, not on tokio.
+    let threads = app.config.http_threads;
+    let listener = std::net::TcpListener::bind(app.config.http_addr)?;
+    own_http::spawn(
+        app.clone(),
+        listener,
+        threads,
+        own_http::Timeouts::default(),
+    )?;
+    tracing::info!(addr = %app.config.http_addr, threads, "HLS listening (own event loop)");
     let srt_task = tokio::spawn(srt::listen(app.clone(), app.config.srt_addr));
     let rtmp_task = tokio::spawn({
         let app = app.clone();
@@ -195,17 +194,9 @@ async fn run(config: Config) -> std::io::Result<()> {
             app.config.record_delete_after,
         ));
     }
-    let http_task: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>>>> =
-        match http {
-            Some(http) => Box::pin(http::serve(http, http::router(app.clone()), stop_signal())),
-            None => Box::pin(async {
-                stop_signal().await;
-                Ok(())
-            }),
-        };
 
     tokio::select! {
-        r = http_task => r,
+        () = stop_signal() => Ok(()),
         r = srt_task => match r {
             Ok(r) => r,
             Err(e) => Err(std::io::Error::other(e)),

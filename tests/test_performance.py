@@ -61,14 +61,14 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual((row["drained_requests"], row["max_drain_seconds"]), (2, .03))
 
     def test_full_cycle_balances_every_treatment_position(self):
-        treatments = ["hyper", "own-1", "own-4", "own", "mediamtx"]
+        treatments = ["own-1", "own-4", "own", "mediamtx"]
         orders = [performance.trial_order(treatments, n) for n in range(len(treatments))]
         for column in zip(*orders):
             self.assertEqual(set(column), set(treatments))
 
     def test_pair_order_reverses_and_three_treatments_rotate(self):
-        self.assertEqual(performance.trial_order(["hyper", "own"], 1), ["own", "hyper"])
-        treatments = ["hyper", "own", "mediamtx"]
+        self.assertEqual(performance.trial_order(["own", "own-1"], 1), ["own-1", "own"])
+        treatments = ["own", "own-1", "mediamtx"]
         self.assertEqual([performance.trial_order(treatments, n)[0] for n in range(3)], treatments)
 
     def test_summary_retains_spread_and_sums_failures(self):
@@ -120,9 +120,8 @@ class PerformanceTests(unittest.TestCase):
 
     def test_failed_and_rejected_trials_remain_in_the_structured_receipt(self):
         for runner_exit, report, reason, variant, threads in [
-            (7, "viewer failed\n", "runner exit 7", "hyper", None),
-            (0, REPORT.replace("measured 60 s", "measured 1 s"), "viewer workload", "hyper", None),
             (7, "viewer failed\n", "runner exit 7", "own", "8"),
+            (0, REPORT.replace("measured 60 s", "measured 1 s"), "viewer workload", "own", "8"),
             (7, "viewer failed\n", "runner exit 7", "own-1", "1"),
             (7, "viewer failed\n", "runner exit 7", "own-4", "4"),
         ]:
@@ -142,7 +141,7 @@ class PerformanceTests(unittest.TestCase):
                     return "fixture"
 
                 def run_trial(env, server, raw):
-                    self.assertEqual(env["SAPFLOW_HTTP_IMPL"], "hyper" if variant == "hyper" else "own")
+                    self.assertEqual(env["SAPFLOW_HTTP_IMPL"], "own")
                     self.assertEqual(env.get("SAPFLOW_HTTP_THREADS"), threads)
                     raw.write_text(report)
                     raw.with_suffix(".logs").mkdir()
@@ -169,9 +168,7 @@ class PerformanceTests(unittest.TestCase):
                     performance.main()
                 result = json.loads((output / "results.json").read_text())
                 self.assertEqual(result["status"], "failed")
-                settings = {"SAPFLOW_HTTP_IMPL": "hyper" if variant == "hyper" else "own"}
-                if threads is not None:
-                    settings["SAPFLOW_HTTP_THREADS"] = threads
+                settings = {"SAPFLOW_HTTP_IMPL": "own", "SAPFLOW_HTTP_THREADS": threads}
                 self.assertEqual(result["http_settings"], {variant: settings})
                 trial = result["runs"][0]
                 self.assertEqual(trial["runner_exit"], runner_exit)
@@ -205,7 +202,9 @@ class PerformanceTests(unittest.TestCase):
             executable(server, f"#!{sys.executable}\nimport json, os, pathlib\npathlib.Path(os.environ['FIXTURE_ENV_FILE']).write_text(json.dumps({{k: os.environ.get(k) for k in ['SAPFLOW_HTTP_IMPL', 'SAPFLOW_HTTP_THREADS']}}))\nraise SystemExit(23)\n")
             for script in ("bench.sh", "smoke.sh"):
                 for index, (backend, count, expected_backend, expected_count) in enumerate([
-                    (None, None, "own", "8"), ("hyper", "99", "hyper", None),
+                    (None, None, "own", "8"),
+                    # A stale selection reaches the server, which refuses it.
+                    ("hyper", "99", "hyper", "99"),
                     ("own", "1", "own", "1"), ("own", "4", "own", "4"),
                     (None, "3", "own", "3"),
                 ]):
@@ -227,12 +226,13 @@ class PerformanceTests(unittest.TestCase):
                         self.assertEqual(json.loads(capture.read_text()), {
                             "SAPFLOW_HTTP_IMPL": expected_backend, "SAPFLOW_HTTP_THREADS": expected_count})
 
-    def test_ci_smoke_covers_explicit_hyper_and_own_worker_settings(self):
+    def test_ci_smoke_covers_the_own_event_loop_and_no_other_backend(self):
         workflow = (performance.ROOT / ".github/workflows/ci.yml").read_text()
         steps = [step for step in workflow.split("\n      - name:") if "\n        run: scripts/smoke.sh" in step]
-        self.assertEqual(len(steps), 2)
-        self.assertEqual(sum("SAPFLOW_HTTP_IMPL: hyper" in step for step in steps), 1)
-        self.assertEqual(sum("SAPFLOW_HTTP_IMPL: own" in step and "SAPFLOW_HTTP_THREADS: 1" in step for step in steps), 1)
+        self.assertEqual(len(steps), 1)
+        self.assertIn("SAPFLOW_HTTP_IMPL: own", steps[0])
+        self.assertIn("SAPFLOW_HTTP_THREADS: 1", steps[0])
+        self.assertNotIn("hyper", workflow.lower())
 
     def test_failed_viewer_keeps_all_diagnostics_and_original_exit_status(self):
         # Execute the real shell orchestration with finite executable fixtures.
