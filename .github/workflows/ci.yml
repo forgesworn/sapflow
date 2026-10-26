@@ -256,3 +256,7 @@ jobs:
           SAPFLOW_HTTP_IMPL: own
           SAPFLOW_HTTP_THREADS: 1
         run: scripts/smoke.sh
+      - name: Prepared TV script regressions (generated media only)
+        run: |
+          bash -n scripts/tv-prepare.sh scripts/tv-playout.sh
+          python3 -B tests/test_tv_scripts.py

@@ -116,6 +116,10 @@ or `rtmp://<host>:1935/live` with key `<eventId>?user=<publisher>&pass=<password
 and play `http://<host>:8888/live/<eventId>/index.m3u8`. `sapflow --help`
 lists every setting.
 
+For a continuously looping folder of prepared videos, see the
+[TV channel guide](docs/tv-channel.md), including separate live gig paths and an
+optional HAProxy TLS/HTTP2 example.
+
 sapflow serves HTTP/1.1 without TLS. Put Caddy or another HTTP/2 proxy in
 front: Safari takes the low-latency position only over HTTP/2 (about 3 s
 glass to glass through it, against about 10 s over HTTP/1.1; see
