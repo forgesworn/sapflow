@@ -13,17 +13,29 @@ import signal
 import threading
 from urllib.parse import urlsplit
 
-from tv_preview_policy import media_target
+from tv_preview_policy import media_target, audience_target
 from tv_preview_transport import TorTransport
 
 HERE = Path(__file__).resolve().parent
 ASSETS = HERE.parent / "web/tv"
-STATIC = {"/tv/": ("index.html", "text/html; charset=utf-8"),
+STATIC = {"/tv/version.mjs": ("version.mjs", "text/javascript; charset=utf-8"),
+          "/tv/loading-ident.mp4": ("loading-ident.mp4", "video/mp4"),
+          "/tv/ident.mjs": ("ident.mjs", "text/javascript; charset=utf-8"),
+          "/tv/controls.mjs": ("controls.mjs", "text/javascript; charset=utf-8"),
+          "/tv/network.mjs": ("network.mjs", "text/javascript; charset=utf-8"),
+          "/tv/audience.mjs": ("audience.mjs", "text/javascript; charset=utf-8"),
+          "/tv/": ("index.html", "text/html; charset=utf-8"),
+          "/tv/licences.html": ("licences.html", "text/html; charset=utf-8"),
+          "/tv/LICENSE.txt": ("LICENSE.txt", "text/plain; charset=utf-8"),
+          "/tv/now-streaming.png": ("now-streaming.png", "image/png"),
+          "/tv/off-air.png": ("off-air.png", "image/png"),
+          "/tv/connection.mjs": ("connection.mjs", "text/javascript; charset=utf-8"),
+          "/tv/playlist.mjs": ("playlist.mjs", "text/javascript; charset=utf-8"),
+          "/tv/cmaf-player.mjs": ("cmaf-player.mjs", "text/javascript; charset=utf-8"),
+          "/tv/tone.mjs": ("tone.mjs", "text/javascript; charset=utf-8"),
           "/tv/player.css": ("player.css", "text/css; charset=utf-8"),
           "/tv/player.mjs": ("player.mjs", "text/javascript; charset=utf-8"),
-          "/tv/vendor/hls.light.min.mjs": ("vendor/hls.light.min.mjs", "text/javascript; charset=utf-8"),
-          "/tv/vendor/APACHE-2.0.txt": ("vendor/APACHE-2.0.txt", "text/plain; charset=utf-8"),
-          "/tv/vendor/hls.js-LICENSE": ("vendor/hls.js-LICENSE", "text/plain; charset=utf-8")}
+          "/tv/vendor/THIRD-PARTY-LICENCES.txt": ("vendor/THIRD-PARTY-LICENCES.txt", "text/plain; charset=utf-8")}
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
        "media-src 'self' blob:; img-src 'self'; base-uri 'none'; object-src 'none'; "
        "form-action 'none'; frame-ancestors 'none'")
@@ -90,13 +102,14 @@ class PreviewHandler(BaseHTTPRequestHandler):
             self.reply(200, (self.server.assets / name).read_bytes(), mime)
             return
         try:
-            if not media_target(self.path):
+            if not (media_target(self.path) or audience_target(self.path)):
                 self.reply(404, b"Not found\n")
                 return
         except ValueError:
             self.reply(400, b"Invalid request\n")
             return
-        if not self.server.slots.acquire(blocking=False):
+        slots = self.server.audience_slots if audience_target(self.path) else self.server.slots
+        if not slots.acquire(blocking=False):
             self.reply(503, b"Preview busy\n")
             return
         try:
@@ -105,12 +118,17 @@ class PreviewHandler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             self.reply(503, b"Tor preview unavailable\n")
         finally:
-            self.server.slots.release()
+            slots.release()
 
 
 class PreviewServer(ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.slots = threading.BoundedSemaphore(4)
+        self.audience_slots = threading.BoundedSemaphore(1)
 
 
 def main():
@@ -124,7 +142,8 @@ def main():
     if not ASSETS.joinpath("index.html").is_file():
         parser.error("trusted local web/tv assets are required")
     try:
-        transport = TorTransport(args.receiver, args.socks_port)
+        # Four media transfers plus one small aggregate status request.
+        transport = TorTransport(args.receiver, args.socks_port, size=5)
     except RuntimeError as error:
         parser.error(str(error))
     with PreviewServer(("127.0.0.1", args.port), PreviewHandler) as server:
@@ -136,13 +155,13 @@ def main():
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         print(f"Preview: http://127.0.0.1:{server.server_port}/tv/", flush=True)
-        print("Only TV media uses Tor. Other browser applications are unaffected.", flush=True)
+        print("Only TV media and aggregate channel status use Tor. Other browser applications are unaffected.", flush=True)
         try:
             server.serve_forever(poll_interval=0.1)
         finally:
             transport.stop()
     transport.close()
-    print(f"Preview stopped: {transport.requests} media requests, {transport.connections} connections.", flush=True)
+    print(f"Preview stopped: {transport.requests} channel requests, {transport.connections} connections.", flush=True)
 
 
 if __name__ == "__main__":

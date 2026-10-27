@@ -44,15 +44,19 @@ def main():
     engine=publisher=server=worker=None
     with tempfile.TemporaryDirectory(prefix='sapflow-tv-browser-') as work:
         home=Path(work);media=home/'media';media.mkdir()
-        subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=s=320x180:r=25:d=12',
-                        '-f','lavfi','-i','sine=r=48000:d=12','-c:v','libx264','-preset','ultrafast',
-                        '-g','25','-pix_fmt','yuv420p','-c:a','aac','-ac','2',str(media/'generated.mp4')],check=True,timeout=60)
+        # Distinct tracks deliberately contain audio tails shorter than video.
+        # The continuous playout clock must fill those gaps across every cut.
+        for index, (colour, duration, audio_duration) in enumerate([('red',4,2),('lime',5,4),('blue',6,6)]):
+            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i',f'color=c={colour}:s=320x180:r=25:d={duration}',
+                            '-f','lavfi','-i',f'sine=r=48000:d={audio_duration}:f={440+index*220}',
+                            '-c:v','libx264','-preset','medium','-g','25','-keyint_min','25','-sc_threshold','0',
+                            '-pix_fmt','yuv420p','-c:a','aac','-ac','2',str(media/f'{index:02}-generated.mp4')],check=True,timeout=60)
         with (output/'engine.log').open('w') as engine_log,(output/'publisher.log').open('w') as pub_log:
             try:
                 env={k:v for k,v in os.environ.items() if not k.startswith('SAPFLOW_')}
                 env.update(SAPFLOW_OPEN_PUBLISH='1',SAPFLOW_HTTP_ADDR=f'127.0.0.1:{http}',
                            SAPFLOW_RTMP_ADDR=f'127.0.0.1:{rtmp}',SAPFLOW_SRT_ADDR=f'127.0.0.1:{srt}',
-                           SAPFLOW_HTTP_THREADS='1',SAPFLOW_RECONNECT_GRACE='3')
+                           SAPFLOW_HTTP_THREADS='1',SAPFLOW_RECONNECT_GRACE='10')
                 engine=subprocess.Popen([str(binary)],env=env,stdout=engine_log,stderr=subprocess.STDOUT,start_new_session=True)
                 deadline=time.monotonic()+10
                 while True:
@@ -68,7 +72,7 @@ def main():
                 while True:
                     try:
                         data=opener.open(f'http://127.0.0.1:{http}/live/event-tv/stream.m3u8',timeout=2).read()
-                        if data.count(b'#EXTINF:')>=10:break
+                        if data.count(b'#EXTINF:')>=20:break
                     except urllib.error.URLError:pass
                     if time.monotonic()>deadline:raise RuntimeError('Fixture live stream never primed')
                     time.sleep(.2)
@@ -85,14 +89,25 @@ def main():
                     except urllib.error.HTTPError as error:
                         code=error.code;error.close();return code,b'Unavailable\n','text/plain'
 
+                if os.environ.get('SAPFLOW_TV_TEST_PEERS') == '1':
+                    subprocess.run(['node',str(ROOT/'tests/tv-peers-browser.mjs'),f'http://127.0.0.1:{http}/live/event-tv/',str(publisher.pid)],check=True,timeout=150)
+
                 server=preview.PreviewServer(('127.0.0.1',0),preview.PreviewHandler)
                 class FixtureTransport:
-                    def fetch(self,target):return fixture_fetch(target)
+                    def fetch(self,target):
+                        if target=='/tv/audience':
+                            return 200,b'{"activePlayers":2,"peerEnabledPlayers":1,"updatedAt":1,"ttlSeconds":35,"playerVersion":"2026.10.27.7","channel":{"state":"live","startedAt":1,"endedAt":null,"lastMediaAgeSeconds":0}}', 'application/json'
+                        return fixture_fetch(target)
                 server.assets=ROOT/'web/tv';server.transport=FixtureTransport()
                 server.slots=threading.BoundedSemaphore(4)
                 worker=threading.Thread(target=server.serve_forever);worker.start()
                 subprocess.run(['node',str(ROOT/'tests/tv-player-browser.mjs'),f'http://127.0.0.1:{server.server_port}/tv/',
-                                str(output/'chromium'),'15','chrome'],check=True,timeout=150)
+                                str(output/'chromium'),'20','chrome'],check=True,timeout=150,
+                               env=dict(os.environ,SAPFLOW_TV_TEST_CUTS='1'))
+                subprocess.run(['node',str(ROOT/'tests/tv-player-browser.mjs'),f'http://127.0.0.1:{server.server_port}/tv/',
+                                str(output/'managed'),'20','chrome-managed'],check=True,timeout=150,
+                               env=dict(os.environ,SAPFLOW_TV_TEST_CUTS='1'))
+                subprocess.run(['node',str(ROOT/'tests/tv-network-browser.mjs'),f'http://127.0.0.1:{server.server_port}/tv/'],check=True,timeout=180)
             finally:
                 if server:
                     server.shutdown();server.server_close();worker.join(timeout=5)

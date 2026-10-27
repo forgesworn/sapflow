@@ -237,7 +237,7 @@ jobs:
 
   smoke:
     name: Smoke test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -251,8 +251,14 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install ffmpeg and SRT tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg srt-tools curl python3 openssh-server netcat-openbsd
+          # The hosted image's Azure mirror timed out fetching media packages.
+          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            if [ -f "$source" ]; then
+              sudo sed -i -e 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' -e 's|https://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
+            fi
+          done
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends ffmpeg srt-tools curl python3 openssh-server netcat-openbsd
           sudo install -d -m 0755 /run/sshd
           command -v srt-live-transmit ffmpeg ffprobe
       - name: Smoke, viewers on the own event loop
@@ -265,12 +271,20 @@ jobs:
           bash -n scripts/tv-prepare.sh scripts/tv-playout.sh
           python3 -B tests/test_tv_scripts.py
           python3 -B tests/test_private_tv_publish.py
+          python3 -B tests/test_tv_channel_control.py
           # Only the generated loopback sshd fixture needs Linux PAM privileges.
           # Do not unlock the runner's password account to enable key auth.
           sudo -n python3 -B tests/test_private_tv_integration.py
       - name: TV player, preview privacy and bounded manifest mutation gate
         run: |
-          node --test tests/tv-player.test.mjs
+          npm ci --prefix tools/tv-relayswarm --ignore-scripts --no-audit --no-fund
+          python3 tools/tv-relayswarm/fetch.py
+          python3 tools/tv-relayswarm/wasm-notices.py --check
+          node tools/tv-relayswarm/build.mjs
+          git diff --exit-code -- web/tv/vendor/THIRD-PARTY-LICENCES.txt
+          node --test tests/tv-audience.test.mjs tests/tv-player.test.mjs tests/tv-playlist.test.mjs tests/tv-tone.test.mjs tests/tv-connection.test.mjs tests/tv-peers.test.mjs tests/tv-swarm-server.test.mjs
+          node fuzz/tv_playlist_fuzz.mjs 20000
+          node fuzz/tv_swarm_fuzz.mjs 20000
           python3 -B scripts/check-tv-assets.py
           python3 -m venv "$RUNNER_TEMP/tv-preview-venv"
           "$RUNNER_TEMP/tv-preview-venv/bin/python" -m pip install --only-binary=:all: --require-hashes --no-deps -r scripts/requirements-tv-preview.txt
@@ -283,7 +297,7 @@ jobs:
           trap 'rm -rf "$tv_tools"' EXIT
           npm install --prefix "$tv_tools" --no-package-lock --ignore-scripts --no-audit --no-fund playwright@1.63.0
           export SAPFLOW_PLAYWRIGHT_MODULE="$tv_tools/node_modules/playwright/index.mjs"
-          python3 -B tests/tv_browser_fixture.py
+          SAPFLOW_TV_TEST_PEERS=1 python3 -B tests/tv_browser_fixture.py
       - name: Retain generated TV browser evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

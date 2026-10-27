@@ -12,7 +12,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from tv_preview_policy import checked_manifest, media_target, preview_manifest, MAX_MANIFEST
+from tv_preview_policy import checked_manifest, media_target, preview_manifest, MAX_MANIFEST, audience_target, checked_audience
 import tv_preview_transport as TRANSPORT
 
 SPEC = importlib.util.spec_from_file_location("preview", ROOT / "scripts/tv-preview.py")
@@ -68,6 +68,19 @@ class Policy(unittest.TestCase):
         for origin in ['http://media.example', 'https://user:pass@media.example', 'https://media.example/other']:
             with self.assertRaises(Exception):
                 PREVIEW.receiver_origin(origin)
+
+
+class AudiencePolicy(unittest.TestCase):
+    def test_aggregate_only_and_exact_route(self):
+        import json
+        data={"activePlayers":2,"peerEnabledPlayers":1,"updatedAt":1,"ttlSeconds":35,"playerVersion":"1","channel":{"state":"ended","startedAt":1,"endedAt":2,"lastMediaAgeSeconds":5}}
+        self.assertEqual(json.loads(checked_audience(json.dumps(data).encode())),data)
+        self.assertTrue(audience_target('/tv/audience'))
+        for path in ['/tv/audience?ip=1','/tv/audience/','https://receiver.example/tv/audience']:
+            self.assertFalse(audience_target(path))
+        for value in [{**data,'ip':'198.51.100.1'}, {**data,'activePlayers':True}, {**data,'activePlayers':0}, {**data,'playerVersion':'<script>'}, {**data,'channel':{**data['channel'],'location':'somewhere'}}]:
+            with self.assertRaises(ValueError):checked_audience(json.dumps(value).encode())
+        with self.assertRaises(ValueError):checked_audience(b' '*8193)
 
 
 class CurlTransport(unittest.TestCase):
@@ -186,6 +199,29 @@ class LoopbackServer(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.base = f'http://127.0.0.1:{self.server.server_port}'
+
+    def test_status_poll_cannot_take_a_media_transfer_slot(self):
+        from concurrent.futures import ThreadPoolExecutor
+        entered = threading.Barrier(5)
+        release = threading.Event()
+        def fetch(target):
+            if target == '/tv/audience':
+                return 200, b'{"activePlayers":1}', 'application/json'
+            entered.wait(timeout=5)
+            release.wait(timeout=5)
+            return 200, b'generated fragment', 'video/mp4'
+        self.server.transport.fetch.side_effect = fetch
+        def get(path):
+            with urllib.request.urlopen(self.base+path,timeout=6) as r:return r.status
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            pending=[workers.submit(get,f'/tv/live/event-tv/{PREFIX}_seg{i}.mp4') for i in range(4)]
+            try:
+                entered.wait(timeout=5)
+                self.assertEqual(get('/tv/audience'),200)
+                with self.assertRaises(urllib.error.HTTPError) as busy:get(f'/tv/live/event-tv/{PREFIX}_seg99.mp4')
+                self.assertEqual(busy.exception.code,503)
+            finally:release.set()
+            self.assertEqual([p.result() for p in pending],[200]*4)
 
     def test_idle_browser_socket_cannot_hold_shutdown_open(self):
         idle=socket.create_connection(('127.0.0.1', self.server.server_port),timeout=7)

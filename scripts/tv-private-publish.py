@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from tv_channel_control import ChannelControl
 
 HERE = Path(__file__).resolve().parent
 
@@ -111,7 +112,11 @@ def stop_child(child):
     child.wait()
 
 
-def run(args):
+class OnionUnavailable(ValueError):
+    """A pinned onion transport failed; never authorises a different route."""
+
+
+def run(args, on_stop=None, on_ready=None):
     publish_path = os.environ.get("TV_PRIVATE_PUBLISH_PATH", "")
     if not re.fullmatch(r"live/[A-Za-z0-9_-]{1,128}(?:\?[^\x00-\x20\x7f#]*)?", publish_path):
         raise ValueError("set TV_PRIVATE_PUBLISH_PATH to live/EVENT with URL-encoded credentials")
@@ -134,6 +139,8 @@ def run(args):
     def on_signal(_signum, _frame):
         nonlocal stopped
         stopped = True
+        if on_stop is not None:
+            on_stop(_signum, _frame)
 
     old_handlers = {s: signal.signal(s, on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
     verifier = master = playout = None
@@ -158,6 +165,10 @@ def run(args):
             raise ValueError("prepared media verification failed; run tv-prepare.sh --verify locally")
         if stopped:
             return 130
+        if on_ready is not None:
+            on_ready()
+        if stopped:
+            return 130
         # /tmp keeps the SSH control socket below Unix pathname length limits on macOS.
         with tempfile.TemporaryDirectory(prefix="sapflow-private-", dir="/tmp") as work:
             control = Path(work) / "ssh"
@@ -172,7 +183,7 @@ def run(args):
                     if stopped:
                         return 130
                     if master.poll() is not None or time.monotonic() >= deadline:
-                        raise ValueError("onion SSH failed; check Tor, receiver access and the pinned host key")
+                        raise OnionUnavailable("onion SSH failed; check Tor, receiver access and the pinned host key")
                     if control.exists():
                         check = subprocess.run(command + ["-O", "check", args.onion_host],
                                                env=clean_env, stdout=subprocess.DEVNULL,
@@ -205,7 +216,7 @@ def run(args):
                 playout = subprocess.Popen(play_command, env=playout_env, start_new_session=True)
                 while not stopped:
                     if master.poll() is not None:
-                        raise ValueError("onion SSH disconnected; stopping publisher")
+                        raise OnionUnavailable("onion SSH disconnected; stopping publisher")
                     result = playout.poll()
                     if result is not None:
                         return 0 if result == 0 else 1
@@ -219,6 +230,44 @@ def run(args):
             signal.signal(signum, handler)
 
 
+def supervise(args):
+    """Retry only the same pinned Tor route after cleaning up a failed attempt."""
+    stopping = False
+    channel = ChannelControl(getattr(args, "control_config", None), getattr(args, "socks_port", 9050))
+    def cancel(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+    handlers = {sig: signal.signal(sig, cancel) for sig in (signal.SIGINT, signal.SIGTERM)}
+    delay = 2
+    try:
+        while not stopping:
+            started = time.monotonic()
+            try:
+                return run(args, on_stop=cancel, on_ready=channel.start)
+            except OnionUnavailable:
+                if args.once:
+                    raise
+                if stopping:
+                    return 130
+                if time.monotonic() - started >= 60:
+                    delay = 2
+                print(f"private-tv: pinned onion SSH unavailable; retrying through Tor in {delay}s; Ctrl-C stops",
+                      file=sys.stderr)
+                deadline = time.monotonic() + delay
+                while not stopping and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                delay = min(delay * 2, 30)
+        return 130
+    finally:
+        if stopping or args.once:
+            if channel.end():
+                print("private-tv: broadcast end confirmed by receiver", file=sys.stderr)
+            elif channel.attempted:
+                print("private-tv: end notice unconfirmed; receiver reconnect grace still applies", file=sys.stderr)
+        for sig, previous in handlers.items():
+            signal.signal(sig, previous)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--onion-host", type=onion_host, required=True)
@@ -228,12 +277,13 @@ def main():
     parser.add_argument("--socks-port", type=port, default=9050)
     parser.add_argument("--ssh-port", type=port, default=22)
     parser.add_argument("--ingest-port", type=port, default=1935)
+    parser.add_argument("--control-config", type=Path, help="private HTTPS channel lifecycle configuration; always through Tor")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("prepared_dir", type=Path)
     args = parser.parse_args()
     try:
-        return run(args)
+        return supervise(args)
     except ValueError as error:
         # Only our fixed validation messages reach here, never filesystem errors.
         print(f"private-tv: {error}", file=sys.stderr)

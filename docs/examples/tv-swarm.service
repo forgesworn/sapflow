@@ -1,0 +1,30 @@
+[Unit]
+Description=Sapflow single-channel viewer peer adapter
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=sapflow-tv-swarm
+StateDirectoryMode=0700
+WorkingDirectory=/opt/sapflow-tv-swarm
+EnvironmentFile=/etc/sapflow-tv-swarm.env
+ExecStart=/usr/bin/node /opt/sapflow-tv-swarm/server.mjs
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=32
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

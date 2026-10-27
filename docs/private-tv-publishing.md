@@ -180,10 +180,14 @@ verifies prepared media before networking, ignores user/system SSH config,
 uses only the explicit SSH identity and pin, and establishes a fresh private
 SSH master before asking it to bind the local RTMP port.
 
-If Tor or SSH fails, it stops. It never switches to public SSH, SRT, direct
+If Tor or SSH fails, the current publish attempt stops. It never switches to public SSH, SRT, direct
 RTMP or a different relay. SSH keepalives detect a stalled connection; until
 then FFmpeg can block on the existing local tunnel. After a failure, restore
-Tor/access and restart explicitly. The media supervisor can retry encoder
+Tor/access if the pinned route stays unavailable. Normal continuous publishing retries
+the same pinned onion route with a 2 to 30 second backoff after cleaning up
+the old tunnel and media worker. It never switches to a direct route. Ctrl-C
+also stops a pending retry. `--once` keeps a single-attempt policy. A new
+tunnel starts the prepared playlist from the beginning. The media supervisor can retry encoder
 failures while the same SSH master remains alive.
 
 `--strip-metadata` is mandatory in this wrapper. It disables source global and
@@ -222,3 +226,42 @@ The live gate is a generated-media run over the configured onion receiver:
 
 No real footage, origin addresses, operator keys or private relay endpoints
 belong in public qualification evidence.
+
+
+## Deliberate stop notices
+
+The optional `--control-config /private/channel-control.json` flag lets Ctrl+C
+end the channel promptly instead of looking like an accidental tunnel drop.
+Create a separate random 32-byte token, shared only between the publisher and
+receiver. Store its lower-case hexadecimal form in a 0600 file on each machine,
+inside private directories. Do not reuse an SSH key, publish path or account
+credential, put the token in a command line, commit it or serve it to browsers.
+
+The private configuration file must also have mode 0600:
+
+```json
+{"origin":"https://media.example","token_file":"/private/channel-control-token"}
+```
+
+Set the receiver sidecar's `TV_CHANNEL_CONTROL_TOKEN_FILE` to its private token
+file, restart the sidecar and allow the exact `/tv/broadcast/control` route to
+reach it through the existing proxy. The example Caddy fragment includes it.
+The route is disabled when no token is configured. It accepts only bounded,
+authenticated start/end notices, never media, arbitrary paths or server commands.
+It does not make the Rust ingest/control API public.
+
+The helper registers its random session after local media verification. It
+sends the end notice only for an intentional stop or a completed `--once` run;
+unexpected tunnel loss keeps the same session and reconnect policy. Both notices
+use the existing Tor SOCKS listener, remote DNS, verified HTTPS and no redirects
+or direct fallback. A new registration supersedes older sessions. The receiver atomically retains
+only the current lifecycle nonce and end marker in a private 0600 state file,
+so restarting the adapter preserves the current publisher and a confirmed end.
+During upgrade, a first authenticated end can adopt the existing publisher
+session when no checkpoint exists; later mismatched sessions remain rejected. Notices do not
+appear in the viewer's metadata or aggregate audience response.
+
+An end notice stops the player's retry loop after its buffered tail plays out.
+A lost notice falls back to the receiver's reconnect grace. A hard process kill
+cannot run shutdown code and therefore also relies on that fallback. Test both
+Ctrl+C and accidental disconnect with generated media before a live programme.

@@ -9,7 +9,8 @@
 # srt://... or rtmp://...; when omitted, TV_PUBLISH_URL is used, which keeps
 # credentials out of a service file's command line. The files are joined with
 # ffmpeg's concat demuxer, played in real time (-re) and looped without end
-# (-stream_loop -1). Video is copied untouched. Audio is re-encoded by default
+# (-stream_loop -1). When supported, a temporary 2x input rate replenishes
+# the receiver after a blocked upload instead of FFmpeg's slow default catch-up. Video is copied untouched. Audio is re-encoded by default
 # (AAC-LC, 48 kHz, stereo) because the AAC priming and padding frames at each
 # file boundary overlap in time when copied (ffmpeg then reports non-monotonic
 # DTS); --audio copy keeps the prepared audio bytes at the cost of that.
@@ -211,6 +212,10 @@ sink_srt() { # url; the MPEG-TS arrives on stdin
   wait "$pid"
 }
 
+tv_catchup_options() { # ffmpeg full help text -> supported input options
+  case $1 in *-readrate_catchup*) printf '%s\n' -readrate_catchup 2 ;; esac
+}
+
 ffmpeg_has_srt() { ffmpeg -hide_banner -protocols 2> /dev/null | grep -qw srt; }
 
 main() {
@@ -279,6 +284,8 @@ main() {
   trap on_signal INT TERM
   trap cleanup EXIT
 
+  local catchup
+  catchup=$(tv_catchup_options "$(ffmpeg -hide_banner -h full 2> /dev/null || true)")
   local backoff=$TV_BACKOFF_MIN started elapsed rc reason attempt=0
   log "publishing to $redacted via $sink_mode (audio $audio$([ "$once" = 1 ] && echo ', once'))"
   while :; do
@@ -295,13 +302,15 @@ main() {
     log "attempt $attempt: ${#files[@]} file(s)"
 
     local -a in=(-re)
+    [ -z "$catchup" ] || in+=(-readrate_catchup 2)
     [ "$once" = 1 ] || in+=(-stream_loop -1)
     # Only local prepared files may be opened in the private publishing mode.
     [ "$strip_metadata" = 0 ] || in+=(-protocol_whitelist file,concat)
     in+=(-f concat -safe 0 -i "$work/list.txt")
     local -a codec=(-map 0:v:0 -map 0:a:0 -c:v copy)
     if [ "$audio" = encode ]; then
-      codec+=(-c:a aac -profile:a aac_low -b:a "$TV_AUDIO_BITRATE" -ar 48000 -ac 2)
+      codec+=(-af "aresample=48000:async=1:first_pts=0"
+        -c:a aac -profile:a aac_low -b:a "$TV_AUDIO_BITRATE" -ar 48000 -ac 2)
     else
       codec+=(-c:a copy)
     fi

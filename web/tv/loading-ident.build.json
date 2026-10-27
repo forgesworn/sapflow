@@ -1,0 +1,13 @@
+{
+  "provider": "Higgsfield",
+  "model": "seedance_2_5",
+  "jobId": "b94614c8-31a6-42e3-ab0b-98700e6a9ed4",
+  "durationSeconds": 6,
+  "audio": false,
+  "sourceArtwork": "off-air.png",
+  "sourceArtworkSha256": "69ad60c8ab8a87b342f3277cb43cddf383cdc688b30e51d4c5d05ea19eb0f908",
+  "sha256": "da60134c2b08705f6537f6ed634220b062566d84a988ecc8a6a39466dd41e730",
+  "provenance": "Generated from our Sunburst calibration artwork; no camera or programme media.",
+  "delivery": "1280x720, 24 fps, H264, no audio or embedded source metadata",
+  "prompt": "loading-ident.prompt.txt"
+}

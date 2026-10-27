@@ -18,3 +18,5 @@
 # Certificates mediamtx writes when benchmarked from here
 /auto.crt
 /auto.key
+
+/tools/tv-relayswarm/node_modules/

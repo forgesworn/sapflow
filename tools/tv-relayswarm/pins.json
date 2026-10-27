@@ -1,0 +1,18 @@
+{
+  "version": "0.4.4",
+  "sourceCommit": "fdebc64875bc89623f0d87e5cd20096f3f86a22a",
+  "assets": {
+    "relayswarm-0.4.4.tgz": {
+      "url": "https://github.com/forgesworn/relayswarm/releases/download/v0.4.4/relayswarm-0.4.4.tgz",
+      "sha256": "d979b6bcc6c3d81ff6fe5774e96b46b510bef3a534879efb63685462f8108392"
+    },
+    "relayswarm-hls-swarm-0.4.4.mjs": {
+      "url": "https://github.com/forgesworn/relayswarm/releases/download/v0.4.4/relayswarm-hls-swarm-0.4.4.mjs",
+      "sha256": "43736e69c311ece4c0ad3cc69844c389d78264da8151944f47d378c79e097d7b"
+    },
+    "relayswarm-core-0.4.4.wasm": {
+      "url": "https://github.com/forgesworn/relayswarm/releases/download/v0.4.4/relayswarm-core-0.4.4.wasm",
+      "sha256": "cb67128f84cf99b9fc8e4dc8e2fe6e8287d2ec442823021e3d0ad18ce10cbece"
+    }
+  }
+}

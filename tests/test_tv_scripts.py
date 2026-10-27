@@ -230,7 +230,7 @@ class Supervisor(unittest.TestCase):
     def test_sigterm_stops_an_active_encoder_and_cleans_its_concat_list(self):
         fake = Path(self.tmp.name) / "bin/ffmpeg"
         marker = Path(self.tmp.name) / "encoder.pid"
-        fake.write_text('#!/bin/sh\necho $$ > "$TV_TEST_PID"\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n')
+        fake.write_text('#!/bin/sh\ncase "$*" in *"-h full"*) exit 0 ;; esac\necho $$ > "$TV_TEST_PID"\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n')
         env = dict(self.env, TV_TEST_PID=str(marker))
         proc = subprocess.Popen(["bash", str(PLAYOUT), "--no-verify", str(self.media), "rtmp://h.example/live/key"],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
@@ -253,6 +253,12 @@ class Supervisor(unittest.TestCase):
         finally:
             if proc.poll() is None:
                 proc.kill(); proc.communicate(timeout=5)
+
+
+class CatchupOptions(unittest.TestCase):
+    def test_new_ffmpeg_catches_up_and_older_builds_keep_compatible_input(self):
+        self.assertEqual(call(PLAYOUT, 'tv_catchup_options', ' -readrate_catchup <speed>').stdout.splitlines(), ['-readrate_catchup', '2'])
+        self.assertEqual(call(PLAYOUT, 'tv_catchup_options', ' -readrate <speed>').stdout, '')
 
 
 class PrepareHelpers(unittest.TestCase):
@@ -280,6 +286,20 @@ class PrepareRoundTrip(unittest.TestCase):
              "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)],
             check=True, timeout=120,
         )
+
+    def test_short_audio_is_padded_to_video_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src,out=Path(tmp)/'src',Path(tmp)/'out';src.mkdir()
+            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','color=c=red:s=320x180:r=25:d=3',
+                            '-f','lavfi','-i','sine=r=48000:d=0.5','-c:v','libx264','-preset','ultrafast',
+                            '-pix_fmt','yuv420p','-c:a','aac',str(src/'generated.mp4')],check=True,timeout=60)
+            env=dict(os.environ,TV_ENCODER='libx264',TV_PRESET='ultrafast',TV_WIDTH='320',TV_HEIGHT='180')
+            prepared=subprocess.run(['bash',str(PREPARE),str(src),str(out)],capture_output=True,text=True,env=env,timeout=60)
+            self.assertEqual(prepared.returncode,0,prepared.stderr)
+            probe=subprocess.run(['ffprobe','-v','error','-show_entries','stream=codec_type,duration','-of','json',str(out/'generated.mp4')],capture_output=True,text=True,check=True)
+            durations={row['codec_type']:float(row['duration']) for row in json.loads(probe.stdout)['streams']}
+            self.assertGreaterEqual(durations['audio'],durations['video']-.022)
+            self.assertLessEqual(durations['audio'],durations['video']+.05)
 
     def test_mixed_sources_come_out_identical_and_reruns_skip(self):
         with tempfile.TemporaryDirectory() as tmp:

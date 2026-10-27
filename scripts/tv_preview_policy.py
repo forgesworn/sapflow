@@ -85,3 +85,33 @@ def preview_manifest(data):
     if b'#EXT-X-STREAM-INF:' not in data:
         lines.insert(1, b'#EXT-X-START:TIME-OFFSET=-6.0,PRECISE=NO')
     return b'\n'.join(lines) + b'\n'
+
+
+def audience_target(value):
+    return value == "/tv/audience"
+
+
+def checked_audience(data):
+    """Only aggregate counts and channel lifecycle may cross the private proxy."""
+    import json
+    if len(data) > 8192:
+        raise ValueError("audience budget exceeded")
+    value = json.loads(data)
+    if not isinstance(value, dict) or set(value) != {"activePlayers", "peerEnabledPlayers", "updatedAt", "ttlSeconds", "channel", "playerVersion"}:
+        raise ValueError("unexpected audience fields")
+    for name in ("activePlayers", "peerEnabledPlayers", "updatedAt", "ttlSeconds"):
+        if type(value[name]) is not int or not 0 <= value[name] <= 9007199254740991:
+            raise ValueError("invalid audience count")
+    if value["activePlayers"] > 4096 or value["peerEnabledPlayers"] > value["activePlayers"] or not 1 <= value["ttlSeconds"] <= 120:
+        raise ValueError("invalid audience bounds")
+    if not isinstance(value["playerVersion"], str) or not re.fullmatch(r"[a-zA-Z0-9._-]{1,32}", value["playerVersion"]):
+        raise ValueError("invalid player version")
+    channel = value["channel"]
+    if not isinstance(channel, dict) or set(channel) != {"state", "startedAt", "endedAt", "lastMediaAgeSeconds"}:
+        raise ValueError("unexpected channel fields")
+    if channel["state"] not in ("offair", "live", "reconnecting", "ended"):
+        raise ValueError("invalid channel state")
+    for name in ("startedAt", "endedAt", "lastMediaAgeSeconds"):
+        if channel[name] is not None and (type(channel[name]) is not int or not 0 <= channel[name] <= 9007199254740991):
+            raise ValueError("invalid channel time")
+    return (json.dumps(value, separators=(",", ":")) + "\n").encode()

@@ -9,7 +9,7 @@ try:
 except ImportError:
     pycurl = None
 
-from tv_preview_policy import MAX_MANIFEST, preview_manifest
+from tv_preview_policy import MAX_MANIFEST, preview_manifest, checked_audience, audience_target
 
 
 class TorTransport:
@@ -39,7 +39,7 @@ class TorTransport:
     def fetch(self,target):
         if self.stopped.is_set():raise ValueError('preview stopped')
         handle=self.pool.get_nowait()
-        budget=MAX_MANIFEST if urlsplit(target).path.endswith('.m3u8') else 8*1024*1024
+        budget=8192 if audience_target(target) else MAX_MANIFEST if urlsplit(target).path.endswith('.m3u8') else 8*1024*1024
         body=bytearray()
         def write(chunk):
             if len(body)+len(chunk)>budget:return 0
@@ -54,6 +54,8 @@ class TorTransport:
             if code not in (200,400,404,410,429,503):raise ValueError('receiver redirect or unexpected response')
             if code!=200:return code,b'Channel unavailable\n','text/plain; charset=utf-8'
             data=bytes(body)
+            if audience_target(target):
+                return 200,checked_audience(data),'application/json; charset=utf-8'
             if urlsplit(target).path.endswith('.m3u8'):
                 return 200,preview_manifest(data),'application/vnd.apple.mpegurl'
             return 200,data,'video/mp4'
