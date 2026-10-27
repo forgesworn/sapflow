@@ -45,8 +45,10 @@ once eight seconds are decoded while the remaining headroom is fetched; ordinary
 track changes do not reload the player. A waiting decoder may
 nudge across at most two seconds of already-buffered empty time, only at the end
 of the preceding range; it never jumps directly over the older programme to a
-newer buffered range. Transient playlist 404/429/503 responses and network errors use at most four
-retries within the same ten-second request budget, and Stop cancels the backoff. It cannot recover
+newer buffered range. Transient playlist 404/429/503 responses, network errors and attempts that hang
+for four seconds use at most four retries with bounded backoff, about thirty
+seconds in the worst case, so one stalled read cannot reset a buffered engine.
+Stop cancels the attempt and the backoff. It cannot recover
 quality already lost during preparation or compensate for an upload that stays
 slower than the encoded programme bitrate.
 

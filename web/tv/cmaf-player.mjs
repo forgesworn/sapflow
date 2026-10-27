@@ -10,14 +10,16 @@ export async function boundedBytes(response,limit) {
   const output=new Uint8Array(size);let offset=0;for(const chunk of chunks){output.set(chunk,offset);offset+=chunk.length;}return output;
 }
 // Retry complete reads after a route change; never append partial media.
-async function retryBytes(url,{signal,limit,retry404=false,onAttempt=()=>{},onResponse=()=>{}}){
+async function retryBytes(url,{signal,limit,retry404=false,attemptMs=0,onAttempt=()=>{},onResponse=()=>{}}){
  for(let attempt=0;attempt<5;attempt++){
   signal.throwIfAborted();onAttempt(attempt);
-  try{const response=await fetch(url,{signal,redirect:'error',cache:'no-store',credentials:'omit'});onResponse(response);
+  // A hung attempt is retried; only the caller's signal ends the read.
+  const attemptSignal=attemptMs?AbortSignal.any([signal,AbortSignal.timeout(attemptMs)]):signal;
+  try{const response=await fetch(url,{signal:attemptSignal,redirect:'error',cache:'no-store',credentials:'omit'});onResponse(response);
    if(!response.ok){await response.body?.cancel();throw Object.assign(Error(`Media HTTP ${response.status}`),{status:response.status});}
    return await boundedBytes(response,limit);
   }catch(error){
-   if(signal.aborted||attempt===4||!(error instanceof TypeError||[429,503,...(retry404?[404]:[])].includes(error.status)))throw error;
+   if(signal.aborted||attempt===4||!(error instanceof TypeError||error?.name==='TimeoutError'||[429,503,...(retry404?[404]:[])].includes(error.status)))throw error;
    await new Promise(resolve=>{const done=()=>{clearTimeout(timer);signal.removeEventListener('abort',done);resolve();};const timer=setTimeout(done,[500,1500,3000,5000][attempt]);signal.addEventListener('abort',done,{once:true});if(signal.aborted)done();});
   }
  }
@@ -77,8 +79,8 @@ export default class CmafPlayer {
   get liveSyncPosition(){return this.offset===null||this.edge===null?NaN:this.offset+this.edge-this.config.liveSyncDuration;}
   get latency(){return this.offset===null||this.edge===null?0:Math.max(0,this.offset+this.edge-this.media.currentTime);}
   async text(url){
-    const signal=AbortSignal.any([this.controller.signal,AbortSignal.timeout(10000)]);
-    return new TextDecoder('ascii',{fatal:true}).decode(await retryBytes(url,{signal,limit:65536,retry404:true}));
+    // Five 4-second attempts plus backoff stay inside the 20-30 second buffer.
+    return new TextDecoder('ascii',{fatal:true}).decode(await retryBytes(url,{signal:this.controller.signal,limit:65536,retry404:true,attemptMs:4000}));
   }
   begin(){if(this.started||!this.media||!this.url)return;this.started=true;void this.run().catch(error=>{if(!this.controller.signal.aborted)this.trigger(CmafPlayer.Events.ERROR,{fatal:true,details:error.message});});}
   async append(bytes){if(this.buffer.updating)await waitEvent(this.buffer,'updateend',this.controller.signal);await waitEvent(this.buffer,'updateend',this.controller.signal,()=>this.buffer.appendBuffer(bytes));}
