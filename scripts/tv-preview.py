@@ -108,7 +108,8 @@ class PreviewHandler(BaseHTTPRequestHandler):
         except ValueError:
             self.reply(400, b"Invalid request\n")
             return
-        if not self.server.slots.acquire(blocking=False):
+        slots = self.server.audience_slots if audience_target(self.path) else self.server.slots
+        if not slots.acquire(blocking=False):
             self.reply(503, b"Preview busy\n")
             return
         try:
@@ -117,12 +118,17 @@ class PreviewHandler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             self.reply(503, b"Tor preview unavailable\n")
         finally:
-            self.server.slots.release()
+            slots.release()
 
 
 class PreviewServer(ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.slots = threading.BoundedSemaphore(4)
+        self.audience_slots = threading.BoundedSemaphore(1)
 
 
 def main():
@@ -136,7 +142,8 @@ def main():
     if not ASSETS.joinpath("index.html").is_file():
         parser.error("trusted local web/tv assets are required")
     try:
-        transport = TorTransport(args.receiver, args.socks_port)
+        # Four media transfers plus one small aggregate status request.
+        transport = TorTransport(args.receiver, args.socks_port, size=5)
     except RuntimeError as error:
         parser.error(str(error))
     with PreviewServer(("127.0.0.1", args.port), PreviewHandler) as server:
@@ -148,13 +155,13 @@ def main():
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
         print(f"Preview: http://127.0.0.1:{server.server_port}/tv/", flush=True)
-        print("Only TV media uses Tor. Other browser applications are unaffected.", flush=True)
+        print("Only TV media and aggregate channel status use Tor. Other browser applications are unaffected.", flush=True)
         try:
             server.serve_forever(poll_interval=0.1)
         finally:
             transport.stop()
     transport.close()
-    print(f"Preview stopped: {transport.requests} media requests, {transport.connections} connections.", flush=True)
+    print(f"Preview stopped: {transport.requests} channel requests, {transport.connections} connections.", flush=True)
 
 
 if __name__ == "__main__":

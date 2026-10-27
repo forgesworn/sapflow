@@ -200,6 +200,29 @@ class LoopbackServer(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.base = f'http://127.0.0.1:{self.server.server_port}'
 
+    def test_status_poll_cannot_take_a_media_transfer_slot(self):
+        from concurrent.futures import ThreadPoolExecutor
+        entered = threading.Barrier(5)
+        release = threading.Event()
+        def fetch(target):
+            if target == '/tv/audience':
+                return 200, b'{"activePlayers":1}', 'application/json'
+            entered.wait(timeout=5)
+            release.wait(timeout=5)
+            return 200, b'generated fragment', 'video/mp4'
+        self.server.transport.fetch.side_effect = fetch
+        def get(path):
+            with urllib.request.urlopen(self.base+path,timeout=6) as r:return r.status
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            pending=[workers.submit(get,f'/tv/live/event-tv/{PREFIX}_seg{i}.mp4') for i in range(4)]
+            try:
+                entered.wait(timeout=5)
+                self.assertEqual(get('/tv/audience'),200)
+                with self.assertRaises(urllib.error.HTTPError) as busy:get(f'/tv/live/event-tv/{PREFIX}_seg99.mp4')
+                self.assertEqual(busy.exception.code,503)
+            finally:release.set()
+            self.assertEqual([p.result() for p in pending],[200]*4)
+
     def test_idle_browser_socket_cannot_hold_shutdown_open(self):
         idle=socket.create_connection(('127.0.0.1', self.server.server_port),timeout=7)
         try:
