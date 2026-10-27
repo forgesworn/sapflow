@@ -89,6 +89,11 @@ test('a dropped network request retries the whole fragment without a fatal callb
  globalThis.fetch=async()=>{if(++calls===1)throw new TypeError('Network changed');return new Response(new Uint8Array([1,2,3]));};
  try{const response=await new Promise((resolve,reject)=>loader.load({url:'https://receiver.example/generated'}, {timeout:3000},{onSuccess:resolve,onError:e=>{failures++;reject(e);}}));assert.equal(response.data.byteLength,3);assert.equal(calls,2);assert.equal(failures,0);assert.equal(loader.stats.retry,1);}finally{loader.destroy();globalThis.fetch=original;}
 });
+test('a hung fragment attempt is retried within the transfer deadline',async()=>{
+ const {FetchLoader}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0,failures=0;const loader=new FetchLoader();
+ globalThis.fetch=async(_url,{signal})=>++calls===1?new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true})):new Response(new Uint8Array([1,2,3]));
+ try{const response=await new Promise((resolve,reject)=>loader.load({url:'https://receiver.example/generated'},{timeout:3000,attemptTimeout:1000},{onSuccess:resolve,onError:e=>{failures++;reject(e);}}));assert.equal(response.data.byteLength,3);assert.equal(calls,2);assert.equal(failures,0);}finally{loader.destroy();globalThis.fetch=original;}
+});
 test('Stop cancels fragment retry backoff and forbidden responses are not retried',async()=>{
  const {FetchLoader}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const loader=new FetchLoader();
  globalThis.fetch=async()=>{calls++;queueMicrotask(()=>loader.destroy());throw new TypeError('Network changed');};

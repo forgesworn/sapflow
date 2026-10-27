@@ -52,8 +52,8 @@ Stop cancels the attempt and the backoff. It cannot recover
 quality already lost during preparation or compensate for an upload that stays
 slower than the encoded programme bitrate.
 
-Whole-fragment network errors and HTTP 429/503 use the same bounded retry policy
-within a fifteen-second transfer deadline. A route change can recover using
+Whole-fragment network errors, HTTP 429/503 and attempts that hang for seven
+seconds use the same bounded retry policy within a fifteen-second transfer deadline. A route change can recover using
 complete fragments without destroying the MediaSource or buffered picture.
 Forbidden responses and oversized data are not retried.
 

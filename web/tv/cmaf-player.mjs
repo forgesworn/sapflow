@@ -44,7 +44,8 @@ export class FetchLoader {
     this.context=context;const controller=new AbortController();this.controller=controller;this.stats.aborted=false;const started=performance.now();this.stats.loading.start=started;
     const timer=setTimeout(()=>controller.abort(),config?.timeout??15000);
     let received;
-    retryBytes(context.url,{signal:controller.signal,limit:8*1024*1024,onAttempt:attempt=>{this.stats.retry=attempt;},onResponse:response=>{received=response;this.stats.loading.first=performance.now();}}).then(data=>{
+    // A hung attempt is retried inside the overall deadline instead of consuming it.
+    retryBytes(context.url,{signal:controller.signal,limit:8*1024*1024,attemptMs:config?.attemptTimeout??7000,onAttempt:attempt=>{this.stats.retry=attempt;},onResponse:response=>{received=response;this.stats.loading.first=performance.now();}}).then(data=>{
       this.stats.loading.end=performance.now();this.stats.loaded=this.stats.total=data.byteLength;
       this.stats.bwEstimate=data.byteLength*8000/Math.max(1,this.stats.loading.end-started);
       if(this.controller===controller&&!this.stats.aborted)callbacks.onSuccess({url:context.url,data:data.buffer},this.stats,context,{getResponseHeader:name=>received.headers.get(name)});
