@@ -11,7 +11,7 @@ const module=process.env.SAPFLOW_PLAYWRIGHT_MODULE;
 const { chromium, webkit }=await import(module ? pathToFileURL(module).href : 'playwright');
 let browser;
 const requests=[], errors=[], failures=[];
-let startupFailures=2, measuring=false, delayedFragment=false, transientManifest=false;
+let startupFailures=2, measuring=false, delayedFragment=false, transientManifest=false,channelEnded=false;
 try {
   browser=engine==='webkit' ? await webkit.launch({ headless:true }) : await chromium.launch({ channel:'chrome', headless:true,
     args:['--disable-background-networking','--disable-quic','--autoplay-policy=no-user-gesture-required'] });
@@ -20,6 +20,7 @@ try {
     const request=route.request(), target=new URL(request.url());
     if (target.protocol==='blob:' || target.origin===url.origin) {
       requests.push(target.pathname);
+      if(target.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:2,peerEnabledPlayers:1,playerVersion:'2026.10.27.3',channel:{state:channelEnded?'ended':'live'}})});
       if (target.pathname==='/tv/live/event-tv/index.m3u8' && startupFailures>0) {
         startupFailures--; return route.fulfill({status:404,body:'Off air'});
       }
@@ -35,7 +36,7 @@ try {
   const inflight=new Set();let peakFragments=0;
   page.on('request',request=>{if(/_seg[0-9]+\.mp4$/.test(new URL(request.url()).pathname)){inflight.add(request);peakFragments=Math.max(peakFragments,inflight.size);}});
   for(const name of ['requestfinished','requestfailed'])page.on(name,request=>inflight.delete(request));
-  page.on('pageerror', error=>errors.push(error.message));
+  page.on('pageerror', error=>{errors.push(error.message);console.error('page error:',error.message);});
   await page.addInitScript(() => {
     window.__peerAttempts=0;
     window.RTCPeerConnection=class { constructor() { window.__peerAttempts++; throw Error('Peer connection forbidden'); } };
@@ -45,11 +46,22 @@ try {
   await page.waitForTimeout(1000);
   assert.equal(requests.some(x=>x.includes('/live/')), false, 'no media before watch intent');
   await page.locator('#watch').click();
-  await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='offline');
+  await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='offline',null,{timeout:10000}).catch(async error=>{console.error('Startup diagnostic',await page.locator('#status').textContent(),await page.locator('#indicator').getAttribute('data-state'),requests,errors);throw error;});
   await page.waitForFunction(() => {
     const v=document.querySelector('video');
     return v.currentTime>1 && (v.getVideoPlaybackQuality?.().totalVideoFrames ?? v.webkitDecodedFrameCount ?? 0)>10;
   }, null, { timeout:90000 });
+  assert.equal(await page.locator('#video').evaluate(v=>v.controls),false);
+  await page.locator('#play-pause').click();await page.waitForFunction(()=>document.querySelector('#video').paused);
+  const pausedAt=await page.locator('#video').evaluate(v=>({time:v.currentTime,src:v.currentSrc}));await page.waitForTimeout(1200);
+  assert(Math.abs(await page.locator('#video').evaluate(v=>v.currentTime)-pausedAt.time)<.1);
+  await page.locator('#play-pause').click();await page.waitForFunction(()=>!document.querySelector('#video').paused);
+  assert.equal(await page.locator('#video').evaluate(v=>v.currentSrc),pausedAt.src,'resume keeps the same MediaSource');
+  await page.locator('#mute').click();assert(await page.locator('#video').evaluate(v=>v.muted));await page.locator('#mute').click();
+  await page.locator('#volume').fill('0.5');assert.equal(await page.locator('#video').evaluate(v=>v.volume),.5);
+  await page.locator('#fullscreen').click();await page.waitForFunction(()=>!!document.fullscreenElement);await page.locator('#fullscreen').click();await page.waitForFunction(()=>!document.fullscreenElement);
+  assert.equal(await page.locator('#audience-count').textContent(),'2');assert.equal(await page.locator('#audience-peers').textContent(),'1');
+  assert.equal(await page.locator('#swarm-visual svg .you').count(),1);
   const snapshots=[];
   const sample=()=>page.evaluate((checkCuts) => {
     const v=document.querySelector('video'), q=v.getVideoPlaybackQuality?.();
@@ -113,6 +125,12 @@ try {
   const stopped=await sample(); assert(stopped.paused); assert.equal(stopped.state,'idle');
   const count=requests.length; await page.waitForTimeout(2500); assert.equal(requests.length,count,'Stop ends requests');
   assert.equal(errors.length,0,errors.join('\n')); assert.equal(failures.length,0);
+  await page.locator('#watch').click();await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing',null,{timeout:45000});
+  channelEnded=true;
+  await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='ended',null,{timeout:45000});
+  assert.match(await page.locator('#standby-title').textContent(),/Broadcast ended/);assert(await page.locator('#placeholder').isVisible());
+  assert.equal(await page.locator('#video').evaluate(v=>v.paused),true);
+  await page.screenshot({path:output+'-ended.png',fullPage:true});
   await page.setViewportSize({ width:390,height:844 }); await page.screenshot({ path:output+'-mobile.png', fullPage:true });
   await writeFile(output+'.json',JSON.stringify({ engine, wallSeconds:(Date.now()-started)/1000,initial,final,stopped,
     snapshots,audio,stallSeconds,delayedFragment,transientManifest,peakFragments,offAirRecovered:startupFailures===0,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');

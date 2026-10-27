@@ -143,9 +143,17 @@ export default class CmafPlayer {
           }
         }
       }
-      if(parsed.end)return;
+      if(parsed.end&&next>last.sn){
+        if(!this.initialised&&this.buffer.buffered.length){this.initialised=true;this.media.currentTime=this.buffer.buffered.start(0);this.trigger(CmafPlayer.Events.MANIFEST_PARSED,{levels:this.levels});}
+        this.source.endOfStream();return;
+      }
       await new Promise(resolve=>{const timer=setTimeout(done,500);const signal=this.controller.signal;function done(){clearTimeout(timer);signal.removeEventListener('abort',done);resolve();}signal.addEventListener('abort',done,{once:true});});
     }
+  }
+  finish(){
+    this.controller.abort();for(const loader of this.loaders)loader.destroy();this.loaders.clear();
+    const end=()=>{try{if(this.source?.readyState==='open')this.source.endOfStream();}catch{}};
+    if(this.buffer?.updating)this.buffer.addEventListener('updateend',end,{once:true});else end();
   }
   destroy(){this.media?.removeEventListener('waiting',this.onWaiting);this.controller.abort();for(const loader of this.loaders)loader.destroy();this.loaders.clear();try{if(this.buffer?.updating)this.buffer.abort();}catch{}if(this.objectUrl){if(this.media?.getAttribute('src')===this.objectUrl){this.media.pause();this.media.removeAttribute('src');this.media.load();}URL.revokeObjectURL(this.objectUrl);}this.listeners.clear();}
 }

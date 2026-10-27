@@ -94,7 +94,10 @@ def main():
 
                 server=preview.PreviewServer(('127.0.0.1',0),preview.PreviewHandler)
                 class FixtureTransport:
-                    def fetch(self,target):return fixture_fetch(target)
+                    def fetch(self,target):
+                        if target=='/tv/audience':
+                            return 200,b'{"activePlayers":2,"peerEnabledPlayers":1,"updatedAt":1,"ttlSeconds":35,"playerVersion":"2026.10.27.3","channel":{"state":"live","startedAt":1,"endedAt":null,"lastMediaAgeSeconds":0}}', 'application/json'
+                        return fixture_fetch(target)
                 server.assets=ROOT/'web/tv';server.transport=FixtureTransport()
                 server.slots=threading.BoundedSemaphore(4)
                 worker=threading.Thread(target=server.serve_forever);worker.start()

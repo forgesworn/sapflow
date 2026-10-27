@@ -12,7 +12,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from tv_preview_policy import checked_manifest, media_target, preview_manifest, MAX_MANIFEST
+from tv_preview_policy import checked_manifest, media_target, preview_manifest, MAX_MANIFEST, audience_target, checked_audience
 import tv_preview_transport as TRANSPORT
 
 SPEC = importlib.util.spec_from_file_location("preview", ROOT / "scripts/tv-preview.py")
@@ -68,6 +68,19 @@ class Policy(unittest.TestCase):
         for origin in ['http://media.example', 'https://user:pass@media.example', 'https://media.example/other']:
             with self.assertRaises(Exception):
                 PREVIEW.receiver_origin(origin)
+
+
+class AudiencePolicy(unittest.TestCase):
+    def test_aggregate_only_and_exact_route(self):
+        import json
+        data={"activePlayers":2,"peerEnabledPlayers":1,"updatedAt":1,"ttlSeconds":35,"playerVersion":"1","channel":{"state":"ended","startedAt":1,"endedAt":2,"lastMediaAgeSeconds":5}}
+        self.assertEqual(json.loads(checked_audience(json.dumps(data).encode())),data)
+        self.assertTrue(audience_target('/tv/audience'))
+        for path in ['/tv/audience?ip=1','/tv/audience/','https://receiver.example/tv/audience']:
+            self.assertFalse(audience_target(path))
+        for value in [{**data,'ip':'198.51.100.1'}, {**data,'activePlayers':True}, {**data,'activePlayers':0}, {**data,'playerVersion':'<script>'}, {**data,'channel':{**data['channel'],'location':'somewhere'}}]:
+            with self.assertRaises(ValueError):checked_audience(json.dumps(value).encode())
+        with self.assertRaises(ValueError):checked_audience(b' '*8193)
 
 
 class CurlTransport(unittest.TestCase):

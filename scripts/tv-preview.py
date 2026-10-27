@@ -13,12 +13,18 @@ import signal
 import threading
 from urllib.parse import urlsplit
 
-from tv_preview_policy import media_target
+from tv_preview_policy import media_target, audience_target
 from tv_preview_transport import TorTransport
 
 HERE = Path(__file__).resolve().parent
 ASSETS = HERE.parent / "web/tv"
-STATIC = {"/tv/": ("index.html", "text/html; charset=utf-8"),
+STATIC = {"/tv/version.mjs": ("version.mjs", "text/javascript; charset=utf-8"),
+          "/tv/loading-ident.mp4": ("loading-ident.mp4", "video/mp4"),
+          "/tv/ident.mjs": ("ident.mjs", "text/javascript; charset=utf-8"),
+          "/tv/controls.mjs": ("controls.mjs", "text/javascript; charset=utf-8"),
+          "/tv/network.mjs": ("network.mjs", "text/javascript; charset=utf-8"),
+          "/tv/audience.mjs": ("audience.mjs", "text/javascript; charset=utf-8"),
+          "/tv/": ("index.html", "text/html; charset=utf-8"),
           "/tv/licences.html": ("licences.html", "text/html; charset=utf-8"),
           "/tv/LICENSE.txt": ("LICENSE.txt", "text/plain; charset=utf-8"),
           "/tv/now-streaming.png": ("now-streaming.png", "image/png"),
@@ -96,7 +102,7 @@ class PreviewHandler(BaseHTTPRequestHandler):
             self.reply(200, (self.server.assets / name).read_bytes(), mime)
             return
         try:
-            if not media_target(self.path):
+            if not (media_target(self.path) or audience_target(self.path)):
                 self.reply(404, b"Not found\n")
                 return
         except ValueError:

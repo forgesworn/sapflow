@@ -35,6 +35,12 @@ test('receiver signs only mirrored playlist contexts and scopes its WebSocket',a
     url.searchParams.set('path','/etc/passwd');assert.equal((await fetch(url)).status,404);
     assert.equal((await fetch(base+'/media/../../publisher.json')).status,404);
     const playlist=await (await fetch(base+'/media/stream.m3u8')).text();assert.deepEqual(parseMedia(playlist),parseMedia(media));
+    const beat=async body=>fetch(base+'/tv/audience',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const visitor={id:'a'.repeat(32),active:true,peers:true,version:'1'};
+    const counted=await (await beat(visitor)).json();assert.equal(counted.activePlayers,1);assert.equal(counted.peerEnabledPlayers,1);assert.equal(counted.channel.state,'live');assert.equal(typeof counted.playerVersion,'string');
+    assert(!JSON.stringify(counted).includes(visitor.id));assert.equal((await beat({...visitor,ip:'198.51.100.1'})).status,400);
+    assert.equal((await fetch(base+'/tv/audience',{headers:{'Sec-Fetch-Site':'cross-site'}})).status,403);
+    assert.equal((await (await beat({...visitor,active:false})).json()).activePlayers,0);
     ws=new WebSocket(base.replace('http:','ws:')+'/tv/swarm/relay',{origin:'https://receiver.example'});await once(ws,'open');
     const received=once(ws,'message');ws.send(JSON.stringify(['REQ','test',{kinds:[24170],'#x':[config.swarmId]}]));assert.equal(JSON.parse(String((await received)[0]))[0],'EOSE');
     const wrong=new WebSocket(base.replace('http:','ws:')+'/tv/swarm/relay',{origin:'https://foreign.example'});const [error]=await once(wrong,'error');assert.match(error.message,/403/);

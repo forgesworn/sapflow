@@ -7,6 +7,8 @@ import {WebSocketServer} from 'ws';
 import {verifyEvent} from 'nostr-tools/pure';
 import {createHlsPublisher} from 'relayswarm/hls-publisher';
 import {loadPublisherState} from 'relayswarm/publisher-state';
+import {Audience,ChannelState} from './audience.mjs';
+import {PLAYER_VERSION} from '../../web/tv/version.mjs';
 import {parseMaster,parseMedia} from '../../web/tv/playlist.mjs';
 
 const ASSET=/^[a-f0-9]{12}_(?:init[0-9]{0,20}|seg[0-9]{1,20})\.mp4$/;
@@ -24,7 +26,7 @@ export function completePlaylist(parsed) {
   if(parsed.end)rows.push('#EXT-X-ENDLIST');return rows.join('\n')+'\n';
 }
 async function bytes(response,limit) {
-  if(!response.ok)throw Error('Upstream unavailable');
+  if(!response.ok)throw Object.assign(Error('Upstream unavailable'),{status:response.status});
   const reader=response.body.getReader(),chunks=[];let length=0;
   try{while(true){const {done,value}=await reader.read();if(done)break;length+=value.length;if(length>limit)throw Error('Upstream budget');chunks.push(value);}}
   catch(error){await reader.cancel().catch(()=>{});throw error;}
@@ -57,12 +59,14 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
   for(const file of await readdir(mediaDir))if(ASSET.test(file)||['index.m3u8','stream.m3u8'].includes(file)||/^\.[a-z0-9_.]+\.tmp$/.test(file))await unlink(resolve(mediaDir,file));
   const identityDir=resolve(stateDir,'identity');await mkdir(identityDir,{mode:0o700,recursive:true});
   const identity=await loadPublisherState(resolve(identityDir,'publisher.json'),{manifest:'index.m3u8'});
+  const audience=new Audience(),channel=new ChannelState();
   const controller=new AbortController(),cache=new Map(),presence=new Map();let publisher=null,fresh=0,closed=false,cacheBytes=0,active=0;
   async function get(name,limit){return bytes(await fetch(new URL(name,source),{redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(6000)])}),limit);}
   async function atomic(name,data){const temporary=resolve(mediaDir,`.${name}.tmp`);await writeFile(temporary,data,{mode:0o600});await rename(temporary,resolve(mediaDir,name));}
   async function mirror() {
     const master=await get('index.m3u8',65536),variant=parseMaster(master.toString('ascii'));
     const parsed=parseMedia((await get(variant.manifest,65536)).toString('ascii'));
+    channel.observe(parsed);
     if(parsed.segments.length>64)throw Error('Mirror window exceeded');
     const names=new Set(parsed.segments.flatMap(s=>s.gap?[s.init]:[s.init,s.name]));
     // Expire only unreferenced objects, retaining in-flight requests briefly.
@@ -78,15 +82,24 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
     if(!publisher)publisher=await createHlsPublisher({mediaDir,manifest:'index.m3u8',...identity,maxCacheEntries:128,maxConcurrent:4});
     fresh=Date.now();
   }
-  const loop=(async()=>{while(!closed){try{await mirror();}catch{/* Off-air remains an ordinary 503, without logging programme paths or viewers. */}await new Promise(r=>{const timer=setTimeout(done,500);function done(){clearTimeout(timer);controller.signal.removeEventListener('abort',done);r();}controller.signal.addEventListener('abort',done,{once:true});if(closed)done();});}})();
-  const httpBudget=bucket(200,100),signBudget=bucket(40,20),eventBudget=bucket(100,50);
+  const loop=(async()=>{while(!closed){try{await mirror();}catch(error){if([404,410].includes(error.status)||Date.now()-channel.lastMediaAt>6000)channel.unavailable(error.status);}await new Promise(r=>{const timer=setTimeout(done,500);function done(){clearTimeout(timer);controller.signal.removeEventListener('abort',done);r();}controller.signal.addEventListener('abort',done,{once:true});if(closed)done();});}})();
+  const audienceBudget=bucket(400,200),httpBudget=bucket(200,100),signBudget=bucket(40,20),eventBudget=bucket(100,50);
   function reply(res,status,data,mime='application/json'){res.writeHead(status,{'Content-Type':mime,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Cross-Origin-Resource-Policy':'same-origin'});res.end(data);}
   const server=createServer(async(req,res)=>{
-    if(active>=32||!httpBudget()){reply(res,503,'Busy');return;}active++;
+    if(active>=32||!(req.url==='/tv/audience'?audienceBudget():httpBudget())){reply(res,503,'Busy');return;}active++;
     try {
       if(req.headers['sec-fetch-site']==='cross-site'||(req.headers.origin&&req.headers.origin!==origin)){reply(res,403,'Forbidden');return;}
-      if(!['GET','HEAD'].includes(req.method)){reply(res,405,'Method not allowed');return;}
       const url=new URL(req.url,'http://localhost');
+      if(url.pathname==='/tv/audience'&&!url.search){
+        if(req.method==='POST'){
+          if(!req.headers['content-type']?.startsWith('application/json')){reply(res,415,'JSON required');return;}
+          let size=0;const chunks=[];
+          for await(const chunk of req){size+=chunk.length;if(size>1024)throw Object.assign(Error('Body budget'),{status:413});chunks.push(chunk);}
+          try{audience.update(JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks))));}catch(error){if(!error.status)error.status=400;throw error;}
+        }else if(!['GET','HEAD'].includes(req.method)){reply(res,405,'Method not allowed');return;}
+        reply(res,200,req.method==='HEAD'?null:JSON.stringify({...audience.snapshot(),channel:channel.snapshot(),playerVersion:PLAYER_VERSION}));return;
+      }
+      if(!['GET','HEAD'].includes(req.method)){reply(res,405,'Method not allowed');return;}
       if(!publisher||Date.now()-fresh>10000){reply(res,503,'Off air');return;}
       if(url.pathname==='/tv/swarm/config'&&!url.search){reply(res,200,req.method==='HEAD'?null:JSON.stringify({swarmId:publisher.swarmId,streamEvent:publisher.streamEvent}));return;}
       if(url.pathname==='/tv/swarm/commitment') {

@@ -55,7 +55,7 @@ public origin in an owner-readable environment file. The upstream defaults to
 Use the specific routes in `docs/examples/tv.Caddyfile`. Preserve existing site
 routes, disable access logging, strip forwarded viewer IP headers, validate the
 full candidate before reloading and keep a rollback copy. The edge connection
-Worker has its own exact `/tv/connection` route and is separate from this sidecar.
+Worker has its own exact `/tv/` and `/tv/connection` routes and is separate from this sidecar.
 The service's signing key stays in its private state directory, outside the
 static site; never include it in deployment archives or source control.
 

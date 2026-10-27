@@ -11,7 +11,8 @@ handle /tv/* {
         Cache-Control no-store
         defer
     }
-    handle /tv/swarm/* {
+    @tv_presence path /tv/audience /tv/swarm/*
+    handle @tv_presence {
         reverse_proxy 127.0.0.1:28777 {
             header_up -X-Forwarded-For
             header_up -X-Real-IP
@@ -28,7 +29,7 @@ handle /tv/* {
         }
     }
     # Explicit asset allowlist: private control routes and other streams stay shut.
-    @tv_assets path /tv/ /tv/player.css /tv/player.mjs /tv/playlist.mjs /tv/cmaf-player.mjs /tv/tone.mjs /tv/connection.mjs /tv/peers.mjs /tv/off-air.png /tv/now-streaming.png /tv/LICENSE.txt /tv/licences.html /tv/vendor/relayswarm-hls-swarm-0.4.4.mjs /tv/vendor/relayswarm-core-0.4.4.wasm /tv/vendor/THIRD-PARTY-LICENCES.txt
+    @tv_assets path /tv/ /tv/player.css /tv/player.mjs /tv/version.mjs /tv/audience.mjs /tv/network.mjs /tv/controls.mjs /tv/ident.mjs /tv/loading-ident.mp4 /tv/playlist.mjs /tv/cmaf-player.mjs /tv/tone.mjs /tv/connection.mjs /tv/peers.mjs /tv/off-air.png /tv/now-streaming.png /tv/LICENSE.txt /tv/licences.html /tv/vendor/relayswarm-hls-swarm-0.4.4.mjs /tv/vendor/relayswarm-core-0.4.4.wasm /tv/vendor/THIRD-PARTY-LICENCES.txt
     handle @tv_assets {
         uri strip_prefix /tv
         root * /var/www/sapflow-tv

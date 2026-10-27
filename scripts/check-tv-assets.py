@@ -11,6 +11,11 @@ for name in ['off-air', 'now-streaming']:
     assert pin['model'] == 'gpt-image-2.5-sunburst'
     assert hashlib.sha256((assets / f'{name}.png').read_bytes()).hexdigest() == pin['sha256']
     assert (assets / pin['prompt']).is_file()
+ident = json.loads((assets / 'loading-ident.build.json').read_text())
+assert ident['model'] == 'seedance_2_5' and ident['audio'] is False
+assert ident['sourceArtworkSha256'] == hashlib.sha256((assets / 'off-air.png').read_bytes()).hexdigest()
+assert ident['sha256'] == hashlib.sha256((assets / 'loading-ident.mp4').read_bytes()).hexdigest()
+assert (assets / ident['prompt']).is_file() and (assets / 'loading-ident.mp4').stat().st_size < 2*1024*1024
 pins = json.loads((root / 'tools/tv-relayswarm/pins.json').read_text())
 for name, pin in pins['assets'].items():
     if name.endswith('.tgz'):

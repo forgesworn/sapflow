@@ -9,18 +9,22 @@ import random
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
-from tv_preview_policy import checked_manifest, preview_manifest, media_target, MAX_MANIFEST
+from tv_preview_policy import checked_manifest, preview_manifest, media_target, MAX_MANIFEST, checked_audience
 
 
 def TestOneInput(data):
     if len(data) > MAX_MANIFEST + 1:
         return
     try:
+        checked_audience(data)
+    except (ValueError, UnicodeError, RecursionError):
+        pass
+    try:
         result = checked_manifest(data)
     except (ValueError, UnicodeError):
         pass
     else:
-        assert result is data and len(result) <= MAX_MANIFEST
+        assert result is data and len(result) <= MAX_MANIFEST, checked_audience
         preview = preview_manifest(data)
         assert b'://' not in preview and b'\\' not in preview
         assert b'://' not in result and b'\\' not in result and b'//' not in result
@@ -39,7 +43,7 @@ def TestOneInput(data):
 
 def main():
     rng=random.Random(20261027)
-    seeds=[b'#EXTM3U\nstream.m3u8\n', b'#EXTM3U\n#EXT-X-MAP:URI="012345abcdef_init.mp4"\n',
+    seeds=[b'{"activePlayers":1,"peerEnabledPlayers":0,"updatedAt":1,"ttlSeconds":35,"playerVersion":"1","channel":{"state":"live","startedAt":1,"endedAt":null,"lastMediaAgeSeconds":0}}',b'#EXTM3U\nstream.m3u8\n', b'#EXTM3U\n#EXT-X-MAP:URI="012345abcdef_init.mp4"\n',
            b'#EXTM3U\n#EXT-X-PART:DURATION=0.2,URI="012345abcdef_part1.mp4"\n',
            b'/tv/live/event-tv/stream.m3u8?_HLS_msn=17&_HLS_part=1',
            b'#EXTM3U\n#EXT-X-KEY:URI="https://evil.example/"\n', b'\xff', b'#EXTM3U\n'+b'A'*MAX_MANIFEST]

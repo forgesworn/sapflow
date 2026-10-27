@@ -146,3 +146,22 @@ test('failed peer media falls back to the receiver on reconnect',async()=>{
  s.watch.click();await settle();assert.equal(s.handles[0].url,'/media/index.m3u8');
  s.handles[0].handlers.get('error')(null,{fatal:true});const retry=[...s.timers.values()][0];retry();await settle();assert.equal(calls,1);assert.equal(s.handles[1].url,'/tv/live/event-tv/index.m3u8');s.player.destroy();
 });
+
+test('pause and resume preserve the engine and do not repeat startup buffering',async()=>{
+ const s=setup();s.video.paused=false;s.video.pause=()=>{s.video.paused=true;};s.video.play=async()=>{s.video.paused=false;s.video.plays++;};
+ s.watch.click();await settle();const engine=s.handles[0];s.video.paused=false;s.video.dispatchEvent(new Event('playing'));
+ s.player.togglePlayback();assert.equal(s.indicator.dataset.state,'paused');assert.equal(s.video.paused,true);assert.equal(engine.destroyed,false);
+ s.player.togglePlayback();await settle();assert.equal(s.video.paused,false);assert.equal(s.handles.length,1);assert.equal(s.fetches.length,1);s.player.destroy();
+});
+test('a natural end shows Broadcast ended and never retries automatically',async()=>{
+ const s=setup();s.watch.click();await settle();s.video.dispatchEvent(new Event('ended'));
+ assert.equal(s.indicator.dataset.state,'ended');assert.equal(s.player.watching,false);assert.equal(s.timers.size,0);assert.equal(s.placeholder.hidden,false);
+ assert.equal(s.handles[0].destroyed,true);s.player.destroy();
+});
+test('confirmed end drains buffered video, while reconnecting does not declare an end',async()=>{
+ const s=setup();s.watch.click();await settle();s.video.readyState=4;s.video.currentTime=10;s.video.paused=false;s.video.buffered={length:1,start:()=>0,end:()=>20};let finished=0;s.handles[0].finish=()=>finished++;
+ s.video.dispatchEvent(new Event('playing'));s.player.setChannelState('reconnecting');assert.equal(s.indicator.dataset.state,'playing');
+ s.player.setChannelState('ended');assert.equal(finished,1);assert.equal(s.handles[0].destroyed,false);assert.equal(s.player.watching,true);
+ s.video.currentTime=19.95;s.video.dispatchEvent(new Event('timeupdate'));assert.equal(s.indicator.dataset.state,'ended');assert.equal(s.timers.size,0);
+ s.player.setChannelState('live');assert.equal(s.indicator.dataset.state,'idle');assert.equal(s.player.watching,false);s.player.destroy();
+});

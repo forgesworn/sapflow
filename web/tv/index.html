@@ -1,54 +1,45 @@
 <!doctype html>
 <html lang="en-GB">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="referrer" content="no-referrer">
-  <title>ForgeSworn TV</title>
-  <link rel="stylesheet" href="/tv/player.css">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
+<title>ForgeSworn TV · Independent signal</title><link rel="stylesheet" href="/tv/player.css">
 </head>
 <body>
-  <main>
-    <header><a class="brand" href="/tv/">Forge<span>Sworn</span></a><span class="channel">TV</span></header>
-    <section aria-labelledby="channel-title">
-      <div class="heading"><div><p class="eyebrow">The live channel</p><h1 id="channel-title">ForgeSworn TV</h1></div><span id="indicator" class="indicator" data-state="idle">Ready</span></div>
-      <div class="screen"><video id="video" controls playsinline preload="none" aria-label="ForgeSworn TV live programme"></video><div id="placeholder"><span id="standby-title" class="standby-title">Standby</span><p>ForgeSworn TV</p></div></div>
-      <p class="vpn-note"><strong>Use a VPN for privacy.</strong> Choose one that covers all browser and peer traffic, with a kill switch. This page cannot verify your VPN.</p>
-      <div class="controls"><button id="watch" type="button">Watch live</button><button id="live-edge" type="button" disabled>Back to live</button><button id="test-tone" type="button" aria-pressed="false">Play quiet test tone</button><p id="status" role="status" aria-live="polite">Press Watch live to tune in.</p></div>
-    </section>
-    <section class="stream-info" aria-labelledby="peer-title">
-      <h2 id="peer-title">RelaySwarm peer assistance</h2>
-      <p><label><input id="peer-assist" type="checkbox"> Receive and share verified video with other viewers</label></p>
-      <p>Optional. Peers and the Cloudflare STUN service may see your connection IP. Use a VPN that covers WebRTC traffic. Sharing is capped at 250 kB/s and 128 MiB per viewing session, and pauses on detected mobile data. The receiver remains the fallback.</p>
-      <p id="peer-status" role="status">Off. No peer connections.</p>
-    </section>
-    <section class="stream-info" aria-labelledby="connection-title">
-      <h2 id="connection-title">What your viewing connection reveals</h2>
-      <p>This is what the HTTPS edge can see when you connect.</p>
-      <dl><div><dt>Public IP address</dt><dd id="viewer-ip">Checking this connection</dd></div>
-      <div><dt>Approximate location</dt><dd id="viewer-location">Checking this connection</dd></div>
-      <div><dt>Network provider</dt><dd id="viewer-network">Checking this connection</dd></div></dl>
-      <p class="privacy-note">IP location can be wrong. It does not reveal your street address or name. A VPN changes the visible connection address; this page cannot verify your VPN. This result is not stored by the TV application or sent to a separate lookup service.</p>
-    </section>
-    <section class="stream-info" aria-labelledby="info-title">
-      <h2 id="info-title">Stream and privacy</h2>
-      <p>What this player receives about the broadcast.</p>
-      <dl>
-        <div><dt>Broadcaster IP address</dt><dd>Not supplied to this player</dd></div>
-        <div><dt>Broadcaster name or account</dt><dd>Not supplied to this player</dd></div>
-        <div><dt>Original filename, device or location</dt><dd>Not supplied as player fields</dd></div>
-        <div><dt>Publisher's network route</dt><dd>This player cannot verify it</dd></div>
-        <div><dt>Peer connections</dt><dd>Viewer opt-in only; always disabled in the private Mac preview</dd></div>
-        <div><dt>Decoded picture</dt><dd id="media-picture">Waiting for playback</dd></div>
-        <div><dt>Advertised stream rate</dt><dd id="media-rate">Not yet reported</dd></div>
-        <div><dt>Advertised codecs</dt><dd id="media-codecs">Not yet reported</dd></div>
-        <div><dt>Video buffered ahead</dt><dd id="media-buffer">Not playing</dd></div>
-        <div><dt>Behind receiver's live edge</dt><dd id="media-delay">Not yet reported</dd></div>
-      </dl>
-      <p class="privacy-note">These observations do not prove anonymity. Picture, sound and timing can identify a broadcaster. Your viewing connection is separate from the publisher's connection.</p>
-    </section>
-    <footer><span>Live from the channel.</span><span><a href="/tv/licences.html">Software licences</a></span></footer>
-  </main>
-  <script type="module" src="/tv/player.mjs"></script>
-</body>
-</html>
+<header class="site-header"><a class="brand" href="/tv/"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M3 18v7M10 11v14M17 4v21M24 14v11"/></svg>Forge<span>Sworn</span><b>TV</b></a><nav aria-label="Channel"><a href="#watch-section">Watch</a><a href="#network">Network</a><a href="#privacy">Privacy</a></nav><div class="audience-pill"><span class="status-dot"></span><strong id="audience-count">—</strong><span>live audience</span></div></header>
+<main>
+<section id="watch-section" class="hero" aria-labelledby="channel-title">
+ <div class="hero-heading"><div><p class="eyebrow"><span class="little-line"></span> Independent signal</p><h1 id="channel-title">ForgeSworn TV</h1></div><div class="channel-status"><span id="channel-state" class="pill">Checking channel</span><span class="subtle">Continuous programme</span></div></div>
+ <div class="stage-layout">
+  <div class="player-card">
+   <div id="screen" class="screen" tabindex="0" role="group" aria-label="ForgeSworn TV player">
+    <video id="video" controls playsinline preload="none" aria-label="ForgeSworn TV live programme"></video>
+    <div id="placeholder"><video id="loading-ident" muted loop playsinline preload="none" aria-hidden="true"></video><div class="standby-copy"><p class="eyebrow">ForgeSworn TV</p><span id="standby-title" class="standby-title">Independent<br>by nature.</span><p id="standby-description">Your front row to the live channel.</p></div></div>
+    <div class="player-topline"><span id="indicator" class="indicator" data-state="idle">Ready</span><span class="player-brand">FORGESWORN / TV</span></div>
+    <button id="start-overlay" class="start-overlay" aria-label="Watch live"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 11 7-11 7Z"/></svg></button>
+    <div id="transport" class="transport" hidden>
+     <div class="buffer-track" aria-hidden="true"><i id="buffer-fill"></i></div>
+     <div class="transport-row">
+      <button id="play-pause" class="icon-button play-button" aria-label="Play"><svg class="play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg><svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg></button>
+      <button id="mute" class="icon-button" aria-label="Mute"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m11 5-6 4H2v6h3l6 4ZM15 8q6 4 0 8"/><path class="mute-slash" d="m15 5 7 14"/></svg></button>
+      <input id="volume" class="volume" type="range" min="0" max="1" step="0.05" value="0.9" aria-label="Volume">
+      <button id="live-edge" class="live-button" disabled><span class="status-dot"></span> LIVE</button>
+      <span id="playback-position" class="playback-position">Ready to tune in</span>
+      <button id="fullscreen" class="icon-button fullscreen-button" aria-label="Enter fullscreen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M3 16v5h5M21 16v5h-5"/></svg></button>
+     </div>
+    </div>
+   </div>
+   <div class="under-player"><p id="status" role="status" aria-live="polite">Press play to tune in.</p><span id="playback-health" class="health-text">No media loaded</span></div>
+  </div>
+  <aside class="channel-card"><p class="eyebrow">On this channel</p><div class="station-mark">F<span>S</span><small>TV</small></div><h2>A signal worth<br>staying for.</h2><p>A continuous live channel, with optional peer-assisted delivery.</p><div class="channel-facts"><div><span>Delivery</span><strong id="delivery-mode">Receiver</strong></div><div><span>Swarm enabled</span><strong id="audience-peers">—</strong></div><div><span>Audience</span><strong>Active players</strong></div></div><button id="watch" class="primary-button">Watch live</button><button id="test-tone" class="quiet-button" aria-pressed="false">Play quiet test tone</button><p class="small-note">Audience is an estimate of active player sessions, not unique people.</p></aside>
+ </div>
+ <div class="vpn-banner"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6ZM8 12l3 3 5-6"/></svg><div><strong>Make privacy part of your setup.</strong><span>Use a VPN that covers browser and WebRTC traffic, with a kill switch. This player cannot verify your VPN.</span></div><a href="#privacy">See your exposure <span aria-hidden="true">↗</span></a></div>
+</section>
+<section id="network" class="dashboard-grid" aria-label="Delivery and playback">
+ <article class="panel network-panel"><div class="panel-heading"><div><p class="eyebrow">The delivery network</p><h2>Better together.</h2></div><span id="network-mode" class="pill">Receiver only</span></div><p class="panel-intro">See how the programme reaches this player, using actual connection and verified transfer data.</p><div id="swarm-visual" class="swarm-visual" role="img" aria-label="Receiver delivery; peer assistance is off"></div><div class="network-stats"><div><span>From peers</span><strong id="peer-received">0 B</strong></div><div><span>Shared back</span><strong id="peer-shared">0 B</strong></div><div><span>Connected peers</span><strong id="peer-connected">0</strong></div></div><label class="peer-option"><input id="peer-assist" type="checkbox"><span><strong>Enable RelaySwarm</strong><small>Receive and share verified video with other viewers.</small></span><i aria-hidden="true"></i></label><p id="peer-status" class="small-note" role="status">Off. No peer connections.</p><p class="small-note">Peers and the STUN service may see your connection IP. Sharing is capped at 250 kB/s and 128 MiB per session, and pauses on detected mobile data. Receiver fallback stays available. The diagram shows your connections, not other viewers' addresses.</p></article>
+ <article class="panel signal-panel"><div class="panel-heading"><div><p class="eyebrow">Behind the picture</p><h2>Your signal.</h2></div><span class="pill">Live diagnostics</span></div><div class="signal-hero"><strong id="media-picture">Waiting for playback</strong><span>Decoded picture</span></div><dl class="signal-grid"><div><dt>Video buffered ahead</dt><dd id="media-buffer">Not playing</dd></div><div><dt>Behind receiver's live edge</dt><dd id="media-delay">Not yet reported</dd></div><div><dt>Advertised stream rate</dt><dd id="media-rate">Not yet reported</dd></div><div><dt>Player</dt><dd id="player-version">Sapflow TV</dd></div></dl><div class="quality-line"><span>Continuous playback</span><span id="quality-summary">Waiting for playback</span></div><details class="diagnostics"><summary>Inspect playback details</summary><dl><div><dt>Advertised codecs</dt><dd id="media-codecs">Not yet reported</dd></div><div><dt>Last recovery</dt><dd id="last-recovery">None</dd></div><div><dt>Recovery attempts</dt><dd id="recovery-count">0</dd></div></dl></details><p id="player-update" class="small-note" hidden>A newer player is available. Reload this page to use it.</p></article>
+</section>
+<section id="privacy" class="panel privacy-panel" aria-labelledby="connection-title"><div class="panel-heading"><div><p class="eyebrow">Know your exposure</p><h2 id="connection-title">What the backend can see.</h2></div><span class="pill">Your connection</span></div><p class="panel-intro">These are observations about your own request. A VPN changes the visible network address; cookies, authentication and browser details can still link requests.</p><dl class="exposure-grid"><div><dt>Your public IP</dt><dd id="viewer-ip">Checking this connection</dd></div><div><dt>IP location estimate</dt><dd id="viewer-location">Checking this connection</dd></div><div><dt>Network / ASN</dt><dd id="viewer-network">Checking this connection</dd></div><div><dt>Estimated postal area</dt><dd id="viewer-postal">Checking</dd></div><div><dt>IP coordinates, not GPS</dt><dd id="viewer-coordinates">Checking</dd></div><div><dt>IP timezone estimate</dt><dd id="viewer-timezone">Checking</dd></div></dl><details class="exposure-details"><summary>Inspect browser, transport and identifying headers <span aria-hidden="true">+</span></summary><dl class="metadata-grid"><div><dt>Observed request</dt><dd id="viewer-scope">Checking</dd></div><div><dt>User agent</dt><dd id="viewer-browser">Checking</dd></div><div><dt>Language preferences</dt><dd id="viewer-languages">Checking</dd></div><div><dt>Browser platform hints</dt><dd id="viewer-platform">Checking</dd></div><div><dt>HTTP / TLS</dt><dd id="viewer-transport">Checking</dd></div><div><dt>TLS fingerprint, if exposed</dt><dd id="viewer-fingerprint">Checking</dd></div><div><dt>Cookie names; values withheld</dt><dd id="viewer-cookies">Checking</dd></div><div><dt>Authentication header</dt><dd id="viewer-auth">Checking</dd></div><div><dt>Referrer; query values withheld</dt><dd id="viewer-referrer">Checking</dd></div><div><dt>Edge endpoint, not your location</dt><dd id="viewer-edge">Checking</dd></div></dl></details><div class="privacy-footnote"><strong>IP location is an estimate, not an exact address.</strong><p>It can be wrong or point to a VPN, ISP or network exit. This application does not request GPS, infer your name or street address, verify your VPN, or retain a viewer-location history. Headers can differ between requests. Your own metadata is returned only to this page and is not part of the public audience count.</p></div></section>
+<section class="broadcaster-note" aria-labelledby="info-title"><div><p class="eyebrow">The other end of the signal</p><h2 id="info-title">Stream and privacy</h2></div><dl><div><dt>Broadcaster IP, name or account</dt><dd>Not supplied to this player</dd></div><div><dt>Original filename, device or location</dt><dd>Not supplied as player fields</dd></div><div><dt>Publisher's network route</dt><dd>This player cannot verify it</dd></div><div><dt>Peer connections in private preview</dt><dd>Always disabled</dd></div></dl><p>These observations do not prove anonymity. Picture, sound and timing can identify a broadcaster. Your viewing connection is separate from the publisher's connection.</p></section>
+<footer><a class="brand" href="/tv/">Forge<span>Sworn</span><b>TV</b></a><span>Independent signal. Shared possibilities.</span><a href="/tv/licences.html">Software licences</a></footer>
+</main><script type="module" src="/tv/player.mjs"></script>
+</body></html>

@@ -4,8 +4,10 @@
 `/tv/live/event-tv/index.m3u8`. It fetches no media before **Watch live**.
 **Stop watching** aborts pending startup and disposes the media engine.
 Off-air responses retry with bounded backoff while watching. **Back to live**
-uses the engine's live position. The native video controls support pause,
-volume, fullscreen and seeking within the available window.
+uses the engine's live position. The controls inside the picture support play/pause, volume, mute, fullscreen
+and return to live. Pause keeps the existing media engine and buffered video;
+resume does not repeat the startup buffer. Native controls remain the fallback
+if enhancement cannot initialise. Space/K, M and F work while the player is focused.
 
 There are no analytics, external fonts or remote scripts. Safari normally uses
 native HLS; Chrome uses Sapflow's own MIT complete-fragment MediaSource player.
@@ -47,17 +49,46 @@ attestation. Images, audio and timing can still identify a broadcaster.
 The footer links to the MIT player licence and the actual permissive dependency
 notices. hls.js and its Apache licence are no longer distributed by this page.
 Sunburst-generated standby and NOW STREAMING cards have saved prompts and digest
-receipts. The on-air card appears only after an availability response while the
-player starts. The user-controlled 1 kHz tone starts quietly, never automatically,
+receipts. The silent, six-second Higgsfield Seedance 2.5 loading ident is derived
+only from that generated standby artwork, with its own prompt and digest receipt.
+It is fetched at low priority while idle and cancelled if media starts loading;
+reduced motion and data-saving preferences retain the static card. The user-controlled 1 kHz tone starts quietly, never automatically,
 and stops when live playback starts or the viewer stops.
 
 The same-origin edge endpoint `/tv/connection` returns that request's public IP,
-approximate city/region/country and network provider. It uses Cloudflare's already
-available request metadata, with no separate lookup, application storage or
-per-viewer logging. This does not describe the platform's security logs. It does
-not identify a street address or name, or establish whether a VPN is running.
-Deploy `edge/tv-connection.mjs` as a Worker scoped to that exact route; missing
-edge information displays unavailable without affecting playback.
+approximate city/region/country, postal area, IP coordinates, timezone and network
+provider when available. It also reflects user agent, language/platform hints,
+HTTP/TLS details, an optional TLS fingerprint, cookie names and authentication
+presence. Secret cookie/header values and referrer query values are withheld.
+These are observations about the viewer's own request. They do not establish
+an exact street address, name or VPN status. Coordinates are displayed rounded
+and explicitly described as approximate IP data, never GPS.
+
+Deploy `edge/tv-connection.mjs` on the two exact routes `/tv/` and
+`/tv/connection`. The page route injects an escaped metadata receipt from the
+actual navigation, so a later credential-free diagnostic request cannot conceal
+cookies or authentication sent on navigation. Both responses bypass edge/browser
+caching. The application makes no separate lookup and keeps no IP/location
+history. This does not describe the platform's security logs. Missing fields
+show unavailable and do not affect playback. Private preview skips these routes.
+
+`/tv/audience` supplies an estimated active-player count and a channel lifecycle
+state. A public page creates a random memory-only identifier and sends bounded
+presence updates every ten seconds while watching. Playing sessions count;
+pause, Stop and page exit remove presence, or it expires after 35 seconds.
+The receiver keeps at most 4,096 entries in RAM, without IPs, cookies or history.
+Counts are unauthenticated session estimates, not unique people or verified
+concurrent viewers. Private preview reads only the aggregate through Tor and
+never registers an identifier. The swarm diagram describes this player's actual
+connections and verified byte counters; it exposes no other viewer's address.
+
+A channel that has never published shows off air. A stalled or temporarily
+unreachable source shows reconnecting. An explicit HLS end marker, or removal
+of a previously live upstream stream, confirms the broadcast has ended. The
+player drains buffered video before displaying **Broadcast ended**, closes peer
+connections and stops retrying. A later broadcast requires another press of play.
+The receiver's reconnect grace must cover expected publisher interruptions;
+no browser can play new pictures while the publisher supplies no new data.
 
 ## Serve the public page
 
@@ -86,7 +117,7 @@ private local preview below.
 
 Keep a trusted local copy of this repository's `scripts/` and `web/tv/`.
 The preview serves the local assets, never receiver-supplied HTML or JavaScript.
-Only the allowed TV media routes are fetched from the configured receiver.
+Only the allowed TV media routes and a strictly validated aggregate audience response are fetched from the configured receiver.
 Install the hash-pinned transport in a private virtual environment (Python
 3.10 or later, a supported PycURL wheel, and an existing Tor SOCKS listener):
 
@@ -125,7 +156,7 @@ for measured results and the remaining Safari acceptance gate.
 ## Verification and third-party software
 
 ```sh
-node --test tests/tv-player.test.mjs tests/tv-playlist.test.mjs tests/tv-tone.test.mjs tests/tv-connection.test.mjs tests/tv-peers.test.mjs
+node --test tests/tv-audience.test.mjs tests/tv-player.test.mjs tests/tv-playlist.test.mjs tests/tv-tone.test.mjs tests/tv-connection.test.mjs tests/tv-peers.test.mjs
 node fuzz/tv_playlist_fuzz.mjs 20000
 python3 -B tests/test_tv_preview.py
 python3 -B scripts/check-tv-assets.py
