@@ -63,6 +63,21 @@ test('a transient playlist update retries within the existing request budget',as
  globalThis.fetch=async()=>++calls===1?new Response('Busy',{status:503}):new Response(master);
  try{assert.equal(await engine.text('http://127.0.0.1/media/index.m3u8'),master);assert.equal(calls,2);}finally{engine.destroy();globalThis.fetch=original;}
 });
+test('a hung playlist attempt is retried instead of resetting the engine',async()=>{
+ const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const engine=new Engine();
+ globalThis.fetch=async(_url,{signal})=>++calls===1?new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true})):new Response(master);
+ try{assert.equal(await engine.text('http://127.0.0.1/media/index.m3u8'),master);assert.equal(calls,2);}finally{engine.destroy();globalThis.fetch=original;}
+});
+test('a busy playlist followed by a slow reply still succeeds',async()=>{
+ const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const engine=new Engine();
+ globalThis.fetch=async()=>++calls===1?new Response('Busy',{status:503}):new Promise(resolve=>setTimeout(()=>resolve(new Response(master)),3000));
+ try{assert.equal(await engine.text('http://127.0.0.1/media/index.m3u8'),master);assert.equal(calls,2);}finally{engine.destroy();globalThis.fetch=original;}
+});
+test('Stop during a hung playlist attempt ends the read without retrying',async()=>{
+ const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const engine=new Engine();
+ globalThis.fetch=async(_url,{signal})=>{calls++;setTimeout(()=>engine.destroy(),50);return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));};
+ try{await assert.rejects(()=>engine.text('http://127.0.0.1/media/index.m3u8'));assert.equal(calls,1);}finally{engine.destroy();globalThis.fetch=original;}
+});
 test('Stop during playlist backoff prevents another request',async()=>{
  const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const engine=new Engine();
  globalThis.fetch=async()=>{calls++;queueMicrotask(()=>engine.destroy());return new Response('Busy',{status:503});};
