@@ -21,5 +21,10 @@ assert 'MIT' in (assets / 'vendor/relayswarm-LICENSE').read_text()
 notices = (assets / 'vendor/THIRD-PARTY-LICENCES.txt').read_text()
 for name in ['@noble/hashes', '@noble/curves', '@noble/ciphers', '@scure/base', 'nostr-tools', 'ws']:
     assert name in notices
+inventory = json.loads((root / 'tools/tv-relayswarm/wasm-licences.json').read_text())
+assert inventory['wasmSha256'] == pins['assets']['relayswarm-core-0.4.4.wasm']['sha256']
+for package in inventory['packages']:
+    assert package['name'] + ' ' + package['version'] in notices
+assert 'BSD-3-Clause' in notices and 'BSL-1.0' in notices
 assert not (assets / 'vendor/hls.light.min.mjs').exists()
 print('TV artwork, RelaySwarm integrity and distributed licence files verified')

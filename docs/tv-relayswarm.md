@@ -31,6 +31,7 @@ Use Node 22.13 or later (Node 24 for repository tooling) and Python 3.12 or late
 ```sh
 npm ci --prefix tools/tv-relayswarm --ignore-scripts --no-audit --no-fund
 python3 tools/tv-relayswarm/fetch.py
+python3 tools/tv-relayswarm/wasm-notices.py --check
 node tools/tv-relayswarm/build.mjs
 node --test tests/tv-swarm-server.test.mjs tests/tv-peers.test.mjs
 node fuzz/tv_swarm_fuzz.mjs 20000
@@ -43,7 +44,10 @@ node target/tv-relayswarm/server.mjs
 The release downloader verifies fixed SHA-256 digests. The bundle includes only
 the required publisher modules and pinned cryptographic/WebSocket dependencies;
 it does not install the upstream project's hls.js, DHT or Node WebRTC stacks.
-Distribute its generated dependency notices alongside the executable. Install
+The combined notices include the pinned Rust WASM dependency graph, selecting MIT
+where dual licences allow it, plus BSD, Boost and Zlib dependencies. The notice
+collector reads Cargo metadata without rebuilding Rust. Distribute the generated
+notices alongside the executable and browser assets. Install
 `docs/examples/tv-swarm.service` with the generated bundle and configure its exact
 public origin in an owner-readable environment file. The upstream defaults to
 `http://127.0.0.1:28888/live/event-tv/`, listener to loopback port 28777.
