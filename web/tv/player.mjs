@@ -96,8 +96,8 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
           if (video.canPlayType('application/vnd.apple.mpegurl')) { video.src = STREAM; await play(token); return; }
           stop(); show('error', 'This browser cannot play the live channel.'); return;
         }
-        hls = new Engine({ lowLatencyMode: false, liveSyncDuration: 10, liveMaxLatencyDuration: 20,
-          backBufferLength: 10, maxBufferLength: 20, maxMaxBufferLength: 30, enableWorker: false });
+        hls = new Engine({ lowLatencyMode: false, liveSyncDuration: 20, liveMaxLatencyDuration: 40,
+          backBufferLength: 10, maxBufferLength: 30, maxMaxBufferLength: 40, enableWorker: false });
         hls.on(Engine.Events.MANIFEST_PARSED, (_event, detail = {}) => {
           if (token !== generation || !watching) return;
           const level = detail.levels?.[0];
@@ -155,7 +155,7 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
   on(edge, 'click', () => {
     const position = hls?.liveSyncPosition;
     if (Number.isFinite(position)) video.currentTime = position;
-    else if (video.seekable.length) video.currentTime = Math.max(video.seekable.start(video.seekable.length - 1), video.seekable.end(video.seekable.length - 1) - 10);
+    else if (video.seekable.length) video.currentTime = Math.max(video.seekable.start(video.seekable.length - 1), video.seekable.end(video.seekable.length - 1) - 20);
     void play(generation);
   });
   for (const name of ['loadedmetadata', 'timeupdate', 'progress', 'emptied']) on(video, name, updateInfo);

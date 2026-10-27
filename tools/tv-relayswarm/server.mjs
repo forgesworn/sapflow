@@ -64,7 +64,8 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
   async function get(name,limit){return bytes(await fetch(new URL(name,source),{redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(6000)])}),limit);}
   async function atomic(name,data){const temporary=resolve(mediaDir,`.${name}.tmp`);await writeFile(temporary,data,{mode:0o600});await rename(temporary,resolve(mediaDir,name));}
   async function mirror() {
-    const master=await get('index.m3u8',65536),variant=parseMaster(master.toString('ascii'));
+    let master;try{master=await get('index.m3u8',65536);}catch(error){error.channelMissing=[404,410].includes(error.status);throw error;}
+    const variant=parseMaster(master.toString('ascii'));
     const parsed=parseMedia((await get(variant.manifest,65536)).toString('ascii'));
     channel.observe(parsed);
     if(parsed.segments.length>64)throw Error('Mirror window exceeded');
@@ -82,7 +83,7 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
     if(!publisher)publisher=await createHlsPublisher({mediaDir,manifest:'index.m3u8',...identity,maxCacheEntries:128,maxConcurrent:4});
     fresh=Date.now();
   }
-  const loop=(async()=>{while(!closed){try{await mirror();}catch(error){if([404,410].includes(error.status)||Date.now()-channel.lastMediaAt>6000)channel.unavailable(error.status);}await new Promise(r=>{const timer=setTimeout(done,500);function done(){clearTimeout(timer);controller.signal.removeEventListener('abort',done);r();}controller.signal.addEventListener('abort',done,{once:true});if(closed)done();});}})();
+  const loop=(async()=>{while(!closed){try{await mirror();}catch(error){if(error.channelMissing)channel.unavailable(error.status);else if(Date.now()-channel.lastMediaAt>6000)channel.unavailable(503);}await new Promise(r=>{const timer=setTimeout(done,500);function done(){clearTimeout(timer);controller.signal.removeEventListener('abort',done);r();}controller.signal.addEventListener('abort',done,{once:true});if(closed)done();});}})();
   const audienceBudget=bucket(400,200),httpBudget=bucket(200,100),signBudget=bucket(40,20),eventBudget=bucket(100,50);
   function reply(res,status,data,mime='application/json'){res.writeHead(status,{'Content-Type':mime,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Cross-Origin-Resource-Policy':'same-origin'});res.end(data);}
   const server=createServer(async(req,res)=>{

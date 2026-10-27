@@ -93,10 +93,10 @@ test('autoplay rejection leaves native controls available without a retry loop',
   s.player.destroy();
 });
 
-test('TV keeps ten seconds of headroom and loads complete segments', async () => {
+test('TV keeps twenty seconds of headroom and loads complete segments', async () => {
   const s=setup(); s.watch.click(); await settle();
   assert.equal(s.handles[0].config.lowLatencyMode, false);
-  assert.equal(s.handles[0].config.liveSyncDuration, 10);
+  assert.equal(s.handles[0].config.liveSyncDuration, 20);
   assert(s.handles[0].config.liveMaxLatencyDuration > s.handles[0].config.liveSyncDuration);
   s.player.destroy();
 });

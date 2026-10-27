@@ -20,7 +20,7 @@ try {
     const request=route.request(), target=new URL(request.url());
     if (target.protocol==='blob:' || target.origin===url.origin) {
       requests.push(target.pathname);
-      if(target.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:2,peerEnabledPlayers:1,playerVersion:'2026.10.27.3',channel:{state:channelEnded?'ended':'live'}})});
+      if(target.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:2,peerEnabledPlayers:1,playerVersion:'2026.10.27.4',channel:{state:channelEnded?'ended':'live'}})});
       if (target.pathname==='/tv/live/event-tv/index.m3u8' && startupFailures>0) {
         startupFailures--; return route.fulfill({status:404,body:'Off air'});
       }

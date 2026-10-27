@@ -96,7 +96,7 @@ def main():
                 class FixtureTransport:
                     def fetch(self,target):
                         if target=='/tv/audience':
-                            return 200,b'{"activePlayers":2,"peerEnabledPlayers":1,"updatedAt":1,"ttlSeconds":35,"playerVersion":"2026.10.27.3","channel":{"state":"live","startedAt":1,"endedAt":null,"lastMediaAgeSeconds":0}}', 'application/json'
+                            return 200,b'{"activePlayers":2,"peerEnabledPlayers":1,"updatedAt":1,"ttlSeconds":35,"playerVersion":"2026.10.27.4","channel":{"state":"live","startedAt":1,"endedAt":null,"lastMediaAgeSeconds":0}}', 'application/json'
                         return fixture_fetch(target)
                 server.assets=ROOT/'web/tv';server.transport=FixtureTransport()
                 server.slots=threading.BoundedSemaphore(4)

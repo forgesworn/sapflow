@@ -30,9 +30,11 @@ edge IP lookup. The Mac's publishing route stays independent of viewer sharing.
 See [the receiver adapter](tv-relayswarm.md) for setup and boundaries.
 
 Chrome playback overlaps at most four complete-fragment downloads, appends them
-in order and uses a ten-second live-edge target to
+in order and uses a twenty-second live-edge target to
 absorb jitter in the publisher's upload. Back to live retains that headroom.
-This deliberately trades a short delay for continuity. A waiting decoder may
+This deliberately trades additional live delay for continuity. Playback can start
+once eight seconds are decoded while the remaining headroom is fetched; ordinary
+track changes do not reload the player. A waiting decoder may
 nudge across at most two seconds of already-buffered empty time, only at the end
 of the preceding range; it never jumps directly over the older programme to a
 newer buffered range. Transient playlist 404/429/503 responses retry at most twice
@@ -84,7 +86,7 @@ connections and verified byte counters; it exposes no other viewer's address.
 
 A channel that has never published shows off air. A stalled or temporarily
 unreachable source shows reconnecting. An explicit HLS end marker, or removal
-of a previously live upstream stream, confirms the broadcast has ended. The
+of a previously live upstream stream for at least two seconds, confirms the broadcast has ended. The
 player drains buffered video before displaying **Broadcast ended**, closes peer
 connections and stops retrying. A later broadcast requires another press of play.
 The receiver's reconnect grace must cover expected publisher interruptions;
@@ -142,7 +144,7 @@ The preview accepts only Sapflow's current, bounded playlist subset. Absolute
 URLs, encryption key URLs, content steering, variable definitions, unknown
 playlist features and unexpected paths are refused. Media always returns
 through the local gateway. The local CSP further restricts network access.
-The preview uses complete segments with an approximately ten-second start
+The preview uses complete segments with an approximately twenty-second start
 offset to reduce Tor round trips; the receiver can still serve LL-HLS parts to other clients.
 Tor capacity and latency still vary. This is not a guarantee of uninterrupted
 playback or complete anonymity against traffic correlation, device compromise,

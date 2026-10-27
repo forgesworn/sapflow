@@ -47,7 +47,7 @@ export default class CmafPlayer {
   static Events={MANIFEST_PARSED:'hlsManifestParsed',ERROR:'hlsError',FRAG_LOADING:'hlsFragLoading',FRAG_LOADED:'hlsFragLoaded',FRAG_BUFFERED:'hlsFragBuffered',LEVEL_LOADED:'hlsLevelLoaded',LEVEL_UPDATED:'hlsLevelUpdated'};
   static isSupported(){return typeof MediaSource!=='undefined';}
   constructor(config={}) {
-    this.config={loader:FetchLoader,fLoader:undefined,progressive:false,liveSyncDuration:10,...config};
+    this.config={loader:FetchLoader,fLoader:undefined,progressive:false,liveSyncDuration:20,...config};
     this.listeners=new Map();this.controller=new AbortController();this.media=null;this.source=null;this.buffer=null;this.objectUrl=null;this.url=null;
     this.levels=[];this.currentLevel=this.loadLevel=0;this.latestLevelDetails=null;this.offset=null;this.edge=null;this.positions=new Map();this.initialised=false;this.started=false;this.loaders=new Set();this.onWaiting=()=>this.nudgeGap();
   }
@@ -116,7 +116,7 @@ export default class CmafPlayer {
       for(let index=0;index<segments.length;) {
         const segment=segments[index];
         if(segment.sn<next){index++;continue;}
-        if(this.initialised&&this.buffer.buffered.length&&this.buffer.buffered.end(this.buffer.buffered.length-1)-this.media.currentTime>20)break;
+        if(this.initialised&&this.buffer.buffered.length&&this.buffer.buffered.end(this.buffer.buffered.length-1)-this.media.currentTime>30)break;
         if(segment.gap){next=segment.sn+1;index++;continue;}
         if(segment.init!==lastInit){await this.appendDownloaded(await this.download(segment,playlistUrl,true));lastInit=segment.init;}
         // Hide Tor round trips behind at most four complete-fragment transfers.

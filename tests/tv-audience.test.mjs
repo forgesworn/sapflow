@@ -20,8 +20,8 @@ test('channel distinguishes never on air, temporary interruption and a confirmed
  state.unavailable(404);assert.equal(state.snapshot().state,'offair');state.observe(parsed);assert.equal(state.snapshot().state,'live');
  now=7000;assert.equal(state.snapshot().state,'reconnecting');state.unavailable(503);assert.equal(state.snapshot().endedAt,null);
  now=8000;state.observe({...parsed,segments:[{name:'two',cc:0}]});assert.equal(state.snapshot().state,'live');
- state.unavailable(404);assert.equal(state.snapshot().state,'ended');assert.equal(state.snapshot().endedAt,8000);
- now=9000;state.observe({...parsed,segments:[{name:'new',cc:0}]});assert.equal(state.snapshot().startedAt,9000);
+ state.unavailable(404);assert.equal(state.snapshot().state,'reconnecting');now=10000;state.unavailable(404);assert.equal(state.snapshot().state,'ended');assert.equal(state.snapshot().endedAt,10000);
+ now=11000;state.observe({...parsed,segments:[{name:'new',cc:0}]});assert.equal(state.snapshot().startedAt,11000);
  state.observe({...parsed,segments:[{name:'new',cc:0}],end:true});assert.equal(state.snapshot().state,'ended');
 });
 test('private preview only reads aggregates through its local proxy',async()=>{
