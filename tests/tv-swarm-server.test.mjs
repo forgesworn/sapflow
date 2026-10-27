@@ -23,7 +23,8 @@ test('rendezvous refuses broader filters, foreign channels and forged events',()
 });
 test('receiver signs only mirrored playlist contexts and scopes its WebSocket',async()=>{
   const directory=await mkdtemp(join(tmpdir(),'sapflow-swarm-test-'));
-  const upstream=createServer((req,res)=>{const asset=req.url.split('/').at(-1);if(asset==='index.m3u8')res.end(master);else if(asset==='stream.m3u8')res.end(media);else if([`${name}_init.mp4`,`${name}_seg10.mp4`,`${name}_seg11.mp4`].includes(asset))res.end('generated fixture bytes');else{res.statusCode=404;res.end();}});
+  let removed=false,expiredFragment=false;
+  const upstream=createServer((req,res)=>{if(removed){res.statusCode=404;res.end();return;}const asset=req.url.split('/').at(-1);if(asset==='index.m3u8')res.end(master);else if(asset==='stream.m3u8')res.end(media+(expiredFragment?`#EXTINF:1,\n${name}_seg12.mp4\n`:''));else if([`${name}_init.mp4`,`${name}_seg10.mp4`,`${name}_seg11.mp4`].includes(asset))res.end('generated fixture bytes');else{res.statusCode=404;res.end();}});
   upstream.listen(0,'127.0.0.1');await once(upstream,'listening');let receiver,ws;
   try {
     receiver=await startReceiver({stateDir:directory,upstream:`http://127.0.0.1:${upstream.address().port}/live/event-tv/`,origin:'https://receiver.example',port:0});
@@ -45,5 +46,10 @@ test('receiver signs only mirrored playlist contexts and scopes its WebSocket',a
     const received=once(ws,'message');ws.send(JSON.stringify(['REQ','test',{kinds:[24170],'#x':[config.swarmId]}]));assert.equal(JSON.parse(String((await received)[0]))[0],'EOSE');
     const wrong=new WebSocket(base.replace('http:','ws:')+'/tv/swarm/relay',{origin:'https://foreign.example'});const [error]=await once(wrong,'error');assert.match(error.message,/403/);
     assert((await readFile(join(directory,'identity','publisher.json'),'utf8')).includes('secretKey'));
+    expiredFragment=true;await new Promise(r=>setTimeout(r,1200));
+    assert.notEqual((await (await fetch(base+'/tv/audience')).json()).channel.state,'ended','an unavailable fragment cannot end the channel');
+    removed=true;let ended=false;
+    for(let i=0;i<35;i++){await new Promise(r=>setTimeout(r,100));if((await (await fetch(base+'/tv/audience')).json()).channel.state==='ended'){ended=true;break;}}
+    assert(ended,'persistent removal of the channel master confirms the broadcast end');
   }finally{ws?.terminate();await receiver?.close();upstream.closeAllConnections();await new Promise(r=>upstream.close(r));await rm(directory,{recursive:true,force:true});}
 });
