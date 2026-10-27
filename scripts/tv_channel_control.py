@@ -56,6 +56,9 @@ class ChannelControl:
 
     def start(self):
         if self.config is not None and not self.registered:
+            if self.attempted:
+                self.session = secrets.token_hex(16)
+            self.started_at = int(time.time() * 1000)
             self.attempted = True
             self.registered = self.notify("start")
             if not self.registered:

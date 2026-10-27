@@ -30,6 +30,11 @@ class Lifecycle(unittest.TestCase):
   c=ChannelControl(self.config)
   with mock.patch('tv_channel_control.subprocess.run',side_effect=[subprocess.TimeoutExpired('curl',12),subprocess.CompletedProcess([],0,'200','')]) as run:
    c.start();self.assertFalse(c.registered);self.assertTrue(c.end());self.assertEqual(run.call_count,2)
+ def test_registration_time_follows_slow_local_verification(self):
+  with mock.patch('tv_channel_control.time.time',side_effect=[100,400]):
+   c=ChannelControl(self.config)
+   with mock.patch('tv_channel_control.subprocess.run',return_value=subprocess.CompletedProcess([],0,'200','')) as run:c.start()
+  message=json.loads(run.call_args.args[0][run.call_args.args[0].index('--data-binary')+1]);self.assertEqual(message['startedAt'],400000)
  def test_private_files_and_exact_https_origin_are_required(self):
   self.token.chmod(0o644)
   with self.assertRaises(ValueError):ChannelControl(self.config)
