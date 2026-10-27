@@ -78,6 +78,11 @@ test('Stop during a hung playlist attempt ends the read without retrying',async(
  globalThis.fetch=async(_url,{signal})=>{calls++;setTimeout(()=>engine.destroy(),50);return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));};
  try{await assert.rejects(()=>engine.text('http://127.0.0.1/media/index.m3u8'));assert.equal(calls,1);}finally{engine.destroy();globalThis.fetch=original;}
 });
+test('edge gateway errors are retried instead of resetting the engine',async()=>{
+ const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const engine=new Engine();
+ globalThis.fetch=async()=>{calls++;return calls===1?new Response('Bad gateway',{status:502}):calls===2?new Response('Timeout',{status:504}):new Response(master);};
+ try{assert.equal(await engine.text('http://127.0.0.1/media/index.m3u8'),master);assert.equal(calls,3);}finally{engine.destroy();globalThis.fetch=original;}
+});
 test('Stop during playlist backoff prevents another request',async()=>{
  const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const engine=new Engine();
  globalThis.fetch=async()=>{calls++;queueMicrotask(()=>engine.destroy());return new Response('Busy',{status:503});};

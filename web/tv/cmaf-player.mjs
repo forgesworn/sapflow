@@ -19,7 +19,7 @@ async function retryBytes(url,{signal,limit,retry404=false,attemptMs=0,onAttempt
    if(!response.ok){await response.body?.cancel();throw Object.assign(Error(`Media HTTP ${response.status}`),{status:response.status});}
    return await boundedBytes(response,limit);
   }catch(error){
-   if(signal.aborted||attempt===4||!(error instanceof TypeError||error?.name==='TimeoutError'||[429,503,...(retry404?[404]:[])].includes(error.status)))throw error;
+   if(signal.aborted||attempt===4||!(error instanceof TypeError||error?.name==='TimeoutError'||[429,502,503,504,...(retry404?[404]:[])].includes(error.status)))throw error;
    await new Promise(resolve=>{const done=()=>{clearTimeout(timer);signal.removeEventListener('abort',done);resolve();};const timer=setTimeout(done,[500,1500,3000,5000][attempt]);signal.addEventListener('abort',done,{once:true});if(signal.aborted)done();});
   }
  }
