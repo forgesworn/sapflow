@@ -1,5 +1,12 @@
 # Fuzz targets
 
+The Python TV preview allowlist has a separate finite mutation target:
+`python3 -B fuzz/tv_preview_fuzz.py 20000`. It exercises bounded hostile
+manifests and resource/query paths without opening sockets or processing media.
+`TestOneInput(bytes)` is available for external Python fuzz engines. The CI
+smoke job runs the mutation campaign and privacy regressions. This campaign is
+not coverage-guided and does not replace the Rust libFuzzer/ASan targets below.
+
 `realtime_queue` exercises the opaque real-time frame scheduler, its scalar
 limits, per-stream sequence/dependency recovery, audio priority, deadlines,
 backwards clocks and ciphertext ownership release. It interprets at most 256

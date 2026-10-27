@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>ForgeSworn TV</title>
+  <link rel="stylesheet" href="/tv/player.css">
+</head>
+<body>
+  <main>
+    <header><a class="brand" href="/tv/">Forge<span>Sworn</span></a><span class="channel">TV</span></header>
+    <section aria-labelledby="channel-title">
+      <div class="heading"><div><p class="eyebrow">The live channel</p><h1 id="channel-title">ForgeSworn TV</h1></div><span id="indicator" class="indicator" data-state="idle">Ready</span></div>
+      <div class="screen"><video id="video" controls playsinline preload="none" aria-label="ForgeSworn TV live programme"></video><div id="placeholder"><span class="signal" aria-hidden="true">FS</span><p>Pull up a chair.</p></div></div>
+      <div class="controls"><button id="watch" type="button">Watch live</button><button id="live-edge" type="button" disabled>Back to live</button><p id="status" role="status" aria-live="polite">Press Watch live to tune in.</p></div>
+    </section>
+    <footer><span>Live from the channel.</span><span><a href="/tv/vendor/hls.js-LICENSE">Player notices</a> · <a href="/tv/vendor/APACHE-2.0.txt">Apache 2.0</a></span></footer>
+  </main>
+  <script type="module" src="/tv/player.mjs"></script>
+</body>
+</html>

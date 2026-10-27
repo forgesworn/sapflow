@@ -1,0 +1,32 @@
+# Inside the existing HTTPS receiver site. Preserve its other routes.
+# Install web/tv/ as /var/www/sapflow-tv (directories 0755, files 0644).
+redir /tv /tv/ 308
+handle /tv/* {
+    # Deferred so an existing site's default CSP cannot replace this policy.
+    header {
+        Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; media-src 'self' blob:; img-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'"
+        Referrer-Policy no-referrer
+        X-Content-Type-Options nosniff
+        Cache-Control no-store
+        defer
+    }
+    @tv_media path /tv/live/event-tv/*
+    handle @tv_media {
+        uri strip_prefix /tv
+        reverse_proxy 127.0.0.1:28888 {
+            header_up -X-Forwarded-For
+            header_up -X-Real-IP
+            header_up -CF-Connecting-IP
+        }
+    }
+    # Explicit asset allowlist: private control routes and other streams stay shut.
+    @tv_assets path /tv/ /tv/player.css /tv/player.mjs /tv/vendor/hls.light.min.mjs /tv/vendor/hls.js-LICENSE /tv/vendor/APACHE-2.0.txt
+    handle @tv_assets {
+        uri strip_prefix /tv
+        root * /var/www/sapflow-tv
+        file_server
+    }
+    handle {
+        respond "Not found" 404
+    }
+}
