@@ -311,6 +311,10 @@ main() {
         -bsf:v filter_units=remove_types=6)
     fi
     local -a base=(ffmpeg -hide_banner -nostdin -nostats -loglevel warning "${in[@]}" "${codec[@]}")
+    local -a rtmp_options=()
+    # FFmpeg otherwise advertises its library version in the RTMP connect
+    # command, independently of the muxer and encoded-media markers.
+    [ "$strip_metadata" = 0 ] || rtmp_options=(-rtmp_flashver FMLE/3.0)
 
     : > "$work/rc"
     : > "$work/err"
@@ -327,7 +331,7 @@ main() {
           { "${base[@]}" -flush_packets 1 -f mpegts pipe:1; echo "ffmpeg=$?" > "$work/rc"; : > "$work/ffmpeg.done"; } | sink_srt "$url"
           echo "srt-live-transmit=${PIPESTATUS[1]}" >> "$work/rc" ;;
         ffmpeg-rtmp)
-          "${base[@]}" -flvflags no_duration_filesize -f flv "$url"
+          "${base[@]}" ${rtmp_options[@]+"${rtmp_options[@]}"} -flvflags no_duration_filesize -f flv "$url"
           echo "ffmpeg=$?" > "$work/rc" ;;
       esac
      ) 2>&1 | tv_redact_stream ${secrets[@]+"${secrets[@]}"} | tee -a "$work/err" | sed 's/^/ffmpeg: /' >&3

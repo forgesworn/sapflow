@@ -39,6 +39,10 @@ This is address hiding, not a promise of zero metadata or complete anonymity:
   way to anonymise other applications running on the Mac.
 - Local process inspection can still expose the publish URL. Keep the Mac,
   private files and operator logs under the broadcaster's control.
+- Opening the public viewer URL in an ordinary browser on the broadcasting Mac
+  reveals that browser's connection address to the HTTPS service. Use a
+  separate privacy-preserving viewing route for an operator preview; this
+  publisher does not proxy the browser or make its fingerprint anonymous.
 
 The receiver observes the local Tor-to-SSH hop and loopback RTMP originator,
 rather than the Mac's public address. Its own public HTTPS endpoint remains
@@ -178,7 +182,8 @@ Tor/access and restart explicitly. The media supervisor can retry encoder
 failures while the same SSH master remains alive.
 
 `--strip-metadata` is mandatory in this wrapper. It disables source global and
-stream tags, chapters, FFmpeg version markers and all H.264 SEI. Audio is
+stream tags, chapters, FFmpeg version markers and all H.264 SEI. The RTMP connect
+command uses a generic client identifier instead of FFmpeg's version. Audio is
 re-encoded. It retains the technical FLV track metadata Sapflow needs to start
 audio/video correctly. Removing all SEI also removes embedded captions and
 supplementary presentation data, as documented by [FFmpeg](https://ffmpeg.org/ffmpeg-bitstream-filters.html#filter_005funits).

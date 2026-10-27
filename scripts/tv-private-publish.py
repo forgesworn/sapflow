@@ -134,14 +134,25 @@ def run(args):
         stopped = True
 
     old_handlers = {s: signal.signal(s, on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
-    master = playout = None
+    verifier = master = playout = None
     try:
         # Verify locally before starting any network connection. Keep filenames,
         # tags and local directory names out of the supervisor's output.
-        checked = subprocess.run(["bash", str(HERE / "tv-prepare.sh"), "--verify", str(media)],
-                                 env=clean_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 timeout=300)
-        if checked.returncode:
+        verifier = subprocess.Popen(["bash", str(HERE / "tv-prepare.sh"), "--verify", str(media)],
+                                    env=clean_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+        verify_deadline = time.monotonic() + 300
+        while verifier.poll() is None:
+            if stopped:
+                return 130
+            if time.monotonic() >= verify_deadline:
+                raise ValueError("local prepared media verification timed out")
+            time.sleep(0.1)
+        verify_status = verifier.returncode
+        # A completed verifier has no surviving asynchronous work. Do not keep
+        # its process-group ID for a broadcast that might last many hours.
+        verifier = None
+        if verify_status:
             raise ValueError("prepared media verification failed; run tv-prepare.sh --verify locally")
         if stopped:
             return 130
@@ -149,7 +160,7 @@ def run(args):
         with tempfile.TemporaryDirectory(prefix="sapflow-private-", dir="/tmp") as work:
             control = Path(work) / "ssh"
             command = ssh_command(args, control, ssh, nc)
-            with tempfile.TemporaryFile() as ssh_errors:
+            with open(os.devnull, "wb") as ssh_errors:
                 master = subprocess.Popen(command + ["-M", "-N", args.onion_host],
                                           env=clean_env, stdin=subprocess.DEVNULL,
                                           stdout=subprocess.DEVNULL, stderr=ssh_errors,
@@ -201,6 +212,7 @@ def run(args):
     finally:
         stop_child(playout)
         stop_child(master)
+        stop_child(verifier)
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
 

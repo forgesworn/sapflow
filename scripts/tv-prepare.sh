@@ -77,20 +77,20 @@ file_size() { wc -c < "$1" | tr -d ' '; }
 # first access unit (Annex B, as hex), and the AAC AudioSpecificConfig.
 fingerprint() {
   local f=$1
-  ffprobe -v error -select_streams v:0 -of default=noprint_wrappers=1 \
+  ffprobe -v error -protocol_whitelist file -select_streams v:0 -of default=noprint_wrappers=1 \
     -show_entries stream=codec_name,profile,level,width,height,coded_width,coded_height,pix_fmt,sample_aspect_ratio,r_frame_rate,avg_frame_rate,field_order,color_range,color_space,color_transfer,color_primaries,time_base \
     "$f" | sed 's/^/video./'
-  ffprobe -v error -select_streams a:0 -of default=noprint_wrappers=1 \
+  ffprobe -v error -protocol_whitelist file -select_streams a:0 -of default=noprint_wrappers=1 \
     -show_entries stream=codec_name,profile,sample_fmt,sample_rate,channels,channel_layout,time_base \
     "$f" | sed 's/^/audio./'
   printf 'video.sps_pps='
-  ffmpeg -v error -i "$f" -map 0:v:0 -c:v copy \
+  ffmpeg -v error -protocol_whitelist file -i "$f" -map 0:v:0 -c:v copy \
     -bsf:v 'h264_mp4toannexb,filter_units=pass_types=7|8' -frames:v 1 -f h264 - \
     | od -An -v -tx1 | tr -d ' \n'
   printf '\n'
   # The hex dump of the audio extradata, without its offsets and ASCII column.
   printf 'audio.config='
-  ffprobe -v error -select_streams a:0 -show_streams -show_data -of default=noprint_wrappers=1 "$f" \
+  ffprobe -v error -protocol_whitelist file -select_streams a:0 -show_streams -show_data -of default=noprint_wrappers=1 "$f" \
     | awk '/^extradata=/ { on = 1; next } /^extradata_size=/ { on = 0 } on && NF { sub(/^[0-9a-f]+: /, ""); print }' \
     | awk '{ for (i = 1; i <= NF && $i ~ /^[0-9a-f]+$/ ; i++) printf "%s", $i } END { printf "\n" }'
 }

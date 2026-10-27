@@ -3,6 +3,7 @@
 import argparse
 import base64
 import hashlib
+import http.server
 import importlib.util
 import json
 import os
@@ -59,11 +60,20 @@ class Supervisor(unittest.TestCase):
                                        prepared_dir=home)
         self.calls, self.children = [], []
         self.drop_tunnel = self.reject_forward = self.reject_host = self.stop_playout = False
+        self.stop_verification = False
 
     def execute(self):
         def popen(command, **kwargs):
             self.calls.append((command, kwargs))
             child = mock.Mock(pid=900000 + len(self.children))
+            if "tv-prepare.sh" in command[1]:
+                child.pid = 899999
+                child.returncode = 0
+                child.poll.return_value = 0
+                if self.stop_verification:
+                    child.poll.return_value = None
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return child
             if len(self.children) == 0:
                 Path(command[command.index("-S") + 1]).touch()
                 child.poll.side_effect = lambda: 255 if self.reject_host or (
@@ -143,6 +153,12 @@ class Supervisor(unittest.TestCase):
         self.assertEqual(len(self.children), 2)
         for child in self.children:
             self.assertIn(mock.call(child.pid, signal.SIGTERM), self.killed)
+
+    def test_sigterm_during_verification_stops_before_any_network(self):
+        self.stop_verification = True
+        self.assertEqual(self.execute(), 130)
+        self.assertEqual(self.children, [])
+        self.assertIn(mock.call(899999, signal.SIGTERM), self.killed)
 
     def test_audio_copy_cannot_bypass_metadata_removal(self):
         result = subprocess.run(["bash", str(ROOT / "scripts/tv-playout.sh"), "--strip-metadata",
@@ -224,6 +240,33 @@ class SocksRouting(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg is required")
 class MediaRemoval(unittest.TestCase):
+    def test_verification_refuses_network_references_inside_a_disguised_media_file(self):
+        requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_error(404)
+
+            def log_message(self, *_args):
+                pass
+
+        with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    disguised = Path(tmp) / "untrusted.mp4"
+                    disguised.write_text("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n"
+                                         f"http://127.0.0.1:{server.server_port}/must-not-fetch.ts\n#EXT-X-ENDLIST\n")
+                    result = subprocess.run(["bash", str(ROOT / "scripts/tv-prepare.sh"), "--verify", tmp],
+                                            capture_output=True, timeout=10)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(requests, [])
+            finally:
+                server.shutdown()
+                worker.join(timeout=3)
+
     def test_playout_removes_tags_chapters_sei_and_encoder_markers_and_still_decodes(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

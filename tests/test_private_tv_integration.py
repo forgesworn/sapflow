@@ -49,6 +49,32 @@ class SocksFixture(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def pump(downstream, upstream, server, capture=False):
+    with selectors.DefaultSelector() as selector:
+        selector.register(downstream, selectors.EVENT_READ, upstream)
+        selector.register(upstream, selectors.EVENT_READ, downstream)
+        while not server.stopping.is_set():
+            for key, _ in selector.select(timeout=0.1):
+                data = key.fileobj.recv(65536)
+                if not data:
+                    return
+                if capture and key.fileobj is downstream:
+                    server.received.extend(data)
+                    if len(server.received) > 2 * 1024 * 1024:
+                        raise AssertionError("synthetic wire capture exceeded its fixture budget")
+                key.data.sendall(data)
+
+
+class RecordingHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            with socket.create_connection(("127.0.0.1", self.server.ingest_port), timeout=5) as upstream:
+                upstream.settimeout(None)
+                pump(self.request, upstream, self.server, capture=True)
+        except BaseException as error:
+            self.server.errors.append(str(error))
+
+
 class SocksHandler(socketserver.BaseRequestHandler):
     def handle(self):
         def exact(n):
@@ -78,15 +104,7 @@ class SocksHandler(socketserver.BaseRequestHandler):
                 self.request.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
                 self.request.settimeout(None)
                 upstream.settimeout(None)
-                with selectors.DefaultSelector() as selector:
-                    selector.register(self.request, selectors.EVENT_READ, upstream)
-                    selector.register(upstream, selectors.EVENT_READ, self.request)
-                    while not self.server.stopping.is_set():
-                        for key, _ in selector.select(timeout=0.1):
-                            data = key.fileobj.recv(65536)
-                            if not data:
-                                return
-                            key.data.sendall(data)
+                pump(self.request, upstream, self.server)
         except BaseException as error:
             self.server.errors.append(str(error))
 
@@ -108,6 +126,17 @@ class PrivateRoute(unittest.TestCase):
             hosts.write_text(onion + " " + (home / "host.pub").read_text())
             hosts.chmod(0o600)
             ssh_port, ingest_port = free_port(), free_port()
+            recording = SocksFixture(("127.0.0.1", 0), RecordingHandler)
+            recording.ingest_port = ingest_port
+            recording.received, recording.errors = bytearray(), []
+            recording.stopping = threading.Event()
+            recording_worker = threading.Thread(target=recording.serve_forever, daemon=True)
+            recording_worker.start()
+            self.addCleanup(recording_worker.join, 3)
+            self.addCleanup(recording.server_close)
+            self.addCleanup(recording.shutdown)
+            self.addCleanup(recording.stopping.set)
+            forward_port = recording.server_address[1]
             config = home / "sshd_config"
             config.write_text(
                 f"Port {ssh_port}\nListenAddress 127.0.0.1\nHostKey {home}/host\n"
@@ -115,7 +144,7 @@ class PrivateRoute(unittest.TestCase):
                 "UsePAM no\nUseDNS no\nStrictModes no\nPasswordAuthentication no\n"
                 "KbdInteractiveAuthentication no\nAuthenticationMethods publickey\n"
                 "AllowAgentForwarding no\nX11Forwarding no\nPermitTTY no\n"
-                f"AllowTcpForwarding local\nPermitOpen 127.0.0.1:{ingest_port}\nMaxSessions 0\n")
+                f"AllowTcpForwarding local\nPermitOpen 127.0.0.1:{forward_port}\nMaxSessions 0\n")
             source = media / "generated.mp4"
             subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=128x96:r=25:d=2.4",
                             "-f", "lavfi", "-i", "sine=r=48000:d=2.4", "-c:v", "libx264",
@@ -137,7 +166,7 @@ class PrivateRoute(unittest.TestCase):
                     command = ["python3", "-B", str(ROOT / "scripts/tv-private-publish.py"),
                                "--onion-host", onion, "--ssh-user", getpass.getuser(),
                                "--identity-file", str(home / "client"), "--known-hosts", str(hosts),
-                               "--socks-port", str(socks.server_address[1]), "--ingest-port", str(ingest_port),
+                               "--socks-port", str(socks.server_address[1]), "--ingest-port", str(forward_port),
                                "--once", str(media)]
                     env = dict(os.environ, TV_PRIVATE_PUBLISH_PATH="live/event-fixture",
                                TV_PUBLISH_URL="rtmp://forbidden.example/live/key")
@@ -165,6 +194,10 @@ class PrivateRoute(unittest.TestCase):
                     self.assertEqual(decoded.returncode, 0, decoded.stderr.decode())
                     self.assertEqual(socks.requests, [(onion, 22), (onion, 22)])
                     self.assertEqual(socks.errors, [])
+                    self.assertEqual(recording.errors, [])
+                    self.assertIn(b"FMLE/3.0", recording.received)
+                    for marker in (b"Lavf", b"Lavc", b"x264"):
+                        self.assertNotIn(marker, recording.received)
             finally:
                 HELPERS.PRIVATE.stop_child(receiver)
                 HELPERS.PRIVATE.stop_child(sshd)
