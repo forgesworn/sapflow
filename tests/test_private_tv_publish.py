@@ -45,6 +45,39 @@ class AddressPolicy(unittest.TestCase):
         self.assertEqual(PRIVATE.port("9150"), 9150)
 
 
+class Reconnect(unittest.TestCase):
+    def test_retries_the_same_validated_arguments_after_a_tunnel_drop(self):
+        args = argparse.Namespace(once=False)
+        with mock.patch.object(PRIVATE, 'run', side_effect=[PRIVATE.OnionUnavailable('dropped'), 0]) as run, \
+             mock.patch.object(PRIVATE.time, 'sleep'), \
+             mock.patch.object(PRIVATE.time, 'monotonic', side_effect=[0, 1, 2, 5, 6]):
+            self.assertEqual(PRIVATE.supervise(args), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(all(call.args[0] is args for call in run.call_args_list))
+
+    def test_once_does_not_retry_and_validation_errors_remain_fatal(self):
+        for args, error in [(argparse.Namespace(once=True), PRIVATE.OnionUnavailable('drop')),
+                            (argparse.Namespace(once=False), ValueError('invalid local config'))]:
+            with mock.patch.object(PRIVATE, 'run', side_effect=error) as run, self.assertRaises(ValueError):
+                PRIVATE.supervise(args)
+            self.assertEqual(run.call_count, 1)
+
+    def test_stop_during_backoff_prevents_another_connection(self):
+        args = argparse.Namespace(once=False)
+        with mock.patch.object(PRIVATE, 'run', side_effect=PRIVATE.OnionUnavailable('drop')) as run, \
+             mock.patch.object(PRIVATE.time, 'sleep', side_effect=lambda _: os.kill(os.getpid(), signal.SIGTERM)):
+            self.assertEqual(PRIVATE.supervise(args), 130)
+        self.assertEqual(run.call_count, 1)
+
+    def test_stop_during_attempt_cleanup_prevents_retry(self):
+        def attempt(_args, on_stop):
+            on_stop(signal.SIGTERM, None)
+            raise PRIVATE.OnionUnavailable('drop during shutdown')
+        with mock.patch.object(PRIVATE, 'run', side_effect=attempt) as run:
+            self.assertEqual(PRIVATE.supervise(argparse.Namespace(once=False)), 130)
+        self.assertEqual(run.call_count, 1)
+
+
 class Supervisor(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -62,7 +95,7 @@ class Supervisor(unittest.TestCase):
         self.drop_tunnel = self.reject_forward = self.reject_host = self.stop_playout = False
         self.stop_verification = False
 
-    def execute(self):
+    def execute(self, reconnect=False):
         def popen(command, **kwargs):
             self.calls.append((command, kwargs))
             child = mock.Mock(pid=900000 + len(self.children))
@@ -97,9 +130,16 @@ class Supervisor(unittest.TestCase):
              mock.patch.object(PRIVATE.subprocess, "run", side_effect=run), \
              mock.patch.object(PRIVATE.os, "killpg") as killed:
             try:
-                return PRIVATE.run(self.args)
+                return (PRIVATE.supervise if reconnect else PRIVATE.run)(self.args)
             finally:
                 self.killed = killed.call_args_list
+
+    def test_ctrl_c_during_a_supervised_attempt_stops_instead_of_retrying(self):
+        self.args.once = False
+        self.stop_playout = True
+        self.assertEqual(self.execute(reconnect=True), 130)
+        masters=[cmd for cmd, _ in self.calls if '-M' in cmd]
+        self.assertEqual(len(masters), 1)
 
     def test_pins_host_key_uses_socks_only_and_local_media_url(self):
         self.assertEqual(self.execute(), 0)

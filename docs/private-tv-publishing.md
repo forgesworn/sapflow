@@ -180,10 +180,14 @@ verifies prepared media before networking, ignores user/system SSH config,
 uses only the explicit SSH identity and pin, and establishes a fresh private
 SSH master before asking it to bind the local RTMP port.
 
-If Tor or SSH fails, it stops. It never switches to public SSH, SRT, direct
+If Tor or SSH fails, the current publish attempt stops. It never switches to public SSH, SRT, direct
 RTMP or a different relay. SSH keepalives detect a stalled connection; until
 then FFmpeg can block on the existing local tunnel. After a failure, restore
-Tor/access and restart explicitly. The media supervisor can retry encoder
+Tor/access if the pinned route stays unavailable. Normal continuous publishing retries
+the same pinned onion route with a 2 to 30 second backoff after cleaning up
+the old tunnel and media worker. It never switches to a direct route. Ctrl-C
+also stops a pending retry. `--once` keeps a single-attempt policy. A new
+tunnel starts the prepared playlist from the beginning. The media supervisor can retry encoder
 failures while the same SSH master remains alive.
 
 `--strip-metadata` is mandatory in this wrapper. It disables source global and
