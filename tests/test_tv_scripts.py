@@ -230,7 +230,7 @@ class Supervisor(unittest.TestCase):
     def test_sigterm_stops_an_active_encoder_and_cleans_its_concat_list(self):
         fake = Path(self.tmp.name) / "bin/ffmpeg"
         marker = Path(self.tmp.name) / "encoder.pid"
-        fake.write_text('#!/bin/sh\necho $$ > "$TV_TEST_PID"\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n')
+        fake.write_text('#!/bin/sh\ncase "$*" in *"-h full"*) exit 0 ;; esac\necho $$ > "$TV_TEST_PID"\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n')
         env = dict(self.env, TV_TEST_PID=str(marker))
         proc = subprocess.Popen(["bash", str(PLAYOUT), "--no-verify", str(self.media), "rtmp://h.example/live/key"],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
@@ -253,6 +253,12 @@ class Supervisor(unittest.TestCase):
         finally:
             if proc.poll() is None:
                 proc.kill(); proc.communicate(timeout=5)
+
+
+class CatchupOptions(unittest.TestCase):
+    def test_new_ffmpeg_catches_up_and_older_builds_keep_compatible_input(self):
+        self.assertEqual(call(PLAYOUT, 'tv_catchup_options', ' -readrate_catchup <speed>').stdout.splitlines(), ['-readrate_catchup', '2'])
+        self.assertEqual(call(PLAYOUT, 'tv_catchup_options', ' -readrate <speed>').stdout, '')
 
 
 class PrepareHelpers(unittest.TestCase):

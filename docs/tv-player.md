@@ -91,6 +91,10 @@ player drains buffered video before displaying **Broadcast ended**, closes peer
 connections and stops retrying. A later broadcast requires another press of play.
 The receiver's reconnect grace must cover expected publisher interruptions;
 no browser can play new pictures while the publisher supplies no new data.
+Playout detects whether FFmpeg supports `-readrate_catchup` and permits a
+temporary 2x read rate after a blocked output so a recovered upload can refill
+that headroom. Older FFmpeg builds keep their compatible real-time input.
+See the [FFmpeg input pacing documentation](https://ffmpeg.org/ffmpeg.html#Advanced-options).
 
 ## Serve the public page
 
@@ -99,6 +103,11 @@ serve the private publisher directory, keys, configuration, logs or recordings.
 Use the [Caddy fragment](examples/tv.Caddyfile) inside the existing receiver's
 HTTPS site. Adapt the loopback upstream port to the deployment. Retain the
 existing site's other services and keep Sapflow's listeners private.
+
+For the twenty-second playback target, set `SAPFLOW_SEGMENT_COUNT=48` on the
+receiver. The default 24 one-second segments leave too little time to retrieve
+older fragments across a slow Tor route. Keep the existing 90-second reconnect
+grace and listener isolation. The bounded mirror accepts at most 64 segments.
 
 Back up the existing configuration, validate the full candidate with
 `caddy validate`, then reload. Read back the page, module and licence hashes,
