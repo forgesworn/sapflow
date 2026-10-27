@@ -68,3 +68,16 @@ test('Stop during playlist backoff prevents another request',async()=>{
  globalThis.fetch=async()=>{calls++;queueMicrotask(()=>engine.destroy());return new Response('Busy',{status:503});};
  try{await assert.rejects(()=>engine.text('http://127.0.0.1/media/index.m3u8'));assert.equal(calls,1);}finally{engine.destroy();globalThis.fetch=original;}
 });
+
+test('a dropped network request retries the whole fragment without a fatal callback',async()=>{
+ const {FetchLoader}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0,failures=0;const loader=new FetchLoader();
+ globalThis.fetch=async()=>{if(++calls===1)throw new TypeError('Network changed');return new Response(new Uint8Array([1,2,3]));};
+ try{const response=await new Promise((resolve,reject)=>loader.load({url:'https://receiver.example/generated'}, {timeout:3000},{onSuccess:resolve,onError:e=>{failures++;reject(e);}}));assert.equal(response.data.byteLength,3);assert.equal(calls,2);assert.equal(failures,0);assert.equal(loader.stats.retry,1);}finally{loader.destroy();globalThis.fetch=original;}
+});
+test('Stop cancels fragment retry backoff and forbidden responses are not retried',async()=>{
+ const {FetchLoader}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const loader=new FetchLoader();
+ globalThis.fetch=async()=>{calls++;queueMicrotask(()=>loader.destroy());throw new TypeError('Network changed');};
+ try{let callbacks=0;loader.load({url:'https://receiver.example/generated'},{timeout:3000},{onSuccess:()=>callbacks++,onError:()=>callbacks++});await new Promise(r=>setTimeout(r,600));assert.equal(calls,1);assert.equal(callbacks,0);
+  globalThis.fetch=async()=>{calls++;return new Response('Forbidden',{status:403});};const forbidden=new FetchLoader();await new Promise(resolve=>forbidden.load({url:'https://receiver.example/generated'},{timeout:3000},{onSuccess:()=>assert.fail('Forbidden'),onError:resolve}));assert.equal(calls,2);forbidden.destroy();
+ }finally{loader.destroy();globalThis.fetch=original;}
+});

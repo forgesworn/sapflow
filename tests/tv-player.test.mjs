@@ -163,7 +163,7 @@ test('confirmed end drains buffered video, while reconnecting does not declare a
  s.video.dispatchEvent(new Event('playing'));s.player.setChannelState('reconnecting');assert.equal(s.indicator.dataset.state,'playing');
  s.player.setChannelState('ended');assert.equal(finished,1);assert.equal(s.handles[0].destroyed,false);assert.equal(s.player.watching,true);
  s.video.currentTime=19.95;s.video.dispatchEvent(new Event('timeupdate'));assert.equal(s.indicator.dataset.state,'ended');assert.equal(s.timers.size,0);
- s.player.setChannelState('live');assert.equal(s.indicator.dataset.state,'idle');assert.equal(s.player.watching,false);s.player.destroy();
+ s.player.setChannelState('live');assert.equal(s.indicator.dataset.state,'available');assert.match(s.status.textContent,/back on air/);assert.equal(s.player.watching,false);s.player.destroy();
 });
 
 test('an interrupted publisher replaces buffering with an explicit reconnect card and then ends',async()=>{
@@ -171,4 +171,15 @@ test('an interrupted publisher replaces buffering with an explicit reconnect car
  s.video.dispatchEvent(new Event('playing'));s.video.dispatchEvent(new Event('waiting'));assert.equal(s.indicator.dataset.state,'buffering');
  s.player.setChannelState('reconnecting');assert.equal(s.indicator.dataset.state,'interrupted');assert.equal(s.placeholder.hidden,false);assert.match(s.status.textContent,/broadcaster/);
  s.player.setChannelState('ended');assert.equal(s.indicator.dataset.state,'ended');assert.equal(s.timers.size,0);s.player.destroy();
+});
+
+test('an observed network-address change closes peer assistance and requests a fresh watch decision',async()=>{
+ const peers=new Element();peers.checked=true;let closed=0;
+ const s=setup({peers,locationImpl:new URL('https://receiver.example/tv/'),loadPeers:async()=>({attachPeers:async()=>({stop:()=>closed++,stream:'/media/index.m3u8'})})});
+ s.watch.click();await settle();s.player.networkChanged();assert.equal(closed,1);assert.equal(peers.checked,false);assert.equal(s.player.watching,false);assert.equal(s.indicator.dataset.state,'network');assert.equal(s.handles[0].destroyed,true);s.player.destroy();
+});
+
+test('an unavailable status request cannot keep blaming the broadcaster for a viewer connection failure',async()=>{
+ const s=setup();s.watch.click();await settle();s.video.readyState=2;s.video.dispatchEvent(new Event('playing'));s.player.setChannelState('reconnecting');s.video.dispatchEvent(new Event('waiting'));assert.equal(s.indicator.dataset.state,'interrupted');
+ s.player.setChannelState('unknown');assert.equal(s.indicator.dataset.state,'connection');assert.match(s.status.textContent,/connection to the receiver/);s.player.destroy();
 });

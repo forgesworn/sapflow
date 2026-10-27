@@ -4,11 +4,11 @@ export function createIdent(video){
  async function preload(){if(reduce||objectUrl||controller||closed)return;controller=new AbortController();try{
   const response=await fetch('/tv/loading-ident.mp4',{credentials:'omit',cache:'force-cache',priority:'low',signal:controller.signal});if(!response.ok)return;
   const reader=response.body.getReader(),chunks=[];let size=0;while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>2*1024*1024){await reader.cancel();throw Error('Ident budget');}chunks.push(value);}
-  if(closed)return;objectUrl=URL.createObjectURL(new Blob(chunks,{type:'video/mp4'}));video.src=objectUrl;if(['connecting','offline','ended','interrupted'].includes(state))void video.play().catch(()=>{});
+  if(closed)return;objectUrl=URL.createObjectURL(new Blob(chunks,{type:'video/mp4'}));video.src=objectUrl;if(['connecting','offline','ended','interrupted','connection'].includes(state))void video.play().catch(()=>{});
  }catch{}finally{controller=null;}}
  return {setState(next){state=next;if(timer!==null)clearTimeout(timer);timer=null;
-  if(['idle','stopped','offline','ended','interrupted'].includes(next)){timer=setTimeout(()=>void preload(),800);}
+  if(['idle','stopped','offline','ended','interrupted','connection'].includes(next)){timer=setTimeout(()=>void preload(),800);}
   if(['playing','paused','buffering','connecting'].includes(next)&&controller)controller.abort();
-  if(objectUrl&&['connecting','offline','ended','interrupted'].includes(next)&&!reduce)void video.play().catch(()=>{});else video.pause();
+  if(objectUrl&&['connecting','offline','ended','interrupted','connection'].includes(next)&&!reduce)void video.play().catch(()=>{});else video.pause();
  },destroy(){closed=true;if(timer!==null)clearTimeout(timer);controller?.abort();video.pause();video.removeAttribute('src');video.load();if(objectUrl)URL.revokeObjectURL(objectUrl);}};
 }

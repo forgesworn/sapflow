@@ -1,4 +1,4 @@
-import { showConnection } from './connection.mjs';
+import { createConnectionMonitor } from './connection.mjs';
 import { createTestTone } from './tone.mjs';
 import {createControls} from './controls.mjs';
 import {createNetwork} from './network.mjs';
@@ -37,9 +37,9 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
   const on = (target, name, fn) => { target.addEventListener(name, fn); listeners.push(() => target.removeEventListener(name, fn)); };
   function show(state, message) {
     tone?.setEnabled(['idle','stopped','offline','ended'].includes(state));
-    if (standbyTitle) standbyTitle.textContent=({idle:'Ready',stopped:'You stopped watching',connecting:'Tuning in',offline:'OFF AIR',error:'Unavailable',ended:'Broadcast ended',paused:'Paused',interrupted:'Broadcast interrupted'})[state] ?? '';
+    if (standbyTitle) standbyTitle.textContent=({idle:'Ready',stopped:'You stopped watching',available:'Broadcast back on air',network:'Connection changed',connection:'Connection interrupted',connecting:'Tuning in',offline:'OFF AIR',error:'Unavailable',ended:'Broadcast ended',paused:'Paused',interrupted:'Broadcast interrupted'})[state] ?? '';
     indicator.dataset.state = state;
-    indicator.textContent = ({ idle: 'Ready',stopped:'Stopped', connecting: 'Connecting', offline: 'Off air', playing: 'Live', buffering: 'Buffering', error: 'Unavailable', ended:'Ended', paused:'Paused',interrupted:'Reconnecting' })[state];
+    indicator.textContent = ({ idle: 'Ready',stopped:'Stopped',available:'On air',network:'Connection changed',connection:'Connection interrupted', connecting: 'Connecting', offline: 'Off air', playing: 'Live', buffering: 'Buffering', error: 'Unavailable', ended:'Ended', paused:'Paused',interrupted:'Reconnecting' })[state];
     status.textContent = message;
     placeholder.hidden = ['playing','buffering','paused'].includes(state);
     if (state !== 'connecting') placeholder.dataset.kind = 'standby';
@@ -165,20 +165,21 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
     startupTimer = null; delay = 1000;userPaused=false;
     show('playing', 'You’re watching live.');
   });
-  on(video, 'waiting', () => { if(watching&&draining){updateInfo();return;}if (watching && !userPaused && video.readyState > 0) show(channelState==='reconnecting'?'interrupted':'buffering',channelState==='reconnecting'?'No new video is arriving. Waiting for the broadcaster to return or the receiver to confirm the end.':'Catching up with the broadcast…'); });
+  on(video, 'waiting', () => { if(watching&&draining){updateInfo();return;}if (watching && !userPaused && video.readyState > 0) show(channelState==='reconnecting'?'interrupted':channelState==='unknown'?'connection':'buffering',channelState==='reconnecting'?'No new video is arriving. Waiting for the broadcaster to return or the receiver to confirm the end.':channelState==='unknown'?'Your connection to the receiver was interrupted. Retrying.':'Catching up with the broadcast…'); });
   on(video, 'error', () => { if (watching && video.currentSrc) recover(generation,'Browser media decode error'); });
   on(video, 'pause', () => {if(watching&&video.readyState>0&&!video.ended&&['playing','buffering'].includes(indicator.dataset.state)){userPaused=true;show('paused','Paused. Press play to continue.');}});
   on(video, 'ended', () => { if(watching)finishEnded(); });
-  return { stop, togglePlayback, get watching(){return watching;}, setChannelState(value){channelState=value;if(value==='reconnecting'&&watching&&['buffering','offline'].includes(indicator.dataset.state))show('interrupted','No new video is arriving. Waiting for the broadcaster to return or the receiver to confirm the end.');if(value==='ended'){if(watching)drainEnded();else show('ended','The broadcast has ended. Come back for the next programme.');}else if(!watching&&indicator.dataset.state==='ended'&&value==='live')show('idle','A new broadcast is live. Press play to tune in.');}, destroy() { stop(); stopped = true; tone?.destroy(); for (const remove of listeners) remove(); } };
+  return { stop, togglePlayback, networkChanged(){
+    if(peerSession||peers?.checked){stop();if(peers)peers.checked=false;peerInfo('Peer assistance switched off after a network address change. Check your VPN before enabling it again.');show('network','Your visible network address changed. Peer assistance is off. Check your VPN, then press play to rejoin.');}
+  }, get watching(){return watching;}, setChannelState(value){channelState=value;if(value==='unknown'&&watching&&indicator.dataset.state==='interrupted')show('connection','Your connection to the receiver was interrupted. Checking channel status again.');if(value==='reconnecting'&&watching&&['buffering','offline'].includes(indicator.dataset.state))show('interrupted','No new video is arriving. Waiting for the broadcaster to return or the receiver to confirm the end.');if(value==='ended'){if(watching)drainEnded();else show('ended','The broadcast has ended. Come back for the next programme.');}else if(!watching&&indicator.dataset.state==='ended'&&value==='live')show('available','The broadcast is back on air. Press play to tune in.');}, destroy() { stop(); stopped = true; tone?.destroy(); for (const remove of listeners) remove(); } };
 }
 
 if (typeof document !== 'undefined') {
-  void showConnection(document,location);
   const get=id=>document.querySelector('#'+id),video=get('video'),network=createNetwork(document),ident=createIdent(get('loading-ident'));
   let player,controls,recoveries=0;
   const audience=createAudience({onSnapshot(data){
     get('audience-count').textContent=data?String(data.activePlayers):'—';get('audience-peers').textContent=data?String(data.peerEnabledPlayers):'—';
-    if(!data)return;
+    if(!data){get('channel-state').textContent='Channel status unavailable';get('channel-state').dataset.state='unknown';player?.setChannelState('unknown');return;}
     const channel=data.channel?.state;get('channel-state').textContent=({live:'On air',offair:'Off air',reconnecting:'Reconnecting',ended:'Broadcast ended'})[channel]??'Checking channel';
     get('channel-state').dataset.state=channel??'unknown';player?.setChannelState(channel);
     get('player-update').hidden=!data.playerVersion||data.playerVersion===PLAYER_VERSION;
@@ -189,8 +190,9 @@ if (typeof document !== 'undefined') {
     onMetrics:(metrics,enabled)=>network.update(metrics,enabled),
     onRecovery(reason){get('last-recovery').textContent=reason;get('recovery-count').textContent=String(++recoveries);},
     onInfo({ahead,latency,watching}){get('buffer-fill').style.width=Math.min(100,ahead/20*100)+'%';get('playback-health').textContent=watching?ahead.toFixed(1)+'s buffered':'No media loaded';get('playback-position').textContent=watching?(latency>0?latency.toFixed(0)+'s behind live':'Live programme'):'Ready to tune in';get('quality-summary').textContent=video.getVideoPlaybackQuality?String(video.getVideoPlaybackQuality().droppedVideoFrames)+' dropped frames':'Not reported';},
-    onState(state,presence){controls?.setState(state);ident.setState(state);audience.set(presence);get('standby-description').textContent=({connecting:'Preparing your picture. The stream starts when enough video is ready.',offline:'Waiting for the broadcaster to reconnect.',interrupted:'No new video is arriving. Waiting for reconnection or confirmation that the broadcast has ended.',ended:'Thanks for watching. Join us for the next broadcast.',idle:'Your front row to the live channel.',stopped:'Press play to rejoin the broadcast.'})[state]??'';}
+    onState(state,presence){controls?.setState(state);ident.setState(state);audience.set(presence);get('standby-description').textContent=({connecting:'Preparing your picture. The stream starts when enough video is ready.',offline:'Waiting for the broadcaster to reconnect.',interrupted:'No new video is arriving. Waiting for reconnection or confirmation that the broadcast has ended.',ended:'Thanks for watching. Join us for the next broadcast.',idle:'Your front row to the live channel.',available:'A new broadcast is live. Press play to tune in.',connection:'Reconnecting to the receiver. Channel status is being checked.',network:'Check your VPN before rejoining. Peer assistance has been switched off.',stopped:'Press play to rejoin the broadcast.'})[state]??'';}
   });
   controls=createControls({video,screen:get('screen'),onToggle:()=>player.togglePlayback()});controls.setState('idle');ident.setState('idle');network.reset();audience.refresh();
-  addEventListener('pagehide',()=>{audience.destroy();player.destroy();controls.destroy();ident.destroy();},{once:true});
+  const connection=createConnectionMonitor({document,location,onAddressChange:()=>player.networkChanged()});
+  addEventListener('pagehide',()=>{connection.destroy();audience.destroy();player.destroy();controls.destroy();ident.destroy();},{once:true});
 }

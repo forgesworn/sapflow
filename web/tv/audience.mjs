@@ -11,8 +11,8 @@ export function createAudience({location=globalThis.location,fetchImpl=fetch,onS
    const r=await fetchImpl('/tv/audience',options);if(!r.ok)throw Error('Unavailable');const data=await r.json();if(!closed)onSnapshot(data);
   }catch{if(!closed)onSnapshot(null);}
  }
- function later(){if(timer!==null)cancel(timer);timer=null;if(watching&&!closed)timer=schedule(async()=>{timer=null;await request(true);later();},10000);}
- return {refresh(){if(!closed)void request(false);},set({watching:nextWatching,active:nextActive,peers:nextPeers}){
+ function later(){if(timer!==null)cancel(timer);timer=null;if(!closed)timer=schedule(async()=>{timer=null;await request(watching);later();},10000);}
+ return {refresh(){if(!closed)void request(false).then(later);},set({watching:nextWatching,active:nextActive,peers:nextPeers}){
   if(closed)return;
   const changed=watching!==nextWatching||active!==nextActive||peers!==nextPeers;watching=nextWatching;active=nextActive;peers=nextPeers;
   if(changed){void request(true);later();}

@@ -39,10 +39,15 @@ once eight seconds are decoded while the remaining headroom is fetched; ordinary
 track changes do not reload the player. A waiting decoder may
 nudge across at most two seconds of already-buffered empty time, only at the end
 of the preceding range; it never jumps directly over the older programme to a
-newer buffered range. Transient playlist 404/429/503 responses retry at most twice
-within the same ten-second request budget, and Stop cancels the backoff. It cannot recover
+newer buffered range. Transient playlist 404/429/503 responses and network errors use at most four
+retries within the same ten-second request budget, and Stop cancels the backoff. It cannot recover
 quality already lost during preparation or compensate for an upload that stays
 slower than the encoded programme bitrate.
+
+Whole-fragment network errors and HTTP 429/503 use the same bounded retry policy
+within a fifteen-second transfer deadline. A route change can recover using
+complete fragments without destroying the MediaSource or buffered picture.
+Forbidden responses and oversized data are not retried.
 
 The stream/privacy panel reports media dimensions, advertised bitrate/codecs,
 buffered video and estimated distance behind the receiver. It identifies
@@ -72,7 +77,17 @@ Deploy `edge/tv-connection.mjs` on the two exact routes `/tv/` and
 `/tv/connection`. The page route injects an escaped metadata receipt from the
 actual navigation, so a later credential-free diagnostic request cannot conceal
 cookies or authentication sent on navigation. Both responses bypass edge/browser
-caching. The application makes no separate lookup and keeps no IP/location
+caching. After the initial navigation receipt, the public page checks the current
+connection every fifteen seconds, on network/visibility events and on request.
+The panel timestamps the observation and warns when the visible IP changes.
+Existing same-origin cookies accompany those diagnostic requests; only their
+names and authentication presence are reflected. An address change closes
+active peer assistance and asks for a fresh watch decision. This detection
+happens after a request, so it cannot replace a VPN kill switch or prevent
+the first exposure of a new viewing address. Private preview never runs these
+external address checks.
+
+The application makes no separate lookup and keeps no IP/location
 history. This does not describe the platform's security logs. Missing fields
 show unavailable and do not affect playback. Private preview skips these routes.
 
@@ -99,7 +114,9 @@ A channel that has never published shows off air. A stalled or temporarily
 unreachable source shows reconnecting. Once buffered video is exhausted, a
 **Broadcast interrupted** card replaces the generic buffering indicator. A
 reconnected publisher resumes playback; this is distinct from a confirmed end. An explicit HLS end marker, or removal
-of a previously live upstream stream for at least two seconds, confirms the broadcast has ended. The
+of a previously live upstream stream for at least two seconds, confirms the broadcast has ended. Read-only channel checks continue after the viewer stops or a broadcast ends.
+If the broadcaster returns, the player announces **Broadcast back on air**
+without autoplaying; Play explicitly rejoins. The
 player drains buffered video before displaying **Broadcast ended**, closes peer
 connections and stops retrying. A later broadcast requires another press of play.
 The receiver's reconnect grace must cover expected publisher interruptions;

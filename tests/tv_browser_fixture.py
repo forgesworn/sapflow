@@ -96,7 +96,7 @@ def main():
                 class FixtureTransport:
                     def fetch(self,target):
                         if target=='/tv/audience':
-                            return 200,b'{"activePlayers":2,"peerEnabledPlayers":1,"updatedAt":1,"ttlSeconds":35,"playerVersion":"2026.10.27.5","channel":{"state":"live","startedAt":1,"endedAt":null,"lastMediaAgeSeconds":0}}', 'application/json'
+                            return 200,b'{"activePlayers":2,"peerEnabledPlayers":1,"updatedAt":1,"ttlSeconds":35,"playerVersion":"2026.10.27.6","channel":{"state":"live","startedAt":1,"endedAt":null,"lastMediaAgeSeconds":0}}', 'application/json'
                         return fixture_fetch(target)
                 server.assets=ROOT/'web/tv';server.transport=FixtureTransport()
                 server.slots=threading.BoundedSemaphore(4)
@@ -104,6 +104,7 @@ def main():
                 subprocess.run(['node',str(ROOT/'tests/tv-player-browser.mjs'),f'http://127.0.0.1:{server.server_port}/tv/',
                                 str(output/'chromium'),'20','chrome'],check=True,timeout=150,
                                env=dict(os.environ,SAPFLOW_TV_TEST_CUTS='1'))
+                subprocess.run(['node',str(ROOT/'tests/tv-network-browser.mjs'),f'http://127.0.0.1:{server.server_port}/tv/'],check=True,timeout=180)
             finally:
                 if server:
                     server.shutdown();server.server_close();worker.join(timeout=5)

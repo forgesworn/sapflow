@@ -30,11 +30,11 @@ test('private preview only reads aggregates through its local proxy',async()=>{
  client.refresh();client.set({watching:true,active:true,peers:false});await settle();client.destroy();
  assert(calls.length>=1);assert(calls.every(c=>c.url==='/tv/audience'&&!c.options.method&&!c.options.body));assert.equal(snapshots.at(-1).activePlayers,3);
 });
-test('public presence uses a temporary page identifier, unregisters pause and stops polling',async()=>{
+test('public presence uses a temporary page identifier, unregisters pause and keeps only read-only channel checks',async()=>{
  const calls=[],timers=new Map();let n=0;const client=createAudience({location:new URL('https://receiver.example/tv/'),fetchImpl:async(url,options)=>{calls.push(options);return {ok:true,json:async()=>({})};},schedule:fn=>{timers.set(++n,fn);return n;},cancel:id=>timers.delete(id)});
  client.set({watching:true,active:true,peers:true});await settle();client.set({watching:true,active:false,peers:true});await settle();
- client.set({watching:false,active:false,peers:false});await settle();assert.equal(timers.size,0);client.destroy();
- const data=calls.map(o=>JSON.parse(o.body));assert.equal(data[0].active,true);assert.equal(data[1].active,false);assert.match(data[0].id,/^[a-f0-9]{32}$/);assert(data.every(p=>p.id===data[0].id));assert(calls.every(o=>o.credentials==='omit'));
+ client.set({watching:false,active:false,peers:false});await settle();assert.equal(timers.size,1);const [timerId,callback]=[...timers][0];timers.delete(timerId);await callback();await settle();assert.equal(calls.at(-1).method,undefined);client.destroy();assert.equal(timers.size,0);
+ const data=calls.filter(o=>o.body).map(o=>JSON.parse(o.body));assert.equal(data[0].active,true);assert.equal(data[1].active,false);assert.match(data[0].id,/^[a-f0-9]{32}$/);assert(data.every(p=>p.id===data[0].id));assert(calls.every(o=>o.credentials==='omit'));
 });
 
 test('lifecycle control is authenticated, scoped to the latest session and bounded',()=>{

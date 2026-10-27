@@ -2,12 +2,25 @@
 import {parseMaster,parseMedia} from './playlist.mjs';
 
 export async function boundedBytes(response,limit) {
-  if(!response.ok)throw Error(`Media HTTP ${response.status}`);
+  if(!response.ok)throw Object.assign(Error(`Media HTTP ${response.status}`),{status:response.status});
   const reader=response.body.getReader(),chunks=[];let size=0;
   try {while(true){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit)throw Error('Media byte budget exceeded');chunks.push(value);}}
   catch(error){await reader.cancel().catch(()=>{});throw error;}
   finally {reader.releaseLock();}
   const output=new Uint8Array(size);let offset=0;for(const chunk of chunks){output.set(chunk,offset);offset+=chunk.length;}return output;
+}
+// Retry complete reads after a route change; never append partial media.
+async function retryBytes(url,{signal,limit,retry404=false,onAttempt=()=>{},onResponse=()=>{}}){
+ for(let attempt=0;attempt<5;attempt++){
+  signal.throwIfAborted();onAttempt(attempt);
+  try{const response=await fetch(url,{signal,redirect:'error',cache:'no-store',credentials:'omit'});onResponse(response);
+   if(!response.ok){await response.body?.cancel();throw Object.assign(Error(`Media HTTP ${response.status}`),{status:response.status});}
+   return await boundedBytes(response,limit);
+  }catch(error){
+   if(signal.aborted||attempt===4||!(error instanceof TypeError||[429,503,...(retry404?[404]:[])].includes(error.status)))throw error;
+   await new Promise(resolve=>{const done=()=>{clearTimeout(timer);signal.removeEventListener('abort',done);resolve();};const timer=setTimeout(done,[500,1500,3000,5000][attempt]);signal.addEventListener('abort',done,{once:true});if(signal.aborted)done();});
+  }
+ }
 }
 export function channelUrl(value,base) {
   const url=new URL(value,base);
@@ -25,10 +38,11 @@ export class FetchLoader {
   load(context,config,callbacks) {
     this.context=context;const controller=new AbortController();this.controller=controller;this.stats.aborted=false;const started=performance.now();this.stats.loading.start=started;
     const timer=setTimeout(()=>controller.abort(),config?.timeout??15000);
-    fetch(context.url,{signal:controller.signal,redirect:'error',cache:'no-store',credentials:'omit'}).then(async response=>{
-      this.stats.loading.first=performance.now();const data=await boundedBytes(response,8*1024*1024);this.stats.loading.end=performance.now();this.stats.loaded=this.stats.total=data.byteLength;
+    let received;
+    retryBytes(context.url,{signal:controller.signal,limit:8*1024*1024,onAttempt:attempt=>{this.stats.retry=attempt;},onResponse:response=>{received=response;this.stats.loading.first=performance.now();}}).then(data=>{
+      this.stats.loading.end=performance.now();this.stats.loaded=this.stats.total=data.byteLength;
       this.stats.bwEstimate=data.byteLength*8000/Math.max(1,this.stats.loading.end-started);
-      if(this.controller===controller&&!this.stats.aborted)callbacks.onSuccess({url:context.url,data:data.buffer},this.stats,context,{getResponseHeader:name=>response.headers.get(name)});
+      if(this.controller===controller&&!this.stats.aborted)callbacks.onSuccess({url:context.url,data:data.buffer},this.stats,context,{getResponseHeader:name=>received.headers.get(name)});
     }).catch(error=>{if(this.controller===controller&&!this.stats.aborted)callbacks.onError({code:0,text:error.message},context,null,this.stats);}).finally(()=>clearTimeout(timer));
   }
   abort(){if(!this.stats.loading.end)this.stats.aborted=true;this.controller?.abort();}
@@ -61,16 +75,7 @@ export default class CmafPlayer {
   get latency(){return this.offset===null||this.edge===null?0:Math.max(0,this.offset+this.edge-this.media.currentTime);}
   async text(url){
     const signal=AbortSignal.any([this.controller.signal,AbortSignal.timeout(10000)]);
-    for(let attempt=0;attempt<3;attempt++){
-      signal.throwIfAborted();
-      const response=await fetch(url,{signal,redirect:'error',cache:'no-store',credentials:'omit'});
-      if([404,429,503].includes(response.status)&&attempt<2){
-        await response.body?.cancel();
-        await new Promise(resolve=>{const done=()=>{clearTimeout(timer);signal.removeEventListener('abort',done);resolve();};const timer=setTimeout(done,200*(attempt+1));signal.addEventListener('abort',done,{once:true});if(signal.aborted)done();});
-        continue;
-      }
-      return new TextDecoder('ascii',{fatal:true}).decode(await boundedBytes(response,65536));
-    }
+    return new TextDecoder('ascii',{fatal:true}).decode(await retryBytes(url,{signal,limit:65536,retry404:true}));
   }
   begin(){if(this.started||!this.media||!this.url)return;this.started=true;void this.run().catch(error=>{if(!this.controller.signal.aborted)this.trigger(CmafPlayer.Events.ERROR,{fatal:true,details:error.message});});}
   async append(bytes){if(this.buffer.updating)await waitEvent(this.buffer,'updateend',this.controller.signal);await waitEvent(this.buffer,'updateend',this.controller.signal,()=>this.buffer.appendBuffer(bytes));}

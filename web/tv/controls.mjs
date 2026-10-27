@@ -6,7 +6,7 @@ export function createControls({video,screen,onToggle}){
   const playing=!video.paused&&!video.ended;play.dataset.playing=String(playing);play.setAttribute('aria-label',playing?'Pause':'Play');
   play.disabled=state==='connecting';screen.dataset.paused=String(video.paused&&video.readyState>0);
   overlay.setAttribute('aria-label',video.readyState>0?'Resume playback':'Watch live');
-  overlay.hidden=playing||['connecting','buffering','offline','ended','interrupted'].includes(state);
+  overlay.hidden=playing||['connecting','buffering','offline','ended','interrupted','connection'].includes(state);
   mute.dataset.muted=String(video.muted||video.volume===0);mute.setAttribute('aria-label',video.muted?'Unmute':'Mute');mute.setAttribute('aria-pressed',String(video.muted));volume.value=String(video.muted?0:video.volume);
   full.setAttribute('aria-label',document.fullscreenElement?'Exit fullscreen':'Enter fullscreen');
  }
