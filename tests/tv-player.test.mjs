@@ -183,3 +183,5 @@ test('an unavailable status request cannot keep blaming the broadcaster for a vi
  const s=setup();s.watch.click();await settle();s.video.readyState=2;s.video.dispatchEvent(new Event('playing'));s.player.setChannelState('reconnecting');s.video.dispatchEvent(new Event('waiting'));assert.equal(s.indicator.dataset.state,'interrupted');
  s.player.setChannelState('unknown');assert.equal(s.indicator.dataset.state,'connection');assert.match(s.status.textContent,/connection to the receiver/);s.player.destroy();
 });
+
+test('an older receiver bundle does not falsely advertise a newer player',async()=>{const {newerPlayerVersion,PLAYER_VERSION}=await import('../web/tv/version.mjs');assert.equal(newerPlayerVersion(PLAYER_VERSION),false);assert.equal(newerPlayerVersion('2026.10.27.5'),false);assert.equal(newerPlayerVersion('2026.10.27.10'),true);assert.equal(newerPlayerVersion('unknown'),false);});

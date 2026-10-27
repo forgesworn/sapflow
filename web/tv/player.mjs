@@ -4,7 +4,7 @@ import {createControls} from './controls.mjs';
 import {createNetwork} from './network.mjs';
 import {createAudience} from './audience.mjs';
 import {createIdent} from './ident.mjs';
-import {PLAYER_VERSION} from './version.mjs';
+import {PLAYER_VERSION,newerPlayerVersion} from './version.mjs';
 const STREAM = '/tv/live/event-tv/index.m3u8';
 
 /** Origin playback with explicit, viewer-only peer assistance. */
@@ -182,7 +182,7 @@ if (typeof document !== 'undefined') {
     if(!data){get('channel-state').textContent='Channel status unavailable';get('channel-state').dataset.state='unknown';player?.setChannelState('unknown');return;}
     const channel=data.channel?.state;get('channel-state').textContent=({live:'On air',offair:'Off air',reconnecting:'Reconnecting',ended:'Broadcast ended'})[channel]??'Checking channel';
     get('channel-state').dataset.state=channel??'unknown';player?.setChannelState(channel);
-    get('player-update').hidden=!data.playerVersion||data.playerVersion===PLAYER_VERSION;
+    get('player-update').hidden=!newerPlayerVersion(data.playerVersion);
   }});
   get('player-version').textContent='Sapflow '+PLAYER_VERSION;
   player = createTvPlayer({video,watch:get('watch'),edge:get('live-edge'),status:get('status'),indicator:get('indicator'),placeholder:get('placeholder'),peers:get('peer-assist'),peerStatus:get('peer-status'),standbyTitle:get('standby-title'),tone:createTestTone(get('test-tone')),
