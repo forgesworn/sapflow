@@ -1,6 +1,6 @@
 // Receiver-side, single-channel RelaySwarm adapter. MIT.
 import {createServer} from 'node:http';
-import {mkdir,writeFile,rename,unlink,readFile,readdir} from 'node:fs/promises';
+import {mkdir,writeFile,rename,unlink,readFile,readdir,stat} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {WebSocketServer} from 'ws';
@@ -61,6 +61,12 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
   const identityDir=resolve(stateDir,'identity');await mkdir(identityDir,{mode:0o700,recursive:true});
   const identity=await loadPublisherState(resolve(identityDir,'publisher.json'),{manifest:'index.m3u8'});
   const audience=new Audience(),channel=new ChannelState(),control=new ChannelControl(controlToken,channel);
+  const lifecycleFile=resolve(stateDir,'channel-session.json');
+  if(control.token){try{if((await stat(lifecycleFile)).size>1024)throw Error('Lifecycle state budget');control.restore(JSON.parse(await readFile(lifecycleFile,'utf8')));}catch(error){if(error.code!=='ENOENT')throw Error('Private lifecycle state unavailable');}}
+  let lifecycleUpdate=Promise.resolve();
+  function updateLifecycle(value){const update=lifecycleUpdate.catch(()=>{}).then(async()=>{
+    control.update(value);const temporary=lifecycleFile+'.tmp';await writeFile(temporary,JSON.stringify(control.snapshot())+'\n',{mode:0o600});await rename(temporary,lifecycleFile);
+  });lifecycleUpdate=update;return update;}
   const controller=new AbortController(),cache=new Map(),presence=new Map();let publisher=null,fresh=0,closed=false,cacheBytes=0,active=0;
   async function get(name,limit){return bytes(await fetch(new URL(name,source),{redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(6000)])}),limit);}
   async function atomic(name,data){const temporary=resolve(mediaDir,`.${name}.tmp`);await writeFile(temporary,data,{mode:0o600});await rename(temporary,resolve(mediaDir,name));}
@@ -100,7 +106,8 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
         if(req.headers['content-type']!=='application/json'){reply(res,415,'JSON required');return;}
         let size=0;const chunks=[];
         for await(const chunk of req){size+=chunk.length;if(size>256)throw Object.assign(Error('Body budget'),{status:413});chunks.push(chunk);}
-        try{control.update(JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks))));}catch(error){if(!error.status)error.status=400;throw error;}
+        let message;try{message=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks)));}catch{throw Object.assign(Error('Invalid lifecycle JSON'),{status:400});}
+        await updateLifecycle(message);
         reply(res,200,JSON.stringify({accepted:true}));return;
       }
       if(url.pathname==='/tv/audience'&&!url.search){
@@ -158,7 +165,7 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
   });
   const heartbeat=setInterval(()=>{for(const ws of wss.clients){if(!ws.alive){ws.terminate();continue;}ws.alive=false;ws.ping();}for(const [key,value]of presence)if(Date.now()-value.at>60000)presence.delete(key);},30000);
   await new Promise((r,j)=>{server.once('error',j);server.listen(port,host,r);});
-  return {server,identity,async close(){closed=true;controller.abort();clearInterval(heartbeat);for(const ws of wss.clients)ws.terminate();wss.close();server.closeAllConnections();await new Promise(r=>server.close(r));await loop;}};
+  return {server,identity,async close(){closed=true;controller.abort();clearInterval(heartbeat);for(const ws of wss.clients)ws.terminate();wss.close();server.closeAllConnections();await new Promise(r=>server.close(r));await loop;await lifecycleUpdate.catch(()=>{});}};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){
   const tokenFile=process.env.TV_CHANNEL_CONTROL_TOKEN_FILE;const controlToken=tokenFile?(await readFile(tokenFile,'utf8')).trim():undefined;

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm,readFile} from 'node:fs/promises';
+import {mkdtemp,rm,readFile,stat} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createServer} from 'node:http';
@@ -28,7 +28,7 @@ test('receiver signs only mirrored playlist contexts and scopes its WebSocket',a
   upstream.listen(0,'127.0.0.1');await once(upstream,'listening');let receiver,ws;
   try {
     receiver=await startReceiver({stateDir:directory,upstream:`http://127.0.0.1:${upstream.address().port}/live/event-tv/`,origin:'https://receiver.example',port:0,controlToken:'a'.repeat(64)});
-    const base=`http://127.0.0.1:${receiver.server.address().port}`;let config;
+    let base=`http://127.0.0.1:${receiver.server.address().port}`;let config;
     for(let i=0;i<30;i++){const response=await fetch(base+'/tv/swarm/config');if(response.ok){config=await response.json();break;}await new Promise(r=>setTimeout(r,100));}
     assert(config?.swarmId);assert(!('secretKey' in config));
     const url=new URL('/tv/swarm/commitment',base);url.search=new URLSearchParams({path:`/media/${name}_seg10.mp4`,sequence:'10',discontinuity:'0',level:'0',playlist:'/media/stream.m3u8',mediaType:'main'});
@@ -51,9 +51,16 @@ test('receiver signs only mirrored playlist contexts and scopes its WebSocket',a
     assert.equal((await control(session,'b'.repeat(64))).status,403);assert.equal((await control(session)).status,200);
     assert.equal((await control({...session,action:'end'})).status,200);await new Promise(r=>setTimeout(r,600));
     assert.equal((await (await fetch(base+'/tv/audience')).json()).channel.state,'ended','a deliberate stop wins over retained playlist samples');
-    assert.equal((await control({...session,session:'b'.repeat(32),startedAt:Date.now()})).status,200);
+    assert.equal((await stat(join(directory,'channel-session.json'))).mode&0o777,0o600);
+    const second={...session,session:'b'.repeat(32),startedAt:Date.now()};assert.equal((await control(second)).status,200);
     assert.equal((await control({...session,action:'end'})).status,409,'late shutdown cannot end a newer session');
     assert.notEqual((await (await fetch(base+'/tv/audience')).json()).channel.state,'ended');
+    ws.terminate();ws=null;await receiver.close();
+    receiver=await startReceiver({stateDir:directory,upstream:`http://127.0.0.1:${upstream.address().port}/live/event-tv/`,origin:'https://receiver.example',port:0,controlToken:'a'.repeat(64)});base=`http://127.0.0.1:${receiver.server.address().port}`;
+    assert.equal((await control({...second,action:'end'})).status,200,'current publisher can end after a receiver-side restart');await receiver.close();
+    receiver=await startReceiver({stateDir:directory,upstream:`http://127.0.0.1:${upstream.address().port}/live/event-tv/`,origin:'https://receiver.example',port:0,controlToken:'a'.repeat(64)});base=`http://127.0.0.1:${receiver.server.address().port}`;
+    assert.equal((await (await fetch(base+'/tv/audience')).json()).channel.state,'ended','retained upstream media cannot revive a confirmed end after restart');
+    assert.equal((await control({...session,session:'c'.repeat(32),startedAt:Date.now()})).status,200);
     expiredFragment=true;await new Promise(r=>setTimeout(r,1200));
     assert.notEqual((await (await fetch(base+'/tv/audience')).json()).channel.state,'ended','an unavailable fragment cannot end the channel');
     removed=true;let ended=false;

@@ -254,7 +254,11 @@ The helper registers its random session after local media verification. It
 sends the end notice only for an intentional stop or a completed `--once` run;
 unexpected tunnel loss keeps the same session and reconnect policy. Both notices
 use the existing Tor SOCKS listener, remote DNS, verified HTTPS and no redirects
-or direct fallback. A new registration supersedes older sessions. Notices do not
+or direct fallback. A new registration supersedes older sessions. The receiver atomically retains
+only the current lifecycle nonce and end marker in a private 0600 state file,
+so restarting the adapter preserves the current publisher and a confirmed end.
+During upgrade, a first authenticated end can adopt the existing publisher
+session when no checkpoint exists; later mismatched sessions remain rejected. Notices do not
 appear in the viewer's metadata or aggregate audience response.
 
 An end notice stops the player's retry loop after its buffered tail plays out.

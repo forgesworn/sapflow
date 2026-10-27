@@ -16,7 +16,7 @@ export class Audience{
 export class ChannelState{
   constructor(now=Date.now){this.now=now;this.state='offair';this.everLive=false;this.lastMedia=null;this.lastMediaAt=0;this.startedAt=null;this.endedAt=null;this.missingSince=null;this.explicitEnd=false;}
   begin(){this.explicitEnd=false;this.endedAt=null;this.state=this.everLive?'reconnecting':'offair';}
-  end(){if(!this.explicitEnd)this.endedAt=this.now();this.explicitEnd=true;this.state='ended';}
+  end(at=this.now()){if(!this.explicitEnd)this.endedAt=at;this.explicitEnd=true;this.state='ended';}
   observe(parsed){if(this.explicitEnd)return;this.missingSince=null;const media=parsed.segments.filter(s=>!s.gap).at(-1);if(!media)return;
     const key=`${media.name}:${media.cc}`;
     if(key!==this.lastMedia){if(!this.everLive||this.state==='ended')this.startedAt=this.now();this.lastMedia=key;this.lastMediaAt=this.now();this.everLive=true;this.endedAt=null;this.state='live';}

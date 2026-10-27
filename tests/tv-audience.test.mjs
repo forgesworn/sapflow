@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {Audience,ChannelState,heartbeat} from '../tools/tv-relayswarm/audience.mjs';
-import {ChannelControl,controlMessage} from '../tools/tv-relayswarm/control.mjs';
+import {ChannelControl,controlMessage,storedControl} from '../tools/tv-relayswarm/control.mjs';
 import {createAudience} from '../web/tv/audience.mjs';
 const presence=(id='a',values={})=>({id:id.repeat(32),active:true,peers:false,version:'1',...values});
 const settle=()=>new Promise(r=>setImmediate(r));
@@ -46,4 +46,13 @@ test('lifecycle control is authenticated, scoped to the latest session and bound
  assert.throws(()=>control.update({...first,action:'end'}),/session/);assert.throws(()=>control.update(first),/Stale/);
  for(const message of [null,[],{}, {...second,ip:'198.51.100.1'},{...second,startedAt:true},{...second,action:'delete'}])assert.throws(()=>controlMessage(message));
  assert(!new ChannelControl(undefined,channel).authorised('Bearer '+'a'.repeat(64)));
+});
+
+test('receiver lifecycle state survives restart and supports pre-upgrade authenticated shutdown',()=>{
+ const channel=new ChannelState(()=>100),control=new ChannelControl('a'.repeat(64),channel,()=>100);
+ control.update({action:'end',session:'a'.repeat(32),startedAt:1});assert.equal(channel.snapshot().state,'ended');const saved=control.snapshot();
+ const nextChannel=new ChannelState(()=>200),next=new ChannelControl('a'.repeat(64),nextChannel,()=>200);next.restore(saved);assert.equal(nextChannel.snapshot().endedAt,100);
+ nextChannel.observe({segments:[{name:'retained',cc:0}],end:false});assert.equal(nextChannel.snapshot().state,'ended');
+ next.update({action:'start',session:'b'.repeat(32),startedAt:200});assert.notEqual(nextChannel.snapshot().state,'ended');assert.throws(()=>next.update({action:'end',session:'a'.repeat(32),startedAt:1}));
+ for(const bad of [null,[],{}, {...saved,ip:'198.51.100.1'},{...saved,endedAt:true}])assert.throws(()=>storedControl(bad));
 });
