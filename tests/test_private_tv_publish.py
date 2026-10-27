@@ -110,7 +110,7 @@ class Supervisor(unittest.TestCase):
                       "ForwardX11=no", "VerifyHostKeyDNS=no", "CanonicalizeHostname=no",
                       "IdentitiesOnly=yes", "PreferredAuthentications=publickey", "UpdateHostKeys=no"):
             self.assertIn(value, options)
-        self.assertIn("ProxyCommand=exec /usr/bin/nc -X 5 -x 127.0.0.1:9050 %h %p", options)
+        self.assertIn("ProxyCommand=/usr/bin/nc -X 5 -x 127.0.0.1:9050 %h %p", options)
         forward = next(c for c, _ in self.calls if "forward" in c)
         value = forward[forward.index("-L") + 1]
         self.assertRegex(value, r"^127\.0\.0\.1:[0-9]+:127\.0\.0\.1:1935$")

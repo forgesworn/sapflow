@@ -191,6 +191,9 @@ Use a separate caption workflow if captions are required.
 
 ## Evidence required before a real programme
 
+The [27 October bounded qualification](private-tv-qualification.md) records the
+M1-to-receiver Tor runs and their remaining acceptance gates.
+
 Local automated checks cover rejected public/malformed addresses, credential
 isolation, strict host pinning, loopback-only forwarding, tunnel failure and
 cleanup. Real FFmpeg checks inject synthetic tags/chapters/H.264 user data,

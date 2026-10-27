@@ -58,7 +58,9 @@ def ssh_command(args, control, ssh, nc):
     # No user/system SSH configuration, agent, environment forwarding, hostname
     # canonicalisation, DNS host-key lookup, shell login or reused SSH connection.
     # Netcat sends the onion name to SOCKS5; it never resolves it locally.
-    proxy = f"exec {shlex.quote(nc)} -X 5 -x 127.0.0.1:{args.socks_port} %h %p"
+    # OpenSSH prefixes the proxy command with exec itself. A second exec works
+    # in some shells but fails in dash, before any SOCKS connection is made.
+    proxy = f"{shlex.quote(nc)} -X 5 -x 127.0.0.1:{args.socks_port} %h %p"
     options = {
         "ProxyCommand": proxy,
         "BatchMode": "yes",

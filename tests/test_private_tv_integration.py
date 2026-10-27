@@ -4,15 +4,16 @@ Run with OpenSSH server, OpenBSD nc, FFmpeg/libx264/AAC and FFprobe installed.
 Every key and media byte is generated for the fixture and deleted afterwards.
 """
 
-import getpass
 import importlib.util
 import os
 from pathlib import Path
+import pwd
 import selectors
 import shutil
 import socket
 import socketserver
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -141,7 +142,10 @@ class PrivateRoute(unittest.TestCase):
             config.write_text(
                 f"Port {ssh_port}\nListenAddress 127.0.0.1\nHostKey {home}/host\n"
                 f"PidFile {home}/sshd.pid\nAuthorizedKeysFile {home}/authorised\n"
-                "UsePAM no\nUseDNS no\nStrictModes no\nPasswordAuthentication no\n"
+                # Linux hosted runners have locked password accounts. PAM
+                # account checks permit key auth without unlocking passwords.
+                f"UsePAM {'yes' if sys.platform.startswith('linux') else 'no'}\n"
+                "UseDNS no\nStrictModes no\nPasswordAuthentication no\n"
                 "KbdInteractiveAuthentication no\nAuthenticationMethods publickey\n"
                 "AllowAgentForwarding no\nX11Forwarding no\nPermitTTY no\n"
                 f"AllowTcpForwarding local\nPermitOpen 127.0.0.1:{forward_port}\nMaxSessions 0\n")
@@ -164,12 +168,22 @@ class PrivateRoute(unittest.TestCase):
                                             start_new_session=True)
                     await_listener(sshd, ssh_port)
                     command = ["python3", "-B", str(ROOT / "scripts/tv-private-publish.py"),
-                               "--onion-host", onion, "--ssh-user", getpass.getuser(),
+                               "--onion-host", onion, "--ssh-user", pwd.getpwuid(os.getuid()).pw_name,
                                "--identity-file", str(home / "client"), "--known-hosts", str(hosts),
                                "--socks-port", str(socks.server_address[1]), "--ingest-port", str(forward_port),
                                "--once", str(media)]
+                    # Keep client diagnostics in this generated fixture only.
+                    # No publisher credentials are passed to SSH by the supervisor.
+                    tools = home / "bin"
+                    tools.mkdir()
+                    ssh_client = tools / "ssh"
+                    ssh_client.write_text('#!/bin/sh\nexec "' + shutil.which("ssh")
+                                          + '" "$@" 2>>"$TV_FIXTURE_SSH_LOG"\n')
+                    ssh_client.chmod(0o755)
                     env = dict(os.environ, TV_PRIVATE_PUBLISH_PATH="live/event-fixture",
-                               TV_PUBLISH_URL="rtmp://forbidden.example/live/key")
+                               TV_PUBLISH_URL="rtmp://forbidden.example/live/key",
+                               PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                               TV_FIXTURE_SSH_LOG=str(home / "client.log"))
                     # A mismatched pin must fail before an RTMP listener exists.
                     hosts.write_text(onion + " " + (home / "wrong-host.pub").read_text())
                     refused = subprocess.run(command, env=env, capture_output=True, timeout=20)
@@ -185,7 +199,11 @@ class PrivateRoute(unittest.TestCase):
                             start_new_session=True)
                         await_listener(receiver, ingest_port)
                         sent = subprocess.run(command, env=env, capture_output=True, timeout=30)
-                        self.assertEqual(sent.returncode, 0, sent.stderr.decode() + log.name)
+                        log.flush()
+                        self.assertEqual(sent.returncode, 0,
+                                         sent.stderr.decode() + (home / "sshd.log").read_text()
+                                         + (home / "client.log").read_text()
+                                         + repr(socks.errors))
                         receiver.wait(timeout=10)
                     self.assertGreater(capture.stat().st_size, 1000)
                     decoded = subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", str(capture),
