@@ -11,7 +11,7 @@ const module=process.env.SAPFLOW_PLAYWRIGHT_MODULE;
 const { chromium, webkit }=await import(module ? pathToFileURL(module).href : 'playwright');
 let browser;
 const requests=[], errors=[], failures=[];
-let startupFailures=2, measuring=false, delayedFragment=false;
+let startupFailures=2, measuring=false, delayedFragment=false, transientManifest=false;
 try {
   browser=engine==='webkit' ? await webkit.launch({ headless:true }) : await chromium.launch({ channel:'chrome', headless:true,
     args:['--disable-background-networking','--disable-quic','--autoplay-policy=no-user-gesture-required'] });
@@ -23,6 +23,7 @@ try {
       if (target.pathname==='/tv/live/event-tv/index.m3u8' && startupFailures>0) {
         startupFailures--; return route.fulfill({status:404,body:'Off air'});
       }
+      if(measuring&&!transientManifest&&target.pathname.endsWith('/stream.m3u8')){transientManifest=true;return route.fulfill({status:503,body:'Transient mirror update'});}
       if (measuring && !delayedFragment && /_seg[0-9]+\.mp4$/.test(target.pathname)) {
         delayedFragment=true; await new Promise(resolve=>setTimeout(resolve,3000));
       }
@@ -95,6 +96,7 @@ try {
   while (Date.now()-started<seconds*1000) { await page.waitForTimeout(process.env.SAPFLOW_TV_TEST_CUTS==='1'?1000:5000); snapshots.push(await sample()); }
   const final=snapshots.at(-1);
   const stallSeconds=await page.evaluate(()=>window.__stall.seconds+(window.__stall.started===null?0:(performance.now()-window.__stall.started)/1000));
+  assert(transientManifest,'a transient playlist 503 was injected');
   assert(delayedFragment,'real media fetch was delayed for three seconds');
   assert(peakFragments>=2&&peakFragments<=4,'two to four complete fragments overlap, without exceeding the request bound');
   assert(stallSeconds<1,'buffer absorbs a three-second fragment delay');
@@ -113,7 +115,7 @@ try {
   assert.equal(errors.length,0,errors.join('\n')); assert.equal(failures.length,0);
   await page.setViewportSize({ width:390,height:844 }); await page.screenshot({ path:output+'-mobile.png', fullPage:true });
   await writeFile(output+'.json',JSON.stringify({ engine, wallSeconds:(Date.now()-started)/1000,initial,final,stopped,
-    snapshots,audio,stallSeconds,delayedFragment,peakFragments,offAirRecovered:startupFailures===0,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');
+    snapshots,audio,stallSeconds,delayedFragment,transientManifest,peakFragments,offAirRecovered:startupFailures===0,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');
   console.log(JSON.stringify({ engine,frames:final.frames-initial.frames,advance:final.time-initial.time,
     dimensions:[final.width,final.height],audioBytes:final.audioBytes,externalRequests:failures.length,stopVerified:true }));
 } catch (error) { console.error(error); throw error; }

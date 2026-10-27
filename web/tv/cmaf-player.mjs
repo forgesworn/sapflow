@@ -14,6 +14,12 @@ export function channelUrl(value,base) {
   if(url.origin!==new URL(base).origin||url.username||url.password||url.search||url.hash||!['/tv/live/event-tv/index.m3u8','/media/index.m3u8'].includes(url.pathname))throw Error('Untrusted channel URL');
   return url.href;
 }
+// Nudge at most two seconds of unbuffered time only when decoding is waiting.
+export function gapPosition(ranges,time,readyState,seeking=false) {
+  if(readyState>=3||seeking)return null;
+  for(let i=1;i<ranges.length;i++)if(time>=ranges.end(i-1)-.1&&time<ranges.start(i)&&ranges.start(i)-time<=2)return ranges.start(i)+.001;
+  return null;
+}
 export class FetchLoader {
   constructor(){this.stats={aborted:false,loaded:0,total:0,retry:0,chunkCount:0,bwEstimate:0,loading:{start:0,first:0,end:0},parsing:{start:0,end:0},buffering:{start:0,first:0,end:0}};this.controller=null;}
   load(context,config,callbacks) {
@@ -43,16 +49,29 @@ export default class CmafPlayer {
   constructor(config={}) {
     this.config={loader:FetchLoader,fLoader:undefined,progressive:false,liveSyncDuration:10,...config};
     this.listeners=new Map();this.controller=new AbortController();this.media=null;this.source=null;this.buffer=null;this.objectUrl=null;this.url=null;
-    this.levels=[];this.currentLevel=this.loadLevel=0;this.latestLevelDetails=null;this.offset=null;this.edge=null;this.positions=new Map();this.initialised=false;this.started=false;this.loaders=new Set();
+    this.levels=[];this.currentLevel=this.loadLevel=0;this.latestLevelDetails=null;this.offset=null;this.edge=null;this.positions=new Map();this.initialised=false;this.started=false;this.loaders=new Set();this.onWaiting=()=>this.nudgeGap();
   }
   on(name,callback){if(!this.listeners.has(name))this.listeners.set(name,new Set());this.listeners.get(name).add(callback);}
   off(name,callback){this.listeners.get(name)?.delete(callback);}
   trigger(name,data){for(const callback of this.listeners.get(name)??[])callback(name,data);}
   loadSource(url){this.url=channelUrl(url,location.href);this.begin();}
-  attachMedia(media){this.media=media;this.begin();}
+  attachMedia(media){this.media?.removeEventListener('waiting',this.onWaiting);this.media=media;media.addEventListener('waiting',this.onWaiting);this.begin();}
+  nudgeGap(){if(!this.initialised||this.controller.signal.aborted)return;const position=gapPosition(this.media.buffered,this.media.currentTime,this.media.readyState,this.media.seeking);if(position!==null)this.media.currentTime=position;}
   get liveSyncPosition(){return this.offset===null||this.edge===null?NaN:this.offset+this.edge-this.config.liveSyncDuration;}
   get latency(){return this.offset===null||this.edge===null?0:Math.max(0,this.offset+this.edge-this.media.currentTime);}
-  async text(url){const response=await fetch(url,{signal:AbortSignal.any([this.controller.signal,AbortSignal.timeout(10000)]),redirect:'error',cache:'no-store',credentials:'omit'});return new TextDecoder('ascii',{fatal:true}).decode(await boundedBytes(response,65536));}
+  async text(url){
+    const signal=AbortSignal.any([this.controller.signal,AbortSignal.timeout(10000)]);
+    for(let attempt=0;attempt<3;attempt++){
+      signal.throwIfAborted();
+      const response=await fetch(url,{signal,redirect:'error',cache:'no-store',credentials:'omit'});
+      if([404,429,503].includes(response.status)&&attempt<2){
+        await response.body?.cancel();
+        await new Promise(resolve=>{const done=()=>{clearTimeout(timer);signal.removeEventListener('abort',done);resolve();};const timer=setTimeout(done,200*(attempt+1));signal.addEventListener('abort',done,{once:true});if(signal.aborted)done();});
+        continue;
+      }
+      return new TextDecoder('ascii',{fatal:true}).decode(await boundedBytes(response,65536));
+    }
+  }
   begin(){if(this.started||!this.media||!this.url)return;this.started=true;void this.run().catch(error=>{if(!this.controller.signal.aborted)this.trigger(CmafPlayer.Events.ERROR,{fatal:true,details:error.message});});}
   async append(bytes){if(this.buffer.updating)await waitEvent(this.buffer,'updateend',this.controller.signal);await waitEvent(this.buffer,'updateend',this.controller.signal,()=>this.buffer.appendBuffer(bytes));}
   async download(record,playlistUrl,initialisation=false) {
@@ -70,7 +89,7 @@ export default class CmafPlayer {
     return {frag,loader,...response};
   }
   async appendDownloaded({frag,loader,data,stats}) {
-    try{await this.append(data);stats.buffering.end=performance.now();this.trigger(CmafPlayer.Events.FRAG_BUFFERED,{frag,stats});}
+    try{await this.append(data);this.nudgeGap();stats.buffering.end=performance.now();this.trigger(CmafPlayer.Events.FRAG_BUFFERED,{frag,stats});}
     finally{loader.destroy();this.loaders.delete(loader);}
   }
   async run() {
@@ -103,7 +122,7 @@ export default class CmafPlayer {
         // Hide Tor round trips behind at most four complete-fragment transfers.
         // Native appends remain ordered; no fragment crosses an init epoch.
         const batch=[];
-        while(index<segments.length&&batch.length<4&&!segments[index].gap&&segments[index].init===lastInit)batch.push(segments[index++]);
+        while(index<segments.length&&batch.length<4&&!segments[index].gap&&segments[index].init===lastInit&&segments[index].cc===segment.cc)batch.push(segments[index++]);
         const downloaded=batch.map(item=>this.download(item,playlistUrl).then(value=>({value}),error=>({error})));
         for(let item=0;item<batch.length;item++) {
           const segment=batch[item];next=segment.sn+1;
@@ -116,7 +135,7 @@ export default class CmafPlayer {
               this.initialised=true;this.media.currentTime=Math.max(start,Math.min(this.liveSyncPosition,end-.1));
               this.trigger(CmafPlayer.Events.MANIFEST_PARSED,{levels:this.levels});
             }
-            if(this.initialised&&this.media.currentTime<start-.1)this.media.currentTime=start;
+            if(this.initialised&&this.media.currentTime<ranges.start(0)-.1)this.media.currentTime=ranges.start(0);
             if(this.initialised&&this.liveSyncPosition-this.media.currentTime>12)this.media.currentTime=Math.max(start,this.liveSyncPosition);
             this.source.setLiveSeekableRange(ranges.start(0),Math.max(end,this.offset+this.edge));
             const keep=this.media.currentTime-15;
@@ -128,5 +147,5 @@ export default class CmafPlayer {
       await new Promise(resolve=>{const timer=setTimeout(done,500);const signal=this.controller.signal;function done(){clearTimeout(timer);signal.removeEventListener('abort',done);resolve();}signal.addEventListener('abort',done,{once:true});});
     }
   }
-  destroy(){this.controller.abort();for(const loader of this.loaders)loader.destroy();this.loaders.clear();try{if(this.buffer?.updating)this.buffer.abort();}catch{}if(this.objectUrl){if(this.media?.getAttribute('src')===this.objectUrl){this.media.pause();this.media.removeAttribute('src');this.media.load();}URL.revokeObjectURL(this.objectUrl);}this.listeners.clear();}
+  destroy(){this.media?.removeEventListener('waiting',this.onWaiting);this.controller.abort();for(const loader of this.loaders)loader.destroy();this.loaders.clear();try{if(this.buffer?.updating)this.buffer.abort();}catch{}if(this.objectUrl){if(this.media?.getAttribute('src')===this.objectUrl){this.media.pause();this.media.removeAttribute('src');this.media.load();}URL.revokeObjectURL(this.objectUrl);}this.listeners.clear();}
 }

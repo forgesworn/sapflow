@@ -72,3 +72,21 @@ browser gate asserts two to four overlapping requests, and a separate lifecycle
 regression requires Stop to abort all four loaders. This transport correction's
 full Mac-loop and hosted receipts belong to the delivered PR; the earlier public
 result alone did not qualify the private Tor preview.
+
+
+The full publishing-Mac Chrome run through the trusted Tor preview presented
+20,263 frames over 810.58 media seconds, with zero dropped frames or waiting
+events and zero external page requests or peer attempts. A later public run
+caught a real publishing-tunnel outage of about a minute. The receiver's old
+15-second trial reconnect grace expired before the publisher returned; its
+operational setting is now the normal 90 seconds. This keeps the channel's
+identity across a return but cannot manufacture video while the upload is down.
+
+Forced reconnect testing also found an early seek to the newest buffered range
+and small AAC holes at a timestamp boundary. The player now preserves the older
+range and nudges only a waiting decoder over a bounded empty interval. The
+browser regression records every requested seek and rejects skipped buffered
+programme beyond the 100 ms recovery tolerance, then verifies continued playback
+when the serving peer leaves. A transient playlist 503 is injected separately
+and must not reset decoding. These checks distinguish ordinary track continuity,
+client recovery and actual upstream network availability.

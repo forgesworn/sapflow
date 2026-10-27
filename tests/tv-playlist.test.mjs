@@ -46,3 +46,25 @@ test('Stop aborts all concurrent fragment transfers and releases their loaders',
  assert.equal(loaders.length,4);engine.destroy();const results=await Promise.allSettled(pending);
  assert(results.every(r=>r.status==='rejected'));assert(loaders.every(l=>l.aborted&&l.destroyed));assert.equal(engine.loaders.size,0);
 });
+
+
+test('gap recovery keeps old buffered programme and only nudges a bounded stalled hole',async()=>{
+ const {gapPosition}=await import('../web/tv/cmaf-player.mjs');
+ const ranges={length:2,start:i=>[0,10.03][i],end:i=>[10,20][i]};
+ assert.equal(gapPosition(ranges,5,2),null);assert.equal(gapPosition(ranges,9.99,4),null);
+ assert.equal(gapPosition(ranges,10,2,true),null);assert(Math.abs(gapPosition(ranges,10,2)-10.031)<.00001);
+ const splice={length:2,start:i=>[0,10.356][i],end:i=>[10,20][i]};assert(Math.abs(gapPosition(splice,10,2)-10.357)<.00001);
+ const distant={length:2,start:i=>[0,15][i],end:i=>[10,20][i]};assert.equal(gapPosition(distant,10,2),null);
+});
+
+
+test('a transient playlist update retries within the existing request budget',async()=>{
+ const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const engine=new Engine();
+ globalThis.fetch=async()=>++calls===1?new Response('Busy',{status:503}):new Response(master);
+ try{assert.equal(await engine.text('http://127.0.0.1/media/index.m3u8'),master);assert.equal(calls,2);}finally{engine.destroy();globalThis.fetch=original;}
+});
+test('Stop during playlist backoff prevents another request',async()=>{
+ const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const original=globalThis.fetch;let calls=0;const engine=new Engine();
+ globalThis.fetch=async()=>{calls++;queueMicrotask(()=>engine.destroy());return new Response('Busy',{status:503});};
+ try{await assert.rejects(()=>engine.text('http://127.0.0.1/media/index.m3u8'));assert.equal(calls,1);}finally{engine.destroy();globalThis.fetch=original;}
+});

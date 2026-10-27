@@ -30,7 +30,11 @@ See [the receiver adapter](tv-relayswarm.md) for setup and boundaries.
 Chrome playback overlaps at most four complete-fragment downloads, appends them
 in order and uses a ten-second live-edge target to
 absorb jitter in the publisher's upload. Back to live retains that headroom.
-This deliberately trades a short delay for continuity. It cannot recover
+This deliberately trades a short delay for continuity. A waiting decoder may
+nudge across at most two seconds of already-buffered empty time, only at the end
+of the preceding range; it never jumps directly over the older programme to a
+newer buffered range. Transient playlist 404/429/503 responses retry at most twice
+within the same ten-second request budget, and Stop cancels the backoff. It cannot recover
 quality already lost during preparation or compensate for an upload that stays
 slower than the encoded programme bitrate.
 

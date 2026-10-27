@@ -56,7 +56,7 @@ def main():
                 env={k:v for k,v in os.environ.items() if not k.startswith('SAPFLOW_')}
                 env.update(SAPFLOW_OPEN_PUBLISH='1',SAPFLOW_HTTP_ADDR=f'127.0.0.1:{http}',
                            SAPFLOW_RTMP_ADDR=f'127.0.0.1:{rtmp}',SAPFLOW_SRT_ADDR=f'127.0.0.1:{srt}',
-                           SAPFLOW_HTTP_THREADS='1',SAPFLOW_RECONNECT_GRACE='3')
+                           SAPFLOW_HTTP_THREADS='1',SAPFLOW_RECONNECT_GRACE='10')
                 engine=subprocess.Popen([str(binary)],env=env,stdout=engine_log,stderr=subprocess.STDOUT,start_new_session=True)
                 deadline=time.monotonic()+10
                 while True:
@@ -90,7 +90,7 @@ def main():
                         code=error.code;error.close();return code,b'Unavailable\n','text/plain'
 
                 if os.environ.get('SAPFLOW_TV_TEST_PEERS') == '1':
-                    subprocess.run(['node',str(ROOT/'tests/tv-peers-browser.mjs'),f'http://127.0.0.1:{http}/live/event-tv/'],check=True,timeout=150)
+                    subprocess.run(['node',str(ROOT/'tests/tv-peers-browser.mjs'),f'http://127.0.0.1:{http}/live/event-tv/',str(publisher.pid)],check=True,timeout=150)
 
                 server=preview.PreviewServer(('127.0.0.1',0),preview.PreviewHandler)
                 class FixtureTransport:
