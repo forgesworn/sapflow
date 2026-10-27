@@ -45,14 +45,14 @@ once eight seconds are decoded while the remaining headroom is fetched; ordinary
 track changes do not reload the player. A waiting decoder may
 nudge across at most two seconds of already-buffered empty time, only at the end
 of the preceding range; it never jumps directly over the older programme to a
-newer buffered range. Transient playlist 404/429/503 responses, network errors and attempts that hang
+newer buffered range. Transient playlist 404/429/502/503/504 responses, network errors and attempts that hang
 for four seconds use at most four retries with bounded backoff, about thirty
 seconds in the worst case, so one stalled read cannot reset a buffered engine.
 Stop cancels the attempt and the backoff. It cannot recover
 quality already lost during preparation or compensate for an upload that stays
 slower than the encoded programme bitrate.
 
-Whole-fragment network errors, HTTP 429/503 and attempts that hang for seven
+Whole-fragment network errors, HTTP 429/502/503/504 and attempts that hang for seven
 seconds use the same bounded retry policy within a fifteen-second transfer deadline. A route change can recover using
 complete fragments without destroying the MediaSource or buffered picture.
 Forbidden responses and oversized data are not retried.
