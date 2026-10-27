@@ -14,6 +14,7 @@ handover. See [setup and privacy boundaries](private-tv-publishing.md).
 | Socket observation | Publisher/SSH/netcat TCP sockets used loopback; receiver SSH and ingest connections arrived over loopback. This is process/socket observation, not a full packet-capture audit. |
 | Lower-rate run | HLS advertised about 1.04 Mbit/s average. A sample advanced 178 media sequences over 178.995 wall seconds, with no discontinuity in its playlist window. |
 | Higher-rate run | The 1080p profile targeted 4.5 Mbit/s video; the actual HLS average was about 3.60 Mbit/s. A sample advanced 249 media sequences over 254.564 wall seconds, with no discontinuity in its playlist window. |
+| Longer higher-rate observation | Decoded media tail timestamps advanced only 353.960 seconds over 397.254 wall seconds: about 43.3 seconds of additional delay. This route did not sustain that profile in real time. |
 | Media readback | Received init/parts decoded both H.264 video and AAC audio on the M1. |
 | Injected metadata | Synthetic source tags, stream handler names and H.264 user-data markers were absent from received parts; both tracks still decoded. |
 | Connection interruption | Terminating the task-owned SOCKS helper stopped the supervisor, encoder and SSH groups. The existing Tor service was left running. |
@@ -22,10 +23,11 @@ handover. See [setup and privacy boundaries](private-tv-publishing.md).
 | HTTPS route | Public master playlist fetched through Tor; the private-control path returned 404. Only the dedicated TV stream was routed to the media receiver. |
 | Other receiver services | Existing Caddy, Tor and Nostr gate stayed active. Nostr information readback retained its previous relay version and policy. Existing Tor configuration and onion fragment hashes stayed unchanged. |
 
-The higher-rate sequence count is reported as observed, not converted into a
-glass-to-glass latency or zero-stall claim. Encoder segmentation and network
-jitter affect that comparison. These are bounded synthetic runs, not a real
-show or a sustained 4.66 Mbit/s wire-rate qualification.
+Start with the lower-rate preparation example and measure again on the actual
+route. The higher-rate profile failed the real-time delivery gate in this run.
+No automatic bitrate adaptation or direct-route fallback is provided. These
+are bounded synthetic runs, not a real show, glass-to-glass latency measurement
+or a sustained 4.66 Mbit/s wire-rate qualification.
 
 ## Regressions
 

@@ -153,6 +153,9 @@ TV_ENCODER=videotoolbox TV_WIDTH=1280 TV_HEIGHT=720 \
 This bitrate is a test setting, not a Tor capacity guarantee. The default TV
 profile is about 4.66 Mbit/s before overhead. Measure the actual circuit rather
 than assuming either profile can run continuously with low latency.
+The longer 1080p qualification accumulated about 43 seconds of additional
+delivery delay over 6.6 minutes. Use the lower-rate example as a starting point;
+the higher-rate profile has not passed real-time delivery on this route.
 
 Put `live/event-tv?user=USER&pass=PASSWORD` in a private mode-0600 publish-path
 file, with URL-encoded credentials. Keep the SSH private key and known-hosts
