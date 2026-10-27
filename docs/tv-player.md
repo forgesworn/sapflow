@@ -70,6 +70,9 @@ identifying programme content or other applications on the Mac. Metadata
 stripping and prepared publishing are covered in the
 [private publishing guide](private-tv-publishing.md).
 
+See the [bounded browser and deployment qualification](tv-player-qualification.md)
+for measured results and the remaining Safari acceptance gate.
+
 ## Verification and third-party software
 
 ```sh
