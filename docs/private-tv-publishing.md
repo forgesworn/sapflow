@@ -64,7 +64,9 @@ PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 AllowTcpForwarding local
+AllowStreamLocalForwarding no
 PermitOpen 127.0.0.1:1935
+PermitTunnel no
 AllowAgentForwarding no
 X11Forwarding no
 PermitTTY no

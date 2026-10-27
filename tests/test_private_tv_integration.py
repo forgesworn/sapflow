@@ -148,7 +148,8 @@ class PrivateRoute(unittest.TestCase):
                 "UseDNS no\nStrictModes no\nPasswordAuthentication no\n"
                 "KbdInteractiveAuthentication no\nAuthenticationMethods publickey\n"
                 "AllowAgentForwarding no\nX11Forwarding no\nPermitTTY no\n"
-                f"AllowTcpForwarding local\nPermitOpen 127.0.0.1:{forward_port}\nMaxSessions 0\n")
+                f"AllowTcpForwarding local\nAllowStreamLocalForwarding no\nPermitTunnel no\n"
+                f"PermitOpen 127.0.0.1:{forward_port}\nMaxSessions 0\n")
             source = media / "generated.mp4"
             subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=128x96:r=25:d=2.4",
                             "-f", "lavfi", "-i", "sine=r=48000:d=2.4", "-c:v", "libx264",
@@ -216,6 +217,26 @@ class PrivateRoute(unittest.TestCase):
                     self.assertIn(b"FMLE/3.0", recording.received)
                     for marker in (b"Lavf", b"Lavc", b"x264"):
                         self.assertNotIn(marker, recording.received)
+                    # Unix socket forwarding has its own sshd permission;
+                    # PermitOpen alone does not restrict it to the ingest port.
+                    requested_socket = home / "must-not-create.sock"
+                    denied = subprocess.Popen(
+                        [shutil.which("ssh"), "-F", "/dev/null", "-N", "-i", str(home / "client"),
+                         "-l", pwd.getpwuid(os.getuid()).pw_name, "-o", "BatchMode=yes",
+                         "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={hosts}",
+                         "-o", "IdentityAgent=none", "-o", "IdentitiesOnly=yes",
+                         "-o", "ExitOnForwardFailure=yes", "-o",
+                         f"ProxyCommand=nc -X 5 -x 127.0.0.1:{socks.server_address[1]} %h %p",
+                         "-R", f"{requested_socket}:{home}/unused-client.sock", onion],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        start_new_session=True)
+                    try:
+                        _, reason = denied.communicate(timeout=10)
+                        self.assertNotEqual(denied.returncode, 0)
+                        self.assertIn(b"forwarding failed", reason)
+                        self.assertFalse(requested_socket.exists())
+                    finally:
+                        HELPERS.PRIVATE.stop_child(denied)
             finally:
                 HELPERS.PRIVATE.stop_child(receiver)
                 HELPERS.PRIVATE.stop_child(sshd)
