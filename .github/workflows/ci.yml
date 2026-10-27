@@ -249,7 +249,8 @@ jobs:
       - name: Install ffmpeg and SRT tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg srt-tools curl python3
+          sudo apt-get install -y --no-install-recommends ffmpeg srt-tools curl python3 openssh-server netcat-openbsd
+          sudo install -d -m 0755 /run/sshd
           command -v srt-live-transmit ffmpeg ffprobe
       - name: Smoke, viewers on the own event loop
         env:
@@ -260,3 +261,5 @@ jobs:
         run: |
           bash -n scripts/tv-prepare.sh scripts/tv-playout.sh
           python3 -B tests/test_tv_scripts.py
+          python3 -B tests/test_private_tv_publish.py
+          python3 -B tests/test_private_tv_integration.py

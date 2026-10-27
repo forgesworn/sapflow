@@ -2,6 +2,7 @@
 # Loop a folder of prepared videos into sapflow as one continuous publish.
 #
 #   scripts/tv-playout.sh [--shuffle] [--once] [--audio encode|copy] [--no-verify]
+#                         [--strip-metadata]
 #                         PREPARED_DIR [PUBLISH_URL]
 #
 # PREPARED_DIR holds the output of scripts/tv-prepare.sh. PUBLISH_URL is
@@ -18,6 +19,9 @@
 #                 no restart (for testing)
 #   --audio MODE  encode (default) or copy
 #   --no-verify   skip the check that the files share one SPS/PPS and AAC config
+#   --strip-metadata  remove source tags, chapters and H.264 SEI (including
+#                 captions); encode audio without FFmpeg's version marker.
+#                 This does not anonymise the network or visible/audible content.
 #
 # ffmpeg is restarted with a growing delay (TV_BACKOFF_MIN to TV_BACKOFF_MAX
 # seconds, 2 and 60 by default) whenever it exits, and why is logged. A
@@ -210,13 +214,14 @@ sink_srt() { # url; the MPEG-TS arrives on stdin
 ffmpeg_has_srt() { ffmpeg -hide_banner -protocols 2> /dev/null | grep -qw srt; }
 
 main() {
-  local shuffle=0 once=0 audio=encode verify=1
+  local shuffle=0 once=0 audio=encode verify=1 strip_metadata=0
   while [ "$#" -gt 0 ]; do
     case $1 in
       --shuffle) shuffle=1; shift ;;
       --once) once=1; shift ;;
       --audio) [ "$#" -ge 2 ] || usage; audio=$2; shift 2 ;;
       --no-verify) verify=0; shift ;;
+      --strip-metadata) strip_metadata=1; shift ;;
       -h|--help) usage 0 ;;
       --) shift; break ;;
       -*) echo "tv-playout: unknown option $1" >&2; usage ;;
@@ -224,6 +229,7 @@ main() {
     esac
   done
   case $audio in encode|copy) ;; *) die "--audio: encode or copy" ;; esac
+  [ "$strip_metadata" = 0 ] || [ "$audio" = encode ] || die "--strip-metadata requires encoded audio"
   local setting
   for setting in "$TV_BACKOFF_MIN" "$TV_BACKOFF_MAX" "$TV_STABLE_SECONDS"; do
     [[ "$setting" =~ ^[1-9][0-9]{0,4}$ ]] || die "backoff and stable times must be positive integers up to 99999 seconds"
@@ -290,12 +296,19 @@ main() {
 
     local -a in=(-re)
     [ "$once" = 1 ] || in+=(-stream_loop -1)
+    # Only local prepared files may be opened in the private publishing mode.
+    [ "$strip_metadata" = 0 ] || in+=(-protocol_whitelist file,concat)
     in+=(-f concat -safe 0 -i "$work/list.txt")
     local -a codec=(-map 0:v:0 -map 0:a:0 -c:v copy)
     if [ "$audio" = encode ]; then
       codec+=(-c:a aac -profile:a aac_low -b:a "$TV_AUDIO_BITRATE" -ar 48000 -ac 2)
     else
       codec+=(-c:a copy)
+    fi
+    if [ "$strip_metadata" = 1 ]; then
+      codec+=(-map_metadata -1 -map_metadata:s -1 -map_chapters -1
+        -fflags +bitexact -flags:a +bitexact -metadata encoder= -metadata:s encoder=
+        -bsf:v filter_units=remove_types=6)
     fi
     local -a base=(ffmpeg -hide_banner -nostdin -nostats -loglevel warning "${in[@]}" "${codec[@]}")
 
