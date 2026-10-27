@@ -81,3 +81,15 @@ test('Stop cancels fragment retry backoff and forbidden responses are not retrie
   globalThis.fetch=async()=>{calls++;return new Response('Forbidden',{status:403});};const forbidden=new FetchLoader();await new Promise(resolve=>forbidden.load({url:'https://receiver.example/generated'},{timeout:3000},{onSuccess:()=>assert.fail('Forbidden'),onError:resolve}));assert.equal(calls,2);forbidden.destroy();
  }finally{loader.destroy();globalThis.fetch=original;}
 });
+
+
+test('Safari managed media is selected when ordinary MediaSource is absent or rejects the codecs',async()=>{
+ const {mediaSourceType}=await import('../web/tv/cmaf-player.mjs');
+ class Ordinary{static isTypeSupported(mime){return mime==='ordinary';}}
+ class Managed{static isTypeSupported(mime){return mime==='managed';}}
+ assert.equal(mediaSourceType({}),null);
+ assert.equal(mediaSourceType({ManagedMediaSource:Managed}),Managed);
+ assert.equal(mediaSourceType({MediaSource:Ordinary,ManagedMediaSource:Managed},'managed'),Managed);
+ assert.equal(mediaSourceType({MediaSource:Ordinary,ManagedMediaSource:Managed},'ordinary'),Ordinary);
+ assert.equal(mediaSourceType({MediaSource:Ordinary,ManagedMediaSource:Managed},'unsupported'),null);
+});

@@ -33,6 +33,9 @@ export function gapPosition(ranges,time,readyState,seeking=false) {
   for(let i=1;i<ranges.length;i++)if(time>=ranges.end(i-1)-.1&&time<ranges.start(i)&&ranges.start(i)-time<=2)return ranges.start(i)+.001;
   return null;
 }
+export function mediaSourceType(environment=globalThis,mime=null){
+ return [environment.MediaSource,environment.ManagedMediaSource].find(Type=>typeof Type==='function'&&(!mime||Type.isTypeSupported(mime)))??null;
+}
 export class FetchLoader {
   constructor(){this.stats={aborted:false,loaded:0,total:0,retry:0,chunkCount:0,bwEstimate:0,loading:{start:0,first:0,end:0},parsing:{start:0,end:0},buffering:{start:0,first:0,end:0}};this.controller=null;}
   load(context,config,callbacks) {
@@ -59,7 +62,7 @@ function waitEvent(target,event,signal,action) {
 }
 export default class CmafPlayer {
   static Events={MANIFEST_PARSED:'hlsManifestParsed',ERROR:'hlsError',FRAG_LOADING:'hlsFragLoading',FRAG_LOADED:'hlsFragLoaded',FRAG_BUFFERED:'hlsFragBuffered',LEVEL_LOADED:'hlsLevelLoaded',LEVEL_UPDATED:'hlsLevelUpdated'};
-  static isSupported(){return typeof MediaSource!=='undefined';}
+  static isSupported(){return mediaSourceType()!==null;}
   constructor(config={}) {
     this.config={loader:FetchLoader,fLoader:undefined,progressive:false,liveSyncDuration:20,...config};
     this.listeners=new Map();this.controller=new AbortController();this.media=null;this.source=null;this.buffer=null;this.objectUrl=null;this.url=null;
@@ -99,9 +102,11 @@ export default class CmafPlayer {
   }
   async run() {
     const master=parseMaster(await this.text(this.url)),mime=`video/mp4; codecs="${master.codec}"`;
-    if(!MediaSource.isTypeSupported(mime))throw Error('Channel codecs unsupported');
+    const SourceType=mediaSourceType(globalThis,mime);if(!SourceType)throw Error('Channel codecs unsupported');
+    this.managed=SourceType===globalThis.ManagedMediaSource;
+    if(this.managed){this.previousRemotePlayback=this.media.disableRemotePlayback;this.media.disableRemotePlayback=true;}
     this.levels=[{bitrate:master.bitrate,averageBitrate:master.averageBitrate,videoCodec:master.codec.split(',')[0],audioCodec:master.codec.split(',')[1]}];
-    this.source=new MediaSource();this.objectUrl=URL.createObjectURL(this.source);this.media.src=this.objectUrl;
+    this.source=new SourceType();this.objectUrl=URL.createObjectURL(this.source);this.media.src=this.objectUrl;
     await waitEvent(this.source,'sourceopen',this.controller.signal,()=>this.media.load());this.source.duration=Infinity;this.buffer=this.source.addSourceBuffer(mime);
     const playlistUrl=new URL(master.manifest,this.url).href;let next=null,lastInit=null,lastPrefix=null;
     while(!this.controller.signal.aborted) {
@@ -121,6 +126,7 @@ export default class CmafPlayer {
       for(let index=0;index<segments.length;) {
         const segment=segments[index];
         if(segment.sn<next){index++;continue;}
+        if(this.managed&&this.initialised&&this.source.streaming===false)break;
         if(this.initialised&&this.buffer.buffered.length&&this.buffer.buffered.end(this.buffer.buffered.length-1)-this.media.currentTime>30)break;
         if(segment.gap){next=segment.sn+1;index++;continue;}
         if(segment.init!==lastInit){await this.appendDownloaded(await this.download(segment,playlistUrl,true));lastInit=segment.init;}
@@ -160,5 +166,5 @@ export default class CmafPlayer {
     const end=()=>{try{if(this.source?.readyState==='open')this.source.endOfStream();}catch{}};
     if(this.buffer?.updating)this.buffer.addEventListener('updateend',end,{once:true});else end();
   }
-  destroy(){this.media?.removeEventListener('waiting',this.onWaiting);this.controller.abort();for(const loader of this.loaders)loader.destroy();this.loaders.clear();try{if(this.buffer?.updating)this.buffer.abort();}catch{}if(this.objectUrl){if(this.media?.getAttribute('src')===this.objectUrl){this.media.pause();this.media.removeAttribute('src');this.media.load();}URL.revokeObjectURL(this.objectUrl);}this.listeners.clear();}
+  destroy(){if(this.managed&&this.media)this.media.disableRemotePlayback=this.previousRemotePlayback;this.media?.removeEventListener('waiting',this.onWaiting);this.controller.abort();for(const loader of this.loaders)loader.destroy();this.loaders.clear();try{if(this.buffer?.updating)this.buffer.abort();}catch{}if(this.objectUrl){if(this.media?.getAttribute('src')===this.objectUrl){this.media.pause();this.media.removeAttribute('src');this.media.load();}URL.revokeObjectURL(this.objectUrl);}this.listeners.clear();}
 }

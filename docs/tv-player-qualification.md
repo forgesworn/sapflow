@@ -25,7 +25,8 @@ traffic correlation, compromised software or activity from other applications.
 
 Playwright WebKit stalled while creating a page on this Mac, before playback
 could be tested. Actual Safari and iPhone playback remain unqualified. The
-public player retains the native HLS path and has lifecycle regression tests,
+public player now supports ManagedMediaSource with a native-only fallback and
+has lifecycle regression tests,
 but Chrome results are not promoted into Safari acceptance. High-bitrate Tor
 publishing and large-audience capacity are also outside this check.
 
@@ -90,3 +91,21 @@ programme beyond the 100 ms recovery tolerance, then verifies continued playback
 when the serving peer leaves. A transient playlist 503 is injected separately
 and must not reset decoding. These checks distinguish ordinary track continuity,
 client recovery and actual upstream network availability.
+
+
+## iPhone playback-path correction
+
+The previous capability check considered only ordinary MediaSource. An iPhone
+with ManagedMediaSource alone therefore fell back to native HLS, missing the
+complete-fragment buffering, gap recovery and peer loader. Selection now checks
+both APIs against the advertised codecs and disables remote playback for the
+managed attachment, restoring it on Stop. Managed streaming hints stop new
+media transfers after initial buffering. Native-only public fallback uses the
+whole-fragment mirror with a twenty-second start offset.
+
+The generated browser gate exercises managed API selection with real Chrome
+fMP4 decoding, transfer suspension/resumption and remote-playback cleanup.
+This simulated capability check is distinct from actual iOS WebKit or physical
+Safari acceptance. Public peers default on at Play with a visible opt-out;
+private preview remains forced off. The public-origin browser gate verifies
+the default and opt-out before playback without making external connections.

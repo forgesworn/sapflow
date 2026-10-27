@@ -11,14 +11,20 @@ and return to live. Pause keeps the existing media engine and buffered video;
 resume does not repeat the startup buffer. Native controls remain the fallback
 if enhancement cannot initialise. Space/K, M and F work while the player is focused.
 
-There are no analytics, external fonts or remote scripts. Safari normally uses
-native HLS; Chrome uses Sapflow's own MIT complete-fragment MediaSource player.
+There are no analytics, external fonts or remote scripts. Capable browsers use
+Sapflow's own MIT complete-fragment MediaSource player, including iPhone Safari
+through ManagedMediaSource. Managed playback disables remote playback (AirPlay)
+while attached, as required by Safari; Stop restores the previous setting.
+Safari's streaming hints pause new fragment transfers once the initial buffer
+is ready. Older native-only browsers use the receiver's complete-fragment HLS
+mirror with a twenty-second start offset and no peer support.
 It consumes the receiver's single H.264/AAC fMP4 rendition, without a general
 HLS transmuxer or hls.js dependency. The strict 64 KiB playlist parser refuses
 external references and unsupported features; fragments are limited to 8 MiB.
 
-Viewer RelaySwarm assistance is explicitly opt-in. Enabling it selects the
-MediaSource engine and receiver-side `/media/` mirror. Peers supply only media
+Public viewer RelaySwarm assistance is enabled by default when playback starts.
+A visible quick toggle allows opting out before Play; no peers connect while idle.
+Enabling it selects the MediaSource engine and receiver-side `/media/` mirror. Peers supply only media
 verified against the receiver's signed, playlist-bound commitments. HTTP remains
 the fallback; peer waiting is capped at 500 ms with a three-second origin reserve.
 Upload is capped at 250 kB/s and 128 MiB per viewing session. The page always

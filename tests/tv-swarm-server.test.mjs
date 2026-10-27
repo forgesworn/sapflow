@@ -13,7 +13,7 @@ const name='abcdef123456',media=`#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-MAP:U
 const master='#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1500000,CODECS="avc1.640029,mp4a.40.2"\nstream.m3u8\n';
 test('whole-fragment mirror preserves sequence, discontinuity and exact media identity',()=>{
   const parsed=parseMedia(media),roundtrip=parseMedia(completePlaylist(parsed));assert.deepEqual(roundtrip,parsed);
-  assert(!completePlaylist(parsed).includes('#EXT-X-PART'));
+  assert(!completePlaylist(parsed).includes('#EXT-X-PART'));assert(completePlaylist(parsed).includes('#EXT-X-START:TIME-OFFSET=-20.0,PRECISE=NO'));
 });
 test('rendezvous refuses broader filters, foreign channels and forged events',()=>{
   assert(validFilter({kinds:[24170,24171],'#x':['channel']},'channel'));

@@ -15,7 +15,8 @@ connection, 32 KiB messages, heartbeat and send-queue limits. HTTP and signallin
 have bounded global/concurrent and connection rate budgets. It writes no viewer
 IP logs. Neither the cache nor the signing identity contains source filenames.
 
-The browser enables peers only after explicit consent. It verifies media before
+Public viewers start with peer assistance enabled and a visible opt-out before
+Play. No peers connect while idle; private Mac preview always disables peers. It verifies media before
 append, limits waiting and upload, and stops peer connections on Stop or page
 exit. A failed peer media service falls back to the ordinary receiver path on
 reconnect. The private Mac preview never loads these assets or joins the swarm.

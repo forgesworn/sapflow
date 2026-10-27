@@ -75,7 +75,7 @@ test('fatal engine errors dispose the old player before a retry', async () => {
 test('native HLS needs no hls.js module and tears down its source', async () => {
   const s=setup({ preferNative:true, loadEngine: () => { throw Error('must not load'); } });
   s.video.native=true; s.watch.click(); await settle();
-  assert.equal(s.video.currentSrc, '/tv/live/event-tv/index.m3u8');
+  assert.equal(s.video.currentSrc, '/media/index.m3u8');
   assert.equal(s.video.plays, 1); s.player.destroy(); assert.equal(s.video.currentSrc, '');
 });
 

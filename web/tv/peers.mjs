@@ -1,4 +1,4 @@
-// Viewer-only opt-in. The trusted Mac preview never calls or serves this module.
+// Public viewer assistance with a visible opt-out. The trusted Mac preview never calls or serves this module.
 export const privatePreview=location=>['127.0.0.1','localhost','[::1]'].includes(location.hostname);
 export async function attachPeers(engine,{location=globalThis.location,signal,onMetrics=()=>{},fetchImpl=fetch,
   loadSdk=()=>import('./vendor/relayswarm-hls-swarm-0.4.4.mjs')}={}) {

@@ -7,3 +7,5 @@
 .screen[data-state=interrupted] .standby-title{font-size:clamp(24px,4vw,49px);text-transform:uppercase;letter-spacing:.04em}.screen[data-state=interrupted] #start-overlay{display:none}
 
 .connection-refresh{display:flex;align-items:center;gap:16px;margin:0 0 20px}.connection-refresh .quiet-button{border:1px solid var(--line);border-radius:6px;padding:6px 12px;color:var(--accent)}.connection-change{padding:12px 14px;border:1px solid #7b7450;border-radius:7px;color:#e4d5a4;font-size:12px;margin-bottom:20px}@media(max-width:600px){.connection-refresh{align-items:flex-start;flex-direction:column;gap:7px}}
+
+.peer-toggle{background:transparent;border:1px solid #5f6e49;border-radius:6px;min-height:34px;font-size:10px;color:var(--accent);margin-top:9px;padding:6px 10px}.peer-toggle:disabled{opacity:.5}@media(max-width:850px){.channel-card .peer-toggle{grid-column:1;grid-row:2;margin:0;width:auto;text-align:left;font-size:10px}.channel-card .quiet-button{grid-row:2}}

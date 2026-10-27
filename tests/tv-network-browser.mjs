@@ -14,7 +14,7 @@ try{
  await context.route('**/*',async route=>{
   const u=new URL(route.request().url());assert.equal(u.origin,'https://viewer.example','all browser requests stay on the synthetic origin');
   if(u.pathname==='/favicon.ico')return route.fulfill({status:204,body:''});
-  if(u.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:1,peerEnabledPlayers:0,channel:{state},playerVersion:'2026.10.27.6'})});
+  if(u.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:1,peerEnabledPlayers:0,channel:{state},playerVersion:'2026.10.27.7'})});
   if(u.pathname==='/tv/connection'){metadataRequests++;return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(observation())});}
   if(u.pathname.startsWith('/tv/live/event-tv/')){mediaRequests++;const response=await context.request.get(new URL(u.pathname,base).href);return route.fulfill({response});}
   assert(u.pathname.startsWith('/tv/')&&!u.pathname.includes('..'));const name=u.pathname==='/tv/'?'index.html':u.pathname.slice(4);
@@ -22,7 +22,7 @@ try{
   if(name==='index.html')body=Buffer.from(body.toString().replace('</head>',`<meta name="tv-connection" content='${JSON.stringify(observation()).replace(/'/g,'&#39;')}'>\n</head>`));
   const mime=name.endsWith('.mjs')?'text/javascript':name.endsWith('.css')?'text/css':name.endsWith('.png')?'image/png':name.endsWith('.mp4')?'video/mp4':'text/html';return route.fulfill({status:200,contentType:mime,body});
  });
- await page.goto('https://viewer.example/tv/');assert.equal(await page.locator('#viewer-ip').textContent(),'198.51.100.7');await page.locator('#watch').click();await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing',null,{timeout:45000});
+ await page.goto('https://viewer.example/tv/');assert.equal(await page.locator('#viewer-ip').textContent(),'198.51.100.7');assert(await page.locator('#peer-assist').isChecked(),'public peer assistance defaults on');assert.equal(await page.locator('#peer-toggle').getAttribute('aria-pressed'),'true');await page.locator('#peer-toggle').click();assert(!await page.locator('#peer-assist').isChecked(),'quick opt-out works before playback');assert.equal(await page.locator('#peer-toggle').getAttribute('aria-pressed'),'false');await page.locator('#watch').click();await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing',null,{timeout:45000});
  const source=await page.locator('#video').evaluate(v=>v.currentSrc);await page.waitForTimeout(2000);
  await context.setOffline(true);await page.waitForTimeout(700);await context.setOffline(false);
  address='203.0.113.9';await page.locator('#refresh-connection').click();await page.waitForFunction(()=>document.querySelector('#viewer-ip').textContent==='203.0.113.9');assert.equal(await page.locator('#viewer-location').textContent(),'Current city');assert(await page.locator('#connection-change').isVisible());

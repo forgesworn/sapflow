@@ -161,9 +161,10 @@ Playlist reloads and preload hints continue to use Sapflow.
 
 Start with origin-only playback, then shadow measurement; shadow downloads
 additional peer bytes and saves no origin bandwidth. Peer-first requires the
-authorised commitments and measured recovery deadlines. Enable uploads only
-after viewer consent, with bounded budgets and an immediate origin-only switch.
-Native Safari playback does not use an hls.js loader. Acceptance needs two real
+authorised commitments and measured recovery deadlines. The public TV page enables bounded sharing on Play by default, with a visible
+IP-exposure notice and an immediate origin-only opt-out. Safari with
+ManagedMediaSource can use the same complete-fragment engine and peer loader;
+older native-only HLS playback cannot. Acceptance needs two real
 browser peers, verified peer media, working fallback on departure, no increased
 stalls, and measured origin-byte reduction. Public NAT, mobile and a real show
 are separate checks. The [receiver TV page](tv-player.md) uses our MIT complete-fragment player

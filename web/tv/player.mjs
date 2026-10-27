@@ -6,20 +6,21 @@ import {createAudience} from './audience.mjs';
 import {createIdent} from './ident.mjs';
 import {PLAYER_VERSION,newerPlayerVersion} from './version.mjs';
 const STREAM = '/tv/live/event-tv/index.m3u8';
+const NATIVE_STREAM='/media/index.m3u8';
 
-/** Origin playback with explicit, viewer-only peer assistance. */
+/** Origin playback with viewer-only peer assistance and an explicit opt-out. */
 export function createTvPlayer({ video, watch, edge, status, indicator, placeholder,
   fetchImpl = globalThis.fetch.bind(globalThis), loadEngine = () => import('./cmaf-player.mjs'),
   schedule = setTimeout, cancel = clearTimeout,
   info = {}, standbyTitle=null, tone=null, peers=null, peerStatus=null,
   onState=()=>{}, onMetrics=()=>{}, onRecovery=()=>{}, onInfo=()=>{},
-  locationImpl=globalThis.location, loadPeers=()=>import('./peers.mjs'), preferNative = globalThis.navigator?.vendor === 'Apple Computer, Inc.' } = {}) {
+  locationImpl=globalThis.location, loadPeers=()=>import('./peers.mjs'), preferNative = false } = {}) {
   let watching = false, stopped = false, generation = 0, hls = null, request = null;
   let peerSession=null,peerFailed=false,userPaused=false,channelState=null,draining=false,originBytes=0;
   const privatePreview=['127.0.0.1','localhost','[::1]'].includes(locationImpl?.hostname);
   if(peers&&privatePreview){peers.checked=false;peers.disabled=true;}
   const peerInfo=value=>{if(peerStatus)peerStatus.textContent=value;};
-  peerInfo(privatePreview?'Disabled in private Mac preview':'Off. Enable peer assistance to share with other viewers.');
+  peerInfo(privatePreview?'Disabled in private Mac preview':peers?.checked?'RelaySwarm is on for playback. Peers may see your IP; switch it off before playing to opt out.':'Off. Receiver delivery only.');
   let retry = null, delay = 1000, startupTimer = null;
   const listeners = [];
   const field = (name, value) => { if (info[name]) info[name].textContent = value; };
@@ -87,20 +88,20 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
       if (!response.ok) { recover(token,`Receiver returned HTTP ${response.status??"unavailable"}`); return; }
       placeholder.dataset.kind='streaming';
       if (!peers?.checked && preferNative && video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = STREAM;
+        video.src = privatePreview?STREAM:NATIVE_STREAM;field('engine','Native HLS · receiver only');
         await play(token);
       } else {
         const { default: Engine } = await loadEngine();
         if (token !== generation || !watching || stopped) return;
         if (!Engine.isSupported()) {
-          if (video.canPlayType('application/vnd.apple.mpegurl')) { video.src = STREAM; await play(token); return; }
+          if (video.canPlayType('application/vnd.apple.mpegurl')) {video.src=privatePreview?STREAM:NATIVE_STREAM;field('engine','Native HLS · receiver only');peerInfo('RelaySwarm is unavailable in this browser. Playing from the receiver.');await play(token);return;}
           stop(); show('error', 'This browser cannot play the live channel.'); return;
         }
         hls = new Engine({ lowLatencyMode: false, liveSyncDuration: 20, liveMaxLatencyDuration: 40,
           backBufferLength: 10, maxBufferLength: 30, maxMaxBufferLength: 40, enableWorker: false });
         hls.on(Engine.Events.MANIFEST_PARSED, (_event, detail = {}) => {
           if (token !== generation || !watching) return;
-          const level = detail.levels?.[0];
+          const level = detail.levels?.[0];field('engine',hls?.managed?'Safari managed media · AirPlay unavailable':'MediaSource · complete fragments');
           field('rate', level?.bitrate > 0 ? `${(level.bitrate / 1000000).toFixed(2)} Mbit/s` : 'Not advertised');
           field('codecs', [level?.videoCodec, level?.audioCodec].filter(Boolean).join(', ') || 'Not advertised');
           void play(token);
@@ -151,7 +152,7 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
     else{userPaused=false;void play(generation);}
   }
   on(watch,'click',()=>{if(watching)stop();else start();});
-  if(peers)on(peers,'change',()=>{peerFailed=false;if(watching)void connect();});
+  if(peers)on(peers,'change',()=>{peerFailed=false;if(watching)void connect();else peerInfo(privatePreview?'Disabled in private Mac preview':peers.checked?'RelaySwarm is on for playback. Peers may see your IP; opt out before playing if preferred.':'Off. Receiver delivery only.');});
   on(edge, 'click', () => {
     const position = hls?.liveSyncPosition;
     if (Number.isFinite(position)) video.currentTime = position;
@@ -186,13 +187,16 @@ if (typeof document !== 'undefined') {
   }});
   get('player-version').textContent='Sapflow '+PLAYER_VERSION;
   player = createTvPlayer({video,watch:get('watch'),edge:get('live-edge'),status:get('status'),indicator:get('indicator'),placeholder:get('placeholder'),peers:get('peer-assist'),peerStatus:get('peer-status'),standbyTitle:get('standby-title'),tone:createTestTone(get('test-tone')),
-    info:Object.fromEntries(['picture','rate','codecs','buffer','delay'].map(key=>[key,get('media-'+key)])),
+    info:Object.fromEntries(['picture','rate','codecs','buffer','delay','engine'].map(key=>[key,get('media-'+key)])),
     onMetrics:(metrics,enabled)=>network.update(metrics,enabled),
     onRecovery(reason){get('last-recovery').textContent=reason;get('recovery-count').textContent=String(++recoveries);},
     onInfo({ahead,latency,watching}){get('buffer-fill').style.width=Math.min(100,ahead/20*100)+'%';get('playback-health').textContent=watching?ahead.toFixed(1)+'s buffered':'No media loaded';get('playback-position').textContent=watching?(latency>0?latency.toFixed(0)+'s behind live':'Live programme'):'Ready to tune in';get('quality-summary').textContent=video.getVideoPlaybackQuality?String(video.getVideoPlaybackQuality().droppedVideoFrames)+' dropped frames':'Not reported';},
     onState(state,presence){controls?.setState(state);ident.setState(state);audience.set(presence);get('standby-description').textContent=({connecting:'Preparing your picture. The stream starts when enough video is ready.',offline:'Waiting for the broadcaster to reconnect.',interrupted:'No new video is arriving. Waiting for reconnection or confirmation that the broadcast has ended.',ended:'Thanks for watching. Join us for the next broadcast.',idle:'Your front row to the live channel.',available:'A new broadcast is live. Press play to tune in.',connection:'Reconnecting to the receiver. Channel status is being checked.',network:'Check your VPN before rejoining. Peer assistance has been switched off.',stopped:'Press play to rejoin the broadcast.'})[state]??'';}
   });
+  const peerChoice=get('peer-assist'),peerToggle=get('peer-toggle');
+  const syncPeerChoice=()=>{peerToggle.disabled=peerChoice.disabled;peerToggle.setAttribute('aria-pressed',String(peerChoice.checked));peerToggle.textContent=peerChoice.disabled?'Peers off in private preview':peerChoice.checked?'Peer assistance on · switch off':'Peer assistance off · switch on';};
+  peerToggle.addEventListener('click',()=>{peerChoice.checked=!peerChoice.checked;peerChoice.dispatchEvent(new Event('change'));});peerChoice.addEventListener('change',syncPeerChoice);syncPeerChoice();
   controls=createControls({video,screen:get('screen'),onToggle:()=>player.togglePlayback()});controls.setState('idle');ident.setState('idle');network.reset();audience.refresh();
-  const connection=createConnectionMonitor({document,location,onAddressChange:()=>player.networkChanged()});
+  const connection=createConnectionMonitor({document,location,onAddressChange:()=>{player.networkChanged();syncPeerChoice();}});
   addEventListener('pagehide',()=>{connection.destroy();audience.destroy();player.destroy();controls.destroy();ident.destroy();},{once:true});
 }

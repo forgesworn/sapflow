@@ -20,7 +20,7 @@ try {
     const request=route.request(), target=new URL(request.url());
     if (target.protocol==='blob:' || target.origin===url.origin) {
       requests.push(target.pathname);
-      if(target.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:2,peerEnabledPlayers:1,playerVersion:'2026.10.27.6',channel:{state:channelEnded?'ended':'live'}})});
+      if(target.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:2,peerEnabledPlayers:1,playerVersion:'2026.10.27.7',channel:{state:channelEnded?'ended':'live'}})});
       if (target.pathname==='/tv/live/event-tv/index.m3u8' && startupFailures>0) {
         startupFailures--; return route.fulfill({status:404,body:'Off air'});
       }
@@ -40,6 +40,11 @@ try {
   await page.addInitScript(() => {
     window.__peerAttempts=0;
     window.RTCPeerConnection=class { constructor() { window.__peerAttempts++; throw Error('Peer connection forbidden'); } };
+  });
+  if(engine==='chrome-managed')await page.addInitScript(()=>{
+    const Original=window.MediaSource;
+    window.ManagedMediaSource=class extends Original{constructor(){super();this.streaming=true;window.__managedSource=this;}};
+    window.MediaSource=undefined;
   });
   await page.goto(base);
   assert.equal(await page.locator('h1').textContent(), 'ForgeSworn TV');
@@ -95,7 +100,7 @@ try {
     window.__audioProbe={ context,source,analyser,silent };
     return { available:true,rms };
   });
-  if (engine==='chrome') assert(audio.available && audio.rms>0.00001,'decoded synthetic audio reaches Web Audio');
+  if (engine.startsWith('chrome')) assert(audio.available && audio.rms>0.00001,'decoded synthetic audio reaches Web Audio');
   await page.screenshot({ path:output+'.png', fullPage:true });
   await page.evaluate(() => {
     window.__stall={ started:null, seconds:0 };
@@ -103,6 +108,13 @@ try {
     video.addEventListener('waiting',()=>{window.__stall.started ??= performance.now();});
     video.addEventListener('playing',()=>{if(window.__stall.started!==null){window.__stall.seconds+=(performance.now()-window.__stall.started)/1000;window.__stall.started=null;}});
   });
+  if(engine==='chrome-managed'){
+    assert(await page.locator('#video').evaluate(v=>v.disableRemotePlayback),'managed playback disables unsupported AirPlay');
+    await page.evaluate(()=>{window.__managedSource.streaming=false;});await page.waitForTimeout(1500);
+    const settled=requests.filter(x=>/_seg[0-9]+\.mp4$/.test(x)).length;await page.waitForTimeout(2000);
+    assert.equal(requests.filter(x=>/_seg[0-9]+\.mp4$/.test(x)).length,settled,'managed media stops new transfers when streaming is false');
+    await page.evaluate(()=>{window.__managedSource.streaming=true;});
+  }
   measuring=true;
   const started=Date.now();
   while (Date.now()-started<seconds*1000) { await page.waitForTimeout(process.env.SAPFLOW_TV_TEST_CUTS==='1'?1000:5000); snapshots.push(await sample()); }
@@ -122,7 +134,7 @@ try {
   await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing');
   await page.locator('#watch').click();
   await page.waitForTimeout(1000);
-  const stopped=await sample(); assert(stopped.paused); assert.equal(stopped.state,'stopped');
+  const stopped=await sample(); if(engine==='chrome-managed')assert.equal(await page.locator('#video').evaluate(v=>v.disableRemotePlayback),false,'Stop restores remote playback');assert(stopped.paused); assert.equal(stopped.state,'stopped');
   const mediaCount=()=>requests.filter(path=>path.includes('/live/')||path.startsWith('/media/')).length;const count=mediaCount();await page.waitForTimeout(2500);assert.equal(mediaCount(),count,'Stop ends programme requests; read-only status checks continue');
   assert.equal(errors.length,0,errors.join('\n')); assert.equal(failures.length,0);
   await page.locator('#watch').click();await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing',null,{timeout:45000});

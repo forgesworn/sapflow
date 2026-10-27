@@ -15,7 +15,7 @@ import {parseMaster,parseMedia} from '../../web/tv/playlist.mjs';
 const ASSET=/^[a-f0-9]{12}_(?:init[0-9]{0,20}|seg[0-9]{1,20})\.mp4$/;
 export function completePlaylist(parsed) {
   const segments=parsed.segments;
-  const rows=['#EXTM3U','#EXT-X-VERSION:7','#EXT-X-INDEPENDENT-SEGMENTS',
+  const rows=['#EXTM3U','#EXT-X-VERSION:7','#EXT-X-INDEPENDENT-SEGMENTS','#EXT-X-START:TIME-OFFSET=-20.0,PRECISE=NO',
     `#EXT-X-TARGETDURATION:${Math.ceil(Math.max(...segments.map(s=>s.duration)))}`,
     `#EXT-X-MEDIA-SEQUENCE:${segments[0].sn}`,`#EXT-X-DISCONTINUITY-SEQUENCE:${segments[0].cc}`];
   let init=null,cc=segments[0].cc;
