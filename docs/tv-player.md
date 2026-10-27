@@ -12,6 +12,21 @@ connections. Safari uses native HLS; other supported browsers use the local,
 pinned hls.js light module. A Chromium native HLS capability hint alone does
 not select native playback. No RelaySwarm integration is enabled here.
 
+Chrome playback uses complete segments and a ten-second live-edge target to
+absorb jitter in the publisher's upload. Back to live retains that headroom.
+This deliberately trades a short delay for continuity. It cannot recover
+quality already lost during preparation or compensate for an upload that stays
+slower than the encoded programme bitrate.
+
+The stream/privacy panel reports media dimensions, advertised bitrate/codecs,
+buffered video and estimated distance behind the receiver. It identifies
+broadcaster fields that the player is not given and states that the publisher's
+network route is not verifiable from this browser. It is not an anonymity
+attestation. Images, audio and timing can still identify a broadcaster.
+
+The footer attributes Apache 2.0 specifically to hls.js; Sapflow's own code
+remains MIT.
+
 ## Serve the public page
 
 Copy the contents of `web/tv/` into a separate public static directory. Do not
@@ -64,7 +79,7 @@ URLs, encryption key URLs, content steering, variable definitions, unknown
 playlist features and unexpected paths are refused. Media always returns
 through the local gateway. The local CSP further restricts network access.
 The preview uses complete segments with an approximately six-second start
-offset to reduce Tor round trips; public playback retains LL-HLS parts.
+offset to reduce Tor round trips; the receiver can still serve LL-HLS parts to other clients.
 Tor capacity and latency still vary. This is not a guarantee of uninterrupted
 playback or complete anonymity against traffic correlation, device compromise,
 identifying programme content or other applications on the Mac. Metadata

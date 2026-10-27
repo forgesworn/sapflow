@@ -23,7 +23,7 @@ function setup(overrides = {}) {
     static Events = { MANIFEST_PARSED: 'manifest', ERROR: 'error' };
     static isSupported() { return true; }
     handlers = new Map(); destroyed = false;
-    constructor() { handles.push(this); }
+    constructor(config) { this.config=config; handles.push(this); }
     on(name, fn) { this.handlers.set(name, fn); }
     loadSource(url) { this.url = url; }
     attachMedia() {} destroy() { this.destroyed = true; }
@@ -91,4 +91,24 @@ test('autoplay rejection leaves native controls available without a retry loop',
   assert.equal(s.timers.size, 0);
   assert.match(s.status.textContent, /Press play/);
   s.player.destroy();
+});
+
+test('TV keeps ten seconds of headroom and loads complete segments', async () => {
+  const s=setup(); s.watch.click(); await settle();
+  assert.equal(s.handles[0].config.lowLatencyMode, false);
+  assert.equal(s.handles[0].config.liveSyncDuration, 10);
+  assert(s.handles[0].config.liveMaxLatencyDuration > s.handles[0].config.liveSyncDuration);
+  s.player.destroy();
+});
+
+test('stream information reports received media fields and clears on Stop', async () => {
+  const info=Object.fromEntries(['picture','rate','codecs','buffer','delay'].map(key=>[key,new Element()]));
+  const s=setup({info}); s.watch.click(); await settle();
+  s.handles[0].handlers.get('manifest')(null,{levels:[{bitrate:2100000,videoCodec:'avc1.640029',audioCodec:'mp4a.40.2'}]});
+  s.video.videoWidth=1280;s.video.videoHeight=720;s.video.currentTime=20;
+  s.video.buffered={length:1,start:()=>10,end:()=>29};s.handles[0].latency=10.5;
+  s.video.dispatchEvent(new Event('timeupdate'));
+  assert.equal(info.picture.textContent,'1280 × 720');assert.equal(info.rate.textContent,'2.10 Mbit/s');
+  assert.equal(info.buffer.textContent,'9.0 seconds');assert.match(info.delay.textContent,/10.5 seconds/);
+  s.player.stop();assert.equal(info.rate.textContent,'Not yet reported');assert.equal(info.buffer.textContent,'Not playing');
 });

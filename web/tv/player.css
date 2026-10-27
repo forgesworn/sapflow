@@ -27,3 +27,13 @@ button:focus-visible, a:focus-visible { outline: 3px solid var(--accent); outlin
 #status { flex: 1; min-width: 180px; margin: 0; color: var(--muted); font-size: 14px; }
 footer { justify-content: space-between; border-top: 1px solid var(--line); padding: 24px 0 36px; color: var(--muted); font-size: 12px; }
 @media (max-width: 560px) { main { width: calc(100% - 24px); } .controls { gap: 12px; } #status { flex-basis: 100%; } .heading { padding-top: 24px; } }
+
+.stream-info { border-top: 1px solid var(--line); padding: 24px 0; }
+.stream-info h2 { font-size: 20px; margin: 0 0 6px; }
+.stream-info p { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+.stream-info dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 32px; margin: 0 0 20px; }
+.stream-info dl div { min-width: 0; }
+.stream-info dt { color: var(--muted); font-size: 12px; }
+.stream-info dd { margin: 3px 0 0; overflow-wrap: anywhere; }
+.stream-info .privacy-note { margin-bottom: 0; max-width: 80ch; }
+@media (max-width: 560px) { .stream-info dl { grid-template-columns: 1fr; } footer { flex-wrap: wrap; } }

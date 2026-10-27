@@ -4,10 +4,20 @@ const STREAM = '/tv/live/event-tv/index.m3u8';
 export function createTvPlayer({ video, watch, edge, status, indicator, placeholder,
   fetchImpl = globalThis.fetch.bind(globalThis), loadHls = () => import('./vendor/hls.light.min.mjs'),
   schedule = setTimeout, cancel = clearTimeout,
-  preferNative = globalThis.navigator?.vendor === 'Apple Computer, Inc.' } = {}) {
+  info = {}, preferNative = globalThis.navigator?.vendor === 'Apple Computer, Inc.' } = {}) {
   let watching = false, stopped = false, generation = 0, hls = null, request = null;
   let retry = null, delay = 1000, startupTimer = null;
   const listeners = [];
+  const field = (name, value) => { if (info[name]) info[name].textContent = value; };
+  function updateInfo() {
+    field('picture', video.videoWidth && video.videoHeight ? `${video.videoWidth} × ${video.videoHeight}` : 'Waiting for playback');
+    let ahead = 0;
+    for (let i = 0; i < (video.buffered?.length ?? 0); i++) {
+      if (video.buffered.start(i) <= video.currentTime && video.currentTime <= video.buffered.end(i)) ahead = video.buffered.end(i) - video.currentTime;
+    }
+    field('buffer', watching ? `${ahead.toFixed(1)} seconds` : 'Not playing');
+    field('delay', watching && Number.isFinite(hls?.latency) && hls.latency > 0 ? `${hls.latency.toFixed(1)} seconds (estimated)` : 'Not reported');
+  }
   const on = (target, name, fn) => { target.addEventListener(name, fn); listeners.push(() => target.removeEventListener(name, fn)); };
   function show(state, message) {
     indicator.dataset.state = state;
@@ -62,9 +72,15 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
           if (video.canPlayType('application/vnd.apple.mpegurl')) { video.src = STREAM; await play(token); return; }
           stop(); show('error', 'This browser cannot play the live channel.'); return;
         }
-        hls = new Hls({ lowLatencyMode: true, backBufferLength: 10, maxBufferLength: 15,
-          maxMaxBufferLength: 30, enableWorker: false });
-        hls.on(Hls.Events.MANIFEST_PARSED, () => { void play(token); });
+        hls = new Hls({ lowLatencyMode: false, liveSyncDuration: 10, liveMaxLatencyDuration: 20,
+          backBufferLength: 10, maxBufferLength: 20, maxMaxBufferLength: 30, enableWorker: false });
+        hls.on(Hls.Events.MANIFEST_PARSED, (_event, detail = {}) => {
+          if (token !== generation || !watching) return;
+          const level = detail.levels?.[0];
+          field('rate', level?.bitrate > 0 ? `${(level.bitrate / 1000000).toFixed(2)} Mbit/s` : 'Not advertised');
+          field('codecs', [level?.videoCodec, level?.audioCodec].filter(Boolean).join(', ') || 'Not advertised');
+          void play(token);
+        });
         hls.on(Hls.Events.ERROR, (_event, detail) => { if (detail.fatal) recover(token); });
         hls.loadSource(STREAM); hls.attachMedia(video);
       }
@@ -74,6 +90,7 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
     watching = false; generation++; clearMedia(); delay = 1000;
     watch.textContent = 'Watch live';
     show('idle', 'Press Watch live to tune in.');
+    field('rate', 'Not yet reported'); field('codecs', 'Not yet reported'); updateInfo();
   }
   on(watch, 'click', () => {
     if (watching) stop();
@@ -82,9 +99,10 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
   on(edge, 'click', () => {
     const position = hls?.liveSyncPosition;
     if (Number.isFinite(position)) video.currentTime = position;
-    else if (video.seekable.length) video.currentTime = Math.max(video.seekable.start(video.seekable.length - 1), video.seekable.end(video.seekable.length - 1) - 2);
+    else if (video.seekable.length) video.currentTime = Math.max(video.seekable.start(video.seekable.length - 1), video.seekable.end(video.seekable.length - 1) - 10);
     void play(generation);
   });
+  for (const name of ['loadedmetadata', 'timeupdate', 'progress', 'emptied']) on(video, name, updateInfo);
   on(video, 'playing', () => {
     if (!watching || stopped) return;
     if (startupTimer !== null) cancel(startupTimer);
@@ -100,6 +118,7 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
 if (typeof document !== 'undefined') {
   const player = createTvPlayer({ video: document.querySelector('#video'), watch: document.querySelector('#watch'),
     edge: document.querySelector('#live-edge'), status: document.querySelector('#status'),
-    indicator: document.querySelector('#indicator'), placeholder: document.querySelector('#placeholder') });
+    indicator: document.querySelector('#indicator'), placeholder: document.querySelector('#placeholder'),
+    info: Object.fromEntries(['picture', 'rate', 'codecs', 'buffer', 'delay'].map(key => [key, document.querySelector(`#media-${key}`)])) });
   addEventListener('pagehide', () => player.destroy(), { once: true });
 }
