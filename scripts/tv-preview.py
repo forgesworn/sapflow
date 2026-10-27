@@ -19,11 +19,17 @@ from tv_preview_transport import TorTransport
 HERE = Path(__file__).resolve().parent
 ASSETS = HERE.parent / "web/tv"
 STATIC = {"/tv/": ("index.html", "text/html; charset=utf-8"),
+          "/tv/licences.html": ("licences.html", "text/html; charset=utf-8"),
+          "/tv/LICENSE.txt": ("LICENSE.txt", "text/plain; charset=utf-8"),
+          "/tv/now-streaming.png": ("now-streaming.png", "image/png"),
+          "/tv/off-air.png": ("off-air.png", "image/png"),
+          "/tv/connection.mjs": ("connection.mjs", "text/javascript; charset=utf-8"),
+          "/tv/playlist.mjs": ("playlist.mjs", "text/javascript; charset=utf-8"),
+          "/tv/cmaf-player.mjs": ("cmaf-player.mjs", "text/javascript; charset=utf-8"),
+          "/tv/tone.mjs": ("tone.mjs", "text/javascript; charset=utf-8"),
           "/tv/player.css": ("player.css", "text/css; charset=utf-8"),
           "/tv/player.mjs": ("player.mjs", "text/javascript; charset=utf-8"),
-          "/tv/vendor/hls.light.min.mjs": ("vendor/hls.light.min.mjs", "text/javascript; charset=utf-8"),
-          "/tv/vendor/APACHE-2.0.txt": ("vendor/APACHE-2.0.txt", "text/plain; charset=utf-8"),
-          "/tv/vendor/hls.js-LICENSE": ("vendor/hls.js-LICENSE", "text/plain; charset=utf-8")}
+          "/tv/vendor/THIRD-PARTY-LICENCES.txt": ("vendor/THIRD-PARTY-LICENCES.txt", "text/plain; charset=utf-8")}
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
        "media-src 'self' blob:; img-src 'self'; base-uri 'none'; object-src 'none'; "
        "form-action 'none'; frame-ancestors 'none'")

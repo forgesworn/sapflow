@@ -31,7 +31,7 @@ function setup(overrides = {}) {
   const fetches = [];
   const player = createTvPlayer({ video, watch, edge, status, indicator, placeholder,
     fetchImpl: async (url, options) => { fetches.push({ url, options }); return { ok: true }; },
-    loadHls: async () => ({ default: Hls }), schedule: (fn) => { timers.set(++next, fn); return next; },
+    loadEngine: async () => ({ default: Hls }), schedule: (fn) => { timers.set(++next, fn); return next; },
     cancel: id => timers.delete(id), ...overrides });
   return { player, video, watch, edge, status, indicator, placeholder, timers, handles, fetches, Hls };
 }
@@ -54,7 +54,7 @@ test('a late fetch cannot restart playback after Stop', async () => {
 
 test('a late hls import cannot attach after Stop', async () => {
   let finish;
-  const s=setup({ loadHls: () => new Promise(r => { finish=r; }) });
+  const s=setup({ loadEngine: () => new Promise(r => { finish=r; }) });
   s.watch.click(); await settle(); s.watch.click(); finish({ default:s.Hls }); await settle();
   assert.equal(s.handles.length, 0);
 });
@@ -73,7 +73,7 @@ test('fatal engine errors dispose the old player before a retry', async () => {
 });
 
 test('native HLS needs no hls.js module and tears down its source', async () => {
-  const s=setup({ preferNative:true, loadHls: () => { throw Error('must not load'); } });
+  const s=setup({ preferNative:true, loadEngine: () => { throw Error('must not load'); } });
   s.video.native=true; s.watch.click(); await settle();
   assert.equal(s.video.currentSrc, '/tv/live/event-tv/index.m3u8');
   assert.equal(s.video.plays, 1); s.player.destroy(); assert.equal(s.video.currentSrc, '');
@@ -111,4 +111,38 @@ test('stream information reports received media fields and clears on Stop', asyn
   assert.equal(info.picture.textContent,'1280 × 720');assert.equal(info.rate.textContent,'2.10 Mbit/s');
   assert.equal(info.buffer.textContent,'9.0 seconds');assert.match(info.delay.textContent,/10.5 seconds/);
   s.player.stop();assert.equal(info.rate.textContent,'Not yet reported');assert.equal(info.buffer.textContent,'Not playing');
+});
+
+
+test('NOW STREAMING ident follows a successful availability check and clears on Stop', async () => {
+  const s=setup(); assert.equal(s.placeholder.dataset.kind, undefined);
+  s.watch.click(); await settle(); assert.equal(s.placeholder.dataset.kind,'streaming');
+  s.video.dispatchEvent(new Event('playing')); assert.equal(s.placeholder.hidden,true);
+  s.player.stop(); assert.equal(s.placeholder.dataset.kind,'standby'); assert.equal(s.placeholder.hidden,false);
+  s.player.destroy();
+});
+
+test('off-air responses never show the NOW STREAMING ident', async () => {
+  const s=setup({fetchImpl:async()=>({ok:false})});
+  s.watch.click();await settle();assert.equal(s.placeholder.dataset.kind,'standby');s.player.destroy();
+});
+
+
+test('private preview disables peer consent even when previously checked',async()=>{
+ const peers=new Element();peers.checked=true;let calls=0;
+ const s=setup({peers,locationImpl:new URL('http://127.0.0.1:9999/tv/'),loadPeers:async()=>{calls++;throw Error('forbidden');}});
+ s.watch.click();await settle();assert(peers.disabled);assert.equal(peers.checked,false);assert.equal(calls,0);s.player.destroy();
+});
+
+test('a late peer setup cannot attach after Stop',async()=>{
+ const peers=new Element();peers.checked=true;let finish,stops=0;
+ const s=setup({peers,locationImpl:new URL('https://receiver.example/tv/'),loadPeers:async()=>({attachPeers:()=>new Promise(r=>finish=r)})});
+ s.watch.click();await settle();s.player.stop();finish({stop:()=>stops++,stream:'/media/index.m3u8'});await settle();assert.equal(stops,1);assert.equal(s.handles[0].url,undefined);s.player.destroy();
+});
+
+test('failed peer media falls back to the receiver on reconnect',async()=>{
+ const peers=new Element();peers.checked=true;let calls=0;
+ const s=setup({peers,locationImpl:new URL('https://receiver.example/tv/'),loadPeers:async()=>({attachPeers:async()=>{calls++;return {stop(){},stream:'/media/index.m3u8'};}})});
+ s.watch.click();await settle();assert.equal(s.handles[0].url,'/media/index.m3u8');
+ s.handles[0].handlers.get('error')(null,{fatal:true});const retry=[...s.timers.values()][0];retry();await settle();assert.equal(calls,1);assert.equal(s.handles[1].url,'/tv/live/event-tv/index.m3u8');s.player.destroy();
 });

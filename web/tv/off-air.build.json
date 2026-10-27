@@ -1,0 +1,9 @@
+{
+  "model": "gpt-image-2.5-sunburst",
+  "quality": "high",
+  "size": "1536x864",
+  "background": "opaque",
+  "provenance": "Newly generated artwork; no reference images or camera media supplied.",
+  "prompt": "off-air.prompt.txt",
+  "sha256": "69ad60c8ab8a87b342f3277cb43cddf383cdc688b30e51d4c5d05ea19eb0f908"
+}

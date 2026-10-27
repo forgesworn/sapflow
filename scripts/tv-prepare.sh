@@ -180,7 +180,7 @@ encode_one() { # src tmp_out
     -map 0:v:0 "${amap[@]}" -map_metadata -1 -map_chapters -1 -sn -dn \
     -vf "$vf" -fps_mode cfr -r "$TV_FPS" "${venc[@]}" \
     -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
-    -af "aresample=${TV_AUDIO_RATE}:async=1:first_pts=0" \
+    -af "aresample=${TV_AUDIO_RATE}:async=1:first_pts=0,apad" -shortest \
     -c:a aac -profile:a aac_low -b:a "$TV_AUDIO_BITRATE" -ar "$TV_AUDIO_RATE" -ac 2 \
     -movflags +faststart -f mp4 "$out"
 }

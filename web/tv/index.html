@@ -12,8 +12,23 @@
     <header><a class="brand" href="/tv/">Forge<span>Sworn</span></a><span class="channel">TV</span></header>
     <section aria-labelledby="channel-title">
       <div class="heading"><div><p class="eyebrow">The live channel</p><h1 id="channel-title">ForgeSworn TV</h1></div><span id="indicator" class="indicator" data-state="idle">Ready</span></div>
-      <div class="screen"><video id="video" controls playsinline preload="none" aria-label="ForgeSworn TV live programme"></video><div id="placeholder"><span class="signal" aria-hidden="true">FS</span><p>Pull up a chair.</p></div></div>
-      <div class="controls"><button id="watch" type="button">Watch live</button><button id="live-edge" type="button" disabled>Back to live</button><p id="status" role="status" aria-live="polite">Press Watch live to tune in.</p></div>
+      <div class="screen"><video id="video" controls playsinline preload="none" aria-label="ForgeSworn TV live programme"></video><div id="placeholder"><span id="standby-title" class="standby-title">Standby</span><p>ForgeSworn TV</p></div></div>
+      <p class="vpn-note"><strong>Use a VPN for privacy.</strong> Choose one that covers all browser and peer traffic, with a kill switch. This page cannot verify your VPN.</p>
+      <div class="controls"><button id="watch" type="button">Watch live</button><button id="live-edge" type="button" disabled>Back to live</button><button id="test-tone" type="button" aria-pressed="false">Play quiet test tone</button><p id="status" role="status" aria-live="polite">Press Watch live to tune in.</p></div>
+    </section>
+    <section class="stream-info" aria-labelledby="peer-title">
+      <h2 id="peer-title">RelaySwarm peer assistance</h2>
+      <p><label><input id="peer-assist" type="checkbox"> Receive and share verified video with other viewers</label></p>
+      <p>Optional. Peers and the Cloudflare STUN service may see your connection IP. Use a VPN that covers WebRTC traffic. Sharing is capped at 250 kB/s and 128 MiB per viewing session, and pauses on detected mobile data. The receiver remains the fallback.</p>
+      <p id="peer-status" role="status">Off. No peer connections.</p>
+    </section>
+    <section class="stream-info" aria-labelledby="connection-title">
+      <h2 id="connection-title">What your viewing connection reveals</h2>
+      <p>This is what the HTTPS edge can see when you connect.</p>
+      <dl><div><dt>Public IP address</dt><dd id="viewer-ip">Checking this connection</dd></div>
+      <div><dt>Approximate location</dt><dd id="viewer-location">Checking this connection</dd></div>
+      <div><dt>Network provider</dt><dd id="viewer-network">Checking this connection</dd></div></dl>
+      <p class="privacy-note">IP location can be wrong. It does not reveal your street address or name. A VPN changes the visible connection address; this page cannot verify your VPN. This result is not stored by the TV application or sent to a separate lookup service.</p>
     </section>
     <section class="stream-info" aria-labelledby="info-title">
       <h2 id="info-title">Stream and privacy</h2>
@@ -23,7 +38,7 @@
         <div><dt>Broadcaster name or account</dt><dd>Not supplied to this player</dd></div>
         <div><dt>Original filename, device or location</dt><dd>Not supplied as player fields</dd></div>
         <div><dt>Publisher's network route</dt><dd>This player cannot verify it</dd></div>
-        <div><dt>Peer connections</dt><dd>Disabled in this player</dd></div>
+        <div><dt>Peer connections</dt><dd>Viewer opt-in only; always disabled in the private Mac preview</dd></div>
         <div><dt>Decoded picture</dt><dd id="media-picture">Waiting for playback</dd></div>
         <div><dt>Advertised stream rate</dt><dd id="media-rate">Not yet reported</dd></div>
         <div><dt>Advertised codecs</dt><dd id="media-codecs">Not yet reported</dd></div>
@@ -32,7 +47,7 @@
       </dl>
       <p class="privacy-note">These observations do not prove anonymity. Picture, sound and timing can identify a broadcaster. Your viewing connection is separate from the publisher's connection.</p>
     </section>
-    <footer><span>Live from the channel.</span><span><a href="/tv/vendor/hls.js-LICENSE">hls.js notices</a> · <a href="/tv/vendor/APACHE-2.0.txt">hls.js licence: Apache 2.0</a></span></footer>
+    <footer><span>Live from the channel.</span><span><a href="/tv/licences.html">Software licences</a></span></footer>
   </main>
   <script type="module" src="/tv/player.mjs"></script>
 </body>

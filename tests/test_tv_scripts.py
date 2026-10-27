@@ -281,6 +281,20 @@ class PrepareRoundTrip(unittest.TestCase):
             check=True, timeout=120,
         )
 
+    def test_short_audio_is_padded_to_video_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src,out=Path(tmp)/'src',Path(tmp)/'out';src.mkdir()
+            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','color=c=red:s=320x180:r=25:d=3',
+                            '-f','lavfi','-i','sine=r=48000:d=0.5','-c:v','libx264','-preset','ultrafast',
+                            '-pix_fmt','yuv420p','-c:a','aac',str(src/'generated.mp4')],check=True,timeout=60)
+            env=dict(os.environ,TV_ENCODER='libx264',TV_PRESET='ultrafast',TV_WIDTH='320',TV_HEIGHT='180')
+            prepared=subprocess.run(['bash',str(PREPARE),str(src),str(out)],capture_output=True,text=True,env=env,timeout=60)
+            self.assertEqual(prepared.returncode,0,prepared.stderr)
+            probe=subprocess.run(['ffprobe','-v','error','-show_entries','stream=codec_type,duration','-of','json',str(out/'generated.mp4')],capture_output=True,text=True,check=True)
+            durations={row['codec_type']:float(row['duration']) for row in json.loads(probe.stdout)['streams']}
+            self.assertGreaterEqual(durations['audio'],durations['video']-.022)
+            self.assertLessEqual(durations['audio'],durations['video']+.05)
+
     def test_mixed_sources_come_out_identical_and_reruns_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
             src, out = Path(tmp) / "src", Path(tmp) / "out"

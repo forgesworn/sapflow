@@ -284,3 +284,13 @@ bytes and catches only expected `IllegalArgumentException` refusals. Seed with
 the synthetic short/long fragment layout used by its ten JUnit controls; do not
 use camera or private source identities. A coverage-guided campaign and replay
 are pending. Parser/host checks do not qualify native codecs or presentation.
+
+### TV complete-fragment playlists and channel rendezvous (JavaScript)
+
+`node fuzz/tv_playlist_fuzz.mjs 20000` exercises the bounded Sapflow-only master
+and media parsers used by the MIT browser engine and receiver mirror.
+`node fuzz/tv_swarm_fuzz.mjs 20000` mutates JSON event/filter inputs to the
+single-channel signalling validators after building the pinned sidecar with
+`python3 tools/tv-relayswarm/fetch.py && node tools/tv-relayswarm/build.mjs`.
+Both are finite deterministic mutation gates, not coverage-guided campaigns.
+CI's smoke job runs them alongside the private preview policy mutation gate.

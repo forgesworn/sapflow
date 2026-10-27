@@ -1,0 +1,1 @@
+{"name":"sapflow-tv-relayswarm","private":true,"type":"module","license":"MIT","engines":{"node":">=22.13"},"dependencies":{"nostr-tools":"2.24.1","ws":"8.21.3"},"devDependencies":{"esbuild":"0.28.2"}}

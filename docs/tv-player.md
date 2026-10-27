@@ -1,16 +1,31 @@
 # Receiver TV page and private preview
 
-`web/tv/` is a standalone, origin-only TV player for
+`web/tv/` is a standalone TV player for
 `/tv/live/event-tv/index.m3u8`. It fetches no media before **Watch live**.
 **Stop watching** aborts pending startup and disposes the media engine.
 Off-air responses retry with bounded backoff while watching. **Back to live**
 uses the engine's live position. The native video controls support pause,
 volume, fullscreen and seeking within the available window.
 
-There are no analytics, external fonts, remote scripts, signalling or peer
-connections. Safari uses native HLS; other supported browsers use the local,
-pinned hls.js light module. A Chromium native HLS capability hint alone does
-not select native playback. No RelaySwarm integration is enabled here.
+There are no analytics, external fonts or remote scripts. Safari normally uses
+native HLS; Chrome uses Sapflow's own MIT complete-fragment MediaSource player.
+It consumes the receiver's single H.264/AAC fMP4 rendition, without a general
+HLS transmuxer or hls.js dependency. The strict 64 KiB playlist parser refuses
+external references and unsupported features; fragments are limited to 8 MiB.
+
+Viewer RelaySwarm assistance is explicitly opt-in. Enabling it selects the
+MediaSource engine and receiver-side `/media/` mirror. Peers supply only media
+verified against the receiver's signed, playlist-bound commitments. HTTP remains
+the fallback; peer waiting is capped at 500 ms with a three-second origin reserve.
+Upload is capped at 250 kB/s and 128 MiB per viewing session. The page always
+recommends a VPN covering browser and WebRTC traffic with a kill switch.
+Peers and the configured STUN service may see the viewer's connection address.
+No VPN or anonymity claim is inferred from a successful connection.
+
+The private loopback Mac preview forcibly disables peer controls, never imports
+the SDK and does not serve the peer module or SDK/WASM assets. It also skips the
+edge IP lookup. The Mac's publishing route stays independent of viewer sharing.
+See [the receiver adapter](tv-relayswarm.md) for setup and boundaries.
 
 Chrome playback uses complete segments and a ten-second live-edge target to
 absorb jitter in the publisher's upload. Back to live retains that headroom.
@@ -24,8 +39,20 @@ broadcaster fields that the player is not given and states that the publisher's
 network route is not verifiable from this browser. It is not an anonymity
 attestation. Images, audio and timing can still identify a broadcaster.
 
-The footer attributes Apache 2.0 specifically to hls.js; Sapflow's own code
-remains MIT.
+The footer links to the MIT player licence and the actual permissive dependency
+notices. hls.js and its Apache licence are no longer distributed by this page.
+Sunburst-generated standby and NOW STREAMING cards have saved prompts and digest
+receipts. The on-air card appears only after an availability response while the
+player starts. The user-controlled 1 kHz tone starts quietly, never automatically,
+and stops when live playback starts or the viewer stops.
+
+The same-origin edge endpoint `/tv/connection` returns that request's public IP,
+approximate city/region/country and network provider. It uses Cloudflare's already
+available request metadata, with no separate lookup, application storage or
+per-viewer logging. This does not describe the platform's security logs. It does
+not identify a street address or name, or establish whether a VPN is running.
+Deploy `edge/tv-connection.mjs` as a Worker scoped to that exact route; missing
+edge information displays unavailable without affecting playback.
 
 ## Serve the public page
 
@@ -42,7 +69,8 @@ verify that other relay routes still work, and rehearse restoring the saved
 configuration. If the existing site has a deferred, unconditional CSP header, turn that
 header into a `?Content-Security-Policy` default so it respects the TV policy.
 Check that other routes retain their existing CSP. The player needs
-`media-src 'self' blob:` for Media Source Extensions. No inline scripts, `eval`, worker or external origin is required.
+`media-src 'self' blob:` for Media Source Extensions. No inline scripts or JavaScript `eval` is required. The public peer-enabled policy
+allows WASM compilation and same-host WSS; the private preview keeps both disabled.
 
 The public URL is for ordinary viewers. Opening it normally reveals that
 browser's connection address to the HTTPS endpoint and any intermediary.
@@ -78,7 +106,7 @@ The preview accepts only Sapflow's current, bounded playlist subset. Absolute
 URLs, encryption key URLs, content steering, variable definitions, unknown
 playlist features and unexpected paths are refused. Media always returns
 through the local gateway. The local CSP further restricts network access.
-The preview uses complete segments with an approximately six-second start
+The preview uses complete segments with an approximately ten-second start
 offset to reduce Tor round trips; the receiver can still serve LL-HLS parts to other clients.
 Tor capacity and latency still vary. This is not a guarantee of uninterrupted
 playback or complete anonymity against traffic correlation, device compromise,
@@ -92,7 +120,8 @@ for measured results and the remaining Safari acceptance gate.
 ## Verification and third-party software
 
 ```sh
-node --test tests/tv-player.test.mjs
+node --test tests/tv-player.test.mjs tests/tv-playlist.test.mjs tests/tv-tone.test.mjs tests/tv-connection.test.mjs tests/tv-peers.test.mjs
+node fuzz/tv_playlist_fuzz.mjs 20000
 python3 -B tests/test_tv_preview.py
 python3 -B scripts/check-tv-assets.py
 python3 -B fuzz/tv_preview_fuzz.py 20000
@@ -107,9 +136,9 @@ network isolation and Stop, retaining generated evidence in `target/tv-browser`.
 The Python mutation gate is finite and is not coverage-guided fuzzing. A
 WebKit run is distinct from physical Safari or iPhone acceptance.
 
-hls.js light 1.7.3 is vendored under Apache 2.0, including its upstream notice
-and complete licence. `web/tv/vendor/hls.build.json` records upstream package
-integrity and the local file hash. Only the source map comment was removed.
+RelaySwarm 0.4.4 browser and core assets are pinned by SHA-256 in
+`tools/tv-relayswarm/pins.json`. Runtime dependency notices are distributed under
+`web/tv/vendor/THIRD-PARTY-LICENCES.txt`, alongside the MIT player licence.
 The preview optionally installs PycURL 7.49.0, with distribution hashes pinned
 in `scripts/requirements-tv-preview.txt`, using the MIT option of its dual
 licence. PycURL and its bundled libcurl dependencies are installed separately;

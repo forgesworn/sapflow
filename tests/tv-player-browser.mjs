@@ -47,14 +47,21 @@ try {
     return v.currentTime>1 && (v.getVideoPlaybackQuality?.().totalVideoFrames ?? v.webkitDecodedFrameCount ?? 0)>10;
   }, null, { timeout:90000 });
   const snapshots=[];
-  const sample=()=>page.evaluate(() => {
+  const sample=()=>page.evaluate((checkCuts) => {
     const v=document.querySelector('video'), q=v.getVideoPlaybackQuality?.();
+    let colour=null;
+    if (checkCuts && v.videoWidth) {
+      const canvas=document.createElement('canvas');canvas.width=canvas.height=1;
+      const context=canvas.getContext('2d');context.drawImage(v,0,0,1,1);
+      const rgb=Array.from(context.getImageData(0,0,1,1).data).slice(0,3);
+      colour=['red','green','blue'][rgb.indexOf(Math.max(...rgb))];
+    }
     return { time:v.currentTime, frames:q?.totalVideoFrames ?? v.webkitDecodedFrameCount ?? 0,
       dropped:q?.droppedVideoFrames ?? v.webkitDroppedFrameCount ?? 0,
       width:v.videoWidth,height:v.videoHeight,readyState:v.readyState,paused:v.paused,
       audioBytes:v.webkitAudioDecodedByteCount ?? null,peerAttempts:window.__peerAttempts,
-      state:document.querySelector('#indicator').dataset.state };
-  });
+      state:document.querySelector('#indicator').dataset.state,colour };
+  },process.env.SAPFLOW_TV_TEST_CUTS==='1');
   const initial=await sample(); snapshots.push(initial);
   const audio=await page.evaluate(async () => {
     const Audio=window.AudioContext ?? window.webkitAudioContext;
@@ -63,9 +70,12 @@ try {
     const source=context.createMediaElementSource(document.querySelector('video'));
     const analyser=context.createAnalyser(), silent=context.createGain(); silent.gain.value=0;
     source.connect(analyser); analyser.connect(silent); silent.connect(context.destination);
-    await new Promise(resolve=>setTimeout(resolve,500));
-    const values=new Float32Array(analyser.fftSize); analyser.getFloatTimeDomainData(values);
-    const rms=Math.sqrt(values.reduce((sum,x)=>sum+x*x,0)/values.length);
+    let rms=0;
+    const values=new Float32Array(analyser.fftSize);
+    for (let attempt=0;attempt<50 && rms<=0.00001;attempt++) {
+      await new Promise(resolve=>setTimeout(resolve,100));analyser.getFloatTimeDomainData(values);
+      rms=Math.sqrt(values.reduce((sum,x)=>sum+x*x,0)/values.length);
+    }
     window.__audioProbe={ context,source,analyser,silent };
     return { available:true,rms };
   });
@@ -79,11 +89,12 @@ try {
   });
   measuring=true;
   const started=Date.now();
-  while (Date.now()-started<seconds*1000) { await page.waitForTimeout(5000); snapshots.push(await sample()); }
+  while (Date.now()-started<seconds*1000) { await page.waitForTimeout(process.env.SAPFLOW_TV_TEST_CUTS==='1'?1000:5000); snapshots.push(await sample()); }
   const final=snapshots.at(-1);
   const stallSeconds=await page.evaluate(()=>window.__stall.seconds+(window.__stall.started===null?0:(performance.now()-window.__stall.started)/1000));
   assert(delayedFragment,'real media fetch was delayed for three seconds');
   assert(stallSeconds<1,'buffer absorbs a three-second fragment delay');
+  if(process.env.SAPFLOW_TV_TEST_CUTS==='1') assert.equal(new Set(snapshots.map(row=>row.colour).filter(Boolean)).size,3,'all three tracks played');
   assert(final.frames>initial.frames+seconds*18, 'sustained decoding exceeds 18 frames per second');
   assert(final.time>initial.time+seconds*.85, 'playback keeps pace with wall time');
   assert(final.dropped-initial.dropped < (final.frames-initial.frames)*.1, 'fewer than 10% dropped frames');

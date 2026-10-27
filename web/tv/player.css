@@ -37,3 +37,11 @@ footer { justify-content: space-between; border-top: 1px solid var(--line); padd
 .stream-info dd { margin: 3px 0 0; overflow-wrap: anywhere; }
 .stream-info .privacy-note { margin-bottom: 0; max-width: 80ch; }
 @media (max-width: 560px) { .stream-info dl { grid-template-columns: 1fr; } footer { flex-wrap: wrap; } }
+
+#placeholder { background: #10110f url('/tv/off-air.png') center / cover no-repeat; }
+.standby-title { color: var(--text); font-size: clamp(26px, 7vw, 72px); font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }
+.vpn-note { padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); font-size: 14px; margin-bottom: 0; }
+.vpn-note strong { color: var(--accent); }
+
+#placeholder[data-kind="streaming"] { background-image: url('/tv/now-streaming.png'); }
+#placeholder[data-kind="streaming"] > * { visibility: hidden; }

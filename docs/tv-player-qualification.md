@@ -32,3 +32,32 @@ publishing and large-audience capacity are also outside this check.
 Only generated test patterns and sine-wave audio were broadcast. The test
 publisher and preview processes are stopped after qualification. No personal
 programme, camera footage or frames are published by this work.
+
+## Complete-fragment MIT player and continuity follow-up
+
+The historical hls.js receipt above predates the replacement player. The new
+MediaSource engine uses Sapflow's own strict master/media playlist parser and
+native fMP4 decoding. A 60-second public Chrome observation decoded 1,480 frames
+with 59.227 seconds of media progression, no dropped frames or buffering events,
+and no hls.js module loaded. This short observation does not clear the owner's
+reported long-running pauses or physical Safari acceptance.
+
+Prepared programme diagnosis found two AAC tail gaps of 2.461 and 1.272 seconds
+while video timestamps remained continuous. Preparation now pads short audio to
+the video end, and playout maintains a continuous audio clock across file cuts.
+A generated three-track fixture deliberately includes short audio tails, checks
+all three decoded colours plus a loop, and injects a three-second fragment delay.
+The player, quiet-tone lifecycle, artwork availability state, peer consent and
+private-preview restrictions have separate unit regressions. The image prompts
+and model/digest receipts establish generated artwork provenance, without camera
+references. Two-peer and hosted CI receipts are recorded with the delivered PR;
+local loopback peer results do not qualify restrictive NATs or audience capacity.
+
+The generated two-browser gate received 47,522 verified peer bytes, rejected a
+corrupted signed commitment, advanced 10.025 seconds after its serving peer
+left, and reported zero connected peers after Stop. The separate origin-only
+fixture decoded 507 frames over 20.341 seconds with audio, all three track
+colours, no external requests and no peer attempts. Loopback peer ICE used an
+explicit fake-device permission accommodation; production does not request
+camera or microphone access. These are finite checks, not public-NAT or
+long-show acceptance.

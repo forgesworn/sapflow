@@ -301,7 +301,8 @@ main() {
     in+=(-f concat -safe 0 -i "$work/list.txt")
     local -a codec=(-map 0:v:0 -map 0:a:0 -c:v copy)
     if [ "$audio" = encode ]; then
-      codec+=(-c:a aac -profile:a aac_low -b:a "$TV_AUDIO_BITRATE" -ar 48000 -ac 2)
+      codec+=(-af "aresample=48000:async=1:first_pts=0"
+        -c:a aac -profile:a aac_low -b:a "$TV_AUDIO_BITRATE" -ar 48000 -ac 2)
     else
       codec+=(-c:a copy)
     fi
