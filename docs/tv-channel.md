@@ -1,5 +1,10 @@
 # A linear TV channel
 
+For publishing from a Mac while hiding its network address from the receiver,
+see [private TV publishing](private-tv-publishing.md). It uses onion-only SSH
+through Tor with mandatory metadata stripping and no direct fallback. Ordinary
+SRT/RTMP publishing below does not hide the publisher's address from the receiver.
+
 Prepare a folder once, then publish it continuously to one Sapflow path. Sources
 stay untouched. Live gigs from phones or OBS use separate paths and credentials:
 their encoder formats need not match the channel. Switching a single player
