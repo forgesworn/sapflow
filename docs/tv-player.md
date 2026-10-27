@@ -27,7 +27,8 @@ the SDK and does not serve the peer module or SDK/WASM assets. It also skips the
 edge IP lookup. The Mac's publishing route stays independent of viewer sharing.
 See [the receiver adapter](tv-relayswarm.md) for setup and boundaries.
 
-Chrome playback uses complete segments and a ten-second live-edge target to
+Chrome playback overlaps at most four complete-fragment downloads, appends them
+in order and uses a ten-second live-edge target to
 absorb jitter in the publisher's upload. Back to live retains that headroom.
 This deliberately trades a short delay for continuity. It cannot recover
 quality already lost during preparation or compensate for an upload that stays

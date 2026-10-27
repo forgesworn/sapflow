@@ -36,3 +36,13 @@ test('fragment loader can start after the swarm pre-load abort without stale cal
     assert.equal(data.data.byteLength,3);assert.equal(loader.stats.aborted,false);
   }finally{loader.destroy();globalThis.fetch=original;}
 });
+
+
+test('Stop aborts all concurrent fragment transfers and releases their loaders',async()=>{
+ const {default:Engine}=await import('../web/tv/cmaf-player.mjs');const loaders=[];
+ class Loader {stats={};constructor(){loaders.push(this);}load(){}abort(){this.aborted=true;}destroy(){this.destroyed=true;this.abort();}}
+ const engine=new Engine({loader:Loader});
+ const pending=Array.from({length:4},(_,i)=>engine.download({name:`012345abcdef_seg${i}.mp4`,sn:i,cc:0,position:i,duration:1},'http://127.0.0.1/media/stream.m3u8'));
+ assert.equal(loaders.length,4);engine.destroy();const results=await Promise.allSettled(pending);
+ assert(results.every(r=>r.status==='rejected'));assert(loaders.every(l=>l.aborted&&l.destroyed));assert.equal(engine.loaders.size,0);
+});

@@ -43,7 +43,7 @@ export default class CmafPlayer {
   constructor(config={}) {
     this.config={loader:FetchLoader,fLoader:undefined,progressive:false,liveSyncDuration:10,...config};
     this.listeners=new Map();this.controller=new AbortController();this.media=null;this.source=null;this.buffer=null;this.objectUrl=null;this.url=null;
-    this.levels=[];this.currentLevel=this.loadLevel=0;this.latestLevelDetails=null;this.offset=null;this.edge=null;this.positions=new Map();this.initialised=false;this.started=false;this.loader=null;
+    this.levels=[];this.currentLevel=this.loadLevel=0;this.latestLevelDetails=null;this.offset=null;this.edge=null;this.positions=new Map();this.initialised=false;this.started=false;this.loaders=new Set();
   }
   on(name,callback){if(!this.listeners.has(name))this.listeners.set(name,new Set());this.listeners.get(name).add(callback);}
   off(name,callback){this.listeners.get(name)?.delete(callback);}
@@ -55,19 +55,23 @@ export default class CmafPlayer {
   async text(url){const response=await fetch(url,{signal:AbortSignal.any([this.controller.signal,AbortSignal.timeout(10000)]),redirect:'error',cache:'no-store',credentials:'omit'});return new TextDecoder('ascii',{fatal:true}).decode(await boundedBytes(response,65536));}
   begin(){if(this.started||!this.media||!this.url)return;this.started=true;void this.run().catch(error=>{if(!this.controller.signal.aborted)this.trigger(CmafPlayer.Events.ERROR,{fatal:true,details:error.message});});}
   async append(bytes){if(this.buffer.updating)await waitEvent(this.buffer,'updateend',this.controller.signal);await waitEvent(this.buffer,'updateend',this.controller.signal,()=>this.buffer.appendBuffer(bytes));}
-  async fragment(record,playlistUrl,initialisation=false) {
+  async download(record,playlistUrl,initialisation=false) {
     const url=new URL(initialisation?record.init:record.name,playlistUrl).href;
     const frag={url,sn:initialisation?'initSegment':record.sn,cc:record.cc,level:0,type:'main',start:this.offset===null?0:this.offset+record.position,duration:record.duration,baseurl:playlistUrl};
-    const context={url,frag,responseType:'arraybuffer'};const Loader=this.config.fLoader??this.config.loader;const loader=new Loader(this.config);this.loader=loader;frag.stats=loader.stats;
+    const context={url,frag,responseType:'arraybuffer'};const Loader=this.config.fLoader??this.config.loader;const loader=new Loader(this.config);this.loaders.add(loader);frag.stats=loader.stats;
     this.trigger(CmafPlayer.Events.FRAG_LOADING,{frag});
-    const response=await new Promise((resolve,reject)=>{
+    let response;try{response=await new Promise((resolve,reject)=>{
       const abort=()=>{loader.abort();reject(new DOMException('Stopped','AbortError'));};this.controller.signal.addEventListener('abort',abort,{once:true});
       const finish=fn=>(...args)=>{this.controller.signal.removeEventListener('abort',abort);fn(...args);};
       loader.load(context,{timeout:15000,loadPolicy:{maxLoadTimeMs:15000}}, {onSuccess:finish((data,stats)=>resolve({data:data.data,stats})),onError:finish(error=>reject(Error(error.text??'Fragment failed'))),onTimeout:finish(()=>reject(Error('Fragment timed out')))});
     });
+    }catch(error){loader.destroy();this.loaders.delete(loader);throw error;}
     this.trigger(CmafPlayer.Events.FRAG_LOADED,{frag,stats:response.stats,payload:response.data});
-    await this.append(response.data);response.stats.buffering.end=performance.now();
-    this.trigger(CmafPlayer.Events.FRAG_BUFFERED,{frag,stats:response.stats});loader.destroy();if(this.loader===loader)this.loader=null;
+    return {frag,loader,...response};
+  }
+  async appendDownloaded({frag,loader,data,stats}) {
+    try{await this.append(data);stats.buffering.end=performance.now();this.trigger(CmafPlayer.Events.FRAG_BUFFERED,{frag,stats});}
+    finally{loader.destroy();this.loaders.delete(loader);}
   }
   async run() {
     const master=parseMaster(await this.text(this.url)),mime=`video/mp4; codecs="${master.codec}"`;
@@ -90,29 +94,39 @@ export default class CmafPlayer {
       this.latestLevelDetails={live:!parsed.end,edge:this.edge+(this.offset??0),startSN:first.sn,endSN:last.sn,fragments:segments};
       this.levels[0].details=this.latestLevelDetails;
       this.trigger(CmafPlayer.Events.LEVEL_UPDATED,{details:this.latestLevelDetails,level:0});
-      for(const segment of segments) {
-        if(segment.sn<next)continue;
+      for(let index=0;index<segments.length;) {
+        const segment=segments[index];
+        if(segment.sn<next){index++;continue;}
         if(this.initialised&&this.buffer.buffered.length&&this.buffer.buffered.end(this.buffer.buffered.length-1)-this.media.currentTime>20)break;
-        next=segment.sn+1;if(segment.gap)continue;
-        if(segment.init!==lastInit){await this.fragment(segment,playlistUrl,true);lastInit=segment.init;}
-        await this.fragment(segment,playlistUrl);
-        if(this.offset===null&&this.buffer.buffered.length)this.offset=this.buffer.buffered.start(0)-segment.position;
-        if(this.buffer.buffered.length) {
-          const ranges=this.buffer.buffered,end=ranges.end(ranges.length-1),start=ranges.start(ranges.length-1);
-          if(!this.initialised&&end-start>=Math.min(8,this.config.liveSyncDuration)) {
-            this.initialised=true;this.media.currentTime=Math.max(start,Math.min(this.liveSyncPosition,end-.1));
-            this.trigger(CmafPlayer.Events.MANIFEST_PARSED,{levels:this.levels});
+        if(segment.gap){next=segment.sn+1;index++;continue;}
+        if(segment.init!==lastInit){await this.appendDownloaded(await this.download(segment,playlistUrl,true));lastInit=segment.init;}
+        // Hide Tor round trips behind at most four complete-fragment transfers.
+        // Native appends remain ordered; no fragment crosses an init epoch.
+        const batch=[];
+        while(index<segments.length&&batch.length<4&&!segments[index].gap&&segments[index].init===lastInit)batch.push(segments[index++]);
+        const downloaded=batch.map(item=>this.download(item,playlistUrl).then(value=>({value}),error=>({error})));
+        for(let item=0;item<batch.length;item++) {
+          const segment=batch[item];next=segment.sn+1;
+          const result=await downloaded[item];if(result.error)throw result.error;
+          await this.appendDownloaded(result.value);
+          if(this.offset===null&&this.buffer.buffered.length)this.offset=this.buffer.buffered.start(0)-segment.position;
+          if(this.buffer.buffered.length) {
+            const ranges=this.buffer.buffered,end=ranges.end(ranges.length-1),start=ranges.start(ranges.length-1);
+            if(!this.initialised&&end-start>=Math.min(8,this.config.liveSyncDuration)) {
+              this.initialised=true;this.media.currentTime=Math.max(start,Math.min(this.liveSyncPosition,end-.1));
+              this.trigger(CmafPlayer.Events.MANIFEST_PARSED,{levels:this.levels});
+            }
+            if(this.initialised&&this.media.currentTime<start-.1)this.media.currentTime=start;
+            if(this.initialised&&this.liveSyncPosition-this.media.currentTime>12)this.media.currentTime=Math.max(start,this.liveSyncPosition);
+            this.source.setLiveSeekableRange(ranges.start(0),Math.max(end,this.offset+this.edge));
+            const keep=this.media.currentTime-15;
+            if(keep>ranges.start(0)+5)await waitEvent(this.buffer,'updateend',this.controller.signal,()=>this.buffer.remove(0,keep));
           }
-          if(this.initialised&&this.media.currentTime<start-.1)this.media.currentTime=start;
-          if(this.initialised&&this.liveSyncPosition-this.media.currentTime>12)this.media.currentTime=Math.max(start,this.liveSyncPosition);
-          this.source.setLiveSeekableRange(ranges.start(0),Math.max(end,this.offset+this.edge));
-          const keep=this.media.currentTime-15;
-          if(keep>ranges.start(0)+5)await waitEvent(this.buffer,'updateend',this.controller.signal,()=>this.buffer.remove(0,keep));
         }
       }
       if(parsed.end)return;
       await new Promise(resolve=>{const timer=setTimeout(done,500);const signal=this.controller.signal;function done(){clearTimeout(timer);signal.removeEventListener('abort',done);resolve();}signal.addEventListener('abort',done,{once:true});});
     }
   }
-  destroy(){this.controller.abort();this.loader?.destroy();try{if(this.buffer?.updating)this.buffer.abort();}catch{}if(this.objectUrl){if(this.media?.getAttribute('src')===this.objectUrl){this.media.pause();this.media.removeAttribute('src');this.media.load();}URL.revokeObjectURL(this.objectUrl);}this.listeners.clear();}
+  destroy(){this.controller.abort();for(const loader of this.loaders)loader.destroy();this.loaders.clear();try{if(this.buffer?.updating)this.buffer.abort();}catch{}if(this.objectUrl){if(this.media?.getAttribute('src')===this.objectUrl){this.media.pause();this.media.removeAttribute('src');this.media.load();}URL.revokeObjectURL(this.objectUrl);}this.listeners.clear();}
 }

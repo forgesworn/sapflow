@@ -31,6 +31,9 @@ try {
     failures.push('Unexpected external request'); return route.abort();
   });
   const page=await context.newPage();
+  const inflight=new Set();let peakFragments=0;
+  page.on('request',request=>{if(/_seg[0-9]+\.mp4$/.test(new URL(request.url()).pathname)){inflight.add(request);peakFragments=Math.max(peakFragments,inflight.size);}});
+  for(const name of ['requestfinished','requestfailed'])page.on(name,request=>inflight.delete(request));
   page.on('pageerror', error=>errors.push(error.message));
   await page.addInitScript(() => {
     window.__peerAttempts=0;
@@ -93,6 +96,7 @@ try {
   const final=snapshots.at(-1);
   const stallSeconds=await page.evaluate(()=>window.__stall.seconds+(window.__stall.started===null?0:(performance.now()-window.__stall.started)/1000));
   assert(delayedFragment,'real media fetch was delayed for three seconds');
+  assert(peakFragments>=2&&peakFragments<=4,'two to four complete fragments overlap, without exceeding the request bound');
   assert(stallSeconds<1,'buffer absorbs a three-second fragment delay');
   if(process.env.SAPFLOW_TV_TEST_CUTS==='1') assert.equal(new Set(snapshots.map(row=>row.colour).filter(Boolean)).size,3,'all three tracks played');
   assert(final.frames>initial.frames+seconds*18, 'sustained decoding exceeds 18 frames per second');
@@ -109,7 +113,7 @@ try {
   assert.equal(errors.length,0,errors.join('\n')); assert.equal(failures.length,0);
   await page.setViewportSize({ width:390,height:844 }); await page.screenshot({ path:output+'-mobile.png', fullPage:true });
   await writeFile(output+'.json',JSON.stringify({ engine, wallSeconds:(Date.now()-started)/1000,initial,final,stopped,
-    snapshots,audio,stallSeconds,delayedFragment,offAirRecovered:startupFailures===0,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');
+    snapshots,audio,stallSeconds,delayedFragment,peakFragments,offAirRecovered:startupFailures===0,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');
   console.log(JSON.stringify({ engine,frames:final.frames-initial.frames,advance:final.time-initial.time,
     dimensions:[final.width,final.height],audioBytes:final.audioBytes,externalRequests:failures.length,stopVerified:true }));
 } catch (error) { console.error(error); throw error; }

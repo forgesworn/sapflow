@@ -61,3 +61,14 @@ colours, no external requests and no peer attempts. Loopback peer ICE used an
 explicit fake-device permission accommodation; production does not request
 camera or microphone access. These are finite checks, not public-NAT or
 long-show acceptance.
+
+
+A subsequent full public loop presented 20,260 frames over 810.37 seconds with
+zero waiting events or dropped frames. An independent publishing-Mac test
+through the private Tor preview exposed another bottleneck: sequential fragment
+fetches could not hide the route's round-trip delay. The player now overlaps at
+most four complete fragments and keeps native appends ordered. The generated
+browser gate asserts two to four overlapping requests, and a separate lifecycle
+regression requires Stop to abort all four loaders. This transport correction's
+full Mac-loop and hosted receipts belong to the delivered PR; the earlier public
+result alone did not qualify the private Tor preview.
