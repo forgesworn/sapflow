@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {Audience,ChannelState,heartbeat} from '../tools/tv-relayswarm/audience.mjs';
+import {ChannelControl,controlMessage} from '../tools/tv-relayswarm/control.mjs';
 import {createAudience} from '../web/tv/audience.mjs';
 const presence=(id='a',values={})=>({id:id.repeat(32),active:true,peers:false,version:'1',...values});
 const settle=()=>new Promise(r=>setImmediate(r));
@@ -34,4 +35,15 @@ test('public presence uses a temporary page identifier, unregisters pause and st
  client.set({watching:true,active:true,peers:true});await settle();client.set({watching:true,active:false,peers:true});await settle();
  client.set({watching:false,active:false,peers:false});await settle();assert.equal(timers.size,0);client.destroy();
  const data=calls.map(o=>JSON.parse(o.body));assert.equal(data[0].active,true);assert.equal(data[1].active,false);assert.match(data[0].id,/^[a-f0-9]{32}$/);assert(data.every(p=>p.id===data[0].id));assert(calls.every(o=>o.credentials==='omit'));
+});
+
+test('lifecycle control is authenticated, scoped to the latest session and bounded',()=>{
+ let now=100000;const channel=new ChannelState(()=>now),control=new ChannelControl('a'.repeat(64),channel,()=>now);
+ assert(control.authorised('Bearer '+'a'.repeat(64)));for(const header of [undefined,'','Bearer '+'b'.repeat(64),'a'.repeat(64)])assert(!control.authorised(header));
+ const first={action:'start',session:'a'.repeat(32),startedAt:now};control.update(first);control.update({...first,action:'end'});assert.equal(channel.snapshot().state,'ended');
+ channel.observe({segments:[{name:'retained',cc:0}],end:false});channel.unavailable(503);assert.equal(channel.snapshot().state,'ended');
+ now++;const second={...first,session:'b'.repeat(32),startedAt:now};control.update(second);assert.notEqual(channel.snapshot().state,'ended');
+ assert.throws(()=>control.update({...first,action:'end'}),/session/);assert.throws(()=>control.update(first),/Stale/);
+ for(const message of [null,[],{}, {...second,ip:'198.51.100.1'},{...second,startedAt:true},{...second,action:'delete'}])assert.throws(()=>controlMessage(message));
+ assert(!new ChannelControl(undefined,channel).authorised('Bearer '+'a'.repeat(64)));
 });

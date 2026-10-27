@@ -7,6 +7,7 @@ import {WebSocketServer} from 'ws';
 import {verifyEvent} from 'nostr-tools/pure';
 import {createHlsPublisher} from 'relayswarm/hls-publisher';
 import {loadPublisherState} from 'relayswarm/publisher-state';
+import {ChannelControl} from './control.mjs';
 import {Audience,ChannelState} from './audience.mjs';
 import {PLAYER_VERSION} from '../../web/tv/version.mjs';
 import {parseMaster,parseMedia} from '../../web/tv/playlist.mjs';
@@ -51,7 +52,7 @@ export function validFilter(filter,swarmId) {
 }
 function matches(event,f){return f.kinds.includes(event.kind)&&(!f['#p']||event.tags.some(t=>t[0]==='p'&&t[1]===f['#p'][0]))&&(f.since===undefined||event.created_at>=f.since);}
 function bucket(capacity,rate){let tokens=capacity,at=Date.now();return()=>{const now=Date.now();tokens=Math.min(capacity,tokens+(now-at)*rate/1000);at=now;if(tokens<1)return false;tokens--;return true;};}
-export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/live/event-tv/',origin,port=28777,host='127.0.0.1'}={}) {
+export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/live/event-tv/',origin,port=28777,host='127.0.0.1',controlToken}={}) {
   const source=new URL(upstream);
   if(source.protocol!=='http:'||source.hostname!=='127.0.0.1'||source.username||source.password||source.search||source.hash||source.pathname!=='/live/event-tv/')throw Error('Upstream must be the loopback TV channel');
   if(!origin||new URL(origin).origin!==origin)throw Error('An exact public origin is required');
@@ -59,7 +60,7 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
   for(const file of await readdir(mediaDir))if(ASSET.test(file)||['index.m3u8','stream.m3u8'].includes(file)||/^\.[a-z0-9_.]+\.tmp$/.test(file))await unlink(resolve(mediaDir,file));
   const identityDir=resolve(stateDir,'identity');await mkdir(identityDir,{mode:0o700,recursive:true});
   const identity=await loadPublisherState(resolve(identityDir,'publisher.json'),{manifest:'index.m3u8'});
-  const audience=new Audience(),channel=new ChannelState();
+  const audience=new Audience(),channel=new ChannelState(),control=new ChannelControl(controlToken,channel);
   const controller=new AbortController(),cache=new Map(),presence=new Map();let publisher=null,fresh=0,closed=false,cacheBytes=0,active=0;
   async function get(name,limit){return bytes(await fetch(new URL(name,source),{redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(6000)])}),limit);}
   async function atomic(name,data){const temporary=resolve(mediaDir,`.${name}.tmp`);await writeFile(temporary,data,{mode:0o600});await rename(temporary,resolve(mediaDir,name));}
@@ -84,13 +85,24 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
     fresh=Date.now();
   }
   const loop=(async()=>{while(!closed){try{await mirror();}catch(error){if(error.channelMissing)channel.unavailable(error.status);else if(Date.now()-channel.lastMediaAt>6000)channel.unavailable(503);}await new Promise(r=>{const timer=setTimeout(done,500);function done(){clearTimeout(timer);controller.signal.removeEventListener('abort',done);r();}controller.signal.addEventListener('abort',done,{once:true});if(closed)done();});}})();
-  const audienceBudget=bucket(400,200),httpBudget=bucket(200,100),signBudget=bucket(40,20),eventBudget=bucket(100,50);
+  const controlBudget=bucket(8,1),audienceBudget=bucket(400,200),httpBudget=bucket(200,100),signBudget=bucket(40,20),eventBudget=bucket(100,50);
   function reply(res,status,data,mime='application/json'){res.writeHead(status,{'Content-Type':mime,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Cross-Origin-Resource-Policy':'same-origin'});res.end(data);}
   const server=createServer(async(req,res)=>{
     if(active>=32||!(req.url==='/tv/audience'?audienceBudget():httpBudget())){reply(res,503,'Busy');return;}active++;
     try {
       if(req.headers['sec-fetch-site']==='cross-site'||(req.headers.origin&&req.headers.origin!==origin)){reply(res,403,'Forbidden');return;}
       const url=new URL(req.url,'http://localhost');
+      if(url.pathname==='/tv/broadcast/control'&&!url.search){
+        if(!control.token){reply(res,404,'Not found');return;}
+        if(req.method!=='POST'){reply(res,405,'POST required');return;}
+        if(!control.authorised(req.headers.authorization)){reply(res,403,'Forbidden');return;}
+        if(!controlBudget()){reply(res,429,'Busy');return;}
+        if(req.headers['content-type']!=='application/json'){reply(res,415,'JSON required');return;}
+        let size=0;const chunks=[];
+        for await(const chunk of req){size+=chunk.length;if(size>256)throw Object.assign(Error('Body budget'),{status:413});chunks.push(chunk);}
+        try{control.update(JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks))));}catch(error){if(!error.status)error.status=400;throw error;}
+        reply(res,200,JSON.stringify({accepted:true}));return;
+      }
       if(url.pathname==='/tv/audience'&&!url.search){
         if(req.method==='POST'){
           if(!req.headers['content-type']?.startsWith('application/json')){reply(res,415,'JSON required');return;}
@@ -149,6 +161,7 @@ export async function startReceiver({stateDir,upstream='http://127.0.0.1:28888/l
   return {server,identity,async close(){closed=true;controller.abort();clearInterval(heartbeat);for(const ws of wss.clients)ws.terminate();wss.close();server.closeAllConnections();await new Promise(r=>server.close(r));await loop;}};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){
-  const service=await startReceiver({stateDir:process.env.STATE_DIRECTORY??process.env.TV_SWARM_STATE,origin:process.env.TV_PUBLIC_ORIGIN,upstream:process.env.TV_UPSTREAM,port:Number(process.env.TV_SWARM_PORT??28777)});
+  const tokenFile=process.env.TV_CHANNEL_CONTROL_TOKEN_FILE;const controlToken=tokenFile?(await readFile(tokenFile,'utf8')).trim():undefined;
+  const service=await startReceiver({controlToken,stateDir:process.env.STATE_DIRECTORY??process.env.TV_SWARM_STATE,origin:process.env.TV_PUBLIC_ORIGIN,upstream:process.env.TV_UPSTREAM,port:Number(process.env.TV_SWARM_PORT??28777)});
   for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>{void service.close();});
 }

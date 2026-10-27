@@ -165,3 +165,10 @@ test('confirmed end drains buffered video, while reconnecting does not declare a
  s.video.currentTime=19.95;s.video.dispatchEvent(new Event('timeupdate'));assert.equal(s.indicator.dataset.state,'ended');assert.equal(s.timers.size,0);
  s.player.setChannelState('live');assert.equal(s.indicator.dataset.state,'idle');assert.equal(s.player.watching,false);s.player.destroy();
 });
+
+test('an interrupted publisher replaces buffering with an explicit reconnect card and then ends',async()=>{
+ const s=setup();s.watch.click();await settle();s.video.readyState=2;s.video.currentTime=10;s.video.paused=false;s.video.buffered={length:1,start:()=>0,end:()=>10};
+ s.video.dispatchEvent(new Event('playing'));s.video.dispatchEvent(new Event('waiting'));assert.equal(s.indicator.dataset.state,'buffering');
+ s.player.setChannelState('reconnecting');assert.equal(s.indicator.dataset.state,'interrupted');assert.equal(s.placeholder.hidden,false);assert.match(s.status.textContent,/broadcaster/);
+ s.player.setChannelState('ended');assert.equal(s.indicator.dataset.state,'ended');assert.equal(s.timers.size,0);s.player.destroy();
+});

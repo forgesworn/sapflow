@@ -265,6 +265,7 @@ jobs:
           bash -n scripts/tv-prepare.sh scripts/tv-playout.sh
           python3 -B tests/test_tv_scripts.py
           python3 -B tests/test_private_tv_publish.py
+          python3 -B tests/test_tv_channel_control.py
           # Only the generated loopback sshd fixture needs Linux PAM privileges.
           # Do not unlock the runner's password account to enable key auth.
           sudo -n python3 -B tests/test_private_tv_integration.py

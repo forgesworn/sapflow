@@ -226,3 +226,38 @@ The live gate is a generated-media run over the configured onion receiver:
 
 No real footage, origin addresses, operator keys or private relay endpoints
 belong in public qualification evidence.
+
+
+## Deliberate stop notices
+
+The optional `--control-config /private/channel-control.json` flag lets Ctrl+C
+end the channel promptly instead of looking like an accidental tunnel drop.
+Create a separate random 32-byte token, shared only between the publisher and
+receiver. Store its lower-case hexadecimal form in a 0600 file on each machine,
+inside private directories. Do not reuse an SSH key, publish path or account
+credential, put the token in a command line, commit it or serve it to browsers.
+
+The private configuration file must also have mode 0600:
+
+```json
+{"origin":"https://media.example","token_file":"/private/channel-control-token"}
+```
+
+Set the receiver sidecar's `TV_CHANNEL_CONTROL_TOKEN_FILE` to its private token
+file, restart the sidecar and allow the exact `/tv/broadcast/control` route to
+reach it through the existing proxy. The example Caddy fragment includes it.
+The route is disabled when no token is configured. It accepts only bounded,
+authenticated start/end notices, never media, arbitrary paths or server commands.
+It does not make the Rust ingest/control API public.
+
+The helper registers its random session after local media verification. It
+sends the end notice only for an intentional stop or a completed `--once` run;
+unexpected tunnel loss keeps the same session and reconnect policy. Both notices
+use the existing Tor SOCKS listener, remote DNS, verified HTTPS and no redirects
+or direct fallback. A new registration supersedes older sessions. Notices do not
+appear in the viewer's metadata or aggregate audience response.
+
+An end notice stops the player's retry loop after its buffered tail plays out.
+A lost notice falls back to the receiver's reconnect grace. A hard process kill
+cannot run shutdown code and therefore also relies on that fallback. Test both
+Ctrl+C and accidental disconnect with generated media before a live programme.

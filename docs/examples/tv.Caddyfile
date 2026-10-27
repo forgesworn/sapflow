@@ -11,7 +11,7 @@ handle /tv/* {
         Cache-Control no-store
         defer
     }
-    @tv_presence path /tv/audience /tv/swarm/*
+    @tv_presence path /tv/broadcast/control /tv/audience /tv/swarm/*
     handle @tv_presence {
         reverse_proxy 127.0.0.1:28777 {
             header_up -X-Forwarded-For

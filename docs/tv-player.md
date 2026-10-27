@@ -2,7 +2,9 @@
 
 `web/tv/` is a standalone TV player for
 `/tv/live/event-tv/index.m3u8`. It fetches no media before **Watch live**.
-**Stop watching** aborts pending startup and disposes the media engine.
+**Stop watching** aborts pending startup, disposes the media engine and says
+**You stopped watching** with a Play action to rejoin. It does not describe the
+channel as standby or suggest that the broadcaster has stopped.
 Off-air responses retry with bounded backoff while watching. **Back to live**
 uses the engine's live position. The controls inside the picture support play/pause, volume, mute, fullscreen
 and return to live. Pause keeps the existing media engine and buffered video;
@@ -84,8 +86,19 @@ concurrent viewers. Private preview reads only the aggregate through Tor and
 never registers an identifier. The swarm diagram describes this player's actual
 connections and verified byte counters; it exposes no other viewer's address.
 
+An optional authenticated lifecycle route distinguishes intentional publisher
+shutdown from network loss. The private publisher registers a random session,
+then sends an end notice on Ctrl+C after stopping media and SSH. Both requests
+use HTTPS through Tor with remote DNS and a dedicated private bearer token.
+Credentials travel over curl stdin, never argv or player assets. The receiver
+rejects stale or mismatched sessions so a late shutdown cannot end a newer
+broadcast. If a notice cannot arrive, ordinary reconnect grace remains the
+fallback. See [private lifecycle setup](private-tv-publishing.md#deliberate-stop-notices).
+
 A channel that has never published shows off air. A stalled or temporarily
-unreachable source shows reconnecting. An explicit HLS end marker, or removal
+unreachable source shows reconnecting. Once buffered video is exhausted, a
+**Broadcast interrupted** card replaces the generic buffering indicator. A
+reconnected publisher resumes playback; this is distinct from a confirmed end. An explicit HLS end marker, or removal
 of a previously live upstream stream for at least two seconds, confirms the broadcast has ended. The
 player drains buffered video before displaying **Broadcast ended**, closes peer
 connections and stops retrying. A later broadcast requires another press of play.

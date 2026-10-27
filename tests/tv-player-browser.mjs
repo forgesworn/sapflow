@@ -20,7 +20,7 @@ try {
     const request=route.request(), target=new URL(request.url());
     if (target.protocol==='blob:' || target.origin===url.origin) {
       requests.push(target.pathname);
-      if(target.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:2,peerEnabledPlayers:1,playerVersion:'2026.10.27.4',channel:{state:channelEnded?'ended':'live'}})});
+      if(target.pathname==='/tv/audience')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({activePlayers:2,peerEnabledPlayers:1,playerVersion:'2026.10.27.5',channel:{state:channelEnded?'ended':'live'}})});
       if (target.pathname==='/tv/live/event-tv/index.m3u8' && startupFailures>0) {
         startupFailures--; return route.fulfill({status:404,body:'Off air'});
       }
@@ -122,7 +122,7 @@ try {
   await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing');
   await page.locator('#watch').click();
   await page.waitForTimeout(1000);
-  const stopped=await sample(); assert(stopped.paused); assert.equal(stopped.state,'idle');
+  const stopped=await sample(); assert(stopped.paused); assert.equal(stopped.state,'stopped');
   const count=requests.length; await page.waitForTimeout(2500); assert.equal(requests.length,count,'Stop ends requests');
   assert.equal(errors.length,0,errors.join('\n')); assert.equal(failures.length,0);
   await page.locator('#watch').click();await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing',null,{timeout:45000});

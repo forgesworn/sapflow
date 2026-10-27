@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from tv_channel_control import ChannelControl
 
 HERE = Path(__file__).resolve().parent
 
@@ -115,7 +116,7 @@ class OnionUnavailable(ValueError):
     """A pinned onion transport failed; never authorises a different route."""
 
 
-def run(args, on_stop=None):
+def run(args, on_stop=None, on_ready=None):
     publish_path = os.environ.get("TV_PRIVATE_PUBLISH_PATH", "")
     if not re.fullmatch(r"live/[A-Za-z0-9_-]{1,128}(?:\?[^\x00-\x20\x7f#]*)?", publish_path):
         raise ValueError("set TV_PRIVATE_PUBLISH_PATH to live/EVENT with URL-encoded credentials")
@@ -162,6 +163,10 @@ def run(args, on_stop=None):
         verifier = None
         if verify_status:
             raise ValueError("prepared media verification failed; run tv-prepare.sh --verify locally")
+        if stopped:
+            return 130
+        if on_ready is not None:
+            on_ready()
         if stopped:
             return 130
         # /tmp keeps the SSH control socket below Unix pathname length limits on macOS.
@@ -228,6 +233,7 @@ def run(args, on_stop=None):
 def supervise(args):
     """Retry only the same pinned Tor route after cleaning up a failed attempt."""
     stopping = False
+    channel = ChannelControl(getattr(args, "control_config", None), getattr(args, "socks_port", 9050))
     def cancel(_signum, _frame):
         nonlocal stopping
         stopping = True
@@ -237,7 +243,7 @@ def supervise(args):
         while not stopping:
             started = time.monotonic()
             try:
-                return run(args, on_stop=cancel)
+                return run(args, on_stop=cancel, on_ready=channel.start)
             except OnionUnavailable:
                 if args.once:
                     raise
@@ -253,6 +259,11 @@ def supervise(args):
                 delay = min(delay * 2, 30)
         return 130
     finally:
+        if stopping or args.once:
+            if channel.end():
+                print("private-tv: broadcast end confirmed by receiver", file=sys.stderr)
+            elif channel.attempted:
+                print("private-tv: end notice unconfirmed; receiver reconnect grace still applies", file=sys.stderr)
         for sig, previous in handlers.items():
             signal.signal(sig, previous)
 
@@ -266,6 +277,7 @@ def main():
     parser.add_argument("--socks-port", type=port, default=9050)
     parser.add_argument("--ssh-port", type=port, default=22)
     parser.add_argument("--ingest-port", type=port, default=1935)
+    parser.add_argument("--control-config", type=Path, help="private HTTPS channel lifecycle configuration; always through Tor")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("prepared_dir", type=Path)

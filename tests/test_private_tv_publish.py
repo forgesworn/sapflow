@@ -13,11 +13,13 @@ import signal
 import socket
 import subprocess
 import tempfile
+import sys
 import threading
 import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 SPEC = importlib.util.spec_from_file_location("private_tv", ROOT / "scripts/tv-private-publish.py")
 PRIVATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PRIVATE)
@@ -70,12 +72,25 @@ class Reconnect(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
 
     def test_stop_during_attempt_cleanup_prevents_retry(self):
-        def attempt(_args, on_stop):
+        def attempt(_args, on_stop, on_ready=None):
             on_stop(signal.SIGTERM, None)
             raise PRIVATE.OnionUnavailable('drop during shutdown')
         with mock.patch.object(PRIVATE, 'run', side_effect=attempt) as run:
             self.assertEqual(PRIVATE.supervise(argparse.Namespace(once=False)), 130)
         self.assertEqual(run.call_count, 1)
+
+
+    def test_explicit_stop_notifies_channel_but_tunnel_retry_does_not_end_it(self):
+        def stop(_args,on_stop,on_ready):
+            on_ready();on_stop(signal.SIGINT,None);return 130
+        control=mock.Mock();control.end.return_value=True
+        with mock.patch.object(PRIVATE,'ChannelControl',return_value=control),mock.patch.object(PRIVATE,'run',side_effect=stop):
+            self.assertEqual(PRIVATE.supervise(argparse.Namespace(once=False)),130)
+        control.start.assert_called_once();control.end.assert_called_once()
+        control.reset_mock()
+        with mock.patch.object(PRIVATE,'ChannelControl',return_value=control),mock.patch.object(PRIVATE,'run',side_effect=[PRIVATE.OnionUnavailable('drop'),0]),mock.patch.object(PRIVATE.time,'sleep'),mock.patch.object(PRIVATE.time,'monotonic',side_effect=[0,1,2,5,6]):
+            self.assertEqual(PRIVATE.supervise(argparse.Namespace(once=False)),0)
+        control.end.assert_not_called()
 
 
 class Supervisor(unittest.TestCase):

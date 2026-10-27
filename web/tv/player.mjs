@@ -36,10 +36,10 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
   }
   const on = (target, name, fn) => { target.addEventListener(name, fn); listeners.push(() => target.removeEventListener(name, fn)); };
   function show(state, message) {
-    tone?.setEnabled(['idle','offline','ended'].includes(state));
-    if (standbyTitle) standbyTitle.textContent=({idle:'Standby',connecting:'Tuning in',offline:'OFF AIR',error:'Unavailable',ended:'Broadcast ended',paused:'Paused'})[state] ?? '';
+    tone?.setEnabled(['idle','stopped','offline','ended'].includes(state));
+    if (standbyTitle) standbyTitle.textContent=({idle:'Ready',stopped:'You stopped watching',connecting:'Tuning in',offline:'OFF AIR',error:'Unavailable',ended:'Broadcast ended',paused:'Paused',interrupted:'Broadcast interrupted'})[state] ?? '';
     indicator.dataset.state = state;
-    indicator.textContent = ({ idle: 'Ready', connecting: 'Connecting', offline: 'Off air', playing: 'Live', buffering: 'Buffering', error: 'Unavailable', ended:'Ended', paused:'Paused' })[state];
+    indicator.textContent = ({ idle: 'Ready',stopped:'Stopped', connecting: 'Connecting', offline: 'Off air', playing: 'Live', buffering: 'Buffering', error: 'Unavailable', ended:'Ended', paused:'Paused',interrupted:'Reconnecting' })[state];
     status.textContent = message;
     placeholder.hidden = ['playing','buffering','paused'].includes(state);
     if (state !== 'connecting') placeholder.dataset.kind = 'standby';
@@ -59,7 +59,7 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
     if (!watching || stopped || token !== generation) return;
     if(channelState==='ended'||draining){drainEnded();return;}
     onRecovery(reason);generation++; clearMedia();
-    show('offline', 'The channel is off air or reconnecting. We’ll keep checking.');
+    show(channelState==='reconnecting'?'interrupted':'offline',channelState==='reconnecting'?'No new video is arriving. Waiting for the broadcaster to return or the receiver to confirm the end.':'The channel is off air or reconnecting. We’ll keep checking.');
     retry = schedule(() => { retry = null; void connect(); }, delay);
     delay = Math.min(delay * 2, 10000);
   }
@@ -129,7 +129,7 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
     watching = false; generation++; clearMedia(); tone?.stop(); delay = 1000;peerFailed=false;userPaused=false;draining=false;originBytes=0;onMetrics({},false);
     watch.textContent = 'Watch live';
     peerInfo(privatePreview?'Disabled in private Mac preview':'Off. Peer connections closed.');
-    show(channelState==='ended'?'ended':'idle',channelState==='ended'?'The broadcast has ended. Come back for the next programme.':'Press Watch live to tune in.');
+    show('stopped','You stopped watching. Press play to rejoin the broadcast.');
     field('rate', 'Not yet reported'); field('codecs', 'Not yet reported'); updateInfo();
   }
   function start(){if(channelState==='ended')channelState=null;userPaused=false;draining=false;watching=true;watch.textContent='Stop watching';void connect();}
@@ -165,11 +165,11 @@ export function createTvPlayer({ video, watch, edge, status, indicator, placehol
     startupTimer = null; delay = 1000;userPaused=false;
     show('playing', 'You’re watching live.');
   });
-  on(video, 'waiting', () => { if(watching&&draining){updateInfo();return;}if (watching && !userPaused && video.readyState > 0) show('buffering', 'Catching up with the broadcast…'); });
+  on(video, 'waiting', () => { if(watching&&draining){updateInfo();return;}if (watching && !userPaused && video.readyState > 0) show(channelState==='reconnecting'?'interrupted':'buffering',channelState==='reconnecting'?'No new video is arriving. Waiting for the broadcaster to return or the receiver to confirm the end.':'Catching up with the broadcast…'); });
   on(video, 'error', () => { if (watching && video.currentSrc) recover(generation,'Browser media decode error'); });
   on(video, 'pause', () => {if(watching&&video.readyState>0&&!video.ended&&['playing','buffering'].includes(indicator.dataset.state)){userPaused=true;show('paused','Paused. Press play to continue.');}});
   on(video, 'ended', () => { if(watching)finishEnded(); });
-  return { stop, togglePlayback, get watching(){return watching;}, setChannelState(value){channelState=value;if(value==='ended'){if(watching)drainEnded();else show('ended','The broadcast has ended. Come back for the next programme.');}else if(!watching&&indicator.dataset.state==='ended'&&value==='live')show('idle','A new broadcast is live. Press play to tune in.');}, destroy() { stop(); stopped = true; tone?.destroy(); for (const remove of listeners) remove(); } };
+  return { stop, togglePlayback, get watching(){return watching;}, setChannelState(value){channelState=value;if(value==='reconnecting'&&watching&&['buffering','offline'].includes(indicator.dataset.state))show('interrupted','No new video is arriving. Waiting for the broadcaster to return or the receiver to confirm the end.');if(value==='ended'){if(watching)drainEnded();else show('ended','The broadcast has ended. Come back for the next programme.');}else if(!watching&&indicator.dataset.state==='ended'&&value==='live')show('idle','A new broadcast is live. Press play to tune in.');}, destroy() { stop(); stopped = true; tone?.destroy(); for (const remove of listeners) remove(); } };
 }
 
 if (typeof document !== 'undefined') {
@@ -189,7 +189,7 @@ if (typeof document !== 'undefined') {
     onMetrics:(metrics,enabled)=>network.update(metrics,enabled),
     onRecovery(reason){get('last-recovery').textContent=reason;get('recovery-count').textContent=String(++recoveries);},
     onInfo({ahead,latency,watching}){get('buffer-fill').style.width=Math.min(100,ahead/20*100)+'%';get('playback-health').textContent=watching?ahead.toFixed(1)+'s buffered':'No media loaded';get('playback-position').textContent=watching?(latency>0?latency.toFixed(0)+'s behind live':'Live programme'):'Ready to tune in';get('quality-summary').textContent=video.getVideoPlaybackQuality?String(video.getVideoPlaybackQuality().droppedVideoFrames)+' dropped frames':'Not reported';},
-    onState(state,presence){controls?.setState(state);ident.setState(state);audience.set(presence);get('standby-description').textContent=({connecting:'Preparing your picture. The stream starts when enough video is ready.',offline:'Waiting for the broadcaster to reconnect.',ended:'Thanks for watching. Join us for the next broadcast.',idle:'Your front row to the live channel.'})[state]??'';}
+    onState(state,presence){controls?.setState(state);ident.setState(state);audience.set(presence);get('standby-description').textContent=({connecting:'Preparing your picture. The stream starts when enough video is ready.',offline:'Waiting for the broadcaster to reconnect.',interrupted:'No new video is arriving. Waiting for reconnection or confirmation that the broadcast has ended.',ended:'Thanks for watching. Join us for the next broadcast.',idle:'Your front row to the live channel.',stopped:'Press play to rejoin the broadcast.'})[state]??'';}
   });
   controls=createControls({video,screen:get('screen'),onToggle:()=>player.togglePlayback()});controls.setState('idle');ident.setState('idle');network.reset();audience.refresh();
   addEventListener('pagehide',()=>{audience.destroy();player.destroy();controls.destroy();ident.destroy();},{once:true});
