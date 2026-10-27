@@ -27,6 +27,7 @@ for(const pkg of [...packages.values()].sort((a,b)=>a.name.localeCompare(b.name)
   notices+=`\n\n${pkg.name} ${pkg.version}\n${licence}`;
 }
 notices+='\n\n'+await readFile(resolve(here,'wasm-LICENCES.txt'),'utf8');
+notices=notices.split('\n').map(line=>line.trimEnd()).join('\n').trimEnd()+'\n';
 await writeFile(resolve(out,'THIRD-PARTY-LICENCES.txt'),notices);
 await writeFile(resolve(root,'web/tv/vendor/THIRD-PARTY-LICENCES.txt'),notices);
 await writeFile(resolve(out,'build.json'),JSON.stringify({packages:[...packages.values()].map(p=>({name:p.name,version:p.version,licence:p.license}))},null,2)+'\n');

@@ -49,7 +49,8 @@ for name, version in sorted(packages):
                       'noticeSha256': hashlib.sha256(licence.encode()).hexdigest()})
 pins = json.loads((here / 'pins.json').read_text())
 receipt = {'wasmSha256': pins['assets']['relayswarm-core-0.4.4.wasm']['sha256'], 'packages': inventory}
-outputs = {'wasm-LICENCES.txt': '\n'.join(notices), 'wasm-licences.json': json.dumps(receipt, indent=2) + '\n'}
+notice_text = '\n'.join(line.rstrip() for line in '\n'.join(notices).splitlines()).rstrip() + '\n'
+outputs = {'wasm-LICENCES.txt': notice_text, 'wasm-licences.json': json.dumps(receipt, indent=2) + '\n'}
 for name, content in outputs.items():
     path = here / name
     if '--check' in sys.argv:

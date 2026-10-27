@@ -274,6 +274,7 @@ jobs:
           python3 tools/tv-relayswarm/fetch.py
           python3 tools/tv-relayswarm/wasm-notices.py --check
           node tools/tv-relayswarm/build.mjs
+          git diff --exit-code -- web/tv/vendor/THIRD-PARTY-LICENCES.txt
           node --test tests/tv-player.test.mjs tests/tv-playlist.test.mjs tests/tv-tone.test.mjs tests/tv-connection.test.mjs tests/tv-peers.test.mjs tests/tv-swarm-server.test.mjs
           node fuzz/tv_playlist_fuzz.mjs 20000
           node fuzz/tv_swarm_fuzz.mjs 20000
