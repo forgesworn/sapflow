@@ -68,7 +68,7 @@ def main():
                 while True:
                     try:
                         data=opener.open(f'http://127.0.0.1:{http}/live/event-tv/stream.m3u8',timeout=2).read()
-                        if data.count(b'#EXTINF:')>=10:break
+                        if data.count(b'#EXTINF:')>=20:break
                     except urllib.error.URLError:pass
                     if time.monotonic()>deadline:raise RuntimeError('Fixture live stream never primed')
                     time.sleep(.2)

@@ -11,17 +11,20 @@ const module=process.env.SAPFLOW_PLAYWRIGHT_MODULE;
 const { chromium, webkit }=await import(module ? pathToFileURL(module).href : 'playwright');
 let browser;
 const requests=[], errors=[], failures=[];
-let startupFailures=2;
+let startupFailures=2, measuring=false, delayedFragment=false;
 try {
   browser=engine==='webkit' ? await webkit.launch({ headless:true }) : await chromium.launch({ channel:'chrome', headless:true,
     args:['--disable-background-networking','--disable-quic','--autoplay-policy=no-user-gesture-required'] });
   const context=await browser.newContext({ viewport:{ width:1280,height:1000 }, serviceWorkers:'block' });
-  await context.route('**/*', route => {
+  await context.route('**/*', async route => {
     const request=route.request(), target=new URL(request.url());
     if (target.protocol==='blob:' || target.origin===url.origin) {
       requests.push(target.pathname);
       if (target.pathname==='/tv/live/event-tv/index.m3u8' && startupFailures>0) {
         startupFailures--; return route.fulfill({status:404,body:'Off air'});
+      }
+      if (measuring && !delayedFragment && /_seg[0-9]+\.mp4$/.test(target.pathname)) {
+        delayedFragment=true; await new Promise(resolve=>setTimeout(resolve,3000));
       }
       return route.continue();
     }
@@ -68,9 +71,19 @@ try {
   });
   if (engine==='chrome') assert(audio.available && audio.rms>0.00001,'decoded synthetic audio reaches Web Audio');
   await page.screenshot({ path:output+'.png', fullPage:true });
+  await page.evaluate(() => {
+    window.__stall={ started:null, seconds:0 };
+    const video=document.querySelector('video');
+    video.addEventListener('waiting',()=>{window.__stall.started ??= performance.now();});
+    video.addEventListener('playing',()=>{if(window.__stall.started!==null){window.__stall.seconds+=(performance.now()-window.__stall.started)/1000;window.__stall.started=null;}});
+  });
+  measuring=true;
   const started=Date.now();
   while (Date.now()-started<seconds*1000) { await page.waitForTimeout(5000); snapshots.push(await sample()); }
   const final=snapshots.at(-1);
+  const stallSeconds=await page.evaluate(()=>window.__stall.seconds+(window.__stall.started===null?0:(performance.now()-window.__stall.started)/1000));
+  assert(delayedFragment,'real media fetch was delayed for three seconds');
+  assert(stallSeconds<1,'buffer absorbs a three-second fragment delay');
   assert(final.frames>initial.frames+seconds*18, 'sustained decoding exceeds 18 frames per second');
   assert(final.time>initial.time+seconds*.85, 'playback keeps pace with wall time');
   assert(final.dropped-initial.dropped < (final.frames-initial.frames)*.1, 'fewer than 10% dropped frames');
@@ -85,7 +98,7 @@ try {
   assert.equal(errors.length,0,errors.join('\n')); assert.equal(failures.length,0);
   await page.setViewportSize({ width:390,height:844 }); await page.screenshot({ path:output+'-mobile.png', fullPage:true });
   await writeFile(output+'.json',JSON.stringify({ engine, wallSeconds:(Date.now()-started)/1000,initial,final,stopped,
-    snapshots,audio,offAirRecovered:startupFailures===0,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');
+    snapshots,audio,stallSeconds,delayedFragment,offAirRecovered:startupFailures===0,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');
   console.log(JSON.stringify({ engine,frames:final.frames-initial.frames,advance:final.time-initial.time,
     dimensions:[final.width,final.height],audioBytes:final.audioBytes,externalRequests:failures.length,stopVerified:true }));
 } catch (error) { console.error(error); throw error; }
