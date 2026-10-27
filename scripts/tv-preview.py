@@ -46,6 +46,9 @@ def receiver_origin(value):
 
 
 class PreviewHandler(BaseHTTPRequestHandler):
+    # Browsers may pre-open idle sockets. Bound reads/writes so shutdown can
+    # join request threads even when no HTTP request has arrived.
+    timeout = 5
     server_version = "SapflowPreview"
     sys_version = ""
 
