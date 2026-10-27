@@ -13,7 +13,7 @@ storage. See [setup and privacy boundaries](tv-player.md).
 | Existing relay | Nostr information readback retained version 1.1.2 and its existing CSP. TV's readback included the required blob media policy. Existing services remained active. |
 | Configuration rollback | Restored the exact pre-player Caddy fragment and reloaded it, then restored the validated player configuration. The enclosing CSP was subsequently made a default so it respected the specific TV policy. |
 | Separate loopback Sapflow fixture | Generated 320 x 180 H.264/AAC decoded 399 frames over 15 seconds with audio and off-air recovery. This local run reused an existing sibling-checkout binary; the CI gate builds Sapflow separately before running the fixture. |
-| Lifecycle/privacy regressions | Eight player tests and sixteen preview tests passed with PycURL installed, including real SOCKS hostname forwarding despite NO_PROXY and a dead proxy that never connected to the origin. |
+| Lifecycle/privacy regressions | Eight player tests and seventeen preview tests passed with PycURL installed, including real SOCKS hostname forwarding despite NO_PROXY and a dead proxy that never connected to the origin. A real idle socket also closed within the shutdown deadline. |
 | Manifest mutation | 20,000 deterministic mutation executions passed. This is finite, not coverage-guided fuzzing. |
 
 The browser route guard allowed only the operator-owned loopback preview

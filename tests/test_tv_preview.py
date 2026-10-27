@@ -5,7 +5,6 @@ from pathlib import Path
 import sys
 import socket
 import threading
-import time
 import unittest
 from unittest import mock
 import urllib.error
@@ -189,15 +188,12 @@ class LoopbackServer(unittest.TestCase):
         self.base = f'http://127.0.0.1:{self.server.server_port}'
 
     def test_idle_browser_socket_cannot_hold_shutdown_open(self):
-        # Shorten only the timeout for this real socket regression.
-        with mock.patch.object(PREVIEW.PreviewHandler, 'timeout', .15):
-            idle=socket.create_connection(('127.0.0.1', self.server.server_port),timeout=2)
-            try:
-                # A request sent after the idle deadline must find the socket
-                # closed; server_close must then join the finished handler.
-                time.sleep(.3)
-                self.assertEqual(idle.recv(1), b'')
-            finally:idle.close()
+        idle=socket.create_connection(('127.0.0.1', self.server.server_port),timeout=7)
+        try:
+            # No request is sent. The real default must close this idle socket;
+            # without a handler timeout, recv would hit the seven-second limit.
+            self.assertEqual(idle.recv(1), b'')
+        finally:idle.close()
 
     def test_page_is_local_and_no_media_or_external_assets_are_fetched(self):
         with mock.patch.object(self.server.transport, 'fetch') as network:

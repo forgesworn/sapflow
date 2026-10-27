@@ -55,7 +55,8 @@ Open the printed `http://127.0.0.1:PORT/tv/` address. The server binds only to
 loopback and checks Host, Origin and cross-site fetch headers. Requests use
 SOCKS5 with remote hostname resolution, mandatory certificate verification,
 no redirects and no direct fallback. The pool reuses HTTPS connections and
-limits concurrent transfers to four, with time and response-size bounds.
+limits concurrent transfers to four, with time and response-size bounds. Idle local browser sockets are closed
+after five seconds so they cannot hold shutdown open.
 Stopping the process cancels outstanding transfers and closes the pool.
 
 The preview accepts only Sapflow's current, bounded playlist subset. Absolute
