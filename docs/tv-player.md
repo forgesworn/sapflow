@@ -24,8 +24,10 @@ Back up the existing configuration, validate the full candidate with
 `caddy validate`, then reload. Read back the page, module and licence hashes,
 CSP and MIME types through HTTPS. Test live playback and off-air recovery,
 verify that other relay routes still work, and rehearse restoring the saved
-configuration. The player needs `media-src 'self' blob:` for Media Source
-Extensions. No inline scripts, `eval`, worker or external origin is required.
+configuration. If the existing site has a deferred, unconditional CSP header, turn that
+header into a `?Content-Security-Policy` default so it respects the TV policy.
+Check that other routes retain their existing CSP. The player needs
+`media-src 'self' blob:` for Media Source Extensions. No inline scripts, `eval`, worker or external origin is required.
 
 The public URL is for ordinary viewers. Opening it normally reveals that
 browser's connection address to the HTTPS endpoint and any intermediary.

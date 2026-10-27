@@ -11,13 +11,20 @@ const module=process.env.SAPFLOW_PLAYWRIGHT_MODULE;
 const { chromium, webkit }=await import(module ? pathToFileURL(module).href : 'playwright');
 let browser;
 const requests=[], errors=[], failures=[];
+let startupFailures=2;
 try {
   browser=engine==='webkit' ? await webkit.launch({ headless:true }) : await chromium.launch({ channel:'chrome', headless:true,
     args:['--disable-background-networking','--disable-quic','--autoplay-policy=no-user-gesture-required'] });
   const context=await browser.newContext({ viewport:{ width:1280,height:1000 }, serviceWorkers:'block' });
   await context.route('**/*', route => {
     const request=route.request(), target=new URL(request.url());
-    if (target.protocol==='blob:' || target.origin===url.origin) { requests.push(target.pathname); return route.continue(); }
+    if (target.protocol==='blob:' || target.origin===url.origin) {
+      requests.push(target.pathname);
+      if (target.pathname==='/tv/live/event-tv/index.m3u8' && startupFailures>0) {
+        startupFailures--; return route.fulfill({status:404,body:'Off air'});
+      }
+      return route.continue();
+    }
     failures.push('Unexpected external request'); return route.abort();
   });
   const page=await context.newPage();
@@ -31,6 +38,7 @@ try {
   await page.waitForTimeout(1000);
   assert.equal(requests.some(x=>x.includes('/live/')), false, 'no media before watch intent');
   await page.locator('#watch').click();
+  await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='offline');
   await page.waitForFunction(() => {
     const v=document.querySelector('video');
     return v.currentTime>1 && (v.getVideoPlaybackQuality?.().totalVideoFrames ?? v.webkitDecodedFrameCount ?? 0)>10;
@@ -68,6 +76,8 @@ try {
   assert(final.dropped-initial.dropped < (final.frames-initial.frames)*.1, 'fewer than 10% dropped frames');
   assert(snapshots.filter(s=>s.state==='buffering').length<=1, 'no sustained buffering');
   assert.equal(final.peerAttempts,0); assert(final.width>=320 && final.height>=180);
+  await page.locator('#live-edge').click();
+  await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing');
   await page.locator('#watch').click();
   await page.waitForTimeout(1000);
   const stopped=await sample(); assert(stopped.paused); assert.equal(stopped.state,'idle');
@@ -75,7 +85,8 @@ try {
   assert.equal(errors.length,0,errors.join('\n')); assert.equal(failures.length,0);
   await page.setViewportSize({ width:390,height:844 }); await page.screenshot({ path:output+'-mobile.png', fullPage:true });
   await writeFile(output+'.json',JSON.stringify({ engine, wallSeconds:(Date.now()-started)/1000,initial,final,stopped,
-    snapshots,audio,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');
+    snapshots,audio,offAirRecovered:startupFailures===0,requests:requests.length,externalRequests:failures.length,pageErrors:errors },null,2)+'\n');
   console.log(JSON.stringify({ engine,frames:final.frames-initial.frames,advance:final.time-initial.time,
     dimensions:[final.width,final.height],audioBytes:final.audioBytes,externalRequests:failures.length,stopVerified:true }));
-} finally { await browser?.close(); }
+} catch (error) { console.error(error); throw error; }
+finally { await browser?.close(); }

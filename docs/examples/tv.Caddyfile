@@ -2,7 +2,8 @@
 # Install web/tv/ as /var/www/sapflow-tv (directories 0755, files 0644).
 redir /tv /tv/ 308
 handle /tv/* {
-    # Deferred so an existing site's default CSP cannot replace this policy.
+    # If the enclosing site sets CSP, make that a ?Content-Security-Policy
+    # default. A deferred, unconditional outer CSP would overwrite this one.
     header {
         Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; media-src 'self' blob:; img-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'"
         Referrer-Policy no-referrer
