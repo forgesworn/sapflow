@@ -161,6 +161,7 @@ qualification.
 - [What v4v expects from its media server](docs/v4v-contract.md)
 - [Scoped native publishing sessions and private control API](docs/scoped-publish-sessions.md)
 - [Prepared TV publishing through an onion receiver](docs/private-tv-publishing.md)
+- [Receiver TV page and Tor-only local preview](docs/tv-player.md)
 - [Encoders tried so far](docs/interop.md)
 - [Apple's LL-HLS rules and the mediamtx/gohlslib reference](docs/reference.md)
 - [Agent guide](AGENTS.md)

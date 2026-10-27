@@ -243,6 +243,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
       - name: Install toolchain
         run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -265,3 +268,27 @@ jobs:
           # Only the generated loopback sshd fixture needs Linux PAM privileges.
           # Do not unlock the runner's password account to enable key auth.
           sudo -n python3 -B tests/test_private_tv_integration.py
+      - name: TV player, preview privacy and bounded manifest mutation gate
+        run: |
+          node --test tests/tv-player.test.mjs
+          python3 -B scripts/check-tv-assets.py
+          python3 -m venv "$RUNNER_TEMP/tv-preview-venv"
+          "$RUNNER_TEMP/tv-preview-venv/bin/python" -m pip install --only-binary=:all: --require-hashes --no-deps -r scripts/requirements-tv-preview.txt
+          "$RUNNER_TEMP/tv-preview-venv/bin/python" -B tests/test_tv_preview.py
+          python3 -B fuzz/tv_preview_fuzz.py 20000
+      - name: Real generated-video and audio playback through Sapflow
+        run: |
+          set -euo pipefail
+          tv_tools=$(mktemp -d)
+          trap 'rm -rf "$tv_tools"' EXIT
+          npm install --prefix "$tv_tools" --no-package-lock --ignore-scripts --no-audit --no-fund playwright@1.63.0
+          export SAPFLOW_PLAYWRIGHT_MODULE="$tv_tools/node_modules/playwright/index.mjs"
+          python3 -B tests/tv_browser_fixture.py
+      - name: Retain generated TV browser evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: tv-browser-generated
+          path: target/tv-browser/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -166,7 +166,8 @@ after viewer consent, with bounded budgets and an immediate origin-only switch.
 Native Safari playback does not use an hls.js loader. Acceptance needs two real
 browser peers, verified peer media, working fallback on departure, no increased
 stalls, and measured origin-byte reduction. Public NAT, mobile and a real show
-are separate checks. No TV player or live service was changed by this work.
+are separate checks. The [receiver TV page](tv-player.md) currently uses
+origin-only playback and does not enable peers.
 
 See RelaySwarm's [host integration contract](https://github.com/forgesworn/relayswarm/blob/main/INTEGRATION.md)
 and `src/hls-publisher.mjs` for the current publisher boundary.
