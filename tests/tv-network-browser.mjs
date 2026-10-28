@@ -7,8 +7,10 @@ const base=new URL(process.argv[2]);assert.equal(base.hostname,'127.0.0.1');
 const {chromium}=await import(pathToFileURL(process.env.SAPFLOW_PLAYWRIGHT_MODULE).href);
 const browser=await chromium.launch({channel:'chrome',headless:true,args:['--autoplay-policy=no-user-gesture-required','--disable-background-networking']});
 let state='live',address='198.51.100.7',mediaRequests=0,metadataRequests=0;
+let context;
 try{
- const context=await browser.newContext({serviceWorkers:'block'}),page=await context.newPage(),errors=[];
+ context=await browser.newContext({serviceWorkers:'block'});
+ const page=await context.newPage(),errors=[];
  page.on('pageerror',e=>errors.push(e.message));
  const observation=()=>({ip:address,city:address==='198.51.100.7'?'Initial city':'Current city',network:'Generated network',scope:'synthetic connection observation',cookieNames:[],authorizationPresent:false});
  await context.route('**/*',async route=>{
@@ -32,4 +34,8 @@ try{
  assert.match(await page.locator('#standby-title').textContent(),/back on air/);assert(await page.locator('#video').evaluate(v=>v.paused));assert.equal(mediaRequests,endedMedia,'new-broadcast notification does not autoplay');
  await page.locator('#start-overlay').click();await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing',null,{timeout:45000});assert(mediaRequests>endedMedia);assert.deepEqual(errors,[]);
  console.log(JSON.stringify({networkChangeRetainedBuffer:true,metadataRefreshed:metadataRequests>0,newBroadcastAnnounced:true,explicitRejoinPlayed:true,externalNetworkRequests:0}));
-}finally{await browser.close();}
+}finally{
+ // A routed segment can still be using context.request when playback passes.
+ try{await context?.unrouteAll({behavior:'wait'});}
+ finally{await browser.close();}
+}
