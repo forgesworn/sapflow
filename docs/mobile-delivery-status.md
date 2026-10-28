@@ -1,5 +1,25 @@
 # Mobile delivery status
 
+## Current review, 28 October 2026
+
+Reviewed against `3c7e1aa`. Current main uses a direct C ABI with Swift/Kotlin
+wrappers and its CI passes, including the current SDK/app and iOS checkpoint
+jobs. Older UniFFI and build/package receipts below describe their named
+revisions. Their source hashes and package-freshness statements are not current
+build verdicts. Current CI does not qualify every optional native path or
+complete its integration and adoption gates.
+
+The current queue is in [GOALS.md](../GOALS.md#remaining-work) and the
+[delivery plan](delivery-plan.md). Native AAC source/presentation and EOF
+qualification, durable recovery, the aggregate two-second loss bound, full
+physical Android/iOS shows, complete V4V journeys, performance comparisons and
+installed signed releases remain open. Existing optional recording and reader
+controls do not authorise default-backend adoption. The
+[recording recovery record](recording-recovery.md) retains its implementation
+order, original failed verdicts and source-bound receipts.
+
+## Retained implementation and qualification record
+
 The delivery goal is active. This record separates implemented code, local
 tests, native packages, actual broadcasting, physical acceptance and release.
 It does not replace any requirement in the [delivery plan](mobile-streaming-plan.md)

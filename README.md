@@ -62,12 +62,24 @@ want the protocol code as reusable, fuzzed, memory-safe Rust.
 
 ## Status
 
-An experiment that is close to its first production trial. It passes v4v's
-ingest gate, plays in Safari on iPhone (3.0 to 3.2 s glass to glass over
-HTTP/2), resumes after encoder drops, and has thirteen fuzz targets run nightly.
-It has not yet run a production show, and every measurement so far is from
-macOS. The crates are version 0.1.0 on [crates.io](https://crates.io/crates/sapflow). See
-[GOALS.md](GOALS.md), [docs/readiness.md](docs/readiness.md) and
+Reviewed 28 October 2026 against `3c7e1aa`: the own HTTP viewer loop,
+Hyper/Axum removal, private Tor publishing and receiver TV player are merged,
+and current-main CI passes. Earlier origin checks passed v4v's ingest gate,
+Safari playback on iPhone (3.0 to 3.2 s glass to glass over HTTP/2) and
+recovery after encoder drops. Those receipts do not qualify the newer TV
+player on a physical iPhone.
+
+The TV player has successful generated-media Chrome loops of about 13.5
+minutes. Actual Safari/iPhone acceptance, long private-preview and publishing
+runs, separate-network peer savings and wired Linux/Caddy audience capacity
+remain open. Global retained-HLS memory bounds, native recording recovery,
+complete phone shows and signed mobile releases also remain open. There is
+no recorded acceptance of a real V4V production show in these documents.
+
+The crates are version 0.1.0 on [crates.io](https://crates.io/crates/sapflow).
+The current queue and acceptance gates are in [GOALS.md](GOALS.md#remaining-work),
+[docs/delivery-plan.md](docs/delivery-plan.md) and
+[docs/readiness.md](docs/readiness.md); rollout steps remain in
 [docs/trial-plan.md](docs/trial-plan.md).
 
 | Crate | What it is |
