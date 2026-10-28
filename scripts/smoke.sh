@@ -144,6 +144,16 @@ init=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/stream.m3u8")
 curl -s "$BASE/$init" > "$WORK/segs.mp4"; cp "$WORK/segs.mp4" "$WORK/parts.mp4"
 for s in $(grep '_seg' "$WORK/stream.m3u8"); do curl -s "$BASE/$s" >> "$WORK/segs.mp4"; done
 for p in $(grep -o '[0-9a-f]*_part[0-9]*\.mp4' "$WORK/stream.m3u8"); do curl -s "$BASE/$p" >> "$WORK/parts.mp4"; done
+
+# Check live requests before decoding the downloaded files. Decoding can
+# outlast the finite publisher and its reconnect hold on a busy host.
+curl -s "$BASE/stream.m3u8" -o "$WORK/now.m3u8"
+msn=$(( $(grep MEDIA-SEQUENCE "$WORK/now.m3u8" | cut -d: -f2) + $(grep -c EXTINF "$WORK/now.m3u8") + 1 ))
+t=$(curl -s -o /dev/null -w '%{time_total}' "$BASE/stream.m3u8?_HLS_msn=$msn")
+awk "BEGIN { exit !($t > 0.05) }" || fail "blocking reload returned at once ($t s)"
+curl -s -o /dev/null -w '%{http_code}' "$BASE/stream.m3u8?_HLS_msn=$((msn + 5))" | grep -q 400 || fail "far msn not 400"
+echo "ok   blocking reload (waited ${t}s; far ahead is 400)"
+
 ffmpeg -hide_banner -v error -xerror -i "$WORK/segs.mp4" -f null - || fail "segments do not decode"
 ffmpeg -hide_banner -v error -xerror -i "$WORK/parts.mp4" -f null - || fail "parts do not decode"
 for media in "$WORK/segs.mp4" "$WORK/parts.mp4"; do
@@ -159,13 +169,6 @@ assert (audio[0]["codec_name"], int(audio[0]["sample_rate"]), audio[0]["channels
 ' || fail "decoded track profile"
 done
 echo "ok   segments and parts decode"
-
-curl -s "$BASE/stream.m3u8" -o "$WORK/now.m3u8"
-msn=$(( $(grep MEDIA-SEQUENCE "$WORK/now.m3u8" | cut -d: -f2) + $(grep -c EXTINF "$WORK/now.m3u8") + 1 ))
-t=$(curl -s -o /dev/null -w '%{time_total}' "$BASE/stream.m3u8?_HLS_msn=$msn")
-awk "BEGIN { exit !($t > 0.05) }" || fail "blocking reload returned at once ($t s)"
-curl -s -o /dev/null -w '%{http_code}' "$BASE/stream.m3u8?_HLS_msn=$((msn + 5))" | grep -q 400 || fail "far msn not 400"
-echo "ok   blocking reload (waited ${t}s; far ahead is 400)"
 
 for _ in $(seq 1 60); do grep -q '"event":"unpublish"' "$WORK/cb.log" && break; sleep 0.5; done
 grep -q '"event":"unpublish","path":"live/event-smoke"' "$WORK/cb.log" || fail "no unpublish callback"

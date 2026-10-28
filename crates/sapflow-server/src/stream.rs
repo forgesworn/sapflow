@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use sapflow_core::StreamPath;
 use sapflow_core::limits::{PublicationPermit, PublicationQuota};
+use sapflow_core::residency::{PresentationPermit, PresentationQuota, default_presentation_limit};
 use sapflow_hls::muxer::Part;
 use sapflow_hls::{
     FlvIngest, IngestError, Muxer, MuxerConfig, PartLookup, TsIngest, Update, playlist,
@@ -21,6 +22,10 @@ pub struct LiveStream {
     state: Mutex<State>,
     session: Mutex<Session>,
     version: watch::Sender<u64>,
+    fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    // Drop after cached state and session: reservation follows the final stream
+    // owner, including publications, grace tasks and parked viewer requests.
+    _presentation_permit: PresentationPermit,
 }
 
 /// Frozen nonempty track configs for one recorder initialization epoch.
@@ -62,17 +67,26 @@ pub enum SourceKind {
 }
 
 impl Source {
-    fn new(kind: SourceKind, cfg: MuxerConfig) -> Self {
+    fn new(
+        kind: SourceKind,
+        cfg: MuxerConfig,
+        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
         match kind {
-            SourceKind::Ts => Self::Ts(Box::new(TsIngest::new(cfg))),
-            SourceKind::Flv => Self::Flv(Box::new(FlvIngest::new(cfg))),
+            SourceKind::Ts => Self::Ts(Box::new(TsIngest::with_fragment_quota(cfg, fragments))),
+            SourceKind::Flv => Self::Flv(Box::new(FlvIngest::with_fragment_quota(cfg, fragments))),
         }
     }
 
     /// A new connection's ingest, carrying on `muxer` if there is one.
-    fn resume(kind: SourceKind, cfg: MuxerConfig, muxer: Option<Muxer>) -> Self {
+    fn resume(
+        kind: SourceKind,
+        cfg: MuxerConfig,
+        muxer: Option<Muxer>,
+        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
         match (kind, muxer) {
-            (_, None) => Self::new(kind, cfg),
+            (_, None) => Self::new(kind, cfg, fragments),
             (SourceKind::Ts, Some(m)) => Self::Ts(Box::new(TsIngest::resume(cfg, m))),
             (SourceKind::Flv, Some(m)) => Self::Flv(Box::new(FlvIngest::resume(cfg, m))),
         }
@@ -210,12 +224,14 @@ impl LiveStream {
         cfg: MuxerConfig,
         kind: SourceKind,
         publication_permit: Option<PublicationPermit>,
+        presentation_permit: PresentationPermit,
+        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
     ) -> Self {
         Self {
             path,
             cfg,
             state: Mutex::new(State {
-                ingest: Source::new(kind, cfg),
+                ingest: Source::new(kind, cfg, fragments.clone()),
                 prefix: fresh_prefix(),
                 closed: false,
                 media: None,
@@ -231,6 +247,8 @@ impl LiveStream {
                 outage_deadline: None,
             }),
             version: watch::Sender::new(0),
+            fragments,
+            _presentation_permit: presentation_permit,
         }
     }
 
@@ -423,7 +441,19 @@ impl LiveStream {
     }
 
     pub fn close(&self) {
-        self.lock().closed = true;
+        {
+            let mut state = self.lock();
+            state.closed = true;
+            // Terminal drain and recorder feed precede close. Existing response
+            // and recorder aliases retain their own immutable accepted bytes.
+            let kind = match state.ingest {
+                Source::Ts(_) => SourceKind::Ts,
+                Source::Flv(_) => SourceKind::Flv,
+            };
+            state.ingest = Source::new(kind, self.cfg, self.fragments.clone());
+            state.media = None;
+            state.multivariant = None;
+        }
         self.version.send_modify(|v| *v += 1);
         crate::own_http::notify();
     }
@@ -449,19 +479,44 @@ pub enum Retirement {
 pub enum ClaimError {
     AlreadyLive,
     PublisherLimit,
+    PresentationLimit,
 }
 
 /// The live streams, by event id, and current RTMP publication admission.
-#[derive(Default)]
 pub struct Registry {
     streams: Mutex<HashMap<String, Arc<LiveStream>>>,
     rtmp_publications: Arc<PublicationQuota>,
+    presentations: Arc<PresentationQuota>,
+    fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new(default_presentation_limit(16))
+    }
 }
 
 impl Registry {
+    pub fn new(maximum_presentations: usize) -> Self {
+        Self::with_limits(maximum_presentations, 512 * 1024 * 1024)
+    }
+
+    pub fn with_limits(maximum_presentations: usize, fragment_bytes: usize) -> Self {
+        Self {
+            streams: Mutex::new(HashMap::new()),
+            rtmp_publications: Arc::new(PublicationQuota::new()),
+            presentations: Arc::new(PresentationQuota::new(maximum_presentations)),
+            fragments: Arc::new(sapflow_core::fragment::FragmentQuota::new(fragment_bytes)),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn active_rtmp_publishers(&self) -> usize {
         self.rtmp_publications.active()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fragment_quota(&self) -> Arc<sapflow_core::fragment::FragmentQuota> {
+        self.fragments.clone()
     }
 
     fn map(&self) -> MutexGuard<'_, HashMap<String, Arc<LiveStream>>> {
@@ -557,7 +612,7 @@ impl Registry {
                 // the old run. Its final pending part is already below this
                 // floor, and cannot be completed by this connection's first IDR.
                 session.fresh_part_floor = muxer.as_ref().map_or(0, Muxer::next_part_id);
-                st.ingest = Source::resume(kind, stream.cfg, muxer);
+                st.ingest = Source::resume(kind, stream.cfg, muxer, self.fragments.clone());
                 drop(st);
                 configure(&mut session, Claim::Resumed);
                 return Ok((stream.clone(), session.generation, Claim::Resumed));
@@ -570,7 +625,18 @@ impl Registry {
                     .map_err(|_| ClaimError::PublisherLimit)?,
             );
         }
-        let stream = Arc::new(LiveStream::new(path.clone(), cfg, kind, publication_permit));
+        let presentation_permit = self
+            .presentations
+            .try_acquire()
+            .map_err(|_| ClaimError::PresentationLimit)?;
+        let stream = Arc::new(LiveStream::new(
+            path.clone(),
+            cfg,
+            kind,
+            publication_permit,
+            presentation_permit,
+            self.fragments.clone(),
+        ));
         configure(&mut stream.session(), Claim::Fresh);
         map.insert(path.event_id().to_owned(), stream.clone());
         Ok((stream, 0, Claim::Fresh))
@@ -713,6 +779,10 @@ impl Registry {
         drop(recorder);
     }
 }
+
+#[cfg(test)]
+#[path = "stream_retention_tests.rs"]
+mod retention_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1210,6 +1280,7 @@ mod publication_capacity_tests {
         assert!(failed.is_err());
         assert!(registry.get("event-unpublished").is_none());
         assert_eq!(registry.active_rtmp_publishers(), 0);
+        assert_eq!(registry.presentations.active(), 0);
         assert!(attach(&registry, limit, "accepted", SourceKind::Flv).is_ok());
     }
 }

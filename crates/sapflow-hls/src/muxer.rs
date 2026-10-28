@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use sapflow_core::fragment::FragmentQuota;
 
 use crate::codec::{AacConfig, H264Config};
 use crate::fmp4::{self, AUDIO_TRACK, Sample, TrackRun, VIDEO_TIMESCALE, VIDEO_TRACK};
@@ -269,6 +270,8 @@ pub enum PartLookup {
 /// Why the muxer refused media.
 #[derive(Debug, Clone)]
 pub enum MuxError {
+    /// The shared immutable encoded-backing budget cannot admit an allocation.
+    FragmentLimit,
     /// The charged open media passed 64 MiB, live AAC or video entries
     /// exceeded their separate 16,384 limits, or fragment lengths cannot
     /// be represented.
@@ -364,6 +367,8 @@ pub struct Muxer {
     audio_run: Option<AudioRun>,
     audio_end: Option<i64>,
     init: Arc<Initialization>,
+    fragment_quota: Option<Arc<FragmentQuota>>,
+    fragment_refused: bool,
     epoch_first_part_id: u64,
 
     pending_video: Option<Pending>,
@@ -417,6 +422,52 @@ impl Muxer {
         Ok(Self::with_tracks(cfg, None, Some(audio), init))
     }
 
+    /// Builds a muxer whose init and fragment allocations share one byte domain.
+    /// Whole encoded Vec capacities are admitted before any bytes are published.
+    /// Clones and slices keep the same charge through their final payload owner.
+    pub fn with_fragment_quota(
+        cfg: MuxerConfig,
+        video: Option<H264Config>,
+        audio: Option<AacConfig>,
+        quota: Arc<FragmentQuota>,
+    ) -> Result<Self, MuxError> {
+        if video.is_none() {
+            Self::validate_audio(audio.ok_or(MuxError::InvalidTracks)?)?;
+        }
+        let init = fmp4::init_with_quota(
+            video.as_ref(),
+            audio.as_ref(),
+            video.is_none().then_some(0),
+            Some(&quota),
+        )
+        .map_err(|_| MuxError::FragmentLimit)?;
+        if init.is_empty() {
+            return Err(MuxError::InvalidTracks);
+        }
+        let mut muxer = Self::with_tracks(cfg, video, audio, init);
+        muxer.fragment_quota = Some(quota);
+        Ok(muxer)
+    }
+
+    pub(crate) fn fragment_quota(&self) -> Option<Arc<FragmentQuota>> {
+        self.fragment_quota.clone()
+    }
+
+    pub(crate) fn resume_fragment_admission(&mut self) {
+        if self.fragment_refused {
+            self.interrupt(SystemTime::UNIX_EPOCH);
+            self.fragment_refused = false;
+        }
+    }
+
+    fn check_fragment_admission(&self) -> Result<(), MuxError> {
+        if self.fragment_refused {
+            Err(MuxError::FragmentLimit)
+        } else {
+            Ok(())
+        }
+    }
+
     fn validate_audio(audio: AacConfig) -> Result<(), MuxError> {
         if audio.object_type != 2
             || !(1..=2).contains(&audio.channels)
@@ -444,6 +495,8 @@ impl Muxer {
             audio_run: None,
             audio_end: None,
             init: Arc::new(Initialization { id: 0, data: init }),
+            fragment_quota: None,
+            fragment_refused: false,
             epoch_first_part_id: 0,
             pending_video: None,
             pending_audio: None,
@@ -496,9 +549,10 @@ impl Muxer {
     /// decode-time identities. Old initializations live only while referenced
     /// by the bounded segment/part window (or an in-flight response).
     pub fn reconfigure(&mut self, video: H264Config, audio: Option<AacConfig>, now: SystemTime) {
-        // Existing H.264 constructor semantics remain unchanged.
-        let init = fmp4::init_segment(&video, audio.as_ref());
-        self.replace_tracks(Some(video), audio, init, now);
+        // Keep the legacy infallible signature. Bounded callers should use
+        // reconfigure_tracks for immediate refusal; failure also fences pushes
+        // and is reported as media loss by interrupt until a new ingest resumes.
+        let _ = self.reconfigure_tracks(Some(video), audio, now);
     }
 
     /// Replaces topology at a connection boundary, preserving playlist and
@@ -512,18 +566,26 @@ impl Muxer {
         audio: Option<AacConfig>,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        self.check_fragment_admission()?;
         if video.is_none() {
             let audio = audio.ok_or(MuxError::InvalidTracks)?;
             Self::validate_audio(audio)?;
             self.check_audio_part_timing(audio)?;
         }
-        let init = if let Some(video) = &video {
-            fmp4::init_segment(video, audio.as_ref())
-        } else {
-            fmp4::init_segment_for_tracks(None, audio.as_ref(), Duration::ZERO)
-                .ok_or(MuxError::InvalidTracks)?
-        };
-        Ok(self.replace_tracks(video, audio, init, now))
+        let init = fmp4::init_with_quota(
+            video.as_ref(),
+            audio.as_ref(),
+            video.is_none().then_some(0),
+            self.fragment_quota.as_ref(),
+        )
+        .map_err(|_| {
+            self.fragment_refused = true;
+            MuxError::FragmentLimit
+        })?;
+        if init.is_empty() {
+            return Err(MuxError::InvalidTracks);
+        }
+        self.replace_tracks(video, audio, init, now)
     }
 
     fn replace_tracks(
@@ -532,8 +594,13 @@ impl Muxer {
         audio: Option<AacConfig>,
         data: Bytes,
         now: SystemTime,
-    ) -> Update {
+    ) -> Result<Update, MuxError> {
         let update = self.interrupt(now);
+        if self.fragment_refused {
+            // The new init was admitted, but sealing the old tail was not.
+            // Release the unused successor backing and keep the old epoch.
+            return Err(MuxError::FragmentLimit);
+        }
         self.pending_audio = None;
         self.audio_run = None;
         self.audio_end = None;
@@ -544,7 +611,7 @@ impl Muxer {
         });
         self.video = video;
         self.audio = audio;
-        update
+        Ok(update)
     }
 
     /// The id of the first part cut under the current init segment (zero until
@@ -733,6 +800,7 @@ impl Muxer {
         data: Bytes,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        self.check_fragment_admission()?;
         if self.video.is_none() {
             return Err(MuxError::InvalidTracks);
         }
@@ -814,11 +882,11 @@ impl Muxer {
 
         let mut update = Update::default();
         if self.timing.is_some() {
-            update.part = self.place_video(frame, ends_segment);
+            update.part = self.place_video(frame, ends_segment)?;
         } else {
             self.learning.push(frame);
             if ends_segment {
-                self.choose_part_timing();
+                self.choose_part_timing()?;
             }
         }
         if ends_segment {
@@ -884,6 +952,9 @@ impl Muxer {
     /// Audio-only seals every accepted complete AAC frame, whose duration is
     /// known, then rebases the next run after a discontinuity.
     pub fn interrupt(&mut self, now: SystemTime) -> Update {
+        if self.fragment_refused {
+            return self.interrupt_refused(now);
+        }
         if self.video.is_none() {
             self.audio_run = None;
             let Some(end) = self.audio_end.take() else {
@@ -891,6 +962,7 @@ impl Muxer {
             };
             let (closed, media_loss) = match self.close_run(end, now) {
                 Ok(closed) => (closed, false),
+                Err(_) if self.fragment_refused => return self.interrupt_refused(now),
                 Err(_) => (false, true),
             };
             self.rebase_to = Some(end);
@@ -912,6 +984,7 @@ impl Muxer {
         }
         let (closed, media_loss) = match self.close_run(cur.dts, now) {
             Ok(closed) => (closed, false),
+            Err(_) if self.fragment_refused => return self.interrupt_refused(now),
             Err(_) => (false, true),
         };
         self.rebase_to = Some(cur.dts);
@@ -919,6 +992,47 @@ impl Muxer {
             part: closed,
             segment: closed,
             media_loss,
+            ..Update::default()
+        }
+    }
+
+    // A refused unsealed suffix must not extend the accepted prefix's duration.
+    // Seal only already-admitted parts, then discard unencoded pending input.
+    fn interrupt_refused(&mut self, now: SystemTime) -> Update {
+        let had_run =
+            self.next_segment.is_some() || self.pending_video.is_some() || self.audio_run.is_some();
+        self.part = None;
+        self.pending_video = None;
+        self.pending_audio = None;
+        self.learning.clear();
+        self.audio_run = None;
+        self.audio_end = None;
+        let end = self.next_segment.as_ref().and_then(|segment| {
+            (!segment.parts.is_empty())
+                .then(|| {
+                    segment
+                        .parts
+                        .iter()
+                        .try_fold(segment.start_dts, |at, part| {
+                            at.checked_add(duration_to_ticks(part.span, VIDEO_TIMESCALE))
+                        })
+                })
+                .flatten()
+        });
+        let closed = if let Some(end) = end {
+            self.rebase_to = Some(end);
+            self.rotate_segment(end, now, false).is_ok()
+        } else {
+            self.next_segment = None;
+            false
+        };
+        self.discontinuity_next = true;
+        if had_run {
+            self.breaks += 1;
+        }
+        Update {
+            segment: closed,
+            media_loss: true,
             ..Update::default()
         }
     }
@@ -932,7 +1046,7 @@ impl Muxer {
             .as_ref()
             .is_some_and(|p| !p.video.is_empty() || (self.video.is_none() && !p.audio.is_empty()))
         {
-            self.rotate_part(end, end);
+            self.rotate_part(end, end)?;
         }
         // An open part with no video (audio alone) is dropped.
         self.part = None;
@@ -962,7 +1076,7 @@ impl Muxer {
 
     /// Fixes the part timing from the first segment's frames and cuts that
     /// segment into parts.
-    fn choose_part_timing(&mut self) {
+    fn choose_part_timing(&mut self) -> Result<(), MuxError> {
         let durations: Vec<u32> = self
             .learning
             .iter()
@@ -978,8 +1092,9 @@ impl Muxer {
         let frames = std::mem::take(&mut self.learning);
         let last = frames.len().saturating_sub(1);
         for (i, f) in frames.into_iter().enumerate() {
-            self.place_video(f, i == last);
+            self.place_video(f, i == last)?;
         }
+        Ok(())
     }
 
     /// Adds a frame to the open part and closes the part when it has reached
@@ -992,9 +1107,9 @@ impl Muxer {
     /// the true time. The alternatives break Apple's part rules: letting
     /// the part run long exceeds `PART-TARGET`, and closing the part before
     /// the frame leaves it under 85%.
-    fn place_video(&mut self, f: Frame, ends_segment: bool) -> bool {
+    fn place_video(&mut self, f: Frame, ends_segment: bool) -> Result<bool, MuxError> {
         let (Some(t), Some(part)) = (self.timing, self.part.as_mut()) else {
-            return false;
+            return Ok(false);
         };
         if part.video.is_empty() {
             part.video_base = f.dts as u64;
@@ -1022,10 +1137,10 @@ impl Muxer {
             data: f.data,
         });
         if ends_segment || duration < full || end - start >= t.cut {
-            self.rotate_part(end, f.next_dts);
-            return true;
+            self.rotate_part(end, f.next_dts)?;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 
     fn check_audio_part_timing(&self, audio: AacConfig) -> Result<PartTiming, MuxError> {
@@ -1053,6 +1168,7 @@ impl Muxer {
         data: Bytes,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        self.check_fragment_admission()?;
         if self.video.is_some() {
             self.push_audio(pts, data)?;
             return Ok(Update::default());
@@ -1162,7 +1278,7 @@ impl Muxer {
         let end_segment =
             ticks_to_duration(end - seg.start_dts, VIDEO_TIMESCALE) >= self.cfg.segment_min;
         if end_segment || end - part.start_dts >= timing.cut {
-            self.rotate_part(end, end);
+            self.rotate_part(end, end)?;
             update.part = true;
         }
         if end_segment {
@@ -1175,6 +1291,7 @@ impl Muxer {
     /// Checks video-led AAC before a borrowed payload is copied by ingest.
     /// Pending video and payload backing capacity remain separately scoped.
     pub(crate) fn check_audio_admission(&self, pts: i64, bytes: usize) -> Result<(), MuxError> {
+        self.check_fragment_admission()?;
         let Some(audio) = self.audio else {
             return Ok(());
         };
@@ -1221,6 +1338,7 @@ impl Muxer {
     /// callers must propagate it and mark any accepted recording incomplete.
     /// Use `push_audio_at` for an entry point that also supports audio-only.
     pub fn push_audio(&mut self, pts: i64, data: Bytes) -> Result<(), MuxError> {
+        self.check_fragment_admission()?;
         self.check_audio_admission(pts, data.len())?;
         // This compatibility path needs video to supply cuts and wall time.
         // Audio-only callers must use the checked, updating `push_audio_at`.
@@ -1290,9 +1408,9 @@ impl Muxer {
     /// Closes the open part at `end_dts` and opens the next at `next_start`
     /// (later than `end_dts` only after a clamped frame). Audio that starts
     /// at or after the end moves to the next part.
-    fn rotate_part(&mut self, end_dts: i64, next_start: i64) {
+    fn rotate_part(&mut self, end_dts: i64, next_start: i64) -> Result<(), MuxError> {
         let Some(mut part) = self.part.take() else {
-            return;
+            return Ok(());
         };
         let split = part
             .audio_times
@@ -1301,7 +1419,7 @@ impl Muxer {
             .unwrap_or(part.audio.len());
         let later_audio = part.audio.split_off(split);
         let later_times = part.audio_times.split_off(split);
-        let data = fmp4::encode_part(
+        let data = fmp4::encode_part_with_quota(
             (part.id + 1) as u32,
             &[
                 TrackRun {
@@ -1315,7 +1433,15 @@ impl Muxer {
                     samples: &part.audio,
                 },
             ],
-        );
+            self.fragment_quota.as_ref(),
+        )
+        .map_err(|_| {
+            self.fragment_refused = true;
+            MuxError::FragmentLimit
+        })?;
+        if data.is_empty() {
+            return Err(MuxError::SegmentTooLarge);
+        }
         let finished = Arc::new(Part {
             initialization: self.init.clone(),
             id: part.id,
@@ -1333,6 +1459,7 @@ impl Muxer {
         next.audio = later_audio;
         next.audio_times = later_times;
         self.part = Some(next);
+        Ok(())
     }
 
     /// Closes the open segment at `end_dts` and, unless the stream broke,
@@ -1605,6 +1732,10 @@ impl Muxer {
         Some(((bytes as f64 * 8.0 / secs) as u64, lens[lens.len() / 2]))
     }
 }
+
+#[cfg(test)]
+#[path = "fragment_quota_tests.rs"]
+mod fragment_quota_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -61,6 +61,34 @@ its events feed `FlvIngest` directly. For SRT, see
 [`sapflow-srt`](https://crates.io/crates/sapflow-srt); it carries MPEG-TS for
 `TsIngest`.
 
+Encoded init/fragment backings can share a byte budget through
+`sapflow_core::fragment::FragmentQuota`. Pass the same `Arc` to
+`Muxer::with_fragment_quota`, `EsIngest::with_fragment_quota`,
+`TsIngest::with_fragment_quota` or `FlvIngest::with_fragment_quota` for all
+presentations in one admission domain. The server opts in on both protocols.
+Existing `new` and `audio_only` constructors retain their unmetered encoded
+storage policy; their input/sample limits above still apply.
+
+Each immutable encoded Vec is charged for its whole capacity, including box
+headers and spare space, before publishing it. `Bytes` clones and slices,
+parts, segment chunks, responses and recorder aliases share that charge until
+the final payload owner releases it. Cache removal is not final release.
+`FragmentQuota::used()` measures logical charged capacity, not RSS. Input
+buffers, encoding temporaries, metadata, recorder output copies and kernel
+buffers need their own bounds and measurements.
+
+Exhaustion reports the new `MuxError::FragmentLimit` or
+`IngestError::FragmentLimit` case; exhaustive error matches must handle it.
+Stop the failed input and drain its accepted prefix as incomplete. Once an
+existing muxer refuses backing, its further pushes remain refused until a new
+ingest resumes the presentation. Resume
+carries the same quota through codec changes and reconnects; it still needs
+available capacity. Use fallible `reconfigure_tracks` for immediate refusal.
+The legacy infallible `reconfigure` preserves its signature but fences media
+after refusal, which subsequent pushes and `interrupt` report. Reconfiguration
+keeps the old epoch if sealing its tail cannot be admitted. No release or
+native recorder-default change is implied by these source APIs.
+
 Sans-IO throughout: no sockets, no async runtime, no `unsafe`. You own the
 connections, the clock and the HTTP server.
 

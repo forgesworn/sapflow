@@ -18,6 +18,7 @@
 //! - A request head must arrive within [`HEADER_TIMEOUT`] of its first byte.
 //! - A connection with nothing parked that makes no progress for
 //!   [`IDLE_TIMEOUT`] is closed.
+//! - A ready response has an absolute [`BODY_TIMEOUT`], independent of progress.
 //! - One response in flight per connection, so a client that sends without
 //!   reading stops being read, and at most [`REQUESTS_PER_TURN`] requests per
 //!   connection before the worker serves the others.
@@ -55,9 +56,15 @@ pub const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 /// reuse: at 10 s, viewers that reused a connection just as it closed saw
 /// failed requests.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Absolute time allowed to transfer one ready framed response, including
+/// headers. Parked LL-HLS waiting has its own deadline and is excluded.
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Requests one connection may have answered before the worker turns to the
 /// others; the rest wait their turn on the ready queue.
 pub const REQUESTS_PER_TURN: usize = 16;
+/// Write attempts per connection turn. A continuously writable large response
+/// must yield so the worker can sweep other connections' deadlines.
+const WRITES_PER_TURN: usize = 16;
 /// Connections accepted per turn, for the same reason.
 const ACCEPTS_PER_TURN: usize = 64;
 /// How often each worker checks deadlines and retries a paused accept.
@@ -82,6 +89,7 @@ pub fn notify() {
 pub struct Timeouts {
     pub header: Duration,
     pub idle: Duration,
+    pub body: Duration,
 }
 
 impl Default for Timeouts {
@@ -89,6 +97,7 @@ impl Default for Timeouts {
         Self {
             header: HEADER_TIMEOUT,
             idle: IDLE_TIMEOUT,
+            body: BODY_TIMEOUT,
         }
     }
 }
@@ -155,6 +164,7 @@ struct Output {
     head: Bytes,
     written: usize,
     body: MediaBody,
+    response_started: Option<Instant>,
 }
 
 /// Bound stack usage independently of the number of parts in a segment.
@@ -163,6 +173,42 @@ const WRITE_SLICES: usize = 8;
 impl Output {
     fn is_empty(&self) -> bool {
         self.head.is_empty() && self.body.is_empty()
+    }
+
+    fn expired(&self, now: Instant, timeout: Duration) -> bool {
+        !self.is_empty()
+            && self
+                .response_started
+                .is_some_and(|started| now.saturating_duration_since(started) >= timeout)
+    }
+
+    /// Writes a finite turn. The clock is injectable to check progress and
+    /// expiry without sleeping; real sockets use the monotonic wall clock.
+    fn flush_to(
+        &mut self,
+        writer: &mut impl Write,
+        timeout: Duration,
+        mut now: impl FnMut() -> Instant,
+    ) -> io::Result<(Option<Instant>, bool)> {
+        let mut progress = None;
+        for _ in 0..WRITES_PER_TURN {
+            if self.is_empty() {
+                return Ok((progress, false));
+            }
+            if self.expired(now(), timeout) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match self.write_to(writer) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(_) => progress = Some(now()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok((progress, false));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok((progress, !self.is_empty()))
     }
 
     fn write_to(&mut self, writer: &mut impl Write) -> io::Result<usize> {
@@ -445,7 +491,10 @@ impl Worker {
                     let slow_head = c
                         .head_started
                         .is_some_and(|s| now.duration_since(s) >= t.header);
-                    if slow_head || now.duration_since(c.last_progress) >= t.idle {
+                    if slow_head
+                        || c.output.expired(now, t.body)
+                        || now.duration_since(c.last_progress) >= t.idle
+                    {
                         closing.push(*id);
                     }
                 }
@@ -477,8 +526,9 @@ impl Worker {
         let app = &self.app;
         let poll = &self.poll;
         let buf = &mut self.buf;
+        let body_timeout = self.timeouts.body;
         let turn = catch_unwind(AssertUnwindSafe(|| {
-            drive(app, poll, conn, Token(id), buf, read)
+            drive(app, poll, conn, Token(id), buf, read, body_timeout)
         }))
         .unwrap_or_else(|_| {
             tracing::error!("panic while serving an HTTP connection; closed it");
@@ -509,10 +559,14 @@ fn drive(
     token: Token,
     buf: &mut [u8],
     mut read: bool,
+    body_timeout: Duration,
 ) -> io::Result<Turn> {
     let mut taken = 0;
     let turn = loop {
         let now = Instant::now();
+        if conn.output.expired(now, body_timeout) {
+            return Ok(Turn::Close);
+        }
         if read || conn.unread {
             read = false;
             if !fill(conn, buf, now) {
@@ -522,9 +576,9 @@ fn drive(
         if let Some(mut p) = conn.parked.take() {
             let seen = stream_of(&p.request).version();
             match answer(app, &p.request) {
-                Some(r) => respond(conn, r, p.head_only),
+                Some(r) => respond(conn, r, p.head_only, now),
                 None if now >= p.deadline => {
-                    respond(conn, Response::empty("503 Service Unavailable"), false)
+                    respond(conn, Response::empty("503 Service Unavailable"), false, now)
                 }
                 None => {
                     p.seen = seen;
@@ -542,7 +596,9 @@ fn drive(
                 taken += 1;
             }
         }
-        flush(conn, now)?;
+        if flush(conn, body_timeout)? {
+            break Turn::Again;
+        }
         // Go round again while there is another request to take: one already
         // buffered, or bytes left in the socket when the buffer was full.
         let ready_for_more = conn.parked.is_none() && conn.output.is_empty() && !conn.close_after;
@@ -611,7 +667,7 @@ fn take_request(app: &App, conn: &mut Conn, now: Instant) -> bool {
             conn.input = Vec::new();
             conn.unread = false;
             conn.keep_alive_10 = false;
-            respond(conn, Response::empty("400 Bad Request"), false);
+            respond(conn, Response::empty("400 Bad Request"), false, now);
             return true;
         }
     };
@@ -628,7 +684,7 @@ fn take_request(app: &App, conn: &mut Conn, now: Instant) -> bool {
         Ok(request) => {
             let seen = stream_of(&request).version();
             match answer(app, &request) {
-                Some(r) => respond(conn, r, head_only),
+                Some(r) => respond(conn, r, head_only, now),
                 None => {
                     let deadline = now + block_limit(stream_of(&request));
                     conn.parked = Some(Parked {
@@ -640,12 +696,12 @@ fn take_request(app: &App, conn: &mut Conn, now: Instant) -> bool {
                 }
             }
         }
-        Err(r) => respond(conn, r, head_only),
+        Err(r) => respond(conn, r, head_only, now),
     }
     true
 }
 
-fn respond(conn: &mut Conn, r: Response, head_only: bool) {
+fn respond(conn: &mut Conn, r: Response, head_only: bool, now: Instant) {
     let persist = if conn.close_after {
         Persist::Close
     } else if conn.keep_alive_10 {
@@ -658,6 +714,7 @@ fn respond(conn: &mut Conn, r: Response, head_only: bool) {
     conn.output = Output {
         head: Bytes::from(head),
         written: 0,
+        response_started: Some(now),
         body: if head_only {
             MediaBody::default()
         } else {
@@ -666,19 +723,14 @@ fn respond(conn: &mut Conn, r: Response, head_only: bool) {
     };
 }
 
-fn flush(conn: &mut Conn, now: Instant) -> io::Result<()> {
-    while !conn.output.is_empty() {
-        match conn.output.write_to(&mut conn.sock) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(_) => {
-                conn.last_progress = now;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
+fn flush(conn: &mut Conn, body_timeout: Duration) -> io::Result<bool> {
+    let (progress, again) = conn
+        .output
+        .flush_to(&mut conn.sock, body_timeout, Instant::now)?;
+    if let Some(now) = progress {
+        conn.last_progress = now;
     }
-    Ok(())
+    Ok(again)
 }
 
 fn stream_of(r: &Request) -> &LiveStream {
@@ -898,6 +950,7 @@ mod tests {
         let mut output = Output {
             head,
             written: 0,
+            response_started: None,
             body: data.into(),
         };
         let mut writer = Writer {
@@ -1155,6 +1208,7 @@ mod tests {
         let timeouts = Timeouts {
             header: Duration::from_millis(400),
             idle: Duration::from_secs(60),
+            body: BODY_TIMEOUT,
         };
         spawn(app, listener, 1, timeouts).expect("spawn");
         let (mut s, mut r) = connect(addr);
@@ -1223,3 +1277,7 @@ mod tests {
         let _ = hog.join();
     }
 }
+
+#[cfg(test)]
+#[path = "own_http_deadline_tests.rs"]
+mod deadline_tests;

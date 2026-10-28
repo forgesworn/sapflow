@@ -271,7 +271,110 @@ fn audio_timing(data: &[u8]) {
     }
 }
 
+// Bounded allocations, response aliases and connection recovery. Copies in the
+// oracle are test metadata; this verifies logical charges, not process RSS.
+fn fragment_budget(data: &[u8]) {
+    use sapflow_core::fragment::FragmentQuota;
+    use sapflow_hls::{EsIngest, PartLookup};
+    use std::sync::Arc;
+    if data.len() < 2 {
+        return;
+    }
+    let maximum = usize::from(u16::from_le_bytes([data[0], data[1]]));
+    let quota = Arc::new(FragmentQuota::new(maximum));
+    let video = H264Config::new(SPS, PPS).expect("generated supported config");
+    let cfg = MuxerConfig {
+        segment_count: 8,
+        ..MuxerConfig::default()
+    };
+    let Ok(mut muxer) = Muxer::with_fragment_quota(cfg, Some(video.clone()), None, quota.clone())
+    else {
+        assert_eq!(quota.used(), 0);
+        return;
+    };
+    let mut held: Vec<(Bytes, Vec<u8>)> = Vec::new();
+    let mut dts = 0;
+    let mut rules = playlist::RuleCheck::default();
+    for record in data[2..].chunks_exact(8).take(256) {
+        match record[0] % 6 {
+            0 => {
+                let _ = muxer.push_video(
+                    dts,
+                    dts,
+                    record[1] & 1 != 0,
+                    Bytes::copy_from_slice(&record[2..]),
+                    std::time::UNIX_EPOCH,
+                );
+                dts += 3000;
+            }
+            1 | 2 if held.len() < 32 => {
+                let bytes = if record[0] % 6 == 1 {
+                    Some(muxer.init().clone())
+                } else {
+                    muxer
+                        .next_part_id()
+                        .checked_sub(1)
+                        .and_then(|id| match muxer.part(id) {
+                            PartLookup::Found(part) => Some(part.data.clone()),
+                            _ => None,
+                        })
+                };
+                if let Some(bytes) = bytes {
+                    let before = quota.used();
+                    let offset = usize::from(record[1]) % bytes.len().max(1);
+                    let alias = bytes.slice(offset..);
+                    held.push((alias.clone(), alias.to_vec()));
+                    assert_eq!(quota.used(), before, "clones and slices share one charge");
+                }
+            }
+            3 => {
+                held.pop();
+            }
+            4 => {
+                muxer.interrupt(std::time::UNIX_EPOCH);
+                let mut ingest = EsIngest::resume(cfg, muxer);
+                muxer = ingest.take_muxer().expect("retained presentation");
+                dts = 0;
+            }
+            5 => {
+                let old_epoch = muxer.current_initialization_id();
+                if matches!(
+                    muxer.reconfigure_tracks(Some(video.clone()), None, std::time::UNIX_EPOCH),
+                    Err(sapflow_hls::muxer::MuxError::FragmentLimit)
+                ) {
+                    assert_eq!(
+                        muxer.current_initialization_id(),
+                        old_epoch,
+                        "refusal cannot install an unaccepted successor epoch"
+                    );
+                }
+            }
+            _ => {}
+        }
+        assert!(quota.used() <= maximum);
+        for (bytes, expected) in &held {
+            assert_eq!(bytes.as_ref(), expected.as_slice());
+        }
+        if muxer.has_content() {
+            let text = playlist::media(&muxer, "p");
+            rules
+                .check(&text)
+                .unwrap_or_else(|error| panic!("{error}\n{text}"));
+        }
+    }
+    drop(muxer);
+    for (bytes, expected) in &held {
+        assert_eq!(bytes.as_ref(), expected.as_slice());
+    }
+    drop(held);
+    assert_eq!(quota.used(), 0);
+}
+
 fuzz_target!(|data: &[u8]| {
+    if let Some(records) = data.strip_prefix(b"FBUD") {
+        fragment_budget(records);
+        return;
+    }
     if let Some(records) = data.strip_prefix(b"NREC") {
         native_recording(records);
         return;

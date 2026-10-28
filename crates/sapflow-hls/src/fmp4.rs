@@ -310,6 +310,23 @@ fn native_box(kind: &[u8; 4], body: &[u8], output: &mut Vec<u8>) -> Result<(), T
 }
 
 fn init(video: Option<&H264Config>, audio: Option<&AacConfig>, duration_ms: Option<u64>) -> Bytes {
+    Bytes::from(init_buffer(video, audio, duration_ms))
+}
+
+pub(crate) fn init_with_quota(
+    video: Option<&H264Config>,
+    audio: Option<&AacConfig>,
+    duration_ms: Option<u64>,
+    quota: Option<&std::sync::Arc<sapflow_core::fragment::FragmentQuota>>,
+) -> Result<Bytes, sapflow_core::fragment::FragmentLimit> {
+    crate::fragment::retain(init_buffer(video, audio, duration_ms), quota)
+}
+
+fn init_buffer(
+    video: Option<&H264Config>,
+    audio: Option<&AacConfig>,
+    duration_ms: Option<u64>,
+) -> Vec<u8> {
     let ftyp = Ftyp {
         major_brand: b"iso5".into(),
         minor_version: 1,
@@ -358,9 +375,9 @@ fn init(video: Option<&H264Config>, audio: Option<&AacConfig>, duration_ms: Opti
     // Encoding into a Vec cannot run out of space; the only failures are
     // values that do not fit their fields, which our own configs never hold.
     if ftyp.encode(&mut buf).is_err() || moov.encode(&mut buf).is_err() {
-        return Bytes::new();
+        return Vec::new();
     }
-    Bytes::from(buf)
+    buf
 }
 
 fn empty_stbl(stsd: Stsd) -> Stbl {
@@ -539,6 +556,31 @@ fn encode_part_inner(
     native_recording: bool,
     final_audio_duration: Option<u32>,
 ) -> Bytes {
+    Bytes::from(encode_part_buffer(
+        sequence_number,
+        runs,
+        native_recording,
+        final_audio_duration,
+    ))
+}
+
+pub(crate) fn encode_part_with_quota(
+    sequence_number: u32,
+    runs: &[TrackRun<'_>],
+    quota: Option<&std::sync::Arc<sapflow_core::fragment::FragmentQuota>>,
+) -> Result<Bytes, sapflow_core::fragment::FragmentLimit> {
+    crate::fragment::retain(
+        encode_part_buffer(sequence_number, runs, false, None),
+        quota,
+    )
+}
+
+fn encode_part_buffer(
+    sequence_number: u32,
+    runs: &[TrackRun<'_>],
+    native_recording: bool,
+    final_audio_duration: Option<u32>,
+) -> Vec<u8> {
     let runs: Vec<&TrackRun<'_>> = runs.iter().filter(|r| !r.samples.is_empty()).collect();
 
     let build = |offsets: &[i32]| Moof {
@@ -596,7 +638,7 @@ fn encode_part_inner(
     // on their values: encode once to measure, then again with real offsets.
     let mut probe = Vec::new();
     if build(&vec![0; runs.len()]).encode(&mut probe).is_err() {
-        return Bytes::new();
+        return Vec::new();
     }
     let lengths = runs.iter().map(|run| {
         run.samples.iter().try_fold(0usize, |length, sample| {
@@ -604,11 +646,11 @@ fn encode_part_inner(
         })
     });
     let Some((offsets, capacity)) = checked_part_layout(probe.len(), lengths) else {
-        return Bytes::new();
+        return Vec::new();
     };
     let mut buf = Vec::with_capacity(capacity);
     if build(&offsets).encode(&mut buf).is_err() {
-        return Bytes::new();
+        return Vec::new();
     }
     // Write shared sample payloads directly into the final fragment. Keep the
     // same mp4-atom box framing without a temporary payload Vec, its growth
@@ -624,9 +666,9 @@ fn encode_part_inner(
         })
         .is_err()
     {
-        return Bytes::new();
+        return Vec::new();
     }
-    Bytes::from(buf)
+    buf
 }
 
 // mp4-atom's Atom encoder supports 32-bit sizes, not extended mdat boxes.
@@ -818,6 +860,53 @@ mod tests {
             &[0x68, 0xef, 0xbc, 0x80],
         )
         .expect("valid sps")
+    }
+
+    #[test]
+    fn bounded_encodings_charge_actual_vec_capacity_including_headers() {
+        use sapflow_core::fragment::FragmentQuota;
+        use std::sync::Arc;
+        let config = video();
+        let init_buffer = super::init_buffer(Some(&config), None, None);
+        let capacity = init_buffer.capacity();
+        let quota = Arc::new(FragmentQuota::new(capacity));
+        let init = super::init_with_quota(Some(&config), None, None, Some(&quota))
+            .expect("exact encoded init capacity");
+        assert_eq!(init.as_ref(), init_buffer.as_slice());
+        assert_eq!(quota.used(), capacity);
+        assert!(capacity >= init.len());
+        drop(init);
+        assert_eq!(quota.used(), 0);
+
+        let samples = [Sample {
+            duration: 3000,
+            cts: 0,
+            sync: true,
+            data: Bytes::from_static(b"generated sample"),
+        }];
+        let runs = [TrackRun {
+            track_id: VIDEO_TRACK,
+            base_time: 0,
+            samples: &samples,
+        }];
+        let buffer = super::encode_part_buffer(1, &runs, false, None);
+        let capacity = buffer.capacity();
+        assert!(capacity >= buffer.len() && buffer.len() > samples[0].data.len());
+        let quota = Arc::new(FragmentQuota::new(capacity));
+        let fragment = super::encode_part_with_quota(1, &runs, Some(&quota))
+            .expect("exact full encoded capacity");
+        assert_eq!(fragment.as_ref(), buffer.as_slice());
+        assert_eq!(
+            quota.used(),
+            capacity,
+            "moof/mdat headers and all spare capacity are charged"
+        );
+        assert!(quota.try_acquire(1).is_err());
+        let suffix = fragment.slice(8..);
+        drop(fragment);
+        assert_eq!(quota.used(), capacity);
+        drop(suffix);
+        assert_eq!(quota.used(), 0);
     }
 
     #[test]

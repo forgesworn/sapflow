@@ -4,7 +4,25 @@ use libfuzzer_sys::fuzz_target;
 use sapflow_hls::{FlvIngest, MuxerConfig, TrackSet};
 
 fuzz_target!(|data: &[u8]| {
-    let mut ing = FlvIngest::new(MuxerConfig::default());
+    let (quota, data) = if let Some(rest) = data.strip_prefix(b"FBUD") {
+        if rest.len() < 2 {
+            return;
+        }
+        let maximum = usize::from(u16::from_le_bytes([rest[0], rest[1]]));
+        (
+            Some((
+                std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(maximum)),
+                maximum,
+            )),
+            &rest[2..],
+        )
+    } else {
+        (None, data)
+    };
+    let mut ing = match &quota {
+        Some((quota, _)) => FlvIngest::with_fragment_quota(MuxerConfig::default(), quota.clone()),
+        None => FlvIngest::new(MuxerConfig::default()),
+    };
     // Keep historical three-kind crash inputs unchanged. The explicit prefix
     // adds track-declaration records for new seeds without reinterpreting them.
     let declarations = data.starts_with(b"TRKS");
@@ -22,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
                     .video(ms, body, std::time::SystemTime::UNIX_EPOCH)
                     .is_err()
                 {
-                    return;
+                    break;
                 }
             }
             1 => {
@@ -30,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
                     .audio_at(ms, body, std::time::SystemTime::UNIX_EPOCH)
                     .is_err()
                 {
-                    return;
+                    break;
                 }
             }
             2 => ing.expect_audio(body.first().is_some_and(|b| b & 1 == 1)),
@@ -44,9 +62,14 @@ fuzz_target!(|data: &[u8]| {
                     .declare_tracks(tracks, std::time::SystemTime::UNIX_EPOCH)
                     .is_err()
                 {
-                    return;
+                    break;
                 }
             }
         }
+    }
+    if let Some((quota, maximum)) = quota {
+        assert!(quota.used() <= maximum);
+        drop(ing);
+        assert_eq!(quota.used(), 0);
     }
 });

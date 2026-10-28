@@ -45,6 +45,8 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_HLS_MODE         low-latency (default) or whole; whole omits parts
   SAPFLOW_HTTP_THREADS     viewer event loop threads (default: one per core, max 256)
                            explicit values: 1..256
+  SAPFLOW_HTTP_BODY_TIMEOUT absolute ready-response transfer seconds, including
+                           headers (default 120, 1..3600); excludes parked waits
   SAPFLOW_RECORDINGS       record every show to this directory (unset: off)
   SAPFLOW_RECORD_SKIP      paths not to record, comma-separated; a trailing *
                            matches a prefix (live/event-loop-*)
@@ -52,6 +54,11 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_RECORD_MIN_FREE_GB   do not record below this much free disk
                                (default 2; 0 turns the check off)
   SAPFLOW_MAX_PUBLISHERS   simultaneous publishers per protocol (default 16)
+  SAPFLOW_MAX_PRESENTATIONS resident HLS presentations, including reconnect hold
+                           and removed streams with owners (default 4x publishers;
+                           64 at default, explicit values 1..4096)
+  SAPFLOW_MAX_FRAGMENT_BYTES shared encoded init/fragment backing capacity
+                           (default 536870912, 512 MiB; positive byte count)
   SAPFLOW_MAX_PUBLISH_MBPS drop a publisher above this bitrate, averaged over
                            5 s (default 40)
   RUST_LOG                 log filter (default info)
@@ -81,11 +88,14 @@ const KEYS: &[&str] = &[
     "SAPFLOW_HLS_MODE",
     "SAPFLOW_HTTP_IMPL",
     "SAPFLOW_HTTP_THREADS",
+    "SAPFLOW_HTTP_BODY_TIMEOUT",
     "SAPFLOW_RTMP_ADDR",
     "SAPFLOW_RECORDINGS",
     "SAPFLOW_RECORD_SKIP",
     "SAPFLOW_RECORD_DELETE_AFTER",
     "SAPFLOW_MAX_PUBLISHERS",
+    "SAPFLOW_MAX_PRESENTATIONS",
+    "SAPFLOW_MAX_FRAGMENT_BYTES",
     "SAPFLOW_MAX_PUBLISH_MBPS",
     "SAPFLOW_RECORD_MIN_FREE_GB",
     "SAPFLOW_SRT_IMPL",
@@ -122,10 +132,13 @@ pub struct Config {
     pub low_latency: bool,
     /// Threads for the viewer event loop (`own_http.rs`).
     pub http_threads: usize,
+    pub http_body_timeout: Duration,
     pub recordings: Option<PathBuf>,
     pub record_policy: RecordPolicy,
     pub record_delete_after: Duration,
     pub max_publishers: usize,
+    pub max_presentations: usize,
+    pub max_fragment_bytes: usize,
     pub max_publish_bps: u64,
     /// Bytes of free disk below which recording does not start or stops.
     pub record_min_free: u64,
@@ -284,6 +297,26 @@ impl Config {
                 .ok_or_else(|| ConfigError::Invalid("SAPFLOW_MAX_PUBLISHERS: 1 to 1000".into()))?,
         };
 
+        let max_presentations = match vals.get("SAPFLOW_MAX_PRESENTATIONS") {
+            None => sapflow_core::residency::default_presentation_limit(max_publishers),
+            Some(v) => v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| (1..=4096).contains(n))
+                .ok_or_else(|| {
+                    ConfigError::Invalid("SAPFLOW_MAX_PRESENTATIONS: 1 to 4096".into())
+                })?,
+        };
+
+        let max_fragment_bytes = match vals.get("SAPFLOW_MAX_FRAGMENT_BYTES") {
+            None => 512 * 1024 * 1024,
+            Some(v) => v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                ConfigError::Invalid(
+                    "SAPFLOW_MAX_FRAGMENT_BYTES: positive representable byte count".into(),
+                )
+            })?,
+        };
+
         let max_publish_bps = match vals.get("SAPFLOW_MAX_PUBLISH_MBPS") {
             None => 40_000_000,
             Some(v) => v
@@ -321,6 +354,12 @@ impl Config {
         };
         let reconnect_grace = seconds("SAPFLOW_RECONNECT_GRACE", 90)?;
         let health_interval = seconds("SAPFLOW_HEALTH_INTERVAL", 30)?;
+        let http_body_timeout = seconds("SAPFLOW_HTTP_BODY_TIMEOUT", 120)?;
+        if http_body_timeout.is_zero() {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_HTTP_BODY_TIMEOUT: seconds, 1 to 3600".into(),
+            ));
+        }
         // Keep recognising the removed implementation switch so obsolete
         // deployments fail explicitly rather than silently changing transport.
         match vals.get("SAPFLOW_SRT_IMPL").map(String::as_str) {
@@ -418,6 +457,7 @@ impl Config {
 
         Ok(Self {
             http_threads,
+            http_body_timeout,
             low_latency: match vals.get("SAPFLOW_HLS_MODE").map(String::as_str) {
                 None | Some("low-latency") => true,
                 Some("whole") => false,
@@ -441,6 +481,8 @@ impl Config {
             ),
             record_delete_after,
             max_publishers,
+            max_presentations,
+            max_fragment_bytes,
             srt_addr: addr("SAPFLOW_SRT_ADDR", "0.0.0.0:8890")?,
             http_addr: addr("SAPFLOW_HTTP_ADDR", "0.0.0.0:8888")?,
             publisher,
@@ -577,6 +619,117 @@ mod tests {
         assert_eq!(c.http_addr.port(), 8888);
         assert!(c.publisher.is_some());
         assert_eq!(c.segment_count, 24);
+        assert_eq!(c.max_presentations, 64);
+    }
+
+    #[test]
+    fn resident_presentations_have_an_explicit_bounded_domain() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        assert_eq!(
+            load(&[open, ("SAPFLOW_MAX_PUBLISHERS", "1")], &[])
+                .expect("derived limit")
+                .max_presentations,
+            4
+        );
+        assert_eq!(
+            load(&[open, ("SAPFLOW_MAX_PUBLISHERS", "1000")], &[])
+                .expect("large publisher limit")
+                .max_presentations,
+            4000
+        );
+        for limit in ["1", "4096"] {
+            assert_eq!(
+                load(&[open, ("SAPFLOW_MAX_PRESENTATIONS", limit)], &[])
+                    .expect("explicit limit")
+                    .max_presentations
+                    .to_string(),
+                limit
+            );
+        }
+        for limit in ["0", "4097", "-1", "invalid", "18446744073709551616"] {
+            assert!(matches!(
+                load(&[open, ("SAPFLOW_MAX_PRESENTATIONS", limit)], &[]),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
+        assert_eq!(
+            load(
+                &[open, ("SAPFLOW_MAX_PRESENTATIONS", "4")],
+                &["--max-presentations", "2"]
+            )
+            .expect("flag override")
+            .max_presentations,
+            2
+        );
+    }
+
+    #[test]
+    fn fragment_byte_domain_is_explicit_checked_and_independent_of_publication_count() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        assert_eq!(
+            load(&[open], &[]).expect("defaults").max_fragment_bytes,
+            512 * 1024 * 1024
+        );
+        for limit in ["1".to_string(), usize::MAX.to_string()] {
+            assert_eq!(
+                load(&[open, ("SAPFLOW_MAX_FRAGMENT_BYTES", &limit)], &[])
+                    .expect("explicit byte domain")
+                    .max_fragment_bytes
+                    .to_string(),
+                limit
+            );
+        }
+        for limit in ["0", "-1", "invalid", "18446744073709551616"] {
+            assert!(matches!(
+                load(&[open, ("SAPFLOW_MAX_FRAGMENT_BYTES", limit)], &[]),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
+        let config = load(
+            &[
+                open,
+                ("SAPFLOW_MAX_FRAGMENT_BYTES", "1000"),
+                ("SAPFLOW_MAX_PUBLISHERS", "1"),
+            ],
+            &["--max-fragment-bytes", "64"],
+        )
+        .expect("flag override");
+        assert_eq!(config.max_fragment_bytes, 64);
+        assert_eq!(config.max_presentations, 4);
+    }
+
+    #[test]
+    fn absolute_http_body_timeout_is_positive_bounded_and_overridable() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        assert_eq!(
+            load(&[open], &[]).expect("default").http_body_timeout,
+            Duration::from_secs(120)
+        );
+        for value in ["1", "3600"] {
+            assert_eq!(
+                load(&[open, ("SAPFLOW_HTTP_BODY_TIMEOUT", value)], &[])
+                    .expect("selected deadline")
+                    .http_body_timeout
+                    .as_secs()
+                    .to_string(),
+                value
+            );
+        }
+        for value in ["0", "3601", "-1", "invalid", "18446744073709551616"] {
+            assert!(matches!(
+                load(&[open, ("SAPFLOW_HTTP_BODY_TIMEOUT", value)], &[]),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
+        assert_eq!(
+            load(
+                &[open, ("SAPFLOW_HTTP_BODY_TIMEOUT", "10")],
+                &["--http-body-timeout", "2"]
+            )
+            .expect("override")
+            .http_body_timeout,
+            Duration::from_secs(2)
+        );
     }
 
     #[test]

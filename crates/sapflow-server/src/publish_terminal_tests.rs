@@ -463,14 +463,10 @@ async fn terminal_codec_change_then_error_cannot_append_new_aac_under_old_file_i
     wire.extend(start(pid, &audio, 28, 90_000, 0));
     feed(&mut next, &wire);
     next.end();
+    assert!(stream.lock().closed);
     assert!(
-        stream
-            .lock()
-            .ingest
-            .muxer()
-            .expect("new epoch is visible to HLS")
-            .video()
-            .is_none()
+        stream.lock().ingest.muxer().is_none(),
+        "closed epoch releases its HLS cache"
     );
     let body = completion(&mut fixture, "incomplete").await;
     assert_eq!(

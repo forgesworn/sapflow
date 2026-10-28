@@ -72,7 +72,7 @@ player on a physical iPhone.
 The TV player has successful generated-media Chrome loops of about 13.5
 minutes. Actual Safari/iPhone acceptance, long private-preview and publishing
 runs, separate-network peer savings and wired Linux/Caddy audience capacity
-remain open. Global retained-HLS memory bounds, native recording recovery,
+remain open. Retained-HLS load qualification, native recording recovery,
 complete phone shows and signed mobile releases also remain open. There is
 no recorded acceptance of a real V4V production show in these documents.
 
@@ -81,6 +81,7 @@ The current queue and acceptance gates are in [GOALS.md](GOALS.md#remaining-work
 [docs/delivery-plan.md](docs/delivery-plan.md#next-work) and
 [docs/readiness.md](docs/readiness.md); rollout steps remain in
 [docs/trial-plan.md](docs/trial-plan.md).
+New coding sessions can start with the [Codex handover](docs/codex-handover.md).
 
 | Crate | What it is |
 |-------|------------|
@@ -142,6 +143,29 @@ glass to glass through it, against about 10 s over HTTP/1.1; see
 advertising. Use it when a delivery path cannot fetch parts quickly enough;
 the default remains `low-latency`. Both modes serve the same encoded media,
 segment timeline and codec changes.
+
+Resident presentations are limited by `SAPFLOW_MAX_PRESENTATIONS` (also
+`--max-presentations`), defaulting to four times `SAPFLOW_MAX_PUBLISHERS`,
+capped at 4,096 (64 by default). Both protocols share the domain. A stream
+stays counted through its final owner, including reconnect hold and removed
+streams retained by publications or parked requests. At capacity a new
+presentation is refused; same-path reconnects reuse their reservation. Close
+releases cached ingest and playlists while accepted responses retain valid
+bytes.
+
+`SAPFLOW_MAX_FRAGMENT_BYTES` (`--max-fragment-bytes`) independently limits shared
+encoded init/fragment backing capacity to 512 MiB by default. Each allocation
+is charged once, including headers and spare Vec capacity. Cache, response,
+sliced and recorder aliases keep that charge through their final payload
+owner. Exhaustion refuses media and preserves the admitted recording prefix
+as incomplete.
+
+`SAPFLOW_HTTP_BODY_TIMEOUT` (`--http-body-timeout`) gives each ready framed
+response 120 seconds by default, configurable from 1 through 3,600. Successful
+writes do not extend it. Parked LL-HLS waiting is excluded, and each keep-alive
+response gets a fresh timer. Expiry closes the incomplete response. These are
+logical resource policies; RSS, kernel memory and audience capacity need
+separate qualification in the [resource contract](docs/retained-media-contract.md).
 
 Recording limits retained encoded originals to 512 MiB across the server and
 64 MiB per stream path, including queued and active parts from draining codec

@@ -132,7 +132,10 @@ async fn run(config: Config) -> std::io::Result<()> {
         recording_limits: Arc::new(recorder::RecordingLimits::new(config.max_publishers)),
         publish_sessions,
         callbacks: Callbacks::start(config.callback_url.clone(), config.callback_secret.clone()),
-        streams: Arc::new(Registry::default()),
+        streams: Arc::new(Registry::with_limits(
+            config.max_presentations,
+            config.max_fragment_bytes,
+        )),
         refusal_log: std::sync::Mutex::new(sapflow_core::limits::LogLimiter::new(
             20,
             std::time::Duration::from_secs(60),
@@ -144,6 +147,13 @@ async fn run(config: Config) -> std::io::Result<()> {
         config,
     });
 
+    tracing::info!(
+        presentations = app.config.max_presentations,
+        fragment_bytes = app.config.max_fragment_bytes,
+        response_deadline_secs = app.config.http_body_timeout.as_secs(),
+        "retained HLS limits"
+    );
+
     // Viewers are served on our own event loop, not on tokio.
     let threads = app.config.http_threads;
     let listener = std::net::TcpListener::bind(app.config.http_addr)?;
@@ -151,7 +161,10 @@ async fn run(config: Config) -> std::io::Result<()> {
         app.clone(),
         listener,
         threads,
-        own_http::Timeouts::default(),
+        own_http::Timeouts {
+            body: app.config.http_body_timeout,
+            ..own_http::Timeouts::default()
+        },
     )?;
     tracing::info!(addr = %app.config.http_addr, threads, "HLS listening (own event loop)");
     let srt_task = tokio::spawn(srt::listen(app.clone(), app.config.srt_addr));

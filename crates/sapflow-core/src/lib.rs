@@ -10,10 +10,12 @@
 
 #![warn(missing_docs)]
 
+pub mod fragment;
 pub mod limits;
 pub mod publish_session;
 pub mod realtime;
 pub mod recording;
+pub mod residency;
 pub mod tracks;
 
 pub use tracks::TrackSet;

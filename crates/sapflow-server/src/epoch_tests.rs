@@ -48,7 +48,10 @@ async fn whole_mode_serves_completed_segments_without_waiting_for_old_part_queri
     assert!(!segment.body.is_empty());
 }
 
-fn exercise(app: &Arc<App>) {
+async fn exercise(
+    app: &Arc<App>,
+    mut recording_callbacks: Option<&mut tokio::sync::mpsc::Receiver<crate::callback::Queued>>,
+) {
     let address = viewer(app);
     let get = |file: &str| Pending::new(address, "GET", &format!("/live/{EVENT}/{file}"));
     let mut check = playlist::RuleCheck::default();
@@ -59,6 +62,25 @@ fn exercise(app: &Arc<App>) {
     for (epoch, data) in [PORTRAIT, LANDSCAPE, PORTRAIT].into_iter().enumerate() {
         let mut publisher = begin(app);
         feed(&mut publisher, data);
+        if epoch > 0
+            && let Some(callbacks) = &mut recording_callbacks
+        {
+            // Three offline epochs can arrive before the first writer drains.
+            // Honour the two-writer path bound: wait for actual synced
+            // completion of the previous epoch before sending the next one.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let callback = callbacks.recv().await.expect("recording callback queue");
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&callback.body).expect("recording callback JSON");
+                    if body["event"] == "recordSegmentComplete" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("previous codec epoch writer must finish");
+        }
         let stream = publisher.stream.clone();
         let mut reload_msn = None;
         {
@@ -191,14 +213,17 @@ fn exercise(app: &Arc<App>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn portrait_landscape_portrait_preserves_http_identity_and_pending_reload() {
     let (app, _scratch) = app(false);
-    exercise(&app);
+    exercise(&app, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
 async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
-    let (app, scratch) = app(true);
-    exercise(&app);
+    let (mut app, scratch) = app(true);
+    let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+    let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
+    Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
+    exercise(&app, Some(&mut receiver)).await;
     let directory = scratch.0.join("live/event-epochs");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let files = loop {
@@ -237,7 +262,8 @@ async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
-    for (index, file) in files.iter().enumerate() {
+    let mut widths = Vec::new();
+    for file in &files {
         let output = std::process::Command::new("ffprobe")
             .args([
                 "-v",
@@ -256,14 +282,14 @@ async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
             text.contains("h264") && text.contains("aac"),
             "both tracks required: {text}"
         );
-        assert!(
-            text.contains(if index == 1 {
-                "\"width\": 1280"
-            } else {
-                "\"width\": 720"
-            }),
-            "{text}"
-        );
+        let metadata: serde_json::Value = serde_json::from_str(&text).expect("ffprobe metadata");
+        let video = metadata["streams"]
+            .as_array()
+            .expect("recorded tracks")
+            .iter()
+            .find(|track| track["codec_name"] == "h264")
+            .expect("recorded video");
+        widths.push(video["width"].as_u64().expect("recorded width"));
         assert!(
             text.contains("0.000000") || text.contains("0.000011"),
             "file origin near zero: {text}"
@@ -280,4 +306,9 @@ async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
             file.display()
         );
     }
+    // Writer tasks can create their files in a different order from codec
+    // arrival. HTTP identities test epoch order; recordings must preserve the
+    // expected track configurations and decode independently of their names.
+    widths.sort_unstable();
+    assert_eq!(widths, [720, 720, 1280]);
 }

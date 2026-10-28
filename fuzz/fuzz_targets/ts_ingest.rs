@@ -4,10 +4,28 @@ use libfuzzer_sys::fuzz_target;
 use sapflow_hls::{IngestError, MuxerConfig, TsIngest, Update, playlist};
 
 fuzz_target!(|data: &[u8]| {
+    let (quota, data) = if let Some(rest) = data.strip_prefix(b"FBUD") {
+        if rest.len() < 2 {
+            return;
+        }
+        let maximum = usize::from(u16::from_le_bytes([rest[0], rest[1]]));
+        (
+            Some((
+                std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(maximum)),
+                maximum,
+            )),
+            &rest[2..],
+        )
+    } else {
+        (None, data)
+    };
     let Some((&split, rest)) = data.split_first() else {
         return;
     };
-    let mut ing = TsIngest::new(MuxerConfig::default());
+    let mut ing = match &quota {
+        Some((quota, _)) => TsIngest::with_fragment_quota(MuxerConfig::default(), quota.clone()),
+        None => TsIngest::new(MuxerConfig::default()),
+    };
     let mut rules = playlist::RuleCheck::default();
     for chunk in rest.chunks(usize::from(split).max(1) * 7) {
         if ing.push(chunk, std::time::SystemTime::UNIX_EPOCH).is_err() {
@@ -37,4 +55,9 @@ fuzz_target!(|data: &[u8]| {
         ing.push(rest, std::time::SystemTime::UNIX_EPOCH),
         Err(IngestError::InputFinished)
     );
+    if let Some((quota, maximum)) = quota {
+        assert!(quota.used() <= maximum);
+        drop(ing);
+        assert_eq!(quota.used(), 0);
+    }
 });

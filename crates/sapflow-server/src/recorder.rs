@@ -2263,6 +2263,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_backing_charge_follows_queued_and_active_writes_through_all_exits() {
+        use tokio::io::AsyncReadExt;
+        for mode in ["complete", "error", "cancel"] {
+            let quota = Arc::new(sapflow_core::fragment::FragmentQuota::new(8 * 1024 * 1024));
+            let mut ingest = sapflow_hls::TsIngest::with_fragment_quota(
+                sapflow_hls::MuxerConfig::default(),
+                quota.clone(),
+            );
+            for chunk in
+                include_bytes!("../../sapflow-hls/tests/fixtures/testsrc-3s.ts").chunks(1316)
+            {
+                ingest
+                    .push(chunk, SystemTime::UNIX_EPOCH)
+                    .expect("generated bounded media");
+            }
+            let muxer = ingest.take_muxer().expect("bounded muxer");
+            let audio_rate = muxer.audio().map(|audio| audio.sample_rate);
+            let sapflow_hls::PartLookup::Found(part) = muxer.part(0) else {
+                panic!("accepted part")
+            };
+            let size = part.data.len();
+            let span = part.span;
+            drop(muxer);
+            drop(ingest);
+            let charge = quota.used();
+            assert!(
+                charge >= size,
+                "whole backing and initialization stay charged"
+            );
+            let budget = PartBudget::new(size, MAX_FILE_FRAGMENT_BYTES);
+            let (sender, mut receiver) = mpsc::channel(1);
+            assert!(
+                sender
+                    .try_send(Msg::Part(budget.retain(part).expect("recorder alias")))
+                    .is_ok(),
+                "queue part"
+            );
+            assert_eq!(quota.used(), charge, "queued original retains its charge");
+            let Msg::Part(retained) = receiver.recv().await.expect("dequeue") else {
+                panic!("part")
+            };
+            let (mut writer, mut reader) = tokio::io::duplex(64);
+            let task = tokio::spawn(async move {
+                write_part(&mut writer, retained, audio_rate, &mut None).await
+            });
+            let mut first = [0];
+            tokio::time::timeout(Duration::from_secs(3), reader.read_exact(&mut first))
+                .await
+                .expect("writer backpressure")
+                .expect("first byte");
+            assert!(!task.is_finished());
+            assert_eq!(
+                quota.used(),
+                charge,
+                "active write retains original despite its rebased copy"
+            );
+            match mode {
+                "complete" => {
+                    let mut rest = Vec::new();
+                    tokio::time::timeout(Duration::from_secs(3), reader.read_to_end(&mut rest))
+                        .await
+                        .expect("bounded drain")
+                        .expect("remaining bytes");
+                    assert_eq!(rest.len() + 1, size);
+                    assert_eq!(task.await.expect("writer").expect("write"), span);
+                }
+                "error" => {
+                    drop(reader);
+                    assert!(task.await.expect("writer").is_err());
+                }
+                "cancel" => {
+                    task.abort();
+                    assert!(task.await.expect_err("cancelled").is_cancelled());
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                quota.used(),
+                0,
+                "final original owner releases once on {mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn byte_refusal_drains_and_syncs_only_the_accepted_prefix() {
         for scoped in [false, true] {
             let scratch = ScopedScratch::new("byte-prefix");
