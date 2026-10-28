@@ -344,6 +344,8 @@ in every official build.
 Reviewed 2026-10-28 against `3c7e1aa`. The old dated anchor remains for existing
 links. Source, CI, physical acceptance, deployed behaviour and release are
 separate evidence. Each unchecked item names the evidence still needed.
+Start with the [next-work checklist](docs/delivery-plan.md#next-work) for the
+immediate priorities; the delivery tables name owners and dependencies.
 
 ### 1. TV playback and private publishing qualification
 

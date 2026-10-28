@@ -78,7 +78,7 @@ no recorded acceptance of a real V4V production show in these documents.
 
 The crates are version 0.1.0 on [crates.io](https://crates.io/crates/sapflow).
 The current queue and acceptance gates are in [GOALS.md](GOALS.md#remaining-work),
-[docs/delivery-plan.md](docs/delivery-plan.md) and
+[docs/delivery-plan.md](docs/delivery-plan.md#next-work) and
 [docs/readiness.md](docs/readiness.md); rollout steps remain in
 [docs/trial-plan.md](docs/trial-plan.md).
 
