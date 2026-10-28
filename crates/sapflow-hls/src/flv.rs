@@ -26,6 +26,16 @@ pub struct FlvIngest {
 }
 
 impl FlvIngest {
+    /// Starts FLV ingest with a shared encoded-backing budget.
+    pub fn with_fragment_quota(
+        cfg: MuxerConfig,
+        quota: std::sync::Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
+        let mut ingest = Self::new(cfg);
+        ingest.es = EsIngest::with_fragment_quota(cfg, quota);
+        ingest.es.set_expect_audio(false);
+        ingest
+    }
     /// An ingest with no muxer yet: normally the first keyframe, once its
     /// parameter sets are known, creates one from `cfg`. Explicit audio-only
     /// declarations instead initialize on their first AAC frame. No audio is expected until

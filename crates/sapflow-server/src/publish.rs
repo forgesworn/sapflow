@@ -24,6 +24,8 @@ pub enum Refusal {
     AlreadyLive,
     /// The configured per-protocol RTMP publication cap is already owned.
     PublisherLimit,
+    /// All resident presentations are owned, including held or removed streams.
+    PresentationLimit,
     /// Too many failed attempts from this address recently.
     Throttled,
 }
@@ -214,6 +216,7 @@ impl Publication {
             .map_err(|error| match error {
                 ClaimError::AlreadyLive => Refusal::AlreadyLive,
                 ClaimError::PublisherLimit => Refusal::PublisherLimit,
+                ClaimError::PresentationLimit => Refusal::PresentationLimit,
             })?;
         tracing::info!(
             path = %req.path.as_path(),
@@ -734,24 +737,18 @@ pub(crate) mod loss_tests {
             crate::srt::feed(&mut publication, packet).expect("generated AAC fixture");
         }
         let stream = publication.stream.clone();
-        let before = stream
-            .lock()
-            .ingest
-            .muxer()
-            .expect("AAC muxer")
-            .next_part_id();
         publication.end();
-        let after = stream
-            .lock()
-            .ingest
-            .muxer()
-            .expect("retained AAC state")
-            .next_part_id();
+        assert!(stream.lock().closed);
         assert!(
-            after > before,
-            "normal end must seal the final accepted AAC part"
+            stream.lock().ingest.muxer().is_none(),
+            "terminal drain precedes cache release"
         );
         let body = fixture.completion("finalised").await;
+        assert_eq!(
+            super::terminal_tests::recording_samples(&body),
+            283,
+            "all generated AAC frames, including the sealed tail, reach the actual file"
+        );
         let seconds: f64 = body["segmentDuration"]
             .as_str()
             .expect("duration")
@@ -865,6 +862,44 @@ mod publication_capacity_tests {
 
     fn request(id: &str) -> PublishRequest {
         PublishRequest::parse_rtmp("live", &format!("event-{id}")).expect("generated request")
+    }
+
+    #[tokio::test]
+    async fn resident_refusal_keeps_the_existing_recording_complete_and_recovers_after_release() {
+        let mut fixture = loss_tests::Fixture::new();
+        Arc::get_mut(&mut fixture.app).expect("sole App").streams =
+            Arc::new(crate::stream::Registry::new(1));
+        let mut original = fixture.begin();
+        loss_tests::Fixture::feed(&mut original);
+        let retained = original.stream.clone();
+        let queued = fixture.callbacks.len();
+        let from = "127.0.0.1".parse().expect("loopback");
+        assert!(matches!(
+            Publication::begin(&fixture.app, &request("next"), SourceKind::Ts, from),
+            Err(Refusal::PresentationLimit)
+        ));
+        assert_eq!(
+            fixture.callbacks.len(),
+            queued,
+            "refusal starts no recorder or callbacks"
+        );
+        original.end();
+        fixture.completion("finalised").await;
+        assert!(
+            matches!(
+                Publication::begin(&fixture.app, &request("next"), SourceKind::Ts, from),
+                Err(Refusal::PresentationLimit)
+            ),
+            "removed but owned presentation remains charged"
+        );
+        drop(retained);
+        let mut next = Publication::begin(&fixture.app, &request("a"), SourceKind::Ts, from)
+            .expect("released resident reservation");
+        loss_tests::Fixture::feed(&mut next);
+        next.end();
+        fixture.completion("finalised").await;
+        assert_eq!(fixture.scope.observations.counts().recordings_finalised, 2);
+        assert_eq!(fixture.scope.observations.counts().recordings_incomplete, 0);
     }
 
     #[tokio::test]
@@ -1045,6 +1080,10 @@ mod publication_capacity_tests {
         assert_eq!(fixture.scope.observations.counts().recordings_incomplete, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "publish_fragment_tests.rs"]
+mod fragment_tests;
 
 #[cfg(test)]
 mod configured_publication_cap_regression {

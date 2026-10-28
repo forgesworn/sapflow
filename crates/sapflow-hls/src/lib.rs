@@ -11,6 +11,7 @@ use std::time::Duration;
 pub mod codec;
 pub mod flv;
 pub mod fmp4;
+mod fragment;
 pub mod ingest;
 pub mod muxer;
 pub mod playlist;

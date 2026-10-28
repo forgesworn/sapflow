@@ -13,14 +13,18 @@ records; they do not make every later revision qualified.
 ## Next work
 
 The full remaining-work inventory is in [GOALS.md](../GOALS.md#remaining-work).
+For a new coding session, use the [Codex handover](codex-handover.md) for
+startup checks, the first implementation steps, source entry points and gates.
 The immediate queue is:
 
-- [ ] **Next server implementation, 2.6:** enforce retained HLS path and
-  fragment-byte budgets, account through the final owner and define a
-  slow-response deadline. Prove exhaustion, alias release, reconnect/codec
-  changes and incomplete-recording handling against the
-  [retained-media contract](retained-media-contract.md). Its suggested limits
-  remain candidates until qualified.
+- [ ] **Next server resource qualification, 2.6:** local follow-up to `30dedca`
+  implements resident presentation admission, whole-allocation shared backing
+  charges, close-time cache release and absolute response deadlines. Generated
+  correctness checks cover refusal, aliases, recording/recovery and slow
+  responses. Complete matched nominal/adverse measurements with declared
+  limits under the [retained-media contract](retained-media-contract.md).
+  Its defaults are selected policies, not measured operating guarantees;
+  task 2.6 remains open for qualification.
 - [ ] **Then server qualification, 2.1 to 2.5:** refresh performance PRs #14
   and #15 against the selected main revision and resolve their failed native
   checks. Complete wired Linux/Caddy/HTTP2 load, Safari delay and rollback

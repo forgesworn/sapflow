@@ -231,4 +231,53 @@ mod tests {
         assert!(body.is_empty());
         assert_eq!(body.len(), 0);
     }
+
+    #[test]
+    fn partial_response_retains_consumed_prefix_until_the_final_body_drains() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Payload(Vec<u8>, Arc<AtomicUsize>);
+        impl AsRef<[u8]> for Payload {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let released = Arc::new(AtomicUsize::new(0));
+        let segment = SegmentData::from_chunks(vec![
+            Bytes::from_owner(Payload(b"abc".to_vec(), released.clone())),
+            Bytes::from_owner(Payload(b"defgh".to_vec(), released.clone())),
+        ])
+        .expect("owned generated payloads");
+        let mut body = MediaBody::from(segment.clone());
+        let alias = body.clone();
+        drop(segment); // Models lookup/window eviction.
+        body.advance(3).expect("consume whole prefix chunk");
+        assert_eq!(gathered(&body), b"defgh");
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            0,
+            "consumed prefix remains in the shared chunk array"
+        );
+        drop(alias);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        body.advance(2).expect("partial suffix");
+        assert_eq!(gathered(&body), b"fgh");
+        body.advance(3).expect("final accepted bytes");
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            2,
+            "each backing released exactly once"
+        );
+        drop(body);
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+    }
 }

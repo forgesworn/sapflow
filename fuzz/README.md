@@ -95,6 +95,23 @@ The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
 `target/`.
 
+`FBUD` inputs opt `ts_ingest`, `flv_ingest` and `muxer_timing` into a shared
+fragment budget. The following little-endian u16 is the byte maximum. The
+ingest targets then use their ordinary records/chunks and require zero final
+charge after dropping ingest. Historical regression inputs keep their original
+interpretation. The muxer target instead uses bounded eight-byte operations
+for video, init/part response aliases, alias release, interrupt/reconnect and
+codec replacement. It checks capacity, exact retained bytes, refusal without
+installing a successor epoch, playlist rules and final release.
+
+The three `fragment-budget-*` seeds are generated test inputs. The TS seed
+uses a bounded prefix of the documented generated sine fixture
+`audio-48k-mono.ts`; the FLV seed contains original structural AAC placeholders,
+not a decoder/interoperability claim; the muxer seed contains original frame
+placeholders and ownership operations. They contain no camera/microphone media,
+private hosts or credentials. Run the usual finite campaigns with task-owned
+copies of seeds so mutations never alter the committed inputs.
+
 ```bash
 cd fuzz
 RUSTC_BOOTSTRAP=1 cargo fuzz run -O own_srt_packet -- -max_total_time=300

@@ -372,8 +372,18 @@ own network and privacy limits. TV delivery does not complete native B6.
 Implemented: RTMP publication admission, recorder bounds, reconnect grace and
 the own HTTP viewer loop. Hyper and Axum have been removed.
 
-- [ ] Implement and qualify resident HLS path and fragment-byte admission,
-  final-owner accounting and slow-viewer reclamation in the
+Local task 2.6 progress from `30dedca`: resident presentation admission counts
+through the final stream owner; close releases cached ingest and playlists
+after draining accepted input. Shared encoded init/fragment capacities are
+charged once through their final payload owner, and ready HTTP responses have
+an absolute deadline independent of progress. Selected defaults are 64
+presentations at 16 publishers, 512 MiB of shared backing and a 120-second
+response deadline. Generated local correctness checks pass; matched load
+qualification remains open in the resource contract below.
+
+- [ ] Qualify the implemented resident HLS path/fragment admission,
+  final-owner accounting and slow-viewer reclamation with matched nominal and
+  adverse-load measurements in the
   [retained-media contract](docs/retained-media-contract.md).
 - [ ] Run wired Linux behind Caddy/HTTP2 with 250 and 750 full viewers,
   slow consumers, multiple publishers and sustained load. Record memory,

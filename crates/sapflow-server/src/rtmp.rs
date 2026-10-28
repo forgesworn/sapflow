@@ -207,6 +207,9 @@ impl Conn<'_> {
                             Refusal::PublisherLimit => {
                                 ("NetStream.Publish.Denied", "publisher limit")
                             }
+                            Refusal::PresentationLimit => {
+                                ("NetStream.Publish.Denied", "presentation limit")
+                            }
                             _ => ("NetStream.Publish.Denied", "refused"),
                         };
                         // Send the refusal, then close.
@@ -485,6 +488,58 @@ mod tests {
         assert_eq!(fixture.app.streams.active_rtmp_publishers(), 0);
         drop(setup);
         assert_eq!(active.load(Ordering::Relaxed), 0);
+        assert!(fixture.callbacks.is_empty());
+    }
+
+    #[test]
+    fn resident_capacity_refusal_is_visible_on_the_actual_rtmp_wire() {
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.recordings = None;
+        app.streams = Arc::new(crate::stream::Registry::new(1));
+        let from = "127.0.0.1".parse().expect("loopback");
+        let mut first = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        assert!(
+            negotiate_capacity_fixture(&mut first, "event-first")
+                .0
+                .is_ok()
+        );
+        let mut refused = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        let (result, wire, done) = negotiate_capacity_fixture(&mut refused, "event-next");
+        assert!(
+            matches!(result, Err(sapflow_rtmp::client::ClientError::Refused(code)) if code == "NetStream.Publish.Denied")
+        );
+        assert!(done && refused.publication.is_none());
+        assert!(
+            wire.windows(b"presentation limit".len())
+                .any(|bytes| bytes == b"presentation limit")
+        );
+        assert_eq!(fixture.app.streams.active_rtmp_publishers(), 1);
+        first.publication.take().expect("accepted first").end();
+        let mut recovered = Conn {
+            app: &fixture.app,
+            from,
+            publication: None,
+        };
+        assert!(
+            negotiate_capacity_fixture(&mut recovered, "event-next")
+                .0
+                .is_ok()
+        );
+        recovered
+            .publication
+            .take()
+            .expect("accepted after final release")
+            .end();
+        assert_eq!(fixture.app.streams.active_rtmp_publishers(), 0);
         assert!(fixture.callbacks.is_empty());
     }
 }

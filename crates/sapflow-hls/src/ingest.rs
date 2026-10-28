@@ -68,6 +68,8 @@ struct StartupVideo {
 /// Why an ingest cannot carry on with the publisher's media.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestError {
+    /// The shared encoded fragment-backing budget is exhausted.
+    FragmentLimit,
     /// The program carries a video codec other than H.264.
     UnsupportedVideo,
     /// The held presentation expired before new media recovered it.
@@ -92,6 +94,7 @@ pub enum IngestError {
 impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::FragmentLimit => f.write_str("shared encoded fragment budget exhausted"),
             Self::PresentationExpired => f.write_str("presentation reconnect deadline expired"),
             Self::UnsupportedVideo => f.write_str("video is not H.264"),
             Self::SegmentTooLarge => f.write_str("segment or unsealed media exceeds media limit"),
@@ -110,6 +113,7 @@ impl std::error::Error for IngestError {}
 impl From<MuxError> for IngestError {
     fn from(value: MuxError) -> Self {
         match value {
+            MuxError::FragmentLimit => Self::FragmentLimit,
             MuxError::SegmentTooLarge => Self::SegmentTooLarge,
             MuxError::InvalidTracks => Self::InvalidTracks,
             MuxError::InvalidAudio => Self::InvalidAudio,
@@ -487,6 +491,7 @@ pub struct EsIngest {
     expect_audio: bool,
     declared: Option<TrackSet>,
     muxer: Option<Muxer>,
+    fragment_quota: Option<Arc<sapflow_core::fragment::FragmentQuota>>,
 }
 
 impl EsIngest {
@@ -502,6 +507,7 @@ impl EsIngest {
             expect_audio: true,
             declared: None,
             muxer: None,
+            fragment_quota: None,
         }
     }
 
@@ -510,9 +516,23 @@ impl EsIngest {
     /// config, its media continues the stream after a discontinuity;
     /// otherwise it starts a new initialization epoch on the retained muxer
     /// and the update says `restarted` (for recording rollover).
-    pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
+    pub fn resume(cfg: MuxerConfig, mut muxer: Muxer) -> Self {
+        let fragment_quota = muxer.fragment_quota();
+        muxer.resume_fragment_admission();
         Self {
             muxer: Some(muxer),
+            fragment_quota,
+            ..Self::new(cfg)
+        }
+    }
+
+    /// Uses one shared encoded-backing budget for every codec epoch.
+    pub fn with_fragment_quota(
+        cfg: MuxerConfig,
+        quota: Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
+        Self {
+            fragment_quota: Some(quota),
             ..Self::new(cfg)
         }
     }
@@ -656,11 +676,16 @@ impl EsIngest {
                 tracing::warn!(
                     "reconnected encoder changed configuration; starting a new codec epoch on the existing timeline"
                 );
-                m.reconfigure(video.clone(), audio, now);
+                m.reconfigure_tracks(Some(video.clone()), audio, now)?;
                 restarted = true;
             }
             if self.muxer.is_none() {
-                self.muxer = Some(Muxer::new(self.cfg, video, audio));
+                self.muxer = Some(match &self.fragment_quota {
+                    Some(quota) => {
+                        Muxer::with_fragment_quota(self.cfg, Some(video), audio, quota.clone())?
+                    }
+                    None => Muxer::new(self.cfg, video, audio),
+                });
             }
             self.origin = Some(dts);
         }
@@ -713,7 +738,12 @@ impl EsIngest {
                     update.restarted = true;
                 }
             } else {
-                self.muxer = Some(Muxer::audio_only(self.cfg, config)?);
+                self.muxer = Some(match &self.fragment_quota {
+                    Some(quota) => {
+                        Muxer::with_fragment_quota(self.cfg, None, Some(config), quota.clone())?
+                    }
+                    None => Muxer::audio_only(self.cfg, config)?,
+                });
             }
             self.origin = Some(pts);
         }
@@ -788,6 +818,15 @@ pub struct TsIngest {
 }
 
 impl TsIngest {
+    /// Starts TS ingest with a shared encoded-backing budget.
+    pub fn with_fragment_quota(
+        cfg: MuxerConfig,
+        quota: Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
+        let mut ingest = Self::new(cfg);
+        ingest.es = EsIngest::with_fragment_quota(cfg, quota);
+        ingest
+    }
     /// Carries on another connection's stream ([`EsIngest::resume`]).
     pub fn resume(cfg: MuxerConfig, muxer: Muxer) -> Self {
         let mut ts = Self::new(cfg);

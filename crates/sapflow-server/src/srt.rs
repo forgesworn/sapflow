@@ -53,9 +53,10 @@ impl Refused {
             Self::Policy(Refusal::Request(PublishError::Unauthorized)) => 401,
             Self::Policy(Refusal::Request(PublishError::BadPath)) => 404,
             Self::Policy(Refusal::AlreadyLive) => 409,
-            Self::Policy(Refusal::Throttled | Refusal::PublisherLimit) | Self::PublisherLimit => {
-                402
-            }
+            Self::Policy(
+                Refusal::Throttled | Refusal::PublisherLimit | Refusal::PresentationLimit,
+            )
+            | Self::PublisherLimit => 402,
         }
     }
 }
@@ -123,6 +124,7 @@ mod tests {
             (Refused::Policy(Refusal::AlreadyLive), 409),
             (Refused::Policy(Refusal::Throttled), 402),
             (Refused::Policy(Refusal::PublisherLimit), 402),
+            (Refused::Policy(Refusal::PresentationLimit), 402),
             (Refused::PublisherLimit, 402),
         ] {
             assert_eq!(r.status(), status, "{r:?}");
