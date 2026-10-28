@@ -1,13 +1,21 @@
 # Goals
 
-sapflow is a small, purpose-built live media server in Rust: SRT (and later
-RTMP) in, Low-Latency HLS out, with recording and a stream-health callback.
+sapflow is a small, purpose-built live media server in Rust: SRT and RTMP in,
+Low-Latency HLS out, with recording and a stream-health callback.
 It exists to replace mediamtx behind the v4v live stage with something that
-does only what the stage needs, and to give the future native iOS and Android
-apps a shared Rust core.
+does only what the stage needs, and to give native iOS and Android apps a
+shared Rust core and native SDK.
 
 It is an experiment until milestone 4 says otherwise. Nothing here replaces
 mediamtx in production before the numbers favour it and the user decides.
+
+**Current review (2026-10-28, source `3c7e1aa`):** the own HTTP viewer loop,
+Hyper/Axum removal, private TV publishing and receiver player are merged.
+Current-main CI passed. Physical TV playback, sustained network and resource
+qualification, mobile recording recovery and published releases remain separate
+gates. The [remaining work](#remaining-work) and [delivery plan](docs/delivery-plan.md)
+are the current queue. Dated milestone receipts below retain their original
+scope; a historical failure or missing measurement is not a current verdict.
 
 ## Principles
 
@@ -25,9 +33,11 @@ mediamtx in production before the numbers favour it and the user decides.
   not log viewer IPs unless asked. One shared viewer session, so playlists and
   chunk URLs are identical for everyone (cacheable, swarm-friendly), the way
   mediamtx's `hlsCDNSecret` mode behaves.
-- **`#![forbid(unsafe_code)]`** across the workspace (set in `Cargo.toml`).
+- **`unsafe` denied** across the workspace. Only the reviewed `capi.rs` C ABI
+  modules have an exception; the remaining modules retain the deny.
 - **Phone-ready core.** `sapflow-core` has no networking or async runtime, so it
-  can be built for iOS and Android with UniFFI later.
+  can be built for iOS and Android. The native SDK now uses a direct C ABI
+  with Swift and Kotlin wrappers; platform adapters own codecs and networking.
 - **Measure, do not assert.** "Faster" and "smaller" are claims milestone 4
   checks against mediamtx 1.19.1.
 - **Prefer our existing libraries.** Where we have our own implementation,
@@ -321,90 +331,141 @@ those mobile gates. V4V broadcasting remains unlimited, free and watermark-free
 in every official build.
 
 - Native RelaySwarm chunk verification and a swarm peer through shared Rust
-  bindings for iOS and Android.
-- relayswarm's signed segment commitments produced at the origin.
+  bindings for iOS and Android. The receiver TV player already has a peer path;
+  that does not qualify native app playback or separate-network peers.
+- Qualify origin signed segment commitments with the native playback path;
+  the TV integration already produces and verifies commitments.
 - A second rendition.
 
-## Remaining work (2026-10-23)
+<a id="remaining-work-2026-10-23"></a>
 
-Where things stand after the trial preparation of 22 and 23 October, in the
-order to do them. Each item says what finishes it. The
-[delivery plan](docs/delivery-plan.md) sequences them into phases with an
-owner, dependencies and a done-when for every task.
+## Remaining work
 
-### 1. Broadcaster app reliability
+Reviewed 2026-10-28 against `3c7e1aa`. The old dated anchor remains for existing
+links. Source, CI, physical acceptance, deployed behaviour and release are
+separate evidence. Each unchecked item names the evidence still needed.
 
-Done on 23 October: a keyframe after a dropped publish backlog no longer
-fails the connection (`fafbd0d`), and the SRT sender drops media past its age
-budget instead of closing the session (`132a910`). On a Pixel over a link
-resending about 10% of packets, five minutes held one connection, and a
-15 s Wi-Fi drop resumed the same stream 7.6 s after Wi-Fi returned.
+### 1. TV playback and private publishing qualification
 
-- [ ] Fold in the Android failure logging (local branch
-  `diag/srt-fail-reason`: `c322d21`, `75650fc`, `a4c721e`, `da9c86a`): every
-  SRT attempt end and capture failure logged with its reason, and the SRT
-  caller's own close reason reported instead of a generic one. These touch
-  files the broadcaster branch also edits, so they go in there.
-- [ ] Explain the one audio encoder failure (16:21 UTC, 1.4 s into a
-  stream). Done when the new logging names its cause or a long run shows
-  none.
-- [ ] Run the app for the length of a show with scheduled drops (Wi-Fi,
-  mobile data, a locked screen) on a phone no other session is driving. Done
-  when it holds one stream throughout, resumes every drop within the grace
-  and leaves one complete recording on both ends.
-- [ ] Bring iOS to the same point: the same fixes, the same run.
+Implemented: onion-only publishing, private Tor preview, the receiver's own
+complete-fragment player, signed peer assistance and bounded retry handling.
+[TV player qualification](docs/tv-player-qualification.md) records successful
+Chrome loops of about 13.5 minutes. These do not complete the following:
 
-### 2. The first show on sapflow
+- [ ] Actual Safari/iPhone playback through track changes, a full programme
+  loop, Stop and recovery after an interruption.
+- [ ] Long-duration public playback and private Tor preview, with measured
+  stalls, reconnects and end-to-end delay. Qualify the current retry revision.
+- [ ] Sustained higher-rate publishing on the actual Tor route. The earlier
+  higher-rate run fell behind; keep the measured lower-rate profile until a
+  new run passes. Full packet-capture verification also remains open.
+- [ ] Real devices on separate networks for RelaySwarm, including corrupt
+  media refusal, peer departure, origin fallback, consent and measured savings.
 
-The switch and rollback are rehearsed (`docs/trial-plan.md`, phase B), and
-the server has run two hours with encoder drops and viewers.
+The [private-publishing record](docs/private-tv-qualification.md) retains its
+own network and privacy limits. TV delivery does not complete native B6.
 
-- [ ] The 250 and 750 full-viewer run on Linux behind Caddy, and Safari's
-  delay through Caddy over HTTP/2.
-- [ ] One real show on sapflow with Larix as the encoder, mediamtx kept
-  ready, and the rollback steps in `docs/trial-plan.md`.
-- [ ] Viewers need a reload after a rollback today; decide whether v4v's
-  player should recover by itself.
+### 2. Server resource bounds and production qualification
 
-### 3. The app replaces Larix
+Implemented: RTMP publication admission, recorder bounds, reconnect grace and
+the own HTTP viewer loop. Hyper and Axum have been removed.
 
-Milestones B3R to B5 in `docs/mobile-streaming-plan.md`.
+- [ ] Implement and qualify resident HLS path and fragment-byte admission,
+  final-owner accounting and slow-viewer reclamation in the
+  [retained-media contract](docs/retained-media-contract.md).
+- [ ] Run wired Linux behind Caddy/HTTP2 with 250 and 750 full viewers,
+  slow consumers, multiple publishers and sustained load. Record memory,
+  descriptors, failures, latency and recording integrity on the named build.
+- [ ] Complete the encrypted SRT qualification matrix and source-specific long
+  fuzz runs. Keep the version 4 handshake unsupported unless a tested encoder
+  justifies it; all historical encoder checks used version 5.
+- [ ] Measure Safari delay through the actual Caddy route against mediamtx.
+- [ ] Revalidate rollout and viewer recovery, then complete one real V4V show
+  with mediamtx ready and an explicit maintainer production decision.
 
-- [ ] RTMPS with certificate validation.
-- [ ] Bitrate that adapts to the link.
-- [ ] Audio-only shows that survive a locked screen and the background.
-- [ ] External and USB microphones; camera controls; pause, mute and
-  standby; saved profiles; QR destination import (in testing).
-- [ ] Signed builds on Zapstore and the app stores, with free, unlimited
-  v4v broadcasting in every build.
-- [ ] Then point v4v's encoder guidance at our app instead of Larix.
+As of this review, performance evidence PR #14 and harness PR #15 remain open.
+Their last native CI checks failed; refresh them against current main before
+accepting them. Screening runs do not establish the wired deployment result.
+The [readiness assessment](docs/readiness.md) and
+[trial plan](docs/trial-plan.md) retain the switch gate.
 
-### 4. Libraries for other developers
+### 3. Native recording and recovery
 
-Work queue LQ1 to LQ8 in `docs/library-quality-plan.md`.
+Implemented: optional SDK recording, programme-window metadata, native AAC
+observations and checkpoint storage foundations. Generated host and package
+checks do not qualify capture or change the legacy recorder defaults.
 
-- [ ] Release `sapflow-srt` 0.2.0: `SendStats` gained `expired_packets` and
-  `expired_bytes`, which is a breaking change for 0.1.
-- [ ] A documented Swift and Kotlin SDK contract, compiling examples and
-  installable packages.
-- [ ] Repeatable interoperability tests against OBS and FFmpeg, and a
-  performance scorecard.
-- [ ] A second real consumer of the libraries besides our own app.
-- [ ] Decisions on an OBS adapter, then scenes, mixing and a desktop studio.
+- [ ] Qualify native AAC leading/tail facts, exact programme presentation,
+  complete EOF, seeks and paired independent decoding on both platforms.
+- [ ] Complete durable checkpoint installation and recover-to-new-file
+  transactions, preserving originals through refusal and interrupted writes.
+- [ ] Prove the aggregate two-second source-presentation loss bound, including
+  native pending work, queues, muxing and durable audio/video progress.
+- [ ] Qualify physical capture, Stop, process termination, storage/power-loss
+  behaviour and installed recovery/export before adopting a new default.
 
-### 5. Later
+The [recording recovery record](docs/recording-recovery.md) defines the
+implementation order and retains historical failed verdicts.
 
-- [ ] RelaySwarm peer playback in the apps (B6), then a second rendition
-  and wider formats (B7).
-- [ ] Server features left out on purpose until a show needs them: RTMPS
-  ingest, HEVC and AV1, delta playlists, a metrics endpoint, a config file,
-  release binaries (`docs/comparison.md`, "Gaps sapflow has today").
+### 4. Broadcaster apps and the complete V4V journey
 
-### Owed by the maintainer
+Source already includes RTMP/RTMPS and SRT adapters, audio-only controls,
+external-input routing, standby and reviewed destination/profile import. Their
+presence does not close B3R to B5 in the [mobile plan](docs/mobile-streaming-plan.md).
 
-- [ ] Change the publisher password on the media host: it appeared in a
-  chat. It means mediamtx's settings, sapflow's, v4v's stream-key and SRT
-  templates, restarts in a quiet window, and re-preparing saved encoders.
+Earlier Android evidence (23 October): `fafbd0d` corrected a keyframe after a
+dropped backlog and `132a910` added age-based SRT media expiry. A five-minute
+Pixel run with about 10% retransmissions held one connection; after a 15 s
+Wi-Fi drop it resumed the same stream 7.6 s after Wi-Fi returned. These bounded
+observations remain short of the sustained gates below.
+
+- [ ] Qualify trusted RTMPS, certificate refusal, encrypted SRT, bounded link
+  adaptation and current failure reporting on the physical devices. Compare
+  old diagnostic patches with current behaviour before applying them; retain
+  the historical unexplained audio failure until evidence resolves it.
+- [ ] Complete two-hour Android and iOS runs with scheduled Wi-Fi/mobile
+  changes and outages. Keep one logical stream, recover within the grace,
+  and verify complete recordings on the phone and origin.
+- [ ] Qualify the supported audio-only background/lock-screen mode, external
+  microphones, camera controls, mute/standby, profiles and QR/deep-link import.
+  Video lock/background must follow the documented foreground-camera policy.
+- [ ] Prove current-attempt V4V authentication, Prepare/Start/End, actual viewer
+  media and replay with the reviewed destination profile on both phones.
+- [ ] Measure capture-to-screen latency, power/thermal behaviour and matched
+  competitor performance against the registered native budgets.
+
+Use the [mobile status record](docs/mobile-delivery-status.md) for scoped
+receipts. Reserve each phone for one session at a time.
+
+### 5. Libraries and releases
+
+SDK contracts, Swift/Kotlin wrappers and development package consumers already
+exist. Current-main CI checks the direct native bindings. Public package and
+installed-release acceptance remain open under [LQ1 to LQ8](docs/library-quality-plan.md).
+
+- [ ] Finish API stability, ownership/thread/cancellation contracts and the
+  supported toolchain matrix; verify fresh external package installs.
+- [ ] Prepare versioned crate and SDK releases with migration guidance,
+  including the planned `sapflow-srt` 0.2.0 API break from added statistics.
+- [ ] Complete repeatable interoperability and the full performance scorecard;
+  prove a second independently built real library consumer.
+- [ ] Verify recipient-facing notices and covered-source access in each actual
+  APK, SDK and container distribution.
+- [ ] Publish signed Android/Zapstore and app-store builds, verify installation,
+  upgrades and release readback, and preserve free unlimited V4V broadcasting.
+- [ ] After app and origin acceptance, update V4V's encoder guidance.
+
+### 6. Later work and maintainer actions
+
+- [ ] Native RelaySwarm playback (B6), then a second rendition and wider
+  formats (B7), under their own acceptance gates.
+- [ ] Decide on an OBS adapter and any scenes, mixing or desktop studio work.
+- [ ] Add server capabilities only when a show needs them: RTMPS ingest, HEVC
+  and AV1, delta playlists, metrics, configuration and release binaries.
+- [ ] Maintainer: verify completion of the publisher-credential rotation
+  previously requested. No current host audit was performed for this review.
+  Coordinate affected servers, V4V templates, restarts and saved encoders in a
+  quiet window; keep credentials and host details outside committed files.
 
 ## Decisions made
 
@@ -437,4 +498,7 @@ Work queue LQ1 to LQ8 in `docs/library-quality-plan.md`.
 
 ## Decisions owed by the user
 
-None at present.
+No new decision is needed to continue local implementation and qualification
+preparation. Production changes, credentials, signing/publication and the later
+OBS/desktop product choices retain their explicit maintainer gates in the
+[delivery plan](docs/delivery-plan.md).

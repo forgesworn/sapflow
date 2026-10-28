@@ -1,10 +1,49 @@
 # Readiness to replace mediamtx
 
-An assessment for the maintainer, written 2026-10-21 against `main` (985de00).
-`GOALS.md` keeps sapflow an experiment until the numbers favour it and the
-maintainer decides. This page lists what is measured and what is not.
+## Current readiness, 28 October 2026
 
-## 1. Recommendation (the maintainer's to make)
+Reviewed repository evidence at `3c7e1aa`. The own HTTP viewer loop,
+Hyper/Axum removal, private Tor publishing and receiver TV player are merged.
+[Current-main CI passed](https://github.com/forgesworn/sapflow/actions/runs/40581289226).
+This is a documentation review, not a fresh audit of deployed settings, a
+device test or a production-switch decision.
+
+`GOALS.md` still requires favourable measurements and an explicit maintainer
+decision before replacing mediamtx for the V4V stage. Existing TV deployment
+and short player tests do not complete that gate. No accepted real V4V show
+or wired Linux/Caddy capacity result is recorded here.
+
+| Area | Evidence already recorded | Remaining acceptance |
+|---|---|---|
+| Origin ingest and recording | RTMP/SRT encoder interoperability, V4V ingest/replay gates, reconnects and a two-hour trial-preparation run | Re-run the ingest gates and rollback on the selected current build; complete a real show and record the maintainer's decision |
+| HTTP implementation and resources | The own viewer loop is the only backend; Hyper/Axum are removed; recorder and RTMP publication admission exist | Global HLS path/fragment accounting, final-owner release and slow-viewer reclamation in the [retained-media contract](retained-media-contract.md) |
+| Performance | Dated macOS comparisons in [benchmarks](benchmarks.md); evidence and Linux/slow-viewer follow-ups remain in open PRs #14/#15 | Refresh those PRs and their failed native checks; qualify wired Linux/Caddy/HTTP2 at 250/750 full viewers, adverse load and sustained operation on the selected build |
+| SRT security and interoperability | Own encrypted sender/receiver, bidirectional independent checks and finite loss/rotation cases | Complete the encrypted matrix and long fuzz runs for the actual source; retain unsupported-version and unauthenticated-CTR limits |
+| TV player and private publishing | About 13.5-minute generated-media Chrome loops, signed peer verification, Tor-only publishing and bounded retries | Actual Safari/iPhone, long public/private runs, current-revision reconnect behaviour, measured latency, separate-network peers and sustained higher rates |
+| Native mobile recording and apps | Direct native bindings, current SDK/app CI and scoped capture/recording controls | Native AAC presentation/EOF, durable recovery and aggregate two-second loss; complete physical shows, V4V journeys and signed installed releases |
+
+Evidence: [trial preparation and rollback](trial-plan.md),
+[TV player qualification](tv-player-qualification.md),
+[private publishing qualification](private-tv-qualification.md),
+[mobile delivery](mobile-delivery-status.md) and
+[recording recovery](recording-recovery.md). Tasks, dependencies and owners are
+in the [delivery plan](delivery-plan.md).
+
+Before a V4V trial, verify the actual host's configuration, credentials,
+recording volume, file limits, destination/encryption policy and viewer recovery.
+Keep mediamtx and the measured rollback available. A previously requested
+credential rotation remains unverified by this repository-only review. Do not
+infer permission to change a live host or publish packages from this assessment.
+
+## Historical assessment, 21 October 2026
+
+The sections below retain the assessment against `985de00` and its subsequent
+trial-preparation annotations. Their statements about unmerged V4V work,
+macOS-only measurements, minutes-long runs, missing control APIs and nightly
+target counts belong to those revisions. Use the current review above for the
+remaining queue; use the dated records for the exact scope of each observation.
+
+### 1. Recommendation (the maintainer's to make)
 
 Ingest, packaging, recording, callbacks and reconnects work with real encoders
 and v4v's gates, at about a third of mediamtx's CPU and memory on one machine.
@@ -14,7 +53,7 @@ no benchmark, profile or load test has run on Linux, behind Caddy, over a
 wired link at 250 and 750 viewers, which is the shape of the deployment, and
 the v4v player fix for Safari drift is not merged (section 3).
 
-## 2. Proven
+### 2. Proven
 
 | Area | What was shown | Where |
 |------|----------------|-------|
@@ -28,7 +67,7 @@ the v4v player fix for Safari drift is not merged (section 3).
 | Reconnect grace | A dropped encoder is held 90 s, v4v's own window. Larix over RTMP resumed seven times in six minutes; OBS restarted after 62 s resumed. hls.js crossed the discontinuities; Safari carried on (by eye). | `docs/interop.md` "Stopping and restarting"; `docs/reference.md` "Target duration and breaks" |
 | Delay | Camera to Safari 3.0 and 3.2 s over HTTP/2 (a Node HTTP/2 front stood in for Caddy); 10.8 s over plain HTTP/1.1, where Safari ignores the low-latency position. The server adds nothing measurable beyond the SRT latency. | `docs/interop.md` "Delay through the server" |
 
-## 3. Not yet proven
+### 3. Not yet proven
 
 | Gap | What would prove it | Needs |
 |-----|---------------------|-------|
@@ -42,7 +81,7 @@ the v4v player fix for Safari drift is not merged (section 3).
 | SRT handshake version 4 | No encoder tested needed it. Find one that does and test it, or document it as unsupported. | An older encoder |
 | Safari after drops | Safari ended about 10 s behind the camera after seven drops. The v4v player fix is merged (v4v #475) but not yet watched in real Safari; rewatch with `?stats=1` across drops. | A Safari or iPhone check |
 
-## 4. Risks for a switch, and mitigations
+### 4. Risks for a switch, and mitigations
 
 - **Rollback.** Keep mediamtx's config and image ready, untouched, and switch
   back by restoring the templates and Caddy upstream (section 5). Do it
@@ -73,7 +112,7 @@ the v4v player fix for Safari drift is not merged (section 3).
   URL v4v hands out. `SAPFLOW_SRT_ENCRYPTION=optional` sets a passphrase
   without forcing it on encoders, so the URL can stay as it is.
 
-## 5. What a switch changes
+### 5. What a switch changes
 
 v4v needs no code change (`docs/v4v-contract.md`): it reaches the media server
 only through URL templates and the callback. The gate branch changes only the
@@ -100,7 +139,7 @@ deployment, so a trial is a window on the whole stage, or a second stack.
   (mediamtx 1.19 names; 1.21 calls the first two `runOnAvailable` and
   `runOnUnavailable`).
 
-## 6. Staged rollout
+### 6. Staged rollout
 
 1. Choose the build (a named commit of main). Run `cargo test --workspace`,
    `scripts/smoke.sh` and both v4v ingest gates against it.
