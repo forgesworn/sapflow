@@ -10,6 +10,39 @@ The own HTTP loop, Hyper/Axum removal and private TV workflow are merged.
 Current-main CI passed. Detailed historical receipts remain in their linked
 records; they do not make every later revision qualified.
 
+## Next work
+
+The full remaining-work inventory is in [GOALS.md](../GOALS.md#remaining-work).
+The immediate queue is:
+
+- [ ] **Next server implementation, 2.6:** enforce retained HLS path and
+  fragment-byte budgets, account through the final owner and define a
+  slow-response deadline. Prove exhaustion, alias release, reconnect/codec
+  changes and incomplete-recording handling against the
+  [retained-media contract](retained-media-contract.md). Its suggested limits
+  remain candidates until qualified.
+- [ ] **Then server qualification, 2.1 to 2.5:** refresh performance PRs #14
+  and #15 against the selected main revision and resolve their failed native
+  checks. Complete wired Linux/Caddy/HTTP2 load, Safari delay and rollback
+  tests before a real V4V show and the maintainer's production decision.
+- [ ] **Next TV acceptance, TV1:** reserve the physical iPhone and name the
+  tested build. Pass track changes, a full programme loop, Stop and
+  interruption recovery. Simulator and Chrome receipts do not close this gate.
+- [ ] **TV follow-ups, TV2 to TV4:** qualify sustained public and private Tor
+  playback, then real peers on separate networks. Measure private publishing
+  and higher-rate profiles before promotion; retain the measured lower-rate
+  profile and onion-only publishing route while those gates remain open.
+- [ ] **Native recording, 1.6:** qualify native AAC presentation and EOF,
+  durable checkpoints, recover-to-new-file and the aggregate two-second loss
+  bound on both platforms. Then run the two-hour physical Android/iOS shows
+  in 1.2 and 1.4 with complete phone and origin recordings.
+
+Server, TV and native work can progress independently, with each phone reserved
+for one session. The tables below retain owners, dependencies and acceptance
+for the rest of the app/V4V journey, libraries, signed releases and later work.
+Library contracts and consumer checks can progress now; publication and the
+production switch retain their separate maintainer gates.
+
 ## Who carries what
 
 | Owner | Area |
