@@ -38,6 +38,8 @@ def stop(child):
 def main():
     binary=Path(os.environ.get('SAPFLOW_BIN',ROOT/'target/debug/sapflow')).resolve()
     if not binary.is_file():raise SystemExit('Build Sapflow before the TV browser gate')
+    subprocess.run(['node', str(ROOT/'tests/tv-route-teardown-browser.mjs')],
+                   check=True, timeout=30)
     output=ROOT/'target/tv-browser';output.mkdir(parents=True,exist_ok=True)
     http,rtmp,srt=port(),port(),port(socket.SOCK_DGRAM)
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))

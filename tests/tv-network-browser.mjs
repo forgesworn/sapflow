@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 import {readFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
+import {closeRoutedBrowser} from './tv-browser-cleanup.mjs';
 const base=new URL(process.argv[2]);assert.equal(base.hostname,'127.0.0.1');
 const {chromium}=await import(pathToFileURL(process.env.SAPFLOW_PLAYWRIGHT_MODULE).href);
 const browser=await chromium.launch({channel:'chrome',headless:true,args:['--autoplay-policy=no-user-gesture-required','--disable-background-networking']});
@@ -35,7 +36,5 @@ try{
  await page.locator('#start-overlay').click();await page.waitForFunction(()=>document.querySelector('#indicator').dataset.state==='playing',null,{timeout:45000});assert(mediaRequests>endedMedia);assert.deepEqual(errors,[]);
  console.log(JSON.stringify({networkChangeRetainedBuffer:true,metadataRefreshed:metadataRequests>0,newBroadcastAnnounced:true,explicitRejoinPlayed:true,externalNetworkRequests:0}));
 }finally{
- // A routed segment can still be using context.request when playback passes.
- try{await context?.unrouteAll({behavior:'wait'});}
- finally{await browser.close();}
+ await closeRoutedBrowser(browser,context);
 }
