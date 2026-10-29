@@ -137,8 +137,15 @@ for tag in '#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=' '#EXT-X-
            '#EXT-X-TARGETDURATION:2' '#EXT-X-PRELOAD-HINT:TYPE=PART' '#EXT-X-PART:DURATION='; do
   grep -q "$tag" "$WORK/stream.m3u8" || fail "media playlist lacks $tag"
 done
-[ "$(grep -c '^#EXT-X-GAP' "$WORK/stream.m3u8")" = 7 ] || fail "expected 7 leading gaps"
-echo "ok   media playlist (LL-HLS tags, 7 gaps)"
+# Seven leading gaps, less any the window has rotated out to admit segments
+# (as gohlslib does): a seven-entry window keeps six beside its first segment.
+gaps=$(grep -c '^#EXT-X-GAP' "$WORK/stream.m3u8" || true)
+segments=$(grep -c '_seg' "$WORK/stream.m3u8" || true)
+window=${SAPFLOW_SEGMENT_COUNT:-24}
+expected_gaps=$(( window - segments < 7 ? window - segments : 7 ))
+[ "$segments" -ge 1 ] && [ "$gaps" = "$expected_gaps" ] \
+  || fail "expected $expected_gaps leading gaps beside $segments segments, found $gaps"
+echo "ok   media playlist (LL-HLS tags, $gaps gaps)"
 
 init=$(grep -o '[0-9a-f]*_init.mp4' "$WORK/stream.m3u8")
 curl -s "$BASE/$init" > "$WORK/segs.mp4"; cp "$WORK/segs.mp4" "$WORK/parts.mp4"
@@ -223,7 +230,11 @@ pids+=("$check")
 publish "publish:live/$R:pub:secret" 8 18904 > /dev/null 2>&1
 curl -sf "http://$HTTP/live/$R/stream.m3u8" -o "$WORK/resumed.m3u8" || fail "resumed stream not served"
 grep -q "$init" "$WORK/resumed.m3u8" || fail "reconnect did not keep the chunk names"
-grep -q '^#EXT-X-DISCONTINUITY$' "$WORK/resumed.m3u8" || fail "no discontinuity at the reconnect"
+# A small window may already have rotated the discontinuity out; the
+# discontinuity sequence then records it.
+grep -q '^#EXT-X-DISCONTINUITY$' "$WORK/resumed.m3u8" \
+  || ! grep -q '^#EXT-X-DISCONTINUITY-SEQUENCE:0$' "$WORK/resumed.m3u8" \
+  || fail "no discontinuity at the reconnect"
 wait_child "$check" || { cat "$WORK/resume-check.log" >&2; fail "playlist rules broken across the reconnect"; }
 [ "$(grep -c "\"publish\",\"path\":\"live/$R\"" "$WORK/cb.log")" = 2 ] || fail "expected two publish callbacks"
 for _ in $(seq 1 30); do grep -q "recordSegmentComplete\",\"path\":\"live/$R\"" "$WORK/cb.log" && break; sleep 0.5; done

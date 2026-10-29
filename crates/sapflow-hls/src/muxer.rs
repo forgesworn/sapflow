@@ -1586,8 +1586,12 @@ impl Muxer {
     }
 
     /// True once the first segment exists: the stream is servable.
+    ///
+    /// Leading gaps only precede the first segment, so the newest entry is a
+    /// segment from then on. Counting entries instead would never succeed
+    /// with a seven-entry window, which evicts a gap to admit that segment.
     pub fn has_content(&self) -> bool {
-        self.entries.len() > LEADING_GAPS as usize
+        matches!(self.entries.back(), Some(Entry::Segment(_)))
     }
 
     /// Whether a media playlist request can be answered now
@@ -2477,6 +2481,30 @@ pub(crate) mod tests {
         for e in m.entries().iter().take(7) {
             assert!(matches!(e, Entry::Gap { duration } if *duration == Duration::from_secs(1)));
         }
+    }
+
+    #[test]
+    fn the_minimum_seven_entry_window_becomes_servable() {
+        let cfg = MuxerConfig {
+            segment_count: LEADING_GAPS as usize,
+            ..MuxerConfig::default()
+        };
+        let mut m = Muxer::new(cfg, video(), Some(aac()));
+        // Starts on a non-keyframe, so frames 30 to 59 form the first segment.
+        feed(&mut m, 25..30, 30);
+        assert!(!m.has_content());
+        assert_eq!(m.readiness(None, None), Readiness::Wait);
+        feed(&mut m, 30..61, 30);
+        // The first segment evicts one leading gap to stay within the window.
+        assert_eq!(m.entries().len(), 7);
+        assert_eq!(m.media_sequence(), 1);
+        assert!(m.segment(LEADING_GAPS).is_some());
+        assert!(m.has_content());
+        assert_eq!(m.readiness(None, None), Readiness::Ready);
+        feed(&mut m, 61..400, 30);
+        assert_eq!(m.entries().len(), 7);
+        assert!(m.entries().iter().all(|e| matches!(e, Entry::Segment(_))));
+        assert!(m.has_content());
     }
 
     #[test]
