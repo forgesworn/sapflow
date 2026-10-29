@@ -19,6 +19,15 @@
 //!
 //!     sapflow-bench --url https://localhost:8943/live-hls/live/event-x/index.m3u8 \
 //!         --ca caddy-root.crt --http2 --viewers 250 --secs 60
+//!
+//! `--slow N --slow-rate BYTES_PER_SEC` makes N of the full-media viewers slow
+//! consumers. Each reads its response bodies frame by frame, never faster than
+//! the rate, so the server sees TCP backpressure. They behave as the other
+//! viewers otherwise, are counted in `--viewers`, and are reported in a
+//! section of their own; the figures for the other viewers exclude them.
+//!
+//!     sapflow-bench --url http://127.0.0.1:8888/live/event-x/index.m3u8 \
+//!         --viewers 250 --secs 60 --slow 5 --slow-rate 50000
 
 mod tls;
 
@@ -95,6 +104,11 @@ struct Args {
     ca: Option<String>,
     /// HTTP/2 over TLS, one connection per viewer (`https://`).
     http2: bool,
+    /// Full-media viewers that read their response bodies slowly. They are
+    /// counted in `viewers` and reported apart from the others.
+    slow: usize,
+    /// The most bytes a second a slow viewer reads from one response body.
+    slow_rate: Option<u64>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -106,6 +120,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
         full: None,
         ca: None,
         http2: false,
+        slow: 0,
+        slow_rate: None,
     };
     let mut it = args.into_iter();
     while let Some(k) = it.next() {
@@ -121,6 +137,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--ramp" => a.ramp = v.parse().map_err(|_| "--ramp: a number")?,
             "--full" => a.full = Some(v.parse().map_err(|_| "--full: a number")?),
             "--ca" => a.ca = Some(v),
+            "--slow" => a.slow = v.parse().map_err(|_| "--slow: a number")?,
+            "--slow-rate" => a.slow_rate = Some(v.parse().map_err(|_| "--slow-rate: a number")?),
             _ => return Err(format!("unknown option {k}")),
         }
     }
@@ -147,6 +165,21 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     if !tls && a.ca.is_some() {
         return Err("--ca only applies to an https:// URL".into());
     }
+    let full_viewers = a.full.map_or(a.viewers, |n| n.min(a.viewers));
+    if a.slow > full_viewers {
+        return Err(format!(
+            "--slow {} exceeds the {full_viewers} full-media viewers",
+            a.slow
+        ));
+    }
+    match (a.slow, a.slow_rate) {
+        (_, Some(0)) => return Err("--slow-rate must be positive".into()),
+        (0, Some(_)) => return Err("--slow-rate only applies with --slow N (N > 0)".into()),
+        (_, None) if a.slow > 0 => {
+            return Err("--slow needs --slow-rate <bytes per second>".into());
+        }
+        _ => {}
+    }
     Ok(a)
 }
 
@@ -160,7 +193,7 @@ async fn main() {
         }
     };
     match run(&a).await {
-        Ok(st) => report(&a, &st),
+        Ok(out) => report(&a, &out),
         Err(e) => {
             eprintln!("sapflow-bench: {e}");
             std::process::exit(2);
@@ -168,8 +201,16 @@ async fn main() {
     }
 }
 
+/// What the viewers saw: the ordinary viewers, and the slow consumers kept
+/// apart so they cannot colour the figures the older receipts compare.
+#[derive(Default)]
+struct Outcome {
+    normal: Stats,
+    slow: Stats,
+}
+
 /// Runs the viewers to the end of the measurement and returns what they saw.
-async fn run(a: &Args) -> Result<Stats, String> {
+async fn run(a: &Args) -> Result<Outcome, String> {
     let start = Instant::now()
         .checked_add(Duration::from_secs(a.ramp))
         .ok_or("ramp is too long")?;
@@ -179,10 +220,16 @@ async fn run(a: &Args) -> Result<Stats, String> {
             .checked_add(Duration::from_secs(a.secs))
             .ok_or("measurement is too long")?,
     };
-    let stats = Arc::new(Mutex::new(Stats {
-        window: Some(window),
-        ..Stats::default()
-    }));
+    let cohort = || {
+        Arc::new(Mutex::new(Stats {
+            window: Some(window),
+            ..Stats::default()
+        }))
+    };
+    let stats = Cohorts {
+        normal: cohort(),
+        slow: cohort(),
+    };
     let tasks = match &a.ca {
         Some(path) => {
             let pem = std::fs::read(path).map_err(|e| format!("cannot read --ca {path}: {e}"))?;
@@ -195,14 +242,27 @@ async fn run(a: &Args) -> Result<Stats, String> {
     for t in tasks {
         let _ = t.await;
     }
-    let st = std::mem::take(&mut *lock(&stats));
-    Ok(st)
+    Ok(Outcome {
+        normal: std::mem::take(&mut *lock(&stats.normal)),
+        slow: std::mem::take(&mut *lock(&stats.slow)),
+    })
 }
+
+/// Where each kind of viewer records what it sees.
+struct Cohorts {
+    normal: Arc<Mutex<Stats>>,
+    slow: Arc<Mutex<Stats>>,
+}
+
+/// Drop pooled connections before the server's 60 second idle close, as
+/// browsers do, so a reuse never races the server closing the connection.
+pub(crate) const POOL_IDLE: Duration = Duration::from_secs(50);
 
 /// HTTP/1.1 over plain TCP, as the benchmarks have always run.
 fn plain_client() -> Client<HttpConnector, Empty<Bytes>> {
     Client::builder(TokioExecutor::new())
         .pool_max_idle_per_host(4)
+        .pool_idle_timeout(POOL_IDLE)
         .build_http()
 }
 
@@ -210,7 +270,7 @@ fn plain_client() -> Client<HttpConnector, Empty<Bytes>> {
 /// connection, as a player has.
 fn spawn_viewers<C>(
     a: &Args,
-    stats: &Arc<Mutex<Stats>>,
+    stats: &Cohorts,
     window: CollectionWindow,
     make_client: impl Fn() -> Client<C, Empty<Bytes>>,
 ) -> Vec<tokio::task::JoinHandle<()>>
@@ -220,14 +280,18 @@ where
     let deadline = window.end;
     let mut tasks = Vec::new();
     for i in 0..a.viewers {
-        let stats = stats.clone();
+        // The first `slow` viewers are the slow ones: `--slow` is at most the
+        // full-media count, and the full-media viewers are the first ones.
+        let slow = i < a.slow;
+        let stats = if slow { &stats.slow } else { &stats.normal }.clone();
+        let pace = if slow { a.slow_rate } else { None };
         let url = a.url.clone();
         let client = make_client();
         let full = a.full.is_none_or(|n| i < n);
         let delay = Duration::from_millis(a.ramp * 1000 * i as u64 / a.viewers.max(1) as u64);
         tasks.push(tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            viewer(&client, &url, deadline, &stats, full).await;
+            viewer(&client, &url, deadline, &stats, full, pace).await;
         }));
     }
     tasks
@@ -241,6 +305,7 @@ async fn get<C>(
     client: &Client<C, Empty<Bytes>>,
     url: &str,
     stats: &Mutex<Stats>,
+    pace: Option<u64>,
 ) -> Option<Download>
 where
     C: Connect + Clone + Send + Sync + 'static,
@@ -298,8 +363,9 @@ where
             );
             return None;
         }
-        let body = match tokio::time::timeout(Duration::from_secs(15), body.collect()).await {
-            Ok(Ok(b)) => b.to_bytes(),
+        let body = match tokio::time::timeout(Duration::from_secs(15), read_body(body, pace)).await
+        {
+            Ok(Ok(b)) => b,
             Ok(Err(e)) => {
                 record_request(
                     stats,
@@ -334,6 +400,41 @@ where
         });
     }
     None
+}
+
+/// Reads a response body. With a `pace` in bytes a second it reads frame by
+/// frame and, after each, waits until the bytes so far are due at that rate, so
+/// a slow consumer leaves the rest in the connection and the server sees the
+/// backpressure. The caller's timeout covers the waits as well.
+async fn read_body<B>(mut body: B, pace: Option<u64>) -> Result<Bytes, B::Error>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    let Some(rate) = pace else {
+        return Ok(body.collect().await?.to_bytes());
+    };
+    let started = Instant::now();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            bytes.extend_from_slice(&data);
+            tokio::time::sleep(pace_delay(bytes.len() as u64, rate, started.elapsed())).await;
+        }
+    }
+    Ok(Bytes::from(bytes))
+}
+
+/// How much longer a paced reader waits, `elapsed` into a body of which it has
+/// read `bytes`, for `bytes` to be due at `rate` bytes a second. Zero once it
+/// is on or behind schedule. A zero rate is treated as one byte a second.
+fn pace_delay(bytes: u64, rate: u64, elapsed: Duration) -> Duration {
+    let rate = u128::from(rate.max(1));
+    let nanos = u128::from(bytes) * 1_000_000_000 / rate;
+    let due = Duration::new(
+        u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX),
+        (nanos % 1_000_000_000) as u32,
+    );
+    due.saturating_sub(elapsed)
 }
 
 fn record_request(
@@ -482,17 +583,19 @@ fn attr(list: &str, name: &str) -> Option<String> {
 
 /// `full`: fetch parts and segments as a player does; otherwise follow the
 /// playlist only (blocking reloads), for networks too slow to carry media to
-/// every simulated viewer.
+/// every simulated viewer. `pace`: read every response body at no more than
+/// that many bytes a second (a slow consumer).
 async fn viewer<C>(
     client: &Client<C, Empty<Bytes>>,
     index_url: &str,
     deadline: Instant,
     stats: &Arc<Mutex<Stats>>,
     full: bool,
+    pace: Option<u64>,
 ) where
     C: Connect + Clone + Send + Sync + 'static,
 {
-    let Some(master) = get(client, index_url, stats).await else {
+    let Some(master) = get(client, index_url, stats, pace).await else {
         return;
     };
     let Some(variant) = String::from_utf8_lossy(&master.body)
@@ -511,7 +614,7 @@ async fn viewer<C>(
         // Every fifth reload, and at the start: a plain playlist request and
         // the newest whole segment.
         if loops.is_multiple_of(5) || media.is_none() {
-            let Some(download) = get(client, &media_url, stats).await else {
+            let Some(download) = get(client, &media_url, stats, pace).await else {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 media = None;
                 loops += 1;
@@ -523,7 +626,7 @@ async fn viewer<C>(
             let m = parse_media(&String::from_utf8_lossy(&download.body));
             if full
                 && let Some(seg) = &m.last_segment
-                && let Some(download) = get(client, &join(&media_url, seg), stats).await
+                && let Some(download) = get(client, &join(&media_url, seg), stats, pace).await
                 && download.measured
             {
                 lock(stats).segment.push(download.took);
@@ -544,12 +647,12 @@ async fn viewer<C>(
         let part_url = join(&media_url, &hint);
         let fetch_part = async {
             if full {
-                get(client, &part_url, stats).await
+                get(client, &part_url, stats, pace).await
             } else {
                 None
             }
         };
-        let (pl, part) = tokio::join!(get(client, &pl_url, stats), fetch_part);
+        let (pl, part) = tokio::join!(get(client, &pl_url, stats, pace), fetch_part);
         if let Some(download) = &pl
             && download.measured
         {
@@ -596,7 +699,10 @@ fn protocols(st: &Stats) -> String {
         .join(", ")
 }
 
-fn report(a: &Args, st: &Stats) {
+fn report(a: &Args, out: &Outcome) {
+    let st = &out.normal;
+    // The viewers the figures below cover: all of them unless some are slow.
+    let normal_viewers = a.viewers - a.slow;
     let mut playlist = st.playlist.clone();
     let mut segment = st.segment.clone();
     let mut spread: Vec<Duration> = Vec::new();
@@ -645,7 +751,7 @@ fn report(a: &Args, st: &Stats) {
         "responses {}  connections {} ({:.2} per viewer)",
         protocols(st),
         st.connections.len(),
-        st.connections.len() as f64 / a.viewers.max(1) as f64
+        st.connections.len() as f64 / normal_viewers.max(1) as f64
     );
     for (name, v) in [("playlist", &mut playlist), ("segment", &mut segment)] {
         println!(
@@ -668,11 +774,51 @@ fn report(a: &Args, st: &Stats) {
         "part fan-out (first to last viewer) parts={} reach {:.0}/{}  p50 {:.1} ms  p95 {:.1} ms  max {:.1} ms",
         spread.len(),
         mean_reach,
-        a.viewers,
+        normal_viewers,
         pct(&mut spread, 0.5),
         pct(&mut spread, 0.95),
         pct(&mut spread, 1.0)
     );
+    if a.slow > 0 {
+        report_slow(a, &out.slow);
+    }
+}
+
+/// The slow consumers, in lines of their own: every one starts `slow ` so none
+/// can be mistaken for the figures of the other viewers above.
+fn report_slow(a: &Args, st: &Stats) {
+    let mut playlist = st.playlist.clone();
+    let mut segment = st.segment.clone();
+    let parts: usize = st.parts.values().map(Vec::len).sum();
+    println!(
+        "slow viewers {} of {}  rate {} B/s each; the figures above cover the other {}",
+        a.slow,
+        a.viewers,
+        a.slow_rate.unwrap_or(0),
+        a.viewers - a.slow
+    );
+    println!(
+        "slow excluded requests {}  errors {}",
+        st.excluded_requests, st.excluded_errors
+    );
+    println!(
+        "slow requests {}  errors {}  received {:.1} MB",
+        st.requests,
+        st.errors,
+        st.bytes as f64 / 1e6
+    );
+    for (kind, n) in &st.error_kinds {
+        println!("  slow error {kind}: {n}");
+    }
+    for (name, v) in [("playlist", &mut playlist), ("segment ", &mut segment)] {
+        println!(
+            "slow {name} n={:<6} p50 {:.1} ms  p99 {:.1} ms",
+            v.len(),
+            pct(v, 0.5),
+            pct(v, 0.99)
+        );
+    }
+    println!("slow parts fetched {parts}");
 }
 
 #[cfg(test)]
@@ -881,6 +1027,143 @@ mod tests {
         assert_eq!(protocols(&lock(&stats)), "HTTP/1.1 1, HTTP/2 2");
         // No connection information on a hand-made response.
         assert!(lock(&stats).connections.is_empty());
+    }
+
+    #[test]
+    fn slow_options_default_to_off() {
+        let a = parse("--url http://h/x").expect("parses");
+        assert_eq!((a.slow, a.slow_rate), (0, None));
+        let a = parse("--url http://h/x --viewers 20 --slow 5 --slow-rate 50000").expect("parses");
+        assert_eq!((a.viewers, a.slow, a.slow_rate), (20, 5, Some(50_000)));
+        // As many slow viewers as full-media viewers is allowed.
+        let a =
+            parse("--url http://h/x --viewers 20 --full 8 --slow 8 --slow-rate 1").expect("all");
+        assert_eq!((a.full, a.slow), (Some(8), 8));
+        let a = parse("--url http://h/x --viewers 4 --slow 4 --slow-rate 1").expect("all");
+        assert_eq!(a.slow, 4);
+        // `--full` beyond `--viewers` still means every viewer.
+        parse("--url http://h/x --viewers 4 --full 99 --slow 4 --slow-rate 1").expect("capped");
+        // `--slow 0` is the same as leaving it off.
+        let a = parse("--url http://h/x --slow 0").expect("parses");
+        assert_eq!((a.slow, a.slow_rate), (0, None));
+    }
+
+    #[test]
+    fn rejects_inconsistent_slow_options() {
+        let e = parse("--url http://h/x --slow 2").expect_err("no rate");
+        assert!(e.contains("--slow-rate"), "{e}");
+        let e = parse("--url http://h/x --slow-rate 5000").expect_err("rate without slow");
+        assert!(e.contains("--slow"), "{e}");
+        let e = parse("--url http://h/x --slow 0 --slow-rate 5000").expect_err("zero slow");
+        assert!(e.contains("--slow"), "{e}");
+        let e = parse("--url http://h/x --slow 2 --slow-rate 0").expect_err("zero rate");
+        assert!(e.contains("positive"), "{e}");
+        let e = parse("--url http://h/x --viewers 5 --slow 6 --slow-rate 5000").expect_err("more");
+        assert!(e.contains("--slow 6") && e.contains("5 full-media"), "{e}");
+        let e = parse("--url http://h/x --viewers 20 --full 3 --slow 4 --slow-rate 5000")
+            .expect_err("more than the full-media viewers");
+        assert!(e.contains("3 full-media"), "{e}");
+        assert!(parse("--url http://h/x --slow many --slow-rate 5").is_err());
+        assert!(parse("--url http://h/x --slow 1 --slow-rate fast").is_err());
+        assert!(parse("--url http://h/x --slow 1 --slow-rate -5").is_err());
+        assert!(
+            parse("--url http://h/x --slow").is_err(),
+            "a value is missing"
+        );
+    }
+
+    #[test]
+    fn paces_bytes_to_the_rate() {
+        let ms = Duration::from_millis;
+        // Nothing read yet, or nothing due: no wait.
+        assert_eq!(pace_delay(0, 50_000, Duration::ZERO), Duration::ZERO);
+        // 50 000 bytes at 50 000 B/s are due after a second.
+        assert_eq!(pace_delay(50_000, 50_000, Duration::ZERO), ms(1000));
+        assert_eq!(pace_delay(50_000, 50_000, ms(400)), ms(600));
+        // On schedule or behind: no wait, never a negative one.
+        assert_eq!(pace_delay(50_000, 50_000, ms(1000)), Duration::ZERO);
+        assert_eq!(pace_delay(50_000, 50_000, ms(2500)), Duration::ZERO);
+        // Fractions of a second are exact, and the delay is never early.
+        assert_eq!(pace_delay(1, 4, Duration::ZERO), ms(250));
+        assert_eq!(
+            pace_delay(1, 3, Duration::ZERO),
+            Duration::from_nanos(333_333_333)
+        );
+        // 62 500 bytes (a 200 ms part at 2.5 Mbit/s) at 50 000 B/s.
+        assert_eq!(pace_delay(62_500, 50_000, Duration::ZERO), ms(1250));
+        // A faster rate than the data needs waits less.
+        assert_eq!(pace_delay(1000, 1_000_000, Duration::ZERO), ms(1));
+    }
+
+    #[test]
+    fn pacing_does_not_overflow_or_divide_by_zero() {
+        assert_eq!(
+            pace_delay(u64::MAX, 1, Duration::ZERO),
+            Duration::from_secs(u64::MAX)
+        );
+        assert_eq!(pace_delay(5, 0, Duration::ZERO), Duration::from_secs(5));
+        let huge = pace_delay(u64::MAX, u64::MAX, Duration::ZERO);
+        assert_eq!(huge, Duration::from_secs(1));
+    }
+
+    /// A body that yields the given frames at once.
+    struct Frames(Vec<Bytes>);
+
+    impl hyper::body::Body for Frames {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Ready(if self.0.is_empty() {
+                None
+            } else {
+                Some(Ok(hyper::body::Frame::data(self.0.remove(0))))
+            })
+        }
+    }
+
+    fn frames(sizes: &[usize]) -> Frames {
+        Frames(sizes.iter().map(|n| Bytes::from(vec![9u8; *n])).collect())
+    }
+
+    #[tokio::test]
+    async fn an_unpaced_body_is_read_whole_and_at_once() {
+        let started = Instant::now();
+        let body = read_body(frames(&[1000, 1000, 500]), None).await;
+        assert_eq!(body.expect("read").len(), 2500);
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn a_paced_body_arrives_whole_but_no_sooner_than_its_rate_allows() {
+        // 3 000 bytes at 10 000 B/s: 0.3 s, however the frames fall.
+        let started = Instant::now();
+        let body = read_body(frames(&[1000, 1000, 1000]), Some(10_000)).await;
+        assert_eq!(body.expect("read").len(), 3000);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        // An empty body, or one with no data, is not waited for.
+        let started = Instant::now();
+        assert!(
+            read_body(frames(&[]), Some(1))
+                .await
+                .expect("read")
+                .is_empty()
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn the_timeout_cuts_a_paced_body_off_in_mid_wait() {
+        // 1 000 bytes at 100 B/s would take 10 s; the caller's timeout ends it.
+        let paced = read_body(frames(&[1000]), Some(100));
+        let outcome = tokio::time::timeout(Duration::from_millis(100), paced).await;
+        assert!(
+            outcome.is_err(),
+            "the timeout must fire during the pacing wait"
+        );
     }
 
     #[test]

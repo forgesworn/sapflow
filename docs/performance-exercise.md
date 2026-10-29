@@ -112,6 +112,87 @@ the current hot path separately with symbols and reconcile sampled CPU with
 process CPU time.  The existing profiling profile retains line tables.  A
 stack sampler that counts blocked threads cannot establish on-CPU shares.
 
+## Linux and slow viewers
+
+Two of the gates above need more than the macOS screening: Linux/epoll
+behaviour and slow consumers.  The loader and runner support both.  Linux
+results are a separate cohort.  Don't pool them with macOS receipts or quote a
+saving from one against the other.
+
+### Slow consumers
+
+`sapflow-bench --slow N --slow-rate BYTES_PER_SEC` makes N of the full-media
+viewers slow consumers.  `performance.py` takes the same two options and
+`bench.sh` the `SLOW` and `SLOW_RATE` environment variables.  The slow viewers
+are counted in `--viewers` and behave like any other full viewer, except that
+each reads a response body frame by frame and, after every frame, waits until
+`bytes / rate` has elapsed since the body began.  The unread rest stays in the
+connection, so TCP backpressure can reach the server.  The 15 second body
+timeout still applies, waits included.  `--slow` can't exceed the full-media
+viewer count, `--slow-rate` is required with it, and the runner needs at
+least one ordinary viewer left in every viewer count.
+
+The ordinary figures keep their format and are computed over the other
+viewers only (part reach is out of the viewers that are not slow), so older
+receipts stay comparable.  A section of lines starting `slow ` follows them:
+requests, errors by kind, playlist and segment p50 and p99, and parts fetched.
+Falling behind live should appear as 404 or 410 responses or timeouts.  The
+runner records these under `slow` in each measurement and doesn't fail a trial
+on them; any error from an ordinary viewer still fails it.
+
+Pacing stops the reader, not the kernel.  Socket buffers, the HTTP client's
+read buffer and, over HTTP/2, the 1 MiB stream window absorb some bytes before
+the server's write blocks, so a 200 ms part can fit in them entirely and a
+whole segment is likelier to reach the limit.  Pick rates that bite: the
+generated media is about 312 kB/s, so 50000 B/s falls behind live about sixfold.
+Say which rates were tried; one rate doesn't qualify slow clients in general.
+
+### Linux
+
+Run the server, publisher and loader together inside one native linux/arm64
+container on the M4 Max.  Don't use x86_64 under emulation: the runner refuses
+it.  With `--platform linux` (the default is `m4`, unchanged) the runner
+requires aarch64 Linux and records, in place of the macOS fields: the
+`/etc/os-release` PRETTY_NAME, the kernel release, `os.cpu_count()`, the size
+of the affinity mask, and the cgroup v2 `cpu.max` and `memory.max` when
+present.  It also records the cores the process may use: the affinity mask
+lowered to the CPU quota, rounded up, which is what the server's default
+worker count sees.  The `own` treatment uses that count, not the host's.
+The process sampler reads CPU from `/proc/<pid>/stat` (user plus system time at
+clock-tick resolution, normally 10 ms) and RSS from `VmRSS`.  The macOS path
+is unchanged.
+
+The image needs the Rust toolchain named in `rust-toolchain.toml` (an image
+based on the matching `rust` tag has it), a C compiler and linker, `ffmpeg`
+with libx264, `lsof`, `file`, `curl`, `git`, `python3` and `bash`.  Nothing
+needs `ps`.
+
+```sh
+# From a plain clone, not a linked worktree: a worktree's .git file points
+# outside the mount.  The volume keeps Linux build output out of the macOS
+# target/.  Leave CARGO_BUILD_TARGET unset.  --init reaps what the runner stops.
+docker run --rm --init --cpus 8 --memory 8g \
+  -v "$PWD":/src -v sapflow-linux-target:/src/target -w /src \
+  -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
+  <image> python3 scripts/performance.py --platform linux \
+    --output scratch/performance-linux-<run-id> \
+    --viewers 250 750 --seconds 60 --rounds 3 \
+    --variants own own-1 own-4 \
+    --slow 5 --slow-rate 50000
+```
+
+`--cpus` is a CPU quota, not pinning (`--cpuset-cpus` pins).  Both limits appear
+in the receipt, so give every run you compare the same values.  Docker on a Mac
+runs Linux in a virtual machine, which adds its own scheduling and memory
+overhead to loopback and to the server; note the Docker version and the VM's
+allocation beside the receipt.  `--mediamtx` takes a linux-arm64 binary on this
+platform (`file -b` must report ELF and aarch64); a Mach-O binary is refused
+here, as an ELF one is on `m4`.
+
+A Linux receipt speaks to Linux/epoll for the treatments and container
+settings measured, and a slow-viewer receipt to the rates tried.  Neither
+closes the production-shaped proxy, sustained-run or physical-phone gates.
+
 ## Workloads and responsibility
 
 | Layer | Experiment | Measures and acceptance |

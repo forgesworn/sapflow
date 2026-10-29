@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Repeated, alternating M4 screenings using the existing socket benchmark."""
+"""Repeated, alternating screenings using the existing socket benchmark.
+
+`--platform m4` (the default) is the macOS screening on the Apple M4 Max.
+`--platform linux` runs the same workload inside native aarch64 Linux, for
+example a linux/arm64 container on that Mac; its receipts are a separate cohort.
+"""
 
 import argparse
 import hashlib
@@ -10,6 +15,7 @@ from pathlib import Path
 import platform
 import re
 import resource
+import shlex
 import shutil
 import signal
 import statistics
@@ -20,6 +26,17 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 VARIANTS = ("own", "own-1", "own-4", "mediamtx")
+PLATFORMS = ("m4", "linux")
+OS_RELEASE = "/etc/os-release"
+CGROUP_CPU_MAX = "/sys/fs/cgroup/cpu.max"
+CGROUP_MEMORY_MAX = "/sys/fs/cgroup/memory.max"
+
+
+NOTES = dict(
+    m4="Loopback HTTP/1.1; full media viewers; generated 720p30 H.264/AAC. Server and encoder/load generator share the host. RSS excludes kernel memory. Existing workloads remain running. Separate server and viewer builds avoid feature unification. No recording, TLS, WAN, phone, energy or thermal qualification.",
+    linux="Loopback HTTP/1.1 inside one native linux/arm64 environment; full media viewers; generated 720p30 H.264/AAC. Server, FFmpeg publisher and load generator share its CPU and memory allocation. A separate cohort: Linux/epoll results are not comparable with macOS/kqueue receipts. CPU is utime plus stime from /proc at clock-tick resolution, as a percentage of one core; RSS is VmRSS and excludes kernel memory. Separate server and viewer builds avoid feature unification. No recording, TLS, WAN, phone, energy or thermal qualification.",
+)
+SLOW_NOTES = " Slow viewers are counted in the viewer total and read each response body at no more than the recorded rate; they are reported apart and excluded from the ordinary viewers' figures. Their request errors are recorded and do not fail a trial."
 
 
 def sha256(path):
@@ -36,11 +53,140 @@ def trial_order(variants, round_number):
     return variants[start:] + variants[:start]
 
 
-def parse_report(output, expected_viewers, *, expected_server, expected_seconds, expected_ramp=10):
+def read_optional(path):
+    """A file's text, stripped, or None when it is absent (cgroup v1, no os-release)."""
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def os_pretty_name(text):
+    """PRETTY_NAME from the text of /etc/os-release, or None."""
+    for line in (text or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "PRETTY_NAME":
+            try:
+                words = shlex.split(value)
+            except ValueError:
+                return value.strip() or None
+            return " ".join(words) or None
+    return None
+
+
+def parse_cpu_max(text):
+    """(quota, period) in microseconds from cgroup v2 cpu.max; the quota is None for "max"."""
+    fields = text.split()
+    if len(fields) != 2:
+        raise ValueError("unexpected cgroup cpu.max: " + repr(text))
+    quota = None if fields[0] == "max" else int(fields[0])
+    period = int(fields[1])
+    if period < 1 or (quota is not None and quota < 1):
+        raise ValueError("unexpected cgroup cpu.max: " + repr(text))
+    return quota, period
+
+
+def parse_memory_max(text):
+    """Bytes from cgroup v2 memory.max, or None for "max" (no limit)."""
+    value = text.strip()
+    if value == "max":
+        return None
+    limit = int(value)
+    if limit < 1:
+        raise ValueError("unexpected cgroup memory.max: " + repr(text))
+    return limit
+
+
+def effective_cpus(affinity, cpu_max):
+    """Cores usable as Rust's available_parallelism counts them: the affinity
+    mask, lowered to the cgroup CPU quota rounded up (at least one)."""
+    if cpu_max and cpu_max[0] is not None:
+        return min(affinity, max(1, -(-cpu_max[0] // cpu_max[1])))
+    return affinity
+
+
+def linux_host(*, read=None, cpu_count=None, affinity=None, kernel=None):
+    """What the receipt records of a Linux host or container in place of the macOS fields.
+
+    `read` returns a file's text, or None when absent; the other values default
+    to this process's own. The cgroup limits are those of its own cgroup (v2).
+    """
+    read = read_optional if read is None else read
+    cpu_count = os.cpu_count() if cpu_count is None else cpu_count
+    affinity = len(os.sched_getaffinity(0)) if affinity is None else affinity
+    kernel = platform.release() if kernel is None else kernel
+    cpu_text = read(CGROUP_CPU_MAX)
+    memory_text = read(CGROUP_MEMORY_MAX)
+    cpu_max = parse_cpu_max(cpu_text) if cpu_text is not None else None
+    return dict(
+        os=os_pretty_name(read(OS_RELEASE)), kernel=kernel,
+        logical_cpus=cpu_count, affinity_cpus=affinity,
+        cgroup_cpu_max=cpu_text,
+        cgroup_cpu_quota_cpus=cpu_max[0] / cpu_max[1] if cpu_max and cpu_max[0] is not None else None,
+        cgroup_memory_max=memory_text,
+        cgroup_memory_max_bytes=parse_memory_max(memory_text) if memory_text is not None else None,
+        effective_cpus=effective_cpus(affinity, cpu_max),
+    )
+
+
+def is_native_arm64(description, platform_name="m4"):
+    """Whether `file -b` describes a thin native ARM64 binary for the platform."""
+    if "x86_64" in description or "x86-64" in description:
+        return False
+    if platform_name == "linux":
+        return "ELF" in description and "aarch64" in description
+    return "arm64" in description
+
+
+def parse_ms(text):
+    """A millisecond figure from the loader, or None where it printed NaN (no samples)."""
+    value = float(text)
+    return value if math.isfinite(value) else None
+
+
+def parse_slow(block, viewers, expected_slow, expected_slow_rate):
+    """The slow-consumer section, which must be present exactly when slow viewers were planned."""
+    header = re.search(r"^slow viewers (\d+) of (\d+)  rate (\d+) B/s each; the figures above cover the other (\d+)$", block, re.M)
+    if not expected_slow:
+        if header or re.search(r"^slow ", block, re.M):
+            raise ValueError("unexpected slow viewer section")
+        return None
+    excluded = re.search(r"^slow excluded requests (\d+)  errors (\d+)$", block, re.M)
+    counts = re.search(r"^slow requests (\d+)  errors (\d+)  received ([\d.]+) MB$", block, re.M)
+    playlist = re.search(r"^slow playlist\s+n=(\d+)\s+p50 (\S+) ms  p99 (\S+) ms$", block, re.M)
+    segment = re.search(r"^slow segment\s+n=(\d+)\s+p50 (\S+) ms  p99 (\S+) ms$", block, re.M)
+    parts = re.search(r"^slow parts fetched (\d+)$", block, re.M)
+    if not all((header, excluded, counts, playlist, segment, parts)):
+        raise ValueError("incomplete benchmark output")
+    if tuple(map(int, header.groups())) != (expected_slow, viewers, expected_slow_rate, viewers - expected_slow):
+        raise ValueError("slow viewer workload differs from the planned measurement")
+    if int(counts[1]) == 0:
+        raise ValueError("no requests from the slow viewers")
+    kinds = {}
+    for kind, count in re.findall(r"^  slow error (.+): (\d+)$", block, re.M):
+        kinds[kind] = kinds.get(kind, 0) + int(count)
+    return dict(
+        viewers=expected_slow, rate_bytes_per_second=expected_slow_rate,
+        requests=int(counts[1]), errors=int(counts[2]), received_mb=float(counts[3]),
+        excluded_requests=int(excluded[1]), excluded_errors=int(excluded[2]),
+        error_kinds=kinds,
+        playlist=dict(n=int(playlist[1]), p50_ms=parse_ms(playlist[2]), p99_ms=parse_ms(playlist[3])),
+        segment=dict(n=int(segment[1]), p50_ms=parse_ms(segment[2]), p99_ms=parse_ms(segment[3])),
+        parts_fetched=int(parts[1]),
+    )
+
+
+def parse_report(output, expected_viewers, *, expected_server, expected_seconds, expected_ramp=10,
+                 expected_slow=0, expected_slow_rate=None):
     """Qualify the declared workload and sampling interval, not only sample counts.
 
     Allow the sampler at most one second or 2% of the planned interval, whichever
     is larger. This is a predeclared screening tolerance, not a timing guarantee.
+
+    With `expected_slow` viewers the figures are those of the other viewers, whose
+    part reach is out of `viewers - expected_slow`, and the slow viewers' own
+    section is required and returned under `slow`. Their request errors are
+    recorded, not refused: falling behind live is what they are there to show.
     """
     rows = []
     for block in output.split("--- ")[1:]:
@@ -61,7 +207,9 @@ def parse_report(output, expected_viewers, *, expected_server, expected_seconds,
         viewers = int(match[2])
         if tuple(map(int, workload.groups())) != (viewers, expected_seconds, expected_ramp):
             raise ValueError("viewer workload differs from the planned measurement")
-        if int(fanout[3]) != viewers or not 0 < float(fanout[2]) <= viewers:
+        slow = parse_slow(block, viewers, expected_slow, expected_slow_rate)
+        ordinary = viewers - expected_slow
+        if int(fanout[3]) != ordinary or not 0 < float(fanout[2]) <= ordinary:
             raise ValueError("part fan-out reach or viewer denominator is inconsistent")
         tolerance = max(1.0, expected_seconds * .02)
         if int(sampling[2]) != expected_seconds or abs(float(sampling[1]) - expected_seconds) > tolerance:
@@ -83,6 +231,8 @@ def parse_report(output, expected_viewers, *, expected_server, expected_seconds,
         )
         if any(isinstance(value, float) and not math.isfinite(value) for value in row.values()):
             raise ValueError("non-finite benchmark measurement")
+        if slow is not None:
+            row["slow"] = slow
         rows.append(row)
     if [row["viewers"] for row in rows] != expected_viewers:
         raise ValueError("missing, duplicate or unexpected viewer measurements")
@@ -103,6 +253,17 @@ def summary(runs):
         record["requests"] = sum(row["requests"] for row in rows)
         record["errors"] = sum(row["errors"] for row in rows)
         record["drained_requests"] = sum(row["drained_requests"] for row in rows)
+        if any("slow" in row for row in rows):
+            slow = [row["slow"] for row in rows]
+            kinds = {}
+            for item in slow:
+                for kind, count in item["error_kinds"].items():
+                    kinds[kind] = kinds.get(kind, 0) + count
+            record["slow"] = dict(
+                viewers=slow[0]["viewers"], rate_bytes_per_second=slow[0]["rate_bytes_per_second"],
+                requests=sum(item["requests"] for item in slow), errors=sum(item["errors"] for item in slow),
+                parts_fetched=sum(item["parts_fetched"] for item in slow), error_kinds=kinds,
+            )
         result.append(record)
     return result
 
@@ -147,7 +308,11 @@ def main():
     parser.add_argument("--viewers", nargs="+", type=int, default=[250, 750])
     parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--rounds", type=int, default=4, help="a multiple of the treatment count balances order positions")
-    parser.add_argument("--mediamtx", type=Path)
+    parser.add_argument("--mediamtx", type=Path, help="MediaMTX binary: arm64 Mach-O on --platform m4, ELF aarch64 on --platform linux")
+    parser.add_argument("--platform", choices=PLATFORMS, default="m4",
+                        help="m4: macOS on the Apple M4 Max (default); linux: native aarch64 Linux, e.g. a linux/arm64 container")
+    parser.add_argument("--slow", type=int, default=0, help="viewers (of each viewer count) that read slowly, reported apart from the others")
+    parser.add_argument("--slow-rate", type=int, help="bytes per second each slow viewer may read; required with --slow")
     args = parser.parse_args()
     if args.rounds < 1 or args.seconds < 10 or any(n < 1 for n in args.viewers):
         parser.error("positive rounds/viewers and at least ten measured seconds are required")
@@ -157,14 +322,34 @@ def main():
         parser.error("rounds must be a multiple of the treatment count for balanced ordering")
     if "mediamtx" in args.variants and not args.mediamtx:
         parser.error("--mediamtx is required for the mediamtx treatment")
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
-        parser.error("run with native ARM64 Python on the M4")
+    if args.slow < 0:
+        parser.error("--slow cannot be negative")
+    if args.slow and (args.slow_rate or 0) < 1:
+        parser.error("--slow needs a positive --slow-rate in bytes per second")
+    if args.slow_rate is not None and (args.slow_rate < 1 or not args.slow):
+        parser.error("--slow-rate must be positive and only applies with --slow N")
+    if args.slow and args.slow >= min(args.viewers):
+        parser.error("--slow must leave at least one ordinary viewer in the smallest viewer count")
+    if args.platform == "m4":
+        if platform.system() != "Darwin" or platform.machine() != "arm64":
+            parser.error("run with native ARM64 Python on the M4")
+    elif platform.system() != "Linux" or platform.machine() != "aarch64":
+        parser.error("--platform linux needs native aarch64 Linux, such as a linux/arm64 container")
     for tool in ("cargo", "rustc", "ffmpeg", "lsof", "file"):
         if not shutil.which(tool):
             parser.error("missing tool: " + tool)
-    chip = command("sysctl", "-n", "machdep.cpu.brand_string")
-    if "M4" not in chip:
-        parser.error("this screening requires the M4 test platform")
+    if args.platform == "m4":
+        chip = command("sysctl", "-n", "machdep.cpu.brand_string")
+        if "M4" not in chip:
+            parser.error("this screening requires the M4 test platform")
+        host = dict(cpu=chip, logical_cpus=os.cpu_count(), macos=command("sw_vers", "-productVersion"))
+        usable_cpus = os.cpu_count() or 4
+    else:
+        try:
+            host = linux_host()
+        except ValueError as error:
+            parser.error(str(error))
+        usable_cpus = host["effective_cpus"]
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     wanted = max(4096, soft)
     if hard != resource.RLIM_INFINITY:
@@ -175,11 +360,14 @@ def main():
     ensure_ports_unused()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    env = {key: value for key, value in os.environ.items() if not key.startswith("SAPFLOW_")}
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("SAPFLOW_") and key not in ("SLOW", "SLOW_RATE")}
     env.update(VIEWERS=" ".join(map(str, args.viewers)), SECS=str(args.seconds))
+    if args.slow:
+        env.update(SLOW=str(args.slow), SLOW_RATE=str(args.slow_rate))
     target = env.get("CARGO_BUILD_TARGET", "")
     release = ROOT / "target" / target / "release"
-    own_threads = min(256, os.cpu_count() or 4)
+    own_threads = min(256, usable_cpus)
     http_settings = {}
     for variant in args.variants:
         settings = {}
@@ -192,15 +380,16 @@ def main():
         tracked_changes=command("git", "status", "--porcelain", "--untracked-files=no"),
         tracked_diff_sha256=hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=ROOT)).hexdigest(),
         runner_sha256=sha256(__file__), bench_script_sha256=sha256(ROOT / "scripts/bench.sh"),
-        lock_sha256=sha256(ROOT / "Cargo.lock"), cpu=chip, logical_cpus=os.cpu_count(),
-        macos=command("sw_vers", "-productVersion"), rustc=command("rustc", "-Vv"),
+        lock_sha256=sha256(ROOT / "Cargo.lock"), platform=args.platform, **host,
+        rustc=command("rustc", "-Vv"),
         ffmpeg=command("ffmpeg", "-version").splitlines()[0], file_descriptor_limit=wanted,
         load_before=os.getloadavg(), measured_seconds=args.seconds, ramp_seconds=10,
         viewers=args.viewers, variants=args.variants, rounds=args.rounds,
+        slow_viewers=args.slow, slow_rate_bytes_per_second=args.slow_rate,
         http_settings=http_settings,
         collection="requests started inside a fixed post-ramp interval, with bounded completion drain; warm-up failures retained",
         sampler_tolerance_seconds=max(1.0, args.seconds * .02),
-        notes="Loopback HTTP/1.1; full media viewers; generated 720p30 H.264/AAC. Server and encoder/load generator share the host. RSS excludes kernel memory. Existing workloads remain running. Separate server and viewer builds avoid feature unification. No recording, TLS, WAN, phone, energy or thermal qualification.",
+        notes=NOTES[args.platform] + (SLOW_NOTES if args.slow else ""),
         runs=[],
     )
     save(output, data)
@@ -216,8 +405,8 @@ def main():
             data["mediamtx_version"] = command(str(binaries["mediamtx"]), "--version")
         for name, binary in binaries.items():
             architecture = command("file", "-b", str(binary))
-            if "arm64" not in architecture or "x86_64" in architecture:
-                raise ValueError(name + " must be a thin native ARM64 binary")
+            if not is_native_arm64(architecture, args.platform):
+                raise ValueError(name + " must be a thin native ARM64 binary" + (" (ELF aarch64)" if args.platform == "linux" else ""))
             data["binaries"][name] = dict(sha256=sha256(binary), bytes=binary.stat().st_size, architecture=architecture)
         for round_number in range(args.rounds):
             for variant in trial_order(args.variants, round_number):
@@ -240,7 +429,8 @@ def main():
                     raise RuntimeError(f"{raw.name}: runner exit {status}")
                 try:
                     rows = parse_report(raw.read_text(), args.viewers, expected_server=server,
-                        expected_seconds=args.seconds, expected_ramp=10)
+                        expected_seconds=args.seconds, expected_ramp=10,
+                        expected_slow=args.slow, expected_slow_rate=args.slow_rate)
                 except ValueError as error:
                     trial["failure"] = str(error)
                     raise

@@ -74,6 +74,7 @@ pub fn https_client(config: &ClientConfig, http2: bool) -> HttpsClient {
     } else {
         client
             .pool_max_idle_per_host(4)
+            .pool_idle_timeout(crate::POOL_IDLE)
             .build(connector.enable_http1().build())
     }
 }
