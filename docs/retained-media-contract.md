@@ -1,8 +1,10 @@
 # Retained HLS resource contract
 
-This follows the 24 October performance audit. The local follow-up to
-`30dedca` implements resident presentation admission, prompt close-time cache
-release, shared encoded-backing admission and absolute response deadlines.
+This follows the 24 October performance audit. PR #30 (`348bdf8`, merged to
+main as `39b3180` on 28 October) implements resident presentation admission,
+prompt close-time cache release, shared encoded-backing admission and absolute
+response deadlines. The two dated receipts below were written on its local
+branch before that merge and are kept as recorded.
 Matched nominal/adverse measurements and Linux audience qualification remain
 open. Recorder admission and muxer input limits cover different owners.
 
@@ -218,8 +220,10 @@ these tests nor the selected count default qualifies Linux audience capacity.
 
 The small-window setup also exposed an existing separate readiness problem:
 `has_content()` requires more than seven entries, so the permitted seven-entry
-configuration never becomes servable. These regressions use eight entries;
-repair and qualification of the minimum window remain open.
+configuration never becomes servable. These regressions use eight entries.
+Fixed on 29 October: `has_content()` now tests for a real newest entry, and a
+muxer regression covers the seven-entry window; the full smoke test also
+passes with `SAPFLOW_SEGMENT_COUNT=7`.
 
 ## Shared backing and response deadlines, 28 October 2026
 
@@ -293,4 +297,4 @@ slow consumers, sustained memory/descriptors, recording integrity and deadline
 scheduling under load. Wired Linux/Caddy/HTTP2 audience qualification, long
 fuzz campaigns and the production decision remain separate gates. Logical
 charges, process RSS and kernel memory must be reported separately. The
-seven-entry readiness problem above remains a separate open defect.
+seven-entry readiness problem above was fixed separately on 29 October.

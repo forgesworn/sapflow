@@ -17,8 +17,8 @@ For a new coding session, use the [Codex handover](codex-handover.md) for
 startup checks, the first implementation steps, source entry points and gates.
 The immediate queue is:
 
-- [ ] **Next server resource qualification, 2.6:** local follow-up to `30dedca`
-  implements resident presentation admission, whole-allocation shared backing
+- [ ] **Next server resource qualification, 2.6:** PR #30 (`348bdf8`, merged
+  28 October) implements resident presentation admission, whole-allocation shared backing
   charges, close-time cache release and absolute response deadlines. Generated
   correctness checks cover refusal, aliases, recording/recovery and slow
   responses. Complete matched nominal/adverse measurements with declared
