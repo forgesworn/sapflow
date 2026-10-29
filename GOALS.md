@@ -372,7 +372,7 @@ own network and privacy limits. TV delivery does not complete native B6.
 Implemented: RTMP publication admission, recorder bounds, reconnect grace and
 the own HTTP viewer loop. Hyper and Axum have been removed.
 
-Local task 2.6 progress from `30dedca`: resident presentation admission counts
+Task 2.6 implementation, merged in PR #30 (`348bdf8`): resident presentation admission counts
 through the final stream owner; close releases cached ingest and playlists
 after draining accepted input. Shared encoded init/fragment capacities are
 charged once through their final payload owner, and ready HTTP responses have
