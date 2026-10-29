@@ -1,5 +1,27 @@
 # Fuzz targets
 
+The nightly workflow fuzzes every Rust target for 20 minutes. For a longer
+campaign on GitHub's runners rather than a shared machine, run it by hand
+with a duration per target (60 to 19,800 seconds, within the six-hour job
+limit) and, optionally, only some targets:
+
+```sh
+gh workflow run fuzz-nightly.yml -f seconds=18000 \
+  -f targets="own_srt_packet own_srt_listener own_srt_caller"
+```
+
+Each target starts from a fresh corpus of its regressions and seeds, and a
+crash uploads its input as an artifact. Record the run, revision, targets and
+duration with the result; a campaign is evidence for that source only.
+
+| Date | Run | Revision | Seconds per target | Targets and runs | Result |
+|---|---|---|---|---|---|
+| 29 Oct 2026 | [40873370439](https://github.com/forgesworn/sapflow/actions/runs/40873370439) | `19a2124` (source as main `7d31de0`) | 18,000 | `own_srt_packet` 1,362,704,098; `own_srt_listener` 53,596,793; `own_srt_caller` 2,938,459; `rtmp_session` 49,899,804; `http1_request` 205,234,322; `http_lite` 1,090,948,023; `ts_ingest` 2,521,953; `flv_ingest` 34,283,027 | No crash, leak or timeout |
+
+Since that revision, main changed `Muxer::has_content`, which the ingest
+targets reach, and the server's chunk prefix. The SRT, RTMP and HTTP parsers
+are unchanged.
+
 The Python TV preview allowlist has a separate finite mutation target:
 `python3 -B fuzz/tv_preview_fuzz.py 20000`. It exercises bounded hostile
 manifests and resource/query paths without opening sockets or processing media.
