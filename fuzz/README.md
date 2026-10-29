@@ -1,5 +1,19 @@
 # Fuzz targets
 
+The nightly workflow fuzzes every Rust target for 20 minutes. For a longer
+campaign on GitHub's runners rather than a shared machine, run it by hand
+with a duration per target (60 to 19,800 seconds, within the six-hour job
+limit) and, optionally, only some targets:
+
+```sh
+gh workflow run fuzz-nightly.yml -f seconds=18000 \
+  -f targets="own_srt_packet own_srt_listener own_srt_caller"
+```
+
+Each target starts from a fresh corpus of its regressions and seeds, and a
+crash uploads its input as an artifact. Record the run, revision, targets and
+duration with the result; a campaign is evidence for that source only.
+
 The Python TV preview allowlist has a separate finite mutation target:
 `python3 -B fuzz/tv_preview_fuzz.py 20000`. It exercises bounded hostile
 manifests and resource/query paths without opening sockets or processing media.

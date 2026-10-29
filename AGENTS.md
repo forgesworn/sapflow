@@ -33,8 +33,9 @@ python3 scripts/third-party-licences.py   # after dependency changes
 
 CI (`.github/workflows/ci.yml`) runs the fmt, clippy and test commands above,
 the fuzz regressions plus 60 s per target, and
-`scripts/smoke.sh`. `fuzz-nightly.yml` fuzzes each target for 20 minutes. Keep
-the local commands and the workflow in step.
+`scripts/smoke.sh`. `fuzz-nightly.yml` fuzzes each target for 20 minutes; run
+it by hand for longer campaigns (below). Keep the local commands and the
+workflow in step.
 
 ## Rust builds: keep them tidy
 

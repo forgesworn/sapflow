@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
+    # Manual runs can fuzz longer, or only some targets, within GitHub's
+    # six-hour job limit. Scheduled runs keep 20 minutes for every target.
+    inputs:
+      seconds:
+        description: "Seconds per target, 60 to 19800"
+        default: "1200"
+      targets:
+        description: "Space-separated target names; empty for all"
+        default: ""
 
 permissions:
   contents: read
@@ -28,11 +37,19 @@ jobs:
         with:
           persist-credentials: false
       - id: list
+        env:
+          TARGETS: ${{ inputs.targets }}
         run: |
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
-          import json, tomllib
+          import json, os, sys, tomllib
           with open("fuzz/Cargo.toml", "rb") as f:
               names = [b["name"] for b in tomllib.load(f)["bin"]]
+          wanted = os.environ.get("TARGETS", "").split()
+          unknown = sorted(set(wanted) - set(names))
+          if unknown:
+              sys.exit("unknown fuzz targets: " + " ".join(unknown))
+          if wanted:
+              names = [n for n in names if n in wanted]
           print("matrix=" + json.dumps({"target": names}))
           PY
 
@@ -40,7 +57,8 @@ jobs:
     name: ${{ matrix.target }}
     needs: targets
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    # Expressions have no arithmetic: a manual run gets the six-hour maximum.
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 360 || 50 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
@@ -56,13 +74,17 @@ jobs:
           cache-bin: "true"
       - name: Install cargo-fuzz
         run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --version 0.13.2 --locked
-      - name: Fuzz for 20 minutes
+      - name: Fuzz
         working-directory: fuzz
         env:
           RUSTC_BOOTSTRAP: "1"
           TARGET: ${{ matrix.target }}
+          FUZZ_SECONDS: ${{ inputs.seconds || '1200' }}
         run: |
           set -euo pipefail
+          if ! [[ "$FUZZ_SECONDS" =~ ^[0-9]+$ ]] || (( FUZZ_SECONDS < 60 || FUZZ_SECONDS > 19800 )); then
+            echo "seconds must be 60 to 19800, not $FUZZ_SECONDS" >&2; exit 2
+          fi
           # A fresh corpus seeded from regressions and valid exchanges.
           corpus=$(mktemp -d)
           trap 'rm -rf "$corpus"' EXIT
@@ -72,7 +94,7 @@ jobs:
               if [ -f "$seed" ]; then cp "$seed" "$corpus/"; fi
             done
           fi
-          cargo fuzz run -O -a "$TARGET" "$corpus" -- -max_total_time=1200 -max_len=65536
+          cargo fuzz run -O -a "$TARGET" "$corpus" -- -max_total_time="$FUZZ_SECONDS" -max_len=65536
       - name: Upload crashes
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
