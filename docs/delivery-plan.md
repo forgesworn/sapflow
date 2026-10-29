@@ -123,7 +123,9 @@ Refresh open performance PRs [#14](https://github.com/forgesworn/sapflow/pull/14
 (evidence) and [#15](https://github.com/forgesworn/sapflow/pull/15) (Linux/slow-viewer
 harness) against current main and resolve their last failed native checks.
 Short screens and historical Hyper comparisons do not complete 2.1. Complete
-the encrypted SRT matrix and source-specific long fuzzing alongside this work.
+the encrypted SRT matrix alongside this work. A five-hour campaign on eight
+parser and ingest targets passed on 29 October ([fuzz receipts](../fuzz/README.md));
+repeat it on the selected trial build if parser code changes.
 
 Unblocks: switching production to sapflow by default.
 
