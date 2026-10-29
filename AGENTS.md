@@ -48,6 +48,54 @@ The Mac's disk is nearly full and Rust builds are large.
 - Run `scripts/tidy.sh` at the end of a session and `scripts/tidy.sh --clean`
   when `target/` passes a few GB or you are done for a while.
 - Worktrees each have their own `target/`; clean one before removing it.
+- Before cleaning a shared target, check for active builds, running binaries
+  and native packaging work. Preserve installed runtimes and release packages;
+  remove inactive compiler caches rather than keeping every build indefinitely.
+
+## Scratch and benchmark retention
+
+These rules apply to every clone, worktree and agent, including remote test
+hosts. Scratch space is temporary, not an evidence archive.
+
+- Keep small result summaries and handover notes by default. Record the source
+  revision, command, workload, relevant environment, result and limitations.
+  Do not retain raw output merely to prove that a check ran.
+- Delete task-owned raw logs, per-sample traces, media captures, temporary
+  generated fixtures and transfer archives after writing the summary. Clean up
+  failed and interrupted runs too, once their failure has been recorded. Do
+  this as part of finishing the task, without waiting for a separate cleanup
+  request.
+- Retain raw benchmark data only when the owner explicitly requests it for a
+  particular investigation. Record its purpose, size, location and cleanup
+  condition. An unresolved result is not blanket permission to retain every
+  run, source snapshot or archive.
+- Reuse existing tools and source checkouts. Do not copy whole source trees,
+  toolchains or build directories into each benchmark run. Remove task-owned
+  downloaded tools and copied executables when the task ends.
+- Do not embed whole source, tool or media bundles in generated launcher
+  scripts. Transfer only required files or small patches, and summarise
+  relevant build outputs instead of repeatedly inventorying whole targets.
+- Bound benchmark duration, log growth and output size before launching it.
+  Check available disk space and clean completed runs before starting more.
+  Stop or reduce diagnostics if output exceeds the planned storage budget.
+- Before removing copied source trees, preserve unique unfinished changes as
+  small patches or in their original checkout. Never discard unrelated work,
+  active processes, secrets or installed service runtimes during cleanup.
+- Check process arguments, working directories and open files before deleting
+  a candidate. Use Git's worktree removal procedure for linked worktrees;
+  never treat a checkout as disposable because it lives under `scratch/`.
+- Cleanup means reducing total stored data. Moving bulk output elsewhere or
+  retaining both an archive and its expanded contents does not count. Compact
+  notes or unique source changes when useful; do not archive raw benchmark
+  data as a substitute for deleting it.
+- At handover, report remaining scratch/build sizes, anything deliberately
+  retained and why, and any task-owned processes left running. Distinguish
+  files removed from measured free-space gain, since snapshots can retain
+  deleted blocks. Do not delete backup snapshots without explicit permission.
+
+Keep private summaries in ignored `*.local.md` files. Put reusable, non-private
+findings in the existing project documentation. Never commit raw camera media
+or private benchmark output.
 
 ## Conventions
 
