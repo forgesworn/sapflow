@@ -215,7 +215,15 @@ fn fresh_prefix() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{:x}", nanos & 0xffff_ffff_ffff)
+    prefix_from_nanos(nanos)
+}
+
+/// Twelve lowercase hex digits from the clock's low 48 bits. Zero-padded:
+/// for about five hours in every 78 the leading digit is zero, and players
+/// that accept exactly twelve digits (the TV player and receiver) refused
+/// every chunk of a stream started then.
+fn prefix_from_nanos(nanos: u128) -> String {
+    format!("{:012x}", nanos & 0xffff_ffff_ffff)
 }
 
 impl LiveStream {
@@ -787,6 +795,22 @@ mod retention_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_prefixes_are_always_twelve_hex_digits() {
+        // The leading zero case: 2026-10-29 12:31:16 UTC to 17:24:28 UTC.
+        assert_eq!(prefix_from_nanos(0x0175_955d_0500), "0175955d0500");
+        assert_eq!(prefix_from_nanos(0), "000000000000");
+        assert_eq!(prefix_from_nanos(u128::MAX), "ffffffffffff");
+        assert_eq!(prefix_from_nanos(0x1234_fe4b_1084_8000), "fe4b10848000");
+        let prefix = fresh_prefix();
+        assert_eq!(prefix.len(), 12);
+        assert!(
+            prefix
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+    }
 
     fn claim(reg: &Registry, p: &StreamPath) -> Option<(Arc<LiveStream>, u64, Claim)> {
         reg.claim(p, MuxerConfig::default(), SourceKind::Ts)

@@ -109,3 +109,22 @@ This simulated capability check is distinct from actual iOS WebKit or physical
 Safari acceptance. Public peers default on at Play with a visible opt-out;
 private preview remains forced off. The public-origin browser gate verifies
 the default and opt-out before playback without making external connections.
+
+## Chunk-prefix width defect, 29 October 2026
+
+Sapflow formatted each stream's chunk-name prefix from the low 48 bits of
+the clock in nanoseconds, without padding. For 2^44 ns (about 4.9 hours) in
+every 2^48 ns (about 78.2 hours) the leading hex digit is zero, so a stream
+started in that window got an eleven-digit prefix. The player and receiver
+accept exactly twelve digits: the receiver refused every mirrored asset and
+reported the channel off air for as long as that stream lasted. Earlier
+receipts here passed because they ran outside such a window. CI's TV peer
+browser check failed on unrelated branches from 12:31 UTC on 29 October. The
+next windows would have been 1 November 18:42 to 23:35 UTC and 5 November
+00:53 to 05:46 UTC.
+
+The fix zero-pads the prefix to twelve digits. A unit regression covers the
+leading-zero case, and the generated TV peer browser gate passed in CI inside
+the affected window. A deployed origin needs the fixed build: a stream keeps
+its prefix while it is live or held for a reconnect, so restarting with the
+fix gives every new stream twelve digits.
