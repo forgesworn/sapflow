@@ -122,6 +122,11 @@ rehearsal evidence: [trial-plan.md](trial-plan.md).
 Performance PRs [#14](https://github.com/forgesworn/sapflow/pull/14)
 (evidence) and [#15](https://github.com/forgesworn/sapflow/pull/15) (Linux/slow-viewer
 harness) merged on 29 October.
+On 30 October the 2.6 matched nominal/adverse measurements, a six-hour run
+with drops and a slow-reader check ran on Linux at 100 viewers; they found a
+silent incomplete-recording flag around SRT publishes, a timestamp step on
+resume after RTMP, and an out-of-memory kill when the retained-bytes cap
+exceeds the container limit ([retained-media contract](retained-media-contract.md)).
 Short screens and historical Hyper comparisons do not complete 2.1. Complete
 the encrypted SRT matrix alongside this work. A five-hour campaign on eight
 parser and ingest targets passed on 29 October ([fuzz receipts](../fuzz/README.md));
