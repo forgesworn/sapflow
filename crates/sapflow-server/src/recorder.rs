@@ -121,9 +121,83 @@ impl WriterReservation {
     }
 }
 
+/// Why a recording no longer describes the whole show. The first reason is
+/// kept: later ones follow from the same gap or add nothing a reader needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncompleteReason {
+    /// The SRT receiver dropped packets it could not recover.
+    TransportDrop = 1,
+    /// The SRT connection timed out rather than being closed by the publisher.
+    TransportTimeout,
+    /// Received SRT media did not fit the bounded ingest queue.
+    IngestQueueFull,
+    /// The RTMP wire parser rejected the connection.
+    Protocol,
+    /// The publisher exceeded the bitrate cap.
+    OverRate,
+    /// A scoped publication delivered media more than a second late.
+    StaleMedia,
+    /// The SRT listener stopped while the publisher was connected.
+    ListenerStopped,
+    /// Ingest discarded transport or PES packets during the stream.
+    IngestDiscard,
+    /// Ingest rejected the stream.
+    IngestError,
+    /// Ingest reported missing media during the stream.
+    MediaLoss,
+    /// Ingest found truncated or rejected media when the publisher's input ended.
+    EndOfInput,
+    /// The recording writer fell too far behind.
+    WriterBehind,
+    /// The recordings disk ran low.
+    DiskLow,
+}
+
+impl IncompleteReason {
+    const ALL: [Self; 13] = [
+        Self::TransportDrop,
+        Self::TransportTimeout,
+        Self::IngestQueueFull,
+        Self::Protocol,
+        Self::OverRate,
+        Self::StaleMedia,
+        Self::ListenerStopped,
+        Self::IngestDiscard,
+        Self::IngestError,
+        Self::MediaLoss,
+        Self::EndOfInput,
+        Self::WriterBehind,
+        Self::DiskLow,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TransportDrop => "srt-unrecovered-loss",
+            Self::TransportTimeout => "srt-timeout",
+            Self::IngestQueueFull => "srt-ingest-queue-full",
+            Self::Protocol => "rtmp-protocol-error",
+            Self::OverRate => "over-bitrate",
+            Self::StaleMedia => "stale-media",
+            Self::ListenerStopped => "srt-listener-stopped",
+            Self::IngestDiscard => "ingest-discarded-packets",
+            Self::IngestError => "ingest-error",
+            Self::MediaLoss => "media-loss",
+            Self::EndOfInput => "end-of-input-loss",
+            Self::WriterBehind => "writer-behind",
+            Self::DiskLow => "disk-low",
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| *reason as u8 == code)
+    }
+}
+
 #[derive(Default)]
-struct RecordingStatus {
+pub(crate) struct RecordingStatus {
     state: AtomicU8,
+    /// The first [`IncompleteReason`] as its code; zero while complete.
+    reason: AtomicU8,
 }
 
 impl RecordingStatus {
@@ -139,8 +213,19 @@ impl RecordingStatus {
             .is_ok()
     }
 
-    fn mark_incomplete(&self) -> bool {
-        self.mark(Self::INCOMPLETE)
+    fn mark_incomplete(&self, reason: IncompleteReason) -> bool {
+        let accepted = self.mark(Self::INCOMPLETE);
+        if accepted {
+            let _ =
+                self.reason
+                    .compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire);
+        }
+        accepted
+    }
+
+    /// The first reason this recording was marked incomplete.
+    pub(crate) fn reason(&self) -> Option<IncompleteReason> {
+        IncompleteReason::from_code(self.reason.load(Ordering::Acquire))
     }
 
     fn mark_fatal(&self) -> bool {
@@ -349,6 +434,7 @@ pub struct Recorder {
     observation: Option<RecordingObservation>,
     status: Arc<RecordingStatus>,
     budget: PartBudget,
+    path: StreamPath,
 }
 
 impl Recorder {
@@ -405,11 +491,13 @@ impl Recorder {
                 observation: None,
                 status,
                 budget,
+                path: plan.path,
             };
         };
         plan.callbacks = callbacks;
         Self {
             tx: None,
+            path: plan.path.clone(),
             pending: Some(plan),
             started: false,
             initialization_id: None,
@@ -434,16 +522,32 @@ impl Recorder {
 
     /// Preserve and sync the accepted prefix, but never describe it as a
     /// complete recording after a definite upstream media gap.
-    pub fn mark_incomplete(&self) {
-        if !self.status.mark_incomplete() {
+    pub fn mark_incomplete(&self, reason: IncompleteReason) {
+        let first = self.status.reason().is_none();
+        if !self.status.mark_incomplete(reason) {
             return;
         }
         // A rejected connection before its first Init creates no recording.
-        if self.started
-            && let Some(observation) = &self.observation
-        {
+        if !self.started {
+            return;
+        }
+        // A reason stored before the first Init is not logged here; the
+        // "recording finished" line always carries it.
+        if first {
+            tracing::warn!(
+                path = %self.path.as_path(),
+                reason = reason.as_str(),
+                "recording marked incomplete"
+            );
+        }
+        if let Some(observation) = &self.observation {
             observation.incomplete();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> Arc<RecordingStatus> {
+        self.status.clone()
     }
 
     /// Queues the init segment (once) and new parts.
@@ -547,7 +651,7 @@ impl Recorder {
                 observation.failed();
             }
         } else {
-            self.mark_incomplete();
+            self.mark_incomplete(IncompleteReason::WriterBehind);
         }
         tracing::error!("recording cannot accept another part; stopping this recording");
         self.tx = None;
@@ -595,9 +699,11 @@ impl Drop for WriteReceipt {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_recording(
     receipt: &mut WriteReceipt,
     complete: bool,
+    reason: Option<IncompleteReason>,
     callbacks: &Callbacks,
     path: &StreamPath,
     file_path: &Path,
@@ -612,7 +718,13 @@ fn publish_recording(
         }
     }
     receipt.completed = true;
-    tracing::info!(file = %file_path.display(), secs = duration.as_secs_f64(), complete, "recording finished");
+    tracing::info!(
+        file = %file_path.display(),
+        secs = duration.as_secs_f64(),
+        complete,
+        reason = reason.map(IncompleteReason::as_str),
+        "recording finished"
+    );
     // Scoped callbacks distinguish a complete file from a synced prefix. The
     // legacy event continues to mean only that a file has finished.
     callbacks.send(
@@ -795,7 +907,7 @@ impl RecordingWriter {
                 parts += 1;
                 if parts.is_multiple_of(50) && !space_ok(&self.dir, self.min_free).await {
                     tracing::error!(file = %file_path.display(), "recordings disk nearly full; recording stops here");
-                    self.status.mark_incomplete();
+                    self.status.mark_incomplete(IncompleteReason::DiskLow);
                     if let Some(observation) = &self.observation {
                         observation.incomplete();
                     }
@@ -834,6 +946,7 @@ impl RecordingWriter {
         publish_recording(
             &mut receipt,
             complete,
+            self.status.reason(),
             &self.callbacks,
             &self.path,
             file_path,
@@ -1296,7 +1409,7 @@ mod tests {
             let mut recorder = factory.start();
             recorder.feed(tracks.clone(), vec![part]);
             if generation == 2 {
-                recorder.mark_incomplete();
+                recorder.mark_incomplete(IncompleteReason::MediaLoss);
             }
             drop(recorder);
             drop(factory);
@@ -1796,7 +1909,7 @@ mod tests {
     fn recording_status(incomplete: bool) -> Arc<RecordingStatus> {
         let status = Arc::new(RecordingStatus::default());
         if incomplete {
-            status.mark_incomplete();
+            status.mark_incomplete(IncompleteReason::MediaLoss);
         }
         status
     }
@@ -1860,13 +1973,38 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_reason_keeps_the_first_cause_until_commit() {
+        let status = RecordingStatus::default();
+        assert_eq!(status.reason(), None);
+        assert!(status.mark_incomplete(IncompleteReason::EndOfInput));
+        assert!(status.mark_incomplete(IncompleteReason::TransportDrop));
+        assert_eq!(status.reason(), Some(IncompleteReason::EndOfInput));
+        assert_eq!(status.try_commit(), Some(false));
+
+        let committed = RecordingStatus::default();
+        assert_eq!(committed.try_commit(), Some(true));
+        assert!(!committed.mark_incomplete(IncompleteReason::DiskLow));
+        assert_eq!(committed.reason(), None, "a published decision is frozen");
+    }
+
+    #[test]
+    fn incomplete_reason_codes_round_trip_with_distinct_names() {
+        let mut names = std::collections::HashSet::new();
+        for reason in IncompleteReason::ALL {
+            assert_eq!(IncompleteReason::from_code(reason as u8), Some(reason));
+            assert!(names.insert(reason.as_str()), "{reason:?}");
+        }
+        assert_eq!(IncompleteReason::from_code(0), None);
+    }
+
+    #[test]
     fn publication_commit_freezes_complete_incomplete_and_fatal_decisions() {
         for incomplete in [false, true] {
             let status = recording_status(incomplete);
             assert_eq!(status.try_commit(), Some(!incomplete));
             assert!(!status.accepts_input());
             assert!(!status.mark_fatal());
-            assert!(!status.mark_incomplete());
+            assert!(!status.mark_incomplete(IncompleteReason::MediaLoss));
             assert!(!status.is_fatal());
             assert_eq!(status.try_commit(), None, "publication is claimed once");
         }
@@ -1894,6 +2032,7 @@ mod tests {
                     observation: None,
                     status: recording_status(false),
                     budget: PartBudget::new(retained_bytes, MAX_FILE_FRAGMENT_BYTES),
+                    path: StreamPath::parse("live/event-a").expect("path"),
                 },
                 receiver,
             )
@@ -1901,7 +2040,7 @@ mod tests {
 
         let (mut count_limited, count_rx) = make_recorder(2, size * 3);
         assert!(count_limited.is_accepting());
-        count_limited.mark_incomplete();
+        count_limited.mark_incomplete(IncompleteReason::MediaLoss);
         assert!(
             count_limited.is_accepting(),
             "upstream gaps can keep recording"
@@ -1960,7 +2099,7 @@ mod tests {
                 let mut recorder = Recorder::start(&scratch.0, &scope.key().path, callbacks, 0);
                 recorder.feed(tracks, parts);
                 if incomplete {
-                    recorder.mark_incomplete();
+                    recorder.mark_incomplete(IncompleteReason::MediaLoss);
                 }
                 drop(recorder);
                 let queued = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
@@ -2005,7 +2144,7 @@ mod tests {
         let scope = crate::publish_observer::fixture_scope("a", 1, 1, 1);
         let (callbacks, receiver) = crate::callback::test_queue(scope.clone(), 1);
         let recorder = Recorder::start(&scratch.0, &scope.key().path, callbacks, 0);
-        recorder.mark_incomplete();
+        recorder.mark_incomplete(IncompleteReason::MediaLoss);
         drop(recorder);
         tokio::task::yield_now().await;
         assert_eq!(scope.observations.recording_state(), "never-started");
@@ -2142,6 +2281,7 @@ mod tests {
             observation,
             status: recording_status(false),
             budget: PartBudget::new(RETAINED_PART_BYTES, MAX_FILE_FRAGMENT_BYTES),
+            path: scope.key().path.clone(),
         };
         let (tracks, parts) = fixture_parts();
         let first_id = parts[0].id;
@@ -2443,6 +2583,7 @@ mod tests {
                     observation: observation.clone(),
                     status: status.clone(),
                     budget,
+                    path: scope.key().path.clone(),
                 };
                 recorder.feed(tracks.clone(), vec![first.clone()]);
                 assert_eq!(input.len(), 2, "count queue is full");
@@ -2677,6 +2818,7 @@ mod tests {
                     observation: observation.clone(),
                     status: status.clone(),
                     budget: PartBudget::new(size * 3, size),
+                    path: scope.key().path.clone(),
                 };
                 recorder.feed(tracks.clone(), vec![first.clone()]);
                 assert!(matches!(input.try_recv(), Ok(Msg::Init(_))));
@@ -2705,7 +2847,7 @@ mod tests {
                 // Model low-space shutdown: the writer closes its receiver
                 // while the producer can still hold a sender and call feed.
                 input.close();
-                assert!(status.mark_incomplete());
+                assert!(status.mark_incomplete(IncompleteReason::DiskLow));
                 if let Some(observation) = &observation {
                     observation.incomplete();
                 }
@@ -2727,7 +2869,7 @@ mod tests {
                 let decision = status.try_commit();
                 if !fatal_first {
                     recorder.feed(tracks.clone(), vec![oversized]);
-                    recorder.mark_incomplete();
+                    recorder.mark_incomplete(IncompleteReason::MediaLoss);
                     assert!(!status.is_fatal(), "committed input decisions are frozen");
                 }
                 let mut receipt = WriteReceipt {
@@ -2739,6 +2881,7 @@ mod tests {
                     publish_recording(
                         &mut receipt,
                         complete,
+                        status.reason(),
                         &callbacks,
                         &scope.key().path,
                         Path::new("recording.mp4"),

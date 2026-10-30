@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 use crate::App;
 use crate::publish::{Publication, PublicationLoss};
 use crate::publish_sessions::ScopedLease;
+use crate::recorder::IncompleteReason;
 use crate::srt::{IDLE, Refused, admit, feed};
 
 const QUEUE: usize = 16_384;
@@ -30,8 +31,8 @@ impl Publisher {
     fn closed(self, reason: Option<CloseReason>, dropped: u64) {
         // `lost` also counts recovered loss. Only irrecoverable drops, or
         // an abnormal transport timeout, make this prefix incomplete.
-        if incomplete_close(reason, dropped) {
-            self.loss.mark_incomplete();
+        if let Some(cause) = incomplete_close(reason, dropped) {
+            self.loss.mark_incomplete(cause);
         }
         if let Some(scope) = self.scope {
             scope.protocol_stopped();
@@ -42,7 +43,7 @@ impl Publisher {
         match self.tx.try_send(payload) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.loss.mark_incomplete();
+                self.loss.mark_incomplete(IncompleteReason::IngestQueueFull);
                 false
             }
             // End/revoke may already have closed admission normally.
@@ -50,8 +51,14 @@ impl Publisher {
         }
     }
 }
-fn incomplete_close(reason: Option<CloseReason>, dropped: u64) -> bool {
-    dropped != 0 || matches!(reason, Some(CloseReason::Timeout))
+fn incomplete_close(reason: Option<CloseReason>, dropped: u64) -> Option<IncompleteReason> {
+    if dropped != 0 {
+        Some(IncompleteReason::TransportDrop)
+    } else if matches!(reason, Some(CloseReason::Timeout)) {
+        Some(IncompleteReason::TransportTimeout)
+    } else {
+        None
+    }
 }
 struct Engine {
     listener: Listener,
@@ -63,7 +70,9 @@ impl Drop for Engine {
         // message. Native protocol state is destroyed before its receipt says
         // stopped, and dropping senders lets independent media owners finish.
         for (id, publisher) in &self.publishers {
-            publisher.loss.mark_incomplete();
+            publisher
+                .loss
+                .mark_incomplete(IncompleteReason::ListenerStopped);
             self.listener.close(*id, Instant::now());
             if let Some(scope) = &publisher.scope {
                 scope.protocol_stopped();
@@ -320,7 +329,9 @@ async fn cancelled(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) {
 }
 fn reject_stale(publication: &Publication, received: Instant, scoped: bool) -> bool {
     if scoped && received.elapsed() > std::time::Duration::from_secs(1) {
-        publication.loss_notice().mark_incomplete();
+        publication
+            .loss_notice()
+            .mark_incomplete(IncompleteReason::StaleMedia);
         true
     } else {
         false
@@ -377,6 +388,13 @@ mod tests {
                 loss: publication.loss_notice(),
             };
             let incomplete = !matches!(cause, "closed" | "shutdown");
+            let status = publication
+                .stream
+                .session()
+                .recorder
+                .as_ref()
+                .expect("recording started")
+                .status();
             match cause {
                 "full" => {
                     assert!(publisher.enqueue(Payload {
@@ -414,6 +432,15 @@ mod tests {
                     drop(engine);
                 }
             }
+            let expected = match cause {
+                "full" => Some(IncompleteReason::IngestQueueFull),
+                "dropped" => Some(IncompleteReason::TransportDrop),
+                "timeout" => Some(IncompleteReason::TransportTimeout),
+                "age" => Some(IncompleteReason::StaleMedia),
+                "engine" => Some(IncompleteReason::ListenerStopped),
+                _ => None,
+            };
+            assert_eq!(status.reason(), expected, "{cause}");
             publication.end();
             fixture
                 .completion(if incomplete {

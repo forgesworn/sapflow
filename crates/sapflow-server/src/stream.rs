@@ -13,7 +13,7 @@ use sapflow_hls::{
     FlvIngest, IngestError, Muxer, MuxerConfig, PartLookup, TsIngest, Update, playlist,
 };
 
-use crate::recorder::{Recorder, RecorderFactory};
+use crate::recorder::{IncompleteReason, Recorder, RecorderFactory};
 use tokio::sync::watch;
 
 pub struct LiveStream {
@@ -159,11 +159,11 @@ impl Session {
     }
 
     /// Ignore delayed notices from an older connection after replacement.
-    pub fn mark_recording_incomplete(&self, generation: u64) {
+    pub fn mark_recording_incomplete(&self, generation: u64, reason: IncompleteReason) {
         if self.generation == generation
             && let Some(recorder) = &self.recorder
         {
-            recorder.mark_incomplete();
+            recorder.mark_incomplete(reason);
         }
     }
 
@@ -408,7 +408,7 @@ impl LiveStream {
             Err(_) => true,
         };
         if loss {
-            session.mark_recording_incomplete(session.generation);
+            session.mark_recording_incomplete(session.generation, IncompleteReason::EndOfInput);
         }
         if result.is_ok_and(|update| update.restarted) {
             session.recorder = session
@@ -416,7 +416,7 @@ impl LiveStream {
                 .as_ref()
                 .map(RecorderFactory::start);
             if loss {
-                session.mark_recording_incomplete(session.generation);
+                session.mark_recording_incomplete(session.generation, IncompleteReason::EndOfInput);
             }
         }
         if let Some(recorder) = &mut session.recorder

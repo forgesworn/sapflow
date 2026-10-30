@@ -290,9 +290,21 @@ async fn terminal_truncation_and_semantic_errors_taint_only_the_accepted_prefix(
             _ => wire.extend(start(pid, ADTS44, 18, 91_920, 1)),
         }
         feed(&mut publication, &wire);
+        let status = publication
+            .stream
+            .session()
+            .recorder
+            .as_ref()
+            .expect("recording started")
+            .status();
         publication.end();
         let body = completion(&mut fixture, "incomplete").await;
         assert_eq!(recording_samples(&body), 1, "valid prefix, {failure}");
+        assert_eq!(
+            status.reason(),
+            Some(IncompleteReason::EndOfInput),
+            "{failure}"
+        );
         assert_eq!(fixture.scope.observations.counts().recordings_finalised, 0);
     }
 }
