@@ -127,7 +127,9 @@ cargo run --release -p sapflow
 Publish to `srt://<host>:8890?streamid=publish:live/<eventId>:<publisher>:<password>`
 or `rtmp://<host>:1935/live` with key `<eventId>?user=<publisher>&pass=<password>`,
 and play `http://<host>:8888/live/<eventId>/index.m3u8`. `sapflow --help`
-lists every setting.
+lists every setting. To give every gig its own key, set
+`SAPFLOW_PUBLISH_AUTH_URL` instead of the user and password, and sapflow asks
+the app about each publisher ([the v4v contract](docs/v4v-contract.md#publish-authorisation)).
 
 For a continuously looping folder of prepared videos, see the
 [TV channel guide](docs/tv-channel.md), including separate live gig paths and an

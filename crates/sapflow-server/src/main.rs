@@ -10,6 +10,7 @@ mod http_lite;
 mod media_body;
 mod own_http;
 mod publish;
+mod publish_auth;
 mod publish_control;
 mod publish_observer;
 mod publish_session_store;
@@ -112,7 +113,9 @@ async fn run(config: Config) -> std::io::Result<()> {
     } else {
         tracing::info!(before, after, "open-file limit");
     }
-    if config.publisher.is_none() && config.control.is_none() {
+    if config.publish_auth.is_some() {
+        tracing::info!("publishers are authorised by the app (SAPFLOW_PUBLISH_AUTH_URL)");
+    } else if config.publisher.is_none() && config.control.is_none() {
         tracing::warn!("SAPFLOW_OPEN_PUBLISH=1: anyone can publish to any stage path");
     }
     if config.callback_url.is_none() {

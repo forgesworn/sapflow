@@ -28,6 +28,10 @@ pub enum Refusal {
     PresentationLimit,
     /// Too many failed attempts from this address recently.
     Throttled,
+    /// The app that authorises publishers (`SAPFLOW_PUBLISH_AUTH_URL`) gave
+    /// no usable answer: unreachable, too slow, or neither 2xx nor 401/403.
+    /// Carries nothing the app said.
+    AuthUnavailable,
 }
 
 /// A live publisher went over the bitrate cap and is dropped.
@@ -109,6 +113,12 @@ impl Publication {
         if app.publish_sessions.is_some() {
             return Err(Refusal::Request(PublishError::Unauthorized));
         }
+        // With app authorisation there is no local publisher, which this
+        // entry point would read as open publishing. Fail closed: only
+        // `begin_authorised` may admit in that mode.
+        if app.config.publish_auth.is_some() {
+            return Err(Refusal::Request(PublishError::Unauthorized));
+        }
         let throttle = || app.auth_throttle.lock().unwrap_or_else(|e| e.into_inner());
         if !throttle().allowed(from, Instant::now()) {
             return Err(Refusal::Throttled);
@@ -129,13 +139,57 @@ impl Publication {
         )
     }
 
+    /// Like `begin`, but asks the app first when `SAPFLOW_PUBLISH_AUTH_URL`
+    /// is set: the RTMP and unscoped SRT entry point. Only a 401 or 403
+    /// counts against the address's throttle; an app that is down or slow
+    /// refuses without locking an encoder out.
+    pub async fn begin_authorised(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        kind: SourceKind,
+        from: IpAddr,
+    ) -> Result<Self, Refusal> {
+        let Some(endpoint) = &app.config.publish_auth else {
+            return Self::begin(app, req, kind, from);
+        };
+        if app.publish_sessions.is_some() {
+            return Err(Refusal::Request(PublishError::Unauthorized));
+        }
+        let throttle = || app.auth_throttle.lock().unwrap_or_else(|e| e.into_inner());
+        if !throttle().allowed(from, Instant::now()) {
+            return Err(Refusal::Throttled);
+        }
+        let protocol = match kind {
+            SourceKind::Ts => crate::publish_auth::Protocol::Srt,
+            SourceKind::Flv => crate::publish_auth::Protocol::Rtmp,
+        };
+        use crate::publish_auth::Verdict;
+        match crate::publish_auth::ask(endpoint, req, protocol, from).await {
+            Verdict::Admitted => {}
+            Verdict::Denied => {
+                throttle().failed(from, Instant::now());
+                return Err(Refusal::Request(PublishError::Unauthorized));
+            }
+            Verdict::Throttled => return Err(Refusal::Throttled),
+            Verdict::Unavailable => return Err(Refusal::AuthUnavailable),
+        }
+        Self::claim(
+            app,
+            req,
+            kind,
+            None,
+            app.config.max_publish_bps,
+            app.config.reconnect_grace,
+        )
+    }
+
     pub async fn begin_srt(
         app: &Arc<App>,
         req: &PublishRequest,
         from: IpAddr,
     ) -> Result<Self, Refusal> {
         let Some(manager) = &app.publish_sessions else {
-            return Self::begin(app, req, SourceKind::Ts, from);
+            return Self::begin_authorised(app, req, SourceKind::Ts, from).await;
         };
         if !app
             .auth_throttle

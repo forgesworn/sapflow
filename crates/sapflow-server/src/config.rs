@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::http_lite::Endpoint;
 use crate::publish_session_wire::Secret;
 use sapflow_core::Publisher;
 use sapflow_core::recording::{RecordPolicy, parse_age};
@@ -34,8 +35,12 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_CONTROL_TOKEN    dedicated control bearer (32..256 ASCII token bytes)
   SAPFLOW_SESSION_STORE    absolute metadata file in an existing private directory
                            (all three required; disables global/open publishing)
+  Outside scoped mode, choose exactly one way to authorise publishers:
   SAPFLOW_PUBLISH_USER     the one publisher allowed to push
   SAPFLOW_PUBLISH_PASS     its password
+  SAPFLOW_PUBLISH_AUTH_URL ask the app about each publisher instead: an http://
+                           URL (no TLS; keep it on the private network) that
+                           gets mediamtx's HTTP auth request; 2xx admits
   SAPFLOW_OPEN_PUBLISH     set to 1 to accept any publisher (local testing only)
   SAPFLOW_CALLBACK_URL     stream-health callback; {eventId}, {path} and
                            {token} are substituted
@@ -81,6 +86,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_HTTP_ADDR",
     "SAPFLOW_PUBLISH_USER",
     "SAPFLOW_PUBLISH_PASS",
+    "SAPFLOW_PUBLISH_AUTH_URL",
     "SAPFLOW_OPEN_PUBLISH",
     "SAPFLOW_CALLBACK_URL",
     "SAPFLOW_CALLBACK_SECRET",
@@ -124,8 +130,12 @@ pub struct Config {
     pub srt_allow_plaintext: bool,
     pub rtmp_addr: Option<SocketAddr>,
     pub http_addr: SocketAddr,
-    /// `None` only when open publishing was asked for explicitly.
+    /// `None` when open publishing was asked for explicitly, in scoped mode,
+    /// or when the app authorises each publisher (`publish_auth`).
     pub publisher: Option<Publisher>,
+    /// Ask the app about each publisher (`SAPFLOW_PUBLISH_AUTH_URL`). The URL
+    /// carries the app's token; `Endpoint`'s Debug never prints it.
+    pub publish_auth: Option<Endpoint>,
     pub callback_url: Option<String>,
     pub callback_secret: Option<String>,
     pub segment_count: usize,
@@ -230,8 +240,10 @@ impl Config {
             _ => return Err(ConfigError::Invalid("SAPFLOW_CONTROL_ADDR, SAPFLOW_CONTROL_TOKEN and SAPFLOW_SESSION_STORE must be configured together".into())),
         };
         let open = vals.get("SAPFLOW_OPEN_PUBLISH").is_some_and(|v| v == "1");
+        let publish_auth_url = vals.get("SAPFLOW_PUBLISH_AUTH_URL");
         if control.is_some()
             && (open
+                || publish_auth_url.is_some()
                 || vals.contains_key("SAPFLOW_PUBLISH_USER")
                 || vals.contains_key("SAPFLOW_PUBLISH_PASS")
                 || srt_crypto.is_some()
@@ -240,17 +252,42 @@ impl Config {
                 || vals.contains_key("SAPFLOW_SRT_ENCRYPTION")
                 || vals.get("SAPFLOW_RTMP_ADDR").is_some_and(|v| v != "off"))
         {
-            return Err(ConfigError::Invalid("scoped control mode requires per-session encrypted SRT; global/open publishing, global SRT keys and RTMP are disabled".into()));
+            return Err(ConfigError::Invalid("scoped control mode requires per-session encrypted SRT; global/open/app-authorised publishing, global SRT keys and RTMP are disabled".into()));
+        }
+        // The URL carries the app's token: no error below repeats it.
+        let publish_auth = match publish_auth_url {
+            None => None,
+            Some(url)
+                if url
+                    .get(..8)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("https://")) =>
+            {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_PUBLISH_AUTH_URL must be http:// (sapflow has no TLS client; keep it on the private network)".into(),
+                ));
+            }
+            Some(url) => Some(Endpoint::parse(url).ok_or_else(|| {
+                ConfigError::Invalid("SAPFLOW_PUBLISH_AUTH_URL: not a usable http:// URL".into())
+            })?),
+        };
+        if publish_auth.is_some()
+            && (open
+                || vals.contains_key("SAPFLOW_PUBLISH_USER")
+                || vals.contains_key("SAPFLOW_PUBLISH_PASS"))
+        {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_PUBLISH_AUTH_URL replaces SAPFLOW_PUBLISH_USER/PASS and SAPFLOW_OPEN_PUBLISH; set only one".into(),
+            ));
         }
         let publisher = match (
             vals.get("SAPFLOW_PUBLISH_USER"),
             vals.get("SAPFLOW_PUBLISH_PASS"),
         ) {
             (Some(u), Some(p)) => Some(Publisher::new(u, p)),
-            (None, None) if open || control.is_some() => None,
+            (None, None) if open || control.is_some() || publish_auth.is_some() => None,
             (None, None) => {
                 return Err(ConfigError::Invalid(
-                    "set SAPFLOW_PUBLISH_USER and SAPFLOW_PUBLISH_PASS (or SAPFLOW_OPEN_PUBLISH=1 for local testing)".into(),
+                    "set SAPFLOW_PUBLISH_USER and SAPFLOW_PUBLISH_PASS, or SAPFLOW_PUBLISH_AUTH_URL (or SAPFLOW_OPEN_PUBLISH=1 for local testing)".into(),
                 ));
             }
             _ => {
@@ -486,6 +523,7 @@ impl Config {
             srt_addr: addr("SAPFLOW_SRT_ADDR", "0.0.0.0:8890")?,
             http_addr: addr("SAPFLOW_HTTP_ADDR", "0.0.0.0:8888")?,
             publisher,
+            publish_auth,
             callback_url,
             callback_secret: vals.get("SAPFLOW_CALLBACK_SECRET").cloned(),
             segment_count,
@@ -1104,6 +1142,97 @@ mod tests {
             assert!(load(&base, &args).is_err());
         }
         assert!(load(&base, &["--control-addr=[::1]:9000", "--rtmp-addr=off"]).is_ok());
+    }
+
+    #[test]
+    fn app_authorisation_is_its_own_mode_and_never_prints_its_token() {
+        let url = (
+            "SAPFLOW_PUBLISH_AUTH_URL",
+            "http://app:5181/api/media/publish-auth?token=app-secret-token&server=sapflow",
+        );
+        let config = load(&[url], &[]).expect("app-authorised config");
+        let endpoint = config.publish_auth.as_ref().expect("endpoint");
+        assert_eq!((endpoint.host.as_str(), endpoint.port), ("app", 5181));
+        assert_eq!(
+            endpoint.target(),
+            "/api/media/publish-auth?token=app-secret-token&server=sapflow"
+        );
+        assert!(config.publisher.is_none());
+        assert!(config.control.is_none());
+        assert!(config.rtmp_addr.is_some());
+        assert!(!format!("{config:?}").contains("app-secret-token"));
+        // The flag form, and an empty value means unset as for every setting.
+        assert!(
+            load(&[], &["--publish-auth-url=http://app/auth?token=t"])
+                .expect("flag")
+                .publish_auth
+                .is_some()
+        );
+        assert!(
+            load(
+                &[
+                    ("SAPFLOW_OPEN_PUBLISH", "1"),
+                    ("SAPFLOW_PUBLISH_AUTH_URL", "")
+                ],
+                &[]
+            )
+            .expect("empty")
+            .publish_auth
+            .is_none()
+        );
+        assert!(load(&[("SAPFLOW_PUBLISH_AUTH_URL", "")], &[]).is_err());
+        // Exactly one of the three publisher modes.
+        for extra in [
+            vec![("SAPFLOW_OPEN_PUBLISH", "1")],
+            vec![("SAPFLOW_PUBLISH_USER", "u"), ("SAPFLOW_PUBLISH_PASS", "p")],
+            vec![("SAPFLOW_PUBLISH_USER", "u")],
+            vec![("SAPFLOW_PUBLISH_PASS", "p")],
+        ] {
+            let mut env = vec![url];
+            env.extend(extra);
+            let Err(ConfigError::Invalid(error)) = load(&env, &[]) else {
+                panic!("conflicting publisher modes accepted: {env:?}")
+            };
+            assert!(
+                error.contains("set only one") || error.contains("go together"),
+                "{error}"
+            );
+            assert!(!error.contains("app-secret-token"));
+        }
+        // An unusable or TLS URL stops startup without echoing the token.
+        for bad in [
+            "https://app/auth?token=app-secret-token",
+            "HTTPS://app/auth?token=app-secret-token",
+            "ftp://app/auth?token=app-secret-token",
+            "http://app:0/auth?token=app-secret-token",
+            "http://app/auth?token=app secret token",
+            "app/auth?token=app-secret-token",
+        ] {
+            let Err(ConfigError::Invalid(error)) = load(&[("SAPFLOW_PUBLISH_AUTH_URL", bad)], &[])
+            else {
+                panic!("bad URL accepted: {bad}")
+            };
+            assert!(error.starts_with("SAPFLOW_PUBLISH_AUTH_URL"), "{error}");
+            assert!(!error.contains("app-secret-token"), "{error}");
+        }
+        assert!(HELP.contains("SAPFLOW_PUBLISH_AUTH_URL"));
+    }
+
+    #[test]
+    fn scoped_mode_refuses_app_authorisation() {
+        let env = [
+            ("SAPFLOW_CONTROL_ADDR", "127.0.0.1:9000"),
+            (
+                "SAPFLOW_CONTROL_TOKEN",
+                "independent-control-token-32-bytes-minimum",
+            ),
+            ("SAPFLOW_SESSION_STORE", "/private/session-authority.json"),
+            ("SAPFLOW_PUBLISH_AUTH_URL", "http://app/auth?token=t"),
+        ];
+        assert!(matches!(
+            load(&env, &[]),
+            Err(ConfigError::Invalid(m)) if m.contains("scoped control mode")
+        ));
     }
 
     #[test]
