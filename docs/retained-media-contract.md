@@ -334,7 +334,7 @@ newest segment every second; the server was sampled every minute.
   lasting 4501.4 s (three), 2557.9 s and 1500.5 s (three). Every file decoded;
   each 4501 s file has one decoder message at the RTMP-to-SRT resume (see
   the reconnect timing finding below). Two of the seven were finished as
-  `complete=false` with no logged cause (see below).
+  `complete=false` with no logged cause at the time (see below).
 
 ### Matched nominal and adverse load
 
@@ -388,15 +388,21 @@ The same high-bitrate run found a memory limit that does not hold (finding 4).
    | SRT, RTMP | 5 of 12 | none |
    | SRT, SRT | 6 of 12 | none |
 
-   The flag follows the start of an SRT publish (about 40%) and, less often,
-   its end (about 17%); the media in flagged files decode no worse than the
-   rest. The marking paths (`push_open` in `crates/sapflow-server/src/publish.rs`
-   on dropped packets, ingest error or `media_loss`, and `finish` in
-   `stream.rs`) log nothing, so the cause is not yet identified. Under the
+   The cause, found by logging each marking reason
+   ([#39](https://github.com/forgesworn/sapflow/pull/39)), is loss at end of
+   input after a clean SRT stop: in about half of SRT publishes the TS stream
+   ended partway through a bounded audio PES, which the parser reports as
+   truncated, with every SRT close a clean `shutdown` and no packet lost. The
+   sender discards its unsent tail on close; with ffmpeg's `linger=1` no
+   recording was flagged. Packets never sent carry no sequence numbers, so
+   the SRT layer cannot see the gap. The media in flagged files decode no
+   worse than the rest. Under the
    [scoped-session contract](scoped-publish-sessions.md) an incomplete
-   recording must not advertise a complete-show replay, so a clean show
-   published over SRT could lose its replay. The maintainer should decide
-   whether this blocks a trial; logging the reason is the first step.
+   recording must not advertise a complete-show replay, so a show whose SRT
+   encoder stops this way loses its replay, including at the show's final
+   stop. Whether to trim a truncated tail after a clean close is the
+   maintainer's decision (#39); whether Larix and OBS truncate on stop is
+   untested.
 2. **Display time steps back when a stream resumes after RTMP.** Every resume
    that follows an RTMP publish gives one or two decoder messages (two per
    file in the table above, one in each 4501 s soak file). In a frame dump the old run's
