@@ -1,4 +1,6 @@
-//! The stream-health callback to v4v: the only outbound call sapflow makes.
+//! The stream-health callback to v4v. With `SAPFLOW_PUBLISH_AUTH_URL` set,
+//! sapflow makes one other outbound call, the publish authorisation request
+//! (`publish_auth.rs`), over the same one-shot `POST` below.
 //!
 //! Events go through one queue and are sent in order, so an `unpublish`
 //! never overtakes the `publish` before it.
@@ -205,7 +207,7 @@ pub(crate) fn test_queue(
 /// Why an attempt got no status. Neither carries the error text: it may
 /// contain the secret-bearing URL.
 #[derive(Debug, PartialEq, Eq)]
-enum Failure {
+pub(crate) enum Failure {
     Timeout,
     Transport,
 }
@@ -255,7 +257,11 @@ async fn post(endpoint: &Endpoint, body: &[u8]) -> std::io::Result<u16> {
     }
 }
 
-async fn attempt(endpoint: &Endpoint, body: &[u8], limit: Duration) -> Result<u16, Failure> {
+pub(crate) async fn attempt(
+    endpoint: &Endpoint,
+    body: &[u8],
+    limit: Duration,
+) -> Result<u16, Failure> {
     match tokio::time::timeout(limit, post(endpoint, body)).await {
         Ok(Ok(status)) => Ok(status),
         Ok(Err(_)) => Err(Failure::Transport),

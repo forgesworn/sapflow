@@ -3,7 +3,9 @@
 //! The handshake and chunk protocol are ours (`sapflow_rtmp`,
 //! sans-IO); this is the socket loop and the policy. Credentials ride in
 //! the stream key's query (`<eventId>?user=..&pass=..`) and are checked
-//! when the encoder asks to publish, before any media is accepted.
+//! when the encoder asks to publish, before any media is accepted: against
+//! the configured publisher, or by asking the app
+//! (`SAPFLOW_PUBLISH_AUTH_URL`) while this connection waits.
 
 use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, SocketAddr};
@@ -115,7 +117,7 @@ async fn connection(app: &Arc<App>, mut sock: TcpStream, from: IpAddr) -> Result
         let mut failed = None;
         loop {
             match rtmp.poll() {
-                Ok(Some(ev)) => match conn.event(&mut rtmp, ev) {
+                Ok(Some(ev)) => match conn.event(&mut rtmp, ev).await {
                     Ok(done) => {
                         if done {
                             finished = true;
@@ -188,12 +190,18 @@ struct Conn<'a> {
 impl Conn<'_> {
     /// Handles one session event; returns whether the connection is done
     /// (the publisher finished, or was refused).
-    fn event(&mut self, rtmp: &mut Connection, ev: Event) -> Result<bool, End> {
+    /// A publish request may wait on the app (`SAPFLOW_PUBLISH_AUTH_URL`),
+    /// bounded by its own timeout; nothing else here awaits.
+    async fn event(&mut self, rtmp: &mut Connection, ev: Event) -> Result<bool, End> {
         match ev {
             Event::Publish { app, key } => {
-                let begun = PublishRequest::parse_rtmp(&app, &key)
-                    .map_err(Refusal::Request)
-                    .and_then(|req| Publication::begin(self.app, &req, SourceKind::Flv, self.from));
+                let begun = match PublishRequest::parse_rtmp(&app, &key) {
+                    Err(e) => Err(Refusal::Request(e)),
+                    Ok(req) => {
+                        Publication::begin_authorised(self.app, &req, SourceKind::Flv, self.from)
+                            .await
+                    }
+                };
                 match begun {
                     Ok(p) => {
                         self.publication = Some(p);
@@ -388,7 +396,7 @@ mod tests {
         assert_eq!(active.load(Ordering::Relaxed), 0);
     }
 
-    fn negotiate_capacity_fixture(
+    async fn negotiate_capacity_fixture(
         conn: &mut Conn<'_>,
         key: &str,
     ) -> (Result<(), sapflow_rtmp::client::ClientError>, Vec<u8>, bool) {
@@ -408,6 +416,7 @@ mod tests {
             while let Some(event) = server.poll().expect("actual server parser") {
                 done = conn
                     .event(&mut server, event)
+                    .await
                     .expect("actual connection policy");
                 if done {
                     break;
@@ -429,8 +438,8 @@ mod tests {
         panic!("bounded 32-exchange handshake did not terminate");
     }
 
-    #[test]
-    fn setup_slots_remain_independent_and_publication_capacity_is_visible_on_the_wire() {
+    #[tokio::test]
+    async fn setup_slots_remain_independent_and_publication_capacity_is_visible_on_the_wire() {
         let mut fixture = crate::publish::loss_tests::Fixture::new();
         let app = Arc::get_mut(&mut fixture.app).expect("sole App");
         app.config.recordings = None;
@@ -462,15 +471,17 @@ mod tests {
         };
         assert!(
             negotiate_capacity_fixture(&mut first, "event-one")
+                .await
                 .0
                 .is_ok()
         );
         assert!(
             negotiate_capacity_fixture(&mut second, "event-two")
+                .await
                 .0
                 .is_ok()
         );
-        let (result, wire, done) = negotiate_capacity_fixture(&mut refused, "event-three");
+        let (result, wire, done) = negotiate_capacity_fixture(&mut refused, "event-three").await;
         assert!(
             matches!(result, Err(sapflow_rtmp::client::ClientError::Refused(code))
             if code == "NetStream.Publish.Denied")
@@ -491,8 +502,59 @@ mod tests {
         assert!(fixture.callbacks.is_empty());
     }
 
-    #[test]
-    fn resident_capacity_refusal_is_visible_on_the_actual_rtmp_wire() {
+    #[tokio::test]
+    async fn app_authorisation_decides_an_rtmp_publish_on_the_wire() {
+        use crate::publish_auth::stub::{self, Answer};
+        for (answer, admitted) in [
+            (Answer::Status(200), true),
+            (Answer::Status(401), false),
+            (Answer::Status(503), false),
+        ] {
+            let stub = stub::start(answer).await;
+            let mut fixture = crate::publish::loss_tests::Fixture::new();
+            let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+            app.config.recordings = None;
+            app.config.publish_auth = Some(stub.endpoint.clone());
+            let mut conn = Conn {
+                app: &fixture.app,
+                from: "127.0.0.1".parse().expect("loopback"),
+                publication: None,
+            };
+            let (result, _, done) =
+                negotiate_capacity_fixture(&mut conn, "event-one?user=encoder&pass=gig-secret")
+                    .await;
+            assert_eq!(result.is_ok(), admitted);
+            assert_eq!(conn.publication.is_some(), admitted);
+            if !admitted {
+                assert!(done);
+                assert!(
+                    matches!(result, Err(sapflow_rtmp::client::ClientError::Refused(code))
+                    if code == "NetStream.Publish.Denied")
+                );
+            }
+            let sent = stub.last();
+            assert_eq!(
+                (
+                    &sent["user"],
+                    &sent["password"],
+                    &sent["path"],
+                    &sent["protocol"]
+                ),
+                (
+                    &"encoder".into(),
+                    &"gig-secret".into(),
+                    &"live/event-one".into(),
+                    &"rtmp".into()
+                )
+            );
+            if let Some(publication) = conn.publication.take() {
+                publication.end();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resident_capacity_refusal_is_visible_on_the_actual_rtmp_wire() {
         let mut fixture = crate::publish::loss_tests::Fixture::new();
         let app = Arc::get_mut(&mut fixture.app).expect("sole App");
         app.config.recordings = None;
@@ -505,6 +567,7 @@ mod tests {
         };
         assert!(
             negotiate_capacity_fixture(&mut first, "event-first")
+                .await
                 .0
                 .is_ok()
         );
@@ -513,7 +576,7 @@ mod tests {
             from,
             publication: None,
         };
-        let (result, wire, done) = negotiate_capacity_fixture(&mut refused, "event-next");
+        let (result, wire, done) = negotiate_capacity_fixture(&mut refused, "event-next").await;
         assert!(
             matches!(result, Err(sapflow_rtmp::client::ClientError::Refused(code)) if code == "NetStream.Publish.Denied")
         );
@@ -531,6 +594,7 @@ mod tests {
         };
         assert!(
             negotiate_capacity_fixture(&mut recovered, "event-next")
+                .await
                 .0
                 .is_ok()
         );

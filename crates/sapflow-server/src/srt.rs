@@ -53,6 +53,8 @@ impl Refused {
             Self::Policy(Refusal::Request(PublishError::Unauthorized)) => 401,
             Self::Policy(Refusal::Request(PublishError::BadPath)) => 404,
             Self::Policy(Refusal::AlreadyLive) => 409,
+            // The app that authorises publishers did not answer usably.
+            Self::Policy(Refusal::AuthUnavailable) => 503,
             Self::Policy(
                 Refusal::Throttled | Refusal::PublisherLimit | Refusal::PresentationLimit,
             )
@@ -122,6 +124,7 @@ mod tests {
                 404,
             ),
             (Refused::Policy(Refusal::AlreadyLive), 409),
+            (Refused::Policy(Refusal::AuthUnavailable), 503),
             (Refused::Policy(Refusal::Throttled), 402),
             (Refused::Policy(Refusal::PublisherLimit), 402),
             (Refused::Policy(Refusal::PresentationLimit), 402),

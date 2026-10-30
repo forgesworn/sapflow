@@ -11,8 +11,50 @@ a corresponding V4V connector. These are separate integration contracts.
 
 - Every stage stream is `live/<eventId>`, with `<eventId>` matching
   `event-[a-z0-9-]+` (`PULSEWIRE_LIVE_STREAM_ID_TEMPLATE={eventId}`).
-- Only the configured publisher may push to those paths. Anyone may read HLS
+- Only the configured publisher, or one the app admits for that path (below),
+  may push to those paths. Anyone may read HLS
   (v4v enforces its closed beta itself, in front).
+
+## Publish authorisation
+
+Two ways to decide who may publish, outside scoped sessions; set exactly one
+(sapflow refuses to start with both, or with either and
+`SAPFLOW_OPEN_PUBLISH=1`):
+
+- `SAPFLOW_PUBLISH_USER` and `SAPFLOW_PUBLISH_PASS`: one shared publisher for
+  every path. Any gig's credentials publish to every gig.
+- `SAPFLOW_PUBLISH_AUTH_URL`: ask the app about each publisher, the request
+  mediamtx's `authMethod: http` sends, so one app endpoint serves both media
+  servers and each gig can have its own key. Scoped publish sessions
+  (`SAPFLOW_CONTROL_ADDR`) refuse it, as they refuse the shared publisher.
+
+```
+POST http://<app-host>:5181/api/media/publish-auth?token=<app-token>&server=sapflow
+content-type: application/json
+
+{"user":"<user>","password":"<password>","ip":"<publisher address>","action":"publish",
+ "path":"live/<eventId>","protocol":"srt","id":null,"query":""}
+```
+
+- `user` and `password` are what the publisher gave, from either SRT stream
+  id form (`publish:live/<eventId>:<user>:<pass>` or
+  `#!::m=publish,r=live/<eventId>,u=<user>,s=<pass>`) or the RTMP key's
+  `?user=&pass=` query (percent-decoded). Missing ones are sent empty.
+- `protocol` is `srt` or `rtmp`. `query` is always empty: sapflow does not
+  keep the raw query or stream id, and the password is already in
+  `password`. `id` is always `null`.
+- Any 2xx admits. 401 or 403 refuses and counts as a failed attempt against
+  sapflow's own throttle (10 a minute per address). 429 refuses without
+  counting. Any other status, no answer within 3 s, or a connection that
+  fails refuses without counting. There is one attempt and no retry; a
+  redirect is not followed; the answer's body is never read.
+- `http://` only: sapflow has no TLS client, so keep this on the private
+  network. The whole URL is treated as a secret and never logged, and
+  neither is the password.
+- SRT refusals reach the caller as `PREDEFINED:401` (refused),
+  `PREDEFINED:402` (throttled, by sapflow or the app) or `PREDEFINED:503`
+  (the app did not answer usably). RTMP refusals are
+  `NetStream.Publish.Denied`.
 
 ## Ingest addresses v4v hands to encoders
 

@@ -299,8 +299,9 @@ fn valid_response_framing(
     true
 }
 
-/// Where a callback goes, from an `http://` URL.
-#[derive(PartialEq, Eq)]
+/// Where a callback or a publish authorisation request goes, from an
+/// `http://` URL.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Endpoint {
     /// The host to connect to, without brackets.
     pub host: String,
