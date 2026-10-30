@@ -25,9 +25,9 @@ The immediate queue is:
   limits under the [retained-media contract](retained-media-contract.md).
   Its defaults are selected policies, not measured operating guarantees;
   task 2.6 remains open for qualification.
-- [ ] **Then server qualification, 2.1 to 2.5:** refresh performance PRs #14
-  and #15 against the selected main revision and resolve their failed native
-  checks. Complete wired Linux/Caddy/HTTP2 load, Safari delay and rollback
+- [ ] **Then server qualification, 2.1 to 2.5:** performance evidence PR #14
+  and harness PR #15 merged on 29 October with current-main CI passing.
+  Complete wired Linux/Caddy/HTTP2 load, Safari delay and rollback
   tests before a real V4V show and the maintainer's production decision.
 - [ ] **Next TV acceptance, TV1:** reserve the physical iPhone and name the
   tested build. Pass track changes, a full programme loop, Stop and
@@ -119,9 +119,9 @@ rehearsal evidence: [trial-plan.md](trial-plan.md).
 | 2.5 | The show itself, with a qualified encoder such as Larix | Maintainer runs; server work watches | 2.1 to 2.4, current ingest gates and rehearsed rollback | Show and replay complete, or rollback is executed and timed; maintainer records the production decision |
 | 2.6 | Bound retained HLS paths/bytes and slow-viewer ownership | Server work | Retained-media contract and existing admission controls | Exhaustion, final-owner release, reconnect/codec changes, incomplete recordings and slow-response deadlines pass; accounting and RSS stay separate |
 
-Refresh open performance PRs [#14](https://github.com/forgesworn/sapflow/pull/14)
+Performance PRs [#14](https://github.com/forgesworn/sapflow/pull/14)
 (evidence) and [#15](https://github.com/forgesworn/sapflow/pull/15) (Linux/slow-viewer
-harness) against current main and resolve their last failed native checks.
+harness) merged on 29 October.
 Short screens and historical Hyper comparisons do not complete 2.1. Complete
 the encrypted SRT matrix alongside this work. A five-hour campaign on eight
 parser and ingest targets passed on 29 October ([fuzz receipts](../fuzz/README.md));
@@ -154,7 +154,7 @@ Goal: other people can build on our crates and SDK. Work queue LQ1 to LQ8 in
 |---|------|-------|-------|-----------|
 | 4.1 | Complete existing SDK contracts and compatibility policy | App and SDK work | Current direct C ABI and Swift/Kotlin consumers | Ownership, threads, cancellation, errors and supported toolchains are documented and exercised by current consumers |
 | 4.2 | Qualify public installable packages: Swift Package Manager and Maven | App work; maintainer publishes | 4.1 | Fresh external installs run examples; actual archives include required notices and usable covered-source access |
-| 4.3 | Complete repeatable interoperability and performance scorecard | Server work | Existing scripts and evidence; refreshed PRs #14/#15 | Supported OBS/FFmpeg/encrypted SRT/RTMPS profiles are repeatable; complete-path and physical measurements retain their scope |
+| 4.3 | Complete repeatable interoperability and performance scorecard | Server work | Existing scripts and evidence; merged PRs #14/#15 | Supported OBS/FFmpeg/encrypted SRT/RTMPS profiles are repeatable; complete-path and physical measurements retain their scope |
 | 4.4 | A second real consumer of the libraries, besides our app | Server work or app work | 4.2 | Built only from the public interface |
 | 4.5 | Decide on an OBS adapter, then scenes, mixing and a desktop studio | Maintainer | 4.3 | Written decisions with scope and acceptance |
 | 4.6 | Finish the repository homepage proposal | Maintainer reviews; server work prepares | Reviewed current page and publication instruction | A project homepage is live and linked from the repository; its GitHub homepage field was still empty at this review |

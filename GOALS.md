@@ -395,9 +395,8 @@ qualification remains open in the resource contract below.
 - [ ] Revalidate rollout and viewer recovery, then complete one real V4V show
   with mediamtx ready and an explicit maintainer production decision.
 
-As of this review, performance evidence PR #14 and harness PR #15 remain open.
-Their last native CI checks failed; refresh them against current main before
-accepting them. Screening runs do not establish the wired deployment result.
+Performance evidence PR #14 and harness PR #15 merged on 29 October, with
+current-main CI passing. Screening runs do not establish the wired deployment result.
 The [readiness assessment](docs/readiness.md) and
 [trial plan](docs/trial-plan.md) retain the switch gate.
 
