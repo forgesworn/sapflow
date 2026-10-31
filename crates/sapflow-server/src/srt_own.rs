@@ -30,9 +30,15 @@ struct Publisher {
 impl Publisher {
     fn closed(self, reason: Option<CloseReason>, dropped: u64) {
         // `lost` also counts recovered loss. Only irrecoverable drops, or
-        // an abnormal transport timeout, make this prefix incomplete.
-        if let Some(cause) = incomplete_close(reason, dropped) {
-            self.loss.mark_incomplete(cause);
+        // an abnormal transport timeout, make this prefix incomplete. A peer
+        // SHUTDOWN without drops is clean: senders that discard unsent data
+        // on close can still cut the final audio PES short, which the
+        // terminal drain may then trim. This runs before `tx` drops, so it
+        // precedes that drain.
+        match incomplete_close(reason, dropped) {
+            Some(cause) => self.loss.mark_incomplete(cause),
+            None if matches!(reason, Some(CloseReason::Shutdown)) => self.loss.mark_clean_close(),
+            None => {}
         }
         if let Some(scope) = self.scope {
             scope.protocol_stopped();
@@ -441,6 +447,12 @@ mod tests {
                 _ => None,
             };
             assert_eq!(status.reason(), expected, "{cause}");
+            // Only a peer SHUTDOWN without drops allows tail trimming.
+            assert_eq!(
+                publication.stream.session().closed_cleanly(),
+                cause == "shutdown",
+                "{cause}"
+            );
             publication.end();
             fixture
                 .completion(if incomplete {
@@ -449,6 +461,45 @@ mod tests {
                     "finalised"
                 })
                 .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_shutdown_trims_a_cut_off_final_audio_pes_but_a_dropped_close_does_not() {
+        use crate::publish::loss_tests::Fixture;
+        // A sender that discards unsent data on close stops mid-PES: cut the
+        // generated A/V fixture three packets into its final audio PES.
+        let fixture_ts = include_bytes!("../../sapflow-hls/tests/fixtures/testsrc-3s.ts");
+        let packets: Vec<&[u8]> = fixture_ts.chunks_exact(188).collect();
+        let pid = |p: &[u8]| (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
+        let last_audio = packets
+            .iter()
+            .rposition(|p| pid(p) == 257 && p[1] & 0x40 != 0)
+            .expect("fixture audio PES");
+        let cut = packets[last_audio..]
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| pid(p) == 257)
+            .nth(3)
+            .map(|(i, _)| last_audio + i)
+            .expect("multi-packet audio PES");
+        let wire = packets[..cut].concat();
+        for (dropped, state) in [(0, "finalised"), (1, "incomplete")] {
+            let mut fixture = Fixture::new();
+            let mut publication = fixture.begin();
+            for datagram in wire.chunks(1316) {
+                feed(&mut publication, datagram).expect("accepted prefix");
+            }
+            let (tx, _rx) = mpsc::channel(1);
+            // As in serve: the close notice precedes the worker's terminal drain.
+            Publisher {
+                tx,
+                scope: None,
+                loss: publication.loss_notice(),
+            }
+            .closed(Some(CloseReason::Shutdown), dropped);
+            publication.end();
+            fixture.completion(state).await;
         }
     }
 

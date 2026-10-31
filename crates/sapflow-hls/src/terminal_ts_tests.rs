@@ -552,3 +552,94 @@ fn stuffed_header_payload_completes_normally_on_continuation_or_next_start() {
         assert_eq!(ingest.dropped_packets(), 0);
     }
 }
+
+#[test]
+fn clean_close_trims_only_a_final_audio_pes_the_sender_cut_short() {
+    let (mut wire, pid) = tables();
+    wire.extend(start_at(pid, 0xc0, 18, ADTS, 90_000, 0));
+    // The second PES advertises ten payload bytes; its continuation never came.
+    wire.extend(start_at(pid, 0xc0, 18, &ADTS[..8], 91_920, 1));
+    let mut strict = TsIngest::new(MuxerConfig::default());
+    strict
+        .push(&wire, NOW)
+        .expect("truncated bounded PES waits");
+    assert!(strict.finish(NOW).expect("strict EOF").media_loss);
+    assert!(!strict.trimmed_audio_tail());
+    let mut clean = TsIngest::new(MuxerConfig::default());
+    clean.push(&wire, NOW).expect("truncated bounded PES waits");
+    let update = clean
+        .finish_after_clean_close(NOW)
+        .expect("clean transport close");
+    assert!(update.part && !update.media_loss);
+    assert!(clean.trimmed_audio_tail());
+    assert_eq!(samples(&clean), 1, "the cut-off PES is never emitted");
+    assert_eq!(clean.dropped_packets(), 0);
+    assert_eq!(
+        clean.finish_after_clean_close(NOW).expect("repeat finish"),
+        Update::default()
+    );
+}
+
+#[test]
+fn clean_close_still_reports_every_other_terminal_loss() {
+    // Partial TS packet, truncated bounded video, video plus audio truncation,
+    // an earlier continuity gap, and a truncated ADTS frame in a whole PES.
+    let (tables, pid, other) = tables_with_extra_audio_pid();
+    let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+    cases.push(("partial TS", start(pid, 0xc0, 18, ADTS)[..100].to_vec()));
+    cases.push(("video", start(pid, 0xe0, 30, ADTS)));
+    let mut both = start(pid, 0xc0, 19, ADTS);
+    both.extend(start(other, 0xe0, 30, ADTS));
+    cases.push(("audio and video", both));
+    let mut gap = start(pid, 0xc0, 18, &ADTS[..8]);
+    gap.extend(continuation(pid, 2, &ADTS[8..]));
+    cases.push(("continuity gap", gap));
+    let mut adts = ADTS.to_vec();
+    adts.extend(&ADTS[..8]);
+    cases.push(("truncated ADTS", start(pid, 0xc0, 26, &adts)));
+    for (name, tail) in cases {
+        let mut wire = tables.clone();
+        wire.extend(start_at(pid, 0xc0, 18, ADTS, 88_080, 15));
+        wire.extend(tail);
+        let mut ingest = TsIngest::new(MuxerConfig::default());
+        ingest.push(&wire, NOW).expect("accepted prefix");
+        let update = ingest.finish_after_clean_close(NOW).expect("finish");
+        assert!(update.media_loss, "{name}");
+        assert!(!ingest.trimmed_audio_tail(), "{name}");
+    }
+}
+
+#[test]
+fn clean_close_trims_a_real_av_stream_cut_inside_its_last_audio_pes() {
+    // A sender that discards unsent data on close stops mid-PES. Cut the
+    // generated fixture a few packets into its final audio PES.
+    let fixture = include_bytes!("../tests/fixtures/testsrc-3s.ts");
+    let packets: Vec<&[u8]> = fixture.chunks_exact(188).collect();
+    let pid = |p: &[u8]| (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
+    let last_audio_start = packets
+        .iter()
+        .rposition(|p| pid(p) == 257 && p[1] & 0x40 != 0)
+        .expect("fixture audio PES");
+    let cut = packets[last_audio_start..]
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| pid(p) == 257)
+        .nth(3)
+        .map(|(i, _)| last_audio_start + i)
+        .expect("multi-packet audio PES");
+    let wire: Vec<u8> = packets[..cut].concat();
+    let mut strict = TsIngest::new(MuxerConfig::default());
+    strict.push(&wire, NOW).expect("accepted prefix");
+    assert!(strict.finish(NOW).expect("strict EOF").media_loss);
+    let mut clean = TsIngest::new(MuxerConfig::default());
+    clean.push(&wire, NOW).expect("accepted prefix");
+    assert!(
+        !clean
+            .finish_after_clean_close(NOW)
+            .expect("clean close")
+            .media_loss
+    );
+    assert!(clean.trimmed_audio_tail());
+    assert_eq!(samples(&clean), samples(&strict));
+    assert!(samples(&clean) > 0);
+}

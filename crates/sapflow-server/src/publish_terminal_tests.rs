@@ -310,6 +310,40 @@ async fn terminal_truncation_and_semantic_errors_taint_only_the_accepted_prefix(
 }
 
 #[tokio::test]
+async fn clean_transport_close_trims_only_a_cut_off_final_audio_pes() {
+    for failure in ["pes", "ts", "asc"] {
+        let mut fixture = Fixture::new();
+        let mut publication = fixture.begin();
+        let (mut wire, pid) = tables();
+        wire.extend(start(pid, ADTS48, 18, 90_000, 0));
+        match failure {
+            "pes" => wire.extend(start(pid, ADTS48, 19, 91_920, 1)),
+            "ts" => wire.extend(&start(pid, ADTS48, 18, 91_920, 1)[..50]),
+            _ => wire.extend(start(pid, ADTS44, 18, 91_920, 1)),
+        }
+        feed(&mut publication, &wire);
+        let status = publication
+            .stream
+            .session()
+            .recorder
+            .as_ref()
+            .expect("recording started")
+            .status();
+        publication.loss_notice().mark_clean_close();
+        publication.end();
+        let trimmed = failure == "pes";
+        let body = completion(
+            &mut fixture,
+            if trimmed { "finalised" } else { "incomplete" },
+        )
+        .await;
+        assert_eq!(recording_samples(&body), 1, "valid prefix, {failure}");
+        let expected = (!trimmed).then_some(IncompleteReason::EndOfInput);
+        assert_eq!(status.reason(), expected, "{failure}");
+    }
+}
+
+#[tokio::test]
 async fn stale_generation_cannot_finish_or_feed_its_successor_parser_or_recorder() {
     let mut fixture = Fixture::new();
     let mut old = fixture.begin();

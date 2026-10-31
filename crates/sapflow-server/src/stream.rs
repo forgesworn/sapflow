@@ -115,13 +115,19 @@ impl Source {
 
     /// Drain only input already accepted by this connection. This is not a
     /// media admission path and must also run after a scoped gate is revoked.
-    fn finish(&mut self, now: SystemTime) -> Result<Update, IngestError> {
+    /// `clean_close` lets TS trim a final audio PES the sender cut short.
+    fn finish(&mut self, now: SystemTime, clean_close: bool) -> Result<Update, IngestError> {
         match self {
+            Self::Ts(ts) if clean_close => ts.finish_after_clean_close(now),
             Self::Ts(ts) => ts.finish(now),
             Self::Flv(flv) => Ok(flv
                 .muxer_mut()
                 .map_or_else(Update::default, |m| m.interrupt(now))),
         }
+    }
+
+    fn trimmed_audio_tail(&self) -> bool {
+        matches!(self, Self::Ts(ts) if ts.trimmed_audio_tail())
     }
 }
 
@@ -151,6 +157,8 @@ pub struct Session {
     pub recorder: Option<Recorder>,
     pub recorder_factory: Option<RecorderFactory>,
     outage_deadline: Option<Instant>,
+    /// The generation whose transport reported an orderly, lossless close.
+    clean_close: Option<u64>,
 }
 
 impl Session {
@@ -165,6 +173,19 @@ impl Session {
         {
             recorder.mark_incomplete(reason);
         }
+    }
+
+    /// The transport of `generation` closed in order with nothing dropped.
+    /// This marks nothing complete by itself: it only lets the terminal drain
+    /// trim a final audio PES that the sender cut short.
+    pub fn mark_clean_close(&mut self, generation: u64) {
+        if self.generation == generation {
+            self.clean_close = Some(generation);
+        }
+    }
+
+    pub fn closed_cleanly(&self) -> bool {
+        self.clean_close == Some(self.generation)
     }
 
     pub fn hold_remaining(&mut self, grace: Duration, now: Instant) -> Duration {
@@ -253,6 +274,7 @@ impl LiveStream {
                 recorder: None,
                 recorder_factory: None,
                 outage_deadline: None,
+                clean_close: None,
             }),
             version: watch::Sender::new(0),
             fragments,
@@ -397,7 +419,17 @@ impl LiveStream {
             if state.closed {
                 return;
             }
-            let result = state.ingest.finish(SystemTime::now());
+            // Repeated finishes return early; log the trim only once.
+            let trimmed_before = state.ingest.trimmed_audio_tail();
+            let result = state
+                .ingest
+                .finish(SystemTime::now(), session.closed_cleanly());
+            if !trimmed_before && state.ingest.trimmed_audio_tail() {
+                tracing::info!(
+                    path = %self.path.as_path(),
+                    "trimmed a final audio packet the sender cut short at a clean close"
+                );
+            }
             // finish can seal an accepted prefix before returning a semantic
             // error. Its immutable media still needs rendering and feeding.
             Self::render(&mut state);
@@ -1006,6 +1038,7 @@ mod grace_tests {
             recorder: None,
             recorder_factory: None,
             outage_deadline: None,
+            clean_close: None,
         };
         let grace = Duration::from_secs(90);
         assert_eq!(session.hold_remaining(grace, now), grace);
