@@ -14,12 +14,15 @@ use tokio::task::JoinSet;
 use crate::App;
 use crate::publish::{Publication, PublicationLoss};
 use crate::publish_sessions::ScopedLease;
-use crate::srt::{IDLE, Refused, admit, feed};
+use crate::recorder::IncompleteReason;
+use crate::srt::{IDLE, Refused, admit, feed_payload};
 
 const QUEUE: usize = 16_384;
 struct Payload {
     bytes: Vec<u8>,
     received: Instant,
+    /// The SRT receiver gave up on data just before this payload.
+    after_loss: bool,
 }
 struct Publisher {
     tx: mpsc::Sender<Payload>,
@@ -29,9 +32,15 @@ struct Publisher {
 impl Publisher {
     fn closed(self, reason: Option<CloseReason>, dropped: u64) {
         // `lost` also counts recovered loss. Only irrecoverable drops, or
-        // an abnormal transport timeout, make this prefix incomplete.
-        if incomplete_close(reason, dropped) {
-            self.loss.mark_incomplete();
+        // an abnormal transport timeout, make this prefix incomplete. A peer
+        // SHUTDOWN without drops is clean: senders that discard unsent data
+        // on close can still cut the final audio PES short, which the
+        // terminal drain may then trim. This runs before `tx` drops, so it
+        // precedes that drain.
+        match incomplete_close(reason, dropped) {
+            Some(cause) => self.loss.mark_incomplete(cause),
+            None if matches!(reason, Some(CloseReason::Shutdown)) => self.loss.mark_clean_close(),
+            None => {}
         }
         if let Some(scope) = self.scope {
             scope.protocol_stopped();
@@ -42,7 +51,7 @@ impl Publisher {
         match self.tx.try_send(payload) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.loss.mark_incomplete();
+                self.loss.mark_incomplete(IncompleteReason::IngestQueueFull);
                 false
             }
             // End/revoke may already have closed admission normally.
@@ -50,8 +59,14 @@ impl Publisher {
         }
     }
 }
-fn incomplete_close(reason: Option<CloseReason>, dropped: u64) -> bool {
-    dropped != 0 || matches!(reason, Some(CloseReason::Timeout))
+fn incomplete_close(reason: Option<CloseReason>, dropped: u64) -> Option<IncompleteReason> {
+    if dropped != 0 {
+        Some(IncompleteReason::TransportDrop)
+    } else if matches!(reason, Some(CloseReason::Timeout)) {
+        Some(IncompleteReason::TransportTimeout)
+    } else {
+        None
+    }
 }
 struct Engine {
     listener: Listener,
@@ -63,7 +78,9 @@ impl Drop for Engine {
         // message. Native protocol state is destroyed before its receipt says
         // stopped, and dropping senders lets independent media owners finish.
         for (id, publisher) in &self.publishers {
-            publisher.loss.mark_incomplete();
+            publisher
+                .loss
+                .mark_incomplete(IncompleteReason::ListenerStopped);
             self.listener.close(*id, Instant::now());
             if let Some(scope) = &publisher.scope {
                 scope.protocol_stopped();
@@ -182,11 +199,16 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                         (id, peer, result)
                     });
                 }
-                Event::Data { id, payload } => {
+                Event::Data {
+                    id,
+                    payload,
+                    after_loss,
+                } => {
                     if let Some(publisher) = publishers.get(&id)
                         && !publisher.enqueue(Payload {
                             bytes: payload,
                             received: Instant::now(),
+                            after_loss,
                         })
                     {
                         tracing::warn!("SRT publisher queue is full or gone");
@@ -320,7 +342,9 @@ async fn cancelled(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) {
 }
 fn reject_stale(publication: &Publication, received: Instant, scoped: bool) -> bool {
     if scoped && received.elapsed() > std::time::Duration::from_secs(1) {
-        publication.loss_notice().mark_incomplete();
+        publication
+            .loss_notice()
+            .mark_incomplete(IncompleteReason::StaleMedia);
         true
     } else {
         false
@@ -342,7 +366,7 @@ async fn publish(
             result=tokio::time::timeout(IDLE,rx.recv())=>match result {
                 Ok(Some(data))=>{
                     if reject_stale(&publication, data.received, scope.is_some()){tracing::warn!("SRT scoped media queue exceeded one second");break}
-                    if let Err(error)=feed(&mut publication,&data.bytes){tracing::warn!(%error,"dropping SRT publisher");break}
+                    if let Err(error)=feed_payload(&mut publication,&data.bytes,data.after_loss){tracing::warn!(%error,"dropping SRT publisher");break}
                 }
                 Ok(None)=>break,
                 Err(_)=>{tracing::info!("SRT publisher idle");break}
@@ -356,6 +380,7 @@ async fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::srt::feed;
     use sapflow_srt::crypto::{CryptoConfig, KeySize};
     use sapflow_srt::seq::Seq;
     use sapflow_srt::{Caller, CallerConfig};
@@ -377,22 +402,32 @@ mod tests {
                 loss: publication.loss_notice(),
             };
             let incomplete = !matches!(cause, "closed" | "shutdown");
+            let status = publication
+                .stream
+                .session()
+                .recorder
+                .as_ref()
+                .expect("recording started")
+                .status();
             match cause {
                 "full" => {
                     assert!(publisher.enqueue(Payload {
                         bytes: vec![0],
-                        received: Instant::now()
+                        received: Instant::now(),
+                        after_loss: false,
                     }));
                     assert!(!publisher.enqueue(Payload {
                         bytes: vec![1],
-                        received: Instant::now()
+                        received: Instant::now(),
+                        after_loss: false,
                     }));
                 }
                 "closed" => {
                     drop(rx);
                     assert!(!publisher.enqueue(Payload {
                         bytes: vec![0],
-                        received: Instant::now()
+                        received: Instant::now(),
+                        after_loss: false,
                     }));
                 }
                 "shutdown" => publisher.closed(Some(CloseReason::Shutdown), 0),
@@ -414,6 +449,21 @@ mod tests {
                     drop(engine);
                 }
             }
+            let expected = match cause {
+                "full" => Some(IncompleteReason::IngestQueueFull),
+                "dropped" => Some(IncompleteReason::TransportDrop),
+                "timeout" => Some(IncompleteReason::TransportTimeout),
+                "age" => Some(IncompleteReason::StaleMedia),
+                "engine" => Some(IncompleteReason::ListenerStopped),
+                _ => None,
+            };
+            assert_eq!(status.reason(), expected, "{cause}");
+            // Only a peer SHUTDOWN without drops allows tail trimming.
+            assert_eq!(
+                publication.stream.session().closed_cleanly(),
+                cause == "shutdown",
+                "{cause}"
+            );
             publication.end();
             fixture
                 .completion(if incomplete {
@@ -422,6 +472,45 @@ mod tests {
                     "finalised"
                 })
                 .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_shutdown_trims_a_cut_off_final_audio_pes_but_a_dropped_close_does_not() {
+        use crate::publish::loss_tests::Fixture;
+        // A sender that discards unsent data on close stops mid-PES: cut the
+        // generated A/V fixture three packets into its final audio PES.
+        let fixture_ts = include_bytes!("../../sapflow-hls/tests/fixtures/testsrc-3s.ts");
+        let packets: Vec<&[u8]> = fixture_ts.chunks_exact(188).collect();
+        let pid = |p: &[u8]| (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
+        let last_audio = packets
+            .iter()
+            .rposition(|p| pid(p) == 257 && p[1] & 0x40 != 0)
+            .expect("fixture audio PES");
+        let cut = packets[last_audio..]
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| pid(p) == 257)
+            .nth(3)
+            .map(|(i, _)| last_audio + i)
+            .expect("multi-packet audio PES");
+        let wire = packets[..cut].concat();
+        for (dropped, state) in [(0, "finalised"), (1, "incomplete")] {
+            let mut fixture = Fixture::new();
+            let mut publication = fixture.begin();
+            for datagram in wire.chunks(1316) {
+                feed(&mut publication, datagram).expect("accepted prefix");
+            }
+            let (tx, _rx) = mpsc::channel(1);
+            // As in serve: the close notice precedes the worker's terminal drain.
+            Publisher {
+                tx,
+                scope: None,
+                loss: publication.loss_notice(),
+            }
+            .closed(Some(CloseReason::Shutdown), dropped);
+            publication.end();
+            fixture.completion(state).await;
         }
     }
 

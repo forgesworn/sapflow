@@ -158,6 +158,10 @@ pub enum Event {
         id: ConnId,
         /// One packet's payload, decrypted when encryption is in use.
         payload: Vec<u8>,
+        /// Data before this payload was given up on (dropped as too late or
+        /// skipped). MPEG-TS continuity counters miss some such gaps, so
+        /// treat this payload as following a discontinuity.
+        after_loss: bool,
     },
     /// The connection ended from the other side, or a caller was not
     /// answered in time (`reason` is `None` then).
@@ -559,10 +563,11 @@ impl<S: BuildHasher> Listener<S> {
         while let Some(b) = rx.take_send() {
             self.transmits.push_back((c.peer, b));
         }
-        while let Some(payload) = rx.take_delivery() {
+        while let Some((payload, after_loss)) = rx.take_delivery() {
             self.events.push_back(Event::Data {
                 id: ConnId(id),
                 payload,
+                after_loss,
             });
         }
         if let Some(reason) = rx.closed() {
@@ -975,7 +980,8 @@ mod tests {
             got,
             vec![Event::Data {
                 id,
-                payload: b"ts".to_vec()
+                payload: b"ts".to_vec(),
+                after_loss: false,
             }]
         );
         // Due 2000 ms after its timestamp, which is 100 µs after the

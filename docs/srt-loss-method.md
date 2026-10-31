@@ -29,9 +29,15 @@ collection incomplete and its exit nonzero. The harness does not silently
 skip conditions. Existing output evidence is refused rather than overwritten.
 
 For this audio/video fixture, a passing trial requires the source FFmpeg exit
-to be zero, positive video and audio packet counts, both probe exits and the
-decoder exit to be zero, and zero lines from `ffmpeg -v error`. Decoder error
-messages fail even if FFmpeg exits zero. Receiver/proxy crashes and source
+to be zero, positive video and audio packet counts, and both probe exits and
+the decoder exit to be zero. A clean run (`--loss none`) also needs zero
+lines from `ffmpeg -v error`: there an error message means the clip or the
+harness is broken, and it fails even if FFmpeg exits zero. Under loss, error
+messages are a result and are reported in the decode messages column. libsrt
+writes the bytes it was given, holes included, while sapflow drops what it
+cannot use, so failing every trial with an error message hid libsrt's 200 ms
+rows entirely; where the two receivers' decode messages differ, their packets
+delivered count different things. Receiver/proxy crashes and source
 timeouts fail. Requested child termination is recorded separately from a
 natural nonzero exit; SIGKILL never qualifies as a clean shutdown.
 The original 15 TSV columns keep their positions; encryption, actual tool
@@ -54,8 +60,8 @@ Run the finite offline regressions with:
 python3 -B tests/test_srt_loss_results.py
 ```
 
-They execute the shell with fake tools, including positive decoder
-errors, source/probe/decoder/receiver exits, a killed trial shell, missing
+They execute the shell with fake tools, including decoder errors in a
+clean and a loss trial, source/probe/decoder/receiver exits, a killed trial shell, missing
 receipts and setup failure. Tiny loopback UDP fixtures verify ownership and
 sender-before-feeder order, including an occupied port whose owner survives.
 The fixtures contain generated packet bytes, use no SRT connection or codec,

@@ -71,6 +71,17 @@ prefix. This remains an accepted-prefix recording policy, not a complete-show
 guarantee. Finish may seal that prefix before returning a semantic error; callers
 must preserve the incomplete-recording result before feeding its final parts.
 
+One exception follows an orderly, lossless transport close: an SRT SHUTDOWN
+with no dropped packets. Senders in live mode, such as ffmpeg with libsrt's
+default linger, discard data they have not sent when they close. The stream
+then ends inside the final bounded AAC PES, without any sequence gap SRT could
+see. `TsIngest::finish_after_clean_close` trims that cut-off PES, which is never
+emitted, instead of reporting loss, provided every bounded PES still incomplete
+at EOF is audio. A truncated bounded video PES, a partial TS packet, an earlier
+drop or continuity gap, a malformed tail, a timeout and every RTMP, takeover or
+revocation finish still mark the recording incomplete. The server logs each
+trim.
+
 The server drains accepted input under registry, session and media ownership
 before closing or holding the connection. Revocation permits no new input, while
 already accepted data can still finish. Stale generations cannot drain a later

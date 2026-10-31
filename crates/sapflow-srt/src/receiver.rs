@@ -218,7 +218,10 @@ pub struct Receiver {
     closed: Option<CloseReason>,
     /// Control packets to send, encoded.
     send: VecDeque<Vec<u8>>,
-    deliver: VecDeque<Vec<u8>>,
+    /// Payloads to hand over, each marked if data was lost just before it.
+    deliver: VecDeque<(Vec<u8>, bool)>,
+    /// Data was given up on since the last payload queued for delivery.
+    lost: bool,
     crypto: Option<Decryptor>,
     next_km: i64,
     /// One distinct KM attempt after a decrypted forward key-slot change.
@@ -264,6 +267,7 @@ impl Receiver {
             closed: None,
             send: VecDeque::new(),
             deliver: VecDeque::new(),
+            lost: false,
             crypto: None,
             next_km: 0,
             early_km: false,
@@ -299,8 +303,12 @@ impl Receiver {
         self.send.pop_front()
     }
 
-    /// Takes the next payload due for delivery, in sequence order, if any.
-    pub fn take_delivery(&mut self) -> Option<Vec<u8>> {
+    /// Takes the next payload due for delivery, in sequence order, if any,
+    /// and whether data was given up on just before it: a packet dropped as
+    /// too late, or skipped by a jump past the whole buffer. MPEG-TS
+    /// continuity counters cannot see every such gap, so the consumer must
+    /// treat the payload as following a discontinuity.
+    pub fn take_delivery(&mut self) -> Option<(Vec<u8>, bool)> {
         self.deliver.pop_front()
     }
 
@@ -432,6 +440,7 @@ impl Receiver {
             self.flush();
             self.head = seq;
             self.loss.clear();
+            self.lost = true;
         } else {
             for _ in 0..excess {
                 self.pop_front();
@@ -446,9 +455,13 @@ impl Receiver {
         match self.buf.pop_front() {
             Some(Some(slot)) => {
                 self.stats.delivered += 1;
-                self.deliver.push_back(slot.payload);
+                let lost = std::mem::take(&mut self.lost);
+                self.deliver.push_back((slot.payload, lost));
             }
-            Some(None) => self.stats.dropped += 1,
+            Some(None) => {
+                self.stats.dropped += 1;
+                self.lost = true;
+            }
             None => {}
         }
         self.head = self.head.next();
@@ -731,6 +744,10 @@ mod tests {
     }
 
     fn delivered(r: &mut Receiver) -> Vec<Vec<u8>> {
+        marked(r).into_iter().map(|(payload, _)| payload).collect()
+    }
+
+    fn marked(r: &mut Receiver) -> Vec<(Vec<u8>, bool)> {
         std::iter::from_fn(|| r.take_delivery()).collect()
     }
 
@@ -1116,6 +1133,24 @@ mod tests {
         );
         assert_eq!(r.stats().dropped, 0);
         assert_eq!(r.stats().retransmitted, 2);
+    }
+
+    #[test]
+    fn the_payload_after_a_given_up_packet_is_marked_and_only_that_one() {
+        let mut r = rx();
+        r.on_data(0, &data(ISN, 0, b"0"));
+        r.on_data(2 * MS, &data(ISN + 2, 2 * MS as u32, b"2"));
+        r.on_data(3 * MS, &data(ISN + 3, 3 * MS as u32, b"3"));
+        r.on_timer(203 * MS);
+        assert_eq!(
+            marked(&mut r),
+            vec![
+                (b"0".to_vec(), false),
+                (b"2".to_vec(), true),
+                (b"3".to_vec(), false)
+            ]
+        );
+        assert_eq!(r.stats().dropped, 1);
     }
 
     #[test]

@@ -257,6 +257,18 @@ class QualificationTests(unittest.TestCase):
         raw["outcomes"]["encoder_exit"] = False
         self.assertTrue(results.qualify(raw, 0))
 
+    def test_decoder_messages_fail_clean_runs_but_are_a_result_under_loss(self):
+        raw = copy.deepcopy(GOOD)
+        raw["metrics"]["decode_msgs"] = 7
+        self.assertTrue(results.qualify(raw, 0))
+        self.assertTrue(results.qualify(raw, 0, "none"))
+        self.assertEqual(results.qualify(raw, 0, "random:10"), [])
+        self.assertEqual(results.qualify(raw, 0, "burst:8,8"), [])
+        for value in [-1, None, "7"]:
+            with self.subTest(value=value):
+                raw["metrics"]["decode_msgs"] = value
+                self.assertTrue(results.qualify(raw, 0, "random:10"))
+
     def test_collation_retains_order_crashes_and_not_attempted_trials(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
@@ -289,7 +301,7 @@ class QualificationTests(unittest.TestCase):
 
     def test_real_shell_retains_tool_failures_and_returns_nonzero(self):
         for case, field, value in [
-            ("decoder_messages", "decode_msgs", "1"), ("decoder_exit", "decoder_exit", "23"),
+            ("decoder_exit", "decoder_exit", "23"),
             ("encoder_exit", "encoder_exit", "17"), ("probe_exit", "video_probe_exit", "21"),
             ("zero_audio", "audio", "0"), ("receiver_exit", "receiver_exit", "29"),
         ]:
@@ -302,6 +314,19 @@ class QualificationTests(unittest.TestCase):
                     self.assertEqual((row["status"], row[field]), ("FAIL", value), row)
                     self.assertTrue(row["failure"])
                     self.assertTrue((trial.output / f"logs/{row['trial_index']}-own-fixture/ff.log").exists())
+
+    def test_real_shell_decoder_messages_fail_the_clean_run_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            trial = OfflineTrial(temporary)
+            # The clean baseline fails, so the collection still exits nonzero.
+            self.assertNotEqual(trial.run("decoder_messages"), 0, trial.stdout + trial.stderr)
+            rows = {row["loss"]: row for row in trial.rows()}
+            self.assertEqual((rows["none"]["status"], rows["none"]["decode_msgs"]), ("FAIL", "1"))
+            self.assertIn("decode_msgs=1", rows["none"]["failure"])
+            self.assertEqual((rows["random:3"]["status"], rows["random:3"]["decode_msgs"],
+                              rows["random:3"]["trial_exit"], rows["random:3"]["failure"]),
+                             ("ok", "1", "0", ""))
+            self.assertIn("| random:3 | 200 ms | own-fixture | 1 |", trial.stdout)
 
     def test_real_shell_pass_and_encryption_metadata(self):
         for encrypted, libsrt in [(False, False), (True, False), (False, True)]:
@@ -431,11 +456,24 @@ class UdpFixtureTests(unittest.TestCase):
             path = Path(temporary) / "historical.tsv"
             # The former writer labelled this row ok despite an error message.
             path.write_text("\t".join(results.HEADER[:15]) + "\n" +
-                            "own\trandom:3\t200\t1\t100\t200\t1\t80\t0\t0\t0xbf\tok\t0\t80\t80\n")
+                            "own\tnone\t200\t1\t100\t200\t1\t80\t0\t0\t0xbf\tok\t0\t80\t80\n")
             run = subprocess.run(["bash", str(ROOT / "scripts/srt-loss.sh"), "--summarise", str(path)],
                                  text=True, capture_output=True, timeout=5)
             self.assertNotEqual(run.returncode, 0)
-            self.assertIn("Unqualified trial: own random:3", run.stdout)
+            self.assertIn("Unqualified trial: own none", run.stdout)
+
+    def test_summary_reports_decoder_messages_under_loss(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "damaged.tsv"
+            path.write_text("\t".join(results.HEADER[:15]) + "\n" +
+                            "libsrt\tnone\t200\t1\t100\t200\t0\t80\t0\t0\t0xbf\tok\t0\t80\t80\n" +
+                            "libsrt\trandom:10\t200\t1\t100\t198\t12\t80\t9\t9\t0xbf\tok\t0\t80\t79\n")
+            run = subprocess.run(["bash", str(ROOT / "scripts/srt-loss.sh"), "--summarise", str(path)],
+                                 text=True, capture_output=True, timeout=5)
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertNotIn("Unqualified", run.stdout)
+            self.assertIn("| random:10 | 200 ms | libsrt | 1 |", run.stdout)
+            self.assertIn("| 12.0 ± 0.0 |", run.stdout)
 
     def test_empty_summary_cannot_pass(self):
         with tempfile.TemporaryDirectory() as temporary:

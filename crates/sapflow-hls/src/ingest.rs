@@ -43,6 +43,10 @@ mod pes_limits_tests;
 #[path = "startup_ts_tests.rs"]
 mod startup_ts_tests;
 
+#[cfg(test)]
+#[path = "transport_gap_tests.rs"]
+mod transport_gap_tests;
+
 #[derive(Clone, Copy)]
 struct StartupLimits {
     aus: usize,
@@ -815,6 +819,8 @@ pub struct TsIngest {
     startup_replaying: bool,
     startup_has_successor: bool,
     startup_now: Option<SystemTime>,
+    trim_audio_tail: bool,
+    trimmed_audio_tail: bool,
 }
 
 impl TsIngest {
@@ -874,6 +880,8 @@ impl TsIngest {
             startup_replaying: false,
             startup_has_successor: false,
             startup_now: None,
+            trim_audio_tail: false,
+            trimmed_audio_tail: false,
         }
     }
 
@@ -953,6 +961,41 @@ impl TsIngest {
         Ok(self.pending)
     }
 
+    /// The transport gave up on data before the next bytes (an SRT packet
+    /// dropped as too late). TS continuity counters wrap every 16 packets per
+    /// PID, so a loss of exactly 16, 32 or more packets on one PID is invisible
+    /// to them: the next frame's payload would be appended to the previous
+    /// frame's unbounded PES and one frame would vanish without a trace. Like
+    /// a detected continuity loss, this discards partial assemblies and any
+    /// unaligned leftover bytes, and waits for a keyframe. Call it before
+    /// pushing the first bytes after the gap.
+    pub fn transport_gap(&mut self, now: SystemTime) {
+        {
+            let Ok(mut input) = self.input.lock() else {
+                return;
+            };
+            if input.terminal || input.limit_exceeded {
+                return;
+            }
+            input.dropped = input.dropped.saturating_add(1);
+            input.start = input.buf.len();
+            input.reset_pes = false;
+        }
+        if self.waiting_for_startup_audio() || self.startup_replaying {
+            self.discard_startup_catchup(now);
+        }
+        if let Some(pes) = self.pes.take() {
+            let mut feed = pes.into_ts_packet_reader();
+            feed.boundaries.clear();
+            feed.pending_bytes = 0;
+            feed.pending = None;
+            // The first packet per PID after the gap starts a new count.
+            feed.continuity.clear();
+            self.pes = Some(PesPacketReader::new(feed));
+        }
+        self.waiting_keyframe = true;
+    }
+
     /// Ends this connection's input, as distinct from temporary starvation.
     /// Releases only complete bounded AAC still held by the PES reader, then
     /// seals accepted muxer media. An unbounded video tail is never emitted;
@@ -961,6 +1004,29 @@ impl TsIngest {
     /// can be resumed by a new ingest; this parser cannot accept more bytes.
     /// Repeated finish calls are harmless and return an empty update.
     pub fn finish(&mut self, now: SystemTime) -> Result<Update, IngestError> {
+        self.finish_terminal(now, false)
+    }
+
+    /// [`TsIngest::finish`] after the transport reported an orderly close with
+    /// nothing lost, such as an SRT SHUTDOWN with no dropped packets.
+    ///
+    /// A live sender can discard data it has not yet sent when it closes, so
+    /// the stream can end inside the final bounded AAC PES. That PES is
+    /// trimmed rather than counted as loss when every bounded PES still
+    /// incomplete at EOF is audio. A truncated bounded video PES, a partial TS
+    /// packet, an earlier drop or a malformed tail still sets `media_loss`.
+    /// The trimmed PES is never emitted; [`TsIngest::trimmed_audio_tail`]
+    /// reports it.
+    pub fn finish_after_clean_close(&mut self, now: SystemTime) -> Result<Update, IngestError> {
+        self.finish_terminal(now, true)
+    }
+
+    /// Whether the terminal drain trimmed a truncated final AAC PES.
+    pub fn trimmed_audio_tail(&self) -> bool {
+        self.trimmed_audio_tail
+    }
+
+    fn finish_terminal(&mut self, now: SystemTime, trim: bool) -> Result<Update, IngestError> {
         let failed = {
             let mut input = self.input.lock().expect("input lock is private to ingest");
             if input.terminal {
@@ -971,6 +1037,7 @@ impl TsIngest {
             input.limit_exceeded
         };
         self.pending = Update::default();
+        self.trim_audio_tail = trim;
         let result = if let Some(error) = &self.startup_error {
             Err(error.clone())
         } else if failed {
@@ -1315,6 +1382,12 @@ impl TsIngest {
                     if starved {
                         break;
                     }
+                    if terminal && self.trim_audio_tail && self.truncated_audio_tail() {
+                        // After real EOF only the PES reader's end check can
+                        // fail: one PID's final bounded PES was cut short.
+                        self.trimmed_audio_tail = true;
+                        continue;
+                    }
                     // A malformed PES: its data is gone, the next one is fine.
                     if self.waiting_for_startup_audio() || self.startup_replaying {
                         self.discard_startup_catchup(now);
@@ -1330,6 +1403,24 @@ impl TsIngest {
 
     fn program(&self) -> Program {
         self.input.lock().map(|i| i.program).unwrap_or_default()
+    }
+
+    /// Input has ended and every bounded PES still short of its advertised
+    /// length is audio. Completed PES leave the boundary table, so these are
+    /// exactly the packets the PES reader rejects at EOF.
+    fn truncated_audio_tail(&self) -> bool {
+        let Some(feed) = self.pes.as_ref().map(PesPacketReader::ts_packet_reader) else {
+            return false;
+        };
+        let ended = feed.input.lock().map(|i| i.ended).unwrap_or(false);
+        let mut incomplete = feed
+            .boundaries
+            .values()
+            .filter(|b| b.expected.is_some_and(|n| b.received < n))
+            .peekable();
+        ended
+            && incomplete.peek().is_some()
+            && incomplete.all(|b| (0xc0..=0xdf).contains(&b.header.stream_id.as_u8()))
     }
 
     fn on_pes(

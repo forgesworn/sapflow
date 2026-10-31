@@ -50,7 +50,7 @@ fn main() -> std::io::Result<()> {
                     println!("{peer} wants {:?}", String::from_utf8_lossy(&stream_id));
                     listener.accept(id, Instant::now());
                 }
-                Event::Data { id, payload } => println!("{id:?}: {} bytes", payload.len()),
+                Event::Data { id, payload, .. } => println!("{id:?}: {} bytes", payload.len()),
                 Event::Closed { id, reason, .. } => println!("{id:?} closed: {reason:?}"),
             }
         }
