@@ -394,6 +394,9 @@ pub struct Muxer {
     offset: i64,
     /// After a break: the output time the next keyframe is moved to.
     rebase_to: Option<i64>,
+    /// The latest presentation end of any video frame placed so far, in
+    /// output time. A resuming keyframe is never presented before it.
+    presented_end: Option<i64>,
     /// After a break: audio before this output time is dropped.
     audio_floor: i64,
     /// The next segment to open follows a break.
@@ -511,6 +514,7 @@ impl Muxer {
             target: None,
             offset: duration_to_ticks(START_OFFSET, VIDEO_TIMESCALE),
             rebase_to: None,
+            presented_end: None,
             audio_floor: 0,
             discontinuity_next: false,
             discontinuity_sequence: 0,
@@ -812,7 +816,8 @@ impl Muxer {
         let mut dts = dts.saturating_add(self.offset);
         if self.pending_video.is_none() && self.next_segment.is_none() {
             // The keyframe that resumes the stream after a break.
-            if let Some(to) = self.rebase_to.take() {
+            if let Some(end) = self.rebase_to.take() {
+                let to = self.resume_at(end, cts);
                 self.rebase(dts, to);
                 dts = to;
             }
@@ -931,8 +936,9 @@ impl Muxer {
         let closed = self.close_run(end, now)?;
         if next.sync {
             let mut next = next;
-            self.rebase(next.dts, end);
-            next.dts = end;
+            let to = self.resume_at(end, next.cts);
+            self.rebase(next.dts, to);
+            next.dts = to;
             self.pending_video = Some(next);
         } else {
             self.rebase_to = Some(end);
@@ -1066,6 +1072,15 @@ impl Muxer {
         result.map(|()| closed)
     }
 
+    /// Where a keyframe with composition offset `cts` resumes a run that
+    /// ended at `end`: there, unless the old run's reordered frames are still
+    /// presented past it. Then later, so display time never steps back; the
+    /// decode-time hole this leaves is at most the old run's reorder delay.
+    fn resume_at(&self, end: i64, cts: i32) -> i64 {
+        self.presented_end
+            .map_or(end, |presented| end.max(presented - i64::from(cts)))
+    }
+
     /// Moves output time so that input now at output `from` lands at `to`.
     fn rebase(&mut self, from: i64, to: i64) {
         self.offset += to - from;
@@ -1130,6 +1145,8 @@ impl Muxer {
         } else {
             (full, f.next_dts)
         };
+        let presented = f.dts + i64::from(f.cts) + duration;
+        self.presented_end = Some(self.presented_end.map_or(presented, |p| p.max(presented)));
         part.video.push(Sample {
             duration: duration as u32,
             cts: f.cts,
@@ -2260,8 +2277,10 @@ pub(crate) mod tests {
     }
 
     /// Output decode times only move forward and leave no hole at a break
-    /// (they are rebased), every segment after a break starts on a
-    /// keyframe, and no AAC frame lasts more than one frame's time.
+    /// (they are rebased; these fixtures do not reorder frames, which may
+    /// leave a hole up to the reorder delay), every segment after a break
+    /// starts on a keyframe, and no AAC frame lasts more than one frame's
+    /// time.
     fn assert_clean_timeline(m: &Muxer) -> usize {
         let mut breaks = 0;
         let (mut video_end, mut audio_end) = (None::<u64>, None::<u64>);
@@ -2396,6 +2415,95 @@ pub(crate) mod tests {
             let after: usize = all_parts(&m).iter().skip_while(|(brk, _)| !brk).count();
             assert!(after > 80, "{after} parts after the resume");
         }
+    }
+
+    /// Every video sample as (dts, pts, duration), and whether it follows a
+    /// break, read back from the parts' moof boxes.
+    fn presented_video(m: &Muxer) -> Vec<(bool, i64, i64, i64)> {
+        use mp4_atom::Decode;
+        let mut out = Vec::new();
+        let mut after = false;
+        for (brk, part) in all_parts(m) {
+            after |= brk;
+            let mut cur = std::io::Cursor::new(&part.data[..]);
+            let moof = mp4_atom::Moof::decode(&mut cur).expect("moof");
+            let traf = moof
+                .traf
+                .iter()
+                .find(|t| t.tfhd.track_id == VIDEO_TRACK)
+                .expect("video traf");
+            let mut dts = traf.tfdt.as_ref().expect("tfdt").base_media_decode_time as i64;
+            for e in &traf.trun[0].entries {
+                let duration = i64::from(e.duration.expect("duration"));
+                out.push((after, dts, dts + i64::from(e.cts.unwrap_or(0)), duration));
+                dts += duration;
+            }
+        }
+        out
+    }
+
+    /// I P B B at 30 fps from a fresh encoder clock: decode order n shows
+    /// frame p, with presentation 6000 ticks (two frames) after decode at
+    /// the keyframe. Keyframes fall on anchor frames, every two seconds.
+    fn ipbb(count: i64) -> Vec<(i64, i64, bool)> {
+        (0..count)
+            .map(|n| {
+                let p = match n {
+                    0 => 0,
+                    n if (n - 1) % 3 == 0 => n + 2,
+                    n => n - 1,
+                };
+                (n * 3000, p * 3000 + 6000, n == 0 || n % 60 == 1)
+            })
+            .collect()
+    }
+
+    /// A resume after reordered frames: the old run's last anchor frame is
+    /// presented after the dropped frame's decode time, so a keyframe moved
+    /// onto that decode time would be shown before it. It is moved later
+    /// instead, by no more than the old run's reorder delay.
+    #[test]
+    fn a_resume_never_steps_display_time_back_after_reordered_frames() {
+        let cfg = MuxerConfig {
+            segment_count: 1000,
+            ..MuxerConfig::default()
+        };
+        let mut m = Muxer::new(cfg, video(), None);
+        let push = |m: &mut Muxer, frames: &[(i64, i64, bool)]| {
+            for &(dts, pts, sync) in frames {
+                m.push_video(
+                    dts,
+                    pts,
+                    sync,
+                    Bytes::from(vec![0u8; 100]),
+                    SystemTime::UNIX_EPOCH,
+                )
+                .expect("push");
+            }
+        };
+        let frames = ipbb(300);
+        push(&mut m, &frames);
+        m.interrupt(SystemTime::UNIX_EPOCH);
+        push(&mut m, &frames);
+        let samples = presented_video(&m);
+        let (before, after): (Vec<&(bool, i64, i64, i64)>, Vec<_>) =
+            samples.iter().partition(|s| !s.0);
+        assert!(before.len() > 200 && after.len() > 200);
+        let presented = before.iter().map(|s| s.2 + s.3).max().expect("old run");
+        let decoded = before.last().map(|s| s.1 + s.3).expect("old run");
+        let reorder = before.iter().map(|s| s.2 - s.1).max().expect("old run");
+        assert!(presented > decoded, "the fixture reorders past the run end");
+        for s in &after {
+            assert!(
+                s.2 >= presented,
+                "resumed frame shown at {} before {presented}",
+                s.2
+            );
+        }
+        let hole = after[0].1 - decoded;
+        assert!((0..=reorder).contains(&hole), "decode-time hole {hole}");
+        // Without reordering a resume still leaves no hole: see
+        // an_interrupted_stream_resumes_from_any_clock.
     }
 
     /// The health report's measures: keyframe interval from segment
