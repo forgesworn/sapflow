@@ -405,6 +405,9 @@ pub struct Muxer {
     discontinuity_sequence: u64,
     /// Breaks since the stream started (stalls, jumps, reconnects).
     breaks: u64,
+    /// Ingest dropped video after transport damage, so the next gap is
+    /// frames it withheld on a timeline that is still intact.
+    hold_gap: bool,
 }
 
 impl Muxer {
@@ -519,6 +522,7 @@ impl Muxer {
             discontinuity_next: false,
             discontinuity_sequence: 0,
             breaks: 0,
+            hold_gap: false,
         }
     }
 
@@ -754,7 +758,7 @@ impl Muxer {
     /// Read-only projection before any video state mutation. Existing real
     /// timestamp/target breaks release the previous run before retaining at
     /// most one new pending frame, so they remain available at a full budget.
-    fn check_video_entry_admission(&self, dts: i64) -> Result<(), MuxError> {
+    fn check_video_entry_admission(&self, dts: i64, sync: bool) -> Result<(), MuxError> {
         let next_dts = if self.pending_video.is_none() && self.next_segment.is_none() {
             self.rebase_to
                 .unwrap_or_else(|| dts.saturating_add(self.offset))
@@ -774,7 +778,8 @@ impl Muxer {
                 i128::from(next_dts.max(current.dts)) - i128::from(segment_start)
                     > i128::from(target.limit_ticks())
             });
-            if gap > i128::from(BREAK_GAP) || target_break {
+            let held = self.holds_gap(self.hold_gap, current.dts, next_dts, sync);
+            if (gap > i128::from(BREAK_GAP) && !held) || target_break {
                 return Ok(());
             }
         }
@@ -811,7 +816,9 @@ impl Muxer {
         if self.pending_video.is_none() && self.next_segment.is_none() && !sync {
             return Ok(Update::default());
         }
-        self.check_video_entry_admission(dts)?;
+        self.check_video_entry_admission(dts, sync)?;
+        // The hold covers only the next frame that gets this far.
+        let hold_gap = std::mem::take(&mut self.hold_gap);
         let cts = (pts - dts).clamp(0, i64::from(i32::MAX)) as i32;
         let mut dts = dts.saturating_add(self.offset);
         if self.pending_video.is_none() && self.next_segment.is_none() {
@@ -835,7 +842,8 @@ impl Muxer {
             self.pending_video = Some(next);
             return Ok(Update::default());
         };
-        if (next.dts - cur.dts).abs() > BREAK_GAP {
+        let held = self.holds_gap(hold_gap, cur.dts, next.dts, next.sync);
+        if (next.dts - cur.dts).abs() > BREAK_GAP && !held {
             let end = cur.dts;
             return self.break_stream(end, next, now);
         }
@@ -950,6 +958,22 @@ impl Muxer {
         })
     }
 
+    /// Ingest found transport damage and is withholding video until the
+    /// next keyframe. Its timestamps are still the encoder's, so when that
+    /// keyframe moves forward by more than `BREAK_GAP` the last good frame is
+    /// held across the gap, as a shorter stall is, and the gap's audio is
+    /// kept, instead of breaking the run and dropping it. The segment length
+    /// limit still applies, and before the part timing is fixed, or on a jump
+    /// back, the gap breaks as before.
+    pub fn hold_next_gap(&mut self) {
+        self.hold_gap = true;
+    }
+
+    /// Whether a gap before `next_dts` is held rather than broken.
+    fn holds_gap(&self, hold: bool, current_dts: i64, next_dts: i64, sync: bool) -> bool {
+        hold && sync && next_dts > current_dts && self.timing.is_some()
+    }
+
     /// The encoder went away; another connection may carry on the stream.
     /// Ends the current run as a break does, at the last frame (which is
     /// dropped, its duration unknown): whatever video arrives next, from
@@ -958,6 +982,7 @@ impl Muxer {
     /// Audio-only seals every accepted complete AAC frame, whose duration is
     /// known, then rebases the next run after a discontinuity.
     pub fn interrupt(&mut self, now: SystemTime) -> Update {
+        self.hold_gap = false;
         if self.fragment_refused {
             return self.interrupt_refused(now);
         }
@@ -1083,6 +1108,7 @@ impl Muxer {
 
     /// Moves output time so that input now at output `from` lands at `to`.
     fn rebase(&mut self, from: i64, to: i64) {
+        self.hold_gap = false;
         self.offset += to - from;
         self.audio_floor = to;
         // Its timestamp was taken with the old offset.
@@ -2874,6 +2900,118 @@ pub(crate) mod tests {
         // The first AAC frame arrives before video opens a part, so it is
         // dropped: the audio run starts one frame (1024 samples) later.
         assert_eq!(a, Some(1024));
+    }
+
+    /// 2 s keyframes with 48 kHz AAC underneath, checking the playlist rules
+    /// after every push. Video frames strictly between `damaged` and
+    /// `resume` are missing (ingest withheld them after transport damage);
+    /// audio carries on through, as it does over SRT. With `hold`, ingest
+    /// tells the muxer before the resuming keyframe.
+    fn feed_loss_gap(damaged: i64, resume: i64, hold: bool) -> Muxer {
+        let cfg = MuxerConfig {
+            segment_count: 1000,
+            ..MuxerConfig::default()
+        };
+        let mut m = Muxer::new(cfg, video(), Some(aac()));
+        let mut rules = crate::playlist::RuleCheck::default();
+        let mut next_audio = 0;
+        for i in 0..900 {
+            let dts = i * 3000;
+            while next_audio <= dts {
+                m.push_audio(next_audio, Bytes::from_static(b"aac"))
+                    .expect("bounded test AAC");
+                next_audio += 1920;
+            }
+            if i >= damaged && i < resume {
+                continue;
+            }
+            if i == resume && hold {
+                m.hold_next_gap();
+            }
+            m.push_video(
+                dts,
+                dts,
+                i % 60 == 0,
+                Bytes::from(vec![0u8; 100]),
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("push");
+            if m.has_content() {
+                let pl = crate::playlist::media(&m, "p");
+                if let Err(e) = rules.check(&pl) {
+                    panic!("at frame {i}: {e}\n{pl}");
+                }
+            }
+        }
+        m
+    }
+
+    fn audio_frames(m: &Muxer) -> usize {
+        all_parts(m)
+            .iter()
+            .filter_map(|(_, p)| track_run(p, AUDIO_TRACK))
+            .map(|(_, _, starts)| starts.len())
+            .sum()
+    }
+
+    /// Damage at frame 305 withholds video to the keyframe at 360, 1.83 s
+    /// later. Held, the last good frame covers the gap, nothing breaks and
+    /// every AAC frame is kept; broken, as before, the gap's audio is lost.
+    #[test]
+    fn a_loss_gap_holds_the_last_frame_and_keeps_its_audio() {
+        let clean = feed_loss_gap(0, 0, false);
+        let held = feed_loss_gap(305, 360, true);
+        assert_eq!(held.breaks(), 0);
+        assert_eq!(assert_clean_timeline(&held), 0);
+        assert_eq!(audio_frames(&held), audio_frames(&clean));
+
+        let broken = feed_loss_gap(305, 360, false);
+        assert_eq!(broken.breaks(), 1);
+        assert_eq!(assert_clean_timeline(&broken), 1);
+        let lost = audio_frames(&clean) - audio_frames(&broken);
+        // 1.83 s of 48 kHz AAC is 86 frames.
+        assert!((80..=90).contains(&lost), "{lost} AAC frames lost");
+    }
+
+    /// The keyframe at 360 was damaged too: resuming at 420 would run the
+    /// segment from 300 past its limit, so the hold gives way to a break.
+    #[test]
+    fn a_loss_gap_past_the_segment_limit_still_breaks() {
+        let m = feed_loss_gap(305, 420, true);
+        assert_eq!(m.breaks(), 1);
+        assert_eq!(assert_clean_timeline(&m), 1);
+    }
+
+    /// The hold covers only the next frame: a later jump still breaks, and
+    /// a hold never freezes time across a jump back.
+    #[test]
+    fn a_loss_gap_hold_is_spent_on_the_next_frame() {
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        feed(&mut m, 0..300, 60);
+        m.hold_next_gap();
+        feed(&mut m, 300..301, 60);
+        m.push_video(
+            360 * 3000,
+            360 * 3000,
+            true,
+            Bytes::from(vec![0u8; 100]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect("push");
+        assert_eq!(m.breaks(), 1);
+
+        let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
+        feed(&mut m, 0..300, 60);
+        m.hold_next_gap();
+        m.push_video(
+            0,
+            0,
+            true,
+            Bytes::from(vec![0u8; 100]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect("push");
+        assert_eq!(m.breaks(), 1);
     }
 }
 

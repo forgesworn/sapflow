@@ -108,6 +108,25 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   (Part timing, above): one second is under the target's headroom, so one
   such stall cannot by itself push a segment past the limit, and the
   length rule catches several.
+- **Except a gap sapflow made itself.** After transport damage (an SRT
+  packet the receiver gave up on, a continuity jump, lost sync, a malformed
+  packet) ingest withholds video until the next keyframe, so with 1 s keyframes the wait often passes a second. The
+  timestamps are still the encoder's, so ingest tells the muxer
+  (`Muxer::hold_next_gap`), and when that keyframe moves time forward the
+  last good frame is held across the gap as a shorter stall is: no break,
+  no discontinuity, and the audio under the gap is kept. Video freezes for
+  the gap. The length rule still applies, so a wait that would run the
+  segment past the limit breaks as before, as does a jump back or a gap
+  before the part timing is fixed. Before 2026-10-31 these gaps broke, which
+  cut the gap's audio out with the video: under 20% loss at 200 ms latency
+  a recording kept two thirds of its audio. In a same-session comparison
+  through `scripts/srt-loss.sh` (4 seeds, 200 ms, unencrypted, on a shared
+  machine at a load average of 51 falling to 14) the audio kept rose from
+  67% to 89% of the clean run at 20% random loss (before 62 to 70%; after
+  two trials 97 and 99%, one 89%, one 73%) and from 97.8% to 99.5% at 10%;
+  video kept at 20% rose from 33% to 43% (before 220 to 347 frames, after
+  354 to 415). What is still lost is likely waits past the length limit,
+  which still break.
 - **Output time carries on.** The keyframe that resumes the stream is
   moved to the time the last segment ended, and everything after it, audio
   included, by the same amount. Output timestamps therefore only move
@@ -129,9 +148,9 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   segment, and for the part the preload hint names, wait (up to three
   target durations, then 503), and the hinted part becomes the new
   segment's first.
-- **Audio.** AAC from before the resuming keyframe is dropped, and an AAC
-  frame is never given a gap as its duration (a frame lasts 1024 samples;
-  anything over three frames' time becomes one).
+- **Audio.** At a break, AAC from before the resuming keyframe is
+  dropped, and an AAC frame is never given a gap as its duration (a frame
+  lasts 1024 samples; anything over three frames' time becomes one).
 - **The first segment.** A break before the first segment is complete
   starts the stream over: nothing has been served, and the targets should
   come from a whole segment. The seven leading gap segments are only ever
