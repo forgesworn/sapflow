@@ -403,6 +403,16 @@ The same high-bitrate run found a memory limit that does not hold (finding 4).
    stop. Whether to trim a truncated tail after a clean close is the
    maintainer's decision (#39); whether Larix and OBS truncate on stop is
    untested.
+
+   *Since then (31 October):* trimmed
+   ([#40](https://github.com/forgesworn/sapflow/pull/40)). After a clean SRT
+   close (a `shutdown`, no packets dropped), a final audio PES cut off at
+   end of input is dropped and logged instead of marking the recording
+   incomplete. With ffmpeg and libsrt as sender, 22 of 36 recordings were
+   flagged before and 48 of 48 were complete after (18 trimmed). Our own
+   SRT sender, as the iOS and Android apps use it, ends every payload on a
+   sample boundary and never truncated (12 of 12 complete on both builds).
+   Larix and OBS remain untested.
 2. **Display time steps back when a stream resumes after RTMP.** Every resume
    that follows an RTMP publish gives one or two decoder messages (two per
    file in the table above, one in each 4501 s soak file). In a frame dump the old run's
@@ -412,9 +422,21 @@ The same high-bitrate run found a memory limit that does not hold (finding 4).
    934), not past its largest presentation time, so B-frame streams overlap by
    their reorder delay. SRT-first files did not show it with this clip. Live
    HLS parts carry the same timestamps; player impact is untested.
+
+   *Since then:* fixed
+   ([#43](https://github.com/forgesworn/sapflow/pull/43)). The resuming
+   keyframe is placed no earlier than the old run's last presentation time
+   less its own composition offset, so display time never steps back; the
+   "Output time carries on" rule in `docs/reference.md` says so.
 3. **Slow-viewer closes are not logged.** The no-progress and absolute
    deadline closes above leave no log line or counter, so operators cannot
    tell slow viewers being shed from other failures.
+
+   *Since then:* logged
+   ([#42](https://github.com/forgesworn/sapflow/pull/42)): "closed a slow
+   viewer's response" with the reason (`body-deadline` or `no-progress`),
+   the bytes still unsent and per-worker counts, at most 10 lines a minute
+   per worker with a suppressed count.
 4. **High-bitrate publishing gets the server killed instead of refused.**
    With the deployed settings (48-segment window, the default 512 MiB
    retained-bytes cap, a 384 MiB container limit), one 30 Mbit/s publisher
@@ -429,6 +451,13 @@ The same high-bitrate run found a memory limit that does not hold (finding 4).
    server refuses first; do not lower a container's memory limit without
    lowering these. Whether the default cap should follow the cgroup limit is
    the maintainer's call.
+
+   *Since then:* the TV channel's container runs with
+   `SAPFLOW_MAX_FRAGMENT_BYTES` at 256 MiB, and the server now warns at
+   start when the cap is above three quarters of its cgroup memory limit,
+   naming a value that fits
+   ([#41](https://github.com/forgesworn/sapflow/pull/41)). The default cap
+   is unchanged.
 
 ### Limits
 
