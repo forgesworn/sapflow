@@ -1304,6 +1304,11 @@ impl TsIngest {
                         feed.pending_bytes = 0;
                         self.pes = Some(PesPacketReader::new(feed));
                         self.waiting_keyframe = true;
+                        // Damage in the stream, not a clock jump: the
+                        // muxer holds the last frame across the wait.
+                        if let Some(muxer) = self.es.muxer_mut() {
+                            muxer.hold_next_gap();
+                        }
                         continue;
                     }
                     let starved = self.input.lock().map(|i| i.starved).unwrap_or(true);
@@ -1570,6 +1575,10 @@ mod tests {
     }
 
     fn video_samples(ing: &TsIngest) -> Vec<Vec<u8>> {
+        track_samples(ing, 1)
+    }
+
+    fn track_samples(ing: &TsIngest, track_id: u32) -> Vec<Vec<u8>> {
         use mp4_atom::Decode;
         let muxer = ing.muxer().expect("muxer");
         let mut samples = Vec::new();
@@ -1578,7 +1587,11 @@ mod tests {
                 continue;
             };
             let moof = mp4_atom::Moof::decode(&mut part.data.as_ref()).expect("fragment");
-            for track in moof.traf.iter().filter(|track| track.tfhd.track_id == 1) {
+            for track in moof
+                .traf
+                .iter()
+                .filter(|track| track.tfhd.track_id == track_id)
+            {
                 for run in &track.trun {
                     let mut offset = run.data_offset.expect("sample offset") as usize;
                     for entry in &run.entries {
@@ -1648,6 +1661,41 @@ mod tests {
             "recover through the final complete part"
         );
         assert!(ing.dropped_packets() > 0, "report transport loss");
+    }
+
+    /// A lost packet inside the keyframe at 2 s withholds video until the
+    /// keyframe at 3 s, a gap of just over a second. The timeline is intact,
+    /// so the muxer holds the last good frame: no break, and the audio over
+    /// the gap is kept rather than cut out with the video.
+    #[test]
+    fn video_withheld_after_loss_keeps_the_audio_under_it() {
+        let packets: Vec<&[u8]> = LOSS_FIXTURE.chunks_exact(TS_SIZE).collect();
+        let video = |p: &[u8]| (u16::from(p[1] & 0x1f) << 8 | u16::from(p[2])) == 256;
+        let keyframe =
+            |p: &[u8]| video(p) && p[1] & 0x40 != 0 && p[3] & 0x20 != 0 && p[5] & 0x40 != 0;
+        let keyframes: Vec<usize> = (0..packets.len())
+            .filter(|&i| keyframe(packets[i]))
+            .collect();
+        assert!(keyframes.len() >= 5, "1 s keyframes over six seconds");
+        let lost = (keyframes[2] + 1..packets.len())
+            .find(|&i| video(packets[i]))
+            .expect("the keyframe spans several packets");
+        assert!(lost < keyframes[3]);
+        let damaged: Vec<u8> = packets
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != lost)
+            .flat_map(|(_, packet)| packet.iter().copied())
+            .collect();
+        let clean = loss_ingest(LOSS_FIXTURE);
+        let ing = loss_ingest(&damaged);
+        assert!(ing.dropped_packets() > 0);
+        let muxer = ing.muxer().expect("muxer");
+        assert_eq!(muxer.breaks(), 0, "a loss gap is held, not broken");
+        let (video_kept, video_all) = (video_samples(&ing).len(), video_samples(&clean).len());
+        assert!(video_kept + 25 < video_all, "the damaged GOP is withheld");
+        // A break would have cut the gap's AAC frames out with the video.
+        assert_eq!(track_samples(&ing, 2), track_samples(&clean, 2));
     }
 
     #[test]
