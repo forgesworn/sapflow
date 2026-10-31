@@ -15,12 +15,14 @@ use crate::App;
 use crate::publish::{Publication, PublicationLoss};
 use crate::publish_sessions::ScopedLease;
 use crate::recorder::IncompleteReason;
-use crate::srt::{IDLE, Refused, admit, feed};
+use crate::srt::{IDLE, Refused, admit, feed_payload};
 
 const QUEUE: usize = 16_384;
 struct Payload {
     bytes: Vec<u8>,
     received: Instant,
+    /// The SRT receiver gave up on data just before this payload.
+    after_loss: bool,
 }
 struct Publisher {
     tx: mpsc::Sender<Payload>,
@@ -197,11 +199,16 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                         (id, peer, result)
                     });
                 }
-                Event::Data { id, payload } => {
+                Event::Data {
+                    id,
+                    payload,
+                    after_loss,
+                } => {
                     if let Some(publisher) = publishers.get(&id)
                         && !publisher.enqueue(Payload {
                             bytes: payload,
                             received: Instant::now(),
+                            after_loss,
                         })
                     {
                         tracing::warn!("SRT publisher queue is full or gone");
@@ -359,7 +366,7 @@ async fn publish(
             result=tokio::time::timeout(IDLE,rx.recv())=>match result {
                 Ok(Some(data))=>{
                     if reject_stale(&publication, data.received, scope.is_some()){tracing::warn!("SRT scoped media queue exceeded one second");break}
-                    if let Err(error)=feed(&mut publication,&data.bytes){tracing::warn!(%error,"dropping SRT publisher");break}
+                    if let Err(error)=feed_payload(&mut publication,&data.bytes,data.after_loss){tracing::warn!(%error,"dropping SRT publisher");break}
                 }
                 Ok(None)=>break,
                 Err(_)=>{tracing::info!("SRT publisher idle");break}
@@ -373,6 +380,7 @@ async fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::srt::feed;
     use sapflow_srt::crypto::{CryptoConfig, KeySize};
     use sapflow_srt::seq::Seq;
     use sapflow_srt::{Caller, CallerConfig};
@@ -405,18 +413,21 @@ mod tests {
                 "full" => {
                     assert!(publisher.enqueue(Payload {
                         bytes: vec![0],
-                        received: Instant::now()
+                        received: Instant::now(),
+                        after_loss: false,
                     }));
                     assert!(!publisher.enqueue(Payload {
                         bytes: vec![1],
-                        received: Instant::now()
+                        received: Instant::now(),
+                        after_loss: false,
                     }));
                 }
                 "closed" => {
                     drop(rx);
                     assert!(!publisher.enqueue(Payload {
                         bytes: vec![0],
-                        received: Instant::now()
+                        received: Instant::now(),
+                        after_loss: false,
                     }));
                 }
                 "shutdown" => publisher.closed(Some(CloseReason::Shutdown), 0),

@@ -52,7 +52,7 @@ while let Some(event) = listener.poll_event() {
                 listener.reject(id, RejectCode::PEER);
             }
         }
-        Event::Data { id, payload } => { /* Vec<u8> of MPEG-TS, in order, on time */ }
+        Event::Data { id, payload, after_loss } => { /* Vec<u8> of MPEG-TS, in order, on time; after_loss: data just before it was given up on */ }
         Event::Closed { id, reason, stats } => { /* reason: Option<CloseReason> */ }
     }
 }

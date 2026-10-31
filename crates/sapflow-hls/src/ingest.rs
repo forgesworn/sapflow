@@ -43,6 +43,10 @@ mod pes_limits_tests;
 #[path = "startup_ts_tests.rs"]
 mod startup_ts_tests;
 
+#[cfg(test)]
+#[path = "transport_gap_tests.rs"]
+mod transport_gap_tests;
+
 #[derive(Clone, Copy)]
 struct StartupLimits {
     aus: usize,
@@ -955,6 +959,41 @@ impl TsIngest {
             );
         }
         Ok(self.pending)
+    }
+
+    /// The transport gave up on data before the next bytes (an SRT packet
+    /// dropped as too late). TS continuity counters wrap every 16 packets per
+    /// PID, so a loss of exactly 16, 32 or more packets on one PID is invisible
+    /// to them: the next frame's payload would be appended to the previous
+    /// frame's unbounded PES and one frame would vanish without a trace. Like
+    /// a detected continuity loss, this discards partial assemblies and any
+    /// unaligned leftover bytes, and waits for a keyframe. Call it before
+    /// pushing the first bytes after the gap.
+    pub fn transport_gap(&mut self, now: SystemTime) {
+        {
+            let Ok(mut input) = self.input.lock() else {
+                return;
+            };
+            if input.terminal || input.limit_exceeded {
+                return;
+            }
+            input.dropped = input.dropped.saturating_add(1);
+            input.start = input.buf.len();
+            input.reset_pes = false;
+        }
+        if self.waiting_for_startup_audio() || self.startup_replaying {
+            self.discard_startup_catchup(now);
+        }
+        if let Some(pes) = self.pes.take() {
+            let mut feed = pes.into_ts_packet_reader();
+            feed.boundaries.clear();
+            feed.pending_bytes = 0;
+            feed.pending = None;
+            // The first packet per PID after the gap starts a new count.
+            feed.continuity.clear();
+            self.pes = Some(PesPacketReader::new(feed));
+        }
+        self.waiting_keyframe = true;
     }
 
     /// Ends this connection's input, as distinct from temporary starvation.
