@@ -19,7 +19,7 @@ NATIVE_TEST_SUITES = {
 }
 HOST_OWNER_SOURCES = tuple('mobile/android/app/src/main/java/dev/forgesworn/sapflow/broadcaster/' + name for name in (
     'CaptureProfile.kt', 'CaptureIntent.kt', 'RecordingSourceGate.kt', 'AudioAacOutputDisposition.kt',
-    'AudioAacProfile.kt', 'AudioNativeAacGeneration.kt', 'AudioNativeAacRun.kt', 'RecordingCatalogue.kt',
+    'AudioAacProfile.kt', 'AudioHandoffBounds.kt', 'AudioNativeAacGeneration.kt', 'AudioNativeAacRun.kt', 'RecordingCatalogue.kt',
     'RecordingAppendContext.kt', 'RecordingCheckpointStorage.kt', 'AndroidRecordingStorageIO.kt', 'RecordingCheckpointOwner.kt',
 )) + ('mobile/android/host-tests/RecordingCheckpointOwnerHostTest.kt',)
 NATIVE_LIBRARIES = ('libsapflow_ffi.so', 'libsapflow_jni.so')

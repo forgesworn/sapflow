@@ -53,8 +53,8 @@ internal class AudioNativeAacGeneration(
     private var headBeforeFirstAu = false
     // Existing transfer-slot index + scalar serial, no token per output. A slot
     // cannot be recycled until actual checked Transfer.close returned.
-    private val serials = LongArray(16)
-    private val states = IntArray(16)
+    private val serials = LongArray(AudioHandoffBounds.SLOTS)
+    private val states = IntArray(AudioHandoffBounds.SLOTS)
     private fun owns(who: Any, native: Any) = who === owner && native === codec && !finished
     private fun callback(who: Any, native: Any, actualCallback: Any) = owns(who, native) && actualCallback === callbackOwner
     private fun refuse(): Boolean { failed = true; return false }
