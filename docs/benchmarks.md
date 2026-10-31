@@ -1534,6 +1534,11 @@ skipped, three runs each, interleaved with the order flipping each round,
    video packets against libsrt's 882 or 883, of 900). The decode columns in A
    count from 3 s in for that reason. It also means the first playable time in B
    includes a wait for the next keyframe.
+   Since 2026-10-31 `scripts/srt-loss.sh` starts the encoder only after the
+   sender prints `SRT target connected`. In a one-seed check at 0% and 3%
+   loss and 2000 ms, libsrt's output then held 900 of 900 video packets and
+   decoded with no messages, and sapflow's 898 (868 before the change, when
+   all three libsrt trials failed on decode messages).
 3. **sapflow logged video parser errors at 50 SRT streams while the OS dropped
    UDP datagrams.** In the 50-stream SRT
    runs sapflow logged `h264_reader::annexb` "invalid byte" errors: 10,837, 5,194

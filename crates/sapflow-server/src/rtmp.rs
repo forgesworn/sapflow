@@ -21,6 +21,7 @@ use tokio::time::Instant;
 
 use crate::App;
 use crate::publish::{Publication, Refusal};
+use crate::recorder::IncompleteReason;
 use crate::srt::IDLE;
 use crate::stream::{Source, SourceKind};
 
@@ -174,7 +175,7 @@ async fn connection(app: &Arc<App>, mut sock: TcpStream, from: IpAddr) -> Result
         // The strict wire parser can reject media or metadata before a push
         // reaches ingest. Its already accepted recording prefix is incomplete.
         if protocol_failed || matches!(result, Err(End::Protocol(_))) {
-            p.loss_notice().mark_incomplete();
+            p.loss_notice().mark_incomplete(IncompleteReason::Protocol);
         }
         p.end();
     }

@@ -251,6 +251,26 @@ that session were accepted but sent no data, and timed out after 5 s; its
 third, 20 s later, ran cleanly. Not yet explained. OBS quit and
 restarted 62 s later also resumed its held stream (table above).
 
+### Clean SRT stops and the final audio packet (2026-10-31)
+
+A clean SRT stop could mark a recording incomplete: the sender discarded
+unsent data on close, so the stream ended inside the final bounded AAC
+PES. The terminal drain now trims that PES after a lossless SHUTDOWN
+(`docs/audio-only-origin.md`). Each sender ran against the server before
+and after that change, on a shared Apple Silicon Mac:
+
+| Sender | Stop | Before | After |
+|--------|------|--------|-------|
+| ffmpeg 5.1.9, libsrt (Debian bookworm, in a Linux container) | SIGINT after 15 s, 12 rounds of two publishes per path (SRT then SRT, SRT then RTMP, RTMP then SRT) | 22 of 36 recordings with SRT incomplete (`end-of-input-loss`); RTMP-only 12 of 12 complete | 48 of 48 complete, 18 trims, all 48 SRT closes clean |
+| Our TS writer and SRT caller (`srt-publish-lab` example), 720p 2.5 Mbit/s, AAC 128 kbit/s | The apps' Stop (cancel, discard unsent, SHUTDOWN) at 6 to 12 s, 12 publishes | 12 of 12 complete | 12 of 12 complete, no trims |
+| srt-live-transmit (libsrt 1.5.7) fed by ffmpeg over UDP | SIGINT mid-stream, or as soon as the encoder finished, 20 publishes | not run | 20 of 20 complete, no trims |
+
+Our writer cannot cause this: it ends every SRT payload at a sample
+boundary, so an AAC frame of up to seven TS packets travels in one
+datagram, and its video PES are unbounded, so a cut video frame is not
+loss. srt-live-transmit sent its whole buffer before closing. Larix and
+OBS stops are not yet measured.
+
 ## SRT under packet loss (2026-10-20)
 
 `scripts/srt-loss.sh` compares sapflow's SRT receiver with libsrt's under
