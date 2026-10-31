@@ -70,7 +70,7 @@ internal class EncodedAudioEpoch(
         }
     }
     // Keep quarantined owners reachable even when they cannot rejoin free.
-    private val slots = Array(16) { Transfer(it) }
+    private val slots = Array(AudioHandoffBounds.SLOTS) { Transfer(it) }
     private val free = ArrayDeque<Transfer>().apply { slots.forEach { addLast(it) } }
     private fun discard(slot: Transfer, problem: Exception) {
         if (slot.ownershipUnknown) return // Failure fences this generation, never guess a native retry.
@@ -81,7 +81,7 @@ internal class EncodedAudioEpoch(
             } else slot.close()
         } catch (cleanup: Throwable) { problem.addSuppressed(cleanup) }
     }
-    private val handoff = CoalescedOwnedQueue<Transfer>(16, 64 * 1024, 250_000_000,
+    private val handoff = CoalescedOwnedQueue<Transfer>(AudioHandoffBounds.SLOTS, AudioHandoffBounds.BYTES, AudioHandoffBounds.MAX_AGE_NS,
         SystemClock::elapsedRealtimeNanos, callbacks::post,
         {
             if (it.receiptSerial != 0L) nativeAac?.handoffEntered(checkNotNull(generationOwner), checkNotNull(actualCodec),
