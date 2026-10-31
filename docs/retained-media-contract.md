@@ -298,3 +298,172 @@ scheduling under load. Wired Linux/Caddy/HTTP2 audience qualification, long
 fuzz campaigns and the production decision remain separate gates. Logical
 charges, process RSS and kernel memory must be reported separately. The
 seven-entry readiness problem above was fixed separately on 29 October.
+
+## Linux show-length run and matched load, 30 October 2026
+
+Source: `a9d8b11` (current `main`), the release container image, on an
+x86_64 Linux host with 8 cores, in a container limited as the deployed one is
+(`--cpus 1 --memory 384m`), recording on. Publishers, viewers and the server
+shared the host over loopback, through Docker's port proxy, on HTTP/1.1 with
+no Caddy. Media: a generated 60 s clip (`testsrc2`, 640x360 at 25 fps,
+600 kbit/s H.264 with 1 s keyframes, a 440 Hz AAC tone), looped with
+`ffmpeg -re -stream_loop -1 -c copy`; SRT publishes used 2000 ms latency.
+The harness scripts and raw samples were task scratch and are deleted; the
+figures below are the summary.
+
+### Six hours with drops
+
+One path published for six hours in 14 cycles of up to 25 minutes, alternating
+SRT and RTMP, with gaps of 20 s (inside the 90 s reconnect grace) and 150 s
+(beyond it) in turn, then a 10-minute tail. One reader fetched the playlist and
+newest segment every second; the server was sampled every minute.
+
+- **Viewer:** 21,253 playlist responses and 20,746 segments, no failed fetch,
+  slowest fetch 5 ms. The 869 playlist 404s fell only in the beyond-grace gaps
+  and the tail, as the contract requires.
+- **Server:** RSS 9.0 to 9.8 MB for the whole run, 14 to 16 descriptors, 3 to
+  5 threads, mean CPU 1.1% of a core, no restart or OOM kill. The log held
+  only the expected lifecycle lines.
+- **Container memory:** the cgroup reached its 384 MiB limit 9,740 times, all
+  page cache from the recording; anonymous memory stayed at or under 6.1 MB,
+  reclaim found every page it scanned, refaults were zero and full memory
+  pressure totalled 70 ms. A recording container's memory limit is therefore
+  mostly cache and should not be set from the server's RSS alone.
+- **Recordings:** seven files, one per stream ended by a break beyond the
+  grace or by the end of the run, 1.76 GB in all,
+  lasting 4501.4 s (three), 2557.9 s and 1500.5 s (three). Every file decoded;
+  each 4501 s file has one decoder message at the RTMP-to-SRT resume (see
+  the reconnect timing finding below). Two of the seven were finished as
+  `complete=false` with no logged cause at the time (see below).
+
+### Matched nominal and adverse load
+
+Four publishers (two SRT, two RTMP) on separate paths, 25 `sapflow-bench`
+viewers per path (100 in all), 600 s measured after a 10 s ramp.
+
+| Case | Requests, errors | Playlist p99 | Segment p99 | Part fan-out p95 | Peak RSS | Descriptors under load, after |
+|---|---|---:|---:|---:|---:|---|
+| Nominal | 719,760, 0 | 2.9 to 3.0 ms | 2.0 ms | 3.7 to 3.8 ms | 23.9 MB | 290 to 320, 14 |
+| Adverse: 5 of 25 per path at 16 kB/s | 575,808 fast, 0; 13,159 slow, 0 | 1.7 to 2.8 ms | 1.3 to 3.0 ms | 2.0 to 2.2 ms | 23.9 MB | 287 to 296, 14 |
+
+Slow viewers' segments took a median of 5.2 s (p99 6.6 s) without delaying
+the others. Idle RSS was 3.9 MB and CPU about 9% of a core under load. All
+four recordings in each case finished `complete=true` and decoded cleanly.
+A third case at 600 B/s recorded only the benchmark's own 15 s client
+timeout, so the server deadline is measured separately below.
+
+### Response deadline on the deployed container
+
+Small segments never reach the server's timeouts through a proxy. With the
+85 kB segments above, clients reading at 600 and 100 B/s through Docker's port
+proxy received every byte (after 142 s and 853 s): the proxy and kernel
+buffers took the whole response at once, so the server's write never blocked.
+The same holds for any buffering front, Caddy included, unless the response
+is larger than its buffers.
+
+A larger response was then read from inside the container's network: a
+generated 30 Mbit/s 1080p noise clip with 2 s keyframes gave 7.7 MB segments,
+and one client read a segment at 4 kB/s. The server's send queue held 1.1 to
+1.3 MB and did not drain far enough to accept more, and the server closed the
+connection 60 to 65 s after it opened (`FIN-WAIT-1`, the unsent queue still
+draining to the client). That is the 60 s no-progress timeout
+(`IDLE_TIMEOUT` in `crates/sapflow-server/src/own_http.rs`), which counts only
+successful writes and so fires before the 120 s absolute deadline for a
+reader this slow. The absolute deadline itself, for a reader that keeps
+writes progressing but too slowly to finish, remains covered only by the unit
+tests above. Neither close is logged.
+
+The same high-bitrate run found a memory limit that does not hold (finding 4).
+
+### Findings
+
+1. **Recordings are marked incomplete around SRT publishes, silently.** To
+   isolate the soak's two `complete=false` files, each trial published twice
+   for 15 s on its own path with a 5 s gap, twelve rounds of each pattern:
+
+   | First, second publish | Flagged incomplete | Decoder messages |
+   |---|---:|---|
+   | RTMP, RTMP | 0 of 12 | 2 in every file |
+   | RTMP, SRT | 2 of 12 | 2 in every file |
+   | SRT, RTMP | 5 of 12 | none |
+   | SRT, SRT | 6 of 12 | none |
+
+   The cause, found by logging each marking reason
+   ([#39](https://github.com/forgesworn/sapflow/pull/39)), is loss at end of
+   input after a clean SRT stop: in about half of SRT publishes the TS stream
+   ended partway through a bounded audio PES, which the parser reports as
+   truncated, with every SRT close a clean `shutdown` and no packet lost. The
+   sender discards its unsent tail on close; with ffmpeg's `linger=1` no
+   recording was flagged. Packets never sent carry no sequence numbers, so
+   the SRT layer cannot see the gap. The media in flagged files decode no
+   worse than the rest. Under the
+   [scoped-session contract](scoped-publish-sessions.md) an incomplete
+   recording must not advertise a complete-show replay, so a show whose SRT
+   encoder stops this way loses its replay, including at the show's final
+   stop. Whether to trim a truncated tail after a clean close is the
+   maintainer's decision (#39); whether Larix and OBS truncate on stop is
+   untested.
+
+   *Since then (31 October):* trimmed
+   ([#40](https://github.com/forgesworn/sapflow/pull/40)). After a clean SRT
+   close (a `shutdown`, no packets dropped), a final audio PES cut off at
+   end of input is dropped and logged instead of marking the recording
+   incomplete. With ffmpeg and libsrt as sender, 22 of 36 recordings were
+   flagged before and 48 of 48 were complete after (18 trimmed). Our own
+   SRT sender, as the iOS and Android apps use it, ends every payload on a
+   sample boundary and never truncated (12 of 12 complete on both builds).
+   Larix and OBS remain untested.
+2. **Display time steps back when a stream resumes after RTMP.** Every resume
+   that follows an RTMP publish gives one or two decoder messages (two per
+   file in the table above, one in each 4501 s soak file). In a frame dump the old run's
+   last reordered frame has PTS 15.68 s while the resuming keyframe gets DTS
+   15.56 s and PTS 15.64 s. The resume rebases decode time to the end of the
+   previous run (`rebase` from `crates/sapflow-hls/src/muxer.rs` lines 816 and
+   934), not past its largest presentation time, so B-frame streams overlap by
+   their reorder delay. SRT-first files did not show it with this clip. Live
+   HLS parts carry the same timestamps; player impact is untested.
+
+   *Since then:* fixed
+   ([#43](https://github.com/forgesworn/sapflow/pull/43)). The resuming
+   keyframe is placed no earlier than the old run's last presentation time
+   less its own composition offset, so display time never steps back; the
+   "Output time carries on" rule in `docs/reference.md` says so.
+3. **Slow-viewer closes are not logged.** The no-progress and absolute
+   deadline closes above leave no log line or counter, so operators cannot
+   tell slow viewers being shed from other failures.
+
+   *Since then:* logged
+   ([#42](https://github.com/forgesworn/sapflow/pull/42)): "closed a slow
+   viewer's response" with the reason (`body-deadline` or `no-progress`),
+   the bytes still unsent and per-worker counts, at most 10 lines a minute
+   per worker with a suppressed count.
+4. **High-bitrate publishing gets the server killed instead of refused.**
+   With the deployed settings (48-segment window, the default 512 MiB
+   retained-bytes cap, a 384 MiB container limit), one 30 Mbit/s publisher
+   raised anonymous memory to 383 MB in about two minutes and the kernel
+   killed the server (`Memory cgroup out of memory`, twice, restarted by
+   Docker), ending every stream on the host. Retained media is roughly the
+   bitrate times the window (48 segments of 2 s is 96 s, about 370 MB at
+   30 Mbit/s), and the default cap is above the container limit, so the
+   server's own admission never refused. The default publish limit is
+   40 Mbit/s. Keep `SAPFLOW_MAX_FRAGMENT_BYTES` well below the container's
+   memory limit (or lower the window or `SAPFLOW_MAX_PUBLISH_MBPS`) so the
+   server refuses first; do not lower a container's memory limit without
+   lowering these. Whether the default cap should follow the cgroup limit is
+   the maintainer's call.
+
+   *Since then:* the TV channel's container runs with
+   `SAPFLOW_MAX_FRAGMENT_BYTES` at 256 MiB, and the server now warns at
+   start when the cap is above three quarters of its cgroup memory limit,
+   naming a value that fits
+   ([#41](https://github.com/forgesworn/sapflow/pull/41)). The default cap
+   is unchanged.
+
+### Limits
+
+Loopback on one host, with the benchmark beside the server; HTTP/1.1 through
+Docker's proxy, not Caddy or HTTP/2; 100 viewers, not 250 or 750; one
+generated low-bitrate clip for the soak and load cases, one generated
+high-bitrate clip for the deadline and memory checks. This completes the matched nominal and adverse
+measurements left open above, on Linux, but not task 2.1's wired audience
+qualification or the production decision.

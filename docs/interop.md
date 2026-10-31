@@ -753,6 +753,71 @@ unencrypted), although fewer of its packets go unrecovered; the two
 receivers' outputs are counted differently (sapflow's after muxing into
 HLS, libsrt's as the raw stream), which may explain it; not yet checked.
 
+### Current main, both key lengths (2026-10-30)
+
+The same harness on the code of `a9d8b11` (a release build for Apple
+Silicon), on a shared Mac whose load average went from 1.5 to 13 during the
+runs (indexing, a browser and an Android emulator), so not a quiet machine.
+Five seeds, the four loss conditions, both latencies:
+
+```bash
+PASSPHRASE=loss-test-key PBKEYLEN=16 KMREFRESH=1500 SEEDS=5 JOBS=2 \
+  RECEIVERS="own=$SAPFLOW_BIN libsrt" scripts/srt-loss.sh
+PASSPHRASE=loss-test-key PBKEYLEN=32 KMREFRESH=2000 SEEDS=5 JOBS=2 \
+  RECEIVERS="own=$SAPFLOW_BIN libsrt" scripts/srt-loss.sh
+```
+
+**No libsrt comparison came out of it.** The machine's `srt-live-transmit`
+is now libsrt 1.5.7 (the runs above used 1.5.4). As the
+[SRT benchmark](benchmarks.md) records, the 1.5.7 sender drops the first GOP
+of every stream, so libsrt's raw output always starts mid-GOP and decodes
+with 39 to 144 messages, the loss-free run included. `scripts/srt-loss.sh`
+decodes the whole file and fails a trial on any decode message, so every
+libsrt trial was unqualified and the "own minus libsrt" tables are empty. The
+harness needs the benchmark's rule (decode from the first keyframe at or after
+3 s) before a like-for-like rerun. The cause turned out to be the harness
+starting the encoder before the sender had connected (fixed in #44), and the
+comparison with libsrt was rerun on 31 October (below).
+
+Our receiver, mean ± sample standard deviation over 5 seeds:
+
+| Loss | Latency | Overhead, AES-128 | Overhead, AES-256 | Video delivered, AES-128 | Video delivered, AES-256 |
+|------|--------:|------------------:|------------------:|-------------------------:|-------------------------:|
+| 3% random | 2000 ms | 3.2% ± 0.1 | 3.2% ± 0.1 | 100.00% | 100.00% |
+| 10% random | 2000 ms | 11.4% ± 0.4 | 11.4% ± 0.4 | 100.00% | 99.91% ± 0.21 |
+| 20% random | 2000 ms | 25.6% ± 0.5 | 25.7% ± 0.6 | 99.91% ± 0.21 | 100.00% |
+| bursty 8% | 2000 ms | 9.0% ± 1.2 | 9.0% ± 1.1 | 100.00% | 100.00% |
+| 3% random | 200 ms | 3.3% ± 0.1 | 3.4% ± 0.1 | 99.35% ± 1.44 | 100.00% |
+| 10% random | 200 ms | 12.0% ± 1.2 | 11.8% ± 0.7 | 87.40% ± 3.70 | 89.24% ± 4.23 |
+| 20% random | 200 ms | 25.5% ± 0.3 | 25.1% ± 0.3 | 36.11% ± 6.28 | 34.63% ± 5.06 |
+| bursty 8% | 200 ms | 9.4% ± 1.6 | 9.1% ± 1.1 | 89.66% ± 4.92 | 93.62% ± 2.96 |
+
+- **At 2000 ms nothing changed.** Overhead matches 21 October (3.3, 11.7,
+  26.1 and 9.8%) and the earlier unencrypted runs; on average under 0.1% of video
+  packets were missing in any condition; key refresh at both key lengths
+  left no undecryptable run.
+- **At 200 ms less video is delivered than on 21 October** (87% against
+  about 99% at 10% loss), while the packets left unrecovered stayed under 1%
+  (0.11% at 10%, 0.90 to 0.97% at 20%). This is the policy added after that
+  run, withholding video from a damaged frame to the next keyframe
+  (`62d2d02`, see the [SRT benchmark](benchmarks.md)). With 1 s keyframes
+  each unrecovered packet costs about half a second of video: one every 4 s
+  at 10% loss leaves about 87%, two a second at 20% leaves about a third.
+  Audio is not withheld and fared better (95 to 97% at 10%, 70 to 75% at
+  20%).
+- **One of 160 trials qualified badly** (AES-128, bursty 8%, 200 ms, seed 5):
+  its recording decoded with three `Frame num change from 14 to 15`
+  messages, a missing frame followed by kept frames, which the withholding
+  policy is meant to prevent. A candidate path: the malformed-PES branch of
+  `drain` in `crates/sapflow-hls/src/ingest.rs` counts a dropped PES and
+  carries on without `waiting_keyframe`, unlike the continuity and reset
+  branches. Not reproduced. A likelier mechanism, found later (#45; the
+  trial's raw output was gone): an SRT drop holding exactly 16 TS packets of
+  the video PID, which the 4-bit continuity counter cannot see. That branch
+  is not the cause, and the receiver now signals every given-up packet to
+  ingest; not shown to remove the symptom end to end.
+- 79 of 80 AES-128 and 80 of 80 AES-256 trials of our receiver qualified.
+
 ### Encrypted again, against libsrt 1.5.7 (2026-10-31)
 
 The encrypted matrix again, with the harness's connect wait (the sender
