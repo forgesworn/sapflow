@@ -247,6 +247,12 @@ if [ "${1:-}" = "--trial" ]; then
   srt-live-transmit -a:no -c:1316 "udp://127.0.0.1:$up" "srt://127.0.0.1:$pp?latency=$lat$sndq$sid" > "$d/snd.log" 2>&1 &
   srp=$!; pids+=("$srp")
   python3 "$UDP_FIXTURE" wait --pid "$srp" --port "$up" >> "$d/outcomes.txt" 2>> "$d/snd.log"
+  # srt-live-transmit discards input it reads before its SRT connection is up
+  # (libsrt 1.5.7 lost the first GOP that way, so every receiver started
+  # mid-GOP and libsrt's output never decoded cleanly). Start the encoder only
+  # once the sender reports the connection; a sender that never connects
+  # still runs the trial, which then fails on its own evidence.
+  for _ in $(seq 50); do grep -q 'SRT target connected' "$d/snd.log" && break; sleep 0.1; done
   # Preserve the actual FFmpeg PIPESTATUS even when it exits before discovery.
   # Its supervising shell and the independent sender are reaped separately.
   ( set +e
