@@ -15,7 +15,7 @@ use crate::callback::Callbacks;
 use crate::publish_sessions::ScopedLease;
 #[cfg(test)]
 use crate::recorder::Recorder;
-use crate::recorder::RecorderFactory;
+use crate::recorder::{IncompleteReason, RecorderFactory};
 use crate::stream::{Claim, ClaimError, LiveStream, Retirement, Source, SourceKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,11 +66,11 @@ pub struct PublicationLoss {
     scope: Option<ScopedLease>,
 }
 impl PublicationLoss {
-    pub fn mark_incomplete(&self) {
+    pub fn mark_incomplete(&self, reason: IncompleteReason) {
         let mark = || {
             self.stream
                 .session()
-                .mark_recording_incomplete(self.generation)
+                .mark_recording_incomplete(self.generation, reason)
         };
         if let Some(scope) = &self.scope {
             // Revoke/end and this notice share gate -> session lock order.
@@ -319,7 +319,8 @@ impl Publication {
         if self.rate.add(n, Instant::now()) {
             Ok(())
         } else {
-            self.loss_notice().mark_incomplete();
+            self.loss_notice()
+                .mark_incomplete(IncompleteReason::OverRate);
             Err(OverRate)
         }
     }
@@ -375,17 +376,17 @@ impl Publication {
             result
         });
         if discarded {
-            session.mark_recording_incomplete(self.generation);
+            session.mark_recording_incomplete(self.generation, IncompleteReason::IngestDiscard);
         }
         let applied = match result {
             Ok(applied) => applied,
             Err(error) => {
-                session.mark_recording_incomplete(self.generation);
+                session.mark_recording_incomplete(self.generation, IncompleteReason::IngestError);
                 return Err(PushError::Ingest(error));
             }
         };
         if applied.media_loss {
-            session.mark_recording_incomplete(self.generation);
+            session.mark_recording_incomplete(self.generation, IncompleteReason::MediaLoss);
         }
         let ready = !self.published
             && if self.scope.is_some() {
@@ -415,8 +416,10 @@ impl Publication {
             // One ingest batch can both begin an epoch and discover loss.
             // Without sample-level attribution, conservatively taint both
             // files before feeding any parts into the successor recorder.
-            if applied.media_loss || discarded {
-                session.mark_recording_incomplete(self.generation);
+            if discarded {
+                session.mark_recording_incomplete(self.generation, IncompleteReason::IngestDiscard);
+            } else if applied.media_loss {
+                session.mark_recording_incomplete(self.generation, IncompleteReason::MediaLoss);
             }
         }
         if let Some(rec) = &mut session.recorder
@@ -895,7 +898,7 @@ pub(crate) mod loss_tests {
             fixture.app.callbacks.clone(),
             0,
         ));
-        notice.mark_incomplete();
+        notice.mark_incomplete(IncompleteReason::MediaLoss);
         Fixture::feed(&mut new);
         new.end();
         fixture.completion("finalised").await;

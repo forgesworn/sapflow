@@ -102,6 +102,17 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// The lowest cgroup memory limit over this process's cgroup and its
+/// parents, on Linux. None elsewhere or when unlimited.
+fn memory_limit() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    sapflow_core::memory::limit_files(&own)
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(format!("/sys/fs/cgroup{file}")).ok())
+        .filter_map(|contents| sapflow_core::memory::parse_limit(&contents))
+        .min()
+}
+
 async fn run(config: Config) -> std::io::Result<()> {
     let (before, after) = fdlimit::raise();
     if after < 4_096 {
@@ -150,12 +161,25 @@ async fn run(config: Config) -> std::io::Result<()> {
         config,
     });
 
+    let memory_limit = memory_limit();
     tracing::info!(
         presentations = app.config.max_presentations,
         fragment_bytes = app.config.max_fragment_bytes,
+        memory_limit,
         response_deadline_secs = app.config.http_body_timeout.as_secs(),
         "retained HLS limits"
     );
+    let fragment_bytes = app.config.max_fragment_bytes as u64;
+    if let Some(limit) = memory_limit
+        && sapflow_core::memory::fragment_cap_exceeds(fragment_bytes, limit)
+    {
+        tracing::warn!(
+            fragment_bytes,
+            memory_limit = limit,
+            suggested_max = sapflow_core::memory::max_fragment_bytes(limit),
+            "SAPFLOW_MAX_FRAGMENT_BYTES is above three quarters of the memory limit: a high-bitrate publisher can get the server killed instead of refused; lower it or raise the limit"
+        );
+    }
 
     // Viewers are served on our own event loop, not on tokio.
     let threads = app.config.http_threads;
