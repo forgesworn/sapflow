@@ -92,3 +92,61 @@ fn a_transport_gap_after_finish_or_a_failed_parser_changes_nothing() {
     ingest.transport_gap(NOW);
     assert_eq!(ingest.dropped_packets(), dropped);
 }
+
+fn track_frames(ingest: &TsIngest, track_id: u32) -> usize {
+    use mp4_atom::Decode;
+    let muxer = ingest.muxer().expect("muxer");
+    (0..muxer.next_part_id())
+        .filter_map(|id| match muxer.part(id) {
+            crate::PartLookup::Found(part) => Some(part),
+            _ => None,
+        })
+        .map(|part| {
+            let moof = mp4_atom::Moof::decode(&mut std::io::Cursor::new(&part.data[..]))
+                .expect("actual MP4 moof");
+            moof.traf
+                .iter()
+                .filter(|t| t.tfhd.track_id == track_id)
+                .flat_map(|t| &t.trun)
+                .map(|r| r.entries.len())
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// 16 video-PID packets lost from the start of the keyframe at 2 s, so
+/// video waits for the keyframe at 3 s, a gap of just over a second. The
+/// signal's keyframe wait holds the last good frame, as a continuity jump's
+/// does: no break, and the audio under the gap is kept.
+#[test]
+fn a_signalled_gap_holds_the_last_frame_and_keeps_the_audio() {
+    let fixture = include_bytes!("../tests/fixtures/transport-loss-6s.ts");
+    let packets: Vec<&[u8]> = fixture.chunks_exact(TS_SIZE).collect();
+    let video = |p: &[u8]| ((u16::from(p[1] & 0x1f) << 8) | u16::from(p[2])) == 256;
+    let keyframe = |p: &[u8]| video(p) && p[1] & 0x40 != 0 && p[3] & 0x20 != 0 && p[5] & 0x40 != 0;
+    let keyframes: Vec<usize> = (0..packets.len())
+        .filter(|&i| keyframe(packets[i]))
+        .collect();
+    let removed: Vec<usize> = (keyframes[2]..packets.len())
+        .filter(|&i| video(packets[i]))
+        .take(16)
+        .collect();
+    assert!(*removed.last().expect("16 packets") < keyframes[3]);
+    let cut = removed[0];
+    let keep = |range: std::ops::Range<usize>| -> Vec<u8> {
+        range
+            .filter(|i| !removed.contains(i))
+            .flat_map(|i| packets[i].to_vec())
+            .collect()
+    };
+    let mut clean = TsIngest::new(MuxerConfig::default());
+    clean.push(fixture, NOW).expect("clean");
+    let mut told = TsIngest::new(MuxerConfig::default());
+    told.push(&keep(0..cut), NOW).expect("prefix");
+    told.transport_gap(NOW);
+    told.push(&keep(cut..packets.len()), NOW).expect("suffix");
+    assert!(told.dropped_packets() > 0);
+    assert_eq!(told.muxer().expect("muxer").breaks(), 0);
+    assert!(track_frames(&told, 1) + 25 < track_frames(&clean, 1));
+    assert_eq!(track_frames(&told, 2), track_frames(&clean, 2));
+}

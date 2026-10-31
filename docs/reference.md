@@ -108,9 +108,9 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   (Part timing, above): one second is under the target's headroom, so one
   such stall cannot by itself push a segment past the limit, and the
   length rule catches several.
-- **Except a gap sapflow made itself.** After transport damage (a
-  continuity jump where a packet was lost, lost sync, a malformed packet)
-  ingest withholds video until the next keyframe, so with 1 s keyframes the wait often passes a second. The
+- **Except a gap sapflow made itself.** After transport damage (an SRT
+  packet the receiver gave up on, a continuity jump, lost sync, a malformed
+  packet) ingest withholds video until the next keyframe, so with 1 s keyframes the wait often passes a second. The
   timestamps are still the encoder's, so ingest tells the muxer
   (`Muxer::hold_next_gap`), and when that keyframe moves time forward the
   last good frame is held across the gap as a shorter stall is: no break,

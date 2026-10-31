@@ -994,6 +994,9 @@ impl TsIngest {
             self.pes = Some(PesPacketReader::new(feed));
         }
         self.waiting_keyframe = true;
+        if let Some(muxer) = self.es.muxer_mut() {
+            muxer.hold_next_gap();
+        }
     }
 
     /// Ends this connection's input, as distinct from temporary starvation.
