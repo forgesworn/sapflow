@@ -80,6 +80,18 @@ impl PublicationLoss {
             mark();
         }
     }
+
+    /// The transport closed in order with nothing dropped, so a final audio
+    /// PES cut short by the sender may be trimmed instead of marking loss.
+    pub fn mark_clean_close(&self) {
+        let mark = || self.stream.session().mark_clean_close(self.generation);
+        if let Some(scope) = &self.scope {
+            // After revocation the terminal drain has already run strictly.
+            let _ = scope.with_open(mark);
+        } else {
+            mark();
+        }
+    }
 }
 
 #[derive(Debug)]
