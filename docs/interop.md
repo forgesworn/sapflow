@@ -732,3 +732,80 @@ relative to its own clean run than libsrt does (99.05% against 99.89%,
 unencrypted), although fewer of its packets go unrecovered; the two
 receivers' outputs are counted differently (sapflow's after muxing into
 HLS, libsrt's as the raw stream), which may explain it; not yet checked.
+
+### Encrypted again, against libsrt 1.5.7 (2026-10-31)
+
+The encrypted matrix again, with the harness's connect wait (the sender
+must print `SRT target connected` before the encoder starts, so no GOP is
+lost at the start and libsrt's clean runs decode without error), 5 seeds,
+both key lengths, on a shared Apple Silicon Mac. Source: `e555596` plus that
+fix (`249fcc4`), a native release build. The sender is libsrt 1.5.7's
+`srt-live-transmit`, FFmpeg 8.1.2 encodes the clip. 12:35 to 13:36 UTC; load
+average 42 falling to about 4 in the first ten minutes, then 2 to 13.
+
+```bash
+PASSPHRASE=loss-test-key PBKEYLEN=16 KMREFRESH=1500 JOBS=2 \
+  RECEIVERS="own=$SAPFLOW_BIN libsrt" scripts/srt-loss.sh
+PASSPHRASE=loss-test-key PBKEYLEN=32 KMREFRESH=2000 JOBS=2 \
+  RECEIVERS="own=$SAPFLOW_BIN libsrt" scripts/srt-loss.sh
+```
+
+The run used the rule before this change, which failed every trial with a
+decoder message. 18 of 84 AES-128 trials and 17 of 84 AES-256 ones failed
+that way, all libsrt at 200 ms except one at 20% and 2000 ms, and for no
+other reason. The tables below rescore those rows under the current rule
+(a decoder message fails only a clean run) from the retained `results.tsv`;
+nothing was run again.
+
+`own` minus libsrt, AES-128 then AES-256, with Welch t over the 5 seeds
+(|t| below about 2.3 is noise):
+
+| Loss | Latency | Overhead, points | Admission loss, points | Video delivered, own / libsrt | Decode messages, own / libsrt |
+|------|--------:|-----------------:|-----------------------:|------------------------------:|------------------------------:|
+| 3% random | 2000 ms | -0.2 (t -3.4) / -0.1 (t -1.9) | 0 / 0 | 100 / 100% both | 0 / 0 both |
+| 10% random | 2000 ms | -0.9 (t -2.8) / -0.7 (t -2.7) | 0 / 0 | 100 / 100% both | 0 / 0 both |
+| 20% random | 2000 ms | -1.7 (t -5.7) / -1.9 (t -5.2) | 0 / +0.01 (t 1.9) | 99.91 / 100%, 100 / 100% | 0 / 0.4 both |
+| bursty 8% | 2000 ms | -0.6 (t -0.7) / -0.5 (t -0.6) | 0 / 0 | 100 / 100% both | 0 / 0 both |
+| 3% random | 200 ms | +0.0 (t 0.5) / +0.2 (t 1.6) | -0.01 (t -1.1) / 0.00 | 99.06 / 100%, 99.22 / 100% | 0 / 0.6, 0 / 0.2 |
+| 10% random | 200 ms | -0.0 (t -0.1) / -0.2 (t -0.9) | -0.06 (t -1.7) / -0.07 (t -2.0) | 82.3 / 100%, 89.4 / 100% | 0 / 16.6, 0 / 13.6 |
+| 20% random | 200 ms | +0.2 (t 0.6) / -1.0 (t -4.3) | -0.52 (t -6.1) / -0.58 (t -12.3) | 37.1 / 99.98%, 33.5 / 99.98% | 0 / 123.4, 0 / 108.4 |
+| bursty 8% | 200 ms | +0.1 (t 0.1) / -0.1 (t -0.1) | +0.16 (t 0.7) / +0.05 (t 0.5) | 92.7 / 99.89%, 91.8 / 99.93% | 0 / 6.6, 0 / 5.8 |
+
+Audio delivered by `own` at 200 ms was 95.4% and 98.3% at 10% random loss,
+65.3% and 65.9% at 20%, and 97.4% and 97.1% under bursts (libsrt 98.4% or
+more everywhere). Clean runs: `own` 898 video and 1,404 audio packets,
+libsrt 900 and 1,408, at both latencies, with no decoder messages.
+
+What it shows:
+
+- **Key refresh under loss still works.** At 2000 ms `own` delivered every
+  video and audio packet of its clean run with no decoder messages in all
+  30 trials at 3%, 10% and bursty loss, and at 20% lost at most a fraction
+  of a percent (99.91% video, 99.77% audio at AES-128).
+- **Overhead is level or lower.** At 2000 ms `own` retransmits less than
+  libsrt at 10% and 20% random loss with both key lengths (t -2.7 to -5.7)
+  and at 3% with AES-128 (t -3.4), but not measurably at 3% with AES-256
+  (t -1.9) or under bursts. At 200 ms it is level everywhere except 1.0
+  point lower at 20% with AES-256 (t -4.3). The 21 October excess at 200 ms
+  (+3.3 to +5.5 points at a load of 80 to 130) is gone here, as it was on the
+  quieter machine that day; this run does not separate the load from code
+  changes since `8ee5704`.
+- **Fewer packets miss the deadline at 20% and 200 ms:** 0.52 and 0.58
+  points fewer than libsrt (t -6.1 and -12.3), as on 21 October.
+- **The recordings differ most at 200 ms under heavy loss.** libsrt writes
+  every byte it got, holes included: nearly every video packet, with 75 to
+  204 decoder messages a trial at 20%. sapflow withholds video from a
+  damaged frame to the next keyframe (commit `62d2d02`). About 0.9% of
+  packets unrecovered would hit most 1 s GOPs, and its recording kept
+  a third of the video and two thirds of the audio, with no decoder
+  messages. On 21 October, with a build from before that commit, it kept
+  99.25% of the video with 54.5 decoder messages a trial. The video loss
+  follows from the design; why audio also drops by a third is not yet
+  checked.
+
+Limits as in the sections above, and: one sender (libsrt 1.5.7); the run
+predates the SRT drop signal work (PR #45), which withholds video
+after every given-up packet and may lower `own`'s delivery at 200 ms
+further; the delivered figures compare different things wherever the decode
+messages differ; the first ten minutes of the AES-128 run were at a high
+but falling load.
