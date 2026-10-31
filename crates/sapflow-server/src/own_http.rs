@@ -19,6 +19,8 @@
 //! - A connection with nothing parked that makes no progress for
 //!   [`IDLE_TIMEOUT`] is closed.
 //! - A ready response has an absolute [`BODY_TIMEOUT`], independent of progress.
+//! - Closing a response at either deadline is logged, without the viewer's
+//!   address and at most [`SLOW_CLOSE_LOGS`] a minute per worker.
 //! - One response in flight per connection, so a client that sends without
 //!   reading stops being read, and at most [`REQUESTS_PER_TURN`] requests per
 //!   connection before the worker serves the others.
@@ -69,6 +71,8 @@ const WRITES_PER_TURN: usize = 16;
 const ACCEPTS_PER_TURN: usize = 64;
 /// How often each worker checks deadlines and retries a paused accept.
 const SWEEP: Duration = Duration::from_millis(250);
+/// Slow-viewer close lines each worker logs a minute; the rest are counted.
+pub const SLOW_CLOSE_LOGS: u32 = 10;
 
 static OPEN: AtomicUsize = AtomicUsize::new(0);
 /// Every worker's waker, so a stream change reaches every parked request.
@@ -170,9 +174,31 @@ struct Output {
 /// Bound stack usage independently of the number of parts in a segment.
 const WRITE_SLICES: usize = 8;
 
+/// Why the server ended a response before the viewer had read it all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlowClose {
+    /// The absolute [`BODY_TIMEOUT`] passed.
+    Deadline,
+    /// Nothing written for [`IDLE_TIMEOUT`] with bytes still queued.
+    Stalled,
+}
+
+impl SlowClose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "body-deadline",
+            Self::Stalled => "no-progress",
+        }
+    }
+}
+
 impl Output {
     fn is_empty(&self) -> bool {
         self.head.is_empty() && self.body.is_empty()
+    }
+
+    fn remaining(&self) -> usize {
+        self.head.len() - self.written + self.body.len()
     }
 
     fn expired(&self, now: Instant, timeout: Duration) -> bool {
@@ -327,6 +353,9 @@ struct Worker {
     /// Accepting stopped on the connection cap or an error: retry at sweeps.
     accept_paused: bool,
     buf: Vec<u8>,
+    slow_log: sapflow_core::limits::LogLimiter,
+    /// Responses this worker closed at the body deadline and for no progress.
+    slow_closes: (u64, u64),
 }
 
 impl Worker {
@@ -351,6 +380,11 @@ impl Worker {
             accept_more: false,
             accept_paused: false,
             buf: vec![0; 16 * 1024],
+            slow_log: sapflow_core::limits::LogLimiter::new(
+                SLOW_CLOSE_LOGS,
+                Duration::from_secs(60),
+            ),
+            slow_closes: (0, 0),
         })
     }
 
@@ -491,11 +525,13 @@ impl Worker {
                     let slow_head = c
                         .head_started
                         .is_some_and(|s| now.duration_since(s) >= t.header);
-                    if slow_head
-                        || c.output.expired(now, t.body)
-                        || now.duration_since(c.last_progress) >= t.idle
-                    {
-                        closing.push(*id);
+                    let idle = now.duration_since(c.last_progress) >= t.idle;
+                    if c.output.expired(now, t.body) {
+                        closing.push((*id, Some(SlowClose::Deadline)));
+                    } else if idle && !c.output.is_empty() {
+                        closing.push((*id, Some(SlowClose::Stalled)));
+                    } else if slow_head || idle {
+                        closing.push((*id, None));
                     }
                 }
             }
@@ -503,11 +539,39 @@ impl Worker {
         for id in expired {
             self.service(id, false);
         }
-        for id in closing {
+        for (id, slow) in closing {
+            if let Some(reason) = slow {
+                self.record_slow_close(id, reason, now);
+            }
             self.close(id);
         }
         if self.accept_paused {
             self.accept();
+        }
+    }
+
+    /// Counts and, within the log budget, reports a response ended early.
+    fn record_slow_close(&mut self, id: usize, reason: SlowClose, now: Instant) {
+        let Some((conn, _)) = self.conns.get(&id) else {
+            return;
+        };
+        match reason {
+            SlowClose::Deadline => self.slow_closes.0 += 1,
+            SlowClose::Stalled => self.slow_closes.1 += 1,
+        }
+        if let Some(suppressed) = self.slow_log.allow(now) {
+            tracing::info!(
+                reason = reason.as_str(),
+                remaining_bytes = conn.output.remaining(),
+                response_ms = conn
+                    .output
+                    .response_started
+                    .map_or(0, |at| now.saturating_duration_since(at).as_millis() as u64),
+                worker_body_deadline_closes = self.slow_closes.0,
+                worker_no_progress_closes = self.slow_closes.1,
+                suppressed,
+                "closed a slow viewer's response"
+            );
         }
     }
 
@@ -536,8 +600,14 @@ impl Worker {
         })
         .unwrap_or(Turn::Close);
         let parked = conn.parked.is_some();
+        let deadline = conn.output.expired(Instant::now(), body_timeout);
         match turn {
-            Turn::Close => self.close(id),
+            Turn::Close => {
+                if deadline {
+                    self.record_slow_close(id, SlowClose::Deadline, Instant::now());
+                }
+                self.close(id);
+            }
             Turn::Again => {
                 self.parked.remove(&id);
                 self.ready.push_back(id);
