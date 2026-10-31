@@ -90,13 +90,30 @@ pub async fn admit(
 
 /// Feeds one payload (MPEG-TS) to the publication. An error means the
 /// publisher is dropped.
+#[cfg(test)]
 pub fn feed(publication: &mut Publication, data: &[u8]) -> Result<(), String> {
+    feed_payload(publication, data, false)
+}
+
+/// [`feed`], first resetting TS assembly when the transport gave up on data
+/// just before this payload (`after_loss`): continuity counters miss gaps of
+/// a multiple of 16 packets on a PID.
+pub fn feed_payload(
+    publication: &mut Publication,
+    data: &[u8],
+    after_loss: bool,
+) -> Result<(), String> {
     publication
         .received(data.len())
         .map_err(|e| e.to_string())?;
     publication
         .push(|src, now| match src {
-            Source::Ts(ts) => ts.push(data, now),
+            Source::Ts(ts) => {
+                if after_loss {
+                    ts.transport_gap(now);
+                }
+                ts.push(data, now)
+            }
             Source::Flv(_) => Ok(Default::default()),
         })
         .map_err(|e| e.to_string())
