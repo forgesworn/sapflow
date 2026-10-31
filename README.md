@@ -160,7 +160,10 @@ encoded init/fragment backing capacity to 512 MiB by default. Each allocation
 is charged once, including headers and spare Vec capacity. Cache, response,
 sliced and recorder aliases keep that charge through their final payload
 owner. Exhaustion refuses media and preserves the admitted recording prefix
-as incomplete.
+as incomplete. The cap covers retained media, not the whole process: on
+Linux the server reads its cgroup memory limit at startup and warns when
+the cap is above three quarters of it, since a high-bitrate publisher could
+then get the server killed instead of refused.
 
 `SAPFLOW_HTTP_BODY_TIMEOUT` (`--http-body-timeout`) gives each ready framed
 response 120 seconds by default, configurable from 1 through 3,600. Successful
