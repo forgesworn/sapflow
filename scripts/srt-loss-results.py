@@ -68,8 +68,13 @@ def collect(work):
     }}
 
 
-def qualify(raw, trial_exit):
-    """A completed source and clean decoded A/V are required for this A/V fixture."""
+def qualify(raw, trial_exit, loss=None):
+    """A completed source and decoded A/V are required for this A/V fixture.
+
+    Decoder error messages fail a loss-free trial (or one whose loss is not
+    known), where they mean the clip or harness is broken. Under loss they are
+    what the receiver delivered: libsrt writes damaged bytes through, and that
+    is the comparison, so they are recorded rather than disqualifying."""
     failures = []
     if trial_exit != 0:
         failures.append(f"trial exit {trial_exit if trial_exit is not None else 'missing'}")
@@ -96,8 +101,9 @@ def qualify(raw, trial_exit):
         value = metrics.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             failures.append(f"{field} must be positive")
-    if type(metrics.get("decode_msgs")) is not int or metrics["decode_msgs"] != 0:
-        failures.append(f"decode_msgs={metrics.get('decode_msgs')}")
+    decode = metrics.get("decode_msgs")
+    if type(decode) is not int or decode < 0 or (decode != 0 and loss in (None, "none")):
+        failures.append(f"decode_msgs={decode}")
     for field in ["data_retx", "naks", "reordered", "in_time"]:
         value = metrics.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -134,7 +140,7 @@ def collate(output, work=None):
         exit_path = prefix.with_suffix(".exit")
         trial_exit = number(exit_path.read_text().strip()) if exit_path.is_file() else None
         if attempted:
-            failures.extend(qualify(raw, trial_exit))
+            failures.extend(qualify(raw, trial_exit, planned["loss"]))
         else:
             failures.append("planned trial was not attempted")
         row = {field: planned[field] for field in ["receiver", "loss", "latency_ms", "seed"]}
@@ -176,13 +182,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--index", type=int)
     parser.add_argument("--work", type=Path)
+    parser.add_argument("--loss")
     args = parser.parse_args()
     if args.command == "record":
         if args.index is None or args.work is None:
             parser.error("record needs --index and --work")
         raw = collect(args.work)
         atomic_json(args.output / "trials" / f"{args.index}.json", raw)
-        return 0 if not qualify(raw, 0) else 1
+        return 0 if not qualify(raw, 0, args.loss) else 1
     return 0 if collate(args.output, args.work) else 1
 
 

@@ -111,9 +111,14 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
 - **Output time carries on.** The keyframe that resumes the stream is
   moved to the time the last segment ended, and everything after it, audio
   included, by the same amount. Output timestamps therefore only move
-  forward with no hole, even across an encoder clock jumping back, and a
-  recording (one fMP4 file) plays and seeks straight through; its length is
-  the media kept.
+  forward, even across an encoder clock jumping back, and a recording (one
+  fMP4 file) plays and seeks straight through; its length is the media kept.
+  There is no hole unless the old run reordered frames (B-frames): its last
+  anchor frame is presented after the run's decode end, so the keyframe is
+  moved later, until its presentation time is not before that frame's end.
+  The decode-time hole this leaves is at most the old run's reorder delay,
+  typically one to three frames, after the discontinuity, instead of display
+  time stepping back.
 - **Marked as a discontinuity.** The segment after a break carries
   `EXT-X-DISCONTINUITY`, before its `EXT-X-PROGRAM-DATE-TIME` and its
   parts (never among them), because media was lost and the wall clock

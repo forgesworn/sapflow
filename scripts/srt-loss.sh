@@ -29,7 +29,9 @@
 # about 2.3 is not a difference worth claiming.
 #
 # A trial passes only with a completed source encoder, positive video/audio
-# counts, successful probes/decoding and no decoder error messages. Every
+# counts and successful probes/decoding. Decoder error messages fail a clean
+# (loss-free) run; under loss they are a result, since libsrt writes damaged
+# bytes through where sapflow drops them, and are reported per row. Every
 # planned trial is retained, including crashes and trials not attempted after
 # an earlier failure. A failed or incomplete collection exits nonzero.
 #
@@ -81,7 +83,7 @@ summarise() { # results.tsv
       r = $1; loss = $2; lat = $3; v = $5; a = $6; dec = $7; orig = $8; retx = $9
       if ($13 + 0 > 0) reordered++
       if (enc_col && !($(enc_col) in encseen)) { encseen[$(enc_col)] = 1; encs[++nenc] = $(enc_col) }
-      if ($12 != "ok" || v !~ /^[0-9]+$/ || a !~ /^[0-9]+$/ || v + 0 <= 0 || a + 0 <= 0 || dec !~ /^0$/) {
+      if ($12 != "ok" || v !~ /^[0-9]+$/ || a !~ /^[0-9]+$/ || v + 0 <= 0 || a + 0 <= 0 || dec !~ /^[0-9]+$/ || (loss == "none" && dec + 0 > 0)) {
         failed[r SUBSEP loss SUBSEP lat]++; total_failed++
         printf "Unqualified trial: %s %s %s ms seed %s (%s)\n", r, loss, lat, $4, $12
         next
@@ -123,7 +125,9 @@ summarise() { # results.tsv
         if (!(loss SUBSEP lat in cond)) { cond[loss SUBSEP lat] = 1; conds[++nc] = loss SUBSEP lat }
       }
       print ""
-      print "Each sapflow build minus libsrt (Welch t over the seeds; |t| below about 2.3 is noise):"
+      print "Each sapflow build minus libsrt (Welch t over the seeds; |t| below about 2.3 is noise)."
+      print "Where decode messages differ, packets delivered count different things: libsrt"
+      print "writes damaged packets through, sapflow drops what it cannot use."
       print ""
       print "| Loss | Latency | Receiver | Overhead, points | t | Proxy admission loss, points | t | Video delivered, points | t | Decode messages | t |"
       print "|------|--------:|----------|-----------------:|--:|----------------------:|--:|------------------------:|--:|----------------:|--:|"
@@ -247,6 +251,12 @@ if [ "${1:-}" = "--trial" ]; then
   srt-live-transmit -a:no -c:1316 "udp://127.0.0.1:$up" "srt://127.0.0.1:$pp?latency=$lat$sndq$sid" > "$d/snd.log" 2>&1 &
   srp=$!; pids+=("$srp")
   python3 "$UDP_FIXTURE" wait --pid "$srp" --port "$up" >> "$d/outcomes.txt" 2>> "$d/snd.log"
+  # srt-live-transmit discards input it reads before its SRT connection is up
+  # (libsrt 1.5.7 lost the first GOP that way, so every receiver started
+  # mid-GOP and libsrt's output never decoded cleanly). Start the encoder only
+  # once the sender reports the connection; a sender that never connects
+  # still runs the trial, which then fails on its own evidence.
+  for _ in $(seq 50); do grep -q 'SRT target connected' "$d/snd.log" && break; sleep 0.1; done
   # Preserve the actual FFmpeg PIPESTATUS even when it exits before discovery.
   # Its supervising shell and the independent sender are reaped separately.
   ( set +e
@@ -288,7 +298,7 @@ if [ "${1:-}" = "--trial" ]; then
     ffmpeg -v error -i "$f" -f null - > "$d/decode.log" 2>&1 || e_exit=$?
     printf 'video_probe_exit=%s\naudio_probe_exit=%s\ndecoder_exit=%s\n' "$v_exit" "$a_exit" "$e_exit" >> "$d/outcomes.txt"
   fi
-  python3 "$RESULTS" record --output "$OUT" --index "$idx" --work "$d"
+  python3 "$RESULTS" record --output "$OUT" --index "$idx" --work "$d" --loss "$loss"
   exit $?
 fi
 

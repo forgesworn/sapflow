@@ -118,6 +118,44 @@ fn stalled_response_releases_its_payload_at_the_absolute_deadline() {
         "idle timeout cannot reclaim this stalled body yet"
     );
     assert_eq!(quota.used(), 0);
+    assert_eq!(
+        worker.slow_closes,
+        (1, 0),
+        "counted as a body-deadline close"
+    );
+}
+
+#[test]
+fn no_progress_close_is_counted_only_when_bytes_were_still_queued() {
+    let idle = Duration::from_millis(40);
+    for queued in [true, false] {
+        let (mut worker, _client, _scratch, id) = fixture(Timeouts {
+            idle,
+            body: Duration::from_secs(3600),
+            ..Timeouts::default()
+        });
+        let (_quota, data, _) = charged_body();
+        let now = Instant::now();
+        let conn = &mut worker.conns.get_mut(&id).expect("connection").0;
+        conn.last_progress = now;
+        if queued {
+            respond(
+                conn,
+                Response::ok(data, "video/mp4", CHUNK_CACHE),
+                false,
+                now,
+            );
+            assert!(conn.output.remaining() > 0);
+        }
+        worker.sweep(now + idle);
+        assert!(
+            !worker.conns.contains_key(&id),
+            "idle close, queued={queued}"
+        );
+        // A keep-alive connection idling with nothing queued is not slow.
+        let expected = if queued { (0, 1) } else { (0, 0) };
+        assert_eq!(worker.slow_closes, expected, "queued={queued}");
+    }
 }
 
 #[test]

@@ -160,13 +160,20 @@ encoded init/fragment backing capacity to 512 MiB by default. Each allocation
 is charged once, including headers and spare Vec capacity. Cache, response,
 sliced and recorder aliases keep that charge through their final payload
 owner. Exhaustion refuses media and preserves the admitted recording prefix
-as incomplete.
+as incomplete. The cap covers retained media, not the whole process: on
+Linux the server reads its cgroup memory limit at startup and warns when
+the cap is above three quarters of it, since a high-bitrate publisher could
+then get the server killed instead of refused.
 
 `SAPFLOW_HTTP_BODY_TIMEOUT` (`--http-body-timeout`) gives each ready framed
 response 120 seconds by default, configurable from 1 through 3,600. Successful
 writes do not extend it. Parked LL-HLS waiting is excluded, and each keep-alive
-response gets a fresh timer. Expiry closes the incomplete response. These are
-logical resource policies; RSS, kernel memory and audience capacity need
+response gets a fresh timer. Expiry closes the incomplete response. A response
+that writes nothing for 60 seconds with bytes still queued is closed too. Both
+closes are logged as `closed a slow viewer's response` with the reason, the
+bytes left and the response age, never the viewer's address, at most 10 a
+minute per HTTP worker with the rest counted. These are logical resource
+policies; RSS, kernel memory and audience capacity need
 separate qualification in the [resource contract](docs/retained-media-contract.md).
 
 Recording limits retained encoded originals to 512 MiB across the server and
