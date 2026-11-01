@@ -184,6 +184,7 @@ jobs:
           python3 -B tests/test_ios_privacy_resources.py
           python3 -B tests/test_ios_xctest_runtime.py
           python3 -B tests/test_ios_capture_recording.py
+          python3 -B tests/test_ios_simulator_report.py
 
   fuzz:
     name: Fuzz regressions and 60 s per target
