@@ -9,6 +9,7 @@ parser.add_argument('report', type=Path)
 args = parser.parse_args()
 report = json.loads(args.report.read_text())
 viewer = report.get('viewerBest', report.get('viewer', {}))
+presented_frames = viewer.get('frames', 0) - viewer.get('dropped', 0)
 checks = {
     'finished': report.get('state') == 'finished',
     'no_native_error': not report.get('error') and not report.get('finalisationError'),
@@ -18,10 +19,11 @@ checks = {
     'native_video': report.get('videoUnits', 0) >= 300,
     'native_audio': report.get('audioUnits', 0) >= 300,
     'keyframe_interval': report.get('keyframes', 0) >= 10 and 0 < report.get('maxKeyframeSeconds', 0) <= 1.1,
-    'decoded_video': viewer.get('frames', 0) >= 60 and viewer.get('width') == 1280 and viewer.get('height') == 720,
+    'decoded_video': presented_frames >= 60 and viewer.get('width') == 1280 and viewer.get('height') == 720,
     'playback_progress': viewer.get('time', 0) >= 5 and viewer.get('error', 0) == 0,
     'audio_track': viewer.get('audioTracks') == 1,
     'transport_cleanup': report.get('publisherCleanupComplete') is True,
 }
-print(json.dumps({'passed': all(checks.values()), 'checks': checks, 'viewer': viewer}, indent=2))
+print(json.dumps({'passed': all(checks.values()), 'checks': checks, 'viewer': viewer,
+                  'presentedFrames': presented_frames}, indent=2))
 raise SystemExit(0 if all(checks.values()) else 1)

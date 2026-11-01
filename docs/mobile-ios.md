@@ -87,11 +87,13 @@ under both `targetEnvironment(simulator)` and `SAPFLOW_SIMULATOR_TEST_SOURCE`.
 The harness also checks the ordinary constructor's hardware requirement.
 
 Run `python3 mobile/ios/check-simulator-report.py <REPORT_PATH>` on the terminal
-report. It rejects missing encoding, absent decoded frames/audio, the wrong GOP,
+report. It rejects missing encoding, absent presented frames/audio, the wrong GOP,
 native errors or incomplete transport cleanup. `viewerBest` preserves the largest
 decoded-frame observation across native player reloads; current `viewer` state
 remains separate. Retain both when investigating recovery or buffering. A passing
 report proves this finite generated run, not sustained quality or reconnect.
+Dropped frames are subtracted from the media element's total-frame counter
+before checking that pictures were presented.
 
 Retain a small result summary, then stop the local receiver, shut down and delete
 the task-created simulator, and remove this check's generated build directory.

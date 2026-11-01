@@ -45,6 +45,11 @@ class SimulatorReportTests(unittest.TestCase):
         report['viewer']['audioTracks'] = 0
         self.check_report(report, False)
 
+    def test_dropped_frames_do_not_count_as_presented_video(self):
+        report = self.report()
+        report['viewer'].update(frames=100, dropped=100)
+        self.assertFalse(self.check_report(report, False)['checks']['decoded_video'])
+
     def test_stop_must_complete_without_native_errors(self):
         for change in [{'state': 'stopping'}, {'publisherCleanupComplete': False},
                        {'error': 'Codec failed'}, {'finalisationError': 'Native EOF failed'}]:
