@@ -41,8 +41,65 @@ unsigned builds remain separate from physical switching and recording acceptance
 The bundle identifier is a development placeholder and no development team,
 signing identity, provisioning profile or distributable package is assumed.
 Generated projects, build products and DerivedData stay under `target/`.
-A simulator build proves compilation only: hardware/camera availability is
-checked at runtime and unsupported hardware must fail visibly.
+The normal capture app keeps its hardware checks in a simulator and reports
+unsupported capture visibly. The separate generated-source check below can
+exercise encoding, publishing and playback without those capture devices.
+
+### Generated broadcast in an iPhone simulator
+
+The separate `SimulatorBroadcastCheck` app can exercise native encoding,
+shared Rust compressed-media validation, the ordinary manual RTMP publisher,
+a local Sapflow receiver and decoded playback in an embedded iOS WebKit viewer.
+It generates a moving picture and 48 kHz PCM tone, without a camera, microphone,
+input media file or FFmpeg. It does not drive the normal capture UI, recorder,
+capture admission or physical hardware encoder.
+
+Build with existing packaged Apple SDKs and XcodeGen:
+
+```sh
+python3 mobile/ios/build-simulator-check.py
+# For a clean worktree using SDKs already built in another checkout:
+python3 mobile/ios/build-simulator-check.py --sdk-root <SDK_CHECKOUT>
+```
+
+The script prints the simulator app path. Its output directory, defaulting to
+`target/simulator-broadcast-check`, is caller-owned temporary build output.
+Install it on a task-owned iPhone simulator. Set these launch environment values
+with the `SIMCTL_CHILD_` prefix when invoking `xcrun simctl launch`:
+
+- `SAPFLOW_SIMULATOR_ENDPOINT`: the receiver's loopback RTMP application URL.
+- `SAPFLOW_SIMULATOR_STREAM_KEY`: that disposable stream's key.
+- `SAPFLOW_SIMULATOR_VIEWER_URL`: the loopback V4V audience page for the gig.
+
+Launch bundle `dev.forgesworn.sapflow.simulatorcheck` with the explicit argument
+`--sapflow-simulator-broadcast-check`. Both destinations require numeric loopback;
+the harness cannot point its generated source at a production receiver. The
+embedded viewer explicitly automates Play and permits media playback without a
+touch gesture. It uses the real media element and records decoded dimensions,
+frame counts, dropped frames, playback progress and audio-track presence.
+
+The app writes `Documents/simulator-broadcast-report.json` about once per second
+and stops after 1,800 generated frames, with an independent 75-second owner-queue
+deadline. Check actual receiver readiness and advancing decoded viewer frames,
+not merely the app's encoding counters. Inspect the terminal report for native
+codec errors and transport cleanup. The software encoder entry point exists only
+under both `targetEnvironment(simulator)` and `SAPFLOW_SIMULATOR_TEST_SOURCE`.
+The harness also checks the ordinary constructor's hardware requirement.
+
+Run `python3 mobile/ios/check-simulator-report.py <REPORT_PATH>` on the terminal
+report. It rejects missing encoding, absent presented frames/audio, the wrong GOP,
+native errors or incomplete transport cleanup. `viewerBest` preserves the largest
+decoded-frame observation across native player reloads; current `viewer` state
+remains separate. Retain both when investigating recovery or buffering. A passing
+report proves this finite generated run, not sustained quality or reconnect.
+Dropped frames are subtracted from the media element's total-frame counter
+before checking that pictures were presented.
+
+Retain a small result summary, then stop the local receiver, shut down and delete
+the task-created simulator, and remove this check's generated build directory.
+Passing this path establishes generated-source simulator coverage. It does not
+qualify camera exposure, microphone capture or acoustic quality, physical codec
+performance, venue networking, the normal broadcaster UI or recording recovery.
 
 ## V4V creator flow
 

@@ -40,6 +40,16 @@ final class HardwareVideoEncoder {
         try self.init(orientation: orientation, profile: profile, strict: false,
             output: { unit, _ in output(unit) }, fault: { _, error in failure(error) }, permitsInput: { _ in false })
     }
+    #if targetEnvironment(simulator) && SAPFLOW_SIMULATOR_TEST_SOURCE
+    /// Only the separately built generated-source check can select software.
+    /// The ordinary app and its strict capture initialiser still require hardware.
+    convenience init(simulatorTestSource orientation: CaptureOrientation, profile: CaptureProfile,
+                     output: @escaping (CompressedUnit) -> Void, failure: @escaping (Error) -> Void) throws {
+        try self.init(orientation: orientation, profile: profile, strict: false,
+            output: { unit, _ in output(unit) }, fault: { _, error in failure(error) },
+            permitsInput: { _ in false }, requireHardware: false)
+    }
+    #endif
     convenience init(orientation: CaptureOrientation, profile: CaptureProfile = .defaultProfile,
                      output: @escaping (CompressedUnit, CaptureAdmission.MediaToken) -> Void,
                      fault: @escaping (CaptureAdmission.MediaToken?, Error) -> Void,
@@ -50,7 +60,8 @@ final class HardwareVideoEncoder {
     private init(orientation: CaptureOrientation, profile: CaptureProfile, strict: Bool,
                  output: @escaping (CompressedUnit, CaptureAdmission.MediaToken?) -> Void,
                  fault: @escaping (CaptureAdmission.MediaToken?, Error) -> Void,
-                 permitsInput: @escaping (CaptureAdmission.MediaToken) -> Bool) throws {
+                 permitsInput: @escaping (CaptureAdmission.MediaToken) -> Bool,
+                 requireHardware: Bool = true) throws {
         self.output = output; self.fault = fault; self.permitsInput = permitsInput; self.strict = strict
         self.callbacks = try .init()
         self.profile = profile
@@ -67,13 +78,15 @@ final class HardwareVideoEncoder {
               let entries = encoderList as? [[CFString: Any]],
               let selected = entries.first(where: {
                   ($0[kVTVideoEncoderList_CodecType] as? NSNumber)?.uint32Value == kCMVideoCodecType_H264 &&
-                  ($0[kVTVideoEncoderList_IsHardwareAccelerated] as? Bool) == true
+                  ($0[kVTVideoEncoderList_IsHardwareAccelerated] as? Bool) == requireHardware
               }), let encoderID = selected[kVTVideoEncoderList_EncoderID] as? String else {
-            throw CaptureFailure(message: "No explicitly identified hardware H.264 encoder is available")
+            throw CaptureFailure(message: requireHardware
+                ? "No explicitly identified hardware H.264 encoder is available"
+                : "No simulator software H.264 encoder is available")
         }
         implementation = encoderID
         var specification: [CFString: Any] = [kVTVideoEncoderSpecification_EncoderID: encoderID]
-        if #available(iOS 17.4, *) { specification[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true }
+        if #available(iOS 17.4, *), requireHardware { specification[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true }
         let status = VTCompressionSessionCreate(allocator: nil, width: dimensions.width, height: dimensions.height, codecType: kCMVideoCodecType_H264,
             encoderSpecification: specification as CFDictionary,
             imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: callback,
@@ -93,7 +106,7 @@ final class HardwareVideoEncoder {
             guard try property(kVTCompressionPropertyKey_EncoderID, session: created) as? String == encoderID else {
                 throw CaptureFailure(message: "Video encoder identity changed from the selected hardware implementation")
             }
-            if #available(iOS 17.4, *) {
+            if #available(iOS 17.4, *), requireHardware {
                 guard try property(kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, session: created) as? Bool == true else {
                     throw CaptureFailure(message: "Video encoder did not confirm hardware acceleration")
                 }
