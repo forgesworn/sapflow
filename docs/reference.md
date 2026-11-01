@@ -127,6 +127,26 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   video kept at 20% rose from 33% to 43% (before 220 to 347 frames, after
   354 to 415). What is still lost is likely waits past the length limit,
   which still break.
+
+  Safari on iOS holds the frozen frame and plays on. On 2026-11-01 the
+  builds before and after this change each served one stream under the same
+  seeded 20% random loss at 200 ms latency (`srt-loss-proxy`, ffmpeg/libsrt
+  sender, 30 minutes). Both streams played side by side in Safari in an
+  iPhone 17 simulator (iOS 26.5), logging playback position and decoded
+  frames once a second. Before: 170 breaks on the server, and Safari stalled
+  116 times for 259 s in all. After: 27 breaks and 31 stalls for 62 s in
+  all. Frames shown were about the same (17.0 and 16.5 a second), with no
+  media errors on either. The stalls that remain fall a second or few after
+  a break. During a hold the playback clock runs in real time while the
+  picture is still. In an earlier 18-minute run on the new build, once,
+  just after a break, Safari stopped showing video for good while its clock
+  ran on; the server kept serving. That did not recur in the 30 minutes of
+  either build and is not tied to this change, but is worth watching for on
+  a device. The simulator plays muted and iOS Safari reports no decoded
+  audio, so audio was judged from the HLS stream itself: a two-minute
+  capture of the new build kept 96.5% of its audio packets, the gaps
+  (0.1 to 0.4 s) being packets lost in transport. Not yet checked by ear on
+  a device.
 - **Output time carries on.** The keyframe that resumes the stream is
   moved to the time the last segment ended, and everything after it, audio
   included, by the same amount. Output timestamps therefore only move
