@@ -21,11 +21,12 @@ class SimulatorReportTests(unittest.TestCase):
             'viewer': {'frames': 1504, 'width': 1280, 'height': 720, 'time': 58.8, 'error': 0, 'audioTracks': 1},
         }
 
-    def check_report(self, report, passed):
+    def check_report(self, report, passed, require_recovery=False):
         with tempfile.TemporaryDirectory(prefix='sapflow-simulator-report-') as directory:
             path = Path(directory) / 'report.json'
             path.write_text(json.dumps(report))
-            result = subprocess.run([sys.executable, '-B', str(SCRIPT), str(path)],
+            result = subprocess.run([sys.executable, '-B', str(SCRIPT), str(path)]
+                                    + (['--require-recovery'] if require_recovery else []),
                                     capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0 if passed else 1, result.stderr)
         summary = json.loads(result.stdout)
@@ -76,6 +77,55 @@ class SimulatorReportTests(unittest.TestCase):
         report['viewer'].update(frames=0, width=0, height=0)
         self.check_report(report, True)
         self.assertEqual(report['viewer']['frames'], 0)  # Preserve the current recovery observation too.
+
+    def recovery_report(self):
+        report = self.report()
+        report.update(recoveryCheck=True, run=3)
+        report['recoveryReadings'] = [
+            dict(report['viewer'], run=run, state='broadcasting', ready=4,
+                 frames=i * 30, time=i, at=run * 25 + i)
+            for run in range(1, 4) for i in range(12)
+        ]
+        return report
+
+    def test_each_restart_must_decode_fresh_frames(self):
+        self.check_report(self.report(), False, require_recovery=True)
+        self.check_report(self.recovery_report(), True)
+        for run in [2, 3]:
+            report = self.recovery_report()
+            for sample in report['recoveryReadings']:
+                if sample['run'] == run: sample['frames'] = 330
+            self.assertFalse(self.check_report(report, False)['checks'][f'run_{run}_playback'])
+
+    def test_early_playback_cannot_hide_a_late_stall(self):
+        report = self.recovery_report()
+        for sample in report['recoveryReadings']:
+            if sample['run'] == 3 and sample['time'] >= 7:
+                sample.update(frames=180, time=6)
+        self.check_report(report, False)
+
+    def test_recovery_rejects_drops_missing_audio_and_skipped_runs(self):
+        for change in [{'dropped': 330}, {'audioTracks': 0}, {'error': 3}]:
+            report = self.recovery_report()
+            for sample in report['recoveryReadings']:
+                if sample['run'] == 2:
+                    sample.update(change)
+                    if 'dropped' in change: sample['dropped'] = sample['frames']
+            self.check_report(report, False)
+        report = self.recovery_report()
+        report['recoveryReadings'] = [s for s in report['recoveryReadings'] if s['run'] != 2]
+        self.check_report(report, False)
+
+    def test_actual_presentation_callbacks_handle_webkit_quality_counter_sticking(self):
+        report = self.recovery_report()
+        report['viewer'].update(frameCallbacksSupported=True, presentedCallbacks=1504, frames=0)
+        for sample in report['recoveryReadings']:
+            sample.update(frameCallbacksSupported=True, presentedCallbacks=sample['frames'], frames=0)
+        self.check_report(report, True)
+        # A moving media clock and a historical quality counter cannot hide a frozen picture.
+        for sample in report['recoveryReadings']:
+            if sample['run'] == 3: sample.update(presentedCallbacks=330, frames=sample['time'] * 30)
+        self.check_report(report, False)
 
 
 if __name__ == '__main__':

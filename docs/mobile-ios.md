@@ -95,6 +95,25 @@ report proves this finite generated run, not sustained quality or reconnect.
 Dropped frames are subtracted from the media element's total-frame counter
 before checking that pictures were presented.
 
+WebKit's quality counter can stick across native HLS reloads. When supported,
+the harness records actual `requestVideoFrameCallback` presentations and their
+media times as well, and the checker uses those instead of the quality counter.
+
+Set `SAPFLOW_SIMULATOR_RECOVERY_CHECK=on` to send three 900-frame broadcasts
+with new native encoders and a reset input clock on each run, separated by 3 s
+and 12 s outages. Keep the same gig, receiver and embedded audience page; allow
+at least 15 s reconnect grace on the receiver and app. This mode has a 150 s
+owner-queue deadline and retains at most 180 one-second viewer readings. Play
+is automated once per video element, so the harness cannot hide a failed
+recovery by repeatedly pressing it.
+
+Run `python3 mobile/ios/check-simulator-report.py --require-recovery <REPORT_PATH>`
+to require all three runs. Each must show at least 120 new presented frames,
+five seconds of advancing media with audio present, and progress within three
+seconds of its last reading. An earlier peak, a moving audio clock or successful
+encoding alone cannot satisfy a restarted run. The check does not simulate
+packet loss, TLS failures or a real phone switching between networks.
+
 Retain a small result summary, then stop the local receiver, shut down and delete
 the task-created simulator, and remove this check's generated build directory.
 Passing this path establishes generated-source simulator coverage. It does not
