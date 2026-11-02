@@ -18,8 +18,13 @@ final class SimulatorBroadcastCheck: ObservableObject {
     private var timer: DispatchSourceTimer?
     private var frame = 0
     private var stopped = false
-    private let ingress = RustEncodedIngress()
+    private var terminal = false
+    private var ingress = RustEncodedIngress()
     private var lastKeyframe: CMTime? // delivery queue only
+    private let recoveryCheck = ProcessInfo.processInfo.environment["SAPFLOW_SIMULATOR_RECOVERY_CHECK"] == "on"
+    private var run = 0
+    private var endpoint = ""
+    private var streamKey = ""
 
     init() {
         let raw = ProcessInfo.processInfo.environment["SAPFLOW_SIMULATOR_VIEWER_URL"] ?? ""
@@ -27,6 +32,19 @@ final class SimulatorBroadcastCheck: ObservableObject {
         viewerURL = url?.host == "127.0.0.1" && url?.scheme == "http" ? url : nil
     }
     func set(_ key: String, _ value: Any) { lock.lock(); facts[key] = value; lock.unlock() }
+    func observeViewer(_ reading: [String: Any]) {
+        lock.lock(); defer { lock.unlock() }
+        facts["viewer"] = reading
+        if recoveryCheck {
+            var readings = facts["recoveryReadings"] as? [[String: Any]] ?? []
+            var sample = reading
+            sample["run"] = facts["run"] ?? 0
+            sample["state"] = facts["state"] ?? "waiting"
+            sample["at"] = ProcessInfo.processInfo.systemUptime
+            if readings.count < 180 { readings.append(sample) }
+            facts["recoveryReadings"] = readings
+        }
+    }
     private func increment(_ key: String) {
         lock.lock(); facts[key] = (facts[key] as? Int ?? 0) + 1; lock.unlock()
     }
@@ -60,23 +78,31 @@ final class SimulatorBroadcastCheck: ObservableObject {
                     guard error.message == "No explicitly identified hardware H.264 encoder is available" else { throw error }
                     self.set("ordinaryHardwareGuard", "Ordinary initialiser rejected absent hardware")
                 }
-                let sink = ManualRtmpPublisher(destination: try ManualDestination(endpoint: endpoint, streamKey: key, allowPlaintext: true))
-                self.sink = sink; self.ingress.destination = sink
-                self.video = try HardwareVideoEncoder(simulatorTestSource: .landscapeRight, profile: .hd720p30,
-                    output: { [weak self] unit in self?.accept(unit) }, failure: { [weak self] _ in self?.fail("Video encoder failed") })
-                self.audio = try NativeAudioEncoder(output: { [weak self] unit in self?.accept(unit) }, meter: { _ in })
-                self.set("encoderImplementation", self.video!.implementation)
-                try sink.start()
-                self.set("state", "broadcasting")
-                let timer = DispatchSource.makeTimerSource(queue: self.owner)
-                timer.schedule(deadline: .now(), repeating: 1.0 / 30.0, leeway: .milliseconds(2))
-                timer.setEventHandler { [weak self] in self?.tick() }
-                self.timer = timer; timer.resume()
+                self.endpoint = endpoint; self.streamKey = key
+                self.set("recoveryCheck", self.recoveryCheck)
+                try self.beginRun()
                 // Independent wall-clock bound also covers a delayed samples queue.
-                self.owner.asyncAfter(deadline: .now() + 75) { self.stopOnOwner() }
+                self.owner.asyncAfter(deadline: .now() + (self.recoveryCheck ? 150 : 75)) { self.stopOnOwner() }
             } catch { self.fail((error as? CaptureFailure)?.message ?? "Generated source could not start") }
             self.report()
         }
+    }
+    private func beginRun() throws {
+        run += 1; frame = 0; lastKeyframe = nil
+        ingress = RustEncodedIngress()
+        set("run", run)
+        let sink = ManualRtmpPublisher(destination: try ManualDestination(endpoint: endpoint, streamKey: streamKey, allowPlaintext: true))
+        self.sink = sink; self.ingress.destination = sink
+        self.video = try HardwareVideoEncoder(simulatorTestSource: .landscapeRight, profile: .hd720p30,
+            output: { [weak self] unit in self?.accept(unit) }, failure: { [weak self] _ in self?.fail("Video encoder failed") })
+        self.audio = try NativeAudioEncoder(output: { [weak self] unit in self?.accept(unit) }, meter: { _ in })
+        self.set("encoderImplementation", self.video!.implementation)
+        try sink.start()
+        self.set("state", "broadcasting")
+        let timer = DispatchSource.makeTimerSource(queue: self.owner)
+        timer.schedule(deadline: .now(), repeating: 1.0 / 30.0, leeway: .milliseconds(2))
+        timer.setEventHandler { [weak self] in self?.tick() }
+        self.timer = timer; timer.resume()
     }
     private func accept(_ unit: CompressedUnit) {
         delivery.async {
@@ -106,7 +132,7 @@ final class SimulatorBroadcastCheck: ObservableObject {
             if frame % 30 == 0 {
                 set("submittedFrames", frame); set("publisherStatus", sink?.status ?? "absent"); report()
             }
-            if frame >= 1800 { stopOnOwner() }
+            if frame >= (recoveryCheck ? 900 : 1800) { stopOnOwner(restart: recoveryCheck && run < 3) }
         } catch { fail((error as? CaptureFailure)?.message ?? "Native generated media encoding failed") }
     }
     private func fail(_ message: String) {
@@ -114,8 +140,13 @@ final class SimulatorBroadcastCheck: ObservableObject {
         owner.async { self.stopOnOwner() }
     }
     func stop() { owner.async { self.stopOnOwner() } }
-    private func stopOnOwner() {
-        guard !stopped else { return }; stopped = true
+    private func stopOnOwner(restart: Bool = false) {
+        if !restart { terminal = true }
+        guard !stopped else {
+            if terminal && sink == nil { completeStop() }
+            return
+        }
+        stopped = true
         timer?.cancel(); timer = nil
         do { try audio?.finish() } catch { set("finalisationError", "Native audio finalisation failed") }
         do { try video?.finishChecked() } catch { set("finalisationError", "Native video finalisation failed") }
@@ -125,7 +156,23 @@ final class SimulatorBroadcastCheck: ObservableObject {
         guard let sink else { completeStop(); return }
         sink.stop { [weak self] in
             guard let self else { return }
-            self.owner.async { self.completeStop() }
+            self.owner.async {
+                if !sink.cleanupComplete {
+                    self.set("error", "Publisher transport did not finish cleanup")
+                    self.terminal = true
+                }
+                if restart && !self.terminal {
+                    self.set("publisherCleanupComplete", sink.cleanupComplete)
+                    self.video = nil; self.audio = nil; self.sink = nil
+                    self.set("state", "outage"); self.report()
+                    // One brief dropout, then a longer interruption which exercises player recovery.
+                    self.owner.asyncAfter(deadline: .now() + (self.run == 1 ? 3 : 12)) {
+                        guard !self.terminal else { return }
+                        do { self.stopped = false; try self.beginRun() }
+                        catch { self.fail("Restarted generated source could not start") }
+                    }
+                } else { self.completeStop() }
+            }
         }
     }
     private func completeStop() {
@@ -187,8 +234,10 @@ private struct SimulatorViewer: UIViewRepresentable {
         init(_ check: SimulatorBroadcastCheck) { self.check = check }
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let facts = message.body as? [String: Any] else { return }
-            check.set("viewer", facts)
-            let frames = facts["frames"] as? Int ?? 0
+            check.observeViewer(facts)
+            let frames = facts["frameCallbacksSupported"] as? Bool == true
+                ? facts["presentedCallbacks"] as? Int ?? 0
+                : (facts["frames"] as? Int ?? 0) - (facts["dropped"] as? Int ?? 0)
             if frames > 0, (facts["width"] as? Int ?? 0) > 0 {
                 decodedReadings += 1
                 check.set("viewerDecodedReadings", decodedReadings)
@@ -199,20 +248,42 @@ private struct SimulatorViewer: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(check) }
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
+        // Every launch must load the candidate viewer bundle, not a service
+        // worker or HTTP cache left by a previous test revision.
+        config.websiteDataStore = .nonPersistent()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = [] // Explicit automated test interaction.
         config.userContentController.add(context.coordinator, name: "simulatorCheck")
         config.userContentController.addUserScript(WKUserScript(source: """
+        const opened = new WeakSet(), started = new WeakSet(), presentations = new WeakMap();
         setInterval(() => {
           const button = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Open stream');
-          if (button) button.click();
+          if (button && !opened.has(button)) { opened.add(button); button.click(); }
           const v = document.querySelector('video');
           if (!v) return;
-          if (v.paused) v.play().catch(() => {});
+          if (!presentations.has(v)) {
+            const record = {count:0, time:0};
+            presentations.set(v, record);
+            if (v.requestVideoFrameCallback) {
+              const frame = (_, metadata) => {
+                record.count++; record.time = metadata.mediaTime;
+                v.requestVideoFrameCallback(frame);
+              };
+              v.requestVideoFrameCallback(frame);
+            }
+          }
+          // Automate the viewer's first Play only. Recovery must come from the player.
+          if (v.paused && !started.has(v)) v.play().then(() => started.add(v)).catch(() => {});
+          if (!v.paused) started.add(v);
           const q = v.getVideoPlaybackQuality?.();
           window.webkit.messageHandlers.simulatorCheck.postMessage({time:v.currentTime, paused:v.paused,
             ready:v.readyState, width:v.videoWidth, height:v.videoHeight, frames:q?.totalVideoFrames || 0,
-            dropped:q?.droppedVideoFrames || 0, audioTracks:v.audioTracks?.length || 0, error:v.error?.code || 0});
+            dropped:q?.droppedVideoFrames || 0, audioTracks:v.audioTracks?.length || 0, error:v.error?.code || 0,
+            presentedCallbacks:presentations.get(v).count, callbackMediaTime:presentations.get(v).time,
+            frameCallbacksSupported:typeof v.requestVideoFrameCallback === 'function',
+            duration:Number.isFinite(v.duration) ? v.duration : null,
+            bufferedEnd:v.buffered.length ? v.buffered.end(v.buffered.length-1) : null,
+            seekableEnd:v.seekable.length ? v.seekable.end(v.seekable.length-1) : null});
         }, 1000);
         """, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         let web = WKWebView(frame: .zero, configuration: config)
