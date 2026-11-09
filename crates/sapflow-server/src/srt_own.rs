@@ -2,7 +2,7 @@
 //! tasks; the UDP owner continues handling timers and established publishers.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -106,7 +106,7 @@ fn wanted_recv_buffer(max_publishers: usize) -> usize {
 /// Binds the SRT socket with a receive buffer of up to `want` bytes. macOS
 /// refuses a size above its limit, so halve until the OS accepts one (Linux
 /// accepts and caps silently). Returns the socket and the size the OS reports.
-fn bind_udp(addr: SocketAddr, want: usize) -> std::io::Result<(UdpSocket, usize)> {
+fn bind_udp(addr: SocketAddr, want: usize) -> std::io::Result<(UdpSocket, StdUdpSocket, usize)> {
     let std_socket = std::net::UdpSocket::bind(addr)?;
     let mut size = want;
     while size >= 64 * 1024 {
@@ -117,12 +117,56 @@ fn bind_udp(addr: SocketAddr, want: usize) -> std::io::Result<(UdpSocket, usize)
     }
     let got = rustix::net::sockopt::socket_recv_buffer_size(&std_socket)?;
     std_socket.set_nonblocking(true)?;
-    Ok((UdpSocket::from_std(std_socket)?, got))
+    let pending = std_socket.try_clone()?;
+    Ok((UdpSocket::from_std(std_socket)?, pending, got))
+}
+
+// A fixed per-turn budget keeps hostile/continuous UDP input from starving
+// ACKs, delivery, expiry, admission completion or publisher cancellation.
+const TIMER_RECV_BUDGET: usize = 4096;
+
+/// Drain a bounded ready batch before interpreting an overdue deadline. `recv`
+/// must be nonblocking. Timers run even when the batch limit is reached.
+fn service_ready_timers(
+    listener: &mut Listener,
+    buf: &mut [u8],
+    mut now: impl FnMut() -> Instant,
+    mut recv: impl FnMut(&mut [u8]) -> std::io::Result<(usize, SocketAddr)>,
+) {
+    for _ in 0..TIMER_RECV_BUDGET {
+        match recv(buf) {
+            Ok((n, peer)) => {
+                if let Some(datagram) = buf.get(..n) {
+                    listener.handle_datagram(now(), peer, datagram);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::debug!(%error, "SRT receive failed");
+                break;
+            }
+        }
+    }
+    listener.handle_timeout(now());
+}
+
+fn service_due_timers(
+    listener: &mut Listener,
+    pending: &StdUdpSocket,
+    buf: &mut [u8],
+    now: impl FnMut() -> Instant,
+) {
+    // The nonblocking duplicate sees kernel-queued packets even before Tokio
+    // has delivered a readiness notification after a scheduler stall. There
+    // is still only one reader task. Tokio clears a stale readiness bit on
+    // its next WouldBlock if this batch emptied the socket.
+    service_ready_timers(listener, buf, now, |buf| pending.recv_from(buf));
 }
 
 pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     let want = wanted_recv_buffer(app.config.max_publishers);
-    let (socket, recv_buffer) = bind_udp(addr, want)?;
+    let (socket, pending, recv_buffer) = bind_udp(addr, want)?;
     if recv_buffer < want {
         tracing::warn!(
             requested = want,
@@ -166,7 +210,7 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
             result=socket.recv_from(&mut buf)=>{
                 if let Ok((n,peer))=result && let Some(datagram)=buf.get(..n) {listener.handle_datagram(Instant::now(),peer,datagram);}
             }
-            ()=&mut timer,if armed.is_some()=>{armed=None;listener.handle_timeout(Instant::now());}
+            ()=&mut timer,if armed.is_some()=>{armed=None;}
             Some(id)=ended_rx.recv()=>{
                 listener.close(id,Instant::now());
                 if let Some(publisher)=publishers.remove(&id) && let Some(scope)=publisher.scope {scope.protocol_stopped();}
@@ -174,6 +218,14 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
             Some(result)=admissions.join_next(),if !admissions.is_empty()=>{
                 if let Ok((id,peer,result))=result {complete_admission(&app,listener,publishers,&ended_tx,id,peer,result);}
             }
+        }
+        let now = Instant::now();
+        if listener
+            .poll_timeout()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            service_due_timers(listener, &pending, &mut buf, Instant::now);
+            armed = None;
         }
         while let Some(event) = listener.poll_event() {
             match event {
@@ -640,8 +692,13 @@ mod recv_buffer_tests {
     async fn bind_raises_the_receive_buffer_above_the_default() -> std::io::Result<()> {
         let plain = std::net::UdpSocket::bind("127.0.0.1:0")?;
         let default = rustix::net::sockopt::socket_recv_buffer_size(&plain)?;
-        let (_socket, got) = bind_udp(SocketAddr::from(([127, 0, 0, 1], 0)), 4 * 1024 * 1024)?;
+        let (_socket, _pending, got) =
+            bind_udp(SocketAddr::from(([127, 0, 0, 1], 0)), 4 * 1024 * 1024)?;
         assert!(got > default, "granted {got}, default {default}");
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "srt_own_io_tests.rs"]
+mod io_tests;
