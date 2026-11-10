@@ -16,7 +16,7 @@ function stripFeedback(sdp, { transportCc }) {
     if (/^a=rtcp-fb:\S+ goog-remb/.test(l)) return false;
     if (transportCc) return true; // arm (b): keep transport-cc
     if (/^a=rtcp-fb:\S+ transport-cc/.test(l)) return false;
-    if (/^a=extmap:\d+ http:\/\/www\.ietf\.org\/id\/draft-holmer-rmcat-transport-wide-cc-extensions-01/.test(l)) return false;
+    if (/^a=extmap:\d+(\/\S+)? http:\/\/www\.ietf\.org\/id\/draft-holmer-rmcat-transport-wide-cc-extensions-01/.test(l)) return false;
     return true;
   }).join('\r\n');
 }
@@ -97,8 +97,8 @@ async function ramp(arm, prefix = '') {
     if (o) series.push({
       s, bitrateKbps: prev ? Math.round(((o.bytesSent + o.headerBytesSent) - (prev.bytesSent + prev.headerBytesSent)) * 8 / 1000) : null,
       payloadKbps: prev ? Math.round((o.bytesSent - prev.bytesSent) * 8 / 1000) : null,
-      targetKbps: Math.round((o.targetBitrate || 0) / 1000), availableKbps: cp ? Math.round((cp.availableOutgoingBitrate || 0) / 1000) : null,
-      fps: o.framesPerSecond, w: o.frameWidth, h: o.frameHeight, qlr: o.qualityLimitationReason, nack: o.nackCount, pli: o.pliCount, fir: o.firCount,
+      targetKbps: o.targetBitrate == null ? null : Math.round(o.targetBitrate / 1000), availableKbps: cp ? Math.round((cp.availableOutgoingBitrate || 0) / 1000) : null,
+      fps: o.framesPerSecond, w: o.frameWidth, h: o.frameHeight, qlr: o.qualityLimitationReason === undefined ? 'not exposed' : o.qualityLimitationReason, nack: o.nackCount, pli: o.pliCount, fir: o.firCount,
       rtt: rr && rr.roundTripTime, lost: rr && rr.fractionLost, load1: lo, codec: codec && codec.mimeType, impl: o.encoderImplementation,
     });
     prev = o;
