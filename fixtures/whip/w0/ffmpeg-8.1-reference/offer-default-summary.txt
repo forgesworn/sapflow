@@ -1,0 +1,18 @@
+session: a=group:BUNDLE 0 1; ice-lite=no
+audio section: mid=0 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=passive rtcp-mux=yes fingerprint=sha-256 ice-options=absent
+  candidates: none
+  ssrc lines: 2, ssrc-group: none
+  header extensions: none
+  payloads in offer order:
+    111 opus/48000/2
+video section: mid=1 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=passive rtcp-mux=yes fingerprint=sha-256 ice-options=absent
+  candidates: none
+  ssrc lines: 2, ssrc-group: FID 1586424042 1586424043
+  header extensions: none
+  payloads in offer order:
+    106 H264/90000  profile-level-id=42001f packetization-mode=1  rtcp-fb: nack
+    105 rtx/90000  fmtp: apt=106
+video codecs offered (excluding rtx/red/fec): H264
+H.264: 42001f/pm1
