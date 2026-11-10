@@ -163,11 +163,41 @@ decision.
 "The browser profile" means exactly what the target publishers offer, captured
 from them in W0 and kept as fixtures, not recalled. The targets are Chrome on
 desktop and Android, Safari on iOS and macOS, Firefox, and OBS's WHIP output.
-The expected shape, to be confirmed by those captures:
+Desktop Chrome 157 is captured
+([evidence](whip-evidence/w0-chrome-desktop-2026-11-10.md), fixtures in
+`fixtures/whip/w0/`). The other targets are still expected, not observed.
 
-- DTLS 1.2 with `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (RFC 5289), P-256
-  key exchange (RFC 8422), `ecdsa_secp256r1_sha256` signatures, the extended
-  master secret (RFC 7627) and the `use_srtp` extension.
+What Chrome 157 sends:
+
+- **A 1413-byte ClientHello in two handshake fragments**, in two datagrams of
+  1200 and 263 bytes.
+- **DTLS 1.3 and 1.2** in `supported_versions`, with a 1258-byte `key_share`.
+- **Groups:** `X25519MLKEM768` first, then `x25519`, `secp256r1` and
+  `secp384r1`.
+- **14 cipher suites**, including `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`.
+- **Signatures:** `ecdsa_secp256r1_sha256` first.
+- **Extensions:** the extended master secret, `renegotiation_info`, and
+  `use_srtp` with `SRTP_AES128_CM_HMAC_SHA1_80`, `SRTP_AEAD_AES_256_GCM` and
+  `SRTP_AEAD_AES_128_GCM`, in that order.
+- **Record version** `0xfeff` on the first flight.
+
+What Sapflow does with it:
+
+- **Reassembles handshake fragments** from the first message, within the
+  handshake caps. A single-datagram ClientHello is not assumed.
+- **Answers DTLS 1.2** to a ClientHello that also offers 1.3, as a 1.2 server
+  does. It ignores `supported_versions` and `key_share`, and sends no TLS 1.3
+  downgrade marker in its random.
+- **Uses `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`** with P-256 key exchange
+  (RFC 5289, RFC 8422), `ecdsa_secp256r1_sha256` signatures and the extended
+  master secret (RFC 7627).
+- **Picks `SRTP_AEAD_AES_128_GCM`** when the client lists it, and otherwise
+  `SRTP_AES128_CM_HMAC_SHA1_80`. RFC 5764 lets the server choose from the
+  client's list. `SRTP_AEAD_AES_256_GCM` is not in v1.
+
+The FFmpeg 8.1 WHIP muxer, used only as a reference client, offers
+`a=setup:passive` by default. Sapflow refuses that. With
+`-whip_flags dtls_active` it offers `active` and fits.
 - A peer certificate with a P-256 key, accepted only if its SHA-256 matches
   the offer's `a=fingerprint` (RFC 8122). Certificate dates and issuers are
   not checked, as in WebRTC generally.
@@ -182,9 +212,11 @@ An offer that does not fit is refused at `POST` with a plain reason (see
 target's capture does not fit this profile, the profile changes in this
 document before W2 starts.
 
-A browser can stop offering DTLS 1.2. The record layer and handshake code are
-kept separate so that adding DTLS 1.3 later does not mean rewriting SRTP key
-handling. W0 records which DTLS versions each target offers.
+A browser can stop offering DTLS 1.2. Chrome 157 already offers 1.3 first. The
+record layer and handshake code are kept separate so that adding DTLS 1.3
+later does not mean rewriting SRTP key handling. W0 records which DTLS
+versions each target offers. DTLS 1.3 support is a tracked risk, not v1
+scope.
 
 ## SDP answer and stream matching
 
@@ -211,8 +243,9 @@ The answer is built as follows:
   if A0.4 puts it in v1.
 - **Audio payload.** `opus/48000/2`, answered with `stereo=1`,
   `maxaveragebitrate` set from configuration (music needs more than a
-  browser's speech default) and `usedtx=0`. W0 confirms that each browser
-  honours each of these.
+  browser's speech default) and `usedtx=0`. Chrome 157 honours `stereo=1`
+  (it sends mono without it) and `maxaveragebitrate`. DTX is off by default,
+  so `usedtx=0` only states it. The other targets are pending (A0.7).
 - **Header extensions.** Only `urn:ietf:params:rtp-hdrext:sdes:mid` is
   accepted, plus the transport-wide sequence number if `transport-cc` is
   used. Video orientation (`urn:3gpp:video-orientation`) is deliberately not
@@ -348,12 +381,22 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   5-tuple is accepted only through a STUN Binding request whose USERNAME names
   a live session and whose MESSAGE-INTEGRITY checks. After that, the tuple
   maps to its session.
+- **Unknown STUN attributes.** Comprehension-optional attributes (0x8000 and
+  above) that Sapflow does not know are ignored. Chrome 157 sends `0xC057` in
+  every check. An unknown comprehension-required attribute gets `420 Unknown
+  Attribute` (RFC 8489).
 - **TCP.** A passive candidate (`tcptype passive`) on a listener
   (`SAPFLOW_WHIP_TCP_ADDR`) that a layer-4 front proxy can forward to, so the
   media can use TCP 443 when UDP is blocked. When the proxy sends PROXY
   protocol v2 (`SAPFLOW_WHIP_TCP_PROXY_PROTOCOL=v2`), the header is accepted
   only from the trusted proxy address and gives the publisher's real address.
   RFC 4571 frames carry STUN, DTLS and SRTP exactly as datagrams do.
+  Chrome 157 did not start ICE-TCP to a private address on a port below 1024
+  (80, 443 and 1023 were tried). It did at 1024 and 8443, and it started
+  checks to a public-range address on 443. A public deployment advertises a
+  public address, so 443 is expected to work, but A0.3 stays open until a
+  run against a public address on 443 succeeds. Local tests use a port of
+  1024 or above.
 - **Roles.** A lite agent is always the controlled one (RFC 8445 section
   6.1.1) and cannot switch. A request carrying ICE-CONTROLLED is answered
   with `487 Role Conflict`, so the full agent takes the controlling role
@@ -491,6 +534,15 @@ control feedback (`transport-cc`, draft-holmer-rmcat-transport-wide-cc-extension
   its own.
 - REMB is not planned unless W0 shows a target that needs it and cannot use
   `transport-cc`.
+
+Provisional result: desktop Chrome 157, in-page loopback, with receiver
+reports still present.
+
+- With `transport-cc`, the target rate reached 5 Mbit/s in all three runs,
+  after 1, 2 and 19 s.
+- Without it, two of three runs were still near 2.6 Mbit/s after 30 s.
+
+So `transport-cc` is planned for v1 unless the other targets contradict it.
 
 The existing per-publisher cap (`SAPFLOW_MAX_PUBLISH_MBPS`) counts SRTP bytes.
 
@@ -755,8 +807,8 @@ they describe what ships.
 
 | Decision | Settled by |
 |---|---|
-| `transport-cc` in v1 | A0.4 |
-| Whether ICE-TCP is worth carrying | A0.3 |
+| `transport-cc` in v1 | Provisionally yes from desktop Chrome; A0.4 on the other targets |
+| Whether ICE-TCP is worth carrying | A0.3 against a public address on 443 |
 | Default `SAPFLOW_WHIP_JITTER` | A4.1 |
 | RustCrypto or `ring` | A4.2 |
 | Accepting another video codec for phones without H.264 | A0.5, and would need transcoding downstream |
