@@ -15,12 +15,13 @@ Why it is worth having:
   microphone and goes live. Camera, encoder and network handling are the
   browser's.
 - **Networks that block non-web ports.** RTMP on 1935 and SRT on 8890 are
-  often blocked on public Wi-Fi. WHIP signalling is HTTPS, and the media can
-  use one fixed UDP port or TCP 443 (see [Connectivity](#connectivity)).
-- **A shorter ingest wait.** The receiver waits a short bounded time for lost
-  packets instead of SRT's latency window or RTMP's TCP buffering. Viewers
-  still watch LL-HLS, so most of the delay a viewer sees is unchanged (see
-  [Delay budget](#delay-budget)).
+  often blocked on public Wi-Fi. WHIP signalling is HTTPS. The media uses one
+  fixed UDP port or, where clients support it, TCP 443 (see
+  [Connectivity](#connectivity); client support is checked in A0.3).
+- **A shorter ingest wait, expected.** The receiver waits a short bounded
+  time for lost packets instead of SRT's latency window or RTMP's TCP
+  buffering. W4 measures the effect. Viewers still watch LL-HLS, so most of
+  the delay a viewer sees is unchanged (see [Delay budget](#delay-budget)).
 
 ## Decision and how it fits the goals
 
@@ -117,8 +118,10 @@ publisher (browser, OBS)
 | `sapflow-dtls` | DTLS 1.2 server in the browser profile: records, handshake, retransmission, DTLS-SRTP key export, certificate fingerprints | New, sans-IO |
 | `sapflow-whip` | ICE-lite and STUN, SDP offer parsing and answer building, the session that composes ICE, DTLS, SRTP and RTP, and the WHIP resource rules | New, sans-IO |
 | `sapflow-hls` | An Opus audio track beside AAC (see [Opus](#opus)) | Changed |
-| `sapflow-core` | `PublishRequest` and the protocol list gain WebRTC | Changed |
-| `sapflow` (server) | `whip.rs`: signalling listener, UDP owner task, TCP listener, wiring into `Publication` and `EsIngest` | Changed |
+| `sapflow-server` (package and binary `sapflow`) | `whip.rs`: signalling listener, UDP owner task, TCP listener, wiring into `Publication` and `EsIngest`. `Protocol` in `publish_auth.rs` gains `Webrtc` | Changed |
+
+`sapflow-core` is not expected to change: a WHIP request fills the existing
+`PublishRequest` (path, user, password).
 
 Crate names are checked against crates.io before any publication, as in
 [crates-io-plan.md](crates-io-plan.md). Nothing here changes which crates are
@@ -180,6 +183,53 @@ A browser can stop offering DTLS 1.2. The record layer and handshake code are
 kept separate so that adding DTLS 1.3 later does not mean rewriting SRTP key
 handling. W0 records which DTLS versions each target offers.
 
+## SDP answer and stream matching
+
+The offer is accepted only if it has:
+
+- one BUNDLE group covering every accepted media section;
+- `a=mid` on each section, `a=rtcp-mux`, `a=ice-ufrag` and `a=ice-pwd`, and
+  a `sha-256` fingerprint;
+- `a=setup:actpass` or `a=setup:active`;
+- no `a=ice-lite` of its own, because two lite agents cannot connect.
+
+The answer is built as follows:
+
+- **Sections.** At most one video and one audio section, each `sendonly` or
+  `sendrecv`, is accepted and answered `recvonly`. Every other section (a
+  second video, a data channel) is answered with port 0. An offer with
+  neither video nor audio is refused.
+- **Video payload.** The first H.264 payload type, in offer order, with
+  `packetization-mode=1` and a `profile-level-id` whose profile is
+  Constrained Baseline, Baseline, Main or High. The answer repeats that
+  payload's `fmtp` line. The RTX payload whose `apt` names it is accepted.
+  Every other video payload is left out.
+- **Video feedback.** `nack`, `nack pli` and `ccm fir`, plus `transport-cc`
+  if A0.4 puts it in v1.
+- **Audio payload.** `opus/48000/2`, answered with `stereo=1`,
+  `maxaveragebitrate` set from configuration (music needs more than a
+  browser's speech default) and `usedtx=0`. W0 confirms that each browser
+  honours each of these.
+- **Header extensions.** Only `urn:ietf:params:rtp-hdrext:sdes:mid` is
+  accepted, plus the transport-wide sequence number if `transport-cc` is
+  used. Video orientation (`urn:3gpp:video-orientation`) is deliberately not
+  accepted, so a phone rotates the pixels itself instead of sending rotation
+  metadata that LL-HLS players would ignore. Unknown extensions in received
+  packets are skipped.
+- **ICE and DTLS.** `a=ice-lite`, our credentials, the configured candidates,
+  `a=setup:passive` and our fingerprint.
+
+Packets are matched to sections:
+
+- **By SSRC.** The offer's `a=ssrc` lines and its `ssrc-group:FID` lines pair
+  each media SSRC with its RTX SSRC.
+- **By MID.** When the offer names no SSRC, the MID header extension on the
+  first packets maps SSRCs to sections.
+- **By payload type**, which is unique per section under BUNDLE, as a last
+  resort.
+
+A packet that matches none is dropped and counted.
+
 ## Signalling
 
 ### Where WHIP HTTP ends
@@ -207,15 +257,24 @@ bodies.
 | Request | Answer |
 |---|---|
 | `POST /whip/live/<eventId>` with `Content-Type: application/sdp`, `Authorization: Bearer <token>` | `201 Created`, `Content-Type: application/sdp`, the answer, and `Location: /whip/session/<id>` |
-| `DELETE /whip/session/<id>` with the same token | `200 OK`; the publication ends as an encoder leaving does today |
+| `DELETE /whip/session/<id>` with the same token | `200 OK`; the publisher has left, handled as an encoder leaving is today (see [Reconnects](#reconnects)) |
 | `OPTIONS` on either | CORS preflight for configured origins; `Accept-Post: application/sdp` |
 | `PATCH /whip/session/<id>` | `405 Method Not Allowed`: no trickle ICE or ICE restart in v1 |
 
 - `<id>` is 128 random bits. It is not a credential on its own: `DELETE` also
   needs the token.
+- `Location` is a relative path, which RFC 9725 allows. A front proxy that
+  keeps the path unchanged needs no rewriting.
+- CORS, for configured origins only:
+  - allowed methods `POST`, `DELETE` and `OPTIONS`;
+  - allowed headers `Authorization` and `Content-Type`;
+  - exposed header `Location`.
+
+  Any other origin gets no CORS headers.
 - The offer is at most 16 KiB. The headers and body share the absolute
   deadlines the control API already uses.
 - Refusals, each with a short plain-text reason:
+  - `415`: the content type is missing or not `application/sdp`.
   - `400`: the SDP does not parse.
   - `401`: no token, or the app answered 401.
   - `403`: the app answered 403.
@@ -239,13 +298,24 @@ contract unchanged in shape:
 ```
 
 - `protocol` is `webrtc`, the name mediamtx uses for WHIP, so one app
-  endpoint still serves both media servers.
-- With `SAPFLOW_PUBLISH_USER` and `SAPFLOW_PUBLISH_PASS`, the token must equal
-  the password. With `SAPFLOW_OPEN_PUBLISH=1`, any token is accepted.
+  endpoint still serves both media servers. The
+  [v4v contract](v4v-contract.md#publish-authorisation) lists `srt` or `rtmp`
+  today; it gains `webrtc` in W5, when WHIP ships.
+- The token carries the user and password in one string, because WHIP
+  clients have a single token field:
+  - if it contains a colon, the part before the first colon is the user and
+    the rest is the password;
+  - otherwise the user is empty and the whole token is the password.
+
+  So with `SAPFLOW_PUBLISH_USER` and `SAPFLOW_PUBLISH_PASS`, the token is
+  `<user>:<password>`, checked exactly as the shared publisher is today. An app
+  using `SAPFLOW_PUBLISH_AUTH_URL` should issue colon-free tokens. With
+  `SAPFLOW_OPEN_PUBLISH=1`, any token is accepted.
 - The token is a secret like the password: never logged or kept.
 - The path is claimed at `POST`, before the answer is returned, so a second
   publisher gets `409` at once. Takeover of a stream held for a reconnect
-  works as it does for SRT and RTMP.
+  works as it does for SRT and RTMP. A stalled WHIP session can also be
+  superseded (see [Reconnects](#reconnects)).
 - `ip` is the publisher's address. Behind a front proxy, it comes from
   `X-Forwarded-For` only when the request arrives from
   `SAPFLOW_WHIP_TRUSTED_PROXY`; otherwise it is the peer address. The
@@ -276,6 +346,11 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   protocol v2 (`SAPFLOW_WHIP_TCP_PROXY_PROTOCOL=v2`), the header is accepted
   only from the trusted proxy address and gives the publisher's real address.
   RFC 4571 frames carry STUN, DTLS and SRTP exactly as datagrams do.
+- **Roles.** Sapflow is always the controlled agent. A request carrying
+  ICE-CONTROLLED gets `487 Role Conflict`.
+- **Nomination.** When a valid Binding request with USE-CANDIDATE arrives for
+  a session from a new 5-tuple, media moves to that tuple. Media is never
+  moved by anything other than an authenticated STUN request.
 - **Consent.** A session whose consent checks stop for 30 s ends, as an
   encoder timing out does today.
 - **Limits of TCP 443.** A network that only lets real TLS through on 443
@@ -310,7 +385,20 @@ means:
   samples.
 - An Opus sample entry with a `dOps` box in the fMP4 init segment, using
   `mp4-atom`'s `Opus` and `Dops` (present in the pinned 0.16.2), and `opus` in
-  the playlist's `CODECS`.
+  the playlist's `CODECS`. RTP carries no Opus header, so the `dOps` fields
+  are set by rule:
+  - channel count 2 when stereo was negotiated, otherwise 1;
+  - input sample rate 48 000;
+  - output gain 0;
+  - channel mapping family 0;
+  - pre-skip 312 (the usual encoder lookahead at 48 kHz). A0.2 checks that
+    this value plays cleanly, and the value changes if it does not.
+- No gaps in the audio track. A gap in RTP timestamps with no gap in sequence
+  numbers is the sender's silence suppression (DTX). A gap in sequence
+  numbers that NACK did not recover is loss. Both are filled with a constant
+  encoded-silence Opus frame of matching channel layout, so players see a
+  continuous track. Only the loss counts as media loss. W1 verifies the
+  silence frame against a reference decoder run as a black box.
 - The same in recordings, including the recording checkpoint and programme
   modules.
 - `sapflow-client` and `sapflow-ffi` keep AAC. The native SDK does not publish
@@ -347,8 +435,9 @@ Browsers send a keyframe when asked, not on a schedule. `TargetDuration` and
 - It then asks for a keyframe every `SAPFLOW_WHIP_KEYFRAME_INTERVAL`
   (proposed 2 s), sending PLI (or FIR where only FIR is negotiated). That keeps
   segments near the target that was fixed from the first one.
-- A sender that ignores keyframe requests (OBS uses its own keyframe interval)
-  needs that interval set to match. The ingest guidance says so.
+- A sender may not act on keyframe requests. Whether OBS does is checked in
+  A0.6. Until it is shown to, OBS guidance sets its own keyframe interval to
+  match.
 
 ### Format changes
 
@@ -368,8 +457,8 @@ publish from a browser should hold resolution and let frame rate drop instead
   until the next keyframe. A PLI is sent at once. The loss is reported through
   the existing `PublicationLoss` path, so recordings are marked incomplete as
   they are for SRT.
-- A lost Opus packet leaves a gap. Nothing is concealed, since sapflow does
-  not decode.
+- A lost Opus packet is replaced by silence, as described under [Opus](#opus).
+  Nothing else is concealed, since sapflow does not decode.
 
 ### Congestion feedback
 
@@ -389,11 +478,23 @@ The existing per-publisher cap (`SAPFLOW_MAX_PUBLISH_MBPS`) counts SRTP bytes.
 
 ### Reconnects
 
-There is no ICE restart in v1. When a publisher's path fails, for example
-when a phone moves from Wi-Fi to mobile data, the client deletes its session
-if it can and publishes again with a new `POST`. Within `SAPFLOW_RECONNECT_GRACE`,
-that takes over the held stream, exactly as a reconnecting SRT or RTMP encoder
-does.
+There is no ICE restart in v1.
+
+- **A session that ends** sends `unpublish` at once and holds the stream for
+  `SAPFLOW_RECONNECT_GRACE`, exactly as an SRT or RTMP encoder leaving does
+  today (`publish.rs:481-486`). A session ends through `DELETE`,
+  consent expiry or a failed handshake. A new `POST` within the grace takes
+  over the held stream.
+- **A stalled session can be superseded.** When a phone moves from Wi-Fi to
+  mobile data, its old session can look alive until consent expires, up to
+  30 s. So a new admitted `POST` for a path whose publisher is a WHIP session
+  that has delivered no media for `SAPFLOW_WHIP_STALE` (proposed 2 s) ends
+  that session and takes over at once, as if it had left. If the current
+  WHIP session is still delivering media, or the current publisher is SRT or
+  RTMP, the new `POST` gets `409`, so two encoders never fight over one
+  stream.
+- **Clients** recover by sending a new `POST`. A `DELETE` first is a
+  courtesy, and is not needed when the old network is gone.
 
 ## Concurrency and resource bounds
 
@@ -426,8 +527,8 @@ does.
 - **Not logged:**
   - Offers carry the publisher's addresses in their candidates. They are
     parsed in memory and never logged or stored.
-  - The token is never logged. Neither are publisher addresses, as with RTMP
-    and SRT today.
+  - The token is never logged, and neither are publisher addresses. A3.6
+    checks both. The address is used only for the throttle, in memory.
 - **One server certificate per process.** It is generated at start (ECDSA
   P-256) and its fingerprint is put in every answer. It identifies the server,
   not the publisher.
@@ -451,6 +552,8 @@ All names are proposed and settle in W3.
 | `SAPFLOW_WHIP_ALLOW_ORIGINS` | Origins allowed by CORS for browser publishing |
 | `SAPFLOW_WHIP_KEYFRAME_INTERVAL` | Keyframe request cadence, proposed 2 s |
 | `SAPFLOW_WHIP_JITTER` | Longest wait for a lost packet, proposed 200 ms |
+| `SAPFLOW_WHIP_STALE` | Media silence after which a new `POST` may supersede a session, proposed 2 s |
+| `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | `maxaveragebitrate` offered for Opus |
 
 ## Delay budget
 
@@ -476,74 +579,127 @@ report or a green run is a claim until that evidence exists.
 
 ### W0: evidence before code
 
+W0 gathers facts. Each check fails if a target is skipped, tested only in
+emulation where a device is named, or described from documentation or memory
+instead of observed.
+
 - **A0.1 Captured profile.** Capture offers and DTLS ClientHellos from every
   target in [The browser profile](#the-browser-profile) and keep them as
-  fixtures (with addresses replaced). Evidence: the fixtures, and this
-  document updated to match them. Fails if any target's capture is described
-  from memory.
-- **A0.2 Opus playback.** Package a captured browser Opus stream as fMP4
-  LL-HLS and a recording, then play both on Safari for iOS (native player),
-  Safari for macOS, Chrome and Firefox with hls.js, and Chrome on Android.
-  Evidence: a table per player, playback and recording, with versions.
-- **A0.3 TCP 443.** Check that each browser target, and OBS, reaches a passive
-  TCP candidate through a layer-4 proxy on 443 when UDP is blocked. Evidence:
-  the selected candidate pair from each client's statistics. Fails if
-  inferred from documentation.
+  fixtures, with addresses replaced. Evidence: the fixtures, and this
+  document updated to match them.
+- **A0.2 Opus playback.** Package a captured browser Opus stream, with the
+  `dOps` values above, as fMP4 LL-HLS and as a recording. Play both on:
+  - Safari for iOS on a physical iPhone, in the native player;
+  - Safari for macOS;
+  - Chrome and Firefox with hls.js;
+  - Chrome on a physical Android phone.
+
+  Evidence: a table per player for live and recording, with versions, noting
+  any click at the start (pre-skip).
+- **A0.3 TCP 443.** With UDP blocked, each browser target and OBS reaches a
+  passive TCP candidate through a layer-4 proxy on 443. Evidence: the
+  selected candidate pair from each client's statistics.
 - **A0.4 Rate ramp.** Measure each browser target's sending rate over the
-  first 30 s with no feedback and with `transport-cc`. Evidence: the rate
+  first 30 s, with no feedback and with `transport-cc`. Evidence: the rate
   series per target. This decides whether `transport-cc` is in v1.
-- **A0.5 Missing H.264.** Record which targets, if any, offer no H.264. Those
-  devices get `422` with a reason. Evidence: the offers.
+- **A0.5 Missing H.264.** Record which targets, if any, offer no H.264.
+  Evidence: their offers.
+- **A0.6 OBS keyframes.** Record whether OBS's WHIP output answers PLI and FIR
+  with a keyframe. Evidence: keyframe arrival times after requests sent at
+  known times.
+- **A0.7 Opus parameters.** Record whether each browser target honours
+  `stereo=1`, `maxaveragebitrate` and `usedtx=0`. Evidence: the TOC stereo
+  flag and bitrate of received packets.
 
 ### W1: `sapflow-rtp`
 
-- **A1.1** SRTP and SRTCP protect and unprotect the RFC 3711 and RFC 7714
-  test vectors exactly.
-- **A1.2** Fed the captured browser streams with packets reordered, duplicated
-  and dropped, the depacketiser emits the same access units as the lossless
-  capture, or reports the loss.
-- **A1.3** Fuzz targets for RTP, RTCP, SRTP unprotect and both depacketisers
-  run in CI under the existing 60 s and nightly regime.
+- **A1.1 Vectors.** SRTP and SRTCP protect and unprotect the RFC 3711 and
+  RFC 7714 test vectors exactly.
+- **A1.2 Recovery.** Feed the captured streams with packets reordered,
+  duplicated and dropped, where every dropped packet's retransmission arrives
+  within the wait. The depacketiser must emit exactly the access units of the
+  lossless capture. With retransmissions withheld, it must report loss for
+  exactly the withheld packets' frames. Fails if any access unit differs, or
+  if loss is reported for a delivered packet.
+- **A1.3 Fuzzing.** RTP, RTCP, SRTP unprotect, both depacketisers and the
+  Opus TOC parser each have a fuzz target. Each target:
+  - starts from a seed corpus built from the W0 captures;
+  - runs in CI under the existing 60 s and nightly regime;
+  - has a coverage report showing it reaches the parser past its length
+    checks.
+
+  Fails if a target only ever rejects at the first byte.
 
 ### W2: `sapflow-dtls`
 
-- **A2.1** A handshake completes against a black-box OpenSSL DTLS 1.2 client
-  (`s_client -dtls1_2 -use_srtp ... -keymatexport EXTRACTOR-dtls_srtp`), and
-  both sides export the same SRTP keying material.
-- **A2.2** Replayed captured ClientHellos from every target pass, and
-  malformed, oversized, out-of-order and retransmitted flights are refused or
-  handled within the caps.
-- **A2.3** A peer certificate that does not match the offer's fingerprint is
-  refused. The test fails if the check is bypassed by a test-only flag.
-- **A2.4** Fuzz targets for records and each handshake message.
+- **A2.1 Key export.** A handshake completes against a black-box OpenSSL DTLS
+  1.2 client (`s_client -dtls1_2 -use_srtp ... -keymatexport
+  EXTRACTOR-dtls_srtp`). Both sides export byte-identical SRTP keying
+  material.
+- **A2.2 Captures and abuse.** Replayed ClientHellos from every target
+  complete. Malformed, oversized, out-of-order and retransmitted flights are
+  each refused or handled within the caps, with one test per case.
+- **A2.3 Fingerprint.** A peer certificate that does not match the offer's
+  fingerprint is refused. Fails if any build or test flag can skip the check.
+- **A2.4 Fuzzing.** Records and each handshake message have fuzz targets, held
+  to A1.3's corpus and coverage rules.
 
 ### W3: `sapflow-whip` and the server
 
-- **A3.1** Headless Chrome with fake media publishes through `POST` to a local
-  sapflow. The stream plays as LL-HLS in hls.js, and the recording opens.
-  Evidence: the test log and a played frame.
-- **A3.2** `DELETE` sends `unpublish`. A new `POST` within the grace period
-  continues the same stream. Each refusal in [Resources](#resources) is
-  observed with its status and reason.
-- **A3.3** A panic injected while handling one session ends only that session.
-  Another live session keeps publishing.
-- **A3.4** Fuzz targets for STUN, SDP and the WHIP request parser.
-- **A3.5** `scripts/smoke.sh` covers WHIP alongside SRT and RTMP.
+- **A3.1 End to end.** Headless Chrome with fake media publishes through
+  `POST` to a local sapflow. The stream plays as LL-HLS in hls.js, and the
+  recording opens. Evidence: the test log and a decoded frame.
+- **A3.2 Leaving and returning.** `DELETE` sends `unpublish` at once and holds
+  the stream. A new `POST` within the grace continues the same stream, and
+  one after the grace starts a new one. Every refusal in
+  [Resources](#resources) is observed with its status and reason.
+- **A3.3 Supersede.** A second `POST` while the first session is still
+  delivering media gets `409`. Once the first session has delivered nothing
+  for `SAPFLOW_WHIP_STALE`, a second `POST` takes over without waiting for
+  consent expiry.
+- **A3.4 Panic isolation.** A panic injected while handling one session ends
+  only that session. A second live session keeps publishing without a gap.
+- **A3.5 Fuzzing.** STUN, SDP and the WHIP request parser have fuzz targets,
+  held to A1.3's rules.
+- **A3.6 Privacy and default.**
+  - With `SAPFLOW_WHIP_ADDR` unset, no WHIP socket is bound (checked with the
+    process's open sockets).
+  - With trace logging on, an A3.1 run's logs contain neither the token, nor
+    any address from the offer, nor the publisher's address.
+- **A3.7 Bounds and reflection.**
+  - Each cap in [Concurrency and resource bounds](#concurrency-and-resource-bounds)
+    refuses at its limit.
+  - A session with no completed handshake is gone 10 s after its `201`, and
+    one without consent checks is gone 30 s after the last.
+  - Unauthenticated STUN, DTLS and random datagrams sent to the UDP port from
+    a fresh address produce zero bytes in reply (packet capture).
+- **A3.8 Audio and video sync.** A browser publishing from a test file with a
+  click and a flash at known times produces HLS whose audio is no more than
+  40 ms early or 60 ms late against the video (the EBU R37 range).
+- **A3.9 Smoke.** `scripts/smoke.sh` covers WHIP alongside SRT and RTMP.
 
 ### W4: qualification
 
-- **A4.1** Under 1%, 5% and 10% random loss with added jitter (Linux `netem`),
-  recovered and lost frames and the resulting delay are recorded per
-  `SAPFLOW_WHIP_JITTER` value.
-- **A4.2** CPU and memory per WHIP publisher are measured at the bitrates in
-  [benchmarks.md](benchmarks.md), beside the RTMP and SRT publishers on the
-  same machine.
-- **A4.3** Physical devices: an iPhone (Safari) and an Android phone (Chrome)
-  each publish for 30 minutes over Wi-Fi and mobile data, with a network
-  switch. Evidence: the stream, the recording and the reconnects.
-- **A4.4** An independent review of `sapflow-dtls` and SRTP in `sapflow-rtp`
-  is recorded with its findings resolved. A review by the author, or by an
-  agent of the same session, does not count.
+- **A4.1 Loss.** Apply 1%, 5% and 10% random loss with added jitter (Linux
+  `netem`). At the chosen default `SAPFLOW_WHIP_JITTER`, WHIP must leave no
+  more frames unrecovered than the SRT receiver at the SRT latency giving a
+  similar delay, on the same loss profile
+  ([srt-loss-method.md](srt-loss-method.md)). Fails otherwise, unless the user
+  accepts the difference in writing.
+- **A4.2 Cost.** CPU and memory per WHIP publisher, measured at the bitrates
+  in [benchmarks.md](benchmarks.md) beside the RTMP and SRT publishers on the
+  same machine, must be no higher than the SRT publisher's. Fails otherwise,
+  unless the user accepts the difference in writing.
+- **A4.3 Physical devices.** An iPhone (Safari) and an Android phone (Chrome)
+  each publish for 30 minutes over Wi-Fi and mobile data, switching network
+  at least twice. Fails on:
+  - any stop the publisher did not ask for;
+  - a switch that is not back live within `SAPFLOW_RECONNECT_GRACE`;
+  - a recording missing anything other than marked loss.
+- **A4.4 Review.** An independent review of `sapflow-dtls` and of SRTP in
+  `sapflow-rtp` is recorded, with every finding resolved or accepted in
+  writing. A review by the author, or by an agent of the same session, does
+  not count.
 
 ### W5: documentation
 
@@ -561,3 +717,4 @@ they describe what ships.
 | RustCrypto or `ring` | A4.2 |
 | Accepting another video codec for phones without H.264 | A0.5, and would need transcoding downstream |
 | ICE restart via `PATCH` | Physical results in A4.3 |
+| Defaults for `SAPFLOW_WHIP_STALE` and `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | A3.3, A0.7 and A4.3 |
