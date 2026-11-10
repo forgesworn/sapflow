@@ -209,6 +209,13 @@ these ways:
 Firefox 160's offer is captured. Its ClientHello is not yet, because no ICE
 check reached the test endpoint from the test host (see the evidence).
 
+Safari 26.6 on macOS and Safari on iOS 27 send small single-datagram
+ClientHellos: 153 and 216 bytes. Both are DTLS 1.2 only, with no hybrid
+group. Safari on macOS lists the same `use_srtp` profiles as Chrome. Both
+offer H.264 High (`640c1f`) first, and the iOS offer has no Baseline. Both
+list video before audio, and their Opus offer has no `stereo=1`, which the
+answer adds.
+
 The FFmpeg 8.1 WHIP muxer, used only as a reference client, offers
 `a=setup:passive` by default. Sapflow refuses that. With
 `-whip_flags dtls_active` it offers `active` and fits.
@@ -424,7 +431,10 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   checks to a public-range address on 443. A public deployment advertises a
   public address, so 443 is expected to work, but A0.3 stays open until a
   run against a public address on 443 succeeds. Local tests use a port of
-  1024 or above.
+  1024 or above. Safari on macOS also connected over ICE-TCP in W0.
+  Vanadium, a hardened Chromium on Android, gathered no UDP candidates at
+  all and connected only over TCP. For such a browser, TCP is the only
+  route, not a fallback.
 - **Roles.** A lite agent is always the controlled one (RFC 8445 section
   6.1.1) and cannot switch. A request carrying ICE-CONTROLLED is answered
   with `487 Role Conflict`, so the full agent takes the controlling role
@@ -480,8 +490,8 @@ means:
   - channel mapping family 0;
   - pre-skip 0 (provisional). Chrome's own recorder writes 0. In W0, a
     312 asset clicked twice at the start in Firefox with hls.js, in four of
-    four runs, and the 0 assets never did. The cause is unknown. Safari and
-    the phones are still to be checked.
+    four runs, and the 0 assets never did. The cause is unknown. Safari gave
+    no comparison (see below). W3 rechecks with sapflow's own packaging.
 - No gaps in the audio track. A gap in RTP timestamps with no gap in sequence
   numbers is the sender's silence suppression (DTX). A gap in sequence
   numbers that NACK did not recover is loss. Both are filled with a constant
@@ -493,14 +503,30 @@ means:
 - `sapflow-client` and `sapflow-ffi` keep AAC. The native SDK does not publish
   over WebRTC.
 
-Transcoding Opus to AAC inside sapflow was considered and rejected. It would
-bring an Opus decoder and an AAC encoder into the server, against the
-no-transcoding goal. A deployment whose players cannot take Opus can
-transcode downstream.
+**Apple players do not decode it.** W0 played Opus in fMP4 HLS, packaged by
+FFmpeg as a stand-in for sapflow, in every target player:
 
-Whether every target player decodes Opus in fMP4 LL-HLS is tested in W0, not
-assumed. The results decide what a deployment needs downstream, not what
-sapflow sends.
+| Player | Opus in fMP4 HLS | Opus in plain fragmented MP4 |
+|---|---|---|
+| Chrome 157 and Firefox 160, hls.js 1.7.4 | Plays and decodes | Plays |
+| Vanadium on Android, hls.js 1.7.4 | Plays and decodes | Plays |
+| Safari 26.6 on macOS, native HLS | `MEDIA_ERR_DECODE` | Plays, both channels |
+| Safari on iOS 27, native HLS | `MEDIA_ERR_DECODE` | Plays (muted, decode not shown) |
+| Safari 26.6 on macOS, hls.js 1.7.4 | Time advances, audio not shown | |
+
+Safari also reports `audio/mp4; codecs="opus"` as unsupported to Media
+Source Extensions. The test did not separate Opus in HLS from FFmpeg's
+playlist and init segment, so W3 repeats it with sapflow's own packaging.
+Until then, a WHIP stream's LL-HLS is treated as unplayable on Apple's
+players.
+
+**Decision (user, 10 November 2026): sapflow keeps Opus and does not
+transcode.** Transcoding Opus to AAC inside sapflow was considered and
+rejected again with this evidence. It would bring an Opus decoder and an AAC
+encoder into the server, against the no-transcoding goal. A deployment with
+Apple viewers converts the audio to AAC downstream, before players see it.
+The README and [comparison.md](comparison.md) say so when WHIP ships. If WHIP
+is wanted without a downstream converter, this decision is revisited.
 
 ### One timeline
 
@@ -850,5 +876,6 @@ they describe what ships.
 | Default `SAPFLOW_WHIP_JITTER` | A4.1 |
 | RustCrypto or `ring` | A4.2 |
 | Accepting another video codec for phones without H.264 | A0.5, and would need transcoding downstream |
+| Opus to AAC inside sapflow | Decided no (10 November 2026). Revisit if WHIP is used without a downstream converter |
 | ICE restart via `PATCH` | Physical results in A4.3 |
 | Defaults for `SAPFLOW_WHIP_STALE` and `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | A3.3, A0.7 and A4.3 |
