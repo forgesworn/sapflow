@@ -164,6 +164,14 @@ Goal: other people can build on our crates and SDK. Work queue LQ1 to LQ8 in
 | 4.5 | Decide on an OBS adapter, then scenes, mixing and a desktop studio | Maintainer | 4.3 | Written decisions with scope and acceptance |
 | 4.6 | Finish the repository homepage proposal | Maintainer reviews; server work prepares | Reviewed current page and publication instruction | A project homepage is live and linked from the repository; its GitHub homepage field was still empty at this review |
 
+## WHIP ingest
+
+Designed, not built: [whip-ingest.md](whip-ingest.md). W0 gathers evidence
+(captured browser and OBS offers, Opus playback, TCP 443, rate ramp) before
+any code. W1 to W4 carry their own acceptance checks, and W4 includes an
+independent review of the DTLS and SRTP code before WHIP is enabled on a
+public deployment. It can progress independently of the phases above.
+
 ## Phase 5: later
 
 - RelaySwarm peer playback in the apps (B6), after phase 3.

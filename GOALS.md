@@ -20,13 +20,17 @@ scope; a historical failure or missing measurement is not a current verdict.
 ## Principles
 
 - **Only what the stage needs.** One way in, one way out, recording, one
-  callback. No RTSP, WebRTC, transcoding, playback API or config file the size
-  of mediamtx's.
+  callback. No RTSP, transcoding, playback API or config file the size
+  of mediamtx's. WebRTC only as receive-only WHIP ingest, which is designed
+  but not built ([whip-ingest.md](docs/whip-ingest.md)).
 - **Do not hand-roll hostile-input parsers** without a reason. MPEG-TS and
   H.264 bitstream parsing come from maintained crates. The ingest protocols
   are the exception: no maintained Rust choice exists for RTMP or SRT, so
   sapflow carries its own, narrow to what the stage needs (see Decisions),
-  and proves each against the reference implementation before it ships. Our other code is glue,
+  and proves each against the reference implementation before it ships.
+  WHIP ingest is a deliberate further exception: maintained Rust WebRTC
+  stacks exist, and the reasons and gates for our own are in
+  [whip-ingest.md](docs/whip-ingest.md#decision-and-how-it-fits-the-goals). Our other code is glue,
   policy and the LL-HLS playlist logic. Anything we parse ourselves gets a
   fuzz target before it faces the internet.
 - **Private by default.** No outbound calls except the configured callback. Do
@@ -506,6 +510,13 @@ installed-release acceptance remain open under [LQ1 to LQ8](docs/library-quality
   MIT implementation (M6), developed inside sapflow first, unencrypted
   receive first and encryption before it becomes the default. This
   supersedes "no SRT implementation of our own" above.
+
+- **2026-11-10, WHIP ingest is our own** (user's decision): receive-only
+  WHIP (RFC 9725) as new sans-IO crates under MIT, written from the RFCs and
+  wire observation only, with other WebRTC, DTLS and SRTP implementations run
+  only as black boxes. It stays off by default until its fuzz, interoperability
+  and independent-review gates pass. Design and gates:
+  [whip-ingest.md](docs/whip-ingest.md).
 
 ## Decisions owed by the user
 
