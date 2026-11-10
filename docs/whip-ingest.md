@@ -476,6 +476,10 @@ publish from a browser should hold resolution and let frame rate drop instead
 
 ### Congestion feedback
 
+Sapflow sends RTCP receiver reports (RFC 3550) for each stream it receives,
+at the usual RTCP interval and in compound packets with its NACK, PLI and any
+other feedback. Senders use them for loss-based rate control.
+
 A browser sets its bitrate from the receiver's feedback. Without feedback it
 may stay at a low starting rate. W0 measures, for each browser target, how
 the sending rate ramps with no feedback and with transport-wide congestion
@@ -627,7 +631,8 @@ instead of observed.
   passive TCP candidate through a layer-4 proxy on 443. Evidence: the
   selected candidate pair from each client's statistics.
 - **A0.4 Rate ramp.** Measure each browser target's sending rate over the
-  first 30 s, with no feedback and with `transport-cc`. Evidence: the rate
+  first 30 s, with receiver reports only and with receiver reports plus
+  `transport-cc`. Evidence: the rate
   series per target. This decides whether `transport-cc` is in v1.
 - **A0.5 Missing H.264.** Record which targets, if any, offer no H.264.
   Evidence: their offers.
