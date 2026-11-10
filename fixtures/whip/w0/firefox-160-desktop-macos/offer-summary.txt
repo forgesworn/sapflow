@@ -1,0 +1,33 @@
+session: a=group:BUNDLE 0 1; ice-lite=no
+audio section: mid=0 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=actpass rtcp-mux=yes fingerprint=sha-256 ice-options=trickle
+  candidates: 2 x UDP host; 2 x TCP host active
+  ssrc lines: 1, ssrc-group: none
+  header extensions: ssrc-audio-level, csrc-audio-level, sdes:mid, draft-holmer-rmcat-transport-wide-cc-extensions-01
+  payloads in offer order:
+    109 opus/48000/2  fmtp: maxplaybackrate=48000;stereo=1;useinbandfec=1  rtcp-fb: transport-cc
+    9 G722/8000/1  rtcp-fb: transport-cc
+    0 PCMU/8000  rtcp-fb: transport-cc
+    8 PCMA/8000  rtcp-fb: transport-cc
+    101 telephone-event/8000  fmtp: 0-15
+video section: mid=1 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=actpass rtcp-mux=yes fingerprint=sha-256 ice-options=trickle
+  candidates: 2 x UDP host; 2 x TCP host active
+  ssrc lines: 2, ssrc-group: FID 2287091134 931427898
+  header extensions: sdes:mid, rtp-hdrext/abs-send-time, toffset, rtp-hdrext/playout-delay, draft-holmer-rmcat-transport-wide-cc-extensions-01, urn:3gpp:video-orientation, https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension
+  payloads in offer order:
+    120 VP8/90000  fmtp: max-fs=12288;max-fr=60  rtcp-fb: nack, nack pli, ccm fir, goog-remb, transport-cc
+    124 rtx/90000  fmtp: apt=120
+    121 VP9/90000  fmtp: max-fs=12288;max-fr=60  rtcp-fb: nack, nack pli, ccm fir, goog-remb, transport-cc
+    125 rtx/90000  fmtp: apt=121
+    126 H264/90000  profile-level-id=42e01f packetization-mode=1  rtcp-fb: nack, nack pli, ccm fir, goog-remb, transport-cc
+    127 rtx/90000  fmtp: apt=126
+    105 H264/90000  profile-level-id=42001f packetization-mode=1  rtcp-fb: nack, nack pli, ccm fir, goog-remb, transport-cc
+    106 rtx/90000  fmtp: apt=105
+    99 AV1/90000  fmtp: profile=0;level-idx=9;tier=0  rtcp-fb: nack, nack pli, ccm fir, goog-remb, transport-cc
+    100 rtx/90000  fmtp: apt=99
+    123 ulpfec/90000  rtcp-fb: nack, nack pli, ccm fir, goog-remb, transport-cc
+    122 red/90000  rtcp-fb: nack, nack pli, ccm fir, goog-remb, transport-cc
+    119 rtx/90000  fmtp: apt=122
+video codecs offered (excluding rtx/red/fec): VP8, VP9, H264, AV1
+H.264: 42e01f/pm1, 42001f/pm1

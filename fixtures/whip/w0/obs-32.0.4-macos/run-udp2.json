@@ -1,0 +1,79 @@
+{
+ "obsVersion": "32.0.4",
+ "backup": "made",
+ "backupFiles": 168,
+ "pid": 57427,
+ "startedAndWasAlive": true,
+ "obsPidsDuring": [
+  57427
+ ],
+ "secondSigtermNeeded": true,
+ "exit": {
+  "code": null,
+  "signal": "SIGABRT"
+ },
+ "obsEndedAfterSigterm": true,
+ "obsPidsAfter": [],
+ "restoreDiffExit": 0,
+ "restoreDiff": "",
+ "restoreRsyncDryRun": "",
+ "modifiedConfigMovedTo": "obs-studio-1794350661730",
+ "backupMovedTo": "w0-obs-backup-M9v5mO-1794350661956",
+ "events": {
+  "label": "obs-udp",
+  "mode": "udp",
+  "stun": {
+   "requests": 3,
+   "valid": 3,
+   "badIntegrity": 0,
+   "noFingerprint": 0,
+   "attrs": {
+    "PRIORITY": 3,
+    "ICE_CONTROLLING": 3,
+    "SOFTWARE": 3,
+    "USERNAME": 3,
+    "MESSAGE_INTEGRITY": 3,
+    "FINGERPRINT": 3,
+    "USE_CANDIDATE": 2
+   },
+   "useCandidate": 2,
+   "controlling": 3,
+   "controlled": 0,
+   "tuples": 1
+  },
+  "dtls": {
+   "datagrams": 4,
+   "firstTransport": "udp",
+   "firstLength": 342,
+   "helloFragments": [
+    342
+   ]
+  },
+  "tcpConnections": 0,
+  "whipRequests": [
+   {
+    "authScheme": "Bearer",
+    "contentType": "application/sdp",
+    "userAgent": "Mozilla/5.0 (OBS-Studio/32.0.4; Mac OS X; en-US)",
+    "headerNames": [
+     "accept",
+     "authorization",
+     "content-length",
+     "content-type",
+     "host",
+     "user-agent"
+    ]
+   }
+  ],
+  "loadStart": [
+   14.23583984375,
+   40.439453125,
+   65.43798828125
+  ],
+  "loadEnd": [
+   16.166015625,
+   39.9951171875,
+   64.98828125
+  ]
+ }
+}

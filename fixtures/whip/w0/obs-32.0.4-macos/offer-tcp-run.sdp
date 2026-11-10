@@ -1,0 +1,35 @@
+v=0
+o=rtc 2107598623 0 IN IP4 203.0.113.1
+s=-
+t=0 0
+a=group:BUNDLE 0 1
+a=group:LS 0 1
+a=msid-semantic:WMS *
+a=setup:actpass
+a=ice-ufrag:zivK
+a=ice-pwd:uKY3/pvyu3aqzj4todmJKS
+a=ice-options:ice2,trickle
+a=fingerprint:sha-256 2F:DC:57:AF:93:A2:30:A7:41:71:B5:E3:52:2D:1E:F6:12:31:E9:D0:DC:71:E8:DF:82:E1:8E:C2:DE:F2:7F:79
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+c=IN IP4 0.0.0.0
+a=mid:0
+a=sendonly
+a=ssrc:4141937077 cname:Ofd48k9Y85GzzyKD
+a=ssrc:4141937077 msid:HOFA6VsVgpAboDRD HOFA6VsVgpAboDRD-audio
+a=msid:HOFA6VsVgpAboDRD HOFA6VsVgpAboDRD-audio
+a=rtcp-mux
+a=rtpmap:111 opus/48000/2
+a=fmtp:111 minptime=10;maxaveragebitrate=96000;stereo=1;sprop-stereo=1;useinbandfec=1
+m=video 9 UDP/TLS/RTP/SAVPF 96
+c=IN IP4 0.0.0.0
+a=mid:1
+a=sendonly
+a=ssrc:4141937078 cname:Ofd48k9Y85GzzyKD
+a=ssrc:4141937078 msid:HOFA6VsVgpAboDRD HOFA6VsVgpAboDRD-video
+a=msid:HOFA6VsVgpAboDRD HOFA6VsVgpAboDRD-video
+a=rtcp-mux
+a=rtpmap:96 H264/90000
+a=rtcp-fb:96 nack
+a=rtcp-fb:96 nack pli
+a=rtcp-fb:96 goog-remb
+a=fmtp:96 profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1
