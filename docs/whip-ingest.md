@@ -216,9 +216,9 @@ The answer is built as follows:
 - **Header extensions.** Only `urn:ietf:params:rtp-hdrext:sdes:mid` is
   accepted, plus the transport-wide sequence number if `transport-cc` is
   used. Video orientation (`urn:3gpp:video-orientation`) is deliberately not
-  accepted, because LL-HLS players would ignore rotation metadata. A phone is
-  then expected to rotate the pixels itself; A0.8 checks what each phone
-  target does. Unknown extensions in received packets are skipped.
+  accepted, because Sapflow has no way to carry a per-frame rotation into
+  LL-HLS. A phone is then expected to rotate the pixels itself; A0.8 checks
+  what each phone target does. Unknown extensions in received packets are skipped.
 - **ICE and DTLS.** `a=ice-lite`, our credentials, the configured candidates,
   `a=setup:passive` and our fingerprint.
 
@@ -266,9 +266,10 @@ bodies.
 
 - `<id>` is 128 random bits. It is not a credential on its own: `DELETE` also
   needs the token, which RFC 9725 has clients send on every request.
-- RFC 9725 makes trickle ICE and ICE restart optional, and names no status
-  for a session that supports neither. 405 is HTTP's answer for an
-  unsupported method.
+- RFC 9725 makes trickle ICE and ICE restart optional. Its ICE sections (4.3
+  and 4.3.1) require 422 only for a session that supports one of the two,
+  and name no status for a session that supports neither. 405 is HTTP's
+  answer for an unsupported method.
 - `Location` is an absolute URL built from `SAPFLOW_WHIP_PUBLIC_URL`, the
   public base URL the front proxy serves. RFC 9725's examples use absolute
   URLs, and a client may not resolve a relative one.
@@ -353,8 +354,10 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   protocol v2 (`SAPFLOW_WHIP_TCP_PROXY_PROTOCOL=v2`), the header is accepted
   only from the trusted proxy address and gives the publisher's real address.
   RFC 4571 frames carry STUN, DTLS and SRTP exactly as datagrams do.
-- **Roles.** Sapflow is always the controlled agent. A request carrying
-  ICE-CONTROLLED gets `487 Role Conflict`.
+- **Roles.** A lite agent is always the controlled one (RFC 8445 section
+  6.1.1) and cannot switch. A request carrying ICE-CONTROLLED is answered
+  with `487 Role Conflict`, so the full agent takes the controlling role
+  (section 7.3.1.1). W3 tests check that each browser target recovers from it.
 - **Nomination.** When a valid Binding request with USE-CANDIDATE arrives for
   a session from a new 5-tuple, media moves to that tuple. Media is never
   moved by anything other than an authenticated STUN request.
@@ -394,7 +397,11 @@ means:
   `mp4-atom`'s `Opus` and `Dops` (present in the pinned 0.16.2), and `opus` in
   the playlist's `CODECS`. RTP carries no Opus header, so the `dOps` fields
   are set by rule:
-  - channel count 2 when stereo was negotiated, otherwise 1;
+  - channel count 2 when stereo was negotiated or the first packet's TOC
+    byte is stereo, otherwise 1. An Opus decoder set up for that count
+    decodes both mono and stereo packets, so a later change in the TOC
+    stereo flag is not a format change. A0.2 includes a stream that
+    switches;
   - input sample rate 48 000;
   - output gain 0;
   - channel mapping family 0;
@@ -500,8 +507,14 @@ There is no ICE restart in v1.
   30 s. So a new admitted `POST` for a path whose publisher is a stalled WHIP
   session ends that session and takes over at once, as if it had left. A
   session is stalled when `SAPFLOW_WHIP_STALE` (proposed 2 s) has passed
-  since its last accepted media packet, or since its `201` if it has
-  accepted none. If the current
+  since its last accepted media packet.
+- **A session that has accepted no media yet** is replaced by any new
+  admitted `POST` for its path, at once. Nothing is live yet, so a retried or
+  double-clicked `POST` simply wins.
+- **Ending a gig.** A deliberate `DELETE` is handled like a drop, so the
+  stream is held and an app may show "reconnecting" until the grace runs out.
+  That is intended and matches encoders today. An app that knows the gig has
+  ended says so from its own state. If the current
   WHIP session is still delivering media, or the current publisher is SRT or
   RTMP, the new `POST` gets `409`, so two encoders never fight over one
   stream.
@@ -675,10 +688,12 @@ instead of observed.
     with no callback.
   - Every refusal in [Resources](#resources) is observed with its status and
     reason.
-- **A3.3 Supersede.** A second `POST` while the first session is still
-  delivering media gets `409`. Once the first session has delivered nothing
-  for `SAPFLOW_WHIP_STALE`, a second `POST` takes over without waiting for
-  consent expiry.
+- **A3.3 Supersede.**
+  - A second `POST` while the first session is still delivering media gets
+    `409`.
+  - Once the first session has delivered nothing for `SAPFLOW_WHIP_STALE`, a
+    second `POST` takes over without waiting for consent expiry.
+  - A second `POST` during the first session's handshake replaces it at once.
 - **A3.4 Panic isolation.** A panic injected while handling one session ends
   only that session. A second live session keeps publishing without a gap.
 - **A3.5 Fuzzing.** STUN, SDP and the WHIP request parser have fuzz targets,
@@ -704,14 +719,16 @@ instead of observed.
 
 - **A4.1 Loss.** Apply 1%, 5% and 10% random loss with added jitter (Linux
   `netem`). At the chosen default `SAPFLOW_WHIP_JITTER`, WHIP must leave no
-  more frames unrecovered than the SRT receiver at the SRT latency giving a
-  similar delay, on the same loss profile
+  more frames unrecovered than the SRT receiver with its latency set to the
+  same value, on the same loss profile
   ([srt-loss-method.md](srt-loss-method.md)). Fails otherwise, unless the user
   accepts the difference in writing.
 - **A4.2 Cost.** CPU and memory per WHIP publisher, measured at the bitrates
   in [benchmarks.md](benchmarks.md) beside the RTMP and SRT publishers on the
   same machine, must be no higher than the SRT publisher's. Fails otherwise,
-  unless the user accepts the difference in writing.
+  unless the user accepts the difference in writing. DTLS, SRTP and ICE add
+  work that SRT does not do, so a failure here is a decision point, not
+  necessarily a defect.
 - **A4.3 Physical devices.** An iPhone (Safari) and an Android phone (Chrome)
   each publish for 30 minutes over Wi-Fi and mobile data, switching network
   at least twice. Fails on:
