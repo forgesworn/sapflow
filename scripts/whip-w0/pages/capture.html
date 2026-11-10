@@ -1,0 +1,48 @@
+<!doctype html><meta charset="utf-8"><title>W0 capture</title>
+<script>
+// Publishes fake camera and microphone to the W0 fake WHIP endpoint as a WHIP
+// client would (RFC 9725), then samples ICE/DTLS state and getStats.
+const q = new URLSearchParams(location.search);
+const label = q.get('label') || 'chrome';
+const post = (name, body) => fetch('/result/' + name, { method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body, null, 1) });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(async () => {
+  const out = { label, userAgent: navigator.userAgent, timeline: [], errors: [] };
+  try {
+    out.capabilities = {
+      video: RTCRtpSender.getCapabilities('video').codecs.map((c) => [c.mimeType, c.sdpFmtpLine || ''].join(' ')),
+      audio: RTCRtpSender.getCapabilities('audio').codecs.map((c) => [c.mimeType, c.sdpFmtpLine || ''].join(' ')),
+    };
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 1280, height: 720 } });
+    const pc = new RTCPeerConnection();
+    out.config = pc.getConfiguration();
+    stream.getTracks().forEach((t) => pc.addTransceiver(t, { direction: 'sendonly', streams: [stream] }));
+    pc.oniceconnectionstatechange = () => out.timeline.push([Math.round(performance.now()), 'ice', pc.iceConnectionState]);
+    pc.onconnectionstatechange = () => out.timeline.push([Math.round(performance.now()), 'conn', pc.connectionState]);
+    await pc.setLocalDescription(await pc.createOffer());
+    await Promise.race([new Promise((r) => { pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && r(); }), sleep(3000)]);
+    const res = await fetch('/whip?label=' + label, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+    out.whipStatus = res.status;
+    await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+    const snap = async (tag) => {
+      const stats = [...(await pc.getStats()).values()];
+      const byId = Object.fromEntries(stats.map((s) => [s.id, s]));
+      const transport = stats.find((s) => s.type === 'transport');
+      const sel = transport && byId[transport.selectedCandidatePairId];
+      out[tag] = {
+        t: Math.round(performance.now()), ice: pc.iceConnectionState, conn: pc.connectionState,
+        transport: transport && { dtlsState: transport.dtlsState, iceState: transport.iceState, dtlsRole: transport.dtlsRole, selectedCandidatePairId: transport.selectedCandidatePairId, srtpCipher: transport.srtpCipher, dtlsCipher: transport.dtlsCipher, tlsVersion: transport.tlsVersion, bytesSent: transport.bytesSent, bytesReceived: transport.bytesReceived },
+        selectedPair: sel && { state: sel.state, nominated: sel.nominated, writable: sel.writable, requestsSent: sel.requestsSent, responsesReceived: sel.responsesReceived, bytesSent: sel.bytesSent, local: byId[sel.localCandidateId], remote: byId[sel.remoteCandidateId] },
+        pairs: stats.filter((s) => s.type === 'candidate-pair').map((s) => ({ state: s.state, nominated: s.nominated, local: byId[s.localCandidateId] && [byId[s.localCandidateId].protocol, byId[s.localCandidateId].candidateType, byId[s.localCandidateId].tcpType].join(' '), remote: byId[s.remoteCandidateId] && [byId[s.remoteCandidateId].protocol, byId[s.remoteCandidateId].candidateType, byId[s.remoteCandidateId].tcpType].join(' ') })),
+        localCandidates: stats.filter((s) => s.type === 'local-candidate').map((s) => [s.protocol, s.candidateType, s.tcpType || ''].join(' ')),
+        remoteCandidates: stats.filter((s) => s.type === 'remote-candidate').map((s) => [s.protocol, s.candidateType, s.tcpType || ''].join(' ')),
+      };
+    };
+    await sleep(2500); await snap('stats_t2_5');
+    await sleep(3500); await snap('stats_t6');
+    out.localDescriptionHasCandidates = pc.localDescription.sdp.split('\n').filter((l) => l.startsWith('a=candidate')).map((l) => l.trim().split(' ').filter((x, i) => [2, 4, 7, 8, 9].includes(i) || i === 6 ? true : false).join(' '));
+  } catch (e) { out.errors.push(String(e && e.stack || e)); }
+  await post(label + '-page.json', out);
+  await fetch('/done', { method: 'POST' });
+})();
+</script>
