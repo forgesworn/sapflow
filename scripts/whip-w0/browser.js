@@ -47,7 +47,9 @@ async function launchSafari(url, { range } = {}) {
     const s = ports.net.createServer(); s.once('error', rej); s.listen(p, '127.0.0.1', () => { const q = s.address().port; s.close(() => res(q)); });
   }));
   const log = path.join(os.tmpdir(), `w0-safaridriver-${process.pid}.log`);
-  const child = spawn(SAFARIDRIVER, ['-p', String(port)], { stdio: ['ignore', fs.openSync(log, 'w'), fs.openSync(log, 'a')], detached: true });
+  // W0_SAFARI_ASUSER=1 starts the driver in the owner's GUI session (launchctl asuser), for ssh sessions that cannot reach Safari.
+  const cmd = process.env.W0_SAFARI_ASUSER ? ['/bin/launchctl', ['asuser', String(process.getuid()), SAFARIDRIVER, '-p', String(port)]] : [SAFARIDRIVER, ['-p', String(port)]];
+  const child = spawn(cmd[0], cmd[1], { stdio: ['ignore', fs.openSync(log, 'w'), fs.openSync(log, 'a')], detached: true });
   const base = `http://127.0.0.1:${port}`;
   const call = async (method, p, body) => {
     const r = await fetch(base + p, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });

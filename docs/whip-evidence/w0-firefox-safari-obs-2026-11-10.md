@@ -201,6 +201,28 @@ I cannot tell the two apart. Enabling it needs `sudo safaridriver --enable`,
 which is the owner's job and was not attempted. No session was ever created,
 so there was nothing to delete. Every Safari cell in this note is pending.
 
+### Safari: second session, after the owner enabled remote automation
+
+Two further attempts, again with no session:
+
+1. `safaridriver` started over ssh: the same 500, "The session timed out while
+   connecting to a Safari instance ... waiting for its RWIApplication to appear
+   and become ready", after 30 s. No Safari process was running.
+2. The driver started in the owner's GUI session with `launchctl asuser`
+   (`W0_SAFARI_ASUSER=1`): the driver never answered (`fetch failed`).
+   `launchctl asuser <uid> /usr/bin/true` itself fails over ssh with "Could not
+   switch to audit session ... Operation not permitted", so this route needs
+   root or a process already in the GUI session.
+
+The `AllowRemoteAutomation` key is still absent from Safari's preferences
+domain for this account, which is consistent with automation not being
+effective for the ssh login, though the owner reports enabling it. I did not
+try anything else. A session needs either a driver started from a process inside
+the owner's GUI session (for example Terminal there, running
+`node scripts/whip-w0/run.js ... --browser safari`) or a check of what
+`sudo safaridriver --enable` changed. No session was created, so none needed
+ending; no Safari process was started by me. All Safari cells stay pending.
+
 ## A0.1 Captured profile
 
 | Item | Firefox 160.0 | OBS 32.0.4 |
