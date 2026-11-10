@@ -206,6 +206,7 @@ async function opus(name, params, silent, xform = 'script') {
   const errors = [];
   if (q.get('gesture')) {
     // Safari starts a WebAudio context suspended without a user gesture: wait for a click on #go.
+    if (!document.body) await new Promise((r) => addEventListener('DOMContentLoaded', r));
     const b = document.createElement('button'); b.id = 'go'; b.textContent = 'start'; b.style.cssText = 'font-size:40px;padding:20px'; document.body.append(b);
     await new Promise((r) => { b.onclick = r; });
   }

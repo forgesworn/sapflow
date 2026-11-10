@@ -16,7 +16,7 @@ function cases(browser) {
   const c = [];
   for (const a of ['a-av', 'b-audio', 'd-av-preskip312']) c.push({ browser, player: 'hlsjs', asset: a });
   c.push({ browser, player: 'native', asset: 'c-recording' });
-  for (const a of ['a-av', 'b-audio']) c.push({ browser, player: 'native', asset: a }); // native HLS: Safari's path; informative for the others
+  for (const a of browser === 'safari' ? ['a-av', 'b-audio', 'd-av-preskip312'] : ['a-av', 'b-audio']) c.push({ browser, player: 'native', asset: a }); // native HLS: Safari's path; informative for the others
   return c;
 }
 
@@ -32,10 +32,10 @@ async function main({ opt, range, out }) {
   const summary = [];
   for (const b of browsers) {
     for (const c of cases(b)) {
-      const label = `${b}-${c.player}-${c.asset}`;
+      const label = `${b}-${c.player}-${c.asset}${opt('notap') ? '-notap' : ''}`;
       if (only && !label.includes(only)) continue;
       const load0 = os.loadavg()[0];
-      const url = `http://127.0.0.1:${srv.port}/play.html?src=${encodeURIComponent(ASSETS[c.asset])}&player=${c.player}&label=${label}&seconds=${seconds}${b === 'safari' ? '&gesture=1' : ''}`;
+      const url = `http://127.0.0.1:${srv.port}/play.html?src=${encodeURIComponent(ASSETS[c.asset])}&player=${c.player}&label=${label}&seconds=${seconds}${opt('notap') ? '&notap=1' : ''}${b === 'safari' ? '&gesture=1' : ''}`;
       let h;
       try { h = b === 'chrome' ? launchChrome(url) : b === 'firefox' ? launchFirefox(url) : await launchSafari(url, { range }); }
       catch (e) { console.log(label, 'launch failed:', e.message); summary.push({ label, launchError: e.message }); continue; }

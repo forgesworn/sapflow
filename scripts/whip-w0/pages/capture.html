@@ -15,7 +15,7 @@ async function synthetic(out) {
   dest.channelCount = 2; dest.channelCountMode = 'explicit'; dest.channelInterpretation = 'discrete';
   [440, 880].forEach((f, ch) => { const o = ac.createOscillator(); o.frequency.value = f; const gn = ac.createGain(); gn.gain.value = 0.3; o.connect(gn); gn.connect(merger, 0, ch); o.start(); });
   merger.connect(dest);
-  try { await ac.resume(); } catch {}
+  try { await Promise.race([ac.resume(), new Promise((r) => setTimeout(r, 1000))]); } catch {} // Safari leaves resume() pending without a gesture
   out.audioContextState = ac.state;
   const s = c.captureStream(30);
   dest.stream.getAudioTracks().forEach((t) => s.addTrack(t));

@@ -59,14 +59,17 @@ function summariseAudio() {
     if (q.get('gesture')) { const b = document.createElement('button'); b.id = 'go'; b.textContent = 'play'; b.style.cssText = 'font-size:40px;padding:20px'; document.body.prepend(b); await new Promise((r) => { b.onclick = r; }); }
     v.addEventListener('error', () => out.errors.push('element error: ' + JSON.stringify({ code: v.error && v.error.code, message: v.error && v.error.message })));
     ['stalled', 'waiting', 'ended'].forEach((n) => v.addEventListener(n, () => out.hlsEvents.push(['element-' + n, Math.round(performance.now()), +v.currentTime.toFixed(2)])));
-    tap(); await ac.resume().catch(() => {});
-    out.audio.contextStateAfterResume = ac.state;
+    // ?notap=1 leaves the element untouched by Web Audio (Safari's native HLS does not cope with a tap); decode evidence is then webkitAudioDecodedByteCount.
+    if (!q.get('notap')) { tap(); await Promise.race([ac.resume().catch(() => {}), sleep(1000)]); } else out.audio = { tapped: false };
+    if (ac) out.audio.contextStateAfterResume = ac.state;
     if (player === 'hlsjs') {
       if (!window.Hls || !Hls.isSupported()) { out.errors.push('hls.js not supported here'); }
       else {
         const hls = new Hls();
         hls.on(Hls.Events.ERROR, (e, d) => out.hlsEvents.push(['hls-error', Math.round(performance.now()), d.type, d.details, !!d.fatal, d.error && String(d.error.message || d.error).slice(0, 160)]));
         hls.on(Hls.Events.MANIFEST_PARSED, (e, d) => { out.manifest = { levels: d.levels.map((l) => ({ videoCodec: l.videoCodec || null, audioCodec: l.audioCodec || null, codecSet: l.codecSet || null, attrsCodecs: l.attrs && l.attrs.CODECS })) }; });
+        hls.on(Hls.Events.BUFFER_CODECS, (e, d) => { out.bufferCodecs = JSON.parse(JSON.stringify(d, (k, v) => (v && v.container) || typeof v !== 'object' ? v : v)); });
+        hls.on(Hls.Events.BUFFER_APPENDED, (e, d) => { out.appendedTypes = Object.assign(out.appendedTypes || {}, { [d.type]: ((out.appendedTypes || {})[d.type] || 0) + 1 }); });
         hls.loadSource(src); hls.attachMedia(v);
         out.supportedOpusMse = (window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="opus"')) || false;
       }
@@ -75,7 +78,8 @@ function summariseAudio() {
       v.src = src;
     }
     tapStart = performance.now(); const playAt = tapStart;
-    try { await v.play(); } catch (e) { out.errors.push('play() rejected: ' + e.name + ': ' + e.message); }
+    // Not awaited: Safari's native HLS can leave the play() promise pending while the media plays.
+    v.play().then(() => { out.playResolvedMs = Math.round(performance.now() - playAt); }, (e) => out.errors.push('play() rejected: ' + e.name + ': ' + e.message));
     let prev = -1;
     for (let i = 0; i < DURATION * 2; i++) {
       await sleep(500);
@@ -87,8 +91,10 @@ function summariseAudio() {
     out.currentTimeEnd = last.t; out.advancedSeconds = +(last.t - (out.samples.find((s) => s.t > 0) || last).t).toFixed(2);
     out.currentTimeAdvancedAtLeast10 = last.t >= 10;
     out.videoWidth = v.videoWidth; out.audioDecodedByteCountExists = typeof v.webkitAudioDecodedByteCount === 'number'; out.audioDecodedBytesEnd = v.webkitAudioDecodedByteCount;
+    out.audioTracks = v.audioTracks ? [...Array(v.audioTracks.length).keys()].map((i) => ({ kind: v.audioTracks[i].kind, enabled: v.audioTracks[i].enabled, label: v.audioTracks[i].label })) : null;
+    out.isTypeSupported = window.MediaSource ? { opusAudioMp4: MediaSource.isTypeSupported('audio/mp4; codecs="opus"'), avc1Opus: MediaSource.isTypeSupported('video/mp4; codecs="avc1.4d401f,opus"') } : 'no MediaSource'; out.hasManagedMediaSource = !!window.ManagedMediaSource; out.managedIsTypeSupported = window.ManagedMediaSource ? { opusAudioMp4: ManagedMediaSource.isTypeSupported('audio/mp4; codecs="opus"'), avc1Opus: ManagedMediaSource.isTypeSupported('video/mp4; codecs="avc1.4d401f,opus"') } : null;
     out.mediaError = v.error && { code: v.error.code, message: v.error.message };
-    summariseAudio();
+    if (ac) summariseAudio();
   } catch (e) { out.errors.push(String(e && e.stack || e)); }
   document.getElementById('log').textContent = JSON.stringify(out.audio);
   await post(label + '.json', out);

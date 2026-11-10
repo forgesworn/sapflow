@@ -53,6 +53,7 @@ function trash(p) {
       handle = browser === 'firefox' ? launchFirefox(url, { extraPrefs: JSON.parse(opt('ff-prefs', '{}')) }) : await launchSafari(url, { range });
     } catch (e) { console.log('launch failed:', e.message, e.safariAutomationDisabled ? '(remote automation not enabled)' : ''); srv.ev.launchError = e.message; srv.close(); process.exit(2); }
     child = handle.child;
+    if (handle.capabilities) srv.ev.safariCapabilities = handle.capabilities;
     if (browser === 'safari' && cmd === 'loopback') { await sleep(2500); srv.ev.safariClick = await handle.click('#go'); }
   } else {
     profile = fs.mkdtempSync(path.join(os.tmpdir(), 'w0-chrome-'));

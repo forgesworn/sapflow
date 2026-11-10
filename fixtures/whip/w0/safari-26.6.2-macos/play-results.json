@@ -1,0 +1,375 @@
+[
+ {
+  "label": "safari-hlsjs-a-av",
+  "run": "play-safari4",
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Safari/605.1.15",
+  "hlsjsVersion": "1.7.4",
+  "loadAverage1min": [
+   62.8,
+   53
+  ],
+  "currentTimeEnd": 14.02,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "hlsEvents": [
+   [
+    "element-waiting",
+    2092,
+    0
+   ]
+  ],
+  "isTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "managedIsTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "appendedTypes": {
+   "audiovideo": 11
+  },
+  "audioTracks": [
+   {
+    "kind": "main",
+    "enabled": true,
+    "label": ""
+   }
+  ],
+  "framesTotalAndDropped": [
+   424,
+   0
+  ],
+  "audio": {
+   "audible": false,
+   "firstAudibleMs": null,
+   "steadyLeftHz": null,
+   "steadyRightHz": null,
+   "maxStepFirstBlocks": null,
+   "maxStepSteady": null,
+   "clicks": null,
+   "silentBlocksAfterOnset": null,
+   "contextStateAfterResume": "running"
+  }
+ },
+ {
+  "label": "safari-hlsjs-b-audio",
+  "run": "play-safari4",
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Safari/605.1.15",
+  "hlsjsVersion": "1.7.4",
+  "loadAverage1min": [
+   53,
+   40
+  ],
+  "currentTimeEnd": 14.04,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "hlsEvents": [
+   [
+    "element-waiting",
+    2093,
+    0
+   ]
+  ],
+  "isTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "managedIsTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "appendedTypes": {
+   "audio": 11
+  },
+  "audioTracks": [
+   {
+    "kind": "main",
+    "enabled": true,
+    "label": ""
+   }
+  ],
+  "framesTotalAndDropped": [
+   0,
+   0
+  ],
+  "audio": {
+   "audible": false,
+   "firstAudibleMs": null,
+   "steadyLeftHz": null,
+   "steadyRightHz": null,
+   "maxStepFirstBlocks": null,
+   "maxStepSteady": null,
+   "clicks": null,
+   "silentBlocksAfterOnset": null,
+   "contextStateAfterResume": "running"
+  }
+ },
+ {
+  "label": "safari-hlsjs-d-av-preskip312",
+  "run": "play-safari4",
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Safari/605.1.15",
+  "hlsjsVersion": "1.7.4",
+  "loadAverage1min": [
+   40,
+   29.8
+  ],
+  "currentTimeEnd": 14.02,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "hlsEvents": [
+   [
+    "element-waiting",
+    2086,
+    0
+   ]
+  ],
+  "isTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "managedIsTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "appendedTypes": {
+   "audiovideo": 11
+  },
+  "audioTracks": [
+   {
+    "kind": "main",
+    "enabled": true,
+    "label": ""
+   }
+  ],
+  "framesTotalAndDropped": [
+   424,
+   0
+  ],
+  "audio": {
+   "audible": false,
+   "firstAudibleMs": null,
+   "steadyLeftHz": null,
+   "steadyRightHz": null,
+   "maxStepFirstBlocks": null,
+   "maxStepSteady": null,
+   "clicks": null,
+   "silentBlocksAfterOnset": null,
+   "contextStateAfterResume": "running"
+  }
+ },
+ {
+  "label": "safari-native-c-recording",
+  "run": "play-safari5",
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Safari/605.1.15",
+  "hlsjsVersion": null,
+  "loadAverage1min": [
+   29.8,
+   22.8
+  ],
+  "currentTimeEnd": 13.69,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "hlsEvents": [
+   [
+    "element-waiting",
+    2091,
+    0
+   ]
+  ],
+  "isTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "managedIsTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "appendedTypes": null,
+  "audioTracks": [
+   {
+    "kind": "main",
+    "enabled": true,
+    "label": ""
+   }
+  ],
+  "framesTotalAndDropped": [
+   420,
+   0
+  ],
+  "audio": {
+   "audible": true,
+   "firstAudibleMs": 432,
+   "steadyLeftHz": 445,
+   "steadyRightHz": 879,
+   "maxStepFirstBlocks": 0.2778,
+   "maxStepSteady": 0.0349,
+   "clicks": [
+    [
+     4,
+     432,
+     0.278
+    ]
+   ],
+   "silentBlocksAfterOnset": 0,
+   "contextStateAfterResume": "running"
+  }
+ },
+ {
+  "label": "safari-native-a-av",
+  "run": "play-safari3",
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Safari/605.1.15",
+  "hlsjsVersion": null,
+  "loadAverage1min": [
+   155.6,
+   122.7
+  ],
+  "currentTimeEnd": 0,
+  "advancedAtLeast10s": false,
+  "mediaError": {
+   "code": 3,
+   "message": "Media failed to decode"
+  },
+  "errors": [
+   "element error: {\"code\":3,\"message\":\"Media failed to decode\"}"
+  ],
+  "hlsEvents": [
+   [
+    "element-waiting",
+    2081,
+    0
+   ]
+  ],
+  "isTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "managedIsTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "appendedTypes": null,
+  "audioTracks": [],
+  "framesTotalAndDropped": [
+   0,
+   0
+  ],
+  "audio": {
+   "audible": false,
+   "firstAudibleMs": null,
+   "steadyLeftHz": null,
+   "steadyRightHz": null,
+   "maxStepFirstBlocks": null,
+   "maxStepSteady": null,
+   "clicks": null,
+   "silentBlocksAfterOnset": null,
+   "contextStateAfterResume": "running"
+  }
+ },
+ {
+  "label": "safari-native-b-audio",
+  "run": "play-safari3",
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Safari/605.1.15",
+  "hlsjsVersion": null,
+  "loadAverage1min": [
+   113.5,
+   92.9
+  ],
+  "currentTimeEnd": 0,
+  "advancedAtLeast10s": false,
+  "mediaError": {
+   "code": 3,
+   "message": "Media failed to decode"
+  },
+  "errors": [
+   "element error: {\"code\":3,\"message\":\"Media failed to decode\"}"
+  ],
+  "hlsEvents": [
+   [
+    "element-waiting",
+    2090,
+    0
+   ]
+  ],
+  "isTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "managedIsTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "appendedTypes": null,
+  "audioTracks": [],
+  "framesTotalAndDropped": [
+   0,
+   0
+  ],
+  "audio": {
+   "audible": false,
+   "firstAudibleMs": null,
+   "steadyLeftHz": null,
+   "steadyRightHz": null,
+   "maxStepFirstBlocks": null,
+   "maxStepSteady": null,
+   "clicks": null,
+   "silentBlocksAfterOnset": null,
+   "contextStateAfterResume": "running"
+  }
+ },
+ {
+  "label": "safari-native-d-av-preskip312",
+  "run": "play-safari3",
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Safari/605.1.15",
+  "hlsjsVersion": null,
+  "loadAverage1min": [
+   86,
+   71.8
+  ],
+  "currentTimeEnd": 0,
+  "advancedAtLeast10s": false,
+  "mediaError": {
+   "code": 3,
+   "message": "Media failed to decode"
+  },
+  "errors": [
+   "element error: {\"code\":3,\"message\":\"Media failed to decode\"}"
+  ],
+  "hlsEvents": [
+   [
+    "element-waiting",
+    2097,
+    0
+   ]
+  ],
+  "isTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "managedIsTypeSupported": {
+   "opusAudioMp4": false,
+   "avc1Opus": false
+  },
+  "appendedTypes": null,
+  "audioTracks": [],
+  "framesTotalAndDropped": [
+   0,
+   0
+  ],
+  "audio": {
+   "audible": false,
+   "firstAudibleMs": null,
+   "steadyLeftHz": null,
+   "steadyRightHz": null,
+   "maxStepFirstBlocks": null,
+   "maxStepSteady": null,
+   "clicks": null,
+   "silentBlocksAfterOnset": null,
+   "contextStateAfterResume": "running"
+  }
+ }
+]

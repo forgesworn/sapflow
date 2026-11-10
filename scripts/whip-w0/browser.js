@@ -1,7 +1,7 @@
 'use strict';
 // Launchers for the browsers other than Chrome. Each returns { pid, exited, stop(), ... }.
 // Stops only what it started, by PID. Never pkill.
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -47,9 +47,20 @@ async function launchSafari(url, { range } = {}) {
     const s = ports.net.createServer(); s.once('error', rej); s.listen(p, '127.0.0.1', () => { const q = s.address().port; s.close(() => res(q)); });
   }));
   const log = path.join(os.tmpdir(), `w0-safaridriver-${process.pid}.log`);
-  // W0_SAFARI_ASUSER=1 starts the driver in the owner's GUI session (launchctl asuser), for ssh sessions that cannot reach Safari.
-  const cmd = process.env.W0_SAFARI_ASUSER ? ['/bin/launchctl', ['asuser', String(process.getuid()), SAFARIDRIVER, '-p', String(port)]] : [SAFARIDRIVER, ['-p', String(port)]];
-  const child = spawn(cmd[0], cmd[1], { stdio: ['ignore', fs.openSync(log, 'w'), fs.openSync(log, 'a')], detached: true });
+  // W0_SAFARI_AGENT=1: run the driver as a LaunchAgent in the owner's GUI session (an ssh-started driver cannot reach Safari).
+  // The agent is booted out and its plist moved to the Trash by stop().
+  let child, plist = null;
+  const label = 'dev.w0.safaridriver', uid = String(process.getuid());
+  if (process.env.W0_SAFARI_AGENT) {
+    plist = path.join(os.tmpdir(), label + '.plist');
+    fs.writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array><string>${SAFARIDRIVER}</string><string>-p</string><string>${port}</string></array><key>RunAtLoad</key><true/><key>StandardOutPath</key><string>${log}</string><key>StandardErrorPath</key><string>${log}</string></dict></plist>\n`);
+    const r = spawnSync('launchctl', ['bootstrap', `gui/${uid}`, plist]);
+    if (r.status !== 0) throw new Error('launchctl bootstrap failed: ' + r.stderr);
+    child = new (require('node:events'))(); child.pid = null;
+    await sleep(2000);
+  } else {
+    child = spawn(SAFARIDRIVER, ['-p', String(port)], { stdio: ['ignore', fs.openSync(log, 'w'), fs.openSync(log, 'a')], detached: true });
+  }
   const base = `http://127.0.0.1:${port}`;
   const call = async (method, p, body) => {
     const r = await fetch(base + p, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
@@ -63,7 +74,13 @@ async function launchSafari(url, { range } = {}) {
     async stop() {
       if (session) { try { await call('DELETE', '/session/' + session); h.sessionEnded = true; } catch (e) { h.sessionEnded = 'delete failed: ' + e.message; } session = null; }
       await sleep(500);
-      await stopGroup(child.pid, 'safaridriver'); trash(log);
+      if (plist) {
+        spawnSync('launchctl', ['bootout', `gui/${uid}/${label}`]);
+        await sleep(500);
+        h.agentUnloaded = spawnSync('launchctl', ['print', `gui/${uid}/${label}`]).status !== 0;
+        trash(plist);
+      } else await stopGroup(child.pid, 'safaridriver');
+      try { trash(log); } catch {}
     },
     async script(src, args = []) { return call('POST', `/session/${session}/execute/sync`, { script: src, args }); },
     async click(selector) {
@@ -74,7 +91,7 @@ async function launchSafari(url, { range } = {}) {
     },
   };
   for (let i = 0; i < 40; i++) { try { if ((await fetch(base + '/status')).ok) break; } catch {} await sleep(250); }
-  const s = await call('POST', '/session', { capabilities: { alwaysMatch: { browserName: 'safari' } } });
+  const s = await call('POST', '/session', { capabilities: { alwaysMatch: { browserName: 'safari', ...(process.env.W0_SAFARI_NOFILTER ? { 'webkit:WebRTC': { DisableICECandidateFiltering: true } } : {}) } } });
   if (s.status !== 200 || !s.value || !s.value.sessionId) {
     const e = new Error('safari session failed: ' + JSON.stringify(s));
     e.safariAutomationDisabled = /enable|remote automation|not allowed/i.test(JSON.stringify(s));
