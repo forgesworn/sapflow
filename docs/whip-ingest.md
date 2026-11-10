@@ -39,8 +39,9 @@ amends:
   WebRTC stacks do exist. The reasons here are different:
   - **Shape.** Sapflow's protocol code has no sockets, threads or clocks of its
     own, so the same crates run in the server, in tests driven packet by
-    packet and, later, in the phone SDK. A general WebRTC stack brings its own
-    runtime model.
+    packet and, later, in the phone SDK. Our own crates keep that shape and
+    plug straight into Sapflow's existing ingest types, resource limits and
+    loss reporting.
   - **Narrow scope.** Receive-only, ICE-lite, one DTLS profile, two codecs.
     That is a small fraction of a general WebRTC stack, and everything outside
     it is refused at the door.
@@ -170,8 +171,10 @@ The expected shape, to be confirmed by those captures:
 - A peer certificate with a P-256 key, accepted only if its SHA-256 matches
   the offer's `a=fingerprint` (RFC 8122). Certificate dates and issuers are
   not checked, as in WebRTC generally.
-- Sapflow answers `a=setup:passive` (RFC 8842) and acts as the DTLS server. An
-  offer that can only be `passive` is refused.
+- Sapflow answers `a=setup:passive` (RFC 8842), as RFC 9725's example does,
+  and acts as the DTLS server. RFC 9725 has clients offer `actpass`, or
+  `active` if they implement only the DTLS client role. An offer that can only
+  be `passive` is refused.
 - One BUNDLE group (RFC 9143) with `rtcp-mux`; `a=ice-lite`, `a=recvonly`.
 
 An offer that does not fit is refused at `POST` with a plain reason (see
@@ -213,9 +216,9 @@ The answer is built as follows:
 - **Header extensions.** Only `urn:ietf:params:rtp-hdrext:sdes:mid` is
   accepted, plus the transport-wide sequence number if `transport-cc` is
   used. Video orientation (`urn:3gpp:video-orientation`) is deliberately not
-  accepted, so a phone rotates the pixels itself instead of sending rotation
-  metadata that LL-HLS players would ignore. Unknown extensions in received
-  packets are skipped.
+  accepted, because LL-HLS players would ignore rotation metadata. A phone is
+  then expected to rotate the pixels itself; A0.8 checks what each phone
+  target does. Unknown extensions in received packets are skipped.
 - **ICE and DTLS.** `a=ice-lite`, our credentials, the configured candidates,
   `a=setup:passive` and our fingerprint.
 
@@ -259,12 +262,16 @@ bodies.
 | `POST /whip/live/<eventId>` with `Content-Type: application/sdp`, `Authorization: Bearer <token>` | `201 Created`, `Content-Type: application/sdp`, the answer, and `Location: /whip/session/<id>` |
 | `DELETE /whip/session/<id>` with the same token | `200 OK`; the publisher has left, handled as an encoder leaving is today (see [Reconnects](#reconnects)) |
 | `OPTIONS` on either | CORS preflight for configured origins; `Accept-Post: application/sdp` |
-| `PATCH /whip/session/<id>` | `405 Method Not Allowed`: no trickle ICE or ICE restart in v1 |
+| `PATCH /whip/session/<id>` | `405 Method Not Allowed` with `Allow: DELETE, OPTIONS`: no trickle ICE or ICE restart in v1 |
 
 - `<id>` is 128 random bits. It is not a credential on its own: `DELETE` also
-  needs the token.
-- `Location` is a relative path, which RFC 9725 allows. A front proxy that
-  keeps the path unchanged needs no rewriting.
+  needs the token, which RFC 9725 has clients send on every request.
+- RFC 9725 makes trickle ICE and ICE restart optional, and names no status
+  for a session that supports neither. 405 is HTTP's answer for an
+  unsupported method.
+- `Location` is an absolute URL built from `SAPFLOW_WHIP_PUBLIC_URL`, the
+  public base URL the front proxy serves. RFC 9725's examples use absolute
+  URLs, and a client may not resolve a relative one.
 - CORS, for configured origins only:
   - allowed methods `POST`, `DELETE` and `OPTIONS`;
   - allowed headers `Authorization` and `Content-Type`;
@@ -278,14 +285,14 @@ bodies.
   - `400`: the SDP does not parse.
   - `401`: no token, or the app answered 401.
   - `403`: the app answered 403.
-  - `409`: the path is live with another publisher and not held for a
-    reconnect.
+  - `409`: the path is live with another publisher, is not held for a
+    reconnect, and is not a stalled WHIP session (see [Reconnects](#reconnects)).
   - `422`: a well-formed offer outside the profile, for example no H.264.
   - `429`: throttled.
   - `503`: the app did not answer usably, or a resource cap is reached.
 - A session that has not completed ICE and DTLS within 10 s of its `201` is
-  removed and its path released. No `publish` callback has been sent by then,
-  because that callback waits for the first servable segment, as today.
+  removed. It never accepted media, so its path is simply released: no
+  callback is sent and nothing is held (see [Reconnects](#reconnects)).
 
 ### Admission
 
@@ -480,16 +487,21 @@ The existing per-publisher cap (`SAPFLOW_MAX_PUBLISH_MBPS`) counts SRTP bytes.
 
 There is no ICE restart in v1.
 
-- **A session that ends** sends `unpublish` at once and holds the stream for
-  `SAPFLOW_RECONNECT_GRACE`, exactly as an SRT or RTMP encoder leaving does
-  today (`publish.rs:481-486`). A session ends through `DELETE`,
-  consent expiry or a failed handshake. A new `POST` within the grace takes
-  over the held stream.
+- **A session that never accepted media** releases its path with no callback
+  and nothing held. That covers a failed or timed-out handshake, and a
+  `DELETE` before any media.
+- **A session that has accepted media and then ends**, through `DELETE`,
+  consent expiry or being superseded, leaves by the existing path for an
+  encoder that goes (`publish.rs:481-486`). `unpublish` is sent at once and
+  the stream is held for `SAPFLOW_RECONNECT_GRACE`. A new `POST` within the
+  grace takes over the held stream.
 - **A stalled session can be superseded.** When a phone moves from Wi-Fi to
   mobile data, its old session can look alive until consent expires, up to
-  30 s. So a new admitted `POST` for a path whose publisher is a WHIP session
-  that has delivered no media for `SAPFLOW_WHIP_STALE` (proposed 2 s) ends
-  that session and takes over at once, as if it had left. If the current
+  30 s. So a new admitted `POST` for a path whose publisher is a stalled WHIP
+  session ends that session and takes over at once, as if it had left. A
+  session is stalled when `SAPFLOW_WHIP_STALE` (proposed 2 s) has passed
+  since its last accepted media packet, or since its `201` if it has
+  accepted none. If the current
   WHIP session is still delivering media, or the current publisher is SRT or
   RTMP, the new `POST` gets `409`, so two encoders never fight over one
   stream.
@@ -515,8 +527,9 @@ There is no ICE restart in v1.
   - TCP connections per address;
   - and the existing publisher and presentation caps.
 - Nothing is sent to an address before it passes a STUN check with valid
-  MESSAGE-INTEGRITY, and answers are never larger than the requests that
-  caused them. So the UDP port cannot be used to reflect traffic at a third
+  MESSAGE-INTEGRITY. STUN answers are no larger than the requests that caused
+  them. DTLS flights, which are larger, go only to addresses that have passed
+  that check. So the UDP port cannot be used to reflect traffic at a third
   party.
 
 ## Privacy and security
@@ -544,6 +557,7 @@ All names are proposed and settle in W3.
 | Variable | Meaning |
 |---|---|
 | `SAPFLOW_WHIP_ADDR` | Signalling listener. Unset means WHIP is off |
+| `SAPFLOW_WHIP_PUBLIC_URL` | Public base URL of the signalling listener, for `Location` |
 | `SAPFLOW_WHIP_UDP_ADDR` | Media UDP bind address |
 | `SAPFLOW_WHIP_TCP_ADDR` | Passive ICE-TCP listener, for a front proxy. Optional |
 | `SAPFLOW_WHIP_TCP_PROXY_PROTOCOL` | `v2` to accept PROXY protocol v2 from the trusted proxy |
@@ -610,6 +624,10 @@ instead of observed.
 - **A0.7 Opus parameters.** Record whether each browser target honours
   `stereo=1`, `maxaveragebitrate` and `usedtx=0`. Evidence: the TOC stereo
   flag and bitrate of received packets.
+- **A0.8 Rotation.** Rotate each phone target mid-stream, with video
+  orientation not negotiated. Record whether it sends rotated pixels at new
+  dimensions, or something else. Evidence: the SPS dimensions before and
+  after, and a decoded frame from each.
 
 ### W1: `sapflow-rtp`
 
@@ -649,10 +667,14 @@ instead of observed.
 - **A3.1 End to end.** Headless Chrome with fake media publishes through
   `POST` to a local sapflow. The stream plays as LL-HLS in hls.js, and the
   recording opens. Evidence: the test log and a decoded frame.
-- **A3.2 Leaving and returning.** `DELETE` sends `unpublish` at once and holds
-  the stream. A new `POST` within the grace continues the same stream, and
-  one after the grace starts a new one. Every refusal in
-  [Resources](#resources) is observed with its status and reason.
+- **A3.2 Leaving and returning.**
+  - `DELETE` after media sends `unpublish` at once and holds the stream.
+  - A new `POST` within the grace continues the same stream, and one after
+    the grace starts a new one.
+  - A `DELETE`, or a handshake timeout, before any media releases the path
+    with no callback.
+  - Every refusal in [Resources](#resources) is observed with its status and
+    reason.
 - **A3.3 Supersede.** A second `POST` while the first session is still
   delivering media gets `409`. Once the first session has delivered nothing
   for `SAPFLOW_WHIP_STALE`, a second `POST` takes over without waiting for
