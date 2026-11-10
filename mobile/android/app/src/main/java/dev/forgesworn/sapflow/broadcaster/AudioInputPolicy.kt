@@ -39,6 +39,15 @@ internal class AudioInputPolicy<Owner> private constructor(
         }
         actualId = id; return Observation.ACCEPTED
     }
+    /** Why [observe] would refuse [id]; diagnostic text only, no state change. */
+    @Synchronized fun describe(id: String?): String = when {
+        id == null -> "Android reported no routed input"
+        id !in available -> "routed input $id is not one of the listed inputs ${available.sorted()}"
+        requestedId != null && requestedId != id -> "routed input $id is not the chosen input $requestedId"
+        actualId != null && actualId != id -> "routed input moved from $actualId to $id"
+        closed -> "route check already closed"
+        else -> "routed input $id refused"
+    }
     @Synchronized fun permitsMedia(owner: Owner): Boolean = owner == this.owner && !closed && !failed && actualId != null
     @Synchronized fun observedId(owner: Owner): String? = if (owner == this.owner && !closed && !failed) actualId else null
     @Synchronized fun close(owner: Owner) { if (owner == this.owner) closed = true }

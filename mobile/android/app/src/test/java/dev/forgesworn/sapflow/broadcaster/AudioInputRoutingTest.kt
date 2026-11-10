@@ -30,6 +30,25 @@ class AudioInputRoutingTest {
         actual = "a"; assertTrue(route.verify()); route.routeChanged(); assertTrue(route.permitsPcm())
         actual = null; route.routeChanged(); assertFalse(route.permitsPcm()); assertTrue(route.hasFailed()); assertEquals(1, failures)
     }
+    @Test fun initialCheckToleratesARouteReappliedTwiceWhileStarting() {
+        // Pixel 10: the audio HAL re-applies the microphone route as camera recording starts.
+        var changes = 2; var failures = 0
+        lateinit var route: AudioInputRouting
+        route = AudioInputRouting(owner(), AudioInputPin(null), listOf(a), { "a" }, { failures++ }, {}, beforeRead = { if (changes-- > 0) route.routeChanged() })
+        assertTrue(route.verify()); assertEquals(0, failures); assertTrue(route.permitsPcm())
+    }
+    @Test fun initialCheckStillFailsWhenTheRouteNeverSettles() {
+        var failures = 0
+        lateinit var route: AudioInputRouting
+        route = AudioInputRouting(owner(), AudioInputPin(null), listOf(a), { "a" }, { failures++ }, {}, beforeRead = { route.routeChanged() })
+        assertFalse(route.verify()); assertEquals(1, failures); assertTrue(route.hasFailed()); assertFalse(route.permitsPcm())
+        assertEquals("Microphone route kept changing while capture started", route.failureDescription)
+    }
+    @Test fun refusedRouteNamesTheRoutedAndChosenInputs() {
+        val route = AudioInputRouting(owner(), AudioInputPin("a"), listOf(a,b), { "b" }, {}, {})
+        assertFalse(route.verify())
+        assertTrue(route.failureDescription, route.failureDescription.contains("routed input b is not the chosen input a"))
+    }
     @Test fun closedEpochNeverCallsFailureAndNewPrepareCanChooseAfresh() {
         var actual: String? = "a"; var failures = 0
         val old = AudioInputRouting(owner(), AudioInputPin(null), listOf(a), { actual }, { failures++ }, {})

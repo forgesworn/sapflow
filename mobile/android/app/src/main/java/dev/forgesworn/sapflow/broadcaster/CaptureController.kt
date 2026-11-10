@@ -898,8 +898,10 @@ class CaptureController internal constructor(private val context: Context,
         if (!rawRun.admit(mediaNow)) {
             drops.incrementAndGet()
             if (token == drainGeneration) {
-                markFailure(CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE, "Camera source fault; new media admission stopped")
-                if (!stoppingEpoch) fail("Camera source fault; new media admission stopped")
+                val cameraFault = "Camera source fault (${rawRun.failure ?: "not failed"}); new media admission stopped"
+                android.util.Log.w("SapflowCameraRun", cameraFault)
+                markFailure(CaptureLifecycleDiagnostics.Code.CAPTURE_FAILURE, cameraFault)
+                if (!stoppingEpoch) fail(cameraFault)
             }
             return
         }

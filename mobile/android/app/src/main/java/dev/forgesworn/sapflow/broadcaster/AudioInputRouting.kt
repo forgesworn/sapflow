@@ -11,6 +11,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
+/** Initial route checks before giving up, and the pause between them (worst case ~45 ms). */
+private const val ROUTE_SETTLE_PASSES = 4
+private const val ROUTE_SETTLE_PAUSE_MS = 15L
+
 /** Shared by codec epochs of one Preparation; only a new Prepare can repin Default. */
 internal class AudioInputPin(requestedId: String?) {
     private var id = requestedId
@@ -66,7 +70,11 @@ internal class AudioInputRouting(
     private fun perform(reservation: Verification): Boolean {
         val revision = reservation.revision
         val initial = reservation.initial
-        for (pass in 0..1) {
+        for (pass in 0 until ROUTE_SETTLE_PASSES) {
+            // Some devices (Pixel 10) re-apply the microphone route two or three
+            // times as camera recording starts. Give the route a moment to settle
+            // between initial checks; the routed input must still be accepted.
+            if (pass > 0) try { Thread.sleep(ROUTE_SETTLE_PAUSE_MS) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
             beforeRead() // Cold dependency handoff, outside the state lock.
             val id = try { read() } catch (_: Exception) { null } // Outside the scalar/media lock.
             var notifyFailure = false
@@ -76,8 +84,8 @@ internal class AudioInputRouting(
                 if (closed || fault || revision != verification) return false
                 if (initial && pendingRoute) {
                     pendingRoute = false
-                    if (pass == 0) recheck = true
-                    else { failLocked(); notifyFailure = true }
+                    if (pass < ROUTE_SETTLE_PASSES - 1) recheck = true
+                    else { failLocked("Microphone route kept changing while capture started"); notifyFailure = true }
                     false
                 } else {
                     val settlement = now()
@@ -85,7 +93,7 @@ internal class AudioInputRouting(
                     if (elapsed != null && (elapsed < 0 || elapsed >= 250_000_000L)) {
                         failLocked("Microphone route verification exceeded 250 ms"); notifyFailure = true; false
                     } else if (id == null || policy.observe(owner, id) != AudioInputPolicy.Observation.ACCEPTED || !pin.accept(id)) {
-                        failLocked(); notifyFailure = true; false
+                        failLocked("Microphone route refused: ${policy.describe(id)} (pinned ${pin.resolvedId() ?: "none"})"); notifyFailure = true; false
                     } else {
                         notifyChange = true; verified = true; armed = true; activating = false; checking = false
                         settledAt = settlement
