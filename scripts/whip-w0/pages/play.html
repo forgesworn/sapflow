@@ -1,0 +1,97 @@
+<!doctype html><meta charset="utf-8"><title>W0 play</title>
+<body style="font:16px monospace"><video id="v" playsinline width="640" height="360" controls></video><pre id="log"></pre>
+<script src="/vendor/hls.min.js"></script>
+<script>
+// A0.2: play one asset in one player for DURATION seconds and record what happened.
+// ?src=<url>&player=hlsjs|native&label=<name>[&seconds=14][&gesture=1]
+const q = new URLSearchParams(location.search);
+const src = q.get('src'), player = q.get('player') || 'native', label = q.get('label') || 'play', DURATION = +(q.get('seconds') || 14);
+const v = document.getElementById('v');
+const post = (name, body) => fetch('/result/' + name, { method: 'POST', body: JSON.stringify(body, null, 1) });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const out = { label, src, player, userAgent: navigator.userAgent, hlsjsVersion: (window.Hls && Hls.version) || null, errors: [], hlsEvents: [], samples: [], audio: {} };
+
+// The audio tap: the element feeds a Web Audio graph and we read the decoded samples.
+// Safari's native HLS may not route audio through Web Audio, so webkitAudioDecodedByteCount is read as well.
+let ac, blocks = [], tapStart = null;
+function tap() {
+  ac = new AudioContext();
+  const srcNode = ac.createMediaElementSource(v), splitter = ac.createChannelSplitter(2), sp = ac.createScriptProcessor(4096, 2, 2);
+  srcNode.connect(sp); sp.connect(ac.destination); // keep audible: the element has no other output once tapped
+  out.audio.sampleRate = ac.sampleRate; out.audio.contextState = ac.state;
+  sp.onaudioprocess = (e) => {
+    const L = e.inputBuffer.getChannelData(0), R = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : L;
+    const stat = (d) => { let s = 0, zc = 0, mx = 0, step = 0; for (let i = 0; i < d.length; i++) { s += d[i] * d[i]; if (d[i] > mx) mx = d[i]; if (i && d[i - 1] <= 0 && d[i] > 0) zc++; if (i) step = Math.max(step, Math.abs(d[i] - d[i - 1])); } return { rms: Math.sqrt(s / d.length), hz: zc * ac.sampleRate / d.length, step, peak: mx }; };
+    blocks.push({ t: +(performance.now() - (tapStart || performance.now())).toFixed(0), L: stat(L), R: stat(R), n: L.length });
+    for (let ch = 0; ch < e.outputBuffer.numberOfChannels; ch++) e.outputBuffer.getChannelData(ch).set(e.inputBuffer.getChannelData(Math.min(ch, e.inputBuffer.numberOfChannels - 1)));
+  };
+}
+
+function summariseAudio() {
+  const audible = (b) => b.L.rms > 0.02 || b.R.rms > 0.02;
+  const first = blocks.findIndex(audible);
+  const a = out.audio;
+  a.blocks = blocks.length; a.firstAudibleBlock = first;
+  if (first < 0) { a.audible = false; return; }
+  a.audible = true; a.firstAudibleMs = blocks[first].t;
+  const steady = blocks.slice(first + 3).filter(audible);
+  const med = (xs) => xs.sort((x, y) => x - y)[Math.floor(xs.length / 2)];
+  a.steadyLeftHz = steady.length ? +med(steady.map((b) => b.L.hz)).toFixed(0) : null;
+  a.steadyRightHz = steady.length ? +med(steady.map((b) => b.R.hz)).toFixed(0) : null;
+  a.steadyLeftRms = steady.length ? +med(steady.map((b) => b.L.rms)).toFixed(3) : null;
+  a.steadyRightRms = steady.length ? +med(steady.map((b) => b.R.rms)).toFixed(3) : null;
+  // Largest sample-to-sample step: a click shows as a step far above the steady maximum of the tone.
+  const stepSteady = steady.length ? Math.max(...steady.map((b) => Math.max(b.L.step, b.R.step))) : null;
+  const head = blocks.slice(Math.max(0, first - 1), first + 3);
+  a.maxStepFirstBlocks = +Math.max(...head.map((b) => Math.max(b.L.step, b.R.step))).toFixed(4);
+  a.maxStepSteady = stepSteady && +stepSteady.toFixed(4);
+  a.expectedMaxStepRightTone = +(0.3 * 2 * Math.PI * 880 / ac.sampleRate).toFixed(4);
+  a.firstBlocks = blocks.slice(0, first + 4).map((b) => [b.t, +b.L.rms.toFixed(3), +b.R.rms.toFixed(3), +Math.max(b.L.step, b.R.step).toFixed(3)]);
+  // Every block whose largest step is more than twice the tone's own maximum: a click, with the time it happened.
+  a.clicks = blocks.map((b, i) => [i, b.t, +Math.max(b.L.step, b.R.step).toFixed(3)]).filter((x) => x[2] > 0.07).slice(0, 40);
+  a.clickBlocksAfterFirstFour = a.clicks.filter((x) => x[0] > first + 3).length;
+  // Dropouts after onset: blocks that fell silent while playing.
+  a.silentBlocksAfterOnset = blocks.slice(first).filter((b) => !audible(b)).length;
+}
+
+(async () => {
+  try {
+    if (q.get('gesture')) { const b = document.createElement('button'); b.id = 'go'; b.textContent = 'play'; b.style.cssText = 'font-size:40px;padding:20px'; document.body.prepend(b); await new Promise((r) => { b.onclick = r; }); }
+    v.addEventListener('error', () => out.errors.push('element error: ' + JSON.stringify({ code: v.error && v.error.code, message: v.error && v.error.message })));
+    ['stalled', 'waiting', 'ended'].forEach((n) => v.addEventListener(n, () => out.hlsEvents.push(['element-' + n, Math.round(performance.now()), +v.currentTime.toFixed(2)])));
+    tap(); await ac.resume().catch(() => {});
+    out.audio.contextStateAfterResume = ac.state;
+    if (player === 'hlsjs') {
+      if (!window.Hls || !Hls.isSupported()) { out.errors.push('hls.js not supported here'); }
+      else {
+        const hls = new Hls();
+        hls.on(Hls.Events.ERROR, (e, d) => out.hlsEvents.push(['hls-error', Math.round(performance.now()), d.type, d.details, !!d.fatal, d.error && String(d.error.message || d.error).slice(0, 160)]));
+        hls.on(Hls.Events.MANIFEST_PARSED, (e, d) => { out.manifest = { levels: d.levels.map((l) => ({ videoCodec: l.videoCodec || null, audioCodec: l.audioCodec || null, codecSet: l.codecSet || null, attrsCodecs: l.attrs && l.attrs.CODECS })) }; });
+        hls.loadSource(src); hls.attachMedia(v);
+        out.supportedOpusMse = (window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="opus"')) || false;
+      }
+    } else {
+      out.canPlayHlsNative = v.canPlayType('application/vnd.apple.mpegurl'); out.canPlayOpusMp4 = v.canPlayType('audio/mp4; codecs="opus"'); out.canPlayVideoOpusMp4 = v.canPlayType('video/mp4; codecs="avc1.4d401f,opus"');
+      v.src = src;
+    }
+    tapStart = performance.now(); const playAt = tapStart;
+    try { await v.play(); } catch (e) { out.errors.push('play() rejected: ' + e.name + ': ' + e.message); }
+    let prev = -1;
+    for (let i = 0; i < DURATION * 2; i++) {
+      await sleep(500);
+      const vq = v.getVideoPlaybackQuality && v.getVideoPlaybackQuality();
+      out.samples.push({ ms: Math.round(performance.now() - playAt), t: +v.currentTime.toFixed(2), rs: v.readyState, paused: v.paused, buf: v.buffered.length ? +v.buffered.end(v.buffered.length - 1).toFixed(1) : 0,
+        audioBytes: v.webkitAudioDecodedByteCount, videoBytes: v.webkitVideoDecodedByteCount, frames: vq && vq.totalVideoFrames, dropped: vq && vq.droppedVideoFrames });
+    }
+    const last = out.samples[out.samples.length - 1];
+    out.currentTimeEnd = last.t; out.advancedSeconds = +(last.t - (out.samples.find((s) => s.t > 0) || last).t).toFixed(2);
+    out.currentTimeAdvancedAtLeast10 = last.t >= 10;
+    out.videoWidth = v.videoWidth; out.audioDecodedByteCountExists = typeof v.webkitAudioDecodedByteCount === 'number'; out.audioDecodedBytesEnd = v.webkitAudioDecodedByteCount;
+    out.mediaError = v.error && { code: v.error.code, message: v.error.message };
+    summariseAudio();
+  } catch (e) { out.errors.push(String(e && e.stack || e)); }
+  document.getElementById('log').textContent = JSON.stringify(out.audio);
+  await post(label + '.json', out);
+  await fetch('/done?label=' + encodeURIComponent(label), { method: 'POST' });
+})();
+</script>

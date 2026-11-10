@@ -18,9 +18,15 @@ was written from the RFCs and from observed traffic only: RFC 8489 and 5769
 | `run.js` | Runs one mode and cleans up its own child processes and temp profile |
 | `pages/capture.html` | Page that publishes fake media to the endpoint and samples `getStats` |
 | `pages/loopback.html` | A0.4 and A0.7 loopback tests (`--which ramp`, `ramp-a`, `ramp-b`, `opus`) |
+| `ports.js` | Binds inside a port range (`--range 47000-47199`), so a run stays out of other runs' ports |
+| `browser.js` | Launchers: Firefox (headless, temporary profile, `user.js`), Safari through `safaridriver`, Chrome for playback |
+| `obs-run.js` | OBS WHIP capture: backs up OBS's config, makes the `W0-WHIP-test` profile and scene collection, launches OBS, ends it by PID, restores the config and diffs it |
+| `play-run.js`, `play-server.js` | A0.2 playback matrix and its static server (Range support) |
+| `make-opus-assets.sh` | The A0.2 asset recipe: Chrome's `MediaRecorder` Opus muxed with `ffmpeg` into fMP4 HLS (audio and video, audio only) and a fragmented MP4 |
+| `pages/play.html`, `pages/record-opus.html` | The playback page (analyser, decoded-byte count, click detector) and the Opus recorder |
 
 Needs `openssl` on the path (a throwaway P-256 certificate is made per run) and
-Google Chrome. Set `CHROME` to use another binary. Run from the repository root.
+Google Chrome. Set `CHROME` or `FIREFOX` to use another binary. Run from the repository root.
 
 ```sh
 # 1. STUN vectors
@@ -38,6 +44,15 @@ node scripts/whip-w0/run.js loopback --out <dir> [--which ramp|opus]
 # 5. FFmpeg reference client (not a target)
 node scripts/whip-w0/run.js ffmpeg udp --host <lan-ip> --out <dir>
 node scripts/whip-w0/run.js ffmpeg udp --dtls-active --host <lan-ip> --out <dir>
+
+# Other targets: --browser firefox|safari on capture and loopback (Safari uses synthetic media
+# and needs `sudo safaridriver --enable` once); --range keeps every listener in one port range
+node scripts/whip-w0/run.js capture udp --browser firefox --range 47000-47199 --host <addr> --out <dir>
+node scripts/whip-w0/run.js obs udp|tcp --host <addr> --range 47000-47199 [--port N] --out <dir>
+
+# A0.2 Opus playback: build the assets, then play them (hls.js fetched into scratch, never the repo)
+scripts/whip-w0/make-opus-assets.sh ~/whip-w0-assets
+node scripts/whip-w0/run.js play --vendor <dir with hls.min.js> --out <dir> --range 47000-47199 --browsers chrome,firefox
 
 # Summaries
 node scripts/whip-w0/clienthello.js <dir>/chrome-udp-clienthello.hex
