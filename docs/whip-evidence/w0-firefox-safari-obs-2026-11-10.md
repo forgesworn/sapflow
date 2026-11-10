@@ -13,11 +13,11 @@ reasons that are host problems, not findings about the targets (see
 | Target | A0.1 offer | A0.1 ClientHello | A0.5 H.264 | A0.3 TCP | A0.4 ramp | A0.7 Opus |
 |---|---|---|---|---|---|---|
 | Firefox 160.0 | captured | not captured (ICE could not complete on this host) | offered | no connection (host-blocked) | not run (host-blocked) | not run (host-blocked) |
-| Safari 26.6.2 (macOS) | not run (automation session could not start) | not run | not run | not run | not run | not run |
+| Safari 26.6.2 (macOS) | captured (see the Safari section) | captured, UDP and over TCP | offered | ClientHello over RFC 4571 arrived | not run (host-blocked, as Firefox) | not run (host-blocked) |
 | OBS 32.0.4 | captured | captured, two runs | offered | no TCP attempt at all (two runs) | not applicable | not applicable |
 
 A0.2 (Opus playback on desktop) ran on Chrome and Firefox with hls.js and, for
-the recording, with the native element. Safari did not run. A0.6 (OBS
+the recording, with the native element, and later on Safari (Safari section). A0.6 (OBS
 keyframes) is not run here: it needs a receiver that completes DTLS, which
 does not exist until W3. It moves to W3.
 
@@ -184,7 +184,7 @@ Nothing was changed on the machine's network, and no VPN was touched. A run
 with the tunnel down, or on another host, is needed for Firefox A0.1
 ClientHello, A0.3, A0.4 and A0.7.
 
-### Safari: no automation session
+### Safari: no automation session (first attempts; superseded by the Safari section below)
 
 Two attempts with `safaridriver` (one with `--diagnose`) returned, after 30 s:
 
@@ -222,6 +222,125 @@ the owner's GUI session (for example Terminal there, running
 `node scripts/whip-w0/run.js ... --browser safari`) or a check of what
 `sudo safaridriver --enable` changed. No session was created, so none needed
 ending; no Safari process was started by me. All Safari cells stay pending.
+
+## Safari 26.6.2 (macOS), run after automation was enabled
+
+The owner changed Safari's own setting. `safaridriver` started over ssh still
+could not launch Safari, so the driver ran as a LaunchAgent (`dev.w0.safaridriver`,
+`RunAtLoad`, loaded with `launchctl bootstrap gui/<uid>`) in the owner's GUI
+session (`W0_SAFARI_AGENT=1` in `scripts/whip-w0/browser.js`). Each run created
+a session, drove one page, ended it with `DELETE /session/<id>`, ran
+`launchctl bootout`, checked the agent was gone and moved the plist to the
+Trash. Capabilities returned: `browserName` Safari, `browserVersion` 26.6.2,
+`platformName` macOS, **`webkit:WebRTC` `DisableICECandidateFiltering` false and
+`DisableInsecureMediaCapture` false** (defaults) and `webkit:alwaysAllowAutoplay`
+false. Defaults were used for every run except one: the second loopback attempt
+set `DisableICECandidateFiltering` true (stated there).
+
+Media is synthetic (an animated 1280x720 canvas `captureStream(30)` and a stereo
+WebAudio source): automation cannot answer a camera prompt. The audio context
+stayed `suspended` in the capture page, so the audio track carried silence.
+That does not change the offer's codecs, but it means Safari's real camera
+offer is not observed.
+
+### A0.1 and A0.5
+
+Fixtures: `fixtures/whip/w0/safari-26.6.2-macos/` (`offer.sdp`,
+`offer-tcp-run.sdp`, `clienthello.hex`, `clienthello-over-tcp.hex`, summaries,
+`play-results.json`). Load average at start and end: UDP run 115.7 / 107.8,
+TCP run 130.9 / 136.6 (the machine was heavily used by others).
+
+| Item | Safari 26.6.2 |
+|---|---|
+| Section order | **video is mid 0, audio is mid 1**, BUNDLE `0 1` |
+| DTLS setup, fingerprint, ICE options | `actpass` and `sha-256` at section level in each section, `ice-options:trickle` |
+| Candidates in the offer | one UDP host candidate per section (mDNS name, with `generation 0` and `network-cost 999`) |
+| Direction | `sendonly` |
+| Video payloads in offer order | H.264 `640c1f`/1 (96), `42e01f`/1 (98), `640c1f`/0, `42e01f`/0, then H.265, VP8, VP9 (profile 0 and 2), AV1; each with RTX; `red` and `ulpfec` |
+| Feedback (video) | `goog-remb`, `transport-cc`, `ccm fir`, `nack`, `nack pli` |
+| Header extensions (video) | `toffset`, `abs-send-time`, `video-orientation`, transport-wide-cc, `playout-delay`, `video-content-type`, `video-timing`, `color-space`, `sdes:mid`, `sdes:rtp-stream-id`, `sdes:repaired-rtp-stream-id` |
+| Audio | Opus 111 `minptime=10;useinbandfec=1` (no `stereo=1`), `red/48000/2`, G722, PCMU, PCMA, CN, two telephone-event; `transport-cc`; extensions `ssrc-audio-level`, `abs-send-time`, transport-wide-cc, `sdes:mid` |
+| ClientHello | 153 bytes in one datagram, DTLS 1.2 only: `client_version` 0xfefd, record version 0xfeff, no `supported_versions`, no `key_share`, no cookie |
+| Suites | 11: ECDHE-ECDSA-AES128-GCM-SHA256 first, then ECDHE-RSA-AES128-GCM, two CHACHA20, four CBC, three plain RSA |
+| Groups, signatures | x25519, secp256r1, secp384r1; `ecdsa_secp256r1_sha256` first of 9 |
+| `use_srtp` | `AES128_CM_HMAC_SHA1_80`, `AEAD_AES_256_GCM`, `AEAD_AES_128_GCM`, MKI length 0 (same list and order as Chrome) |
+| Other extensions | `renegotiation_info`, `extended_master_secret`, `ec_point_formats`; no `session_ticket`, no `encrypt_then_mac`. The order of extensions differed between the UDP and the TCP run (shuffled) |
+| STUN checks | 6 per run, all valid; `ICE-CONTROLLING`, `PRIORITY`, `USERNAME`, `MESSAGE-INTEGRITY`, `FINGERPRINT` and the unknown `0xC057`, as Chrome; `USE-CANDIDATE` on 5 of 6 |
+| WHIP HTTP | `POST`, `Content-Type: application/sdp`, browser `Origin` |
+| Result | `iceConnectionState` `connected` within 2 ms of the answer; selected pair succeeded and nominated, local udp prflx to remote udp host; DTLS stayed `connecting` and the role was `client` |
+
+A0.5: Safari offers H.264 with `packetization-mode=1` in two profiles, High
+(`640c1f`, first in offer order, so the design's rule picks payload 96) and
+Constrained Baseline (`42e01f`).
+
+### A0.3
+
+| Run | Advertised | ICE | Evidence |
+|---|---|---|---|
+| Safari, port 47110 | LAN address, one passive TCP candidate behind the relay | `connected`; selected pair succeeded, nominated, local tcp prflx to remote tcp host | 6 valid STUN checks and the 153-byte ClientHello arrived over RFC 4571 framing; 1 TCP connection to the relay (the Safari datagram count was 7 including retransmits). Load 130.9 / 136.6 |
+
+Safari does ICE-TCP, from a prflx TCP candidate, and not only UDP. The offer
+lists no TCP candidate; the TCP candidates (`tcp host`) exist in Safari's
+statistics. Port 443 on a public address is still untested.
+
+### A0.4 and A0.7: not obtained
+
+Two attempts at the in-page loopback (one ramp arm, 6 s each). Both left ICE at
+`checking`, with 111 to 112 requests sent and no response, and sent 0 bits:
+
+1. default capabilities (mDNS host candidates);
+2. `webkit:WebRTC` `DisableICECandidateFiltering` true (real addresses).
+
+This is the same host condition as Firefox: the M4's default route is a VPN
+tunnel and a connection between two sockets of the same browser cannot be
+delivered on it. Safari's capture run still connected, because the other end
+was our endpoint reached through the LAN address. A0.4 and A0.7 for Safari need
+the tunnel down or another host. An earlier version of the loopback page also
+failed for Safari because it added its start button before `<body>` existed;
+that is fixed.
+
+### A0.2: Safari playback
+
+Method as for Chrome and Firefox. Safari has no
+`webkitAudioDecodedByteCount`, so decode evidence is the Web Audio tap where it
+works. The tap worked for the native MP4. With hls.js it read silence, so for
+those rows decode is **not shown**, not shown to fail. Safari's
+`MediaSource.isTypeSupported('audio/mp4; codecs="opus"')` and the same on
+`ManagedMediaSource` both returned false, yet hls.js appended 11 Opus
+fragments without error and the video advanced.
+
+| Player | Asset | t end | 10 s or more | Media error | Audio decode evidence | Start | Load |
+|---|---|---|---|---|---|---|---|
+| Safari hls.js 1.7.4 | (a) av | 14.02 | yes | none, no hls.js error | tap silent; **not shown** | not measurable | 62.8 / 53.0 |
+| Safari hls.js 1.7.4 | (b) audio | 14.04 | yes | none | tap silent; **not shown** | not measurable | 53.0 / 40.0 |
+| Safari hls.js 1.7.4 | (d) pre-skip 312 | 14.02 | yes | none | tap silent; **not shown** | not measurable | 40.0 / 29.8 |
+| Safari native element | (c) recording | 13.69 | yes | none | tap: 445 / 879 Hz, both channels | see below | 29.8 / 22.8 |
+| Safari native HLS | (a) av | 0 | no | code 3, "Media failed to decode" | none | none | 155.6 / 122.7 |
+| Safari native HLS | (b) audio | 0 | no | code 3, "Media failed to decode" | none | none | 113.5 / 92.9 |
+| Safari native HLS | (d) pre-skip 312 | 0 | no | code 3, "Media failed to decode" | none | none | 86.0 / 71.8 |
+
+Reading:
+
+- **Safari's native HLS failed to decode all three Opus fMP4 HLS assets**
+  (3 of 3, and an earlier run of the same assets, in which the page did not
+  finish, never showed playback either). The same Opus in a plain fragmented
+  MP4 played natively. HLS native playback was the design's expected iOS and
+  Safari route. Whether the failure is Opus in HLS, something in FFmpeg's
+  playlist and init segment, or the headless automation window is not
+  separated by this run. It is a result against "every target player decodes
+  Opus in fMP4 LL-HLS", on a plain (not LL) playlist.
+- **Pre-skip 312 on Safari.** Native (d) failed for the same reason as (a) and
+  (b), so there is no Safari pre-skip comparison. With hls.js the tap is
+  silent for (a), (b) and (d), so no click check is possible there either. The
+  Safari pre-skip-312 result is therefore **inconclusive**, not clean.
+- **Start of the native MP4 (c), pre-skip 0.** In 3 of 4 runs the first audible
+  block had a step of 0.278 (the tone's own maximum is 0.035) at about 425 to
+  432 ms after play; in the first run it did not (0.035). That is a likely
+  onset click or a first block that starts mid-wave. A tap cannot tell a
+  decoder trim from a block boundary, so this is a flag, not a finding. In
+  Chrome and Firefox the same asset and the same tap never showed it.
+- Loads of 60 to 150 during the native HLS runs came from other work on the
+  M4. They do not explain a decode error.
 
 ## A0.1 Captured profile
 
@@ -437,13 +556,13 @@ Reading:
 
 | Check | Firefox | Safari macOS | OBS |
 |---|---|---|---|
-| A0.1 ClientHello | needs ICE: tunnel down or another host | needs `sudo safaridriver --enable` (owner) | done |
-| A0.1 offer | done | needs automation | done |
-| A0.3 | needs ICE | needs automation | no TCP attempt; nothing pending except a 443 run if wanted |
-| A0.4 ramp | needs ICE | needs automation | not applicable |
-| A0.5 | offer only | needs automation | done (offer) |
-| A0.7 Opus | needs ICE | needs automation | not run (no browser page); the offer states `stereo=1` and a 96 kbit/s maximum |
-| A0.2 | done (hls.js and MP4); the pre-skip click needs a second look | needs automation | not applicable |
+| A0.1 ClientHello | needs ICE: tunnel down or another host | done | done |
+| A0.1 offer | done | done | done |
+| A0.3 | needs ICE | done on a LAN port; 443 on a public address pending | no TCP attempt; nothing pending except a 443 run if wanted |
+| A0.4 ramp | needs ICE | needs ICE (tunnel down or another host) | not applicable |
+| A0.5 | offer only | done (offer) | done (offer) |
+| A0.7 Opus | needs ICE | needs ICE | not run (no browser page); the offer states `stereo=1` and a 96 kbit/s maximum |
+| A0.2 | done (hls.js and MP4); the pre-skip click needs a second look | native HLS failed to decode; hls.js decode not shown; pre-skip 312 inconclusive | not applicable |
 | A0.6 keyframes | not applicable | not applicable | moved to W3 (needs a receiver that completes DTLS) |
 
 Also not started here: A0.2 on a physical iPhone and a physical Android phone,
