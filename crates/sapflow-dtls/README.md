@@ -87,9 +87,10 @@ if let Some(Event::Connected(c)) = dtls.poll_event() {
 Fixed: at most 4 messages buffered ahead, 4 certificates in the peer's
 chain, 16 datagrams queued for sending. One input datagram produces at most
 one flight and one alert. A peer's retransmission triggers a resend only if
-it repeats the hello we answered exactly (or, after the handshake, our
-authenticated Finished was lost), at most once per datagram and half the
-initial timeout apart. One ECDSA signature, one ECDH and one verification
+it repeats the start of the hello we answered (offset 0, same length, the
+version and random equal) or, after the handshake, its authenticated
+Finished arrives again; at most once per datagram, half the initial timeout
+apart, and within `max_transmissions`. One ECDSA signature, one ECDH and one verification
 per session; a fatal alert is sent once, then nothing.
 
 The cookie exchange is off by default: the server is used only behind ICE,
@@ -102,7 +103,8 @@ a round trip. Turning it on works (A2.1 runs it against OpenSSL).
 
 - A2.1: `tests/openssl_interop.sh` runs OpenSSL 4 `s_client -dtls1_2` against
   `examples/udp_server.rs` on loopback for both SRTP profiles, with small
-  MTUs, a dropped flight and the cookie exchange, and compares the exported
+  MTUs, a dropped first or final flight and the cookie exchange, and
+  compares the exported
   keying material. `tests/fixtures/openssl-keymatexport.txt` is the
   transcript; `tests/fixtures/openssl/` holds each run's datagrams and
   OpenSSL's key log, which the unit tests replay offline byte for byte.

@@ -861,12 +861,12 @@ Implementation notes (11 November 2026):
   - HelloVerifyRequest is off by default, because ICE has already proved
     return routability.
   - Flights are re-recorded for every send.
-  - A peer's retransmission triggers a resend only when it exactly repeats
-    the hello we answered, or when an authenticated Finished arrives again
-    after the handshake.
+  - A peer's retransmission triggers a resend only when it repeats the
+    start of the hello we answered (the version and random included), or
+    when an authenticated Finished arrives again after the handshake.
 - **A2.1.** OpenSSL 4.0.3 `s_client` matched our exported keying material
-  byte for byte in seven runs. Both profiles ran, with 300-byte MTUs, a
-  dropped first flight and the cookie exchange. The datagrams and OpenSSL's
+  byte for byte in eight runs. Both profiles ran, with 300-byte MTUs, a
+  dropped first flight, a dropped final flight and the cookie exchange. The datagrams and OpenSSL's
   key log are fixtures. Unit tests replay them offline, derive the exporter
   and record keys from OpenSSL's master secret, and feed both halves of the
   material to `sapflow-rtp`.
