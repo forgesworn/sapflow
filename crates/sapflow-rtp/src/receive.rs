@@ -589,6 +589,9 @@ pub struct StreamStats {
     /// Frames held to the timeline's arrival bound or continued by arrival
     /// time (see [`crate::timeline`]), without a discontinuity.
     pub timeline_clamps: u64,
+    /// Of those, the frames held to the bound; the rest continued by
+    /// arrival time.
+    pub timeline_held: u64,
     /// Events dropped because the queue was full.
     pub events_dropped: u64,
 }
@@ -805,6 +808,7 @@ impl Receiver {
             }
             stats.timeline_discontinuities = self.events.timeline.discontinuities(stream.0);
             stats.timeline_clamps = self.events.timeline.clamps(stream.0);
+            stats.timeline_held = self.events.timeline.held(stream.0);
             stats
         })
     }
@@ -1345,6 +1349,27 @@ impl Receiver {
             });
         }
         self.events.check_hold(now);
+    }
+
+    /// Media not given out yet: packets the reorder buffers hold behind a
+    /// gap, and events still queued (all of them during the start hold). A
+    /// caller that stops polling here, because its session ended, loses
+    /// them.
+    pub fn unreleased(&self) -> usize {
+        self.streams
+            .iter()
+            .map(|s| s.buffer.held().0)
+            .sum::<usize>()
+            .saturating_add(self.events.queue.len())
+    }
+
+    /// Events dropped because the queue was full, all streams together
+    /// ([`StreamStats::events_dropped`]).
+    pub fn events_dropped(&self) -> u64 {
+        self.streams
+            .iter()
+            .map(|s| s.stats.events_dropped)
+            .fold(0, u64::saturating_add)
     }
 
     /// Packets and payload bytes a stream's reorder buffer holds.

@@ -1,0 +1,5 @@
+OPTIONS /whip/live/event-abc HTTP/1.1
+origin: https://stage.example
+access-control-request-method: POST
+access-control-request-headers: authorization, content-type
+

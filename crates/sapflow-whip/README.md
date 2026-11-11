@@ -176,7 +176,8 @@ let mut s = Session::new(SessionConfig::default(), identity.clone(), creds, nego
 s.handle_datagram(now, Tuple::udp(from), &datagram);
 while let Some(t) = s.poll_transmit() { send(t.tuple, &t.bytes) }
 while let Some(e) = s.poll_event() {
-    // Nominated, Connected(profile), Media(sapflow_rtp::Event), Ended(reason)
+    // Nominated, Connected(profile), Media(sapflow_rtp::Event), MediaDropped { count },
+    // Ended(reason)
 }
 if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
 // s.state(), s.selected(), s.send_tuple(), s.last_media() (for SAPFLOW_WHIP_STALE), s.close(now)
@@ -190,6 +191,7 @@ if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
 | `framing` | RFC 4571 `Decoder` and `encode`, 1500 bytes a frame |
 | `resource` | Bearer token split at the first colon, 128-bit session IDs, `/whip/session/<id>`, `Location` from an absolute public base URL, every refusal and its status (400, 401, 403, 409, 415, 422, 429, 503) |
 | `session` | `Session` |
+| `router` | `Router`: every session on one socket for the UDP owner. Binding requests go to the session their USERNAME names, everything else to the tuple's owner; a new check takes a tuple unless its owner has had fresh media from it within 2 s (`RouterConfig::media_hold`) or has not connected yet. Bounded by `RouterConfig::max_sessions` |
 
 ## Bounds and defaults
 

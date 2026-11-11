@@ -335,6 +335,16 @@ impl Agent {
         self.validated.iter().any(|v| v.tuple == *tuple)
     }
 
+    /// When fresh SRTP or SRTCP last arrived from a validated tuple, as the
+    /// session reported it; `None` for one that has delivered none since it
+    /// was validated, or is not validated.
+    pub fn media_from(&self, tuple: &Tuple) -> Option<Instant> {
+        self.validated
+            .iter()
+            .find(|v| v.tuple == *tuple)
+            .and_then(|v| v.media)
+    }
+
     /// Fresh SRTP or SRTCP arrived from a validated tuple: it now outranks,
     /// for eviction, every tuple whose media is older or that has none.
     pub fn note_media(&mut self, tuple: &Tuple, now: Instant) {

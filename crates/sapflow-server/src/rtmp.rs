@@ -242,7 +242,7 @@ impl Conn<'_> {
                 if let Some(p) = &mut self.publication {
                     p.push(|src, now| match src {
                         Source::Flv(f) => f.declare_tracks(tracks, now),
-                        Source::Ts(_) => Ok(Default::default()),
+                        Source::Ts(_) | Source::Es(_) => Ok(Default::default()),
                     })
                     .map_err(|e| End::Protocol(e.to_string()))?;
                 }
@@ -254,7 +254,7 @@ impl Conn<'_> {
                 };
                 p.push(|src, now| match src {
                     Source::Flv(f) => f.video(timestamp, &data, now),
-                    Source::Ts(_) => Ok(Default::default()),
+                    Source::Ts(_) | Source::Es(_) => Ok(Default::default()),
                 })
                 .map_err(|e| End::Protocol(e.to_string()))?;
                 Ok(false)
@@ -263,7 +263,7 @@ impl Conn<'_> {
                 if let Some(p) = &mut self.publication {
                     p.push(|src, now| match src {
                         Source::Flv(f) => f.audio_at(timestamp, &data, now),
-                        Source::Ts(_) => Ok(Default::default()),
+                        Source::Ts(_) | Source::Es(_) => Ok(Default::default()),
                     })
                     .map_err(|e| End::Protocol(e.to_string()))?;
                 }

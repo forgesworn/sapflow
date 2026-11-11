@@ -1,0 +1,7 @@
+POST /whip/live/event-abc HTTP/1.1
+content-type: application/sdp
+content-type: text/plain
+origin: https://stage.example
+origin: https://other.example
+transfer-encoding: chunked
+

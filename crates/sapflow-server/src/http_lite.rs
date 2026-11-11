@@ -33,6 +33,12 @@ impl Credential {
     pub fn bearer(&self) -> Option<&str> {
         self.0.strip_prefix("Bearer ")
     }
+
+    /// The whole value, for the WHIP listener's own bearer rules
+    /// (`sapflow_whip::resource::Token`). Never log it.
+    pub fn value(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for Credential {
@@ -65,6 +71,15 @@ pub struct RequestHead {
     /// `expect: 100-continue`: the client waits for an interim answer before
     /// it sends the body.
     pub expects_continue: bool,
+    /// The single `content-type` header, for the WHIP listener. `None` if
+    /// absent, repeated or not UTF-8.
+    pub content_type: Option<String>,
+    /// The single `origin` header, for CORS on the WHIP listener. `None` if
+    /// absent, repeated or not UTF-8.
+    pub origin: Option<String>,
+    /// The single `x-forwarded-for` header, believed only from the WHIP
+    /// listener's trusted proxy. `None` if absent, repeated or not UTF-8.
+    pub forwarded_for: Option<String>,
 }
 
 /// Why a head was refused.
@@ -130,6 +145,9 @@ pub fn parse_request(buf: &[u8]) -> ParsedRequest {
     let mut length = None;
     let mut ambiguous = false;
     let mut expects_continue = false;
+    let mut content_type = Single::default();
+    let mut origin = Single::default();
+    let mut forwarded_for = Single::default();
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("authorization") {
             authorizations += 1;
@@ -147,6 +165,12 @@ pub fn parse_request(buf: &[u8]) -> ParsedRequest {
             && h.value.trim_ascii().eq_ignore_ascii_case(b"100-continue")
         {
             expects_continue = true;
+        } else if h.name.eq_ignore_ascii_case("content-type") {
+            content_type.see(h.value);
+        } else if h.name.eq_ignore_ascii_case("origin") {
+            origin.see(h.value);
+        } else if h.name.eq_ignore_ascii_case("x-forwarded-for") {
+            forwarded_for.see(h.value);
         }
     }
     ParsedRequest::Complete(
@@ -164,9 +188,31 @@ pub fn parse_request(buf: &[u8]) -> ParsedRequest {
                 Framing::Length(length.unwrap_or(0))
             },
             expects_continue,
+            content_type: content_type.value(),
+            origin: origin.value(),
+            forwarded_for: forwarded_for.value(),
         },
         used,
     )
+}
+
+/// A header that must appear at most once: a repeat is ambiguous, so it
+/// gives nothing.
+#[derive(Default)]
+struct Single {
+    seen: usize,
+    value: Option<String>,
+}
+
+impl Single {
+    fn see(&mut self, value: &[u8]) {
+        self.seen += 1;
+        self.value = std::str::from_utf8(value).ok().map(|v| v.trim().to_owned());
+    }
+
+    fn value(self) -> Option<String> {
+        if self.seen == 1 { self.value } else { None }
+    }
 }
 
 /// A `content-length` value: ASCII digits only, so no sign, list or space.
@@ -183,6 +229,7 @@ fn reason(status: u16) -> &'static str {
     match status {
         100 => "Continue",
         200 => "OK",
+        201 => "Created",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -191,7 +238,9 @@ fn reason(status: u16) -> &'static str {
         408 => "Request Timeout",
         409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         414 => "URI Too Long",
+        422 => "Unprocessable Content",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
