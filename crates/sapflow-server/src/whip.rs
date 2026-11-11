@@ -42,7 +42,7 @@ use sapflow_whip::ice::{Kind, classify};
 use sapflow_whip::resource::{self, SessionId};
 use sapflow_whip::router::{InsertError, Router, RouterConfig};
 use sapflow_whip::sdp::{self, AnswerConfig, Offer};
-use sapflow_whip::{Credentials, Event, Session, SessionConfig, Tuple};
+use sapflow_whip::{Credentials, EndReason, Event, Session, SessionConfig, Tuple};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -164,6 +164,22 @@ impl Feed {
     /// should be asked for now; reading it clears it.
     pub(crate) fn take_keyframe_request(&mut self) -> bool {
         std::mem::take(&mut self.keyframe)
+    }
+
+    /// The session ended. An end that was not orderly marks the
+    /// recording: its last media may be missing with no later packet to
+    /// show a gap. Loss just before an orderly end cannot be seen.
+    pub(crate) fn ended(&mut self, reason: EndReason) {
+        let cause = match reason {
+            EndReason::ConsentExpired | EndReason::MediaTimeout => {
+                IncompleteReason::TransportTimeout
+            }
+            EndReason::Dtls(_) | EndReason::KeysExhausted => IncompleteReason::Protocol,
+            // Never connected, so nothing was recorded; or an orderly end:
+            // DELETE, our close, or the publisher's close_notify.
+            EndReason::HandshakeTimeout | EndReason::Closed | EndReason::PeerClosed => return,
+        };
+        self.loss.mark_incomplete(cause);
     }
 
     /// Passes one receiver event on. Loss is marked on the recording here.
@@ -513,7 +529,10 @@ async fn own_udp(
                 Event::Ended(reason) => {
                     // Dropping the feed ends the ingest task, which
                     // releases the publication.
-                    let lost = feeds.remove(&id).map_or(0, |f| f.lost());
+                    let lost = feeds.remove(&id).map_or(0, |mut f| {
+                        f.ended(reason);
+                        f.lost()
+                    });
                     tracing::info!(?reason, lost, "WHIP session ended");
                 }
                 Event::Nominated => {}

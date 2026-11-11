@@ -774,59 +774,30 @@ async fn a_lost_packet_is_marked_from_the_receiver_not_the_muxer() {
 
 /// Path (a): a sequence jump of more than 3000 that the next packet
 /// confirms is a restart, reported as a discontinuity and with no `Lost`;
-/// the frames until the next IDR are skipped. The recording is marked.
-#[tokio::test]
-async fn a_sequence_restart_marks_the_recording() {
+/// the frames until the next IDR are skipped.
+fn sequence_restart() -> Run {
     let mut run = Run::new(42, video_only, SessionConfig::default());
     run.video(50, |i| i % 25 == 0);
     run.p.video_seq = run.p.video_seq.wrapping_add(30_000);
     run.video(50, |i| i % 25 == 10);
-    assert!(run.has(|e| matches!(
-        e,
-        Event::Media(sapflow_rtp::Event::Discontinuity {
-            cause: Discontinuity::Sequence,
-            ..
-        })
-    )));
-    assert!(!run.lost(), "no Lost on this path");
-    let setup = Setup {
-        video: true,
-        audio: false,
-    };
-    assert_eq!(
-        recorded(run.events, setup, true).await,
-        Some(IncompleteReason::MediaLoss)
-    );
+    run
 }
 
 /// Path (b): a refused Opus payload sets the gap flag, and the next packet
 /// is filled with silence for loss, with no sequence gap and no `Lost`.
-/// The recording is marked.
-#[tokio::test]
-async fn a_refused_opus_payload_marks_the_recording() {
+fn refused_opus() -> Run {
     let mut run = Run::new(43, audio_only, SessionConfig::default());
     run.audio(100, &[]);
     let bad = run.p.audio_payload(vec![0xff]);
     run.send(&bad);
     run.wait(20);
     run.audio(20, &[]);
-    assert!(run.has(|e| matches!(e, Event::Media(sapflow_rtp::Event::Refused { .. }))));
-    assert!(run.has(|e| matches!(
-        e,
-        Event::Media(sapflow_rtp::Event::Audio { frame, .. }) if frame.kind == FrameKind::Loss
-    )));
-    assert!(!run.lost(), "no Lost on this path");
-    assert_eq!(
-        recorded(run.events, AUDIO_ONLY, true).await,
-        Some(IncompleteReason::MediaLoss)
-    );
+    run
 }
 
 /// Path (c): the session ends while packets wait behind a gap, inside the
-/// jitter wait. They never come out and no `Lost` is reported; the session
-/// says what it dropped, and the recording is marked.
-#[tokio::test]
-async fn media_held_when_the_session_ends_marks_the_recording() {
+/// jitter wait. They never come out and no `Lost` is reported.
+fn held_at_the_end() -> Run {
     let mut run = Run::new(44, audio_only, SessionConfig::default());
     run.audio(100, &[]);
     let _missing = run.p.audio(0);
@@ -836,20 +807,12 @@ async fn media_held_when_the_session_ends_marks_the_recording() {
     }
     run.s.close(run.now);
     run.drain();
-    assert!(run.has(|e| matches!(e, Event::MediaDropped { count } if *count >= 3)));
-    assert!(matches!(run.events.last(), Some(Event::Ended(_))));
-    assert!(!run.lost(), "no Lost on this path");
-    assert_eq!(
-        recorded(run.events, AUDIO_ONLY, true).await,
-        Some(IncompleteReason::MediaLoss)
-    );
+    run
 }
 
 /// Another path: events the receiver's queue had no room for are dropped
-/// and counted there. The session reports them, and the recording is
-/// marked. A small queue makes one gap's release overflow it.
-#[tokio::test]
-async fn receiver_events_dropped_for_room_mark_the_recording() {
+/// and counted there. A small queue makes one gap's release overflow it.
+fn dropped_for_room() -> Run {
     let mut config = SessionConfig::default();
     config.receiver.max_events = 4;
     let mut run = Run::new(45, audio_only, config);
@@ -860,11 +823,114 @@ async fn receiver_events_dropped_for_room_mark_the_recording() {
         run.send(&a);
     }
     run.send(&missing);
-    assert!(run.has(|e| matches!(e, Event::MediaDropped { .. })));
+    run
+}
+
+const VIDEO_ONLY: Setup = Setup {
+    video: true,
+    audio: false,
+};
+
+/// Each path marks the recording through the server, and the muxer alone,
+/// given the same access units and audio, does not.
+async fn marked_only_by_the_server(path: fn() -> Run, setup: Setup) -> Run {
+    let alone = path();
     assert_eq!(
-        recorded(run.events, AUDIO_ONLY, true).await,
+        recorded(alone.events, setup, false).await,
+        None,
+        "the muxer alone"
+    );
+    let run = path();
+    let check = path();
+    assert_eq!(
+        recorded(run.events, setup, true).await,
         Some(IncompleteReason::MediaLoss)
     );
+    check
+}
+
+#[tokio::test]
+async fn a_sequence_restart_marks_the_recording() {
+    let run = marked_only_by_the_server(sequence_restart, VIDEO_ONLY).await;
+    assert!(run.has(|e| matches!(
+        e,
+        Event::Media(sapflow_rtp::Event::Discontinuity {
+            cause: Discontinuity::Sequence,
+            ..
+        })
+    )));
+    assert!(!run.lost(), "no Lost on this path");
+}
+
+#[tokio::test]
+async fn a_refused_opus_payload_marks_the_recording() {
+    let run = marked_only_by_the_server(refused_opus, AUDIO_ONLY).await;
+    assert!(run.has(|e| matches!(e, Event::Media(sapflow_rtp::Event::Refused { .. }))));
+    assert!(run.has(|e| matches!(
+        e,
+        Event::Media(sapflow_rtp::Event::Audio { frame, .. }) if frame.kind == FrameKind::Loss
+    )));
+    assert!(!run.lost(), "no Lost on this path");
+}
+
+#[tokio::test]
+async fn media_held_when_the_session_ends_marks_the_recording() {
+    let run = marked_only_by_the_server(held_at_the_end, AUDIO_ONLY).await;
+    assert!(run.has(|e| matches!(e, Event::MediaDropped { count } if *count >= 3)));
+    assert!(matches!(run.events.last(), Some(Event::Ended(_))));
+    assert!(!run.lost(), "no Lost on this path");
+}
+
+#[tokio::test]
+async fn receiver_events_dropped_for_room_mark_the_recording() {
+    let run = marked_only_by_the_server(dropped_for_room, AUDIO_ONLY).await;
+    assert!(run.has(|e| matches!(e, Event::MediaDropped { .. })));
+}
+
+/// A run that loses nothing and ends with `close` leaves the recording
+/// complete: no `MediaDropped`, and nothing marked.
+#[tokio::test]
+async fn a_clean_close_leaves_the_recording_complete() {
+    let mut run = Run::new(46, audio_only, SessionConfig::default());
+    run.audio(150, &[]);
+    run.s.close(run.now);
+    run.drain();
+    assert!(!run.has(|e| matches!(e, Event::MediaDropped { .. })));
+    assert!(matches!(
+        run.events.last(),
+        Some(Event::Ended(sapflow_whip::EndReason::Closed))
+    ));
+    assert_eq!(recorded(run.events, AUDIO_ONLY, true).await, None);
+}
+
+/// A session that ends without an orderly close (consent or media timing
+/// out, DTLS failing, keys spent) marks its recording, since its last
+/// media may be missing with no later packet to show a gap; `DELETE`, our
+/// close and the publisher's `close_notify` do not. Loss just before an
+/// orderly end cannot be seen.
+#[tokio::test]
+async fn an_abnormal_end_marks_the_recording() {
+    use sapflow_whip::EndReason as R;
+    for (reason, mark) in [
+        (R::ConsentExpired, Some(IncompleteReason::TransportTimeout)),
+        (R::MediaTimeout, Some(IncompleteReason::TransportTimeout)),
+        (
+            R::Dtls(sapflow_dtls::Error::Timeout),
+            Some(IncompleteReason::Protocol),
+        ),
+        (R::KeysExhausted, Some(IncompleteReason::Protocol)),
+        (R::HandshakeTimeout, None),
+        (R::Closed, None),
+        (R::PeerClosed, None),
+    ] {
+        let fixture = crate::publish::loss_tests::Fixture::new();
+        let publication = fixture.begin();
+        let status = status(&publication);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut feed = Feed::new(tx, publication.loss_notice());
+        feed.ended(reason);
+        assert_eq!(status.reason(), mark, "{reason:?}");
+    }
 }
 
 /// Each `Lost` is counted and marks the recording incomplete; a dropped
