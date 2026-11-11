@@ -4,6 +4,8 @@
 //!   (`sendonly` or `sendrecv`), are enabled (a port, or `a=bundle-only`)
 //!   and are in the BUNDLE group are accepted and answered `recvonly`.
 //!   Every other section is answered with port 0 and left out of the group.
+//! - **Payload types** 64 to 95 are never chosen: under `rtcp-mux` they
+//!   would read as RTCP (RFC 5761 section 4).
 //! - **Video.** The first H.264 payload in offer order with
 //!   `packetization-mode=1` and a Constrained Baseline, Baseline, Main or
 //!   High `profile-level-id` (RFC 6184 section 8.1, Table 5), its `fmtp`
@@ -185,8 +187,15 @@ fn receivable(e: &Extmap) -> Option<&'static str> {
     }
 }
 
+/// Whether a payload type can share the port with RTCP. RFC 5761 section
+/// 4: under `rtcp-mux`, 64 to 95 would read as RTCP packet types 192 to
+/// 223, so the first-byte demultiplexer would never see them as RTP.
+fn muxable(pt: u8) -> bool {
+    !(64..=95).contains(&pt)
+}
+
 fn choose_h264(s: &Section) -> Option<(u8, H264Profile)> {
-    s.payload_types().find_map(|pt| {
+    s.payload_types().filter(|&pt| muxable(pt)).find_map(|pt| {
         let r = s.rtpmap(pt)?;
         if !r.encoding.eq_ignore_ascii_case("H264") || r.clock_rate != 90_000 {
             return None;
@@ -205,7 +214,7 @@ fn choose_h264(s: &Section) -> Option<(u8, H264Profile)> {
 }
 
 fn choose_rtx(s: &Section, apt: u8) -> Option<u8> {
-    s.payload_types().find(|&pt| {
+    s.payload_types().filter(|&pt| muxable(pt)).find(|&pt| {
         s.rtpmap(pt)
             .is_some_and(|r| r.encoding.eq_ignore_ascii_case("rtx") && r.clock_rate == 90_000)
             && s.fmtp(pt)
@@ -216,7 +225,7 @@ fn choose_rtx(s: &Section, apt: u8) -> Option<u8> {
 }
 
 fn choose_opus(s: &Section) -> Option<u8> {
-    s.payload_types().find(|&pt| {
+    s.payload_types().filter(|&pt| muxable(pt)).find(|&pt| {
         s.rtpmap(pt).is_some_and(|r| {
             r.encoding.eq_ignore_ascii_case("opus")
                 && r.clock_rate == 48_000

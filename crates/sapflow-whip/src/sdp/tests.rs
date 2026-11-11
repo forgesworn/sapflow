@@ -730,6 +730,38 @@ fn h264_choice_follows_offer_order_and_profiles() {
 }
 
 #[test]
+fn payload_types_that_read_as_rtcp_are_passed_over() {
+    // H.264 at 72 with RTX at 73 comes first, then the usual 96 and 97.
+    let b = base().replace("96 97\r\n", "72 73 96 97\r\n").replace(
+        "a=rtpmap:96 H264/90000",
+        "a=rtpmap:72 H264/90000\r\na=fmtp:72 packetization-mode=1;profile-level-id=42e01f\r\n\
+         a=rtpmap:73 rtx/90000\r\na=fmtp:73 apt=72\r\na=rtpmap:96 H264/90000",
+    );
+    let (sdp, n) = negotiate(&b).expect("valid");
+    let v = n.video.expect("video");
+    assert_eq!((v.payload_type, v.rtx_payload_type), (96, Some(97)));
+    assert!(!sdp.contains("a=rtpmap:72") && !sdp.contains("a=rtpmap:73"));
+    // Only 72 and 73: no H.264 that can be received.
+    let only = base()
+        .replace("96 97\r\n", "72 73\r\n")
+        .replace(":96 ", ":72 ")
+        .replace(":97 ", ":73 ")
+        .replace("apt=96", "apt=72");
+    assert_eq!(refused(&only), Refusal::Profile(ProfileError::NoH264));
+    // Opus at 80 alone: no Opus.
+    let opus = base()
+        .replace(" 111 0\r\n", " 80 0\r\n")
+        .replace(":111 ", ":80 ");
+    assert_eq!(refused(&opus), Refusal::Profile(ProfileError::NoOpus));
+    // The refusal is the payload type's, not the codec's: 63 is fine.
+    let ok = base()
+        .replace(" 111 0\r\n", " 63 0\r\n")
+        .replace(":111 ", ":63 ");
+    let audio = negotiate(&ok).expect("valid").1.audio.expect("audio");
+    assert_eq!(audio.payload_type, 63);
+}
+
+#[test]
 fn ssrcs_without_fid_bind_later() {
     let b = base().replace("a=ssrc-group:FID 8193 8194\r\n", "");
     let (_, n) = negotiate(&b).expect("valid");
