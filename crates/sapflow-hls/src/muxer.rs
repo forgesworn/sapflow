@@ -96,8 +96,11 @@ pub struct MuxerConfig {
     pub part_min: Duration,
     /// Segments kept in the playlist, gaps included. At least 7. More are
     /// kept when removing one would leave the playlist lasting less than
-    /// three target durations (RFC 8216bis 6.2.2), up to
+    /// three target durations (RFC 8216bis 6.2.2's segment rule), up to
     /// [`MAX_WINDOW_ENTRIES`] entries and 64 MiB of media beyond these.
+    /// 6.2.2's part rule is not met yet: a part's data goes with its
+    /// segment, so below about six target durations a part can go before
+    /// three target durations have passed since its tag left the playlist.
     pub segment_count: usize,
 }
 

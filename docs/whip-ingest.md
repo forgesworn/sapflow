@@ -769,18 +769,38 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
 - Settled after W3b: audio-only Opus carries a timeline's slew (see
   Audio-only above), and video-led Opus keeps timestamp durations (see
   Video-led audio above).
-- Settled after W3b, with the user's agreement: RFC 8216bis 6.2.2's live
-  window. A segment is no longer removed if the playlist left would last
-  less than three target durations, as printed, up to 256 entries and
+- Settled after W3b, with the user's agreement: RFC 8216bis 6.2.2's
+  segment rule. A segment is no longer removed if the playlist left would
+  last less than three target durations, as printed, up to 256 entries and
   64 MiB of media beyond `segment_count`; past either cap, removal goes on.
   Count-only eviction broke it for AAC: with `segment_count` 8 the epoch
   regression fell to 5.40 s against 6 s (now 6.27 s, nine entries at most),
   and at the default 24, a publisher reconnecting every 10 AAC frames left
   5.12 s (now 6.19 s, 29 entries at most). `RuleCheck` and
   `check-playlist.py` check it by default, and so do the `ts_ingest`,
-  `flv_ingest`, `muxer_timing` and `opus_packaging` fuzz targets. The
-  `epochs` golden digest changed with it: that scenario now keeps one more
-  1 s segment.
+  `flv_ingest`, `muxer_timing` and `opus_packaging` fuzz targets. A render
+  shows the entry cap but not the byte cap, so `Muxer::window_byte_capped()`
+  says when the byte cap cut the window short; the fuzz targets pass it to
+  `RuleCheck::check_with_byte_cap`, and `check-playlist.py` takes
+  `--byte-capped`. The `epochs` golden digest changed with it: that
+  scenario now keeps one more 1 s segment. Opus output is pinned at 4ab0c12
+  by `real_opus_output_is_byte_identical_to_4ab0c12`, which still matches.
+- Open, and older than W3b: RFC 8216bis 6.2.2's part rule. A part must stay
+  downloadable for three target durations after its `EXT-X-PART` tag leaves
+  the playlist. Tags are listed while their segment ends within three
+  target durations of the live edge (`playlist.rs`), but a part's data is
+  freed with its segment (`Muxer::rotate_segment`), so a window shorter than
+  about six target durations falls short. The live-window review measured
+  how long a part stays downloadable after its tag leaves, the same at
+  4ab0c12 and after the segment rule:
+
+  | Case | Part held after its tag leaves |
+  |---|---|
+  | Steady stream, `segment_count` 7 | 1.0 s |
+  | Default 24, reconnect every 10 frames | 0.000 s |
+  | Default 24, reconnect every 20 frames | 4.05 s |
+  | Steady stream, `segment_count` 12 | 6.02 s |
+  | Steady stream, `segment_count` 24 | 18.05 s |
 - The departures from the encapsulation listed above, and the cause of the
   312 click.
 - Safari, iOS and Android with sapflow's packaging, which need the user's

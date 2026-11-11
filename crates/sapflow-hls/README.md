@@ -21,10 +21,13 @@ live media server. MIT.
   `docs/reference.md`. Encoder reconnects and codec changes continue the
   same presentation with a discontinuity. Segments leave the playlist by
   count (`MuxerConfig::segment_count`), but not while the playlist left
-  would last less than three target durations (RFC 8216bis 6.2.2), up to
-  `muxer::MAX_WINDOW_ENTRIES` (256) entries and 64 MiB of media beyond the
-  count. Past either cap removal goes on, so a publisher making tiny
-  segments cannot grow the window without bound.
+  would last less than three target durations (RFC 8216bis 6.2.2's segment
+  rule), up to `muxer::MAX_WINDOW_ENTRIES` (256) entries and 64 MiB of
+  media beyond the count. Past either cap removal goes on, so a publisher
+  making tiny segments cannot grow the window without bound. 6.2.2's part
+  rule is not met yet: a part should stay downloadable for three target
+  durations after its tag leaves the playlist, but its data goes with its
+  segment, so a window shorter than about six target durations falls short.
 - **Ingest.** `TsIngest` takes MPEG-TS (what SRT carries), `FlvIngest`
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
   units and AAC frames or Opus packets directly.
