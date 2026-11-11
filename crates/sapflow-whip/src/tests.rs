@@ -1342,3 +1342,38 @@ fn close_after_consent_lapsed_sends_nothing() {
     assert!(s.poll_transmit().is_none(), "nothing after consent lapsed");
     assert_eq!(s.state(), State::Ended(EndReason::ConsentExpired));
 }
+
+/// `request_keyframe` sends a PLI at once, even with no keyframe interval
+/// and an IDR already received, so a consumer that dropped video can
+/// resync without waiting.
+#[test]
+fn request_keyframe_sends_a_pli_at_once() {
+    let t0 = Instant::now();
+    let mut p = Publisher::new(47, &[GCM]);
+    let config = SessionConfig {
+        keyframe_interval: None,
+        ..SessionConfig::default()
+    };
+    let mut a = accept(&p.offer(), config, t0, 47);
+    p.answered(&a);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    let (packets, _) = p.keyframe(600);
+    for d in packets {
+        s.handle_datagram(t0 + ms(10), p.tuple, &d);
+    }
+    let pli = |p: &Publisher| p.rtcp.iter().any(|c| rtcp_types(c).contains(&(206, 1)));
+    for step in 1..=20u64 {
+        s.handle_timeout(t0 + ms(100 * step));
+        p.receive(s);
+    }
+    p.rtcp.clear();
+    for step in 21..=30u64 {
+        s.handle_timeout(t0 + ms(100 * step));
+        p.receive(s);
+    }
+    assert!(!pli(&p), "none asked for without an interval");
+    s.request_keyframe(t0 + ms(3_000));
+    p.receive(s);
+    assert!(pli(&p), "a PLI at once");
+}

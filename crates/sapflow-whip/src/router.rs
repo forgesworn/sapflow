@@ -38,8 +38,10 @@
 //!   from the tuple takes it back, since that session has no fresh media
 //!   from it. If it has not connected, it keeps the tuple while it checks
 //!   or handshakes, so the publisher's media is dropped until it connects
-//!   (and the publisher's next check then takes the tuple back) or ends at
-//!   its handshake deadline, up to 10 s after it was created.
+//!   or ends at its handshake deadline, up to 10 s after it was created,
+//!   and then until the publisher's next check from the tuple takes it
+//!   back (once it has ended, the tuple has no owner and the publisher's
+//!   media from it is routed nowhere until that check).
 //! - An admitted publisher that can spoof source addresses can take a
 //!   tuple whenever its owner may lose it: before the owner's first check
 //!   from it, or after the owner has been silent from it for longer than
