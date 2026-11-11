@@ -1,9 +1,9 @@
 # WHIP ingest (design)
 
 Status: design, 10 November 2026, updated 11 November 2026. The WHIP
-libraries `sapflow-rtp` and `sapflow-dtls` are built but not yet wired into
-the server, so WHIP stays off. It does not face the internet before the
-gates in [Delivery and gates](#delivery-and-gates) pass.
+libraries `sapflow-rtp`, `sapflow-dtls` and `sapflow-whip` are built but not
+yet wired into the server, so WHIP stays off. It does not face the internet
+before the gates in [Delivery and gates](#delivery-and-gates) pass.
 
 WHIP (RFC 9725) lets a publisher send live media over WebRTC after a single
 HTTP exchange. A browser can publish with no app installed, and OBS 30 and
@@ -258,8 +258,9 @@ What `sapflow-dtls` does with the captures (W2, 11 November 2026):
 - OBS's SCSV-only hello is accepted.
 - The hellos that offer DTLS 1.3 (Chrome, Vanadium, Safari on iOS) are
   answered with 1.2.
-- Not yet covered: Firefox's ClientHello, which is still not captured, and
-  any browser's second flight, which needs a live browser (W3, A3.1).
+- Not yet covered: Firefox's ClientHello, which is still not captured.
+  A browser's second flight was first covered in W3a: Chrome 157 completed
+  the handshake with `sapflow-whip` on loopback (see W3a below).
 
 ## SDP answer and stream matching
 
@@ -880,18 +881,23 @@ Implementation notes (11 November 2026):
   datagrams and OpenSSL's key log are fixtures. Unit tests replay them offline, derive the exporter
   and record keys from OpenSSL's master secret, and feed both halves of the
   material to `sapflow-rtp`.
-  - That last step runs `sapflow-rtp` on both sides. GCM SRTP is still
-    unchecked against a real peer's SRTP packets; that check comes in W3.
+  - That last step runs `sapflow-rtp` on both sides. GCM SRTP stayed
+    unchecked against a real peer's packets until W3a, where Chrome 157's
+    SRTP and SRTCP under `SRTP_AEAD_AES_128_GCM` authenticated, live and in
+    an offline replay (see W3a below). `SRTP_AES128_CM_HMAC_SHA1_80` has
+    met a real peer only through FFmpeg in W1.
 - **A2.4.** The fuzz targets are `dtls_record`, `dtls_handshake_messages`
   and `dtls_server`. Their seeds come from the W0 captures, the OpenSSL runs
   and scripted handshakes.
   - CI's 60 s runs and a coverage report are still to come.
   - A seed replay test and a fixed-seed mutation pass run with the unit
     tests.
-- **Review.** On 11 November 2026 an independent review of this crate found
-  no defect in the protocol or crypto code, and asked for fixes. Those
-  fixes are made. A4.4 still needs SRTP in `sapflow-rtp` reviewed and every
-  finding recorded.
+- **Review.** On 11 November 2026 a review of this crate found no defect in
+  the protocol or crypto code, and asked for fixes. Those fixes are made.
+  That review was by an agent of the same session as the crate's author,
+  which A4.4 excludes, so it does not count towards A4.4. A4.4 still needs
+  an independent review of `sapflow-dtls` and of SRTP in `sapflow-rtp`,
+  with every finding recorded.
 - **For W3.**
   - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
     timer doubling to 60 s, six sends), an unanswered flight 4 runs to
@@ -950,6 +956,100 @@ Implementation notes (11 November 2026):
     it changes its sending rate on REMB or receiver reports.
   - Evidence: keyframe arrival times after requests sent at known times, and
     the rate series.
+
+Implementation notes (W3a, 11 November 2026):
+
+- **Crate.** `crates/sapflow-whip`, sans-IO, with the same lints as W1
+  and W2: STUN, the ICE-lite agent, SDP offer parsing and answer building,
+  RFC 4571 framing, the WHIP resource rules (token split, 128-bit session
+  IDs, refusal statuses, `Location`) and the session that composes ICE,
+  `sapflow-dtls`, SRTP and the `sapflow-rtp` receiver. It adds no crate the
+  workspace did not already pin: `hmac` 0.13.0 and `sha1` 0.11.0, as
+  `sapflow-rtp` uses them, for MESSAGE-INTEGRITY; CRC-32 is our own table.
+  The details and bounds are in the crate README.
+- **Decided in W3a.**
+  - Unauthenticated STUN gets no answer at all, not 400 or 401; 420 and
+    487 go only to requests that passed MESSAGE-INTEGRITY. A response that
+    would be larger than its request is not sent.
+  - The selected tuple is first set, as well as moved, only by a
+    successful check with USE-CANDIDATE. Up to four DTLS datagrams from a
+    validated tuple are held until it is nominated. Chrome 157 sent its
+    two ClientHello fragments that way in every gate 2 run.
+  - SRTP and SRTCP are taken from any validated tuple (RFC 8445 section
+    12), not only the selected one. Chrome 157 nominated a second pair in
+    every gate 2 run and kept sending on the first for a moment; when only
+    the selected tuple was taken, 10 packets were dropped and 3 Opus
+    packets lost. DTLS input and everything sapflow sends stay on the
+    selected tuple.
+  - The answer puts the configured candidates in its tagged section and
+    our credentials, fingerprint and `setup:passive` in every accepted
+    section, as W0's answer did for every target. It does not negotiate
+    `rtcp-rsize`. It answers `transport-cc` for Opus too when the offer
+    lists it there.
+  - The handshake deadline is the session's (10 s), so `sapflow-dtls`'s
+    63 s timeout never runs. A DTLS failure ends the session with
+    `EndReason::Dtls` and its reason, for W3c to count.
+- **Gate 1, in process.** For both SRTP profiles a scripted publisher (the
+  test STUN client, the `sapflow-dtls` test client, `sapflow-rtp`'s SRTP
+  protect) sends H.264 in STAP-A and FU-A and Opus. The session emits
+  exactly the access units and audio sent. The client unprotects the PLI
+  sent as SRTP comes up, receiver reports, SDES and transport-cc. Tests
+  also cover DTLS from an unvalidated tuple, unauthenticated STUN (zero
+  bytes), 487, USE-CANDIDATE moving the tuple, consent expiry, the
+  handshake deadline, a fingerprint mismatch, MID matching and RTX repair.
+- **Gate 2, a real browser.** This is not A3.1: no server, LL-HLS or
+  recording is involved.
+  - Headless Google Chrome 157 with fake media, on the M4, published
+    through `POST` to `examples/whip_harness.rs` on loopback, in three
+    runs. Every run reached every milestone:
+    - ICE nominated at about 120 ms after the `201`;
+    - DTLS connected 4 to 6 ms later, with `SRTP_AEAD_AES_128_GCM`;
+    - first SRTP packet decrypted;
+    - first H.264 keyframe and Opus at about 1.65 s, after the 1.5 s
+      start hold. That ended by arrival time, because Chrome's video
+      started late;
+    - feedback sent.
+  - Chrome's own statistics showed DTLS 1.2 as the client, our PLIs
+    answered with keyframes (one every 2 s), and its target rate rising
+    from 30 to about 450 kbit/s on our transport-cc feedback.
+  - Chrome sent RTX for packets already delivered, in one run 628 of 819
+    video packets. These look like bandwidth probes. `sapflow-rtp` counts
+    them as late.
+  - One run is kept in `crates/sapflow-whip/tests/fixtures/chrome-157/`:
+    - the offer without candidates or addresses;
+    - every DTLS datagram both ways;
+    - the leaf certificate;
+    - the first SRTP and SRTCP packets.
+
+    A unit test replays it with the same seeded session. Our flights match
+    byte for byte, the leaf matches the offer's fingerprint, and Chrome's
+    GCM SRTP and SRTCP authenticate.
+  - Firefox was not run. It is no longer installed on the M4, and W0 found
+    that its ICE could not complete on that host. So Firefox's ClientHello
+    is still not captured.
+- **Fuzzing.** `stun_message`, `sdp_offer`, `rfc4571_frames` and
+  `whip_session`. The session target scripts honest checks and DTLS
+  flights so it reaches the authenticated paths. After every step it checks
+  that nothing goes to a tuple that never authenticated, DTLS and RTCP go
+  only to the selected tuple, and output is bounded. Seeds come from the
+  RFC 5769 vectors, the W0 offers and TCP captures, the recorded Chrome
+  offer and scripted sessions; a seed replay test and a fixed-seed
+  mutation pass run with the unit tests. CI's fuzz job picks the targets up
+  from `cargo fuzz list`. A coverage report is still to come. These cover
+  A3.5's STUN and SDP parsers; the WHIP request parser's target comes with
+  W3c's listener.
+- **Left to W3c.**
+  - The signalling listener: HTTP, CORS, the 16 KiB offer cap at the
+    request, the throttle, admission and publish-auth.
+  - The UDP owner task: routing a check from a new address by
+    `stun::request_username` and the session's `local_ufrag`, then by
+    `Session::accepts`.
+  - Pending-session caps, in total and per address.
+  - Running each session call under `catch_unwind` (A3.4).
+  - Supersede from `Session::last_media`.
+  - Counting end reasons.
+  - Wiring media into `EsIngest`, and the rest of A3.
+- **Left to W3d.** PROXY protocol v2 and the TCP listener.
 
 ### W4: qualification
 
