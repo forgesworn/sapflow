@@ -24,9 +24,12 @@ live media server. MIT.
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
   units and AAC frames or Opus packets directly.
 - **Opus.** `EsIngest::opus_at` (and `opus` for video-led streams) takes
-  one Opus packet per call, as RTP carries them (RFC 7587). Each packet's
-  duration comes from its TOC byte (RFC 6716 section 3.1), and a malformed
-  packet or one over 120 ms is refused with `IngestError::InvalidAudio`.
+  one Opus packet per call, as RTP carries them (RFC 7587). Audio-only, each
+  packet lasts its TOC duration (RFC 6716 section 3.1), and a timestamp more
+  than 2 ms from the previous one plus that duration is a break, so a
+  slewing timeline is not; beside video, as with AAC, a packet lasts until
+  the next one's timestamp. A malformed packet or one over 120 ms is refused
+  with `IngestError::InvalidAudio`.
   The init segment has an `Opus` sample entry and a `dOps` box at a 48 kHz
   timescale, and `CODECS` says `Opus`, the sample entry's case-sensitive
   four-character code (RFC 6381 section 3.3). RTP carries no Opus header, so the
