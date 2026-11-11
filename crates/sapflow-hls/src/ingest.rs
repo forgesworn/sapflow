@@ -873,10 +873,13 @@ impl EsIngest {
     /// stereo flag is not a configuration change.
     ///
     /// Gaps are not filled here: a caller fills silence suppression and loss
-    /// with encoded silence first. A repeated, backward or missing timestamp
-    /// is handled as for AAC: video-led audio keeps timestamp jitter and
-    /// caps a gap at the packet's own duration, and audio-only starts a
-    /// discontinuous run reported as `media_loss`.
+    /// with encoded silence first. Video-led audio, as for AAC, lasts until
+    /// the next timestamp, jitter and slew included, with a gap of more than
+    /// three packets capped at the packet's own duration. Audio-only reports
+    /// a timestamp more than 2 ms from the previous one plus that packet's
+    /// duration (a missing, repeated or backward packet) as `media_loss`
+    /// and starts a discontinuous run; a timeline's slew, carried step by
+    /// step, is not a break.
     pub fn opus_at(
         &mut self,
         pts: i64,

@@ -365,6 +365,10 @@ struct AudioRun {
     input_origin: i64,
     samples: i64,
     next_sample: i64,
+    /// Opus only: where the next packet's timestamp should be, the last
+    /// packet's timestamp plus its TOC duration. AAC compares each frame
+    /// with the run's origin and sample count instead.
+    next_input: Option<i64>,
 }
 
 /// The segmenter for one stream: media samples in, parts and segments out, with
@@ -1323,11 +1327,15 @@ impl Muxer {
     /// a negative or unrepresentable timestamp, a packet the part target
     /// cannot hold, or one that would carry the segment past its byte limit
     /// leaves the muxer as it was, and `payload` is only called (to copy a
-    /// borrowed packet) once the packet is admitted. Then, as for AAC, a
-    /// timestamp more than 2 ms off the sample count starts a discontinuous
-    /// run, and a packet the open part has no room for closes that part
-    /// first. A fragment budget failure while sealing is the one exception:
-    /// it fences the muxer, as it does for AAC.
+    /// borrowed packet) once the packet is admitted. Then a timestamp more
+    /// than 2 ms from the previous one plus that packet's TOC duration (a
+    /// missing, repeated or backward packet) starts a discontinuous run, and
+    /// a packet the open part has no room for closes that part first.
+    /// Comparing step by step carries a timeline's slew instead of measuring
+    /// it against the whole run: decode time is the sample count either way,
+    /// so the timestamps are only there to find breaks. A fragment budget
+    /// failure while sealing is the one exception: it fences the muxer, as it
+    /// does for AAC.
     fn push_opus_audio_only(
         &mut self,
         pts: i64,
@@ -1346,10 +1354,14 @@ impl Muxer {
             i64::try_from(i128::from(n) * scale / rate).map_err(|_| MuxError::Timestamp)
         };
         // Plan.
-        let discontinuous = self.audio_run.as_ref().is_some_and(|run| {
-            let expected = i128::from(run.input_origin) + i128::from(run.samples) * scale / rate;
-            (i128::from(pts) - expected).abs() > 180
-        });
+        let discontinuous = self
+            .audio_run
+            .as_ref()
+            .and_then(|run| run.next_input)
+            .is_some_and(|expected| (i128::from(pts) - i128::from(expected)).abs() > 180);
+        let next_input = pts
+            .checked_add(ticks(samples)?)
+            .ok_or(MuxError::Timestamp)?;
         let (sample, run_samples) = match &self.audio_run {
             Some(run) if !discontinuous => (run.next_sample, run.samples),
             _ => {
@@ -1418,6 +1430,7 @@ impl Muxer {
                 input_origin: pts,
                 samples: 0,
                 next_sample: sample,
+                next_input: None,
             });
         }
         if early {
@@ -1470,6 +1483,7 @@ impl Muxer {
         if let Some(run) = self.audio_run.as_mut() {
             run.next_sample = next_sample;
             run.samples = total;
+            run.next_input = Some(next_input);
         }
         let end_segment =
             ticks_to_duration(end - seg_start, VIDEO_TIMESCALE) >= self.cfg.segment_min;
@@ -1564,6 +1578,7 @@ impl Muxer {
                 input_origin: pts,
                 samples: 0,
                 next_sample,
+                next_input: None,
             });
         }
         let run = self.audio_run.as_ref().ok_or(MuxError::Timestamp)?;

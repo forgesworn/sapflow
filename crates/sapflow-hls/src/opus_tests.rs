@@ -832,6 +832,143 @@ fn video_led_opus_keeps_timestamps_and_caps_a_gap_at_the_packets_own_duration() 
     assert_eq!(durations, [960, 1008, 912]);
 }
 
+/// Audio-only Opus with timestamps a timeline slews against the sample
+/// count: `ppm` fast (negative: slow), `samples` per packet, 120 s. Returns
+/// the times of the discontinuities, in seconds.
+fn slewed_audio_only(ppm: f64, samples: u32) -> Vec<f64> {
+    let mut m = audio_only(MuxerConfig::default(), 2);
+    let step = ticks(samples) as f64 * (1.0 + ppm * 1e-6);
+    let mut losses = Vec::new();
+    let mut i = 0i64;
+    loop {
+        let pts = (i as f64 * step) as i64;
+        if pts > 120 * 90_000 {
+            break;
+        }
+        let up = m
+            .push_audio_at(pts, Bytes::from(packet(samples, true)), NOW)
+            .expect("Opus");
+        if up.media_loss {
+            losses.push(pts as f64 / 90_000.0);
+        }
+        i += 1;
+    }
+    losses
+}
+
+/// The One timeline section slews audio at up to 500 ppm. Timestamps that
+/// drift that way against the run's sample count are not breaks.
+#[test]
+fn audio_only_opus_carries_timeline_slew_without_discontinuities() {
+    let mut broken = Vec::new();
+    for ppm in [100.0, 500.0, -100.0, -500.0] {
+        for samples in [960u32, 120, 2880, 5760] {
+            let losses = slewed_audio_only(ppm, samples);
+            println!(
+                "slew {ppm} ppm, {} ms packets: {} discontinuities in 120 s, first at {:?} s",
+                samples as f64 / 48.0,
+                losses.len(),
+                losses.first()
+            );
+            if !losses.is_empty() {
+                broken.push((ppm, samples, losses.len()));
+            }
+        }
+    }
+    assert!(broken.is_empty(), "{broken:?}");
+}
+
+/// Pushes a stream `ppm` fast, 400 packets, through `edit`,
+/// which sees each packet's index and timestamp and may move it, replace it
+/// with a malformed packet, or drop it (`None`). Returns the packets after
+/// which media loss was reported.
+fn breaks_under_slew(
+    ppm: f64,
+    samples: u32,
+    edit: impl Fn(usize, i64) -> Option<(i64, Vec<u8>)>,
+) -> Vec<usize> {
+    let mut m = audio_only(MuxerConfig::default(), 2);
+    let step = ticks(samples) as f64 * (1.0 + ppm * 1e-6);
+    let mut losses = Vec::new();
+    for i in 0..400usize {
+        let Some((pts, p)) = edit(i, (i as f64 * step) as i64) else {
+            continue;
+        };
+        match m.push_audio_at(pts, Bytes::from(p), NOW) {
+            Ok(up) if up.media_loss => losses.push(i),
+            Ok(_) => {}
+            Err(_) => assert_eq!(i, 200, "only the edited packet may be refused"),
+        }
+    }
+    losses
+}
+
+/// A real break is still reported while the timeline slews (500 ppm): a
+/// missing, repeated or non-increasing packet. The bound itself, without
+/// slew: a step more than 2 ms (180 ticks) from the previous timestamp plus
+/// that packet's duration. Tightest at 2.5 ms packets, only 225 ticks long.
+#[test]
+fn audio_only_opus_reports_real_breaks_while_slewing() {
+    for samples in [120u32, 960] {
+        let good = || packet(samples, true);
+        let d = ticks(samples);
+        let at = |pts: i64| Some((pts, good()));
+        // Unedited: no break.
+        assert_eq!(breaks_under_slew(500.0, samples, |_, pts| at(pts)), []);
+        // Packet 200 missing: packet 201 is a packet late.
+        assert_eq!(
+            breaks_under_slew(500.0, samples, |i, pts| (i != 200).then(|| (pts, good()))),
+            [201],
+            "{samples}"
+        );
+        // Packet 200 repeating 199's timestamp, or stepping back past it:
+        // a break into it and another out of it.
+        for back in [d, 2 * d, d + 1] {
+            assert_eq!(
+                breaks_under_slew(500.0, samples, |i, pts| at(if i == 200 {
+                    pts - back
+                } else {
+                    pts
+                })),
+                [200, 201],
+                "{samples} {back}"
+            );
+        }
+        // Without slew, every packet from 200 on moved by up to 180 ticks
+        // either way is carried; by 181, packet 200 is a break and the rest
+        // carry on. (Slew adds up to a tick to a step.)
+        for off in [180, -180] {
+            assert_eq!(
+                breaks_under_slew(0.0, samples, |i, pts| at(if i >= 200 {
+                    pts + off
+                } else {
+                    pts
+                })),
+                []
+            );
+        }
+        for off in [181, -181] {
+            assert_eq!(
+                breaks_under_slew(0.0, samples, |i, pts| at(if i >= 200 {
+                    pts + off
+                } else {
+                    pts
+                })),
+                [200],
+                "{samples} {off}"
+            );
+        }
+        // A refused (malformed) packet is missing media: the next is late.
+        assert_eq!(
+            breaks_under_slew(500.0, samples, |i, pts| Some((
+                pts,
+                if i == 200 { vec![0xfb, 0] } else { good() }
+            ))),
+            [201]
+        );
+    }
+}
+
 #[test]
 fn audio_only_opus_reports_a_missing_repeated_or_backward_timestamp_as_loss() {
     let mut m = audio_only(MuxerConfig::default(), 2);
