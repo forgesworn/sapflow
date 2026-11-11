@@ -1383,17 +1383,21 @@ Implementation notes (W3c part 1, 11 November 2026):
   (`SAPFLOW_MAX_PUBLISHERS`). In the server, `whip.rs` binds both sockets
   at start, serves signalling on tokio with `http_lite`, and runs one task
   for the media socket and the router. Each session's access units and
-  Opus packets go to its own ingest task over a bounded queue (1024
-  items); that task owns the `Publication` and feeds a new
+  Opus packets go to its own ingest task over a queue bounded at 1024
+  items and 16 MiB; that task owns the `Publication` and feeds a new
   elementary-stream source (`EsIngest`, stereo Opus as answered), so the
-  stream is packaged and recorded by the same code as SRT's and RTMP's.
-  Only SRTP and SRTCP that the session authenticated count against the
-  bitrate cap, so bytes spoofed from a publisher's tuple cannot push it
-  over. Health and publish callbacks go through the same `Publication`,
-  untested for WHIP. A failed receive on the media socket is logged and
-  passed over, as for SRT. A full queue marks the recording and makes video
-  wait for the next IDR. The request rules are a pure module,
-  `whip_request.rs`, which the `whip_request` fuzz target includes.
+  stream is packaged and recorded by the same code as SRT's and RTMP's. A
+  full queue marks the recording, asks the publisher for a keyframe at
+  once, and makes video wait for the next IDR. Only SRTP and SRTCP that
+  the session authenticated count against the bitrate cap, so bytes
+  spoofed from a publisher's tuple cannot push it over. Health and publish
+  callbacks go through the same `Publication`, untested for WHIP. A failed
+  receive on the media socket, and a failed accept on the signalling
+  listener (retried after 100 ms), are logged and passed over, as for SRT.
+  The trusted proxy is compared by canonical address, so a dual-stack
+  listener that sees it IPv4-mapped still believes it. The request rules
+  are a pure module, `whip_request.rs`, which the `whip_request` fuzz
+  target includes.
 - **Tuple ownership.** The rule written for W3c, "the session whose check
   from it came last", fails: a valid check for session X, copied or
   spoofed from the tuple Y's publisher is sending media on, gave X that
@@ -1405,12 +1409,25 @@ Implementation notes (W3c part 1, 11 November 2026):
   fails authentication moves nothing. Left open:
   - after a publisher is silent from its tuple for more than 2 s, one
     valid check for another session from it, copied or spoofed, takes it,
-    and the publisher's media is dropped until its own next check takes
-    it back;
-  - an admitted publisher that can spoof addresses, and whose check from
-    a victim's tuple beats the victim's first check, owns that tuple; if
-    it also sends its own SRTP from it, the victim cannot connect on it
-    until that stops for 2 s.
+    and the publisher's media is dropped. If the session that took it has
+    connected, the publisher's own next check takes it back (that session
+    has no fresh media from it). If it has not connected, it keeps the
+    tuple while it checks or handshakes, and the publisher's media is
+    dropped until it connects (the publisher's next check then takes the
+    tuple back) or ends at its handshake deadline, up to 10 s after it was
+    created;
+  - an admitted publisher that can spoof addresses can take a tuple
+    whenever its owner may lose it: before the owner's first check from
+    it, or after the owner has been silent from it for more than 2 s. If
+    it then sends its own SRTP from the tuple, it keeps it for as long as
+    it does, and the victim cannot connect on it, or its media from it is
+    dropped.
+
+  Letting the publisher's check take a tuple back from a session that has
+  not connected would close the second case of the first item, but checks
+  replayed for a session whose publisher has gone (with their IDs
+  forgotten) could then break the handshake of a new publisher given the
+  same port by a NAT, so the rule is unchanged.
 - **Admission.** A `POST` goes through `Publication::begin_authorised`
   with protocol `webrtc`: the publish-auth request, the failed-attempt
   throttle and the global publisher, as for SRT and RTMP. Only the global
@@ -1424,11 +1441,25 @@ Implementation notes (W3c part 1, 11 November 2026):
   and answers `200` once the publication has been released, so a `POST`
   that follows at once is admitted rather than refused `409`.
 - **Loss.** A recording is marked incomplete from the `sapflow-rtp`
-  receiver: its `Lost` events (sequence numbers never received within the
-  jitter wait, after NACK and RTX repair) and dropped frames. The muxer's
-  own discontinuities are not relied on, because a lost Opus packet is
-  filled with silence and the timeline can absorb its timestamp jump, so
-  audio-only Opus can look continuous to the muxer. Each session's lost
+  receiver and the session, never from the muxer's own discontinuities: a
+  lost Opus packet is filled with silence and the timeline can absorb its
+  timestamp jump, so audio-only Opus can look continuous to the muxer.
+  Every path by which media goes missing marks it:
+  - `Lost`: sequence numbers never received within the jitter wait, after
+    NACK and RTX repair;
+  - `IncompleteFrame`, and `FrameSkipped` after loss: video frames dropped;
+  - `Discontinuity` for a confirmed sequence restart (a jump of more than
+    3000, reported with no `Lost`) or an Opus timestamp jump too big to
+    fill;
+  - `Refused`, and Opus silence filled for loss (`FrameKind::Loss`), which
+    is how a refused Opus payload shows, with no sequence gap;
+  - the session's `MediaDropped`: events the receiver's queue had no room
+    for, and, when the session ends, packets still held behind a gap or in
+    the start hold (`Receiver::unreleased`);
+  - a full queue to the ingest task, by items or by bytes.
+
+  Frames skipped before the first IDR, timeline re-anchors on arrival and
+  sender-report steps lose nothing and do not mark. Each session's lost
   packets are logged when it ends.
 - **Opus timing.** Audio-only Opus discontinuities under a slewed timeline
   (Open after W3b, above) belong to `sapflow-hls`; the server does not
@@ -1446,18 +1477,25 @@ Implementation notes (W3c part 1, 11 November 2026):
 | `503` past `SAPFLOW_MAX_PUBLISHERS` sessions, its path released | `whip::tests::past_the_session_cap_a_post_gets_503` | Met |
 | CORS only for configured origins, refusals included; preflight methods, headers and `Accept-Post` | `whip::tests::cors_only_for_configured_origins`, `whip_request::tests::cors_only_for_configured_origins` | Met |
 | `X-Forwarded-For` only from the trusted proxy, its own entry | `whip_request::tests::forwarded_for_only_from_the_trusted_proxy` | Unit tests only |
-| A3.5: the WHIP request parser has a fuzz target | `whip_request`; its six seeds replayed by `whip_request::tests::seeds_hold_the_fuzz_checks`, and 12,000 fixed-seed mutations of them by `whip_request::tests::mutated_seeds_hold_the_fuzz_checks` | Partial: built, seeds and mutations pass, but not fuzzed yet: libFuzzer does not run on the test host, and CI's fuzz job, which lists targets with `cargo fuzz list`, has not run it |
+| A3.5: the WHIP request parser has a fuzz target | `whip_request`; its six seeds replayed by `whip_request::tests::seeds_hold_the_fuzz_checks`, and 12,000 fixed-seed mutations of them by `whip_request::tests::mutated_seeds_hold_the_fuzz_checks` | Met for 60 s runs: on the test host, built with `-s none` and `RUSTFLAGS="-Clink-arg=-undefined -Clink-arg=dynamic_lookup"` (`sapflow-signet-ffi`'s library otherwise fails to link the coverage hooks), it ran 8,338,071 times in 60 s in the review and 7,780,914 times in 61 s after it, with no crash. CI's fuzz job, which lists targets with `cargo fuzz list`, has not run it yet |
 | A3.6: nothing bound with `SAPFLOW_WHIP_ADDR` unset, and the media address alone refused | `scripts/whip-e2e.js` (lsof on the process), `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 | A3.6: an A3.1 run's trace log holds no token, offer address, port or mDNS name, or publisher address | `scripts/whip-e2e.js` | Met for that run (44 literals); the check first finds a planted token |
 | A check for another session from a media tuple does not cost its publisher media | `router::tests::a_check_for_another_session_cannot_take_a_media_tuple` (with and without USE-CANDIDATE) | Met |
 | The first session keeps a tuple through its handshake | `router::tests::the_first_session_keeps_a_tuple_through_its_handshake` | Met |
 | A silent tuple passes to the session that checks from it (NAT reuse) | `router::tests::a_silent_tuple_passes_to_the_session_that_checks_from_it` | Met in process |
 | A replayed or forged check moves nothing | `router::tests::a_replayed_or_forged_check_moves_nothing` | Met |
-| The two limits above | `router::tests::a_check_that_beats_the_first_one_owns_the_tuple`, `router::tests::a_publisher_back_after_a_gap_reclaims_its_tuple_at_its_next_check` | Shown |
+| The two limits above | `router::tests::a_check_that_beats_the_first_one_owns_the_tuple`, `router::tests::a_publisher_back_after_a_gap_reclaims_its_tuple_at_its_next_check`, `router::tests::an_unconnected_session_keeps_a_taken_tuple_until_its_deadline`, `router::tests::spoofed_media_keeps_a_tuple_taken_after_a_silence` | Shown |
 | Datagrams for no session draw nothing | `router::tests::unroutable_datagrams_draw_nothing` | Met in process; the packet-capture check is A3.7 |
-| A full queue marks loss and video waits for an IDR | `whip::tests::a_full_queue_skips_video_to_the_next_idr` | Met |
+| A full queue marks the recording, asks for a keyframe once, and video waits for an IDR | `whip::tests::a_full_queue_skips_video_to_the_next_idr` | Met |
+| The queue is bounded in bytes (16 MiB a session) as well as items, and past it is a full queue | `whip::tests::the_queue_is_bounded_in_bytes` | Met |
 | Only authenticated SRTP and SRTCP count against the bitrate cap | `whip::tests::only_authenticated_media_counts_against_the_cap` | Met |
-| Loss from the receiver marks the recording, even where the muxer sees none: audio-only Opus with one packet left out is marked, without loss it is not; lost packets are counted | `whip::tests::a_lost_packet_marks_the_recording_from_the_receiver`, `whip::tests::receiver_loss_is_counted_and_marks_the_recording` | Met in process. With the receiver's mark taken out, the lossy run is not marked: the muxer alone sees nothing |
+| A lost packet marks the recording from the receiver; the muxer alone does not see it; a run without loss is not marked; lost packets are counted | `whip::tests::a_lost_packet_is_marked_from_the_receiver_not_the_muxer`, `whip::tests::a_lost_packet_marks_the_recording_from_the_receiver` (over UDP), `whip::tests::receiver_loss_is_counted_and_marks_the_recording` | Met |
+| A confirmed sequence restart (no `Lost`) marks the recording | `whip::tests::a_sequence_restart_marks_the_recording` | Met |
+| A refused Opus payload (silence filled for loss, no `Lost`) marks the recording | `whip::tests::a_refused_opus_payload_marks_the_recording` | Met |
+| Packets held behind a gap when the session ends mark the recording | `whip::tests::media_held_when_the_session_ends_marks_the_recording` | Met |
+| Receiver events dropped for want of queue room mark the recording | `whip::tests::receiver_events_dropped_for_room_mark_the_recording` | Met |
+| The four paths above are each caught only by their own mark | the same four tests, run with the marks taken out: each fails | Shown when written |
+| A dual-stack listener believes `X-Forwarded-For` from an IPv4 proxy seen IPv4-mapped | `whip_request::tests::forwarded_for_only_from_the_trusted_proxy` | Unit tests only |
 | WHIP settings | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 
 - **Left to W3c part 2.**
@@ -1470,6 +1508,23 @@ Implementation notes (W3c part 1, 11 November 2026):
     refusal observed.
   - A3.7's bounds and the packet-capture tests, as invariants on the
     router and session harness.
+  - The UDP owner scans every session for due timers on each datagram
+    (`Router::poll_timeout` and `Router::handle_timeout`); a deadline
+    index would make that cost independent of the session count.
+  - Slow signalling clients: 32 of them can hold every slot for about
+    20 s each (5 s for the head, then 10 s and the drain), and a body
+    that arrives too slowly gets 503 rather than 408.
+  - The end-to-end privacy check (`scripts/whip-e2e.js`) does not look for
+    127.0.0.1 on its own, since the server's listeners log it; it checks
+    the publisher's address with its port. A run from a non-loopback
+    address would check the address alone.
+  - `rtmp.rs` and `publish_control.rs` still end on an accept error, as
+    `whip.rs` did; they need the same fix.
+  - `SAPFLOW_SEGMENT_COUNT`: once the live-window fix in `sapflow-hls`
+    lands, the playlist keeps at least three target durations and can
+    hold more than the count (up to 256 entries, or 64 MiB of media
+    beyond it); `--help` and any server doc that states the count as
+    exact should say so.
   - A muted video section draws a PLI every second: `sapflow-rtp` asks
     again every `keyframe_retry` while it waits for an IDR. That case has
     no test yet. The per-tuple bound holds whatever happens, since a send
