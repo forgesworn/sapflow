@@ -4,6 +4,7 @@ description = "RTP and RTCP packets, SRTP and SRTCP for receive-only WHIP ingest
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
