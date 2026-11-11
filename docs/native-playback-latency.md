@@ -103,9 +103,13 @@ The fixed-count resource buffer and existing PDT policy are unchanged.
 Regressions cover evicted requests, incomplete versus complete parents,
 part-index rollover, future requests, one- and three-second GOPs, exact history
 boundaries, advancing open parts and continued default-window part availability
-for three target durations after tag removal. Very short configured resource
-windows still need separate duration-based qualification; expanding playlist
-part history does not itself extend resource availability.
+for three target durations after tag removal on a steady stream. Very short
+configured resource windows still need separate duration-based qualification;
+expanding playlist part history does not itself extend resource availability.
+Frequent reconnects break the part rule even at the default window: a reconnect
+every 10 AAC frames left parts fetchable for 0 s after their tags left, with
+`segment_count` 24. That rule is open; see "Open after W3b" in
+`docs/whip-ingest.md`.
 
 Validation: `cargo test --offline -p sapflow-hls -j 2` passed all 102 tests;
 `cargo clippy --offline -p sapflow-hls --all-targets -j 2 -- -D warnings` passed.
