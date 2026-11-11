@@ -2196,6 +2196,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sapflow-whip"
+version = "0.2.0-rc.1"
+dependencies = [
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "sapflow-dtls",
+ "sapflow-rtp",
+ "sha1 0.11.0",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "sec1"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

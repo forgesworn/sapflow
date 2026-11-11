@@ -1,0 +1,35 @@
+[package]
+name = "sapflow-whip"
+description = "ICE-lite and STUN, SDP offer parsing and answer building, RFC 4571 framing, the WHIP resource rules, and a session composing ICE, DTLS, SRTP and RTP, for receive-only WHIP ingest, in pure Rust, sans-IO."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["whip", "webrtc", "ice", "stun", "sans-io"]
+categories = ["network-programming", "multimedia::video"]
+
+[lints]
+workspace = true
+
+[dependencies]
+getrandom = "=0.4.3"
+hmac = { version = "=0.13.0", features = ["zeroize"] }
+sapflow-dtls = { path = "../sapflow-dtls", version = "=0.2.0-rc.1" }
+sapflow-rtp = { path = "../sapflow-rtp", version = "=0.2.0-rc.1" }
+sha1 = { version = "=0.11.0", features = ["zeroize"] }
+subtle = "=2.6.1"
+zeroize = "=1.9.1"
+
+[dev-dependencies]
+sapflow-dtls = { path = "../sapflow-dtls", features = ["testing"] }
+sapflow-rtp = { path = "../sapflow-rtp", features = ["testing"] }
+
+[features]
+# Test helpers (a STUN client, a scripted publisher over the sapflow-dtls
+# test client and SRTP protect, seeded randomness) and the fuzz entry
+# points. Not for production use.
+testing = ["sapflow-dtls/testing", "sapflow-rtp/testing"]
