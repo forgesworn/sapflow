@@ -1,0 +1,1402 @@
+{
+  "schema": "sapflow-srt-gap-measurement-v1",
+  "date": "2026-11-11",
+  "change": "Cache the sequence number of the first occupied receive slot. Update on accepted insert; rescan only when that occupied packet is removed. Release and timer queries use the cached slot.",
+  "status": "Correctness checks passed. Library burst-gap benefit observed. Full nominal non-regression guard NOT passed: one pending/timer pair and one clean-stream pair exceeded 1.10. No retry after the longer follow-up.",
+  "commands": [
+    "cargo test --locked -p sapflow-srt -j 2",
+    "cargo clippy --locked -p sapflow-srt --all-targets -j 2 -- -D warnings",
+    "cargo build --locked --release -p sapflow-srt --example receiver-gap-bench -j 2",
+    "Build the retained example against baseline receiver.rs from fa16f09112d92cf1db3fe04a9461e0feb0238bcd, preserve its executable, restore candidate receiver.rs, then build the same example in the same target directory.",
+    "Run baseline/candidate sequentially in AB, BA, AB, BA order; each executable prints aggregate JSON for all eight profiles. No failed row was discarded or replaced."
+  ],
+  "correctness": {
+    "passed_unit_tests": 77,
+    "passed_caller_integration_tests": 29,
+    "passed_recorded_trace_differential_tests": 3,
+    "ignored_existing_manual_crypto_benchmark": 1,
+    "new_tests": [
+      "first_present_follows_earlier_retransmissions_across_sequence_wrap",
+      "first_present_survives_room_making_drop_requests_and_shutdown",
+      "first_present_matches_linear_scans_through_mixed_receiver_events",
+      "release_matches_scan_with_sparse_nonmonotonic_delivery_times"
+    ],
+    "mixed_events": 24000,
+    "notes": "Independent value-only old-scan release model compares remaining buffer, head, delivered bytes/order/lost flags and counters. Timer and cached lookup are compared with the original linear scan after each mixed event.",
+    "clippy": "passed with warnings denied",
+    "initial_development_failure": "Two malformed JSON closing braces in the new example caused its initial compile to fail; fixed before all successful checks and measured builds."
+  },
+  "layout_bytes": {
+    "baseline": 776,
+    "candidate": 784
+  },
+  "limitations": [
+    "Local ARM64 macOS shared-host library elapsed-time benchmark; no network, whole-server CPU, RSS, kernel memory, phone, energy, media encode/decode or sustained deployment claim.",
+    "Calls per timed interval are fixed within each profile and matched between arms. Warm-up is not separately measured; all process-order rows are retained.",
+    "Long-gap cached query intervals remain sub-millisecond to a few milliseconds because the same 100000 calls take much longer in the old scanner; precise cached nanosecond timings are diagnostic only.",
+    "Clean stream follow-up verifies ten million 1200-byte plaintext packets per arm. It includes payload checks, queue drains, timer calls and final shutdown. Synthetic burst gap includes forced shutdown to verify every accepted packet and loss marker.",
+    "First exploratory nominal intervals were below ten milliseconds under very high host load. The one predeclared follow-up lengthened those profiles; it did not discard the initial rows.",
+    "Nominal median ratios pass the follow-up 1.05 guard, but two profile worst-pair ratios fail the 1.10 guard. Busy-host variation remains visible; no nominal performance acceptance is claimed.",
+    "The cache adds an Option<Seq> per receiver; layout sizes below exclude heap buffers, allocator metadata and cryptographic state allocations.",
+    "No forbidden external SRT implementation source was read or copied. Existing generated trace fixtures were replayed."
+  ],
+  "exploratory": {
+    "identities": {
+      "parent": "fa16f09112d92cf1db3fe04a9461e0feb0238bcd",
+      "host": "macOS-14.6.1-arm64-arm-64bit-Mach-O",
+      "architecture": "arm64",
+      "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+      "example_sha256": "6b9e1b92f3ca2edfc5f70ec688ef28bd83c8beccb678e09b9f4a01ec1fcaa003",
+      "sources": {
+        "baseline": "af275a691464833487b87f1625f2fe6bc3c1e763d1e50eb586f3a7885076b2a1",
+        "candidate": "e9766fa5ebc22d588df17f3f951e4fdbb696ad6373437be3cda51bcc2c26b0ae"
+      },
+      "binaries": {
+        "baseline": "77a69d3f8a9cab83477ebd46e688f1ef77f52e41f8c61dc2658dbd3dab7da3ea",
+        "candidate": "692403f627e7c1366b50b96ecf8460d107fd9895905f7cd95fec5f46a90bdece"
+      }
+    },
+    "method": {
+      "pairs": 4,
+      "order": [
+        "baseline,candidate",
+        "candidate,baseline",
+        "baseline,candidate",
+        "candidate,baseline"
+      ],
+      "socket_io": false,
+      "workload": "bounded public Receiver API generated plaintext packets; successful delivery and flags checked",
+      "limits": "library elapsed time only; no RSS, CPU sampling, energy or whole-server claim"
+    },
+    "load_before": [
+      89.85302734375,
+      60.447265625,
+      48.62841796875
+    ],
+    "runs": [
+      {
+        "pair": 1,
+        "arm": "baseline",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 1177750,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 855667,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 583762791,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 924358708,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1084510333,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 3128315708,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 50000,
+            "elapsed_ns": 5934875,
+            "verified_deliveries": 50000
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 176857958,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 1,
+        "arm": "candidate",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 285333,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 637292,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 1225791,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 4309666,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1054458,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1498750,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 50000,
+            "elapsed_ns": 12758541,
+            "verified_deliveries": 50000
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 15051708,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 2,
+        "arm": "candidate",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 285125,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 860458,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 785958,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 1499750,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 703792,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1771042,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 50000,
+            "elapsed_ns": 7789334,
+            "verified_deliveries": 50000
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 18302250,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 2,
+        "arm": "baseline",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 307625,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 1599542,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 210934417,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 392076125,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 733734500,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1363232334,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 50000,
+            "elapsed_ns": 5623500,
+            "verified_deliveries": 50000
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 119010458,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 3,
+        "arm": "baseline",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 306833,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 703625,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 159424750,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 366896625,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 744584333,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1507650458,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 50000,
+            "elapsed_ns": 6848500,
+            "verified_deliveries": 50000
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 132620792,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 3,
+        "arm": "candidate",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 383209,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 965000,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 707833,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 1669708,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 715917,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1885583,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 50000,
+            "elapsed_ns": 6443750,
+            "verified_deliveries": 50000
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 10732542,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 4,
+        "arm": "candidate",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 352917,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 700333,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 843500,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 2558125,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 981750,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 2099709,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 50000,
+            "elapsed_ns": 5848375,
+            "verified_deliveries": 50000
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 10183416,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 4,
+        "arm": "baseline",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 310541,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 100000,
+            "elapsed_ns": 703542,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 158022125,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 341880500,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 618514334,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1384420042,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 50000,
+            "elapsed_ns": 6453125,
+            "verified_deliveries": 50000
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 145265375,
+            "verified_deliveries": 32768
+          }
+        ]
+      }
+    ],
+    "load_after": [
+      77.685546875,
+      59.29052734375,
+      48.427734375
+    ],
+    "summary": [
+      {
+        "profile": "timer",
+        "gap": 0,
+        "baseline_median_ns_per_operation": 3.09083,
+        "candidate_median_ns_per_operation": 3.19125,
+        "paired_median_ratio": 1.0316588161389073,
+        "paired_ratios": [
+          0.24226958182976016,
+          0.9268590004063388,
+          1.248917163408108,
+          1.136458631871476
+        ]
+      },
+      {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "baseline_median_ns_per_operation": 7.79646,
+        "candidate_median_ns_per_operation": 7.803955,
+        "paired_median_ratio": 0.8701142655585905,
+        "paired_ratios": [
+          0.7447897371290466,
+          0.5379402353923811,
+          1.3714691774737964,
+          0.9954387939881343
+        ]
+      },
+      {
+        "profile": "timer",
+        "gap": 4096,
+        "baseline_median_ns_per_operation": 1851.795835,
+        "candidate_median_ns_per_operation": 8.14729,
+        "paired_median_ratio": 0.004082998358582182,
+        "paired_ratios": [
+          0.002099810092212609,
+          0.0037260775703568567,
+          0.004439919146807507,
+          0.005337860125599501
+        ]
+      },
+      {
+        "profile": "pending-and-timer",
+        "gap": 4096,
+        "baseline_median_ns_per_operation": 3794.86375,
+        "candidate_median_ns_per_operation": 21.139165,
+        "paired_median_ratio": 0.004606612837554078,
+        "paired_ratios": [
+          0.0046623307193423445,
+          0.003825150026668928,
+          0.00455089495576581,
+          0.007482512164338125
+        ]
+      },
+      {
+        "profile": "timer",
+        "gap": 16384,
+        "baseline_median_ns_per_operation": 7391.594165,
+        "candidate_median_ns_per_operation": 8.488335,
+        "paired_median_ratio": 0.0009668941841506391,
+        "paired_ratios": [
+          0.0009722894913164465,
+          0.0009591916422084554,
+          0.0009614988769848317,
+          0.0015872712175495033
+        ]
+      },
+      {
+        "profile": "pending-and-timer",
+        "gap": 16384,
+        "baseline_median_ns_per_operation": 14460.3525,
+        "candidate_median_ns_per_operation": 18.283125,
+        "paired_median_ratio": 0.001274912778715998,
+        "paired_ratios": [
+          0.0004790916710123811,
+          0.001299149056128535,
+          0.0012506765013034606,
+          0.0015166704730499706
+        ]
+      },
+      {
+        "profile": "clean-stream",
+        "gap": 0,
+        "baseline_median_ns_per_operation": 123.88,
+        "candidate_median_ns_per_operation": 142.33084,
+        "paired_median_ratio": 1.1630196632773355,
+        "paired_ratios": [
+          2.149757324290739,
+          1.3851398595180937,
+          0.9408994670365773,
+          0.9062857142857143
+        ]
+      },
+      {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "baseline_median_ns_per_operation": 4240.206405639648,
+        "candidate_median_ns_per_operation": 393.4364318847656,
+        "paired_median_ratio": 0.08301636853952449,
+        "paired_ratios": [
+          0.08510619578679066,
+          0.15378690501300316,
+          0.0809265412922583,
+          0.07010215614009876
+        ]
+      }
+    ]
+  },
+  "longer_followup": {
+    "identities": {
+      "parent": "fa16f09112d92cf1db3fe04a9461e0feb0238bcd",
+      "host": "macOS-14.6.1-arm64-arm-64bit-Mach-O",
+      "architecture": "arm64",
+      "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+      "example_sha256": "94eb41407eec6253b5b86110ecfa025e05ac30649a565f10f9c871b166e00166",
+      "sources": {
+        "baseline": "af275a691464833487b87f1625f2fe6bc3c1e763d1e50eb586f3a7885076b2a1",
+        "candidate": "e9766fa5ebc22d588df17f3f951e4fdbb696ad6373437be3cda51bcc2c26b0ae"
+      },
+      "binaries": {
+        "baseline": "a571b21ecb015658da335fa68e85bd215b1985628714538523053c2124e9713d",
+        "candidate": "e6e90928731356d4ebeca183eab5db327ef8507c7fe73150b999aa5d23d55c45"
+      },
+      "build_inputs": {
+        "Cargo.toml": "6cc5ff24f00204f9232f9ca28978f91d2df8d5c459acde291aeda2f292bb30ff",
+        "Cargo.lock": "bac3300c326970e868cfa1aeb0bd5180336a1d0608df0f670d72bc675478e03b",
+        "crates/sapflow-srt/Cargo.toml": "a50a00ebe619af2f3934c61878f80b589a9f3626c68aa3f1c80b5e76a32451ee"
+      }
+    },
+    "method": {
+      "pairs": 4,
+      "order": [
+        "baseline,candidate",
+        "candidate,baseline",
+        "baseline,candidate",
+        "candidate,baseline"
+      ],
+      "socket_io": false,
+      "workload": "bounded public Receiver API generated plaintext packets; successful delivery and flags checked",
+      "limits": "library elapsed time only; no RSS, CPU sampling, energy or whole-server claim",
+      "nominal_guard": {
+        "paired_median_ratio_at_most": 1.05,
+        "every_pair_ratio_at_most": 1.1,
+        "minimum_interval_seconds": 0.5
+      },
+      "followup_reason": "initial clean intervals were sub-10ms and noisy; retain all initial rows and perform one longer fixed-work follow-up"
+    },
+    "load_before": [
+      15.80908203125,
+      40.6962890625,
+      47.3896484375
+    ],
+    "runs": [
+      {
+        "pair": 1,
+        "arm": "baseline",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 979066708,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 2353286917,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 141416250,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 299978208,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 567575875,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1228688042,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 10000000,
+            "elapsed_ns": 1158601125,
+            "verified_deliveries": 10000000,
+            "receiver_bytes": 776
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 112238042,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 1,
+        "arm": "candidate",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 923298166,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 2057711125,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 752875,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 1536000,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 755042,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1592625,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 10000000,
+            "elapsed_ns": 1203947833,
+            "verified_deliveries": 10000000,
+            "receiver_bytes": 784
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 10159750,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 2,
+        "arm": "candidate",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 989853417,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 1981409250,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 685792,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 1509333,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 686708,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1424125,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 10000000,
+            "elapsed_ns": 1130491875,
+            "verified_deliveries": 10000000,
+            "receiver_bytes": 784
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 9457375,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 2,
+        "arm": "baseline",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 959892250,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 2291323292,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 145814042,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 304857541,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 572258250,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1192679667,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 10000000,
+            "elapsed_ns": 1177263000,
+            "verified_deliveries": 10000000,
+            "receiver_bytes": 776
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 112323625,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 3,
+        "arm": "baseline",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 934724625,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 2179487417,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 142356041,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 300879917,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 612008833,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1258425500,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 10000000,
+            "elapsed_ns": 1157704459,
+            "verified_deliveries": 10000000,
+            "receiver_bytes": 776
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 111246250,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 3,
+        "arm": "candidate",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 955437209,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 2527905209,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 1063542,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 1476458,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 786208,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1720166,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 10000000,
+            "elapsed_ns": 1290937541,
+            "verified_deliveries": 10000000,
+            "receiver_bytes": 784
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 8850541,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 4,
+        "arm": "candidate",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 934229458,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 2214882750,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 737834,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 1469875,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 709875,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1485083,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 10000000,
+            "elapsed_ns": 1107999083,
+            "verified_deliveries": 10000000,
+            "receiver_bytes": 784
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 9204916,
+            "verified_deliveries": 32768
+          }
+        ]
+      },
+      {
+        "pair": 4,
+        "arm": "baseline",
+        "exit": 0,
+        "results": [
+          {
+            "profile": "timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 975569000,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 0,
+            "operations": 300000000,
+            "elapsed_ns": 2300157167,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 144056625,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 4096,
+            "operations": 100000,
+            "elapsed_ns": 298052791,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 557396833,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "pending-and-timer",
+            "gap": 16384,
+            "operations": 100000,
+            "elapsed_ns": 1208476834,
+            "verified_deliveries": 1
+          },
+          {
+            "profile": "clean-stream",
+            "payload_bytes": 1200,
+            "operations": 10000000,
+            "elapsed_ns": 1343942709,
+            "verified_deliveries": 10000000,
+            "receiver_bytes": 776
+          },
+          {
+            "profile": "bursty-stream",
+            "gap": 4096,
+            "payload_bytes": 1200,
+            "operations": 32768,
+            "elapsed_ns": 114584292,
+            "verified_deliveries": 32768
+          }
+        ]
+      }
+    ],
+    "load_after": [
+      10.7861328125,
+      35.88671875,
+      45.2724609375
+    ],
+    "summary": [
+      {
+        "profile": "timer",
+        "gap": 0,
+        "baseline_median_ns_per_operation": 3.2257687500000003,
+        "candidate_median_ns_per_operation": 3.149444445,
+        "paired_median_ratio": 0.9898921108731256,
+        "paired_ratios": [
+          0.9430390783954631,
+          1.0312130522983178,
+          1.0221590225035528,
+          0.9576251992426983
+        ]
+      },
+      {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "baseline_median_ns_per_operation": 7.6524674316666665,
+        "candidate_median_ns_per_operation": 7.120989791666666,
+        "paired_median_ratio": 0.9186627220416363,
+        "paired_ratios": [
+          0.8743987442139848,
+          0.8647445155024418,
+          1.1598622636140687,
+          0.9629266998692878
+        ]
+      },
+      {
+        "profile": "timer",
+        "gap": 4096,
+        "baseline_median_ns_per_operation": 1432.06333,
+        "candidate_median_ns_per_operation": 7.453545,
+        "paired_median_ratio": 0.005222827785876633,
+        "paired_ratios": [
+          0.005323822403719516,
+          0.00470319586916053,
+          0.007471000124258864,
+          0.00512183316803375
+        ]
+      },
+      {
+        "profile": "pending-and-timer",
+        "gap": 4096,
+        "baseline_median_ns_per_operation": 3004.2906249999996,
+        "candidate_median_ns_per_operation": 14.928955,
+        "paired_median_ratio": 0.004941269037115313,
+        "paired_ratios": [
+          0.005120371943817999,
+          0.004950945267907937,
+          0.00490713376526224,
+          0.0049315928063226894
+        ]
+      },
+      {
+        "profile": "timer",
+        "gap": 16384,
+        "baseline_median_ns_per_operation": 5699.170625000001,
+        "candidate_median_ns_per_operation": 7.324585,
+        "paired_median_ratio": 0.0012790945570831985,
+        "paired_ratios": [
+          0.001330292623871654,
+          0.0011999966798206926,
+          0.0012846350536251166,
+          0.0012735540605412804
+        ]
+      },
+      {
+        "profile": "pending-and-timer",
+        "gap": 16384,
+        "baseline_median_ns_per_operation": 12185.82438,
+        "candidate_median_ns_per_operation": 15.388539999999999,
+        "paired_median_ratio": 0.0012625439535023848,
+        "paired_ratios": [
+          0.0012961996418615752,
+          0.0011940548995709509,
+          0.0013669192177049815,
+          0.0012288882651431943
+        ]
+      },
+      {
+        "profile": "clean-stream",
+        "gap": 0,
+        "baseline_median_ns_per_operation": 116.79320625,
+        "candidate_median_ns_per_operation": 116.7219854,
+        "paired_median_ratio": 0.9997052458312901,
+        "paired_ratios": [
+          1.039139188648725,
+          0.9602713030138551,
+          1.1150838462823958,
+          0.8244392231752491
+        ]
+      },
+      {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "baseline_median_ns_per_operation": 3426.539108276367,
+        "candidate_median_ns_per_operation": 284.7639617919922,
+        "paired_median_ratio": 0.0822653494348326,
+        "paired_ratios": [
+          0.09051966533771143,
+          0.08419755861689827,
+          0.07955810645302651,
+          0.08033314025276693
+        ]
+      }
+    ],
+    "nominal_guards": {
+      "timer": {
+        "minimum_seconds": 0.923298166,
+        "median_pass": true,
+        "every_pair_pass": true,
+        "duration_pass": true
+      },
+      "pending-and-timer": {
+        "minimum_seconds": 1.98140925,
+        "median_pass": true,
+        "every_pair_pass": false,
+        "duration_pass": true
+      },
+      "clean-stream": {
+        "minimum_seconds": 1.107999083,
+        "median_pass": true,
+        "every_pair_pass": false,
+        "duration_pass": true
+      }
+    }
+  },
+  "current_source_sha256": "e9766fa5ebc22d588df17f3f951e4fdbb696ad6373437be3cda51bcc2c26b0ae",
+  "current_example_sha256": "94eb41407eec6253b5b86110ecfa025e05ac30649a565f10f9c871b166e00166"
+}

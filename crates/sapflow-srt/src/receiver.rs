@@ -199,6 +199,9 @@ pub struct Receiver {
     /// given up on.
     head: Seq,
     buf: VecDeque<Option<Slot>>,
+    /// First occupied slot, retained across missing heads and sequence wrap.
+    /// Only removing this packet requires another scan of the buffer.
+    first_present: Option<Seq>,
     /// The first sequence number not yet received (what an ACK reports).
     ack_pos: Seq,
     loss: LossList,
@@ -247,6 +250,7 @@ impl Receiver {
             drift: Drift::default(),
             head: initial_seq,
             buf: VecDeque::new(),
+            first_present: None,
             ack_pos: initial_seq,
             loss: LossList::new(),
             rtt: Rtt::new(),
@@ -421,6 +425,9 @@ impl Receiver {
             }
             self.buf.push_back(Some(slot));
         }
+        if self.first_present.is_none_or(|first| p.seq < first) {
+            self.first_present = Some(p.seq);
+        }
         self.advance_ack_pos();
         self.since_ack += 1;
         if self.since_ack >= LIGHT_ACK_PACKETS && self.ack_pos != self.last_ack_sent {
@@ -452,6 +459,7 @@ impl Receiver {
 
     /// Delivers or drops the packet at the head.
     fn pop_front(&mut self) {
+        let removed_first = self.first_present == Some(self.head);
         match self.buf.pop_front() {
             Some(Some(slot)) => {
                 self.stats.delivered += 1;
@@ -465,6 +473,19 @@ impl Receiver {
             None => {}
         }
         self.head = self.head.next();
+        if removed_first {
+            self.first_present = self
+                .buf
+                .iter()
+                .position(Option::is_some)
+                .map(|i| self.head.add(i as u32));
+        }
+    }
+
+    /// Earliest received packet by sequence, not by its delivery timestamp.
+    fn first_slot(&self) -> Option<(usize, &Slot)> {
+        let index = self.head.distance_to(self.first_present?) as usize;
+        self.buf.get(index)?.as_ref().map(|slot| (index, slot))
     }
 
     /// Delivers everything held, in order, now.
@@ -491,11 +512,7 @@ impl Receiver {
             match self.buf.front() {
                 Some(Some(slot)) if slot.deliver_at <= now => self.pop_front(),
                 Some(None) => {
-                    let due = self
-                        .buf
-                        .iter()
-                        .position(Option::is_some)
-                        .and_then(|i| Some((i, self.buf.get(i)?.as_ref()?.deliver_at)));
+                    let due = self.first_slot().map(|(i, slot)| (i, slot.deliver_at));
                     match due {
                         Some((i, at)) if at <= now => {
                             for _ in 0..i {
@@ -676,12 +693,8 @@ impl Receiver {
         if let Some(at) = self.loss.next_due(self.now, self.timing()) {
             t = t.min(at);
         }
-        if let Some(at) = self
-            .buf
-            .iter()
-            .find_map(|s| s.as_ref().map(|s| s.deliver_at))
-        {
-            t = t.min(at);
+        if let Some((_, slot)) = self.first_slot() {
+            t = t.min(slot.deliver_at);
         }
         t
     }
@@ -1382,5 +1395,206 @@ mod tests {
         );
         r.on_timer(150 * MS);
         assert!(!sent(&mut r).iter().any(|c| matches!(c, Control::Nak(_))));
+    }
+
+    /// Compare the cached lookup and public timer with the original linear
+    /// scans after each state transition, including empty and wrapped buffers.
+    fn assert_first_present_matches_scan(r: &Receiver) {
+        let scanned = r
+            .buf
+            .iter()
+            .enumerate()
+            .find_map(|(i, slot)| slot.as_ref().map(|slot| (i, slot)));
+        assert_eq!(r.first_present, scanned.map(|(i, _)| r.head.add(i as u32)));
+        assert_eq!(
+            r.first_slot()
+                .map(|(i, slot)| (i, slot.deliver_at, &slot.payload)),
+            scanned.map(|(i, slot)| (i, slot.deliver_at, &slot.payload))
+        );
+        let mut expected = r
+            .last_received
+            .saturating_add(r.settings.peer_idle)
+            .min(r.last_sent + KEEPALIVE_INTERVAL);
+        if r.ack_pos != r.last_ack_sent {
+            expected = expected.min(r.last_full_ack + ACK_INTERVAL);
+        }
+        if let Some(at) = r.loss.next_due(r.now, r.timing()) {
+            expected = expected.min(at);
+        }
+        if let Some((_, slot)) = scanned {
+            expected = expected.min(slot.deliver_at);
+        }
+        assert_eq!(r.next_timer(), expected);
+    }
+
+    /// The old release algorithm over a separate value-only buffer. This
+    /// deliberately does not use the hint or Receiver's pop_front helper.
+    fn release_against_scan_reference(r: &mut Receiver, now: i64) {
+        let mut buffer: VecDeque<_> = r
+            .buf
+            .iter()
+            .map(|slot| slot.as_ref().map(|s| (s.deliver_at, s.payload.clone())))
+            .collect();
+        let mut head = r.head;
+        let mut lost = r.lost;
+        let mut deliveries = r.deliver.clone();
+        let mut dropped = r.stats().dropped;
+        let mut delivered = r.stats().delivered;
+        loop {
+            let pop = match buffer.front() {
+                Some(Some((at, _))) => *at <= now,
+                Some(None) => buffer
+                    .iter()
+                    .find_map(|slot| slot.as_ref().map(|(at, _)| *at))
+                    .is_some_and(|at| at <= now),
+                None => false,
+            };
+            if !pop {
+                break;
+            }
+            match buffer.pop_front() {
+                Some(Some((_, payload))) => {
+                    delivered += 1;
+                    deliveries.push_back((payload, std::mem::take(&mut lost)));
+                }
+                Some(None) => {
+                    dropped += 1;
+                    lost = true;
+                }
+                None => unreachable!("a populated head was checked above"),
+            }
+            head = head.next();
+        }
+        r.release(now);
+        assert_eq!(r.head, head);
+        assert_eq!(r.lost, lost);
+        assert_eq!(r.deliver, deliveries);
+        assert_eq!(r.stats().dropped, dropped);
+        assert_eq!(r.stats().delivered, delivered);
+        let actual: VecDeque<_> = r
+            .buf
+            .iter()
+            .map(|slot| slot.as_ref().map(|s| (s.deliver_at, s.payload.clone())))
+            .collect();
+        assert_eq!(actual, buffer);
+        assert_first_present_matches_scan(r);
+    }
+
+    #[test]
+    fn release_matches_scan_with_sparse_nonmonotonic_delivery_times() {
+        for initial in [Seq::new(ISN), Seq::new(Seq::MAX - 4)] {
+            let mut r = Receiver::new(settings(), 0, 77, initial, 0);
+            // Later sequence numbers need not have later delivery times.
+            for (offset, timestamp) in [(10, 0), (2, 50 * MS), (7, 20 * MS), (20, 0)] {
+                let mut p = data(initial.add(offset).get(), timestamp as u32, b"sparse");
+                p.retransmitted = true;
+                r.on_data(0, &p);
+            }
+            for now in [0, LATENCY, LATENCY + 49 * MS, LATENCY + 50 * MS] {
+                release_against_scan_reference(&mut r, now);
+            }
+            assert_eq!(r.stats().delivered, 4);
+            assert_eq!(r.stats().dropped, 17);
+            assert_eq!(r.buffered(), 0);
+        }
+    }
+
+    #[test]
+    fn first_present_follows_earlier_retransmissions_across_sequence_wrap() {
+        let initial = Seq::new(Seq::MAX - 4);
+        let mut r = Receiver::new(settings(), 0, 77, initial, 0);
+        // A far packet is received first, then an earlier retransmission.
+        // Its later timestamp must still hold back the later sequence.
+        r.on_data(0, &data(initial.add(10).get(), 0, b"far"));
+        assert_first_present_matches_scan(&r);
+        let mut earlier = data(initial.add(2).get(), 50 * MS as u32, b"early");
+        earlier.retransmitted = true;
+        r.on_data(MS, &earlier);
+        assert_first_present_matches_scan(&r);
+        r.on_timer(LATENCY);
+        assert!(delivered(&mut r).is_empty());
+        assert_first_present_matches_scan(&r);
+        r.on_timer(LATENCY + 50 * MS);
+        assert_eq!(
+            marked(&mut r),
+            vec![(b"early".to_vec(), true), (b"far".to_vec(), true)]
+        );
+        assert_eq!(r.stats().dropped, 9);
+        assert_first_present_matches_scan(&r);
+    }
+
+    #[test]
+    fn first_present_survives_room_making_drop_requests_and_shutdown() {
+        let mut r = rx();
+        r.on_data(0, &data(ISN + 60, 0, b"first"));
+        r.on_data(MS, &data(ISN + 70, MS as u32, b"second"));
+        assert_eq!(r.head, Seq::new(ISN + 7));
+        assert_first_present_matches_scan(&r);
+        r.on_control(
+            2 * MS,
+            &Control::DropRequest {
+                message: 0,
+                first: r.head,
+                last: Seq::new(ISN + 59),
+            },
+        );
+        assert_first_present_matches_scan(&r);
+        r.on_data(3 * MS, &data(ISN + 1_000_000, 3 * MS as u32, b"jump"));
+        assert_eq!(
+            marked(&mut r),
+            vec![(b"first".to_vec(), true), (b"second".to_vec(), true)]
+        );
+        assert_eq!(r.first_present, Some(Seq::new(ISN + 1_000_000)));
+        assert_first_present_matches_scan(&r);
+        r.on_control(4 * MS, &Control::Shutdown);
+        assert_eq!(marked(&mut r), vec![(b"jump".to_vec(), true)]);
+        assert_first_present_matches_scan(&r);
+    }
+
+    #[test]
+    fn first_present_matches_linear_scans_through_mixed_receiver_events() {
+        for initial in [Seq::new(0), Seq::new(Seq::MAX - 31)] {
+            let mut r = Receiver::new(settings(), 0, 77, initial, 0);
+            let mut random = 0x91e1_0da5u32;
+            for step in 0..12_000u32 {
+                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let now = i64::from(step) * MS;
+                match random % 7 {
+                    0 => {
+                        release_against_scan_reference(&mut r, now);
+                        r.on_timer(now);
+                    }
+                    1 => r.on_control(
+                        now,
+                        &Control::DropRequest {
+                            message: 0,
+                            first: r.head,
+                            last: r.head.add(random % 32),
+                        },
+                    ),
+                    _ => {
+                        let offset = (random >> 8) % 96;
+                        let seq = if random & 0x10000 == 0 {
+                            r.head.add(offset)
+                        } else {
+                            r.head.prev()
+                        };
+                        let mut packet = data(seq.get(), now as u32, b"payload");
+                        packet.retransmitted = random & 0x20000 != 0;
+                        // Exercise key-mismatch refusal too.
+                        if random & 0x3f == 0 {
+                            packet.key = 1;
+                        }
+                        r.on_data(now, &packet);
+                    }
+                }
+                assert_first_present_matches_scan(&r);
+                while r.take_delivery().is_some() {}
+                while r.take_send().is_some() {}
+            }
+            r.on_control(12_001 * MS, &Control::Shutdown);
+            assert_first_present_matches_scan(&r);
+            assert_eq!(r.buffered(), 0);
+        }
     }
 }

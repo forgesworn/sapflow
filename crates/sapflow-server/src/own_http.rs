@@ -884,7 +884,7 @@ fn answer(app: &App, request: &Request) -> Option<Response> {
             None => not_found(),
         },
         Request::Media { stream, msn, part } => {
-            let st = stream.lock();
+            let mut st = stream.lock();
             if st.closed {
                 return not_found();
             }
@@ -895,14 +895,10 @@ fn answer(app: &App, request: &Request) -> Option<Response> {
             match readiness {
                 Readiness::BadRequest => Some(Response::empty("400 Bad Request")),
                 Readiness::Ready => {
-                    if !app.config.low_latency
-                        && let Some(muxer) = st.ingest.muxer()
-                    {
-                        return Some(Response::ok(
-                            Bytes::from(playlist::media_with_mode(muxer, &st.prefix, false)),
-                            PLAYLIST_TYPE,
-                            "no-cache",
-                        ));
+                    if !app.config.low_latency {
+                        return st
+                            .conventional_playlist()
+                            .map(|body| Response::ok(body, PLAYLIST_TYPE, "no-cache"));
                     }
                     st.media
                         .clone()
@@ -1351,3 +1347,7 @@ mod tests {
 #[cfg(test)]
 #[path = "own_http_deadline_tests.rs"]
 mod deadline_tests;
+
+#[cfg(test)]
+#[path = "own_http_performance_tests.rs"]
+mod performance_tests;

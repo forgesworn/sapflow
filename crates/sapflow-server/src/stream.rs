@@ -138,6 +138,8 @@ pub struct State {
     pub prefix: String,
     pub closed: bool,
     pub media: Option<Bytes>,
+    /// Rendered only on demand, then shared until the next media update.
+    conventional_media: Option<Bytes>,
     pub multivariant: Option<Bytes>,
 }
 
@@ -247,6 +249,20 @@ fn prefix_from_nanos(nanos: u128) -> String {
     format!("{:012x}", nanos & 0xffff_ffff_ffff)
 }
 
+impl State {
+    pub(crate) fn conventional_playlist(&mut self) -> Option<Bytes> {
+        if self.conventional_media.is_none() {
+            let muxer = self.ingest.muxer()?;
+            self.conventional_media = Some(Bytes::from(playlist::media_with_mode(
+                muxer,
+                &self.prefix,
+                false,
+            )));
+        }
+        self.conventional_media.clone()
+    }
+}
+
 impl LiveStream {
     fn new(
         path: StreamPath,
@@ -264,6 +280,7 @@ impl LiveStream {
                 prefix: fresh_prefix(),
                 closed: false,
                 media: None,
+                conventional_media: None,
                 multivariant: None,
             }),
             session: Mutex::new(Session {
@@ -378,7 +395,15 @@ impl LiveStream {
         if st.closed {
             return Err(IngestError::PresentationExpired);
         }
-        let update = f(&mut st.ingest, SystemTime::now())?;
+        let update = match f(&mut st.ingest, SystemTime::now()) {
+            Ok(update) => update,
+            Err(error) => {
+                // A rejected input can still retire accepted muxer state.
+                // Conventional requests previously rendered that state live.
+                st.conventional_media = None;
+                return Err(error);
+            }
+        };
         if !update.any() {
             return Ok(Applied::default());
         }
@@ -396,6 +421,7 @@ impl LiveStream {
     }
 
     fn render(st: &mut State) -> bool {
+        st.conventional_media = None;
         let rendered = st.ingest.muxer().filter(|m| m.has_content()).map(|m| {
             (
                 Bytes::from(playlist::media(m, &st.prefix)),
@@ -492,6 +518,7 @@ impl LiveStream {
             };
             state.ingest = Source::new(kind, self.cfg, self.fragments.clone());
             state.media = None;
+            state.conventional_media = None;
             state.multivariant = None;
         }
         self.version.send_modify(|v| *v += 1);

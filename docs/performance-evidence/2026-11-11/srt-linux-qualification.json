@@ -1,0 +1,1507 @@
+{
+  "schema": "sapflow-srt-linux-qualification-v1",
+  "status": "passed",
+  "baseline_revision": "aee2a526c26f8837266857e139b46d40591d5da2",
+  "candidate_revision": "1fa202bc705a577214bd865690fde22b98292126",
+  "protocol": {
+    "pairs": 4,
+    "order": [
+      "AB",
+      "BA",
+      "AB",
+      "BA"
+    ],
+    "pilot": "one fixed pilot per arm/profile; common work frozen before timing",
+    "target_seconds": 5.0,
+    "minimum_seconds": 3.0,
+    "maximum_predicted_seconds": 120.0,
+    "profiles": {
+      "clean-stream": {
+        "pilot": 20000000,
+        "cap": 500000000,
+        "multiplier": 1
+      },
+      "pending-and-timer": {
+        "pilot": 1000000000,
+        "cap": 8000000000,
+        "multiplier": 1
+      },
+      "bursty-stream": {
+        "pilot": 32768,
+        "cap": 1000000,
+        "multiplier": 128
+      }
+    },
+    "nominal_median_limit": 1.05,
+    "nominal_pair_limit": 1.1,
+    "burst_median_limit": 0.95,
+    "burst_pair_limit": 1.0,
+    "maximum_steal_fraction": 0.005,
+    "maximum_external_busy_cores": 0.1
+  },
+  "environment": {
+    "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "logical_cpus": 4,
+    "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8",
+    "build_env": {
+      "RUSTFLAGS": null,
+      "CARGO_ENCODED_RUSTFLAGS": null,
+      "CARGO_INCREMENTAL": "0"
+    }
+  },
+  "identities": {
+    "example_sha256": "efe3eb16014fb61366c3140b566ca24c25b45600c89fba7b46b8b33e5630c30d",
+    "Cargo.toml": "70ddf2942ce29613ba15a2b35761a8085b1249158f5214a153e82643241d2913",
+    "Cargo.lock": "7466bda2141a26692068d807f57a861b90d891a4a26805a82fc049f1438e105b",
+    "crates/sapflow-srt/Cargo.toml": "a50a00ebe619af2f3934c61878f80b589a9f3626c68aa3f1c80b5e76a32451ee",
+    "common_source_sha256": {
+      "crates/sapflow-srt/src/caller.rs": "6cac983a58f0d18dadf7aac6face1d7f54128195f89708544d13a967ff82a9b3",
+      "crates/sapflow-srt/src/crypto.rs": "17a01e78198d4dcec45b46d6bcc7448ff1486d4cdb2a1b2acbda473185bba370",
+      "crates/sapflow-srt/src/lib.rs": "7a5b53017d34108eb4ea6062eb598dd9a94d6253b1f6964d78a2dd2da03e90b0",
+      "crates/sapflow-srt/src/listener.rs": "260ef13fab101c0090681fa94a624e57adf52a6aa5754c4c56682ec62c35cba8",
+      "crates/sapflow-srt/src/loss.rs": "9b5370b43504e704792f35ff393716c044f593f95a873ba4d86b189a3fa7ae39",
+      "crates/sapflow-srt/src/packet.rs": "d31387e8f47ae6a85124e48f854648c2da269cd924131a0e1b41316fac34cb3b",
+      "crates/sapflow-srt/src/rtt.rs": "ce7f41ebfeded68f5d7c91057ecf0b42a70a6680119445f2409b09d9b02c16b3",
+      "crates/sapflow-srt/src/sender.rs": "eed3f30dd1d6d484a93c01cf6538f75a4f199f459d41a7bf1031cc9026e80040",
+      "crates/sapflow-srt/src/seq.rs": "22c88a425fa3d9efc1734492e593c0c1a8bd90da2a95c8643df09af3ff67d316"
+    },
+    "runner_sha256": "75f43b1844017815e560667f7640831f2360db9b76b70e897f71b45f5fd32fda",
+    "baseline": {
+      "receiver_sha256": "af275a691464833487b87f1625f2fe6bc3c1e763d1e50eb586f3a7885076b2a1",
+      "binary_sha256": "60b2ba8dea6025572ce4e0ee1259c4dadea1aa7bc946a26db6c1e3c70348e6b1"
+    },
+    "candidate": {
+      "receiver_sha256": "e9766fa5ebc22d588df17f3f951e4fdbb696ad6373437be3cda51bcc2c26b0ae",
+      "binary_sha256": "8bd33c22aa2c0428851101cf6db1565ce8399a2747781faa18c505f7b93167fc"
+    }
+  },
+  "pilots": [
+    {
+      "profile": "clean-stream",
+      "arm": "baseline",
+      "phase": "pilot",
+      "pair": 0,
+      "work": 20000000,
+      "load_before": [
+        1.24560546875,
+        0.328125,
+        0.1123046875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 20000000,
+        "elapsed_ns": 1913305791,
+        "verified_deliveries": 20000000,
+        "receiver_bytes": 776
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.05018284055876048,
+        "wall_seconds": 1.9144193300000012,
+        "child_cpu_seconds": 1.9139290000000007,
+        "system_busy_seconds": 2.01,
+        "cpu_tick_delta": [
+          198,
+          0,
+          2,
+          551,
+          13,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.24560546875,
+        0.328125,
+        0.1123046875
+      ]
+    },
+    {
+      "profile": "clean-stream",
+      "arm": "candidate",
+      "phase": "pilot",
+      "pair": 0,
+      "work": 20000000,
+      "load_before": [
+        1.24560546875,
+        0.328125,
+        0.1123046875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 20000000,
+        "elapsed_ns": 1816975025,
+        "verified_deliveries": 20000000,
+        "receiver_bytes": 784
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.017813046454746056,
+        "wall_seconds": 1.8181617659999958,
+        "child_cpu_seconds": 1.817612999999999,
+        "system_busy_seconds": 1.85,
+        "cpu_tick_delta": [
+          184,
+          0,
+          1,
+          530,
+          12,
+          0,
+          0,
+          0
+        ]
+      },
+      "load_after": [
+        1.2255859375,
+        0.33935546875,
+        0.1171875
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "baseline",
+      "phase": "pilot",
+      "pair": 0,
+      "work": 1000000000,
+      "load_before": [
+        1.2255859375,
+        0.33935546875,
+        0.1171875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 9005636223,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.007120411174509868,
+        "wall_seconds": 9.006783235999997,
+        "child_cpu_seconds": 9.005867999999998,
+        "system_busy_seconds": 9.07,
+        "cpu_tick_delta": [
+          904,
+          0,
+          2,
+          2622,
+          68,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.27099609375,
+        0.37841796875,
+        0.13232421875
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "candidate",
+      "phase": "pilot",
+      "pair": 0,
+      "work": 1000000000,
+      "load_before": [
+        1.27099609375,
+        0.37841796875,
+        0.13232421875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 8006362546,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.011576617217205811,
+        "wall_seconds": 8.007520526999997,
+        "child_cpu_seconds": 8.007300000000003,
+        "system_busy_seconds": 8.1,
+        "cpu_tick_delta": [
+          804,
+          0,
+          5,
+          2325,
+          66,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.2490234375,
+        0.38916015625,
+        0.13720703125
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "baseline",
+      "phase": "pilot",
+      "pair": 0,
+      "work": 32768,
+      "load_before": [
+        1.2490234375,
+        0.38916015625,
+        0.13720703125
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 4194304,
+        "elapsed_ns": 13734904135,
+        "verified_deliveries": 4194304
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.014165113137035806,
+        "wall_seconds": 13.736071015999997,
+        "child_cpu_seconds": 13.735427000000001,
+        "system_busy_seconds": 13.93,
+        "cpu_tick_delta": [
+          1384,
+          0,
+          7,
+          3739,
+          355,
+          0,
+          2,
+          0
+        ]
+      },
+      "load_after": [
+        1.193359375,
+        0.419921875,
+        0.15185546875
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "candidate",
+      "phase": "pilot",
+      "pair": 0,
+      "work": 32768,
+      "load_before": [
+        1.193359375,
+        0.419921875,
+        0.15185546875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 4194304,
+        "elapsed_ns": 953314446,
+        "verified_deliveries": 4194304
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.01655779136564302,
+        "wall_seconds": 0.9544751260000055,
+        "child_cpu_seconds": 0.954195999999996,
+        "system_busy_seconds": 0.97,
+        "cpu_tick_delta": [
+          96,
+          0,
+          0,
+          276,
+          9,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.193359375,
+        0.419921875,
+        0.15185546875
+      ]
+    }
+  ],
+  "workloads": {
+    "clean-stream": {
+      "work": 55036530,
+      "predicted_slower_seconds": 5.265085578277262,
+      "pilot_seconds": [
+        1.913305791,
+        1.816975025
+      ]
+    },
+    "pending-and-timer": {
+      "work": 1000000000,
+      "predicted_slower_seconds": 9.005636223,
+      "pilot_seconds": [
+        9.005636223,
+        8.006362546
+      ]
+    },
+    "bursty-stream": {
+      "work": 171864,
+      "predicted_slower_seconds": 72.03782849907348,
+      "pilot_seconds": [
+        13.734904135,
+        0.953314446
+      ]
+    }
+  },
+  "rows": [
+    {
+      "profile": "clean-stream",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 1,
+      "work": 55036530,
+      "load_before": [
+        1.193359375,
+        0.419921875,
+        0.15185546875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 55036530,
+        "elapsed_ns": 4958116346,
+        "verified_deliveries": 55036530,
+        "receiver_bytes": 776
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.008256715876674795,
+        "wall_seconds": 4.959235683000003,
+        "child_cpu_seconds": 4.959053000000002,
+        "system_busy_seconds": 5.0,
+        "cpu_tick_delta": [
+          498,
+          0,
+          2,
+          1442,
+          41,
+          0,
+          0,
+          0
+        ]
+      },
+      "load_after": [
+        1.177734375,
+        0.4296875,
+        0.15673828125
+      ]
+    },
+    {
+      "profile": "clean-stream",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 1,
+      "work": 55036530,
+      "load_before": [
+        1.177734375,
+        0.4296875,
+        0.15673828125
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 55036530,
+        "elapsed_ns": 5009410189,
+        "verified_deliveries": 55036530,
+        "receiver_bytes": 784
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.007910273562018833,
+        "wall_seconds": 5.010572603999989,
+        "child_cpu_seconds": 5.010365000000003,
+        "system_busy_seconds": 5.05,
+        "cpu_tick_delta": [
+          502,
+          0,
+          2,
+          1454,
+          42,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.1630859375,
+        0.439453125,
+        0.16162109375
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 1,
+      "work": 1000000000,
+      "load_before": [
+        1.1630859375,
+        0.439453125,
+        0.16162109375
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 9019632614,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.016578911020690205,
+        "wall_seconds": 9.020797555000001,
+        "child_cpu_seconds": 9.020444999999995,
+        "system_busy_seconds": 9.17,
+        "cpu_tick_delta": [
+          912,
+          0,
+          4,
+          2610,
+          79,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.1376953125,
+        0.45849609375,
+        0.17138671875
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 1,
+      "work": 1000000000,
+      "load_before": [
+        1.1376953125,
+        0.45849609375,
+        0.17138671875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 7991175653,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.014760715655933683,
+        "wall_seconds": 7.992295411000001,
+        "child_cpu_seconds": 7.992028000000005,
+        "system_busy_seconds": 8.11,
+        "cpu_tick_delta": [
+          805,
+          0,
+          4,
+          2314,
+          69,
+          0,
+          2,
+          0
+        ]
+      },
+      "load_after": [
+        1.1162109375,
+        0.47705078125,
+        0.18115234375
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 1,
+      "work": 171864,
+      "load_before": [
+        1.1162109375,
+        0.47705078125,
+        0.18115234375
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 21998592,
+        "elapsed_ns": 71734656548,
+        "verified_deliveries": 21998592
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.010689153938431027,
+        "wall_seconds": 71.73579914899999,
+        "child_cpu_seconds": 71.73320499999997,
+        "system_busy_seconds": 72.5,
+        "cpu_tick_delta": [
+          7207,
+          0,
+          33,
+          21038,
+          386,
+          0,
+          10,
+          0
+        ]
+      },
+      "load_after": [
+        1.2060546875,
+        0.64697265625,
+        0.2646484375
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 1,
+      "work": 171864,
+      "load_before": [
+        1.2060546875,
+        0.64697265625,
+        0.2646484375
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 21998592,
+        "elapsed_ns": 4978777236,
+        "verified_deliveries": 21998592
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.008105117904860548,
+        "wall_seconds": 4.979939893999983,
+        "child_cpu_seconds": 4.979637000000011,
+        "system_busy_seconds": 5.02,
+        "cpu_tick_delta": [
+          500,
+          0,
+          2,
+          1489,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "load_after": [
+        1.189453125,
+        0.6533203125,
+        0.26904296875
+      ]
+    },
+    {
+      "profile": "clean-stream",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 2,
+      "work": 55036530,
+      "load_before": [
+        1.189453125,
+        0.6533203125,
+        0.26904296875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 55036530,
+        "elapsed_ns": 4995234288,
+        "verified_deliveries": 55036530,
+        "receiver_bytes": 784
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.004765107640379978,
+        "wall_seconds": 4.996529312000007,
+        "child_cpu_seconds": 4.996191000000006,
+        "system_busy_seconds": 5.02,
+        "cpu_tick_delta": [
+          501,
+          0,
+          1,
+          1494,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "load_after": [
+        1.173828125,
+        0.6591796875,
+        0.2734375
+      ]
+    },
+    {
+      "profile": "clean-stream",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 2,
+      "work": 55036530,
+      "load_before": [
+        1.173828125,
+        0.6591796875,
+        0.2734375
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 55036530,
+        "elapsed_ns": 4950102396,
+        "verified_deliveries": 55036530,
+        "receiver_bytes": 776
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.007877838812211652,
+        "wall_seconds": 4.951231032999999,
+        "child_cpu_seconds": 4.950995000000006,
+        "system_busy_seconds": 4.99,
+        "cpu_tick_delta": [
+          496,
+          0,
+          2,
+          1480,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.15966796875,
+        0.6650390625,
+        0.27734375
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 2,
+      "work": 1000000000,
+      "load_before": [
+        1.15966796875,
+        0.6650390625,
+        0.27734375
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 7891045140,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.016221154195626645,
+        "wall_seconds": 7.892163433999997,
+        "child_cpu_seconds": 7.891979999999999,
+        "system_busy_seconds": 8.02,
+        "cpu_tick_delta": [
+          796,
+          0,
+          4,
+          2354,
+          0,
+          0,
+          2,
+          0
+        ]
+      },
+      "load_after": [
+        1.146484375,
+        0.6708984375,
+        0.28125
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 2,
+      "work": 1000000000,
+      "load_before": [
+        1.146484375,
+        0.6708984375,
+        0.28125
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 8880943254,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.007688878986755582,
+        "wall_seconds": 8.88204901100002,
+        "child_cpu_seconds": 8.881706999999988,
+        "system_busy_seconds": 8.95,
+        "cpu_tick_delta": [
+          891,
+          0,
+          3,
+          2656,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.123046875,
+        0.68212890625,
+        0.2890625
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 2,
+      "work": 171864,
+      "load_before": [
+        1.123046875,
+        0.68212890625,
+        0.2890625
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 21998592,
+        "elapsed_ns": 4933874457,
+        "verified_deliveries": 21998592
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.009161276307092465,
+        "wall_seconds": 4.935011070999991,
+        "child_cpu_seconds": 4.934789000000009,
+        "system_busy_seconds": 4.98,
+        "cpu_tick_delta": [
+          496,
+          0,
+          1,
+          1475,
+          1,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.11279296875,
+        0.6875,
+        0.29296875
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 2,
+      "work": 171864,
+      "load_before": [
+        1.11279296875,
+        0.6875,
+        0.29296875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 21998592,
+        "elapsed_ns": 70855470227,
+        "verified_deliveries": 21998592
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.008387124600287309,
+        "wall_seconds": 70.856584148,
+        "child_cpu_seconds": 70.85571699999998,
+        "system_busy_seconds": 71.45,
+        "cpu_tick_delta": [
+          7114,
+          0,
+          25,
+          21178,
+          0,
+          0,
+          6,
+          0
+        ]
+      },
+      "load_after": [
+        1.138671875,
+        0.7978515625,
+        0.36376953125
+      ]
+    },
+    {
+      "profile": "clean-stream",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 3,
+      "work": 55036530,
+      "load_before": [
+        1.138671875,
+        0.7978515625,
+        0.36376953125
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 55036530,
+        "elapsed_ns": 4954895319,
+        "verified_deliveries": 55036530,
+        "receiver_bytes": 776
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.008996545652953165,
+        "wall_seconds": 4.956013310000003,
+        "child_cpu_seconds": 4.9554129999999414,
+        "system_busy_seconds": 5.0,
+        "cpu_tick_delta": [
+          497,
+          0,
+          2,
+          1482,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.12744140625,
+        0.80126953125,
+        0.3671875
+      ]
+    },
+    {
+      "profile": "clean-stream",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 3,
+      "work": 55036530,
+      "load_before": [
+        1.12744140625,
+        0.80126953125,
+        0.3671875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 55036530,
+        "elapsed_ns": 5005363431,
+        "verified_deliveries": 55036530,
+        "receiver_bytes": 784
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.006763629731187682,
+        "wall_seconds": 5.006483403999994,
+        "child_cpu_seconds": 5.006138000000008,
+        "system_busy_seconds": 5.04,
+        "cpu_tick_delta": [
+          502,
+          0,
+          2,
+          1497,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "load_after": [
+        1.1171875,
+        0.8046875,
+        0.37060546875
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 3,
+      "work": 1000000000,
+      "load_before": [
+        1.1171875,
+        0.8046875,
+        0.37060546875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 8888351504,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.006848686325396698,
+        "wall_seconds": 8.889588032999995,
+        "child_cpu_seconds": 8.889117999999982,
+        "system_busy_seconds": 8.95,
+        "cpu_tick_delta": [
+          892,
+          0,
+          2,
+          2658,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.0986328125,
+        0.8115234375,
+        0.37744140625
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 3,
+      "work": 1000000000,
+      "load_before": [
+        1.0986328125,
+        0.8115234375,
+        0.37744140625
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 7883578872,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.01971047016664749,
+        "wall_seconds": 7.884692687999973,
+        "child_cpu_seconds": 7.884588999999992,
+        "system_busy_seconds": 8.04,
+        "cpu_tick_delta": [
+          797,
+          0,
+          5,
+          2347,
+          1,
+          0,
+          2,
+          0
+        ]
+      },
+      "load_after": [
+        1.0830078125,
+        0.818359375,
+        0.38427734375
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 3,
+      "work": 171864,
+      "load_before": [
+        1.0830078125,
+        0.818359375,
+        0.38427734375
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 21998592,
+        "elapsed_ns": 70981280808,
+        "verified_deliveries": 21998592
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.018298747013735774,
+        "wall_seconds": 70.98245574000003,
+        "child_cpu_seconds": 70.98111000000004,
+        "system_busy_seconds": 72.28,
+        "cpu_tick_delta": [
+          7186,
+          0,
+          35,
+          21155,
+          1,
+          0,
+          7,
+          0
+        ]
+      },
+      "load_after": [
+        1.1591796875,
+        0.9033203125,
+        0.4482421875
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 3,
+      "work": 171864,
+      "load_before": [
+        1.1591796875,
+        0.9033203125,
+        0.4482421875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 21998592,
+        "elapsed_ns": 5224284012,
+        "verified_deliveries": 21998592
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.010519157635218017,
+        "wall_seconds": 5.225513478000039,
+        "child_cpu_seconds": 5.2250319999999615,
+        "system_busy_seconds": 5.28,
+        "cpu_tick_delta": [
+          524,
+          0,
+          3,
+          1562,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.14599609375,
+        0.9052734375,
+        0.45166015625
+      ]
+    },
+    {
+      "profile": "clean-stream",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 4,
+      "work": 55036530,
+      "load_before": [
+        1.14599609375,
+        0.9052734375,
+        0.45166015625
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 55036530,
+        "elapsed_ns": 4923638825,
+        "verified_deliveries": 55036530,
+        "receiver_bytes": 784
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.013320330008234363,
+        "wall_seconds": 4.924802911000029,
+        "child_cpu_seconds": 4.924399999999967,
+        "system_busy_seconds": 4.99,
+        "cpu_tick_delta": [
+          496,
+          0,
+          2,
+          1471,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.13427734375,
+        0.9072265625,
+        0.455078125
+      ]
+    },
+    {
+      "profile": "clean-stream",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 4,
+      "work": 55036530,
+      "load_before": [
+        1.13427734375,
+        0.9072265625,
+        0.455078125
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "clean-stream",
+        "payload_bytes": 1200,
+        "operations": 55036530,
+        "elapsed_ns": 4905371483,
+        "verified_deliveries": 55036530,
+        "receiver_bytes": 776
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.00892599298107463,
+        "wall_seconds": 4.906568949000018,
+        "child_cpu_seconds": 4.906204000000067,
+        "system_busy_seconds": 4.95,
+        "cpu_tick_delta": [
+          492,
+          0,
+          2,
+          1467,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.123046875,
+        0.9091796875,
+        0.4580078125
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 4,
+      "work": 1000000000,
+      "load_before": [
+        1.123046875,
+        0.9091796875,
+        0.4580078125
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 7882867017,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.01093888137793805,
+        "wall_seconds": 7.884078547000001,
+        "child_cpu_seconds": 7.8837570000000206,
+        "system_busy_seconds": 7.97,
+        "cpu_tick_delta": [
+          791,
+          0,
+          5,
+          2356,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.11279296875,
+        0.9111328125,
+        0.4609375
+      ]
+    },
+    {
+      "profile": "pending-and-timer",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 4,
+      "work": 1000000000,
+      "load_before": [
+        1.11279296875,
+        0.9111328125,
+        0.4609375
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "pending-and-timer",
+        "gap": 0,
+        "operations": 1000000000,
+        "elapsed_ns": 8887373935,
+        "verified_deliveries": 1
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.010316359579040618,
+        "wall_seconds": 8.888503672000013,
+        "child_cpu_seconds": 8.888303000000025,
+        "system_busy_seconds": 8.98,
+        "cpu_tick_delta": [
+          894,
+          0,
+          3,
+          2655,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.09521484375,
+        0.91455078125,
+        0.466796875
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "candidate",
+      "phase": "measured",
+      "pair": 4,
+      "work": 171864,
+      "load_before": [
+        1.09521484375,
+        0.91455078125,
+        0.466796875
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 21998592,
+        "elapsed_ns": 4909802466,
+        "verified_deliveries": 21998592
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.008004765437576236,
+        "wall_seconds": 4.910949646999995,
+        "child_cpu_seconds": 4.910689000000017,
+        "system_busy_seconds": 4.95,
+        "cpu_tick_delta": [
+          492,
+          0,
+          2,
+          1468,
+          0,
+          0,
+          1,
+          0
+        ]
+      },
+      "load_after": [
+        1.08740234375,
+        0.916015625,
+        0.4697265625
+      ]
+    },
+    {
+      "profile": "bursty-stream",
+      "arm": "baseline",
+      "phase": "measured",
+      "pair": 4,
+      "work": 171864,
+      "load_before": [
+        1.08740234375,
+        0.916015625,
+        0.4697265625
+      ],
+      "exit": 0,
+      "result": {
+        "profile": "bursty-stream",
+        "gap": 4096,
+        "payload_bytes": 1200,
+        "operations": 21998592,
+        "elapsed_ns": 70924683170,
+        "verified_deliveries": 21998592
+      },
+      "host": {
+        "valid": true,
+        "steal_fraction": 0.0,
+        "external_busy_cores": 0.009805703430404284,
+        "wall_seconds": 70.92586523099999,
+        "child_cpu_seconds": 70.924522,
+        "system_busy_seconds": 71.62,
+        "cpu_tick_delta": [
+          7125,
+          0,
+          29,
+          21194,
+          1,
+          0,
+          8,
+          0
+        ]
+      },
+      "load_after": [
+        1.18505859375,
+        0.9814453125,
+        0.52685546875
+      ]
+    }
+  ],
+  "limitations": [
+    "Library elapsed time, not network or whole-server performance.",
+    "All calibration and measured aggregate rows retained; no retry or replacement.",
+    "No CPU affinity changes; Linux system/child CPU accounting gates shared-host noise."
+  ],
+  "builds": [
+    {
+      "arm": "baseline",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "sapflow-srt",
+        "--example",
+        "receiver-gap-bench",
+        "-j",
+        "2"
+      ],
+      "exit": 0,
+      "seconds": 8.383716345000003
+    },
+    {
+      "arm": "candidate",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "sapflow-srt",
+        "--example",
+        "receiver-gap-bench",
+        "-j",
+        "2"
+      ],
+      "exit": 0,
+      "seconds": 5.177140381000001
+    }
+  ],
+  "qualification": {
+    "passed": true,
+    "profiles": {
+      "clean-stream": {
+        "ratios": [
+          1.0103454294777454,
+          1.009117365337022,
+          1.0101855051925064,
+          1.0037239467109285
+        ],
+        "median_ratio": 1.009651435264764,
+        "maximum_ratio": 1.0103454294777454,
+        "minimum_seconds": 4.905371483,
+        "median_pass": true,
+        "every_pair_pass": true,
+        "duration_pass": true
+      },
+      "pending-and-timer": {
+        "ratios": [
+          0.8859757370379299,
+          0.8885368270364584,
+          0.8869562447493413,
+          0.886973708392748
+        ],
+        "median_ratio": 0.8869649765710447,
+        "maximum_ratio": 0.8885368270364584,
+        "minimum_seconds": 7.882867017,
+        "median_pass": true,
+        "every_pair_pass": true,
+        "duration_pass": true
+      },
+      "bursty-stream": {
+        "ratios": [
+          0.06940546558090144,
+          0.06963293647185352,
+          0.07360086987062642,
+          0.06922558193501761
+        ],
+        "median_ratio": 0.06951920102637749,
+        "maximum_ratio": 0.07360086987062642,
+        "minimum_seconds": 4.909802466,
+        "median_pass": true,
+        "every_pair_pass": true,
+        "duration_pass": true
+      }
+    }
+  }
+}
