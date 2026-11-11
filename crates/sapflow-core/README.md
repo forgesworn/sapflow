@@ -11,6 +11,20 @@ log limits, publish-session state and recording file names. No networking,
 no async runtime, no dependencies, so it builds for iOS and Android as well
 as servers. MIT.
 
+## PROXY protocol v2
+
+`proxy_protocol` parses the binary PROXY protocol version 2 header a
+layer-4 front proxy puts before a forwarded TCP connection. It does no I/O:
+feed it the bytes received so far and it answers `NeedMore`, a header with
+the number of bytes it used, or a typed error. It accepts PROXY over TCP on
+IPv4 or IPv6, and LOCAL whatever its family (UNSPEC included); it refuses
+version 1, and PROXY over UNSPEC, UDP or UNIX. A
+header is at most 536 bytes with at most 32 TLVs; a CRC32C TLV is verified,
+and ALPN, AUTHORITY and the other TLVs are exposed. `parse_trusted` refuses
+any TCP peer other than the trusted proxy, comparing canonical addresses so
+an IPv4-mapped IPv6 peer matches an IPv4 proxy. The module docs give each
+decision and its reason.
+
 Most people want one of the other crates:
 
 - [`sapflow`](https://crates.io/crates/sapflow): the server binary.

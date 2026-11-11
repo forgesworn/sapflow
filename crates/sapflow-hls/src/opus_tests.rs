@@ -277,7 +277,9 @@ fn audio_only_opus_cuts_independent_parts_on_toc_durations() {
 /// every render, every part as it is produced (so nothing is lost to the
 /// window), and RFC 8216bis 6.2.2's part retention: a part stays
 /// downloadable for three target durations after its tag leaves the
-/// playlist.
+/// playlist. That holds at the default window these tests use; shorter
+/// windows do not meet it yet (docs/whip-ingest.md, "Open after W3b").
+#[derive(Default)]
 struct Watch {
     rules: playlist::RuleCheck,
     parts: Vec<Arc<Part>>,
@@ -285,19 +287,6 @@ struct Watch {
     listed: std::collections::BTreeSet<u64>,
     removed: std::collections::BTreeMap<u64, i64>,
     gone: std::collections::BTreeMap<u64, i64>,
-}
-
-impl Default for Watch {
-    fn default() -> Self {
-        Self {
-            rules: playlist::RuleCheck::with_live_window(),
-            parts: Vec::new(),
-            next: 0,
-            listed: Default::default(),
-            removed: Default::default(),
-            gone: Default::default(),
-        }
-    }
 }
 
 impl Watch {
@@ -1099,6 +1088,33 @@ fn video_led_opus_durations_follow_the_timestamps_within_the_slew() {
             );
             assert!(worst <= bound, "{samples} {ppm}: {worst}");
         }
+    }
+}
+
+/// Video-led steps other than slew, as a timeline hold or a step by arrival
+/// time makes: a repeated timestamp gives a sample no duration, a step of up
+/// to three packets is kept, and a longer one gives the packet its own.
+#[test]
+fn video_led_opus_keeps_steps_up_to_three_packets() {
+    for (step, expected) in [
+        (0, 0),
+        (1800 * 5 / 2, 2400),
+        (1800 * 3, 2880),
+        (1800 * 7 / 2, 960),
+    ] {
+        let mut m = av_muxer();
+        m.push_audio(0, Bytes::from(packet(960, true)))
+            .expect("Opus");
+        m.push_audio(step, Bytes::from(packet(960, true)))
+            .expect("Opus");
+        let first = m
+            .part
+            .as_ref()
+            .expect("part")
+            .audio
+            .first()
+            .map(|s| s.duration);
+        assert_eq!(first, Some(expected), "step {step}");
     }
 }
 

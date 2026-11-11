@@ -290,3 +290,10 @@ path = "fuzz_targets/opus_packaging.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "proxy_protocol_v2"
+path = "fuzz_targets/proxy_protocol_v2.rs"
+test = false
+doc = false
+bench = false

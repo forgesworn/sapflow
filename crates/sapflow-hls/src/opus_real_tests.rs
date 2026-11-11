@@ -75,6 +75,8 @@ fn ticks(samples: u32) -> i64 {
 struct Collected {
     parts: Vec<Arc<Part>>,
     next: u64,
+    /// Each media playlist render that differs from the one before.
+    renders: Vec<String>,
 }
 
 impl Collected {
@@ -84,6 +86,12 @@ impl Collected {
                 self.parts.push(part);
             }
             self.next += 1;
+        }
+        if m.has_content() {
+            let render = playlist::media(m, "golden");
+            if self.renders.last() != Some(&render) {
+                self.renders.push(render);
+            }
         }
     }
 
@@ -389,6 +397,101 @@ fn real_mono_then_stereo_packets_keep_the_first_configuration() {
     assert_eq!(m.audio_config(), Some(&AudioConfig::Opus(OpusConfig::MONO)));
     assert_eq!(m.current_initialization_id(), 0);
     assert_eq!(collected.tracks().0, samples(&mixed));
+}
+
+/// Every byte served or recorded over the run: each playlist render as it
+/// changed, every part as it closed, then the final inits, segments and
+/// playlists and the recording file.
+fn golden(m: &Muxer, collected: &Collected) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for render in &collected.renders {
+        h.update(render);
+    }
+    for part in &collected.parts {
+        h.update(part.duration.as_nanos().to_be_bytes());
+        h.update(part.span.as_nanos().to_be_bytes());
+        h.update([u8::from(part.independent)]);
+        h.update(&part.data);
+    }
+    for id in 0..=m.current_initialization_id() {
+        if let Some(init) = m.initialization(id) {
+            h.update(id.to_be_bytes());
+            h.update(init);
+        }
+    }
+    for entry in m.entries() {
+        if let crate::muxer::Entry::Segment(segment) = entry {
+            h.update(segment.id.to_be_bytes());
+            h.update(segment.duration.as_nanos().to_be_bytes());
+            for chunk in segment.data.chunks() {
+                h.update(chunk);
+            }
+        }
+    }
+    h.update(playlist::media(m, "golden"));
+    h.update(playlist::multivariant(m));
+    h.update(collected.recording_file(m));
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Opus output pinned at 4ab0c12 (the Opus timing fix), before the live
+/// window change: these streams are shorter than the window, so a
+/// difference here means Opus packaging changed. Audio-only and video-led
+/// (testsrc-3s video), for 20 ms stereo, 60 ms mono SILK and 120 ms stereo
+/// packets of several frames.
+#[test]
+fn real_opus_output_is_byte_identical_to_4ab0c12() {
+    let unwindowed = |m: &Muxer| {
+        playlist::media(m, "golden")
+            .lines()
+            .any(|l| l == "#EXT-X-MEDIA-SEQUENCE:0")
+    };
+    let mut actual = Vec::new();
+    for (name, ogg) in [
+        ("20ms-stereo", STEREO_20),
+        ("60ms-mono", MONO_60),
+        ("120ms-stereo", STEREO_120),
+    ] {
+        let (_, _, packets) = opus_stream(ogg);
+        let (m, collected) = audio_only(&packets, None);
+        assert!(unwindowed(&m), "{name}: nothing removed");
+        actual.push((format!("audio-only-{name}"), golden(&m, &collected)));
+        let (m, collected) = audio_video(VIDEO, &packets, None);
+        assert!(unwindowed(&m), "{name}: nothing removed");
+        actual.push((format!("video-led-{name}"), golden(&m, &collected)));
+    }
+    let expected = [
+        (
+            "audio-only-20ms-stereo",
+            "4b810a2591d6d5400bcb8c7a45a1e9b2507a82081ce4c6c27d3e63ddb5aba2b7",
+        ),
+        (
+            "video-led-20ms-stereo",
+            "25171e9dda3855310cdcb0062640294338ce7c237543141b6d1408dc38f0dfa1",
+        ),
+        (
+            "audio-only-60ms-mono",
+            "83a2af933af664f358fa88d4e73dc6224098aad74963e35f939ed380fd945685",
+        ),
+        (
+            "video-led-60ms-mono",
+            "ba05e8a5827b9df18d60c9811b20791a47057517b5acffa993fb2f192db182ff",
+        ),
+        (
+            "audio-only-120ms-stereo",
+            "8ee5f2ad717d802bd04e71d00febae7d4a35fe0913ff7813502c174df958190a",
+        ),
+        (
+            "video-led-120ms-stereo",
+            "7e9d5bfe27cdcec495ad5648d9ec9f3df880ac6c306676e6894377c4451c2bb2",
+        ),
+    ];
+    let actual: Vec<(&str, &str)> = actual
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
+    assert_eq!(actual, expected);
 }
 
 fn json_summary(name: &str, m: &Muxer, collected: &Collected, packets: &[Vec<u8>]) -> String {
