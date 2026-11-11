@@ -34,7 +34,7 @@ only dependencies are pinned RustCrypto primitives (`aes`, `ctr`,
 | `opus` | The RFC 6716 TOC byte and packet framing (codes 0 to 3, padding, the 120 ms bound), constant encoded-silence packets, and a depacketiser that fills DTX and loss with silence of the stream's channel layout, marked apart |
 | `rtx` | RFC 4588 payloads: the OSN, and padding-only probes |
 | `twcc` | Transport-wide congestion control: arrival times recorded once per transport-wide sequence number in a bounded window, encoded as RTPFB FMT 15 feedback (run-length and one- and two-bit vector chunks, 250 us deltas, 64 ms reference time) at a fixed cadence and split at a size cap |
-| `timeline` | One 90 kHz timeline: a start hold for every stream's first sender report (1.5 s at most, bounded in bytes), then alignment by sender reports or by arrival time, timestamps that never go back or run ahead of arrival time, and drift checks on later reports |
+| `timeline` | One 90 kHz timeline: a start hold for every stream's first sender report (1.5 s at most, bounded in bytes), then alignment by sender reports or by arrival time, timestamps that strictly increase and stay within a lead of arrival time, and later reports slewed in at up to 500 ppm |
 | `receive` | The `Receiver`: per stream, a bounded reorder buffer, NACKs and RTT, RTX or same-SSRC retransmissions, keyframe requests (PLI or FIR), the depacketisers and receiver report statistics (RFC 3550 A.3 and A.8, each packet counted once); for the session, transport-cc and the timeline; giving events stamped on the timeline, and RTCP datagrams that start with the receiver report |
 
 ```rust
@@ -139,14 +139,16 @@ Each stream keeps:
 - **Report block.** RFC 3550 A.3 and A.8 for the media SSRC: each sequence
   number counted once within 4096 of the highest, so copies and needless
   resends never make loss negative; RTX not counted (RFC 4588 section 6.2),
-  so loss is the network's before repair, while OBS's same-SSRC resends
-  count as late arrivals; jitter only from first arrivals never NACKed;
-  LSR and DLSR from its last sender report.
+  so loss is the network's before repair, which rate control needs (RFC
+  4588 section 7), while OBS's same-SSRC resends count as late arrivals,
+  so its loss is after repair; no blocks for RTX streams; jitter only from
+  first arrivals never NACKed; LSR and DLSR from its last sender report.
 
 For the session:
 
 - **RTCP out.** `poll_feedback` writes datagrams of at most `max_datagram`
-  (1200) bytes: a receiver report first (with blocks every `interval`, 1 s
+  (1200) bytes, a hard cap from 436 bytes (feedback is sized to fit after
+  the largest report and CNAME): a receiver report first (with blocks every `interval`, 1 s
   fixed, the first at 0.5 s; empty between), the SDES CNAME, then NACK,
   PLI, FIR and transport-cc. With `reduced_size`, feedback between reports
   goes alone. A sender report for an SSRC not yet bound is kept until it is.
@@ -160,9 +162,14 @@ For the session:
   `max_hold_bytes` (4 MiB) or half the event queue, then `Event::Aligned`
   says whether they were aligned by the reports or by arrival time and
   why. Every `AccessUnit` and `Audio` event carries `pts` on one 90 kHz
-  timeline, which never goes back and never runs ahead of arrival time by
-  more than `max_lead` (500 ms, plus 0.1% of elapsed time); a later sender
-  report more than `max_drift` (100 ms) off is a discontinuity.
+  timeline, which strictly increases and stays within `max_lead` (500 ms,
+  plus 0.1% of elapsed time up to another 500 ms) of arrival time either
+  way. Later sender reports are used in agreeing pairs at least
+  `report_spacing` (500 ms) apart; errors within `max_lead` are slewed at
+  up to `max_slew_ppm` (500 ppm), never backwards and with no event, so a
+  sender's audio clock drifting against NTP is followed. Only a larger
+  step forward, or a timestamp that jumps or falls behind arrival time by
+  more than `max_lead`, is a discontinuity.
 
 Each access unit, after a gap between one frame's marker and the next
 packet, is kept only if its first NAL unit begins an access unit: an access
@@ -212,7 +219,10 @@ first one received cannot be known or NACKed.
   far jumps and splitting at the size cap.
 - The timeline on the FFmpeg captures with sender reports synthesised
   from one clock (audio exactly 300 ms after video), the fallback to
-  arrival time, audio only, drift and hostile reports.
+  arrival time, audio only, hostile reports, and an hour of audio clock
+  drift at 30 and 100 ppm either way (no discontinuity, A/V within 1 ms),
+  forged alternating reports, a falling delay with reports, and a
+  constant RTP timestamp.
 - Fuzz targets `rtp_packet`, `rtcp_compound`, `srtp_unprotect`,
   `srtcp_unprotect`, `h264_depacketise`, `opus_depacketise`,
   `reorder_nack`, `rr_stats`, `twcc_feedback` and `sr_timeline`
