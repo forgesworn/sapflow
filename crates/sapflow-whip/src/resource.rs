@@ -87,16 +87,22 @@ impl SessionId {
         &self.0
     }
 
-    /// Reads 32 hex digits, either case.
+    /// Reads 32 hex digits, either case, and nothing else.
     pub fn parse(s: &str) -> Option<Self> {
         let b = s.as_bytes();
         if b.len() != 32 {
             return None;
         }
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        };
         let mut out = [0u8; 16];
         for (o, pair) in out.iter_mut().zip(b.chunks_exact(2)) {
-            let hex = std::str::from_utf8(pair).ok()?;
-            *o = u8::from_str_radix(hex, 16).ok()?;
+            let [hi, lo] = <[u8; 2]>::try_from(pair).ok()?;
+            *o = (nibble(hi)? << 4) | nibble(lo)?;
         }
         Some(Self(out))
     }
@@ -290,6 +296,10 @@ mod tests {
         assert_eq!(SessionId::parse("00"), None);
         assert_eq!(SessionId::parse(&"zz".repeat(16)), None);
         assert_eq!(SessionId::parse(&"é".repeat(16)), None);
+        // Hex digits only: from_str_radix would take a sign.
+        assert_eq!(SessionId::parse(&"+0".repeat(16)), None);
+        assert_eq!(SessionId::parse(&"-0".repeat(16)), None);
+        assert_eq!(SessionId::parse(&" 0".repeat(16)), None);
         let s = SessionId::generate_seeded([1; 32]).expect("valid");
         assert_eq!(s, SessionId::generate_seeded([1; 32]).expect("valid"));
     }
