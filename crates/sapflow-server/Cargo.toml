@@ -49,4 +49,4 @@ workspace = true
 [dev-dependencies]
 # The scripted WHIP publisher (STUN client, DTLS test client, SRTP) for the
 # in-process WHIP tests.
-sapflow-whip = { path = "../sapflow-whip", version = "=0.2.0-rc.1", features = ["testing"] }
+sapflow-whip = { path = "../sapflow-whip", version = "=0.2.0-rc.1", features = ["testing", "test-panic"] }

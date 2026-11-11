@@ -749,9 +749,10 @@ impl Session {
 
     /// One datagram (or RFC 4571 frame) from `tuple`.
     pub fn handle_datagram(&mut self, now: Instant, tuple: Tuple, bytes: &[u8]) {
-        // Test builds only: a datagram that makes this call panic, for the
-        // router's and the server's panic isolation tests.
-        #[cfg(any(test, feature = "testing"))]
+        // Test builds only, never the fuzz targets': a datagram that makes
+        // this call panic, for the router's and the server's panic
+        // isolation tests.
+        #[cfg(any(test, feature = "test-panic"))]
         if bytes == crate::testing::PANIC_DATAGRAM {
             crate::testing::injected_panic();
         }

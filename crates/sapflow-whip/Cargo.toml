@@ -37,3 +37,7 @@ required-features = ["testing"]
 # test client and SRTP protect, seeded randomness) and the fuzz entry
 # points. Not for production use.
 testing = ["sapflow-dtls/testing", "sapflow-rtp/testing"]
+# With testing: a datagram that makes a session panic, for panic isolation
+# tests. Apart from testing so that the fuzz targets, which use testing,
+# can never reach it. Not for production use.
+test-panic = ["testing"]
