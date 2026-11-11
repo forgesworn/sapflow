@@ -181,7 +181,8 @@ uses), `subtle` 2.6.1 for the constant-time comparison, `zeroize` 1.9.1 and
   `examples/whip_harness.rs` on loopback and reached every milestone
   (`tests/browser_gate.js`). `tests/fixtures/chrome-157/` keeps that run's
   offer (no candidates or addresses), its DTLS datagrams both ways, the
-  peer's leaf certificate and its first SRTP and SRTCP packets; a unit test
+  peer's leaf certificate and its first SRTP and SRTCP packets (Chrome's
+  built-in fake camera and microphone, not a camera); a unit test
   replays them offline, our flights byte for byte, and authenticates
   Chrome's GCM SRTP. Firefox was not run: it is not installed on the test
   host.

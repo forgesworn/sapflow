@@ -461,7 +461,9 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   (section 7.3.1.1). W3 tests check that each browser target recovers from it.
 - **Nomination.** When a valid Binding request with USE-CANDIDATE arrives for
   a session from a new 5-tuple, media moves to that tuple. Media is never
-  moved by anything other than an authenticated STUN request.
+  moved by anything other than an authenticated STUN request. What moves is
+  where sapflow sends; SRTP it receives is taken from any tuple that has
+  passed a check, since SRTP authenticates it (decided in W3a, below).
 - **Consent.** A session whose consent checks stop for 30 s ends, as an
   encoder timing out does today.
 - **Limits of TCP 443.** A network that only lets real TLS through on 443
@@ -977,10 +979,11 @@ Implementation notes (W3a, 11 November 2026):
     two ClientHello fragments that way in every gate 2 run.
   - SRTP and SRTCP are taken from any validated tuple (RFC 8445 section
     12), not only the selected one. Chrome 157 nominated a second pair in
-    every gate 2 run and kept sending on the first for a moment; when only
-    the selected tuple was taken, 10 packets were dropped and 3 Opus
-    packets lost. DTLS input and everything sapflow sends stay on the
-    selected tuple.
+    every gate 2 run and kept sending on the first for a moment. The two
+    runs that took SRTP only from the selected tuple lost 3 Opus packets
+    each (one counted 10 packets dropped); the three after the change lost
+    none. DTLS input and everything sapflow sends stay on the selected
+    tuple.
   - The answer puts the configured candidates in its tagged section and
     our credentials, fingerprint and `setup:passive` in every accepted
     section, as W0's answer did for every target. It does not negotiate
@@ -999,34 +1002,39 @@ Implementation notes (W3a, 11 November 2026):
   handshake deadline, a fingerprint mismatch, MID matching and RTX repair.
 - **Gate 2, a real browser.** This is not A3.1: no server, LL-HLS or
   recording is involved.
-  - Headless Google Chrome 157 with fake media, on the M4, published
-    through `POST` to `examples/whip_harness.rs` on loopback, in three
+  - Headless Google Chrome 157 with fake media, on the test host, published
+    through `POST` to `examples/whip_harness.rs` on loopback, in five
     runs. Every run reached every milestone:
     - ICE nominated at about 120 ms after the `201`;
     - DTLS connected 4 to 6 ms later, with `SRTP_AEAD_AES_128_GCM`;
     - first SRTP packet decrypted;
-    - first H.264 keyframe and Opus at about 1.65 s, after the 1.5 s
-      start hold. That ended by arrival time, because Chrome's video
-      started late;
+    - first Opus at about 1.65 s, after the 1.5 s start hold, and the
+      first H.264 keyframe at 1.64 to 3.14 s. The hold ended by arrival
+      time (`Fallback::Timeout`): not every stream had a sender report
+      within it;
     - feedback sent.
-  - Chrome's own statistics showed DTLS 1.2 as the client, our PLIs
-    answered with keyframes (one every 2 s), and its target rate rising
-    from 30 to about 450 kbit/s on our transport-cc feedback.
-  - Chrome sent RTX for packets already delivered, in one run 628 of 819
-    video packets. These look like bandwidth probes. `sapflow-rtp` counts
-    them as late.
+  - Chrome's own statistics showed DTLS 1.2 as the client, 6 to 8 PLIs
+    received and 5 to 7 keyframes encoded in 10 s, and its target rate
+    rising from 30 kbit/s to between 455 kbit/s and 1.7 Mbit/s.
+  - Chrome sends RTX while its rate ramps up. In the two runs that counted
+    payload types, 43 of 182 and 33 of 196 video-section packets were RTX.
+    10 and 9 of them repeated packets already delivered, which
+    `sapflow-rtp` counts as late; the rest were padding only. Another run
+    counted 628 of 819 video packets late. Bandwidth probing is the likely
+    cause; it was not confirmed.
   - One run is kept in `crates/sapflow-whip/tests/fixtures/chrome-157/`:
     - the offer without candidates or addresses;
     - every DTLS datagram both ways;
     - the leaf certificate;
-    - the first SRTP and SRTCP packets.
+    - the first SRTP and SRTCP packets, from Chrome's built-in fake camera
+      and microphone (generated, not a camera).
 
     A unit test replays it with the same seeded session. Our flights match
     byte for byte, the leaf matches the offer's fingerprint, and Chrome's
     GCM SRTP and SRTCP authenticate.
-  - Firefox was not run. It is no longer installed on the M4, and W0 found
-    that its ICE could not complete on that host. So Firefox's ClientHello
-    is still not captured.
+  - Firefox was not run. It is no longer installed on the test host, and
+    W0 found that its ICE could not complete on that host. So Firefox's
+    ClientHello is still not captured.
 - **Fuzzing.** `stun_message`, `sdp_offer`, `rfc4571_frames` and
   `whip_session`. The session target scripts honest checks and DTLS
   flights so it reaches the authenticated paths. After every step it checks
