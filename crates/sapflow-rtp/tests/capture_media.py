@@ -139,9 +139,8 @@ def decode(ffmpeg, decoder, payloads):
     err = child.stderr.read().decode(errors='replace') if child.stderr else ''
     if child.returncode != 0:
         raise SystemExit(f'decode with {decoder}: exit {child.returncode}: {err.strip()}')
+    # check.sdp and check.raw stay in OUT_DIR, which is scratch.
     pcm = raw.read_bytes()
-    sdp.unlink()
-    raw.unlink()
     return list(struct.unpack(f'<{len(pcm) // 2}h', pcm))
 
 

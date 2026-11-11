@@ -536,11 +536,11 @@ mod tests {
 
         // h264_depacketise: the capture whole, then with losses, then
         // built aggregation and refusals, under small limits.
-        let h264_records = |mode: u8, lose: &dyn Fn(usize) -> bool| {
+        let h264_records = |mode: u8, count: usize, lose: &dyn Fn(usize) -> bool| {
             let mut out = vec![mode];
             let mut last_ts = None;
             let mut lost = false;
-            for (n, d) in video.iter().enumerate() {
+            for (n, d) in video.iter().take(count).enumerate() {
                 let p = parsed(d);
                 if lose(n) {
                     lost = true;
@@ -561,17 +561,17 @@ mod tests {
         write(
             "h264_depacketise",
             "ffmpeg-h264-fu",
-            &h264_records(0, &|_| false),
+            &h264_records(0, usize::MAX, &|_| false),
         );
         write(
             "h264_depacketise",
             "ffmpeg-h264-fu-lossy",
-            &h264_records(0, &|n| n % 13 == 4 || n == 90),
+            &h264_records(0, usize::MAX, &|n| n % 13 == 4 || n == 90),
         );
         write(
             "h264_depacketise",
             "ffmpeg-h264-fu-small-limits",
-            &h264_records(1, &|_| false),
+            &h264_records(1, 40, &|_| false),
         );
         let mut built = vec![0u8];
         let sps = [0x67, 0x42, 0xc0, 0x1e, 0xda];
