@@ -69,10 +69,24 @@ except the test-only example harness.
   until SRTP or SRTCP has arrived, then to the tuple of the latest fresh
   SRTP or SRTCP packet from a tuple with current consent; nomination no
   longer moves them. A browser's own move is followed by its next packet
-  on the new pair, and after a copy wins a race, sends are back with the
-  publisher at its next packet that arrives before any copy of it. A
-  re-sent check that arrives after its original draws nothing while its ID
-  is remembered.
+  on the new pair. A re-sent check that arrives after its original draws
+  nothing while its ID is remembered.
+- **Eviction keeps the publisher.** A full table of validated tuples
+  evicts one that is neither selected nor the send tuple: one that has
+  never delivered fresh media first, then the one whose last fresh media
+  is oldest, the earliest validated breaking ties. Against an observer
+  that copies and spoofs but cannot drop or delay the publisher's packets,
+  the publisher's tuple stays validated while it keeps delivering media:
+  pushing it out would take `max_tuples` - 2 other tuples (6 by default)
+  each with fresher media than the publisher's last packet, that many won
+  races or copies of lost packets within one packet interval. Short of
+  that, after a won race or a copy of a lost packet, the publisher loses
+  no media and sends are back with it at its next packet that arrives
+  before any copy of it. An attacker who wins every race, or drops or
+  delays the publisher's packets (RFC 8445 section 19.2), can keep them
+  from counting as fresh, push the publisher's tuple out so its media is
+  dropped until its next check, and keep sends away from it, within the
+  per-tuple bound.
 - **Consent** is kept per tuple and read for the send tuple: it expires 30
   s after the last new successful check from it (RFC 7675).
 - **Keys.** SRTP comes from the DTLS-SRTP exporter through

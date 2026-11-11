@@ -29,9 +29,23 @@
 //!   selected tuple. From then on it is the tuple of the latest fresh SRTP
 //!   or SRTCP packet (authenticated and inside the replay window) from a
 //!   tuple with current consent, and nomination no longer moves it: a
-//!   publisher's own move is followed by its next packet on the new pair,
-//!   and after one won race the session is back with the publisher at the
-//!   publisher's next packet that arrives before any copy of it.
+//!   publisher's own move is followed by its next packet on the new pair.
+//! - **Eviction keeps the publisher.** A full table evicts a tuple that is
+//!   neither selected nor the send tuple: one that has never delivered
+//!   fresh media first, then the one whose last fresh media is oldest. So
+//!   against an observer that copies and spoofs but cannot drop or delay
+//!   the publisher's packets, the publisher's tuple stays validated while
+//!   it keeps delivering media: pushing it out would take `max_tuples` - 2
+//!   other tuples (6 by default) each with fresher media than the
+//!   publisher's last packet, that is that many won races or copies of lost
+//!   packets within one packet interval. Short of that, after one won race
+//!   or one copy of a lost packet, the publisher loses no media and sends
+//!   are back with it at its next packet that arrives before any copy of
+//!   it. An attacker who wins every race, or drops or delays the
+//!   publisher's packets (RFC 8445 section 19.2), can keep its packets from
+//!   ever counting as fresh, push its tuple out so its media is dropped
+//!   until its next check, and keep sends away from it, though never
+//!   beyond the per-tuple bound.
 //! - **DTLS from the selected tuple only.** `sapflow-dtls` is fed only
 //!   datagrams from the selected tuple. A few that arrive from a validated
 //!   tuple before its USE-CANDIDATE check ([`SessionConfig::max_early_dtls`])

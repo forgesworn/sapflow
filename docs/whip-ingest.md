@@ -746,17 +746,29 @@ There is no ICE restart in v1.
     dropped and counted, and the session goes on;
   - DTLS and RTCP go to the selected address until SRTP or SRTCP has
     arrived, then to the address of the latest fresh SRTP or SRTCP with
-    current consent. After a copy wins a race, sends are back with the
-    publisher at its next packet that arrives before any copy of it;
+    current consent;
+  - a full table of validated addresses evicts one that is neither
+    selected nor sent to: first one that has never delivered fresh media,
+    then the one whose last fresh media is oldest;
   - a connected session ends 30 s after its last fresh SRTP or SRTCP.
 
   So a re-sent check that arrives after its original draws nothing while
   its ID is remembered, and any amount of re-sending, copying or racing
-  draws at most four times what the attacker sent from that address. The
-  bound does not cover an attacker who can drop or delay the publisher's
-  packets (RFC 8445 section 19.2): it can win every race and keep sapflow's
-  sends, PLIs and NACKs among them, away from the publisher, which
-  disrupts delivery, though still not beyond four times what it sends.
+  draws at most four times what the attacker sent from that address.
+  Against an observer that copies and spoofs but cannot drop or delay the
+  publisher's packets, the publisher's address stays validated while it
+  keeps delivering media: pushing it out would take `max_tuples` - 2 other
+  addresses (6 by default) each with fresher media than the publisher's
+  last packet, that many won races or copies of lost packets within one
+  packet interval. Short of that, after a won race or a copy of a lost
+  packet, the publisher loses no media and sends are back with it at its
+  next packet that arrives before any copy of it. The bound does not cover
+  an attacker who wins every race, or drops or delays the publisher's
+  packets (RFC 8445 section 19.2): it can keep them from counting as fresh,
+  push the publisher's address out so its media is dropped until its next
+  check, and keep sapflow's sends, PLIs and NACKs among them, away from
+  the publisher, which disrupts delivery, though still not beyond four
+  times what it sends.
   This is shown in process (W3a); no real browser has yet been seen to
   move pairs mid-handshake.
 
@@ -1044,6 +1056,11 @@ Implementation notes (W3a, 11 November 2026):
       tuple of the latest fresh SRTP or SRTCP with current consent, so
       after a won race they are back with the publisher at its next
       packet (20 ms of audio in the test);
+    - eviction takes a tuple that has never delivered fresh media, then
+      the one with the stalest, never the selected or send tuple. A third
+      review showed that eviction by age alone let forgotten copies push
+      the publisher's tuple out after one copied packet (2 s of its audio
+      dropped in a test, now none);
     - consent is kept per tuple and read for the send tuple;
     - a connected session ends 30 s after its last fresh SRTP or SRTCP.
   - The answer puts the configured candidates in its tagged section and
@@ -1123,6 +1140,10 @@ Implementation notes (W3a, 11 November 2026):
     UDP owner must map each tuple to one session, the one whose check from
     it came last, and must not route by `accepts` alone.
   - Pending-session caps, in total and per address.
+  - A muted video section draws a PLI every second: `sapflow-rtp` asks
+    again every `keyframe_retry` while it waits for an IDR. That case has
+    no test yet; it sits within the per-tuple bound only if the
+    publisher's sender reports and checks keep its tuple's budget up.
   - A publisher's `close_notify` can be lost. DTLS is taken only from the
     selected tuple but sent to the send tuple, so once they differ a
     `close_notify` from the media tuple is dropped. A graceful end should
