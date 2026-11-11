@@ -4,9 +4,12 @@
 //! towards the per-message fragment cap, while duplicates are dropped
 //! without counting; a fragment that disagrees with earlier ones for the
 //! same seq (type, length or epoch) starts one of at most [`MAX_VARIANTS`]
-//! candidates rather than being lost or blocking the real message; and all
-//! messages in progress together hold at most `max_buffered` bytes.
-//! Messages are released strictly in `message_seq` order.
+//! candidates, so while `max_buffered` has room it neither is lost nor
+//! blocks the real message; a candidate over the fragment cap is dropped
+//! when the seq has another; and all messages in progress together hold at
+//! most `max_buffered` bytes. Messages are released strictly in
+//! `message_seq` order, and of several complete candidates the one started
+//! first wins.
 
 /// Candidates kept for one `message_seq`.
 pub(crate) const MAX_VARIANTS: usize = 4;
@@ -133,7 +136,8 @@ impl Reassembler {
             None => {
                 // A fragment that disagrees with an earlier one for this seq
                 // (type, length or epoch) starts a separate candidate, so a
-                // forged first fragment cannot block the real message.
+                // forged first fragment cannot block the real message while
+                // the buffer has room for both.
                 let variants = self.partials.iter().filter(|p| p.seq == f.seq).count();
                 if variants >= MAX_VARIANTS {
                     return Ok(Push::Dropped);
@@ -179,6 +183,14 @@ impl Reassembler {
         // forged duplicates cannot use up the cap.
         p.fragments += 1;
         if p.fragments > max_fragments {
+            let (seq, len) = (p.seq, p.body.len());
+            if self.partials.iter().filter(|q| q.seq == seq).count() > 1 {
+                // One of several candidates for this seq: drop it rather
+                // than end the handshake, so a forged candidate cannot.
+                self.partials.remove(index);
+                self.buffered -= len;
+                return Ok(Push::Dropped);
+            }
             return Err(Error::Limit(Limit::Fragments));
         }
         // `fragments` already checked offset + length against the declared
@@ -198,7 +210,9 @@ impl Reassembler {
             .partials
             .iter()
             .position(|p| p.seq == self.next_seq && p.complete())?;
-        let p = self.partials.swap_remove(i);
+        // `remove`, not `swap_remove`: candidates stay in the order they
+        // were started, so a later forgery cannot overtake an earlier one.
+        let p = self.partials.remove(i);
         self.buffered -= p.body.len();
         let seq = p.seq;
         let mut freed = 0;
@@ -347,6 +361,40 @@ mod tests {
         let mut r = Reassembler::new(LIMITS);
         r.push(0, &frag(0, 100, 0, b"x")).expect("first");
         assert_eq!(r.push(0, &frag(0, 60, 0, b"x")), Ok(Push::Dropped));
+    }
+
+    #[test]
+    fn the_first_started_candidate_wins_after_an_earlier_release() {
+        let mut r = Reassembler::new(LIMITS);
+        r.push(0, &frag(0, 2, 0, b"a")).expect("seq 0");
+        r.push(0, &frag(1, 3, 0, b"abc")).expect("real seq 1");
+        let mut forged = frag(1, 3, 0, b"xyz");
+        forged.msg_type = 2;
+        r.push(0, &forged).expect("forged seq 1");
+        r.push(0, &frag(0, 2, 1, b"b")).expect("seq 0 complete");
+        assert_eq!(r.pop().map(|m| m.seq), Some(0));
+        // Releasing seq 0 must not reorder the seq 1 candidates.
+        let m = r.pop().expect("seq 1");
+        assert_eq!((m.msg_type, m.body.as_slice()), (1, &b"abc"[..]));
+        assert_eq!(r.buffered(), 0);
+    }
+
+    #[test]
+    fn a_candidate_over_the_fragment_cap_is_dropped_when_another_exists() {
+        let mut r = Reassembler::new(LIMITS);
+        r.push(0, &frag(0, 10, 0, b"a")).expect("real");
+        let data = [b'x'; 5];
+        for i in 0..5u32 {
+            let mut forged = frag(0, 10, i, &data[i as usize..=i as usize]);
+            forged.msg_type = 2;
+            let want = if i < 4 { Push::Stored } else { Push::Dropped };
+            assert_eq!(r.push(0, &forged), Ok(want));
+        }
+        assert_eq!(r.buffered(), 10);
+        r.push(0, &frag(0, 10, 1, b"bcdefghij")).expect("real");
+        let m = r.pop().expect("complete");
+        assert_eq!((m.msg_type, m.body.as_slice()), (1, &b"abcdefghij"[..]));
+        assert_eq!(r.buffered(), 0);
     }
 
     #[test]

@@ -517,7 +517,8 @@ impl Client {
             .to_sec1_point(fault == Fault::CompressedPoint);
         let mut encoded = point.as_bytes().to_vec();
         match fault {
-            // y + 1 is never on the curve with y for the same x.
+            // Flipping y's low bit gives y ± 1, which is not on the curve
+            // with this x (outside a negligible case).
             Fault::OffCurvePoint => encoded[64] ^= 1,
             // All ones is above p (p = 2^256 - 2^224 + 2^192 + 2^96 - 1).
             Fault::CoordinateAboveP => encoded[1..33].fill(0xff),

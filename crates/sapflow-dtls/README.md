@@ -70,7 +70,7 @@ if let Some(Event::Connected(c)) = dtls.poll_event() {
 |--------|------|
 | `record` | Record framing, the 48-bit sequence number, epoch 1 AES-128-GCM (explicit nonce read from the wire, 13-byte AAD over the plaintext length) and the 64-record replay window, applied to epoch 1 only |
 | `message` | The handshake header and fragments; parsers for ClientHello (with every extension the profile reads), Certificate, ClientKeyExchange, CertificateVerify and Finished; builders for our flight; negotiation |
-| `reassembly` | Fragment reassembly with caps on message size, coverage-adding fragments per message and bytes buffered, checked before allocation; overlapping and out-of-order fragments; duplicates dropped without counting; a conflicting fragment for the same seq kept as one of at most four candidates rather than blocking the real message |
+| `reassembly` | Fragment reassembly with caps on message size, coverage-adding fragments per message and bytes buffered, checked before allocation; overlapping and out-of-order fragments; duplicates dropped without counting; a conflicting fragment for the same seq kept as one of at most four candidates, so it does not block the real message while the buffer has room; a candidate over the fragment cap dropped when the seq has another; the first-started complete candidate released |
 | `flight` | Our flights kept as plaintext and re-recorded on each send (new sequence numbers and nonces), fragmented to the MTU |
 | `crypto` | The TLS 1.2 PRF, extended master secret, key block, Finished and the RFC 5705 exporter |
 | `identity` | Our certificate, fingerprints, the peer's P-256 key |
