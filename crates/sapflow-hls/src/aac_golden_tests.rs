@@ -3,7 +3,10 @@
 //! Each scenario hashes every byte sapflow serves or records for it: init
 //! segments, parts, segments and playlists. The digests were taken from the
 //! code at 945cb21 (crates 0.2.0-rc.1), before any Opus change, so a
-//! difference here means AAC output changed.
+//! difference here means AAC output changed. The scenarios cover the
+//! unmetered and fragment-quota constructors, TS, elementary video-led and
+//! audio-only input, codec epochs over reconnects, and every init builder.
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -63,14 +66,85 @@ fn ts(bytes: &[u8]) -> String {
     served(ingest.muxer().expect("golden fixture"))
 }
 
+fn quota() -> Arc<sapflow_core::fragment::FragmentQuota> {
+    Arc::new(sapflow_core::fragment::FragmentQuota::new(
+        256 * 1024 * 1024,
+    ))
+}
+
+/// As the server ingests SRT: with a shared fragment budget.
+fn ts_quota(bytes: &[u8]) -> String {
+    let mut ingest = TsIngest::with_fragment_quota(MuxerConfig::default(), quota());
+    for chunk in bytes.chunks(1316) {
+        ingest.push(chunk, NOW).expect("golden fixture");
+    }
+    ingest.finish(NOW).expect("golden fixture");
+    served(ingest.muxer().expect("golden fixture"))
+}
+
+/// Codec epochs: alternating resolutions over reconnects, each resumed on
+/// the retained muxer, which reconfigures its tracks.
+fn epochs() -> String {
+    let portrait = include_bytes!("../tests/fixtures/epoch-portrait.ts");
+    let landscape = include_bytes!("../tests/fixtures/epoch-landscape.ts");
+    let cfg = MuxerConfig {
+        segment_count: 8,
+        ..MuxerConfig::default()
+    };
+    let budget = quota();
+    let mut ingest = TsIngest::with_fragment_quota(cfg, budget.clone());
+    let mut h = Sha256::new();
+    for epoch in 0..4 {
+        let bytes = if epoch % 2 == 0 {
+            portrait.as_slice()
+        } else {
+            landscape.as_slice()
+        };
+        for chunk in bytes.chunks(1316) {
+            ingest.push(chunk, NOW).expect("golden fixture");
+        }
+        let mut held = ingest.take_muxer().expect("golden fixture");
+        h.update(held.interrupt(NOW).segment.to_string());
+        h.update(served(&held));
+        ingest = TsIngest::resume(cfg, held);
+    }
+    hex(h.finalize())
+}
+
+/// An audio-only epoch change: 48 kHz mono, then 44.1 kHz stereo.
+fn audio_only_reconfigure() -> String {
+    let mut m = Muxer::audio_only(MuxerConfig::default(), aac([0x11, 0x88])).expect("AAC");
+    for frame in 0..200i64 {
+        m.push_audio_at(frame * 1920, Bytes::from(vec![frame as u8; 3]), NOW)
+            .expect("AAC");
+    }
+    m.reconfigure_tracks(None, Some(aac([0x12, 0x10])), NOW)
+        .expect("reconfigure");
+    for frame in 0..200i64 {
+        m.push_audio_at(
+            frame * 1024 * 90_000 / 44_100,
+            Bytes::from(vec![frame as u8; 4]),
+            NOW,
+        )
+        .expect("AAC");
+    }
+    m.interrupt(NOW);
+    served(&m)
+}
+
 fn aac(asc: [u8; 2]) -> AacConfig {
     AacConfig::from_audio_specific_config(&asc).expect("golden AAC")
 }
 
-/// Video-led AAC through the elementary API that RTMP uses.
-fn elementary_av() -> String {
+/// Video-led AAC through the elementary API that RTMP uses, with or
+/// without a shared fragment budget.
+fn elementary_av(budget: bool) -> String {
     let video = tests::video();
-    let mut ingest = EsIngest::new(MuxerConfig::default());
+    let mut ingest = if budget {
+        EsIngest::with_fragment_quota(MuxerConfig::default(), quota())
+    } else {
+        EsIngest::new(MuxerConfig::default())
+    };
     ingest.parameter_sets(Some(video.sps.clone()), Some(video.pps.clone()));
     ingest.audio_config(aac([0x11, 0x90]));
     let mut audio = 0i64;
@@ -216,7 +290,18 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
             "audio-44k1-stereo",
             ts(include_bytes!("../tests/fixtures/audio-44k1-stereo.ts")),
         ),
-        ("elementary-av", elementary_av()),
+        ("elementary-av", elementary_av(false)),
+        ("elementary-av-quota", elementary_av(true)),
+        (
+            "testsrc-3s-quota",
+            ts_quota(include_bytes!("../tests/fixtures/testsrc-3s.ts")),
+        ),
+        (
+            "audio-48k-mono-quota",
+            ts_quota(include_bytes!("../tests/fixtures/audio-48k-mono.ts")),
+        ),
+        ("epochs", epochs()),
+        ("audio-only-reconfigure", audio_only_reconfigure()),
         ("elementary-aac-48k", elementary_audio_only([0x11, 0x88])),
         ("elementary-aac-44k1", elementary_audio_only([0x12, 0x10])),
         ("headers", headers()),
@@ -243,6 +328,26 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
             "55c7780d53fe43a12f8f36fe4b5da0dba50826d07b6ae4060c07a89c46cec992",
         ),
         (
+            "elementary-av-quota",
+            "55c7780d53fe43a12f8f36fe4b5da0dba50826d07b6ae4060c07a89c46cec992",
+        ),
+        (
+            "testsrc-3s-quota",
+            "7f06f5617b35055643bb84dda80ba3c7ff75f8d3369c96a23472e33624ebf86a",
+        ),
+        (
+            "audio-48k-mono-quota",
+            "aea38555ff14d01955b9ee0888a7b22bea69e2b626f200750d5ab532fae5617d",
+        ),
+        (
+            "epochs",
+            "f13b9b430c622d135cbc9ba756c867c0890772a47889acfb74874e05785878c8",
+        ),
+        (
+            "audio-only-reconfigure",
+            "83799c6dcf91d61d18fc1f2b9f84f2322c99d5c509b95f7c2e2ffc622b4cb023",
+        ),
+        (
             "elementary-aac-48k",
             "a306e81c6e4fd721a110de3377e8d7f3a29585e4a7f34abbd4fc559ddb9db3e7",
         ),
@@ -258,7 +363,9 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
     for (name, got) in &actual {
         println!("{name}: {got}");
     }
-    for ((name, got), (_, want)) in actual.iter().zip(expected) {
+    assert_eq!(actual.len(), expected.len());
+    for ((name, got), (want_name, want)) in actual.iter().zip(expected) {
+        assert_eq!(*name, want_name);
         assert_eq!(got, want, "{name}: AAC output changed");
     }
 }
