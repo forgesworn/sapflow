@@ -93,8 +93,8 @@ Each stream keeps:
   from the front, declaring what is missing there lost, and a payload
   larger than `max_bytes` is refused.
 - **NACK.** A gap is NACKed after `reorder_delay`, then every RTT and a
-  quarter (at least 5 ms) while an answer can still arrive before the
-  deadline, at most `max_nacks` (4) times. All due numbers for a stream go
+  quarter (at least 5 ms) until the deadline, at most `max_nacks` (4)
+  times. All due numbers for a stream go
   in one NACK, oldest first, and NACK bytes for the whole receiver are held
   to `nack_bitrate` (64 kbit/s) with a `nack_burst` (1500 bytes)
   allowance. RTT starts at 100 ms and is measured from a NACK to the

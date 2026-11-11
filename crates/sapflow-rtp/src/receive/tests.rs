@@ -532,17 +532,8 @@ fn recovered(resend: Resend) {
     let (delay, short) = delays(&c, &drop);
     assert!(!short.is_empty() && delay.len() > short.len());
     let duplicate = duplicates(&c, &drop);
-    // Some retransmissions are lost too, so NACKs repeat. Repeats need an
-    // RTT measured below the assumed 100 ms, so only in the second second.
-    let sent = |k: &(usize, u16)| {
-        let s = if k.0 == 0 { &c.video } else { &c.audio };
-        s.iter().find(|p| p.seq == k.1).map_or(0, |p| p.sent)
-    };
-    let lose_first_resend: HashSet<_> = drop
-        .iter()
-        .copied()
-        .filter(|k| sent(k) > 1_000 * MS)
-        .collect();
+    // Some retransmissions are lost too, so NACKs repeat.
+    let lose_first_resend: HashSet<_> = drop.iter().copied().filter(|k| k.1 % 3 == 0).collect();
     assert!(!lose_first_resend.is_empty());
     let imp = Impairments {
         drop: drop.clone(),

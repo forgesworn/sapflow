@@ -14,8 +14,8 @@
 //!   waits up to the jitter deadline (`SAPFLOW_WHIP_JITTER`, 200 ms by
 //!   default) for a gap, then declares it lost and moves on;
 //! - generic NACKs (RFC 4585 section 6.2.1) for the gaps, after a short
-//!   reorder delay, repeated every RTT and a quarter while an answer can
-//!   still arrive, capped per packet and rate-limited in total. RTT is
+//!   reorder delay, repeated every RTT and a quarter until the jitter
+//!   deadline, capped per packet and rate-limited in total. RTT is
 //!   measured from NACK to retransmission of a packet NACKed once (from
 //!   RTX only, where RTX was negotiated), 100 ms until then;
 //! - retransmissions either on the RTX stream or, as OBS sends them, on the

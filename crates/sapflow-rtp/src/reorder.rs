@@ -397,13 +397,7 @@ impl Reorder {
         let at = if nacks == 0 {
             since.saturating_add(self.s.reorder_delay)
         } else if nacks < self.s.max_nacks {
-            let at = last_nack.saturating_add(retry(rtt));
-            // A repeat whose answer cannot arrive before the deadline is
-            // not worth sending.
-            if at.saturating_add(rtt) >= deadline {
-                return None;
-            }
-            at
+            last_nack.saturating_add(retry(rtt))
         } else {
             return None;
         };
@@ -411,9 +405,8 @@ impl Reorder {
     }
 
     /// The missing packets due a NACK at `now`, oldest first: the first
-    /// after the reorder delay, then repeats every RTT and a quarter, up
-    /// to the per-packet cap and only while an answer can still arrive
-    /// before the jitter deadline.
+    /// after the reorder delay, then repeats every RTT and a quarter until
+    /// the jitter deadline, up to the per-packet cap.
     pub fn due_nacks(&self, now: u64, rtt: u64) -> Vec<u64> {
         if self.missing == 0 {
             return Vec::new();
@@ -577,7 +570,7 @@ mod tests {
         let due = r.due_nacks(30 * MS, rtt);
         assert_eq!(due.len(), 2);
         r.mark_nacked(&due, 30 * MS);
-        // Repeats every 37.5 ms while an answer can still arrive by 220.
+        // Repeats every 37.5 ms until the deadline at 220, at most 4.
         assert_eq!(r.next_nack(rtt), Some(30 * MS + 37_500));
         let mut sent = vec![30 * MS];
         let mut now = 30 * MS;
@@ -607,14 +600,15 @@ mod tests {
                 rtt: Some(25 * MS)
             }
         );
-        // A long RTT: the first NACK still goes, repeats do not.
+        // The assumed 100 ms RTT: a repeat at 135 ms, then the deadline.
         let mut r = Reorder::new(settings());
         put(&mut r, 0, 1);
         put(&mut r, 0, 3);
-        let slow = 150 * MS;
-        assert_eq!(r.due_nacks(10 * MS, slow).len(), 1);
-        r.mark_nacked(&[BASE + 2], 10 * MS);
-        assert_eq!(r.next_nack(slow), None);
+        let assumed = 100 * MS;
+        r.mark_nacked(&r.due_nacks(10 * MS, assumed), 10 * MS);
+        assert_eq!(r.next_nack(assumed), Some(135 * MS));
+        r.mark_nacked(&r.due_nacks(135 * MS, assumed), 135 * MS);
+        assert_eq!(r.next_nack(assumed), None, "260 ms is past the deadline");
     }
 
     #[test]
