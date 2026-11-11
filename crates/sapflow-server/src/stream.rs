@@ -22,7 +22,6 @@ pub struct LiveStream {
     state: Mutex<State>,
     session: Mutex<Session>,
     version: watch::Sender<u64>,
-    pub(crate) http_notifications: crate::own_http::StreamNotifications,
     fragments: Arc<sapflow_core::fragment::FragmentQuota>,
     // Drop after cached state and session: reservation follows the final stream
     // owner, including publications, grace tasks and parked viewer requests.
@@ -265,12 +264,6 @@ impl State {
 }
 
 impl LiveStream {
-    /// Identity of this exact presentation, kept alive by every HTTP waiter.
-    /// Workers unsubscribe and clear queued identities before dropping it.
-    pub(crate) fn http_key(&self) -> usize {
-        std::ptr::from_ref(self).addr()
-    }
-
     fn new(
         path: StreamPath,
         cfg: MuxerConfig,
@@ -301,7 +294,6 @@ impl LiveStream {
                 clean_close: None,
             }),
             version: watch::Sender::new(0),
-            http_notifications: crate::own_http::StreamNotifications::default(),
             fragments,
             _presentation_permit: presentation_permit,
         }
@@ -420,7 +412,7 @@ impl LiveStream {
         let ready = Self::render(&mut st);
         drop(st);
         self.version.send_modify(|v| *v += 1);
-        self.http_notifications.notify(self.http_key());
+        crate::own_http::notify();
         Ok(Applied {
             ready,
             restarted: update.restarted,
@@ -494,7 +486,7 @@ impl LiveStream {
             recorder.feed(tracks, parts);
         }
         self.version.send_modify(|v| *v += 1);
-        self.http_notifications.notify(self.http_key());
+        crate::own_http::notify();
     }
 
     /// The init segment and every finished part after `after`, for the
@@ -530,7 +522,7 @@ impl LiveStream {
             state.multivariant = None;
         }
         self.version.send_modify(|v| *v += 1);
-        self.http_notifications.notify(self.http_key());
+        crate::own_http::notify();
     }
 }
 

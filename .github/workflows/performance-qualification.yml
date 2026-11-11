@@ -1,22 +1,6 @@
 name: Performance qualification
 
 on:
-  push:
-    branches: [perf/http-srt-efficiency-20261111]
-    paths:
-      - 'crates/sapflow-server/**'
-      - 'crates/sapflow-srt/**'
-      - 'crates/sapflow-bench/**'
-      - 'scripts/compare-http-efficiency.py'
-      - 'scripts/qualify-srt-gap.py'
-      - 'scripts/build-http-comparison.sh'
-      - 'tests/test_http_efficiency.py'
-      - 'tests/test_qualify_srt_gap.py'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - '.github/workflows/performance-qualification.yml'
-      - 'docs/performance-qualification-2026-11-11.md'
   workflow_dispatch:
     inputs:
       baseline:

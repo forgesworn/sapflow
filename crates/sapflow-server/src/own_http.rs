@@ -9,8 +9,8 @@
 //! Each worker thread owns a poller and the connections it accepts from a
 //! shared listener. Requests that must wait (blocking playlist reload, the
 //! preload-hinted part) park on their connection. A stream change wakes
-//! only workers subscribed to that stream, which re-check its parked requests.
-//! Request framing is `http1.rs`.
+//! every worker ([`notify`]), and each re-checks the parked requests whose
+//! stream changed. Request framing is `http1.rs`.
 //!
 //! Limits:
 //! - At most [`MAX_CONNECTIONS`] connections; past it, new ones wait in the
@@ -29,8 +29,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, IoSlice, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -43,11 +43,6 @@ use crate::App;
 use crate::http1::{self, Method, Parsed, Persist};
 use crate::media_body::MediaBody;
 use crate::stream::LiveStream;
-
-#[path = "own_http_notify.rs"]
-mod notify;
-pub(crate) use notify::StreamNotifications;
-use notify::WorkerWake;
 
 const LISTENER: Token = Token(0);
 const WAKE: Token = Token(1);
@@ -80,6 +75,19 @@ const SWEEP: Duration = Duration::from_millis(250);
 pub const SLOW_CLOSE_LOGS: u32 = 10;
 
 static OPEN: AtomicUsize = AtomicUsize::new(0);
+/// Every worker's waker, so a stream change reaches every parked request.
+static WAKERS: Mutex<Vec<Arc<Waker>>> = Mutex::new(Vec::new());
+
+/// Wakes every worker to re-check its parked requests. Called after every
+/// stream change; a no-op unless this event loop is running.
+pub fn notify() {
+    if let Ok(wakers) = WAKERS.lock() {
+        for w in wakers.iter() {
+            let _ = w.wake();
+        }
+    }
+}
+
 /// The timeouts, separate so tests can shorten them.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
@@ -330,23 +338,13 @@ enum Turn {
     Close,
 }
 
-struct WaitingStream {
-    stream: Arc<LiveStream>,
-    connections: HashSet<usize>,
-}
-
 struct Worker {
     app: Arc<App>,
     poll: Poll,
     listener: TcpListener,
     timeouts: Timeouts,
     conns: HashMap<usize, (Conn, Slot)>,
-    /// Each parked connection belongs to one exact presentation.
-    parked: HashMap<usize, usize>,
-    waiting: HashMap<usize, WaitingStream>,
-    wake: Arc<WorkerWake>,
-    changed: HashSet<usize>,
-    woken: Vec<usize>,
+    parked: HashSet<usize>,
     /// Connections with work left over from their last turn.
     ready: VecDeque<usize>,
     next: usize,
@@ -366,18 +364,17 @@ impl Worker {
         let mut listener = TcpListener::from_std(listener);
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
-        let wake = Arc::new(WorkerWake::new(Waker::new(poll.registry(), WAKE)?));
+        let waker = Arc::new(Waker::new(poll.registry(), WAKE)?);
+        if let Ok(mut w) = WAKERS.lock() {
+            w.push(waker);
+        }
         Ok(Self {
             app,
             poll,
             listener,
             timeouts,
             conns: HashMap::new(),
-            parked: HashMap::new(),
-            waiting: HashMap::new(),
-            wake,
-            changed: HashSet::new(),
-            woken: Vec::new(),
+            parked: HashSet::new(),
             ready: VecDeque::new(),
             next: 2,
             accept_more: false,
@@ -437,75 +434,21 @@ impl Worker {
         }
     }
 
-    /// Re-check only waiters on changed streams; unrelated parked requests do
-    /// not require a connection lookup or a version read.
+    /// Re-checks the parked requests whose stream has changed.
     fn wake_parked(&mut self) {
-        let mut ids = std::mem::take(&mut self.woken);
-        self.collect_woken(&mut ids);
-        for id in ids.drain(..) {
-            self.service(id, false);
-        }
-        self.woken = ids;
-    }
-
-    fn collect_woken(&mut self, ids: &mut Vec<usize>) {
-        self.wake.take_into(&mut self.changed);
-        for key in self.changed.drain() {
-            let Some(waiting) = self.waiting.get(&key) else {
-                continue;
-            };
-            let version = waiting.stream.version();
-            ids.extend(waiting.connections.iter().copied().filter(|id| {
+        let ids: Vec<usize> = self
+            .parked
+            .iter()
+            .copied()
+            .filter(|id| {
                 self.conns
                     .get(id)
                     .and_then(|(c, _)| c.parked.as_ref())
-                    .is_some_and(|p| version != p.seen)
-            }));
-        }
-    }
-
-    fn park(&mut self, id: usize, stream: Arc<LiveStream>, seen: u64) {
-        let key = stream.http_key();
-        if self.parked.get(&id) != Some(&key) {
-            self.unpark(id);
-            self.parked.insert(id, key);
-            self.waiting
-                .entry(key)
-                .or_insert_with(|| {
-                    stream.http_notifications.subscribe(&self.wake);
-                    WaitingStream {
-                        stream: stream.clone(),
-                        connections: HashSet::new(),
-                    }
-                })
-                .connections
-                .insert(id);
-        }
-        // A publish between answer() and subscribe() had no listener to wake.
-        // Subscribe first, then recheck, so either this test or notify catches
-        // it. Keep the earlier version until drive has checked availability.
-        if stream.version() != seen {
-            self.wake.changed(key);
-        }
-    }
-
-    fn unpark(&mut self, id: usize) {
-        let Some(key) = self.parked.remove(&id) else {
-            return;
-        };
-        if let Some(waiting) = self.waiting.get_mut(&key) {
-            waiting.connections.remove(&id);
-            if waiting.connections.is_empty() {
-                waiting
-                    .stream
-                    .http_notifications
-                    .unsubscribe(&self.wake, key);
-                self.waiting.remove(&key);
-            } else if waiting.connections.len() < waiting.connections.capacity() / 4 {
-                // Viewers can migrate between live streams. Do not leave each
-                // surviving group retaining its own historical audience peak.
-                waiting.connections.shrink_to(waiting.connections.len() * 2);
-            }
+                    .is_some_and(|p| stream_of(&p.request).version() != p.seen)
+            })
+            .collect();
+        for id in ids {
+            self.service(id, false);
         }
     }
 
@@ -633,7 +576,7 @@ impl Worker {
     }
 
     fn close(&mut self, id: usize) {
-        self.unpark(id);
+        self.parked.remove(&id);
         if let Some((mut c, _slot)) = self.conns.remove(&id) {
             let _ = self.poll.registry().deregister(&mut c.sock);
         }
@@ -656,10 +599,7 @@ impl Worker {
             Ok(Turn::Close)
         })
         .unwrap_or(Turn::Close);
-        let parked = conn
-            .parked
-            .as_ref()
-            .map(|p| (stream_arc(&p.request).clone(), p.seen));
+        let parked = conn.parked.is_some();
         let deadline = conn.output.expired(Instant::now(), body_timeout);
         match turn {
             Turn::Close => {
@@ -669,24 +609,15 @@ impl Worker {
                 self.close(id);
             }
             Turn::Again => {
-                self.unpark(id);
+                self.parked.remove(&id);
                 self.ready.push_back(id);
             }
-            Turn::Idle => match parked {
-                Some((stream, seen)) => self.park(id, stream, seen),
-                None => self.unpark(id),
-            },
-        }
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        for (key, waiting) in &self.waiting {
-            waiting
-                .stream
-                .http_notifications
-                .unsubscribe(&self.wake, *key);
+            Turn::Idle if parked => {
+                self.parked.insert(id);
+            }
+            Turn::Idle => {
+                self.parked.remove(&id);
+            }
         }
     }
 }
@@ -873,10 +804,6 @@ fn flush(conn: &mut Conn, body_timeout: Duration) -> io::Result<bool> {
 }
 
 fn stream_of(r: &Request) -> &LiveStream {
-    stream_arc(r)
-}
-
-fn stream_arc(r: &Request) -> &Arc<LiveStream> {
     match r {
         Request::Multivariant(s) => s,
         Request::Media { stream, .. } | Request::Chunk { stream, .. } => stream,

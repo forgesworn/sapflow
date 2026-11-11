@@ -349,12 +349,12 @@ fn parked_waiting_is_excluded_and_head_releases_media_without_a_body_transfer() 
     let conn = &mut worker.conns.get_mut(&id).expect("connection").0;
     conn.last_progress = now;
     conn.parked = Some(Parked {
-        request: Request::Multivariant(stream.clone()),
+        request: Request::Multivariant(stream),
         head_only: false,
         deadline: now + Duration::from_secs(1),
         seen,
     });
-    worker.park(id, stream, seen);
+    worker.parked.insert(id);
     let ready = now + duration * 5;
     worker.sweep(ready);
     assert!(
@@ -362,9 +362,9 @@ fn parked_waiting_is_excluded_and_head_releases_media_without_a_body_transfer() 
         "ready-response deadline does not consume parked LL-HLS waiting"
     );
     let (quota, data, _) = charged_body();
-    worker.unpark(id);
     let conn = &mut worker.conns.get_mut(&id).expect("parked connection").0;
     conn.parked = None;
+    worker.parked.remove(&id);
     respond(
         conn,
         Response::ok(data, "video/mp4", CHUNK_CACHE),

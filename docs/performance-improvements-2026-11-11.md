@@ -1,5 +1,10 @@
 # HTTP and SRT efficiency, 11 November 2026
 
+This document records the initial shared-Mac screening. The later
+[Linux qualification and adoption decisions](performance-qualification-results-2026-11-11.md)
+supersede its provisional conclusions where explicitly stated; all original
+measurements below remain unchanged.
+
 This work starts from `fa16f09112d92cf1db3fe04a9461e0feb0238bcd`.
 It preserves the HTTP and SRT contracts, playback defaults and admission limits.
 No deployed service, physical device, publishing route or media quality setting
