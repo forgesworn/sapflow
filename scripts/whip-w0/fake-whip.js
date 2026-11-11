@@ -13,6 +13,7 @@ const { execFileSync } = require('node:child_process');
 const stun = require('./stun.js');
 const { buildAnswer } = require('./sdp.js');
 const { startRelay } = require('./l4-relay.js');
+const ports = require('./ports.js');
 
 function makeCert(dir) {
   const key = path.join(dir, 'key.pem'), crt = path.join(dir, 'cert.pem');
@@ -23,13 +24,13 @@ function makeCert(dir) {
 
 // Start the endpoint. mode: 'udp' or 'tcp'. outDir receives raw captures.
 async function start({ mode = 'udp', host, advertise, httpPort = 0, udpPort = 0, relayPort = 443, outDir, label = mode,
-  pagesDir = path.join(__dirname, 'pages'), transportCc = false, opusFmtp = 'stereo=1;maxaveragebitrate=128000;usedtx=0' }) {
+  pagesDir = path.join(__dirname, 'pages'), transportCc = false, range = null, opusFmtp = 'stereo=1;maxaveragebitrate=128000;usedtx=0' }) {
   fs.mkdirSync(outDir, { recursive: true });
   const fingerprint = makeCert(outDir);
   const ufrag = crypto.randomBytes(4).toString('hex'), pwd = crypto.randomBytes(16).toString('hex');
   const key = Buffer.from(pwd);
   const ev = { label, mode, stun: { requests: 0, valid: 0, badIntegrity: 0, noFingerprint: 0, attrs: {}, useCandidate: 0, controlling: 0, controlled: 0, tuples: 0 },
-    dtls: { datagrams: 0, firstTransport: null, firstLength: null }, tcpConnections: 0, other: 0, loadStart: os.loadavg(), results: [], done: false };
+    dtls: { datagrams: 0, firstTransport: null, firstLength: null }, tcpConnections: 0, whipRequests: [], other: 0, loadStart: os.loadavg(), results: [], done: false };
   const seenTuples = new Set(), dtlsSeen = new Set(), dtlsKept = [];
   let finish = () => {};
   const donePromise = new Promise((r) => { finish = r; });
@@ -77,8 +78,7 @@ async function start({ mode = 'udp', host, advertise, httpPort = 0, udpPort = 0,
   // UDP
   const udp = dgram.createSocket('udp4');
   udp.on('message', (b, r) => handle(b, r, 'udp', (out) => udp.send(out, r.port, r.address)));
-  await new Promise((r) => udp.bind(udpPort, '0.0.0.0', r));
-  const udpP = udp.address().port;
+  const udpP = await ports.bindUdp(udp, '0.0.0.0', range, udpPort);
 
   // TCP with RFC 4571 framing (2-byte length, then the packet), behind the relay.
   let tcpSrv = null, relay = null, tcpPort = 0;
@@ -96,8 +96,7 @@ async function start({ mode = 'udp', host, advertise, httpPort = 0, udpPort = 0,
       });
       sock.on('error', () => {});
     });
-    await new Promise((r) => tcpSrv.listen(0, '127.0.0.1', r));
-    const backend = tcpSrv.address().port;
+    const backend = await ports.listenTcp(tcpSrv, '127.0.0.1', range);
     try {
       relay = await startRelay({ listenHost: relayPort < 1024 ? '0.0.0.0' : host, listenPort: relayPort, targetHost: '127.0.0.1', targetPort: backend, onConnection: () => { ev.tcpConnections++; } });
     } catch (e) {
@@ -119,6 +118,8 @@ async function start({ mode = 'udp', host, advertise, httpPort = 0, udpPort = 0,
     req.on('end', () => {
       const body = Buffer.concat(chunks);
       if (req.method === 'POST' && url.pathname === '/whip') {
+        // Record that a bearer token arrived (scheme only, never the value) and which headers a client sent.
+        ev.whipRequests.push({ authScheme: (req.headers.authorization || '').split(' ')[0] || null, contentType: req.headers['content-type'] || null, userAgent: req.headers['user-agent'] || null, headerNames: Object.keys(req.headers).sort() });
         if (!(req.headers['content-type'] || '').startsWith('application/sdp')) { res.writeHead(415).end(); return; }
         const lbl = url.searchParams.get('label') || label;
         fs.writeFileSync(path.join(outDir, `${lbl}-offer.sdp`), body);
@@ -126,7 +127,8 @@ async function start({ mode = 'udp', host, advertise, httpPort = 0, udpPort = 0,
         fs.writeFileSync(path.join(outDir, `${lbl}-answer.sdp`), a.sdp);
         res.writeHead(201, { 'Content-Type': 'application/sdp', Location: '/whip/1', 'Access-Control-Expose-Headers': 'Location' });
         res.end(a.sdp);
-      } else if (req.method === 'DELETE') { res.writeHead(200).end();
+      } else if (req.method === 'DELETE') { ev.whipDelete = (ev.whipDelete || 0) + 1; res.writeHead(200).end();
+      } else if (req.method === 'PATCH') { ev.whipPatch = (ev.whipPatch || 0) + 1; ev.whipPatchTypes = [...new Set([...(ev.whipPatchTypes || []), req.headers['content-type'] || ''])]; res.writeHead(204).end();
       } else if (req.method === 'POST' && url.pathname.startsWith('/result/')) {
         const n = path.basename(url.pathname);
         fs.writeFileSync(path.join(outDir, n), body);
@@ -140,10 +142,10 @@ async function start({ mode = 'udp', host, advertise, httpPort = 0, udpPort = 0,
       } else res.writeHead(404).end();
     });
   });
-  await new Promise((r) => server.listen(httpPort, '127.0.0.1', r));
+  const httpBound = await ports.listenTcp(server, '127.0.0.1', range, httpPort);
 
   return {
-    httpPort: server.address().port, udpPort: udpP, tcpPort, ev, done: donePromise,
+    httpPort: httpBound, udpPort: udpP, tcpPort, ev, done: donePromise,
     close() {
       ev.loadEnd = os.loadavg();
       fs.writeFileSync(path.join(outDir, `${label}-events.json`), JSON.stringify(ev, null, 2));

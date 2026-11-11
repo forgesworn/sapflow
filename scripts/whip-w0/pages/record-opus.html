@@ -1,0 +1,32 @@
+<!doctype html><meta charset="utf-8"><title>W0 record Opus</title>
+<script>
+// A0.2 asset source: 20 s of stereo Opus from MediaRecorder (audio/webm;codecs=opus).
+// A stereo WebAudio source, 440 Hz on the left and 880 Hz on the right, at 0.3 gain.
+const q = new URLSearchParams(location.search);
+const SECONDS = +(q.get('seconds') || 20);
+const post = (name, body) => fetch('/result/' + name, { method: 'POST', body });
+(async () => {
+  const info = { userAgent: navigator.userAgent, seconds: SECONDS, errors: [] };
+  try {
+    const ac = new AudioContext(), merger = ac.createChannelMerger(2), dest = ac.createMediaStreamDestination();
+    dest.channelCount = 2; dest.channelCountMode = 'explicit'; dest.channelInterpretation = 'discrete';
+    [440, 880].forEach((f, ch) => { const o = ac.createOscillator(); o.frequency.value = f; const g = ac.createGain(); g.gain.value = 0.3; o.connect(g); g.connect(merger, 0, ch); o.start(); });
+    merger.connect(dest);
+    await ac.resume();
+    info.mimeSupported = MediaRecorder.isTypeSupported('audio/webm;codecs=opus');
+    const rec = new MediaRecorder(dest.stream, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 128000 });
+    const chunks = [];
+    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    const stopped = new Promise((r) => { rec.onstop = r; });
+    rec.start(1000);
+    await new Promise((r) => setTimeout(r, SECONDS * 1000));
+    rec.stop(); await stopped;
+    info.mimeType = rec.mimeType; info.audioBitsPerSecond = rec.audioBitsPerSecond;
+    const blob = new Blob(chunks, { type: rec.mimeType });
+    info.bytes = blob.size;
+    await post('opus-20s.webm', blob);
+  } catch (e) { info.errors.push(String(e && e.stack || e)); }
+  await post('record-opus.json', JSON.stringify(info, null, 1));
+  await fetch('/done', { method: 'POST' });
+})();
+</script>

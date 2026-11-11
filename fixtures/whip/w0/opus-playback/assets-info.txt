@@ -1,0 +1,65 @@
+== ffprobe, init segments and recording (codec, channels, initial_padding = Opus pre-skip, sample_rate)
+-- ~/whip-w0-assets/av/init.mp4
+codec_name=h264
+profile=unknown
+codec_tag_string=avc1
+codec_name=opus
+profile=unknown
+codec_tag_string=Opus
+sample_rate=48000
+channels=2
+channel_layout=stereo
+initial_padding=0
+-- ~/whip-w0-assets/audio/init.mp4
+codec_name=opus
+profile=unknown
+codec_tag_string=Opus
+sample_rate=48000
+channels=2
+channel_layout=stereo
+initial_padding=0
+-- ~/whip-w0-assets/recording/recording.mp4
+codec_name=h264
+profile=Main
+codec_tag_string=avc1
+codec_name=opus
+profile=unknown
+codec_tag_string=Opus
+sample_rate=48000
+channels=2
+channel_layout=stereo
+initial_padding=0
+== dOps box bytes from the init segment (version, channels, pre-skip BE16, input rate BE32, gain BE16, mapping family)
+-- ~/whip-w0-assets/av/init.mp4
+644f7073000200000000bb800000000000
+-- ~/whip-w0-assets/audio/init.mp4
+644f7073000200000000bb800000000000
+-- ~/whip-w0-assets/av-preskip312/init.mp4
+644f7073000201380000bb800000000000
+== master playlists
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-STREAM-INF:BANDWIDTH=3264608,AVERAGE-BANDWIDTH=3180463,RESOLUTION=1280x720,CODECS="avc1.4d401f,opus"
+stream_0.m3u8
+
+
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-STREAM-INF:BANDWIDTH=129217,AVERAGE-BANDWIDTH=129052,CODECS="opus"
+stream_0.m3u8
+
+== segments
+init.mp4
+master.m3u8
+seg_000.m4s
+seg_001.m4s
+      13
+{
+ "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/157.0.0.0 Safari/537.36",
+ "seconds": 20,
+ "errors": [],
+ "mimeSupported": true,
+ "mimeType": "audio/webm;codecs=opus",
+ "audioBitsPerSecond": 128000,
+ "bytes": 319245
+}

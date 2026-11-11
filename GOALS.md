@@ -516,7 +516,10 @@ installed-release acceptance remain open under [LQ1 to LQ8](docs/library-quality
   wire observation only, with other WebRTC, DTLS and SRTP implementations run
   only as black boxes. It stays off by default until its fuzz, interoperability
   and independent-review gates pass. Design and gates:
-  [whip-ingest.md](docs/whip-ingest.md).
+  [whip-ingest.md](docs/whip-ingest.md). WHIP audio stays Opus and sapflow
+  does not transcode it. Apple's native HLS players did not decode Opus in
+  W0, so a deployment with Apple viewers converts the audio to AAC
+  downstream (user's decision, the same day).
 
 ## Decisions owed by the user
 

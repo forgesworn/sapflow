@@ -195,9 +195,33 @@ What Sapflow does with it:
   `SRTP_AES128_CM_HMAC_SHA1_80`. RFC 5764 lets the server choose from the
   client's list. `SRTP_AEAD_AES_256_GCM` is not in v1.
 
+OBS 32.0.4 ([evidence](whip-evidence/w0-firefox-safari-obs-2026-11-10.md))
+sends a 342-byte, single-datagram ClientHello. It differs from Chrome's in
+these ways:
+
+- DTLS 1.2 only.
+- `use_srtp` offers only `SRTP_AES128_CM_HMAC_SHA1_80`.
+- `ecdsa_secp256r1_sha256` is fifth of six signature algorithms.
+- No `renegotiation_info` extension, only the
+  `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` value. Sapflow treats either as the
+  RFC 5746 signal.
+
+Firefox 160's offer is captured. Its ClientHello is not yet, because no ICE
+check reached the test endpoint from the test host (see the evidence).
+
+Safari 26.6 on macOS and Safari on iOS 27 send small single-datagram
+ClientHellos: 153 and 216 bytes. Both are DTLS 1.2 only, with no hybrid
+group. Safari on macOS lists the same `use_srtp` profiles as Chrome. Both
+offer H.264 High (`640c1f`) first, and the iOS offer has no Baseline. Both
+list video before audio, and their Opus offer has no `stereo=1`, which the
+answer adds.
+
 The FFmpeg 8.1 WHIP muxer, used only as a reference client, offers
 `a=setup:passive` by default. Sapflow refuses that. With
 `-whip_flags dtls_active` it offers `active` and fits.
+
+For every target:
+
 - A peer certificate with a P-256 key, accepted only if its SHA-256 matches
   the offer's `a=fingerprint` (RFC 8122). Certificate dates and issuers are
   not checked, as in WebRTC generally.
@@ -222,11 +246,22 @@ scope.
 
 The offer is accepted only if it has:
 
-- one BUNDLE group covering every accepted media section;
+- one BUNDLE group covering every accepted media section. Other group
+  semantics, such as OBS's `a=group:LS`, are ignored;
 - `a=mid` on each section, `a=rtcp-mux`, `a=ice-ufrag` and `a=ice-pwd`, and
   a `sha-256` fingerprint;
 - `a=setup:actpass` or `a=setup:active`;
 - no `a=ice-lite` of its own, because two lite agents cannot connect.
+
+Parsing rules:
+
+- **Session level or per section.** ICE credentials, the fingerprint, the
+  setup role and the direction may be given at session level, as OBS and
+  Firefox do, or per section. A section's own value wins (RFC 8866).
+- **Extension directions.** `a=extmap` lines may carry a direction suffix
+  (`a=extmap:<id>/<direction>`), as Firefox's do.
+- **No candidates needed.** An offer may carry no candidates at all, as
+  OBS's does. Sapflow needs none (see [Connectivity](#connectivity)).
 
 The answer is built as follows:
 
@@ -396,7 +431,10 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   checks to a public-range address on 443. A public deployment advertises a
   public address, so 443 is expected to work, but A0.3 stays open until a
   run against a public address on 443 succeeds. Local tests use a port of
-  1024 or above.
+  1024 or above. Safari on macOS also connected over ICE-TCP in W0.
+  Vanadium, a hardened Chromium on Android, gathered no UDP candidates at
+  all and connected only over TCP. For such a browser, TCP is the only
+  route, not a fallback.
 - **Roles.** A lite agent is always the controlled one (RFC 8445 section
   6.1.1) and cannot switch. A request carrying ICE-CONTROLLED is answered
   with `487 Role Conflict`, so the full agent takes the controlling role
@@ -408,6 +446,8 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   encoder timing out does today.
 - **Limits of TCP 443.** A network that only lets real TLS through on 443
   will block ICE-TCP framing. RTMPS remains the route for those networks.
+  OBS 32 made no TCP connection to a passive candidate in W0, so OBS on a
+  network that blocks UDP uses RTMPS.
   Media over TCP also stalls behind each lost segment, so it is the fallback,
   not the default.
 - **No TURN.** Sapflow neither runs nor configures TURN. A deployment may
@@ -448,8 +488,10 @@ means:
   - input sample rate 48 000;
   - output gain 0;
   - channel mapping family 0;
-  - pre-skip 312 (the usual encoder lookahead at 48 kHz). A0.2 checks that
-    this value plays cleanly, and the value changes if it does not.
+  - pre-skip 0 (provisional). Chrome's own recorder writes 0. In W0, a
+    312 asset clicked twice at the start in Firefox with hls.js, in four of
+    four runs, and the 0 assets never did. The cause is unknown. Safari gave
+    no comparison (see below). W3 rechecks with sapflow's own packaging.
 - No gaps in the audio track. A gap in RTP timestamps with no gap in sequence
   numbers is the sender's silence suppression (DTX). A gap in sequence
   numbers that NACK did not recover is loss. Both are filled with a constant
@@ -461,14 +503,30 @@ means:
 - `sapflow-client` and `sapflow-ffi` keep AAC. The native SDK does not publish
   over WebRTC.
 
-Transcoding Opus to AAC inside sapflow was considered and rejected. It would
-bring an Opus decoder and an AAC encoder into the server, against the
-no-transcoding goal. A deployment whose players cannot take Opus can
-transcode downstream.
+**Apple players do not decode it.** W0 played Opus in fMP4 HLS, packaged by
+FFmpeg as a stand-in for sapflow, in every target player:
 
-Whether every target player decodes Opus in fMP4 LL-HLS is tested in W0, not
-assumed. The results decide what a deployment needs downstream, not what
-sapflow sends.
+| Player | Opus in fMP4 HLS | Opus in plain fragmented MP4 |
+|---|---|---|
+| Chrome 157 and Firefox 160, hls.js 1.7.4 | Plays and decodes | Plays |
+| Vanadium on Android, hls.js 1.7.4 | Plays and decodes | Plays |
+| Safari 26.6 on macOS, native HLS | `MEDIA_ERR_DECODE` | Plays, both channels |
+| Safari on iOS 27, native HLS | `MEDIA_ERR_DECODE` | Plays (muted, decode not shown) |
+| Safari 26.6 on macOS, hls.js 1.7.4 | Time advances, audio not shown | |
+
+Safari also reports `audio/mp4; codecs="opus"` as unsupported to Media
+Source Extensions. The test did not separate Opus in HLS from FFmpeg's
+playlist and init segment, so W3 repeats it with sapflow's own packaging.
+Until then, a WHIP stream's LL-HLS is treated as unplayable on Apple's
+players.
+
+**Decision (user, 10 November 2026): sapflow keeps Opus and does not
+transcode.** Transcoding Opus to AAC inside sapflow was considered and
+rejected again with this evidence. It would bring an Opus decoder and an AAC
+encoder into the server, against the no-transcoding goal. A deployment with
+Apple viewers converts the audio to AAC downstream, before players see it.
+The README and [comparison.md](comparison.md) say so when WHIP ships. If WHIP
+is wanted without a downstream converter, this decision is revisited.
 
 ### One timeline
 
@@ -493,7 +551,7 @@ Browsers send a keyframe when asked, not on a schedule. `TargetDuration` and
   (proposed 2 s), sending PLI (or FIR where only FIR is negotiated). That keeps
   segments near the target that was fixed from the first one.
 - A sender may not act on keyframe requests. Whether OBS does is checked in
-  A0.6. Until it is shown to, OBS guidance sets its own keyframe interval to
+  A3.10. OBS's offer has no `ccm fir`, so only PLI is used with it. Until it is shown to, OBS guidance sets its own keyframe interval to
   match.
 
 ### Format changes
@@ -508,7 +566,8 @@ publish from a browser should hold resolution and let frame rate drop instead
 
 - Gaps trigger NACKs, repeated within a bounded wait (`SAPFLOW_WHIP_JITTER`,
   proposed 200 ms). Retransmissions arrive on the RTX stream and are
-  unwrapped. Round-trip time is estimated from NACK to retransmission, with
+  unwrapped. A sender that negotiated no RTX, such as OBS, resends on the
+  original SSRC and sequence number. The reorder buffer takes either. Round-trip time is estimated from NACK to retransmission, with
   100 ms assumed until measured.
 - A frame still incomplete after the wait is dropped, along with every frame
   until the next keyframe. A PLI is sent at once. The loss is reported through
@@ -532,8 +591,9 @@ control feedback (`transport-cc`, draft-holmer-rmcat-transport-wide-cc-extension
   at a fixed cadence (proposed every 50 ms), recording each packet's arrival
   time. The sender runs the estimate, so sapflow does no rate estimation of
   its own.
-- REMB is not planned unless W0 shows a target that needs it and cannot use
-  `transport-cc`.
+- REMB is not planned unless a target needs it and cannot use
+  `transport-cc`. OBS 32 offers REMB and not `transport-cc`. Whether OBS
+  changes its rate on feedback at all is checked in A3.10.
 
 Provisional result: desktop Chrome 157, in-page loopback, with receiver
 reports still present.
@@ -688,9 +748,8 @@ instead of observed.
   series per target. This decides whether `transport-cc` is in v1.
 - **A0.5 Missing H.264.** Record which targets, if any, offer no H.264.
   Evidence: their offers.
-- **A0.6 OBS keyframes.** Record whether OBS's WHIP output answers PLI and FIR
-  with a keyframe. Evidence: keyframe arrival times after requests sent at
-  known times.
+- **A0.6** moved to W3 as A3.10, because it needs a receiver that completes
+  DTLS.
 - **A0.7 Opus parameters.** Record whether each browser target honours
   `stereo=1`, `maxaveragebitrate` and `usedtx=0`. Evidence: the TOC stereo
   flag and bitrate of received packets.
@@ -771,6 +830,11 @@ instead of observed.
   click and a flash at known times produces HLS whose audio is no more than
   40 ms early or 60 ms late against the video (the EBU R37 range).
 - **A3.9 Smoke.** `scripts/smoke.sh` covers WHIP alongside SRT and RTMP.
+- **A3.10 OBS keyframes and rate.**
+  - Record whether OBS's WHIP output answers PLI with a keyframe, and whether
+    it changes its sending rate on REMB or receiver reports.
+  - Evidence: keyframe arrival times after requests sent at known times, and
+    the rate series.
 
 ### W4: qualification
 
@@ -812,5 +876,6 @@ they describe what ships.
 | Default `SAPFLOW_WHIP_JITTER` | A4.1 |
 | RustCrypto or `ring` | A4.2 |
 | Accepting another video codec for phones without H.264 | A0.5, and would need transcoding downstream |
+| Opus to AAC inside sapflow | Decided no (10 November 2026). Revisit if WHIP is used without a downstream converter |
 | ICE restart via `PATCH` | Physical results in A4.3 |
 | Defaults for `SAPFLOW_WHIP_STALE` and `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | A3.3, A0.7 and A4.3 |

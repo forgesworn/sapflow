@@ -11,7 +11,8 @@ function summarise(text) {
   L.push(`session: ${g || 'no BUNDLE group'}; ice-lite=${o.session.includes('a=ice-lite') ? 'yes' : 'no'}`);
   for (const s of o.sections) {
     L.push(`${s.kind} section: mid=${s.mid} direction=${s.dir} proto=${s.proto}`);
-    const has = (p) => s.lines.filter((l) => l.startsWith(p)).map((l) => l.slice(p.length));
+    // setup, fingerprint, ice-options and credentials may sit at session level (Firefox and OBS do): read both.
+    const has = (p) => s.lines.concat(o.session).filter((l) => l.startsWith(p)).map((l) => l.slice(p.length));
     L.push(`  setup=${has('a=setup:').join(',') || 'absent'} rtcp-mux=${s.lines.includes('a=rtcp-mux') ? 'yes' : 'no'} fingerprint=${has('a=fingerprint:').map((f) => f.split(' ')[0]).join(',') || 'absent'} ice-options=${has('a=ice-options:').join(',') || 'absent'}`);
     const cands = s.lines.filter((l) => l.startsWith('a=candidate:')).map((l) => {
       const p = l.split(' ');

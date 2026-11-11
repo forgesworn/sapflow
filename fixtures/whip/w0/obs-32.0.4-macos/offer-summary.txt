@@ -1,0 +1,17 @@
+session: a=group:BUNDLE 0 1; ice-lite=no
+audio section: mid=0 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=actpass rtcp-mux=yes fingerprint=sha-256 ice-options=ice2,trickle
+  candidates: none
+  ssrc lines: 2, ssrc-group: none
+  header extensions: none
+  payloads in offer order:
+    111 opus/48000/2  fmtp: minptime=10;maxaveragebitrate=96000;stereo=1;sprop-stereo=1;useinbandfec=1
+video section: mid=1 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=actpass rtcp-mux=yes fingerprint=sha-256 ice-options=ice2,trickle
+  candidates: none
+  ssrc lines: 2, ssrc-group: none
+  header extensions: none
+  payloads in offer order:
+    96 H264/90000  profile-level-id=42e01f packetization-mode=1  rtcp-fb: nack, nack pli, goog-remb
+video codecs offered (excluding rtx/red/fec): H264
+H.264: 42e01f/pm1

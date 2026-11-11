@@ -4,6 +4,8 @@
 // page, answer edited. Provisional: the receiver is a browser.
 const q = new URLSearchParams(location.search);
 const which = q.get('which') || 'all';
+// ?xform=script reads Opus frames with RTCRtpScriptTransform for every arm (Firefox and Safari have no createEncodedStreams).
+const XFORM = q.get('xform') || 'legacy';
 const RAMP_SECONDS = +(q.get('ramp') || 30), OPUS_SECONDS = +(q.get('opus') || 12);
 const post = (name, body) => fetch('/result/' + name, { method: 'POST', body: JSON.stringify(body, null, 1) });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -14,7 +16,7 @@ function stripFeedback(sdp, { transportCc }) {
     if (/^a=rtcp-fb:\S+ goog-remb/.test(l)) return false;
     if (transportCc) return true; // arm (b): keep transport-cc
     if (/^a=rtcp-fb:\S+ transport-cc/.test(l)) return false;
-    if (/^a=extmap:\d+ http:\/\/www\.ietf\.org\/id\/draft-holmer-rmcat-transport-wide-cc-extensions-01/.test(l)) return false;
+    if (/^a=extmap:\d+(\/\S+)? http:\/\/www\.ietf\.org\/id\/draft-holmer-rmcat-transport-wide-cc-extensions-01/.test(l)) return false;
     return true;
   }).join('\r\n');
 }
@@ -95,8 +97,8 @@ async function ramp(arm, prefix = '') {
     if (o) series.push({
       s, bitrateKbps: prev ? Math.round(((o.bytesSent + o.headerBytesSent) - (prev.bytesSent + prev.headerBytesSent)) * 8 / 1000) : null,
       payloadKbps: prev ? Math.round((o.bytesSent - prev.bytesSent) * 8 / 1000) : null,
-      targetKbps: Math.round((o.targetBitrate || 0) / 1000), availableKbps: cp ? Math.round((cp.availableOutgoingBitrate || 0) / 1000) : null,
-      fps: o.framesPerSecond, w: o.frameWidth, h: o.frameHeight, qlr: o.qualityLimitationReason, nack: o.nackCount, pli: o.pliCount, fir: o.firCount,
+      targetKbps: o.targetBitrate == null ? null : Math.round(o.targetBitrate / 1000), availableKbps: cp ? Math.round((cp.availableOutgoingBitrate || 0) / 1000) : null,
+      fps: o.framesPerSecond, w: o.frameWidth, h: o.frameHeight, qlr: o.qualityLimitationReason === undefined ? 'not exposed' : o.qualityLimitationReason, nack: o.nackCount, pli: o.pliCount, fir: o.firCount,
       rtt: rr && rr.roundTripTime, lost: rr && rr.fractionLost, load1: lo, codec: codec && codec.mimeType, impl: o.encoderImplementation,
     });
     prev = o;
@@ -105,6 +107,9 @@ async function ramp(arm, prefix = '') {
   const result = {
     arm, freshPage: !!prefix, note: 'provisional loopback: receiver is a browser and still sends RTCP receiver reports',
     feedbackInAnswer: feedbackLines(r.answerSdp), feedbackInRawAnswer: feedbackLines(r.rawAnswer),
+    iceState: [r.pc1.iceConnectionState, r.pc2.iceConnectionState], connectionState: [r.pc1.connectionState, r.pc2.connectionState],
+    pairs: [...(await r.pc1.getStats()).values()].filter((x) => x.type === 'candidate-pair' || x.type === 'local-candidate').map((x) => x.type === 'candidate-pair' ? { state: x.state, nominated: x.nominated, bytesSent: x.bytesSent, requestsSent: x.requestsSent, responsesReceived: x.responsesReceived } : { cand: [x.protocol, x.candidateType, x.address && x.address.replace(/[0-9]+/g, 'n')].join(' ') }),
+    userAgent: navigator.userAgent,
     receiverReportsSeen: !![...(await r.pc1.getStats()).values()].find((x) => x.type === 'remote-inbound-rtp'),
     qualityLimitationDurations: finalStats && finalStats.qualityLimitationDurations, series,
   };
@@ -182,7 +187,7 @@ async function opus(name, params, silent, xform = 'script') {
   const fmtp = r.answerSdp.split(/\r?\n/).filter((l) => /^a=fmtp:\d+ .*(minptime|opus|stereo)/.test(l) || /^a=fmtp:\d+ .*useinbandfec/.test(l));
   const offerFmtp = r.pc1.localDescription.sdp.split(/\r?\n/).filter((l) => /^a=fmtp:\d+ .*useinbandfec/.test(l));
   const result = {
-    name, xform, silent: !!silent, provisional: 'loopback only; receiver is a browser',
+    name, xform, silent: !!silent, audioContextState: ac.state, userAgent: navigator.userAgent, provisional: 'loopback only; receiver is a browser',
     offerFmtp, answerFmtp: fmtp, seconds: +secs.toFixed(2),
     statsPayloadKbps: +(((s1.bytesSent - s0.bytesSent) * 8) / 1000 / secs).toFixed(1),
     statsPacketsPerSec: +((s1.packetsSent - s0.packetsSent) / secs).toFixed(1),
@@ -199,6 +204,12 @@ async function opus(name, params, silent, xform = 'script') {
 
 (async () => {
   const errors = [];
+  if (q.get('gesture')) {
+    // Safari starts a WebAudio context suspended without a user gesture: wait for a click on #go.
+    if (!document.body) await new Promise((r) => addEventListener('DOMContentLoaded', r));
+    const b = document.createElement('button'); b.id = 'go'; b.textContent = 'start'; b.style.cssText = 'font-size:40px;padding:20px'; document.body.append(b);
+    await new Promise((r) => { b.onclick = r; });
+  }
   try {
     if (which === 'all' || which === 'ramp') { await ramp('a'); await ramp('b'); }
     if (which === 'ramp-a') await ramp('a', 'solo-');
@@ -209,14 +220,16 @@ async function opus(name, params, silent, xform = 'script') {
       // Legacy createEncodedStreams is the main reader: RTCRtpScriptTransform delivered
       // no frames in arms with stereo or maxaveragebitrate set (see the evidence note),
       // so it is run for two arms only, for comparison.
-      await opus('default', null, false, 'legacy');
-      await opus('params', { stereo: 1, maxaveragebitrate: 128000, usedtx: 0 }, false, 'legacy');
-      await opus('stereo-only', { stereo: 1 }, false, 'legacy');
-      await opus('maxavg-only', { maxaveragebitrate: 128000 }, false, 'legacy');
-      await opus('silent-usedtx0', { usedtx: 0 }, true, 'legacy');
-      await opus('silent-usedtx1', { usedtx: 1 }, true, 'legacy');
-      await opus('default-script', null, false, 'script');
-      await opus('params-script', { stereo: 1, maxaveragebitrate: 128000, usedtx: 0 }, false, 'script');
+      await opus('default', null, false, XFORM);
+      await opus('params', { stereo: 1, maxaveragebitrate: 128000, usedtx: 0 }, false, XFORM);
+      await opus('stereo-only', { stereo: 1 }, false, XFORM);
+      await opus('maxavg-only', { maxaveragebitrate: 128000 }, false, XFORM);
+      await opus('silent-usedtx0', { usedtx: 0 }, true, XFORM);
+      await opus('silent-usedtx1', { usedtx: 1 }, true, XFORM);
+      if (XFORM === 'legacy') {
+        await opus('default-script', null, false, 'script');
+        await opus('params-script', { stereo: 1, maxaveragebitrate: 128000, usedtx: 0 }, false, 'script');
+      }
     }
   } catch (e) { errors.push('opus: ' + (e.stack || e)); }
   await post('loopback-errors.json', errors);
