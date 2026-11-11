@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,6 +36,8 @@ use sapflow_core::{PublishError, PublishRequest, StreamPath};
 use sapflow_dtls::Identity;
 use sapflow_hls::codec::{AccessUnit, OpusConfig};
 use sapflow_hls::{IngestError, TrackSet, Update};
+use sapflow_rtp::opus::FrameKind;
+use sapflow_rtp::receive::{Discontinuity, SkipReason};
 use sapflow_whip::ice::{Kind, classify};
 use sapflow_whip::resource::{self, SessionId};
 use sapflow_whip::router::{InsertError, Router, RouterConfig};
@@ -57,6 +60,12 @@ use crate::whip_request::{self, Action, Refused};
 const CONNECTIONS: usize = 32;
 /// Media items queued per session: about 10 s of audio and video.
 const QUEUE: usize = 1024;
+/// Media bytes queued per session. An access unit may be 8 MiB, so 1024 of
+/// them could pin 8 GiB; 16 MiB is about 3 s at the 40 Mbit/s publish cap
+/// and over 20 s at a browser's 5 Mbit/s, so it is reached only when the
+/// ingest stalls. At the default 16 publishers it bounds the queues to
+/// 256 MiB. Reaching it is a full queue.
+const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 /// The whole request head, counted from accept.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reading the offer, admission and setup together.
@@ -80,15 +89,42 @@ pub(crate) enum Item {
     },
 }
 
+impl Item {
+    /// The media bytes it holds, for the queue's byte bound.
+    fn size(&self) -> usize {
+        match self {
+            Self::Video { au, .. } => au
+                .data
+                .len()
+                .saturating_add(au.sps.as_ref().map_or(0, Vec::len))
+                .saturating_add(au.pps.as_ref().map_or(0, Vec::len)),
+            Self::Audio { packet, .. } => packet.len(),
+        }
+    }
+
+    fn received(&self) -> usize {
+        match self {
+            Self::Video { received, .. } | Self::Audio { received, .. } => *received,
+        }
+    }
+}
+
 /// What the UDP owner keeps per session for its ingest task.
 pub(crate) struct Feed {
     tx: mpsc::Sender<Item>,
     loss: PublicationLoss,
+    /// Media bytes queued and not yet taken by the ingest task, which
+    /// subtracts what it takes.
+    queued: Arc<AtomicUsize>,
+    /// The byte bound on `queued`.
+    max_bytes: usize,
     /// SRTP and SRTCP bytes not yet passed on.
     received: usize,
     /// An access unit was dropped: skip video until the next IDR.
     skip_video: bool,
-    /// Packets the receiver gave up on, after NACK and RTX repair.
+    /// A keyframe should be asked for, to end `skip_video` soon.
+    keyframe: bool,
+    /// Packets the receiver gave up on or dropped.
     lost: u64,
 }
 
@@ -98,23 +134,46 @@ pub(crate) struct Gone;
 
 impl Feed {
     pub(crate) fn new(tx: mpsc::Sender<Item>, loss: PublicationLoss) -> Self {
+        Self::bounded(tx, loss, QUEUE_BYTES)
+    }
+
+    pub(crate) fn bounded(tx: mpsc::Sender<Item>, loss: PublicationLoss, max_bytes: usize) -> Self {
         Self {
             tx,
             loss,
+            queued: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
             received: 0,
             skip_video: false,
+            keyframe: false,
             lost: 0,
         }
     }
 
-    /// Packets the receiver gave up on so far.
+    /// The queued-bytes counter, for the ingest task.
+    pub(crate) fn queued(&self) -> Arc<AtomicUsize> {
+        self.queued.clone()
+    }
+
+    /// Packets the receiver gave up on or dropped so far.
     pub(crate) fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// Whether video has just started waiting for an IDR, so a keyframe
+    /// should be asked for now; reading it clears it.
+    pub(crate) fn take_keyframe_request(&mut self) -> bool {
+        std::mem::take(&mut self.keyframe)
     }
 
     /// Passes one receiver event on. Loss is marked on the recording here.
     pub(crate) fn offer(&mut self, event: sapflow_rtp::Event) -> Result<(), Gone> {
         self.push(media(event))
+    }
+
+    fn mark_loss(&mut self, packets: u64) {
+        self.lost = self.lost.saturating_add(packets);
+        self.loss.mark_incomplete(IncompleteReason::MediaLoss);
     }
 
     /// Queues one media item for the ingest task.
@@ -131,14 +190,20 @@ impl Feed {
                     received: std::mem::take(&mut self.received),
                 }
             }
-            Media::Audio { pts, packet } => Item::Audio {
-                pts,
-                packet,
-                received: std::mem::take(&mut self.received),
-            },
+            Media::Audio { pts, packet, lost } => {
+                // Silence in place of lost packets: the timeline stays
+                // whole, but the recording is not.
+                if lost {
+                    self.mark_loss(0);
+                }
+                Item::Audio {
+                    pts,
+                    packet,
+                    received: std::mem::take(&mut self.received),
+                }
+            }
             Media::Loss { packets } => {
-                self.lost = self.lost.saturating_add(packets);
-                self.loss.mark_incomplete(IncompleteReason::MediaLoss);
+                self.mark_loss(packets);
                 return Ok(());
             }
             Media::Other(name) => {
@@ -146,22 +211,36 @@ impl Feed {
                 return Ok(());
             }
         };
+        let size = item.size();
         let video = matches!(item, Item::Video { .. });
-        match self.tx.try_send(item) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(item)) => {
-                self.loss.mark_incomplete(IncompleteReason::IngestQueueFull);
-                if video {
-                    self.skip_video = true;
+        let room = self
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                q.checked_add(size).filter(|n| *n <= self.max_bytes)
+            })
+            .is_ok();
+        let refused = if room {
+            match self.tx.try_send(item) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(item)) => {
+                    self.queued.fetch_sub(size, Ordering::AcqRel);
+                    item
                 }
-                // Keep the bytes for the rate cap.
-                self.received += match item {
-                    Item::Video { received, .. } | Item::Audio { received, .. } => received,
-                };
-                Ok(())
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(Gone),
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(Gone),
+        } else {
+            item
+        };
+        // Full, by count or by bytes: loss for this publisher, never
+        // back-pressure on the socket.
+        self.loss.mark_incomplete(IncompleteReason::IngestQueueFull);
+        if video && !self.skip_video {
+            self.skip_video = true;
+            self.keyframe = true;
         }
+        // Keep the bytes for the rate cap.
+        self.received += refused.received();
+        Ok(())
     }
 }
 
@@ -175,20 +254,26 @@ pub(crate) enum Media {
     Audio {
         pts: u64,
         packet: Vec<u8>,
+        /// Silence the receiver filled in for lost packets.
+        lost: bool,
     },
-    /// The receiver gave up on packets (sequence numbers never received
-    /// within the jitter wait, after NACK and RTX repair), or dropped a
-    /// frame that lost data: the recording is incomplete. Loss is taken
-    /// from here, not from the muxer: a lost Opus packet is filled with
+    /// Media lost, so the recording is incomplete: sequence numbers never
+    /// received within the jitter wait, after NACK and RTX repair
+    /// (`packets` of them); a video frame dropped because it lost data, or
+    /// skipped while waiting for an IDR after loss; a confirmed sequence
+    /// restart or an Opus timestamp jump too big to fill; a payload the
+    /// depacketiser refused; and media the session dropped
+    /// (`Event::MediaDropped`, `packets` of it). Loss is taken from the
+    /// receiver, never the muxer: a lost Opus packet is filled with
     /// silence and the timeline can absorb its timestamp jump, so the
     /// muxer may see nothing missing.
     Loss {
         packets: u64,
     },
-    /// Nothing for the ingest, by name. A discontinuity keeps each
-    /// stream's timeline moving forward (sapflow-rtp never sends a
-    /// timestamp back within a stream), and `EsIngest` takes the jump as it
-    /// does from RTMP.
+    /// Nothing for the ingest, by name: the start hold's alignment, frames
+    /// skipped before the first IDR, and timeline re-anchors and sender
+    /// report steps, which move the timeline but lose no media (any packets
+    /// missing are reported on their own).
     Other(&'static str),
 }
 
@@ -206,10 +291,20 @@ fn media(event: sapflow_rtp::Event) -> Media {
         },
         E::Audio { frame, pts, .. } => Media::Audio {
             pts,
+            lost: frame.kind == FrameKind::Loss,
             packet: frame.data,
         },
         E::Lost { count, .. } => Media::Loss { packets: count },
-        E::IncompleteFrame { .. } => Media::Loss { packets: 0 },
+        E::IncompleteFrame { .. }
+        | E::Refused { .. }
+        | E::FrameSkipped {
+            reason: SkipReason::AfterLoss,
+            ..
+        }
+        | E::Discontinuity {
+            cause: Discontinuity::Sequence | Discontinuity::Timestamp { .. },
+            ..
+        } => Media::Loss { packets: 0 },
         other => Media::Other(event_name(&other)),
     }
 }
@@ -395,13 +490,21 @@ async fn own_udp(
             }
         }
         let mut gone = Vec::new();
+        let mut keyframes = Vec::new();
         while let Some((id, event)) = router.poll_event() {
             match event {
                 Event::Media(e) => {
-                    if let Some(feed) = feeds.get_mut(&id)
-                        && feed.offer(e).is_err()
-                    {
-                        gone.push(id);
+                    if let Some(feed) = feeds.get_mut(&id) {
+                        if feed.offer(e).is_err() {
+                            gone.push(id);
+                        } else if feed.take_keyframe_request() {
+                            keyframes.push(id);
+                        }
+                    }
+                }
+                Event::MediaDropped { count } => {
+                    if let Some(feed) = feeds.get_mut(&id) {
+                        let _ = feed.push(Media::Loss { packets: count });
                     }
                 }
                 Event::Connected(profile) => {
@@ -414,6 +517,16 @@ async fn own_udp(
                     tracing::info!(?reason, lost, "WHIP session ended");
                 }
                 Event::Nominated => {}
+            }
+        }
+        // Video waits for an IDR after a full queue: ask for one now rather
+        // than at the next keyframe interval.
+        for id in keyframes {
+            router.request_keyframe(&id, Instant::now());
+            while let Some(t) = router.poll_transmit() {
+                if socket.send_to(&t.bytes, t.tuple.remote).await.is_err() {
+                    tracing::debug!("WHIP send failed");
+                }
             }
         }
         for id in gone {
@@ -748,6 +861,7 @@ async fn publish(
     let (tx, rx) = mpsc::channel(QUEUE);
     let (released_tx, released) = watch::channel(false);
     let feed = Feed::new(tx, publication.loss_notice());
+    let queued = feed.queued();
     whip.resources().insert(
         id,
         Resource {
@@ -759,7 +873,7 @@ async fn publish(
         whip.clone(),
         id,
         publication,
-        rx,
+        (rx, queued),
         released_tx,
         setup,
     ));
@@ -833,7 +947,7 @@ async fn ingest(
     whip: Arc<Whip>,
     id: SessionId,
     mut publication: Publication,
-    mut rx: mpsc::Receiver<Item>,
+    (mut rx, queued): (mpsc::Receiver<Item>, Arc<AtomicUsize>),
     released: watch::Sender<bool>,
     setup: Setup,
 ) {
@@ -841,9 +955,8 @@ async fn ingest(
         tracing::warn!(%error, "WHIP ingest setup refused");
     } else {
         while let Some(item) = rx.recv().await {
-            let received = match &item {
-                Item::Video { received, .. } | Item::Audio { received, .. } => *received,
-            };
+            queued.fetch_sub(item.size(), Ordering::AcqRel);
+            let received = item.received();
             if let Err(error) = publication.received(received) {
                 tracing::warn!(%error, "dropping WHIP publisher");
                 break;

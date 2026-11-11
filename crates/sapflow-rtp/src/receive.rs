@@ -1347,6 +1347,27 @@ impl Receiver {
         self.events.check_hold(now);
     }
 
+    /// Media not given out yet: packets the reorder buffers hold behind a
+    /// gap, and events still queued (all of them during the start hold). A
+    /// caller that stops polling here, because its session ended, loses
+    /// them.
+    pub fn unreleased(&self) -> usize {
+        self.streams
+            .iter()
+            .map(|s| s.buffer.held().0)
+            .sum::<usize>()
+            .saturating_add(self.events.queue.len())
+    }
+
+    /// Events dropped because the queue was full, all streams together
+    /// ([`StreamStats::events_dropped`]).
+    pub fn events_dropped(&self) -> u64 {
+        self.streams
+            .iter()
+            .map(|s| s.stats.events_dropped)
+            .fold(0, u64::saturating_add)
+    }
+
     /// Packets and payload bytes a stream's reorder buffer holds.
     #[cfg(any(test, feature = "testing"))]
     pub fn buffered(&self, stream: StreamId) -> Option<(usize, usize)> {

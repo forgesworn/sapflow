@@ -651,7 +651,7 @@ pub(crate) mod loss_tests {
         pub fn begin(&self) -> Publication {
             self.begin_kind(SourceKind::Ts)
         }
-        fn begin_kind(&self, kind: SourceKind) -> Publication {
+        pub fn begin_kind(&self, kind: SourceKind) -> Publication {
             let req = PublishRequest::parse_srt_stream_id("publish:live/event-a:fixture:fixture")
                 .expect("request");
             Publication::begin(

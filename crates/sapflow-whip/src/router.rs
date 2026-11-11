@@ -265,6 +265,15 @@ impl Router {
             .min()
     }
 
+    /// Asks a session's publisher for a keyframe
+    /// ([`Session::request_keyframe`]).
+    pub fn request_keyframe(&mut self, id: &SessionId, now: Instant) {
+        if let Some(e) = self.sessions.get_mut(id) {
+            e.session.request_keyframe(now);
+            self.drain(*id);
+        }
+    }
+
     /// Ends a session ([`Session::close`]) and removes it. Returns whether
     /// it was live.
     pub fn close(&mut self, id: &SessionId, now: Instant) -> bool {

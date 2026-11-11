@@ -522,6 +522,25 @@ impl Publisher {
     }
 
     /// One Opus packet, and advances the clock by 20 ms.
+    /// An audio packet with this payload, as `audio` sends one: for a
+    /// payload the depacketiser must refuse.
+    pub fn audio_payload(&mut self, payload: Vec<u8>) -> Vec<u8> {
+        let extension = self.extension(b"0");
+        let b = RtpBuilder {
+            marker: false,
+            payload_type: OPUS_PT,
+            sequence: self.audio_seq,
+            timestamp: self.audio_ts,
+            ssrc: AUDIO_SSRC,
+            extension,
+            payload,
+            ..RtpBuilder::default()
+        };
+        self.audio_seq = self.audio_seq.wrapping_add(1);
+        self.audio_ts = self.audio_ts.wrapping_add(960);
+        self.protect_rtp(b)
+    }
+
     pub fn audio(&mut self, fill: u8) -> Vec<u8> {
         let extension = self.extension(b"0");
         let b = RtpBuilder {

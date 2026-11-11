@@ -176,7 +176,8 @@ let mut s = Session::new(SessionConfig::default(), identity.clone(), creds, nego
 s.handle_datagram(now, Tuple::udp(from), &datagram);
 while let Some(t) = s.poll_transmit() { send(t.tuple, &t.bytes) }
 while let Some(e) = s.poll_event() {
-    // Nominated, Connected(profile), Media(sapflow_rtp::Event), Ended(reason)
+    // Nominated, Connected(profile), Media(sapflow_rtp::Event), MediaDropped { count },
+    // Ended(reason)
 }
 if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
 // s.state(), s.selected(), s.send_tuple(), s.last_media() (for SAPFLOW_WHIP_STALE), s.close(now)

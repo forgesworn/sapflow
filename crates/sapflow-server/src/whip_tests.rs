@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use sapflow_whip::testing::{PPS, Publisher, StunClient, VIDEO_SSRC, idr_slice, server_identity};
-use sapflow_whip::{Transmit, Tuple};
+use sapflow_whip::{Event, SessionConfig, Transmit, Tuple};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -543,25 +543,328 @@ fn access_unit(idr: bool) -> Media {
     }
 }
 
-/// A full queue is loss for that publisher: the recording is marked, and
-/// video waits for the next IDR rather than feeding undecodable frames.
-#[test]
-fn a_full_queue_skips_video_to_the_next_idr() {
-    let (app, _scratch) = crate::test_support::app(false);
-    let publication = crate::test_support::begin(&app);
+fn status(publication: &Publication) -> Arc<crate::recorder::RecordingStatus> {
+    publication
+        .stream
+        .session()
+        .recorder
+        .as_ref()
+        .expect("recording started")
+        .status()
+}
+
+/// A full queue is loss for that publisher: the recording is marked, a
+/// keyframe is asked for, and video waits for the next IDR rather than
+/// feeding undecodable frames.
+#[tokio::test]
+async fn a_full_queue_skips_video_to_the_next_idr() {
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let publication = fixture.begin();
+    let status = status(&publication);
     let (tx, mut rx) = mpsc::channel(1);
     let mut feed = Feed::new(tx, publication.loss_notice());
     assert_eq!(feed.push(access_unit(true)), Ok(()));
+    assert_eq!(status.reason(), None);
     assert_eq!(feed.push(access_unit(false)), Ok(()), "full: dropped");
+    assert_eq!(status.reason(), Some(IncompleteReason::IngestQueueFull));
+    assert!(feed.take_keyframe_request(), "a keyframe is asked for");
+    assert!(!feed.take_keyframe_request(), "once");
     assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
     assert_eq!(feed.push(access_unit(false)), Ok(()));
     assert!(rx.try_recv().is_err(), "skipped until an IDR");
+    assert!(!feed.take_keyframe_request(), "already waiting");
     assert_eq!(feed.push(access_unit(true)), Ok(()));
     assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
     assert_eq!(feed.push(access_unit(false)), Ok(()));
     assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if !au.idr));
     drop(rx);
     assert_eq!(feed.push(access_unit(true)), Err(Gone));
+}
+
+/// The queue is bounded in bytes as well as items: past the bound is a
+/// full queue, and bytes the ingest task takes make room again.
+#[tokio::test]
+async fn the_queue_is_bounded_in_bytes() {
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let publication = fixture.begin();
+    let status = status(&publication);
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut feed = Feed::bounded(tx, publication.loss_notice(), 12);
+    let queued = feed.queued();
+    assert_eq!(feed.push(access_unit(true)), Ok(()));
+    assert_eq!(feed.push(access_unit(false)), Ok(()));
+    assert_eq!(queued.load(Ordering::Acquire), 10);
+    assert_eq!(status.reason(), None);
+    // A third would be 15 bytes: dropped as a full queue.
+    assert_eq!(feed.push(access_unit(false)), Ok(()));
+    assert_eq!(status.reason(), Some(IncompleteReason::IngestQueueFull));
+    assert!(feed.take_keyframe_request());
+    assert_eq!(queued.load(Ordering::Acquire), 10);
+    // The ingest task takes both; the next IDR fits.
+    while let Ok(item) = rx.try_recv() {
+        queued.fetch_sub(item.size(), Ordering::AcqRel);
+    }
+    assert_eq!(feed.push(access_unit(true)), Ok(()));
+    assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
+}
+
+/// An in-process session run with the scripted publisher, collecting the
+/// session's events, on a clock the test moves.
+struct Run {
+    p: Publisher,
+    s: Session,
+    now: Instant,
+    events: Vec<Event>,
+}
+
+impl Run {
+    fn new(seed: u8, offer: fn(&str) -> String, config: SessionConfig) -> Self {
+        let t0 = Instant::now();
+        let mut p = Publisher::new(seed, &[GCM]);
+        let a = sapflow_whip::testing::accept(&offer(&p.offer()), config, t0, seed);
+        p.answered(&a);
+        let mut s = a.session;
+        p.connect(&mut s, t0);
+        let mut run = Self {
+            p,
+            s,
+            now: t0,
+            events: Vec::new(),
+        };
+        run.drain();
+        run
+    }
+
+    fn drain(&mut self) {
+        while self.s.poll_transmit().is_some() {}
+        while let Some(e) = self.s.poll_event() {
+            self.events.push(e);
+        }
+    }
+
+    fn send(&mut self, d: &[u8]) {
+        let tuple = self.p.tuple;
+        self.s.handle_datagram(self.now, tuple, d);
+        self.drain();
+    }
+
+    fn wait(&mut self, ms: u64) {
+        self.now += Duration::from_millis(ms);
+        self.s.handle_timeout(self.now);
+        self.drain();
+    }
+
+    /// `n` Opus packets 20 ms apart, leaving out those numbered in `skip`.
+    fn audio(&mut self, n: u64, skip: &[u64]) {
+        for i in 0..n {
+            let a = self.p.audio(i as u8);
+            if !skip.contains(&i) {
+                self.send(&a);
+            }
+            self.wait(20);
+        }
+    }
+
+    /// `n` video frames 40 ms apart, a keyframe when `idr(i)`.
+    fn video(&mut self, n: u64, idr: fn(u64) -> bool) {
+        for i in 0..n {
+            let packets = if idr(i) {
+                let slice = idr_slice(1200, 0x11);
+                self.p.video(&[SPS, PPS, &slice], VIDEO_SSRC)
+            } else {
+                self.p.delta(300).0
+            };
+            for d in packets {
+                self.send(&d);
+            }
+            self.wait(40);
+        }
+    }
+
+    fn has(&self, f: impl Fn(&Event) -> bool) -> bool {
+        self.events.iter().any(f)
+    }
+
+    fn lost(&self) -> bool {
+        self.has(|e| matches!(e, Event::Media(sapflow_rtp::Event::Lost { .. })))
+    }
+}
+
+fn video_only(offer: &str) -> String {
+    let head = offer.split("m=audio").next().expect("session part");
+    let video = offer.split("m=video").nth(1).expect("a video section");
+    format!("{head}m=video{video}").replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 1")
+}
+
+const AUDIO_ONLY: Setup = Setup {
+    video: false,
+    audio: true,
+};
+
+/// What a recording says after a session's events: through a `Feed`, as
+/// the server runs them, or, with `feed` false, with only the access units
+/// and audio given to the ingest and no loss marked by the server, which
+/// leaves the muxer's own view.
+async fn recorded(events: Vec<Event>, setup: Setup, feed: bool) -> Option<IncompleteReason> {
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let mut publication = fixture.begin_kind(SourceKind::Es);
+    publication
+        .push(|source, now| configure(source, setup, now))
+        .expect("setup");
+    let status = status(&publication);
+    let (tx, mut rx) = mpsc::channel(QUEUE);
+    let mut server = Feed::new(tx, publication.loss_notice());
+    for e in events {
+        let mut items = Vec::new();
+        match e {
+            Event::Media(m) if feed => server.offer(m).expect("ingest"),
+            Event::MediaDropped { count } if feed => {
+                server.push(Media::Loss { packets: count }).expect("ingest");
+            }
+            Event::Media(m) => match media(m) {
+                Media::Video { pts, au } => items.push(Item::Video {
+                    pts,
+                    au,
+                    received: 0,
+                }),
+                Media::Audio { pts, packet, .. } => items.push(Item::Audio {
+                    pts,
+                    packet,
+                    received: 0,
+                }),
+                Media::Loss { .. } | Media::Other(_) => {}
+            },
+            _ => {}
+        }
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+        for item in items {
+            publication
+                .push(|source, now| feed_item(source, item, now))
+                .expect("ingest");
+        }
+    }
+    status.reason()
+}
+
+/// The lost packet: a sequence gap the receiver declares lost after the
+/// jitter wait, and fills with silence. The recording is marked from the
+/// receiver. The muxer alone sees nothing (the committed form of taking the
+/// receiver's mark out), and a run without loss is not marked.
+#[tokio::test]
+async fn a_lost_packet_is_marked_from_the_receiver_not_the_muxer() {
+    let run = |seed, skip: &'static [u64]| {
+        let mut r = Run::new(seed, audio_only, SessionConfig::default());
+        r.audio(150, skip);
+        r
+    };
+    let clean = run(40, &[]);
+    assert!(!clean.lost());
+    assert_eq!(recorded(clean.events, AUDIO_ONLY, true).await, None);
+    let lossy = run(41, &[80]);
+    assert!(lossy.lost());
+    assert_eq!(
+        recorded(lossy.events, AUDIO_ONLY, true).await,
+        Some(IncompleteReason::MediaLoss)
+    );
+    let lossy = run(41, &[80]);
+    assert_eq!(recorded(lossy.events, AUDIO_ONLY, false).await, None);
+}
+
+/// Path (a): a sequence jump of more than 3000 that the next packet
+/// confirms is a restart, reported as a discontinuity and with no `Lost`;
+/// the frames until the next IDR are skipped. The recording is marked.
+#[tokio::test]
+async fn a_sequence_restart_marks_the_recording() {
+    let mut run = Run::new(42, video_only, SessionConfig::default());
+    run.video(50, |i| i % 25 == 0);
+    run.p.video_seq = run.p.video_seq.wrapping_add(30_000);
+    run.video(50, |i| i % 25 == 10);
+    assert!(run.has(|e| matches!(
+        e,
+        Event::Media(sapflow_rtp::Event::Discontinuity {
+            cause: Discontinuity::Sequence,
+            ..
+        })
+    )));
+    assert!(!run.lost(), "no Lost on this path");
+    let setup = Setup {
+        video: true,
+        audio: false,
+    };
+    assert_eq!(
+        recorded(run.events, setup, true).await,
+        Some(IncompleteReason::MediaLoss)
+    );
+}
+
+/// Path (b): a refused Opus payload sets the gap flag, and the next packet
+/// is filled with silence for loss, with no sequence gap and no `Lost`.
+/// The recording is marked.
+#[tokio::test]
+async fn a_refused_opus_payload_marks_the_recording() {
+    let mut run = Run::new(43, audio_only, SessionConfig::default());
+    run.audio(100, &[]);
+    let bad = run.p.audio_payload(vec![0xff]);
+    run.send(&bad);
+    run.wait(20);
+    run.audio(20, &[]);
+    assert!(run.has(|e| matches!(e, Event::Media(sapflow_rtp::Event::Refused { .. }))));
+    assert!(run.has(|e| matches!(
+        e,
+        Event::Media(sapflow_rtp::Event::Audio { frame, .. }) if frame.kind == FrameKind::Loss
+    )));
+    assert!(!run.lost(), "no Lost on this path");
+    assert_eq!(
+        recorded(run.events, AUDIO_ONLY, true).await,
+        Some(IncompleteReason::MediaLoss)
+    );
+}
+
+/// Path (c): the session ends while packets wait behind a gap, inside the
+/// jitter wait. They never come out and no `Lost` is reported; the session
+/// says what it dropped, and the recording is marked.
+#[tokio::test]
+async fn media_held_when_the_session_ends_marks_the_recording() {
+    let mut run = Run::new(44, audio_only, SessionConfig::default());
+    run.audio(100, &[]);
+    let _missing = run.p.audio(0);
+    for i in 0..3 {
+        let a = run.p.audio(i);
+        run.send(&a);
+    }
+    run.s.close(run.now);
+    run.drain();
+    assert!(run.has(|e| matches!(e, Event::MediaDropped { count } if *count >= 3)));
+    assert!(matches!(run.events.last(), Some(Event::Ended(_))));
+    assert!(!run.lost(), "no Lost on this path");
+    assert_eq!(
+        recorded(run.events, AUDIO_ONLY, true).await,
+        Some(IncompleteReason::MediaLoss)
+    );
+}
+
+/// Another path: events the receiver's queue had no room for are dropped
+/// and counted there. The session reports them, and the recording is
+/// marked. A small queue makes one gap's release overflow it.
+#[tokio::test]
+async fn receiver_events_dropped_for_room_mark_the_recording() {
+    let mut config = SessionConfig::default();
+    config.receiver.max_events = 4;
+    let mut run = Run::new(45, audio_only, config);
+    run.audio(100, &[]);
+    let missing = run.p.audio(0);
+    for i in 0..10 {
+        let a = run.p.audio(i);
+        run.send(&a);
+    }
+    run.send(&missing);
+    assert!(run.has(|e| matches!(e, Event::MediaDropped { .. })));
+    assert_eq!(
+        recorded(run.events, AUDIO_ONLY, true).await,
+        Some(IncompleteReason::MediaLoss)
+    );
 }
 
 /// Each `Lost` is counted and marks the recording incomplete; a dropped
