@@ -928,8 +928,8 @@ async fn delete(whip: &Arc<Whip>, id: &str, authorization: Option<&str>) -> Repl
     let found = whip
         .resources()
         .get(&id)
-        .map(|r| (r.token, r.released.clone()));
-    let Some((token, mut released)) = found else {
+        .map(|r| (r.token, r.released.clone(), r.losses.clone()));
+    let Some((token, mut released, losses)) = found else {
         return not_found();
     };
     if !same(&token, &digest(bearer)) {
@@ -941,6 +941,7 @@ async fn delete(whip: &Arc<Whip>, id: &str, authorization: Option<&str>) -> Repl
     // Answer once the path is released, so a POST that follows at once is
     // not refused 409 by the publication on its way out.
     let _ = tokio::time::timeout(RELEASE_TIMEOUT, released.wait_for(|r| *r)).await;
+    tracing::debug!(%losses, "WHIP session deleted");
     Reply {
         status: 200,
         headers: Vec::new(),
