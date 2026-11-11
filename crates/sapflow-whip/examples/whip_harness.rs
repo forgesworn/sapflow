@@ -350,6 +350,8 @@ fn main() {
     let mut rec = Record::default();
     let mut kept_offer = String::new();
     let mut counts = (0u64, 0u64, 0u64, 0u64); // access units, keyframes, audio, lost
+    // RTP datagrams by payload type, read from the clear header.
+    let mut by_pt: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
     let mut done = None;
     let mut buf = [0u8; 2048];
     let reach = |reached: &mut Vec<(&'static str, u128, String)>,
@@ -398,6 +400,11 @@ fn main() {
                 let selected = s.selected() == Some(tuple);
                 let kind = classify(d);
                 let dropped = s.stats().dtls_dropped;
+                if kind == Kind::Rtp
+                    && let Some(b) = d.get(1)
+                {
+                    *by_pt.entry(b & 0x7f).or_default() += 1;
+                }
                 if selected && kind == Kind::Rtp && rec.srtp.len() < 8 {
                     rec.srtp.push(d.to_vec());
                 }
@@ -532,6 +539,7 @@ fn main() {
             }
         }
     }
+    println!("rtp by payload type: {by_pt:?}");
     println!(
         "media before keys: {}, from unvalidated tuples: {}",
         st.media_before_keys, st.media_unvalidated
