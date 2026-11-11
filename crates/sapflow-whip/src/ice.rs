@@ -364,19 +364,15 @@ impl Agent {
         }
         // Authenticated from here. A repeated transaction ID is a
         // retransmission only from the tuple that first sent it.
+        // A new ID is recorded only once it is answered: a request refused
+        // here is not taken, so its retransmission is new too.
         let repeat = match self.seen.iter().find(|(id, _)| *id == m.transaction) {
             Some((_, first)) if *first != tuple => {
                 self.stats.replays += 1;
                 return None;
             }
             Some(_) => true,
-            None => {
-                if self.seen.len() >= self.config.max_transactions.max(1) {
-                    self.seen.pop_front();
-                }
-                self.seen.push_back((m.transaction, tuple));
-                false
-            }
+            None => false,
         };
         let (response, success) = if !m.unknown_required.is_empty() {
             self.stats.unknown_attributes += 1;
@@ -413,13 +409,17 @@ impl Agent {
             });
         }
         let mut nominated = false;
+        // Only a validated tuple can be selected; with no room to remember
+        // this one, the check is not answered (and its ID not recorded).
+        if success && !self.validate(tuple, now) {
+            self.stats.full += 1;
+            return None;
+        }
+        if self.seen.len() >= self.config.max_transactions.max(1) {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((m.transaction, tuple));
         if success {
-            // Only a validated tuple can be selected; with no room to
-            // remember this one, the check is not answered.
-            if !self.validate(tuple, now) {
-                self.stats.full += 1;
-                return None;
-            }
             self.stats.successes += 1;
             if m.use_candidate && self.selected != Some(tuple) {
                 self.selected = Some(tuple);
@@ -799,6 +799,10 @@ mod tests {
         // answered, and nothing moves.
         assert!(a.handle(now, tuple(3), &r.build(3)).is_none());
         assert_eq!(a.stats().full, 1);
+        // Its ID was not recorded: a retransmission is refused the same way,
+        // not answered as a repeat.
+        assert!(a.handle(now, tuple(3), &r.build(3)).is_none());
+        assert_eq!((a.stats().full, a.stats().repeats), (2, 0));
         assert!(a.is_validated(&tuple(1)) && a.is_validated(&tuple(2)));
         assert_eq!(a.selected(), Some(tuple(2)));
     }
