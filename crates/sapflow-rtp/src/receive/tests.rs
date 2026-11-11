@@ -1011,7 +1011,10 @@ fn nacks_are_rate_limited_and_coalesced() {
 #[test]
 fn sequence_restarts_and_backwards_clocks() {
     let mut r = video_only(ReceiverConfig::default(), false);
-    let idr = [0x65, 0x88, 1];
+    // SPS, PPS and an IDR slice in one STAP-A, so it starts an access unit.
+    let idr = [
+        0x78, 0, 5, 0x67, 0x42, 0xc0, 0x1e, 0xda, 0, 4, 0x68, 0xce, 0x3c, 0x80, 0, 3, 0x65, 0x88, 1,
+    ];
     feed(&mut r, 0, &pkt(96, 7, 10, 0, true, &idr)).expect("taken");
     feed(&mut r, 20, &pkt(96, 7, 11, 3000, true, &idr)).expect("taken");
     // A jump of 30 000: set aside, then confirmed by its successor.

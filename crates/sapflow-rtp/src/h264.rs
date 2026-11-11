@@ -230,6 +230,8 @@ pub struct Depacketiser {
     fu: Option<Vec<u8>>,
     /// Packets were lost since the last one.
     gap: bool,
+    /// Whether a packet has been seen since the start or the last reset.
+    started: bool,
     /// Whether the last complete IDR access unit carried an SPS. If IDRs
     /// come with their parameter sets, one that starts an access unit
     /// right after a gap may have lost them.
@@ -246,6 +248,7 @@ impl Depacketiser {
             au: None,
             fu: None,
             gap: false,
+            started: false,
             idr_with_sps: false,
             out: VecDeque::new(),
             missing_markers: 0,
@@ -271,6 +274,7 @@ impl Depacketiser {
         }
         self.fu = None;
         self.gap = false;
+        self.started = false;
     }
 
     /// Access units that ended at a timestamp change with no marker, no
@@ -293,8 +297,14 @@ impl Depacketiser {
     /// later slice, a PPS, SEI, an FU-A continuation) may have lost what
     /// came before it, so the access unit is reported as
     /// [`Incomplete::StartLost`].
+    ///
+    /// The first access unit, and the first after a reset, is checked the
+    /// same way, as if IDRs carried their SPS: packets before the first
+    /// one received cannot be NACKed, so an IDR slice first may have lost
+    /// its parameter sets.
     pub fn push(&mut self, timestamp: u32, marker: bool, payload: &[u8]) -> Result<(), H264Error> {
         let gap = std::mem::take(&mut self.gap);
+        let first = !std::mem::replace(&mut self.started, true);
         // A new timestamp ends the access unit in progress.
         if let Some(mut au) = self.au.take_if(|au| au.unit.timestamp != timestamp) {
             if gap {
@@ -309,9 +319,9 @@ impl Depacketiser {
         }
         let fresh = self.au.is_none();
         let au = self.au.get_or_insert_with(|| Building::new(timestamp));
-        if gap {
+        if gap || first {
             if fresh {
-                if !starts_access_unit(first_nal(payload), self.idr_with_sps) {
+                if !starts_access_unit(first_nal(payload), self.idr_with_sps || first) {
                     au.damage(Incomplete::StartLost);
                 }
             } else {
@@ -414,6 +424,10 @@ impl Depacketiser {
             if indicator & 0x80 != 0 {
                 return Err(H264Error::ForbiddenBit);
             }
+            if 1 + data.len() > self.limits.max_nal_bytes {
+                self.damage(Incomplete::TooLarge);
+                return Ok(());
+            }
             let mut unit = Vec::with_capacity(1 + data.len());
             unit.push(indicator & 0xe0 | kind);
             unit.extend_from_slice(data);
@@ -429,16 +443,14 @@ impl Depacketiser {
                 self.damage(Incomplete::Fragment);
                 return Ok(());
             }
+            // Checked before growing, so the buffer never passes the bound.
+            if unit.len() + data.len() > self.limits.max_nal_bytes {
+                self.fu = None;
+                self.damage(Incomplete::TooLarge);
+                return Ok(());
+            }
+            reserve_within(unit, data.len(), self.limits.max_nal_bytes);
             unit.extend_from_slice(data);
-        }
-        if self
-            .fu
-            .as_ref()
-            .is_some_and(|u| u.len() > self.limits.max_nal_bytes)
-        {
-            self.fu = None;
-            self.damage(Incomplete::TooLarge);
-            return Ok(());
         }
         if end && let Some(unit) = self.fu.take() {
             return self.nal_unit(&unit);
@@ -484,11 +496,24 @@ impl Depacketiser {
                 if kind == nal::IDR {
                     au.unit.idr = true;
                 }
+                reserve_within(&mut au.unit.data, 4 + unit.len(), limits.max_frame_bytes);
                 au.unit.data.extend_from_slice(&len.to_be_bytes());
                 au.unit.data.extend_from_slice(unit);
             }
         }
         Ok(())
+    }
+}
+
+/// Makes room for `add` more bytes in `v` without its capacity passing
+/// `max` (the caller has checked that its length will not): doubling, as
+/// `Vec` would, but stopping at `max`, so a stated bound is the memory
+/// bound.
+fn reserve_within(v: &mut Vec<u8>, add: usize, max: usize) {
+    let need = v.len() + add;
+    if need > v.capacity() {
+        let target = v.capacity().saturating_mul(2).max(need).min(max.max(need));
+        v.reserve_exact(target - v.len());
     }
 }
 
@@ -665,6 +690,8 @@ mod tests {
     #[test]
     fn interleaved_types_are_refused() {
         let mut d = Depacketiser::new(H264Limits::default());
+        d.push(0, true, &slice(true, 3)).expect("start");
+        drain(&mut d);
         for kind in [STAP_B, MTAP16, MTAP24, FU_B] {
             let err = d
                 .push(3, true, &[0x60 | kind, 0, 0, 0, 0])
@@ -721,6 +748,8 @@ mod tests {
         // Without a gap: a continuation with no start, a start with no
         // end before the marker, and a single NAL unit inside a fragment.
         let mut d = Depacketiser::new(H264Limits::default());
+        d.push(0, true, &slice(true, 3)).expect("start");
+        drain(&mut d);
         d.push(1, true, &frags[1]).expect("continuation");
         d.push(2, true, &frags[0]).expect("start");
         d.push(3, false, &frags[0]).expect("start");
@@ -832,6 +861,7 @@ mod tests {
         }
         // With IDRs that come without an SPS, an IDR start is clean.
         let mut d = Depacketiser::new(H264Limits::default());
+        d.push(0, false, &[0x09, 0xf0]).expect("aud");
         d.push(0, true, &idr(10)).expect("idr");
         d.lost();
         d.push(1, true, &idr(10)).expect("idr");
@@ -892,5 +922,85 @@ mod tests {
             }]
         );
         assert!(!d.in_progress());
+    }
+
+    #[test]
+    fn the_first_access_unit_is_checked_too() {
+        // Its first packets may be lost unseen: an IDR slice first may
+        // have lost its SPS and PPS, as may one after a reset.
+        let mut d = Depacketiser::new(H264Limits::default());
+        d.push(0, true, &idr(10)).expect("idr");
+        d.push(1, false, &stap(&[SPS, PPS])).expect("stap");
+        d.push(1, true, &idr(10)).expect("idr");
+        d.reset();
+        d.push(2, true, &idr(10)).expect("idr");
+        let out = drain(&mut d);
+        assert!(matches!(
+            out[0],
+            H264Output::Incomplete {
+                reason: Incomplete::StartLost,
+                ..
+            }
+        ));
+        assert!(frame(&out[1]).idr);
+        assert!(matches!(
+            out[2],
+            H264Output::Incomplete {
+                reason: Incomplete::StartLost,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn buffers_never_pass_their_bounds() {
+        let limits = H264Limits {
+            max_frame_bytes: 10_000,
+            max_nal_bytes: 6_000,
+            max_nal_units: 256,
+        };
+        let mut d = Depacketiser::new(limits);
+        // An FU-A in 100-byte pieces up to the NAL bound, and slices up to
+        // the frame bound: capacity stays within both.
+        let unit = slice(true, 5_997);
+        assert_eq!(unit.len(), 5_999);
+        for f in &fus(&unit, 100) {
+            d.push(1, false, f).expect("fu");
+            if let Some(fu) = &d.fu {
+                assert!(fu.capacity() <= limits.max_nal_bytes, "{}", fu.capacity());
+            }
+        }
+        // 6003 bytes so far; 38 more of 104 and a last of 6 make 9961.
+        for _ in 0..38 {
+            d.push(1, false, &slice(false, 98)).expect("slice");
+            let au = d.au.as_ref().expect("building");
+            assert!(au.unit.data.capacity() <= limits.max_frame_bytes);
+        }
+        d.push(1, true, &slice(false, 0)).expect("last");
+        let out = drain(&mut d);
+        let au = frame(&out[0]);
+        assert!(au.data.len() <= limits.max_frame_bytes);
+        assert!(
+            au.data.capacity() <= limits.max_frame_bytes,
+            "{}",
+            au.data.capacity()
+        );
+        // One byte over, fragment or frame, is refused without growing.
+        let mut d = Depacketiser::new(limits);
+        for f in &fus(&slice(true, 5_999), 100) {
+            d.push(2, false, f).expect("fu");
+            assert!(
+                d.fu.as_ref()
+                    .is_none_or(|u| u.capacity() <= limits.max_nal_bytes)
+            );
+        }
+        d.push(2, true, &slice(false, 1)).expect("end");
+        assert!(matches!(
+            drain(&mut d)[..],
+            [H264Output::Incomplete {
+                reason: Incomplete::TooLarge,
+                ..
+            }]
+        ));
     }
 }
