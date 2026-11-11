@@ -892,7 +892,8 @@ was changed by this correction.
 Normal Stop now publishes one original 100ms deadline, closes admission and
 wakes the Selector without interrupting its worker or closing UDP early. The
 UDP owner cancels native media/keys, discards its previously returned media,
-then polls at most one fresh 16-byte SRT SHUTDOWN control. It makes one
+then polls at most one fresh SRT SHUTDOWN control: its 16-byte header may be
+followed by one zero word for newer libsrt peers. It makes one
 nonblocking write only: zero-write, partial write, exception or expiry ends the
 attempt without retry. Local submission never means destination receipt. The
 original deadline cannot be renewed; its watchdog hard-closes the channel and

@@ -33,9 +33,11 @@ internal class SrtShutdown {
         if (nowUs() >= deadline) return Result.EXPIRED
         val bytes = try { takeControl() } catch (_: Exception) { return Result.NATIVE_FAILED }
             ?: return Result.NO_CONTROL
-        // SRT SHUTDOWN is a 16-byte control header, type 5, subtype 0.
+        // SRT SHUTDOWN is a 16-byte control header, type 5, subtype 0,
+        // optionally followed by the zero word required by newer libsrt peers.
         // A previously returned media datagram can never enter this path.
-        if (bytes.size != 16 || bytes[0] != 0x80.toByte() || bytes[1] != 5.toByte() || bytes[2] != 0.toByte() || bytes[3] != 0.toByte()) return Result.INVALID_CONTROL
+        val validLength = bytes.size == 16 || (bytes.size == 20 && (16..19).all { bytes[it] == 0.toByte() })
+        if (!validLength || bytes[0] != 0x80.toByte() || bytes[1] != 5.toByte() || bytes[2] != 0.toByte() || bytes[3] != 0.toByte()) return Result.INVALID_CONTROL
         if (aborted.get()) return Result.ABORTED
         if (nowUs() >= deadline) return Result.EXPIRED
         val sent = try { write(ByteBuffer.wrap(bytes)) } catch (_: Exception) { return Result.WRITE_FAILED }
