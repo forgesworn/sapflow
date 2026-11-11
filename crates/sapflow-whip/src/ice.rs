@@ -164,7 +164,8 @@ impl Credentials {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IceConfig {
     /// Most validated tuples remembered. A new one beyond it evicts the
-    /// oldest that is not selected. 1 to 64; default 8.
+    /// oldest that is not selected. 2 to 64 (one for the selected tuple,
+    /// at least one for a new one); default 8.
     pub max_tuples: usize,
     /// Consent lasts this long after the last successful check on the
     /// selected tuple (RFC 7675 section 5.1). 1 to 300 s; default 30 s.
@@ -183,7 +184,7 @@ impl Default for IceConfig {
 impl IceConfig {
     /// Checks every field's range.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !(1..=64).contains(&self.max_tuples) {
+        if !(2..=64).contains(&self.max_tuples) {
             return Err("max_tuples");
         }
         if !(Duration::from_secs(1)..=Duration::from_secs(300)).contains(&self.consent_timeout) {
@@ -345,9 +346,10 @@ impl Agent {
             return None;
         }
         let mut nominated = false;
+        // Only a validated tuple can be selected.
+        let success = success && self.validate(tuple);
         if success {
             self.stats.successes += 1;
-            self.validate(tuple);
             if m.use_candidate && self.selected != Some(tuple) {
                 self.selected = Some(tuple);
                 self.stats.nominations += 1;
@@ -364,20 +366,22 @@ impl Agent {
         })
     }
 
-    fn validate(&mut self, tuple: Tuple) {
+    /// Remembers a tuple as validated, evicting the oldest one that is not
+    /// selected if full. Returns whether it is validated.
+    fn validate(&mut self, tuple: Tuple) -> bool {
         if self.validated.contains(&tuple) {
-            return;
+            return true;
         }
-        if self.validated.len() >= self.config.max_tuples.max(1) {
+        if self.validated.len() >= self.config.max_tuples.max(2) {
             let selected = self.selected;
-            if let Some(i) = self.validated.iter().position(|t| Some(*t) != selected) {
-                self.validated.remove(i);
-                self.stats.evicted += 1;
-            } else {
-                return;
-            }
+            let Some(i) = self.validated.iter().position(|t| Some(*t) != selected) else {
+                return false;
+            };
+            self.validated.remove(i);
+            self.stats.evicted += 1;
         }
         self.validated.push(tuple);
+        true
     }
 }
 
@@ -602,6 +606,34 @@ mod tests {
         assert!(a.is_validated(&tuple(5)));
         assert!(!a.is_validated(&tuple(2)));
         assert_eq!(a.stats().evicted, 3);
+    }
+
+    #[test]
+    fn the_selected_tuple_is_always_validated() {
+        // With room for two, nominations across three tuples never leave
+        // the selection on a tuple the agent has forgotten.
+        let c = creds();
+        let one = IceConfig {
+            max_tuples: 1,
+            ..IceConfig::default()
+        };
+        assert_eq!(one.validate(), Err("max_tuples"));
+        let config = IceConfig {
+            max_tuples: 2,
+            ..IceConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        let mut a = Agent::new(config, &c, "peer");
+        let now = Instant::now();
+        let mut r = Req::honest(&c);
+        r.use_candidate = true;
+        for (i, port) in [1u16, 2, 3, 1, 3, 2].into_iter().enumerate() {
+            a.handle(now, tuple(port), &r.build(i as u8))
+                .expect("answered");
+            let sel = a.selected().expect("selected");
+            assert_eq!(sel, tuple(port));
+            assert!(a.is_validated(&sel), "step {i}");
+        }
     }
 
     #[test]
