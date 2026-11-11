@@ -1,8 +1,9 @@
 # WHIP ingest (design)
 
-Status: design only, 10 November 2026. Nothing here is built. WHIP stays off
-unless configured, and it does not face the internet before the gates in
-[Delivery and gates](#delivery-and-gates) pass.
+Status: design, 10 November 2026, updated 11 November 2026. The WHIP
+libraries `sapflow-rtp` and `sapflow-dtls` are built but not yet wired into
+the server, so WHIP stays off. It does not face the internet before the
+gates in [Delivery and gates](#delivery-and-gates) pass.
 
 WHIP (RFC 9725) lets a publisher send live media over WebRTC after a single
 HTTP exchange. A browser can publish with no app installed, and OBS 30 and
@@ -151,7 +152,8 @@ RustCrypto crates for the new primitives:
 | AES-128-GCM (DTLS records, SRTP GCM) | `aes-gcm` |
 | AES-128 counter mode and HMAC-SHA1 (SRTP CM) | `aes`, `ctr`, `hmac`, `sha1` (already used) |
 | PRF, transcript hashes, fingerprints | `sha2`, `hmac` (already used) |
-| Peer certificate parsing, our self-signed certificate | `x509-cert` and `der` |
+| Peer certificate parsing | `x509-cert` and `der` |
+| Our self-signed certificate | Hand-encoded DER, signed with `p256` |
 | Randomness | `getrandom` (already used) |
 
 `ring` is the measured alternative if W4 shows AES-GCM or ECDSA cost matters.
@@ -165,7 +167,9 @@ from them in W0 and kept as fixtures, not recalled. The targets are Chrome on
 desktop and Android, Safari on iOS and macOS, Firefox, and OBS's WHIP output.
 Desktop Chrome 157 is captured
 ([evidence](whip-evidence/w0-chrome-desktop-2026-11-10.md), fixtures in
-`fixtures/whip/w0/`). The other targets are still expected, not observed.
+`fixtures/whip/w0/`). Safari on macOS and iOS, OBS, FFmpeg and Vanadium
+(Chrome on Android) are captured too. Firefox's offer is captured but its
+ClientHello is not.
 
 What Chrome 157 sends:
 
@@ -842,8 +846,10 @@ instead of observed.
   1.2 client (`s_client -dtls1_2 -use_srtp ... -keymatexport
   EXTRACTOR-dtls_srtp`). Both sides export byte-identical SRTP keying
   material.
-- **A2.2 Captures and abuse.** Replayed ClientHellos from every target
-  complete. Malformed, oversized, out-of-order and retransmitted flights are
+- **A2.2 Captures and abuse.** Every captured ClientHello, replayed, gets a
+  correct first flight. A full handshake with each target needs a live peer
+  and is part of A3.1. Firefox's ClientHello is not captured yet, so it is
+  pending. Malformed, oversized, out-of-order and retransmitted flights are
   each refused or handled within the caps, with one test per case.
 - **A2.3 Fingerprint.** A peer certificate that does not match the offer's
   fingerprint is refused. Fails if any build or test flag can skip the check.
@@ -856,7 +862,11 @@ Implementation notes (11 November 2026):
   0.14, `ecdsa` 0.17, `aes-gcm` 0.11, `sha2` 0.11, `hmac` 0.13, `x509-cert`
   0.3 and `der` 0.8.
 - **Our certificate.** It is DER written by sapflow and signed with `p256`.
-  `x509-cert` parses only the peer's.
+  `x509-cert` parses only the peer's. Ours is valid from a day before
+  process start to a year after it, and W3 makes a new one at each start.
+- **Expected fingerprints.** `Server::new` takes one to four `sha-256`
+  fingerprints from the offer (RFC 8122 allows several lines), and any one
+  may match.
 - **Bounds and defaults.** These are listed in the crate README.
   - HelloVerifyRequest is off by default, because ICE has already proved
     return routability.
@@ -866,8 +876,8 @@ Implementation notes (11 November 2026):
     when an authenticated Finished arrives again after the handshake.
 - **A2.1.** OpenSSL 4.0.3 `s_client` matched our exported keying material
   byte for byte in eight runs. Both profiles ran, with 300-byte MTUs, a
-  dropped first flight, a dropped final flight and the cookie exchange. The datagrams and OpenSSL's
-  key log are fixtures. Unit tests replay them offline, derive the exporter
+  dropped first flight, a dropped final flight and the cookie exchange. The
+  datagrams and OpenSSL's key log are fixtures. Unit tests replay them offline, derive the exporter
   and record keys from OpenSSL's master secret, and feed both halves of the
   material to `sapflow-rtp`.
   - That last step runs `sapflow-rtp` on both sides. GCM SRTP is still
@@ -878,13 +888,29 @@ Implementation notes (11 November 2026):
   - CI's 60 s runs and a coverage report are still to come.
   - A seed replay test and a fixed-seed mutation pass run with the unit
     tests.
-- **Review.** A4.4's independent review of this crate has not happened yet.
+- **Review.** On 11 November 2026 an independent review of this crate found
+  no defect in the protocol or crypto code, and asked for fixes. Those
+  fixes are made. A4.4 still needs SRTP in `sapflow-rtp` reviewed and every
+  finding recorded.
+- **For W3.**
+  - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
+    timer doubling to 60 s, six sends), an unanswered flight 4 runs to
+    about 63 s before `Error::Timeout`.
+  - **Epoch 0 injection.** An unauthenticated epoch 0 packet, such as a
+    forged fatal alert, can end a handshake. W3 limits the damage:
+    - each `Server` receives only datagrams from its selected ICE-validated
+      5-tuple;
+    - handshake failures are counted by reason, without addresses;
+    - the publisher recovers with a new WHIP `POST`.
 
 ### W3: `sapflow-whip` and the server
 
 - **A3.1 End to end.** Headless Chrome with fake media publishes through
   `POST` to a local sapflow. The stream plays as LL-HLS in hls.js, and the
-  recording opens. Evidence: the test log and a decoded frame.
+  recording opens. Evidence: the test log and a decoded frame. The DTLS
+  handshake also completes with every target in
+  [The browser profile](#the-browser-profile) (moved from A2.2), Firefox
+  included once its ClientHello is captured.
 - **A3.2 Leaving and returning.**
   - `DELETE` after media sends `unpublish` at once and holds the stream.
   - A new `POST` within the grace continues the same stream, and one after
