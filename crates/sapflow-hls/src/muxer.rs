@@ -1319,6 +1319,171 @@ impl Muxer {
         }
     }
 
+    /// Audio-only Opus, every refusal before any change: a malformed packet,
+    /// a negative or unrepresentable timestamp, a packet the part target
+    /// cannot hold, or one that would carry the segment past its byte limit
+    /// leaves the muxer as it was, and `payload` is only called (to copy a
+    /// borrowed packet) once the packet is admitted. Then, as for AAC, a
+    /// timestamp more than 2 ms off the sample count starts a discontinuous
+    /// run, and a packet the open part has no room for closes that part
+    /// first. A fragment budget failure while sealing is the one exception:
+    /// it fences the muxer, as it does for AAC.
+    fn push_opus_audio_only(
+        &mut self,
+        pts: i64,
+        packet: &[u8],
+        payload: impl FnOnce() -> Bytes,
+        now: SystemTime,
+    ) -> Result<Update, MuxError> {
+        if pts < 0 || packet.is_empty() {
+            return Err(MuxError::Timestamp);
+        }
+        let samples = i64::from(opus_packet(packet).ok_or(MuxError::InvalidAudio)?.samples());
+        let timing = self.check_opus_part_timing(samples)?;
+        let rate = i128::from(crate::codec::OPUS_SAMPLE_RATE);
+        let scale = i128::from(VIDEO_TIMESCALE);
+        let ticks = |n: i64| -> Result<i64, MuxError> {
+            i64::try_from(i128::from(n) * scale / rate).map_err(|_| MuxError::Timestamp)
+        };
+        // Plan.
+        let discontinuous = self.audio_run.as_ref().is_some_and(|run| {
+            let expected = i128::from(run.input_origin) + i128::from(run.samples) * scale / rate;
+            (i128::from(pts) - expected).abs() > 180
+        });
+        let (sample, run_samples) = match &self.audio_run {
+            Some(run) if !discontinuous => (run.next_sample, run.samples),
+            _ => {
+                // A new run starts where the old one ended after a
+                // discontinuity (interrupt rebases there), else where a
+                // rebase or this timestamp puts it.
+                let at = match (discontinuous, self.rebase_to) {
+                    (true, _) => self.audio_end.ok_or(MuxError::Timestamp)?,
+                    (false, Some(at)) => at,
+                    (false, None) => pts.checked_add(self.offset).ok_or(MuxError::Timestamp)?,
+                };
+                if at < 0 {
+                    return Err(MuxError::Timestamp);
+                }
+                let first = i64::try_from((i128::from(at) * rate + scale - 1) / scale)
+                    .map_err(|_| MuxError::Timestamp)?;
+                (first, 0)
+            }
+        };
+        let next_sample = sample.checked_add(samples).ok_or(MuxError::Timestamp)?;
+        let total = run_samples
+            .checked_add(samples)
+            .ok_or(MuxError::Timestamp)?;
+        if sample < 0 {
+            return Err(MuxError::Timestamp);
+        }
+        let at = ticks(sample)?;
+        let end = ticks(next_sample)?;
+        let open = if discontinuous {
+            None
+        } else {
+            self.part.as_ref()
+        };
+        let early = open.is_some_and(|p| !p.audio.is_empty() && end - p.start_dts > timing.target);
+        let part_start = match open {
+            Some(p) if !early => p.start_dts,
+            _ => at,
+        };
+        if end - part_start > timing.target {
+            return Err(MuxError::InvalidAudio);
+        }
+        let segment_bytes = if discontinuous {
+            0
+        } else {
+            self.next_segment.as_ref().map_or(0, |s| s.bytes)
+        };
+        let bytes = segment_bytes
+            .checked_add(packet.len())
+            .ok_or(MuxError::SegmentTooLarge)?;
+        if bytes > MAX_SEGMENT_BYTES {
+            return Err(MuxError::SegmentTooLarge);
+        }
+        // Admitted: apply.
+        let data = payload();
+        let mut update = Update::default();
+        if discontinuous {
+            update.merge(self.interrupt(now));
+            update.media_loss = true;
+            if self.fragment_refused {
+                return Err(MuxError::FragmentLimit);
+            }
+        }
+        if self.audio_run.is_none() {
+            self.rebase_to = None;
+            self.audio_run = Some(AudioRun {
+                input_origin: pts,
+                samples: 0,
+                next_sample: sample,
+            });
+        }
+        if early {
+            // Only the part: an INDEPENDENT=YES part is exempt from the 85%
+            // floor (RFC 8216bis 4.4.4.9), and closing the segment too would
+            // shrink the count-limited window to single-part segments.
+            self.rotate_part(at, at)?;
+            update.part = true;
+        }
+        if self.next_segment.is_none() {
+            let id = if self.entries.is_empty() {
+                LEADING_GAPS
+            } else {
+                self.next_segment_id()
+            };
+            let start = match self.entries.back() {
+                Some(Entry::Segment(previous)) => now.max(previous.start + previous.duration),
+                _ => now,
+            };
+            self.next_segment = Some(OpenSegment {
+                initialization: self.init.clone(),
+                id,
+                start_dts: at,
+                start,
+                wall_origin: (at, start),
+                parts: Vec::new(),
+                bytes: 0,
+                audio_bytes: 0,
+                discontinuity: std::mem::take(&mut self.discontinuity_next),
+            });
+        }
+        if self.part.is_none() {
+            self.part = Some(OpenPart::new(self.next_part_id, at));
+        }
+        let seg = self.next_segment.as_mut().ok_or(MuxError::Timestamp)?;
+        seg.bytes = bytes;
+        let seg_start = seg.start_dts;
+        let part = self.part.as_mut().ok_or(MuxError::Timestamp)?;
+        let part_start = part.start_dts;
+        part.independent = true;
+        part.audio_times.push((at, sample as u64));
+        part.audio.push(Sample {
+            duration: samples as u32,
+            cts: 0,
+            sync: true,
+            data,
+        });
+        self.timing = Some(timing);
+        self.audio_end = Some(end);
+        if let Some(run) = self.audio_run.as_mut() {
+            run.next_sample = next_sample;
+            run.samples = total;
+        }
+        let end_segment =
+            ticks_to_duration(end - seg_start, VIDEO_TIMESCALE) >= self.cfg.segment_min;
+        if end_segment || end - part_start >= timing.cut {
+            self.rotate_part(end, end)?;
+            update.part = true;
+        }
+        if end_segment {
+            self.rotate_segment(end, now, true)?;
+            update.segment = true;
+        }
+        Ok(update)
+    }
+
     /// Explicit audio-only mode. Each accepted AAC-LC frame contributes exactly
     /// 1024 sample ticks, and each Opus packet its TOC duration; no rounded
     /// per-frame 90 kHz increment is accumulated. A malformed Opus packet is
@@ -1340,18 +1505,16 @@ impl Muxer {
         }
         let audio = self.audio.ok_or(MuxError::InvalidTracks)?;
         Self::validate_audio(audio)?;
+        let AudioConfig::Aac(aac) = audio else {
+            let packet = data.clone();
+            return self.push_opus_audio_only(pts, &packet, move || data, now);
+        };
         if pts < 0 || data.is_empty() {
             return Err(MuxError::Timestamp);
         }
-        let rate = i64::from(audio.sample_rate());
-        let (frame_samples, timing) = match audio {
-            AudioConfig::Aac(aac) => (AAC_FRAME, self.check_audio_part_timing(aac)?),
-            AudioConfig::Opus(_) => {
-                let packet = opus_packet(&data).ok_or(MuxError::InvalidAudio)?;
-                let samples = i64::from(packet.samples());
-                (samples, self.check_opus_part_timing(samples)?)
-            }
-        };
+        let rate = i64::from(aac.sample_rate);
+        let frame_samples = AAC_FRAME;
+        let timing = self.check_audio_part_timing(aac)?;
         let mut update = Update::default();
         if let Some(run) = &self.audio_run {
             let expected = i128::from(run.input_origin)
@@ -1399,18 +1562,6 @@ impl Muxer {
         let end = ticks(next_sample)?;
         if sample < 0 {
             return Err(MuxError::Timestamp);
-        }
-        if matches!(audio, AudioConfig::Opus(_))
-            && self
-                .part
-                .as_ref()
-                .is_some_and(|part| !part.audio.is_empty() && end - part.start_dts > timing.target)
-        {
-            // Only the part: an INDEPENDENT=YES part is exempt from the 85%
-            // floor (RFC 8216bis 4.4.4.9), and closing the segment too would
-            // shrink the count-limited window to single-part segments.
-            self.rotate_part(at, at)?;
-            update.part = true;
         }
         if self.next_segment.is_none() {
             let id = if self.entries.is_empty() {

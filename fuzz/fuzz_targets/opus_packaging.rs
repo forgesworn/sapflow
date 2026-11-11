@@ -5,8 +5,8 @@
 //! passed on. With the `OPT1` prefix, records of packet shapes, timestamp
 //! steps, gaps, steps back, malformed packets and interrupts go into an
 //! audio-only or video-led Opus muxer; rendered playlists must pass
-//! `playlist::RuleCheck` after every push, and a refused malformed packet
-//! must leave the muxer able to carry on.
+//! `playlist::RuleCheck` after every push, and a refused packet must change
+//! nothing a viewer or recorder could observe.
 #![no_main]
 use std::time::UNIX_EPOCH;
 
@@ -52,6 +52,23 @@ fn packet(toc: u8, frames: u8) -> Vec<u8> {
             p
         }
     }
+}
+
+/// What a viewer or recorder could observe of a muxer.
+fn observable(m: &Muxer) -> (u64, u64, usize, usize, u64, u64, String) {
+    (
+        m.next_part_id(),
+        m.media_sequence(),
+        m.entries().len(),
+        m.open_parts().len(),
+        m.breaks(),
+        m.current_initialization_id(),
+        if m.has_content() {
+            playlist::media(m, "p")
+        } else {
+            String::new()
+        },
+    )
 }
 
 /// Head: bit 0 video-led, bit 1 stereo. Records of four bytes: TOC, code 3
@@ -105,7 +122,11 @@ fn timing(data: &[u8]) {
                 }
             }
         }
+        let before = observable(&m);
         let result = m.push_audio_at(pts, Bytes::from(p), UNIX_EPOCH);
+        if result.is_err() {
+            assert_eq!(before, observable(&m), "a refused packet changed the muxer");
+        }
         pts = if flags & 2 != 0 {
             pts.saturating_sub(step)
         } else {

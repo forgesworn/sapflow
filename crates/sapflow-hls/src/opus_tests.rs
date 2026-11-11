@@ -516,6 +516,56 @@ fn an_inherited_part_target_under_120ms_refuses_audio_only_opus() {
     );
 }
 
+/// What a viewer or recorder could observe of a muxer.
+fn observable(m: &Muxer) -> (u64, u64, usize, usize, u64, String) {
+    (
+        m.next_part_id(),
+        m.media_sequence(),
+        m.entries().len(),
+        m.open_parts().len(),
+        m.breaks(),
+        if m.has_content() {
+            playlist::media(m, "p")
+        } else {
+            String::new()
+        },
+    )
+}
+
+/// The review's minor 7: a packet that would close the open part early was
+/// refused only after the part (and then the segment) had been rotated.
+#[test]
+fn a_refused_opus_packet_changes_nothing_even_where_it_would_close_a_part() {
+    let mut m = audio_only(MuxerConfig::default(), 2);
+    let mut pts = 0;
+    for _ in 0..60 {
+        m.push_audio_at(pts, Bytes::from(packet(960, true)), NOW)
+            .expect("20 ms");
+        pts += ticks(960);
+    }
+    for _ in 0..3 {
+        m.push_audio_at(pts, Bytes::from(packet(2880, true)), NOW)
+            .expect("60 ms");
+        pts += ticks(2880);
+    }
+    // The open part holds 180 ms of a 234 ms target: a 120 ms packet would
+    // close it. Refused for size, it must change nothing.
+    assert!(m.part.as_ref().is_some_and(|p| !p.audio.is_empty()));
+    m.next_segment.as_mut().expect("segment").bytes = MAX_SEGMENT_BYTES;
+    let before = (observable(&m), state(&m), m.audio_end);
+    let up = m.push_audio_at(pts, Bytes::from(packet(5760, true)), NOW);
+    assert!(matches!(up, Err(MuxError::SegmentTooLarge)), "{up:?}");
+    assert_eq!(before, (observable(&m), state(&m), m.audio_end));
+    // A discontinuous timestamp refused for a malformed packet changes
+    // nothing either.
+    let before = (observable(&m), state(&m), m.audio_end);
+    assert!(
+        m.push_audio_at(pts + 90_000, Bytes::from_static(&[0xfb, 0]), NOW)
+            .is_err()
+    );
+    assert_eq!(before, (observable(&m), state(&m), m.audio_end));
+}
+
 #[test]
 fn malformed_opus_is_refused_before_any_state_changes() {
     let bad: [&[u8]; 4] = [&[], &[0xf9, 1, 2, 3], &[0xfb, 0], &[0xfb, 49, 0]];
