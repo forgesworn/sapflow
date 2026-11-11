@@ -148,7 +148,7 @@ while let Some(e) = s.poll_event() {
     // Nominated, Connected(profile), Media(sapflow_rtp::Event), Ended(reason)
 }
 if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
-// s.state(), s.selected(), s.last_media() (for SAPFLOW_WHIP_STALE), s.close()
+// s.state(), s.selected(), s.send_tuple(), s.last_media() (for SAPFLOW_WHIP_STALE), s.close(now)
 ```
 
 | Module | What |

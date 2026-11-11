@@ -526,7 +526,7 @@ pub fn whip_session_run(data: &[u8]) -> Run {
                     sent.push((t, d));
                 }
             }
-            op::CLOSE => s.close(),
+            op::CLOSE => s.close(now),
             op::ELSEWHERE => {
                 let copier = copiers[usize::from(first >> 5) % copiers.len()];
                 let pick = usize::from(bytes.get(1).copied().unwrap_or(0));

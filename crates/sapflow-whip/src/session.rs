@@ -656,10 +656,12 @@ impl Session {
         self.flush();
     }
 
-    /// Ends the session: `close_notify` to the send tuple if DTLS is up.
+    /// Ends the session at `now`: `close_notify` to the send tuple if DTLS
+    /// is up. A deadline that has already passed ends it first, consent
+    /// among them, so nothing goes to a tuple whose consent has lapsed.
     /// Idempotent.
-    pub fn close(&mut self) {
-        if matches!(self.state, State::Ended(_)) {
+    pub fn close(&mut self, now: Instant) {
+        if self.expire(now) {
             return;
         }
         self.dtls.close();

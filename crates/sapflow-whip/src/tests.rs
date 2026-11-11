@@ -449,7 +449,7 @@ fn close_and_peer_close() {
     let (mut p, mut a, t0) = setup(13, &[GCM]);
     let s = &mut a.session;
     p.connect(s, t0);
-    s.close();
+    s.close(t0);
     assert_eq!(s.state(), State::Ended(EndReason::Closed));
     let mut alerts = 0;
     while let Some(t) = s.poll_transmit() {
@@ -457,7 +457,7 @@ fn close_and_peer_close() {
         alerts += usize::from(t.bytes.first() == Some(&21));
     }
     assert_eq!(alerts, 1, "close_notify");
-    s.close();
+    s.close(t0);
 
     let (mut p, mut a, t0) = setup(14, &[GCM]);
     let s = &mut a.session;
@@ -1320,4 +1320,23 @@ fn unauthenticated_dtls_after_connect_is_discarded() {
         assert_eq!(s.state(), State::Connected, "{name}");
         assert!(!ev.iter().any(|e| matches!(e, Event::Ended(_))), "{name}");
     }
+}
+
+/// close() after consent has lapsed ends the session for that reason and
+/// sends nothing: no close_notify to a tuple without consent.
+#[test]
+fn close_after_consent_lapsed_sends_nothing() {
+    let (mut p, mut a, t0) = setup(34, &[GCM]);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    for second in 1..=29u64 {
+        let at = t0 + Duration::from_secs(second);
+        s.handle_datagram(at, p.tuple, &p.audio(second as u8));
+        while s.poll_transmit().is_some() {}
+    }
+    // Consent from the check at t0 ran out at 30 s; close at 31 s, with no
+    // input or timer in between.
+    s.close(t0 + Duration::from_secs(31) + ms(1));
+    assert!(s.poll_transmit().is_none(), "nothing after consent lapsed");
+    assert_eq!(s.state(), State::Ended(EndReason::ConsentExpired));
 }
