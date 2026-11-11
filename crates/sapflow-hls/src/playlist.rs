@@ -163,23 +163,10 @@ pub fn media_with_mode(m: &Muxer, prefix: &str, low_latency: bool) -> String {
         .unwrap_or(m.current_initialization_id());
 
     let n = m.entries().len();
-    // RFC 8216bis 6.2.2 uses media duration, not a count of parents, for
-    // recent part tags. Keep whole parent part sets while their end lies
-    // within three target durations of the published edge (inclusive).
-    // Count published open-part spans too, including any decode-time gaps.
-    let part_window = Duration::from_secs(m.target_duration().saturating_mul(3));
-    let mut age = m
-        .open_parts()
-        .iter()
-        .fold(Duration::ZERO, |sum, part| sum.saturating_add(part.span));
-    let mut parts_from = n;
-    for (i, entry) in m.entries().iter().enumerate().rev() {
-        if age > part_window {
-            break;
-        }
-        parts_from = i;
-        age = age.saturating_add(entry.duration());
-    }
+    // Part tags for the segments whose end lies within three target
+    // durations of the published edge (RFC 8216bis 6.2.2), decided in one
+    // place with the muxer's part retention.
+    let parts_from = m.part_tags_from();
     for (i, entry) in m.entries().iter().enumerate() {
         match entry {
             Entry::Gap { duration } => {
@@ -472,6 +459,96 @@ pub fn multivariant(m: &Muxer) -> String {
     }
     let _ = write!(s, "\n{MEDIA_PLAYLIST}\n");
     s
+}
+
+/// RFC 8216bis 6.2.2's part rule, as a client sees it: "Clients MUST be
+/// able to download the Partial Segment for at least three Target Durations
+/// after the EXT-X-PART tag is removed from the Playlist." Time is the
+/// published media: every `EXTINF` the window has listed, once each, plus
+/// the open parts' spans. Call [`RetentionCheck::check`] after every push,
+/// so that no entry joins and leaves the window between calls.
+///
+/// A part whose tag a render stops listing must be served by
+/// [`Muxer::part`] until the published media is three target durations
+/// further on, unless the muxer counted it in
+/// [`Muxer::parts_released_early`] by then. For tests and fuzzing.
+#[derive(Debug, Default)]
+pub struct RetentionCheck {
+    listed: std::collections::BTreeSet<u64>,
+    /// Part id, and the published media when its tag left.
+    removed: std::collections::BTreeMap<u64, Duration>,
+    counted: u64,
+    closed: Duration,
+    published: Duration,
+    released_early: u64,
+    shortest: Option<Duration>,
+}
+
+impl RetentionCheck {
+    /// Checks the muxer after one more push, returning a description of the
+    /// first part listed but not served, or served too briefly.
+    pub fn check(&mut self, m: &Muxer) -> Result<(), String> {
+        for (i, entry) in m.entries().iter().enumerate() {
+            let msn = m.media_sequence() + i as u64;
+            if msn >= self.counted {
+                self.closed = self.closed.saturating_add(entry.duration());
+                self.counted = msn + 1;
+            }
+        }
+        let open = m
+            .open_parts()
+            .iter()
+            .fold(Duration::ZERO, |sum, part| sum.saturating_add(part.span));
+        self.published = self.published.max(self.closed.saturating_add(open));
+        let excused = m.parts_released_early() != self.released_early;
+        self.released_early = m.parts_released_early();
+        let listed: std::collections::BTreeSet<u64> = if m.has_content() {
+            media(m, "r")
+                .lines()
+                .filter_map(|l| l.strip_prefix("#EXT-X-PART:"))
+                .filter_map(|l| l.split("URI=\"r_part").nth(1))
+                .filter_map(|r| r.split('.').next()?.parse().ok())
+                .collect()
+        } else {
+            self.listed.clone()
+        };
+        for &id in &listed {
+            if !matches!(m.part(id), crate::PartLookup::Found(_)) {
+                return Err(format!("part {id} listed but not served"));
+            }
+        }
+        for &id in self.listed.difference(&listed) {
+            self.removed.entry(id).or_insert(self.published);
+        }
+        self.listed = listed;
+        let window = Duration::from_secs(m.target_duration().saturating_mul(3));
+        let mut gone = Vec::new();
+        for (&id, &left) in &self.removed {
+            if matches!(m.part(id), crate::PartLookup::Found(_)) {
+                continue;
+            }
+            let held = self.published.saturating_sub(left);
+            if held < window && !excused {
+                return Err(format!(
+                    "part {id} gone {held:?} after its tag left, under {window:?}"
+                ));
+            }
+            if !excused {
+                self.shortest = Some(self.shortest.map_or(held, |s| s.min(held)));
+            }
+            gone.push(id);
+        }
+        for id in gone {
+            self.removed.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// The shortest time, in published media, a part was still served
+    /// after its tag left, over the parts that have gone in their time.
+    pub fn shortest_held(&self) -> Option<Duration> {
+        self.shortest
+    }
 }
 
 #[cfg(test)]

@@ -40,6 +40,9 @@ mod opus_real_tests;
 mod live_window_tests;
 
 #[cfg(test)]
+mod part_retention_tests;
+
+#[cfg(test)]
 mod terminal_ts_tests;
 
 #[cfg(test)]
