@@ -74,6 +74,13 @@ pub const MAX_STREAMS: usize = 4;
 /// are already bounded by their rate limits.
 pub const MAX_QUEUED_FEEDBACK: usize = 256;
 
+/// Bytes reserved in each datagram for the SDES CNAME: a chunk with the
+/// longest CNAME, 255 bytes.
+pub const SDES_ROOM: usize = 268;
+/// The smallest feedback packet room: a transport-cc packet of
+/// [`crate::twcc::MIN_PACKET`] bytes.
+pub const MIN_ITEM: usize = crate::twcc::MIN_PACKET;
+
 /// Receiver reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReportConfig {
@@ -95,9 +102,13 @@ pub struct ReportConfig {
     /// feedback between reports goes without a receiver report and SDES.
     /// Default false.
     pub reduced_size: bool,
-    /// Largest RTCP datagram before SRTCP, in bytes. Feedback that does
-    /// not fit waits for the next datagram; one packet larger than this
-    /// still goes, alone. Default 1200.
+    /// Largest RTCP datagram before SRTCP, in bytes. Feedback packets are
+    /// sized when they are made to fit after the largest receiver report
+    /// and SDES CNAME this receiver could send (8 bytes, 24 per stream and
+    /// [`SDES_ROOM`]); what does not fit waits for the next datagram. So it
+    /// is a hard cap when it is at least that header and [`MIN_ITEM`]
+    /// together (436 bytes for four streams); below that, a packet that
+    /// cannot fit still goes, alone. Default 1200.
     pub max_datagram: usize,
 }
 impl Default for ReportConfig {
@@ -999,12 +1010,20 @@ impl Receiver {
         }
     }
 
+    /// Room for one feedback packet in a datagram, after the largest
+    /// receiver report and SDES CNAME.
+    fn item_room(&self) -> usize {
+        let header = 8 + 24 * self.streams.len() + SDES_ROOM;
+        self.config.reports.max_datagram.saturating_sub(header)
+    }
+
     fn flush_transport_cc(&mut self) {
+        let room = self.item_room();
         let media_ssrc = self.streams.iter().find_map(|s| s.ssrc).unwrap_or(0);
         let Some(t) = &mut self.twcc else {
             return;
         };
-        for built in t.flush(self.now) {
+        for built in t.flush(self.now, room) {
             if self.feedback.len() >= MAX_QUEUED_FEEDBACK {
                 t.note_dropped(1);
                 continue;
@@ -1124,7 +1143,11 @@ impl Receiver {
         {
             next = Some(next.map_or(t, |n| n.min(t)));
         }
-        next.map(|t| self.epoch + Duration::from_micros(t.max(self.now)))
+        // A time too far to represent is no timer.
+        next.and_then(|t| {
+            self.epoch
+                .checked_add(Duration::from_micros(t.max(self.now)))
+        })
     }
 
     /// The next event, in order. None while the start hold lasts.
@@ -1158,7 +1181,8 @@ impl Receiver {
     /// which RFC 3550 section 6.1 does not allow outside reduced-size
     /// RTCP). Then queued NACK, PLI, FIR and transport-cc feedback, oldest
     /// first, while the datagram stays within
-    /// [`ReportConfig::max_datagram`]; one packet always goes. With
+    /// [`ReportConfig::max_datagram`] (a hard cap from 436 bytes; see
+    /// there). With
     /// [`ReportConfig::reduced_size`], a datagram when no report is due
     /// carries the feedback alone.
     pub fn poll_feedback(&mut self, sender_ssrc: u32, cname: &[u8], out: &mut Vec<u8>) -> bool {
@@ -1239,7 +1263,7 @@ impl Receiver {
         if rate == 0 || need > u64::from(self.config.nack_burst) * 1_000_000 {
             return None;
         }
-        Some(self.now + (need - self.tokens).div_ceil(rate))
+        Some(self.now.saturating_add((need - self.tokens).div_ceil(rate)))
     }
 
     fn refill(&mut self) {
@@ -1256,6 +1280,7 @@ impl Receiver {
     fn run(&mut self) {
         let now = self.now;
         let rtt = self.srtt;
+        let room = self.item_room().max(MIN_ITEM) as u64;
         self.refill();
         for (i, s) in self.streams.iter_mut().enumerate() {
             let id = StreamId(i);
@@ -1266,7 +1291,7 @@ impl Receiver {
                 && let Some(ssrc) = s.ssrc
             {
                 let due = s.buffer.due_nacks(now, rtt);
-                let (take, bytes) = nack_fit(&due, self.tokens / 1_000_000);
+                let (take, bytes) = nack_fit(&due, (self.tokens / 1_000_000).min(room));
                 if let Some(sent) = due.get(..take)
                     && !sent.is_empty()
                 {

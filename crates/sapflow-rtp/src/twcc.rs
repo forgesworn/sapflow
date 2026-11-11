@@ -213,8 +213,11 @@ impl Recorder {
         (!self.pending.is_empty()).then(|| self.last_flush.saturating_add(self.interval))
     }
 
-    /// Builds feedback for everything pending, at `now`.
-    pub fn flush(&mut self, now: u64) -> Vec<Built> {
+    /// Builds feedback for everything pending, at `now`, in packets of at
+    /// most `room` bytes as well as [`TransportCcConfig::max_packet`] (and
+    /// at least [`MIN_PACKET`]).
+    pub fn flush(&mut self, now: u64, room: usize) -> Vec<Built> {
+        let max_packet = self.cfg.max_packet.min(room).max(MIN_PACKET);
         self.last_flush = now;
         let mut pending = std::mem::take(&mut self.pending);
         pending.sort_unstable_by_key(|p| p.0);
@@ -225,7 +228,7 @@ impl Recorder {
                 Some(nb) if nb <= next && next - nb <= u64::from(MAX_RUN) => nb,
                 _ => next,
             };
-            let (fci, used, last) = encode(base, rest, self.fb_count, self.cfg.max_packet);
+            let (fci, used, last) = encode(base, rest, self.fb_count, max_packet);
             out.push(Built { fci });
             self.stats.feedback += 1;
             self.fb_count = self.fb_count.wrapping_add(1);
@@ -547,7 +550,7 @@ mod tests {
         for &(seq, at) in packets {
             r.record(at, &element(seq));
         }
-        r.flush(now)
+        r.flush(now, usize::MAX)
             .into_iter()
             .map(|b| {
                 assert!(b.fci.len() + 12 <= r.config().max_packet);
@@ -619,7 +622,7 @@ mod tests {
         let mut r = Recorder::new(TransportCcConfig::new(3));
         r.record(64_250, &element(100));
         r.record(164_250, &element(102));
-        let built = r.flush(200 * MS);
+        let built = r.flush(200 * MS, usize::MAX);
         let mut out = Vec::new();
         crate::rtcp::build::transport_cc(&mut out, 0x0102_0304, 0x0a0b_0c0d, &built[0].fci)
             .expect("builds");
@@ -840,7 +843,7 @@ mod tests {
         for &(seq, at) in &packets {
             r.record(at, &element(seq));
         }
-        let built = r.flush(30_000 * MS);
+        let built = r.flush(30_000 * MS, usize::MAX);
         assert!(built.len() > 1);
         let mut next = 0u16;
         let mut seen = 0;
@@ -874,7 +877,7 @@ mod tests {
         assert!(!r.record(0, &element(3)));
         assert!(r.record(0, &element(4)), "full");
         assert_eq!(r.due(), Some(50 * MS));
-        assert_eq!(r.flush(1).len(), 1);
+        assert_eq!(r.flush(1, usize::MAX).len(), 1);
         assert_eq!(r.due(), None);
     }
 }

@@ -251,7 +251,7 @@ pub fn twcc_feedback(data: &[u8]) -> usize {
     // none skipped, none twice, none invented, and gaps only where nothing
     // was recorded.
     let mut check = |r: &mut Recorder, now: u64, pending: &mut BTreeMap<i64, u64>| {
-        let built = r.flush(now);
+        let built = r.flush(now, usize::MAX);
         assert!(
             built.len() <= pending.len(),
             "each feedback reports a packet"
@@ -366,7 +366,7 @@ fn ntp_after(us: i64) -> u64 {
 }
 
 /// `sr_timeline`: a mode byte (bit 0: no start hold; bit 1: reduced-size
-/// RTCP; bit 2: a 64-event queue, a 4000-byte hold and 300-byte
+/// RTCP; bit 2: a 64-event queue, a 4000-byte hold and 500-byte
 /// datagrams), then records whose first byte picks an operation (modulo
 /// 6):
 ///
@@ -405,7 +405,7 @@ fn run_sr_timeline(data: &[u8]) -> Option<Session> {
     if mode & 4 != 0 {
         cfg.max_events = 64;
         cfg.timeline.max_hold_bytes = 4000;
-        cfg.reports.max_datagram = 300;
+        cfg.reports.max_datagram = 500;
     }
     let start = Instant::now();
     let mut r = Receiver::new(cfg, start);
@@ -589,11 +589,7 @@ impl Session {
             let c = Compound::parse(&d).expect("datagram parses");
             let packets: Vec<_> = c.packets().map(|p| p.expect("valid")).collect();
             assert!(!packets.is_empty());
-            assert!(
-                d.len() <= cfg.reports.max_datagram || packets.len() <= 3,
-                "{} bytes",
-                d.len()
-            );
+            assert!(d.len() <= cfg.reports.max_datagram, "{} bytes", d.len());
             if !cfg.reports.reduced_size {
                 assert!(c.starts_with_report(), "RR first");
             }
