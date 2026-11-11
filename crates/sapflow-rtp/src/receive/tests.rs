@@ -1043,3 +1043,80 @@ fn sequence_restarts_and_backwards_clocks() {
         1
     );
 }
+
+#[test]
+fn opus_fill_cannot_be_amplified_by_timestamps() {
+    // The review's case: 1023 tiny packets, each 96 120 samples (2 s)
+    // after the last, all arriving within the start hold. Before the fill
+    // was bounded by arrival time, one handle_timeout gave 819 424 events.
+    let mut r = Receiver::new(ReceiverConfig::default(), Instant::now());
+    r.add_stream(StreamConfig::new(Codec::Opus, 111))
+        .expect("audio");
+    let tiny = [0xe0u8, 1];
+    let mut ts = 0u32;
+    for n in 0..1023u16 {
+        let at = r.epoch + Duration::from_micros(u64::from(n) * 8);
+        let d = pkt(111, 5, n, ts, false, &tiny);
+        r.handle_rtp(at, &RtpPacket::parse(&d).expect("rtp"))
+            .expect("taken");
+        ts = ts.wrapping_add(96_120);
+    }
+    r.handle_timeout(r.epoch + Duration::from_millis(10));
+    let (mut events, mut bytes, mut fill) = (0usize, 0usize, 0u32);
+    while let Some(e) = r.poll_event() {
+        events += 1;
+        if let Event::Audio { frame, .. } = &e {
+            bytes += frame.data.len();
+            if frame.kind != FrameKind::Media {
+                fill += frame.duration;
+            }
+        }
+    }
+    // Each packet, and at most a discontinuity before it; fill within the
+    // 200 ms allowance.
+    assert!(events <= 2 * 1023, "{events} events");
+    assert!(fill <= 9_600, "{fill} samples filled");
+    assert!(
+        bytes <= 2 * 1023 + 9_600 / 120 * 3,
+        "{bytes} bytes of frames"
+    );
+}
+
+#[test]
+fn the_event_queue_is_bounded() {
+    let cfg = ReceiverConfig {
+        max_events: 10,
+        ..ReceiverConfig::default()
+    };
+    let mut r = Receiver::new(cfg, Instant::now());
+    let mut v = StreamConfig::new(Codec::H264, 96);
+    v.pli = true;
+    r.add_stream(v).expect("video");
+    let stap = [
+        0x78, 0, 5, 0x67, 0x42, 0xc0, 0x1e, 0xda, 0, 4, 0x68, 0xce, 0x3c, 0x80, 0, 3, 0x65, 0x88, 1,
+    ];
+    // Twenty IDRs, never drained: ten queued, ten dropped and counted.
+    for n in 0..20u16 {
+        feed(
+            &mut r,
+            20 + u64::from(n),
+            &pkt(96, 7, n, u32::from(n) * 3000, true, &stap),
+        )
+        .expect("taken");
+    }
+    let stats = r.stats(StreamId(0)).expect("stats");
+    assert_eq!((stats.frames, stats.events_dropped), (10, 10));
+    // The first packet asked for a keyframe; a dropped access unit then
+    // means waiting for an IDR.
+    assert!(std::iter::from_fn(|| r.poll_feedback()).any(|f| matches!(f, Feedback::Pli { .. })));
+    assert_eq!(std::iter::from_fn(|| r.poll_event()).count(), 10);
+    let p = [0x41, 0x9a, 1];
+    feed(&mut r, 50, &pkt(96, 7, 20, 60_000, true, &p)).expect("taken");
+    assert!(matches!(
+        r.poll_event(),
+        Some(Event::FrameSkipped {
+            reason: SkipReason::AfterLoss,
+            ..
+        })
+    ));
+}

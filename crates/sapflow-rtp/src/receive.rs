@@ -83,6 +83,12 @@ pub struct ReceiverConfig {
     pub h264: H264Limits,
     /// Opus fill bounds.
     pub opus: OpusLimits,
+    /// Most events queued at once, all streams together. Beyond it,
+    /// events are dropped and counted (`StreamStats::events_dropped`), and
+    /// a video stream that lost one waits for an IDR. A caller that drains
+    /// [`Receiver::poll_event`] after every call never reaches it. Default
+    /// 8192.
+    pub max_events: usize,
 }
 impl Default for ReceiverConfig {
     fn default() -> Self {
@@ -101,6 +107,7 @@ impl Default for ReceiverConfig {
             keyframe_retry: Duration::from_secs(1),
             h264: H264Limits::default(),
             opus: OpusLimits::default(),
+            max_events: 8192,
         }
     }
 }
@@ -431,6 +438,8 @@ pub struct StreamStats {
     pub refused: u64,
     /// Sequence and timestamp discontinuities.
     pub discontinuities: u64,
+    /// Events dropped because the queue was full.
+    pub events_dropped: u64,
 }
 
 /// When to ask for a keyframe.
@@ -507,7 +516,7 @@ pub struct Receiver {
     /// Microseconds since `epoch`, never going back.
     now: u64,
     streams: Vec<Stream>,
-    events: VecDeque<Event>,
+    events: Events,
     feedback: VecDeque<Feedback>,
     srtt: u64,
     rtt_measured: bool,
@@ -528,7 +537,10 @@ impl Receiver {
             epoch: now,
             now: 0,
             streams: Vec::new(),
-            events: VecDeque::new(),
+            events: Events {
+                queue: VecDeque::new(),
+                max: config.max_events,
+            },
             feedback: VecDeque::new(),
             srtt: micros(config.initial_rtt),
             rtt_measured: false,
@@ -783,7 +795,7 @@ impl Receiver {
 
     /// The next event, in order.
     pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        self.events.queue.pop_front()
     }
 
     /// The next RTCP feedback to send.
@@ -902,7 +914,26 @@ fn nack_fit(due: &[u64], budget: u64) -> (usize, u64) {
     (take, if take == 0 { 0 } else { size })
 }
 
-fn release(s: &mut Stream, id: StreamId, r: Released, events: &mut VecDeque<Event>) {
+/// The event queue, bounded by [`ReceiverConfig::max_events`].
+#[derive(Debug)]
+struct Events {
+    queue: VecDeque<Event>,
+    max: usize,
+}
+impl Events {
+    /// Queues `event`, or drops and counts it if the queue is full.
+    #[must_use]
+    fn push(&mut self, stats: &mut StreamStats, event: Event) -> bool {
+        if self.queue.len() >= self.max {
+            stats.events_dropped += 1;
+            return false;
+        }
+        self.queue.push_back(event);
+        true
+    }
+}
+
+fn release(s: &mut Stream, id: StreamId, r: Released, events: &mut Events) {
     match r {
         Released::Packet(p) => {
             let sequence = p.seq as u16;
@@ -910,22 +941,28 @@ fn release(s: &mut Stream, id: StreamId, r: Released, events: &mut VecDeque<Even
                 Media::Video(v) => {
                     if let Err(e) = v.depack.push(p.timestamp, p.marker, &p.payload) {
                         s.stats.refused += 1;
-                        events.push_back(Event::Refused {
-                            stream: id,
-                            sequence,
-                            error: PayloadError::H264(e),
-                        });
+                        let _ = events.push(
+                            &mut s.stats,
+                            Event::Refused {
+                                stream: id,
+                                sequence,
+                                error: PayloadError::H264(e),
+                            },
+                        );
                     }
                     drain_video(v, id, &mut s.stats, events);
                 }
                 Media::Audio(a) => {
-                    if let Err(e) = a.push(p.timestamp, &p.payload) {
+                    if let Err(e) = a.push(p.timestamp, p.arrival, &p.payload) {
                         s.stats.refused += 1;
-                        events.push_back(Event::Refused {
-                            stream: id,
-                            sequence,
-                            error: PayloadError::Opus(e),
-                        });
+                        let _ = events.push(
+                            &mut s.stats,
+                            Event::Refused {
+                                stream: id,
+                                sequence,
+                                error: PayloadError::Opus(e),
+                            },
+                        );
                     }
                     drain_audio(a, id, &mut s.stats, events);
                 }
@@ -933,11 +970,14 @@ fn release(s: &mut Stream, id: StreamId, r: Released, events: &mut VecDeque<Even
         }
         Released::Lost { first, count } => {
             s.stats.lost += count;
-            events.push_back(Event::Lost {
-                stream: id,
-                first: first as u16,
-                count,
-            });
+            let _ = events.push(
+                &mut s.stats,
+                Event::Lost {
+                    stream: id,
+                    first: first as u16,
+                    count,
+                },
+            );
             match &mut s.media {
                 Media::Video(v) => {
                     v.depack.lost();
@@ -956,41 +996,54 @@ fn release(s: &mut Stream, id: StreamId, r: Released, events: &mut VecDeque<Even
                 }
                 Media::Audio(a) => a.reset(),
             }
-            events.push_back(Event::Discontinuity {
-                stream: id,
-                cause: Discontinuity::Sequence,
-            });
+            let _ = events.push(
+                &mut s.stats,
+                Event::Discontinuity {
+                    stream: id,
+                    cause: Discontinuity::Sequence,
+                },
+            );
         }
     }
 }
 
-fn drain_video(v: &mut Video, id: StreamId, stats: &mut StreamStats, events: &mut VecDeque<Event>) {
+fn drain_video(v: &mut Video, id: StreamId, stats: &mut StreamStats, events: &mut Events) {
     while let Some(o) = v.depack.poll() {
         match o {
             H264Output::Frame(au) => match v.awaiting {
                 Some(reason) if !au.idr => {
                     stats.skipped += 1;
-                    events.push_back(Event::FrameSkipped {
-                        stream: id,
-                        timestamp: au.timestamp,
-                        reason,
-                    });
+                    let _ = events.push(
+                        stats,
+                        Event::FrameSkipped {
+                            stream: id,
+                            timestamp: au.timestamp,
+                            reason,
+                        },
+                    );
                 }
                 _ => {
                     if v.awaiting.take().is_some() {
                         v.keyframes.awaiting = false;
                     }
-                    stats.frames += 1;
-                    events.push_back(Event::AccessUnit { stream: id, au });
+                    if events.push(stats, Event::AccessUnit { stream: id, au }) {
+                        stats.frames += 1;
+                    } else {
+                        // The decoder would miss a frame: wait for an IDR.
+                        v.unrecoverable();
+                    }
                 }
             },
             H264Output::Incomplete { timestamp, reason } => {
                 stats.incomplete += 1;
-                events.push_back(Event::IncompleteFrame {
-                    stream: id,
-                    timestamp,
-                    reason,
-                });
+                let _ = events.push(
+                    stats,
+                    Event::IncompleteFrame {
+                        stream: id,
+                        timestamp,
+                        reason,
+                    },
+                );
                 v.unrecoverable();
             }
         }
@@ -1001,7 +1054,7 @@ fn drain_audio(
     a: &mut opus::Depacketiser,
     id: StreamId,
     stats: &mut StreamStats,
-    events: &mut VecDeque<Event>,
+    events: &mut Events,
 ) {
     while let Some(o) = a.poll() {
         match o {
@@ -1011,20 +1064,23 @@ fn drain_audio(
                     FrameKind::Dtx => stats.dtx_frames += 1,
                     FrameKind::Loss => stats.loss_frames += 1,
                 }
-                events.push_back(Event::Audio { stream: id, frame });
+                let _ = events.push(stats, Event::Audio { stream: id, frame });
             }
             OpusOutput::Discontinuity {
                 expected,
                 timestamp,
             } => {
                 stats.discontinuities += 1;
-                events.push_back(Event::Discontinuity {
-                    stream: id,
-                    cause: Discontinuity::Timestamp {
-                        expected,
-                        timestamp,
+                let _ = events.push(
+                    stats,
+                    Event::Discontinuity {
+                        stream: id,
+                        cause: Discontinuity::Timestamp {
+                            expected,
+                            timestamp,
+                        },
                     },
-                });
+                );
             }
         }
     }

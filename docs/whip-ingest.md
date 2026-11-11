@@ -500,7 +500,13 @@ means:
   numbers that NACK did not recover is loss. Both are filled with a constant
   encoded-silence Opus frame of matching channel layout, so players see a
   continuous track. Only the loss counts as media loss. W1 verifies the
-  silence frame against a reference decoder run as a black box.
+  silence frame against a reference decoder run as a black box. The
+  timestamp is the sender's to choose, so fill is bounded by arrival time:
+  a gap is filled only up to the time between the two packets' arrivals
+  plus the jitter allowance, and in total never runs ahead of arrival time
+  by more than that allowance and the fill limit. A timestamp advance
+  beyond the bound is a discontinuity, which re-anchors the track and is
+  not filled.
 - The same in recordings, including the recording checkpoint and programme
   modules.
 - `sapflow-client` and `sapflow-ffi` keep AAC. The native SDK does not publish

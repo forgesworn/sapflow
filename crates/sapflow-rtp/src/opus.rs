@@ -7,12 +7,18 @@
 //! of RFC 6716 section 3.4 (R1 to R7) and gives its frame count and total
 //! duration; nothing in the packet is trusted before that.
 //!
-//! [`Depacketiser`] is fed packets in sequence order and told where
-//! packets were lost. A timestamp gap with no loss before it is the
-//! sender's silence suppression (DTX); a gap after a loss is loss. Both
-//! are filled with [`silence`] packets of the stream's channel layout, so
-//! the output timeline has no holes, and the two are marked apart
-//! ([`FrameKind`]).
+//! [`Depacketiser`] is fed packets in sequence order, with when each
+//! arrived, and told where packets were lost. A timestamp gap with no loss
+//! before it is the sender's silence suppression (DTX); a gap after a loss
+//! is loss. Both are filled with [`silence`] packets of the stream's
+//! channel layout, so the output timeline has no holes, and the two are
+//! marked apart ([`FrameKind`]).
+//!
+//! The RTP timestamp is the sender's to choose, so fill is bounded by
+//! arrival time too: a gap is filled only if it is no longer than the time
+//! between the two packets' arrivals plus an allowance for jitter, and
+//! total fill never runs ahead of arrival time by more than the fill limit
+//! and that allowance. Anything beyond is a discontinuity, not silence.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -363,10 +369,17 @@ pub struct OpusLimits {
     /// longer gap, or a timestamp that goes backwards, is a discontinuity
     /// and is not filled. Default 96 000 (2 s).
     pub max_fill: u32,
+    /// How far a gap may exceed the arrival time between its two packets,
+    /// in 48 kHz samples, for network jitter. Default 9600 (200 ms, the
+    /// jitter wait).
+    pub allowance: u32,
 }
 impl Default for OpusLimits {
     fn default() -> Self {
-        Self { max_fill: 96_000 }
+        Self {
+            max_fill: 96_000,
+            allowance: 9_600,
+        }
     }
 }
 
@@ -398,6 +411,13 @@ pub struct Depacketiser {
     out: VecDeque<OpusOutput>,
     /// Samples of gaps too short to fill (under 2.5 ms), in total.
     unfilled: u64,
+    /// When the last packet arrived, in microseconds on the caller's clock.
+    arrived: Option<u64>,
+    /// Fill still allowed, in samples: it grows with arrival time up to
+    /// `max_fill + allowance`, and filling spends it.
+    credit: u64,
+    /// Samples filled with silence, in total.
+    filled: u64,
 }
 
 impl Depacketiser {
@@ -410,6 +430,9 @@ impl Depacketiser {
             gap: false,
             out: VecDeque::new(),
             unfilled: 0,
+            arrived: None,
+            credit: u64::from(limits.allowance),
+            filled: 0,
         }
     }
 
@@ -431,14 +454,29 @@ impl Depacketiser {
         self.unfilled
     }
 
+    /// Samples filled with silence, in total.
+    pub fn filled_samples(&self) -> u64 {
+        self.filled
+    }
+
     /// The next output, in order.
     pub fn poll(&mut self) -> Option<OpusOutput> {
         self.out.pop_front()
     }
 
-    /// One RTP payload, the next in sequence order. A packet that fails
-    /// [`parse_packet`] is refused and counts as lost.
-    pub fn push(&mut self, timestamp: u32, payload: &[u8]) -> Result<(), OpusError> {
+    /// One RTP payload, the next in sequence order, and when it arrived
+    /// (microseconds on any clock that does not go back). A packet that
+    /// fails [`parse_packet`] is refused and counts as lost.
+    pub fn push(&mut self, timestamp: u32, arrival: u64, payload: &[u8]) -> Result<(), OpusError> {
+        // Arrival time since the last packet, in samples, earns fill.
+        let since = self
+            .arrived
+            .map_or(0, |a| arrival.saturating_sub(a))
+            .saturating_mul(u64::from(CLOCK_RATE / 1000))
+            / 1000;
+        self.arrived = Some(self.arrived.map_or(arrival, |a| a.max(arrival)));
+        let cap = u64::from(self.limits.max_fill) + u64::from(self.limits.allowance);
+        self.credit = self.credit.saturating_add(since).min(cap);
         let info = match parse_packet(payload) {
             Ok(info) => info,
             Err(e) => {
@@ -449,8 +487,14 @@ impl Depacketiser {
         if let Some(expected) = self.next {
             let delta = timestamp.wrapping_sub(expected);
             if delta != 0 {
-                // A negative step reads as a huge positive one.
-                if delta <= self.limits.max_fill {
+                // A negative step reads as a huge positive one. The gap
+                // must fit the fill limit, the time the sender really took
+                // (plus the allowance), and the credit left.
+                let allowed = u64::from(self.limits.max_fill)
+                    .min(since + u64::from(self.limits.allowance))
+                    .min(self.credit);
+                if u64::from(delta) <= allowed {
+                    self.credit -= u64::from(delta);
                     let kind = if self.gap {
                         FrameKind::Loss
                     } else {
@@ -500,28 +544,29 @@ impl Depacketiser {
         let mut at = start;
         let mut left = samples;
         let chunk = frame_samples * u32::from(frames);
-        let mut push = |at: &mut u32, left: &mut u32, fs: u32, n: u8| {
-            if let Some(data) = silence(fs, n, stereo) {
-                let duration = fs * u32::from(n);
-                self.out.push_back(OpusOutput::Frame(OpusFrame {
-                    timestamp: *at,
-                    duration,
-                    stereo,
-                    data,
-                    kind,
-                }));
-                *at = at.wrapping_add(duration);
-                *left -= duration;
-            }
+        let out = &mut self.out;
+        let mut push = |at: &mut u32, left: &mut u32, fs: u32, n: u8| -> bool {
+            let Some(data) = silence(fs, n, stereo) else {
+                return false;
+            };
+            let duration = fs * u32::from(n);
+            out.push_back(OpusOutput::Frame(OpusFrame {
+                timestamp: *at,
+                duration,
+                stereo,
+                data,
+                kind,
+            }));
+            *at = at.wrapping_add(duration);
+            *left -= duration;
+            true
         };
-        while left >= chunk {
-            push(&mut at, &mut left, frame_samples, frames);
-        }
+        // Every loop ends: each step either fills or stops.
+        while left >= chunk && push(&mut at, &mut left, frame_samples, frames) {}
         for fs in [960, 480, 240, 120] {
-            while left >= fs {
-                push(&mut at, &mut left, fs, 1);
-            }
+            while left >= fs && push(&mut at, &mut left, fs, 1) {}
         }
+        self.filled += u64::from(samples - left);
         self.unfilled += u64::from(left);
     }
 }
@@ -705,6 +750,11 @@ mod tests {
         }
     }
 
+    /// An honest arrival time: the timestamp, in microseconds.
+    fn at(ts: u32) -> u64 {
+        u64::from(ts) * 1000 / 48
+    }
+
     fn frames(d: &mut Depacketiser) -> Vec<OpusOutput> {
         std::iter::from_fn(|| d.poll()).collect()
     }
@@ -722,13 +772,15 @@ mod tests {
     fn dtx_and_loss_fill() {
         let mut d = Depacketiser::new(OpusLimits::default());
         let speech = [0xfcu8, 1, 2, 3];
-        d.push(1000, &speech).expect("ok");
-        d.push(1960, &speech).expect("ok");
+        d.push(1000, at(1000), &speech).expect("ok");
+        d.push(1960, at(1960), &speech).expect("ok");
         // DTX: the next packet is 3 frames later with no loss.
-        d.push(1960 + 960 * 3, &speech).expect("ok");
+        d.push(1960 + 960 * 3, at(1960 + 960 * 3), &speech)
+            .expect("ok");
         // Loss: one packet lost, its 20 ms filled and marked.
         d.lost();
-        d.push(1960 + 960 * 5, &speech).expect("ok");
+        d.push(1960 + 960 * 5, at(1960 + 960 * 5), &speech)
+            .expect("ok");
         let out = frames(&mut d);
         use FrameKind::*;
         assert_eq!(
@@ -758,11 +810,11 @@ mod tests {
         // 60 ms SILK packets (config 3, mono): silence comes as 3 x 20 ms
         // CELT, then the rest in the largest frames that fit.
         let silk60 = [0x18u8, 9, 9];
-        d.push(0, &silk60).expect("ok");
+        d.push(0, at(0), &silk60).expect("ok");
         d.lost();
         // 2880 * 2 + 960 + 240 + 120 + 50 samples later.
         let gap = 2880 * 2 + 960 + 240 + 120 + 50;
-        d.push(2880 + gap, &silk60).expect("ok");
+        d.push(2880 + gap, at(2880 + gap), &silk60).expect("ok");
         let out = frames(&mut d);
         let k: Vec<u32> = kinds(&out).iter().map(|k| k.1).collect();
         assert_eq!(k, [2880, 2880, 2880, 960, 240, 120, 2880]);
@@ -776,24 +828,33 @@ mod tests {
 
     #[test]
     fn discontinuities_are_not_filled() {
-        let mut d = Depacketiser::new(OpusLimits { max_fill: 9600 });
+        let mut d = Depacketiser::new(OpusLimits {
+            max_fill: 9600,
+            ..OpusLimits::default()
+        });
         let p = [0xf8u8, 1];
-        d.push(0, &p).expect("ok");
-        d.push(960 + 9600, &p).expect("ok, at the limit");
+        d.push(0, at(0), &p).expect("ok");
+        d.push(960 + 9600, at(960 + 9600), &p)
+            .expect("ok, at the limit");
         assert_eq!(frames(&mut d).len(), 1 + 10 + 1);
-        d.push(20_000 + 9601, &p).expect("ok");
+        d.push(20_000 + 9601, at(20_000 + 9601), &p).expect("ok");
         let out = frames(&mut d);
         assert!(matches!(out[0], OpusOutput::Discontinuity { .. }));
         assert_eq!(out.len(), 2);
         // Backwards, and the 2^31 jump the fuzzer would find: no fill.
-        d.push(5, &p).expect("ok");
-        d.push(5u32.wrapping_add(1 << 31), &p).expect("ok");
+        d.push(5, at(5), &p).expect("ok");
+        d.push(
+            5u32.wrapping_add(1 << 31),
+            at(5u32.wrapping_add(1 << 31)),
+            &p,
+        )
+        .expect("ok");
         let out = frames(&mut d);
         assert_eq!(out.len(), 4);
         // Across the 32-bit wrap is an ordinary step.
-        d.push(u32::MAX - 959, &p).expect("ok");
-        d.push(0, &p).expect("ok");
-        d.push(960 * 2, &p).expect("ok");
+        d.push(u32::MAX - 959, at(u32::MAX - 959), &p).expect("ok");
+        d.push(0, at(0), &p).expect("ok");
+        d.push(960 * 2, at(960 * 2), &p).expect("ok");
         let out = frames(&mut d);
         assert_eq!(
             kinds(&out).iter().map(|k| k.2).collect::<Vec<_>>(),
@@ -809,14 +870,71 @@ mod tests {
     #[test]
     fn refused_packets_count_as_loss() {
         let mut d = Depacketiser::new(OpusLimits::default());
-        d.push(0, &[0xf8, 1]).expect("ok");
-        assert_eq!(d.push(960, &[0xf9, 1]), Err(OpusError::UnequalFrames));
-        d.push(1920, &[0xf8, 1]).expect("ok");
+        d.push(0, at(0), &[0xf8, 1]).expect("ok");
+        assert_eq!(
+            d.push(960, at(960), &[0xf9, 1]),
+            Err(OpusError::UnequalFrames)
+        );
+        d.push(1920, at(1920), &[0xf8, 1]).expect("ok");
         let out = frames(&mut d);
         assert_eq!(kinds(&out)[1], (960, 960, FrameKind::Loss));
         // A reset forgets the timeline.
         d.reset();
-        d.push(50_000, &[0xf8, 1]).expect("ok");
+        d.push(50_000, at(50_000), &[0xf8, 1]).expect("ok");
         assert_eq!(frames(&mut d).len(), 1);
+    }
+
+    #[test]
+    fn fill_is_bounded_by_arrival_time() {
+        // A sender claims 2 s gaps between packets that arrive together:
+        // only the 200 ms allowance is ever filled, the rest are
+        // discontinuities.
+        let mut d = Depacketiser::new(OpusLimits::default());
+        let tiny = [0xe0u8, 1];
+        let mut ts = 0u32;
+        for n in 0..1023u64 {
+            d.push(ts, n, &tiny).expect("ok");
+            ts = ts.wrapping_add(96_120);
+        }
+        let out = frames(&mut d);
+        let fill: u32 = kinds(&out)
+            .iter()
+            .filter(|k| k.2 != FrameKind::Media)
+            .map(|k| k.1)
+            .sum();
+        assert_eq!(u64::from(fill), d.filled_samples());
+        assert!(fill <= 9_600, "{fill}");
+        assert!(out.len() <= 2 * 1023, "{}", out.len());
+        // Small gaps spend the same credit: back to back, 100 ms each,
+        // only two fit.
+        let mut d = Depacketiser::new(OpusLimits::default());
+        let p = [0xf8u8, 1];
+        for n in 0..10u32 {
+            d.push(n * (960 + 4800), 0, &p).expect("ok");
+        }
+        let out = frames(&mut d);
+        let filled = kinds(&out).iter().filter(|k| k.2 == FrameKind::Dtx).count();
+        assert_eq!(filled, 10, "two gaps of five 20 ms frames");
+        // A real DTX pause: the next packet really is 1.5 s later.
+        let mut d = Depacketiser::new(OpusLimits::default());
+        d.push(0, 0, &p).expect("ok");
+        d.push(960 + 72_000, 1_520_000, &p).expect("ok");
+        let out = frames(&mut d);
+        assert_eq!(
+            kinds(&out).iter().filter(|k| k.2 == FrameKind::Dtx).count(),
+            75
+        );
+        // Credit grows with arrival time only up to the fill limit and the
+        // allowance: after a minute's quiet, a 2 s gap and a 200 ms gap
+        // fill, and a third straight after does not.
+        d.push(73_920 + 96_000, 60_000_000, &p).expect("ok");
+        assert_eq!(frames(&mut d).len(), 101);
+        d.push(170_880 + 9_600, 60_000_000, &p).expect("ok");
+        assert_eq!(frames(&mut d).len(), 11);
+        d.push(181_440 + 960, 60_000_000, &p).expect("ok");
+        assert!(matches!(
+            frames(&mut d)[0],
+            OpusOutput::Discontinuity { .. }
+        ));
     }
 }

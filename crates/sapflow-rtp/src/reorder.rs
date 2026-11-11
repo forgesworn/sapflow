@@ -37,6 +37,8 @@ pub(crate) struct Stored {
     pub timestamp: u32,
     pub marker: bool,
     pub payload: Vec<u8>,
+    /// When it arrived.
+    pub arrival: u64,
 }
 
 /// A packet set aside as a possible restart: sequence number and packet.
@@ -175,6 +177,7 @@ impl Reorder {
             timestamp,
             marker,
             payload: payload.to_vec(),
+            arrival: now,
         };
         if !self.started {
             self.start(now, seq, stored(0));
@@ -220,6 +223,7 @@ impl Reorder {
                 timestamp,
                 marker,
                 payload: payload.to_vec(),
+                arrival: now,
             }));
             self.bytes += payload.len();
             self.head = ext;
@@ -241,6 +245,7 @@ impl Reorder {
                     timestamp,
                     marker,
                     payload: payload.to_vec(),
+                    arrival: now,
                 });
             }
             self.missing -= 1;
@@ -288,6 +293,7 @@ impl Reorder {
             timestamp,
             marker,
             payload: payload.to_vec(),
+            arrival: now,
         }));
         self.bytes += payload.len();
         self.highest = self.highest.max(ext);

@@ -10,6 +10,8 @@
 //!   limit) and records of `[flags, step high, step low, Opus packet]`;
 //!   the timestamp advances by the step (times 120 unless flag bit 1),
 //!   flag bit 2 adds 2^31, and bit 0 signals a loss before the packet.
+//!   The packet arrives as much later as its step says, unless flag bit 3
+//!   holds arrival time still (a sender lying about its timestamps).
 //! - `reorder_nack`: a mode byte and records of operations on a
 //!   [`Receiver`] with a video stream (RTX negotiated) and an audio stream:
 //!   video, audio and RTX packets with explicit sequence numbers, clock
@@ -21,6 +23,9 @@
 //! except at a reported discontinuity, buffers stay within their bounds,
 //! NACKs read back through the RTCP parser and name only packets still
 //! missing, and the next timer is always later than the one just run.
+//! Output is bounded by input: silence fill never exceeds arrival time
+//! plus the fill limit and allowance, and the number of events stays
+//! within a constant per input byte plus what that fill accounts for.
 
 use super::records;
 use crate::h264::{self, AccessUnit, H264Limits, H264Output};
@@ -145,10 +150,13 @@ pub fn opus_depacketise(data: &[u8]) -> usize {
     };
     let limits = OpusLimits {
         max_fill: if mode & 1 != 0 { 4800 } else { 96_000 },
+        ..OpusLimits::default()
     };
     let mut d = opus::Depacketiser::new(limits);
     let mut ts = 0u32;
+    let mut arrival = 0u64;
     let mut frames = 0usize;
+    let mut packets = 0usize;
     // Where the timeline should continue, and whether loss came first.
     let mut end: Option<u32> = None;
     for record in records(rest) {
@@ -156,7 +164,13 @@ pub fn opus_depacketise(data: &[u8]) -> usize {
             continue;
         };
         let step = u32::from(u16::from_be_bytes([hi, lo]));
-        ts = ts.wrapping_add(if flags & 2 != 0 { step } else { step * 120 });
+        let step = if flags & 2 != 0 { step } else { step * 120 };
+        ts = ts.wrapping_add(step);
+        let before = arrival;
+        if flags & 8 == 0 {
+            arrival += u64::from(step) * 1000 / 48;
+        }
+        packets += 1;
         if flags & 4 != 0 {
             ts = ts.wrapping_add(1 << 31);
         }
@@ -165,7 +179,7 @@ pub fn opus_depacketise(data: &[u8]) -> usize {
             d.lost();
         }
         let valid_packet = check_opus_packet(payload);
-        assert_eq!(d.push(ts, payload).is_ok(), valid_packet);
+        assert_eq!(d.push(ts, arrival, payload).is_ok(), valid_packet);
         let mut fills = 0u32;
         let mut seen_media = false;
         while let Some(o) = d.poll() {
@@ -193,6 +207,10 @@ pub fn opus_depacketise(data: &[u8]) -> usize {
                             assert!(!seen_media, "fill comes first");
                             fills += f.duration;
                             assert!(fills <= limits.max_fill);
+                            // No more than the time the sender took, and
+                            // the allowance.
+                            let since = (arrival - before) * 48 / 1000;
+                            assert!(u64::from(fills) <= since + u64::from(limits.allowance) + 48);
                         }
                     }
                     frames += 1;
@@ -204,6 +222,12 @@ pub fn opus_depacketise(data: &[u8]) -> usize {
             }
         }
         assert_eq!(seen_media, valid_packet);
+        // Output bounded by input and arrival time, however the
+        // timestamps lie.
+        let cap = u64::from(limits.max_fill) + u64::from(limits.allowance);
+        let elapsed = arrival * 48 / 1000;
+        assert!(d.filled_samples() <= cap + elapsed + 48 * packets as u64);
+        assert!(frames as u64 <= 6 * packets as u64 + d.filled_samples() / 120);
     }
     frames + valid
 }
@@ -238,7 +262,9 @@ const AUDIO_SSRC: u32 = 0x3333_3333;
 ///
 /// - 0 video and 1 audio: `[op, seq high, seq low, flags, payload]`. Flag
 ///   bit 0 is the marker; bit 1 advances the timestamp (3000 for video,
-///   960 for audio).
+///   960 for audio). For audio, flag bit 2 takes the first two payload
+///   bytes as a further step, in units of 120 samples, so the sender can
+///   lie about its timestamps.
 /// - 2 RTX: `[op, OSN high, OSN low, flags, payload]`, at the current
 ///   video timestamp. An empty payload after the flags sends padding only.
 /// - 3: the clock moves on `[op, ms high, ms low]` milliseconds, then
@@ -274,6 +300,7 @@ pub fn reorder_nack(data: &[u8]) -> usize {
     let mut clock = 0u64;
     let (mut vts, mut ats, mut rtx_seq) = (0u32, 0u32, 0u16);
     let mut produced = 0usize;
+    let mut events = 0usize;
     // The last Lost run per stream, to check that losses only move on.
     let mut last_lost: [Option<u16>; 2] = [None, None];
     for record in records(rest) {
@@ -298,6 +325,14 @@ pub fn reorder_nack(data: &[u8]) -> usize {
                     1 => {
                         if advance {
                             ats = ats.wrapping_add(960);
+                        }
+                        let mut payload = payload;
+                        if flags & 4 != 0
+                            && let Some((&[hi, lo], rest)) = payload.split_first_chunk::<2>()
+                        {
+                            let step = u32::from(u16::from_be_bytes([hi, lo]));
+                            ats = ats.wrapping_add(step * 120);
+                            payload = rest;
                         }
                         (111, AUDIO_SSRC, seq, ats, payload.to_vec())
                     }
@@ -347,7 +382,7 @@ pub fn reorder_nack(data: &[u8]) -> usize {
                     if let Some(after) = r.poll_timeout() {
                         assert!(after > next, "the next timer is later");
                     }
-                    produced += drain(&mut r, [v, a], &cfg.h264, &mut last_lost);
+                    produced += drain(&mut r, [v, a], &cfg.h264, &mut last_lost, &mut events);
                 }
             }
             _ => {
@@ -357,11 +392,30 @@ pub fn reorder_nack(data: &[u8]) -> usize {
             }
         }
         now = now.max(clock);
-        produced += drain(&mut r, [v, a], &cfg.h264, &mut last_lost);
+        produced += drain(&mut r, [v, a], &cfg.h264, &mut last_lost, &mut events);
         for s in [v, a] {
             let (packets, bytes) = r.buffered(s).expect("stream");
             assert!(packets <= cfg.max_packets && bytes <= cfg.max_bytes);
         }
+        // Output volume: a constant per input byte, plus the silence that
+        // arrival time can account for (2.5 ms frames over the elapsed
+        // time and the fill limit and allowance), however the sender's
+        // timestamps lie.
+        // Events the queue had to drop count too: this bounds what is
+        // generated, not only what is queued.
+        let fill_cap = u64::from(cfg.opus.max_fill) + u64::from(cfg.opus.allowance);
+        let fill_frames = (fill_cap + 48 * now) / 120;
+        let dropped: u64 = [v, a]
+            .iter()
+            .filter_map(|&s| r.stats(s))
+            .map(|s| s.events_dropped)
+            .sum();
+        let events = events as u64 + dropped;
+        assert!(
+            events <= 16 * data.len() as u64 + fill_frames,
+            "{events} events from {} bytes over {now} ms",
+            data.len()
+        );
     }
     produced
 }
@@ -371,6 +425,7 @@ fn drain(
     streams: [StreamId; 2],
     limits: &H264Limits,
     last_lost: &mut [Option<u16>; 2],
+    events: &mut usize,
 ) -> usize {
     let mut n = 0;
     while let Some(f) = r.poll_feedback() {
@@ -402,6 +457,7 @@ fn drain(
     }
     while let Some(e) = r.poll_event() {
         n += 1;
+        *events += 1;
         match e {
             Event::AccessUnit { au, .. } => check_access_unit(&au, limits),
             Event::Audio { frame, .. } => {
@@ -498,6 +554,36 @@ mod tests {
             opus_depacketise(junk);
             reorder_nack(junk);
         }
+    }
+
+    /// The review's case: tiny Opus packets each 96 120 samples (2 s) after
+    /// the last, arriving together. Before fill was bounded by arrival
+    /// time, both targets' volume checks failed on it.
+    fn lying_timestamps() -> (Vec<u8>, Vec<u8>) {
+        let mut receiver = vec![0u8];
+        for n in 0..250u16 {
+            let mut rec = vec![1u8];
+            rec.extend_from_slice(&n.to_be_bytes());
+            // Flag bit 2: a step of 801 * 120 = 96 120 samples.
+            rec.push(4);
+            rec.extend_from_slice(&801u16.to_be_bytes());
+            rec.extend_from_slice(&[0xe0, 1]);
+            push_record(&mut receiver, &rec);
+        }
+        push_record(&mut receiver, &[3, 0, 20]);
+        let mut depacketiser = vec![0u8];
+        for _ in 0..255 {
+            // Flag bit 3: arrival time held still.
+            push_record(&mut depacketiser, &[8, 0x03, 0x21, 0xe0, 1]);
+        }
+        (receiver, depacketiser)
+    }
+
+    #[test]
+    fn lying_timestamps_are_bounded() {
+        let (receiver, depacketiser) = lying_timestamps();
+        assert!(reorder_nack(&receiver) > 0);
+        assert!(opus_depacketise(&depacketiser) > 0);
     }
 
     /// Reads a fixture: RTP datagrams in `[channel, u16 length, bytes]`.
@@ -710,5 +796,8 @@ mod tests {
         // Small buffers and short waits, SSRCs bound from the packets.
         ops[0] = 1 | 2 | 4;
         write("reorder_nack", "ffmpeg-interleaved-small-bound", &ops);
+        let (receiver, depacketiser) = lying_timestamps();
+        write("reorder_nack", "built-lying-timestamps", &receiver);
+        write("opus_depacketise", "built-lying-timestamps", &depacketiser);
     }
 }
