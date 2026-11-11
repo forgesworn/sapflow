@@ -552,18 +552,26 @@ fn a_refused_opus_packet_changes_nothing_even_where_it_would_close_a_part() {
     // close it. Refused for size, it must change nothing.
     assert!(m.part.as_ref().is_some_and(|p| !p.audio.is_empty()));
     m.next_segment.as_mut().expect("segment").bytes = MAX_SEGMENT_BYTES;
-    let before = (observable(&m), state(&m), m.audio_end);
+    let before = (observable(&m), m.internal_state());
     let up = m.push_audio_at(pts, Bytes::from(packet(5760, true)), NOW);
     assert!(matches!(up, Err(MuxError::SegmentTooLarge)), "{up:?}");
-    assert_eq!(before, (observable(&m), state(&m), m.audio_end));
+    assert_eq!(before, (observable(&m), m.internal_state()));
     // A discontinuous timestamp refused for a malformed packet changes
     // nothing either.
-    let before = (observable(&m), state(&m), m.audio_end);
+    let before = (observable(&m), m.internal_state());
     assert!(
         m.push_audio_at(pts + 90_000, Bytes::from_static(&[0xfb, 0]), NOW)
             .is_err()
     );
-    assert_eq!(before, (observable(&m), state(&m), m.audio_end));
+    assert_eq!(before, (observable(&m), m.internal_state()));
+    // The digest sees an admitted packet that changes nothing observable:
+    // a 2.5 ms packet into the open part.
+    m.next_segment.as_mut().expect("segment").bytes = 0;
+    let (seen, inner) = (observable(&m), m.internal_state());
+    m.push_audio_at(pts, Bytes::from(packet(120, true)), NOW)
+        .expect("admitted");
+    assert_eq!(seen, observable(&m));
+    assert_ne!(inner, m.internal_state());
 }
 
 /// The W3b review: copying a borrowed packet before the checks passed every

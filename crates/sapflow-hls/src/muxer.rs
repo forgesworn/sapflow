@@ -577,7 +577,120 @@ impl Muxer {
         }
     }
 
-    /// The current video configuration, or `None` for an audio-only epoch.
+    /// Every field of the muxer as text, for checks that a refused push
+    /// changes nothing: sealed and pending media by id, timing and length
+    /// rather than by content. For tests, and for the fuzz targets through
+    /// the `testing` feature; not part of the API.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn internal_state(&self) -> String {
+        // No `..`: a new field must be added here, or this stops compiling.
+        let Self {
+            cfg,
+            video,
+            audio,
+            audio_run,
+            audio_end,
+            init,
+            fragment_quota,
+            fragment_refused,
+            epoch_first_part_id,
+            pending_video,
+            pending_audio,
+            entries,
+            media_sequence,
+            parts,
+            next_segment,
+            part,
+            next_part_id,
+            timing,
+            learning,
+            target,
+            offset,
+            rebase_to,
+            presented_end,
+            audio_floor,
+            discontinuity_next,
+            discontinuity_sequence,
+            breaks,
+            hold_gap,
+        } = self;
+        let pending = |p: &Option<Pending>| {
+            p.as_ref()
+                .map(|p| (p.dts, p.cts, p.sync, p.data.len(), p.samples))
+        };
+        let sample = |s: &Sample| (s.duration, s.cts, s.sync, s.data.len());
+        let sealed = |p: &Arc<Part>| {
+            (
+                p.initialization.id,
+                p.id,
+                p.duration,
+                p.span,
+                p.independent,
+                p.data.len(),
+            )
+        };
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|e| match e {
+                Entry::Gap { duration } => (None, *duration, Vec::new()),
+                Entry::Segment(s) => (
+                    Some((
+                        s.initialization.id,
+                        s.id,
+                        s.start,
+                        s.discontinuity,
+                        s.data.len(),
+                    )),
+                    s.duration,
+                    s.parts.iter().map(sealed).collect(),
+                ),
+            })
+            .collect();
+        let parts: Vec<_> = parts.iter().map(sealed).collect();
+        let next_segment = next_segment.as_ref().map(|s| {
+            (
+                s.initialization.id,
+                s.id,
+                s.start_dts,
+                s.start,
+                s.wall_origin,
+                s.parts.iter().map(sealed).collect::<Vec<_>>(),
+                s.bytes,
+                s.audio_bytes,
+                s.discontinuity,
+            )
+        });
+        let part = part.as_ref().map(|p| {
+            (
+                p.id,
+                p.start_dts,
+                p.video.iter().map(sample).collect::<Vec<_>>(),
+                p.video_base,
+                p.audio.iter().map(sample).collect::<Vec<_>>(),
+                p.audio_times.clone(),
+                p.independent,
+            )
+        });
+        let learning: Vec<_> = learning
+            .iter()
+            .map(|f| (f.dts, f.next_dts, f.cts, f.sync, f.data.len()))
+            .collect();
+        format!(
+            "{cfg:?} {video:?} {audio:?} {audio_run:?} {audio_end:?} {} {} \
+             {fragment_refused} {epoch_first_part_id} {:?} {:?} {entries:?} \
+             {media_sequence} {parts:?} {next_segment:?} {part:?} {next_part_id} \
+             {timing:?} {learning:?} {target:?} {offset} {rebase_to:?} \
+             {presented_end:?} {audio_floor} {discontinuity_next} \
+             {discontinuity_sequence} {breaks} {hold_gap}",
+            init.id,
+            init.data.len(),
+            pending(pending_video),
+            pending(pending_audio),
+        ) + &format!(" {:?}", fragment_quota.as_ref().map(|q| q.used()))
+    }
+
+    /// The current video configuration, or `None` for an audio-only epoch.    /// The current video configuration, or `None` for an audio-only epoch.
     pub fn video(&self) -> Option<&H264Config> {
         self.video.as_ref()
     }
