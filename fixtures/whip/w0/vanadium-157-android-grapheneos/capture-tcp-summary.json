@@ -1,0 +1,97 @@
+{
+ "userAgent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36",
+ "whipStatus": 201,
+ "gathered": [
+  "end-of-candidates"
+ ],
+ "gatheringBeforePost": "complete",
+ "timeline": [
+  [
+   3620,
+   "ice",
+   "checking"
+  ],
+  [
+   3621,
+   "conn",
+   "connecting"
+  ],
+  [
+   7191,
+   "ice",
+   "connected"
+  ]
+ ],
+ "ice": "connected",
+ "connection": "connecting",
+ "transport": {
+  "dtlsState": "connecting",
+  "iceState": "connected",
+  "dtlsRole": "client"
+ },
+ "pairs": [
+  {
+   "state": "succeeded",
+   "nominated": false,
+   "requestsSent": 23,
+   "responsesReceived": 23,
+   "local": "tcp prflx active",
+   "remote": "tcp host passive"
+  }
+ ],
+ "localCandidates": [
+  "tcp host active",
+  "tcp host active",
+  "tcp prflx active"
+ ],
+ "remoteCandidates": [
+  "tcp host passive"
+ ],
+ "audioContextState": null,
+ "stun": {
+  "requests": 31,
+  "valid": 31,
+  "badIntegrity": 0,
+  "noFingerprint": 0,
+  "attrs": {
+   "USERNAME": 31,
+   "0xc057": 31,
+   "ICE_CONTROLLING": 31,
+   "PRIORITY": 31,
+   "MESSAGE_INTEGRITY": 31,
+   "FINGERPRINT": 31,
+   "USE_CANDIDATE": 8
+  },
+  "useCandidate": 8,
+  "controlling": 31,
+  "controlled": 0,
+  "tuples": 1
+ },
+ "dtls": {
+  "datagrams": 4,
+  "firstTransport": "tcp",
+  "firstLength": 1200,
+  "helloFragments": [
+   1200,
+   263
+  ]
+ },
+ "tcpConnections": 1,
+ "promptsTapped": [
+  "Allow this time"
+ ],
+ "phoneNotes": {
+  "before": {
+   "batteryTempTenthsC": 342,
+   "batteryLevel": 80,
+   "thermalStatus": "0",
+   "loadavg": "1.00 0.88 0.84"
+  },
+  "after": {
+   "batteryTempTenthsC": 343,
+   "batteryLevel": 80,
+   "thermalStatus": "0",
+   "loadavg": "1.30 0.95 0.87"
+  }
+ }
+}

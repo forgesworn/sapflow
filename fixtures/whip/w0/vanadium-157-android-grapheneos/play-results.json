@@ -1,0 +1,262 @@
+[
+ {
+  "label": "vanadium-hlsjs-a-av",
+  "userAgent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36",
+  "hlsjsVersion": "1.7.4",
+  "src": "/assets/av/master.m3u8",
+  "currentTimeEnd": 14.02,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "fatalHlsErrors": 0,
+  "hlsEvents": [
+   [
+    "element-waiting",
+    5629,
+    0
+   ]
+  ],
+  "canPlayHlsNative": null,
+  "canPlayOpusMp4": null,
+  "supportedOpusMse": true,
+  "videoWidth": 1280,
+  "webkitAudioDecodedByteCountExists": true,
+  "audio": {
+   "audible": true,
+   "firstAudibleMs": 398,
+   "steadyLeftHz": 445,
+   "steadyRightHz": 879,
+   "maxStepFirstBlocks": 0.0351,
+   "maxStepSteady": 0.0349,
+   "expectedMaxStepRightTone": 0.0346,
+   "clicks": [],
+   "silentBlocksAfterOnset": 0,
+   "contextState": "running"
+  }
+ },
+ {
+  "label": "vanadium-hlsjs-b-audio",
+  "userAgent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36",
+  "hlsjsVersion": "1.7.4",
+  "src": "/assets/audio/master.m3u8",
+  "currentTimeEnd": 14.02,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "fatalHlsErrors": 0,
+  "hlsEvents": [
+   [
+    "element-waiting",
+    5610,
+    0
+   ]
+  ],
+  "canPlayHlsNative": null,
+  "canPlayOpusMp4": null,
+  "supportedOpusMse": true,
+  "videoWidth": 0,
+  "webkitAudioDecodedByteCountExists": true,
+  "audio": {
+   "audible": true,
+   "firstAudibleMs": 250,
+   "steadyLeftHz": 445,
+   "steadyRightHz": 879,
+   "maxStepFirstBlocks": 0.0351,
+   "maxStepSteady": 0.0349,
+   "expectedMaxStepRightTone": 0.0346,
+   "clicks": [],
+   "silentBlocksAfterOnset": 0,
+   "contextState": "running"
+  }
+ },
+ {
+  "label": "vanadium-hlsjs-d-av-preskip312",
+  "userAgent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36",
+  "hlsjsVersion": "1.7.4",
+  "src": "/assets/av-preskip312/master.m3u8",
+  "currentTimeEnd": 14.02,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "fatalHlsErrors": 0,
+  "hlsEvents": [
+   [
+    "element-waiting",
+    5616,
+    0
+   ]
+  ],
+  "canPlayHlsNative": null,
+  "canPlayOpusMp4": null,
+  "supportedOpusMse": true,
+  "videoWidth": 1280,
+  "webkitAudioDecodedByteCountExists": true,
+  "audio": {
+   "audible": true,
+   "firstAudibleMs": 343,
+   "steadyLeftHz": 445,
+   "steadyRightHz": 879,
+   "maxStepFirstBlocks": 0.0351,
+   "maxStepSteady": 0.4952,
+   "expectedMaxStepRightTone": 0.0346,
+   "clicks": [
+    [
+     21,
+     1892,
+     0.387
+    ],
+    [
+     157,
+     13502,
+     0.269
+    ],
+    [
+     160,
+     13762,
+     0.495
+    ]
+   ],
+   "silentBlocksAfterOnset": 0,
+   "contextState": "running"
+  }
+ },
+ {
+  "label": "vanadium-native-a-av",
+  "userAgent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36",
+  "hlsjsVersion": "1.7.4",
+  "src": "/assets/av/master.m3u8",
+  "currentTimeEnd": 13.86,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "fatalHlsErrors": 0,
+  "hlsEvents": [
+   [
+    "element-waiting",
+    5437,
+    0
+   ],
+   [
+    "element-stalled",
+    9033,
+    3.34
+   ],
+   [
+    "element-stalled",
+    15861,
+    10.17
+   ]
+  ],
+  "canPlayHlsNative": "maybe",
+  "canPlayOpusMp4": "probably",
+  "videoWidth": 1280,
+  "webkitAudioDecodedByteCountExists": true,
+  "audio": {
+   "audible": true,
+   "firstAudibleMs": 337,
+   "steadyLeftHz": 445,
+   "steadyRightHz": 879,
+   "maxStepFirstBlocks": 0.0351,
+   "maxStepSteady": 0.4473,
+   "expectedMaxStepRightTone": 0.0346,
+   "clicks": [
+    [
+     88,
+     7599,
+     0.285
+    ],
+    [
+     149,
+     12807,
+     0.447
+    ]
+   ],
+   "silentBlocksAfterOnset": 0,
+   "contextState": "running"
+  }
+ },
+ {
+  "label": "vanadium-native-b-audio",
+  "userAgent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36",
+  "hlsjsVersion": "1.7.4",
+  "src": "/assets/audio/master.m3u8",
+  "currentTimeEnd": 13.99,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "fatalHlsErrors": 0,
+  "hlsEvents": [
+   [
+    "element-waiting",
+    5445,
+    0
+   ],
+   [
+    "element-stalled",
+    9027,
+    3.49
+   ],
+   [
+    "element-stalled",
+    15856,
+    10.31
+   ]
+  ],
+  "canPlayHlsNative": "maybe",
+  "canPlayOpusMp4": "probably",
+  "videoWidth": 0,
+  "webkitAudioDecodedByteCountExists": true,
+  "audio": {
+   "audible": true,
+   "firstAudibleMs": 177,
+   "steadyLeftHz": 445,
+   "steadyRightHz": 879,
+   "maxStepFirstBlocks": 0.0351,
+   "maxStepSteady": 0.2984,
+   "expectedMaxStepRightTone": 0.0346,
+   "clicks": [
+    [
+     41,
+     3598,
+     0.298
+    ]
+   ],
+   "silentBlocksAfterOnset": 0,
+   "contextState": "running"
+  }
+ },
+ {
+  "label": "vanadium-native-c-recording",
+  "userAgent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36",
+  "hlsjsVersion": "1.7.4",
+  "src": "/assets/recording/recording.mp4",
+  "currentTimeEnd": 14.02,
+  "advancedAtLeast10s": true,
+  "mediaError": null,
+  "errors": [],
+  "fatalHlsErrors": 0,
+  "hlsEvents": [
+   [
+    "element-waiting",
+    5464,
+    0
+   ]
+  ],
+  "canPlayHlsNative": "maybe",
+  "canPlayOpusMp4": "probably",
+  "videoWidth": 1280,
+  "webkitAudioDecodedByteCountExists": true,
+  "audio": {
+   "audible": true,
+   "firstAudibleMs": 514,
+   "steadyLeftHz": 445,
+   "steadyRightHz": 879,
+   "maxStepFirstBlocks": 0.0351,
+   "maxStepSteady": 0.0349,
+   "expectedMaxStepRightTone": 0.0346,
+   "clicks": [],
+   "silentBlocksAfterOnset": 0,
+   "contextState": "running"
+  }
+ }
+]

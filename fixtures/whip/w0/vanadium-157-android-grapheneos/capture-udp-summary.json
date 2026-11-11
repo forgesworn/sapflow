@@ -1,0 +1,57 @@
+{
+ "userAgent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36",
+ "whipStatus": 201,
+ "gathered": [
+  "end-of-candidates"
+ ],
+ "gatheringBeforePost": "complete",
+ "timeline": [],
+ "ice": "new",
+ "connection": "new",
+ "transport": {
+  "dtlsState": "new",
+  "iceState": "new",
+  "dtlsRole": "client"
+ },
+ "pairs": [],
+ "localCandidates": [
+  "tcp host active",
+  "tcp host active"
+ ],
+ "remoteCandidates": [],
+ "audioContextState": null,
+ "stun": {
+  "requests": 0,
+  "valid": 0,
+  "badIntegrity": 0,
+  "noFingerprint": 0,
+  "attrs": {},
+  "useCandidate": 0,
+  "controlling": 0,
+  "controlled": 0,
+  "tuples": 0
+ },
+ "dtls": {
+  "datagrams": 0,
+  "firstTransport": null,
+  "firstLength": null
+ },
+ "tcpConnections": 0,
+ "promptsTapped": [
+  "Allow this time"
+ ],
+ "phoneNotes": {
+  "before": {
+   "batteryTempTenthsC": 340,
+   "batteryLevel": 80,
+   "thermalStatus": "0",
+   "loadavg": "0.63 0.81 0.82"
+  },
+  "after": {
+   "batteryTempTenthsC": 342,
+   "batteryLevel": 80,
+   "thermalStatus": "0",
+   "loadavg": "0.62 0.80 0.82"
+  }
+ }
+}

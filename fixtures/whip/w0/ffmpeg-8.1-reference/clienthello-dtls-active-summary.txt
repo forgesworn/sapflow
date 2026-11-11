@@ -1,0 +1,56 @@
+datagram 0: 215 bytes
+  record 0: content type 22 (handshake), record version DTLS 1.0 (0xfeff), epoch 0, seq 0, length 202
+    handshake: type 1 (client_hello), message length 190, message_seq 0, fragment offset 0, fragment length 190
+client_hello reassembled from 1 fragment(s): 190 bytes
+  client_version: DTLS 1.2 (0xfefd)
+  random: 32 bytes (not recorded)
+  session_id length: 0
+  cookie length: 0
+  cipher suites (27), in offered order:
+    TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 (0xc02c)
+    TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 (0xc030)
+    TLS_DHE_RSA_WITH_AES_256_GCM_SHA384 (0x009f)
+    TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 (0xcca9)
+    TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 (0xcca8)
+    TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256 (0xccaa)
+    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (0xc02b)
+    TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (0xc02f)
+    TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 (0x009e)
+    TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 (0xc024)
+    TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384 (0xc028)
+    TLS_DHE_RSA_WITH_AES_256_CBC_SHA256 (0x006b)
+    TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 (0xc023)
+    TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256 (0xc027)
+    TLS_DHE_RSA_WITH_AES_128_CBC_SHA256 (0x0067)
+    TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA (0xc00a)
+    TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA (0xc014)
+    TLS_DHE_RSA_WITH_AES_256_CBC_SHA (0x0039)
+    TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA (0xc009)
+    TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA (0xc013)
+    TLS_DHE_RSA_WITH_AES_128_CBC_SHA (0x0033)
+    TLS_RSA_WITH_AES_256_GCM_SHA384 (0x009d)
+    TLS_RSA_WITH_AES_128_GCM_SHA256 (0x009c)
+    TLS_RSA_WITH_AES_256_CBC_SHA256 (0x003d)
+    TLS_RSA_WITH_AES_128_CBC_SHA256 (0x003c)
+    TLS_RSA_WITH_AES_256_CBC_SHA (0x0035)
+    TLS_RSA_WITH_AES_128_CBC_SHA (0x002f)
+  compression methods: null
+  extensions (8), in offered order:
+    renegotiation_info (0xff01), 1 bytes
+    ec_point_formats (0x000b), 2 bytes
+    supported_groups (0x000a), 12 bytes
+    session_ticket (0x0023), 0 bytes
+    use_srtp (0x000e), 5 bytes
+    encrypt_then_mac (0x0016), 0 bytes
+    extended_master_secret (0x0017), 0 bytes
+    signature_algorithms (0x000d), 42 bytes
+  extension detail:
+    renegotiation_info: present, renegotiated_connection length 0
+    ec_point_formats: uncompressed
+    supported_groups: x25519 (0x001d), secp256r1 (0x0017), x448 (0x001e), secp384r1 (0x0018), secp521r1 (0x0019)
+    session_ticket: 0 bytes
+    use_srtp profiles: SRTP_AES128_CM_HMAC_SHA1_80 (0x0001); MKI length 0
+    encrypt_then_mac: present
+    extended_master_secret: present (empty, 0 bytes)
+    signature_algorithms: ecdsa_secp256r1_sha256 (0x0403), ecdsa_secp384r1_sha384 (0x0503), ecdsa_secp521r1_sha512 (0x0603), ed25519 (0x0807), ed448 (0x0808), rsa_pss_pss_sha256 (0x0809), rsa_pss_pss_sha384 (0x080a), rsa_pss_pss_sha512 (0x080b), rsa_pss_rsae_sha256 (0x0804), rsa_pss_rsae_sha384 (0x0805), rsa_pss_rsae_sha512 (0x0806), rsa_pkcs1_sha256 (0x0401), rsa_pkcs1_sha384 (0x0501), rsa_pkcs1_sha512 (0x0601), ecdsa_sha224 (0x0303), rsa_pkcs1_sha224 (0x0301), dsa_sha224 (0x0302), dsa_sha256 (0x0402), dsa_sha384 (0x0502), dsa_sha512 (0x0602)
+  presence: extended_master_secret=yes renegotiation_info=yes use_srtp=yes supported_versions=no key_share=no session_ticket=yes encrypt_then_mac=yes server_name=no ALPN=no

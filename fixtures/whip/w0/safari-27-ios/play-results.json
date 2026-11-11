@@ -1,0 +1,406 @@
+{
+ "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27 Safari/605.1.15",
+ "rows": [
+  {
+   "label": "safari-ios-native-a-av",
+   "src": "/assets/av/master.m3u8",
+   "muted": true,
+   "currentTimeEnd": 0,
+   "advancedAtLeast10s": false,
+   "mediaError": {
+    "code": 3,
+    "message": "Media failed to decode"
+   },
+   "errors": [],
+   "events": [
+    [
+     "waiting",
+     33,
+     0,
+     ""
+    ],
+    [
+     "loadedmetadata",
+     153,
+     0,
+     ""
+    ],
+    [
+     "error",
+     165,
+     0,
+     "3 Media failed to decode"
+    ]
+   ],
+   "canPlayHls": "maybe",
+   "canPlayOpusMp4": "",
+   "canPlayAvcOpusMp4": "",
+   "videoWidth": 0,
+   "webkitAudioDecodedByteCountExists": false,
+   "webkitAudioDecodedByteCount": null,
+   "webkitVideoDecodedByteCount": null,
+   "samples": [
+    {
+     "ms": 504,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 2509,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 4513,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 6524,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 8540,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 10556,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    }
+   ]
+  },
+  {
+   "label": "safari-ios-native-b-audio",
+   "src": "/assets/audio/master.m3u8",
+   "muted": true,
+   "currentTimeEnd": 0,
+   "advancedAtLeast10s": false,
+   "mediaError": {
+    "code": 3,
+    "message": "Media failed to decode"
+   },
+   "errors": [],
+   "events": [
+    [
+     "waiting",
+     12151,
+     0,
+     ""
+    ],
+    [
+     "loadedmetadata",
+     12209,
+     0,
+     ""
+    ],
+    [
+     "error",
+     12234,
+     0,
+     "3 Media failed to decode"
+    ]
+   ],
+   "canPlayHls": "maybe",
+   "canPlayOpusMp4": "",
+   "canPlayAvcOpusMp4": "",
+   "videoWidth": 0,
+   "webkitAudioDecodedByteCountExists": false,
+   "webkitAudioDecodedByteCount": null,
+   "webkitVideoDecodedByteCount": null,
+   "samples": [
+    {
+     "ms": 501,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 2506,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 4511,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 6525,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 8541,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 10556,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    }
+   ]
+  },
+  {
+   "label": "safari-ios-native-c-recording",
+   "src": "/assets/recording/recording.mp4",
+   "muted": true,
+   "currentTimeEnd": 10.05,
+   "advancedAtLeast10s": true,
+   "mediaError": null,
+   "errors": [],
+   "events": [
+    [
+     "waiting",
+     24264,
+     0,
+     ""
+    ],
+    [
+     "loadedmetadata",
+     25610,
+     0,
+     ""
+    ],
+    [
+     "playing",
+     26230,
+     0,
+     ""
+    ]
+   ],
+   "canPlayHls": "maybe",
+   "canPlayOpusMp4": "",
+   "canPlayAvcOpusMp4": "",
+   "videoWidth": 1280,
+   "webkitAudioDecodedByteCountExists": false,
+   "webkitAudioDecodedByteCount": null,
+   "webkitVideoDecodedByteCount": null,
+   "samples": [
+    {
+     "ms": 502,
+     "t": 0,
+     "rs": 0,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 2507,
+     "t": 0.49,
+     "rs": 4,
+     "paused": false,
+     "muted": true,
+     "buf": 20,
+     "frames": 1,
+     "dropped": 0
+    },
+    {
+     "ms": 4513,
+     "t": 2.5,
+     "rs": 4,
+     "paused": false,
+     "muted": true,
+     "buf": 20,
+     "frames": 64,
+     "dropped": 0
+    },
+    {
+     "ms": 6526,
+     "t": 4.51,
+     "rs": 4,
+     "paused": false,
+     "muted": true,
+     "buf": 20,
+     "frames": 124,
+     "dropped": 0
+    },
+    {
+     "ms": 8542,
+     "t": 6.52,
+     "rs": 4,
+     "paused": false,
+     "muted": true,
+     "buf": 20,
+     "frames": 184,
+     "dropped": 0
+    },
+    {
+     "ms": 10558,
+     "t": 8.54,
+     "rs": 4,
+     "paused": false,
+     "muted": true,
+     "buf": 20,
+     "frames": 244,
+     "dropped": 0
+    }
+   ]
+  },
+  {
+   "label": "safari-ios-native-d-av-preskip312",
+   "src": "/assets/av-preskip312/master.m3u8",
+   "muted": true,
+   "currentTimeEnd": 0,
+   "advancedAtLeast10s": false,
+   "mediaError": {
+    "code": 3,
+    "message": "Media failed to decode"
+   },
+   "errors": [],
+   "events": [
+    [
+     "waiting",
+     36376,
+     0,
+     ""
+    ],
+    [
+     "loadedmetadata",
+     36434,
+     0,
+     ""
+    ],
+    [
+     "error",
+     36453,
+     0,
+     "3 Media failed to decode"
+    ]
+   ],
+   "canPlayHls": "maybe",
+   "canPlayOpusMp4": "",
+   "canPlayAvcOpusMp4": "",
+   "videoWidth": 0,
+   "webkitAudioDecodedByteCountExists": false,
+   "webkitAudioDecodedByteCount": null,
+   "webkitVideoDecodedByteCount": null,
+   "samples": [
+    {
+     "ms": 501,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 2506,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 4509,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 6523,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 8539,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    },
+    {
+     "ms": 10555,
+     "t": 0,
+     "rs": 1,
+     "paused": false,
+     "muted": true,
+     "buf": 0,
+     "frames": 0,
+     "dropped": 0
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,69 @@
+{
+ "obsVersion": "32.0.4",
+ "backup": "made",
+ "backupFiles": 168,
+ "pid": 38277,
+ "startedAndWasAlive": true,
+ "obsPidsDuring": [
+  38277
+ ],
+ "exit": {
+  "code": null,
+  "signal": "SIGABRT"
+ },
+ "secondSigtermNeeded": false,
+ "obsEndedAfterSigterm": true,
+ "obsPidsAfter": [],
+ "restoreDiffExit": 0,
+ "restoreDiff": "",
+ "restoreRsyncDryRun": "",
+ "modifiedConfigMovedTo": "obs-studio-1794349614782",
+ "backupMovedTo": "w0-obs-backup-YqkEqs-1794349615307",
+ "events": {
+  "label": "obs-tcp",
+  "mode": "tcp",
+  "stun": {
+   "requests": 0,
+   "valid": 0,
+   "badIntegrity": 0,
+   "noFingerprint": 0,
+   "attrs": {},
+   "useCandidate": 0,
+   "controlling": 0,
+   "controlled": 0,
+   "tuples": 0
+  },
+  "dtls": {
+   "datagrams": 0,
+   "firstTransport": null,
+   "firstLength": null
+  },
+  "tcpConnections": 0,
+  "whipRequests": [
+   {
+    "authScheme": "Bearer",
+    "contentType": "application/sdp",
+    "userAgent": "Mozilla/5.0 (OBS-Studio/32.0.4; Mac OS X; en-US)",
+    "headerNames": [
+     "accept",
+     "authorization",
+     "content-length",
+     "content-type",
+     "host",
+     "user-agent"
+    ]
+   }
+  ],
+  "whipDelete": 1,
+  "loadStart": [
+   280.42919921875,
+   118.71240234375,
+   59.0009765625
+  ],
+  "loadEnd": [
+   394.94140625,
+   173.0263671875,
+   82.1396484375
+  ]
+ }
+}

@@ -112,6 +112,10 @@ source-EOF qualification. No Rust build is involved.
 | `publish_session` | Production scoped-session JSON and checksummed metadata parsers, plus bounded pure authority commands, durable snapshots, connection claims and stale lease/restart/terminal fences; no I/O |
 | `http1_request` | HTTP/1.1 request framing for the viewer event loop (`own_http.rs`): arbitrary bytes taken one request at a time; progress, the head limit, refusal of bodies, and that later bytes never change an earlier request |
 | `http_lite` | The private control API's request heads and the callback client's response heads and URLs (`http_lite.rs`): progress and the head, target and header limits, CRLF lines throughout, a head that never changes with later bytes, and that every accepted callback URL is sent as exactly one request head the server side reads back as the same `POST` |
+| `rtp_packet` | Our RTP packet view (`sapflow_rtp::rtp`): fixed header, CSRCs, padding and RFC 8285 one-byte and two-byte extensions; header, payload and padding must add up and lookup by ID must agree with iteration |
+| `rtcp_compound` | Our RTCP compound and reduced-size parser (`sapflow_rtp::rtcp`); RR, NACK, PLI and FIR are rebuilt with `rtcp::build` and must read back the same |
+| `srtp_unprotect` | SRTP unprotect for both profiles with fixed test keys: a mode byte, then `[u16 length, packet]` records into one context, so mutation reaches index estimation, the sequence wrap and the replay window; a mode bit makes records plaintext that must survive protect then unprotect |
+| `srtcp_unprotect` | SRTCP unprotect in the same record format, with the E flag and 31-bit index |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
@@ -284,6 +288,47 @@ worker or connects to a relay. Use `-max_len=16384` for this cold-auth parser.
 
 Native recording follow-on SOURCE CANDIDATE: four generated `native-final-duration-*` NREC seeds exercise container final-duration acceptance/refusal and unchanged original entries/payloads. The target also reads completed-generation coverage without mutation. Actual FFI lookbehind ownership/byte budgets are direct unit-test scope, not modelled as fuzzed runtime ownership. No new replay/sanitizer run has been claimed until this source is compiled and executed.
 
+
+### RTP, RTCP and SRTP (`sapflow-rtp`)
+
+The four `sapflow-rtp` targets call the entry functions in
+`crates/sapflow-rtp/src/fuzzing.rs` (behind the crate's `testing` feature),
+and a unit test there replays every file in their `seeds/` directories
+through the same functions, so the seeds are regressions wherever
+cargo-fuzz is not installed (`cargo test -p sapflow-rtp`). That test also
+requires every SRTP and SRTCP seed to get at least one packet past
+authentication, so fuzzing starts beyond the tag check. The mode byte and
+record format are described at the top of `fuzzing.rs`.
+
+Seed provenance: the `ffmpeg-*` RTP and RTCP seeds are packets FFmpeg 8.1.2
+sent, run as a black box by `crates/sapflow-rtp/tests/capture_ffmpeg.py` on
+generated sources (`testsrc2` with libx264, a sine tone with libopus). The
+`built-*` seeds come from our builders, for shapes FFmpeg does not send
+(extensions, CSRCs, padding, feedback). The SRTP and SRTCP seeds are those
+packets protected with our code under the fixed, public test keys in
+`fuzzing.rs`. None contains camera or microphone media. To regenerate after
+a fresh capture:
+
+```bash
+python3 crates/sapflow-rtp/tests/capture_ffmpeg.py <scratch dir>
+SAPFLOW_RTP_CAPTURE=<scratch dir> cargo test -p sapflow-rtp --lib -- --ignored write_seeds
+```
+
+No local cargo-fuzz run of these targets has been made; CI's 60 s per
+target and the nightly run are their first fuzzing.
+
+Still pending for the W1 gate A1.3 in `docs/whip-ingest.md`:
+
+- **The coverage report** showing each target reaches its parser past the
+  length checks. It needs cargo-fuzz and a nightly toolchain, which are not
+  installed on the build hosts used for W1a; CI's fuzz job does not produce
+  one. Until it exists, the only evidence of depth is the seed test above
+  (every SRTP and SRTCP seed authenticates at least once).
+- **Seeds from the W0 browser captures.** The seeds here come from FFmpeg
+  and our builders. The W0 fixtures (`fixtures/whip/w0/`) hold offers,
+  ClientHellos and run summaries but no RTP or SRTP: no DTLS server existed
+  to finish a handshake, so no browser sent media. Browser seeds follow once
+  W2's DTLS completes a handshake and can record the exported keys.
 
 ### Portable recording checkpoints
 

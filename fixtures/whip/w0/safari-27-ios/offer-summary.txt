@@ -1,0 +1,42 @@
+session: a=group:BUNDLE 0 1; ice-lite=no
+video section: mid=0 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=actpass rtcp-mux=yes fingerprint=sha-256 ice-options=trickle
+  candidates: 1 x udp host
+  ssrc lines: 4, ssrc-group: FID 1368388419 2015727447
+  header extensions: toffset, rtp-hdrext/abs-send-time, urn:3gpp:video-orientation, draft-holmer-rmcat-transport-wide-cc-extensions-01, rtp-hdrext/playout-delay, rtp-hdrext/video-content-type, rtp-hdrext/video-timing, rtp-hdrext/color-space, sdes:mid, sdes:rtp-stream-id, sdes:repaired-rtp-stream-id
+  payloads in offer order:
+    96 H264/90000  profile-level-id=640c1f packetization-mode=1  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    97 rtx/90000  fmtp: apt=96
+    98 H264/90000  profile-level-id=42e01f packetization-mode=1  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    99 rtx/90000  fmtp: apt=98
+    100 H264/90000  profile-level-id=640c1f packetization-mode=0  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    101 rtx/90000  fmtp: apt=100
+    103 H264/90000  profile-level-id=42e01f packetization-mode=0  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    104 rtx/90000  fmtp: apt=103
+    35 H265/90000  fmtp: level-id=93;tx-mode=SRST  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    36 rtx/90000  fmtp: apt=35
+    107 VP8/90000  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    108 rtx/90000  fmtp: apt=107
+    109 VP9/90000  fmtp: profile-id=0  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    114 rtx/90000  fmtp: apt=109
+    115 VP9/90000  fmtp: profile-id=2  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    116 rtx/90000  fmtp: apt=115
+    117 red/90000
+    118 rtx/90000  fmtp: apt=117
+    119 ulpfec/90000
+audio section: mid=1 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=actpass rtcp-mux=yes fingerprint=sha-256 ice-options=trickle
+  candidates: 1 x udp host
+  ssrc lines: 2, ssrc-group: none
+  header extensions: ssrc-audio-level, rtp-hdrext/abs-send-time, draft-holmer-rmcat-transport-wide-cc-extensions-01, sdes:mid
+  payloads in offer order:
+    111 opus/48000/2  fmtp: minptime=10;useinbandfec=1  rtcp-fb: transport-cc
+    63 red/48000/2  fmtp: 111/111
+    9 G722/8000
+    0 PCMU/8000
+    8 PCMA/8000
+    13 CN/8000
+    110 telephone-event/48000
+    126 telephone-event/8000
+video codecs offered (excluding rtx/red/fec): H264, H265, VP8, VP9
+H.264: 640c1f/pm1, 42e01f/pm1, 640c1f/pm0, 42e01f/pm0
