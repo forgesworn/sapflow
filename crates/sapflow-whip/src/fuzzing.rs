@@ -13,7 +13,9 @@
 //! - [`whip_session`]: a scripted run of a [`Session`] against the scripted
 //!   publisher: raw, mutated and honest datagrams from two tuples, checks
 //!   with and without USE-CANDIDATE or ICE-CONTROLLED, DTLS flights, SRTP
-//!   and SRTCP, and time.
+//!   and SRTCP, and time. After every step: nothing sent to a tuple that
+//!   never authenticated, DTLS and RTCP only to the selected tuple, at most
+//!   [`MAX_DATAGRAMS_PER_STEP`] datagrams, none over 1500 bytes.
 
 #![allow(
     clippy::panic,
@@ -35,8 +37,9 @@ use std::time::{Duration, Instant};
 
 /// Most script steps read from one input.
 pub const MAX_STEPS: usize = 64;
-/// Most bytes one step may make the session send.
-pub const MAX_OUTPUT_PER_STEP: usize = 16 * 1024;
+/// Most datagrams one step may make the session send: its output queue
+/// (`SessionConfig::max_queued`, 64 by default), whatever the step does.
+pub const MAX_DATAGRAMS_PER_STEP: usize = 64;
 
 /// Splits `[op, len_hi, len_lo, bytes]` steps, stopping at a truncated one.
 pub fn steps(data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
@@ -166,7 +169,14 @@ pub fn sdp_offer(data: &[u8]) -> bool {
     };
     assert!(n.video.is_some() || n.audio.is_some());
     assert!((1..=sapflow_dtls::MAX_EXPECTED_FINGERPRINTS).contains(&n.fingerprints.len()));
-    let back = Offer::parse(answer.as_bytes()).expect("our answer parses");
+    // Our answer repeats some of the offer's lines and adds our own, so it
+    // can be longer than the offer cap: read it back with room to spare.
+    let room = sdp::Limits {
+        max_offer: 64 * 1024,
+        max_lines: 4096,
+        ..sdp::Limits::default()
+    };
+    let back = Offer::parse_with(answer.as_bytes(), &room).expect("our answer parses");
     assert!(back.ice_lite);
     assert_eq!(back.sections.len(), offer.sections.len());
     assert_eq!(back.bundles.len(), 1);
@@ -337,8 +347,8 @@ pub fn whip_session(data: &[u8]) -> u8 {
                 if first & 1 == 0 {
                     let ntp = u64::from_be_bytes([first, 1, 2, 3, 4, 5, 6, 7]);
                     sent.extend(p.sender_reports(ntp).into_iter().map(|d| (p.tuple, d)));
-                } else if bytes.len() >= 4 {
-                    sent.push((p.tuple, p.protect_rtcp(bytes)));
+                } else if let Some(d) = p.try_protect_rtcp(bytes) {
+                    sent.push((p.tuple, d));
                 }
             }
             op::REPLAY => {
@@ -361,7 +371,8 @@ pub fn whip_session(data: &[u8]) -> u8 {
         let mut out = 0usize;
         let mut replies = Vec::new();
         while let Some(t) = s.poll_transmit() {
-            out += t.bytes.len();
+            out += 1;
+            assert!(t.bytes.len() <= 1500, "a datagram within the MTU cap");
             assert!(authenticated.contains(&t.tuple), "sent to a stranger");
             match classify(&t.bytes) {
                 Kind::Stun => {}
@@ -375,7 +386,10 @@ pub fn whip_session(data: &[u8]) -> u8 {
                 replies.push(t);
             }
         }
-        assert!(out <= MAX_OUTPUT_PER_STEP, "{out} bytes from one step");
+        assert!(
+            out <= MAX_DATAGRAMS_PER_STEP,
+            "{out} datagrams from one step"
+        );
         // The publisher reads what was sent to it.
         for t in replies {
             match classify(&t.bytes) {

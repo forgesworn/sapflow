@@ -305,4 +305,100 @@ fn write_seeds() {
     push_step(&mut s, op::DTLS, &[0x03, 0xff, 0x00, 0x10]);
     push_step(&mut s, op::DTLS, &[]);
     write("whip_session", "stranger-then-mutated-dtls", &s);
+    // RTCP too short to protect, which the harness once unwrapped.
+    let mut s = Vec::new();
+    connect(&mut s);
+    push_step(&mut s, op::RTCP, &[1, 0x81, 0xc9, 0]);
+    push_step(&mut s, op::RTP, &[2]);
+    write("whip_session", "connect-short-rtcp", &s);
+}
+
+/// A longer mutation pass than the unit tests run: bit flips, byte sets,
+/// inserts, deletes, truncation and splices between seeds. For hosts where
+/// libFuzzer cannot run. `WHIP_SOAK_ROUNDS` sets the rounds per seed
+/// (default 2000; a tenth of that for the session).
+#[test]
+#[ignore = "a long mutation run"]
+fn mutation_soak() {
+    let rounds: usize = std::env::var("WHIP_SOAK_ROUNDS")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(2000);
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    type Target = (&'static str, fn(&[u8]));
+    let targets: [Target; 4] = [
+        ("stun_message", |d| {
+            stun_message(d);
+        }),
+        ("sdp_offer", |d| {
+            sdp_offer(d);
+        }),
+        ("rfc4571_frames", |d| {
+            rfc4571_frames(d);
+        }),
+        ("whip_session", |d| {
+            whip_session(d);
+        }),
+    ];
+    let mut runs = 0usize;
+    for (target, run) in targets {
+        let all = seeds(target);
+        let n = if target == "whip_session" {
+            rounds / 10
+        } else {
+            rounds
+        };
+        for (_, seed) in &all {
+            for _ in 0..n {
+                let mut m = seed.clone();
+                for _ in 0..1 + next() % 8 {
+                    let len = m.len();
+                    let at = if len == 0 { 0 } else { (next() as usize) % len };
+                    match next() % 7 {
+                        0 if len > 0 => m[at] ^= 1 << (next() % 8),
+                        1 if len > 0 => m[at] = next() as u8,
+                        2 => m.insert(at, next() as u8),
+                        3 if len > 0 => {
+                            m.remove(at);
+                        }
+                        4 => m.truncate(at),
+                        5 if len > 0 => {
+                            let end = (at + 1 + (next() as usize) % 16).min(len);
+                            let chunk = m[at..end].to_vec();
+                            m.splice(at..at, chunk);
+                        }
+                        6 => {
+                            let (_, other) = &all[(next() as usize) % all.len()];
+                            if !other.is_empty() {
+                                let from = (next() as usize) % other.len();
+                                m.truncate(at);
+                                m.extend_from_slice(&other[from..]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                run(&m);
+                runs += 1;
+            }
+        }
+    }
+    println!("mutation soak: {runs} runs");
+}
+
+/// RTCP of fewer than 8 bytes cannot be protected (no SSRC): the harness
+/// must skip it, not panic. One byte away from `connect-and-publish`.
+#[test]
+fn short_rtcp_after_connect_is_safe() {
+    let mut s = Vec::new();
+    connect(&mut s);
+    push_step(&mut s, op::RTCP, &[1, 0x81, 0xc9, 0]);
+    push_step(&mut s, op::RTCP, &[1, 0x81, 0xc9, 0, 1, 2, 3]);
+    assert_eq!(whip_session(&s), 2);
 }

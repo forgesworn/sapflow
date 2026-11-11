@@ -445,12 +445,18 @@ impl Publisher {
 
     /// Protects an RTCP compound.
     pub fn protect_rtcp(&mut self, rtcp: &[u8]) -> Vec<u8> {
-        let (out, _) = self.srtp.as_mut().expect("keys");
+        self.try_protect_rtcp(rtcp).expect("protects")
+    }
+
+    /// Protects an RTCP compound, or `None` when SRTCP refuses it (shorter
+    /// than a header and SSRC).
+    pub fn try_protect_rtcp(&mut self, rtcp: &[u8]) -> Option<Vec<u8>> {
+        let (out, _) = self.srtp.as_mut()?;
         let mut buf = rtcp.to_vec();
         buf.resize(rtcp.len() + out.profile().rtcp_overhead(), 0);
-        let n = out.protect_rtcp(&mut buf, rtcp.len()).unwrap();
+        let n = out.protect_rtcp(&mut buf, rtcp.len()).ok()?;
         buf.truncate(n);
-        buf
+        Some(buf)
     }
 
     fn extension(&mut self, mid: &[u8]) -> Option<(u16, Vec<u8>)> {
