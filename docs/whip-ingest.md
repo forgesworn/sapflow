@@ -1540,6 +1540,16 @@ Implementation notes (W3c part 1, 11 November 2026):
     address would check the address alone.
   - `rtmp.rs` and `publish_control.rs` still end on an accept error, as
     `whip.rs` did; they need the same fix.
+  - `publish_auth::tests::neither_the_password_nor_the_url_reaches_logs_or_refusals`
+    sometimes misses its log line when the server's tests run in
+    parallel (3 times in about 95 runs of the whole test binary on a
+    loaded host), probably because its subscriber is thread-local
+    (`set_default`). It predates W3c.
+  - WHIP's recording marks are reported under the SRT- and RTMP-named
+    callback codes (`srt-unrecovered-loss` is not used, but
+    `srt-ingest-queue-full`, `srt-timeout` and `rtmp-protocol-error` are,
+    beside `media-loss`). The codes are part of the v4v contract, so they
+    stay as they are until the v4v integration.
   - `SAPFLOW_SEGMENT_COUNT`: once the live-window fix in `sapflow-hls`
     lands, the playlist keeps at least three target durations and can
     hold more than the count (up to 256 entries, or 64 MiB of media
