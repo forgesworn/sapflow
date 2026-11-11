@@ -1,6 +1,6 @@
 [package]
 name = "sapflow-rtp"
-description = "RTP and RTCP packets, SRTP and SRTCP for receive-only WHIP ingest, in pure Rust, sans-IO."
+description = "RTP, RTCP, SRTP and SRTCP, and receive-side H.264 and Opus handling, for receive-only WHIP ingest, in pure Rust, sans-IO."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
