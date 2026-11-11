@@ -33,13 +33,25 @@
 //!
 //! - After a publisher has been silent from its tuple for longer than the
 //!   hold, one valid check for another session from that tuple, copied or
-//!   spoofed, takes it, and the publisher's media is dropped until its own
-//!   next check from it, which takes it back (the other session has no
-//!   fresh media from it).
-//! - An admitted publisher that can spoof source addresses and whose check
-//!   from a victim's tuple arrives before the victim's first one owns that
-//!   tuple. If it then sends its own SRTP from that tuple, it keeps it, and
-//!   the victim's handshake on that tuple fails.
+//!   spoofed, takes it, and the publisher's media is dropped. If the
+//!   session that took it has connected, the publisher's own next check
+//!   from the tuple takes it back, since that session has no fresh media
+//!   from it. If it has not connected, it keeps the tuple while it checks
+//!   or handshakes, so the publisher's media is dropped until it connects
+//!   (and the publisher's next check then takes the tuple back) or ends at
+//!   its handshake deadline, up to 10 s after it was created.
+//! - An admitted publisher that can spoof source addresses can take a
+//!   tuple whenever its owner may lose it: before the owner's first check
+//!   from it, or after the owner has been silent from it for longer than
+//!   the hold. If it then sends its own SRTP from that tuple, it keeps it
+//!   for as long as it does so, and the victim's handshake on that tuple
+//!   fails or its media from it is dropped.
+//!
+//! Letting the publisher's check take a tuple back from a session that has
+//! not connected would close the second half of the first item, but it
+//! would let checks replayed for a session whose publisher has gone (their
+//! IDs forgotten) break the handshake of a new publisher that a NAT has
+//! given the same port, so the rule stays as it is.
 //!
 //! Each session's owned tuples are kept within the ones it still has
 //! validated, so the map is bounded by the sessions' tuple tables.

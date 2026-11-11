@@ -268,6 +268,79 @@ fn a_publisher_back_after_a_gap_reclaims_its_tuple_at_its_next_check() {
     assert_eq!(srtp(&r, &y), before + 5);
 }
 
+/// Limit one when the session that takes a silent publisher's tuple has
+/// not connected: it keeps the tuple while it handshakes, so the
+/// publisher's own check does not take it back, and its media is dropped
+/// until that session ends at its handshake deadline (10 s after it was
+/// made). The publisher's next check after that takes the tuple, and its
+/// media flows again.
+#[test]
+fn an_unconnected_session_keeps_a_taken_tuple_until_its_deadline() {
+    let t0 = Instant::now();
+    let mut r = router();
+    let mut y = join(&mut r, 20, t0);
+    let mut x = join(&mut r, 21, t0);
+    connect(&mut r, t0, &mut y);
+    let ty = y.p.tuple;
+    let now = talk(&mut r, &mut y, t0, 20);
+    let gap = now + ms(2_100);
+    r.handle_datagram(gap, ty, &x.p.check(false));
+    assert_eq!(r.owner(&ty), Some(x.id));
+    assert_eq!(state(&r, &x), Some(State::Checking));
+    // Y resumes: its media goes to X, which has no keys.
+    let before = srtp(&r, &y);
+    let resumed = talk(&mut r, &mut y, gap, 10);
+    assert_eq!(srtp(&r, &y), before, "dropped while X owns the tuple");
+    // Y's own check does not take the tuple back from a session that has
+    // not connected.
+    let kept = r.stats().kept;
+    r.handle_datagram(resumed, ty, &y.p.check(false));
+    assert_eq!(r.owner(&ty), Some(x.id));
+    assert_eq!(r.stats().kept, kept + 1);
+    // X ends at its handshake deadline and takes its tuples with it; Y's
+    // media from the tuple is then routed nowhere until Y's next check.
+    let deadline = t0 + Duration::from_secs(10);
+    r.handle_timeout(deadline);
+    assert!(r.session(&x.id).is_none(), "X ended at its deadline");
+    assert_eq!(r.owner(&ty), None);
+    let a = y.p.audio(1);
+    assert_eq!(r.handle_datagram(deadline, ty, &a), None);
+    assert_eq!(srtp(&r, &y), before);
+    r.handle_datagram(deadline, ty, &y.p.check(false));
+    assert_eq!(r.owner(&ty), Some(y.id));
+    talk(&mut r, &mut y, deadline, 5);
+    assert_eq!(srtp(&r, &y), before + 5);
+}
+
+/// Limit two after a silence: an admitted publisher that spoofs its own
+/// SRTP from a silent publisher's tuple keeps it, and the publisher's
+/// checks and media from it do not get it back.
+#[test]
+fn spoofed_media_keeps_a_tuple_taken_after_a_silence() {
+    let t0 = Instant::now();
+    let mut r = router();
+    let mut y = join(&mut r, 22, t0);
+    let mut x = join(&mut r, 23, t0);
+    connect(&mut r, t0, &mut y);
+    connect(&mut r, t0, &mut x);
+    let ty = y.p.tuple;
+    let now = talk(&mut r, &mut y, t0, 20);
+    let gap = now + ms(2_100);
+    r.handle_datagram(gap, ty, &x.p.check(false));
+    r.handle_datagram(gap, ty, &x.p.audio(1));
+    assert_eq!(r.owner(&ty), Some(x.id));
+    let before = srtp(&r, &y);
+    for i in 1..=10u64 {
+        let at = gap + ms(20 * i);
+        r.handle_datagram(at, ty, &x.p.audio(i as u8 + 1));
+        r.handle_datagram(at, ty, &y.p.check(false));
+        r.handle_datagram(at, ty, &y.p.audio(i as u8));
+        pump(&mut r, at, &mut [&mut y, &mut x]);
+    }
+    assert_eq!(r.owner(&ty), Some(x.id));
+    assert_eq!(srtp(&r, &y), before, "all of Y's media went to X");
+}
+
 /// Only a check the session takes as new moves a tuple: neither a
 /// retransmission of a remembered ID nor a request that fails
 /// authentication does, though the session has the tuple validated.
