@@ -75,6 +75,18 @@ fn forgotten_and_copied_reaches_the_third_tuple() {
     assert!(run.to_third <= 4 * run.from_third, "{run:?}");
 }
 
+/// The eviction seed evicts, under the eviction oracle.
+#[test]
+fn connect_evict_evicts() {
+    let (_, bytes) = seeds("whip_session")
+        .into_iter()
+        .find(|(n, _)| n == "connect-evict")
+        .expect("seed");
+    let run = whip_session_run(&bytes);
+    assert_eq!(run.stage, 2);
+    assert!(run.evicted > 0, "{run:?}");
+}
+
 /// A fixed-seed mutation pass over every seed, with the unit tests.
 #[test]
 fn seeded_mutations_hold_the_invariants() {
@@ -350,6 +362,24 @@ fn write_seeds() {
     push_step(&mut s, op::RTP, &[2]);
     push_step(&mut s, op::TIME, &[0x0b, 0xb8]);
     write("whip_session", "connect-forgotten-and-copied", &s);
+    // The eviction attack: forgotten checks, a forgotten nominating copy
+    // from B, a copy of fresh SRTP from B ahead of its original, then
+    // forgotten copies from new tuples into a full table. The publisher's
+    // tuple, which delivered media more recently than the copiers, must
+    // stay, and its next packet must count.
+    let mut s = Vec::new();
+    connect(&mut s);
+    push_step(&mut s, op::RTP, &[2]);
+    push_step(&mut s, op::CHECK, &[0xf0]);
+    push_step(&mut s, op::CHECK, &[0xf1]);
+    push_step(&mut s, op::ELSEWHERE, &[0x80, 0]);
+    push_step(&mut s, op::ELSEWHERE, &[0x81]);
+    push_step(&mut s, op::ELSEWHERE, &[0x00, 1]);
+    push_step(&mut s, op::ELSEWHERE, &[0x20, 2]);
+    push_step(&mut s, op::ELSEWHERE, &[0x40, 3]);
+    push_step(&mut s, op::RTP, &[2]);
+    push_step(&mut s, op::TIME, &[4]);
+    write("whip_session", "connect-evict", &s);
     // RTCP too short to protect, which the harness once unwrapped.
     let mut s = Vec::new();
     connect(&mut s);

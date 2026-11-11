@@ -15,11 +15,15 @@
 //!   with and without USE-CANDIDATE or ICE-CONTROLLED, DTLS flights, SRTP
 //!   and SRTCP, time, and captured checks and copies of fresh SRTP and SRTCP
 //!   delivered from another tuple before or after their originals, with an
-//!   ID cache of 16 so that checks are forgotten. After every step: every
-//!   tuple has been sent at most `amplification_limit` times what it sent
-//!   (STUN responses included); DTLS and RTCP only to the send tuple; the
-//!   selected and send tuples validated; at most
-//!   [`MAX_DATAGRAMS_PER_STEP`] datagrams, none over 1500 bytes.
+//!   ID cache of 16 so that checks are forgotten and room for 3 validated
+//!   tuples of the 6 it uses so that tuples are evicted. After every
+//!   datagram: every tuple has been sent at most `amplification_limit`
+//!   times what it sent (STUN responses included); a tuple never validated
+//!   only a STUN error response to the request it just sent, no larger;
+//!   DTLS and RTCP only to the send tuple; an evicted tuple had the stalest
+//!   media of those that could go, the earliest validated breaking ties;
+//!   the selected and send tuples validated; at most
+//!   [`MAX_DATAGRAMS_PER_STEP`] datagrams a step, none over 1500 bytes.
 
 #![allow(
     clippy::panic,
@@ -32,7 +36,7 @@ use crate::Transport;
 use crate::framing::{self, Decoder, Framing};
 use crate::ice::{Agent, Credentials, IceConfig, Kind, Tuple, classify};
 use crate::sdp::{self, AnswerConfig, Candidate, Offer};
-use crate::session::{Event, SessionConfig, State};
+use crate::session::{Event, Session, SessionConfig, State, Transmit};
 use crate::stun::{self, Builder, Message};
 use crate::testing::{self, Publisher, tuple};
 use sapflow_dtls::Fingerprint;
@@ -267,9 +271,9 @@ pub mod op {
     pub const REPLAY: u8 = 8;
     /// Closes the session.
     pub const CLOSE: u8 = 9;
-    /// An observer's copy from another tuple: the third tuple, which never
-    /// sends a check of its own, or with bit 7 of the first byte tuple B.
-    /// Bits 0 and 1 pick what: 0, a STUN datagram sent so far (chosen by
+    /// An observer's copy from another tuple: bits 5 to 7 of the first byte
+    /// pick one of four that never send a check of their own, or (4)
+    /// tuple B. Bits 0 and 1 pick what: 0, a STUN datagram sent so far (chosen by
     /// the second byte); 1, a copy of a fresh SRTP packet ahead of its
     /// original; 2, the same after its original; 3, copies of fresh sender
     /// reports, ahead of the originals unless bit 2 is set.
@@ -293,25 +297,156 @@ pub struct Run {
     pub to_third: u64,
     /// Bytes the third tuple sent the session.
     pub from_third: u64,
+    /// Validated tuples the session evicted.
+    pub evicted: u64,
+}
+
+/// What the harness knows about the tuples, for the oracles: bytes both
+/// ways, the tuples ever validated, and its own record of when each last
+/// delivered fresh media and when it was validated.
+struct Oracle {
+    limit: u64,
+    known: Vec<Tuple>,
+    from: HashMap<Tuple, u64>,
+    to: HashMap<Tuple, u64>,
+    ever: Vec<Tuple>,
+    fresh: HashMap<Tuple, Instant>,
+    order: HashMap<Tuple, u64>,
+    validations: u64,
+    out: usize,
+}
+
+impl Oracle {
+    /// Hands one datagram to the session and checks what follows.
+    fn deliver(
+        &mut self,
+        s: &mut Session,
+        now: Instant,
+        t: Tuple,
+        d: &[u8],
+        replies: &mut Vec<Transmit>,
+        home: Tuple,
+    ) {
+        let before: Vec<bool> = self.known.iter().map(|k| s.accepts(k)).collect();
+        let (selected, sending) = (s.selected(), s.send_tuple());
+        let media = |s: &Session| s.stats().srtp_packets + s.stats().srtcp_packets;
+        let media_before = media(s);
+        *self.from.entry(t).or_default() += d.len() as u64;
+        s.handle_datagram(now, t, d);
+        let after: Vec<bool> = self.known.iter().map(|k| s.accepts(k)).collect();
+        // Eviction: whoever went had the stalest media of those that could.
+        let key = |o: &Self, k: &Tuple| o.fresh.get(k).copied();
+        for (i, gone) in self.known.iter().enumerate() {
+            if !before[i] || after[i] {
+                continue;
+            }
+            for (j, kept) in self.known.iter().enumerate() {
+                if i == j
+                    || !(before[j] && after[j])
+                    || Some(*kept) == selected
+                    || Some(*kept) == sending
+                {
+                    continue;
+                }
+                let (kg, kk) = (key(self, gone), key(self, kept));
+                let earlier = self.order.get(gone) < self.order.get(kept);
+                assert!(
+                    kk > kg || (kk == kg && earlier),
+                    "evicted a tuple with fresher media than one kept"
+                );
+            }
+        }
+        for (i, k) in self.known.clone().iter().enumerate() {
+            if before[i] && !after[i] {
+                self.fresh.remove(k);
+            }
+            if !before[i] && after[i] {
+                self.validations += 1;
+                self.order.insert(*k, self.validations);
+                self.fresh.remove(k);
+                if !self.ever.contains(k) {
+                    self.ever.push(*k);
+                }
+            }
+        }
+        if media(s) > media_before {
+            self.fresh.insert(t, now);
+        }
+        self.drain(s, Some((t, d.len())), replies, home);
+    }
+
+    /// Takes what the session queued and checks it; `request` is the
+    /// datagram it answers, if any.
+    fn drain(
+        &mut self,
+        s: &mut Session,
+        request: Option<(Tuple, usize)>,
+        replies: &mut Vec<Transmit>,
+        home: Tuple,
+    ) {
+        let target = s.send_tuple();
+        while let Some(x) = s.poll_transmit() {
+            self.out += 1;
+            assert!(x.bytes.len() <= 1500, "a datagram within the MTU cap");
+            // Every tuple, whatever it has proven: at most the limit times
+            // what it sent, STUN responses included.
+            let total = self.to.entry(x.tuple).or_default();
+            *total += x.bytes.len() as u64;
+            let got = self.from.get(&x.tuple).copied().unwrap_or(0);
+            assert!(
+                *total <= self.limit * got,
+                "{total} bytes to a tuple that sent {got}"
+            );
+            // A tuple never validated: only a STUN error response to the
+            // request it just sent, no larger than it.
+            if !self.ever.contains(&x.tuple) {
+                let error =
+                    Message::parse(&x.bytes).is_ok_and(|m| m.msg_type == stun::BINDING_ERROR);
+                let answers = request.is_some_and(|(t, n)| t == x.tuple && x.bytes.len() <= n);
+                assert!(error && answers, "sent to a tuple that never authenticated");
+            }
+            if classify(&x.bytes) != Kind::Stun {
+                assert_eq!(
+                    Some(x.tuple),
+                    target,
+                    "DTLS and RTCP only to the send tuple"
+                );
+            }
+            if x.tuple == home {
+                replies.push(x);
+            }
+        }
+    }
 }
 
 /// [`whip_session`], reporting what reached the third tuple.
 pub fn whip_session_run(data: &[u8]) -> Run {
     let t0 = Instant::now();
     let mut p = Publisher::new(3, &[0x0007, 0x0001]);
-    // The smallest ID cache, so that checks are forgotten within a script.
+    // The smallest ID cache, so that checks are forgotten within a script,
+    // and room for 3 tuples of the 6 used, so that tuples are evicted.
     let mut config = SessionConfig::default();
     config.ice.max_transactions = 16;
+    config.ice.max_tuples = 3;
     let limit = u64::from(config.amplification_limit);
     let mut a = testing::accept(&p.offer(), config, t0, 3);
     p.answered(&a);
     let s = &mut a.session;
     let other = tuple(9);
     let stranger = tuple(77);
+    let copiers = [stranger, tuple(78), tuple(79), tuple(80), other];
     let mut now = t0;
-    // Bytes each tuple sent the session, and the session sent it.
-    let mut from: HashMap<Tuple, u64> = HashMap::new();
-    let mut to: HashMap<Tuple, u64> = HashMap::new();
+    let mut o = Oracle {
+        limit,
+        known: [p.tuple, other, stranger, tuple(78), tuple(79), tuple(80)].to_vec(),
+        from: HashMap::new(),
+        to: HashMap::new(),
+        ever: Vec::new(),
+        fresh: HashMap::new(),
+        order: HashMap::new(),
+        validations: 0,
+        out: 0,
+    };
     let mut pending: Vec<Vec<u8>> = Vec::new();
     let mut history: Vec<(Tuple, Vec<u8>)> = Vec::new();
     let mut started = false;
@@ -393,7 +528,7 @@ pub fn whip_session_run(data: &[u8]) -> Run {
             }
             op::CLOSE => s.close(),
             op::ELSEWHERE => {
-                let copier = if first & 0x80 == 0 { stranger } else { other };
+                let copier = copiers[usize::from(first >> 5) % copiers.len()];
                 let pick = usize::from(bytes.get(1).copied().unwrap_or(0));
                 match first & 3 {
                     0 => {
@@ -429,44 +564,21 @@ pub fn whip_session_run(data: &[u8]) -> Run {
             }
             _ => {}
         }
+        // Invariants on what the session sends: timer output first, then
+        // each datagram's.
+        o.out = 0;
+        let mut replies = Vec::new();
+        o.drain(s, None, &mut replies, p.tuple);
         for (t, d) in sent {
             if history.len() < 256 {
                 history.push((t, d.clone()));
             }
-            *from.entry(t).or_default() += d.len() as u64;
-            s.handle_datagram(now, t, &d);
-        }
-        // Invariants on what the session sends.
-        let target = s.send_tuple();
-        let mut out = 0usize;
-        let mut replies = Vec::new();
-        while let Some(t) = s.poll_transmit() {
-            out += 1;
-            assert!(t.bytes.len() <= 1500, "a datagram within the MTU cap");
-            // Every tuple, whatever it has proven: at most the limit times
-            // what it sent, STUN responses included.
-            let total = to.entry(t.tuple).or_default();
-            *total += t.bytes.len() as u64;
-            let got = from.get(&t.tuple).copied().unwrap_or(0);
-            assert!(
-                *total <= limit * got,
-                "{total} bytes to a tuple that sent {got}"
-            );
-            match classify(&t.bytes) {
-                Kind::Stun => {}
-                _ => assert_eq!(
-                    Some(t.tuple),
-                    target,
-                    "DTLS and RTCP only to the send tuple"
-                ),
-            }
-            if t.tuple == p.tuple {
-                replies.push(t);
-            }
+            o.deliver(s, now, t, &d, &mut replies, p.tuple);
         }
         assert!(
-            out <= MAX_DATAGRAMS_PER_STEP,
-            "{out} datagrams from one step"
+            o.out <= MAX_DATAGRAMS_PER_STEP,
+            "{} datagrams from one step",
+            o.out
         );
         // The publisher reads what was sent to it.
         for t in replies {
@@ -510,8 +622,9 @@ pub fn whip_session_run(data: &[u8]) -> Run {
     }
     Run {
         stage: furthest,
-        to_third: to.get(&stranger).copied().unwrap_or(0),
-        from_third: from.get(&stranger).copied().unwrap_or(0),
+        to_third: o.to.get(&stranger).copied().unwrap_or(0),
+        from_third: o.from.get(&stranger).copied().unwrap_or(0),
+        evicted: s.stats().ice.evicted,
     }
 }
 
