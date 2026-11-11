@@ -1472,11 +1472,25 @@ Implementation notes (W3c part 1, 11 November 2026):
     failing, keys spent), since the last media may be missing with no
     later packet to show a gap.
 
-  Frames skipped before the first IDR, timeline re-anchors on arrival and
-  sender-report steps lose nothing and do not mark, nor does an orderly
-  end (`DELETE`, our close, the publisher's `close_notify`); loss just
-  before an orderly end cannot be seen. A run that loses nothing stays
-  complete. Each session's lost packets are logged when it ends.
+  Frames skipped before the first IDR lose nothing and do not mark, nor
+  does an orderly end (`DELETE`, our close, the publisher's
+  `close_notify`); loss just before an orderly end cannot be seen. A run
+  that loses nothing stays complete. Each session's lost packets are
+  logged when it ends.
+- **A re-anchor with no loss is not a mark.** When the `sapflow-rtp`
+  timeline re-anchors on arrival time (`Discontinuity::Arrival`: the
+  publisher's packets have fallen more than 500 ms behind their own RTP
+  clock, as a delivery delay that ramps up does) or moves forward to a
+  sender report, no media is missing. For an audio-only stream the server
+  then ends the muxer's run deliberately (`Muxer::interrupt`, as a
+  reconnect does) before the jumped packet, so the packet starts a new run
+  after an HLS discontinuity, which keeps live latency bounded, and the
+  recording stays complete. Fed straight to the muxer, the same jump reads
+  as a break, which it reports as loss. A video-led stream's muxer takes
+  the jump without reporting loss, and an interrupt there would drop its
+  pending frame and wait for a keyframe, so it is left alone. Re-anchors
+  are counted per session (`reanchors`) and logged at debug. A re-anchor
+  after an outage that lost packets is still marked, by the loss.
 - **Opus timing.** Audio-only Opus discontinuities under a slewed timeline
   (Open after W3b, above) belong to `sapflow-hls`; the server does not
   work around them. For an audio-only stream, `EXT-X-PROGRAM-DATE-TIME`
@@ -1512,7 +1526,9 @@ Implementation notes (W3c part 1, 11 November 2026):
 | Receiver events dropped for want of queue room mark the recording | `whip::tests::receiver_events_dropped_for_room_mark_the_recording` | Met |
 | The muxer alone, given the same access units and audio, marks none of the four paths above | the same four tests, through `marked_only_by_the_server` | Met |
 | An end that is not orderly marks the recording; an orderly one does not | `whip::tests::an_abnormal_end_marks_the_recording` | Met |
-| A run that loses nothing stays complete | `whip::tests::a_clean_close_leaves_the_recording_complete`; `whip::tests::a_clean_run_over_udp_stays_complete`; `scripts/whip-e2e.js` (session ended with `lost=0`, recording finished complete) | Met in process and in the Chrome run. Over UDP on a loaded test host, a clean run is marked about once in 100 runs of the whole server test binary, by the audio-only Opus muxer's own continuity check (`muxer=1` in the session's loss counts), never by a server path: a false mark that the Opus timing change (#68) is expected to remove. To be retested once it is in main |
+| A run that loses nothing stays complete | `whip::tests::a_clean_close_leaves_the_recording_complete`; `whip::tests::a_clean_run_over_udp_stays_complete` (the test publisher paced by its media clock); `scripts/whip-e2e.js` (session ended with `lost=0`, recording finished complete) | Met; see the soak figures below |
+| A re-anchor with no loss leaves the recording complete, gives one HLS discontinuity and is counted; the muxer alone would have marked it | `whip::tests::a_delay_ramp_with_no_loss_reanchors_without_marking` | Met in process (audio-only) |
+| An outage that loses packets and then re-anchors is still marked | `whip::tests::an_outage_that_loses_packets_and_reanchors_is_marked` | Met in process |
 | Each mark says which path set it | the session's loss counts (`LossCounts`), logged when it ends and given in the UDP tests' failure messages | Met |
 | A full queue's keyframe request sends a PLI at once, with no keyframe interval | `tests::request_keyframe_sends_a_pli_at_once` (sapflow-whip) | Met at the session; the server's call is not tested end to end |
 | A dual-stack listener believes `X-Forwarded-For` from an IPv4 proxy seen IPv4-mapped | `whip_request::tests::forwarded_for_only_from_the_trusted_proxy` | Unit tests only |

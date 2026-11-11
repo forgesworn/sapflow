@@ -798,6 +798,18 @@ const AUDIO_ONLY: Setup = Setup {
 /// and audio given to the ingest and no loss marked by the server, which
 /// leaves the muxer's own view.
 async fn recorded(events: Vec<Event>, setup: Setup, feed: bool) -> Option<IncompleteReason> {
+    recorded_in_full(events, setup, feed).await.reason
+}
+
+/// A recording's state after a run, with what the server counted.
+struct Recorded {
+    reason: Option<IncompleteReason>,
+    /// `EXT-X-DISCONTINUITY` tags in the media playlist.
+    discontinuities: usize,
+    counts: Arc<LossCounts>,
+}
+
+async fn recorded_in_full(events: Vec<Event>, setup: Setup, feed: bool) -> Recorded {
     let fixture = crate::publish::loss_tests::Fixture::new();
     let mut publication = fixture.begin_kind(SourceKind::Es);
     publication
@@ -830,7 +842,7 @@ async fn recorded(events: Vec<Event>, setup: Setup, feed: bool) -> Option<Incomp
                     received: 0,
                     trace: AudioTrace::default(),
                 }),
-                Media::Loss { .. } | Media::Other(_) => {}
+                Media::Loss { .. } | Media::Reanchor | Media::Other(_) => {}
             },
             _ => {}
         }
@@ -839,11 +851,95 @@ async fn recorded(events: Vec<Event>, setup: Setup, feed: bool) -> Option<Incomp
         }
         for item in items {
             publication
-                .push(|source, now| feed_item(source, item, now))
+                .push(|source, now| match item {
+                    Item::Reanchor => reanchor(source, setup, now),
+                    item => feed_item(source, item, now),
+                })
                 .expect("ingest");
         }
     }
-    status.reason()
+    let playlist = publication
+        .stream
+        .lock()
+        .media
+        .as_ref()
+        .map(|m| String::from_utf8_lossy(m).into_owned())
+        .unwrap_or_default();
+    Recorded {
+        reason: status.reason(),
+        discontinuities: playlist.matches("#EXT-X-DISCONTINUITY\n").count(),
+        counts: server.counts(),
+    }
+}
+
+fn arrival_reanchors(run: &Run) -> usize {
+    run.events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Media(sapflow_rtp::Event::Discontinuity {
+                    cause: Discontinuity::Arrival { .. },
+                    ..
+                })
+            )
+        })
+        .count()
+}
+
+/// Audio-only Opus whose delivery delay ramps past 500 ms with nothing
+/// lost: each packet 24 ms after the last, 20 ms of RTP apart, for 4 s.
+fn delay_ramp() -> Run {
+    let mut run = Run::new(48, audio_only, SessionConfig::default());
+    for i in 0..200u64 {
+        let a = run.p.audio(i as u8);
+        run.send(&a);
+        run.wait(24);
+    }
+    run
+}
+
+/// A timeline re-anchor with no loss is not a mark: the server ends the
+/// muxer's run deliberately before the jumped packet, so the recording
+/// stays complete, the playlist gets one discontinuity (keeping live
+/// latency bounded), and the re-anchor is counted. The muxer alone, given
+/// the same media, would have marked it.
+#[tokio::test]
+async fn a_delay_ramp_with_no_loss_reanchors_without_marking() {
+    let run = delay_ramp();
+    assert_eq!(arrival_reanchors(&run), 1, "one re-anchor on arrival time");
+    assert!(!run.lost());
+    let r = recorded_in_full(run.events, AUDIO_ONLY, true).await;
+    assert_eq!(r.reason, None, "{}", r.counts);
+    assert_eq!(r.counts.reanchors.load(Ordering::Relaxed), 1);
+    assert_eq!(r.discontinuities, 1, "one HLS discontinuity");
+    let alone = recorded(delay_ramp().events, AUDIO_ONLY, false).await;
+    assert_eq!(
+        alone,
+        Some(IncompleteReason::MediaLoss),
+        "the muxer alone marks it"
+    );
+}
+
+/// An outage that loses packets and then re-anchors is marked as before:
+/// the lost packets mark it, whatever the re-anchor does.
+#[tokio::test]
+async fn an_outage_that_loses_packets_and_reanchors_is_marked() {
+    let mut run = Run::new(49, audio_only, SessionConfig::default());
+    run.audio(100, &[]);
+    // Ten packets lost, and the next arrives 900 ms after the last one,
+    // 220 ms of RTP time later.
+    for _ in 0..10 {
+        let _lost = run.p.audio(0);
+    }
+    run.wait(880);
+    run.audio(100, &[]);
+    assert!(run.lost(), "the receiver reports the gap");
+    assert_eq!(arrival_reanchors(&run), 1, "and re-anchors after it");
+    let r = recorded_in_full(run.events, AUDIO_ONLY, true).await;
+    assert_eq!(r.reason, Some(IncompleteReason::MediaLoss), "{}", r.counts);
+    assert_eq!(r.counts.lost_packets.load(Ordering::Relaxed), 10);
+    assert_eq!(r.counts.reanchors.load(Ordering::Relaxed), 1);
 }
 
 /// The lost packet: a sequence gap the receiver declares lost after the

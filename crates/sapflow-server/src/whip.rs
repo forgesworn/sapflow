@@ -89,6 +89,9 @@ pub(crate) enum Item {
         /// For the diagnostic when the muxer reports a break.
         trace: AudioTrace,
     },
+    /// The receiver's timeline re-anchored on arrival time (or moved to a
+    /// sender report) before the next frame, with no loss of its own.
+    Reanchor,
 }
 
 /// The audio stream's timeline counters in `sapflow-rtp` as an event was
@@ -124,19 +127,21 @@ impl Item {
                 .saturating_add(au.sps.as_ref().map_or(0, Vec::len))
                 .saturating_add(au.pps.as_ref().map_or(0, Vec::len)),
             Self::Audio { packet, .. } => packet.len(),
+            Self::Reanchor => 0,
         }
     }
 
     fn audio_trace(&self) -> Option<(u64, AudioTrace)> {
         match self {
             Self::Audio { pts, trace, .. } => Some((*pts, *trace)),
-            Self::Video { .. } => None,
+            Self::Video { .. } | Self::Reanchor => None,
         }
     }
 
     fn received(&self) -> usize {
         match self {
             Self::Video { received, .. } | Self::Audio { received, .. } => *received,
+            Self::Reanchor => 0,
         }
     }
 }
@@ -168,12 +173,15 @@ pub(crate) struct LossCounts {
     pub abnormal_ends: AtomicU64,
     /// Ingest updates in which the muxer itself reported media loss.
     pub muxer: AtomicU64,
+    /// Timeline re-anchors with no loss of their own: not a mark, counted
+    /// beside the marks.
+    pub reanchors: AtomicU64,
     /// The last break the audio-only muxer reported, explained.
     pub muxer_break: Mutex<Option<String>>,
 }
 
 impl LossCounts {
-    fn fields(&self) -> [(&'static str, u64); 11] {
+    fn fields(&self) -> [(&'static str, u64); 12] {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         [
             ("lost_packets", g(&self.lost_packets)),
@@ -187,6 +195,7 @@ impl LossCounts {
             ("queue_full", g(&self.queue_full)),
             ("abnormal_ends", g(&self.abnormal_ends)),
             ("muxer", g(&self.muxer)),
+            ("reanchors", g(&self.reanchors)),
         ]
     }
 }
@@ -385,6 +394,11 @@ impl Feed {
                 tracing::debug!(event = name, "WHIP media event");
                 return Ok(());
             }
+            Media::Reanchor => {
+                self.counts.reanchors.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("WHIP timeline re-anchored with no loss");
+                Item::Reanchor
+            }
         };
         let size = item.size();
         let video = matches!(item, Item::Video { .. });
@@ -450,10 +464,12 @@ pub(crate) enum Media {
         path: LossPath,
         packets: u64,
     },
-    /// Nothing for the ingest, by name: the start hold's alignment, frames
-    /// skipped before the first IDR, and timeline re-anchors and sender
-    /// report steps, which move the timeline but lose no media (any packets
-    /// missing are reported on their own).
+    /// The timeline re-anchored on arrival time, or moved forward to a
+    /// sender report: a jump in timestamps with no media missing (packets
+    /// missing are reported on their own, and mark). Not a mark.
+    Reanchor,
+    /// Nothing for the ingest, by name: the start hold's alignment and
+    /// frames skipped before the first IDR.
     Other(&'static str),
 }
 
@@ -494,6 +510,10 @@ fn media(event: sapflow_rtp::Event) -> Media {
             cause: Discontinuity::Timestamp { .. },
             ..
         } => loss(LossPath::TimestampJump),
+        E::Discontinuity {
+            cause: Discontinuity::Arrival { .. } | Discontinuity::SenderReport { .. },
+            ..
+        } => Media::Reanchor,
         other => Media::Other(event_name(&other)),
     }
 }
@@ -1207,7 +1227,27 @@ fn feed_item(source: &mut Source, item: Item, now: SystemTime) -> Result<Update,
             let t = i64::try_from(pts).map_err(|_| IngestError::InvalidTimestamp)?;
             es.opus_at(t, &packet, now)
         }
+        Item::Reanchor => Ok(Update::default()),
     }
+}
+
+/// A timeline re-anchor with no loss, for an audio-only stream: end the
+/// run here, as a reconnect does (`Muxer::interrupt`), so the jumped
+/// packet starts a new one after an HLS discontinuity instead of reading
+/// to the muxer as a break, which it would report as loss. Live latency
+/// stays bounded either way. A video-led stream is left alone: its muxer
+/// takes a timestamp jump without reporting loss, and an interrupt would
+/// drop its pending frame and wait for a keyframe.
+fn reanchor(source: &mut Source, setup: Setup, now: SystemTime) -> Result<Update, IngestError> {
+    let Source::Es(es) = source else {
+        return Err(IngestError::TrackConflict);
+    };
+    if setup.video {
+        return Ok(Update::default());
+    }
+    Ok(es
+        .muxer_mut()
+        .map_or_else(Update::default, |m| m.interrupt(now)))
 }
 
 /// One session's ingest: owns its publication, and releases it when the
@@ -1234,7 +1274,10 @@ async fn ingest(
             let audio = item.audio_trace();
             let mut broke = false;
             let pushed = publication.push(|source, now| {
-                let update = feed_item(source, item, now)?;
+                let update = match item {
+                    Item::Reanchor => reanchor(source, setup, now)?,
+                    item => feed_item(source, item, now)?,
+                };
                 if update.media_loss {
                     counts.muxer.fetch_add(1, Ordering::Relaxed);
                     broke = true;
