@@ -975,12 +975,13 @@ There is no ICE restart in v1.
   `max_tuples` - 2 other addresses (6 by default) each with fresh media at
   least as new as the publisher's last, and a selected address other than
   the publisher's. An observer that copies and spoofs gets them from
-  forgotten check IDs, one of them carrying USE-CANDIDATE, and that many
+  checks whose IDs are forgotten or whose originals were lost, one of them
+  carrying USE-CANDIDATE, and that many
   of the publisher's packets that the session never received on their
   original index while each was inside the replay window (1024 packets per
   SSRC, about 20 s of Opus at 50 a second): packets lost after the
   observer saw them, or beaten by its copies. No race is needed: it can
-  keep lost packets and send them, with a forgotten check from a new
+  keep lost packets and send them, with one such check from a new
   address, in one burst between two of the publisher's packets, and RTX
   resends go on their own SSRC, leaving the original index open. Short of
   that, after a won race or a copy of a lost packet, the publisher loses
@@ -989,7 +990,7 @@ There is no ICE restart in v1.
   until one of its own checks arrives before any copy of it (a check whose
   copy came first is refused as a replay). That check brings its address
   back with no media, below every address that has some, so one more
-  forgotten check from a new address that lands before the publisher's
+  such check from a new address that lands before the publisher's
   next packet pushes it out again: that needs no race, only the gap. The
   exception is a check of the publisher's that carries USE-CANDIDATE: its
   address becomes the selected one and is kept while it stays selected. An
@@ -1282,13 +1283,12 @@ Implementation notes (W3a, 11 November 2026):
       exchange would not help: it proves the address once, at the hello,
       and is not bound to the address;
     - sends follow the selected tuple until SRTP or SRTCP arrives, then the
-      tuple of the latest fresh SRTP or SRTCP with current consent, so
-      after a won race they are back with the publisher at its next
-      packet that arrives before any copy of it (20 ms of audio in the
-      test). That holds against an observer that copies and spoofs but
-      cannot drop or delay the publisher's packets; one that wins every
-      race can keep sends away from the publisher, within the per-tuple
-      bound;
+      tuple of the latest fresh SRTP or SRTCP with current consent. Short
+      of a push-out (see the eviction paragraph under Concurrency and
+      resource bounds), after a won race they are back with the publisher
+      at its next packet that arrives before any copy of it (20 ms of
+      audio in the test). A push-out, or an attacker that wins every race,
+      can keep sends away from the publisher, within the per-tuple bound;
     - eviction takes a tuple that has never delivered fresh media, then
       the one with the stalest, never the selected or send tuple. A third
       review showed that eviction by age alone let forgotten copies push

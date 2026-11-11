@@ -81,12 +81,13 @@ except the test-only example harness.
   out takes `max_tuples` - 2 other tuples (6 by default) each with fresh
   media at least as new as the publisher's last, and a selected tuple
   other than the publisher's. An observer that copies and spoofs gets them
-  from forgotten check IDs, one of them carrying USE-CANDIDATE, and that
+  from checks whose IDs are forgotten or whose originals were lost, one of
+  them carrying USE-CANDIDATE, and that
   many of the publisher's packets that the session never received on their
   original index while each was inside the replay window (1024 packets per
   SSRC, about 20 s of Opus at 50 a second): packets lost after the
   observer saw them, or beaten by its copies. No race is needed: it can
-  keep lost packets and send them, with a forgotten check from a new
+  keep lost packets and send them, with one such check from a new
   tuple, in one burst between two of the publisher's packets, and RTX
   resends go on their own SSRC, leaving the original index open. Short of
   that, after a won race or a copy of a lost packet, the publisher loses
@@ -95,7 +96,7 @@ except the test-only example harness.
   until one of its own checks arrives before any copy of it (a check whose
   copy came first is refused as a replay). That check brings its tuple
   back with no media, below every tuple that has some, so one more
-  forgotten check from a new tuple that lands before the publisher's next
+  such check from a new tuple that lands before the publisher's next
   packet pushes it out again: that needs no race, only the gap. The
   exception is a check of the publisher's that carries USE-CANDIDATE: its
   tuple becomes the selected one and is kept while it stays selected. An
