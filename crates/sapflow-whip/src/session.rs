@@ -36,16 +36,17 @@
 //!   against an observer that copies and spoofs but cannot drop or delay
 //!   the publisher's packets, the publisher's tuple stays validated while
 //!   it keeps delivering media: pushing it out would take `max_tuples` - 2
-//!   other tuples (6 by default) each with fresher media than the
-//!   publisher's last packet, that is that many won races or copies of lost
-//!   packets within one packet interval. Short of that, after one won race
-//!   or one copy of a lost packet, the publisher loses no media and sends
-//!   are back with it at its next packet that arrives before any copy of
-//!   it. An attacker who wins every race, or drops or delays the
-//!   publisher's packets (RFC 8445 section 19.2), can keep its packets from
-//!   ever counting as fresh, push its tuple out so its media is dropped
-//!   until its next check, and keep sends away from it, though never
-//!   beyond the per-tuple bound.
+//!   other tuples (6 by default) each with fresh media newer than the
+//!   publisher's last, so that many of the publisher's packets in a row
+//!   each beaten by a copy from another tuple, or lost and copied. Short of
+//!   that, after one won race or one copy of a lost packet, the publisher
+//!   loses no media and sends are back with it at its next packet that
+//!   arrives before any copy of it. An attacker who wins every race, or
+//!   drops or delays the publisher's packets (RFC 8445 section 19.2), can
+//!   keep its packets from ever counting as fresh, push its tuple out so
+//!   its media is dropped until one of its own checks arrives before any
+//!   copy of it (a check whose copy came first is refused as a replay), and
+//!   keep sends away from it, though never beyond the per-tuple bound.
 //! - **DTLS from the selected tuple only.** `sapflow-dtls` is fed only
 //!   datagrams from the selected tuple. A few that arrive from a validated
 //!   tuple before its USE-CANDIDATE check ([`SessionConfig::max_early_dtls`])

@@ -758,17 +758,19 @@ There is no ICE restart in v1.
   Against an observer that copies and spoofs but cannot drop or delay the
   publisher's packets, the publisher's address stays validated while it
   keeps delivering media: pushing it out would take `max_tuples` - 2 other
-  addresses (6 by default) each with fresher media than the publisher's
-  last packet, that many won races or copies of lost packets within one
-  packet interval. Short of that, after a won race or a copy of a lost
+  addresses (6 by default) each with fresh media newer than the
+  publisher's last, so that many of the publisher's packets in a row each
+  beaten by a copy from another address, or lost and copied. Short of
+  that, after a won race or a copy of a lost
   packet, the publisher loses no media and sends are back with it at its
   next packet that arrives before any copy of it. The bound does not cover
   an attacker who wins every race, or drops or delays the publisher's
   packets (RFC 8445 section 19.2): it can keep them from counting as fresh,
-  push the publisher's address out so its media is dropped until its next
-  check, and keep sapflow's sends, PLIs and NACKs among them, away from
-  the publisher, which disrupts delivery, though still not beyond four
-  times what it sends.
+  push the publisher's address out so its media is dropped until one of
+  its own checks arrives before any copy of it (a check whose copy came
+  first is refused as a replay), and keep sapflow's sends, PLIs and NACKs
+  among them, away from the publisher, which disrupts delivery, though
+  still not beyond four times what it sends.
   This is shown in process (W3a); no real browser has yet been seen to
   move pairs mid-handshake.
 
