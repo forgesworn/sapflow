@@ -16,7 +16,7 @@ use mpeg2ts::es::StreamType;
 use mpeg2ts::pes::{PesHeader, PesPacket, PesPacketReader, ReadPesPacket};
 use mpeg2ts::ts::{Pid, ReadTsPacket, TsPacket, TsPacketReader, TsPayload};
 
-use crate::codec::{self, AAC_FRAME_SAMPLES, AacConfig, H264Config};
+use crate::codec::{self, AAC_FRAME_SAMPLES, AacConfig, AudioConfig, H264Config, OpusConfig};
 use crate::muxer::{MuxError, Muxer, MuxerConfig, Update};
 
 use crate::TrackSet;
@@ -84,7 +84,9 @@ pub enum IngestError {
     InvalidTracks,
     /// Media contradicts this connection's explicit immutable declaration.
     TrackConflict,
-    /// The AAC configuration is unsupported or changes within the connection.
+    /// The audio configuration is unsupported or changes within the
+    /// connection (including a change of codec), or an Opus packet is
+    /// malformed (RFC 6716 section 3.4).
     InvalidAudio,
     /// An AAC timestamp cannot be represented on the supported timeline.
     InvalidTimestamp,
@@ -484,13 +486,17 @@ fn starved() -> mpeg2ts::Error {
 }
 
 /// Elementary streams in, muxer out: shared by the TS (SRT) and FLV (RTMP)
-/// front ends. Timestamps are 90 kHz on one monotonic timeline.
+/// front ends, and by any caller with H.264 access units and AAC frames or
+/// Opus packets. Timestamps are 90 kHz on one monotonic timeline. One
+/// connection carries one audio codec: AAC through [`EsIngest::audio_config`],
+/// [`EsIngest::audio_at`] and [`EsIngest::audio`], or Opus through
+/// [`EsIngest::opus_config`], [`EsIngest::opus_at`] and [`EsIngest::opus`].
 pub struct EsIngest {
     cfg: MuxerConfig,
     origin: Option<i64>,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
-    aac: Option<AacConfig>,
+    audio: Option<AudioConfig>,
     /// Whether to hold the first keyframe until the audio config is known.
     expect_audio: bool,
     declared: Option<TrackSet>,
@@ -507,7 +513,7 @@ impl EsIngest {
             origin: None,
             sps: None,
             pps: None,
-            aac: None,
+            audio: None,
             expect_audio: true,
             declared: None,
             muxer: None,
@@ -610,25 +616,50 @@ impl EsIngest {
         }
     }
 
-    /// The AAC configuration, once one has been seen.
+    /// The AAC configuration, once one has been seen; `None` for Opus (see
+    /// [`EsIngest::known_audio_config`]).
     pub fn known_audio(&self) -> Option<AacConfig> {
-        self.aac
+        self.audio.and_then(|audio| audio.aac().copied())
+    }
+
+    /// The audio configuration, AAC or Opus, once one has been seen.
+    pub fn known_audio_config(&self) -> Option<AudioConfig> {
+        self.audio
     }
 
     /// Records the AAC configuration; only the first is kept. A muxer that has
     /// no audio track and nothing servable yet is discarded, so the next
     /// keyframe starts one with both tracks.
     pub fn audio_config(&mut self, config: AacConfig) {
-        if self.aac.is_none() {
+        self.record_audio(AudioConfig::Aac(config));
+    }
+
+    /// Records the Opus configuration, for a caller that negotiated it: pass
+    /// [`OpusConfig::STEREO`] when `stereo=1` was negotiated. Without it the
+    /// first Opus packet decides ([`OpusConfig::for_first_packet`]). Only the
+    /// first audio configuration of either codec is kept, as for AAC, and a
+    /// video-only muxer with nothing servable yet is discarded so the next
+    /// keyframe starts one with both tracks.
+    pub fn opus_config(&mut self, config: OpusConfig) {
+        self.record_audio(AudioConfig::Opus(config));
+    }
+
+    fn record_audio(&mut self, config: AudioConfig) {
+        if self.audio.is_none() {
             if let Some(muxer) = &self.muxer
-                && muxer.audio().is_none()
+                && muxer.audio_config().is_none()
             {
                 if muxer.has_content() {
                     // A served init segment and the recorder's track identity
                     // cannot acquire a new track in place.
-                    tracing::warn!(
-                        "AAC configuration arrived after video-only content became servable; audio cannot be added to this init segment"
-                    );
+                    match config {
+                        AudioConfig::Aac(_) => tracing::warn!(
+                            "AAC configuration arrived after video-only content became servable; audio cannot be added to this init segment"
+                        ),
+                        AudioConfig::Opus(_) => tracing::warn!(
+                            "Opus audio arrived after video-only content became servable; audio cannot be added to this init segment"
+                        ),
+                    }
                 } else {
                     // Separate hardware encoders may deliver AVC + first IDR
                     // before AAC's sequence header. No content was published,
@@ -638,7 +669,7 @@ impl EsIngest {
                     self.origin = None;
                 }
             }
-            self.aac = Some(config);
+            self.audio = Some(config);
         }
     }
 
@@ -670,25 +701,30 @@ impl EsIngest {
             };
             // If audio is expected, wait for its config before the init
             // segment is fixed (or compared); the next keyframe will do.
-            if self.expect_audio && self.aac.is_none() {
+            if self.expect_audio && self.audio.is_none() {
                 return Ok(Update::default());
             }
-            let audio = if self.expect_audio { self.aac } else { None };
+            let audio = if self.expect_audio { self.audio } else { None };
             if let Some(m) = &mut self.muxer
-                && (m.video() != Some(&video) || m.audio().copied() != audio)
+                && (m.video() != Some(&video) || m.audio_config().copied() != audio)
             {
                 tracing::warn!(
                     "reconnected encoder changed configuration; starting a new codec epoch on the existing timeline"
                 );
-                m.reconfigure_tracks(Some(video.clone()), audio, now)?;
+                m.reconfigure_with_audio(Some(video.clone()), audio, now)?;
                 restarted = true;
             }
             if self.muxer.is_none() {
-                self.muxer = Some(match &self.fragment_quota {
-                    Some(quota) => {
-                        Muxer::with_fragment_quota(self.cfg, Some(video), audio, quota.clone())?
+                self.muxer = Some(match (&self.fragment_quota, audio) {
+                    (Some(quota), audio) => {
+                        Muxer::with_audio_config(self.cfg, Some(video), audio, Some(quota.clone()))?
                     }
-                    None => Muxer::new(self.cfg, video, audio),
+                    (None, Some(AudioConfig::Opus(_))) => {
+                        Muxer::with_audio_config(self.cfg, Some(video), audio, None)?
+                    }
+                    (None, audio) => {
+                        Muxer::new(self.cfg, video, audio.and_then(|a| a.aac().copied()))
+                    }
                 });
             }
             self.origin = Some(dts);
@@ -721,8 +757,11 @@ impl EsIngest {
         if self.declared == Some(TrackSet::VideoOnly) {
             return Err(IngestError::TrackConflict);
         }
+        if matches!(self.audio, Some(AudioConfig::Opus(_))) {
+            return Err(IngestError::InvalidAudio);
+        }
         if (self.origin.is_some() || self.declared == Some(TrackSet::AudioOnly))
-            && self.aac.is_some_and(|old| old != config)
+            && self.known_audio().is_some_and(|old| old != config)
         {
             return Err(IngestError::InvalidAudio);
         }
@@ -776,6 +815,9 @@ impl EsIngest {
         if self.declared == Some(TrackSet::AudioOnly) {
             return Ok(());
         }
+        if matches!(self.audio, Some(AudioConfig::Opus(_))) {
+            return Err(IngestError::InvalidAudio);
+        }
         self.audio_config(config);
         let (Some(muxer), Some(origin)) = (self.muxer.as_mut(), self.origin) else {
             return Ok(());
@@ -786,6 +828,108 @@ impl EsIngest {
         if t >= 0 {
             muxer.check_audio_admission(t, payload.len())?;
             muxer.push_audio(t, Bytes::copy_from_slice(payload))?;
+        }
+        Ok(())
+    }
+
+    /// The Opus configuration for the next packet: the recorded one, or one
+    /// from this packet's TOC stereo flag. Refuses a malformed packet and an
+    /// ingest that already carries AAC, before anything changes.
+    fn opus_for(&self, packet: &[u8]) -> Result<OpusConfig, IngestError> {
+        let stereo = codec::opus_packet(packet)
+            .ok_or(IngestError::InvalidAudio)?
+            .stereo;
+        match self.audio {
+            Some(AudioConfig::Opus(config)) => Ok(config),
+            Some(_) => Err(IngestError::InvalidAudio),
+            None => Ok(if stereo {
+                OpusConfig::STEREO
+            } else {
+                OpusConfig::MONO
+            }),
+        }
+    }
+
+    /// One Opus packet (one RTP payload, RFC 7587 section 4.2) plus
+    /// caller-owned wall time: the Opus counterpart of
+    /// [`EsIngest::audio_at`], for video-led and declared audio-only
+    /// streams. `pts` is the packet's 90 kHz timestamp. Its duration comes
+    /// from its TOC byte. A malformed packet, one over 120 ms, or Opus on an
+    /// ingest that carries AAC is refused with [`IngestError::InvalidAudio`]
+    /// before anything changes. The first packet fixes the channel count
+    /// unless [`EsIngest::opus_config`] was called; a later change of the TOC
+    /// stereo flag is not a configuration change.
+    ///
+    /// Gaps are not filled here: a caller fills silence suppression and loss
+    /// with encoded silence first. A repeated, backward or missing timestamp
+    /// is handled as for AAC: video-led audio keeps timestamp jitter and
+    /// caps a gap at the packet's own duration, and audio-only starts a
+    /// discontinuous run reported as `media_loss`.
+    pub fn opus_at(
+        &mut self,
+        pts: i64,
+        packet: &[u8],
+        now: SystemTime,
+    ) -> Result<Update, IngestError> {
+        if self.declared == Some(TrackSet::VideoOnly) {
+            return Err(IngestError::TrackConflict);
+        }
+        let config = self.opus_for(packet)?;
+        if self.declared != Some(TrackSet::AudioOnly) {
+            self.opus(pts, packet)?;
+            return Ok(Update::default());
+        }
+        self.opus_config(config);
+        let audio = AudioConfig::Opus(config);
+        let mut update = Update::default();
+        if self.origin.is_none() {
+            if let Some(muxer) = &mut self.muxer {
+                if muxer.tracks() != TrackSet::AudioOnly || muxer.audio_config() != Some(&audio) {
+                    update.merge(muxer.reconfigure_with_audio(None, Some(audio), now)?);
+                    update.restarted = true;
+                }
+            } else {
+                self.muxer = Some(Muxer::with_audio_config(
+                    self.cfg,
+                    None,
+                    Some(audio),
+                    self.fragment_quota.clone(),
+                )?);
+            }
+            self.origin = Some(pts);
+        }
+        let origin = self.origin.ok_or(IngestError::InvalidTimestamp)?;
+        let relative = pts
+            .checked_sub(origin)
+            .ok_or(IngestError::InvalidTimestamp)?;
+        update.merge(
+            self.muxer
+                .as_mut()
+                .ok_or(IngestError::InvalidTracks)?
+                .push_audio_at(relative, Bytes::copy_from_slice(packet), now)?,
+        );
+        Ok(update)
+    }
+
+    /// Video-led Opus: the counterpart of [`EsIngest::audio`]. Audio before
+    /// the first keyframe is dropped, as for AAC. Declared audio-only
+    /// streams need the updating [`EsIngest::opus_at`]. Refuses as
+    /// [`EsIngest::opus_at`] does.
+    pub fn opus(&mut self, pts: i64, packet: &[u8]) -> Result<(), IngestError> {
+        if self.declared == Some(TrackSet::AudioOnly) {
+            return Ok(());
+        }
+        let config = self.opus_for(packet)?;
+        self.opus_config(config);
+        let (Some(muxer), Some(origin)) = (self.muxer.as_mut(), self.origin) else {
+            return Ok(());
+        };
+        let t = pts
+            .checked_sub(origin)
+            .ok_or(IngestError::InvalidTimestamp)?;
+        if t >= 0 {
+            muxer.check_audio_admission(t, packet.len())?;
+            muxer.push_audio(t, Bytes::copy_from_slice(packet))?;
         }
         Ok(())
     }

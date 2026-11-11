@@ -14,7 +14,9 @@
 //! segment is marked as a discontinuity.
 //!
 //! Explicit AAC-only streams instead use complete 1024-sample frames to cut
-//! independent parts and segments on a rational audio sample clock.
+//! independent parts and segments on a rational audio sample clock. Opus is
+//! handled the same way, with each packet's duration read from its TOC byte
+//! (RFC 6716 section 3.1) instead of a fixed 1024 samples.
 //!
 //! No I/O and no clock: the caller passes the wall-clock time for
 //! `EXT-X-PROGRAM-DATE-TIME`.
@@ -26,7 +28,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use sapflow_core::fragment::FragmentQuota;
 
-use crate::codec::{AacConfig, H264Config};
+use crate::codec::{AacConfig, AudioConfig, H264Config, OpusConfig, opus_packet};
 use crate::fmp4::{self, AUDIO_TRACK, Sample, TrackRun, VIDEO_TIMESCALE, VIDEO_TRACK};
 use crate::time::{duration_to_ticks, ticks_to_duration};
 use crate::{PartTiming, TargetDuration, TrackSet};
@@ -64,8 +66,8 @@ const MAX_LEARNED_FRAMES: usize = 1024;
 /// the length rule in `push_video` catches several.
 const BREAK_GAP: i64 = 90_000;
 
-/// AAC-LC frames are 1024 samples. A longer gap between two (the audio
-/// stopped) is not given to the frame before it.
+/// AAC-LC frames are 1024 samples. A gap of more than three frames between
+/// two (the audio stopped) is not given to the frame before it.
 const AAC_FRAME: i64 = 1024;
 
 /// Settings for a [`Muxer`].
@@ -278,7 +280,8 @@ pub enum MuxError {
     SegmentTooLarge,
     /// The requested topology has no supported media tracks.
     InvalidTracks,
-    /// The AAC configuration or resulting part timing is unsupported.
+    /// The audio configuration or resulting part timing is unsupported, or
+    /// an Opus packet is malformed (RFC 6716 section 3.4).
     InvalidAudio,
     /// An AAC timestamp or decode-time calculation is outside its valid range.
     Timestamp,
@@ -290,6 +293,9 @@ struct Pending {
     cts: i32,
     sync: bool,
     data: Bytes,
+    /// Audio only: the frame's own duration in samples (1024 for AAC, the
+    /// TOC duration for Opus), used when the next timestamp leaves a gap.
+    samples: i64,
 }
 
 /// A video frame whose duration is known (the next one has arrived).
@@ -346,13 +352,14 @@ impl OpenPart {
     }
 }
 
-/// Audio decode time is an exact count of 1024-sample AAC-LC frames. Input
-/// timestamps only detect a break; rounding a 90 kHz timestamp on every frame
-/// must not accumulate drift at 44.1 kHz.
+/// Audio decode time is an exact count of samples: 1024 per AAC-LC frame, or
+/// each Opus packet's TOC duration. Input timestamps only detect a break;
+/// rounding a 90 kHz timestamp on every frame must not accumulate drift at
+/// 44.1 kHz.
 #[derive(Debug)]
 struct AudioRun {
     input_origin: i64,
-    frames: i64,
+    samples: i64,
     next_sample: i64,
 }
 
@@ -363,7 +370,7 @@ struct AudioRun {
 pub struct Muxer {
     cfg: MuxerConfig,
     video: Option<H264Config>,
-    audio: Option<AacConfig>,
+    audio: Option<AudioConfig>,
     audio_run: Option<AudioRun>,
     audio_end: Option<i64>,
     init: Arc<Initialization>,
@@ -416,16 +423,21 @@ impl Muxer {
     /// [`LEADING_GAPS`].
     pub fn new(cfg: MuxerConfig, video: H264Config, audio: Option<AacConfig>) -> Self {
         let init = fmp4::init_segment(&video, audio.as_ref());
-        Self::with_tracks(cfg, Some(video), audio, init)
+        Self::with_tracks(cfg, Some(video), audio.map(AudioConfig::Aac), init)
     }
 
     /// An explicit AAC-only declaration is required at ingest; an AAC sequence
     /// header alone must not turn an ordinary video publication into radio.
     pub fn audio_only(cfg: MuxerConfig, audio: AacConfig) -> Result<Self, MuxError> {
-        Self::validate_audio(audio)?;
+        Self::validate_aac(audio)?;
         let init = fmp4::init_segment_for_tracks(None, Some(&audio), Duration::ZERO)
             .ok_or(MuxError::InvalidTracks)?;
-        Ok(Self::with_tracks(cfg, None, Some(audio), init))
+        Ok(Self::with_tracks(
+            cfg,
+            None,
+            Some(AudioConfig::Aac(audio)),
+            init,
+        ))
     }
 
     /// Builds a muxer whose init and fragment allocations share one byte domain.
@@ -437,21 +449,37 @@ impl Muxer {
         audio: Option<AacConfig>,
         quota: Arc<FragmentQuota>,
     ) -> Result<Self, MuxError> {
+        Self::with_audio_config(cfg, video, audio.map(AudioConfig::Aac), Some(quota))
+    }
+
+    /// A muxer for optional H.264 video and optional audio of either codec,
+    /// with or without a shared fragment budget (see
+    /// [`Muxer::with_fragment_quota`]). At least one track is required, and
+    /// audio-only needs supported audio. AAC is checked exactly as by the
+    /// AAC constructors; an Opus configuration must be mono or stereo.
+    pub fn with_audio_config(
+        cfg: MuxerConfig,
+        video: Option<H264Config>,
+        audio: Option<AudioConfig>,
+        quota: Option<Arc<FragmentQuota>>,
+    ) -> Result<Self, MuxError> {
         if video.is_none() {
             Self::validate_audio(audio.ok_or(MuxError::InvalidTracks)?)?;
+        } else if let Some(AudioConfig::Opus(opus)) = audio {
+            Self::validate_opus(opus)?;
         }
         let init = fmp4::init_with_quota(
             video.as_ref(),
             audio.as_ref(),
             video.is_none().then_some(0),
-            Some(&quota),
+            quota.as_ref(),
         )
         .map_err(|_| MuxError::FragmentLimit)?;
         if init.is_empty() {
             return Err(MuxError::InvalidTracks);
         }
         let mut muxer = Self::with_tracks(cfg, video, audio, init);
-        muxer.fragment_quota = Some(quota);
+        muxer.fragment_quota = quota;
         Ok(muxer)
     }
 
@@ -474,7 +502,22 @@ impl Muxer {
         }
     }
 
-    fn validate_audio(audio: AacConfig) -> Result<(), MuxError> {
+    fn validate_audio(audio: AudioConfig) -> Result<(), MuxError> {
+        match audio {
+            AudioConfig::Aac(aac) => Self::validate_aac(aac),
+            AudioConfig::Opus(opus) => Self::validate_opus(opus),
+        }
+    }
+
+    fn validate_opus(opus: OpusConfig) -> Result<(), MuxError> {
+        if opus.is_supported() {
+            Ok(())
+        } else {
+            Err(MuxError::InvalidAudio)
+        }
+    }
+
+    fn validate_aac(audio: AacConfig) -> Result<(), MuxError> {
         if audio.object_type != 2
             || !(1..=2).contains(&audio.channels)
             || audio.sample_rate > u32::from(u16::MAX)
@@ -488,7 +531,7 @@ impl Muxer {
     fn with_tracks(
         cfg: MuxerConfig,
         video: Option<H264Config>,
-        audio: Option<AacConfig>,
+        audio: Option<AudioConfig>,
         init: Bytes,
     ) -> Self {
         Self {
@@ -542,9 +585,15 @@ impl Muxer {
         }
     }
 
-    /// The audio track's configuration in the current codec epoch, or `None`
-    /// for video only.
+    /// The AAC configuration in the current codec epoch, or `None` for video
+    /// only and for an Opus track (see [`Muxer::audio_config`]).
     pub fn audio(&self) -> Option<&AacConfig> {
+        self.audio.as_ref().and_then(AudioConfig::aac)
+    }
+
+    /// The audio track's configuration in the current codec epoch, AAC or
+    /// Opus, or `None` for video only.
+    pub fn audio_config(&self) -> Option<&AudioConfig> {
         self.audio.as_ref()
     }
 
@@ -574,11 +623,27 @@ impl Muxer {
         audio: Option<AacConfig>,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        self.reconfigure_with_audio(video, audio.map(AudioConfig::Aac), now)
+    }
+
+    /// [`Muxer::reconfigure_tracks`] for either audio codec. Opus part timing
+    /// depends on packet durations, so an audio-only Opus epoch is checked
+    /// against an inherited part target packet by packet instead of here.
+    pub fn reconfigure_with_audio(
+        &mut self,
+        video: Option<H264Config>,
+        audio: Option<AudioConfig>,
+        now: SystemTime,
+    ) -> Result<Update, MuxError> {
         self.check_fragment_admission()?;
         if video.is_none() {
             let audio = audio.ok_or(MuxError::InvalidTracks)?;
             Self::validate_audio(audio)?;
-            self.check_audio_part_timing(audio)?;
+            if let AudioConfig::Aac(aac) = audio {
+                self.check_audio_part_timing(aac)?;
+            }
+        } else if let Some(AudioConfig::Opus(opus)) = audio {
+            Self::validate_opus(opus)?;
         }
         let init = fmp4::init_with_quota(
             video.as_ref(),
@@ -599,7 +664,7 @@ impl Muxer {
     fn replace_tracks(
         &mut self,
         video: Option<H264Config>,
-        audio: Option<AacConfig>,
+        audio: Option<AudioConfig>,
         data: Bytes,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
@@ -677,7 +742,7 @@ impl Muxer {
 
     fn pending_audio_frontier(&self) -> Option<i64> {
         let pending = self.pending_audio.as_ref()?;
-        let rate = self.audio?.sample_rate;
+        let rate = self.audio?.sample_rate();
         i64::try_from(i128::from(pending.dts) * 90_000 / i128::from(rate)).ok()
     }
 
@@ -733,7 +798,7 @@ impl Muxer {
             + part.map_or(0, |p| p.audio.iter().map(|a| a.data.len()).sum::<usize>());
         let frames = usize::from(pending.is_some()) + part.map_or(0, |p| p.audio.len());
         let span = self.audio.and_then(|config| {
-            let latest = pending?.dts * 90_000 / i64::from(config.sample_rate);
+            let latest = pending?.dts * 90_000 / i64::from(config.sample_rate());
             let first = part
                 .and_then(|p| p.audio_times.first())
                 .map_or(latest, |a| a.0);
@@ -834,6 +899,7 @@ impl Muxer {
             cts,
             sync,
             data,
+            samples: 0,
         };
         if next.dts < 0 {
             return Ok(Update::default());
@@ -1202,8 +1268,30 @@ impl Muxer {
         Ok(timing)
     }
 
+    /// Audio-only Opus part timing: fixed, like AAC's, from the first packet's
+    /// duration, so a stream of 20 ms packets gets the same parts as a 30 fps
+    /// stream of five-frame multiples. A later packet must fit the fixed part
+    /// target on its own. Opus frame sizes are whole multiples of 120 samples,
+    /// 225 ticks at 90 kHz, so the conversion is exact.
+    fn check_opus_part_timing(&self, samples: i64) -> Result<PartTiming, MuxError> {
+        let ticks =
+            samples * i64::from(VIDEO_TIMESCALE) / i64::from(crate::codec::OPUS_SAMPLE_RATE);
+        let timing = self
+            .timing
+            .unwrap_or_else(|| PartTiming::new(self.cfg.part_min, &[ticks as u32]));
+        if ticks > timing.target {
+            return Err(MuxError::InvalidAudio);
+        }
+        Ok(timing)
+    }
+
     /// Explicit audio-only mode. Each accepted AAC-LC frame contributes exactly
-    /// 1024 sample ticks; no rounded per-frame 90 kHz increment is accumulated.
+    /// 1024 sample ticks, and each Opus packet its TOC duration; no rounded
+    /// per-frame 90 kHz increment is accumulated. A malformed Opus packet is
+    /// refused before anything changes. Opus packet durations may change
+    /// mid-stream: a packet that would carry the open part past the fixed
+    /// part target first closes that part and its segment, both short, which
+    /// Apple's part rules allow for the last part of a segment.
     /// The wall clock is supplied only for run anchoring, as on the video path.
     pub fn push_audio_at(
         &mut self,
@@ -1221,13 +1309,19 @@ impl Muxer {
         if pts < 0 || data.is_empty() {
             return Err(MuxError::Timestamp);
         }
-        let rate = i64::from(audio.sample_rate);
-        let timing = self.check_audio_part_timing(audio)?;
+        let rate = i64::from(audio.sample_rate());
+        let (frame_samples, timing) = match audio {
+            AudioConfig::Aac(aac) => (AAC_FRAME, self.check_audio_part_timing(aac)?),
+            AudioConfig::Opus(_) => {
+                let packet = opus_packet(&data).ok_or(MuxError::InvalidAudio)?;
+                let samples = i64::from(packet.samples());
+                (samples, self.check_opus_part_timing(samples)?)
+            }
+        };
         let mut update = Update::default();
         if let Some(run) = &self.audio_run {
             let expected = i128::from(run.input_origin)
-                + i128::from(run.frames) * i128::from(AAC_FRAME) * i128::from(VIDEO_TIMESCALE)
-                    / i128::from(rate);
+                + i128::from(run.samples) * i128::from(VIDEO_TIMESCALE) / i128::from(rate);
             // TS tick rounding and RTMP's millisecond timestamps are tolerated;
             // missing/repeated AAC frames start a discontinuous new run.
             if (i128::from(pts) - expected).abs() > 180 {
@@ -1250,14 +1344,19 @@ impl Muxer {
             .map_err(|_| MuxError::Timestamp)?;
             self.audio_run = Some(AudioRun {
                 input_origin: pts,
-                frames: 0,
+                samples: 0,
                 next_sample,
             });
         }
         let run = self.audio_run.as_ref().ok_or(MuxError::Timestamp)?;
         let sample = run.next_sample;
-        let next_sample = sample.checked_add(AAC_FRAME).ok_or(MuxError::Timestamp)?;
-        let frames = run.frames.checked_add(1).ok_or(MuxError::Timestamp)?;
+        let next_sample = sample
+            .checked_add(frame_samples)
+            .ok_or(MuxError::Timestamp)?;
+        let samples = run
+            .samples
+            .checked_add(frame_samples)
+            .ok_or(MuxError::Timestamp)?;
         let ticks = |n: i64| -> Result<i64, MuxError> {
             i64::try_from(i128::from(n) * i128::from(VIDEO_TIMESCALE) / i128::from(rate))
                 .map_err(|_| MuxError::Timestamp)
@@ -1266,6 +1365,17 @@ impl Muxer {
         let end = ticks(next_sample)?;
         if sample < 0 {
             return Err(MuxError::Timestamp);
+        }
+        if matches!(audio, AudioConfig::Opus(_))
+            && self
+                .part
+                .as_ref()
+                .is_some_and(|part| !part.audio.is_empty() && end - part.start_dts > timing.target)
+        {
+            self.rotate_part(at, at)?;
+            self.rotate_segment(at, now, true)?;
+            update.part = true;
+            update.segment = true;
         }
         if self.next_segment.is_none() {
             let id = if self.entries.is_empty() {
@@ -1308,7 +1418,7 @@ impl Muxer {
         part.independent = true;
         part.audio_times.push((at, sample as u64));
         part.audio.push(Sample {
-            duration: AAC_FRAME as u32,
+            duration: frame_samples as u32,
             cts: 0,
             sync: true,
             data,
@@ -1317,7 +1427,7 @@ impl Muxer {
         self.audio_end = Some(end);
         let run = self.audio_run.as_mut().ok_or(MuxError::Timestamp)?;
         run.next_sample = next_sample;
-        run.frames = frames;
+        run.samples = samples;
         let end_segment =
             ticks_to_duration(end - seg.start_dts, VIDEO_TIMESCALE) >= self.cfg.segment_min;
         if end_segment || end - part.start_dts >= timing.cut {
@@ -1341,13 +1451,13 @@ impl Muxer {
         if self.video.is_none() || pts < 0 || pts.saturating_add(self.offset) < 0 {
             return Ok(());
         }
-        if audio.sample_rate == 0 {
+        if audio.sample_rate() == 0 {
             return Err(MuxError::InvalidAudio);
         }
         let staged = self.pending_audio.as_ref().filter(|pending| {
             self.part.is_some()
                 && i128::from(pending.dts) * i128::from(VIDEO_TIMESCALE)
-                    / i128::from(audio.sample_rate)
+                    / i128::from(audio.sample_rate())
                     >= i128::from(self.audio_floor)
         });
         let samples = self
@@ -1375,7 +1485,12 @@ impl Muxer {
         Ok(())
     }
 
-    /// Feeds one AAC frame. `pts` is 90 kHz on the same timeline as video.
+    /// Feeds one audio frame: an AAC frame, or an Opus packet for an Opus
+    /// track, which is refused if malformed. `pts` is 90 kHz on the same
+    /// timeline as video. Each frame lasts until the next one's timestamp,
+    /// unless that leaves a gap of more than three of its own durations (the
+    /// audio stopped): then it keeps its own duration, 1024 samples for AAC
+    /// or the packet's TOC duration for Opus.
     /// Refuses the new frame before mutation when payload or live AAC sample
     /// bounds are exhausted. This pre-release API now returns the refusal;
     /// callers must propagate it and mark any accepted recording incomplete.
@@ -1391,10 +1506,16 @@ impl Muxer {
         let Some(audio) = self.audio else {
             return Ok(());
         };
+        let samples = match audio {
+            AudioConfig::Opus(_) => {
+                i64::from(opus_packet(&data).ok_or(MuxError::InvalidAudio)?.samples())
+            }
+            AudioConfig::Aac(_) => AAC_FRAME,
+        };
         if pts < 0 {
             return Ok(());
         }
-        let rate = audio.sample_rate;
+        let rate = audio.sample_rate();
         let pts = pts.saturating_add(self.offset);
         if pts < 0 {
             return Ok(());
@@ -1404,6 +1525,7 @@ impl Muxer {
             cts: 0,
             sync: true,
             data,
+            samples,
         };
         let Some(cur) = self.pending_audio.take() else {
             self.pending_audio = Some(next);
@@ -1414,8 +1536,8 @@ impl Muxer {
         }
         // Timestamp jitter is kept; a gap (the audio stopped) is not.
         let mut duration = next.dts - cur.dts;
-        if duration > 3 * AAC_FRAME {
-            duration = AAC_FRAME;
+        if duration > 3 * cur.samples {
+            duration = cur.samples;
         }
         let duration = duration as u32;
         self.pending_audio = Some(next);
@@ -3018,6 +3140,10 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "audio_resource_tests.rs"]
 mod audio_resource_tests;
+
+#[cfg(test)]
+#[path = "opus_tests.rs"]
+pub(crate) mod opus_tests;
 
 #[cfg(test)]
 #[path = "video_resource_tests.rs"]

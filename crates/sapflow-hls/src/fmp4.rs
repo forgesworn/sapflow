@@ -1,17 +1,17 @@
 //! Fragmented MP4: the init segment and one `moof` + `mdat` per part.
 //!
 //! Box encoding comes from `mp4-atom`; this module only decides what goes in
-//! them. Track 1 is optional H.264 video at 90 kHz; track 2 is optional AAC at its
-//! sample rate.
+//! them. Track 1 is optional H.264 video at 90 kHz; track 2 is optional audio:
+//! AAC at its sample rate, or Opus at 48 kHz.
 
 use bytes::Bytes;
 use mp4_atom::{
-    Audio, Avc1, Avcc, BufMut, Dinf, Dref, Encode, Esds, Ftyp, Hdlr, Mdhd, Mdia, Mfhd, Minf, Moof,
-    Moov, Mp4a, Mvex, Mvhd, Smhd, Stbl, Stco, Stsc, Stsd, Stsz, Stts, Tfdt, Tfhd, Tkhd, Traf, Trak,
-    Trex, Trun, TrunEntry, Url, Visual, Vmhd, esds,
+    Audio, Avc1, Avcc, BufMut, Dinf, Dops, Dref, Encode, Esds, Ftyp, Hdlr, Mdhd, Mdia, Mfhd, Minf,
+    Moof, Moov, Mp4a, Mvex, Mvhd, Opus, Smhd, Stbl, Stco, Stsc, Stsd, Stsz, Stts, Tfdt, Tfhd, Tkhd,
+    Traf, Trak, Trex, Trun, TrunEntry, Url, Visual, Vmhd, esds,
 };
 
-use crate::codec::{AacConfig, H264Config};
+use crate::codec::{AacConfig, AudioConfig, H264Config, OPUS_SAMPLE_RATE, OpusConfig};
 use crate::recording_programme::ProgrammeRecordingPresentation;
 use crate::recording_timing::{MOVIE_TIMESCALE, RecordingPresentation, TimingError};
 
@@ -58,7 +58,11 @@ pub struct TrackRun<'a> {
 
 /// Builds `ftyp` + `moov` for the given tracks.
 pub fn init_segment(video: &H264Config, audio: Option<&AacConfig>) -> Bytes {
-    init(Some(video), audio, None)
+    init(Some(video), aac(audio).as_ref(), None)
+}
+
+fn aac(audio: Option<&AacConfig>) -> Option<AudioConfig> {
+    audio.copied().map(AudioConfig::Aac)
 }
 
 /// The init segment for a recording file, carrying its total duration
@@ -70,7 +74,11 @@ pub fn init_segment_for_file(
     audio: Option<&AacConfig>,
     duration: std::time::Duration,
 ) -> Bytes {
-    init(Some(video), audio, Some(duration.as_millis() as u64))
+    init(
+        Some(video),
+        aac(audio).as_ref(),
+        Some(duration.as_millis() as u64),
+    )
 }
 
 /// Recording init for video, audio or both. An empty track set is refused.
@@ -80,7 +88,22 @@ pub fn init_segment_for_tracks(
     audio: Option<&AacConfig>,
     duration: std::time::Duration,
 ) -> Option<Bytes> {
-    if video.is_none() && audio.is_none() {
+    init_segment_for_audio_tracks(video, aac(audio).as_ref(), duration)
+}
+
+/// [`init_segment_for_tracks`] for either audio codec: AAC, or Opus with an
+/// `Opus` sample entry and `dOps` box at a 48 kHz timescale. An empty track
+/// set, or an Opus configuration that is not mono or stereo, is refused.
+pub fn init_segment_for_audio_tracks(
+    video: Option<&H264Config>,
+    audio: Option<&AudioConfig>,
+    duration: std::time::Duration,
+) -> Option<Bytes> {
+    if (video.is_none() && audio.is_none())
+        || audio
+            .and_then(AudioConfig::opus)
+            .is_some_and(|o| !o.is_supported())
+    {
         return None;
     }
     let duration_ms = u64::try_from(duration.as_millis()).ok()?;
@@ -309,13 +332,17 @@ fn native_box(kind: &[u8; 4], body: &[u8], output: &mut Vec<u8>) -> Result<(), T
     Ok(())
 }
 
-fn init(video: Option<&H264Config>, audio: Option<&AacConfig>, duration_ms: Option<u64>) -> Bytes {
+fn init(
+    video: Option<&H264Config>,
+    audio: Option<&AudioConfig>,
+    duration_ms: Option<u64>,
+) -> Bytes {
     Bytes::from(init_buffer(video, audio, duration_ms))
 }
 
 pub(crate) fn init_with_quota(
     video: Option<&H264Config>,
-    audio: Option<&AacConfig>,
+    audio: Option<&AudioConfig>,
     duration_ms: Option<u64>,
     quota: Option<&std::sync::Arc<sapflow_core::fragment::FragmentQuota>>,
 ) -> Result<Bytes, sapflow_core::fragment::FragmentLimit> {
@@ -324,7 +351,7 @@ pub(crate) fn init_with_quota(
 
 fn init_buffer(
     video: Option<&H264Config>,
-    audio: Option<&AacConfig>,
+    audio: Option<&AudioConfig>,
     duration_ms: Option<u64>,
 ) -> Vec<u8> {
     let ftyp = Ftyp {
@@ -344,7 +371,10 @@ fn init_buffer(
         });
     }
     if let Some(a) = audio {
-        trak.push(audio_trak(a));
+        trak.push(match a {
+            AudioConfig::Aac(a) => audio_trak(a),
+            AudioConfig::Opus(o) => opus_trak(o),
+        });
         trex.push(Trex {
             track_id: AUDIO_TRACK,
             default_sample_description_index: 1,
@@ -509,6 +539,64 @@ fn audio_trak(a: &AacConfig) -> Trak {
                 dinf: dinf(),
                 stbl: empty_stbl(Stsd {
                     codecs: vec![mp4a.into()],
+                }),
+                ..Default::default()
+            },
+        },
+        ..Default::default()
+    }
+}
+
+/// The Opus track, by the "Encapsulation of Opus in ISO Base Media File
+/// Format" (version 0.6.8) sections 4.3.1 and 4.3.2: an `Opus` sample entry
+/// with 16-bit samples at 48 kHz and a version 0 `dOps` box, big-endian. RTP
+/// carries no Opus identification header, so the `dOps` fields are set by
+/// rule: the configured channel count, input sample rate 48000, output gain
+/// 0, channel mapping family 0 and pre-skip 0. Pre-skip 0 is provisional and
+/// departs from the encapsulation's "at least 80 milliseconds" (see
+/// `docs/whip-ingest.md`). The media timescale is 48000, which the
+/// encapsulation calls typical (section 4.4): every Opus frame size is a
+/// whole number of 48 kHz ticks, so sample durations are exact.
+fn opus_trak(o: &OpusConfig) -> Trak {
+    let opus = Opus {
+        audio: Audio {
+            data_reference_index: 1,
+            channel_count: u16::from(o.channels),
+            sample_size: 16,
+            sample_rate: (OPUS_SAMPLE_RATE as u16).into(),
+        },
+        dops: Dops {
+            output_channel_count: o.channels,
+            pre_skip: 0,
+            input_sample_rate: OPUS_SAMPLE_RATE,
+            output_gain: 0,
+        },
+        btrt: None,
+    };
+    Trak {
+        tkhd: Tkhd {
+            track_id: AUDIO_TRACK,
+            alternate_group: 1,
+            enabled: true,
+            in_movie: true,
+            volume: 1.into(),
+            ..Default::default()
+        },
+        mdia: Mdia {
+            mdhd: Mdhd {
+                timescale: OPUS_SAMPLE_RATE,
+                language: "und".into(),
+                ..Default::default()
+            },
+            hdlr: Hdlr {
+                handler: b"soun".into(),
+                name: "SoundHandler".into(),
+            },
+            minf: Minf {
+                smhd: Some(Smhd::default()),
+                dinf: dinf(),
+                stbl: empty_stbl(Stsd {
+                    codecs: vec![opus.into()],
                 }),
                 ..Default::default()
             },

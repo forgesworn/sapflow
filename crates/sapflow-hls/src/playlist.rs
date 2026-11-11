@@ -394,7 +394,7 @@ impl RuleCheck {
 pub fn multivariant(m: &Muxer) -> String {
     let (peak, avg) = m.bandwidth();
     let mut codecs = m.video().map_or_else(String::new, |v| v.codec_string());
-    if let Some(a) = m.audio() {
+    if let Some(a) = m.audio_config() {
         if !codecs.is_empty() {
             codecs.push(',');
         }
