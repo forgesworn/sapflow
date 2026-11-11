@@ -122,6 +122,9 @@ source-EOF qualification. No Rust build is involved.
 | `rr_stats` | Our receiver report statistics (`sapflow_rtp::stats`, RFC 3550 A.3 and A.8): packets with arbitrary sequence numbers, timestamp steps and arrival times, taken as first arrivals, repeats, probes or confirmed restarts, with sender reports and reports between. Checked against a model that keeps every counted sequence number: the count, extended highest sequence number, cumulative and fractional loss and DLSR must match exactly, loss never goes negative, and every block survives the RR builder and parser (the 24-bit clamp included) |
 | `twcc_feedback` | Our transport-cc recorder and encoder (`sapflow_rtp::twcc`): transport-wide sequence numbers from the input (wraps, far jumps, reordering, copies), malformed extensions, time steps of 100 us to seconds, and the feedback timer, under default or small packet and pending caps. Every feedback packet is read back by our own parser: each recorded packet is reported received exactly once, in order, at its exact arrival time in 250 us units with the 24-bit reference time, nothing else is, no packet exceeds its cap, the feedback count runs on, and nothing stays pending |
 | `sr_timeline` | Our receiver with video, RTX, audio and transport-cc (`sapflow_rtp::receive`, `sapflow_rtp::timeline`): media with timestamps stepped forward or back, RTX, strangers, sender reports honest, skewed or arbitrary (NTP zero and the maximum included), other RTCP and clock steps, with or without the start hold. Frames come only after one `Aligned` event and the hold ends on time; each stream's `pts` strictly increases and stays within the timeline's stated bounds of each frame's own arrival time, above and below; every RTCP datagram parses, leads with a receiver report unless reduced-size, stays within its hard cap and reports no negative loss; queued events and pending transport-cc stay bounded; events and datagrams stay within a constant per record plus what elapsed time accounts for |
+| `dtls_record` | One datagram through our DTLS record layer (`sapflow_dtls::record`): framing, handshake fragment framing, epoch 1 AES-GCM opening with a fixed key, a seal then open round trip and the replay window; records must add up within the datagram and fragments within their messages |
+| `dtls_handshake_messages` | A selector byte, then one body for our ClientHello (with negotiation), Certificate (and the `x509-cert` leaf and its P-256 key), ClientKeyExchange (and the point), CertificateVerify (and the DER signature), Finished or SDP fingerprint parsers, or all of them; anything negotiated must be in the profile |
+| `dtls_server` | Our DTLS server (`sapflow_dtls::Server`) in a scripted run against the test client: raw, mutated, dropped, replayed and duplicated datagrams, timers and sealed records, with the cookie exchange, a small MTU, fragmentation, a wrong fingerprint or the OpenSSL interop server by mode. After every step: reassembly within its cap, at most 4 KB sent per input and a fixed bound per run, at most one signature, agreement and verification, a timer only while waiting for flight 5, one `Connected` at most, and equal keys when both sides connect |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
@@ -345,6 +348,28 @@ each `sr_timeline` seed to align as its name says. To regenerate:
 `mutation_smoke`, also ignored, runs mutated seeds through the three
 targets (`SAPFLOW_FUZZ_SMOKE` inputs per target, `SAPFLOW_FUZZ_SEED`); it is
 not coverage-guided and does not replace a cargo-fuzz run.
+
+### DTLS (`sapflow-dtls`)
+
+The three `sapflow-dtls` targets call the entry functions in
+`crates/sapflow-dtls/src/fuzzing.rs` (behind the crate's `testing` feature),
+and a unit test there replays every seed through the same functions
+(`cargo test -p sapflow-dtls`). It requires every record seed to frame a
+record, every message seed to be accepted by a parser, and every server seed
+to reach its stage: past the hello for `w0-*` and `mismatch`, a completed
+handshake on both sides for `connect-*`, and a completed server handshake
+for `openssl-gcm`. A fixed-seed mutation pass over all the seeds runs with
+the same tests; it is not coverage-guided and does not replace these
+targets.
+
+Seed provenance: the `w0-*` seeds are the ClientHello captures in
+`fixtures/whip/w0/` (Chrome, Safari on macOS and iOS, Vanadium, OBS and
+FFmpeg). The `openssl-*` seeds are datagrams from the black-box OpenSSL runs
+in `crates/sapflow-dtls/tests/fixtures/openssl/`; `openssl-gcm` replays
+OpenSSL's flights into the seeded interop server, which completes the
+handshake. The `connect-*` and `mismatch` seeds script handshakes with the
+test client. None contains media or real addresses. To regenerate:
+`cargo test -p sapflow-dtls --lib -- --ignored write_seeds`.
 
 No local cargo-fuzz run of these targets has been made; CI's 60 s per
 target and the nightly run are their first fuzzing. After merge, a longer

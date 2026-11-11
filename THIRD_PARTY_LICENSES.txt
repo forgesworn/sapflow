@@ -1189,7 +1189,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-ctutils 0.4.3  (Apache-2.0 OR MIT)
+ctutils 0.4.8  (Apache-2.0 OR MIT)
 https://github.com/RustCrypto/utils
 ==============================================================================
 --- LICENSE-APACHE: same text as cmov LICENSE-APACHE

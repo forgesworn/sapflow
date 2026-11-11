@@ -1,0 +1,40 @@
+[package]
+name = "sapflow-dtls"
+description = "A DTLS 1.2 server in the WebRTC browser profile, with DTLS-SRTP key export, for receive-only WHIP ingest, in pure Rust, sans-IO."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["dtls", "dtls-srtp", "webrtc", "whip", "sans-io"]
+categories = ["network-programming", "cryptography"]
+
+[lints]
+workspace = true
+
+[dependencies]
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "zeroize"] }
+der = { version = "=0.8.3", features = ["alloc", "oid"] }
+ecdsa = { version = "=0.17.0", default-features = false, features = ["der"] }
+getrandom = "=0.4.3"
+hmac = { version = "=0.13.0", features = ["zeroize"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic", "ecdh", "ecdsa", "precomputed-tables", "std"] }
+sha2 = { version = "=0.11.1", features = ["zeroize"] }
+subtle = "=2.6.1"
+x509-cert = { version = "=0.3.0", default-features = false }
+zeroize = "=1.9.1"
+
+[dev-dependencies]
+sapflow-rtp = { path = "../sapflow-rtp", features = ["testing"] }
+
+[[example]]
+name = "udp_server"
+required-features = ["testing"]
+
+[features]
+# Test helpers (a deterministic DTLS client, seeded randomness) and the fuzz
+# entry points. Not for production use.
+testing = []
