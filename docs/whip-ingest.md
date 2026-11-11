@@ -608,10 +608,12 @@ feeds it yet; W3c connects `sapflow-whip` to it.
   timestamp, jitter and slew included, not for its TOC duration: the
   timeline slews audio by up to 500 ppm to keep it with the video, and TOC
   durations would throw that away. With exact timestamps every sample is
-  exactly its TOC duration; slewed 500 ppm either way, each stays within
-  that slew plus one sample (at most 4 samples for a 120 ms packet). A gap
-  of more than three of the packet's own durations (1024 samples for AAC)
-  gives it its own duration instead.
+  exactly its TOC duration, and slew alone (500 ppm either way) keeps each
+  within that slew plus one sample (at most 4 samples for a 120 ms packet).
+  Other timestamp steps move it further: a timeline hold or a step by
+  arrival time can make it anything from nothing (a repeated timestamp) to
+  three packets' worth. A gap of more than three of the packet's own
+  durations (1024 samples for AAC) gives it its own duration instead.
 - **Audio-only.** As for AAC, decode time is an exact count of samples and
   timestamps only find breaks. Unlike AAC, which measures each frame against
   the run's origin and sample count, each Opus packet is compared with the
@@ -676,9 +678,10 @@ them is open.
 
 Video-led sample durations also depart from section 4.3.4, which makes a
 sample's duration its frames' total: they follow the timestamps (see
-Video-led audio above), so a slewing timeline moves them off the TOC
-duration by up to the slew plus a sample. No player has been tried on a
-slewed stream.
+Video-led audio above). Slew alone moves them off the TOC duration by up to
+the slew plus a sample; a timeline hold or a step by arrival time can move
+one from nothing to three packets' worth. No player has been tried on such
+a stream.
 
 **FFmpeg decode.** sapflow's own init segment and parts, built in a test
 (`write_opus_evidence` in `opus_real_tests.rs`) from real Opus packets, as

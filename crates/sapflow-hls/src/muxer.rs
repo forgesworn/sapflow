@@ -690,7 +690,7 @@ impl Muxer {
         ) + &format!(" {:?}", fragment_quota.as_ref().map(|q| q.used()))
     }
 
-    /// The current video configuration, or `None` for an audio-only epoch.    /// The current video configuration, or `None` for an audio-only epoch.
+    /// The current video configuration, or `None` for an audio-only epoch.
     pub fn video(&self) -> Option<&H264Config> {
         self.video.as_ref()
     }
