@@ -560,6 +560,36 @@ fn malformed_opus_is_refused_before_any_state_changes() {
 }
 
 #[test]
+fn an_unsupported_channel_count_is_refused_when_configured() {
+    for channels in [0u8, 3, 8] {
+        let mut ingest = EsIngest::new(MuxerConfig::default());
+        assert_eq!(
+            ingest.opus_config(OpusConfig { channels }),
+            Err(IngestError::InvalidAudio)
+        );
+        assert_eq!(ingest.known_audio_config(), None);
+        // Nothing was recorded, so the stream still starts from its first
+        // packet: a keyframe after it builds a muxer.
+        let video = tests::video();
+        ingest.parameter_sets(Some(video.sps), Some(video.pps));
+        ingest.opus(0, &packet(960, true)).expect("Opus");
+        ingest
+            .video(
+                0,
+                0,
+                AccessUnit {
+                    data: vec![1],
+                    idr: true,
+                    ..AccessUnit::default()
+                },
+                NOW,
+            )
+            .expect("IDR");
+        assert_eq!(ingest.muxer().and_then(Muxer::audio_config), Some(&opus(2)));
+    }
+}
+
+#[test]
 fn the_stereo_rule_and_a_changing_toc_stereo_flag() {
     for (negotiated, first, expected) in [
         (None, false, 1u8),
@@ -573,7 +603,7 @@ fn the_stereo_rule_and_a_changing_toc_stereo_flag() {
             let mut ingest = EsIngest::new(MuxerConfig::default());
             ingest.declare_tracks(declared, NOW).expect("declaration");
             if let Some(config) = negotiated {
-                ingest.opus_config(config);
+                ingest.opus_config(config).expect("supported");
             }
             let video = tests::video();
             ingest.parameter_sets(Some(video.sps), Some(video.pps));
@@ -898,7 +928,7 @@ fn elementary_opus_propagates_admission_refusal_and_timestamp_overflow() {
     let mut ingest = EsIngest::new(MuxerConfig::default());
     let video = tests::video();
     ingest.parameter_sets(Some(video.sps), Some(video.pps));
-    ingest.opus_config(OpusConfig::STEREO);
+    ingest.opus_config(OpusConfig::STEREO).expect("stereo");
     for (dts, idr) in [(1, true), (3001, false)] {
         ingest
             .video(

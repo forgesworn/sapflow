@@ -641,13 +641,19 @@ impl EsIngest {
     /// [`OpusConfig::STEREO`] when `stereo=1` was negotiated. Mono is what a
     /// stream without negotiated stereo is, and then the first Opus packet
     /// decides ([`OpusConfig::for_first_packet`]), so [`OpusConfig::MONO`]
-    /// records nothing. Only the first audio configuration of either codec
-    /// is kept, as for AAC, and a video-only muxer with nothing servable yet
-    /// is discarded so the next keyframe starts one with both tracks.
-    pub fn opus_config(&mut self, config: OpusConfig) {
+    /// records nothing. Any count but 1 or 2 is refused with
+    /// [`IngestError::InvalidAudio`] and records nothing. Only the first
+    /// audio configuration of either codec is kept, as for AAC, and a
+    /// video-only muxer with nothing servable yet is discarded so the next
+    /// keyframe starts one with both tracks.
+    pub fn opus_config(&mut self, config: OpusConfig) -> Result<(), IngestError> {
+        if !config.is_supported() {
+            return Err(IngestError::InvalidAudio);
+        }
         if config != OpusConfig::MONO {
             self.record_audio(AudioConfig::Opus(config));
         }
+        Ok(())
     }
 
     fn record_audio(&mut self, config: AudioConfig) {

@@ -295,6 +295,7 @@ const OPUS_MAX_FRAME_BYTES: usize = 1_275;
 /// either count decodes both mono and stereo packets, so a stream whose TOC
 /// stereo flag later changes keeps its configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OpusConfig {
     /// Output channel count: 1 or 2.
     pub channels: u8,
@@ -305,6 +306,12 @@ impl OpusConfig {
     pub const MONO: Self = Self { channels: 1 };
     /// Two output channels.
     pub const STEREO: Self = Self { channels: 2 };
+
+    /// The configuration for `channels`, or `None` for any count but 1 or 2.
+    pub fn new(channels: u8) -> Option<Self> {
+        let config = Self { channels };
+        config.is_supported().then_some(config)
+    }
 
     /// The configuration for a stream that starts with `packet`: stereo if
     /// `stereo_negotiated` (`stereo=1` in the SDP answer) or if the packet's
@@ -333,6 +340,7 @@ impl OpusConfig {
 /// What one Opus packet's TOC byte and frame count say (RFC 6716 section 3.1
 /// and 3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OpusPacket {
     /// The TOC stereo flag.
     pub stereo: bool,
@@ -343,6 +351,15 @@ pub struct OpusPacket {
 }
 
 impl OpusPacket {
+    /// A packet description, for code that stands in for [`opus_packet`].
+    pub fn new(stereo: bool, frames: u8, frame_samples: u32) -> Self {
+        Self {
+            stereo,
+            frames,
+            frame_samples,
+        }
+    }
+
     /// The packet's duration in 48 kHz samples, at most
     /// [`OPUS_MAX_PACKET_SAMPLES`].
     pub fn samples(&self) -> u32 {
@@ -814,6 +831,10 @@ mod tests {
         assert!(audio.aac().is_none() && audio.opus().is_some());
         assert!(!OpusConfig { channels: 3 }.is_supported());
         assert!(!OpusConfig { channels: 0 }.is_supported());
+        assert_eq!(OpusConfig::new(2), Some(OpusConfig::STEREO));
+        assert_eq!(OpusConfig::new(1), Some(OpusConfig::MONO));
+        assert_eq!(OpusConfig::new(3), None);
+        assert_eq!(OpusPacket::new(true, 2, 960).samples(), 1920);
     }
 
     #[test]
