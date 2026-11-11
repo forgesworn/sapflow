@@ -253,9 +253,11 @@ jobs:
         run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install ffmpeg and SRT tools
+        timeout-minutes: 5
         run: |
           # The hosted image's Azure mirror timed out fetching media packages.
-          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+          # mirror+file sources also resolve through this separate mirror list.
+          for source in /etc/apt/sources.list /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
             if [ -f "$source" ]; then
               sudo sed -i -e 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' -e 's|https://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
             fi
