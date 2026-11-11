@@ -76,7 +76,9 @@ remain open. Retained-HLS load qualification, native recording recovery,
 complete phone shows and signed mobile releases also remain open. There is
 no recorded acceptance of a real V4V production show in these documents.
 
-The crates are version 0.1.0 on [crates.io](https://crates.io/crates/sapflow).
+The opt-in prerelease is version 0.2.0-rc.1 on [crates.io](https://crates.io/crates/sapflow).
+See the [0.2.0-rc.1 migration and release notes](https://github.com/forgesworn/sapflow/blob/v0.2.0-rc.1/docs/releases/0.2.0-rc.1.md) before
+upgrading from 0.1.0.
 The current queue and acceptance gates are in [GOALS.md](GOALS.md#remaining-work),
 [docs/delivery-plan.md](docs/delivery-plan.md#next-work) and
 [docs/readiness.md](docs/readiness.md); rollout steps remain in
@@ -101,8 +103,9 @@ callbacks, timers and recording; the control API and the callback client are our
 own small HTTP/1.1 code (`crates/sapflow-server/src/http_lite.rs`), with no Axum
 or Hyper.
 
-`cargo add sapflow-srt` (or `sapflow-rtmp`, `sapflow-hls`) for a library,
-`cargo install sapflow` for the server. API docs are on
+`cargo add sapflow-srt@=0.2.0-rc.1` for the prerelease library (use the same
+exact version for `sapflow-rtmp` or `sapflow-hls`), or
+`cargo install sapflow --version 0.2.0-rc.1 --locked` for the prerelease server. API docs are on
 [docs.rs](https://docs.rs/sapflow-srt). Rust 1.94, edition 2024. A complete SRT listener is
 [crates/sapflow-srt/examples/listen.rs](crates/sapflow-srt/examples/listen.rs);
 for RTMP, `sapflow_rtmp::Connection` accepts a publish. No C dependencies.

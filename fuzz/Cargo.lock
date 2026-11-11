@@ -1699,7 +1699,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "sapflow-client"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "h264-reader",
  "mpeg2ts",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "sapflow-core"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 
 [[package]]
 name = "sapflow-dtls"
@@ -1751,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "sapflow-hls"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "adts-reader",
  "bytes",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "sapflow-rtmp"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "hmac 0.12.1",
  "sapflow-core",
@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "sapflow-rtp"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "sapflow-signet-ffi"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "nostr",
  "nostr-sdk",
@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "sapflow-srt"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "aes 0.9.3",
  "aes-kw",
