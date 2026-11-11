@@ -1703,7 +1703,9 @@ Implementation notes (W3d, 11 November 2026):
   frames come only after a PROXY header, whose canonical source is the
   address, and LOCAL or a refused header gives none. Eight synthetic seeds;
   a seed replay test and a fixed-seed mutation pass run with the unit
-  tests. FUZZ_RESULT
+  tests. On the test host, built with `-s none` and
+  `RUSTFLAGS="-Clink-arg=-undefined -Clink-arg=dynamic_lookup"`, it ran
+  7,474,458 times in 121 s from the seeds with no crash.
 - **End to end** (`scripts/whip-e2e.js --transport tcp|proxy`, headless
   Google Chrome 157 on the test host, loopback, ports 47400 to 47447). The
   answer advertised only a TCP candidate, so ICE-TCP was the only way in:
@@ -1756,7 +1758,7 @@ Implementation notes (W3d, 11 November 2026):
 | A connection never answered closes at 10 s, whatever it sends; one answered then left quiet, at 30 s | `whip::tcp_tests::unanswered_and_idle_connections_close` (at 300 ms each) | Met |
 | A frame over 1500 bytes ends the connection | `whip::tcp_tests::a_frame_over_the_cap_ends_the_connection`, `whip_tcp_front::tests::a_frame_over_the_cap_ends_the_connection` | Met |
 | A connection's send queue is bounded in frames (256) and bytes (256 KiB); past either, and for a connection that has gone or a packet over 1500 bytes, the packet is dropped and counted | `whip_tcp::tests::the_send_queue_is_bounded_in_bytes_and_frames` (at 4 frames, 3006 bytes) | Met. That the owner never waits on a connection follows from `try_send`; no test stalls a reader to show it |
-| The front's outcome does not depend on how the stream is cut | the `whip_tcp_front` target; `whip_tcp_front::tests::seeds_hold_the_fuzz_checks` (6 inline seeds, 500 mutations each), `whip_tcp_front::tests::committed_seeds_hold_the_fuzz_checks` | FUZZ_STATUS |
+| The front's outcome does not depend on how the stream is cut | the `whip_tcp_front` target; `whip_tcp_front::tests::seeds_hold_the_fuzz_checks` (6 inline seeds, 500 mutations each), `whip_tcp_front::tests::committed_seeds_hold_the_fuzz_checks` | Met for a 121 s run (7,474,458 inputs, no crash); CI's fuzz job has not run it yet |
 | Configuration refusals and the TCP settings | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 | A3.1 over ICE-TCP: headless Chrome publishes with only a TCP candidate, directly and through a PROXY v2 relay; hls.js plays; the recording opens | `scripts/whip-e2e.js --transport tcp`, `--transport proxy` | Partial: Chrome 157 on loopback, figures above. Other browsers, and A0.3 (a public address on 443, UDP blocked), are open |
 | A3.6 over ICE-TCP: the trace log holds no token, offer address, port or mDNS name, or the publisher's real TCP ends | the same runs | Met for those runs (54 literals each) |
