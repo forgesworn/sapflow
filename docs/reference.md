@@ -279,9 +279,30 @@ follows the observed behaviour.
   which libsrt prints as `PREDEFINED:401`. srt-tokio sent 400, 401, 402
   (overload, and our throttle), 404 and 409 for sapflow's refusals;
   sapflow-srt sends the same.
-- **Observed:** a libsrt receiver sends a full ACK at most every 10 ms and
-  only when the acknowledged position has moved (the specification reads
-  as every 10 ms); keepalives every second when idle, both ways.
+- **Observed:** with feedback delivered, a libsrt receiver sends a full
+  ACK at most every 10 ms when the acknowledged position moves; keepalives
+  every second when idle, both ways. A separate libsrt 1.5.4 loopback probe
+  (2026-11-11) suppressed the first ACK for one final data packet: the
+  receiver repeated that same position 303.249 ms later, then stopped after
+  ACKACK. This qualifies the earlier observation, which did not lose ACKs.
+- **Feedback recovery:** draft-sharabayko-srt-01 §4.8.1 requires repeating
+  an ACK position until ACKACK confirms it. Sapflow sends new progress on
+  the 10 ms SYN interval and repeats an unchanged, unconfirmed position
+  after `max(10 ms, RTT + 4 * RTTVar)`. This bounded repeat policy matches
+  the default approximately 300 ms black-box observation and avoids a
+  persistent 100 Hz timer for sparse traffic with lost feedback. Retained
+  ACK numbers identify their exact data positions; confirming an older
+  position cannot suppress newer progress, and a light ACK cannot suppress
+  a later full ACK. A virtual-time caller/listener regression reproduces
+  the former failure: losing one final ACK left delivered data unconfirmed
+  until the caller reached its retry limit.
+- **Sender timeout eligibility:** §5.1.2 defines RTO relative to a packet's
+  transmission. A connection-wide alarm now queues only packets whose
+  latest transmission is at least one base RTO old, preserving immediate
+  NAK handling and connection backoff. A virtual-time regression previously
+  retransmitted a 12 ms-old packet at a 320 ms connection timeout, even
+  after an advancing ACK removed the older packet. These feedback fixes
+  do not establish the cause of earlier physical recording discards.
 - **Observed:** its first RTT sample replaces the starting 100 ms / 50 ms:
   the ACK after the first ACKACK reports that sample as the RTT and half
   of it as the variance. Later samples are smoothed as specified (7/8,
