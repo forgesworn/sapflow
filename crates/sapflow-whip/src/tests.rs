@@ -558,3 +558,125 @@ fn rtx_repairs_a_lost_packet() {
     assert_eq!(seen.units.first().map(|u| u.0.clone()), Some(want));
     assert_eq!(seen.lost, 0);
 }
+
+/// Replays a recorded real-browser run (the example harness's `--record`)
+/// offline: the same seeded session, our test STUN client validating a
+/// documentation-range tuple, then the browser's DTLS datagrams in order.
+/// Every datagram our DTLS sends must match the live run byte for byte,
+/// the handshake must complete with the recorded profile, the peer's
+/// leaf certificate must match the offer's fingerprint, and the browser's
+/// first SRTP and SRTCP packets must authenticate.
+fn replay(dir: &str) {
+    use crate::Credentials;
+    use crate::ice::{Kind, classify};
+    use crate::sdp::{self, AnswerConfig, Offer};
+    use sapflow_dtls::Fingerprint;
+    let read =
+        |f: &str| std::fs::read_to_string(crate_fixture(&format!("{dir}/{f}"))).expect("fixture");
+    let offer = read("offer.sdp");
+    let leaf = unhex(read("leaf.der.hex").trim());
+    let summary = read("summary.txt");
+    let profile = summary
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("profile "))
+        .expect("profile");
+    for leak in ["a=candidate", "127.0.0.1", "192.168.", ".local"] {
+        assert!(!offer.contains(leak), "{leak}");
+    }
+    let parsed = Offer::parse(offer.as_bytes()).expect("offer parses");
+    let creds = Credentials::generate_seeded(HARNESS_SEED).expect("credentials");
+    let (ufrag, pwd) = (creds.ufrag().to_owned(), creds.pwd().to_owned());
+    let (_, negotiated) = sdp::answer(
+        &parsed,
+        &AnswerConfig {
+            credentials: &creds,
+            fingerprint: server_identity().fingerprint(),
+            candidates: &[],
+            opus_max_bitrate: 128_000,
+            origin: 1,
+        },
+    )
+    .expect("answer");
+    assert!(
+        negotiated
+            .fingerprints
+            .contains(&Fingerprint::of_certificate(&leaf))
+    );
+    let t0 = Instant::now();
+    let mut s = crate::Session::new_seeded(
+        SessionConfig::default(),
+        server_identity(),
+        creds,
+        negotiated.clone(),
+        t0,
+        HARNESS_SEED,
+    )
+    .expect("session");
+    let from = tuple(5000);
+    let mut stun = StunClient::new(&ufrag, &pwd, &negotiated.remote_ufrag);
+    s.handle_datagram(t0, from, &stun.check(true));
+    let mut now = t0;
+    let mut ours = std::collections::VecDeque::new();
+    let mut matched = 0;
+    for line in read("dtls.txt").lines() {
+        let (tag, rest) = line.split_at(1);
+        match tag {
+            "C" => s.handle_datagram(now, from, &unhex(rest.trim())),
+            "T" => {
+                now = s.poll_timeout().expect("a timer");
+                s.handle_timeout(now);
+            }
+            "S" => {
+                while ours.is_empty() {
+                    let t = s.poll_transmit().expect("our DTLS datagram");
+                    if classify(&t.bytes) == Kind::Dtls {
+                        ours.push_back(t.bytes);
+                    }
+                }
+                assert_eq!(
+                    ours.pop_front(),
+                    Some(unhex(rest.trim())),
+                    "datagram {matched}"
+                );
+                matched += 1;
+                continue;
+            }
+            other => panic!("{other}"),
+        }
+        while let Some(t) = s.poll_transmit() {
+            if classify(&t.bytes) == Kind::Dtls {
+                ours.push_back(t.bytes);
+            }
+        }
+    }
+    assert!(matched >= 2, "our flights were compared");
+    assert_eq!(s.state(), State::Connected);
+    assert_eq!(
+        s.profile().map(|p| format!("{p:?}")).as_deref(),
+        Some(profile)
+    );
+    let media = read("media.txt");
+    let (mut rtp, mut rtcp) = (0, 0);
+    for line in media.lines() {
+        let (kind, hexed) = line.split_once(' ').expect("kind and bytes");
+        s.handle_datagram(now, from, &unhex(hexed));
+        match kind {
+            "srtp" => rtp += 1,
+            _ => rtcp += 1,
+        }
+    }
+    let st = s.stats();
+    assert!(rtp > 0 && rtcp > 0);
+    assert_eq!(
+        (st.srtp_packets, st.srtcp_packets),
+        (rtp, rtcp),
+        "the browser's SRTP authenticates"
+    );
+    assert_eq!((st.srtp_refused, st.srtcp_refused, st.malformed), (0, 0, 0));
+}
+
+#[test]
+fn chrome_157_handshake_and_srtp_replay() {
+    replay("chrome-157");
+}

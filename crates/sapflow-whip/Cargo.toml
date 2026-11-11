@@ -28,6 +28,10 @@ zeroize = "=1.9.1"
 sapflow-dtls = { path = "../sapflow-dtls", features = ["testing"] }
 sapflow-rtp = { path = "../sapflow-rtp", features = ["testing"] }
 
+[[example]]
+name = "whip_harness"
+required-features = ["testing"]
+
 [features]
 # Test helpers (a STUN client, a scripted publisher over the sapflow-dtls
 # test client and SRTP protect, seeded randomness) and the fuzz entry
