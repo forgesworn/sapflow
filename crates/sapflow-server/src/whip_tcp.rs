@@ -67,9 +67,14 @@ pub(crate) const FRAMING: Framing = Framing {
 /// The listener's bounds. Each has a refusal path and a test.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
-    /// Connections at once, in every state.
+    /// Connections at once, in every state. Chrome 157 opened one per
+    /// local candidate, 5 on the test host, so the default 128 is 8 for
+    /// each of the default 16 publishers.
     pub connections: usize,
-    /// Connections at once from one publisher address.
+    /// Connections at once from one publisher address. Publishers behind
+    /// one NAT share an address, so the default 32 leaves room for several
+    /// browsers there while one address takes at most a quarter of the
+    /// slots.
     pub per_address: usize,
     /// For a whole PROXY header, from accept.
     pub header_timeout: Duration,
@@ -89,8 +94,8 @@ pub(crate) struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            connections: 64,
-            per_address: 8,
+            connections: 128,
+            per_address: 32,
             header_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
@@ -210,8 +215,10 @@ impl Link {
     pub(crate) async fn transmit(&self, socket: &UdpSocket, t: Transmit) {
         match t.tuple.transport {
             Transport::Udp => {
-                if socket.send_to(&t.bytes, t.tuple.remote).await.is_err() {
-                    tracing::debug!("WHIP send failed");
+                // Logged under the UDP owner's target, as before W3d. An
+                // I/O error's text names no address.
+                if let Err(error) = socket.send_to(&t.bytes, t.tuple.remote).await {
+                    tracing::debug!(target: "sapflow::whip", %error, "WHIP send failed");
                 }
             }
             Transport::Tcp => self.queue(&t),
