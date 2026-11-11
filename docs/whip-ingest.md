@@ -432,10 +432,13 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
 ```
 
 - **UDP.** One socket (`SAPFLOW_WHIP_UDP_ADDR`) for every session. Packets
-  are told apart by their first byte (RFC 7983, as updated by RFC 9443). A new
-  5-tuple is accepted only through a STUN Binding request whose USERNAME names
-  a live session and whose MESSAGE-INTEGRITY checks. After that, the tuple
-  maps to its session.
+  are told apart by their first byte (RFC 7983, as updated by RFC 9443). A
+  Binding request goes to the session its USERNAME names, from any tuple; a
+  new 5-tuple is accepted only through one whose MESSAGE-INTEGRITY checks.
+  Everything else goes to the session that owns its tuple. A tuple belongs
+  to one session at a time: a session that a new check validates from it
+  takes it, unless its owner has had fresh SRTP or SRTCP from it within the
+  last 2 s or has not connected yet (W3c; see the notes below).
 - **Unknown STUN attributes.** Comprehension-optional attributes (0x8000 and
   above) that Sapflow does not know are ignored. Chrome 157 sends `0xC057` in
   every check. An unknown comprehension-required attribute gets `420 Unknown
@@ -1022,7 +1025,14 @@ There is no ICE restart in v1.
 
 ## Configuration
 
-All names are proposed and settle in W3.
+W3c built `SAPFLOW_WHIP_ADDR`, `SAPFLOW_WHIP_PUBLIC_URL`,
+`SAPFLOW_WHIP_UDP_ADDR` and `SAPFLOW_WHIP_CANDIDATES` (required together,
+UDP candidates only), and `SAPFLOW_WHIP_ALLOW_ORIGINS`,
+`SAPFLOW_WHIP_TRUSTED_PROXY`, `SAPFLOW_WHIP_KEYFRAME_INTERVAL` (seconds, 0
+for none) and `SAPFLOW_WHIP_OPUS_MAX_BITRATE`. Any WHIP setting without
+`SAPFLOW_WHIP_ADDR`, `SAPFLOW_WHIP_TCP_ADDR` (W3d), and WHIP with the scoped
+control API are refused at start. `SAPFLOW_WHIP_JITTER` and
+`SAPFLOW_WHIP_STALE` are still proposals.
 
 | Variable | Meaning |
 |---|---|
@@ -1364,20 +1374,99 @@ Implementation notes (W3a, 11 November 2026):
   scripted sessions; a seed replay test and a fixed-seed mutation pass run
   with the unit tests. CI's fuzz job picks the targets up from `cargo fuzz
   list`. A coverage report is still to come. These cover A3.5's STUN and
-  SDP parsers; the WHIP request parser's target comes with W3c's listener.
-- **Left to W3c.**
-  - The signalling listener: HTTP, CORS, the 16 KiB offer cap at the
-    request, the throttle, admission and publish-auth.
-  - The UDP owner task: routing a check from a new address by
-    `stun::request_username` and the session's `local_ufrag`, then by
-    `Session::accepts`.
-  - Tuple ownership. A session's validated tuples never age (up to
-    `max_tuples`; those that have delivered no fresh media are evicted
-    first, then the stalest), so once a NAT gives a port to a second
-    publisher, two sessions can both accept the same tuple. The UDP owner
-    must map each tuple to one session, the one whose check from it came
-    last, and must not route by `accepts` alone.
-  - Pending-session caps, in total and per address.
+  SDP parsers; `whip_request` (W3c) covers the WHIP request rules.
+Implementation notes (W3c part 1, 11 November 2026):
+
+- **Shape.** `sapflow_whip::router::Router` is the UDP owner's sans-IO
+  core: every session on one socket, checks routed by USERNAME, everything
+  else by the tuple's owner, with a session cap
+  (`SAPFLOW_MAX_PUBLISHERS`). In the server, `whip.rs` binds both sockets
+  at start, serves signalling on tokio with `http_lite`, and runs one task
+  for the media socket and the router. Each session's access units and
+  Opus packets go to its own ingest task over a bounded queue (1024
+  items); that task owns the `Publication` and feeds a new
+  elementary-stream source (`EsIngest`, stereo Opus as answered), so the
+  stream is packaged and recorded by the same code as SRT's and RTMP's.
+  Its SRTP and SRTCP bytes count against the bitrate cap, and its health
+  and publish callbacks go through the same `Publication`; neither is
+  tested for WHIP yet. A full queue marks the recording and makes video
+  wait for the next IDR. The request rules are a pure module,
+  `whip_request.rs`, which the `whip_request` fuzz target includes.
+- **Tuple ownership.** The rule written for W3c, "the session whose check
+  from it came last", fails: a valid check for session X, copied or
+  spoofed from the tuple Y's publisher is sending media on, gave X that
+  tuple, and every one of Y's packets after it went to X and was refused
+  (50 of 100 in the test). So a session that a check it takes as new
+  validates from a tuple takes that tuple unless its owner still has it
+  validated and either has had fresh SRTP or SRTCP from it within 2 s or
+  has not connected yet. A retransmission, a replayed ID or a request that
+  fails authentication moves nothing. Left open:
+  - after a publisher is silent from its tuple for more than 2 s, one
+    valid check for another session from it, copied or spoofed, takes it,
+    and the publisher's media is dropped until its own next check takes
+    it back;
+  - an admitted publisher that can spoof addresses, and whose check from
+    a victim's tuple beats the victim's first check, owns that tuple; if
+    it also sends its own SRTP from it, the victim cannot connect on it
+    until that stops for 2 s.
+- **Admission.** A `POST` goes through `Publication::begin_authorised`
+  with protocol `webrtc`: the publish-auth request, the failed-attempt
+  throttle and the global publisher, as for SRT and RTMP. Only the global
+  publisher's refusal and `409` are tested for WHIP. A WHIP claim never
+  takes over an attached publisher, so a second `POST` gets `409` even
+  while the first is handshaking (superseding is not built yet). By the
+  code, and untested: an SRT or RTMP publisher still takes over a live
+  WHIP stream in global-publisher mode, and an app's 403 answers `401`
+  like its 401.
+- **`DELETE`** needs the bearer token again (compared as SHA-256 digests)
+  and answers `200` once the publication has been released, so a `POST`
+  that follows at once is admitted rather than refused `409`.
+- **Loss.** A recording is marked incomplete from the `sapflow-rtp`
+  receiver: its `Lost` events (sequence numbers never received within the
+  jitter wait, after NACK and RTX repair) and dropped frames. The muxer's
+  own discontinuities are not relied on, because a lost Opus packet is
+  filled with silence and the timeline can absorb its timestamp jump, so
+  audio-only Opus can look continuous to the muxer. Each session's lost
+  packets are logged when it ends.
+- **Opus timing.** Audio-only Opus discontinuities under a slewed timeline
+  (Open after W3b, above) belong to `sapflow-hls`; the server does not
+  work around them. For an audio-only stream, `EXT-X-PROGRAM-DATE-TIME`
+  drifts from wall-clock time by the sender's clock skew (about 0.36 s an
+  hour at 100 ppm), as AAC from SRT and RTMP already does. That is
+  expected, and the server leaves program dates alone.
+
+| Claim | Test | Status |
+|---|---|---|
+| A3.1: Chrome publishes through `POST`, LL-HLS plays in hls.js, the recording opens | `scripts/whip-e2e.js` | Partial: headless Chrome 157 on the test host, one run: 10.1 s played at 640x360 (206 frames decoded); the recording decoded 245 H.264 frames at 640x360 and 607 stereo Opus frames, and a frame from each was saved. Other browsers, and the DTLS handshake with every target, are later gates |
+| A3.1 in process: `POST`, ICE, DTLS, SRTP over UDP, media in the playlist | `whip::tests::a_publisher_reaches_the_stream_through_post_and_udp` | Met, with the scripted publisher |
+| A3.2 (basic): `DELETE` needs the token, answers `200`, the session is gone, and an immediate `POST` takes the held stream | the same test | Partial: the callbacks, the grace and a handshake timeout at server level are not observed |
+| Refusals before admission: 404, 405 with `Allow`, 401, 415, 413 by `content-length`, 400, 422; 409 and 401 from admission | `whip::tests::refusals_carry_their_statuses`, `whip_request::tests` | Met for these. 403, 429 and 503 from the app are not tested |
+| `503` past `SAPFLOW_MAX_PUBLISHERS` sessions, its path released | `whip::tests::past_the_session_cap_a_post_gets_503` | Met |
+| CORS only for configured origins, refusals included; preflight methods, headers and `Accept-Post` | `whip::tests::cors_only_for_configured_origins`, `whip_request::tests::cors_only_for_configured_origins` | Met |
+| `X-Forwarded-For` only from the trusted proxy, its own entry | `whip_request::tests::forwarded_for_only_from_the_trusted_proxy` | Unit tests only |
+| A3.5: the WHIP request parser has a fuzz target | `whip_request`, seeds replayed by `whip_request::tests::seeds_hold_the_fuzz_checks` | Partial: built and seeds replayed; not fuzzed on the test host (libFuzzer does not run there); CI's fuzz job runs it |
+| A3.6: nothing bound with `SAPFLOW_WHIP_ADDR` unset, and the media address alone refused | `scripts/whip-e2e.js` (lsof on the process), `config::tests::whip_is_off_unless_its_address_is_set` | Met |
+| A3.6: an A3.1 run's trace log holds no token, offer address, port or mDNS name, or publisher address | `scripts/whip-e2e.js` | Met for that run (44 literals); the check first finds a planted token |
+| A check for another session from a media tuple does not cost its publisher media | `router::tests::a_check_for_another_session_cannot_take_a_media_tuple` (with and without USE-CANDIDATE) | Met |
+| The first session keeps a tuple through its handshake | `router::tests::the_first_session_keeps_a_tuple_through_its_handshake` | Met |
+| A silent tuple passes to the session that checks from it (NAT reuse) | `router::tests::a_silent_tuple_passes_to_the_session_that_checks_from_it` | Met in process |
+| A replayed or forged check moves nothing | `router::tests::a_replayed_or_forged_check_moves_nothing` | Met |
+| The two limits above | `router::tests::a_check_that_beats_the_first_one_owns_the_tuple`, `router::tests::a_publisher_back_after_a_gap_reclaims_its_tuple_at_its_next_check` | Shown |
+| Datagrams for no session draw nothing | `router::tests::unroutable_datagrams_draw_nothing` | Met in process; the packet-capture check is A3.7 |
+| A full queue marks loss and video waits for an IDR | `whip::tests::a_full_queue_skips_video_to_the_next_idr` | Met |
+| Loss from the receiver marks the recording, even where the muxer sees none: audio-only Opus with one packet left out is marked, without loss it is not; lost packets are counted | `whip::tests::a_lost_packet_marks_the_recording_from_the_receiver`, `whip::tests::receiver_loss_is_counted_and_marks_the_recording` | Met in process |
+| WHIP settings | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
+
+- **Left to W3c part 2.**
+  - The throttle as a WHIP refusal path of its own, and pending-session
+    caps, in total and per address.
+  - Supersede (A3.3), from `Session::last_media`.
+  - Running each session call under `catch_unwind` (A3.4).
+  - Counting end reasons.
+  - A3.2 beyond the basic `DELETE`: the callbacks and the grace, and every
+    refusal observed.
+  - A3.7's bounds and the packet-capture tests, as invariants on the
+    router and session harness.
   - A muted video section draws a PLI every second: `sapflow-rtp` asks
     again every `keyframe_retry` while it waits for an IDR. That case has
     no test yet. The per-tuple bound holds whatever happens, since a send
@@ -1394,10 +1483,6 @@ Implementation notes (W3a, 11 November 2026):
     selected tuple but sent to the send tuple, so once they differ a
     `close_notify` from the media tuple is dropped. A graceful end should
     rely on `DELETE` and the media timeout, not on it.
-  - Running each session call under `catch_unwind` (A3.4).
-  - Supersede from `Session::last_media`.
-  - Counting end reasons.
-  - Wiring media into `EsIngest`, and the rest of A3.
 - **Left to W3d.** PROXY protocol v2 and the TCP listener.
 
 ### W4: qualification
