@@ -80,11 +80,17 @@ android {
             }
             require(playbackPrefix.startsWith('/') && playbackPrefix.endsWith('/') && !playbackPrefix.contains("..") && !playbackPrefix.contains("//") && playbackPrefix.matches(Regex("/[A-Za-z0-9/_-]*"))) { "Invalid approved playback prefix" }
         }
+        buildConfigField("int", "DIAGNOSTIC_PREVIEW_FPS", "0")
         buildConfigField("String", "V4V_API_ORIGIN", literal(apiOrigin))
         buildConfigField("String", "V4V_PLAYBACK_ORIGIN", literal(playbackOrigin))
         buildConfigField("String", "V4V_PLAYBACK_PREFIX", literal(playbackPrefix))
     }
     buildTypes {
+        getByName("debug") {
+            val previewFps = providers.gradleProperty("sapflowDebugPreviewFps").orElse("0").get()
+            require(previewFps in setOf("0", "15")) { "Debug preview fps must be 0 or 15" }
+            buildConfigField("int", "DIAGNOSTIC_PREVIEW_FPS", previewFps)
+        }
         create("qualification") {
             initWith(getByName("release"))
             isDebuggable = false

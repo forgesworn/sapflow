@@ -51,6 +51,7 @@ internal class CameraGlRenderer(
     }
     private val owner = Handler(thread.looper)
     private var admission = RenderAdmission()
+    private val previewAdmission = PreviewAdmission(BuildConfig.DIAGNOSTIC_PREVIEW_FPS)
     private val requestedSource = AtomicLong(initialSourceToken)
     private var sourceToken = initialSourceToken
     private var sourcePlan = plan
@@ -311,6 +312,7 @@ internal class CameraGlRenderer(
                 makeCurrent(scratch)
                 cameraTexture?.setOnFrameAvailableListener(null); owner.removeCallbacks(render)
                 admission.close()
+                previewAdmission.reset()
                 cameraSurface?.release(); cameraSurface = null
                 cameraTexture?.release(); cameraTexture = null
                 if (textureName != 0) { GLES20.glDeleteTextures(1, intArrayOf(textureName), 0); textureName = 0 }
@@ -391,7 +393,7 @@ internal class CameraGlRenderer(
                     callbacks.post { if (live.get() && requestedSource.get() == confirmed) onSourceFrame(confirmed, observedAtNs) }
                 }
                 if (previewAllowed() && preview != EGL14.EGL_NO_SURFACE && live.get() && requestedSource.get() == sourceToken) {
-                    renderPreview(false)
+                    if (BuildConfig.DIAGNOSTIC_PREVIEW_FPS == 0 || previewAdmission.claim(System.nanoTime())) renderPreview(false)
                 }
             }
         } finally {
@@ -452,6 +454,7 @@ internal class CameraGlRenderer(
     }
 
     private fun detachPreview() {
+        previewAdmission.reset()
         makeCurrent(scratch)
         val previous = preview
         preview = EGL14.EGL_NO_SURFACE; previewSurface = null
