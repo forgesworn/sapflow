@@ -26,6 +26,7 @@ pub(crate) struct Settings {
     pub jitter: u64,
     pub reorder_delay: u64,
     pub max_dropout: u64,
+    pub max_misorder: u64,
     pub max_nacks: u8,
 }
 
@@ -37,6 +38,9 @@ pub(crate) struct Stored {
     pub marker: bool,
     pub payload: Vec<u8>,
 }
+
+/// A packet set aside as a possible restart: sequence number and packet.
+type Probe = (u16, Stored);
 
 #[derive(Debug)]
 enum Slot {
@@ -98,7 +102,7 @@ pub(crate) struct Reorder {
     bytes: usize,
     missing: usize,
     ready: VecDeque<Released>,
-    probe: Option<(u16, u32, bool, Vec<u8>)>,
+    probe: Option<Probe>,
 }
 
 impl Reorder {
@@ -130,20 +134,16 @@ impl Reorder {
         self.highest.saturating_add_signed(step)
     }
 
-    fn start(&mut self, now: u64, seq: u16, timestamp: u32, marker: bool, payload: Vec<u8>) {
+    fn start(&mut self, now: u64, seq: u16, mut packet: Stored) {
         let ext = BASE + u64::from(seq);
         self.started = true;
         self.released_any = false;
         self.first_arrival = now;
         self.head = ext;
         self.highest = ext;
-        self.bytes = payload.len();
-        self.slots.push_back(Slot::Held(Stored {
-            seq: ext,
-            timestamp,
-            marker,
-            payload,
-        }));
+        self.bytes = packet.payload.len();
+        packet.seq = ext;
+        self.slots.push_back(Slot::Held(packet));
     }
 
     /// Whether `seq` (16-bit) is a gap being waited for.
@@ -170,21 +170,32 @@ impl Reorder {
         if payload.len() > self.s.max_bytes {
             return Inserted::TooLarge;
         }
+        let stored = |ext| Stored {
+            seq: ext,
+            timestamp,
+            marker,
+            payload: payload.to_vec(),
+        };
         if !self.started {
-            self.start(now, seq, timestamp, marker, payload.to_vec());
+            self.start(now, seq, stored(0));
             return Inserted::New;
         }
         let ext = self.extend(seq);
-        // A packet far from the stream, either way, may be a restart.
+        // A packet far from the stream may be a restart: more than
+        // MAX_MISORDER (RFC 3550 Appendix A.1, 100) behind what has been
+        // released, or more than MAX_DROPOUT (3000) ahead of the highest.
+        // Forward jumps up to 3000 are taken as loss, since a burst that
+        // long is about a second at a few Mbit/s, which a real network
+        // can lose; backward ones that far cannot be reordering.
         let far = if ext < self.head {
-            self.head - ext > self.s.max_dropout
+            self.head - ext > self.s.max_misorder
         } else {
             ext > self.highest && ext - self.highest > self.s.max_dropout
         };
         if far {
-            return self.probe(now, seq, timestamp, marker, payload);
+            return self.probe(now, seq, stored(0));
         }
-        self.probe = None;
+        self.clear_probe();
         if let Some(Slot::Held(_)) = self.slot(ext) {
             return Inserted::Duplicate;
         }
@@ -283,20 +294,26 @@ impl Reorder {
         Inserted::New
     }
 
-    fn probe(
-        &mut self,
-        now: u64,
-        seq: u16,
-        timestamp: u32,
-        marker: bool,
-        payload: &[u8],
-    ) -> Inserted {
+    /// Drops the packet set aside, if any.
+    fn clear_probe(&mut self) {
+        if let Some((_, p)) = self.probe.take() {
+            self.bytes -= p.payload.len();
+        }
+    }
+
+    fn probe(&mut self, now: u64, seq: u16, packet: Stored) -> Inserted {
         let confirmed = self
             .probe
             .as_ref()
             .is_some_and(|p| p.0.wrapping_add(1) == seq);
         if !confirmed {
-            self.probe = Some((seq, timestamp, marker, payload.to_vec()));
+            // It counts against the byte bound like any held packet.
+            self.clear_probe();
+            if self.bytes + packet.payload.len() > self.s.max_bytes {
+                return Inserted::Late;
+            }
+            self.bytes += packet.payload.len();
+            self.probe = Some((seq, packet));
             return Inserted::Probe;
         }
         // Flush everything in order, then start again from the probe.
@@ -304,10 +321,10 @@ impl Reorder {
             self.pop_front();
         }
         self.ready.push_back(Released::Discontinuity);
-        if let Some((pseq, pts, pmarker, ppayload)) = self.probe.take() {
-            self.start(now, pseq, pts, pmarker, ppayload);
+        if let Some((pseq, first)) = self.probe.take() {
+            self.start(now, pseq, first);
             self.released_any = true;
-            let _ = self.insert(now, seq, timestamp, marker, payload);
+            let _ = self.insert(now, seq, packet.timestamp, packet.marker, &packet.payload);
         }
         Inserted::Restart
     }
@@ -394,12 +411,13 @@ impl Reorder {
     /// [`due_nacks`](Self::due_nacks).
     fn nack_time(&self, since: u64, nacks: u8, last_nack: u64, rtt: u64) -> Option<u64> {
         let deadline = since.saturating_add(self.s.jitter);
-        let at = if nacks == 0 {
-            since.saturating_add(self.s.reorder_delay)
-        } else if nacks < self.s.max_nacks {
-            last_nack.saturating_add(retry(rtt))
-        } else {
+        let at = if nacks >= self.s.max_nacks {
+            // Including a cap of zero: no NACK at all.
             return None;
+        } else if nacks == 0 {
+            since.saturating_add(self.s.reorder_delay)
+        } else {
+            last_nack.saturating_add(retry(rtt))
         };
         (at < deadline).then_some(at)
     }
@@ -479,6 +497,7 @@ mod tests {
             jitter: 200 * MS,
             reorder_delay: 10 * MS,
             max_dropout: 3000,
+            max_misorder: 100,
             max_nacks: 4,
         }
     }
@@ -695,5 +714,42 @@ mod tests {
         assert_eq!(put(&mut r, 3, 20_000), Inserted::Probe);
         assert_eq!(put(&mut r, 3, 20_001), Inserted::Restart);
         assert_eq!(drain(&mut r, 3), ["restart", "20000", "20001"]);
+        // Up to 100 behind is late; more is a possible restart (RFC 3550
+        // A.1 MAX_MISORDER), and two in a row confirm it.
+        assert_eq!(put(&mut r, 4, 19_902), Inserted::Late, "100 behind");
+        assert_eq!(put(&mut r, 4, 19_901), Inserted::Probe, "101 behind");
+        assert_eq!(put(&mut r, 4, 19_950), Inserted::Late);
+        assert_eq!(put(&mut r, 4, 19_500), Inserted::Probe);
+        assert_eq!(put(&mut r, 4, 19_501), Inserted::Restart);
+    }
+
+    #[test]
+    fn probes_count_against_the_byte_bound() {
+        let mut r = Reorder::new(Settings {
+            max_bytes: 25,
+            ..settings()
+        });
+        put(&mut r, 0, 10);
+        assert_eq!(put(&mut r, 0, 30_000), Inserted::Probe);
+        assert_eq!(r.held(), (1, 20));
+        // No room for another: refused, and the old probe is gone.
+        assert_eq!(r.insert(0, 31_000, 0, false, &[0; 16]), Inserted::Late);
+        assert_eq!(r.held(), (1, 10));
+        assert_eq!(put(&mut r, 0, 30_000), Inserted::Probe);
+        // An ordinary packet drops the probe.
+        assert_eq!(put(&mut r, 0, 11), Inserted::New);
+        assert_eq!(r.held(), (2, 20));
+    }
+
+    #[test]
+    fn a_nack_cap_of_zero_sends_none() {
+        let mut r = Reorder::new(Settings {
+            max_nacks: 0,
+            ..settings()
+        });
+        put(&mut r, 0, 1);
+        put(&mut r, 0, 3);
+        assert_eq!(r.next_nack(30 * MS), None);
+        assert!(r.due_nacks(100 * MS, 30 * MS).is_empty());
     }
 }
