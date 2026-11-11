@@ -2242,10 +2242,7 @@ impl Muxer {
             if t.parts_freed {
                 continue;
             }
-            if !t
-                .left
-                .is_some_and(|left| edge >= left.saturating_add(window))
-            {
+            if t.left.is_none_or(|left| edge < left.saturating_add(window)) {
                 break;
             }
             let (end_part, parts) = (t.end_part, t.parts);
@@ -2293,10 +2290,10 @@ impl Muxer {
     /// Frees the oldest segment kept past the window, and its parts, before
     /// their time, and counts what went early. Returns whether there was one.
     fn release_oldest(&mut self) -> bool {
-        if !self
+        if self
             .tagged
             .front()
-            .is_some_and(|t| t.msn < self.media_sequence)
+            .is_none_or(|t| t.msn >= self.media_sequence)
         {
             return false;
         }
@@ -3778,7 +3775,10 @@ pub(crate) mod tests {
         let mut m = Muxer::new(MuxerConfig::default(), video(), Some(aac()));
         feed(&mut m, 0..(30 * 40 + 1), 30);
         let evicted = m.media_sequence() - 1;
-        assert!(m.segment(evicted).is_none());
+        // Out of the playlist, though still served for its Availability
+        // Duration (RFC 8216bis 6.2.2); the one before is gone.
+        assert!(m.segment(evicted).is_some());
+        assert!(m.segment(evicted - 1).is_none());
         assert_eq!(m.readiness(Some(evicted), None), Readiness::Ready);
         assert_eq!(m.readiness(Some(evicted), Some(0)), Readiness::Ready);
         assert_eq!(m.readiness(Some(evicted), Some(u64::MAX)), Readiness::Ready);
