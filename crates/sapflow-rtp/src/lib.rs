@@ -37,6 +37,7 @@ pub mod h264;
 pub mod opus;
 pub mod rtcp;
 pub mod rtp;
+pub mod rtx;
 pub mod srtp;
 
 #[cfg(any(test, feature = "testing"))]
