@@ -13,9 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sapflow_core::recording::{is_recording_name, recording_file, scoped_recording_file};
 use sapflow_core::{RecordingTracks, StreamEvent, StreamPath};
-use sapflow_hls::fmp4::{
-    FileTimeBase, MAX_FILE_FRAGMENT_BYTES, init_segment_for_tracks, rebase_part_for_file,
-};
+#[cfg(test)]
+use sapflow_hls::fmp4::init_segment_for_tracks;
+use sapflow_hls::fmp4::{FileTimeBase, MAX_FILE_FRAGMENT_BYTES, rebase_part_for_file};
 use sapflow_hls::muxer::Part;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -821,8 +821,7 @@ impl RecordingWriter {
             observation: self.observation.clone(),
             completed: false,
         };
-        let Some(init) = init_segment_for_tracks(tracks.video(), tracks.audio(), Duration::ZERO)
-        else {
+        let Some(init) = tracks.recording_init(Duration::ZERO) else {
             return;
         };
         #[cfg(test)]
@@ -885,7 +884,7 @@ impl RecordingWriter {
         mut receipt: WriteReceipt,
     ) {
         let Some(recording_tracks) =
-            RecordingTracks::new(tracks.video().is_some(), tracks.audio().is_some())
+            RecordingTracks::new(tracks.video().is_some(), tracks.audio_config().is_some())
         else {
             return;
         };
@@ -915,8 +914,7 @@ impl RecordingWriter {
                     rx.close();
                     break;
                 }
-                match write_part(file, p, tracks.audio().map(|a| a.sample_rate), &mut origin).await
-                {
+                match write_part(file, p, tracks.audio_rate(), &mut origin).await {
                     Ok(span) => duration = duration.saturating_add(span),
                     Err(_) => {
                         failed = true;
@@ -931,8 +929,7 @@ impl RecordingWriter {
             observation.finalising();
         }
         // Now the length is known: rewrite the init in place (same size).
-        let Some(final_init) = init_segment_for_tracks(tracks.video(), tracks.audio(), duration)
-        else {
+        let Some(final_init) = tracks.recording_init(duration) else {
             tracing::error!(file = %file_path.display(), "recording header is invalid");
             return;
         };
@@ -2125,6 +2122,149 @@ mod tests {
                 assert!(bytes.len() > header.len());
                 assert_eq!(&bytes[..header.len()], header.as_ref());
                 assert_eq!(receiver.len(), 0, "one completion per actual writer");
+            }
+        }
+    }
+
+    /// Opus packets from a single-stream Ogg file (RFC 3533 pages), after
+    /// OpusHead and OpusTags. Test scaffolding only.
+    fn ogg_opus_packets(mut data: &[u8]) -> Vec<Vec<u8>> {
+        let (mut packets, mut current) = (Vec::new(), Vec::new());
+        while data.len() >= 27 {
+            assert_eq!(&data[..4], b"OggS");
+            let count = usize::from(data[26]);
+            let mut body = &data[27 + count..];
+            let mut used = 0;
+            for &lacing in &data[27..27 + count] {
+                let (segment, rest) = body.split_at(usize::from(lacing));
+                current.extend_from_slice(segment);
+                body = rest;
+                used += usize::from(lacing);
+                if lacing < 255 {
+                    packets.push(std::mem::take(&mut current));
+                }
+            }
+            data = &data[27 + count + used..];
+        }
+        packets.split_off(2)
+    }
+
+    /// Opus parts through the public elementary API, audio-only or with
+    /// synthetic H.264 access units, sealed by an interrupt.
+    fn opus_parts(with_video: bool) -> (Tracks, Vec<Arc<Part>>) {
+        let packets = ogg_opus_packets(include_bytes!(
+            "../../sapflow-hls/tests/fixtures/opus-48k-stereo-20ms.ogg"
+        ));
+        let now = SystemTime::UNIX_EPOCH;
+        let mut ingest = sapflow_hls::EsIngest::new(sapflow_hls::MuxerConfig::default());
+        let declared = if with_video {
+            sapflow_core::TrackSet::AudioVideo
+        } else {
+            sapflow_core::TrackSet::AudioOnly
+        };
+        ingest.declare_tracks(declared, now).expect("declaration");
+        ingest.parameter_sets(
+            Some(vec![
+                0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0x00, 0x00, 0x03,
+                0x00, 0x08, 0x00, 0x00, 0x03, 0x01, 0xe0, 0x78, 0xa1, 0x4c, 0xb0,
+            ]),
+            Some(vec![0x68, 0xef, 0xbc, 0x80]),
+        );
+        let mut parts = Vec::new();
+        let mut next = 0;
+        for (i, packet) in packets.iter().enumerate() {
+            let pts = i as i64 * 1800;
+            ingest.opus_at(pts, packet, now).expect("real Opus packet");
+            if with_video && i % 2 == 0 {
+                let idr = i % 50 == 0;
+                ingest
+                    .video(
+                        pts,
+                        pts,
+                        sapflow_hls::codec::AccessUnit {
+                            data: vec![0, 0, 0, 2, if idr { 0x65 } else { 0x41 }, i as u8],
+                            idr,
+                            ..Default::default()
+                        },
+                        now,
+                    )
+                    .expect("video");
+            }
+            if let Some(m) = ingest.muxer() {
+                while next < m.next_part_id() {
+                    if let sapflow_hls::PartLookup::Found(part) = m.part(next) {
+                        parts.push(part);
+                    }
+                    next += 1;
+                }
+            }
+        }
+        let mut muxer = ingest.take_muxer().expect("muxer");
+        muxer.interrupt(now);
+        while next < muxer.next_part_id() {
+            if let sapflow_hls::PartLookup::Found(part) = muxer.part(next) {
+                parts.push(part);
+            }
+            next += 1;
+        }
+        let tracks = Tracks::with_audio(muxer.video().cloned(), muxer.audio_config().copied())
+            .expect("nonempty tracks");
+        (tracks, parts)
+    }
+
+    #[tokio::test]
+    async fn opus_recordings_are_written_with_an_opus_sample_entry() {
+        for with_video in [false, true] {
+            let scratch = ScopedScratch::new("opus");
+            let scope = crate::publish_observer::fixture_scope("opus", 1, 1, 1);
+            let (callbacks, mut receiver) = crate::callback::test_queue(scope.clone(), 2);
+            let (tracks, parts) = opus_parts(with_video);
+            assert_eq!(
+                tracks.audio_config(),
+                Some(&sapflow_hls::codec::AudioConfig::Opus(
+                    sapflow_hls::codec::OpusConfig::STEREO
+                ))
+            );
+            assert_eq!(tracks.audio(), None, "not AAC");
+            assert_eq!(tracks.audio_rate(), Some(48_000));
+            assert!(parts.len() > 5);
+            let duration = parts.iter().fold(Duration::ZERO, |d, part| d + part.span);
+            let mut expected = tracks.recording_init(duration).expect("Opus init").to_vec();
+            let mut origin = None;
+            for part in &parts {
+                expected.extend_from_slice(
+                    &rebase_part_for_file(&part.data, Some(48_000), &mut origin)
+                        .expect("own fragment"),
+                );
+            }
+            let mut recorder = Recorder::start(&scratch.0, &scope.key().path, callbacks, 0);
+            recorder.feed(tracks, parts);
+            drop(recorder);
+            let queued = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+                .await
+                .expect("writer completion deadline")
+                .expect("completion callback");
+            let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
+            assert_eq!(body["recordingState"], "finalised");
+            assert_eq!(
+                body["recordingTracks"],
+                serde_json::json!({"hasVideo": with_video, "hasAudio": true})
+            );
+            let path = body["segmentPath"].as_str().expect("file path");
+            let bytes = tokio::fs::read(path).await.expect("synced file");
+            assert_eq!(bytes, expected, "the recorder's layout, byte for byte");
+            for tag in [&b"Opus"[..], b"dOps"] {
+                assert!(bytes.windows(4).any(|w| w == tag));
+            }
+            assert!(!bytes.windows(4).any(|w| w == b"mp4a"));
+            // For the black-box decode: SAPFLOW_OPUS_EVIDENCE_OUT=<dir>.
+            if let Ok(out) = std::env::var("SAPFLOW_OPUS_EVIDENCE_OUT") {
+                let name = if with_video {
+                    "server-recording-av-synthetic-video.mp4"
+                } else {
+                    "server-recording-audio.mp4"
+                };
+                std::fs::write(Path::new(&out).join(name), &bytes).expect("evidence copy");
             }
         }
     }

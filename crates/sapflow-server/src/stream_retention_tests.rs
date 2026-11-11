@@ -411,3 +411,35 @@ fn close_releases_cached_ingest_but_preserves_an_accepted_body() {
     body.advance(body.len()).expect("drain body");
     assert!(body.is_empty());
 }
+
+#[test]
+fn an_opus_stream_reports_its_audio_in_fresh_media() {
+    use sapflow_hls::codec::{AudioConfig, OpusConfig};
+    let registry = Registry::default();
+    let (stream, generation, _claim) = attach(&registry, 9).expect("presentation");
+    // Nothing carries Opus into a live stream yet; stand one in with an Opus
+    // muxer resumed under the TS source.
+    let mut muxer = Muxer::with_audio_config(
+        MuxerConfig::default(),
+        None,
+        Some(AudioConfig::Opus(OpusConfig::STEREO)),
+        None,
+    )
+    .expect("Opus muxer");
+    for i in 0..100 {
+        muxer
+            .push_audio_at(
+                i * 1800,
+                Bytes::from_static(&[0xfc, 0xff, 0xfe]),
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("20 ms Opus");
+    }
+    stream.lock().ingest = Source::Ts(Box::new(TsIngest::resume(MuxerConfig::default(), muxer)));
+    let fresh = stream
+        .connection_media(generation)
+        .and_then(|snapshot| snapshot.fresh_media)
+        .expect("an independent Opus part");
+    assert!(fresh.has_audio, "Opus is audio");
+    assert!(!fresh.has_video);
+}

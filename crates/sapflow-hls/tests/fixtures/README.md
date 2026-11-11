@@ -52,3 +52,42 @@ different encoded bytes.
 These generated fixtures establish parser and media test inputs. They do not
 establish native phone capture, hardware decoding, background operation or
 whole-show recording acceptance.
+
+## Generated Opus fixtures
+
+`opus-48k-stereo-20ms.ogg`, `opus-48k-mono-60ms.ogg` and
+`opus-48k-stereo-120ms.ogg` are generated sine tones (440 Hz, with 880 Hz on
+the right in the stereo ones), encoded with FFmpeg's libopus encoder. They
+contain no camera, microphone or uploaded media. They give the Opus tests real encoded packets: 20 ms
+packets, 60 ms SILK packets and 120 ms packets of several frames. The Ogg
+container is read only by test code; sapflow takes Opus packets, not Ogg.
+Regenerate them with:
+
+```sh
+ffmpeg -nostdin -hide_banner -loglevel error \
+  -f lavfi -i sine=frequency=440:sample_rate=48000 \
+  -f lavfi -i sine=frequency=880:sample_rate=48000 \
+  -filter_complex "[0:a][1:a]amerge=inputs=2[a]" -map "[a]" -t 2 \
+  -c:a libopus -b:a 64k -frame_duration 20 \
+  -map_metadata -1 -fflags +bitexact -flags:a +bitexact opus-48k-stereo-20ms.ogg
+ffmpeg -nostdin -hide_banner -loglevel error \
+  -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -ac 1 \
+  -c:a libopus -b:a 32k -frame_duration 60 \
+  -map_metadata -1 -fflags +bitexact -flags:a +bitexact opus-48k-mono-60ms.ogg
+ffmpeg -nostdin -hide_banner -loglevel error \
+  -f lavfi -i sine=frequency=440:sample_rate=48000 \
+  -f lavfi -i sine=frequency=880:sample_rate=48000 \
+  -filter_complex "[0:a][1:a]amerge=inputs=2[a]" -map "[a]" -t 1 \
+  -c:a libopus -b:a 64k -frame_duration 120 \
+  -map_metadata -1 -fflags +bitexact -flags:a +bitexact opus-48k-stereo-120ms.ogg
+```
+
+They were made with FFmpeg 8.1.2. Each header gives a pre-skip of 312; the
+last packet of each is trimmed by its Ogg granule position, which sapflow
+does not read.
+
+| Fixture | Bytes | SHA-256 | Packets | TOC duration |
+| --- | ---: | --- | ---: | --- |
+| `opus-48k-stereo-20ms.ogg` | 21426 | `6b4ea92d9b700d07252c2a28abe9ec7f2113a98c9d2e13f23c6d7e4d71d95a30` | 101 | 960 samples each |
+| `opus-48k-mono-60ms.ogg` | 4228 | `09fe117f190eda3a869291abeab11b5322d420ea1539b71402cf7ca3cf216fe3` | 17 | 2880 samples each |
+| `opus-48k-stereo-120ms.ogg` | 8788 | `fe31350cc590d72bd436e25dbb907bd1cd83eb651a8fcfb26fe1c955408f452b` | 9 | 5760 samples each |

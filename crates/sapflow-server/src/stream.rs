@@ -28,17 +28,27 @@ pub struct LiveStream {
     _presentation_permit: PresentationPermit,
 }
 
-/// Frozen nonempty track configs for one recorder initialization epoch.
+/// Frozen nonempty track configs for one recorder initialization epoch. The
+/// audio track is AAC or Opus.
 #[derive(Clone)]
 pub struct Tracks {
     video: Option<sapflow_hls::codec::H264Config>,
-    audio: Option<sapflow_hls::codec::AacConfig>,
+    audio: Option<sapflow_hls::codec::AudioConfig>,
 }
 
 impl Tracks {
+    /// AAC-only constructor kept for the existing recorder tests.
+    #[cfg(test)]
     pub fn new(
         video: Option<sapflow_hls::codec::H264Config>,
         audio: Option<sapflow_hls::codec::AacConfig>,
+    ) -> Option<Self> {
+        Self::with_audio(video, audio.map(sapflow_hls::codec::AudioConfig::Aac))
+    }
+
+    pub fn with_audio(
+        video: Option<sapflow_hls::codec::H264Config>,
+        audio: Option<sapflow_hls::codec::AudioConfig>,
     ) -> Option<Self> {
         (video.is_some() || audio.is_some()).then_some(Self { video, audio })
     }
@@ -47,8 +57,32 @@ impl Tracks {
         self.video.as_ref()
     }
 
+    /// The AAC track, for the existing recorder tests; `None` for Opus.
+    #[cfg(test)]
     pub fn audio(&self) -> Option<&sapflow_hls::codec::AacConfig> {
+        self.audio
+            .as_ref()
+            .and_then(sapflow_hls::codec::AudioConfig::aac)
+    }
+
+    pub fn audio_config(&self) -> Option<&sapflow_hls::codec::AudioConfig> {
         self.audio.as_ref()
+    }
+
+    /// The audio track's timescale, which recording rebases its fragments in.
+    pub fn audio_rate(&self) -> Option<u32> {
+        self.audio
+            .as_ref()
+            .map(sapflow_hls::codec::AudioConfig::sample_rate)
+    }
+
+    /// The recording init segment for these tracks.
+    pub fn recording_init(&self, duration: Duration) -> Option<Bytes> {
+        sapflow_hls::fmp4::init_segment_for_audio_tracks(
+            self.video(),
+            self.audio_config(),
+            duration,
+        )
     }
 }
 
@@ -364,7 +398,7 @@ impl LiveStream {
                     ),
                     part_path: format!("/{root}/{}", playlist::part_name(&state.prefix, id)),
                     has_video: muxer.video().is_some(),
-                    has_audio: muxer.audio().is_some(),
+                    has_audio: muxer.audio_config().is_some(),
                 });
             }
         }
@@ -503,7 +537,10 @@ impl LiveStream {
             }
             id += 1;
         }
-        Some((Tracks::new(m.video().cloned(), m.audio().copied())?, parts))
+        Some((
+            Tracks::with_audio(m.video().cloned(), m.audio_config().copied())?,
+            parts,
+        ))
     }
 
     pub fn close(&self) {

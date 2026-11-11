@@ -111,6 +111,46 @@ impl std::fmt::Display for PushError {
     }
 }
 
+/// The health callback for a muxer that has a segment to measure. Audio is
+/// either codec: `Muxer::audio()` is AAC only.
+fn health_of(m: &sapflow_hls::Muxer) -> Option<Health> {
+    let (bps, keyframe) = m.recent(6)?;
+    Some(Health {
+        bitrate_kbps: bps / 1000,
+        keyframe_interval_ms: m.video().map(|_| keyframe.as_millis() as u64),
+        audio: m.audio_config().is_some(),
+        breaks: m.breaks(),
+    })
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use sapflow_hls::codec::{AudioConfig, OpusConfig};
+
+    #[test]
+    fn an_opus_stream_reports_audio_in_its_health() {
+        let mut m = sapflow_hls::Muxer::with_audio_config(
+            sapflow_hls::MuxerConfig::default(),
+            None,
+            Some(AudioConfig::Opus(OpusConfig::STEREO)),
+            None,
+        )
+        .expect("Opus muxer");
+        for i in 0..200 {
+            m.push_audio_at(
+                i * 1800,
+                bytes::Bytes::from_static(&[0xfc, 0xff, 0xfe]),
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+            .expect("20 ms Opus");
+        }
+        let health = health_of(&m).expect("a measured segment");
+        assert!(health.audio, "Opus is audio");
+        assert_eq!(health.keyframe_interval_ms, None);
+    }
+}
+
 impl Publication {
     /// Authorises the request and claims its path, or takes over a stream
     /// held for a reconnect.
@@ -454,16 +494,10 @@ impl Publication {
         self.last_health = Instant::now();
         let health = {
             let st = self.stream.lock();
-            let Some(m) = st.ingest.muxer() else { return };
-            let Some((bps, keyframe)) = m.recent(6) else {
+            let Some(health) = st.ingest.muxer().and_then(health_of) else {
                 return;
             };
-            Health {
-                bitrate_kbps: bps / 1000,
-                keyframe_interval_ms: m.video().map(|_| keyframe.as_millis() as u64),
-                audio: m.audio().is_some(),
-                breaks: m.breaks(),
-            }
+            health
         };
         self.callbacks
             .send(&self.stream.path, StreamEvent::Health(health));

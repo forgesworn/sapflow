@@ -27,8 +27,10 @@ The rule sapflow implements, from RFC 8216bis (draft-pantos-hls-rfc8216bis)
 section 4.4.4.9 on `EXT-X-PART`, quoted from memory and not re-read here:
 a Partial Segment's duration must be less than or equal to the Part Target
 Duration, and at least 85% of it, except for the last Partial Segment of a
-Parent Segment (the draft may also exempt `INDEPENDENT=YES` parts; sapflow
-does not rely on that). `PART-TARGET` (4.4.3.7) is treated like
+Parent Segment. Draft 19 also exempts `INDEPENDENT=YES` parts. sapflow relies
+on that only for audio-only Opus, where a packet too long for the open part
+closes it early (Apple's players do not play Opus in HLS), and the checks
+below allow it for independent parts. `PART-TARGET` (4.4.3.7) is treated like
 `EXT-X-TARGETDURATION`: fixed for the life of the stream. Safari on macOS
 refused a Larix stream that broke all three (`PART-TARGET` climbed to
 0.534 s while its parts stayed 0.2 s; `docs/interop.md`); which one it
