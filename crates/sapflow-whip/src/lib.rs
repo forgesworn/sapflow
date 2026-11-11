@@ -17,6 +17,8 @@
 //! - [`ice`]: the lite agent, credentials, tuples and the first-byte
 //!   demultiplexer.
 //! - [`sdp`]: [`sdp::Offer::parse`] and [`sdp::answer`].
+//! - [`framing`]: RFC 4571 frames.
+//! - [`resource`]: tokens, session IDs, refusals and `Location`.
 //!
 //! Sans-IO: nothing here owns a socket, a clock or a thread. Every byte that
 //! arrives is hostile: nothing indexes without a bound or trusts a length,
@@ -37,7 +39,9 @@
 )]
 
 mod entropy;
+pub mod framing;
 pub mod ice;
+pub mod resource;
 pub mod sdp;
 pub mod stun;
 
