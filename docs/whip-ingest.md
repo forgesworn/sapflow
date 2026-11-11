@@ -968,9 +968,10 @@ There is no ICE restart in v1.
   full table evicts an address that is neither selected nor the send
   address: one that has never delivered fresh media first, then the one
   whose last fresh media is oldest, the earliest validated breaking ties.
-  An address validated again starts with no media. Checks alone, replayed
-  or not, never push out an address that has delivered fresh media since
-  it was validated. Pushing the publisher's address out takes
+  An address validated again starts with no media. So checks alone,
+  replayed or not, push out an address that has delivered fresh media
+  since it was validated only once every address that could go has
+  delivered some. Pushing the publisher's address out takes
   `max_tuples` - 2 other addresses (6 by default) each with fresh media at
   least as new as the publisher's last, and a selected address other than
   the publisher's. An observer that copies and spoofs gets them from
@@ -1349,17 +1350,21 @@ Implementation notes (W3a, 11 November 2026):
 - **Fuzzing.** `stun_message`, `sdp_offer`, `rfc4571_frames` and
   `whip_session`. The session target scripts honest checks and DTLS
   flights so it reaches the authenticated paths. With an ID cache of 16 so
-  that checks are forgotten, it delivers copies of captured checks and of
-  fresh SRTP and SRTCP from another tuple, ahead of and after their
-  originals. After every step it checks that every tuple has been sent at
-  most four times what it sent, STUN responses included, that DTLS and
-  RTCP go only to the send tuple, and that output is bounded. Seeds come from the
-  RFC 5769 vectors, the W0 offers and TCP captures, the recorded Chrome
-  offer and scripted sessions; a seed replay test and a fixed-seed
-  mutation pass run with the unit tests. CI's fuzz job picks the targets up
-  from `cargo fuzz list`. A coverage report is still to come. These cover
-  A3.5's STUN and SDP parsers; the WHIP request parser's target comes with
-  W3c's listener.
+  that checks are forgotten, and room for 3 validated tuples of the 6 it
+  uses so that tuples are evicted, it delivers copies of captured checks
+  and of fresh SRTP and SRTCP from five other tuples, ahead of and after
+  their originals. After every datagram in and every one out it checks
+  that every tuple has been sent at most four times what it sent, STUN
+  responses included, that a tuple that never authenticated gets only a
+  STUN error response no larger than its request, that DTLS and RTCP go
+  only to the send tuple, and that an evicted tuple had the stalest media
+  of those that could go; after every step, that output is bounded and the
+  selected and send tuples are validated. Seeds come from the RFC 5769
+  vectors, the W0 offers and TCP captures, the recorded Chrome offer and
+  scripted sessions; a seed replay test and a fixed-seed mutation pass run
+  with the unit tests. CI's fuzz job picks the targets up from `cargo fuzz
+  list`. A coverage report is still to come. These cover A3.5's STUN and
+  SDP parsers; the WHIP request parser's target comes with W3c's listener.
 - **Left to W3c.**
   - The signalling listener: HTTP, CORS, the 16 KiB offer cap at the
     request, the throttle, admission and publish-auth.
@@ -1367,10 +1372,11 @@ Implementation notes (W3a, 11 November 2026):
     `stun::request_username` and the session's `local_ufrag`, then by
     `Session::accepts`.
   - Tuple ownership. A session's validated tuples never age (up to
-    `max_tuples`, the stalest media evicted first), so once a NAT gives a
-    port to a second publisher, two sessions can both accept the same
-    tuple. The UDP owner must map each tuple to one session, the one whose
-    check from it came last, and must not route by `accepts` alone.
+    `max_tuples`; those that have delivered no fresh media are evicted
+    first, then the stalest), so once a NAT gives a port to a second
+    publisher, two sessions can both accept the same tuple. The UDP owner
+    must map each tuple to one session, the one whose check from it came
+    last, and must not route by `accepts` alone.
   - Pending-session caps, in total and per address.
   - A muted video section draws a PLI every second: `sapflow-rtp` asks
     again every `keyframe_retry` while it waits for an IDR. That case has

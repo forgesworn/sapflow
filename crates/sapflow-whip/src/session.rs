@@ -34,17 +34,18 @@
 //!   tuple that is neither selected nor the send tuple: one that has never
 //!   delivered fresh media first, then the one whose last fresh media is
 //!   oldest, the earliest validated breaking ties. A tuple validated again
-//!   starts with no media. Checks alone, replayed or not, never push out a
-//!   tuple that has delivered fresh media since it was validated. Pushing
-//!   the publisher's tuple out takes `max_tuples` - 2 other tuples (6 by
-//!   default) each with fresh media at least as new as the publisher's
-//!   last, and a selected tuple other than the publisher's. An observer
-//!   that copies and spoofs gets them from forgotten check IDs, one of them
-//!   carrying USE-CANDIDATE, and that many of the publisher's packets that
-//!   the session never received on their original index while each was
-//!   inside the replay window (1024 packets per SSRC, about 20 s of Opus at
-//!   50 a second): packets lost after the observer saw them, or beaten by
-//!   its copies. No race is needed: it can keep lost packets and send them,
+//!   starts with no media. So checks alone, replayed or not, push out a
+//!   tuple that has delivered fresh media since it was validated only once
+//!   every tuple that could go has delivered some. Pushing the publisher's
+//!   tuple out takes `max_tuples` - 2 other tuples (6 by default) each with
+//!   fresh media at least as new as the publisher's last, and a selected
+//!   tuple other than the publisher's. An observer that copies and spoofs
+//!   gets them from forgotten check IDs, one of them carrying
+//!   USE-CANDIDATE, and that many of the publisher's packets that the
+//!   session never received on their original index while each was inside
+//!   the replay window (1024 packets per SSRC, about 20 s of Opus at 50 a
+//!   second): packets lost after the observer saw them, or beaten by its
+//!   copies. No race is needed: it can keep lost packets and send them,
 //!   with a forgotten check from a new tuple, in one burst between two of
 //!   the publisher's packets, and RTX resends go on their own SSRC, leaving
 //!   the original index open. Short of that, after a won race or a copy of
