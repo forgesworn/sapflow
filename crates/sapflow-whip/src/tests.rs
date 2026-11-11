@@ -711,3 +711,78 @@ fn replay(dir: &str) {
 fn chrome_157_handshake_and_srtp_replay() {
     replay("chrome-157");
 }
+
+/// Bytes the session queued for `to`, split into STUN and everything else.
+fn sent_to(s: &mut crate::Session, to: crate::Tuple) -> (Vec<usize>, usize) {
+    let (mut stun, mut other) = (Vec::new(), 0);
+    let mut rest = Vec::new();
+    while let Some(t) = s.poll_transmit() {
+        if t.tuple == to {
+            if crate::ice::classify(&t.bytes) == crate::ice::Kind::Stun {
+                stun.push(t.bytes.len());
+            } else {
+                other += t.bytes.len();
+            }
+        } else {
+            rest.push(t);
+        }
+    }
+    (stun, other)
+}
+
+/// M1: an observer re-sends a captured USE-CANDIDATE check with a
+/// victim's address as its source. Nothing but a response no larger than
+/// the request may reach the victim, and DTLS and RTCP must not follow.
+#[test]
+fn replayed_check_from_another_tuple_after_connect() {
+    let (mut p, mut a, t0) = setup(19, &[GCM]);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    p.receive(s);
+    let victim = tuple(50_000);
+    // A fresh nominating check from the publisher, captured on the way.
+    let captured = p.check(true);
+    s.handle_datagram(t0 + ms(10), p.tuple, &captured);
+    p.receive(s);
+    s.handle_datagram(t0 + ms(20), victim, &captured);
+    let mut to_victim = sent_to(s, victim);
+    // Time passes: receiver reports, PLIs and transport-cc are due.
+    for d in p.sender_reports(1 << 62) {
+        s.handle_datagram(t0 + ms(30), p.tuple, &d);
+    }
+    for step in 1..=40u64 {
+        s.handle_datagram(t0 + ms(30 + 50 * step), p.tuple, &p.audio(step as u8));
+        run_until(s, t0 + ms(30 + 50 * step));
+        let (stun, other) = sent_to(s, victim);
+        to_victim.0.extend(stun);
+        to_victim.1 += other;
+    }
+    assert!(to_victim.0.iter().all(|n| *n <= captured.len()));
+    assert_eq!(to_victim.1, 0, "DTLS or RTCP followed the replayed check");
+}
+
+/// M1 before SRTP: the replay lands mid-handshake, and DTLS
+/// retransmissions must not follow it to the victim.
+#[test]
+fn replayed_check_from_another_tuple_mid_handshake() {
+    let (mut p, mut a, t0) = setup(20, &[GCM]);
+    let s = &mut a.session;
+    let captured = p.check(true);
+    s.handle_datagram(t0, p.tuple, &captured);
+    for d in p.client.start() {
+        s.handle_datagram(t0, p.tuple, &d);
+    }
+    p.receive(s);
+    let victim = tuple(50_001);
+    s.handle_datagram(t0 + ms(5), victim, &captured);
+    let mut other = 0;
+    let mut stun = Vec::new();
+    for step in 1..=9u64 {
+        run_until(s, t0 + Duration::from_secs(step));
+        let (st, o) = sent_to(s, victim);
+        stun.extend(st);
+        other += o;
+    }
+    assert!(stun.iter().all(|n| *n <= captured.len()));
+    assert_eq!(other, 0, "DTLS retransmissions followed the replayed check");
+}

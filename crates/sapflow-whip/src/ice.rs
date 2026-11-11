@@ -16,8 +16,17 @@
 //!   ICE-CONTROLLED gets 487 Role Conflict, because a lite agent is always
 //!   controlled and cannot switch (RFC 8445 section 7.3.1.1).
 //! - Every other authenticated request gets a success response with
-//!   XOR-MAPPED-ADDRESS, and its tuple becomes validated: one the session
-//!   may send to.
+//!   XOR-MAPPED-ADDRESS, and its tuple becomes validated.
+//! - MESSAGE-INTEGRITY does not cover the source address (RFC 8445
+//!   section 19.2), so a captured check verifies from anywhere. The agent
+//!   remembers the transaction IDs of the last
+//!   [`IceConfig::max_transactions`] authenticated requests (the ID is
+//!   covered by MESSAGE-INTEGRITY; a hash of the datagram would not do,
+//!   since bytes after it are not). A repeated ID is answered only from
+//!   the tuple that first sent it, as a retransmission, and never
+//!   validates, nominates or renews consent. From any other tuple it gets
+//!   nothing. A copy that arrives before its original, or after the ID is
+//!   forgotten, is the session's to contain: see `crate::session`.
 //! - A response is never larger than the request that caused it; one that
 //!   would be is not sent.
 //! - The selected tuple is set and moved only by a successful request with
@@ -28,6 +37,7 @@
 
 use crate::entropy::{ALPHANUMERIC, Entropy, EntropyError};
 use crate::stun::{self, Builder, Message};
+use std::collections::VecDeque;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -170,6 +180,10 @@ pub struct IceConfig {
     /// Consent lasts this long after the last successful check on the
     /// selected tuple (RFC 7675 section 5.1). 1 to 300 s; default 30 s.
     pub consent_timeout: Duration,
+    /// Transaction IDs of authenticated requests remembered, to tell a
+    /// replay from a new check. 16 to 4096; default 512, more than the
+    /// checks Chrome 157 sent in the first 10 s (about 130).
+    pub max_transactions: usize,
 }
 
 impl Default for IceConfig {
@@ -177,6 +191,7 @@ impl Default for IceConfig {
         Self {
             max_tuples: 8,
             consent_timeout: Duration::from_secs(30),
+            max_transactions: 512,
         }
     }
 }
@@ -189,6 +204,9 @@ impl IceConfig {
         }
         if !(Duration::from_secs(1)..=Duration::from_secs(300)).contains(&self.consent_timeout) {
             return Err("consent_timeout");
+        }
+        if !(16..=4096).contains(&self.max_transactions) {
+            return Err("max_transactions");
         }
         Ok(())
     }
@@ -220,6 +238,11 @@ pub struct IceStats {
     pub nominations: u64,
     /// Validated tuples forgotten to make room.
     pub evicted: u64,
+    /// Repeated transaction IDs from the tuple that first sent them,
+    /// answered without changing anything.
+    pub repeats: u64,
+    /// Repeated transaction IDs from another tuple: replays, dropped.
+    pub replays: u64,
 }
 
 /// What a request did.
@@ -242,6 +265,8 @@ pub struct Agent {
     validated: Vec<Tuple>,
     selected: Option<Tuple>,
     last_consent: Option<Instant>,
+    /// Transaction IDs seen, oldest first, with the tuple that sent each.
+    seen: VecDeque<([u8; 12], Tuple)>,
     stats: IceStats,
 }
 
@@ -269,6 +294,7 @@ impl Agent {
             validated: Vec::new(),
             selected: None,
             last_consent: None,
+            seen: VecDeque::new(),
             stats: IceStats::default(),
         }
     }
@@ -318,7 +344,22 @@ impl Agent {
             self.stats.bad_integrity += 1;
             return None;
         }
-        // Authenticated from here.
+        // Authenticated from here. A repeated transaction ID is a
+        // retransmission only from the tuple that first sent it.
+        let repeat = match self.seen.iter().find(|(id, _)| *id == m.transaction) {
+            Some((_, first)) if *first != tuple => {
+                self.stats.replays += 1;
+                return None;
+            }
+            Some(_) => true,
+            None => {
+                if self.seen.len() >= self.config.max_transactions.max(1) {
+                    self.seen.pop_front();
+                }
+                self.seen.push_back((m.transaction, tuple));
+                false
+            }
+        };
         let (response, success) = if !m.unknown_required.is_empty() {
             self.stats.unknown_attributes += 1;
             let r = Builder::new(stun::BINDING_ERROR, &m.transaction)
@@ -344,6 +385,14 @@ impl Agent {
         if response.len() > b.len() {
             self.stats.oversized += 1;
             return None;
+        }
+        if repeat {
+            self.stats.repeats += 1;
+            return Some(Answer {
+                response,
+                success: false,
+                nominated: false,
+            });
         }
         let mut nominated = false;
         // Only a validated tuple can be selected.
@@ -609,6 +658,81 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_transaction_changes_nothing() {
+        let c = creds();
+        let mut a = Agent::new(IceConfig::default(), &c, "peer");
+        let t0 = Instant::now();
+        let mut r = Req::honest(&c);
+        r.use_candidate = true;
+        let check = r.build(40);
+        a.handle(t0, tuple(1), &check).expect("answered");
+        assert_eq!(a.consent_expires(), Some(t0 + Duration::from_secs(30)));
+        // From another tuple: nothing, and nothing changes.
+        let t1 = t0 + Duration::from_secs(5);
+        assert!(a.handle(t1, tuple(2), &check).is_none());
+        assert!(!a.is_validated(&tuple(2)));
+        assert_eq!(a.selected(), Some(tuple(1)));
+        // From its own tuple: answered, as a retransmission, but consent
+        // is not renewed.
+        let again = a.handle(t1, tuple(1), &check).expect("retransmission");
+        assert!(!again.success && !again.nominated);
+        assert!(again.response.len() <= check.len());
+        assert_eq!(a.consent_expires(), Some(t0 + Duration::from_secs(30)));
+        let st = a.stats();
+        assert_eq!((st.replays, st.repeats, st.successes), (1, 1, 1));
+    }
+
+    #[test]
+    fn the_first_copy_wins_and_a_fresh_check_recovers() {
+        // A replay that arrives before its original takes the selection;
+        // the original is then the repeat. The publisher's next check, a
+        // new transaction, takes it back.
+        let c = creds();
+        let mut a = Agent::new(IceConfig::default(), &c, "peer");
+        let now = Instant::now();
+        let mut r = Req::honest(&c);
+        r.use_candidate = true;
+        let check = r.build(41);
+        assert!(
+            a.handle(now, tuple(9), &check)
+                .expect("first copy")
+                .nominated
+        );
+        assert!(
+            a.handle(now, tuple(1), &check).is_none(),
+            "the original, second"
+        );
+        assert_eq!(a.selected(), Some(tuple(9)));
+        assert!(
+            a.handle(now, tuple(1), &r.build(42))
+                .expect("fresh")
+                .nominated
+        );
+        assert_eq!(a.selected(), Some(tuple(1)));
+    }
+
+    #[test]
+    fn forgotten_transactions_are_new_again() {
+        let c = creds();
+        let config = IceConfig {
+            max_transactions: 16,
+            ..IceConfig::default()
+        };
+        let mut a = Agent::new(config, &c, "peer");
+        let now = Instant::now();
+        let r = Req::honest(&c);
+        let first = r.build(0);
+        a.handle(now, tuple(1), &first).expect("answered");
+        for i in 1..=16u8 {
+            a.handle(now, tuple(1), &r.build(i)).expect("answered");
+        }
+        // The first ID has been pushed out: from another tuple it is a new
+        // check again. Containing that is the session's job.
+        assert!(a.handle(now, tuple(2), &first).expect("forgotten").success);
+        assert_eq!(a.stats().replays, 0);
+    }
+
+    #[test]
     fn the_selected_tuple_is_always_validated() {
         // With room for two, nominations across three tuples never leave
         // the selection on a tuple the agent has forgotten.
@@ -644,16 +768,21 @@ mod tests {
         let c = creds();
         let mut a = Agent::new(IceConfig::default(), &c, "peer");
         let user = format!("{}:peer", c.ufrag());
-        let req = Builder::new(stun::BINDING_REQUEST, &[9; 12])
-            .attribute(stun::attr::USERNAME, user.as_bytes())
-            .integrity(c.pwd().as_bytes())
-            .fingerprint();
+        let bare = |tid: u8| {
+            Builder::new(stun::BINDING_REQUEST, &[tid; 12])
+                .attribute(stun::attr::USERNAME, user.as_bytes())
+                .integrity(c.pwd().as_bytes())
+                .fingerprint()
+        };
+        let req = bare(9);
         let v6 = Tuple::udp("[2001:db8::1]:5000".parse().expect("answered"));
         assert_eq!(req.len(), 72);
         assert!(a.handle(Instant::now(), v6, &req).is_none());
         assert_eq!(a.stats().oversized, 1);
-        // IPv4: the response (64 bytes) fits.
-        let ans = a.handle(Instant::now(), tuple(9), &req).expect("answered");
+        // IPv4, a new transaction: the response (64 bytes) fits.
+        let ans = a
+            .handle(Instant::now(), tuple(9), &bare(10))
+            .expect("answered");
         assert_eq!(ans.response.len(), 64);
     }
 
