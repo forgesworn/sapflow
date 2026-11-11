@@ -188,14 +188,11 @@ impl Reorder {
         if let Some(Slot::Held(_)) = self.slot(ext) {
             return Inserted::Duplicate;
         }
-        // Room in bytes first; this may release the front.
-        while self.bytes + payload.len() > self.s.max_bytes && !self.slots.is_empty() {
-            self.pop_front();
-        }
         if ext < self.head {
             let back = self.head - ext;
             let room = self.s.max_packets.saturating_sub(self.slots.len()) as u64;
-            if self.released_any || back > room {
+            if self.released_any || back > room || self.bytes + payload.len() > self.s.max_bytes {
+                // Late: nothing is released to make room for it.
                 return Inserted::Late;
             }
             // Reordering at the very start: grow the front backwards.
@@ -222,6 +219,10 @@ impl Reorder {
         }) = self.slot(ext)
         {
             let (nacks, last_nack) = (*nacks, *last_nack);
+            // Room in bytes, releasing from the front up to this gap only.
+            while self.bytes + payload.len() > self.s.max_bytes && self.head < ext {
+                self.pop_front();
+            }
             let rtt = (nacks == 1).then(|| now.saturating_sub(last_nack));
             if let Some(slot) = self.slot_mut(ext) {
                 *slot = Slot::Held(Stored {
@@ -233,10 +234,18 @@ impl Reorder {
             }
             self.missing -= 1;
             self.bytes += payload.len();
+            if self.bytes > self.s.max_bytes {
+                // Still over: this gap was the front, so it goes at once.
+                self.pop_front();
+            }
             return Inserted::Recovered {
                 nacked: nacks > 0,
                 rtt,
             };
+        }
+        // Room in bytes; this may release the front.
+        while self.bytes + payload.len() > self.s.max_bytes && !self.slots.is_empty() {
+            self.pop_front();
         }
         // Beyond the highest: the packets in between are missing. Release
         // from the front until the whole span fits.
@@ -633,6 +642,45 @@ mod tests {
         assert_eq!(r.insert(0, 99, 0, false, &[0; 1001]), Inserted::TooLarge);
         // Once anything has been forced out, the start hold is over.
         assert_eq!(drain(&mut r, 0).len(), 20);
+        // At the byte bound, a late packet releases nothing, and a gap
+        // filled behind the front releases only what is before it.
+        let mut r = Reorder::new(Settings {
+            max_bytes: 1000,
+            ..settings()
+        });
+        r.insert(0, 10, 0, false, &[0; 100]);
+        drain(&mut r, 10 * MS);
+        for s in [12u16, 13, 15, 16, 17, 18, 19, 20, 21] {
+            r.insert(11 * MS, s, 0, false, &[0; 100]);
+        }
+        assert_eq!(r.held(), (9, 900));
+        assert_eq!(r.insert(12 * MS, 9, 0, false, &[0; 150]), Inserted::Late);
+        assert_eq!(r.held(), (9, 900));
+        assert!(r.is_missing(11) && r.is_missing(14));
+        assert_eq!(
+            r.insert(12 * MS, 14, 0, false, &[0; 150]),
+            Inserted::Recovered {
+                nacked: false,
+                rtt: None
+            }
+        );
+        // 11 was declared lost and 12 released to make room.
+        assert_eq!(drain(&mut r, 12 * MS)[..3], ["lost 11+1", "12", "13"]);
+        assert!(r.held().1 <= 1000);
+        // The gap at the front itself: filled and released at once.
+        let mut r = Reorder::new(Settings {
+            max_bytes: 300,
+            ..settings()
+        });
+        r.insert(0, 1, 0, false, &[0; 100]);
+        drain(&mut r, 10 * MS);
+        r.insert(11 * MS, 3, 0, false, &[0; 100]);
+        r.insert(11 * MS, 4, 0, false, &[0; 100]);
+        r.insert(11 * MS, 5, 0, false, &[0; 100]);
+        assert_eq!(r.held(), (3, 300));
+        r.insert(12 * MS, 2, 0, false, &[0; 100]);
+        assert!(r.held().1 <= 300);
+        assert_eq!(drain(&mut r, 12 * MS), ["2", "3", "4", "5"]);
     }
 
     #[test]
