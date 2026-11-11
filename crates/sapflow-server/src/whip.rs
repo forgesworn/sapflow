@@ -1,8 +1,9 @@
 //! WHIP ingest (docs/whip-ingest.md): the signalling listener on
 //! `SAPFLOW_WHIP_ADDR`, and one task that owns the media socket on
 //! `SAPFLOW_WHIP_UDP_ADDR` and every session's sans-IO state through
-//! `sapflow_whip::router::Router`. Nothing is bound unless WHIP is
-//! configured.
+//! `sapflow_whip::router::Router`, which also takes the frames of the
+//! ICE-TCP listener on `SAPFLOW_WHIP_TCP_ADDR` (`whip_tcp.rs`). Nothing is
+//! bound unless WHIP is configured.
 //!
 //! A `POST` is checked in this order, and a refusal at any step is sent
 //! without going further (`whip_request.rs` holds the rules):
