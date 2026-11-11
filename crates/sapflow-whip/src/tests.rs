@@ -1267,3 +1267,57 @@ fn a_publisher_delivering_media_is_never_evicted() {
     assert_eq!(dropped, 0, "the publisher's media was dropped");
     assert!(back.is_some_and(|b| b <= ms(20)), "{back:?}");
 }
+
+/// A DTLS record as the publisher's address would send it.
+fn dtls_record(content_type: u8, epoch: u16, seq: u64, body: &[u8]) -> Vec<u8> {
+    let mut r = vec![content_type, 0xfe, 0xfd];
+    r.extend_from_slice(&epoch.to_be_bytes());
+    r.extend_from_slice(&seq.to_be_bytes()[2..]);
+    r.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    r.extend_from_slice(body);
+    r
+}
+
+/// Round 3, step 3: input that has not authenticated, from the selected
+/// tuple after Connected, must not end the session (RFC 6347 section
+/// 4.1.2.7: invalid records are discarded).
+#[test]
+fn unauthenticated_dtls_after_connect_is_discarded() {
+    type Case = (&'static str, fn(&mut Publisher) -> Vec<u8>);
+    let cases: [Case; 4] = [
+        ("epoch 0 fatal alert", |_| dtls_record(21, 0, 40, &[2, 40])),
+        ("epoch 1 record with a bad tag", |p| {
+            let mut r = p.client.seal(21, &[2, 40]);
+            let last = r.len() - 1;
+            r[last] ^= 1;
+            r
+        }),
+        ("junk handshake record", |_| {
+            dtls_record(22, 0, 41, &[0xff; 24])
+        }),
+        ("fresh ClientHello", |_| {
+            let mut other = sapflow_dtls::testing::Client::new(
+                sapflow_dtls::testing::Options::default(),
+                identity(77),
+                77,
+            );
+            other.start().concat()
+        }),
+    ];
+    for (i, (name, make)) in cases.into_iter().enumerate() {
+        let (mut p, mut a, t0) = setup(40 + i as u8, &[GCM]);
+        let s = &mut a.session;
+        p.connect(s, t0);
+        let _ = events(s);
+        let d = make(&mut p);
+        s.handle_datagram(t0 + ms(5), p.tuple, &d);
+        let ev = events(s);
+        println!(
+            "{name}: state {:?}, events {ev:?}, dtls {:?}",
+            s.state(),
+            s.stats().dtls
+        );
+        assert_eq!(s.state(), State::Connected, "{name}");
+        assert!(!ev.iter().any(|e| matches!(e, Event::Ended(_))), "{name}");
+    }
+}
