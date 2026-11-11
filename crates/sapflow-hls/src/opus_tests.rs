@@ -268,7 +268,7 @@ fn audio_only_opus_cuts_independent_parts_on_toc_durations() {
         playlist::multivariant(m)
             .lines()
             .find(|l| l.contains("CODECS"))
-            .map(|l| l.contains("CODECS=\"opus\"")),
+            .map(|l| l.contains("CODECS=\"Opus\"")),
         Some(true)
     );
 }
@@ -790,7 +790,7 @@ fn video_led_opus_keeps_timestamps_and_caps_a_gap_at_the_packets_own_duration() 
             "a gap keeps the packet's own duration"
         );
         assert!(
-            playlist::multivariant(m).contains("CODECS=\"avc1.4d400d,opus\""),
+            playlist::multivariant(m).contains("CODECS=\"avc1.4d400d,Opus\""),
             "{}",
             playlist::multivariant(m)
         );

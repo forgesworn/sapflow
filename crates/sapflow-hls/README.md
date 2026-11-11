@@ -28,7 +28,8 @@ live media server. MIT.
   duration comes from its TOC byte (RFC 6716 section 3.1), and a malformed
   packet or one over 120 ms is refused with `IngestError::InvalidAudio`.
   The init segment has an `Opus` sample entry and a `dOps` box at a 48 kHz
-  timescale, and `CODECS` says `opus`. RTP carries no Opus header, so the
+  timescale, and `CODECS` says `Opus`, the sample entry's case-sensitive
+  four-character code (RFC 6381 section 3.3). RTP carries no Opus header, so the
   channel count is 2 when stereo was negotiated (`EsIngest::opus_config`
   with `OpusConfig::STEREO`; `MONO` records nothing) or the first packet is
   stereo, otherwise 1;

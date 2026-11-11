@@ -357,7 +357,7 @@ fn real_audio_only_opus_keeps_every_packet_at_its_toc_duration() {
         let (audio, video) = collected.tracks();
         assert_eq!(video, 0);
         assert_eq!(audio, samples(&packets), "every packet, in order");
-        assert!(playlist::multivariant(&m).contains("CODECS=\"opus\""));
+        assert!(playlist::multivariant(&m).contains("CODECS=\"Opus\""));
     }
 }
 
@@ -376,7 +376,7 @@ fn real_opus_with_real_video_cuts_parts_on_video() {
         audio.len()
     );
     assert!(audio.iter().all(|&d| d == 960));
-    assert!(playlist::multivariant(&m).contains(",opus\""));
+    assert!(playlist::multivariant(&m).contains(",Opus\""));
 }
 
 #[test]

@@ -331,9 +331,12 @@ impl OpusConfig {
         (1..=2).contains(&self.channels)
     }
 
-    /// The `CODECS` value for Opus in an MP4 `Opus` sample entry: `opus`.
+    /// The `CODECS` value for Opus in an MP4 `Opus` sample entry: `Opus`,
+    /// the sample entry's four-character code, which RFC 6381 section 3.3
+    /// makes the first element of an ISO BMFF codecs value and calls case
+    /// sensitive. Chrome 157 and Firefox 160 accept both spellings.
     pub fn codec_string(&self) -> String {
-        "opus".to_owned()
+        "Opus".to_owned()
     }
 }
 
@@ -506,7 +509,7 @@ impl AudioConfig {
         }
     }
 
-    /// RFC 6381 codec string: `mp4a.40.2` for AAC-LC, `opus` for Opus.
+    /// RFC 6381 codec string: `mp4a.40.2` for AAC-LC, `Opus` for Opus.
     pub fn codec_string(&self) -> String {
         match self {
             Self::Aac(a) => a.codec_string(),
@@ -826,7 +829,7 @@ mod tests {
         let audio = AudioConfig::from(OpusConfig::STEREO);
         assert_eq!(
             (audio.sample_rate(), audio.channels(), audio.codec_string()),
-            (48_000, 2, "opus".to_owned())
+            (48_000, 2, "Opus".to_owned())
         );
         assert!(audio.aac().is_none() && audio.opus().is_some());
         assert!(!OpusConfig { channels: 3 }.is_supported());
