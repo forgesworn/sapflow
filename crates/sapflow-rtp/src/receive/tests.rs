@@ -146,6 +146,11 @@ struct Impairments {
     duplicate: HashSet<(usize, u16)>,
     /// Packets whose first retransmission is also dropped.
     lose_first_resend: HashSet<(usize, u16)>,
+    /// Audio without NACK, as browsers usually offer Opus.
+    audio_nack_off: bool,
+    /// Padding-only RTX probes every 50 ms, as Chrome sends to probe
+    /// bandwidth.
+    rtx_probes: bool,
 }
 
 struct Outcome {
@@ -155,7 +160,7 @@ struct Outcome {
     receiver: Receiver,
 }
 
-fn receiver(c: &Capture, rtx: bool) -> Receiver {
+fn receiver(c: &Capture, rtx: bool, audio_nack: bool) -> Receiver {
     let mut r = Receiver::new(ReceiverConfig::default(), Instant::now());
     let mut video = StreamConfig::new(Codec::H264, c.video_pt);
     video.ssrc = Some(c.video_ssrc);
@@ -169,7 +174,7 @@ fn receiver(c: &Capture, rtx: bool) -> Receiver {
     }
     let mut audio = StreamConfig::new(Codec::Opus, c.audio_pt);
     audio.ssrc = Some(c.audio_ssrc);
-    audio.nack = true;
+    audio.nack = audio_nack;
     assert_eq!(r.add_stream(video).expect("video").index(), 0);
     assert_eq!(r.add_stream(audio).expect("audio").index(), 1);
     r
@@ -178,7 +183,7 @@ fn receiver(c: &Capture, rtx: bool) -> Receiver {
 /// Plays the capture through `imp` to a receiver, answering NACKs by
 /// `resend`.
 fn simulate(c: &Capture, imp: &Impairments, resend: Resend) -> Outcome {
-    let mut r = receiver(c, resend == Resend::Rtx);
+    let mut r = receiver(c, resend == Resend::Rtx, !imp.audio_nack_off);
     let t0 = r.epoch;
     let at = |us: u64| t0 + Duration::from_micros(us);
     let mut queue: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> = BinaryHeap::new();
@@ -201,6 +206,20 @@ fn simulate(c: &Capture, imp: &Impairments, resend: Resend) -> Outcome {
         }
     }
     let last = queue.iter().map(|Reverse((t, ..))| *t).max().unwrap_or(0);
+    if imp.rtx_probes {
+        for (n, t) in (0..last).step_by(50 * MS as usize).enumerate() {
+            let probe = RtpBuilder {
+                payload_type: RTX_PT,
+                sequence: 40_000 + n as u16,
+                timestamp: 0,
+                ssrc: RTX_SSRC,
+                padding: 200,
+                ..RtpBuilder::default()
+            }
+            .build();
+            push(&mut queue, t + 7, probe);
+        }
+    }
     let mut events = Vec::new();
     let mut nacked = HashSet::new();
     let mut feedback = Vec::new();
@@ -495,9 +514,24 @@ fn delays(c: &Capture, dropped: &HashSet<Key>) -> (BTreeMap<Key, u64>, HashSet<K
         .filter(|k| !dropped.contains(k))
         .collect();
     for (n, k) in keys.iter().enumerate() {
+        // Audio 25 ms late: the next packet (20 ms on) overtakes it, and it
+        // arrives 5 ms after the gap is seen, inside the reorder delay.
+        if k.0 == 1 {
+            let p = c.audio.iter().position(|p| p.seq == k.1).expect("p");
+            if n % 19 == 9
+                && c.audio
+                    .get(p + 1)
+                    .is_some_and(|q| !dropped.contains(&(1, q.seq)))
+                && !short.contains(&(1, c.audio[p.saturating_sub(1)].seq))
+            {
+                delay.insert(*k, 25 * MS);
+                short.insert(*k);
+            }
+            continue;
+        }
         // Only video packets with a next packet in the same frame can be
         // overtaken within 2 ms.
-        if n % 23 == 5 && k.0 == 0 {
+        if n % 23 == 5 {
             let p = c.video.iter().position(|p| p.seq == k.1).expect("p");
             if c.video
                 .get(p + 1)
@@ -506,7 +540,7 @@ fn delays(c: &Capture, dropped: &HashSet<Key>) -> (BTreeMap<Key, u64>, HashSet<K
                 delay.insert(*k, 2 * MS);
                 short.insert(*k);
             }
-        } else if n % 41 == 7 && k.0 == 0 {
+        } else if n % 41 == 7 {
             delay.insert(*k, 25 * MS);
         }
     }
@@ -524,85 +558,71 @@ fn duplicates(c: &Capture, dropped: &HashSet<(usize, u16)>) -> HashSet<(usize, u
         .collect()
 }
 
-fn recovered(resend: Resend) {
-    let c = capture();
-    let base = lossless(&c);
-    let (drop, what) = drops(&c);
-    assert_eq!(what.len(), 7);
-    let (delay, short) = delays(&c, &drop);
-    assert!(!short.is_empty() && delay.len() > short.len());
-    let duplicate = duplicates(&c, &drop);
-    // Some retransmissions are lost too, so NACKs repeat.
-    let lose_first_resend: HashSet<_> = drop.iter().copied().filter(|k| k.1 % 3 == 0).collect();
-    assert!(!lose_first_resend.is_empty());
-    let imp = Impairments {
-        drop: drop.clone(),
-        delay,
-        duplicate,
-        lose_first_resend,
-    };
-    let out = simulate(&c, &imp, resend);
-    assert_clean(&out.events);
-    // Exactly the lossless output.
+/// Video exactly as lossless, with nothing lost, incomplete or skipped.
+fn video_recovered(base: &Outcome, out: &Outcome) {
     assert_eq!(access_units(&out.events), access_units(&base.events));
-    assert_eq!(audio_frames(&out.events), audio_frames(&base.events));
-    // Every dropped packet was NACKed; nothing merely reordered inside
-    // the reorder delay was.
-    for k in &drop {
-        assert!(out.nacked.contains(k), "{k:?} NACKed");
+    for e in &out.events {
+        if e_stream(e) == Some(0) {
+            assert!(matches!(e, Event::AccessUnit { .. }), "{e:?}");
+        }
     }
-    for k in &short {
-        assert!(!out.nacked.contains(k), "{k:?} reordered, not NACKed");
-    }
-    // RTT measured from NACK to retransmission: 30 ms here. On the
-    // original SSRC, late originals (15 ms after their NACK) are timed
-    // too, so the estimate can only fall short.
-    assert!(out.receiver.rtt_measured());
-    let rtt = out.receiver.rtt();
-    let low = if resend == Resend::Rtx { 29 } else { 10 };
-    assert!(
-        rtt >= Duration::from_millis(low) && rtt <= Duration::from_millis(31),
-        "{rtt:?}"
-    );
     let v = out.receiver.stats(StreamId(0)).expect("stats");
-    assert!(v.recovered as usize >= drop.iter().filter(|k| k.0 == 0).count());
-    assert!(v.duplicates > 0);
     assert_eq!((v.lost, v.incomplete, v.skipped), (0, 0, 0));
     assert_eq!(out.receiver.buffered(StreamId(0)), Some((0, 0)));
 }
 
-#[test]
-fn a12_every_retransmission_arrives_on_rtx() {
-    recovered(Resend::Rtx);
-}
-
-#[test]
-fn a12_every_retransmission_arrives_on_the_original_ssrc() {
-    recovered(Resend::Original);
-}
-
-#[test]
-fn a12_withheld_retransmissions_report_exactly_their_frames() {
-    let c = capture();
-    let base = lossless(&c);
-    let (drop, _) = drops(&c);
-    let (delay, _) = delays(&c, &drop);
-    let imp = Impairments {
-        drop: drop.clone(),
-        delay,
-        duplicate: duplicates(&c, &drop),
-        ..Impairments::default()
-    };
-    let out = simulate(&c, &imp, Resend::Never);
-    // Loss is reported for exactly the withheld packets.
-    for stream in [0, 1] {
-        let want: BTreeSet<u16> = drop.iter().filter(|k| k.0 == stream).map(|k| k.1).collect();
-        assert_eq!(lost_set(&out.events, stream), want, "stream {stream}");
+/// Audio exactly as lossless: every packet, no fill.
+fn audio_recovered(base: &Outcome, out: &Outcome) {
+    assert_eq!(audio_frames(&out.events), audio_frames(&base.events));
+    for e in &out.events {
+        if e_stream(e) == Some(1) {
+            assert!(matches!(e, Event::Audio { .. }), "{e:?}");
+        }
     }
-    // Video: incomplete exactly for the frames that lost some but not all
-    // of their packets (a frame lost whole has no timestamp to report; its
-    // loss is in the Lost events). Every other frame is delivered exactly
-    // as in the lossless run, or skipped until the next IDR.
+}
+
+fn e_stream(e: &Event) -> Option<usize> {
+    match e {
+        Event::AccessUnit { stream, .. }
+        | Event::Audio { stream, .. }
+        | Event::Lost { stream, .. }
+        | Event::IncompleteFrame { stream, .. }
+        | Event::FrameSkipped { stream, .. }
+        | Event::Discontinuity { stream, .. }
+        | Event::Refused { stream, .. } => Some(stream.index()),
+    }
+}
+
+/// Every dropped packet NACKed (except those never seen), and nothing
+/// that was merely reordered inside the reorder delay.
+fn nacks_exact(out: &Outcome, dropped: &HashSet<Key>, short: &HashSet<Key>) {
+    for k in dropped {
+        assert!(out.nacked.contains(k), "{k:?} NACKed");
+    }
+    for k in short {
+        assert!(!out.nacked.contains(k), "{k:?} reordered, not NACKed");
+    }
+}
+
+/// Video with `lost` never recovered. Loss is reported for exactly the
+/// lost packets the receiver could know of (not `unseen`, before its first
+/// packet); incomplete exactly for the frames that lost some but not all
+/// of their packets (a frame lost whole has no timestamp to report; its
+/// loss is in the Lost events). Every other frame is delivered exactly as
+/// in the lossless run, or skipped until the next IDR.
+fn video_withheld(
+    c: &Capture,
+    base: &Outcome,
+    out: &Outcome,
+    lost: &HashSet<Key>,
+    unseen: &HashSet<Key>,
+) {
+    let want: BTreeSet<u16> = lost
+        .iter()
+        .filter(|k| k.0 == 0 && !unseen.contains(k))
+        .map(|k| k.1)
+        .collect();
+    assert_eq!(lost_set(&out.events, 0), want);
     let base_aus: BTreeMap<u32, AccessUnit> = access_units(&base.events)
         .into_iter()
         .map(|a| (a.timestamp, a))
@@ -611,8 +631,8 @@ fn a12_withheld_retransmissions_report_exactly_their_frames() {
     let mut want_delivered = BTreeSet::new();
     let mut want_skipped = BTreeSet::new();
     let mut awaiting = false;
-    for (ts, seqs) in frames(&c) {
-        let hit = seqs.iter().filter(|s| drop.contains(&(0, **s))).count();
+    for (ts, seqs) in frames(c) {
+        let hit = seqs.iter().filter(|s| lost.contains(&(0, **s))).count();
         if hit > 0 {
             if hit < seqs.len() {
                 want_incomplete.insert(ts);
@@ -627,7 +647,7 @@ fn a12_withheld_retransmissions_report_exactly_their_frames() {
     }
     let mut incomplete = BTreeSet::new();
     let mut skipped = BTreeSet::new();
-    for e in &out.events {
+    for e in out.events.iter().filter(|e| e_stream(e) == Some(0)) {
         match e {
             Event::IncompleteFrame {
                 timestamp, reason, ..
@@ -661,20 +681,35 @@ fn a12_withheld_retransmissions_report_exactly_their_frames() {
     for au in &delivered {
         assert_eq!(au, &base_aus[&au.timestamp]);
     }
-    // A keyframe was asked for at once after each loss.
-    assert!(
-        out.feedback
-            .iter()
-            .filter(|f| matches!(f, Feedback::Pli { .. }))
-            .count()
-            >= 3
-    );
-    // Audio: silence marked as loss fills exactly the withheld packets'
-    // time, and every delivered packet comes through unchanged.
-    let lost_ranges: BTreeSet<u32> = c
+}
+
+/// Audio with `lost` never recovered: loss reported for exactly the lost
+/// packets it could know of, silence marked as loss fills exactly their
+/// time, every delivered packet comes through unchanged, and the timeline
+/// has no holes.
+fn audio_withheld(
+    c: &Capture,
+    base: &Outcome,
+    out: &Outcome,
+    lost: &HashSet<Key>,
+    unseen: &HashSet<Key>,
+) {
+    let want: BTreeSet<u16> = lost
+        .iter()
+        .filter(|k| k.0 == 1 && !unseen.contains(k))
+        .map(|k| k.1)
+        .collect();
+    assert_eq!(lost_set(&out.events, 1), want);
+    let gone: BTreeSet<u32> = c
         .audio
         .iter()
-        .filter(|p| drop.contains(&(1, p.seq)))
+        .filter(|p| lost.contains(&(1, p.seq)))
+        .map(|p| p.ts)
+        .collect();
+    let fill_want: BTreeSet<u32> = c
+        .audio
+        .iter()
+        .filter(|p| lost.contains(&(1, p.seq)) && !unseen.contains(&(1, p.seq)))
         .map(|p| p.ts)
         .collect();
     let audio = audio_frames(&out.events);
@@ -683,7 +718,7 @@ fn a12_withheld_retransmissions_report_exactly_their_frames() {
         .filter(|f| f.kind == FrameKind::Loss)
         .map(|f| f.timestamp)
         .collect();
-    assert_eq!(filled, lost_ranges);
+    assert_eq!(filled, fill_want);
     assert!(audio.iter().all(|f| f.kind != FrameKind::Dtx));
     for f in audio.iter().filter(|f| f.kind == FrameKind::Loss) {
         assert_eq!(
@@ -698,13 +733,187 @@ fn a12_withheld_retransmissions_report_exactly_their_frames() {
         .collect();
     let want: Vec<_> = audio_frames(&base.events)
         .into_iter()
-        .filter(|f| !lost_ranges.contains(&f.timestamp))
+        .filter(|f| !gone.contains(&f.timestamp))
         .collect();
     assert_eq!(media, want);
-    // The timeline has no holes.
     for w in audio.windows(2) {
         assert_eq!(w[0].timestamp.wrapping_add(w[0].duration), w[1].timestamp);
     }
+    for e in out.events.iter().filter(|e| e_stream(e) == Some(1)) {
+        assert!(
+            !matches!(e, Event::Discontinuity { .. } | Event::Refused { .. }),
+            "{e:?}"
+        );
+    }
+}
+
+/// The A1.2 impairments: [`drops`], [`delays`] and [`duplicates`], with
+/// some first retransmissions lost too, so NACKs repeat.
+fn impairments(c: &Capture) -> (Impairments, HashSet<Key>) {
+    let (drop, what) = drops(c);
+    assert_eq!(what.len(), 7);
+    let (delay, short) = delays(c, &drop);
+    assert!(short.iter().any(|k| k.0 == 0) && short.iter().any(|k| k.0 == 1));
+    assert!(delay.len() > short.len());
+    let duplicate = duplicates(c, &drop);
+    let lose_first_resend: HashSet<_> = drop.iter().copied().filter(|k| k.1 % 3 == 0).collect();
+    assert!(!lose_first_resend.is_empty());
+    let imp = Impairments {
+        drop,
+        delay,
+        duplicate,
+        lose_first_resend,
+        ..Impairments::default()
+    };
+    (imp, short)
+}
+
+fn recovered(resend: Resend) {
+    let c = capture();
+    let base = lossless(&c);
+    let (mut imp, short) = impairments(&c);
+    imp.rtx_probes = resend == Resend::Rtx;
+    let out = simulate(&c, &imp, resend);
+    assert_clean(&out.events);
+    video_recovered(&base, &out);
+    audio_recovered(&base, &out);
+    nacks_exact(&out, &imp.drop, &short);
+    // RTT measured from NACK to retransmission: 30 ms here. On the
+    // original SSRC, late originals (15 ms after their NACK) are timed
+    // too, so the estimate can only fall short.
+    assert!(out.receiver.rtt_measured());
+    let rtt = out.receiver.rtt();
+    let low = if resend == Resend::Rtx { 29 } else { 10 };
+    assert!(
+        rtt >= Duration::from_millis(low) && rtt <= Duration::from_millis(31),
+        "{rtt:?}"
+    );
+    let v = out.receiver.stats(StreamId(0)).expect("stats");
+    assert!(v.recovered as usize >= imp.drop.iter().filter(|k| k.0 == 0).count());
+    assert!(v.duplicates > 0);
+    if resend == Resend::Rtx {
+        assert!(v.rtx_padding > 30, "probes interleaved: {}", v.rtx_padding);
+    }
+}
+
+#[test]
+fn a12_every_retransmission_arrives_on_rtx() {
+    recovered(Resend::Rtx);
+}
+
+#[test]
+fn a12_every_retransmission_arrives_on_the_original_ssrc() {
+    recovered(Resend::Original);
+}
+
+#[test]
+fn a12_withheld_retransmissions_report_exactly_their_frames() {
+    let c = capture();
+    let base = lossless(&c);
+    let (mut imp, _) = impairments(&c);
+    imp.lose_first_resend.clear();
+    let out = simulate(&c, &imp, Resend::Never);
+    let none = HashSet::new();
+    video_withheld(&c, &base, &out, &imp.drop, &none);
+    audio_withheld(&c, &base, &out, &imp.drop, &none);
+    // A keyframe was asked for at once after each loss.
+    assert!(
+        out.feedback
+            .iter()
+            .filter(|f| matches!(f, Feedback::Pli { .. }))
+            .count()
+            >= 3
+    );
+}
+
+#[test]
+fn a12_audio_without_nack() {
+    // Video recovers over RTX; audio, with no NACK negotiated, does not,
+    // and its losses are reported and filled exactly.
+    let c = capture();
+    let base = lossless(&c);
+    let (mut imp, short) = impairments(&c);
+    imp.audio_nack_off = true;
+    let out = simulate(&c, &imp, Resend::Rtx);
+    video_recovered(&base, &out);
+    let audio_drops: HashSet<Key> = imp.drop.iter().copied().filter(|k| k.0 == 1).collect();
+    audio_withheld(&c, &base, &out, &audio_drops, &HashSet::new());
+    assert!(out.nacked.iter().all(|k| k.0 == 0), "no audio NACK");
+    let video_drops: HashSet<Key> = imp.drop.iter().copied().filter(|k| k.0 == 0).collect();
+    nacks_exact(&out, &video_drops, &short);
+}
+
+#[test]
+fn a12_loss_inside_an_idr_frame() {
+    // The second IDR's STAP-A (SPS and PPS) and a packet in its middle.
+    let c = capture();
+    let base = lossless(&c);
+    let (ts, seqs) = frames(&c)[15].clone();
+    assert!(access_units(&base.events)[15].idr);
+    let first = c.video.iter().find(|p| p.seq == seqs[0]).expect("first");
+    assert_eq!(first.payload[0] & 0x1f, 24, "the IDR starts with a STAP-A");
+    let drop: HashSet<Key> = [(0, seqs[0]), (0, seqs[seqs.len() / 2])].into();
+    let imp = Impairments {
+        drop: drop.clone(),
+        ..Impairments::default()
+    };
+    let out = simulate(&c, &imp, Resend::Rtx);
+    assert_clean(&out.events);
+    video_recovered(&base, &out);
+    nacks_exact(&out, &drop, &HashSet::new());
+    let out = simulate(&c, &imp, Resend::Never);
+    video_withheld(&c, &base, &out, &drop, &HashSet::new());
+    // The IDR is incomplete, and so every frame after it is skipped.
+    assert!(out.events.iter().any(|e| matches!(
+        e,
+        Event::IncompleteFrame { timestamp, reason: Incomplete::StartLost, .. } if *timestamp == ts
+    )));
+    assert_eq!(out.receiver.stats(StreamId(0)).expect("stats").skipped, 14);
+}
+
+#[test]
+fn a12_the_start_hold() {
+    let c = capture();
+    let base = lossless(&c);
+    // The first packets of each stream arrive behind later ones, inside
+    // the start hold, and the third video packet is lost and NACKed.
+    let delay: BTreeMap<Key, u64> = [
+        ((0, c.video[0].seq), 5 * MS),
+        ((1, c.audio[0].seq), 25 * MS),
+    ]
+    .into();
+    let drop: HashSet<Key> = [(0, c.video[2].seq)].into();
+    let imp = Impairments {
+        drop: drop.clone(),
+        delay,
+        ..Impairments::default()
+    };
+    let out = simulate(&c, &imp, Resend::Rtx);
+    assert_clean(&out.events);
+    video_recovered(&base, &out);
+    audio_recovered(&base, &out);
+    let reordered: HashSet<Key> = [(0, c.video[0].seq), (1, c.audio[0].seq)].into();
+    nacks_exact(&out, &drop, &reordered);
+    // The very first packets lost: the receiver never knew of them, so
+    // nothing is NACKed or reported lost, the first frame (an IDR without
+    // its SPS and PPS) is incomplete, video waits for the next IDR, and
+    // audio starts at its second packet.
+    let first: HashSet<Key> = [(0, c.video[0].seq), (1, c.audio[0].seq)].into();
+    let imp = Impairments {
+        drop: first.clone(),
+        ..Impairments::default()
+    };
+    let out = simulate(&c, &imp, Resend::Rtx);
+    video_withheld(&c, &base, &out, &first, &first);
+    audio_withheld(&c, &base, &out, &first, &first);
+    assert!(out.nacked.is_empty());
+    assert!(matches!(
+        out.events.iter().find(|e| e_stream(e) == Some(0)),
+        Some(Event::IncompleteFrame {
+            reason: Incomplete::StartLost,
+            ..
+        })
+    ));
 }
 
 #[test]
