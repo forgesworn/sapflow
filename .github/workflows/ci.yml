@@ -253,15 +253,54 @@ jobs:
         run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install ffmpeg and SRT tools
+        timeout-minutes: 15
+        shell: bash
         run: |
-          # The hosted image's Azure mirror timed out fetching media packages.
-          for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
-            if [ -f "$source" ]; then
-              sudo sed -i -e 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' -e 's|https://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
+          set -euo pipefail
+          # The runner could not resolve three ubuntu.com archive hosts.
+          # Include kernel.org's Ubuntu mirror in a separate DNS zone, retaining
+          # Ubuntu signatures and bounded downloads. Never retry a dpkg run.
+          . /etc/os-release
+          test "$ID:$VERSION_CODENAME" = ubuntu:noble
+          test "$(dpkg --print-architecture)" = amd64
+          sapflow_apt="$(mktemp -d "$RUNNER_TEMP/sapflow-apt-XXXXXX")"
+          trap 'sudo rm -rf "$sapflow_apt"' EXIT
+          chmod 0755 "$sapflow_apt"
+          mkdir "$sapflow_apt/parts" "$sapflow_apt/archives"
+          apt_options=(
+            -o "Dir::Etc::sourcelist=$sapflow_apt/ubuntu.list"
+            -o "Dir::Etc::sourceparts=$sapflow_apt/parts"
+            -o "Dir::Cache::archives=$sapflow_apt/archives"
+            -o Acquire::Retries=0
+            -o Acquire::http::Timeout=10
+            -o Acquire::https::Timeout=10
+            -o Acquire::Languages=none
+            -o APT::Update::Error-Mode=any
+          )
+          packages=(ffmpeg srt-tools curl python3 openssh-server netcat-openbsd)
+          downloaded=false
+          for mirror in https://mirrors.edge.kernel.org/ubuntu https://archive.ubuntu.com/ubuntu https://security.ubuntu.com/ubuntu; do
+            printf 'Trying authenticated Ubuntu packages from %s\n' "$mirror"
+            for suite in noble noble-updates noble-backports noble-security; do
+              printf 'deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] %s %s main restricted universe multiverse\n' "$mirror" "$suite"
+            done > "$sapflow_apt/ubuntu.list"
+            # An unsuccessful refresh must not reuse an earlier mirror's lists.
+            lists="$(mktemp -d "$sapflow_apt/lists-XXXXXX")"
+            chmod 0755 "$lists"
+            if sudo timeout --kill-after=5s 60s apt-get "${apt_options[@]}" -o "Dir::State::lists=$lists" update &&
+               sudo timeout --kill-after=5s 120s apt-get "${apt_options[@]}" -o "Dir::State::lists=$lists" install --download-only -y --no-install-recommends "${packages[@]}"; then
+              downloaded=true
+              break
             fi
+            printf 'Ubuntu endpoint failed or exceeded its download budget: %s\n' "$mirror" >&2
           done
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends ffmpeg srt-tools curl python3 openssh-server netcat-openbsd
+          if [ "$downloaded" != true ]; then
+            echo 'No Ubuntu mirror completed authenticated package downloads' >&2
+            exit 1
+          fi
+          # All downloads passed APT signature/hash checks. Install once, offline;
+          # only the outer step timeout bounds dpkg, never a mirror retry loop.
+          sudo apt-get "${apt_options[@]}" -o "Dir::State::lists=$lists" install --no-download -y --no-install-recommends "${packages[@]}"
           sudo install -d -m 0755 /run/sshd
           command -v srt-live-transmit ffmpeg ffprobe
       - name: Smoke, viewers on the own event loop

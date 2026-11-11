@@ -9,15 +9,17 @@ sapflow_scratch="$(mktemp -d "$sapflow_root/target/sapflow-ios-origin-XXXXXX")"
 trap 'rm -rf "$sapflow_scratch"' EXIT
 sed '/@testable import SapflowBroadcaster/d; /^final class V4vTypedContractsTests/,$d' "$sapflow_root/mobile/ios/Tests/V4vSessionEngineTests.swift" > "$sapflow_scratch/main.swift"
 sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/OriginObservationTests.swift" >> "$sapflow_scratch/main.swift"
+sed '/@testable import SapflowBroadcaster/d' "$sapflow_root/mobile/ios/Tests/SrtRecoveryPolicyTests.swift" >> "$sapflow_scratch/main.swift"
 cat >> "$sapflow_scratch/main.swift" <<'SWIFT'
 let suite = XCTestSuite(name: "Native origin observation")
 suite.addTest(OriginObservationPolicyTests.defaultTestSuite)
 suite.addTest(OriginObservationPipelineTests.defaultTestSuite)
 suite.addTest(OriginObservationSlotTests.defaultTestSuite)
+suite.addTest(SrtRecoveryPolicyTests.defaultTestSuite)
 suite.run()
-guard let result = suite.testRun, result.executionCount == 50, result.hasSucceeded else { exit(1) }
+guard let result = suite.testRun, result.executionCount == 53, result.hasSucceeded else { exit(1) }
 SWIFT
-sapflow_sources=(AudioShowLifecycle CaptureOrientation CaptureProfile SrtDestination SrtPublishingLimits V4vContracts V4vSessionEngine V4vControlClient V4vLoginContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot)
+sapflow_sources=(AudioShowLifecycle CaptureOrientation CaptureProfile SrtDestination SrtPublishingLimits V4vContracts V4vCreatorContracts V4vSessionEngine V4vControlClient V4vLoginContracts OriginObservationPolicy OriginMediaHTTP OriginMediaDecoder V4vOriginObserver V4vObservationSlot)
 sapflow_files=()
 for sapflow_source in "${sapflow_sources[@]}"; do sapflow_files+=("$sapflow_root/mobile/ios/Sources/$sapflow_source.swift"); done
 swiftc -swift-version 5 -warnings-as-errors -module-cache-path "$sapflow_scratch/module-cache" -F "$sapflow_frameworks" -I "$sapflow_testlibs" -L "$sapflow_testlibs" \

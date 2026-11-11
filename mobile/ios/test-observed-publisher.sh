@@ -14,6 +14,7 @@ sed '/^final class V4vTypedContractsTests/,$d' "$sapflow_root/mobile/ios/Tests/V
 cp "$sapflow_root/mobile/ios/Tests/OriginObservationTests.swift" "$sapflow_scratch/Tests/NativePublisherTests/OriginObservationTests.swift"
 cp "$sapflow_root/mobile/ios/Tests/V4vObservedPublisherTests.swift" "$sapflow_scratch/Tests/NativePublisherTests/V4vObservedPublisherTests.swift"
 cp "$sapflow_root/mobile/ios/Tests/PublishingTelemetryTests.swift" "$sapflow_scratch/Tests/NativePublisherTests/PublishingTelemetryTests.swift"
+cp "$sapflow_root/mobile/ios/Tests/SrtRecoveryPolicyTests.swift" "$sapflow_scratch/Tests/NativePublisherTests/SrtRecoveryPolicyTests.swift"
 python3 - "$sapflow_root" "$sapflow_scratch" <<'PY'
 import json,sys
 from pathlib import Path

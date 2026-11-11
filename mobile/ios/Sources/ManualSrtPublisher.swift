@@ -2,6 +2,21 @@ import Foundation
 import Network
 import Sapflow
 
+/// Internal facts only: a request is not proof of the negotiated buffer time.
+struct SrtRecoveryDiagnostics: Equatable {
+    let requestedLatencyMs: UInt32
+    let maxPacketAgeMs: UInt32
+    private(set) var negotiatedLatencyMs: UInt32?
+
+    init(policy: SrtRecoveryPolicy) {
+        requestedLatencyMs = policy.requestedLatencyMs
+        maxPacketAgeMs = policy.maxPacketAgeMs
+    }
+    mutating func observe(_ event: NativeSrtEvent) {
+        if case let .connected(latencyMs, _) = event { negotiatedLatencyMs = latencyMs }
+    }
+}
+
 /// Network.framework owns one connected UDP socket. Rust owns MPEG-TS, SRT,
 /// encryption, pacing, ACK/retry windows and deadlines. The prepared track set
 /// and immutable codec handles are fixed for this attempt.
@@ -15,6 +30,8 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private let observe: (PublishingAttemptEvent, UInt64) -> Void
     private let destination: ManualSrtDestination
     private let limits: SrtPublishingLimits
+    private let recoveryPolicy: SrtRecoveryPolicy
+    private var recoveryDiagnostics: SrtRecoveryDiagnostics // published under lock
     private let hasVideo: Bool
     private let outputAuthority: AudioShowOutputAuthority?
     private let queue = DispatchQueue(label: "sapflow.manual-srt", qos: .userInitiated)
@@ -47,12 +64,23 @@ final class ManualSrtPublisher: EncodedPublishingSink {
     private var finalCounters: SocketOutboundSample? // published under lock at actual close
 
     init(destination: ManualSrtDestination, limits: SrtPublishingLimits = .manual, hasVideo: Bool = true,
-         outputAuthority: AudioShowOutputAuthority? = nil, observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) {
+         outputAuthority: AudioShowOutputAuthority? = nil, recoveryPolicy: SrtRecoveryPolicy = .mobile,
+         observe: @escaping (PublishingAttemptEvent, UInt64) -> Void = { _, _ in }) {
         self.destination = destination; self.limits = limits; self.hasVideo = hasVideo; self.observe = observe; self.outputAuthority = outputAuthority
+        self.recoveryPolicy = recoveryPolicy
+        recoveryDiagnostics = SrtRecoveryDiagnostics(policy: recoveryPolicy)
     }
     deinit { timer.cancel(); connection?.cancel(); try? publisher?.stop(nowUs: Self.nowUs()) }
     var cleanupComplete: Bool { lock.lock(); defer { lock.unlock() }; return released }
     var status: String { lock.lock(); defer { lock.unlock() }; return currentStatus }
+    var recoverySnapshot: SrtRecoveryDiagnostics { lock.lock(); defer { lock.unlock() }; return recoveryDiagnostics }
+    var nativeConfig: NativeSrtConfig {
+        NativeSrtConfig(destination: destination.socketAddress, streamId: destination.streamID,
+            cipher: destination.encrypted ? .aes256 : nil, latencyMs: recoveryPolicy.requestedLatencyMs,
+            maxBufferedPackets: 128, maxBufferedBytes: limits.queueBytes,
+            maxPacketAgeMs: recoveryPolicy.maxPacketAgeMs, maxSampleResidenceMs: 1000,
+            bandwidthBytesPerSecond: limits.bandwidthBytesPerSecond)
+    }
     var finalSocketOutbound: SocketOutboundSample? { lock.lock(); defer { lock.unlock() }; return finalCounters }
     func readSocketOutbound(completion: @escaping (SocketOutboundSample?) -> Void) {
         queue.async {
@@ -69,6 +97,7 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         let token = generation
         admission.close(); admission = EncodedWorkBudget(bytes: Int(limits.queueBytes), count: 128, span: 1)
         accepting = true; released = false; finalCounters = nil; currentStatus = "Preparing SRT UDP caller · single attempt"
+        recoveryDiagnostics = SrtRecoveryDiagnostics(policy: recoveryPolicy)
         lock.unlock()
         queue.async {
             guard self.isCurrent(token), self.isAccepting() else { return }
@@ -130,13 +159,9 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         guard let audio, !hasVideo || video != nil else {
             setStatus(token, hasVideo ? "Waiting for encoded video/audio configuration · local recording active" : "Waiting for encoded audio configuration · local recording active"); return
         }
-        let config = NativeSrtConfig(destination: destination.socketAddress, streamId: destination.streamID,
-            cipher: destination.encrypted ? .aes256 : nil, latencyMs: 120,
-            maxBufferedPackets: 128, maxBufferedBytes: limits.queueBytes,
-            maxPacketAgeMs: 1000, maxSampleResidenceMs: 1000, bandwidthBytesPerSecond: limits.bandwidthBytesPerSecond)
         // Foreign String/Data copies cannot promise zeroisation. The Rust key
         // owner zeroises its transferred secret; no credential is logged here.
-        publisher = try NativeSrtPublisher(config: config, video: video, audio: audio,
+        publisher = try NativeSrtPublisher(config: nativeConfig, video: video, audio: audio,
             passphrase: destination.passphrase.map { Data($0.utf8) }, nowUs: Self.nowUs())
         connectDeadlineUs = nil
         setStatus(token, "SRT handshake · playback unconfirmed")
@@ -255,6 +280,9 @@ final class ManualSrtPublisher: EncodedPublishingSink {
         guard let publisher else { return false }
         for _ in 0..<8 {
             guard let event = try publisher.pollEvent() else { break }
+            lock.lock()
+            if token == generation { recoveryDiagnostics.observe(event) }
+            lock.unlock()
             switch event {
             case .connected:
                 connected = true

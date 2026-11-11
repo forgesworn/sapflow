@@ -281,9 +281,30 @@ follows the observed behaviour.
   which libsrt prints as `PREDEFINED:401`. srt-tokio sent 400, 401, 402
   (overload, and our throttle), 404 and 409 for sapflow's refusals;
   sapflow-srt sends the same.
-- **Observed:** a libsrt receiver sends a full ACK at most every 10 ms and
-  only when the acknowledged position has moved (the specification reads
-  as every 10 ms); keepalives every second when idle, both ways.
+- **Observed:** with feedback delivered, a libsrt receiver sends a full
+  ACK at most every 10 ms when the acknowledged position moves; keepalives
+  every second when idle, both ways. A separate libsrt 1.5.4 loopback probe
+  (2026-11-11) suppressed the first ACK for one final data packet: the
+  receiver repeated that same position 303.249 ms later, then stopped after
+  ACKACK. This qualifies the earlier observation, which did not lose ACKs.
+- **Feedback recovery:** draft-sharabayko-srt-01 §4.8.1 requires repeating
+  an ACK position until ACKACK confirms it. Sapflow sends new progress on
+  the 10 ms SYN interval and repeats an unchanged, unconfirmed position
+  after `max(10 ms, RTT + 4 * RTTVar)`. This bounded repeat policy matches
+  the default approximately 300 ms black-box observation and avoids a
+  persistent 100 Hz timer for sparse traffic with lost feedback. Retained
+  ACK numbers identify their exact data positions; confirming an older
+  position cannot suppress newer progress, and a light ACK cannot suppress
+  a later full ACK. A virtual-time caller/listener regression reproduces
+  the former failure: losing one final ACK left delivered data unconfirmed
+  until the caller reached its retry limit.
+- **Sender timeout eligibility:** §5.1.2 defines RTO relative to a packet's
+  transmission. A connection-wide alarm now queues only packets whose
+  latest transmission is at least one base RTO old, preserving immediate
+  NAK handling and connection backoff. A virtual-time regression previously
+  retransmitted a 12 ms-old packet at a 320 ms connection timeout, even
+  after an advancing ACK removed the older packet. These feedback fixes
+  do not establish the cause of earlier physical recording discards.
 - **Observed:** its first RTT sample replaces the starting 100 ms / 50 ms:
   the ACK after the first ACKACK reports that sample as the RTT and half
   of it as the variance. Later samples are smoothed as specified (7/8,
@@ -319,6 +340,46 @@ follows the observed behaviour.
   in time. On the recorded 200 ms session under 20% loss it delivered 57
   packets where libsrt's receiver and sapflow-srt delivered the same 59
   (`crates/sapflow-srt/tests/differential.rs`).
+
+### Mobile SRT recovery budget
+
+The Android and iOS publishers request a 1,000 ms recovery buffer by default,
+replacing their earlier 120 ms request. This adds 880 ms of requested buffering
+to allow more time for delayed originals and retransmissions. It is a mobile
+transport policy; the shared SRT library's default remains 120 ms.
+
+Each publisher receives an immutable request in the range 1 to 1,000 ms. Packet
+retention is `max(1000, ceil(5 * requested_ms / 4))` milliseconds, bounded at
+1,250 ms. This follows the sender drop-threshold recommendation in the
+[public SRT draft, section 4.6](https://datatracker.ietf.org/doc/html/draft-sharabayko-srt-01#section-4.6),
+an archived Internet-Draft rather than an IETF standard. The 128-packet/4-MiB
+transport bounds, one-second SDK sample residence and pacing limits remain
+unchanged. The peer may negotiate a larger receive buffer; diagnostics report
+the actual value, but negotiation does not increase these local retention or
+memory limits. A longer negotiated buffer therefore does not promise matching
+sender retransmission history. Imports, saved destination formats and V4V
+authority grants do not acquire a new field.
+
+Stop remains immediate cancellation, not a promise to drain the remote player's
+buffer. Sapflow's receiver flushes held packets when it receives SHUTDOWN; an
+independent live receiver can discard media whose playback time has not arrived.
+The desktop adapter fixtures therefore wait for the actual negotiated latency
+plus a bounded scheduling margin before cancelling, and still require the full
+received frame count and decode. In the matched Android host check, the old
+500 ms wait at a negotiated 1,000 ms delivered 166 of 180 video frames; a
+1,250 ms wait delivered all 180. This fixture settling does not change application
+Stop, authority revocation, or production teardown deadlines.
+
+Physical tests with the 120 ms request produced both complete and incomplete
+recordings. One metadata trace measured recovery taking up to 466 ms. A later
+instrumented run completed without drops: all 42,298 original packets reached
+Java socket submission within 57.8 ms of native enqueue, with no zero-byte or
+partial writes. That passing run did not reproduce the earlier loss or establish
+another scheduler defect. Delay after socket submission can include the sending
+kernel, network and receiver-host scheduling. These observations motivate testing
+a larger recovery budget; they are not a controlled performance comparison or a
+guarantee of complete recording under arbitrary conditions. Expired gaps must
+still mark the recording incomplete.
 
 ## Related
 
