@@ -58,17 +58,27 @@ pub const MAX_WINDOW_ENTRIES: usize = 256;
 /// limit.
 const MAX_EXTRA_WINDOW_BYTES: usize = MAX_SEGMENT_BYTES;
 
-/// Part bytes the muxer may keep for segments that have left the live
-/// window, so a part stays fetchable for three target durations after its
-/// tag leaves the playlist (RFC 8216bis 6.2.2): one segment's limit. Past
-/// it, or past [`MAX_RETAINED_PARTS`], the oldest go early and
-/// [`Muxer::parts_released_early`] counts them.
+/// Bytes the muxer may keep for segments that have left the live window,
+/// so a part stays fetchable for three target durations after its tag
+/// leaves the playlist, and the segment for its Availability Duration
+/// (RFC 8216bis 6.2.2): one segment's limit. A segment and its parts share
+/// their bytes, which count once. Past it, or past [`MAX_RETAINED_PARTS`]
+/// or [`MAX_RETAINED_SEGMENTS`], the oldest go early and
+/// [`Muxer::parts_released_early`] and [`Muxer::segments_released_early`]
+/// count them.
 const MAX_RETAINED_BYTES: usize = MAX_SEGMENT_BYTES;
 
 /// Parts the muxer may keep for segments that have left the live window,
 /// for the same rule: three target durations of 20 ms parts at a target
 /// of up to 27 s.
 pub const MAX_RETAINED_PARTS: usize = 4096;
+
+/// Segments the muxer may keep after they leave the live window, so each
+/// stays fetchable for its Availability Duration after it first appeared
+/// (RFC 8216bis 6.2.2): four windows at [`MAX_WINDOW_ENTRIES`]. A kept
+/// segment and its kept parts share their bytes, which count once towards
+/// the same 64 MiB.
+pub const MAX_RETAINED_SEGMENTS: usize = 4 * MAX_WINDOW_ENTRIES;
 
 /// Pending AAC plus samples in the current unsealed video-led part.
 /// A count bound also covers tiny payloads and repeated timestamps.
@@ -111,9 +121,10 @@ pub struct MuxerConfig {
     /// three target durations (RFC 8216bis 6.2.2's segment rule), up to
     /// [`MAX_WINDOW_ENTRIES`] entries and 64 MiB of media beyond these.
     /// A segment's parts stay fetchable for three target durations of
-    /// published media after their tags leave the playlist (6.2.2's part
-    /// rule), whatever this is, within [`MAX_RETAINED_PARTS`] parts and
-    /// 64 MiB beyond the window.
+    /// published media after their tags leave the playlist, and a removed
+    /// segment for its Availability Duration (6.2.2), whatever this is,
+    /// within [`MAX_RETAINED_PARTS`] parts, [`MAX_RETAINED_SEGMENTS`]
+    /// segments and 64 MiB beyond the window.
     pub segment_count: usize,
 }
 
@@ -224,9 +235,10 @@ pub struct Segment {
     pub data: SegmentData,
 }
 
-/// A real segment from its entry until its parts are freed: when its part
-/// tags left the playlist, and what it holds.
-#[derive(Debug, Clone, Copy)]
+/// A real segment from its entry until its parts and the segment itself are
+/// freed: when its part tags left the playlist, when it first appeared and
+/// the longest playlist that listed it, and what it holds.
+#[derive(Debug, Clone)]
 struct Tagged {
     /// Its media sequence number.
     msn: u64,
@@ -234,6 +246,17 @@ struct Tagged {
     end_part: u64,
     /// The published edge when the playlist stopped listing its parts.
     left: Option<Duration>,
+    /// The published edge when it first appeared in the playlist.
+    appeared: Duration,
+    /// Its `EXTINF` duration.
+    duration: Duration,
+    /// The longest playlist, as a total of `EXTINF`, that has listed it.
+    longest: Duration,
+    /// Kept after it leaves the window, until its Availability Duration
+    /// has passed.
+    segment: Option<Arc<Segment>>,
+    /// Its parts have been freed.
+    parts_freed: bool,
     bytes: usize,
     parts: usize,
 }
@@ -447,11 +470,15 @@ pub struct Muxer {
     /// Each real segment from its entry until its parts are freed, oldest
     /// first.
     tagged: VecDeque<Tagged>,
-    /// Bytes and parts kept for segments that have left the window.
-    retained: (usize, usize),
+    /// Bytes, parts and segments kept for segments that have left the
+    /// window.
+    retained: (usize, usize, usize),
     /// Parts freed before three target durations had passed since their
     /// tags left, because a cap or the fragment budget needed the room.
     parts_released_early: u64,
+    /// Segments freed before their Availability Duration had passed, for
+    /// the same reasons.
+    segments_released_early: u64,
     next_segment: Option<OpenSegment>,
     part: Option<OpenPart>,
     next_part_id: u64,
@@ -624,8 +651,9 @@ impl Muxer {
             parts: VecDeque::new(),
             published: Duration::ZERO,
             tagged: VecDeque::new(),
-            retained: (0, 0),
+            retained: (0, 0, 0),
             parts_released_early: 0,
+            segments_released_early: 0,
             next_segment: None,
             part: None,
             next_part_id: 0,
@@ -671,6 +699,7 @@ impl Muxer {
             tagged,
             retained,
             parts_released_early,
+            segments_released_early,
             next_segment,
             part,
             next_part_id,
@@ -720,6 +749,23 @@ impl Muxer {
             })
             .collect();
         let parts: Vec<_> = parts.iter().map(sealed).collect();
+        let tagged: Vec<_> = tagged
+            .iter()
+            .map(|t| {
+                (
+                    t.msn,
+                    t.end_part,
+                    t.left,
+                    t.appeared,
+                    t.duration,
+                    t.longest,
+                    t.segment.as_ref().map(|s| (s.id, s.data.len())),
+                    t.parts_freed,
+                    t.bytes,
+                    t.parts,
+                )
+            })
+            .collect();
         let next_segment = next_segment.as_ref().map(|s| {
             (
                 s.initialization.id,
@@ -752,7 +798,8 @@ impl Muxer {
             "{cfg:?} {video:?} {audio:?} {audio_run:?} {audio_end:?} {} {} \
              {fragment_refused} {epoch_first_part_id} {:?} {:?} {entries:?} \
              {media_sequence} {parts:?} {published:?} {tagged:?} {retained:?} \
-             {parts_released_early} {next_segment:?} {part:?} {next_part_id} \
+             {parts_released_early} {segments_released_early} {next_segment:?} \
+             {part:?} {next_part_id} \
              {timing:?} {learning:?} {target:?} {offset} {rebase_to:?} \
              {presented_end:?} {audio_floor} {discontinuity_next} \
              {discontinuity_sequence} {breaks} {hold_gap} {window_byte_capped}",
@@ -776,13 +823,23 @@ impl Muxer {
 
     /// Parts freed before three target durations had passed since their
     /// tags left the playlist (RFC 8216bis 6.2.2), since the stream began:
-    /// kept past the window, they went early because more than 64 MiB or
-    /// [`MAX_RETAINED_PARTS`] were kept, or because new media needed their
-    /// room under the fragment budget. Zero while every part removed from
+    /// kept past the window, they went early because more than 64 MiB,
+    /// [`MAX_RETAINED_PARTS`] parts or [`MAX_RETAINED_SEGMENTS`] segments
+    /// were kept, or because new media needed their room under the
+    /// fragment budget. Zero while every part removed from
     /// the playlist stays fetchable for three target durations of
     /// published media.
     pub fn parts_released_early(&self) -> u64 {
         self.parts_released_early
+    }
+
+    /// Segments freed before their Availability Duration had passed since
+    /// they first appeared in the playlist (RFC 8216bis 6.2.2), since the
+    /// stream began, for the same reasons as
+    /// [`Muxer::parts_released_early`]. Zero while every removed segment
+    /// stays fetchable for that long in published media.
+    pub fn segments_released_early(&self) -> u64 {
+        self.segments_released_early
     }
 
     /// The current video configuration, or `None` for an audio-only epoch.
@@ -923,15 +980,21 @@ impl Muxer {
     }
 
     /// The init segment of codec epoch `id`, if it is the current one or a part
-    /// still served uses it.
+    /// or segment still served uses it.
     pub fn initialization(&self, id: u64) -> Option<&Bytes> {
         if self.init.id == id {
             return Some(&self.init.data);
         }
         self.parts
             .iter()
-            .find(|part| part.initialization.id == id)
-            .map(|part| &part.initialization.data)
+            .map(|part| &part.initialization)
+            .chain(
+                self.tagged
+                    .iter()
+                    .filter_map(|t| t.segment.as_ref().map(|s| &s.initialization)),
+            )
+            .find(|init| init.id == id)
+            .map(|init| &init.data)
     }
 
     /// The id of the current codec epoch.
@@ -2145,13 +2208,22 @@ impl Muxer {
         from
     }
 
-    /// RFC 8216bis 6.2.2: "Clients MUST be able to download the Partial
-    /// Segment for at least three Target Durations after the EXT-X-PART tag
-    /// is removed from the Playlist." Stamps each segment whose part tags
-    /// the playlist has stopped listing with the published edge, then frees
-    /// the parts of segments that have left the window once the edge is
-    /// three target durations past that stamp, or sooner, oldest first, while
-    /// more than [`MAX_RETAINED_BYTES`] or [`MAX_RETAINED_PARTS`] are kept.
+    /// RFC 8216bis 6.2.2 (drafts 19 and 22): "Clients MUST be able to
+    /// download the Partial Segment for at least three Target Durations
+    /// after the EXT-X-PART tag is removed from the Playlist", and, for a
+    /// playlist without `EXT-X-ENDLIST` (sapflow never writes one), "clients
+    /// MUST be able to download the segment until the time at which it first
+    /// appeared in the Playlist plus the segment's Availability Duration",
+    /// "the duration of the segment plus the duration of the longest-duration
+    /// Playlist distributed by the server containing that segment".
+    ///
+    /// Time is the published edge. Stamps each segment whose part tags the
+    /// playlist has stopped listing; frees, in id order, the parts of
+    /// segments out of the window once the edge is three target durations
+    /// past that stamp; drops each segment out of the window once the edge
+    /// is past its appearance plus its Availability Duration. Past
+    /// [`MAX_RETAINED_BYTES`], [`MAX_RETAINED_PARTS`] or
+    /// [`MAX_RETAINED_SEGMENTS`], the oldest go early.
     fn retain_parts(&mut self) {
         let edge = self.edge();
         let listed_from = self.media_sequence + self.part_tags_from() as u64;
@@ -2162,51 +2234,94 @@ impl Muxer {
             t.left.get_or_insert(edge);
         }
         let window = self.part_window();
-        while let Some(t) = self.tagged.front() {
+        for i in 0..self.tagged.len() {
+            let t = &self.tagged[i];
             if t.msn >= self.media_sequence {
                 break;
             }
-            let expired = t
+            if t.parts_freed {
+                continue;
+            }
+            if !t
                 .left
-                .is_some_and(|left| edge >= left.saturating_add(window));
-            let (bytes, parts) = self.retained;
-            if !expired && bytes <= MAX_RETAINED_BYTES && parts <= MAX_RETAINED_PARTS {
+                .is_some_and(|left| edge >= left.saturating_add(window))
+            {
                 break;
             }
-            if !expired {
-                self.parts_released_early += t.parts as u64;
-            }
-            self.release_oldest();
+            let (end_part, parts) = (t.end_part, t.parts);
+            self.free_parts_before(end_part);
+            self.tagged[i].parts_freed = true;
+            self.retained.1 -= parts;
         }
+        for t in &mut self.tagged {
+            if t.msn >= self.media_sequence {
+                break;
+            }
+            let available_until = t
+                .appeared
+                .saturating_add(t.duration)
+                .saturating_add(t.longest);
+            if t.segment.is_some() && edge >= available_until {
+                t.segment = None;
+                self.retained.2 -= 1;
+            }
+        }
+        while self
+            .tagged
+            .front()
+            .is_some_and(|t| t.msn < self.media_sequence && t.parts_freed && t.segment.is_none())
+        {
+            if let Some(t) = self.tagged.pop_front() {
+                self.retained.0 -= t.bytes;
+            }
+        }
+        while (self.retained.0 > MAX_RETAINED_BYTES
+            || self.retained.1 > MAX_RETAINED_PARTS
+            || self.retained.2 > MAX_RETAINED_SEGMENTS)
+            && self.release_oldest()
+        {}
     }
 
-    /// Frees the oldest kept segment's parts, by id: parts left by a
-    /// segment that never entered the window go with the next one.
-    fn release_oldest(&mut self) {
-        let Some(t) = self.tagged.pop_front() else {
-            return;
-        };
-        if t.msn < self.media_sequence {
-            self.retained.0 -= t.bytes;
-            self.retained.1 -= t.parts;
-        }
-        while self.parts.front().is_some_and(|p| p.id < t.end_part) {
+    /// Frees every part with an id below `end`. Parts left by a segment
+    /// that never entered the window go with the next one.
+    fn free_parts_before(&mut self, end: u64) {
+        while self.parts.front().is_some_and(|p| p.id < end) {
             self.parts.pop_front();
         }
     }
 
-    /// Frees every part kept for a segment that has left the window, before
-    /// its time, so that new media is admitted under the fragment budget.
-    /// Returns whether anything was freed.
-    fn release_retained(&mut self) -> bool {
-        let mut released = false;
-        while self
+    /// Frees the oldest segment kept past the window, and its parts, before
+    /// their time, and counts what went early. Returns whether there was one.
+    fn release_oldest(&mut self) -> bool {
+        if !self
             .tagged
             .front()
             .is_some_and(|t| t.msn < self.media_sequence)
         {
-            self.parts_released_early += self.tagged.front().map_or(0, |t| t.parts as u64);
-            self.release_oldest();
+            return false;
+        }
+        let Some(t) = self.tagged.pop_front() else {
+            return false;
+        };
+        if !t.parts_freed {
+            self.parts_released_early += t.parts as u64;
+            self.retained.1 -= t.parts;
+            self.free_parts_before(t.end_part);
+        }
+        if t.segment.is_some() {
+            self.segments_released_early += 1;
+            self.retained.2 -= 1;
+        }
+        self.retained.0 -= t.bytes;
+        true
+    }
+
+    /// Frees everything kept for segments that have left the window, before
+    /// its time, so that new media is admitted under the fragment budget.
+    /// Returns whether anything was freed.
+    fn release_retained(&mut self) -> bool {
+        let mut released = false;
+        while self.release_oldest() {
             released = true;
         }
         released
@@ -2247,6 +2362,11 @@ impl Muxer {
             msn: seg.id,
             end_part: seg.parts.last().map_or(self.next_part_id, |p| p.id + 1),
             left: None,
+            appeared: self.published,
+            duration: seg.duration,
+            longest: Duration::ZERO,
+            segment: None,
+            parts_freed: false,
             bytes: seg.data.len(),
             parts: seg.parts.len(),
         });
@@ -2292,17 +2412,31 @@ impl Muxer {
                 self.window_byte_capped = true;
             }
             if let Some(Entry::Segment(old)) = self.entries.pop_front() {
-                // Its parts stay until three target durations after their
-                // tags left the playlist (`retain_parts`).
-                if let Some(t) = self.tagged.iter().find(|t| t.msn == old.id) {
-                    self.retained.0 += t.bytes;
-                    self.retained.1 += t.parts;
-                }
                 if old.discontinuity {
                     self.discontinuity_sequence += 1;
                 }
+                // It and its parts stay until RFC 8216bis 6.2.2 lets them
+                // go (`retain_parts`).
+                if let Some(t) = self.tagged.iter_mut().find(|t| t.msn == old.id) {
+                    self.retained.0 += t.bytes;
+                    self.retained.1 += t.parts;
+                    self.retained.2 += 1;
+                    t.segment = Some(old);
+                }
             }
             self.media_sequence += 1;
+        }
+        // The playlist now distributed lists every entry left: the longest
+        // playlist each listed segment has been in.
+        let total = self
+            .entries
+            .iter()
+            .fold(Duration::ZERO, |sum, e| sum.saturating_add(e.duration()));
+        for t in self.tagged.iter_mut().rev() {
+            if t.msn < self.media_sequence {
+                break;
+            }
+            t.longest = t.longest.max(total);
         }
         if self.window_byte_capped {
             let listed: u64 = self
@@ -2466,10 +2600,17 @@ impl Muxer {
         }
     }
 
-    /// The real segment with media sequence number `id`; `None` for a gap or a
-    /// number outside the window.
+    /// The real segment with media sequence number `id`, in the window or
+    /// still kept for its Availability Duration after leaving it (RFC 8216bis
+    /// 6.2.2); `None` for a gap or any other number.
     pub fn segment(&self, id: u64) -> Option<Arc<Segment>> {
-        let idx = id.checked_sub(self.media_sequence)?;
+        let Some(idx) = id.checked_sub(self.media_sequence) else {
+            return self
+                .tagged
+                .iter()
+                .find(|t| t.msn == id)
+                .and_then(|t| t.segment.clone());
+        };
         match self.entries.get(idx as usize)? {
             Entry::Segment(s) => Some(s.clone()),
             Entry::Gap { .. } => None,
@@ -3598,7 +3739,11 @@ pub(crate) mod tests {
         // 40 segments + 7 gaps produced, 24 kept.
         assert_eq!(m.media_sequence(), 47 - 24);
         assert!(m.entries().iter().all(|e| matches!(e, Entry::Segment(_))));
-        assert!(m.segment(m.media_sequence() - 1).is_none());
+        // The segment removed last is still served for its Availability
+        // Duration (RFC 8216bis 6.2.2): 1 s plus the 24 s playlist since it
+        // appeared. The one before has had it.
+        assert!(m.segment(m.media_sequence() - 1).is_some());
+        assert!(m.segment(m.media_sequence() - 2).is_none());
         let first = m.segment(m.media_sequence()).expect("oldest kept");
         match m.part(first.parts[0].id) {
             PartLookup::Found(p) => assert_eq!(p.id, first.parts[0].id),
