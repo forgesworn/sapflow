@@ -567,7 +567,16 @@ fn receive(
 async fn listen(listener: TcpListener, app: Arc<App>, whip: Arc<Whip>) -> std::io::Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS));
     loop {
-        let (socket, peer) = listener.accept().await?;
+        let (socket, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // Out of file descriptors, or a connection reset before it was
+            // taken: not the end of WHIP, nor of the server.
+            Err(error) => {
+                tracing::warn!(%error, "WHIP accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             continue;
         };
