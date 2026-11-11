@@ -10,4 +10,4 @@ extensions), RFC 3711 (SRTP), RFC 7714 (AES-GCM) and RFC 5764 section 4.2
 (DTLS-SRTP keys). No source of another RTP, RTCP or SRTP implementation was
 read. FFmpeg is used only as a black box, to capture test traffic.
 
-Work in progress: RTP and RTCP packets so far.
+Work in progress: RTP and RTCP packets, SRTP and SRTCP so far.

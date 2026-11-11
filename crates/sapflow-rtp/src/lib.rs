@@ -12,6 +12,8 @@
 //! - [`rtp`]: a zero-copy view of an RTP packet, with RFC 8285 extensions.
 //! - [`rtcp`]: compound packet parsing, and [`rtcp::build`] for the receiver
 //!   reports and feedback sapflow sends.
+//! - [`srtp`]: SRTP and SRTCP in `SRTP_AES128_CM_HMAC_SHA1_80` and
+//!   `SRTP_AEAD_AES_128_GCM`, DTLS-SRTP key splitting, replay windows.
 //!
 //! Every byte that arrives is hostile until it authenticates, and the
 //! parsers stay careful after that: nothing indexes without a bound or
@@ -32,6 +34,11 @@
 
 pub mod rtcp;
 pub mod rtp;
+pub mod srtp;
 
 pub use rtcp::{Compound, Packet, RtcpError};
 pub use rtp::{RtpError, RtpPacket};
+pub use srtp::{
+    Config, DtlsSrtpKeys, Inbound, MasterKey, Outbound, Profile, Role, SrtpError,
+    split_keying_material,
+};
