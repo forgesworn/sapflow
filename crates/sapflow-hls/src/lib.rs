@@ -34,6 +34,9 @@ mod aac_golden_tests;
 mod audio_only_tests;
 
 #[cfg(test)]
+mod opus_real_tests;
+
+#[cfg(test)]
 mod terminal_ts_tests;
 
 #[cfg(test)]
