@@ -33,6 +33,7 @@
     )
 )]
 
+pub mod h264;
 pub mod rtcp;
 pub mod rtp;
 pub mod srtp;
