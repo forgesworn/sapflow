@@ -359,18 +359,16 @@ async fn own_udp(
             armed = deadline;
         }
         tokio::select! {
-            r = socket.recv_from(&mut buf) => {
-                let (n, peer) = r?;
-                if let Some(datagram) = buf.get(..n) {
-                    let routed = router.handle_datagram(Instant::now(), Tuple::udp(peer), datagram);
-                    if let Some(id) = routed
-                        && matches!(classify(datagram), Kind::Rtp | Kind::Rtcp)
-                        && let Some(feed) = feeds.get_mut(&id)
-                    {
-                        feed.received += n;
+            r = socket.recv_from(&mut buf) => match r {
+                Ok((n, peer)) => {
+                    if let Some(datagram) = buf.get(..n) {
+                        receive(&mut router, &mut feeds, Tuple::udp(peer), datagram);
                     }
                 }
-            }
+                // As for SRT: one failed receive is not the end of WHIP, and
+                // never of the server.
+                Err(error) => tracing::debug!(%error, "WHIP receive failed"),
+            },
             () = &mut timer, if armed.is_some() => {
                 armed = None;
                 router.handle_timeout(Instant::now());
@@ -422,6 +420,34 @@ async fn own_udp(
             router.close(&id, Instant::now());
             feeds.remove(&id);
         }
+    }
+}
+
+/// One datagram into the router. Only SRTP and SRTCP the session
+/// authenticated count against its publisher's bitrate cap, so bytes
+/// spoofed from its tuple cannot push it over.
+fn receive(
+    router: &mut Router,
+    feeds: &mut HashMap<SessionId, Feed>,
+    tuple: Tuple,
+    datagram: &[u8],
+) {
+    let authenticated = |s: &Session| {
+        let st = s.stats();
+        st.srtp_packets + st.srtcp_packets
+    };
+    let before = matches!(classify(datagram), Kind::Rtp | Kind::Rtcp)
+        .then(|| router.owner(&tuple))
+        .flatten()
+        .and_then(|id| router.session(&id).map(|s| (id, authenticated(s))));
+    router.handle_datagram(Instant::now(), tuple, datagram);
+    if let Some((id, count)) = before
+        && router
+            .session(&id)
+            .is_some_and(|s| authenticated(s) > count)
+        && let Some(feed) = feeds.get_mut(&id)
+    {
+        feed.received += datagram.len();
     }
 }
 
