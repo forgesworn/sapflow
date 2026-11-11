@@ -19,6 +19,7 @@
 //! - [`sdp`]: [`sdp::Offer::parse`] and [`sdp::answer`].
 //! - [`framing`]: RFC 4571 frames.
 //! - [`resource`]: tokens, session IDs, refusals and `Location`.
+//! - [`session`]: the [`Session`].
 //!
 //! Sans-IO: nothing here owns a socket, a clock or a thread. Every byte that
 //! arrives is hostile: nothing indexes without a bound or trusts a length,
@@ -43,7 +44,10 @@ pub mod framing;
 pub mod ice;
 pub mod resource;
 pub mod sdp;
+pub mod session;
 pub mod stun;
+#[cfg(test)]
+mod tests;
 
 #[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
@@ -51,3 +55,6 @@ pub mod testing;
 
 pub use entropy::EntropyError;
 pub use ice::{Credentials, IceConfig, Transport, Tuple};
+pub use session::{
+    EndReason, Event, Session, SessionConfig, SessionError, SessionStats, State, Transmit,
+};
