@@ -22,6 +22,7 @@ pub struct LiveStream {
     state: Mutex<State>,
     session: Mutex<Session>,
     version: watch::Sender<u64>,
+    pub(crate) http_notifications: crate::own_http::StreamNotifications,
     fragments: Arc<sapflow_core::fragment::FragmentQuota>,
     // Drop after cached state and session: reservation follows the final stream
     // owner, including publications, grace tasks and parked viewer requests.
@@ -138,6 +139,8 @@ pub struct State {
     pub prefix: String,
     pub closed: bool,
     pub media: Option<Bytes>,
+    /// Rendered only on demand, then shared until the next media update.
+    conventional_media: Option<Bytes>,
     pub multivariant: Option<Bytes>,
 }
 
@@ -247,7 +250,27 @@ fn prefix_from_nanos(nanos: u128) -> String {
     format!("{:012x}", nanos & 0xffff_ffff_ffff)
 }
 
+impl State {
+    pub(crate) fn conventional_playlist(&mut self) -> Option<Bytes> {
+        if self.conventional_media.is_none() {
+            let muxer = self.ingest.muxer()?;
+            self.conventional_media = Some(Bytes::from(playlist::media_with_mode(
+                muxer,
+                &self.prefix,
+                false,
+            )));
+        }
+        self.conventional_media.clone()
+    }
+}
+
 impl LiveStream {
+    /// Identity of this exact presentation, kept alive by every HTTP waiter.
+    /// Workers unsubscribe and clear queued identities before dropping it.
+    pub(crate) fn http_key(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
     fn new(
         path: StreamPath,
         cfg: MuxerConfig,
@@ -264,6 +287,7 @@ impl LiveStream {
                 prefix: fresh_prefix(),
                 closed: false,
                 media: None,
+                conventional_media: None,
                 multivariant: None,
             }),
             session: Mutex::new(Session {
@@ -277,6 +301,7 @@ impl LiveStream {
                 clean_close: None,
             }),
             version: watch::Sender::new(0),
+            http_notifications: crate::own_http::StreamNotifications::default(),
             fragments,
             _presentation_permit: presentation_permit,
         }
@@ -378,7 +403,15 @@ impl LiveStream {
         if st.closed {
             return Err(IngestError::PresentationExpired);
         }
-        let update = f(&mut st.ingest, SystemTime::now())?;
+        let update = match f(&mut st.ingest, SystemTime::now()) {
+            Ok(update) => update,
+            Err(error) => {
+                // A rejected input can still retire accepted muxer state.
+                // Conventional requests previously rendered that state live.
+                st.conventional_media = None;
+                return Err(error);
+            }
+        };
         if !update.any() {
             return Ok(Applied::default());
         }
@@ -387,7 +420,7 @@ impl LiveStream {
         let ready = Self::render(&mut st);
         drop(st);
         self.version.send_modify(|v| *v += 1);
-        crate::own_http::notify();
+        self.http_notifications.notify(self.http_key());
         Ok(Applied {
             ready,
             restarted: update.restarted,
@@ -396,6 +429,7 @@ impl LiveStream {
     }
 
     fn render(st: &mut State) -> bool {
+        st.conventional_media = None;
         let rendered = st.ingest.muxer().filter(|m| m.has_content()).map(|m| {
             (
                 Bytes::from(playlist::media(m, &st.prefix)),
@@ -460,7 +494,7 @@ impl LiveStream {
             recorder.feed(tracks, parts);
         }
         self.version.send_modify(|v| *v += 1);
-        crate::own_http::notify();
+        self.http_notifications.notify(self.http_key());
     }
 
     /// The init segment and every finished part after `after`, for the
@@ -492,10 +526,11 @@ impl LiveStream {
             };
             state.ingest = Source::new(kind, self.cfg, self.fragments.clone());
             state.media = None;
+            state.conventional_media = None;
             state.multivariant = None;
         }
         self.version.send_modify(|v| *v += 1);
-        crate::own_http::notify();
+        self.http_notifications.notify(self.http_key());
     }
 }
 
