@@ -1,0 +1,22 @@
+# Test fixtures
+
+`ffmpeg-srtp-h264.rec` is SRTP and SRTCP sent by FFmpeg 8.1.2, run as a
+black box by `tests/capture_ffmpeg.py`:
+
+- Source: FFmpeg's generated `testsrc2` pattern at 160x120 and 15 frames per
+  second (no camera, microphone or recorded media), encoded with libx264
+  (baseline, ultrafast, zerolatency, a keyframe every 15 frames).
+- Output: `-f rtp -srtp_out_suite AES_CM_128_HMAC_SHA1_80` to `srtp://` on
+  127.0.0.1, with `-srtp_out_params` set to base64 of the public test master
+  key `10 11 ... 1f` and salt `40 41 ... 4d`. The key protects nothing else.
+- Contents: the first 30 SRTP packets and the two SRTCP sender reports, as
+  records of `[channel (0 RTP, 1 RTCP), u16 big-endian length, datagram]`.
+
+`ffmpeg_srtp_interop` in `src/srtp/tests.rs` unprotects every packet with
+our code, reads it as RTP or RTCP, and checks that our protect gives back
+FFmpeg's exact bytes.
+
+To recapture, run `python3 crates/sapflow-rtp/tests/capture_ffmpeg.py
+<scratch dir>` and copy `h264-srtp.rec` here. The SSRC, sequence numbers and
+timestamps are random on each run. Delete the rest of the scratch directory
+afterwards.

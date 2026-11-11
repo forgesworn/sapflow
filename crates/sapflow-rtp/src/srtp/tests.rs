@@ -763,3 +763,76 @@ fn configuration_and_key_checks() {
     assert_eq!(Profile::AeadAes128Gcm.rtcp_overhead(), 20);
     assert_eq!(Profile::Aes128CmHmacSha1_80.rtcp_overhead(), 14);
 }
+
+/// Records `[channel, u16 length, datagram]` from `tests/capture_ffmpeg.py`.
+fn fixture_records(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while let Some((&channel, tail)) = rest.split_first() {
+        let len = usize::from(u16::from_be_bytes([tail[0], tail[1]]));
+        out.push((channel, tail[2..2 + len].to_vec()));
+        rest = &tail[2 + len..];
+    }
+    out
+}
+
+/// FFmpeg 8.1.2, run as a black box with `-srtp_out_suite
+/// AES_CM_128_HMAC_SHA1_80` and a public test key
+/// (`tests/fixtures/README.md`): every SRTP and SRTCP packet it sent
+/// unprotects with our code, reads as RTP or RTCP, and protects back with
+/// our code to exactly FFmpeg's bytes.
+#[test]
+fn ffmpeg_srtp_interop() {
+    let records = fixture_records(include_bytes!("../../tests/fixtures/ffmpeg-srtp-h264.rec"));
+    let key: Vec<u8> = (0x10..0x20).collect();
+    let salt: Vec<u8> = (0x40..0x4e).collect();
+    let master = MasterKey::new(Profile::Aes128CmHmacSha1_80, &key, &salt).expect("key");
+    let mut inbound = Inbound::new(&master, Config::default()).expect("inbound");
+    let mut outbound = Outbound::new(&master).expect("outbound");
+    let (mut rtp_count, mut rtcp_count) = (0, 0);
+    let mut first: Option<(u32, u16)> = None;
+    for (channel, sealed) in records {
+        let mut buf = sealed.clone();
+        if channel == 0 {
+            let n = inbound
+                .unprotect_rtp(&mut buf)
+                .expect("FFmpeg SRTP unprotects");
+            let plain = buf[..n].to_vec();
+            let p = crate::rtp::RtpPacket::parse(&plain).expect("RTP");
+            assert_eq!(p.payload_type(), 96);
+            let (ssrc, seq) = *first.get_or_insert((p.ssrc(), p.sequence()));
+            assert_eq!(p.ssrc(), ssrc);
+            assert_eq!(p.sequence(), seq.wrapping_add(rtp_count as u16));
+            let nal = p.payload()[0];
+            assert_eq!(nal & 0x80, 0, "forbidden bit");
+            assert!(matches!(nal & 0x1f, 1..=24 | 28), "NAL type {}", nal & 0x1f);
+            let mut again = plain.clone();
+            again.resize(plain.len() + 10, 0);
+            let m = outbound
+                .protect_rtp(&mut again, plain.len())
+                .expect("protects");
+            assert_eq!(again[..m], sealed[..], "our SRTP matches FFmpeg's");
+            rtp_count += 1;
+        } else {
+            let n = inbound
+                .unprotect_rtcp(&mut buf)
+                .expect("FFmpeg SRTCP unprotects");
+            let plain = buf[..n].to_vec();
+            let c = crate::rtcp::Compound::parse(&plain).expect("RTCP");
+            let Some(Ok(crate::rtcp::Packet::SenderReport(sr))) = c.packets().next() else {
+                panic!("FFmpeg sends sender reports");
+            };
+            if let Some((ssrc, _)) = first {
+                assert_eq!(sr.ssrc(), ssrc);
+            }
+            let mut again = plain.clone();
+            again.resize(plain.len() + 14, 0);
+            let m = outbound
+                .protect_rtcp(&mut again, plain.len())
+                .expect("protects");
+            assert_eq!(again[..m], sealed[..], "our SRTCP matches FFmpeg's");
+            rtcp_count += 1;
+        }
+    }
+    assert_eq!((rtp_count, rtcp_count), (30, 2));
+}
