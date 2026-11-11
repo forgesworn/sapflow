@@ -17,13 +17,14 @@
 //!   delivered from another tuple before or after their originals, with an
 //!   ID cache of 16 so that checks are forgotten and room for 3 validated
 //!   tuples of the 6 it uses so that tuples are evicted. After every
-//!   datagram: every tuple has been sent at most `amplification_limit`
-//!   times what it sent (STUN responses included); a tuple never validated
-//!   only a STUN error response to the request it just sent, no larger;
-//!   DTLS and RTCP only to the send tuple; an evicted tuple had the stalest
-//!   media of those that could go, the earliest validated breaking ties;
-//!   the selected and send tuples validated; at most
-//!   [`MAX_DATAGRAMS_PER_STEP`] datagrams a step, none over 1500 bytes.
+//!   datagram in and every one out: every tuple has been sent at most
+//!   `amplification_limit` times what it sent (STUN responses included); a
+//!   tuple never validated only a STUN error response to the request it
+//!   just sent, no larger; DTLS and RTCP only to the send tuple; none over
+//!   1500 bytes; an evicted tuple had the stalest media of those that could
+//!   go, the earliest validated breaking ties. After every step: at most
+//!   [`MAX_DATAGRAMS_PER_STEP`] datagrams, the selected and send tuples
+//!   validated, and no timer once ended.
 
 #![allow(
     clippy::panic,

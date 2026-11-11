@@ -1312,11 +1312,13 @@ fn unauthenticated_dtls_after_connect_is_discarded() {
         let d = make(&mut p);
         s.handle_datagram(t0 + ms(5), p.tuple, &d);
         let ev = events(s);
-        println!(
-            "{name}: state {:?}, events {ev:?}, dtls {:?}",
-            s.state(),
-            s.stats().dtls
-        );
+        // Each is one record dropped and counted, not a datagram refused:
+        // the three in epoch 0 fall through to sapflow-dtls's catch-all
+        // drop (server.rs:622), and only the bad tag reaches decryption,
+        // which fails (:629-630).
+        let dtls = s.stats().dtls;
+        assert_eq!(dtls.records_dropped, 1, "{name}");
+        assert_eq!(dtls.datagrams_dropped, 0, "{name}");
         assert_eq!(s.state(), State::Connected, "{name}");
         assert!(!ev.iter().any(|e| matches!(e, Event::Ended(_))), "{name}");
     }
