@@ -1,0 +1,85 @@
+{
+ "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27 Safari/605.1.15",
+ "whipStatus": 201,
+ "gathered": [
+  "udp host  mdns",
+  "udp host  mdns",
+  "end-of-candidates"
+ ],
+ "gatheringBeforePost": "complete",
+ "timeline": [
+  [
+   2264,
+   "ice",
+   "checking"
+  ],
+  [
+   2264,
+   "conn",
+   "connecting"
+  ],
+  [
+   2264,
+   "ice",
+   "connected"
+  ]
+ ],
+ "ice": "connected",
+ "connection": "connecting",
+ "transport": {
+  "dtlsState": "connecting",
+  "iceState": "connected",
+  "dtlsRole": "client"
+ },
+ "pairs": [
+  {
+   "state": "succeeded",
+   "nominated": true,
+   "requestsSent": 6,
+   "responsesReceived": 6,
+   "local": "udp prflx ",
+   "remote": "udp host "
+  }
+ ],
+ "localCandidates": [
+  "tcp host active",
+  "udp host ",
+  "tcp host active",
+  "udp host ",
+  "udp prflx "
+ ],
+ "remoteCandidates": [
+  "udp host "
+ ],
+ "audioContextState": "suspended",
+ "stun": {
+  "requests": 6,
+  "valid": 6,
+  "badIntegrity": 0,
+  "noFingerprint": 0,
+  "attrs": {
+   "USERNAME": 6,
+   "0xc057": 6,
+   "ICE_CONTROLLING": 6,
+   "PRIORITY": 6,
+   "MESSAGE_INTEGRITY": 6,
+   "FINGERPRINT": 6,
+   "USE_CANDIDATE": 5
+  },
+  "useCandidate": 5,
+  "controlling": 6,
+  "controlled": 0,
+  "tuples": 1
+ },
+ "dtls": {
+  "datagrams": 7,
+  "firstTransport": "udp",
+  "firstLength": 216,
+  "helloFragments": [
+   216
+  ]
+ },
+ "tcpConnections": 0,
+ "promptsTapped": [],
+ "phoneNotes": null
+}

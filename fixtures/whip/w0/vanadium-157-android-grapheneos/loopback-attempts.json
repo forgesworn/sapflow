@@ -1,0 +1,73 @@
+{
+ "note": "In-page loopback with the real camera did not connect: no candidate pair, ICE stayed new in both connections, so no rate was measured. Opus (A0.7) runs stopped at the page gesture gate in two attempts and no result was posted.",
+ "ramp_a": {
+  "arm": "a",
+  "source": "camera",
+  "iceState": [
+   "new",
+   "new"
+  ],
+  "connectionState": [
+   "new",
+   "new"
+  ],
+  "receiverReportsSeen": false,
+  "pairs": [
+   {
+    "cand": "tcp host ::"
+   },
+   {
+    "cand": "tcp host n.n.n.n"
+   }
+  ],
+  "seriesSeconds": 30,
+  "lastSample": {
+   "s": 30,
+   "bitrateKbps": 0,
+   "payloadKbps": 0,
+   "targetKbps": null,
+   "availableKbps": null,
+   "qlr": "none",
+   "nack": 0,
+   "pli": 0,
+   "fir": 0,
+   "load1": 112.71337890625,
+   "codec": "video/H264"
+  }
+ },
+ "ramp_b": {
+  "arm": "b",
+  "source": "camera",
+  "iceState": [
+   "new",
+   "new"
+  ],
+  "connectionState": [
+   "new",
+   "new"
+  ],
+  "receiverReportsSeen": false,
+  "pairs": [
+   {
+    "cand": "tcp host n.n.n.n"
+   },
+   {
+    "cand": "tcp host ::"
+   }
+  ],
+  "seriesSeconds": 30,
+  "lastSample": {
+   "s": 30,
+   "bitrateKbps": 0,
+   "payloadKbps": 0,
+   "targetKbps": null,
+   "availableKbps": null,
+   "qlr": "none",
+   "nack": 0,
+   "pli": 0,
+   "fir": 0,
+   "load1": 5.39697265625,
+   "codec": "video/H264"
+  }
+ }
+}

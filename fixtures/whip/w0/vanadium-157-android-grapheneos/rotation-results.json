@@ -1,0 +1,107 @@
+{
+ "note": "The loopback did not connect (see loopback-attempts.json), so nothing was sent and the receiver side is empty. Only the capture side (camera track and local preview) was measured.",
+ "orientationExtensionInOffer": true,
+ "inUnmodifiedAnswer": true,
+ "inEditedAnswer": false,
+ "originalSettings": {
+  "accel": "1",
+  "user": "0"
+ },
+ "steps": [
+  "accelerometer_rotation=0 user_rotation=1",
+  "user_rotation=0"
+ ],
+ "restored": {
+  "accel": "1",
+  "user": "0"
+ },
+ "phases": [
+  {
+   "name": "p0",
+   "orientation": {
+    "screen": "portrait-primary",
+    "angle": 0,
+    "inner": [
+     443,
+     840
+    ]
+   },
+   "trackSettings": {
+    "w": 720,
+    "h": 1280,
+    "facingMode": "user"
+   },
+   "localVideo": [
+    720,
+    1280
+   ],
+   "remoteVideo": [
+    0,
+    0
+   ],
+   "sender": {
+    "framesEncoded": 0,
+    "framesSent": 0,
+    "qlr": "none"
+   }
+  },
+  {
+   "name": "p1",
+   "orientation": {
+    "screen": "landscape-primary",
+    "angle": 90,
+    "inner": [
+     920,
+     338
+    ]
+   },
+   "trackSettings": {
+    "w": 1280,
+    "h": 720,
+    "facingMode": "user"
+   },
+   "localVideo": [
+    1280,
+    720
+   ],
+   "remoteVideo": [
+    0,
+    0
+   ],
+   "sender": {
+    "framesEncoded": 0,
+    "framesSent": 0,
+    "qlr": "none"
+   }
+  },
+  {
+   "name": "p2",
+   "orientation": {
+    "screen": "portrait-primary",
+    "angle": 0,
+    "inner": [
+     443,
+     840
+    ]
+   },
+   "trackSettings": {
+    "w": 720,
+    "h": 1280,
+    "facingMode": "user"
+   },
+   "localVideo": [
+    720,
+    1280
+   ],
+   "remoteVideo": [
+    0,
+    0
+   ],
+   "sender": {
+    "framesEncoded": 0,
+    "framesSent": 0,
+    "qlr": "none"
+   }
+  }
+ ]
+}
