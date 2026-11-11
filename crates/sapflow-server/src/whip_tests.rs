@@ -27,8 +27,24 @@ const ORIGIN: &str = "https://stage.example";
 
 struct Server {
     app: Arc<App>,
+    whip: Arc<Whip>,
     http: SocketAddr,
     udp: SocketAddr,
+}
+
+impl Server {
+    /// The per-path loss counts of the session at `location`.
+    fn losses(&self, location: &str) -> String {
+        let id = location
+            .rsplit('/')
+            .next()
+            .and_then(SessionId::parse)
+            .expect("a session Location");
+        self.whip
+            .resources()
+            .get(&id)
+            .map_or_else(|| "session gone".to_owned(), |r| r.losses.to_string())
+    }
 }
 
 fn app(env: &[(&str, &str)]) -> Arc<App> {
@@ -80,8 +96,16 @@ async fn start(env: &[(&str, &str)]) -> Server {
         sockets.http.local_addr().expect("addr"),
         sockets.udp.local_addr().expect("addr"),
     );
-    tokio::spawn(serve_with(app.clone(), sockets, server_identity()));
-    Server { app, http, udp }
+    let (whip, router, rx) = prepare(&app, server_identity())
+        .expect("router")
+        .expect("WHIP on");
+    tokio::spawn(run(app.clone(), whip.clone(), router, rx, sockets));
+    Server {
+        app,
+        whip,
+        http,
+        udp,
+    }
 }
 
 struct Answer {
@@ -472,14 +496,15 @@ fn audio_only(offer: &str) -> String {
     audio.replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0")
 }
 
-/// Publishes `packets` of audio-only Opus, 20 ms apart, leaving out the
-/// sequence numbers in `skip`; returns the recording's incomplete reason.
+/// Publishes audio-only Opus, 20 ms apart, leaving out the sequence
+/// numbers in `skip`; returns the recording's incomplete reason and the
+/// session's per-path loss counts, which say what set it.
 async fn audio_run(
     server: &Server,
     seed: u8,
     event: &str,
     skip: &[u64],
-) -> Option<IncompleteReason> {
+) -> (Option<IncompleteReason>, String) {
     let mut phone = Phone::new(seed, server).await;
     let offer = audio_only(&phone.p.offer());
     let a = send(
@@ -504,24 +529,23 @@ async fn audio_run(
         }
     }
     assert!(stream.has_content(), "audio-only Opus reached the playlist");
-    let session = stream.session();
-    let recorder = session.recorder.as_ref().expect("recording");
-    recorder.status().reason()
+    let reason = {
+        let session = stream.session();
+        let recorder = session.recorder.as_ref().expect("recording");
+        recorder.status().reason()
+    };
+    let location = a.header("location").expect("Location");
+    (reason, server.losses(location))
 }
 
-/// Over real UDP: audio-only Opus with one packet left out marks the
-/// recording. The clean case is asserted in process
-/// (`a_lost_packet_is_marked_from_the_receiver_not_the_muxer`,
-/// `a_clean_close_leaves_the_recording_complete`), where time is the
-/// test's: here, on a loaded host, a clean run was once marked as well
-/// (the cause was not caught; the audio-only muxer's own continuity check
-/// reacting to arrival jitter is the likely one), so this test asserts
-/// only that loss is never missed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lost_packet_marks_the_recording_from_the_receiver() {
+async fn udp_server() -> (Server, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target")
-        .join(format!("whip-loss-test-{}", std::process::id()));
+        .join(format!(
+            "whip-loss-test-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
     std::fs::create_dir_all(&root).expect("owned scratch");
     let dir = root.to_str().expect("utf-8 path").to_owned();
     let server = start(&[
@@ -529,9 +553,32 @@ async fn a_lost_packet_marks_the_recording_from_the_receiver() {
         ("SAPFLOW_RECORD_MIN_FREE_GB", "0"),
     ])
     .await;
-    let lossy = audio_run(&server, 8, "event-whip-lossy", &[80]).await;
+    (server, root)
+}
+
+static NEXT_ROOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Over real UDP and real time, a run that loses nothing leaves the
+/// recording complete. If it is ever marked, the message says which path
+/// marked it: a receiver path, a drop, the queue, or the muxer's own
+/// report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_run_over_udp_stays_complete() {
+    let (server, root) = udp_server().await;
+    let (reason, losses) = audio_run(&server, 7, "event-whip-clean", &[]).await;
     let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(lossy, Some(IncompleteReason::MediaLoss));
+    assert_eq!(reason, None, "marked by: {losses}");
+}
+
+/// Over real UDP: audio-only Opus with one packet left out marks the
+/// recording, from the receiver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_packet_marks_the_recording_from_the_receiver() {
+    let (server, root) = udp_server().await;
+    let (reason, losses) = audio_run(&server, 8, "event-whip-lossy", &[80]).await;
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(reason, Some(IncompleteReason::MediaLoss), "{losses}");
+    assert!(losses.contains("lost_packets=1"), "{losses}");
 }
 
 fn access_unit(idr: bool) -> Media {
@@ -722,7 +769,12 @@ async fn recorded(events: Vec<Event>, setup: Setup, feed: bool) -> Option<Incomp
         match e {
             Event::Media(m) if feed => server.offer(m).expect("ingest"),
             Event::MediaDropped { count } if feed => {
-                server.push(Media::Loss { packets: count }).expect("ingest");
+                server
+                    .push(Media::Loss {
+                        path: LossPath::Dropped,
+                        packets: count,
+                    })
+                    .expect("ingest");
             }
             Event::Media(m) => match media(m) {
                 Media::Video { pts, au } => items.push(Item::Video {
@@ -952,8 +1004,14 @@ async fn receiver_loss_is_counted_and_marks_the_recording() {
         .expect("recording started")
         .status();
     assert_eq!(status.reason(), None);
-    assert_eq!(feed.push(Media::Loss { packets: 3 }), Ok(()));
-    assert_eq!(feed.push(Media::Loss { packets: 0 }), Ok(()));
+    assert_eq!(
+        feed.push(Media::Loss {
+            path: LossPath::Lost,
+            packets: 3
+        }),
+        Ok(())
+    );
+    assert_eq!(feed.push(loss(LossPath::IncompleteFrame)), Ok(()));
     assert_eq!(feed.lost(), 3);
     assert_eq!(status.reason(), Some(IncompleteReason::MediaLoss));
 }

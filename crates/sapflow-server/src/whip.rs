@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -109,6 +109,83 @@ impl Item {
     }
 }
 
+/// Which path marked a session's recording, counted path by path: logged
+/// when the session ends and readable by tests, so a mark always says
+/// where it came from. The recording itself keeps only the first reason.
+#[derive(Debug, Default)]
+pub(crate) struct LossCounts {
+    /// Packets the receiver declared lost (`Lost`), after NACK and RTX.
+    pub lost_packets: AtomicU64,
+    /// Confirmed sequence restarts.
+    pub restarts: AtomicU64,
+    /// Opus timestamp jumps too big to fill, or backward.
+    pub timestamp_jumps: AtomicU64,
+    /// Video frames dropped because they lost data.
+    pub incomplete_frames: AtomicU64,
+    /// Video frames skipped while waiting for an IDR after loss.
+    pub skipped_after_loss: AtomicU64,
+    /// Payloads the depacketiser refused.
+    pub refused: AtomicU64,
+    /// Opus frames filled with silence for loss.
+    pub loss_fills: AtomicU64,
+    /// Media the session dropped (`Event::MediaDropped`).
+    pub dropped: AtomicU64,
+    /// Items the ingest queue had no room for.
+    pub queue_full: AtomicU64,
+    /// Ends that were not orderly.
+    pub abnormal_ends: AtomicU64,
+    /// Ingest updates in which the muxer itself reported media loss.
+    pub muxer: AtomicU64,
+}
+
+impl LossCounts {
+    fn fields(&self) -> [(&'static str, u64); 11] {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        [
+            ("lost_packets", g(&self.lost_packets)),
+            ("restarts", g(&self.restarts)),
+            ("timestamp_jumps", g(&self.timestamp_jumps)),
+            ("incomplete_frames", g(&self.incomplete_frames)),
+            ("skipped_after_loss", g(&self.skipped_after_loss)),
+            ("refused", g(&self.refused)),
+            ("loss_fills", g(&self.loss_fills)),
+            ("dropped", g(&self.dropped)),
+            ("queue_full", g(&self.queue_full)),
+            ("abnormal_ends", g(&self.abnormal_ends)),
+            ("muxer", g(&self.muxer)),
+        ]
+    }
+}
+
+impl std::fmt::Display for LossCounts {
+    /// The non-zero counts, or `none`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut any = false;
+        for (name, n) in self.fields() {
+            if n > 0 {
+                write!(f, "{}{name}={n}", if any { " " } else { "" })?;
+                any = true;
+            }
+        }
+        if !any {
+            f.write_str("none")?;
+        }
+        Ok(())
+    }
+}
+
+/// A receiver path that loses media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LossPath {
+    Lost,
+    Restart,
+    TimestampJump,
+    IncompleteFrame,
+    SkippedAfterLoss,
+    Refused,
+    Dropped,
+}
+
 /// What the UDP owner keeps per session for its ingest task.
 pub(crate) struct Feed {
     tx: mpsc::Sender<Item>,
@@ -124,8 +201,8 @@ pub(crate) struct Feed {
     skip_video: bool,
     /// A keyframe should be asked for, to end `skip_video` soon.
     keyframe: bool,
-    /// Packets the receiver gave up on or dropped.
-    lost: u64,
+    /// Which paths marked the recording.
+    counts: Arc<LossCounts>,
 }
 
 /// The ingest task has gone.
@@ -146,8 +223,13 @@ impl Feed {
             received: 0,
             skip_video: false,
             keyframe: false,
-            lost: 0,
+            counts: Arc::new(LossCounts::default()),
         }
+    }
+
+    /// The per-path loss counts, shared with the ingest task.
+    pub(crate) fn counts(&self) -> Arc<LossCounts> {
+        self.counts.clone()
     }
 
     /// The queued-bytes counter, for the ingest task.
@@ -157,7 +239,8 @@ impl Feed {
 
     /// Packets the receiver gave up on or dropped so far.
     pub(crate) fn lost(&self) -> u64 {
-        self.lost
+        self.counts.lost_packets.load(Ordering::Relaxed)
+            + self.counts.dropped.load(Ordering::Relaxed)
     }
 
     /// Whether video has just started waiting for an IDR, so a keyframe
@@ -179,6 +262,7 @@ impl Feed {
             // DELETE, our close, or the publisher's close_notify.
             EndReason::HandshakeTimeout | EndReason::Closed | EndReason::PeerClosed => return,
         };
+        self.counts.abnormal_ends.fetch_add(1, Ordering::Relaxed);
         self.loss.mark_incomplete(cause);
     }
 
@@ -187,8 +271,18 @@ impl Feed {
         self.push(media(event))
     }
 
-    fn mark_loss(&mut self, packets: u64) {
-        self.lost = self.lost.saturating_add(packets);
+    fn mark_loss(&mut self, path: LossPath, packets: u64) {
+        let c = &self.counts;
+        let (counter, n) = match path {
+            LossPath::Lost => (&c.lost_packets, packets),
+            LossPath::Dropped => (&c.dropped, packets),
+            LossPath::Restart => (&c.restarts, 1),
+            LossPath::TimestampJump => (&c.timestamp_jumps, 1),
+            LossPath::IncompleteFrame => (&c.incomplete_frames, 1),
+            LossPath::SkippedAfterLoss => (&c.skipped_after_loss, 1),
+            LossPath::Refused => (&c.refused, 1),
+        };
+        counter.fetch_add(n, Ordering::Relaxed);
         self.loss.mark_incomplete(IncompleteReason::MediaLoss);
     }
 
@@ -210,7 +304,8 @@ impl Feed {
                 // Silence in place of lost packets: the timeline stays
                 // whole, but the recording is not.
                 if lost {
-                    self.mark_loss(0);
+                    self.counts.loss_fills.fetch_add(1, Ordering::Relaxed);
+                    self.loss.mark_incomplete(IncompleteReason::MediaLoss);
                 }
                 Item::Audio {
                     pts,
@@ -218,8 +313,8 @@ impl Feed {
                     received: std::mem::take(&mut self.received),
                 }
             }
-            Media::Loss { packets } => {
-                self.mark_loss(packets);
+            Media::Loss { path, packets } => {
+                self.mark_loss(path, packets);
                 return Ok(());
             }
             Media::Other(name) => {
@@ -249,6 +344,7 @@ impl Feed {
         };
         // Full, by count or by bytes: loss for this publisher, never
         // back-pressure on the socket.
+        self.counts.queue_full.fetch_add(1, Ordering::Relaxed);
         self.loss.mark_incomplete(IncompleteReason::IngestQueueFull);
         if video && !self.skip_video {
             self.skip_video = true;
@@ -284,6 +380,7 @@ pub(crate) enum Media {
     /// silence and the timeline can absorb its timestamp jump, so the
     /// muxer may see nothing missing.
     Loss {
+        path: LossPath,
         packets: u64,
     },
     /// Nothing for the ingest, by name: the start hold's alignment, frames
@@ -310,19 +407,30 @@ fn media(event: sapflow_rtp::Event) -> Media {
             lost: frame.kind == FrameKind::Loss,
             packet: frame.data,
         },
-        E::Lost { count, .. } => Media::Loss { packets: count },
-        E::IncompleteFrame { .. }
-        | E::Refused { .. }
-        | E::FrameSkipped {
+        E::Lost { count, .. } => Media::Loss {
+            path: LossPath::Lost,
+            packets: count,
+        },
+        E::IncompleteFrame { .. } => loss(LossPath::IncompleteFrame),
+        E::Refused { .. } => loss(LossPath::Refused),
+        E::FrameSkipped {
             reason: SkipReason::AfterLoss,
             ..
-        }
-        | E::Discontinuity {
-            cause: Discontinuity::Sequence | Discontinuity::Timestamp { .. },
+        } => loss(LossPath::SkippedAfterLoss),
+        E::Discontinuity {
+            cause: Discontinuity::Sequence,
             ..
-        } => Media::Loss { packets: 0 },
+        } => loss(LossPath::Restart),
+        E::Discontinuity {
+            cause: Discontinuity::Timestamp { .. },
+            ..
+        } => loss(LossPath::TimestampJump),
         other => Media::Other(event_name(&other)),
     }
+}
+
+fn loss(path: LossPath) -> Media {
+    Media::Loss { path, packets: 0 }
 }
 
 /// A receiver event's name, for a log line that carries nothing else.
@@ -356,6 +464,8 @@ enum Command {
 struct Resource {
     /// SHA-256 of the bearer token, which `DELETE` must repeat.
     token: [u8; 32],
+    /// Which paths have marked its recording.
+    losses: Arc<LossCounts>,
     /// Set once the session's publication has been released.
     released: watch::Receiver<bool>,
 }
@@ -423,8 +533,19 @@ async fn serve_with(
     sockets: Sockets,
     identity: Arc<Identity>,
 ) -> std::io::Result<()> {
+    match prepare(&app, identity)? {
+        Some((whip, router, rx)) => run(app, whip, router, rx, sockets).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The shared state, the router and the owner's command queue, or `None`
+/// with WHIP off.
+type Prepared = (Arc<Whip>, Router, mpsc::Receiver<Command>);
+
+fn prepare(app: &App, identity: Arc<Identity>) -> std::io::Result<Option<Prepared>> {
     let Some(config) = app.config.whip.clone() else {
-        return std::future::pending().await;
+        return Ok(None);
     };
     let router = Router::new(RouterConfig {
         max_sessions: app.config.max_publishers,
@@ -438,6 +559,16 @@ async fn serve_with(
         commands,
         resources: Mutex::new(HashMap::new()),
     });
+    Ok(Some((whip, router, rx)))
+}
+
+async fn run(
+    app: Arc<App>,
+    whip: Arc<Whip>,
+    router: Router,
+    rx: mpsc::Receiver<Command>,
+    sockets: Sockets,
+) -> std::io::Result<()> {
     tracing::info!(
         addr = %whip.config.addr,
         udp = %whip.config.udp_addr,
@@ -520,7 +651,10 @@ async fn own_udp(
                 }
                 Event::MediaDropped { count } => {
                     if let Some(feed) = feeds.get_mut(&id) {
-                        let _ = feed.push(Media::Loss { packets: count });
+                        let _ = feed.push(Media::Loss {
+                            path: LossPath::Dropped,
+                            packets: count,
+                        });
                     }
                 }
                 Event::Connected(profile) => {
@@ -529,11 +663,12 @@ async fn own_udp(
                 Event::Ended(reason) => {
                     // Dropping the feed ends the ingest task, which
                     // releases the publication.
-                    let lost = feeds.remove(&id).map_or(0, |mut f| {
+                    // The ingest task may still add muxer reports after this.
+                    if let Some(mut f) = feeds.remove(&id) {
                         f.ended(reason);
-                        f.lost()
-                    });
-                    tracing::info!(?reason, lost, "WHIP session ended");
+                        let (lost, losses) = (f.lost(), f.counts());
+                        tracing::info!(?reason, lost, %losses, "WHIP session ended");
+                    }
                 }
                 Event::Nominated => {}
             }
@@ -889,11 +1024,12 @@ async fn publish(
     let (tx, rx) = mpsc::channel(QUEUE);
     let (released_tx, released) = watch::channel(false);
     let feed = Feed::new(tx, publication.loss_notice());
-    let queued = feed.queued();
+    let (queued, counts) = (feed.queued(), feed.counts());
     whip.resources().insert(
         id,
         Resource {
             token: digest(bearer),
+            losses: counts.clone(),
             released,
         },
     );
@@ -901,7 +1037,7 @@ async fn publish(
         whip.clone(),
         id,
         publication,
-        (rx, queued),
+        (rx, queued, counts),
         released_tx,
         setup,
     ));
@@ -975,7 +1111,7 @@ async fn ingest(
     whip: Arc<Whip>,
     id: SessionId,
     mut publication: Publication,
-    (mut rx, queued): (mpsc::Receiver<Item>, Arc<AtomicUsize>),
+    (mut rx, queued, counts): (mpsc::Receiver<Item>, Arc<AtomicUsize>, Arc<LossCounts>),
     released: watch::Sender<bool>,
     setup: Setup,
 ) {
@@ -989,7 +1125,14 @@ async fn ingest(
                 tracing::warn!(%error, "dropping WHIP publisher");
                 break;
             }
-            if let Err(error) = publication.push(|source, now| feed_item(source, item, now)) {
+            let pushed = publication.push(|source, now| {
+                let update = feed_item(source, item, now)?;
+                if update.media_loss {
+                    counts.muxer.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(update)
+            });
+            if let Err(error) = pushed {
                 tracing::warn!(%error, "dropping WHIP publisher");
                 break;
             }
