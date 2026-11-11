@@ -130,8 +130,9 @@ fn args() -> Args {
     }
 }
 
-/// The offer as kept: no candidates, and documentation addresses on the
-/// lines that carry one.
+/// The offer as kept: no candidates, documentation addresses on the lines
+/// that carry one, and the discard port on `m=` lines (the browser's own
+/// ephemeral ports otherwise).
 fn scrub_offer(offer: &str) -> String {
     let mut out = String::new();
     for line in offer.lines() {
@@ -142,6 +143,12 @@ fn scrub_offer(offer: &str) -> String {
             "c=IN IP4 0.0.0.0".to_owned()
         } else if line.starts_with("c=IN IP6 ") {
             "c=IN IP6 ::".to_owned()
+        } else if let Some(rest) = line.strip_prefix("m=") {
+            let mut f = rest.splitn(3, ' ');
+            match (f.next(), f.next(), f.next()) {
+                (Some(media), Some(_port), Some(tail)) => format!("m={media} 9 {tail}"),
+                _ => line.to_owned(),
+            }
         } else if line.starts_with("a=rtcp:") {
             "a=rtcp:9 IN IP4 0.0.0.0".to_owned()
         } else if let Some(rest) = line.strip_prefix("o=") {
