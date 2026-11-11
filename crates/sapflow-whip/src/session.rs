@@ -36,8 +36,8 @@
 //!   against an observer that copies and spoofs but cannot drop or delay
 //!   the publisher's packets, the publisher's tuple stays validated while
 //!   it keeps delivering media: pushing it out would take `max_tuples` - 2
-//!   other tuples (6 by default) each with fresh media newer than the
-//!   publisher's last, so that many of the publisher's packets in a row
+//!   other tuples (6 by default) each with fresh media at least as new as
+//!   the publisher's last, so that many of the publisher's packets in a row
 //!   each beaten by a copy from another tuple, or lost and copied. Short of
 //!   that, after one won race or one copy of a lost packet, the publisher
 //!   loses no media and sends are back with it at its next packet that
