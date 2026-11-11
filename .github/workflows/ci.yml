@@ -257,9 +257,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # mirror+file failover stalled on both Azure and the public archive.
-          # Try each official endpoint directly, with isolated authenticated
-          # indexes and wall-clock bounds. Never retry an interrupted dpkg run.
+          # The runner could not resolve three ubuntu.com archive hosts.
+          # Include kernel.org's Ubuntu mirror in a separate DNS zone, retaining
+          # Ubuntu signatures and bounded downloads. Never retry a dpkg run.
           . /etc/os-release
           test "$ID:$VERSION_CODENAME" = ubuntu:noble
           test "$(dpkg --print-architecture)" = amd64
@@ -279,7 +279,7 @@ jobs:
           )
           packages=(ffmpeg srt-tools curl python3 openssh-server netcat-openbsd)
           downloaded=false
-          for mirror in https://archive.ubuntu.com/ubuntu https://security.ubuntu.com/ubuntu https://azure.archive.ubuntu.com/ubuntu; do
+          for mirror in https://mirrors.edge.kernel.org/ubuntu https://archive.ubuntu.com/ubuntu https://security.ubuntu.com/ubuntu; do
             printf 'Trying authenticated Ubuntu packages from %s\n' "$mirror"
             for suite in noble noble-updates noble-backports noble-security; do
               printf 'deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] %s %s main restricted universe multiverse\n' "$mirror" "$suite"
@@ -295,7 +295,7 @@ jobs:
             printf 'Ubuntu endpoint failed or exceeded its download budget: %s\n' "$mirror" >&2
           done
           if [ "$downloaded" != true ]; then
-            echo 'No official Ubuntu endpoint completed authenticated package downloads' >&2
+            echo 'No Ubuntu mirror completed authenticated package downloads' >&2
             exit 1
           fi
           # All downloads passed APT signature/hash checks. Install once, offline;
