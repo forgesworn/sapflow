@@ -182,6 +182,10 @@ struct Phone {
     p: Publisher,
     socket: UdpSocket,
     server: SocketAddr,
+    /// The media clock: when its first 20 ms tick fell due, and the ticks
+    /// taken since. Packets go out on it, as a real encoder's do, so time a
+    /// step takes is not added to every later packet.
+    clock: Option<(tokio::time::Instant, u64)>,
 }
 
 impl Phone {
@@ -193,6 +197,7 @@ impl Phone {
             p,
             socket,
             server: server.udp,
+            clock: None,
         }
     }
 
@@ -211,8 +216,24 @@ impl Phone {
 
     /// Takes what the server sent within `wait`, answering DTLS.
     async fn receive(&mut self, wait: Duration) {
+        self.receive_until(tokio::time::Instant::now() + wait).await;
+    }
+
+    /// Waits for the media clock's next 20 ms tick, answering what the
+    /// server sends meanwhile; returns the tick's number. A tick already
+    /// past returns at once, so a stall delays packets without slowing the
+    /// clock.
+    async fn tick(&mut self) -> u64 {
+        let (start, n) = *self.clock.get_or_insert((tokio::time::Instant::now(), 0));
+        self.receive_until(start + Duration::from_millis(20 * n))
+            .await;
+        self.clock = Some((start, n + 1));
+        n
+    }
+
+    /// Takes what the server sends until `until`, answering DTLS.
+    async fn receive_until(&mut self, until: tokio::time::Instant) {
         let mut buf = vec![0u8; 2048];
-        let until = tokio::time::Instant::now() + wait;
         while let Ok(Ok((n, _))) =
             tokio::time::timeout_at(until, self.socket.recv_from(&mut buf)).await
         {
@@ -245,23 +266,24 @@ impl Phone {
     }
 
     /// `seconds` of 25 fps video, a keyframe each second, and 20 ms audio,
-    /// paced in real time.
+    /// on the media clock.
     async fn publish(&mut self, seconds: u64) {
-        for frame in 0..seconds * 25 {
-            let packets = if frame % 25 == 0 {
-                let idr = idr_slice(1200, 0x11);
-                self.p.video(&[SPS, PPS, &idr], VIDEO_SSRC)
-            } else {
-                self.p.delta(300).0
-            };
-            for d in packets {
-                self.send(&d).await;
+        for _ in 0..seconds * 50 {
+            let tick = self.tick().await;
+            if tick % 2 == 0 {
+                let frame = tick / 2;
+                let packets = if frame % 25 == 0 {
+                    let idr = idr_slice(1200, 0x11);
+                    self.p.video(&[SPS, PPS, &idr], VIDEO_SSRC)
+                } else {
+                    self.p.delta(300).0
+                };
+                for d in packets {
+                    self.send(&d).await;
+                }
             }
-            for _ in 0..2 {
-                let a = self.p.audio((frame % 251) as u8);
-                self.send(&a).await;
-            }
-            self.receive(Duration::from_millis(40)).await;
+            let a = self.p.audio((tick % 251) as u8);
+            self.send(&a).await;
         }
     }
 }
@@ -517,18 +539,17 @@ async fn audio_run(
     phone.answered(&a.body);
     phone.connect().await;
     let stream = server.app.streams.get(event).expect("claimed");
-    // At least 3 s, and on until a part is out (at most 10 s). Each packet
-    // is sent after the last one's 20 ms wait, so any time a step takes
-    // beyond that makes the packets later than their RTP clock.
+    // At least 3 s, and on until a part is out (at most 10 s), on the media
+    // clock: packet n goes at the start plus n times 20 ms.
     let started = std::time::Instant::now();
     let mut packets = 0u64;
     for n in 0..500u64 {
+        phone.tick().await;
         let packet = phone.p.audio((n % 251) as u8);
         if !skip.contains(&n) {
             phone.send(&packet).await;
         }
         packets += 1;
-        phone.receive(Duration::from_millis(20)).await;
         if n >= 150 && stream.has_content() {
             break;
         }
