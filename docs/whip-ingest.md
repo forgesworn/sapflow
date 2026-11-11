@@ -1582,7 +1582,9 @@ Implementation notes (W3c part 2a, lifecycle):
   attached stream, a live WHIP session's included: that is the existing
   rule ("the one authorised publisher may replace its own stale
   connection"), and SRT and RTMP already take over each other under it. A
-  WHIP session that loses its stream so ends on its next packet. The
+  WHIP session that loses its stream so ends on its next packet. Tested
+  for SRT in global-publisher mode; RTMP and app-authorised mode follow
+  the same claim, read from the code. The
   reverse is not allowed: a WHIP `POST` never closes an SRT or RTMP
   publisher, and gets `409`. Narrowing the rule for SRT and RTMP is a
   change to all three protocols and to the v4v contract, not to WHIP.
@@ -1590,9 +1592,16 @@ Implementation notes (W3c part 2a, lifecycle):
   under `catch_unwind` (`panic = "unwind"`). A session whose call panics
   is dropped with its queued output, its ufrag and its tuples, ends with
   `EndReason::Panicked`, and its recording is marked (`ingest-error`);
-  every other session goes on. Test builds carry a datagram that makes a
-  session panic (`sapflow_whip::testing::PANIC_DATAGRAM`); production
-  builds have no such hook.
+  every other session goes on. That covers the sessions' own code (ICE,
+  DTLS, SRTP and the receiver), where hostile input lands; a panic in the
+  UDP owner's own per-session code (the feed to the ingest task) is not
+  caught, and would still end WHIP and the server. The ingest tasks are
+  separate tokio tasks, so a panic there ends only that session's
+  publication. Builds with `sapflow-whip`'s `test-panic` feature, which only
+  the server's tests enable, carry a datagram that makes a session panic
+  (`sapflow_whip::testing::PANIC_DATAGRAM`); the fuzz targets and the
+  release binary do not, and `scripts/whip-e2e.js` checks the binary for
+  it.
 - **End reasons.** Every end is counted by name: the session's own
   (`handshake-timeout`, `consent-expired`, `dtls-failed`, `peer-closed`,
   `media-timeout`, `keys-exhausted`, `panicked`) or, when the server
@@ -1610,7 +1619,8 @@ Implementation notes (W3c part 2a, lifecycle):
 | A3.3: after `SAPFLOW_WHIP_STALE` without media, a second `POST` takes over at once | `whip::tests::a_stalled_session_is_superseded` | Met in process (stale set to 1 s) |
 | A3.3: a second `POST` during the first session's handshake replaces it at once | `whip::tests::a_post_during_the_first_handshake_replaces_it` | Met in process |
 | SRT takes over a live WHIP stream in global-publisher mode, and a WHIP `POST` never takes over SRT | `whip::tests::srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt` | Met in process |
-| A3.4: a panic in one session ends only that session; another keeps publishing with nothing lost | `router::tests::a_panicking_session_is_dropped_and_the_others_go_on` (sapflow-whip), `whip::tests::a_panic_in_one_session_ends_only_that_session` | Met in process |
+| A3.4: a panic in a session call ends only that session; another keeps publishing with nothing lost; its recording is marked | `router::tests::a_panicking_session_is_dropped_and_the_others_go_on` (sapflow-whip), `whip::tests::a_panic_in_one_session_ends_only_that_session`, `whip::tests::an_abnormal_end_marks_the_recording` | Met in process for session calls; the owner's own code is not guarded |
+| The panic hook is in no binary but the tests' | `scripts/whip-e2e.js` (the built binary is searched for its marker) | Met |
 | End reasons are counted by name | `whip::tests::every_end_reason_has_a_name`, and the counts asserted in the A3.2, A3.3 and A3.4 tests | Met |
 | `SAPFLOW_WHIP_STALE` | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 

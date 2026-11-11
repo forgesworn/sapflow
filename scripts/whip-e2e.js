@@ -189,6 +189,10 @@ function hits(text, s) {
 }
 
 (async () => {
+  // 0. The panic-injection hook exists only in test builds.
+  const marker = 'sapflow-whip test: panic here';
+  check('the binary has no panic-injection hook', !fs.readFileSync(bin).includes(Buffer.from(marker)));
+
   // 1. A3.6 default: nothing bound without SAPFLOW_WHIP_ADDR.
   let s = await sapflow({ ...common }, path.join(out, 'off.log'), 'HLS listening');
   const off = sockets(s.child.pid);
@@ -261,7 +265,7 @@ function hits(text, s) {
   // 3. A3.6 privacy, with the check shown to work first.
   const logText = fs.readFileSync(log, 'utf8');
   const plain = logText.replace(/\x1b\[[0-9;]*m/g, '');
-  check('the session ended with nothing lost', /WHIP session ended reason=Closed lost=0/.test(plain));
+  check('the session ended, deleted, with nothing lost', /WHIP session ended reason="?deleted"? count=\d+ lost=0/.test(plain));
   check('the recording finished complete', /recording finished .*complete=true/.test(plain));
   const list = r ? secrets(r.offer || '', r.publisher) : [TOKEN];
   const planted = logText + `\nplanted ${TOKEN}\n`;

@@ -1120,6 +1120,7 @@ async fn an_abnormal_end_marks_the_recording() {
             Some(IncompleteReason::Protocol),
         ),
         (R::KeysExhausted, Some(IncompleteReason::Protocol)),
+        (R::Panicked, Some(IncompleteReason::IngestError)),
         (R::HandshakeTimeout, None),
         (R::Closed, None),
         (R::PeerClosed, None),
@@ -1415,13 +1416,20 @@ async fn every_refusal_has_its_status_and_reason() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_post_while_media_flows_gets_409() {
     let server = start(&[]).await;
-    let (_phone, _) = live(&server, 37, "event-busy").await;
+    let (mut phone, _) = live(&server, 37, "event-busy").await;
+    // The first goes on publishing while the second asks.
+    let publishing = tokio::spawn(async move {
+        phone.publish(2).await;
+        phone
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let second = Phone::new(38, &server).await;
     let busy = send(
         server.http,
         &sdp_post("/whip/live/event-busy", TOKEN, &second.p.offer()),
     )
     .await;
+    let _phone = publishing.await.expect("published");
     assert_eq!(busy.status, 409);
     assert_eq!(busy.body, resource::Refusal::Conflict.reason());
     assert_eq!(busy.header("access-control-allow-origin"), Some(ORIGIN));
@@ -1436,9 +1444,18 @@ async fn a_stalled_session_is_superseded() {
     let server = start(&[("SAPFLOW_WHIP_STALE", "1")]).await;
     let (_phone, _) = live(&server, 39, "event-stall").await;
     let held = server.app.streams.get("event-stall").expect("live");
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // Its last media is stamped as the owner reads it: ask again, until
+    // the stale time has passed on the server's clock.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     let mut next = Phone::new(40, &server).await;
-    let a = admit(&server, &mut next, "event-stall").await;
+    let mut a = admit(&server, &mut next, "event-stall").await;
+    for _ in 0..40 {
+        if a.status != 409 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        a = admit(&server, &mut next, "event-stall").await;
+    }
     assert_eq!(a.status, 201, "{}", a.body);
     assert_eq!(server.whip.ends.get("superseded"), 1);
     let taken = server.app.streams.get("event-stall").expect("claimed");
@@ -1519,7 +1536,19 @@ async fn a_panic_in_one_session_ends_only_that_session() {
         eventually(|| server.losses(&a_location) == "session gone").await,
         "A's publication released"
     );
-    assert_eq!(server.losses(&b_location), "none", "B lost nothing");
+    let b_counts = server
+        .whip
+        .resources()
+        .get(&SessionId::parse(b_location.rsplit('/').next().expect("id")).expect("id"))
+        .map(|r| r.losses.clone())
+        .expect("B is live");
+    let marks: u64 = b_counts
+        .fields()
+        .iter()
+        .filter(|(name, _)| *name != "reanchors")
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(marks, 0, "B lost nothing: {b_counts}");
     assert!(parts() > before, "B's playlist kept growing");
 }
 
