@@ -278,8 +278,9 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
 ///   its segment is at least 85% of it (the last part after the final
 ///   `EXTINF` is exempt: it may yet be the last of its segment). 4.4.4.9
 ///   also exempts `INDEPENDENT=YES` parts; this check allows that only in a
-///   render whose every part is independent (audio-only), and holds video
-///   to the stricter rule Apple's players were built against;
+///   segment (or the open run of parts) whose every part is independent, as
+///   in audio-only, and holds video to the stricter rule Apple's players
+///   were built against;
 /// - once segments have been removed (`EXT-X-MEDIA-SEQUENCE` above 0), the
 ///   segments listed last at least three target durations (6.2.2), unless
 ///   the render lists [`crate::muxer::MAX_WINDOW_ENTRIES`] entries or more,
@@ -353,11 +354,10 @@ impl RuleCheck {
         let first_msn = msn;
         let mut listed = 0u64;
         let mut entries = 0usize;
-        let audio_only = pl
-            .lines()
-            .filter_map(|l| l.strip_prefix("#EXT-X-PART:"))
-            .all(|a| a.split(',').any(|a| a == "INDEPENDENT=YES"));
         let parts = |run: &[(u64, bool)], open: bool| -> Result<(), String> {
+            // Decided per segment, so an audio-only epoch after an A/V one
+            // keeps its exemption while the A/V parts are still listed.
+            let audio_only = run.iter().all(|&(_, independent)| independent);
             for (i, &(d, independent)) in run.iter().enumerate() {
                 if d > part_target {
                     return Err(format!("part {d} longer than PART-TARGET {part_target}"));
@@ -656,6 +656,32 @@ mod tests {
         assert!(
             RuleCheck::default().check(&render(true, false)).is_err(),
             "a short keyframe part in video"
+        );
+        // Decided per segment: an audio-only segment after an A/V one keeps
+        // its exemption, and an A/V one after it is still held to the rule.
+        let av = format!(
+            "{}{}#EXTINF:0.4,\ns\n",
+            part("0.23400", true),
+            part("0.16600", false)
+        );
+        let audio = format!(
+            "{}{}#EXTINF:0.3,\nt\n",
+            part("0.12000", true),
+            part("0.18000", true)
+        );
+        let short_av = format!(
+            "{}{}#EXTINF:0.3,\nu\n",
+            part("0.12000", true),
+            part("0.18000", false)
+        );
+        assert_eq!(
+            RuleCheck::default().check(&format!("{}{av}{audio}", head(0))),
+            Ok(())
+        );
+        assert!(
+            RuleCheck::default()
+                .check(&format!("{}{audio}{short_av}", head(0)))
+                .is_err()
         );
         // Three seconds listed after removals: under three targets of 2 s
         // (RFC 8216bis 6.2.2).

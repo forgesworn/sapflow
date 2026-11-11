@@ -11,7 +11,8 @@ docs/reference.md), the same as sapflow_hls::playlist::RuleCheck:
   - no EXT-X-PART DURATION is above PART-TARGET;
   - every part but the last of its segment is at least 85% of PART-TARGET;
     4.4.4.9 also exempts INDEPENDENT=YES parts, allowed here only in a
-    render whose every part is independent (audio-only);
+    segment (or the open run of parts) whose every part is independent, as
+    in audio-only;
   - once segments have been removed (MEDIA-SEQUENCE above 0), the segments
     listed last at least three TARGETDURATIONs (6.2.2), unless the render
     lists 256 entries or more, sapflow's cap (--no-live-window leaves this
@@ -80,8 +81,9 @@ def check(text, live_window=True):
     if target is None:
         return head, [], dseqs, extinfs, ["no PART-TARGET"]
     seen = []
-    audio_only = all(independent for run, _ in parts for _, _, independent in run)
     for run, open_segment in parts:
+        # Per segment, so an audio-only epoch after an A/V one keeps it.
+        audio_only = all(independent for _, _, independent in run)
         for i, (uri, d, independent) in enumerate(run):
             seen.append((uri, d))
             if d > target:

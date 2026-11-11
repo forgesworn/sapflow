@@ -192,3 +192,60 @@ fn the_byte_cap_bounds_what_the_window_holds_beyond_its_count() {
     assert!(m.entries().len() < crate::muxer::MAX_WINDOW_ENTRIES);
     assert!(most_extra <= 64 << 20, "{most_extra}");
 }
+
+/// The review's mixed-epoch case: A/V Opus, then a reconnect as audio-only
+/// Opus with 60 ms packets, which close parts early under the inherited
+/// 234 ms part target. While the A/V epoch's parts are still listed, the
+/// new epoch's short independent parts are legal (RFC 8216bis 4.4.4.9).
+#[test]
+fn audio_only_parts_after_an_av_epoch_keep_their_exemption() {
+    use crate::codec::OpusConfig;
+    use crate::{EsIngest, TrackSet};
+    let opus = |samples: u32| -> Vec<u8> {
+        match samples {
+            960 => vec![31 << 3 | 4, 0xff, 0xfe],
+            _ => vec![11 << 3 | 4, 1, 2],
+        }
+    };
+    let video = crate::muxer::tests::video();
+    let mut av = EsIngest::new(MuxerConfig::default());
+    av.declare_tracks(TrackSet::AudioVideo, NOW).expect("A/V");
+    av.opus_config(OpusConfig::STEREO).expect("stereo");
+    av.parameter_sets(Some(video.sps), Some(video.pps));
+    let mut rules = playlist::RuleCheck::default();
+    let mut audio = 0i64;
+    for frame in 0..150i64 {
+        while audio <= frame * 3000 {
+            av.opus_at(audio, &opus(960), NOW).expect("Opus");
+            audio += 1800;
+        }
+        av.video(
+            frame * 3000,
+            frame * 3000,
+            crate::codec::AccessUnit {
+                data: vec![1],
+                idr: frame % 30 == 0,
+                ..Default::default()
+            },
+            NOW,
+        )
+        .expect("video");
+        if let Some(m) = av.muxer().filter(|m| m.has_content()) {
+            rules.check(&playlist::media(m, "w")).expect("A/V epoch");
+        }
+    }
+    let mut held = av.take_muxer().expect("muxer");
+    held.interrupt(NOW);
+    let mut only = EsIngest::resume(MuxerConfig::default(), held);
+    only.declare_tracks(TrackSet::AudioOnly, NOW)
+        .expect("audio-only");
+    let mut pts = 0;
+    for _ in 0..100 {
+        only.opus_at(pts, &opus(2880), NOW).expect("60 ms Opus");
+        pts += 5400;
+        let m = only.muxer().expect("muxer");
+        if let Err(e) = rules.check(&playlist::media(m, "w")) {
+            panic!("{:.3} s after the switch: {e}", pts as f64 / 90_000.0);
+        }
+    }
+}
