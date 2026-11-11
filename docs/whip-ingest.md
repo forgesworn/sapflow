@@ -608,10 +608,12 @@ feeds it yet; W3c connects `sapflow-whip` to it.
   timestamp, jitter and slew included, not for its TOC duration: the
   timeline slews audio by up to 500 ppm to keep it with the video, and TOC
   durations would throw that away. With exact timestamps every sample is
-  exactly its TOC duration; slewed 500 ppm either way, each stays within
-  that slew plus one sample (at most 4 samples for a 120 ms packet). A gap
-  of more than three of the packet's own durations (1024 samples for AAC)
-  gives it its own duration instead.
+  exactly its TOC duration, and slew alone (500 ppm either way) keeps each
+  within that slew plus one sample (at most 4 samples for a 120 ms packet).
+  Other timestamp steps move it further: a timeline hold or a step by
+  arrival time can make it anything from nothing (a repeated timestamp) to
+  three packets' worth. A gap of more than three of the packet's own
+  durations (1024 samples for AAC) gives it its own duration instead.
 - **Audio-only.** As for AAC, decode time is an exact count of samples and
   timestamps only find breaks. Unlike AAC, which measures each frame against
   the run's origin and sample count, each Opus packet is compared with the
@@ -630,7 +632,8 @@ feeds it yet; W3c connects `sapflow-whip` to it.
   refuses the audio-only Opus epoch up front (`InvalidAudio`). A later,
   longer packet that the open part has no room for closes only that part,
   short but `INDEPENDENT=YES`, which RFC 8216bis draft 19 section 4.4.4.9
-  exempts from the 85% floor; the segment carries on. (Closing the segment
+  exempts from the 85% floor (`RuleCheck` allows that only where every part
+  is independent, as in audio-only); the segment carries on. (Closing the segment
   too, as W3b first did, collapsed the count-limited window: after a 20 ms
   first packet, 120 ms packets made 0.12 s segments and a 2.88 s window. Now
   they make 1.08 s segments and a 25.9 s window.) Every refusal is made
@@ -676,9 +679,10 @@ them is open.
 
 Video-led sample durations also depart from section 4.3.4, which makes a
 sample's duration its frames' total: they follow the timestamps (see
-Video-led audio above), so a slewing timeline moves them off the TOC
-duration by up to the slew plus a sample. No player has been tried on a
-slewed stream.
+Video-led audio above). Slew alone moves them off the TOC duration by up to
+the slew plus a sample; a timeline hold or a step by arrival time can move
+one from nothing to three packets' worth. No player has been tried on such
+a stream.
 
 **FFmpeg decode.** sapflow's own init segment and parts, built in a test
 (`write_opus_evidence` in `opus_real_tests.rs`) from real Opus packets, as
@@ -765,15 +769,38 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
 - Settled after W3b: audio-only Opus carries a timeline's slew (see
   Audio-only above), and video-led Opus keeps timestamp durations (see
   Video-led audio above).
-- Next, and needing the user's agreement: `RuleCheck::with_live_window` (and `check-playlist.py
-  --live-window`) checks RFC 8216bis 6.2.2's rule that a segment is not
-  removed if the playlist left would last less than three target
-  durations. Count-based eviction already breaks it for AAC, without Opus:
-  with `segment_count` 8 the epoch regression evicts to 5.40 s against 6 s,
-  and at the default 24, a publisher reconnecting every 10 AAC frames leaves
-  5.12 s. The check is therefore opt-in and is not in the fuzz targets.
-  Duration-aware eviction would fix it, but would change AAC output in
-  those cases, including the `epochs` golden digest.
+- Settled after W3b, with the user's agreement: RFC 8216bis 6.2.2's
+  segment rule. A segment is no longer removed if the playlist left would
+  last less than three target durations, as printed, up to 256 entries and
+  64 MiB of media beyond `segment_count`; past either cap, removal goes on.
+  Count-only eviction broke it for AAC: with `segment_count` 8 the epoch
+  regression fell to 5.40 s against 6 s (now 6.27 s, nine entries at most),
+  and at the default 24, a publisher reconnecting every 10 AAC frames left
+  5.12 s (now 6.19 s, 29 entries at most). `RuleCheck` and
+  `check-playlist.py` check it by default, and so do the `ts_ingest`,
+  `flv_ingest`, `muxer_timing` and `opus_packaging` fuzz targets. A render
+  shows the entry cap but not the byte cap, so `Muxer::window_byte_capped()`
+  says when the byte cap cut the window short; the fuzz targets pass it to
+  `RuleCheck::check_with_byte_cap`, and `check-playlist.py` takes
+  `--byte-capped`. The `epochs` golden digest changed with it: that
+  scenario now keeps one more 1 s segment. Opus output is pinned at 4ab0c12
+  by `real_opus_output_is_byte_identical_to_4ab0c12`, which still matches.
+- Open, and older than W3b: RFC 8216bis 6.2.2's part rule. A part must stay
+  downloadable for three target durations after its `EXT-X-PART` tag leaves
+  the playlist. Tags are listed while their segment ends within three
+  target durations of the live edge (`playlist.rs`), but a part's data is
+  freed with its segment (`Muxer::rotate_segment`), so a window shorter than
+  about six target durations falls short. The live-window review measured
+  how long a part stays downloadable after its tag leaves, the same at
+  4ab0c12 and after the segment rule:
+
+  | Case | Part held after its tag leaves |
+  |---|---|
+  | Steady stream, `segment_count` 7 | 1.0 s |
+  | Default 24, reconnect every 10 frames | 0.000 s |
+  | Default 24, reconnect every 20 frames | 4.05 s |
+  | Steady stream, `segment_count` 12 | 6.02 s |
+  | Steady stream, `segment_count` 24 | 18.05 s |
 - The departures from the encapsulation listed above, and the cause of the
   312 click.
 - Safari, iOS and Android with sapflow's packaging, which need the user's

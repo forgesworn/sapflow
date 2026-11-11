@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """Checks an LL-HLS media playlist against Apple's part rules.
 
-  python3 -I scripts/check-playlist.py [--live-window] URL [SECONDS]   poll a live playlist
-  python3 -I scripts/check-playlist.py [--live-window] FILE...         check saved renders
+  python3 -I scripts/check-playlist.py [FLAGS] URL [SECONDS]   poll a live playlist
+  python3 -I scripts/check-playlist.py [FLAGS] FILE...         check saved renders
 
 Rules (RFC 8216bis 4.4.3.1, 4.4.3.3, 4.4.3.7, 4.4.4.9, 6.2.2;
 docs/reference.md), the same as sapflow_hls::playlist::RuleCheck:
   - TARGETDURATION and PART-TARGET never change while the stream runs;
   - every EXTINF, rounded to the nearest second, is at most TARGETDURATION;
   - no EXT-X-PART DURATION is above PART-TARGET;
-  - every part but the last of its segment is at least 85% of PART-TARGET,
-    unless it is INDEPENDENT=YES, which 4.4.4.9 exempts;
-  - with --live-window, once segments have been removed (MEDIA-SEQUENCE
-    above 0), the segments listed last at least three TARGETDURATIONs;
+  - every part but the last of its segment is at least 85% of PART-TARGET;
+    4.4.4.9 also exempts INDEPENDENT=YES parts, allowed here only in a
+    segment (or the open run of parts) whose every part is independent, as
+    in audio-only;
+  - once segments have been removed (MEDIA-SEQUENCE above 0), the segments
+    listed last at least three TARGETDURATIONs (6.2.2's segment rule; its
+    part rule is not checked), unless the render lists 256 entries or more,
+    sapflow's entry cap. sapflow's other cap, 64 MiB of segments beyond
+    MuxerConfig::segment_count, cannot be seen in a render: pass
+    --byte-capped when the muxer reported it (Muxer::window_byte_capped)
+    for the renders checked, and a short window is then accepted.
+    --no-live-window leaves the rule out altogether, for renders not made
+    by sapflow; --live-window, its old opt-in, is accepted and ignored;
   - EXT-X-DISCONTINUITY never sits among a segment's parts, and each media
     sequence number keeps one discontinuity sequence number across renders.
 The last part listed after the final EXTINF is exempt: it may yet be the
@@ -25,7 +34,11 @@ import urllib.request
 from decimal import Decimal
 
 
-def check(text, live_window=False):
+# sapflow_hls::muxer::MAX_WINDOW_ENTRIES
+MAX_WINDOW_ENTRIES = 256
+
+
+def check(text, live_window=True, byte_capped=False):
     """One render: (headers, [(uri, duration)], {msn: dseq}, [extinf], [violations])."""
     head = {}
     parts, run, bad, dseqs, extinfs = [], [], [], {}, []
@@ -66,19 +79,22 @@ def check(text, live_window=False):
     parts.append((run, True))
     first = head.get("#EXT-X-MEDIA-SEQUENCE:", 0)
     duration = head.get("#EXT-X-TARGETDURATION:")
-    if live_window and first > 0 and duration is not None and sum(extinfs) < 3 * duration:
+    if (live_window and not byte_capped and first > 0 and duration is not None
+            and sum(extinfs) < 3 * duration and len(extinfs) < MAX_WINDOW_ENTRIES):
         bad.append(f"segments removed down to {sum(extinfs)}, under three TARGETDURATIONs of {duration}")
     target = head.get("PART-TARGET")
     if target is None:
         return head, [], dseqs, extinfs, ["no PART-TARGET"]
     seen = []
     for run, open_segment in parts:
+        # Per segment, so an audio-only epoch after an A/V one keeps it.
+        audio_only = all(independent for _, _, independent in run)
         for i, (uri, d, independent) in enumerate(run):
             seen.append((uri, d))
             if d > target:
                 bad.append(f"{uri} lasts {d}, over PART-TARGET {target}")
             last = i == len(run) - 1
-            if not last and not independent and d < target * Decimal("0.85"):
+            if not last and not (independent and audio_only) and d < target * Decimal("0.85"):
                 where = "open segment" if open_segment else "segment"
                 bad.append(f"{uri} lasts {d}, under 85% of PART-TARGET {target} (not last of its {where})")
     return head, seen, dseqs, extinfs, bad
@@ -110,8 +126,9 @@ def changes(values):
 
 
 def main(args):
-    live_window = "--live-window" in args
-    args = [a for a in args if a != "--live-window"]
+    live_window = "--no-live-window" not in args
+    byte_capped = "--byte-capped" in args
+    args = [a for a in args if a not in ("--live-window", "--no-live-window", "--byte-capped")]
     if not args:
         print(__doc__, file=sys.stderr)
         return 2
@@ -121,7 +138,7 @@ def main(args):
         if "#EXT-X-PART" not in text:
             continue
         count += 1
-        head, seen, dseqs, ext, bad = check(text, live_window)
+        head, seen, dseqs, ext, bad = check(text, live_window, byte_capped)
         part_targets.append(head.get("PART-TARGET"))
         targets.append(head.get("#EXT-X-TARGETDURATION:"))
         extinfs.update(ext)

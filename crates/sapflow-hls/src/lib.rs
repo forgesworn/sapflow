@@ -37,6 +37,9 @@ mod audio_only_tests;
 mod opus_real_tests;
 
 #[cfg(test)]
+mod live_window_tests;
+
+#[cfg(test)]
 mod terminal_ts_tests;
 
 #[cfg(test)]

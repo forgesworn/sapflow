@@ -1,7 +1,9 @@
 //! Arbitrary RTMP video and audio tag bodies, as an RTMP publisher sends them.
+//! After every record the rendered playlist must keep `playlist::RuleCheck`'s
+//! rules, the live window among them.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use sapflow_hls::{FlvIngest, MuxerConfig, TrackSet};
+use sapflow_hls::{FlvIngest, MuxerConfig, TrackSet, playlist};
 
 fuzz_target!(|data: &[u8]| {
     let (quota, data) = if let Some(rest) = data.strip_prefix(b"FBUD") {
@@ -27,6 +29,7 @@ fuzz_target!(|data: &[u8]| {
     // adds track-declaration records for new seeds without reinterpreting them.
     let declarations = data.starts_with(b"TRKS");
     let mut rest = if declarations { &data[4..] } else { data };
+    let mut rules = playlist::RuleCheck::default();
     // Each record: kind (1), timestamp (4), length (2), body.
     while rest.len() >= 7 {
         let kind = rest[0];
@@ -64,6 +67,12 @@ fuzz_target!(|data: &[u8]| {
                 {
                     break;
                 }
+            }
+        }
+        if let Some(muxer) = ing.muxer().filter(|muxer| muxer.has_content()) {
+            let rendered = playlist::media(muxer, "p");
+            if let Err(error) = rules.check_with_byte_cap(&rendered, muxer.window_byte_capped()) {
+                panic!("{error}\n{rendered}");
             }
         }
     }

@@ -143,7 +143,7 @@ fn timing(data: &[u8]) {
         }
         if m.has_content() {
             let rendered = playlist::media(&m, "p");
-            if let Err(error) = rules.check(&rendered) {
+            if let Err(error) = rules.check_with_byte_cap(&rendered, m.window_byte_capped()) {
                 panic!("{error}\n{rendered}");
             }
         }

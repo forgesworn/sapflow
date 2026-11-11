@@ -261,7 +261,7 @@ fn audio_timing(data: &[u8]) {
         }
         if muxer.has_content() {
             let rendered = playlist::media(&muxer, "p");
-            if let Err(error) = rules.check(&rendered) {
+            if let Err(error) = rules.check_with_byte_cap(&rendered, muxer.window_byte_capped()) {
                 panic!("{error}\n{rendered}");
             }
         }
@@ -427,7 +427,7 @@ fuzz_target!(|data: &[u8]| {
             continue;
         }
         let pl = playlist::media(&m, "p");
-        if let Err(e) = rules.check(&pl) {
+        if let Err(e) = rules.check_with_byte_cap(&pl, m.window_byte_capped()) {
             panic!("{e}\n{pl}");
         }
     }

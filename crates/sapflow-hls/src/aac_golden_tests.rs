@@ -3,9 +3,11 @@
 //! Each scenario hashes every byte sapflow serves or records for it: init
 //! segments, parts, segments and playlists. The digests were taken from the
 //! code at 945cb21 (crates 0.2.0-rc.1), before any Opus change, so a
-//! difference here means AAC output changed. The scenarios cover the
-//! unmetered and fragment-quota constructors, TS, elementary video-led and
-//! audio-only input, codec epochs over reconnects, and every init builder.
+//! difference here means AAC output changed. The one exception is `epochs`,
+//! retaken when the live window began keeping three target durations. The
+//! scenarios cover the unmetered and fragment-quota constructors, TS,
+//! elementary video-led and audio-only input, codec epochs over reconnects,
+//! and every init builder.
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -339,9 +341,13 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
             "audio-48k-mono-quota",
             "aea38555ff14d01955b9ee0888a7b22bea69e2b626f200750d5ab532fae5617d",
         ),
+        // Changed with the RFC 8216bis 6.2.2 live window: at eight entries
+        // the old count-only eviction left 5.40 s listed after the third and
+        // fourth epochs; one more 1 s segment is now kept (6.40 s). Every
+        // part and segment served before is unchanged.
         (
             "epochs",
-            "f13b9b430c622d135cbc9ba756c867c0890772a47889acfb74874e05785878c8",
+            "96bd3461c6d65e769cec2aaa991366e11013497bcccdb1e7fc78dee15a09df75",
         ),
         (
             "audio-only-reconfigure",

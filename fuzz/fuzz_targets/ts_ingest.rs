@@ -33,7 +33,7 @@ fuzz_target!(|data: &[u8]| {
         }
         if let Some(muxer) = ing.muxer().filter(|muxer| muxer.has_content()) {
             let rendered = playlist::media(muxer, "p");
-            if let Err(error) = rules.check(&rendered) {
+            if let Err(error) = rules.check_with_byte_cap(&rendered, muxer.window_byte_capped()) {
                 panic!("{error}\n{rendered}");
             }
         }
@@ -43,7 +43,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = ing.finish(std::time::SystemTime::UNIX_EPOCH);
     if let Some(muxer) = ing.muxer().filter(|muxer| muxer.has_content()) {
         let rendered = playlist::media(muxer, "p");
-        if let Err(error) = rules.check(&rendered) {
+        if let Err(error) = rules.check_with_byte_cap(&rendered, muxer.window_byte_capped()) {
             panic!("{error}\n{rendered}");
         }
     }
