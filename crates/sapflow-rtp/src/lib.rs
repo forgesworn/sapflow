@@ -4,10 +4,12 @@
 //! Written from the RFCs only: RFC 3550 and RFC 3551 (RTP and RTCP),
 //! RFC 4585 and RFC 5104 (feedback), RFC 5506 (reduced-size RTCP),
 //! RFC 8285 (header extensions), RFC 3711 (SRTP), RFC 7714 (AES-GCM),
-//! RFC 5764 section 4.2 (DTLS-SRTP keys), RFC 6184 (H.264 payload),
-//! RFC 7587 and RFC 6716 sections 3.1 to 3.4 (Opus payload and framing)
-//! and RFC 4588 (RTX). No other RTP, SRTP, depacketiser, jitter buffer or
-//! WebRTC implementation's source was read.
+//! RFC 5764 section 4.2 (DTLS-SRTP keys), RFC 6184 (H.264 payload) with
+//! ITU-T H.264 for the NAL unit types and the start of the slice header,
+//! RFC 7587 and RFC 6716 sections 3.1 to 3.4 and 4.3 (Opus payload,
+//! framing and the CELT silence flag) and RFC 4588 (RTX). No other RTP,
+//! SRTP, depacketiser, jitter buffer or WebRTC implementation's source was
+//! read.
 //!
 //! Sans-IO: nothing here owns a socket, a clock or a thread. Callers hand in
 //! datagrams and get back borrowed views or in-place results.
