@@ -501,16 +501,19 @@ fn kept_parts_and_segments_stop_at_64_mib_and_are_counted() {
         most.segments = most.segments.max(now.segments);
     }
     assert!(m.parts_released_early() > 0, "the byte cap was reached");
-    assert!(most.bytes > 0 && most.bytes <= 64 << 20, "{most:?}");
+    // Within two 2 MiB segments of the cap: it binds.
+    assert!(
+        most.bytes > (60 << 20) && most.bytes <= 64 << 20,
+        "{most:?}"
+    );
     assert!(most.segments > 0, "{most:?}");
 }
 
 /// A 45 s first segment fixes a 46 s target, then one-frame segments:
-/// three target durations of them are more parts than the part cap, and
-/// the 45 s playlists they appear in keep more segments than the segment
-/// cap.
+/// three target durations of them are more parts than the part cap. Only
+/// parts go early; their segments stay for their own rule.
 #[test]
-fn kept_parts_and_segments_stop_at_their_count_caps() {
+fn kept_parts_stop_at_their_count_cap() {
     let mut m = Muxer::new(MuxerConfig::default(), video(), None);
     let frame = |m: &mut Muxer, i: i64, sync: bool| {
         m.push_video(i * 3000, i * 3000, sync, Bytes::from_static(&[1]), NOW)
@@ -530,22 +533,56 @@ fn kept_parts_and_segments_stop_at_their_count_caps() {
         if step % 250 == 249 {
             let now = kept_past_the_window(&m);
             most.parts = most.parts.max(now.parts);
-            most.segments = most.segments.max(now.segments);
         }
     }
     assert!(m.parts_released_early() > 0, "the part cap was reached");
+    assert_eq!(most.parts, crate::muxer::MAX_RETAINED_PARTS, "{most:?}");
+    assert_eq!(m.segments_released_early(), 0, "no segment went with them");
+}
+
+/// A 1,000-entry window of 1 s segments, then one-frame segments: each
+/// one-frame segment removes a 1 s one, which first appeared in a 1,000 s
+/// playlist and so is kept for up to 1,001 s, while its parts, whose tags
+/// left long before, are not. The kept segments reach the segment cap;
+/// only segments go early.
+#[test]
+fn kept_segments_stop_at_their_count_cap() {
+    let cfg = MuxerConfig {
+        segment_count: 1000,
+        ..MuxerConfig::default()
+    };
+    let mut m = Muxer::new(cfg, video(), None);
+    let frame = |m: &mut Muxer, i: i64, sync: bool| {
+        m.push_video(i * 3000, i * 3000, sync, Bytes::from_static(&[1]), NOW)
+            .expect("video");
+    };
+    let long = 1000 * 30;
+    for i in 0..=long {
+        frame(&mut m, i, i % 30 == 0);
+    }
+    assert_eq!(m.target_duration(), 2);
+    let mut most = Kept::default();
+    for step in 0..1200 {
+        // The first frame is sealed by the second; the second is dropped.
+        let i = long + 1 + 2 * step;
+        frame(&mut m, i, true);
+        frame(&mut m, i + 1, true);
+        m.interrupt(NOW);
+        if step % 50 == 49 {
+            let now = kept_past_the_window(&m);
+            most.segments = most.segments.max(now.segments);
+        }
+    }
     assert!(
         m.segments_released_early() > 0,
         "the segment cap was reached"
     );
-    assert!(
-        most.parts > 0 && most.parts <= crate::muxer::MAX_RETAINED_PARTS,
+    assert_eq!(
+        most.segments,
+        crate::muxer::MAX_RETAINED_SEGMENTS,
         "{most:?}"
     );
-    assert!(
-        most.segments > 0 && most.segments <= crate::muxer::MAX_RETAINED_SEGMENTS,
-        "{most:?}"
-    );
+    assert_eq!(m.parts_released_early(), 0, "no part went with them");
 }
 
 /// A fragment budget that holds the window but not three more target

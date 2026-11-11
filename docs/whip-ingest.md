@@ -815,9 +815,11 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   What is kept past the window is bounded at 64 MiB, counted once for a
   segment and its parts since they share their bytes, 4,096 parts
   (`muxer::MAX_RETAINED_PARTS`) and 1,024 segments
-  (`muxer::MAX_RETAINED_SEGMENTS`); past any of them, the oldest go early.
-  One byte cap rather than two: a second would count the same bytes twice
-  or allow 128 MiB. What is kept holds its fragment-budget charge. A part
+  (`muxer::MAX_RETAINED_SEGMENTS`). Over a count cap the oldest of that
+  kind go early, parts leaving their segment and segments leaving later
+  parts; over the byte cap the oldest segment and its parts go together,
+  since freeing either alone frees no bytes. One byte cap rather than two:
+  a second would count the same bytes twice or allow 128 MiB. What is kept holds its fragment-budget charge. A part
   encode the budget refuses first frees all of it and tries once more;
   that returns only the bytes no viewer still holds, and a new codec
   epoch's init is not retried. Another stream cannot reclaim it, so each

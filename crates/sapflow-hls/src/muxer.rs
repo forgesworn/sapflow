@@ -2263,6 +2263,35 @@ impl Muxer {
                 self.retained.2 -= 1;
             }
         }
+        // Over a count cap, the oldest of that kind go early: parts in id
+        // order, leaving their segment, or segments, leaving later parts.
+        while self.retained.1 > MAX_RETAINED_PARTS {
+            let Some(i) = self
+                .tagged
+                .iter()
+                .position(|t| t.msn < self.media_sequence && !t.parts_freed)
+            else {
+                break;
+            };
+            let (end_part, parts) = (self.tagged[i].end_part, self.tagged[i].parts);
+            self.free_parts_before(end_part);
+            self.tagged[i].parts_freed = true;
+            self.retained.1 -= parts;
+            self.parts_released_early += parts as u64;
+        }
+        while self.retained.2 > MAX_RETAINED_SEGMENTS {
+            let media_sequence = self.media_sequence;
+            let Some(t) = self
+                .tagged
+                .iter_mut()
+                .find(|t| t.msn < media_sequence && t.segment.is_some())
+            else {
+                break;
+            };
+            t.segment = None;
+            self.retained.2 -= 1;
+            self.segments_released_early += 1;
+        }
         while self
             .tagged
             .front()
@@ -2272,11 +2301,9 @@ impl Muxer {
                 self.retained.0 -= t.bytes;
             }
         }
-        while (self.retained.0 > MAX_RETAINED_BYTES
-            || self.retained.1 > MAX_RETAINED_PARTS
-            || self.retained.2 > MAX_RETAINED_SEGMENTS)
-            && self.release_oldest()
-        {}
+        // Over the byte cap, whole segments and their parts go: they share
+        // their bytes, so freeing only one would free nothing.
+        while self.retained.0 > MAX_RETAINED_BYTES && self.release_oldest() {}
     }
 
     /// Frees every part with an id below `end`. Parts left by a segment
