@@ -50,6 +50,7 @@ pub mod rtcp;
 pub mod rtp;
 pub mod rtx;
 pub mod srtp;
+mod stats;
 
 #[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
