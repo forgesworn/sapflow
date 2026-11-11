@@ -902,7 +902,13 @@ fn receiver(
         routes
             .accepted
             .push((s.mid.clone(), id, s.payload_type, s.rtx_payload_type));
+        // The offer's SSRCs come before the MID: matched by SSRC, a packet
+        // goes to the receiver whatever MID it carries.
+        for ssrc in [s.ssrc, s.rtx_ssrc].into_iter().flatten() {
+            routes.known.insert(0, (ssrc, Some(id)));
+        }
     }
+    routes.known.truncate(MAX_ROUTES);
     Ok((rx, routes))
 }
 

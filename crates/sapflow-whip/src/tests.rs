@@ -525,6 +525,37 @@ fn mid_matching_for_unnamed_ssrcs() {
 }
 
 #[test]
+fn declared_ssrcs_win_over_the_mid() {
+    // The offer names the video SSRC; its packets carry the MID of a
+    // section answered with port 0. By SSRC first, they are video.
+    let t0 = Instant::now();
+    let mut p = Publisher::new(18, &[GCM]);
+    let offer = p
+        .offer()
+        .replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0 1 2")
+        + &format!(
+            "m=video 9 UDP/TLS/RTP/SAVPF 98\r\nc=IN IP4 0.0.0.0\r\na=mid:2\r\na=sendonly\r\n\
+             a=rtcp-mux\r\na=extmap:{MID_ID} {}\r\na=rtpmap:98 H264/90000\r\n",
+            crate::sdp::MID_URI
+        );
+    let mut a = accept(&offer, SessionConfig::default(), t0, 18);
+    assert_eq!(a.negotiated.rejected_mids, ["2"]);
+    p.answered(&a);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    p.video_mid = b"2".to_vec();
+    let (kf, _) = p.keyframe(300);
+    for d in &kf {
+        s.handle_datagram(t0, p.tuple, d);
+    }
+    let st = s.stats();
+    assert_eq!((st.unmatched, st.refused), (0, 0));
+    let video = s.stream(MediaKind::Video).expect("video");
+    let rx = s.receiver().expect("receiver");
+    assert_eq!(rx.stats(video).expect("stats").packets, kf.len() as u64);
+}
+
+#[test]
 fn rtx_repairs_a_lost_packet() {
     let (mut p, mut a, t0) = setup(17, &[GCM]);
     let s = &mut a.session;
