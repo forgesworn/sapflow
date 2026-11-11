@@ -1413,9 +1413,11 @@ Implementation notes (W3c part 1, 11 November 2026):
     connected, the publisher's own next check takes it back (that session
     has no fresh media from it). If it has not connected, it keeps the
     tuple while it checks or handshakes, and the publisher's media is
-    dropped until it connects (the publisher's next check then takes the
-    tuple back) or ends at its handshake deadline, up to 10 s after it was
-    created;
+    dropped until it connects or ends at its handshake deadline, up to 10 s
+    after it was created, and then until the publisher's next check from
+    the tuple takes it back (once that session has ended, the tuple has no
+    owner and the publisher's media from it goes nowhere until that
+    check);
   - an admitted publisher that can spoof addresses can take a tuple
     whenever its owner may lose it: before the owner's first check from
     it, or after the owner has been silent from it for more than 2 s. If
@@ -1456,11 +1458,16 @@ Implementation notes (W3c part 1, 11 November 2026):
   - the session's `MediaDropped`: events the receiver's queue had no room
     for, and, when the session ends, packets still held behind a gap or in
     the start hold (`Receiver::unreleased`);
-  - a full queue to the ingest task, by items or by bytes.
+  - a full queue to the ingest task, by items or by bytes;
+  - an end that is not orderly (consent or media timing out, DTLS
+    failing, keys spent), since the last media may be missing with no
+    later packet to show a gap.
 
   Frames skipped before the first IDR, timeline re-anchors on arrival and
-  sender-report steps lose nothing and do not mark. Each session's lost
-  packets are logged when it ends.
+  sender-report steps lose nothing and do not mark, nor does an orderly
+  end (`DELETE`, our close, the publisher's `close_notify`); loss just
+  before an orderly end cannot be seen. A run that loses nothing stays
+  complete. Each session's lost packets are logged when it ends.
 - **Opus timing.** Audio-only Opus discontinuities under a slewed timeline
   (Open after W3b, above) belong to `sapflow-hls`; the server does not
   work around them. For an audio-only stream, `EXT-X-PROGRAM-DATE-TIME`
@@ -1494,7 +1501,10 @@ Implementation notes (W3c part 1, 11 November 2026):
 | A refused Opus payload (silence filled for loss, no `Lost`) marks the recording | `whip::tests::a_refused_opus_payload_marks_the_recording` | Met |
 | Packets held behind a gap when the session ends mark the recording | `whip::tests::media_held_when_the_session_ends_marks_the_recording` | Met |
 | Receiver events dropped for want of queue room mark the recording | `whip::tests::receiver_events_dropped_for_room_mark_the_recording` | Met |
-| The four paths above are each caught only by their own mark | the same four tests, run with the marks taken out: each fails | Shown when written |
+| The muxer alone, given the same access units and audio, marks none of the four paths above | the same four tests, through `marked_only_by_the_server` | Met |
+| An end that is not orderly marks the recording; an orderly one does not | `whip::tests::an_abnormal_end_marks_the_recording` | Met |
+| A run that loses nothing stays complete | `whip::tests::a_clean_close_leaves_the_recording_complete`; `scripts/whip-e2e.js` (session ended with `lost=0`, recording finished complete) | Met |
+| A full queue's keyframe request sends a PLI at once, with no keyframe interval | `tests::request_keyframe_sends_a_pli_at_once` (sapflow-whip) | Met at the session; the server's call is not tested end to end |
 | A dual-stack listener believes `X-Forwarded-For` from an IPv4 proxy seen IPv4-mapped | `whip_request::tests::forwarded_for_only_from_the_trusted_proxy` | Unit tests only |
 | WHIP settings | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 

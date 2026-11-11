@@ -260,6 +260,9 @@ function hits(text, s) {
 
   // 3. A3.6 privacy, with the check shown to work first.
   const logText = fs.readFileSync(log, 'utf8');
+  const plain = logText.replace(/\x1b\[[0-9;]*m/g, '');
+  check('the session ended with nothing lost', /WHIP session ended reason=Closed lost=0/.test(plain));
+  check('the recording finished complete', /recording finished .*complete=true/.test(plain));
   const list = r ? secrets(r.offer || '', r.publisher) : [TOKEN];
   const planted = logText + `\nplanted ${TOKEN}\n`;
   check('privacy check catches a planted token', hits(planted, TOKEN).length === 1);
