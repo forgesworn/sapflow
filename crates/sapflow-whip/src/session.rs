@@ -32,13 +32,16 @@
 //!   are held, and fed if that tuple is then selected; everything else is
 //!   dropped and counted. Browsers start DTLS once a check succeeds and
 //!   nominate on the next, so this saves a retransmission.
-//! - **SRTP and SRTCP from any validated tuple.** RFC 8445 section 12
-//!   has an agent receive media on any valid pair, and a browser that
-//!   nominates a second pair keeps sending on the first for a moment
-//!   (Chrome 157 did, on loopback). SRTP authenticates every packet, so
-//!   one from a validated tuple is taken; one from any other tuple is
-//!   dropped and counted. What the session sends still goes only to the
-//!   selected tuple.
+//! - **SRTP and SRTCP from any validated tuple.** RFC 8445 section 12.2
+//!   says an agent should be prepared to receive data on any of the
+//!   candidates from the most recent exchange. A lite agent learns the
+//!   publisher's candidates only from its checks, so the validated tuples
+//!   stand in for them; and a browser that nominates a second pair keeps
+//!   sending on the first for a moment (Chrome 157 did, on loopback).
+//!   Consent (RFC 7675) governs sending only. SRTP authenticates every
+//!   packet, so one from a validated tuple is taken; one from any other
+//!   tuple is dropped and counted. What the session sends goes to the
+//!   send tuple, below.
 //! - **SRTP** keys come from the DTLS-SRTP exporter, split with
 //!   `split_keying_material` as the DTLS server: the client's write keys
 //!   unprotect what we receive, the server's protect our RTCP.

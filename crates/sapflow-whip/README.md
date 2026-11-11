@@ -45,11 +45,14 @@ except the test-only example harness.
   validated tuple before its USE-CANDIDATE check are held and fed if that
   tuple is then selected; Chrome 157 did this in every gate 2 run (two
   ClientHello fragments). Everything else is dropped and counted.
-- **SRTP from any validated tuple.** RFC 8445 section 12 has an agent
-  receive media on any valid pair. Chrome 157 nominated a second pair in
-  each gate 2 run and kept sending on the first for a moment; dropping
-  that lost audio. SRTP authenticates every packet, so SRTP and SRTCP from
-  a validated tuple are taken.
+- **SRTP from any validated tuple.** RFC 8445 section 12.2 says an agent
+  should be prepared to receive data on any of the candidates from the
+  most recent exchange; a lite agent learns the publisher's candidates
+  only from its checks, so the validated tuples stand in for them.
+  Consent (RFC 7675) governs sending only. Chrome 157 nominated a second
+  pair in each gate 2 run and kept sending on the first for a moment;
+  dropping that lost audio. SRTP authenticates every packet, so SRTP and
+  SRTCP from a validated tuple are taken.
 - **Where the session sends.** A check that beats its original, or whose
   ID has been forgotten, can still select a replayer's source, so
   selection alone does not decide where DTLS and RTCP go. A tuple is

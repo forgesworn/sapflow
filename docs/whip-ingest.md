@@ -1000,8 +1000,11 @@ Implementation notes (W3a, 11 November 2026):
     successful check with USE-CANDIDATE. Up to four DTLS datagrams from a
     validated tuple are held until it is nominated. Chrome 157 sent its
     two ClientHello fragments that way in every gate 2 run.
-  - SRTP and SRTCP are taken from any validated tuple (RFC 8445 section
-    12), not only the selected one. Chrome 157 nominated a second pair in
+  - SRTP and SRTCP are taken from any validated tuple, not only the
+    selected one. RFC 8445 section 12.2 says an agent should be prepared
+    to receive data on any candidate from the most recent exchange; a lite
+    agent learns the publisher's only from its checks, so the validated
+    tuples stand in for them. Consent (RFC 7675) governs sending only. Chrome 157 nominated a second pair in
     every gate 2 run and kept sending on the first for a moment. The two
     runs that took SRTP only from the selected tuple lost 3 Opus packets
     each (one counted 10 packets dropped); the three after the change lost
