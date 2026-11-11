@@ -1,5 +1,9 @@
 # sapflow-core
 
+Version 0.2.0-rc.1 is an experimental, opt-in prerelease. Physical show-length
+and wider library acceptance remain open. Read the [migration and release notes](https://github.com/forgesworn/sapflow/blob/v0.2.0-rc.1/docs/releases/0.2.0-rc.1.md)
+before upgrading from 0.1.0.
+
 Shared types for the [sapflow](https://github.com/forgesworn/sapflow) live
 media server and its mobile publishing apps: validated stream paths,
 publish requests and credentials, stream-health callback events, rate and
@@ -16,5 +20,5 @@ Most people want one of the other crates:
 
 This crate is prepared for publication because the server depends on it.
 Its types follow what sapflow's host application expects (stream paths are
-`live/event-<id>`); they are not a general media vocabulary. Version 0.1:
+`live/event-<id>`); they are not a general media vocabulary. Pre-1.0:
 the API may change.

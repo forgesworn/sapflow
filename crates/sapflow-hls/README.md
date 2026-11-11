@@ -1,5 +1,9 @@
 # sapflow-hls
 
+Version 0.2.0-rc.1 is an experimental, opt-in prerelease. Physical show-length
+and wider library acceptance remain open. Read the [migration and release notes](https://github.com/forgesworn/sapflow/blob/v0.2.0-rc.1/docs/releases/0.2.0-rc.1.md)
+before upgrading from 0.1.0.
+
 Low-Latency HLS packaging in pure Rust, and the ingest that feeds it: FLV
 tags, MPEG-TS and H.264/AAC elementary streams in, fragmented MP4 parts,
 segments and playlists out.
@@ -96,7 +100,7 @@ connections, the clock and the HTTP server.
 
 ```toml
 [dependencies]
-sapflow-hls = "0.1"
+sapflow-hls = "=0.2.0-rc.1"
 ```
 
 MPEG-TS in, a playlist out:
@@ -160,6 +164,6 @@ recording or codecs; process RSS describes this cache model only.
 
 ## Status
 
-Version 0.1: the API may change. It has run against OBS, Larix, ffmpeg and
+Pre-1.0: the API may change. It has run against OBS, Larix, ffmpeg and
 Safari on iPhone, and its parsers are fuzzed; see the repository's
 `docs/interop.md` and `fuzz/`. H.264 and AAC only.

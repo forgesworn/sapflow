@@ -1,5 +1,9 @@
 # sapflow-rtmp
 
+Version 0.2.0-rc.1 is an experimental, opt-in prerelease. Physical show-length
+and wider library acceptance remain open. Read the [migration and release notes](https://github.com/forgesworn/sapflow/blob/v0.2.0-rc.1/docs/releases/0.2.0-rc.1.md)
+before upgrading from 0.1.0.
+
 RTMP publishing in pure Rust, sans-IO: the server side of a publish
 (`Connection`) and a publishing client (`client::Publisher`). Original and
 digest handshakes, the chunk stream, AMF0 and the publish commands. No
@@ -26,7 +30,7 @@ session in its unit tests.
 
 ```toml
 [dependencies]
-sapflow-rtmp = "0.1"
+sapflow-rtmp = "=0.2.0-rc.1"
 ```
 
 Accepting a publish:
@@ -62,5 +66,5 @@ complete publisher that sends an FLV file to a server.
 
 Publish only: no playback (`play`), no RTMPS (bring your own TLS). Commands
 and metadata are AMF0; the AMF3 message types some encoders send are
-unwrapped to their AMF0 contents. Version 0.1: the API may
+unwrapped to their AMF0 contents. Pre-1.0: the API may
 change.

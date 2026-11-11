@@ -1,5 +1,9 @@
 # sapflow-srt
 
+Version 0.2.0-rc.1 is an experimental, opt-in prerelease. Physical show-length
+and wider library acceptance remain open. Read the [migration and release notes](https://github.com/forgesworn/sapflow/blob/v0.2.0-rc.1/docs/releases/0.2.0-rc.1.md)
+before upgrading from 0.1.0.
+
 sapflow's own SRT: live-mode SRT as a listener and receiver, and as a
 bounded, paced caller and sender, with optional AES-128/256-CTR encryption.
 MIT, like the rest of sapflow.
@@ -24,7 +28,7 @@ source address and the time and gives back datagrams to send, events and
 the next time it needs; the server owns the socket and the timer.
 
 ```sh
-cargo add sapflow-srt
+cargo add sapflow-srt@=0.2.0-rc.1
 ```
 
 API documentation: [docs.rs/sapflow-srt](https://docs.rs/sapflow-srt).
