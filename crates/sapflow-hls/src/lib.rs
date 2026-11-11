@@ -28,6 +28,9 @@ pub use muxer::{Muxer, MuxerConfig, PartLookup, Readiness, Update};
 pub use tracks::TrackSet;
 
 #[cfg(test)]
+mod aac_golden_tests;
+
+#[cfg(test)]
 mod audio_only_tests;
 
 #[cfg(test)]
