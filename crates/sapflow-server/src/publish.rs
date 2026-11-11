@@ -214,6 +214,7 @@ impl Publication {
         let protocol = match kind {
             SourceKind::Ts => crate::publish_auth::Protocol::Srt,
             SourceKind::Flv => crate::publish_auth::Protocol::Rtmp,
+            SourceKind::Es => crate::publish_auth::Protocol::Webrtc,
         };
         use crate::publish_auth::Verdict;
         match crate::publish_auth::ask(endpoint, req, protocol, from).await {
@@ -297,7 +298,11 @@ impl Publication {
             ..MuxerConfig::default()
         };
         // Global-publisher mode: the one authorised publisher may replace its
-        // own stale connection. Scoped sessions keep their single owner.
+        // own stale connection. Scoped sessions keep their single owner, and
+        // so does a WHIP claim: a POST for a live path gets 409, whoever is
+        // publishing (docs/whip-ingest.md, Reconnects). Superseding a stalled
+        // WHIP session is not built yet.
+        let take_over = scope.is_none() && !matches!(kind, SourceKind::Es);
         let recorder_factory = Self::recorder_factory(app, &req.path, &callbacks);
         let mut recording = false;
         let (stream, generation, claim) = app
@@ -306,7 +311,7 @@ impl Publication {
                 &req.path,
                 cfg,
                 kind,
-                scope.is_none(),
+                take_over,
                 app.config.max_publishers,
                 |session, claim| {
                     session.recorder_factory = recorder_factory;
@@ -646,7 +651,7 @@ pub(crate) mod loss_tests {
         pub fn begin(&self) -> Publication {
             self.begin_kind(SourceKind::Ts)
         }
-        fn begin_kind(&self, kind: SourceKind) -> Publication {
+        pub fn begin_kind(&self, kind: SourceKind) -> Publication {
             let req = PublishRequest::parse_srt_stream_id("publish:live/event-a:fixture:fixture")
                 .expect("request");
             Publication::begin(

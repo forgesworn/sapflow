@@ -18,7 +18,7 @@
 
 use crate::ice::{Credentials, Kind, Transport, Tuple, classify};
 use crate::sdp::{self, AnswerConfig, Candidate, Negotiated, Offer};
-use crate::session::{Event, Session, SessionConfig};
+use crate::session::{Event, Session, SessionConfig, Transmit};
 use crate::stun::{self, Builder, Message};
 use sapflow_dtls::testing::{Client, Options};
 use sapflow_dtls::{Fingerprint, Identity};
@@ -371,29 +371,38 @@ impl Publisher {
     pub fn receive(&mut self, s: &mut Session) -> Vec<Vec<u8>> {
         let mut replies = Vec::new();
         while let Some(t) = s.poll_transmit() {
-            if t.tuple != self.tuple {
-                self.misdirected += t.bytes.len();
-                continue;
-            }
-            match classify(&t.bytes) {
-                Kind::Stun => self.stun_answers.push(t.bytes),
-                Kind::Dtls => {
-                    if let Ok(r) = self.client.handle(&t.bytes) {
-                        replies.extend(r);
-                    }
-                    self.receive_keys();
+            replies.extend(self.take(t));
+        }
+        replies
+    }
+
+    /// Handles one datagram sent to us (counted as misdirected if it is
+    /// for another tuple). Returns the DTLS datagrams the client answers
+    /// with.
+    pub fn take(&mut self, t: Transmit) -> Vec<Vec<u8>> {
+        let mut replies = Vec::new();
+        if t.tuple != self.tuple {
+            self.misdirected += t.bytes.len();
+            return replies;
+        }
+        match classify(&t.bytes) {
+            Kind::Stun => self.stun_answers.push(t.bytes),
+            Kind::Dtls => {
+                if let Ok(r) = self.client.handle(&t.bytes) {
+                    replies.extend(r);
                 }
-                Kind::Rtcp => {
-                    let mut b = t.bytes.clone();
-                    let (_, inbound) = self.srtp.as_mut().expect("SRTCP after keys");
-                    let n = inbound
-                        .unprotect_rtcp(&mut b)
-                        .expect("our feedback unprotects");
-                    b.truncate(n);
-                    self.rtcp.push(b);
-                }
-                k => panic!("session sent {k:?}"),
+                self.receive_keys();
             }
+            Kind::Rtcp => {
+                let mut b = t.bytes.clone();
+                let (_, inbound) = self.srtp.as_mut().expect("SRTCP after keys");
+                let n = inbound
+                    .unprotect_rtcp(&mut b)
+                    .expect("our feedback unprotects");
+                b.truncate(n);
+                self.rtcp.push(b);
+            }
+            k => panic!("session sent {k:?}"),
         }
         replies
     }
@@ -513,6 +522,25 @@ impl Publisher {
     }
 
     /// One Opus packet, and advances the clock by 20 ms.
+    /// An audio packet with this payload, as `audio` sends one: for a
+    /// payload the depacketiser must refuse.
+    pub fn audio_payload(&mut self, payload: Vec<u8>) -> Vec<u8> {
+        let extension = self.extension(b"0");
+        let b = RtpBuilder {
+            marker: false,
+            payload_type: OPUS_PT,
+            sequence: self.audio_seq,
+            timestamp: self.audio_ts,
+            ssrc: AUDIO_SSRC,
+            extension,
+            payload,
+            ..RtpBuilder::default()
+        };
+        self.audio_seq = self.audio_seq.wrapping_add(1);
+        self.audio_ts = self.audio_ts.wrapping_add(960);
+        self.protect_rtp(b)
+    }
+
     pub fn audio(&mut self, fill: u8) -> Vec<u8> {
         let extension = self.extension(b"0");
         let b = RtpBuilder {

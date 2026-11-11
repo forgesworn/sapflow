@@ -26,7 +26,8 @@ mod answer;
 mod tests;
 
 pub use answer::{
-    AnswerConfig, Candidate, H264Profile, MID_URI, Negotiated, Stream, TRANSPORT_CC_URI, answer,
+    AnswerConfig, Candidate, H264Profile, MAX_CANDIDATES, MID_URI, Negotiated, Stream,
+    TRANSPORT_CC_URI, answer,
 };
 
 use sapflow_dtls::Fingerprint;

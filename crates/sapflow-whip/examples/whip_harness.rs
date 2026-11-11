@@ -497,6 +497,7 @@ fn main() {
                     println!("aligned: {alignment:?}");
                 }
                 Event::Media(_) => {}
+                Event::MediaDropped { count } => counts.3 += count,
                 Event::Ended(r) => println!("session ended: {r:?}"),
             }
         }

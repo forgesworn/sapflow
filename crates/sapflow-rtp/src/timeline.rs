@@ -194,6 +194,8 @@ struct Track {
     discontinuities: u64,
     /// Timestamps held to the bound or continued by arrival time.
     clamps: u64,
+    /// Of those, the ones held to the bound.
+    held: u64,
 }
 
 /// What [`Timeline::stamp`] gives.
@@ -260,6 +262,7 @@ impl Timeline {
             reanchor: false,
             discontinuities: 0,
             clamps: 0,
+            held: 0,
         });
     }
 
@@ -267,6 +270,13 @@ impl Timeline {
     /// time.
     pub fn clamps(&self, track: usize) -> u64 {
         self.tracks.get(track).map_or(0, |t| t.clamps)
+    }
+
+    /// Of a track's [`Timeline::clamps`], the timestamps held to the bound
+    /// (a little ahead of arrival time); the rest continued by arrival
+    /// time.
+    pub fn held(&self, track: usize) -> u64 {
+        self.tracks.get(track).map_or(0, |t| t.held)
     }
 
     /// Discontinuities the timeline found in a track.
@@ -475,6 +485,7 @@ impl Timeline {
                     // A little ahead of arrival time: held to the bound,
                     // and no slewing further ahead.
                     t.clamps += 1;
+                    t.held += 1;
                     t.slew = t.slew.min(0);
                     (bound.max(l.pts.saturating_add(1)), false)
                 } else {

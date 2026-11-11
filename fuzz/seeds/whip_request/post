@@ -1,0 +1,8 @@
+POST /whip/live/event-abc HTTP/1.1
+host: whip.example
+authorization: Bearer publisher:secret
+content-type: application/sdp
+origin: https://stage.example
+content-length: 4
+
+v=0

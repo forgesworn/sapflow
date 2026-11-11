@@ -25,6 +25,8 @@ mod stream;
 mod test_support;
 #[cfg(test)]
 mod viewer_tests;
+mod whip;
+mod whip_request;
 
 use std::sync::Arc;
 
@@ -194,6 +196,21 @@ async fn run(config: Config) -> std::io::Result<()> {
         },
     )?;
     tracing::info!(addr = %app.config.http_addr, threads, "HLS listening (own event loop)");
+    // WHIP's sockets are bound here, before anything is served, so a bad
+    // address stops the server; with WHIP off nothing is bound.
+    let whip_sockets = match &app.config.whip {
+        Some(config) => Some(whip::Sockets::bind(config).await?),
+        None => None,
+    };
+    let whip_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            match whip_sockets {
+                Some(sockets) => whip::serve(app, sockets).await,
+                None => std::future::pending().await,
+            }
+        }
+    });
     let srt_task = tokio::spawn(srt::listen(app.clone(), app.config.srt_addr));
     let rtmp_task = tokio::spawn({
         let app = app.clone();
@@ -247,6 +264,7 @@ async fn run(config: Config) -> std::io::Result<()> {
             Err(e) => Err(std::io::Error::other(e)),
         },
         r = control_task => r.map_err(std::io::Error::other)?,
+        r = whip_task => r.map_err(std::io::Error::other)?,
         r = expiry_task => r.map_err(std::io::Error::other)?,
     }
 }

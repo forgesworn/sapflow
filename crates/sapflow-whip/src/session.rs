@@ -299,6 +299,14 @@ pub enum Event {
     Connected(sapflow_dtls::SrtpProfile),
     /// From the receiver: access units, audio, alignment, loss.
     Media(sapflow_rtp::Event),
+    /// Media the receiver dropped with no event of its own: events its
+    /// queue had no room for, and, when the session ends, packets still
+    /// held behind an unfilled gap or in the start hold. Whatever records
+    /// the stream is missing something from here.
+    MediaDropped {
+        /// Events or packets dropped.
+        count: u64,
+    },
     /// The session ended.
     Ended(EndReason),
 }
@@ -441,6 +449,8 @@ pub struct Session {
     out: VecDeque<Transmit>,
     events: VecDeque<Event>,
     last_media: Option<Instant>,
+    /// Receiver events dropped that a `MediaDropped` has reported.
+    dropped_reported: u64,
     our_ssrc: u32,
     cname: Vec<u8>,
     stats: SessionStats,
@@ -545,6 +555,7 @@ impl Session {
             out: VecDeque::new(),
             events: VecDeque::new(),
             last_media: None,
+            dropped_reported: 0,
             our_ssrc,
             cname,
             stats: SessionStats::default(),
@@ -588,6 +599,14 @@ impl Session {
     /// route its datagrams here.
     pub fn accepts(&self, tuple: &Tuple) -> bool {
         self.ice.is_validated(tuple)
+    }
+
+    /// When fresh SRTP or SRTCP (authenticated, inside the replay window)
+    /// last arrived from `tuple` while it was validated, or `None`. The UDP
+    /// owner uses it to keep a tuple with the session it is delivering
+    /// media to ([`crate::router`]).
+    pub fn media_from(&self, tuple: &Tuple) -> Option<Instant> {
+        self.ice.media_from(tuple)
     }
 
     /// When the last authenticated RTP packet that the receiver took as
@@ -646,10 +665,16 @@ impl Session {
         if let Some(e) = self.events.pop_front() {
             return Some(e);
         }
-        self.media
-            .as_mut()
-            .and_then(|m| m.rx.poll_event())
-            .map(Event::Media)
+        let media = self.media.as_mut()?;
+        if let Some(e) = media.rx.poll_event() {
+            return Some(Event::Media(e));
+        }
+        let dropped = media.rx.events_dropped();
+        (dropped > self.dropped_reported).then(|| {
+            let count = dropped - self.dropped_reported;
+            self.dropped_reported = dropped;
+            Event::MediaDropped { count }
+        })
     }
 
     /// When [`Session::handle_timeout`] should next be called.
@@ -685,6 +710,24 @@ impl Session {
         if let Some(m) = self.media.as_mut() {
             m.rx.handle_timeout(now);
         }
+        self.flush();
+    }
+
+    /// Asks the publisher for a keyframe now (PLI, or FIR where only that
+    /// was negotiated), within the receiver's minimum interval: for a
+    /// consumer that dropped video and must resync without waiting for
+    /// `keyframe_interval`. Nothing happens before SRTP is up.
+    pub fn request_keyframe(&mut self, now: Instant) {
+        if self.expire(now) {
+            return;
+        }
+        let Some(m) = self.media.as_mut() else {
+            return;
+        };
+        for &(_, id, ..) in &m.routes.accepted {
+            m.rx.request_keyframe(id);
+        }
+        m.rx.handle_timeout(now);
         self.flush();
     }
 
@@ -817,10 +860,16 @@ impl Session {
         if matches!(self.state, State::Ended(_)) {
             return;
         }
-        // Media already released keeps its order before the end.
+        // Media already released keeps its order before the end. What the
+        // receiver still holds, and events it dropped unreported, are lost.
         if let Some(mut m) = self.media.take() {
             while let Some(e) = m.rx.poll_event() {
                 self.events.push_back(Event::Media(e));
+            }
+            let count = (m.rx.unreleased() as u64)
+                .saturating_add(m.rx.events_dropped().saturating_sub(self.dropped_reported));
+            if count > 0 {
+                self.events.push_back(Event::MediaDropped { count });
             }
         }
         self.early.clear();
