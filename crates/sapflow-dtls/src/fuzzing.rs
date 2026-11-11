@@ -328,7 +328,7 @@ pub fn dtls_server(data: &[u8]) -> Reached {
     } else {
         (testing::identity(1), [7; 32], client.fingerprint())
     };
-    let server = Server::new_seeded(config.clone(), identity, expected, seed).expect("server");
+    let server = Server::new_seeded(config.clone(), identity, &[expected], seed).expect("server");
     let mut h = Harness {
         server,
         config,

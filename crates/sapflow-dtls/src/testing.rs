@@ -54,6 +54,12 @@ pub enum Fault {
     NoCertificate,
     /// Send a compressed point in ClientKeyExchange.
     CompressedPoint,
+    /// Send an uncompressed point (`0x04` prefix) whose y is not on the
+    /// curve for its x.
+    OffCurvePoint,
+    /// Send an uncompressed point whose x coordinate is above the field
+    /// prime.
+    CoordinateAboveP,
     /// Leave ChangeCipherSpec out.
     NoChangeCipherSpec,
 }
@@ -78,6 +84,8 @@ pub struct Options {
     /// Fragment our messages to this datagram size.
     pub mtu: usize,
     pub fault: Fault,
+    /// Send this DER as our certificate instead of our own.
+    pub certificate: Option<Vec<u8>>,
 }
 
 impl Default for Options {
@@ -97,6 +105,7 @@ impl Default for Options {
             offer_dtls13: false,
             mtu: 1200,
             fault: Fault::None,
+            certificate: None,
         }
     }
 }
@@ -488,7 +497,12 @@ impl Client {
             put_vec24(&mut cert_body, &[]).unwrap();
         } else {
             let mut list = Vec::new();
-            put_vec24(&mut list, self.identity.certificate_der()).unwrap();
+            let der = self
+                .options
+                .certificate
+                .clone()
+                .unwrap_or_else(|| self.identity.certificate_der().to_vec());
+            put_vec24(&mut list, &der).unwrap();
             put_vec24(&mut cert_body, &list).unwrap();
         }
         let cert = OutMessage {
@@ -501,8 +515,16 @@ impl Client {
         let point = ecdh
             .public_key()
             .to_sec1_point(fault == Fault::CompressedPoint);
+        let mut encoded = point.as_bytes().to_vec();
+        match fault {
+            // y + 1 is never on the curve with y for the same x.
+            Fault::OffCurvePoint => encoded[64] ^= 1,
+            // All ones is above p (p = 2^256 - 2^224 + 2^192 + 2^96 - 1).
+            Fault::CoordinateAboveP => encoded[1..33].fill(0xff),
+            _ => {}
+        }
         let mut cke_body = Vec::new();
-        put_vec8(&mut cke_body, point.as_bytes()).unwrap();
+        put_vec8(&mut cke_body, &encoded).unwrap();
         let cke = OutMessage {
             msg_type: message::CLIENT_KEY_EXCHANGE,
             seq: next(),

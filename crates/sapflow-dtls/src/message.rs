@@ -427,9 +427,9 @@ pub fn client_key_exchange(body: &[u8]) -> Result<&[u8], Error> {
     Ok(point)
 }
 
-/// A CertificateVerify's scheme and DER signature (RFC 5246 section
-/// 7.4.8). The scheme must be `ecdsa_secp256r1_sha256`, as the
-/// CertificateRequest asked.
+/// A CertificateVerify's DER signature (RFC 5246 section 7.4.8). The scheme
+/// must be `ecdsa_secp256r1_sha256`, the only one the CertificateRequest
+/// offered.
 pub fn certificate_verify(body: &[u8]) -> Result<&[u8], Error> {
     let mut r = Reader::new(body);
     let scheme = r.u16().ok_or(Error::Decode)?;
@@ -438,7 +438,7 @@ pub fn certificate_verify(body: &[u8]) -> Result<&[u8], Error> {
         return Err(Error::Decode);
     }
     if scheme != ECDSA_P256_SHA256 {
-        return Err(Error::NoSignatureScheme);
+        return Err(Error::VerifyScheme);
     }
     Ok(sig)
 }
@@ -448,10 +448,11 @@ pub fn finished(body: &[u8]) -> Result<[u8; 12], Error> {
     body.try_into().map_err(|_| Error::Decode)
 }
 
-/// HelloVerifyRequest (RFC 6347 section 4.2.1).
+/// HelloVerifyRequest (RFC 6347 section 4.2.1), with `server_version`
+/// DTLS 1.0, as that section says DTLS 1.2 servers should use.
 pub(crate) fn hello_verify_request(cookie: &[u8]) -> Result<Vec<u8>, Error> {
     let mut b = Vec::with_capacity(3 + cookie.len());
-    put_u16(&mut b, DTLS_1_2);
+    put_u16(&mut b, DTLS_1_0);
     put_vec8(&mut b, cookie)?;
     Ok(b)
 }

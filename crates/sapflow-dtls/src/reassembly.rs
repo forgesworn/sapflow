@@ -1,9 +1,15 @@
 //! Handshake message reassembly (RFC 6347 sections 4.2.2 and 4.2.3), with
 //! hard bounds: a message's declared length is checked against the cap
-//! before anything is allocated, every fragment (duplicate, overlapping,
-//! empty or inconsistent) counts towards the per-message fragment cap, and
-//! all messages in progress together hold at most `max_buffered` bytes.
+//! before anything is allocated; every fragment that adds coverage counts
+//! towards the per-message fragment cap, while duplicates are dropped
+//! without counting; a fragment that disagrees with earlier ones for the
+//! same seq (type, length or epoch) starts one of at most [`MAX_VARIANTS`]
+//! candidates rather than being lost or blocking the real message; and all
+//! messages in progress together hold at most `max_buffered` bytes.
 //! Messages are released strictly in `message_seq` order.
+
+/// Candidates kept for one `message_seq`.
+pub(crate) const MAX_VARIANTS: usize = 4;
 
 use crate::message::Fragment;
 use crate::{Error, Limit};
@@ -119,10 +125,25 @@ impl Reassembler {
         if length > self.limits.max_message {
             return Err(Error::Limit(Limit::MessageSize));
         }
-        let index = match self.partials.iter().position(|p| p.seq == f.seq) {
+        let same = |p: &Partial| {
+            p.seq == f.seq && p.msg_type == f.msg_type && p.body.len() == length && p.epoch == epoch
+        };
+        let index = match self.partials.iter().position(same) {
             Some(i) => i,
             None => {
+                // A fragment that disagrees with an earlier one for this seq
+                // (type, length or epoch) starts a separate candidate, so a
+                // forged first fragment cannot block the real message.
+                let variants = self.partials.iter().filter(|p| p.seq == f.seq).count();
+                if variants >= MAX_VARIANTS {
+                    return Ok(Push::Dropped);
+                }
                 if self.buffered + length > self.limits.max_buffered {
+                    // Refused only for a message seen for the first time;
+                    // a conflicting candidate that does not fit is dropped.
+                    if variants > 0 {
+                        return Ok(Push::Dropped);
+                    }
                     return Err(Error::Limit(Limit::Buffered));
                 }
                 self.buffered += length;
@@ -139,13 +160,6 @@ impl Reassembler {
         };
         let max_fragments = self.limits.max_fragments;
         let p = self.partials.get_mut(index).ok_or(Error::Internal)?;
-        p.fragments += 1;
-        if p.fragments > max_fragments {
-            return Err(Error::Limit(Limit::Fragments));
-        }
-        if p.msg_type != f.msg_type || p.body.len() != length || p.epoch != epoch {
-            return Ok(Push::Dropped);
-        }
         if f.data.is_empty() {
             // Progress only for a zero-length message, which is complete
             // as soon as it is seen.
@@ -157,6 +171,16 @@ impl Reassembler {
         }
         let start = usize::try_from(f.offset).map_err(|_| Error::Internal)?;
         let end = start + f.data.len();
+        if p.covered.iter().any(|&(s, e)| s <= start && end <= e) {
+            // A duplicate: no new bytes, so it neither counts nor stores.
+            return Ok(Push::Dropped);
+        }
+        // Only fragments that add coverage count, so retransmissions and
+        // forged duplicates cannot use up the cap.
+        p.fragments += 1;
+        if p.fragments > max_fragments {
+            return Err(Error::Limit(Limit::Fragments));
+        }
         // `fragments` already checked offset + length against the declared
         // length, and the body has exactly that length.
         p.body
@@ -167,7 +191,8 @@ impl Reassembler {
         Ok(Push::Stored)
     }
 
-    /// The next message in order, if it is complete.
+    /// The next message in order, if it is complete. Other candidates for
+    /// the same seq are discarded with it.
     pub(crate) fn pop(&mut self) -> Option<Message> {
         let i = self
             .partials
@@ -175,6 +200,16 @@ impl Reassembler {
             .position(|p| p.seq == self.next_seq && p.complete())?;
         let p = self.partials.swap_remove(i);
         self.buffered -= p.body.len();
+        let seq = p.seq;
+        let mut freed = 0;
+        self.partials.retain(|q| {
+            let keep = q.seq != seq;
+            if !keep {
+                freed += q.body.len();
+            }
+            keep
+        });
+        self.buffered -= freed;
         self.next_seq = self.next_seq.checked_add(1)?;
         Some(Message {
             msg_type: p.msg_type,
@@ -256,39 +291,62 @@ mod tests {
             Err(Error::Limit(Limit::Buffered)),
             "100 + 51 > 150"
         );
-        // Duplicates and empty fragments are not progress, but count.
-        r.push(0, &frag(0, 100, 0, b"x")).expect("dup");
-        assert_eq!(r.push(0, &frag(0, 100, 5, b"")), Ok(Push::Dropped));
-        r.push(0, &frag(0, 100, 0, b"x")).expect("dup");
+        // Fragments that add coverage count: four are allowed, a fifth is
+        // refused.
+        for o in 1..4 {
+            assert_eq!(r.push(0, &frag(0, 100, o, b"x")), Ok(Push::Stored));
+        }
         assert_eq!(
-            r.push(0, &frag(0, 100, 0, b"x")),
+            r.push(0, &frag(0, 100, 4, b"x")),
             Err(Error::Limit(Limit::Fragments))
         );
     }
 
     #[test]
-    fn inconsistent_fragments_are_dropped() {
-        let mut r = Reassembler::new(Limits {
-            max_fragments: 8,
-            ..LIMITS
-        });
-        r.push(0, &frag(0, 4, 0, b"ab")).expect("first");
-        assert_eq!(
-            r.push(0, &frag(0, 5, 2, b"cd")),
-            Ok(Push::Dropped),
-            "other length"
-        );
-        assert_eq!(
-            r.push(1, &frag(0, 4, 2, b"cd")),
-            Ok(Push::Dropped),
-            "other epoch"
-        );
-        let mut other = frag(0, 4, 2, b"cd");
+    fn duplicates_neither_count_nor_fail() {
+        let mut r = Reassembler::new(LIMITS);
+        r.push(0, &frag(0, 6, 0, b"abc")).expect("first");
+        // Far more repeats than the cap, as heavy loss or a forger could
+        // send: dropped, not counted.
+        for _ in 0..100 {
+            assert_eq!(r.push(0, &frag(0, 6, 0, b"abc")), Ok(Push::Dropped));
+            assert_eq!(r.push(0, &frag(0, 6, 1, b"b")), Ok(Push::Dropped));
+            assert_eq!(r.push(0, &frag(0, 6, 5, b"")), Ok(Push::Dropped));
+        }
+        assert_eq!(r.push(0, &frag(0, 6, 3, b"def")), Ok(Push::Stored));
+        assert_eq!(r.pop().expect("complete").body, b"abcdef");
+    }
+
+    #[test]
+    fn a_conflicting_first_fragment_does_not_block_the_message() {
+        let mut r = Reassembler::new(LIMITS);
+        // A forged fragment arrives first, with another length, epoch and
+        // type: each starts its own candidate.
+        assert_eq!(r.push(0, &frag(0, 5, 0, b"zz")), Ok(Push::Stored));
+        assert_eq!(r.push(1, &frag(0, 4, 0, b"zz")), Ok(Push::Stored));
+        let mut other = frag(0, 4, 0, b"zz");
         other.msg_type = 2;
-        assert_eq!(r.push(0, &other), Ok(Push::Dropped), "other type");
+        assert_eq!(r.push(0, &other), Ok(Push::Stored));
+        // The real message still assembles and is released; the
+        // candidates go with it.
+        r.push(0, &frag(0, 4, 0, b"ab")).expect("real");
         assert_eq!(r.pop(), None);
-        r.push(0, &frag(0, 4, 2, b"cd")).expect("fits");
-        assert_eq!(r.pop().expect("complete").body, b"abcd");
+        r.push(0, &frag(0, 4, 2, b"cd")).expect("real");
+        let m = r.pop().expect("complete");
+        assert_eq!(
+            (m.msg_type, m.epoch, m.body.as_slice()),
+            (1, 0, &b"abcd"[..])
+        );
+        assert_eq!(r.buffered(), 0);
+        // Candidates are bounded: a fifth is dropped, without failing.
+        for len in 10..14 {
+            assert_eq!(r.push(0, &frag(1, len, 0, b"x")), Ok(Push::Stored));
+        }
+        assert_eq!(r.push(0, &frag(1, 20, 0, b"x")), Ok(Push::Dropped));
+        // A conflicting candidate that does not fit the buffer is dropped.
+        let mut r = Reassembler::new(LIMITS);
+        r.push(0, &frag(0, 100, 0, b"x")).expect("first");
+        assert_eq!(r.push(0, &frag(0, 60, 0, b"x")), Ok(Push::Dropped));
     }
 
     #[test]

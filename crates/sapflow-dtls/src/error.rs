@@ -67,8 +67,12 @@ pub enum Error {
     /// `secp256r1` is not in `supported_groups`, or the extension is absent.
     NoGroup,
     /// `ecdsa_secp256r1_sha256` is not in `signature_algorithms`, or the
-    /// extension is absent, or a CertificateVerify used another scheme.
+    /// extension is absent.
     NoSignatureScheme,
+    /// A CertificateVerify used a scheme other than
+    /// `ecdsa_secp256r1_sha256`, the only one the CertificateRequest
+    /// offered.
+    VerifyScheme,
     /// No `extended_master_secret` extension (RFC 7627).
     NoExtendedMasterSecret,
     /// Neither `renegotiation_info` nor the SCSV (RFC 5746).
@@ -92,11 +96,15 @@ pub enum Error {
     Decode,
     /// A handshake message, or ChangeCipherSpec, out of order.
     UnexpectedMessage,
-    /// An empty Certificate message.
+    /// An empty Certificate message. A client whose only certificate is
+    /// not ECDSA P-256 (an RSA one, say) sends this: the CertificateRequest
+    /// asks only for `ecdsa_sign` with `ecdsa_secp256r1_sha256`, so the
+    /// certificate never reaches the server. OpenSSL 4 does exactly that.
     NoCertificate,
     /// The peer's leaf certificate does not parse, or its key is invalid.
     BadCertificate,
-    /// The peer's certificate key is not ECDSA P-256.
+    /// The peer sent a certificate (its fingerprint matched) whose key is
+    /// not ECDSA P-256.
     UnsupportedCertificate,
     /// The SHA-256 of the peer's certificate is not the expected
     /// fingerprint from the offer.
@@ -142,7 +150,8 @@ impl Error {
             Self::Compression
             | Self::PointFormat
             | Self::DuplicateExtension
-            | Self::BadKeyShare => ILLEGAL_PARAMETER,
+            | Self::BadKeyShare
+            | Self::VerifyScheme => ILLEGAL_PARAMETER,
             Self::Decode => DECODE_ERROR,
             Self::UnexpectedMessage => UNEXPECTED_MESSAGE,
             Self::BadCertificate | Self::FingerprintMismatch => BAD_CERTIFICATE,

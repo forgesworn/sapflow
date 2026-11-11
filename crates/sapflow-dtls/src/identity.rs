@@ -115,9 +115,10 @@ impl fmt::Debug for Identity {
 
 impl Identity {
     /// A new ECDSA P-256 key and a self-signed certificate for it, valid
-    /// from a day before `unix_time` for 30 days (peers do not check the
-    /// dates). `unix_time` is the wall clock, passed in so the crate keeps
-    /// no clock of its own.
+    /// from a day before `unix_time` to 366 days after it. Peers do not
+    /// check the dates, and the server makes a new identity each time it
+    /// starts; the year is margin for a long-running process. `unix_time`
+    /// is the wall clock, passed in so the crate keeps no clock of its own.
     pub fn generate(unix_time: Duration) -> Result<Self, Error> {
         Self::generate_with(&mut Entropy::System, unix_time)
     }
@@ -225,7 +226,7 @@ fn self_signed(key: &SigningKey, serial: &[u8], unix_time: Duration) -> Result<V
     let day = Duration::from_secs(86_400);
     let validity = seq(&[
         &utc(unix_time.saturating_sub(day))?,
-        &utc(unix_time.saturating_add(30 * day))?,
+        &utc(unix_time.saturating_add(366 * day))?,
     ])?;
     let point = key.verifying_key().to_sec1_point(false);
     let mut bits = vec![0u8];
@@ -319,6 +320,17 @@ mod tests {
             "seeded is reproducible"
         );
         assert!(!format!("{id:?}").contains("key:"));
+        let v = cert.tbs_certificate().validity();
+        let span = v.not_after.to_unix_duration() - v.not_before.to_unix_duration();
+        assert_eq!(
+            span,
+            Duration::from_secs(367 * 86_400),
+            "a day before to a year after"
+        );
+        assert_eq!(
+            v.not_before.to_unix_duration(),
+            Duration::from_secs(1_793_000_000 - 86_400)
+        );
     }
 
     #[test]

@@ -68,5 +68,6 @@ pub use error::{ConfigError, Error, Limit, alert};
 pub use identity::{Fingerprint, Identity};
 pub use message::SrtpProfile;
 pub use server::{
-    Config, Connected, Event, KeyingMaterial, MAX_CHAIN, MAX_QUEUED, Server, State, Stats,
+    Config, Connected, Event, KeyingMaterial, MAX_CHAIN, MAX_EXPECTED_FINGERPRINTS, MAX_QUEUED,
+    Server, State, Stats,
 };

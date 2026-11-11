@@ -27,7 +27,7 @@ fn pair_with(options: Options, config: Config, expected: Option<Fingerprint>) ->
     let mut client = client;
     client.expect_server(id.fingerprint());
     Pair {
-        server: Server::new_seeded(config, id, expected, SEED).expect("server"),
+        server: Server::new_seeded(config, id, &[expected], SEED).expect("server"),
         client,
         now: Instant::now(),
     }
@@ -206,16 +206,36 @@ fn fingerprint_mismatch_is_refused() {
     assert!(p.drain().is_empty());
 }
 
+/// RFC 8122 allows several fingerprints in an offer: any one of up to four
+/// may match, and the set may be neither empty nor larger.
+#[test]
+fn any_of_the_expected_fingerprints_matches() {
+    let other = |b| Fingerprint::from_bytes([b; 32]);
+    let client = Client::new(Options::default(), testing::identity(2), 3);
+    let set = [other(1), client.fingerprint(), other(2), other(3)];
+    let mut p = pair(Options::default());
+    p.server =
+        Server::new_seeded(Config::default(), testing::identity(1), &set, SEED).expect("server");
+    p.run().expect("handshake");
+    assert_eq!(p.connected().peer_fingerprint, client.fingerprint());
+
+    let mut p = pair(Options::default());
+    let wrong = [other(1), other(2), other(3), other(4)];
+    p.server =
+        Server::new_seeded(Config::default(), testing::identity(1), &wrong, SEED).expect("server");
+    assert_eq!(p.run(), Err(Error::FingerprintMismatch));
+
+    for bad in [&[][..], &[other(1); 5][..]] {
+        assert!(Server::new(Config::default(), testing::identity(1), bad).is_err());
+    }
+}
+
 #[test]
 fn client_flight_faults_are_refused() {
     use alert::*;
     for (fault, err, desc) in [
         (Fault::WrongSigningKey, Error::BadSignature, DECRYPT_ERROR),
-        (
-            Fault::VerifyScheme,
-            Error::NoSignatureScheme,
-            HANDSHAKE_FAILURE,
-        ),
+        (Fault::VerifyScheme, Error::VerifyScheme, ILLEGAL_PARAMETER),
         (
             Fault::NoCertificate,
             Error::NoCertificate,
@@ -223,6 +243,12 @@ fn client_flight_faults_are_refused() {
         ),
         (
             Fault::CompressedPoint,
+            Error::BadKeyShare,
+            ILLEGAL_PARAMETER,
+        ),
+        (Fault::OffCurvePoint, Error::BadKeyShare, ILLEGAL_PARAMETER),
+        (
+            Fault::CoordinateAboveP,
             Error::BadKeyShare,
             ILLEGAL_PARAMETER,
         ),
@@ -235,7 +261,38 @@ fn client_flight_faults_are_refused() {
         assert_eq!(p.run(), Err(err), "{fault:?}");
         assert_eq!(plain_alert(&p.drain()), [FATAL, desc], "{fault:?}");
         assert!(p.server.poll_event().is_none());
+        if err == Error::BadKeyShare {
+            assert_eq!(p.server.stats().key_agreements, 0, "{fault:?}: no ECDH");
+        }
     }
+}
+
+/// A client that does send a certificate whose key is not P-256 (here an
+/// RSA certificate made by OpenSSL) is refused with
+/// `unsupported_certificate`, once its fingerprint has matched. A client
+/// that sends none (OpenSSL with only an RSA key does this, since we ask
+/// only for `ecdsa_sign`) is `NoCertificate`, which the faults above cover.
+#[test]
+fn rsa_client_certificate_is_unsupported() {
+    let rsa = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rsa-client-cert.der"),
+    )
+    .expect("fixture");
+    let options = Options {
+        certificate: Some(rsa.clone()),
+        ..Options::default()
+    };
+    let mut p = pair_with(
+        options,
+        Config::default(),
+        Some(Fingerprint::of_certificate(&rsa)),
+    );
+    assert_eq!(p.run(), Err(Error::UnsupportedCertificate));
+    assert_eq!(
+        plain_alert(&p.drain()),
+        [alert::FATAL, alert::UNSUPPORTED_CERTIFICATE]
+    );
+    assert_eq!(p.server.stats().verifications, 0);
 }
 
 #[test]
@@ -260,7 +317,7 @@ fn captured_hellos_get_a_first_flight_then_time_out() {
         let mut s = Server::new_seeded(
             config.clone(),
             id.clone(),
-            Fingerprint::from_bytes([0; 32]),
+            &[Fingerprint::from_bytes([0; 32])],
             SEED,
         )
         .expect("server");
@@ -380,8 +437,12 @@ fn retransmitted_hello_resends_once_per_spacing_and_within_budget() {
     // Immediately repeated: too soon after our send.
     p.feed(&hello).expect("repeat");
     assert!(p.drain().is_empty());
-    // Half the initial timeout later: resent, with new record numbers.
-    p.now += Duration::from_millis(500);
+    // Still too soon at 150 ms; past the 200 ms floor, resent with new
+    // record numbers (the 1 s timer has not fired).
+    p.now += Duration::from_millis(150);
+    p.feed(&hello).expect("repeat");
+    assert!(p.drain().is_empty());
+    p.now += Duration::from_millis(100);
     p.feed(&hello).expect("repeat");
     let again = p.drain();
     assert_eq!(flight_types(&again), flight_types(&first));
@@ -492,12 +553,46 @@ fn oversized_hello_is_refused() {
 
 #[test]
 fn too_many_fragments_are_refused() {
+    // 33 fragments that each add coverage: the 33rd is refused.
     let mut p = pair(Options::default());
     let mut last = Ok(());
-    for i in 0..33u64 {
-        last = p.feed(&[fragment_record(1, 0, 4000, 0, &[1; 10], i)]);
+    for i in 0..33u32 {
+        last = p.feed(&[fragment_record(1, 0, 4000, i * 10, &[1; 10], u64::from(i))]);
     }
     assert_eq!(last, Err(Error::Limit(Limit::Fragments)));
+}
+
+#[test]
+fn repeated_fragments_beyond_the_cap_do_not_end_the_handshake() {
+    let mut p = pair(Options {
+        mtu: 70,
+        ..Options::default()
+    });
+    let hello = p.client.start();
+    assert!(hello.len() > 2);
+    // The first fragment 100 times, as heavy loss or a forger might send.
+    for _ in 0..100 {
+        p.feed(&hello[..1]).expect("duplicate");
+    }
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    p.feed(&hello[1..]).expect("rest");
+    assert_eq!(p.server.state(), State::Handshaking);
+}
+
+#[test]
+fn a_forged_first_fragment_does_not_block_the_hello() {
+    let mut p = pair(Options::default());
+    let hello = p.client.start();
+    let r = record::records(&hello[0]).next().expect("record");
+    let f = message::fragments(r.body).next().expect("fragment");
+    // Same seq, another declared length, sent first; then another type.
+    let forged = fragment_record(1, 0, f.length + 7, 0, &f.data[..20], 0);
+    let typed = fragment_record(2, 0, f.length, 0, &f.data[..20], 1);
+    p.feed(&[forged, typed]).expect("forged");
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    p.feed(&hello).expect("real hello");
+    assert_eq!(p.server.state(), State::Handshaking);
+    assert_eq!(p.server.buffered(), 0, "the forged candidates went with it");
 }
 
 #[test]
@@ -787,6 +882,7 @@ fn unpolled_output_is_bounded() {
     let config = Config {
         initial_retransmit: Duration::from_millis(10),
         max_retransmit: Duration::from_millis(10),
+        min_resend_interval: Duration::from_millis(5),
         max_transmissions: 32,
         mtu: 256,
         ..Config::default()
@@ -881,7 +977,7 @@ fn config_ranges() {
     ] {
         assert!(bad.validate().is_err(), "{bad:?}");
         let id = testing::identity(1);
-        assert!(Server::new(bad, id, Fingerprint::from_bytes([0; 32])).is_err());
+        assert!(Server::new(bad, id, &[Fingerprint::from_bytes([0; 32])]).is_err());
     }
 }
 
@@ -978,8 +1074,8 @@ fn openssl_runs_replay_byte_for_byte() {
         let run = load_run(name);
         assert_eq!(run.openssl, run.sapflow, "{name}: the live run matched");
         let id = Arc::new(Identity::generate_seeded(seed, TEST_TIME).expect("identity"));
-        let mut s =
-            Server::new_seeded(interop_config(name), id, run.expected_peer, seed).expect("server");
+        let mut s = Server::new_seeded(interop_config(name), id, &[run.expected_peer], seed)
+            .expect("server");
         let base = Instant::now();
         let mut produced = Vec::new();
         for (dir, ms, bytes) in &run.lines {

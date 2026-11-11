@@ -45,6 +45,8 @@ pub const MAX_CHAIN: usize = 4;
 /// produces more than a flight and an alert; if the caller stops polling,
 /// further output is dropped and counted in [`Stats::output_dropped`].
 pub const MAX_QUEUED: usize = 16;
+/// Most expected peer fingerprints [`Server::new`] takes.
+pub const MAX_EXPECTED_FINGERPRINTS: usize = 4;
 /// Messages past the next expected one that reassembly buffers. The
 /// client's longest flight is four handshake messages.
 const AHEAD: u16 = 4;
@@ -65,8 +67,13 @@ pub struct Config {
     /// 1 s). Default 1 s.
     pub initial_retransmit: Duration,
     /// Longest retransmission timeout; the timer doubles up to it. Default
-    /// 60 s, the RFC's floor for the cap.
+    /// 60 s, the RFC's floor for the cap. With the defaults an unanswered
+    /// flight 4 is sent at 0, 1, 3, 7, 15 and 31 s and the handshake fails
+    /// at 63 s, so the caller needs its own, shorter handshake deadline.
     pub max_retransmit: Duration,
+    /// Shortest gap between a send of our flight and a resend triggered by
+    /// the peer's retransmission. Up to `max_retransmit`; default 200 ms.
+    pub min_resend_interval: Duration,
     /// Most sends of one flight, the first included, whatever triggered
     /// them. After that many sends of flight 4 with no reply the handshake
     /// fails with [`Error::Timeout`]. 1 to 32; default 6.
@@ -95,6 +102,7 @@ impl Default for Config {
             max_datagram: 1500,
             initial_retransmit: Duration::from_secs(1),
             max_retransmit: Duration::from_secs(60),
+            min_resend_interval: Duration::from_millis(200),
             max_transmissions: 6,
             hello_verify: false,
             max_message_len: 8192,
@@ -113,7 +121,8 @@ impl Config {
         check(
             self.initial_retransmit >= Duration::from_millis(10)
                 && self.initial_retransmit <= self.max_retransmit
-                && self.max_retransmit <= Duration::from_secs(600),
+                && self.max_retransmit <= Duration::from_secs(600)
+                && self.min_resend_interval <= self.max_retransmit,
             "retransmit timers",
         )?;
         check(
@@ -251,7 +260,8 @@ struct Handshake {
 pub struct Server {
     config: Config,
     identity: Arc<Identity>,
-    expected: Fingerprint,
+    /// One to [`MAX_EXPECTED_FINGERPRINTS`] acceptable fingerprints.
+    expected: Vec<Fingerprint>,
     entropy: Entropy,
     cookie_secret: Option<Zeroizing<[u8; 32]>>,
     phase: Phase,
@@ -308,14 +318,16 @@ fn whole(m: &Message) -> Result<Vec<u8>, Error> {
 
 impl Server {
     /// A server that will accept only a peer whose certificate's SHA-256 is
-    /// `expected_peer`, the `a=fingerprint` of the offer that came with the
-    /// admitted request. There is no way to skip this check.
+    /// one of `expected_peers`: the `sha-256` `a=fingerprint` values of the
+    /// offer that came with the admitted request (RFC 8122 allows several).
+    /// One to [`MAX_EXPECTED_FINGERPRINTS`] of them; there is no way to skip
+    /// the check.
     pub fn new(
         config: Config,
         identity: Arc<Identity>,
-        expected_peer: Fingerprint,
+        expected_peers: &[Fingerprint],
     ) -> Result<Self, ConfigError> {
-        Self::with_entropy(config, identity, expected_peer, Entropy::System)
+        Self::with_entropy(config, identity, expected_peers, Entropy::System)
     }
 
     /// As [`Server::new`], with randomness from a seed so that a run
@@ -324,23 +336,27 @@ impl Server {
     pub fn new_seeded(
         config: Config,
         identity: Arc<Identity>,
-        expected_peer: Fingerprint,
+        expected_peers: &[Fingerprint],
         seed: [u8; 32],
     ) -> Result<Self, ConfigError> {
         let entropy = Entropy::Seeded {
             seed: Zeroizing::new(seed),
             counter: 0,
         };
-        Self::with_entropy(config, identity, expected_peer, entropy)
+        Self::with_entropy(config, identity, expected_peers, entropy)
     }
 
     fn with_entropy(
         config: Config,
         identity: Arc<Identity>,
-        expected: Fingerprint,
+        expected_peers: &[Fingerprint],
         entropy: Entropy,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
+        if !(1..=MAX_EXPECTED_FINGERPRINTS).contains(&expected_peers.len()) {
+            return Err(ConfigError("expected fingerprints"));
+        }
+        let expected = expected_peers.to_vec();
         let limits = Limits {
             max_message: config.max_message_len,
             max_fragments: config.max_fragments,
@@ -547,8 +563,8 @@ impl Server {
 
     /// A retransmission from the peer suggests our flight was lost (RFC
     /// 6347 section 4.2.4). At most one resend per input datagram, none
-    /// beyond [`Config::max_transmissions`], and none sooner than half the
-    /// initial timeout after the last send.
+    /// beyond [`Config::max_transmissions`], and none sooner than
+    /// [`Config::min_resend_interval`] after the last send.
     fn resend(&mut self, now: Instant) -> Result<(), Error> {
         if self.sent_this_input
             || self.flight.is_none()
@@ -558,7 +574,7 @@ impl Server {
         }
         if self
             .last_sent
-            .is_some_and(|last| now < last + self.config.initial_retransmit / 2)
+            .is_some_and(|last| now < last + self.config.min_resend_interval)
         {
             return Ok(());
         }
@@ -915,7 +931,13 @@ impl Server {
                 let leaf = message::certificate_leaf(&m.body, MAX_CHAIN)?;
                 // Compared before the DER is parsed at all.
                 let fingerprint = Fingerprint::of_certificate(leaf);
-                if !fingerprint.ct_eq(&self.expected) {
+                // Every candidate is compared, so the time taken does not
+                // depend on which one matched.
+                let matched = self
+                    .expected
+                    .iter()
+                    .fold(false, |any, e| any | fingerprint.ct_eq(e));
+                if !matched {
                     return Err(Error::FingerprintMismatch);
                 }
                 hs.peer = Some(identity::peer_key(leaf)?);

@@ -79,8 +79,8 @@ fn main() {
         .unwrap(),
     });
     let mut server = match seed {
-        Some(s) => Server::new_seeded(config, identity.clone(), expect, s).unwrap(),
-        None => Server::new(config, identity.clone(), expect).unwrap(),
+        Some(s) => Server::new_seeded(config, identity.clone(), &[expect], s).unwrap(),
+        None => Server::new(config, identity.clone(), &[expect]).unwrap(),
     };
     println!("server fingerprint: sha-256 {}", identity.fingerprint());
     let socket = UdpSocket::bind(&bind).unwrap();

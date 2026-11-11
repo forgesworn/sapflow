@@ -341,7 +341,11 @@ fn key_exchange_verify_and_finished_bounds() {
     assert_eq!(certificate_verify(&[4, 3, 0, 1, 9]), Ok(&[9][..]));
     assert_eq!(
         certificate_verify(&[5, 3, 0, 1, 9]),
-        Err(Error::NoSignatureScheme)
+        Err(Error::VerifyScheme)
+    );
+    assert_eq!(
+        Error::VerifyScheme.alert(),
+        Some(crate::alert::ILLEGAL_PARAMETER)
     );
     assert_eq!(certificate_verify(&[4, 3, 0, 0]), Err(Error::Decode));
     assert_eq!(certificate_verify(&[4, 3, 0, 2, 9]), Err(Error::Decode));
