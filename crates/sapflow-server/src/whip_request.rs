@@ -140,7 +140,10 @@ pub fn publisher_ip(
     trusted: Option<IpAddr>,
     forwarded_for: Option<&str>,
 ) -> Result<IpAddr, Refused> {
-    if trusted != Some(peer) {
+    // A dual-stack listener sees an IPv4 peer as an IPv4-mapped IPv6
+    // address: compare the canonical forms.
+    let peer = peer.to_canonical();
+    if trusted.map(|t| t.to_canonical()) != Some(peer) {
         return Ok(peer);
     }
     forwarded_for
@@ -411,6 +414,22 @@ mod tests {
             publisher_ip(proxy, Some(proxy), Some("198.51.100.1, 192.0.2.9")),
             Ok(client),
             "the entry the proxy added"
+        );
+        // On a dual-stack listener the proxy arrives IPv4-mapped, and an
+        // IPv6 setting can name an IPv4 proxy the same way.
+        let mapped: IpAddr = "::ffff:10.0.0.1".parse().expect("ip");
+        assert_eq!(
+            publisher_ip(mapped, Some(proxy), Some("192.0.2.9")),
+            Ok(client)
+        );
+        assert_eq!(
+            publisher_ip(proxy, Some(mapped), Some("192.0.2.9")),
+            Ok(client)
+        );
+        let other: IpAddr = "::ffff:10.0.0.2".parse().expect("ip");
+        assert_eq!(
+            publisher_ip(other, Some(proxy), Some("192.0.2.9")),
+            Ok(peer)
         );
         for bad in [None, Some(""), Some("192.0.2.9:4000"), Some("unknown")] {
             assert_eq!(
