@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use sapflow_whip::testing::{PPS, Publisher, StunClient, VIDEO_SSRC, idr_slice, server_identity};
 use sapflow_whip::{Transmit, Tuple};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -272,8 +273,14 @@ async fn a_publisher_reaches_the_stream_through_post_and_udp() {
     assert_eq!(a.header("access-control-expose-headers"), Some("location"));
     assert!(a.body.contains("a=ice-lite"));
     phone.connect().await;
-    phone.publish(3).await;
     let stream = server.app.streams.get("event-whip-one").expect("claimed");
+    // A second at a time, up to ten, until a part is out.
+    for _ in 0..10 {
+        phone.publish(1).await;
+        if stream.has_content() {
+            break;
+        }
+    }
     assert!(stream.has_content(), "media reached the playlist");
 
     let path = format!("/whip/session/{id}");
@@ -448,8 +455,13 @@ async fn past_the_session_cap_a_post_gets_503() {
     )
     .await;
     assert_eq!(full.status, 503);
-    // Its claim was released: nothing holds event-b.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Its claim is released: nothing holds event-b.
+    for _ in 0..50 {
+        if server.app.streams.get("event-b").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(server.app.streams.get("event-b").is_none());
 }
 
@@ -479,14 +491,18 @@ async fn audio_run(
     assert!(!a.body.contains("m=video"));
     phone.answered(&a.body);
     phone.connect().await;
-    for n in 0..150u64 {
+    let stream = server.app.streams.get(event).expect("claimed");
+    // At least 3 s, and on until a part is out (at most 10 s).
+    for n in 0..500u64 {
         let packet = phone.p.audio((n % 251) as u8);
         if !skip.contains(&n) {
             phone.send(&packet).await;
         }
         phone.receive(Duration::from_millis(20)).await;
+        if n >= 150 && stream.has_content() {
+            break;
+        }
     }
-    let stream = server.app.streams.get(event).expect("claimed");
     assert!(stream.has_content(), "audio-only Opus reached the playlist");
     let session = stream.session();
     let recorder = session.recorder.as_ref().expect("recording");
@@ -568,4 +584,43 @@ async fn receiver_loss_is_counted_and_marks_the_recording() {
     assert_eq!(feed.push(Media::Loss { packets: 0 }), Ok(()));
     assert_eq!(feed.lost(), 3);
     assert_eq!(status.reason(), Some(IncompleteReason::MediaLoss));
+}
+
+/// Only SRTP and SRTCP the session authenticated count against the
+/// bitrate cap: bytes spoofed from the publisher's tuple do not.
+#[tokio::test]
+async fn only_authenticated_media_counts_against_the_cap() {
+    let t0 = Instant::now();
+    let mut router = Router::new(RouterConfig::default()).expect("router");
+    let mut p = Publisher::new(30, &[GCM]);
+    let a = sapflow_whip::testing::accept(&p.offer(), SessionConfig::default(), t0, 30);
+    p.answered(&a);
+    let id = SessionId::generate_seeded([30; 32]).expect("id");
+    router.insert(id, a.session).expect("room");
+    router.handle_datagram(t0, p.tuple, &p.check(true));
+    let mut pending = p.client.start();
+    for _ in 0..16 {
+        for d in std::mem::take(&mut pending) {
+            router.handle_datagram(t0, p.tuple, &d);
+        }
+        while let Some(t) = router.poll_transmit() {
+            if classify(&t.bytes) != Kind::Rtcp {
+                pending.extend(p.take(t));
+            }
+        }
+        if p.has_keys() && pending.is_empty() {
+            break;
+        }
+    }
+    assert!(p.has_keys());
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let publication = fixture.begin();
+    let (tx, _rx) = mpsc::channel(4);
+    let mut feeds = HashMap::from([(id, Feed::new(tx, publication.loss_notice()))]);
+    let junk = [0x80, 0x6f, 0, 9, 0, 0, 0, 1, 0, 0, 0x10, 0x01, 1, 2, 3, 4];
+    receive(&mut router, &mut feeds, p.tuple, &junk);
+    assert_eq!(feeds[&id].received, 0, "spoofed bytes count");
+    let audio = p.audio(1);
+    receive(&mut router, &mut feeds, p.tuple, &audio);
+    assert_eq!(feeds[&id].received, audio.len());
 }

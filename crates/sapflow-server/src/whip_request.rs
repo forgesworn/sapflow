@@ -251,6 +251,42 @@ mod tests {
         assert!(n >= 6, "{n} seeds");
     }
 
+    /// A fixed-seed mutation pass over the seeds: byte flips, cuts and
+    /// insertions, each through the fuzz target's checks. Not coverage
+    /// guided; it runs where cargo-fuzz does not.
+    #[test]
+    fn mutated_seeds_hold_the_fuzz_checks() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/whip_request");
+        let mut state = 0x5eed_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        let mut runs = 0;
+        for entry in std::fs::read_dir(&dir).expect("seeds") {
+            let seed = std::fs::read(entry.expect("seed").path()).expect("seed");
+            for _ in 0..2_000 {
+                let mut b = seed.clone();
+                for _ in 0..1 + next() % 4 {
+                    let i = next() % b.len().max(1);
+                    match next() % 4 {
+                        0 if !b.is_empty() => b[i] ^= 1 << (next() % 8),
+                        1 if !b.is_empty() => b.truncate(i),
+                        2 => b.insert(i.min(b.len()), b"\r\n:, \0A"[next() % 7]),
+                        _ if !b.is_empty() => b[i] = next() as u8,
+                        _ => {}
+                    }
+                }
+                check(&b);
+                runs += 1;
+            }
+        }
+        assert!(runs >= 12_000);
+    }
+
     fn head(raw: &str) -> RequestHead {
         match crate::http_lite::parse_request(raw.as_bytes()) {
             crate::http_lite::ParsedRequest::Complete(h, _) => h,
