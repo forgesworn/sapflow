@@ -35,9 +35,10 @@ mod tls;
 mod front_tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
@@ -211,7 +212,11 @@ struct Outcome {
 
 /// Runs the viewers to the end of the measurement and returns what they saw.
 async fn run(a: &Args) -> Result<Outcome, String> {
-    let start = Instant::now()
+    let origin = Instant::now();
+    let unix_origin = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock precedes Unix epoch")?;
+    let start = origin
         .checked_add(Duration::from_secs(a.ramp))
         .ok_or("ramp is too long")?;
     let window = CollectionWindow {
@@ -220,6 +225,13 @@ async fn run(a: &Args) -> Result<Outcome, String> {
             .checked_add(Duration::from_secs(a.secs))
             .ok_or("measurement is too long")?,
     };
+    // The external CPU sampler can align to the actual collection window,
+    // rather than assuming process launch and runtime startup are immediate.
+    // Request admission continues to use the monotonic Instant above.
+    let unix_start = unix_origin.as_nanos() + u128::from(a.ramp) * 1_000_000_000;
+    let unix_end = unix_start + u128::from(a.secs) * 1_000_000_000;
+    println!("qualification window_start_unix_ns {unix_start} window_end_unix_ns {unix_end}");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
     let cohort = || {
         Arc::new(Mutex::new(Stats {
             window: Some(window),
@@ -699,6 +711,12 @@ fn protocols(st: &Stats) -> String {
         .join(", ")
 }
 
+fn qualification_part_reach(st: &Stats) -> (usize, f64) {
+    let parts = st.parts.len();
+    let observations: usize = st.parts.values().map(Vec::len).sum();
+    (parts, observations as f64 / parts.max(1) as f64)
+}
+
 fn report(a: &Args, out: &Outcome) {
     let st = &out.normal;
     // The viewers the figures below cover: all of them unless some are slow.
@@ -718,6 +736,15 @@ fn report(a: &Args, out: &Outcome) {
         reach.push(times.len());
     }
     let mean_reach = reach.iter().sum::<usize>() as f64 / reach.len().max(1) as f64;
+    let (observed_parts, qualification_reach) = qualification_part_reach(st);
+    println!(
+        "qualification received_bytes {} playlist_samples {} segment_samples {} observed_parts {} mean_part_reach {:.6}",
+        st.bytes,
+        st.playlist.len(),
+        st.segment.len(),
+        observed_parts,
+        qualification_reach
+    );
     let mut pl_spread: Vec<Duration> = st
         .playlist_updates
         .values()
@@ -824,6 +851,18 @@ fn report_slow(a: &Args, st: &Stats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualification_reach_includes_parts_seen_by_only_one_viewer() {
+        let now = Instant::now();
+        let mut stats = Stats::default();
+        stats.parts.insert("shared".into(), vec![now; 2]);
+        for n in 0..9 {
+            stats.parts.insert(format!("singleton-{n}"), vec![now]);
+        }
+        assert_eq!(qualification_part_reach(&stats), (10, 1.1));
+        assert_eq!(qualification_part_reach(&Stats::default()), (0, 0.0));
+    }
 
     #[test]
     fn collection_excludes_ramp_and_post_deadline_starts_but_retains_slow_completions() {

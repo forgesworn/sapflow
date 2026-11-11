@@ -44,12 +44,11 @@ fn packet(seq: u32, timestamp: u32, payload: &[u8]) -> DataPacket<'_> {
     }
 }
 
-fn gap_queries(gap: u32, pending: bool) {
+fn gap_queries(gap: u32, pending: bool, queries: usize) {
     let mut r = receiver();
     r.on_data(0, &packet(gap, 0, b"verified"));
     while r.take_send().is_some() {}
     let expected = r.next_timer();
-    let queries = if gap == 0 { CLEAN_QUERIES } else { GAP_QUERIES };
     let started = Instant::now();
     for _ in 0..queries {
         if pending {
@@ -86,37 +85,36 @@ fn drain(r: &mut Receiver, payload: &[u8], count: &mut u32) {
     while r.take_send().is_some() {}
 }
 
-fn clean_stream() {
+fn clean_stream(packets: u32) {
     let mut r = receiver();
     let payload = [0x53; 1200];
     let mut delivered = 0;
     let started = Instant::now();
-    for seq in 0..STREAM_PACKETS {
+    for seq in 0..packets {
         let now = i64::from(seq) * 1000;
         r.on_data(now, &packet(seq, now as u32, &payload));
         r.on_timer(now);
         black_box(r.next_timer());
         drain(&mut r, &payload, &mut delivered);
     }
-    r.on_control(i64::from(STREAM_PACKETS) * 1000, &Control::Shutdown);
+    r.on_control(i64::from(packets) * 1000, &Control::Shutdown);
     drain(&mut r, &payload, &mut delivered);
     let elapsed = started.elapsed().as_nanos();
-    assert_eq!(delivered, STREAM_PACKETS);
+    assert_eq!(delivered, packets);
     assert_eq!(r.stats().dropped, 0);
     let receiver_bytes = std::mem::size_of::<Receiver>();
     println!(
-        "{{\"profile\":\"clean-stream\",\"payload_bytes\":1200,\"operations\":{STREAM_PACKETS},\"elapsed_ns\":{elapsed},\"verified_deliveries\":{delivered},\"receiver_bytes\":{receiver_bytes}}}"
+        "{{\"profile\":\"clean-stream\",\"payload_bytes\":1200,\"operations\":{packets},\"elapsed_ns\":{elapsed},\"verified_deliveries\":{delivered},\"receiver_bytes\":{receiver_bytes}}}"
     );
 }
 
-fn bursty_stream() {
-    const CYCLES: u32 = 256;
+fn bursty_stream(cycles: u32) {
     const PACKETS: u32 = 128;
     const GAP: u32 = 4096;
     let payload = [0x47; 1200];
     let mut delivered = 0;
     let started = Instant::now();
-    for _ in 0..CYCLES {
+    for _ in 0..cycles {
         let mut r = receiver();
         for seq in 0..PACKETS {
             let now = i64::from(seq) * 10;
@@ -136,18 +134,58 @@ fn bursty_stream() {
         assert_eq!(r.stats().dropped, u64::from(GAP));
     }
     let elapsed = started.elapsed().as_nanos();
-    let operations = CYCLES * PACKETS;
+    let operations = cycles * PACKETS;
     assert_eq!(delivered, operations);
     println!(
         "{{\"profile\":\"bursty-stream\",\"gap\":{GAP},\"payload_bytes\":1200,\"operations\":{operations},\"elapsed_ns\":{elapsed},\"verified_deliveries\":{delivered}}}"
     );
 }
 
-fn main() {
-    for gap in [0, 4096, 16384] {
-        gap_queries(gap, false);
-        gap_queries(gap, true);
+fn selected(args: &[String]) -> Result<(), String> {
+    let [profile_flag, profile, work_flag, work] = args else {
+        return Err(
+            "use --profile clean-stream|pending-and-timer|bursty-stream --work COUNT".into(),
+        );
+    };
+    if profile_flag != "--profile" || work_flag != "--work" {
+        return Err("expected --profile PROFILE --work COUNT".into());
     }
-    clean_stream();
-    bursty_stream();
+    let work: u64 = work
+        .parse()
+        .map_err(|_| "work must be a positive integer")?;
+    if work == 0 {
+        return Err("work must be positive".into());
+    }
+    match profile.as_str() {
+        "clean-stream" if work <= 500_000_000 => clean_stream(work as u32),
+        "pending-and-timer" if work <= 8_000_000_000 => gap_queries(
+            0,
+            true,
+            usize::try_from(work).map_err(|_| "work exceeds this platform's count range")?,
+        ),
+        "bursty-stream" if work <= 1_000_000 => bursty_stream(work as u32),
+        _ => return Err("unknown profile or work exceeds the profile's safety cap".into()),
+    }
+    Ok(())
+}
+
+fn main() -> std::process::ExitCode {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        return match selected(&args) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::ExitCode::from(2)
+            }
+        };
+    }
+    for gap in [0, 4096, 16384] {
+        let queries = if gap == 0 { CLEAN_QUERIES } else { GAP_QUERIES };
+        gap_queries(gap, false, queries);
+        gap_queries(gap, true, queries);
+    }
+    clean_stream(STREAM_PACKETS);
+    bursty_stream(256);
+    std::process::ExitCode::SUCCESS
 }

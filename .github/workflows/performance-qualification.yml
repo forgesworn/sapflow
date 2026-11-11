@@ -1,0 +1,107 @@
+name: Performance qualification
+
+on:
+  push:
+    branches: [perf/http-srt-efficiency-20261111]
+    paths:
+      - 'crates/sapflow-server/**'
+      - 'crates/sapflow-srt/**'
+      - 'crates/sapflow-bench/**'
+      - 'scripts/compare-http-efficiency.py'
+      - 'scripts/qualify-srt-gap.py'
+      - 'scripts/build-http-comparison.sh'
+      - 'tests/test_http_efficiency.py'
+      - 'tests/test_qualify_srt_gap.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/performance-qualification.yml'
+      - 'docs/performance-qualification-2026-11-11.md'
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Exact ancestor commit to compare against (40 hexadecimal characters)
+        required: true
+        default: aee2a526c26f8837266857e139b46d40591d5da2
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: never
+  QUALIFICATION_BASELINE: ${{ inputs.baseline || 'aee2a526c26f8837266857e139b46d40591d5da2' }}
+
+jobs:
+  http:
+    name: Paired HTTP qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned compiler and generated-media tools
+        run: |
+          rustup toolchain install --profile minimal
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get -o Acquire::Retries=3 update
+            sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ffmpeg
+          fi
+      - name: Verify the measurement harness
+        run: |
+          python3 -B tests/test_http_efficiency.py
+          python3 -B tests/test_performance.py
+          python3 -B tests/test_measure_process.py
+      - name: Build the exact parent and candidate sequentially
+        run: bash scripts/build-http-comparison.sh "$QUALIFICATION_BASELINE" "$GITHUB_SHA"
+      - name: Run the frozen paired HTTP campaign
+        run: |
+          ulimit -n 8192
+          python3 -B scripts/compare-http-efficiency.py --qualify-linux \
+            --baseline target/performance-qualification/baseline-sapflow \
+            --candidate target/release/sapflow --bench target/release/sapflow-bench \
+            --baseline-source "$QUALIFICATION_BASELINE" --candidate-source "$GITHUB_SHA" \
+            --pairs 4 --seconds 60 --threads 2 \
+            --output target/performance-qualification/http.json
+      - name: Retain compact results, including failed guards
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: http-performance-qualification
+          path: target/performance-qualification/http.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  srt:
+    name: Paired SRT receive-gap qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned compiler
+        run: rustup toolchain install --profile minimal
+      - name: Verify the measurement harness
+        run: python3 -B tests/test_qualify_srt_gap.py
+      - name: Build and run the frozen paired SRT campaign
+        run: |
+          python3 -B scripts/qualify-srt-gap.py \
+            --baseline "$QUALIFICATION_BASELINE" --candidate "$GITHUB_SHA" \
+            --output target/performance-qualification/srt.json
+      - name: Retain compact results, including failed guards
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: srt-performance-qualification
+          path: target/performance-qualification/srt.json
+          if-no-files-found: warn
+          retention-days: 7
