@@ -13,8 +13,11 @@
 //! - [`whip_session`]: a scripted run of a [`Session`] against the scripted
 //!   publisher: raw, mutated and honest datagrams from two tuples, checks
 //!   with and without USE-CANDIDATE or ICE-CONTROLLED, DTLS flights, SRTP
-//!   and SRTCP, and time. After every step: nothing sent to a tuple that
-//!   never authenticated, DTLS and RTCP only to the send tuple, at most
+//!   and SRTCP, time, and captured checks re-sent from a third tuple. After
+//!   every step: nothing sent to a tuple that never authenticated, so
+//!   nothing at all to the third; DTLS and RTCP only to the send tuple; to
+//!   a tuple not proven by fresh SRTP, at most four times what it sent;
+//!   the selected and send tuples validated; at most
 //!   [`MAX_DATAGRAMS_PER_STEP`] datagrams, none over 1500 bytes.
 
 #![allow(
@@ -32,7 +35,7 @@ use crate::session::{Event, SessionConfig, State};
 use crate::stun::{self, Builder, Message};
 use crate::testing::{self, Publisher, tuple};
 use sapflow_dtls::Fingerprint;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Most script steps read from one input.
@@ -263,8 +266,12 @@ pub mod op {
     pub const REPLAY: u8 = 8;
     /// Closes the session.
     pub const CLOSE: u8 = 9;
+    /// Re-sends one of the STUN datagrams sent so far, chosen by the first
+    /// byte, from a third tuple that never sends a check of its own: an
+    /// observer replaying a captured check with a victim's address.
+    pub const ELSEWHERE: u8 = 10;
     /// How many.
-    pub const COUNT: u8 = 10;
+    pub const COUNT: u8 = 11;
 }
 
 /// A scripted session run. Returns how far it got: 0 checking, 1
@@ -276,8 +283,15 @@ pub fn whip_session(data: &[u8]) -> u8 {
     p.answered(&a);
     let s = &mut a.session;
     let other = tuple(9);
+    let stranger = tuple(77);
+    let limit = u64::from(SessionConfig::default().amplification_limit);
     let mut now = t0;
     let mut authenticated: HashSet<Tuple> = HashSet::new();
+    // Bytes each tuple sent the session and the session sent it, and the
+    // tuples fresh SRTP or SRTCP was sent from while connected.
+    let mut from: HashMap<Tuple, u64> = HashMap::new();
+    let mut to: HashMap<Tuple, u64> = HashMap::new();
+    let mut proven: HashSet<Tuple> = HashSet::new();
     let mut pending: Vec<Vec<u8>> = Vec::new();
     let mut history: Vec<(Tuple, Vec<u8>)> = Vec::new();
     let mut started = false;
@@ -341,13 +355,24 @@ pub fn whip_session(data: &[u8]) -> u8 {
                         first & 8 != 0,
                     )],
                 };
+                if s.state() == State::Connected {
+                    proven.insert(p.tuple);
+                }
                 sent.extend(pkts.into_iter().map(|d| (p.tuple, d)));
             }
             op::RTCP if p.has_keys() => {
+                let connected = s.state() == State::Connected;
                 if first & 1 == 0 {
                     let ntp = u64::from_be_bytes([first, 1, 2, 3, 4, 5, 6, 7]);
+                    if connected {
+                        proven.insert(p.tuple);
+                    }
                     sent.extend(p.sender_reports(ntp).into_iter().map(|d| (p.tuple, d)));
                 } else if let Some(d) = p.try_protect_rtcp(bytes) {
+                    // Fresh only if the session reads it as SRTCP.
+                    if connected && classify(&d) == Kind::Rtcp {
+                        proven.insert(p.tuple);
+                    }
                     sent.push((p.tuple, d));
                 }
             }
@@ -358,12 +383,24 @@ pub fn whip_session(data: &[u8]) -> u8 {
                 }
             }
             op::CLOSE => s.close(),
+            op::ELSEWHERE => {
+                let checks: Vec<&Vec<u8>> = history
+                    .iter()
+                    .map(|(_, d)| d)
+                    .filter(|d| classify(d) == Kind::Stun)
+                    .collect();
+                if !checks.is_empty() {
+                    let d = checks[usize::from(first) % checks.len()].clone();
+                    sent.push((stranger, d));
+                }
+            }
             _ => {}
         }
         for (t, d) in sent {
             if history.len() < 256 {
                 history.push((t, d.clone()));
             }
+            *from.entry(t).or_default() += d.len() as u64;
             s.handle_datagram(now, t, &d);
         }
         // Invariants on what the session sends.
@@ -374,6 +411,16 @@ pub fn whip_session(data: &[u8]) -> u8 {
             out += 1;
             assert!(t.bytes.len() <= 1500, "a datagram within the MTU cap");
             assert!(authenticated.contains(&t.tuple), "sent to a stranger");
+            assert_ne!(t.tuple, stranger, "a replayed check drew a reply");
+            let total = to.entry(t.tuple).or_default();
+            *total += t.bytes.len() as u64;
+            if !proven.contains(&t.tuple) {
+                let got = from.get(&t.tuple).copied().unwrap_or(0);
+                assert!(
+                    *total <= limit * got,
+                    "{total} bytes to an unproven tuple that sent {got}"
+                );
+            }
             match classify(&t.bytes) {
                 Kind::Stun => {}
                 _ => assert_eq!(
@@ -405,6 +452,14 @@ pub fn whip_session(data: &[u8]) -> u8 {
                 _ => {}
             }
         }
+        assert!(
+            s.selected().is_none_or(|t| s.accepts(&t)),
+            "selected unvalidated"
+        );
+        assert!(
+            s.send_tuple().is_none_or(|t| s.accepts(&t)),
+            "sending unvalidated"
+        );
         p.receive_keys();
         while let Some(e) = s.poll_event() {
             if let Event::Connected(_) = e {

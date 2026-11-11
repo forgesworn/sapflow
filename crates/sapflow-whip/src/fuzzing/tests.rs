@@ -305,6 +305,18 @@ fn write_seeds() {
     push_step(&mut s, op::DTLS, &[0x03, 0xff, 0x00, 0x10]);
     push_step(&mut s, op::DTLS, &[]);
     write("whip_session", "stranger-then-mutated-dtls", &s);
+    // Captured checks re-sent from a third tuple, before and after SRTP.
+    let mut s = Vec::new();
+    push_step(&mut s, op::CHECK, &[1]);
+    push_step(&mut s, op::ELSEWHERE, &[0]);
+    push_step(&mut s, op::DTLS, &[]);
+    push_step(&mut s, op::DTLS, &[]);
+    push_step(&mut s, op::RTP, &[2]);
+    push_step(&mut s, op::CHECK, &[1]);
+    push_step(&mut s, op::ELSEWHERE, &[1]);
+    push_step(&mut s, op::TIME, &[40]);
+    push_step(&mut s, op::RTP, &[2]);
+    write("whip_session", "connect-replays-elsewhere", &s);
     // RTCP too short to protect, which the harness once unwrapped.
     let mut s = Vec::new();
     connect(&mut s);
