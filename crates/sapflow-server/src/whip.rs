@@ -492,7 +492,26 @@ async fn connection(mut socket: TcpStream, peer: SocketAddr, app: Arc<App>, whip
         socket.write_all(&reply.bytes()).await?;
         socket.shutdown().await
     };
-    let _ = tokio::time::timeout(HEAD_TIMEOUT, sent).await;
+    if matches!(tokio::time::timeout(HEAD_TIMEOUT, sent).await, Ok(Ok(()))) {
+        drain(&mut socket).await;
+    }
+}
+
+/// After the answer, an offer still arriving is read and dropped for a
+/// moment, so a refusal sent before the whole request came in reaches the
+/// client rather than being lost to a TCP reset.
+async fn drain(socket: &mut TcpStream) {
+    let mut scratch = [0u8; 4096];
+    let mut total = 0;
+    let _ = tokio::time::timeout(Duration::from_millis(250), async {
+        while total < 2 * whip_request::MAX_OFFER {
+            match socket.read(&mut scratch).await {
+                Ok(n) if n > 0 => total += n,
+                _ => break,
+            }
+        }
+    })
+    .await;
 }
 
 /// Reads until a whole head is in `buf`; `Err(None)` if the client left.
