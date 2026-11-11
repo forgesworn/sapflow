@@ -575,6 +575,13 @@ publish from a browser should hold resolution and let frame rate drop instead
   they are for SRT.
 - A lost Opus packet is replaced by silence, as described under [Opus](#opus).
   Nothing else is concealed, since sapflow does not decode.
+- **SRTP replay window (implementation note).** RFC 3711 requires a window
+  of at least 64 packets. A sender without RTX, such as OBS, resends a NACKed
+  packet on its original SSRC and index, up to the 200 ms wait later; at
+  5 Mbit/s that is a hundred or more packets back. So `sapflow-rtp` keeps a
+  configurable window per SSRC, 1024 packets by default. An index never
+  received inside the window is accepted; a duplicate of a received index is
+  refused.
 
 ### Congestion feedback
 
