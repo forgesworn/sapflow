@@ -88,6 +88,8 @@ pub(crate) struct Feed {
     received: usize,
     /// An access unit was dropped: skip video until the next IDR.
     skip_video: bool,
+    /// Packets the receiver gave up on, after NACK and RTX repair.
+    lost: u64,
 }
 
 /// The ingest task has gone.
@@ -101,7 +103,13 @@ impl Feed {
             loss,
             received: 0,
             skip_video: false,
+            lost: 0,
         }
+    }
+
+    /// Packets the receiver gave up on so far.
+    pub(crate) fn lost(&self) -> u64 {
+        self.lost
     }
 
     /// Passes one receiver event on. Loss is marked on the recording here.
@@ -128,7 +136,8 @@ impl Feed {
                 packet,
                 received: std::mem::take(&mut self.received),
             },
-            Media::Loss => {
+            Media::Loss { packets } => {
+                self.lost = self.lost.saturating_add(packets);
                 self.loss.mark_incomplete(IncompleteReason::MediaLoss);
                 return Ok(());
             }
@@ -167,8 +176,15 @@ pub(crate) enum Media {
         pts: u64,
         packet: Vec<u8>,
     },
-    /// Packets or a frame lost: the recording is incomplete.
-    Loss,
+    /// The receiver gave up on packets (sequence numbers never received
+    /// within the jitter wait, after NACK and RTX repair), or dropped a
+    /// frame that lost data: the recording is incomplete. Loss is taken
+    /// from here, not from the muxer: a lost Opus packet is filled with
+    /// silence and the timeline can absorb its timestamp jump, so the
+    /// muxer may see nothing missing.
+    Loss {
+        packets: u64,
+    },
     /// Nothing for the ingest, by name. A discontinuity keeps each
     /// stream's timeline moving forward (sapflow-rtp never sends a
     /// timestamp back within a stream), and `EsIngest` takes the jump as it
@@ -192,7 +208,8 @@ fn media(event: sapflow_rtp::Event) -> Media {
             pts,
             packet: frame.data,
         },
-        E::Lost { .. } | E::IncompleteFrame { .. } => Media::Loss,
+        E::Lost { count, .. } => Media::Loss { packets: count },
+        E::IncompleteFrame { .. } => Media::Loss { packets: 0 },
         other => Media::Other(event_name(&other)),
     }
 }
@@ -395,8 +412,8 @@ async fn own_udp(
                 Event::Ended(reason) => {
                     // Dropping the feed ends the ingest task, which
                     // releases the publication.
-                    feeds.remove(&id);
-                    tracing::info!(?reason, "WHIP session ended");
+                    let lost = feeds.remove(&id).map_or(0, |f| f.lost());
+                    tracing::info!(?reason, lost, "WHIP session ended");
                 }
                 Event::Nominated => {}
             }

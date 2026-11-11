@@ -2,6 +2,7 @@
 //! driven by `sapflow-whip`'s scripted publisher (STUN client, the
 //! `sapflow-dtls` test client and SRTP) over a real UDP socket.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use sapflow_whip::testing::{PPS, Publisher, StunClient, VIDEO_SSRC, idr_slice, server_identity};
@@ -452,6 +453,68 @@ async fn past_the_session_cap_a_post_gets_503() {
     assert!(server.app.streams.get("event-b").is_none());
 }
 
+/// The test offer without its video section: audio-only Opus, the case
+/// where the muxer cannot see a lost packet.
+fn audio_only(offer: &str) -> String {
+    let audio = offer.split("m=video").next().expect("audio first");
+    audio.replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0")
+}
+
+/// Publishes `packets` of audio-only Opus, 20 ms apart, leaving out the
+/// sequence numbers in `skip`; returns the recording's incomplete reason.
+async fn audio_run(
+    server: &Server,
+    seed: u8,
+    event: &str,
+    skip: &[u64],
+) -> Option<IncompleteReason> {
+    let mut phone = Phone::new(seed, server).await;
+    let offer = audio_only(&phone.p.offer());
+    let a = send(
+        server.http,
+        &sdp_post(&format!("/whip/live/{event}"), TOKEN, &offer),
+    )
+    .await;
+    assert_eq!(a.status, 201, "{}", a.body);
+    assert!(!a.body.contains("m=video"));
+    phone.answered(&a.body);
+    phone.connect().await;
+    for n in 0..150u64 {
+        let packet = phone.p.audio((n % 251) as u8);
+        if !skip.contains(&n) {
+            phone.send(&packet).await;
+        }
+        phone.receive(Duration::from_millis(20)).await;
+    }
+    let stream = server.app.streams.get(event).expect("claimed");
+    assert!(stream.has_content(), "audio-only Opus reached the playlist");
+    let session = stream.session();
+    let recorder = session.recorder.as_ref().expect("recording");
+    recorder.status().reason()
+}
+
+/// Loss comes from the receiver: a lost Opus packet is filled with
+/// silence, so the muxer sees a continuous run, yet the recording is
+/// marked incomplete. Without loss it is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_packet_marks_the_recording_from_the_receiver() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("whip-loss-test-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("owned scratch");
+    let dir = root.to_str().expect("utf-8 path").to_owned();
+    let server = start(&[
+        ("SAPFLOW_RECORDINGS", &dir),
+        ("SAPFLOW_RECORD_MIN_FREE_GB", "0"),
+    ])
+    .await;
+    let clean = audio_run(&server, 7, "event-whip-clean", &[]).await;
+    let lossy = audio_run(&server, 8, "event-whip-lossy", &[80]).await;
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(clean, None, "nothing lost");
+    assert_eq!(lossy, Some(IncompleteReason::MediaLoss));
+}
+
 fn access_unit(idr: bool) -> Media {
     Media::Video {
         pts: 0,
@@ -483,4 +546,26 @@ fn a_full_queue_skips_video_to_the_next_idr() {
     assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if !au.idr));
     drop(rx);
     assert_eq!(feed.push(access_unit(true)), Err(Gone));
+}
+
+/// Each `Lost` is counted and marks the recording incomplete; a dropped
+/// frame marks it too.
+#[tokio::test]
+async fn receiver_loss_is_counted_and_marks_the_recording() {
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let publication = fixture.begin();
+    let (tx, _rx) = mpsc::channel(4);
+    let mut feed = Feed::new(tx, publication.loss_notice());
+    let status = publication
+        .stream
+        .session()
+        .recorder
+        .as_ref()
+        .expect("recording started")
+        .status();
+    assert_eq!(status.reason(), None);
+    assert_eq!(feed.push(Media::Loss { packets: 3 }), Ok(()));
+    assert_eq!(feed.push(Media::Loss { packets: 0 }), Ok(()));
+    assert_eq!(feed.lost(), 3);
+    assert_eq!(status.reason(), Some(IncompleteReason::MediaLoss));
 }
