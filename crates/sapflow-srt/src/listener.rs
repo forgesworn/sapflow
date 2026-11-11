@@ -363,6 +363,8 @@ impl<S: BuildHasher> Listener<S> {
 
     /// Does what is due at `now`: closes callers the application has not
     /// answered in time and runs each open connection's timers.
+    /// Drain a bounded batch of already-readable datagrams first, so delayed
+    /// scheduling does not expire gaps while their recovery is still queued.
     pub fn handle_timeout(&mut self, now: Instant) {
         let t = self.micros(now);
         let due: Vec<u32> = self

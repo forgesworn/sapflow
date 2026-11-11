@@ -50,6 +50,32 @@ class SrtShutdownTest {
         }
     }
 
+    @Test fun zeroPaddedShutdownIsSubmittedOnceWithTheFullDatagram() {
+        val shutdown = SrtShutdown(); shutdown.request(0)
+        val expected = control().copyOf(20)
+        var writes = 0
+        assertEquals(SrtShutdown.Result.SUBMITTED, shutdown.finish({ 1 }, {}, { expected }, { buffer ->
+            writes++
+            val actual = ByteArray(buffer.remaining()); buffer.get(actual)
+            assertArrayEquals(expected, actual)
+            actual.size
+        }))
+        assertEquals(1, writes)
+        assertEquals(SrtShutdown.Result.DUPLICATE, shutdown.finish({ 2 }, {}, { expected }, { writes++; 20 }))
+        assertEquals(1, writes)
+    }
+
+    @Test fun paddedShutdownStillRejectsMalformedLengthPaddingTypeAndSubtype() {
+        val invalid = (listOf(0, 1, 15, 17, 18, 19, 21, 24).map { control().copyOf(it) } +
+            (16..19).map { index -> control().copyOf(20).also { it[index] = 1 } } +
+            (0..3).map { index -> control().copyOf(20).also { it[index] = (it[index].toInt() xor 1).toByte() } })
+        for (packet in invalid) {
+            val shutdown = SrtShutdown(); shutdown.request(0)
+            assertEquals(SrtShutdown.Result.INVALID_CONTROL, shutdown.finish({ 1 }, {}, { packet },
+                { fail("malformed padded control must not be sent"); 0 }))
+        }
+    }
+
     @Test fun hardAbortBeforeOrDuringNativeCancellationForbidsControlButStillReleasesNative() {
         for (abortBefore in listOf(true, false)) {
             val shutdown = SrtShutdown(); shutdown.request(0)

@@ -725,15 +725,16 @@ fn publish_recording(
         reason = reason.map(IncompleteReason::as_str),
         "recording finished"
     );
-    // Scoped callbacks distinguish a complete file from a synced prefix. The
-    // legacy event continues to mean only that a file has finished.
-    callbacks.send(
+    // Both integrations must distinguish a finalised file from a synced prefix.
+    callbacks.send_recording(
         path,
         StreamEvent::RecordSegmentComplete {
             segment_path: file_path.display().to_string(),
             duration_secs: (duration.as_secs_f64() * 1000.0).round() / 1000.0,
             recording_tracks,
         },
+        complete,
+        reason.map(IncompleteReason::as_str),
     );
 }
 
@@ -2667,7 +2668,7 @@ mod tests {
                 assert_eq!(body["recordingState"], "incomplete");
                 assert_eq!(scope.observations.counts().recordings_finalised, 0);
             } else {
-                assert!(body.get("recordingState").is_none());
+                assert_eq!(body["recordingState"], "incomplete");
             }
             let duration = prefix
                 .iter()
@@ -2771,7 +2772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_recording_with_a_gap_still_reports_it_finished() {
+    async fn a_legacy_recording_with_a_gap_reports_the_incomplete_reason() {
         let scratch = ScopedScratch::new("legacy-gap");
         let path = StreamPath::parse("live/event-a").expect("path");
         let (callbacks, mut receiver) = crate::callback::legacy_test_queue(2);
@@ -2786,7 +2787,8 @@ mod tests {
         let queued = receiver.try_recv().expect("recordSegmentComplete");
         let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
         assert_eq!(body["event"], "recordSegmentComplete");
-        assert!(body.get("recordingState").is_none());
+        assert_eq!(body["recordingState"], "incomplete");
+        assert_eq!(body["recordingReason"], "media-loss");
         assert!(
             std::fs::metadata(body["segmentPath"].as_str().expect("path"))
                 .expect("file")
@@ -3044,7 +3046,7 @@ mod tests {
                         assert_eq!(scope.observations.recording_state(), "incomplete");
                         assert_eq!(scope.observations.counts().recordings_failed, 0);
                     } else {
-                        assert!(body.get("recordingState").is_none());
+                        assert_eq!(body["recordingState"], "incomplete");
                     }
                 }
             }

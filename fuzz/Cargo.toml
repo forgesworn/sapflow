@@ -21,6 +21,7 @@ sapflow-hls = { path = "../crates/sapflow-hls" }
 sapflow-rtmp = { path = "../crates/sapflow-rtmp" }
 sapflow-srt = { path = "../crates/sapflow-srt" }
 sapflow-rtp = { path = "../crates/sapflow-rtp", features = ["testing"] }
+sapflow-dtls = { path = "../crates/sapflow-dtls", features = ["testing"] }
 sapflow-client = { path = "../crates/sapflow-client" }
 sapflow-signet-ffi = { path = "../crates/sapflow-signet-ffi" }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -222,6 +223,27 @@ bench = false
 [[bin]]
 name = "sr_timeline"
 path = "fuzz_targets/sr_timeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dtls_record"
+path = "fuzz_targets/dtls_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dtls_server"
+path = "fuzz_targets/dtls_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dtls_handshake_messages"
+path = "fuzz_targets/dtls_handshake_messages.rs"
 test = false
 doc = false
 bench = false

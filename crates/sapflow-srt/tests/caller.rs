@@ -260,7 +260,7 @@ fn independent_data_ack_nak_vectors_and_original_timestamp() {
         &hex("80020000 00000007 00000000 0000000b 00000065 000003e8 000001f4 00002000"),
     );
     let (_, bytes) = c.poll_transmit(time(now, 400)).expect("ACKACK");
-    assert_eq!(bytes, hex("80060000 00000007 00000190 00000016"));
+    assert_eq!(bytes, hex("80060000 00000007 00000190 00000016 00000000"));
     assert_eq!(c.stats().send.acknowledged_packets, 1);
     assert_eq!(c.stats().send.buffered_packets, 0);
     assert_eq!(c.stats().send.buffered_bytes, 0);

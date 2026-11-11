@@ -675,7 +675,7 @@ impl Sender {
     }
 
     fn control(&mut self, now: i64, body: Control) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(16);
+        let mut bytes = Vec::with_capacity(20);
         ControlPacket::new(now as u32, self.peer_socket, body).encode(&mut bytes);
         self.last_send = now;
         bytes
