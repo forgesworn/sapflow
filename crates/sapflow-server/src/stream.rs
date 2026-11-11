@@ -398,7 +398,7 @@ impl LiveStream {
                     ),
                     part_path: format!("/{root}/{}", playlist::part_name(&state.prefix, id)),
                     has_video: muxer.video().is_some(),
-                    has_audio: muxer.audio().is_some(),
+                    has_audio: muxer.audio_config().is_some(),
                 });
             }
         }
