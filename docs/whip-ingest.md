@@ -553,12 +553,17 @@ is wanted without a downstream converter, this decision is revisited.
   held to it; a timestamp that does not advance continues by arrival time.
 - Later sender reports are used only in agreeing pairs (same rate within
   0.1% and 1 ms) at least 500 ms apart, so forged or alternating reports are
-  ignored. An error within 500 ms is slewed at up to 500 ppm, never
-  backwards and with no discontinuity; this follows a sender's audio clock
-  drifting against its NTP clock. Only a step forward of more than 500 ms,
-  or a timestamp that jumps back, jumps ahead of or falls behind arrival
-  time by more than that, is treated as a discontinuity, the way a resumed
-  encoder is today.
+  ignored. An error within 500 ms, or a stream ahead by any amount, is
+  slewed at up to 500 ppm, never backwards and with no discontinuity; this
+  follows a sender's audio clock drifting against its NTP clock. Video
+  slews the part of its error audio does not share at up to 5%, so a video
+  RTP jump of 900 ms is back in sync within 20 s. Only a step forward of
+  more than 500 ms, or a timestamp that jumps back, jumps ahead of or falls
+  behind arrival time by more than that, is treated as a discontinuity,
+  the way a resumed encoder is today.
+- A sender whose timestamps crawl can cause about one discontinuity a
+  second, so the server merges or rate-limits discontinuity epochs rather
+  than starting one per event.
 
 ### Keyframes
 

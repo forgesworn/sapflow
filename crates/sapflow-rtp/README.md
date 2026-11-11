@@ -165,9 +165,11 @@ For the session:
   timeline, which strictly increases and stays within `max_lead` (500 ms,
   plus 0.1% of elapsed time up to another 500 ms) of arrival time either
   way. Later sender reports are used in agreeing pairs at least
-  `report_spacing` (500 ms) apart; errors within `max_lead` are slewed at
-  up to `max_slew_ppm` (500 ppm), never backwards and with no event, so a
-  sender's audio clock drifting against NTP is followed. Only a larger
+  `report_spacing` (500 ms) apart; errors within `max_lead`, or ahead by
+  any amount, are slewed at up to `max_slew_ppm` (500 ppm), never
+  backwards and with no event, so a sender's audio clock drifting against
+  NTP is followed; video slews what audio does not share at up to
+  `max_video_slew_ppm` (5%), so a 900 ms video RTP jump is undone in 20 s. Only a larger
   step forward, or a timestamp that jumps or falls behind arrival time by
   more than `max_lead`, is a discontinuity.
 
@@ -221,6 +223,7 @@ first one received cannot be known or NACKed.
   from one clock (audio exactly 300 ms after video), the fallback to
   arrival time, audio only, hostile reports, and an hour of audio clock
   drift at 30 and 100 ppm either way (no discontinuity, A/V within 1 ms),
+  video RTP jumps of 450 and 900 ms (back within 1 ms in 10 and 20 s),
   forged alternating reports, a falling delay with reports, and a
   constant RTP timestamp.
 - Fuzz targets `rtp_packet`, `rtcp_compound`, `srtp_unprotect`,
