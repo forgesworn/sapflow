@@ -1,10 +1,13 @@
 //! The RTCP that sapflow sends as a receiver: receiver reports, SDES
-//! CNAME, generic NACK, PLI and FIR, and a compound packet that starts with
-//! the receiver report (RFC 3550 section 6.1).
+//! CNAME, generic NACK, PLI, FIR and transport-wide congestion control
+//! feedback, and a compound packet that starts with the receiver report
+//! (RFC 3550 section 6.1).
 //!
 //! Every function appends to a caller's buffer; nothing else is allocated.
 
-use super::{FMT_FIR, FMT_NACK, FMT_PLI, PT_PSFB, PT_RR, PT_RTPFB, PT_SDES, ReportBlock};
+use super::{
+    FMT_FIR, FMT_NACK, FMT_PLI, FMT_TRANSPORT_CC, PT_PSFB, PT_RR, PT_RTPFB, PT_SDES, ReportBlock,
+};
 use std::fmt;
 
 /// Most report blocks one RR can carry (the five-bit count).
@@ -18,7 +21,8 @@ pub const MAX_FCI: usize = 8192;
 pub enum BuildError {
     /// Nothing to report: no lost packets, no FIR entries or an empty CNAME.
     Empty,
-    /// More entries than [`MAX_FCI`], or a CNAME over 255 bytes.
+    /// More entries than [`MAX_FCI`], a CNAME over 255 bytes, or
+    /// transport-cc FCI that is not whole words or overflows the length.
     TooLarge,
 }
 impl fmt::Display for BuildError {
@@ -161,6 +165,34 @@ pub fn fir(out: &mut Vec<u8>, sender_ssrc: u32, entries: &[(u32, u8)]) -> Result
     Ok(())
 }
 
+/// Most bytes of transport-cc FCI in one packet, so that the 16-bit length
+/// field cannot overflow.
+pub const MAX_TRANSPORT_CC_FCI: usize = 4 * (u16::MAX as usize - 2);
+
+/// Appends a transport-wide congestion control feedback packet (RTPFB,
+/// FMT 15, draft-holmer-rmcat-transport-wide-cc-extensions-01 section 3.1)
+/// about `media_ssrc`. `fci` is everything after the two SSRCs, already
+/// padded with zeros to whole words, as [`crate::twcc`] encodes it. The
+/// padding bit is not used, so the packet may sit anywhere in a compound.
+pub fn transport_cc(
+    out: &mut Vec<u8>,
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    fci: &[u8],
+) -> Result<(), BuildError> {
+    if fci.is_empty() {
+        return Err(BuildError::Empty);
+    }
+    if !fci.len().is_multiple_of(4) || fci.len() > MAX_TRANSPORT_CC_FCI {
+        return Err(BuildError::TooLarge);
+    }
+    header(out, FMT_TRANSPORT_CC, PT_RTPFB, 8 + fci.len());
+    out.extend_from_slice(&sender_ssrc.to_be_bytes());
+    out.extend_from_slice(&media_ssrc.to_be_bytes());
+    out.extend_from_slice(fci);
+    Ok(())
+}
+
 /// Builds a compound packet in `out`, starting with the receiver reports.
 #[derive(Debug)]
 pub struct CompoundBuilder<'v> {
@@ -191,6 +223,11 @@ impl<'v> CompoundBuilder<'v> {
     /// Adds a FIR.
     pub fn fir(&mut self, entries: &[(u32, u8)]) -> Result<&mut Self, BuildError> {
         fir(self.out, self.sender_ssrc, entries)?;
+        Ok(self)
+    }
+    /// Adds transport-cc feedback (see [`transport_cc`]).
+    pub fn transport_cc(&mut self, media_ssrc: u32, fci: &[u8]) -> Result<&mut Self, BuildError> {
+        transport_cc(self.out, self.sender_ssrc, media_ssrc, fci)?;
         Ok(self)
     }
 }
