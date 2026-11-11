@@ -548,7 +548,79 @@ enum Command {
     },
     Close {
         id: SessionId,
+        cause: CloseCause,
     },
+    /// Whether a session is live, and when it last took media.
+    Liveness {
+        id: SessionId,
+        reply: oneshot::Sender<Option<Liveness>>,
+    },
+}
+
+/// Why the server closed a session, for its end-reason count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseCause {
+    /// The publisher's `DELETE`.
+    Delete,
+    /// A new `POST` took the path over (A3.3).
+    Superseded,
+    /// Its ingest task ended: the media was refused, it went over the
+    /// bitrate cap, or another publisher took the stream.
+    IngestEnded,
+}
+
+/// What `Command::Liveness` tells the listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Liveness {
+    /// When the last authenticated RTP packet the receiver took as new
+    /// media arrived (`Session::last_media`); `None` before any.
+    pub last_media: Option<Instant>,
+}
+
+/// Every way a WHIP session ends, counted since start: the session's own
+/// reasons, and the server's when it closed one. Logged as each session
+/// ends; none carries an address.
+#[derive(Debug, Default)]
+pub(crate) struct EndCounts {
+    counts: Mutex<HashMap<&'static str, u64>>,
+}
+
+impl EndCounts {
+    fn add(&self, name: &'static str) -> u64 {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let n = counts.entry(name).or_insert(0);
+        *n += 1;
+        *n
+    }
+
+    /// The count for one reason.
+    #[cfg(test)]
+    pub(crate) fn get(&self, name: &str) -> u64 {
+        self.counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// An end reason's name for its count: the server's cause when it closed
+/// the session, else the session's own.
+fn end_name(reason: EndReason, cause: Option<CloseCause>) -> &'static str {
+    match (reason, cause) {
+        (EndReason::Closed, Some(CloseCause::Delete)) => "deleted",
+        (EndReason::Closed, Some(CloseCause::Superseded)) => "superseded",
+        (EndReason::Closed, Some(CloseCause::IngestEnded)) => "ingest-ended",
+        (EndReason::Closed, None) => "closed",
+        (EndReason::HandshakeTimeout, _) => "handshake-timeout",
+        (EndReason::ConsentExpired, _) => "consent-expired",
+        (EndReason::Dtls(_), _) => "dtls-failed",
+        (EndReason::PeerClosed, _) => "peer-closed",
+        (EndReason::MediaTimeout, _) => "media-timeout",
+        (EndReason::KeysExhausted, _) => "keys-exhausted",
+        (EndReason::Panicked, _) => "panicked",
+    }
 }
 
 /// A live session's resource, for `DELETE`.
@@ -565,13 +637,23 @@ struct Resource {
 pub(crate) struct Whip {
     config: WhipConfig,
     identity: Arc<Identity>,
+    /// What each session is made with.
+    session: SessionConfig,
     commands: mpsc::Sender<Command>,
     resources: Mutex<HashMap<SessionId, Resource>>,
+    /// The WHIP session publishing to each event, for supersede.
+    paths: Mutex<HashMap<String, SessionId>>,
+    /// How sessions have ended.
+    ends: EndCounts,
 }
 
 impl Whip {
     fn resources(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, Resource>> {
         self.resources.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn paths(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionId>> {
+        self.paths.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -638,6 +720,18 @@ fn prepare(app: &App, identity: Arc<Identity>) -> std::io::Result<Option<Prepare
     let Some(config) = app.config.whip.clone() else {
         return Ok(None);
     };
+    let session = session_config(&config);
+    prepare_with(app, identity, config, session).map(Some)
+}
+
+/// As [`prepare`], with the session settings given: tests shorten the
+/// handshake deadline.
+fn prepare_with(
+    app: &App,
+    identity: Arc<Identity>,
+    config: WhipConfig,
+    session: SessionConfig,
+) -> std::io::Result<Prepared> {
     let router = Router::new(RouterConfig {
         max_sessions: app.config.max_publishers,
         ..RouterConfig::default()
@@ -647,10 +741,13 @@ fn prepare(app: &App, identity: Arc<Identity>) -> std::io::Result<Option<Prepare
     let whip = Arc::new(Whip {
         config,
         identity,
+        session,
         commands,
         resources: Mutex::new(HashMap::new()),
+        paths: Mutex::new(HashMap::new()),
+        ends: EndCounts::default(),
     });
-    Ok(Some((whip, router, rx)))
+    Ok((whip, router, rx))
 }
 
 async fn run(
@@ -666,7 +763,7 @@ async fn run(
         "WHIP listening"
     );
     tokio::select! {
-        r = own_udp(sockets.udp, router, rx) => r,
+        r = own_udp(sockets.udp, router, rx, whip.clone()) => r,
         r = listen(sockets.http, app, whip) => r,
     }
 }
@@ -676,8 +773,11 @@ async fn own_udp(
     socket: UdpSocket,
     mut router: Router,
     mut commands: mpsc::Receiver<Command>,
+    whip: Arc<Whip>,
 ) -> std::io::Result<()> {
     let mut feeds: HashMap<SessionId, Feed> = HashMap::new();
+    // Why the server closed a session, until its end is counted.
+    let mut closing: HashMap<SessionId, CloseCause> = HashMap::new();
     // One datagram; the session takes at most 1500 bytes of it.
     let mut buf = vec![0u8; 65_536];
     let timer = tokio::time::sleep(Duration::ZERO);
@@ -714,8 +814,17 @@ async fn own_udp(
                     }
                     let _ = reply.send(result);
                 }
-                Command::Close { id } => {
-                    router.close(&id, Instant::now());
+                Command::Close { id, cause } => {
+                    if router.session(&id).is_some() {
+                        closing.insert(id, cause);
+                        router.close(&id, Instant::now());
+                    }
+                }
+                Command::Liveness { id, reply } => {
+                    let live = router.session(&id).map(|s| Liveness {
+                        last_media: s.last_media(),
+                    });
+                    let _ = reply.send(live);
                 }
             },
         }
@@ -756,10 +865,12 @@ async fn own_udp(
                     // Dropping the feed ends the ingest task, which
                     // releases the publication.
                     // The ingest task may still add muxer reports after this.
+                    let name = end_name(reason, closing.remove(&id));
+                    let count = whip.ends.add(name);
                     if let Some(mut f) = feeds.remove(&id) {
                         f.ended(reason);
                         let (lost, losses) = (f.lost(), f.counts());
-                        tracing::info!(?reason, lost, %losses, "WHIP session ended");
+                        tracing::info!(reason = name, count, lost, %losses, "WHIP session ended");
                     }
                 }
                 Event::Nominated => {}
@@ -776,6 +887,7 @@ async fn own_udp(
             }
         }
         for id in gone {
+            closing.insert(id, CloseCause::IngestEnded);
             router.close(&id, Instant::now());
             feeds.remove(&id);
         }
@@ -1061,7 +1173,11 @@ async fn delete(whip: &Arc<Whip>, id: &str, authorization: Option<&str>) -> Repl
     if !same(&token, &digest(bearer)) {
         return Reply::refused(resource::Refusal::Unauthorised.into());
     }
-    if whip.commands.send(Command::Close { id }).await.is_err() {
+    let close = Command::Close {
+        id,
+        cause: CloseCause::Delete,
+    };
+    if whip.commands.send(close).await.is_err() {
         return Reply::refused(resource::Refusal::Unavailable.into());
     }
     // Answer once the path is released, so a POST that follows at once is
@@ -1073,6 +1189,44 @@ async fn delete(whip: &Arc<Whip>, id: &str, authorization: Option<&str>) -> Repl
         headers: Vec::new(),
         content_type: "text/plain; charset=utf-8",
         body: Vec::new(),
+    }
+}
+
+/// A3.3, before the claim: a WHIP session of ours publishing to this
+/// event that has taken no media yet (it is still checking or
+/// handshaking), or none for `SAPFLOW_WHIP_STALE`, is closed as if it had
+/// left, and the claim waits for its publication's release, so it takes
+/// the stream over (held, if it had published) without waiting for
+/// consent to expire. One still taking media is left alone, and the claim
+/// refuses 409. An SRT or RTMP publisher is never closed here.
+async fn supersede(whip: &Arc<Whip>, event: &str) {
+    let Some(old) = whip.paths().get(event).copied() else {
+        return;
+    };
+    let (reply, live) = oneshot::channel();
+    let ask = Command::Liveness { id: old, reply };
+    if whip.commands.send(ask).await.is_err() {
+        return;
+    }
+    let Ok(Some(live)) = live.await else {
+        return;
+    };
+    let stalled = live
+        .last_media
+        .is_none_or(|t| t.elapsed() >= whip.config.stale);
+    if !stalled {
+        return;
+    }
+    let released = whip.resources().get(&old).map(|r| r.released.clone());
+    let close = Command::Close {
+        id: old,
+        cause: CloseCause::Superseded,
+    };
+    if whip.commands.send(close).await.is_err() {
+        return;
+    }
+    if let Some(mut released) = released {
+        let _ = tokio::time::timeout(RELEASE_TIMEOUT, released.wait_for(|r| *r)).await;
     }
 }
 
@@ -1129,18 +1283,25 @@ async fn publish(
         pass: Some(token.password.to_owned()),
         connection_attempt_id: None,
     };
-    let publication = Publication::begin_authorised(app, &req, SourceKind::Es, ip)
+    let refused = |r: Refusal| {
+        app.log_refusal("webrtc", &r);
+        admission_refusal(r)
+    };
+    let event = req.path.event_id().to_owned();
+    let admitted = Publication::admit(app, &req, SourceKind::Es, ip)
         .await
-        .map_err(|r| {
-            app.log_refusal("webrtc", &r);
-            admission_refusal(r)
-        })?;
+        .map_err(refused)?;
+    supersede(whip, &event).await;
+    let publication =
+        Publication::claim_admitted(app, &req, SourceKind::Es, admitted).map_err(refused)?;
+    // From here a later POST for the path can find this session.
+    whip.paths().insert(event, id);
     let setup = Setup {
         video: negotiated.video.is_some(),
         audio: negotiated.audio.is_some(),
     };
     let session = Session::new(
-        session_config(&whip.config),
+        whip.session.clone(),
         whip.identity.clone(),
         credentials,
         negotiated,
@@ -1302,9 +1463,20 @@ async fn ingest(
         }
     }
     rx.close();
+    let event = publication.stream.path.event_id().to_owned();
     publication.end();
     whip.resources().remove(&id);
-    let _ = whip.commands.send(Command::Close { id }).await;
+    {
+        let mut paths = whip.paths();
+        if paths.get(&event) == Some(&id) {
+            paths.remove(&event);
+        }
+    }
+    let close = Command::Close {
+        id,
+        cause: CloseCause::IngestEnded,
+    };
+    let _ = whip.commands.send(close).await;
     let _ = released.send(true);
 }
 

@@ -87,7 +87,20 @@ fn app(env: &[(&str, &str)]) -> Arc<App> {
 }
 
 async fn start(env: &[(&str, &str)]) -> Server {
-    let app = app(env);
+    start_with(env, |_| {}, None).await
+}
+
+/// A server whose sessions `tweak` adjusts, and whose callbacks go to
+/// `callbacks` if given.
+async fn start_with(
+    env: &[(&str, &str)],
+    tweak: impl FnOnce(&mut SessionConfig),
+    callbacks: Option<Callbacks>,
+) -> Server {
+    let mut app = app(env);
+    if let Some(callbacks) = callbacks {
+        Arc::get_mut(&mut app).expect("unshared").callbacks = callbacks;
+    }
     let sockets = Sockets {
         http: TcpListener::bind("127.0.0.1:0").await.expect("bind"),
         udp: UdpSocket::bind("127.0.0.1:0").await.expect("bind"),
@@ -96,9 +109,11 @@ async fn start(env: &[(&str, &str)]) -> Server {
         sockets.http.local_addr().expect("addr"),
         sockets.udp.local_addr().expect("addr"),
     );
-    let (whip, router, rx) = prepare(&app, server_identity())
-        .expect("router")
-        .expect("WHIP on");
+    let config = app.config.whip.clone().expect("WHIP on");
+    let mut session = session_config(&config);
+    tweak(&mut session);
+    let (whip, router, rx) =
+        prepare_with(&app, server_identity(), config, session).expect("router");
     tokio::spawn(run(app.clone(), whip.clone(), router, rx, sockets));
     Server {
         app,
@@ -421,14 +436,6 @@ async fn refusals_carry_their_statuses() {
         status(send(at, &sdp_post("/whip/live/event-a", TOKEN, &offer)).await),
         201
     );
-    let second = Phone::new(4, &server).await;
-    let busy = send(
-        at,
-        &sdp_post("/whip/live/event-a", TOKEN, &second.p.offer()),
-    )
-    .await;
-    assert_eq!(busy.status, 409, "the path was claimed at POST");
-    assert_eq!(busy.header("access-control-allow-origin"), Some(ORIGIN));
     let unknown = send(
         at,
         format!("DELETE /whip/session/00112233445566778899aabbccddeeff HTTP/1.1\r\nauthorization: Bearer {TOKEN}\r\n\r\n").as_bytes(),
@@ -1192,4 +1199,349 @@ async fn only_authenticated_media_counts_against_the_cap() {
     let audio = p.audio(1);
     receive(&mut router, &mut feeds, p.tuple, &audio);
     assert_eq!(feeds[&id].received, audio.len());
+}
+
+/// Callbacks for `live/event-<event>` into a queue a test reads.
+fn callback_queue(event: &str) -> (Callbacks, mpsc::Receiver<crate::callback::Queued>) {
+    crate::callback::test_queue(crate::publish_observer::fixture_scope(event, 1, 1, 1), 64)
+}
+
+/// The callback events queued within `wait`, by name.
+async fn callback_events(
+    rx: &mut mpsc::Receiver<crate::callback::Queued>,
+    wait: Duration,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    while let Ok(Some(q)) = tokio::time::timeout(wait, rx.recv()).await {
+        let body: serde_json::Value = serde_json::from_slice(&q.body).expect("JSON");
+        names.push(body["event"].as_str().unwrap_or_default().to_owned());
+    }
+    names
+}
+
+fn delete(location: &str) -> Vec<u8> {
+    let path = location
+        .strip_prefix("https://whip.example")
+        .expect("our Location");
+    format!("DELETE {path} HTTP/1.1\r\nauthorization: Bearer {TOKEN}\r\n\r\n").into_bytes()
+}
+
+/// A phone admitted to `event`, connected, publishing until a part is out.
+async fn live(server: &Server, seed: u8, event: &str) -> (Phone, String) {
+    let mut phone = Phone::new(seed, server).await;
+    let a = admit(server, &mut phone, event).await;
+    assert_eq!(a.status, 201, "{}", a.body);
+    let location = a.header("location").expect("Location").to_owned();
+    phone.connect().await;
+    let stream = server.app.streams.get(event).expect("claimed");
+    for _ in 0..10 {
+        phone.publish(1).await;
+        if stream.has_content() {
+            break;
+        }
+    }
+    assert!(stream.has_content());
+    (phone, location)
+}
+
+/// Polls `f` every 50 ms for up to 5 s.
+async fn eventually(mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..100 {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f()
+}
+
+/// A3.2: a DELETE after media sends `unpublish` at once and holds the
+/// stream; a POST within the grace continues the same stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_after_media_unpublishes_and_a_post_in_the_grace_continues() {
+    let (callbacks, mut rx) = callback_queue("grace");
+    let server = start_with(&[], |_| {}, Some(callbacks)).await;
+    let (_phone, location) = live(&server, 30, "event-grace").await;
+    assert_eq!(
+        callback_events(&mut rx, Duration::from_millis(200)).await,
+        ["publish"]
+    );
+    let held = server.app.streams.get("event-grace").expect("live");
+    assert_eq!(send(server.http, &delete(&location)).await.status, 200);
+    assert_eq!(
+        callback_events(&mut rx, Duration::from_millis(200)).await,
+        ["unpublish"],
+        "at once"
+    );
+    let still = server
+        .app
+        .streams
+        .get("event-grace")
+        .expect("held for the grace");
+    assert!(Arc::ptr_eq(&held, &still) && still.has_content());
+    assert_eq!(server.whip.ends.get("deleted"), 1);
+    // A new POST within the grace takes the held stream over.
+    let mut next = Phone::new(31, &server).await;
+    assert_eq!(admit(&server, &mut next, "event-grace").await.status, 201);
+    let resumed = server.app.streams.get("event-grace").expect("claimed");
+    assert!(Arc::ptr_eq(&held, &resumed), "the same stream");
+}
+
+/// A3.2: a POST after the grace starts a new stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_after_the_grace_starts_a_new_stream() {
+    let server = start(&[("SAPFLOW_RECONNECT_GRACE", "1")]).await;
+    let (_phone, location) = live(&server, 32, "event-later").await;
+    let held = server.app.streams.get("event-later").expect("live");
+    assert_eq!(send(server.http, &delete(&location)).await.status, 200);
+    assert!(
+        eventually(|| server.app.streams.get("event-later").is_none()).await,
+        "ended after the grace"
+    );
+    let mut next = Phone::new(33, &server).await;
+    assert_eq!(admit(&server, &mut next, "event-later").await.status, 201);
+    let fresh = server.app.streams.get("event-later").expect("claimed");
+    assert!(!Arc::ptr_eq(&held, &fresh), "a new stream");
+}
+
+/// A3.2: a DELETE before any media releases the path with no callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_before_media_releases_with_no_callback() {
+    let (callbacks, mut rx) = callback_queue("early");
+    let server = start_with(&[], |_| {}, Some(callbacks)).await;
+    let mut phone = Phone::new(34, &server).await;
+    let a = admit(&server, &mut phone, "event-early").await;
+    assert_eq!(a.status, 201);
+    let location = a.header("location").expect("Location").to_owned();
+    assert_eq!(send(server.http, &delete(&location)).await.status, 200);
+    assert!(server.app.streams.get("event-early").is_none(), "released");
+    assert!(
+        callback_events(&mut rx, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+    assert_eq!(server.whip.ends.get("deleted"), 1);
+}
+
+/// A3.2: a session whose handshake never completes ends at its deadline
+/// and releases the path with no callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handshake_timeout_releases_with_no_callback() {
+    let (callbacks, mut rx) = callback_queue("mute");
+    let server = start_with(
+        &[],
+        |s| s.handshake_timeout = Duration::from_secs(1),
+        Some(callbacks),
+    )
+    .await;
+    let mut phone = Phone::new(35, &server).await;
+    assert_eq!(admit(&server, &mut phone, "event-mute").await.status, 201);
+    assert!(server.app.streams.get("event-mute").is_some());
+    assert!(
+        eventually(|| server.app.streams.get("event-mute").is_none()).await,
+        "released at the deadline"
+    );
+    assert_eq!(server.whip.ends.get("handshake-timeout"), 1);
+    assert!(
+        callback_events(&mut rx, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+}
+
+/// A3.2: every refusal in Resources, with its status and its reason, the
+/// app's 401, 403, 429 and a 500 among them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_refusal_has_its_status_and_reason() {
+    use crate::publish_auth::stub::{self, Answer as App};
+    let _keep: Option<stub::Stub> = None;
+    use resource::Refusal as R;
+    let reason = |r: R| r.reason().to_owned();
+    // Before admission, on the global publisher.
+    let server = start(&[]).await;
+    let phone = Phone::new(36, &server).await;
+    let offer = phone.p.offer();
+    let at = server.http;
+    let check = |a: Answer, status: u16, why: String| {
+        assert_eq!((a.status, a.body), (status, why));
+    };
+    let no_type = post(
+        "/whip/live/event-r",
+        &[("authorization", "Bearer publisher:whip-test-secret")],
+        &offer,
+    );
+    check(
+        send(at, &no_type).await,
+        415,
+        reason(R::UnsupportedMediaType),
+    );
+    let not_sdp = send(at, &sdp_post("/whip/live/event-r", TOKEN, "not sdp")).await;
+    assert_eq!(not_sdp.status, 400);
+    assert!(!not_sdp.body.is_empty());
+    let unprofiled = offer
+        .replace("H264/90000", "VP8/90000")
+        .replace("opus/48000/2", "PCMU/8000");
+    let outside = send(at, &sdp_post("/whip/live/event-r", TOKEN, &unprofiled)).await;
+    assert_eq!(outside.status, 422);
+    assert!(!outside.body.is_empty());
+    let no_token = post(
+        "/whip/live/event-r",
+        &[("content-type", "application/sdp")],
+        &offer,
+    );
+    check(send(at, &no_token).await, 401, reason(R::Unauthorised));
+    // From the app that authorises publishers.
+    for (answer, status, why) in [
+        (App::Status(401), 401, R::Unauthorised),
+        (App::Status(403), 403, R::Forbidden),
+        (App::Status(429), 429, R::Throttled),
+        (App::Status(500), 503, R::Unavailable),
+    ] {
+        let auth = stub::start(answer).await;
+        let url = auth.url.clone();
+        let server = start(&[
+            ("SAPFLOW_PUBLISH_USER", ""),
+            ("SAPFLOW_PUBLISH_PASS", ""),
+            ("SAPFLOW_PUBLISH_AUTH_URL", &url),
+        ])
+        .await;
+        let refused = send(server.http, &sdp_post("/whip/live/event-r", TOKEN, &offer)).await;
+        check(refused, status, reason(why));
+    }
+}
+
+/// A3.3: a second POST while the first session is still taking media gets
+/// 409, with its reason and the CORS headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_post_while_media_flows_gets_409() {
+    let server = start(&[]).await;
+    let (_phone, _) = live(&server, 37, "event-busy").await;
+    let second = Phone::new(38, &server).await;
+    let busy = send(
+        server.http,
+        &sdp_post("/whip/live/event-busy", TOKEN, &second.p.offer()),
+    )
+    .await;
+    assert_eq!(busy.status, 409);
+    assert_eq!(busy.body, resource::Refusal::Conflict.reason());
+    assert_eq!(busy.header("access-control-allow-origin"), Some(ORIGIN));
+    assert_eq!(server.whip.ends.get("superseded"), 0);
+}
+
+/// A3.3: once the first session has taken no media for SAPFLOW_WHIP_STALE,
+/// a second POST takes over at once, as if it had left, without waiting
+/// for consent to expire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_session_is_superseded() {
+    let server = start(&[("SAPFLOW_WHIP_STALE", "1")]).await;
+    let (_phone, _) = live(&server, 39, "event-stall").await;
+    let held = server.app.streams.get("event-stall").expect("live");
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let mut next = Phone::new(40, &server).await;
+    let a = admit(&server, &mut next, "event-stall").await;
+    assert_eq!(a.status, 201, "{}", a.body);
+    assert_eq!(server.whip.ends.get("superseded"), 1);
+    let taken = server.app.streams.get("event-stall").expect("claimed");
+    assert!(Arc::ptr_eq(&held, &taken), "the held stream, carried on");
+}
+
+/// A3.3: a second POST during the first session's handshake replaces it
+/// at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_during_the_first_handshake_replaces_it() {
+    let server = start(&[]).await;
+    let mut first = Phone::new(41, &server).await;
+    assert_eq!(admit(&server, &mut first, "event-race").await.status, 201);
+    let mut second = Phone::new(42, &server).await;
+    let a = admit(&server, &mut second, "event-race").await;
+    assert_eq!(a.status, 201, "{}", a.body);
+    assert_eq!(server.whip.ends.get("superseded"), 1);
+    assert_eq!(server.whip.resources().len(), 1, "only the second is live");
+    second.connect().await;
+}
+
+/// Kept from before WHIP: in global-publisher mode an SRT or RTMP publisher
+/// with the publisher's credentials takes over any attached stream, a live
+/// WHIP session's included, which then ends on its next packet. A WHIP
+/// POST never takes over SRT or RTMP: it gets 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt() {
+    let server = start(&[]).await;
+    let (mut phone, _) = live(&server, 43, "event-mixed").await;
+    let req = sapflow_core::PublishRequest::parse_srt_stream_id(
+        "publish:live/event-mixed:publisher:whip-test-secret",
+    )
+    .expect("request");
+    let srt = Publication::begin(
+        &server.app,
+        &req,
+        SourceKind::Ts,
+        "127.0.0.1".parse().expect("ip"),
+    )
+    .expect("SRT takes over");
+    phone.publish(1).await;
+    assert!(
+        eventually(|| server.whip.ends.get("ingest-ended") == 1).await,
+        "the WHIP session ended on its next packet"
+    );
+    let other = Phone::new(44, &server).await;
+    let busy = send(
+        server.http,
+        &sdp_post("/whip/live/event-mixed", TOKEN, &other.p.offer()),
+    )
+    .await;
+    assert_eq!(busy.status, 409, "SRT is never superseded by WHIP");
+    srt.end();
+}
+
+/// A3.4: a panic while handling one session's datagram ends only that
+/// session; a second session keeps publishing with nothing lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_one_session_ends_only_that_session() {
+    let server = start(&[]).await;
+    let (a, a_location) = live(&server, 45, "event-pa").await;
+    let (mut b, b_location) = live(&server, 46, "event-pb").await;
+    let b_stream = server.app.streams.get("event-pb").expect("live");
+    let parts = || b_stream.lock().media.as_ref().map_or(0, |m| m.len());
+    let before = parts();
+    let b_task = tokio::spawn(async move {
+        b.publish(2).await;
+        b
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    a.send(sapflow_whip::testing::PANIC_DATAGRAM).await;
+    let _b = b_task.await.expect("B published throughout");
+    assert!(
+        eventually(|| server.whip.ends.get("panicked") == 1).await,
+        "A ended"
+    );
+    assert!(
+        eventually(|| server.losses(&a_location) == "session gone").await,
+        "A's publication released"
+    );
+    assert_eq!(server.losses(&b_location), "none", "B lost nothing");
+    assert!(parts() > before, "B's playlist kept growing");
+}
+
+#[test]
+fn every_end_reason_has_a_name() {
+    use sapflow_whip::EndReason as R;
+    let names = [
+        end_name(R::Closed, Some(CloseCause::Delete)),
+        end_name(R::Closed, Some(CloseCause::Superseded)),
+        end_name(R::Closed, Some(CloseCause::IngestEnded)),
+        end_name(R::Closed, None),
+        end_name(R::HandshakeTimeout, None),
+        end_name(R::ConsentExpired, None),
+        end_name(R::Dtls(sapflow_dtls::Error::Timeout), None),
+        end_name(R::PeerClosed, None),
+        end_name(R::MediaTimeout, None),
+        end_name(R::KeysExhausted, None),
+        end_name(R::Panicked, None),
+    ];
+    let distinct: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(distinct.len(), names.len());
+    let counts = EndCounts::default();
+    assert_eq!((counts.add("deleted"), counts.add("deleted")), (1, 2));
+    assert_eq!((counts.get("deleted"), counts.get("panicked")), (2, 0));
 }
