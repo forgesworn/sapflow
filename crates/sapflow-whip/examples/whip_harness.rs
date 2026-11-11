@@ -525,6 +525,15 @@ fn main() {
         st.ice.role_conflicts,
         st.dtls.retransmissions,
     );
+    println!(
+        "sending: budget_dropped={} transmit_dropped={} ice_repeats={} ice_replays={} \
+         send_tuple_is_selected={}",
+        st.budget_dropped,
+        st.transmit_dropped,
+        st.ice.repeats,
+        st.ice.replays,
+        s.send_tuple() == s.selected(),
+    );
     if let Some(rx) = s.receiver() {
         for kind in [sdp::MediaKind::Video, sdp::MediaKind::Audio] {
             if let Some(x) = s.stream(kind).and_then(|id| rx.stats(id)) {
