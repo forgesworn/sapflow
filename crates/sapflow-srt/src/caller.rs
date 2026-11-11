@@ -357,7 +357,7 @@ impl Caller {
         let t = self.micros(now);
         self.tick(t);
         if let Some(dest) = self.shutdown.take() {
-            let mut bytes = Vec::with_capacity(16);
+            let mut bytes = Vec::with_capacity(20);
             ControlPacket::new(t as u32, dest, Control::Shutdown).encode(&mut bytes);
             return Some((self.peer, bytes));
         }
