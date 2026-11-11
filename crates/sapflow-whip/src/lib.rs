@@ -23,8 +23,9 @@
 //!
 //! Sans-IO: nothing here owns a socket, a clock or a thread. Every byte that
 //! arrives is hostile: nothing indexes without a bound or trusts a length,
-//! and every buffer has a stated cap. No `Debug` output shows an address,
-//! a token or a password.
+//! every buffer has a stated cap, and each parser has a fuzz target
+//! (`stun_message`, `sdp_offer`, `rfc4571_frames`, `whip_session`). No
+//! `Debug` output shows an address, a token or a password.
 
 #![warn(missing_docs)]
 #![cfg_attr(
@@ -52,6 +53,10 @@ mod tests;
 #[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
 pub mod testing;
+
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod fuzzing;
 
 pub use entropy::EntropyError;
 pub use ice::{Credentials, IceConfig, Transport, Tuple};
