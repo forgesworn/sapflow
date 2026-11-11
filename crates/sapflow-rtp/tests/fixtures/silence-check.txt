@@ -1,0 +1,34 @@
+ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers
+opus      120 samples x 1 mono   e0fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      120 samples x 1 stereo e4fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      240 samples x 1 mono   e8fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      240 samples x 1 stereo ecfffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      480 samples x 1 mono   f0fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      480 samples x 1 stereo f4fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      960 samples x 1 mono   f8fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      960 samples x 1 stereo fcfffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      960 samples x 2 mono   f9fffefffe                   fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      960 samples x 2 stereo fdfffefffe                   fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      960 samples x 3 mono   fb03fffefffefffe             fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      960 samples x 3 stereo ff03fffefffefffe             fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      960 samples x 6 mono   fb06fffefffefffefffefffefffe fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      960 samples x 6 stereo ff06fffefffefffefffefffefffe fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      480 samples x 3 mono   f303fffefffefffe             fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+opus      480 samples x 3 stereo f703fffefffefffe             fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   120 samples x 1 mono   e0fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   120 samples x 1 stereo e4fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   240 samples x 1 mono   e8fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   240 samples x 1 stereo ecfffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   480 samples x 1 mono   f0fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   480 samples x 1 stereo f4fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   960 samples x 1 mono   f8fffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   960 samples x 1 stereo fcfffe                       fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   960 samples x 2 mono   f9fffefffe                   fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   960 samples x 2 stereo fdfffefffe                   fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   960 samples x 3 mono   fb03fffefffefffe             fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   960 samples x 3 stereo ff03fffefffefffe             fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   960 samples x 6 mono   fb06fffefffefffefffefffefffe fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   960 samples x 6 stereo ff06fffefffefffefffefffefffe fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   480 samples x 3 mono   f303fffefffefffe             fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+libopus   480 samples x 3 stereo f703fffefffefffe             fresh peak 0, after tone: first 20 ms peak 4157, then 0; tone peaks 4169 4169: ok
+PASS

@@ -22,6 +22,8 @@
     clippy::indexing_slicing
 )]
 
+pub mod media;
+
 use crate::rtcp::{Compound, Packet, build};
 use crate::rtp::{RtpPacket, header_len};
 use crate::srtp::{Config, Inbound, Outbound, Profile, Role, SrtpError, split_keying_material};
