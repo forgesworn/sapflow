@@ -308,6 +308,8 @@ impl Feed {
                 IncompleteReason::TransportTimeout
             }
             EndReason::Dtls(_) | EndReason::KeysExhausted => IncompleteReason::Protocol,
+            // Its state was dropped mid-call.
+            EndReason::Panicked => IncompleteReason::IngestError,
             // Never connected, so nothing was recorded; or an orderly end:
             // DELETE, our close, or the publisher's close_notify.
             EndReason::HandshakeTimeout | EndReason::Closed | EndReason::PeerClosed => return,

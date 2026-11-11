@@ -87,6 +87,16 @@ pub fn synthetic_offer(fingerprint: &Fingerprint, ufrag: &str) -> String {
     )
 }
 
+/// A datagram that makes a session panic in test builds, for panic
+/// isolation tests. Its first byte reads as none of STUN, DTLS, RTP or
+/// RTCP, so the router sends it to the owner of the tuple it came from.
+pub const PANIC_DATAGRAM: &[u8] = b"\xffsapflow-whip test: panic here";
+
+/// The panic [`PANIC_DATAGRAM`] causes.
+pub fn injected_panic() -> ! {
+    panic!("a test asked this session to panic")
+}
+
 /// The documentation address the tests publish from.
 pub fn tuple(port: u16) -> Tuple {
     Tuple::udp(SocketAddr::from(([192, 0, 2, 7], port)))

@@ -58,6 +58,13 @@
 //! Each session's owned tuples are kept within the ones it still has
 //! validated, so the map is bounded by the sessions' tuple tables.
 //!
+//! # Panics
+//!
+//! Every call into a session runs under `catch_unwind` (the workspace
+//! builds with `panic = "unwind"`). A session whose call panics is dropped
+//! with its queued output, its ufrag and its tuples, and its last event is
+//! `Ended(Panicked)`; every other session goes on as it was.
+//!
 //! # Driving it
 //!
 //! As for a [`Session`]: after each [`Router::handle_datagram`],
@@ -136,6 +143,8 @@ pub struct RouterStats {
     pub stale_owner: u64,
     /// Sessions removed after they ended.
     pub removed: u64,
+    /// Sessions dropped because a call into them panicked.
+    pub panics: u64,
 }
 
 struct Entry {
@@ -238,13 +247,17 @@ impl Router {
             self.stats.unrouted += 1;
             return None;
         };
-        let entry = self.sessions.get_mut(&id)?;
-        let before = entry.session.stats().ice.successes;
-        entry.session.handle_datagram(now, tuple, bytes);
-        // A check the session took as new, and so validated this tuple.
-        let checked =
-            stun && entry.session.stats().ice.successes > before && entry.session.accepts(&tuple);
-        let gone = !stun && !entry.session.accepts(&tuple);
+        let handled = self.guarded(id, |s| {
+            let before = s.stats().ice.successes;
+            s.handle_datagram(now, tuple, bytes);
+            // A check the session took as new, and so validated this tuple.
+            let checked = stun && s.stats().ice.successes > before && s.accepts(&tuple);
+            (checked, !stun && !s.accepts(&tuple))
+        });
+        // The session panicked and is gone; the datagram was still its.
+        let Some((checked, gone)) = handled else {
+            return Some(id);
+        };
         self.drain(id);
         if checked {
             self.claim(now, tuple, id);
@@ -264,10 +277,9 @@ impl Router {
             .map(|(id, _)| *id)
             .collect();
         for id in due {
-            if let Some(e) = self.sessions.get_mut(&id) {
-                e.session.handle_timeout(now);
+            if self.guarded(id, |s| s.handle_timeout(now)).is_some() {
+                self.drain(id);
             }
-            self.drain(id);
         }
     }
 
@@ -282,8 +294,7 @@ impl Router {
     /// Asks a session's publisher for a keyframe
     /// ([`Session::request_keyframe`]).
     pub fn request_keyframe(&mut self, id: &SessionId, now: Instant) {
-        if let Some(e) = self.sessions.get_mut(id) {
-            e.session.request_keyframe(now);
+        if self.guarded(*id, |s| s.request_keyframe(now)).is_some() {
             self.drain(*id);
         }
     }
@@ -291,11 +302,12 @@ impl Router {
     /// Ends a session ([`Session::close`]) and removes it. Returns whether
     /// it was live.
     pub fn close(&mut self, id: &SessionId, now: Instant) -> bool {
-        let Some(e) = self.sessions.get_mut(id) else {
+        if !self.sessions.contains_key(id) {
             return false;
-        };
-        e.session.close(now);
-        self.drain(*id);
+        }
+        if self.guarded(*id, |s| s.close(now)).is_some() {
+            self.drain(*id);
+        }
         true
     }
 
@@ -371,18 +383,43 @@ impl Router {
     /// Moves what a session queued into the router's queues, and removes it
     /// once it has ended.
     fn drain(&mut self, id: SessionId) {
-        let Some(e) = self.sessions.get_mut(&id) else {
+        let drained = self.guarded(id, |s| {
+            let out: Vec<Transmit> = std::iter::from_fn(|| s.poll_transmit()).collect();
+            let events: Vec<Event> = std::iter::from_fn(|| s.poll_event()).collect();
+            (out, events, matches!(s.state(), State::Ended(_)))
+        });
+        let Some((out, events, ended)) = drained else {
             return;
         };
-        while let Some(t) = e.session.poll_transmit() {
-            self.out.push_back(t);
+        self.out.extend(out);
+        self.events.extend(events.into_iter().map(|ev| (id, ev)));
+        if ended {
+            self.remove(id);
+            self.stats.removed += 1;
         }
-        while let Some(ev) = e.session.poll_event() {
-            self.events.push_back((id, ev));
+    }
+
+    /// Runs `f` on a session under `catch_unwind`. If it panics, the
+    /// session is dropped, since its state is not trusted after that: its
+    /// queued output is discarded, its ufrag and tuples are freed, and
+    /// `Ended(Panicked)` is its last event. Returns `None` then, or for a
+    /// session that is not live. Every other session goes on as it was.
+    fn guarded<R>(&mut self, id: SessionId, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
+        let e = self.sessions.get_mut(&id)?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut e.session))) {
+            Ok(r) => Some(r),
+            Err(_) => {
+                self.remove(id);
+                self.stats.panics += 1;
+                self.events
+                    .push_back((id, Event::Ended(crate::session::EndReason::Panicked)));
+                None
+            }
         }
-        if !matches!(e.session.state(), State::Ended(_)) {
-            return;
-        }
+    }
+
+    /// Forgets a session, its ufrag and the tuples it owns.
+    fn remove(&mut self, id: SessionId) {
         if let Some(e) = self.sessions.remove(&id) {
             self.ufrags.remove(e.session.local_ufrag());
             for t in &e.owned {
@@ -390,7 +427,6 @@ impl Router {
                     self.owners.remove(t);
                 }
             }
-            self.stats.removed += 1;
         }
     }
 }

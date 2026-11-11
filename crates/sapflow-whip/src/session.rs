@@ -274,6 +274,9 @@ pub enum EndReason {
     Closed,
     /// The SRTCP index for our key is spent (2^31 packets).
     KeysExhausted,
+    /// A call into the session panicked. Set by [`crate::router::Router`],
+    /// which drops the session: its state is not trusted after that.
+    Panicked,
 }
 
 /// Where a session stands.
@@ -746,6 +749,12 @@ impl Session {
 
     /// One datagram (or RFC 4571 frame) from `tuple`.
     pub fn handle_datagram(&mut self, now: Instant, tuple: Tuple, bytes: &[u8]) {
+        // Test builds only: a datagram that makes this call panic, for the
+        // router's and the server's panic isolation tests.
+        #[cfg(any(test, feature = "testing"))]
+        if bytes == crate::testing::PANIC_DATAGRAM {
+            crate::testing::injected_panic();
+        }
         if matches!(self.state, State::Ended(_)) {
             self.stats.after_end += 1;
             return;
