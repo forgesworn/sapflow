@@ -15,8 +15,9 @@ docs/reference.md), the same as sapflow_hls::playlist::RuleCheck:
     in audio-only;
   - once segments have been removed (MEDIA-SEQUENCE above 0), the segments
     listed last at least three TARGETDURATIONs (6.2.2's segment rule; its
-    part rule is not checked), unless the render lists 256 entries or more,
-    sapflow's entry cap. sapflow's other cap, 64 MiB of segments beyond
+    part rule needs the parts, which sapflow_hls::playlist::RetentionCheck
+    checks), unless the render lists 256 entries or more, sapflow's entry
+    cap. sapflow's other cap, 64 MiB of segments beyond
     MuxerConfig::segment_count, cannot be seen in a render: pass
     --byte-capped when the muxer reported it (Muxer::window_byte_capped)
     for the renders checked, and a short window is then accepted.

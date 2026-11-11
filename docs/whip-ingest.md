@@ -785,22 +785,58 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   `--byte-capped`. The `epochs` golden digest changed with it: that
   scenario now keeps one more 1 s segment. Opus output is pinned at 4ab0c12
   by `real_opus_output_is_byte_identical_to_4ab0c12`, which still matches.
-- Open, and older than W3b: RFC 8216bis 6.2.2's part rule. A part must stay
-  downloadable for three target durations after its `EXT-X-PART` tag leaves
-  the playlist. Tags are listed while their segment ends within three
-  target durations of the live edge (`playlist.rs`), but a part's data is
-  freed with its segment (`Muxer::rotate_segment`), so a window shorter than
-  about six target durations falls short. The live-window review measured
-  how long a part stays downloadable after its tag leaves, the same at
-  4ab0c12 and after the segment rule:
+- Settled after W3b, with the user's agreement: RFC 8216bis 6.2.2's part
+  rule (drafts 19 and 22 word it the same): "Clients MUST be able to
+  download the Partial Segment for at least three Target Durations after
+  the EXT-X-PART tag is removed from the Playlist." Part data used to be
+  freed with its segment, so a window shorter than about six target
+  durations fell short. Now `Muxer::part`, which the server answers part
+  requests from, keeps serving a part until the published media has
+  advanced three target durations past the render that dropped its tag.
+  Published media is every `EXTINF` the window has listed plus the open
+  parts' spans; one function, `Muxer::part_tags_from`, decides both which
+  part tags the playlist lists and when they left. Time is media time: a
+  publisher sending faster than real time gets less wall-clock time, and a
+  stall gets more. Playlists and segments are unchanged.
 
-  | Case | Part held after its tag leaves |
-  |---|---|
-  | Steady stream, `segment_count` 7 | 1.0 s |
-  | Default 24, reconnect every 10 frames | 0.000 s |
-  | Default 24, reconnect every 20 frames | 4.05 s |
-  | Steady stream, `segment_count` 12 | 6.02 s |
-  | Steady stream, `segment_count` 24 | 18.05 s |
+  Parts kept for segments that have left the window are bounded at 64 MiB
+  and 4,096 parts (`muxer::MAX_RETAINED_PARTS`); past either, the oldest
+  go early. They keep their fragment-budget charge: a part encode the
+  budget refuses first frees them all and tries again, so this stream's
+  retention never causes a refusal of its own media. Another stream cannot
+  reclaim them, so each stream can hold up to 64 MiB more of the shared
+  budget than before. `Muxer::parts_released_early()` counts every part
+  that went early, and `playlist::RetentionCheck` holds a muxer to the rule
+  given that count; the `muxer_timing` and `opus_packaging` fuzz targets
+  run it after every push.
+
+  The shortest time any part was still served after its tag left
+  (`part_retention_tests`; target 2 s, so the rule asks for 6 s):
+
+  | Case | Before | After |
+  |---|---|---|
+  | Steady A/V, `segment_count` 7 | 0.8 s | 6.0 s |
+  | Steady A/V, `segment_count` 12 | 5.8 s | 6.0 s |
+  | Steady A/V, `segment_count` 24 | 17.8 s | 17.8 s |
+  | AAC, default 24, reconnect every 10 frames | 0.0 s | 6.19 s |
+  | AAC, default 24, reconnect every 20 frames | 4.05 s | 6.19 s |
+  | TS epochs, `segment_count` 8 | 0.2 s | 6.2 s |
+  | Opus audio-only, 20 ms, `segment_count` 7 | 0.8 s | 6.0 s |
+  | Opus audio-only, 60 ms, `segment_count` 7 | 1.02 s | 6.0 s |
+  | Opus video-led, 20 ms, `segment_count` 7 | 0.8 s | 6.0 s |
+
+  The live-window review's own probe measured 1.0, 0.000, 4.05, 6.02 and
+  18.05 s for the first five. The
+  `epochs` golden digest changed again: after the fourth epoch the first
+  epoch's parts 0 to 10 and its init are still served. Every playlist,
+  segment, and part and init served before is unchanged, and the other 12
+  AAC and the 6 Opus digests are byte-identical.
+- Open: RFC 8216bis 6.2.2's segment availability. A removed segment must
+  stay downloadable until it first appeared plus its duration plus the
+  longest playlist that listed it. `Muxer::segment` stops serving a segment
+  when it leaves the window, one segment duration short of that: 1.0 s
+  short for steady 1 s segments at `segment_count` 7 and 24, measured once
+  with a probe that was not kept.
 - The departures from the encapsulation listed above, and the cause of the
   312 click.
 - Safari, iOS and Android with sapflow's packaging, which need the user's

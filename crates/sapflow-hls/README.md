@@ -25,9 +25,13 @@ live media server. MIT.
   rule), up to `muxer::MAX_WINDOW_ENTRIES` (256) entries and 64 MiB of
   media beyond the count. Past either cap removal goes on, so a publisher
   making tiny segments cannot grow the window without bound. 6.2.2's part
-  rule is not met yet: a part should stay downloadable for three target
-  durations after its tag leaves the playlist, but its data goes with its
-  segment, so a window shorter than about six target durations falls short.
+  rule holds in media time: `Muxer::part` keeps serving a part for three
+  target durations of published media after the playlist stops listing it,
+  up to 64 MiB and `muxer::MAX_RETAINED_PARTS` (4,096) parts beyond the
+  window; past either, or when the fragment budget refuses new media, the
+  oldest go early and `Muxer::parts_released_early` counts them. A segment
+  itself is not served once it leaves the window, one segment duration
+  short of 6.2.2's availability rule for segments.
 - **Ingest.** `TsIngest` takes MPEG-TS (what SRT carries), `FlvIngest`
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
   units and AAC frames or Opus packets directly.
