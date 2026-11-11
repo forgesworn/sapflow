@@ -1120,3 +1120,28 @@ fn the_event_queue_is_bounded() {
         })
     ));
 }
+
+#[test]
+fn keyframes_can_be_asked_for_before_media() {
+    // With the SSRC from the offer, the server asks as soon as SRTP is up.
+    let mut r = Receiver::new(ReceiverConfig::default(), Instant::now());
+    let mut v = StreamConfig::new(Codec::H264, 96);
+    v.ssrc = Some(7);
+    v.pli = true;
+    let video = r.add_stream(v).expect("video");
+    let audio = r
+        .add_stream(StreamConfig::new(Codec::Opus, 111))
+        .expect("audio");
+    assert!(r.request_keyframe(video));
+    assert!(!r.request_keyframe(audio));
+    assert_eq!(r.poll_timeout(), Some(r.epoch));
+    r.handle_timeout(r.epoch);
+    assert_eq!(r.poll_feedback(), Some(Feedback::Pli { media_ssrc: 7 }));
+    // Without an SSRC, the request waits for the first packet.
+    let mut r = video_only(ReceiverConfig::default(), false);
+    assert!(r.request_keyframe(StreamId(0)));
+    r.handle_timeout(r.epoch);
+    assert_eq!(r.poll_feedback(), None);
+    feed(&mut r, 1, &pkt(96, 7, 1, 0, true, &[0x41, 0x9a, 1])).expect("taken");
+    assert_eq!(r.poll_feedback(), Some(Feedback::Pli { media_ssrc: 7 }));
+}

@@ -22,7 +22,8 @@
 //!   original SSRC and sequence number; both fill the same gap;
 //! - the H.264 or Opus depacketiser ([`crate::h264`], [`crate::opus`]);
 //! - for video, keyframe requests (PLI, or FIR where only FIR was
-//!   negotiated): at once on the first packet, every keyframe interval,
+//!   negotiated): when the caller asks ([`Receiver::request_keyframe`],
+//!   as soon as SRTP is up), on the first packet, every keyframe interval,
 //!   and at once after unrecoverable loss, rate-limited. After loss, every
 //!   frame up to the next IDR is dropped and reported
 //!   ([`Event::FrameSkipped`]).
@@ -634,6 +635,21 @@ impl Receiver {
             }
             stats
         })
+    }
+
+    /// Asks for a keyframe on a video stream at the next timer (subject to
+    /// the rate limit). The server calls this as soon as SRTP is up, so the
+    /// first IDR comes at once; the first media packet asks too, as a
+    /// fallback. A request waits until the stream's SSRC is known. Returns
+    /// false for an audio stream or an unknown one.
+    pub fn request_keyframe(&mut self, stream: StreamId) -> bool {
+        match self.streams.get_mut(stream.0).map(|s| &mut s.media) {
+            Some(Media::Video(v)) => {
+                v.keyframes.pending = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The smoothed RTT estimate: 100 ms (or the configured value) until

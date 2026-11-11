@@ -555,7 +555,9 @@ Browsers send a keyframe when asked, not on a schedule. `TargetDuration` and
 `PartTiming` are fixed from the first segment. So:
 
 - Sapflow sends a PLI as soon as SRTP is up, so the first keyframe comes at
-  once.
+  once. The server asks `sapflow-rtp`'s receiver for it then
+  (`Receiver::request_keyframe`); the first media packet asks too, as a
+  fallback, and so does any stream whose SSRC is not yet known.
 - It then asks for a keyframe every `SAPFLOW_WHIP_KEYFRAME_INTERVAL`
   (proposed 2 s), sending PLI (or FIR where only FIR is negotiated). That keeps
   segments near the target that was fixed from the first one.
