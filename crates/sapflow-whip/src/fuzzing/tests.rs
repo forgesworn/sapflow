@@ -61,6 +61,20 @@ fn session_seeds_reach_their_stage() {
     }
 }
 
+/// The forgotten-and-copied seed does what it says: forgotten checks
+/// validate the third tuple, copies draw sends to it, and the budget holds.
+#[test]
+fn forgotten_and_copied_reaches_the_third_tuple() {
+    let (_, bytes) = seeds("whip_session")
+        .into_iter()
+        .find(|(n, _)| n == "connect-forgotten-and-copied")
+        .expect("seed");
+    let run = whip_session_run(&bytes);
+    assert_eq!(run.stage, 2);
+    assert!(run.to_third > 0, "{run:?}");
+    assert!(run.to_third <= 4 * run.from_third, "{run:?}");
+}
+
 /// A fixed-seed mutation pass over every seed, with the unit tests.
 #[test]
 fn seeded_mutations_hold_the_invariants() {
@@ -317,6 +331,25 @@ fn write_seeds() {
     push_step(&mut s, op::TIME, &[40]);
     push_step(&mut s, op::RTP, &[2]);
     write("whip_session", "connect-replays-elsewhere", &s);
+    // More checks than the ID cache holds, then old ones re-sent from the
+    // third tuple (forgotten, so they validate it), and copies of fresh
+    // SRTP and SRTCP from it ahead of and after their originals.
+    let mut s = Vec::new();
+    connect(&mut s);
+    push_step(&mut s, op::CHECK, &[0xf0]);
+    push_step(&mut s, op::CHECK, &[0x31]);
+    push_step(&mut s, op::ELSEWHERE, &[0, 0]);
+    push_step(&mut s, op::ELSEWHERE, &[0, 1]);
+    push_step(&mut s, op::ELSEWHERE, &[1]);
+    push_step(&mut s, op::TIME, &[2]);
+    push_step(&mut s, op::ELSEWHERE, &[2]);
+    push_step(&mut s, op::ELSEWHERE, &[3]);
+    push_step(&mut s, op::ELSEWHERE, &[7]);
+    push_step(&mut s, op::TIME, &[0, 200]);
+    push_step(&mut s, op::ELSEWHERE, &[0x81]);
+    push_step(&mut s, op::RTP, &[2]);
+    push_step(&mut s, op::TIME, &[0x0b, 0xb8]);
+    write("whip_session", "connect-forgotten-and-copied", &s);
     // RTCP too short to protect, which the harness once unwrapped.
     let mut s = Vec::new();
     connect(&mut s);
