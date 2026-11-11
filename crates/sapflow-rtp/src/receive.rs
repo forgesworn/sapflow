@@ -894,12 +894,7 @@ impl Receiver {
         }
         let id = StreamId(i);
         let t = self.now;
-        if !is_rtx {
-            if self.report_next.is_none() {
-                self.report_next = Some(t.saturating_add(self.report_interval() / 2));
-            }
-            self.events.timeline.note_packet(i, packet.timestamp(), t);
-        }
+        let interval = self.report_interval();
         let s = self.streams.get_mut(i).ok_or(ReceiveError::UnknownStream)?;
         let (seq, payload) = if is_rtx {
             match rtx::unwrap(packet.payload()).map_err(ReceiveError::Rtx)? {
@@ -912,6 +907,11 @@ impl Receiver {
         } else {
             (packet.sequence(), packet.payload())
         };
+        // Media by either route starts the report timer and the start
+        // hold; an RTX packet keeps its original's timestamp.
+        self.report_next
+            .get_or_insert(t.saturating_add(interval / 2));
+        self.events.timeline.note_packet(i, packet.timestamp(), t);
         if s.stats.packets == 0
             && let Media::Video(v) = &mut s.media
         {

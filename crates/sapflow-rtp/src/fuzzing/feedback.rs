@@ -491,8 +491,10 @@ fn run_sr_timeline(data: &[u8]) -> Option<Session> {
                 }
                 .build();
                 let parsed = RtpPacket::parse(&built).expect("built packets parse");
+                // Media by either route starts the hold; a padding-only
+                // RTX probe does not.
                 let taken = r.handle_rtp(at, &parsed).is_ok();
-                if taken && kind != 5 && !rtx {
+                if taken && kind != 5 && !(rtx && payload.is_empty()) {
                     s.first_media.get_or_insert(s.now);
                 }
             }
@@ -1023,5 +1025,16 @@ mod tests {
         push_record(&mut hostile, &[5, 0, 1, 0, 0, 0, 0x41]);
         push_record(&mut hostile, &[3, 0, 200]);
         write("sr_timeline", "built-hostile-reports", &hostile);
+        // Video only over RTX, every original lost, with the default hold.
+        let mut rtx_only = vec![0u8];
+        push_record(&mut rtx_only, &[0, 0, 1, 0x10, 0, 0]);
+        for n in 0..60u16 {
+            let mut rec = vec![0u8];
+            rec.extend_from_slice(&n.to_be_bytes());
+            rec.extend_from_slice(&[0x13, 0, 0, 0x65, 0x88, 0x84, 0x21]);
+            push_record(&mut rtx_only, &rec);
+            push_record(&mut rtx_only, &[3, 0, 33]);
+        }
+        write("sr_timeline", "built-rtx-only", &rtx_only);
     }
 }

@@ -536,3 +536,36 @@ fn a_drifting_report_is_a_discontinuity() {
     );
     assert_eq!(last, 59 * 3000 + 27_000, "moved forward by the drift");
 }
+
+/// Video that only ever arrives over RTX (every original lost) still
+/// starts the hold, which still ends on time.
+#[test]
+fn media_only_over_rtx_still_ends_the_hold() {
+    let mut r = Receiver::new(ReceiverConfig::default(), Instant::now());
+    let mut v = StreamConfig::new(Codec::H264, 96);
+    v.ssrc = Some(7);
+    v.rtx = Some(RtxConfig {
+        payload_type: 97,
+        ssrc: Some(99),
+    });
+    v.nack = true;
+    r.add_stream(v).expect("video");
+    // A padding-only probe is not media: nothing starts.
+    feed(&mut r, 0, &pkt(97, 99, 1, 0, false, &[])).expect("probe");
+    assert_eq!(r.poll_timeout(), None);
+    for n in 0..60u16 {
+        let mut body = n.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0x65, 0x88, 1]);
+        let at = 10 + u64::from(n) * 33;
+        feed(
+            &mut r,
+            at,
+            &pkt(97, 99, 2 + n, u32::from(n) * 3000, true, &body),
+        )
+        .expect("taken");
+        r.handle_timeout(r.epoch + Duration::from_millis(at));
+    }
+    assert_eq!(r.alignment(), Some(Alignment::Arrival(Fallback::Timeout)));
+    assert!(matches!(r.poll_event(), Some(Event::Aligned { .. })));
+    assert!(std::iter::from_fn(|| r.poll_event()).any(|e| matches!(e, Event::AccessUnit { .. })));
+}
