@@ -330,11 +330,18 @@ fn consent_expires_30_s_after_the_last_check() {
     let (mut p, mut a, t0) = setup(8, &[GCM]);
     let s = &mut a.session;
     p.connect(s, t0);
-    // A check at 20 s renews consent to 50 s.
-    run_until(s, t0 + Duration::from_secs(20));
-    let c = p.check(false);
-    s.handle_datagram(t0 + Duration::from_secs(20), p.tuple, &c);
-    run_until(s, t0 + Duration::from_secs(49));
+    // Media every second keeps the media timeout away; a check at 20 s
+    // renews consent to 50 s.
+    for second in 1..=49u64 {
+        let at = t0 + Duration::from_secs(second);
+        s.handle_datagram(at, p.tuple, &p.audio(second as u8));
+        if second == 20 {
+            let c = p.check(false);
+            s.handle_datagram(at, p.tuple, &c);
+        }
+        run_until(s, at);
+        p.receive(s);
+    }
     assert_eq!(s.state(), State::Connected);
     run_until(s, t0 + Duration::from_secs(50));
     assert_eq!(s.state(), State::Ended(EndReason::ConsentExpired));
@@ -969,4 +976,65 @@ fn the_limit_admits_every_w0_hello_after_one_check() {
     }
     assert_eq!(sent_to(s, p.tuple).1, 0);
     assert!(s.stats().budget_dropped > 0);
+}
+
+/// After the publisher has gone, replays of checks the agent has forgotten
+/// count as new, from its old tuple or a victim's, and renew consent. What
+/// still stops sending is the media timeout: nobody can replay SRTP into
+/// the replay window.
+#[test]
+fn forgotten_replays_cannot_outlive_the_media() {
+    let t0 = Instant::now();
+    let mut p = Publisher::new(27, &[GCM]);
+    let mut config = SessionConfig::default();
+    config.ice.max_transactions = 16;
+    let mut a = accept(&p.offer(), config, t0, 27);
+    p.answered(&a);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    let home = p.tuple;
+    let victim = tuple(50_004);
+    // Ten seconds of publishing, a check every half second, all captured.
+    let mut captured = Vec::new();
+    for step in 1..=20u64 {
+        let at = t0 + ms(500 * step);
+        s.handle_datagram(at, home, &p.audio(step as u8));
+        let c = p.check(true);
+        s.handle_datagram(at, home, &c);
+        captured.push(c);
+        run_until(s, at);
+        p.receive(s);
+    }
+    let gone = t0 + ms(10_000);
+    let successes = s.stats().ice.successes;
+    // Every 5 s, an old check from the publisher's tuple or the victim's.
+    let mut to_victim = (Vec::new(), 0);
+    for (i, old) in captured.iter().take(6).enumerate() {
+        let at = gone + Duration::from_secs(5 * (i as u64 + 1)) - ms(1);
+        run_until(s, at);
+        p.receive(s);
+        let from = if i % 2 == 0 { home } else { victim };
+        s.handle_datagram(at, from, old);
+        let (stun, other) = sent_to(s, victim);
+        to_victim.0.extend(stun);
+        to_victim.1 += other;
+        p.receive(s);
+    }
+    assert_eq!(
+        s.stats().ice.successes,
+        successes + 6,
+        "forgotten IDs are new checks"
+    );
+    assert!(to_victim.0.iter().all(|n| *n <= captured[0].len()));
+    assert_eq!(to_victim.1, 0, "nothing else to the victim");
+    assert_eq!(s.send_tuple(), Some(home));
+    run_until(s, gone + Duration::from_secs(30) - ms(1));
+    assert_eq!(s.state(), State::Connected);
+    run_until(s, gone + Duration::from_secs(30));
+    assert_eq!(s.state(), State::Ended(EndReason::MediaTimeout));
+    p.receive(s);
+    // From then on, nothing, whatever arrives.
+    s.handle_datagram(gone + Duration::from_secs(31), home, &captured[7]);
+    run_until(s, gone + Duration::from_secs(60));
+    assert!(s.poll_transmit().is_none());
 }

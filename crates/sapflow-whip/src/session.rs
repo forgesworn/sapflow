@@ -52,8 +52,12 @@
 //!   [`SessionConfig::keyframe_interval`].
 //! - **Ending.** A session ends with an [`EndReason`]: no ICE and DTLS by
 //!   [`SessionConfig::handshake_timeout`] after creation, consent expired,
-//!   DTLS failed or closed by the peer, or [`Session::close`]. After that
-//!   it sends nothing and ignores input.
+//!   no fresh SRTP or SRTCP for [`SessionConfig::media_timeout`] once
+//!   connected, DTLS failed or closed by the peer, or [`Session::close`].
+//!   After that it sends nothing and ignores input. The media timeout is
+//!   what bounds sending after the publisher has gone: a check whose ID
+//!   the agent has forgotten renews consent when replayed, but nobody can
+//!   replay SRTP into the replay window.
 //!
 //! Counters ([`SessionStats`]) hold no addresses, and no `Debug` output
 //! shows one.
@@ -97,6 +101,11 @@ pub struct SessionConfig {
     /// Datagrams queued for [`Session::poll_transmit`]; beyond it output is
     /// dropped and counted. 16 to 1024; default 64.
     pub max_queued: usize,
+    /// Once connected, the session ends this long after the last fresh
+    /// SRTP or SRTCP packet (or after connecting, if none came). 1 to 300
+    /// s; default 30 s, as consent. A publisher always sends media or
+    /// sender reports, so a silent one has gone.
+    pub media_timeout: Duration,
     /// To a tuple not yet proven by fresh SRTP or SRTCP, the session sends
     /// at most this many times the bytes it received from it, STUN
     /// responses included; the rest is dropped and counted. 1 to 8;
@@ -126,6 +135,7 @@ impl Default for SessionConfig {
             max_datagram: 1500,
             max_early_dtls: 4,
             max_queued: 64,
+            media_timeout: Duration::from_secs(30),
             amplification_limit: 4,
             ice: IceConfig::default(),
             dtls: sapflow_dtls::Config::default(),
@@ -160,6 +170,10 @@ impl SessionConfig {
         check(
             (1..=8).contains(&self.amplification_limit),
             "amplification_limit",
+        )?;
+        check(
+            (Duration::from_secs(1)..=Duration::from_secs(300)).contains(&self.media_timeout),
+            "media_timeout",
         )?;
         self.ice.validate().map_err(SessionError::Config)?;
         self.dtls
@@ -211,6 +225,9 @@ pub enum EndReason {
     Dtls(sapflow_dtls::Error),
     /// The publisher sent `close_notify`.
     PeerClosed,
+    /// No fresh SRTP or SRTCP for [`SessionConfig::media_timeout`] once
+    /// connected.
+    MediaTimeout,
     /// [`Session::close`].
     Closed,
     /// The SRTCP index for our key is spent (2^31 packets).
@@ -374,6 +391,8 @@ pub struct Session {
     media: Option<Box<Media>>,
     /// Where DTLS and RTCP go.
     send_to: Option<Tuple>,
+    /// When SRTP came up, then when fresh SRTP or SRTCP last arrived.
+    last_srtp: Option<Instant>,
     paths: Vec<Path>,
     early: Vec<(Tuple, Vec<u8>)>,
     out: VecDeque<Transmit>,
@@ -476,6 +495,7 @@ impl Session {
             negotiated,
             media: None,
             send_to: None,
+            last_srtp: None,
             paths: Vec::new(),
             early: Vec::new(),
             out: VecDeque::new(),
@@ -589,6 +609,7 @@ impl Session {
         [
             deadline,
             self.consent_expires(),
+            self.media_expires(),
             self.dtls.poll_timeout(),
             self.media.as_ref().and_then(|m| m.rx.poll_timeout()),
         ]
@@ -682,7 +703,8 @@ impl Session {
     }
 
     /// Fresh authenticated SRTP or SRTCP arrived from `tuple`.
-    fn prove(&mut self, tuple: Tuple) {
+    fn prove(&mut self, now: Instant, tuple: Tuple) {
+        self.last_srtp = Some(now);
         if let Some(p) = self.paths.iter_mut().find(|p| p.tuple == tuple) {
             p.proven = true;
         }
@@ -711,6 +733,12 @@ impl Session {
         self.send_to.and_then(|t| self.ice.consent_expires(&t))
     }
 
+    /// When the media timeout runs out, once connected.
+    fn media_expires(&self) -> Option<Instant> {
+        self.last_srtp
+            .and_then(|t| t.checked_add(self.config.media_timeout))
+    }
+
     /// Ends the session if a deadline has passed. Returns whether it has
     /// ended.
     fn expire(&mut self, now: Instant) -> bool {
@@ -724,6 +752,10 @@ impl Session {
         }
         if self.consent_expires().is_some_and(|d| now >= d) {
             self.end(EndReason::ConsentExpired);
+            return true;
+        }
+        if self.media_expires().is_some_and(|d| now >= d) {
+            self.end(EndReason::MediaTimeout);
             return true;
         }
         false
@@ -888,6 +920,7 @@ impl Session {
         }
         media.rx.handle_timeout(now);
         self.media = Some(media);
+        self.last_srtp = Some(now);
         self.state = State::Connected;
         self.push_event(Event::Connected(c.profile));
     }
@@ -906,7 +939,7 @@ impl Session {
         self.stats.srtp_packets += 1;
         // Authenticated and inside the replay window: this tuple is the
         // publisher's.
-        self.prove(tuple);
+        self.prove(now, tuple);
         let Some(m) = self.media.as_mut() else {
             return;
         };
@@ -939,7 +972,7 @@ impl Session {
             return;
         };
         self.stats.srtcp_packets += 1;
-        self.prove(tuple);
+        self.prove(now, tuple);
         let Some(m) = self.media.as_mut() else {
             return;
         };
