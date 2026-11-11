@@ -24,6 +24,6 @@ subtle = "=2.6.1"
 zeroize = "=1.9.1"
 
 [features]
-# Test helpers (an RTP builder, SRTP protect for RTP). Not for production
-# use.
+# Test helpers (an RTP builder, SRTP protect for RTP) and the fuzz entry
+# points. Not for production use.
 testing = []

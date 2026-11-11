@@ -460,7 +460,7 @@ impl Outbound {
         self.protect_rtcp_with(buf, len, true)
     }
 
-    fn protect_rtcp_with(
+    pub(crate) fn protect_rtcp_with(
         &mut self,
         buf: &mut [u8],
         len: usize,

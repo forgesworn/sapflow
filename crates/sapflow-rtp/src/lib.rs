@@ -17,7 +17,8 @@
 //!
 //! Every byte that arrives is hostile until it authenticates, and the
 //! parsers stay careful after that: nothing indexes without a bound or
-//! trusts a length.
+//! trusts a length, and each parser has a fuzz target (`rtp_packet`,
+//! `rtcp_compound`, `srtp_unprotect`, `srtcp_unprotect`).
 
 #![warn(missing_docs)]
 #![cfg_attr(
@@ -35,6 +36,10 @@
 pub mod rtcp;
 pub mod rtp;
 pub mod srtp;
+
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod fuzzing;
 
 pub use rtcp::{Compound, Packet, RtcpError};
 pub use rtp::{RtpError, RtpPacket};
