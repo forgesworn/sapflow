@@ -20,8 +20,8 @@ FFmpeg's exact bytes.
 
 To recapture, run `python3 crates/sapflow-rtp/tests/capture_ffmpeg.py
 <scratch dir>` and copy `h264-srtp.rec` here. The SSRC, sequence numbers and
-timestamps are random on each run. Delete the rest of the scratch directory
-afterwards.
+timestamps are random on each run. Move the rest of the scratch directory to
+the Trash afterwards.
 
 The fixture covers the CM profile only: FFmpeg has no AES-GCM SRTP, so the
 GCM profile (including its 96-bit salt handling) is first checked against a

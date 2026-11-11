@@ -88,12 +88,15 @@ Each stream keeps:
   to `jitter` (200 ms, `SAPFLOW_WHIP_JITTER`) from when it was seen, then
   is declared lost (`Event::Lost`, with its sequence numbers). The first
   packets are held for `reorder_delay` (10 ms) in case earlier ones arrive
-  late. Duplicates and packets older than what was released are dropped.
-  A jump of more than `max_dropout` (3000) either way is a restart only
-  once the next packet follows it; otherwise it is set aside. When the
-  buffer is full (`max_packets` 1024, `max_bytes` 1 536 000) it releases
-  from the front, declaring what is missing there lost, and a payload
-  larger than `max_bytes` is refused.
+  late. Duplicates and packets up to 100 older than what was released
+  (RFC 3550 A.1's `MAX_MISORDER`) are dropped as late. A jump of more
+  than that back, or of more than `max_dropout` (3000, A.1's
+  `MAX_DROPOUT`) forward, is a restart only once the next packet follows
+  it; until then it is set aside, counted against the byte bound. When
+  the buffer is full (`max_packets` 1024, `max_bytes` 1 536 000) it
+  releases from the front, declaring what is missing there lost, though
+  never for a late packet, and a payload larger than `max_bytes` is
+  refused.
 - **NACK.** A gap is NACKed after `reorder_delay`, then every RTT and a
   quarter (at least 5 ms) until the deadline, at most `max_nacks` (4)
   times. All due numbers for a stream go
@@ -102,24 +105,38 @@ Each stream keeps:
   allowance. RTT starts at 100 ms and is measured from a NACK to the
   retransmission of a packet NACKed once, from RTX only where RTX was
   negotiated (a late original would read as a short RTT).
-- **Keyframes.** A PLI (or FIR, when only `ccm fir` was negotiated) on the
-  first packet, every `keyframe_interval` (2 s), at once after
+- **Keyframes.** A PLI (or FIR, when only `ccm fir` was negotiated) when
+  the server calls `request_keyframe` as SRTP comes up, on the first
+  packet as a fallback, every `keyframe_interval` (2 s), at once after
   unrecoverable loss, and every `keyframe_retry` (1 s) while waiting for an
   IDR, never closer than `keyframe_min_interval` (500 ms). Complete frames
   before the next IDR are dropped and reported (`Event::FrameSkipped`).
 - **H.264 limits.** 8 MiB per access unit, 4 MiB per NAL unit (the FU-A
-  reassembly buffer), 256 NAL units per access unit.
+  reassembly buffer), 256 NAL units per access unit. Buffers grow by
+  doubling but stop at the bound, so these are bounds on capacity, not
+  only length.
 - **Opus.** A timestamp gap with no sequence gap is DTX, one after a loss
   is loss; both are filled with silence shaped like the sender's last
-  packet, up to `max_fill` (2 s). A longer gap, or a step back, is a
+  packet, up to `max_fill` (2 s). Since the sender chooses its
+  timestamps, fill is also bounded by arrival time: a gap may exceed the
+  time between its two packets' arrivals by at most `allowance` (200 ms),
+  and total fill may run ahead of arrival time by at most `max_fill` and
+  `allowance` together. A gap beyond any of these, or a step back, is a
   discontinuity and is not filled. A gap under 2.5 ms (the smallest CELT
   frame) is left as a short timestamp step.
+- **Events.** At most `max_events` (8192) are queued at once, all
+  streams together; beyond, they are dropped and counted
+  (`StreamStats::events_dropped`), and a video stream that lost one waits
+  for an IDR. Draining after every call never reaches it.
 
 Each access unit, after a gap between one frame's marker and the next
 packet, is kept only if its first NAL unit begins an access unit: an access
 unit delimiter, an SPS, a slice with `first_mb_in_slice` 0, or an IDR slice
 when the stream's IDRs do not carry an SPS. Otherwise it is reported
 incomplete (`StartLost`), since the lost packets may have been its start.
+The first access unit, and the first after a restart, is checked the same
+way, with an IDR slice first never taken as a start: packets before the
+first one received cannot be known or NACKed.
 
 ## Tests
 

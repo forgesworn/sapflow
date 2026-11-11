@@ -117,8 +117,8 @@ source-EOF qualification. No Rust build is involved.
 | `srtp_unprotect` | SRTP unprotect for both profiles with fixed test keys: a mode byte, then `[u16 length, packet]` records into one context, so mutation reaches index estimation, the sequence wrap and the replay window; a mode bit makes records plaintext that must survive protect then unprotect |
 | `srtcp_unprotect` | SRTCP unprotect in the same record format, with the E flag and 31-bit index |
 | `h264_depacketise` | Our H.264 RTP depacketiser (`sapflow_rtp::h264`): records of a flag byte (marker, new timestamp, loss before) and a payload, under default or small limits; every access unit must re-parse within its limits, in timestamp order |
-| `opus_depacketise` | The Opus TOC and framing parser on the whole input, then the Opus depacketiser on records with timestamp steps and losses; frames must parse, fills must come before the packet and within the limit, and the timeline may only have holes under 2.5 ms or at a reported discontinuity |
-| `reorder_nack` | Our receiver (`sapflow_rtp::receive`) with a video stream (RTX negotiated) and an audio stream: video, audio and RTX packets with explicit sequence numbers, clock steps forward and back, strangers. Buffers stay within their packet and byte bounds, every NACK reads back through the RTCP parser and names only missing packets, losses only move forward, and the next timer is always later than the one just run |
+| `opus_depacketise` | The Opus TOC and framing parser on the whole input, then the Opus depacketiser on records with timestamp steps and losses; frames must parse, fills must come before the packet and within the limit, and the timeline may only have holes under 2.5 ms or at a reported discontinuity. A flag holds arrival time still, as a sender lying about its timestamps would; fill must stay within arrival time plus the allowance, per gap and in total, and frames within a constant per packet plus that fill |
+| `reorder_nack` | Our receiver (`sapflow_rtp::receive`) with a video stream (RTX negotiated) and an audio stream: video, audio and RTX packets with explicit sequence numbers, clock steps forward and back, strangers. Buffers stay within their packet and byte bounds, every NACK reads back through the RTCP parser and names only missing packets, losses only move forward, and the next timer is always later than the one just run. Audio timestamps can be stepped at will; events generated (queued or dropped) must stay within 16 per input byte plus the 2.5 ms fill frames that elapsed time, the fill limit and the allowance account for |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
@@ -330,12 +330,17 @@ a valid packet). To regenerate:
 `cargo test -p sapflow-rtp --lib -- --ignored write_media_seeds`.
 
 No local cargo-fuzz run of these targets has been made; CI's 60 s per
-target and the nightly run are their first fuzzing.
+target and the nightly run are their first fuzzing. After merge, a longer
+campaign for them can be dispatched on GitHub's runners with
+`fuzz-nightly.yml` (see the top of this file). The `built-lying-timestamps`
+seeds are the review's Opus fill amplification case (tiny packets each 2 s
+of timestamp apart, arriving together), on which both volume checks fail
+without the arrival-time bound.
 
 Still pending for the W1 gate A1.3 in `docs/whip-ingest.md`:
 
-- **The coverage report** showing each target reaches its parser past the
-  length checks. It needs cargo-fuzz and a nightly toolchain, which are not
+- **The coverage report** showing each target, the media ones included,
+  reaches its parser past the length checks. It needs cargo-fuzz and a nightly toolchain, which are not
   installed on the build hosts used for W1a; CI's fuzz job does not produce
   one. Until it exists, the only evidence of depth is the seed test above
   (every SRTP and SRTCP seed authenticates at least once).
