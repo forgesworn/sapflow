@@ -60,6 +60,10 @@ mod tests;
 #[doc(hidden)]
 pub mod testing;
 
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod fuzzing;
+
 pub use error::{ConfigError, Error, Limit, alert};
 pub use identity::{Fingerprint, Identity};
 pub use message::SrtpProfile;

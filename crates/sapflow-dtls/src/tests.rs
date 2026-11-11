@@ -21,7 +21,7 @@ struct Pair {
 }
 
 fn pair_with(options: Options, config: Config, expected: Option<Fingerprint>) -> Pair {
-    let id = Arc::new(testing::identity(1));
+    let id = testing::identity(1);
     let client = Client::new(options, testing::identity(2), 3);
     let expected = expected.unwrap_or_else(|| client.fingerprint());
     let mut client = client;
@@ -255,7 +255,7 @@ fn hello_refusal_sends_the_alert() {
 #[test]
 fn captured_hellos_get_a_first_flight_then_time_out() {
     for &(dir, stem, profile) in testing::CAPTURES {
-        let id = Arc::new(testing::identity(1));
+        let id = testing::identity(1);
         let config = Config::default();
         let mut s = Server::new_seeded(
             config.clone(),
@@ -859,7 +859,7 @@ fn config_ranges() {
         },
     ] {
         assert!(bad.validate().is_err(), "{bad:?}");
-        let id = Arc::new(testing::identity(1));
+        let id = testing::identity(1);
         assert!(Server::new(bad, id, Fingerprint::from_bytes([0; 32])).is_err());
     }
 }

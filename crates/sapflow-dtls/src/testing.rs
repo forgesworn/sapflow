@@ -23,6 +23,8 @@ use crate::reassembly::{Limits, Message, Push, Reassembler};
 use crate::record::{self, Protection};
 use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -180,9 +182,19 @@ pub fn set_record_version(datagram: &mut [u8], version: u16) {
     }
 }
 
-/// A seeded identity for tests.
-pub fn identity(seed: u8) -> Identity {
-    Identity::generate_seeded([seed; 32], TEST_TIME).expect("identity")
+/// A seeded identity for tests, made once per seed and shared.
+pub fn identity(seed: u8) -> Arc<Identity> {
+    static CACHE: OnceLock<Mutex<HashMap<u8, Arc<Identity>>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(seed)
+        .or_insert_with(|| {
+            Arc::new(Identity::generate_seeded([seed; 32], TEST_TIME).expect("identity"))
+        })
+        .clone()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +207,7 @@ enum Wait {
 /// The client.
 pub struct Client {
     pub options: Options,
-    identity: Identity,
+    identity: Arc<Identity>,
     expected_server: Option<Fingerprint>,
     entropy: Entropy,
     random: [u8; 32],
@@ -219,7 +231,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(options: Options, identity: Identity, seed: u8) -> Self {
+    pub fn new(options: Options, identity: Arc<Identity>, seed: u8) -> Self {
         let mut entropy = Entropy::Seeded {
             seed: Zeroizing::new([seed ^ 0x5a; 32]),
             counter: 0,
@@ -273,9 +285,7 @@ impl Client {
         self.profile
     }
 
-    /// The datagrams of the last flight we sent, re-recorded with new
-    /// sequence numbers would be the honest retransmission; these are the
-    /// same bytes, for replay tests.
+    /// The datagrams of the last flight we sent, byte for byte.
     pub fn last_flight(&self) -> &[Vec<u8>] {
         &self.last_flight
     }
@@ -314,13 +324,6 @@ impl Client {
     /// The first flight.
     pub fn start(&mut self) -> Vec<Vec<u8>> {
         self.hello_flight(&[])
-    }
-
-    /// Resends the last flight with fresh record sequence numbers.
-    pub fn retransmit(&mut self) -> Vec<Vec<u8>> {
-        // Rebuilding is enough for the hello; for flight 5 the stored
-        // datagrams are replayed, which the server must treat as replays.
-        self.last_flight.clone()
     }
 
     /// One datagram from the server; returns what to send back.
@@ -383,8 +386,9 @@ impl Client {
                 r.u16().ok_or("hvr")?;
                 let cookie = r.vec8().ok_or("hvr")?.to_vec();
                 self.hello_verify_requests += 1;
-                self.hello_seq = m.seq + 1;
-                self.reassembler.restart_at(m.seq + 1);
+                let next = m.seq.checked_add(1).ok_or("seq")?;
+                self.hello_seq = next;
+                self.reassembler.restart_at(next);
                 Ok(self.hello_flight(&cookie))
             }
             (Wait::ServerFlight, message::SERVER_HELLO) => {
@@ -454,7 +458,7 @@ impl Client {
             }
             (Wait::ServerFlight, message::SERVER_HELLO_DONE) => {
                 self.transcript.update(&whole);
-                Ok(self.flight5(m.seq))
+                self.flight5()
             }
             (Wait::Finished, message::FINISHED) => {
                 if m.epoch != 1 || m.body != self.expected_finished {
@@ -467,9 +471,12 @@ impl Client {
         }
     }
 
-    fn flight5(&mut self, server_done_seq: u16) -> Vec<Vec<u8>> {
-        let _ = server_done_seq;
+    fn flight5(&mut self) -> Result<Vec<Vec<u8>>, String> {
         let fault = self.options.fault;
+        let server_point = self.server_point.ok_or("no key exchange")?;
+        if self.hello_seq > u16::MAX - 5 {
+            return Err("seq".into());
+        }
         let mut seq = self.hello_seq + 1;
         let mut next = || {
             let s = seq;
@@ -504,10 +511,7 @@ impl Client {
         self.transcript.update(cert.whole().unwrap());
         self.transcript.update(cke.whole().unwrap());
         let session_hash: [u8; 32] = self.transcript.clone().finalize().into();
-        let shared = p256::ecdh::diffie_hellman(
-            ecdh.to_nonzero_scalar(),
-            self.server_point.as_ref().unwrap().as_affine(),
-        );
+        let shared = p256::ecdh::diffie_hellman(ecdh.to_nonzero_scalar(), server_point.as_affine());
         let master =
             crypto::extended_master_secret(shared.raw_secret_bytes(), &session_hash).unwrap();
         let signer = if fault == Fault::WrongSigningKey {
@@ -584,18 +588,18 @@ impl Client {
                 .collect();
             self.last_flight = grams.clone();
         }
-        grams
+        Ok(grams)
     }
 
     /// An epoch 1 record from the client, after flight 5.
     pub fn seal(&mut self, content_type: u8, body: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        let seq = self.seqs.take(1).unwrap();
+        let seq = self.seqs.take(1).expect("sequence");
         self.write
             .as_ref()
             .expect("keys")
             .seal(&mut out, content_type, 1, seq, body)
-            .unwrap();
+            .expect("seal");
         out
     }
 
@@ -612,7 +616,12 @@ impl Client {
 
     /// The message_seq the client's Finished used.
     pub fn finished_seq(&self) -> u16 {
-        self.hello_seq + 4
+        self.hello_seq.saturating_add(4)
+    }
+
+    /// Whether flight 5 has been built, so [`Client::seal`] has keys.
+    pub fn has_keys(&self) -> bool {
+        self.write.is_some()
     }
 }
 
