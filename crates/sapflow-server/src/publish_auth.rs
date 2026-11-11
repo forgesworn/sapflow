@@ -46,9 +46,12 @@ impl Protocol {
 pub(crate) enum Verdict {
     /// 2xx.
     Admitted,
-    /// 401 (wrong key) or 403 (a gig that cannot take a publisher): counts
-    /// as a failed attempt against the address's throttle.
+    /// 401 (wrong key): counts as a failed attempt against the address's
+    /// throttle.
     Denied,
+    /// 403 (a gig that cannot take a publisher): counts as a failed attempt
+    /// too, and WHIP answers it 403 rather than 401.
+    Forbidden,
     /// 429: the app is already throttling this address.
     Throttled,
     /// Any other status, a timeout or a transport failure. Refused, but not
@@ -61,7 +64,8 @@ pub(crate) enum Verdict {
 pub(crate) fn classify(outcome: Result<u16, Failure>) -> Verdict {
     match outcome {
         Ok(200..=299) => Verdict::Admitted,
-        Ok(401 | 403) => Verdict::Denied,
+        Ok(401) => Verdict::Denied,
+        Ok(403) => Verdict::Forbidden,
         Ok(429) => Verdict::Throttled,
         Ok(_) | Err(_) => Verdict::Unavailable,
     }
@@ -143,6 +147,8 @@ pub(crate) mod stub {
 
     pub(crate) struct Stub {
         pub endpoint: Endpoint,
+        /// The endpoint's URL, for a test's `SAPFLOW_PUBLISH_AUTH_URL`.
+        pub url: String,
         /// Each request's head and body, as received.
         pub requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
         task: tokio::task::JoinHandle<()>,
@@ -234,6 +240,7 @@ pub(crate) mod stub {
         });
         Stub {
             endpoint: Endpoint::parse(&url(port)).expect("stub URL"),
+            url: url(port),
             requests,
             task,
         }
@@ -277,9 +284,8 @@ mod tests {
         for status in [200, 204, 299] {
             assert_eq!(classify(Ok(status)), Verdict::Admitted, "{status}");
         }
-        for status in [401, 403] {
-            assert_eq!(classify(Ok(status)), Verdict::Denied, "{status}");
-        }
+        assert_eq!(classify(Ok(401)), Verdict::Denied);
+        assert_eq!(classify(Ok(403)), Verdict::Forbidden);
         assert_eq!(classify(Ok(429)), Verdict::Throttled);
         for status in [101, 199, 301, 302, 400, 404, 409, 500, 502, 503] {
             assert_eq!(classify(Ok(status)), Verdict::Unavailable, "{status}");
@@ -387,10 +393,19 @@ mod tests {
             let req = srt("publish:live/event-a:encoder:wrong-key");
             // The fixture's throttle allows ten failures a minute.
             for _ in 0..10 {
-                assert!(matches!(
-                    Publication::begin_authorised(&fixture.app, &req, SourceKind::Ts, from()).await,
-                    Err(Refusal::Request(PublishError::Unauthorized))
-                ));
+                let refusal =
+                    Publication::begin_authorised(&fixture.app, &req, SourceKind::Ts, from())
+                        .await
+                        .err()
+                        .expect("refused");
+                if status == 401 {
+                    assert!(matches!(
+                        refusal,
+                        Refusal::Request(PublishError::Unauthorized)
+                    ));
+                } else {
+                    assert!(matches!(refusal, Refusal::Forbidden));
+                }
             }
             assert!(matches!(
                 Publication::begin_authorised(&fixture.app, &req, SourceKind::Flv, from()).await,
