@@ -785,7 +785,9 @@ impl Receiver {
             stats: StreamStats::default(),
             reception: Reception::new(cfg.codec.clock_rate()),
         });
-        self.events.timeline.add_track(cfg.codec.clock_rate());
+        self.events
+            .timeline
+            .add_track(cfg.codec.clock_rate(), cfg.codec == Codec::H264);
         Ok(StreamId(self.streams.len() - 1))
     }
 

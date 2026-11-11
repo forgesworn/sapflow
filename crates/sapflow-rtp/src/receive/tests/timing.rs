@@ -491,7 +491,7 @@ fn audio_only_session_aligns_on_its_report() {
 }
 
 /// Two agreeing sender reports 400 ms ahead of where the stream's
-/// timestamps put it: pts move towards them at 500 ppm, with no
+/// timestamps put it: pts move towards them at 5% (video), with no
 /// discontinuity, and never back. A lone report is ignored.
 #[test]
 fn a_report_error_within_the_lead_is_slewed() {
@@ -530,8 +530,9 @@ fn a_report_error_within_the_lead_is_slewed() {
     }
     let stats = r.stats(StreamId(0)).expect("stats");
     assert_eq!(stats.timeline_discontinuities, 0);
-    // Nine frames after the second report, 1.5 ticks each.
-    assert_eq!(last, Some(59 * 3000 + 13));
+    // Nine frames after the second report, at the 5% video rate: 150
+    // ticks each.
+    assert_eq!(last, Some(59 * 3000 + 9 * 150));
 }
 
 /// Video that only ever arrives over RTX (every original lost) still

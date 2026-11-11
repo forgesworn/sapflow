@@ -36,16 +36,21 @@
 //!   reports that alternate, are ignored. The error between where the
 //!   stream's timestamps put the report's RTP time and where the report
 //!   does is then corrected:
-//!   - within `max_lead`, by slewing: the stream's timestamps advance up to
-//!     [`TimelineConfig::max_slew_ppm`] (500 ppm) faster or slower until
-//!     the error is gone, never backwards, with no discontinuity. A
-//!     sender's audio clock running fast or slow against its NTP clock is
-//!     followed this way;
+//!   - within `max_lead`, or ahead by any amount, by slewing: the stream's
+//!     timestamps advance up to [`TimelineConfig::max_slew_ppm`] (500 ppm)
+//!     faster or slower until the error is gone, never backwards, with no
+//!     discontinuity. A video stream slews the part of its error that the
+//!     audio stream does not share at up to
+//!     [`TimelineConfig::max_video_slew_ppm`] (5%), since video frame
+//!     durations can stretch; what both need moves together. A sender's audio clock running fast or slow against
+//!     its NTP clock is followed this way, and so is a video RTP jump
+//!     forward that stamping held to the upper bound. A slew back stops at
+//!     the lower bound, and counts an error of more than twice the lead
+//!     as twice the lead, so a forged pair of reports can slow a stream
+//!     only that far;
 //!   - behind by more, by moving forward to the report, no further than
 //!     the upper bound: a discontinuity if that moves it more than
-//!     `max_lead`, otherwise slewed;
-//!   - ahead by more, by taking the report as the stream's new reference,
-//!     since it cannot go back: no movement, no discontinuity.
+//!     `max_lead`, otherwise slewed.
 //!
 //!   A stream aligned or re-anchored by arrival time takes its next agreeing
 //!   report as its reference.
@@ -72,9 +77,13 @@ pub struct TimelineConfig {
     /// time, for network jitter, and the largest sender report error that
     /// is slewed rather than stepped. Default 500 ms.
     pub max_lead: Duration,
-    /// Fastest correction towards the sender reports, in parts per million
-    /// of media time. Default 500.
+    /// Fastest correction of an audio stream towards the sender reports,
+    /// in parts per million of media time. Default 500: audio frames have
+    /// fixed durations, so their timestamps may only stretch a little.
     pub max_slew_ppm: u32,
+    /// The same for video, whose frame durations can stretch. Default
+    /// 50 000 (5%).
+    pub max_video_slew_ppm: u32,
     /// Shortest time between two sender reports of a stream that are
     /// compared. Default 500 ms.
     pub report_spacing: Duration,
@@ -86,6 +95,7 @@ impl Default for TimelineConfig {
             max_hold_bytes: 4 << 20,
             max_lead: Duration::from_millis(500),
             max_slew_ppm: 500,
+            max_video_slew_ppm: 50_000,
             report_spacing: Duration::from_millis(500),
         }
     }
@@ -157,6 +167,8 @@ struct Last {
 #[derive(Debug)]
 struct Track {
     rate: u32,
+    /// Video: the part of its slew that audio does not share is faster.
+    video: bool,
     /// The first media packet's RTP timestamp and arrival.
     first: Option<(u32, u64)>,
     sr: Option<Sr>,
@@ -167,9 +179,11 @@ struct Track {
     offset: Option<i64>,
     /// The last sender report compared, for the next to agree with.
     compared: Option<Sr>,
-    /// Ticks still to slew, and the fraction of a tick carried.
+    /// Ticks still to slew, and the fractions of a tick carried at the
+    /// audio and the video rate.
     slew: i64,
     slew_carry: u64,
+    fast_carry: u64,
     /// Timeline ticks minus arrival ticks at the first frame: the lower
     /// bound's reference.
     floor_offset: i64,
@@ -197,6 +211,7 @@ pub(crate) struct Timeline {
     max_hold_bytes: usize,
     lead: i64,
     slew_ppm: u64,
+    video_slew_ppm: u64,
     spacing: u64,
     tracks: Vec<Track>,
     /// The first media packet's arrival.
@@ -216,6 +231,7 @@ impl Timeline {
             max_hold_bytes: cfg.max_hold_bytes,
             lead: ticks(micros(cfg.max_lead)),
             slew_ppm: u64::from(cfg.max_slew_ppm),
+            video_slew_ppm: u64::from(cfg.max_video_slew_ppm),
             spacing: micros(cfg.report_spacing),
             tracks: Vec::new(),
             since: None,
@@ -226,9 +242,11 @@ impl Timeline {
         }
     }
 
-    pub fn add_track(&mut self, rate: u32) {
+    /// Adds a stream at RTP clock `rate`; `video` slews faster.
+    pub fn add_track(&mut self, rate: u32, video: bool) {
         self.tracks.push(Track {
             rate,
+            video,
             first: None,
             sr: None,
             anchor: None,
@@ -237,6 +255,7 @@ impl Timeline {
             compared: None,
             slew: 0,
             slew_carry: 0,
+            fast_carry: 0,
             floor_offset: 0,
             reanchor: false,
             discontinuities: 0,
@@ -367,7 +386,16 @@ impl Timeline {
         let below = self.lead.saturating_add(self.slack(arrival));
         let arrival_pts = ticks(arrival).saturating_add(self.arrival_offset);
         let synced = self.aligned == Some(Alignment::SenderReports);
-        let (origin, lead, slew_ppm) = (self.origin, self.lead, self.slew_ppm);
+        let (origin, lead) = (self.origin, self.lead);
+        let (slow_ppm, fast_ppm) = (self.slew_ppm, self.video_slew_ppm);
+        // What an audio stream still has to slew: the part of a video
+        // stream's slew it shares goes at the audio rate, so a correction
+        // both need (as when network delay falls) keeps them together.
+        let shared = self
+            .tracks
+            .iter()
+            .find(|o| !o.video && o.offset.is_some())
+            .map(|o| o.slew);
         let Some(t) = self.tracks.get_mut(track) else {
             return Stamp {
                 pts: 0,
@@ -383,15 +411,42 @@ impl Timeline {
         let mut reanchored = false;
         let pts = match (t.anchor, t.last) {
             (Some((ae, mut ap)), Some(l)) => {
-                // Slew: move the anchor by up to slew_ppm of the media time
-                // since the last frame.
+                let floor = ticks(arrival)
+                    .saturating_add(t.floor_offset)
+                    .saturating_sub(below);
+                // Slew: move the anchor by a share of the media time since
+                // the last frame, never back below the lower bound (the
+                // upper is kept by the clamp below). Audio, and the part
+                // of a video stream's slew that audio shares, go at
+                // max_slew_ppm; the rest of a video stream's at
+                // max_video_slew_ppm.
                 let advance = scale(ext.saturating_sub(l.ext), t.rate);
                 if t.slew != 0 && advance > 0 {
-                    let budget = u128::from(advance.unsigned_abs()) * u128::from(slew_ppm)
-                        + u128::from(t.slew_carry);
-                    t.slew_carry = (budget % 1_000_000) as u64;
-                    let budget = i64::try_from(budget / 1_000_000).unwrap_or(i64::MAX);
-                    let step = t.slew.clamp(budget.saturating_neg(), budget);
+                    let (common, own) = match shared {
+                        _ if !t.video => (t.slew, 0),
+                        Some(a) if a.signum() == t.slew.signum() => {
+                            let c = t.slew.signum() * a.abs().min(t.slew.abs());
+                            (c, t.slew - c)
+                        }
+                        _ => (0, t.slew),
+                    };
+                    let take = |want: i64, ppm: u64, carry: &mut u64| {
+                        if want == 0 {
+                            return 0;
+                        }
+                        let budget = u128::from(advance.unsigned_abs()) * u128::from(ppm)
+                            + u128::from(*carry);
+                        *carry = (budget % 1_000_000) as u64;
+                        let budget = i64::try_from(budget / 1_000_000).unwrap_or(i64::MAX);
+                        want.clamp(budget.saturating_neg(), budget)
+                    };
+                    let mut step = take(common, slow_ppm, &mut t.slew_carry)
+                        + take(own, fast_ppm, &mut t.fast_carry);
+                    let unslewed = ap.saturating_add(scale(ext.saturating_sub(ae), t.rate));
+                    if step < 0 && unslewed.saturating_add(step) < floor {
+                        step = floor.saturating_sub(unslewed).clamp(step, 0);
+                        t.slew = step;
+                    }
                     ap = ap.saturating_add(step);
                     t.slew -= step;
                     t.anchor = Some((ae, ap));
@@ -402,9 +457,6 @@ impl Timeline {
                 let by_arrival = l
                     .pts
                     .saturating_add(ticks(arrival).saturating_sub(ticks(l.arrival)).max(1));
-                let floor = ticks(arrival)
-                    .saturating_add(t.floor_offset)
-                    .saturating_sub(below);
                 let (pts, event) = if t.reanchor {
                     (by_arrival, false)
                 } else if mapped < l.pts.saturating_sub(lead) || mapped > far {
@@ -518,16 +570,16 @@ impl Timeline {
         };
         let truth = n.saturating_add(offset);
         let error = predicted.saturating_sub(truth);
-        if error.unsigned_abs() <= lead.unsigned_abs() {
-            t.slew = error.saturating_neg();
+        if error >= lead.saturating_neg() {
+            // Within the lead, or ahead by any amount: slewed, since it
+            // cannot go back. Stamping stops a slew back at the lower
+            // bound, and an error over twice the lead (more than any
+            // timestamp jump stamping lets through) counts as twice the
+            // lead, so a forged pair can only slow a stream that far.
+            t.slew = error.min(lead.saturating_mul(2)).saturating_neg();
             return None;
         }
         t.slew = 0;
-        if error > 0 {
-            // Ahead: it cannot go back, so the report is the reference.
-            t.offset = Some(predicted.saturating_sub(n));
-            return None;
-        }
         // Behind: forward to the report, no further than arrival allows,
         // and slewed if that is no further than the lead.
         let to = truth.min(cap).max(predicted);
@@ -558,8 +610,8 @@ mod tests {
 
     fn two(cfg: TimelineConfig) -> Timeline {
         let mut t = Timeline::new(cfg);
-        t.add_track(90_000);
-        t.add_track(48_000);
+        t.add_track(90_000, true);
+        t.add_track(48_000, false);
         t
     }
 
@@ -641,7 +693,8 @@ mod tests {
     #[test]
     fn reports_slew_small_errors_and_step_large_ones() {
         let mut t = Timeline::new(TimelineConfig::default());
-        t.add_track(90_000);
+        // Slewed at the audio rate, 500 ppm, to keep the numbers small.
+        t.add_track(90_000, false);
         t.note_packet(0, 0, 0);
         t.sender_report(0, ntp(0), 0, 0);
         assert_eq!(t.try_align(0, 0, false), Some(Alignment::SenderReports));
@@ -682,8 +735,8 @@ mod tests {
         assert_eq!(moved, Some(450_135 - 508_500));
         assert_eq!(t.discontinuities(0), 1);
         assert_eq!(frames(&mut t, 151..=151), Some(495_450 + 3000));
-        // Ahead by more than the lead: it cannot go back, so the report
-        // becomes the reference, with nothing moved.
+        // Ahead by more than the lead: it cannot go back, so it is slewed
+        // back, here at 500 ppm, with no discontinuity.
         assert_eq!(frames(&mut t, 152..=180), Some(495_450 + 30 * 3000));
         assert_eq!(
             t.sender_report(0, ntp(5_750 * MS), 540_000, 6_000 * MS),
@@ -693,14 +746,14 @@ mod tests {
             t.sender_report(0, ntp(6_750 * MS), 630_000, 7_000 * MS),
             None
         );
-        assert_eq!(frames(&mut t, 181..=210), Some(495_450 + 60 * 3000));
+        assert_eq!(frames(&mut t, 181..=210), Some(495_450 + 60 * 3000 - 45));
         assert_eq!(t.discontinuities(0), 1);
     }
 
     #[test]
     fn timestamps_never_go_back_or_run_ahead_of_arrival() {
         let mut t = Timeline::new(TimelineConfig::default());
-        t.add_track(90_000);
+        t.add_track(90_000, true);
         t.note_packet(0, 0, 0);
         t.try_align(2_000 * MS, 0, false);
         assert_eq!(t.stamp(0, 0, 0).pts, 0);
@@ -724,7 +777,7 @@ mod tests {
             start_hold: Duration::ZERO,
             ..TimelineConfig::default()
         });
-        t.add_track(48_000);
+        t.add_track(48_000, false);
         t.note_packet(0, u32::MAX - 959, 0);
         t.try_align(0, 0, false);
         assert_eq!(t.stamp(0, u32::MAX - 959, 0).pts, 0);
@@ -739,7 +792,7 @@ mod tests {
     #[test]
     fn a_hostile_report_cannot_place_media_ahead() {
         let mut t = Timeline::new(TimelineConfig::default());
-        t.add_track(90_000);
+        t.add_track(90_000, true);
         t.note_packet(0, 0, 0);
         t.sender_report(0, ntp(0), 0, 0);
         t.try_align(0, 0, false);
@@ -779,7 +832,7 @@ mod tests {
     #[test]
     fn audio_only_and_late_streams() {
         let mut t = Timeline::new(TimelineConfig::default());
-        t.add_track(48_000);
+        t.add_track(48_000, false);
         t.note_packet(0, 100, 10 * MS);
         t.sender_report(0, ntp(5_000 * MS), 100, 10 * MS);
         assert_eq!(
@@ -819,7 +872,7 @@ mod tests {
             start_hold: Duration::ZERO,
             ..TimelineConfig::default()
         });
-        t.add_track(90_000);
+        t.add_track(90_000, true);
         // Frames 33.3 ms apart on the sender; 900 ms of delay falling to
         // 50 ms over 3 s, then steady, with 8 ms of jitter either way.
         let sent = |n: u64| n * 100_000 / 3;
@@ -857,9 +910,18 @@ mod tests {
     /// clock and audio at 50 packets a second whose RTP clock runs `ppm`
     /// fast, aligned by sender reports sent every second (or, with
     /// `forged`, audio reports alternately 1 s early and late every 0.5 s),
-    /// delivered after `delay(sent)`. Returns the discontinuities and the
-    /// largest A/V skew in ticks after the first 2 s.
-    fn av_run(ppm: i64, secs: u64, delay: &dyn Fn(u64) -> u64, forged: bool) -> (u64, i64) {
+    /// delivered after `delay(sent)`. With `jump`, the sender's video RTP
+    /// timestamps jump that many ticks at that time (in us), its reports
+    /// honestly following. Returns the discontinuities and the largest A/V
+    /// skew in ticks from `from` (us).
+    fn av_run(
+        ppm: i64,
+        secs: u64,
+        delay: &dyn Fn(u64) -> u64,
+        forged: bool,
+        jump: Option<(u64, i64)>,
+        from: u64,
+    ) -> (u64, i64) {
         let mut t = two(TimelineConfig::default());
         enum Item {
             Video(u64),
@@ -868,6 +930,10 @@ mod tests {
         }
         let audio_rtp =
             |us: u64| (u128::from(us) * 48 * (1_000_000 + ppm) as u128 / 1_000_000_000) as u32;
+        let video_rtp = |us: u64, ticks: u64| {
+            let j = jump.filter(|j| us >= j.0).map_or(0, |j| j.1);
+            (ticks as i64 + j) as u32
+        };
         let mut items: Vec<(u64, Item)> = Vec::new();
         let end = secs * 1_000_000;
         let mut n = 0;
@@ -884,7 +950,7 @@ mod tests {
             let sent = s * 1_000_000 + 10_000;
             items.push((
                 sent + delay(sent),
-                Item::Sr(0, ntp(sent), (sent * 9 / 100) as u32),
+                Item::Sr(0, ntp(sent), video_rtp(sent, sent * 9 / 100)),
             ));
             if forged && s > 2 {
                 for (half, skew) in [(0, 1_000_000), (500_000, 0)] {
@@ -910,7 +976,8 @@ mod tests {
                         t.note_packet(0, 0, arrival);
                     }
                     if aligned {
-                        let pts = t.stamp(0, (n * 3000) as u32, arrival).pts as i64;
+                        let rtp = video_rtp(n * 100_000 / 3, n * 3000);
+                        let pts = t.stamp(0, rtp, arrival).pts as i64;
                         video_err = Some(pts - (n * 3000) as i64);
                     }
                 }
@@ -923,7 +990,7 @@ mod tests {
                         let pts = t.stamp(1, audio_rtp(sent), arrival).pts as i64;
                         let err = pts - (sent * 9 / 100) as i64;
                         if let Some(v) = video_err
-                            && sent > 2_000_000
+                            && sent > from
                         {
                             skew_max = skew_max.max((err - v).abs());
                         }
@@ -946,7 +1013,7 @@ mod tests {
     fn audio_clock_drift_is_slewed_not_stepped() {
         let runs: Vec<_> = [30, -30, 100, -100]
             .into_iter()
-            .map(|ppm| (ppm, av_run(ppm, 3600, &|_| 40_000, false)))
+            .map(|ppm| (ppm, av_run(ppm, 3600, &|_| 40_000, false, None, 2_000_000)))
             .collect();
         for &(ppm, (disc, skew)) in &runs {
             eprintln!("drift {ppm} ppm: {disc} discontinuities, max skew {skew} ticks");
@@ -962,7 +1029,7 @@ mod tests {
     /// RTP timestamps.
     #[test]
     fn forged_alternating_reports_cause_no_storm() {
-        let (disc, skew) = av_run(0, 120, &|_| 40_000, true);
+        let (disc, skew) = av_run(0, 120, &|_| 40_000, true, None, 2_000_000);
         eprintln!("forged: {disc} discontinuities, max skew {skew} ticks");
         assert_eq!(disc, 0);
         assert!(skew <= 90, "{skew} ticks");
@@ -978,13 +1045,17 @@ mod tests {
                 50_000
             }
         };
-        let (disc, skew) = av_run(0, 60, &falling, false);
-        eprintln!("falling delay with reports: {disc} discontinuities, max skew {skew} ticks");
+        let (disc, skew) = av_run(0, 60, &falling, false, None, 2_000_000);
+        let (_, settled) = av_run(0, 60, &falling, false, None, 20_000_000);
+        eprintln!(
+            "falling delay with reports: {disc} discontinuities, max skew {skew} ticks, {settled} from 20 s"
+        );
         assert_eq!(disc, 0);
-        // Both streams are held to the same arrival bound; skew is measured
-        // against the latest video frame, and while the delay falls it
-        // falls 9.4 ms (850 ticks) a video frame.
+        // Both streams are held to the same arrival bound and slewed
+        // together; skew is measured against the latest video frame, and
+        // while the delay falls it falls 9.4 ms (850 ticks) a video frame.
         assert!(skew <= 900, "{skew} ticks");
+        assert!(settled <= 90, "{settled} ticks");
     }
 
     /// The reviewer's constant-timestamp case: 36 000 video frames (20
@@ -996,7 +1067,7 @@ mod tests {
             start_hold: Duration::ZERO,
             ..TimelineConfig::default()
         });
-        t.add_track(90_000);
+        t.add_track(90_000, true);
         t.note_packet(0, 7, 0);
         t.try_align(0, 0, false);
         let mut last = None;
@@ -1015,5 +1086,69 @@ mod tests {
             t.discontinuities(0)
         );
         assert_eq!((flat, behind), (0, 0));
+    }
+
+    /// The reviewer's case: the sender's video RTP timestamps jump 900 ms
+    /// (or 450 ms) forward a minute in, its reports honestly following.
+    /// Video is slewed back at up to 5% of media time, so it is back within
+    /// 1 ms of audio 20 s (or 10 s) later, with no discontinuity.
+    #[test]
+    fn a_video_rtp_jump_is_slewed_back() {
+        let runs: Vec<_> = [(81_000, 20), (40_500, 10)]
+            .into_iter()
+            .map(|(ticks, settle)| {
+                let (disc, skew) = av_run(
+                    0,
+                    120,
+                    &|_| 40_000,
+                    false,
+                    Some((60_000_000, ticks)),
+                    (60 + settle) * 1_000_000,
+                );
+                let (_, during) = av_run(
+                    0,
+                    120,
+                    &|_| 40_000,
+                    false,
+                    Some((60_000_000, ticks)),
+                    61_000_000,
+                );
+                (ticks, settle, disc, skew, during)
+            })
+            .collect();
+        for &(ticks, settle, disc, skew, during) in &runs {
+            eprintln!(
+                "video jump {} ms: {disc} discontinuities, max skew {during} ticks from 1 s after, {skew} from {settle} s after",
+                ticks / 90
+            );
+        }
+        for (ticks, _, disc, skew, _) in runs {
+            assert_eq!(disc, 0, "{ticks}");
+            assert!(skew <= 90, "{ticks}: {skew} ticks");
+        }
+    }
+
+    /// The same jumps inside an hour of audio clock drift at 100 ppm either
+    /// way: converged 20 s after a jump half an hour in.
+    #[test]
+    fn a_video_rtp_jump_during_drift_is_slewed_back() {
+        for ppm in [100, -100] {
+            for ticks in [81_000, 40_500] {
+                let (disc, skew) = av_run(
+                    ppm,
+                    3600,
+                    &|_| 40_000,
+                    false,
+                    Some((1_800_000_000, ticks)),
+                    1_820_000_000,
+                );
+                eprintln!(
+                    "{ppm} ppm, video jump {} ms: {disc} discontinuities, max skew {skew} ticks after 20 s",
+                    ticks / 90
+                );
+                assert_eq!(disc, 0);
+                assert!(skew <= 90, "{ppm} ppm, {ticks}: {skew} ticks");
+            }
+        }
     }
 }
