@@ -2,7 +2,9 @@
 //! steps backwards, keyframes anywhere and audio in between. After every
 //! push the rendered playlist must keep the rules `playlist::RuleCheck`
 //! holds it to: fixed `TARGETDURATION` and `PART-TARGET`, no `EXTINF` over
-//! the target, the part rules, consistent discontinuities.
+//! the target, the part rules, consistent discontinuities. Every part must
+//! stay served for three target durations after its tag leaves the
+//! playlist (`playlist::RetentionCheck`), unless the muxer counts it.
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
@@ -244,6 +246,7 @@ fn audio_timing(data: &[u8]) {
     let mut muxer = Muxer::audio_only(MuxerConfig::default(), config(stereo))
         .expect("fixed supported AAC profile");
     let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
     let mut pts = 0i64;
     for rec in records.chunks_exact(3) {
         let flags = rec[2];
@@ -264,6 +267,9 @@ fn audio_timing(data: &[u8]) {
             if let Err(error) = rules.check_with_byte_cap(&rendered, muxer.window_byte_capped()) {
                 panic!("{error}\n{rendered}");
             }
+        }
+        if let Err(error) = retention.check(&muxer) {
+            panic!("{error}");
         }
         if result.is_err() {
             return;
@@ -295,6 +301,7 @@ fn fragment_budget(data: &[u8]) {
     let mut held: Vec<(Bytes, Vec<u8>)> = Vec::new();
     let mut dts = 0;
     let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
     for record in data[2..].chunks_exact(8).take(256) {
         match record[0] % 6 {
             0 => {
@@ -361,6 +368,9 @@ fn fragment_budget(data: &[u8]) {
                 .check(&text)
                 .unwrap_or_else(|error| panic!("{error}\n{text}"));
         }
+        retention
+            .check(&muxer)
+            .unwrap_or_else(|error| panic!("{error}"));
     }
     drop(muxer);
     for (bytes, expected) in &held {
@@ -397,6 +407,7 @@ fuzz_target!(|data: &[u8]| {
     let mut m = Muxer::new(MuxerConfig::default(), video, Some(aac));
     let (mut dts, mut audio) = (0i64, 0i64);
     let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
     // Each record: a step in ticks (2 bytes), then flags: bit 0 keyframe,
     // bit 1 the step is a stall (x 16), bit 2 the step goes backwards,
     // bits 3-5 AAC frames before the frame, bits 6-7 a composition offset.
@@ -410,6 +421,9 @@ fuzz_target!(|data: &[u8]| {
                 return;
             }
             audio += 1920;
+            if let Err(e) = retention.check(&m) {
+                panic!("{e}");
+            }
         }
         let pts = dts + i64::from(flags >> 6) * 3000;
         if m.push_video(
@@ -422,6 +436,9 @@ fuzz_target!(|data: &[u8]| {
         .is_err()
         {
             return;
+        }
+        if let Err(e) = retention.check(&m) {
+            panic!("{e}");
         }
         if !m.has_content() {
             continue;
