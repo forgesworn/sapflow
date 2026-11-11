@@ -1407,7 +1407,14 @@ Implementation notes (W3a, 11 November 2026):
   - Supersede from `Session::last_media`.
   - Counting end reasons.
   - Wiring media into `EsIngest`, and the rest of A3.
-- **Left to W3d.** PROXY protocol v2 and the TCP listener.
+- **Left to W3d.** PROXY protocol v2 and the TCP listener. The v2 header
+  parser and trusted-proxy check exist (`sapflow_core::proxy_protocol`); the
+  listener that uses them is still to come. For that listener:
+  - It needs a timeout for a partial header.
+  - Decide what LOCAL means on the ICE-TCP port.
+  - The trust check compares addresses, not ports, so any process on the
+    proxy host is trusted.
+  - Call `parse_trusted`, not `parse`, on every connection.
 
 ### W4: qualification
 
