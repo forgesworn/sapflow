@@ -125,7 +125,7 @@ fn assert_prefix_consistent(input: &[u8]) {
 }
 
 #[test]
-fn spec_tcp4_example_gives_both_endpoints() {
+fn hand_built_tcp4_header_gives_both_endpoints() {
     let (header, consumed) = complete(&TCP4);
     assert_eq!(consumed, 28);
     assert_eq!(
@@ -142,7 +142,7 @@ fn spec_tcp4_example_gives_both_endpoints() {
 }
 
 #[test]
-fn spec_tcp6_example_gives_both_endpoints() {
+fn hand_built_tcp6_header_gives_both_endpoints() {
     let (header, consumed) = complete(&TCP6);
     assert_eq!(consumed, 52);
     assert_eq!(
@@ -278,15 +278,16 @@ fn crc32c_covers_the_whole_header_including_other_tlvs() {
         let (header, _) = complete(&input);
         assert!(header.has_crc32c());
         assert_eq!(header.alpn(), Some(&b"h2"[..]));
-        // Flipping any bit of the header, the checksum included, never gives
-        // a header: a changed length waits for more bytes or is refused, a
-        // changed type is refused for its own reason, and the rest fail the
-        // checksum.
+        // Flipping the lowest or highest bit of any byte, the checksum
+        // included, never gives a header: a changed length waits for more
+        // bytes or is refused, a changed type is refused for its own reason,
+        // and the rest fail the checksum.
         for at in 0..input.len() {
             for bit in [0x01, 0x80] {
-                // PROXY becomes LOCAL, whose block is discarded unread, or
-                // the CRC32C TLV becomes an unknown type: neither can be
-                // caught by a checksum carried in the header itself.
+                // Two flips are skipped: PROXY becomes LOCAL, whose block is
+                // discarded unread, and 0x80 turns the CRC32C type into an
+                // unknown one. A checksum carried in the header cannot catch
+                // either; that is a limit of the protocol, not of the parser.
                 let crc_type = FIXED_LEN + TCP4_ADDRESSES.len() + before.len();
                 if (at, bit) == (12, 0x01) || (at == crc_type && bit == 0x80) {
                     continue;
@@ -307,6 +308,15 @@ fn crc32c_covers_the_whole_header_including_other_tlvs() {
         *byte ^= 1;
     }
     assert_eq!(parse(&wrong), Err(Error::Crc32cMismatch));
+    // Any change to the CRC32C TLV's own type byte, such as 0x03 to 0x07,
+    // leaves an unknown TLV that is accepted with no checksum checked.
+    let mut retyped = TCP4_CRC_BE;
+    if let Some(byte) = retyped.get_mut(28) {
+        *byte ^= 0x04;
+    }
+    let (header, _) = complete(&retyped);
+    assert!(!header.has_crc32c());
+    assert_eq!(header.tlv(0x07), Some(&[0xd4, 0x5a, 0x11, 0xb9][..]));
 }
 
 #[test]
@@ -475,8 +485,40 @@ fn the_header_cap_is_536_bytes_in_all() {
     assert_eq!(complete(&input).1, MAX_HEADER_LEN);
     let input = tcp4_with(&tlv(PP2_TYPE_NOOP, &vec![0; padding + 1]));
     assert_eq!(parse(&input), Err(Error::TooLong(521)));
-    // The largest address block, UNIX, still leaves room for TLVs.
-    const { assert!(MAX_HEADER_LEN - FIXED_LEN - 216 >= 300) };
+    // After the largest accepted address block, TCP6's 36 bytes, 484 bytes
+    // are left for TLVs.
+    let padding = MAX_HEADER_LEN - FIXED_LEN - 36 - 3;
+    assert_eq!(padding + 3, 484);
+    let mut body = TCP6.get(16..).expect("addresses").to_vec();
+    body.extend(tlv(PP2_TYPE_NOOP, &vec![0; padding]));
+    let input = header(0x21, 0x21, &body);
+    assert_eq!(complete(&input).1, MAX_HEADER_LEN);
+    body.push(0);
+    assert_eq!(parse(&header(0x21, 0x21, &body)), Err(Error::TooLong(521)));
+}
+
+#[test]
+fn local_returns_an_ipv6_peer_as_given_and_a_mapped_peer_as_ipv4() {
+    let (local, _) = complete(&LOCAL);
+    let v6_peer = v6("2001:db8::10", 40000);
+    assert_eq!(local.client_address(v6_peer), v6_peer);
+    let mapped_peer = v6("::ffff:192.0.2.10", 40000);
+    assert_eq!(
+        local.client_address(mapped_peer),
+        v4([192, 0, 2, 10], 40000)
+    );
+    // A scoped link-local peer keeps its scope id and flow info.
+    let scoped = SocketAddr::V6(SocketAddrV6::new(
+        "fe80::10".parse().expect("link-local"),
+        40000,
+        7,
+        3,
+    ));
+    let SocketAddr::V6(returned) = local.client_address(scoped) else {
+        panic!("IPv6 expected");
+    };
+    assert_eq!((returned.scope_id(), returned.flowinfo()), (3, 7));
+    assert_eq!(SocketAddr::V6(returned), scoped);
 }
 
 #[test]

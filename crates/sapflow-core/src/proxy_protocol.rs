@@ -24,18 +24,30 @@
 //! - **PROXY over TCP/IPv4 (`\x11`) and TCP/IPv6 (`\x21`)**: the source and
 //!   destination are returned; extra bytes after the addresses are walked as
 //!   TLVs.
-//! - **LOCAL**: the proxy's own connection, such as a health check. The
-//!   whole address block is skipped, its family byte ignored and its TLVs not
-//!   read, as section 2.2 says, so a CRC32C TLV in it is not checked;
+//! - **LOCAL**, whatever its family and protocol, UNSPEC included: the
+//!   proxy's own connection, such as a health check. The whole address block
+//!   is skipped, its family byte ignored and its TLVs not read, and
 //!   [`Header::client_address`] returns the peer.
+//!
+//! Section 2.2 pulls two ways on a CRC32C TLV under LOCAL: a receiver that
+//! supports the checksum must verify one that is present, but under LOCAL it
+//! must also discard the address block, family included, so it cannot know
+//! where any TLVs start. The block is discarded and the CRC32C left
+//! unchecked. That costs little: a LOCAL header resolves to the TCP peer,
+//! which has already been checked to be the trusted proxy.
 //!
 //! Everything else is refused:
 //!
-//! - **PROXY with UNSPEC, UDP or UNIX** ([`Error::Unsupported`]). The
-//!   specification lets a receiver reject these. Falling back to the peer
-//!   address would attribute every such client to the proxy itself, which
-//!   collapses per-publisher limits and logs onto one address, and a TCP
-//!   listener has no use for a datagram or UNIX socket description.
+//! - **PROXY with UNSPEC, UDP or UNIX** ([`Error::Unsupported`]). This
+//!   takes two steps in section 2.2. A receiver need not implement a valid
+//!   family and protocol other than UNSPEC, provided it falls back to UNSPEC
+//!   for them; and under PROXY, a receiver "is free to accept the connection
+//!   anyway and use the real endpoints addresses or to reject the
+//!   connection". So UDP and UNIX fall back to UNSPEC, and UNSPEC under PROXY
+//!   is rejected. The specification's section 9 sample code instead keeps the
+//!   local address; this parser deliberately does not. Falling back to the
+//!   peer would attribute every such client to the proxy itself, collapsing
+//!   per-publisher limits and logs onto one address.
 //! - **Family or protocol nibbles the specification does not define**
 //!   ([`Error::InvalidFamily`]), commands other than LOCAL and PROXY
 //!   ([`Error::Command`]) and versions other than 2 ([`Error::Version`]): the
@@ -45,10 +57,15 @@
 //!
 //! # Bounds
 //!
-//! - A whole header is at most [`MAX_HEADER_LEN`] (536) bytes. The
-//!   specification designs both formats to fit the smallest TCP segment any
-//!   host must accept (576 - 40 = 536 bytes), so a longer header is refused
-//!   as soon as its length field arrives, without waiting for its body.
+//! - A whole header is at most [`MAX_HEADER_LEN`] (536) bytes, refused as
+//!   soon as its length field arrives, without waiting for its body. This is
+//!   a policy cap taken from the specification's design note that both
+//!   formats fit the smallest TCP segment any host must accept (576 - 40 =
+//!   536 bytes); it is not a MUST on senders. A TLS-terminating sender that
+//!   adds UNIQUE_ID (131 bytes with its TLV header), a 255-byte AUTHORITY
+//!   (258) and the full SSL sub-TLVs could exceed it, at around 600 bytes or
+//!   more after a 52-byte IPv6 fixed part and address block. A layer-4
+//!   forward of ICE-TCP, which terminates no TLS, sends none of those.
 //! - At most [`MAX_TLVS`] TLVs, each wholly inside the header. A TLV that
 //!   overruns it, or one or two stray trailing bytes, is an error.
 //! - `CRC32C`, `ALPN`, `AUTHORITY` and `UNIQUE_ID` may each appear once.
@@ -60,10 +77,12 @@
 //! When a `PP2_TYPE_CRC32C` TLV is present, the CRC-32C (Castagnoli, RFC 4960
 //! Appendix B) of the whole header with that TLV's value zeroed must match it.
 //! The specification calls the value "a 32-bit number" without saying in
-//! which byte order it is stored; network order is the document's convention,
-//! while RFC 4960's own procedure places the low byte first. Either placement
-//! is accepted. The check guards against corruption, not forgery, so the
-//! one-bit loss does not matter; trust comes from the peer address.
+//! which byte order it is stored. Network order is the document's convention
+//! for every other field, while RFC 4960's Appendix C sample code puts the
+//! low byte first on the wire. Either placement is accepted, and will be
+//! until a capture from the real front proxy settles which one it sends. The
+//! check guards against corruption, not forgery, so the one-bit loss does
+//! not matter; trust comes from the peer address.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -102,6 +121,7 @@ pub const PP2_TYPE_NETNS: u8 = 0x30;
 
 /// What the header says about the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Command {
     /// The proxy's own connection, such as a health check: use the
     /// connection's real endpoints.
@@ -133,13 +153,20 @@ impl<'a> Header<'a> {
     /// The address to treat as the client's: the header's source for PROXY,
     /// or `peer` (the TCP peer, which is the proxy) for LOCAL. An
     /// IPv4-mapped IPv6 address is returned as IPv4, so that limits and logs
-    /// keyed on the address see one form.
+    /// keyed on the address see one form; any other address is returned as
+    /// given, an IPv6 scope id included.
     pub fn client_address(&self, peer: SocketAddr) -> SocketAddr {
         let address = match self.command {
             Command::Local => peer,
             Command::Proxy { source, .. } => source,
         };
-        SocketAddr::new(address.ip().to_canonical(), address.port())
+        match address {
+            SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+                Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+                None => address,
+            },
+            SocketAddr::V4(_) => address,
+        }
     }
 
     /// The TLVs after the addresses, in order. Empty for LOCAL, whose
@@ -206,6 +233,7 @@ impl<'a> Iterator for Tlvs<'a> {
 
 /// The parser's answer when the input is not refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Parsed<'a> {
     /// The input is a valid start of a header, but incomplete, or one to four
     /// bytes of `PROXY` not yet enough to label a version 1 header. At least
