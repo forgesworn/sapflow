@@ -27,6 +27,8 @@ pub(crate) const TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) enum Protocol {
     Srt,
     Rtmp,
+    /// WHIP, by the name mediamtx gives it.
+    Webrtc,
 }
 
 impl Protocol {
@@ -34,6 +36,7 @@ impl Protocol {
         match self {
             Self::Srt => "srt",
             Self::Rtmp => "rtmp",
+            Self::Webrtc => "webrtc",
         }
     }
 }

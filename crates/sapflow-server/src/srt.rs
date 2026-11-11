@@ -114,7 +114,7 @@ pub fn feed_payload(
                 }
                 ts.push(data, now)
             }
-            Source::Flv(_) => Ok(Default::default()),
+            Source::Flv(_) | Source::Es(_) => Ok(Default::default()),
         })
         .map_err(|e| e.to_string())
 }

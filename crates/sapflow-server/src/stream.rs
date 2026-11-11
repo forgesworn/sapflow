@@ -10,7 +10,7 @@ use sapflow_core::limits::{PublicationPermit, PublicationQuota};
 use sapflow_core::residency::{PresentationPermit, PresentationQuota, default_presentation_limit};
 use sapflow_hls::muxer::Part;
 use sapflow_hls::{
-    FlvIngest, IngestError, Muxer, MuxerConfig, PartLookup, TsIngest, Update, playlist,
+    EsIngest, FlvIngest, IngestError, Muxer, MuxerConfig, PartLookup, TsIngest, Update, playlist,
 };
 
 use crate::recorder::{IncompleteReason, Recorder, RecorderFactory};
@@ -92,12 +92,16 @@ pub enum Source {
     Ts(Box<TsIngest>),
     /// RTMP carries FLV tags.
     Flv(Box<FlvIngest>),
+    /// WHIP carries H.264 access units and Opus packets, already
+    /// depacketised by `sapflow-whip`.
+    Es(Box<EsIngest>),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum SourceKind {
     Ts,
     Flv,
+    Es,
 }
 
 impl Source {
@@ -109,6 +113,7 @@ impl Source {
         match kind {
             SourceKind::Ts => Self::Ts(Box::new(TsIngest::with_fragment_quota(cfg, fragments))),
             SourceKind::Flv => Self::Flv(Box::new(FlvIngest::with_fragment_quota(cfg, fragments))),
+            SourceKind::Es => Self::Es(Box::new(EsIngest::with_fragment_quota(cfg, fragments))),
         }
     }
 
@@ -123,13 +128,14 @@ impl Source {
             (_, None) => Self::new(kind, cfg, fragments),
             (SourceKind::Ts, Some(m)) => Self::Ts(Box::new(TsIngest::resume(cfg, m))),
             (SourceKind::Flv, Some(m)) => Self::Flv(Box::new(FlvIngest::resume(cfg, m))),
+            (SourceKind::Es, Some(m)) => Self::Es(Box::new(EsIngest::resume(cfg, m))),
         }
     }
 
     pub fn dropped_packets(&self) -> u64 {
         match self {
             Self::Ts(ingest) => ingest.dropped_packets(),
-            Self::Flv(_) => 0,
+            Self::Flv(_) | Self::Es(_) => 0,
         }
     }
 
@@ -137,6 +143,7 @@ impl Source {
         match self {
             Self::Ts(t) => t.muxer(),
             Self::Flv(f) => f.muxer(),
+            Self::Es(e) => e.muxer(),
         }
     }
 
@@ -144,6 +151,7 @@ impl Source {
         match self {
             Self::Ts(t) => t.take_muxer(),
             Self::Flv(f) => f.take_muxer(),
+            Self::Es(e) => e.take_muxer(),
         }
     }
 
@@ -155,6 +163,9 @@ impl Source {
             Self::Ts(ts) if clean_close => ts.finish_after_clean_close(now),
             Self::Ts(ts) => ts.finish(now),
             Self::Flv(flv) => Ok(flv
+                .muxer_mut()
+                .map_or_else(Update::default, |m| m.interrupt(now))),
+            Self::Es(es) => Ok(es
                 .muxer_mut()
                 .map_or_else(Update::default, |m| m.interrupt(now))),
         }
@@ -552,6 +563,7 @@ impl LiveStream {
             let kind = match state.ingest {
                 Source::Ts(_) => SourceKind::Ts,
                 Source::Flv(_) => SourceKind::Flv,
+                Source::Es(_) => SourceKind::Es,
             };
             state.ingest = Source::new(kind, self.cfg, self.fragments.clone());
             state.media = None;

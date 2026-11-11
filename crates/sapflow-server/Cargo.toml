@@ -29,6 +29,9 @@ sapflow-core = { path = "../sapflow-core", version = "=0.2.0-rc.1" }
 sapflow-hls = { path = "../sapflow-hls", version = "=0.2.0-rc.1" }
 sapflow-rtmp = { path = "../sapflow-rtmp", version = "=0.2.0-rc.1" }
 sapflow-srt = { path = "../sapflow-srt", version = "=0.2.0-rc.1" }
+sapflow-whip = { path = "../sapflow-whip", version = "=0.2.0-rc.1" }
+sapflow-dtls = { path = "../sapflow-dtls", version = "=0.2.0-rc.1" }
+sapflow-rtp = { path = "../sapflow-rtp", version = "=0.2.0-rc.1" }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -42,3 +45,8 @@ getrandom = "=0.4.3"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The scripted WHIP publisher (STUN client, DTLS test client, SRTP) for the
+# in-process WHIP tests.
+sapflow-whip = { path = "../sapflow-whip", version = "=0.2.0-rc.1", features = ["testing"] }

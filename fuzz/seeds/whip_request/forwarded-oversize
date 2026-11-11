@@ -1,0 +1,6 @@
+POST /whip/live/event-abc HTTP/1.1
+authorization: bearer only-a-password
+content-type: application/sdp; charset=utf-8
+x-forwarded-for: 198.51.100.1, 192.0.2.9
+content-length: 16385
+

@@ -2,7 +2,7 @@
 //!
 //! No config file: the stage needs a handful of settings.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,6 +12,9 @@ use crate::publish_session_wire::Secret;
 use sapflow_core::Publisher;
 use sapflow_core::recording::{RecordPolicy, parse_age};
 use sapflow_srt::crypto::{CryptoConfig, KeySize};
+use sapflow_whip::Transport;
+use sapflow_whip::resource::PublicUrl;
+use sapflow_whip::sdp::Candidate;
 use std::sync::Arc;
 
 pub const HELP: &str = "\
@@ -72,8 +75,22 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_HEALTH_INTERVAL  seconds between health callbacks (default 30;
                            0 disables, maximum 3600)
 
+WHIP (browser and OBS publishing over WebRTC) is off unless SAPFLOW_WHIP_ADDR
+is set; then the next three are required:
+  SAPFLOW_WHIP_ADDR        WHIP signalling over plain HTTP, behind a TLS proxy
+  SAPFLOW_WHIP_PUBLIC_URL  the public base URL of that listener, for Location
+  SAPFLOW_WHIP_UDP_ADDR    the media UDP socket every session shares
+  SAPFLOW_WHIP_CANDIDATES  advertised candidates: udp <ip>:<port>, comma-separated
+  SAPFLOW_WHIP_ALLOW_ORIGINS  browser origins allowed by CORS, comma-separated
+  SAPFLOW_WHIP_TRUSTED_PROXY  the proxy address whose X-Forwarded-For is believed
+  SAPFLOW_WHIP_KEYFRAME_INTERVAL  seconds between keyframe requests (default 2;
+                           0 asks only when needed, maximum 60)
+  SAPFLOW_WHIP_OPUS_MAX_BITRATE   Opus maxaveragebitrate offered (default 128000;
+                           6000 to 510000)
+
 Publish with SRT, streamid=publish:live/<eventId>:<user>:<pass>, or RTMP,
-rtmp://<host>:1935/live with key <eventId>?user=<user>&pass=<pass>.
+rtmp://<host>:1935/live with key <eventId>?user=<user>&pass=<pass>, or WHIP,
+POST <SAPFLOW_WHIP_PUBLIC_URL>/whip/live/<eventId> with bearer <user>:<pass>.
 Play at http://<host>:8888/live/<eventId>/index.m3u8.
 ";
 
@@ -111,7 +128,147 @@ const KEYS: &[&str] = &[
     "SAPFLOW_SRT_ENCRYPTION",
     "SAPFLOW_RECONNECT_GRACE",
     "SAPFLOW_HEALTH_INTERVAL",
+    "SAPFLOW_WHIP_ADDR",
+    "SAPFLOW_WHIP_PUBLIC_URL",
+    "SAPFLOW_WHIP_UDP_ADDR",
+    "SAPFLOW_WHIP_CANDIDATES",
+    "SAPFLOW_WHIP_ALLOW_ORIGINS",
+    "SAPFLOW_WHIP_TRUSTED_PROXY",
+    "SAPFLOW_WHIP_KEYFRAME_INTERVAL",
+    "SAPFLOW_WHIP_OPUS_MAX_BITRATE",
+    "SAPFLOW_WHIP_TCP_ADDR",
 ];
+
+/// WHIP ingest, when `SAPFLOW_WHIP_ADDR` is set.
+#[derive(Debug, Clone)]
+pub struct WhipConfig {
+    /// The signalling listener.
+    pub addr: SocketAddr,
+    /// For `Location`.
+    pub public_url: PublicUrl,
+    /// The media socket.
+    pub udp_addr: SocketAddr,
+    /// What the answer advertises (UDP only until W3d's TCP listener).
+    pub candidates: Vec<Candidate>,
+    /// Exact origins CORS allows.
+    pub allow_origins: Vec<String>,
+    /// The proxy whose `X-Forwarded-For` gives the publisher's address.
+    pub trusted_proxy: Option<IpAddr>,
+    pub keyframe_interval: Option<Duration>,
+    pub opus_max_bitrate: u32,
+}
+
+impl WhipConfig {
+    fn load(vals: &std::collections::HashMap<String, String>) -> Result<Option<Self>, ConfigError> {
+        let invalid = |m: &str| ConfigError::Invalid(m.into());
+        let Some(addr) = vals.get("SAPFLOW_WHIP_ADDR") else {
+            if let Some(key) = KEYS
+                .iter()
+                .find(|k| k.starts_with("SAPFLOW_WHIP_") && vals.contains_key(**k))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "{key} needs SAPFLOW_WHIP_ADDR: WHIP is off without it"
+                )));
+            }
+            return Ok(None);
+        };
+        if vals.contains_key("SAPFLOW_WHIP_TCP_ADDR") {
+            return Err(invalid(
+                "SAPFLOW_WHIP_TCP_ADDR: ICE over TCP is not built yet; leave it unset",
+            ));
+        }
+        let socket = |key: &str, v: &str| -> Result<SocketAddr, ConfigError> {
+            v.parse()
+                .map_err(|_| ConfigError::Invalid(format!("{key}: not an address: {v}")))
+        };
+        let addr = socket("SAPFLOW_WHIP_ADDR", addr)?;
+        let required = |key: &str| {
+            vals.get(key).ok_or_else(|| {
+                ConfigError::Invalid(format!("{key} is required with SAPFLOW_WHIP_ADDR"))
+            })
+        };
+        let public_url = PublicUrl::parse(required("SAPFLOW_WHIP_PUBLIC_URL")?).ok_or_else(|| {
+            invalid("SAPFLOW_WHIP_PUBLIC_URL: an http:// or https:// base URL with a host, no query")
+        })?;
+        let udp_addr = socket("SAPFLOW_WHIP_UDP_ADDR", required("SAPFLOW_WHIP_UDP_ADDR")?)?;
+        let mut candidates = Vec::new();
+        for item in required("SAPFLOW_WHIP_CANDIDATES")?.split(',') {
+            let item = item.trim();
+            let address = match item.split_once(char::is_whitespace) {
+                Some((kind, address)) if kind.eq_ignore_ascii_case("udp") => address.trim(),
+                Some((kind, _)) if kind.eq_ignore_ascii_case("tcp") => {
+                    return Err(invalid(
+                        "SAPFLOW_WHIP_CANDIDATES: tcp candidates need the ICE-TCP listener, which is not built yet",
+                    ));
+                }
+                _ => {
+                    return Err(invalid(
+                        "SAPFLOW_WHIP_CANDIDATES: udp <ip>:<port>, comma-separated",
+                    ));
+                }
+            };
+            candidates.push(Candidate {
+                transport: Transport::Udp,
+                address: socket("SAPFLOW_WHIP_CANDIDATES", address)?,
+            });
+        }
+        if candidates.is_empty() || candidates.len() > sapflow_whip::sdp::MAX_CANDIDATES {
+            return Err(invalid("SAPFLOW_WHIP_CANDIDATES: 1 to 8 candidates"));
+        }
+        let allow_origins = match vals.get("SAPFLOW_WHIP_ALLOW_ORIGINS") {
+            None => Vec::new(),
+            Some(v) => v
+                .split(',')
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
+                .map(|o| {
+                    let rest = o.strip_prefix("https://").or_else(|| o.strip_prefix("http://"));
+                    match rest {
+                        Some(host) if !host.is_empty() && !host.contains(['/', '?', '#', ' ', '*']) => {
+                            Ok(o.to_owned())
+                        }
+                        _ => Err(invalid(
+                            "SAPFLOW_WHIP_ALLOW_ORIGINS: exact origins like https://example.org, comma-separated",
+                        )),
+                    }
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        let trusted_proxy = match vals.get("SAPFLOW_WHIP_TRUSTED_PROXY") {
+            None => None,
+            Some(v) => Some(
+                v.parse::<IpAddr>()
+                    .map_err(|_| invalid("SAPFLOW_WHIP_TRUSTED_PROXY: an IP address"))?,
+            ),
+        };
+        let keyframe_interval = match vals.get("SAPFLOW_WHIP_KEYFRAME_INTERVAL") {
+            None => Some(Duration::from_secs(2)),
+            Some(v) => match v.parse::<u64>() {
+                Ok(0) => None,
+                Ok(n) if n <= 60 => Some(Duration::from_secs(n)),
+                _ => return Err(invalid("SAPFLOW_WHIP_KEYFRAME_INTERVAL: seconds, 0 to 60")),
+            },
+        };
+        let opus_max_bitrate = match vals.get("SAPFLOW_WHIP_OPUS_MAX_BITRATE") {
+            None => 128_000,
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (6_000..=510_000).contains(n))
+                .ok_or_else(|| invalid("SAPFLOW_WHIP_OPUS_MAX_BITRATE: 6000 to 510000"))?,
+        };
+        Ok(Some(Self {
+            addr,
+            public_url,
+            udp_addr,
+            candidates,
+            allow_origins,
+            trusted_proxy,
+            keyframe_interval,
+            opus_max_bitrate,
+        }))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ControlConfig {
@@ -154,6 +311,8 @@ pub struct Config {
     pub record_min_free: u64,
     pub reconnect_grace: Duration,
     pub health_interval: Duration,
+    /// WHIP ingest; `None` binds nothing.
+    pub whip: Option<WhipConfig>,
 }
 
 #[derive(Debug)]
@@ -492,7 +651,15 @@ impl Config {
                 .ok_or_else(|| ConfigError::Invalid("SAPFLOW_HTTP_THREADS: 1 to 256".into()))?,
         };
 
+        let whip = WhipConfig::load(&vals)?;
+        if whip.is_some() && control.is_some() {
+            return Err(ConfigError::Invalid(
+                "WHIP needs global or app-authorised publishing; scoped control mode is SRT only"
+                    .into(),
+            ));
+        }
         Ok(Self {
+            whip,
             http_threads,
             http_body_timeout,
             low_latency: match vals.get("SAPFLOW_HLS_MODE").map(String::as_str) {
@@ -632,6 +799,144 @@ mod tests {
             !load(&[open], &["--hls-mode", "whole"])
                 .expect("flag override")
                 .low_latency
+        );
+    }
+
+    /// `base` with `changes` applied: a value replaces its key's, `None`
+    /// removes it.
+    fn with<'a>(
+        base: &[(&'a str, &'a str)],
+        changes: &[(&'a str, Option<&'a str>)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut out: Vec<(&str, &str)> = base
+            .iter()
+            .filter(|(k, _)| !changes.iter().any(|(c, _)| c == k))
+            .copied()
+            .collect();
+        out.extend(changes.iter().filter_map(|(k, v)| v.map(|v| (*k, v))));
+        out
+    }
+
+    #[test]
+    fn whip_is_off_unless_its_address_is_set() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        assert!(load(&[open], &[]).expect("defaults").whip.is_none());
+        let whip = [
+            open,
+            ("SAPFLOW_WHIP_ADDR", "127.0.0.1:8443"),
+            ("SAPFLOW_WHIP_PUBLIC_URL", "https://whip.example"),
+            ("SAPFLOW_WHIP_UDP_ADDR", "0.0.0.0:8189"),
+            (
+                "SAPFLOW_WHIP_CANDIDATES",
+                "udp 203.0.113.5:8189, UDP 198.51.100.7:8189",
+            ),
+        ];
+        let c = load(&whip, &[]).expect("WHIP").whip.expect("on");
+        assert_eq!(c.candidates.len(), 2);
+        assert_eq!(c.keyframe_interval, Some(Duration::from_secs(2)));
+        assert_eq!(c.opus_max_bitrate, 128_000);
+        assert!(c.allow_origins.is_empty() && c.trusted_proxy.is_none());
+        let c = load(
+            &with(
+                &whip,
+                &[
+                    (
+                        "SAPFLOW_WHIP_ALLOW_ORIGINS",
+                        Some("https://a.example, http://b.example:8080"),
+                    ),
+                    ("SAPFLOW_WHIP_TRUSTED_PROXY", Some("10.0.0.1")),
+                    ("SAPFLOW_WHIP_KEYFRAME_INTERVAL", Some("0")),
+                    ("SAPFLOW_WHIP_OPUS_MAX_BITRATE", Some("64000")),
+                ],
+            ),
+            &[],
+        )
+        .expect("WHIP")
+        .whip
+        .expect("on");
+        assert_eq!(
+            c.allow_origins,
+            ["https://a.example", "http://b.example:8080"]
+        );
+        assert_eq!(c.trusted_proxy, Some("10.0.0.1".parse().expect("ip")));
+        assert_eq!((c.keyframe_interval, c.opus_max_bitrate), (None, 64_000));
+        // A WHIP setting without the address is refused, not ignored.
+        assert!(load(&[open, ("SAPFLOW_WHIP_UDP_ADDR", "0.0.0.0:8189")], &[]).is_err());
+        for missing in [
+            "SAPFLOW_WHIP_PUBLIC_URL",
+            "SAPFLOW_WHIP_UDP_ADDR",
+            "SAPFLOW_WHIP_CANDIDATES",
+        ] {
+            assert!(
+                load(&with(&whip, &[(missing, None)]), &[]).is_err(),
+                "{missing}"
+            );
+        }
+        for (key, bad) in [
+            ("SAPFLOW_WHIP_CANDIDATES", "tcp 203.0.113.5:443"),
+            ("SAPFLOW_WHIP_CANDIDATES", "udp somewhere"),
+            ("SAPFLOW_WHIP_CANDIDATES", ""),
+            ("SAPFLOW_WHIP_TCP_ADDR", "0.0.0.0:8443"),
+            ("SAPFLOW_WHIP_PUBLIC_URL", "whip.example"),
+            ("SAPFLOW_WHIP_ALLOW_ORIGINS", "*"),
+            ("SAPFLOW_WHIP_ALLOW_ORIGINS", "https://a.example/page"),
+            ("SAPFLOW_WHIP_TRUSTED_PROXY", "proxy.example"),
+            ("SAPFLOW_WHIP_KEYFRAME_INTERVAL", "61"),
+            ("SAPFLOW_WHIP_OPUS_MAX_BITRATE", "5999"),
+        ] {
+            assert!(
+                load(&with(&whip, &[(key, Some(bad))]), &[]).is_err(),
+                "{key}={bad}"
+            );
+        }
+        assert_eq!(
+            load(
+                &with(
+                    &whip,
+                    &[(
+                        "SAPFLOW_WHIP_CANDIDATES",
+                        Some(&["udp 192.0.2.1:1"; 9].join(","))
+                    )]
+                ),
+                &[]
+            )
+            .map(|_| ())
+            .map_err(|_| ()),
+            Err(()),
+            "at most eight candidates"
+        );
+        // Scoped control mode is SRT only.
+        let scoped = with(
+            &whip,
+            &[
+                ("SAPFLOW_OPEN_PUBLISH", None),
+                ("SAPFLOW_RTMP_ADDR", Some("off")),
+                ("SAPFLOW_CONTROL_ADDR", Some("127.0.0.1:9000")),
+                (
+                    "SAPFLOW_CONTROL_TOKEN",
+                    Some("0123456789abcdef0123456789abcdef"),
+                ),
+                (
+                    "SAPFLOW_SESSION_STORE",
+                    Some("/var/lib/sapflow/sessions.json"),
+                ),
+            ],
+        );
+        assert!(load(&scoped, &[]).is_err());
+        assert!(
+            load(
+                &with(
+                    &scoped,
+                    &[
+                        ("SAPFLOW_WHIP_ADDR", None),
+                        ("SAPFLOW_WHIP_PUBLIC_URL", None),
+                        ("SAPFLOW_WHIP_UDP_ADDR", None),
+                        ("SAPFLOW_WHIP_CANDIDATES", None)
+                    ]
+                ),
+                &[]
+            )
+            .is_ok()
         );
     }
 
