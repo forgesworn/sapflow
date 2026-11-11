@@ -31,8 +31,8 @@ live media server. MIT.
   timescale, and `CODECS` says `Opus`, the sample entry's case-sensitive
   four-character code (RFC 6381 section 3.3). RTP carries no Opus header, so the
   channel count is 2 when stereo was negotiated (`EsIngest::opus_config`
-  with `OpusConfig::STEREO`; `MONO` records nothing) or the first packet is
-  stereo, otherwise 1;
+  with `OpusConfig::STEREO`; `MONO` records nothing, and other counts are
+  refused) or the first packet is stereo, otherwise 1;
   pre-skip, output gain and mapping family are 0. Nothing is transcoded,
   and Apple's players do not decode Opus in HLS: convert to AAC downstream
   for them. The AAC entry points, signatures and output are unchanged;
