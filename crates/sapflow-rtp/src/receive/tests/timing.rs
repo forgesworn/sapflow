@@ -566,3 +566,38 @@ fn media_only_over_rtx_still_ends_the_hold() {
     assert!(matches!(r.poll_event(), Some(Event::Aligned { .. })));
     assert!(std::iter::from_fn(|| r.poll_event()).any(|e| matches!(e, Event::AccessUnit { .. })));
 }
+
+/// A1.2 with the default 1.5 s start hold: exactly the access units and
+/// audio of the run without it, after one Aligned event (the fixtures carry
+/// no sender reports), with pts strictly increasing in each stream.
+#[test]
+fn a12_recovery_with_the_start_hold() {
+    let c = capture();
+    let (mut imp, _) = impairments(&c);
+    imp.rtx_probes = true;
+    let base = simulate(&c, &imp, Resend::Rtx);
+    let held = simulate_with(&c, &imp, Resend::Rtx, ReceiverConfig::default());
+    assert_eq!(access_units(&held.events), access_units(&base.events));
+    assert_eq!(audio_frames(&held.events), audio_frames(&base.events));
+    assert_eq!(
+        held.events.first(),
+        Some(&Event::Aligned {
+            alignment: Alignment::Arrival(Fallback::Timeout)
+        })
+    );
+    let mut last = [None, None];
+    for e in &held.events {
+        let (stream, pts) = match e {
+            Event::AccessUnit { stream, pts, .. } | Event::Audio { stream, pts, .. } => {
+                (stream, *pts)
+            }
+            _ => continue,
+        };
+        let slot = &mut last[stream.index()];
+        assert!(slot.is_none_or(|l| pts > l), "{pts} after {slot:?}");
+        *slot = Some(pts);
+    }
+    for s in [StreamId(0), StreamId(1)] {
+        assert_eq!(held.receiver.stats(s).expect("stats").events_dropped, 0);
+    }
+}

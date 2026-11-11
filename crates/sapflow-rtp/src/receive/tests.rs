@@ -172,8 +172,8 @@ struct Outcome {
     receiver: Receiver,
 }
 
-fn receiver(c: &Capture, rtx: bool, audio_nack: bool) -> Receiver {
-    let mut r = Receiver::new(no_hold(), Instant::now());
+fn receiver(c: &Capture, rtx: bool, audio_nack: bool, cfg: ReceiverConfig) -> Receiver {
+    let mut r = Receiver::new(cfg, Instant::now());
     let mut video = StreamConfig::new(Codec::H264, c.video_pt);
     video.ssrc = Some(c.video_ssrc);
     video.nack = true;
@@ -195,7 +195,12 @@ fn receiver(c: &Capture, rtx: bool, audio_nack: bool) -> Receiver {
 /// Plays the capture through `imp` to a receiver, answering NACKs by
 /// `resend`.
 fn simulate(c: &Capture, imp: &Impairments, resend: Resend) -> Outcome {
-    let mut r = receiver(c, resend == Resend::Rtx, !imp.audio_nack_off);
+    simulate_with(c, imp, resend, no_hold())
+}
+
+/// [`simulate`] with a receiver configuration of its own.
+fn simulate_with(c: &Capture, imp: &Impairments, resend: Resend, cfg: ReceiverConfig) -> Outcome {
+    let mut r = receiver(c, resend == Resend::Rtx, !imp.audio_nack_off, cfg);
     let t0 = r.epoch;
     let at = |us: u64| t0 + Duration::from_micros(us);
     let mut queue: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> = BinaryHeap::new();
