@@ -66,6 +66,9 @@ const MAX_LEARNED_FRAMES: usize = 1024;
 /// the length rule in `push_video` catches several.
 const BREAK_GAP: i64 = 90_000;
 
+/// The longest valid Opus packet, 120 ms, in 90 kHz ticks.
+const OPUS_MAX_PACKET_TICKS: i64 = 10_800;
+
 /// AAC-LC frames are 1024 samples. A gap of more than three frames between
 /// two (the audio stopped) is not given to the frame before it.
 const AAC_FRAME: i64 = 1024;
@@ -627,9 +630,10 @@ impl Muxer {
         self.reconfigure_with_audio(video, audio.map(AudioConfig::Aac), now)
     }
 
-    /// [`Muxer::reconfigure_tracks`] for either audio codec. Opus part timing
-    /// depends on packet durations, so an audio-only Opus epoch is checked
-    /// against an inherited part target packet by packet instead of here.
+    /// [`Muxer::reconfigure_tracks`] for either audio codec. An audio-only
+    /// Opus epoch is refused here if the part target it would inherit is
+    /// under 120 ms, the longest valid packet; a fresh Opus part target is
+    /// never under 120 ms.
     pub fn reconfigure_with_audio(
         &mut self,
         video: Option<H264Config>,
@@ -640,8 +644,20 @@ impl Muxer {
         if video.is_none() {
             let audio = audio.ok_or(MuxError::InvalidTracks)?;
             Self::validate_audio(audio)?;
-            if let AudioConfig::Aac(aac) = audio {
-                self.check_audio_part_timing(aac)?;
+            match audio {
+                AudioConfig::Aac(aac) => {
+                    self.check_audio_part_timing(aac)?;
+                }
+                // An inherited part target that cannot hold the longest
+                // valid packet would make that packet fatal later.
+                AudioConfig::Opus(_)
+                    if self
+                        .timing
+                        .is_some_and(|t| t.target < OPUS_MAX_PACKET_TICKS) =>
+                {
+                    return Err(MuxError::InvalidAudio);
+                }
+                AudioConfig::Opus(_) => {}
             }
         } else if let Some(AudioConfig::Opus(opus)) = audio {
             Self::validate_opus(opus)?;
@@ -1279,11 +1295,28 @@ impl Muxer {
             samples * i64::from(VIDEO_TIMESCALE) / i64::from(crate::codec::OPUS_SAMPLE_RATE);
         let timing = self
             .timing
-            .unwrap_or_else(|| PartTiming::new(self.cfg.part_min, &[ticks as u32]));
+            .unwrap_or_else(|| Self::opus_part_timing(self.cfg.part_min, ticks));
+        // Unreachable for a valid packet: a fresh target is at least 120 ms
+        // and reconfiguration refuses a shorter inherited one.
         if ticks > timing.target {
             return Err(MuxError::InvalidAudio);
         }
         Ok(timing)
+    }
+
+    /// The part timing a first Opus packet of `ticks` fixes: as for any
+    /// frame duration, but never a target under the longest valid packet
+    /// (120 ms), so every later packet fits a part of its own. A
+    /// `part_min` that would give less gives 120 ms parts.
+    fn opus_part_timing(part_min: Duration, ticks: i64) -> PartTiming {
+        let timing = PartTiming::new(part_min, &[ticks as u32]);
+        if timing.target >= OPUS_MAX_PACKET_TICKS {
+            return timing;
+        }
+        PartTiming {
+            target: OPUS_MAX_PACKET_TICKS,
+            cut: (OPUS_MAX_PACKET_TICKS * 85 + 99) / 100,
+        }
     }
 
     /// Explicit audio-only mode. Each accepted AAC-LC frame contributes exactly

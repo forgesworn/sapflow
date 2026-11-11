@@ -455,31 +455,65 @@ fn longer_packets_after_a_20ms_first_packet_keep_the_live_window() {
     }
 }
 
+/// The review's minor 6: a part_min of 100 ms gave a 116 ms part target,
+/// and then a valid 120 ms packet was refused. The Opus part target is
+/// never under 120 ms, so every valid packet fits a part.
 #[test]
-fn a_packet_longer_than_an_inherited_part_target_is_refused() {
-    let mut m = audio_only(
-        MuxerConfig {
-            part_min: Duration::ZERO,
-            ..MuxerConfig::default()
-        },
-        2,
-    );
-    m.push_audio_at(0, Bytes::from(packet(120, true)), NOW)
-        .expect("2.5 ms fixes a short part target");
-    // Five 2.5 ms frames, less a millisecond, over 85%.
-    assert_eq!(m.part_target(), Duration::from_millis(13));
-    let before = (m.part.as_ref().map(|p| p.audio.len()), m.next_part_id());
+fn a_short_part_min_never_makes_a_valid_packet_fatal() {
+    for (part_min, first) in [(100, 960u32), (0, 120), (50, 480), (150, 2880)] {
+        let mut m = audio_only(
+            MuxerConfig {
+                part_min: Duration::from_millis(part_min),
+                ..MuxerConfig::default()
+            },
+            2,
+        );
+        let mut watch = Watch::default();
+        let mut pts = 0;
+        for samples in [first, 5760, 120, 5760, 5760, 960, 3840, 5760] {
+            for _ in 0..20 {
+                m.push_audio_at(pts, Bytes::from(packet(samples, true)), NOW)
+                    .expect("every valid packet is taken");
+                pts += ticks(samples);
+                watch.observe(&m, pts);
+            }
+        }
+        assert!(m.part_target() >= Duration::from_millis(120), "{part_min}");
+    }
+}
+
+/// A part target inherited from an earlier epoch cannot change, so one under
+/// 120 ms refuses the audio-only Opus epoch up front, before any change.
+#[test]
+fn an_inherited_part_target_under_120ms_refuses_audio_only_opus() {
+    let cfg = MuxerConfig {
+        part_min: Duration::ZERO,
+        ..MuxerConfig::default()
+    };
+    let mut m = Muxer::new(cfg, tests::video(), None);
+    for frame in 0..=60i64 {
+        m.push_video(
+            frame * 1500,
+            frame * 1500,
+            frame % 30 == 0,
+            Bytes::from_static(&[1]),
+            NOW,
+        )
+        .expect("60 fps video");
+    }
+    assert!(m.part_target() < Duration::from_millis(120));
+    let epoch = m.current_initialization_id();
     assert!(matches!(
-        m.push_audio_at(ticks(120), Bytes::from(packet(5760, true)), NOW),
+        m.reconfigure_with_audio(None, Some(opus(2)), NOW),
         Err(MuxError::InvalidAudio)
     ));
-    assert_eq!(
-        before,
-        (m.part.as_ref().map(|p| p.audio.len()), m.next_part_id())
+    assert_eq!(m.current_initialization_id(), epoch);
+    assert!(m.video().is_some());
+    // Opus beside the video is unaffected: video cuts its parts.
+    assert!(
+        m.reconfigure_with_audio(Some(tests::video()), Some(opus(2)), NOW)
+            .is_ok()
     );
-    // Packets that fit carry on.
-    m.push_audio_at(ticks(120), Bytes::from(packet(480, true)), NOW)
-        .expect("10 ms fits");
 }
 
 #[test]
