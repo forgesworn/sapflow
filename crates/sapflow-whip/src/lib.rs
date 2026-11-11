@@ -20,6 +20,8 @@
 //! - [`framing`]: RFC 4571 frames.
 //! - [`resource`]: tokens, session IDs, refusals and `Location`.
 //! - [`session`]: the [`Session`].
+//! - [`router`]: every session on one socket, for the UDP owner: checks
+//!   by USERNAME, everything else by the tuple's owner.
 //!
 //! Sans-IO: nothing here owns a socket, a clock or a thread. Every byte that
 //! arrives is hostile: nothing indexes without a bound or trusts a length,
@@ -44,6 +46,7 @@ mod entropy;
 pub mod framing;
 pub mod ice;
 pub mod resource;
+pub mod router;
 pub mod sdp;
 pub mod session;
 pub mod stun;

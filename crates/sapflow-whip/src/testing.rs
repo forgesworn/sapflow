@@ -18,7 +18,7 @@
 
 use crate::ice::{Credentials, Kind, Transport, Tuple, classify};
 use crate::sdp::{self, AnswerConfig, Candidate, Negotiated, Offer};
-use crate::session::{Event, Session, SessionConfig};
+use crate::session::{Event, Session, SessionConfig, Transmit};
 use crate::stun::{self, Builder, Message};
 use sapflow_dtls::testing::{Client, Options};
 use sapflow_dtls::{Fingerprint, Identity};
@@ -371,29 +371,38 @@ impl Publisher {
     pub fn receive(&mut self, s: &mut Session) -> Vec<Vec<u8>> {
         let mut replies = Vec::new();
         while let Some(t) = s.poll_transmit() {
-            if t.tuple != self.tuple {
-                self.misdirected += t.bytes.len();
-                continue;
-            }
-            match classify(&t.bytes) {
-                Kind::Stun => self.stun_answers.push(t.bytes),
-                Kind::Dtls => {
-                    if let Ok(r) = self.client.handle(&t.bytes) {
-                        replies.extend(r);
-                    }
-                    self.receive_keys();
+            replies.extend(self.take(t));
+        }
+        replies
+    }
+
+    /// Handles one datagram sent to us (counted as misdirected if it is
+    /// for another tuple). Returns the DTLS datagrams the client answers
+    /// with.
+    pub fn take(&mut self, t: Transmit) -> Vec<Vec<u8>> {
+        let mut replies = Vec::new();
+        if t.tuple != self.tuple {
+            self.misdirected += t.bytes.len();
+            return replies;
+        }
+        match classify(&t.bytes) {
+            Kind::Stun => self.stun_answers.push(t.bytes),
+            Kind::Dtls => {
+                if let Ok(r) = self.client.handle(&t.bytes) {
+                    replies.extend(r);
                 }
-                Kind::Rtcp => {
-                    let mut b = t.bytes.clone();
-                    let (_, inbound) = self.srtp.as_mut().expect("SRTCP after keys");
-                    let n = inbound
-                        .unprotect_rtcp(&mut b)
-                        .expect("our feedback unprotects");
-                    b.truncate(n);
-                    self.rtcp.push(b);
-                }
-                k => panic!("session sent {k:?}"),
+                self.receive_keys();
             }
+            Kind::Rtcp => {
+                let mut b = t.bytes.clone();
+                let (_, inbound) = self.srtp.as_mut().expect("SRTCP after keys");
+                let n = inbound
+                    .unprotect_rtcp(&mut b)
+                    .expect("our feedback unprotects");
+                b.truncate(n);
+                self.rtcp.push(b);
+            }
+            k => panic!("session sent {k:?}"),
         }
         replies
     }

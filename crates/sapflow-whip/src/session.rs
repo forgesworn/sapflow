@@ -590,6 +590,14 @@ impl Session {
         self.ice.is_validated(tuple)
     }
 
+    /// When fresh SRTP or SRTCP (authenticated, inside the replay window)
+    /// last arrived from `tuple` while it was validated, or `None`. The UDP
+    /// owner uses it to keep a tuple with the session it is delivering
+    /// media to ([`crate::router`]).
+    pub fn media_from(&self, tuple: &Tuple) -> Option<Instant> {
+        self.ice.media_from(tuple)
+    }
+
     /// When the last authenticated RTP packet that the receiver took as
     /// new media arrived (not a duplicate, padding or probe), for
     /// superseding a stalled session (`SAPFLOW_WHIP_STALE`).
