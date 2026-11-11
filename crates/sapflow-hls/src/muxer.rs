@@ -1484,6 +1484,27 @@ impl Muxer {
         Ok(update)
     }
 
+    /// [`Muxer::push_audio_at`] for an Opus packet the caller has borrowed:
+    /// refused before it is copied, in both modes.
+    pub(crate) fn push_opus_slice_at(
+        &mut self,
+        pts: i64,
+        packet: &[u8],
+        now: SystemTime,
+    ) -> Result<Update, MuxError> {
+        self.check_fragment_admission()?;
+        if !matches!(self.audio, Some(AudioConfig::Opus(_))) {
+            return Err(MuxError::InvalidAudio);
+        }
+        if self.video.is_some() {
+            opus_packet(packet).ok_or(MuxError::InvalidAudio)?;
+            self.check_audio_admission(pts, packet.len())?;
+            self.push_audio(pts, Bytes::copy_from_slice(packet))?;
+            return Ok(Update::default());
+        }
+        self.push_opus_audio_only(pts, packet, || Bytes::copy_from_slice(packet), now)
+    }
+
     /// Explicit audio-only mode. Each accepted AAC-LC frame contributes exactly
     /// 1024 sample ticks, and each Opus packet its TOC duration; no rounded
     /// per-frame 90 kHz increment is accumulated. A malformed Opus packet is

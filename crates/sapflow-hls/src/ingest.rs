@@ -918,7 +918,7 @@ impl EsIngest {
             self.muxer
                 .as_mut()
                 .ok_or(IngestError::InvalidTracks)?
-                .push_audio_at(relative, Bytes::copy_from_slice(packet), now)?,
+                .push_opus_slice_at(relative, packet, now)?,
         );
         Ok(update)
     }
