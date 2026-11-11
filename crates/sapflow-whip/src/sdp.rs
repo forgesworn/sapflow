@@ -76,6 +76,10 @@ pub enum ParseError {
     TooManyLines,
     /// A line longer than [`Limits::max_line`].
     LineTooLong,
+    /// A control character inside a line: a CR other than the one before
+    /// LF, NUL or any other C0 control but tab (RFC 8866 section 9). Some
+    /// values are repeated in the answer, so none is let through.
+    ControlCharacter,
     /// More than [`Limits::max_sections`] media sections.
     TooManySections,
     /// More than [`Limits::max_formats`] formats in a section.
@@ -185,6 +189,7 @@ impl Refusal {
                 P::NotUtf8 => "offer is not UTF-8",
                 P::TooManyLines => "too many lines",
                 P::LineTooLong => "line too long",
+                P::ControlCharacter => "control character in a line",
                 P::TooManySections => "too many media sections",
                 P::TooManyFormats => "too many formats",
                 P::TooManySsrcs => "too many SSRCs",
@@ -465,6 +470,9 @@ impl Offer {
             }
             if line.len() > limits.max_line {
                 return Err(ParseError::LineTooLong);
+            }
+            if line.bytes().any(|c| c < 0x20 && c != b'\t') {
+                return Err(ParseError::ControlCharacter);
             }
             let (kind, value) = line.split_once('=').ok_or(ParseError::Line)?;
             if kind.len() != 1 || !kind.bytes().all(|c| c.is_ascii_lowercase()) {

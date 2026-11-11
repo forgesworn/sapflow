@@ -526,6 +526,13 @@ fn parse_refusals() {
         (b.replace("v=0\r\n", "").into_bytes(), P::Version),
         (Vec::new(), P::Version),
         (b.replace("s=-", "s").into_bytes(), P::Line),
+        (b.replace("s=-", "s=a\rb").into_bytes(), P::ControlCharacter),
+        (b.replace("s=-", "s=a\0b").into_bytes(), P::ControlCharacter),
+        (
+            b.replace("packetization-mode=1", "packetization-mode=1\x1b[2J")
+                .into_bytes(),
+            P::ControlCharacter,
+        ),
         (b.replace("s=-", "S=-").into_bytes(), P::Line),
         (
             b.replace("m=video 9", "m=video x").into_bytes(),
@@ -613,6 +620,10 @@ fn parse_refusals() {
         );
     }
     assert_eq!(Refusal::Malformed(P::Line).status(), 400);
+    assert_eq!(Refusal::Malformed(P::ControlCharacter).status(), 400);
+    // A tab is allowed (RFC 8866's byte-string), and a CR only before LF.
+    assert!(negotiate(&b.replace("s=-", "s=a\tb")).is_ok());
+    assert!(negotiate(&b.replace("\r\n", "\n")).is_ok());
 }
 
 fn negotiate_bytes(b: &[u8]) -> Result<(), Refusal> {
