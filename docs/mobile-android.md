@@ -20,6 +20,24 @@ settings acknowledgement is separate from autofocus/exposure convergence;
 Refresh camera status requests a new observation without continuous polling.
 Physical front/rear geometry, switching and recording acceptance remain open.
 
+## Debug preview cadence experiment
+
+This opt-in diagnostic limits only live preview drawing to 15 fps. The camera
+source and encoder still receive their normal frame cadence, and privacy
+concealment remains immediate. Debug builds default to uncapped preview; release
+and qualification builds remain uncapped. Set the Gradle property
+`-PsapflowDebugPreviewFps=15` for the debug experiment, or omit it (equivalently
+use `0`) for the uncapped comparison. Other values are rejected.
+
+The matched diagnostic debug builds used source `75bf50a` and the same
+manifest, signer and native libraries as the accepted baseline APK. Their
+SHA-256 values are `203032b3dd8c3b6e8e67914df00dfac2161e7d498f1a136265444e3e2798b3eb`
+(uncapped) and `f47733c9861fb30464bc4e5de0ae10baf773da7e9849d79b49ad621f93d53a22`
+(15 fps). The build receipt records 841 Android unit tests passing and lint
+with zero errors and 30 warnings; host policy and renderer-structure checks
+passed. These results do not establish physical benefit, a heat fix, or
+endurance qualification.
+
 ## Manual destination profiles
 
 The normal manual controls support explicit save, load and delete for up to 16
