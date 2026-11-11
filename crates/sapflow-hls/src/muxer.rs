@@ -1291,8 +1291,8 @@ impl Muxer {
     /// per-frame 90 kHz increment is accumulated. A malformed Opus packet is
     /// refused before anything changes. Opus packet durations may change
     /// mid-stream: a packet that would carry the open part past the fixed
-    /// part target first closes that part and its segment, both short, which
-    /// Apple's part rules allow for the last part of a segment.
+    /// part target first closes that part, short but independent, which RFC
+    /// 8216bis 4.4.4.9 exempts from the 85% floor. The segment carries on.
     /// The wall clock is supplied only for run anchoring, as on the video path.
     pub fn push_audio_at(
         &mut self,
@@ -1373,10 +1373,11 @@ impl Muxer {
                 .as_ref()
                 .is_some_and(|part| !part.audio.is_empty() && end - part.start_dts > timing.target)
         {
+            // Only the part: an INDEPENDENT=YES part is exempt from the 85%
+            // floor (RFC 8216bis 4.4.4.9), and closing the segment too would
+            // shrink the count-limited window to single-part segments.
             self.rotate_part(at, at)?;
-            self.rotate_segment(at, now, true)?;
             update.part = true;
-            update.segment = true;
         }
         if self.next_segment.is_none() {
             let id = if self.entries.is_empty() {

@@ -15,8 +15,8 @@ const NOW: SystemTime = SystemTime::UNIX_EPOCH;
 const LIVE_LIMIT: usize = 16_384;
 
 /// One packet of `samples` at 48 kHz: one CELT fullband frame for 2.5 to
-/// 20 ms, one SILK wideband frame for 40 and 60 ms, six 20 ms CELT frames
-/// (code 3) for 120 ms. Each frame is the two-byte silent CELT frame.
+/// 20 ms, one SILK wideband frame for 40 and 60 ms, four or six 20 ms CELT
+/// frames (code 3) for 80 and 120 ms. Each frame is the two-byte silent CELT frame.
 pub(crate) fn packet(samples: u32, stereo: bool) -> Vec<u8> {
     let s = if stereo { 0x04 } else { 0 };
     let celt = |config: u8| vec![config << 3 | s, 0xff, 0xfe];
@@ -27,9 +27,10 @@ pub(crate) fn packet(samples: u32, stereo: bool) -> Vec<u8> {
         960 => celt(31),
         1920 => vec![10 << 3 | s, 1, 2],
         2880 => vec![11 << 3 | s, 1, 2],
-        5760 => {
-            let mut p = vec![31 << 3 | s | 3, 6];
-            for _ in 0..6 {
+        3840 | 5760 => {
+            let frames = (samples / 960) as u8;
+            let mut p = vec![31 << 3 | s | 3, frames];
+            for _ in 0..frames {
                 p.extend([0xff, 0xfe]);
             }
             p
@@ -117,13 +118,14 @@ fn segments(m: &Muxer) -> Vec<Arc<Segment>> {
         .collect()
 }
 
-/// Apple's part rules on every segment, as RuleCheck holds the playlist to.
+/// The part rules on every segment, as RuleCheck holds the playlist to: an
+/// independent part is exempt from the 85% floor (RFC 8216bis 4.4.4.9).
 fn assert_part_rules(m: &Muxer) {
     for segment in segments(m) {
         assert!(segment.duration.as_secs_f64().round() <= m.target_duration() as f64);
         for (i, part) in segment.parts.iter().enumerate() {
             assert!(part.duration <= m.part_target(), "part {}", part.id);
-            if i + 1 < segment.parts.len() {
+            if i + 1 < segment.parts.len() && !part.independent {
                 assert!(
                     part.duration.as_secs_f64() >= m.part_target().as_secs_f64() * 0.85,
                     "part {} is short but not last",
@@ -271,17 +273,89 @@ fn audio_only_opus_cuts_independent_parts_on_toc_durations() {
     );
 }
 
+/// Watches a live stream push by push, as a client would: RuleCheck on
+/// every render, every part as it is produced (so nothing is lost to the
+/// window), and RFC 8216bis 6.2.2's part retention: a part stays
+/// downloadable for three target durations after its tag leaves the
+/// playlist.
+struct Watch {
+    rules: playlist::RuleCheck,
+    parts: Vec<Arc<Part>>,
+    next: u64,
+    listed: std::collections::BTreeSet<u64>,
+    removed: std::collections::BTreeMap<u64, i64>,
+    gone: std::collections::BTreeMap<u64, i64>,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            rules: playlist::RuleCheck::with_live_window(),
+            parts: Vec::new(),
+            next: 0,
+            listed: Default::default(),
+            removed: Default::default(),
+            gone: Default::default(),
+        }
+    }
+}
+
+impl Watch {
+    fn observe(&mut self, m: &Muxer, now: i64) {
+        while self.next < m.next_part_id() {
+            if let PartLookup::Found(p) = m.part(self.next) {
+                self.parts.push(p);
+            }
+            self.next += 1;
+        }
+        if !m.has_content() {
+            return;
+        }
+        let pl = playlist::media(m, "p");
+        if let Err(e) = self.rules.check(&pl) {
+            panic!("{e}\n{pl}");
+        }
+        let listed: std::collections::BTreeSet<u64> = pl
+            .lines()
+            .filter_map(|l| l.split("URI=\"p_part").nth(1))
+            .filter_map(|r| r.split('.').next()?.parse().ok())
+            .collect();
+        for id in self.listed.difference(&listed) {
+            self.removed.entry(*id).or_insert(now);
+        }
+        for id in self.removed.keys() {
+            if !self.gone.contains_key(id) && matches!(m.part(*id), PartLookup::Missing) {
+                self.gone.insert(*id, now);
+            }
+        }
+        self.listed = listed;
+    }
+
+    fn check_retention(&self, m: &Muxer) {
+        let floor = 3 * m.target_duration() as i64 * 90_000;
+        for (id, gone) in &self.gone {
+            let held = gone - self.removed[id];
+            assert!(
+                held >= floor,
+                "part {id} gone {held} ticks after its tag left"
+            );
+        }
+    }
+
+    fn audio(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for part in &self.parts {
+            out.extend(audio_run(part).map(|(_, d)| d).unwrap_or_default());
+        }
+        out
+    }
+}
+
 #[test]
 fn audio_only_opus_keeps_the_part_rules_when_packet_durations_change() {
     for first in [960u32, 2880, 120, 5760] {
-        let mut m = audio_only(
-            MuxerConfig {
-                segment_count: 1000,
-                ..MuxerConfig::default()
-            },
-            1,
-        );
-        let mut rules = playlist::RuleCheck::default();
+        let mut m = audio_only(MuxerConfig::default(), 1);
+        let mut watch = Watch::default();
         let mut pushed = Vec::new();
         let mut pts = 0i64;
         let plan = [
@@ -294,6 +368,7 @@ fn audio_only_opus_keeps_the_part_rules_when_packet_durations_change() {
             (1920, 30),
             (240, 50),
             (5760, 3),
+            (3840, 10),
             (960, 60),
         ];
         for (samples, count) in plan {
@@ -304,37 +379,79 @@ fn audio_only_opus_keeps_the_part_rules_when_packet_durations_change() {
                 assert!(!up.media_loss);
                 pushed.push(samples);
                 pts += ticks(samples);
-                check(&mut rules, &m);
+                watch.observe(&m, pts);
             }
         }
         m.interrupt(NOW);
-        check(&mut rules, &m);
+        watch.observe(&m, pts);
+        watch.check_retention(&m);
         assert_part_rules(&m);
-        assert_eq!(audio_durations(&m), pushed, "first packet {first}");
+        assert_eq!(watch.audio(), pushed, "first packet {first}");
         assert_eq!(m.breaks(), 1, "only the final interrupt");
-        if first == 960 {
-            // A 120 ms packet after a 20 ms part target closes its part and
-            // segment early: a short segment before the last.
-            let all = segments(&m);
-            assert!(
-                all[..all.len() - 1]
-                    .iter()
-                    .any(|s| s.duration < Duration::from_secs(1)),
-                "early close exercised"
-            );
-        }
         assert_eq!(
             m.part_target(),
             PartTiming::new(Duration::from_millis(200), &[ticks(first) as u32]).target_duration(),
             "the part target follows the first packet"
         );
-        // Segment durations add up to the media.
-        let total: Duration = segments(&m).iter().map(|s| s.duration).sum();
-        let samples: u32 = pushed.iter().sum();
-        assert_eq!(
-            total.as_nanos(),
-            u128::from(samples) * 1_000_000_000 / 48_000
+        // Every segment but the last reaches segment_min: a packet that does
+        // not fit closes only its part (independent, so exempt from 85%).
+        let all = segments(&m);
+        assert!(
+            all[..all.len() - 1]
+                .iter()
+                .all(|s| s.duration >= Duration::from_secs(1))
         );
+        if first == 960 {
+            let short = watch
+                .parts
+                .iter()
+                .any(|p| p.duration.as_secs_f64() < m.part_target().as_secs_f64() * 0.85);
+            assert!(short, "early part close exercised");
+        }
+    }
+}
+
+/// The review's probe P1: a 20 ms first packet fixes a 234 ms part target,
+/// then 60, 80 or 120 ms packets for a minute, default configuration.
+/// Closing the segment with each early part collapsed the window to
+/// single-part segments (2.88 s at 120 ms, against RFC 8216bis 6.2.2's
+/// three target durations).
+#[test]
+fn longer_packets_after_a_20ms_first_packet_keep_the_live_window() {
+    for samples in [2880u32, 3840, 5760] {
+        let mut m = audio_only(MuxerConfig::default(), 2);
+        let mut watch = Watch::default();
+        let mut pts = 0i64;
+        let mut pushes = 0;
+        m.push_audio_at(pts, Bytes::from(packet(960, true)), NOW)
+            .expect("first packet");
+        pts += ticks(960);
+        pushes += 1;
+        while pts < 60 * 90_000 {
+            m.push_audio_at(pts, Bytes::from(packet(samples, true)), NOW)
+                .expect("valid packet");
+            pts += ticks(samples);
+            pushes += 1;
+            watch.observe(&m, pts);
+        }
+        watch.check_retention(&m);
+        assert_eq!(m.part_target(), Duration::from_millis(234));
+        let window: Duration = m.entries().iter().map(Entry::duration).sum();
+        let all = segments(&m);
+        let mean = all.iter().map(|s| s.duration).sum::<Duration>() / all.len() as u32;
+        println!(
+            "P1 {} ms: segment {:.3} s, window {:.3} s, {} parts for {pushes} pushes",
+            samples / 48,
+            mean.as_secs_f64(),
+            window.as_secs_f64(),
+            watch.parts.len()
+        );
+        assert!(
+            window >= Duration::from_secs(3 * m.target_duration()),
+            "{} ms packets: window {window:?}",
+            samples / 48
+        );
+        assert!(mean >= Duration::from_secs(1), "{mean:?}");
     }
 }
 
