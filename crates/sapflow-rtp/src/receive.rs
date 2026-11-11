@@ -589,6 +589,9 @@ pub struct StreamStats {
     /// Frames held to the timeline's arrival bound or continued by arrival
     /// time (see [`crate::timeline`]), without a discontinuity.
     pub timeline_clamps: u64,
+    /// Of those, the frames held to the bound; the rest continued by
+    /// arrival time.
+    pub timeline_held: u64,
     /// Events dropped because the queue was full.
     pub events_dropped: u64,
 }
@@ -805,6 +808,7 @@ impl Receiver {
             }
             stats.timeline_discontinuities = self.events.timeline.discontinuities(stream.0);
             stats.timeline_clamps = self.events.timeline.clamps(stream.0);
+            stats.timeline_held = self.events.timeline.held(stream.0);
             stats
         })
     }

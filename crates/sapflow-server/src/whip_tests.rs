@@ -517,17 +517,23 @@ async fn audio_run(
     phone.answered(&a.body);
     phone.connect().await;
     let stream = server.app.streams.get(event).expect("claimed");
-    // At least 3 s, and on until a part is out (at most 10 s).
+    // At least 3 s, and on until a part is out (at most 10 s). Each packet
+    // is sent after the last one's 20 ms wait, so any time a step takes
+    // beyond that makes the packets later than their RTP clock.
+    let started = std::time::Instant::now();
+    let mut packets = 0u64;
     for n in 0..500u64 {
         let packet = phone.p.audio((n % 251) as u8);
         if !skip.contains(&n) {
             phone.send(&packet).await;
         }
+        packets += 1;
         phone.receive(Duration::from_millis(20)).await;
         if n >= 150 && stream.has_content() {
             break;
         }
     }
+    let wall = started.elapsed();
     assert!(stream.has_content(), "audio-only Opus reached the playlist");
     let reason = {
         let session = stream.session();
@@ -535,7 +541,21 @@ async fn audio_run(
         recorder.status().reason()
     };
     let location = a.header("location").expect("Location");
-    (reason, server.losses(location))
+    let playlist = stream
+        .lock()
+        .media
+        .as_ref()
+        .map(|m| String::from_utf8_lossy(m).into_owned())
+        .unwrap_or_default();
+    let shown = format!(
+        "{}; {packets} packets ({} ms of RTP time) sent over {} ms; playlist: {} EXT-X-DISCONTINUITY, {} EXT-X-GAP",
+        server.losses(location),
+        packets * 20,
+        wall.as_millis(),
+        playlist.matches("#EXT-X-DISCONTINUITY\n").count(),
+        playlist.matches("#EXT-X-GAP").count()
+    );
+    (reason, shown)
 }
 
 async fn udp_server() -> (Server, PathBuf) {
@@ -567,6 +587,7 @@ async fn a_clean_run_over_udp_stays_complete() {
     let (server, root) = udp_server().await;
     let (reason, losses) = audio_run(&server, 7, "event-whip-clean", &[]).await;
     let _ = std::fs::remove_dir_all(&root);
+    println!("clean UDP run: {losses}");
     assert_eq!(reason, None, "marked by: {losses}");
 }
 
@@ -786,6 +807,7 @@ async fn recorded(events: Vec<Event>, setup: Setup, feed: bool) -> Option<Incomp
                     pts,
                     packet,
                     received: 0,
+                    trace: AudioTrace::default(),
                 }),
                 Media::Loss { .. } | Media::Other(_) => {}
             },

@@ -41,7 +41,7 @@ use sapflow_rtp::receive::{Discontinuity, SkipReason};
 use sapflow_whip::ice::{Kind, classify};
 use sapflow_whip::resource::{self, SessionId};
 use sapflow_whip::router::{InsertError, Router, RouterConfig};
-use sapflow_whip::sdp::{self, AnswerConfig, Offer};
+use sapflow_whip::sdp::{self, AnswerConfig, MediaKind, Offer};
 use sapflow_whip::{Credentials, EndReason, Event, Session, SessionConfig, Tuple};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -86,7 +86,32 @@ pub(crate) enum Item {
         pts: u64,
         packet: Vec<u8>,
         received: usize,
+        /// For the diagnostic when the muxer reports a break.
+        trace: AudioTrace,
     },
+}
+
+/// The audio stream's timeline counters in `sapflow-rtp` as an event was
+/// taken: their changes between two packets say which branch stamped the
+/// second (`sapflow_rtp::timeline`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Timeline {
+    /// Timestamps held to the bound, a little ahead of arrival time.
+    pub held: u64,
+    /// Timestamps held to the bound or continued by arrival time.
+    pub clamps: u64,
+    /// Re-anchors on arrival time and moves to a sender report.
+    pub discontinuities: u64,
+}
+
+/// What the ingest keeps of an Opus packet to explain a break the muxer
+/// reports: the sender's RTP timestamp (48 kHz), the packet's TOC duration
+/// in samples, and the timeline's counters when it was released.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AudioTrace {
+    pub rtp: u32,
+    pub samples: u32,
+    pub timeline: Timeline,
 }
 
 impl Item {
@@ -99,6 +124,13 @@ impl Item {
                 .saturating_add(au.sps.as_ref().map_or(0, Vec::len))
                 .saturating_add(au.pps.as_ref().map_or(0, Vec::len)),
             Self::Audio { packet, .. } => packet.len(),
+        }
+    }
+
+    fn audio_trace(&self) -> Option<(u64, AudioTrace)> {
+        match self {
+            Self::Audio { pts, trace, .. } => Some((*pts, *trace)),
+            Self::Video { .. } => None,
         }
     }
 
@@ -136,6 +168,8 @@ pub(crate) struct LossCounts {
     pub abnormal_ends: AtomicU64,
     /// Ingest updates in which the muxer itself reported media loss.
     pub muxer: AtomicU64,
+    /// The last break the audio-only muxer reported, explained.
+    pub muxer_break: Mutex<Option<String>>,
 }
 
 impl LossCounts {
@@ -170,6 +204,10 @@ impl std::fmt::Display for LossCounts {
         if !any {
             f.write_str("none")?;
         }
+        let last = self.muxer_break.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(detail) = last.as_deref() {
+            write!(f, "; last muxer break: {detail}")?;
+        }
         Ok(())
     }
 }
@@ -203,6 +241,8 @@ pub(crate) struct Feed {
     keyframe: bool,
     /// Which paths marked the recording.
     counts: Arc<LossCounts>,
+    /// The audio timeline's counters as the current event was taken.
+    timeline: Timeline,
 }
 
 /// The ingest task has gone.
@@ -224,6 +264,7 @@ impl Feed {
             skip_video: false,
             keyframe: false,
             counts: Arc::new(LossCounts::default()),
+            timeline: Timeline::default(),
         }
     }
 
@@ -267,7 +308,19 @@ impl Feed {
     }
 
     /// Passes one receiver event on. Loss is marked on the recording here.
+    #[cfg(test)]
     pub(crate) fn offer(&mut self, event: sapflow_rtp::Event) -> Result<(), Gone> {
+        self.push(media(event))
+    }
+
+    /// As [`Feed::offer`], with the audio timeline's counters as the event
+    /// was taken, for the break diagnostic.
+    pub(crate) fn offer_with(
+        &mut self,
+        event: sapflow_rtp::Event,
+        timeline: Timeline,
+    ) -> Result<(), Gone> {
+        self.timeline = timeline;
         self.push(media(event))
     }
 
@@ -300,7 +353,13 @@ impl Feed {
                     received: std::mem::take(&mut self.received),
                 }
             }
-            Media::Audio { pts, packet, lost } => {
+            Media::Audio {
+                pts,
+                packet,
+                lost,
+                rtp,
+                samples,
+            } => {
                 // Silence in place of lost packets: the timeline stays
                 // whole, but the recording is not.
                 if lost {
@@ -311,6 +370,11 @@ impl Feed {
                     pts,
                     packet,
                     received: std::mem::take(&mut self.received),
+                    trace: AudioTrace {
+                        rtp,
+                        samples,
+                        timeline: self.timeline,
+                    },
                 }
             }
             Media::Loss { path, packets } => {
@@ -368,6 +432,9 @@ pub(crate) enum Media {
         packet: Vec<u8>,
         /// Silence the receiver filled in for lost packets.
         lost: bool,
+        /// Its RTP timestamp and TOC duration (48 kHz), for diagnostics.
+        rtp: u32,
+        samples: u32,
     },
     /// Media lost, so the recording is incomplete: sequence numbers never
     /// received within the jitter wait, after NACK and RTX repair
@@ -405,6 +472,8 @@ fn media(event: sapflow_rtp::Event) -> Media {
         E::Audio { frame, pts, .. } => Media::Audio {
             pts,
             lost: frame.kind == FrameKind::Loss,
+            rtp: frame.timestamp,
+            samples: frame.duration,
             packet: frame.data,
         },
         E::Lost { count, .. } => Media::Loss {
@@ -641,8 +710,9 @@ async fn own_udp(
         while let Some((id, event)) = router.poll_event() {
             match event {
                 Event::Media(e) => {
+                    let timeline = audio_timeline(&router, &id);
                     if let Some(feed) = feeds.get_mut(&id) {
-                        if feed.offer(e).is_err() {
+                        if feed.offer_with(e, timeline).is_err() {
                             gone.push(id);
                         } else if feed.take_keyframe_request() {
                             keyframes.push(id);
@@ -688,6 +758,40 @@ async fn own_udp(
             feeds.remove(&id);
         }
     }
+}
+
+/// The session's audio timeline counters now, or zeros.
+fn audio_timeline(router: &Router, id: &SessionId) -> Timeline {
+    router
+        .session(id)
+        .and_then(|s| s.receiver().zip(s.stream(MediaKind::Audio)))
+        .and_then(|(rx, stream)| rx.stats(stream))
+        .map_or_else(Timeline::default, |st| Timeline {
+            held: st.timeline_held,
+            clamps: st.timeline_clamps,
+            discontinuities: st.timeline_discontinuities,
+        })
+}
+
+/// Explains a break the audio-only muxer reported at `pts`, against the
+/// packet before it: the muxer expects each timestamp within 2 ms of the
+/// previous one plus that packet's TOC duration.
+fn explain_break(prev: (u64, AudioTrace), pts: u64, trace: AudioTrace) -> String {
+    let (prev_pts, p) = prev;
+    let expected = prev_pts.saturating_add(u64::from(p.samples) * 15 / 8);
+    let step = i128::from(pts) - i128::from(expected);
+    let delta = |now: u64, before: u64| now.saturating_sub(before);
+    let held = delta(trace.timeline.held, p.timeline.held);
+    let clamps = delta(trace.timeline.clamps, p.timeline.clamps);
+    format!(
+        "step {:+.2} ms (pts {pts}, expected {expected}); sender RTP step {} samples for a {}-sample packet; this packet {} samples; timeline since the last packet: held to the bound +{held}, continued by arrival +{}, discontinuities +{}",
+        step as f64 / 90.0,
+        trace.rtp.wrapping_sub(p.rtp),
+        p.samples,
+        trace.samples,
+        clamps.saturating_sub(held),
+        delta(trace.timeline.discontinuities, p.timeline.discontinuities),
+    )
 }
 
 /// One datagram into the router. Only SRTP and SRTCP the session
@@ -1119,6 +1223,7 @@ async fn ingest(
     if let Err(error) = publication.push(|source, now| configure(source, setup, now)) {
         tracing::warn!(%error, "WHIP ingest setup refused");
     } else {
+        let mut last_audio: Option<(u64, AudioTrace)> = None;
         while let Some(item) = rx.recv().await {
             queued.fetch_sub(item.size(), Ordering::AcqRel);
             let received = item.received();
@@ -1126,16 +1231,27 @@ async fn ingest(
                 tracing::warn!(%error, "dropping WHIP publisher");
                 break;
             }
+            let audio = item.audio_trace();
+            let mut broke = false;
             let pushed = publication.push(|source, now| {
                 let update = feed_item(source, item, now)?;
                 if update.media_loss {
                     counts.muxer.fetch_add(1, Ordering::Relaxed);
+                    broke = true;
                 }
                 Ok(update)
             });
             if let Err(error) = pushed {
                 tracing::warn!(%error, "dropping WHIP publisher");
                 break;
+            }
+            if let Some((pts, trace)) = audio {
+                if broke && let Some(before) = last_audio {
+                    let detail = explain_break(before, pts, trace);
+                    tracing::debug!(%detail, "WHIP audio muxer reported a break");
+                    *counts.muxer_break.lock().unwrap_or_else(|e| e.into_inner()) = Some(detail);
+                }
+                last_audio = Some((pts, trace));
             }
         }
     }
