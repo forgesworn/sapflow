@@ -16,7 +16,7 @@ categories = ["multimedia::video", "network-programming"]
 workspace = true
 
 [dependencies]
-sapflow-core = { path = "../sapflow-core", version = "0.1.0" }
+sapflow-core = { path = "../sapflow-core", version = "=0.2.0-rc.1" }
 bytes = "1.12.1"
 mp4-atom = "0.16.2"
 adts-reader = "0.4.0"

@@ -16,11 +16,11 @@ categories = ["network-programming", "multimedia::video"]
 workspace = true
 
 [dependencies]
-sapflow-core = { path = "../sapflow-core", version = "0.1.0" }
+sapflow-core = { path = "../sapflow-core", version = "=0.2.0-rc.1" }
 # The digest handshake.
 hmac = "0.12.1"
 sha2 = "0.10.9"
 
 [dev-dependencies]
 # tests/flv_ingest.rs: RTMP media into LL-HLS.
-sapflow-hls = { path = "../sapflow-hls" }
+sapflow-hls = { path = "../sapflow-hls", version = "=0.2.0-rc.1" }
