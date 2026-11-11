@@ -82,9 +82,21 @@ fun main(arguments: Array<String>) {
             check(!sink.status.contains("stopped", true)) { sink.status }
             if (tag.video) videoUnits++ else audioUnits++
         }
-        Thread.sleep(500)
+        // Explicit Stop cancels immediately. Let this finite fixture reach the
+        // independent receiver's playout horizon before testing cancellation.
+        val requestedMs = sink.nativeConfig().latencyMs
+        val negotiatedMs = checkNotNull(Regex("negotiated ([0-9]+) ms").find(sink.diagnostics)) {
+            "Missing negotiated latency: ${sink.diagnostics}"
+        }.groupValues[1].toLong()
+        val settleMs = Math.addExact(negotiatedMs, 250L)
+        check(negotiatedMs > 0 && settleMs <= 5000) { "Fixture settle interval exceeds five seconds" }
+        val settleDeadline = System.nanoTime() + settleMs * 1_000_000L
+        while (System.nanoTime() < settleDeadline) {
+            check(sink.status.contains("handshake complete")) { sink.status }
+            Thread.sleep(5)
+        }
         check(sink.status.contains("handshake complete")) { sink.status }
-        println("UDP_LOOP_HANDSHAKE_ENCRYPTED=true offered_video=$videoUnits offered_audio=$audioUnits observed_media=false")
+        println("UDP_LOOP_HANDSHAKE_ENCRYPTED=true offered_video=$videoUnits offered_audio=$audioUnits requested_latency_ms=$requestedMs negotiated_latency_ms=$negotiatedMs settle_ms=$settleMs observed_media=false")
     } finally {
         sink.close(); video.close(); audio.close()
     }
