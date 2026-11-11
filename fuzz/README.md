@@ -317,6 +317,19 @@ SAPFLOW_RTP_CAPTURE=<scratch dir> cargo test -p sapflow-rtp --lib -- --ignored w
 No local cargo-fuzz run of these targets has been made; CI's 60 s per
 target and the nightly run are their first fuzzing.
 
+Still pending for the W1 gate A1.3 in `docs/whip-ingest.md`:
+
+- **The coverage report** showing each target reaches its parser past the
+  length checks. It needs cargo-fuzz and a nightly toolchain, which are not
+  installed on the build hosts used for W1a; CI's fuzz job does not produce
+  one. Until it exists, the only evidence of depth is the seed test above
+  (every SRTP and SRTCP seed authenticates at least once).
+- **Seeds from the W0 browser captures.** The seeds here come from FFmpeg
+  and our builders. The W0 fixtures (`fixtures/whip/w0/`) hold offers,
+  ClientHellos and run summaries but no RTP or SRTP: no DTLS server existed
+  to finish a handshake, so no browser sent media. Browser seeds follow once
+  W2's DTLS completes a handshake and can record the exported keys.
+
 ### Portable recording checkpoints
 
 `recording_checkpoint` exercises the shared bounded native-recording snapshot

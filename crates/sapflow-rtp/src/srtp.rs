@@ -20,6 +20,18 @@
 //! without RTX (OBS) resends on the original SSRC and index; at 5 Mbit/s
 //! that is a hundred or more packets back. An index never received inside
 //! the window is accepted; a duplicate of a received one is refused.
+//!
+//! Stream slots are bounded and never freed: [`Config::max_streams`] (8 by
+//! default) SSRCs for RTP and, separately, for RTCP. A slot is taken by an
+//! SSRC's first authenticated packet and kept for the life of the context,
+//! so once all are taken a packet from a ninth distinct SSRC is refused
+//! with [`SrtpError::TooManyStreams`] for the rest of the session. Slots are
+//! not reused, because forgetting an SSRC's replay window would let old
+//! packets from it be replayed. A WHIP publisher needs at most a video, an
+//! RTX and an audio SSRC.
+//!
+//! Master key identifiers (MKI) are not supported; the DTLS stage refuses a
+//! `use_srtp` extension that asks for one.
 
 mod replay;
 #[cfg(test)]
@@ -221,8 +233,9 @@ pub fn split_keying_material(
 pub struct Config {
     /// Replay window in packets: a multiple of 64 from 64 to 32768.
     pub replay_window: u32,
-    /// SSRCs tracked for RTP, and separately for RTCP, 1 to 64. A packet
-    /// from one more SSRC is refused before any cryptography.
+    /// SSRCs tracked for RTP, and separately for RTCP, 1 to 64. Slots are
+    /// never freed: once they are all taken, a packet from one more SSRC is
+    /// refused before any cryptography for the rest of the session.
     pub max_streams: usize,
 }
 impl Default for Config {

@@ -194,6 +194,9 @@ What Sapflow does with it:
 - **Picks `SRTP_AEAD_AES_128_GCM`** when the client lists it, and otherwise
   `SRTP_AES128_CM_HMAC_SHA1_80`. RFC 5764 lets the server choose from the
   client's list. `SRTP_AEAD_AES_256_GCM` is not in v1.
+- **Refuses a non-empty `srtp_mki`** in the client's `use_srtp` extension.
+  `sapflow-rtp` has no MKI support, so a peer that expects MKI fails at the
+  handshake rather than on its first SRTP packet.
 
 OBS 32.0.4 ([evidence](whip-evidence/w0-firefox-safari-obs-2026-11-10.md))
 sends a 342-byte, single-datagram ClientHello. It differs from Chrome's in

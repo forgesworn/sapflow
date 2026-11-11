@@ -22,7 +22,7 @@ only dependencies are pinned RustCrypto primitives (`aes`, `ctr`,
 | `rtp` | A zero-copy, checked view of an RTP packet: fixed header, CSRCs, padding removed and validated, RFC 8285 one-byte and two-byte extensions with lookup by ID |
 | `rtcp` | Compound and reduced-size RTCP: SR and RR with report blocks, generic NACK, PLI and FIR; SDES, BYE, APP, REMB, transport-cc and unknown types length-checked and skipped |
 | `rtcp::build` | What sapflow sends: RR, SDES CNAME, NACK (losses coalesced into PID and BLP pairs, across the sequence wrap), PLI, FIR, and a compound packet that starts with the RR |
-| `srtp` | `SRTP_AES128_CM_HMAC_SHA1_80` and `SRTP_AEAD_AES_128_GCM`: RFC 3711 key derivation, DTLS-SRTP keying material split by role, unprotect of RTP and RTCP, protect of RTCP, ROC and index estimation, per-SSRC replay windows (1024 by default, configurable), the SRTCP E flag and 31-bit index |
+| `srtp` | `SRTP_AES128_CM_HMAC_SHA1_80` and `SRTP_AEAD_AES_128_GCM`: RFC 3711 key derivation, DTLS-SRTP keying material split by role, unprotect of RTP and RTCP, protect of RTCP, ROC and index estimation, per-SSRC replay windows (1024 by default, configurable), the SRTCP E flag and 31-bit index. No MKI |
 
 ```rust
 use sapflow_rtp::{Config, Inbound, Outbound, Profile, Role, RtpPacket, split_keying_material};
@@ -36,6 +36,18 @@ let mut outbound = Outbound::new(&keys.local)?;
 let len = inbound.unprotect_rtp(&mut datagram)?;
 let packet = RtpPacket::parse(&datagram[..len])?;
 ```
+
+Stream slots are bounded and never freed: 8 SSRCs for RTP and 8 for RTCP
+by default (`Config::max_streams`, up to 64). An SSRC takes a slot with its
+first authenticated packet and keeps it, so a ninth distinct SSRC is
+refused (`SrtpError::TooManyStreams`) for the rest of the session. Freeing
+a slot would forget that SSRC's replay window and let its old packets be
+replayed.
+
+GCM key derivation pads the 96-bit master salt with two zero octets on the
+right, as RFC 7714 section 11 says after erratum 4938. No published vector
+covers this end to end; the first check against a real GCM peer is the DTLS
+stage (W2).
 
 Packets are processed in place in the caller's buffer, and the unprotect
 paths allocate nothing after the context is built. Tags are compared in
