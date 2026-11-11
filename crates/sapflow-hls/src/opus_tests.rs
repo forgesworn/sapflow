@@ -552,18 +552,88 @@ fn a_refused_opus_packet_changes_nothing_even_where_it_would_close_a_part() {
     // close it. Refused for size, it must change nothing.
     assert!(m.part.as_ref().is_some_and(|p| !p.audio.is_empty()));
     m.next_segment.as_mut().expect("segment").bytes = MAX_SEGMENT_BYTES;
-    let before = (observable(&m), state(&m), m.audio_end);
+    let before = (observable(&m), m.internal_state());
     let up = m.push_audio_at(pts, Bytes::from(packet(5760, true)), NOW);
     assert!(matches!(up, Err(MuxError::SegmentTooLarge)), "{up:?}");
-    assert_eq!(before, (observable(&m), state(&m), m.audio_end));
+    assert_eq!(before, (observable(&m), m.internal_state()));
     // A discontinuous timestamp refused for a malformed packet changes
     // nothing either.
-    let before = (observable(&m), state(&m), m.audio_end);
+    let before = (observable(&m), m.internal_state());
     assert!(
         m.push_audio_at(pts + 90_000, Bytes::from_static(&[0xfb, 0]), NOW)
             .is_err()
     );
-    assert_eq!(before, (observable(&m), state(&m), m.audio_end));
+    assert_eq!(before, (observable(&m), m.internal_state()));
+    // The digest sees an admitted packet that changes nothing observable:
+    // a 2.5 ms packet into the open part.
+    m.next_segment.as_mut().expect("segment").bytes = 0;
+    let (seen, inner) = (observable(&m), m.internal_state());
+    m.push_audio_at(pts, Bytes::from(packet(120, true)), NOW)
+        .expect("admitted");
+    assert_eq!(seen, observable(&m));
+    assert_ne!(inner, m.internal_state());
+}
+
+/// The W3b review: copying a borrowed packet before the checks passed every
+/// test. A refused packet, or one the muxer would only drop, is never
+/// copied; an admitted one is copied once.
+#[test]
+fn a_refused_or_dropped_borrowed_opus_packet_is_never_copied() {
+    let copies = std::cell::Cell::new(0);
+    let copy = |p: &[u8]| {
+        copies.set(copies.get() + 1);
+        Bytes::copy_from_slice(p)
+    };
+    let good = packet(960, true);
+    let malformed: &[u8] = &[0xfb, 0];
+    // Audio-only.
+    let mut m = audio_only(MuxerConfig::default(), 2);
+    m.push_opus_slice_at_with(0, &good, NOW, copy)
+        .expect("admitted");
+    assert_eq!(copies.get(), 1);
+    for (pts, p) in [(1800, malformed), (1800, &[][..]), (-1, &good[..])] {
+        assert!(m.push_opus_slice_at_with(pts, p, NOW, copy).is_err());
+    }
+    m.next_segment.as_mut().expect("segment").bytes = MAX_SEGMENT_BYTES;
+    assert!(matches!(
+        m.push_opus_slice_at_with(1800, &good, NOW, copy),
+        Err(MuxError::SegmentTooLarge)
+    ));
+    assert_eq!(copies.get(), 1, "audio-only refusals copied nothing");
+    // Opus into an AAC muxer.
+    let mut aac = Muxer::audio_only(MuxerConfig::default(), tests::aac()).expect("AAC");
+    assert!(matches!(
+        aac.push_opus_slice_at_with(0, &good, NOW, copy),
+        Err(MuxError::InvalidAudio)
+    ));
+    // Video-led, through both entry points.
+    let mut m = av_muxer();
+    m.push_opus_slice_with(0, &good, copy).expect("admitted");
+    m.push_opus_slice_at_with(1800, &good, NOW, copy)
+        .expect("admitted");
+    assert_eq!(copies.get(), 3);
+    assert!(m.push_opus_slice_with(3600, malformed, copy).is_err());
+    // Dropped, not refused: before the stream's start.
+    m.push_opus_slice_with(-1800, &good, copy)
+        .expect("dropped quietly");
+    m.next_segment.as_mut().expect("segment").bytes = MAX_SEGMENT_BYTES;
+    assert!(matches!(
+        m.push_opus_slice_with(3600, &good, copy),
+        Err(MuxError::SegmentTooLarge)
+    ));
+    // A video-only muxer drops Opus without copying it.
+    let mut video_only = Muxer::new(MuxerConfig::default(), tests::video(), None);
+    video_only
+        .push_video(0, 0, true, Bytes::from_static(&[1]), NOW)
+        .expect("IDR");
+    video_only
+        .push_opus_slice_with(0, &good, copy)
+        .expect("dropped quietly");
+    assert_eq!(
+        copies.get(),
+        3,
+        "video-led refusals and drops copied nothing"
+    );
 }
 
 #[test]
@@ -830,6 +900,206 @@ fn video_led_opus_keeps_timestamps_and_caps_a_gap_at_the_packets_own_duration() 
         .map(|s| s.duration)
         .collect();
     assert_eq!(durations, [960, 1008, 912]);
+}
+
+/// Audio-only Opus with timestamps a timeline slews against the sample
+/// count: `ppm` fast (negative: slow), `samples` per packet, 120 s. Returns
+/// the times of the discontinuities, in seconds.
+fn slewed_audio_only(ppm: f64, samples: u32) -> Vec<f64> {
+    let mut m = audio_only(MuxerConfig::default(), 2);
+    let step = ticks(samples) as f64 * (1.0 + ppm * 1e-6);
+    let mut losses = Vec::new();
+    let mut i = 0i64;
+    loop {
+        let pts = (i as f64 * step) as i64;
+        if pts > 120 * 90_000 {
+            break;
+        }
+        let up = m
+            .push_audio_at(pts, Bytes::from(packet(samples, true)), NOW)
+            .expect("Opus");
+        if up.media_loss {
+            losses.push(pts as f64 / 90_000.0);
+        }
+        i += 1;
+    }
+    losses
+}
+
+/// The One timeline section slews audio at up to 500 ppm. Timestamps that
+/// drift that way against the run's sample count are not breaks.
+#[test]
+fn audio_only_opus_carries_timeline_slew_without_discontinuities() {
+    let mut broken = Vec::new();
+    for ppm in [100.0, 500.0, -100.0, -500.0] {
+        for samples in [960u32, 120, 2880, 5760] {
+            let losses = slewed_audio_only(ppm, samples);
+            println!(
+                "slew {ppm} ppm, {} ms packets: {} discontinuities in 120 s, first at {:?} s",
+                samples as f64 / 48.0,
+                losses.len(),
+                losses.first()
+            );
+            if !losses.is_empty() {
+                broken.push((ppm, samples, losses.len()));
+            }
+        }
+    }
+    assert!(broken.is_empty(), "{broken:?}");
+}
+
+/// Pushes a stream `ppm` fast, 400 packets, through `edit`,
+/// which sees each packet's index and timestamp and may move it, replace it
+/// with a malformed packet, or drop it (`None`). Returns the packets after
+/// which media loss was reported.
+fn breaks_under_slew(
+    ppm: f64,
+    samples: u32,
+    edit: impl Fn(usize, i64) -> Option<(i64, Vec<u8>)>,
+) -> Vec<usize> {
+    let mut m = audio_only(MuxerConfig::default(), 2);
+    let step = ticks(samples) as f64 * (1.0 + ppm * 1e-6);
+    let mut losses = Vec::new();
+    for i in 0..400usize {
+        let Some((pts, p)) = edit(i, (i as f64 * step) as i64) else {
+            continue;
+        };
+        match m.push_audio_at(pts, Bytes::from(p), NOW) {
+            Ok(up) if up.media_loss => losses.push(i),
+            Ok(_) => {}
+            Err(_) => assert_eq!(i, 200, "only the edited packet may be refused"),
+        }
+    }
+    losses
+}
+
+/// A real break is still reported while the timeline slews (500 ppm): a
+/// missing, repeated or non-increasing packet. The bound itself, without
+/// slew: a step more than 2 ms (180 ticks) from the previous timestamp plus
+/// that packet's duration. Tightest at 2.5 ms packets, only 225 ticks long.
+#[test]
+fn audio_only_opus_reports_real_breaks_while_slewing() {
+    for samples in [120u32, 960] {
+        let good = || packet(samples, true);
+        let d = ticks(samples);
+        let at = |pts: i64| Some((pts, good()));
+        // Unedited: no break.
+        assert_eq!(breaks_under_slew(500.0, samples, |_, pts| at(pts)), []);
+        // Packet 200 missing: packet 201 is a packet late.
+        assert_eq!(
+            breaks_under_slew(500.0, samples, |i, pts| (i != 200).then(|| (pts, good()))),
+            [201],
+            "{samples}"
+        );
+        // Packet 200 repeating 199's timestamp, or stepping back past it:
+        // a break into it and another out of it.
+        for back in [d, 2 * d, d + 1] {
+            assert_eq!(
+                breaks_under_slew(500.0, samples, |i, pts| at(if i == 200 {
+                    pts - back
+                } else {
+                    pts
+                })),
+                [200, 201],
+                "{samples} {back}"
+            );
+        }
+        // Without slew, every packet from 200 on moved by up to 180 ticks
+        // either way is carried; by 181, packet 200 is a break and the rest
+        // carry on. (Slew adds up to a tick to a step.)
+        for off in [180, -180] {
+            assert_eq!(
+                breaks_under_slew(0.0, samples, |i, pts| at(if i >= 200 {
+                    pts + off
+                } else {
+                    pts
+                })),
+                []
+            );
+        }
+        for off in [181, -181] {
+            assert_eq!(
+                breaks_under_slew(0.0, samples, |i, pts| at(if i >= 200 {
+                    pts + off
+                } else {
+                    pts
+                })),
+                [200],
+                "{samples} {off}"
+            );
+        }
+        // A refused (malformed) packet is missing media: the next is late.
+        assert_eq!(
+            breaks_under_slew(500.0, samples, |i, pts| Some((
+                pts,
+                if i == 200 { vec![0xfb, 0] } else { good() }
+            ))),
+            [201]
+        );
+    }
+}
+
+/// Video-led Opus at `ppm`, `samples` per packet, 30 s beside 30 fps video:
+/// every audio sample duration in the closed parts.
+fn video_led_durations(ppm: f64, samples: u32) -> Vec<u32> {
+    let mut m = Muxer::with_audio_config(
+        MuxerConfig::default(),
+        Some(tests::video()),
+        Some(opus(2)),
+        None,
+    )
+    .expect("A/V");
+    let mut watch = Watch::default();
+    let step = ticks(samples) as f64 * (1.0 + ppm * 1e-6);
+    let mut frame = 0i64;
+    let mut i = 0i64;
+    while frame < 900 {
+        let audio = (i as f64 * step) as i64;
+        while frame * 3000 <= audio && frame < 900 {
+            m.push_video(
+                frame * 3000,
+                frame * 3000,
+                frame % 30 == 0,
+                Bytes::from_static(&[1]),
+                NOW,
+            )
+            .expect("video");
+            frame += 1;
+        }
+        m.push_audio(audio, Bytes::from(packet(samples, true)))
+            .expect("Opus");
+        watch.observe(&m, audio);
+        i += 1;
+    }
+    watch.audio()
+}
+
+/// Video-led Opus sample durations come from the timestamps, as AAC's do,
+/// because the shared timeline's slew is what keeps audio with video. With
+/// exact timestamps they are exactly each packet's TOC duration; slewed at
+/// up to 500 ppm either way, they stay within that slew plus one sample of
+/// rounding of it.
+#[test]
+fn video_led_opus_durations_follow_the_timestamps_within_the_slew() {
+    for samples in [120u32, 960, 2880, 5760] {
+        let exact = video_led_durations(0.0, samples);
+        assert!(exact.len() > 100);
+        assert!(exact.iter().all(|&d| d == samples), "{samples}");
+        let bound = (f64::from(samples) * 500e-6).ceil() as i64 + 1;
+        for ppm in [500.0, -500.0] {
+            let slewed = video_led_durations(ppm, samples);
+            let worst = slewed
+                .iter()
+                .map(|&d| (i64::from(d) - i64::from(samples)).abs())
+                .max()
+                .expect("samples");
+            println!(
+                "video-led {} ms at {ppm} ppm: largest difference from the TOC duration {worst} samples (bound {bound})",
+                f64::from(samples) / 48.0
+            );
+            assert!(worst <= bound, "{samples} {ppm}: {worst}");
+        }
+    }
 }
 
 #[test]

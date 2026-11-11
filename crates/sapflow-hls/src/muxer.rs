@@ -365,6 +365,10 @@ struct AudioRun {
     input_origin: i64,
     samples: i64,
     next_sample: i64,
+    /// Opus only: where the next packet's timestamp should be, the last
+    /// packet's timestamp plus its TOC duration. AAC compares each frame
+    /// with the run's origin and sample count instead.
+    next_input: Option<i64>,
 }
 
 /// The segmenter for one stream: media samples in, parts and segments out, with
@@ -573,7 +577,120 @@ impl Muxer {
         }
     }
 
-    /// The current video configuration, or `None` for an audio-only epoch.
+    /// Every field of the muxer as text, for checks that a refused push
+    /// changes nothing: sealed and pending media by id, timing and length
+    /// rather than by content. For tests, and for the fuzz targets through
+    /// the `testing` feature; not part of the API.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn internal_state(&self) -> String {
+        // No `..`: a new field must be added here, or this stops compiling.
+        let Self {
+            cfg,
+            video,
+            audio,
+            audio_run,
+            audio_end,
+            init,
+            fragment_quota,
+            fragment_refused,
+            epoch_first_part_id,
+            pending_video,
+            pending_audio,
+            entries,
+            media_sequence,
+            parts,
+            next_segment,
+            part,
+            next_part_id,
+            timing,
+            learning,
+            target,
+            offset,
+            rebase_to,
+            presented_end,
+            audio_floor,
+            discontinuity_next,
+            discontinuity_sequence,
+            breaks,
+            hold_gap,
+        } = self;
+        let pending = |p: &Option<Pending>| {
+            p.as_ref()
+                .map(|p| (p.dts, p.cts, p.sync, p.data.len(), p.samples))
+        };
+        let sample = |s: &Sample| (s.duration, s.cts, s.sync, s.data.len());
+        let sealed = |p: &Arc<Part>| {
+            (
+                p.initialization.id,
+                p.id,
+                p.duration,
+                p.span,
+                p.independent,
+                p.data.len(),
+            )
+        };
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|e| match e {
+                Entry::Gap { duration } => (None, *duration, Vec::new()),
+                Entry::Segment(s) => (
+                    Some((
+                        s.initialization.id,
+                        s.id,
+                        s.start,
+                        s.discontinuity,
+                        s.data.len(),
+                    )),
+                    s.duration,
+                    s.parts.iter().map(sealed).collect(),
+                ),
+            })
+            .collect();
+        let parts: Vec<_> = parts.iter().map(sealed).collect();
+        let next_segment = next_segment.as_ref().map(|s| {
+            (
+                s.initialization.id,
+                s.id,
+                s.start_dts,
+                s.start,
+                s.wall_origin,
+                s.parts.iter().map(sealed).collect::<Vec<_>>(),
+                s.bytes,
+                s.audio_bytes,
+                s.discontinuity,
+            )
+        });
+        let part = part.as_ref().map(|p| {
+            (
+                p.id,
+                p.start_dts,
+                p.video.iter().map(sample).collect::<Vec<_>>(),
+                p.video_base,
+                p.audio.iter().map(sample).collect::<Vec<_>>(),
+                p.audio_times.clone(),
+                p.independent,
+            )
+        });
+        let learning: Vec<_> = learning
+            .iter()
+            .map(|f| (f.dts, f.next_dts, f.cts, f.sync, f.data.len()))
+            .collect();
+        format!(
+            "{cfg:?} {video:?} {audio:?} {audio_run:?} {audio_end:?} {} {} \
+             {fragment_refused} {epoch_first_part_id} {:?} {:?} {entries:?} \
+             {media_sequence} {parts:?} {next_segment:?} {part:?} {next_part_id} \
+             {timing:?} {learning:?} {target:?} {offset} {rebase_to:?} \
+             {presented_end:?} {audio_floor} {discontinuity_next} \
+             {discontinuity_sequence} {breaks} {hold_gap}",
+            init.id,
+            init.data.len(),
+            pending(pending_video),
+            pending(pending_audio),
+        ) + &format!(" {:?}", fragment_quota.as_ref().map(|q| q.used()))
+    }
+
+    /// The current video configuration, or `None` for an audio-only epoch.    /// The current video configuration, or `None` for an audio-only epoch.
     pub fn video(&self) -> Option<&H264Config> {
         self.video.as_ref()
     }
@@ -1323,11 +1440,15 @@ impl Muxer {
     /// a negative or unrepresentable timestamp, a packet the part target
     /// cannot hold, or one that would carry the segment past its byte limit
     /// leaves the muxer as it was, and `payload` is only called (to copy a
-    /// borrowed packet) once the packet is admitted. Then, as for AAC, a
-    /// timestamp more than 2 ms off the sample count starts a discontinuous
-    /// run, and a packet the open part has no room for closes that part
-    /// first. A fragment budget failure while sealing is the one exception:
-    /// it fences the muxer, as it does for AAC.
+    /// borrowed packet) once the packet is admitted. Then a timestamp more
+    /// than 2 ms from the previous one plus that packet's TOC duration (a
+    /// missing, repeated or backward packet) starts a discontinuous run, and
+    /// a packet the open part has no room for closes that part first.
+    /// Comparing step by step carries a timeline's slew instead of measuring
+    /// it against the whole run: decode time is the sample count either way,
+    /// so the timestamps are only there to find breaks. A fragment budget
+    /// failure while sealing is the one exception: it fences the muxer, as it
+    /// does for AAC.
     fn push_opus_audio_only(
         &mut self,
         pts: i64,
@@ -1346,10 +1467,14 @@ impl Muxer {
             i64::try_from(i128::from(n) * scale / rate).map_err(|_| MuxError::Timestamp)
         };
         // Plan.
-        let discontinuous = self.audio_run.as_ref().is_some_and(|run| {
-            let expected = i128::from(run.input_origin) + i128::from(run.samples) * scale / rate;
-            (i128::from(pts) - expected).abs() > 180
-        });
+        let discontinuous = self
+            .audio_run
+            .as_ref()
+            .and_then(|run| run.next_input)
+            .is_some_and(|expected| (i128::from(pts) - i128::from(expected)).abs() > 180);
+        let next_input = pts
+            .checked_add(ticks(samples)?)
+            .ok_or(MuxError::Timestamp)?;
         let (sample, run_samples) = match &self.audio_run {
             Some(run) if !discontinuous => (run.next_sample, run.samples),
             _ => {
@@ -1418,6 +1543,7 @@ impl Muxer {
                 input_origin: pts,
                 samples: 0,
                 next_sample: sample,
+                next_input: None,
             });
         }
         if early {
@@ -1470,6 +1596,7 @@ impl Muxer {
         if let Some(run) = self.audio_run.as_mut() {
             run.next_sample = next_sample;
             run.samples = total;
+            run.next_input = Some(next_input);
         }
         let end_segment =
             ticks_to_duration(end - seg_start, VIDEO_TIMESCALE) >= self.cfg.segment_min;
@@ -1492,17 +1619,58 @@ impl Muxer {
         packet: &[u8],
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        self.push_opus_slice_at_with(pts, packet, now, Bytes::copy_from_slice)
+    }
+
+    /// [`Muxer::push_audio`] for an Opus packet the caller has borrowed:
+    /// refused before it is copied, and not copied at all when it would only
+    /// be dropped (no audio track, or a timestamp before the stream starts).
+    pub(crate) fn push_opus_slice(&mut self, pts: i64, packet: &[u8]) -> Result<(), MuxError> {
+        self.push_opus_slice_with(pts, packet, Bytes::copy_from_slice)
+    }
+
+    /// The one place a borrowed audio-only Opus packet is copied.
+    pub(crate) fn push_opus_slice_at_with(
+        &mut self,
+        pts: i64,
+        packet: &[u8],
+        now: SystemTime,
+        copy: impl FnOnce(&[u8]) -> Bytes,
+    ) -> Result<Update, MuxError> {
         self.check_fragment_admission()?;
         if !matches!(self.audio, Some(AudioConfig::Opus(_))) {
             return Err(MuxError::InvalidAudio);
         }
         if self.video.is_some() {
-            opus_packet(packet).ok_or(MuxError::InvalidAudio)?;
-            self.check_audio_admission(pts, packet.len())?;
-            self.push_audio(pts, Bytes::copy_from_slice(packet))?;
+            self.push_opus_slice_with(pts, packet, copy)?;
             return Ok(Update::default());
         }
-        self.push_opus_audio_only(pts, packet, || Bytes::copy_from_slice(packet), now)
+        self.push_opus_audio_only(pts, packet, || copy(packet), now)
+    }
+
+    /// The one place a borrowed video-led Opus packet is copied: the same
+    /// checks as [`Muxer::push_audio`], in the same order, first.
+    pub(crate) fn push_opus_slice_with(
+        &mut self,
+        pts: i64,
+        packet: &[u8],
+        copy: impl FnOnce(&[u8]) -> Bytes,
+    ) -> Result<(), MuxError> {
+        self.check_fragment_admission()?;
+        self.check_audio_admission(pts, packet.len())?;
+        if self.video.is_none() {
+            return Ok(());
+        }
+        match self.audio {
+            None => return Ok(()),
+            Some(AudioConfig::Opus(_)) => {}
+            Some(AudioConfig::Aac(_)) => return Err(MuxError::InvalidAudio),
+        }
+        opus_packet(packet).ok_or(MuxError::InvalidAudio)?;
+        if pts < 0 || pts.saturating_add(self.offset) < 0 {
+            return Ok(());
+        }
+        self.push_audio(pts, copy(packet))
     }
 
     /// Explicit audio-only mode. Each accepted AAC-LC frame contributes exactly
@@ -1564,6 +1732,7 @@ impl Muxer {
                 input_origin: pts,
                 samples: 0,
                 next_sample,
+                next_input: None,
             });
         }
         let run = self.audio_run.as_ref().ok_or(MuxError::Timestamp)?;

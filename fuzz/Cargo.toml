@@ -17,7 +17,7 @@ libfuzzer-sys = "0.4.13"
 httparse = "1.10.1"
 bytes = "1.12.1"
 sapflow-core = { path = "../crates/sapflow-core" }
-sapflow-hls = { path = "../crates/sapflow-hls" }
+sapflow-hls = { path = "../crates/sapflow-hls", features = ["testing"] }
 sapflow-rtmp = { path = "../crates/sapflow-rtmp" }
 sapflow-srt = { path = "../crates/sapflow-srt" }
 sapflow-rtp = { path = "../crates/sapflow-rtp", features = ["testing"] }

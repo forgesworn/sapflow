@@ -605,12 +605,24 @@ feeds it yet; W3c connects `sapflow-whip` to it.
   (120 samples are 225), so sample durations and the conversion to the
   shared timeline are exact.
 - **Video-led audio.** As for AAC, a sample lasts until the next packet's
-  timestamp, jitter included. A gap of more than three of the packet's own
-  durations (1024 samples for AAC) gives it its own duration instead.
+  timestamp, jitter and slew included, not for its TOC duration: the
+  timeline slews audio by up to 500 ppm to keep it with the video, and TOC
+  durations would throw that away. With exact timestamps every sample is
+  exactly its TOC duration; slewed 500 ppm either way, each stays within
+  that slew plus one sample (at most 4 samples for a 120 ms packet). A gap
+  of more than three of the packet's own durations (1024 samples for AAC)
+  gives it its own duration instead.
 - **Audio-only.** As for AAC, decode time is an exact count of samples and
-  timestamps only detect a break: one more than 2 ms off the count (missing,
-  repeated or backward) starts a discontinuous run reported as media loss.
-  The part target is fixed from the first packet's duration, as AAC's comes
+  timestamps only find breaks. Unlike AAC, which measures each frame against
+  the run's origin and sample count, each Opus packet is compared with the
+  previous timestamp plus that packet's TOC duration: more than 2 ms (180
+  ticks) off starts a discontinuous run reported as media loss. A missing,
+  repeated or non-increasing packet is a break, and so is the packet after
+  a refused one, whose duration is missing. A timeline's slew is carried
+  step by step: timestamps drifting smoothly at up to 500 ppm either way
+  give no discontinuity in 120 s with 2.5 to 120 ms packets, where the
+  run-origin rule gave the first at 20.1 s at 100 ppm and at 4.0 s at
+  500 ppm (five and 29 in 120 s). The part target is fixed from the first packet's duration, as AAC's comes
   from its frame: 20 ms packets make 200 ms parts under a 234 ms target. It
   is never under 120 ms, the longest valid packet, so every packet fits a
   part of its own; a `part_min` that would give less gives 120 ms parts. A
@@ -661,6 +673,12 @@ in ISO Base Media File Format", version 0.6.8:
 
 FFmpeg and both browsers decoded the output without them. Whether to add
 them is open.
+
+Video-led sample durations also depart from section 4.3.4, which makes a
+sample's duration its frames' total: they follow the timestamps (see
+Video-led audio above), so a slewing timeline moves them off the TOC
+duration by up to the slew plus a sample. No player has been tried on a
+slewed stream.
 
 **FFmpeg decode.** sapflow's own init segment and parts, built in a test
 (`write_opus_evidence` in `opus_real_tests.rs`) from real Opus packets, as
@@ -744,19 +762,10 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
 
 **Open after W3b.**
 
-- W3c: audio-only Opus keeps AAC's 2 ms tolerance between each timestamp
-  and the run's sample count, which a slewed timeline drifts against. Measured
-  with 20 ms packets whose timestamps run 100 ppm fast: the first
-  discontinuity at 20.1 s and five in 120 s; at 500 ppm, the timeline's
-  limit, the first at 4.0 s and 29 in 120 s. Each one is reported as media
-  loss, which marks the recording incomplete. A fix would compare each
-  timestamp with the previous one plus its packet's duration, carrying the
-  drift, instead of with the run's origin.
-- W3c: video-led Opus sample durations come from the gaps between
-  timestamps, as AAC's do, not from each packet's TOC duration, which is
-  used only when the next timestamp leaves a gap of more than three
-  packets.
-- For the user: `RuleCheck::with_live_window` (and `check-playlist.py
+- Settled after W3b: audio-only Opus carries a timeline's slew (see
+  Audio-only above), and video-led Opus keeps timestamp durations (see
+  Video-led audio above).
+- Next, and needing the user's agreement: `RuleCheck::with_live_window` (and `check-playlist.py
   --live-window`) checks RFC 8216bis 6.2.2's rule that a segment is not
   removed if the playlist left would last less than three target
   durations. Count-based eviction already breaks it for AAC, without Opus:
