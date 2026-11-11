@@ -2097,6 +2097,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "der",
+ "ecdsa",
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "p256",
