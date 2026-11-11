@@ -632,7 +632,8 @@ feeds it yet; W3c connects `sapflow-whip` to it.
   refuses the audio-only Opus epoch up front (`InvalidAudio`). A later,
   longer packet that the open part has no room for closes only that part,
   short but `INDEPENDENT=YES`, which RFC 8216bis draft 19 section 4.4.4.9
-  exempts from the 85% floor; the segment carries on. (Closing the segment
+  exempts from the 85% floor (`RuleCheck` allows that only where every part
+  is independent, as in audio-only); the segment carries on. (Closing the segment
   too, as W3b first did, collapsed the count-limited window: after a 20 ms
   first packet, 120 ms packets made 0.12 s segments and a 2.88 s window. Now
   they make 1.08 s segments and a 25.9 s window.) Every refusal is made
@@ -768,15 +769,18 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
 - Settled after W3b: audio-only Opus carries a timeline's slew (see
   Audio-only above), and video-led Opus keeps timestamp durations (see
   Video-led audio above).
-- Next, and needing the user's agreement: `RuleCheck::with_live_window` (and `check-playlist.py
-  --live-window`) checks RFC 8216bis 6.2.2's rule that a segment is not
-  removed if the playlist left would last less than three target
-  durations. Count-based eviction already breaks it for AAC, without Opus:
-  with `segment_count` 8 the epoch regression evicts to 5.40 s against 6 s,
-  and at the default 24, a publisher reconnecting every 10 AAC frames leaves
-  5.12 s. The check is therefore opt-in and is not in the fuzz targets.
-  Duration-aware eviction would fix it, but would change AAC output in
-  those cases, including the `epochs` golden digest.
+- Settled after W3b, with the user's agreement: RFC 8216bis 6.2.2's live
+  window. A segment is no longer removed if the playlist left would last
+  less than three target durations, as printed, up to 256 entries and
+  64 MiB of media beyond `segment_count`; past either cap, removal goes on.
+  Count-only eviction broke it for AAC: with `segment_count` 8 the epoch
+  regression fell to 5.40 s against 6 s (now 6.27 s, nine entries at most),
+  and at the default 24, a publisher reconnecting every 10 AAC frames left
+  5.12 s (now 6.19 s, 29 entries at most). `RuleCheck` and
+  `check-playlist.py` check it by default, and so do the `ts_ingest`,
+  `flv_ingest`, `muxer_timing` and `opus_packaging` fuzz targets. The
+  `epochs` golden digest changed with it: that scenario now keeps one more
+  1 s segment.
 - The departures from the encapsulation listed above, and the cause of the
   312 click.
 - Safari, iOS and Android with sapflow's packaging, which need the user's

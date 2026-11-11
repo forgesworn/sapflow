@@ -14,7 +14,7 @@ git clone --depth 1 --branch v2.4.0  https://github.com/bluenviron/gohlslib.git
 |------|-------------------|---------|
 | `EXT-X-TARGETDURATION` must not change during a stream, and every segment's `EXTINF`, rounded to the nearest second, must be at most it. gohlslib raises it whenever a segment runs long, which Safari does not accept; sapflow fixes it once and breaks the segment instead (see [Target duration and breaks](#target-duration-and-breaks)). | `muxer_stream.go` `targetDuration`, `rotateSegments` | `sapflow_hls::TargetDuration`, `Muxer::break_stream` |
 | No part may be longer than `PART-TARGET`, every part but the last of its segment must be at least 85% of it, and `PART-TARGET` must not change during a stream (see [Part timing](#part-timing) for the wording and how sapflow keeps it). gohlslib reads the rule as 85% of the longest part and recomputes `PART-TARGET` as the longest part in the window at every part, only logging when it changes, so one long frame raises it; do not copy that. | `muxer_segmenter.go` `findCompatiblePartDuration`, `fmp4AdjustPartDuration`; `muxer_stream.go` `partTargetDuration` | `sapflow_hls::PartTiming`, `Muxer::place_video` |
-| The LL-HLS playlist starts with seven gap segments (same duration as the first real one); iOS needs them. This is why mediamtx refuses fewer than 7 segments. The gaps count towards the window, so a seven-entry window rotates one out and serves six beside its first segment, as gohlslib does. | `muxer_stream.go` `rotateSegments` | M1 |
+| The LL-HLS playlist starts with seven gap segments (same duration as the first real one); iOS needs them. This is why mediamtx refuses fewer than 7 segments. The gaps count towards the window, so a seven-entry window rotates one out and serves six beside its first segment, as gohlslib does. Unlike gohlslib, sapflow keeps more than its count while removing one would leave the playlist lasting less than three target durations (RFC 8216bis 6.2.2), up to 256 entries and 64 MiB beyond the count. | `muxer_stream.go` `rotateSegments` | M1 |
 | Blocking reload: a request with `_HLS_msn` beyond last + 1, or older than the window, gets 400; otherwise it waits until that part exists. `_HLS_part` without `_HLS_msn` is 400. | `muxer_stream.go` `handleMediaPlaylist` | M1 |
 | The reference uses `PART-HOLD-BACK` at 2.5 x part target; Sapflow uses 3 x to meet [Apple authoring specification §14.3](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices/). `CAN-BLOCK-RELOAD=YES`; Sapflow does not offer delta updates. | `generateMediaPlaylistFMP4` | `sapflow_hls::playlist::media` |
 | Segments are cut only on a keyframe once the minimum duration has passed, so segment length follows the encoder's keyframe interval. | `fmp4WriteSample` | M1 |
@@ -30,7 +30,9 @@ Duration, and at least 85% of it, except for the last Partial Segment of a
 Parent Segment. Draft 19 also exempts `INDEPENDENT=YES` parts. sapflow relies
 on that only for audio-only Opus, where a packet too long for the open part
 closes it early (Apple's players do not play Opus in HLS), and the checks
-below allow it for independent parts. `PART-TARGET` (4.4.3.7) is treated like
+below allow it only in a render whose every part is independent (audio-only).
+A short video part with a keyframe would pass the draft too, but sapflow
+never cuts one and the checks hold video to Apple's stricter rule. `PART-TARGET` (4.4.3.7) is treated like
 `EXT-X-TARGETDURATION`: fixed for the life of the stream. Safari on macOS
 refused a Larix stream that broke all three (`PART-TARGET` climbed to
 0.534 s while its parts stayed 0.2 s; `docs/interop.md`); which one it
