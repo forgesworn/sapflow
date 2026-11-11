@@ -263,13 +263,18 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
 }
 
 /// Checks the renders of one stream's media playlist against the rules a
-/// client holds them to (RFC 8216bis 4.4.3.1, 4.4.3.3, 4.4.3.7, 4.4.4.9):
+/// client holds them to (RFC 8216bis 4.4.3.1, 4.4.3.3, 4.4.3.7, 4.4.4.9,
+/// 6.2.2):
 ///
 /// - `EXT-X-TARGETDURATION` and `PART-TARGET` never change;
 /// - every `EXTINF`, rounded to the nearest second, is at most the target;
 /// - no part is longer than `PART-TARGET`, and every part but the last of
 ///   its segment is at least 85% of it (the last part after the final
-///   `EXTINF` is exempt: it may yet be the last of its segment);
+///   `EXTINF` is exempt: it may yet be the last of its segment), unless it
+///   is `INDEPENDENT=YES`, which 4.4.4.9 exempts;
+/// - with [`RuleCheck::with_live_window`], once segments have been removed
+///   (`EXT-X-MEDIA-SEQUENCE` above 0), the segments listed last at least
+///   three target durations (6.2.2);
 /// - an `EXT-X-DISCONTINUITY` sits before a segment's parts, never among
 ///   them, and every media sequence number keeps one discontinuity
 ///   sequence number from render to render.
@@ -283,6 +288,7 @@ pub struct RuleCheck {
     discontinuity: std::collections::BTreeMap<u64, u64>,
     media_identity: std::collections::BTreeMap<u64, (String, String)>,
     first_msn: Option<u64>,
+    live_window: bool,
 }
 
 /// A decimal with up to 5 places, in units of 0.00001.
@@ -297,6 +303,18 @@ fn fixed5(v: &str) -> Result<u64, String> {
 }
 
 impl RuleCheck {
+    /// A check that also holds every render to RFC 8216bis 6.2.2's live
+    /// window: a server must not remove a segment if the playlist left would
+    /// last less than three target durations. Opt-in because count-based
+    /// eviction with a small `MuxerConfig::segment_count` and short
+    /// segments can break it (see `docs/whip-ingest.md`).
+    pub fn with_live_window() -> Self {
+        Self {
+            live_window: true,
+            ..Self::default()
+        }
+    }
+
     /// Checks one more render, returning a description of the first rule it
     /// breaks. Rules that span renders (the targets, and what each media
     /// sequence number points at) are held against the renders seen by earlier
@@ -324,13 +342,15 @@ impl RuleCheck {
         if *self.target.get_or_insert(target) != target {
             return Err(format!("TARGETDURATION changed to {target}"));
         }
-        let parts = |run: &[u64], open: bool| -> Result<(), String> {
-            for (i, &d) in run.iter().enumerate() {
+        let first_msn = msn;
+        let mut listed = 0u64;
+        let parts = |run: &[(u64, bool)], open: bool| -> Result<(), String> {
+            for (i, &(d, independent)) in run.iter().enumerate() {
                 if d > part_target {
                     return Err(format!("part {d} longer than PART-TARGET {part_target}"));
                 }
                 let last = i + 1 == run.len();
-                if !last && d * 100 < part_target * 85 {
+                if !last && !independent && d * 100 < part_target * 85 {
                     let what = if open { "open segment" } else { "segment" };
                     return Err(format!("part {d} under 85% of {part_target} ({what})"));
                 }
@@ -361,7 +381,10 @@ impl RuleCheck {
                 }
             }
             if let Some(rest) = l.strip_prefix("#EXT-X-PART:DURATION=") {
-                run.push(fixed5(rest.split(',').next().unwrap_or_default())?);
+                run.push((
+                    fixed5(rest.split(',').next().unwrap_or_default())?,
+                    rest.split(',').any(|a| a == "INDEPENDENT=YES"),
+                ));
             } else if l == "#EXT-X-DISCONTINUITY" {
                 if !run.is_empty() {
                     return Err(format!("discontinuity among the parts of segment {msn}"));
@@ -371,6 +394,7 @@ impl RuleCheck {
                 parts(&run, false)?;
                 run.clear();
                 let d = fixed5(rest.trim_end_matches(','))?;
+                listed += d;
                 // Rounded to the nearest second, halves up.
                 if (d + 50_000) / 100_000 > target {
                     return Err(format!(
@@ -385,6 +409,11 @@ impl RuleCheck {
                 pending_uri = Some(msn);
                 msn += 1;
             }
+        }
+        if self.live_window && first_msn > 0 && listed < target * 3 * 100_000 {
+            return Err(format!(
+                "segments removed down to {listed}, under three TARGETDURATIONs of {target}"
+            ));
         }
         parts(&run, true)
     }
@@ -575,6 +604,43 @@ mod tests {
                 crate::PartLookup::Found(_)
             ));
         }
+    }
+
+    #[test]
+    fn rule_check_exempts_independent_parts_and_opts_into_the_live_window() {
+        let head = |msn: u64| {
+            format!(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-PART-INF:PART-TARGET=0.23400\n\
+                 #EXT-X-MEDIA-SEQUENCE:{msn}\n"
+            )
+        };
+        // A short part before others in its segment: refused unless it is
+        // INDEPENDENT=YES (RFC 8216bis 4.4.4.9).
+        let short = |independent: &str| {
+            format!(
+                "{}#EXT-X-PART:DURATION=0.12000,URI=\"a\"{independent}\n\
+                 #EXT-X-PART:DURATION=0.20000,URI=\"b\"\n#EXTINF:1.0,\ns\n",
+                head(0)
+            )
+        };
+        assert!(RuleCheck::default().check(&short("")).is_err());
+        assert_eq!(
+            RuleCheck::default().check(&short(",INDEPENDENT=YES")),
+            Ok(())
+        );
+        // Three seconds listed after removals: under three targets of 2 s
+        // (RFC 8216bis 6.2.2), but only the opt-in check sees it.
+        let thin = format!("{}#EXTINF:1.5,\ns\n#EXTINF:1.5,\nt\n", head(4));
+        assert_eq!(RuleCheck::default().check(&thin), Ok(()));
+        assert!(RuleCheck::with_live_window().check(&thin).is_err());
+        // Nothing removed yet: a short playlist is fine.
+        let young = format!("{}#EXTINF:1.5,\ns\n", head(0));
+        assert_eq!(RuleCheck::with_live_window().check(&young), Ok(()));
+        let full = format!(
+            "{}#EXTINF:2.0,\ns\n#EXTINF:2.0,\nt\n#EXTINF:2.0,\nu\n",
+            head(4)
+        );
+        assert_eq!(RuleCheck::with_live_window().check(&full), Ok(()));
     }
 
     #[test]
