@@ -82,8 +82,6 @@ use std::time::{Duration, Instant};
 
 /// Most SSRCs the session remembers from MID matching.
 const MAX_ROUTES: usize = 16;
-/// Most session-level events queued (media events wait in the receiver).
-const MAX_SESSION_EVENTS: usize = 32;
 
 /// A session's settings. Every bound has a refusal path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,7 +251,8 @@ pub enum State {
 /// Something to act on.
 #[derive(Debug)]
 pub enum Event {
-    /// The selected tuple was set or moved ([`Session::selected`]).
+    /// The selected tuple was set or moved ([`Session::selected`]). Moves
+    /// not yet polled are coalesced into one.
     Nominated,
     /// DTLS completed and SRTP is up, with this profile.
     Connected(sapflow_dtls::SrtpProfile),
@@ -779,10 +778,16 @@ impl Session {
         self.events.push_back(Event::Ended(reason));
     }
 
+    /// Queues a session event. None is dropped: `Connected` and `Ended`
+    /// come once each, and a `Nominated` already waiting stands for any
+    /// later move, so the queue stays bounded (media events wait in the
+    /// receiver, within its own bound).
     fn push_event(&mut self, e: Event) {
-        if self.events.len() < MAX_SESSION_EVENTS {
-            self.events.push_back(e);
+        let waiting = |q: &VecDeque<Event>| q.iter().any(|x| matches!(x, Event::Nominated));
+        if matches!(e, Event::Nominated) && waiting(&self.events) {
+            return;
         }
+        self.events.push_back(e);
     }
 
     /// Queues a datagram for `tuple`. A STUN `response` is never larger

@@ -1038,3 +1038,23 @@ fn forgotten_replays_cannot_outlive_the_media() {
     run_until(s, gone + Duration::from_secs(60));
     assert!(s.poll_transmit().is_none());
 }
+
+/// Milestones always get through: many moves before anything is polled
+/// leave one Nominated, and Connected still follows.
+#[test]
+fn milestones_are_never_dropped() {
+    let (mut p, mut a, t0) = setup(28, &[GCM]);
+    let s = &mut a.session;
+    let home = p.tuple;
+    for i in 0..40u16 {
+        let c = p.check(true);
+        s.handle_datagram(t0, tuple(42_000 + i % 2), &c);
+    }
+    p.connect(s, t0);
+    assert_eq!(s.selected(), Some(home));
+    let ev = events(s);
+    assert!(
+        matches!(ev.as_slice(), [Event::Nominated, Event::Connected(_)]),
+        "{ev:?}"
+    );
+}

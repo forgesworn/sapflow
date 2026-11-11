@@ -167,9 +167,10 @@ if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
 | Opus `maxaveragebitrate` | as configured | held to 6000 to 510000 |
 
 Fixed: 32 attributes a STUN message, 8 unknown types listed, 513-byte
-USERNAME, 8 candidates in an answer, 16 SSRCs remembered from MID matching,
-32 session events queued (media events wait in the receiver, within its
-own bound). `SessionConfig` also carries `sapflow-dtls`'s `Config`,
+USERNAME, 8 candidates in an answer, 16 SSRCs remembered from MID matching.
+Session events are never dropped: `Connected` and `Ended` come once each
+and moves not yet polled coalesce into one `Nominated` (media events wait
+in the receiver, within its own bound). `SessionConfig` also carries `sapflow-dtls`'s `Config`,
 `sapflow-rtp`'s SRTP `Config` (1024-packet replay windows, 8 streams) and
 the `ReceiverConfig` (reorder, NACK, start hold, reports, transport-cc and
 events), each with its own stated bounds.
