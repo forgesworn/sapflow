@@ -13,19 +13,25 @@
 //! - **Nothing to a stranger.** A tuple gets bytes only after a STUN check
 //!   from it passed MESSAGE-INTEGRITY ([`crate::ice`]), and a repeated
 //!   transaction ID from another tuple gets nothing.
-//! - **Where the session sends.** MESSAGE-INTEGRITY does not prove the
-//!   source address, so a check that arrives before its original, or after
-//!   its ID is forgotten, can come from anywhere. DTLS and RTCP go to one
-//!   send tuple ([`Session::send_tuple`]):
-//!   - a tuple is *proven* once fresh SRTP or SRTCP from it (authenticated
-//!     and inside the replay window) arrives;
-//!   - the send tuple follows the selected tuple while it is unproven, and
-//!     once it is proven moves only to a selected tuple that is proven too;
-//!   - to a tuple that is not proven, the session sends at most
-//!     [`SessionConfig::amplification_limit`] (4) times the bytes it has
-//!     received from it, as RFC 9000 section 8.1 limits a QUIC server
-//!     before address validation (3 there, with padded client datagrams).
-//!     STUN responses are never larger than their request.
+//! - **A budget for every tuple.** Neither MESSAGE-INTEGRITY nor SRTP
+//!   authentication covers the source address, so a copy of a check, or
+//!   of an SRTP packet, that arrives before its original, or a check whose
+//!   ID has been forgotten, verifies from any address. So, for the whole
+//!   session, the session sends each validated tuple at most
+//!   [`SessionConfig::amplification_limit`] (4) times the bytes it has
+//!   received from it (STUN, DTLS, SRTP and SRTCP, STUN responses
+//!   included), and drops the rest; RFC 9000 section 8.1 limits a QUIC
+//!   server the same way before address validation (3 there, with padded
+//!   client datagrams). A response to a tuple not yet validated is never
+//!   larger than its request.
+//! - **Where the session sends.** DTLS and RTCP go to one send tuple
+//!   ([`Session::send_tuple`]). Until SRTP or SRTCP has arrived it is the
+//!   selected tuple. From then on it is the tuple of the latest fresh SRTP
+//!   or SRTCP packet (authenticated and inside the replay window) from a
+//!   tuple with current consent, and nomination no longer moves it: a
+//!   publisher's own move is followed by its next packet on the new pair,
+//!   and after one won race the session is back with the publisher at the
+//!   publisher's next packet that arrives before any copy of it.
 //! - **DTLS from the selected tuple only.** `sapflow-dtls` is fed only
 //!   datagrams from the selected tuple. A few that arrive from a validated
 //!   tuple before its USE-CANDIDATE check ([`SessionConfig::max_early_dtls`])
@@ -58,9 +64,12 @@
 //!   no fresh SRTP or SRTCP for [`SessionConfig::media_timeout`] once
 //!   connected, DTLS failed or closed by the peer, or [`Session::close`].
 //!   After that it sends nothing and ignores input. The media timeout is
-//!   what bounds sending after the publisher has gone: a check whose ID
-//!   the agent has forgotten renews consent when replayed, but nobody can
-//!   replay SRTP into the replay window.
+//!   what bounds sending after the publisher has gone: a replayed check
+//!   whose ID the agent has forgotten renews consent, but a copy of SRTP
+//!   counts as fresh only if it arrives before its original or the
+//!   original was lost, so once the publisher stops sending, nothing new
+//!   can count: the session ends 30 s after the publisher's last packet,
+//!   or the last copy of one, arrived.
 //!
 //! Counters ([`SessionStats`]) hold no addresses, and no `Debug` output
 //! shows one.
@@ -107,9 +116,9 @@ pub struct SessionConfig {
     /// s; default 30 s, as consent. A publisher always sends media or
     /// sender reports, so a silent one has gone.
     pub media_timeout: Duration,
-    /// To a tuple not yet proven by fresh SRTP or SRTCP, the session sends
-    /// at most this many times the bytes it received from it, STUN
-    /// responses included; the rest is dropped and counted. 1 to 8;
+    /// The session sends any tuple at most this many times the bytes it has
+    /// received from it, over the whole session, STUN responses included;
+    /// the rest is dropped and counted, and the session goes on. 1 to 8;
     /// default 4: one 104-byte check and the smallest ClientHello in the
     /// profile (about 120 bytes) must draw the check's 64-byte response
     /// and our 637-byte first flight at once. QUIC's limit is 3 (RFC 9000
@@ -310,7 +319,7 @@ pub struct SessionStats {
     pub feedback_sent: u64,
     /// Output dropped because the queue was full.
     pub transmit_dropped: u64,
-    /// Output to an unproven tuple dropped by the amplification limit.
+    /// Output dropped by the amplification limit.
     pub budget_dropped: u64,
     /// Input after the session ended.
     pub after_end: u64,
@@ -367,8 +376,6 @@ struct Path {
     tuple: Tuple,
     received: u64,
     sent: u64,
-    /// Fresh authenticated SRTP or SRTCP has arrived from it.
-    proven: bool,
 }
 
 /// SRTP and the receiver, from the moment DTLS completes.
@@ -395,6 +402,8 @@ pub struct Session {
     send_to: Option<Tuple>,
     /// When SRTP came up, then when fresh SRTP or SRTCP last arrived.
     last_srtp: Option<Instant>,
+    /// Fresh SRTP or SRTCP has arrived: sends follow media from now on.
+    media_seen: bool,
     paths: Vec<Path>,
     early: Vec<(Tuple, Vec<u8>)>,
     out: VecDeque<Transmit>,
@@ -498,6 +507,7 @@ impl Session {
             media: None,
             send_to: None,
             last_srtp: None,
+            media_seen: false,
             paths: Vec::new(),
             early: Vec::new(),
             out: VecDeque::new(),
@@ -526,10 +536,20 @@ impl Session {
         self.ice.selected()
     }
 
-    /// Where DTLS and RTCP go: the selected tuple, unless the selection has
-    /// moved from a proven tuple to one that is not proven yet.
+    /// Where DTLS and RTCP go: the selected tuple until SRTP or SRTCP has
+    /// arrived, then the tuple of the latest fresh SRTP or SRTCP packet
+    /// from a tuple with current consent.
     pub fn send_tuple(&self) -> Option<Tuple> {
         self.send_to
+    }
+
+    /// Bytes received from and sent to a validated tuple, for the
+    /// amplification limit.
+    pub fn tuple_bytes(&self, tuple: &Tuple) -> Option<(u64, u64)> {
+        self.paths
+            .iter()
+            .find(|p| p.tuple == *tuple)
+            .map(|p| (p.received, p.sent))
     }
 
     /// Whether a check from this tuple succeeded: the UDP owner may then
@@ -636,8 +656,8 @@ impl Session {
         self.flush();
     }
 
-    /// Ends the session: `close_notify` to the selected tuple if DTLS is
-    /// up. Idempotent.
+    /// Ends the session: `close_notify` to the send tuple if DTLS is up.
+    /// Idempotent.
     pub fn close(&mut self) {
         if matches!(self.state, State::Ended(_)) {
             return;
@@ -695,37 +715,31 @@ impl Session {
             tuple,
             received: len,
             sent: 0,
-            proven: false,
         });
         true
     }
 
-    fn proven(&self, tuple: Tuple) -> bool {
-        self.paths.iter().any(|p| p.tuple == tuple && p.proven)
-    }
-
-    /// Fresh authenticated SRTP or SRTCP arrived from `tuple`.
-    fn prove(&mut self, now: Instant, tuple: Tuple) {
-        self.last_srtp = Some(now);
-        if let Some(p) = self.paths.iter_mut().find(|p| p.tuple == tuple) {
-            p.proven = true;
-        }
-        self.retarget();
-    }
-
-    /// Points the send tuple at the selected tuple, unless that would move
-    /// it from a proven tuple to one that is not proven.
-    fn retarget(&mut self) {
-        let Some(selected) = self.ice.selected() else {
-            return;
-        };
-        if self.send_to == Some(selected) {
-            return;
-        }
-        let keep = self.send_to.is_some_and(|t| self.proven(t)) && !self.proven(selected);
-        if !keep {
-            self.send_to = Some(selected);
+    fn point_at(&mut self, tuple: Tuple) {
+        if self.send_to != Some(tuple) {
+            self.send_to = Some(tuple);
             self.ice.protect(self.send_to);
+        }
+    }
+
+    /// Fresh authenticated SRTP or SRTCP arrived from `tuple`: sends follow
+    /// it, if it has consent.
+    fn fresh_media(&mut self, now: Instant, tuple: Tuple) {
+        self.last_srtp = Some(now);
+        self.media_seen = true;
+        if self.ice.consent_expires(&tuple).is_some_and(|d| d > now) {
+            self.point_at(tuple);
+        }
+    }
+
+    /// A nomination moves sends only until media has arrived.
+    fn nominated(&mut self) {
+        if let (false, Some(t)) = (self.media_seen, self.ice.selected()) {
+            self.point_at(t);
         }
     }
 
@@ -790,10 +804,10 @@ impl Session {
         self.events.push_back(e);
     }
 
-    /// Queues a datagram for `tuple`. A STUN `response` is never larger
-    /// than its request and always goes; anything else to a tuple not
-    /// proven goes only within the amplification limit. Returns whether it
-    /// was queued.
+    /// Queues a datagram for `tuple`, within the amplification limit for a
+    /// validated tuple. A STUN `response` to a tuple not validated goes as
+    /// it is, being no larger than its request. Returns whether it was
+    /// queued; a datagram over the limit is dropped and counted.
     fn send(&mut self, tuple: Tuple, bytes: Vec<u8>, response: bool) -> bool {
         if self.out.len() >= self.config.max_queued {
             self.stats.transmit_dropped += 1;
@@ -802,11 +816,7 @@ impl Session {
         let len = bytes.len() as u64;
         let limit = u64::from(self.config.amplification_limit);
         match self.paths.iter_mut().find(|p| p.tuple == tuple) {
-            Some(p)
-                if p.proven
-                    || response
-                    || p.sent.saturating_add(len) <= p.received.saturating_mul(limit) =>
-            {
+            Some(p) if p.sent.saturating_add(len) <= p.received.saturating_mul(limit) => {
                 p.sent = p.sent.saturating_add(len);
             }
             None if response => {}
@@ -830,7 +840,7 @@ impl Session {
         if !answer.nominated {
             return;
         }
-        self.retarget();
+        self.nominated();
         self.push_event(Event::Nominated);
         if self.state == State::Checking {
             self.state = State::Handshaking;
@@ -947,7 +957,7 @@ impl Session {
         self.stats.srtp_packets += 1;
         // Authenticated and inside the replay window: this tuple is the
         // publisher's.
-        self.prove(now, tuple);
+        self.fresh_media(now, tuple);
         let Some(m) = self.media.as_mut() else {
             return;
         };
@@ -980,7 +990,7 @@ impl Session {
             return;
         };
         self.stats.srtcp_packets += 1;
-        self.prove(now, tuple);
+        self.fresh_media(now, tuple);
         let Some(m) = self.media.as_mut() else {
             return;
         };

@@ -269,11 +269,15 @@ fn ice_controlled_gets_487() {
 
 #[test]
 fn use_candidate_moves_the_selected_tuple() {
+    // USE-CANDIDATE moves the selected tuple; once media flows, sends go
+    // where the latest fresh SRTP came from, and SRTP is taken from every
+    // validated tuple.
     let (mut p, mut a, t0) = setup(7, &[CM80]);
     let s = &mut a.session;
     p.connect(s, t0);
     let first = p.tuple;
     assert_eq!(s.selected(), Some(first));
+    assert_eq!(s.send_tuple(), Some(first));
     let _ = events(s);
     // A plain check from a new tuple validates it and moves nothing.
     let moved = tuple(41_000);
@@ -281,8 +285,7 @@ fn use_candidate_moves_the_selected_tuple() {
     s.handle_datagram(t0 + ms(10), moved, &c);
     assert_eq!(s.selected(), Some(first));
     assert!(s.accepts(&moved));
-    // SRTP from it is taken before it is selected: it is the publisher's,
-    // and SRTP authenticates it.
+    // SRTP from it is taken before it is selected, and sends follow it.
     for d in p.sender_reports(1 << 63) {
         s.handle_datagram(t0 + ms(10), moved, &d);
     }
@@ -291,38 +294,37 @@ fn use_candidate_moves_the_selected_tuple() {
         s.handle_datagram(t0 + ms(10), moved, d);
     }
     assert_eq!(s.stats().srtp_packets, kf.len() as u64);
-    // From a tuple that never passed a check, it is not.
+    assert_eq!(s.send_tuple(), Some(moved));
+    // From a tuple that never passed a check, it is not taken.
     let stranger = tuple(41_001);
     s.handle_datagram(t0 + ms(10), stranger, &p.audio(1));
     assert_eq!(s.stats().media_unvalidated, 1);
     assert_eq!(s.stats().srtp_packets, kf.len() as u64);
-    // Nothing is sent to the new tuple but its STUN answer until
-    // USE-CANDIDATE moves the selection there.
-    while let Some(t) = s.poll_transmit() {
-        if t.tuple == moved {
-            assert_eq!(crate::ice::classify(&t.bytes), crate::ice::Kind::Stun);
-        } else {
-            assert_eq!(t.tuple, first);
-        }
-    }
+    // USE-CANDIDATE from it moves the selection there too.
     let c = p.check(true);
     s.handle_datagram(t0 + ms(20), moved, &c);
     assert_eq!(s.selected(), Some(moved));
     assert!(matches!(events(s).as_slice(), [Event::Nominated]));
-    p.tuple = moved;
-    p.receive(s);
-    // Media still arriving on the old pair is not lost.
+    // Media still arriving on the old pair is not lost, and sends follow
+    // the latest of it.
     let (kf2, _) = p.keyframe(500);
     for d in &kf2 {
         s.handle_datagram(t0 + ms(30), first, d);
     }
+    assert_eq!(s.send_tuple(), Some(first));
     s.handle_datagram(t0 + ms(30), moved, &p.audio(2));
+    assert_eq!(s.send_tuple(), Some(moved));
     assert_eq!(s.stats().srtp_packets, (kf.len() + kf2.len() + 1) as u64);
+    // Everything went to one of the publisher's tuples, within the limit.
     run_until(s, t0 + ms(1600));
-    let before = p.rtcp.len();
-    p.receive(s);
-    assert!(p.rtcp.len() > before, "feedback follows the move");
-    assert_eq!(p.misdirected, 0, "nothing to the old tuple after the move");
+    while let Some(t) = s.poll_transmit() {
+        assert!(t.tuple == first || t.tuple == moved);
+    }
+    for t in [first, moved] {
+        let (received, sent) = s.tuple_bytes(&t).expect("validated");
+        assert!(sent <= 4 * received, "{sent} for {received}");
+    }
+    assert_eq!(s.stats().budget_dropped, 0);
 }
 
 #[test]
@@ -794,11 +796,10 @@ fn replayed_check_from_another_tuple_mid_handshake() {
     assert_eq!(other, 0, "DTLS retransmissions followed the replayed check");
 }
 
-/// Sends move from a proven tuple only to another proven one: the
-/// publisher's own renomination moves them once its SRTP arrives on the
-/// new pair.
+/// Before media, a nomination moves sends; once media flows, only fresh
+/// media does, so a publisher's own move is followed by its next packet.
 #[test]
-fn sends_move_only_to_a_proven_tuple() {
+fn sends_follow_fresh_media_once_it_flows() {
     let (mut p, mut a, t0) = setup(21, &[GCM]);
     let s = &mut a.session;
     p.connect(s, t0);
@@ -809,11 +810,11 @@ fn sends_move_only_to_a_proven_tuple() {
     let c = p.check(true);
     s.handle_datagram(t0 + ms(10), second, &c);
     assert_eq!(s.selected(), Some(second));
-    assert_eq!(s.send_tuple(), Some(first), "not proven yet");
+    assert_eq!(s.send_tuple(), Some(first), "no media from it yet");
     let (_, other) = sent_to(s, second);
     assert_eq!(other, 0);
     s.handle_datagram(t0 + ms(20), second, &p.audio(2));
-    assert_eq!(s.send_tuple(), Some(second), "proven by its SRTP");
+    assert_eq!(s.send_tuple(), Some(second), "its first packet");
 }
 
 /// The attacker's copy of a check arrives before the original, after
@@ -1057,4 +1058,84 @@ fn milestones_are_never_dropped() {
         matches!(ev.as_slice(), [Event::Nominated, Event::Connected(_)]),
         "{ev:?}"
     );
+}
+
+/// One won race, then a publisher that keeps sending but never nominates
+/// again. Returns (bytes sent to B, bytes received from B, the time sends
+/// went back to the publisher's tuple if they did, the session's state).
+fn won_race(seed: u8) -> (usize, usize, Option<Duration>, State) {
+    let (mut p, mut a, t0) = setup(seed, &[GCM]);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    let home = p.tuple;
+    for d in p.sender_reports(1 << 62) {
+        s.handle_datagram(t0, home, &d);
+    }
+    s.handle_datagram(t0, home, &p.audio(0));
+    let b = tuple(50_010);
+    let (mut from_b, mut to_b) = (0usize, 0usize);
+    let drain = |s: &mut crate::Session, to_b: &mut usize| {
+        let mut home_bytes = 0;
+        while let Some(t) = s.poll_transmit() {
+            if t.tuple == b {
+                *to_b += t.bytes.len();
+            } else if t.tuple == home {
+                home_bytes += t.bytes.len();
+            }
+        }
+        home_bytes
+    };
+    // The copy of a nominating check, then of an SRTP packet, each first.
+    let at = t0 + ms(100);
+    let check = p.check(true);
+    s.handle_datagram(at, b, &check);
+    from_b += check.len();
+    s.handle_datagram(at, home, &check);
+    let srtp = p.audio(1);
+    s.handle_datagram(at, b, &srtp);
+    from_b += srtp.len();
+    s.handle_datagram(at, home, &srtp);
+    drain(s, &mut to_b);
+    // Sixty seconds: audio every 20 ms, sender reports every second and a
+    // check without USE-CANDIDATE every 2 s, all from home.
+    let mut back = None;
+    let mut home_after = 0;
+    for step in 1..=3000u64 {
+        let at = t0 + ms(100 + 20 * step);
+        s.handle_datagram(at, home, &p.audio(step as u8));
+        if step % 50 == 0 {
+            for d in p.sender_reports((1 << 62) + step) {
+                s.handle_datagram(at, home, &d);
+            }
+        }
+        if step % 100 == 0 {
+            s.handle_datagram(at, home, &p.check(false));
+        }
+        run_until(s, at);
+        home_after += drain(s, &mut to_b);
+        if back.is_none() && s.send_tuple() == Some(home) {
+            back = Some(at - (t0 + ms(100)));
+        }
+    }
+    assert!(home_after > 0, "the publisher still gets our RTCP");
+    (to_b, from_b, back, s.state())
+}
+
+/// (a) Over 60 s, B is sent at most four times what it sent.
+#[test]
+fn a_won_race_cannot_lift_the_budget() {
+    let (to_b, from_b, _, _) = won_race(29);
+    println!("won race: {to_b} bytes to B for {from_b} from it");
+    assert!(to_b <= 4 * from_b, "{to_b} bytes to B for {from_b} from it");
+}
+
+/// (b) Sends go back to the publisher's tuple at its next fresh packet,
+/// here 20 ms of audio, and the session stays up.
+#[test]
+fn sends_return_to_the_publisher_after_a_won_race() {
+    let (_, _, back, state) = won_race(30);
+    println!("won race: sends back with the publisher after {back:?}, state {state:?}");
+    assert_eq!(state, State::Connected);
+    let back = back.expect("sends went back to the publisher");
+    assert!(back <= ms(20), "{back:?}");
 }
