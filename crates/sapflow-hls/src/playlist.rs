@@ -104,6 +104,12 @@ fn secs(d: Duration) -> String {
     format!("{:.5}", d.as_secs_f64())
 }
 
+/// A duration as `EXTINF` prints it, in units of 10 µs, so the muxer's
+/// window rule counts exactly what a client adds up.
+pub(crate) fn extinf_units(d: Duration) -> u64 {
+    fixed5(&secs(d)).unwrap_or(u64::MAX)
+}
+
 /// The LL-HLS media playlist. Call only once `has_content()` is true.
 pub fn media(m: &Muxer, prefix: &str) -> String {
     media_with_mode(m, prefix, true)

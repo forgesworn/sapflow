@@ -47,6 +47,17 @@ pub const LEADING_GAPS: u64 = 7;
 /// separate; this is not a whole-process or allocator/RSS limit.
 const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Entries the live window may hold when keeping three target durations
+/// listed (RFC 8216bis 6.2.2) needs more than `MuxerConfig::segment_count`:
+/// enough for segments down to a 24th of a two-second target. A window this
+/// long is removed from as normal, even below three target durations.
+pub const MAX_WINDOW_ENTRIES: usize = 256;
+
+/// Sealed media bytes the live window may hold beyond its first
+/// `MuxerConfig::segment_count` entries, for the same rule: one segment's
+/// limit.
+const MAX_EXTRA_WINDOW_BYTES: usize = MAX_SEGMENT_BYTES;
+
 /// Pending AAC plus samples in the current unsealed video-led part.
 /// A count bound also covers tiny payloads and repeated timestamps.
 const MAX_OPEN_AUDIO_SAMPLES: usize = 16_384;
@@ -83,7 +94,10 @@ pub struct MuxerConfig {
     /// The shortest nominal part, from which `PART-TARGET` is derived (see
     /// [`PartTiming`]). Default 200 ms.
     pub part_min: Duration,
-    /// Segments kept in the playlist, gaps included. At least 7.
+    /// Segments kept in the playlist, gaps included. At least 7. More are
+    /// kept when removing one would leave the playlist lasting less than
+    /// three target durations (RFC 8216bis 6.2.2), up to
+    /// [`MAX_WINDOW_ENTRIES`] entries and 64 MiB of media beyond these.
     pub segment_count: usize,
 }
 
@@ -2033,7 +2047,41 @@ impl Muxer {
             }
         }
         self.entries.push_back(Entry::Segment(seg));
+        // RFC 8216bis 6.2.2: no removal may leave the playlist lasting less
+        // than three target durations, as printed. The target is fixed from
+        // this segment if it is the first.
+        let floor = 3
+            * self
+                .target
+                .unwrap_or_else(|| TargetDuration::for_first_segment(duration))
+                .secs()
+            * 100_000;
         while self.entries.len() > self.cfg.segment_count {
+            let listed: u64 = self
+                .entries
+                .iter()
+                .skip(1)
+                .map(|e| crate::playlist::extinf_units(e.duration()))
+                .sum();
+            let extra = self.entries.len() - self.cfg.segment_count;
+            let extra_bytes: usize = self
+                .entries
+                .iter()
+                .take(extra)
+                .map(|e| match e {
+                    Entry::Segment(s) => s.data.len(),
+                    Entry::Gap { .. } => 0,
+                })
+                .sum();
+            // The cap wins over the 3x rule: only a publisher making
+            // segments far shorter than the target (reconnecting or
+            // stalling over and over) needs more, and holding without
+            // bound would let it grow the window and every render.
+            let capped = self.entries.len() > MAX_WINDOW_ENTRIES.max(self.cfg.segment_count)
+                || extra_bytes > MAX_EXTRA_WINDOW_BYTES;
+            if listed < floor && !capped {
+                break;
+            }
             if let Some(Entry::Segment(old)) = self.entries.pop_front() {
                 for _ in 0..old.parts.len() {
                     self.parts.pop_front();
