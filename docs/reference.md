@@ -30,9 +30,10 @@ Duration, and at least 85% of it, except for the last Partial Segment of a
 Parent Segment. Draft 19 also exempts `INDEPENDENT=YES` parts. sapflow relies
 on that only for audio-only Opus, where a packet too long for the open part
 closes it early (Apple's players do not play Opus in HLS), and the checks
-below allow it only in a render whose every part is independent (audio-only).
-A short video part with a keyframe would pass the draft too, but sapflow
-never cuts one and the checks hold video to Apple's stricter rule. `PART-TARGET` (4.4.3.7) is treated like
+below allow it only in a segment whose every part is independent, as in
+audio-only. A short video part with a keyframe would pass the draft too, but
+sapflow never cuts one, and the checks hold any segment that mixes independent
+and other parts to Apple's stricter rule. `PART-TARGET` (4.4.3.7) is treated like
 `EXT-X-TARGETDURATION`: fixed for the life of the stream. Safari on macOS
 refused a Larix stream that broke all three (`PART-TARGET` climbed to
 0.534 s while its parts stayed 0.2 s; `docs/interop.md`); which one it

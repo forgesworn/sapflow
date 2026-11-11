@@ -651,9 +651,9 @@ mod tests {
             )
         };
         // A short part before others in its segment. RFC 8216bis 4.4.4.9
-        // exempts it if INDEPENDENT=YES: allowed where every part is
-        // independent (audio-only), refused beside a part that is not
-        // (video, held to Apple's stricter rule).
+        // exempts it if INDEPENDENT=YES: allowed in a segment whose every
+        // part is independent (as in audio-only), refused beside a part
+        // that is not (held to Apple's stricter rule).
         let render = |first: bool, second: bool| {
             format!(
                 "{}{}{}#EXTINF:1.0,\ns\n",

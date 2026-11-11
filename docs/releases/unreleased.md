@@ -5,7 +5,9 @@ Notes for the release after 0.2.0-rc.1.
 ## sapflow-hls
 
 - `RuleCheck::default()` now enforces the live window (RFC 8216bis 6.2.2's
-  segment rule), so it rejects some renders that rc.1 accepted. A muxer
+  segment rule), so it rejects some renders that rc.1 accepted. It also
+  accepts short `INDEPENDENT=YES` parts in a segment whose every part is
+  independent, which rc.1 rejected. A muxer
   whose 64 MiB byte cap cut its window short says so through
   `Muxer::window_byte_capped()`; pass that to
   `RuleCheck::check_with_byte_cap`.
@@ -14,3 +16,5 @@ Notes for the release after 0.2.0-rc.1.
   durations, up to `muxer::MAX_WINDOW_ENTRIES` (256) entries and 64 MiB
   beyond the count. AAC output changes only where the count alone fell
   short of that.
+- Opus audio beside AAC (#66), with timeline slew carried in audio-only
+  Opus and the refusal order tested (#68). See `docs/whip-ingest.md`.
