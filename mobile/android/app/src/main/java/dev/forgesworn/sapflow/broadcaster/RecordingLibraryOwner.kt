@@ -3,8 +3,8 @@ package dev.forgesworn.sapflow.broadcaster
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.StatFs
 import java.io.OutputStream
-import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.RejectedExecutionException
@@ -17,6 +17,7 @@ internal class RecordingLibraryOwner internal constructor(
     private val directory: Path,
     private val execute: (Runnable) -> Unit,
     private val deliver: (() -> Unit) -> Unit,
+    private val availableBytes: (Path) -> Long? = { StatFs(it.toString()).availableBytes },
 ) {
     private enum class PreparationProblem { LOW_STORAGE, UNAVAILABLE }
     private class PreparationFailure(val reason: PreparationProblem) : IllegalStateException()
@@ -57,7 +58,7 @@ internal class RecordingLibraryOwner internal constructor(
             val store = catalogue()
             store.checkRecordingCapacity()
             val check = RecordingStorage.check(RecordingStorage.budget(intent)) {
-                runCatching { Files.getFileStore(directory).usableSpace }.getOrNull()
+                availableBytes(directory)
             }
             when (check.state) {
                 RecordingStorage.State.AVAILABLE -> Unit
