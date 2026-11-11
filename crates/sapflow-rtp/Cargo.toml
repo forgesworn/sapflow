@@ -1,0 +1,19 @@
+[package]
+name = "sapflow-rtp"
+description = "RTP and RTCP packets, SRTP and SRTCP for receive-only WHIP ingest, in pure Rust, sans-IO."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["rtp", "rtcp", "srtp", "webrtc", "sans-io"]
+categories = ["network-programming", "multimedia::video"]
+
+[lints]
+workspace = true
+
+[features]
+# Test helpers (an RTP builder). Not for production use.
+testing = []
