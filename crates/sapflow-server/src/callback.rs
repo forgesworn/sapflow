@@ -76,6 +76,27 @@ impl Callbacks {
     }
 
     pub fn send(&self, path: &StreamPath, event: StreamEvent) {
+        self.send_inner(path, event, None);
+    }
+
+    /// Freeze the writer's synchronised result into both callback contracts.
+    /// The legacy event name alone only says that a file has finished.
+    pub(crate) fn send_recording(
+        &self,
+        path: &StreamPath,
+        event: StreamEvent,
+        complete: bool,
+        reason: Option<&str>,
+    ) {
+        self.send_inner(path, event, Some((complete, reason)));
+    }
+
+    fn send_inner(
+        &self,
+        path: &StreamPath,
+        event: StreamEvent,
+        completion: Option<(bool, Option<&str>)>,
+    ) {
         tracing::info!(path = %path.as_path(), event = event.name(), "stream event");
         // Allocation, sequencing and enqueue are serialised per immutable
         // scope. Concurrent recorder/health tasks cannot enqueue sequence N+1
@@ -90,7 +111,33 @@ impl Callbacks {
             }
             return;
         };
-        let Some(body) = self.body(path, &event) else {
+        let body = self.body(path, &event).and_then(|body| {
+            let Some((complete, reason)) = completion else {
+                return Some(body);
+            };
+            if !matches!(event, StreamEvent::RecordSegmentComplete { .. }) {
+                return None;
+            }
+            let state = if complete { "finalised" } else { "incomplete" };
+            let mut body: serde_json::Value = serde_json::from_str(&body).ok()?;
+            let object = body.as_object_mut()?;
+            // A scoped completion must also have passed the existing sync
+            // receipt gate; never overwrite a conflicting writer observation.
+            if object
+                .get("recordingState")
+                .is_some_and(|value| value != state)
+            {
+                return None;
+            }
+            object.insert("recordingState".into(), state.into());
+            object.insert(
+                "recordingReason".into(),
+                if complete { None } else { reason }.into(),
+            );
+            let body = serde_json::to_string(&body).ok()?;
+            (body.len() <= MAX_BODY).then_some(body)
+        });
+        let Some(body) = body else {
             if let Some(scope) = &self.scope {
                 scope.observations.callback_failed();
             }
@@ -345,6 +392,72 @@ mod tests {
             duration_secs: 1.0,
             recording_tracks: sapflow_core::RecordingTracks::AudioVideo,
         }
+    }
+
+    #[test]
+    fn writer_integrity_is_frozen_in_both_callback_contracts() {
+        for scoped in [false, true] {
+            for complete in [false, true] {
+                let scope = fixture_scope("a", 2, 11, 3);
+                let (callbacks, mut rx) = if scoped {
+                    test_queue(scope.clone(), 4)
+                } else {
+                    legacy_test_queue(4)
+                };
+                let (callbacks, observation) = callbacks.for_recording().expect("writer");
+                if let Some(observation) = &observation {
+                    observation.active();
+                    if complete {
+                        observation.finalised();
+                    } else {
+                        observation.synced_incomplete();
+                    }
+                }
+                callbacks.send_recording(
+                    &scope.key().path,
+                    completion(),
+                    complete,
+                    (!complete).then_some("ingest-discarded-packets"),
+                );
+                let queued = rx.try_recv().expect("synchronised completion");
+                let body: serde_json::Value = serde_json::from_slice(&queued.body).expect("JSON");
+                assert_eq!(
+                    body["recordingState"],
+                    if complete { "finalised" } else { "incomplete" }
+                );
+                assert_eq!(
+                    body["recordingReason"],
+                    if complete {
+                        serde_json::Value::Null
+                    } else {
+                        "ingest-discarded-packets".into()
+                    }
+                );
+                assert_eq!(body.get("sessionId").is_some(), scoped);
+                if let Some(observation) = observation {
+                    observation.failed();
+                }
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&queued.body.clone())
+                        .expect("retry JSON"),
+                    body
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn writer_integrity_cannot_override_an_unsynchronised_or_conflicting_scope() {
+        let scope = fixture_scope("a", 2, 11, 3);
+        let (callbacks, mut rx) = test_queue(scope.clone(), 4);
+        let (callbacks, observation) = callbacks.for_recording().expect("writer");
+        let observation = observation.expect("scoped");
+        observation.active();
+        callbacks.send_recording(&scope.key().path, completion(), true, None);
+        assert!(rx.try_recv().is_err());
+        observation.synced_incomplete();
+        callbacks.send_recording(&scope.key().path, completion(), true, None);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

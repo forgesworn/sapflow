@@ -286,6 +286,16 @@ follows the observed behaviour.
   the ACK after the first ACKACK reports that sample as the RTT and half
   of it as the variance. Later samples are smoothed as specified (7/8,
   3/4). Its first ACKs report a link capacity of 1000 packets per second.
+- **Observed, control padding (2026-11-11):** the draft describes no CIF
+  for ACKACK, KEEPALIVE, SHUTDOWN, congestion warning and peer error.
+  Black-box probes against libsrt 1.5.7 reject all five header-only forms
+  with `INVALID SIZE: 0`, but accept a four-byte zero word after the header.
+  libsrt 1.5.4 accepts both forms. With the same Sapflow caller on loopback,
+  padding ACKACK changes 1.5.7's reported RTT from the initial 100 ms to
+  0.30–0.35 ms; leaving it unpadded produces 240 rejects in three seconds.
+  Sapflow emits the zero word and continues accepting either form. This is
+  a wire interoperability adjustment to the draft, not evidence that
+  ACKACK rejection caused earlier missing media or a phone disconnect.
 - **Observed:** libsrt sends a NAK range for two consecutive lost numbers
   (the specification describes ranges for more than two); sapflow-srt
   does the same, and accepts either.

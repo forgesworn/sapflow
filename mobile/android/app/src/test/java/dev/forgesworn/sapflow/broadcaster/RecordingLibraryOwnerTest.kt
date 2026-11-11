@@ -22,6 +22,46 @@ class RecordingLibraryOwnerTest {
         fun reply() = replies.removeFirst().invoke()
     }
     private fun owner(root: Path, queue: Queue) = RecordingLibraryOwner(root, { queue.work.add(it) }, { queue.replies.add(it) })
+
+    @Test fun preflightUsesPlatformSpaceProbeOnTheIoWorker() {
+        val root = temporary.root.toPath().resolve("recordings")
+        val queue = Queue()
+        var probes = 0
+        val owner = RecordingLibraryOwner(root, { queue.work.add(it) }, { queue.replies.add(it) }, { path ->
+            assertEquals(root, path)
+            probes++
+            RecordingStorage.budget(CaptureProfile.DEFAULT).requiredBytes
+        })
+        var result: Result<RecordingLibraryOwner.Preparation>? = null
+        checkNotNull(owner.prepare(CaptureProfile.DEFAULT) { result = it })
+        assertEquals(0, probes); assertFalse(Files.exists(root))
+        queue.run()
+        assertEquals(1, probes); assertNull(result)
+        queue.reply()
+        assertTrue(result!!.isSuccess)
+        assertEquals(CaptureProfile.DEFAULT, result!!.getOrThrow().profile)
+    }
+
+    @Test fun lowOrUnavailablePlatformSpaceStillRefusesRecording() {
+        val budget = RecordingStorage.budget(CaptureProfile.DEFAULT)
+        val probes: List<Pair<() -> Long?, String>> = listOf(
+            ({ budget.requiredBytes - 1 }) to "Not enough free storage",
+            ({ null }) to "Recording storage is unavailable",
+            ({ -1L }) to "Recording storage is unavailable",
+            ({ throw SecurityException("generated unavailable storage") }) to "Recording storage is unavailable",
+        )
+        probes.forEachIndexed { index, (probe, message) ->
+            val root = temporary.root.toPath().resolve("recordings-$index")
+            val queue = Queue()
+            val owner = RecordingLibraryOwner(root, { queue.work.add(it) }, { queue.replies.add(it) }, { probe() })
+            var result: Result<RecordingLibraryOwner.Preparation>? = null
+            checkNotNull(owner.prepare(CaptureProfile.DEFAULT) { result = it })
+            queue.run(); queue.reply()
+            assertTrue(result!!.isFailure)
+            assertTrue(RecordingLibraryOwner.message(checkNotNull(result!!.exceptionOrNull())).startsWith(message))
+            assertTrue(owner.idle); assertFalse(owner.cleanupRetained)
+        }
+    }
     private fun finished(root: Path): RecordingCatalogue.Entry {
         val store = RecordingCatalogue(root)
         val writer = store.begin(store.newShow(CaptureProfile.DEFAULT).nextIdentity())

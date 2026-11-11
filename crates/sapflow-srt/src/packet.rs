@@ -604,7 +604,12 @@ impl ControlPacket {
             | Control::CongestionWarning
             | Control::Shutdown
             | Control::AckAck { .. }
-            | Control::PeerError { .. } => {}
+            | Control::PeerError { .. } => {
+                // The draft omits the CIF, but libsrt 1.5.7 rejects empty
+                // control bodies. One zero word also works with 1.5.4;
+                // decoding still accepts the draft's header-only form.
+                out.extend_from_slice(&[0; 4]);
+            }
         }
     }
 }
@@ -905,6 +910,45 @@ mod tests {
             ));
             let out = round_trip(&p);
             assert_eq!(out.len(), if stats.is_some() { 32 } else { 20 });
+        }
+    }
+
+    #[test]
+    fn empty_cif_controls_use_interoperable_zero_word_and_accept_legacy_headers() {
+        // Literal wire vectors: libsrt 1.5.7 rejects a zero-length CIF for
+        // these controls. Both 1.5.4 and 1.5.7 accept one zero word.
+        for (body, wire) in [
+            (
+                Control::KeepAlive,
+                "80010000 00000000 00000009 0000000a 00000000",
+            ),
+            (
+                Control::CongestionWarning,
+                "80040000 00000000 00000009 0000000a 00000000",
+            ),
+            (
+                Control::Shutdown,
+                "80050000 00000000 00000009 0000000a 00000000",
+            ),
+            (
+                Control::AckAck { number: 77 },
+                "80060000 0000004d 00000009 0000000a 00000000",
+            ),
+            (
+                Control::PeerError { code: 4000 },
+                "80080000 00000fa0 00000009 0000000a 00000000",
+            ),
+        ] {
+            let packet = Packet::Control(ControlPacket::new(9, 10, body));
+            let expected = hex(&wire.replace(' ', ""));
+            let mut encoded = Vec::new();
+            packet.encode(&mut encoded);
+            assert_eq!(encoded, expected);
+            assert_eq!(Packet::parse(&expected).expect("padded control"), packet);
+            assert_eq!(
+                Packet::parse(&expected[..16]).expect("legacy header-only control"),
+                packet
+            );
         }
     }
 

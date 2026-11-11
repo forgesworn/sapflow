@@ -91,7 +91,7 @@ content-type: application/json
 |------|------|
 | Stream ready to play | `{"event":"publish","path":"live/<eventId>"}` |
 | Stream gone | `{"event":"unpublish","path":"live/<eventId>"}` |
-| Recording finished | `{"event":"recordSegmentComplete","path":"live/<eventId>","segmentPath":"/recordings/live/<eventId>/<unix-start>.mp4","segmentDuration":"3723.5"}` |
+| Recording finished | `{"event":"recordSegmentComplete","path":"live/<eventId>","segmentPath":"/recordings/live/<eventId>/<unix-start>.mp4","segmentDuration":"3723.5","recordingState":"finalised","recordingReason":null}` |
 | While live, every `SAPFLOW_HEALTH_INTERVAL` (sapflow only; default 30 s) | `{"event":"health","path":"live/<eventId>","health":{"bitrateKbps":2620,"keyframeIntervalMs":1000,"audio":true,"breaks":0}}` |
 
 v4v reads `health.bitrateKbps` (Studio's bitrate and its lagging and
@@ -123,8 +123,18 @@ guarantee of current scoped recording. Current codec epochs can produce separate
 files, with scoped names `<unix-start>-<recordingId>.mp4`. Scoped completions add
 immutable `recordingTracks: {"hasVideo": boolean, "hasAudio": boolean}` from the
 actual file initialization. Audio-only files map to `audio/mp4`; video-bearing
-files map to `video/mp4`. Legacy callback JSON is unchanged and has no track
-classification. Do not infer an old file's topology from the latest live
+files map to `video/mp4`. Legacy callbacks have no track classification. Both callback modes now add
+`recordingState: "finalised" | "incomplete"` and `recordingReason: string | null`
+from the synchronised writer result. An incomplete file can decode successfully
+while containing gaps or only a prefix; the app must retain and show that warning.
+A finalised file is not proof of a complete show. Older callbacks without these
+fields have unknown integrity, never an implicit finalised result. Retries keep
+the exact same state and reason. Reason codes include `ingest-discarded-packets`,
+`srt-unrecovered-loss`, `srt-timeout`, `srt-ingest-queue-full`,
+`rtmp-protocol-error`, `over-bitrate`, `stale-media`, `srt-listener-stopped`,
+`ingest-error`, `media-loss`, `end-of-input-loss`, `writer-behind` and `disk-low`.
+Receivers must handle unknown future reason codes without rendering untrusted
+provider text. Failed or unsynchronised files still produce no completion. Do not infer an old file's topology from the latest live
 session, and do not equate a finalised epoch file with a complete-show replay.
 See [callbacks and recordings](scoped-publish-sessions.md#callbacks-and-recordings)
 for required identity, sync, incomplete-prefix and asynchronous adoption fences.

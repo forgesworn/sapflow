@@ -310,3 +310,60 @@ fn a_batch_uses_the_current_clock_for_packets_and_final_expiry() {
     );
     assert_eq!(closed(&mut listener), vec![a]);
 }
+
+#[test]
+fn queued_reordered_media_is_read_before_missing_packets_expire() {
+    use sapflow_srt::packet::{DataPacket, Position};
+
+    for retransmitted in [false, true] {
+        let start = Instant::now();
+        let mut listener = Listener::new(Config::default(), start);
+        let source = SocketAddr::from(([127, 0, 0, 1], 9100));
+        let id = open(&mut listener, source, 11, start);
+        let mut ready = std::collections::VecDeque::new();
+        for seq in [100, 102, 101] {
+            let mut bytes = Vec::new();
+            DataPacket {
+                seq: Seq::new(seq),
+                position: Position::Only,
+                in_order: false,
+                key: 0,
+                retransmitted: retransmitted && seq == 101,
+                message: seq - 99,
+                timestamp: 0,
+                dest: id.0,
+                payload: &[seq as u8],
+            }
+            .encode(&mut bytes);
+            ready.push_back(bytes);
+        }
+        // The adapter resumes after the120ms deadline with the whole batch
+        // readable. Both reordered originals and queued retries must survive.
+        service_ready_timers(
+            &mut listener,
+            &mut [0; 65536],
+            || start + Duration::from_millis(300),
+            |buf| {
+                let Some(bytes) = ready.pop_front() else {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                };
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                Ok((bytes.len(), source))
+            },
+        );
+        let media: Vec<_> = std::iter::from_fn(|| listener.poll_event())
+            .filter_map(|event| match event {
+                Event::Data {
+                    payload,
+                    after_loss,
+                    ..
+                } => Some((payload, after_loss)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            media,
+            vec![(vec![100], false), (vec![101], false), (vec![102], false)]
+        );
+    }
+}

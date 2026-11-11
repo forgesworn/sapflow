@@ -331,7 +331,9 @@ impl Receiver {
 
     /// Takes a data packet that arrived at `now`: checks its encryption,
     /// buffers it, reports any gap in a NAK, sends a light ACK after enough
-    /// packets and releases what is due.
+    /// packets and releases contiguous data that is due. Missing packets
+    /// expire in [`on_timer`](Self::on_timer), after the adapter has drained a
+    /// bounded batch of ready input.
     pub fn on_data(&mut self, now: i64, p: &DataPacket) {
         self.now = self.now.max(now);
         if self.closed.is_some() {
@@ -434,7 +436,10 @@ impl Receiver {
             self.light_ack(now);
         }
         self.nak_due(now);
-        self.release(now);
+        // A delayed adapter can have reordered originals or retransmissions
+        // already queued in its socket. Deliver contiguous ready data here,
+        // but let its timer call expire gaps after the bounded receive batch.
+        self.release(now, false);
     }
 
     /// `seq` is beyond the buffer: deliver or give up the oldest packets to
@@ -506,12 +511,13 @@ impl Receiver {
     }
 
     /// TSBPD: hands over every packet whose time has come; a missing packet
-    /// is skipped once a later one is due (too-late packet drop).
-    fn release(&mut self, now: i64) {
+    /// is skipped once a later one is due (too-late packet drop), but only
+    /// when the adapter services timers after draining ready input.
+    fn release(&mut self, now: i64, expire_missing: bool) {
         loop {
             match self.buf.front() {
                 Some(Some(slot)) if slot.deliver_at <= now => self.pop_front(),
-                Some(None) => {
+                Some(None) if expire_missing => {
                     let due = self.first_slot().map(|(i, slot)| (i, slot.deliver_at));
                     match due {
                         Some((i, at)) if at <= now => {
@@ -671,7 +677,7 @@ impl Receiver {
             self.closed = Some(CloseReason::Timeout);
             return;
         }
-        self.release(now);
+        self.release(now, true);
         if self.ack_pos != self.last_ack_sent && now - self.last_full_ack >= ACK_INTERVAL {
             self.full_ack(now);
         }
@@ -1149,6 +1155,47 @@ mod tests {
     }
 
     #[test]
+    fn queued_reordered_data_survives_an_overdue_receive_batch() {
+        let mut r = rx();
+        // All three datagrams are already readable after the adapter was
+        // descheduled beyond the delivery deadline. The missing original is
+        // later in that ready batch; expiry must wait until it is drained.
+        r.on_data(300 * MS, &data(ISN, 0, b"0"));
+        r.on_data(300 * MS, &data(ISN + 2, 2 * MS as u32, b"2"));
+        assert_eq!(r.stats().dropped, 0, "do not expire between ready reads");
+        r.on_data(300 * MS, &data(ISN + 1, MS as u32, b"1"));
+        r.on_timer(300 * MS);
+        assert_eq!(
+            marked(&mut r),
+            vec![
+                (b"0".to_vec(), false),
+                (b"1".to_vec(), false),
+                (b"2".to_vec(), false)
+            ]
+        );
+        assert_eq!(r.stats().dropped, 0);
+        assert_eq!(r.stats().belated, 0);
+    }
+
+    #[test]
+    fn an_overdue_batch_still_marks_a_gap_when_no_recovery_is_queued() {
+        let mut r = rx();
+        r.on_data(300 * MS, &data(ISN, 0, b"0"));
+        r.on_data(300 * MS, &data(ISN + 2, 2 * MS as u32, b"2"));
+        assert_eq!(r.stats().dropped, 0);
+        assert!(
+            r.next_timer() <= 300 * MS,
+            "gap expiry remains immediately due"
+        );
+        r.on_timer(300 * MS);
+        assert_eq!(
+            marked(&mut r),
+            vec![(b"0".to_vec(), false), (b"2".to_vec(), true)]
+        );
+        assert_eq!(r.stats().dropped, 1);
+    }
+
+    #[test]
     fn the_payload_after_a_given_up_packet_is_marked_and_only_that_one() {
         let mut r = rx();
         r.on_data(0, &data(ISN, 0, b"0"));
@@ -1465,7 +1512,7 @@ mod tests {
             }
             head = head.next();
         }
-        r.release(now);
+        r.release(now, true);
         assert_eq!(r.head, head);
         assert_eq!(r.lost, lost);
         assert_eq!(r.deliver, deliveries);
