@@ -964,23 +964,39 @@ There is no ICE restart in v1.
 
   So a re-sent check that arrives after its original draws nothing while
   its ID is remembered, and any amount of re-sending, copying or racing
-  draws at most four times what the attacker sent from that address.
-  Against an observer that copies and spoofs but cannot drop or delay the
-  publisher's packets, the publisher's address stays validated while it
-  keeps delivering media: pushing it out would take `max_tuples` - 2 other
-  addresses (6 by default) each with fresh media at least as new as the
-  publisher's last, so that many of the publisher's packets in a row each
-  beaten by a copy from another address, or lost and copied. Short of
+  draws at most four times what the attacker sent from that address. A
+  full table evicts an address that is neither selected nor the send
+  address: one that has never delivered fresh media first, then the one
+  whose last fresh media is oldest, the earliest validated breaking ties.
+  An address validated again starts with no media. Checks alone, replayed
+  or not, never push out an address that has delivered fresh media since
+  it was validated. Pushing the publisher's address out takes
+  `max_tuples` - 2 other addresses (6 by default) each with fresh media at
+  least as new as the publisher's last, and a selected address other than
+  the publisher's. An observer that copies and spoofs gets them from
+  forgotten check IDs, one of them carrying USE-CANDIDATE, and that many
+  of the publisher's packets that the session never received on their
+  original index while each was inside the replay window (1024 packets per
+  SSRC, about 20 s of Opus at 50 a second): packets lost after the
+  observer saw them, or beaten by its copies. No race is needed: it can
+  keep lost packets and send them, with a forgotten check from a new
+  address, in one burst between two of the publisher's packets, and RTX
+  resends go on their own SSRC, leaving the original index open. Short of
   that, after a won race or a copy of a lost packet, the publisher loses
   no media and sends are back with it at its next packet that arrives
-  before any copy of it. The bound does not cover an attacker who wins
-  every race, or drops or delays the publisher's packets (RFC 8445 section
-  19.2): it can keep them from counting as fresh, push the publisher's
-  address out so its media is dropped until one of its own checks arrives
-  before any copy of it (a check whose copy came first is refused as a
-  replay), and keep sapflow's sends, PLIs and NACKs among them, away from
-  the publisher, which disrupts delivery, though still not beyond four
-  times what it sends.
+  before any copy of it. Once pushed out, the publisher's media is dropped
+  until one of its own checks arrives before any copy of it (a check whose
+  copy came first is refused as a replay). That check brings its address
+  back with no media, below every address that has some, so one more
+  forgotten check from a new address that lands before the publisher's
+  next packet pushes it out again: that needs no race, only the gap. The
+  exception is a check of the publisher's that carries USE-CANDIDATE: its
+  address becomes the selected one and is kept while it stays selected. An
+  attacker who wins every race, or drops or delays the publisher's packets
+  (RFC 8445 section 19.2), can also keep them from ever counting as fresh
+  and keep sapflow's sends, PLIs and NACKs among them, away from the
+  publisher. That disrupts delivery, though still not beyond four times
+  what the attacker sends.
   This is shown in process (W3a); no real browser has yet been seen to
   move pairs mid-handshake.
 
@@ -1351,10 +1367,10 @@ Implementation notes (W3a, 11 November 2026):
     `stun::request_username` and the session's `local_ufrag`, then by
     `Session::accepts`.
   - Tuple ownership. A session's validated tuples never age (up to
-    `max_tuples`, oldest evicted first), so once a NAT gives a port to a
-    second publisher, two sessions can both accept the same tuple. The
-    UDP owner must map each tuple to one session, the one whose check from
-    it came last, and must not route by `accepts` alone.
+    `max_tuples`, the stalest media evicted first), so once a NAT gives a
+    port to a second publisher, two sessions can both accept the same
+    tuple. The UDP owner must map each tuple to one session, the one whose
+    check from it came last, and must not route by `accepts` alone.
   - Pending-session caps, in total and per address.
   - A muted video section draws a PLI every second: `sapflow-rtp` asks
     again every `keyframe_retry` while it waits for an IDR. That case has
@@ -1362,6 +1378,12 @@ Implementation notes (W3a, 11 November 2026):
     over budget is dropped; what the budget decides is whether each PLI
     goes out, which depends on the publisher's sender reports and checks
     keeping its tuple's budget up.
+  - Eviction memory. A tuple validated again starts with no media, so a
+    publisher that comes back after being pushed out is first in line to
+    go again. Consider keeping a tuple's last media time across
+    re-validation, in a small bounded memory of evicted tuples. No test
+    yet covers an honest NAT rebinding or an honest pair move with the
+    table full; add both.
   - A publisher's `close_notify` can be lost. DTLS is taken only from the
     selected tuple but sent to the send tuple, so once they differ a
     `close_notify` from the media tuple is dropped. A graceful end should

@@ -30,23 +30,38 @@
 //!   or SRTCP packet (authenticated and inside the replay window) from a
 //!   tuple with current consent, and nomination no longer moves it: a
 //!   publisher's own move is followed by its next packet on the new pair.
-//! - **Eviction keeps the publisher.** A full table evicts a tuple that is
-//!   neither selected nor the send tuple: one that has never delivered
-//!   fresh media first, then the one whose last fresh media is oldest. So
-//!   against an observer that copies and spoofs but cannot drop or delay
-//!   the publisher's packets, the publisher's tuple stays validated while
-//!   it keeps delivering media: pushing it out would take `max_tuples` - 2
-//!   other tuples (6 by default) each with fresh media at least as new as
-//!   the publisher's last, so that many of the publisher's packets in a row
-//!   each beaten by a copy from another tuple, or lost and copied. Short of
-//!   that, after one won race or one copy of a lost packet, the publisher
-//!   loses no media and sends are back with it at its next packet that
-//!   arrives before any copy of it. An attacker who wins every race, or
-//!   drops or delays the publisher's packets (RFC 8445 section 19.2), can
-//!   keep its packets from ever counting as fresh, push its tuple out so
-//!   its media is dropped until one of its own checks arrives before any
-//!   copy of it (a check whose copy came first is refused as a replay), and
-//!   keep sends away from it, though never beyond the per-tuple bound.
+//! - **Eviction ranks tuples by their fresh media.** A full table evicts a
+//!   tuple that is neither selected nor the send tuple: one that has never
+//!   delivered fresh media first, then the one whose last fresh media is
+//!   oldest, the earliest validated breaking ties. A tuple validated again
+//!   starts with no media. Checks alone, replayed or not, never push out a
+//!   tuple that has delivered fresh media since it was validated. Pushing
+//!   the publisher's tuple out takes `max_tuples` - 2 other tuples (6 by
+//!   default) each with fresh media at least as new as the publisher's
+//!   last, and a selected tuple other than the publisher's. An observer
+//!   that copies and spoofs gets them from forgotten check IDs, one of them
+//!   carrying USE-CANDIDATE, and that many of the publisher's packets that
+//!   the session never received on their original index while each was
+//!   inside the replay window (1024 packets per SSRC, about 20 s of Opus at
+//!   50 a second): packets lost after the observer saw them, or beaten by
+//!   its copies. No race is needed: it can keep lost packets and send them,
+//!   with a forgotten check from a new tuple, in one burst between two of
+//!   the publisher's packets, and RTX resends go on their own SSRC, leaving
+//!   the original index open. Short of that, after a won race or a copy of
+//!   a lost packet, the publisher loses no media and sends are back with it
+//!   at its next packet that arrives before any copy of it. Once pushed
+//!   out, the publisher's media is dropped until one of its own checks
+//!   arrives before any copy of it (a check whose copy came first is
+//!   refused as a replay). That check brings its tuple back with no media,
+//!   below every tuple that has some, so one more forgotten check from a
+//!   new tuple that lands before the publisher's next packet pushes it out
+//!   again: that needs no race, only the gap. The exception is a check of
+//!   the publisher's that carries USE-CANDIDATE: its tuple becomes the
+//!   selected one and is kept while it stays selected. An attacker who wins
+//!   every race, or drops or delays the publisher's packets (RFC 8445
+//!   section 19.2), can also keep them from ever counting as fresh and keep
+//!   sapflow's sends, PLIs and NACKs among them, away from the publisher.
+//!   None of this goes beyond the per-tuple bound.
 //! - **DTLS from the selected tuple only.** `sapflow-dtls` is fed only
 //!   datagrams from the selected tuple. A few that arrive from a validated
 //!   tuple before its USE-CANDIDATE check ([`SessionConfig::max_early_dtls`])
