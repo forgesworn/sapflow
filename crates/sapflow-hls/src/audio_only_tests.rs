@@ -717,3 +717,29 @@ fn audio_pdt_is_media_anchored_under_jitter_and_reanchors_real_breaks_without_ov
         .expect("resumed part floor identifies its first segment");
     assert!(rollback.discontinuity && rollback.start >= end);
 }
+
+/// AAC keeps its cumulative rule: each frame's timestamp against the run's
+/// origin plus its sample count, within 2 ms. A source drifting steadily
+/// still breaks there (Opus compares step by step instead).
+#[test]
+fn aac_from_a_drifting_source_breaks_at_the_cumulative_rule() {
+    for (ppm, count, first) in [(100.0f64, 5, 20.0), (500.0, 29, 4.0), (-500.0, 29, 4.0)] {
+        let mut muxer = Muxer::audio_only(MuxerConfig::default(), audio(48_000))
+            .expect("supported AAC-only muxer configuration");
+        let step = 1920.0 * (1.0 + ppm * 1e-6);
+        let mut losses = Vec::new();
+        for frame in 0..(120 * 48_000 / 1024) {
+            let pts = (f64::from(frame) * step) as i64;
+            let up = muxer
+                .push_audio_at(pts, Bytes::from_static(&[1, 2, 3]), now())
+                .expect("valid AAC frame");
+            if up.media_loss {
+                losses.push(pts as f64 / 90_000.0);
+            }
+        }
+        assert_eq!(losses.len(), count, "{ppm} ppm: {losses:?}");
+        // 180 ticks of drift at this rate, and every such span after.
+        let at = losses[0];
+        assert!((at - first).abs() < 0.2, "{ppm} ppm: first at {at}");
+    }
+}

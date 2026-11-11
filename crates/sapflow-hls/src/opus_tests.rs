@@ -1102,6 +1102,33 @@ fn video_led_opus_durations_follow_the_timestamps_within_the_slew() {
     }
 }
 
+/// Video-led steps other than slew, as a timeline hold or a step by arrival
+/// time makes: a repeated timestamp gives a sample no duration, a step of up
+/// to three packets is kept, and a longer one gives the packet its own.
+#[test]
+fn video_led_opus_keeps_steps_up_to_three_packets() {
+    for (step, expected) in [
+        (0, 0),
+        (1800 * 5 / 2, 2400),
+        (1800 * 3, 2880),
+        (1800 * 7 / 2, 960),
+    ] {
+        let mut m = av_muxer();
+        m.push_audio(0, Bytes::from(packet(960, true)))
+            .expect("Opus");
+        m.push_audio(step, Bytes::from(packet(960, true)))
+            .expect("Opus");
+        let first = m
+            .part
+            .as_ref()
+            .expect("part")
+            .audio
+            .first()
+            .map(|s| s.duration);
+        assert_eq!(first, Some(expected), "step {step}");
+    }
+}
+
 #[test]
 fn audio_only_opus_reports_a_missing_repeated_or_backward_timestamp_as_loss() {
     let mut m = audio_only(MuxerConfig::default(), 2);
