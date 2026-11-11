@@ -11,7 +11,8 @@ Writes one file per capture to OUT_DIR, each a sequence of records
 
   h264.rec        H.264, plain RTP and RTCP
   opus.rec        Opus, plain RTP and RTCP
-  h264-srtp.rec   H.264 under SRTP_AES128_CM_HMAC_SHA1_80, with the
+  h264-srtp.rec   H.264 under SRTP_AES128_CM_HMAC_SHA1_80, starting at
+                  sequence number 65520 so it crosses the wrap, with the
                   public test key below (FFmpeg's -srtp_out_params is
                   base64 of the 16-byte master key and 14-byte salt)
 
@@ -102,7 +103,10 @@ def main():
     srtp = ['-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80', '-srtp_out_params', params]
     capture(args.ffmpeg, 'h264', video, h264, 'rtp', [], args.out_dir, 6, 400)
     capture(args.ffmpeg, 'opus', audio, opus, 'rtp', [], args.out_dir, 6, 400)
-    capture(args.ffmpeg, 'h264-srtp', video, h264, 'srtp', srtp, args.out_dir, 6, 30)
+    # Start near the top of the sequence space so the fixture crosses the
+    # wrap and ROC 1 is checked against FFmpeg too.
+    capture(args.ffmpeg, 'h264-srtp', video, h264, 'srtp', srtp + ['-seq', '65520'],
+            args.out_dir, 6, 30)
 
 
 if __name__ == '__main__':

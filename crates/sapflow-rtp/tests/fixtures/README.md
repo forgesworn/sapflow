@@ -9,6 +9,8 @@ black box by `tests/capture_ffmpeg.py`:
 - Output: `-f rtp -srtp_out_suite AES_CM_128_HMAC_SHA1_80` to `srtp://` on
   127.0.0.1, with `-srtp_out_params` set to base64 of the public test master
   key `10 11 ... 1f` and salt `40 41 ... 4d`. The key protects nothing else.
+- Sequence numbers start at 65520 (`-seq 65520`), so the 30 packets cross
+  the wrap and the later ones are under ROC 1.
 - Contents: the first 30 SRTP packets and the two SRTCP sender reports, as
   records of `[channel (0 RTP, 1 RTCP), u16 big-endian length, datagram]`.
 

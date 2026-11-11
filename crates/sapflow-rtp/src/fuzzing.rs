@@ -107,15 +107,11 @@ pub fn rtp_packet(data: &[u8]) -> bool {
     );
     if let Some(ext) = p.extension() {
         let _ = ext.form();
-        for e in ext.elements() {
+        // Bounded so a 64 KB extension stays cheap per execution.
+        for e in ext.elements().take(16) {
             assert!(e.data.len() <= ext.data().len());
-            assert!(p.extension_element(e.id).is_some());
-        }
-        for id in 0..=255u8 {
-            assert_eq!(
-                ext.get(id),
-                ext.elements().find(|e| e.id == id).map(|e| e.data)
-            );
+            let first = ext.elements().find(|f| f.id == e.id).map(|f| f.data);
+            assert_eq!(p.extension_element(e.id), first);
         }
     }
     true

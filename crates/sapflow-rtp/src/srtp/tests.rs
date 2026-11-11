@@ -183,6 +183,9 @@ fn rfc7714_16_2_aes256() {
         .encrypt_inout_detached(&iv, &plain, (&mut [0u8; 0][..]).into())
         .expect("16.2.3");
     assert_eq!(tag.as_slice(), hex("a866d591 0f887463 067ceefe c45215d4"));
+    keys.cipher
+        .decrypt_inout_detached(&iv, &plain, (&mut [0u8; 0][..]).into(), &tag)
+        .expect("16.2.4 verifies");
 }
 
 // ---- RFC 7714 section 17 (RTCP) ---------------------------------------------
@@ -777,10 +780,10 @@ fn fixture_records(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
 }
 
 /// FFmpeg 8.1.2, run as a black box with `-srtp_out_suite
-/// AES_CM_128_HMAC_SHA1_80` and a public test key
-/// (`tests/fixtures/README.md`): every SRTP and SRTCP packet it sent
-/// unprotects with our code, reads as RTP or RTCP, and protects back with
-/// our code to exactly FFmpeg's bytes.
+/// AES_CM_128_HMAC_SHA1_80`, a public test key and a start at sequence
+/// number 65520 (`tests/fixtures/README.md`): every SRTP and SRTCP packet it
+/// sent, across the wrap into ROC 1, unprotects with our code, reads as RTP
+/// or RTCP, and protects back with our code to exactly FFmpeg's bytes.
 #[test]
 fn ffmpeg_srtp_interop() {
     let records = fixture_records(include_bytes!("../../tests/fixtures/ffmpeg-srtp-h264.rec"));
@@ -835,4 +838,12 @@ fn ffmpeg_srtp_interop() {
         }
     }
     assert_eq!((rtp_count, rtcp_count), (30, 2));
+    // The capture starts at 65520, so the last 14 packets are under ROC 1.
+    assert_eq!(first.map(|(_, seq)| seq), Some(65_520));
+    let ssrc = first.map(|(s, _)| s).expect("stream");
+    let slot = inbound.rtp.find(ssrc).expect("stream");
+    assert_eq!(
+        inbound.rtp.window(slot).expect("w").top(),
+        Some(65_536 + 13)
+    );
 }
