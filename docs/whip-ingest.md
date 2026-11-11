@@ -1437,7 +1437,7 @@ Implementation notes (W3c part 1, 11 November 2026):
 
 | Claim | Test | Status |
 |---|---|---|
-| A3.1: Chrome publishes through `POST`, LL-HLS plays in hls.js, the recording opens | `scripts/whip-e2e.js` | Partial: headless Chrome 157 on the test host, one run: 10.1 s played at 640x360 (206 frames decoded); the recording decoded 245 H.264 frames at 640x360 and 607 stereo Opus frames, and a frame from each was saved. Other browsers, and the DTLS handshake with every target, are later gates |
+| A3.1: Chrome publishes through `POST`, LL-HLS plays in hls.js, the recording opens | `scripts/whip-e2e.js` | Partial: headless Chrome 157 on the test host, the gate run: 10.1 s played at 640x360 (206 frames decoded, none dropped); the recording decoded 247 H.264 frames at 640x360 and 615 stereo Opus frames, and a frame from each was saved. Other browsers, and the DTLS handshake with every target, are later gates |
 | A3.1 in process: `POST`, ICE, DTLS, SRTP over UDP, media in the playlist | `whip::tests::a_publisher_reaches_the_stream_through_post_and_udp` | Met, with the scripted publisher |
 | A3.2 (basic): `DELETE` needs the token, answers `200`, the session is gone, and an immediate `POST` takes the held stream | the same test | Partial: the callbacks, the grace and a handshake timeout at server level are not observed |
 | Refusals before admission: 404, 405 with `Allow`, 401, 415, 413 by `content-length`, 400, 422; 409 and 401 from admission | `whip::tests::refusals_carry_their_statuses`, `whip_request::tests` | Met for these. 403, 429 and 503 from the app are not tested |
