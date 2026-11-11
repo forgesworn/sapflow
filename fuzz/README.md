@@ -119,6 +119,9 @@ source-EOF qualification. No Rust build is involved.
 | `h264_depacketise` | Our H.264 RTP depacketiser (`sapflow_rtp::h264`): records of a flag byte (marker, new timestamp, loss before) and a payload, under default or small limits; every access unit must re-parse within its limits, in timestamp order |
 | `opus_depacketise` | The Opus TOC and framing parser on the whole input, then the Opus depacketiser on records with timestamp steps and losses; frames must parse, fills must come before the packet and within the limit, and the timeline may only have holes under 2.5 ms or at a reported discontinuity. A flag holds arrival time still, as a sender lying about its timestamps would; fill must stay within arrival time plus the allowance, per gap and in total, and frames within a constant per packet plus that fill |
 | `reorder_nack` | Our receiver (`sapflow_rtp::receive`) with a video stream (RTX negotiated) and an audio stream: video, audio and RTX packets with explicit sequence numbers, clock steps forward and back, strangers. Buffers stay within their packet and byte bounds, every NACK reads back through the RTCP parser and names only missing packets, losses only move forward, and the next timer is always later than the one just run. Audio timestamps can be stepped at will; events generated (queued or dropped) must stay within 16 per input byte plus the 2.5 ms fill frames that elapsed time, the fill limit and the allowance account for |
+| `rr_stats` | Our receiver report statistics (`sapflow_rtp::stats`, RFC 3550 A.3 and A.8): packets with arbitrary sequence numbers, timestamp steps and arrival times, taken as first arrivals, repeats, probes or confirmed restarts, with sender reports and reports between. Checked against a model that keeps every counted sequence number: the count, extended highest sequence number, cumulative and fractional loss and DLSR must match exactly, loss never goes negative, and every block survives the RR builder and parser (the 24-bit clamp included) |
+| `twcc_feedback` | Our transport-cc recorder and encoder (`sapflow_rtp::twcc`): transport-wide sequence numbers from the input (wraps, far jumps, reordering, copies), malformed extensions, time steps of 100 us to seconds, and the feedback timer, under default or small packet and pending caps. Every feedback packet is read back by our own parser: each recorded packet is reported received exactly once, in order, at its exact arrival time in 250 us units with the 24-bit reference time, nothing else is, no packet exceeds its cap, the feedback count runs on, and nothing stays pending |
+| `sr_timeline` | Our receiver with video, RTX, audio and transport-cc (`sapflow_rtp::receive`, `sapflow_rtp::timeline`): media with timestamps stepped forward or back, RTX, strangers, sender reports honest, skewed or arbitrary (NTP zero and the maximum included), other RTCP and clock steps, with or without the start hold. Frames come only after one `Aligned` event and the hold ends on time; each stream's `pts` never goes back and never runs ahead of arrival time beyond the timeline's stated bound; every RTCP datagram parses, leads with a receiver report unless reduced-size, stays within its cap and reports no negative loss; queued events and pending transport-cc stay bounded; events and datagrams stay within a constant per record plus what elapsed time accounts for |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
@@ -328,6 +331,20 @@ RTX answers, reordering, a duplicate, clock steps and a stranger. The seed
 test requires each to produce output (an access unit, a frame, feedback or
 a valid packet). To regenerate:
 `cargo test -p sapflow-rtp --lib -- --ignored write_media_seeds`.
+
+The feedback targets' seeds (`rr_stats`, `twcc_feedback`, `sr_timeline`)
+are made from the same fixtures: the H.264 capture's sequence numbers with
+drops, copies, a probe and a restart, and the Opus capture with jitter; the
+two captures interleaved as one transport with losses, reordering, a copy,
+a long pause and a far jump; and the captures on one clock with honest
+sender reports, skewed ones, none (under small bounds), hostile ones, and
+video only over RTX. Each is within 256 records, so every record is read.
+The seed test requires each to report, give feedback or make frames, and
+each `sr_timeline` seed to align as its name says. To regenerate:
+`cargo test -p sapflow-rtp --lib -- --ignored write_feedback_seeds`.
+`mutation_smoke`, also ignored, runs mutated seeds through the three
+targets (`SAPFLOW_FUZZ_SMOKE` inputs per target, `SAPFLOW_FUZZ_SEED`); it is
+not coverage-guided and does not replace a cargo-fuzz run.
 
 No local cargo-fuzz run of these targets has been made; CI's 60 s per
 target and the nightly run are their first fuzzing. After merge, a longer
