@@ -1,7 +1,10 @@
-//! H.264 and AAC: just enough to describe the tracks and frame the samples.
+//! H.264, AAC and Opus: just enough to describe the tracks and frame the
+//! samples.
 //!
 //! Bitstream parsing is delegated to `h264-reader` (Annex B splitting, SPS)
-//! and `adts-reader` (ADTS headers). This module is glue around them.
+//! and `adts-reader` (ADTS headers). This module is glue around them, plus
+//! the Opus packet framing check (RFC 6716 sections 3.1 to 3.4), which reads
+//! only the TOC byte, frame count, frame lengths and padding.
 
 use std::io::Read;
 
@@ -273,6 +276,276 @@ const SAMPLE_RATES: [u32; 13] = [
 /// Samples per AAC frame.
 pub const AAC_FRAME_SAMPLES: u32 = 1024;
 
+/// Samples per second of every Opus stream: the decoder's output rate and the
+/// RTP clock (RFC 7587 section 4.1), and the track timescale sapflow uses.
+pub const OPUS_SAMPLE_RATE: u32 = 48_000;
+
+/// The longest Opus packet, 120 ms at 48 kHz (RFC 6716 section 3.2.5).
+pub const OPUS_MAX_PACKET_SAMPLES: u32 = 5_760;
+
+/// The largest Opus frame in bytes (RFC 6716 section 3.4, R2).
+const OPUS_MAX_FRAME_BYTES: usize = 1_275;
+
+/// Opus as one connection carries it: 48 kHz, one or two output channels,
+/// channel mapping family 0 (RFC 7845 section 5.1.1.1).
+///
+/// RTP carries no Opus identification header, so the count is set by rule:
+/// 2 when stereo was negotiated or the first packet's TOC byte is stereo,
+/// otherwise 1 ([`OpusConfig::for_first_packet`]). A decoder set up for
+/// either count decodes both mono and stereo packets, so a stream whose TOC
+/// stereo flag later changes keeps its configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OpusConfig {
+    /// Output channel count: 1 or 2.
+    pub channels: u8,
+}
+
+impl OpusConfig {
+    /// One output channel.
+    pub const MONO: Self = Self { channels: 1 };
+    /// Two output channels.
+    pub const STEREO: Self = Self { channels: 2 };
+
+    /// The configuration for `channels`, or `None` for any count but 1 or 2.
+    pub fn new(channels: u8) -> Option<Self> {
+        let config = Self { channels };
+        config.is_supported().then_some(config)
+    }
+
+    /// The configuration for a stream that starts with `packet`: stereo if
+    /// `stereo_negotiated` (`stereo=1` in the SDP answer) or if the packet's
+    /// TOC stereo flag is set, otherwise mono. `None` if the packet is not a
+    /// valid Opus packet ([`opus_packet`]).
+    pub fn for_first_packet(stereo_negotiated: bool, packet: &[u8]) -> Option<Self> {
+        let packet = opus_packet(packet)?;
+        Some(if stereo_negotiated || packet.stereo {
+            Self::STEREO
+        } else {
+            Self::MONO
+        })
+    }
+
+    /// Whether sapflow can describe this configuration: one or two channels.
+    pub fn is_supported(&self) -> bool {
+        (1..=2).contains(&self.channels)
+    }
+
+    /// The `CODECS` value for Opus in an MP4 `Opus` sample entry: `Opus`,
+    /// the sample entry's four-character code, which RFC 6381 section 3.3
+    /// makes the first element of an ISO BMFF codecs value and calls case
+    /// sensitive. Chrome 157 and Firefox 160 accept both spellings.
+    pub fn codec_string(&self) -> String {
+        "Opus".to_owned()
+    }
+}
+
+/// What one Opus packet's TOC byte and frame count say (RFC 6716 section 3.1
+/// and 3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OpusPacket {
+    /// The TOC stereo flag.
+    pub stereo: bool,
+    /// Frames in the packet, 1 to 48.
+    pub frames: u8,
+    /// Duration of each frame in 48 kHz samples: 120 (2.5 ms) to 2880 (60 ms).
+    pub frame_samples: u32,
+}
+
+impl OpusPacket {
+    /// A packet description, for code that stands in for [`opus_packet`].
+    pub fn new(stereo: bool, frames: u8, frame_samples: u32) -> Self {
+        Self {
+            stereo,
+            frames,
+            frame_samples,
+        }
+    }
+
+    /// The packet's duration in 48 kHz samples, at most
+    /// [`OPUS_MAX_PACKET_SAMPLES`].
+    pub fn samples(&self) -> u32 {
+        u32::from(self.frames) * self.frame_samples
+    }
+}
+
+/// Frame duration in 48 kHz samples for a TOC configuration number (RFC 6716
+/// section 3.1, Table 2).
+fn opus_frame_samples(config: u8) -> u32 {
+    match config {
+        // SILK only: 10, 20, 40 or 60 ms.
+        0..=11 => [480, 960, 1920, 2880][usize::from(config % 4)],
+        // Hybrid: 10 or 20 ms.
+        12..=15 => [480, 960][usize::from(config % 2)],
+        // CELT only: 2.5, 5, 10 or 20 ms.
+        _ => [120, 240, 480, 960][usize::from(config % 4)],
+    }
+}
+
+/// One frame length (RFC 6716 section 3.2.1): a byte below 252, otherwise
+/// that byte plus four times the next. Returns the length and the bytes read.
+fn opus_frame_length(buf: &[u8]) -> Option<(usize, usize)> {
+    let first = usize::from(*buf.first()?);
+    if first < 252 {
+        return Some((first, 1));
+    }
+    let second = usize::from(*buf.get(1)?);
+    Some((4 * second + first, 2))
+}
+
+/// Checks one Opus packet against the framing rules R1 to R7 of RFC 6716
+/// section 3.4 and reads its duration. `None` for a malformed packet,
+/// including one longer than 120 ms. Nothing in the packet is decoded.
+pub fn opus_packet(packet: &[u8]) -> Option<OpusPacket> {
+    // R1: at least one byte.
+    let (&toc, rest) = packet.split_first()?;
+    let frame_samples = opus_frame_samples(toc >> 3);
+    let frames = match toc & 0x03 {
+        // One frame (R2).
+        0 => {
+            if rest.len() > OPUS_MAX_FRAME_BYTES {
+                return None;
+            }
+            1
+        }
+        // Two frames of equal size (R2, R3).
+        1 => {
+            if rest.len() % 2 != 0 || rest.len() / 2 > OPUS_MAX_FRAME_BYTES {
+                return None;
+            }
+            2
+        }
+        // Two frames, the first one's length coded (R2, R4).
+        2 => {
+            let (first, used) = opus_frame_length(rest)?;
+            let remaining = rest.len() - used;
+            if first > remaining
+                || first > OPUS_MAX_FRAME_BYTES
+                || remaining - first > OPUS_MAX_FRAME_BYTES
+            {
+                return None;
+            }
+            2
+        }
+        // Any number of frames (section 3.2.5; R2, R5 to R7).
+        _ => {
+            let (&count, mut rest) = rest.split_first()?;
+            let vbr = count & 0x80 != 0;
+            let frames = count & 0x3f;
+            if frames == 0 || u32::from(frames) * frame_samples > OPUS_MAX_PACKET_SAMPLES {
+                return None;
+            }
+            // Padding: each length byte of 255 means 254 octets and another
+            // length byte; the last is 0 to 254. The octets end the packet.
+            let mut padding = 0usize;
+            if count & 0x40 != 0 {
+                loop {
+                    let (&p, tail) = rest.split_first()?;
+                    rest = tail;
+                    if p == 255 {
+                        padding += 254;
+                    } else {
+                        padding += usize::from(p);
+                        break;
+                    }
+                }
+            }
+            let body = rest.get(..rest.len().checked_sub(padding)?)?;
+            let frames_usize = usize::from(frames);
+            if vbr {
+                let (mut at, mut coded) = (0usize, 0usize);
+                for _ in 1..frames {
+                    let (len, used) = opus_frame_length(body.get(at..)?)?;
+                    if len > OPUS_MAX_FRAME_BYTES {
+                        return None;
+                    }
+                    at += used;
+                    coded += len;
+                }
+                let data = body.len().checked_sub(at)?;
+                if coded > data || data - coded > OPUS_MAX_FRAME_BYTES {
+                    return None;
+                }
+            } else if body.len() % frames_usize != 0
+                || body.len() / frames_usize > OPUS_MAX_FRAME_BYTES
+            {
+                return None;
+            }
+            frames
+        }
+    };
+    Some(OpusPacket {
+        stereo: toc & 0x04 != 0,
+        frames,
+        frame_samples,
+    })
+}
+
+/// The audio track's codec: AAC as before, or Opus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AudioConfig {
+    /// AAC, described by its AudioSpecificConfig.
+    Aac(AacConfig),
+    /// Opus at 48 kHz.
+    Opus(OpusConfig),
+}
+
+impl AudioConfig {
+    /// The track timescale: the AAC sample rate, or 48 kHz for Opus.
+    pub fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Aac(a) => a.sample_rate,
+            Self::Opus(_) => OPUS_SAMPLE_RATE,
+        }
+    }
+
+    /// The channel count the sample entry declares.
+    pub fn channels(&self) -> u8 {
+        match self {
+            Self::Aac(a) => a.channels,
+            Self::Opus(o) => o.channels,
+        }
+    }
+
+    /// RFC 6381 codec string: `mp4a.40.2` for AAC-LC, `Opus` for Opus.
+    pub fn codec_string(&self) -> String {
+        match self {
+            Self::Aac(a) => a.codec_string(),
+            Self::Opus(o) => o.codec_string(),
+        }
+    }
+
+    /// The AAC configuration, or `None` for Opus.
+    pub fn aac(&self) -> Option<&AacConfig> {
+        match self {
+            Self::Aac(a) => Some(a),
+            Self::Opus(_) => None,
+        }
+    }
+
+    /// The Opus configuration, or `None` for AAC.
+    pub fn opus(&self) -> Option<&OpusConfig> {
+        match self {
+            Self::Opus(o) => Some(o),
+            Self::Aac(_) => None,
+        }
+    }
+}
+
+impl From<AacConfig> for AudioConfig {
+    fn from(value: AacConfig) -> Self {
+        Self::Aac(value)
+    }
+}
+
+impl From<OpusConfig> for AudioConfig {
+    fn from(value: OpusConfig) -> Self {
+        Self::Opus(value)
+    }
+}
+
 /// Splits a buffer of ADTS frames (one PES payload) into raw AAC frames.
 /// Stops at the first malformed header.
 pub fn adts_frames(mut buf: &[u8]) -> Vec<(AacConfig, &[u8])> {
@@ -429,6 +702,142 @@ mod tests {
         }
         // The input that made h264-reader panic.
         assert_eq!(avc_decoder_config(&[1, 0, 0, 0, 0xff, 0xe1]), None);
+    }
+
+    /// RFC 6716 Table 2, written out: frame size in ms for configurations
+    /// 0 to 31.
+    const TABLE_2_MS: [f64; 32] = [
+        10.0, 20.0, 40.0, 60.0, 10.0, 20.0, 40.0, 60.0, 10.0, 20.0, 40.0,
+        60.0, // SILK NB, MB, WB
+        10.0, 20.0, 10.0, 20.0, // Hybrid SWB, FB
+        2.5, 5.0, 10.0, 20.0, 2.5, 5.0, 10.0, 20.0, 2.5, 5.0, 10.0, 20.0, 2.5, 5.0, 10.0,
+        20.0, // CELT NB, WB, SWB, FB
+    ];
+
+    fn ms(samples: u32) -> f64 {
+        f64::from(samples) / 48.0
+    }
+
+    #[test]
+    fn opus_duration_for_every_configuration_and_frame_count_code() {
+        for config in 0u8..32 {
+            let frame = TABLE_2_MS[usize::from(config)];
+            for stereo in [false, true] {
+                let toc = config << 3 | u8::from(stereo) << 2;
+                // Code 0: one frame of three bytes.
+                let p = opus_packet(&[toc, 1, 2, 3]).expect("code 0");
+                assert_eq!((ms(p.samples()), p.frames, p.stereo), (frame, 1, stereo));
+                // Code 1: two equal frames of two bytes each.
+                let p = opus_packet(&[toc | 1, 1, 2, 3, 4]).expect("code 1");
+                assert_eq!((ms(p.samples()), p.frames), (2.0 * frame, 2));
+                // Code 2: a one-byte frame, then a two-byte frame.
+                let p = opus_packet(&[toc | 2, 1, 9, 8, 7]).expect("code 2");
+                assert_eq!((ms(p.samples()), p.frames), (2.0 * frame, 2));
+                // Code 3: as many frames as fit in 120 ms, CBR, one byte each.
+                let most = (120.0 / frame) as u8;
+                let mut cbr = vec![toc | 3, most];
+                cbr.extend(std::iter::repeat_n(0xaa, usize::from(most)));
+                let p = opus_packet(&cbr).expect("code 3");
+                assert_eq!((ms(p.samples()), p.frames), (f64::from(most) * frame, most));
+                assert_eq!(p.samples(), OPUS_MAX_PACKET_SAMPLES);
+                // One frame more is over 120 ms (R5).
+                let mut long = vec![toc | 3, most + 1];
+                long.extend(std::iter::repeat_n(0xaa, usize::from(most) + 1));
+                assert_eq!(opus_packet(&long), None, "config {config}: over 120 ms");
+            }
+        }
+    }
+
+    #[test]
+    fn opus_code_3_padding_and_vbr() {
+        // CELT FB 20 ms (config 31), stereo, code 3.
+        let toc = 31 << 3 | 0x04 | 3;
+        // CBR, three frames of two bytes, padding: one length byte of 4,
+        // then four octets.
+        let mut p = vec![toc, 0x40 | 3, 4];
+        p.extend([1, 2, 3, 4, 5, 6]);
+        p.extend([0; 4]);
+        let info = opus_packet(&p).expect("padded CBR");
+        assert_eq!((info.frames, info.samples(), info.stereo), (3, 2880, true));
+        // A length byte of 255 is 254 octets and another length byte.
+        let mut p = vec![toc, 0x40 | 2, 255, 1, 7, 7];
+        p.extend(vec![0; 255]);
+        assert_eq!(opus_packet(&p).map(|i| i.samples()), Some(1920));
+        // Padding past the end (R6, R7).
+        assert_eq!(opus_packet(&[toc, 0x40 | 1, 5, 1, 2]), None);
+        assert_eq!(opus_packet(&[toc, 0x40 | 1]), None);
+        assert_eq!(opus_packet(&[toc, 0x40 | 1, 255]), None);
+        // CBR whose bytes do not divide into equal frames (R6).
+        assert_eq!(opus_packet(&[toc, 3, 1, 2, 3, 4]), None);
+        // VBR, three frames: lengths 1 and 2 coded, the last takes the rest,
+        // with two octets of padding.
+        let p = [toc, 0x80 | 0x40 | 3, 2, 1, 2, 9, 8, 8, 7, 7, 7, 0, 0];
+        assert_eq!(opus_packet(&p).map(|i| i.frames), Some(3));
+        // A two-byte frame length: 252 + 4 * 1 = 256 bytes.
+        let mut p = vec![toc, 0x80 | 2, 252, 1];
+        p.extend(vec![1; 256 + 3]);
+        assert_eq!(opus_packet(&p).map(|i| i.frames), Some(2));
+        // VBR lengths running past the end (R7).
+        assert_eq!(opus_packet(&[toc, 0x80 | 3, 5, 1, 1]), None);
+        assert_eq!(opus_packet(&[toc, 0x80 | 2, 252]), None);
+        // No frame-count byte, or a count of zero (R5).
+        assert_eq!(opus_packet(&[toc]), None);
+        assert_eq!(opus_packet(&[toc, 0]), None);
+    }
+
+    #[test]
+    fn opus_framing_refusals() {
+        // R1: an empty packet.
+        assert_eq!(opus_packet(&[]), None);
+        // A TOC byte alone is one zero-length frame (DTX), which is valid.
+        assert_eq!(opus_packet(&[0x78]).map(|p| p.samples()), Some(960));
+        // R2: one frame over 1275 bytes.
+        let mut p = vec![0x78];
+        p.extend(vec![0; 1275]);
+        assert!(opus_packet(&p).is_some());
+        p.push(0);
+        assert_eq!(opus_packet(&p), None);
+        // R3: code 1 with an odd number of frame bytes.
+        assert_eq!(opus_packet(&[0x79, 1, 2, 3]), None);
+        // R4: code 2 whose first length runs past the end, or is missing.
+        assert_eq!(opus_packet(&[0x7a, 5, 1, 2]), None);
+        assert_eq!(opus_packet(&[0x7a]), None);
+        assert_eq!(opus_packet(&[0x7a, 253]), None);
+        // R2 for code 2's second frame.
+        let mut p = vec![0x7a, 0];
+        p.extend(vec![0; 1276]);
+        assert_eq!(opus_packet(&p), None);
+    }
+
+    #[test]
+    fn opus_channel_count_follows_negotiation_or_the_first_toc() {
+        let mono = [0x78, 1];
+        let stereo = [0x7c, 1];
+        assert_eq!(
+            OpusConfig::for_first_packet(false, &mono),
+            Some(OpusConfig::MONO)
+        );
+        assert_eq!(
+            OpusConfig::for_first_packet(false, &stereo),
+            Some(OpusConfig::STEREO)
+        );
+        assert_eq!(
+            OpusConfig::for_first_packet(true, &mono),
+            Some(OpusConfig::STEREO)
+        );
+        assert_eq!(OpusConfig::for_first_packet(true, &[]), None);
+        let audio = AudioConfig::from(OpusConfig::STEREO);
+        assert_eq!(
+            (audio.sample_rate(), audio.channels(), audio.codec_string()),
+            (48_000, 2, "Opus".to_owned())
+        );
+        assert!(audio.aac().is_none() && audio.opus().is_some());
+        assert!(!OpusConfig { channels: 3 }.is_supported());
+        assert!(!OpusConfig { channels: 0 }.is_supported());
+        assert_eq!(OpusConfig::new(2), Some(OpusConfig::STEREO));
+        assert_eq!(OpusConfig::new(1), Some(OpusConfig::MONO));
+        assert_eq!(OpusConfig::new(3), None);
+        assert_eq!(OpusPacket::new(true, 2, 960).samples(), 1920);
     }
 
     #[test]
