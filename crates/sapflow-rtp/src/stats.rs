@@ -6,10 +6,18 @@
 //!
 //! - Only packets on the media SSRC. RTX packets are a separate RTP stream
 //!   (RFC 4588 section 6.2, SSRC multiplexing), so a packet repaired over
-//!   RTX still counts as lost here: the sender's loss-based rate control
-//!   sees the network's loss before repair. A sender without RTX (OBS)
+//!   RTX still counts as lost here: the report gives the network's loss
+//!   before repair. That is what the sender's loss-based rate control
+//!   needs: RFC 4588 section 7 asks it to keep the loss rate acceptable
+//!   whatever retransmission repairs, and transport-cc feedback likewise
+//!   reports each original that never arrived. A sender without RTX (OBS)
 //!   resends on the media SSRC and sequence number, which cannot be told
-//!   from a late original, so its repaired packets count as received.
+//!   from a late original, so its report gives loss after repair.
+//! - No report blocks for RTX streams. RFC 4588 section 6.2 describes them
+//!   for SSRC multiplexing; sapflow leaves them out, since the media block
+//!   already carries the loss the sender needs, and RTX's own sequence
+//!   numbers (padding probes included) and copied timestamps would give it
+//!   a loss and jitter of no use to rate control.
 //! - Each sequence number once. A copy of one already counted, whether a
 //!   network duplicate or a needless retransmission, changes nothing, so
 //!   cumulative loss never goes negative (Appendix A.3 counts duplicates;
