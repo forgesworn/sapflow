@@ -490,10 +490,11 @@ fn audio_only_session_aligns_on_its_report() {
     assert_eq!(pts, [0, 1800]);
 }
 
-/// A sender report far behind where the stream's timestamps put it:
-/// reported, and timestamps never go back.
+/// Two agreeing sender reports 400 ms ahead of where the stream's
+/// timestamps put it: pts move towards them at 500 ppm, with no
+/// discontinuity, and never back. A lone report is ignored.
 #[test]
-fn a_drifting_report_is_a_discontinuity() {
+fn a_report_error_within_the_lead_is_slewed() {
     let mut r = Receiver::new(no_hold(), Instant::now());
     let mut v = StreamConfig::new(Codec::H264, 96);
     v.ssrc = Some(7);
@@ -501,7 +502,7 @@ fn a_drifting_report_is_a_discontinuity() {
     r.add_stream(v).expect("video");
     rtcp(&mut r, 0, &sr(7, ntp_at(0), 0));
     let idr = [0x65, 0x88, 1];
-    let mut last = 0;
+    let mut last = None;
     for n in 0..60u64 {
         feed(
             &mut r,
@@ -511,30 +512,26 @@ fn a_drifting_report_is_a_discontinuity() {
         .expect("taken");
         r.handle_timeout(r.epoch + Duration::from_millis(n * 33 + 20));
         if n == 30 {
-            // The sender says frame 30 was 300 ms later than its RTP time.
-            rtcp(&mut r, n * 33 + 21, &sr(7, ntp_at(1_300_000), 90_000));
+            rtcp(&mut r, n * 33 + 21, &sr(7, ntp_at(1_400_000), 90_000));
+        }
+        if n == 50 {
+            rtcp(&mut r, n * 33 + 21, &sr(7, ntp_at(2_066_667), 150_000));
         }
         for e in std::iter::from_fn(|| r.poll_event()) {
             match e {
                 Event::AccessUnit { pts, .. } => {
-                    assert!(pts >= last, "{pts} after {last}");
-                    last = pts;
+                    assert!(last.is_none_or(|l| pts > l), "{pts} after {last:?}");
+                    last = Some(pts);
                 }
-                Event::Discontinuity {
-                    cause: Discontinuity::SenderReport { drift },
-                    ..
-                } => assert_eq!(drift, -27_000),
+                Event::Discontinuity { .. } => panic!("{e:?}"),
                 _ => {}
             }
         }
     }
-    assert_eq!(
-        r.stats(StreamId(0))
-            .expect("stats")
-            .timeline_discontinuities,
-        1
-    );
-    assert_eq!(last, 59 * 3000 + 27_000, "moved forward by the drift");
+    let stats = r.stats(StreamId(0)).expect("stats");
+    assert_eq!(stats.timeline_discontinuities, 0);
+    // Nine frames after the second report, 1.5 ticks each.
+    assert_eq!(last, Some(59 * 3000 + 13));
 }
 
 /// Video that only ever arrives over RTX (every original lost) still

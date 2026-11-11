@@ -17,9 +17,10 @@
 //! - `sr_timeline`: the receiver with video, audio, RTX and transport-cc,
 //!   fed media, sender reports (honest, skewed or arbitrary) and clock
 //!   steps. Frames come only after [`Event::Aligned`], each stream's `pts`
-//!   never goes back and never runs ahead of arrival time beyond the
-//!   timeline's stated bound, and every RTCP datagram parses, leads with a
-//!   receiver report (unless reduced-size) and stays within its cap.
+//!   strictly increases and stays within the timeline's stated bounds of
+//!   arrival time, above and below (each frame's own arrival, from
+//!   `Receiver::poll_event_at`), and every RTCP datagram parses, leads with
+//!   a receiver report (unless reduced-size) and stays within its cap.
 //!
 //! Each also bounds state (pending packets, queued events) and output (a
 //! constant per input record, plus what elapsed time accounts for).
@@ -427,6 +428,7 @@ fn run_sr_timeline(data: &[u8]) -> Option<Session> {
         now: 0,
         first_media: None,
         aligned: None,
+        aligned_ms: 0,
         last_pts: [None, None],
         frames: 0,
         events: 0,
@@ -566,6 +568,8 @@ struct Session {
     now: u64,
     first_media: Option<u64>,
     aligned: Option<Alignment>,
+    /// When the alignment was seen, in milliseconds.
+    aligned_ms: u64,
     last_pts: [Option<u64>; 2],
     frames: u64,
     events: usize,
@@ -612,12 +616,15 @@ impl Session {
             }
         }
         let lead = 90 * u64::try_from(cfg.timeline.max_lead.as_millis()).unwrap_or(0);
-        while let Some(e) = r.poll_event() {
+        while let Some((e, at)) = r.poll_event_at() {
             self.events += 1;
+            let arrival = u64::try_from(at.saturating_duration_since(self.start).as_micros())
+                .unwrap_or(u64::MAX);
             let (stream, pts) = match e {
                 Event::Aligned { alignment } => {
                     assert!(self.aligned.is_none(), "aligned once");
                     self.aligned = Some(alignment);
+                    self.aligned_ms = self.now;
                     continue;
                 }
                 Event::AccessUnit { stream, pts, .. } => (stream, pts),
@@ -633,7 +640,7 @@ impl Session {
             let k = stream.index();
             assert!(k < 2);
             if let Some(prev) = self.last_pts[k] {
-                assert!(pts >= prev, "pts {pts} after {prev}");
+                assert!(pts > prev, "pts {pts} after {prev}");
             }
             self.last_pts[k] = Some(pts);
             // Bounded by arrival time: 90 ticks a millisecond since the
@@ -642,6 +649,12 @@ impl Session {
             let elapsed = 90 * (self.now - self.first_media.expect("media came first"));
             let bound = elapsed + elapsed / 1000 + 2 * lead + self.frames;
             assert!(pts <= bound, "pts {pts} beyond {bound}");
+            // And from below, against the frame's own arrival: the lead
+            // twice (once for the alignment) and the slack, at most a lead,
+            // from where arrival time put the stream when aligned.
+            let floor = (u128::from(arrival) * 9 / 100) as u64;
+            let margin = 90 * self.aligned_ms + 3 * lead + 2;
+            assert!(pts + margin >= floor, "pts {pts} behind arrival {floor}");
         }
         // The start hold is bounded in time.
         let hold = u64::try_from(cfg.timeline.start_hold.as_millis()).unwrap_or(u64::MAX);

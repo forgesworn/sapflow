@@ -358,18 +358,21 @@ pub enum Discontinuity {
         /// Where it was.
         timestamp: u32,
     },
-    /// A frame's RTP timestamp went back, or ran further ahead of arrival
-    /// time than the timeline allows: the stream re-anchored on arrival
-    /// time, continuing from its last `pts`.
+    /// A frame's RTP timestamp went back by more than
+    /// [`TimelineConfig::max_lead`], jumped more than that past the
+    /// timeline's arrival bound, or fell behind arrival time by more than
+    /// it: the stream re-anchored on arrival time (see [`crate::timeline`]).
     Arrival {
         /// The frame's RTP timestamp.
         timestamp: u32,
     },
-    /// A sender report put the stream further from its RTP timestamps than
-    /// [`TimelineConfig::max_drift`].
+    /// Two agreeing sender reports put the stream more than
+    /// [`TimelineConfig::max_lead`] behind where its RTP timestamps had it,
+    /// and it moved forward by more than that. Smaller errors are slewed
+    /// without an event.
     SenderReport {
-        /// How far ahead the stream was, in 90 kHz ticks (negative:
-        /// behind, and it moved forward).
+        /// How far ahead the stream was, in 90 kHz ticks (negative here:
+        /// behind).
         drift: i64,
     },
 }
@@ -569,11 +572,11 @@ pub struct StreamStats {
     pub refused: u64,
     /// Sequence and timestamp discontinuities.
     pub discontinuities: u64,
-    /// Timeline discontinuities: re-anchors on arrival time, and sender
-    /// reports beyond the drift bound.
+    /// Timeline discontinuities: re-anchors on arrival time, and moves
+    /// forward to a sender report.
     pub timeline_discontinuities: u64,
-    /// Frames held to the timeline's arrival bound (see
-    /// [`crate::timeline`]), without a discontinuity.
+    /// Frames held to the timeline's arrival bound or continued by arrival
+    /// time (see [`crate::timeline`]), without a discontinuity.
     pub timeline_clamps: u64,
     /// Events dropped because the queue was full.
     pub events_dropped: u64,
@@ -1130,6 +1133,18 @@ impl Receiver {
             return None;
         }
         self.events.queue.pop_front().map(|q| q.event)
+    }
+
+    /// The next event and when the packet that released it arrived. For
+    /// tests: the timeline's bounds are in terms of that arrival.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn poll_event_at(&mut self) -> Option<(Event, Instant)> {
+        if self.events.timeline.holding() {
+            return None;
+        }
+        let q = self.events.queue.pop_front()?;
+        let at = self.epoch.checked_add(Duration::from_micros(q.arrival))?;
+        Some((q.event, at))
     }
 
     /// Appends the next RTCP datagram to send to `out`, if there is one,
