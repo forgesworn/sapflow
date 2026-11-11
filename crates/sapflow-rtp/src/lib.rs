@@ -58,7 +58,11 @@ pub mod twcc;
 #[doc(hidden)]
 pub mod fuzzing;
 
-pub use receive::{Event, Feedback, Receiver, ReceiverConfig, StreamConfig, StreamId};
+pub use receive::{
+    Event, Feedback, Receiver, ReceiverConfig, ReportConfig, StreamConfig, StreamId,
+};
+pub use timeline::{Alignment, TimelineConfig};
+pub use twcc::TransportCcConfig;
 pub use rtcp::{Compound, Packet, RtcpError};
 pub use rtp::{RtpError, RtpPacket};
 pub use srtp::{
