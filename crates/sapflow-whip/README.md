@@ -27,12 +27,17 @@ except the test-only example harness.
   no reply at all: no 400 or 401, unlike RFC 8489 section 9.1.3. 420 (with
   UNKNOWN-ATTRIBUTES) and 487 go only to authenticated requests. A response
   is never larger than its request; one that would be is not sent.
+- **Replays.** MESSAGE-INTEGRITY does not cover the source address (RFC
+  8445 section 19.2). The agent remembers the transaction IDs of its last
+  512 authenticated requests: a repeated one is answered only from the
+  tuple that first sent it, as a retransmission, and never validates,
+  nominates or renews consent; from any other tuple it gets nothing.
 - **Roles.** A lite agent is always controlled: a request with
   ICE-CONTROLLED gets 487 Role Conflict (RFC 8445 section 7.3.1.1).
 - **Nomination.** A successful check validates its tuple. The selected
   tuple is set and moved only by a successful check with USE-CANDIDATE
   (RFC 8445 section 8.2: a lite agent sends media only on a nominated
-  pair). The first check is usually not a nominating one: W0 saw
+  pair), and only to a validated tuple. The first check is usually not a nominating one: W0 saw
   USE-CANDIDATE on 5 of 6 checks from Chrome and Safari and 2 of 3 from
   OBS.
 - **DTLS only from the selected tuple.** `sapflow-dtls` is fed only
@@ -44,10 +49,20 @@ except the test-only example harness.
   receive media on any valid pair. Chrome 157 nominated a second pair in
   each gate 2 run and kept sending on the first for a moment; dropping
   that lost audio. SRTP authenticates every packet, so SRTP and SRTCP from
-  a validated tuple are taken. Everything the session sends, DTLS and RTCP,
-  goes only to the selected tuple.
-- **Consent** expires 30 s after the last successful check on the selected
-  tuple (RFC 7675).
+  a validated tuple are taken.
+- **Where the session sends.** A check that beats its original, or whose
+  ID has been forgotten, can still select a replayer's source, so
+  selection alone does not decide where DTLS and RTCP go. A tuple is
+  proven once fresh SRTP or SRTCP from it authenticates and passes the
+  replay window. The send tuple follows the selected tuple while it is
+  unproven, and once proven moves only to a selected tuple that is proven
+  too. A tuple not proven is sent at most four times the bytes received
+  from it, STUN responses included (`amplification_limit`). So a re-sent
+  check that arrives after its original draws nothing; one that arrives
+  first draws at most four times its bytes in all, and only the STUN
+  response while the session sends to a tuple SRTP has proven.
+- **Consent** is kept per tuple and read for the send tuple: it expires 30
+  s after the last new successful check from it (RFC 7675).
 - **Keys.** SRTP comes from the DTLS-SRTP exporter through
   `split_keying_material` as the DTLS server: the client's write keys
   unprotect what we receive, the server's protect our RTCP.
@@ -57,9 +72,12 @@ except the test-only example harness.
   or an unknown MID, is dropped and counted.
 - **Keyframes.** A PLI (or FIR) as soon as SRTP is up, then every
   `keyframe_interval` (2 s).
-- **Ending.** No ICE and DTLS 10 s after creation, consent expired, DTLS
-  failed or closed by the peer, or `close`: the session ends with a typed
-  `EndReason` and sends nothing more.
+- **Ending.** No ICE and DTLS 10 s after creation, consent expired, no
+  fresh SRTP or SRTCP for 30 s once connected, DTLS failed or closed by the
+  peer, or `close`: the session ends with a typed `EndReason` and sends
+  nothing more. The media timeout is what bounds sending after the
+  publisher has gone, since a replayed check whose ID has been forgotten
+  renews consent but nobody can replay SRTP into its window.
 
 ## SDP
 
@@ -136,8 +154,11 @@ if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
 | `SessionConfig::max_datagram` (datagram or frame taken) | 1500 | 256 to 65535 |
 | `SessionConfig::max_early_dtls` | 4 | 0 to 16 |
 | `SessionConfig::max_queued` (output) | 64 | 16 to 1024 |
-| `IceConfig::max_tuples` (validated) | 8 | 1 to 64 |
+| `SessionConfig::media_timeout` | 30 s | 1 to 300 s |
+| `SessionConfig::amplification_limit` (to an unproven tuple) | 4 times what it sent | 1 to 8 |
+| `IceConfig::max_tuples` (validated) | 8 | 2 to 64 |
 | `IceConfig::consent_timeout` | 30 s | 1 to 300 s |
+| `IceConfig::max_transactions` (remembered) | 512 | 16 to 4096 |
 | `sdp::Limits` | 16 KiB offer, 1024 lines of 1024 bytes, 16 sections, 64 formats, 16 SSRCs a section | |
 | `Framing` | 1500 bytes a frame, 64 KiB buffered | frame 1 to 65535, buffer to 1 MiB |
 | Opus `maxaveragebitrate` | as configured | held to 6000 to 510000 |
@@ -177,6 +198,15 @@ uses), `subtle` 2.6.1 for the constant-time comparison, `zeroize` 1.9.1 and
   STUN drawing zero bytes, 487, USE-CANDIDATE moving the tuple, consent
   expiry, the handshake deadline, a fingerprint mismatch, held DTLS, MID
   matching, RTX repair, close.
+- Replays: a captured check re-sent from a victim's tuple after its
+  original draws nothing, before or after SRTP (before the fix, 3272 bytes
+  of RTCP and 1917 bytes of DTLS reached the victim); a copy that beats its
+  original draws only the STUN response once the session sends to a proven
+  tuple and at most four times its bytes before, and the publisher's next
+  check recovers; an
+  honest move mid-handshake connects; every W0 ClientHello draws our
+  first flight after one check; forgotten replays renew consent after the
+  publisher has gone, and the session still ends on the media timeout.
 - Gate 2: headless Google Chrome 157 with fake media published to
   `examples/whip_harness.rs` on loopback and reached every milestone
   (`tests/browser_gate.js`). `tests/fixtures/chrome-157/` keeps that run's
