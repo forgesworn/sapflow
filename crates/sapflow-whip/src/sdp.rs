@@ -77,8 +77,10 @@ pub enum ParseError {
     /// A line longer than [`Limits::max_line`].
     LineTooLong,
     /// A control character inside a line: a CR other than the one before
-    /// LF, NUL or any other C0 control but tab (RFC 8866 section 9). Some
-    /// values are repeated in the answer, so none is let through.
+    /// LF, NUL, or any other C0 control but tab. RFC 8866 section 9
+    /// excludes only NUL, CR and LF from a value; refusing the other C0
+    /// controls too is stricter by choice, since some values are repeated
+    /// in the answer.
     ControlCharacter,
     /// More than [`Limits::max_sections`] media sections.
     TooManySections,

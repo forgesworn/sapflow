@@ -985,8 +985,9 @@ fn the_limit_admits_every_w0_hello_after_one_check() {
 
 /// After the publisher has gone, replays of checks the agent has forgotten
 /// count as new, from its old tuple or a victim's, and renew consent. What
-/// still stops sending is the media timeout: nobody can replay SRTP into
-/// the replay window.
+/// still stops sending is the media timeout: a copy of SRTP is fresh only
+/// if it beats its original or the original was lost, so once the
+/// publisher stops, nothing new counts.
 #[test]
 fn forgotten_replays_cannot_outlive_the_media() {
     let t0 = Instant::now();

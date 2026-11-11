@@ -53,17 +53,26 @@ except the test-only example harness.
   pair in each gate 2 run and kept sending on the first for a moment;
   dropping that lost audio. SRTP authenticates every packet, so SRTP and
   SRTCP from a validated tuple are taken.
-- **Where the session sends.** A check that beats its original, or whose
-  ID has been forgotten, can still select a replayer's source, so
-  selection alone does not decide where DTLS and RTCP go. A tuple is
-  proven once fresh SRTP or SRTCP from it authenticates and passes the
-  replay window. The send tuple follows the selected tuple while it is
-  unproven, and once proven moves only to a selected tuple that is proven
-  too. A tuple not proven is sent at most four times the bytes received
-  from it, STUN responses included (`amplification_limit`). So a re-sent
-  check that arrives after its original draws nothing; one that arrives
-  first draws at most four times its bytes in all, and only the STUN
-  response while the session sends to a tuple SRTP has proven.
+- **The bound.** Neither MESSAGE-INTEGRITY nor SRTP authentication covers
+  the source address: a copy of a check, or of an SRTP or SRTCP packet,
+  that arrives before its original (or whose original was lost), and a
+  check whose ID has been forgotten, verify from any tuple. So for each
+  tuple, over the life of a session, the session sends at most four times
+  the bytes it has received from that tuple (`amplification_limit`),
+  counting STUN, DTLS, SRTP and SRTCP and including its STUN responses; a
+  response to a tuple that has not passed a check is no larger than its
+  request. A datagram over the limit is dropped and counted, and the
+  session goes on. Not covered: an attacker who can drop or delay the
+  publisher's packets (RFC 8445 section 19.2) can win every race and keep
+  sends away from the publisher, though still within the bound.
+- **Where the session sends.** DTLS and RTCP go to the selected tuple
+  until SRTP or SRTCP has arrived, then to the tuple of the latest fresh
+  SRTP or SRTCP packet from a tuple with current consent; nomination no
+  longer moves them. A browser's own move is followed by its next packet
+  on the new pair, and after a copy wins a race, sends are back with the
+  publisher at its next packet that arrives before any copy of it. A
+  re-sent check that arrives after its original draws nothing while its ID
+  is remembered.
 - **Consent** is kept per tuple and read for the send tuple: it expires 30
   s after the last new successful check from it (RFC 7675).
 - **Keys.** SRTP comes from the DTLS-SRTP exporter through
@@ -79,8 +88,11 @@ except the test-only example harness.
   fresh SRTP or SRTCP for 30 s once connected, DTLS failed or closed by the
   peer, or `close`: the session ends with a typed `EndReason` and sends
   nothing more. The media timeout is what bounds sending after the
-  publisher has gone, since a replayed check whose ID has been forgotten
-  renews consent but nobody can replay SRTP into its window.
+  publisher has gone: a replayed check whose ID has been forgotten renews
+  consent, but a copy of SRTP counts as fresh only if it beats its
+  original or the original was lost, so once the publisher stops nothing
+  new can count, and the session ends 30 s after the last packet, or copy
+  of one, arrived.
 
 ## SDP
 
@@ -158,7 +170,7 @@ if let Some(at) = s.poll_timeout() { /* call s.handle_timeout(at) then */ }
 | `SessionConfig::max_early_dtls` | 4 | 0 to 16 |
 | `SessionConfig::max_queued` (output) | 64 | 16 to 1024 |
 | `SessionConfig::media_timeout` | 30 s | 1 to 300 s |
-| `SessionConfig::amplification_limit` (to an unproven tuple) | 4 times what it sent | 1 to 8 |
+| `SessionConfig::amplification_limit` (to any tuple, whole session) | 4 times what it sent | 1 to 8 |
 | `IceConfig::max_tuples` (validated) | 8 | 2 to 64 |
 | `IceConfig::consent_timeout` | 30 s | 1 to 300 s |
 | `IceConfig::max_transactions` (remembered) | 512 | 16 to 4096 |
@@ -202,15 +214,22 @@ uses), `subtle` 2.6.1 for the constant-time comparison, `zeroize` 1.9.1 and
   STUN drawing zero bytes, 487, USE-CANDIDATE moving the tuple, consent
   expiry, the handshake deadline, a fingerprint mismatch, held DTLS, MID
   matching, RTX repair, close.
-- Replays: a captured check re-sent from a victim's tuple after its
-  original draws nothing, before or after SRTP (before the fix, 3272 bytes
-  of RTCP and 1917 bytes of DTLS reached the victim); a copy that beats its
-  original draws only the STUN response once the session sends to a proven
-  tuple and at most four times its bytes before, and the publisher's next
-  check recovers; an
-  honest move mid-handshake connects; every W0 ClientHello draws our
-  first flight after one check; forgotten replays renew consent after the
-  publisher has gone, and the session still ends on the media timeout.
+- Replays and copies: a captured check re-sent from a victim's tuple after
+  its original draws nothing, before or after SRTP (before the first fix,
+  3272 bytes of RTCP and 1917 bytes of DTLS reached the victim). A copied
+  check and a copied SRTP packet, each ahead of its original, with the
+  publisher then sending for 60 s without nominating again, draw 148 bytes
+  for the 224 sent (45384 before the second fix, when proof by SRTP lifted
+  the limit), and sends are back with the publisher 20 ms later. A copy
+  mid-handshake draws at most four times its bytes and the publisher's
+  next check recovers; an honest move mid-handshake connects; every W0
+  ClientHello draws our first flight after one check; forgotten replays
+  renew consent after the publisher has gone, and the session still ends
+  on the media timeout.
+- Honest cost of the limit: in a headless Chrome 157 run every tuple
+  peaked at 0.64 times what it sent and nothing was dropped; an audio-only
+  publisher, sending or muted from the start, peaks at 3.18 just after our
+  first flight (the test client's 121-byte hello) and is never capped.
 - Gate 2: headless Google Chrome 157 with fake media published to
   `examples/whip_harness.rs` on loopback and reached every milestone
   (`tests/browser_gate.js`). `tests/fixtures/chrome-157/` keeps that run's
