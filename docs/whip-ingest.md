@@ -245,6 +245,18 @@ later does not mean rewriting SRTP key handling. W0 records which DTLS
 versions each target offers. DTLS 1.3 support is a tracked risk, not v1
 scope.
 
+What `sapflow-dtls` does with the captures (W2, 11 November 2026):
+
+- Each captured ClientHello gets a correct first flight: Chrome, Safari on
+  macOS (both over UDP and TCP), Safari on iOS, Vanadium and OBS. So does
+  FFmpeg with `dtls_active`. Chrome, Safari and Vanadium get
+  `SRTP_AEAD_AES_128_GCM`; OBS and FFmpeg get `SRTP_AES128_CM_HMAC_SHA1_80`.
+- OBS's SCSV-only hello is accepted.
+- The hellos that offer DTLS 1.3 (Chrome, Vanadium, Safari on iOS) are
+  answered with 1.2.
+- Not yet covered: Firefox's ClientHello, which is still not captured, and
+  any browser's second flight, which needs a live browser (W3, A3.1).
+
 ## SDP answer and stream matching
 
 The offer is accepted only if it has:
@@ -837,6 +849,36 @@ instead of observed.
   fingerprint is refused. Fails if any build or test flag can skip the check.
 - **A2.4 Fuzzing.** Records and each handshake message have fuzz targets, held
   to A1.3's corpus and coverage rules.
+
+Implementation notes (11 November 2026):
+
+- **Crate.** `crates/sapflow-dtls`, sans-IO, with RustCrypto only: `p256`
+  0.14, `ecdsa` 0.17, `aes-gcm` 0.11, `sha2` 0.11, `hmac` 0.13, `x509-cert`
+  0.3 and `der` 0.8.
+- **Our certificate.** It is DER written by sapflow and signed with `p256`.
+  `x509-cert` parses only the peer's.
+- **Bounds and defaults.** These are listed in the crate README.
+  - HelloVerifyRequest is off by default, because ICE has already proved
+    return routability.
+  - Flights are re-recorded for every send.
+  - A peer's retransmission triggers a resend only when it exactly repeats
+    the hello we answered, or when an authenticated Finished arrives again
+    after the handshake.
+- **A2.1.** OpenSSL 4.0.3 `s_client` matched our exported keying material
+  byte for byte in seven runs. Both profiles ran, with 300-byte MTUs, a
+  dropped first flight and the cookie exchange. The datagrams and OpenSSL's
+  key log are fixtures. Unit tests replay them offline, derive the exporter
+  and record keys from OpenSSL's master secret, and feed both halves of the
+  material to `sapflow-rtp`.
+  - That last step runs `sapflow-rtp` on both sides. GCM SRTP is still
+    unchecked against a real peer's SRTP packets; that check comes in W3.
+- **A2.4.** The fuzz targets are `dtls_record`, `dtls_handshake_messages`
+  and `dtls_server`. Their seeds come from the W0 captures, the OpenSSL runs
+  and scripted handshakes.
+  - CI's 60 s runs and a coverage report are still to come.
+  - A seed replay test and a fixed-seed mutation pass run with the unit
+    tests.
+- **Review.** A4.4's independent review of this crate has not happened yet.
 
 ### W3: `sapflow-whip` and the server
 
