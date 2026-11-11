@@ -24,7 +24,8 @@
 //! Every byte that arrives is hostile until it authenticates, and the
 //! parsers stay careful after that: nothing indexes without a bound or
 //! trusts a length, and each parser has a fuzz target (`rtp_packet`,
-//! `rtcp_compound`, `srtp_unprotect`, `srtcp_unprotect`).
+//! `rtcp_compound`, `srtp_unprotect`, `srtcp_unprotect`, `h264_depacketise`,
+//! `opus_depacketise` and `reorder_nack`).
 
 #![warn(missing_docs)]
 #![cfg_attr(

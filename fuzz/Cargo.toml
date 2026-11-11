@@ -183,3 +183,24 @@ path = "fuzz_targets/srtcp_unprotect.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "h264_depacketise"
+path = "fuzz_targets/h264_depacketise.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "opus_depacketise"
+path = "fuzz_targets/opus_depacketise.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reorder_nack"
+path = "fuzz_targets/reorder_nack.rs"
+test = false
+doc = false
+bench = false

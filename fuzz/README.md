@@ -116,6 +116,9 @@ source-EOF qualification. No Rust build is involved.
 | `rtcp_compound` | Our RTCP compound and reduced-size parser (`sapflow_rtp::rtcp`); RR, NACK, PLI and FIR are rebuilt with `rtcp::build` and must read back the same |
 | `srtp_unprotect` | SRTP unprotect for both profiles with fixed test keys: a mode byte, then `[u16 length, packet]` records into one context, so mutation reaches index estimation, the sequence wrap and the replay window; a mode bit makes records plaintext that must survive protect then unprotect |
 | `srtcp_unprotect` | SRTCP unprotect in the same record format, with the E flag and 31-bit index |
+| `h264_depacketise` | Our H.264 RTP depacketiser (`sapflow_rtp::h264`): records of a flag byte (marker, new timestamp, loss before) and a payload, under default or small limits; every access unit must re-parse within its limits, in timestamp order |
+| `opus_depacketise` | The Opus TOC and framing parser on the whole input, then the Opus depacketiser on records with timestamp steps and losses; frames must parse, fills must come before the packet and within the limit, and the timeline may only have holes under 2.5 ms or at a reported discontinuity |
+| `reorder_nack` | Our receiver (`sapflow_rtp::receive`) with a video stream (RTX negotiated) and an audio stream: video, audio and RTX packets with explicit sequence numbers, clock steps forward and back, strangers. Buffers stay within their packet and byte bounds, every NACK reads back through the RTCP parser and names only missing packets, losses only move forward, and the next timer is always later than the one just run |
 
 The pinned toolchain is newer than the installed nightly, so unlock nightly
 features on it for these builds only. Builds share the repository's
@@ -291,8 +294,9 @@ Native recording follow-on SOURCE CANDIDATE: four generated `native-final-durati
 
 ### RTP, RTCP and SRTP (`sapflow-rtp`)
 
-The four `sapflow-rtp` targets call the entry functions in
-`crates/sapflow-rtp/src/fuzzing.rs` (behind the crate's `testing` feature),
+The seven `sapflow-rtp` targets call the entry functions in
+`crates/sapflow-rtp/src/fuzzing.rs` and `fuzzing/media.rs` (behind the
+crate's `testing` feature),
 and a unit test there replays every file in their `seeds/` directories
 through the same functions, so the seeds are regressions wherever
 cargo-fuzz is not installed (`cargo test -p sapflow-rtp`). That test also
@@ -313,6 +317,17 @@ a fresh capture:
 python3 crates/sapflow-rtp/tests/capture_ffmpeg.py <scratch dir>
 SAPFLOW_RTP_CAPTURE=<scratch dir> cargo test -p sapflow-rtp --lib -- --ignored write_seeds
 ```
+
+The media targets' seeds (`h264_depacketise`, `opus_depacketise`,
+`reorder_nack`) are made from the committed A1.2 fixtures
+(`crates/sapflow-rtp/tests/fixtures/README.md`) and builder shapes:
+FFmpeg's H.264 whole, with losses and under small limits; hand-built STAP-A,
+FU-A and refused types; FFmpeg's Opus with DTX gaps, a loss and a jump;
+packets of every Opus code; and the two captures interleaved with drops,
+RTX answers, reordering, a duplicate, clock steps and a stranger. The seed
+test requires each to produce output (an access unit, a frame, feedback or
+a valid packet). To regenerate:
+`cargo test -p sapflow-rtp --lib -- --ignored write_media_seeds`.
 
 No local cargo-fuzz run of these targets has been made; CI's 60 s per
 target and the nightly run are their first fuzzing.
