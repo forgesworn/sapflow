@@ -731,6 +731,8 @@ impl Session {
     fn fresh_media(&mut self, now: Instant, tuple: Tuple) {
         self.last_srtp = Some(now);
         self.media_seen = true;
+        // Eviction keeps the tuples delivering the freshest media.
+        self.ice.note_media(&tuple, now);
         if self.ice.consent_expires(&tuple).is_some_and(|d| d > now) {
             self.point_at(tuple);
         }

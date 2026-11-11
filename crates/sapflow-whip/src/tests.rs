@@ -1207,3 +1207,63 @@ fn honest_low_rate_publishers_are_never_capped() {
         assert_eq!(state, State::Connected);
     }
 }
+
+/// Round 3: a session old enough that checks are forgotten. A forgotten
+/// nominating copy selects B, one SRTP packet whose original was lost
+/// arrives from B, and forgotten copies from new tuples fill the table.
+/// Returns the publisher's packets dropped as from an unvalidated tuple,
+/// and how long after the attack sends were back with the publisher.
+fn eviction_attack(seed: u8) -> (u64, Option<Duration>) {
+    let t0 = Instant::now();
+    let mut p = Publisher::new(seed, &[GCM]);
+    let mut config = SessionConfig::default();
+    config.ice.max_transactions = 16;
+    let mut a = accept(&p.offer(), config, t0, seed);
+    p.answered(&a);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    let home = p.tuple;
+    let mut at = t0;
+    let mut captured = Vec::new();
+    for step in 1..=24u64 {
+        at = t0 + ms(20 * step);
+        s.handle_datagram(at, home, &p.audio(step as u8));
+        let c = p.check(true);
+        s.handle_datagram(at, home, &c);
+        captured.push(c);
+        run_until(s, at);
+        p.receive(s);
+    }
+    assert_eq!(s.send_tuple(), Some(home));
+    // The attack, all at one instant.
+    let b = tuple(50_020);
+    s.handle_datagram(at, b, &captured[0]);
+    assert_eq!(s.selected(), Some(b), "a forgotten ID needs no race");
+    let lost = p.audio(100);
+    s.handle_datagram(at, b, &lost);
+    assert_eq!(s.send_tuple(), Some(b));
+    for (i, c) in captured.iter().enumerate().skip(1).take(7) {
+        s.handle_datagram(at, tuple(51_000 + i as u16), c);
+    }
+    let before = s.stats().media_unvalidated;
+    // The publisher goes on sending audio, and its next check is 2 s away.
+    let mut back = None;
+    for step in 1..=100u64 {
+        let now = at + ms(20 * step);
+        s.handle_datagram(now, home, &p.audio(step as u8));
+        if back.is_none() && s.send_tuple() == Some(home) {
+            back = Some(now - at);
+        }
+        run_until(s, now);
+        while s.poll_transmit().is_some() {}
+    }
+    (s.stats().media_unvalidated - before, back)
+}
+
+#[test]
+fn a_publisher_delivering_media_is_never_evicted() {
+    let (dropped, back) = eviction_attack(33);
+    println!("eviction attack: {dropped} publisher packets dropped, sends back after {back:?}");
+    assert_eq!(dropped, 0, "the publisher's media was dropped");
+    assert!(back.is_some_and(|b| b <= ms(20)), "{back:?}");
+}

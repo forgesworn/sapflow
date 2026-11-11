@@ -176,9 +176,10 @@ impl Credentials {
 /// The agent's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IceConfig {
-    /// Most validated tuples remembered. A new one beyond it evicts the
-    /// oldest that is not selected. 2 to 64 (one for the selected tuple,
-    /// at least one for a new one); default 8.
+    /// Most validated tuples remembered. A new one beyond it evicts one that
+    /// is neither selected nor the session's send tuple: first one that has
+    /// never delivered fresh media, then the one whose last fresh media is
+    /// oldest, the earliest validated breaking ties. 2 to 64; default 8.
     pub max_tuples: usize,
     /// Consent for a tuple lasts this long after the last successful check
     /// from it (RFC 7675 section 5.1). 1 to 300 s; default 30 s.
@@ -262,15 +263,24 @@ pub struct Answer {
     pub nominated: bool,
 }
 
+/// A validated tuple.
+#[derive(Debug, Clone, Copy)]
+struct Validated {
+    tuple: Tuple,
+    /// When it last passed a new check.
+    checked: Instant,
+    /// When fresh SRTP or SRTCP last arrived from it, as the session says.
+    media: Option<Instant>,
+}
+
 /// The ICE-lite agent of one session.
 pub struct Agent {
     config: IceConfig,
     /// `<our ufrag>:<their ufrag>`.
     username: Vec<u8>,
     key: Zeroizing<Vec<u8>>,
-    /// Validated tuples, oldest first, and when each last passed a new
-    /// check.
-    validated: Vec<(Tuple, Instant)>,
+    /// Validated tuples, in the order they were validated.
+    validated: Vec<Validated>,
     selected: Option<Tuple>,
     /// A tuple eviction must keep besides the selected one: where the
     /// session sends.
@@ -322,7 +332,15 @@ impl Agent {
     /// Whether a check from this tuple has succeeded (and it has not been
     /// evicted since).
     pub fn is_validated(&self, tuple: &Tuple) -> bool {
-        self.validated.iter().any(|(t, _)| t == tuple)
+        self.validated.iter().any(|v| v.tuple == *tuple)
+    }
+
+    /// Fresh SRTP or SRTCP arrived from a validated tuple: it now outranks,
+    /// for eviction, every tuple whose media is older or that has none.
+    pub fn note_media(&mut self, tuple: &Tuple, now: Instant) {
+        if let Some(v) = self.validated.iter_mut().find(|v| v.tuple == *tuple) {
+            v.media = Some(now);
+        }
     }
 
     /// Keeps `tuple` validated through eviction, as well as the selected
@@ -335,8 +353,8 @@ impl Agent {
     pub fn consent_expires(&self, tuple: &Tuple) -> Option<Instant> {
         self.validated
             .iter()
-            .find(|(t, _)| t == tuple)
-            .and_then(|(_, at)| at.checked_add(self.config.consent_timeout))
+            .find(|v| v.tuple == *tuple)
+            .and_then(|v| v.checked.checked_add(self.config.consent_timeout))
     }
 
     /// One STUN datagram from `tuple`. Returns the answer to send back to
@@ -434,12 +452,19 @@ impl Agent {
         })
     }
 
-    /// Remembers a tuple as validated at `now`, evicting the oldest one
-    /// that is neither selected nor protected if full. Returns whether it
-    /// is validated.
+    /// Remembers a tuple as validated at `now`, evicting one if full.
+    /// Returns whether it is validated.
+    ///
+    /// The victim is never the selected tuple or the protected one (the
+    /// session's send tuple). Of the rest, it is one that has never
+    /// delivered fresh SRTP or SRTCP if there is one, else the one whose
+    /// last fresh media is oldest; the earliest validated breaks ties. So
+    /// a publisher's tuple that keeps delivering media outranks every
+    /// tuple that has delivered none, and every one whose last fresh media
+    /// is older: checks alone, replayed or not, cannot push it out.
     fn validate(&mut self, tuple: Tuple, now: Instant) -> bool {
-        if let Some((_, at)) = self.validated.iter_mut().find(|(t, _)| *t == tuple) {
-            *at = now;
+        if let Some(v) = self.validated.iter_mut().find(|v| v.tuple == tuple) {
+            v.checked = now;
             return true;
         }
         if self.validated.len() >= self.config.max_tuples.max(2) {
@@ -447,14 +472,21 @@ impl Agent {
             let Some(i) = self
                 .validated
                 .iter()
-                .position(|(t, _)| !keep.contains(&Some(*t)))
+                .enumerate()
+                .filter(|(_, v)| !keep.contains(&Some(v.tuple)))
+                .min_by_key(|&(i, v)| (v.media, i))
+                .map(|(i, _)| i)
             else {
                 return false;
             };
             self.validated.remove(i);
             self.stats.evicted += 1;
         }
-        self.validated.push((tuple, now));
+        self.validated.push(Validated {
+            tuple,
+            checked: now,
+            media: None,
+        });
         true
     }
 }
@@ -778,6 +810,52 @@ mod tests {
         // check again. Containing that is the session's job.
         assert!(a.handle(now, tuple(2), &first).expect("forgotten").success);
         assert_eq!(a.stats().replays, 0);
+    }
+
+    #[test]
+    fn eviction_spares_the_tuple_with_the_freshest_media() {
+        let c = creds();
+        let config = IceConfig {
+            max_tuples: 5,
+            ..IceConfig::default()
+        };
+        let mut a = Agent::new(config, &c, "peer");
+        let t0 = Instant::now();
+        let secs = Duration::from_secs;
+        let plain = Req::honest(&c);
+        let mut nominate = Req::honest(&c);
+        nominate.use_candidate = true;
+        let mut tid = 0u8;
+        let mut check = |a: &mut Agent, port: u16, r: &Req| {
+            tid += 1;
+            a.handle(t0, tuple(port), &r.build(tid)).expect("answered");
+        };
+        // The publisher's tuple first, with media; one with older media;
+        // two with none; and a selected one. The table is full.
+        check(&mut a, 1, &plain);
+        a.note_media(&tuple(1), t0 + secs(1));
+        check(&mut a, 2, &plain);
+        a.note_media(&tuple(2), t0);
+        check(&mut a, 3, &plain);
+        check(&mut a, 8, &plain);
+        check(&mut a, 4, &nominate);
+        let gone = |a: &Agent, port: u16| !a.is_validated(&tuple(port));
+        // Tuples with no media go first, the earliest validated first.
+        check(&mut a, 5, &plain);
+        assert!(gone(&a, 3));
+        check(&mut a, 6, &plain);
+        assert!(gone(&a, 8));
+        a.note_media(&tuple(5), t0 + secs(2));
+        check(&mut a, 7, &plain);
+        assert!(gone(&a, 6));
+        // Then the oldest media.
+        a.note_media(&tuple(7), t0 + secs(3));
+        check(&mut a, 9, &plain);
+        assert!(gone(&a, 2));
+        for kept in [1, 4, 5, 7, 9] {
+            assert!(!gone(&a, kept), "{kept}");
+        }
+        assert_eq!(a.stats().evicted, 4);
     }
 
     #[test]
