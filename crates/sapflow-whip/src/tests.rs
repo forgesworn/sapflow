@@ -786,3 +786,187 @@ fn replayed_check_from_another_tuple_mid_handshake() {
     assert!(stun.iter().all(|n| *n <= captured.len()));
     assert_eq!(other, 0, "DTLS retransmissions followed the replayed check");
 }
+
+/// Sends move from a proven tuple only to another proven one: the
+/// publisher's own renomination moves them once its SRTP arrives on the
+/// new pair.
+#[test]
+fn sends_move_only_to_a_proven_tuple() {
+    let (mut p, mut a, t0) = setup(21, &[GCM]);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    let first = p.tuple;
+    s.handle_datagram(t0, first, &p.audio(1));
+    assert_eq!(s.send_tuple(), Some(first));
+    let second = tuple(41_200);
+    let c = p.check(true);
+    s.handle_datagram(t0 + ms(10), second, &c);
+    assert_eq!(s.selected(), Some(second));
+    assert_eq!(s.send_tuple(), Some(first), "not proven yet");
+    let (_, other) = sent_to(s, second);
+    assert_eq!(other, 0);
+    s.handle_datagram(t0 + ms(20), second, &p.audio(2));
+    assert_eq!(s.send_tuple(), Some(second), "proven by its SRTP");
+}
+
+/// The attacker's copy of a check arrives before the original, after
+/// SRTP is up. The original is then the repeat. Sends stay with the
+/// proven tuple, and the publisher's next check takes the selection back.
+#[test]
+fn a_copy_that_beats_its_original_after_srtp() {
+    let (mut p, mut a, t0) = setup(22, &[GCM]);
+    let s = &mut a.session;
+    p.connect(s, t0);
+    let home = p.tuple;
+    for d in p.sender_reports(1 << 62) {
+        s.handle_datagram(t0, home, &d);
+    }
+    p.receive(s);
+    let victim = tuple(50_002);
+    let captured = p.check(true);
+    s.handle_datagram(t0 + ms(5), victim, &captured);
+    assert_eq!(s.selected(), Some(victim));
+    s.handle_datagram(t0 + ms(6), home, &captured);
+    assert_eq!(s.stats().ice.replays, 1, "the original is now the repeat");
+    let (stun, _) = sent_to(s, victim);
+    assert!(stun.iter().all(|n| *n <= captured.len()));
+    let mut to_victim = 0;
+    for step in 1..=40u64 {
+        let at = t0 + ms(10 + 50 * step);
+        s.handle_datagram(at, home, &p.audio(step as u8));
+        run_until(s, at);
+        to_victim += sent_to(s, victim).1;
+    }
+    assert_eq!(to_victim, 0, "nothing but the STUN response to the victim");
+    assert_eq!(s.send_tuple(), Some(home));
+    assert!(s.stats().feedback_sent > 0);
+    // The publisher's next check, a new transaction, recovers the selection.
+    let fresh = p.check(true);
+    s.handle_datagram(t0 + ms(2100), home, &fresh);
+    assert_eq!(s.selected(), Some(home));
+    assert_eq!(s.state(), State::Connected);
+}
+
+/// The attacker's copies of the check and the ClientHello arrive first,
+/// mid-handshake. The victim gets no more than four times what the
+/// attacker sent it, and the publisher's next check recovers the session.
+#[test]
+fn a_copy_that_beats_its_original_mid_handshake() {
+    let (mut p, mut a, t0) = setup(23, &[GCM]);
+    let s = &mut a.session;
+    let victim = tuple(50_003);
+    let check = p.check(true);
+    let hello = p.client.start();
+    let mut sent_by_attacker = check.len();
+    s.handle_datagram(t0, victim, &check);
+    for d in &hello {
+        s.handle_datagram(t0, victim, d);
+        sent_by_attacker += d.len();
+    }
+    // The originals, second, go nowhere.
+    s.handle_datagram(t0, p.tuple, &check);
+    for d in &hello {
+        s.handle_datagram(t0, p.tuple, d);
+    }
+    let mut to_victim = 0;
+    for step in 1..=9u64 {
+        run_until(s, t0 + Duration::from_secs(step) / 2);
+        let (stun, other) = sent_to(s, victim);
+        to_victim += stun.iter().sum::<usize>() + other;
+    }
+    assert!(
+        to_victim <= 4 * sent_by_attacker,
+        "{to_victim} bytes to the victim for {sent_by_attacker}"
+    );
+    assert!(
+        s.stats().budget_dropped > 0,
+        "the retransmissions were held back"
+    );
+    // The publisher checks again and starts over from its own tuple.
+    let fresh = p.check(true);
+    s.handle_datagram(t0 + Duration::from_secs(5), p.tuple, &fresh);
+    assert_eq!(s.send_tuple(), Some(p.tuple));
+    // The server already answered the copied hello; the publisher's own
+    // retransmission of it, now from the selected tuple, draws the flight.
+    let mut pending = hello.clone();
+    let mut now = t0 + Duration::from_secs(5);
+    for _ in 0..8 {
+        for d in std::mem::take(&mut pending) {
+            s.handle_datagram(now, p.tuple, &d);
+        }
+        while let Some(t) = s.poll_transmit() {
+            if t.tuple == p.tuple
+                && crate::ice::classify(&t.bytes) == crate::ice::Kind::Dtls
+                && let Ok(r) = p.client.handle(&t.bytes)
+            {
+                pending.extend(r);
+            }
+        }
+        now += ms(300);
+    }
+    assert!(p.client.connected(), "the publisher's handshake completes");
+    assert_eq!(s.state(), State::Connected);
+}
+
+/// The publisher moves pairs mid-handshake: our first flight went to the
+/// first tuple, and the rest of the handshake runs on the second.
+#[test]
+fn an_honest_move_mid_handshake_connects() {
+    let (mut p, mut a, t0) = setup(24, &[GCM]);
+    let s = &mut a.session;
+    let c = p.check(true);
+    s.handle_datagram(t0, p.tuple, &c);
+    for d in p.client.start() {
+        s.handle_datagram(t0, p.tuple, &d);
+    }
+    let flight5 = p.receive(s);
+    assert!(
+        !flight5.is_empty(),
+        "our first flight reached the first tuple"
+    );
+    p.tuple = tuple(41_300);
+    let c = p.check(true);
+    s.handle_datagram(t0 + ms(30), p.tuple, &c);
+    assert_eq!(s.send_tuple(), Some(p.tuple));
+    for d in flight5 {
+        s.handle_datagram(t0 + ms(31), p.tuple, &d);
+    }
+    p.receive(s);
+    assert!(p.has_keys(), "our last flight reached the second tuple");
+    assert_eq!(s.state(), State::Connected);
+    assert_eq!(s.stats().budget_dropped, 0);
+}
+
+/// Every captured W0 ClientHello, after one check, draws our first flight
+/// at once within the default limit; with a limit of 1, Safari's would
+/// wait for retransmissions.
+#[test]
+fn the_limit_admits_every_w0_hello_after_one_check() {
+    for &(dir, stem, _) in sapflow_dtls::testing::CAPTURES {
+        let (mut p, mut a, t0) = setup(25, &[GCM]);
+        let s = &mut a.session;
+        s.handle_datagram(t0, p.tuple, &p.check(true));
+        for d in sapflow_dtls::testing::capture(dir, stem) {
+            s.handle_datagram(t0, p.tuple, &d);
+        }
+        let (_, flight) = sent_to(s, p.tuple);
+        assert!(flight >= 600, "{dir}/{stem}: {flight}");
+        assert_eq!(s.stats().budget_dropped, 0, "{dir}/{stem}");
+    }
+    let t0 = Instant::now();
+    let p = Publisher::new(26, &[GCM]);
+    let config = SessionConfig {
+        amplification_limit: 1,
+        ..SessionConfig::default()
+    };
+    let mut a = accept(&p.offer(), config, t0, 26);
+    let mut p = p;
+    p.answered(&a);
+    let s = &mut a.session;
+    s.handle_datagram(t0, p.tuple, &p.check(true));
+    for d in sapflow_dtls::testing::capture("safari-26.6.2-macos", "clienthello") {
+        s.handle_datagram(t0, p.tuple, &d);
+    }
+    assert_eq!(sent_to(s, p.tuple).1, 0);
+    assert!(s.stats().budget_dropped > 0);
+}

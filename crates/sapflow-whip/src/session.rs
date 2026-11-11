@@ -11,8 +11,21 @@
 //! The rules:
 //!
 //! - **Nothing to a stranger.** A tuple gets bytes only after a STUN check
-//!   from it passed MESSAGE-INTEGRITY ([`crate::ice`]). DTLS output and
-//!   RTCP feedback go only to the selected tuple.
+//!   from it passed MESSAGE-INTEGRITY ([`crate::ice`]), and a repeated
+//!   transaction ID from another tuple gets nothing.
+//! - **Where the session sends.** MESSAGE-INTEGRITY does not prove the
+//!   source address, so a check that arrives before its original, or after
+//!   its ID is forgotten, can come from anywhere. DTLS and RTCP go to one
+//!   send tuple ([`Session::send_tuple`]):
+//!   - a tuple is *proven* once fresh SRTP or SRTCP from it (authenticated
+//!     and inside the replay window) arrives;
+//!   - the send tuple follows the selected tuple while it is unproven, and
+//!     once it is proven moves only to a selected tuple that is proven too;
+//!   - to a tuple that is not proven, the session sends at most
+//!     [`SessionConfig::amplification_limit`] (4) times the bytes it has
+//!     received from it, as RFC 9000 section 8.1 limits a QUIC server
+//!     before address validation (3 there, with padded client datagrams).
+//!     STUN responses are never larger than their request.
 //! - **DTLS from the selected tuple only.** `sapflow-dtls` is fed only
 //!   datagrams from the selected tuple. A few that arrive from a validated
 //!   tuple before its USE-CANDIDATE check ([`SessionConfig::max_early_dtls`])
@@ -84,6 +97,15 @@ pub struct SessionConfig {
     /// Datagrams queued for [`Session::poll_transmit`]; beyond it output is
     /// dropped and counted. 16 to 1024; default 64.
     pub max_queued: usize,
+    /// To a tuple not yet proven by fresh SRTP or SRTCP, the session sends
+    /// at most this many times the bytes it received from it, STUN
+    /// responses included; the rest is dropped and counted. 1 to 8;
+    /// default 4: one 104-byte check and the smallest ClientHello in the
+    /// profile (about 120 bytes) must draw the check's 64-byte response
+    /// and our 637-byte first flight at once. QUIC's limit is 3 (RFC 9000
+    /// section 8.1), but QUIC clients pad their first datagrams to 1200
+    /// bytes, and ICE and DTLS clients do not.
+    pub amplification_limit: u32,
     /// ICE-lite bounds and consent.
     pub ice: IceConfig,
     /// DTLS bounds and timers.
@@ -104,6 +126,7 @@ impl Default for SessionConfig {
             max_datagram: 1500,
             max_early_dtls: 4,
             max_queued: 64,
+            amplification_limit: 4,
             ice: IceConfig::default(),
             dtls: sapflow_dtls::Config::default(),
             srtp: sapflow_rtp::Config::default(),
@@ -134,6 +157,10 @@ impl SessionConfig {
         check((256..=65535).contains(&self.max_datagram), "max_datagram")?;
         check(self.max_early_dtls <= 16, "max_early_dtls")?;
         check((16..=1024).contains(&self.max_queued), "max_queued")?;
+        check(
+            (1..=8).contains(&self.amplification_limit),
+            "amplification_limit",
+        )?;
         self.ice.validate().map_err(SessionError::Config)?;
         self.dtls
             .validate()
@@ -177,8 +204,8 @@ pub enum EndReason {
     /// ICE and DTLS did not complete within
     /// [`SessionConfig::handshake_timeout`].
     HandshakeTimeout,
-    /// No successful check on the selected tuple for
-    /// [`IceConfig::consent_timeout`].
+    /// No new successful check from the send tuple for
+    /// [`IceConfig::consent_timeout`] (RFC 7675).
     ConsentExpired,
     /// The DTLS handshake or association failed.
     Dtls(sapflow_dtls::Error),
@@ -264,6 +291,8 @@ pub struct SessionStats {
     pub feedback_sent: u64,
     /// Output dropped because the queue was full.
     pub transmit_dropped: u64,
+    /// Output to an unproven tuple dropped by the amplification limit.
+    pub budget_dropped: u64,
     /// Input after the session ended.
     pub after_end: u64,
 }
@@ -313,6 +342,16 @@ impl Routes {
     }
 }
 
+/// What has passed between the session and one validated tuple.
+#[derive(Debug, Clone, Copy)]
+struct Path {
+    tuple: Tuple,
+    received: u64,
+    sent: u64,
+    /// Fresh authenticated SRTP or SRTCP has arrived from it.
+    proven: bool,
+}
+
 /// SRTP and the receiver, from the moment DTLS completes.
 struct Media {
     profile: sapflow_dtls::SrtpProfile,
@@ -333,6 +372,9 @@ pub struct Session {
     dtls: Server,
     negotiated: Negotiated,
     media: Option<Box<Media>>,
+    /// Where DTLS and RTCP go.
+    send_to: Option<Tuple>,
+    paths: Vec<Path>,
     early: Vec<(Tuple, Vec<u8>)>,
     out: VecDeque<Transmit>,
     events: VecDeque<Event>,
@@ -433,6 +475,8 @@ impl Session {
             dtls,
             negotiated,
             media: None,
+            send_to: None,
+            paths: Vec::new(),
             early: Vec::new(),
             out: VecDeque::new(),
             events: VecDeque::new(),
@@ -458,6 +502,12 @@ impl Session {
     /// The selected tuple.
     pub fn selected(&self) -> Option<Tuple> {
         self.ice.selected()
+    }
+
+    /// Where DTLS and RTCP go: the selected tuple, unless the selection has
+    /// moved from a proven tuple to one that is not proven yet.
+    pub fn send_tuple(&self) -> Option<Tuple> {
+        self.send_to
     }
 
     /// Whether a check from this tuple succeeded: the UDP owner may then
@@ -538,7 +588,7 @@ impl Session {
             .flatten();
         [
             deadline,
-            self.ice.consent_expires(),
+            self.consent_expires(),
             self.dtls.poll_timeout(),
             self.media.as_ref().and_then(|m| m.rx.poll_timeout()),
         ]
@@ -589,17 +639,76 @@ impl Session {
             return;
         }
         self.stats.datagrams += 1;
+        // Bytes from a validated tuple raise what the session may send it;
+        // a check that validates its tuple counts once it has.
+        let counted = self.received(tuple, bytes.len());
         match classify(bytes) {
-            Kind::Stun => self.stun(now, tuple, bytes),
+            Kind::Stun => self.stun(now, tuple, bytes, counted),
             Kind::Dtls => self.dtls_in(now, tuple, bytes),
             Kind::Rtp | Kind::Rtcp if !self.ice.is_validated(&tuple) => {
                 self.stats.media_unvalidated += 1;
             }
-            Kind::Rtp => self.rtp(now, bytes),
-            Kind::Rtcp => self.rtcp(now, bytes),
+            Kind::Rtp => self.rtp(now, tuple, bytes),
+            Kind::Rtcp => self.rtcp(now, tuple, bytes),
             Kind::Other => self.stats.other += 1,
         }
         self.flush();
+    }
+
+    /// Counts bytes from a validated tuple. Returns whether it did.
+    fn received(&mut self, tuple: Tuple, len: usize) -> bool {
+        if !self.ice.is_validated(&tuple) {
+            return false;
+        }
+        let len = len as u64;
+        if let Some(p) = self.paths.iter_mut().find(|p| p.tuple == tuple) {
+            p.received = p.received.saturating_add(len);
+            return true;
+        }
+        // One path per validated tuple: forget those the agent forgot.
+        let ice = &self.ice;
+        self.paths.retain(|p| ice.is_validated(&p.tuple));
+        self.paths.push(Path {
+            tuple,
+            received: len,
+            sent: 0,
+            proven: false,
+        });
+        true
+    }
+
+    fn proven(&self, tuple: Tuple) -> bool {
+        self.paths.iter().any(|p| p.tuple == tuple && p.proven)
+    }
+
+    /// Fresh authenticated SRTP or SRTCP arrived from `tuple`.
+    fn prove(&mut self, tuple: Tuple) {
+        if let Some(p) = self.paths.iter_mut().find(|p| p.tuple == tuple) {
+            p.proven = true;
+        }
+        self.retarget();
+    }
+
+    /// Points the send tuple at the selected tuple, unless that would move
+    /// it from a proven tuple to one that is not proven.
+    fn retarget(&mut self) {
+        let Some(selected) = self.ice.selected() else {
+            return;
+        };
+        if self.send_to == Some(selected) {
+            return;
+        }
+        let keep = self.send_to.is_some_and(|t| self.proven(t)) && !self.proven(selected);
+        if !keep {
+            self.send_to = Some(selected);
+            self.ice.protect(self.send_to);
+        }
+    }
+
+    /// When consent for the send tuple runs out (RFC 7675: consent is for
+    /// sending).
+    fn consent_expires(&self) -> Option<Instant> {
+        self.send_to.and_then(|t| self.ice.consent_expires(&t))
     }
 
     /// Ends the session if a deadline has passed. Returns whether it has
@@ -613,7 +722,7 @@ impl Session {
             self.end(EndReason::HandshakeTimeout);
             return true;
         }
-        if self.ice.consent_expires().is_some_and(|d| now >= d) {
+        if self.consent_expires().is_some_and(|d| now >= d) {
             self.end(EndReason::ConsentExpired);
             return true;
         }
@@ -641,22 +750,47 @@ impl Session {
         }
     }
 
-    fn queue(&mut self, tuple: Tuple, bytes: Vec<u8>) {
+    /// Queues a datagram for `tuple`. A STUN `response` is never larger
+    /// than its request and always goes; anything else to a tuple not
+    /// proven goes only within the amplification limit. Returns whether it
+    /// was queued.
+    fn send(&mut self, tuple: Tuple, bytes: Vec<u8>, response: bool) -> bool {
         if self.out.len() >= self.config.max_queued {
             self.stats.transmit_dropped += 1;
-        } else {
-            self.out.push_back(Transmit { tuple, bytes });
+            return false;
         }
+        let len = bytes.len() as u64;
+        let limit = u64::from(self.config.amplification_limit);
+        match self.paths.iter_mut().find(|p| p.tuple == tuple) {
+            Some(p)
+                if p.proven
+                    || response
+                    || p.sent.saturating_add(len) <= p.received.saturating_mul(limit) =>
+            {
+                p.sent = p.sent.saturating_add(len);
+            }
+            None if response => {}
+            _ => {
+                self.stats.budget_dropped += 1;
+                return false;
+            }
+        }
+        self.out.push_back(Transmit { tuple, bytes });
+        true
     }
 
-    fn stun(&mut self, now: Instant, tuple: Tuple, bytes: &[u8]) {
+    fn stun(&mut self, now: Instant, tuple: Tuple, bytes: &[u8], counted: bool) {
         let Some(answer) = self.ice.handle(now, tuple, bytes) else {
             return;
         };
-        self.queue(tuple, answer.response);
+        if !counted && answer.success {
+            self.received(tuple, bytes.len());
+        }
+        self.send(tuple, answer.response, true);
         if !answer.nominated {
             return;
         }
+        self.retarget();
         self.push_event(Event::Nominated);
         if self.state == State::Checking {
             self.state = State::Handshaking;
@@ -687,14 +821,14 @@ impl Session {
     }
 
     fn drain_dtls(&mut self) {
-        let Some(to) = self.ice.selected() else {
+        let Some(to) = self.send_to else {
             // Nothing is sent before a tuple is selected; DTLS has nothing
             // to send then either.
             while self.dtls.poll_transmit().is_some() {}
             return;
         };
         while let Some(d) = self.dtls.poll_transmit() {
-            self.queue(to, d);
+            self.send(to, d, false);
         }
     }
 
@@ -758,7 +892,7 @@ impl Session {
         self.push_event(Event::Connected(c.profile));
     }
 
-    fn rtp(&mut self, now: Instant, bytes: &[u8]) {
+    fn rtp(&mut self, now: Instant, tuple: Tuple, bytes: &[u8]) {
         let Some(m) = self.media.as_mut() else {
             self.stats.media_before_keys += 1;
             return;
@@ -770,6 +904,12 @@ impl Session {
             return;
         };
         self.stats.srtp_packets += 1;
+        // Authenticated and inside the replay window: this tuple is the
+        // publisher's.
+        self.prove(tuple);
+        let Some(m) = self.media.as_mut() else {
+            return;
+        };
         let Some(Ok(packet)) = self.scratch.get(..len).map(RtpPacket::parse) else {
             self.stats.malformed += 1;
             return;
@@ -787,7 +927,7 @@ impl Session {
         }
     }
 
-    fn rtcp(&mut self, now: Instant, bytes: &[u8]) {
+    fn rtcp(&mut self, now: Instant, tuple: Tuple, bytes: &[u8]) {
         let Some(m) = self.media.as_mut() else {
             self.stats.media_before_keys += 1;
             return;
@@ -799,6 +939,10 @@ impl Session {
             return;
         };
         self.stats.srtcp_packets += 1;
+        self.prove(tuple);
+        let Some(m) = self.media.as_mut() else {
+            return;
+        };
         match self.scratch.get(..len).map(Compound::parse) {
             Some(Ok(c)) => {
                 m.rx.handle_rtcp(now, &c);
@@ -807,11 +951,12 @@ impl Session {
         }
     }
 
-    /// Sends the receiver's RTCP through SRTCP to the selected tuple.
+    /// Sends the receiver's RTCP through SRTCP to the send tuple.
     fn flush(&mut self) {
-        let Some(to) = self.ice.selected() else {
+        let Some(to) = self.send_to else {
             return;
         };
+        let mut protected = Vec::new();
         let mut exhausted = false;
         if let Some(m) = self.media.as_mut() {
             let mut buf = Vec::new();
@@ -825,21 +970,18 @@ impl Session {
                 match m.outbound.protect_rtcp(&mut buf, len) {
                     Ok(n) => {
                         buf.truncate(n);
-                        if self.out.len() >= self.config.max_queued {
-                            self.stats.transmit_dropped += 1;
-                        } else {
-                            self.out.push_back(Transmit {
-                                tuple: to,
-                                bytes: buf.clone(),
-                            });
-                            self.stats.feedback_sent += 1;
-                        }
+                        protected.push(buf.clone());
                     }
                     Err(_) => {
                         exhausted = true;
                         break;
                     }
                 }
+            }
+        }
+        for d in protected {
+            if self.send(to, d, false) {
+                self.stats.feedback_sent += 1;
             }
         }
         if exhausted {

@@ -14,7 +14,7 @@
 //!   publisher: raw, mutated and honest datagrams from two tuples, checks
 //!   with and without USE-CANDIDATE or ICE-CONTROLLED, DTLS flights, SRTP
 //!   and SRTCP, and time. After every step: nothing sent to a tuple that
-//!   never authenticated, DTLS and RTCP only to the selected tuple, at most
+//!   never authenticated, DTLS and RTCP only to the send tuple, at most
 //!   [`MAX_DATAGRAMS_PER_STEP`] datagrams, none over 1500 bytes.
 
 #![allow(
@@ -367,7 +367,7 @@ pub fn whip_session(data: &[u8]) -> u8 {
             s.handle_datagram(now, t, &d);
         }
         // Invariants on what the session sends.
-        let selected = s.selected();
+        let target = s.send_tuple();
         let mut out = 0usize;
         let mut replies = Vec::new();
         while let Some(t) = s.poll_transmit() {
@@ -378,8 +378,8 @@ pub fn whip_session(data: &[u8]) -> u8 {
                 Kind::Stun => {}
                 _ => assert_eq!(
                     Some(t.tuple),
-                    selected,
-                    "DTLS and RTCP only to the selected tuple"
+                    target,
+                    "DTLS and RTCP only to the send tuple"
                 ),
             }
             if t.tuple == p.tuple {

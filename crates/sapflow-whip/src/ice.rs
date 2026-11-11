@@ -31,9 +31,12 @@
 //!   would be is not sent.
 //! - The selected tuple is set and moved only by a successful request with
 //!   USE-CANDIDATE (RFC 8445 section 8.2: a lite agent sends media only on
-//!   a nominated pair). Nothing else moves it.
-//! - Consent: each successful check on the selected tuple renews it, and
-//!   it expires [`IceConfig::consent_timeout`] (30 s) after the last.
+//!   a nominated pair), and only to a validated tuple. Nothing else moves
+//!   it. Where the session actually sends is the session's decision.
+//! - Consent (RFC 7675) is kept per validated tuple: each new successful
+//!   check from a tuple renews it, and it expires
+//!   [`IceConfig::consent_timeout`] (30 s) after the last. The session
+//!   reads it for the tuple it sends to.
 
 use crate::entropy::{ALPHANUMERIC, Entropy, EntropyError};
 use crate::stun::{self, Builder, Message};
@@ -177,8 +180,8 @@ pub struct IceConfig {
     /// oldest that is not selected. 2 to 64 (one for the selected tuple,
     /// at least one for a new one); default 8.
     pub max_tuples: usize,
-    /// Consent lasts this long after the last successful check on the
-    /// selected tuple (RFC 7675 section 5.1). 1 to 300 s; default 30 s.
+    /// Consent for a tuple lasts this long after the last successful check
+    /// from it (RFC 7675 section 5.1). 1 to 300 s; default 30 s.
     pub consent_timeout: Duration,
     /// Transaction IDs of authenticated requests remembered, to tell a
     /// replay from a new check. 16 to 4096; default 512, more than the
@@ -243,6 +246,9 @@ pub struct IceStats {
     pub repeats: u64,
     /// Repeated transaction IDs from another tuple: replays, dropped.
     pub replays: u64,
+    /// New checks not answered because every validated tuple was selected
+    /// or protected.
+    pub full: u64,
 }
 
 /// What a request did.
@@ -262,9 +268,13 @@ pub struct Agent {
     /// `<our ufrag>:<their ufrag>`.
     username: Vec<u8>,
     key: Zeroizing<Vec<u8>>,
-    validated: Vec<Tuple>,
+    /// Validated tuples, oldest first, and when each last passed a new
+    /// check.
+    validated: Vec<(Tuple, Instant)>,
     selected: Option<Tuple>,
-    last_consent: Option<Instant>,
+    /// A tuple eviction must keep besides the selected one: where the
+    /// session sends.
+    protected: Option<Tuple>,
     /// Transaction IDs seen, oldest first, with the tuple that sent each.
     seen: VecDeque<([u8; 12], Tuple)>,
     stats: IceStats,
@@ -293,7 +303,7 @@ impl Agent {
             key: Zeroizing::new(local.pwd().as_bytes().to_vec()),
             validated: Vec::new(),
             selected: None,
-            last_consent: None,
+            protected: None,
             seen: VecDeque::new(),
             stats: IceStats::default(),
         }
@@ -312,13 +322,21 @@ impl Agent {
     /// Whether a check from this tuple has succeeded (and it has not been
     /// evicted since).
     pub fn is_validated(&self, tuple: &Tuple) -> bool {
-        self.validated.contains(tuple)
+        self.validated.iter().any(|(t, _)| t == tuple)
     }
 
-    /// When consent for the selected tuple runs out.
-    pub fn consent_expires(&self) -> Option<Instant> {
-        self.last_consent
-            .and_then(|t| t.checked_add(self.config.consent_timeout))
+    /// Keeps `tuple` validated through eviction, as well as the selected
+    /// one. The session passes the tuple it sends to.
+    pub fn protect(&mut self, tuple: Option<Tuple>) {
+        self.protected = tuple;
+    }
+
+    /// When consent for a validated tuple runs out.
+    pub fn consent_expires(&self, tuple: &Tuple) -> Option<Instant> {
+        self.validated
+            .iter()
+            .find(|(t, _)| t == tuple)
+            .and_then(|(_, at)| at.checked_add(self.config.consent_timeout))
     }
 
     /// One STUN datagram from `tuple`. Returns the answer to send back to
@@ -395,17 +413,18 @@ impl Agent {
             });
         }
         let mut nominated = false;
-        // Only a validated tuple can be selected.
-        let success = success && self.validate(tuple);
         if success {
+            // Only a validated tuple can be selected; with no room to
+            // remember this one, the check is not answered.
+            if !self.validate(tuple, now) {
+                self.stats.full += 1;
+                return None;
+            }
             self.stats.successes += 1;
             if m.use_candidate && self.selected != Some(tuple) {
                 self.selected = Some(tuple);
                 self.stats.nominations += 1;
                 nominated = true;
-            }
-            if self.selected == Some(tuple) {
-                self.last_consent = Some(now);
             }
         }
         Some(Answer {
@@ -415,21 +434,27 @@ impl Agent {
         })
     }
 
-    /// Remembers a tuple as validated, evicting the oldest one that is not
-    /// selected if full. Returns whether it is validated.
-    fn validate(&mut self, tuple: Tuple) -> bool {
-        if self.validated.contains(&tuple) {
+    /// Remembers a tuple as validated at `now`, evicting the oldest one
+    /// that is neither selected nor protected if full. Returns whether it
+    /// is validated.
+    fn validate(&mut self, tuple: Tuple, now: Instant) -> bool {
+        if let Some((_, at)) = self.validated.iter_mut().find(|(t, _)| *t == tuple) {
+            *at = now;
             return true;
         }
         if self.validated.len() >= self.config.max_tuples.max(2) {
-            let selected = self.selected;
-            let Some(i) = self.validated.iter().position(|t| Some(*t) != selected) else {
+            let keep = [self.selected, self.protected];
+            let Some(i) = self
+                .validated
+                .iter()
+                .position(|(t, _)| !keep.contains(&Some(*t)))
+            else {
                 return false;
             };
             self.validated.remove(i);
             self.stats.evicted += 1;
         }
-        self.validated.push(tuple);
+        self.validated.push((tuple, now));
         true
     }
 }
@@ -524,7 +549,11 @@ mod tests {
         assert!(m.check_fingerprint(&ans.response));
         assert!(a.is_validated(&tuple(5000)));
         assert_eq!(a.selected(), None, "no USE-CANDIDATE yet");
-        assert_eq!(a.consent_expires(), None);
+        assert_eq!(
+            a.consent_expires(&tuple(5000)),
+            Some(t0 + Duration::from_secs(30))
+        );
+        assert_eq!(a.consent_expires(&tuple(5001)), None);
     }
 
     #[test]
@@ -602,7 +631,10 @@ mod tests {
         let ans = a.handle(t0, tuple(1), &r.build(5)).expect("answered");
         assert!(ans.nominated);
         assert_eq!(a.selected(), Some(tuple(1)));
-        assert_eq!(a.consent_expires(), Some(t0 + Duration::from_secs(30)));
+        assert_eq!(
+            a.consent_expires(&tuple(1)),
+            Some(t0 + Duration::from_secs(30))
+        );
         // A plain check on another tuple validates it, moves nothing.
         let t1 = t0 + Duration::from_secs(5);
         let plain = Req::honest(&c);
@@ -612,10 +644,20 @@ mod tests {
                 .nominated
         );
         assert_eq!(a.selected(), Some(tuple(1)));
-        assert_eq!(a.consent_expires(), Some(t0 + Duration::from_secs(30)));
-        // A plain check on the selected tuple renews consent.
+        assert_eq!(
+            a.consent_expires(&tuple(1)),
+            Some(t0 + Duration::from_secs(30))
+        );
+        assert_eq!(
+            a.consent_expires(&tuple(2)),
+            Some(t1 + Duration::from_secs(30))
+        );
+        // A plain check on the selected tuple renews its consent.
         a.handle(t1, tuple(1), &plain.build(7)).expect("answered");
-        assert_eq!(a.consent_expires(), Some(t1 + Duration::from_secs(30)));
+        assert_eq!(
+            a.consent_expires(&tuple(1)),
+            Some(t1 + Duration::from_secs(30))
+        );
         // USE-CANDIDATE from the second tuple moves the selection.
         let t2 = t1 + Duration::from_secs(1);
         assert!(
@@ -666,7 +708,10 @@ mod tests {
         r.use_candidate = true;
         let check = r.build(40);
         a.handle(t0, tuple(1), &check).expect("answered");
-        assert_eq!(a.consent_expires(), Some(t0 + Duration::from_secs(30)));
+        assert_eq!(
+            a.consent_expires(&tuple(1)),
+            Some(t0 + Duration::from_secs(30))
+        );
         // From another tuple: nothing, and nothing changes.
         let t1 = t0 + Duration::from_secs(5);
         assert!(a.handle(t1, tuple(2), &check).is_none());
@@ -677,7 +722,10 @@ mod tests {
         let again = a.handle(t1, tuple(1), &check).expect("retransmission");
         assert!(!again.success && !again.nominated);
         assert!(again.response.len() <= check.len());
-        assert_eq!(a.consent_expires(), Some(t0 + Duration::from_secs(30)));
+        assert_eq!(
+            a.consent_expires(&tuple(1)),
+            Some(t0 + Duration::from_secs(30))
+        );
         let st = a.stats();
         assert_eq!((st.replays, st.repeats, st.successes), (1, 1, 1));
     }
@@ -730,6 +778,29 @@ mod tests {
         // check again. Containing that is the session's job.
         assert!(a.handle(now, tuple(2), &first).expect("forgotten").success);
         assert_eq!(a.stats().replays, 0);
+    }
+
+    #[test]
+    fn eviction_keeps_the_selected_and_protected_tuples() {
+        let c = creds();
+        let config = IceConfig {
+            max_tuples: 2,
+            ..IceConfig::default()
+        };
+        let mut a = Agent::new(config, &c, "peer");
+        let now = Instant::now();
+        let mut r = Req::honest(&c);
+        r.use_candidate = true;
+        a.handle(now, tuple(1), &r.build(1)).expect("answered");
+        a.protect(Some(tuple(1)));
+        a.handle(now, tuple(2), &r.build(2)).expect("answered");
+        assert_eq!(a.selected(), Some(tuple(2)));
+        // Both slots hold a tuple that must be kept: a third is not
+        // answered, and nothing moves.
+        assert!(a.handle(now, tuple(3), &r.build(3)).is_none());
+        assert_eq!(a.stats().full, 1);
+        assert!(a.is_validated(&tuple(1)) && a.is_validated(&tuple(2)));
+        assert_eq!(a.selected(), Some(tuple(2)));
     }
 
     #[test]
