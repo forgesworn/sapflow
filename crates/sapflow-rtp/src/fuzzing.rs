@@ -371,7 +371,7 @@ mod tests {
 
     /// Writes the committed seeds. Run on demand after a capture:
     /// `SAPFLOW_RTP_CAPTURE=<dir> cargo test -p sapflow-rtp --lib --
-    /// --ignored write_seeds`.
+    /// --ignored write_seeds`, optionally with `SAPFLOW_RTP_SEED_PREFIX`.
     #[test]
     #[ignore = "writes fuzz/seeds from a fresh FFmpeg capture"]
     fn write_seeds() {
@@ -379,7 +379,13 @@ mod tests {
         use crate::rtp::RtpBuilder;
         let dir = PathBuf::from(std::env::var("SAPFLOW_RTP_CAPTURE").expect("capture dir"));
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds");
+        // SAPFLOW_RTP_SEED_PREFIX limits the rewrite to seeds whose names
+        // start with it (for example `gcm-`).
+        let prefix = std::env::var("SAPFLOW_RTP_SEED_PREFIX").unwrap_or_default();
         let write = |target: &str, name: &str, bytes: &[u8]| {
+            if !name.starts_with(&prefix) {
+                return;
+            }
             let d = root.join(target);
             std::fs::create_dir_all(&d).expect("dir");
             assert!(bytes.len() <= 65_536, "{name} within CI's -max_len");

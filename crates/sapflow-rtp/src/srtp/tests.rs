@@ -83,6 +83,29 @@ fn rfc3711_b3_key_derivation() {
     );
 }
 
+/// RFC 7714 section 11 with erratum 4938: a 96-bit master salt `S` is used
+/// as the 112-bit `S || 00 00`, so the PRF input is `S || 00 00 || 00 00`
+/// with the label XORed into octet 7.
+#[test]
+fn gcm_prf_input_pads_the_96_bit_salt_on_the_right() {
+    let salt = hex("0102030405060708090a0b0c");
+    for (label, block) in [
+        (0, "0102030405060708090a0b0c00000000"),
+        (1, "0102030405060709090a0b0c00000000"),
+        (2, "010203040506070a090a0b0c00000000"),
+        (3, "010203040506070b090a0b0c00000000"),
+        (4, "010203040506070c090a0b0c00000000"),
+        (5, "010203040506070d090a0b0c00000000"),
+    ] {
+        assert_eq!(
+            transform::prf_input(&salt, label).expect("x"),
+            arr::<16>(block),
+            "label {label}"
+        );
+    }
+    assert_eq!(transform::prf_input(&[0; 15], 0), Err(SrtpError::Config));
+}
+
 // ---- RFC 7714 section 16 (RTP) ----------------------------------------------
 
 const RTP_PLAIN: &str = "8040f17b 8041f8d3 5501a0b2 47616c6c

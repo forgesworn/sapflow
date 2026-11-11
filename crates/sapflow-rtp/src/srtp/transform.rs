@@ -70,19 +70,21 @@ pub(crate) fn keystream(
 ///
 /// With a key derivation rate of 0, `r` is zero, so `key_id` is the label
 /// followed by six zero octets, and `x = key_id XOR master_salt` with the
-/// two right-aligned. The PRF input is `x * 2^16` in a 128-bit block.
+/// two right-aligned in 112 bits. The PRF input is `x * 2^16` in a 128-bit
+/// block, so the salt starts at octet 0 and the label lands on octet 7.
 ///
-/// Placement of a 96-bit master salt (the GCM profile, RFC 7714 section
-/// 12): it is right-aligned like the 112-bit one, so it occupies octets 2
-/// to 13 and octets 0 and 1 are zero. No RFC test vector covers this case;
-/// it is checked against real peers in the DTLS stage.
+/// A 96-bit master salt (the GCM profile) is first multiplied by 2^16 to
+/// make the 112-bit salt the KDF expects: RFC 7714 section 11 as corrected
+/// by erratum 4938 (verified 2023-11-08). So it occupies octets 0 to 11,
+/// followed by zeros. No RFC test vector covers this end to end; the first
+/// check against a real GCM peer is the DTLS stage (W2).
 pub(crate) fn prf_input(master_salt: &[u8], label: u8) -> Result<[u8; 16], SrtpError> {
     let mut block = [0u8; 16];
-    let start = 14usize
-        .checked_sub(master_salt.len())
-        .ok_or(SrtpError::Config)?;
+    if master_salt.len() > 14 {
+        return Err(SrtpError::Config);
+    }
     block
-        .get_mut(start..14)
+        .get_mut(..master_salt.len())
         .ok_or(SrtpError::Config)?
         .copy_from_slice(master_salt);
     // The label is the seventh octet from the right of the 112-bit x.
