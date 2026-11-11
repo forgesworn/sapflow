@@ -727,12 +727,19 @@ socket submission is outstanding.
 
 SRT uses actual `uptimeNanoseconds / 1000` microseconds and `nextDeadlineUs`,
 not a multiplied millisecond clock. The shared one-shot timer schedules absolute
-nanoseconds. Default Rust limits are 128 packets/4 MiB of transport retention,
-one-second packet age, one-second SDK sample residence, 120 ms SRT latency and
-1,250,000 packet bytes/s including retransmissions. These native/SDK/transport
+nanoseconds. The mobile publisher uses 128 packets/4 MiB of transport retention,
+1,250 ms packet age, one-second SDK sample residence, a requested 1,000 ms SRT
+recovery buffer and 1,250,000 packet bytes/s including retransmissions. These native/SDK/transport
 residence bounds are distinct and can add; they are not an end-to-end one-second
 latency claim. TS staging, serialization, encryption and FFI output copies remain
 accounted separately from shared compressed sample ownership.
+
+The immutable publisher setting accepts requests from 1 to 1,000 ms. Its
+diagnostic snapshot records negotiated latency only after the actual Connected
+event. A peer can negotiate a larger receive buffer without extending local
+packet retention. Manual imports and V4V grants remain unchanged. See
+[mobile SRT recovery budget](reference.md#mobile-srt-recovery-budget) for the
+bounded retention calculation and the additional buffering this introduces.
 
 Failure closes only publishing. Explicit stop cancels media and attempts at most
 one best-effort SRT shutdown, bounded by the same submission deadline; recording

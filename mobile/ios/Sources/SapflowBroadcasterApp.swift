@@ -648,7 +648,7 @@ struct BroadcasterView: View {
                 Toggle("Explicit plaintext SRT", isOn: $manual.srtPlaintext).font(.caption)
                 Text(manual.srtPlaintext ? "Clear the passphrase to send plaintext media. There is no automatic downgrade." : "AES-256 media encryption. Stream ID/control remain clear; SRT does not authenticate peer identity.")
                     .font(.caption).foregroundStyle(manual.srtPlaintext ? .orange : .secondary)
-                Text("Numeric IPv4/IPv6 peer only · 120 ms SRT latency").font(.caption).foregroundStyle(.secondary)
+                Text("Numeric IPv4/IPv6 peer only · requests a 1-second SRT buffer for loss recovery, with longer playback delay").font(.caption).foregroundStyle(.secondary)
             } else {
                 TextField("rtmps://stream.example.invalid/live", text: $manual.endpoint).accessibilityIdentifier("destination.endpoint")
                     .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL).textFieldStyle(.roundedBorder)

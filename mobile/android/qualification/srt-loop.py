@@ -59,7 +59,7 @@ def main():
             classes.write_bytes(archive.read("classes.jar"))
         source = ROOT / "mobile/android/app/src/main/java/dev/forgesworn/sapflow/broadcaster"
         run("kotlinc", "-language-version", "2.2", "-api-version", "2.2", "-cp", str(classes),
-            *[str(source / name) for name in ("EncodedSink.kt", "SrtPublishingSink.kt", "SrtDestination.kt", "SingleSampleOffer.kt", "ExplicitAttempt.kt", "SrtShutdown.kt",
+            *[str(source / name) for name in ("EncodedSink.kt", "SrtPublishingSink.kt", "SrtRecoveryPolicy.kt", "SrtDestination.kt", "SingleSampleOffer.kt", "ExplicitAttempt.kt", "SrtShutdown.kt",
                 "ReconnectController.kt", "PublishingAuthority.kt", "CaptureIntent.kt", "CaptureProfile.kt", "SocketOutputTelemetry.kt")],
             str(ROOT / "mobile/android/qualification/SrtLoop.kt"), "-include-runtime", "-d", str(consumer))
         fixture, received = scratch / "source.flv", scratch / "received.ts"

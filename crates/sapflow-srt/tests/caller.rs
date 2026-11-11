@@ -378,6 +378,64 @@ fn lost_ack_has_rto_recovery_then_bounded_retry_failure() {
 }
 
 #[test]
+fn timeout_does_not_retry_young_tail_after_an_advancing_ack() {
+    let now = Instant::now();
+    let mut c = open(CallerConfig::default(), now);
+    c.enqueue(now, vec![1]).expect("old packet");
+    c.poll_transmit(now).expect("old original");
+    c.enqueue(time(now, 310_000), vec![2])
+        .expect("young packet");
+    c.poll_transmit(time(now, 310_000)).expect("young original");
+    c.handle_timeout(time(now, 320_000));
+    assert_eq!(c.stats().send.timeout_retransmissions, 1);
+    // A delayed ACK covers only the old packet. The young one is still in
+    // flight and has had only 12 ms to reach the receiver and be acknowledged.
+    control(
+        &mut c,
+        time(now, 321_000),
+        Control::Ack(sapflow_srt::packet::Ack {
+            number: 0,
+            ack: Seq::new(101),
+            stats: None,
+        }),
+    );
+    assert!(c.poll_transmit(time(now, 322_000)).is_none());
+    assert_eq!(c.stats().send.acknowledged_packets, 1);
+    assert!(c.poll_transmit(time(now, 640_999)).is_none());
+    let (_, bytes) = c
+        .poll_transmit(time(now, 641_000))
+        .expect("young packet eventually retries without feedback");
+    assert_eq!(data(&bytes).seq, Seq::new(101));
+    assert!(data(&bytes).retransmitted);
+    assert_eq!(c.stats().send.nak_packets, 0);
+}
+
+#[test]
+fn timeout_does_not_repeat_a_recent_nak_retry() {
+    let now = Instant::now();
+    let mut c = open(CallerConfig::default(), now);
+    c.enqueue(now, vec![1]).expect("packet");
+    c.poll_transmit(now).expect("original");
+    control(
+        &mut c,
+        time(now, 310_000),
+        Control::Nak(vec![(Seq::new(100), Seq::new(100))]),
+    );
+    let (_, bytes) = c
+        .poll_transmit(time(now, 310_000))
+        .expect("urgent NAK retry");
+    assert!(data(&bytes).retransmitted);
+    assert!(c.poll_transmit(time(now, 320_000)).is_none());
+    assert_eq!(c.stats().send.timeout_retransmissions, 0);
+    assert!(c.poll_timeout().is_some_and(|at| at > time(now, 320_000)));
+    let (_, bytes) = c
+        .poll_transmit(time(now, 960_000))
+        .expect("feedback loss still recovers");
+    assert!(data(&bytes).retransmitted);
+    assert_eq!(c.stats().send.timeout_retransmissions, 1);
+}
+
+#[test]
 fn media_past_its_age_budget_is_dropped_and_the_session_stays_open() {
     let now = Instant::now();
     for sent in [false, true] {
@@ -477,6 +535,281 @@ fn keepalive_shutdown_and_empty_invalid_payloads() {
     control(&mut c, time(now, 1_100_000), Control::Shutdown);
     assert_eq!(reason(&mut c), CallerCloseReason::PeerClosed);
     assert!(c.poll_transmit(time(now, 1_100_000)).is_none());
+}
+
+struct RecoveryOutcome {
+    delivered: Vec<(Vec<u8>, bool)>,
+    receiver: sapflow_srt::Stats,
+    sender: sapflow_srt::SendStats,
+    caller_latency: Duration,
+    listener_latency: Duration,
+    delayed_retry: bool,
+}
+
+/// A 20 ms RTT path loses one original and delays its first actual repair.
+/// Other copies of that sequence are lost. All other traffic is delivered,
+/// including the receiver's honest too-late ACK if its budget runs out.
+fn delayed_recovery(
+    requested_ms: u64,
+    retention_ms: u64,
+    peer_ms: u64,
+    recovery_ms: Option<u64>,
+) -> RecoveryOutcome {
+    let now = Instant::now();
+    let mut config = CallerConfig {
+        latency: Duration::from_millis(requested_ms),
+        ..CallerConfig::default()
+    };
+    config.send.max_age_us = retention_ms * 1000;
+    config.send.max_packets = 128;
+    config.send.max_bytes = 4 * 1024 * 1024;
+    let mut c = caller(config, now);
+    let mut listener = Listener::new(
+        Config {
+            latency: Duration::from_millis(peer_ms),
+            ..Config::default()
+        },
+        now,
+    );
+    let mut network: Vec<(u64, bool, Vec<u8>)> = Vec::new();
+    let mut connection = None;
+    let mut caller_latency = None;
+    let mut enqueued = false;
+    let mut original_sent = None;
+    let mut delayed_retry = false;
+    let mut delivered = Vec::new();
+    for us in (0..(requested_ms.max(peer_ms) + 1000) * 1000).step_by(1000) {
+        let at = time(now, us);
+        network.sort_by_key(|packet| packet.0);
+        let ready = network.partition_point(|packet| packet.0 <= us);
+        // Ready input precedes timers, matching the adapter's receive drain.
+        for (_, to_listener, bytes) in network.drain(..ready) {
+            if to_listener {
+                listener.handle_datagram(at, source(), &bytes);
+            } else {
+                c.handle_datagram(at, peer(), &bytes);
+            }
+        }
+        c.handle_timeout(at);
+        listener.handle_timeout(at);
+        while let Some(event) = c.poll_event() {
+            match event {
+                CallerEvent::Connected { latency, .. } => caller_latency = Some(latency),
+                CallerEvent::Closed { reason } => panic!("caller closed: {reason:?}"),
+            }
+        }
+        if c.is_connected() && !enqueued {
+            for n in 0..3 {
+                c.enqueue(at, vec![n; 188]).expect("bounded message");
+            }
+            enqueued = true;
+        }
+        while let Some((_, bytes)) = c.poll_transmit(at) {
+            if let Ok(Packet::Data(packet)) = Packet::parse(&bytes)
+                && packet.seq == Seq::new(101)
+            {
+                if !packet.retransmitted {
+                    original_sent = Some(us);
+                } else if !delayed_retry && let Some(delay) = recovery_ms {
+                    let arrival = original_sent.expect("original preceded repair") + delay * 1000;
+                    assert!(arrival > us, "the fixture must delay an actual repair");
+                    network.push((arrival, true, bytes));
+                    delayed_retry = true;
+                }
+                continue;
+            }
+            network.push((us + 10_000, true, bytes));
+        }
+        while let Some(event) = listener.poll_event() {
+            match event {
+                Event::Connect { id, .. } => {
+                    connection = Some(id);
+                    assert!(listener.accept(id, at));
+                }
+                Event::Data {
+                    payload,
+                    after_loss,
+                    ..
+                } => delivered.push((payload, after_loss)),
+                Event::Closed { reason, .. } => panic!("listener closed: {reason:?}"),
+            }
+        }
+        while let Some((_, bytes)) = listener.poll_transmit() {
+            network.push((us + 10_000, false, bytes));
+        }
+    }
+    assert!(c.is_connected());
+    let connection = connection.expect("accepted connection");
+    RecoveryOutcome {
+        delivered,
+        receiver: listener
+            .connection_stats(connection)
+            .expect("receiver stats"),
+        sender: c.stats().send,
+        caller_latency: caller_latency.expect("caller connected"),
+        listener_latency: listener.latency(connection).expect("negotiated latency"),
+        delayed_retry,
+    }
+}
+
+#[test]
+fn mobile_recovery_budget_admits_a_500ms_repair_but_keeps_deadlines() {
+    // The same repair misses the former 120 ms mobile budget and fits the
+    // explicit 1000 ms request. These are policy inputs, not new core defaults.
+    let old = delayed_recovery(120, 1000, 120, Some(500));
+    assert!(old.delayed_retry);
+    assert_eq!(
+        old.delivered,
+        vec![(vec![0; 188], false), (vec![2; 188], true)]
+    );
+    assert_eq!(old.receiver.dropped, 1);
+    assert!(old.receiver.belated >= 1);
+
+    let current = delayed_recovery(1000, 1250, 120, Some(500));
+    assert!(current.delayed_retry);
+    assert_eq!(
+        current.delivered,
+        (0..3).map(|n| (vec![n; 188], false)).collect::<Vec<_>>(),
+        "500 ms repair must preserve every message within the chosen mobile budget"
+    );
+    assert_eq!(current.caller_latency, Duration::from_millis(1000));
+    assert_eq!(current.listener_latency, current.caller_latency);
+    assert_eq!(current.receiver.dropped, 0);
+    assert_eq!(current.sender.acknowledged_packets, 3);
+    assert_eq!(current.sender.expired_packets, 0);
+    assert_eq!(current.sender.buffered_packets, 0);
+
+    let too_late = delayed_recovery(1000, 1250, 120, Some(1100));
+    assert!(too_late.delayed_retry);
+    assert_eq!(too_late.delivered, old.delivered);
+    assert_eq!(too_late.receiver.dropped, 1);
+    assert!(too_late.receiver.belated >= 1);
+}
+
+#[test]
+fn larger_peer_latency_does_not_extend_local_sender_retention() {
+    let result = delayed_recovery(1000, 1250, 2000, None);
+    assert_eq!(result.caller_latency, Duration::from_millis(2000));
+    assert_eq!(result.listener_latency, result.caller_latency);
+    assert_eq!(result.sender.acknowledged_packets, 1);
+    assert_eq!(result.sender.expired_packets, 2);
+    assert_eq!(result.sender.buffered_packets, 0);
+    assert_eq!(result.receiver.dropped, 1);
+    assert_eq!(
+        result.delivered,
+        vec![(vec![0; 188], false), (vec![2; 188], true)]
+    );
+}
+
+#[test]
+fn mobile_sender_retention_expires_at_1250ms_without_expanding_queue_caps() {
+    let now = Instant::now();
+    for byte_cap in [false, true] {
+        let mut config = CallerConfig {
+            latency: Duration::from_millis(1000),
+            ..CallerConfig::default()
+        };
+        config.send.max_age_us = 1_250_000;
+        config.send.max_packets = 128;
+        config.send.max_bytes = 4 * 1024 * 1024;
+        let mut c = open(config, now);
+        let count = if byte_cap { 1 } else { 128 };
+        for _ in 0..count {
+            let mut payload = if byte_cap {
+                Vec::with_capacity(4 * 1024 * 1024)
+            } else {
+                Vec::with_capacity(1316)
+            };
+            payload.resize(if byte_cap { 1 } else { 1316 }, 7);
+            c.enqueue(now, payload).expect("within mobile queue cap");
+        }
+        c.poll_transmit(now).expect("one original in flight");
+        assert_eq!(c.enqueue(now, vec![8]), Err(SendError::QueueFull));
+        assert_eq!(c.stats().send.buffered_packets, count);
+        assert!(c.stats().send.buffered_bytes <= 4 * 1024 * 1024);
+        c.handle_timeout(time(now, 1_249_999));
+        assert_eq!(c.stats().send.buffered_packets, count);
+        c.handle_timeout(time(now, 1_250_000));
+        assert_eq!(c.stats().send.expired_packets, count as u64);
+        assert_eq!(c.stats().send.buffered_packets, 0);
+        assert_eq!(c.stats().send.buffered_bytes, 0);
+        assert!(c.is_connected(), "age expiry does not disable the session");
+        c.enqueue(time(now, 1_250_001), vec![9])
+            .expect("fresh media accepted after bounded expiry");
+    }
+}
+
+#[test]
+fn own_listener_recovers_a_lost_final_ack_or_ackack() {
+    for drop_ackack in [false, true] {
+        let now = Instant::now();
+        let mut config = CallerConfig::default();
+        config.send.max_retransmits = 1;
+        let mut c = caller(config, now);
+        let mut listener = Listener::new(Config::default(), now);
+        let mut enqueued = false;
+        let mut dropped = false;
+        let mut delivered = Vec::new();
+        let mut acks = 0;
+        for us in (0..1_500_000).step_by(1000) {
+            let at = time(now, us);
+            c.handle_timeout(at);
+            listener.handle_timeout(at);
+            while let Some((_, bytes)) = c.poll_transmit(at) {
+                if drop_ackack
+                    && !dropped
+                    && matches!(
+                        Packet::parse(&bytes),
+                        Ok(Packet::Control(ControlPacket {
+                            body: Control::AckAck { .. },
+                            ..
+                        }))
+                    )
+                {
+                    dropped = true;
+                    continue;
+                }
+                listener.handle_datagram(at, source(), &bytes);
+            }
+            while let Some(event) = listener.poll_event() {
+                match event {
+                    Event::Connect { id, .. } => assert!(listener.accept(id, at)),
+                    Event::Data { payload, .. } => delivered.push(payload),
+                    Event::Closed { reason, .. } => panic!("unexpected close: {reason:?}"),
+                }
+            }
+            while let Some((_, bytes)) = listener.poll_transmit() {
+                if matches!(
+                    Packet::parse(&bytes),
+                    Ok(Packet::Control(ControlPacket {
+                        body: Control::Ack(_),
+                        ..
+                    }))
+                ) {
+                    acks += 1;
+                    if !drop_ackack && !dropped {
+                        dropped = true;
+                        continue;
+                    }
+                }
+                c.handle_datagram(at, peer(), &bytes);
+            }
+            if c.is_connected() && !enqueued {
+                c.enqueue(at, vec![1; 188]).expect("final packet");
+                enqueued = true;
+            }
+        }
+        assert!(dropped);
+        assert_eq!(delivered, vec![vec![1; 188]]);
+        assert!(
+            c.is_connected(),
+            "one lost feedback packet must not close the caller"
+        );
+        assert_eq!(c.stats().send.acknowledged_packets, 1);
+        assert_eq!(c.stats().send.retransmitted_packets, 0);
+        assert_eq!(c.stats().send.buffered_packets, 0);
+        assert_eq!(acks, 2, "one repeat then quiescence after confirmation");
+    }
 }
 
 #[test]

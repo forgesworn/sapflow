@@ -449,9 +449,12 @@ impl Sender {
         }
         self.drop_expired(now);
         if self.next_rto.is_some_and(|deadline| now >= deadline) {
+            let rto = self.rto();
             self.rto_count = self.rto_count.saturating_add(1);
             for f in &mut self.flight {
-                if !f.requested {
+                // The connection alarm can predate a newer original or NAK
+                // retry. Give each transmission its own feedback interval.
+                if !f.requested && now.saturating_sub(f.last_sent) >= rto {
                     f.requested = true;
                     self.retries.push_back(f.seq);
                     self.stats.timeout_retransmissions += 1;

@@ -390,12 +390,20 @@ Selector worker owns all SRT calls at actual microsecond precision. It has at
 most one borrowed sample offer, one outgoing datagram of at most 1500 bytes,
 16 bounded steps per turn and one native-deadline timer; there is no idle
 polling or additional media queue. A zero-byte socket write enables writable
-readiness and a 100 ms deadline. The native configuration uses 120 ms latency,
-128 packets, 4 MiB, one-second packet/sample residence and a 1,250,000-byte/s
+readiness and a 100 ms deadline. The mobile publisher requests a 1,000 ms SRT
+recovery buffer and retains transport packets for at most 1,250 ms. It keeps
+128 packets, 4 MiB, one-second SDK sample residence and a 1,250,000-byte/s
 bandwidth ceiling. These separate bounds do not sum to a one-second latency
 guarantee. Prehandshake samples are dropped and sending starts at a fresh IDR.
 Failure ends that attempt while independent recording continues. Connected
 means handshake completion; media reception remains unconfirmed.
+
+The immutable publisher setting accepts requests from 1 to 1,000 ms; diagnostics
+separate that request from the latency reported by the completed handshake.
+A peer can negotiate a larger receive buffer without extending the local packet
+retention limit. Manual imports and V4V grants do not carry this local setting.
+See [mobile SRT recovery budget](reference.md#mobile-srt-recovery-budget) for
+the retention calculation, physical evidence and the buffering tradeoff.
 
 Private MP4 recording is a separate explicit checkbox, enabled initially.
 `PrivateRecordingSink` consumes the same immutable encoded handles through
