@@ -720,16 +720,21 @@ impl Server {
     }
 
     /// Whether `f` is the start of a retransmission of the ClientHello our
-    /// last flight answered. A different hello under the same seq (another
-    /// random, say) is ignored rather than answered with our flight.
+    /// last flight answered: offset 0, the same length, and at least the
+    /// version and the 32-byte random (or the whole message), all equal to
+    /// it. A different hello under the same seq (another random, say), or a
+    /// short fragment that proves nothing, is ignored rather than answered
+    /// with our flight.
     fn repeats_answered_hello(&self, f: &message::Fragment<'_>) -> bool {
+        /// `client_version` and `random`.
+        const PROOF: usize = 34;
         let Some((seq, body)) = &self.answered else {
             return false;
         };
         f.msg_type == message::CLIENT_HELLO
             && f.seq == *seq
             && f.offset == 0
-            && !f.data.is_empty()
+            && f.data.len() >= PROOF.min(body.len())
             && usize::try_from(f.length).is_ok_and(|n| n == body.len())
             && body.get(..f.data.len()) == Some(f.data)
     }

@@ -406,6 +406,27 @@ fn retransmitted_hello_resends_once_per_spacing_and_within_budget() {
 }
 
 #[test]
+fn a_short_prefix_of_the_hello_does_not_trigger_a_resend() {
+    let mut p = pair(Options::default());
+    let hello = p.client.start();
+    p.feed(&hello).expect("hello");
+    p.drain();
+    let random_len = 34;
+    let r = record::records(&hello[0]).next().expect("record");
+    let f = message::fragments(r.body).next().expect("fragment");
+    for n in [1, 2, random_len - 1] {
+        p.now += Duration::from_secs(1);
+        let d = fragment_record(1, 0, f.length, 0, &f.data[..n], 50 + n as u64);
+        p.feed(&[d]).expect("prefix");
+        assert!(p.drain().is_empty(), "{n}-byte prefix");
+    }
+    p.now += Duration::from_secs(1);
+    let d = fragment_record(1, 0, f.length, 0, &f.data[..random_len], 90);
+    p.feed(&[d]).expect("prefix");
+    assert!(!p.drain().is_empty(), "version and random repeated: resent");
+}
+
+#[test]
 fn a_different_hello_under_the_same_seq_is_ignored() {
     let mut p = pair(Options::default());
     let hello = p.client.start();
