@@ -339,6 +339,36 @@ follows the observed behaviour.
   packets where libsrt's receiver and sapflow-srt delivered the same 59
   (`crates/sapflow-srt/tests/differential.rs`).
 
+### Mobile SRT recovery budget
+
+The Android and iOS publishers request a 1,000 ms recovery buffer by default,
+replacing their earlier 120 ms request. This adds 880 ms of requested buffering
+to allow more time for delayed originals and retransmissions. It is a mobile
+transport policy; the shared SRT library's default remains 120 ms.
+
+Each publisher receives an immutable request in the range 1 to 1,000 ms. Packet
+retention is `max(1000, ceil(5 * requested_ms / 4))` milliseconds, bounded at
+1,250 ms. This follows the sender drop-threshold recommendation in the
+[public SRT draft, section 4.6](https://datatracker.ietf.org/doc/html/draft-sharabayko-srt-01#section-4.6),
+an archived Internet-Draft rather than an IETF standard. The 128-packet/4-MiB
+transport bounds, one-second SDK sample residence and pacing limits remain
+unchanged. The peer may negotiate a larger receive buffer; diagnostics report
+the actual value, but negotiation does not increase these local retention or
+memory limits. A longer negotiated buffer therefore does not promise matching
+sender retransmission history. Imports, saved destination formats and V4V
+authority grants do not acquire a new field.
+
+Physical tests with the 120 ms request produced both complete and incomplete
+recordings. One metadata trace measured recovery taking up to 466 ms. A later
+instrumented run completed without drops: all 42,298 original packets reached
+Java socket submission within 57.8 ms of native enqueue, with no zero-byte or
+partial writes. That passing run did not reproduce the earlier loss or establish
+another scheduler defect. Delay after socket submission can include the sending
+kernel, network and receiver-host scheduling. These observations motivate testing
+a larger recovery budget; they are not a controlled performance comparison or a
+guarantee of complete recording under arbitrary conditions. Expired gaps must
+still mark the recording incomplete.
+
 ## Related
 
 relayswarm (forgesworn) already has a Node HLS origin that signs a Nostr
