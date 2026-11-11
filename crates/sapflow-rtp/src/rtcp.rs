@@ -36,6 +36,9 @@ pub const FMT_NACK: u8 = 1;
 pub const FMT_PLI: u8 = 1;
 /// PSFB format: full intra request (RFC 5104 section 4.3.1).
 pub const FMT_FIR: u8 = 4;
+/// RTPFB format: transport-wide congestion control feedback
+/// (draft-holmer-rmcat-transport-wide-cc-extensions-01 section 3.1).
+pub const FMT_TRANSPORT_CC: u8 = 15;
 
 /// Length of one report block.
 const REPORT_BLOCK_LEN: usize = 24;

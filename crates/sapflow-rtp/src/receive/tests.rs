@@ -21,6 +21,18 @@ const H264_ANNEXB: &[u8] = include_bytes!("../../tests/fixtures/ffmpeg-h264-fu.h
 const OPUS_REC: &[u8] = include_bytes!("../../tests/fixtures/ffmpeg-opus-stereo.rec");
 
 const MS: u64 = 1000;
+
+/// W1b's tests predate the start hold: they align by arrival at the first
+/// packet, so events come out as before.
+fn no_hold() -> ReceiverConfig {
+    ReceiverConfig {
+        timeline: TimelineConfig {
+            start_hold: Duration::ZERO,
+            ..TimelineConfig::default()
+        },
+        ..ReceiverConfig::default()
+    }
+}
 /// One-way delay of the simulated network; the RTT is twice this.
 const ONE_WAY: u64 = 15 * MS;
 const RTX_PT: u8 = 98;
@@ -160,8 +172,8 @@ struct Outcome {
     receiver: Receiver,
 }
 
-fn receiver(c: &Capture, rtx: bool, audio_nack: bool) -> Receiver {
-    let mut r = Receiver::new(ReceiverConfig::default(), Instant::now());
+fn receiver(c: &Capture, rtx: bool, audio_nack: bool, cfg: ReceiverConfig) -> Receiver {
+    let mut r = Receiver::new(cfg, Instant::now());
     let mut video = StreamConfig::new(Codec::H264, c.video_pt);
     video.ssrc = Some(c.video_ssrc);
     video.nack = true;
@@ -183,7 +195,12 @@ fn receiver(c: &Capture, rtx: bool, audio_nack: bool) -> Receiver {
 /// Plays the capture through `imp` to a receiver, answering NACKs by
 /// `resend`.
 fn simulate(c: &Capture, imp: &Impairments, resend: Resend) -> Outcome {
-    let mut r = receiver(c, resend == Resend::Rtx, !imp.audio_nack_off);
+    simulate_with(c, imp, resend, no_hold())
+}
+
+/// [`simulate`] with a receiver configuration of its own.
+fn simulate_with(c: &Capture, imp: &Impairments, resend: Resend, cfg: ReceiverConfig) -> Outcome {
+    let mut r = receiver(c, resend == Resend::Rtx, !imp.audio_nack_off, cfg);
     let t0 = r.epoch;
     let at = |us: u64| t0 + Duration::from_micros(us);
     let mut queue: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> = BinaryHeap::new();
@@ -249,7 +266,7 @@ fn simulate(c: &Capture, imp: &Impairments, resend: Resend) -> Outcome {
         } else {
             r.handle_timeout(at(now));
         }
-        while let Some(f) = r.poll_feedback() {
+        while let Some(f) = r.poll_feedback_item() {
             // Every NACK reads back through the RTCP parser.
             let mut wire = Vec::new();
             f.write(&mut wire, 1).expect("built");
@@ -346,7 +363,10 @@ fn lost_set(events: &[Event], stream: usize) -> BTreeSet<u16> {
 fn assert_clean(events: &[Event]) {
     for e in events {
         assert!(
-            matches!(e, Event::AccessUnit { .. } | Event::Audio { .. }),
+            matches!(
+                e,
+                Event::AccessUnit { .. } | Event::Audio { .. } | Event::Aligned { .. }
+            ),
             "unexpected {e:?}"
         );
         if let Event::Audio { frame, .. } = e {
@@ -590,6 +610,7 @@ fn e_stream(e: &Event) -> Option<usize> {
         | Event::FrameSkipped { stream, .. }
         | Event::Discontinuity { stream, .. }
         | Event::Refused { stream, .. } => Some(stream.index()),
+        Event::Aligned { .. } => None,
     }
 }
 
@@ -964,7 +985,10 @@ fn opus_dtx_is_filled_and_not_counted_as_loss() {
 fn assert_clean_but_dtx(events: &[Event]) {
     for e in events {
         assert!(
-            matches!(e, Event::AccessUnit { .. } | Event::Audio { .. }),
+            matches!(
+                e,
+                Event::AccessUnit { .. } | Event::Audio { .. } | Event::Aligned { .. }
+            ),
             "{e:?}"
         );
         if let Event::Audio { frame, .. } = e {
@@ -1010,7 +1034,7 @@ fn feed(r: &mut Receiver, at_ms: u64, d: &[u8]) -> Result<(StreamId, Received), 
 
 #[test]
 fn routing_binds_ssrcs_and_refuses_strangers() {
-    let mut r = video_only(ReceiverConfig::default(), true);
+    let mut r = video_only(no_hold(), true);
     let idr = [0x65, 0x88, 1];
     assert_eq!(
         feed(&mut r, 0, &pkt(96, 7, 1, 0, true, &idr)),
@@ -1045,7 +1069,7 @@ fn routing_binds_ssrcs_and_refuses_strangers() {
     );
     assert_eq!(r.stats(StreamId(0)).expect("stats").rtx_padding, 1);
     // Configuration refusals.
-    let mut r = video_only(ReceiverConfig::default(), true);
+    let mut r = video_only(no_hold(), true);
     assert_eq!(
         r.add_stream(StreamConfig::new(Codec::Opus, 97)),
         Err(ConfigError::PayloadTypeTaken(97))
@@ -1073,12 +1097,16 @@ fn routing_binds_ssrcs_and_refuses_strangers() {
 
 #[test]
 fn keyframe_requests_are_scheduled_and_rate_limited() {
-    let mut r = video_only(ReceiverConfig::default(), false);
+    let mut r = video_only(no_hold(), false);
     let p_frame = [0x41, 0x9a, 1];
     feed(&mut r, 0, &pkt(96, 7, 1, 0, true, &p_frame)).expect("taken");
     // At once on the first packet; the P frame is skipped.
-    assert_eq!(r.poll_feedback(), Some(Feedback::Pli { media_ssrc: 7 }));
+    assert_eq!(
+        r.poll_feedback_item(),
+        Some(Feedback::Pli { media_ssrc: 7 })
+    );
     r.handle_timeout(r.epoch + Duration::from_millis(20));
+    assert!(matches!(r.poll_event(), Some(Event::Aligned { .. })));
     assert!(matches!(
         r.poll_event(),
         Some(Event::FrameSkipped {
@@ -1088,20 +1116,26 @@ fn keyframe_requests_are_scheduled_and_rate_limited() {
     ));
     // Still waiting: asked again after the 1 s retry.
     r.handle_timeout(r.epoch + Duration::from_millis(999));
-    assert_eq!(r.poll_feedback(), None);
+    assert_eq!(r.poll_feedback_item(), None);
     r.handle_timeout(r.epoch + Duration::from_millis(1000));
-    assert_eq!(r.poll_feedback(), Some(Feedback::Pli { media_ssrc: 7 }));
+    assert_eq!(
+        r.poll_feedback_item(),
+        Some(Feedback::Pli { media_ssrc: 7 })
+    );
     feed(&mut r, 1100, &pkt(96, 7, 2, 9000, true, &[0x65, 0x88, 1])).expect("idr");
     assert!(matches!(r.poll_event(), Some(Event::AccessUnit { .. })));
     // Then every 2 s.
     r.handle_timeout(r.epoch + Duration::from_millis(2999));
-    assert_eq!(r.poll_feedback(), None);
+    assert_eq!(r.poll_feedback_item(), None);
     assert_eq!(
         r.poll_timeout(),
         Some(r.epoch + Duration::from_millis(3000))
     );
     r.handle_timeout(r.epoch + Duration::from_millis(3000));
-    assert_eq!(r.poll_feedback(), Some(Feedback::Pli { media_ssrc: 7 }));
+    assert_eq!(
+        r.poll_feedback_item(),
+        Some(Feedback::Pli { media_ssrc: 7 })
+    );
     // Loss asks at once, but not within 500 ms of the last request.
     feed(&mut r, 3100, &pkt(96, 7, 4, 18000, true, &p_frame)).expect("gap");
     r.handle_timeout(r.epoch + Duration::from_millis(3300));
@@ -1116,7 +1150,7 @@ fn keyframe_requests_are_scheduled_and_rate_limited() {
     let mut got = Vec::new();
     for ms in (3300..=3500).step_by(10) {
         r.handle_timeout(r.epoch + Duration::from_millis(ms));
-        got.extend(std::iter::from_fn(|| r.poll_feedback()).map(|f| (ms, f)));
+        got.extend(std::iter::from_fn(|| r.poll_feedback_item()).map(|f| (ms, f)));
     }
     let plis: Vec<u64> = got
         .iter()
@@ -1125,13 +1159,13 @@ fn keyframe_requests_are_scheduled_and_rate_limited() {
         .collect();
     assert_eq!(plis, [3500]);
     // FIR where only FIR is negotiated, with a new sequence number each time.
-    let mut r = Receiver::new(ReceiverConfig::default(), Instant::now());
+    let mut r = Receiver::new(no_hold(), Instant::now());
     let mut v = StreamConfig::new(Codec::H264, 96);
     v.fir = true;
     r.add_stream(v).expect("video");
     feed(&mut r, 0, &pkt(96, 7, 1, 0, true, &p_frame)).expect("taken");
     assert_eq!(
-        r.poll_feedback(),
+        r.poll_feedback_item(),
         Some(Feedback::Fir {
             media_ssrc: 7,
             sequence: 1
@@ -1139,7 +1173,7 @@ fn keyframe_requests_are_scheduled_and_rate_limited() {
     );
     r.handle_timeout(r.epoch + Duration::from_millis(1000));
     assert_eq!(
-        r.poll_feedback(),
+        r.poll_feedback_item(),
         Some(Feedback::Fir {
             media_ssrc: 7,
             sequence: 2
@@ -1163,7 +1197,7 @@ fn nacks_are_rate_limited_and_coalesced() {
     let cfg = ReceiverConfig {
         nack_bitrate: 8_000,
         nack_burst: 40,
-        ..ReceiverConfig::default()
+        ..no_hold()
     };
     let mut r = video_only(cfg, false);
     let s = [0x41, 0x22, 1];
@@ -1176,7 +1210,7 @@ fn nacks_are_rate_limited_and_coalesced() {
         }
     }
     r.handle_timeout(r.epoch + Duration::from_millis(11));
-    let nacks: Vec<_> = std::iter::from_fn(|| r.poll_feedback())
+    let nacks: Vec<_> = std::iter::from_fn(|| r.poll_feedback_item())
         .filter(|f| matches!(f, Feedback::Nack { .. }))
         .collect();
     // The 40-byte burst holds 12 + 4 * 7 bytes: the oldest seven.
@@ -1195,7 +1229,7 @@ fn nacks_are_rate_limited_and_coalesced() {
     assert_eq!(r.poll_timeout(), Some(r.epoch + Duration::from_millis(27)));
     r.handle_timeout(r.epoch + Duration::from_millis(35));
     assert_eq!(
-        r.poll_feedback(),
+        r.poll_feedback_item(),
         Some(Feedback::Nack {
             media_ssrc: 7,
             lost: missing[7..].to_vec()
@@ -1203,12 +1237,12 @@ fn nacks_are_rate_limited_and_coalesced() {
     );
     assert_eq!(r.stats(StreamId(0)).expect("stats").nacked, 10);
     // Coalescing: a run of 17 takes one pair.
-    let mut r = video_only(ReceiverConfig::default(), false);
+    let mut r = video_only(no_hold(), false);
     feed(&mut r, 0, &pkt(96, 7, 0, 0, false, &s)).expect("taken");
     feed(&mut r, 1, &pkt(96, 7, 18, 0, false, &s)).expect("taken");
     r.handle_timeout(r.epoch + Duration::from_millis(11));
     let Some(f @ Feedback::Nack { .. }) =
-        std::iter::from_fn(|| r.poll_feedback()).find(|f| matches!(f, Feedback::Nack { .. }))
+        std::iter::from_fn(|| r.poll_feedback_item()).find(|f| matches!(f, Feedback::Nack { .. }))
     else {
         panic!("a NACK");
     };
@@ -1219,7 +1253,7 @@ fn nacks_are_rate_limited_and_coalesced() {
 
 #[test]
 fn sequence_restarts_and_backwards_clocks() {
-    let mut r = video_only(ReceiverConfig::default(), false);
+    let mut r = video_only(no_hold(), false);
     // SPS, PPS and an IDR slice in one STAP-A, so it starts an access unit.
     let idr = [
         0x78, 0, 5, 0x67, 0x42, 0xc0, 0x1e, 0xda, 0, 4, 0x68, 0xce, 0x3c, 0x80, 0, 3, 0x65, 0x88, 1,
@@ -1258,7 +1292,7 @@ fn opus_fill_cannot_be_amplified_by_timestamps() {
     // The review's case: 1023 tiny packets, each 96 120 samples (2 s)
     // after the last, all arriving within the start hold. Before the fill
     // was bounded by arrival time, one handle_timeout gave 819 424 events.
-    let mut r = Receiver::new(ReceiverConfig::default(), Instant::now());
+    let mut r = Receiver::new(no_hold(), Instant::now());
     r.add_stream(StreamConfig::new(Codec::Opus, 111))
         .expect("audio");
     let tiny = [0xe0u8, 1];
@@ -1295,7 +1329,7 @@ fn opus_fill_cannot_be_amplified_by_timestamps() {
 fn the_event_queue_is_bounded() {
     let cfg = ReceiverConfig {
         max_events: 10,
-        ..ReceiverConfig::default()
+        ..no_hold()
     };
     let mut r = Receiver::new(cfg, Instant::now());
     let mut v = StreamConfig::new(Codec::H264, 96);
@@ -1304,7 +1338,9 @@ fn the_event_queue_is_bounded() {
     let stap = [
         0x78, 0, 5, 0x67, 0x42, 0xc0, 0x1e, 0xda, 0, 4, 0x68, 0xce, 0x3c, 0x80, 0, 3, 0x65, 0x88, 1,
     ];
-    // Twenty IDRs, never drained: ten queued, ten dropped and counted.
+    // Twenty IDRs, never drained: the alignment and eight queued (a frame
+    // needs room for a discontinuity before it), twelve dropped and
+    // counted.
     for n in 0..20u16 {
         feed(
             &mut r,
@@ -1314,11 +1350,13 @@ fn the_event_queue_is_bounded() {
         .expect("taken");
     }
     let stats = r.stats(StreamId(0)).expect("stats");
-    assert_eq!((stats.frames, stats.events_dropped), (10, 10));
+    assert_eq!((stats.frames, stats.events_dropped), (8, 12));
     // The first packet asked for a keyframe; a dropped access unit then
     // means waiting for an IDR.
-    assert!(std::iter::from_fn(|| r.poll_feedback()).any(|f| matches!(f, Feedback::Pli { .. })));
-    assert_eq!(std::iter::from_fn(|| r.poll_event()).count(), 10);
+    assert!(
+        std::iter::from_fn(|| r.poll_feedback_item()).any(|f| matches!(f, Feedback::Pli { .. }))
+    );
+    assert_eq!(std::iter::from_fn(|| r.poll_event()).count(), 9);
     let p = [0x41, 0x9a, 1];
     feed(&mut r, 50, &pkt(96, 7, 20, 60_000, true, &p)).expect("taken");
     assert!(matches!(
@@ -1333,7 +1371,7 @@ fn the_event_queue_is_bounded() {
 #[test]
 fn keyframes_can_be_asked_for_before_media() {
     // With the SSRC from the offer, the server asks as soon as SRTP is up.
-    let mut r = Receiver::new(ReceiverConfig::default(), Instant::now());
+    let mut r = Receiver::new(no_hold(), Instant::now());
     let mut v = StreamConfig::new(Codec::H264, 96);
     v.ssrc = Some(7);
     v.pli = true;
@@ -1345,21 +1383,27 @@ fn keyframes_can_be_asked_for_before_media() {
     assert!(!r.request_keyframe(audio));
     assert_eq!(r.poll_timeout(), Some(r.epoch));
     r.handle_timeout(r.epoch);
-    assert_eq!(r.poll_feedback(), Some(Feedback::Pli { media_ssrc: 7 }));
+    assert_eq!(
+        r.poll_feedback_item(),
+        Some(Feedback::Pli { media_ssrc: 7 })
+    );
     // Without an SSRC, the request waits for the first packet.
-    let mut r = video_only(ReceiverConfig::default(), false);
+    let mut r = video_only(no_hold(), false);
     assert!(r.request_keyframe(StreamId(0)));
     r.handle_timeout(r.epoch);
-    assert_eq!(r.poll_feedback(), None);
+    assert_eq!(r.poll_feedback_item(), None);
     feed(&mut r, 1, &pkt(96, 7, 1, 0, true, &[0x41, 0x9a, 1])).expect("taken");
-    assert_eq!(r.poll_feedback(), Some(Feedback::Pli { media_ssrc: 7 }));
+    assert_eq!(
+        r.poll_feedback_item(),
+        Some(Feedback::Pli { media_ssrc: 7 })
+    );
 }
 
 /// The review's case: 1000 packets a second; 500 and 501 are lost and
 /// NACKed, and their retransmissions arrive 349 packets behind, after
 /// the deadline. They are late, never a restart.
 fn late_retransmissions(rtx: bool) {
-    let mut r = video_only(ReceiverConfig::default(), rtx);
+    let mut r = video_only(no_hold(), rtx);
     let slice = [0x41, 0x9a, 1];
     let mut late = Vec::new();
     let mut events = Vec::new();
@@ -1382,7 +1426,7 @@ fn late_retransmissions(rtx: bool) {
             }
         }
         events.extend(std::iter::from_fn(|| r.poll_event()));
-        for f in std::iter::from_fn(|| r.poll_feedback()) {
+        for f in std::iter::from_fn(|| r.poll_feedback_item()) {
             if let Feedback::Nack { lost, .. } = f {
                 nacked.extend(lost);
             }
@@ -1412,3 +1456,5 @@ fn late_retransmissions_on_the_original_ssrc_are_not_a_restart() {
 fn late_retransmissions_over_rtx_are_not_a_restart() {
     late_retransmissions(true);
 }
+
+mod timing;

@@ -204,3 +204,24 @@ path = "fuzz_targets/reorder_nack.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rr_stats"
+path = "fuzz_targets/rr_stats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "twcc_feedback"
+path = "fuzz_targets/twcc_feedback.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sr_timeline"
+path = "fuzz_targets/sr_timeline.rs"
+test = false
+doc = false
+bench = false

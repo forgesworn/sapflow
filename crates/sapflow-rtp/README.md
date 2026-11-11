@@ -10,8 +10,10 @@ Written from the RFCs and the H.264 specification only: RFC 3550 and RFC
 (AES-GCM), RFC 5764 section 4.2 (DTLS-SRTP keys), RFC 6184 (H.264 payload)
 with ITU-T H.264 for the NAL unit types and the start of the slice header,
 RFC 7587 and RFC 6716 sections 3.1 to 3.4 and 4.3 (Opus payload, framing and
-the CELT silence flag) and RFC 4588 (RTX). No source of another RTP, RTCP or
-SRTP implementation, depacketiser, jitter buffer or WebRTC stack was read.
+the CELT silence flag), RFC 4588 (RTX) and
+draft-holmer-rmcat-transport-wide-cc-extensions-01 (transport-cc). No source of
+another RTP, RTCP or SRTP implementation, depacketiser, jitter buffer,
+congestion controller or WebRTC stack was read.
 FFmpeg is used only as a black box, to capture test traffic and to decode
 the Opus silence frames.
 
@@ -26,12 +28,14 @@ only dependencies are pinned RustCrypto primitives (`aes`, `ctr`,
 |--------|------|
 | `rtp` | A zero-copy, checked view of an RTP packet: fixed header, CSRCs, padding removed and validated, RFC 8285 one-byte and two-byte extensions with lookup by ID |
 | `rtcp` | Compound and reduced-size RTCP: SR and RR with report blocks, generic NACK, PLI and FIR; SDES, BYE, APP, REMB, transport-cc and unknown types length-checked and skipped |
-| `rtcp::build` | What sapflow sends: RR, SDES CNAME, NACK (losses coalesced into PID and BLP pairs, across the sequence wrap), PLI, FIR, and a compound packet that starts with the RR |
+| `rtcp::build` | What sapflow sends: RR, SDES CNAME, NACK (losses coalesced into PID and BLP pairs, across the sequence wrap), PLI, FIR, transport-cc, and a compound packet that starts with the RR |
 | `srtp` | `SRTP_AES128_CM_HMAC_SHA1_80` and `SRTP_AEAD_AES_128_GCM`: RFC 3711 key derivation, DTLS-SRTP keying material split by role, unprotect of RTP and RTCP, protect of RTCP, ROC and index estimation, per-SSRC replay windows (1024 by default, configurable), the SRTCP E flag and 31-bit index. No MKI |
 | `h264` | RFC 6184 packetisation mode 1: single NAL units, STAP-A and FU-A into access units by timestamp and marker, with 4-byte length prefixes, SPS and PPS taken out and an IDR flag. STAP-B, MTAP and FU-B refused. An access unit that lost anything is reported incomplete, never delivered with holes |
 | `opus` | The RFC 6716 TOC byte and packet framing (codes 0 to 3, padding, the 120 ms bound), constant encoded-silence packets, and a depacketiser that fills DTX and loss with silence of the stream's channel layout, marked apart |
 | `rtx` | RFC 4588 payloads: the OSN, and padding-only probes |
-| `receive` | The `Receiver`: per stream, a bounded reorder buffer, NACKs and RTT, RTX or same-SSRC retransmissions, keyframe requests (PLI or FIR) and the depacketisers, giving events and feedback |
+| `twcc` | Transport-wide congestion control: arrival times recorded once per transport-wide sequence number in a bounded window, encoded as RTPFB FMT 15 feedback (run-length and one- and two-bit vector chunks, 250 us deltas, 64 ms reference time) at a fixed cadence and split at a size cap |
+| `timeline` | One 90 kHz timeline: a start hold for every stream's first sender report (1.5 s at most, bounded in bytes), then alignment by sender reports or by arrival time, timestamps that strictly increase and stay within a lead of arrival time, and later reports slewed in at up to 500 ppm |
+| `receive` | The `Receiver`: per stream, a bounded reorder buffer, NACKs and RTT, RTX or same-SSRC retransmissions, keyframe requests (PLI or FIR), the depacketisers and receiver report statistics (RFC 3550 A.3 and A.8, each packet counted once); for the session, transport-cc and the timeline; giving events stamped on the timeline, and RTCP datagrams that start with the receiver report |
 
 ```rust
 use sapflow_rtp::{Config, Inbound, Outbound, Profile, Role, RtpPacket, split_keying_material};
@@ -74,11 +78,13 @@ video.rtx = Some(RtxConfig { payload_type: 97, ssrc: None });
 let video = rx.add_stream(video)?;
 let audio = rx.add_stream(StreamConfig::new(Codec::Opus, 111))?;
 
-// For each authenticated RTP packet, and whenever poll_timeout() says:
+// For each authenticated RTP and RTCP datagram, and whenever
+// poll_timeout() says:
 rx.handle_rtp(now, &packet)?;
+rx.handle_rtcp(now, &compound);
 rx.handle_timeout(now);
-while let Some(event) = rx.poll_event() { /* AccessUnit, Audio, Lost, ... */ }
-while let Some(feedback) = rx.poll_feedback() { feedback.write(&mut rtcp, our_ssrc)?; }
+while let Some(event) = rx.poll_event() { /* Aligned, AccessUnit { pts, .. }, Audio, Lost, ... */ }
+while rx.poll_feedback(our_ssrc, cname, &mut rtcp) { send(srtcp(&rtcp)); rtcp.clear(); }
 ```
 
 Packets are routed by SSRC, or by payload type until an SSRC is bound.
@@ -130,6 +136,42 @@ Each stream keeps:
   streams together; beyond, they are dropped and counted
   (`StreamStats::events_dropped`), and a video stream that lost one waits
   for an IDR. Draining after every call never reaches it.
+- **Report block.** RFC 3550 A.3 and A.8 for the media SSRC: each sequence
+  number counted once within 4096 of the highest, so copies and needless
+  resends never make loss negative; RTX not counted (RFC 4588 section 6.2),
+  so loss is the network's before repair, which rate control needs (RFC
+  4588 section 7), while OBS's same-SSRC resends count as late arrivals,
+  so its loss is after repair; no blocks for RTX streams; jitter only from
+  first arrivals never NACKed; LSR and DLSR from its last sender report.
+
+For the session:
+
+- **RTCP out.** `poll_feedback` writes datagrams of at most `max_datagram`
+  (1200) bytes, a hard cap from 436 bytes (feedback is sized to fit after
+  the largest report and CNAME): a receiver report first (with blocks every `interval`, 1 s
+  fixed, the first at 0.5 s; empty between), the SDES CNAME, then NACK,
+  PLI, FIR and transport-cc. With `reduced_size`, feedback between reports
+  goes alone. A sender report for an SSRC not yet bound is kept until it is.
+- **Transport-cc** (`transport_cc`, the `a=extmap` ID): every packet with
+  the extension, RTX and probes included, recorded once within 4096
+  sequence numbers; feedback every 50 ms, from where the last ended, in
+  packets of at most `max_packet` (1000) bytes, at most `max_pending`
+  (1024) packets waiting, at most 256 feedback packets queued.
+- **Timeline.** Frames are held from the first media packet until every
+  stream has a sender report, for at most `start_hold` (1.5 s) and
+  `max_hold_bytes` (4 MiB) or half the event queue, then `Event::Aligned`
+  says whether they were aligned by the reports or by arrival time and
+  why. Every `AccessUnit` and `Audio` event carries `pts` on one 90 kHz
+  timeline, which strictly increases and stays within `max_lead` (500 ms,
+  plus 0.1% of elapsed time up to another 500 ms) of arrival time either
+  way. Later sender reports are used in agreeing pairs at least
+  `report_spacing` (500 ms) apart; errors within `max_lead`, or ahead by
+  any amount, are slewed at up to `max_slew_ppm` (500 ppm), never
+  backwards and with no event, so a sender's audio clock drifting against
+  NTP is followed; video slews what audio does not share at up to
+  `max_video_slew_ppm` (5%), so a 900 ms video RTP jump is undone in 20 s. Only a larger
+  step forward, or a timestamp that jumps or falls behind arrival time by
+  more than `max_lead`, is a discontinuity.
 
 Each access unit, after a gap between one frame's marker and the next
 packet, is kept only if its first NAL unit begins an access unit: an access
@@ -169,7 +211,23 @@ first one received cannot be known or NACKed.
   exactly the withheld packets' time.
 - The Opus silence packets decode to exact zeros with both of FFmpeg's
   decoders, alone and after a tone (`tests/fixtures/silence-check.txt`).
+- Receiver report statistics worked by hand (fraction and cumulative
+  loss, copies, the wrap, jitter, LSR and DLSR, the 24-bit clamp), and
+  against the A1.2 impairments: over RTX the block reports exactly the
+  originals dropped, on the original SSRC none.
+- Transport-cc against the draft's chunk examples and hand-built cases:
+  run-length against vectors, large and negative deltas, a delta past 16
+  bits, the 24-bit reference wrap, the sequence wrap, reordering, copies,
+  far jumps and splitting at the size cap.
+- The timeline on the FFmpeg captures with sender reports synthesised
+  from one clock (audio exactly 300 ms after video), the fallback to
+  arrival time, audio only, hostile reports, and an hour of audio clock
+  drift at 30 and 100 ppm either way (no discontinuity, A/V within 1 ms),
+  video RTP jumps of 450 and 900 ms (back within 1 ms in 10 and 20 s),
+  forged alternating reports, a falling delay with reports, and a
+  constant RTP timestamp.
 - Fuzz targets `rtp_packet`, `rtcp_compound`, `srtp_unprotect`,
-  `srtcp_unprotect`, `h264_depacketise`, `opus_depacketise` and
-  `reorder_nack` (`fuzz/README.md`). A unit test replays every seed
-  through the same entry functions.
+  `srtcp_unprotect`, `h264_depacketise`, `opus_depacketise`,
+  `reorder_nack`, `rr_stats`, `twcc_feedback` and `sr_timeline`
+  (`fuzz/README.md`). A unit test replays every seed through the same
+  entry functions.
