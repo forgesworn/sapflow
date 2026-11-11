@@ -194,6 +194,9 @@ What Sapflow does with it:
 - **Picks `SRTP_AEAD_AES_128_GCM`** when the client lists it, and otherwise
   `SRTP_AES128_CM_HMAC_SHA1_80`. RFC 5764 lets the server choose from the
   client's list. `SRTP_AEAD_AES_256_GCM` is not in v1.
+- **Refuses a non-empty `srtp_mki`** in the client's `use_srtp` extension.
+  `sapflow-rtp` has no MKI support, so a peer that expects MKI fails at the
+  handshake rather than on its first SRTP packet.
 
 OBS 32.0.4 ([evidence](whip-evidence/w0-firefox-safari-obs-2026-11-10.md))
 sends a 342-byte, single-datagram ClientHello. It differs from Chrome's in
@@ -575,6 +578,13 @@ publish from a browser should hold resolution and let frame rate drop instead
   they are for SRT.
 - A lost Opus packet is replaced by silence, as described under [Opus](#opus).
   Nothing else is concealed, since sapflow does not decode.
+- **SRTP replay window (implementation note).** RFC 3711 requires a window
+  of at least 64 packets. A sender without RTX, such as OBS, resends a NACKed
+  packet on its original SSRC and index, up to the 200 ms wait later; at
+  5 Mbit/s that is a hundred or more packets back. So `sapflow-rtp` keeps a
+  configurable window per SSRC, 1024 packets by default. An index never
+  received inside the window is accepted; a duplicate of a received index is
+  refused.
 
 ### Congestion feedback
 
