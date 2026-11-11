@@ -345,7 +345,13 @@ fn main() {
     let a = args();
     let listener = TcpListener::bind(a.http).expect("http bind");
     let udp = UdpSocket::bind(a.udp).expect("udp bind");
-    println!("harness: http and udp bound on loopback");
+    // Loopback in every run this harness is meant for; print what was
+    // bound, so an override shows.
+    println!(
+        "harness: http bound on {}, udp bound on {}",
+        listener.local_addr().expect("http address"),
+        udp.local_addr().expect("udp address")
+    );
     let (tx, rx) = mpsc::channel();
     let advertise = a.advertise;
     std::thread::spawn(move || http_thread(listener, advertise, tx));
