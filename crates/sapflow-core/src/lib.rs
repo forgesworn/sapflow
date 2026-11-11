@@ -1,7 +1,8 @@
 //! Types and rules shared by the sapflow media server and its native clients:
 //! stream paths, publish requests and publisher credentials, the stream-health
 //! callback events, publisher limits, recording policy and file names, the
-//! prepared publish-session authority and the memory-limit check.
+//! prepared publish-session authority, the memory-limit check and the PROXY
+//! protocol v2 header.
 //!
 //! Everything here is pure parsing and bookkeeping. The crate has no
 //! dependencies beyond `std`, no networking, no async runtime and no
@@ -13,6 +14,7 @@
 pub mod fragment;
 pub mod limits;
 pub mod memory;
+pub mod proxy_protocol;
 pub mod publish_session;
 pub mod realtime;
 pub mod recording;
