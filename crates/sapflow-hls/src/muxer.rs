@@ -74,7 +74,8 @@ const AAC_FRAME: i64 = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxerConfig {
     /// A segment is cut at the first keyframe after it has lasted this long,
-    /// or at a complete AAC frame boundary for audio-only. Default 1 s.
+    /// or at a complete AAC frame or Opus packet boundary for audio-only.
+    /// Default 1 s.
     pub segment_min: Duration,
     /// The shortest nominal part, from which `PART-TARGET` is derived (see
     /// [`PartTiming`]). Default 200 ms.
@@ -119,7 +120,7 @@ pub struct Part {
     /// spans of a segment's parts add up to the segment's duration.
     pub span: Duration,
     /// Whether the part can be decoded independently (`INDEPENDENT=YES`): a
-    /// video keyframe or complete audio-only AAC frames.
+    /// video keyframe, or complete audio-only AAC frames or Opus packets.
     pub independent: bool,
     /// The part's `moof` + `mdat` fragment.
     pub data: Bytes,
@@ -274,7 +275,7 @@ pub enum PartLookup {
 pub enum MuxError {
     /// The shared immutable encoded-backing budget cannot admit an allocation.
     FragmentLimit,
-    /// The charged open media passed 64 MiB, live AAC or video entries
+    /// The charged open media passed 64 MiB, live audio or video entries
     /// exceeded their separate 16,384 limits, or fragment lengths cannot
     /// be represented.
     SegmentTooLarge,

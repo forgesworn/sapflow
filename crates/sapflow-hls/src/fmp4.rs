@@ -40,7 +40,7 @@ pub struct Sample {
     /// Whether this is a sync sample (a keyframe).
     pub sync: bool,
     /// The coded sample: length-prefixed NAL units for video, one raw AAC frame
-    /// for audio.
+    /// or one Opus packet for audio.
     pub data: Bytes,
 }
 

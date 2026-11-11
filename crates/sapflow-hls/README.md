@@ -30,7 +30,8 @@ live media server. MIT.
   The init segment has an `Opus` sample entry and a `dOps` box at a 48 kHz
   timescale, and `CODECS` says `opus`. RTP carries no Opus header, so the
   channel count is 2 when stereo was negotiated (`EsIngest::opus_config`
-  with `OpusConfig::STEREO`) or the first packet is stereo, otherwise 1;
+  with `OpusConfig::STEREO`; `MONO` records nothing) or the first packet is
+  stereo, otherwise 1;
   pre-skip, output gain and mapping family are 0. Nothing is transcoded,
   and Apple's players do not decode Opus in HLS: convert to AAC downstream
   for them. The AAC entry points, signatures and output are unchanged;

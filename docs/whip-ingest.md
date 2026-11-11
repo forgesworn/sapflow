@@ -557,9 +557,11 @@ feeds it yet; W3c connects `sapflow-whip` to it.
   `reconfigure_with_audio` and `audio_config`; and
   `fmp4::init_segment_for_audio_tracks`. No existing signature changed.
   `Muxer::audio()` and `EsIngest::known_audio()` still return only an AAC
-  configuration, so they give `None` for an Opus track. A test pins every
-  byte of AAC output (init segments, parts, segments, playlists and
-  recording headers) to the 0.2.0-rc.1 code.
+  configuration, so they give `None` for an Opus track. A test hashes the
+  AAC output of the TS, elementary video-led and audio-only paths, with and
+  without a fragment quota and across codec epochs and reconnects (init
+  segments, parts, segments and playlists), and of every init builder, and
+  holds it to digests taken from the 0.2.0-rc.1 code before the Opus change.
 - **Durations.** Each packet's duration comes from its TOC configuration
   (2.5 to 60 ms frames) and frame-count code (0 to 3). A packet that breaks
   the framing rules of RFC 6716 section 3.4, including one over 120 ms, is
@@ -586,7 +588,9 @@ feeds it yet; W3c connects `sapflow-whip` to it.
   refused; only a `part_min` far below the default makes a target that
   short.
 - **Channels** follow the rule above: `EsIngest::opus_config(OpusConfig::STEREO)`
-  when stereo was negotiated, otherwise the first packet's TOC. A later
+  when stereo was negotiated, otherwise the first packet's TOC.
+  `opus_config(OpusConfig::MONO)` records nothing, since mono is what a
+  stream without negotiated stereo is. A later
   change of the stereo flag keeps the configuration and the init segment. A
   reconnect whose first packet gives another count starts a codec epoch, as
   a changed AAC configuration does.
