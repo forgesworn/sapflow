@@ -448,6 +448,9 @@ fn the_stereo_rule_and_a_changing_toc_stereo_flag() {
         (None, false, 1u8),
         (None, true, 2),
         (Some(OpusConfig::STEREO), false, 2),
+        // Mono is the absence of negotiated stereo: the first TOC decides.
+        (Some(OpusConfig::MONO), true, 2),
+        (Some(OpusConfig::MONO), false, 1),
     ] {
         for declared in [TrackSet::AudioOnly, TrackSet::AudioVideo] {
             let mut ingest = EsIngest::new(MuxerConfig::default());

@@ -88,7 +88,7 @@ pub enum IngestError {
     /// connection (including a change of codec), or an Opus packet is
     /// malformed (RFC 6716 section 3.4).
     InvalidAudio,
-    /// An AAC timestamp cannot be represented on the supported timeline.
+    /// An audio timestamp cannot be represented on the supported timeline.
     InvalidTimestamp,
     /// This connection has explicitly finished; resume with a new ingest.
     InputFinished,
@@ -506,7 +506,9 @@ pub struct EsIngest {
 
 impl EsIngest {
     /// An ingest with no muxer yet. Audio is expected, so the first keyframe
-    /// waits for an AAC configuration (see [`EsIngest::set_expect_audio`]).
+    /// waits for an audio configuration: AAC, or Opus from
+    /// [`EsIngest::opus_config`] or the first packet (see
+    /// [`EsIngest::set_expect_audio`]).
     pub fn new(cfg: MuxerConfig) -> Self {
         Self {
             cfg,
@@ -588,8 +590,9 @@ impl EsIngest {
         self.declared
     }
 
-    /// Sets whether the first video keyframe waits for AAC configuration before
-    /// fixing the init segment. An explicit track declaration takes precedence.
+    /// Sets whether the first video keyframe waits for an audio configuration
+    /// before fixing the init segment. An explicit track declaration takes
+    /// precedence.
     pub fn set_expect_audio(&mut self, expect: bool) {
         if self.declared.is_none() {
             self.expect_audio = expect;
@@ -634,14 +637,17 @@ impl EsIngest {
         self.record_audio(AudioConfig::Aac(config));
     }
 
-    /// Records the Opus configuration, for a caller that negotiated it: pass
-    /// [`OpusConfig::STEREO`] when `stereo=1` was negotiated. Without it the
-    /// first Opus packet decides ([`OpusConfig::for_first_packet`]). Only the
-    /// first audio configuration of either codec is kept, as for AAC, and a
-    /// video-only muxer with nothing servable yet is discarded so the next
-    /// keyframe starts one with both tracks.
+    /// Records the negotiated Opus configuration: pass
+    /// [`OpusConfig::STEREO`] when `stereo=1` was negotiated. Mono is what a
+    /// stream without negotiated stereo is, and then the first Opus packet
+    /// decides ([`OpusConfig::for_first_packet`]), so [`OpusConfig::MONO`]
+    /// records nothing. Only the first audio configuration of either codec
+    /// is kept, as for AAC, and a video-only muxer with nothing servable yet
+    /// is discarded so the next keyframe starts one with both tracks.
     pub fn opus_config(&mut self, config: OpusConfig) {
-        self.record_audio(AudioConfig::Opus(config));
+        if config != OpusConfig::MONO {
+            self.record_audio(AudioConfig::Opus(config));
+        }
     }
 
     fn record_audio(&mut self, config: AudioConfig) {
@@ -857,7 +863,7 @@ impl EsIngest {
     /// from its TOC byte. A malformed packet, one over 120 ms, or Opus on an
     /// ingest that carries AAC is refused with [`IngestError::InvalidAudio`]
     /// before anything changes. The first packet fixes the channel count
-    /// unless [`EsIngest::opus_config`] was called; a later change of the TOC
+    /// unless stereo was negotiated ([`EsIngest::opus_config`]); a later change of the TOC
     /// stereo flag is not a configuration change.
     ///
     /// Gaps are not filled here: a caller fills silence suppression and loss
@@ -879,7 +885,7 @@ impl EsIngest {
             self.opus(pts, packet)?;
             return Ok(Update::default());
         }
-        self.opus_config(config);
+        self.record_audio(AudioConfig::Opus(config));
         let audio = AudioConfig::Opus(config);
         let mut update = Update::default();
         if self.origin.is_none() {
@@ -920,7 +926,7 @@ impl EsIngest {
             return Ok(());
         }
         let config = self.opus_for(packet)?;
-        self.opus_config(config);
+        self.record_audio(AudioConfig::Opus(config));
         let (Some(muxer), Some(origin)) = (self.muxer.as_mut(), self.origin) else {
             return Ok(());
         };
