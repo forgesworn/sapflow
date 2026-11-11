@@ -22,6 +22,8 @@ was written from the RFCs and from observed traffic only: RFC 8489 and 5769
 | `browser.js` | Launchers: Firefox (headless, temporary profile, `user.js`), Safari through `safaridriver`, Chrome for playback |
 | `obs-run.js` | OBS WHIP capture: backs up OBS's config, makes the `W0-WHIP-test` profile and scene collection, launches OBS, ends it by PID, restores the config and diffs it |
 | `play-run.js`, `play-server.js` | A0.2 playback matrix and its static server (Range support) |
+| `phone-run.js` | Phone drivers: Android over `adb` (capture, loopback, play, rotate; answers the camera prompts, removes every `adb reverse`, restores rotation, ends on the home screen) and iPhone Safari through `devicectl --payload-url` |
+| `pages/rotate.html`, `pages/ios-play.html` | A0.8 rotation with video orientation stripped, and A0.2 with Safari's native player |
 | `make-opus-assets.sh` | The A0.2 asset recipe: Chrome's `MediaRecorder` Opus muxed with `ffmpeg` into fMP4 HLS (audio and video, audio only) and a fragmented MP4 |
 | `pages/play.html`, `pages/record-opus.html` | The playback page (analyser, decoded-byte count, click detector) and the Opus recorder |
 

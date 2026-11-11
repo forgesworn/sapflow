@@ -1,0 +1,40 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>W0 native HLS</title>
+<body style="font:14px monospace;margin:8px"><video id="v" muted playsinline autoplay width="320" height="180"></video><pre id="log"></pre>
+<script>
+// A0.2 with Safari's native player: <video muted playsinline autoplay>. One page load plays each asset in turn
+// (so the owner's phone gets one new tab, not one per case). Playback is muted, so a click at the start cannot be heard
+// or tapped; webkitAudioDecodedByteCount shows whether audio was decoded. Results are posted as they finish.
+const q = new URLSearchParams(location.search);
+const SECONDS = +(q.get('seconds') || 12);
+const CASES = [['a-av', '/assets/av/master.m3u8'], ['b-audio', '/assets/audio/master.m3u8'], ['c-recording', '/assets/recording/recording.mp4'], ['d-av-preskip312', '/assets/av-preskip312/master.m3u8']];
+const post = (name, body) => fetch('/result/' + name, { method: 'POST', body: JSON.stringify(body, null, 1) });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(async () => {
+  const all = { userAgent: navigator.userAgent, hasRTCPeerConnection: typeof RTCPeerConnection, hasMediaSource: typeof MediaSource, cases: {} };
+  for (const [label, src] of CASES) {
+    const v = document.createElement('video'); v.muted = true; v.setAttribute('muted', ''); v.setAttribute('playsinline', ''); v.autoplay = true; v.width = 320; v.height = 180;
+    document.body.insertBefore(v, document.getElementById('log'));
+    const r = { label, src, errors: [], events: [], samples: [], canPlayHls: v.canPlayType('application/vnd.apple.mpegurl'), canPlayOpusMp4: v.canPlayType('audio/mp4; codecs="opus"'), canPlayAvcOpusMp4: v.canPlayType('video/mp4; codecs="avc1.4d401f,opus"') };
+    ['error', 'stalled', 'waiting', 'ended', 'loadedmetadata', 'playing'].forEach((n) => v.addEventListener(n, () => r.events.push([n, Math.round(performance.now()), +v.currentTime.toFixed(2), n === 'error' ? (v.error && v.error.code + ' ' + v.error.message) : ''])));
+    v.src = src;
+    const t0 = performance.now();
+    // play() can stay pending while the player waits for data, so it is not awaited for long
+    v.play().catch((e) => r.errors.push('play() rejected: ' + e.name + ': ' + e.message));
+    for (let i = 0; i < SECONDS * 2; i++) {
+      await sleep(500);
+      const vq = v.getVideoPlaybackQuality && v.getVideoPlaybackQuality();
+      r.samples.push({ ms: Math.round(performance.now() - t0), t: +v.currentTime.toFixed(2), rs: v.readyState, paused: v.paused, muted: v.muted, buf: v.buffered.length ? +v.buffered.end(v.buffered.length - 1).toFixed(1) : 0, audioBytes: v.webkitAudioDecodedByteCount, videoBytes: v.webkitVideoDecodedByteCount, frames: vq && vq.totalVideoFrames, dropped: vq && vq.droppedVideoFrames });
+    }
+    const last = r.samples[r.samples.length - 1];
+    r.currentTimeEnd = last.t; r.currentTimeAdvancedAtLeast10 = last.t >= 10; r.audioDecodedByteCountExists = typeof v.webkitAudioDecodedByteCount === 'number';
+    r.audioDecodedBytesEnd = v.webkitAudioDecodedByteCount; r.videoDecodedBytesEnd = v.webkitVideoDecodedByteCount; r.mediaError = v.error && { code: v.error.code, message: v.error.message };
+    r.videoWidth = v.videoWidth; r.muted = v.muted;
+    all.cases[label] = r;
+    await post('ios-play-' + label + '.json', r);
+    v.pause(); v.removeAttribute('src'); v.load(); v.remove();
+    document.getElementById('log').textContent += label + ' t=' + r.currentTimeEnd + ' audioBytes=' + r.audioDecodedBytesEnd + '\n';
+  }
+  await post('ios-play-all.json', all);
+  await fetch('/done?label=ios', { method: 'POST' });
+})();
+</script>

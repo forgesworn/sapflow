@@ -1,4 +1,4 @@
-<!doctype html><meta charset="utf-8"><title>W0 play</title>
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>W0 play</title>
 <body style="font:16px monospace"><video id="v" playsinline width="640" height="360" controls></video><pre id="log"></pre>
 <script src="/vendor/hls.min.js"></script>
 <script>
@@ -19,11 +19,12 @@ function tap() {
   const srcNode = ac.createMediaElementSource(v), splitter = ac.createChannelSplitter(2), sp = ac.createScriptProcessor(4096, 2, 2);
   srcNode.connect(sp); sp.connect(ac.destination); // keep audible: the element has no other output once tapped
   out.audio.sampleRate = ac.sampleRate; out.audio.contextState = ac.state;
+  const QUIET = !!q.get('quiet'); // ?quiet=1 (phones): analyse the decoded samples but send silence to the speaker
   sp.onaudioprocess = (e) => {
     const L = e.inputBuffer.getChannelData(0), R = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : L;
     const stat = (d) => { let s = 0, zc = 0, mx = 0, step = 0; for (let i = 0; i < d.length; i++) { s += d[i] * d[i]; if (d[i] > mx) mx = d[i]; if (i && d[i - 1] <= 0 && d[i] > 0) zc++; if (i) step = Math.max(step, Math.abs(d[i] - d[i - 1])); } return { rms: Math.sqrt(s / d.length), hz: zc * ac.sampleRate / d.length, step, peak: mx }; };
     blocks.push({ t: +(performance.now() - (tapStart || performance.now())).toFixed(0), L: stat(L), R: stat(R), n: L.length });
-    for (let ch = 0; ch < e.outputBuffer.numberOfChannels; ch++) e.outputBuffer.getChannelData(ch).set(e.inputBuffer.getChannelData(Math.min(ch, e.inputBuffer.numberOfChannels - 1)));
+    for (let ch = 0; ch < e.outputBuffer.numberOfChannels; ch++) e.outputBuffer.getChannelData(ch).set(QUIET ? new Float32Array(e.outputBuffer.length) : e.inputBuffer.getChannelData(Math.min(ch, e.inputBuffer.numberOfChannels - 1)));
   };
 }
 
@@ -56,7 +57,7 @@ function summariseAudio() {
 
 (async () => {
   try {
-    if (q.get('gesture')) { const b = document.createElement('button'); b.id = 'go'; b.textContent = 'play'; b.style.cssText = 'font-size:40px;padding:20px'; document.body.prepend(b); await new Promise((r) => { b.onclick = r; }); }
+    if (q.get('gesture')) { const b = document.createElement('button'); b.id = 'go'; b.textContent = 'play'; b.style.cssText = 'font-size:40px;padding:20px;' + (q.get('quiet') ? 'width:100%;height:50vh;' : ''); document.body.prepend(b); await new Promise((r) => { b.onclick = r; }); }
     v.addEventListener('error', () => out.errors.push('element error: ' + JSON.stringify({ code: v.error && v.error.code, message: v.error && v.error.message })));
     ['stalled', 'waiting', 'ended'].forEach((n) => v.addEventListener(n, () => out.hlsEvents.push(['element-' + n, Math.round(performance.now()), +v.currentTime.toFixed(2)])));
     // ?notap=1 leaves the element untouched by Web Audio (Safari's native HLS does not cope with a tap); decode evidence is then webkitAudioDecodedByteCount.

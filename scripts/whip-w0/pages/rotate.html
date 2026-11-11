@@ -1,0 +1,74 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>W0 rotate</title>
+<body style="margin:0;background:#222;color:#ccc;font:14px monospace">
+<video id="lv" muted playsinline autoplay style="width:45vw"></video><video id="rv" muted playsinline autoplay style="width:45vw"></video><pre id="log"></pre>
+<script>
+// A0.8: real camera sent over an in-page loopback with the video-orientation extension stripped from the answer.
+// Three phases, each a snapshot of the receiver: the starting orientation (p0), after the device rotates (p1), and back (p2).
+// The orchestrator (phone-run.js) rotates the display between phases and watches the result files.
+const q = new URLSearchParams(location.search);
+const post = (name, body, raw) => fetch('/result/' + name, { method: 'POST', body: raw ? body : JSON.stringify(body, null, 1) });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const orient = () => ({ screen: screen.orientation && screen.orientation.type, angle: screen.orientation && screen.orientation.angle, inner: [innerWidth, innerHeight] });
+const lv = document.getElementById('lv'), rv = document.getElementById('rv'), log = document.getElementById('log');
+const say = (m) => { log.textContent += m + '\n'; };
+const strip = (sdp) => sdp.split(/\r?\n/).filter((l) => !/^a=extmap:\d+(\/\S+)? urn:3gpp:video-orientation/.test(l)).join('\r\n');
+function grey(el, w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'); g.drawImage(el, 0, 0, w, h); const d = g.getImageData(0, 0, w, h).data; const o = new Float32Array(w * h); for (let i = 0; i < w * h; i++) o[i] = (d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2]) / 765; return o; }
+function rot(a, n, k) { const o = new Float32Array(n * n); for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) { let sx = x, sy = y; for (let r = 0; r < k; r++) { const t = sx; sx = n - 1 - sy; sy = t; } o[y * n + x] = a[sy * n + sx]; } return o; }
+function diff(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return +(s / a.length).toFixed(4); }
+(async () => {
+  const out = { userAgent: navigator.userAgent, errors: [], phases: {} };
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false });
+    lv.srcObject = stream;
+    const pc1 = new RTCPeerConnection(), pc2 = new RTCPeerConnection();
+    pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
+    pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
+    pc2.ontrack = (e) => { rv.srcObject = e.streams[0] || new MediaStream([e.track]); };
+    const sender = pc1.addTrack(stream.getVideoTracks()[0], stream);
+    const h264 = RTCRtpSender.getCapabilities('video').codecs.filter((c) => /h264/i.test(c.mimeType) && /packetization-mode=1/.test(c.sdpFmtpLine || ''));
+    if (h264.length) pc1.getTransceivers()[0].setCodecPreferences([...h264, ...RTCRtpSender.getCapabilities('video').codecs.filter((c) => !/h264/i.test(c.mimeType))]);
+    await pc1.setLocalDescription(await pc1.createOffer());
+    out.offerHadOrientationExt = /urn:3gpp:video-orientation/.test(pc1.localDescription.sdp);
+    await pc2.setRemoteDescription(pc1.localDescription);
+    const ans = await pc2.createAnswer();
+    out.answerHadOrientationExt = /urn:3gpp:video-orientation/.test(ans.sdp);
+    const edited = strip(ans.sdp);
+    out.editedAnswerHasOrientationExt = /urn:3gpp:video-orientation/.test(edited);
+    await pc2.setLocalDescription({ type: 'answer', sdp: edited });
+    await pc1.setRemoteDescription({ type: 'answer', sdp: edited });
+    const snap = async (name) => {
+      await sleep(+(q.get('settle') || 7000));
+      const s1 = [...(await pc1.getStats()).values()], s2 = [...(await pc2.getStats()).values()];
+      const o = s1.find((x) => x.type === 'outbound-rtp' && x.kind === 'video'), i = s2.find((x) => x.type === 'inbound-rtp' && x.kind === 'video');
+      const codec = i && s2.find((x) => x.id === i.codecId);
+      const st = stream.getVideoTracks()[0].getSettings();
+      const n = 24, L = grey(lv, n, n), R = grey(rv, n, n);
+      const p = {
+        name, t: Math.round(performance.now()), orientation: orient(),
+        trackSettings: { w: st.width, h: st.height, facingMode: st.facingMode || null }, localVideo: [lv.videoWidth, lv.videoHeight], remoteVideo: [rv.videoWidth, rv.videoHeight],
+        sender: o && { frameWidth: o.frameWidth, frameHeight: o.frameHeight, framesEncoded: o.framesEncoded, framesSent: o.framesSent, fps: o.framesPerSecond, impl: o.encoderImplementation, qlr: o.qualityLimitationReason },
+        receiver: i && { frameWidth: i.frameWidth, frameHeight: i.frameHeight, framesDecoded: i.framesDecoded, framesReceived: i.framesReceived, fps: i.framesPerSecond, codec: codec && codec.mimeType, impl: i.decoderImplementation },
+        // Mean absolute grey difference between the local preview (upright for the display) and the received frame
+        // rotated by 0, 90, 180 and 270 degrees, both squashed to 24 x 24. The smallest says which turn matches.
+        diffByQuarterTurns: [0, 1, 2, 3].map((k) => diff(L, rot(R, n, k))),
+      };
+      out.phases[name] = p;
+      for (const [el, tag] of [[rv, 'recv'], [lv, 'local']]) {
+        const c = document.createElement('canvas'); c.width = el.videoWidth || 640; c.height = el.videoHeight || 360; c.getContext('2d').drawImage(el, 0, 0);
+        const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+        await post(`rot-${name}-${tag}.png`, blob, true);
+      }
+      await post('rot-' + name + '.json', Object.assign({}, out, { phase: p }));
+      say(name + ' ' + JSON.stringify(p.receiver));
+    };
+    const key = () => orient().screen + '|' + (innerWidth > innerHeight);
+    const waitChange = async (from) => { for (let t = 0; t < 120; t++) { await sleep(500); if (key() !== from) return true; } return false; };
+    await snap('p0');
+    let k = key(); out.changed1 = await waitChange(k); await snap('p1');
+    k = key(); out.changed2 = await waitChange(k); await snap('p2');
+    stream.getTracks().forEach((t) => t.stop()); pc1.close(); pc2.close();
+  } catch (e) { out.errors.push(String(e && e.stack || e)); }
+  await post('rot-final.json', out);
+  await fetch('/done', { method: 'POST' });
+})();
+</script>

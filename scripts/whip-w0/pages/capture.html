@@ -15,7 +15,7 @@ async function synthetic(out) {
   dest.channelCount = 2; dest.channelCountMode = 'explicit'; dest.channelInterpretation = 'discrete';
   [440, 880].forEach((f, ch) => { const o = ac.createOscillator(); o.frequency.value = f; const gn = ac.createGain(); gn.gain.value = 0.3; o.connect(gn); gn.connect(merger, 0, ch); o.start(); });
   merger.connect(dest);
-  try { await Promise.race([ac.resume(), new Promise((r) => setTimeout(r, 1000))]); } catch {} // Safari leaves resume() pending without a gesture
+  try { await Promise.race([ac.resume(), new Promise((r) => setTimeout(r, 1500))]); } catch {} // Safari leaves resume() pending without a gesture
   out.audioContextState = ac.state;
   const s = c.captureStream(30);
   dest.stream.getAudioTracks().forEach((t) => s.addTrack(t));
@@ -34,10 +34,15 @@ async function synthetic(out) {
     const pc = new RTCPeerConnection();
     out.config = pc.getConfiguration();
     stream.getTracks().forEach((t) => pc.addTransceiver(t, { direction: 'sendonly', streams: [stream] }));
+    // Candidates as gathered (type, protocol, tcpType only), and the gathering state, so a browser that gathers no UDP shows it.
+    out.gathered = []; out.candidateErrors = [];
+    pc.onicecandidate = (e) => out.gathered.push(e.candidate ? [e.candidate.protocol, e.candidate.type, e.candidate.tcpType || '', /\.[l]ocal$/.test(e.candidate.address || '') ? 'mdns' : 'ip'].join(' ') : 'end-of-candidates');
+    pc.onicecandidateerror = (e) => out.candidateErrors.push([e.errorCode, e.errorText, e.url || ''].join(' '));
     pc.oniceconnectionstatechange = () => out.timeline.push([Math.round(performance.now()), 'ice', pc.iceConnectionState]);
     pc.onconnectionstatechange = () => out.timeline.push([Math.round(performance.now()), 'conn', pc.connectionState]);
     await pc.setLocalDescription(await pc.createOffer());
     await Promise.race([new Promise((r) => { pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && r(); }), sleep(3000)]);
+    out.gatheringBeforePost = pc.iceGatheringState;
     const res = await fetch('/whip?label=' + label, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
     out.whipStatus = res.status;
     await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });

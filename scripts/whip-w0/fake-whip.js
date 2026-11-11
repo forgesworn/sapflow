@@ -24,7 +24,7 @@ function makeCert(dir) {
 
 // Start the endpoint. mode: 'udp' or 'tcp'. outDir receives raw captures.
 async function start({ mode = 'udp', host, advertise, httpPort = 0, udpPort = 0, relayPort = 443, outDir, label = mode,
-  pagesDir = path.join(__dirname, 'pages'), transportCc = false, range = null, opusFmtp = 'stereo=1;maxaveragebitrate=128000;usedtx=0' }) {
+  pagesDir = path.join(__dirname, 'pages'), httpHost = '127.0.0.1', transportCc = false, range = null, opusFmtp = 'stereo=1;maxaveragebitrate=128000;usedtx=0' }) {
   fs.mkdirSync(outDir, { recursive: true });
   const fingerprint = makeCert(outDir);
   const ufrag = crypto.randomBytes(4).toString('hex'), pwd = crypto.randomBytes(16).toString('hex');
@@ -137,12 +137,13 @@ async function start({ mode = 'udp', host, advertise, httpPort = 0, udpPort = 0,
       } else if (req.method === 'POST' && url.pathname === '/done') { res.writeHead(204).end(); ev.done = true; finish(); 
       } else if (url.pathname === '/loadavg') { res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(os.loadavg()));
       } else if (req.method === 'GET') {
+        (ev.pageGets = ev.pageGets || []).push(url.pathname + ' ' + (req.headers['user-agent'] || '').slice(0, 60));
         const f = path.join(pagesDir, path.basename(url.pathname === '/' ? 'index.html' : url.pathname));
         if (fs.existsSync(f)) { res.writeHead(200, { 'Content-Type': f.endsWith('.js') ? 'text/javascript' : 'text/html' }).end(fs.readFileSync(f)); } else res.writeHead(404).end();
       } else res.writeHead(404).end();
     });
   });
-  const httpBound = await ports.listenTcp(server, '127.0.0.1', range, httpPort);
+  const httpBound = await ports.listenTcp(server, httpHost, range, httpPort);
 
   return {
     httpPort: httpBound, udpPort: udpP, tcpPort, ev, done: donePromise,
