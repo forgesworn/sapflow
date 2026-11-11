@@ -611,6 +611,37 @@ mod tests {
         );
     }
 
+    /// One packet assembled by hand from the section 3.1 figure, byte for
+    /// byte: 100 received 0.25 ms after the 64 ms reference, 101 not
+    /// received, 102 received 100 ms after 100 (a large delta).
+    #[test]
+    fn a_whole_packet_matches_the_figure() {
+        let mut r = Recorder::new(TransportCcConfig::new(3));
+        r.record(64_250, &element(100));
+        r.record(164_250, &element(102));
+        let built = r.flush(200 * MS);
+        let mut out = Vec::new();
+        crate::rtcp::build::transport_cc(&mut out, 0x0102_0304, 0x0a0b_0c0d, &built[0].fci)
+            .expect("builds");
+        #[rustfmt::skip]
+        let want = [
+            // V=2, P=0, FMT=15; PT=205; length 6 (28 bytes).
+            0x8f, 0xcd, 0x00, 0x06,
+            // SSRC of packet sender, SSRC of media source.
+            0x01, 0x02, 0x03, 0x04,
+            0x0a, 0x0b, 0x0c, 0x0d,
+            // Base sequence number 100, packet status count 3.
+            0x00, 0x64, 0x00, 0x03,
+            // Reference time 1 (64 ms), feedback packet count 0.
+            0x00, 0x00, 0x01, 0x00,
+            // A two-bit status vector: 01 (small), 00 (not received), 10
+            // (large), four spare 00; then the deltas 1 and 400.
+            0xd2, 0x00, 0x01, 0x01,
+            0x90, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(out, want);
+    }
+
     #[test]
     fn run_length_versus_vectors() {
         let chunks = |runs: &[(u8, u32)]| {
