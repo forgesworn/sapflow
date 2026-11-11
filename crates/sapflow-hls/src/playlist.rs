@@ -276,11 +276,14 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
 /// - every `EXTINF`, rounded to the nearest second, is at most the target;
 /// - no part is longer than `PART-TARGET`, and every part but the last of
 ///   its segment is at least 85% of it (the last part after the final
-///   `EXTINF` is exempt: it may yet be the last of its segment), unless it
-///   is `INDEPENDENT=YES`, which 4.4.4.9 exempts;
-/// - with [`RuleCheck::with_live_window`], once segments have been removed
-///   (`EXT-X-MEDIA-SEQUENCE` above 0), the segments listed last at least
-///   three target durations (6.2.2);
+///   `EXTINF` is exempt: it may yet be the last of its segment). 4.4.4.9
+///   also exempts `INDEPENDENT=YES` parts; this check allows that only in a
+///   render whose every part is independent (audio-only), and holds video
+///   to the stricter rule Apple's players were built against;
+/// - once segments have been removed (`EXT-X-MEDIA-SEQUENCE` above 0), the
+///   segments listed last at least three target durations (6.2.2), unless
+///   the render lists [`crate::muxer::MAX_WINDOW_ENTRIES`] entries or more,
+///   the muxer's cap;
 /// - an `EXT-X-DISCONTINUITY` sits before a segment's parts, never among
 ///   them, and every media sequence number keeps one discontinuity
 ///   sequence number from render to render.
@@ -294,7 +297,9 @@ pub struct RuleCheck {
     discontinuity: std::collections::BTreeMap<u64, u64>,
     media_identity: std::collections::BTreeMap<u64, (String, String)>,
     first_msn: Option<u64>,
-    live_window: bool,
+    /// Test-only: leave out the live-window rule, for synthetic renders
+    /// about the other rules.
+    no_live_window: bool,
 }
 
 /// A decimal with up to 5 places, in units of 0.00001.
@@ -309,14 +314,11 @@ fn fixed5(v: &str) -> Result<u64, String> {
 }
 
 impl RuleCheck {
-    /// A check that also holds every render to RFC 8216bis 6.2.2's live
-    /// window: a server must not remove a segment if the playlist left would
-    /// last less than three target durations. Opt-in because count-based
-    /// eviction with a small `MuxerConfig::segment_count` and short
-    /// segments can break it (see `docs/whip-ingest.md`).
-    pub fn with_live_window() -> Self {
+    /// Without the live-window rule, for synthetic windows about the others.
+    #[cfg(test)]
+    fn without_live_window() -> Self {
         Self {
-            live_window: true,
+            no_live_window: true,
             ..Self::default()
         }
     }
@@ -350,13 +352,19 @@ impl RuleCheck {
         }
         let first_msn = msn;
         let mut listed = 0u64;
+        let mut entries = 0usize;
+        let audio_only = pl
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXT-X-PART:"))
+            .all(|a| a.split(',').any(|a| a == "INDEPENDENT=YES"));
         let parts = |run: &[(u64, bool)], open: bool| -> Result<(), String> {
             for (i, &(d, independent)) in run.iter().enumerate() {
                 if d > part_target {
                     return Err(format!("part {d} longer than PART-TARGET {part_target}"));
                 }
                 let last = i + 1 == run.len();
-                if !last && !independent && d * 100 < part_target * 85 {
+                let exempt = last || (independent && audio_only);
+                if !exempt && d * 100 < part_target * 85 {
                     let what = if open { "open segment" } else { "segment" };
                     return Err(format!("part {d} under 85% of {part_target} ({what})"));
                 }
@@ -401,6 +409,7 @@ impl RuleCheck {
                 run.clear();
                 let d = fixed5(rest.trim_end_matches(','))?;
                 listed += d;
+                entries += 1;
                 // Rounded to the nearest second, halves up.
                 if (d + 50_000) / 100_000 > target {
                     return Err(format!(
@@ -416,7 +425,11 @@ impl RuleCheck {
                 msn += 1;
             }
         }
-        if self.live_window && first_msn > 0 && listed < target * 3 * 100_000 {
+        if !self.no_live_window
+            && first_msn > 0
+            && listed < target * 3 * 100_000
+            && entries < crate::muxer::MAX_WINDOW_ENTRIES
+        {
             return Err(format!(
                 "segments removed down to {listed}, under three TARGETDURATIONs of {target}"
             ));
@@ -613,40 +626,61 @@ mod tests {
     }
 
     #[test]
-    fn rule_check_exempts_independent_parts_and_opts_into_the_live_window() {
+    fn rule_check_exempts_audio_only_independent_parts_and_holds_the_live_window() {
         let head = |msn: u64| {
             format!(
                 "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-PART-INF:PART-TARGET=0.23400\n\
                  #EXT-X-MEDIA-SEQUENCE:{msn}\n"
             )
         };
-        // A short part before others in its segment: refused unless it is
-        // INDEPENDENT=YES (RFC 8216bis 4.4.4.9).
-        let short = |independent: &str| {
+        let part = |d: &str, independent: bool| {
             format!(
-                "{}#EXT-X-PART:DURATION=0.12000,URI=\"a\"{independent}\n\
-                 #EXT-X-PART:DURATION=0.20000,URI=\"b\"\n#EXTINF:1.0,\ns\n",
-                head(0)
+                "#EXT-X-PART:DURATION={d},URI=\"p\"{}\n",
+                if independent { ",INDEPENDENT=YES" } else { "" }
             )
         };
-        assert!(RuleCheck::default().check(&short("")).is_err());
-        assert_eq!(
-            RuleCheck::default().check(&short(",INDEPENDENT=YES")),
-            Ok(())
+        // A short part before others in its segment. RFC 8216bis 4.4.4.9
+        // exempts it if INDEPENDENT=YES: allowed where every part is
+        // independent (audio-only), refused beside a part that is not
+        // (video, held to Apple's stricter rule).
+        let render = |first: bool, second: bool| {
+            format!(
+                "{}{}{}#EXTINF:1.0,\ns\n",
+                head(0),
+                part("0.12000", first),
+                part("0.20000", second)
+            )
+        };
+        assert!(RuleCheck::default().check(&render(false, false)).is_err());
+        assert_eq!(RuleCheck::default().check(&render(true, true)), Ok(()));
+        assert!(
+            RuleCheck::default().check(&render(true, false)).is_err(),
+            "a short keyframe part in video"
         );
         // Three seconds listed after removals: under three targets of 2 s
-        // (RFC 8216bis 6.2.2), but only the opt-in check sees it.
+        // (RFC 8216bis 6.2.2).
         let thin = format!("{}#EXTINF:1.5,\ns\n#EXTINF:1.5,\nt\n", head(4));
-        assert_eq!(RuleCheck::default().check(&thin), Ok(()));
-        assert!(RuleCheck::with_live_window().check(&thin).is_err());
+        assert!(RuleCheck::default().check(&thin).is_err());
         // Nothing removed yet: a short playlist is fine.
         let young = format!("{}#EXTINF:1.5,\ns\n", head(0));
-        assert_eq!(RuleCheck::with_live_window().check(&young), Ok(()));
+        assert_eq!(RuleCheck::default().check(&young), Ok(()));
         let full = format!(
             "{}#EXTINF:2.0,\ns\n#EXTINF:2.0,\nt\n#EXTINF:2.0,\nu\n",
             head(4)
         );
-        assert_eq!(RuleCheck::with_live_window().check(&full), Ok(()));
+        assert_eq!(RuleCheck::default().check(&full), Ok(()));
+        // The muxer's entry cap: a render listing that many entries passes
+        // even under three target durations; one fewer does not.
+        let many = |n: usize| {
+            let mut pl = head(4);
+            for _ in 0..n {
+                pl.push_str("#EXTINF:0.02000,\ns\n");
+            }
+            pl
+        };
+        let cap = crate::muxer::MAX_WINDOW_ENTRIES;
+        assert_eq!(RuleCheck::default().check(&many(cap)), Ok(()));
+        assert!(RuleCheck::default().check(&many(cap - 1)).is_err());
     }
 
     #[test]
@@ -669,7 +703,7 @@ mod tests {
             seg("1.0"),
             part("0.01000"),
         );
-        let mut c = RuleCheck::default();
+        let mut c = RuleCheck::without_live_window();
         assert_eq!(c.check(&ok), Ok(()));
         // The same window a segment later: segment 11 is now first, its
         // discontinuity still tagged, the sequence unchanged.
@@ -688,7 +722,7 @@ mod tests {
             c.check(&wrong).is_err(),
             "segment 11 lost its discontinuity"
         );
-        let mut fresh = RuleCheck::default();
+        let mut fresh = RuleCheck::without_live_window();
         for bad in [
             format!("{}{}", head(3, 0, 0), seg("3.50000")),
             format!("{}{}{}", head(3, 0, 0), part("0.23401"), seg("1")),
@@ -709,7 +743,10 @@ mod tests {
             ),
             "#EXTM3U\n".to_string(),
         ] {
-            assert!(RuleCheck::default().check(&bad).is_err(), "{bad}");
+            assert!(
+                RuleCheck::without_live_window().check(&bad).is_err(),
+                "{bad}"
+            );
         }
         assert_eq!(
             fresh.check(&format!("{}{}", head(3, 0, 0), seg("1"))),

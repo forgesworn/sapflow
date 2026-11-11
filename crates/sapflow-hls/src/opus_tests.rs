@@ -278,6 +278,7 @@ fn audio_only_opus_cuts_independent_parts_on_toc_durations() {
 /// window), and RFC 8216bis 6.2.2's part retention: a part stays
 /// downloadable for three target durations after its tag leaves the
 /// playlist.
+#[derive(Default)]
 struct Watch {
     rules: playlist::RuleCheck,
     parts: Vec<Arc<Part>>,
@@ -285,19 +286,6 @@ struct Watch {
     listed: std::collections::BTreeSet<u64>,
     removed: std::collections::BTreeMap<u64, i64>,
     gone: std::collections::BTreeMap<u64, i64>,
-}
-
-impl Default for Watch {
-    fn default() -> Self {
-        Self {
-            rules: playlist::RuleCheck::with_live_window(),
-            parts: Vec::new(),
-            next: 0,
-            listed: Default::default(),
-            removed: Default::default(),
-            gone: Default::default(),
-        }
-    }
 }
 
 impl Watch {

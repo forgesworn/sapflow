@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Checks an LL-HLS media playlist against Apple's part rules.
 
-  python3 -I scripts/check-playlist.py [--live-window] URL [SECONDS]   poll a live playlist
-  python3 -I scripts/check-playlist.py [--live-window] FILE...         check saved renders
+  python3 -I scripts/check-playlist.py [--no-live-window] URL [SECONDS]   poll a live playlist
+  python3 -I scripts/check-playlist.py [--no-live-window] FILE...         check saved renders
 
 Rules (RFC 8216bis 4.4.3.1, 4.4.3.3, 4.4.3.7, 4.4.4.9, 6.2.2;
 docs/reference.md), the same as sapflow_hls::playlist::RuleCheck:
   - TARGETDURATION and PART-TARGET never change while the stream runs;
   - every EXTINF, rounded to the nearest second, is at most TARGETDURATION;
   - no EXT-X-PART DURATION is above PART-TARGET;
-  - every part but the last of its segment is at least 85% of PART-TARGET,
-    unless it is INDEPENDENT=YES, which 4.4.4.9 exempts;
-  - with --live-window, once segments have been removed (MEDIA-SEQUENCE
-    above 0), the segments listed last at least three TARGETDURATIONs;
+  - every part but the last of its segment is at least 85% of PART-TARGET;
+    4.4.4.9 also exempts INDEPENDENT=YES parts, allowed here only in a
+    render whose every part is independent (audio-only);
+  - once segments have been removed (MEDIA-SEQUENCE above 0), the segments
+    listed last at least three TARGETDURATIONs (6.2.2), unless the render
+    lists 256 entries or more, sapflow's cap (--no-live-window leaves this
+    out; --live-window, its old opt-in, is accepted and ignored);
   - EXT-X-DISCONTINUITY never sits among a segment's parts, and each media
     sequence number keeps one discontinuity sequence number across renders.
 The last part listed after the final EXTINF is exempt: it may yet be the
@@ -25,7 +28,11 @@ import urllib.request
 from decimal import Decimal
 
 
-def check(text, live_window=False):
+# sapflow_hls::muxer::MAX_WINDOW_ENTRIES
+MAX_WINDOW_ENTRIES = 256
+
+
+def check(text, live_window=True):
     """One render: (headers, [(uri, duration)], {msn: dseq}, [extinf], [violations])."""
     head = {}
     parts, run, bad, dseqs, extinfs = [], [], [], {}, []
@@ -66,19 +73,21 @@ def check(text, live_window=False):
     parts.append((run, True))
     first = head.get("#EXT-X-MEDIA-SEQUENCE:", 0)
     duration = head.get("#EXT-X-TARGETDURATION:")
-    if live_window and first > 0 and duration is not None and sum(extinfs) < 3 * duration:
+    if (live_window and first > 0 and duration is not None and sum(extinfs) < 3 * duration
+            and len(extinfs) < MAX_WINDOW_ENTRIES):
         bad.append(f"segments removed down to {sum(extinfs)}, under three TARGETDURATIONs of {duration}")
     target = head.get("PART-TARGET")
     if target is None:
         return head, [], dseqs, extinfs, ["no PART-TARGET"]
     seen = []
+    audio_only = all(independent for run, _ in parts for _, _, independent in run)
     for run, open_segment in parts:
         for i, (uri, d, independent) in enumerate(run):
             seen.append((uri, d))
             if d > target:
                 bad.append(f"{uri} lasts {d}, over PART-TARGET {target}")
             last = i == len(run) - 1
-            if not last and not independent and d < target * Decimal("0.85"):
+            if not last and not (independent and audio_only) and d < target * Decimal("0.85"):
                 where = "open segment" if open_segment else "segment"
                 bad.append(f"{uri} lasts {d}, under 85% of PART-TARGET {target} (not last of its {where})")
     return head, seen, dseqs, extinfs, bad
@@ -110,8 +119,8 @@ def changes(values):
 
 
 def main(args):
-    live_window = "--live-window" in args
-    args = [a for a in args if a != "--live-window"]
+    live_window = "--no-live-window" not in args
+    args = [a for a in args if a not in ("--live-window", "--no-live-window")]
     if not args:
         print(__doc__, file=sys.stderr)
         return 2
