@@ -943,8 +943,7 @@ impl EsIngest {
             .checked_sub(origin)
             .ok_or(IngestError::InvalidTimestamp)?;
         if t >= 0 {
-            muxer.check_audio_admission(t, packet.len())?;
-            muxer.push_audio(t, Bytes::copy_from_slice(packet))?;
+            muxer.push_opus_slice(t, packet)?;
         }
         Ok(())
     }

@@ -566,6 +566,68 @@ fn a_refused_opus_packet_changes_nothing_even_where_it_would_close_a_part() {
     assert_eq!(before, (observable(&m), state(&m), m.audio_end));
 }
 
+/// The W3b review: copying a borrowed packet before the checks passed every
+/// test. A refused packet, or one the muxer would only drop, is never
+/// copied; an admitted one is copied once.
+#[test]
+fn a_refused_or_dropped_borrowed_opus_packet_is_never_copied() {
+    let copies = std::cell::Cell::new(0);
+    let copy = |p: &[u8]| {
+        copies.set(copies.get() + 1);
+        Bytes::copy_from_slice(p)
+    };
+    let good = packet(960, true);
+    let malformed: &[u8] = &[0xfb, 0];
+    // Audio-only.
+    let mut m = audio_only(MuxerConfig::default(), 2);
+    m.push_opus_slice_at_with(0, &good, NOW, copy)
+        .expect("admitted");
+    assert_eq!(copies.get(), 1);
+    for (pts, p) in [(1800, malformed), (1800, &[][..]), (-1, &good[..])] {
+        assert!(m.push_opus_slice_at_with(pts, p, NOW, copy).is_err());
+    }
+    m.next_segment.as_mut().expect("segment").bytes = MAX_SEGMENT_BYTES;
+    assert!(matches!(
+        m.push_opus_slice_at_with(1800, &good, NOW, copy),
+        Err(MuxError::SegmentTooLarge)
+    ));
+    assert_eq!(copies.get(), 1, "audio-only refusals copied nothing");
+    // Opus into an AAC muxer.
+    let mut aac = Muxer::audio_only(MuxerConfig::default(), tests::aac()).expect("AAC");
+    assert!(matches!(
+        aac.push_opus_slice_at_with(0, &good, NOW, copy),
+        Err(MuxError::InvalidAudio)
+    ));
+    // Video-led, through both entry points.
+    let mut m = av_muxer();
+    m.push_opus_slice_with(0, &good, copy).expect("admitted");
+    m.push_opus_slice_at_with(1800, &good, NOW, copy)
+        .expect("admitted");
+    assert_eq!(copies.get(), 3);
+    assert!(m.push_opus_slice_with(3600, malformed, copy).is_err());
+    // Dropped, not refused: before the stream's start.
+    m.push_opus_slice_with(-1800, &good, copy)
+        .expect("dropped quietly");
+    m.next_segment.as_mut().expect("segment").bytes = MAX_SEGMENT_BYTES;
+    assert!(matches!(
+        m.push_opus_slice_with(3600, &good, copy),
+        Err(MuxError::SegmentTooLarge)
+    ));
+    // A video-only muxer drops Opus without copying it.
+    let mut video_only = Muxer::new(MuxerConfig::default(), tests::video(), None);
+    video_only
+        .push_video(0, 0, true, Bytes::from_static(&[1]), NOW)
+        .expect("IDR");
+    video_only
+        .push_opus_slice_with(0, &good, copy)
+        .expect("dropped quietly");
+    assert_eq!(
+        copies.get(),
+        3,
+        "video-led refusals and drops copied nothing"
+    );
+}
+
 #[test]
 fn malformed_opus_is_refused_before_any_state_changes() {
     let bad: [&[u8]; 4] = [&[], &[0xf9, 1, 2, 3], &[0xfb, 0], &[0xfb, 49, 0]];

@@ -1506,17 +1506,58 @@ impl Muxer {
         packet: &[u8],
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        self.push_opus_slice_at_with(pts, packet, now, Bytes::copy_from_slice)
+    }
+
+    /// [`Muxer::push_audio`] for an Opus packet the caller has borrowed:
+    /// refused before it is copied, and not copied at all when it would only
+    /// be dropped (no audio track, or a timestamp before the stream starts).
+    pub(crate) fn push_opus_slice(&mut self, pts: i64, packet: &[u8]) -> Result<(), MuxError> {
+        self.push_opus_slice_with(pts, packet, Bytes::copy_from_slice)
+    }
+
+    /// The one place a borrowed audio-only Opus packet is copied.
+    pub(crate) fn push_opus_slice_at_with(
+        &mut self,
+        pts: i64,
+        packet: &[u8],
+        now: SystemTime,
+        copy: impl FnOnce(&[u8]) -> Bytes,
+    ) -> Result<Update, MuxError> {
         self.check_fragment_admission()?;
         if !matches!(self.audio, Some(AudioConfig::Opus(_))) {
             return Err(MuxError::InvalidAudio);
         }
         if self.video.is_some() {
-            opus_packet(packet).ok_or(MuxError::InvalidAudio)?;
-            self.check_audio_admission(pts, packet.len())?;
-            self.push_audio(pts, Bytes::copy_from_slice(packet))?;
+            self.push_opus_slice_with(pts, packet, copy)?;
             return Ok(Update::default());
         }
-        self.push_opus_audio_only(pts, packet, || Bytes::copy_from_slice(packet), now)
+        self.push_opus_audio_only(pts, packet, || copy(packet), now)
+    }
+
+    /// The one place a borrowed video-led Opus packet is copied: the same
+    /// checks as [`Muxer::push_audio`], in the same order, first.
+    pub(crate) fn push_opus_slice_with(
+        &mut self,
+        pts: i64,
+        packet: &[u8],
+        copy: impl FnOnce(&[u8]) -> Bytes,
+    ) -> Result<(), MuxError> {
+        self.check_fragment_admission()?;
+        self.check_audio_admission(pts, packet.len())?;
+        if self.video.is_none() {
+            return Ok(());
+        }
+        match self.audio {
+            None => return Ok(()),
+            Some(AudioConfig::Opus(_)) => {}
+            Some(AudioConfig::Aac(_)) => return Err(MuxError::InvalidAudio),
+        }
+        opus_packet(packet).ok_or(MuxError::InvalidAudio)?;
+        if pts < 0 || pts.saturating_add(self.offset) < 0 {
+            return Ok(());
+        }
+        self.push_audio(pts, copy(packet))
     }
 
     /// Explicit audio-only mode. Each accepted AAC-LC frame contributes exactly
