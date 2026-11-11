@@ -969,6 +969,69 @@ fn audio_only_opus_reports_real_breaks_while_slewing() {
     }
 }
 
+/// Video-led Opus at `ppm`, `samples` per packet, 30 s beside 30 fps video:
+/// every audio sample duration in the closed parts.
+fn video_led_durations(ppm: f64, samples: u32) -> Vec<u32> {
+    let mut m = Muxer::with_audio_config(
+        MuxerConfig::default(),
+        Some(tests::video()),
+        Some(opus(2)),
+        None,
+    )
+    .expect("A/V");
+    let mut watch = Watch::default();
+    let step = ticks(samples) as f64 * (1.0 + ppm * 1e-6);
+    let mut frame = 0i64;
+    let mut i = 0i64;
+    while frame < 900 {
+        let audio = (i as f64 * step) as i64;
+        while frame * 3000 <= audio && frame < 900 {
+            m.push_video(
+                frame * 3000,
+                frame * 3000,
+                frame % 30 == 0,
+                Bytes::from_static(&[1]),
+                NOW,
+            )
+            .expect("video");
+            frame += 1;
+        }
+        m.push_audio(audio, Bytes::from(packet(samples, true)))
+            .expect("Opus");
+        watch.observe(&m, audio);
+        i += 1;
+    }
+    watch.audio()
+}
+
+/// Video-led Opus sample durations come from the timestamps, as AAC's do,
+/// because the shared timeline's slew is what keeps audio with video. With
+/// exact timestamps they are exactly each packet's TOC duration; slewed at
+/// up to 500 ppm either way, they stay within that slew plus one sample of
+/// rounding of it.
+#[test]
+fn video_led_opus_durations_follow_the_timestamps_within_the_slew() {
+    for samples in [120u32, 960, 2880, 5760] {
+        let exact = video_led_durations(0.0, samples);
+        assert!(exact.len() > 100);
+        assert!(exact.iter().all(|&d| d == samples), "{samples}");
+        let bound = (f64::from(samples) * 500e-6).ceil() as i64 + 1;
+        for ppm in [500.0, -500.0] {
+            let slewed = video_led_durations(ppm, samples);
+            let worst = slewed
+                .iter()
+                .map(|&d| (i64::from(d) - i64::from(samples)).abs())
+                .max()
+                .expect("samples");
+            println!(
+                "video-led {} ms at {ppm} ppm: largest difference from the TOC duration {worst} samples (bound {bound})",
+                f64::from(samples) / 48.0
+            );
+            assert!(worst <= bound, "{samples} {ppm}: {worst}");
+        }
+    }
+}
+
 #[test]
 fn audio_only_opus_reports_a_missing_repeated_or_backward_timestamp_as_loss() {
     let mut m = audio_only(MuxerConfig::default(), 2);
