@@ -263,7 +263,7 @@ class MainActivity : ComponentActivity() {
     }
     private val refresh = object : Runnable {
         override fun run() {
-            snapshot = capture.snapshot()
+            snapshot = capture.snapshot().forDisplay()
             updatePrivacyCover(snapshot)
             cameraState = capture.cameraSnapshot()
             v4vState = v4v?.control?.view
@@ -463,12 +463,12 @@ class MainActivity : ComponentActivity() {
                                     val ticket=preparedCapture;val fresh=capture.snapshot()
                                     if(ticket!=null && capture.standby(ticket,fresh.privacyEpoch)) {
                                         privacyCover?.visibility=View.VISIBLE // same main call, before waiting for any owner queue
-                                        snapshot=capture.snapshot()
+                                        snapshot=capture.snapshot().forDisplay()
                                     }
                                 }){Text("Standby")}
                                 OutlinedButton(enabled=current.canResumePrivacy,onClick={
                                     val ticket=preparedCapture;val fresh=capture.snapshot()
-                                    if(ticket!=null && capture.resumePrivacy(ticket,fresh.privacyEpoch,fresh.privacyRevision))snapshot=capture.snapshot()
+                                    if(ticket!=null && capture.resumePrivacy(ticket,fresh.privacyEpoch,fresh.privacyRevision))snapshot=capture.snapshot().forDisplay()
                                 }){Text("Resume live input")}
                             }
                         }
@@ -511,7 +511,7 @@ class MainActivity : ComponentActivity() {
                             else -> "Unknown (${output.availability.name.lowercase().replace('_', ' ')})"
                         }
                         Text("Socket outbound $rate", style = MaterialTheme.typography.bodySmall)
-                        Text("Completed writes ${output?.completedBytes?.let { "$it B" } ?: "Unknown"}${if (output?.incomplete == true) " · incomplete accounting" else ""} · sample age ${output?.sampleAgeMs?.let { "${it}ms" } ?: "Unknown"}", style = MaterialTheme.typography.bodySmall)
+                        Text("Completed writes ${output?.completedBytes?.let { "$it B" } ?: "Unknown"}${if (output?.incomplete == true) " · incomplete accounting" else ""} · ${socketOutputReadingLabel(output)}", style = MaterialTheme.typography.bodySmall)
                         Text("Measured locally; delivery and playback are unconfirmed. Capture elapsed is not saved recording duration.", style = MaterialTheme.typography.bodySmall)
                         Text("Video timing/IDR ${current?.videoRejects ?: 0} · AAC priming ${current?.audioPrimingRejects ?: 0} · Wait IDR ${current?.waitingKeyframeRejects ?: 0} · Other ingress rejects ${current?.queueRejects ?: 0}", style = MaterialTheme.typography.bodySmall)
                         Text(current?.queueDiagnostics ?: "Queue diagnostics not sampled", style = MaterialTheme.typography.bodySmall)
