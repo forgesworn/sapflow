@@ -148,6 +148,10 @@ fn publish(profile: u16, seed: u8) {
         (stats.srtp_refused, stats.unmatched, stats.refused),
         (0, 0, 0)
     );
+    assert_eq!(
+        stats.budget_dropped, 0,
+        "the limit never drops an honest send"
+    );
     assert_eq!(s.last_media(), Some(t0 + ms(980)));
     assert_eq!(p.misdirected, 0);
 }
@@ -1138,4 +1142,67 @@ fn sends_return_to_the_publisher_after_a_won_race() {
     assert_eq!(state, State::Connected);
     let back = back.expect("sends went back to the publisher");
     assert!(back <= ms(20), "{back:?}");
+}
+
+/// An honest low-rate publisher on an audio-only offer, for 60 s: audio
+/// every 20 ms, or muted from the start (sender reports every 5 s only),
+/// with a check every 2.5 s. Returns the peak ratio of bytes sent to
+/// bytes received for its tuple, the budget drops and the final state.
+fn low_rate(muted: bool, seed: u8) -> (f64, u64, State) {
+    let t0 = Instant::now();
+    let mut p = Publisher::new(seed, &[GCM]);
+    let offer = p.offer().replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0");
+    let mut a = accept(&offer, SessionConfig::default(), t0, seed);
+    p.answered(&a);
+    assert!(a.negotiated.video.is_none());
+    let s = &mut a.session;
+    let home = p.tuple;
+    let mut peak = 0f64;
+    let mut track = |s: &crate::Session| {
+        if let Some((received, sent)) = s.tuple_bytes(&home) {
+            peak = peak.max(sent as f64 / received.max(1) as f64);
+        }
+    };
+    // The handshake a datagram at a time, so the peak after our first
+    // flight is seen.
+    s.handle_datagram(t0, home, &p.check(true));
+    track(s);
+    let mut pending = p.client.start();
+    for _ in 0..8 {
+        for d in std::mem::take(&mut pending) {
+            s.handle_datagram(t0, home, &d);
+            track(s);
+        }
+        pending = p.receive(s);
+    }
+    assert!(p.has_keys());
+    for step in 1..=3000u64 {
+        let at = t0 + ms(20 * step);
+        if !muted {
+            s.handle_datagram(at, home, &p.audio(step as u8));
+        }
+        if step % 250 == 0 {
+            for d in p.sender_reports((1 << 62) + step) {
+                s.handle_datagram(at, home, &d);
+            }
+        }
+        if step % 125 == 0 {
+            s.handle_datagram(at, home, &p.check(false));
+        }
+        run_until(s, at);
+        track(s);
+        p.receive(s);
+    }
+    (peak, s.stats().budget_dropped, s.state())
+}
+
+#[test]
+fn honest_low_rate_publishers_are_never_capped() {
+    for muted in [false, true] {
+        let (peak, dropped, state) = low_rate(muted, 31 + u8::from(muted));
+        println!("low rate, muted {muted}: peak sent/received {peak:.2}, dropped {dropped}");
+        assert!(peak <= 4.0, "{peak}");
+        assert_eq!(dropped, 0);
+        assert_eq!(state, State::Connected);
+    }
 }

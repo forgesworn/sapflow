@@ -367,6 +367,9 @@ fn main() {
     let mut by_pt: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
     let mut done = None;
     let mut buf = [0u8; 2048];
+    // Each tuple's peak ratio of bytes sent to bytes received, for the
+    // amplification limit; tuples are numbered, never printed.
+    let mut tuples: Vec<(Tuple, f64)> = Vec::new();
     let reach = |reached: &mut Vec<(&'static str, u128, String)>,
                  what: &'static str,
                  posted: Option<Instant>,
@@ -406,6 +409,7 @@ fn main() {
         let got = udp.recv_from(&mut buf);
         let Some(s) = session.as_mut() else { continue };
         let now = Instant::now();
+        let source = got.as_ref().ok().map(|&(_, from)| from);
         match got {
             Ok((n, from)) => {
                 let d = &buf[..n];
@@ -439,6 +443,17 @@ fn main() {
                         let _ = writeln!(rec.dtls, "T");
                     }
                 }
+            }
+        }
+        if let Some(from) = source
+            && tuples.len() < 16
+            && !tuples.iter().any(|(t, _)| *t == Tuple::udp(from))
+        {
+            tuples.push((Tuple::udp(from), 0.0));
+        }
+        for (t, peak) in &mut tuples {
+            if let Some((received, sent)) = s.tuple_bytes(t) {
+                *peak = peak.max(sent as f64 / received.max(1) as f64);
             }
         }
         let st = s.stats();
@@ -525,6 +540,14 @@ fn main() {
         st.ice.role_conflicts,
         st.dtls.retransmissions,
     );
+    for (i, (t, peak)) in tuples.iter().enumerate() {
+        if let Some((received, sent)) = s.tuple_bytes(t) {
+            println!(
+                "tuple {}: peak sent/received {peak:.3}, at the end received {received} sent {sent}",
+                i + 1
+            );
+        }
+    }
     println!(
         "sending: budget_dropped={} transmit_dropped={} ice_repeats={} ice_replays={} \
          send_tuple_is_selected={}",
