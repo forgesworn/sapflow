@@ -20,15 +20,19 @@
 //! - **Bounded by arrival time.** A stream's timestamps never go back, and
 //!   never run ahead of arrival time by more than `max_lead` (plus 0.1% of
 //!   the time since alignment, for clock rate differences between sender
-//!   and receiver). A timestamp that would do either re-anchors the stream
-//!   on arrival time, continuing from its last timestamp: a discontinuity.
-//!   So does a sequence or Opus timestamp discontinuity in the stream.
+//!   and receiver). A timestamp a little past that bound, as when network
+//!   delay falls after the start, is held to it and the stream continues
+//!   from there, silently (counted as a clamp). One that goes back, or more
+//!   than `max_lead` past the bound, re-anchors the stream on arrival time,
+//!   continuing from its last timestamp: a discontinuity. So does a
+//!   sequence or Opus timestamp discontinuity in the stream.
 //! - **Drift.** Each later sender report is checked against where the
 //!   stream's RTP timestamps put it. Beyond [`TimelineConfig::max_drift`]
 //!   either way is a discontinuity. If the stream is behind, it re-anchors
-//!   on the report (moving forward, and still bounded by arrival time). If
-//!   it is ahead, it cannot go back, so it keeps its timestamps and takes
-//!   the report as its new reference. A stream aligned or re-anchored by
+//!   on the report, moving forward no further than the arrival bound, and
+//!   takes where it lands as its reference. If it is ahead, it cannot go
+//!   back, so it keeps its timestamps and takes the report as its new
+//!   reference. A stream aligned or re-anchored by
 //!   arrival time takes its next report as its reference.
 //!
 //! A sender report with an NTP time of zero carries no mapping and is
@@ -139,6 +143,8 @@ struct Track {
     /// Re-anchors on arrival time this timeline made, and sender reports
     /// beyond the drift bound.
     discontinuities: u64,
+    /// Timestamps held to the arrival bound.
+    clamps: u64,
 }
 
 /// What [`Timeline::stamp`] gives.
@@ -193,7 +199,13 @@ impl Timeline {
             offset: None,
             reanchor: false,
             discontinuities: 0,
+            clamps: 0,
         });
+    }
+
+    /// Timestamps of a track held to the arrival bound.
+    pub fn clamps(&self, track: usize) -> u64 {
+        self.tracks.get(track).map_or(0, |t| t.clamps)
     }
 
     /// Discontinuities the timeline found in a track.
@@ -305,6 +317,7 @@ impl Timeline {
     /// come in the order the receiver emits them. Call only once aligned.
     pub fn stamp(&mut self, track: usize, rtp: u32, arrival: u64) -> Stamp {
         let bound = self.bound(arrival);
+        let far = bound.saturating_add(self.lead);
         let arrival_pts = ticks(arrival).saturating_add(self.arrival_offset);
         let synced = self.aligned == Some(Alignment::SenderReports);
         let (origin, lead) = (self.origin, self.lead);
@@ -324,7 +337,7 @@ impl Timeline {
         let pts = match (t.anchor, t.last) {
             (Some((ae, ap)), Some(l)) => {
                 let mapped = ap.saturating_add(scale(ext.saturating_sub(ae), t.rate));
-                if t.reanchor || mapped < l.pts || mapped > bound {
+                if t.reanchor || mapped < l.pts || mapped > far {
                     // Continue from the last timestamp by arrival time.
                     let step = ticks(arrival.saturating_sub(l.arrival)).max(1);
                     let pts = l.pts.saturating_add(step);
@@ -332,6 +345,13 @@ impl Timeline {
                     t.discontinuities += u64::from(reanchored);
                     t.anchor = Some((ext, pts));
                     t.offset = None;
+                    pts
+                } else if mapped > bound {
+                    // A little ahead of arrival time: held to the bound,
+                    // and continued from there.
+                    let pts = bound.max(l.pts.saturating_add(1));
+                    t.anchor = Some((ext, pts));
+                    t.clamps += 1;
                     pts
                 } else {
                     mapped
@@ -373,11 +393,12 @@ impl Timeline {
         }
     }
 
-    /// A sender report for `track`, at `arrival`. Returns the drift in
-    /// 90 kHz ticks (positive: the stream was ahead) when it is beyond the
-    /// bound, a discontinuity.
-    pub fn sender_report(&mut self, track: usize, ntp: u64, rtp: u32) -> Option<i64> {
+    /// A sender report for `track`, arriving at `arrival`. Returns the
+    /// drift in 90 kHz ticks (positive: the stream was ahead) when it is
+    /// beyond the bound, a discontinuity.
+    pub fn sender_report(&mut self, track: usize, ntp: u64, rtp: u32, arrival: u64) -> Option<i64> {
         let drift_bound = self.drift;
+        let cap = self.bound(arrival);
         let t = self.tracks.get_mut(track)?;
         if ntp == 0 {
             return None;
@@ -399,7 +420,10 @@ impl Timeline {
             return None;
         }
         if drift < 0 {
-            t.anchor = Some((e, truth));
+            // Forward to the report, no further than arrival time allows.
+            let to = truth.min(cap).max(predicted);
+            t.anchor = Some((e, to));
+            t.offset = Some(to.saturating_sub(n));
         } else {
             t.offset = Some(predicted.saturating_sub(n));
         }
@@ -436,8 +460,8 @@ mod tests {
         t.note_packet(0, 1000, 20 * MS);
         t.note_packet(1, 50_000 + 14_400, 320 * MS);
         assert_eq!(t.try_align(330 * MS, 0, false), None, "still waiting");
-        assert_eq!(t.sender_report(0, ntp(0), 1000), None);
-        assert_eq!(t.sender_report(1, ntp(0), 50_000), None);
+        assert_eq!(t.sender_report(0, ntp(0), 1000, 30 * MS), None);
+        assert_eq!(t.sender_report(1, ntp(0), 50_000, 330 * MS), None);
         assert_eq!(
             t.try_align(340 * MS, 0, false),
             Some(Alignment::SenderReports)
@@ -458,7 +482,7 @@ mod tests {
         let mut t = two(TimelineConfig::default());
         t.note_packet(0, 1000, 100 * MS);
         t.note_packet(1, 7, 150 * MS);
-        t.sender_report(0, ntp(0), 1000);
+        t.sender_report(0, ntp(0), 1000, 30 * MS);
         assert_eq!(t.hold_deadline(), Some(1600 * MS));
         assert_eq!(t.try_align(1599 * MS, 0, false), None);
         assert_eq!(
@@ -495,8 +519,8 @@ mod tests {
         t.note_packet(1, 0, 0);
         // Audio's report says its first packet was captured 2 s after
         // video's, but they arrived together.
-        t.sender_report(0, ntp(0), 0);
-        t.sender_report(1, ntp(2_000 * MS), 0);
+        t.sender_report(0, ntp(0), 0, 0);
+        t.sender_report(1, ntp(2_000 * MS), 0, 0);
         assert_eq!(
             t.try_align(MS, 0, false),
             Some(Alignment::Arrival(Fallback::Inconsistent))
@@ -508,22 +532,31 @@ mod tests {
         let mut t = Timeline::new(TimelineConfig::default());
         t.add_track(90_000);
         t.note_packet(0, 0, 0);
-        t.sender_report(0, ntp(0), 0);
+        t.sender_report(0, ntp(0), 0, 0);
         assert_eq!(t.try_align(0, 0, false), Some(Alignment::SenderReports));
         let frame = |t: &mut Timeline, n: u64| t.stamp(0, (n * 3000) as u32, n * 33_333);
         assert_eq!(frame(&mut t, 0).pts, 0);
         assert_eq!(frame(&mut t, 30).pts, 90_000);
         // 50 ms of drift at 1 s: within the bound.
-        assert_eq!(t.sender_report(0, ntp(1_050 * MS), 90_000), None);
+        assert_eq!(
+            t.sender_report(0, ntp(1_050 * MS), 90_000, 1_000 * MS),
+            None
+        );
         // 150 ms behind: re-anchors forward on the report.
-        assert_eq!(t.sender_report(0, ntp(1_150 * MS), 90_000), Some(-13_500));
+        assert_eq!(
+            t.sender_report(0, ntp(1_150 * MS), 90_000, 1_000 * MS),
+            Some(-13_500)
+        );
         assert_eq!(frame(&mut t, 31).pts, 90_000 + 13_500 + 3000);
         // 300 ms ahead: kept, and the report becomes the reference.
         let s = frame(&mut t, 60).pts;
-        assert_eq!(t.sender_report(0, ntp(1_850 * MS), 180_000), Some(27_000));
+        assert_eq!(
+            t.sender_report(0, ntp(1_850 * MS), 180_000, 2_000 * MS),
+            Some(27_000)
+        );
         assert_eq!(frame(&mut t, 61).pts, s + 3000, "never back");
         assert_eq!(
-            t.sender_report(0, ntp(1_883 * MS), 183_000),
+            t.sender_report(0, ntp(1_883 * MS), 183_000, 2_034 * MS),
             None,
             "the new reference"
         );
@@ -573,18 +606,24 @@ mod tests {
         let mut t = Timeline::new(TimelineConfig::default());
         t.add_track(90_000);
         t.note_packet(0, 0, 0);
-        t.sender_report(0, ntp(0), 0);
+        t.sender_report(0, ntp(0), 0, 0);
         t.try_align(0, 0, false);
         assert_eq!(t.stamp(0, 0, 0).pts, 0);
         assert_eq!(t.stamp(0, 3000, 33 * MS).pts, 3000);
-        // A report a day ahead: the stream re-anchors forward...
-        assert!(t.sender_report(0, ntp(86_400_000 * MS), 3000).is_some());
-        // ...but its next frame is bounded by arrival time.
+        // A report a day ahead: reported, but the stream moves forward no
+        // further than the arrival bound (33 ms and the 500 ms lead)...
+        assert!(
+            t.sender_report(0, ntp(86_400_000 * MS), 3000, 33 * MS)
+                .is_some()
+        );
+        // ...and its next frame is held to the bound.
         let s = t.stamp(0, 6000, 66 * MS);
-        assert!(s.reanchored);
-        assert_eq!(s.pts, 3000 + 2970);
+        assert!(!s.reanchored);
+        // 66 ms is 5940 ticks, plus 0.1% of it as slack, plus the lead.
+        assert_eq!(s.pts, 5940 + 5 + 45_000);
+        assert_eq!(t.clamps(0), 1);
         // NTP zero is no mapping.
-        assert_eq!(t.sender_report(0, 0, 0), None);
+        assert_eq!(t.sender_report(0, 0, 0, 40 * MS), None);
     }
 
     #[test]
@@ -592,7 +631,7 @@ mod tests {
         let mut t = Timeline::new(TimelineConfig::default());
         t.add_track(48_000);
         t.note_packet(0, 100, 10 * MS);
-        t.sender_report(0, ntp(5_000 * MS), 100);
+        t.sender_report(0, ntp(5_000 * MS), 100, 10 * MS);
         assert_eq!(
             t.try_align(10 * MS, 0, false),
             Some(Alignment::SenderReports)
@@ -603,21 +642,64 @@ mod tests {
         // audio's report, and video arriving later maps by its own report.
         let mut t = two(TimelineConfig::default());
         t.note_packet(1, 0, 0);
-        t.sender_report(1, ntp(0), 0);
+        t.sender_report(1, ntp(0), 0, 0);
         assert_eq!(
             t.try_align(1_500 * MS, 0, false),
             Some(Alignment::SenderReports)
         );
         assert_eq!(t.stamp(1, 0, 0).pts, 0);
         t.note_packet(0, 500, 2_000 * MS);
-        t.sender_report(0, ntp(1_990 * MS), 500);
+        t.sender_report(0, ntp(1_990 * MS), 500, 2_000 * MS);
         assert_eq!(t.stamp(0, 500, 2_000 * MS).pts, 179_100, "1.99 s");
         // Without a report it maps by arrival time.
         let mut t = two(TimelineConfig::default());
         t.note_packet(1, 0, 0);
-        t.sender_report(1, ntp(0), 0);
+        t.sender_report(1, ntp(0), 0, 0);
         t.try_align(1_500 * MS, 0, false);
         t.stamp(1, 0, 0);
         assert_eq!(t.stamp(0, 500, 2_000 * MS).pts, 180_000);
+    }
+
+    /// Network delay that falls by more than the lead after the start (a
+    /// queue draining): frames are held to the arrival bound, silently,
+    /// never back, with no discontinuity.
+    #[test]
+    fn a_falling_delay_is_absorbed_without_discontinuities() {
+        let mut t = Timeline::new(TimelineConfig {
+            start_hold: Duration::ZERO,
+            ..TimelineConfig::default()
+        });
+        t.add_track(90_000);
+        // Frames 33.3 ms apart on the sender; 900 ms of delay falling to
+        // 50 ms over 3 s, then steady, with 8 ms of jitter either way.
+        let sent = |n: u64| n * 100_000 / 3;
+        let arrival = |n: u64| {
+            let s = sent(n);
+            let delay = if s < 3_000_000 {
+                900_000 - s * 850 / 3000
+            } else {
+                50_000
+            };
+            s + delay + if n.is_multiple_of(2) { 8_000 } else { 0 }
+        };
+        t.note_packet(0, 0, arrival(0));
+        t.try_align(arrival(0), 0, false);
+        let mut last = 0;
+        for n in 0..600u64 {
+            let s = t.stamp(0, (n * 3000) as u32, arrival(n));
+            assert!(!s.reanchored, "frame {n}");
+            assert!(s.pts >= last);
+            last = s.pts;
+        }
+        assert_eq!(t.discontinuities(0), 0);
+        // Clamped while the delay fell past the lead (about 1.8 s to 3 s,
+        // some 37 frames); once steady, a clamp on an early frame leaves
+        // the rest under the bound, and RTP deltas take over again.
+        assert!((20..=60).contains(&t.clamps(0)), "{} clamps", t.clamps(0));
+        let before = t.clamps(0);
+        for n in 600..700u64 {
+            t.stamp(0, (n * 3000) as u32, arrival(n));
+        }
+        assert_eq!(t.clamps(0), before, "none once steady");
     }
 }

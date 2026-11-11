@@ -572,6 +572,9 @@ pub struct StreamStats {
     /// Timeline discontinuities: re-anchors on arrival time, and sender
     /// reports beyond the drift bound.
     pub timeline_discontinuities: u64,
+    /// Frames held to the timeline's arrival bound (see
+    /// [`crate::timeline`]), without a discontinuity.
+    pub timeline_clamps: u64,
     /// Events dropped because the queue was full.
     pub events_dropped: u64,
 }
@@ -785,6 +788,7 @@ impl Receiver {
                 stats.missing_markers = v.depack.missing_markers();
             }
             stats.timeline_discontinuities = self.events.timeline.discontinuities(stream.0);
+            stats.timeline_clamps = self.events.timeline.clamps(stream.0);
             stats
         })
     }
@@ -1064,7 +1068,7 @@ impl Receiver {
             return;
         };
         s.reception.sender_report(ntp, arrival);
-        if let Some(drift) = self.events.timeline.sender_report(i, ntp, rtp) {
+        if let Some(drift) = self.events.timeline.sender_report(i, ntp, rtp, arrival) {
             let _ = self.events.push(
                 &mut s.stats,
                 Event::Discontinuity {
