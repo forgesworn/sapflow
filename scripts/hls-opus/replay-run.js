@@ -16,7 +16,11 @@
 //     position 0, so the page as served passes hls.js a startPosition at the
 //     first real segment (the W0 file itself is unchanged);
 //   - ps312: a copy whose init segment has the dOps pre-skip patched to 312,
-//     for comparison with W0. Pre-skip 0 is what sapflow writes.
+//     for comparison with W0. Pre-skip 0 is what sapflow writes;
+//   - the other CODECS spelling: a copy whose multivariant playlist says
+//     "Opus" where sapflow says "opus", or the reverse, with a probe page
+//     (/codecs.html) that records MediaSource.isTypeSupported and
+//     canPlayType for both spellings.
 //
 // Usage (repository root):
 //   node scripts/hls-opus/replay-run.js --evidence <write_opus_evidence out>
@@ -52,6 +56,28 @@ function load(dir) {
   }
   return { dir, snaps, available };
 }
+
+// The same stream with the multivariant playlist's Opus codec string
+// respelt: "opus" becomes "Opus" and the reverse.
+function respelt(evidence, out, name) {
+  const src = path.join(evidence, name), dst = path.join(out, 'variants', `${name}-respelt`);
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  fs.cpSync(src, dst, { recursive: true });
+  const master = path.join(dst, 'master.m3u8'), text = fs.readFileSync(master, 'utf8');
+  const swapped = text.replace(/CODECS="([^"]*)"/, (_, c) => `CODECS="${c.split(',').map((x) => (x === 'opus' ? 'Opus' : x === 'Opus' ? 'opus' : x)).join(',')}"`);
+  if (swapped === text) throw new Error('no Opus codec string in ' + master);
+  fs.writeFileSync(master, swapped);
+  return load(dst);
+}
+
+const PROBE = `<!doctype html><meta charset="utf-8"><title>codecs probe</title><script>
+const label = new URLSearchParams(location.search).get('label');
+const types = ['audio/mp4; codecs="opus"', 'audio/mp4; codecs="Opus"', 'video/mp4; codecs="avc1.4d401f,opus"', 'video/mp4; codecs="avc1.4d401f,Opus"'];
+const v = document.createElement('video');
+const out = { userAgent: navigator.userAgent, mse: {}, canPlayType: {} };
+for (const t of types) { out.mse[t] = window.MediaSource ? MediaSource.isTypeSupported(t) : null; out.canPlayType[t] = v.canPlayType(t); }
+fetch('/result/' + label + '.json', { method: 'POST', body: JSON.stringify(out, null, 1) }).then(() => fetch('/done?label=' + label, { method: 'POST' }));
+</script>`;
 
 function variant(evidence, out, name, preskip) {
   const src = path.join(evidence, name);
@@ -91,6 +117,8 @@ async function main() {
     'av-ps0': variant(evidence, out, 'live-av', 0),
     'audio-ps0': variant(evidence, out, 'live-audio', 0),
     'av-ps312': variant(evidence, out, 'live-av', 312),
+    'av-respelt': respelt(evidence, out, 'live-av'),
+    'audio-respelt': respelt(evidence, out, 'live-audio'),
   };
   const clocks = new Map(), waiters = new Map(), log = new Map();
   const note = (id, what) => { if (!log.has(id)) log.set(id, []); log.get(id).push(what); };
@@ -108,6 +136,7 @@ async function main() {
     }
     const send = (status, body, type) => res.writeHead(status, { 'Content-Type': type || 'application/octet-stream', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(body) }).end(body);
     if (url.pathname === '/play.html') return send(200, page, TYPES['.html']);
+    if (url.pathname === '/codecs.html') return send(200, PROBE, TYPES['.html']);
     if (url.pathname === '/vendor/hls.min.js') return send(200, fs.readFileSync(path.join(vendor, 'hls.min.js')), TYPES['.js']);
     const m = /^\/run\/([\w-]+)\/([\w-]+)\/(live|vod)\/([\w.]+)$/.exec(url.pathname);
     if (!m || !streams[m[2]]) return send(404, '');
@@ -151,8 +180,21 @@ async function main() {
     const add = (stream, mode, n) => { for (let r = 1; r <= n; r++) cases.push({ b, stream, mode, r }); };
     if (b === 'chrome') { add('av-ps0', 'live', +opt('chrome-runs', 2)); add('audio-ps0', 'live', 1); add('av-ps0', 'vod', 1); }
     else { add('av-ps0', 'live', runs); add('av-ps0', 'vod', runs); add('av-ps312', 'live', runs); add('av-ps312', 'vod', runs); add('audio-ps0', 'live', 1); }
+    add('av-respelt', 'live', 1); add('audio-respelt', 'live', 1);
   }
   const summary = [];
+  for (const b of browsers) {
+    const label = `${b}-codecs`;
+    if (only && !label.includes(only)) continue;
+    const done = new Promise((r) => { waiters.set(label, () => r(true)); setTimeout(() => r(false), 30000); });
+    const h = b === 'chrome' ? launchChrome(`http://127.0.0.1:${port}/codecs.html?label=${label}`) : launchFirefox(`http://127.0.0.1:${port}/codecs.html?label=${label}`);
+    const finished = await done;
+    await h.stop();
+    let r = null; try { r = JSON.parse(fs.readFileSync(path.join(out, label + '.json'), 'utf8')); } catch {}
+    const row = { label, finished, ua: r && (r.userAgent.match(/(Firefox|Chrome)\/[\d.]+/) || [])[0], mse: r && r.mse, canPlayType: r && r.canPlayType };
+    console.log(JSON.stringify(row));
+    summary.push(row);
+  }
   for (const c of cases) {
     const label = `${c.b}-${c.stream}-${c.mode}-${c.r}`;
     if (only && !label.includes(only)) continue;
