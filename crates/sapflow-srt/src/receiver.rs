@@ -209,7 +209,10 @@ pub struct Receiver {
     next_ack_number: u32,
     last_ack_sent: Seq,
     last_full_ack: i64,
-    unanswered: VecDeque<(u32, i64)>,
+    last_full_ack_pos: Seq,
+    /// Latest data position confirmed by a retained full ACK's ACKACK.
+    ack_confirmed: Seq,
+    unanswered: VecDeque<(u32, i64, Seq)>,
     since_ack: u32,
     last_sent: i64,
     last_received: i64,
@@ -257,6 +260,8 @@ impl Receiver {
             next_ack_number: 1,
             last_ack_sent: initial_seq,
             last_full_ack: now,
+            last_full_ack_pos: initial_seq,
+            ack_confirmed: initial_seq,
             unanswered: VecDeque::new(),
             since_ack: 0,
             last_sent: now,
@@ -570,12 +575,13 @@ impl Receiver {
         self.next_ack_number = self.next_ack_number.wrapping_add(1).max(1);
         self.last_ack_sent = self.ack_pos;
         self.last_full_ack = now;
+        self.last_full_ack_pos = self.ack_pos;
         self.since_ack = 0;
         self.stats.acks_sent += 1;
         if self.unanswered.len() >= ACKS_REMEMBERED {
             self.unanswered.pop_front();
         }
-        self.unanswered.push_back((number, now));
+        self.unanswered.push_back((number, now, self.ack_pos));
         let clamp = |v: i64| u32::try_from(v.max(0)).unwrap_or(u32::MAX);
         let free = self.settings.buffer.saturating_sub(self.buf.len());
         let ack = Ack {
@@ -647,9 +653,12 @@ impl Receiver {
         self.last_received = now;
         match c {
             Control::AckAck { number } => {
-                if let Some(i) = self.unanswered.iter().position(|(n, _)| n == number) {
-                    if let Some((_, sent)) = self.unanswered.get(i).copied() {
+                if let Some(i) = self.unanswered.iter().position(|(n, _, _)| n == number) {
+                    if let Some((_, sent, position)) = self.unanswered.get(i).copied() {
                         self.rtt.sample(now - sent);
+                        if self.ack_confirmed.distance_to(position) > 0 {
+                            self.ack_confirmed = position;
+                        }
                     }
                     self.unanswered.drain(..=i);
                 }
@@ -678,7 +687,10 @@ impl Receiver {
             return;
         }
         self.release(now, true);
-        if self.ack_pos != self.last_ack_sent && now - self.last_full_ack >= ACK_INTERVAL {
+        if self
+            .full_ack_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
             self.full_ack(now);
         }
         self.nak_due(now);
@@ -687,14 +699,28 @@ impl Receiver {
         }
     }
 
+    /// New progress uses SYN; an unchanged, unconfirmed position waits for
+    /// feedback before repeating. A light ACK cannot confirm either case.
+    fn full_ack_deadline(&self) -> Option<i64> {
+        if self.ack_pos == self.ack_confirmed {
+            return None;
+        }
+        let interval = if self.ack_pos != self.last_full_ack_pos {
+            ACK_INTERVAL
+        } else {
+            self.rtt.retry().max(ACK_INTERVAL)
+        };
+        Some(self.last_full_ack.saturating_add(interval))
+    }
+
     /// When [`on_timer`](Self::on_timer) next has something to do.
     pub fn next_timer(&self) -> i64 {
         let mut t = self
             .last_received
             .saturating_add(self.settings.peer_idle)
             .min(self.last_sent + KEEPALIVE_INTERVAL);
-        if self.ack_pos != self.last_ack_sent {
-            t = t.min(self.last_full_ack + ACK_INTERVAL);
+        if let Some(deadline) = self.full_ack_deadline() {
+            t = t.min(deadline);
         }
         if let Some(at) = self.loss.next_due(self.now, self.timing()) {
             t = t.min(at);
@@ -1273,6 +1299,109 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_ack_repeats_at_retry_interval_then_stops() {
+        let mut r = rx();
+        r.on_timer(10 * MS);
+        assert!(
+            sent(&mut r).is_empty(),
+            "idle connection has no ACK traffic"
+        );
+        r.on_data(11 * MS, &data(ISN, 11_000, b"x"));
+        r.on_timer(20 * MS);
+        assert!(matches!(sent(&mut r).as_slice(), [Control::Ack(a)] if a.number == 1));
+        r.on_timer(319 * MS);
+        assert!(
+            sent(&mut r).is_empty(),
+            "do not repeat before the retry interval"
+        );
+        r.on_timer(320 * MS);
+        assert!(matches!(sent(&mut r).as_slice(), [Control::Ack(a)] if a.number == 2));
+        r.on_timer(320 * MS);
+        assert!(sent(&mut r).is_empty(), "no same-time repeat loop");
+        // An older ACK number for the same position confirms that position.
+        r.on_control(321 * MS, &Control::AckAck { number: 1 });
+        r.on_timer(900 * MS);
+        assert!(sent(&mut r).is_empty());
+        assert!(r.next_timer() > 900 * MS);
+    }
+
+    #[test]
+    fn unchanged_ack_repeats_never_exceed_the_syn_rate() {
+        let mut r = rx();
+        r.rtt.sample(1);
+        r.on_data(0, &data(ISN, 0, b"x"));
+        r.on_timer(10 * MS);
+        sent(&mut r);
+        assert_eq!(r.next_timer(), 20 * MS);
+        r.on_timer(20 * MS - 1);
+        assert!(sent(&mut r).is_empty());
+        r.on_timer(20 * MS);
+        assert!(matches!(sent(&mut r).as_slice(), [Control::Ack(a)] if a.number == 2));
+        assert_eq!(r.next_timer(), 30 * MS);
+    }
+
+    #[test]
+    fn old_ackack_cannot_confirm_new_progress_across_sequence_wrap() {
+        let mut r = Receiver::new(settings(), 0, 77, Seq::new(Seq::MAX), 0);
+        r.next_ack_number = u32::MAX;
+        r.on_data(0, &data(Seq::MAX, 0, b"a"));
+        r.on_timer(10 * MS);
+        assert!(
+            matches!(sent(&mut r).as_slice(), [Control::Ack(a)] if a.number == u32::MAX && a.ack == Seq::new(0))
+        );
+        r.on_data(11 * MS, &data(0, 11_000, b"b"));
+        r.on_timer(20 * MS);
+        assert!(
+            matches!(sent(&mut r).as_slice(), [Control::Ack(a)] if a.number == 1 && a.ack == Seq::new(1))
+        );
+        r.on_control(21 * MS, &Control::AckAck { number: u32::MAX });
+        // The old position is confirmed, but the newer full ACK still needs
+        // a response. The RTT sample shortens its retry interval to 33 ms.
+        r.on_timer(53 * MS);
+        assert!(
+            matches!(sent(&mut r).as_slice(), [Control::Ack(a)] if a.number == 2 && a.ack == Seq::new(1))
+        );
+        let rtt = r.rtt().rtt();
+        for number in [u32::MAX, 42, 0] {
+            r.on_control(54 * MS, &Control::AckAck { number });
+        }
+        assert_eq!(
+            r.rtt().rtt(),
+            rtt,
+            "unknown and stale ACKACKs cannot sample RTT"
+        );
+        r.on_control(55 * MS, &Control::AckAck { number: 1 });
+        r.on_timer(500 * MS);
+        assert!(sent(&mut r).is_empty());
+        assert!(r.next_timer() > 500 * MS);
+    }
+
+    #[test]
+    fn repeated_ack_history_and_delayed_timer_remain_bounded() {
+        let mut r = rx();
+        r.on_data(0, &data(ISN, 0, b"x"));
+        for i in 0..(ACKS_REMEMBERED + 4) {
+            let at = 10 * MS + i as i64 * 300 * MS;
+            r.on_control(at, &Control::KeepAlive);
+            r.on_timer(at);
+            assert!(matches!(sent(&mut r).as_slice(), [Control::Ack(_)]));
+            assert!(r.unanswered.len() <= ACKS_REMEMBERED);
+            r.on_timer(at);
+            assert!(sent(&mut r).is_empty());
+        }
+        let at = 60_000 * MS;
+        r.on_control(at, &Control::KeepAlive);
+        r.on_control(at, &Control::AckAck { number: 1 }); // evicted
+        assert_eq!(r.rtt().rtt(), 100 * MS);
+        r.on_timer(at);
+        assert!(
+            matches!(sent(&mut r).as_slice(), [Control::Ack(_)]),
+            "one ACK, no catch-up burst"
+        );
+        assert!(r.next_timer() > at);
+    }
+
+    #[test]
     fn light_ack_every_64_packets() {
         let mut r = Receiver::new(
             Settings {
@@ -1291,6 +1420,11 @@ mod tests {
         assert!(
             matches!(c.as_slice(), [Control::Ack(Ack { number: 0, stats: None, ack })] if *ack == Seq::new(ISN + 64)),
             "{c:?}"
+        );
+        r.on_timer(10 * MS);
+        assert!(
+            matches!(sent(&mut r).as_slice(), [Control::Ack(a)] if a.number == 1 && a.stats.is_some()),
+            "a light ACK cannot suppress the full tail ACK"
         );
     }
 
@@ -1462,8 +1596,8 @@ mod tests {
             .last_received
             .saturating_add(r.settings.peer_idle)
             .min(r.last_sent + KEEPALIVE_INTERVAL);
-        if r.ack_pos != r.last_ack_sent {
-            expected = expected.min(r.last_full_ack + ACK_INTERVAL);
+        if let Some(deadline) = r.full_ack_deadline() {
+            expected = expected.min(deadline);
         }
         if let Some(at) = r.loss.next_due(r.now, r.timing()) {
             expected = expected.min(at);

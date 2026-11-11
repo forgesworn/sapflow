@@ -140,6 +140,68 @@ private final class PublisherHarness {
 }
 
 final class V4vObservedPublisherTests: XCTestCase {
+    func testSRTRecoveryWiringPreservesIndependentMediaAndGrantBounds() throws {
+        let destination = try ManualSrtDestination(endpoint: "srt://192.0.2.10:9000", streamID: "generated-only", passphrase: "", allowPlaintext: true)
+        let scoped = try SrtPublishingLimits.scoped(maxQueueBytes: 65_536, maxPublishBps: 4_000_000)
+        for limits in [SrtPublishingLimits.manual, scoped] {
+            for request: UInt32 in [120, 801, 1000] {
+                let policy = try SrtRecoveryPolicy(requestedLatencyMs: request)
+                let sink = ManualSrtPublisher(destination: destination, limits: limits, recoveryPolicy: policy)
+                let config = sink.nativeConfig
+                XCTAssertEqual(config.latencyMs, request)
+                XCTAssertEqual(config.maxPacketAgeMs, policy.maxPacketAgeMs)
+                XCTAssertEqual(config.maxSampleResidenceMs, 1000)
+                XCTAssertEqual(config.maxBufferedPackets, 128)
+                XCTAssertEqual(config.maxBufferedBytes, limits.queueBytes)
+                XCTAssertEqual(config.bandwidthBytesPerSecond, limits.bandwidthBytesPerSecond)
+                XCTAssertEqual(sink.recoverySnapshot.requestedLatencyMs, request)
+                XCTAssertNil(sink.recoverySnapshot.negotiatedLatencyMs)
+                XCTAssertTrue(sink.cleanupComplete) // Prepared constructor remains dormant.
+            }
+        }
+        let defaultSink = ManualSrtPublisher(destination: destination)
+        XCTAssertEqual(defaultSink.nativeConfig.latencyMs, 1000)
+        XCTAssertEqual(defaultSink.nativeConfig.maxPacketAgeMs, 1250)
+    }
+
+    func testSRTDiagnosticsOnlyRecordActualConnectedAndDoNotCapPeerLatency() {
+        var facts = SrtRecoveryDiagnostics(policy: .mobile)
+        facts.observe(.sending); facts.observe(.peerMediaProgress)
+        XCTAssertNil(facts.negotiatedLatencyMs)
+        facts.observe(.connected(latencyMs: 2000, maxPayloadBytes: 1316))
+        XCTAssertEqual(facts.negotiatedLatencyMs, 2000)
+        XCTAssertEqual(facts.requestedLatencyMs, 1000)
+        XCTAssertEqual(facts.maxPacketAgeMs, 1250)
+        facts.observe(.sending)
+        XCTAssertEqual(facts.negotiatedLatencyMs, 2000)
+        let successor = SrtRecoveryDiagnostics(policy: .mobile)
+        XCTAssertNil(successor.negotiatedLatencyMs)
+    }
+
+    func testSRTRecoveryPolicySurvivesActualReconnectFactoryReplacement() throws {
+        let destination = try ManualSrtDestination(endpoint: "srt://192.0.2.10:9000", streamID: "generated-only", passphrase: "", allowPlaintext: true)
+        for policy in [SrtRecoveryPolicy.mobile, try SrtRecoveryPolicy(requestedLatencyMs: 120)] {
+            let sinks = PublisherBox<[PublisherTransport]>([])
+            let snapshots = PublisherBox<[SrtRecoveryDiagnostics]>([])
+            let logical = try ReconnectingPublisher(source: .srtPeerAcknowledgedWatermark, hasVideo: false) { observe in
+                // Construct the real dormant SRT owner on each SDK attempt;
+                // simulated transport events avoid opening any socket here.
+                let prepared = ManualSrtPublisher(destination: destination, hasVideo: false, recoveryPolicy: policy)
+                snapshots.update { $0.append(prepared.recoverySnapshot) }
+                let sink = PublisherTransport(observe)
+                sinks.update { $0.append(sink) }
+                return sink
+            }
+            defer { logical.endDestination() }
+            try logical.start()
+            try logical.configure(video: nil, audio: MediaCodec.aac(asc: Data([0x11, 0x88])))
+            until { sinks.value.count == 1 }
+            sinks.value[0].emit(.failed)
+            until { sinks.value.count == 2 }
+            XCTAssertEqual(snapshots.value, [SrtRecoveryDiagnostics(policy: policy), SrtRecoveryDiagnostics(policy: policy)])
+        }
+    }
+
     func testQueuedNativeAndUserSpaceOutputRefuseExpiredGrantWithoutTimerOrOwnerWake() throws {
         let clock = PublisherBox<UInt64>(1), expires: UInt64 = 60_000_000_000
         let lifetime = try V4vPublishingLifetime(V4vPublishingGrantPermit(

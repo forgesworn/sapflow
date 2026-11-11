@@ -31,6 +31,7 @@ internal class SrtPublishingSink(
     private val pacingBytesPerSecond: ULong = 1_250_000uL,
     private val intent: CaptureIntent = CaptureIntent.DEFAULT,
     private val authority: PublishingAuthority? = null,
+    private val recoveryPolicy: SrtRecoveryPolicy = SrtRecoveryPolicy(),
 ) : EncodedSink, SocketOutputProvider {
     private val outputCounter = SocketOutputCounter(SocketOutputAccounting.SRT_DATAGRAM)
     override val socketOutput: SocketOutputSource get() = outputCounter
@@ -46,7 +47,11 @@ internal class SrtPublishingSink(
     @Volatile private var worker: Thread? = null
     private val shutdown = SrtShutdown()
     private val shutdownResult = AtomicReference<SrtShutdown.Result?>()
-    override val diagnostics: String get() = "SRT pacer ${pacingBytesPerSecond} B/s · shutdown ${shutdownResult.get()?.name ?: "not requested"}"
+    private val negotiatedLatencyMs = AtomicReference<UInt?>(null)
+    override val diagnostics: String get() {
+        val negotiated = negotiatedLatencyMs.get()?.let { "$it ms" } ?: "pending"
+        return "SRT pacer ${pacingBytesPerSecond} B/s · latency requested ${recoveryPolicy.requestedLatencyMs} ms · negotiated $negotiated · shutdown ${shutdownResult.get()?.name ?: "not requested"}"
+    }
     private val timers = ScheduledThreadPoolExecutor(1) { task -> Thread(task, "sapflow-srt-deadline") }.apply { removeOnCancelPolicy = true }
     private val lifecycle = ExplicitAttempt(::startNetwork, ::closeNetwork)
 
@@ -80,6 +85,22 @@ internal class SrtPublishingSink(
         } catch (error: Exception) { fail("SRT attempt stopped: ${error.javaClass.simpleName} · capture can continue") }
     }
 
+    /** Built afresh for this attempt; peer negotiation does not mutate its bounds. */
+    internal fun nativeConfig() = NativeSrtConfig(
+        destination = destination.nativeAddress, streamId = streamId,
+        cipher = if (plaintext) null else NativeSrtCipher.AES256,
+        latencyMs = recoveryPolicy.requestedLatencyMs.toUInt(), maxBufferedPackets = 128u,
+        maxBufferedBytes = 4u * 1024u * 1024u, maxPacketAgeMs = recoveryPolicy.maxPacketAgeMs.toUInt(),
+        maxSampleResidenceMs = 1000u, bandwidthBytesPerSecond = pacingBytesPerSecond,
+    )
+
+    /** Called only for the native Connected event on the UDP worker. */
+    internal fun connected(event: NativeSrtEvent.Connected) {
+        negotiatedLatencyMs.set(event.latencyMs)
+        message.set("SRT ${if (plaintext) "plaintext lab" else "AES-256"} handshake complete · media delivery unconfirmed")
+        events(PublishingAttemptEvent.Accepted)
+    }
+
     private fun runNetwork(configureDeadlineUs: Long) {
         var native: NativeSrtPublisher? = null
         var alarm: ScheduledFuture<*>? = null
@@ -103,13 +124,7 @@ internal class SrtPublishingSink(
                     check(now < configureDeadlineUs) { "SRT codec configuration deadline exceeded" }
                     val descriptors = codecs.get()
                     if (intent.codecsReady(descriptors.video != null, descriptors.audio != null)) {
-                        val config = NativeSrtConfig(
-                            destination = destination.nativeAddress, streamId = streamId,
-                            cipher = if (plaintext) null else NativeSrtCipher.AES256,
-                            latencyMs = 120u, maxBufferedPackets = 128u,
-                            maxBufferedBytes = 4u * 1024u * 1024u, maxPacketAgeMs = 1000u,
-                            maxSampleResidenceMs = 1000u, bandwidthBytesPerSecond = pacingBytesPerSecond,
-                        )
+                        val config = nativeConfig()
                         val pass = secret.getAndSet(null)
                         try { native = NativeSrtPublisher(config, descriptors.video, descriptors.audio, pass, now.toULong()) }
                         finally { pass?.fill(0) }
@@ -178,10 +193,7 @@ internal class SrtPublishingSink(
                     // Drain after bounded work, before sleeping on readiness.
                     for (index in 0 until 16) {
                         when (val event = publisher.pollEvent()) {
-                            is NativeSrtEvent.Connected -> {
-                                message.set("SRT ${if (plaintext) "plaintext lab" else "AES-256"} handshake complete · media delivery unconfirmed")
-                                events(PublishingAttemptEvent.Accepted)
-                            }
+                            is NativeSrtEvent.Connected -> connected(event)
                             NativeSrtEvent.Sending -> events(PublishingAttemptEvent.Sending)
                             NativeSrtEvent.PeerMediaProgress -> events(PublishingAttemptEvent.PeerMediaProgress(PeerProgressSource.SRT))
                             is NativeSrtEvent.Closed -> error("SRT closed: ${event.reason}")

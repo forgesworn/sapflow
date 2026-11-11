@@ -146,10 +146,25 @@ func run() throws {
         if isVideo { videoPackets += 1; v = try video.next() } else { audioPackets += 1; a = try audio.next() }
     }
     if useSrt {
-        // SRT explicit stop is cancellation, so let the paced fixture's final
-        // datagrams complete first. This wait is only in the desktop driver.
-        Thread.sleep(forTimeInterval: 0.25)
-        try check(!sink.status.contains("recording continues"), "SRT failed while draining fixture tail")
+        // Stop cancels queued media. Let this finite desktop fixture's tail
+        // reach its negotiated receive time before testing that cancellation.
+        // The receiver must still independently prove full frame count/decode.
+        guard let srt = sink as? ManualSrtPublisher,
+              let negotiatedMs = srt.recoverySnapshot.negotiatedLatencyMs else {
+            throw CaptureFailure(message: "SRT fixture has no negotiated latency diagnostic")
+        }
+        try check((1...4750).contains(negotiatedMs), "SRT fixture negotiated latency exceeds its settling bound")
+        let settleMs = negotiatedMs + 250
+        let settleStart = ProcessInfo.processInfo.systemUptime
+        let settleDeadline = settleStart + Double(settleMs) / 1000
+        while true {
+            try check(!sink.status.contains("recording continues"), "SRT failed while settling fixture tail")
+            let remaining = settleDeadline - ProcessInfo.processInfo.systemUptime
+            if remaining <= 0 { break }
+            Thread.sleep(forTimeInterval: min(0.02, remaining))
+        }
+        let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - settleStart) * 1000)
+        print("SRT fixture settle: requestedMs=\(srt.recoverySnapshot.requestedLatencyMs), negotiatedMs=\(negotiatedMs), settleMs=\(settleMs), elapsedMs=\(elapsedMs). Stop remains cancellation; receiver frame count/decode is independent.")
     }
     let stopped = DispatchGroup()
     // Rotation must await actual transport teardown. Repeated stop requests

@@ -1,5 +1,20 @@
 enum SrtPublishingLimitFailure: Error { case invalid }
 
+/// Mobile recovery trades a longer receive buffer for more time to repair loss.
+/// Packet retention follows the public SRT draft section 4.6 recommendation,
+/// bounded independently of any larger latency requested by the peer.
+struct SrtRecoveryPolicy: Equatable {
+    let requestedLatencyMs: UInt32
+    var maxPacketAgeMs: UInt32 { max(1000, (requestedLatencyMs * 5 + 3) / 4) }
+    static let mobile = SrtRecoveryPolicy(validatedLatencyMs: 1000)
+
+    init(requestedLatencyMs: UInt32) throws {
+        guard (1...1000).contains(requestedLatencyMs) else { throw SrtPublishingLimitFailure.invalid }
+        self.init(validatedLatencyMs: requestedLatencyMs)
+    }
+    private init(validatedLatencyMs: UInt32) { requestedLatencyMs = validatedLatencyMs }
+}
+
 /// Wire pacing is bytes per second; the scoped grant is bits per second.
 /// A scoped destination can only reduce the existing manual transport caps.
 struct SrtPublishingLimits: Equatable {
