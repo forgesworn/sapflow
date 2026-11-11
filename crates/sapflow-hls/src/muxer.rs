@@ -437,6 +437,9 @@ pub struct Muxer {
     /// Ingest dropped video after transport damage, so the next gap is
     /// frames it withheld on a timeline that is still intact.
     hold_gap: bool,
+    /// The live window lists less than three target durations because the
+    /// byte cap forced a removal (see [`Muxer::window_byte_capped`]).
+    window_byte_capped: bool,
 }
 
 impl Muxer {
@@ -588,6 +591,7 @@ impl Muxer {
             discontinuity_sequence: 0,
             breaks: 0,
             hold_gap: false,
+            window_byte_capped: false,
         }
     }
 
@@ -628,6 +632,7 @@ impl Muxer {
             discontinuity_sequence,
             breaks,
             hold_gap,
+            window_byte_capped,
         } = self;
         let pending = |p: &Option<Pending>| {
             p.as_ref()
@@ -696,12 +701,21 @@ impl Muxer {
              {media_sequence} {parts:?} {next_segment:?} {part:?} {next_part_id} \
              {timing:?} {learning:?} {target:?} {offset} {rebase_to:?} \
              {presented_end:?} {audio_floor} {discontinuity_next} \
-             {discontinuity_sequence} {breaks} {hold_gap}",
+             {discontinuity_sequence} {breaks} {hold_gap} {window_byte_capped}",
             init.id,
             init.data.len(),
             pending(pending_video),
             pending(pending_audio),
         ) + &format!(" {:?}", fragment_quota.as_ref().map(|q| q.used()))
+    }
+
+    /// Whether the live window now lists less than three target durations
+    /// because its 64 MiB byte cap forced a removal (RFC 8216bis 6.2.2 gives
+    /// way to the cap). A playlist cannot show this, unlike the entry cap,
+    /// which shows as [`MAX_WINDOW_ENTRIES`] entries listed: pass it to
+    /// [`crate::playlist::RuleCheck::check_with_byte_cap`].
+    pub fn window_byte_capped(&self) -> bool {
+        self.window_byte_capped
     }
 
     /// The current video configuration, or `None` for an audio-only epoch.
@@ -2077,10 +2091,15 @@ impl Muxer {
             // segments far shorter than the target (reconnecting or
             // stalling over and over) needs more, and holding without
             // bound would let it grow the window and every render.
-            let capped = self.entries.len() > MAX_WINDOW_ENTRIES.max(self.cfg.segment_count)
-                || extra_bytes > MAX_EXTRA_WINDOW_BYTES;
-            if listed < floor && !capped {
+            let entry_capped = self.entries.len() > MAX_WINDOW_ENTRIES.max(self.cfg.segment_count);
+            let byte_capped = extra_bytes > MAX_EXTRA_WINDOW_BYTES;
+            if listed < floor && !entry_capped && !byte_capped {
                 break;
+            }
+            // A render shows the entry cap (that many entries) but not the
+            // byte cap: say so when only the byte cap cut the window short.
+            if listed < floor && byte_capped && !entry_capped {
+                self.window_byte_capped = true;
             }
             if let Some(Entry::Segment(old)) = self.entries.pop_front() {
                 for _ in 0..old.parts.len() {
@@ -2091,6 +2110,14 @@ impl Muxer {
                 }
             }
             self.media_sequence += 1;
+        }
+        if self.window_byte_capped {
+            let listed: u64 = self
+                .entries
+                .iter()
+                .map(|e| crate::playlist::extinf_units(e.duration()))
+                .sum();
+            self.window_byte_capped = listed < floor;
         }
         if self.target.is_none() {
             let t = TargetDuration::for_first_segment(duration);

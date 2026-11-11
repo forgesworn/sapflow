@@ -282,9 +282,11 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
 ///   in audio-only, and holds video to the stricter rule Apple's players
 ///   were built against;
 /// - once segments have been removed (`EXT-X-MEDIA-SEQUENCE` above 0), the
-///   segments listed last at least three target durations (6.2.2), unless
-///   the render lists [`crate::muxer::MAX_WINDOW_ENTRIES`] entries or more,
-///   the muxer's cap;
+///   segments listed last at least three target durations (6.2.2's segment
+///   rule), unless the render lists [`crate::muxer::MAX_WINDOW_ENTRIES`]
+///   entries or more, the muxer's entry cap, or the caller says the muxer's
+///   byte cap cut it ([`RuleCheck::check_with_byte_cap`],
+///   [`crate::Muxer::window_byte_capped`]);
 /// - an `EXT-X-DISCONTINUITY` sits before a segment's parts, never among
 ///   them, and every media sequence number keeps one discontinuity
 ///   sequence number from render to render.
@@ -329,6 +331,14 @@ impl RuleCheck {
     /// sequence number points at) are held against the renders seen by earlier
     /// calls.
     pub fn check(&mut self, pl: &str) -> Result<(), String> {
+        self.check_with_byte_cap(pl, false)
+    }
+
+    /// [`RuleCheck::check`] for a render whose muxer says its byte cap cut
+    /// the window short ([`crate::Muxer::window_byte_capped`]), which the
+    /// render cannot show: then a window under three target durations is
+    /// accepted.
+    pub fn check_with_byte_cap(&mut self, pl: &str, byte_capped: bool) -> Result<(), String> {
         let tag = |name: &str| pl.lines().find_map(|l| l.strip_prefix(name));
         let part_target = fixed5(tag("#EXT-X-PART-INF:PART-TARGET=").ok_or("no PART-TARGET")?)?;
         let target: u64 = tag("#EXT-X-TARGETDURATION:")
@@ -426,6 +436,7 @@ impl RuleCheck {
             }
         }
         if !self.no_live_window
+            && !byte_capped
             && first_msn > 0
             && listed < target * 3 * 100_000
             && entries < crate::muxer::MAX_WINDOW_ENTRIES
@@ -707,6 +718,11 @@ mod tests {
         let cap = crate::muxer::MAX_WINDOW_ENTRIES;
         assert_eq!(RuleCheck::default().check(&many(cap)), Ok(()));
         assert!(RuleCheck::default().check(&many(cap - 1)).is_err());
+        // The byte cap does not show in a render: the muxer's signal says so.
+        assert_eq!(
+            RuleCheck::default().check_with_byte_cap(&thin, true),
+            Ok(())
+        );
     }
 
     #[test]

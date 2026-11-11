@@ -170,10 +170,25 @@ fn the_byte_cap_bounds_what_the_window_holds_beyond_its_count() {
     let payload = Bytes::from(vec![0u8; 2 << 20]);
     let mut pts = 0;
     let mut most_extra = 0usize;
+    // RuleCheck with the muxer's byte-cap signal accepts every render;
+    // without it, the cut-short window is refused.
+    let (mut signalled, mut plain) = (
+        playlist::RuleCheck::default(),
+        playlist::RuleCheck::default(),
+    );
+    let (mut refused_plain, mut capped) = (false, false);
     for _ in 0..120 {
         m.push_audio_at(pts, payload.clone(), NOW).expect("AAC");
         pts += 1920;
         m.interrupt(NOW);
+        if m.has_content() {
+            let pl = playlist::media(&m, "w");
+            signalled
+                .check_with_byte_cap(&pl, m.window_byte_capped())
+                .expect("with the muxer's signal");
+            refused_plain |= plain.check(&pl).is_err();
+            capped |= m.window_byte_capped();
+        }
         let extra: usize = m
             .entries()
             .iter()
@@ -191,6 +206,7 @@ fn the_byte_cap_bounds_what_the_window_holds_beyond_its_count() {
     );
     assert!(m.entries().len() < crate::muxer::MAX_WINDOW_ENTRIES);
     assert!(most_extra <= 64 << 20, "{most_extra}");
+    assert!(capped && refused_plain, "the byte cap cut the window short");
 }
 
 /// The review's mixed-epoch case: A/V Opus, then a reconnect as audio-only
