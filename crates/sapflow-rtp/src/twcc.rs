@@ -310,9 +310,13 @@ fn encode(
     let mut fci = Vec::with_capacity(size - 12);
     fci.extend_from_slice(&(base as u16).to_be_bytes());
     fci.extend_from_slice(&((last + 1 - base) as u16).to_be_bytes());
-    // 24 bits, signed in the draft; sapflow's time base starts at zero, so
-    // it wraps after 2^24 * 64 ms (about 12.4 days), which the sender reads
-    // modulo 2^24.
+    // 24 bits, signed in the draft, in a time base of the receiver's
+    // choosing. sapflow's starts at zero when the receiver is made and
+    // counts up, written as its low 24 bits: two's complement, so a signed
+    // reader sees it pass from 2^23 - 1 to -2^23 after about 6.2 days and
+    // keep counting up from there, one step per 64 ms, as a wrapping
+    // counter does. Only differences between reference times mean anything
+    // to the sender.
     let reference = (reference & 0x00ff_ffff) as u32;
     fci.extend_from_slice(&(reference << 8 | u32::from(fb_count)).to_be_bytes());
     encode_chunks(&runs, &mut fci);
@@ -757,6 +761,24 @@ mod tests {
         let f = feed(&mut r, &[(2, wrap + 70 * MS)], wrap + 100 * MS);
         assert_eq!(f[0].reference, 1, "64 ms after the wrap");
         assert_eq!(f[0].statuses, [Status::Small(24)], "70 - 64 = 6 ms");
+    }
+
+    /// Read as the draft's signed 24-bit field, the reference time steps by
+    /// one 64 ms unit across the signed limit (about 6.2 days in) as
+    /// anywhere else.
+    #[test]
+    fn the_reference_time_reads_as_signed_across_its_limit() {
+        let signed = |r: u32| ((r << 8) as i32) >> 8;
+        let mut r = Recorder::new(TransportCcConfig::new(3));
+        let edge = (1u64 << 23) * REFERENCE_US;
+        let a = feed(&mut r, &[(1, edge - REFERENCE_US)], edge);
+        let b = feed(&mut r, &[(2, edge)], edge + 10 * MS);
+        assert_eq!(
+            (signed(a[0].reference), signed(b[0].reference)),
+            ((1 << 23) - 1, -(1 << 23))
+        );
+        // The sender's difference, modulo 2^24, is one unit.
+        assert_eq!(b[0].reference.wrapping_sub(a[0].reference) & 0xff_ffff, 1);
     }
 
     #[test]
