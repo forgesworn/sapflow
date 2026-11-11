@@ -914,6 +914,7 @@ const RUNS: &[&str] = &[
     "gcm-drop",
     "cm80-mtu300-drop",
     "gcm-cookie",
+    "gcm-drop-final",
 ];
 
 /// The seed `tests/openssl_interop.sh` passes for port 47010.

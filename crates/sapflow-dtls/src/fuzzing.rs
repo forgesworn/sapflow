@@ -153,8 +153,7 @@ fn fixed_identity() -> Arc<Identity> {
     testing::identity(1)
 }
 
-/// The OpenSSL run whose datagrams `dtls_server` mode bit 5 accepts.
-const INTEROP_KEYS: &str = include_str!("../tests/fixtures/openssl/gcm.keys");
+/// The seed `tests/openssl_interop.sh` gives the server on port 47010.
 const INTEROP_SEED: [u8; 32] = {
     let mut s = *b"SaplowDTDSOpenSSLInterop\0\0\0\0\0\0\0\0";
     s[31] = 0x10;
@@ -281,8 +280,9 @@ impl Harness {
 /// - bit 2: the client offers only `SRTP_AES128_CM_HMAC_SHA1_80`;
 /// - bit 3: the client fragments to 90-byte datagrams;
 /// - bit 4: the server expects another fingerprint;
-/// - bit 5: the server is the seeded OpenSSL interop server, expecting the
-///   `gcm` run's client certificate (so op 0 can replay OpenSSL's flights).
+/// - bit 5: the server is the seeded OpenSSL interop server, and the next 32
+///   bytes are the fingerprint it expects (so op 0 can replay a recorded
+///   OpenSSL run's flights).
 ///
 /// Then steps of `[op, u16 length, bytes]`, op modulo 8: 0 a raw datagram;
 /// 1 the next client datagram with `(u16 position, xor)` mutations; 2 drop
@@ -292,9 +292,18 @@ impl Harness {
 /// `bytes[0]`, body the rest) once the client has keys; 7 the next client
 /// datagram twice.
 pub fn dtls_server(data: &[u8]) -> Reached {
-    let Some((&mode, script)) = data.split_first() else {
+    let Some((&mode, mut script)) = data.split_first() else {
         return Reached::Nothing;
     };
+    let interop = mode & 32 != 0;
+    let mut interop_peer = Fingerprint::from_bytes([0; 32]);
+    if interop {
+        let Some((fp, rest)) = script.split_first_chunk::<32>() else {
+            return Reached::Nothing;
+        };
+        interop_peer = Fingerprint::from_bytes(*fp);
+        script = rest;
+    }
     let config = Config {
         hello_verify: mode & 1 != 0,
         mtu: if mode & 2 != 0 { 256 } else { 1200 },
@@ -308,14 +317,8 @@ pub fn dtls_server(data: &[u8]) -> Reached {
         ..Options::default()
     };
     let client = Client::new(options, testing::identity(2), 3);
-    let interop = mode & 32 != 0;
     let (identity, seed, expected) = if interop {
-        let fp = INTEROP_KEYS.lines().next().and_then(Fingerprint::parse_sdp);
-        (
-            interop_identity(),
-            INTEROP_SEED,
-            fp.expect("fixture fingerprint"),
-        )
+        (interop_identity(), INTEROP_SEED, interop_peer)
     } else if mode & 16 != 0 {
         (
             testing::identity(1),

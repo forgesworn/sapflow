@@ -7,12 +7,14 @@
 //! cargo run -p sapflow-dtls --features testing --example udp_server -- \
 //!     --bind 127.0.0.1:47010 --expect <client sha-256 fingerprint> \
 //!     [--seed <64 hex>] [--mtu <bytes>] [--hello-verify] \
-//!     [--drop-first-flight] [--record <file>]
+//!     [--drop-first-flight] [--drop-final-flight] [--record <file>]
 //! ```
 //!
 //! `--seed` makes the identity and the server's randomness reproducible, so
 //! a `--record`ed run replays offline byte for byte. `--drop-first-flight`
-//! discards our first flight once, to exercise both sides' retransmission.
+//! discards our first flight once, to exercise both sides' retransmission;
+//! `--drop-final-flight` discards our ChangeCipherSpec and Finished once, so
+//! the client must retransmit its flight and we must answer it.
 //! Bind to loopback only.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -41,6 +43,7 @@ fn main() {
     let mut seed = None;
     let mut config = Config::default();
     let mut drop_first = false;
+    let mut drop_final = false;
     let mut record = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -55,6 +58,7 @@ fn main() {
             "--mtu" => config.mtu = args.next().expect("mtu").parse().expect("mtu"),
             "--hello-verify" => config.hello_verify = true,
             "--drop-first-flight" => drop_first = true,
+            "--drop-final-flight" => drop_final = true,
             "--record" => record = Some(std::fs::File::create(args.next().expect("file")).unwrap()),
             other => panic!("unknown argument {other}"),
         }
@@ -123,6 +127,14 @@ fn main() {
                 }
             }
             Err(e) => panic!("recv: {e}"),
+        }
+        // Our final flight goes out in the same call that connects.
+        if drop_final && server.state() == State::Connected {
+            println!("dropping our final flight");
+            drop_final = false;
+            while let Some(d) = server.poll_transmit() {
+                log("D", &d);
+            }
         }
         while let Some(d) = server.poll_transmit() {
             if drop_first {

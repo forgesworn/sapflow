@@ -246,6 +246,16 @@ fn write_seeds() {
     write("dtls_handshake_messages", "fingerprint", &fp);
 
     let mut s = vec![32];
+    let keys = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/openssl/gcm.keys"),
+    )
+    .expect("keys");
+    let fp = keys
+        .lines()
+        .next()
+        .and_then(Fingerprint::parse_sdp)
+        .expect("fingerprint");
+    s.extend_from_slice(fp.as_bytes());
     for g in openssl_datagrams("gcm", 'C') {
         push_step(&mut s, 0, &g);
     }
