@@ -801,11 +801,11 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
 
   Parts kept for segments that have left the window are bounded at 64 MiB
   and 4,096 parts (`muxer::MAX_RETAINED_PARTS`); past either, the oldest
-  go early. They keep their fragment-budget charge: a part encode the
-  budget refuses first frees them all and tries again, so this stream's
-  retention never causes a refusal of its own media. Another stream cannot
-  reclaim them, so each stream can hold up to 64 MiB more of the shared
-  budget than before. `Muxer::parts_released_early()` counts every part
+  go early. They keep their fragment-budget charge. A part encode the
+  budget refuses first frees them all and tries once more; that returns
+  only the bytes no viewer still holds, and a new codec epoch's init is not
+  retried. Another stream cannot reclaim them, so each stream can hold up
+  to 64 MiB more of the shared budget than before. `Muxer::parts_released_early()` counts every part
   that went early, and `playlist::RetentionCheck` holds a muxer to the rule
   given that count; the `muxer_timing` and `opus_packaging` fuzz targets
   run it after every push.

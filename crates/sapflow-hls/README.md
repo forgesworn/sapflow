@@ -28,7 +28,7 @@ live media server. MIT.
   rule holds in media time: `Muxer::part` keeps serving a part for three
   target durations of published media after the playlist stops listing it,
   up to 64 MiB and `muxer::MAX_RETAINED_PARTS` (4,096) parts beyond the
-  window; past either, or when the fragment budget refuses new media, the
+  window; past either, or when the fragment budget refuses a new part, the
   oldest go early and `Muxer::parts_released_early` counts them. A segment
   itself is not served once it leaves the window, one segment duration
   short of 6.2.2's availability rule for segments.
