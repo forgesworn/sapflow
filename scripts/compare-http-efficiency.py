@@ -165,8 +165,9 @@ def main():
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if not 5 <= args.seconds <= 60 or not 2 <= args.pairs <= 6 or not 1 <= args.threads <= 8:
-        parser.error("bounded screening requires seconds 5..60, pairs 2..6 and threads 1..8")
+    if (not 5 <= args.seconds <= 60 or args.pairs not in (2, 4, 6)
+            or not 1 <= args.threads <= 8):
+        parser.error("bounded screening requires seconds 5..60, pairs 2/4/6 and threads 1..8")
     if args.output.exists():
         parser.error("refusing to overwrite an existing result")
     if any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value)
