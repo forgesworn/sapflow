@@ -119,6 +119,7 @@ impl Reorder {
     }
 
     /// Packets and bytes held.
+    #[cfg(any(test, feature = "testing"))]
     pub fn held(&self) -> (usize, usize) {
         (self.slots.len() - self.missing, self.bytes)
     }
@@ -146,6 +147,7 @@ impl Reorder {
     }
 
     /// Whether `seq` (16-bit) is a gap being waited for.
+    #[cfg(any(test, feature = "testing"))]
     pub fn is_missing(&self, seq: u16) -> bool {
         if !self.started {
             return false;
