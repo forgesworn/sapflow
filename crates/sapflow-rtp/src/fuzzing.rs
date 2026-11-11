@@ -22,6 +22,7 @@
     clippy::indexing_slicing
 )]
 
+pub mod feedback;
 pub mod media;
 
 use crate::rtcp::{Compound, Packet, build};

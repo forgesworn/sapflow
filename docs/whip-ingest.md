@@ -543,11 +543,27 @@ is wanted without a downstream converter, this decision is revisited.
   Opus uses 48 kHz, converted to 90 kHz.
 - RTCP sender reports map each stream's RTP clock to the sender's wall clock.
   At start, media is held until both streams' first sender reports arrive, for
-  at most 1.5 s (proposed). After that, the stream falls back to aligning by
-  arrival time and says so in its health.
-- After start, timestamps advance by RTP deltas. Later sender reports check
-  for drift. A jump beyond a bound is treated as a discontinuity, the way a
-  resumed encoder is today.
+  at most 1.5 s (proposed), 4 MiB of media or half the event queue. After
+  that, or if the reports disagree with arrival times by more than 500 ms,
+  the streams are aligned by arrival time. `sapflow-rtp` says which, and why,
+  in an `Aligned` event before the first frame.
+- After start, timestamps advance by RTP deltas, strictly increasing, and
+  stay within 500 ms (`max_lead`) of arrival time either way, plus 0.1% of
+  elapsed time up to another 500 ms. A little above that bound a timestamp is
+  held to it; a timestamp that does not advance continues by arrival time.
+- Later sender reports are used only in agreeing pairs (same rate within
+  0.1% and 1 ms) at least 500 ms apart, so forged or alternating reports are
+  ignored. An error within 500 ms, or a stream ahead by any amount, is
+  slewed at up to 500 ppm, never backwards and with no discontinuity; this
+  follows a sender's audio clock drifting against its NTP clock. Video
+  slews the part of its error audio does not share at up to 5%, so a video
+  RTP jump of 900 ms is back in sync within 20 s. Only a step forward of
+  more than 500 ms, or a timestamp that jumps back, jumps ahead of or falls
+  behind arrival time by more than that, is treated as a discontinuity,
+  the way a resumed encoder is today.
+- A sender whose timestamps crawl can cause about one discontinuity a
+  second, so the server merges or rate-limits discontinuity epochs rather
+  than starting one per event.
 
 ### Keyframes
 
@@ -597,8 +613,15 @@ publish from a browser should hold resolution and let frame rate drop instead
 ### Congestion feedback
 
 Sapflow sends RTCP receiver reports (RFC 3550) for each stream it receives,
-at the usual RTCP interval and in compound packets with its NACK, PLI and any
-other feedback. Senders use them for loss-based rate control.
+every second, fixed rather than RFC 3550's randomised interval (a WHIP
+session has one sender and one receiver, so there is nothing to fall into
+step with), and in compound packets with its NACK, PLI and any other
+feedback, at most 1200 bytes each. Senders use them for loss-based rate
+control. Each sequence number counts once. Packets repaired over RTX still
+count as lost, so the reports give loss before repair, as rate control needs
+(RFC 4588 section 7) and as transport-cc does; OBS, which resends on the
+original SSRC, gets loss after repair. RTX streams get no report blocks of
+their own.
 
 A browser sets its bitrate from the receiver's feedback. Without feedback it
 may stay at a low starting rate. W0 measures, for each browser target, how
@@ -670,6 +693,10 @@ There is no ICE restart in v1.
   - offer size;
   - packet size (1500 bytes for UDP, 1500 per RFC 4571 frame);
   - reorder buffer packets and bytes per stream;
+  - the start hold's bytes and time, and the event queue;
+  - RTCP datagram size, and queued feedback (256 packets);
+  - transport-cc packets awaiting feedback (1024) and feedback packet size
+    (1000 bytes);
   - DTLS handshake message size and number of flights;
   - TCP connections per address;
   - and the existing publisher and presentation caps.
@@ -787,7 +814,9 @@ instead of observed.
   exactly the withheld packets' frames. Fails if any access unit differs, or
   if loss is reported for a delivered packet.
 - **A1.3 Fuzzing.** RTP, RTCP, SRTP unprotect, both depacketisers and the
-  Opus TOC parser each have a fuzz target. Each target:
+  Opus TOC parser each have a fuzz target, as do the receiver
+  (`reorder_nack`), its report statistics (`rr_stats`), transport-cc
+  (`twcc_feedback`) and the timeline (`sr_timeline`). Each target:
   - starts from a seed corpus built from the W0 captures;
   - runs in CI under the existing 60 s and nightly regime;
   - has a coverage report showing it reaches the parser past its length

@@ -247,6 +247,10 @@ fn receiver_config(mode: u8) -> ReceiverConfig {
     if mode & 8 != 0 {
         cfg.h264 = small_h264();
     }
+    if mode & 16 == 0 {
+        // W1b's seeds predate the start hold; `sr_timeline` covers it.
+        cfg.timeline.start_hold = Duration::ZERO;
+    }
     cfg
 }
 
@@ -257,7 +261,8 @@ const AUDIO_SSRC: u32 = 0x3333_3333;
 /// The receiver as the server drives it. A mode byte (bit 0: a 16-packet,
 /// 4000-byte buffer; bit 1: a 50 ms jitter wait and a small NACK
 /// allowance; bit 2: FIR instead of PLI and SSRCs bound from the first
-/// packets; bit 3: small H.264 limits), then records whose first byte
+/// packets; bit 3: small H.264 limits; bit 4: the default 1.5 s start
+/// hold instead of none), then records whose first byte
 /// picks an operation (modulo 6):
 ///
 /// - 0 video and 1 audio: `[op, seq high, seq low, flags, payload]`. Flag
@@ -428,7 +433,7 @@ fn drain(
     events: &mut usize,
 ) -> usize {
     let mut n = 0;
-    while let Some(f) = r.poll_feedback() {
+    while let Some(f) = r.poll_feedback_item() {
         n += 1;
         let mut wire = Vec::new();
         f.write(&mut wire, 1).expect("feedback builds");
@@ -452,6 +457,7 @@ fn drain(
             (Feedback::Pli { .. }, Packet::Pli(_)) | (Feedback::Fir { .. }, Packet::Fir(_)) => {
                 assert_eq!(stream, streams[0], "keyframes for video only");
             }
+            (Feedback::TransportCc { .. }, _) => panic!("transport-cc is not negotiated here"),
             other => panic!("feedback {other:?}"),
         }
     }
@@ -480,7 +486,10 @@ fn drain(
                 *slot = Some(first.wrapping_add(count as u16));
             }
             Event::Discontinuity { stream, .. } => last_lost[stream.index()] = None,
-            Event::IncompleteFrame { .. } | Event::FrameSkipped { .. } | Event::Refused { .. } => {}
+            Event::IncompleteFrame { .. }
+            | Event::FrameSkipped { .. }
+            | Event::Refused { .. }
+            | Event::Aligned { .. } => {}
         }
     }
     n
