@@ -58,11 +58,12 @@ pub struct ReceiverConfig {
     pub max_packets: usize,
     /// Most payload bytes the reorder buffer holds. Default 1 536 000.
     pub max_bytes: usize,
-    /// A forward sequence jump larger than this is a possible restart,
-    /// confirmed by the next packet in sequence; a smaller one is loss.
-    /// Default 3000 (RFC 3550 Appendix A.1's `MAX_DROPOUT`). Backwards,
-    /// the bound is A.1's `MAX_MISORDER`, 100 behind what was released:
-    /// closer is late, further a possible restart.
+    /// A sequence jump larger than this, either way, is a possible
+    /// restart, confirmed by the next packet in sequence; a smaller one is
+    /// loss forward and lateness backward. Default 3000 (RFC 3550 Appendix
+    /// A.1's `MAX_DROPOUT`). A.1's `MAX_MISORDER` is not used backward:
+    /// retransmissions arrive late by design, hundreds of packets behind
+    /// at high packet rates, and must not read as a restart.
     pub max_dropout: u16,
     /// RTT assumed until one is measured. Default 100 ms.
     pub initial_rtt: Duration,
@@ -591,7 +592,6 @@ impl Receiver {
             jitter: micros(c.jitter),
             reorder_delay: micros(c.reorder_delay),
             max_dropout: u64::from(c.max_dropout),
-            max_misorder: 100,
             max_nacks: c.max_nacks,
         };
         let media = match cfg.codec {

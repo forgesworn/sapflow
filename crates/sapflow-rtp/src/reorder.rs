@@ -26,7 +26,6 @@ pub(crate) struct Settings {
     pub jitter: u64,
     pub reorder_delay: u64,
     pub max_dropout: u64,
-    pub max_misorder: u64,
     pub max_nacks: u8,
 }
 
@@ -184,14 +183,18 @@ impl Reorder {
             return Inserted::New;
         }
         let ext = self.extend(seq);
-        // A packet far from the stream may be a restart: more than
-        // MAX_MISORDER (RFC 3550 Appendix A.1, 100) behind what has been
-        // released, or more than MAX_DROPOUT (3000) ahead of the highest.
-        // Forward jumps up to 3000 are taken as loss, since a burst that
-        // long is about a second at a few Mbit/s, which a real network
-        // can lose; backward ones that far cannot be reordering.
+        // A packet more than MAX_DROPOUT (RFC 3550 Appendix A.1, 3000)
+        // from the stream, either way, may be a restart. Forward, a burst
+        // that long is about a second at a few Mbit/s, which a real
+        // network can lose. Backward, A.1's MAX_MISORDER (100) does not
+        // apply here: retransmissions arrive late by design (one NACKed
+        // just before its deadline is answered about an RTT later, which
+        // at 1000 packets a second is hundreds behind), and two of them in
+        // a row must not read as a restart. A same-SSRC restart behind
+        // the stream is rare anyway, since SRTP's replay window refuses
+        // indices it has already seen.
         let far = if ext < self.head {
-            self.head - ext > self.s.max_misorder
+            self.head - ext > self.s.max_dropout
         } else {
             ext > self.highest && ext - self.highest > self.s.max_dropout
         };
@@ -503,7 +506,6 @@ mod tests {
             jitter: 200 * MS,
             reorder_delay: 10 * MS,
             max_dropout: 3000,
-            max_misorder: 100,
             max_nacks: 4,
         }
     }
@@ -720,13 +722,17 @@ mod tests {
         assert_eq!(put(&mut r, 3, 20_000), Inserted::Probe);
         assert_eq!(put(&mut r, 3, 20_001), Inserted::Restart);
         assert_eq!(drain(&mut r, 3), ["restart", "20000", "20001"]);
-        // Up to 100 behind is late; more is a possible restart (RFC 3550
-        // A.1 MAX_MISORDER), and two in a row confirm it.
-        assert_eq!(put(&mut r, 4, 19_902), Inserted::Late, "100 behind");
-        assert_eq!(put(&mut r, 4, 19_901), Inserted::Probe, "101 behind");
-        assert_eq!(put(&mut r, 4, 19_950), Inserted::Late);
-        assert_eq!(put(&mut r, 4, 19_500), Inserted::Probe);
-        assert_eq!(put(&mut r, 4, 19_501), Inserted::Restart);
+        // Late retransmissions, two in a row and hundreds behind, are late
+        // up to 3000 behind, never a restart.
+        assert_eq!(put(&mut r, 4, 19_653), Inserted::Late, "349 behind");
+        assert_eq!(put(&mut r, 4, 19_654), Inserted::Late);
+        assert_eq!(put(&mut r, 4, 17_002), Inserted::Late, "3000 behind");
+        assert_eq!(put(&mut r, 4, 17_003), Inserted::Late);
+        assert_eq!(put(&mut r, 4, 17_001), Inserted::Probe, "3001 behind");
+        // Its successor is within 3000, so it confirms nothing.
+        assert_eq!(put(&mut r, 4, 17_002), Inserted::Late);
+        assert_eq!(put(&mut r, 4, 16_900), Inserted::Probe);
+        assert_eq!(put(&mut r, 4, 16_901), Inserted::Restart);
     }
 
     #[test]

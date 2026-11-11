@@ -88,11 +88,13 @@ Each stream keeps:
   to `jitter` (200 ms, `SAPFLOW_WHIP_JITTER`) from when it was seen, then
   is declared lost (`Event::Lost`, with its sequence numbers). The first
   packets are held for `reorder_delay` (10 ms) in case earlier ones arrive
-  late. Duplicates and packets up to 100 older than what was released
-  (RFC 3550 A.1's `MAX_MISORDER`) are dropped as late. A jump of more
-  than that back, or of more than `max_dropout` (3000, A.1's
-  `MAX_DROPOUT`) forward, is a restart only once the next packet follows
-  it; until then it is set aside, counted against the byte bound. When
+  late. Duplicates and packets older than what was released are dropped
+  as late. A jump of more than `max_dropout` (3000, RFC 3550 A.1's
+  `MAX_DROPOUT`) either way is a restart only once the next packet
+  follows it; until then it is set aside, counted against the byte bound.
+  A.1's `MAX_MISORDER` (100) is not used backward: late retransmissions
+  are often further behind than that, and two in a row must not read as a
+  restart. When
   the buffer is full (`max_packets` 1024, `max_bytes` 1 536 000) it
   releases from the front, declaring what is missing there lost, though
   never for a late packet, and a payload larger than `max_bytes` is

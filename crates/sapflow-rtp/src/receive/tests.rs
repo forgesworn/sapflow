@@ -1354,3 +1354,61 @@ fn keyframes_can_be_asked_for_before_media() {
     feed(&mut r, 1, &pkt(96, 7, 1, 0, true, &[0x41, 0x9a, 1])).expect("taken");
     assert_eq!(r.poll_feedback(), Some(Feedback::Pli { media_ssrc: 7 }));
 }
+
+/// The review's case: 1000 packets a second; 500 and 501 are lost and
+/// NACKed, and their retransmissions arrive 349 packets behind, after
+/// the deadline. They are late, never a restart.
+fn late_retransmissions(rtx: bool) {
+    let mut r = video_only(ReceiverConfig::default(), rtx);
+    let slice = [0x41, 0x9a, 1];
+    let mut late = Vec::new();
+    let mut events = Vec::new();
+    let mut nacked = BTreeSet::new();
+    for seq in 0..1100u16 {
+        if seq != 500 && seq != 501 {
+            let d = pkt(96, 7, seq, u32::from(seq) * 90, true, &slice);
+            feed(&mut r, u64::from(seq), &d).expect("taken");
+        }
+        if seq == 850 {
+            for osn in [500u16, 501] {
+                let d = if rtx {
+                    let mut payload = osn.to_be_bytes().to_vec();
+                    payload.extend_from_slice(&slice);
+                    pkt(97, 8, osn - 400, u32::from(osn) * 90, true, &payload)
+                } else {
+                    pkt(96, 7, osn, u32::from(osn) * 90, true, &slice)
+                };
+                late.push((osn, feed(&mut r, 850, &d).expect("taken").1));
+            }
+        }
+        events.extend(std::iter::from_fn(|| r.poll_event()));
+        for f in std::iter::from_fn(|| r.poll_feedback()) {
+            if let Feedback::Nack { lost, .. } = f {
+                nacked.extend(lost);
+            }
+        }
+    }
+    r.handle_timeout(r.epoch + Duration::from_millis(1500));
+    events.extend(std::iter::from_fn(|| r.poll_event()));
+    assert_eq!(late, [(500, Received::Late), (501, Received::Late)]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::Discontinuity { .. }))
+    );
+    // Loss for exactly the two that missed the deadline, and NACKs for
+    // nothing that was received.
+    assert_eq!(lost_set(&events, 0), BTreeSet::from([500, 501]));
+    assert_eq!(nacked, BTreeSet::from([500, 501]));
+    assert_eq!(r.stats(StreamId(0)).expect("stats").discontinuities, 0);
+}
+
+#[test]
+fn late_retransmissions_on_the_original_ssrc_are_not_a_restart() {
+    late_retransmissions(false);
+}
+
+#[test]
+fn late_retransmissions_over_rtx_are_not_a_restart() {
+    late_retransmissions(true);
+}
