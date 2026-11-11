@@ -1,4 +1,4 @@
-<!doctype html><meta charset="utf-8"><title>W0 loopback</title>
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>W0 loopback</title>
 <script>
 // A0.4 (rate ramp) and A0.7 (Opus parameters): two RTCPeerConnections in one
 // page, answer edited. Provisional: the receiver is a browser.
@@ -69,9 +69,9 @@ function animatedCanvas() {
   return c;
 }
 
+// ?source=camera: the real camera (phones) instead of the animated canvas.
 async function ramp(arm, prefix = '') {
-  const canvas = animatedCanvas();
-  const stream = canvas.captureStream(30);
+  const stream = q.get('source') === 'camera' ? await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false }) : animatedCanvas().captureStream(30);
   const r = await connect(stream, (sdp) => stripFeedback(sdp, { transportCc: arm === 'b' }), {
     beforeOffer(pc1) {
       const tx = pc1.getTransceivers()[0];
@@ -105,7 +105,7 @@ async function ramp(arm, prefix = '') {
   }
   const finalStats = [...(await r.pc1.getStats()).values()].find((x) => x.type === 'outbound-rtp' && x.kind === 'video');
   const result = {
-    arm, freshPage: !!prefix, note: 'provisional loopback: receiver is a browser and still sends RTCP receiver reports',
+    arm, freshPage: !!prefix, source: q.get('source') || 'canvas', note: 'provisional loopback: receiver is a browser and still sends RTCP receiver reports',
     feedbackInAnswer: feedbackLines(r.answerSdp), feedbackInRawAnswer: feedbackLines(r.rawAnswer),
     iceState: [r.pc1.iceConnectionState, r.pc2.iceConnectionState], connectionState: [r.pc1.connectionState, r.pc2.connectionState],
     pairs: [...(await r.pc1.getStats()).values()].filter((x) => x.type === 'candidate-pair' || x.type === 'local-candidate').map((x) => x.type === 'candidate-pair' ? { state: x.state, nominated: x.nominated, bytesSent: x.bytesSent, requestsSent: x.requestsSent, responsesReceived: x.responsesReceived } : { cand: [x.protocol, x.candidateType, x.address && x.address.replace(/[0-9]+/g, 'n')].join(' ') }),
@@ -207,7 +207,7 @@ async function opus(name, params, silent, xform = 'script') {
   if (q.get('gesture')) {
     // Safari starts a WebAudio context suspended without a user gesture: wait for a click on #go.
     if (!document.body) await new Promise((r) => addEventListener('DOMContentLoaded', r));
-    const b = document.createElement('button'); b.id = 'go'; b.textContent = 'start'; b.style.cssText = 'font-size:40px;padding:20px'; document.body.append(b);
+    const b = document.createElement('button'); b.id = 'go'; b.textContent = 'start'; b.style.cssText = 'font-size:40px;padding:20px;width:100%;height:50vh'; document.body.append(b);
     await new Promise((r) => { b.onclick = r; });
   }
   try {

@@ -9,7 +9,7 @@ const ports = require('./ports.js');
 
 const TYPES = { '.m3u8': 'application/vnd.apple.mpegurl', '.m4s': 'video/iso.segment', '.mp4': 'video/mp4', '.html': 'text/html', '.js': 'text/javascript', '.webm': 'audio/webm' };
 
-function startPlayServer({ assetsDir, vendorDir, pagesDir = path.join(__dirname, 'pages'), outDir, range }) {
+function startPlayServer({ assetsDir, vendorDir, pagesDir = path.join(__dirname, 'pages'), outDir, range, host = '127.0.0.1' }) {
   fs.mkdirSync(outDir, { recursive: true });
   const waiters = new Map(), done = new Set(), log = [];
   const server = http.createServer((req, res) => {
@@ -39,7 +39,7 @@ function startPlayServer({ assetsDir, vendorDir, pagesDir = path.join(__dirname,
       fs.createReadStream(file, { start, end }).pipe(res);
     } else { res.writeHead(200, { ...headers, 'Content-Length': st.size }); fs.createReadStream(file).pipe(res); }
   });
-  return ports.listenTcp(server, '127.0.0.1', range).then((port) => ({
+  return ports.listenTcp(server, host, range).then((port) => ({
     port, requests: log,
     waitFor(label, ms) { return new Promise((r) => { if (done.has(label)) return r(true); const t = setTimeout(() => r(false), ms); waiters.set(label, [...(waiters.get(label) || []), () => { clearTimeout(t); r(true); }]); }); },
     close() { server.close(); },

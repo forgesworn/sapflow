@@ -1,0 +1,48 @@
+session: a=group:BUNDLE 0 1; ice-lite=no
+audio section: mid=0 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=actpass rtcp-mux=yes fingerprint=sha-256 ice-options=trickle
+  candidates: none
+  ssrc lines: 2, ssrc-group: none
+  header extensions: ssrc-audio-level, rtp-hdrext/abs-send-time, draft-holmer-rmcat-transport-wide-cc-extensions-01, sdes:mid
+  payloads in offer order:
+    111 opus/48000/2  fmtp: minptime=10;useinbandfec=1  rtcp-fb: transport-cc
+    63 red/48000/2  fmtp: 111/111
+    9 G722/8000
+    0 PCMU/8000
+    8 PCMA/8000
+    13 CN/8000
+    110 telephone-event/48000
+    126 telephone-event/8000
+video section: mid=1 direction=sendonly proto=UDP/TLS/RTP/SAVPF
+  setup=actpass rtcp-mux=yes fingerprint=sha-256 ice-options=trickle
+  candidates: none
+  ssrc lines: 4, ssrc-group: FID 3264906012 3021184236
+  header extensions: toffset, rtp-hdrext/abs-send-time, urn:3gpp:video-orientation, draft-holmer-rmcat-transport-wide-cc-extensions-01, rtp-hdrext/playout-delay, rtp-hdrext/video-content-type, rtp-hdrext/video-timing, rtp-hdrext/color-space, sdes:mid, sdes:rtp-stream-id, sdes:repaired-rtp-stream-id
+  payloads in offer order:
+    96 VP8/90000  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    97 rtx/90000  fmtp: apt=96
+    100 H264/90000  profile-level-id=42001f packetization-mode=1  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    101 rtx/90000  fmtp: apt=100
+    102 H264/90000  profile-level-id=42001f packetization-mode=0  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    103 rtx/90000  fmtp: apt=102
+    104 H264/90000  profile-level-id=42e01f packetization-mode=1  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    107 rtx/90000  fmtp: apt=104
+    108 H264/90000  profile-level-id=42e01f packetization-mode=0  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    109 rtx/90000  fmtp: apt=108
+    114 H264/90000  profile-level-id=4d001f packetization-mode=1  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    115 rtx/90000  fmtp: apt=114
+    39 H264/90000  profile-level-id=4d001f packetization-mode=0  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    40 rtx/90000  fmtp: apt=39
+    45 AV1/90000  fmtp: level-idx=5;profile=0;tier=0  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    46 rtx/90000  fmtp: apt=45
+    98 VP9/90000  fmtp: profile-id=0  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    99 rtx/90000  fmtp: apt=98
+    118 H264/90000  profile-level-id=64001f packetization-mode=1  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    119 rtx/90000  fmtp: apt=118
+    49 H265/90000  fmtp: level-id=123;profile-id=1;tier-flag=0;tx-mode=SRST  rtcp-fb: goog-remb, transport-cc, ccm fir, nack, nack pli
+    50 rtx/90000  fmtp: apt=49
+    122 red/90000
+    123 rtx/90000  fmtp: apt=122
+    124 ulpfec/90000
+video codecs offered (excluding rtx/red/fec): VP8, H264, AV1, VP9, H265
+H.264: 42001f/pm1, 42001f/pm0, 42e01f/pm1, 42e01f/pm0, 4d001f/pm1, 4d001f/pm0, 64001f/pm1
