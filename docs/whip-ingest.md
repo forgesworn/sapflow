@@ -1,9 +1,9 @@
 # WHIP ingest (design)
 
 Status: design, 10 November 2026, updated 11 November 2026. The WHIP
-libraries `sapflow-rtp` and `sapflow-dtls` are built but not yet wired into
-the server, so WHIP stays off. It does not face the internet before the
-gates in [Delivery and gates](#delivery-and-gates) pass.
+libraries `sapflow-rtp`, `sapflow-dtls` and `sapflow-whip` are built but not
+yet wired into the server, so WHIP stays off. It does not face the internet
+before the gates in [Delivery and gates](#delivery-and-gates) pass.
 
 WHIP (RFC 9725) lets a publisher send live media over WebRTC after a single
 HTTP exchange. A browser can publish with no app installed, and OBS 30 and
@@ -258,8 +258,9 @@ What `sapflow-dtls` does with the captures (W2, 11 November 2026):
 - OBS's SCSV-only hello is accepted.
 - The hellos that offer DTLS 1.3 (Chrome, Vanadium, Safari on iOS) are
   answered with 1.2.
-- Not yet covered: Firefox's ClientHello, which is still not captured, and
-  any browser's second flight, which needs a live browser (W3, A3.1).
+- Not yet covered: Firefox's ClientHello, which is still not captured.
+  A browser's second flight was first covered in W3a: Chrome 157 completed
+  the handshake with `sapflow-whip` on loopback (see W3a below).
 
 ## SDP answer and stream matching
 
@@ -458,11 +459,19 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
   6.1.1) and cannot switch. A request carrying ICE-CONTROLLED is answered
   with `487 Role Conflict`, so the full agent takes the controlling role
   (section 7.3.1.1). W3 tests check that each browser target recovers from it.
-- **Nomination.** When a valid Binding request with USE-CANDIDATE arrives for
-  a session from a new 5-tuple, media moves to that tuple. Media is never
-  moved by anything other than an authenticated STUN request.
+- **Nomination.** A valid Binding request with USE-CANDIDATE from a new
+  5-tuple moves the selected tuple there; nothing else moves it. Until SRTP
+  or SRTCP has arrived, sapflow sends to the selected tuple; from then on
+  it sends to the tuple of the latest fresh SRTP or SRTCP with current
+  consent, and nomination no longer moves its sends. SRTP is taken from
+  any tuple that has passed a check (decided in W3a, below).
 - **Consent.** A session whose consent checks stop for 30 s ends, as an
-  encoder timing out does today.
+  encoder timing out does today. A connected session also ends 30 s after
+  its last fresh SRTP or SRTCP (W3a). A replayed check whose ID the
+  session has forgotten renews consent. A copy of SRTP counts as fresh
+  only if it arrives before its original or the original was lost, so
+  once the publisher stops sending nothing new can count, and the session
+  ends 30 s after the last packet, or copy of one, arrived.
 - **Limits of TCP 443.** A network that only lets real TLS through on 443
   will block ICE-TCP framing. RTMPS remains the route for those networks.
   OBS 32 made no TCP connection to a passive candidate in W0, so OBS on a
@@ -926,11 +935,72 @@ There is no ICE restart in v1.
   - DTLS handshake message size and number of flights;
   - TCP connections per address;
   - and the existing publisher and presentation caps.
-- Nothing is sent to an address before it passes a STUN check with valid
-  MESSAGE-INTEGRITY. STUN answers are no larger than the requests that caused
-  them. DTLS flights, which are larger, go only to addresses that have passed
-  that check. So the UDP port cannot be used to reflect traffic at a third
-  party.
+- Nothing is sent to an address before a STUN check from it passes
+  MESSAGE-INTEGRITY, and STUN answers are no larger than the requests that
+  caused them. MESSAGE-INTEGRITY does not prove the source address (RFC
+  8445 section 19.2), so a check captured on the way and re-sent with a
+  third party's address as its source verifies too. W3a limits what that
+  gains:
+  - a check whose transaction ID the session has seen (the last 512) is
+    answered only from the address that first sent it, and changes
+    nothing; from any other address it gets nothing;
+  - SRTP authentication does not cover the source address either, so a
+    copy of an SRTP or SRTCP packet that arrives before its original, or
+    whose original was lost, is fresh too. Neither kind of proof lifts
+    the limit below;
+  - **the bound:** for each address, over the life of a session, sapflow
+    sends at most four times the bytes it has received from that address,
+    counting STUN, DTLS, SRTP and SRTCP and including its STUN responses.
+    A STUN response to an address that has not passed a check (a 487 or
+    a 420) is no larger than its request. A datagram over the limit is
+    dropped and counted, and the session goes on;
+  - DTLS and RTCP go to the selected address until SRTP or SRTCP has
+    arrived, then to the address of the latest fresh SRTP or SRTCP with
+    current consent;
+  - a full table of validated addresses evicts one that is neither
+    selected nor sent to: first one that has never delivered fresh media,
+    then the one whose last fresh media is oldest;
+  - a connected session ends 30 s after its last fresh SRTP or SRTCP.
+
+  So a re-sent check that arrives after its original draws nothing while
+  its ID is remembered, and any amount of re-sending, copying or racing
+  draws at most four times what the attacker sent from that address. A
+  full table evicts an address that is neither selected nor the send
+  address: one that has never delivered fresh media first, then the one
+  whose last fresh media is oldest, the earliest validated breaking ties.
+  An address validated again starts with no media. So checks alone,
+  replayed or not, push out an address that has delivered fresh media
+  since it was validated only once every address that could go has
+  delivered some. Pushing the publisher's address out takes
+  `max_tuples` - 2 other addresses (6 by default) each with fresh media at
+  least as new as the publisher's last, and a selected address other than
+  the publisher's. An observer that copies and spoofs gets them from
+  checks whose IDs are forgotten or whose originals were lost, one of them
+  carrying USE-CANDIDATE, and that many
+  of the publisher's packets that the session never received on their
+  original index while each was inside the replay window (1024 packets per
+  SSRC, about 20 s of Opus at 50 a second): packets lost after the
+  observer saw them, or beaten by its copies. No race is needed: it can
+  keep lost packets and send them, with one such check from a new
+  address, in one burst between two of the publisher's packets, and RTX
+  resends go on their own SSRC, leaving the original index open. Short of
+  that, after a won race or a copy of a lost packet, the publisher loses
+  no media and sends are back with it at its next packet that arrives
+  before any copy of it. Once pushed out, the publisher's media is dropped
+  until one of its own checks arrives before any copy of it (a check whose
+  copy came first is refused as a replay). That check brings its address
+  back with no media, below every address that has some, so one more
+  such check from a new address that lands before the publisher's
+  next packet pushes it out again: that needs no race, only the gap. The
+  exception is a check of the publisher's that carries USE-CANDIDATE: its
+  address becomes the selected one and is kept while it stays selected. An
+  attacker who wins every race, or drops or delays the publisher's packets
+  (RFC 8445 section 19.2), can also keep them from ever counting as fresh
+  and keep sapflow's sends, PLIs and NACKs among them, away from the
+  publisher. That disrupts delivery, though still not beyond four times
+  what the attacker sends.
+  This is shown in process (W3a); no real browser has yet been seen to
+  move pairs mid-handshake.
 
 ## Privacy and security
 
@@ -1090,18 +1160,23 @@ Implementation notes (11 November 2026):
   datagrams and OpenSSL's key log are fixtures. Unit tests replay them offline, derive the exporter
   and record keys from OpenSSL's master secret, and feed both halves of the
   material to `sapflow-rtp`.
-  - That last step runs `sapflow-rtp` on both sides. GCM SRTP is still
-    unchecked against a real peer's SRTP packets; that check comes in W3.
+  - That last step runs `sapflow-rtp` on both sides. GCM SRTP stayed
+    unchecked against a real peer's packets until W3a, where Chrome 157's
+    SRTP and SRTCP under `SRTP_AEAD_AES_128_GCM` authenticated, live and in
+    an offline replay (see W3a below). `SRTP_AES128_CM_HMAC_SHA1_80` has
+    met a real peer only through FFmpeg in W1.
 - **A2.4.** The fuzz targets are `dtls_record`, `dtls_handshake_messages`
   and `dtls_server`. Their seeds come from the W0 captures, the OpenSSL runs
   and scripted handshakes.
   - CI's 60 s runs and a coverage report are still to come.
   - A seed replay test and a fixed-seed mutation pass run with the unit
     tests.
-- **Review.** On 11 November 2026 an independent review of this crate found
-  no defect in the protocol or crypto code, and asked for fixes. Those
-  fixes are made. A4.4 still needs SRTP in `sapflow-rtp` reviewed and every
-  finding recorded.
+- **Review.** On 11 November 2026 a review of this crate found no defect in
+  the protocol or crypto code, and asked for fixes. Those fixes are made.
+  That review was by an agent of the same session as the crate's author,
+  which A4.4 excludes, so it does not count towards A4.4. A4.4 still needs
+  an independent review of `sapflow-dtls` and of SRTP in `sapflow-rtp`,
+  with every finding recorded.
 - **For W3.**
   - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
     timer doubling to 60 s, six sends), an unanswered flight 4 runs to
@@ -1151,6 +1226,10 @@ Implementation notes (11 November 2026):
     one without consent checks is gone 30 s after the last.
   - Unauthenticated STUN, DTLS and random datagrams sent to the UDP port from
     a fresh address produce zero bytes in reply (packet capture).
+  - A captured check re-sent from a fresh address draws zero bytes once
+    its original has arrived, while its ID is remembered; any mix of
+    re-sent checks and copied SRTP from an address draws at most four
+    times what that address sent (packet capture).
 - **A3.8 Audio and video sync.** A browser publishing from a test file with a
   click and a flash at known times produces HLS whose audio is no more than
   40 ms early or 60 ms late against the video (the EBU R37 range).
@@ -1160,6 +1239,166 @@ Implementation notes (11 November 2026):
     it changes its sending rate on REMB or receiver reports.
   - Evidence: keyframe arrival times after requests sent at known times, and
     the rate series.
+
+Implementation notes (W3a, 11 November 2026):
+
+- **Crate.** `crates/sapflow-whip`, sans-IO, with the same lints as W1
+  and W2: STUN, the ICE-lite agent, SDP offer parsing and answer building,
+  RFC 4571 framing, the WHIP resource rules (token split, 128-bit session
+  IDs, refusal statuses, `Location`) and the session that composes ICE,
+  `sapflow-dtls`, SRTP and the `sapflow-rtp` receiver. It adds no crate the
+  workspace did not already pin: `hmac` 0.13.0 and `sha1` 0.11.0, as
+  `sapflow-rtp` uses them, for MESSAGE-INTEGRITY; CRC-32 is our own table.
+  The details and bounds are in the crate README.
+- **Decided in W3a.**
+  - Unauthenticated STUN gets no answer at all, not 400 or 401; 420 and
+    487 go only to requests that passed MESSAGE-INTEGRITY. A response that
+    would be larger than its request is not sent.
+  - The selected tuple is first set, as well as moved, only by a
+    successful check with USE-CANDIDATE. Up to four DTLS datagrams from a
+    validated tuple are held until it is nominated. Chrome 157 sent its
+    two ClientHello fragments that way in every gate 2 run.
+  - SRTP and SRTCP are taken from any validated tuple, not only the
+    selected one. RFC 8445 section 12.2 says an agent should be prepared
+    to receive data on any candidate from the most recent exchange; a lite
+    agent learns the publisher's only from its checks, so the validated
+    tuples stand in for them. Consent (RFC 7675) governs sending only. Chrome 157 nominated a second pair in
+    every gate 2 run and kept sending on the first for a moment. The two
+    runs that took SRTP only from the selected tuple lost 3 Opus packets
+    each (one counted 10 packets dropped); the three after the change lost
+    none. DTLS input stays on the selected tuple.
+  - After review, replayed checks (see Concurrency and resource bounds):
+    - the agent remembers the transaction IDs of its last 512
+      authenticated requests;
+    - every tuple is held to four times what it sent, for the whole
+      session; a second review showed that a copied SRTP packet, fresh
+      if it beats its original, had lifted the limit in an earlier
+      version that exempted tuples proven by SRTP (45384 bytes for 224
+      over 60 s in a test, now 148). One check
+      and the smallest ClientHello in the profile (about 120 bytes) must
+      draw the check's 64-byte response and our 637-byte first flight. At
+      one times, Safari's 153-byte hello would have waited for
+      retransmissions. QUIC's limit is three (RFC 9000 section 8.1), but
+      its clients pad their first datagrams to 1200 bytes. The DTLS cookie
+      exchange would not help: it proves the address once, at the hello,
+      and is not bound to the address;
+    - sends follow the selected tuple until SRTP or SRTCP arrives, then the
+      tuple of the latest fresh SRTP or SRTCP with current consent. Short
+      of a push-out (see the eviction paragraph under Concurrency and
+      resource bounds), after a won race they are back with the publisher
+      at its next packet that arrives before any copy of it (20 ms of
+      audio in the test). A push-out, or an attacker that wins every race,
+      can keep sends away from the publisher, within the per-tuple bound;
+    - eviction takes a tuple that has never delivered fresh media, then
+      the one with the stalest, never the selected or send tuple. A third
+      review showed that eviction by age alone let forgotten copies push
+      the publisher's tuple out after one copied packet (2 s of its audio
+      dropped in a test, now none);
+    - consent is kept per tuple and read for the send tuple;
+    - a connected session ends 30 s after its last fresh SRTP or SRTCP.
+  - The answer puts the configured candidates in its tagged section and
+    our credentials, fingerprint and `setup:passive` in every accepted
+    section, as W0's answer did for every target. It does not negotiate
+    `rtcp-rsize`. It answers `transport-cc` for Opus too when the offer
+    lists it there.
+  - The handshake deadline is the session's (10 s), so `sapflow-dtls`'s
+    63 s timeout never runs. A DTLS failure ends the session with
+    `EndReason::Dtls` and its reason, for W3c to count.
+- **Gate 1, in process.** For both SRTP profiles a scripted publisher (the
+  test STUN client, the `sapflow-dtls` test client, `sapflow-rtp`'s SRTP
+  protect) sends H.264 in STAP-A and FU-A and Opus. The session emits
+  exactly the access units and audio sent. The client unprotects the PLI
+  sent as SRTP comes up, receiver reports, SDES and transport-cc. Tests
+  also cover DTLS from an unvalidated tuple, unauthenticated STUN (zero
+  bytes), 487, USE-CANDIDATE moving the tuple, consent expiry, the
+  handshake deadline, a fingerprint mismatch, MID matching and RTX repair.
+- **Gate 2, a real browser.** This is not A3.1: no server, LL-HLS or
+  recording is involved.
+  - Headless Google Chrome 157 with fake media, on the test host, published
+    through `POST` to `examples/whip_harness.rs` on loopback, in five
+    runs. Every run reached every milestone:
+    - ICE nominated at about 120 ms after the `201`;
+    - DTLS connected 4 to 6 ms later, with `SRTP_AEAD_AES_128_GCM`;
+    - first SRTP packet decrypted;
+    - first Opus at about 1.65 s, after the 1.5 s start hold, and the
+      first H.264 keyframe at 1.64 to 3.14 s. The hold ended by arrival
+      time (`Fallback::Timeout`): not every stream had a sender report
+      within it;
+    - feedback sent.
+  - Chrome's own statistics showed DTLS 1.2 as the client, 6 to 8 PLIs
+    received and 5 to 7 keyframes encoded in 10 s, and its target rate
+    rising from 30 kbit/s to between 455 kbit/s and 1.7 Mbit/s.
+  - Chrome sends RTX while its rate ramps up. In the two runs that counted
+    payload types, 43 of 182 and 33 of 196 video-section packets were RTX.
+    10 and 9 of them repeated packets already delivered, which
+    `sapflow-rtp` counts as late; the rest were padding only. Another run
+    counted 628 of 819 video packets late. Bandwidth probing is the likely
+    cause; it was not confirmed.
+  - One run is kept in `crates/sapflow-whip/tests/fixtures/chrome-157/`:
+    - the offer without candidates or addresses;
+    - every DTLS datagram both ways;
+    - the leaf certificate;
+    - the first SRTP and SRTCP packets, from Chrome's built-in fake camera
+      and microphone (generated, not a camera).
+
+    A unit test replays it with the same seeded session. Our flights match
+    byte for byte, the leaf matches the offer's fingerprint, and Chrome's
+    GCM SRTP and SRTCP authenticate.
+  - Firefox was not run. It is no longer installed on the test host, and
+    W0 found that its ICE could not complete on that host. So Firefox's
+    ClientHello is still not captured.
+- **Fuzzing.** `stun_message`, `sdp_offer`, `rfc4571_frames` and
+  `whip_session`. The session target scripts honest checks and DTLS
+  flights so it reaches the authenticated paths. With an ID cache of 16 so
+  that checks are forgotten, and room for 3 validated tuples of the 6 it
+  uses so that tuples are evicted, it delivers copies of captured checks
+  and of fresh SRTP and SRTCP from five other tuples, ahead of and after
+  their originals. After every datagram in and every one out it checks
+  that every tuple has been sent at most four times what it sent, STUN
+  responses included, that a tuple that never authenticated gets only a
+  STUN error response no larger than its request, that DTLS and RTCP go
+  only to the send tuple, and that an evicted tuple had the stalest media
+  of those that could go; after every step, that output is bounded and the
+  selected and send tuples are validated. Seeds come from the RFC 5769
+  vectors, the W0 offers and TCP captures, the recorded Chrome offer and
+  scripted sessions; a seed replay test and a fixed-seed mutation pass run
+  with the unit tests. CI's fuzz job picks the targets up from `cargo fuzz
+  list`. A coverage report is still to come. These cover A3.5's STUN and
+  SDP parsers; the WHIP request parser's target comes with W3c's listener.
+- **Left to W3c.**
+  - The signalling listener: HTTP, CORS, the 16 KiB offer cap at the
+    request, the throttle, admission and publish-auth.
+  - The UDP owner task: routing a check from a new address by
+    `stun::request_username` and the session's `local_ufrag`, then by
+    `Session::accepts`.
+  - Tuple ownership. A session's validated tuples never age (up to
+    `max_tuples`; those that have delivered no fresh media are evicted
+    first, then the stalest), so once a NAT gives a port to a second
+    publisher, two sessions can both accept the same tuple. The UDP owner
+    must map each tuple to one session, the one whose check from it came
+    last, and must not route by `accepts` alone.
+  - Pending-session caps, in total and per address.
+  - A muted video section draws a PLI every second: `sapflow-rtp` asks
+    again every `keyframe_retry` while it waits for an IDR. That case has
+    no test yet. The per-tuple bound holds whatever happens, since a send
+    over budget is dropped; what the budget decides is whether each PLI
+    goes out, which depends on the publisher's sender reports and checks
+    keeping its tuple's budget up.
+  - Eviction memory. A tuple validated again starts with no media, so a
+    publisher that comes back after being pushed out is first in line to
+    go again. Consider keeping a tuple's last media time across
+    re-validation, in a small bounded memory of evicted tuples. No test
+    yet covers an honest NAT rebinding or an honest pair move with the
+    table full; add both.
+  - A publisher's `close_notify` can be lost. DTLS is taken only from the
+    selected tuple but sent to the send tuple, so once they differ a
+    `close_notify` from the media tuple is dropped. A graceful end should
+    rely on `DELETE` and the media timeout, not on it.
+  - Running each session call under `catch_unwind` (A3.4).
+  - Supersede from `Session::last_media`.
+  - Counting end reasons.
+  - Wiring media into `EsIngest`, and the rest of A3.
+- **Left to W3d.** PROXY protocol v2 and the TCP listener.
 
 ### W4: qualification
 

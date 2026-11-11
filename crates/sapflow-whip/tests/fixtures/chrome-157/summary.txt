@@ -1,0 +1,7 @@
+profile AeadAes128Gcm
+ICE nominated: +121 ms 
+DTLS connected: +127 ms profile=AeadAes128Gcm
+feedback sent: +127 ms datagrams=1
+first SRTP packet decrypted: +148 ms 
+Opus packets received: +1649 ms stereo=true duration=960
+first H.264 keyframe access unit: +1649 ms bytes=1164 sps=1 pps=1

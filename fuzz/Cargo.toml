@@ -22,6 +22,7 @@ sapflow-rtmp = { path = "../crates/sapflow-rtmp" }
 sapflow-srt = { path = "../crates/sapflow-srt" }
 sapflow-rtp = { path = "../crates/sapflow-rtp", features = ["testing"] }
 sapflow-dtls = { path = "../crates/sapflow-dtls", features = ["testing"] }
+sapflow-whip = { path = "../crates/sapflow-whip", features = ["testing"] }
 sapflow-client = { path = "../crates/sapflow-client" }
 sapflow-signet-ffi = { path = "../crates/sapflow-signet-ffi" }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -244,6 +245,34 @@ bench = false
 [[bin]]
 name = "dtls_handshake_messages"
 path = "fuzz_targets/dtls_handshake_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stun_message"
+path = "fuzz_targets/stun_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sdp_offer"
+path = "fuzz_targets/sdp_offer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfc4571_frames"
+path = "fuzz_targets/rfc4571_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "whip_session"
+path = "fuzz_targets/whip_session.rs"
 test = false
 doc = false
 bench = false

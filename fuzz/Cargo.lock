@@ -1743,6 +1743,7 @@ dependencies = [
  "sapflow-rtp",
  "sapflow-signet-ffi",
  "sapflow-srt",
+ "sapflow-whip",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1809,6 +1810,19 @@ dependencies = [
  "getrandom 0.4.3",
  "pbkdf2",
  "sha1 0.11.0",
+ "zeroize",
+]
+
+[[package]]
+name = "sapflow-whip"
+version = "0.2.0-rc.1"
+dependencies = [
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "sapflow-dtls",
+ "sapflow-rtp",
+ "sha1 0.11.0",
+ "subtle",
  "zeroize",
 ]
 
