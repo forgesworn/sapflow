@@ -1094,6 +1094,11 @@ Implementation notes (W3a, 11 November 2026):
   - The UDP owner task: routing a check from a new address by
     `stun::request_username` and the session's `local_ufrag`, then by
     `Session::accepts`.
+  - Tuple ownership. A session's validated tuples never age (up to
+    `max_tuples`, oldest evicted first), so once a NAT gives a port to a
+    second publisher, two sessions can both accept the same tuple. The
+    UDP owner must map each tuple to one session, the one whose check from
+    it came last, and must not route by `accepts` alone.
   - Pending-session caps, in total and per address.
   - Running each session call under `catch_unwind` (A3.4).
   - Supersede from `Session::last_media`.
