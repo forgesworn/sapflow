@@ -29,9 +29,13 @@ live media server. MIT.
   target durations of published media after the playlist stops listing it,
   up to 64 MiB and `muxer::MAX_RETAINED_PARTS` (4,096) parts beyond the
   window; past either, or when the fragment budget refuses a new part, the
-  oldest go early and `Muxer::parts_released_early` counts them. A segment
-  itself is not served once it leaves the window, one segment duration
-  short of 6.2.2's availability rule for segments.
+  oldest go early and `Muxer::parts_released_early` counts them. A removed
+  segment, with its init, stays fetchable through `Muxer::segment` until
+  its Availability Duration (its own duration plus the longest playlist
+  that listed it) has passed since it first appeared, as 6.2.2 asks,
+  within the same 64 MiB, which counts a segment and its parts once, and
+  `muxer::MAX_RETAINED_SEGMENTS` (1,024); `Muxer::segments_released_early`
+  counts any that go early.
 - **Ingest.** `TsIngest` takes MPEG-TS (what SRT carries), `FlvIngest`
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
   units and AAC frames or Opus packets directly.

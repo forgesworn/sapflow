@@ -25,5 +25,13 @@ Notes for the release after 0.2.0-rc.1.
   window, more parts and their codec epoch's init are served than in rc.1,
   and each stream can hold up to 64 MiB more of the shared fragment budget.
   `playlist::RetentionCheck` checks the rule.
+- A segment that leaves the window stays fetchable through
+  `Muxer::segment`, with its init, until its Availability Duration (its
+  duration plus the longest playlist that listed it) has passed since it
+  first appeared (RFC 8216bis 6.2.2); rc.1 dropped it at once, one segment
+  duration early. It shares the 64 MiB, which counts a segment and its
+  parts once, and is capped at `muxer::MAX_RETAINED_SEGMENTS` (1,024)
+  segments; `Muxer::segments_released_early()` counts any that go early.
+  `playlist::RetentionCheck` checks this rule too.
 - Opus audio beside AAC (#66), with timeline slew carried in audio-only
   Opus and the refusal order tested (#68). See `docs/whip-ingest.md`.
