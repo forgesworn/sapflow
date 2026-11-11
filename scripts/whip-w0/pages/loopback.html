@@ -1,0 +1,225 @@
+<!doctype html><meta charset="utf-8"><title>W0 loopback</title>
+<script>
+// A0.4 (rate ramp) and A0.7 (Opus parameters): two RTCPeerConnections in one
+// page, answer edited. Provisional: the receiver is a browser.
+const q = new URLSearchParams(location.search);
+const which = q.get('which') || 'all';
+const RAMP_SECONDS = +(q.get('ramp') || 30), OPUS_SECONDS = +(q.get('opus') || 12);
+const post = (name, body) => fetch('/result/' + name, { method: 'POST', body: JSON.stringify(body, null, 1) });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const load = async () => (await (await fetch('/loadavg')).json())[0];
+
+function stripFeedback(sdp, { transportCc }) {
+  return sdp.split(/\r?\n/).filter((l) => {
+    if (/^a=rtcp-fb:\S+ goog-remb/.test(l)) return false;
+    if (transportCc) return true; // arm (b): keep transport-cc
+    if (/^a=rtcp-fb:\S+ transport-cc/.test(l)) return false;
+    if (/^a=extmap:\d+ http:\/\/www\.ietf\.org\/id\/draft-holmer-rmcat-transport-wide-cc-extensions-01/.test(l)) return false;
+    return true;
+  }).join('\r\n');
+}
+function feedbackLines(sdp) {
+  // Every RTCP and header-extension line of the video section, so nothing is assumed.
+  const v = sdp.split(/\r?\nm=/).find((x) => x.startsWith('video')) || '';
+  return v.split(/\r?\n/).filter((l) => /^a=(rtcp|extmap)/.test(l));
+}
+function editOpus(sdp, params) {
+  return sdp.replace(/^(a=fmtp:(\d+) )(.*)$/gm, (line, pre, pt, rest, off) => {
+    const rtp = new RegExp('^a=rtpmap:' + pt + ' opus/', 'm');
+    if (!rtp.test(sdp)) return line;
+    const kv = new Map(rest.split(';').map((p) => p.split('=')));
+    Object.entries(params).forEach(([k, v]) => kv.set(k, String(v)));
+    return pre + [...kv].map(([k, v]) => k + '=' + v).join(';');
+  });
+}
+
+async function connect(sendStream, editAnswer, setup, cfg2 = {}) {
+  const pc1 = new RTCPeerConnection(), pc2 = new RTCPeerConnection(cfg2);
+  pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
+  pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
+  const got = new Promise((r) => { pc2.ontrack = (e) => { if (typeof setup === 'function') setup(e); r(e); }; });
+  const senders = sendStream.getTracks().map((t) => pc1.addTrack(t, sendStream));
+  if (setup && setup.beforeOffer) setup.beforeOffer(pc1);
+  await pc1.setLocalDescription(await pc1.createOffer());
+  await pc2.setRemoteDescription(pc1.localDescription);
+  const ans = await pc2.createAnswer();
+  const edited = editAnswer(ans.sdp);
+  await pc2.setLocalDescription({ type: 'answer', sdp: edited });
+  await pc1.setRemoteDescription({ type: 'answer', sdp: edited });
+  return { pc1, pc2, senders, answerSdp: edited, rawAnswer: ans.sdp };
+}
+
+// ---- A0.4
+function animatedCanvas() {
+  const c = document.createElement('canvas'); c.width = 1280; c.height = 720;
+  const g = c.getContext('2d'); let n = 0;
+  const draw = () => {
+    n++;
+    g.fillStyle = `hsl(${(n * 3) % 360},60%,30%)`; g.fillRect(0, 0, 1280, 720);
+    for (let i = 0; i < 1500; i++) {
+      g.fillStyle = `rgb(${Math.random() * 255 | 0},${Math.random() * 255 | 0},${Math.random() * 255 | 0})`;
+      g.fillRect(Math.random() * 1280, Math.random() * 720, 24, 24);
+    }
+    g.fillStyle = '#fff'; g.font = '64px monospace'; g.fillText('frame ' + n, 40 + (n * 7) % 800, 120 + (n * 3) % 400);
+    requestAnimationFrame(draw);
+  };
+  draw();
+  return c;
+}
+
+async function ramp(arm, prefix = '') {
+  const canvas = animatedCanvas();
+  const stream = canvas.captureStream(30);
+  const r = await connect(stream, (sdp) => stripFeedback(sdp, { transportCc: arm === 'b' }), {
+    beforeOffer(pc1) {
+      const tx = pc1.getTransceivers()[0];
+      const caps = RTCRtpSender.getCapabilities('video').codecs;
+      const h264 = caps.filter((c) => /h264/i.test(c.mimeType) && /packetization-mode=1/.test(c.sdpFmtpLine || ''));
+      if (h264.length) tx.setCodecPreferences([...h264, ...caps.filter((c) => !/h264/i.test(c.mimeType))]);
+    },
+  });
+  const sender = r.senders[0];
+  const p = sender.getParameters();
+  p.encodings[0].maxBitrate = 5_000_000;
+  p.encodings[0].maxFramerate = 30;
+  await sender.setParameters(p);
+  const series = []; let prev = null;
+  for (let s = 1; s <= RAMP_SECONDS; s++) {
+    await sleep(1000);
+    const st = [...(await r.pc1.getStats()).values()];
+    const o = st.find((x) => x.type === 'outbound-rtp' && x.kind === 'video');
+    const cp = st.find((x) => x.type === 'candidate-pair' && x.nominated) || st.find((x) => x.type === 'candidate-pair' && x.state === 'succeeded');
+    const rr = st.find((x) => x.type === 'remote-inbound-rtp');
+    const codec = o && st.find((x) => x.id === o.codecId);
+    const lo = await load();
+    if (o) series.push({
+      s, bitrateKbps: prev ? Math.round(((o.bytesSent + o.headerBytesSent) - (prev.bytesSent + prev.headerBytesSent)) * 8 / 1000) : null,
+      payloadKbps: prev ? Math.round((o.bytesSent - prev.bytesSent) * 8 / 1000) : null,
+      targetKbps: Math.round((o.targetBitrate || 0) / 1000), availableKbps: cp ? Math.round((cp.availableOutgoingBitrate || 0) / 1000) : null,
+      fps: o.framesPerSecond, w: o.frameWidth, h: o.frameHeight, qlr: o.qualityLimitationReason, nack: o.nackCount, pli: o.pliCount, fir: o.firCount,
+      rtt: rr && rr.roundTripTime, lost: rr && rr.fractionLost, load1: lo, codec: codec && codec.mimeType, impl: o.encoderImplementation,
+    });
+    prev = o;
+  }
+  const finalStats = [...(await r.pc1.getStats()).values()].find((x) => x.type === 'outbound-rtp' && x.kind === 'video');
+  const result = {
+    arm, freshPage: !!prefix, note: 'provisional loopback: receiver is a browser and still sends RTCP receiver reports',
+    feedbackInAnswer: feedbackLines(r.answerSdp), feedbackInRawAnswer: feedbackLines(r.rawAnswer),
+    receiverReportsSeen: !![...(await r.pc1.getStats()).values()].find((x) => x.type === 'remote-inbound-rtp'),
+    qualityLimitationDurations: finalStats && finalStats.qualityLimitationDurations, series,
+  };
+  r.pc1.close(); r.pc2.close(); stream.getTracks().forEach((t) => t.stop());
+  await post(`${prefix}ramp-${arm}.json`, result);
+  return result;
+}
+
+// ---- A0.7
+const workerSrc = `
+let started = false, workerErrors = [];
+let st = { frames: 0, bytes: 0, stereoFlag: 0, monoFlag: 0, small: 0, configs: {}, c: {}, firstBytes: [], sizes: [] };
+onrtctransform = (ev) => {
+  const { readable, writable } = ev.transformer;
+  started = true;
+  readable.pipeThrough(new TransformStream({ transform(frame, ctrl) {
+    const d = new Uint8Array(frame.data); const b = d.length ? d[0] : 0;
+    st.frames++; st.bytes += d.length;
+    if (!d.length) { st.empty = (st.empty || 0) + 1; ctrl.enqueue(frame); return; }
+    if ((b >> 2) & 1) st.stereoFlag++; else st.monoFlag++;
+    if (d.length <= 3) st.small++;
+    const cfg = b >> 3; st.configs[cfg] = (st.configs[cfg] || 0) + 1;
+    const c = b & 3; st.c[c] = (st.c[c] || 0) + 1;
+    if (st.firstBytes.length < 8) st.firstBytes.push(b.toString(16).padStart(2, '0'));
+    ctrl.enqueue(frame);
+  } })).pipeTo(writable).catch((e) => workerErrors.push(String(e)));
+};
+onerror = (e) => workerErrors.push(String(e.message || e));
+onmessage = (e) => { if (e.data === 'dump') postMessage(Object.assign(JSON.parse(JSON.stringify(st)), { workerStarted: started, workerErrors })); if (e.data === 'reset') st = { frames: 0, bytes: 0, stereoFlag: 0, monoFlag: 0, small: 0, configs: {}, c: {}, firstBytes: [] }; };
+`;
+
+function toneStream(silent) {
+  const ac = new AudioContext();
+  const merger = ac.createChannelMerger(2);
+  const dest = ac.createMediaStreamDestination();
+  dest.channelCount = 2; dest.channelCountMode = 'explicit'; dest.channelInterpretation = 'discrete';
+  [440, 880].forEach((f, ch) => {
+    const o = ac.createOscillator(); o.frequency.value = f;
+    const g = ac.createGain(); g.gain.value = silent ? 0 : 0.3;
+    o.connect(g); g.connect(merger, 0, ch); o.start();
+  });
+  merger.connect(dest);
+  ac.resume();
+  return { stream: dest.stream, ac };
+}
+
+async function opus(name, params, silent, xform = 'script') {
+  const { stream, ac } = toneStream(silent);
+  const worker = new Worker(URL.createObjectURL(new Blob([workerSrc])));
+  const legacy = { frames: 0, bytes: 0, stereoFlag: 0, monoFlag: 0, small: 0, configs: {}, c: {}, firstBytes: [] };
+  const r = await connect(stream, (sdp) => (params ? editOpus(sdp, params) : sdp), (e) => {
+    if (xform === 'script') e.receiver.transform = new RTCRtpScriptTransform(worker, {});
+    if (xform === 'legacy') {
+      const { readable, writable } = e.receiver.createEncodedStreams();
+      readable.pipeThrough(new TransformStream({ transform(frame, ctrl) {
+        const d = new Uint8Array(frame.data), b = d.length ? d[0] : 0;
+        legacy.frames++; if (!d.length) legacy.empty = (legacy.empty || 0) + 1; legacy.bytes += d.length; if ((b >> 2) & 1) legacy.stereoFlag++; else legacy.monoFlag++;
+        if (d.length <= 3) legacy.small++;
+        legacy.configs[b >> 3] = (legacy.configs[b >> 3] || 0) + 1; legacy.c[b & 3] = (legacy.c[b & 3] || 0) + 1;
+        ctrl.enqueue(frame);
+      } })).pipeTo(writable);
+    }
+  }, xform === 'legacy' ? { encodedInsertableStreams: true } : {});
+  await sleep(2000);
+  worker.postMessage('reset');
+  if (xform === 'legacy') { Object.assign(legacy, { frames: 0, bytes: 0, stereoFlag: 0, monoFlag: 0, small: 0, configs: {}, c: {} }); }
+  const s0 = [...(await r.pc1.getStats()).values()].find((x) => x.type === 'outbound-rtp' && x.kind === 'audio');
+  const t0 = performance.now();
+  await sleep(OPUS_SECONDS * 1000);
+  const st = [...(await r.pc1.getStats()).values()];
+  const s1 = st.find((x) => x.type === 'outbound-rtp' && x.kind === 'audio');
+  const secs = (performance.now() - t0) / 1000;
+  const rin = [...(await r.pc2.getStats()).values()].find((x) => x.type === 'inbound-rtp' && x.kind === 'audio');
+  const frames = xform === 'legacy' ? JSON.parse(JSON.stringify(legacy)) : xform === 'none' ? { frames: 0, bytes: 0, stereoFlag: 0, monoFlag: 0, configs: {}, c: {} } : await new Promise((res) => { worker.onmessage = (e) => res(e.data); worker.postMessage('dump'); });
+  const fmtp = r.answerSdp.split(/\r?\n/).filter((l) => /^a=fmtp:\d+ .*(minptime|opus|stereo)/.test(l) || /^a=fmtp:\d+ .*useinbandfec/.test(l));
+  const offerFmtp = r.pc1.localDescription.sdp.split(/\r?\n/).filter((l) => /^a=fmtp:\d+ .*useinbandfec/.test(l));
+  const result = {
+    name, xform, silent: !!silent, provisional: 'loopback only; receiver is a browser',
+    offerFmtp, answerFmtp: fmtp, seconds: +secs.toFixed(2),
+    statsPayloadKbps: +(((s1.bytesSent - s0.bytesSent) * 8) / 1000 / secs).toFixed(1),
+    statsPacketsPerSec: +((s1.packetsSent - s0.packetsSent) / secs).toFixed(1),
+    receivedFrames: frames, receivedPayloadKbps: +((frames.bytes * 8) / 1000 / secs).toFixed(1),
+    receivedFramesPerSec: +(frames.frames / secs).toFixed(1),
+    stereoFlagFraction: frames.frames ? +(frames.stereoFlag / frames.frames).toFixed(3) : null,
+    receiverInbound: rin && { packetsReceived: rin.packetsReceived, bytesReceived: rin.bytesReceived, totalSamplesReceived: rin.totalSamplesReceived, concealedSamples: rin.concealedSamples, jitterBufferEmittedCount: rin.jitterBufferEmittedCount },
+    load1: await load(),
+  };
+  r.pc1.close(); r.pc2.close(); worker.terminate(); ac.close();
+  await post(`opus-${name}.json`, result);
+  return result;
+}
+
+(async () => {
+  const errors = [];
+  try {
+    if (which === 'all' || which === 'ramp') { await ramp('a'); await ramp('b'); }
+    if (which === 'ramp-a') await ramp('a', 'solo-');
+    if (which === 'ramp-b') await ramp('b', 'solo-');
+  } catch (e) { errors.push('ramp: ' + (e.stack || e)); }
+  try {
+    if (which === 'all' || which === 'opus') {
+      // Legacy createEncodedStreams is the main reader: RTCRtpScriptTransform delivered
+      // no frames in arms with stereo or maxaveragebitrate set (see the evidence note),
+      // so it is run for two arms only, for comparison.
+      await opus('default', null, false, 'legacy');
+      await opus('params', { stereo: 1, maxaveragebitrate: 128000, usedtx: 0 }, false, 'legacy');
+      await opus('stereo-only', { stereo: 1 }, false, 'legacy');
+      await opus('maxavg-only', { maxaveragebitrate: 128000 }, false, 'legacy');
+      await opus('silent-usedtx0', { usedtx: 0 }, true, 'legacy');
+      await opus('silent-usedtx1', { usedtx: 1 }, true, 'legacy');
+      await opus('default-script', null, false, 'script');
+      await opus('params-script', { stereo: 1, maxaveragebitrate: 128000, usedtx: 0 }, false, 'script');
+    }
+  } catch (e) { errors.push('opus: ' + (e.stack || e)); }
+  await post('loopback-errors.json', errors);
+  await fetch('/done', { method: 'POST' });
+})();
+</script>
