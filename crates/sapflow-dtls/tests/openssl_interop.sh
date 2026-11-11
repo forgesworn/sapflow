@@ -13,7 +13,10 @@ port=${1:-47010}
 out=${2:-}
 openssl=${OPENSSL:-openssl}
 work=$(mktemp -d)
-trap 'mv "$work" "${TMPDIR:-/tmp}/.trash-$(basename "$work")" 2>/dev/null || true' EXIT
+cleanup() {
+  if [ -d "$HOME/.Trash" ]; then mv "$work" "$HOME/.Trash/sapflow-dtls-interop-$(basename "$work")"; else rm -rf "$work"; fi
+}
+trap cleanup EXIT
 cargo build -q -p sapflow-dtls --features testing --example udp_server --target aarch64-apple-darwin
 bin=target/aarch64-apple-darwin/debug/examples/udp_server
 "$openssl" req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
