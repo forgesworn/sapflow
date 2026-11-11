@@ -1387,9 +1387,11 @@ Implementation notes (W3c part 1, 11 November 2026):
   items); that task owns the `Publication` and feeds a new
   elementary-stream source (`EsIngest`, stereo Opus as answered), so the
   stream is packaged and recorded by the same code as SRT's and RTMP's.
-  Its SRTP and SRTCP bytes count against the bitrate cap, and its health
-  and publish callbacks go through the same `Publication`; neither is
-  tested for WHIP yet. A full queue marks the recording and makes video
+  Only SRTP and SRTCP that the session authenticated count against the
+  bitrate cap, so bytes spoofed from a publisher's tuple cannot push it
+  over. Health and publish callbacks go through the same `Publication`,
+  untested for WHIP. A failed receive on the media socket is logged and
+  passed over, as for SRT. A full queue marks the recording and makes video
   wait for the next IDR. The request rules are a pure module,
   `whip_request.rs`, which the `whip_request` fuzz target includes.
 - **Tuple ownership.** The rule written for W3c, "the session whose check
@@ -1439,12 +1441,12 @@ Implementation notes (W3c part 1, 11 November 2026):
 |---|---|---|
 | A3.1: Chrome publishes through `POST`, LL-HLS plays in hls.js, the recording opens | `scripts/whip-e2e.js` | Partial: headless Chrome 157 on the test host, the gate run: 10.1 s played at 640x360 (206 frames decoded, none dropped); the recording decoded 247 H.264 frames at 640x360 and 615 stereo Opus frames, and a frame from each was saved. Other browsers, and the DTLS handshake with every target, are later gates |
 | A3.1 in process: `POST`, ICE, DTLS, SRTP over UDP, media in the playlist | `whip::tests::a_publisher_reaches_the_stream_through_post_and_udp` | Met, with the scripted publisher |
-| A3.2 (basic): `DELETE` needs the token, answers `200`, the session is gone, and an immediate `POST` takes the held stream | the same test | Partial: the callbacks, the grace and a handshake timeout at server level are not observed |
+| A3.2 (basic): `DELETE` needs the token, answers `200`, the session is gone, and an immediate `POST` for the path is admitted (`201`) | the same test | Partial: the callbacks, the grace and a handshake timeout at server level are not observed |
 | Refusals before admission: 404, 405 with `Allow`, 401, 415, 413 by `content-length`, 400, 422; 409 and 401 from admission | `whip::tests::refusals_carry_their_statuses`, `whip_request::tests` | Met for these. 403, 429 and 503 from the app are not tested |
 | `503` past `SAPFLOW_MAX_PUBLISHERS` sessions, its path released | `whip::tests::past_the_session_cap_a_post_gets_503` | Met |
 | CORS only for configured origins, refusals included; preflight methods, headers and `Accept-Post` | `whip::tests::cors_only_for_configured_origins`, `whip_request::tests::cors_only_for_configured_origins` | Met |
 | `X-Forwarded-For` only from the trusted proxy, its own entry | `whip_request::tests::forwarded_for_only_from_the_trusted_proxy` | Unit tests only |
-| A3.5: the WHIP request parser has a fuzz target | `whip_request`, seeds replayed by `whip_request::tests::seeds_hold_the_fuzz_checks` | Partial: built and seeds replayed; not fuzzed on the test host (libFuzzer does not run there); CI's fuzz job runs it |
+| A3.5: the WHIP request parser has a fuzz target | `whip_request`; its six seeds replayed by `whip_request::tests::seeds_hold_the_fuzz_checks`, and 12,000 fixed-seed mutations of them by `whip_request::tests::mutated_seeds_hold_the_fuzz_checks` | Partial: built, seeds and mutations pass, but not fuzzed yet: libFuzzer does not run on the test host, and CI's fuzz job, which lists targets with `cargo fuzz list`, has not run it |
 | A3.6: nothing bound with `SAPFLOW_WHIP_ADDR` unset, and the media address alone refused | `scripts/whip-e2e.js` (lsof on the process), `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 | A3.6: an A3.1 run's trace log holds no token, offer address, port or mDNS name, or publisher address | `scripts/whip-e2e.js` | Met for that run (44 literals); the check first finds a planted token |
 | A check for another session from a media tuple does not cost its publisher media | `router::tests::a_check_for_another_session_cannot_take_a_media_tuple` (with and without USE-CANDIDATE) | Met |
@@ -1454,7 +1456,8 @@ Implementation notes (W3c part 1, 11 November 2026):
 | The two limits above | `router::tests::a_check_that_beats_the_first_one_owns_the_tuple`, `router::tests::a_publisher_back_after_a_gap_reclaims_its_tuple_at_its_next_check` | Shown |
 | Datagrams for no session draw nothing | `router::tests::unroutable_datagrams_draw_nothing` | Met in process; the packet-capture check is A3.7 |
 | A full queue marks loss and video waits for an IDR | `whip::tests::a_full_queue_skips_video_to_the_next_idr` | Met |
-| Loss from the receiver marks the recording, even where the muxer sees none: audio-only Opus with one packet left out is marked, without loss it is not; lost packets are counted | `whip::tests::a_lost_packet_marks_the_recording_from_the_receiver`, `whip::tests::receiver_loss_is_counted_and_marks_the_recording` | Met in process |
+| Only authenticated SRTP and SRTCP count against the bitrate cap | `whip::tests::only_authenticated_media_counts_against_the_cap` | Met |
+| Loss from the receiver marks the recording, even where the muxer sees none: audio-only Opus with one packet left out is marked, without loss it is not; lost packets are counted | `whip::tests::a_lost_packet_marks_the_recording_from_the_receiver`, `whip::tests::receiver_loss_is_counted_and_marks_the_recording` | Met in process. With the receiver's mark taken out, the lossy run is not marked: the muxer alone sees nothing |
 | WHIP settings | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 
 - **Left to W3c part 2.**
