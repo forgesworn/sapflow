@@ -470,10 +470,11 @@ SAPFLOW_WHIP_CANDIDATES="udp 203.0.113.5:8189, tcp 203.0.113.5:443"
 
 ### Opus
 
-`sapflow-hls` handles AAC only today. `AacConfig` and `AAC_FRAME_SAMPLES`
-appear in `codec.rs`, `ingest.rs`, `fmp4.rs`, `muxer.rs` and `flv.rs`, in the
-server's `stream.rs`, and in `sapflow-client` and `sapflow-ffi`. Opus support
-means:
+Before W3b, `sapflow-hls` handled AAC only. `AacConfig` and
+`AAC_FRAME_SAMPLES` appear in `codec.rs`, `ingest.rs`, `fmp4.rs`, `muxer.rs`
+and `flv.rs`, in the server's `stream.rs`, and in `sapflow-client` and
+`sapflow-ffi`. Opus support means (W3b built it; see
+[Opus as built](#opus-as-built)):
 
 - An audio configuration that is AAC or Opus (channels, 48 kHz) throughout
   `EsIngest`, the muxer and the init segments, with Opus frame durations read
@@ -494,7 +495,10 @@ means:
   - pre-skip 0 (provisional). Chrome's own recorder writes 0. In W0, a
     312 asset clicked twice at the start in Firefox with hls.js, in four of
     four runs, and the 0 assets never did. The cause is unknown. Safari gave
-    no comparison (see below). W3 rechecks with sapflow's own packaging.
+    no comparison (see below). W3b rechecked with sapflow's own packaging:
+    0 played without a click in four of four Firefox runs from the start,
+    and 312 clicked once in four of four (see
+    [Opus as built](#opus-as-built)).
 - No gaps in the audio track. A gap in RTP timestamps with no gap in sequence
   numbers is the sender's silence suppression (DTX). A gap in sequence
   numbers that NACK did not recover is loss. Both are filled with a constant
@@ -507,8 +511,12 @@ means:
   by more than that allowance and the fill limit. A timestamp advance
   beyond the bound is a discontinuity, which re-anchors the track and is
   not filled.
-- The same in recordings, including the recording checkpoint and programme
-  modules.
+- The same in the server's recordings. The recording checkpoint and
+  programme modules (`recording_checkpoint.rs`, `recording_programme.rs` and
+  `recording_timing.rs` in `sapflow-hls`) serve only the native SDK's AAC
+  recordings in `sapflow-ffi`, with 1024-sample AAC arithmetic. The native
+  SDK stays AAC, so they stay AAC too; the server's recorder does not use
+  them.
 - `sapflow-client` and `sapflow-ffi` keep AAC. The native SDK does not publish
   over WebRTC.
 
@@ -526,8 +534,9 @@ FFmpeg as a stand-in for sapflow, in every target player:
 Safari also reports `audio/mp4; codecs="opus"` as unsupported to Media
 Source Extensions. The test did not separate Opus in HLS from FFmpeg's
 playlist and init segment, so W3 repeats it with sapflow's own packaging.
-Until then, a WHIP stream's LL-HLS is treated as unplayable on Apple's
-players.
+W3b did so for Chrome and Firefox; Safari and the phones need the user's
+go-ahead and have not been rerun. Until then, a WHIP stream's LL-HLS is
+treated as unplayable on Apple's players.
 
 **Decision (user, 10 November 2026): sapflow keeps Opus and does not
 transcode.** Transcoding Opus to AAC inside sapflow was considered and
@@ -536,6 +545,168 @@ encoder into the server, against the no-transcoding goal. A deployment with
 Apple viewers converts the audio to AAC downstream, before players see it.
 The README and [comparison.md](comparison.md) say so when WHIP ships. If WHIP
 is wanted without a downstream converter, this decision is revisited.
+
+#### Opus as built
+
+W3b added Opus to `sapflow-hls` and to the server's recordings. Nothing
+feeds it yet; W3c connects `sapflow-whip` to it.
+
+- **API, additive only.** `codec::OpusConfig`, `codec::AudioConfig` (AAC or
+  Opus), `codec::opus_packet` and `codec::OpusPacket`; `EsIngest::opus_config`,
+  `opus_at`, `opus` and `known_audio_config`; `Muxer::with_audio_config`,
+  `reconfigure_with_audio` and `audio_config`; and
+  `fmp4::init_segment_for_audio_tracks`. No existing signature changed.
+  `Muxer::audio()` and `EsIngest::known_audio()` still return only an AAC
+  configuration, so they give `None` for an Opus track. A test pins every
+  byte of AAC output (init segments, parts, segments, playlists and
+  recording headers) to the 0.2.0-rc.1 code.
+- **Durations.** Each packet's duration comes from its TOC configuration
+  (2.5 to 60 ms frames) and frame-count code (0 to 3). A packet that breaks
+  the framing rules of RFC 6716 section 3.4, including one over 120 ms, is
+  refused with `InvalidAudio` before anything changes, as an unsupported AAC
+  configuration is. So is Opus on an ingest that carries AAC, and AAC on one
+  that carries Opus. The check agrees with `sapflow_rtp::opus::parse_packet`
+  on validity, duration, frame count and stereo flag (fuzz target
+  `opus_packaging`).
+- **Timescale 48 000.** The encapsulation calls it typical (section 4.4).
+  Every Opus frame is a whole number of 48 kHz ticks, and of 90 kHz ticks
+  (120 samples are 225), so sample durations and the conversion to the
+  shared timeline are exact.
+- **Video-led audio.** As for AAC, a sample lasts until the next packet's
+  timestamp, jitter included. A gap of more than three of the packet's own
+  durations (1024 samples for AAC) gives it its own duration instead.
+- **Audio-only.** As for AAC, decode time is an exact count of samples and
+  timestamps only detect a break: one more than 2 ms off the count (missing,
+  repeated or backward) starts a discontinuous run reported as media loss.
+  The part target is fixed from the first packet's duration, as AAC's comes
+  from its frame: 20 ms packets make 200 ms parts under a 234 ms target. A
+  later, longer packet that would carry the open part past the target first
+  closes that part and its segment, both short, which Apple's part rules
+  allow for a segment's last part. A packet longer than the part target is
+  refused; only a `part_min` far below the default makes a target that
+  short.
+- **Channels** follow the rule above: `EsIngest::opus_config(OpusConfig::STEREO)`
+  when stereo was negotiated, otherwise the first packet's TOC. A later
+  change of the stereo flag keeps the configuration and the init segment. A
+  reconnect whose first packet gives another count starts a codec epoch, as
+  a changed AAC configuration does.
+- **Bounds.** Opus goes through AAC's admission: the 64 MiB charged-segment
+  limit (pending packet included), the 16,384 live-sample limit, the shared
+  fragment quota and the audio-only segment limit, each refused before any
+  change.
+- **Recordings.** The server's recorder writes Opus with
+  `init_segment_for_audio_tracks` and rebases audio at 48 kHz. Its test
+  checks the file byte for byte against that layout (the recording init,
+  then each part rebased), which the FFmpeg check below decodes.
+  `sapflow-client`, `sapflow-ffi` and `sapflow-rtmp` are unchanged.
+
+**Departures from the encapsulation.** Read against "Encapsulation of Opus
+in ISO Base Media File Format", version 0.6.8:
+
+- Pre-skip is 0. Section 4.3.2 says it "shall be at least 80 milliseconds'
+  worth of PCM samples", and also that it is informative only, discarding
+  priming samples being the edit list's job. W3b follows this design's
+  provisional rule and Chrome's recorder, and the measurement below.
+- The init segment has no edit list (`edts`, `elst`), as for AAC. Section
+  4.4 asks for one to trim priming and padding.
+- There are no `roll` sample groups (`sgpd` in the init segment, `sbgp` in
+  each fragment), which section 4.3.6.2 requires for the 80 ms pre-roll
+  after random access. Adding `sbgp` would also need
+  `fmp4::rebase_part_for_file` changed for recordings: it accepts only
+  `tfhd`, `tfdt` and `trun` in a track fragment.
+
+FFmpeg and both browsers decoded the output without them. Whether to add
+them is open.
+
+**FFmpeg decode.** sapflow's own init segment and parts, built in a test
+(`write_opus_evidence` in `opus_real_tests.rs`) from real Opus packets, as
+one file per stream and in the recorder's layout, decoded by FFmpeg 8.1.2 as
+a black box: no errors from any file, a 48 kHz Opus stream with
+`initial_padding=0`, and decoded samples per channel equal to the sum of
+the packets' TOC durations.
+
+| Stream | Packets | Channels | Duration | Decoded samples |
+|---|---|---|---|---|
+| libopus, 20 ms stereo, audio only | 101 | 2 | 2.020 s | 96 960 |
+| libopus, 60 ms SILK mono, audio only | 17 | 1 | 1.020 s | 48 960 |
+| libopus, 120 ms multi-frame stereo, audio only | 9 | 2 | 1.080 s | 51 840 |
+| mono 60 ms, then stereo 20 ms, then stereo 120 ms (the TOC stereo flag changes) | 127 | 1 | 4.120 s | 197 760 |
+| Chrome `MediaRecorder` (60 ms stereo), audio only | 332 | 2 | 19.920 s | 956 160 |
+| Chrome Opus with 1280x720 H.264, also as a recording | 332 | 2 | 19.967 s | 950 400, video without errors |
+
+The libopus sources declare a pre-skip of 312 and trim their last packet by
+granule position. sapflow reads neither, so its output decodes those 312
+priming samples and the final padding. Video-led output stops at the last
+video frame, so the A/V file holds 950 400 of the 956 160 samples, as with
+AAC. The audio-only recording the server's recorder wrote in its test
+decodes the same way: 96 960 samples and no errors. Its A/V test recording
+carries placeholder video, which FFmpeg opens but cannot decode, by design;
+its audio decodes (94 080 samples).
+
+**Playback.** sapflow's LL-HLS of 1280x720 30 fps H.264 (libx264) with the
+Chrome recording's Opus (60 ms stereo packets) played in headless Chrome
+157 and Firefox 160 with hls.js 1.7.4, through W0's play page (Web Audio
+analyser and click detector). `scripts/hls-opus/replay-run.js` serves the
+playlists sapflow wrote after each change, each from the media time it
+appeared. It holds a blocking reload until a playlist satisfies it, and a
+part or segment until a playlist lists it. Every playlist and media byte is
+sapflow's; the harness adds only that timing, a view from the start (the
+last playlist with `EXT-X-ENDLIST`, which hls.js starts at the first real
+segment, past the leading `EXT-X-GAP` entries), and a copy with the `dOps`
+pre-skip patched to 312.
+
+| Browser | Stream | Runs | Result |
+|---|---|---|---|
+| Chrome 157 | Live, audio and video | 6 | Played 13.5 to 14 s of 14 s; 228 to 236 kB of audio decoded (`webkitAudioDecodedByteCount`); 445 Hz left, 879 Hz right |
+| Chrome 157 | Live, audio only (`CODECS="opus"`) | 2 | Played and decoded, both tones |
+| Chrome 157 | From the start, audio and video | 1 | Played and decoded, no click |
+| Firefox 160 | Live, audio and video | 8 | Played 13.5 s of 14 s; both tones in the analyser |
+| Firefox 160 | Live, audio only | 1 | Played, both tones |
+| Firefox 160 | From the start, audio and video | 8 | Played 13.5 s of 14 s; see pre-skip below |
+
+hls.js reported no fatal error. The audio-only and from-the-start runs report
+the leading gaps as non-fatal `fragGap`. One early Chrome run stalled once
+for 5.5 s and recovered, while the page's own 500 ms timer was also held up
+under other load on the host. Four reruns at lower load did not stall.
+
+Joining live with video, the first audible block jumps by 0.27 to 0.29 in 13
+of 14 runs, against the test tone's largest step of 0.035, at pre-skip 0
+and 312 alike. Audio-only live joins do not. The likely cause, not
+confirmed, is the players starting the audio at the video's first frame, in
+the middle of a continuous tone. It is the same at either pre-skip, so it
+comes from the join, not the pre-skip.
+
+**Pre-skip, measured.** Firefox 160 with hls.js 1.7.4, from the start of
+sapflow's packaging, judged from decoded samples by W0's click detector (a
+step over 0.07):
+
+| `dOps` pre-skip | Runs | Click |
+|---|---|---|
+| 0, as sapflow writes | 4 | None. Largest step 0.0347 at onset, 0.0349 steady |
+| 312, the same files with that field patched | 4 | One in each run: a step of 0.273 about 1.1 s after playback began, inside the first segment |
+
+Chrome from the start, at pre-skip 0, had no click either. W0 saw two
+clicks at the start with FFmpeg's packaging at 312; the count and position
+differ, but the result is the same: 0 plays cleanly and 312 clicks in
+Firefox. The cause is still unknown, so pre-skip stays 0.
+
+**Open after W3b.**
+
+- W3c: the live path still reads `Muxer::audio()` in two places, which is
+  `None` for Opus: `has_audio` for a fresh part in `stream.rs`, and the
+  health callback's `audio` in `publish.rs`. They want
+  `Muxer::tracks().has_audio()` or `audio_config()` when WHIP is wired in.
+  W3b left the live path alone.
+- W3c: audio-only Opus keeps AAC's 2 ms tolerance between timestamps and the
+  sample count. The timeline here slews audio at up to 500 ppm, which
+  reaches 2 ms in 4 s, so an audio-only WHIP stream being slewed could break
+  into a discontinuity every few seconds. This is inferred, not tested.
+- The departures from the encapsulation listed above, and the cause of the
+  312 click.
+- Safari, iOS and Android with sapflow's packaging, which need the user's
+  go-ahead.
+- `sapflow-hls` and `sapflow-rtp` each have an Opus framing check. The fuzz
+  target holds them to the same answers; one could move to `sapflow-core`.
 
 ### One timeline
 

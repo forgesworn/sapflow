@@ -5,8 +5,8 @@ and wider library acceptance remain open. Read the [migration and release notes]
 before upgrading from 0.1.0.
 
 Low-Latency HLS packaging in pure Rust, and the ingest that feeds it: FLV
-tags, MPEG-TS and H.264/AAC elementary streams in, fragmented MP4 parts,
-segments and playlists out.
+tags, MPEG-TS and H.264 elementary streams with AAC or Opus audio in,
+fragmented MP4 parts, segments and playlists out.
 It is the packaging core of the [sapflow](https://github.com/forgesworn/sapflow)
 live media server. MIT.
 
@@ -22,7 +22,20 @@ live media server. MIT.
   same presentation with a discontinuity.
 - **Ingest.** `TsIngest` takes MPEG-TS (what SRT carries), `FlvIngest`
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
-  units and AAC frames directly.
+  units and AAC frames or Opus packets directly.
+- **Opus.** `EsIngest::opus_at` (and `opus` for video-led streams) takes
+  one Opus packet per call, as RTP carries them (RFC 7587). Each packet's
+  duration comes from its TOC byte (RFC 6716 section 3.1), and a malformed
+  packet or one over 120 ms is refused with `IngestError::InvalidAudio`.
+  The init segment has an `Opus` sample entry and a `dOps` box at a 48 kHz
+  timescale, and `CODECS` says `opus`. RTP carries no Opus header, so the
+  channel count is 2 when stereo was negotiated (`EsIngest::opus_config`
+  with `OpusConfig::STEREO`) or the first packet is stereo, otherwise 1;
+  pre-skip, output gain and mapping family are 0. Nothing is transcoded,
+  and Apple's players do not decode Opus in HLS: convert to AAC downstream
+  for them. The AAC entry points, signatures and output are unchanged;
+  `Muxer::audio()` still returns the AAC configuration only, and
+  `Muxer::audio_config()` returns either codec.
 
 For declared A/V TS startup, video can wait for AAC configuration and catch up
 in timestamp order. The retained video prefix has limits of 64 access units,
@@ -166,4 +179,7 @@ recording or codecs; process RSS describes this cache model only.
 
 Pre-1.0: the API may change. It has run against OBS, Larix, ffmpeg and
 Safari on iPhone, and its parsers are fuzzed; see the repository's
-`docs/interop.md` and `fuzz/`. H.264 and AAC only.
+`docs/interop.md` and `fuzz/`. H.264 video; AAC or Opus audio. Opus output
+has been decoded by FFmpeg and played by hls.js in Chrome and Firefox, not
+yet fed by a live WebRTC publisher; see the repository's
+`docs/whip-ingest.md`.
