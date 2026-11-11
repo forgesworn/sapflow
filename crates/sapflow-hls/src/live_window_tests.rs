@@ -177,18 +177,31 @@ fn the_byte_cap_bounds_what_the_window_holds_beyond_its_count() {
         playlist::RuleCheck::default(),
     );
     let (mut refused_plain, mut capped) = (false, false);
+    // The signal is exact: a render on its own breaks the window rule only
+    // when the muxer says the byte cap cut it.
+    let mut check = |m: &Muxer| {
+        if !m.has_content() {
+            return;
+        }
+        let pl = playlist::media(m, "w");
+        signalled
+            .check_with_byte_cap(&pl, m.window_byte_capped())
+            .expect("with the muxer's signal");
+        refused_plain |= plain.check(&pl).is_err();
+        capped |= m.window_byte_capped();
+        assert_eq!(
+            playlist::RuleCheck::default().check(&pl).is_err(),
+            m.window_byte_capped(),
+            "{} entries, listed {:?}",
+            m.entries().len(),
+            listed(&pl)
+        );
+    };
     for _ in 0..120 {
         m.push_audio_at(pts, payload.clone(), NOW).expect("AAC");
         pts += 1920;
         m.interrupt(NOW);
-        if m.has_content() {
-            let pl = playlist::media(&m, "w");
-            signalled
-                .check_with_byte_cap(&pl, m.window_byte_capped())
-                .expect("with the muxer's signal");
-            refused_plain |= plain.check(&pl).is_err();
-            capped |= m.window_byte_capped();
-        }
+        check(&m);
         let extra: usize = m
             .entries()
             .iter()
@@ -206,7 +219,27 @@ fn the_byte_cap_bounds_what_the_window_holds_beyond_its_count() {
     );
     assert!(m.entries().len() < crate::muxer::MAX_WINDOW_ENTRIES);
     assert!(most_extra <= 64 << 20, "{most_extra}");
+    assert!(m.window_byte_capped(), "still cut short");
+    // Small segments of ten frames after it: the large ones leave, the
+    // window grows back to three target durations and the signal clears.
+    let mut small = 0;
+    while m.window_byte_capped() && small < 100 {
+        for _ in 0..10 {
+            m.push_audio_at(pts, Bytes::from_static(&[1, 2]), NOW)
+                .expect("AAC");
+            pts += 1920;
+            check(&m);
+        }
+        m.interrupt(NOW);
+        check(&m);
+        small += 1;
+    }
     assert!(capped && refused_plain, "the byte cap cut the window short");
+    assert!(!m.window_byte_capped(), "recovered after {small} segments");
+    assert_eq!(
+        playlist::RuleCheck::default().check(&playlist::media(&m, "w")),
+        Ok(())
+    );
 }
 
 /// The review's mixed-epoch case: A/V Opus, then a reconnect as audio-only

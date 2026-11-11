@@ -277,7 +277,8 @@ fn audio_only_opus_cuts_independent_parts_on_toc_durations() {
 /// every render, every part as it is produced (so nothing is lost to the
 /// window), and RFC 8216bis 6.2.2's part retention: a part stays
 /// downloadable for three target durations after its tag leaves the
-/// playlist.
+/// playlist. That holds at the default window these tests use; shorter
+/// windows do not meet it yet (docs/whip-ingest.md, "Open after W3b").
 #[derive(Default)]
 struct Watch {
     rules: playlist::RuleCheck,

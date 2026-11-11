@@ -14,14 +14,14 @@ docs/reference.md), the same as sapflow_hls::playlist::RuleCheck:
     segment (or the open run of parts) whose every part is independent, as
     in audio-only;
   - once segments have been removed (MEDIA-SEQUENCE above 0), the segments
-    listed last at least three TARGETDURATIONs (6.2.2), unless the render
-    lists 256 entries or more, sapflow's entry cap. sapflow's other cap,
-    64 MiB of segments beyond MuxerConfig::segment_count, cannot be seen in
-    a render: pass --byte-capped when the muxer reported it
-    (Muxer::window_byte_capped) for the renders checked, and a short window
-    is then accepted. --no-live-window leaves the rule out altogether, for
-    renders not made by sapflow; --live-window, its old opt-in, is accepted
-    and ignored;
+    listed last at least three TARGETDURATIONs (6.2.2's segment rule; its
+    part rule is not checked), unless the render lists 256 entries or more,
+    sapflow's entry cap. sapflow's other cap, 64 MiB of segments beyond
+    MuxerConfig::segment_count, cannot be seen in a render: pass
+    --byte-capped when the muxer reported it (Muxer::window_byte_capped)
+    for the renders checked, and a short window is then accepted.
+    --no-live-window leaves the rule out altogether, for renders not made
+    by sapflow; --live-window, its old opt-in, is accepted and ignored;
   - EXT-X-DISCONTINUITY never sits among a segment's parts, and each media
     sequence number keeps one discontinuity sequence number across renders.
 The last part listed after the final EXTINF is exempt: it may yet be the

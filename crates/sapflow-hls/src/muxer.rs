@@ -716,7 +716,9 @@ impl Muxer {
     /// because its 64 MiB byte cap forced a removal (RFC 8216bis 6.2.2 gives
     /// way to the cap). A playlist cannot show this, unlike the entry cap,
     /// which shows as [`MAX_WINDOW_ENTRIES`] entries listed: pass it to
-    /// [`crate::playlist::RuleCheck::check_with_byte_cap`].
+    /// [`crate::playlist::RuleCheck::check_with_byte_cap`]. It clears once
+    /// the window lists three target durations again, or lists that many
+    /// entries.
     pub fn window_byte_capped(&self) -> bool {
         self.window_byte_capped
     }
@@ -2120,7 +2122,7 @@ impl Muxer {
                 .iter()
                 .map(|e| crate::playlist::extinf_units(e.duration()))
                 .sum();
-            self.window_byte_capped = listed < floor;
+            self.window_byte_capped = listed < floor && self.entries.len() < MAX_WINDOW_ENTRIES;
         }
         if self.target.is_none() {
             let t = TargetDuration::for_first_segment(duration);
