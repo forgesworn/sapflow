@@ -29,6 +29,7 @@ const TOKEN: &str = "publisher:whip-tcp-secret";
 
 struct Server {
     app: Arc<App>,
+    whip: Arc<Whip>,
     http: SocketAddr,
     tcp: SocketAddr,
     stats: Arc<Stats>,
@@ -74,6 +75,11 @@ fn app() -> Arc<App> {
 /// A server whose ICE-TCP listener believes PROXY headers from `proxy`,
 /// within `limits`.
 async fn start(proxy: Option<IpAddr>, limits: Limits) -> Server {
+    serve_tcp(proxy, limits, false).await
+}
+
+/// As [`start`]; with `hooks`, the panic hooks are on (A3.4).
+async fn serve_tcp(proxy: Option<IpAddr>, limits: Limits, hooks: bool) -> Server {
     let app = app();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let tcp = listener.local_addr().expect("addr");
@@ -85,12 +91,17 @@ async fn start(proxy: Option<IpAddr>, limits: Limits) -> Server {
         tcp: Some(bound),
     };
     let http = sockets.http.local_addr().expect("addr");
-    let (whip, router, rx) = prepare(&app, server_identity())
+    let (whip, mut router, rx) = prepare(&app, server_identity())
         .expect("router")
         .expect("WHIP on");
-    tokio::spawn(run(app.clone(), whip, router, rx, sockets));
+    if hooks {
+        router.enable_panic_hooks();
+        whip.panic_hooks.store(true, Ordering::Relaxed);
+    }
+    tokio::spawn(run(app.clone(), whip.clone(), router, rx, sockets));
     Server {
         app,
+        whip,
         http,
         tcp,
         stats,
@@ -473,4 +484,67 @@ async fn unanswered_and_idle_connections_close() {
     assert_eq!(phone.p.stun_answers.len(), 1);
     assert!(closed_within(&mut phone.stream, Duration::from_secs(3)).await);
     assert_eq!(get(&server.stats, |s| &s.idle_timeout), 1);
+}
+
+/// A3.4 over ICE-TCP: a panic in a session on a TCP tuple ends only that
+/// session; another, on its own connection to the same listener, keeps
+/// publishing with nothing marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_a_tcp_session_ends_only_that_session() {
+    let server = serve_tcp(None, Limits::default(), true).await;
+    let mut a = Phone::new(41, &server, None).await;
+    a.admit(&server, "event-tcp-panic-a").await;
+    a.connect().await;
+    let mut b = Phone::new(42, &server, None).await;
+    let b_location = b.admit(&server, "event-tcp-panic-b").await;
+    b.connect().await;
+    let b_stream = server
+        .app
+        .streams
+        .get("event-tcp-panic-b")
+        .expect("claimed");
+    for _ in 0..10 {
+        b.publish(1).await;
+        if b_stream.has_content() {
+            break;
+        }
+    }
+    assert!(b_stream.has_content(), "B is live over TCP");
+    let b_id = b_location
+        .rsplit('/')
+        .next()
+        .and_then(SessionId::parse)
+        .expect("B's id");
+    let b_counts = server
+        .whip
+        .resources()
+        .get(&b_id)
+        .map(|r| r.losses.clone())
+        .expect("B is live");
+    let b_task = tokio::spawn(async move {
+        b.publish(3).await;
+        b
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    a.send(&[sapflow_whip::testing::PANIC_DATAGRAM.to_vec()])
+        .await;
+    let mut ended = false;
+    for _ in 0..100 {
+        if server.whip.ends.get("panicked") == 1 {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ended, "A ended as panicked: {:?}", server.whip.ends);
+    let after = b_stream.version();
+    let _b = b_task.await.expect("B published throughout");
+    assert!(b_stream.version() > after, "B's playlist kept growing");
+    let marks: u64 = b_counts
+        .fields()
+        .iter()
+        .filter(|(name, _)| *name != "reanchors")
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(marks, 0, "B lost nothing: {b_counts}");
 }
