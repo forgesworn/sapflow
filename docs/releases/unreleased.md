@@ -134,11 +134,23 @@ Notes for the release after 0.2.0-rc.1.
   taken): they log it and try again after 100 ms, as WHIP's listeners do.
 - `--help` says the playlist can keep more than `SAPFLOW_SEGMENT_COUNT`
   segments, as above.
+- The "SRT connection closed" log line also gives `reordered`,
+  `duplicates`, `belated` and `naks_sent`. `reordered` counts gaps that the
+  original packet filled after the receiver's NAK went out: retransmissions
+  the path did not need. That is field data for whether the receiver should
+  wait a little before sending a NAK, as it now sends one at the first gap.
 - WHIP logs at debug how each session's start was aligned, each keyframe
   request and arrival, and its receive counters once a second.
 - A `test-feedback` feature, off in every other build, lets
   `SAPFLOW_TEST_WHIP_FEEDBACK` make WHIP sessions claim loss in their
   receiver reports or send REMB, for A3.10. Not for production use.
+
+## sapflow-srt
+
+- `receiver::Stats` gains `reordered`: packets reported missing that then
+  arrived as originals, not retransmissions. `Stats` is not
+  `#[non_exhaustive]`, so code that builds one with a struct literal needs
+  `..Default::default()`.
 
 ## sapflow-dtls
 
