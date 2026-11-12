@@ -51,6 +51,11 @@ impl FragmentQuota {
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }
+
+    /// The fixed limit on [`used`](Self::used).
+    pub fn maximum(&self) -> usize {
+        self.maximum
+    }
 }
 
 impl Drop for FragmentPermit {

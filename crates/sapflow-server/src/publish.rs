@@ -26,6 +26,9 @@ pub enum Refusal {
     PublisherLimit,
     /// All resident presentations are owned, including held or removed streams.
     PresentationLimit,
+    /// The live fragment budget is too full to take a new stream
+    /// (`stream::NEW_STREAM_FRAGMENT_PERCENT`).
+    MemoryLimit,
     /// Too many failed attempts from this address recently.
     Throttled,
     /// The app that authorises publishers answered 403: this publisher may
@@ -337,6 +340,7 @@ impl Publication {
         );
         let cfg = MuxerConfig {
             segment_count: app.config.segment_count,
+            window: app.config.window,
             ..MuxerConfig::default()
         };
         // Global-publisher mode: the one authorised publisher may replace its
@@ -372,6 +376,7 @@ impl Publication {
                 ClaimError::AlreadyLive => Refusal::AlreadyLive,
                 ClaimError::PublisherLimit => Refusal::PublisherLimit,
                 ClaimError::PresentationLimit => Refusal::PresentationLimit,
+                ClaimError::MemoryLimit => Refusal::MemoryLimit,
             })?;
         tracing::info!(
             path = %req.path.as_path(),

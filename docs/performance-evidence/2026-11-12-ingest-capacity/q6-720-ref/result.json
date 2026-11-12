@@ -1,0 +1,87 @@
+{
+ "label": "q6-720-ref",
+ "bin": "window bound + projected admission, final (d9990b4)",
+ "env": {
+  "SAPFLOW_OPEN_PUBLISH": "1",
+  "SAPFLOW_SRT_ADDR": "0.0.0.0:8890",
+  "SAPFLOW_RTMP_ADDR": "0.0.0.0:1935",
+  "SAPFLOW_HTTP_ADDR": "0.0.0.0:8888",
+  "SAPFLOW_SEGMENT_COUNT": "24",
+  "SAPFLOW_RECONNECT_GRACE": "90",
+  "SAPFLOW_RECORDINGS": "/recordings",
+  "SAPFLOW_HLS_MODE": "whole",
+  "SAPFLOW_SRT_ENCRYPTION": "optional",
+  "SAPFLOW_SRT_PBKEYLEN": "32",
+  "SAPFLOW_HEALTH_INTERVAL": "0",
+  "RUST_LOG": "info"
+ },
+ "mem": "384m",
+ "cpus": "1",
+ "server_state": "running false 0 0",
+ "peak_mib": 384.3,
+ "max_cur_mib": 384.0,
+ "max_anon_mib": 298.1,
+ "oom_kill": 0,
+ "recordings": [
+  "32",
+  "2760"
+ ],
+ "udp_rcvbuf_err": 0,
+ "nr_throttled": 0,
+ "throttled_ms": 0,
+ "pub": {
+  "profile": "v4v720",
+  "srt": 16,
+  "rtmp": 16,
+  "step": 5.0,
+  "hold": 180.0,
+  "clip": {
+   "format": {
+    "duration": "600.021333",
+    "bit_rate": "2757799"
+   }
+  },
+  "started": 32,
+  "ready": 32,
+  "exited_early": [],
+  "advancing": 32,
+  "ready_s": [
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   3.0,
+   3.0,
+   3.0,
+   3.0,
+   3.0,
+   3.0,
+   3.0,
+   3.0,
+   3.0,
+   3.01,
+   3.01,
+   3.01,
+   3.01,
+   3.01,
+   3.01,
+   3.01
+  ],
+  "extinf_counts": [
+   24
+  ]
+ },
+ "load": "{ 5.98 5.75 6.55 }"
+}

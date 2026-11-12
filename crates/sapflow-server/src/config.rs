@@ -62,6 +62,12 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            more while that many would last under three target
                            durations: up to 256 entries, with at most 64 MiB of
                            media past the count
+  SAPFLOW_WINDOW_SECONDS   the most media the playlist keeps, beside the
+                           segment count (default 2 s per segment, 48 at the
+                           default count; 0 for no limit): a long keyframe
+                           interval makes long segments, and the count alone
+                           would hold minutes of them. Never under seven
+                           entries or three target durations
   SAPFLOW_HLS_MODE         low-latency (default) or whole; whole omits parts
   SAPFLOW_HTTP_THREADS     viewer event loop threads (default: one per core, max 256)
                            explicit values: 1..256
@@ -87,7 +93,10 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            and removed streams with owners (default 4x publishers;
                            64 at default, explicit values 1..4096)
   SAPFLOW_MAX_FRAGMENT_BYTES shared encoded init/fragment backing capacity
-                           (default 536870912, 512 MiB; positive byte count)
+                           (default 536870912, 512 MiB; positive byte count);
+                           a new stream is refused once the streams' expected
+                           windows would fill 80% of it, or while eight are
+                           starting (a reconnect to a held one is not)
   SAPFLOW_MAX_RETAINED_BYTES media kept past the live window so parts and
                            segments stay fetchable (RFC 8216bis 6.2.2),
                            charged apart from the fragment bytes and never
@@ -145,6 +154,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_CALLBACK_URL",
     "SAPFLOW_CALLBACK_SECRET",
     "SAPFLOW_SEGMENT_COUNT",
+    "SAPFLOW_WINDOW_SECONDS",
     "SAPFLOW_HLS_MODE",
     "SAPFLOW_HTTP_IMPL",
     "SAPFLOW_HTTP_THREADS",
@@ -417,6 +427,9 @@ pub struct Config {
     pub callback_url: Option<String>,
     pub callback_secret: Option<String>,
     pub segment_count: usize,
+    /// The most media the playlist keeps (`SAPFLOW_WINDOW_SECONDS`), beside
+    /// `segment_count`; `None` for no limit.
+    pub window: Option<Duration>,
     pub low_latency: bool,
     /// Threads for the viewer event loop (`own_http.rs`).
     pub http_threads: usize,
@@ -601,6 +614,20 @@ impl Config {
                 .ok()
                 .filter(|n| (7..=1000).contains(n))
                 .ok_or_else(|| ConfigError::Invalid("SAPFLOW_SEGMENT_COUNT: 7 to 1000".into()))?,
+        };
+        // Two seconds a segment: what the count holds for an encoder sending
+        // a keyframe every 2 s or more often, so only longer intervals are cut.
+        let window = match vals.get("SAPFLOW_WINDOW_SECONDS") {
+            None => Some(Duration::from_secs(2 * segment_count as u64)),
+            Some(v) => match v.parse::<u64>() {
+                Ok(0) => None,
+                Ok(n) if n <= 86_400 => Some(Duration::from_secs(n)),
+                _ => {
+                    return Err(ConfigError::Invalid(
+                        "SAPFLOW_WINDOW_SECONDS: 0 (no limit) to 86400".into(),
+                    ));
+                }
+            },
         };
 
         let rtmp_addr = match vals.get("SAPFLOW_RTMP_ADDR").map(String::as_str) {
@@ -885,6 +912,7 @@ impl Config {
             callback_url,
             callback_secret: vals.get("SAPFLOW_CALLBACK_SECRET").cloned(),
             segment_count,
+            window,
         })
     }
 }
@@ -1202,6 +1230,25 @@ mod tests {
             |k| env.iter().find(|(e, _)| e == k).map(|(_, v)| v.clone()),
             args.iter().map(|s| s.to_string()),
         )
+    }
+
+    #[test]
+    fn the_window_bound_follows_the_count_unless_set() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let window = |env: &[(&str, &str)]| {
+            let mut env = env.to_vec();
+            env.push(open);
+            load(&env, &[]).map(|c| c.window)
+        };
+        let secs = |n| Some(Duration::from_secs(n));
+        let valid = |env: &[(&str, &str)]| window(env).expect("valid");
+        assert_eq!(valid(&[]), secs(48));
+        assert_eq!(valid(&[("SAPFLOW_SEGMENT_COUNT", "48")]), secs(96));
+        assert_eq!(valid(&[("SAPFLOW_WINDOW_SECONDS", "30")]), secs(30));
+        assert_eq!(valid(&[("SAPFLOW_WINDOW_SECONDS", "0")]), None);
+        for bad in ["-1", "30s", "86401"] {
+            assert!(window(&[("SAPFLOW_WINDOW_SECONDS", bad)]).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1539,6 +1586,7 @@ mod tests {
         assert!(!c.record_policy.records(&loop_path));
         let d = load(&[("SAPFLOW_OPEN_PUBLISH", "1")], &[]).expect("config");
         assert_eq!(d.rtmp_addr.map(|a| a.port()), Some(1935));
+        assert_eq!(d.window, Some(Duration::from_secs(48)));
         assert!(d.rtmp_proxy.is_none());
         assert!(d.recordings.is_none());
         assert!(matches!(

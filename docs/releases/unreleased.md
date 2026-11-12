@@ -110,6 +110,21 @@ Notes for the release after 0.2.0-rc.1.
   the edge steps back at such a run end; `RetentionCheck` now fails on a
   tag listed again.
 
+- `MuxerConfig::window` (new, default none) bounds the window by time as
+  well as by `segment_count`. Segment length follows the encoder's keyframe
+  interval, so 24 segments of a publisher sending a keyframe every 8 s held
+  192 s of media, and memory grew with bitrate times keyframe interval. With
+  a bound, the oldest segment goes while the rest still last at least the
+  bound, but the window never lists fewer than `LEADING_GAPS` (7) entries
+  or less than three target durations: an 8 s interval under a 48 s bound
+  keeps seven segments, 56 s. A window that `segment_count` already keeps
+  shorter is unchanged. `MuxerConfig` has public fields, so code that builds
+  one with a struct literal needs `..MuxerConfig::default()`.
+- `Muxer::held_window_bytes` (new) says what the live window and the open
+  segment hold, and `Muxer::projected_window_bytes` (new) estimates what
+  the window will hold once full, from the completed segments, for a
+  server's admission decision (`None` until a segment completes).
+
 ## sapflow-rtp
 
 - The timeline's start hold (`TimelineConfig::start_hold`) now defaults to
@@ -126,6 +141,35 @@ Notes for the release after 0.2.0-rc.1.
   REMB (`rtcp::build::remb`), for A3.10.
 
 ## sapflow
+
+- `SAPFLOW_WINDOW_SECONDS` bounds each stream's playlist by time as well as
+  by `SAPFLOW_SEGMENT_COUNT` (`MuxerConfig::window`, above). It defaults to
+  2 s per segment, 48 s at the default count, so an encoder sending a
+  keyframe every 2 s or more often keeps every segment it kept before, and
+  v4v's 1 s keyframes keep 24. A longer interval keeps fewer, longer
+  segments: 8 s keyframes keep seven segments, 56 s, where they kept 192 s,
+  and a stream's memory fell with it. 0 turns the bound off.
+- A new stream is refused when the live fragment budget would be too full
+  for it, with SRT `402`, RTMP `NetStream.Publish.Denied` "media memory
+  limit" and WHIP 503. Once the budget was full, the next part any stream
+  sealed was refused, which in testing dropped 30 of 32 publishers within
+  10 s, and encoders that reconnected into it kept being dropped. A stream
+  fills its window over tens of seconds, so admission counts what the
+  streams hold, plus the growth expected of each stream until its window is
+  full (`Muxer::projected_window_bytes`, from its completed segments; a
+  stream held for a reconnect too, since its publisher may come back), plus
+  an assumed window for each stream still starting and for the newcomer:
+  the median projection, but at least a ninth of the mark, so that eight
+  unmeasured streams and a newcomer fill it on their own. The mark is 80%
+  (`stream::NEW_STREAM_FRAGMENT_PERCENT`). While eight live streams have no
+  completed segment (`stream::MAX_STARTING_STREAMS`, each for at most 20 s,
+  `stream::STARTING_FOR`), a newcomer waits, so a crowd arriving at once is
+  let in as its windows can be measured. A publisher reconnecting to a
+  stream still held for it is not refused for memory. A publisher whose bitrate rises after admission
+  can still fill the budget. The refusal does not count against the
+  failed-attempt throttle, but a retrying encoder asks
+  `SAPFLOW_PUBLISH_AUTH_URL` again each time. sapflow-core adds
+  `FragmentQuota::maximum`.
 
 - A stream's recording no longer rolls to a new file at every codec epoch
   without bound. Each stream has a budget of rolls

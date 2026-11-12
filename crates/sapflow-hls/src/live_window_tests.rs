@@ -298,3 +298,183 @@ fn audio_only_parts_after_an_av_epoch_keep_their_exemption() {
         }
     }
 }
+
+/// What the window held once the feed was past `warm`: the fewest and most
+/// entries and seconds listed, and the first rule either check broke.
+#[derive(Debug)]
+struct Steady {
+    entries: (usize, usize),
+    listed_secs: (f64, f64),
+    target: u64,
+    broken: Option<String>,
+}
+
+/// H.264 at 30 fps with a keyframe every `gop` frames, for `frames` frames,
+/// with a retention pool: `RuleCheck` on every render and `RetentionCheck`
+/// after every push.
+fn keyframes_every(cfg: MuxerConfig, gop: i64, frames: i64, warm: i64) -> Steady {
+    keyframes_every_at(cfg, 3000, gop, frames, warm)
+}
+
+/// As [`keyframes_every`], with frames `tick` 90 kHz ticks apart.
+fn keyframes_every_at(cfg: MuxerConfig, tick: i64, gop: i64, frames: i64, warm: i64) -> Steady {
+    let pool = std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(
+        crate::muxer::RETENTION_POOL_BYTES,
+    ));
+    let mut m = Muxer::new(cfg, crate::muxer::tests::video(), None).with_retention_pool(pool);
+    let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
+    let mut steady = Steady {
+        entries: (usize::MAX, 0),
+        listed_secs: (f64::MAX, 0.0),
+        target: 0,
+        broken: None,
+    };
+    for i in 0..frames {
+        m.push_video(
+            i * tick,
+            i * tick,
+            i % gop == 0,
+            Bytes::from_static(&[1; 64]),
+            NOW,
+        )
+        .expect("video");
+        if let Err(e) = retention.check(&m) {
+            steady
+                .broken
+                .get_or_insert(format!("RetentionCheck at frame {i}: {e}"));
+        }
+        if !m.has_content() {
+            continue;
+        }
+        let pl = playlist::media(&m, "w");
+        if let Err(e) = rules.check(&pl) {
+            steady
+                .broken
+                .get_or_insert(format!("RuleCheck at frame {i}: {e}"));
+        }
+        if i >= warm {
+            let n = m.entries().len();
+            let secs = listed(&pl).1 as f64 / 100_000.0;
+            steady.entries = (steady.entries.0.min(n), steady.entries.1.max(n));
+            steady.listed_secs = (
+                steady.listed_secs.0.min(secs),
+                steady.listed_secs.1.max(secs),
+            );
+        }
+    }
+    steady.target = m.target_duration();
+    steady
+}
+
+fn timed(window: Option<u64>) -> MuxerConfig {
+    MuxerConfig {
+        window: window.map(std::time::Duration::from_secs),
+        ..MuxerConfig::default()
+    }
+}
+
+/// An 8 s keyframe interval: 24 segments would list 192 s. With a 48 s
+/// bound the window keeps seven entries, the fewest it may list (56 s, over
+/// three target durations), and both checks hold throughout.
+#[test]
+fn a_time_bound_holds_a_long_keyframe_interval_to_the_fewest_entries() {
+    let unbounded = keyframes_every(timed(None), 240, 30 * 600, 30 * 300);
+    assert_eq!(unbounded.entries, (24, 24), "{unbounded:?}");
+    let bounded = keyframes_every(timed(Some(48)), 240, 30 * 600, 30 * 300);
+    assert_eq!(bounded.broken, None);
+    assert_eq!(bounded.entries, (7, 7), "{bounded:?}");
+    assert!(
+        bounded.listed_secs.0 >= (3 * bounded.target) as f64 && bounded.listed_secs.0 >= 48.0,
+        "{bounded:?}"
+    );
+}
+
+/// 2 s segments with a 30 s bound: the window keeps the fewest segments
+/// that still last 30 s once the oldest goes, so it lists 30 s and less
+/// than one segment more.
+#[test]
+fn a_time_bound_above_the_entry_floor_keeps_its_length() {
+    let s = keyframes_every(timed(Some(30)), 60, 30 * 300, 30 * 120);
+    assert_eq!(s.broken, None);
+    assert_eq!(s.entries, (15, 15), "{s:?}");
+    assert!(s.listed_secs.0 >= 30.0 && s.listed_secs.1 < 32.0, "{s:?}");
+}
+
+/// v4v's settings (1 s keyframes, 24 segments) last 24 s, under a 48 s
+/// bound: the window is what it was without one.
+#[test]
+fn a_bound_longer_than_the_count_changes_nothing() {
+    let without = keyframes_every(timed(None), 30, 30 * 120, 30 * 60);
+    let with = keyframes_every(timed(Some(48)), 30, 30 * 120, 30 * 60);
+    assert_eq!(with.broken, None);
+    assert_eq!(with.entries, (24, 24), "{with:?}");
+    assert_eq!(with.entries, without.entries);
+    assert_eq!(with.listed_secs, without.listed_secs);
+}
+
+/// The server's default bound is 2 s a segment: keyframes every 2 s, at 30
+/// fps and at 29.97 (2.002 s segments), keep the whole count.
+#[test]
+fn a_bound_of_two_seconds_a_segment_keeps_two_second_keyframes() {
+    for tick in [3000, 3003] {
+        let without = keyframes_every_at(timed(None), tick, 60, 30 * 300, 30 * 150);
+        let with = keyframes_every_at(timed(Some(48)), tick, 60, 30 * 300, 30 * 150);
+        assert_eq!(with.broken, None, "tick {tick}");
+        assert_eq!(with.entries, (24, 24), "tick {tick}: {with:?}");
+        assert_eq!(with.listed_secs, without.listed_secs, "tick {tick}");
+    }
+}
+
+/// `projected_window_bytes` estimates the full window from its first
+/// segments: after three, it is within a segment and a half of what the
+/// window holds once full (which counts a partly filled open segment), for
+/// 1 s keyframes, for 8 s ones under a 48 s bound and for a 300-segment
+/// window; there is one as soon as a segment completes; and it is never
+/// under what is held.
+#[test]
+fn the_projection_estimates_the_full_window_from_its_first_segments() {
+    let long = MuxerConfig {
+        segment_count: 300,
+        ..MuxerConfig::default()
+    };
+    for (cfg, gop) in [(timed(None), 30), (timed(Some(48)), 240), (long, 30)] {
+        let mut m = Muxer::new(cfg, crate::muxer::tests::video(), None);
+        let segments = |m: &Muxer| {
+            m.entries()
+                .iter()
+                .filter(|e| matches!(e, crate::muxer::Entry::Segment(_)))
+                .count()
+        };
+        let mut early = None;
+        for i in 0..30 * 400 {
+            m.push_video(
+                i * 3000,
+                i * 3000,
+                i % gop == 0,
+                Bytes::from_static(&[1; 64]),
+                NOW,
+            )
+            .expect("video");
+            if let Some(p) = m.projected_window_bytes() {
+                assert!(p >= m.held_window_bytes(), "gop {gop}: under what is held");
+            } else {
+                assert_eq!(
+                    segments(&m),
+                    0,
+                    "gop {gop}: none at frame {i}, with a segment"
+                );
+            }
+            if early.is_none() && segments(&m) == 3 {
+                early = m.projected_window_bytes();
+            }
+        }
+        let early = early.expect("three segments");
+        let full = m.held_window_bytes();
+        let segment = full / (segments(&m) + 1);
+        assert!(
+            early.abs_diff(full) <= segment * 3 / 2,
+            "gop {gop}: projected {early} after three segments, full {full}, segment {segment}"
+        );
+    }
+}
