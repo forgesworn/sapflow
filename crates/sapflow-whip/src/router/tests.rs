@@ -599,16 +599,28 @@ fn the_deadline_index_follows_every_session() {
         assert!(r.deadlines_indexed());
     }
     let earliest = r.poll_timeout().expect("a deadline");
-    let due = sides
+    let due: Vec<bool> = sides
         .iter()
-        .filter(|s| {
+        .map(|s| {
             r.session(&s.id)
                 .and_then(Session::poll_timeout)
                 .is_some_and(|d| d <= earliest)
         })
-        .count();
-    assert!(due >= 1);
+        .collect();
+    assert!(due.contains(&true));
+    // A session that runs reads its deadline as its call ends; one that is
+    // not due is not touched.
+    let reads: Vec<u64> = sides
+        .iter()
+        .map(|s| r.session(&s.id).map_or(0, Session::deadline_reads))
+        .collect();
     r.handle_timeout(earliest);
+    for (i, side) in sides.iter().enumerate() {
+        let ran = r
+            .session(&side.id)
+            .is_none_or(|s| s.deadline_reads() > reads[i]);
+        assert_eq!(ran, due[i], "session {i}: due {}", due[i]);
+    }
     assert!(r.deadlines_indexed());
     assert!(r.close(&sides[0].id, now));
     assert!(r.deadlines_indexed());
