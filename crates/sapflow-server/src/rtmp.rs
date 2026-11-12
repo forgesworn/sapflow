@@ -6,6 +6,16 @@
 //! when the encoder asks to publish, before any media is accepted: against
 //! the configured publisher, or by asking the app
 //! (`SAPFLOW_PUBLISH_AUTH_URL`) while this connection waits.
+//!
+//! A second listener (`SAPFLOW_RTMP_PROXY_ADDR`) sits behind a TLS front for
+//! RTMPS. Each connection on it must come from the trusted front, checked
+//! before a byte is read, and start with a PROXY protocol v2 header, parsed
+//! with `sapflow_core::proxy_protocol`. The header's source is the
+//! publisher's address for the failed-attempt throttle and the app's publish
+//! check. Without it every RTMPS publisher would share the front's address,
+//! and one encoder retrying a wrong key could throttle them all.
+//! The plain listener never reads a header, since a header can only be
+//! believed from a configured front.
 
 use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, SocketAddr};
@@ -14,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use sapflow_core::PublishRequest;
+use sapflow_core::proxy_protocol::{self, Command, Parsed};
 use sapflow_rtmp::{Connection, Event};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -29,17 +40,43 @@ use crate::stream::{Source, SourceKind};
 /// handshake and ask to publish.
 const SETUP: Duration = Duration::from_secs(10);
 
-pub async fn listen(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "RTMP listening");
-    serve(app, listener).await
+/// How a listener learns the publisher's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Front {
+    /// The TCP peer is the publisher (`SAPFLOW_RTMP_ADDR`).
+    Direct,
+    /// Every connection comes from this front and starts with a PROXY
+    /// protocol v2 header naming the publisher (`SAPFLOW_RTMP_PROXY_ADDR`).
+    Proxied(IpAddr),
 }
 
-async fn serve(app: Arc<App>, listener: impl crate::accept::Accept) -> std::io::Result<()> {
-    let active = Arc::new(AtomicUsize::new(0));
+/// Listens on `addr`. `active` counts unfinished connections, and is shared
+/// by the plain and proxied listeners so that together they keep one cap.
+pub async fn listen(
+    app: Arc<App>,
+    addr: SocketAddr,
+    front: Front,
+    active: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    match front {
+        Front::Direct => tracing::info!(%addr, "RTMP listening"),
+        Front::Proxied(trusted) => {
+            tracing::info!(%addr, %trusted, "RTMP listening behind a PROXY protocol v2 front");
+        }
+    }
+    serve(app, listener, front, active).await
+}
+
+async fn serve(
+    app: Arc<App>,
+    listener: impl crate::accept::Accept,
+    front: Front,
+    active: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
     let mut warnings = crate::accept::Warnings::default();
     loop {
-        let (sock, peer) = crate::accept::next(&listener, "RTMP", &mut warnings).await;
+        let (mut sock, peer) = crate::accept::next(&listener, "RTMP", &mut warnings).await;
         // Connections, not publishers: a flood of idle sockets is bounded
         // by SETUP and this cap.
         if active.load(Ordering::Relaxed) >= app.config.max_publishers * 4 {
@@ -51,10 +88,70 @@ async fn serve(app: Arc<App>, listener: impl crate::accept::Accept) -> std::io::
         tokio::spawn(async move {
             // Held until the task ends, even if it panics.
             let _slot = slot;
-            if let Err(e) = connection(&app, sock, peer.ip()).await {
-                tracing::info!(error = %e, "RTMP connection ended");
+            // The header, the handshake and the publish request share it.
+            let setup_until = Instant::now() + SETUP;
+            let result = match front {
+                Front::Direct => {
+                    connection(&app, sock, peer.ip().to_canonical(), &[], setup_until).await
+                }
+                Front::Proxied(trusted) => {
+                    match proxy_header(&mut sock, peer, trusted, setup_until).await {
+                        Ok((from, rest)) => connection(&app, sock, from, &rest, setup_until).await,
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            match result {
+                Ok(()) => {}
+                // The front's address, not a publisher's: logged so that a
+                // wrong SAPFLOW_RTMP_TRUSTED_PROXY says what the peer was.
+                Err(e @ End::Proxy(proxy_protocol::Error::UntrustedPeer)) => {
+                    tracing::info!(error = %e, %peer, "RTMP connection ended");
+                }
+                Err(e) => tracing::info!(error = %e, "RTMP connection ended"),
             }
         });
+    }
+}
+
+/// Reads the PROXY protocol v2 header that starts a connection on the
+/// proxied listener, by `deadline`. Returns the publisher's address, with an
+/// IPv4-mapped address as IPv4, and the bytes read past the header, which
+/// are the start of the RTMP handshake. A peer other than `trusted` is
+/// refused before a byte is read. LOCAL, the front's own connection such as
+/// a health check, is refused once its header is in: there is no publisher
+/// behind it, and taking the front as one would put its checks under the
+/// throttle. Nothing here holds more than a header (at most
+/// `proxy_protocol::MAX_HEADER_LEN` bytes) and one read past it.
+async fn proxy_header(
+    sock: &mut TcpStream,
+    peer: SocketAddr,
+    trusted: IpAddr,
+    deadline: Instant,
+) -> Result<(IpAddr, Vec<u8>), End> {
+    if !proxy_protocol::is_trusted_proxy(peer.ip(), trusted) {
+        return Err(End::Proxy(proxy_protocol::Error::UntrustedPeer));
+    }
+    let mut buf = Vec::with_capacity(proxy_protocol::MAX_HEADER_LEN);
+    let mut chunk = [0u8; 1024];
+    loop {
+        match proxy_protocol::parse(&buf) {
+            Ok(Parsed::Complete { header, consumed }) => {
+                return match header.command() {
+                    Command::Proxy { .. } => Ok((
+                        header.client_address(peer).ip(),
+                        buf.get(consumed..).unwrap_or_default().to_vec(),
+                    )),
+                    // LOCAL, and any command a later parser adds: no
+                    // publisher behind it that we know how to name.
+                    _ => Err(End::ProxyLocal),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => return Err(End::Proxy(e)),
+        }
+        let n = read_some(sock, &mut chunk, deadline).await?;
+        buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
     }
 }
 
@@ -79,6 +176,10 @@ enum End {
     Io(std::io::Error),
     Protocol(String),
     Idle,
+    /// A refused PROXY header, or a peer that is not the trusted front.
+    Proxy(proxy_protocol::Error),
+    /// A PROXY LOCAL header: the front's own connection, with no publisher.
+    ProxyLocal,
 }
 
 impl std::fmt::Display for End {
@@ -87,6 +188,8 @@ impl std::fmt::Display for End {
             Self::Io(e) => write!(f, "{e}"),
             Self::Protocol(e) => write!(f, "protocol: {e}"),
             Self::Idle => f.write_str("idle"),
+            Self::Proxy(e) => write!(f, "PROXY protocol: {e}"),
+            Self::ProxyLocal => f.write_str("PROXY LOCAL: the front's own connection"),
         }
     }
 }
@@ -106,17 +209,29 @@ async fn read_some(sock: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> R
     }
 }
 
-async fn connection(app: &Arc<App>, mut sock: TcpStream, from: IpAddr) -> Result<(), End> {
+/// One RTMP connection from `from`. `initial` is what came before the
+/// first read, after a PROXY header in the same segment; the handshake and
+/// the publish request must finish by `setup_until`.
+async fn connection(
+    app: &Arc<App>,
+    mut sock: TcpStream,
+    from: IpAddr,
+    initial: &[u8],
+    setup_until: Instant,
+) -> Result<(), End> {
     let _ = sock.set_nodelay(true);
     let mut buf = vec![0u8; 64 * 1024];
     // S1 and S2's filler: unpredictable is nice, not needed.
     let mut rtmp = Connection::new(RandomState::new().hash_one(from));
+    if !initial.is_empty() {
+        rtmp.feed(initial)
+            .map_err(|e| End::Protocol(e.to_string()))?;
+    }
     let mut conn = Conn {
         app,
         from,
         publication: None,
     };
-    let setup_until = Instant::now() + SETUP;
     let mut protocol_failed = false;
     let result = loop {
         let mut finished = false;
@@ -299,7 +414,9 @@ mod tests {
             let (server, peer) = listener.accept().await.expect("accept fixture");
             drop(listener);
             let app = fixture.app.clone();
-            let server = tokio::spawn(async move { connection(&app, server, peer.ip()).await });
+            let server = tokio::spawn(async move {
+                connection(&app, server, peer.ip(), &[], Instant::now() + SETUP).await
+            });
             let mut publisher = Publisher::new(
                 PublisherConfig::new(
                     "live".into(),
@@ -400,7 +517,12 @@ mod tests {
             .expect("owned loopback listener");
         let address = inner.local_addr().expect("owned address");
         let listener = crate::accept::testing::Flaky::new(inner, 2);
-        let server = tokio::spawn(serve(fixture.app.clone(), listener));
+        let server = tokio::spawn(serve(
+            fixture.app.clone(),
+            listener,
+            Front::Direct,
+            Arc::new(AtomicUsize::new(0)),
+        ));
         let mut socket = TcpStream::connect(address).await.expect("connect");
         let mut c0c1 = vec![3u8];
         c0c1.resize(1 + 1536, 0);
@@ -637,5 +759,211 @@ mod tests {
             .end();
         assert_eq!(fixture.app.streams.active_rtmp_publishers(), 0);
         assert!(fixture.callbacks.is_empty());
+    }
+
+    /// A PROXY protocol v2 header for a TCP/IPv4 connection from `source`
+    /// to a front on 192.0.2.1:443.
+    fn proxy_v2(source: SocketAddr) -> Vec<u8> {
+        let SocketAddr::V4(v4) = source else {
+            panic!("an IPv4 fixture")
+        };
+        let mut header = proxy_protocol::SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x21, 0x11, 0, 12]);
+        header.extend_from_slice(&v4.ip().octets());
+        header.extend_from_slice(&[192, 0, 2, 1]);
+        header.extend_from_slice(&v4.port().to_be_bytes());
+        header.extend_from_slice(&443u16.to_be_bytes());
+        header
+    }
+
+    /// LOCAL: the front's own connection, with no addresses.
+    fn proxy_v2_local() -> Vec<u8> {
+        let mut header = proxy_protocol::SIGNATURE.to_vec();
+        header.extend_from_slice(&[0x20, 0x00, 0, 0]);
+        header
+    }
+
+    fn c0c1() -> Vec<u8> {
+        let mut bytes = vec![3u8];
+        bytes.resize(1 + 1536, 0);
+        bytes
+    }
+
+    async fn proxied_listener(
+        app: Arc<App>,
+        trusted: &str,
+    ) -> (SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("owned loopback listener");
+        let address = listener.local_addr().expect("owned address");
+        let front = Front::Proxied(trusted.parse().expect("front address"));
+        let server = tokio::spawn(serve(app, listener, front, Arc::new(AtomicUsize::new(0))));
+        (address, server)
+    }
+
+    /// Writes `prefix` and the client's first bytes in one segment, then
+    /// runs the client over the socket until it is publishing.
+    async fn publish_through(socket: &mut TcpStream, prefix: Vec<u8>, key: &str) -> bool {
+        let mut client = Publisher::new(
+            PublisherConfig::new("live".into(), key.into(), "rtmp://localhost/live".into()),
+            11,
+            0,
+        )
+        .expect("bounded client");
+        let mut first = prefix;
+        first.extend_from_slice(&client.take_output());
+        socket.write_all(&first).await.expect("header and C0 C1");
+        let mut buf = vec![0u8; 64 * 1024];
+        for step in 0..64 {
+            let n = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
+                .await
+                .expect("the server answers")
+                .expect("read");
+            if n == 0 || client.feed(&buf[..n], step).is_err() {
+                return false;
+            }
+            let out = client.take_output();
+            if !out.is_empty() {
+                socket.write_all(&out).await.expect("client bytes");
+            }
+            if client.state() == PublisherState::Publishing {
+                return true;
+            }
+        }
+        panic!("the handshake did not finish");
+    }
+
+    /// RTMPS through a front: the app's publish check sees the publisher's
+    /// own address from the header, not the front's. The header arrives in
+    /// two writes, and the handshake's first bytes in the same segment as
+    /// its end.
+    #[tokio::test]
+    async fn a_proxied_publisher_is_known_by_the_address_in_its_header() {
+        use crate::publish_auth::stub::{self, Answer};
+        let stub = stub::start(Answer::Status(200)).await;
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.recordings = None;
+        app.config.publish_auth = Some(stub.endpoint.clone());
+        let (address, server) = proxied_listener(fixture.app.clone(), "127.0.0.1").await;
+        let mut socket = TcpStream::connect(address).await.expect("connect");
+        let header = proxy_v2("203.0.113.7:50000".parse().expect("source"));
+        let (start, rest) = header.split_at(7);
+        socket
+            .write_all(start)
+            .await
+            .expect("first part of the header");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let published = publish_through(
+            &mut socket,
+            rest.to_vec(),
+            "event-one?user=encoder&pass=gig-secret",
+        )
+        .await;
+        assert!(published);
+        let sent = stub.last();
+        assert_eq!(sent["ip"], "203.0.113.7");
+        assert_eq!(sent["path"], "live/event-one");
+        drop(socket);
+        server.abort();
+    }
+
+    /// The failed-attempt throttle keys on the header's address: one
+    /// throttled publisher behind the front does not lock out another, and
+    /// the throttled one is refused before the app is asked.
+    #[tokio::test]
+    async fn the_throttle_keys_on_the_address_in_the_header() {
+        use crate::publish_auth::stub::{self, Answer};
+        let stub = stub::start(Answer::Status(200)).await;
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.recordings = None;
+        app.config.publish_auth = Some(stub.endpoint.clone());
+        let noisy: SocketAddr = "203.0.113.7:50000".parse().expect("source");
+        {
+            let mut throttle = fixture.app.auth_throttle.lock().expect("throttle");
+            for _ in 0..10 {
+                throttle.failed(noisy.ip(), Instant::now().into_std());
+            }
+        }
+        let (address, server) = proxied_listener(fixture.app.clone(), "127.0.0.1").await;
+        let key = "event-one?user=encoder&pass=gig-secret";
+        let mut socket = TcpStream::connect(address).await.expect("connect");
+        assert!(
+            !publish_through(&mut socket, proxy_v2(noisy), key).await,
+            "the throttled address is refused"
+        );
+        assert_eq!(stub.count(), 0, "refused before the app is asked");
+        let mut socket = TcpStream::connect(address).await.expect("connect");
+        let other = "198.51.100.9:50001".parse().expect("source");
+        assert!(
+            publish_through(&mut socket, proxy_v2(other), key).await,
+            "another publisher behind the same front is not throttled"
+        );
+        assert_eq!(stub.last()["ip"], "198.51.100.9");
+        drop(socket);
+        server.abort();
+    }
+
+    /// The proxied listener answers no handshake for a peer that is not the
+    /// front, for LOCAL, for a connection without a header and for a version
+    /// 1 header: each is closed with nothing sent back.
+    #[tokio::test]
+    async fn the_proxied_listener_answers_only_a_header_from_its_front() {
+        let fixture = crate::publish::loss_tests::Fixture::new();
+        let source: SocketAddr = "203.0.113.7:50000".parse().expect("source");
+        let with = |mut prefix: Vec<u8>| {
+            prefix.extend_from_slice(&c0c1());
+            prefix
+        };
+        for (trusted, first, why) in [
+            (
+                "192.0.2.99",
+                with(proxy_v2(source)),
+                "a peer that is not the front",
+            ),
+            ("127.0.0.1", with(proxy_v2_local()), "LOCAL"),
+            ("127.0.0.1", c0c1(), "plain RTMP without a header"),
+            (
+                "127.0.0.1",
+                with(b"PROXY TCP4 203.0.113.7 192.0.2.1 50000 443\r\n".to_vec()),
+                "a version 1 header",
+            ),
+        ] {
+            let (address, server) = proxied_listener(fixture.app.clone(), trusted).await;
+            let mut socket = TcpStream::connect(address).await.expect("connect");
+            // The server may close first; what it sends back is the test.
+            let _ = socket.write_all(&first).await;
+            let mut s0 = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut s0))
+                .await
+                .expect("closed promptly");
+            assert!(
+                matches!(read, Ok(0) | Err(_)),
+                "{why}: nothing is answered, got {read:?}"
+            );
+            server.abort();
+        }
+    }
+
+    /// A header that never completes ends the connection at its deadline.
+    #[tokio::test]
+    async fn an_unfinished_header_ends_at_the_setup_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("owned loopback listener");
+        let address = listener.local_addr().expect("owned address");
+        let mut client = TcpStream::connect(address).await.expect("connect");
+        let (mut server, peer) = listener.accept().await.expect("accept");
+        let header = proxy_v2("203.0.113.7:50000".parse().expect("source"));
+        client
+            .write_all(&header[..20])
+            .await
+            .expect("part of a header");
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let trusted = "127.0.0.1".parse().expect("front");
+        let result = proxy_header(&mut server, peer, trusted, deadline).await;
+        assert!(matches!(result, Err(End::Idle)), "{result:?}");
     }
 }

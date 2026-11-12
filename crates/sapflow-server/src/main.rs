@@ -229,11 +229,26 @@ async fn run(config: Config) -> std::io::Result<()> {
         }
     });
     let srt_task = tokio::spawn(srt::listen(app.clone(), app.config.srt_addr));
+    // Unfinished RTMP connections, counted across both listeners.
+    let rtmp_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let rtmp_task = tokio::spawn({
         let app = app.clone();
+        let active = rtmp_active.clone();
         async move {
             match app.config.rtmp_addr {
-                Some(addr) => rtmp::listen(app.clone(), addr).await,
+                Some(addr) => rtmp::listen(app.clone(), addr, rtmp::Front::Direct, active).await,
+                None => std::future::pending().await,
+            }
+        }
+    });
+    let rtmp_proxy_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            match app.config.rtmp_proxy {
+                Some(proxy) => {
+                    let front = rtmp::Front::Proxied(proxy.trusted);
+                    rtmp::listen(app.clone(), proxy.addr, front, rtmp_active).await
+                }
                 None => std::future::pending().await,
             }
         }
@@ -277,6 +292,10 @@ async fn run(config: Config) -> std::io::Result<()> {
             Err(e) => Err(std::io::Error::other(e)),
         },
         r = rtmp_task => match r {
+            Ok(r) => r,
+            Err(e) => Err(std::io::Error::other(e)),
+        },
+        r = rtmp_proxy_task => match r {
             Ok(r) => r,
             Err(e) => Err(std::io::Error::other(e)),
         },

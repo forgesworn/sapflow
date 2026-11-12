@@ -32,6 +32,15 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_SRT_ENCRYPTION   required (default) or optional: with a passphrase,
                            optional also admits callers that send none
   SAPFLOW_RTMP_ADDR        RTMP listener (default 0.0.0.0:1935; off disables)
+  SAPFLOW_RTMP_PROXY_ADDR  a second RTMP listener, for a TLS front that sends
+                           PROXY protocol v2 (RTMPS through Caddy layer4 or
+                           HAProxy): each connection must come from
+                           SAPFLOW_RTMP_TRUSTED_PROXY and start with the header,
+                           whose source is the publisher's address (default off)
+  SAPFLOW_RTMP_TRUSTED_PROXY  the front's address as this server sees it, the
+                           only peer SAPFLOW_RTMP_PROXY_ADDR accepts; keep that
+                           port reachable from the front only (under Docker,
+                           publish it on 127.0.0.1)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
   SAPFLOW_CONTROL_ADDR     enable scoped SRT publishing: private loopback control
                            listener, behind an authenticated private TLS proxy
@@ -141,6 +150,8 @@ const KEYS: &[&str] = &[
     "SAPFLOW_HTTP_THREADS",
     "SAPFLOW_HTTP_BODY_TIMEOUT",
     "SAPFLOW_RTMP_ADDR",
+    "SAPFLOW_RTMP_PROXY_ADDR",
+    "SAPFLOW_RTMP_TRUSTED_PROXY",
     "SAPFLOW_RECORDINGS",
     "SAPFLOW_RECORD_SKIP",
     "SAPFLOW_RECORD_DELETE_AFTER",
@@ -372,6 +383,18 @@ pub struct ControlConfig {
     pub store: PathBuf,
 }
 
+/// The RTMP listener for a TLS front (RTMPS) that sends PROXY protocol v2, so
+/// that limits, logs and the app's publish check see each publisher's own
+/// address rather than the front's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtmpProxy {
+    /// Where it listens.
+    pub addr: SocketAddr,
+    /// The front's address as this server sees it: the only peer accepted,
+    /// and the only one whose header is believed.
+    pub trusted: IpAddr,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub control: Option<ControlConfig>,
@@ -381,6 +404,9 @@ pub struct Config {
     /// With `srt_crypto`, also admit SRT callers that do not encrypt.
     pub srt_allow_plaintext: bool,
     pub rtmp_addr: Option<SocketAddr>,
+    /// A second RTMP listener behind a PROXY protocol v2 front
+    /// (`SAPFLOW_RTMP_PROXY_ADDR`), and the one peer it accepts.
+    pub rtmp_proxy: Option<RtmpProxy>,
     pub http_addr: SocketAddr,
     /// `None` when open publishing was asked for explicitly, in scoped mode,
     /// or when the app authorises each publisher (`publish_auth`).
@@ -510,7 +536,10 @@ impl Config {
                 || vals.contains_key("SAPFLOW_SRT_CIPHER")
                 || vals.contains_key("SAPFLOW_SRT_PBKEYLEN")
                 || vals.contains_key("SAPFLOW_SRT_ENCRYPTION")
-                || vals.get("SAPFLOW_RTMP_ADDR").is_some_and(|v| v != "off"))
+                || vals.get("SAPFLOW_RTMP_ADDR").is_some_and(|v| v != "off")
+                || vals
+                    .get("SAPFLOW_RTMP_PROXY_ADDR")
+                    .is_some_and(|v| v != "off"))
         {
             return Err(ConfigError::Invalid("scoped control mode requires per-session encrypted SRT; global/open/app-authorised publishing, global SRT keys and RTMP are disabled".into()));
         }
@@ -578,6 +607,36 @@ impl Config {
             _ if control.is_some() => None,
             Some("off") => None,
             _ => Some(addr("SAPFLOW_RTMP_ADDR", "0.0.0.0:1935")?),
+        };
+        let rtmp_proxy = match (
+            vals.get("SAPFLOW_RTMP_PROXY_ADDR").map(String::as_str),
+            vals.get("SAPFLOW_RTMP_TRUSTED_PROXY"),
+        ) {
+            (None | Some("off"), None) => None,
+            (None | Some("off"), Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_RTMP_TRUSTED_PROXY needs SAPFLOW_RTMP_PROXY_ADDR".into(),
+                ));
+            }
+            (Some(_), None) => {
+                return Err(ConfigError::Invalid(
+                    "SAPFLOW_RTMP_PROXY_ADDR needs SAPFLOW_RTMP_TRUSTED_PROXY, the only peer whose PROXY header is believed".into(),
+                ));
+            }
+            (Some(_), Some(trusted)) => {
+                let proxy = RtmpProxy {
+                    addr: addr("SAPFLOW_RTMP_PROXY_ADDR", "")?,
+                    trusted: trusted.parse().map_err(|_| {
+                        ConfigError::Invalid("SAPFLOW_RTMP_TRUSTED_PROXY: an IP address".into())
+                    })?,
+                };
+                if rtmp_addr == Some(proxy.addr) {
+                    return Err(ConfigError::Invalid(
+                        "SAPFLOW_RTMP_PROXY_ADDR must differ from SAPFLOW_RTMP_ADDR: one listener takes PROXY headers, the other plain RTMP".into(),
+                    ));
+                }
+                Some(proxy)
+            }
         };
         let record_delete_after = match vals.get("SAPFLOW_RECORD_DELETE_AFTER") {
             None => Duration::from_secs(7 * 86_400),
@@ -809,6 +868,7 @@ impl Config {
             recording_roll,
             max_publish_bps,
             rtmp_addr,
+            rtmp_proxy,
             recordings: vals.get("SAPFLOW_RECORDINGS").map(PathBuf::from),
             record_policy: RecordPolicy::parse(
                 vals.get("SAPFLOW_RECORD_SKIP").map_or("", String::as_str),
@@ -1145,6 +1205,69 @@ mod tests {
     }
 
     #[test]
+    fn the_rtmp_proxy_listener_needs_its_trusted_front() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        let c = load(
+            &[
+                open,
+                ("SAPFLOW_RTMP_PROXY_ADDR", "0.0.0.0:1936"),
+                ("SAPFLOW_RTMP_TRUSTED_PROXY", "172.18.0.1"),
+            ],
+            &[],
+        )
+        .expect("a proxied listener with its front");
+        assert_eq!(
+            c.rtmp_proxy,
+            Some(RtmpProxy {
+                addr: "0.0.0.0:1936".parse().expect("address"),
+                trusted: "172.18.0.1".parse().expect("address"),
+            })
+        );
+        assert_eq!(
+            c.rtmp_addr.map(|a| a.port()),
+            Some(1935),
+            "plain RTMP stays"
+        );
+        let off = load(&[open, ("SAPFLOW_RTMP_PROXY_ADDR", "off")], &[]).expect("off");
+        assert!(off.rtmp_proxy.is_none());
+        for (env, why) in [
+            (
+                vec![("SAPFLOW_RTMP_PROXY_ADDR", "0.0.0.0:1936")],
+                "no trusted front",
+            ),
+            (
+                vec![("SAPFLOW_RTMP_TRUSTED_PROXY", "172.18.0.1")],
+                "no listener",
+            ),
+            (
+                vec![
+                    ("SAPFLOW_RTMP_PROXY_ADDR", "0.0.0.0:1936"),
+                    ("SAPFLOW_RTMP_TRUSTED_PROXY", "172.18.0.0/16"),
+                ],
+                "a range, not an address",
+            ),
+            (
+                vec![
+                    ("SAPFLOW_RTMP_PROXY_ADDR", "1936"),
+                    ("SAPFLOW_RTMP_TRUSTED_PROXY", "172.18.0.1"),
+                ],
+                "not a socket address",
+            ),
+            (
+                vec![
+                    ("SAPFLOW_RTMP_PROXY_ADDR", "0.0.0.0:1935"),
+                    ("SAPFLOW_RTMP_TRUSTED_PROXY", "172.18.0.1"),
+                ],
+                "the plain listener's address",
+            ),
+        ] {
+            let mut env = env;
+            env.push(open);
+            assert!(load(&env, &[]).is_err(), "{why}");
+        }
+    }
+
+    #[test]
     fn defaults_with_a_publisher() {
         let c = load(
             &[("SAPFLOW_PUBLISH_USER", "u"), ("SAPFLOW_PUBLISH_PASS", "p")],
@@ -1416,6 +1539,7 @@ mod tests {
         assert!(!c.record_policy.records(&loop_path));
         let d = load(&[("SAPFLOW_OPEN_PUBLISH", "1")], &[]).expect("config");
         assert_eq!(d.rtmp_addr.map(|a| a.port()), Some(1935));
+        assert!(d.rtmp_proxy.is_none());
         assert!(d.recordings.is_none());
         assert!(matches!(
             load(
@@ -1683,6 +1807,7 @@ mod tests {
         assert!(config.control.is_some());
         assert!(config.publisher.is_none());
         assert!(config.rtmp_addr.is_none());
+        assert!(config.rtmp_proxy.is_none());
         assert!(config.srt_crypto.is_none());
         assert!(!format!("{config:?}").contains("independent-control-token"));
         for (key, value) in [
@@ -1693,6 +1818,7 @@ mod tests {
             ("SAPFLOW_SRT_PBKEYLEN", "32"),
             ("SAPFLOW_SRT_ENCRYPTION", "optional"),
             ("SAPFLOW_RTMP_ADDR", "127.0.0.1:1935"),
+            ("SAPFLOW_RTMP_PROXY_ADDR", "127.0.0.1:1936"),
         ] {
             let mut values = base.to_vec();
             values.push((key, value));
