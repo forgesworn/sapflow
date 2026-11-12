@@ -286,10 +286,15 @@ fn aac_ingest() -> EsIngest {
     es
 }
 
-/// The codec epoch change in the fixture, then the stream's end.
+/// The codec epoch change with the fixture in time order, then the end.
 #[test]
 fn an_epoch_change_keeps_every_video_and_aac_frame() {
-    let events = events();
+    let mut events = events();
+    let from = events
+        .iter()
+        .position(|e| e.at() >= CHANGE - 9_000)
+        .expect("the change");
+    events[from..].sort_by_key(Event::at);
     let mut es = aac_ingest();
     let mut watch = Watch::default();
     let up = feed(&mut es, &events, &mut watch);
@@ -297,6 +302,70 @@ fn an_epoch_change_keeps_every_video_and_aac_frame() {
     assert!(!up.media_loss, "nothing lost");
     assert!(!finish(&mut es, &mut watch).media_loss);
     assert_all_out(&es, &events, "epoch change");
+    assert_continuous_audio(es.muxer().expect("muxer"));
+}
+
+/// In the fixture's own order, its audio PES arrive up to 200 ms after the
+/// video they go with (FFmpeg packs several AAC frames a PES). The frame
+/// stamped just before the change (3.4213 s) then arrives after the new
+/// run's first part has closed: no part it fits is open, so it is dropped
+/// and reported. Everything else comes out.
+#[test]
+fn late_audio_after_the_new_runs_first_part_is_reported() {
+    let events = events();
+    let mut es = aac_ingest();
+    let mut watch = Watch::default();
+    let up = feed(&mut es, &events, &mut watch);
+    assert!(up.restarted && up.media_loss, "the late frame is reported");
+    finish(&mut es, &mut watch);
+    let late = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Aac(pts, _, p) if *pts == 307_920 => Some(p.clone()),
+            _ => None,
+        })
+        .expect("the late frame");
+    let kept: Vec<Event> = events
+        .iter()
+        .filter(|e| !matches!(e, Event::Aac(_, _, p) if *p == late))
+        .cloned()
+        .collect();
+    assert_all_out(&es, &kept, "late audio");
+    assert_continuous_audio_but_for(es.muxer().expect("muxer"), 1024);
+}
+
+/// As [`assert_continuous_audio`], but allowing one gap of up to
+/// `samples`, where a frame was dropped.
+fn assert_continuous_audio_but_for(m: &Muxer, samples: u64) {
+    let mut end: Option<u64> = None;
+    let mut gaps = 0;
+    for part in parts(m) {
+        let moof = Moof::decode(&mut part.data.as_ref()).expect("moof");
+        let Some(audio) = moof.traf.iter().find(|t| t.tfhd.track_id == AUDIO_TRACK) else {
+            continue;
+        };
+        let base = audio.tfdt.as_ref().expect("tfdt").base_media_decode_time;
+        if let Some(previous) = end
+            && base.abs_diff(previous) > 2
+        {
+            assert!(
+                base > previous && base - previous <= samples + 2,
+                "part {}: a gap of {} samples",
+                part.id,
+                base as i64 - previous as i64
+            );
+            gaps += 1;
+        }
+        end = Some(
+            base + audio
+                .trun
+                .iter()
+                .flat_map(|r| &r.entries)
+                .map(|e| u64::from(e.duration.expect("duration")))
+                .sum::<u64>(),
+        );
+    }
+    assert!(gaps <= 1, "{gaps} gaps");
 }
 
 /// As above, but video pauses 300 ms before the new IDR while audio carries

@@ -487,6 +487,16 @@ pub struct Muxer {
     /// The run after a cut opens its first part at its keyframe, so audio
     /// that arrives before its second frame has a part to join.
     open_at_keyframe: bool,
+    /// After a cut on a continuing clock: audio stamped from the old run's
+    /// end up to the new run's keyframe, which may still arrive. It joins
+    /// the new run's first part while that is open; after that it has no
+    /// part its time fits and is dropped and reported.
+    late_audio: Option<(i64, i64)>,
+    /// The new run's first part has closed: audio in `late_audio`'s span
+    /// is now lost.
+    late_closed: bool,
+    /// Audio was lost that no update has reported yet.
+    unreported_loss: bool,
 
     entries: VecDeque<Entry>,
     media_sequence: u64,
@@ -711,6 +721,9 @@ impl Muxer {
             last_frame_ticks: None,
             carried_audio: Vec::new(),
             open_at_keyframe: false,
+            late_audio: None,
+            late_closed: false,
+            unreported_loss: false,
             entries: VecDeque::new(),
             media_sequence: 0,
             parts: VecDeque::new(),
@@ -762,6 +775,9 @@ impl Muxer {
             last_frame_ticks,
             carried_audio,
             open_at_keyframe,
+            late_audio,
+            late_closed,
+            unreported_loss,
             entries,
             media_sequence,
             parts,
@@ -891,7 +907,8 @@ impl Muxer {
              {timing:?} {learning:?} {target:?} {offset} {rebase_to:?} \
              {presented_end:?} {audio_floor} {discontinuity_next} \
              {discontinuity_sequence} {breaks} {hold_gap} {window_byte_capped} \
-             {last_frame_ticks:?} {:?} {open_at_keyframe}",
+             {last_frame_ticks:?} {:?} {open_at_keyframe} {late_audio:?} {late_closed} \
+             {unreported_loss}",
             init.id,
             init.data.len(),
             pending(pending_video),
@@ -1311,6 +1328,20 @@ impl Muxer {
         data: Bytes,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
+        let mut update = self.push_video_inner(dts, pts, sync, data, now)?;
+        // Audio dropped since the last update (late audio after a cut).
+        update.media_loss |= std::mem::take(&mut self.unreported_loss);
+        Ok(update)
+    }
+
+    fn push_video_inner(
+        &mut self,
+        dts: i64,
+        pts: i64,
+        sync: bool,
+        data: Bytes,
+        now: SystemTime,
+    ) -> Result<Update, MuxError> {
         self.check_fragment_admission()?;
         if self.video.is_none() {
             return Err(MuxError::InvalidTracks);
@@ -1485,12 +1516,18 @@ impl Muxer {
     }
 
     /// The encoder went away; another connection may carry on the stream.
-    /// Ends the current run as a break does, at the last frame (which is
-    /// dropped, its duration unknown): whatever video arrives next, from
-    /// any clock, waits for a keyframe, is moved to carry straight on in
-    /// output time, and opens a segment marked as a discontinuity.
-    /// Audio-only seals every accepted complete AAC frame, whose duration is
-    /// known, then rebases the next run after a discontinuity.
+    /// Ends the current run, keeping what it holds: the held audio frame
+    /// with its own duration, and the held video frame, whose duration is
+    /// unknown, for as long as the frame before it, or until the end of the
+    /// audio received if that is later (the last picture holds). Audio past
+    /// a full part goes in one short final part. Only what still cannot fit
+    /// the part target and the segment limit is dropped, and then the
+    /// update says `media_loss`. Whatever video arrives next, from any
+    /// clock, waits for a keyframe, is moved to carry straight on in output
+    /// time, opens its part at once, and starts a segment marked as a
+    /// discontinuity. Audio-only seals every accepted frame, whose duration
+    /// is known, then rebases the next run after a discontinuity. For a cut
+    /// on a clock that carries on, see [`Muxer::reconfigure_with_audio_at`].
     pub fn interrupt(&mut self, now: SystemTime) -> Update {
         self.interrupt_cut(None, now)
     }
@@ -1539,6 +1576,7 @@ impl Muxer {
             };
         }
         self.open_at_keyframe = true;
+        self.late_audio = None;
         let (end, lost) = match self.flush_held(cur, now) {
             Ok(flushed) => flushed,
             Err(_) => return self.interrupt_refused(now),
@@ -1646,6 +1684,8 @@ impl Muxer {
         // Half-way through the last audio frame received: a repeat of it is
         // refused, and the frame after it (whatever its rounding) joins.
         self.audio_floor = audio.map_or(next, |(at, end)| at + (end - at) / 2);
+        self.late_audio = Some((self.audio_floor, next));
+        self.late_closed = false;
         self.open_at_keyframe = true;
         Ok(Update {
             part: fits || closed,
@@ -2478,6 +2518,15 @@ impl Muxer {
         let at =
             i64::try_from(i128::from(cur.dts) * i128::from(VIDEO_TIMESCALE) / i128::from(rate))
                 .expect("nonnegative AAC input converted within the 90 kHz input range");
+        if self.late_closed
+            && self
+                .late_audio
+                .is_some_and(|(from, to)| (from..to).contains(&at))
+        {
+            // Stamped before the new run, arriving after its first part.
+            self.unreported_loss = true;
+            return Ok(());
+        }
         if at < self.audio_floor {
             return Ok(());
         }
@@ -2506,6 +2555,13 @@ impl Muxer {
         let Some(mut part) = self.part.take() else {
             return Ok(());
         };
+        if let Some((_, start)) = self.late_audio
+            && !self.late_closed
+            && part.start_dts >= start
+        {
+            // The new run's first part: late audio has no later place.
+            self.late_closed = true;
+        }
         let split = part
             .audio_times
             .iter()

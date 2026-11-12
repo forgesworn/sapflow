@@ -338,7 +338,7 @@ async fn a_mid_stream_resolution_change_rolls_the_recording_and_both_files_decod
     const CHANGE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-change.ts");
     let (mut app, scratch) = app(true);
     let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
-    let (callbacks, _receiver) = crate::callback::test_queue(scope, 32);
+    let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
     Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
     let mut publisher = begin(&app);
     // As SRT delivers it: one datagram's worth at a time.
@@ -475,6 +475,33 @@ async fn a_mid_stream_resolution_change_rolls_the_recording_and_both_files_decod
     assert!(
         video >= cut_video && audio >= cut_audio && cut_video > 0,
         "the new recording: {recorded:?} for ({cut_video}, {cut_audio}) cut"
+    );
+    // Every input frame, counted: the fixture has 60 video frames each side
+    // of the change. The first file has all 60, the held frame at the
+    // change included; the second all but the last, whose PES never ended
+    // (TS finish leaves an unbounded final PES out).
+    assert_eq!((recorded[first].0, video), (60, 59), "video frames");
+    // The fixture's AAC PES arrive up to 200 ms behind their video, so the
+    // frame stamped just before the change arrives after the new run's
+    // first part: it is dropped, and the file that follows says so.
+    let mut done = Vec::new();
+    while let Ok(callback) = receiver.try_recv() {
+        let body: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("recording callback JSON");
+        if body["event"] == "recordSegmentComplete" {
+            done.push(body);
+        }
+    }
+    let state = |file: &std::path::Path| {
+        done.iter()
+            .find(|b| b["segmentPath"].as_str() == file.to_str())
+            .map(|b| (b["recordingState"].clone(), b["recordingReason"].clone()))
+            .expect("a callback for the file")
+    };
+    assert_eq!(state(&files[first]).0, "finalised");
+    assert_eq!(
+        state(&files[1 - first]),
+        ("incomplete".into(), "media-loss".into())
     );
 }
 
