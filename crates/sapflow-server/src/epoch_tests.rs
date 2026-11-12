@@ -1273,7 +1273,8 @@ fn epochs_of(pattern: &[bool]) -> Vec<Frame> {
 /// One publication of `frames` through the elementary-stream path with the
 /// given roll limit: after each codec change while files are still being
 /// rolled, real time for the last file's writer to finish (two writers a
-/// path), as an encoder's seconds between changes give it.
+/// path), as an encoder's seconds between changes give it, and a moment
+/// every hundred frames for the writer to keep up.
 struct EpochRun {
     app: Arc<crate::App>,
     receiver: tokio::sync::mpsc::Receiver<crate::callback::Queued>,
@@ -1329,7 +1330,13 @@ impl EpochRun {
                 .muxer()
                 .map(|m| m.current_initialization_id())
         };
-        for frame in frames {
+        for (i, frame) in frames.iter().enumerate() {
+            // Media arrives over time: give the writer a moment every few
+            // parts, as real time does, so a loaded machine's writer is not
+            // left behind (writer-behind) by a whole show fed at once.
+            if i % 100 == 99 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             let before = epoch(publisher);
             publisher
                 .push(|source, now| {
