@@ -965,9 +965,10 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   that, or if the reports disagree with arrival times by more than 500 ms,
   the streams are aligned by arrival time. `sapflow-rtp` says which, and why,
   in an `Aligned` event before the first frame, which the server logs at
-  debug (`WHIP timeline aligned`). Chrome 157's first sender reports come
-  about 3.5 s after it connects, so it is always aligned by arrival time
-  (A3.8, [status](#qualification-status-12-november-2026)).
+  debug (`WHIP timeline aligned`). Headless Chrome 157's sender reports for
+  both streams had arrived only about 3.5 s after it connected, so in all
+  20 of its A3.8 runs it was aligned by arrival time
+  ([status](#qualification-status-12-november-2026)).
 - After start, timestamps advance by RTP deltas, strictly increasing, and
   stay within 500 ms (`max_lead`) of arrival time either way, plus 0.1% of
   elapsed time up to another 500 ms. A little above that bound a timestamp is

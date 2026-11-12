@@ -6,13 +6,18 @@ session's start was aligned (`WHIP timeline aligned alignment=...`, at debug),
 which A3.8 needed. The rest is measurement tools (`scripts/whip-sync.js`,
 `scripts/whip-cost.py`), the WHIP part of `scripts/smoke.sh`, and a CI step.
 This note reports against [the WHIP ingest design](../whip-ingest.md) (A3.8,
-A3.9, A4.2).
+A3.9, A4.2). The raw results (every offset of every run, with its load,
+alignment, source offset and lateness; every cost run) are in
+`fixtures/whip/qualification-2026-11-12/`: `a38-chrome-udp.json`,
+`a38-chrome-tcp.json`, `a38-ffmpeg-udp.json`, `a38-chrome-udp-hold6s.json`,
+`a42-runs.tsv` and `a42-summary.tsv` (the driver's own summary, low to high
+per cell).
 
 ## Summary
 
 | Gate | Result | Status |
 |---|---|---|
-| A3.8 sync (EBU R37: audio at most 40 ms early, 60 ms late) | Chrome 157: 17 of 20 runs within (UDP 9 of 10, ICE-TCP 8 of 10); the three others had audio 43 to 49 ms early. Every Chrome run was aligned by arrival time, because Chrome's sender reports for both streams had arrived only 3.4 to 3.5 s after it connected, after Sapflow's 1.5 s start hold. FFmpeg 8.1.2 (sender reports at once): 10 of 10, 0 to 1.5 ms | **Not met.** The cause is Sapflow's start hold, not Chrome: with the hold lengthened to 6 s (an experiment, not committed) every Chrome run was aligned by sender reports and all five were within, at -2.3 to +15.7 ms. A decision point (below) |
+| A3.8 sync (EBU R37: audio at most 40 ms early, 60 ms late) | Chrome 157: 17 of 20 runs within (UDP 9 of 10, ICE-TCP 8 of 10); the three others had audio 41.6 to 49.3 ms early. Every Chrome run was aligned by arrival time, because Chrome's sender reports for both streams had arrived only 3.4 to 3.5 s after it connected, after Sapflow's 1.5 s start hold. FFmpeg 8.1.2 (sender reports at once): 10 of 10, 0 to 1.5 ms | **Not met.** The cause is Sapflow's start hold, not Chrome: with the hold lengthened to 6 s (an experiment, not committed) every Chrome run was aligned by sender reports and all five were within, at -2.3 to +15.7 ms. A decision point (below) |
 | A3.9 smoke | `scripts/smoke.sh` publishes WHIP with FFmpeg 8's WHIP muxer and checks refusals, LL-HLS, decoding, callbacks, `DELETE` and the recording; CI installs a pinned static FFmpeg 8.1.3 for it | **Met locally**: the whole smoke passed on the test host with Homebrew's FFmpeg 8.1.2. CI has not run it yet (not pushed). The pinned build ran in an emulated x86_64 Linux container (Debian 12) on the test host: it lists the WHIP muxer and encodes H.264 baseline and Opus; it has not published WHIP there |
 | A4.2 cost | 26 of 27 runs under the load gate. Per stream, WHIP's RSS was above SRT's in every round at 1 and 50 streams (at 50: 10.8 to 11.4 MB against 9.7 to 10.6 MB); its CPU against SRT's disagreed between rounds at every count (WHIP/SRT 0.51 to 2.06), within the host's own round-to-round spread | **Not met as stated**: memory higher at 1 and 50 streams, CPU undecided. A decision point for the owner |
 
@@ -162,7 +167,8 @@ streams had arrived.
 
 All 30 served offsets -2.3 to 15.7 ms (median 10.7); net 4.8 to 20 ms
 (median 7.4). Within a run the offsets moved by up to 17 ms, more than with
-arrival alignment (7 ms), as later reports were followed. The streams were
+arrival alignment (7 ms); presumably the timeline following later reports,
+which was not checked. The streams were
 ready (`stream ready`) 5.6 to 5.9 s after the publisher connected, with
 either hold.
 
@@ -393,6 +399,11 @@ Per round, from results only (the rule above):
   31.4%, WHIP 16.0 to 35.9%), with the load rising during some windows.
   At one stream WHIP was 1.06 to 1.51% of a core against SRT's 0.73 to
   1.26%.
+
+For scale: RTMP's RSS per stream was also above SRT's in every round at 1
+and 50 streams (17.5 to 22.8 MB against 16.6 to 17.5 at 1; 10.95 to 14.46
+against 9.72 to 10.62 at 50), and WHIP's excess at 50 streams (2 to 14%) is
+about the size of SRT's own spread between rounds there (9.72 to 10.62 MB).
 
 Nothing was changed for it, and the cause was not investigated. WHIP does
 DTLS, SRTP, ICE and RTP reordering per session that SRT does not, which is
