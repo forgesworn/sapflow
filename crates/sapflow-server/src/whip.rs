@@ -725,6 +725,12 @@ fn media(event: sapflow_rtp::Event) -> Media {
             cause: Discontinuity::Arrival { .. } | Discontinuity::SenderReport { .. },
             ..
         } => Media::Reanchor,
+        E::Aligned { alignment } => {
+            // How the start hold ended: by the sender reports, or by
+            // arrival time and why. A3.8's evidence reads this.
+            tracing::debug!(?alignment, "WHIP timeline aligned");
+            Media::Other("aligned")
+        }
         other => Media::Other(event_name(&other)),
     }
 }
