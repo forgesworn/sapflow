@@ -912,19 +912,19 @@ pub enum ClaimError {
     MemoryLimit,
 }
 
-/// The share of the live fragment budget, in percent, past which a new
-/// stream is refused. Once the budget is full the next part any stream
-/// seals is refused, which drops nearly every publisher at once; refusing
-/// new streams first leaves the live ones room. A publisher reconnecting to
-/// a stream still held for it is not new and is not refused for this.
+/// The share of the live fragment budget, in percent, that the streams'
+/// expected windows may fill before a new stream is refused. Once the
+/// budget is full the next part any stream seals is refused, which drops
+/// nearly every publisher at once; refusing new streams first leaves the
+/// live ones room. A publisher reconnecting to a stream still held for it
+/// is not new and is not refused for this.
 pub const NEW_STREAM_FRAGMENT_PERCENT: usize = 80;
 
-/// Whether the live fragment budget admits a new stream.
-fn admits_new_stream(fragments: &sapflow_core::fragment::FragmentQuota) -> bool {
-    // Wide enough that a 32-bit usize cannot saturate at 41 MiB.
-    (fragments.used() as u128) * 100
-        < (fragments.maximum() as u128) * NEW_STREAM_FRAGMENT_PERCENT as u128
-}
+/// Live streams that may be starting at once (no segment complete yet, so
+/// no projection of their window): beyond these a new stream waits, so a
+/// crowd of encoders arriving together, as after a restart, is admitted as
+/// their windows can be measured rather than all at once.
+pub const MAX_STARTING_STREAMS: usize = 8;
 
 /// The live streams, by event id, and current RTMP publication admission.
 pub struct Registry {
@@ -978,6 +978,42 @@ impl Registry {
             fragments: Arc::new(sapflow_core::fragment::FragmentQuota::new(fragment_bytes)),
             retained: Arc::new(sapflow_core::fragment::FragmentQuota::new(retained_bytes)),
         }
+    }
+
+    /// Whether the live fragment budget admits a new stream. A stream fills
+    /// its window over tens of seconds, so what is in use now says little:
+    /// count what each stream holds, plus what each live one is expected to
+    /// add before its window is full ([`Muxer::projected_window_bytes`]), a
+    /// typical window (the median projection) for each still starting and
+    /// one more for the newcomer, against [`NEW_STREAM_FRAGMENT_PERCENT`].
+    /// A stream held for a reconnect has no publisher and does not grow.
+    /// Takes each stream's session and media locks under the map's.
+    fn admits_new_stream(&self, map: &HashMap<String, Arc<LiveStream>>) -> bool {
+        let mut growth = 0u128;
+        let mut projections = Vec::new();
+        let mut starting = 0usize;
+        for stream in map.values() {
+            let attached = stream.session().attached;
+            let state = stream.lock();
+            match state.ingest.muxer().and_then(Muxer::projected_window_bytes) {
+                Some(projected) => {
+                    projections.push(projected);
+                    if attached {
+                        let held = state.ingest.muxer().map_or(0, Muxer::held_window_bytes);
+                        growth += projected.saturating_sub(held) as u128;
+                    }
+                }
+                None => starting += usize::from(attached),
+            }
+        }
+        if starting >= MAX_STARTING_STREAMS {
+            return false;
+        }
+        projections.sort_unstable();
+        let typical = projections.get(projections.len() / 2).copied().unwrap_or(0) as u128;
+        // Wide enough that a 32-bit usize cannot saturate.
+        let committed = self.fragments.used() as u128 + growth + typical * (starting as u128 + 1);
+        committed * 100 < self.fragments.maximum() as u128 * NEW_STREAM_FRAGMENT_PERCENT as u128
     }
 
     fn budget(&self) -> Budget {
@@ -1095,7 +1131,7 @@ impl Registry {
                 return Ok((stream.clone(), session.generation, Claim::Resumed));
             }
         }
-        if !admits_new_stream(&self.fragments) {
+        if !self.admits_new_stream(&map) {
             return Err(ClaimError::MemoryLimit);
         }
         if matches!(kind, SourceKind::Flv) && publication_permit.is_none() {

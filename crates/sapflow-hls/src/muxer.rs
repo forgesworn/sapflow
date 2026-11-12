@@ -3401,6 +3401,53 @@ impl Muxer {
         self.media_sequence + self.entries.len() as u64
     }
 
+    /// The bytes the live window's segments and the open segment hold now.
+    pub fn held_window_bytes(&self) -> usize {
+        let listed: usize = self
+            .entries
+            .iter()
+            .map(|e| match e {
+                Entry::Segment(s) => s.data.len(),
+                Entry::Gap { .. } => 0,
+            })
+            .sum();
+        listed.saturating_add(self.next_segment.as_ref().map_or(0, |s| s.bytes))
+    }
+
+    /// What the live window is expected to hold once it is full, in bytes,
+    /// for admission: the average completed segment's size times the
+    /// segments the window keeps at their average length (`segment_count`,
+    /// fewer under `window`, never under [`LEADING_GAPS`] entries, more
+    /// while three target durations need them), plus one open segment, and
+    /// at least what it holds now. `None` until a segment completes. An
+    /// estimate: a publisher whose bitrate or keyframe interval rises later
+    /// holds more.
+    pub fn projected_window_bytes(&self) -> Option<usize> {
+        let (mut count, mut bytes, mut span) = (0usize, 0usize, Duration::ZERO);
+        for e in &self.entries {
+            if let Entry::Segment(s) = e {
+                count += 1;
+                bytes = bytes.saturating_add(s.data.len());
+                span = span.saturating_add(s.duration);
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        let average = span.as_nanos() / count as u128;
+        // The fewest segments whose all-but-oldest still last `keep`, as the
+        // removal loops stop: one more than whole averages in it.
+        let lasting = |keep: Duration| (keep.as_nanos() / average.max(1)) as usize + 1;
+        let floor = Duration::from_secs(3 * self.target_duration());
+        let mut kept = self.cfg.segment_count;
+        if let Some(window) = self.cfg.window {
+            kept = kept.min(lasting(window.max(floor)).max(LEADING_GAPS as usize));
+        }
+        kept = kept.max(lasting(floor)).min(MAX_WINDOW_ENTRIES);
+        let projected = (bytes / count).saturating_mul(kept + 1);
+        Some(projected.max(self.held_window_bytes()))
+    }
+
     /// Removes the oldest window entry. A segment moves to the retention
     /// pool if there is one, or goes with its parts.
     fn remove_oldest_entry(&mut self) {

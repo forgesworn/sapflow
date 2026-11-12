@@ -187,13 +187,14 @@ fn partial_response_and_consumed_prefix_keep_backing_charges_after_close() {
     );
 }
 
-/// Two 600 kB/s A/V streams at `segment_count` 7 on the server's shared
-/// 10 MB fragment budget, A starting 30 s after B: what B keeps past its
-/// window is in the retention pool, so both run, and once both have gone
-/// the budget and the pool are both empty.
+/// Two 600 kB/s A/V streams at `segment_count` 7 on a shared 16 MB fragment
+/// budget (two expected windows of about 4.8 MB, under the 80% admission
+/// mark), A starting 30 s after B: what B keeps past its window is in the
+/// retention pool, so both run, and once both have gone the budget and the
+/// pool are both empty.
 #[test]
 fn kept_media_never_fences_a_second_stream_on_the_server_budget() {
-    let registry = Registry::with_budgets(4, 10_000_000, 128 * 1024 * 1024);
+    let registry = Registry::with_budgets(4, 16_000_000, 128 * 1024 * 1024);
     let claim = |id: usize| {
         registry
             .claim_configured(
@@ -290,8 +291,9 @@ fn one_publisher_cannot_leave_eight_useful_paths_in_reconnect_hold() {
     assert_eq!(registry.presentations.active(), 4);
 }
 
-/// At 80% of the live fragment budget a new stream is refused, before the
-/// RTMP publication credit or a presentation is taken and before a
+/// A new stream is refused once what the streams hold, plus one typical
+/// window for the newcomer, reaches 80% of the live fragment budget, before
+/// the RTMP publication credit or a presentation is taken and before a
 /// recording is configured; one byte under, the gate lets it through to
 /// those limits. The publisher of a stream held for its reconnect comes
 /// back whatever the budget.
@@ -307,6 +309,13 @@ fn a_full_budget_refuses_new_streams_but_not_a_held_reconnect() {
         registry.detach(&held, generation, true),
         "held for a reconnect"
     );
+    // The held stream's window is the typical one; it no longer grows.
+    let typical = held
+        .lock()
+        .ingest
+        .muxer()
+        .and_then(Muxer::projected_window_bytes)
+        .expect("a completed segment");
     let quota = registry.fragment_quota();
     let configured = std::cell::Cell::new(false);
     let new_rtmp = || {
@@ -320,7 +329,7 @@ fn a_full_budget_refuses_new_streams_but_not_a_held_reconnect() {
         )
     };
     let under = quota
-        .try_acquire(8_000_000 - 1 - quota.used())
+        .try_acquire(8_000_000 - typical - 1 - quota.used())
         .expect("one byte under the mark");
     assert!(matches!(new_rtmp(), Err(ClaimError::PublisherLimit)));
     let at = quota.try_acquire(1).expect("at the mark");
@@ -332,6 +341,56 @@ fn a_full_budget_refuses_new_streams_but_not_a_held_reconnect() {
         "the held stream's publisher comes back"
     );
     drop((under, at));
+}
+
+/// A live stream still filling its window counts at its projected window,
+/// not at what it holds yet: with room for two windows under the mark but
+/// not three, a third stream is refused while the first two hold far less
+/// than the mark.
+#[test]
+fn filling_streams_count_at_their_projected_windows() {
+    let probe = Registry::new(4);
+    let (stream, _, _) = attach(&probe, 0).expect("probe");
+    feed(&stream);
+    let projected = stream
+        .lock()
+        .ingest
+        .muxer()
+        .and_then(Muxer::projected_window_bytes)
+        .expect("a completed segment");
+    drop(stream);
+    drop(probe);
+    // 80% of the budget is 2.5 projected windows.
+    let registry = Registry::with_limits(8, projected * 25 / 8);
+    let mut live = Vec::new();
+    for id in 0..2 {
+        let (stream, _, _) = attach(&registry, id).expect("room for two");
+        feed(&stream);
+        live.push(stream);
+    }
+    assert!(
+        registry.fragments.used() * 100 < registry.fragments.maximum() * 80,
+        "what they hold now is under the mark"
+    );
+    assert!(matches!(attach(&registry, 2), Err(ClaimError::MemoryLimit)));
+}
+
+/// A crowd arriving at once (as after a restart) is admitted
+/// [`MAX_STARTING_STREAMS`] at a time: streams with no segment yet have no
+/// projection, so beyond these a newcomer waits until one has.
+#[test]
+fn a_crowd_of_starting_streams_waits_for_projections() {
+    let registry = Registry::with_limits(32, 1 << 30);
+    let starting: Vec<_> = (0..MAX_STARTING_STREAMS)
+        .map(|id| attach(&registry, id).expect("starting").0)
+        .collect();
+    let next = MAX_STARTING_STREAMS;
+    assert!(matches!(
+        attach(&registry, next),
+        Err(ClaimError::MemoryLimit)
+    ));
+    feed(&starting[0]);
+    assert!(attach(&registry, next).is_ok(), "one is measured now");
 }
 
 #[test]
