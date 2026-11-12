@@ -91,6 +91,7 @@ async fn start(env: &[(&str, &str)]) -> Server {
     let sockets = Sockets {
         http: TcpListener::bind("127.0.0.1:0").await.expect("bind"),
         udp: UdpSocket::bind("127.0.0.1:0").await.expect("bind"),
+        tcp: None,
     };
     let (http, udp) = (
         sockets.http.local_addr().expect("addr"),

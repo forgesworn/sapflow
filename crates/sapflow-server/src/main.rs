@@ -27,6 +27,8 @@ mod test_support;
 mod viewer_tests;
 mod whip;
 mod whip_request;
+mod whip_tcp;
+mod whip_tcp_front;
 
 use std::sync::Arc;
 
