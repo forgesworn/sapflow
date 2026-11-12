@@ -365,8 +365,13 @@ function hits(text, s) {
   check('a recording was written', files.length > 0, files.map((f) => path.basename(f)).join(', '));
   // One file per codec epoch: a browser may also ramp its resolution up
   // by itself at the start.
-  const epochs = (fs.readFileSync(log, 'utf8').match(/starting a new codec epoch/g) || []).length;
-  check('one recording per codec epoch', files.length === epochs + 1 && (!resize || epochs > 0), `${files.length} files, ${epochs} epoch changes`);
+  // An epoch that changed again before its first part (Chrome may start at
+  // one size and drop at once) leaves no recording, so only changes from
+  // an epoch with parts count.
+  const changes = fs.readFileSync(log, 'utf8').replace(/\x1b\[[0-9;]*m/g, '').split('\n')
+    .filter((l) => l.includes('mid-stream; starting a new codec epoch'));
+  const epochs = changes.filter((l) => !/previous_parts=0\b/.test(l)).length;
+  check('one recording per codec epoch', files.length === epochs + 1 && (!resize || epochs > 0), `${files.length} files, ${changes.length} epoch changes, ${changes.length - epochs} from an epoch with no part`);
   for (const f of files) {
     const probe = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-show_entries', 'stream=codec_name,width,height,nb_read_frames,sample_rate,channels', '-of', 'json', f], { encoding: 'utf8' });
     let streams = [];

@@ -809,9 +809,15 @@ impl EsIngest {
             }
             return Ok(false);
         };
+        // Parts the ending epoch produced: none when it changed before its
+        // first part, which then leaves no playlist entry and no recording.
+        let previous_parts = muxer
+            .next_part_id()
+            .saturating_sub(muxer.epoch_first_part_id());
         tracing::info!(
             from = %format_args!("{}x{}", current.width, current.height),
             to = %format_args!("{}x{}", video.width, video.height),
+            previous_parts,
             "encoder changed its parameter sets mid-stream; starting a new codec epoch"
         );
         let audio = muxer.audio_config().copied();

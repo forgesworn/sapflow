@@ -902,6 +902,10 @@ Left open:
 - At the change the muxer drops its pending video frame and pending audio
   (in the fixture test, 1 video frame and 3 AAC frames of 60 and 96), as it
   does at any interrupt, and the recording is not marked for it.
+- An epoch that changes again before its first part is cut leaves no
+  playlist entry and no recording; its frames are not served. Chrome 157
+  did this at the start of some runs: its first IDR at 640x360, then
+  480x270 at once, then 640x360. The log line gives `previous_parts=0`.
 - hls.js 1.7.1 stalled 0.42 to 0.51 s at the boundary in the end-to-end runs.
   Once, in the diagnosis, it stalled about 7 s on a 0.37 s buffer hole
   before stepping over it; that was not seen again.
