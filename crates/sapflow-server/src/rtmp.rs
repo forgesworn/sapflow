@@ -224,6 +224,9 @@ impl Conn<'_> {
                             Refusal::PresentationLimit => {
                                 ("NetStream.Publish.Denied", "presentation limit")
                             }
+                            Refusal::MemoryLimit => {
+                                ("NetStream.Publish.Denied", "media memory limit")
+                            }
                             _ => ("NetStream.Publish.Denied", "refused"),
                         };
                         // Send the refusal, then close.

@@ -122,6 +122,24 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow
 
+- `SAPFLOW_WINDOW_SECONDS` bounds each stream's playlist by time as well as
+  by `SAPFLOW_SEGMENT_COUNT` (`MuxerConfig::window`, above). It defaults to
+  2 s per segment, 48 s at the default count, so an encoder sending a
+  keyframe every 2 s or more often keeps every segment it kept before, and
+  v4v's 1 s keyframes keep 24. A longer interval keeps fewer, longer
+  segments: 8 s keyframes keep seven segments, 56 s, where they kept 192 s,
+  and a stream's memory fell with it. 0 turns the bound off.
+- A new stream is refused once the live fragment budget is 80% used
+  (`stream::NEW_STREAM_FRAGMENT_PERCENT`), with SRT `402`, RTMP
+  `NetStream.Publish.Denied` "media memory limit" and WHIP 503. Once the
+  budget was full, the next part any stream sealed was refused, which in
+  testing dropped 30 of 32 publishers within 10 s, and encoders that
+  reconnected into it kept being dropped. A publisher reconnecting to a
+  stream still held for it is not refused for memory. The refusal does not
+  count against the failed-attempt throttle, but a retrying encoder asks
+  `SAPFLOW_PUBLISH_AUTH_URL` again each time. sapflow-core adds
+  `FragmentQuota::maximum`.
+
 - A stream's recording no longer rolls to a new file at every codec epoch
   without bound. Each stream has a budget of rolls
   (`SAPFLOW_RECORDING_ROLL_BURST`, default 8; 0 turns it off), regaining

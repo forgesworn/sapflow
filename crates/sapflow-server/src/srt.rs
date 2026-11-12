@@ -57,7 +57,10 @@ impl Refused {
             // The app that authorises publishers did not answer usably.
             Self::Policy(Refusal::AuthUnavailable) => 503,
             Self::Policy(
-                Refusal::Throttled | Refusal::PublisherLimit | Refusal::PresentationLimit,
+                Refusal::Throttled
+                | Refusal::PublisherLimit
+                | Refusal::PresentationLimit
+                | Refusal::MemoryLimit,
             )
             | Self::PublisherLimit => 402,
         }
@@ -146,6 +149,7 @@ mod tests {
             (Refused::Policy(Refusal::Throttled), 402),
             (Refused::Policy(Refusal::PublisherLimit), 402),
             (Refused::Policy(Refusal::PresentationLimit), 402),
+            (Refused::Policy(Refusal::MemoryLimit), 402),
             (Refused::PublisherLimit, 402),
         ] {
             assert_eq!(r.status(), status, "{r:?}");

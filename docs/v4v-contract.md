@@ -52,9 +52,14 @@ content-type: application/json
   network. The whole URL is treated as a secret and never logged, and
   neither is the password.
 - SRT refusals reach the caller as `PREDEFINED:401` (refused),
-  `PREDEFINED:402` (throttled, by sapflow or the app) or `PREDEFINED:503`
-  (the app did not answer usably). RTMP refusals are
-  `NetStream.Publish.Denied`.
+  `PREDEFINED:402` (throttled, by sapflow or the app, or a limit on
+  publishers or memory) or `PREDEFINED:503` (the app did not answer usably).
+  RTMP refusals are `NetStream.Publish.Denied`.
+- A stage that admits can still be refused after the app's answer, by
+  sapflow's own limits. That includes a new stage while sapflow's media
+  memory is over 80% used (SRT `402`, RTMP "media memory limit"); an
+  encoder reconnecting to a stage sapflow still holds is not refused for
+  memory. An encoder that retries asks the app again each time.
 
 ## Ingest addresses v4v hands to encoders
 

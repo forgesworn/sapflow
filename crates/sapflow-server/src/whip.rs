@@ -1820,9 +1820,10 @@ fn admission_refusal(r: Refusal) -> Refused {
         Refusal::Forbidden => resource::Refusal::Forbidden,
         Refusal::AlreadyLive => resource::Refusal::Conflict,
         Refusal::Throttled => resource::Refusal::Throttled,
-        Refusal::PublisherLimit | Refusal::PresentationLimit | Refusal::AuthUnavailable => {
-            resource::Refusal::Unavailable
-        }
+        Refusal::PublisherLimit
+        | Refusal::PresentationLimit
+        | Refusal::MemoryLimit
+        | Refusal::AuthUnavailable => resource::Refusal::Unavailable,
     };
     r.into()
 }

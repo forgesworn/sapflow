@@ -906,6 +906,25 @@ pub enum ClaimError {
     AlreadyLive,
     PublisherLimit,
     PresentationLimit,
+    /// The live fragment budget is past [`NEW_STREAM_FRAGMENT_PERCENT`]: a
+    /// new stream, which fills its window from nothing, would take the room
+    /// the streams already live need to slide theirs.
+    MemoryLimit,
+}
+
+/// The share of the live fragment budget, in percent, past which a new
+/// stream is refused. Once the budget is full the next part any stream
+/// seals is refused, which drops nearly every publisher at once; refusing
+/// new streams first leaves the live ones room. A publisher reconnecting to
+/// a stream still held for it is not new and is not refused for this.
+pub const NEW_STREAM_FRAGMENT_PERCENT: usize = 80;
+
+/// Whether the live fragment budget admits a new stream.
+fn admits_new_stream(fragments: &sapflow_core::fragment::FragmentQuota) -> bool {
+    fragments.used().saturating_mul(100)
+        < fragments
+            .maximum()
+            .saturating_mul(NEW_STREAM_FRAGMENT_PERCENT)
 }
 
 /// The live streams, by event id, and current RTMP publication admission.
@@ -1076,6 +1095,9 @@ impl Registry {
                 configure(&mut session, Claim::Resumed);
                 return Ok((stream.clone(), session.generation, Claim::Resumed));
             }
+        }
+        if !admits_new_stream(&self.fragments) {
+            return Err(ClaimError::MemoryLimit);
         }
         if matches!(kind, SourceKind::Flv) && publication_permit.is_none() {
             publication_permit = Some(

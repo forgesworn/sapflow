@@ -106,16 +106,11 @@ fn exact_shared_backing_capacity_refuses_another_path_and_recovers_after_close()
     let (first, g1, _) = attach(&registry, 0).expect("first presentation");
     feed(&first);
     assert_eq!(registry.fragments.used(), capacity);
-    let (other, g2, _) = attach(&registry, 1).expect("publication gate remains separate");
-    assert!(matches!(
-        other.apply(|source, now| match source {
-            Source::Ts(ts) => ts.push(AUDIO, now),
-            _ => unreachable!(),
-        }),
-        Err(IngestError::FragmentLimit)
-    ));
+    // The budget is full, so another path is refused at admission, before
+    // any credit, not at its first fragment (that refusal is the test
+    // above, where admission passes).
+    assert!(matches!(attach(&registry, 1), Err(ClaimError::MemoryLimit)));
     assert_eq!(registry.fragments.used(), capacity);
-    registry.terminate(&other, g2);
     registry.terminate(&first, g1);
     assert_eq!(registry.fragments.used(), 0);
     let (fresh, _, _) = attach(&registry, 2).expect("capacity returned");
@@ -284,6 +279,47 @@ fn one_publisher_cannot_leave_eight_useful_paths_in_reconnect_hold() {
     }
     assert_eq!(registry.map().len(), 4);
     assert_eq!(registry.presentations.active(), 4);
+}
+
+/// Past 80% of the live fragment budget a new stream is refused, before any
+/// credit is taken or a recording configured, while the publisher of a
+/// stream held for its reconnect comes back.
+#[test]
+fn a_full_budget_refuses_new_streams_but_not_a_held_reconnect() {
+    let registry = Registry::with_limits(8, 10_000_000);
+    let (held, generation, _) = attach(&registry, 0).expect("first");
+    feed(&held);
+    assert!(
+        registry.detach(&held, generation, true),
+        "held for a reconnect"
+    );
+    let quota = registry.fragment_quota();
+    let filler = quota
+        .try_acquire(8_000_000 - quota.used())
+        .expect("fill to the mark");
+    let configured = std::cell::Cell::new(false);
+    assert!(matches!(
+        registry.claim_configured(
+            &path(1),
+            MuxerConfig::default(),
+            SourceKind::Flv,
+            true,
+            1,
+            |_, _| configured.set(true),
+        ),
+        Err(ClaimError::MemoryLimit)
+    ));
+    assert!(!configured.get(), "no recording for a refused stream");
+    assert_eq!(registry.active_rtmp_publishers(), 0, "no RTMP credit kept");
+    assert!(
+        matches!(attach(&registry, 0), Ok((_, _, Claim::Resumed))),
+        "the held stream's publisher comes back"
+    );
+    drop(filler);
+    assert!(
+        attach(&registry, 1).is_ok(),
+        "below the mark, new streams are admitted again"
+    );
 }
 
 #[test]
