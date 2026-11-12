@@ -1440,6 +1440,10 @@ instead of observed.
   each refused or handled within the caps, with one test per case.
 - **A2.3 Fingerprint.** A peer certificate that does not match the offer's
   fingerprint is refused. Fails if any build or test flag can skip the check.
+  Since the third round of the A4.4 review, the refusal sends no alert, since
+  at epoch 0 a forger could have sent the certificate. The handshake waits
+  for one that matches, and the session ends at its handshake deadline as
+  the DTLS failure it was (`dtls-failed`, `FingerprintMismatch`).
 - **A2.4 Fuzzing.** Records and each handshake message have fuzz targets, held
   to A1.3's corpus and coverage rules.
 
@@ -1661,8 +1665,9 @@ Implementation notes (W3a, 11 November 2026):
     63 s timeout never runs. A DTLS failure ends the session with
     `EndReason::Dtls` and its reason, for W3c to count. An unauthenticated
     message that `sapflow-dtls` refuses, such as a certificate that does
-    not match the offer, does not end it: the session ends at its deadline
-    as `HandshakeTimeout`, and `Server::refused` holds the reason.
+    not match the offer, does not end it at once. At its deadline the
+    session ends as `EndReason::Dtls` with the reason `Server::refused`
+    holds, and as `HandshakeTimeout` only when nothing was refused.
 - **Gate 1, in process.** For both SRTP profiles a scripted publisher (the
   test STUN client, the `sapflow-dtls` test client, `sapflow-rtp`'s SRTP
   protect) sends H.264 in STAP-A and FU-A and Opus. The session emits
@@ -1984,8 +1989,13 @@ Implementation notes (W3c part 2a, lifecycle):
   (`handshake-timeout`, `consent-expired`, `dtls-failed`, `peer-closed`,
   `media-timeout`, `keys-exhausted`, `panicked`) or, when the server
   closed it, why (`deleted`, `superseded`, `ingest-ended`, and `panicked`
-  for a panic in its feed or its ingest). Each end is
-  logged with its reason and that reason's count; no address is logged.
+  for a panic in its feed or its ingest). A handshake that reaches its
+  deadline after `sapflow-dtls` refused an unauthenticated message, such as
+  a certificate that does not match the offer, is `dtls-failed`;
+  `handshake-timeout` is one where nothing was refused. Each end is logged
+  with its reason and that reason's count, and a `dtls-failed` end with
+  the DTLS error, one of `sapflow-dtls`'s error variants. No address and
+  no other peer data is logged.
 
 | Claim | Test | Status |
 |---|---|---|
@@ -2004,6 +2014,7 @@ Implementation notes (W3c part 2a, lifecycle):
 | No build without test targets contains the panic hooks (`cargo build --release -p sapflow`, `cargo build -p sapflow`) | `scripts/whip-e2e.js` (the binary it runs is searched for their markers) | Met |
 | A build with the test targets (`--all-targets`) contains `sapflow-whip`'s hooks, and they do nothing unless a test turns them on | `router::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on` (sapflow-whip), `whip::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on` | Met in process; the server never calls `Router::enable_panic_hooks` |
 | End reasons are counted by name | `whip::tests::every_end_reason_has_a_name`, and the counts asserted in the A3.2, A3.3 and A3.4 tests | Met |
+| A fingerprint mismatch ends at the handshake deadline as `dtls-failed` with `FingerprintMismatch`; a client that goes quiet ends as `handshake-timeout` | `whip::tests::a_fingerprint_mismatch_is_a_dtls_failure_at_the_deadline`, `whip::tests::a_handshake_timeout_releases_with_no_callback`; `tests::fingerprint_mismatch_ends_the_session_at_the_deadline`, `tests::handshake_deadline` (sapflow-whip) | Met in process (the server's deadline shortened to 1 s) |
 | `SAPFLOW_WHIP_STALE` | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 
 - **Left to W3c part 2b.** Done in part 2b, below, apart from what it

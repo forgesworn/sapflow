@@ -92,6 +92,10 @@ Notes for the release after 0.2.0-rc.1.
   certificate that matches the offer, and from a failed verification still
   end the handshake with their alert.
 - In WHIP, a publisher whose certificate does not match its offer now ends
-  at the 10 s handshake deadline as `EndReason::HandshakeTimeout`, not at
-  once as `EndReason::Dtls(FingerprintMismatch)`.
+  at the 10 s handshake deadline, not at once. It still ends as
+  `EndReason::Dtls(FingerprintMismatch)` and is counted as `dtls-failed`:
+  at the deadline a session reports the reason `sapflow-dtls` last refused
+  a message, and is `HandshakeTimeout` only when nothing was refused. The
+  server's end log line now carries the DTLS error for a `dtls-failed`
+  end.
 - The public API changes only by the addition of `Server::refused`.

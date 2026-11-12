@@ -372,7 +372,7 @@ fn handshake_deadline() {
     run_until(s, t0 + Duration::from_secs(10));
     assert_eq!(s.state(), State::Ended(EndReason::HandshakeTimeout));
     // Nominated, but DTLS never completes: the hello is answered and the
-    // client's flight never comes.
+    // client goes quiet. Nothing was refused, so it is a plain timeout.
     let (mut p, mut a, t0) = setup(10, &[GCM]);
     let s = &mut a.session;
     let c = p.check(true);
@@ -391,9 +391,10 @@ fn handshake_deadline() {
 
 /// The client's certificate does not match the offer. sapflow-dtls refuses
 /// it without an alert, since at epoch 0 a forger could have sent it, so
-/// the session never connects and ends at its handshake deadline.
+/// the session never connects. At its handshake deadline it ends as the
+/// DTLS failure it was, with its reason.
 #[test]
-fn fingerprint_mismatch_never_connects() {
+fn fingerprint_mismatch_ends_the_session_at_the_deadline() {
     let t0 = Instant::now();
     let mut p = Publisher::new(11, &[GCM]);
     // The offer names another certificate than the one the client sends.
@@ -412,8 +413,13 @@ fn fingerprint_mismatch_never_connects() {
     }
     assert_eq!(s.state(), State::Handshaking);
     assert!(!p.has_keys());
+    run_until(s, t0 + Duration::from_millis(9_999));
+    assert_eq!(s.state(), State::Handshaking, "not before the deadline");
     run_until(s, t0 + Duration::from_secs(10));
-    assert_eq!(s.state(), State::Ended(EndReason::HandshakeTimeout));
+    assert_eq!(
+        s.state(),
+        State::Ended(EndReason::Dtls(sapflow_dtls::Error::FingerprintMismatch))
+    );
     assert!(!p.has_keys());
     assert_eq!(p.misdirected, 0);
 }
