@@ -97,6 +97,54 @@ pub fn injected_panic() -> ! {
     panic!("a test asked this session to panic")
 }
 
+/// A read of a session that callers make between its calls, which
+/// [`arm`] can make panic: the router's and the UDP owner's guards around
+/// those reads are tested with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+    /// [`Session::poll_timeout`], which the router reads for every session.
+    PollTimeout,
+    /// [`Session::media_from`], which the router reads from a tuple's owner
+    /// when another session's check arrives from that tuple.
+    MediaFrom,
+    /// [`Session::last_media`], which the UDP owner reads for supersede.
+    LastMedia,
+    /// [`Session::receiver`], which the UDP owner reads for each media
+    /// event's diagnostics.
+    Receiver,
+    /// [`Session::stats`], which the UDP owner reads around each SRTP or
+    /// SRTCP datagram for the bitrate cap, before the router does.
+    Stats,
+}
+
+const ARM: &[u8] = b"\xffsapflow-whip test: panic in ";
+const READS: [(Read, &[u8]); 5] = [
+    (Read::PollTimeout, b"poll_timeout"),
+    (Read::MediaFrom, b"media_from"),
+    (Read::LastMedia, b"last_media"),
+    (Read::Receiver, b"receiver"),
+    (Read::Stats, b"stats"),
+];
+
+/// A datagram that, in builds with the `test-panic` feature (and this
+/// crate's own tests), arms the session it reaches so that its next
+/// `read` panics. Like [`PANIC_DATAGRAM`], it reads as none of STUN, DTLS,
+/// RTP or RTCP, so it goes to the owner of the tuple it came from.
+pub fn arm(read: Read) -> Vec<u8> {
+    let name = READS
+        .iter()
+        .find(|(r, _)| *r == read)
+        .map_or(&b""[..], |(_, n)| n);
+    [ARM, name].concat()
+}
+
+/// The read a datagram from [`arm`] names.
+#[cfg(any(test, feature = "test-panic"))]
+pub(crate) fn armed(bytes: &[u8]) -> Option<Read> {
+    let name = bytes.strip_prefix(ARM)?;
+    READS.iter().find(|(_, n)| *n == name).map(|(r, _)| *r)
+}
+
 /// The documentation address the tests publish from.
 pub fn tuple(port: u16) -> Tuple {
     Tuple::udp(SocketAddr::from(([192, 0, 2, 7], port)))

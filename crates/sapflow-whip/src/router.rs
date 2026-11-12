@@ -61,9 +61,17 @@
 //! # Panics
 //!
 //! Every call into a session runs under `catch_unwind` (the workspace
-//! builds with `panic = "unwind"`). A session whose call panics is dropped
-//! with its queued output, its ufrag and its tuples, and its last event is
-//! `Ended(Panicked)`; every other session goes on as it was.
+//! builds with `panic = "unwind"`), and so does every read of one the
+//! router makes between calls: each session's deadline in
+//! [`Router::poll_timeout`] and [`Router::handle_timeout`], and the tuple
+//! owner's state when another session's check arrives from its tuple. A
+//! caller reads a session the same way through [`Router::inspect`]. A
+//! session whose call or read panics is dropped with its queued output, its
+//! ufrag and its tuples, and its last event is `Ended(Panicked)`; every
+//! other session goes on as it was. [`Router::session`] is not guarded,
+//! for tests and diagnostics. The routing itself reads only a datagram's
+//! first byte ([`classify`]) and, for STUN, its USERNAME
+//! ([`stun::request_username`]); neither reaches session code.
 //!
 //! # Driving it
 //!
@@ -143,7 +151,8 @@ pub struct RouterStats {
     pub stale_owner: u64,
     /// Sessions removed after they ended.
     pub removed: u64,
-    /// Sessions dropped because a call into them panicked.
+    /// Sessions dropped because a call into them, or a read of them,
+    /// panicked.
     pub panics: u64,
 }
 
@@ -194,9 +203,17 @@ impl Router {
         self.stats
     }
 
-    /// A live session.
+    /// A live session. Reads through this are not guarded (module docs):
+    /// the UDP owner reads through [`Router::inspect`].
     pub fn session(&self, id: &SessionId) -> Option<&Session> {
         self.sessions.get(id).map(|e| &e.session)
+    }
+
+    /// Reads a live session under `catch_unwind`. If `f` panics, the
+    /// session is dropped as for a call (module docs) and `None` is
+    /// returned; drain [`Router::poll_event`] after.
+    pub fn inspect<R>(&mut self, id: &SessionId, f: impl FnOnce(&Session) -> R) -> Option<R> {
+        self.guarded(*id, |s| f(s))
     }
 
     /// The session that owns a tuple.
@@ -270,12 +287,12 @@ impl Router {
 
     /// Runs every session whose deadline has come.
     pub fn handle_timeout(&mut self, now: Instant) {
-        let due: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|(_, e)| e.session.poll_timeout().is_some_and(|d| d <= now))
-            .map(|(id, _)| *id)
-            .collect();
+        let mut due = Vec::new();
+        self.deadlines(|id, d| {
+            if d <= now {
+                due.push(id);
+            }
+        });
         for id in due {
             if self.guarded(id, |s| s.handle_timeout(now)).is_some() {
                 self.drain(id);
@@ -283,12 +300,31 @@ impl Router {
         }
     }
 
-    /// The earliest session deadline.
-    pub fn poll_timeout(&self) -> Option<Instant> {
-        self.sessions
-            .values()
-            .filter_map(|e| e.session.poll_timeout())
-            .min()
+    /// The earliest session deadline. A session whose deadline panics is
+    /// dropped here (module docs), so drain [`Router::poll_event`] before
+    /// waiting on it: [`RouterStats::panics`] says whether one was.
+    pub fn poll_timeout(&mut self) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        self.deadlines(|_, d| earliest = Some(earliest.map_or(d, |e| e.min(d))));
+        earliest
+    }
+
+    /// Each live session's deadline, each read under `catch_unwind`; a
+    /// session whose read panics is dropped once all are read.
+    fn deadlines(&mut self, mut f: impl FnMut(SessionId, Instant)) {
+        let mut failed = Vec::new();
+        for (id, e) in &self.sessions {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                e.session.poll_timeout()
+            })) {
+                Ok(Some(d)) => f(*id, d),
+                Ok(None) => {}
+                Err(_) => failed.push(*id),
+            }
+        }
+        for id in failed {
+            self.fail(id);
+        }
     }
 
     /// Asks a session's publisher for a keyframe
@@ -332,13 +368,15 @@ impl Router {
                 return;
             }
             let hold = self.config.media_hold;
-            let keeps = self.sessions.get(&owner).is_some_and(|e| {
-                let s = &e.session;
-                s.accepts(&tuple)
-                    && (matches!(s.state(), State::Checking | State::Handshaking)
-                        || s.media_from(&tuple)
-                            .is_some_and(|t| now.saturating_duration_since(t) < hold))
-            });
+            // An owner whose read panics is dropped, its tuples with it.
+            let keeps = self
+                .guarded(owner, |s| {
+                    s.accepts(&tuple)
+                        && (matches!(s.state(), State::Checking | State::Handshaking)
+                            || s.media_from(&tuple)
+                                .is_some_and(|t| now.saturating_duration_since(t) < hold))
+                })
+                .unwrap_or(false);
             if keeps {
                 self.stats.kept += 1;
                 return;
@@ -350,20 +388,21 @@ impl Router {
         }
         self.owners.insert(tuple, id);
         self.stats.claims += 1;
-        let Some(Entry { session, owned }) = self.sessions.get_mut(&id) else {
-            return;
-        };
-        owned.push(tuple);
-        // Keep only tuples the session still has validated.
-        let mut lapsed = Vec::new();
-        owned.retain(|t| {
-            let keep = session.accepts(t);
-            if !keep {
-                lapsed.push(*t);
-            }
-            keep
+        // Keep only tuples the session still has validated. If its read
+        // panics, it is dropped with every tuple it owns, this one too.
+        let lapsed = self.guarded_entry(id, |Entry { session, owned }| {
+            owned.push(tuple);
+            let mut lapsed = Vec::new();
+            owned.retain(|t| {
+                let keep = session.accepts(t);
+                if !keep {
+                    lapsed.push(*t);
+                }
+                keep
+            });
+            lapsed
         });
-        for t in lapsed {
+        for t in lapsed.unwrap_or_default() {
             if self.owners.get(&t) == Some(&id) {
                 self.owners.remove(&t);
             }
@@ -405,17 +444,27 @@ impl Router {
     /// `Ended(Panicked)` is its last event. Returns `None` then, or for a
     /// session that is not live. Every other session goes on as it was.
     fn guarded<R>(&mut self, id: SessionId, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
+        self.guarded_entry(id, |e| f(&mut e.session))
+    }
+
+    /// As [`Router::guarded`], with the session's tuples.
+    fn guarded_entry<R>(&mut self, id: SessionId, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
         let e = self.sessions.get_mut(&id)?;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut e.session))) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(e))) {
             Ok(r) => Some(r),
             Err(_) => {
-                self.remove(id);
-                self.stats.panics += 1;
-                self.events
-                    .push_back((id, Event::Ended(crate::session::EndReason::Panicked)));
+                self.fail(id);
                 None
             }
         }
+    }
+
+    /// Drops a session that panicked: `Ended(Panicked)` is its last event.
+    fn fail(&mut self, id: SessionId) {
+        self.remove(id);
+        self.stats.panics += 1;
+        self.events
+            .push_back((id, Event::Ended(crate::session::EndReason::Panicked)));
     }
 
     /// Forgets a session, its ufrag and the tuples it owns.

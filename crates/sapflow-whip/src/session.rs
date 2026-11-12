@@ -458,6 +458,10 @@ pub struct Session {
     cname: Vec<u8>,
     stats: SessionStats,
     scratch: Vec<u8>,
+    /// Test builds only: the read a datagram from `testing::arm` has made
+    /// panic.
+    #[cfg(any(test, feature = "test-panic"))]
+    armed: Option<crate::testing::Read>,
 }
 
 impl fmt::Debug for Session {
@@ -563,6 +567,8 @@ impl Session {
             cname,
             stats: SessionStats::default(),
             scratch: Vec::with_capacity(1500),
+            #[cfg(any(test, feature = "test-panic"))]
+            armed: None,
         })
     }
 
@@ -609,6 +615,8 @@ impl Session {
     /// owner uses it to keep a tuple with the session it is delivering
     /// media to ([`crate::router`]).
     pub fn media_from(&self, tuple: &Tuple) -> Option<Instant> {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::MediaFrom);
         self.ice.media_from(tuple)
     }
 
@@ -616,6 +624,8 @@ impl Session {
     /// new media arrived (not a duplicate, padding or probe), for
     /// superseding a stalled session (`SAPFLOW_WHIP_STALE`).
     pub fn last_media(&self) -> Option<Instant> {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::LastMedia);
         self.last_media
     }
 
@@ -647,11 +657,15 @@ impl Session {
 
     /// The receiver, once connected, for its per-stream counters.
     pub fn receiver(&self) -> Option<&Receiver> {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::Receiver);
         self.media.as_ref().map(|m| &m.rx)
     }
 
     /// Counters.
     pub fn stats(&self) -> SessionStats {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::Stats);
         let mut s = self.stats;
         s.ice = self.ice.stats();
         s.dtls = self.dtls.stats();
@@ -680,8 +694,18 @@ impl Session {
         })
     }
 
+    /// Test builds only: panics if `read` is the one armed.
+    #[cfg(any(test, feature = "test-panic"))]
+    fn trip(&self, read: crate::testing::Read) {
+        if self.armed == Some(read) {
+            crate::testing::injected_panic();
+        }
+    }
+
     /// When [`Session::handle_timeout`] should next be called.
     pub fn poll_timeout(&self) -> Option<Instant> {
+        #[cfg(any(test, feature = "test-panic"))]
+        self.trip(crate::testing::Read::PollTimeout);
         if matches!(self.state, State::Ended(_)) {
             return None;
         }
@@ -753,8 +777,14 @@ impl Session {
         // this call panic, for the router's and the server's panic
         // isolation tests.
         #[cfg(any(test, feature = "test-panic"))]
-        if bytes == crate::testing::PANIC_DATAGRAM {
-            crate::testing::injected_panic();
+        {
+            if bytes == crate::testing::PANIC_DATAGRAM {
+                crate::testing::injected_panic();
+            }
+            if let Some(read) = crate::testing::armed(bytes) {
+                self.armed = Some(read);
+                return;
+            }
         }
         if matches!(self.state, State::Ended(_)) {
             self.stats.after_end += 1;

@@ -490,3 +490,104 @@ fn a_panicking_session_is_dropped_and_the_others_go_on() {
     assert_eq!(srtp(&r, &x), before + 10);
     assert_eq!(state(&r, &x), Some(State::Connected));
 }
+
+fn ended_panicked(events: &[(SessionId, Event)], id: SessionId) -> bool {
+    events
+        .iter()
+        .any(|(i, e)| *i == id && matches!(e, Event::Ended(crate::session::EndReason::Panicked)))
+}
+
+/// A panic in a session's deadline, read for every session between calls,
+/// drops that session only, from `poll_timeout` or from `handle_timeout`;
+/// the deadline returned is the others', and the next read is clean.
+#[test]
+fn a_session_whose_deadline_panics_is_dropped_and_the_others_go_on() {
+    let t0 = Instant::now();
+    let mut r = router();
+    let mut y = join(&mut r, 26, t0);
+    let mut x = join(&mut r, 27, t0);
+    connect(&mut r, t0, &mut y);
+    connect(&mut r, t0, &mut x);
+    let ty = y.p.tuple;
+    let now = talk(&mut r, &mut x, t0, 10);
+    while r.poll_event().is_some() {}
+    assert_eq!(
+        r.handle_datagram(now, ty, &arm(Read::PollTimeout)),
+        Some(y.id)
+    );
+    assert!(r.poll_event().is_none(), "arming is not a panic");
+    assert_eq!(r.stats().panics, 0);
+    let deadline = r.poll_timeout();
+    let events: Vec<(SessionId, Event)> = std::iter::from_fn(|| r.poll_event()).collect();
+    assert!(ended_panicked(&events, y.id), "{events:?}");
+    assert_eq!(events.len(), 1);
+    assert_eq!(r.stats().panics, 1);
+    assert!(r.session(&y.id).is_none());
+    assert_eq!(r.owner(&ty), None);
+    assert_eq!(deadline, r.session(&x.id).and_then(Session::poll_timeout));
+    assert_eq!(r.poll_timeout(), deadline, "the next read is clean");
+    assert_eq!(r.stats().panics, 1);
+    // From `handle_timeout`'s own read of the deadlines too.
+    let mut z = join(&mut r, 28, now);
+    connect(&mut r, now, &mut z);
+    while r.poll_event().is_some() {}
+    r.handle_datagram(now, z.p.tuple, &arm(Read::PollTimeout));
+    r.handle_timeout(now);
+    let events: Vec<(SessionId, Event)> = std::iter::from_fn(|| r.poll_event()).collect();
+    assert!(ended_panicked(&events, z.id), "{events:?}");
+    assert_eq!(r.stats().panics, 2);
+    assert!(r.session(&z.id).is_none());
+    let before = srtp(&r, &x);
+    talk(&mut r, &mut x, now, 10);
+    assert_eq!(srtp(&r, &x), before + 10);
+    assert_eq!(state(&r, &x), Some(State::Connected));
+}
+
+/// A panic in the tuple owner's state, read when another session's check
+/// arrives from its tuple, drops the owner, and the checking session takes
+/// the tuple.
+#[test]
+fn a_tuple_owner_whose_read_panics_is_dropped_at_another_sessions_check() {
+    let t0 = Instant::now();
+    let mut r = router();
+    let mut y = join(&mut r, 29, t0);
+    let mut x = join(&mut r, 30, t0);
+    connect(&mut r, t0, &mut y);
+    connect(&mut r, t0, &mut x);
+    let ty = y.p.tuple;
+    let now = talk(&mut r, &mut y, t0, 50);
+    while r.poll_event().is_some() {}
+    assert_eq!(
+        r.handle_datagram(now, ty, &arm(Read::MediaFrom)),
+        Some(y.id)
+    );
+    assert_eq!(r.owner(&ty), Some(y.id));
+    let c = x.p.check(false);
+    assert_eq!(r.handle_datagram(now, ty, &c), Some(x.id));
+    let events: Vec<(SessionId, Event)> = std::iter::from_fn(|| r.poll_event()).collect();
+    assert!(ended_panicked(&events, y.id), "{events:?}");
+    assert_eq!(r.stats().panics, 1);
+    assert!(r.session(&y.id).is_none());
+    assert_eq!(r.owner(&ty), Some(x.id), "X took the tuple Y held");
+    assert_eq!(state(&r, &x), Some(State::Connected));
+}
+
+/// A caller's read through `inspect` that panics drops that session only.
+#[test]
+fn a_session_whose_inspected_read_panics_is_dropped() {
+    let t0 = Instant::now();
+    let mut r = router();
+    let mut y = join(&mut r, 31, t0);
+    let mut x = join(&mut r, 32, t0);
+    connect(&mut r, t0, &mut y);
+    connect(&mut r, t0, &mut x);
+    while r.poll_event().is_some() {}
+    r.handle_datagram(t0, y.p.tuple, &arm(Read::Receiver));
+    assert_eq!(r.inspect(&y.id, |s| s.receiver().is_some()), None);
+    let events: Vec<(SessionId, Event)> = std::iter::from_fn(|| r.poll_event()).collect();
+    assert!(ended_panicked(&events, y.id), "{events:?}");
+    assert_eq!(r.stats().panics, 1);
+    assert!(r.session(&y.id).is_none());
+    assert_eq!(r.inspect(&x.id, |s| s.receiver().is_some()), Some(true));
+    assert_eq!(r.stats().panics, 1);
+}
