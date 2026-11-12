@@ -385,3 +385,31 @@ fn each_epoch_decodes_under_its_own_init() {
         assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), want);
     }
 }
+
+/// A reconnect whose parameter sets differ only by trailing zero bytes
+/// carries the epoch on, as a mid-stream change does.
+#[test]
+fn a_reconnect_with_trailing_zero_bytes_keeps_the_epoch() {
+    let (mut es, restarts) = first_half_with(|_| {});
+    assert_eq!(restarts, 0);
+    let mut held = es.take_muxer().expect("muxer");
+    held.interrupt(NOW);
+    let mut back = EsIngest::resume(MuxerConfig::default(), held);
+    back.audio_config(aac());
+    let mut restarted = false;
+    for e in events().into_iter().take(40) {
+        let up = match e {
+            Event::Video(dts, pts, mut au) => {
+                for set in [&mut au.sps, &mut au.pps].into_iter().flatten() {
+                    set.extend([0, 0]);
+                }
+                back.video(dts, pts, au, NOW)
+            }
+            Event::Audio(pts, config, payload) => back.audio_at(pts, config, &payload, NOW),
+        }
+        .expect("generated fixture");
+        restarted |= up.restarted;
+    }
+    assert!(!restarted, "the same sets, so the same epoch");
+    assert_eq!(back.muxer().expect("muxer").current_initialization_id(), 0);
+}

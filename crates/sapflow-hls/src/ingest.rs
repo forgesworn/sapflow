@@ -485,6 +485,11 @@ impl ReadTsPacket for Feed {
     }
 }
 
+/// Whether `config` was built from these parameter sets ([`same_nal`]).
+fn same_parameter_sets(config: &H264Config, sps: &[u8], pps: &[u8]) -> bool {
+    same_nal(&config.sps, sps) && same_nal(&config.pps, pps)
+}
+
 /// Two NAL units are the same once trailing zero bytes, which a byte
 /// stream may add after a NAL unit, are ignored.
 fn same_nal(a: &[u8], b: &[u8]) -> bool {
@@ -715,8 +720,15 @@ impl EsIngest {
             return Ok(Update::default());
         }
         let mut restarted = false;
-        if self.origin.is_some() && au.idr {
-            restarted = self.change_parameter_sets(now)?;
+        // What a new epoch's interrupt reported: the old epoch's last part
+        // and segment, and any media it could not seal.
+        let mut reconfigured = Update::default();
+        if self.origin.is_some()
+            && au.idr
+            && let Some(update) = self.change_parameter_sets(now)?
+        {
+            reconfigured.merge(update);
+            restarted = true;
         }
         if self.origin.is_none() {
             if !au.idr {
@@ -735,12 +747,13 @@ impl EsIngest {
             }
             let audio = if self.expect_audio { self.audio } else { None };
             if let Some(m) = &mut self.muxer
-                && (m.video() != Some(&video) || m.audio_config().copied() != audio)
+                && (!m.video().is_some_and(|v| same_parameter_sets(v, sps, pps))
+                    || m.audio_config().copied() != audio)
             {
                 tracing::warn!(
                     "reconnected encoder changed configuration; starting a new codec epoch on the existing timeline"
                 );
-                m.reconfigure_with_audio(Some(video.clone()), audio, now)?;
+                reconfigured.merge(m.reconfigure_with_audio(Some(video.clone()), audio, now)?);
                 restarted = true;
             }
             if self.muxer.is_none() {
@@ -771,12 +784,14 @@ impl EsIngest {
             )
             .map_err(IngestError::from)?;
         update.restarted |= restarted;
+        update.merge(reconfigured);
         Ok(update)
     }
 
     /// At an IDR on a running timeline: if the latest SPS or PPS differs
     /// from the current epoch's, starts a new codec epoch with them, keeping
-    /// the audio track, and returns `true`.
+    /// the audio track, and returns the interrupt's update (the old epoch's
+    /// last part and segment, and `media_loss` if it could not seal them).
     ///
     /// - Parameter sets compare byte for byte, after trailing zero bytes,
     ///   which belong to the byte stream rather than the NAL unit (H.264
@@ -790,15 +805,15 @@ impl EsIngest {
     ///   better can be built.
     /// - A change seen on a frame that is not an IDR waits for the next IDR,
     ///   since the new epoch's first sample must be a keyframe.
-    fn change_parameter_sets(&mut self, now: SystemTime) -> Result<bool, IngestError> {
+    fn change_parameter_sets(&mut self, now: SystemTime) -> Result<Option<Update>, IngestError> {
         let (Some(sps), Some(pps), Some(muxer)) = (&self.sps, &self.pps, &mut self.muxer) else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(current) = muxer.video() else {
-            return Ok(false);
+            return Ok(None);
         };
-        if same_nal(&current.sps, sps) && same_nal(&current.pps, pps) {
-            return Ok(false);
+        if same_parameter_sets(current, sps, pps) {
+            return Ok(None);
         }
         let Some(video) = H264Config::new(sps, pps) else {
             if self.unusable_sps.as_ref() != Some(sps) {
@@ -807,23 +822,27 @@ impl EsIngest {
                 );
                 self.unusable_sps = Some(sps.clone());
             }
-            return Ok(false);
+            return Ok(None);
         };
-        // Parts the ending epoch produced: none when it changed before its
-        // first part, which then leaves no playlist entry and no recording.
-        let previous_parts = muxer
-            .next_part_id()
-            .saturating_sub(muxer.epoch_first_part_id());
+        let (from, to) = (
+            format!("{}x{}", current.width, current.height),
+            format!("{}x{}", video.width, video.height),
+        );
+        let first = muxer.epoch_first_part_id();
+        let audio = muxer.audio_config().copied();
+        let update = muxer.reconfigure_with_audio(Some(video), audio, now)?;
+        // Parts the ended epoch produced, counted after the interrupt, which
+        // seals an open part with video once part timing is known. Zero only
+        // while timing is still being learnt: that epoch is never served.
+        let previous_parts = muxer.epoch_first_part_id().saturating_sub(first);
         tracing::info!(
-            from = %format_args!("{}x{}", current.width, current.height),
-            to = %format_args!("{}x{}", video.width, video.height),
+            from,
+            to,
             previous_parts,
             "encoder changed its parameter sets mid-stream; starting a new codec epoch"
         );
-        let audio = muxer.audio_config().copied();
-        muxer.reconfigure_with_audio(Some(video), audio, now)?;
         self.unusable_sps = None;
-        Ok(true)
+        Ok(Some(update))
     }
 
     /// One raw AAC frame plus caller-owned wall time. The returned update is
