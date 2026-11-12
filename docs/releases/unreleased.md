@@ -145,12 +145,17 @@ Notes for the release after 0.2.0-rc.1.
   `SAPFLOW_RTMP_PROXY_ADDR` (off by default) with
   `SAPFLOW_RTMP_TRUSTED_PROXY`, the front's address. Each connection on it
   must come from the front and start with the header, whose source is the
-  publisher's address for the failed-attempt throttle, the app's publish
-  check (`ip`) and logs; anything else is closed unanswered, and LOCAL, the
-  front's own connection, is closed once its header is in. Without it every
-  RTMPS publisher had the front's address, so one encoder retrying a wrong
-  key could throttle them all. The plain listener is unchanged and never
-  reads a header. Both share one cap on open connections.
+  publisher's address for the failed-attempt throttle and the app's publish
+  check (`ip`). Anything else is closed unanswered, LOCAL (the front's own
+  connection) once its header is in, and a refused peer's address is
+  logged. Without it every RTMPS publisher had the front's address, so one
+  encoder retrying a wrong key could throttle them all. The plain listener
+  is unchanged and never reads a header, and now gives the throttle an
+  IPv4-mapped peer as IPv4, as the proxied one does. Both share one cap on
+  open connections (four per allowed publisher), so a flood on either can
+  hold off the other until the 10 s setup deadline. Headers over 536 bytes
+  are refused: send plain PROXY v2, without SSL, authority or unique-ID
+  TLVs.
 
 ## sapflow-dtls
 

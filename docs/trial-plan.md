@@ -84,10 +84,18 @@ deployment and never committed.
     shares the front's address, under one failed-attempt throttle and one
     address in the app's publish check. In Caddy layer4 that is
     `proxy_protocol v2` on the `proxy` handler, with that listener as its
-    upstream. Under Docker the front reaches sapflow through the bridge, so
-    the trusted address is the network's gateway, which every process on
-    the host shares: publish the listener's port on loopback only
-    (`127.0.0.1:<port>:<port>`), so that nothing off the host reaches it.
+    upstream, sending plain PROXY v2 without SSL, authority or unique-ID
+    TLVs (sapflow refuses headers over 536 bytes). The trust is one IP
+    address, with no port. Under Docker, a front on the host reaches sapflow
+    through the bridge, so the trusted address is the network's gateway; a
+    front in another container comes from that container's address, which
+    can change on restart unless the network's addresses are fixed.
+    Publish the listener's port on loopback only (`127.0.0.1:<port>:<port>`).
+    Anything Docker's userland proxy relays to a published port (rootless
+    Docker, or IPv6 to an IPv4-only container) also arrives from the
+    gateway, so on a port reachable from outside, a client could send its
+    own header and name any address. A refusal logs the peer it saw, which
+    is the address to put in `SAPFLOW_RTMP_TRUSTED_PROXY`.
   - `PULSEWIRE_LIVE_STREAM_ID_TEMPLATE` is `{eventId}` (section 2.5).
   - The publisher password in mediamtx's `authInternalUsers` is letters and
     digits only (section 2.3).

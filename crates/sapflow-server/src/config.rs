@@ -38,7 +38,9 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            SAPFLOW_RTMP_TRUSTED_PROXY and start with the header,
                            whose source is the publisher's address (default off)
   SAPFLOW_RTMP_TRUSTED_PROXY  the front's address as this server sees it, the
-                           only peer SAPFLOW_RTMP_PROXY_ADDR accepts
+                           only peer SAPFLOW_RTMP_PROXY_ADDR accepts; keep that
+                           port reachable from the front only (under Docker,
+                           publish it on 127.0.0.1)
   SAPFLOW_HTTP_ADDR        HLS over HTTP (default 0.0.0.0:8888)
   SAPFLOW_CONTROL_ADDR     enable scoped SRT publishing: private loopback control
                            listener, behind an authenticated private TLS proxy

@@ -11,9 +11,9 @@
 //! RTMPS. Each connection on it must come from the trusted front, checked
 //! before a byte is read, and start with a PROXY protocol v2 header, parsed
 //! with `sapflow_core::proxy_protocol`. The header's source is the
-//! publisher's address for the failed-attempt throttle, the app's publish
-//! check and logs. Without it every RTMPS publisher would share the front's
-//! address, and one encoder retrying a wrong key could throttle them all.
+//! publisher's address for the failed-attempt throttle and the app's publish
+//! check. Without it every RTMPS publisher would share the front's address,
+//! and one encoder retrying a wrong key could throttle them all.
 //! The plain listener never reads a header, since a header can only be
 //! believed from a configured front.
 
@@ -91,7 +91,9 @@ async fn serve(
             // The header, the handshake and the publish request share it.
             let setup_until = Instant::now() + SETUP;
             let result = match front {
-                Front::Direct => connection(&app, sock, peer.ip(), &[], setup_until).await,
+                Front::Direct => {
+                    connection(&app, sock, peer.ip().to_canonical(), &[], setup_until).await
+                }
                 Front::Proxied(trusted) => {
                     match proxy_header(&mut sock, peer, trusted, setup_until).await {
                         Ok((from, rest)) => connection(&app, sock, from, &rest, setup_until).await,
@@ -99,8 +101,14 @@ async fn serve(
                     }
                 }
             };
-            if let Err(e) = result {
-                tracing::info!(error = %e, "RTMP connection ended");
+            match result {
+                Ok(()) => {}
+                // The front's address, not a publisher's: logged so that a
+                // wrong SAPFLOW_RTMP_TRUSTED_PROXY says what the peer was.
+                Err(e @ End::Proxy(proxy_protocol::Error::UntrustedPeer)) => {
+                    tracing::info!(error = %e, %peer, "RTMP connection ended");
+                }
+                Err(e) => tracing::info!(error = %e, "RTMP connection ended"),
             }
         });
     }
@@ -130,11 +138,13 @@ async fn proxy_header(
         match proxy_protocol::parse(&buf) {
             Ok(Parsed::Complete { header, consumed }) => {
                 return match header.command() {
-                    Command::Local => Err(End::ProxyLocal),
-                    _ => Ok((
+                    Command::Proxy { .. } => Ok((
                         header.client_address(peer).ip(),
                         buf.get(consumed..).unwrap_or_default().to_vec(),
                     )),
+                    // LOCAL, and any command a later parser adds: no
+                    // publisher behind it that we know how to name.
+                    _ => Err(End::ProxyLocal),
                 };
             }
             Ok(_) => {}
@@ -794,7 +804,7 @@ mod tests {
 
     /// Writes `prefix` and the client's first bytes in one segment, then
     /// runs the client over the socket until it is publishing.
-    async fn publish_through(socket: &mut TcpStream, prefix: Vec<u8>, key: &str) {
+    async fn publish_through(socket: &mut TcpStream, prefix: Vec<u8>, key: &str) -> bool {
         let mut client = Publisher::new(
             PublisherConfig::new("live".into(), key.into(), "rtmp://localhost/live".into()),
             11,
@@ -810,23 +820,24 @@ mod tests {
                 .await
                 .expect("the server answers")
                 .expect("read");
-            assert!(n > 0, "the server closed during setup");
-            client.feed(&buf[..n], step).expect("server bytes");
+            if n == 0 || client.feed(&buf[..n], step).is_err() {
+                return false;
+            }
             let out = client.take_output();
             if !out.is_empty() {
                 socket.write_all(&out).await.expect("client bytes");
             }
             if client.state() == PublisherState::Publishing {
-                return;
+                return true;
             }
         }
         panic!("the handshake did not finish");
     }
 
-    /// RTMPS through a front: the throttle and the app's publish check see
-    /// the publisher's own address from the header, not the front's. The
-    /// header arrives in two writes, and the handshake's first bytes in the
-    /// same segment as its end.
+    /// RTMPS through a front: the app's publish check sees the publisher's
+    /// own address from the header, not the front's. The header arrives in
+    /// two writes, and the handshake's first bytes in the same segment as
+    /// its end.
     #[tokio::test]
     async fn a_proxied_publisher_is_known_by_the_address_in_its_header() {
         use crate::publish_auth::stub::{self, Answer};
@@ -844,15 +855,53 @@ mod tests {
             .await
             .expect("first part of the header");
         tokio::time::sleep(Duration::from_millis(20)).await;
-        publish_through(
+        let published = publish_through(
             &mut socket,
             rest.to_vec(),
             "event-one?user=encoder&pass=gig-secret",
         )
         .await;
+        assert!(published);
         let sent = stub.last();
         assert_eq!(sent["ip"], "203.0.113.7");
         assert_eq!(sent["path"], "live/event-one");
+        drop(socket);
+        server.abort();
+    }
+
+    /// The failed-attempt throttle keys on the header's address: one
+    /// throttled publisher behind the front does not lock out another, and
+    /// the throttled one is refused before the app is asked.
+    #[tokio::test]
+    async fn the_throttle_keys_on_the_address_in_the_header() {
+        use crate::publish_auth::stub::{self, Answer};
+        let stub = stub::start(Answer::Status(200)).await;
+        let mut fixture = crate::publish::loss_tests::Fixture::new();
+        let app = Arc::get_mut(&mut fixture.app).expect("sole App");
+        app.config.recordings = None;
+        app.config.publish_auth = Some(stub.endpoint.clone());
+        let noisy: SocketAddr = "203.0.113.7:50000".parse().expect("source");
+        {
+            let mut throttle = fixture.app.auth_throttle.lock().expect("throttle");
+            for _ in 0..10 {
+                throttle.failed(noisy.ip(), Instant::now().into_std());
+            }
+        }
+        let (address, server) = proxied_listener(fixture.app.clone(), "127.0.0.1").await;
+        let key = "event-one?user=encoder&pass=gig-secret";
+        let mut socket = TcpStream::connect(address).await.expect("connect");
+        assert!(
+            !publish_through(&mut socket, proxy_v2(noisy), key).await,
+            "the throttled address is refused"
+        );
+        assert_eq!(stub.count(), 0, "refused before the app is asked");
+        let mut socket = TcpStream::connect(address).await.expect("connect");
+        let other = "198.51.100.9:50001".parse().expect("source");
+        assert!(
+            publish_through(&mut socket, proxy_v2(other), key).await,
+            "another publisher behind the same front is not throttled"
+        );
+        assert_eq!(stub.last()["ip"], "198.51.100.9");
         drop(socket);
         server.abort();
     }
