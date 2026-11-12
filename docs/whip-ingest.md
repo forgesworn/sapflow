@@ -1120,14 +1120,17 @@ Left open:
   there (segments start at keyframes), and leaving the hole out of
   `EXTINF` would move the playlist off the media's time. `RuleCheck` and
   `scripts/check-playlist.py` allow exactly this: a segment longer than
-  its parts only with a part at `PART-TARGET`, and before a
-  discontinuity only if that part is not the segment's last (the hole is
-  inside the run, not at its end). So a run that breaks or is
-  interrupted right after such a part also ends its segment with its
-  media, and the next run resumes there (found by `muxer_timing` once the
-  rule was in; `fuzz/regressions/muxer_timing`). Both allow each part up
-  to two units of the fifth decimal for its tick rounding: an audio-only
-  part's duration is rounded up from its samples.
+  its parts only with a part at `PART-TARGET`. A render cannot tell that
+  from a hole a run's end should not keep: a continuous run publishes a
+  segment ending at the keyframe it expects, and a break can then drop
+  that keyframe (found by `muxer_timing`). So the tests of cuts check from
+  the muxer that every segment ending a run lasts as long as its parts.
+  A run that breaks or is interrupted right after a clamped part now also
+  ends its segment with its media, and the next run resumes there (also
+  found by `muxer_timing`; both inputs are in
+  `fuzz/regressions/muxer_timing`). Both checks allow each part two units
+  of the fifth decimal for its tick rounding: an audio-only part's
+  duration is rounded up from its samples (found by `ts_ingest`).
 - A cut's own losses (the held frame, or audio past the part and segment
   limits at a reconnect-style cut) are still in the new run's
   `media_loss`, and the server still marks both files for them, as for

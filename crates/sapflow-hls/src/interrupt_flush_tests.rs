@@ -266,8 +266,38 @@ fn expected(events: &[Event]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     (video, audio)
 }
 
+/// Every run ends with its media: each segment that a discontinuity
+/// follows, and the last, lasts as long as its parts do (within a tick a
+/// part), so a gap at a cut falls at the discontinuity. A playlist cannot
+/// show this ([`playlist::RuleCheck`] allows a clamped part's hole).
+fn assert_runs_end_with_their_media(m: &Muxer) {
+    let segments: Vec<_> = m
+        .entries()
+        .iter()
+        .filter_map(|e| match e {
+            crate::muxer::Entry::Segment(s) => Some(s.clone()),
+            crate::muxer::Entry::Gap { .. } => None,
+        })
+        .collect();
+    for (i, segment) in segments.iter().enumerate() {
+        let ends_run = segments.get(i + 1).is_none_or(|next| next.discontinuity);
+        if !ends_run {
+            continue;
+        }
+        let parts: Duration = segment.parts.iter().map(|p| p.duration).sum();
+        let slack = Duration::from_nanos(11_200 * segment.parts.len() as u64);
+        assert!(
+            segment.duration.abs_diff(parts) <= slack,
+            "segment {} ends a run lasting {:?}, its parts {parts:?}",
+            segment.id,
+            segment.duration
+        );
+    }
+}
+
 fn assert_all_out(es: &EsIngest, events: &[Event], what: &str) {
     let m = es.muxer().expect("muxer");
+    assert_runs_end_with_their_media(m);
     let (video, audio) = expected(events);
     let (got_video, got_audio) = (track_samples(m, VIDEO_TRACK), track_samples(m, AUDIO_TRACK));
     assert_eq!(
@@ -497,6 +527,7 @@ fn a_break_after_a_clamped_stall_ends_the_segment_with_its_media() {
     check
         .check(&playlist::media(&m, "p"))
         .expect("every playlist keeps the HLS rules");
+    assert_runs_end_with_their_media(&m);
     let spans = video_spans(&m, 0);
     let resumed = spans
         .windows(2)

@@ -275,13 +275,14 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
 ///   byte cap cut it ([`RuleCheck::check_with_byte_cap`],
 ///   [`crate::Muxer::window_byte_capped`]);
 /// - a segment whose parts are listed lasts, by its `EXTINF`, as long as
-///   they do together (4.4.4.9: a part's duration is that of its media).
-///   The one exception is a hole inside a continuous run: after a part cut
-///   to exactly `PART-TARGET` (a frame longer than the part's room,
-///   clamped), the next part's decode time carries the true time, and the
-///   segment lasts as long as that. A run's end has no such hole: if a
-///   discontinuity follows, the clamped part must not be the segment's
-///   last, since the gap falls at the discontinuity;
+///   they do together (4.4.4.9: a part's duration is that of its media),
+///   within two units of the fifth decimal a part for tick rounding. The
+///   one exception: after a part cut to exactly `PART-TARGET` (a frame
+///   longer than the part's room, clamped), the next part's decode time
+///   carries the true time, and the segment may last as long as that. A
+///   render cannot tell a hole a run's end should not have kept from one a
+///   continuous run published before a break dropped the keyframe it
+///   expected, so tests of cuts check that from the muxer;
 /// - an `EXT-X-DISCONTINUITY` sits before a segment's parts, never among
 ///   them, and every media sequence number keeps one discontinuity
 ///   sequence number from render to render.
@@ -377,9 +378,6 @@ impl RuleCheck {
             Ok(())
         };
         let mut run = Vec::new();
-        // A segment that lasts longer than its parts, until what follows it
-        // shows whether that is a discontinuity.
-        let mut held_hole: Option<(u64, u64, u64)> = None;
         let mut map = String::new();
         let mut pending_uri = None;
         for l in pl.lines() {
@@ -403,7 +401,6 @@ impl RuleCheck {
                 }
             }
             if let Some(rest) = l.strip_prefix("#EXT-X-PART:DURATION=") {
-                held_hole = None;
                 run.push((
                     fixed5(rest.split(',').next().unwrap_or_default())?,
                     rest.split(',').any(|a| a == "INDEPENDENT=YES"),
@@ -411,12 +408,6 @@ impl RuleCheck {
             } else if l == "#EXT-X-DISCONTINUITY" {
                 if !run.is_empty() {
                     return Err(format!("discontinuity among the parts of segment {msn}"));
-                }
-                if let Some((msn, d, sum)) = held_hole {
-                    return Err(format!(
-                        "segment {msn} lasts {d}, but its parts sum to {sum}, \
-                         before a discontinuity"
-                    ));
                 }
                 dseq += 1;
             } else if let Some(rest) = l.strip_prefix("#EXTINF:") {
@@ -434,12 +425,6 @@ impl RuleCheck {
                         return Err(format!(
                             "segment {msn} lasts {d}, but its parts sum to {sum}"
                         ));
-                    }
-                    // A hole that only the last part can explain is at the
-                    // run's end, if a discontinuity follows.
-                    let inside = run[..run.len() - 1].iter().any(|&(p, _)| p == part_target);
-                    if !inside {
-                        held_hole = Some((msn, d, sum));
                     }
                 }
                 run.clear();
@@ -966,15 +951,6 @@ mod tests {
             // Parts that do not add up to their segment.
             format!("{}{}{}", head(3, 0, 0), part("0.2"), seg("0.25")),
             format!("{}{}{}", head(3, 0, 0), part("0.2"), seg("0.15")),
-            // A clamped part's hole is no exception before a discontinuity:
-            // the gap falls at it.
-            format!(
-                "{}{}{}#EXT-X-DISCONTINUITY\n{}",
-                head(3, 0, 0),
-                part("0.23400"),
-                seg("0.5"),
-                part("0.2"),
-            ),
             "#EXTM3U\n".to_string(),
         ] {
             assert!(
@@ -997,7 +973,7 @@ mod tests {
             part("0.2")
         );
         assert_eq!(RuleCheck::without_live_window().check(&stall), Ok(()));
-        // So is one inside a run that a discontinuity then ends.
+        // So is one before a discontinuity.
         let inside = format!(
             "{}{}{}{}#EXT-X-DISCONTINUITY\n{}",
             head(3, 0, 0),
