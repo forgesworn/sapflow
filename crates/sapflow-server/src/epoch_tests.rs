@@ -637,14 +637,18 @@ async fn a_short_epoch_recording_decodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_late_start_marks_the_next_recording() {
     let (mut app, _scratch) = app(true);
-    Arc::get_mut(&mut app).expect("sole fixture App").recording_limits =
-        Arc::new(crate::recorder::RecordingLimits::with_path_bytes(1, 1));
+    Arc::get_mut(&mut app)
+        .expect("sole fixture App")
+        .recording_limits = Arc::new(crate::recorder::RecordingLimits::with_path_bytes(1, 1));
     let mut publisher = begin(&app);
     for chunk in BLIP.chunks(1316) {
         feed(&mut publisher, chunk);
     }
     let session = publisher.stream.session();
-    let recorder = session.recorder.as_ref().expect("the third epoch's recorder");
+    let recorder = session
+        .recorder
+        .as_ref()
+        .expect("the third epoch's recorder");
     assert_eq!(
         recorder.status().reason(),
         Some(crate::recorder::IncompleteReason::EpochUnrecorded)
@@ -727,7 +731,12 @@ async fn a_started_recording_keeps_its_tail_when_an_epoch_passes_in_one_push() {
         drop(st);
         let session = stream.session();
         assert_eq!(
-            session.recorder.as_ref().expect("recorder").status().reason(),
+            session
+                .recorder
+                .as_ref()
+                .expect("recorder")
+                .status()
+                .reason(),
             Some(crate::recorder::IncompleteReason::EpochUnrecorded),
             "the short epoch had no recording"
         );
