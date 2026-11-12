@@ -562,7 +562,7 @@ async fn short_epoch_run() -> (
             .map(|m| m.current_initialization_id());
         if epoch == Some(2) && !waited {
             // As in real time, where the next part gives the first file's
-            // writer time to finish: two writers a path. The first file is
+            // writer time to finish (`recorder::PATH_WRITERS`). The first file is
             // finished at the second change, which ends its late audio.
             waited = true;
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -686,6 +686,52 @@ async fn a_refused_late_start_marks_the_next_recording() {
         recorder.status().reason(),
         Some(crate::recorder::IncompleteReason::EpochUnrecorded)
     );
+}
+
+/// A recording whose first part is refused as it starts after a push has no
+/// file and makes no callback: no free writer (both of the path's still
+/// finishing files, as when codec epochs come faster than a file is synced),
+/// or the byte budget full. The next file must say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recording_refused_its_first_part_marks_the_next_file() {
+    use crate::recorder::RecordingLimits;
+    let (_, _, half) = fixture_halves();
+    let frames = epochs_of(&[true, false]);
+    let cut = frames
+        .iter()
+        .position(|f| f.at() >= 1_000_000 + half)
+        .expect("a second epoch");
+    for limits in [
+        RecordingLimits::with_path_writers(1, 0),
+        RecordingLimits::with_path_bytes(1, 1),
+    ] {
+        let mut run = EpochRun::new(crate::roll_budget::RollLimit::default());
+        Arc::get_mut(&mut run.app)
+            .expect("sole fixture App")
+            .recording_limits = Arc::new(limits);
+        let mut publisher = run.begin();
+        run.feed(&mut publisher, &frames[..cut]).await;
+        assert!(
+            publisher
+                .stream
+                .session()
+                .recorder
+                .as_ref()
+                .expect("the first epoch's recorder")
+                .refused_start(),
+            "refused as it started, not late at the roll"
+        );
+        run.feed(&mut publisher, &frames[cut..]).await;
+        let session = publisher.stream.session();
+        let recorder = session
+            .recorder
+            .as_ref()
+            .expect("the second epoch's recorder");
+        assert_eq!(
+            recorder.status().reason(),
+            Some(crate::recorder::IncompleteReason::EpochUnrecorded)
+        );
+    }
 }
 
 /// A PES start in one TS packet: its stream id and PTS (90 kHz), from the
@@ -1272,9 +1318,10 @@ fn epochs_of(pattern: &[bool]) -> Vec<Frame> {
 
 /// One publication of `frames` through the elementary-stream path with the
 /// given roll limit: after each codec change while files are still being
-/// rolled, real time for the last file's writer to finish (two writers a
-/// path), as an encoder's seconds between changes give it, and a moment
-/// every hundred frames for the writer to keep up.
+/// rolled, the time the file before the held one needs to finish (see
+/// `recorder::PATH_WRITERS`), as an encoder's seconds between changes give
+/// it, and a
+/// moment every hundred frames for the writer to keep up.
 struct EpochRun {
     app: Arc<crate::App>,
     /// A wall clock the feed keeps in step with the media, as a publisher
@@ -1387,10 +1434,26 @@ impl EpochRun {
                 .expect("fixture frames");
             let recording = publisher.stream.session().recorder.is_some();
             if epoch(publisher) != before && recording {
-                self.drain_for(Duration::from_millis(100)).await;
+                self.until_a_writer_is_free().await;
             }
         }
         epoch(publisher).unwrap_or(0)
+    }
+
+    /// After a roll: waits, collecting callbacks, until at most one of the
+    /// path's writers is taken (by the file just ended, held for its late
+    /// audio), so the new epoch's recording will find one free. The file
+    /// before it has then finished, as an encoder's seconds between codec
+    /// changes let it; a loaded runner can take longer than any fixed wait
+    /// to sync a file.
+    async fn until_a_writer_is_free(&mut self) {
+        let path = StreamPath::parse("live/event-epochs").expect("path");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.app.recording_limits.path_writers_in_use(&path) > 1
+            && tokio::time::Instant::now() < deadline
+        {
+            self.drain_for(Duration::from_millis(5)).await;
+        }
     }
 
     async fn drain_for(&mut self, time: Duration) {

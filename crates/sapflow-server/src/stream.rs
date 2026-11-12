@@ -771,12 +771,14 @@ impl LiveStream {
     ///   started, so it is started now with that epoch's tracks, as noted
     ///   after the push that began it, and fed the epoch's parts.
     /// - An epoch begun and ended inside one push left no tracks to start
-    ///   its recording with: `false`. So does a late start whose first part
-    ///   was refused (no free writer, or the byte budget full).
+    ///   its recording with: `false`. So does a recording whose first part
+    ///   was refused (no free writer, or the byte budget full), whether it
+    ///   started after a push or late, here.
     pub fn feed_outgoing(&self, recorder: &mut Recorder) -> bool {
         if !recorder.is_accepting() {
-            // Stopped: it has marked itself.
-            return true;
+            // Stopped: it has marked itself, unless it stopped before it had
+            // a file, so its epoch was served but has no file or callback.
+            return !recorder.refused_start();
         }
         let fed = {
             let st = self.lock();

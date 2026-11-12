@@ -1278,13 +1278,16 @@ Left open:
   writer, which fails it. A late-started file for a short epoch takes one
   of the two. In real time the short epoch and the next part give the
   writer that time; nothing bounds the epoch rate but the IDR cadence (for
-  the bounds work in W3c part 2b). A late start refused a writer or byte
-  budget marks the next file `epoch-unrecorded`.
+  the bounds work in W3c part 2b). A recording refused a writer or byte
+  budget for its first part, whether it started after a push or late at
+  the roll, has no file and no callback, and marks the next file
+  `epoch-unrecorded`.
 - Unmarked losses that need several complete access units in one ingest
   batch, so in practice only crafted input: a short epoch, then an epoch
   with no part, then a third configuration, all in one batch, loses the
   short epoch with no mark; and an `epoch-unrecorded` mark is lost if the
-  recording it was put on never starts.
+  recording it was put on never starts, unless it was refused its first
+  part, which marks the file after it in turn.
 - The end-to-end script matches recordings to served epochs by count, not
   by each file's width.
 - Observed stalls of hls.js 1.7.1 at the boundary in the end-to-end runs,
