@@ -86,3 +86,11 @@ Notes for the release after 0.2.0-rc.1.
   (`segmentDuration` and the file's header) now comes from its parts' own
   timestamps (`fmp4::rebase_part_for_file_timed`), not their spans, which
   over-reported a file by a clamped stall's hole at such a break.
+
+## sapflow
+
+- The RTMP listener and the scoped control API no longer stop on a failed
+  accept (out of file descriptors, or a connection reset before it was
+  taken): they log it and try again after 100 ms, as WHIP's listeners do.
+- `--help` says the playlist can keep more than `SAPFLOW_SEGMENT_COUNT`
+  segments, as above.

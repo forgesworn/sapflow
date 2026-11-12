@@ -27,6 +27,11 @@ impl Fixture {
         Self::start_with(Timeouts::default()).await
     }
     async fn start_with(timeouts: Timeouts) -> Self {
+        Self::start_failing(timeouts, 0).await
+    }
+    /// As [`Fixture::start_with`], with the listener's first `failures`
+    /// accepts failing.
+    async fn start_failing(timeouts: Timeouts, failures: usize) -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
             .join(format!(
@@ -76,7 +81,12 @@ impl Fixture {
             .await
             .expect("loopback listener");
         let address = listener.local_addr().expect("listener address");
-        let task = tokio::spawn(serve_with(listener, app.clone(), timeouts));
+        let task = if failures == 0 {
+            tokio::spawn(serve_with(listener, app.clone(), timeouts))
+        } else {
+            let listener = crate::accept::testing::Flaky::new(listener, failures);
+            tokio::spawn(serve_with(listener, app.clone(), timeouts))
+        };
         Self {
             root,
             address,
@@ -166,6 +176,18 @@ fn body(response: &[u8], expected: u16) -> &[u8] {
             .contains("access-control-allow-origin")
     );
     &response[boundary + 4..]
+}
+
+/// An accept error (out of file descriptors, or a connection reset before
+/// it was taken) is not the end of the control listener.
+#[tokio::test]
+async fn an_accept_error_does_not_end_the_listener() {
+    let fixture = Fixture::start_failing(Timeouts::default(), 2).await;
+    let response = fixture
+        .request("GET", "/v1/no-such-route", Some(TOKEN), b"")
+        .await;
+    assert!(response.starts_with(b"HTTP/1.1 "), "answered");
+    assert!(!fixture.task.is_finished(), "the listener is still running");
 }
 
 #[tokio::test]

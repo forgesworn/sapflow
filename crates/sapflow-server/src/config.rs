@@ -49,7 +49,10 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            {token} are substituted
   SAPFLOW_CALLBACK_SECRET  the callback token (appended as token= if the URL
                            has no {token})
-  SAPFLOW_SEGMENT_COUNT    segments kept in the playlist (default 24, min 7)
+  SAPFLOW_SEGMENT_COUNT    segments the playlist keeps (default 24, 7 to 1000);
+                           more while that many would last under three target
+                           durations: up to 256 entries, with at most 64 MiB of
+                           media past the count
   SAPFLOW_HLS_MODE         low-latency (default) or whole; whole omits parts
   SAPFLOW_HTTP_THREADS     viewer event loop threads (default: one per core, max 256)
                            explicit values: 1..256

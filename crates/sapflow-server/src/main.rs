@@ -1,5 +1,6 @@
 //! sapflow: SRT in, Low-Latency HLS out, with the v4v stream-health callback.
 
+mod accept;
 mod callback;
 mod config;
 #[cfg(test)]
@@ -7,6 +8,8 @@ mod epoch_tests;
 mod fdlimit;
 mod http1;
 mod http_lite;
+#[cfg(test)]
+mod log_capture;
 mod media_body;
 mod own_http;
 mod publish;

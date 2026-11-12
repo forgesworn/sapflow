@@ -52,14 +52,12 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::App;
 use crate::config::WhipConfig;
 use crate::http_lite::{self, ParsedRequest, Refusal as HeadRefusal};
-use crate::publish::{Publication, PublicationLoss, Refusal};
+use crate::publish::{Publication, Refusal};
 use crate::recorder::IncompleteReason;
 use crate::stream::{Source, SourceKind};
 use crate::whip_request::{self, Action, Refused};
 use crate::whip_tcp;
 
-/// Signalling connections served at once; more are closed as they arrive.
-const CONNECTIONS: usize = 32;
 /// Media items queued per session: about 10 s of audio and video.
 const QUEUE: usize = 1024;
 /// Media bytes queued per session. An access unit may be 8 MiB, so 1024 of
@@ -68,10 +66,118 @@ const QUEUE: usize = 1024;
 /// ingest stalls. At the default 16 publishers it bounds the queues to
 /// 256 MiB. Reaching it is a full queue.
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
-/// The whole request head, counted from accept.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
-/// Reading the offer, admission and setup together.
+/// Sending the answer, and the shutdown after it.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Reading the offer, admission and setup together; the offer must also
+/// be in by [`Limits::client_time`].
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The signalling listener's caps and the pending-session caps
+/// (A3.7). Each refuses at its limit; none is a setting.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// Signalling connections at once; more are closed as they arrive.
+    pub connections: usize,
+    /// Of those, from one peer address: one address holds at most this
+    /// share of the slots. The trusted proxy, which carries every publisher
+    /// behind it, is not limited.
+    pub per_address: usize,
+    /// From the connection, how long a client has to send its whole
+    /// request, the head and the offer; a request still arriving then gets
+    /// `408`. A slow client so holds a slot for this, then the answer.
+    pub client_time: Duration,
+    /// Sessions that have not connected yet (ICE and DTLS), in total; a
+    /// `POST` past it gets `503`.
+    pub pending: usize,
+    /// Of those, from one publisher address.
+    pub pending_per_address: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            connections: 32,
+            per_address: 8,
+            client_time: Duration::from_secs(5),
+            pending: 8,
+            pending_per_address: 4,
+        }
+    }
+}
+
+/// Sessions that have not connected yet (A3.7): how many, in total and
+/// from each publisher address, and each one's address until it connects
+/// or ends.
+#[derive(Debug, Default)]
+struct Pending {
+    total: usize,
+    by_ip: HashMap<IpAddr, usize>,
+    sessions: HashMap<SessionId, IpAddr>,
+}
+
+impl Pending {
+    fn release(&mut self, ip: IpAddr) {
+        self.total = self.total.saturating_sub(1);
+        if let Some(n) = self.by_ip.get_mut(&ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.by_ip.remove(&ip);
+            }
+        }
+    }
+}
+
+/// A `POST`'s place among the pending sessions: given back on drop unless
+/// [`PendingSlot::attach`] hands it to the session, which keeps it until it
+/// connects or ends ([`Whip::settled`]).
+struct PendingSlot<'a> {
+    whip: &'a Whip,
+    ip: IpAddr,
+    attached: bool,
+}
+
+impl<'a> PendingSlot<'a> {
+    fn take(whip: &'a Whip, ip: IpAddr) -> Option<Self> {
+        let ip = address_key(ip);
+        let mut pending = whip.pending();
+        let here = pending.by_ip.get(&ip).copied().unwrap_or(0);
+        if pending.total >= whip.limits.pending || here >= whip.limits.pending_per_address {
+            return None;
+        }
+        pending.total += 1;
+        *pending.by_ip.entry(ip).or_insert(0) += 1;
+        Some(Self {
+            whip,
+            ip,
+            attached: false,
+        })
+    }
+
+    fn attach(mut self, id: SessionId) {
+        self.whip.pending().sessions.insert(id, self.ip);
+        self.attached = true;
+    }
+}
+
+impl Drop for PendingSlot<'_> {
+    fn drop(&mut self) {
+        if !self.attached {
+            self.whip.pending().release(self.ip);
+        }
+    }
+}
+
+/// What the signalling listener refused, counted since start; none holds
+/// an address.
+#[derive(Debug, Default)]
+pub(crate) struct SignallingCounts {
+    /// Closed at accept: [`Limits::connections`] were open.
+    pub over_total: AtomicU64,
+    /// Closed at accept: [`Limits::per_address`] were open from the address.
+    pub over_address: AtomicU64,
+    /// Answered `408`: the request was not in by [`Limits::client_time`].
+    pub client_timeouts: AtomicU64,
+}
 /// How long `DELETE` waits for the publication to be released.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -94,6 +200,11 @@ pub(crate) enum Item {
     /// The receiver's timeline re-anchored on arrival time (or moved to a
     /// sender report) before the next frame, with no loss of its own.
     Reanchor,
+    /// Marks the UDP owner raised at this point in the stream, for the
+    /// recording current when the ingest reaches them: one after a queued
+    /// item that rolls the recording (a codec epoch change) is the new
+    /// file's. In the order raised, each once.
+    Marks(Vec<IncompleteReason>),
 }
 
 /// The audio stream's timeline counters in `sapflow-rtp` as an event was
@@ -129,21 +240,21 @@ impl Item {
                 .saturating_add(au.sps.as_ref().map_or(0, Vec::len))
                 .saturating_add(au.pps.as_ref().map_or(0, Vec::len)),
             Self::Audio { packet, .. } => packet.len(),
-            Self::Reanchor => 0,
+            Self::Reanchor | Self::Marks(_) => 0,
         }
     }
 
     fn audio_trace(&self) -> Option<(u64, AudioTrace)> {
         match self {
             Self::Audio { pts, trace, .. } => Some((*pts, *trace)),
-            Self::Video { .. } | Self::Reanchor => None,
+            Self::Video { .. } | Self::Reanchor | Self::Marks(_) => None,
         }
     }
 
     fn received(&self) -> usize {
         match self {
             Self::Video { received, .. } | Self::Audio { received, .. } => *received,
-            Self::Reanchor => 0,
+            Self::Reanchor | Self::Marks(_) => 0,
         }
     }
 }
@@ -188,6 +299,10 @@ pub(crate) struct LossCounts {
     pub panics: AtomicU64,
     /// The last break the audio-only muxer reported, explained.
     pub muxer_break: Mutex<Option<String>>,
+    /// Marks the feed still held, unqueued, when it went (a full queue at
+    /// an abnormal end, say): the ingest task applies them once it has
+    /// taken everything queued before them.
+    pub trailing: Mutex<Vec<IncompleteReason>>,
 }
 
 impl LossCounts {
@@ -248,7 +363,9 @@ pub(crate) enum LossPath {
 /// What the UDP owner keeps per session for its ingest task.
 pub(crate) struct Feed {
     tx: mpsc::Sender<Item>,
-    loss: PublicationLoss,
+    /// Marks raised and not yet queued: they go ahead of the next item
+    /// that fits, so each reaches the ingest where it was raised.
+    marks: Vec<IncompleteReason>,
     /// Media bytes queued and not yet taken by the ingest task, which
     /// subtracts what it takes.
     queued: Arc<AtomicUsize>,
@@ -273,15 +390,34 @@ pub(crate) struct Feed {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Gone;
 
+/// Marks the feed could not queue go to the ingest task to apply after the
+/// rest of the queue: they were raised after everything in it.
+impl Drop for Feed {
+    fn drop(&mut self) {
+        if !self.marks.is_empty() {
+            let mut trailing = self
+                .counts
+                .trailing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for reason in self.marks.drain(..) {
+                if !trailing.contains(&reason) {
+                    trailing.push(reason);
+                }
+            }
+        }
+    }
+}
+
 impl Feed {
-    pub(crate) fn new(tx: mpsc::Sender<Item>, loss: PublicationLoss) -> Self {
-        Self::bounded(tx, loss, QUEUE_BYTES)
+    pub(crate) fn new(tx: mpsc::Sender<Item>) -> Self {
+        Self::bounded(tx, QUEUE_BYTES)
     }
 
-    pub(crate) fn bounded(tx: mpsc::Sender<Item>, loss: PublicationLoss, max_bytes: usize) -> Self {
+    pub(crate) fn bounded(tx: mpsc::Sender<Item>, max_bytes: usize) -> Self {
         Self {
             tx,
-            loss,
+            marks: Vec::new(),
             queued: Arc::new(AtomicUsize::new(0)),
             max_bytes,
             received: 0,
@@ -335,15 +471,45 @@ impl Feed {
             EndReason::HandshakeTimeout | EndReason::Closed | EndReason::PeerClosed => return,
         };
         self.counts.abnormal_ends.fetch_add(1, Ordering::Relaxed);
-        self.loss.mark_incomplete(cause);
+        self.mark(cause);
     }
 
     /// The UDP owner's code for this session panicked: the recording is
     /// marked, as for a session that panicked.
-    pub(crate) fn panicked(&self) {
+    pub(crate) fn panicked(&mut self) {
         self.counts.panics.fetch_add(1, Ordering::Relaxed);
         self.counts.abnormal_ends.fetch_add(1, Ordering::Relaxed);
-        self.loss.mark_incomplete(IncompleteReason::IngestError);
+        self.mark(IncompleteReason::IngestError);
+    }
+
+    /// Marks the recording at this point in the stream: the mark is queued
+    /// behind everything queued so far, or, if the queue has no room, ahead
+    /// of the next item that has, so the ingest applies it to the recording
+    /// current there ([`Item::Marks`]).
+    fn mark(&mut self, reason: IncompleteReason) {
+        if !self.marks.contains(&reason) {
+            self.marks.push(reason);
+        }
+        let _ = self.queue_marks();
+    }
+
+    /// Queues the marks held, if any and if there is room for an item.
+    fn queue_marks(&mut self) -> Result<(), Gone> {
+        if self.marks.is_empty() {
+            return Ok(());
+        }
+        match self
+            .tx
+            .try_send(Item::Marks(std::mem::take(&mut self.marks)))
+        {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(Item::Marks(marks))) => {
+                self.marks = marks;
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Gone),
+        }
     }
 
     /// Whether the ingest task panicked (it sets the count before closing
@@ -381,13 +547,15 @@ impl Feed {
             LossPath::Refused => (&c.refused, 1),
         };
         counter.fetch_add(n, Ordering::Relaxed);
-        self.loss.mark_incomplete(IncompleteReason::MediaLoss);
+        self.mark(IncompleteReason::MediaLoss);
     }
 
     /// Queues one media item for the ingest task.
     pub(crate) fn push(&mut self, media: Media) -> Result<(), Gone> {
         #[cfg(test)]
         injected::feed(self.panic_hooks, &media);
+        // Marks held for want of room go first, in order.
+        self.queue_marks()?;
         let item = match media {
             Media::Video { pts, au } => {
                 if self.skip_video && !au.idr {
@@ -411,7 +579,7 @@ impl Feed {
                 // whole, but the recording is not.
                 if lost {
                     self.counts.loss_fills.fetch_add(1, Ordering::Relaxed);
-                    self.loss.mark_incomplete(IncompleteReason::MediaLoss);
+                    self.mark(IncompleteReason::MediaLoss);
                 }
                 Item::Audio {
                     pts,
@@ -438,14 +606,24 @@ impl Feed {
                 Item::Reanchor
             }
         };
+        self.enqueue(item)
+    }
+
+    /// Queues an item, or refuses it as the queue being full: by count or
+    /// by bytes, or while marks are held for want of room. An item must not
+    /// go ahead of them, and the ingest may have freed a slot since they
+    /// found none; a keyframe at a new size would then roll the recording
+    /// first and take the marks meant for the file before it.
+    fn enqueue(&mut self, item: Item) -> Result<(), Gone> {
         let size = item.size();
         let video = matches!(item, Item::Video { .. });
-        let room = self
-            .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
-                q.checked_add(size).filter(|n| *n <= self.max_bytes)
-            })
-            .is_ok();
+        let room = self.marks.is_empty()
+            && self
+                .queued
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                    q.checked_add(size).filter(|n| *n <= self.max_bytes)
+                })
+                .is_ok();
         let refused = if room {
             match self.tx.try_send(item) {
                 Ok(()) => return Ok(()),
@@ -461,7 +639,7 @@ impl Feed {
         // Full, by count or by bytes: loss for this publisher, never
         // back-pressure on the socket.
         self.counts.queue_full.fetch_add(1, Ordering::Relaxed);
-        self.loss.mark_incomplete(IncompleteReason::IngestQueueFull);
+        self.mark(IncompleteReason::IngestQueueFull);
         if video && !self.skip_video {
             self.skip_video = true;
             self.keyframe = true;
@@ -684,6 +862,12 @@ pub(crate) struct Whip {
     paths: Mutex<HashMap<String, SessionId>>,
     /// How sessions have ended.
     ends: EndCounts,
+    /// The listener's caps.
+    limits: Limits,
+    /// What the listener refused.
+    signalling: SignallingCounts,
+    /// Sessions not connected yet.
+    pending: Mutex<Pending>,
     /// Test builds only: whether a test has turned the feed's and the
     /// ingest's panic hooks on ([`injected`]). The server never does.
     #[cfg(test)]
@@ -697,6 +881,18 @@ impl Whip {
 
     fn paths(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionId>> {
         self.paths.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A session connected or ended: it no longer counts as pending.
+    fn settled(&self, id: &SessionId) {
+        let mut pending = self.pending();
+        if let Some(ip) = pending.sessions.remove(id) {
+            pending.release(ip);
+        }
     }
 }
 
@@ -792,6 +988,9 @@ fn prepare_with(
         resources: Mutex::new(HashMap::new()),
         paths: Mutex::new(HashMap::new()),
         ends: EndCounts::default(),
+        limits: Limits::default(),
+        signalling: SignallingCounts::default(),
+        pending: Mutex::new(Pending::default()),
         #[cfg(test)]
         panic_hooks: std::sync::atomic::AtomicBool::new(false),
     });
@@ -854,13 +1053,7 @@ async fn own_udp(
     let mut armed = None;
     loop {
         owner.flush(&socket, &tcp, &mut router).await;
-        let panics = router.stats().panics;
         let deadline = router.poll_timeout();
-        if router.stats().panics != panics {
-            // A session's deadline panicked and it was dropped: take its
-            // end before waiting.
-            continue;
-        }
         if deadline != armed {
             if let Some(d) = deadline {
                 timer.as_mut().reset(d.into());
@@ -972,6 +1165,7 @@ impl Owner {
                 }
             }),
             Event::Connected(profile) => {
+                self.whip.settled(&id);
                 tracing::info!(?profile, "WHIP session connected");
                 Some(())
             }
@@ -990,6 +1184,7 @@ impl Owner {
     /// releases the publication; that task may still add muxer reports
     /// after this.
     fn ended(&mut self, id: SessionId, reason: EndReason) {
+        self.whip.settled(&id);
         let name = end_name(reason, self.closing.remove(&id));
         let count = self.whip.ends.add(name);
         let Some(mut feed) = self.feeds.remove(&id) else {
@@ -1019,7 +1214,7 @@ impl Owner {
     /// the ingest task, which releases the publication (held for a
     /// reconnect, if it had published).
     fn feed_panicked(&mut self, router: &mut Router, id: SessionId) {
-        let Some(feed) = self.feeds.remove(&id) else {
+        let Some(mut feed) = self.feeds.remove(&id) else {
             return;
         };
         let _ = contained(|| feed.panicked());
@@ -1148,26 +1343,84 @@ fn receive(
 }
 
 async fn listen(listener: TcpListener, app: Arc<App>, whip: Arc<Whip>) -> std::io::Result<()> {
-    let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS));
+    let limits = whip.limits;
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
+    let addresses = Addresses::default();
+    let mut warnings = crate::accept::Warnings::default();
     loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            // Out of file descriptors, or a connection reset before it was
-            // taken: not the end of WHIP, nor of the server.
-            Err(error) => {
-                tracing::warn!(%error, "WHIP accept failed");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
+        let (socket, peer) = crate::accept::next(&listener, "WHIP", &mut warnings).await;
         let Ok(slot) = slots.clone().try_acquire_owned() else {
+            whip.signalling.over_total.fetch_add(1, Ordering::Relaxed);
             continue;
+        };
+        let ip = peer.ip().to_canonical();
+        let address = if whip.config.trusted_proxy.map(|p| p.to_canonical()) == Some(ip) {
+            None
+        } else {
+            let key = address_key(ip);
+            let Some(address) = AddressSlot::take(&addresses, key, limits.per_address) else {
+                whip.signalling.over_address.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            Some(address)
         };
         let (app, whip) = (app.clone(), whip.clone());
         tokio::spawn(async move {
-            let _slot = slot;
+            let _slots = (slot, address);
             connection(socket, peer, app, whip).await;
         });
+    }
+}
+
+/// Signalling connections open from each peer address ([`address_key`]).
+type Addresses = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// What the WHIP per-address caps (signalling and pending sessions) count
+/// an address under: an IPv4 address whole, or an IPv6 address's /64. A
+/// host is usually given a whole /64 (RFC 4291's 64-bit interface IDs), so
+/// keying by the full address would let one host step past the caps by
+/// changing its interface ID.
+fn address_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
+
+/// One of an address's signalling slots, given back on drop, so a
+/// connection's task frees it however it ends.
+struct AddressSlot {
+    addresses: Addresses,
+    ip: IpAddr,
+}
+
+impl AddressSlot {
+    fn take(addresses: &Addresses, ip: IpAddr, limit: usize) -> Option<Self> {
+        let mut open = addresses.lock().unwrap_or_else(|e| e.into_inner());
+        let n = open.entry(ip).or_insert(0);
+        if *n >= limit {
+            return None;
+        }
+        *n += 1;
+        Some(Self {
+            addresses: addresses.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let mut open = self.addresses.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = open.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                open.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -1205,8 +1458,15 @@ impl Reply {
 
 async fn connection(mut socket: TcpStream, peer: SocketAddr, app: Arc<App>, whip: Arc<Whip>) {
     let mut buf = Vec::with_capacity(2048);
-    let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut socket, &mut buf)).await {
-        Err(_) => Err(Refused::new(408, "read timeout")),
+    // The head and the offer must both be in by this.
+    let deadline = tokio::time::Instant::now() + whip.limits.client_time;
+    let head = match tokio::time::timeout_at(deadline, read_head(&mut socket, &mut buf)).await {
+        Err(_) => {
+            whip.signalling
+                .client_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            Err(Refused::new(408, "read timeout"))
+        }
         Ok(Err(None)) => return,
         Ok(Err(Some(why))) => Err(match why {
             HeadRefusal::Malformed => Refused::new(400, "malformed request"),
@@ -1221,7 +1481,15 @@ async fn connection(mut socket: TcpStream, peer: SocketAddr, app: Arc<App>, whip
             let origin =
                 whip_request::allowed_origin(head.origin.as_deref(), &whip.config.allow_origins)
                     .map(str::to_owned);
-            let work = exchange(&mut socket, &buf[used..], &head, peer, &app, &whip);
+            let work = exchange(
+                &mut socket,
+                &buf[used..],
+                &head,
+                peer,
+                &app,
+                &whip,
+                deadline,
+            );
             let mut reply = match tokio::time::timeout(HANDLER_TIMEOUT, work).await {
                 Ok(Some(reply)) => reply,
                 Ok(None) => return,
@@ -1240,7 +1508,7 @@ async fn connection(mut socket: TcpStream, peer: SocketAddr, app: Arc<App>, whip
         socket.write_all(&reply.bytes()).await?;
         socket.shutdown().await
     };
-    if matches!(tokio::time::timeout(HEAD_TIMEOUT, sent).await, Ok(Ok(()))) {
+    if matches!(tokio::time::timeout(SEND_TIMEOUT, sent).await, Ok(Ok(()))) {
         drain(&mut socket).await;
     }
 }
@@ -1284,7 +1552,8 @@ async fn read_head(
     }
 }
 
-/// The answer to one request; `None` if the client went away.
+/// The answer to one request; `None` if the client went away. The offer
+/// must be in by `deadline`.
 async fn exchange(
     socket: &mut TcpStream,
     already: &[u8],
@@ -1292,6 +1561,7 @@ async fn exchange(
     peer: SocketAddr,
     app: &Arc<App>,
     whip: &Arc<Whip>,
+    deadline: tokio::time::Instant,
 ) -> Option<Reply> {
     let action = match whip_request::route(&head.method, &head.path) {
         Ok(action) => action,
@@ -1310,6 +1580,22 @@ async fn exchange(
         }),
         Action::Delete(id) => Some(delete(whip, id, authorization).await),
         Action::Publish(path) => {
+            let ip = match whip_request::publisher_ip(
+                peer.ip(),
+                whip.config.trusted_proxy,
+                head.forwarded_for.as_deref(),
+            ) {
+                Ok(ip) => ip.to_canonical(),
+                Err(r) => return Some(Reply::refused(r)),
+            };
+            // The failed-attempt throttle first, as a refusal of its own: a
+            // throttled address is refused before its offer is read, parsed
+            // or answered.
+            let throttle = || app.auth_throttle.lock().unwrap_or_else(|e| e.into_inner());
+            if !throttle().allowed(ip, Instant::now()) {
+                app.log_refusal("webrtc", &Refusal::Throttled);
+                return Some(Reply::refused(resource::Refusal::Throttled.into()));
+            }
             let token = match whip_request::token(authorization) {
                 Ok(token) => token,
                 Err(r) => return Some(Reply::refused(r)),
@@ -1327,15 +1613,16 @@ async fn exchange(
             let mut body = vec![0u8; length];
             let have = already.len().min(length);
             body[..have].copy_from_slice(&already[..have]);
-            socket.read_exact(&mut body[have..]).await.ok()?;
-            let ip = match whip_request::publisher_ip(
-                peer.ip(),
-                whip.config.trusted_proxy,
-                head.forwarded_for.as_deref(),
-            ) {
-                Ok(ip) => ip,
-                Err(r) => return Some(Reply::refused(r)),
-            };
+            match tokio::time::timeout_at(deadline, socket.read_exact(&mut body[have..])).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => return None,
+                Err(_) => {
+                    whip.signalling
+                        .client_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(Reply::refused(Refused::new(408, "read timeout")));
+                }
+            }
             let bearer = whip_request::bearer(authorization).unwrap_or_default();
             Some(
                 publish(app, whip, path, token, bearer, &body, ip)
@@ -1483,6 +1770,9 @@ async fn publish(
         .await
         .map_err(refused)?;
     supersede(whip, &event).await;
+    // A3.7: after supersede, which may free a place, and before the claim.
+    let pending = PendingSlot::take(whip, ip)
+        .ok_or_else(|| Refused::new(503, "too many sessions connecting"))?;
     let publication =
         Publication::claim_admitted(app, &req, SourceKind::Es, admitted).map_err(refused)?;
     // From here a later POST for the path can find this session.
@@ -1505,11 +1795,12 @@ async fn publish(
     // request leaves no session without one.
     let (tx, rx) = mpsc::channel(QUEUE);
     let (released_tx, released) = watch::channel(false);
-    let feed = Feed::new(tx, publication.loss_notice());
+    let feed = Feed::new(tx);
     #[cfg(test)]
-    let feed = Feed {
-        panic_hooks: setup.panic_hooks,
-        ..feed
+    let feed = {
+        let mut feed = feed;
+        feed.panic_hooks = setup.panic_hooks;
+        feed
     };
     let (queued, counts) = (feed.queued(), feed.counts());
     whip.resources().insert(
@@ -1520,6 +1811,10 @@ async fn publish(
             released,
         },
     );
+    // The session counts as pending from here until it connects or ends.
+    // Before the ingest task starts, so that task's end (which can come at
+    // once, if the setup is refused) always gives the place back.
+    pending.attach(id);
     tokio::spawn(ingest(
         whip.clone(),
         id,
@@ -1529,18 +1824,18 @@ async fn publish(
         setup,
     ));
     let (reply, registered) = oneshot::channel();
-    whip.commands
+    let sent = whip
+        .commands
         .send(Command::Register {
             id,
             session: Box::new(session),
             feed,
             reply,
         })
-        .await
-        .map_err(|_| unavailable())?;
-    match registered.await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) | Err(_) => return Err(unavailable()),
+        .await;
+    if sent.is_err() || !matches!(registered.await, Ok(Ok(()))) {
+        whip.settled(&id);
+        return Err(unavailable());
     }
     Ok(Reply {
         status: 201,
@@ -1593,7 +1888,7 @@ fn feed_item(source: &mut Source, item: Item, now: SystemTime) -> Result<Update,
             let t = i64::try_from(pts).map_err(|_| IngestError::InvalidTimestamp)?;
             es.opus_at(t, &packet, now)
         }
-        Item::Reanchor => Ok(Update::default()),
+        Item::Reanchor | Item::Marks(_) => Ok(Update::default()),
     }
 }
 
@@ -1673,11 +1968,32 @@ async fn ingest(
         tracing::warn!("WHIP ingest panicked; ending its session");
     }
     rx.close();
+    // Marks still queued behind a step that ended the ingest early, then
+    // those the feed could not queue before it went: the recording is the
+    // last one either way.
+    let mut marks = Vec::new();
+    while let Ok(item) = rx.try_recv() {
+        if let Item::Marks(m) = item {
+            marks.extend(m);
+        }
+    }
+    marks.extend(std::mem::take(
+        &mut *counts.trailing.lock().unwrap_or_else(|e| e.into_inner()),
+    ));
+    let loss = publication.loss_notice();
+    let _ = contained(|| {
+        for reason in marks {
+            loss.mark_incomplete(reason);
+        }
+    });
     let event = publication.stream.path.event_id().to_owned();
     if contained(|| publication.end()).is_none() {
         tracing::warn!("WHIP publication panicked as it ended");
     }
     whip.resources().remove(&id);
+    // A session that never reached the router (a cancelled `POST`) gives its
+    // pending place back here; one that did has already.
+    whip.settled(&id);
     {
         let mut paths = whip.paths();
         if paths.get(&event) == Some(&id) {
@@ -1701,6 +2017,13 @@ fn take(
     last_audio: &mut Option<(u64, AudioTrace)>,
     item: Item,
 ) -> bool {
+    if let Item::Marks(marks) = item {
+        let loss = publication.loss_notice();
+        for reason in marks {
+            loss.mark_incomplete(reason);
+        }
+        return true;
+    }
     queued.fetch_sub(item.size(), Ordering::AcqRel);
     if let Err(error) = publication.received(item.received()) {
         tracing::warn!(%error, "dropping WHIP publisher");

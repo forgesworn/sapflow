@@ -278,6 +278,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "whip_router"
+path = "fuzz_targets/whip_router.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "whip_request"
 path = "fuzz_targets/whip_request.rs"
 test = false
