@@ -562,7 +562,7 @@ async fn short_epoch_run() -> (
             .map(|m| m.current_initialization_id());
         if epoch == Some(2) && !waited {
             // As in real time, where the next part gives the first file's
-            // writer time to finish: two writers a path. The first file is
+            // writer time to finish (`recorder::PATH_WRITERS`). The first file is
             // finished at the second change, which ends its late audio.
             waited = true;
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -1318,8 +1318,9 @@ fn epochs_of(pattern: &[bool]) -> Vec<Frame> {
 
 /// One publication of `frames` through the elementary-stream path with the
 /// given roll limit: after each codec change while files are still being
-/// rolled, the time the file before the held one needs to finish (two
-/// writers a path), as an encoder's seconds between changes give it, and a
+/// rolled, the time the file before the held one needs to finish (see
+/// `recorder::PATH_WRITERS`), as an encoder's seconds between changes give
+/// it, and a
 /// moment every hundred frames for the writer to keep up.
 struct EpochRun {
     app: Arc<crate::App>,

@@ -142,6 +142,17 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow
 
+- A recording refused its first part, for want of a writer or byte budget,
+  stopped before it had a file, so its codec epoch was served and then lost
+  with no file, no `recordSegmentComplete` and no mark on either side. The
+  next file is now marked `epoch-unrecorded`, as the v4v contract says. It
+  happened when an encoder changed its codec configuration faster than a
+  file was synced to disk: the file just ended is held open for its late
+  audio, and with two writers a path the one before it, still syncing, left
+  none for the new epoch. A path now has three writers, so a slow disk no
+  longer costs a recording there. A show's last epoch refused this way
+  still has no later file to carry the mark.
+
 - `SAPFLOW_WINDOW_SECONDS` bounds each stream's playlist by time as well as
   by `SAPFLOW_SEGMENT_COUNT` (`MuxerConfig::window`, above). It defaults to
   2 s per segment, 48 s at the default count, so an encoder sending a

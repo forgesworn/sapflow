@@ -31,7 +31,11 @@ const QUEUE: usize = 256;
 /// connection generation of one path. File buffers are separate storage.
 const RETAINED_PART_BYTES: usize = 64 * 1024 * 1024;
 const GLOBAL_RETAINED_PART_BYTES: usize = 512 * 1024 * 1024;
-const PATH_WRITERS: usize = 2;
+/// A path's writers: the file being written, the one just ended and held
+/// open for its late audio, and the one before it still finishing on disk.
+/// At two, codec epochs that came faster than a file was synced left the
+/// new epoch no writer, and its recording was lost.
+const PATH_WRITERS: usize = 3;
 const MAX_WRITERS: usize = 1024;
 
 /// Shared by the App, factories and draining writers. These limits count
