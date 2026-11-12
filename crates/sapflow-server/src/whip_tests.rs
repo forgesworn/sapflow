@@ -705,6 +705,20 @@ fn access_unit(idr: bool) -> Media {
     }
 }
 
+/// What the ingest task does with the marks the feed queued: applies them
+/// in order, then any the feed held when it went. Other items are dropped.
+fn apply_marks(rx: &mut mpsc::Receiver<Item>, publication: &Publication, counts: &LossCounts) {
+    let loss = publication.loss_notice();
+    while let Ok(item) = rx.try_recv() {
+        if let Item::Marks(marks) = item {
+            marks.into_iter().for_each(|r| loss.mark_incomplete(r));
+        }
+    }
+    std::mem::take(&mut *counts.trailing.lock().expect("trailing"))
+        .into_iter()
+        .for_each(|r| loss.mark_incomplete(r));
+}
+
 fn status(publication: &Publication) -> Arc<crate::recorder::RecordingStatus> {
     publication
         .stream
@@ -724,15 +738,19 @@ async fn a_full_queue_skips_video_to_the_next_idr() {
     let publication = fixture.begin();
     let status = status(&publication);
     let (tx, mut rx) = mpsc::channel(1);
-    let mut feed = Feed::new(tx, publication.loss_notice());
+    let mut feed = Feed::new(tx);
     assert_eq!(feed.push(access_unit(true)), Ok(()));
-    assert_eq!(status.reason(), None);
     assert_eq!(feed.push(access_unit(false)), Ok(()), "full: dropped");
-    assert_eq!(status.reason(), Some(IncompleteReason::IngestQueueFull));
     assert!(feed.take_keyframe_request(), "a keyframe is asked for");
     assert!(!feed.take_keyframe_request(), "once");
     assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
+    // The feed never marks the recording itself: the full queue's mark
+    // waited for room, and goes ahead of whatever comes next.
+    assert_eq!(status.reason(), None);
     assert_eq!(feed.push(access_unit(false)), Ok(()));
+    assert!(
+        matches!(rx.try_recv(), Ok(Item::Marks(m)) if m == [IncompleteReason::IngestQueueFull])
+    );
     assert!(rx.try_recv().is_err(), "skipped until an IDR");
     assert!(!feed.take_keyframe_request(), "already waiting");
     assert_eq!(feed.push(access_unit(true)), Ok(()));
@@ -751,23 +769,130 @@ async fn the_queue_is_bounded_in_bytes() {
     let publication = fixture.begin();
     let status = status(&publication);
     let (tx, mut rx) = mpsc::channel(64);
-    let mut feed = Feed::bounded(tx, publication.loss_notice(), 12);
+    let mut feed = Feed::bounded(tx, 12);
     let queued = feed.queued();
     assert_eq!(feed.push(access_unit(true)), Ok(()));
     assert_eq!(feed.push(access_unit(false)), Ok(()));
     assert_eq!(queued.load(Ordering::Acquire), 10);
-    assert_eq!(status.reason(), None);
-    // A third would be 15 bytes: dropped as a full queue.
+    // A third would be 15 bytes: dropped as a full queue, and marked in
+    // the queue behind the two (a mark holds no media bytes).
     assert_eq!(feed.push(access_unit(false)), Ok(()));
-    assert_eq!(status.reason(), Some(IncompleteReason::IngestQueueFull));
     assert!(feed.take_keyframe_request());
     assert_eq!(queued.load(Ordering::Acquire), 10);
-    // The ingest task takes both; the next IDR fits.
+    // The ingest task takes all three; the next IDR fits.
+    let mut marks = Vec::new();
     while let Ok(item) = rx.try_recv() {
         queued.fetch_sub(item.size(), Ordering::AcqRel);
+        if let Item::Marks(m) = item {
+            marks.extend(m);
+        }
     }
+    assert_eq!(marks, [IncompleteReason::IngestQueueFull]);
+    assert_eq!(status.reason(), None, "until the ingest applies it");
     assert_eq!(feed.push(access_unit(true)), Ok(()));
     assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
+}
+
+/// Two SPS at different sizes and their PPS, from `sapflow-hls`'s
+/// `resolution-change.ts` fixture.
+const SPS_WIDE: &[u8] = &[
+    0x67, 0x42, 0xc0, 0x0b, 0xda, 0x0a, 0x37, 0xe4, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00,
+    0x00, 0x03, 0x00, 0xf2, 0x3c, 0x50, 0xaa, 0x80,
+];
+const SPS_NARROW: &[u8] = &[
+    0x67, 0x42, 0xc0, 0x0a, 0xda, 0x08, 0x2f, 0xe5, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00,
+    0x00, 0x03, 0x00, 0xf2, 0x3c, 0x48, 0x9a, 0x80,
+];
+const PPS_FIXTURE: &[u8] = &[0x68, 0xce, 0x0f, 0xc8];
+
+/// Frame `n` of 25 fps video, a keyframe each second carrying `sps`.
+fn frame(n: u64, sps: &[u8]) -> Media {
+    let idr = n.is_multiple_of(25);
+    let nal: &[u8] = if idr {
+        &[0x65, 0x88, 0x84]
+    } else {
+        &[0x41, 0x9a, 0x02]
+    };
+    let mut data = (nal.len() as u32).to_be_bytes().to_vec();
+    data.extend_from_slice(nal);
+    Media::Video {
+        pts: n * 3600,
+        au: AccessUnit {
+            data,
+            idr,
+            sps: idr.then(|| sps.to_vec()),
+            pps: idr.then(|| PPS_FIXTURE.to_vec()),
+        },
+    }
+}
+
+/// A mark the owner raises while the ingest queue still holds the item
+/// that rolls the recording (a codec epoch change, #77) lands on the new
+/// recording, the one the loss is in, and not on the old one.
+#[tokio::test]
+async fn a_mark_raised_behind_a_queued_roll_lands_on_the_new_recording() {
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let mut publication = fixture.begin_kind(SourceKind::Es);
+    publication
+        .push(|source, now| configure(source, VIDEO_ONLY, now))
+        .expect("setup");
+    let (tx, mut rx) = mpsc::channel(QUEUE);
+    let mut feed = Feed::new(tx);
+    let (queued, counts) = (feed.queued(), feed.counts());
+    let mut last_audio = None;
+    // Two seconds at one size, taken by the ingest.
+    for n in 0..50 {
+        assert_eq!(feed.push(frame(n, SPS_WIDE)), Ok(()));
+    }
+    while let Ok(item) = rx.try_recv() {
+        assert!(take(
+            &mut publication,
+            (&queued, &counts),
+            VIDEO_ONLY,
+            &mut last_audio,
+            item
+        ));
+    }
+    let first = status(&publication);
+    // Then a keyframe at another size, still in the queue when loss after
+    // it is reported, and more frames.
+    for n in 50..60 {
+        assert_eq!(feed.push(frame(n, SPS_NARROW)), Ok(()));
+    }
+    assert_eq!(
+        feed.push(Media::Loss {
+            path: LossPath::Lost,
+            packets: 2
+        }),
+        Ok(())
+    );
+    for n in 60..100 {
+        assert_eq!(feed.push(frame(n, SPS_NARROW)), Ok(()));
+    }
+    while let Ok(item) = rx.try_recv() {
+        assert!(take(
+            &mut publication,
+            (&queued, &counts),
+            VIDEO_ONLY,
+            &mut last_audio,
+            item
+        ));
+    }
+    let second = status(&publication);
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "the keyframe rolled the recording"
+    );
+    assert_eq!(
+        second.reason(),
+        Some(IncompleteReason::MediaLoss),
+        "the new recording"
+    );
+    assert_eq!(
+        first.reason(),
+        None,
+        "the loss was not in the old recording"
+    );
 }
 
 /// An in-process session run with the scripted publisher, collecting the
@@ -888,7 +1013,7 @@ async fn recorded_in_full(events: Vec<Event>, setup: Setup, feed: bool) -> Recor
         .expect("setup");
     let status = status(&publication);
     let (tx, mut rx) = mpsc::channel(QUEUE);
-    let mut server = Feed::new(tx, publication.loss_notice());
+    let mut server = Feed::new(tx);
     for e in events {
         let mut items = Vec::new();
         match e {
@@ -921,6 +1046,11 @@ async fn recorded_in_full(events: Vec<Event>, setup: Setup, feed: bool) -> Recor
             items.push(item);
         }
         for item in items {
+            if let Item::Marks(marks) = item {
+                let loss = publication.loss_notice();
+                marks.into_iter().for_each(|r| loss.mark_incomplete(r));
+                continue;
+            }
             publication
                 .push(|source, now| match item {
                     Item::Reanchor => reanchor(source, setup, now),
@@ -1193,11 +1323,35 @@ async fn an_abnormal_end_marks_the_recording() {
         let fixture = crate::publish::loss_tests::Fixture::new();
         let publication = fixture.begin();
         let status = status(&publication);
-        let (tx, _rx) = mpsc::channel(4);
-        let mut feed = Feed::new(tx, publication.loss_notice());
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut feed = Feed::new(tx);
+        let counts = feed.counts();
         feed.ended(reason);
+        apply_marks(&mut rx, &publication, &counts);
         assert_eq!(status.reason(), mark, "{reason:?}");
     }
+}
+
+/// A mark that finds the queue full at the end, as an abnormal end can,
+/// is kept for the ingest task, which applies it after everything queued
+/// before it.
+#[tokio::test]
+async fn a_mark_with_no_room_at_the_end_still_reaches_the_recording() {
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let publication = fixture.begin();
+    let status = status(&publication);
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut feed = Feed::new(tx);
+    let counts = feed.counts();
+    assert_eq!(feed.push(access_unit(true)), Ok(()));
+    feed.ended(sapflow_whip::EndReason::MediaTimeout);
+    drop(feed);
+    assert_eq!(
+        *counts.trailing.lock().expect("trailing"),
+        [IncompleteReason::TransportTimeout]
+    );
+    apply_marks(&mut rx, &publication, &counts);
+    assert_eq!(status.reason(), Some(IncompleteReason::TransportTimeout));
 }
 
 /// Each `Lost` is counted and marks the recording incomplete; a dropped
@@ -1206,8 +1360,9 @@ async fn an_abnormal_end_marks_the_recording() {
 async fn receiver_loss_is_counted_and_marks_the_recording() {
     let fixture = crate::publish::loss_tests::Fixture::new();
     let publication = fixture.begin();
-    let (tx, _rx) = mpsc::channel(4);
-    let mut feed = Feed::new(tx, publication.loss_notice());
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut feed = Feed::new(tx);
+    let counts = feed.counts();
     let status = publication
         .stream
         .session()
@@ -1225,6 +1380,7 @@ async fn receiver_loss_is_counted_and_marks_the_recording() {
     );
     assert_eq!(feed.push(loss(LossPath::IncompleteFrame)), Ok(()));
     assert_eq!(feed.lost(), 3);
+    apply_marks(&mut rx, &publication, &counts);
     assert_eq!(status.reason(), Some(IncompleteReason::MediaLoss));
 }
 
@@ -1255,10 +1411,8 @@ async fn only_authenticated_media_counts_against_the_cap() {
         }
     }
     assert!(p.has_keys());
-    let fixture = crate::publish::loss_tests::Fixture::new();
-    let publication = fixture.begin();
     let (tx, _rx) = mpsc::channel(4);
-    let mut feeds = HashMap::from([(id, Feed::new(tx, publication.loss_notice()))]);
+    let mut feeds = HashMap::from([(id, Feed::new(tx))]);
     let junk = [0x80, 0x6f, 0, 9, 0, 0, 0, 1, 0, 0, 0x10, 0x01, 1, 2, 3, 4];
     receive(&mut router, &mut feeds, p.tuple, &junk);
     assert_eq!(feeds[&id].received, 0, "spoofed bytes count");

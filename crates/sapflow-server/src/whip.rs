@@ -52,7 +52,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::App;
 use crate::config::WhipConfig;
 use crate::http_lite::{self, ParsedRequest, Refusal as HeadRefusal};
-use crate::publish::{Publication, PublicationLoss, Refusal};
+use crate::publish::{Publication, Refusal};
 use crate::recorder::IncompleteReason;
 use crate::stream::{Source, SourceKind};
 use crate::whip_request::{self, Action, Refused};
@@ -199,6 +199,11 @@ pub(crate) enum Item {
     /// The receiver's timeline re-anchored on arrival time (or moved to a
     /// sender report) before the next frame, with no loss of its own.
     Reanchor,
+    /// Marks the UDP owner raised at this point in the stream, for the
+    /// recording current when the ingest reaches them: one after a queued
+    /// item that rolls the recording (a codec epoch change) is the new
+    /// file's. In the order raised, each once.
+    Marks(Vec<IncompleteReason>),
 }
 
 /// The audio stream's timeline counters in `sapflow-rtp` as an event was
@@ -234,21 +239,21 @@ impl Item {
                 .saturating_add(au.sps.as_ref().map_or(0, Vec::len))
                 .saturating_add(au.pps.as_ref().map_or(0, Vec::len)),
             Self::Audio { packet, .. } => packet.len(),
-            Self::Reanchor => 0,
+            Self::Reanchor | Self::Marks(_) => 0,
         }
     }
 
     fn audio_trace(&self) -> Option<(u64, AudioTrace)> {
         match self {
             Self::Audio { pts, trace, .. } => Some((*pts, *trace)),
-            Self::Video { .. } | Self::Reanchor => None,
+            Self::Video { .. } | Self::Reanchor | Self::Marks(_) => None,
         }
     }
 
     fn received(&self) -> usize {
         match self {
             Self::Video { received, .. } | Self::Audio { received, .. } => *received,
-            Self::Reanchor => 0,
+            Self::Reanchor | Self::Marks(_) => 0,
         }
     }
 }
@@ -289,6 +294,10 @@ pub(crate) struct LossCounts {
     pub panics: AtomicU64,
     /// The last break the audio-only muxer reported, explained.
     pub muxer_break: Mutex<Option<String>>,
+    /// Marks the feed still held, unqueued, when it went (a full queue at
+    /// an abnormal end, say): the ingest task applies them once it has
+    /// taken everything queued before them.
+    pub trailing: Mutex<Vec<IncompleteReason>>,
 }
 
 impl LossCounts {
@@ -348,7 +357,9 @@ pub(crate) enum LossPath {
 /// What the UDP owner keeps per session for its ingest task.
 pub(crate) struct Feed {
     tx: mpsc::Sender<Item>,
-    loss: PublicationLoss,
+    /// Marks raised and not yet queued: they go ahead of the next item
+    /// that fits, so each reaches the ingest where it was raised.
+    marks: Vec<IncompleteReason>,
     /// Media bytes queued and not yet taken by the ingest task, which
     /// subtracts what it takes.
     queued: Arc<AtomicUsize>,
@@ -373,15 +384,34 @@ pub(crate) struct Feed {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Gone;
 
+/// Marks the feed could not queue go to the ingest task to apply after the
+/// rest of the queue: they were raised after everything in it.
+impl Drop for Feed {
+    fn drop(&mut self) {
+        if !self.marks.is_empty() {
+            let mut trailing = self
+                .counts
+                .trailing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for reason in self.marks.drain(..) {
+                if !trailing.contains(&reason) {
+                    trailing.push(reason);
+                }
+            }
+        }
+    }
+}
+
 impl Feed {
-    pub(crate) fn new(tx: mpsc::Sender<Item>, loss: PublicationLoss) -> Self {
-        Self::bounded(tx, loss, QUEUE_BYTES)
+    pub(crate) fn new(tx: mpsc::Sender<Item>) -> Self {
+        Self::bounded(tx, QUEUE_BYTES)
     }
 
-    pub(crate) fn bounded(tx: mpsc::Sender<Item>, loss: PublicationLoss, max_bytes: usize) -> Self {
+    pub(crate) fn bounded(tx: mpsc::Sender<Item>, max_bytes: usize) -> Self {
         Self {
             tx,
-            loss,
+            marks: Vec::new(),
             queued: Arc::new(AtomicUsize::new(0)),
             max_bytes,
             received: 0,
@@ -435,15 +465,45 @@ impl Feed {
             EndReason::HandshakeTimeout | EndReason::Closed | EndReason::PeerClosed => return,
         };
         self.counts.abnormal_ends.fetch_add(1, Ordering::Relaxed);
-        self.loss.mark_incomplete(cause);
+        self.mark(cause);
     }
 
     /// The UDP owner's code for this session panicked: the recording is
     /// marked, as for a session that panicked.
-    pub(crate) fn panicked(&self) {
+    pub(crate) fn panicked(&mut self) {
         self.counts.panics.fetch_add(1, Ordering::Relaxed);
         self.counts.abnormal_ends.fetch_add(1, Ordering::Relaxed);
-        self.loss.mark_incomplete(IncompleteReason::IngestError);
+        self.mark(IncompleteReason::IngestError);
+    }
+
+    /// Marks the recording at this point in the stream: the mark is queued
+    /// behind everything queued so far, or, if the queue has no room, ahead
+    /// of the next item that has, so the ingest applies it to the recording
+    /// current there ([`Item::Marks`]).
+    fn mark(&mut self, reason: IncompleteReason) {
+        if !self.marks.contains(&reason) {
+            self.marks.push(reason);
+        }
+        let _ = self.queue_marks();
+    }
+
+    /// Queues the marks held, if any and if there is room for an item.
+    fn queue_marks(&mut self) -> Result<(), Gone> {
+        if self.marks.is_empty() {
+            return Ok(());
+        }
+        match self
+            .tx
+            .try_send(Item::Marks(std::mem::take(&mut self.marks)))
+        {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(Item::Marks(marks))) => {
+                self.marks = marks;
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Gone),
+        }
     }
 
     /// Whether the ingest task panicked (it sets the count before closing
@@ -481,13 +541,15 @@ impl Feed {
             LossPath::Refused => (&c.refused, 1),
         };
         counter.fetch_add(n, Ordering::Relaxed);
-        self.loss.mark_incomplete(IncompleteReason::MediaLoss);
+        self.mark(IncompleteReason::MediaLoss);
     }
 
     /// Queues one media item for the ingest task.
     pub(crate) fn push(&mut self, media: Media) -> Result<(), Gone> {
         #[cfg(test)]
         injected::feed(self.panic_hooks, &media);
+        // Marks held for want of room go first, in order.
+        self.queue_marks()?;
         let item = match media {
             Media::Video { pts, au } => {
                 if self.skip_video && !au.idr {
@@ -511,7 +573,7 @@ impl Feed {
                 // whole, but the recording is not.
                 if lost {
                     self.counts.loss_fills.fetch_add(1, Ordering::Relaxed);
-                    self.loss.mark_incomplete(IncompleteReason::MediaLoss);
+                    self.mark(IncompleteReason::MediaLoss);
                 }
                 Item::Audio {
                     pts,
@@ -561,7 +623,7 @@ impl Feed {
         // Full, by count or by bytes: loss for this publisher, never
         // back-pressure on the socket.
         self.counts.queue_full.fetch_add(1, Ordering::Relaxed);
-        self.loss.mark_incomplete(IncompleteReason::IngestQueueFull);
+        self.mark(IncompleteReason::IngestQueueFull);
         if video && !self.skip_video {
             self.skip_video = true;
             self.keyframe = true;
@@ -1136,7 +1198,7 @@ impl Owner {
     /// the ingest task, which releases the publication (held for a
     /// reconnect, if it had published).
     fn feed_panicked(&mut self, router: &mut Router, id: SessionId) {
-        let Some(feed) = self.feeds.remove(&id) else {
+        let Some(mut feed) = self.feeds.remove(&id) else {
             return;
         };
         let _ = contained(|| feed.panicked());
@@ -1700,11 +1762,12 @@ async fn publish(
     // request leaves no session without one.
     let (tx, rx) = mpsc::channel(QUEUE);
     let (released_tx, released) = watch::channel(false);
-    let feed = Feed::new(tx, publication.loss_notice());
+    let feed = Feed::new(tx);
     #[cfg(test)]
-    let feed = Feed {
-        panic_hooks: setup.panic_hooks,
-        ..feed
+    let feed = {
+        let mut feed = feed;
+        feed.panic_hooks = setup.panic_hooks;
+        feed
     };
     let (queued, counts) = (feed.queued(), feed.counts());
     whip.resources().insert(
@@ -1790,7 +1853,7 @@ fn feed_item(source: &mut Source, item: Item, now: SystemTime) -> Result<Update,
             let t = i64::try_from(pts).map_err(|_| IngestError::InvalidTimestamp)?;
             es.opus_at(t, &packet, now)
         }
-        Item::Reanchor => Ok(Update::default()),
+        Item::Reanchor | Item::Marks(_) => Ok(Update::default()),
     }
 }
 
@@ -1870,6 +1933,24 @@ async fn ingest(
         tracing::warn!("WHIP ingest panicked; ending its session");
     }
     rx.close();
+    // Marks still queued behind a step that ended the ingest early, then
+    // those the feed could not queue before it went: the recording is the
+    // last one either way.
+    let mut marks = Vec::new();
+    while let Ok(item) = rx.try_recv() {
+        if let Item::Marks(m) = item {
+            marks.extend(m);
+        }
+    }
+    marks.extend(std::mem::take(
+        &mut *counts.trailing.lock().unwrap_or_else(|e| e.into_inner()),
+    ));
+    let loss = publication.loss_notice();
+    let _ = contained(|| {
+        for reason in marks {
+            loss.mark_incomplete(reason);
+        }
+    });
     let event = publication.stream.path.event_id().to_owned();
     if contained(|| publication.end()).is_none() {
         tracing::warn!("WHIP publication panicked as it ended");
@@ -1898,6 +1979,13 @@ fn take(
     last_audio: &mut Option<(u64, AudioTrace)>,
     item: Item,
 ) -> bool {
+    if let Item::Marks(marks) = item {
+        let loss = publication.loss_notice();
+        for reason in marks {
+            loss.mark_incomplete(reason);
+        }
+        return true;
+    }
     queued.fetch_sub(item.size(), Ordering::AcqRel);
     if let Err(error) = publication.received(item.received()) {
         tracing::warn!(%error, "dropping WHIP publisher");
