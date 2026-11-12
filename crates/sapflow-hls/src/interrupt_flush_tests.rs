@@ -468,6 +468,43 @@ fn an_interrupt_before_a_cuts_keyframe_resumes_where_the_run_ended() {
     }
 }
 
+/// A stall clamped into the open part, then a break before the next frame:
+/// the segment ends with its media, not after the stall's hole, and the
+/// next run resumes there, so `EXTINF` is the sum of its parts before the
+/// discontinuity and output time has no hole.
+#[test]
+fn a_break_after_a_clamped_stall_ends_the_segment_with_its_media() {
+    use crate::muxer::tests::{aac, feed, video};
+    let mut m = Muxer::new(config(), video(), Some(aac()));
+    let mut check = playlist::RuleCheck::default();
+    feed(&mut m, 0..95, 30);
+    let mut push = |m: &mut Muxer, dts: i64, sync: bool| {
+        m.push_video(dts, dts, sync, Bytes::from(vec![0u8; 100]), NOW)
+            .expect("video");
+        if m.has_content() {
+            check
+                .check(&playlist::media(m, "p"))
+                .expect("every playlist keeps the HLS rules");
+        }
+    };
+    // Frame 94 lasts 0.7 s (clamped), the frame after it 1.5 s (a break).
+    push(&mut m, 282_000 + 63_000, false);
+    push(&mut m, 282_000 + 63_000 + 135_000, true);
+    for i in 1..40 {
+        push(&mut m, 480_000 + i * 3000, i % 30 == 0);
+    }
+    m.interrupt(NOW);
+    check
+        .check(&playlist::media(&m, "p"))
+        .expect("every playlist keeps the HLS rules");
+    let spans = video_spans(&m, 0);
+    let resumed = spans
+        .windows(2)
+        .find(|w| w[1].0 != w[0].1)
+        .map(|w| (w[0].1, w[1].0));
+    assert_eq!(resumed, None, "no hole in output time: {spans:?}");
+}
+
 /// A timestamp at the edge of `i64` after an interrupt rebases without
 /// overflowing.
 #[test]

@@ -81,9 +81,11 @@ def check(text, live_window=True, byte_capped=False):
             target = head.get("#EXT-X-TARGETDURATION:")
             if target is not None and int(d + Decimal("0.5")) > target:
                 bad.append(f"segment {msn} lasts {d}, over TARGETDURATION {target}")
-            # Each printed duration is rounded by up to half a unit.
+            # Each part's duration is a whole number of 90 kHz ticks (an
+            # audio-only part's rounded up), up to 1.2 units from its span,
+            # and each printed is rounded by up to half a unit.
             total = sum(p for _, p, _ in run)
-            if run and abs(total - d) > len(run) * Decimal("0.00001"):
+            if run and abs(total - d) > len(run) * Decimal("0.00002"):
                 # Within a continuous run, only the decode-time hole after a
                 # part cut to PART-TARGET (a clamped stall).
                 if d > total and any(p == head.get("PART-TARGET") for _, p, _ in run):

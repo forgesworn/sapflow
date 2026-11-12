@@ -443,6 +443,9 @@ struct OpenSegment {
     /// The pending AAC frame is reserved separately before admission.
     audio_bytes: usize,
     discontinuity: bool,
+    /// Where the sealed parts' media ends: the last one's start plus its
+    /// duration, before any hole a clamped frame left after it.
+    media_end: i64,
 }
 
 #[derive(Debug)]
@@ -913,6 +916,7 @@ impl Muxer {
                 s.bytes,
                 s.audio_bytes,
                 s.discontinuity,
+                s.media_end,
             )
         });
         let part = part.as_ref().map(|p| {
@@ -1245,6 +1249,7 @@ impl Muxer {
             bytes: 0,
             audio_bytes: 0,
             discontinuity: std::mem::take(&mut self.discontinuity_next),
+            media_end: dts,
         });
         let mut part = OpenPart::new(self.next_part_id, dts);
         if !self.carried_audio.is_empty()
@@ -1553,7 +1558,7 @@ impl Muxer {
             keyframe = next.sync,
             "media broke off (stall, late keyframe or jump in time); new segment from the next keyframe, marked as a discontinuity"
         );
-        let closed = self.close_run(end, now)?;
+        let (closed, end) = self.close_run(end, now)?;
         if next.sync {
             let mut next = next;
             let to = self.resume_at(end, next.cts);
@@ -1616,10 +1621,10 @@ impl Muxer {
             let Some(end) = self.audio_end.take() else {
                 return Update::default();
             };
-            let (closed, media_loss) = match self.close_run(end, now) {
-                Ok(closed) => (closed, false),
+            let (closed, end, media_loss) = match self.close_run(end, now) {
+                Ok((closed, end)) => (closed, end, false),
                 Err(_) if self.fragment_refused => return self.interrupt_refused(now),
-                Err(_) => (false, true),
+                Err(_) => (false, end, true),
             };
             self.rebase_to = Some(end);
             return Update {
@@ -1667,10 +1672,10 @@ impl Muxer {
             Err(_) => return self.interrupt_refused(now),
         };
         self.close_late_audio(false);
-        let (closed, media_loss) = match self.close_run(end, now) {
-            Ok(closed) => (closed, lost),
+        let (closed, end, media_loss) = match self.close_run(end, now) {
+            Ok((closed, end)) => (closed, end, lost),
             Err(_) if self.fragment_refused => return self.interrupt_refused(now),
-            Err(_) => (false, true),
+            Err(_) => (false, end, true),
         };
         self.rebase_to = Some(end);
         // A clock that carries on past a gap too long to hold: its audio
@@ -1749,14 +1754,17 @@ impl Muxer {
                 self.rotate_part(cur.dts, cur.dts)?;
             }
         }
-        // The part after the cut holds only the audio past the old end,
-        // and starts where the sealed parts end.
+        // The part after the cut holds only the audio past the old end.
         let leftover = self.part.take();
-        let end = leftover.as_ref().map_or(end, |part| part.start_dts);
         let closed = self
             .next_segment
             .as_ref()
             .is_some_and(|s| !s.parts.is_empty());
+        // The segment ends with its media.
+        let end = match &self.next_segment {
+            Some(segment) if closed => segment.media_end,
+            _ => end,
+        };
         if closed {
             self.rotate_segment(end, now, false)?;
         } else {
@@ -2030,18 +2038,11 @@ impl Muxer {
         self.learning.clear();
         self.audio_run = None;
         self.audio_end = None;
-        let end = self.next_segment.as_ref().and_then(|segment| {
-            (!segment.parts.is_empty())
-                .then(|| {
-                    segment
-                        .parts
-                        .iter()
-                        .try_fold(segment.start_dts, |at, part| {
-                            at.checked_add(duration_to_ticks(part.span, VIDEO_TIMESCALE))
-                        })
-                })
-                .flatten()
-        });
+        let end = self
+            .next_segment
+            .as_ref()
+            .filter(|segment| !segment.parts.is_empty())
+            .map(|segment| segment.media_end);
         let closed = if let Some(end) = end {
             self.rebase_to = Some(end);
             self.rotate_segment(end, now, false).is_ok()
@@ -2062,8 +2063,10 @@ impl Muxer {
 
     /// Closes the open part and segment at `end`, drops the held frame,
     /// and marks the next segment as a discontinuity. Returns whether a
-    /// segment was closed.
-    fn close_run(&mut self, end: i64, now: SystemTime) -> Result<bool, MuxError> {
+    /// segment was closed, and where it ends: with its media, so before
+    /// `end` if the last part was a clamped frame's or the open part,
+    /// with no video, is dropped. The next run resumes there.
+    fn close_run(&mut self, end: i64, now: SystemTime) -> Result<(bool, i64), MuxError> {
         if self
             .part
             .as_ref()
@@ -2071,13 +2074,16 @@ impl Muxer {
         {
             self.rotate_part(end, end)?;
         }
-        // An open part with no video (audio alone) is dropped. The sealed
-        // parts end where it starts, and so does the segment.
-        let end = self.part.take().map_or(end, |part| part.start_dts);
+        // An open part with no video (audio alone) is dropped.
+        self.part = None;
         let closed = self
             .next_segment
             .as_ref()
             .is_some_and(|s| !s.parts.is_empty());
+        let end = match &self.next_segment {
+            Some(segment) if closed => segment.media_end,
+            _ => end,
+        };
         let result = if closed {
             self.rotate_segment(end, now, false)
         } else {
@@ -2087,7 +2093,7 @@ impl Muxer {
         self.pending_video = None;
         self.discontinuity_next = true;
         self.breaks += 1;
-        result.map(|()| closed)
+        result.map(|()| (closed, end))
     }
 
     /// Where a keyframe with composition offset `cts` resumes a run that
@@ -2373,6 +2379,7 @@ impl Muxer {
                 bytes: 0,
                 audio_bytes: 0,
                 discontinuity: std::mem::take(&mut self.discontinuity_next),
+                media_end: at,
             });
         }
         if self.part.is_none() {
@@ -2573,6 +2580,7 @@ impl Muxer {
                 bytes: 0,
                 audio_bytes: 0,
                 discontinuity: std::mem::take(&mut self.discontinuity_next),
+                media_end: at,
             });
         }
         if self.part.is_none() {
@@ -2827,6 +2835,7 @@ impl Muxer {
         });
         if let Some(seg) = self.next_segment.as_mut() {
             seg.parts.push(finished.clone());
+            seg.media_end = end_dts;
         }
         self.parts.push_back(Held {
             part: finished,
@@ -3258,6 +3267,7 @@ impl Muxer {
             bytes: 0,
             audio_bytes: carried_audio_bytes,
             discontinuity: false,
+            media_end: end_dts,
         });
         Ok(())
     }

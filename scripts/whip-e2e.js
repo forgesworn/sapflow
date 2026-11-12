@@ -416,6 +416,7 @@ function hits(text, s) {
     // which it reports though nothing fails to decode.
     const whole = spawnSync('ffmpeg', ['-hide_banner', '-v', 'error', '-i', f, '-enc_time_base', 'demux', '-f', 'null', '-'], { encoding: 'utf8' });
     const decodeErrors = whole.stderr.split('\n').filter(Boolean);
+    fs.writeFileSync(path.join(out, path.basename(f) + '.decode.txt'), whole.stderr);
     check('recording: decodes whole with no error', whole.status === 0 && decodeErrors.length === 0 && video && +video.nb_read_frames > 0,
       video ? `${video.nb_read_frames} H.264 frames at ${video.width}x${video.height}, ${decodeErrors.length} decode errors; video from ${video.start_time} for ${video.duration} s, audio from ${audio ? audio.start_time : '-'} for ${audio ? audio.duration : '-'} s` : probe.stderr.trim());
     check('recording: Opus decodes', audio && +audio.nb_read_frames > 0, audio ? `${audio.nb_read_frames} frames, ${audio.channels} channels at ${audio.sample_rate}` : '');

@@ -421,9 +421,11 @@ impl RuleCheck {
             } else if let Some(rest) = l.strip_prefix("#EXTINF:") {
                 parts(&run, false)?;
                 let d = fixed5(rest.trim_end_matches(','))?;
-                // Each printed duration is rounded by up to half a unit.
+                // Each part's duration is a whole number of 90 kHz ticks (an
+                // audio-only part's rounded up), up to 1.2 units from its
+                // span, and each printed is rounded by up to half a unit.
                 let sum: u64 = run.iter().map(|&(p, _)| p).sum();
-                if !run.is_empty() && sum.abs_diff(d) > run.len() as u64 {
+                if !run.is_empty() && sum.abs_diff(d) > 2 * run.len() as u64 {
                     // Within a continuous run, only the decode-time hole
                     // after a part cut to PART-TARGET (a clamped stall).
                     let clamped = d > sum && run.iter().any(|&(p, _)| p == part_target);

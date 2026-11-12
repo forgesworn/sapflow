@@ -1047,19 +1047,20 @@ The cut itself loses nothing the muxer holds:
   keyframe that is decided once the first part has closed fits no part
   (in a recording it would come before the file's first video): it is
   dropped, and so is the held frame at a cut if it is such a frame.
-- **Late audio marks the file it belonged to.** A dropped late frame is
-  the old epoch's audio, so the old recording is the one missing it. The
-  muxer counts it against that epoch (`Muxer::take_late_audio_loss`), not
-  in the new run's `media_loss`, and the server keeps the old recording
-  open, not yet finished, while its late audio may still come
-  (`Muxer::late_audio_epoch`): until audio stamped at or after the
-  keyframe arrives, two seconds of video after the keyframe, a change of
-  audio configuration, or the next cut or the end of the connection. A
-  drop in that time marks the old file `media-loss`. If the window closes
-  before audio has reached the keyframe and the audio received ends more
-  than one audio frame short of it, the old file is marked too. That
-  over-marks an encoder that simply stopped sending audio before the
-  change.
+- **A loss is marked on the recording that would have held the lost
+  media.** Late audio belongs to the file its timestamp falls in, which is
+  the outgoing one, so a dropped late frame marks the old file `media-loss`
+  and never the next one. The muxer counts it against the old epoch
+  (`Muxer::take_late_audio_loss`), not in the new run's `media_loss`, and
+  the server keeps the old recording open, not yet finished, while its late
+  audio may still come (`Muxer::late_audio_epoch`): until audio stamped at
+  or after the keyframe arrives, two seconds of video after the keyframe, a
+  change of audio configuration, or the next cut or the end of the
+  connection. Marks for anything later in stream order still go to the
+  current recording. If the window closes before audio has reached the
+  keyframe and the audio received ends more than one audio frame short of
+  it, the old file is marked too. That over-marks an encoder that simply
+  stopped sending audio before the change.
 - **At a reconnect or the end of a stream** no clock carries on. The held
   video frame lasts as long as the frame before it did (with no frame
   before it, the SPS frame rate's interval, else 1/30 s), or until the end
@@ -1118,7 +1119,12 @@ Left open:
   `EXTINF` would move the playlist off the media's time. `RuleCheck` and
   `scripts/check-playlist.py` allow exactly this: a segment longer than
   its parts only within a continuous run and only with a part at
-  `PART-TARGET`; before a discontinuity, never.
+  `PART-TARGET`; before a discontinuity, never. So a run that breaks or is
+  interrupted right after such a part also ends its segment with its
+  media, and the next run resumes there (found by `muxer_timing` once the
+  rule was in; `fuzz/regressions/muxer_timing`). Both allow each part up
+  to two units of the fifth decimal for its tick rounding: an audio-only
+  part's duration is rounded up from its samples.
 - A cut's own losses (the held frame, or audio past the part and segment
   limits at a reconnect-style cut) are still in the new run's
   `media_loss`, and the server still marks both files for them, as for
