@@ -1,7 +1,9 @@
 //! Bounded, pull-driven MPEG-TS packaging of validated native samples.
 //!
-//! `mpeg2ts` owns PAT/PMT, PES, TS, timestamp and CRC encoding. This module
-//! owns the programme layout, cadence and AVCC/ADTS glue. One shared sample
+//! `mpeg2ts` owns PAT/PMT, PES, timestamp, CRC and general TS encoding. This module
+//! owns programme layout, cadence, AVCC/ADTS glue and plain continuation output.
+//! Contiguous continuations copy directly into the final chunk; all other packets
+//! retain the maintained writer. One shared sample
 //! is retained until drained; `poll_chunk` emits at most seven TS packets.
 //! No network, files, runtime, full-show buffer or full-PES copy is involved.
 //!
@@ -122,9 +124,10 @@ pub struct MuxStats {
     pub output_allocations: u64,
     /// Boundary-crossing bytes copied into the small elementary scratch.
     pub elementary_staging_copy_bytes: u64,
-    /// Elementary bytes copied into mpeg2ts::payload::Bytes, directly or via scratch.
+    /// Fallback elementary bytes copied into mpeg2ts::payload::Bytes.
+    /// Direct contiguous continuation payloads are serialised in emitted_bytes.
     pub packet_payload_copy_bytes: u64,
-    /// The same elementary bytes copied by the dependency into its TS payload scratch.
+    /// Fallback elementary bytes copied by the dependency into its TS payload scratch.
     /// Its final serialisation copy is counted separately in emitted_bytes.
     pub writer_payload_copy_bytes: u64,
     pub buffered_sample_bytes: usize,
@@ -458,23 +461,9 @@ impl MpegTsMuxer {
         let mut output = Vec::with_capacity(TS_CHUNK_BYTES);
         self.stats.output_allocations += 1;
         for _ in 0..7 {
-            let Some(packet) = self.next_packet()? else {
+            if !self.write_next_packet(&mut output)? {
                 break;
-            };
-            let pcr = packet
-                .adaptation_field
-                .as_ref()
-                .is_some_and(|a| a.pcr.is_some());
-            let at = output.len();
-            TsPacketWriter::new(&mut output).write_ts_packet(&packet)?;
-            if output.len() != at + TS_PACKET_BYTES {
-                return Err(MuxError::Writer);
             }
-            if pcr {
-                fix_pcr_reserved_bits(output.get_mut(at..).ok_or(MuxError::Writer)?)?;
-            }
-            self.stats.emitted_packets += 1;
-            self.stats.emitted_bytes += TS_PACKET_BYTES as u64;
         }
         if output.is_empty() {
             Ok(None)
@@ -506,18 +495,40 @@ impl MpegTsMuxer {
         Ok(())
     }
 
-    fn next_packet(&mut self) -> Result<Option<TsPacket>, MuxError> {
+    fn write_packet(&mut self, output: &mut Vec<u8>, packet: &TsPacket) -> Result<(), MuxError> {
+        let pcr = packet
+            .adaptation_field
+            .as_ref()
+            .is_some_and(|a| a.pcr.is_some());
+        let at = output.len();
+        TsPacketWriter::new(&mut *output).write_ts_packet(packet)?;
+        if output.len() != at + TS_PACKET_BYTES {
+            return Err(MuxError::Writer);
+        }
+        if pcr {
+            fix_pcr_reserved_bits(output.get_mut(at..).ok_or(MuxError::Writer)?)?;
+        }
+        self.stats.emitted_packets += 1;
+        self.stats.emitted_bytes += TS_PACKET_BYTES as u64;
+        Ok(())
+    }
+
+    fn write_next_packet(&mut self, output: &mut Vec<u8>) -> Result<bool, MuxError> {
         let Some(p) = self.pending.as_mut() else {
-            return Ok(None);
+            return Ok(false);
         };
         if p.force_tables > 0 {
             let pat = p.force_tables == 2;
             p.force_tables -= 1;
-            return Ok(Some(self.table(pat)?));
+            let packet = self.table(pat)?;
+            self.write_packet(output, &packet)?;
+            return Ok(true);
         }
         if self.periodic_table_stage > 0 {
             self.periodic_table_stage = 0;
-            return Ok(Some(self.table(false)?));
+            let packet = self.table(false)?;
+            self.write_packet(output, &packet)?;
+            return Ok(true);
         }
         if let Some(target) = p.clock_target {
             let table = self.next_tables.filter(|t| *t <= target);
@@ -527,13 +538,15 @@ impl MpegTsMuxer {
                     .next_tables
                     .map(|t| t + duration_ticks(self.config.tables_interval));
                 self.periodic_table_stage = 1;
-                return Ok(Some(self.table(true)?));
+                let packet = self.table(true)?;
+                self.write_packet(output, &packet)?;
+                return Ok(true);
             }
             if let Some(pcr) = pcr {
                 self.next_pcr = Some(pcr + duration_ticks(self.config.pcr_interval));
                 let track = if self.config.video.is_some() { 2 } else { 3 };
                 let discontinuity = self.discontinuity.get(track).copied().unwrap_or(false);
-                return Ok(Some(TsPacket {
+                let packet = TsPacket {
                     header: self.header(track, false)?,
                     adaptation_field: Some(adaptation(
                         discontinuity,
@@ -541,12 +554,37 @@ impl MpegTsMuxer {
                         Some(ClockReference::new((pcr & Timestamp::MAX) * 300)?),
                     )),
                     payload: None,
-                }));
+                };
+                self.write_packet(output, &packet)?;
+                return Ok(true);
             }
         }
         let p = self.pending.as_mut().ok_or(MuxError::Writer)?;
         let track = if p.elementary.sample.is_video() { 2 } else { 3 };
         let first = p.first;
+        if !first {
+            let count = (TS_PACKET_BYTES - 4).min(p.elementary.remaining);
+            let contiguous = p
+                .elementary
+                .front()?
+                .is_some_and(|rest| rest.len() >= count);
+            if contiguous {
+                let header = self.header(track, true)?;
+                let pending = self.pending.as_mut().ok_or(MuxError::Writer)?;
+                let data = pending.elementary.front()?.ok_or(MuxError::Writer)?;
+                write_continuation(output, &header, data.get(..count).ok_or(MuxError::Writer)?)?;
+                pending.elementary.advance(count)?;
+                if pending.elementary.remaining == 0 {
+                    self.pending = None;
+                    self.stats.buffered_sample_bytes = 0;
+                    self.stats.buffered_media_duration_ns = 0;
+                    self.stats.piece_metadata_bytes = 0;
+                }
+                self.stats.emitted_packets += 1;
+                self.stats.emitted_bytes += TS_PACKET_BYTES as u64;
+                return Ok(true);
+            }
+        }
         let random = first && p.elementary.sample.is_keyframe();
         let discontinuity = first && self.discontinuity.get(track).copied().unwrap_or(false);
         let adp = (random || discontinuity).then(|| adaptation(discontinuity, random, None));
@@ -597,11 +635,13 @@ impl MpegTsMuxer {
             self.stats.buffered_media_duration_ns = 0;
             self.stats.piece_metadata_bytes = 0;
         }
-        Ok(Some(TsPacket {
+        let packet = TsPacket {
             header,
             adaptation_field: adp,
             payload: Some(payload),
-        }))
+        };
+        self.write_packet(output, &packet)?;
+        Ok(true)
     }
     fn header(&mut self, track: usize, payload: bool) -> Result<TsHeader, MuxError> {
         let pid = match track {
@@ -714,10 +754,50 @@ fn adts_header(config: AacConfig, payload: usize) -> Result<[u8; 7], MuxError> {
     ])
 }
 
+/// Serialise a PES continuation without optional adaptation flags, retaining the writer for
+/// first packets, tables, PCR and boundary-crossing elementary pieces.
+/// Typed header fields and a 1..=184-byte payload produce exactly one packet.
+fn write_continuation(
+    output: &mut Vec<u8>,
+    header: &TsHeader,
+    data: &[u8],
+) -> Result<(), MuxError> {
+    if !(1..=TS_PACKET_BYTES - 4).contains(&data.len()) {
+        return Err(MuxError::Writer);
+    }
+    let at = output.len();
+    let end = at.checked_add(TS_PACKET_BYTES).ok_or(MuxError::Writer)?;
+    let stuffing = TS_PACKET_BYTES - 4 - data.len();
+    let pid = header.pid.as_u16();
+    let control = if stuffing == 0 { 0x10 } else { 0x30 };
+    output.extend_from_slice(&[
+        0x47,
+        (u8::from(header.transport_error_indicator) << 7)
+            | (u8::from(header.transport_priority) << 5)
+            | ((pid >> 8) as u8),
+        pid as u8,
+        ((header.transport_scrambling_control as u8) << 6)
+            | control
+            | header.continuity_counter.as_u8(),
+    ]);
+    if stuffing != 0 {
+        output.push((stuffing - 1) as u8);
+        if stuffing > 1 {
+            output.push(0); // No adaptation flags on this continuation.
+            output.resize(at + 4 + stuffing, 0xff);
+        }
+    }
+    output.extend_from_slice(data);
+    if output.len() != end {
+        return Err(MuxError::Writer);
+    }
+    Ok(())
+}
+
 /// mpeg2ts 0.6.1 time::ClockReference::write_pcr_to leaves the six reserved
 /// PCR bits zero. H.222.0 table 2-6 requires the reserved pattern. Correct
 /// only that byte after checking our dedicated adaptation-only packet shape;
-/// the dependency still owns all timestamp/TS encoding and remains unchanged.
+/// the dependency still encodes this PCR packet; its source remains unchanged.
 fn fix_pcr_reserved_bits(packet: &mut [u8]) -> Result<(), MuxError> {
     if packet.len() != 188
         || packet.first() != Some(&0x47)

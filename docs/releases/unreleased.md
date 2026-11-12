@@ -2,6 +2,22 @@
 
 Notes for the release after 0.2.0-rc.1.
 
+## sapflow-client
+
+- The MPEG-TS muxer that the SRT publishers use writes each PES
+  continuation whose bytes lie in one piece straight into the output chunk,
+  instead of building a packet for the `mpeg2ts` writer; first packets,
+  tables, PCR packets and continuations across two pieces still go through
+  the writer. The bytes are unchanged (the same hash over 5.6 GB of four
+  benchmark workloads, and a test against the writer for every payload
+  length and continuity counter, four PIDs and every flag). On the M4, time per sample
+  fell to 0.76 of before for 320-byte AAC, 0.26 for 8.5 kB H.264 and 0.20
+  for a 512 KiB keyframe.
+- `MuxStats::packet_payload_copy_bytes` and `writer_payload_copy_bytes`,
+  exported by sapflow-ffi among the SRT diagnostics, now count only the
+  bytes that take the writer path, since the direct path does not copy
+  them through the dependency.
+
 ## sapflow-hls
 
 - `RuleCheck::default()` now enforces the live window (RFC 8216bis 6.2.2's
@@ -172,11 +188,35 @@ Notes for the release after 0.2.0-rc.1.
   taken): they log it and try again after 100 ms, as WHIP's listeners do.
 - `--help` says the playlist can keep more than `SAPFLOW_SEGMENT_COUNT`
   segments, as above.
+- The "SRT connection closed" log line also gives `reordered`,
+  `duplicates`, `belated` and `naks_sent`. `reordered` counts missing
+  packets that arrived as originals after the receiver had queued their
+  NAK: retransmissions the path did not need, for a caller that flags its
+  retransmissions as libsrt does. That is field data for whether the
+  receiver should wait a little before sending a NAK, as it now sends one at
+  the first gap.
 - WHIP logs at debug how each session's start was aligned, each keyframe
   request and arrival, and its receive counters once a second.
 - A `test-feedback` feature, off in every other build, lets
   `SAPFLOW_TEST_WHIP_FEEDBACK` make WHIP sessions claim loss in their
   receiver reports or send REMB, for A3.10. Not for production use.
+
+- A second RTMP listener for a TLS front that sends PROXY protocol v2,
+  such as Caddy layer4 or HAProxy terminating RTMPS:
+  `SAPFLOW_RTMP_PROXY_ADDR` (off by default) with
+  `SAPFLOW_RTMP_TRUSTED_PROXY`, the front's address. Each connection on it
+  must come from the front and start with the header, whose source is the
+  publisher's address for the failed-attempt throttle and the app's publish
+  check (`ip`). Anything else is closed unanswered, LOCAL (the front's own
+  connection) once its header is in, and a refused peer's address is
+  logged. Without it every RTMPS publisher had the front's address, so one
+  encoder retrying a wrong key could throttle them all. The plain listener
+  is unchanged and never reads a header, and now gives the throttle an
+  IPv4-mapped peer as IPv4, as the proxied one does. Both share one cap on
+  open connections (four per allowed publisher), so a flood on either can
+  hold off the other until the 10 s setup deadline. Headers over 536 bytes
+  are refused: send plain PROXY v2, without SSL, authority or unique-ID
+  TLVs.
 
 ## sapflow-dtls
 
@@ -222,3 +262,11 @@ Notes for the release after 0.2.0-rc.1.
   server's end log line now carries the DTLS error for a `dtls-failed`
   end.
 - The public API changes only by the addition of `Server::refused`.
+
+## sapflow-srt
+
+- `receiver::Stats` gains `reordered`: packets reported missing that then
+  arrived as originals, not retransmissions (counted correctly only when
+  the caller sets the retransmission flag, as libsrt does). `Stats` is not
+  `#[non_exhaustive]`, so code that builds one with a struct literal needs
+  `..Default::default()`.

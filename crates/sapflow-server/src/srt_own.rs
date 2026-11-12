@@ -286,6 +286,17 @@ pub async fn serve(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
                             retransmitted = stats.retransmitted,
                             lost = stats.lost,
                             dropped = stats.dropped,
+                            // Reordered: missing packets that came as
+                            // originals after their NAK was queued, so the
+                            // sender's retransmission was not needed (for a
+                            // caller that flags retransmissions, as libsrt
+                            // does). Duplicates were already held; belated
+                            // came after delivery or give-up, from
+                            // reordering or a repeated NAK under loss.
+                            reordered = stats.reordered,
+                            duplicates = stats.duplicates,
+                            belated = stats.belated,
+                            naks_sent = stats.naks_sent,
                             "SRT connection closed"
                         );
                     }

@@ -2112,6 +2112,90 @@ mod tests {
             checksum: u64,
         }
 
+        fn stream_header(output: &mut impl std::io::Write, name: &str, iterations: u32) {
+            output.write_all(b"WORK").expect("workload tag");
+            output
+                .write_all(
+                    &u32::try_from(name.len())
+                        .expect("bounded name")
+                        .to_be_bytes(),
+                )
+                .expect("name length");
+            output.write_all(name.as_bytes()).expect("name");
+            output
+                .write_all(&iterations.to_be_bytes())
+                .expect("sample count");
+        }
+
+        fn stream_record(
+            output: &mut impl std::io::Write,
+            sequence: u32,
+            chunk: u32,
+            bytes: &[u8],
+        ) {
+            output.write_all(&sequence.to_be_bytes()).expect("sequence");
+            output.write_all(&chunk.to_be_bytes()).expect("chunk index");
+            output
+                .write_all(
+                    &u32::try_from(bytes.len())
+                        .expect("bounded chunk")
+                        .to_be_bytes(),
+                )
+                .expect("chunk length");
+            output.write_all(bytes).expect("complete output chunk");
+        }
+
+        fn stream_footer(output: &mut impl std::io::Write, bytes: u64, chunks: u64) {
+            output.write_all(b"DONE").expect("workload end");
+            output.write_all(&bytes.to_be_bytes()).expect("byte count");
+            output
+                .write_all(&chunks.to_be_bytes())
+                .expect("chunk count");
+        }
+
+        fn verify_stream(workload: Workload, output: &mut impl std::io::Write) {
+            let mut publisher = client();
+            publish_independently(&mut publisher, 7);
+            publisher.send_avc_config(&[1, 2]).expect("AVC config");
+            publisher
+                .send_aac_config(&[0x12, 0x10])
+                .expect("AAC config");
+            let setup = publisher.take_output();
+            assert!(publisher.recycle_output(setup));
+            let payload: Vec<u8> = (0..workload.payload_bytes)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                .collect();
+            stream_header(output, workload.name, ITERATIONS);
+            let mut output_bytes = 0u64;
+            for sequence in 0..ITERATIONS {
+                match workload.kind {
+                    Kind::Aac => publisher.send_aac(sequence, &payload).expect("AAC media"),
+                    Kind::Avc { keyframe } => publisher
+                        .send_avc(sequence, 0, keyframe, &payload)
+                        .expect("AVC media"),
+                }
+                let wire = publisher.take_output();
+                let prefix = match workload.kind {
+                    Kind::Aac => 2,
+                    Kind::Avc { .. } => 5,
+                };
+                assert_eq!(
+                    wire.len(),
+                    publisher.wire_size(payload.len() + prefix, sequence)
+                );
+                assert!(!wire.is_empty());
+                stream_record(output, sequence, 0, &wire);
+                stream_record(output, sequence, 1, &[]);
+                output_bytes += wire.len() as u64;
+                assert!(publisher.recycle_output(wire));
+            }
+            stream_footer(output, output_bytes, u64::from(ITERATIONS));
+            println!(
+                "{{\"kind\":\"verification_workload\",\"component\":\"rtmp\",\"workload\":\"{}\",\"samples\":{},\"output_bytes\":{},\"chunks\":{}}}",
+                workload.name, ITERATIONS, output_bytes, ITERATIONS,
+            );
+        }
+
         fn checksum(bytes: &[u8]) -> u64 {
             bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
@@ -2172,13 +2256,7 @@ mod tests {
             }
         }
 
-        println!(
-            "{{\"kind\":\"method\",\"synthetic_payloads\":true,\"architecture\":\"{}\",\"debug_assertions\":{},\"iterations\":{},\"timing\":\"send, take and recycle; excludes setup, payload generation, warm-up and checksum\"}}",
-            std::env::consts::ARCH,
-            cfg!(debug_assertions),
-            ITERATIONS,
-        );
-        for workload in [
+        let workloads = [
             Workload {
                 name: "aac-32",
                 kind: Kind::Aac,
@@ -2194,17 +2272,69 @@ mod tests {
                 kind: Kind::Avc { keyframe: true },
                 payload_bytes: 512 * 1024,
             },
-        ] {
-            black_box(measure(workload, 16));
-            let measured = measure(workload, ITERATIONS);
+        ];
+
+        if let Some(mode) = std::env::var_os("SAPFLOW_BENCH_VERIFY_STREAM") {
+            assert_eq!(mode, "1", "verification mode must be exactly 1");
+            use std::io::Write;
+            let stderr = std::io::stderr();
+            let mut output = std::io::BufWriter::with_capacity(65536, stderr.lock());
+            output.write_all(b"SFPERF1R").expect("stream magic");
+            for workload in workloads {
+                verify_stream(workload, &mut output);
+            }
+            output.write_all(b"END!").expect("stream end");
+            output.flush().expect("complete verification stream");
             println!(
-                "{{\"workload\":\"{}\",\"iterations\":{},\"elapsed_ns\":{},\"ns_per_message\":{:.3},\"output_bytes\":{},\"last_fnv1a64\":\"{:016x}\"}}",
+                "{{\"kind\":\"verification_complete\",\"component\":\"rtmp\",\"workloads\":3,\"samples_per_workload\":10000,\"architecture\":\"{}\",\"debug_assertions\":{}}}",
+                std::env::consts::ARCH,
+                cfg!(debug_assertions)
+            );
+            return;
+        }
+
+        println!(
+            "{{\"kind\":\"method\",\"synthetic_payloads\":true,\"architecture\":\"{}\",\"debug_assertions\":{},\"iterations\":{},\"timing\":\"sum of fresh-instance inner batches; send, take and recycle; excludes setup, payload generation, warm-up and checksum\"}}",
+            std::env::consts::ARCH,
+            cfg!(debug_assertions),
+            ITERATIONS,
+        );
+        for workload in workloads {
+            black_box(measure(workload, 16));
+            let batches: u32 = match workload.kind {
+                Kind::Aac => 2048,
+                Kind::Avc { keyframe: false } => 256,
+                Kind::Avc { keyframe: true } => 4,
+            };
+            let mut batch_elapsed_ns = Vec::with_capacity(batches as usize);
+            let mut summed_elapsed_ns = 0u128;
+            let mut total_output_bytes = 0u64;
+            let mut per_batch = None;
+            for _ in 0..batches {
+                let measured = measure(workload, ITERATIONS);
+                let signature = (measured.output_bytes, measured.checksum);
+                if let Some(expected) = per_batch {
+                    assert_eq!(signature, expected, "repeat fresh deterministic batch");
+                }
+                per_batch = Some(signature);
+                batch_elapsed_ns.push(measured.elapsed_ns);
+                summed_elapsed_ns += measured.elapsed_ns;
+                total_output_bytes += measured.output_bytes;
+            }
+            let (output_bytes_per_batch, last_checksum) = per_batch.expect("positive batches");
+            let operations = u64::from(ITERATIONS) * u64::from(batches);
+            println!(
+                "{{\"workload\":\"{}\",\"iterations_per_batch\":{},\"batches\":{},\"operations\":{},\"elapsed_ns\":{},\"ns_per_message\":{:.3},\"output_bytes\":{},\"output_bytes_per_batch\":{},\"last_fnv1a64\":\"{:016x}\",\"batch_elapsed_ns\":{:?}}}",
                 workload.name,
                 ITERATIONS,
-                measured.elapsed_ns,
-                measured.elapsed_ns as f64 / f64::from(ITERATIONS),
-                measured.output_bytes,
-                measured.checksum,
+                batches,
+                operations,
+                summed_elapsed_ns,
+                summed_elapsed_ns as f64 / operations as f64,
+                total_output_bytes,
+                output_bytes_per_batch,
+                last_checksum,
+                batch_elapsed_ns,
             );
         }
     }

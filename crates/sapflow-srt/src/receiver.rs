@@ -60,6 +60,12 @@ pub struct Stats {
     pub duplicates: u64,
     /// Copies of packets already delivered or given up on.
     pub belated: u64,
+    /// Missing packets that then arrived as originals, not retransmissions:
+    /// the path reordered them. Each had already been queued in a NAK, so
+    /// the sender resends it for nothing. This relies on the caller setting
+    /// the retransmission flag (`REXMITFLG`), as libsrt does; a caller that
+    /// never sets it has its retransmissions counted here too.
+    pub reordered: u64,
     /// Packets found missing (each counted once).
     pub lost: u64,
     /// Missing packets skipped at their delivery time.
@@ -419,6 +425,9 @@ impl Receiver {
             }
             *existing = Some(slot);
             self.loss.remove(p.seq);
+            if !p.retransmitted {
+                self.stats.reordered += 1;
+            }
         } else {
             if idx > self.buf.len() {
                 // A gap: report it at once.
@@ -1178,6 +1187,7 @@ mod tests {
         );
         assert_eq!(r.stats().dropped, 0);
         assert_eq!(r.stats().retransmitted, 2);
+        assert_eq!(r.stats().reordered, 0, "retransmissions are not reordering");
     }
 
     #[test]
@@ -1201,6 +1211,7 @@ mod tests {
         );
         assert_eq!(r.stats().dropped, 0);
         assert_eq!(r.stats().belated, 0);
+        assert_eq!(r.stats().reordered, 1, "the late original filled its gap");
     }
 
     #[test]
