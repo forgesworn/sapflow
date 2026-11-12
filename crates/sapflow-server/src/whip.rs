@@ -38,7 +38,7 @@ use sapflow_dtls::Identity;
 use sapflow_hls::codec::{AccessUnit, OpusConfig};
 use sapflow_hls::{IngestError, TrackSet, Update};
 use sapflow_rtp::opus::FrameKind;
-use sapflow_rtp::receive::{Discontinuity, SkipReason};
+use sapflow_rtp::receive::{Discontinuity, SkipReason, StreamStats};
 use sapflow_whip::ice::{Kind, classify};
 use sapflow_whip::resource::{self, SessionId};
 use sapflow_whip::router::{InsertError, Router, RouterConfig};
@@ -690,7 +690,7 @@ fn media(event: sapflow_rtp::Event) -> Media {
         E::AccessUnit { au, pts, .. } => {
             if au.idr {
                 // A3.10's evidence: when each keyframe arrived, beside the
-                // requests `Owner::log_keyframe_requests` logs.
+                // requests `Owner::log_receivers` logs.
                 tracing::debug!(pts, "WHIP keyframe received");
             }
             Media::Video {
@@ -1053,7 +1053,7 @@ async fn own_udp(
         whip,
         feeds: HashMap::new(),
         closing: HashMap::new(),
-        keyframe_requests: HashMap::new(),
+        logged: HashMap::new(),
     };
     // One datagram; the session takes at most 1500 bytes of it.
     let mut buf = vec![0u8; 65_536];
@@ -1062,7 +1062,7 @@ async fn own_udp(
     let mut armed = None;
     loop {
         owner.flush(&socket, &tcp, &mut router).await;
-        owner.log_keyframe_requests(&mut router);
+        owner.log_receivers(&mut router);
         let deadline = router.poll_timeout();
         if deadline != armed {
             if let Some(d) = deadline {
@@ -1096,14 +1096,21 @@ async fn own_udp(
     }
 }
 
+/// Debug only: what was last logged of one session's receiver.
+struct Logged {
+    keyframe_requests: u64,
+    at: Instant,
+    counters: Option<(Option<StreamStats>, Option<StreamStats>)>,
+}
+
 /// What the UDP owner keeps beside the router.
 struct Owner {
     whip: Arc<Whip>,
     feeds: HashMap<SessionId, Feed>,
     /// Why the server closed a session, until its end is counted.
     closing: HashMap<SessionId, CloseCause>,
-    /// Debug only: each session's keyframe requests as last logged.
-    keyframe_requests: HashMap<SessionId, u64>,
+    /// Debug only: what was last logged of each session's receiver.
+    logged: HashMap<SessionId, Logged>,
 }
 
 /// What one round of events calls for once they are all taken.
@@ -1125,32 +1132,62 @@ fn contained<R>(f: impl FnOnce() -> R) -> Option<R> {
 }
 
 impl Owner {
-    /// Debug only: logs the keyframe requests (PLI or FIR, scheduled or
-    /// asked for) each session's receiver has queued since the last look,
-    /// just after they were sent. A3.10's evidence sets them beside each
-    /// keyframe's arrival. Nothing is read unless debug is on.
-    fn log_keyframe_requests(&mut self, router: &mut Router) {
+    /// Debug only, for A3.10's and A4.1's evidence: logs each keyframe
+    /// request (PLI or FIR, scheduled or asked for) a session's receiver
+    /// has queued since the last look, just after it was sent, and at most
+    /// once a second, when they have changed, the receiver's counters for
+    /// each stream (packets, NACKed sequence numbers, packets recovered and
+    /// lost, frames delivered, dropped as incomplete and skipped). Nothing
+    /// is read unless debug is on.
+    fn log_receivers(&mut self, router: &mut Router) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
-        let Self {
-            feeds,
-            keyframe_requests: seen,
-            ..
-        } = self;
-        seen.retain(|id, _| feeds.contains_key(id));
+        let Self { feeds, logged, .. } = self;
+        logged.retain(|id, _| feeds.contains_key(id));
+        let now = Instant::now();
         for id in feeds.keys() {
-            let count = router.inspect(id, |s| {
-                let video = s.stream(MediaKind::Video)?;
-                Some(s.receiver()?.stats(video)?.keyframe_requests)
+            let read = router.inspect(id, |s| {
+                let rx = s.receiver()?;
+                let stats = |k| s.stream(k).and_then(|v| rx.stats(v));
+                Some((stats(MediaKind::Video), stats(MediaKind::Audio)))
             });
-            let Some(Some(count)) = count else {
+            let Some(Some((video, audio))) = read else {
                 continue;
             };
-            let last = seen.entry(*id).or_insert(0);
-            if count > *last {
-                tracing::debug!(count, "WHIP keyframe requested");
-                *last = count;
+            let last = logged.entry(*id).or_insert_with(|| Logged {
+                keyframe_requests: 0,
+                at: now,
+                counters: None,
+            });
+            if let Some(v) = video
+                && v.keyframe_requests > last.keyframe_requests
+            {
+                tracing::debug!(count = v.keyframe_requests, "WHIP keyframe requested");
+                last.keyframe_requests = v.keyframe_requests;
+            }
+            let counters = (video, audio);
+            if last.counters != Some(counters)
+                && now.duration_since(last.at) >= Duration::from_secs(1)
+            {
+                let field =
+                    |s: Option<StreamStats>, f: fn(&StreamStats) -> u64| s.as_ref().map_or(0, f);
+                tracing::debug!(
+                    video_packets = field(video, |s| s.packets),
+                    video_nacked = field(video, |s| s.nacked),
+                    video_recovered = field(video, |s| s.recovered),
+                    video_lost = field(video, |s| s.lost),
+                    video_frames = field(video, |s| s.frames),
+                    video_incomplete = field(video, |s| s.incomplete),
+                    video_skipped = field(video, |s| s.skipped),
+                    audio_packets = field(audio, |s| s.packets),
+                    audio_nacked = field(audio, |s| s.nacked),
+                    audio_recovered = field(audio, |s| s.recovered),
+                    audio_lost = field(audio, |s| s.lost),
+                    "WHIP receive counters"
+                );
+                last.counters = Some(counters);
+                last.at = now;
             }
         }
     }
