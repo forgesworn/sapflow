@@ -1318,9 +1318,9 @@ fn epochs_of(pattern: &[bool]) -> Vec<Frame> {
 
 /// One publication of `frames` through the elementary-stream path with the
 /// given roll limit: after each codec change while files are still being
-/// rolled, real time for the last file's writer to finish (two writers a
-/// path), as an encoder's seconds between changes give it, and a moment
-/// every hundred frames for the writer to keep up.
+/// rolled, the time the file before the held one needs to finish (two
+/// writers a path), as an encoder's seconds between changes give it, and a
+/// moment every hundred frames for the writer to keep up.
 struct EpochRun {
     app: Arc<crate::App>,
     /// A wall clock the feed keeps in step with the media, as a publisher
@@ -1433,10 +1433,26 @@ impl EpochRun {
                 .expect("fixture frames");
             let recording = publisher.stream.session().recorder.is_some();
             if epoch(publisher) != before && recording {
-                self.drain_for(Duration::from_millis(100)).await;
+                self.until_a_writer_is_free().await;
             }
         }
         epoch(publisher).unwrap_or(0)
+    }
+
+    /// After a roll: waits, collecting callbacks, until at most one of the
+    /// path's writers is taken (by the file just ended, held for its late
+    /// audio), so the new epoch's recording will find one free. The file
+    /// before it has then finished, as an encoder's seconds between codec
+    /// changes let it; a loaded runner can take longer than any fixed wait
+    /// to sync a file.
+    async fn until_a_writer_is_free(&mut self) {
+        let path = StreamPath::parse("live/event-epochs").expect("path");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.app.recording_limits.path_writers_in_use(&path) > 1
+            && tokio::time::Instant::now() < deadline
+        {
+            self.drain_for(Duration::from_millis(5)).await;
+        }
     }
 
     async fn drain_for(&mut self, time: Duration) {

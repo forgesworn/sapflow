@@ -85,6 +85,13 @@ impl RecordingLimits {
         )
     }
 
+    /// How many of `path`'s writers are taken, by recordings and by files
+    /// still finishing. Only meaningful while the path has a live factory.
+    #[cfg(test)]
+    pub(crate) fn path_writers_in_use(&self, path: &StreamPath) -> usize {
+        self.path_writers - self.path(path).writers.available_permits()
+    }
+
     fn with_capacities(
         bytes: usize,
         path_bytes: usize,
