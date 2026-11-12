@@ -17,6 +17,30 @@ begun, then compare the emitted video samples with intact input and check
 recovery through the final complete part. Longer input is needed to include
 the next clean keyframe after a damaged PES start.
 
+## Generated resolution-change fixture
+
+`resolution-change.ts` is two seconds of a generated test pattern and sine
+wave at 160x90, then two at 128x72, joined by stream copy, so the SPS changes
+mid-stream at the second part's first IDR (3.44 s) on one timeline. It
+contains no camera, microphone or uploaded media. The ingest regressions
+check that each front end starts one new codec epoch there. Regenerate it
+with:
+
+```sh
+for s in 160x90 128x72; do
+  ffmpeg -nostdin -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc2=size=${s}:rate=30" \
+    -f lavfi -i sine=frequency=440:sample_rate=48000 -t 2 \
+    -c:v libx264 -preset ultrafast -tune zerolatency \
+    -g 30 -keyint_min 30 -sc_threshold 0 -bf 0 -pix_fmt yuv420p \
+    -c:a aac -profile:a aac_low -b:a 64k \
+    -map_metadata -1 -fflags +bitexact -flags +bitexact -f mpegts "part-${s}.ts"
+done
+printf "file part-160x90.ts\nfile part-128x72.ts\n" > list.txt
+ffmpeg -nostdin -hide_banner -loglevel error -y -f concat -safe 0 -i list.txt \
+  -c copy -map_metadata -1 -fflags +bitexact -f mpegts resolution-change.ts
+```
+
 ## Generated audio-only fixtures
 
 `audio-48k-mono.ts` and `audio-44k1-stereo.ts` each contain six seconds of
