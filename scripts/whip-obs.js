@@ -7,7 +7,7 @@
 //   node scripts/whip-obs.js --bin <sapflow> --out <dir> [--seconds 40]
 //        [--keyframe-interval 2] [--obs-keyint 10] [--bitrate 2500]
 //        [--feedback <SAPFLOW_TEST_WHIP_FEEDBACK value>] [--base 47300]
-//        [--obs /Applications/OBS.app]
+//        [--proxy <srt-loss-proxy> --loss <percent>] [--obs /Applications/OBS.app]
 //
 // In order, as W0's obs-run.js:
 //   1. refuses to run if OBS is already running (never touches the user's
@@ -26,6 +26,12 @@
 //      sapflow;
 //   6. puts the config directory back from the backup, whatever happened
 //      before, and diffs it against the backup.
+//
+// --proxy and --loss put the loss proxy (crates/sapflow-bench, --protocol
+// whip: STUN and DTLS pass, SRTP and SRTCP are dropped at random, 30 ms
+// each way, seed 1) between OBS and sapflow, and advertise it as the only
+// candidate, to see whether OBS answers NACKs: sapflow's receive counters
+// (at debug) and the proxy's repeated RTP.
 //
 // --feedback passes SAPFLOW_TEST_WHIP_FEEDBACK to a sapflow built with
 // --features test-feedback (loss:<fraction of 256>:<s> or
@@ -49,11 +55,12 @@ if (!bin || !out) { console.error('--bin and --out are required'); process.exit(
 const seconds = +opt('seconds', 40), base = +opt('base', 47300);
 const keyframeInterval = opt('keyframe-interval', '2'), obsKeyint = +opt('obs-keyint', 10), bitrate = +opt('bitrate', 2500);
 const feedback = opt('feedback');
+const proxyBin = opt('proxy'), lossPct = opt('loss');
 const obsApp = opt('obs', '/Applications/OBS.app');
 const OBS = path.join(obsApp, 'Contents/MacOS/OBS');
 const NAME = 'A310-WHIP-test';
 const CONFIG = path.join(os.homedir(), 'Library/Application Support/obs-studio');
-const port = { hls: base, whip: base + 1, media: base + 2, srt: base + 3, websocket: base + 9 };
+const port = { hls: base, whip: base + 1, media: base + 2, srt: base + 3, proxy: base + 4, websocket: base + 9 };
 const EVENT = 'event-obs';
 const TOKEN = 'obs:' + crypto.randomBytes(12).toString('hex');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -110,7 +117,7 @@ function sapflow() {
     SAPFLOW_PUBLISH_USER: TOKEN.split(':')[0], SAPFLOW_PUBLISH_PASS: TOKEN.split(':')[1],
     SAPFLOW_RECORDINGS: path.join(out, 'recordings'), SAPFLOW_RECORD_MIN_FREE_GB: '0', SAPFLOW_RECONNECT_GRACE: '2',
     SAPFLOW_WHIP_ADDR: `127.0.0.1:${port.whip}`, SAPFLOW_WHIP_UDP_ADDR: `127.0.0.1:${port.media}`,
-    SAPFLOW_WHIP_CANDIDATES: `udp 127.0.0.1:${port.media}`, SAPFLOW_WHIP_PUBLIC_URL: `http://127.0.0.1:${port.whip}`,
+    SAPFLOW_WHIP_CANDIDATES: `udp 127.0.0.1:${proxyBin ? port.proxy : port.media}`, SAPFLOW_WHIP_PUBLIC_URL: `http://127.0.0.1:${port.whip}`,
     SAPFLOW_WHIP_KEYFRAME_INTERVAL: keyframeInterval,
     RUST_LOG: 'info,sapflow::whip=debug',
   };
@@ -164,7 +171,10 @@ function analyse() {
       video_kbps: Object.keys(perSecond).sort((a, b) => a - b).map((s) => [+s, Math.round(perSecond[s] / 1000)]),
     };
   });
-  return { connected: conn ? conn[1] + 'Z' : null, requests: requests.length, keyframes_received: keyframes.length, answered, keyframe_gaps_s: gaps,
+  const counters = [...text.matchAll(/WHIP receive counters (.*)$/gm)].pop();
+  const proxyStats = fs.existsSync(path.join(out, 'proxy.txt')) ? Object.fromEntries(fs.readFileSync(path.join(out, 'proxy.txt'), 'utf8').trim().split('\n').map((l) => l.split('='))) : null;
+  return { counters: counters ? Object.fromEntries([...counters[1].matchAll(/(\w+)=(\d+)/g)].map((m) => [m[1], +m[2]])) : null, proxy: proxyStats,
+    connected: conn ? conn[1] + 'Z' : null, requests: requests.length, keyframes_received: keyframes.length, answered, keyframe_gaps_s: gaps,
     aligned: (/WHIP timeline aligned alignment=(\S+)/.exec(text) || [])[1] || null, feedback_armed: /test feedback hooks armed/.test(text), recordings };
 }
 
@@ -175,10 +185,15 @@ function analyse() {
   const source = clip();
   const backup = fs.mkdtempSync(path.join(os.tmpdir(), 'a310-obs-backup-'));
   execFileSync('rsync', ['-a', CONFIG + '/', backup + '/']);
-  let srv = null, obs = null;
+  let srv = null, obs = null, proxy = null;
   try {
     srv = sapflow();
     await sleep(1000);
+    if (proxyBin) {
+      proxy = spawn(proxyBin, ['--listen', `127.0.0.1:${port.proxy}`, '--target', `127.0.0.1:${port.media}`, '--loss', `random:${lossPct || 5}`,
+        '--delay-ms', '30', '--protocol', 'whip', '--seed', '1', '--stats', path.join(out, 'proxy.txt')], { stdio: ['ignore', 'ignore', fs.openSync(path.join(out, 'proxy.log'), 'w')] });
+      info.proxy_loss_pct = +(lossPct || 5);
+    }
     if (srv.exitCode !== null) throw new Error('sapflow exited at start');
     writeProfile(`http://127.0.0.1:${port.whip}/whip/live/${EVENT}`, source);
     if (obsPids().length) throw new Error('OBS started meanwhile; not launching');
@@ -202,6 +217,7 @@ function analyse() {
       info.obs_ended = !running(obs.pid);
     }
     await sleep(4000); // the recording finishes when the grace is over
+    await stopChild(proxy);
     await stopChild(srv);
     if (obs && running(obs.pid)) { info.restore = 'skipped: OBS still running'; }
     else {
