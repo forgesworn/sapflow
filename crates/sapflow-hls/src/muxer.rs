@@ -2959,13 +2959,21 @@ impl Muxer {
         let edge = self.edge();
         let listed_from = self.media_sequence + self.part_tags_from() as u64;
         for t in &mut self.tagged {
-            if t.msn >= listed_from {
-                break;
+            if t.msn < listed_from {
+                t.left.get_or_insert(edge);
+            } else if !t.parts_freed {
+                // Listed again: a run that ended with its media after a
+                // clamped part gave back the hole the open parts' spans had
+                // counted, so a stamp taken while they did (before the run
+                // ended, inside the same call) is not when the tags left.
+                t.left = None;
             }
-            t.left.get_or_insert(edge);
         }
         self.keep_in_pool();
-        let window = self.part_window();
+        // A stamp is taken as a part is sealed, and one call can seal
+        // another after it (an interrupt's short final part of audio)
+        // before any client sees the playlist: hold a part target more.
+        let window = self.part_window().saturating_add(self.part_target());
         for i in 0..self.tagged.len() {
             let t = &self.tagged[i];
             if t.msn >= self.media_sequence {

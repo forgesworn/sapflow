@@ -1176,11 +1176,17 @@ Left open:
   back when a run ends with its media after a clamped part (the open
   parts' spans counted the hole); retention then runs longer in real
   time, not shorter.
-- The muxer stamps a part tag's removal at the edge it has when the tag
-  leaves, which inside one ingest batch can be before the batch's render:
-  a client then has the part for three target durations less the rest of
-  that batch's media. A batch is normally one frame (WHIP) or one SRT
-  datagram's worth.
+- The muxer stamps a part tag's removal at the edge it has when the part
+  that moves it out is sealed, which can be before a client next sees the
+  playlist: one call can seal more after it (an interrupt's short final
+  part of audio, found by `muxer_timing`, input
+  `tag-listed-again-after-a-run-end`), and one ingest batch can hold
+  several calls. Parts are now held a part target past the three target
+  durations, which covers one call; a batch with more than a part
+  target's media after the stamp still gives a client less. A batch is
+  normally one frame (WHIP) or one SRT datagram's worth. A tag listed
+  again (a run that ended with its media gave back a clamped part's hole)
+  has its stamp cleared, to be taken again when it leaves.
 - A cut's own losses (the held frame, or audio past the part and segment
   limits at a reconnect-style cut) are still in the new run's
   `media_loss`, and the server still marks both files for them, as for
