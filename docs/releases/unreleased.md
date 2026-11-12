@@ -102,7 +102,8 @@ Notes for the release after 0.2.0-rc.1.
   one per `SAPFLOW_RECORDING_ROLL_REFILL` seconds of media (default 60).
   Past it, epochs are still served but not recorded; recording resumes in
   the first epoch that lasts `SAPFLOW_RECORDING_ROLL_SETTLE` seconds
-  (default 10) with a roll back, from that epoch's first retained part.
+  (default 10) with a roll back, from that epoch's earliest retained part
+  that begins a segment.
   The file that ran out and the resumed one are marked with the new reason
   `epoch-rate`. An encoder that changes its parameter sets at every
   keyframe used to make a file and a `recordSegmentComplete` callback a

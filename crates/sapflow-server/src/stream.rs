@@ -640,15 +640,21 @@ impl LiveStream {
             self.resume_recording(session, now);
             return false;
         }
-        let roll = if session.recorder_factory.is_some() {
-            session.rolls.epoch(now)
-        } else {
-            Roll::Record
-        };
         let mut outgoing = session.recorder.take();
         let unrecorded = outgoing
             .as_mut()
             .is_some_and(|recorder| !self.feed_outgoing(recorder));
+        // A roll from a recording that never started (an epoch never
+        // served, as at a start-up change while part timing is learnt)
+        // makes no more files: it spends nothing.
+        let started = outgoing
+            .as_ref()
+            .is_some_and(|recorder| recorder.last_part().is_some());
+        let roll = if session.recorder_factory.is_some() {
+            session.rolls.epoch(now, started)
+        } else {
+            Roll::Record
+        };
         let epoch = outgoing
             .as_ref()
             .and_then(|recorder| self.recorded_epoch(recorder));
@@ -700,20 +706,43 @@ impl LiveStream {
         let Some((tracks, parts)) = self.parts_after(None) else {
             return;
         };
-        let Some(first) = parts.iter().position(|part| part.independent) else {
+        let Some(from) = self.first_segment_part(&parts) else {
             return;
         };
         session.rolls.resume();
         let mut recorder = factory.start();
         recorder.mark_incomplete(IncompleteReason::EpochRate);
         let skipped = session.rolls.skipped();
-        recorder.feed(tracks, parts.into_iter().skip(first).collect());
+        recorder.feed(tracks, parts.into_iter().filter(|p| p.id >= from).collect());
         tracing::info!(
             path = %self.path.as_path(),
             skipped,
             "recording resumes after codec changes that came too often"
         );
         session.recorder = Some(recorder);
+    }
+
+    /// Of the current epoch's retained `parts`, the earliest that begins a
+    /// segment, so begins with a keyframe (`EXT-X-INDEPENDENT-SEGMENTS`): a
+    /// part marked independent may begin mid-GOP with its keyframe later.
+    fn first_segment_part(&self, parts: &[Arc<Part>]) -> Option<u64> {
+        let st = self.lock();
+        let m = st.ingest.muxer()?;
+        let starts: Vec<u64> = m
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                sapflow_hls::muxer::Entry::Segment(segment) => {
+                    segment.parts.first().map(|part| part.id)
+                }
+                sapflow_hls::muxer::Entry::Gap { .. } => None,
+            })
+            .chain(m.open_parts().first().map(|part| part.id))
+            .collect();
+        parts
+            .iter()
+            .map(|part| part.id)
+            .find(|id| starts.contains(id))
     }
 
     /// The codec epoch of the parts `recorder` has had, if any.

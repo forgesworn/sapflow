@@ -421,7 +421,7 @@ function hits(text, s) {
   if (loop) {
     // Past the budget: the first file and the burst, then the resumed one.
     check('every codec epoch served, the recording within its roll budget',
-      maps.size > ROLL_BURST + 1 && files.length <= ROLL_BURST + 2 && files.length >= ROLL_BURST + 1,
+      maps.size > ROLL_BURST + 1 && files.length <= ROLL_BURST + 2 && files.length >= Math.min(maps.size, ROLL_BURST + 1),
       `${files.length} files, ${maps.size} inits served, ${changes.length} epoch changes; widths ${r ? (r.widths || []).join(' then ') : '-'}`);
   } else {
     check('one recording per served codec epoch', maps.size > 0 && files.length === maps.size && withParts + 1 === maps.size && (!resize || maps.size > 1),
@@ -459,9 +459,12 @@ function hits(text, s) {
   // Every file, not any one of them.
   const finished = plain.split('\n').filter((l) => l.includes('recording finished'));
   if (loop) {
+    // A file keeps its first reason only, so the file that ran out can read
+    // another; every incomplete one must have one, and one must be the
+    // budget's.
     const rate = finished.filter((l) => /reason="?epoch-rate/.test(l)).length;
-    check('every recording finished complete but the two the budget marked',
-      finished.length === files.length && rate === 2 && finished.every((l) => /complete=true/.test(l) || /reason="?epoch-rate/.test(l)),
+    check('every recording finished complete or marked, the budget\'s marks among them',
+      finished.length === files.length && rate >= 1 && finished.every((l) => /complete=true/.test(l) || /reason="?[a-z]/.test(l)),
       `${finished.filter((l) => /complete=true/.test(l)).length} of ${finished.length} complete, ${rate} marked epoch-rate, ${files.length} files`);
   } else {
     check('every recording finished complete', finished.length === files.length && finished.every((l) => /complete=true/.test(l)),

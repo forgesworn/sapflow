@@ -112,8 +112,10 @@ impl RollBudget {
         }
     }
 
-    /// A codec epoch begins at media time `now`.
-    pub fn epoch(&mut self, now: Duration) -> Roll {
+    /// A codec epoch begins at media time `now`. `charged`: the file it
+    /// rolls from was written; a roll from a recording that never started
+    /// (an epoch that was never served) makes no more files and is free.
+    pub fn epoch(&mut self, now: Duration, charged: bool) -> Roll {
         self.epoch_start = now;
         if self.limit.burst == 0 {
             return Roll::Record;
@@ -122,6 +124,9 @@ impl RollBudget {
         if self.out {
             self.skipped += 1;
             return Roll::Skip;
+        }
+        if !charged {
+            return Roll::Record;
         }
         if self.tokens > 0 {
             self.tokens -= 1;
@@ -163,10 +168,10 @@ mod tests {
     fn a_burst_records_then_runs_out_and_skips() {
         let mut b = RollBudget::new(RollLimit::default());
         for i in 0..8 {
-            assert_eq!(b.epoch(s(i)), Roll::Record, "roll {i}");
+            assert_eq!(b.epoch(s(i), true), Roll::Record, "roll {i}");
         }
-        assert_eq!(b.epoch(s(8)), Roll::RanOut);
-        assert_eq!(b.epoch(s(9)), Roll::Skip);
+        assert_eq!(b.epoch(s(8), true), Roll::RanOut);
+        assert_eq!(b.epoch(s(9), true), Roll::Skip);
         assert!(b.is_out());
         assert_eq!(b.skipped(), 2);
     }
@@ -175,7 +180,7 @@ mod tests {
     fn recording_resumes_after_the_settle_time_with_a_roll() {
         let mut b = RollBudget::new(RollLimit::default());
         for i in 0..9 {
-            b.epoch(s(i));
+            b.epoch(s(i), true);
         }
         // The epoch began at 8 s; no roll is back before 60 s of media.
         assert!(!b.may_resume(s(30)));
@@ -183,7 +188,7 @@ mod tests {
         b.resume();
         assert!(!b.is_out());
         // A later epoch that does not settle keeps it out again.
-        assert_eq!(b.epoch(s(61)), Roll::RanOut);
+        assert_eq!(b.epoch(s(61), true), Roll::RanOut);
         assert!(!b.may_resume(s(65)), "under the settle time");
     }
 
@@ -194,8 +199,8 @@ mod tests {
             refill: s(60),
             settle: s(10),
         });
-        assert_eq!(b.epoch(s(0)), Roll::Record);
-        assert_eq!(b.epoch(s(1)), Roll::RanOut);
+        assert_eq!(b.epoch(s(0), true), Roll::Record);
+        assert_eq!(b.epoch(s(1), true), Roll::RanOut);
         assert!(!b.may_resume(s(30)), "settled, but no roll");
         assert!(b.may_resume(s(60)));
     }
@@ -207,7 +212,7 @@ mod tests {
             ..RollLimit::default()
         });
         for i in 0..1000 {
-            assert_eq!(b.epoch(s(i)), Roll::Record);
+            assert_eq!(b.epoch(s(i), true), Roll::Record);
         }
         assert!(!b.may_resume(s(2000)));
         assert_eq!(b.skipped(), 0);
@@ -219,7 +224,7 @@ mod tests {
         // An hour of stable media, then a storm: still only the burst.
         let mut rolls = 0;
         for i in 0..20 {
-            if b.epoch(s(3600 + i)) == Roll::Record {
+            if b.epoch(s(3600 + i), true) == Roll::Record {
                 rolls += 1;
             }
         }
@@ -233,9 +238,9 @@ mod tests {
             refill: s(60),
             settle: s(10),
         });
-        b.epoch(s(100));
-        b.epoch(s(101));
-        assert_eq!(b.epoch(s(99)), Roll::RanOut);
+        b.epoch(s(100), true);
+        b.epoch(s(101), true);
+        assert_eq!(b.epoch(s(99), true), Roll::RanOut);
         assert!(!b.may_resume(s(98)));
     }
 
@@ -263,8 +268,11 @@ mod tests {
             for _ in 0..(next() % 400) {
                 now += Duration::from_millis(next() % 20_000);
                 let had = b.tokens > 0 && !b.out;
-                match b.epoch(now) {
-                    Roll::Record => files += 1,
+                // Now and then a roll from a recording that never started.
+                let charged = next() % 5 != 0;
+                match b.epoch(now, charged) {
+                    Roll::Record if charged => files += 1,
+                    Roll::Record => {}
                     Roll::RanOut | Roll::Skip => {
                         assert!(limit.burst > 0 && !had, "case {case}: a roll was available");
                     }

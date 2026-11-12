@@ -1560,3 +1560,55 @@ async fn a_burst_of_zero_rolls_at_every_epoch() {
     assert_eq!(states.len(), 20, "{states:?}");
     assert!(states.iter().all(|s| s.0 == "finalised"), "{states:?}");
 }
+
+/// The usual resume: a short burst of changes spends the budget, the
+/// picture then holds, and the roll comes back only 40 s later, long after
+/// the epoch's first parts have left retention. The resumed file starts at
+/// a segment, so with a keyframe, and decodes cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
+async fn a_late_resume_starts_its_file_at_a_keyframe() {
+    let limit = crate::roll_budget::RollLimit {
+        burst: 2,
+        refill: Duration::from_secs(40),
+        settle: Duration::from_secs(10),
+    };
+    let mut pattern = vec![true, false, true];
+    pattern.extend(std::iter::repeat_n(false, 31));
+    let mut run = EpochRun::new(limit);
+    let mut publisher = run.begin();
+    run.feed(&mut publisher, &epochs_of(&pattern)).await;
+    run.end(publisher).await;
+    let states = run.states();
+    assert_eq!(states.len(), 4, "{states:?}");
+    assert_eq!(
+        states[2].1, "epoch-rate",
+        "the file that ran out: {states:?}"
+    );
+    assert_eq!(states[3].1, "epoch-rate", "the resumed file: {states:?}");
+    let file = std::path::PathBuf::from(run.done[3]["segmentPath"].as_str().expect("a path"));
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "packet=flags", "-of", "csv=p=0"])
+        .arg(&file)
+        .output()
+        .expect("ffprobe runs");
+    let flags = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        flags.lines().next().is_some_and(|f| f.starts_with('K')),
+        "the first video packet is a keyframe: {:?}",
+        flags.lines().next()
+    );
+    let decode = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-v", "error", "-xerror", "-i"])
+        .arg(&file)
+        .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        decode.status.success() && decode.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&decode.stderr)
+    );
+    assert_eq!(widths_of(&[file])[0], 128);
+}

@@ -1043,11 +1043,18 @@ applies to all three:
   left finishes the current file as usual, marked `epoch-rate`, and starts
   none: the epochs after it are served but not recorded. Recording resumes
   in the first epoch that lasts `SAPFLOW_RECORDING_ROLL_SETTLE` (default
-  10 s) with a roll back, from that epoch's first retained part (the first
-  independent one, if the earliest have gone), and that file is marked
-  `epoch-rate` too. The budget counts media time, is kept across a
-  reconnect with the stream and starts full with a new presentation; a
-  burst of 0 turns it off. A burst of 8 covers Chrome's start-up ramp (up
+  10 s) with a roll back, from the epoch's earliest retained part that
+  begins a segment (so with a keyframe; when the roll comes back late the
+  epoch's first parts have left retention), and that file is marked
+  `epoch-rate` too. A file keeps its first reason only, so either file can
+  read another code instead (a loss in the cut's batch marks the outgoing
+  file first), but both are `incomplete`. A roll from a recording that
+  never started (an epoch never served, as at a change while part timing
+  is still learnt) makes no file and spends nothing. The budget counts the
+  muxer's published media time (`Muxer::published_media`), which also
+  counts the seven leading gap segments a stream starts with, is kept
+  across a reconnect with the stream and starts full with a new
+  presentation; a burst of 0 turns it off. A burst of 8 covers Chrome's start-up ramp (up
   to five steps in W0), a couple of rotations and one network switch with
   every file recorded. An encoder that changes configuration every few
   seconds for the rest of a show is recorded only up to the burst and from
@@ -1056,6 +1063,7 @@ applies to all three:
   epochs in ten minutes give 10 files and 10 callbacks),
   `a_start_up_resolution_ramp_stays_inside_the_burst`,
   `recording_resumes_from_the_first_part_of_a_settled_epoch`,
+  `a_late_resume_starts_its_file_at_a_keyframe`,
   `the_roll_budget_survives_a_reconnect_and_resets_with_a_new_presentation`,
   `a_burst_of_zero_rolls_at_every_epoch`, the property test in
   `roll_budget.rs`, and `scripts/whip-e2e.js --resize-loop` (Chrome
