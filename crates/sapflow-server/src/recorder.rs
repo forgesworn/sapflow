@@ -59,6 +59,14 @@ impl RecordingLimits {
         )
     }
 
+    /// Default limits but `path_bytes` for each path's retained parts, for
+    /// tests that need a recording's first part refused.
+    #[cfg(test)]
+    pub(crate) fn with_path_bytes(max_publishers: usize, path_bytes: usize) -> Self {
+        let writers = max_publishers.saturating_mul(10).clamp(1, MAX_WRITERS);
+        Self::with_capacities(GLOBAL_RETAINED_PART_BYTES, path_bytes, writers, PATH_WRITERS)
+    }
+
     fn with_capacities(
         bytes: usize,
         path_bytes: usize,

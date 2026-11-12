@@ -587,7 +587,8 @@ impl LiveStream {
     ///   started, so it is started now with that epoch's tracks, as noted
     ///   after the push that began it, and fed the epoch's parts.
     /// - An epoch begun and ended inside one push left no tracks to start
-    ///   its recording with: `false`.
+    ///   its recording with: `false`. So does a late start whose first part
+    ///   was refused (no free writer, or the byte budget full).
     pub fn feed_outgoing(&self, recorder: &mut Recorder) -> bool {
         if !recorder.is_accepting() {
             // Stopped: it has marked itself.
@@ -610,16 +611,22 @@ impl LiveStream {
                     None => return true,
                 },
             };
-            // Newest first, back to `after` or out of the epoch or window.
-            let mut parts: Vec<Arc<Part>> = (0..first)
-                .rev()
-                .take_while(|id| after.is_none_or(|a| *id > a))
-                .map_while(|id| match m.part(id) {
-                    PartLookup::Found(p) if p.initialization.id == epoch => Some(p),
-                    _ => None,
-                })
-                .collect();
-            parts.reverse();
+            let found = |id: u64| match m.part(id) {
+                PartLookup::Found(p) if p.initialization.id == epoch => Some(p),
+                _ => None,
+            };
+            let parts: Vec<Arc<Part>> = match after {
+                // Upwards from the last part fed: the file's own tail, even
+                // when later epochs sealed parts in the same push.
+                Some(last) => (last + 1..first).map_while(found).collect(),
+                // Never started: the epoch just before the current one,
+                // newest first, back to its start or out of the window.
+                None => {
+                    let mut parts: Vec<Arc<Part>> = (0..first).rev().map_while(found).collect();
+                    parts.reverse();
+                    parts
+                }
+            };
             // An epoch between this one and the current one began and ended
             // inside one push: any parts it left have no recording.
             let current = m.current_initialization_id();
@@ -650,7 +657,9 @@ impl LiveStream {
         };
         let (tracks, parts, skipped) = fed;
         recorder.feed(tracks, parts);
-        !skipped
+        // A late start whose first part was refused (no free writer, or the
+        // byte budget full) recorded nothing of the epoch.
+        !skipped && recorder.last_part().is_some()
     }
 
     /// The init segment and every finished part of the current codec epoch
