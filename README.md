@@ -165,8 +165,9 @@ sliced and recorder aliases keep that charge through their final payload
 owner. Exhaustion refuses media and preserves the admitted recording prefix
 as incomplete. The cap covers retained media, not the whole process: on
 Linux the server reads its cgroup memory limit at startup and warns when
-the cap is above three quarters of it, since a high-bitrate publisher could
-then get the server killed instead of refused.
+the cap plus `SAPFLOW_MAX_RETAINED_BYTES` (below) is above three quarters of
+it, since a high-bitrate publisher could then get the server killed instead
+of refused.
 
 `SAPFLOW_MAX_RETAINED_BYTES` (`--max-retained-bytes`, default 128 MiB) is a
 pool beside it for media kept past the live window, so that parts and

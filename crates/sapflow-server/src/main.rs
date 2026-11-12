@@ -168,19 +168,27 @@ async fn run(config: Config) -> std::io::Result<()> {
     tracing::info!(
         presentations = app.config.max_presentations,
         fragment_bytes = app.config.max_fragment_bytes,
+        retained_bytes = app.config.max_retained_bytes,
         memory_limit,
         response_deadline_secs = app.config.http_body_timeout.as_secs(),
         "retained HLS limits"
     );
+    // The fragment budget and the retention pool beside it together bound
+    // fragment memory.
     let fragment_bytes = app.config.max_fragment_bytes as u64;
+    let retained_bytes = app.config.max_retained_bytes as u64;
     if let Some(limit) = memory_limit
-        && sapflow_core::memory::fragment_cap_exceeds(fragment_bytes, limit)
+        && sapflow_core::memory::fragment_cap_exceeds(
+            fragment_bytes.saturating_add(retained_bytes),
+            limit,
+        )
     {
         tracing::warn!(
             fragment_bytes,
+            retained_bytes,
             memory_limit = limit,
             suggested_max = sapflow_core::memory::max_fragment_bytes(limit),
-            "SAPFLOW_MAX_FRAGMENT_BYTES is above three quarters of the memory limit: a high-bitrate publisher can get the server killed instead of refused; lower it or raise the limit"
+            "SAPFLOW_MAX_FRAGMENT_BYTES plus SAPFLOW_MAX_RETAINED_BYTES is above three quarters of the memory limit: a high-bitrate publisher can get the server killed instead of refused; lower them, so that together they are at most suggested_max, or raise the limit"
         );
     }
 
