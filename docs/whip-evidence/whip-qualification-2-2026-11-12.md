@@ -9,7 +9,8 @@ Raw results are in `fixtures/whip/qualification-2-2026-11-12/`.
 **Builds.** A3.8, A3.10 and A4.1 ran on builds made before main
 (`b5a130a`, with the muxer changes of #79) was merged into this branch;
 A4.2's Linux run and the final gate ran after. One A4.1 trial was rerun on
-the merged build (see "A stream that never goes live").
+the merged build (see "A stream that never goes live"), and A4.1's jitter
+check ran on the build after main's #82 was merged too.
 
 ## The owner's decisions
 
@@ -34,7 +35,7 @@ The owner's written decisions of 12 November 2026, as given:
 | A3.10 OBS keyframes | OBS 32.0.4 does not answer PLI: in five runs its keyframes came every 10 s, or 7 s, as its own keyframe interval was set, whether Sapflow asked every 2 s or not at all (a control) | Recorded: **no** |
 | A3.10 OBS rate | OBS's video stayed at 2.50 to 2.53 Mbit/s with receiver reports claiming 25% loss and with REMB at 500 kbit/s, as without either. The same stimuli took headless Chrome from about 1 Mbit/s to 0.03 and to 0.42 Mbit/s | Recorded: **no** change on either |
 | A3.8 sync, 4 s start hold | Chrome 157: 20 of 20 runs within (UDP and ICE-TCP 10 each), audio -0.6 to +17.5 ms against the video, every run aligned by sender reports. FFmpeg: 10 of 10 at 0 to 0.5 ms, aligned at once | **Met** |
-| A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%. A decision point: the default `SAPFLOW_WHIP_JITTER` (200 ms) and the NACK schedule |
+| A4.1 loss | Userspace proxy (the owner's decision), 1%, 5% and 10% random loss with 0 to 20 ms of jitter, five seeds; Chrome 157 for WHIP (FFmpeg's WHIP muxer does not retransmit). Frames unrecovered, WHIP against SRT: 9.4 against 2.0 at 1% (t 1.28), **83.0 against 6.8 at 5% (t 9.73)**, 50.8 against 130.8 at 10% (t -3.18), but 19.8% against 14.5% of the frames each sent | **Not met** at 5%, with or without jitter: a check after review gave 48.0 against 6.0 with no jitter (t 7.35) and 165.0 against 42.0 with jitter that keeps order (t 8.34). The jitter's reordering, not loss, made libsrt's 6700 retransmissions, but it does not explain the gap. A decision point: the default `SAPFLOW_WHIP_JITTER` (200 ms) and the NACK schedule |
 | A4.2 memory | accepted by the owner in writing (decision 4) | Accepted |
 | A4.2 CPU, Linux container | 27 of 27 runs under the load gate, none skipped. WHIP's CPU per stream against SRT's: 0.74 to 0.84 at 1 stream, 0.83 to 0.96 at 50, and at 10 streams 0.75 and 0.83 with one round at 1.11. WHIP was below SRT in 8 of 9 rounds | **Met** at 1 and 50 streams by the rule. At 10 the rounds disagree (one of three above), so the call there is the owner's |
 
@@ -373,12 +374,13 @@ at 62.3.
 measure. What the counters show:
 
 - **Repair.** WHIP is left with 3 to 9 video packets that its NACKs did not
-  repair in 200 ms, against SRT's 0 or 1. Within that wait, at a 60 ms
-  round trip and up to 20 ms of jitter each way, a packet gets about two
-  NACKs. They repeat every round trip and a quarter, at most 4 in all; how
-  many go is inferred, not counted. Under every lossy profile, libsrt
-  retransmitted about 6700 packets in 30 s, far more than the 760 to 1660
-  the proxy dropped, so it repairs more aggressively.
+  repair in 200 ms, against SRT's 0 or 1. NACKs repeat every round trip and
+  a quarter, at most 4 in all. At a 60 ms round trip that is about two
+  attempts within the wait; how many went is inferred, not counted. libsrt
+  retransmitted about 6700 packets in 30 s under every lossy profile, but
+  that is not loss repair: the check below shows the jitter's reordering
+  makes them. Without jitter it resends about one packet per packet
+  dropped.
 - **Each unrepaired packet.** It costs the frames until Chrome's next
   keyframe: one incomplete frame, then 4 to 9 skipped while the PLI's
   answer comes. Each SRT loss costs the rest of the 1 s GOP, which is why
@@ -391,6 +393,68 @@ measure. What the counters show:
   for Opus, so WHIP's audio loss is not repaired: at 5% (seed 2) Sapflow
   filled 84 Opus packets with silence. SRT repairs its AAC with everything
   else.
+
+### Checking the jitter (after review)
+
+**Why.** The review asked whether the jitter skewed the comparison. libsrt's
+retransmissions were 0 in the clean runs, which had no jitter, and 6445 to
+6942 in every lossy run, which all had it, from 1% to 10% loss. That looks
+like libsrt answering the reordering the jitter causes, which would give
+SRT early repair that WHIP does not get.
+
+**The runs.** Three seeds each on the same method, the merged build and the
+same day:
+
+- jitter without loss;
+- 5% loss without jitter;
+- 5% loss with jitter that keeps order. The proxy's new `--jitter-order
+  keep` spreads the delays the same way, but a packet waits for the one
+  ahead of it rather than overtaking it.
+- 5% loss with the original reordering jitter, as a same-build reference.
+
+| Loss, jitter | Protocol | Frames unrecovered, by seed | Mean (sd) | Retransmissions (SRT: proxy; WHIP: Chrome's own) | Reordered (SRT data, proxy) | Packets dropped, client to server | Residual packets lost (Sapflow) |
+|---|---|---|---|---|---|---|---|
+| 0%, 20 ms reordering | SRT | 1 1 1 | 1.0 (0) | 6294, 6381, 6393 | 6627, 6723, 6668 | 0 | 0 |
+| 0%, 20 ms reordering | WHIP | 4 5 1 | 3.3 (2.1) | 533, 685, 632 | not counted | 0 | 0 |
+| 5%, none | SRT | 14 1 3 | 6.0 (7.0) | 540, 505, 462 | 0 | 468 to 501 | 0 to 1 |
+| 5%, none | WHIP | 55 41 48 | 48.0 (7.0) | 315, 315, 291 | not counted | 386 to 445 | 3 to 5 |
+| 5%, 20 ms keeping order | SRT | 62 44 20 | 42.0 (21.1) | 769, 785, 792 | 0 | 477 to 515 | 1 to 4 |
+| 5%, 20 ms keeping order | WHIP | 177 149 169 | 165.0 (14.4) | 208, 288, 215 | not counted | 313 to 663 | 17 to 19 |
+| 5%, 20 ms reordering | SRT | 1 31 4 | 12.0 (16.5) | 6762, 6655, 6658 | 6294, 6270, 6272 | 756 to 811 | 0 to 1 |
+| 5%, 20 ms reordering | WHIP | 73 70 74 | 72.3 (2.1) | 588, 473, 548 | not counted | 256 to 304 | 6 to 9 |
+
+| Loss, jitter | WHIP less SRT, frames | Welch t |
+|---|---|---|
+| 0%, 20 ms reordering | +2.3 | 1.94 |
+| 5%, none | **+42.0** | **7.35** |
+| 5%, 20 ms keeping order | **+123.0** | **8.34** |
+| 5%, 20 ms reordering | **+60.3** | **6.28** |
+
+**What it shows.**
+
+- **The confound is real for retransmissions.** With jitter and no loss,
+  the proxy dropped nothing, yet libsrt retransmitted 6294 to 6393 packets,
+  about as many as the proxy reordered (6627 to 6723). With loss and no
+  jitter, libsrt retransmitted 462 to 540, about one per packet dropped. So
+  the 6700 in the main runs answer reordering, not loss. Sapflow's NACKs
+  answer reordering too: Chrome resent 533 to 685 packets with nothing lost,
+  since Sapflow NACKs a gap after a 10 ms reorder delay. The jitter also
+  costs WHIP a few frames on its own (1 to 5); it cost SRT 1.
+- **It does not explain the result.** Without any jitter, WHIP still left
+  48.0 frames unrecovered at 5% against SRT's 6.0 (t 7.35). WHIP is left
+  with 3 to 5 packets its NACKs did not repair, SRT with 0 or 1. With
+  jitter that keeps order, both did worse and the gap widened (165.0
+  against 42.0, t 8.34). Holding packets behind delayed ones adds delay,
+  and WHIP was left with 17 to 19 packets unrepaired. With the original
+  reordering jitter the result matches the main runs (72.3 against 12.0,
+  t 6.28; 83.0 against 6.8 before).
+
+**Restated.** **A4.1 is not met at 5% loss, with or without jitter, and
+whatever the jitter does to order.** WHIP at its 200 ms wait leaves several
+times SRT's frames unrecovered. The difference comes from packets WHIP's
+NACKs leave unrepaired, each costing the frames until Chrome's next
+keyframe. It does not come from the jitter. At 1% there is no difference
+worth claiming, and at 10% the measures disagree, as above.
 
 This is a decision point for the default `SAPFLOW_WHIP_JITTER`, which A4.1
 was to settle. A longer wait or more NACK attempts would repair more, at the

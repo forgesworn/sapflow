@@ -1,0 +1,25 @@
+jitter_ms	loss_pct	protocol	seed	audio_frames	chrome_keyFramesEncoded	chrome_nackCount	chrome_packetsSent	chrome_pliCount	chrome_retransmittedPacketsSent	decode_errors	delay_ms	errors	frames_sent	jitter_order	load	proxy_dropped_c2s	proxy_dropped_s2c	proxy_reordered	proxy_retransmits	publisher_exit	ready	recordings	sapflow_srt_dropped	sapflow_srt_lost	sapflow_srt_received	sapflow_srt_retransmitted	sapflow_video_incomplete	sapflow_video_lost	sapflow_video_nacked	sapflow_video_recovered	sapflow_video_skipped	unrecovered	video_frames
+20	0	srt	1	1407						0	30		900	reorder	5.04	0	0	6627	6294	0	True	1	0	6627	14740	6294						1	899
+20	0	whip	1	1442	17	367	4649	18	533	0	30		599	reorder	5.44	0	0		0	0	True	1					1	0	538	1695	0	4	595
+20	0	whip	2	1459	17	465	4879	17	685	0	30		767	reorder	7.53	0	0		0	0	True	1					2	0	692	2199	1	5	762
+20	0	srt	2	1407						0	30		900	reorder	7.13	0	0	6723	6381	0	True	1	0	6723	14827	6381						1	899
+20	0	srt	3	1407						0	30		900	reorder	5.81	0	0	6668	6393	0	True	1	0	6668	14839	6393						1	899
+20	0	whip	3	1467	17	441	5342	17	632	0	30		745	reorder	5.22	0	0		0	0	True	1					1	0	639	2108	0	1	744
+0	5	srt	1	1407						0	30		900	reorder	4.5	491	87	0	540	0	True	1	1	440	8518	512						14	886
+0	5	whip	1	1272	15	282	6938	19	315	0	30		805	reorder	5.86	445	48		0	0	True	1					3	3	327	297	51	55	750
+0	5	whip	2	1312	15	270	6046	18	315	0	30		806	reorder	12.68	413	49		0	0	True	1					3	3	335	303	22	41	765
+0	5	srt	2	1407						0	30		900	reorder	27.51	501	93	0	505	0	True	1	0	455	8472	481						1	899
+0	5	srt	3	1407						0	30		900	reorder	37.37	468	93	0	462	0	True	1	1	408	8474	436						3	897
+0	5	whip	3	1328	17	256	6047	20	291	0	30		811	reorder	36.8	386	47		0	0	True	1					5	5	305	269	41	48	763
+20	5	srt	1	1407						0	30		900	keep	39.78	500	88	0	769	0	True	1	4	429	8742	725						62	838
+20	5	whip	1	1245	23	185	6811	26	208	0	30		756	keep	38.44	436	46		0	0	True	1					19	19	209	166	156	177	579
+20	5	whip	2	1298	22	251	11080	25	288	0	30		783	keep	25.9	663	49		0	0	True	1					17	17	292	255	131	149	634
+20	5	srt	2	1407						0	30		900	keep	25.38	515	104	0	785	0	True	1	3	441	8749	744						44	856
+20	5	srt	3	1407						0	30		900	keep	31.82	477	102	0	792	0	True	1	1	427	8776	757						20	880
+20	5	whip	3	1176	21	196	4593	26	215	0	30		742	keep	33.46	313	45		0	0	True	1					18	17	222	181	114	169	573
+20	5	srt	1	1407						0	30		900	reorder	28.79	811	134	6294	6762	0	True	1	0	6718	14426	6404						1	899
+20	5	whip	1	1250	17	394	4463	20	588	0	30		571	reorder	22.79	304	49		0	0	True	1					7	6	606	1622	65	73	498
+20	5	whip	2	1258	18	315	3318	21	473	0	30		466	reorder	13.58	256	51		0	0	True	1					9	9	497	1346	60	70	396
+20	5	srt	2	1407						0	30		900	reorder	10.63	803	158	6270	6655	0	True	1	1	6707	14327	6318						31	869
+20	5	srt	3	1407						0	30		900	reorder	8.25	756	161	6272	6658	0	True	1	1	6696	14377	6355						4	896
+20	5	whip	3	1164	18	372	3987	21	548	0	30		548	reorder	6.05	281	55		0	0	True	1					8	8	575	1557	43	74	474
