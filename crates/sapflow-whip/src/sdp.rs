@@ -29,6 +29,8 @@ pub use answer::{
     AnswerConfig, Candidate, H264Profile, MAX_CANDIDATES, MID_URI, Negotiated, Stream,
     TRANSPORT_CC_URI, answer,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use answer::{AnswerHooks, answer_with};
 
 use sapflow_dtls::Fingerprint;
 use std::fmt;

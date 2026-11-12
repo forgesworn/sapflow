@@ -42,7 +42,7 @@ use sapflow_rtp::receive::{Discontinuity, SkipReason};
 use sapflow_whip::ice::{Kind, classify};
 use sapflow_whip::resource::{self, SessionId};
 use sapflow_whip::router::{InsertError, Router, RouterConfig};
-use sapflow_whip::sdp::{self, AnswerConfig, MediaKind, Offer};
+use sapflow_whip::sdp::{AnswerConfig, MediaKind, Offer};
 use sapflow_whip::{Credentials, EndReason, Event, Session, SessionConfig, Tuple};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -687,15 +687,22 @@ pub(crate) enum Media {
 fn media(event: sapflow_rtp::Event) -> Media {
     use sapflow_rtp::Event as E;
     match event {
-        E::AccessUnit { au, pts, .. } => Media::Video {
-            pts,
-            au: AccessUnit {
-                data: au.data,
-                idr: au.idr,
-                sps: au.sps.into_iter().last(),
-                pps: au.pps.into_iter().last(),
-            },
-        },
+        E::AccessUnit { au, pts, .. } => {
+            if au.idr {
+                // A3.10's evidence: when each keyframe arrived, beside the
+                // requests `Owner::log_keyframe_requests` logs.
+                tracing::debug!(pts, "WHIP keyframe received");
+            }
+            Media::Video {
+                pts,
+                au: AccessUnit {
+                    data: au.data,
+                    idr: au.idr,
+                    sps: au.sps.into_iter().last(),
+                    pps: au.pps.into_iter().last(),
+                },
+            }
+        }
         E::Audio { frame, pts, .. } => Media::Audio {
             pts,
             lost: frame.kind == FrameKind::Loss,
@@ -1046,6 +1053,7 @@ async fn own_udp(
         whip,
         feeds: HashMap::new(),
         closing: HashMap::new(),
+        keyframe_requests: HashMap::new(),
     };
     // One datagram; the session takes at most 1500 bytes of it.
     let mut buf = vec![0u8; 65_536];
@@ -1054,6 +1062,7 @@ async fn own_udp(
     let mut armed = None;
     loop {
         owner.flush(&socket, &tcp, &mut router).await;
+        owner.log_keyframe_requests(&mut router);
         let deadline = router.poll_timeout();
         if deadline != armed {
             if let Some(d) = deadline {
@@ -1093,6 +1102,8 @@ struct Owner {
     feeds: HashMap<SessionId, Feed>,
     /// Why the server closed a session, until its end is counted.
     closing: HashMap<SessionId, CloseCause>,
+    /// Debug only: each session's keyframe requests as last logged.
+    keyframe_requests: HashMap<SessionId, u64>,
 }
 
 /// What one round of events calls for once they are all taken.
@@ -1114,6 +1125,36 @@ fn contained<R>(f: impl FnOnce() -> R) -> Option<R> {
 }
 
 impl Owner {
+    /// Debug only: logs the keyframe requests (PLI or FIR, scheduled or
+    /// asked for) each session's receiver has queued since the last look,
+    /// just after they were sent. A3.10's evidence sets them beside each
+    /// keyframe's arrival. Nothing is read unless debug is on.
+    fn log_keyframe_requests(&mut self, router: &mut Router) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let Self {
+            feeds,
+            keyframe_requests: seen,
+            ..
+        } = self;
+        seen.retain(|id, _| feeds.contains_key(id));
+        for id in feeds.keys() {
+            let count = router.inspect(id, |s| {
+                let video = s.stream(MediaKind::Video)?;
+                Some(s.receiver()?.stats(video)?.keyframe_requests)
+            });
+            let Some(Some(count)) = count else {
+                continue;
+            };
+            let last = seen.entry(*id).or_insert(0);
+            if count > *last {
+                tracing::debug!(count, "WHIP keyframe requested");
+                *last = count;
+            }
+        }
+    }
+
     /// Sends what the router queued and takes its events, then the closes
     /// and keyframe requests they call for, until nothing is left.
     async fn flush(&mut self, socket: &UdpSocket, tcp: &whip_tcp::Link, router: &mut Router) {
@@ -1744,17 +1785,20 @@ async fn publish(
         .take(8)
         .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
         >> 1;
-    let (answer, negotiated) = sdp::answer(
-        &offer,
-        &AnswerConfig {
-            credentials: &credentials,
-            fingerprint: whip.identity.fingerprint(),
-            candidates: &whip.config.candidates,
-            opus_max_bitrate: whip.config.opus_max_bitrate,
-            origin,
-        },
-    )
-    .map_err(|e| Refused::from(resource::Refusal::OutsideProfile(e)))?;
+    let config = AnswerConfig {
+        credentials: &credentials,
+        fingerprint: whip.identity.fingerprint(),
+        candidates: &whip.config.candidates,
+        opus_max_bitrate: whip.config.opus_max_bitrate,
+        origin,
+    };
+    #[cfg(not(feature = "test-feedback"))]
+    let answered = sapflow_whip::sdp::answer(&offer, &config);
+    // A3.10's test build only; see `whip_feedback`.
+    #[cfg(feature = "test-feedback")]
+    let answered = crate::whip_feedback::answer(&offer, &config);
+    let (answer, negotiated) =
+        answered.map_err(|e| Refused::from(resource::Refusal::OutsideProfile(e)))?;
     let stream = StreamPath::parse(path).ok_or(Refused::new(404, "no such stream path"))?;
     let req = PublishRequest {
         path: stream,
@@ -1784,7 +1828,8 @@ async fn publish(
         #[cfg(test)]
         panic_hooks: whip.panic_hooks.load(Ordering::Relaxed),
     };
-    let session = Session::new(
+    #[allow(unused_mut)]
+    let mut session = Session::new(
         whip.session.clone(),
         whip.identity.clone(),
         credentials,
@@ -1792,6 +1837,8 @@ async fn publish(
         Instant::now(),
     )
     .map_err(|_| unavailable())?;
+    #[cfg(feature = "test-feedback")]
+    crate::whip_feedback::arm(&mut session);
     // The ingest task owns the publication from here, so a cancelled
     // request leaves no session without one.
     let (tx, rx) = mpsc::channel(QUEUE);

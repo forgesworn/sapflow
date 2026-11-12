@@ -3,7 +3,7 @@
 //! reports, so these are synthesised from known clocks).
 
 use super::*;
-use crate::rtcp::PT_RTPFB;
+use crate::rtcp::{PT_PSFB, PT_RTPFB};
 use crate::timeline::{Alignment, Fallback};
 use crate::twcc::parse::{Status, parse_fci};
 
@@ -601,4 +601,85 @@ fn a12_recovery_with_the_start_hold() {
     for s in [StreamId(0), StreamId(1)] {
         assert_eq!(held.receiver.stats(s).expect("stats").events_dropped, 0);
     }
+}
+
+/// A3.10's test hooks: from their delay on, report blocks claim the set
+/// loss (the cumulative count growing to match) and each report carries a
+/// REMB; before it, and without hooks, the reports are what was measured.
+#[test]
+fn feedback_hooks_claim_loss_and_send_remb_after_their_delay() {
+    let report = |hooks: Option<FeedbackHooks>| {
+        let mut r = Receiver::new(av_config(), Instant::now());
+        let mut v = StreamConfig::new(Codec::H264, 96);
+        v.ssrc = Some(7);
+        r.add_stream(v).expect("video");
+        if let Some(h) = hooks {
+            r.set_feedback_hooks(h);
+        }
+        let slice = [0x41, 0x9a, 1];
+        let mut sent = Vec::new();
+        // 100 packets a second for 3 s, none lost; a report every second
+        // from 500 ms.
+        for n in 0..300u16 {
+            let d = pkt(96, 7, n, u32::from(n) * 900, false, &slice);
+            feed(&mut r, u64::from(n) * 10, &d).expect("taken");
+            r.handle_timeout(r.epoch + Duration::from_millis(u64::from(n) * 10));
+            for d in datagrams(&mut r) {
+                let p = packets(&d);
+                let b = blocks(&p[0]);
+                if let Some(b) = b.first() {
+                    let remb = p.iter().find_map(|x| match x {
+                        Packet::Other(o) if o.packet_type == PT_PSFB && o.count == 15 => {
+                            Some(o.body.to_vec())
+                        }
+                        _ => None,
+                    });
+                    sent.push((n, b.fraction_lost, b.cumulative_lost, remb));
+                }
+            }
+        }
+        sent
+    };
+    let plain = report(None);
+    assert!(plain.len() >= 2, "{plain:?}");
+    assert!(
+        plain
+            .iter()
+            .all(|(_, f, c, remb)| (*f, *c) == (0, 0) && remb.is_none()),
+        "{plain:?}"
+    );
+    let hooked = report(Some(FeedbackHooks {
+        loss: Some(64),
+        remb: Some(500_000),
+        after: Duration::from_millis(1200),
+    }));
+    for (n, fraction, cumulative, remb) in &hooked {
+        if *n < 120 {
+            assert_eq!(
+                (*fraction, *cumulative),
+                (0, 0),
+                "before the delay: {hooked:?}"
+            );
+            assert!(remb.is_none());
+        } else {
+            assert_eq!(*fraction, 64, "{hooked:?}");
+            assert!(*cumulative > 0, "{hooked:?}");
+            let body = remb.as_ref().expect("a REMB after the delay");
+            // Sender SSRC, media source 0, "REMB", one SSRC, the bitrate,
+            // then the stream's SSRC.
+            assert_eq!(&body[4..12], b"\0\0\0\0REMB");
+            assert_eq!(body[12], 1);
+            let br = u32::from_be_bytes([0, body[13], body[14], body[15]]);
+            assert_eq!(u64::from(br & 0x3_ffff) << (br >> 18), 500_000);
+            assert_eq!(&body[16..20], &7u32.to_be_bytes());
+        }
+    }
+    assert!(hooked.iter().any(|(n, ..)| *n >= 120), "{hooked:?}");
+    // Each claimed interval adds a quarter of the packets expected in it.
+    let claimed: Vec<i32> = hooked
+        .iter()
+        .filter(|(n, ..)| *n >= 120)
+        .map(|x| x.2)
+        .collect();
+    assert!(claimed.windows(2).all(|w| w[1] - w[0] == 25), "{claimed:?}");
 }

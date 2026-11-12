@@ -688,6 +688,30 @@ pub struct Receiver {
     report_due: bool,
     /// At most [`MAX_STREAMS`], newest last.
     stashed_srs: Vec<StashedSr>,
+    /// Test builds only: the A3.10 stimuli and when they were set.
+    #[cfg(any(test, feature = "testing"))]
+    hooks: Option<(FeedbackHooks, u64)>,
+    /// Test builds only: per SSRC, the loss the hooks have claimed so far
+    /// and the extended highest sequence number at the last report.
+    #[cfg(any(test, feature = "testing"))]
+    hook_lost: Vec<(u32, i64, u32)>,
+}
+
+/// Test-only RTCP stimuli for a sender's rate control (A3.10). Sapflow
+/// never claims loss it did not see, and never sends REMB; a build with
+/// the `testing` feature can, from `after` past
+/// [`Receiver::set_feedback_hooks`] on the receiver's clock.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FeedbackHooks {
+    /// Every report block claims this fraction lost (in 256ths) in place
+    /// of what was measured, and its cumulative loss grows to match.
+    pub loss: Option<u8>,
+    /// Every datagram with a report also carries a REMB of this many bits
+    /// a second, for every stream with a known SSRC.
+    pub remb: Option<u64>,
+    /// How long after the hooks are set they start.
+    pub after: Duration,
 }
 
 fn micros(d: Duration) -> u64 {
@@ -717,7 +741,69 @@ impl Receiver {
             report_next: None,
             report_due: false,
             stashed_srs: Vec::new(),
+            #[cfg(any(test, feature = "testing"))]
+            hooks: None,
+            #[cfg(any(test, feature = "testing"))]
+            hook_lost: Vec::new(),
         }
+    }
+
+    /// Test builds only: sets the A3.10 stimuli ([`FeedbackHooks`]),
+    /// counting their delay from now.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_feedback_hooks(&mut self, hooks: FeedbackHooks) {
+        self.hooks = Some((hooks, self.now));
+    }
+
+    /// The hooks, once their delay has passed.
+    #[cfg(any(test, feature = "testing"))]
+    fn active_hooks(&self) -> Option<FeedbackHooks> {
+        let (h, set) = self.hooks?;
+        (self.now >= set.saturating_add(micros(h.after))).then_some(h)
+    }
+
+    /// Test builds only: report blocks claim the hooks' loss once their
+    /// delay has passed. Every report before that still notes each
+    /// stream's highest sequence number, so the first claim covers one
+    /// interval.
+    #[cfg(any(test, feature = "testing"))]
+    fn hook_report_blocks(&mut self, blocks: &mut [ReportBlock]) {
+        let Some((hooks, _)) = self.hooks else {
+            return;
+        };
+        let active = self.active_hooks().is_some();
+        for b in blocks.iter_mut() {
+            let at = match self.hook_lost.iter().position(|e| e.0 == b.ssrc) {
+                Some(at) => at,
+                None => {
+                    self.hook_lost.push((b.ssrc, 0, b.highest_sequence));
+                    self.hook_lost.len() - 1
+                }
+            };
+            let Some(entry) = self.hook_lost.get_mut(at) else {
+                continue;
+            };
+            let expected = b.highest_sequence.wrapping_sub(entry.2);
+            entry.2 = b.highest_sequence;
+            let Some(fraction) = hooks.loss.filter(|_| active) else {
+                continue;
+            };
+            entry.1 += i64::from(expected) * i64::from(fraction) / 256;
+            b.fraction_lost = fraction;
+            b.cumulative_lost = (i64::from(b.cumulative_lost) + entry.1)
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                as i32;
+        }
+    }
+
+    /// Test builds only: the hooks' REMB, after a report.
+    #[cfg(any(test, feature = "testing"))]
+    fn hook_remb(&self, out: &mut Vec<u8>, sender_ssrc: u32) {
+        let Some(bitrate) = self.active_hooks().and_then(|h| h.remb) else {
+            return;
+        };
+        let ssrcs: Vec<u32> = self.streams.iter().filter_map(|s| s.ssrc).collect();
+        let _ = build::remb(out, sender_ssrc, bitrate, &ssrcs);
     }
 
     /// Adds a stream from the SDP answer.
@@ -1198,14 +1284,21 @@ impl Receiver {
         let start = out.len();
         let report = std::mem::take(&mut self.report_due);
         if report || !self.config.reports.reduced_size {
-            let blocks = if report {
+            #[allow(unused_mut)]
+            let mut blocks = if report {
                 self.take_report_blocks()
             } else {
                 Vec::new()
             };
+            #[cfg(any(test, feature = "testing"))]
+            self.hook_report_blocks(&mut blocks);
             build::receiver_report(out, sender_ssrc, &blocks);
             // A refused CNAME appends nothing.
             let _ = build::sdes_cname(out, sender_ssrc, cname);
+            #[cfg(any(test, feature = "testing"))]
+            if report {
+                self.hook_remb(out, sender_ssrc);
+            }
         }
         let max = self.config.reports.max_datagram;
         let mut items = 0usize;

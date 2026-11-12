@@ -144,6 +144,46 @@ pub fn pli(out: &mut Vec<u8>, sender_ssrc: u32, media_ssrc: u32) {
     out.extend_from_slice(&media_ssrc.to_be_bytes());
 }
 
+/// Appends a receiver estimated maximum bitrate message (REMB,
+/// draft-alvestrand-rmcat-remb-03 section 2.2): a payload-specific
+/// feedback packet with FMT 15 and a media source of 0, the identifier
+/// "REMB", the number of SSRCs, the bitrate as a 6-bit exponent and an
+/// 18-bit mantissa (rounded down), and the SSRCs it applies to. Sapflow
+/// does not send REMB; this is for the A3.10 test hooks only.
+#[cfg(any(test, feature = "testing"))]
+pub fn remb(
+    out: &mut Vec<u8>,
+    sender_ssrc: u32,
+    bitrate: u64,
+    ssrcs: &[u32],
+) -> Result<(), BuildError> {
+    if ssrcs.is_empty() {
+        return Err(BuildError::Empty);
+    }
+    let count = u8::try_from(ssrcs.len()).map_err(|_| BuildError::TooLarge)?;
+    let (mut mantissa, mut exponent) = (bitrate, 0u32);
+    while mantissa > 0x3_ffff {
+        mantissa >>= 1;
+        exponent += 1;
+    }
+    // A u64 needs at most 46 shifts, inside the 6-bit field.
+    header(out, FMT_REMB, PT_PSFB, 16 + 4 * ssrcs.len());
+    out.extend_from_slice(&sender_ssrc.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(b"REMB");
+    out.push(count);
+    let br = (exponent << 18) | mantissa as u32;
+    out.extend_from_slice(&br.to_be_bytes()[1..]);
+    for ssrc in ssrcs {
+        out.extend_from_slice(&ssrc.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// The REMB FMT (draft-alvestrand-rmcat-remb-03 section 2.2).
+#[cfg(any(test, feature = "testing"))]
+const FMT_REMB: u8 = 15;
+
 /// Appends a full intra request (RFC 5104 section 4.3.1) with one entry
 /// per `(media SSRC, command sequence number)`. The media source field is
 /// 0, as RFC 5104 requires; the sender increments the sequence number for
@@ -236,6 +276,35 @@ impl<'v> CompoundBuilder<'v> {
 mod tests {
     use super::super::{Compound, Packet};
     use super::*;
+
+    /// REMB (draft-alvestrand-rmcat-remb-03): the bitrate as an 18-bit
+    /// mantissa and 6-bit exponent, rounded down, and the SSRC list.
+    #[test]
+    fn remb_layout() {
+        let mut out = Vec::new();
+        remb(&mut out, 0xfeed, 2_500_000, &[7, 8]).expect("built");
+        assert_eq!(out.len(), 28);
+        assert_eq!(&out[..4], &[0x8f, PT_PSFB, 0, 6]);
+        assert_eq!(&out[4..8], &0xfeedu32.to_be_bytes());
+        assert_eq!(&out[8..16], b"\0\0\0\0REMB");
+        assert_eq!(out[16], 2);
+        let br = u32::from_be_bytes([0, out[17], out[18], out[19]]);
+        let (mantissa, exponent) = (br & 0x3_ffff, br >> 18);
+        assert!(mantissa <= 0x3_ffff && mantissa > 0x1_ffff, "normalised");
+        let sent = u64::from(mantissa) << exponent;
+        assert!(
+            sent <= 2_500_000 && 2_500_000 - sent < 1 << exponent,
+            "{sent}"
+        );
+        assert_eq!(&out[20..], &[0, 0, 0, 7, 0, 0, 0, 8]);
+        let c = Compound::parse(&out).expect("parses");
+        assert!(matches!(c.packets().next(), Some(Ok(Packet::Other(_)))));
+        assert_eq!(remb(&mut out, 1, 1, &[]), Err(BuildError::Empty));
+        // Small values need no exponent.
+        let mut out = Vec::new();
+        remb(&mut out, 1, 1000, &[1]).expect("built");
+        assert_eq!(&out[17..20], &[0, 0x03, 0xe8]);
+    }
 
     #[test]
     fn nack_coalescing() {
