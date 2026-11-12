@@ -171,6 +171,10 @@ pub struct Router {
     out: VecDeque<Transmit>,
     events: VecDeque<(SessionId, Event)>,
     stats: RouterStats,
+    /// Test builds only: whether sessions get their panic hooks turned on
+    /// ([`Router::enable_panic_hooks`]).
+    #[cfg(any(test, feature = "test-panic"))]
+    panic_hooks: bool,
 }
 
 impl Router {
@@ -185,7 +189,20 @@ impl Router {
             out: VecDeque::new(),
             events: VecDeque::new(),
             stats: RouterStats::default(),
+            #[cfg(any(test, feature = "test-panic"))]
+            panic_hooks: false,
         })
+    }
+
+    /// Test builds only: turns the panic hooks on for every session here
+    /// now and every one inserted later ([`Session::enable_panic_hooks`]).
+    /// Off, as every router starts, the hooks do nothing.
+    #[cfg(any(test, feature = "test-panic"))]
+    pub fn enable_panic_hooks(&mut self) {
+        self.panic_hooks = true;
+        for e in self.sessions.values_mut() {
+            e.session.enable_panic_hooks();
+        }
     }
 
     /// Live sessions.
@@ -223,6 +240,14 @@ impl Router {
 
     /// Adds a session. Its ufrag must be unique among live sessions.
     pub fn insert(&mut self, id: SessionId, session: Session) -> Result<(), InsertError> {
+        #[cfg(any(test, feature = "test-panic"))]
+        let session = {
+            let mut session = session;
+            if self.panic_hooks {
+                session.enable_panic_hooks();
+            }
+            session
+        };
         if self.sessions.len() >= self.config.max_sessions {
             return Err(InsertError::Full);
         }

@@ -99,6 +99,17 @@ async fn start_with(
     tweak: impl FnOnce(&mut SessionConfig),
     callbacks: Option<Callbacks>,
 ) -> Server {
+    serve_test(env, tweak, callbacks, false).await
+}
+
+/// As [`start_with`]; with `hooks`, the panic hooks are on (A3.4), as only
+/// tests turn them on.
+async fn serve_test(
+    env: &[(&str, &str)],
+    tweak: impl FnOnce(&mut SessionConfig),
+    callbacks: Option<Callbacks>,
+    hooks: bool,
+) -> Server {
     let mut app = app(env);
     if let Some(callbacks) = callbacks {
         Arc::get_mut(&mut app).expect("unshared").callbacks = callbacks;
@@ -115,8 +126,12 @@ async fn start_with(
     let config = app.config.whip.clone().expect("WHIP on");
     let mut session = session_config(&config);
     tweak(&mut session);
-    let (whip, router, rx) =
+    let (whip, mut router, rx) =
         prepare_with(&app, server_identity(), config, session).expect("router");
+    if hooks {
+        router.enable_panic_hooks();
+        whip.panic_hooks.store(true, Ordering::Relaxed);
+    }
     tokio::spawn(run(app.clone(), whip.clone(), router, rx, sockets));
     Server {
         app,
@@ -590,6 +605,11 @@ async fn audio_run(
 }
 
 async fn udp_server() -> (Server, PathBuf) {
+    udp_server_with(false).await
+}
+
+/// As [`udp_server`], with the panic hooks on if `hooks`.
+async fn udp_server_with(hooks: bool) -> (Server, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target")
         .join(format!(
@@ -599,11 +619,11 @@ async fn udp_server() -> (Server, PathBuf) {
         ));
     std::fs::create_dir_all(&root).expect("owned scratch");
     let dir = root.to_str().expect("utf-8 path").to_owned();
-    let server = start(&[
-        ("SAPFLOW_RECORDINGS", &dir),
+    let env = [
+        ("SAPFLOW_RECORDINGS", dir.as_str()),
         ("SAPFLOW_RECORD_MIN_FREE_GB", "0"),
-    ])
-    .await;
+    ];
+    let server = serve_test(&env, |_| {}, None, hooks).await;
     (server, root)
 }
 
@@ -801,6 +821,7 @@ fn video_only(offer: &str) -> String {
 const AUDIO_ONLY: Setup = Setup {
     video: false,
     audio: true,
+    panic_hooks: false,
 };
 
 /// What a recording says after a session's events: through a `Feed`, as
@@ -1033,6 +1054,7 @@ fn dropped_for_room() -> Run {
 const VIDEO_ONLY: Setup = Setup {
     video: true,
     audio: false,
+    panic_hooks: false,
 };
 
 /// Each path marks the recording through the server, and the muxer alone,
@@ -1551,7 +1573,7 @@ fn marks(counts: &LossCounts) -> u64 {
 /// listener's entries for it, for a new publisher; B loses nothing, and
 /// its playlist keeps growing after A has gone.
 async fn panic_isolation(seed: u8, fault: Fault) {
-    let (server, root) = udp_server().await;
+    let (server, root) = udp_server_with(true).await;
     let (a_event, b_event) = (
         format!("event-panic-a{seed}"),
         format!("event-panic-b{seed}"),
@@ -1678,6 +1700,60 @@ async fn a_panic_in_the_feed_ends_only_that_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_panic_in_the_ingest_ends_only_that_session() {
     panic_isolation(55, Fault::Audio(injected::INGEST_PANIC)).await;
+}
+
+/// A3.4's hooks with the switch off, as the server always runs: the panic
+/// datagram, every armed read, both payloads and a supersede `POST` reach
+/// a live session, and nothing panics. A build of the test targets
+/// compiles the hooks into the server binary too, which never turns them
+/// on, so this is that binary's case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_panic_hooks_do_nothing_unless_a_test_turns_them_on() {
+    let (server, root) = udp_server_with(false).await;
+    let event = "event-panic-off";
+    let (mut a, location) = live(&server, 57, event).await;
+    let id = session_id(&location);
+    let counts = server
+        .whip
+        .resources()
+        .get(&id)
+        .map(|r| r.losses.clone())
+        .expect("A is live");
+    let stream = server.app.streams.get(event).expect("live");
+    let mut faults = vec![sapflow_whip::testing::PANIC_DATAGRAM.to_vec()];
+    for read in [
+        Read::PollTimeout,
+        Read::MediaFrom,
+        Read::LastMedia,
+        Read::Receiver,
+        Read::Stats,
+    ] {
+        faults.push(arm(read));
+    }
+    for d in faults {
+        a.send(&d).await;
+    }
+    for payload in [injected::FEED_PANIC, injected::INGEST_PANIC] {
+        let d = a.p.audio_payload(payload.to_vec());
+        a.send(&d).await;
+    }
+    a.publish(1).await;
+    // Supersede reads the session's last media: A is live, so 409.
+    let mut c = Phone::new(157, &server).await;
+    assert_eq!(admit(&server, &mut c, event).await.status, 409);
+    let before = stream.version();
+    a.publish(1).await;
+    assert!(stream.version() > before, "A's playlist keeps growing");
+    assert_eq!(
+        server.whip.ends.get("panicked"),
+        0,
+        "{:?}",
+        server.whip.ends
+    );
+    assert!(server.whip.resources().get(&id).is_some(), "A is live");
+    assert_eq!(counts.panics.load(Ordering::Relaxed), 0, "{counts}");
+    assert_eq!(counts.abnormal_ends.load(Ordering::Relaxed), 0, "{counts}");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

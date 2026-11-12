@@ -21,6 +21,13 @@ fn router() -> Router {
     Router::new(RouterConfig::default()).expect("defaults")
 }
 
+/// A router whose sessions have their panic hooks on.
+fn hooked() -> Router {
+    let mut r = router();
+    r.enable_panic_hooks();
+    r
+}
+
 /// A publisher with its session in the router.
 fn join(r: &mut Router, seed: u8, t0: Instant) -> Side {
     let mut p = Publisher::new(seed, &[GCM]);
@@ -462,7 +469,7 @@ fn an_ended_session_is_removed_after_its_last_event() {
 #[test]
 fn a_panicking_session_is_dropped_and_the_others_go_on() {
     let t0 = Instant::now();
-    let mut r = router();
+    let mut r = hooked();
     let mut y = join(&mut r, 24, t0);
     let mut x = join(&mut r, 25, t0);
     connect(&mut r, t0, &mut y);
@@ -503,7 +510,7 @@ fn ended_panicked(events: &[(SessionId, Event)], id: SessionId) -> bool {
 #[test]
 fn a_session_whose_deadline_panics_is_dropped_and_the_others_go_on() {
     let t0 = Instant::now();
-    let mut r = router();
+    let mut r = hooked();
     let mut y = join(&mut r, 26, t0);
     let mut x = join(&mut r, 27, t0);
     connect(&mut r, t0, &mut y);
@@ -549,7 +556,7 @@ fn a_session_whose_deadline_panics_is_dropped_and_the_others_go_on() {
 #[test]
 fn a_tuple_owner_whose_read_panics_is_dropped_at_another_sessions_check() {
     let t0 = Instant::now();
-    let mut r = router();
+    let mut r = hooked();
     let mut y = join(&mut r, 29, t0);
     let mut x = join(&mut r, 30, t0);
     connect(&mut r, t0, &mut y);
@@ -576,7 +583,7 @@ fn a_tuple_owner_whose_read_panics_is_dropped_at_another_sessions_check() {
 #[test]
 fn a_session_whose_inspected_read_panics_is_dropped() {
     let t0 = Instant::now();
-    let mut r = router();
+    let mut r = hooked();
     let mut y = join(&mut r, 31, t0);
     let mut x = join(&mut r, 32, t0);
     connect(&mut r, t0, &mut y);
@@ -590,4 +597,49 @@ fn a_session_whose_inspected_read_panics_is_dropped() {
     assert!(r.session(&y.id).is_none());
     assert_eq!(r.inspect(&x.id, |s| s.receiver().is_some()), Some(true));
     assert_eq!(r.stats().panics, 1);
+}
+
+/// With the hooks off, as every router starts, the panic datagram and the
+/// armed reads do nothing: the session takes them as unknown datagrams and
+/// goes on, through every read the guards cover.
+#[test]
+fn the_panic_hooks_do_nothing_unless_a_test_turns_them_on() {
+    let t0 = Instant::now();
+    let mut r = router();
+    let mut y = join(&mut r, 33, t0);
+    let mut x = join(&mut r, 34, t0);
+    connect(&mut r, t0, &mut y);
+    connect(&mut r, t0, &mut x);
+    let ty = y.p.tuple;
+    let now = talk(&mut r, &mut y, t0, 10);
+    let reads = [
+        Read::PollTimeout,
+        Read::MediaFrom,
+        Read::LastMedia,
+        Read::Receiver,
+        Read::Stats,
+    ];
+    assert_eq!(r.handle_datagram(now, ty, PANIC_DATAGRAM), Some(y.id));
+    for read in reads {
+        assert_eq!(r.handle_datagram(now, ty, &arm(read)), Some(y.id));
+    }
+    r.poll_timeout();
+    r.handle_timeout(now);
+    assert!(
+        r.inspect(&y.id, |s| (
+            s.receiver().is_some(),
+            s.stats(),
+            s.last_media()
+        ))
+        .is_some()
+    );
+    // A check for X from Y's tuple reads Y's state, `media_from` included.
+    assert_eq!(r.handle_datagram(now, ty, &x.p.check(false)), Some(x.id));
+    let events: Vec<(SessionId, Event)> = std::iter::from_fn(|| r.poll_event()).collect();
+    assert!(!ended_panicked(&events, y.id), "{events:?}");
+    assert_eq!(r.stats().panics, 0);
+    assert_eq!(state(&r, &y), Some(State::Connected));
+    let before = srtp(&r, &y);
+    talk(&mut r, &mut y, now, 10);
+    assert_eq!(srtp(&r, &y), before + 10, "Y's media goes on");
 }

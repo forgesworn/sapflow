@@ -458,6 +458,10 @@ pub struct Session {
     cname: Vec<u8>,
     stats: SessionStats,
     scratch: Vec<u8>,
+    /// Test builds only: whether a test has turned this session's panic
+    /// hooks on ([`Session::enable_panic_hooks`]). Off, they do nothing.
+    #[cfg(any(test, feature = "test-panic"))]
+    panic_hooks: bool,
     /// Test builds only: the read a datagram from `testing::arm` has made
     /// panic.
     #[cfg(any(test, feature = "test-panic"))]
@@ -568,8 +572,21 @@ impl Session {
             stats: SessionStats::default(),
             scratch: Vec::with_capacity(1500),
             #[cfg(any(test, feature = "test-panic"))]
+            panic_hooks: false,
+            #[cfg(any(test, feature = "test-panic"))]
             armed: None,
         })
+    }
+
+    /// Test builds only: turns this session's panic hooks on
+    /// ([`crate::testing::PANIC_DATAGRAM`], [`crate::testing::arm`]). The
+    /// `test-panic` feature compiles the hooks in, and a build of the
+    /// server's test targets unifies it into every build made with them;
+    /// until a test calls this (or [`crate::router::Router::enable_panic_hooks`]),
+    /// the hooks do nothing. The server never calls it.
+    #[cfg(any(test, feature = "test-panic"))]
+    pub fn enable_panic_hooks(&mut self) {
+        self.panic_hooks = true;
     }
 
     /// Where the session stands.
@@ -697,7 +714,7 @@ impl Session {
     /// Test builds only: panics if `read` is the one armed.
     #[cfg(any(test, feature = "test-panic"))]
     fn trip(&self, read: crate::testing::Read) {
-        if self.armed == Some(read) {
+        if self.panic_hooks && self.armed == Some(read) {
             crate::testing::injected_panic();
         }
     }
@@ -773,11 +790,12 @@ impl Session {
 
     /// One datagram (or RFC 4571 frame) from `tuple`.
     pub fn handle_datagram(&mut self, now: Instant, tuple: Tuple, bytes: &[u8]) {
-        // Test builds only, never the fuzz targets': a datagram that makes
-        // this call panic, for the router's and the server's panic
+        // Test builds only, never the fuzz targets', and only once a test
+        // has turned the hooks on: a datagram that makes this call panic,
+        // or arms a read to, for the router's and the server's panic
         // isolation tests.
         #[cfg(any(test, feature = "test-panic"))]
-        {
+        if self.panic_hooks {
             if bytes == crate::testing::PANIC_DATAGRAM {
                 crate::testing::injected_panic();
             }

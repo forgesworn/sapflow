@@ -87,8 +87,11 @@ pub fn synthetic_offer(fingerprint: &Fingerprint, ufrag: &str) -> String {
     )
 }
 
-/// A datagram that makes a session panic in builds with the `test-panic`
-/// feature (and this crate's own tests), for panic isolation tests. Its first byte reads as none of STUN, DTLS, RTP or
+/// A datagram that makes a session panic, for panic isolation tests: in
+/// builds with the `test-panic` feature (and this crate's own tests), and
+/// only in a session whose hooks a test has turned on
+/// ([`crate::router::Router::enable_panic_hooks`]); anywhere else it is an
+/// unknown datagram. Its first byte reads as none of STUN, DTLS, RTP or
 /// RTCP, so the router sends it to the owner of the tuple it came from.
 pub const PANIC_DATAGRAM: &[u8] = b"\xffsapflow-whip test: panic here";
 
@@ -126,10 +129,10 @@ const READS: [(Read, &[u8]); 5] = [
     (Read::Stats, b"stats"),
 ];
 
-/// A datagram that, in builds with the `test-panic` feature (and this
-/// crate's own tests), arms the session it reaches so that its next
-/// `read` panics. Like [`PANIC_DATAGRAM`], it reads as none of STUN, DTLS,
-/// RTP or RTCP, so it goes to the owner of the tuple it came from.
+/// A datagram that arms the session it reaches so that its next `read`
+/// panics, under the same conditions as [`PANIC_DATAGRAM`]. Like it, it
+/// reads as none of STUN, DTLS, RTP or RTCP, so it goes to the owner of the
+/// tuple it came from.
 pub fn arm(read: Read) -> Vec<u8> {
     let name = READS
         .iter()

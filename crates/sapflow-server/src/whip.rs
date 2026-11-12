@@ -259,6 +259,9 @@ pub(crate) struct Feed {
     counts: Arc<LossCounts>,
     /// The audio timeline's counters as the current event was taken.
     timeline: Timeline,
+    /// Test builds only: whether its panic hook is on ([`injected`]).
+    #[cfg(test)]
+    panic_hooks: bool,
 }
 
 /// The ingest task has gone.
@@ -281,6 +284,8 @@ impl Feed {
             keyframe: false,
             counts: Arc::new(LossCounts::default()),
             timeline: Timeline::default(),
+            #[cfg(test)]
+            panic_hooks: false,
         }
     }
 
@@ -377,11 +382,7 @@ impl Feed {
     /// Queues one media item for the ingest task.
     pub(crate) fn push(&mut self, media: Media) -> Result<(), Gone> {
         #[cfg(test)]
-        if let Media::Audio { packet, .. } = &media
-            && packet.as_slice() == injected::FEED_PANIC
-        {
-            panic!("a test asked this feed to panic");
-        }
+        injected::feed(self.panic_hooks, &media);
         let item = match media {
             Media::Video { pts, au } => {
                 if self.skip_video && !au.idr {
@@ -678,6 +679,10 @@ pub(crate) struct Whip {
     paths: Mutex<HashMap<String, SessionId>>,
     /// How sessions have ended.
     ends: EndCounts,
+    /// Test builds only: whether a test has turned the feed's and the
+    /// ingest's panic hooks on ([`injected`]). The server never does.
+    #[cfg(test)]
+    panic_hooks: std::sync::atomic::AtomicBool,
 }
 
 impl Whip {
@@ -782,6 +787,8 @@ fn prepare_with(
         resources: Mutex::new(HashMap::new()),
         paths: Mutex::new(HashMap::new()),
         ends: EndCounts::default(),
+        #[cfg(test)]
+        panic_hooks: std::sync::atomic::AtomicBool::new(false),
     });
     Ok((whip, router, rx))
 }
@@ -1478,6 +1485,8 @@ async fn publish(
     let setup = Setup {
         video: negotiated.video.is_some(),
         audio: negotiated.audio.is_some(),
+        #[cfg(test)]
+        panic_hooks: whip.panic_hooks.load(Ordering::Relaxed),
     };
     let session = Session::new(
         whip.session.clone(),
@@ -1492,6 +1501,11 @@ async fn publish(
     let (tx, rx) = mpsc::channel(QUEUE);
     let (released_tx, released) = watch::channel(false);
     let feed = Feed::new(tx, publication.loss_notice());
+    #[cfg(test)]
+    let feed = Feed {
+        panic_hooks: setup.panic_hooks,
+        ..feed
+    };
     let (queued, counts) = (feed.queued(), feed.counts());
     whip.resources().insert(
         id,
@@ -1536,6 +1550,10 @@ async fn publish(
 struct Setup {
     video: bool,
     audio: bool,
+    /// Test builds only: whether the ingest's panic hook is on
+    /// ([`injected`]).
+    #[cfg(test)]
+    panic_hooks: bool,
 }
 
 /// Configures the ingest for the negotiated tracks: stereo Opus (the
@@ -1558,12 +1576,6 @@ fn configure(source: &mut Source, setup: Setup, now: SystemTime) -> Result<Updat
 }
 
 fn feed_item(source: &mut Source, item: Item, now: SystemTime) -> Result<Update, IngestError> {
-    #[cfg(test)]
-    if let Item::Audio { packet, .. } = &item
-        && packet.as_slice() == injected::INGEST_PANIC
-    {
-        panic!("a test asked this ingest to panic");
-    }
     let Source::Es(es) = source else {
         return Err(IngestError::TrackConflict);
     };
@@ -1692,6 +1704,8 @@ fn take(
     let audio = item.audio_trace();
     let mut broke = false;
     let pushed = publication.push(|source, now| {
+        #[cfg(test)]
+        injected::ingest(setup, &item);
         let update = match item {
             Item::Reanchor => reanchor(source, setup, now)?,
             item => feed_item(source, item, now)?,
@@ -1719,12 +1733,36 @@ fn take(
 
 /// Test builds only: Opus payloads that make the UDP owner's feed, or the
 /// ingest inside the publication (with the stream's locks held), panic,
-/// for the A3.4 tests. Each starts with a 20 ms stereo CELT TOC byte, so
-/// the receiver passes it on as audio.
+/// for the A3.4 tests, once a test has turned the hooks on
+/// (`Whip::panic_hooks`, which sessions take as they are made). Each
+/// starts with a 20 ms stereo CELT TOC byte, so the receiver passes it on
+/// as audio; with the hooks off it is only audio.
 #[cfg(test)]
 pub(crate) mod injected {
+    use super::{Item, Media, Setup};
+
     pub(crate) const FEED_PANIC: &[u8] = b"\xfcsapflow test: panic in the feed";
     pub(crate) const INGEST_PANIC: &[u8] = b"\xfcsapflow test: panic in the ingest";
+
+    /// In the feed, before the item is made.
+    pub(super) fn feed(on: bool, media: &Media) {
+        if on
+            && let Media::Audio { packet, .. } = media
+            && packet.as_slice() == FEED_PANIC
+        {
+            panic!("a test asked this feed to panic");
+        }
+    }
+
+    /// In the ingest, inside the publication.
+    pub(super) fn ingest(setup: Setup, item: &Item) {
+        if setup.panic_hooks
+            && let Item::Audio { packet, .. } = item
+            && packet.as_slice() == INGEST_PANIC
+        {
+            panic!("a test asked this ingest to panic");
+        }
+    }
 }
 
 #[cfg(test)]
