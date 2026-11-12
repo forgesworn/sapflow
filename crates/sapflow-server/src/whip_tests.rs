@@ -2217,6 +2217,58 @@ async fn pending_sessions_are_capped_in_total_and_per_address() {
     assert_eq!(send(server.http, &post_as(5, b)).await.status, 201);
 }
 
+/// The per-address caps count an IPv6 host by its /64 and an IPv4 address
+/// whole: a second address in the same /64 shares the first's places, one
+/// in another /64 or another IPv4 address does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_per_address_caps_count_ipv6_by_its_64() {
+    let server = start_limited_with(
+        &[("SAPFLOW_WHIP_TRUSTED_PROXY", "127.0.0.1")],
+        Limits {
+            pending_per_address: 2,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let offer = Publisher::new(64, &[GCM]).offer();
+    let mut n = 0u8;
+    let mut post_as = |ip: &str| {
+        n += 1;
+        forwarded_post(&format!("/whip/live/event-six-{n}"), ip, &offer)
+    };
+    for ip in ["2001:db8:1::1", "2001:db8:1::2"] {
+        assert_eq!(send(server.http, &post_as(ip)).await.status, 201, "{ip}");
+    }
+    let refused = send(server.http, &post_as("2001:db8:1:0:ffff::3")).await;
+    assert_eq!(refused.status, 503, "the same /64: {}", refused.body);
+    assert_eq!(
+        send(server.http, &post_as("2001:db8:2::1")).await.status,
+        201
+    );
+    for ip in ["198.51.100.1", "198.51.100.1"] {
+        assert_eq!(send(server.http, &post_as(ip)).await.status, 201, "{ip}");
+    }
+    assert_eq!(
+        send(server.http, &post_as("198.51.100.2")).await.status,
+        201
+    );
+}
+
+/// The signalling slots are keyed the same way.
+#[test]
+fn address_keys_are_an_ipv4_address_or_an_ipv6_64() {
+    let key = |s: &str| address_key(s.parse().expect("address"));
+    assert_eq!(key("2001:db8:1::1"), key("2001:db8:1:0:ffff::3"));
+    assert_ne!(key("2001:db8:1::1"), key("2001:db8:2::1"));
+    assert_ne!(key("198.51.100.1"), key("198.51.100.2"));
+    assert_eq!(key("::ffff:198.51.100.1"), key("198.51.100.1"));
+    let addresses = Addresses::default();
+    let first = AddressSlot::take(&addresses, key("2001:db8:1::1"), 1).expect("first");
+    assert!(AddressSlot::take(&addresses, key("2001:db8:1::9"), 1).is_none());
+    drop(first);
+    assert!(AddressSlot::take(&addresses, key("2001:db8:1::9"), 1).is_some());
+}
+
 /// A session that has connected no longer counts as pending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connected_session_no_longer_counts_as_pending() {

@@ -138,6 +138,7 @@ struct PendingSlot<'a> {
 
 impl<'a> PendingSlot<'a> {
     fn take(whip: &'a Whip, ip: IpAddr) -> Option<Self> {
+        let ip = address_key(ip);
         let mut pending = whip.pending();
         let here = pending.by_ip.get(&ip).copied().unwrap_or(0);
         if pending.total >= whip.limits.pending || here >= whip.limits.pending_per_address {
@@ -1350,7 +1351,8 @@ async fn listen(listener: TcpListener, app: Arc<App>, whip: Arc<Whip>) -> std::i
         let address = if whip.config.trusted_proxy.map(|p| p.to_canonical()) == Some(ip) {
             None
         } else {
-            let Some(address) = AddressSlot::take(&addresses, ip, limits.per_address) else {
+            let key = address_key(ip);
+            let Some(address) = AddressSlot::take(&addresses, key, limits.per_address) else {
                 whip.signalling.over_address.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
@@ -1364,8 +1366,23 @@ async fn listen(listener: TcpListener, app: Arc<App>, whip: Arc<Whip>) -> std::i
     }
 }
 
-/// Signalling connections open from each peer address.
+/// Signalling connections open from each peer address ([`address_key`]).
 type Addresses = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// What the WHIP per-address caps (signalling and pending sessions) count
+/// an address under: an IPv4 address whole, or an IPv6 address's /64. A
+/// host is usually given a whole /64 (RFC 4291's 64-bit interface IDs), so
+/// keying by the full address would let one host step past the caps by
+/// changing its interface ID.
+fn address_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
 
 /// One of an address's signalling slots, given back on drop, so a
 /// connection's task frees it however it ends.
