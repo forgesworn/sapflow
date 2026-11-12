@@ -1920,9 +1920,13 @@ Implementation notes (W3c part 2a, lifecycle):
 Implementation notes (W3c part 2b, limits, 12 November 2026):
 
 - **The signalling listener.** It holds at most 32 connections, and at
-  most 8 from one peer address, so a few addresses cannot hold every
-  slot. The trusted proxy is not limited, since every publisher behind
-  it shares its address. Past either, a connection is closed as it
+  most 8 from one peer address: one address holds at most a quarter of
+  the slots, so four addresses or more are needed to hold them all, and
+  each connection for at most 5 s and then its answer. The trusted proxy
+  is not limited, since every publisher behind it shares its address.
+  Behind a front proxy without `SAPFLOW_WHIP_TRUSTED_PROXY`, every
+  connection is from the proxy, so both per-address caps (8 signalling
+  connections, 4 pending sessions) fall on it. Past either, a connection is closed as it
   arrives. The head and the offer share one deadline, 5 s from the
   connection, so a slow client holds a slot for 5 s and then the time to
   send its answer; before, the head had 5 s and then the offer,
@@ -1938,9 +1942,11 @@ Implementation notes (W3c part 2b, limits, 12 November 2026):
   `X-Forwarded-For` address behind the trusted proxy). A `POST` past
   either gets `503`. The place is taken after admission and supersede,
   which may free one, and before the claim; a session gives it back when
-  it connects or ends. The two are half and a quarter of the default 16
-  publishers; neither is a setting, and neither follows
-  `SAPFLOW_MAX_PUBLISHERS`, which still caps sessions in all.
+  it connects or ends, and one that never reached the router (a
+  cancelled `POST`) gives it back as its ingest task ends. The two are
+  half and a quarter of the default 16 publishers; neither is a setting,
+  and neither follows `SAPFLOW_MAX_PUBLISHERS`, which still caps sessions
+  in all.
 - **The deadline index.** The router read every session's deadline for
   each datagram, to find the next one and what was due. A session's
   deadline changes only in its own calls, so the router now reads it as

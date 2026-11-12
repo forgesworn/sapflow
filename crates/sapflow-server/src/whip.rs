@@ -78,9 +78,9 @@ const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct Limits {
     /// Signalling connections at once; more are closed as they arrive.
     pub connections: usize,
-    /// Of those, from one peer address, so a few addresses cannot hold
-    /// every slot. The trusted proxy, which carries every publisher behind
-    /// it, is not limited.
+    /// Of those, from one peer address: one address holds at most this
+    /// share of the slots. The trusted proxy, which carries every publisher
+    /// behind it, is not limited.
     pub per_address: usize,
     /// From the connection, how long a client has to send its whole
     /// request, the head and the offer; a request still arriving then gets
@@ -1956,6 +1956,9 @@ async fn ingest(
         tracing::warn!("WHIP publication panicked as it ended");
     }
     whip.resources().remove(&id);
+    // A session that never reached the router (a cancelled `POST`) gives its
+    // pending place back here; one that did has already.
+    whip.settled(&id);
     {
         let mut paths = whip.paths();
         if paths.get(&event) == Some(&id) {

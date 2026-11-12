@@ -172,6 +172,18 @@ async fn start_limited_with(env: &[(&str, &str)], limits: Limits) -> Server {
     }
 }
 
+/// Whether `raw` is answered `200` within 5 s, trying again while the
+/// server has yet to free a slot (it does once it sees a client's close).
+async fn served_again(server: &Server, raw: &[u8]) -> bool {
+    for _ in 0..100 {
+        if send(server.http, raw).await.status == 200 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
 /// Whether the server closes `s` within `wait` without answering.
 async fn closed_unanswered(s: &mut TcpStream, wait: Duration) -> bool {
     let mut b = [0u8; 64];
@@ -1968,18 +1980,13 @@ async fn past_the_signalling_connection_cap_a_connection_is_closed() {
     assert!(closed_unanswered(&mut fourth, Duration::from_secs(2)).await);
     assert_eq!(server.whip.signalling.over_total.load(Ordering::Relaxed), 1);
     drop(idle.pop());
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let preflight = b"OPTIONS /whip/live/event-cap HTTP/1.1\r\nhost: whip.example\r\n\r\n";
-    assert_eq!(
-        send(server.http, preflight).await.status,
-        200,
-        "served again"
-    );
+    assert!(served_again(&server, preflight).await, "served again");
 }
 
 /// A3.7: one address holds at most `Limits::per_address` signalling
-/// connections, below the total, so a few addresses cannot hold every
-/// slot; its own next connection is closed at once.
+/// connections, below the total; its own next connection is closed at
+/// once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_address_holds_at_most_its_share_of_the_signalling_slots() {
     let server = start_limited(Limits {
@@ -2000,9 +2007,8 @@ async fn one_address_holds_at_most_its_share_of_the_signalling_slots() {
     );
     assert_eq!(server.whip.signalling.over_total.load(Ordering::Relaxed), 0);
     drop(idle);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let preflight = b"OPTIONS /whip/live/event-share HTTP/1.1\r\nhost: whip.example\r\n\r\n";
-    assert_eq!(send(server.http, preflight).await.status, 200, "freed");
+    assert!(served_again(&server, preflight).await, "freed");
 }
 
 /// A body still arriving at `Limits::client_time` from the connection is

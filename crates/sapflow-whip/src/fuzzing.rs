@@ -333,10 +333,15 @@ struct Oracle {
     /// The publisher's own checks, byte for byte: a datagram that is not
     /// one of these (or a copy of one) is unauthenticated.
     authentic: Vec<Vec<u8>>,
-    /// The transaction IDs the session remembers, as it does: the last
-    /// `max_transactions` of the requests it answered, each with the tuple
-    /// it first came from.
-    remembered: std::collections::VecDeque<([u8; 12], Tuple)>,
+    /// Transaction IDs of requests the session answered, each with the
+    /// tuple it first came from and how many authentic checks had been
+    /// delivered then. The session records at most one ID per authentic
+    /// check it is handed (it may record one whose answer the per-tuple
+    /// budget then drops), so an ID is surely still remembered while fewer
+    /// than `max_transactions` authentic checks have arrived since.
+    remembered: Vec<([u8; 12], Tuple, u64)>,
+    /// Authentic checks delivered so far.
+    authentic_delivered: u64,
     max_transactions: usize,
 }
 
@@ -402,13 +407,18 @@ impl Oracle {
             .flatten();
         // A re-sent check whose original it remembers, from another tuple:
         // nothing at all goes back to that tuple (A3.7).
+        let since = self.authentic_delivered;
+        let window = self.max_transactions as u64;
         let copy = id.and_then(|id| {
             self.remembered
                 .iter()
-                .find(|(seen, _)| *seen == id)
-                .filter(|(_, first)| *first != t)
+                .find(|(seen, _, _)| *seen == id)
+                .filter(|(_, first, at)| *first != t && since - at < window)
                 .map(|_| t)
         });
+        if authentic {
+            self.authentic_delivered += 1;
+        }
         let answered = self.drain(s, Some((t, d.len(), authentic)), replies, home);
         if let Some(copier) = copy {
             assert!(
@@ -418,12 +428,12 @@ impl Oracle {
         }
         if let Some(id) = id
             && answered.contains(&t)
-            && !self.remembered.iter().any(|(seen, _)| *seen == id)
+            && !self.remembered.iter().any(|(seen, _, _)| *seen == id)
         {
-            if self.remembered.len() >= self.max_transactions {
-                self.remembered.pop_front();
-            }
-            self.remembered.push_back((id, t));
+            self.remembered.push((id, t, since));
+            // Only entries that can still be asserted on are kept.
+            let now = self.authentic_delivered;
+            self.remembered.retain(|(_, _, at)| now - at < window);
         }
     }
 
@@ -508,7 +518,8 @@ pub fn whip_session_run(data: &[u8]) -> Run {
         validations: 0,
         out: 0,
         authentic: Vec::new(),
-        remembered: std::collections::VecDeque::new(),
+        remembered: Vec::new(),
+        authentic_delivered: 0,
         max_transactions: 16,
     };
     let mut pending: Vec<Vec<u8>> = Vec::new();
