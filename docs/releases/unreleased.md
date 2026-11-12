@@ -140,6 +140,22 @@ Notes for the release after 0.2.0-rc.1.
   `SAPFLOW_TEST_WHIP_FEEDBACK` make WHIP sessions claim loss in their
   receiver reports or send REMB, for A3.10. Not for production use.
 
+## sapflow-client
+
+- The MPEG-TS muxer that the SRT publishers use writes each PES
+  continuation whose bytes lie in one piece straight into the output chunk,
+  instead of building a packet for the `mpeg2ts` writer; first packets,
+  tables, PCR packets and continuations across two pieces still go through
+  the writer. The bytes are unchanged (the same hash over 5.6 GB of four
+  benchmark workloads, and a test against the writer for every payload
+  length, PID, continuity counter and flag). On the M4, time per sample
+  fell to 0.76 of before for 320-byte AAC, 0.26 for 8.5 kB H.264 and 0.20
+  for a 512 KiB keyframe.
+- `MuxStats::packet_payload_copy_bytes` and `writer_payload_copy_bytes`,
+  exported by sapflow-ffi among the SRT diagnostics, now count only the
+  bytes that take the writer path, since the direct path does not copy
+  them through the dependency.
+
 ## sapflow-dtls
 
 - A connected server now refuses every renegotiation with one warning-level
