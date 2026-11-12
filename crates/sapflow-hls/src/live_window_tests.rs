@@ -298,3 +298,112 @@ fn audio_only_parts_after_an_av_epoch_keep_their_exemption() {
         }
     }
 }
+
+/// What the window held once the feed was past `warm`: the fewest and most
+/// entries and seconds listed, and the first rule either check broke.
+#[derive(Debug)]
+struct Steady {
+    entries: (usize, usize),
+    listed_secs: (f64, f64),
+    target: u64,
+    broken: Option<String>,
+}
+
+/// H.264 at 30 fps with a keyframe every `gop` frames, for `frames` frames,
+/// with a retention pool: `RuleCheck` on every render and `RetentionCheck`
+/// after every push.
+fn keyframes_every(cfg: MuxerConfig, gop: i64, frames: i64, warm: i64) -> Steady {
+    let pool = std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(
+        crate::muxer::RETENTION_POOL_BYTES,
+    ));
+    let mut m = Muxer::new(cfg, crate::muxer::tests::video(), None).with_retention_pool(pool);
+    let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
+    let mut steady = Steady {
+        entries: (usize::MAX, 0),
+        listed_secs: (f64::MAX, 0.0),
+        target: 0,
+        broken: None,
+    };
+    for i in 0..frames {
+        m.push_video(
+            i * 3000,
+            i * 3000,
+            i % gop == 0,
+            Bytes::from_static(&[1; 64]),
+            NOW,
+        )
+        .expect("video");
+        if let Err(e) = retention.check(&m) {
+            steady
+                .broken
+                .get_or_insert(format!("RetentionCheck at frame {i}: {e}"));
+        }
+        if !m.has_content() {
+            continue;
+        }
+        let pl = playlist::media(&m, "w");
+        if let Err(e) = rules.check(&pl) {
+            steady
+                .broken
+                .get_or_insert(format!("RuleCheck at frame {i}: {e}"));
+        }
+        if i >= warm {
+            let n = m.entries().len();
+            let secs = listed(&pl).1 as f64 / 100_000.0;
+            steady.entries = (steady.entries.0.min(n), steady.entries.1.max(n));
+            steady.listed_secs = (
+                steady.listed_secs.0.min(secs),
+                steady.listed_secs.1.max(secs),
+            );
+        }
+    }
+    steady.target = m.target_duration();
+    steady
+}
+
+fn timed(window: Option<u64>) -> MuxerConfig {
+    MuxerConfig {
+        window: window.map(std::time::Duration::from_secs),
+        ..MuxerConfig::default()
+    }
+}
+
+/// An 8 s keyframe interval: 24 segments would list 192 s. With a 48 s
+/// bound the window keeps seven entries, the fewest it may list (56 s, over
+/// three target durations), and both checks hold throughout.
+#[test]
+fn a_time_bound_holds_a_long_keyframe_interval_to_the_fewest_entries() {
+    let unbounded = keyframes_every(timed(None), 240, 30 * 600, 30 * 300);
+    assert_eq!(unbounded.entries, (24, 24), "{unbounded:?}");
+    let bounded = keyframes_every(timed(Some(48)), 240, 30 * 600, 30 * 300);
+    assert_eq!(bounded.broken, None);
+    assert_eq!(bounded.entries, (7, 7), "{bounded:?}");
+    assert!(
+        bounded.listed_secs.0 >= (3 * bounded.target) as f64 && bounded.listed_secs.0 >= 48.0,
+        "{bounded:?}"
+    );
+}
+
+/// 2 s segments with a 30 s bound: the window keeps the fewest segments
+/// that still last 30 s once the oldest goes, so it lists 30 s and less
+/// than one segment more.
+#[test]
+fn a_time_bound_above_the_entry_floor_keeps_its_length() {
+    let s = keyframes_every(timed(Some(30)), 60, 30 * 300, 30 * 120);
+    assert_eq!(s.broken, None);
+    assert_eq!(s.entries, (15, 15), "{s:?}");
+    assert!(s.listed_secs.0 >= 30.0 && s.listed_secs.1 < 32.0, "{s:?}");
+}
+
+/// v4v's settings (1 s keyframes, 24 segments) last 24 s, under a 48 s
+/// bound: the window is what it was without one.
+#[test]
+fn a_bound_longer_than_the_count_changes_nothing() {
+    let without = keyframes_every(timed(None), 30, 30 * 120, 30 * 60);
+    let with = keyframes_every(timed(Some(48)), 30, 30 * 120, 30 * 60);
+    assert_eq!(with.broken, None);
+    assert_eq!(with.entries, (24, 24), "{with:?}");
+    assert_eq!(with.entries, without.entries);
+    assert_eq!(with.listed_secs, without.listed_secs);
+}

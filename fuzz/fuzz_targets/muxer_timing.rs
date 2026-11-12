@@ -11,6 +11,9 @@
 //! `CUT1` drive codec changes on a clock that carries on
 //! (`Muxer::reconfigure_with_audio_at`) with audio running behind, so late
 //! audio after a cut is placed or dropped and counted against its epoch.
+//! Inputs starting `WIN1` and one byte run the video timing with a window
+//! bounded to that many seconds (`MuxerConfig::window`), so the time bound's
+//! removals meet the same rules.
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
@@ -568,6 +571,14 @@ fuzz_target!(|data: &[u8]| {
         continuing_cuts(records);
         return;
     }
+    let (data, window) = match data.strip_prefix(b"WIN1") {
+        Some([secs, rest @ ..]) => (
+            rest,
+            Some(std::time::Duration::from_secs(u64::from(*secs).max(1))),
+        ),
+        Some([]) => return,
+        None => (data, None),
+    };
     let Some(video) = H264Config::new(SPS, PPS) else {
         return;
     };
@@ -577,7 +588,11 @@ fuzz_target!(|data: &[u8]| {
         sample_rate: 48000,
         channels: 2,
     };
-    let mut m = Muxer::new(MuxerConfig::default(), video, Some(aac)).with_retention_pool(pool());
+    let cfg = MuxerConfig {
+        window,
+        ..MuxerConfig::default()
+    };
+    let mut m = Muxer::new(cfg, video, Some(aac)).with_retention_pool(pool());
     let (mut dts, mut audio) = (0i64, 0i64);
     let mut rules = playlist::RuleCheck::default();
     let mut retention = playlist::RetentionCheck::default();

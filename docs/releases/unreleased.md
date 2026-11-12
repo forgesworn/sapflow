@@ -94,6 +94,17 @@ Notes for the release after 0.2.0-rc.1.
   the edge steps back at such a run end; `RetentionCheck` now fails on a
   tag listed again.
 
+- `MuxerConfig::window` (new, default none) bounds the window by time as
+  well as by `segment_count`. Segment length follows the encoder's keyframe
+  interval, so 24 segments of a publisher sending a keyframe every 8 s held
+  192 s of media, and memory grew with bitrate times keyframe interval. With
+  a bound, the oldest segment goes while the rest still last at least the
+  bound, but the window never lists fewer than `LEADING_GAPS` (7) entries
+  or less than three target durations: an 8 s interval under a 48 s bound
+  keeps seven segments, 56 s. A window that `segment_count` already keeps
+  shorter is unchanged. `MuxerConfig` has public fields, so code that builds
+  one with a struct literal needs `..MuxerConfig::default()`.
+
 ## sapflow-rtp
 
 - The timeline's start hold (`TimelineConfig::start_hold`) now defaults to

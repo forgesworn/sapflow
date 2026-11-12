@@ -143,6 +143,15 @@ pub struct MuxerConfig {
     /// within [`MAX_RETAINED_PARTS`] parts, [`MAX_RETAINED_SEGMENTS`]
     /// segments and 64 MiB beyond the window.
     pub segment_count: usize,
+    /// The most media the window keeps, beside `segment_count`: while the
+    /// segments after the oldest still last at least this long, the oldest
+    /// goes. Segment length follows the encoder's keyframe interval, so
+    /// without it a long interval multiplies what `segment_count` segments
+    /// hold (24 segments of 8 s are 192 s of media). Never below
+    /// [`LEADING_GAPS`] entries, the fewest the window may list (iOS opens
+    /// with that many gaps), or three target durations (RFC 8216bis 6.2.2).
+    /// Default none: `segment_count` alone, as in 0.2.0-rc.1.
+    pub window: Option<Duration>,
 }
 
 impl Default for MuxerConfig {
@@ -151,6 +160,7 @@ impl Default for MuxerConfig {
             segment_min: Duration::from_secs(1),
             part_min: Duration::from_millis(200),
             segment_count: 24,
+            window: None,
         }
     }
 }
@@ -3259,32 +3269,23 @@ impl Muxer {
             if listed < floor && byte_capped && !entry_capped {
                 self.window_byte_capped = true;
             }
-            let removed = self.entries.pop_front();
-            self.media_sequence += 1;
-            if let Some(Entry::Segment(old)) = removed {
-                if old.discontinuity {
-                    self.discontinuity_sequence += 1;
+            self.remove_oldest_entry();
+        }
+        // The time bound: a removal it asks for stops at the floor, and at
+        // the fewest entries the window may list, whatever the caps.
+        if let Some(window) = self.cfg.window {
+            let keep = crate::playlist::extinf_units(window).max(floor);
+            while self.entries.len() > LEADING_GAPS as usize {
+                let rest: u64 = self
+                    .entries
+                    .iter()
+                    .skip(1)
+                    .map(|e| crate::playlist::extinf_units(e.duration()))
+                    .sum();
+                if rest < keep {
+                    break;
                 }
-                if let Some(i) = self.tagged.iter().position(|t| t.msn == old.id) {
-                    if self.retention_pool.is_some() {
-                        // It and its parts stay until RFC 8216bis 6.2.2 lets
-                        // them go (`retain_parts`). Their charges move to
-                        // the pool now, as main freed them now, so the live
-                        // budget never holds more than main's at any point.
-                        let t = &mut self.tagged[i];
-                        self.retained.0 += t.bytes;
-                        self.retained.1 += t.parts;
-                        self.retained.2 += 1;
-                        t.segment = Some(old);
-                        self.keep_in_pool();
-                    } else {
-                        // No retention: it goes with the window, as in rc.1.
-                        drop(old);
-                        let end = self.tagged[i].end_part;
-                        self.tagged.remove(i);
-                        self.free_parts_before(end);
-                    }
-                }
+                self.remove_oldest_entry();
             }
         }
         // The playlist now distributed lists every entry left: the longest
@@ -3398,6 +3399,38 @@ impl Muxer {
 
     fn next_segment_id(&self) -> u64 {
         self.media_sequence + self.entries.len() as u64
+    }
+
+    /// Removes the oldest window entry. A segment moves to the retention
+    /// pool if there is one, or goes with its parts.
+    fn remove_oldest_entry(&mut self) {
+        let removed = self.entries.pop_front();
+        self.media_sequence += 1;
+        if let Some(Entry::Segment(old)) = removed {
+            if old.discontinuity {
+                self.discontinuity_sequence += 1;
+            }
+            if let Some(i) = self.tagged.iter().position(|t| t.msn == old.id) {
+                if self.retention_pool.is_some() {
+                    // It and its parts stay until RFC 8216bis 6.2.2 lets
+                    // them go (`retain_parts`). Their charges move to
+                    // the pool now, as main freed them now, so the live
+                    // budget never holds more than main's at any point.
+                    let t = &mut self.tagged[i];
+                    self.retained.0 += t.bytes;
+                    self.retained.1 += t.parts;
+                    self.retained.2 += 1;
+                    t.segment = Some(old);
+                    self.keep_in_pool();
+                } else {
+                    // No retention: it goes with the window, as in rc.1.
+                    drop(old);
+                    let end = self.tagged[i].end_part;
+                    self.tagged.remove(i);
+                    self.free_parts_before(end);
+                }
+            }
+        }
     }
 
     /// True once the first segment exists: the stream is servable.
