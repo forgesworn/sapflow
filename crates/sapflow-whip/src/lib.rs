@@ -51,6 +51,8 @@ pub mod sdp;
 pub mod session;
 pub mod stun;
 #[cfg(test)]
+mod tcp_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(any(test, feature = "testing"))]
