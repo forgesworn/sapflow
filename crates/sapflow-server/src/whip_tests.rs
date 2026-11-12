@@ -141,6 +141,41 @@ async fn serve_test(
     }
 }
 
+/// A server whose signalling listener has `limits`.
+async fn start_limited(limits: Limits) -> Server {
+    let app = app(&[]);
+    let sockets = Sockets {
+        http: TcpListener::bind("127.0.0.1:0").await.expect("bind"),
+        udp: UdpSocket::bind("127.0.0.1:0").await.expect("bind"),
+        tcp: None,
+    };
+    let (http, udp) = (
+        sockets.http.local_addr().expect("addr"),
+        sockets.udp.local_addr().expect("addr"),
+    );
+    let config = app.config.whip.clone().expect("WHIP on");
+    let session = session_config(&config);
+    let (mut whip, router, rx) =
+        prepare_with(&app, server_identity(), config, session).expect("router");
+    Arc::get_mut(&mut whip).expect("unshared").limits = limits;
+    tokio::spawn(run(app.clone(), whip.clone(), router, rx, sockets));
+    Server {
+        app,
+        whip,
+        http,
+        udp,
+    }
+}
+
+/// Whether the server closes `s` within `wait` without answering.
+async fn closed_unanswered(s: &mut TcpStream, wait: Duration) -> bool {
+    let mut b = [0u8; 64];
+    matches!(
+        tokio::time::timeout(wait, s.read(&mut b)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
 struct Answer {
     status: u16,
     headers: Vec<(String, String)>,
@@ -1754,6 +1789,105 @@ async fn the_panic_hooks_do_nothing_unless_a_test_turns_them_on() {
     assert_eq!(counts.panics.load(Ordering::Relaxed), 0, "{counts}");
     assert_eq!(counts.abnormal_ends.load(Ordering::Relaxed), 0, "{counts}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A3.7: past `Limits::connections` signalling connections, a new one is
+/// closed at once; once one closes, the next is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_the_signalling_connection_cap_a_connection_is_closed() {
+    let server = start_limited(Limits {
+        connections: 3,
+        per_address: 10,
+        ..Limits::default()
+    })
+    .await;
+    let mut idle = Vec::new();
+    for _ in 0..3 {
+        idle.push(TcpStream::connect(server.http).await.expect("connect"));
+    }
+    let mut fourth = TcpStream::connect(server.http).await.expect("connect");
+    assert!(closed_unanswered(&mut fourth, Duration::from_secs(2)).await);
+    assert_eq!(server.whip.signalling.over_total.load(Ordering::Relaxed), 1);
+    drop(idle.pop());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let preflight = b"OPTIONS /whip/live/event-cap HTTP/1.1\r\nhost: whip.example\r\n\r\n";
+    assert_eq!(
+        send(server.http, preflight).await.status,
+        200,
+        "served again"
+    );
+}
+
+/// A3.7: one address holds at most `Limits::per_address` signalling
+/// connections, below the total, so a few addresses cannot hold every
+/// slot; its own next connection is closed at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_address_holds_at_most_its_share_of_the_signalling_slots() {
+    let server = start_limited(Limits {
+        connections: 8,
+        per_address: 2,
+        ..Limits::default()
+    })
+    .await;
+    let mut idle = Vec::new();
+    for _ in 0..2 {
+        idle.push(TcpStream::connect(server.http).await.expect("connect"));
+    }
+    let mut third = TcpStream::connect(server.http).await.expect("connect");
+    assert!(closed_unanswered(&mut third, Duration::from_secs(2)).await);
+    assert_eq!(
+        server.whip.signalling.over_address.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(server.whip.signalling.over_total.load(Ordering::Relaxed), 0);
+    drop(idle);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let preflight = b"OPTIONS /whip/live/event-share HTTP/1.1\r\nhost: whip.example\r\n\r\n";
+    assert_eq!(send(server.http, preflight).await.status, 200, "freed");
+}
+
+/// A body still arriving at `Limits::client_time` from the connection is
+/// answered `408`, not left to the handler's timeout and `503`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_that_arrives_too_slowly_gets_408() {
+    let server = start_limited(Limits {
+        client_time: Duration::from_secs(1),
+        ..Limits::default()
+    })
+    .await;
+    let mut s = TcpStream::connect(server.http).await.expect("connect");
+    let head = format!(
+        "POST /whip/live/event-slow HTTP/1.1\r\nhost: whip.example\r\ncontent-type: application/sdp\r\nauthorization: Bearer {TOKEN}\r\ncontent-length: 200\r\n\r\n"
+    );
+    s.write_all(head.as_bytes()).await.expect("head");
+    let started = Instant::now();
+    let (mut reader, mut writer) = s.into_split();
+    let trickle = tokio::spawn(async move {
+        for _ in 0..40 {
+            if writer.write_all(b"v").await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut out)).await;
+    trickle.abort();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        server
+            .whip
+            .signalling
+            .client_timeouts
+            .load(Ordering::Relaxed),
+        1
+    );
 }
 
 #[test]

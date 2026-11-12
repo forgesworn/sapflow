@@ -58,8 +58,6 @@ use crate::stream::{Source, SourceKind};
 use crate::whip_request::{self, Action, Refused};
 use crate::whip_tcp;
 
-/// Signalling connections served at once; more are closed as they arrive.
-const CONNECTIONS: usize = 32;
 /// Media items queued per session: about 10 s of audio and video.
 const QUEUE: usize = 1024;
 /// Media bytes queued per session. An access unit may be 8 MiB, so 1024 of
@@ -68,10 +66,49 @@ const QUEUE: usize = 1024;
 /// ingest stalls. At the default 16 publishers it bounds the queues to
 /// 256 MiB. Reaching it is a full queue.
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
-/// The whole request head, counted from accept.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
-/// Reading the offer, admission and setup together.
+/// Sending the answer, and the shutdown after it.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Reading the offer, admission and setup together; the offer must also
+/// be in by [`Limits::client_time`].
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The signalling listener's caps and the pending-session caps
+/// (A3.7). Each refuses at its limit; none is a setting.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// Signalling connections at once; more are closed as they arrive.
+    pub connections: usize,
+    /// Of those, from one peer address, so a few addresses cannot hold
+    /// every slot. The trusted proxy, which carries every publisher behind
+    /// it, is not limited.
+    pub per_address: usize,
+    /// From the connection, how long a client has to send its whole
+    /// request, the head and the offer; a request still arriving then gets
+    /// `408`. A slow client so holds a slot for this, then the answer.
+    pub client_time: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            connections: 32,
+            per_address: 8,
+            client_time: Duration::from_secs(5),
+        }
+    }
+}
+
+/// What the signalling listener refused, counted since start; none holds
+/// an address.
+#[derive(Debug, Default)]
+pub(crate) struct SignallingCounts {
+    /// Closed at accept: [`Limits::connections`] were open.
+    pub over_total: AtomicU64,
+    /// Closed at accept: [`Limits::per_address`] were open from the address.
+    pub over_address: AtomicU64,
+    /// Answered `408`: the request was not in by [`Limits::client_time`].
+    pub client_timeouts: AtomicU64,
+}
 /// How long `DELETE` waits for the publication to be released.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -679,6 +716,10 @@ pub(crate) struct Whip {
     paths: Mutex<HashMap<String, SessionId>>,
     /// How sessions have ended.
     ends: EndCounts,
+    /// The listener's caps.
+    limits: Limits,
+    /// What the listener refused.
+    signalling: SignallingCounts,
     /// Test builds only: whether a test has turned the feed's and the
     /// ingest's panic hooks on ([`injected`]). The server never does.
     #[cfg(test)]
@@ -787,6 +828,8 @@ fn prepare_with(
         resources: Mutex::new(HashMap::new()),
         paths: Mutex::new(HashMap::new()),
         ends: EndCounts::default(),
+        limits: Limits::default(),
+        signalling: SignallingCounts::default(),
         #[cfg(test)]
         panic_hooks: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1143,17 +1186,67 @@ fn receive(
 }
 
 async fn listen(listener: TcpListener, app: Arc<App>, whip: Arc<Whip>) -> std::io::Result<()> {
-    let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS));
+    let limits = whip.limits;
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
+    let addresses = Addresses::default();
     loop {
         let (socket, peer) = crate::accept::next(&listener, "WHIP").await;
         let Ok(slot) = slots.clone().try_acquire_owned() else {
+            whip.signalling.over_total.fetch_add(1, Ordering::Relaxed);
             continue;
+        };
+        let ip = peer.ip().to_canonical();
+        let address = if whip.config.trusted_proxy.map(|p| p.to_canonical()) == Some(ip) {
+            None
+        } else {
+            let Some(address) = AddressSlot::take(&addresses, ip, limits.per_address) else {
+                whip.signalling.over_address.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            Some(address)
         };
         let (app, whip) = (app.clone(), whip.clone());
         tokio::spawn(async move {
-            let _slot = slot;
+            let _slots = (slot, address);
             connection(socket, peer, app, whip).await;
         });
+    }
+}
+
+/// Signalling connections open from each peer address.
+type Addresses = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// One of an address's signalling slots, given back on drop, so a
+/// connection's task frees it however it ends.
+struct AddressSlot {
+    addresses: Addresses,
+    ip: IpAddr,
+}
+
+impl AddressSlot {
+    fn take(addresses: &Addresses, ip: IpAddr, limit: usize) -> Option<Self> {
+        let mut open = addresses.lock().unwrap_or_else(|e| e.into_inner());
+        let n = open.entry(ip).or_insert(0);
+        if *n >= limit {
+            return None;
+        }
+        *n += 1;
+        Some(Self {
+            addresses: addresses.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let mut open = self.addresses.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = open.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                open.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -1191,8 +1284,15 @@ impl Reply {
 
 async fn connection(mut socket: TcpStream, peer: SocketAddr, app: Arc<App>, whip: Arc<Whip>) {
     let mut buf = Vec::with_capacity(2048);
-    let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut socket, &mut buf)).await {
-        Err(_) => Err(Refused::new(408, "read timeout")),
+    // The head and the offer must both be in by this.
+    let deadline = tokio::time::Instant::now() + whip.limits.client_time;
+    let head = match tokio::time::timeout_at(deadline, read_head(&mut socket, &mut buf)).await {
+        Err(_) => {
+            whip.signalling
+                .client_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            Err(Refused::new(408, "read timeout"))
+        }
         Ok(Err(None)) => return,
         Ok(Err(Some(why))) => Err(match why {
             HeadRefusal::Malformed => Refused::new(400, "malformed request"),
@@ -1207,7 +1307,15 @@ async fn connection(mut socket: TcpStream, peer: SocketAddr, app: Arc<App>, whip
             let origin =
                 whip_request::allowed_origin(head.origin.as_deref(), &whip.config.allow_origins)
                     .map(str::to_owned);
-            let work = exchange(&mut socket, &buf[used..], &head, peer, &app, &whip);
+            let work = exchange(
+                &mut socket,
+                &buf[used..],
+                &head,
+                peer,
+                &app,
+                &whip,
+                deadline,
+            );
             let mut reply = match tokio::time::timeout(HANDLER_TIMEOUT, work).await {
                 Ok(Some(reply)) => reply,
                 Ok(None) => return,
@@ -1226,7 +1334,7 @@ async fn connection(mut socket: TcpStream, peer: SocketAddr, app: Arc<App>, whip
         socket.write_all(&reply.bytes()).await?;
         socket.shutdown().await
     };
-    if matches!(tokio::time::timeout(HEAD_TIMEOUT, sent).await, Ok(Ok(()))) {
+    if matches!(tokio::time::timeout(SEND_TIMEOUT, sent).await, Ok(Ok(()))) {
         drain(&mut socket).await;
     }
 }
@@ -1270,7 +1378,8 @@ async fn read_head(
     }
 }
 
-/// The answer to one request; `None` if the client went away.
+/// The answer to one request; `None` if the client went away. The offer
+/// must be in by `deadline`.
 async fn exchange(
     socket: &mut TcpStream,
     already: &[u8],
@@ -1278,6 +1387,7 @@ async fn exchange(
     peer: SocketAddr,
     app: &Arc<App>,
     whip: &Arc<Whip>,
+    deadline: tokio::time::Instant,
 ) -> Option<Reply> {
     let action = match whip_request::route(&head.method, &head.path) {
         Ok(action) => action,
@@ -1313,7 +1423,16 @@ async fn exchange(
             let mut body = vec![0u8; length];
             let have = already.len().min(length);
             body[..have].copy_from_slice(&already[..have]);
-            socket.read_exact(&mut body[have..]).await.ok()?;
+            match tokio::time::timeout_at(deadline, socket.read_exact(&mut body[have..])).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => return None,
+                Err(_) => {
+                    whip.signalling
+                        .client_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(Reply::refused(Refused::new(408, "read timeout")));
+                }
+            }
             let ip = match whip_request::publisher_ip(
                 peer.ip(),
                 whip.config.trusted_proxy,
