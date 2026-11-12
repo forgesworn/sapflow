@@ -537,6 +537,25 @@ fn keepalive_shutdown_and_empty_invalid_payloads() {
     assert!(c.poll_transmit(time(now, 1_100_000)).is_none());
 }
 
+#[test]
+fn peer_controls_are_accepted_with_or_without_the_zero_word() {
+    // We pad our own controls with one zero word for libsrt 1.5.7. The draft
+    // gives keep-alive and shutdown no CIF, so a listener may send the bare
+    // header; both forms must keep the session alive and close it.
+    for zero_word in ["", " 00000000"] {
+        let now = Instant::now();
+        let mut c = open(CallerConfig::default(), now);
+        let keepalive = hex(&format!("80010000 00000000 00000000 0000000b{zero_word}"));
+        let shutdown = hex(&format!("80050000 00000000 00000000 0000000b{zero_word}"));
+        c.handle_datagram(time(now, 4_000_000), peer(), &keepalive);
+        c.handle_timeout(time(now, 5_000_000));
+        assert!(c.is_connected(), "a keep-alive is peer activity");
+        c.handle_datagram(time(now, 5_100_000), peer(), &shutdown);
+        assert_eq!(reason(&mut c), CallerCloseReason::PeerClosed);
+        assert_eq!((c.stats().malformed, c.stats().stray), (0, 0));
+    }
+}
+
 struct RecoveryOutcome {
     delivered: Vec<(Vec<u8>, bool)>,
     receiver: sapflow_srt::Stats,
