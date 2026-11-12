@@ -1041,7 +1041,7 @@ applies to all three:
 - How often the recording rolls is bounded; how often HLS starts an epoch
   is not, since a decoder needs every new init. Each stream has a budget of
   rolls (`SAPFLOW_RECORDING_ROLL_BURST`, default 8), regaining one per
-  `SAPFLOW_RECORDING_ROLL_REFILL` of media (default 60 s), so an encoder
+  `SAPFLOW_RECORDING_ROLL_REFILL` (default 60 s), so an encoder
   that changes its parameter sets at every keyframe cannot make a file and
   a `recordSegmentComplete` a second (v4v takes 120 callbacks a minute from
   one address, for every stage together). An epoch change with no roll
@@ -1055,11 +1055,21 @@ applies to all three:
   read another code instead (a loss in the cut's batch marks the outgoing
   file first), but both are `incomplete`. A roll from a recording that
   never started (an epoch never served, as at a change while part timing
-  is still learnt) makes no file and spends nothing. The budget counts the
-  muxer's published media time (`Muxer::published_media`), which also
-  counts the seven leading gap segments a stream starts with, is kept
-  across a reconnect with the stream and starts full with a new
-  presentation; a burst of 0 turns it off. A burst of 8 covers Chrome's start-up ramp (up
+  is still learnt) makes no file and spends nothing. A roll is regained
+  only when a refill period has passed both in media time (the muxer's
+  published media time, `Muxer::published_media`) and in wall time: the
+  first comes from the sender's timestamps, which a publisher can space
+  out faster than real time (frames just under the 1 s break gap apart
+  move media time by their whole spacing, and the bitrate cap counts
+  bytes, not frames), and the second alone would refill during an outage.
+  The storm below, with its timestamps spaced 8 times wider and fed in
+  seconds, made 41 files on media time alone in the #82 review; on both
+  clocks it stays at the burst
+  (`stretched_timestamps_cannot_refill_the_budget_faster_than_real_time`).
+  A full budget just follows both clocks, so its first refill comes a
+  whole period after its first charged roll. The settle time is media
+  time. The budget is kept across a reconnect with the stream and starts
+  full with a new presentation; a burst of 0 turns it off. A burst of 8 covers Chrome's start-up ramp (up
   to five steps in W0), a couple of rotations and one network switch with
   every file recorded. An encoder that changes configuration every few
   seconds for the rest of a show is recorded only up to the burst and from

@@ -69,8 +69,8 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            0 to 1000; 0 turns the limit off). Past it, codec
                            epochs are still served but not recorded, and the
                            files on either side are marked epoch-rate
-  SAPFLOW_RECORDING_ROLL_REFILL  seconds of media per file regained (default
-                           60, 1 to 3600)
+  SAPFLOW_RECORDING_ROLL_REFILL  seconds per file regained, passed in both
+                           media and wall time (default 60, 1 to 3600)
   SAPFLOW_RECORDING_ROLL_SETTLE  seconds a codec epoch must last before
                            recording resumes in it (default 10, 0 to 3600)
   SAPFLOW_MAX_PUBLISHERS   simultaneous publishers per protocol (default 16)

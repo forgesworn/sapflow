@@ -466,6 +466,14 @@ function hits(text, s) {
     check('every recording finished complete or marked, the budget\'s marks among them',
       finished.length === files.length && rate >= 1 && finished.every((l) => /complete=true/.test(l) || /reason="?[a-z]/.test(l)),
       `${finished.filter((l) => /complete=true/.test(l)).length} of ${finished.length} complete, ${rate} marked epoch-rate, ${files.length} files`);
+    // The resume: the last file started, after the stretch the budget left
+    // unrecorded, is marked epoch-rate and begins with a keyframe.
+    const resumed = [...files].sort().pop();
+    const line = resumed && finished.find((l) => l.includes(path.basename(resumed)));
+    const first = resumed ? spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=flags', '-of', 'csv=p=0', '-read_intervals', '%+#1', resumed], { encoding: 'utf8' }).stdout.trim() : '';
+    check('recording resumed after the budget\'s gap, marked, on a keyframe',
+      !!line && /reason="?epoch-rate/.test(line) && first.startsWith('K'),
+      `${resumed ? path.basename(resumed) : 'no file'}: ${line ? (line.match(/reason="?[a-z-]+/) || ['complete'])[0] : 'no finish line'}, first packet ${first || 'none'}`);
   } else {
     check('every recording finished complete', finished.length === files.length && finished.every((l) => /complete=true/.test(l)),
       `${finished.filter((l) => /complete=true/.test(l)).length} of ${finished.length} complete, ${files.length} files`);

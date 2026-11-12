@@ -1277,6 +1277,9 @@ fn epochs_of(pattern: &[bool]) -> Vec<Frame> {
 /// every hundred frames for the writer to keep up.
 struct EpochRun {
     app: Arc<crate::App>,
+    /// A wall clock the feed keeps in step with the media, as a publisher
+    /// sending in real time.
+    paced: Option<(crate::roll_budget::WallClock, i64)>,
     receiver: tokio::sync::mpsc::Receiver<crate::callback::Queued>,
     done: Vec<serde_json::Value>,
     _scratch: crate::test_support::Scratch,
@@ -1294,10 +1297,34 @@ impl EpochRun {
         }
         Self {
             app,
+            paced: None,
             receiver,
             done: Vec::new(),
             _scratch: scratch,
         }
+    }
+
+    /// [`EpochRun::begin`], with the new presentation's roll budget on a
+    /// wall clock the test moves.
+    fn begin_with_clock(
+        &self,
+        clock: &crate::roll_budget::WallClock,
+    ) -> crate::publish::Publication {
+        let publisher = self.begin();
+        publisher.stream.session().rolls = crate::roll_budget::RollBudget::with_clock(
+            self.app.config.recording_roll,
+            clock.clone(),
+        );
+        publisher
+    }
+
+    /// [`EpochRun::begin`], with the roll budget's wall clock kept in step
+    /// with the media the run feeds, from `origin` (90 kHz).
+    fn begin_paced(&mut self, origin: i64) -> crate::publish::Publication {
+        let clock = crate::roll_budget::WallClock::manual();
+        let publisher = self.begin_with_clock(&clock);
+        self.paced = Some((clock, origin));
+        publisher
     }
 
     fn begin(&self) -> crate::publish::Publication {
@@ -1336,6 +1363,10 @@ impl EpochRun {
             // left behind (writer-behind) by a whole show fed at once.
             if i % 100 == 99 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if let Some((clock, origin)) = &self.paced {
+                let ticks = u64::try_from(frame.at() - origin).unwrap_or(0);
+                clock.set(Duration::from_nanos(ticks * 100_000 / 9));
             }
             let before = epoch(publisher);
             publisher
@@ -1415,7 +1446,7 @@ async fn an_epoch_storm_rolls_the_recording_within_its_budget() {
     pattern.extend(std::iter::repeat_n(true, 15));
     let frames = epochs_of(&pattern);
     let mut run = EpochRun::new(limit);
-    let mut publisher = run.begin();
+    let mut publisher = run.begin_paced(1_000_000);
     let epochs = run.feed(&mut publisher, &frames).await;
     assert_eq!(epochs, 300, "HLS served every epoch");
     run.end(publisher).await;
@@ -1478,7 +1509,7 @@ async fn recording_resumes_from_the_first_part_of_a_settled_epoch() {
     let mut pattern: Vec<bool> = (0..15).map(|k| k % 2 == 0).collect();
     pattern.extend(std::iter::repeat_n(false, 6));
     let mut run = EpochRun::new(limit);
-    let mut publisher = run.begin();
+    let mut publisher = run.begin_paced(1_000_000);
     run.feed(&mut publisher, &epochs_of(&pattern)).await;
     run.end(publisher).await;
     let states = run.states();
@@ -1583,7 +1614,7 @@ async fn a_late_resume_starts_its_file_at_a_keyframe() {
     let mut pattern = vec![true, false, true];
     pattern.extend(std::iter::repeat_n(false, 31));
     let mut run = EpochRun::new(limit);
-    let mut publisher = run.begin();
+    let mut publisher = run.begin_paced(1_000_000);
     run.feed(&mut publisher, &epochs_of(&pattern)).await;
     run.end(publisher).await;
     let states = run.states();
@@ -1618,4 +1649,81 @@ async fn a_late_resume_starts_its_file_at_a_keyframe() {
         String::from_utf8_lossy(&decode.stderr)
     );
     assert_eq!(widths_of(&[file])[0], 128);
+}
+
+/// `frames` with every timestamp `k` times further from the first: the same
+/// media, spaced out, as a publisher could send it faster than real time.
+fn stretched(frames: Vec<Frame>, k: i64) -> Vec<Frame> {
+    let origin = frames.first().map_or(0, Frame::at);
+    let at = |t: i64| origin + (t - origin) * k;
+    frames
+        .into_iter()
+        .map(|f| match f {
+            Frame::Video(dts, pts, data) => Frame::Video(at(dts), at(dts) + (pts - dts), data),
+            Frame::Aac(pts, config, data) => Frame::Aac(at(pts), config, data),
+        })
+        .collect()
+}
+
+/// The storm with its timestamps spaced 8 times wider (frames 267 ms
+/// apart, under the 1 s break gap, so media time runs 8 times faster than
+/// the frames): sent in a few seconds of wall time, it must still make no
+/// more files than the burst allows, since a roll is regained only when a
+/// refill period has passed on the wall clock as well. With the wall clock
+/// then moved on a refill period, recording resumes once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stretched_timestamps_cannot_refill_the_budget_faster_than_real_time() {
+    let limit = crate::roll_budget::RollLimit::default();
+    let mut pattern: Vec<bool> = (0..60).map(|k| k % 2 == 0).collect();
+    pattern.extend(std::iter::repeat_n(true, 4));
+    let frames = stretched(epochs_of(&pattern), 8);
+    let clock = crate::roll_budget::WallClock::manual();
+    let mut run = EpochRun::new(limit);
+    let mut publisher = run.begin_with_clock(&clock);
+    // 128 s of frames, 1,024 s of media time, no wall time.
+    let epochs = run.feed(&mut publisher, &frames).await;
+    assert_eq!(epochs, 60);
+    assert!(
+        publisher.stream.session().rolls.is_out(),
+        "no refill by timestamps"
+    );
+    // A refill period of wall time later, the held picture resumes.
+    clock.set(Duration::from_secs(61));
+    let (a, _, half) = fixture_halves();
+    let base = 1_000_000 + pattern.len() as i64 * half;
+    let tail: Vec<Frame> = (0..2)
+        .flat_map(|k| {
+            a.iter().map(move |f| match f {
+                Frame::Video(dts, pts, data) => {
+                    Frame::Video(dts + base + k * half, pts + base + k * half, data.clone())
+                }
+                Frame::Aac(pts, config, data) => {
+                    Frame::Aac(pts + base + k * half, *config, data.clone())
+                }
+            })
+        })
+        .collect();
+    run.feed(
+        &mut publisher,
+        &stretched_from(tail, 8, frames.first().map_or(0, Frame::at)),
+    )
+    .await;
+    run.end(publisher).await;
+    let states = run.states();
+    // The first file and the burst while the clock stood still, then the
+    // one resume a minute of wall time allows.
+    assert_eq!(states.len(), 1 + 8 + 1, "{states:?}");
+    assert!(states.len() as u64 <= 1 + u64::from(limit.burst) + 61 / limit.refill.as_secs() + 1);
+}
+
+/// [`stretched`], about a given origin.
+fn stretched_from(frames: Vec<Frame>, k: i64, origin: i64) -> Vec<Frame> {
+    let at = |t: i64| origin + (t - origin) * k;
+    frames
+        .into_iter()
+        .map(|f| match f {
+            Frame::Video(dts, pts, data) => Frame::Video(at(dts), at(dts) + (pts - dts), data),
+            Frame::Aac(pts, config, data) => Frame::Aac(at(pts), config, data),
+        })
+        .collect()
 }
