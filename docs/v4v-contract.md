@@ -132,9 +132,19 @@ fields have unknown integrity, never an implicit finalised result. Retries keep
 the exact same state and reason. Reason codes include `ingest-discarded-packets`,
 `srt-unrecovered-loss`, `srt-timeout`, `srt-ingest-queue-full`,
 `rtmp-protocol-error`, `over-bitrate`, `stale-media`, `srt-listener-stopped`,
-`ingest-error`, `media-loss`, `end-of-input-loss`, `writer-behind`, `disk-low`
-and `epoch-unrecorded` (a codec epoch before this file was served but not
-recorded).
+`ingest-error`, `media-loss`, `end-of-input-loss`, `writer-behind`, `disk-low`,
+`epoch-unrecorded` (a codec epoch before this file was served but not
+recorded) and `epoch-rate` (the encoder changed its codec configuration too
+often: codec epochs after this file, or before it, were served but not
+recorded; see `SAPFLOW_RECORDING_ROLL_*`). A stream that changes
+configuration often can therefore end a show with a stretch that no file
+holds; the files on either side of it say so. A file keeps only its first
+reason, so the file before such a stretch can read another code (say
+`media-loss`, from the same batch), and the file after it reads
+`epoch-rate` even if it later loses media too: either way it is
+`incomplete`. A resumed file can also lack its own epoch's first seconds,
+when the roll came back after those parts had left retention; its reason
+is still `epoch-rate`.
 Receivers must handle unknown future reason codes without rendering untrusted
 provider text. Failed or unsynchronised files still produce no completion. Do not infer an old file's topology from the latest live
 session, and do not equate a finalised epoch file with a complete-show replay.

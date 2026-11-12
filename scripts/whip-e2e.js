@@ -4,7 +4,7 @@
 //
 //   cargo build -p sapflow [--target <triple>]
 //   node scripts/whip-e2e.js --bin <sapflow> --vendor <dir with hls.min.js> --out <scratch dir> \
-//     [--base 47300] [--seconds 10] [--transport udp|tcp|proxy] [--resize]
+//     [--base 47300] [--seconds 10] [--transport udp|tcp|proxy] [--resize | --resize-loop]
 //
 // Ports: base+1 HLS, base+2 SRT, base+3 WHIP signalling, base+4 WHIP media,
 // base+5 this script's page server, base+6 the ICE-TCP listener, base+7 the
@@ -38,6 +38,13 @@
 //    its own recording, with or without --resize, since a browser may
 //    ramp its resolution up by itself; the longest stall of the playhead
 //    is reported.
+//    --resize-loop toggles that halving every 5 s for 60 s, then holds
+//    the picture until 80 s: more codec epochs than the recording's roll
+//    budget (SAPFLOW_RECORDING_ROLL_*, a burst of 8 by default). Every
+//    epoch must still be served and play; the recording rolls for at most
+//    the first file and the burst, then stops (that file marked
+//    epoch-rate) and resumes once the held picture has lasted the settle
+//    time (that file marked too).
 // 3. A3.6 privacy: sapflow ran with RUST_LOG=trace; its log must not hold
 //    the token, any address, port or mDNS name from the offer, or the
 //    publisher's address or port. The check is first shown to catch a
@@ -58,8 +65,11 @@ const path = require('node:path');
 const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? args[i + 1] : d; };
 const bin = opt('bin'), vendor = opt('vendor'), out = opt('out');
-const base = +opt('base', 47300), seconds = +opt('seconds', 10);
+const loop = args.includes('--resize-loop');
+const base = +opt('base', 47300), seconds = +opt('seconds', loop ? 80 : 10);
 const resize = args.includes('--resize');
+// The server's default roll budget, which --resize-loop runs past.
+const ROLL_BURST = 8;
 const transport = opt('transport', 'udp');
 if (!['udp', 'tcp', 'proxy'].includes(transport)) { console.error('--transport udp|tcp|proxy'); process.exit(2); }
 const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -170,6 +180,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         const p = sender.getParameters(); p.encodings[0].scaleResolutionDownBy = 2;
         await sender.setParameters(p).catch((e) => out.errors.push('setParameters ' + e.message));
         out.resizedAt = v.currentTime; out.resizeFrom = v.videoWidth;
+      }
+      // Toggled every 5 s from the first time at 640 wide, for 60 s.
+      if (${loop} && v.videoWidth === 640 && out.loopFrom === undefined && v.getVideoPlaybackQuality().totalVideoFrames > 100) out.loopFrom = performance.now();
+      if (${loop} && out.loopFrom !== undefined) {
+        const n = Math.floor((performance.now() - out.loopFrom) / 5000);
+        if (n < 12 && n !== out.toggle) {
+          out.toggle = n;
+          const p = sender.getParameters(); p.encodings[0].scaleResolutionDownBy = n % 2 ? 1 : 2;
+          await sender.setParameters(p).catch((e) => out.errors.push('setParameters ' + e.message));
+        }
       }
       if (out.resizeFrom && out.halfAt === undefined && v.videoWidth === out.resizeFrom / 2) out.halfAt = v.currentTime;
       if (out.halfAt !== undefined) out.afterHalf = v.currentTime - out.halfAt;
@@ -398,8 +418,15 @@ function hits(text, s) {
   const changes = fs.readFileSync(log, 'utf8').replace(/\x1b\[[0-9;]*m/g, '').split('\n')
     .filter((l) => l.includes('mid-stream; starting a new codec epoch'));
   const withParts = changes.filter((l) => !/previous_parts=0\b/.test(l)).length;
-  check('one recording per served codec epoch', maps.size > 0 && files.length === maps.size && withParts + 1 === maps.size && (!resize || maps.size > 1),
-    `${files.length} files, ${maps.size} inits served, ${changes.length} epoch changes (${changes.length - withParts} from an epoch with no part)`);
+  if (loop) {
+    // Past the budget: the first file and the burst, then the resumed one.
+    check('every codec epoch served, the recording within its roll budget',
+      maps.size > ROLL_BURST + 2 && files.length === ROLL_BURST + 2,
+      `${files.length} files, ${maps.size} inits served, ${changes.length} epoch changes; widths ${r ? (r.widths || []).join(' then ') : '-'}`);
+  } else {
+    check('one recording per served codec epoch', maps.size > 0 && files.length === maps.size && withParts + 1 === maps.size && (!resize || maps.size > 1),
+      `${files.length} files, ${maps.size} inits served, ${changes.length} epoch changes (${changes.length - withParts} from an epoch with no part)`);
+  }
   for (const f of files) {
     const probe = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-show_entries', 'stream=codec_name,width,height,nb_read_frames,sample_rate,channels,start_time,duration', '-of', 'json', f], { encoding: 'utf8' });
     let streams = [];
@@ -431,8 +458,29 @@ function hits(text, s) {
   check('the session ended, deleted, with nothing lost', /WHIP session ended reason="?deleted"? count=\d+ lost=0/.test(plain));
   // Every file, not any one of them.
   const finished = plain.split('\n').filter((l) => l.includes('recording finished'));
-  check('every recording finished complete', finished.length === files.length && finished.every((l) => /complete=true/.test(l)),
-    `${finished.filter((l) => /complete=true/.test(l)).length} of ${finished.length} complete, ${files.length} files`);
+  if (loop) {
+    // A file keeps its first reason only, so the file that ran out can read
+    // another; every incomplete one must have one, and one must be the
+    // budget's.
+    const rate = finished.filter((l) => /reason="?epoch-rate/.test(l)).length;
+    check('every recording finished complete or marked, the budget\'s marks among them',
+      finished.length === files.length && rate >= 1 && finished.every((l) => /complete=true/.test(l) || /reason="?[a-z]/.test(l)),
+      `${finished.filter((l) => /complete=true/.test(l)).length} of ${finished.length} complete, ${rate} marked epoch-rate, ${files.length} files`);
+    // The resume: two epoch-rate files, the one that ran out and, after the
+    // stretch the budget left unrecorded, the last one started, which
+    // begins with a keyframe.
+    const byName = [...files].sort();
+    const lineOf = (f) => finished.find((l) => l.includes(path.basename(f)));
+    const marked = byName.filter((f) => /reason="?epoch-rate/.test(lineOf(f) || ''));
+    const resumed = byName[byName.length - 1];
+    const first = resumed ? spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=flags', '-of', 'csv=p=0', '-read_intervals', '%+#1', resumed], { encoding: 'utf8' }).stdout.trim() : '';
+    check('recording resumed after the budget\'s gap, marked, on a keyframe',
+      marked.length === 2 && marked[1] === resumed && marked[0] !== resumed && first.startsWith('K'),
+      `${marked.map((f) => path.basename(f)).join(' then ') || 'no epoch-rate file'}; last ${resumed ? path.basename(resumed) : 'none'}, first packet ${first || 'none'}`);
+  } else {
+    check('every recording finished complete', finished.length === files.length && finished.every((l) => /complete=true/.test(l)),
+      `${finished.filter((l) => /complete=true/.test(l)).length} of ${finished.length} complete, ${files.length} files`);
+  }
   if (transport !== 'udp') {
     check('the publisher\'s real TCP ends were seen', peers.length > 0 && peers.every((p) => p.port >= 1024 && p.port !== port.tcp),
       `${peers.length} connection(s)`);
