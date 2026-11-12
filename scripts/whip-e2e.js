@@ -4,7 +4,7 @@
 //
 //   cargo build -p sapflow [--target <triple>]
 //   node scripts/whip-e2e.js --bin <sapflow> --vendor <dir with hls.min.js> --out <scratch dir> \
-//     [--base 47300] [--seconds 10]
+//     [--base 47300] [--seconds 10] [--resize]
 //
 // Ports: base+1 HLS, base+2 SRT, base+3 WHIP signalling, base+4 WHIP media,
 // base+5 this script's page server. CHROME picks the browser binary.
@@ -14,8 +14,14 @@
 //    start, binding nothing.
 // 2. A3.1: headless Chrome with fake media, on a page from another origin
 //    (so CORS is exercised), POSTs to sapflow, plays the stream in hls.js
-//    and draws a decoded frame; then DELETEs the session. ffprobe and ffmpeg
-//    then decode the recording: frame count, dimensions, a frame as PNG.
+//    and draws a decoded frame; then DELETEs the session. ffmpeg then decodes
+//    every recording whole, which must give no error, and a frame as PNG.
+//    --resize halves the sender's resolution (scaleResolutionDownBy) once
+//    100 frames have played, as a browser under load does: playback must
+//    carry on at the new size. Every codec epoch the server logs must have
+//    its own recording, with or without --resize, since a browser may
+//    ramp its resolution up by itself; the longest stall of the playhead
+//    is reported.
 // 3. A3.6 privacy: sapflow ran with RUST_LOG=trace; its log must not hold
 //    the token, any address, port or mDNS name from the offer, or the
 //    publisher's address or port. The check is first shown to catch a
@@ -34,6 +40,7 @@ const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? args[i + 1] : d; };
 const bin = opt('bin'), vendor = opt('vendor'), out = opt('out');
 const base = +opt('base', 47300), seconds = +opt('seconds', 10);
+const resize = args.includes('--resize');
 const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const port = { hls: base + 1, srt: base + 2, whip: base + 3, media: base + 4, page: base + 5 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -97,7 +104,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   try {
     const media = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 640, height: 360 } });
     const pc = new RTCPeerConnection();
-    media.getTracks().forEach((t) => pc.addTransceiver(t, { direction: 'sendonly', streams: [media] }));
+    let sender = null;
+    media.getTracks().forEach((t) => { const tr = pc.addTransceiver(t, { direction: 'sendonly', streams: [media] }); if (t.kind === 'video') sender = tr.sender; });
     await pc.setLocalDescription(await pc.createOffer());
     await Promise.race([new Promise((r) => { pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && r(); }), sleep(1500)]);
     out.offer = pc.localDescription.sdp;
@@ -120,11 +128,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     hls.loadSource(playlist);
     hls.attachMedia(v);
     v.play().catch((e) => out.errors.push('play ' + e.message));
-    // Playing: the playhead advances by ${seconds} s from where it started.
-    let start = null;
+    // Playing: the playhead advances by ${seconds} s from where it started
+    // (and, with --resize, past the change). The longest wait with the
+    // playhead still is the stall.
+    let start = null, still = null, last = -1;
+    out.widths = []; out.stall = 0;
     for (let i = 0; i < ${seconds * 10 + 150}; i++) {
       if (start === null && v.videoWidth > 0 && v.currentTime > 0) start = v.currentTime;
-      if (start !== null && v.currentTime - start >= ${seconds}) break;
+      if (start !== null) {
+        if (v.currentTime !== last) { last = v.currentTime; still = performance.now(); }
+        else out.stall = Math.max(out.stall, performance.now() - still);
+      }
+      if (v.videoWidth && out.widths[out.widths.length - 1] !== v.videoWidth) out.widths.push(v.videoWidth);
+      if (${resize} && out.resizedAt === undefined && v.getVideoPlaybackQuality().totalVideoFrames > 100) {
+        const p = sender.getParameters(); p.encodings[0].scaleResolutionDownBy = 2;
+        await sender.setParameters(p).catch((e) => out.errors.push('setParameters ' + e.message));
+        out.resizedAt = v.currentTime;
+      }
+      if (start !== null && v.currentTime - start >= ${seconds} && (!${resize} || out.widths.length > 1)) break;
       await sleep(100);
     }
     out.played = start === null ? 0 : v.currentTime - start; out.width = v.videoWidth; out.height = v.videoHeight;
@@ -159,7 +180,10 @@ function launchChrome(url) {
   const flags = ['--headless=new', `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check',
     '--autoplay-policy=no-user-gesture-required', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
     '--allow-loopback-in-peer-connection', '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
-    '--disable-backgrounding-occluded-windows'];
+    '--disable-backgrounding-occluded-windows',
+    // The only --disable-features flag (Chrome honours one): without it each
+    // launch on macOS leaves a 1.4 GB code-sign clone of the app behind.
+    '--disable-features=MacAppCodeSignClone'];
   const child = spawn(CHROME, [...flags, url], { stdio: 'ignore', detached: true });
   return { child, profile };
 }
@@ -236,7 +260,10 @@ function hits(text, s) {
     if (r.frame) fs.writeFileSync(path.join(out, 'hls-frame.png'), Buffer.from(r.frame.split(',')[1], 'base64'));
     check('POST 201 with an absolute Location', r.post === 201 && /^http:\/\/127\.0\.0\.1:\d+\/whip\/session\/[0-9a-f]{32}$/.test(r.location || ''), `${r.post}`);
     check('ICE and DTLS connected', r.connection === 'connected', r.connection);
-    check('hls.js played the stream', r.played >= seconds && r.width > 0 && r.decoded >= seconds * 10, `${(r.played || 0).toFixed(1)} s at ${r.width}x${r.height}, ${r.decoded} frames decoded, ${r.dropped} dropped`);
+    check('hls.js played the stream', r.played >= seconds && r.width > 0 && r.decoded >= seconds * 10, `${(r.played || 0).toFixed(1)} s at ${r.width}x${r.height}, ${r.decoded} frames decoded, ${r.dropped} dropped; widths ${(r.widths || []).join(' then ')}, longest stall ${((r.stall || 0) / 1000).toFixed(2)} s`);
+    if (resize) {
+      check('playback carried on through the resolution change', r.widths.length > 1 && r.played >= seconds, `widths ${r.widths.join(' then ')}, longest stall ${(r.stall / 1000).toFixed(2)} s`);
+    }
     check('DELETE 200', r.delete === 200, `${r.delete}`);
     check('no page errors', r.errors.length === 0, r.errors.join('; '));
   }
@@ -245,13 +272,22 @@ function hits(text, s) {
   await stopGroup(s.child.pid);
   const files = fs.readdirSync(recordings, { recursive: true }).map((f) => path.join(recordings, f)).filter((f) => f.endsWith('.mp4'));
   check('a recording was written', files.length > 0, files.map((f) => path.basename(f)).join(', '));
+  // One file per codec epoch: a browser may also ramp its resolution up
+  // by itself at the start.
+  const epochs = (fs.readFileSync(log, 'utf8').match(/starting a new codec epoch/g) || []).length;
+  check('one recording per codec epoch', files.length === epochs + 1 && (!resize || epochs > 0), `${files.length} files, ${epochs} epoch changes`);
   for (const f of files) {
     const probe = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-show_entries', 'stream=codec_name,width,height,nb_read_frames,sample_rate,channels', '-of', 'json', f], { encoding: 'utf8' });
     let streams = [];
     try { streams = JSON.parse(probe.stdout).streams || []; } catch {}
     fs.writeFileSync(path.join(out, path.basename(f) + '.probe.json'), probe.stdout);
     const video = streams.find((x) => x.codec_name === 'h264'), audio = streams.find((x) => x.codec_name === 'opus');
-    check('recording: H.264 frames decode', video && +video.nb_read_frames > 0, video ? `${video.nb_read_frames} frames at ${video.width}x${video.height}` : probe.stderr.trim());
+    // The whole file, not a frame count: a file whose frames do not match
+    // its init can still count frames.
+    const whole = spawnSync('ffmpeg', ['-hide_banner', '-v', 'error', '-i', f, '-f', 'null', '-'], { encoding: 'utf8' });
+    const decodeErrors = whole.stderr.split('\n').filter(Boolean);
+    check('recording: decodes whole with no error', whole.status === 0 && decodeErrors.length === 0 && video && +video.nb_read_frames > 0,
+      video ? `${video.nb_read_frames} H.264 frames at ${video.width}x${video.height}, ${decodeErrors.length} decode errors` : probe.stderr.trim());
     check('recording: Opus decodes', audio && +audio.nb_read_frames > 0, audio ? `${audio.nb_read_frames} frames, ${audio.channels} channels at ${audio.sample_rate}` : '');
     const png = path.join(out, path.basename(f) + '.frame.png');
     const ff = spawnSync('ffmpeg', ['-v', 'error', '-y', '-i', f, '-frames:v', '1', png], { encoding: 'utf8' });
