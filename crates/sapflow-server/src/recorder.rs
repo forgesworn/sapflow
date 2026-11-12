@@ -167,10 +167,14 @@ pub enum IncompleteReason {
     /// A codec epoch before this file was served but could not be recorded
     /// (it began and ended inside one ingest batch).
     EpochUnrecorded,
+    /// The encoder changed its codec configuration too often: codec epochs
+    /// after this file, or before it, were served but not recorded
+    /// (`SAPFLOW_RECORDING_ROLL_*`).
+    EpochRate,
 }
 
 impl IncompleteReason {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::TransportDrop,
         Self::TransportTimeout,
         Self::IngestQueueFull,
@@ -185,6 +189,7 @@ impl IncompleteReason {
         Self::WriterBehind,
         Self::DiskLow,
         Self::EpochUnrecorded,
+        Self::EpochRate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -203,6 +208,7 @@ impl IncompleteReason {
             Self::WriterBehind => "writer-behind",
             Self::DiskLow => "disk-low",
             Self::EpochUnrecorded => "epoch-unrecorded",
+            Self::EpochRate => "epoch-rate",
         }
     }
 

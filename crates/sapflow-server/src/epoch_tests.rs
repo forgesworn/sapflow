@@ -1218,3 +1218,512 @@ async fn a_started_recording_keeps_its_tail_when_an_epoch_passes_in_one_push() {
     );
     publisher.end();
 }
+
+/// The resolution-change fixture's two halves, as 2 s epochs to lay end to
+/// end: the 160x90 half (its first IDR to the change) and the 128x72 half
+/// (the change on, 2 s of it), each with its AAC, time-ordered.
+fn fixture_halves() -> (Vec<Frame>, Vec<Frame>, i64) {
+    const CHANGE_TS: &[u8] =
+        include_bytes!("../../sapflow-hls/tests/fixtures/resolution-change.ts");
+    const CHANGE: i64 = 309_840;
+    let frames = elementary_frames(CHANGE_TS);
+    let first = frames
+        .iter()
+        .find_map(|f| match f {
+            Frame::Video(dts, _, annexb) if sapflow_hls::codec::access_unit(annexb).idr => {
+                Some(*dts)
+            }
+            _ => None,
+        })
+        .expect("an IDR");
+    // About 2 s: the 160x90 half, from its first IDR to the change.
+    let span = CHANGE - first;
+    let half = |from: i64| -> Vec<Frame> {
+        let mut out: Vec<Frame> = frames
+            .iter()
+            .filter(|f| (from..from + span).contains(&f.at()))
+            .map(|f| match f {
+                Frame::Video(dts, pts, data) => Frame::Video(dts - from, pts - from, data.clone()),
+                Frame::Aac(pts, config, data) => Frame::Aac(pts - from, *config, data.clone()),
+            })
+            .collect();
+        out.sort_by_key(Frame::at);
+        out
+    };
+    (half(first), half(CHANGE), span)
+}
+
+/// Lays fixture halves end to end, `true` for the 160x90 half: each change
+/// of half is a codec epoch; repeats of one half are one epoch.
+fn epochs_of(pattern: &[bool]) -> Vec<Frame> {
+    let (a, b, half) = fixture_halves();
+    let mut out = Vec::new();
+    for (k, &is_a) in pattern.iter().enumerate() {
+        let base = 1_000_000 + k as i64 * half;
+        for f in if is_a { &a } else { &b } {
+            out.push(match f {
+                Frame::Video(dts, pts, data) => Frame::Video(dts + base, pts + base, data.clone()),
+                Frame::Aac(pts, config, data) => Frame::Aac(pts + base, *config, data.clone()),
+            });
+        }
+    }
+    out
+}
+
+/// One publication of `frames` through the elementary-stream path with the
+/// given roll limit: after each codec change while files are still being
+/// rolled, real time for the last file's writer to finish (two writers a
+/// path), as an encoder's seconds between changes give it, and a moment
+/// every hundred frames for the writer to keep up.
+struct EpochRun {
+    app: Arc<crate::App>,
+    /// A wall clock the feed keeps in step with the media, as a publisher
+    /// sending in real time.
+    paced: Option<(crate::roll_budget::WallClock, i64)>,
+    receiver: tokio::sync::mpsc::Receiver<crate::callback::Queued>,
+    done: Vec<serde_json::Value>,
+    _scratch: crate::test_support::Scratch,
+}
+
+impl EpochRun {
+    fn new(limit: crate::roll_budget::RollLimit) -> Self {
+        let (mut app, scratch) = app(true);
+        let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+        let (callbacks, receiver) = crate::callback::test_queue(scope, 512);
+        {
+            let app = Arc::get_mut(&mut app).expect("sole fixture App");
+            app.callbacks = callbacks;
+            app.config.recording_roll = limit;
+        }
+        Self {
+            app,
+            paced: None,
+            receiver,
+            done: Vec::new(),
+            _scratch: scratch,
+        }
+    }
+
+    /// [`EpochRun::begin`], with the new presentation's roll budget on a
+    /// wall clock the test moves.
+    fn begin_with_clock(
+        &self,
+        clock: &crate::roll_budget::WallClock,
+    ) -> crate::publish::Publication {
+        let publisher = self.begin();
+        publisher.stream.session().rolls = crate::roll_budget::RollBudget::with_clock(
+            self.app.config.recording_roll,
+            clock.clone(),
+        );
+        publisher
+    }
+
+    /// [`EpochRun::begin`], with the roll budget's wall clock kept in step
+    /// with the media the run feeds, from `origin` (90 kHz).
+    fn begin_paced(&mut self, origin: i64) -> crate::publish::Publication {
+        let clock = crate::roll_budget::WallClock::manual();
+        let publisher = self.begin_with_clock(&clock);
+        self.paced = Some((clock, origin));
+        publisher
+    }
+
+    fn begin(&self) -> crate::publish::Publication {
+        let req = sapflow_core::PublishRequest::parse_srt_stream_id(
+            "publish:live/event-epochs:fixture:fixture",
+        )
+        .expect("request");
+        crate::publish::Publication::begin(
+            &self.app,
+            &req,
+            SourceKind::Es,
+            "127.0.0.1".parse().expect("loopback"),
+        )
+        .expect("begin")
+    }
+
+    /// Feeds `frames`; returns the epochs served (the muxer's last init id).
+    async fn feed(&mut self, publisher: &mut crate::publish::Publication, frames: &[Frame]) -> u64 {
+        let config = frames
+            .iter()
+            .find_map(|f| match f {
+                Frame::Aac(_, config, _) => Some(*config),
+                Frame::Video(..) => None,
+            })
+            .expect("AAC");
+        let epoch = |p: &crate::publish::Publication| {
+            p.stream
+                .lock()
+                .ingest
+                .muxer()
+                .map(|m| m.current_initialization_id())
+        };
+        for (i, frame) in frames.iter().enumerate() {
+            // Media arrives over time: give the writer a moment every few
+            // parts, as real time does, so a loaded machine's writer is not
+            // left behind (writer-behind) by a whole show fed at once.
+            if i % 100 == 99 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if let Some((clock, origin)) = &self.paced {
+                let ticks = u64::try_from(frame.at() - origin).unwrap_or(0);
+                clock.set(Duration::from_nanos(ticks * 100_000 / 9));
+            }
+            let before = epoch(publisher);
+            publisher
+                .push(|source, now| {
+                    let crate::stream::Source::Es(es) = source else {
+                        unreachable!()
+                    };
+                    es.audio_config(config);
+                    match frame {
+                        Frame::Video(dts, pts, annexb) => {
+                            es.video(*dts, *pts, sapflow_hls::codec::access_unit(annexb), now)
+                        }
+                        Frame::Aac(pts, config, payload) => {
+                            es.audio_at(*pts, *config, payload, now)
+                        }
+                    }
+                })
+                .expect("fixture frames");
+            let recording = publisher.stream.session().recorder.is_some();
+            if epoch(publisher) != before && recording {
+                self.drain_for(Duration::from_millis(100)).await;
+            }
+        }
+        epoch(publisher).unwrap_or(0)
+    }
+
+    async fn drain_for(&mut self, time: Duration) {
+        let _ = tokio::time::timeout(time, async {
+            while let Some(callback) = self.receiver.recv().await {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&callback.body).expect("recording callback JSON");
+                if body["event"] == "recordSegmentComplete" {
+                    self.done.push(body);
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Ends the presentation (no reconnect hold) and collects every file.
+    async fn end(&mut self, publisher: crate::publish::Publication) {
+        publisher.end();
+        let path = StreamPath::parse("live/event-epochs").expect("path");
+        let (stream, generation, _) = self
+            .app
+            .streams
+            .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Es)
+            .expect("claim");
+        self.app.streams.detach(&stream, generation, false);
+        self.drain_for(Duration::from_secs(2)).await;
+    }
+
+    fn states(&self) -> Vec<(String, String)> {
+        self.done
+            .iter()
+            .map(|b| {
+                (
+                    b["recordingState"].as_str().unwrap_or_default().to_owned(),
+                    b["recordingReason"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// An encoder that changes its codec configuration at every keyframe pair
+/// (a new epoch every 2 s) for ten minutes, then holds one for 30 s: HLS
+/// serves every epoch; the recording rolls for the first file and the
+/// burst of 8, then stops (that file marked `epoch-rate`), and resumes
+/// once the final epoch has lasted the settle time (marked too). The
+/// `recordSegmentComplete` callbacks it makes stay far under v4v's limit of
+/// 120 a minute (for all stages from one address).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_epoch_storm_rolls_the_recording_within_its_budget() {
+    let limit = crate::roll_budget::RollLimit::default();
+    let mut pattern: Vec<bool> = (0..300).map(|k| k % 2 == 0).collect();
+    pattern.extend(std::iter::repeat_n(true, 15));
+    let frames = epochs_of(&pattern);
+    let mut run = EpochRun::new(limit);
+    let mut publisher = run.begin_paced(1_000_000);
+    let epochs = run.feed(&mut publisher, &frames).await;
+    assert_eq!(epochs, 300, "HLS served every epoch");
+    run.end(publisher).await;
+    let states = run.states();
+    // Media time: 630 s. Files: the first, the burst, and the resumed one.
+    let minutes = 630 / 60;
+    assert!(states.len() as u64 <= 1 + u64::from(limit.burst) + minutes);
+    assert_eq!(states.len(), 10, "{states:?}");
+    let rate = |s: &(String, String)| s.1 == "epoch-rate";
+    assert_eq!(states.iter().filter(|s| rate(s)).count(), 2, "{states:?}");
+    assert!(
+        states.iter().all(|s| s.0 == "finalised" || rate(s)),
+        "every other file finalised, none epoch-unrecorded: {states:?}"
+    );
+    // v4v takes 120 callbacks a minute from one address, for every stage:
+    // the whole storm's recording callbacks are fewer than one minute's.
+    assert!(states.len() < 120);
+    eprintln!(
+        "storm: {} epochs served over {} s of media, {} files and recordSegmentComplete callbacks (v4v allows 120 a minute)",
+        epochs + 1,
+        pattern.len() * 2,
+        states.len()
+    );
+}
+
+/// Chrome's start-up ramp (five resolution steps in its first 30 s, as W0
+/// saw), then a stable picture: every epoch is recorded, every file
+/// finalised. The budget does not touch a normal start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_up_resolution_ramp_stays_inside_the_burst() {
+    // Epochs of 6 s: A B A B A B, then 60 s of B.
+    let mut pattern = Vec::new();
+    for k in 0..6 {
+        pattern.extend(std::iter::repeat_n(k % 2 == 0, 3));
+    }
+    pattern.extend(std::iter::repeat_n(false, 30));
+    let mut run = EpochRun::new(crate::roll_budget::RollLimit::default());
+    let mut publisher = run.begin();
+    let epochs = run.feed(&mut publisher, &epochs_of(&pattern)).await;
+    assert_eq!(epochs, 5);
+    run.end(publisher).await;
+    let states = run.states();
+    assert_eq!(states.len(), 6, "{states:?}");
+    assert!(states.iter().all(|s| s.0 == "finalised"), "{states:?}");
+}
+
+/// After the budget runs out, recording resumes in the first epoch that
+/// lasts the settle time once a roll is back, from that epoch's first
+/// retained part: the resumed file holds the epoch's every video frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffprobe; run explicitly for origin acceptance"]
+async fn recording_resumes_from_the_first_part_of_a_settled_epoch() {
+    let limit = crate::roll_budget::RollLimit {
+        burst: 2,
+        refill: Duration::from_secs(20),
+        settle: Duration::from_secs(10),
+    };
+    // Rolls at 2 s and 4 s spend the burst; 6 s runs out; then epochs of
+    // 2 s until 30 s, then one of 12 s, which settles at 10 s with a roll.
+    let mut pattern: Vec<bool> = (0..15).map(|k| k % 2 == 0).collect();
+    pattern.extend(std::iter::repeat_n(false, 6));
+    let mut run = EpochRun::new(limit);
+    let mut publisher = run.begin_paced(1_000_000);
+    run.feed(&mut publisher, &epochs_of(&pattern)).await;
+    run.end(publisher).await;
+    let states = run.states();
+    assert_eq!(states.len(), 4, "{states:?}");
+    assert_eq!(
+        states.iter().filter(|s| s.1 == "epoch-rate").count(),
+        2,
+        "{states:?}"
+    );
+    // The resumed file: the last epoch's six halves.
+    let (_, b, _) = fixture_halves();
+    let per_half = b.iter().filter(|f| matches!(f, Frame::Video(..))).count();
+    let last = run.done.last().expect("a file");
+    let file = std::path::PathBuf::from(last["segmentPath"].as_str().expect("a path"));
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "packet=pts", "-of", "csv=p=0"])
+        .arg(&file)
+        .output()
+        .expect("ffprobe runs");
+    let packets = String::from_utf8_lossy(&output.stdout).lines().count();
+    // The final frame's PES never ends before the stream does in TS, but
+    // this is the elementary path: every frame is pushed.
+    assert_eq!(
+        packets,
+        6 * per_half,
+        "the settled epoch from its first frame"
+    );
+    assert_eq!(widths_of(&[file])[0], 128);
+}
+
+/// The budget is the stream's: a reconnect inside the grace keeps what is
+/// left of it, and a new presentation starts with a full one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_roll_budget_survives_a_reconnect_and_resets_with_a_new_presentation() {
+    let limit = crate::roll_budget::RollLimit {
+        burst: 2,
+        refill: Duration::from_secs(3600),
+        settle: Duration::from_secs(3600),
+    };
+    let mut run = EpochRun::new(limit);
+    // Two rolls spend the burst.
+    let mut publisher = run.begin();
+    run.feed(&mut publisher, &epochs_of(&[true, false, true]))
+        .await;
+    // The encoder drops and comes back within the grace, continuing.
+    publisher.end();
+    let mut publisher = run.begin();
+    assert!(
+        publisher.stream.session().recorder.is_some(),
+        "still recording the current epoch"
+    );
+    run.feed(&mut publisher, &epochs_of(&[false, true])).await;
+    assert!(
+        publisher.stream.session().rolls.is_out(),
+        "kept across the reconnect"
+    );
+    run.end(publisher).await;
+    let first = run.states();
+    assert_eq!(first.len(), 3, "{first:?}");
+    assert_eq!(first[2].1, "epoch-rate", "{first:?}");
+    // A new presentation: a full budget again.
+    let mut publisher = run.begin();
+    run.feed(&mut publisher, &epochs_of(&[true, false, true]))
+        .await;
+    assert!(!publisher.stream.session().rolls.is_out());
+    run.end(publisher).await;
+    assert_eq!(run.states().len(), 6, "{:?}", run.states());
+}
+
+/// `SAPFLOW_RECORDING_ROLL_BURST=0`: no budget, every epoch its own file,
+/// as before the limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_of_zero_rolls_at_every_epoch() {
+    let limit = crate::roll_budget::RollLimit {
+        burst: 0,
+        ..crate::roll_budget::RollLimit::default()
+    };
+    let pattern: Vec<bool> = (0..20).map(|k| k % 2 == 0).collect();
+    let mut run = EpochRun::new(limit);
+    let mut publisher = run.begin();
+    let epochs = run.feed(&mut publisher, &epochs_of(&pattern)).await;
+    assert_eq!(epochs, 19);
+    run.end(publisher).await;
+    let states = run.states();
+    assert_eq!(states.len(), 20, "{states:?}");
+    assert!(states.iter().all(|s| s.0 == "finalised"), "{states:?}");
+}
+
+/// The usual resume: a short burst of changes spends the budget, the
+/// picture then holds, and the roll comes back only 40 s later, long after
+/// the epoch's first parts have left retention. The resumed file starts at
+/// a segment, so with a keyframe, and decodes cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
+async fn a_late_resume_starts_its_file_at_a_keyframe() {
+    let limit = crate::roll_budget::RollLimit {
+        burst: 2,
+        refill: Duration::from_secs(40),
+        settle: Duration::from_secs(10),
+    };
+    let mut pattern = vec![true, false, true];
+    pattern.extend(std::iter::repeat_n(false, 31));
+    let mut run = EpochRun::new(limit);
+    let mut publisher = run.begin_paced(1_000_000);
+    run.feed(&mut publisher, &epochs_of(&pattern)).await;
+    run.end(publisher).await;
+    let states = run.states();
+    assert_eq!(states.len(), 4, "{states:?}");
+    assert_eq!(
+        states[2].1, "epoch-rate",
+        "the file that ran out: {states:?}"
+    );
+    assert_eq!(states[3].1, "epoch-rate", "the resumed file: {states:?}");
+    let file = std::path::PathBuf::from(run.done[3]["segmentPath"].as_str().expect("a path"));
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "packet=flags", "-of", "csv=p=0"])
+        .arg(&file)
+        .output()
+        .expect("ffprobe runs");
+    let flags = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        flags.lines().next().is_some_and(|f| f.starts_with('K')),
+        "the first video packet is a keyframe: {:?}",
+        flags.lines().next()
+    );
+    let decode = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-v", "error", "-xerror", "-i"])
+        .arg(&file)
+        .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        decode.status.success() && decode.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&decode.stderr)
+    );
+    assert_eq!(widths_of(&[file])[0], 128);
+}
+
+/// `frames` with every timestamp `k` times further from the first: the same
+/// media, spaced out, as a publisher could send it faster than real time.
+fn stretched(frames: Vec<Frame>, k: i64) -> Vec<Frame> {
+    let origin = frames.first().map_or(0, Frame::at);
+    let at = |t: i64| origin + (t - origin) * k;
+    frames
+        .into_iter()
+        .map(|f| match f {
+            Frame::Video(dts, pts, data) => Frame::Video(at(dts), at(dts) + (pts - dts), data),
+            Frame::Aac(pts, config, data) => Frame::Aac(at(pts), config, data),
+        })
+        .collect()
+}
+
+/// The storm with its timestamps spaced 8 times wider (frames 267 ms
+/// apart, under the 1 s break gap, so media time runs 8 times faster than
+/// the frames): sent in a few seconds of wall time, it must still make no
+/// more files than the burst allows, since a roll is regained only when a
+/// refill period has passed on the wall clock as well. With the wall clock
+/// then moved on a refill period, recording resumes once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stretched_timestamps_cannot_refill_the_budget_faster_than_real_time() {
+    let limit = crate::roll_budget::RollLimit::default();
+    let mut pattern: Vec<bool> = (0..60).map(|k| k % 2 == 0).collect();
+    pattern.extend(std::iter::repeat_n(true, 4));
+    let frames = stretched(epochs_of(&pattern), 8);
+    let clock = crate::roll_budget::WallClock::manual();
+    let mut run = EpochRun::new(limit);
+    let mut publisher = run.begin_with_clock(&clock);
+    // 128 s of frames, 1,024 s of media time, no wall time.
+    let epochs = run.feed(&mut publisher, &frames).await;
+    assert_eq!(epochs, 60);
+    assert!(
+        publisher.stream.session().rolls.is_out(),
+        "no refill by timestamps"
+    );
+    // A refill period of wall time later, the held picture resumes.
+    clock.set(Duration::from_secs(61));
+    let (a, _, half) = fixture_halves();
+    let base = 1_000_000 + pattern.len() as i64 * half;
+    let tail: Vec<Frame> = (0..2)
+        .flat_map(|k| {
+            a.iter().map(move |f| match f {
+                Frame::Video(dts, pts, data) => {
+                    Frame::Video(dts + base + k * half, pts + base + k * half, data.clone())
+                }
+                Frame::Aac(pts, config, data) => {
+                    Frame::Aac(pts + base + k * half, *config, data.clone())
+                }
+            })
+        })
+        .collect();
+    run.feed(
+        &mut publisher,
+        &stretched_from(tail, 8, frames.first().map_or(0, Frame::at)),
+    )
+    .await;
+    run.end(publisher).await;
+    let states = run.states();
+    // The first file and the burst while the clock stood still, then the
+    // one resume a minute of wall time allows.
+    assert_eq!(states.len(), 1 + 8 + 1, "{states:?}");
+    assert!(states.len() as u64 <= 1 + u64::from(limit.burst) + 61 / limit.refill.as_secs() + 1);
+}
+
+/// [`stretched`], about a given origin.
+fn stretched_from(frames: Vec<Frame>, k: i64, origin: i64) -> Vec<Frame> {
+    let at = |t: i64| origin + (t - origin) * k;
+    frames
+        .into_iter()
+        .map(|f| match f {
+            Frame::Video(dts, pts, data) => Frame::Video(at(dts), at(dts) + (pts - dts), data),
+            Frame::Aac(pts, config, data) => Frame::Aac(at(pts), config, data),
+        })
+        .collect()
+}

@@ -1038,6 +1038,60 @@ applies to all three:
     640x360, then 480x270 at once, then 640x360.
   - The log line gives the ended epoch's parts after the change sealed them
     (`previous_parts`); zero means it was never served.
+- How often the recording rolls is bounded; how often HLS starts an epoch
+  is not, since a decoder needs every new init. Each stream has a budget of
+  rolls (`SAPFLOW_RECORDING_ROLL_BURST`, default 8), regaining one per
+  `SAPFLOW_RECORDING_ROLL_REFILL` (default 60 s), so an encoder
+  that changes its parameter sets at every keyframe cannot make a file and
+  a `recordSegmentComplete` a second (v4v takes 120 callbacks a minute from
+  one address, for every stage together). An epoch change with no roll
+  left finishes the current file as usual, marked `epoch-rate`, and starts
+  none: the epochs after it are served but not recorded. Recording resumes
+  in the first epoch that lasts `SAPFLOW_RECORDING_ROLL_SETTLE` (default
+  10 s) with a roll back, from the epoch's earliest retained part that
+  begins a segment (so with a keyframe; when the roll comes back late the
+  epoch's first parts have left retention), and that file is marked
+  `epoch-rate` too. A file keeps its first reason only, so either file can
+  read another code instead (a loss in the cut's batch marks the outgoing
+  file first), but both are `incomplete`. A roll from a recording that
+  never started (an epoch never served, as at a change while part timing
+  is still learnt) makes no file and spends nothing. A roll is regained
+  only when a refill period has passed both in media time (the muxer's
+  published media time, `Muxer::published_media`) and in wall time: the
+  first comes from the sender's timestamps, which a publisher can space
+  out faster than real time (frames just under the 1 s break gap apart
+  move media time by their whole spacing, and the bitrate cap counts
+  bytes, not frames), and the second alone would refill during an outage.
+  The storm below, with its timestamps spaced 8 times wider and fed in
+  seconds, made 41 files on media time alone in the #82 review; on both
+  clocks it stays at the burst
+  (`stretched_timestamps_cannot_refill_the_budget_faster_than_real_time`).
+  A full budget just follows both clocks, so its first refill comes a
+  whole period after its first charged roll. Neither clock keeps more than
+  one period of lead over the other: otherwise wall time banked while a
+  publisher's timestamps ran slow would come back at media speed (an hour
+  at half speed then gave 30 files in 10 s in the review), or media time
+  banked before an outage would refill during it. So in any window of
+  either clock a stream starts at most the burst, one file per refill
+  period and one more (the property test checks every window), and an
+  outage regains at most one roll
+  (`wall_time_banked_while_media_is_slow_cannot_be_cashed_in`). The settle time is media
+  time. The budget is kept across a reconnect with the stream and starts
+  full with a new presentation; a burst of 0 turns it off. A burst of 8 covers Chrome's start-up ramp (up
+  to five steps in W0), a couple of rotations and one network switch with
+  every file recorded. An encoder that changes configuration every few
+  seconds for the rest of a show is recorded only up to the burst and from
+  the next epoch that settles; its viewers see every epoch, as before.
+  Tests: `an_epoch_storm_rolls_the_recording_within_its_budget` (300
+  epochs in ten minutes give 10 files and 10 callbacks),
+  `a_start_up_resolution_ramp_stays_inside_the_burst`,
+  `recording_resumes_from_the_first_part_of_a_settled_epoch`,
+  `a_late_resume_starts_its_file_at_a_keyframe`,
+  `the_roll_budget_survives_a_reconnect_and_resets_with_a_new_presentation`,
+  `a_burst_of_zero_rolls_at_every_epoch`, the property test in
+  `roll_budget.rs`, and `scripts/whip-e2e.js --resize-loop` (Chrome
+  toggling its resolution every 5 s for a minute: 13 epochs served, 10
+  files, two marked `epoch-rate`).
 
 Before this, the first init stayed while frames of the new size were
 written under it, so players failed to decode them (hls.js stalled after a
