@@ -86,6 +86,11 @@ pub(crate) struct Limits {
     /// request, the head and the offer; a request still arriving then gets
     /// `408`. A slow client so holds a slot for this, then the answer.
     pub client_time: Duration,
+    /// Sessions that have not connected yet (ICE and DTLS), in total; a
+    /// `POST` past it gets `503`.
+    pub pending: usize,
+    /// Of those, from one publisher address.
+    pub pending_per_address: usize,
 }
 
 impl Default for Limits {
@@ -94,6 +99,69 @@ impl Default for Limits {
             connections: 32,
             per_address: 8,
             client_time: Duration::from_secs(5),
+            pending: 8,
+            pending_per_address: 4,
+        }
+    }
+}
+
+/// Sessions that have not connected yet (A3.7): how many, in total and
+/// from each publisher address, and each one's address until it connects
+/// or ends.
+#[derive(Debug, Default)]
+struct Pending {
+    total: usize,
+    by_ip: HashMap<IpAddr, usize>,
+    sessions: HashMap<SessionId, IpAddr>,
+}
+
+impl Pending {
+    fn release(&mut self, ip: IpAddr) {
+        self.total = self.total.saturating_sub(1);
+        if let Some(n) = self.by_ip.get_mut(&ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.by_ip.remove(&ip);
+            }
+        }
+    }
+}
+
+/// A `POST`'s place among the pending sessions: given back on drop unless
+/// [`PendingSlot::attach`] hands it to the session, which keeps it until it
+/// connects or ends ([`Whip::settled`]).
+struct PendingSlot<'a> {
+    whip: &'a Whip,
+    ip: IpAddr,
+    attached: bool,
+}
+
+impl<'a> PendingSlot<'a> {
+    fn take(whip: &'a Whip, ip: IpAddr) -> Option<Self> {
+        let mut pending = whip.pending();
+        let here = pending.by_ip.get(&ip).copied().unwrap_or(0);
+        if pending.total >= whip.limits.pending || here >= whip.limits.pending_per_address {
+            return None;
+        }
+        pending.total += 1;
+        *pending.by_ip.entry(ip).or_insert(0) += 1;
+        Some(Self {
+            whip,
+            ip,
+            attached: false,
+        })
+    }
+
+    fn attach(mut self, id: SessionId) {
+        self.whip.pending().sessions.insert(id, self.ip);
+        self.attached = true;
+    }
+}
+
+impl Drop for PendingSlot<'_> {
+    fn drop(&mut self) {
+        if !self.attached {
+            self.whip.pending().release(self.ip);
         }
     }
 }
@@ -720,6 +788,8 @@ pub(crate) struct Whip {
     limits: Limits,
     /// What the listener refused.
     signalling: SignallingCounts,
+    /// Sessions not connected yet.
+    pending: Mutex<Pending>,
     /// Test builds only: whether a test has turned the feed's and the
     /// ingest's panic hooks on ([`injected`]). The server never does.
     #[cfg(test)]
@@ -733,6 +803,18 @@ impl Whip {
 
     fn paths(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionId>> {
         self.paths.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A session connected or ended: it no longer counts as pending.
+    fn settled(&self, id: &SessionId) {
+        let mut pending = self.pending();
+        if let Some(ip) = pending.sessions.remove(id) {
+            pending.release(ip);
+        }
     }
 }
 
@@ -830,6 +912,7 @@ fn prepare_with(
         ends: EndCounts::default(),
         limits: Limits::default(),
         signalling: SignallingCounts::default(),
+        pending: Mutex::new(Pending::default()),
         #[cfg(test)]
         panic_hooks: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1010,6 +1093,7 @@ impl Owner {
                 }
             }),
             Event::Connected(profile) => {
+                self.whip.settled(&id);
                 tracing::info!(?profile, "WHIP session connected");
                 Some(())
             }
@@ -1028,6 +1112,7 @@ impl Owner {
     /// releases the publication; that task may still add muxer reports
     /// after this.
     fn ended(&mut self, id: SessionId, reason: EndReason) {
+        self.whip.settled(&id);
         let name = end_name(reason, self.closing.remove(&id));
         let count = self.whip.ends.add(name);
         let Some(mut feed) = self.feeds.remove(&id) else {
@@ -1406,6 +1491,22 @@ async fn exchange(
         }),
         Action::Delete(id) => Some(delete(whip, id, authorization).await),
         Action::Publish(path) => {
+            let ip = match whip_request::publisher_ip(
+                peer.ip(),
+                whip.config.trusted_proxy,
+                head.forwarded_for.as_deref(),
+            ) {
+                Ok(ip) => ip.to_canonical(),
+                Err(r) => return Some(Reply::refused(r)),
+            };
+            // The failed-attempt throttle first, as a refusal of its own: a
+            // throttled address is refused before its offer is read, parsed
+            // or answered.
+            let throttle = || app.auth_throttle.lock().unwrap_or_else(|e| e.into_inner());
+            if !throttle().allowed(ip, Instant::now()) {
+                app.log_refusal("webrtc", &Refusal::Throttled);
+                return Some(Reply::refused(resource::Refusal::Throttled.into()));
+            }
             let token = match whip_request::token(authorization) {
                 Ok(token) => token,
                 Err(r) => return Some(Reply::refused(r)),
@@ -1433,14 +1534,6 @@ async fn exchange(
                     return Some(Reply::refused(Refused::new(408, "read timeout")));
                 }
             }
-            let ip = match whip_request::publisher_ip(
-                peer.ip(),
-                whip.config.trusted_proxy,
-                head.forwarded_for.as_deref(),
-            ) {
-                Ok(ip) => ip,
-                Err(r) => return Some(Reply::refused(r)),
-            };
             let bearer = whip_request::bearer(authorization).unwrap_or_default();
             Some(
                 publish(app, whip, path, token, bearer, &body, ip)
@@ -1588,6 +1681,9 @@ async fn publish(
         .await
         .map_err(refused)?;
     supersede(whip, &event).await;
+    // A3.7: after supersede, which may free a place, and before the claim.
+    let pending = PendingSlot::take(whip, ip)
+        .ok_or_else(|| Refused::new(503, "too many sessions connecting"))?;
     let publication =
         Publication::claim_admitted(app, &req, SourceKind::Es, admitted).map_err(refused)?;
     // From here a later POST for the path can find this session.
@@ -1633,19 +1729,21 @@ async fn publish(
         released_tx,
         setup,
     ));
+    // The session counts as pending from here until it connects or ends.
+    pending.attach(id);
     let (reply, registered) = oneshot::channel();
-    whip.commands
+    let sent = whip
+        .commands
         .send(Command::Register {
             id,
             session: Box::new(session),
             feed,
             reply,
         })
-        .await
-        .map_err(|_| unavailable())?;
-    match registered.await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) | Err(_) => return Err(unavailable()),
+        .await;
+    if sent.is_err() || !matches!(registered.await, Ok(Ok(()))) {
+        whip.settled(&id);
+        return Err(unavailable());
     }
     Ok(Reply {
         status: 201,

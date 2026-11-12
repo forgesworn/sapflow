@@ -143,7 +143,12 @@ async fn serve_test(
 
 /// A server whose signalling listener has `limits`.
 async fn start_limited(limits: Limits) -> Server {
-    let app = app(&[]);
+    start_limited_with(&[], limits).await
+}
+
+/// As [`start_limited`], with `env` too.
+async fn start_limited_with(env: &[(&str, &str)], limits: Limits) -> Server {
+    let app = app(env);
     let sockets = Sockets {
         http: TcpListener::bind("127.0.0.1:0").await.expect("bind"),
         udp: UdpSocket::bind("127.0.0.1:0").await.expect("bind"),
@@ -1888,6 +1893,119 @@ async fn an_offer_that_arrives_too_slowly_gets_408() {
             .load(Ordering::Relaxed),
         1
     );
+}
+
+/// The failed-attempt throttle is a refusal path of its own: past 10
+/// failed attempts a minute, an address gets `429` before its offer is
+/// read, parsed or answered, whatever it sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_throttled_address_is_refused_before_its_offer_is_read() {
+    let server = start(&[]).await;
+    let offer = Publisher::new(60, &[GCM]).offer();
+    for _ in 0..10 {
+        let a = send(
+            server.http,
+            &sdp_post("/whip/live/event-thr", "publisher:wrong", &offer),
+        )
+        .await;
+        assert_eq!(a.status, 401, "{}", a.body);
+    }
+    // The right token, but an offer that does not parse: refused as
+    // throttled, not as malformed.
+    let a = send(
+        server.http,
+        &sdp_post("/whip/live/event-thr", TOKEN, "not sdp"),
+    )
+    .await;
+    assert_eq!(a.status, 429, "{}", a.body);
+    let a = send(
+        server.http,
+        &sdp_post("/whip/live/event-thr", TOKEN, &offer),
+    )
+    .await;
+    assert_eq!(a.status, 429, "{}", a.body);
+}
+
+/// A `POST` as the trusted proxy forwards it for `ip`.
+fn forwarded_post(path: &str, ip: &str, body: &str) -> Vec<u8> {
+    let auth = format!("Bearer {TOKEN}");
+    post(
+        path,
+        &[
+            ("authorization", &auth),
+            ("content-type", "application/sdp"),
+            ("x-forwarded-for", ip),
+        ],
+        body,
+    )
+}
+
+/// A3.7: sessions that have not connected yet are capped in total and per
+/// publisher address; a `POST` past either gets `503`, and a session that
+/// ends gives its place back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_sessions_are_capped_in_total_and_per_address() {
+    let server = start_limited_with(
+        &[("SAPFLOW_WHIP_TRUSTED_PROXY", "127.0.0.1")],
+        Limits {
+            pending: 3,
+            pending_per_address: 2,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let offer = Publisher::new(61, &[GCM]).offer();
+    let post_as =
+        |n: u8, ip: &str| forwarded_post(&format!("/whip/live/event-pend-{n}"), ip, &offer);
+    let (a, b) = ("198.51.100.1", "198.51.100.2");
+    let first = send(server.http, &post_as(1, a)).await;
+    assert_eq!(first.status, 201, "{}", first.body);
+    assert_eq!(send(server.http, &post_as(2, a)).await.status, 201);
+    let refused = send(server.http, &post_as(3, a)).await;
+    assert_eq!(refused.status, 503, "per address: {}", refused.body);
+    assert_eq!(send(server.http, &post_as(4, b)).await.status, 201);
+    let refused = send(server.http, &post_as(5, b)).await;
+    assert_eq!(refused.status, 503, "in total: {}", refused.body);
+    // One of A's ends: B may start another.
+    let location = first.header("location").expect("Location").to_owned();
+    assert_eq!(send(server.http, &delete(&location)).await.status, 200);
+    assert_eq!(send(server.http, &post_as(5, b)).await.status, 201);
+}
+
+/// A session that has connected no longer counts as pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_session_no_longer_counts_as_pending() {
+    let server = start_limited(Limits {
+        pending: 1,
+        ..Limits::default()
+    })
+    .await;
+    let mut phone = Phone::new(62, &server).await;
+    assert_eq!(admit(&server, &mut phone, "event-pc-1").await.status, 201);
+    let other = Publisher::new(63, &[GCM]).offer();
+    let refused = send(
+        server.http,
+        &sdp_post("/whip/live/event-pc-2", TOKEN, &other),
+    )
+    .await;
+    assert_eq!(refused.status, 503, "{}", refused.body);
+    phone.connect().await;
+    let mut admitted = false;
+    for _ in 0..40 {
+        if send(
+            server.http,
+            &sdp_post("/whip/live/event-pc-2", TOKEN, &other),
+        )
+        .await
+        .status
+            == 201
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(admitted, "admitted once the first had connected");
 }
 
 #[test]
