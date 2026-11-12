@@ -958,9 +958,10 @@ There is no ICE restart in v1.
   pattern of `srt_own.rs`. Depacketised media goes to each publication's
   ingest task over a bounded queue. A full queue is media loss for that
   publisher, never back-pressure on the socket.
-- A panic while handling one session's packet ends that session only. Each
-  call into a session runs under `catch_unwind` (safe Rust under
-  `panic = "unwind"`), and the session is then dropped. This is an
+- A panic while handling one session ends that session only. Each call
+  into a session, each read of one between calls, the UDP owner's own code
+  for it and its ingest task's steps run under `catch_unwind` (safe Rust
+  under `panic = "unwind"`), and the session is then dropped. This is an
   acceptance check, not a hope.
 - Every cap is a stated setting with a refusal path:
   - pending (not yet connected) sessions in total and per address;
@@ -1588,24 +1589,62 @@ Implementation notes (W3c part 2a, lifecycle):
   reverse is not allowed: a WHIP `POST` never closes an SRT or RTMP
   publisher, and gets `409`. Narrowing the rule for SRT and RTMP is a
   change to all three protocols and to the v4v contract, not to WHIP.
-- **Panic isolation (A3.4).** The router runs every call into a session
-  under `catch_unwind` (`panic = "unwind"`). A session whose call panics
-  is dropped with its queued output, its ufrag and its tuples, ends with
-  `EndReason::Panicked`, and its recording is marked (`ingest-error`);
-  every other session goes on. That covers the sessions' own code (ICE,
-  DTLS, SRTP and the receiver), where hostile input lands; a panic in the
-  UDP owner's own per-session code (the feed to the ingest task) is not
-  caught, and would still end WHIP and the server. The ingest tasks are
-  separate tokio tasks, so a panic there ends only that session's
-  publication. Builds with `sapflow-whip`'s `test-panic` feature, which only
-  the server's tests enable, carry a datagram that makes a session panic
-  (`sapflow_whip::testing::PANIC_DATAGRAM`); the fuzz targets and the
-  release binary do not, and `scripts/whip-e2e.js` checks the binary for
-  it.
+- **Panic isolation (A3.4).** A panic in anything done for one session
+  ends that session only, counted as `panicked`. Its recording is marked
+  (`ingest-error`) and its path is freed, held for a reconnect if it had
+  published. Every other session goes on. Three layers each run under
+  `catch_unwind` (`panic = "unwind"`):
+  - **The router.** It guards every call into a session, and every read
+    of one it makes between calls: each session's deadline in
+    `poll_timeout` and `handle_timeout`, and the tuple owner's state when
+    another session's check arrives from its tuple. A session whose call
+    or read panics is dropped with its queued output, its ufrag and its
+    tuples, and ends with `EndReason::Panicked`. The UDP owner reads
+    sessions through `Router::inspect`, under the same guard.
+  - **The UDP owner's own code for a session**, a block at a time: what it
+    does with each of the session's events (the feed to the ingest task,
+    and the reads it makes of the session for them) and with its end. A
+    panic there drops the feed, marks the recording and closes the
+    session.
+  - **The ingest task's steps on the publication**: the ingest, the muxer
+    and the recorder, with the stream's locks held. A panic there marks
+    the recording, ends the publication as any end does, and has the owner
+    close the session; it sets the session's `panics` count before its
+    queue closes, so the end is named `panicked` whichever way the owner
+    hears of it. The stream's locks take poisoned state as it was left.
+  - **Left bare.** The routing of each datagram before it reaches a
+    session: `classify` reads the first byte, and `stun::request_username`
+    is `Message::parse`, which uses checked reads only and has the
+    `stun_message` fuzz target. `Publication`'s own `Drop`, shared with SRT
+    and RTMP: a panic in it is caught, so WHIP's cleanup still runs, but
+    how far the stream got retired is up to that code. Saturating
+    arithmetic and atomic loads in the owner.
+  - **The held stream.** After an ingest panic the stream is held for the
+    reconnect grace, as SRT and RTMP hold theirs after a panic in their
+    connection task. A muxer that panicked mid-update is left as it was,
+    and a publisher that comes back carries on from it, in a session of
+    its own. Ending the stream at once instead is a change to
+    `Publication`, which all three protocols share.
+  - **ICE-TCP** is not in this branch. Its frames must enter through the
+    owner's `receive` (or another guarded path), and its per-connection
+    framing should run in a task of its own, where tokio contains a panic.
+  - **Hooks.** Builds with `sapflow-whip`'s `test-panic` feature, which
+    only the server's tests enable, carry a datagram that makes a session
+    panic (`sapflow_whip::testing::PANIC_DATAGRAM`) and datagrams that arm
+    one of five reads to panic (`testing::arm`: `poll_timeout`,
+    `media_from`, `last_media`, `receiver` and `stats`). The server's own test
+    build carries two Opus payloads that make the feed or the ingest
+    panic. The fuzz targets and the release binary carry none, and
+    `scripts/whip-e2e.js` checks the binary for their markers.
+  - **Checked by mutation.** Each new guard was taken out in turn (the
+    router's deadline read, its claim read and `inspect`; the owner's
+    block guard; the ingest's step guard and its mark), and each time its
+    test failed.
 - **End reasons.** Every end is counted by name: the session's own
   (`handshake-timeout`, `consent-expired`, `dtls-failed`, `peer-closed`,
   `media-timeout`, `keys-exhausted`, `panicked`) or, when the server
-  closed it, why (`deleted`, `superseded`, `ingest-ended`). Each end is
+  closed it, why (`deleted`, `superseded`, `ingest-ended`, and `panicked`
+  for a panic in its feed or its ingest). Each end is
   logged with its reason and that reason's count; no address is logged.
 
 | Claim | Test | Status |
@@ -1619,8 +1658,9 @@ Implementation notes (W3c part 2a, lifecycle):
 | A3.3: after `SAPFLOW_WHIP_STALE` without media, a second `POST` takes over at once | `whip::tests::a_stalled_session_is_superseded` | Met in process (stale set to 1 s) |
 | A3.3: a second `POST` during the first session's handshake replaces it at once | `whip::tests::a_post_during_the_first_handshake_replaces_it` | Met in process |
 | SRT takes over a live WHIP stream in global-publisher mode, and a WHIP `POST` never takes over SRT | `whip::tests::srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt` | Met in process |
-| A3.4: a panic in a session call ends only that session; another keeps publishing with nothing lost; its recording is marked | `router::tests::a_panicking_session_is_dropped_and_the_others_go_on` (sapflow-whip), `whip::tests::a_panic_in_one_session_ends_only_that_session`, `whip::tests::an_abnormal_end_marks_the_recording` | Met in process for session calls; the owner's own code is not guarded |
-| The panic hook is in no binary but the tests' | `scripts/whip-e2e.js` (the built binary is searched for its marker) | Met |
+| A3.4: a panic in a call into a session, or in a read of one (its deadline, a tuple owner's state, the owner's reads), ends only that session; another keeps publishing with nothing lost; its recording is marked | `router::tests::a_panicking_session_is_dropped_and_the_others_go_on`, `a_session_whose_deadline_panics_is_dropped_and_the_others_go_on`, `a_tuple_owner_whose_read_panics_is_dropped_at_another_sessions_check`, `a_session_whose_inspected_read_panics_is_dropped` (sapflow-whip); `whip::tests::a_panic_in_one_session_ends_only_that_session`, `a_panic_in_a_session_deadline_ends_only_that_session`, `a_panic_in_the_owners_read_ends_only_that_session`, `a_panic_in_the_supersede_read_ends_only_that_session` | Met in process |
+| A3.4: a panic in the UDP owner's feed for a session, or in its ingest inside the publication, ends only that session, as above | `whip::tests::a_panic_in_the_feed_ends_only_that_session`, `whip::tests::a_panic_in_the_ingest_ends_only_that_session` | Met in process. Each A3.4 server test checks that A ends as `panicked` and never as `ingest-ended`; that A's recording reads `ingest-error` (when nothing marked it before the panic); that A's entries are gone and its publication released; and that a new `POST` for A's path gets 201. B must show no marks, and its playlist must grow after A has gone |
+| The panic hooks are in no binary but the tests' | `scripts/whip-e2e.js` (the built binary is searched for their markers) | Met |
 | End reasons are counted by name | `whip::tests::every_end_reason_has_a_name`, and the counts asserted in the A3.2, A3.3 and A3.4 tests | Met |
 | `SAPFLOW_WHIP_STALE` | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 

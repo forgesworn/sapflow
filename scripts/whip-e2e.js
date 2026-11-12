@@ -189,9 +189,12 @@ function hits(text, s) {
 }
 
 (async () => {
-  // 0. The panic-injection hook exists only in test builds.
-  const marker = 'sapflow-whip test: panic here';
-  check('the binary has no panic-injection hook', !fs.readFileSync(bin).includes(Buffer.from(marker)));
+  // 0. The panic-injection hooks exist only in test builds: the session's
+  // panic and armed reads (sapflow-whip's test-panic feature), and the
+  // server's feed and ingest payloads (its own test build).
+  const image = fs.readFileSync(bin);
+  const markers = ['sapflow-whip test: panic here', 'sapflow-whip test: panic in ', 'sapflow test: panic in the'];
+  check('the binary has no panic-injection hook', markers.every((m) => !image.includes(Buffer.from(m))));
 
   // 1. A3.6 default: nothing bound without SAPFLOW_WHIP_ADDR.
   let s = await sapflow({ ...common }, path.join(out, 'off.log'), 'HLS listening');
