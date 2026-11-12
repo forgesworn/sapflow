@@ -420,7 +420,11 @@ contract unchanged in shape:
 - `ip` is the publisher's address. Behind a front proxy, it comes from
   `X-Forwarded-For` only when the request arrives from
   `SAPFLOW_WHIP_TRUSTED_PROXY`; otherwise it is the peer address. The
-  existing throttle (10 failed attempts a minute per address) applies.
+  existing throttle (10 failed attempts a minute per address) applies. It
+  counts each address in full, an IPv6 address to its /128, and is shared
+  with SRT and RTMP, so an IPv6 host with a /64 can spread failed
+  attempts over many addresses. It is left as it is; WHIP's own
+  per-address caps count an IPv6 address by its /64.
 
 ## Connectivity
 
@@ -1082,6 +1086,32 @@ resolution either, so that is not proof that it prevents one.
   received inside the window is accepted; a duplicate of a received index is
   refused.
 
+### Which recording a loss marks
+
+One rule: a loss is marked on the recording that would have held the
+lost media.
+
+- **Transport losses**: receiver loss, a full ingest queue, an abnormal
+  end, and a panic in the UDP owner's code for the session. The recording
+  is the one current at the loss's place in stream order, and the ingest
+  queue gives that order (W3c part 2b):
+  - the owner's marks travel in the queue behind the media queued before
+    them (`Item::Marks`);
+  - no item is queued while a mark waits for room, so none overtakes it;
+  - marks the feed still holds when it goes are applied after the rest of
+    the queue.
+
+  So a loss reported behind a queued keyframe that rolls the recording (a
+  codec epoch change) is the new file's, and one reported before it is
+  the old file's.
+- **Media the muxer drops after a cut**, such as late audio stamped in
+  the old epoch and dropped once the recording has rolled, belongs to the
+  file its timestamp falls in.
+- **Marks the ingest raises itself** (over the bitrate cap, a refused
+  push, an ingest panic) are in stream order already.
+- Where one ingest batch both rolls the recording and finds loss, with no
+  sample-level attribution, both files are marked (#77), never neither.
+
 ### Congestion feedback
 
 Sapflow sends RTCP receiver reports (RFC 3550) for each stream it receives,
@@ -1167,7 +1197,7 @@ There is no ICE restart in v1.
   for it and its ingest task's steps run under `catch_unwind` (safe Rust
   under `panic = "unwind"`), and the session is then dropped. This is an
   acceptance check, not a hope.
-- Every cap is a stated setting with a refusal path:
+- Every cap is stated, with its value, and has a refusal path:
   - pending (not yet connected) sessions in total (8) and per publisher
     address (4);
   - signalling connections in total (32) and per peer address (8, the
@@ -1922,24 +1952,32 @@ Implementation notes (W3c part 2b, limits, 12 November 2026):
 - **The signalling listener.** It holds at most 32 connections, and at
   most 8 from one peer address: one address holds at most a quarter of
   the slots, so four addresses or more are needed to hold them all, and
-  each connection for at most 5 s and then its answer. The trusted proxy
-  is not limited, since every publisher behind it shares its address.
-  Behind a front proxy without `SAPFLOW_WHIP_TRUSTED_PROXY`, every
-  connection is from the proxy, so both per-address caps (8 signalling
-  connections, 4 pending sessions) fall on it. Past either, a connection is closed as it
-  arrives. The head and the offer share one deadline, 5 s from the
-  connection, so a slow client holds a slot for 5 s and then the time to
-  send its answer; before, the head had 5 s and then the offer,
-  admission and setup another 10 s, and a late offer got `503`. Now it
-  gets `408`. The listener counts what it refuses, with no addresses.
+  each connection for at most 5 s and then its answer. An IPv6 address
+  counts by its /64 (one host's usual share) and an IPv4 address whole,
+  so it takes four /64s or four IPv4 addresses. Past either cap, a
+  connection is closed as it arrives.
+  - The trusted proxy is not limited, since every publisher behind it
+    shares its address. With no per-client signalling cap behind it, one
+    client could hold all 32 slots for about 5 s each, so the proxy must
+    enforce its own per-client connection limit.
+  - Behind a front proxy without `SAPFLOW_WHIP_TRUSTED_PROXY`, every
+    connection is from the proxy, so both per-address caps (8 signalling
+    connections, 4 pending sessions) fall on it.
+  - The head and the offer share one deadline, 5 s from the connection,
+    so a slow client holds a slot for 5 s and then the time to send its
+    answer. Before, the head had 5 s and then the offer, admission and
+    setup another 10 s, and a late offer got `503`; now it gets `408`.
+  - The listener counts what it refuses, with no addresses.
 - **The throttle** is its own refusal path. The failed-attempt throttle
   (10 failed attempts a minute per address, shared with SRT and RTMP) is
   checked straight after the head: a throttled address gets `429`
   before its offer is read, parsed or answered, whatever it sends.
-  Admission still counts each failure.
+  Admission still counts each failure. The throttle keys an IPv6 address
+  in full (see [Admission](#admission)), and is left so.
 - **Pending sessions.** At most 8 sessions that have not connected (ICE
   and DTLS) at once, and 4 from one publisher address (the
-  `X-Forwarded-For` address behind the trusted proxy). A `POST` past
+  `X-Forwarded-For` address behind the trusted proxy; an IPv6 address
+  counts by its /64). A `POST` past
   either gets `503`. The place is taken after admission and supersede,
   which may free one, and before the claim; a session gives it back when
   it connects or ends, and one that never reached the router (a
@@ -1961,13 +1999,17 @@ Implementation notes (W3c part 2b, limits, 12 November 2026):
   (`Item::Marks`), and the ingest applies each to the recording current
   when it reaches it. A mark that finds no room waits in the feed and
   goes ahead of the next item that fits. Any the feed still holds when
-  it goes are applied after the rest of the queue. Marks the ingest
-  raises itself (over the rate cap, a refused push, a panic) were in
-  order already.
+  it goes are applied after the rest of the queue. While a mark waits,
+  every item is refused as the queue being full, so none can go in ahead
+  of it when the ingest frees a slot. Marks the ingest raises itself (over
+  the rate cap, a refused push, a panic) were in order already. The rule
+  is stated once, in
+  [Which recording a loss marks](#which-recording-a-loss-marks).
 - **Accept errors.** RTMP and the scoped control API ended on a failed
   accept, as WHIP did before part 1. Every tokio listener now takes
   connections through `accept::next`, which logs the error and tries
-  again after 100 ms.
+  again after 100 ms. A failure that lasts is logged once a second per
+  listener at most, with how many were left out.
 - **The log-capture flake.** The publish-auth log test sometimes missed
   its line with the server's tests running in parallel. Its subscriber
   was the thread's own (`set_default`); while that is the only
@@ -2007,8 +2049,12 @@ Implementation notes (W3c part 2b, limits, 12 November 2026):
 | A request still arriving 5 s after the connection gets `408` | `whip::tests::an_offer_that_arrives_too_slowly_gets_408` | Met in process (1 s) |
 | A throttled address gets `429` before its offer is read or parsed | `whip::tests::a_throttled_address_is_refused_before_its_offer_is_read` | Met in process |
 | A3.7: pending sessions are capped in all and per publisher address; one that connects or ends gives its place back | `whip::tests::pending_sessions_are_capped_in_total_and_per_address`, `whip::tests::a_connected_session_no_longer_counts_as_pending` | Met in process (caps set small) |
-| Finding the next deadline and what is due reads no session | `router::tests::media_to_one_session_reads_no_other_sessions_deadline`, `router::tests::the_deadline_index_follows_every_session`, and the index checked after every step of the router tests and the router harness | Met |
-| A mark raised behind a queued item that rolls the recording lands on the new file; one with no room at the end still lands | `whip::tests::a_mark_raised_behind_a_queued_roll_lands_on_the_new_recording`, `whip::tests::a_mark_with_no_room_at_the_end_still_reaches_the_recording` | Met in process |
+| Finding the next deadline and what is due reads no session; `handle_timeout` runs only the sessions that are due | `router::tests::media_to_one_session_reads_no_other_sessions_deadline`, `router::tests::the_deadline_index_follows_every_session`, and the index checked after every step of the router tests and the router harness | Met |
+| A mark raised behind a queued item that rolls the recording lands on the new file; one with no room at the end still lands | `whip::tests::a_mark_raised_behind_a_queued_roll_lands_on_the_new_recording`, `whip::tests::a_mark_with_no_room_at_the_end_still_reaches_the_recording`, and through the real ingest task `whip::tests::the_ingest_applies_held_marks_and_gives_back_the_place_as_it_ends` | Met in process |
+| No item goes ahead of a mark waiting for room | `whip::tests::an_item_never_goes_ahead_of_a_held_mark` | Met in process |
+| A `POST` cancelled before its session reached the router gives its pending place back | `whip::tests::the_ingest_applies_held_marks_and_gives_back_the_place_as_it_ends` | Met in process |
+| The per-address caps count an IPv6 address by its /64 and an IPv4 address whole | `whip::tests::the_per_address_caps_count_ipv6_by_its_64`, `whip::tests::address_keys_are_an_ipv4_address_or_an_ipv6_64` | Met in process |
+| A failed accept that lasts is logged once a second per listener | `accept::tests::failed_accepts_are_logged_once_a_second` | Met |
 | A3.7: unauthenticated STUN, DTLS and random datagrams from a fresh address draw nothing | `whip::tests::a_fresh_address_draws_nothing` (real UDP), the session and router harnesses (`fuzzing::tests::unauthenticated_checks_draw_nothing`, `router_scripts_hold_the_invariants`) | Met in process; no packet capture |
 | A3.7: a captured check re-sent from a fresh address draws nothing once its original has arrived, while its ID is remembered | `whip::tests::a_fresh_address_draws_nothing`; the session harness's oracle, over its seeds and mutations | Met in process |
 | A3.7: any mix of re-sent checks and copied SRTP from an address draws at most four times what it sent | the session harness (per tuple) and the router harness (per tuple, across sessions) | Met in the harnesses and the fuzz targets |
