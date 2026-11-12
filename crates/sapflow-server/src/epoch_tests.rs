@@ -845,6 +845,18 @@ async fn es_recordings(
     frames: &[Frame],
     files: usize,
 ) -> (Vec<serde_json::Value>, crate::test_support::Scratch) {
+    es_recordings_marked(frames, files, None).await
+}
+
+/// [`es_recordings`], with a transport mark (`reason`) raised after the
+/// frame at index `at`, as WHIP's owner raises one through the queue
+/// (`Item::Marks` reach the publication's loss notice); it must find the
+/// outgoing recording held for late audio there.
+async fn es_recordings_marked(
+    frames: &[Frame],
+    files: usize,
+    mark: Option<(usize, crate::recorder::IncompleteReason)>,
+) -> (Vec<serde_json::Value>, crate::test_support::Scratch) {
     let (mut app, scratch) = app(true);
     let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
     let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
@@ -867,7 +879,16 @@ async fn es_recordings(
             Frame::Video(..) => None,
         })
         .expect("AAC");
-    for frame in frames {
+    for (i, frame) in frames.iter().enumerate() {
+        if let Some((at, reason)) = mark
+            && i == at
+        {
+            assert!(
+                publisher.stream.session().holds_outgoing(),
+                "the outgoing file is held when the mark comes"
+            );
+            publisher.loss_notice().mark_incomplete(reason);
+        }
         publisher
             .push(|source, now| {
                 let crate::stream::Source::Es(es) = source else {
@@ -970,6 +991,43 @@ async fn a_recording_through_a_stall_and_a_break_reports_its_media_duration() {
         (reported - end).abs() <= 0.002,
         "reported {reported} s, the media ends at {end} s"
     );
+}
+
+/// A transport loss while the outgoing file is held for its late audio
+/// (here audio 300 ms behind, so five late frames are dropped): the
+/// transport mark goes to the recording current in stream order, the new
+/// file, and the late audio marks only the held one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffprobe; run explicitly for origin acceptance"]
+async fn transport_marks_reach_the_current_file_while_the_outgoing_one_is_held() {
+    const CHANGE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-change.ts");
+    let frames = audio_behind(elementary_frames(CHANGE), 300 * 90);
+    let cut = frames
+        .iter()
+        .position(|f| matches!(f, Frame::Video(dts, ..) if *dts == 309_840))
+        .expect("the change");
+    let reason = crate::recorder::IncompleteReason::IngestQueueFull;
+    let (done, _scratch) = es_recordings_marked(&frames, 2, Some((cut + 4, reason))).await;
+    let states: Vec<(u32, String, String)> = done
+        .iter()
+        .map(|b| {
+            let file = std::path::PathBuf::from(b["segmentPath"].as_str().expect("a path"));
+            (
+                widths_of(std::slice::from_ref(&file))[0],
+                b["recordingState"].as_str().unwrap_or_default().to_owned(),
+                b["recordingReason"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let of = |width: u32| {
+        states
+            .iter()
+            .find(|s| s.0 == width)
+            .map(|s| (s.1.as_str(), s.2.as_str()))
+            .unwrap_or_else(|| panic!("a {width}-wide file in {states:?}"))
+    };
+    assert_eq!(of(160), ("incomplete", "media-loss"), "the held file");
+    assert_eq!(of(128), ("incomplete", reason.as_str()), "the current file");
 }
 
 /// The resolution change with its audio arriving 100, 300, 500 and 1000 ms

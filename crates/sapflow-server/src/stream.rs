@@ -219,6 +219,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// Whether an outgoing recording is held for its late audio.
+    #[cfg(test)]
+    pub(crate) fn holds_outgoing(&self) -> bool {
+        self.outgoing.is_some()
+    }
+
     pub fn owns_connection(&self, generation: u64) -> bool {
         self.generation == generation && self.attached
     }
