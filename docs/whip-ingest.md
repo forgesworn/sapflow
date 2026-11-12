@@ -1118,7 +1118,7 @@ bound even when only `tcp` candidates are advertised.
 | `SAPFLOW_WHIP_ALLOW_ORIGINS` | Origins allowed by CORS for browser publishing |
 | `SAPFLOW_WHIP_KEYFRAME_INTERVAL` | Keyframe request cadence, proposed 2 s |
 | `SAPFLOW_WHIP_JITTER` | Longest wait for a lost packet, proposed 200 ms |
-| `SAPFLOW_WHIP_STALE` | Media silence after which a new `POST` may supersede a session, proposed 2 s |
+| `SAPFLOW_WHIP_STALE` | Media silence after which a new `POST` may supersede a session, default 2 s |
 | `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | `maxaveragebitrate` offered for Opus |
 
 ## Delay budget
@@ -1660,21 +1660,47 @@ Implementation notes (W3c part 2a, lifecycle):
     and a publisher that comes back carries on from it, in a session of
     its own. Ending the stream at once instead is a change to
     `Publication`, which all three protocols share.
-  - **ICE-TCP** is not in this branch. Its frames must enter through the
-    owner's `receive` (or another guarded path), and its per-connection
-    framing should run in a task of its own, where tokio contains a panic.
-  - **Hooks.** Builds with `sapflow-whip`'s `test-panic` feature, which
-    only the server's tests enable, carry a datagram that makes a session
-    panic (`sapflow_whip::testing::PANIC_DATAGRAM`) and datagrams that arm
-    one of five reads to panic (`testing::arm`: `poll_timeout`,
-    `media_from`, `last_media`, `receiver` and `stats`). The server's own test
-    build carries two Opus payloads that make the feed or the ingest
-    panic. The fuzz targets and the release binary carry none, and
-    `scripts/whip-e2e.js` checks the binary for their markers.
+  - **ICE-TCP.** Frames from its connections enter through the owner's
+    `receive`, as datagrams do, so the guards above cover a session on a
+    TCP tuple too (`whip::tcp_tests::a_panic_in_a_tcp_session_ends_only_that_session`).
+    A send to a TCP tuple is queued under `catch_unwind` in
+    `Link::transmit`: a panic there drops that packet (counted in the
+    listener's `queue_panics`), never the owner; that guard has no test of
+    its own. Each connection's front and framing run in a task of their
+    own, where tokio contains a panic and the connection's slot is freed.
+  - **Hooks.** `sapflow-whip`'s `test-panic` feature compiles in a
+    datagram that makes a session panic
+    (`sapflow_whip::testing::PANIC_DATAGRAM`) and datagrams that arm one of
+    five reads to panic (`testing::arm`: `poll_timeout`, `media_from`,
+    `last_media`, `receiver` and `stats`). The server's own test build has
+    two Opus payloads that make the feed or the ingest panic. What holds:
+    - A build without test targets contains none of them: the release
+      recipe, `cargo build --release -p sapflow` (the Dockerfile's), and a
+      plain `cargo build -p sapflow`. `scripts/whip-e2e.js` searches the
+      binary it runs for their markers. The fuzz targets never enable
+      `test-panic`.
+    - A build that includes the server's test targets (for example
+      `cargo build -p sapflow --all-targets`) unifies the dev-dependency's
+      `test-panic` into the `sapflow` binary too, so that binary contains
+      `sapflow-whip`'s hooks. They stay inert there: each hook also needs a
+      switch that only a test turns on at run time
+      (`Router::enable_panic_hooks`, which passes it to each session, and
+      the server's `Whip::panic_hooks` for the two payloads, which exist in
+      test builds only). The server never turns it on, and every router
+      starts with it off. With it off, the panic datagram and the arm
+      datagrams are unknown datagrams to the session, and the payloads are
+      only audio (`router::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on`,
+      `whip::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on`,
+      which drives the server's own `prepare` and `run` with the hooks
+      compiled in and the switch off, as such a binary runs).
+    - The switch is per router (and per server for the payloads), not
+      process-wide, so the tests that turn it on and the ones that check it
+      off run side by side in one test binary.
   - **Checked by mutation.** Each new guard was taken out in turn (the
     router's deadline read, its claim read and `inspect`; the owner's
     block guard; the ingest's step guard and its mark), and each time its
-    test failed.
+    test failed. Forcing each hook's switch on in turn (the session's, the
+    feed's and the ingest's) fails the switch-off tests.
 - **End reasons.** Every end is counted by name: the session's own
   (`handshake-timeout`, `consent-expired`, `dtls-failed`, `peer-closed`,
   `media-timeout`, `keys-exhausted`, `panicked`) or, when the server
@@ -1695,7 +1721,9 @@ Implementation notes (W3c part 2a, lifecycle):
 | SRT takes over a live WHIP stream in global-publisher mode, and a WHIP `POST` never takes over SRT | `whip::tests::srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt` | Met in process |
 | A3.4: a panic in a call into a session, or in a read of one (its deadline, a tuple owner's state, the owner's reads), ends only that session; another keeps publishing with nothing lost; its recording is marked | `router::tests::a_panicking_session_is_dropped_and_the_others_go_on`, `a_session_whose_deadline_panics_is_dropped_and_the_others_go_on`, `a_tuple_owner_whose_read_panics_is_dropped_at_another_sessions_check`, `a_session_whose_inspected_read_panics_is_dropped` (sapflow-whip); `whip::tests::a_panic_in_one_session_ends_only_that_session`, `a_panic_in_a_session_deadline_ends_only_that_session`, `a_panic_in_the_owners_read_ends_only_that_session`, `a_panic_in_the_supersede_read_ends_only_that_session` | Met in process |
 | A3.4: a panic in the UDP owner's feed for a session, or in its ingest inside the publication, ends only that session, as above | `whip::tests::a_panic_in_the_feed_ends_only_that_session`, `whip::tests::a_panic_in_the_ingest_ends_only_that_session` | Met in process. Each A3.4 server test checks that A ends as `panicked` and never as `ingest-ended`; that A's recording reads `ingest-error` (when nothing marked it before the panic); that A's entries are gone and its publication released; and that a new `POST` for A's path gets 201. B must show no marks, and its playlist must grow after A has gone |
-| The panic hooks are in no binary but the tests' | `scripts/whip-e2e.js` (the built binary is searched for their markers) | Met |
+| A3.4 over ICE-TCP: a panic in a session on a TCP tuple ends only that session; another on its own connection keeps publishing with nothing marked | `whip::tcp_tests::a_panic_in_a_tcp_session_ends_only_that_session` | Met in process |
+| No build without test targets contains the panic hooks (`cargo build --release -p sapflow`, `cargo build -p sapflow`) | `scripts/whip-e2e.js` (the binary it runs is searched for their markers) | Met |
+| A build with the test targets (`--all-targets`) contains `sapflow-whip`'s hooks, and they do nothing unless a test turns them on | `router::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on` (sapflow-whip), `whip::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on` | Met in process; the server never calls `Router::enable_panic_hooks` |
 | End reasons are counted by name | `whip::tests::every_end_reason_has_a_name`, and the counts asserted in the A3.2, A3.3 and A3.4 tests | Met |
 | `SAPFLOW_WHIP_STALE` | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 
