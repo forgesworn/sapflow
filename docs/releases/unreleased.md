@@ -129,16 +129,25 @@ Notes for the release after 0.2.0-rc.1.
   v4v's 1 s keyframes keep 24. A longer interval keeps fewer, longer
   segments: 8 s keyframes keep seven segments, 56 s, where they kept 192 s,
   and a stream's memory fell with it. 0 turns the bound off.
-- A new stream is refused once the live fragment budget is 80% used
-  (`stream::NEW_STREAM_FRAGMENT_PERCENT`), with SRT `402`, RTMP
-  `NetStream.Publish.Denied` "media memory limit" and WHIP 503. Once the
-  budget was full, the next part any stream sealed was refused, which in
-  testing dropped 30 of 32 publishers within 10 s, and encoders that
-  reconnected into it kept being dropped. A publisher reconnecting to a
-  stream still held for it is not refused for memory. The refusal does not
-  count against the failed-attempt throttle, but a retrying encoder asks
+- A new stream is refused when the live fragment budget would be too full
+  for it, with SRT `402`, RTMP `NetStream.Publish.Denied` "media memory
+  limit" and WHIP 503. Once the budget was full, the next part any stream
+  sealed was refused, which in testing dropped 30 of 32 publishers within
+  10 s, and encoders that reconnected into it kept being dropped. A stream
+  fills its window over tens of seconds, so admission counts what the
+  streams hold, plus the growth expected of each live stream still filling
+  (`Muxer::projected_window_bytes`, from its completed segments), plus one
+  typical (median) window for each still starting and for the newcomer,
+  against 80% (`stream::NEW_STREAM_FRAGMENT_PERCENT`). While eight live
+  streams have no completed segment (`stream::MAX_STARTING_STREAMS`), a
+  newcomer waits, so a crowd arriving at once is let in as its windows can
+  be measured. A publisher reconnecting to a stream still held for it is
+  not refused for memory. A publisher whose bitrate rises after admission
+  can still fill the budget. The refusal does not count against the
+  failed-attempt throttle, but a retrying encoder asks
   `SAPFLOW_PUBLISH_AUTH_URL` again each time. sapflow-core adds
-  `FragmentQuota::maximum`.
+  `FragmentQuota::maximum`; sapflow-hls adds `Muxer::projected_window_bytes`
+  and `Muxer::held_window_bytes`.
 
 - A stream's recording no longer rolls to a new file at every codec epoch
   without bound. Each stream has a budget of rolls

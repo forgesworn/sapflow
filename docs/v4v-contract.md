@@ -56,10 +56,12 @@ content-type: application/json
   publishers or memory) or `PREDEFINED:503` (the app did not answer usably).
   RTMP refusals are `NetStream.Publish.Denied`.
 - A stage that admits can still be refused after the app's answer, by
-  sapflow's own limits. That includes a new stage while sapflow's media
-  memory is over 80% used (SRT `402`, RTMP "media memory limit"); an
-  encoder reconnecting to a stage sapflow still holds is not refused for
-  memory. An encoder that retries asks the app again each time.
+  sapflow's own limits. That includes a new stage when sapflow's media
+  memory would be too full for it (the streams' expected windows at 80% of
+  the budget) or while eight stages are still starting, as after a restart
+  (SRT `402`, RTMP "media memory limit"); an encoder reconnecting to a stage
+  sapflow still holds is not refused for memory, and a refused one is let
+  in as room appears. An encoder that retries asks the app again each time.
 
 ## Ingest addresses v4v hands to encoders
 

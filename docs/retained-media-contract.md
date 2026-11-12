@@ -64,6 +64,14 @@ shared storage.
 
 At resident capacity, RTMP receives `NetStream.Publish.Denied` with
 `presentation limit`; SRT receives the existing resource-refusal status 402.
+A new presentation is also refused, before the RTMP credit or a presentation
+reservation is taken, when the live fragment budget would be too full for
+it (`stream::NEW_STREAM_FRAGMENT_PERCENT`: what is held, plus the projected
+growth of live streams still filling and one typical window for each still
+starting and for the newcomer, against 80%), or while
+`stream::MAX_STARTING_STREAMS` (8) live streams have no completed segment:
+RTMP `media memory limit`, SRT 402, WHIP 503. A reconnect to a held
+presentation resumes before this check.
 Admission runs before recorder setup. Failure rolls back any temporarily
 reserved RTMP publication credit. Same-path reconnect and takeover reuse the
 resident reservation, without silently evicting another presentation. If an

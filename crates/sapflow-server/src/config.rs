@@ -85,8 +85,9 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            64 at default, explicit values 1..4096)
   SAPFLOW_MAX_FRAGMENT_BYTES shared encoded init/fragment backing capacity
                            (default 536870912, 512 MiB; positive byte count);
-                           a new stream is refused once 80% is in use, so live
-                           ones keep room (a reconnect to a held one is not)
+                           a new stream is refused once the streams' expected
+                           windows would fill 80% of it, or while eight are
+                           starting (a reconnect to a held one is not)
   SAPFLOW_MAX_RETAINED_BYTES media kept past the live window so parts and
                            segments stay fetchable (RFC 8216bis 6.2.2),
                            charged apart from the fragment bytes and never

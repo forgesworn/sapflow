@@ -906,9 +906,10 @@ pub enum ClaimError {
     AlreadyLive,
     PublisherLimit,
     PresentationLimit,
-    /// The live fragment budget is past [`NEW_STREAM_FRAGMENT_PERCENT`]: a
-    /// new stream, which fills its window from nothing, would take the room
-    /// the streams already live need to slide theirs.
+    /// The live fragment budget would be too full for a new stream (see
+    /// `Registry::admits_new_stream`), or [`MAX_STARTING_STREAMS`] are
+    /// still starting: it would take the room the streams already live need
+    /// to fill and slide their windows.
     MemoryLimit,
 }
 
