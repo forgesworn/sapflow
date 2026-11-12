@@ -1406,6 +1406,26 @@ impl EpochRun {
         .await;
     }
 
+    /// Collects completed files until none has come for `idle`, or `cap`
+    /// has passed. Finishing a file is asynchronous, and a loaded runner can
+    /// take longer than any fixed wait to finish twenty of them.
+    async fn drain_until_quiet(&mut self, idle: Duration, cap: Duration) {
+        let deadline = tokio::time::Instant::now() + cap;
+        loop {
+            let wait = idle.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            match tokio::time::timeout(wait, self.receiver.recv()).await {
+                Ok(Some(callback)) => {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&callback.body).expect("recording callback JSON");
+                    if body["event"] == "recordSegmentComplete" {
+                        self.done.push(body);
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+
     /// Ends the presentation (no reconnect hold) and collects every file.
     async fn end(&mut self, publisher: crate::publish::Publication) {
         publisher.end();
@@ -1416,7 +1436,8 @@ impl EpochRun {
             .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Es)
             .expect("claim");
         self.app.streams.detach(&stream, generation, false);
-        self.drain_for(Duration::from_secs(2)).await;
+        self.drain_until_quiet(Duration::from_secs(5), Duration::from_secs(60))
+            .await;
     }
 
     fn states(&self) -> Vec<(String, String)> {
