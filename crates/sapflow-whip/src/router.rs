@@ -62,9 +62,9 @@
 //!
 //! Every call into a session runs under `catch_unwind` (the workspace
 //! builds with `panic = "unwind"`), and so does every read of one the
-//! router makes between calls: each session's deadline in
-//! [`Router::poll_timeout`] and [`Router::handle_timeout`], and the tuple
-//! owner's state when another session's check arrives from its tuple. A
+//! router makes: each session's deadline, read as each call ends (see
+//! Deadlines), and the tuple owner's state when another session's check
+//! arrives from its tuple. A
 //! caller reads a session the same way through [`Router::inspect`]. A
 //! session whose call or read panics is dropped with its queued output, its
 //! ufrag and its tuples, and its last event is `Ended(Panicked)`; every
@@ -72,6 +72,15 @@
 //! for tests and diagnostics. The routing itself reads only a datagram's
 //! first byte ([`classify`]) and, for STUN, its USERNAME
 //! ([`stun::request_username`]); neither reaches session code.
+//!
+//! # Deadlines
+//!
+//! A session's deadline changes only in its own calls, so the router reads
+//! it as each call ends and keeps every session's in one sorted index.
+//! [`Router::poll_timeout`] is the index's first entry and
+//! [`Router::handle_timeout`] runs the sessions at its front, so neither
+//! reads every session, and the cost of a datagram does not grow with the
+//! number of sessions beyond the index's logarithm.
 //!
 //! # Driving it
 //!
@@ -87,7 +96,7 @@ use crate::ice::{Kind, Tuple, classify};
 use crate::resource::SessionId;
 use crate::session::{Event, Session, SessionError, State, Transmit};
 use crate::stun;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Bounds and the ownership hold.
@@ -160,6 +169,8 @@ struct Entry {
     session: Session,
     /// Tuples this session owns, all validated by it.
     owned: Vec<Tuple>,
+    /// Its deadline as its last call ended: its key in `Router::due`.
+    due: Option<Instant>,
 }
 
 /// Every session on one socket. See the module docs.
@@ -171,6 +182,8 @@ pub struct Router {
     out: VecDeque<Transmit>,
     events: VecDeque<(SessionId, Event)>,
     stats: RouterStats,
+    /// Every live session's deadline, earliest first (module docs).
+    due: BTreeSet<(Instant, SessionId)>,
     /// Test builds only: whether sessions get their panic hooks turned on
     /// ([`Router::enable_panic_hooks`]).
     #[cfg(any(test, feature = "test-panic"))]
@@ -189,6 +202,7 @@ impl Router {
             out: VecDeque::new(),
             events: VecDeque::new(),
             stats: RouterStats::default(),
+            due: BTreeSet::new(),
             #[cfg(any(test, feature = "test-panic"))]
             panic_hooks: false,
         })
@@ -263,6 +277,7 @@ impl Router {
             Entry {
                 session,
                 owned: Vec::new(),
+                due: None,
             },
         );
         self.drain(id);
@@ -310,14 +325,15 @@ impl Router {
         Some(id)
     }
 
-    /// Runs every session whose deadline has come.
+    /// Runs every session whose deadline has come, from the index (module
+    /// docs).
     pub fn handle_timeout(&mut self, now: Instant) {
-        let mut due = Vec::new();
-        self.deadlines(|id, d| {
-            if d <= now {
-                due.push(id);
-            }
-        });
+        let due: Vec<SessionId> = self
+            .due
+            .iter()
+            .take_while(|(d, _)| *d <= now)
+            .map(|(_, id)| *id)
+            .collect();
         for id in due {
             if self.guarded(id, |s| s.handle_timeout(now)).is_some() {
                 self.drain(id);
@@ -325,31 +341,42 @@ impl Router {
         }
     }
 
-    /// The earliest session deadline. A session whose deadline panics is
-    /// dropped here (module docs), so drain [`Router::poll_event`] before
-    /// waiting on it: [`RouterStats::panics`] says whether one was.
-    pub fn poll_timeout(&mut self) -> Option<Instant> {
-        let mut earliest: Option<Instant> = None;
-        self.deadlines(|_, d| earliest = Some(earliest.map_or(d, |e| e.min(d))));
-        earliest
+    /// The earliest session deadline, from the index (module docs).
+    pub fn poll_timeout(&self) -> Option<Instant> {
+        self.due.first().map(|(d, _)| *d)
     }
 
-    /// Each live session's deadline, each read under `catch_unwind`; a
-    /// session whose read panics is dropped once all are read.
-    fn deadlines(&mut self, mut f: impl FnMut(SessionId, Instant)) {
-        let mut failed = Vec::new();
+    /// Whether the index holds exactly each live session's deadline, read
+    /// now (tests and the fuzz harness).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn deadlines_indexed(&self) -> bool {
+        let mut now: BTreeSet<(Instant, SessionId)> = BTreeSet::new();
         for (id, e) in &self.sessions {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                e.session.poll_timeout()
-            })) {
-                Ok(Some(d)) => f(*id, d),
-                Ok(None) => {}
-                Err(_) => failed.push(*id),
+            if let Some(d) = e.session.poll_timeout() {
+                now.insert((d, *id));
+            }
+            if e.due != e.session.poll_timeout() {
+                return false;
             }
         }
-        for id in failed {
-            self.fail(id);
+        now == self.due
+    }
+
+    /// Keys a session under its deadline as its call ends.
+    fn reindex(&mut self, id: SessionId, due: Option<Instant>) {
+        let Some(e) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        if e.due == due {
+            return;
         }
+        if let Some(old) = e.due {
+            self.due.remove(&(old, id));
+        }
+        if let Some(new) = due {
+            self.due.insert((new, id));
+        }
+        e.due = due;
     }
 
     /// Asks a session's publisher for a keyframe
@@ -415,7 +442,7 @@ impl Router {
         self.stats.claims += 1;
         // Keep only tuples the session still has validated. If its read
         // panics, it is dropped with every tuple it owns, this one too.
-        let lapsed = self.guarded_entry(id, |Entry { session, owned }| {
+        let lapsed = self.guarded_entry(id, |Entry { session, owned, .. }| {
             owned.push(tuple);
             let mut lapsed = Vec::new();
             owned.retain(|t| {
@@ -450,9 +477,15 @@ impl Router {
         let drained = self.guarded(id, |s| {
             let out: Vec<Transmit> = std::iter::from_fn(|| s.poll_transmit()).collect();
             let events: Vec<Event> = std::iter::from_fn(|| s.poll_event()).collect();
-            (out, events, matches!(s.state(), State::Ended(_)))
+            // Its new deadline, for the index (module docs).
+            (
+                out,
+                events,
+                matches!(s.state(), State::Ended(_)),
+                s.poll_timeout(),
+            )
         });
-        let Some((out, events, ended)) = drained else {
+        let Some((out, events, ended, due)) = drained else {
             return;
         };
         self.out.extend(out);
@@ -460,6 +493,8 @@ impl Router {
         if ended {
             self.remove(id);
             self.stats.removed += 1;
+        } else {
+            self.reindex(id, due);
         }
     }
 
@@ -495,6 +530,9 @@ impl Router {
     /// Forgets a session, its ufrag and the tuples it owns.
     fn remove(&mut self, id: SessionId) {
         if let Some(e) = self.sessions.remove(&id) {
+            if let Some(d) = e.due {
+                self.due.remove(&(d, id));
+            }
             self.ufrags.remove(e.session.local_ufrag());
             for t in &e.owned {
                 if self.owners.get(t) == Some(&id) {

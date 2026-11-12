@@ -320,17 +320,9 @@ async fn listen(listener: TcpListener, shared: Arc<Shared>) -> std::io::Result<(
         tracing::info!(tcp = %addr, proxy_protocol = shared.proxy.is_some(), "WHIP ICE-TCP listening");
     }
     let slots = Arc::new(Semaphore::new(shared.limits.connections));
+    let mut warnings = crate::accept::Warnings::default();
     loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            // Out of file descriptors, or a connection reset before it was
-            // taken: not the end of WHIP, nor of the server.
-            Err(error) => {
-                tracing::warn!(%error, "WHIP ICE-TCP accept failed");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
+        let (socket, peer) = crate::accept::next(&listener, "WHIP ICE-TCP", &mut warnings).await;
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             shared.stats.over_total.fetch_add(1, Ordering::Relaxed);
             continue;

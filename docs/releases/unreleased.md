@@ -49,3 +49,11 @@ Notes for the release after 0.2.0-rc.1.
   hold past the end.
 - Opus audio beside AAC (#66), with timeline slew carried in audio-only
   Opus and the refusal order tested (#68). See `docs/whip-ingest.md`.
+
+## sapflow
+
+- The RTMP listener and the scoped control API no longer stop on a failed
+  accept (out of file descriptors, or a connection reset before it was
+  taken): they log it and try again after 100 ms, as WHIP's listeners do.
+- `--help` says the playlist can keep more than `SAPFLOW_SEGMENT_COUNT`
+  segments, as above.

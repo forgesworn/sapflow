@@ -309,7 +309,7 @@ pub async fn serve(listener: TcpListener, app: Arc<App>) -> std::io::Result<()> 
 }
 
 async fn serve_with(
-    listener: TcpListener,
+    listener: impl crate::accept::Accept,
     app: Arc<App>,
     timeouts: Timeouts,
 ) -> std::io::Result<()> {
@@ -317,8 +317,9 @@ async fn serve_with(
         return Err(std::io::Error::other("control listener must be loopback"));
     }
     let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS));
+    let mut warnings = crate::accept::Warnings::default();
     loop {
-        let (socket, peer) = listener.accept().await?;
+        let (socket, peer) = crate::accept::next(&listener, "control", &mut warnings).await;
         if !peer.ip().is_loopback() {
             continue;
         }

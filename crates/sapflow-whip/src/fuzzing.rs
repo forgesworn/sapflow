@@ -24,7 +24,19 @@
 //!   1500 bytes; an evicted tuple had the stalest media of those that could
 //!   go, the earliest validated breaking ties. After every step: at most
 //!   [`MAX_DATAGRAMS_PER_STEP`] datagrams, the selected and send tuples
-//!   validated, and no timer once ended.
+//!   validated, and no timer once ended. A tuple never validated gets
+//!   nothing at all for an unauthenticated datagram, and a check re-sent
+//!   from another tuple while its ID is remembered draws nothing (A3.7).
+//! - [`whip_router`]: two publishers' sessions in one [`Router`], with four
+//!   strangers sending raw bytes and copies of anything sent so far, checks
+//!   sent from the other publisher's tuple, DTLS, media, time and closes.
+//!   After every datagram in and every one out: every tuple has been sent
+//!   at most `amplification_limit` times what it sent, across sessions; a
+//!   stranger that has only sent its own bytes (raw bytes, or checks whose
+//!   MESSAGE-INTEGRITY is corrupted) gets nothing; none over
+//!   1500 bytes. After every step: the deadline index holds each session's
+//!   deadline, every owned tuple's owner is live, and a closed session is
+//!   gone (A3.7).
 
 #![allow(
     clippy::panic,
@@ -36,6 +48,8 @@
 use crate::Transport;
 use crate::framing::{self, Decoder, Framing};
 use crate::ice::{Agent, Credentials, IceConfig, Kind, Tuple, classify};
+use crate::resource::SessionId;
+use crate::router::{Router, RouterConfig};
 use crate::sdp::{self, AnswerConfig, Candidate, Offer};
 use crate::session::{Event, Session, SessionConfig, State, Transmit};
 use crate::stun::{self, Builder, Message};
@@ -253,7 +267,8 @@ pub mod op {
     /// Raw bytes from tuple B.
     pub const RAW_B: u8 = 1;
     /// Honest checks, as many as the first byte's top four bits plus one;
-    /// bit 0 sets USE-CANDIDATE, bit 1 sends from tuple B.
+    /// bit 0 sets USE-CANDIDATE, bit 1 sends from tuple B, and bit 3
+    /// corrupts each one's MESSAGE-INTEGRITY, so it is unauthenticated.
     pub const CHECK: u8 = 2;
     /// A check with ICE-CONTROLLED.
     pub const CONTROLLED: u8 = 3;
@@ -315,6 +330,19 @@ struct Oracle {
     order: HashMap<Tuple, u64>,
     validations: u64,
     out: usize,
+    /// The publisher's own checks, byte for byte: a datagram that is not
+    /// one of these (or a copy of one) is unauthenticated.
+    authentic: Vec<Vec<u8>>,
+    /// Transaction IDs of requests the session answered, each with the
+    /// tuple it first came from and how many authentic checks had been
+    /// delivered then. The session records at most one ID per authentic
+    /// check it is handed (it may record one whose answer the per-tuple
+    /// budget then drops), so an ID is surely still remembered while fewer
+    /// than `max_transactions` authentic checks have arrived since.
+    remembered: Vec<([u8; 12], Tuple, u64)>,
+    /// Authentic checks delivered so far.
+    authentic_delivered: u64,
+    max_transactions: usize,
 }
 
 impl Oracle {
@@ -373,19 +401,54 @@ impl Oracle {
         if media(s) > media_before {
             self.fresh.insert(t, now);
         }
-        self.drain(s, Some((t, d.len())), replies, home);
+        let authentic = self.authentic.iter().any(|a| a == d);
+        let id = authentic
+            .then(|| Message::parse(d).ok().map(|m| m.transaction))
+            .flatten();
+        // A re-sent check whose original it remembers, from another tuple:
+        // nothing at all goes back to that tuple (A3.7).
+        let since = self.authentic_delivered;
+        let window = self.max_transactions as u64;
+        let copy = id.and_then(|id| {
+            self.remembered
+                .iter()
+                .find(|(seen, _, _)| *seen == id)
+                .filter(|(_, first, at)| *first != t && since - at < window)
+                .map(|_| t)
+        });
+        if authentic {
+            self.authentic_delivered += 1;
+        }
+        let answered = self.drain(s, Some((t, d.len(), authentic)), replies, home);
+        if let Some(copier) = copy {
+            assert!(
+                !answered.contains(&copier),
+                "a re-sent check drew bytes while its ID was remembered"
+            );
+        }
+        if let Some(id) = id
+            && answered.contains(&t)
+            && !self.remembered.iter().any(|(seen, _, _)| *seen == id)
+        {
+            self.remembered.push((id, t, since));
+            // Only entries that can still be asserted on are kept.
+            let now = self.authentic_delivered;
+            self.remembered.retain(|(_, _, at)| now - at < window);
+        }
     }
 
     /// Takes what the session queued and checks it; `request` is the
-    /// datagram it answers, if any.
+    /// datagram it answers, if any: its tuple, its length and whether it is
+    /// authentic. Returns the tuples sent to.
     fn drain(
         &mut self,
         s: &mut Session,
-        request: Option<(Tuple, usize)>,
+        request: Option<(Tuple, usize, bool)>,
         replies: &mut Vec<Transmit>,
         home: Tuple,
-    ) {
+    ) -> Vec<Tuple> {
         let target = s.send_tuple();
+        let mut sent_to = Vec::new();
         while let Some(x) = s.poll_transmit() {
             self.out += 1;
             assert!(x.bytes.len() <= 1500, "a datagram within the MTU cap");
@@ -399,12 +462,18 @@ impl Oracle {
                 "{total} bytes to a tuple that sent {got}"
             );
             // A tuple never validated: only a STUN error response to the
-            // request it just sent, no larger than it.
+            // authenticated request it just sent, no larger than it; to an
+            // unauthenticated one, nothing (A3.7).
             if !self.ever.contains(&x.tuple) {
                 let error =
                     Message::parse(&x.bytes).is_ok_and(|m| m.msg_type == stun::BINDING_ERROR);
-                let answers = request.is_some_and(|(t, n)| t == x.tuple && x.bytes.len() <= n);
+                let answers = request.is_some_and(|(t, n, authentic)| {
+                    t == x.tuple && x.bytes.len() <= n && authentic
+                });
                 assert!(error && answers, "sent to a tuple that never authenticated");
+            }
+            if !sent_to.contains(&x.tuple) {
+                sent_to.push(x.tuple);
             }
             if classify(&x.bytes) != Kind::Stun {
                 assert_eq!(
@@ -417,6 +486,7 @@ impl Oracle {
                 replies.push(x);
             }
         }
+        sent_to
     }
 }
 
@@ -447,6 +517,10 @@ pub fn whip_session_run(data: &[u8]) -> Run {
         order: HashMap::new(),
         validations: 0,
         out: 0,
+        authentic: Vec::new(),
+        remembered: Vec::new(),
+        authentic_delivered: 0,
+        max_transactions: 16,
     };
     let mut pending: Vec<Vec<u8>> = Vec::new();
     let mut history: Vec<(Tuple, Vec<u8>)> = Vec::new();
@@ -461,11 +535,18 @@ pub fn whip_session_run(data: &[u8]) -> Run {
             op::CHECK => {
                 let from = if first & 2 == 0 { p.tuple } else { other };
                 for _ in 0..=first >> 4 {
-                    sent.push((from, p.check(first & 1 == 1)));
+                    let mut c = p.check(first & 1 == 1);
+                    if first & 8 == 0 {
+                        o.authentic.push(c.clone());
+                    } else {
+                        unauthenticate(&mut c);
+                    }
+                    sent.push((from, c));
                 }
             }
             op::CONTROLLED => {
                 let c = p.stun.as_mut().unwrap().request(first & 1 == 1, true);
+                o.authentic.push(c.clone());
                 sent.push((p.tuple, c));
             }
             op::DTLS => {
@@ -569,7 +650,7 @@ pub fn whip_session_run(data: &[u8]) -> Run {
         // each datagram's.
         o.out = 0;
         let mut replies = Vec::new();
-        o.drain(s, None, &mut replies, p.tuple);
+        let _ = o.drain(s, None, &mut replies, p.tuple);
         for (t, d) in sent {
             if history.len() < 256 {
                 history.push((t, d.clone()));
@@ -626,6 +707,216 @@ pub fn whip_session_run(data: &[u8]) -> Run {
         to_third: o.to.get(&stranger).copied().unwrap_or(0),
         from_third: o.from.get(&stranger).copied().unwrap_or(0),
         evicted: s.stats().ice.evicted,
+    }
+}
+
+/// Signs a check again with the wrong key and a good FINGERPRINT, so it
+/// reaches the MESSAGE-INTEGRITY check and fails it.
+fn unauthenticate(check: &mut Vec<u8>) {
+    *check = rebuild_signed(check, b"not the session's key at all");
+}
+
+/// [`whip_router`]'s script steps: the first byte's bit 0 picks a
+/// publisher where one is meant.
+pub mod router_op {
+    /// Raw bytes from a stranger (bits 0 and 1 of the first byte).
+    pub const RAW: u8 = 0;
+    /// An honest check, with USE-CANDIDATE if bit 1 is set, from the
+    /// publisher's tuple, or the other publisher's if bit 2 is set. With
+    /// bit 3, its MESSAGE-INTEGRITY corrupted, from the stranger bits 4 and
+    /// 5 pick.
+    pub const CHECK: u8 = 1;
+    /// The publisher's pending DTLS datagrams.
+    pub const DTLS: u8 = 2;
+    /// Advance time by the first byte times 25 ms, then run due timers.
+    pub const TIME: u8 = 3;
+    /// The publisher's media once keyed: bits 1 and 2 pick audio, a delta
+    /// frame or a keyframe.
+    pub const MEDIA: u8 = 4;
+    /// A datagram sent so far, chosen by the second byte, sent again from
+    /// a stranger (bits 0 and 1), or from the other publisher's tuple if
+    /// bit 2 is set.
+    pub const COPY: u8 = 5;
+    /// Closes the publisher's session.
+    pub const CLOSE: u8 = 6;
+    /// How many.
+    pub const COUNT: u8 = 7;
+}
+
+/// A scripted run of two publishers' sessions in one router. Returns how
+/// many connected.
+pub fn whip_router(data: &[u8]) -> u8 {
+    whip_router_run(data).connected
+}
+
+/// What a scripted router run reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterRun {
+    /// Sessions that connected.
+    pub connected: u8,
+    /// Bytes sent to the strangers, which only send raw bytes and copies.
+    pub to_strangers: u64,
+}
+
+/// [`whip_router`], reporting what it reached.
+pub fn whip_router_run(data: &[u8]) -> RouterRun {
+    let t0 = Instant::now();
+    let config = SessionConfig::default();
+    let limit = u64::from(config.amplification_limit);
+    let mut r = Router::new(RouterConfig::default()).expect("defaults");
+    let mut ps = [Publisher::new(5, &[0x0007]), Publisher::new(6, &[0x0007])];
+    let mut ids = Vec::new();
+    for (k, p) in ps.iter_mut().enumerate() {
+        let seed = 5 + k as u8;
+        let a = testing::accept(&p.offer(), config.clone(), t0, seed);
+        p.answered(&a);
+        let id = SessionId::generate_seeded([seed; 32]).expect("id");
+        r.insert(id, a.session).expect("room");
+        ids.push(id);
+    }
+    let strangers = [tuple(70), tuple(71), tuple(72), tuple(73)];
+    let mut from: HashMap<Tuple, u64> = HashMap::new();
+    let mut to: HashMap<Tuple, u64> = HashMap::new();
+    // Tuples that have sent a copy of something, which may then be
+    // answered (within the bound); the others have sent only their own.
+    let mut copiers: Vec<Tuple> = Vec::new();
+    let mut pending: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+    let mut started = [false; 2];
+    let mut closed = [false; 2];
+    let mut connected = [false; 2];
+    let mut history: Vec<Vec<u8>> = Vec::new();
+    let mut now = t0;
+    // What went out: checked, and handed to the publisher it is for.
+    let mut drain = |r: &mut Router,
+                     ps: &mut [Publisher; 2],
+                     pending: &mut [Vec<Vec<u8>>; 2],
+                     from: &HashMap<Tuple, u64>,
+                     copiers: &[Tuple]| {
+        while let Some(x) = r.poll_transmit() {
+            assert!(x.bytes.len() <= 1500, "a datagram within the MTU cap");
+            let total = to.entry(x.tuple).or_default();
+            *total += x.bytes.len() as u64;
+            let got = from.get(&x.tuple).copied().unwrap_or(0);
+            assert!(
+                *total <= limit * got,
+                "{total} bytes to a tuple that sent {got}"
+            );
+            assert!(
+                !strangers.contains(&x.tuple) || copiers.contains(&x.tuple),
+                "sent to a stranger that has only sent its own bytes"
+            );
+            for (k, p) in ps.iter_mut().enumerate() {
+                if p.tuple != x.tuple {
+                    continue;
+                }
+                if classify(&x.bytes) == Kind::Rtcp && !p.has_keys() {
+                    continue;
+                }
+                pending[k].extend(p.take(x.clone()));
+            }
+        }
+        to.clone()
+    };
+    for (op, bytes) in steps(data) {
+        let first = bytes.first().copied().unwrap_or(0);
+        let k = usize::from(first & 1);
+        let mut sent: Vec<(Tuple, Vec<u8>)> = Vec::new();
+        match op % router_op::COUNT {
+            router_op::RAW => sent.push((strangers[usize::from(first & 3)], bytes.to_vec())),
+            router_op::CHECK if first & 8 != 0 => {
+                let mut c = ps[k].check(first & 2 != 0);
+                unauthenticate(&mut c);
+                sent.push((strangers[usize::from(first >> 4) & 3], c));
+            }
+            router_op::CHECK => {
+                let from = if first & 4 == 0 {
+                    ps[k].tuple
+                } else {
+                    ps[1 - k].tuple
+                };
+                sent.push((from, ps[k].check(first & 2 != 0)));
+            }
+            router_op::DTLS => {
+                if !started[k] {
+                    pending[k] = ps[k].client.start();
+                    started[k] = true;
+                }
+                let t = ps[k].tuple;
+                sent.extend(std::mem::take(&mut pending[k]).into_iter().map(|d| (t, d)));
+            }
+            router_op::TIME => {
+                now += Duration::from_millis(u64::from(first) * 25);
+                r.handle_timeout(now);
+            }
+            router_op::MEDIA if ps[k].has_keys() => {
+                let t = ps[k].tuple;
+                let packets = match (first >> 1) & 3 {
+                    1 => ps[k].delta(200).0,
+                    2 => ps[k].keyframe(600).0,
+                    _ => vec![ps[k].audio(first)],
+                };
+                sent.extend(packets.into_iter().map(|d| (t, d)));
+            }
+            router_op::COPY if !history.is_empty() => {
+                let pick = usize::from(bytes.get(1).copied().unwrap_or(0));
+                let d = history[pick % history.len()].clone();
+                let t = if first & 4 == 0 {
+                    strangers[usize::from(first & 3)]
+                } else {
+                    ps[1 - k].tuple
+                };
+                if !copiers.contains(&t) {
+                    copiers.push(t);
+                }
+                sent.push((t, d));
+            }
+            router_op::CLOSE => {
+                r.close(&ids[k], now);
+                closed[k] = true;
+            }
+            _ => {}
+        }
+        let _ = drain(&mut r, &mut ps, &mut pending, &from, &copiers);
+        for (t, d) in sent {
+            if history.len() < 256 {
+                history.push(d.clone());
+            }
+            *from.entry(t).or_default() += d.len() as u64;
+            r.handle_datagram(now, t, &d);
+            let _ = drain(&mut r, &mut ps, &mut pending, &from, &copiers);
+        }
+        for p in &mut ps {
+            p.receive_keys();
+        }
+        while let Some((id, e)) = r.poll_event() {
+            if let Event::Connected(_) = e
+                && let Some(k) = ids.iter().position(|i| *i == id)
+            {
+                connected[k] = true;
+            }
+        }
+        assert!(r.deadlines_indexed(), "the deadline index is exact");
+        for t in strangers.iter().chain(ps.iter().map(|p| &p.tuple)) {
+            if let Some(owner) = r.owner(t) {
+                assert!(
+                    r.session(&owner).is_some(),
+                    "an owned tuple's owner is live"
+                );
+            }
+        }
+        for (k, id) in ids.iter().enumerate() {
+            if closed[k] {
+                assert!(r.session(id).is_none(), "a closed session is gone");
+            }
+        }
+    }
+    let to = drain(&mut r, &mut ps, &mut pending, &from, &copiers);
+    RouterRun {
+        connected: connected.iter().filter(|c| **c).count() as u8,
+        to_strangers: strangers
+            .iter()
+            .map(|t| to.get(t).copied().unwrap_or(0))
+            .sum(),
     }
 }
 

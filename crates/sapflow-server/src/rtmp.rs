@@ -32,9 +32,14 @@ const SETUP: Duration = Duration::from_secs(10);
 pub async fn listen(app: Arc<App>, addr: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "RTMP listening");
+    serve(app, listener).await
+}
+
+async fn serve(app: Arc<App>, listener: impl crate::accept::Accept) -> std::io::Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
+    let mut warnings = crate::accept::Warnings::default();
     loop {
-        let (sock, peer) = listener.accept().await?;
+        let (sock, peer) = crate::accept::next(&listener, "RTMP", &mut warnings).await;
         // Connections, not publishers: a flood of idle sockets is bounded
         // by SETUP and this cap.
         if active.load(Ordering::Relaxed) >= app.config.max_publishers * 4 {
@@ -382,6 +387,32 @@ mod tests {
                 assert_eq!(fixture.scope.observations.counts().recordings_finalised, 0);
             }
         }
+    }
+
+    /// An accept error (out of file descriptors, or a connection reset
+    /// before it was taken) is not the end of the RTMP listener: the next
+    /// encoder is still served.
+    #[tokio::test]
+    async fn an_accept_error_does_not_end_the_listener() {
+        let fixture = crate::publish::loss_tests::Fixture::new();
+        let inner = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("owned loopback listener");
+        let address = inner.local_addr().expect("owned address");
+        let listener = crate::accept::testing::Flaky::new(inner, 2);
+        let server = tokio::spawn(serve(fixture.app.clone(), listener));
+        let mut socket = TcpStream::connect(address).await.expect("connect");
+        let mut c0c1 = vec![3u8];
+        c0c1.resize(1 + 1536, 0);
+        socket.write_all(&c0c1).await.expect("C0 and C1");
+        let mut s0 = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(3), socket.read_exact(&mut s0)).await;
+        assert!(
+            matches!(read, Ok(Ok(_))) && s0[0] == 3,
+            "the handshake was answered after two failed accepts"
+        );
+        assert!(!server.is_finished(), "the listener is still running");
+        server.abort();
     }
 
     #[tokio::test]

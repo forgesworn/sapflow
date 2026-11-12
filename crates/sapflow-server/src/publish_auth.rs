@@ -249,8 +249,7 @@ pub(crate) mod stub {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use sapflow_core::{PublishError, PublishRequest};
@@ -473,29 +472,11 @@ mod tests {
         assert_eq!(stub.count(), 1);
     }
 
-    /// A tracing writer that keeps everything written to it.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-    impl Write for Captured {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log").extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn neither_the_password_nor_the_url_reaches_logs_or_refusals() {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // A capture of this thread's logs that other tests' threads cannot
+        // hide (`log_capture`).
+        let captured = crate::log_capture::Capture::start();
         let req = srt(&format!("publish:live/event-a:encoder:{PASSWORD}"));
         let mut refusals = Vec::new();
         for answer in [
@@ -522,7 +503,7 @@ mod tests {
             .expect("refused");
         fixture.app.log_refusal("srt", &refusal);
         refusals.push(format!("{refusal:?}"));
-        let logs = String::from_utf8(captured.0.lock().expect("log").clone()).expect("UTF-8");
+        let logs = captured.text();
         assert!(
             logs.contains("publish authorisation"),
             "the paths were logged: {logs}"

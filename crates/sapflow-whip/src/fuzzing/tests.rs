@@ -87,6 +87,118 @@ fn connect_evict_evicts() {
     assert!(run.evicted > 0, "{run:?}");
 }
 
+/// Scripts for [`whip_router`]: what the committed seeds hold.
+fn router_scripts() -> Vec<(&'static str, Vec<u8>)> {
+    use router_op as r;
+    let connect = |s: &mut Vec<u8>, k: u8| {
+        push_step(s, r::CHECK, &[k | 2]);
+        for _ in 0..3 {
+            push_step(s, r::DTLS, &[k]);
+        }
+    };
+    let mut both = Vec::new();
+    connect(&mut both, 0);
+    connect(&mut both, 1);
+    for i in 0u8..12 {
+        push_step(&mut both, r::MEDIA, &[(i & 1) | ((i % 3) << 1)]);
+    }
+    push_step(&mut both, r::RAW, &[0, 1, 2, 3]);
+    push_step(&mut both, r::RAW, &[3, 0x80, 0x6f, 0, 9, 0, 0, 0, 1]);
+    push_step(&mut both, r::TIME, &[8]);
+    let mut copies = both.clone();
+    for (who, pick) in [(0u8, 0u8), (1, 3), (2, 7), (3, 11), (4, 5), (5, 20)] {
+        push_step(&mut copies, r::COPY, &[who, pick]);
+    }
+    push_step(&mut copies, r::MEDIA, &[0]);
+    push_step(&mut copies, r::MEDIA, &[1]);
+    let mut cross = Vec::new();
+    connect(&mut cross, 0);
+    connect(&mut cross, 1);
+    push_step(&mut cross, r::MEDIA, &[0]);
+    // Publisher 0's check from publisher 1's tuple, then media from both.
+    push_step(&mut cross, r::CHECK, &[2 | 4]);
+    push_step(&mut cross, r::MEDIA, &[1]);
+    push_step(&mut cross, r::MEDIA, &[0]);
+    push_step(&mut cross, r::CLOSE, &[1]);
+    push_step(&mut cross, r::MEDIA, &[0]);
+    push_step(&mut cross, r::TIME, &[40]);
+    let mut raw = Vec::new();
+    // Checks for both sessions, unauthenticated, from strangers.
+    for b in [0x08u8, 0x19, 0x2a, 0x3b] {
+        push_step(&mut raw, r::CHECK, &[b]);
+    }
+    for b in 0u8..8 {
+        push_step(
+            &mut raw,
+            r::RAW,
+            &[b, 0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42],
+        );
+        push_step(&mut raw, r::RAW, &[b, 0x16, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0]);
+    }
+    // Past both handshake deadlines: the sessions end and are removed.
+    push_step(&mut raw, r::TIME, &[255]);
+    push_step(&mut raw, r::TIME, &[255]);
+    vec![
+        ("connect-both-and-publish", both),
+        ("connect-both-and-copies", copies),
+        ("cross-check-and-close", cross),
+        ("strangers-only", raw),
+    ]
+}
+
+/// Unauthenticated checks from a tuple never validated draw nothing in
+/// the session harness, before and after the publisher connects.
+#[test]
+fn unauthenticated_checks_draw_nothing() {
+    let mut s = Vec::new();
+    push_step(&mut s, op::CHECK, &[0x08 | 2]);
+    connect(&mut s);
+    push_step(&mut s, op::CHECK, &[0x38 | 2]);
+    push_step(&mut s, op::RTP, &[2]);
+    let run = whip_session_run(&s);
+    assert_eq!(run.stage, 2);
+}
+
+/// The router scripts reach what they are for, with every invariant held.
+#[test]
+fn router_scripts_hold_the_invariants() {
+    for (name, script) in router_scripts() {
+        let run = whip_router_run(&script);
+        match name {
+            "strangers-only" => {
+                assert_eq!(run.connected, 0, "{name}");
+                assert_eq!(run.to_strangers, 0, "{name}");
+            }
+            _ => assert_eq!(run.connected, 2, "{name}: {run:?}"),
+        }
+    }
+}
+
+/// The committed router seeds are the scripts above.
+#[test]
+fn router_seeds_are_the_scripts() {
+    let committed = seeds("whip_router");
+    for (name, script) in router_scripts() {
+        let seed = committed
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("seed {name}"));
+        assert_eq!(seed.1, script, "{name}: run write_router_seeds");
+    }
+}
+
+/// Writes the [`whip_router`] seeds. Run with
+/// `cargo test -p sapflow-whip --features testing -- --ignored write_router_seeds`.
+#[test]
+#[ignore = "writes fuzz/seeds/whip_router"]
+fn write_router_seeds() {
+    let dir = seed_dir("whip_router");
+    std::fs::create_dir_all(&dir).expect("dir");
+    for (name, script) in router_scripts() {
+        std::fs::write(dir.join(name), script).expect("write");
+    }
+}
+
 /// A fixed-seed mutation pass over every seed, with the unit tests.
 #[test]
 fn seeded_mutations_hold_the_invariants() {
@@ -98,7 +210,7 @@ fn seeded_mutations_hold_the_invariants() {
         x
     };
     type Target = (&'static str, fn(&[u8]));
-    let targets: [Target; 4] = [
+    let targets: [Target; 5] = [
         ("stun_message", |d| {
             stun_message(d);
         }),
@@ -111,9 +223,12 @@ fn seeded_mutations_hold_the_invariants() {
         ("whip_session", |d| {
             whip_session(d);
         }),
+        ("whip_router", |d| {
+            whip_router(d);
+        }),
     ];
     for (target, run) in targets {
-        let rounds = if target == "whip_session" { 6 } else { 48 };
+        let rounds = if target.starts_with("whip_") { 6 } else { 48 };
         for (_, seed) in seeds(target) {
             for _ in 0..rounds {
                 let mut m = seed.clone();
@@ -407,7 +522,7 @@ fn mutation_soak() {
         x
     };
     type Target = (&'static str, fn(&[u8]));
-    let targets: [Target; 4] = [
+    let targets: [Target; 5] = [
         ("stun_message", |d| {
             stun_message(d);
         }),
@@ -420,11 +535,14 @@ fn mutation_soak() {
         ("whip_session", |d| {
             whip_session(d);
         }),
+        ("whip_router", |d| {
+            whip_router(d);
+        }),
     ];
     let mut runs = 0usize;
     for (target, run) in targets {
         let all = seeds(target);
-        let n = if target == "whip_session" {
+        let n = if target.starts_with("whip_") {
             rounds / 10
         } else {
             rounds

@@ -141,6 +141,58 @@ async fn serve_test(
     }
 }
 
+/// A server whose signalling listener has `limits`.
+async fn start_limited(limits: Limits) -> Server {
+    start_limited_with(&[], limits).await
+}
+
+/// As [`start_limited`], with `env` too.
+async fn start_limited_with(env: &[(&str, &str)], limits: Limits) -> Server {
+    let app = app(env);
+    let sockets = Sockets {
+        http: TcpListener::bind("127.0.0.1:0").await.expect("bind"),
+        udp: UdpSocket::bind("127.0.0.1:0").await.expect("bind"),
+        tcp: None,
+    };
+    let (http, udp) = (
+        sockets.http.local_addr().expect("addr"),
+        sockets.udp.local_addr().expect("addr"),
+    );
+    let config = app.config.whip.clone().expect("WHIP on");
+    let session = session_config(&config);
+    let (mut whip, router, rx) =
+        prepare_with(&app, server_identity(), config, session).expect("router");
+    Arc::get_mut(&mut whip).expect("unshared").limits = limits;
+    tokio::spawn(run(app.clone(), whip.clone(), router, rx, sockets));
+    Server {
+        app,
+        whip,
+        http,
+        udp,
+    }
+}
+
+/// Whether `raw` is answered `200` within 5 s, trying again while the
+/// server has yet to free a slot (it does once it sees a client's close).
+async fn served_again(server: &Server, raw: &[u8]) -> bool {
+    for _ in 0..100 {
+        if send(server.http, raw).await.status == 200 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Whether the server closes `s` within `wait` without answering.
+async fn closed_unanswered(s: &mut TcpStream, wait: Duration) -> bool {
+    let mut b = [0u8; 64];
+    matches!(
+        tokio::time::timeout(wait, s.read(&mut b)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
 struct Answer {
     status: u16,
     headers: Vec<(String, String)>,
@@ -665,6 +717,20 @@ fn access_unit(idr: bool) -> Media {
     }
 }
 
+/// What the ingest task does with the marks the feed queued: applies them
+/// in order, then any the feed held when it went. Other items are dropped.
+fn apply_marks(rx: &mut mpsc::Receiver<Item>, publication: &Publication, counts: &LossCounts) {
+    let loss = publication.loss_notice();
+    while let Ok(item) = rx.try_recv() {
+        if let Item::Marks(marks) = item {
+            marks.into_iter().for_each(|r| loss.mark_incomplete(r));
+        }
+    }
+    std::mem::take(&mut *counts.trailing.lock().expect("trailing"))
+        .into_iter()
+        .for_each(|r| loss.mark_incomplete(r));
+}
+
 fn status(publication: &Publication) -> Arc<crate::recorder::RecordingStatus> {
     publication
         .stream
@@ -684,15 +750,19 @@ async fn a_full_queue_skips_video_to_the_next_idr() {
     let publication = fixture.begin();
     let status = status(&publication);
     let (tx, mut rx) = mpsc::channel(1);
-    let mut feed = Feed::new(tx, publication.loss_notice());
+    let mut feed = Feed::new(tx);
     assert_eq!(feed.push(access_unit(true)), Ok(()));
-    assert_eq!(status.reason(), None);
     assert_eq!(feed.push(access_unit(false)), Ok(()), "full: dropped");
-    assert_eq!(status.reason(), Some(IncompleteReason::IngestQueueFull));
     assert!(feed.take_keyframe_request(), "a keyframe is asked for");
     assert!(!feed.take_keyframe_request(), "once");
     assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
+    // The feed never marks the recording itself: the full queue's mark
+    // waited for room, and goes ahead of whatever comes next.
+    assert_eq!(status.reason(), None);
     assert_eq!(feed.push(access_unit(false)), Ok(()));
+    assert!(
+        matches!(rx.try_recv(), Ok(Item::Marks(m)) if m == [IncompleteReason::IngestQueueFull])
+    );
     assert!(rx.try_recv().is_err(), "skipped until an IDR");
     assert!(!feed.take_keyframe_request(), "already waiting");
     assert_eq!(feed.push(access_unit(true)), Ok(()));
@@ -711,23 +781,130 @@ async fn the_queue_is_bounded_in_bytes() {
     let publication = fixture.begin();
     let status = status(&publication);
     let (tx, mut rx) = mpsc::channel(64);
-    let mut feed = Feed::bounded(tx, publication.loss_notice(), 12);
+    let mut feed = Feed::bounded(tx, 12);
     let queued = feed.queued();
     assert_eq!(feed.push(access_unit(true)), Ok(()));
     assert_eq!(feed.push(access_unit(false)), Ok(()));
     assert_eq!(queued.load(Ordering::Acquire), 10);
-    assert_eq!(status.reason(), None);
-    // A third would be 15 bytes: dropped as a full queue.
+    // A third would be 15 bytes: dropped as a full queue, and marked in
+    // the queue behind the two (a mark holds no media bytes).
     assert_eq!(feed.push(access_unit(false)), Ok(()));
-    assert_eq!(status.reason(), Some(IncompleteReason::IngestQueueFull));
     assert!(feed.take_keyframe_request());
     assert_eq!(queued.load(Ordering::Acquire), 10);
-    // The ingest task takes both; the next IDR fits.
+    // The ingest task takes all three; the next IDR fits.
+    let mut marks = Vec::new();
     while let Ok(item) = rx.try_recv() {
         queued.fetch_sub(item.size(), Ordering::AcqRel);
+        if let Item::Marks(m) = item {
+            marks.extend(m);
+        }
     }
+    assert_eq!(marks, [IncompleteReason::IngestQueueFull]);
+    assert_eq!(status.reason(), None, "until the ingest applies it");
     assert_eq!(feed.push(access_unit(true)), Ok(()));
     assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
+}
+
+/// Two SPS at different sizes and their PPS, from `sapflow-hls`'s
+/// `resolution-change.ts` fixture.
+const SPS_WIDE: &[u8] = &[
+    0x67, 0x42, 0xc0, 0x0b, 0xda, 0x0a, 0x37, 0xe4, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00,
+    0x00, 0x03, 0x00, 0xf2, 0x3c, 0x50, 0xaa, 0x80,
+];
+const SPS_NARROW: &[u8] = &[
+    0x67, 0x42, 0xc0, 0x0a, 0xda, 0x08, 0x2f, 0xe5, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00,
+    0x00, 0x03, 0x00, 0xf2, 0x3c, 0x48, 0x9a, 0x80,
+];
+const PPS_FIXTURE: &[u8] = &[0x68, 0xce, 0x0f, 0xc8];
+
+/// Frame `n` of 25 fps video, a keyframe each second carrying `sps`.
+fn frame(n: u64, sps: &[u8]) -> Media {
+    let idr = n.is_multiple_of(25);
+    let nal: &[u8] = if idr {
+        &[0x65, 0x88, 0x84]
+    } else {
+        &[0x41, 0x9a, 0x02]
+    };
+    let mut data = (nal.len() as u32).to_be_bytes().to_vec();
+    data.extend_from_slice(nal);
+    Media::Video {
+        pts: n * 3600,
+        au: AccessUnit {
+            data,
+            idr,
+            sps: idr.then(|| sps.to_vec()),
+            pps: idr.then(|| PPS_FIXTURE.to_vec()),
+        },
+    }
+}
+
+/// A mark the owner raises while the ingest queue still holds the item
+/// that rolls the recording (a codec epoch change, #77) lands on the new
+/// recording, the one the loss is in, and not on the old one.
+#[tokio::test]
+async fn a_mark_raised_behind_a_queued_roll_lands_on_the_new_recording() {
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let mut publication = fixture.begin_kind(SourceKind::Es);
+    publication
+        .push(|source, now| configure(source, VIDEO_ONLY, now))
+        .expect("setup");
+    let (tx, mut rx) = mpsc::channel(QUEUE);
+    let mut feed = Feed::new(tx);
+    let (queued, counts) = (feed.queued(), feed.counts());
+    let mut last_audio = None;
+    // Two seconds at one size, taken by the ingest.
+    for n in 0..50 {
+        assert_eq!(feed.push(frame(n, SPS_WIDE)), Ok(()));
+    }
+    while let Ok(item) = rx.try_recv() {
+        assert!(take(
+            &mut publication,
+            (&queued, &counts),
+            VIDEO_ONLY,
+            &mut last_audio,
+            item
+        ));
+    }
+    let first = status(&publication);
+    // Then a keyframe at another size, still in the queue when loss after
+    // it is reported, and more frames.
+    for n in 50..60 {
+        assert_eq!(feed.push(frame(n, SPS_NARROW)), Ok(()));
+    }
+    assert_eq!(
+        feed.push(Media::Loss {
+            path: LossPath::Lost,
+            packets: 2
+        }),
+        Ok(())
+    );
+    for n in 60..100 {
+        assert_eq!(feed.push(frame(n, SPS_NARROW)), Ok(()));
+    }
+    while let Ok(item) = rx.try_recv() {
+        assert!(take(
+            &mut publication,
+            (&queued, &counts),
+            VIDEO_ONLY,
+            &mut last_audio,
+            item
+        ));
+    }
+    let second = status(&publication);
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "the keyframe rolled the recording"
+    );
+    assert_eq!(
+        second.reason(),
+        Some(IncompleteReason::MediaLoss),
+        "the new recording"
+    );
+    assert_eq!(
+        first.reason(),
+        None,
+        "the loss was not in the old recording"
+    );
 }
 
 /// An in-process session run with the scripted publisher, collecting the
@@ -848,7 +1025,7 @@ async fn recorded_in_full(events: Vec<Event>, setup: Setup, feed: bool) -> Recor
         .expect("setup");
     let status = status(&publication);
     let (tx, mut rx) = mpsc::channel(QUEUE);
-    let mut server = Feed::new(tx, publication.loss_notice());
+    let mut server = Feed::new(tx);
     for e in events {
         let mut items = Vec::new();
         match e {
@@ -881,6 +1058,11 @@ async fn recorded_in_full(events: Vec<Event>, setup: Setup, feed: bool) -> Recor
             items.push(item);
         }
         for item in items {
+            if let Item::Marks(marks) = item {
+                let loss = publication.loss_notice();
+                marks.into_iter().for_each(|r| loss.mark_incomplete(r));
+                continue;
+            }
             publication
                 .push(|source, now| match item {
                     Item::Reanchor => reanchor(source, setup, now),
@@ -1153,11 +1335,120 @@ async fn an_abnormal_end_marks_the_recording() {
         let fixture = crate::publish::loss_tests::Fixture::new();
         let publication = fixture.begin();
         let status = status(&publication);
-        let (tx, _rx) = mpsc::channel(4);
-        let mut feed = Feed::new(tx, publication.loss_notice());
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut feed = Feed::new(tx);
+        let counts = feed.counts();
         feed.ended(reason);
+        apply_marks(&mut rx, &publication, &counts);
         assert_eq!(status.reason(), mark, "{reason:?}");
     }
+}
+
+/// A mark held for want of room is never overtaken. Between `push`
+/// finding no room for the held marks and queueing its item, the ingest
+/// may free a slot: the item is then refused as the queue being full, so a
+/// keyframe at a new size cannot roll the recording ahead of the mark and
+/// leave the file it belongs to complete.
+#[tokio::test]
+async fn an_item_never_goes_ahead_of_a_held_mark() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut feed = Feed::new(tx);
+    assert_eq!(feed.push(access_unit(true)), Ok(()), "fills the queue");
+    assert_eq!(
+        feed.push(access_unit(false)),
+        Ok(()),
+        "refused: the mark is held"
+    );
+    // As at the top of the next push: still no room, so still held.
+    assert_eq!(feed.queue_marks(), Ok(()));
+    // The ingest takes the queued frame now, before the item goes in.
+    assert!(matches!(rx.try_recv(), Ok(Item::Video { .. })));
+    let roll = Item::Video {
+        pts: 3600,
+        au: AccessUnit {
+            data: vec![0, 0, 0, 3, 0x65, 0x88, 0x84],
+            idr: true,
+            sps: Some(SPS_NARROW.to_vec()),
+            pps: Some(PPS_FIXTURE.to_vec()),
+        },
+        received: 0,
+    };
+    assert_eq!(feed.enqueue(roll), Ok(()));
+    // Refused as the queue being full: the held mark took the freed slot,
+    // and the keyframe did not get ahead of it.
+    assert!(
+        matches!(rx.try_recv(), Ok(Item::Marks(m)) if m == [IncompleteReason::IngestQueueFull]),
+        "the mark first"
+    );
+    assert!(rx.try_recv().is_err(), "the keyframe was refused");
+    // Video waits for the next keyframe, which goes in behind the mark.
+    assert_eq!(feed.push(access_unit(true)), Ok(()));
+    assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
+}
+
+/// The real ingest task, as it ends: marks the feed could not queue are
+/// applied after everything queued before them, and a pending place is
+/// given back, as for a `POST` cancelled before its session reached the
+/// router.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ingest_applies_held_marks_and_gives_back_the_place_as_it_ends() {
+    let (server, root) = udp_server_with(false).await;
+    let req = PublishRequest {
+        path: StreamPath::parse("live/event-tail").expect("path"),
+        user: Some("publisher".to_owned()),
+        pass: Some("whip-test-secret".to_owned()),
+        connection_attempt_id: None,
+    };
+    let from: IpAddr = "127.0.0.1".parse().expect("loopback");
+    let publication = Publication::begin(&server.app, &req, SourceKind::Es, from).expect("claimed");
+    let recording = status(&publication);
+    let id = SessionId::generate_seeded([70; 32]).expect("id");
+    PendingSlot::take(&server.whip, "198.51.100.7".parse().expect("address"))
+        .expect("a place")
+        .attach(id);
+    assert_eq!(server.whip.pending().total, 1);
+    let (tx, rx) = mpsc::channel(1);
+    let mut feed = Feed::new(tx);
+    let (queued, counts) = (feed.queued(), feed.counts());
+    assert_eq!(feed.push(access_unit(true)), Ok(()), "fills the queue");
+    // No room for its mark: the feed holds it, and keeps it as it goes.
+    feed.ended(sapflow_whip::EndReason::MediaTimeout);
+    drop(feed);
+    let (released, _) = watch::channel(false);
+    ingest(
+        server.whip.clone(),
+        id,
+        publication,
+        (rx, queued, counts),
+        released,
+        VIDEO_ONLY,
+    )
+    .await;
+    assert_eq!(recording.reason(), Some(IncompleteReason::TransportTimeout));
+    assert_eq!(server.whip.pending().total, 0, "the place is given back");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A mark that finds the queue full at the end, as an abnormal end can,
+/// is kept for the ingest task, which applies it after everything queued
+/// before it.
+#[tokio::test]
+async fn a_mark_with_no_room_at_the_end_still_reaches_the_recording() {
+    let fixture = crate::publish::loss_tests::Fixture::new();
+    let publication = fixture.begin();
+    let status = status(&publication);
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut feed = Feed::new(tx);
+    let counts = feed.counts();
+    assert_eq!(feed.push(access_unit(true)), Ok(()));
+    feed.ended(sapflow_whip::EndReason::MediaTimeout);
+    drop(feed);
+    assert_eq!(
+        *counts.trailing.lock().expect("trailing"),
+        [IncompleteReason::TransportTimeout]
+    );
+    apply_marks(&mut rx, &publication, &counts);
+    assert_eq!(status.reason(), Some(IncompleteReason::TransportTimeout));
 }
 
 /// Each `Lost` is counted and marks the recording incomplete; a dropped
@@ -1166,8 +1457,9 @@ async fn an_abnormal_end_marks_the_recording() {
 async fn receiver_loss_is_counted_and_marks_the_recording() {
     let fixture = crate::publish::loss_tests::Fixture::new();
     let publication = fixture.begin();
-    let (tx, _rx) = mpsc::channel(4);
-    let mut feed = Feed::new(tx, publication.loss_notice());
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut feed = Feed::new(tx);
+    let counts = feed.counts();
     let status = publication
         .stream
         .session()
@@ -1185,6 +1477,7 @@ async fn receiver_loss_is_counted_and_marks_the_recording() {
     );
     assert_eq!(feed.push(loss(LossPath::IncompleteFrame)), Ok(()));
     assert_eq!(feed.lost(), 3);
+    apply_marks(&mut rx, &publication, &counts);
     assert_eq!(status.reason(), Some(IncompleteReason::MediaLoss));
 }
 
@@ -1215,10 +1508,8 @@ async fn only_authenticated_media_counts_against_the_cap() {
         }
     }
     assert!(p.has_keys());
-    let fixture = crate::publish::loss_tests::Fixture::new();
-    let publication = fixture.begin();
     let (tx, _rx) = mpsc::channel(4);
-    let mut feeds = HashMap::from([(id, Feed::new(tx, publication.loss_notice()))]);
+    let mut feeds = HashMap::from([(id, Feed::new(tx))]);
     let junk = [0x80, 0x6f, 0, 9, 0, 0, 0, 1, 0, 0, 0x10, 0x01, 1, 2, 3, 4];
     receive(&mut router, &mut feeds, p.tuple, &junk);
     assert_eq!(feeds[&id].received, 0, "spoofed bytes count");
@@ -1754,6 +2045,299 @@ async fn the_panic_hooks_do_nothing_unless_a_test_turns_them_on() {
     assert_eq!(counts.panics.load(Ordering::Relaxed), 0, "{counts}");
     assert_eq!(counts.abnormal_ends.load(Ordering::Relaxed), 0, "{counts}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A3.7: past `Limits::connections` signalling connections, a new one is
+/// closed at once; once one closes, the next is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_the_signalling_connection_cap_a_connection_is_closed() {
+    let server = start_limited(Limits {
+        connections: 3,
+        per_address: 10,
+        ..Limits::default()
+    })
+    .await;
+    let mut idle = Vec::new();
+    for _ in 0..3 {
+        idle.push(TcpStream::connect(server.http).await.expect("connect"));
+    }
+    let mut fourth = TcpStream::connect(server.http).await.expect("connect");
+    assert!(closed_unanswered(&mut fourth, Duration::from_secs(2)).await);
+    assert_eq!(server.whip.signalling.over_total.load(Ordering::Relaxed), 1);
+    drop(idle.pop());
+    let preflight = b"OPTIONS /whip/live/event-cap HTTP/1.1\r\nhost: whip.example\r\n\r\n";
+    assert!(served_again(&server, preflight).await, "served again");
+}
+
+/// A3.7: one address holds at most `Limits::per_address` signalling
+/// connections, below the total; its own next connection is closed at
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_address_holds_at_most_its_share_of_the_signalling_slots() {
+    let server = start_limited(Limits {
+        connections: 8,
+        per_address: 2,
+        ..Limits::default()
+    })
+    .await;
+    let mut idle = Vec::new();
+    for _ in 0..2 {
+        idle.push(TcpStream::connect(server.http).await.expect("connect"));
+    }
+    let mut third = TcpStream::connect(server.http).await.expect("connect");
+    assert!(closed_unanswered(&mut third, Duration::from_secs(2)).await);
+    assert_eq!(
+        server.whip.signalling.over_address.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(server.whip.signalling.over_total.load(Ordering::Relaxed), 0);
+    drop(idle);
+    let preflight = b"OPTIONS /whip/live/event-share HTTP/1.1\r\nhost: whip.example\r\n\r\n";
+    assert!(served_again(&server, preflight).await, "freed");
+}
+
+/// A body still arriving at `Limits::client_time` from the connection is
+/// answered `408`, not left to the handler's timeout and `503`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_that_arrives_too_slowly_gets_408() {
+    let server = start_limited(Limits {
+        client_time: Duration::from_secs(1),
+        ..Limits::default()
+    })
+    .await;
+    let mut s = TcpStream::connect(server.http).await.expect("connect");
+    let head = format!(
+        "POST /whip/live/event-slow HTTP/1.1\r\nhost: whip.example\r\ncontent-type: application/sdp\r\nauthorization: Bearer {TOKEN}\r\ncontent-length: 200\r\n\r\n"
+    );
+    s.write_all(head.as_bytes()).await.expect("head");
+    let started = Instant::now();
+    let (mut reader, mut writer) = s.into_split();
+    let trickle = tokio::spawn(async move {
+        for _ in 0..40 {
+            if writer.write_all(b"v").await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut out)).await;
+    trickle.abort();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        server
+            .whip
+            .signalling
+            .client_timeouts
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+/// The failed-attempt throttle is a refusal path of its own: past 10
+/// failed attempts a minute, an address gets `429` before its offer is
+/// read, parsed or answered, whatever it sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_throttled_address_is_refused_before_its_offer_is_read() {
+    let server = start(&[]).await;
+    let offer = Publisher::new(60, &[GCM]).offer();
+    for _ in 0..10 {
+        let a = send(
+            server.http,
+            &sdp_post("/whip/live/event-thr", "publisher:wrong", &offer),
+        )
+        .await;
+        assert_eq!(a.status, 401, "{}", a.body);
+    }
+    // The right token, but an offer that does not parse: refused as
+    // throttled, not as malformed.
+    let a = send(
+        server.http,
+        &sdp_post("/whip/live/event-thr", TOKEN, "not sdp"),
+    )
+    .await;
+    assert_eq!(a.status, 429, "{}", a.body);
+    let a = send(
+        server.http,
+        &sdp_post("/whip/live/event-thr", TOKEN, &offer),
+    )
+    .await;
+    assert_eq!(a.status, 429, "{}", a.body);
+}
+
+/// A `POST` as the trusted proxy forwards it for `ip`.
+fn forwarded_post(path: &str, ip: &str, body: &str) -> Vec<u8> {
+    let auth = format!("Bearer {TOKEN}");
+    post(
+        path,
+        &[
+            ("authorization", &auth),
+            ("content-type", "application/sdp"),
+            ("x-forwarded-for", ip),
+        ],
+        body,
+    )
+}
+
+/// A3.7: sessions that have not connected yet are capped in total and per
+/// publisher address; a `POST` past either gets `503`, and a session that
+/// ends gives its place back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_sessions_are_capped_in_total_and_per_address() {
+    let server = start_limited_with(
+        &[("SAPFLOW_WHIP_TRUSTED_PROXY", "127.0.0.1")],
+        Limits {
+            pending: 3,
+            pending_per_address: 2,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let offer = Publisher::new(61, &[GCM]).offer();
+    let post_as =
+        |n: u8, ip: &str| forwarded_post(&format!("/whip/live/event-pend-{n}"), ip, &offer);
+    let (a, b) = ("198.51.100.1", "198.51.100.2");
+    let first = send(server.http, &post_as(1, a)).await;
+    assert_eq!(first.status, 201, "{}", first.body);
+    assert_eq!(send(server.http, &post_as(2, a)).await.status, 201);
+    let refused = send(server.http, &post_as(3, a)).await;
+    assert_eq!(refused.status, 503, "per address: {}", refused.body);
+    assert_eq!(send(server.http, &post_as(4, b)).await.status, 201);
+    let refused = send(server.http, &post_as(5, b)).await;
+    assert_eq!(refused.status, 503, "in total: {}", refused.body);
+    // One of A's ends: B may start another.
+    let location = first.header("location").expect("Location").to_owned();
+    assert_eq!(send(server.http, &delete(&location)).await.status, 200);
+    assert_eq!(send(server.http, &post_as(5, b)).await.status, 201);
+}
+
+/// The per-address caps count an IPv6 host by its /64 and an IPv4 address
+/// whole: a second address in the same /64 shares the first's places, one
+/// in another /64 or another IPv4 address does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_per_address_caps_count_ipv6_by_its_64() {
+    let server = start_limited_with(
+        &[("SAPFLOW_WHIP_TRUSTED_PROXY", "127.0.0.1")],
+        Limits {
+            pending_per_address: 2,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let offer = Publisher::new(64, &[GCM]).offer();
+    let mut n = 0u8;
+    let mut post_as = |ip: &str| {
+        n += 1;
+        forwarded_post(&format!("/whip/live/event-six-{n}"), ip, &offer)
+    };
+    for ip in ["2001:db8:1::1", "2001:db8:1::2"] {
+        assert_eq!(send(server.http, &post_as(ip)).await.status, 201, "{ip}");
+    }
+    let refused = send(server.http, &post_as("2001:db8:1:0:ffff::3")).await;
+    assert_eq!(refused.status, 503, "the same /64: {}", refused.body);
+    assert_eq!(
+        send(server.http, &post_as("2001:db8:2::1")).await.status,
+        201
+    );
+    for ip in ["198.51.100.1", "198.51.100.1"] {
+        assert_eq!(send(server.http, &post_as(ip)).await.status, 201, "{ip}");
+    }
+    assert_eq!(
+        send(server.http, &post_as("198.51.100.2")).await.status,
+        201
+    );
+}
+
+/// The signalling slots are keyed the same way.
+#[test]
+fn address_keys_are_an_ipv4_address_or_an_ipv6_64() {
+    let key = |s: &str| address_key(s.parse().expect("address"));
+    assert_eq!(key("2001:db8:1::1"), key("2001:db8:1:0:ffff::3"));
+    assert_ne!(key("2001:db8:1::1"), key("2001:db8:2::1"));
+    assert_ne!(key("198.51.100.1"), key("198.51.100.2"));
+    assert_eq!(key("::ffff:198.51.100.1"), key("198.51.100.1"));
+    let addresses = Addresses::default();
+    let first = AddressSlot::take(&addresses, key("2001:db8:1::1"), 1).expect("first");
+    assert!(AddressSlot::take(&addresses, key("2001:db8:1::9"), 1).is_none());
+    drop(first);
+    assert!(AddressSlot::take(&addresses, key("2001:db8:1::9"), 1).is_some());
+}
+
+/// A session that has connected no longer counts as pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_session_no_longer_counts_as_pending() {
+    let server = start_limited(Limits {
+        pending: 1,
+        ..Limits::default()
+    })
+    .await;
+    let mut phone = Phone::new(62, &server).await;
+    assert_eq!(admit(&server, &mut phone, "event-pc-1").await.status, 201);
+    let other = Publisher::new(63, &[GCM]).offer();
+    let refused = send(
+        server.http,
+        &sdp_post("/whip/live/event-pc-2", TOKEN, &other),
+    )
+    .await;
+    assert_eq!(refused.status, 503, "{}", refused.body);
+    phone.connect().await;
+    let mut admitted = false;
+    for _ in 0..40 {
+        if send(
+            server.http,
+            &sdp_post("/whip/live/event-pc-2", TOKEN, &other),
+        )
+        .await
+        .status
+            == 201
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(admitted, "admitted once the first had connected");
+}
+
+/// A3.7 over real UDP: unauthenticated STUN, DTLS, RTP and random bytes
+/// sent to the media port from a fresh address draw nothing, and so does a
+/// live publisher's check re-sent from there once its original has
+/// arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_address_draws_nothing() {
+    let server = start(&[]).await;
+    let (mut phone, _) = live(&server, 64, "event-fresh").await;
+    let fresh = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let mut corrupted = phone.p.check(false);
+    if let Some(last) = corrupted.last_mut() {
+        *last ^= 0xff;
+    }
+    let mut unsigned = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42];
+    unsigned.extend_from_slice(&[7; 12]);
+    let mut hello = vec![0x16, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 1];
+    hello.resize(60, 0x5a);
+    let rtp = [0x80, 0x6f, 0, 9, 0, 0, 0, 1, 0, 0, 0x10, 0x01, 1, 2, 3, 4];
+    let random: Vec<u8> = (0..200u32).map(|i| (i * 37 % 251) as u8).collect();
+    for d in [&corrupted, &unsigned, &hello, &rtp[..], &random] {
+        fresh.send_to(d, server.udp).await.expect("send");
+    }
+    // A check the publisher sends, then the same bytes from the fresh
+    // address, as a captured copy would arrive.
+    let check = phone.p.check(false);
+    phone.send(&check).await;
+    phone.receive(Duration::from_millis(200)).await;
+    fresh.send_to(&check, server.udp).await.expect("send");
+    let mut buf = [0u8; 2048];
+    let got = tokio::time::timeout(Duration::from_millis(700), fresh.recv_from(&mut buf)).await;
+    assert!(got.is_err(), "the fresh address was sent {:?}", got.ok());
+    // The publisher was not cut off.
+    phone.publish(1).await;
 }
 
 #[test]

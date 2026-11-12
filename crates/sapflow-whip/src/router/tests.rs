@@ -98,6 +98,10 @@ fn talk(r: &mut Router, side: &mut Side, from: Instant, n: u64) -> Instant {
         r.handle_datagram(now, tuple, &a);
         r.handle_timeout(now);
         pump(r, now, &mut [&mut *side]);
+        assert!(
+            r.deadlines_indexed(),
+            "the deadline index follows each call"
+        );
     }
     now
 }
@@ -504,9 +508,9 @@ fn ended_panicked(events: &[(SessionId, Event)], id: SessionId) -> bool {
         .any(|(i, e)| *i == id && matches!(e, Event::Ended(crate::session::EndReason::Panicked)))
 }
 
-/// A panic in a session's deadline, read for every session between calls,
-/// drops that session only, from `poll_timeout` or from `handle_timeout`;
-/// the deadline returned is the others', and the next read is clean.
+/// A panic in a session's deadline, read as each of its calls ends, drops
+/// that session only, at once, and takes it out of the deadline index; the
+/// deadline returned is the others'.
 #[test]
 fn a_session_whose_deadline_panics_is_dropped_and_the_others_go_on() {
     let t0 = Instant::now();
@@ -518,36 +522,116 @@ fn a_session_whose_deadline_panics_is_dropped_and_the_others_go_on() {
     let ty = y.p.tuple;
     let now = talk(&mut r, &mut x, t0, 10);
     while r.poll_event().is_some() {}
+    // The arming call itself returns normally; its deadline read does not.
     assert_eq!(
         r.handle_datagram(now, ty, &arm(Read::PollTimeout)),
         Some(y.id)
     );
-    assert!(r.poll_event().is_none(), "arming is not a panic");
-    assert_eq!(r.stats().panics, 0);
-    let deadline = r.poll_timeout();
     let events: Vec<(SessionId, Event)> = std::iter::from_fn(|| r.poll_event()).collect();
     assert!(ended_panicked(&events, y.id), "{events:?}");
     assert_eq!(events.len(), 1);
     assert_eq!(r.stats().panics, 1);
     assert!(r.session(&y.id).is_none());
     assert_eq!(r.owner(&ty), None);
-    assert_eq!(deadline, r.session(&x.id).and_then(Session::poll_timeout));
-    assert_eq!(r.poll_timeout(), deadline, "the next read is clean");
-    assert_eq!(r.stats().panics, 1);
-    // From `handle_timeout`'s own read of the deadlines too.
-    let mut z = join(&mut r, 28, now);
-    connect(&mut r, now, &mut z);
-    while r.poll_event().is_some() {}
-    r.handle_datagram(now, z.p.tuple, &arm(Read::PollTimeout));
-    r.handle_timeout(now);
-    let events: Vec<(SessionId, Event)> = std::iter::from_fn(|| r.poll_event()).collect();
-    assert!(ended_panicked(&events, z.id), "{events:?}");
-    assert_eq!(r.stats().panics, 2);
-    assert!(r.session(&z.id).is_none());
+    assert!(r.deadlines_indexed());
+    assert_eq!(
+        r.poll_timeout(),
+        r.session(&x.id).and_then(Session::poll_timeout),
+        "X's deadline"
+    );
     let before = srtp(&r, &x);
     talk(&mut r, &mut x, now, 10);
     assert_eq!(srtp(&r, &x), before + 10);
     assert_eq!(state(&r, &x), Some(State::Connected));
+}
+
+/// Finding the next deadline, and what is due, reads no session: media to
+/// one session among many reads only that session's deadline, as its
+/// calls end, however many others there are.
+#[test]
+fn media_to_one_session_reads_no_other_sessions_deadline() {
+    let t0 = Instant::now();
+    let mut r = Router::new(RouterConfig {
+        max_sessions: 64,
+        ..RouterConfig::default()
+    })
+    .expect("config");
+    let mut x = join(&mut r, 50, t0);
+    connect(&mut r, t0, &mut x);
+    let others: Vec<Side> = (51..91).map(|seed| join(&mut r, seed, t0)).collect();
+    let reads = |r: &Router| -> u64 {
+        others
+            .iter()
+            .map(|o| r.session(&o.id).map_or(0, Session::deadline_reads))
+            .sum()
+    };
+    let before = reads(&r);
+    let tuple = x.p.tuple;
+    for i in 1..=50u64 {
+        let now = t0 + ms(20 * i);
+        let a = x.p.audio(i as u8);
+        r.handle_datagram(now, tuple, &a);
+        r.handle_timeout(now);
+        assert!(r.poll_timeout().is_some());
+        pump(&mut r, now, &mut [&mut x]);
+    }
+    assert_eq!(srtp(&r, &x), 50);
+    assert_eq!(reads(&r), before, "no other session's deadline was read");
+}
+
+/// The deadline index holds each live session's deadline as its calls
+/// end, through handshakes, media, timers, closes and removals; and
+/// `handle_timeout` runs only the sessions that are due.
+#[test]
+fn the_deadline_index_follows_every_session() {
+    let t0 = Instant::now();
+    let mut r = router();
+    assert_eq!(r.poll_timeout(), None);
+    let mut sides: Vec<Side> = (40..46).map(|seed| join(&mut r, seed, t0)).collect();
+    assert!(r.deadlines_indexed());
+    for side in sides.iter_mut().take(4) {
+        connect(&mut r, t0, side);
+        assert!(r.deadlines_indexed());
+    }
+    let mut now = t0;
+    for side in sides.iter_mut().take(4) {
+        now = talk(&mut r, side, now, 5);
+        assert!(r.deadlines_indexed());
+    }
+    let earliest = r.poll_timeout().expect("a deadline");
+    let due: Vec<bool> = sides
+        .iter()
+        .map(|s| {
+            r.session(&s.id)
+                .and_then(Session::poll_timeout)
+                .is_some_and(|d| d <= earliest)
+        })
+        .collect();
+    assert!(due.contains(&true));
+    // A session that runs reads its deadline as its call ends; one that is
+    // not due is not touched.
+    let reads: Vec<u64> = sides
+        .iter()
+        .map(|s| r.session(&s.id).map_or(0, Session::deadline_reads))
+        .collect();
+    r.handle_timeout(earliest);
+    for (i, side) in sides.iter().enumerate() {
+        let ran = r
+            .session(&side.id)
+            .is_none_or(|s| s.deadline_reads() > reads[i]);
+        assert_eq!(ran, due[i], "session {i}: due {}", due[i]);
+    }
+    assert!(r.deadlines_indexed());
+    assert!(r.close(&sides[0].id, now));
+    assert!(r.deadlines_indexed());
+    // The two that never connected end at their handshake deadline.
+    let deadline = r
+        .session(&sides[5].id)
+        .and_then(Session::poll_timeout)
+        .expect("a handshake deadline");
+    r.handle_timeout(deadline + Duration::from_secs(11));
+    assert!(r.session(&sides[4].id).is_none() && r.session(&sides[5].id).is_none());
+    assert!(r.deadlines_indexed());
 }
 
 /// A panic in the tuple owner's state, read when another session's check
