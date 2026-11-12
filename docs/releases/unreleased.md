@@ -62,3 +62,5 @@ Notes for the release after 0.2.0-rc.1.
   at its keyframe, so its program date is that keyframe's arrival.
   Video-led output changes at every interrupt, including the end of each
   stream; audio-only output and output with no interrupt are unchanged.
+  The fragment budget's use moves with it at an interrupt, where more
+  media is now kept.

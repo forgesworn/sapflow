@@ -334,6 +334,68 @@ fn late_audio_after_the_new_runs_first_part_is_reported() {
     assert_continuous_audio_but_for(es.muxer().expect("muxer"), 1024);
 }
 
+/// A late frame dropped and then the stream's end: the end's interrupt
+/// reports it, though no video came after it.
+#[test]
+fn late_audio_lost_just_before_the_end_is_reported_by_it() {
+    let events = events();
+    // Up to and including the late frame, and no video after it.
+    let late = events
+        .iter()
+        .position(|e| matches!(e, Event::Aac(pts, ..) if *pts == 307_920))
+        .expect("the late frame");
+    let mut es = aac_ingest();
+    let mut watch = Watch::default();
+    // The new run's first part must have closed before the late frame
+    // comes; in the fixture's order it has, by the frame's arrival.
+    let up = feed(&mut es, &events[..late], &mut watch);
+    assert!(up.restarted && !up.media_loss);
+    let up = feed(&mut es, &events[late..=late], &mut watch);
+    assert!(!up.media_loss, "audio alone reports nothing yet");
+    // The frame is held until the next audio places or drops it.
+    let next_audio = events[late + 1..]
+        .iter()
+        .find(|e| matches!(e, Event::Aac(..)))
+        .cloned()
+        .expect("audio after it");
+    feed(&mut es, &[next_audio], &mut watch);
+    assert!(finish(&mut es, &mut watch).media_loss, "the end reports it");
+}
+
+/// Audio-only Opus through a codec change of its own (a new channel count
+/// on reconnect, which reconfigures the audio track): every packet out.
+#[test]
+fn an_audio_only_opus_epoch_change_keeps_every_packet() {
+    let first = opus_events(0, 90_000);
+    let second = opus_events(90_000, 2 * 90_000);
+    let mut es = EsIngest::new(config());
+    es.opus_config(OpusConfig::STEREO).expect("stereo");
+    es.declare_tracks(TrackSet::AudioOnly, NOW)
+        .expect("audio only");
+    let mut watch = Watch::default();
+    feed(&mut es, &first, &mut watch);
+    let m = es.muxer_mut().expect("muxer");
+    let up = m
+        .reconfigure_with_audio(None, Some(AudioConfig::Opus(OpusConfig::MONO)), NOW)
+        .expect("a new audio epoch");
+    assert!(!up.media_loss);
+    // The fixture's packets are stereo; the new epoch only has to keep
+    // whatever comes, so count them through it.
+    feed(&mut es, &second, &mut watch);
+    finish(&mut es, &mut watch);
+    let m = es.muxer().expect("muxer");
+    assert_eq!(m.current_initialization_id(), 1);
+    let audio: Vec<Vec<u8>> = first
+        .iter()
+        .chain(&second)
+        .filter_map(|e| match e {
+            Event::Opus(_, p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(track_samples(m, AUDIO_TRACK), audio);
+}
+
 /// As [`assert_continuous_audio`], but allowing one gap of up to
 /// `samples`, where a frame was dropped.
 fn assert_continuous_audio_but_for(m: &Muxer, samples: u64) {

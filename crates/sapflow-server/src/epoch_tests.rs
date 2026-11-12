@@ -481,6 +481,10 @@ async fn a_mid_stream_resolution_change_rolls_the_recording_and_both_files_decod
     // change included; the second all but the last, whose PES never ended
     // (TS finish leaves an unbounded final PES out).
     assert_eq!((recorded[first].0, video), (60, 59), "video frames");
+    // The fixture's AAC: one frame before the first keyframe (no run to
+    // join), 95 from it to the change and 94 after. The first file has all
+    // 95 but the late one below; the second all 94.
+    assert_eq!((recorded[first].1, audio), (94, 94), "AAC frames");
     // The fixture's AAC PES arrive up to 200 ms behind their video, so the
     // frame stamped just before the change arrives after the new run's
     // first part: it is dropped, and the file that follows says so.

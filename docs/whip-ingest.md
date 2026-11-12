@@ -1052,13 +1052,16 @@ The cut itself loses nothing the muxer holds:
 - **Audio-only runs** already kept every frame, each with its known
   duration, and are unchanged.
 
-In the resolution-change fixture the change used to lose 1 of 60 video
-frames and 3 of 96 AAC frames, and 19 AAC frames after a 300 ms video
-pause, all unmarked. In time order every frame now comes out; in the
-fixture's own order, whose AAC PES arrive up to 200 ms behind their video,
-one AAC frame arrives after the new run's first part and is reported. The
-end of every video-led stream also kept its last frame and audio back
-before; it now writes them.
+Measured with the resolution-change fixture in time order, the change used
+to lose 1 of its 60 video frames and 3 AAC frames (two stamped before the
+new keyframe, one at it); with a 300 ms video pause before the new
+keyframe, 1 video frame and 17 AAC frames; with audio 250 ms ahead of
+video, 1 and 15; and the end of every video-led stream lost its last video
+frame and AAC frame. None was marked. Now every frame comes out in each
+case. In the fixture's own order, whose AAC PES arrive up to 200 ms behind
+their video, one AAC frame arrives after the new run's first part has
+closed and is reported: its recording has 94 of the 95 AAC frames from the
+first keyframe to the change, and is marked `media-loss`.
 
 Left open:
 
@@ -1071,7 +1074,10 @@ Left open:
 - A break inside a run (a timestamp jump or a segment about to outrun its
   target) still drops the frame before it without saying so.
 - A video pause longer than the open part's room at a change leaves a gap
-  in video, under continuous audio, at the start of the new run.
+  in video, under continuous audio, at the start of the new run. The old
+  segment's `EXTINF` then covers the pause while the pause's audio is in
+  the next segment, as for a stall at the end of a segment within a run;
+  no test checks that case's durations.
 - Two writers a path (`PATH_WRITERS`): epochs that change faster than a
   finished file can be written out leave a later recording without a
   writer, which fails it. A late-started file for a short epoch takes one

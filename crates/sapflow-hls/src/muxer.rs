@@ -1535,6 +1535,14 @@ impl Muxer {
     /// [`Muxer::interrupt`], or with `next_dts` a cut on a continuing clock
     /// ([`Muxer::reconfigure_with_audio_at`]).
     fn interrupt_cut(&mut self, next_dts: Option<i64>, now: SystemTime) -> Update {
+        let mut update = self.interrupt_run(next_dts, now);
+        // Audio dropped since the last update (late audio after a cut), so a
+        // stream that ends straight after it still reports it.
+        update.media_loss |= std::mem::take(&mut self.unreported_loss);
+        update
+    }
+
+    fn interrupt_run(&mut self, next_dts: Option<i64>, now: SystemTime) -> Update {
         self.hold_gap = false;
         if self.fragment_refused {
             return self.interrupt_refused(now);
