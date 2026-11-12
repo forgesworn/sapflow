@@ -126,8 +126,14 @@ fn idr_annexb_parameter_sets_and_timestamps_round_trip() {
     assert_eq!(pes.data, expected);
     let stats = mux.stats();
     assert_eq!(stats.elementary_staging_copy_bytes, 184 - 2 - 19);
-    assert_eq!(stats.packet_payload_copy_bytes, expected.len() as u64);
-    assert_eq!(stats.writer_payload_copy_bytes, expected.len() as u64);
+    assert_eq!(
+        stats.packet_payload_copy_bytes,
+        stats.elementary_staging_copy_bytes
+    );
+    assert_eq!(
+        stats.writer_payload_copy_bytes,
+        stats.elementary_staging_copy_bytes
+    );
     assert_eq!(stats.buffered_sample_bytes, 0);
 }
 
@@ -187,9 +193,15 @@ fn contiguous_audio_payload_skips_staging_after_header_boundary() {
     assert_eq!(pes.data, expected);
     let stats = mux.stats();
     assert_eq!(stats.elementary_staging_copy_bytes, 184 - 2 - 14);
-    assert_eq!(stats.packet_payload_copy_bytes, expected.len() as u64);
-    assert_eq!(stats.writer_payload_copy_bytes, expected.len() as u64);
-    assert!(stats.elementary_staging_copy_bytes < stats.packet_payload_copy_bytes);
+    assert_eq!(
+        stats.packet_payload_copy_bytes,
+        stats.elementary_staging_copy_bytes
+    );
+    assert_eq!(
+        stats.writer_payload_copy_bytes,
+        stats.elementary_staging_copy_bytes
+    );
+    assert!(stats.packet_payload_copy_bytes < expected.len() as u64);
 }
 
 #[test]
@@ -453,189 +465,217 @@ fn ffmpeg_generated_av_and_audio_only_decode() {
             .filter_map(|line| line.rsplit(',').next().map(|hash| hash.trim().to_owned()))
             .collect()
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    let scratch = Scratch(root.join(format!(
-            "sapflow-mpegts-interop-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        )));
-    std::fs::create_dir(&scratch.0).expect("task scratch");
-    let h264 = scratch.0.join("fixture.h264");
-    let aac = scratch.0.join("fixture.aac");
-    run(&[
-        "-f",
-        "lavfi",
-        "-i",
-        "testsrc2=size=160x90:rate=30",
-        "-t",
-        "1",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-x264-params",
-        "aud=1:repeat-headers=1:bframes=0:keyint=15",
-        "-f",
-        "h264",
-        path(&h264),
-    ]);
-    run(&[
-        "-f",
-        "lavfi",
-        "-i",
-        "sine=frequency=997:sample_rate=48000",
-        "-t",
-        "1",
-        "-ac",
-        "2",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "96k",
-        "-f",
-        "adts",
-        path(&aac),
-    ]);
-    let h264_bytes = std::fs::read(&h264).expect("video fixture");
-    let nals = annexb(&h264_bytes);
-    let sps = nals.iter().find(|nal| nal[0] & 31 == 7).expect("SPS");
-    let pps = nals.iter().find(|nal| nal[0] & 31 == 8).expect("PPS");
-    let video = H264Config::new(sps, pps).expect("generated H264 configuration");
-    let video_arc = Arc::new(CodecConfig::H264(video.clone()));
-    let mut frames = Vec::new();
-    let mut current = Vec::new();
-    let mut key = false;
-    for nal in nals {
-        let kind = nal[0] & 31;
-        if kind == 9 && !current.is_empty() {
-            frames.push((std::mem::take(&mut current), key));
-            key = false;
+    // Generated noise gives real, independently decodable large access units.
+    // The original small-fixture command and both decode oracles stay intact.
+    for (video_filter, large_access_units) in [
+        ("testsrc2=size=160x90:rate=30", false),
+        (
+            "testsrc2=size=1280x720:rate=30,noise=alls=100:allf=t:all_seed=42",
+            true,
+        ),
+    ] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let scratch = Scratch(root.join(format!(
+                "sapflow-mpegts-interop-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&scratch.0).expect("task scratch");
+        let h264 = scratch.0.join("fixture.h264");
+        let aac = scratch.0.join("fixture.aac");
+        let mut video_args = vec![
+            "-f",
+            "lavfi",
+            "-i",
+            video_filter,
+            "-t",
+            "1",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-x264-params",
+            "aud=1:repeat-headers=1:bframes=0:keyint=15",
+        ];
+        if large_access_units {
+            video_args.extend_from_slice(&["-qp", "0"]);
         }
-        if matches!(kind, 1 | 5 | 6 | 12) {
-            key |= kind == 5;
-            current.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-            current.extend_from_slice(nal);
-        }
-    }
-    if !current.is_empty() {
-        frames.push((current, key));
-    }
-    assert_eq!(frames.len(), 30);
-    let mut samples = Vec::new();
-    for (i, (bytes, key)) in frames.into_iter().enumerate() {
-        samples.push(Arc::new(
-            EncodedSample::new(
-                video_arc.clone(),
-                SampleTiming::new(i as i64, i as i64, 1, 30).expect("time"),
-                key,
-                Arc::from(bytes),
-            )
-            .expect("video sample"),
-        ));
-    }
-    let aac_bytes = std::fs::read(&aac).expect("AAC fixture");
-    let mut rest = &aac_bytes[..];
-    let mut audio_samples = Vec::new();
-    while !rest.is_empty() {
-        assert!(rest.len() >= 7);
-        assert_eq!(rest[0], 0xff);
-        assert_eq!(rest[1] & 1, 1);
-        let len = (usize::from(rest[3] & 3) << 11)
-            | (usize::from(rest[4]) << 3)
-            | usize::from(rest[5] >> 5);
-        assert!((7..=8191).contains(&len));
-        assert!(len <= rest.len());
-        assert_eq!((rest[2] >> 2) & 15, 3, "48k frequency index");
-        audio_samples.push(audio_at(audio_samples.len() as i64 * 1024, &rest[7..len]));
-        rest = &rest[len..];
-    }
-    assert!(audio_samples.len() >= 47);
-    let expected_video = frame_hashes(&run(&[
-        "-i",
-        path(&h264),
-        "-map",
-        "0:v:0",
-        "-f",
-        "framemd5",
-        "-",
-    ]));
-    let expected_audio = run(&["-i", path(&aac), "-map", "0:a:0", "-f", "s16le", "-"]);
-    for audio_only in [false, true] {
-        let cfg = MpegTsConfig {
-            video: (!audio_only).then_some(video.clone()),
-            audio: Some(audio_config()),
-            ..MpegTsConfig::default()
-        };
-        let mut mux = MpegTsMuxer::new(cfg).expect("mux");
-        let output = scratch.0.join(if audio_only {
-            "audio-only.ts"
-        } else {
-            "audio-video.ts"
-        });
-        let mut file = std::fs::File::create(&output).expect("output");
-        let mut all = audio_samples.clone();
-        if !audio_only {
-            all.extend(samples.iter().cloned());
-        }
-        all.sort_by_key(|sample| sample.timing().decode_time_ns());
-        for sample in all {
-            mux.push(sample).expect("mux sample");
-            while let Some(chunk) = mux.poll_chunk().expect("chunk") {
-                file.write_all(&chunk).expect("output");
+        video_args.extend_from_slice(&["-f", "h264", path(&h264)]);
+        run(&video_args);
+        run(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000",
+            "-t",
+            "1",
+            "-ac",
+            "2",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-f",
+            "adts",
+            path(&aac),
+        ]);
+        let h264_bytes = std::fs::read(&h264).expect("video fixture");
+        let nals = annexb(&h264_bytes);
+        let sps = nals.iter().find(|nal| nal[0] & 31 == 7).expect("SPS");
+        let pps = nals.iter().find(|nal| nal[0] & 31 == 8).expect("PPS");
+        let video = H264Config::new(sps, pps).expect("generated H264 configuration");
+        let video_arc = Arc::new(CodecConfig::H264(video.clone()));
+        let mut frames = Vec::new();
+        let mut current = Vec::new();
+        let mut key = false;
+        for nal in nals {
+            let kind = nal[0] & 31;
+            if kind == 9 && !current.is_empty() {
+                frames.push((std::mem::take(&mut current), key));
+                key = false;
+            }
+            if matches!(kind, 1 | 5 | 6 | 12) {
+                key |= kind == 5;
+                current.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                current.extend_from_slice(nal);
             }
         }
-        drop(file);
-        let probe = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_entries",
-                "stream=codec_name,width,height,sample_rate,channels",
-                "-of",
-                "compact",
-                path(&output),
-            ])
-            .output()
-            .expect("ffprobe");
-        assert!(
-            probe.status.success(),
-            "{}",
-            String::from_utf8_lossy(&probe.stderr)
-        );
-        let probe = String::from_utf8(probe.stdout).expect("probe text");
-        assert!(probe.contains("codec_name=aac"));
-        if !audio_only {
-            assert!(probe.contains("codec_name=h264"));
-            let actual = frame_hashes(&run(&[
-                "-i",
-                path(&output),
-                "-map",
-                "0:v:0",
-                "-f",
-                "framemd5",
-                "-",
-            ]));
-            assert_eq!(actual, expected_video, "decoded video frame hashes");
+        if !current.is_empty() {
+            frames.push((current, key));
         }
-        let actual_audio = run(&["-i", path(&output), "-map", "0:a:0", "-f", "s16le", "-"]);
-        assert_eq!(actual_audio, expected_audio, "decoded PCM bytes");
-        let ts = std::fs::read(&output).expect("TS");
-        assert!(
-            packets(&ts)
+        assert_eq!(frames.len(), 30);
+        if large_access_units {
+            let largest = frames
                 .iter()
-                .any(|p| p.adaptation_field.as_ref().is_some_and(|a| a.pcr.is_some()))
-        );
-        println!(
-            "MPEGTS independent decode: audio_only={audio_only} ts_bytes={} video_frames={} pcm_bytes={} pcr_present=true mux_stats={:?}",
-            ts.len(),
-            if audio_only { 0 } else { expected_video.len() },
-            actual_audio.len(),
-            mux.stats()
-        );
+                .map(|(bytes, _)| bytes.len())
+                .max()
+                .expect("frames");
+            assert!(
+                largest >= 256 * 1024,
+                "fixture must actually exercise large access units: {largest}"
+            );
+            assert!(
+                largest <= MAX_SAMPLE_BYTES,
+                "generated access unit exceeds supported bound: {largest}"
+            );
+            println!("MPEGTS generated large access unit: largest_bytes={largest}");
+        }
+        let mut samples = Vec::new();
+        for (i, (bytes, key)) in frames.into_iter().enumerate() {
+            samples.push(Arc::new(
+                EncodedSample::new(
+                    video_arc.clone(),
+                    SampleTiming::new(i as i64, i as i64, 1, 30).expect("time"),
+                    key,
+                    Arc::from(bytes),
+                )
+                .expect("video sample"),
+            ));
+        }
+        let aac_bytes = std::fs::read(&aac).expect("AAC fixture");
+        let mut rest = &aac_bytes[..];
+        let mut audio_samples = Vec::new();
+        while !rest.is_empty() {
+            assert!(rest.len() >= 7);
+            assert_eq!(rest[0], 0xff);
+            assert_eq!(rest[1] & 1, 1);
+            let len = (usize::from(rest[3] & 3) << 11)
+                | (usize::from(rest[4]) << 3)
+                | usize::from(rest[5] >> 5);
+            assert!((7..=8191).contains(&len));
+            assert!(len <= rest.len());
+            assert_eq!((rest[2] >> 2) & 15, 3, "48k frequency index");
+            audio_samples.push(audio_at(audio_samples.len() as i64 * 1024, &rest[7..len]));
+            rest = &rest[len..];
+        }
+        assert!(audio_samples.len() >= 47);
+        let expected_video = frame_hashes(&run(&[
+            "-i",
+            path(&h264),
+            "-map",
+            "0:v:0",
+            "-f",
+            "framemd5",
+            "-",
+        ]));
+        let expected_audio = run(&["-i", path(&aac), "-map", "0:a:0", "-f", "s16le", "-"]);
+        for audio_only in [false, true] {
+            let cfg = MpegTsConfig {
+                video: (!audio_only).then_some(video.clone()),
+                audio: Some(audio_config()),
+                ..MpegTsConfig::default()
+            };
+            let mut mux = MpegTsMuxer::new(cfg).expect("mux");
+            let output = scratch.0.join(if audio_only {
+                "audio-only.ts"
+            } else {
+                "audio-video.ts"
+            });
+            let mut file = std::fs::File::create(&output).expect("output");
+            let mut all = audio_samples.clone();
+            if !audio_only {
+                all.extend(samples.iter().cloned());
+            }
+            all.sort_by_key(|sample| sample.timing().decode_time_ns());
+            for sample in all {
+                mux.push(sample).expect("mux sample");
+                while let Some(chunk) = mux.poll_chunk().expect("chunk") {
+                    file.write_all(&chunk).expect("output");
+                }
+            }
+            drop(file);
+            let probe = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_name,width,height,sample_rate,channels",
+                    "-of",
+                    "compact",
+                    path(&output),
+                ])
+                .output()
+                .expect("ffprobe");
+            assert!(
+                probe.status.success(),
+                "{}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            let probe = String::from_utf8(probe.stdout).expect("probe text");
+            assert!(probe.contains("codec_name=aac"));
+            if !audio_only {
+                assert!(probe.contains("codec_name=h264"));
+                let actual = frame_hashes(&run(&[
+                    "-i",
+                    path(&output),
+                    "-map",
+                    "0:v:0",
+                    "-f",
+                    "framemd5",
+                    "-",
+                ]));
+                assert_eq!(actual, expected_video, "decoded video frame hashes");
+            }
+            let actual_audio = run(&["-i", path(&output), "-map", "0:a:0", "-f", "s16le", "-"]);
+            assert_eq!(actual_audio, expected_audio, "decoded PCM bytes");
+            let ts = std::fs::read(&output).expect("TS");
+            assert!(
+                packets(&ts)
+                    .iter()
+                    .any(|p| p.adaptation_field.as_ref().is_some_and(|a| a.pcr.is_some()))
+            );
+            println!(
+                "MPEGTS independent decode: audio_only={audio_only} ts_bytes={} video_frames={} pcm_bytes={} pcr_present=true mux_stats={:?}",
+                ts.len(),
+                if audio_only { 0 } else { expected_video.len() },
+                actual_audio.len(),
+                mux.stats()
+            );
+        }
     }
 }
 
@@ -714,4 +754,67 @@ fn input_aud_is_replaced_with_exactly_one_before_sps_pps() {
         1
     );
     assert_eq!(&pes.data[..6], &[0, 0, 0, 1, 9, 0xf0]);
+}
+
+#[test]
+fn direct_continuations_match_maintained_writer_for_every_payload_extent_and_header_field() {
+    let payload: Vec<u8> = (0..184).map(|i| (i as u8) ^ 0x5a).collect();
+    for len in 1..=184 {
+        for pid in [0, VIDEO_PID, AUDIO_PID, 0x1fff] {
+            for counter in 0..=15 {
+                for scrambling in [
+                    TransportScramblingControl::NotScrambled,
+                    TransportScramblingControl::ScrambledWithEvenKey,
+                    TransportScramblingControl::ScrambledWithOddKey,
+                ] {
+                    for error in [false, true] {
+                        for priority in [false, true] {
+                            let header = TsHeader {
+                                transport_error_indicator: error,
+                                transport_priority: priority,
+                                pid: Pid::new(pid).expect("PID"),
+                                transport_scrambling_control: scrambling,
+                                continuity_counter: ContinuityCounter::from_u8(counter)
+                                    .expect("counter"),
+                            };
+                            let mut actual = vec![0xab; 3];
+                            write_continuation(&mut actual, &header, &payload[..len])
+                                .expect("direct");
+                            let reference_packet = TsPacket {
+                                header,
+                                adaptation_field: None,
+                                payload: Some(TsPayload::PesContinuation(
+                                    Bytes::new(&payload[..len]).expect("payload"),
+                                )),
+                            };
+                            let mut expected = vec![0xab; 3];
+                            TsPacketWriter::new(&mut expected)
+                                .write_ts_packet(&reference_packet)
+                                .expect("reference");
+                            assert_eq!(actual, expected, "len={len} pid={pid} counter={counter}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn direct_continuation_refuses_invalid_extent_without_touching_output() {
+    let header = TsHeader {
+        transport_error_indicator: false,
+        transport_priority: false,
+        pid: Pid::new(VIDEO_PID).expect("PID"),
+        transport_scrambling_control: TransportScramblingControl::NotScrambled,
+        continuity_counter: ContinuityCounter::new(),
+    };
+    for len in [0, 185] {
+        let mut output = vec![0xab; 3];
+        assert_eq!(
+            write_continuation(&mut output, &header, &vec![0; len]),
+            Err(MuxError::Writer)
+        );
+        assert_eq!(output, vec![0xab; 3]);
+    }
 }
