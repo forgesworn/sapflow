@@ -63,4 +63,12 @@ Notes for the release after 0.2.0-rc.1.
   Video-led output changes at every interrupt, including the end of each
   stream; audio-only output and output with no interrupt are unchanged.
   The fragment budget's use moves with it at an interrupt, where more
-  media is now kept.
+  media is now kept. A cut on a continuing clock ends the old segment with
+  its media, so `EXTINF` is the sum of its parts and a video pause before
+  the new keyframe falls at the discontinuity; `RuleCheck` and
+  `scripts/check-playlist.py` now check that sum. Audio stamped before the
+  new keyframe that has to be dropped belongs to the old epoch: it is not
+  in the new run's `media_loss` but counted by the new
+  `Muxer::take_late_audio_loss`, and `Muxer::late_audio_epoch` says while
+  it may still come. The server holds the old recording open until then
+  and marks it, not the next file, `media-loss`.

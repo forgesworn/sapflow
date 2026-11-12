@@ -1029,19 +1029,37 @@ the change.
 The cut itself loses nothing the muxer holds:
 
 - **On a change mid-stream the clock carries on.** The ingest passes the
-  new keyframe's time (`Muxer::reconfigure_with_audio_at`), and the old run
-  ends exactly there: the held video frame lasts until it, the held audio
-  frame keeps its own duration, and output time is not moved. A frame
-  longer than the open part has room for is cut to fit it, as a stall
-  inside a run is, so the part and segment durations stay those of the
-  media; audio in the rest of that time, and audio stamped past the
-  keyframe that arrived before it, go to the new run's first part.
+  new keyframe's time (`Muxer::reconfigure_with_audio_at`). The held audio
+  frame keeps its own duration and output time is not moved. The held
+  video frame lasts until the keyframe as far as the open part's target
+  and the segment's limit allow, and the old segment ends with its media,
+  so its `EXTINF` is the sum of its parts' durations. A longer gap (a
+  video pause before the new keyframe) falls at the `EXT-X-DISCONTINUITY`,
+  where a player expects a jump. Audio past the old segment's end, and
+  audio stamped past the keyframe that arrived before it, go to the new
+  run's first part. A gap of more than a second, or one the segment cannot
+  hold, is cut as at a reconnect.
 - **The new run's first part opens at its keyframe,** so audio that
   arrives before its second frame, or stamped before the keyframe and
-  arriving just after it, has a part to join. Audio stamped before the
-  keyframe that arrives once that part has closed fits no part (in a
-  recording it would come before the file's first video): it is dropped,
-  and the next update says `media_loss`.
+  arriving while that part is open, has a part to join. Whether a late
+  frame joins is decided when the audio frame after it arrives (each
+  frame is held until then for its duration). Audio stamped before the
+  keyframe that is decided once the first part has closed fits no part
+  (in a recording it would come before the file's first video): it is
+  dropped, and so is the held frame at a cut if it is such a frame.
+- **Late audio marks the file it belonged to.** A dropped late frame is
+  the old epoch's audio, so the old recording is the one missing it. The
+  muxer counts it against that epoch (`Muxer::take_late_audio_loss`), not
+  in the new run's `media_loss`, and the server keeps the old recording
+  open, not yet finished, while its late audio may still come
+  (`Muxer::late_audio_epoch`): until audio stamped at or after the
+  keyframe arrives, two seconds of video after the keyframe, a change of
+  audio configuration, or the next cut or the end of the connection. A
+  drop in that time marks the old file `media-loss`. If the window closes
+  before audio has reached the keyframe and the audio received ends more
+  than one audio frame short of it, the old file is marked too. That
+  over-marks an encoder that simply stopped sending audio before the
+  change.
 - **At a reconnect or the end of a stream** no clock carries on. The held
   video frame lasts as long as the frame before it did (with no frame
   before it, the SPS frame rate's interval, else 1/30 s), or until the end
@@ -1058,10 +1076,24 @@ new keyframe, one at it); with a 300 ms video pause before the new
 keyframe, 1 video frame and 17 AAC frames; with audio 250 ms ahead of
 video, 1 and 15; and the end of every video-led stream lost its last video
 frame and AAC frame. None was marked. Now every frame comes out in each
-case. In the fixture's own order, whose AAC PES arrive up to 200 ms behind
-their video, one AAC frame arrives after the new run's first part has
-closed and is reported: its recording has 94 of the 95 AAC frames from the
-first keyframe to the change, and is marked `media-loss`.
+case. With the fixture's audio arriving behind its video, through the
+elementary-stream path (the server test
+`late_audio_at_a_resolution_change_marks_only_the_file_it_belonged_to`):
+
+| Audio behind video | First file (video, AAC) | Second file | AAC dropped | First file marked |
+| --- | --- | --- | --- | --- |
+| 0 ms | 60, 94 | 60, 94 | 0 | no |
+| 100 ms | 60, 91 | 60, 98 | 0 | no |
+| 300 ms | 60, 81 | 60, 103 | 5 | `media-loss` |
+| 500 ms | 60, 72 | 60, 102 | 15 | `media-loss` |
+| 1000 ms | 60, 48 | 60, 103 | 38 | `media-loss` |
+
+The first file's 95 AAC frames from the first keyframe to the change lose
+one at the stream's start in every row (below). The second file holds its
+own 94 and the late frames that joined its first part; it is never marked
+for late audio. In the fixture's TS order, whose AAC PES arrive up to
+200 ms behind their video, one frame is dropped and the first file is
+marked.
 
 Left open:
 
@@ -1073,11 +1105,29 @@ Left open:
   interrupt touches.
 - A break inside a run (a timestamp jump or a segment about to outrun its
   target) still drops the frame before it without saying so.
-- A video pause longer than the open part's room at a change leaves a gap
-  in video, under continuous audio, at the start of the new run. The old
-  segment's `EXTINF` then covers the pause while the pause's audio is in
-  the next segment, as for a stall at the end of a segment within a run;
-  no test checks that case's durations.
+- Late audio that joins the new run's first part is kept, in the new
+  file, and is not counted as a loss: the old file's audio then ends short
+  of its video by those frames (by up to 200 ms behind in the table
+  above), unmarked. Marking it would mark the old file at nearly every
+  resolution change from an FFmpeg TS source.
+- Within a continuous run, a frame longer than the open part's room (a
+  stall, or the held frame across a loss gap) is cut to `PART-TARGET` and
+  the next part carries the true time, so that segment's `EXTINF` exceeds
+  its parts' durations by the hole. Such a run cannot end its segment
+  there (segments start at keyframes), and leaving the hole out of
+  `EXTINF` would move the playlist off the media's time. `RuleCheck` and
+  `scripts/check-playlist.py` allow exactly this: a segment longer than
+  its parts only within a continuous run and only with a part at
+  `PART-TARGET`; before a discontinuity, never.
+- A cut's own losses (the held frame, or audio past the part and segment
+  limits at a reconnect-style cut) are still in the new run's
+  `media_loss`, and the server still marks both files for them, as for
+  any loss in the batch that begins an epoch.
+- The old recording is held, finished up to two seconds of video later
+  than before. Its writer is released at the latest at the next cut, so a
+  short epoch's file and the next file still share the two writers a path
+  has (below), but the first file now finishes at the second change, not
+  the first.
 - Two writers a path (`PATH_WRITERS`): epochs that change faster than a
   finished file can be written out leave a later recording without a
   writer, which fails it. A late-started file for a short epoch takes one

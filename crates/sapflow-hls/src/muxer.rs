@@ -1058,12 +1058,16 @@ impl Muxer {
     /// [`Muxer::reconfigure_with_audio`] mid-stream, on a clock that carries
     /// on: `next_dts` is the new configuration's first keyframe, on the
     /// timeline [`Muxer::push_video`] takes, as its next call will give it.
-    /// The held video frame lasts until that keyframe (as far as the open
-    /// part's target allows), output time is not moved, and audio past the
-    /// old run's end, or arriving later with a time before the keyframe,
-    /// joins the new run's first part instead of being dropped. A gap of
-    /// more than a second, or one the segment cannot hold, is cut as
-    /// [`Muxer::reconfigure_with_audio`] cuts.
+    /// The held video frame lasts until that keyframe as far as the open
+    /// part's target and the segment's limit allow, the segment ends with
+    /// its media (a longer gap falls at the discontinuity), and output time
+    /// is not moved. Audio past the old run's end, or arriving while the
+    /// new run's first part is open with a time before the keyframe, joins
+    /// that part; such audio arriving later is dropped and counted against
+    /// the old epoch ([`Muxer::take_late_audio_loss`]). A gap of more than a
+    /// second, or one the segment cannot hold, is cut as
+    /// [`Muxer::reconfigure_with_audio`] cuts. An interrupt before the
+    /// keyframe comes resumes the next run where this one ended.
     pub fn reconfigure_with_audio_at(
         &mut self,
         video: Option<H264Config>,

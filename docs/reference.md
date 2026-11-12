@@ -132,8 +132,8 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   video kept at 20% rose from 33% to 43% (before 220 to 347 frames, after
   354 to 415). What is still lost is likely waits past the length limit,
   which still break.
-- **Output time carries on.** The keyframe that resumes the stream is
-  moved to the time the last segment ended, and everything after it, audio
+- **Output time carries on.** The keyframe that resumes the stream after
+  a break or a reconnect is moved to the time the last segment ended, and everything after it, audio
   included, by the same amount. Output timestamps therefore only move
   forward, even across an encoder clock jumping back, and a recording (one
   fMP4 file) plays and seeks straight through; its length is the media kept.
@@ -154,7 +154,9 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   target durations, then 503), and the hinted part becomes the new
   segment's first.
 - **Audio.** At a break, AAC from before the resuming keyframe is
-  dropped, and an AAC frame is never given a gap as its duration (a frame
+  dropped (at an interrupt the audio already held is kept first, above;
+  after a codec change, audio stamped before the new keyframe joins its
+  first part while that is open), and an AAC frame is never given a gap as its duration (a frame
   lasts 1024 samples; anything over three frames' time becomes one).
 - **The first segment.** A break before the first segment is complete
   starts the stream over: nothing has been served, and the targets should
@@ -165,14 +167,20 @@ stopped. How sapflow keeps the rule (`sapflow_hls::TargetDuration`,
   break too. The stream, with its playlist, chunk names and recording, is
   held for `SAPFLOW_RECONNECT_GRACE` (default 90 s, v4v's own window). A
   publisher on the same path within it, over either protocol, takes the
-  stream over: the muxer ends the run at the last frame
-  (`Muxer::interrupt`), and the new connection's first keyframe, from
-  whatever clock it brings, carries output time straight on after an
-  `EXT-X-DISCONTINUITY`. Its parameter sets and AAC config must match the
+  stream over: the muxer seals the run with everything it holds
+  (`Muxer::interrupt`): the held audio frame with its own duration, and
+  the held video frame lasting as long as the frame before it, or to the
+  end of the audio received, within the part and segment limits (what
+  cannot fit is dropped and reported as media loss). The new connection's
+  first keyframe, from whatever clock it brings, carries output time
+  straight on from there after an `EXT-X-DISCONTINUITY`. Its parameter sets and AAC config must match the
   stream's. If they do not (a new resolution), the stream carries on in a
   new codec epoch, with a new init segment after a discontinuity, and a new
   recording begins. An encoder that changes resolution without
-  reconnecting gets the same at its next keyframe. v4v still hears `unpublish` at the drop (its stage
+  reconnecting gets the same at its next keyframe, on its own clock: the
+  old segment ends with its media and output time is not moved, so a
+  pause before that keyframe falls at the discontinuity
+  (`docs/whip-ingest.md`, Format changes). v4v still hears `unpublish` at the drop (its stage
   reads "reconnecting") and `publish` on the return; `recordSegmentComplete`
   comes once, when the stream finally ends. Keep `SAPFLOW_RECONNECT_GRACE`
   equal to `PULSEWIRE_LIVE_RECONNECT_GRACE_SECONDS`. An encoder that
