@@ -148,6 +148,19 @@ fn line<'a>(sdp: &'a str, prefix: &str) -> &'a str {
 }
 
 /// Whether the peer closes the connection within `wait`.
+/// Waits up to 2 s for a counter to reach `n`. The listener counts how a
+/// connection ended after the connection's task has dropped its socket, so
+/// the far end can see the close first.
+async fn counted(stats: &Stats, f: fn(&Stats) -> &std::sync::atomic::AtomicU64, n: u64) -> bool {
+    for _ in 0..40 {
+        if get(stats, f) == n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    get(stats, f) == n
+}
+
 async fn closed_within(s: &mut TcpStream, wait: Duration) -> bool {
     let mut b = [0u8; 2048];
     loop {
@@ -349,7 +362,10 @@ async fn any_other_peer_is_dropped_unread() {
     let _ = phone.try_send(&[c]).await;
     assert!(closed_within(&mut phone.stream, Duration::from_secs(2)).await);
     assert!(phone.p.stun_answers.is_empty());
-    assert_eq!(get(&server.stats, |s| &s.untrusted), 1);
+    assert!(
+        counted(&server.stats, |s| &s.untrusted, 1).await,
+        "untrusted"
+    );
 }
 
 /// A LOCAL header is the proxy's own connection: closed, no frame read.
@@ -363,7 +379,7 @@ async fn a_local_header_is_closed_without_reading_frames() {
     let c = phone.p.check(true);
     let _ = phone.try_send(&[c]).await;
     assert!(closed_within(&mut phone.stream, Duration::from_secs(2)).await);
-    assert_eq!(get(&server.stats, |s| &s.local), 1);
+    assert!(counted(&server.stats, |s| &s.local, 1).await, "local");
     assert_eq!(get(&server.stats, |s| &s.frames_in), 0);
 }
 
@@ -383,7 +399,10 @@ async fn a_partial_header_times_out() {
     assert!(closed_within(&mut s, Duration::from_secs(3)).await);
     let took = t.elapsed();
     assert!(took >= Duration::from_millis(250), "{took:?}");
-    assert_eq!(get(&server.stats, |s| &s.header_timeout), 1);
+    assert!(
+        counted(&server.stats, |s| &s.header_timeout, 1).await,
+        "header_timeout"
+    );
 }
 
 /// The connection cap: past it, a connection is closed as it is accepted.
@@ -439,7 +458,10 @@ async fn past_the_per_address_cap_a_connection_is_closed() {
     );
     assert!(!closed_within(&mut a, Duration::from_millis(200)).await);
     assert!(!closed_within(&mut c, Duration::from_millis(200)).await);
-    assert_eq!(get(&server.stats, |s| &s.over_address), 1);
+    assert!(
+        counted(&server.stats, |s| &s.over_address, 1).await,
+        "over_address"
+    );
 }
 
 /// A frame longer than 1500 bytes ends the connection.
@@ -451,7 +473,7 @@ async fn a_frame_over_the_cap_ends_the_connection() {
     b.extend_from_slice(&[0x80; 1501]);
     s.write_all(&b).await.expect("write");
     assert!(closed_within(&mut s, Duration::from_secs(2)).await);
-    assert_eq!(get(&server.stats, |s| &s.framing), 1);
+    assert!(counted(&server.stats, |s| &s.framing, 1).await, "framing");
     assert_eq!(get(&server.stats, |s| &s.frames_in), 0);
 }
 
@@ -472,7 +494,10 @@ async fn unanswered_and_idle_connections_close() {
     let t = tokio::time::Instant::now();
     assert!(closed_within(&mut s, Duration::from_secs(3)).await);
     assert!(t.elapsed() >= Duration::from_millis(250));
-    assert_eq!(get(&server.stats, |s| &s.handshake_timeout), 1);
+    assert!(
+        counted(&server.stats, |s| &s.handshake_timeout, 1).await,
+        "handshake_timeout"
+    );
 
     let mut phone = Phone::new(35, &server, None).await;
     phone.admit(&server, "event-whip-idle").await;
@@ -483,7 +508,10 @@ async fn unanswered_and_idle_connections_close() {
     phone.receive(Duration::from_millis(150)).await;
     assert_eq!(phone.p.stun_answers.len(), 1);
     assert!(closed_within(&mut phone.stream, Duration::from_secs(3)).await);
-    assert_eq!(get(&server.stats, |s| &s.idle_timeout), 1);
+    assert!(
+        counted(&server.stats, |s| &s.idle_timeout, 1).await,
+        "idle_timeout"
+    );
 }
 
 /// A3.4 over ICE-TCP: a panic in a session on a TCP tuple ends only that
