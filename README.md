@@ -168,11 +168,11 @@ Linux the server reads its cgroup memory limit at startup and warns when
 the cap plus `SAPFLOW_MAX_RETAINED_BYTES` (below) is above three quarters of
 it, since a high-bitrate publisher could then get the server killed instead
 of refused. A new stream is refused (SRT 402, RTMP "media memory limit",
-WHIP 503) once what the streams hold, plus the growth expected of those
-still filling their windows and one typical window for the newcomer, would
-reach 80% of the cap, and while eight live streams are still starting; a
-publisher reconnecting to a stream still held for it is not refused for
-this. `SAPFLOW_WINDOW_SECONDS` (default 2 s per segment, 48 s at the
+WHIP 503) once what the streams hold, plus the growth expected of each
+until its window is full and an assumed window for each stream still
+starting and for the newcomer, would reach 80% of the cap, and while eight
+live streams are still starting; a publisher reconnecting to a stream still
+held for it is not refused for this. `SAPFLOW_WINDOW_SECONDS` (default 2 s per segment, 48 s at the
 default count) bounds each window by time, so a long keyframe interval
 does not multiply what `SAPFLOW_SEGMENT_COUNT` segments hold.
 

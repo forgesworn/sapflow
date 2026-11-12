@@ -429,11 +429,16 @@ fn a_bound_of_two_seconds_a_segment_keeps_two_second_keyframes() {
 /// `projected_window_bytes` estimates the full window from its first
 /// segments: after three, it is within a segment and a half of what the
 /// window holds once full (which counts a partly filled open segment), for
-/// 1 s keyframes and for 8 s ones under a 48 s bound; and it is never under
-/// what is held.
+/// 1 s keyframes, for 8 s ones under a 48 s bound and for a 300-segment
+/// window; there is one as soon as a segment completes; and it is never
+/// under what is held.
 #[test]
 fn the_projection_estimates_the_full_window_from_its_first_segments() {
-    for (cfg, gop) in [(timed(None), 30), (timed(Some(48)), 240)] {
+    let long = MuxerConfig {
+        segment_count: 300,
+        ..MuxerConfig::default()
+    };
+    for (cfg, gop) in [(timed(None), 30), (timed(Some(48)), 240), (long, 30)] {
         let mut m = Muxer::new(cfg, crate::muxer::tests::video(), None);
         let segments = |m: &Muxer| {
             m.entries()
@@ -453,6 +458,12 @@ fn the_projection_estimates_the_full_window_from_its_first_segments() {
             .expect("video");
             if let Some(p) = m.projected_window_bytes() {
                 assert!(p >= m.held_window_bytes(), "gop {gop}: under what is held");
+            } else {
+                assert_eq!(
+                    segments(&m),
+                    0,
+                    "gop {gop}: none at frame {i}, with a segment"
+                );
             }
             if early.is_none() && segments(&m) == 3 {
                 early = m.projected_window_bytes();

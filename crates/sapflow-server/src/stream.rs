@@ -24,6 +24,8 @@ pub struct LiveStream {
     session: Mutex<Session>,
     version: watch::Sender<u64>,
     fragments: Budget,
+    /// When the stream was first claimed, for [`STARTING_FOR`].
+    claimed: Instant,
     // Drop after cached state and session: reservation follows the final stream
     // owner, including publications, grace tasks and parked viewer requests.
     _presentation_permit: PresentationPermit,
@@ -368,6 +370,7 @@ impl LiveStream {
             }),
             version: watch::Sender::new(0),
             fragments,
+            claimed: Instant::now(),
             _presentation_permit: presentation_permit,
         }
     }
@@ -927,6 +930,11 @@ pub const NEW_STREAM_FRAGMENT_PERCENT: usize = 80;
 /// their windows can be measured rather than all at once.
 pub const MAX_STARTING_STREAMS: usize = 8;
 
+/// The longest a live stream counts as starting. One that has sent nothing
+/// a window can be projected from by then, such as video with no keyframe,
+/// no longer holds a place among [`MAX_STARTING_STREAMS`].
+pub const STARTING_FOR: Duration = Duration::from_secs(20);
+
 /// The live streams, by event id, and current RTMP publication admission.
 pub struct Registry {
     streams: Mutex<HashMap<String, Arc<LiveStream>>>,
@@ -981,40 +989,58 @@ impl Registry {
         }
     }
 
-    /// Whether the live fragment budget admits a new stream. A stream fills
-    /// its window over tens of seconds, so what is in use now says little:
-    /// count what each stream holds, plus what each live one is expected to
-    /// add before its window is full ([`Muxer::projected_window_bytes`]), a
-    /// typical window (the median projection) for each still starting and
-    /// one more for the newcomer, against [`NEW_STREAM_FRAGMENT_PERCENT`].
-    /// A stream held for a reconnect has no publisher and does not grow.
-    /// Takes each stream's session and media locks under the map's.
-    fn admits_new_stream(&self, map: &HashMap<String, Arc<LiveStream>>) -> bool {
+    /// How many more bytes the live fragment budget may hold before a new
+    /// stream is refused; 0 refuses. A stream fills its window over tens of
+    /// seconds, so what is in use now says little. The mark,
+    /// [`NEW_STREAM_FRAGMENT_PERCENT`] of the budget, must cover what is in
+    /// use, plus what each stream with a projection
+    /// ([`Muxer::projected_window_bytes`]) is expected to add before its
+    /// window is full (a held one too, since its publisher may come back),
+    /// plus an assumed window for each stream still starting and for the
+    /// newcomer: the median projection, but at least a ninth of the mark, so
+    /// that [`MAX_STARTING_STREAMS`] unmeasured streams and a newcomer fill
+    /// it on their own. A stream starts until it has a projection, for at
+    /// most [`STARTING_FOR`]. Takes each stream's session and media locks
+    /// under the map's.
+    fn admission_headroom(&self, map: &HashMap<String, Arc<LiveStream>>) -> u128 {
         let mut growth = 0u128;
         let mut projections = Vec::new();
         let mut starting = 0usize;
         for stream in map.values() {
             let attached = stream.session().attached;
             let state = stream.lock();
-            match state.ingest.muxer().and_then(Muxer::projected_window_bytes) {
+            let muxer = state.ingest.muxer();
+            match muxer.and_then(Muxer::projected_window_bytes) {
                 Some(projected) => {
                     projections.push(projected);
-                    if attached {
-                        let held = state.ingest.muxer().map_or(0, Muxer::held_window_bytes);
-                        growth += projected.saturating_sub(held) as u128;
-                    }
+                    let held = muxer.map_or(0, Muxer::held_window_bytes);
+                    growth += projected.saturating_sub(held) as u128;
                 }
-                None => starting += usize::from(attached),
+                None => {
+                    starting += usize::from(attached && stream.claimed.elapsed() < STARTING_FOR);
+                }
             }
         }
         if starting >= MAX_STARTING_STREAMS {
-            return false;
+            return 0;
         }
-        projections.sort_unstable();
-        let typical = projections.get(projections.len() / 2).copied().unwrap_or(0) as u128;
         // Wide enough that a 32-bit usize cannot saturate.
-        let committed = self.fragments.used() as u128 + growth + typical * (starting as u128 + 1);
-        committed * 100 < self.fragments.maximum() as u128 * NEW_STREAM_FRAGMENT_PERCENT as u128
+        let mark = self.fragments.maximum() as u128 * NEW_STREAM_FRAGMENT_PERCENT as u128 / 100;
+        projections.sort_unstable();
+        let median = projections.get(projections.len() / 2).copied().unwrap_or(0) as u128;
+        let assumed = median.max(mark / (MAX_STARTING_STREAMS as u128 + 1));
+        let committed = self.fragments.used() as u128 + growth + assumed * (starting as u128 + 1);
+        mark.saturating_sub(committed)
+    }
+
+    fn admits_new_stream(&self, map: &HashMap<String, Arc<LiveStream>>) -> bool {
+        self.admission_headroom(map) > 0
+    }
+
+    /// [`Registry::admission_headroom`] now.
+    #[cfg(test)]
+    pub(crate) fn headroom(&self) -> u128 {
+        self.admission_headroom(&self.map())
     }
 
     fn budget(&self) -> Budget {

@@ -120,6 +120,10 @@ Notes for the release after 0.2.0-rc.1.
   keeps seven segments, 56 s. A window that `segment_count` already keeps
   shorter is unchanged. `MuxerConfig` has public fields, so code that builds
   one with a struct literal needs `..MuxerConfig::default()`.
+- `Muxer::held_window_bytes` (new) says what the live window and the open
+  segment hold, and `Muxer::projected_window_bytes` (new) estimates what
+  the window will hold once full, from the completed segments, for a
+  server's admission decision (`None` until a segment completes).
 
 ## sapflow-rtp
 
@@ -151,19 +155,21 @@ Notes for the release after 0.2.0-rc.1.
   sealed was refused, which in testing dropped 30 of 32 publishers within
   10 s, and encoders that reconnected into it kept being dropped. A stream
   fills its window over tens of seconds, so admission counts what the
-  streams hold, plus the growth expected of each live stream still filling
-  (`Muxer::projected_window_bytes`, from its completed segments), plus one
-  typical (median) window for each still starting and for the newcomer,
-  against 80% (`stream::NEW_STREAM_FRAGMENT_PERCENT`). While eight live
-  streams have no completed segment (`stream::MAX_STARTING_STREAMS`), a
-  newcomer waits, so a crowd arriving at once is let in as its windows can
-  be measured. A publisher reconnecting to a stream still held for it is
-  not refused for memory. A publisher whose bitrate rises after admission
+  streams hold, plus the growth expected of each stream until its window is
+  full (`Muxer::projected_window_bytes`, from its completed segments; a
+  stream held for a reconnect too, since its publisher may come back), plus
+  an assumed window for each stream still starting and for the newcomer:
+  the median projection, but at least a ninth of the mark, so that eight
+  unmeasured streams and a newcomer fill it on their own. The mark is 80%
+  (`stream::NEW_STREAM_FRAGMENT_PERCENT`). While eight live streams have no
+  completed segment (`stream::MAX_STARTING_STREAMS`, each for at most 20 s,
+  `stream::STARTING_FOR`), a newcomer waits, so a crowd arriving at once is
+  let in as its windows can be measured. A publisher reconnecting to a
+  stream still held for it is not refused for memory. A publisher whose bitrate rises after admission
   can still fill the budget. The refusal does not count against the
   failed-attempt throttle, but a retrying encoder asks
   `SAPFLOW_PUBLISH_AUTH_URL` again each time. sapflow-core adds
-  `FragmentQuota::maximum`; sapflow-hls adds `Muxer::projected_window_bytes`
-  and `Muxer::held_window_bytes`.
+  `FragmentQuota::maximum`.
 
 - A stream's recording no longer rolls to a new file at every codec epoch
   without bound. Each stream has a budget of rolls

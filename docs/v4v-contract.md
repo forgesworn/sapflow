@@ -60,8 +60,9 @@ content-type: application/json
   memory would be too full for it (the streams' expected windows at 80% of
   the budget) or while eight stages are still starting, as after a restart
   (SRT `402`, RTMP "media memory limit"); an encoder reconnecting to a stage
-  sapflow still holds is not refused for memory, and a refused one is let
-  in as room appears. An encoder that retries asks the app again each time.
+  sapflow still holds is not refused for memory. A refused encoder that
+  retries is let in once there is room; nothing queues it. Each retry asks
+  the app again.
 
 ## Ingest addresses v4v hands to encoders
 

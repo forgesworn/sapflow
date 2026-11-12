@@ -3419,9 +3419,9 @@ impl Muxer {
     /// segments the window keeps at their average length (`segment_count`,
     /// fewer under `window`, never under [`LEADING_GAPS`] entries, more
     /// while three target durations need them), plus one open segment, and
-    /// at least what it holds now. `None` until a segment completes. An
-    /// estimate: a publisher whose bitrate or keyframe interval rises later
-    /// holds more.
+    /// at least what it holds now. `None` until a segment completes (no
+    /// part is sealed before then either). An estimate: a publisher whose
+    /// bitrate or keyframe interval rises later holds more.
     pub fn projected_window_bytes(&self) -> Option<usize> {
         let (mut count, mut bytes, mut span) = (0usize, 0usize, Duration::ZERO);
         for e in &self.entries {
@@ -3443,7 +3443,9 @@ impl Muxer {
         if let Some(window) = self.cfg.window {
             kept = kept.min(lasting(window.max(floor)).max(LEADING_GAPS as usize));
         }
-        kept = kept.max(lasting(floor)).min(MAX_WINDOW_ENTRIES);
+        kept = kept
+            .max(lasting(floor))
+            .min(MAX_WINDOW_ENTRIES.max(self.cfg.segment_count));
         let projected = (bytes / count).saturating_mul(kept + 1);
         Some(projected.max(self.held_window_bytes()))
     }

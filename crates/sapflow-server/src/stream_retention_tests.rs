@@ -47,7 +47,8 @@ fn gather(body: &MediaBody) -> Vec<u8> {
 
 #[test]
 fn encoded_backing_cannot_publish_beyond_the_shared_byte_limit() {
-    let registry = Registry::with_limits(4, 1);
+    // Room under the admission mark, but less than any init segment.
+    let registry = Registry::with_limits(4, 200);
     let (stream, _, _) = attach(&registry, 0).expect("presentation admission is separate");
     let result = stream.apply(|source, now| match source {
         Source::Ts(ts) => ts.push(AUDIO, now),
@@ -55,7 +56,7 @@ fn encoded_backing_cannot_publish_beyond_the_shared_byte_limit() {
     });
     assert!(
         matches!(result, Err(IngestError::FragmentLimit)),
-        "one byte cannot admit the encoded init and fragments"
+        "200 bytes cannot admit the encoded init and fragments"
     );
     assert_eq!(
         registry.fragments.used(),
@@ -67,7 +68,8 @@ fn encoded_backing_cannot_publish_beyond_the_shared_byte_limit() {
 
 #[test]
 fn flv_initialization_uses_the_same_shared_fragment_admission() {
-    let registry = Registry::with_limits(4, 1);
+    // Room under the admission mark, but less than any init segment.
+    let registry = Registry::with_limits(4, 200);
     let (stream, _, _) = registry
         .claim_configured(
             &path(0),
@@ -291,11 +293,10 @@ fn one_publisher_cannot_leave_eight_useful_paths_in_reconnect_hold() {
     assert_eq!(registry.presentations.active(), 4);
 }
 
-/// A new stream is refused once what the streams hold, plus one typical
-/// window for the newcomer, reaches 80% of the live fragment budget, before
-/// the RTMP publication credit or a presentation is taken and before a
-/// recording is configured; one byte under, the gate lets it through to
-/// those limits. The publisher of a stream held for its reconnect comes
+/// A new stream is refused once the gate's headroom is used up, before the
+/// RTMP publication credit or a presentation is taken and before a
+/// recording is configured; one byte short of that, the claim goes through
+/// to those limits. The publisher of a stream held for its reconnect comes
 /// back whatever the budget.
 #[test]
 fn a_full_budget_refuses_new_streams_but_not_a_held_reconnect() {
@@ -309,13 +310,6 @@ fn a_full_budget_refuses_new_streams_but_not_a_held_reconnect() {
         registry.detach(&held, generation, true),
         "held for a reconnect"
     );
-    // The held stream's window is the typical one; it no longer grows.
-    let typical = held
-        .lock()
-        .ingest
-        .muxer()
-        .and_then(Muxer::projected_window_bytes)
-        .expect("a completed segment");
     let quota = registry.fragment_quota();
     let configured = std::cell::Cell::new(false);
     let new_rtmp = || {
@@ -328,11 +322,12 @@ fn a_full_budget_refuses_new_streams_but_not_a_held_reconnect() {
             |_, _| configured.set(true),
         )
     };
-    let under = quota
-        .try_acquire(8_000_000 - typical - 1 - quota.used())
-        .expect("one byte under the mark");
+    let headroom = usize::try_from(registry.headroom()).expect("small");
+    assert!(headroom > 1, "{headroom}");
+    let under = quota.try_acquire(headroom - 1).expect("one byte short");
     assert!(matches!(new_rtmp(), Err(ClaimError::PublisherLimit)));
-    let at = quota.try_acquire(1).expect("at the mark");
+    let at = quota.try_acquire(1).expect("the last byte");
+    assert_eq!(registry.headroom(), 0);
     assert!(matches!(new_rtmp(), Err(ClaimError::MemoryLimit)));
     assert!(!configured.get(), "no recording for a refused stream");
     assert_eq!(registry.active_rtmp_publishers(), 0, "no RTMP credit kept");
@@ -341,6 +336,30 @@ fn a_full_budget_refuses_new_streams_but_not_a_held_reconnect() {
         "the held stream's publisher comes back"
     );
     drop((under, at));
+}
+
+/// Each stream still starting is assumed to need a typical window: with one
+/// measured stream and room under the mark for three and a half of its
+/// windows, two streams may start beside it, and a third may not.
+#[test]
+fn starting_streams_count_at_an_assumed_window_each() {
+    let probe = Registry::new(4);
+    let (stream, _, _) = attach(&probe, 0).expect("probe");
+    feed(&stream);
+    let projected = stream
+        .lock()
+        .ingest
+        .muxer()
+        .and_then(Muxer::projected_window_bytes)
+        .expect("a completed segment");
+    drop(stream);
+    drop(probe);
+    let registry = Registry::with_limits(8, projected * 35 / 8);
+    let (measured, _, _) = attach(&registry, 0).expect("first");
+    feed(&measured);
+    let _first = attach(&registry, 1).expect("one starting beside it");
+    let _second = attach(&registry, 2).expect("two starting beside it");
+    assert!(matches!(attach(&registry, 3), Err(ClaimError::MemoryLimit)));
 }
 
 /// A live stream still filling its window counts at its projected window,
