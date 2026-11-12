@@ -384,6 +384,13 @@ async function oneRun(n, src) {
     const alog = fs.readFileSync(path.join(dir, 'sapflow.log'), 'utf8');
     const al = /WHIP timeline aligned alignment=(\S+)/.exec(alog);
     run.alignment = al ? al[1] : null;
+    // Time to ready (the server's own measure, from the publisher's
+    // connection), and from the session connecting to the start's alignment.
+    const ready = /stream ready \S+ ready_ms=(\d+)/.exec(alog);
+    run.ready_ms = ready ? +ready[1] : null;
+    const at = (re) => { const m = re.exec(alog); return m ? Date.parse(m[1] + 'Z') : NaN; };
+    const connected = at(/^(\S+)Z\s+\w+\s+\S+ WHIP session connected/m), aligned = at(/^(\S+)Z\s+\w+\s+\S+ WHIP timeline aligned/m);
+    run.aligned_after_ms = Number.isFinite(connected) && Number.isFinite(aligned) ? aligned - connected : null;
     const recDir = path.join(dir, 'recordings');
     const recs = fs.existsSync(recDir)
       ? fs.readdirSync(recDir, { recursive: true }).map((f) => path.join(recDir, f)).filter((f) => f.endsWith('.mp4')) : [];
@@ -428,6 +435,7 @@ async function oneRun(n, src) {
     if (r.source_arrival && r.source_arrival.length && hls.length) r.net = Math.round((stats(hls).median - stats(r.source_arrival).median) * 10) / 10;
     results.push(r);
     console.log(JSON.stringify({ run: n, publisher: publisherKind, transport, load: r.load, alignment: r.alignment,
+      aligned_after_ms: r.aligned_after_ms, ready_ms: r.ready_ms,
       hls: stats(hls), recording: stats(rec), source: r.source_arrival ? stats(r.source_arrival) : undefined, net: r.net,
       lateness: r.lateness ? stats(r.lateness) : undefined,
       first: n === 1 ? r.first : undefined, within: r.within, error: r.error, page_errors: r.page_errors }));
@@ -437,5 +445,7 @@ async function oneRun(n, src) {
   console.log('SUMMARY', JSON.stringify({ publisher: publisherKind, transport, runs: results.length,
     within: results.filter((r) => r.within).length, hls: stats(all('hls')), recording: stats(all('recordings')),
     source: stats(results.flatMap((r) => r.source_arrival || [])), net: stats(results.filter((r) => r.net !== undefined).map((r) => r.net)),
-    alignments: [...new Set(results.map((r) => r.alignment))] }));
+    alignments: [...new Set(results.map((r) => r.alignment))],
+    ready_ms: stats(results.map((r) => r.ready_ms).filter((x) => x !== null)),
+    aligned_after_ms: stats(results.map((r) => r.aligned_after_ms).filter((x) => x !== null)) }));
 })();

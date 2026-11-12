@@ -1,0 +1,282 @@
+{
+ "seconds": 25,
+ "keyframe_interval": "2",
+ "obs_keyint": 10,
+ "bitrate": 2500,
+ "feedback": null,
+ "load": 20.61328125,
+ "obs_version": "32.0.4",
+ "obs_pid": 10262,
+ "connected": "2026-11-12T10:37:52.144873Z",
+ "second_sigterm": true,
+ "obs_ended": true,
+ "restore_diff_exit": 0,
+ "restore_diff": "",
+ "restore_rsync_dry_run": "",
+ "modified_config_moved_to_trash": "obs-studio-1794479912145",
+ "backup_moved_to_trash": "a310-obs-backup-J4YRNN-1794479912548",
+ "requests": 23,
+ "keyframes_received": 4,
+ "answered": [
+  {
+   "request_s": 0,
+   "next_keyframe_s": 4.968,
+   "delay_ms": 4968
+  },
+  {
+   "request_s": 0.502,
+   "next_keyframe_s": 4.968,
+   "delay_ms": 4466
+  },
+  {
+   "request_s": 1.504,
+   "next_keyframe_s": 4.968,
+   "delay_ms": 3464
+  },
+  {
+   "request_s": 2.506,
+   "next_keyframe_s": 4.968,
+   "delay_ms": 2462
+  },
+  {
+   "request_s": 3.508,
+   "next_keyframe_s": 4.968,
+   "delay_ms": 1460
+  },
+  {
+   "request_s": 4.511,
+   "next_keyframe_s": 4.968,
+   "delay_ms": 457
+  },
+  {
+   "request_s": 6.513,
+   "next_keyframe_s": 14.921,
+   "delay_ms": 8408
+  },
+  {
+   "request_s": 8.517,
+   "next_keyframe_s": 14.921,
+   "delay_ms": 6404
+  },
+  {
+   "request_s": 10.522,
+   "next_keyframe_s": 14.921,
+   "delay_ms": 4399
+  },
+  {
+   "request_s": 12.522,
+   "next_keyframe_s": 14.921,
+   "delay_ms": 2399
+  },
+  {
+   "request_s": 14.522,
+   "next_keyframe_s": 14.921,
+   "delay_ms": 399
+  },
+  {
+   "request_s": 16.523,
+   "next_keyframe_s": 24.957,
+   "delay_ms": 8434
+  },
+  {
+   "request_s": 18.525,
+   "next_keyframe_s": 24.957,
+   "delay_ms": 6432
+  },
+  {
+   "request_s": 20.526,
+   "next_keyframe_s": 24.957,
+   "delay_ms": 4431
+  },
+  {
+   "request_s": 22.528,
+   "next_keyframe_s": 24.957,
+   "delay_ms": 2429
+  },
+  {
+   "request_s": 24.53,
+   "next_keyframe_s": 24.957,
+   "delay_ms": 427
+  },
+  {
+   "request_s": 26.532,
+   "next_keyframe_s": 34.962,
+   "delay_ms": 8430
+  },
+  {
+   "request_s": 28.534,
+   "next_keyframe_s": 34.962,
+   "delay_ms": 6428
+  },
+  {
+   "request_s": 30.536,
+   "next_keyframe_s": 34.962,
+   "delay_ms": 4426
+  },
+  {
+   "request_s": 32.538,
+   "next_keyframe_s": 34.962,
+   "delay_ms": 2424
+  },
+  {
+   "request_s": 34.538,
+   "next_keyframe_s": 34.962,
+   "delay_ms": 424
+  },
+  {
+   "request_s": 36.54,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 38.542,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  }
+ ],
+ "keyframe_gaps_s": [
+  9.953,
+  10.036,
+  10.005
+ ],
+ "aligned": "SenderReports",
+ "feedback_armed": false,
+ "recordings": [
+  {
+   "file": "1794479887.mp4",
+   "frames": 918,
+   "keyframes_s": [
+    0,
+    9.999,
+    20,
+    29.999
+   ],
+   "video_kbps": [
+    [
+     0,
+     2648
+    ],
+    [
+     1,
+     2460
+    ],
+    [
+     2,
+     2489
+    ],
+    [
+     3,
+     2494
+    ],
+    [
+     4,
+     2647
+    ],
+    [
+     5,
+     2603
+    ],
+    [
+     6,
+     2552
+    ],
+    [
+     7,
+     2415
+    ],
+    [
+     8,
+     2490
+    ],
+    [
+     9,
+     2683
+    ],
+    [
+     10,
+     2464
+    ],
+    [
+     11,
+     2452
+    ],
+    [
+     12,
+     2467
+    ],
+    [
+     13,
+     2454
+    ],
+    [
+     14,
+     2511
+    ],
+    [
+     15,
+     2458
+    ],
+    [
+     16,
+     2547
+    ],
+    [
+     17,
+     2617
+    ],
+    [
+     18,
+     2489
+    ],
+    [
+     19,
+     2394
+    ],
+    [
+     20,
+     2636
+    ],
+    [
+     21,
+     2544
+    ],
+    [
+     22,
+     2473
+    ],
+    [
+     23,
+     2466
+    ],
+    [
+     24,
+     2453
+    ],
+    [
+     25,
+     2478
+    ],
+    [
+     26,
+     2489
+    ],
+    [
+     27,
+     2509
+    ],
+    [
+     28,
+     2547
+    ],
+    [
+     29,
+     2853
+    ],
+    [
+     30,
+     1401
+    ]
+   ]
+  }
+ ]
+}

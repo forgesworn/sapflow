@@ -67,6 +67,8 @@ pub mod twcc;
 #[doc(hidden)]
 pub mod fuzzing;
 
+#[cfg(any(test, feature = "testing"))]
+pub use receive::FeedbackHooks;
 pub use receive::{
     Event, Feedback, Receiver, ReceiverConfig, ReportConfig, StreamConfig, StreamId,
 };

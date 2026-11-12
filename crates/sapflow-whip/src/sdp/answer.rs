@@ -251,7 +251,7 @@ struct Chosen<'a> {
     twcc_ext: Option<&'a Extmap>,
 }
 
-fn choose<'a>(s: &'a Section) -> Result<Chosen<'a>, ProfileError> {
+fn choose<'a>(s: &'a Section, hooks: AnswerHooks) -> Result<Chosen<'a>, ProfileError> {
     if s.simulcast {
         return Err(ProfileError::Simulcast);
     }
@@ -264,9 +264,9 @@ fn choose<'a>(s: &'a Section) -> Result<Chosen<'a>, ProfileError> {
     };
     let video = s.kind == MediaKind::Video;
     let mid_ext = s.extmap(MID_URI).filter(|e| receivable(e).is_some());
-    let twcc_ext = s
-        .extmap(TRANSPORT_CC_URI)
-        .filter(|e| receivable(e).is_some() && s.has_feedback(pt, "transport-cc"));
+    let twcc_ext = s.extmap(TRANSPORT_CC_URI).filter(|e| {
+        receivable(e).is_some() && s.has_feedback(pt, "transport-cc") && !hooks.no_transport_cc
+    });
     let (ssrc, rtx_ssrc) = ssrcs(s, rtx.is_some());
     let stream = Stream {
         kind: s.kind,
@@ -325,6 +325,38 @@ pub fn answer(
     offer: &Offer,
     config: &AnswerConfig<'_>,
 ) -> Result<(String, Negotiated), ProfileError> {
+    answer_hooked(offer, config, AnswerHooks::default())
+}
+
+/// Test-only changes to the answer (A3.10). The production answer has none.
+/// The struct is compiled in every build, since the answer is built through
+/// it with its default (no change), but only [`answer_with`], under the
+/// `testing` feature, takes one from outside, and it is exported only there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnswerHooks {
+    /// Answer `goog-remb` for video where the offer lists it.
+    pub remb: bool,
+    /// Leave `transport-cc` out, so that REMB, or with neither the receiver
+    /// reports' loss, is the sender's only congestion signal.
+    pub no_transport_cc: bool,
+}
+
+/// As [`answer`], with test-only changes ([`AnswerHooks`]). Not for
+/// production use.
+#[cfg(any(test, feature = "testing"))]
+pub fn answer_with(
+    offer: &Offer,
+    config: &AnswerConfig<'_>,
+    hooks: AnswerHooks,
+) -> Result<(String, Negotiated), ProfileError> {
+    answer_hooked(offer, config, hooks)
+}
+
+fn answer_hooked(
+    offer: &Offer,
+    config: &AnswerConfig<'_>,
+    hooks: AnswerHooks,
+) -> Result<(String, Negotiated), ProfileError> {
     if offer.ice_lite {
         return Err(ProfileError::PeerIceLite);
     }
@@ -344,7 +376,7 @@ pub fn answer(
             && s.mid.as_ref().is_some_and(|m| bundle.contains(m))
             && !chosen.iter().any(|c| c.section.kind == s.kind);
         if eligible {
-            chosen.push(choose(s)?);
+            chosen.push(choose(s, hooks)?);
         }
     }
     let first = chosen.first().ok_or(ProfileError::NoMedia)?;
@@ -443,7 +475,7 @@ pub fn answer(
     for s in &offer.sections {
         match chosen.iter().find(|c| std::ptr::eq(c.section, s)) {
             Some(c) => {
-                let text = accepted(c, config, mid_extension, c.stream.mid == tagged);
+                let text = accepted(c, config, mid_extension, c.stream.mid == tagged, hooks);
                 for l in text.lines() {
                     line(l);
                 }
@@ -483,7 +515,13 @@ pub fn answer(
 }
 
 /// One accepted section's lines, joined by `\n`.
-fn accepted(c: &Chosen<'_>, config: &AnswerConfig<'_>, mid_id: Option<u8>, tagged: bool) -> String {
+fn accepted(
+    c: &Chosen<'_>,
+    config: &AnswerConfig<'_>,
+    mid_id: Option<u8>,
+    tagged: bool,
+    hooks: AnswerHooks,
+) -> String {
     let s = c.section;
     let st = &c.stream;
     let mut t = String::new();
@@ -531,11 +569,13 @@ fn accepted(c: &Chosen<'_>, config: &AnswerConfig<'_>, mid_id: Option<u8>, tagge
     if let Some(r) = rtpmap(pt) {
         l(&r);
     }
+    let remb = hooks.remb && st.kind == MediaKind::Video && s.has_feedback(pt, "goog-remb");
     for (on, fb) in [
         (st.nack, "nack"),
         (st.pli, "nack pli"),
         (st.fir, "ccm fir"),
         (st.transport_cc, "transport-cc"),
+        (remb, "goog-remb"),
     ] {
         if on {
             l(&format!("a=rtcp-fb:{pt} {fb}"));

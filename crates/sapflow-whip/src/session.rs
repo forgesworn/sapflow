@@ -474,6 +474,10 @@ pub struct Session {
     /// read, for the router's deadline index.
     #[cfg(test)]
     deadline_reads: std::cell::Cell<u64>,
+    /// Test builds only: the A3.10 stimuli for the receiver, once there is
+    /// one ([`Session::set_feedback_hooks`]).
+    #[cfg(any(test, feature = "testing"))]
+    feedback_hooks: Option<sapflow_rtp::FeedbackHooks>,
 }
 
 impl fmt::Debug for Session {
@@ -585,6 +589,8 @@ impl Session {
             armed: None,
             #[cfg(test)]
             deadline_reads: std::cell::Cell::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            feedback_hooks: None,
         })
     }
 
@@ -603,6 +609,17 @@ impl Session {
     #[cfg(any(test, feature = "test-panic"))]
     pub fn enable_panic_hooks(&mut self) {
         self.panic_hooks = true;
+    }
+
+    /// Test builds only: RTCP stimuli for the publisher's rate control
+    /// (A3.10, [`sapflow_rtp::FeedbackHooks`]), from when the receiver is
+    /// made (SRTP up) or now if it already is. Not for production use.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_feedback_hooks(&mut self, hooks: sapflow_rtp::FeedbackHooks) {
+        self.feedback_hooks = Some(hooks);
+        if let Some(m) = self.media.as_mut() {
+            m.rx.set_feedback_hooks(hooks);
+        }
     }
 
     /// Where the session stands.
@@ -1087,10 +1104,15 @@ impl Session {
             self.end(EndReason::Dtls(sapflow_dtls::Error::Internal));
             return;
         };
-        let Ok((rx, routes)) = receiver(&self.config, &self.negotiated, now) else {
+        #[allow(unused_mut)]
+        let Ok((mut rx, routes)) = receiver(&self.config, &self.negotiated, now) else {
             self.end(EndReason::Dtls(sapflow_dtls::Error::Internal));
             return;
         };
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(h) = self.feedback_hooks {
+            rx.set_feedback_hooks(h);
+        }
         let overhead = outbound.profile().rtcp_overhead();
         let mut media = Box::new(Media {
             profile: c.profile,

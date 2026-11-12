@@ -962,13 +962,19 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   Opus uses 48 kHz, converted to 90 kHz.
 - RTCP sender reports map each stream's RTP clock to the sender's wall clock.
   At start, media is held until both streams' first sender reports arrive, for
-  at most 1.5 s (proposed), 4 MiB of media or half the event queue. After
+  at most 4 s, 4 MiB of media or half the event queue. After
   that, or if the reports disagree with arrival times by more than 500 ms,
   the streams are aligned by arrival time. `sapflow-rtp` says which, and why,
   in an `Aligned` event before the first frame, which the server logs at
-  debug (`WHIP timeline aligned`). Headless Chrome 157's sender reports for
-  both streams had arrived only about 3.5 s after it connected, so in all
-  20 of its A3.8 runs it was aligned by arrival time
+  debug (`WHIP timeline aligned`). The hold was 1.5 s until A3.8: headless
+  Chrome 157's sender reports for both streams arrived only about 3.5 s
+  after it connected, so all 20 of its runs were aligned by arrival time
+  and 3 were outside the sync range. The owner raised it to about 4 s
+  (12 November 2026), after which all 20 were aligned by the reports and
+  within range. A publisher whose reports come with its first packets, as
+  FFmpeg's do, is aligned at once. One above about 8 Mbit/s whose reports
+  come late fills the 4 MiB bound before 4 s, and is aligned by arrival
+  time
   ([status](#qualification-status-12-november-2026)).
 - After start, timestamps advance by RTP deltas, strictly increasing, and
   stay within 500 ms (`max_lead`) of arrival time either way, plus 0.1% of
@@ -1000,9 +1006,11 @@ Browsers send a keyframe when asked, not on a schedule. `TargetDuration` and
 - It then asks for a keyframe every `SAPFLOW_WHIP_KEYFRAME_INTERVAL`
   (proposed 2 s), sending PLI (or FIR where only FIR is negotiated). That keeps
   segments near the target that was fixed from the first one.
-- A sender may not act on keyframe requests. Whether OBS does is checked in
-  A3.10. OBS's offer has no `ccm fir`, so only PLI is used with it. Until it is shown to, OBS guidance sets its own keyframe interval to
-  match.
+- A sender may not act on keyframe requests. OBS 32 does not: in A3.10 its
+  keyframes followed its own interval whether Sapflow asked every 2 s or
+  not at all. OBS's offer has no `ccm fir`, so only PLI is used with it.
+  So OBS guidance sets its own keyframe interval to match (2 s), which also
+  bounds how long video waits after a loss NACKs cannot repair.
 
 ### Format changes
 
@@ -1384,8 +1392,11 @@ control feedback (`transport-cc`, draft-holmer-rmcat-transport-wide-cc-extension
   time. The sender runs the estimate, so sapflow does no rate estimation of
   its own.
 - REMB is not planned unless a target needs it and cannot use
-  `transport-cc`. OBS 32 offers REMB and not `transport-cc`. Whether OBS
-  changes its rate on feedback at all is checked in A3.10.
+  `transport-cc`. OBS 32 offers REMB and not `transport-cc`, but A3.10
+  found it changes its rate on neither REMB nor the loss in receiver
+  reports, so sending REMB would not help it. A test build can send REMB
+  and claim loss (`--features test-feedback`, `SAPFLOW_TEST_WHIP_FEEDBACK`);
+  the server never does.
 
 Provisional result: desktop Chrome 157, in-page loopback, with receiver
 reports still present.
@@ -1935,7 +1946,7 @@ Implementation notes (W3a, 11 November 2026):
     - ICE nominated at about 120 ms after the `201`;
     - DTLS connected 4 to 6 ms later, with `SRTP_AEAD_AES_128_GCM`;
     - first SRTP packet decrypted;
-    - first Opus at about 1.65 s, after the 1.5 s start hold, and the
+    - first Opus at about 1.65 s, after the start hold (then 1.5 s), and the
       first H.264 keyframe at 1.64 to 3.14 s. The hold ended by arrival
       time (`Fallback::Timeout`): not every stream had a sender report
       within it;
@@ -2572,11 +2583,15 @@ that the inbound queue's back-pressure stays with the slow reader.
 
 ### W4: qualification
 
-- **A4.1 Loss.** Apply 1%, 5% and 10% random loss with added jitter (Linux
-  `netem`). At the chosen default `SAPFLOW_WHIP_JITTER`, WHIP must leave no
+- **A4.1 Loss.** Apply 1%, 5% and 10% random loss with added jitter, with
+  the userspace loss proxy of [srt-loss-method.md](srt-loss-method.md)
+  (`srt-loss-proxy`, which now has `--jitter-ms` and `--protocol whip`), the
+  same seeded profile for both protocols. The owner decided on the proxy in
+  place of Linux `netem` in writing on 12 November 2026: WHIP carries STUN,
+  DTLS and SRTP on one port, and the proxy impairs only SRTP and SRTCP. At
+  the chosen default `SAPFLOW_WHIP_JITTER`, WHIP must leave no
   more frames unrecovered than the SRT receiver with its latency set to the
-  same value, on the same loss profile
-  ([srt-loss-method.md](srt-loss-method.md)). Fails otherwise, unless the user
+  same value, on the same loss profile. Fails otherwise, unless the user
   accepts the difference in writing.
 - **A4.2 Cost.** CPU and memory per WHIP publisher, measured at the bitrates
   in [benchmarks.md](benchmarks.md) beside the RTMP and SRT publishers on the
@@ -2603,15 +2618,20 @@ that the inbound queue's back-pressure stays with the slow reader.
 
 ### Qualification status (12 November 2026)
 
-Evidence: [whip-qualification-2026-11-12.md](whip-evidence/whip-qualification-2026-11-12.md),
-on the test host (Apple M4, macOS 26.6.2), headless Chrome 157 and
-FFmpeg 8.1.
+Evidence: [whip-qualification-2026-11-12.md](whip-evidence/whip-qualification-2026-11-12.md)
+(first round) and
+[whip-qualification-2-2026-11-12.md](whip-evidence/whip-qualification-2-2026-11-12.md)
+(second round, with the owner's written decisions of that day), on the test
+host (Apple M4, macOS 26.6.2), headless Chrome 157, OBS 32.0.4 and FFmpeg 8.1.
 
 | Claim | Test | Status |
 |---|---|---|
-| A3.8: a browser's audio is within 40 ms early and 60 ms late of its video, in HLS | `scripts/whip-sync.js`: a canvas flash and a WebAudio click in the page (Chrome's file capture stalled after a few frames), 10 runs over UDP and 10 over ICE-TCP; FFmpeg 8.1 as the reference, 10 runs | **Not met.** Chrome 157: 17 of 20 runs within; audio -2.4 to -49.3 ms (early), the three failures at -43.2, -41.6 and -49.3 ms. Every Chrome run was aligned by arrival time, since its first sender reports came after the 1.5 s start hold, and the offset stays where the start put it. With the hold at 6 s (an uncommitted build) every run was aligned by sender reports, and five of five were within (-2.3 to +15.7 ms). FFmpeg, aligned by its reports at once: 0 to 1.5 ms. The cause is the start hold; see Open decisions |
-| A3.9: `scripts/smoke.sh` covers WHIP alongside SRT and RTMP | `scripts/smoke.sh` (`whip_smoke`): FFmpeg's WHIP muxer publishes; 401 for a missing and a wrong token, the token not logged; LL-HLS with H.264 and Opus decodes; publish callback; `DELETE` ends the session, unpublish callback, the recording decodes. CI installs a pinned static FFmpeg 8.1.3 for it (`SMOKE_WHIP_FFMPEG`) | Met locally (whole smoke passed, about 15 s added). CI has not run it yet |
-| A4.2: CPU and memory per WHIP publisher no higher than SRT's | `scripts/whip-cost.py` (benchmarks.md section B for SRT, RTMP and WHIP; 1, 10 and 50 publishers, three rounds; the verdict rule fixed before the numbers) | **Not met as stated.** RSS per stream above SRT's in every round at 1 and 50 streams (at 50: 10.8 to 11.4 MB against 9.7 to 10.6 MB); CPU per stream disagreed between rounds at every count (WHIP/SRT 0.51 to 2.06), within the host's own spread (1.8x between rounds for one protocol). The design makes this a decision point: the owner accepts the difference in writing or not |
+| A3.8: a browser's audio is within 40 ms early and 60 ms late of its video, in HLS | `scripts/whip-sync.js`: a canvas flash and a WebAudio click in the page (Chrome's file capture stalled after a few frames), 10 runs over UDP and 10 over ICE-TCP; FFmpeg 8.1 as the reference, 10 runs | **Met** with the 4 s start hold: Chrome 157 20 of 20 within, audio -0.6 to +17.5 ms, every run aligned by sender reports, 3.46 to 4.02 s after it connected; FFmpeg 0 to 0.5 ms, aligned at once. With the earlier 1.5 s hold, 17 of 20 (every Chrome run aligned by arrival time, the worst -49.3 ms), which the owner's decision to raise the hold settled. Time to ready: Chrome 5.6 to 7.6 s (5.6 to 6.8 before), FFmpeg 1.6 s, unchanged |
+| A3.9: `scripts/smoke.sh` covers WHIP alongside SRT and RTMP | `scripts/smoke.sh` (`whip_smoke`): FFmpeg's WHIP muxer publishes; 401 for a missing and a wrong token, the token not logged; LL-HLS with H.264 and Opus decodes; publish callback; `DELETE` ends the session, unpublish callback, the recording decodes. CI installs a pinned static FFmpeg 8.1.3 for it (`SMOKE_WHIP_FFMPEG`) | **Met**, locally and in CI (PR #81, merged as `9a6092c`: the pinned FFmpeg passed its SHA-256 check and the three WHIP checks passed) |
+| A3.10: whether OBS answers PLI with a keyframe | `scripts/whip-obs.js`, a dedicated OBS profile restored after each run; keyframe requests and arrivals from the server's debug log; OBS's own interval set to 10 s (7 s once), PLI every 2 s or none (control) | Recorded: **no**. OBS's keyframes followed its own interval (9.95 to 10.04 s apart, or 7.0) in every run, whether asked every 2 s or not. It answers NACKs, resending on the original SSRC (1495 repeats at 5% loss), so it does read Sapflow's RTCP. With 10 s keyframes and 5% loss, a frame NACKs could not repair cost up to 10 s of video |
+| A3.10: whether OBS changes its sending rate on REMB or receiver reports | `scripts/whip-obs.js` with a server built `--features test-feedback` and armed by `SAPFLOW_TEST_WHIP_FEEDBACK`: reports claiming 25% loss, or REMB at 500 kbit/s (answering `goog-remb`), from 20 s; headless Chrome (`scripts/whip-rate.js`) as the control | Recorded: **no** on either. OBS stayed at 2.50 to 2.53 Mbit/s; the same stimuli took Chrome's target to 30 and to 416 kbit/s within 2 s |
+| A4.1: no more frames unrecovered than SRT at the same wait and latency, on the same loss | `scripts/whip-loss.py` through `srt-loss-proxy` (the owner's decision): 1%, 5% and 10% random loss, 0 to 20 ms jitter, 30 ms each way, five seeds; SRT latency and WHIP's wait both 200 ms; Chrome 157 as the WHIP publisher, since FFmpeg's WHIP muxer does not retransmit | **Not met** at 5%: 83.0 frames unrecovered against SRT's 6.8 (t 9.73). At 1%, 9.4 against 2.0 (t 1.28, no difference worth claiming); at 10%, 50.8 against 130.8 by count but 19.8% against 14.5% of the frames each sent (Chrome cut its frame rate). WHIP was left with 3 to 9 packets its NACKs did not repair at 5%, SRT with 0 or 1. Not the jitter: without it, 48.0 against 6.0 (t 7.35), and with jitter that keeps order, 165.0 against 42.0 (t 8.34); the jitter's reordering is what made libsrt's 6700 retransmissions. A decision point for the default `SAPFLOW_WHIP_JITTER` and the NACK schedule |
+| A4.2: CPU and memory per WHIP publisher no higher than SRT's | `scripts/whip-cost.py` (benchmarks.md section B for SRT, RTMP and WHIP; 1, 10 and 50 publishers, three rounds; the verdict rule fixed before the numbers), on macOS, then again in a Linux container (`scripts/whip-cost-linux.sh`) | Memory: the owner accepts WHIP's (about 1 MB a stream over SRT) in writing, 12 November 2026. CPU, in a Linux container (27 of 27 runs, none skipped): WHIP/SRT per stream 0.74 to 0.84 at 1 stream and 0.83 to 0.96 at 50, so **met** there; at 10 streams 0.75, 0.83 and 1.11, so the rounds disagree and the call is the owner's. WHIP was below SRT in 8 of 9 rounds |
 
 ### W5: documentation
 
@@ -2625,10 +2645,10 @@ they describe what ships.
 |---|---|
 | `transport-cc` in v1 | Provisionally yes from desktop Chrome; A0.4 on the other targets |
 | Whether ICE-TCP is worth carrying | A0.3 against a public address on 443 |
-| Default `SAPFLOW_WHIP_JITTER` | A4.1 |
-| RustCrypto or `ring` | A4.2 |
+| Default `SAPFLOW_WHIP_JITTER` | A4.1: at 200 ms WHIP leaves more frames unrecovered than SRT at 5% loss; open, with the NACK schedule |
+| RustCrypto or `ring` | A4.2, measured 12 November 2026 (CPU met at 1 and 50 streams in a Linux container, the owner's call at 10; memory accepted). Not decided here |
 | Accepting another video codec for phones without H.264 | A0.5, and would need transcoding downstream |
 | Opus to AAC inside sapflow | Decided no (10 November 2026). Revisit if WHIP is used without a downstream converter |
 | ICE restart via `PATCH` | Physical results in A4.3 |
 | Defaults for `SAPFLOW_WHIP_STALE` and `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | A3.3, A0.7 and A4.3 |
-| A3.8: a longer start hold for WHIP (about 4 s; Chrome's reports came by 3.5 s), a correction to the first agreeing reports after an arrival start, or accepting the arrival offset in writing | The owner, from the A3.8 evidence |
+| A3.8: a longer start hold for WHIP, a correction to the first agreeing reports after an arrival start, or accepting the arrival offset | Decided 12 November 2026: the hold is 4 s |

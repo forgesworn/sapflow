@@ -5,7 +5,7 @@
 //!
 //! - **Start hold.** Media is held from the first media packet until every
 //!   stream has media and a sender report, for at most
-//!   [`TimelineConfig::start_hold`] (1.5 s), or until the held media
+//!   [`TimelineConfig::start_hold`] (4 s), or until the held media
 //!   reaches its byte bound or half the event queue. Then the streams are
 //!   aligned by their sender reports' NTP times, so that the earliest first
 //!   frame is at 0. If a stream with media still has no sender report, or
@@ -68,10 +68,16 @@ pub const CLOCK: u32 = 90_000;
 pub struct TimelineConfig {
     /// Longest wait at the start for every stream's first sender report,
     /// from the first media packet. Zero aligns by arrival time at once.
-    /// Default 1.5 s (`docs/whip-ingest.md`, proposed).
+    /// Default 4 s: headless Chrome 157's reports for both streams came
+    /// 3.4 to 3.5 s after it connected, after a 1.5 s hold, so it was
+    /// always aligned by arrival time (A3.8, `docs/whip-ingest.md`). A
+    /// publisher whose reports come with its first packets, as FFmpeg's
+    /// do, is aligned as soon as they have.
     pub start_hold: Duration,
     /// Most media payload bytes held during the start hold; reaching it
-    /// ends the hold early. Default 4 MiB (1.5 s at about 22 Mbit/s).
+    /// ends the hold early. Default 4 MiB (4 s at about 8 Mbit/s), so a
+    /// publisher above that whose sender reports come late ends the hold
+    /// before 4 s and is aligned by arrival time.
     pub max_hold_bytes: usize,
     /// How far a stream's timestamps may run ahead of or behind arrival
     /// time, for network jitter, and the largest sender report error that
@@ -91,7 +97,7 @@ pub struct TimelineConfig {
 impl Default for TimelineConfig {
     fn default() -> Self {
         Self {
-            start_hold: Duration::from_millis(1500),
+            start_hold: Duration::from_secs(4),
             max_hold_bytes: 4 << 20,
             max_lead: Duration::from_millis(500),
             max_slew_ppm: 500,
@@ -657,10 +663,11 @@ mod tests {
         t.note_packet(0, 1000, 100 * MS);
         t.note_packet(1, 7, 150 * MS);
         t.sender_report(0, ntp(0), 1000, 30 * MS);
-        assert_eq!(t.hold_deadline(), Some(1600 * MS));
-        assert_eq!(t.try_align(1599 * MS, 0, false), None);
+        // The default hold, 4 s, from the first media packet.
+        assert_eq!(t.hold_deadline(), Some(4100 * MS));
+        assert_eq!(t.try_align(4099 * MS, 0, false), None);
         assert_eq!(
-            t.try_align(1600 * MS, 0, false),
+            t.try_align(4100 * MS, 0, false),
             Some(Alignment::Arrival(Fallback::Timeout))
         );
         assert_eq!(t.hold_deadline(), None);
@@ -840,6 +847,52 @@ mod tests {
         assert_eq!(t.sender_report(0, 0, 0, 4_000 * MS), None);
     }
 
+    /// The default hold (4 s, A3.8) waits for reports that come 3.5 s
+    /// after the first packet, as headless Chrome 157's did, and ends as
+    /// soon as every stream has one when they come with the first packets,
+    /// as FFmpeg's do. Without reports it still ends on time.
+    #[test]
+    fn the_default_hold_waits_for_late_reports_and_not_for_early_ones() {
+        assert_eq!(TimelineConfig::default().start_hold, Duration::from_secs(4));
+        // Late, as Chrome: media from 0, reports for both at 3.5 s.
+        let mut t = two(TimelineConfig::default());
+        t.note_packet(0, 0, 0);
+        t.note_packet(1, 0, 0);
+        assert_eq!(
+            t.try_align(1_500 * MS, 0, false),
+            None,
+            "past the old 1.5 s"
+        );
+        assert_eq!(t.try_align(3_400 * MS, 0, false), None);
+        t.sender_report(0, ntp(3_500 * MS), 315_000, 3_500 * MS);
+        assert_eq!(
+            t.try_align(3_500 * MS, 0, false),
+            None,
+            "one stream reported"
+        );
+        t.sender_report(1, ntp(3_500 * MS), 168_000, 3_500 * MS);
+        assert_eq!(
+            t.try_align(3_500 * MS, 0, false),
+            Some(Alignment::SenderReports)
+        );
+        // Early, as FFmpeg: reports with the first packets end it at once.
+        let mut t = two(TimelineConfig::default());
+        for track in [0, 1] {
+            t.note_packet(track, 0, MS);
+            t.sender_report(track, ntp(MS), 0, MS);
+        }
+        assert_eq!(t.try_align(MS, 0, false), Some(Alignment::SenderReports));
+        // No reports: arrival time once 4 s have passed, not before.
+        let mut t = two(TimelineConfig::default());
+        t.note_packet(0, 0, 0);
+        t.note_packet(1, 0, 0);
+        assert_eq!(t.try_align(3_999 * MS, 0, false), None);
+        assert_eq!(
+            t.try_align(4_000 * MS, 0, false),
+            Some(Alignment::Arrival(Fallback::Timeout))
+        );
+    }
+
     #[test]
     fn audio_only_and_late_streams() {
         let mut t = Timeline::new(TimelineConfig::default());
@@ -854,7 +907,12 @@ mod tests {
         assert_eq!(t.stamp(0, 1060, 30 * MS).pts, 1800);
         // A video stream that never sends: the hold ends on time, by the
         // audio's report, and video arriving later maps by its own report.
-        let mut t = two(TimelineConfig::default());
+        // (Written for a 1.5 s hold, which it sets.)
+        let short = TimelineConfig {
+            start_hold: Duration::from_millis(1500),
+            ..TimelineConfig::default()
+        };
+        let mut t = two(short);
         t.note_packet(1, 0, 0);
         t.sender_report(1, ntp(0), 0, 0);
         assert_eq!(
@@ -866,7 +924,7 @@ mod tests {
         t.sender_report(0, ntp(1_990 * MS), 500, 2_000 * MS);
         assert_eq!(t.stamp(0, 500, 2_000 * MS).pts, 179_100, "1.99 s");
         // Without a report it maps by arrival time.
-        let mut t = two(TimelineConfig::default());
+        let mut t = two(short);
         t.note_packet(1, 0, 0);
         t.sender_report(1, ntp(0), 0, 0);
         t.try_align(1_500 * MS, 0, false);

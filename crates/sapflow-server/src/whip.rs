@@ -38,11 +38,11 @@ use sapflow_dtls::Identity;
 use sapflow_hls::codec::{AccessUnit, OpusConfig};
 use sapflow_hls::{IngestError, TrackSet, Update};
 use sapflow_rtp::opus::FrameKind;
-use sapflow_rtp::receive::{Discontinuity, SkipReason};
+use sapflow_rtp::receive::{Discontinuity, SkipReason, StreamStats};
 use sapflow_whip::ice::{Kind, classify};
 use sapflow_whip::resource::{self, SessionId};
 use sapflow_whip::router::{InsertError, Router, RouterConfig};
-use sapflow_whip::sdp::{self, AnswerConfig, MediaKind, Offer};
+use sapflow_whip::sdp::{AnswerConfig, MediaKind, Offer};
 use sapflow_whip::{Credentials, EndReason, Event, Session, SessionConfig, Tuple};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -692,15 +692,22 @@ pub(crate) enum Media {
 fn media(event: sapflow_rtp::Event) -> Media {
     use sapflow_rtp::Event as E;
     match event {
-        E::AccessUnit { au, pts, .. } => Media::Video {
-            pts,
-            au: AccessUnit {
-                data: au.data,
-                idr: au.idr,
-                sps: au.sps.into_iter().last(),
-                pps: au.pps.into_iter().last(),
-            },
-        },
+        E::AccessUnit { au, pts, .. } => {
+            if au.idr {
+                // A3.10's evidence: when each keyframe arrived, beside the
+                // requests `Owner::log_receivers` logs.
+                tracing::debug!(pts, "WHIP keyframe received");
+            }
+            Media::Video {
+                pts,
+                au: AccessUnit {
+                    data: au.data,
+                    idr: au.idr,
+                    sps: au.sps.into_iter().last(),
+                    pps: au.pps.into_iter().last(),
+                },
+            }
+        }
         E::Audio { frame, pts, .. } => Media::Audio {
             pts,
             lost: frame.kind == FrameKind::Loss,
@@ -1059,6 +1066,7 @@ async fn own_udp(
         whip,
         feeds: HashMap::new(),
         closing: HashMap::new(),
+        logged: HashMap::new(),
     };
     // One datagram; the session takes at most 1500 bytes of it.
     let mut buf = vec![0u8; 65_536];
@@ -1067,6 +1075,7 @@ async fn own_udp(
     let mut armed = None;
     loop {
         owner.flush(&socket, &tcp, &mut router).await;
+        owner.log_receivers(&mut router);
         let deadline = router.poll_timeout();
         if deadline != armed {
             if let Some(d) = deadline {
@@ -1100,12 +1109,21 @@ async fn own_udp(
     }
 }
 
+/// Debug only: what was last logged of one session's receiver.
+struct Logged {
+    keyframe_requests: u64,
+    at: Instant,
+    counters: Option<(Option<StreamStats>, Option<StreamStats>)>,
+}
+
 /// What the UDP owner keeps beside the router.
 struct Owner {
     whip: Arc<Whip>,
     feeds: HashMap<SessionId, Feed>,
     /// Why the server closed a session, until its end is counted.
     closing: HashMap<SessionId, CloseCause>,
+    /// Debug only: what was last logged of each session's receiver.
+    logged: HashMap<SessionId, Logged>,
 }
 
 /// What one round of events calls for once they are all taken.
@@ -1127,6 +1145,66 @@ fn contained<R>(f: impl FnOnce() -> R) -> Option<R> {
 }
 
 impl Owner {
+    /// Debug only, for A3.10's and A4.1's evidence: logs each keyframe
+    /// request (PLI or FIR, scheduled or asked for) a session's receiver
+    /// has queued since the last look, just after it was sent, and at most
+    /// once a second, when they have changed, the receiver's counters for
+    /// each stream (packets, NACKed sequence numbers, packets recovered and
+    /// lost, frames delivered, dropped as incomplete and skipped). Nothing
+    /// is read unless debug is on.
+    fn log_receivers(&mut self, router: &mut Router) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let Self { feeds, logged, .. } = self;
+        logged.retain(|id, _| feeds.contains_key(id));
+        let now = Instant::now();
+        for id in feeds.keys() {
+            let read = router.inspect(id, |s| {
+                let rx = s.receiver()?;
+                let stats = |k| s.stream(k).and_then(|v| rx.stats(v));
+                Some((stats(MediaKind::Video), stats(MediaKind::Audio)))
+            });
+            let Some(Some((video, audio))) = read else {
+                continue;
+            };
+            let last = logged.entry(*id).or_insert_with(|| Logged {
+                keyframe_requests: 0,
+                at: now,
+                counters: None,
+            });
+            if let Some(v) = video
+                && v.keyframe_requests > last.keyframe_requests
+            {
+                tracing::debug!(count = v.keyframe_requests, "WHIP keyframe requested");
+                last.keyframe_requests = v.keyframe_requests;
+            }
+            let counters = (video, audio);
+            if last.counters != Some(counters)
+                && now.duration_since(last.at) >= Duration::from_secs(1)
+            {
+                let field =
+                    |s: Option<StreamStats>, f: fn(&StreamStats) -> u64| s.as_ref().map_or(0, f);
+                tracing::debug!(
+                    video_packets = field(video, |s| s.packets),
+                    video_nacked = field(video, |s| s.nacked),
+                    video_recovered = field(video, |s| s.recovered),
+                    video_lost = field(video, |s| s.lost),
+                    video_frames = field(video, |s| s.frames),
+                    video_incomplete = field(video, |s| s.incomplete),
+                    video_skipped = field(video, |s| s.skipped),
+                    audio_packets = field(audio, |s| s.packets),
+                    audio_nacked = field(audio, |s| s.nacked),
+                    audio_recovered = field(audio, |s| s.recovered),
+                    audio_lost = field(audio, |s| s.lost),
+                    "WHIP receive counters"
+                );
+                last.counters = Some(counters);
+                last.at = now;
+            }
+        }
+    }
+
     /// Sends what the router queued and takes its events, then the closes
     /// and keyframe requests they call for, until nothing is left.
     async fn flush(&mut self, socket: &UdpSocket, tcp: &whip_tcp::Link, router: &mut Router) {
@@ -1768,17 +1846,20 @@ async fn publish(
         .take(8)
         .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
         >> 1;
-    let (answer, negotiated) = sdp::answer(
-        &offer,
-        &AnswerConfig {
-            credentials: &credentials,
-            fingerprint: whip.identity.fingerprint(),
-            candidates: &whip.config.candidates,
-            opus_max_bitrate: whip.config.opus_max_bitrate,
-            origin,
-        },
-    )
-    .map_err(|e| Refused::from(resource::Refusal::OutsideProfile(e)))?;
+    let config = AnswerConfig {
+        credentials: &credentials,
+        fingerprint: whip.identity.fingerprint(),
+        candidates: &whip.config.candidates,
+        opus_max_bitrate: whip.config.opus_max_bitrate,
+        origin,
+    };
+    #[cfg(not(feature = "test-feedback"))]
+    let answered = sapflow_whip::sdp::answer(&offer, &config);
+    // A3.10's test build only; see `whip_feedback`.
+    #[cfg(feature = "test-feedback")]
+    let answered = crate::whip_feedback::answer(&offer, &config);
+    let (answer, negotiated) =
+        answered.map_err(|e| Refused::from(resource::Refusal::OutsideProfile(e)))?;
     let stream = StreamPath::parse(path).ok_or(Refused::new(404, "no such stream path"))?;
     let req = PublishRequest {
         path: stream,
@@ -1808,7 +1889,8 @@ async fn publish(
         #[cfg(test)]
         panic_hooks: whip.panic_hooks.load(Ordering::Relaxed),
     };
-    let session = Session::new(
+    #[allow(unused_mut)]
+    let mut session = Session::new(
         whip.session.clone(),
         whip.identity.clone(),
         credentials,
@@ -1816,6 +1898,8 @@ async fn publish(
         Instant::now(),
     )
     .map_err(|_| unavailable())?;
+    #[cfg(feature = "test-feedback")]
+    crate::whip_feedback::arm(&mut session);
     // The ingest task owns the publication from here, so a cancelled
     // request leaves no session without one.
     let (tx, rx) = mpsc::channel(QUEUE);

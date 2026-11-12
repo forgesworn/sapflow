@@ -139,6 +139,14 @@ def playable(text):
 
 
 def sample(pid):
+    """CPU seconds (user and system) and resident MB. On Linux from
+    /proc/PID/stat, in clock ticks, since procps prints CPU time in whole
+    seconds; elsewhere from ps, which macOS prints in hundredths."""
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        fields = stat.read_text().rsplit(")", 1)[1].split()
+        cpu = (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+        return cpu, int(fields[21]) * os.sysconf("SC_PAGE_SIZE") / 1048576
     out = subprocess.check_output(["ps", "-o", "time=,rss=", "-p", str(pid)], text=True,
                                   env={**os.environ, "LC_ALL": "C"}).split()
     clock, rss = out[0], int(out[1]) / 1024

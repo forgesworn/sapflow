@@ -907,6 +907,16 @@ async fn a_mark_raised_behind_a_queued_roll_lands_on_the_new_recording() {
     );
 }
 
+/// The session settings for [`Run`]: the defaults, with the 1.5 s start
+/// hold these runs were written for. Their publisher sends no sender
+/// reports, so the hold always runs out, and with the default (4 s, A3.8)
+/// their media would still be held where they check it.
+fn run_config() -> SessionConfig {
+    let mut config = SessionConfig::default();
+    config.receiver.timeline.start_hold = Duration::from_millis(1500);
+    config
+}
+
 /// An in-process session run with the scripted publisher, collecting the
 /// session's events, on a clock the test moves.
 struct Run {
@@ -1103,7 +1113,7 @@ fn arrival_reanchors(run: &Run) -> usize {
 /// Audio-only Opus whose delivery delay ramps past 500 ms with nothing
 /// lost: each packet 24 ms after the last, 20 ms of RTP apart, for 4 s.
 fn delay_ramp() -> Run {
-    let mut run = Run::new(48, audio_only, SessionConfig::default());
+    let mut run = Run::new(48, audio_only, run_config());
     for i in 0..200u64 {
         let a = run.p.audio(i as u8);
         run.send(&a);
@@ -1138,7 +1148,7 @@ async fn a_delay_ramp_with_no_loss_reanchors_without_marking() {
 /// the lost packets mark it, whatever the re-anchor does.
 #[tokio::test]
 async fn an_outage_that_loses_packets_and_reanchors_is_marked() {
-    let mut run = Run::new(49, audio_only, SessionConfig::default());
+    let mut run = Run::new(49, audio_only, run_config());
     run.audio(100, &[]);
     // Ten packets lost, and the next arrives 900 ms after the last one,
     // 220 ms of RTP time later.
@@ -1162,7 +1172,7 @@ async fn an_outage_that_loses_packets_and_reanchors_is_marked() {
 #[tokio::test]
 async fn a_lost_packet_is_marked_from_the_receiver_not_the_muxer() {
     let run = |seed, skip: &'static [u64]| {
-        let mut r = Run::new(seed, audio_only, SessionConfig::default());
+        let mut r = Run::new(seed, audio_only, run_config());
         r.audio(150, skip);
         r
     };
@@ -1183,7 +1193,7 @@ async fn a_lost_packet_is_marked_from_the_receiver_not_the_muxer() {
 /// confirms is a restart, reported as a discontinuity and with no `Lost`;
 /// the frames until the next IDR are skipped.
 fn sequence_restart() -> Run {
-    let mut run = Run::new(42, video_only, SessionConfig::default());
+    let mut run = Run::new(42, video_only, run_config());
     run.video(50, |i| i % 25 == 0);
     run.p.video_seq = run.p.video_seq.wrapping_add(30_000);
     run.video(50, |i| i % 25 == 10);
@@ -1193,7 +1203,7 @@ fn sequence_restart() -> Run {
 /// Path (b): a refused Opus payload sets the gap flag, and the next packet
 /// is filled with silence for loss, with no sequence gap and no `Lost`.
 fn refused_opus() -> Run {
-    let mut run = Run::new(43, audio_only, SessionConfig::default());
+    let mut run = Run::new(43, audio_only, run_config());
     run.audio(100, &[]);
     let bad = run.p.audio_payload(vec![0xff]);
     run.send(&bad);
@@ -1205,7 +1215,7 @@ fn refused_opus() -> Run {
 /// Path (c): the session ends while packets wait behind a gap, inside the
 /// jitter wait. They never come out and no `Lost` is reported.
 fn held_at_the_end() -> Run {
-    let mut run = Run::new(44, audio_only, SessionConfig::default());
+    let mut run = Run::new(44, audio_only, run_config());
     run.audio(100, &[]);
     let _missing = run.p.audio(0);
     for i in 0..3 {
@@ -1220,7 +1230,7 @@ fn held_at_the_end() -> Run {
 /// Another path: events the receiver's queue had no room for are dropped
 /// and counted there. A small queue makes one gap's release overflow it.
 fn dropped_for_room() -> Run {
-    let mut config = SessionConfig::default();
+    let mut config = run_config();
     config.receiver.max_events = 4;
     let mut run = Run::new(45, audio_only, config);
     run.audio(100, &[]);
@@ -1299,7 +1309,7 @@ async fn receiver_events_dropped_for_room_mark_the_recording() {
 /// complete: no `MediaDropped`, and nothing marked.
 #[tokio::test]
 async fn a_clean_close_leaves_the_recording_complete() {
-    let mut run = Run::new(46, audio_only, SessionConfig::default());
+    let mut run = Run::new(46, audio_only, run_config());
     run.audio(150, &[]);
     run.s.close(run.now);
     run.drain();

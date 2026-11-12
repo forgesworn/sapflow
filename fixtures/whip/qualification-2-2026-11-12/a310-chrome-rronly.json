@@ -1,0 +1,699 @@
+{
+ "seconds": 60,
+ "feedback": "loss:0:0",
+ "load": 17.08544921875,
+ "page": {
+  "errors": [],
+  "series": [
+   {
+    "t": 1,
+    "available_kbps": 300,
+    "target_kbps": 0,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 2,
+    "available_kbps": 325,
+    "target_kbps": 0,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 3,
+    "available_kbps": 352,
+    "target_kbps": 0,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 4,
+    "available_kbps": 381,
+    "target_kbps": 318,
+    "sent_kbps": 1249,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 5,
+    "available_kbps": 413,
+    "target_kbps": 343,
+    "sent_kbps": 1513,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 6,
+    "available_kbps": 447,
+    "target_kbps": 372,
+    "sent_kbps": 169,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 7,
+    "available_kbps": 483,
+    "target_kbps": 403,
+    "sent_kbps": 1431,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 8,
+    "available_kbps": 523,
+    "target_kbps": 436,
+    "sent_kbps": 1734,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 9,
+    "available_kbps": 566,
+    "target_kbps": 471,
+    "sent_kbps": 236,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 10,
+    "available_kbps": 612,
+    "target_kbps": 510,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 11,
+    "available_kbps": 662,
+    "target_kbps": 552,
+    "sent_kbps": 1632,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 12,
+    "available_kbps": 716,
+    "target_kbps": 597,
+    "sent_kbps": 1632,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 13,
+    "available_kbps": 774,
+    "target_kbps": 645,
+    "sent_kbps": 848,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 14,
+    "available_kbps": 837,
+    "target_kbps": 698,
+    "sent_kbps": 1864,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 15,
+    "available_kbps": 905,
+    "target_kbps": 754,
+    "sent_kbps": 248,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 16,
+    "available_kbps": 979,
+    "target_kbps": 815,
+    "sent_kbps": 311,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 17,
+    "available_kbps": 1058,
+    "target_kbps": 882,
+    "sent_kbps": 2509,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 18,
+    "available_kbps": 1144,
+    "target_kbps": 953,
+    "sent_kbps": 1669,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 19,
+    "available_kbps": 1236,
+    "target_kbps": 1030,
+    "sent_kbps": 2178,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 20,
+    "available_kbps": 1336,
+    "target_kbps": 1113,
+    "sent_kbps": 2492,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 21,
+    "available_kbps": 1444,
+    "target_kbps": 1203,
+    "sent_kbps": 1774,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   },
+   {
+    "t": 22.1,
+    "available_kbps": 1561,
+    "target_kbps": 1294,
+    "sent_kbps": 3744,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 23.1,
+    "available_kbps": 1686,
+    "target_kbps": 1404,
+    "sent_kbps": 2299,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 24.1,
+    "available_kbps": 1822,
+    "target_kbps": 1512,
+    "sent_kbps": 2520,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 25.1,
+    "available_kbps": 1969,
+    "target_kbps": 1640,
+    "sent_kbps": 353,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 26.1,
+    "available_kbps": 2128,
+    "target_kbps": 1766,
+    "sent_kbps": 4838,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   },
+   {
+    "t": 27.1,
+    "available_kbps": 2299,
+    "target_kbps": 1915,
+    "sent_kbps": 1650,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 28.1,
+    "available_kbps": 2484,
+    "target_kbps": 2063,
+    "sent_kbps": 3647,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 29.1,
+    "available_kbps": 2683,
+    "target_kbps": 2083,
+    "sent_kbps": 5,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 30.1,
+    "available_kbps": 2899,
+    "target_kbps": 2083,
+    "sent_kbps": 5168,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 31.1,
+    "available_kbps": 3132,
+    "target_kbps": 2083,
+    "sent_kbps": 1329,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   },
+   {
+    "t": 32.1,
+    "available_kbps": 3384,
+    "target_kbps": 2083,
+    "sent_kbps": 3977,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 33.1,
+    "available_kbps": 3655,
+    "target_kbps": 2083,
+    "sent_kbps": 4414,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 34.1,
+    "available_kbps": 3949,
+    "target_kbps": 2083,
+    "sent_kbps": 797,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 35.1,
+    "available_kbps": 4266,
+    "target_kbps": 2083,
+    "sent_kbps": 25,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 36.1,
+    "available_kbps": 4608,
+    "target_kbps": 2083,
+    "sent_kbps": 5218,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   },
+   {
+    "t": 37.1,
+    "available_kbps": 4978,
+    "target_kbps": 2083,
+    "sent_kbps": 3998,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 38.1,
+    "available_kbps": 5377,
+    "target_kbps": 1716,
+    "sent_kbps": 1508,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 39.1,
+    "available_kbps": 5808,
+    "target_kbps": 2500,
+    "sent_kbps": 25,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 40.1,
+    "available_kbps": 6274,
+    "target_kbps": 2495,
+    "sent_kbps": 5732,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 41.1,
+    "available_kbps": 6776,
+    "target_kbps": 2367,
+    "sent_kbps": 2986,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   },
+   {
+    "t": 42.1,
+    "available_kbps": 7320,
+    "target_kbps": 2242,
+    "sent_kbps": 3249,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 43.1,
+    "available_kbps": 7906,
+    "target_kbps": 2495,
+    "sent_kbps": 5498,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 44.1,
+    "available_kbps": 8540,
+    "target_kbps": 1634,
+    "sent_kbps": 370,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 45.1,
+    "available_kbps": 9224,
+    "target_kbps": 2500,
+    "sent_kbps": 25,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 46.1,
+    "available_kbps": 9963,
+    "target_kbps": 2495,
+    "sent_kbps": 5786,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   },
+   {
+    "t": 47.1,
+    "available_kbps": 10761,
+    "target_kbps": 2500,
+    "sent_kbps": 5733,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 48.1,
+    "available_kbps": 11622,
+    "target_kbps": 1481,
+    "sent_kbps": 217,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 49.1,
+    "available_kbps": 12553,
+    "target_kbps": 2500,
+    "sent_kbps": 5,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 50.1,
+    "available_kbps": 13559,
+    "target_kbps": 2500,
+    "sent_kbps": 5731,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 51.1,
+    "available_kbps": 14644,
+    "target_kbps": 2464,
+    "sent_kbps": 5807,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 52.1,
+    "available_kbps": 15817,
+    "target_kbps": 2294,
+    "sent_kbps": 44,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 53.1,
+    "available_kbps": 17083,
+    "target_kbps": 2495,
+    "sent_kbps": 5731,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 54.1,
+    "available_kbps": 18451,
+    "target_kbps": 1676,
+    "sent_kbps": 50,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 55.1,
+    "available_kbps": 19928,
+    "target_kbps": 2500,
+    "sent_kbps": 695,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   },
+   {
+    "t": 56.1,
+    "available_kbps": 21523,
+    "target_kbps": 2495,
+    "sent_kbps": 5340,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 57.1,
+    "available_kbps": 23246,
+    "target_kbps": 2500,
+    "sent_kbps": 5731,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 58.1,
+    "available_kbps": 25107,
+    "target_kbps": 1560,
+    "sent_kbps": 94,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 59.1,
+    "available_kbps": 27116,
+    "target_kbps": 2500,
+    "sent_kbps": 33,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 60.1,
+    "available_kbps": 29286,
+    "target_kbps": 2495,
+    "sent_kbps": 5868,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   }
+  ],
+  "post": 201,
+  "answer_remb": false,
+  "answer_twcc": false,
+  "connection": "connected",
+  "delete": 200
+ },
+ "recordings": [
+  {
+   "file": "1794481474.mp4",
+   "video_kbps": [
+    [
+     0,
+     3807
+    ],
+    [
+     1,
+     4180
+    ],
+    [
+     2,
+     269
+    ],
+    [
+     3,
+     4551
+    ],
+    [
+     4,
+     353
+    ],
+    [
+     5,
+     4778
+    ],
+    [
+     6,
+     5210
+    ],
+    [
+     7,
+     129
+    ],
+    [
+     8,
+     5159
+    ],
+    [
+     9,
+     47
+    ],
+    [
+     10,
+     5159
+    ],
+    [
+     11,
+     5251
+    ],
+    [
+     12,
+     43
+    ],
+    [
+     13,
+     25
+    ],
+    [
+     14,
+     5160
+    ],
+    [
+     15,
+     49
+    ],
+    [
+     16,
+     5497
+    ],
+    [
+     17,
+     25
+    ],
+    [
+     18,
+     5722
+    ],
+    [
+     19,
+     439
+    ],
+    [
+     20,
+     5489
+    ],
+    [
+     21,
+     5784
+    ],
+    [
+     22,
+     369
+    ],
+    [
+     23,
+     5723
+    ],
+    [
+     24,
+     53
+    ],
+    [
+     25,
+     5723
+    ],
+    [
+     26,
+     221
+    ],
+    [
+     27,
+     5721
+    ],
+    [
+     28,
+     75
+    ],
+    [
+     29,
+     5721
+    ],
+    [
+     30,
+     44
+    ],
+    [
+     31,
+     5770
+    ],
+    [
+     32,
+     186
+    ],
+    [
+     33,
+     5723
+    ],
+    [
+     34,
+     116
+    ],
+    [
+     35,
+     5721
+    ],
+    [
+     36,
+     128
+    ],
+    [
+     37,
+     5721
+    ]
+   ]
+  }
+ ],
+ "feedback_armed": true
+}

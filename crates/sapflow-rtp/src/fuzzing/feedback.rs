@@ -365,7 +365,7 @@ fn ntp_after(us: i64) -> u64 {
     (i128::from(NTP_ZERO) + frac).clamp(0, i128::from(u64::MAX)) as u64
 }
 
-/// `sr_timeline`: a mode byte (bit 0: no start hold; bit 1: reduced-size
+/// `sr_timeline`: a mode byte (bit 0: no start hold, otherwise 1.5 s; bit 1: reduced-size
 /// RTCP; bit 2: a 64-event queue, a 4000-byte hold and 500-byte
 /// datagrams), then records whose first byte picks an operation (modulo
 /// 6):
@@ -398,6 +398,11 @@ fn run_sr_timeline(data: &[u8]) -> Option<Session> {
     };
     if mode & 1 != 0 {
         cfg.timeline.start_hold = Duration::ZERO;
+    } else {
+        // The seeds were made for the 1.5 s hold, before the default became
+        // 4 s (A3.8); the hold's length is a parameter here, and its
+        // invariants follow it.
+        cfg.timeline.start_hold = Duration::from_millis(1500);
     }
     if mode & 2 != 0 {
         cfg.reports.reduced_size = true;

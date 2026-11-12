@@ -94,6 +94,21 @@ Notes for the release after 0.2.0-rc.1.
   the edge steps back at such a run end; `RetentionCheck` now fails on a
   tag listed again.
 
+## sapflow-rtp
+
+- The timeline's start hold (`TimelineConfig::start_hold`) now defaults to
+  4 s, up from 1.5 s. Headless Chrome 157's sender reports for both streams
+  came 3.4 to 3.5 s after it connected, so with 1.5 s every Chrome session
+  was aligned by arrival time, and 3 of 20 had audio more than 40 ms early
+  (A3.8). A publisher whose reports come with its first packets, as
+  FFmpeg's do, is still aligned at once. One that sends none waits 4 s for
+  its first media. One above about 8 Mbit/s whose reports come late fills
+  `max_hold_bytes` (4 MiB) before 4 s and is aligned by arrival time, as
+  before.
+- Test builds only (`testing`): `FeedbackHooks` and
+  `Receiver::set_feedback_hooks` make receiver reports claim loss and add
+  REMB (`rtcp::build::remb`), for A3.10.
+
 ## sapflow
 
 - A stream's recording no longer rolls to a new file at every codec epoch
@@ -119,6 +134,11 @@ Notes for the release after 0.2.0-rc.1.
   taken): they log it and try again after 100 ms, as WHIP's listeners do.
 - `--help` says the playlist can keep more than `SAPFLOW_SEGMENT_COUNT`
   segments, as above.
+- WHIP logs at debug how each session's start was aligned, each keyframe
+  request and arrival, and its receive counters once a second.
+- A `test-feedback` feature, off in every other build, lets
+  `SAPFLOW_TEST_WHIP_FEEDBACK` make WHIP sessions claim loss in their
+  receiver reports or send REMB, for A3.10. Not for production use.
 
 ## sapflow-dtls
 

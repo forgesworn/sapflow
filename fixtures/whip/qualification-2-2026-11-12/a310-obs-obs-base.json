@@ -1,0 +1,517 @@
+{
+ "seconds": 60,
+ "keyframe_interval": "2",
+ "obs_keyint": 10,
+ "bitrate": 2500,
+ "feedback": null,
+ "load": 5.41748046875,
+ "obs_version": "32.0.4",
+ "obs_pid": 38153,
+ "connected": "2026-11-12T11:07:41.532601Z",
+ "second_sigterm": true,
+ "obs_ended": true,
+ "restore_diff_exit": 0,
+ "restore_diff": "",
+ "restore_rsync_dry_run": "",
+ "modified_config_moved_to_trash": "obs-studio-1794481736485",
+ "backup_moved_to_trash": "a310-obs-backup-ECPybA-1794481736832",
+ "requests": 40,
+ "keyframes_received": 7,
+ "answered": [
+  {
+   "request_s": 0,
+   "next_keyframe_s": 4.214,
+   "delay_ms": 4214
+  },
+  {
+   "request_s": 0.501,
+   "next_keyframe_s": 4.214,
+   "delay_ms": 3713
+  },
+  {
+   "request_s": 1.503,
+   "next_keyframe_s": 4.214,
+   "delay_ms": 2711
+  },
+  {
+   "request_s": 2.503,
+   "next_keyframe_s": 4.214,
+   "delay_ms": 1711
+  },
+  {
+   "request_s": 3.504,
+   "next_keyframe_s": 4.214,
+   "delay_ms": 710
+  },
+  {
+   "request_s": 5.505,
+   "next_keyframe_s": 14.208,
+   "delay_ms": 8703
+  },
+  {
+   "request_s": 7.505,
+   "next_keyframe_s": 14.208,
+   "delay_ms": 6703
+  },
+  {
+   "request_s": 9.507,
+   "next_keyframe_s": 14.208,
+   "delay_ms": 4701
+  },
+  {
+   "request_s": 11.508,
+   "next_keyframe_s": 14.208,
+   "delay_ms": 2700
+  },
+  {
+   "request_s": 13.509,
+   "next_keyframe_s": 14.208,
+   "delay_ms": 699
+  },
+  {
+   "request_s": 15.509,
+   "next_keyframe_s": 24.246,
+   "delay_ms": 8737
+  },
+  {
+   "request_s": 17.511,
+   "next_keyframe_s": 24.246,
+   "delay_ms": 6735
+  },
+  {
+   "request_s": 19.512,
+   "next_keyframe_s": 24.246,
+   "delay_ms": 4734
+  },
+  {
+   "request_s": 21.513,
+   "next_keyframe_s": 24.246,
+   "delay_ms": 2733
+  },
+  {
+   "request_s": 23.515,
+   "next_keyframe_s": 24.246,
+   "delay_ms": 731
+  },
+  {
+   "request_s": 25.515,
+   "next_keyframe_s": 34.213,
+   "delay_ms": 8698
+  },
+  {
+   "request_s": 27.518,
+   "next_keyframe_s": 34.213,
+   "delay_ms": 6695
+  },
+  {
+   "request_s": 29.519,
+   "next_keyframe_s": 34.213,
+   "delay_ms": 4694
+  },
+  {
+   "request_s": 31.521,
+   "next_keyframe_s": 34.213,
+   "delay_ms": 2692
+  },
+  {
+   "request_s": 33.521,
+   "next_keyframe_s": 34.213,
+   "delay_ms": 692
+  },
+  {
+   "request_s": 35.523,
+   "next_keyframe_s": 44.214,
+   "delay_ms": 8691
+  },
+  {
+   "request_s": 37.525,
+   "next_keyframe_s": 44.214,
+   "delay_ms": 6689
+  },
+  {
+   "request_s": 39.527,
+   "next_keyframe_s": 44.214,
+   "delay_ms": 4687
+  },
+  {
+   "request_s": 41.528,
+   "next_keyframe_s": 44.214,
+   "delay_ms": 2686
+  },
+  {
+   "request_s": 43.529,
+   "next_keyframe_s": 44.214,
+   "delay_ms": 685
+  },
+  {
+   "request_s": 45.53,
+   "next_keyframe_s": 54.213,
+   "delay_ms": 8683
+  },
+  {
+   "request_s": 47.532,
+   "next_keyframe_s": 54.213,
+   "delay_ms": 6681
+  },
+  {
+   "request_s": 49.534,
+   "next_keyframe_s": 54.213,
+   "delay_ms": 4679
+  },
+  {
+   "request_s": 51.534,
+   "next_keyframe_s": 54.213,
+   "delay_ms": 2679
+  },
+  {
+   "request_s": 53.535,
+   "next_keyframe_s": 54.213,
+   "delay_ms": 678
+  },
+  {
+   "request_s": 55.536,
+   "next_keyframe_s": 64.177,
+   "delay_ms": 8641
+  },
+  {
+   "request_s": 57.537,
+   "next_keyframe_s": 64.177,
+   "delay_ms": 6640
+  },
+  {
+   "request_s": 59.539,
+   "next_keyframe_s": 64.177,
+   "delay_ms": 4638
+  },
+  {
+   "request_s": 61.54,
+   "next_keyframe_s": 64.177,
+   "delay_ms": 2637
+  },
+  {
+   "request_s": 63.541,
+   "next_keyframe_s": 64.177,
+   "delay_ms": 636
+  },
+  {
+   "request_s": 65.542,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 67.544,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 69.546,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 71.547,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 73.548,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  }
+ ],
+ "keyframe_gaps_s": [
+  9.994,
+  10.038,
+  9.967,
+  10.001,
+  9.999,
+  9.964
+ ],
+ "aligned": "SenderReports",
+ "feedback_armed": false,
+ "recordings": [
+  {
+   "file": "1794481675.mp4",
+   "frames": 1987,
+   "keyframes_s": [
+    0,
+    9.997,
+    19.995,
+    29.995,
+    39.995,
+    50,
+    60
+   ],
+   "video_kbps": [
+    [
+     0,
+     2657
+    ],
+    [
+     1,
+     2456
+    ],
+    [
+     2,
+     2479
+    ],
+    [
+     3,
+     2588
+    ],
+    [
+     4,
+     2532
+    ],
+    [
+     5,
+     2588
+    ],
+    [
+     6,
+     2573
+    ],
+    [
+     7,
+     2412
+    ],
+    [
+     8,
+     2484
+    ],
+    [
+     9,
+     2673
+    ],
+    [
+     10,
+     2464
+    ],
+    [
+     11,
+     2454
+    ],
+    [
+     12,
+     2475
+    ],
+    [
+     13,
+     2390
+    ],
+    [
+     14,
+     2498
+    ],
+    [
+     15,
+     2531
+    ],
+    [
+     16,
+     2567
+    ],
+    [
+     17,
+     2690
+    ],
+    [
+     18,
+     2486
+    ],
+    [
+     19,
+     2558
+    ],
+    [
+     20,
+     2459
+    ],
+    [
+     21,
+     2529
+    ],
+    [
+     22,
+     2494
+    ],
+    [
+     23,
+     2478
+    ],
+    [
+     24,
+     2462
+    ],
+    [
+     25,
+     2464
+    ],
+    [
+     26,
+     2486
+    ],
+    [
+     27,
+     2528
+    ],
+    [
+     28,
+     2541
+    ],
+    [
+     29,
+     2758
+    ],
+    [
+     30,
+     2494
+    ],
+    [
+     31,
+     2408
+    ],
+    [
+     32,
+     2474
+    ],
+    [
+     33,
+     2550
+    ],
+    [
+     34,
+     2403
+    ],
+    [
+     35,
+     2456
+    ],
+    [
+     36,
+     2522
+    ],
+    [
+     37,
+     2508
+    ],
+    [
+     38,
+     2504
+    ],
+    [
+     39,
+     2693
+    ],
+    [
+     40,
+     2537
+    ],
+    [
+     41,
+     2573
+    ],
+    [
+     42,
+     2468
+    ],
+    [
+     43,
+     2411
+    ],
+    [
+     44,
+     2413
+    ],
+    [
+     45,
+     2524
+    ],
+    [
+     46,
+     2431
+    ],
+    [
+     47,
+     2503
+    ],
+    [
+     48,
+     2530
+    ],
+    [
+     49,
+     2536
+    ],
+    [
+     50,
+     2669
+    ],
+    [
+     51,
+     2471
+    ],
+    [
+     52,
+     2504
+    ],
+    [
+     53,
+     2610
+    ],
+    [
+     54,
+     2502
+    ],
+    [
+     55,
+     2410
+    ],
+    [
+     56,
+     2463
+    ],
+    [
+     57,
+     2485
+    ],
+    [
+     58,
+     2462
+    ],
+    [
+     59,
+     2492
+    ],
+    [
+     60,
+     2670
+    ],
+    [
+     61,
+     2557
+    ],
+    [
+     62,
+     2473
+    ],
+    [
+     63,
+     2409
+    ],
+    [
+     64,
+     2534
+    ],
+    [
+     65,
+     2616
+    ],
+    [
+     66,
+     574
+    ]
+   ]
+  }
+ ]
+}

@@ -1,0 +1,442 @@
+[
+ {
+  "run": 1,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 17.58,
+  "alignment": "SenderReports",
+  "ready_ms": 1597,
+  "aligned_after_ms": 1,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483203.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 2,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 12.05,
+  "alignment": "SenderReports",
+  "ready_ms": 1603,
+  "aligned_after_ms": 1,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483229.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 3,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 16.78,
+  "alignment": "SenderReports",
+  "ready_ms": 1593,
+  "aligned_after_ms": 0,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483255.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 4,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 34.26,
+  "alignment": "SenderReports",
+  "ready_ms": 1596,
+  "aligned_after_ms": 0,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483282.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 5,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 30.35,
+  "alignment": "SenderReports",
+  "ready_ms": 1590,
+  "aligned_after_ms": 0,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483308.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 6,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 33.83,
+  "alignment": "SenderReports",
+  "ready_ms": 1590,
+  "aligned_after_ms": 0,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483334.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 7,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 25.47,
+  "alignment": "SenderReports",
+  "ready_ms": 1599,
+  "aligned_after_ms": 1,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483359.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 8,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 16.9,
+  "alignment": "SenderReports",
+  "ready_ms": 1596,
+  "aligned_after_ms": 0,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483385.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 9,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 12.52,
+  "alignment": "SenderReports",
+  "ready_ms": 1602,
+  "aligned_after_ms": 1,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483411.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ },
+ {
+  "run": 10,
+  "publisher": "ffmpeg",
+  "transport": "udp",
+  "load": 9.07,
+  "alignment": "SenderReports",
+  "ready_ms": 1597,
+  "aligned_after_ms": 0,
+  "hls": [
+   {
+    "file": "hls-epoch0.mp4",
+    "flashes": 8,
+    "clicks": 7,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "recordings": [
+   {
+    "file": "1794483436.mp4",
+    "flashes": 10,
+    "clicks": 9,
+    "offsets": [
+     0,
+     0,
+     0,
+     0,
+     0.5,
+     0.5,
+     0.5,
+     0.5,
+     0.5
+    ]
+   }
+  ],
+  "within": true
+ }
+]

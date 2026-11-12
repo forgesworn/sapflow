@@ -30,6 +30,8 @@ mod test_support;
 #[cfg(test)]
 mod viewer_tests;
 mod whip;
+#[cfg(feature = "test-feedback")]
+mod whip_feedback;
 mod whip_request;
 mod whip_tcp;
 mod whip_tcp_front;

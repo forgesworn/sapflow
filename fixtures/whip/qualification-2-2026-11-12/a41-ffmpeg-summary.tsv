@@ -1,0 +1,5 @@
+loss_pct	protocol	runs	unrecovered_mean	unrecovered_sd	unrecovered	vs_clean_mean	whip_minus_srt	welch_t	never_ready
+0	whip	1	32		32	0			0
+1	whip	1	716		716	684			0
+5	whip	1	900		900	868			1
+10	whip	1	900		900	868			1

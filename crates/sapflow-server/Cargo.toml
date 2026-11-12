@@ -14,6 +14,11 @@ categories = ["multimedia::video", "command-line-utilities"]
 
 [features]
 fuzzing = []
+# A3.10's RTCP stimuli for a publisher's rate control: with this feature,
+# SAPFLOW_TEST_WHIP_FEEDBACK makes WHIP sessions claim loss in their
+# receiver reports or send REMB (src/whip_feedback.rs). Not for production
+# use; a default build has neither the feature nor the variable.
+test-feedback = ["sapflow-whip/testing", "sapflow-rtp/testing"]
 
 [[bin]]
 name = "sapflow"

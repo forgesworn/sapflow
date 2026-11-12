@@ -261,6 +261,71 @@ fn obs_32() {
     assert_eq!(n.video.expect("valid").payload_type, 96);
 }
 
+/// A3.10's test hooks: `goog-remb` is answered for video where it is
+/// offered, and `transport-cc` can be left out, so REMB or the receiver
+/// reports are the sender's only congestion signal. The production answer
+/// makes neither change.
+#[test]
+fn the_remb_hook_answers_goog_remb_without_transport_cc() {
+    let c = creds();
+    let cands = candidates();
+    let config = AnswerConfig {
+        credentials: &c,
+        fingerprint: Fingerprint::from_bytes(OURS),
+        candidates: &cands,
+        opus_max_bitrate: 128_000,
+        origin: 42,
+    };
+    for (file, pt) in [
+        ("chrome-157-desktop-macos/offer.sdp", 102),
+        ("obs-32.0.4-macos/offer.sdp", 96),
+    ] {
+        let offer = Offer::parse(fixture(file).as_bytes()).expect("parses");
+        let (plain, _) = answer(&offer, &config).expect("valid");
+        assert!(!plain.contains("goog-remb"), "{file}");
+        let (only_reports, n) = answer_with(
+            &offer,
+            &config,
+            AnswerHooks {
+                remb: false,
+                no_transport_cc: true,
+            },
+        )
+        .expect("valid");
+        assert!(
+            !only_reports.contains("goog-remb") && !only_reports.contains("transport-cc"),
+            "{file}"
+        );
+        assert_eq!(n.transport_cc_extension, None, "{file}");
+        let (hooked, n) = answer_with(
+            &offer,
+            &config,
+            AnswerHooks {
+                remb: true,
+                no_transport_cc: true,
+            },
+        )
+        .expect("valid");
+        assert!(
+            hooked.contains(&format!("a=rtcp-fb:{pt} goog-remb\r\n")),
+            "{file}: {hooked}"
+        );
+        assert!(!hooked.contains("transport-cc"), "{file}: {hooked}");
+        assert_eq!(n.transport_cc_extension, None, "{file}");
+        assert!(n.streams().all(|s| !s.transport_cc), "{file}");
+        // Only video carries it.
+        let audio = hooked.split("m=audio").nth(1).expect("an audio section");
+        assert!(
+            !audio
+                .split("m=video")
+                .next()
+                .unwrap_or("")
+                .contains("goog-remb"),
+            "{file}"
+        );
+    }
+}
+
 #[test]
 fn ffmpeg_8_1() {
     let ffmpeg = Expect {
