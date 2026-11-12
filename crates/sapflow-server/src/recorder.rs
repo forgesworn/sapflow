@@ -151,10 +151,13 @@ pub enum IncompleteReason {
     WriterBehind,
     /// The recordings disk ran low.
     DiskLow,
+    /// A codec epoch before this file was served but could not be recorded
+    /// (it began and ended inside one ingest batch).
+    EpochUnrecorded,
 }
 
 impl IncompleteReason {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::TransportDrop,
         Self::TransportTimeout,
         Self::IngestQueueFull,
@@ -168,6 +171,7 @@ impl IncompleteReason {
         Self::EndOfInput,
         Self::WriterBehind,
         Self::DiskLow,
+        Self::EpochUnrecorded,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -185,6 +189,7 @@ impl IncompleteReason {
             Self::EndOfInput => "end-of-input-loss",
             Self::WriterBehind => "writer-behind",
             Self::DiskLow => "disk-low",
+            Self::EpochUnrecorded => "epoch-unrecorded",
         }
     }
 

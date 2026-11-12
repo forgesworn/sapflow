@@ -468,6 +468,14 @@ async fn a_mid_stream_resolution_change_rolls_the_recording_and_both_files_decod
         files,
         widths_of(&files)
     );
+    // The new file holds at least what the muxer had cut in its epoch when
+    // the feed ended; the end of the stream adds the tail.
+    let (video, audio) = recorded[1 - first];
+    let (cut_video, cut_audio) = packets(&scratch.0.join("muxer-epoch1.mp4"));
+    assert!(
+        video >= cut_video && audio >= cut_audio && cut_video > 0,
+        "the new recording: {recorded:?} for ({cut_video}, {cut_audio}) cut"
+    );
 }
 
 fn widths_of(files: &[std::path::PathBuf]) -> Vec<u32> {
@@ -486,4 +494,139 @@ fn widths_of(files: &[std::path::PathBuf]) -> Vec<u32> {
                 .expect("a width")
         })
         .collect()
+}
+
+const BLIP: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-blip.ts");
+
+/// Feeds `resolution-blip.ts` (160x90, three frames at 128x72, 160x90) as
+/// SRT delivers it, ends the stream, and returns the recording callbacks
+/// and the files. The middle epoch is shorter than a part, but part timing
+/// is fixed by then, so the change seals its open part: it is served.
+async fn short_epoch_run() -> (
+    Vec<serde_json::Value>,
+    Vec<std::path::PathBuf>,
+    crate::test_support::Scratch,
+) {
+    let (mut app, scratch) = app(true);
+    let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+    let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
+    Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
+    let mut publisher = begin(&app);
+    let mut done = Vec::new();
+    let next = |receiver: &mut tokio::sync::mpsc::Receiver<crate::callback::Queued>| {
+        let callback = receiver.try_recv().ok()?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("recording callback JSON");
+        (body["event"] == "recordSegmentComplete").then_some(body)
+    };
+    let mut waited = false;
+    for chunk in BLIP.chunks(1316) {
+        feed(&mut publisher, chunk);
+        let epoch = publisher
+            .stream
+            .lock()
+            .ingest
+            .muxer()
+            .map(|m| m.current_initialization_id());
+        if epoch == Some(1) && !waited {
+            // As in real time, where the short epoch and the next part give
+            // the first file's writer time to finish: two writers a path.
+            waited = true;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while done.is_empty() {
+                    match next(&mut receiver) {
+                        Some(body) => done.push(body),
+                        None => tokio::time::sleep(Duration::from_millis(5)).await,
+                    }
+                }
+            })
+            .await
+            .expect("the first file finishes");
+        }
+    }
+    {
+        let stream = publisher.stream.clone();
+        let st = stream.lock();
+        let m = st.ingest.muxer().expect("muxer");
+        assert_eq!(m.current_initialization_id(), 2, "two changes");
+        let text = std::str::from_utf8(st.media.as_ref().expect("playlist")).expect("UTF-8");
+        let short = format!(
+            "#EXT-X-MAP:URI=\"{}\"\n",
+            playlist::epoch_init_name(&st.prefix, 1)
+        );
+        let at = text
+            .find(&short)
+            .expect("the short epoch is in the playlist");
+        assert!(
+            text[at..]
+                .lines()
+                .nth(1)
+                .is_some_and(|l| !l.starts_with("#EXT-X-DISCONTINUITY")),
+            "with media under it: {text}"
+        );
+    }
+    publisher.end();
+    let path = StreamPath::parse("live/event-epochs").expect("path");
+    let (stream, generation, _) = app
+        .streams
+        .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Ts)
+        .expect("claim");
+    app.streams.detach(&stream, generation, false);
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while done.len() < 3 {
+            let callback = receiver.recv().await.expect("recording callback queue");
+            let body: serde_json::Value =
+                serde_json::from_slice(&callback.body).expect("recording callback JSON");
+            if body["event"] == "recordSegmentComplete" {
+                done.push(body);
+            }
+        }
+    })
+    .await;
+    let mut files: Vec<_> = std::fs::read_dir(scratch.0.join("live/event-epochs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    (done, files, scratch)
+}
+
+/// Served media is recorded: the short epoch gets its own file, and every
+/// file is finalised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_epoch_that_was_served_is_recorded() {
+    let (done, files, _scratch) = short_epoch_run().await;
+    assert_eq!(done.len(), 3, "one recording per served epoch: {done:?}");
+    assert!(
+        done.iter().all(|b| b["recordingState"] == "finalised"),
+        "{done:?}"
+    );
+    assert_eq!(files.len(), 3);
+}
+
+/// Each of the three files decodes alone, at its epoch's size, and the
+/// short epoch's file holds video.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
+async fn a_short_epoch_recording_decodes() {
+    let (_, files, _scratch) = short_epoch_run().await;
+    let mut widths = widths_of(&files);
+    for file in &files {
+        let decode = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-xerror", "-i"])
+            .arg(file)
+            .args(["-map", "0:v:0", "-f", "null", "-"])
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            decode.status.success() && decode.stderr.is_empty(),
+            "{}: {}",
+            file.display(),
+            String::from_utf8_lossy(&decode.stderr)
+        );
+    }
+    widths.sort_unstable();
+    assert_eq!(widths, [128, 160, 160]);
 }
