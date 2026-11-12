@@ -2,13 +2,23 @@
 //! steps backwards, keyframes anywhere and audio in between. After every
 //! push the rendered playlist must keep the rules `playlist::RuleCheck`
 //! holds it to: fixed `TARGETDURATION` and `PART-TARGET`, no `EXTINF` over
-//! the target, the part rules, consistent discontinuities.
+//! the target, the part rules, consistent discontinuities. Every part must
+//! stay served for three target durations after its tag leaves the
+//! playlist (`playlist::RetentionCheck`), unless the muxer counts it.
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use sapflow_hls::codec::{AacConfig, H264Config};
 use sapflow_hls::{Muxer, MuxerConfig, playlist};
 use sapflow_hls::{fmp4, recording_timing as recording};
+
+/// A retention pool, which `playlist::RetentionCheck` needs the muxer to
+/// have: without one, media leaves with the window.
+fn pool() -> std::sync::Arc<sapflow_core::fragment::FragmentQuota> {
+    std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(
+        sapflow_hls::muxer::RETENTION_POOL_BYTES,
+    ))
+}
 
 const SPS: &[u8] = &[
     0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0x00, 0x00, 0x03, 0x00, 0x08,
@@ -242,8 +252,10 @@ fn audio_timing(data: &[u8]) {
     };
     let mut stereo = head & 1 != 0;
     let mut muxer = Muxer::audio_only(MuxerConfig::default(), config(stereo))
-        .expect("fixed supported AAC profile");
+        .expect("fixed supported AAC profile")
+        .with_retention_pool(pool());
     let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
     let mut pts = 0i64;
     for rec in records.chunks_exact(3) {
         let flags = rec[2];
@@ -264,6 +276,9 @@ fn audio_timing(data: &[u8]) {
             if let Err(error) = rules.check_with_byte_cap(&rendered, muxer.window_byte_capped()) {
                 panic!("{error}\n{rendered}");
             }
+        }
+        if let Err(error) = retention.check(&muxer) {
+            panic!("{error}");
         }
         if result.is_err() {
             return;
@@ -287,7 +302,9 @@ fn fragment_budget(data: &[u8]) {
         segment_count: 8,
         ..MuxerConfig::default()
     };
+    let pool = Arc::new(FragmentQuota::new(sapflow_hls::muxer::RETENTION_POOL_BYTES));
     let Ok(mut muxer) = Muxer::with_fragment_quota(cfg, Some(video.clone()), None, quota.clone())
+        .map(|m| m.with_retention_pool(pool.clone()))
     else {
         assert_eq!(quota.used(), 0);
         return;
@@ -295,8 +312,30 @@ fn fragment_budget(data: &[u8]) {
     let mut held: Vec<(Bytes, Vec<u8>)> = Vec::new();
     let mut dts = 0;
     let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
+    // A second stream on the same budget, so that what one keeps past its
+    // window meets the other's live media; both share one retention pool.
+    let mut other = Muxer::with_fragment_quota(cfg, Some(video.clone()), None, quota.clone())
+        .ok()
+        .map(|m| m.with_retention_pool(pool.clone()));
+    let (mut other_dts, mut other_retention) = (0, playlist::RetentionCheck::default());
     for record in data[2..].chunks_exact(8).take(256) {
         match record[0] % 6 {
+            0 if record[1] & 2 != 0 => {
+                if let Some(other) = other.as_mut() {
+                    let _ = other.push_video(
+                        other_dts,
+                        other_dts,
+                        record[1] & 1 != 0,
+                        Bytes::copy_from_slice(&record[2..]),
+                        std::time::UNIX_EPOCH,
+                    );
+                    other_dts += 3000;
+                    other_retention
+                        .check(other)
+                        .unwrap_or_else(|error| panic!("second stream: {error}"));
+                }
+            }
             0 => {
                 let _ = muxer.push_video(
                     dts,
@@ -361,13 +400,18 @@ fn fragment_budget(data: &[u8]) {
                 .check(&text)
                 .unwrap_or_else(|error| panic!("{error}\n{text}"));
         }
+        retention
+            .check(&muxer)
+            .unwrap_or_else(|error| panic!("{error}"));
     }
     drop(muxer);
+    drop(other);
     for (bytes, expected) in &held {
         assert_eq!(bytes.as_ref(), expected.as_slice());
     }
     drop(held);
     assert_eq!(quota.used(), 0);
+    assert_eq!(pool.used(), 0, "nothing kept outlives its owners");
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -394,9 +438,10 @@ fuzz_target!(|data: &[u8]| {
         sample_rate: 48000,
         channels: 2,
     };
-    let mut m = Muxer::new(MuxerConfig::default(), video, Some(aac));
+    let mut m = Muxer::new(MuxerConfig::default(), video, Some(aac)).with_retention_pool(pool());
     let (mut dts, mut audio) = (0i64, 0i64);
     let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
     // Each record: a step in ticks (2 bytes), then flags: bit 0 keyframe,
     // bit 1 the step is a stall (x 16), bit 2 the step goes backwards,
     // bits 3-5 AAC frames before the frame, bits 6-7 a composition offset.
@@ -410,6 +455,9 @@ fuzz_target!(|data: &[u8]| {
                 return;
             }
             audio += 1920;
+            if let Err(e) = retention.check(&m) {
+                panic!("{e}");
+            }
         }
         let pts = dts + i64::from(flags >> 6) * 3000;
         if m.push_video(
@@ -422,6 +470,9 @@ fuzz_target!(|data: &[u8]| {
         .is_err()
         {
             return;
+        }
+        if let Err(e) = retention.check(&m) {
+            panic!("{e}");
         }
         if !m.has_content() {
             continue;
