@@ -1344,6 +1344,91 @@ async fn an_abnormal_end_marks_the_recording() {
     }
 }
 
+/// A mark held for want of room is never overtaken. Between `push`
+/// finding no room for the held marks and queueing its item, the ingest
+/// may free a slot: the item is then refused as the queue being full, so a
+/// keyframe at a new size cannot roll the recording ahead of the mark and
+/// leave the file it belongs to complete.
+#[tokio::test]
+async fn an_item_never_goes_ahead_of_a_held_mark() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut feed = Feed::new(tx);
+    assert_eq!(feed.push(access_unit(true)), Ok(()), "fills the queue");
+    assert_eq!(
+        feed.push(access_unit(false)),
+        Ok(()),
+        "refused: the mark is held"
+    );
+    // As at the top of the next push: still no room, so still held.
+    assert_eq!(feed.queue_marks(), Ok(()));
+    // The ingest takes the queued frame now, before the item goes in.
+    assert!(matches!(rx.try_recv(), Ok(Item::Video { .. })));
+    let roll = Item::Video {
+        pts: 3600,
+        au: AccessUnit {
+            data: vec![0, 0, 0, 3, 0x65, 0x88, 0x84],
+            idr: true,
+            sps: Some(SPS_NARROW.to_vec()),
+            pps: Some(PPS_FIXTURE.to_vec()),
+        },
+        received: 0,
+    };
+    assert_eq!(feed.enqueue(roll), Ok(()));
+    // Refused as the queue being full: the held mark took the freed slot,
+    // and the keyframe did not get ahead of it.
+    assert!(
+        matches!(rx.try_recv(), Ok(Item::Marks(m)) if m == [IncompleteReason::IngestQueueFull]),
+        "the mark first"
+    );
+    assert!(rx.try_recv().is_err(), "the keyframe was refused");
+    // Video waits for the next keyframe, which goes in behind the mark.
+    assert_eq!(feed.push(access_unit(true)), Ok(()));
+    assert!(matches!(rx.try_recv(), Ok(Item::Video { au, .. }) if au.idr));
+}
+
+/// The real ingest task, as it ends: marks the feed could not queue are
+/// applied after everything queued before them, and a pending place is
+/// given back, as for a `POST` cancelled before its session reached the
+/// router.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ingest_applies_held_marks_and_gives_back_the_place_as_it_ends() {
+    let (server, root) = udp_server_with(false).await;
+    let req = PublishRequest {
+        path: StreamPath::parse("live/event-tail").expect("path"),
+        user: Some("publisher".to_owned()),
+        pass: Some("whip-test-secret".to_owned()),
+        connection_attempt_id: None,
+    };
+    let from: IpAddr = "127.0.0.1".parse().expect("loopback");
+    let publication = Publication::begin(&server.app, &req, SourceKind::Es, from).expect("claimed");
+    let recording = status(&publication);
+    let id = SessionId::generate_seeded([70; 32]).expect("id");
+    PendingSlot::take(&server.whip, "198.51.100.7".parse().expect("address"))
+        .expect("a place")
+        .attach(id);
+    assert_eq!(server.whip.pending().total, 1);
+    let (tx, rx) = mpsc::channel(1);
+    let mut feed = Feed::new(tx);
+    let (queued, counts) = (feed.queued(), feed.counts());
+    assert_eq!(feed.push(access_unit(true)), Ok(()), "fills the queue");
+    // No room for its mark: the feed holds it, and keeps it as it goes.
+    feed.ended(sapflow_whip::EndReason::MediaTimeout);
+    drop(feed);
+    let (released, _) = watch::channel(false);
+    ingest(
+        server.whip.clone(),
+        id,
+        publication,
+        (rx, queued, counts),
+        released,
+        VIDEO_ONLY,
+    )
+    .await;
+    assert_eq!(recording.reason(), Some(IncompleteReason::TransportTimeout));
+    assert_eq!(server.whip.pending().total, 0, "the place is given back");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A mark that finds the queue full at the end, as an abnormal end can,
 /// is kept for the ingest task, which applies it after everything queued
 /// before it.

@@ -600,14 +600,24 @@ impl Feed {
                 Item::Reanchor
             }
         };
+        self.enqueue(item)
+    }
+
+    /// Queues an item, or refuses it as the queue being full: by count or
+    /// by bytes, or while marks are held for want of room. An item must not
+    /// go ahead of them, and the ingest may have freed a slot since they
+    /// found none; a keyframe at a new size would then roll the recording
+    /// first and take the marks meant for the file before it.
+    fn enqueue(&mut self, item: Item) -> Result<(), Gone> {
         let size = item.size();
         let video = matches!(item, Item::Video { .. });
-        let room = self
-            .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
-                q.checked_add(size).filter(|n| *n <= self.max_bytes)
-            })
-            .is_ok();
+        let room = self.marks.is_empty()
+            && self
+                .queued
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                    q.checked_add(size).filter(|n| *n <= self.max_bytes)
+                })
+                .is_ok();
         let refused = if room {
             match self.tx.try_send(item) {
                 Ok(()) => return Ok(()),
@@ -1778,6 +1788,10 @@ async fn publish(
             released,
         },
     );
+    // The session counts as pending from here until it connects or ends.
+    // Before the ingest task starts, so that task's end (which can come at
+    // once, if the setup is refused) always gives the place back.
+    pending.attach(id);
     tokio::spawn(ingest(
         whip.clone(),
         id,
@@ -1786,8 +1800,6 @@ async fn publish(
         released_tx,
         setup,
     ));
-    // The session counts as pending from here until it connects or ends.
-    pending.attach(id);
     let (reply, registered) = oneshot::channel();
     let sent = whip
         .commands
