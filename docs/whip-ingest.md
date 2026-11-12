@@ -961,13 +961,17 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   Opus uses 48 kHz, converted to 90 kHz.
 - RTCP sender reports map each stream's RTP clock to the sender's wall clock.
   At start, media is held until both streams' first sender reports arrive, for
-  at most 1.5 s (proposed), 4 MiB of media or half the event queue. After
+  at most 4 s, 4 MiB of media or half the event queue. After
   that, or if the reports disagree with arrival times by more than 500 ms,
   the streams are aligned by arrival time. `sapflow-rtp` says which, and why,
   in an `Aligned` event before the first frame, which the server logs at
-  debug (`WHIP timeline aligned`). Headless Chrome 157's sender reports for
-  both streams had arrived only about 3.5 s after it connected, so in all
-  20 of its A3.8 runs it was aligned by arrival time
+  debug (`WHIP timeline aligned`). The hold was 1.5 s until A3.8: headless
+  Chrome 157's sender reports for both streams arrived only about 3.5 s
+  after it connected, so all 20 of its runs were aligned by arrival time
+  and 3 were outside the sync range. The owner raised it to about 4 s
+  (12 November 2026), after which all 20 were aligned by the reports and
+  within range. A publisher whose reports come with its first packets, as
+  FFmpeg's do, is aligned at once
   ([status](#qualification-status-12-november-2026)).
 - After start, timestamps advance by RTP deltas, strictly increasing, and
   stay within 500 ms (`max_lead`) of arrival time either way, plus 0.1% of
@@ -2262,11 +2266,15 @@ that the inbound queue's back-pressure stays with the slow reader.
 
 ### W4: qualification
 
-- **A4.1 Loss.** Apply 1%, 5% and 10% random loss with added jitter (Linux
-  `netem`). At the chosen default `SAPFLOW_WHIP_JITTER`, WHIP must leave no
+- **A4.1 Loss.** Apply 1%, 5% and 10% random loss with added jitter, with
+  the userspace loss proxy of [srt-loss-method.md](srt-loss-method.md)
+  (`srt-loss-proxy`, which now has `--jitter-ms` and `--protocol whip`), the
+  same seeded profile for both protocols. The owner decided on the proxy in
+  place of Linux `netem` in writing on 12 November 2026: WHIP carries STUN,
+  DTLS and SRTP on one port, and the proxy impairs only SRTP and SRTCP. At
+  the chosen default `SAPFLOW_WHIP_JITTER`, WHIP must leave no
   more frames unrecovered than the SRT receiver with its latency set to the
-  same value, on the same loss profile
-  ([srt-loss-method.md](srt-loss-method.md)). Fails otherwise, unless the user
+  same value, on the same loss profile. Fails otherwise, unless the user
   accepts the difference in writing.
 - **A4.2 Cost.** CPU and memory per WHIP publisher, measured at the bitrates
   in [benchmarks.md](benchmarks.md) beside the RTMP and SRT publishers on the
