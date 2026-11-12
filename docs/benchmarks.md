@@ -1770,22 +1770,25 @@ at once; their reconnects land in the same full budget.
 ### After: window bound and projected admission
 
 With `SAPFLOW_WINDOW_SECONDS` at its default (2 s a segment, 48 s) and
-admission on projected windows (24f633a):
+admission on projected windows, as merged (d9990b4, the `q` runs):
 
 | Run | Container | Load | Outcome |
 |-----|-----------|------|---------|
-| p6 | 384 MiB | 32 x 720p | all live, 24 segments each, 300 MiB (as s1) |
-| p1 | 384 MiB | 1 heavy + 8 x 720p, reconnecting | all live, no drops, 263 MiB; the heavy stream keeps 7 segments, the 720p ones 24 |
-| p3 | 1 GiB | 32 x 1080p, reconnecting | no drops; 11 live, the rest refused while they retried |
-| p4 | 1 GiB | 32 x 1080p all at once, reconnecting | no drops; 11 live |
-| p5 | 384 MiB, budgets 224 + 64 MiB | 32 x 720p, reconnecting | no drops; 22 live, 10 refused |
+| q6 | 384 MiB | 32 x 720p | all live, 24 segments each, 298 MiB (as s1) |
+| q1 | 384 MiB | 1 heavy + 8 x 720p, reconnecting | all live, no drops, 261 MiB; the heavy stream keeps 7 segments, the 720p ones 24 |
+| q3 | 1 GiB | 32 x 1080p, reconnecting | no drops; 10 live, the rest refused while they retried |
+| q4 | 1 GiB | 32 x 1080p all at once, reconnecting | no drops; 10 live |
+| q5 | 384 MiB, budgets 224 + 64 MiB | 32 x 720p, reconnecting | no drops; 21 live, 11 refused |
 
-The intermediate gate on the budget in use (509eedd) is in the evidence as
-the `a` runs: it held the 720p case (a5: no drops, 26 live) but not a 1080p
-ramp (a3: 479 drops) or a crowd (a4: 2,080 drops, nothing advancing),
-because a new stream holds almost nothing when it is admitted. With the
-window bound alone, a1 and a2 (1 heavy + 8 x 720p) had no drops at 384 MiB
-and 1 GiB.
+Two earlier builds are in the evidence. The gate on the budget in use
+(509eedd, the `a` runs) held the 720p case (a5: no drops, 26 live) but not
+a 1080p ramp (a3: 479 drops) or a crowd (a4: 2,080 drops, nothing
+advancing), because a new stream holds almost nothing when it is admitted.
+The first projected admission (24f633a, the `p` runs) had no drops either,
+admitting 11 1080p streams and 22 of the 720p ones; it assumed nothing for
+streams not yet measured, which review showed could let a crowd of up to
+eight onto an empty budget whatever their bitrate. With the window bound
+alone, a1 and a2 (1 heavy + 8 x 720p) had no drops at 384 MiB and 1 GiB.
 
 ### What this does not show
 
