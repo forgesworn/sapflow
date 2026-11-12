@@ -262,8 +262,23 @@ async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
+    // Packets per track, as (video, audio).
+    let packets = |file: &std::path::Path| {
+        let count = |track: &str| {
+            let output = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", track])
+                .args(["-show_entries", "packet=pts", "-of", "csv=p=0"])
+                .arg(file)
+                .output()
+                .expect("ffprobe runs");
+            String::from_utf8_lossy(&output.stdout).lines().count()
+        };
+        (count("v:0"), count("a:0"))
+    };
     let mut widths = Vec::new();
+    let mut recorded = Vec::new();
     for file in &files {
+        recorded.push(packets(file));
         let output = std::process::Command::new("ffprobe")
             .args([
                 "-v",
@@ -311,4 +326,164 @@ async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
     // expected track configurations and decode independently of their names.
     widths.sort_unstable();
     assert_eq!(widths, [720, 720, 1280]);
+}
+
+/// A resolution change mid-stream on one connection, as an encoder under
+/// load makes: the ingest starts a new codec epoch (`restarted`), the
+/// recording rolls to a new file there, and each file decodes on its own,
+/// audio and video, with no error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
+async fn a_mid_stream_resolution_change_rolls_the_recording_and_both_files_decode() {
+    const CHANGE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-change.ts");
+    let (mut app, scratch) = app(true);
+    let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+    let (callbacks, _receiver) = crate::callback::test_queue(scope, 32);
+    Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
+    let mut publisher = begin(&app);
+    // As SRT delivers it: one datagram's worth at a time.
+    for chunk in CHANGE.chunks(1316) {
+        feed(&mut publisher, chunk);
+    }
+    {
+        let stream = publisher.stream.clone();
+        let st = stream.lock();
+        let m = st.ingest.muxer().expect("muxer");
+        assert_eq!(m.current_initialization_id(), 1, "one new epoch");
+        // Each epoch's video and audio as the muxer holds them, to compare
+        // with the recordings.
+        for epoch in 0..=1u64 {
+            let mut file = m.initialization(epoch).expect("init").to_vec();
+            for id in 0..m.next_part_id() {
+                if let sapflow_hls::PartLookup::Found(p) = m.part(id)
+                    && p.initialization.id == epoch
+                {
+                    file.extend_from_slice(&p.data);
+                }
+            }
+            std::fs::write(scratch.0.join(format!("muxer-epoch{epoch}.mp4")), file)
+                .expect("scratch");
+        }
+    }
+    publisher.end();
+    // End the held stream, so the last file is finished.
+    let path = StreamPath::parse("live/event-epochs").expect("path");
+    let (stream, generation, _) = app
+        .streams
+        .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Ts)
+        .expect("claim");
+    app.streams.detach(&stream, generation, false);
+    let directory = scratch.0.join("live/event-epochs");
+    let duration = |file: &std::path::Path| {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(file)
+            .output()
+            .expect("ffprobe runs");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let files = loop {
+        let mut files: Vec<_> = std::fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        files.sort();
+        if files.len() == 2 && files.iter().all(|f| duration(f) > 1.0) {
+            break files;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "two finished recordings required, found {files:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    // Packets per track, as (video, audio).
+    let packets = |file: &std::path::Path| {
+        let count = |track: &str| {
+            let output = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", track])
+                .args(["-show_entries", "packet=pts", "-of", "csv=p=0"])
+                .arg(file)
+                .output()
+                .expect("ffprobe runs");
+            String::from_utf8_lossy(&output.stdout).lines().count()
+        };
+        (count("v:0"), count("a:0"))
+    };
+    let mut widths = Vec::new();
+    let mut recorded = Vec::new();
+    for file in &files {
+        recorded.push(packets(file));
+        let probe = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=width", "-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .expect("ffprobe runs");
+        widths.push(
+            String::from_utf8_lossy(&probe.stdout)
+                .trim()
+                .parse::<u32>()
+                .expect("a width"),
+        );
+        let decode = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-xerror", "-i"])
+            .arg(file)
+            .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            decode.status.success() && decode.stderr.is_empty(),
+            "{}: {}",
+            file.display(),
+            String::from_utf8_lossy(&decode.stderr)
+        );
+    }
+    widths.sort_unstable();
+    assert_eq!(widths, [128, 160], "one file per resolution");
+    // The file of the first resolution holds every packet the muxer cut
+    // in its epoch, the last parts sealed by the change included.
+    let first = files
+        .iter()
+        .zip(&widths_of(&files))
+        .position(|(_, w)| *w == 160)
+        .expect("the 160x90 file");
+    assert_eq!(
+        recorded[first],
+        packets(&scratch.0.join("muxer-epoch0.mp4")),
+        "the old recording keeps its epoch's tail: files {:?}, widths {:?}, packets {recorded:?}",
+        files,
+        widths_of(&files)
+    );
+}
+
+fn widths_of(files: &[std::path::PathBuf]) -> Vec<u32> {
+    files
+        .iter()
+        .map(|file| {
+            let probe = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", "v:0"])
+                .args(["-show_entries", "stream=width", "-of", "csv=p=0"])
+                .arg(file)
+                .output()
+                .expect("ffprobe runs");
+            String::from_utf8_lossy(&probe.stdout)
+                .trim()
+                .parse::<u32>()
+                .expect("a width")
+        })
+        .collect()
 }

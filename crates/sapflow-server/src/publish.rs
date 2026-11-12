@@ -465,7 +465,11 @@ impl Publication {
         }
         if applied.restarted {
             // A new init segment: the old recording ends here (its file is
-            // finished and reported) and a new one starts.
+            // finished and reported) and a new one starts. The old file
+            // first takes its epoch's last parts, sealed by this push.
+            if let Some(outgoing) = &mut session.recorder {
+                self.stream.feed_outgoing(outgoing);
+            }
             session.recorder = session
                 .recorder_factory
                 .as_ref()
