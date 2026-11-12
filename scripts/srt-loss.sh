@@ -49,6 +49,10 @@
 #                       (each with its own default SRT: builds before
 #                       2026-10-21 default to srt-rs, since then our own)
 #   CLIP_SECS=30  DELAY_MS=30 (one way)  JOBS=3 (trials at once)
+#   JITTER_MS=          extra delay per packet, uniform from 0 to this, both
+#                       ways (srt-loss-proxy --jitter-ms; unset for none)
+#   JITTER_ORDER=       keep: jitter that never reorders (--jitter-order keep);
+#                       unset lets jittered packets overtake each other
 #   PASSPHRASE=         encrypt the stream, off when unset. 10 to 79 of
 #                       A-Z a-z 0-9 . _ - (libsrt 1.5.3 does not decode %20).
 #                       The sender and libsrt receiver get it as URL options,
@@ -232,7 +236,7 @@ if [ "${1:-}" = "--trial" ]; then
 
   if [ "$kind" = sapflow ]; then
     SAPFLOW_OPEN_PUBLISH=1 SAPFLOW_HTTP_ADDR=127.0.0.1:$hp SAPFLOW_SRT_ADDR=127.0.0.1:$sp \
-      SAPFLOW_RTMP_ADDR=off SAPFLOW_RECORDINGS="$d/rec" RUST_LOG=warn \
+      SAPFLOW_RTMP_ADDR=off SAPFLOW_RECORDINGS="$d/rec" RUST_LOG=warn,sapflow::publish=info,sapflow::srt_own=info \
       "$bin" > "$d/rcv.log" 2>&1 &
     rp=$!; target=$sp; sid="&streamid=publish:live/event-loss"
   else
@@ -241,8 +245,12 @@ if [ "${1:-}" = "--trial" ]; then
     rp=$!; target=$lp; sid=""
   fi
   pids+=("$rp"); sleep 1
+  jitter=()
+  [ -z "${JITTER_MS:-}" ] || jitter+=(--jitter-ms "$JITTER_MS")
+  [ -z "${JITTER_ORDER:-}" ] || jitter+=(--jitter-order "$JITTER_ORDER")
   "$PROXY_BIN" --listen 127.0.0.1:$pp --target 127.0.0.1:$target --loss "$loss" \
-    --delay-ms "$DELAY_MS" --latency-ms "$lat" --seed "$seed" --stats "$d/proxy.txt" 2> "$d/proxy.log" &
+    --delay-ms "$DELAY_MS" --latency-ms "$lat" --seed "$seed" ${jitter[@]+"${jitter[@]}"} \
+    --stats "$d/proxy.txt" 2> "$d/proxy.log" &
   prp=$!; pids+=("$prp"); sleep 0.5
 
   # UDP supplies explicit TS message boundaries instead of relying on the
@@ -371,7 +379,7 @@ trap finish_run EXIT
 export WORK OUT SAPFLOW_BIN PROXY_BIN DELAY_MS CLIP_SECS PORT_BASE KEEP
 [ -z "$PASSPHRASE" ] || export PASSPHRASE PBKEYLEN KMREFRESH KMPREANNOUNCE SENDER_PASSPHRASE ENC_DESC
 
-echo "clip: ${CLIP_SECS} s, seeds: $SEEDS, receivers: $RECEIVERS, losses: $LOSSES, latencies: $LATENCIES, jobs: $JOBS"
+echo "clip: ${CLIP_SECS} s, seeds: $SEEDS, receivers: $RECEIVERS, losses: $LOSSES, latencies: $LATENCIES, jitter: ${JITTER_MS:-none} ms ${JITTER_ORDER:-}, jobs: $JOBS"
 [ -z "$PASSPHRASE" ] || echo "encryption: $ENC_DESC"
 # Job list: a clean run for each receiver and latency, then the loss trials.
 jobs=$WORK/jobs; : > "$jobs"; : > "$WORK/clean"; i=0

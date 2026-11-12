@@ -1,0 +1,21 @@
+receiver	loss	latency_ms	seed	video	audio	decode_msgs	data_orig	data_retx	naks	handshake_flags	status	reordered	orig_distinct	in_time	encryption	trial_index	attempted	failure	trial_exit	encoder_exit	sender_exit	video_probe_exit	audio_probe_exit	decoder_exit	receiver_exit	proxy_exit	sender_stop	receiver_stop	proxy_stop	encoder_timeout
+own	none	2000	0	878	1399	0	8393	5546	1554	0x3f	ok	6047	8393	8393	aes256, no key refresh	1	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	none	2000	0	895	1400	1	8393	5795	1529	0xbf	FAIL	6037	8393	8393	aes256, no key refresh	2	1	trial exit 1; decode_msgs=1	1	0	0	0	0	0	0	0	1	1	1	0
+own	random:2	2000	1	873	1384	0	8393	5567	1592	0x3f	ok	5818	8393	8393	aes256, no key refresh	3	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	2000	1	895	1400	1	8393	5803	1742	0xbf	ok	5831	8393	8393	aes256, no key refresh	4	1		0	0	0	0	0	0	0	0	1	1	1	0
+own	random:2	2000	2	878	1399	0	8393	5580	1598	0x3f	ok	5832	8393	8393	aes256, no key refresh	5	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	2000	2	895	1400	1	8393	5823	1766	0xbf	ok	5844	8393	8393	aes256, no key refresh	6	1		0	0	0	0	0	0	0	0	1	1	1	0
+own	random:2	2000	3	878	1399	0	8393	5480	1617	0x3f	ok	5801	8393	8393	aes256, no key refresh	7	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:2	2000	3	895	1400	1	8393	5855	1711	0xbf	ok	5879	8393	8393	aes256, no key refresh	8	1		0	0	0	0	0	0	0	0	1	1	1	0
+own	random:5	2000	1	878	1399	0	8393	5680	1639	0x3f	ok	5600	8393	8393	aes256, no key refresh	9	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:5	2000	1	895	1400	1	8393	5995	1937	0xbf	ok	5616	8393	8393	aes256, no key refresh	10	1		0	0	0	0	0	0	0	0	1	1	1	0
+own	random:5	2000	2	878	1399	0	8393	5583	1599	0x3f	ok	5620	8393	8393	aes256, no key refresh	11	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:5	2000	2	895	1400	1	8393	6034	1870	0xbf	ok	5631	8393	8393	aes256, no key refresh	12	1		0	0	0	0	0	0	0	0	1	1	1	0
+own	random:5	2000	3	878	1399	0	8393	5653	1587	0x3f	ok	5672	8393	8393	aes256, no key refresh	13	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	random:5	2000	3	895	1400	1	8393	5935	1901	0xbf	ok	5620	8393	8393	aes256, no key refresh	14	1		0	0	0	0	0	0	0	0	1	1	1	0
+own	burst:5,8	2000	1	878	1399	0	8393	5525	1510	0x3f	ok	5645	8393	8393	aes256, no key refresh	15	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	2000	1	895	1400	1	8393	5942	1579	0xbf	ok	5585	8393	8393	aes256, no key refresh	16	1		0	0	0	0	0	0	0	0	1	1	1	0
+own	burst:5,8	2000	2	878	1399	0	8393	5582	1533	0x3f	ok	5580	8393	8393	aes256, no key refresh	17	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	2000	2	895	1400	1	8393	5914	1590	0xbf	ok	5650	8393	8393	aes256, no key refresh	18	1		0	0	0	0	0	0	0	0	1	1	1	0
+own	burst:5,8	2000	3	878	1399	0	8393	5328	1522	0x3f	ok	5734	8393	8393	aes256, no key refresh	19	1		0	0	0	0	0	0	0	0	1	1	1	0
+libsrt	burst:5,8	2000	3	895	1400	1	8393	5841	1572	0xbf	ok	5728	8393	8393	aes256, no key refresh	20	1		0	0	0	0	0	0	0	0	0	1	1	0
