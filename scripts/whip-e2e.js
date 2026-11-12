@@ -286,6 +286,18 @@ function hits(text, s) {
 }
 
 (async () => {
+  // 0. The panic-injection hooks: the session's panic and armed reads
+  // (sapflow-whip's test-panic feature) and the server's feed and ingest
+  // payloads (its own test build). A build without test targets, as the
+  // release recipe (cargo build --release -p sapflow) and this gate make,
+  // contains none of them. One that includes the test targets
+  // (--all-targets) contains sapflow-whip's, inert unless a test turns them
+  // on (docs/whip-ingest.md, A3.4); this check then fails, as that is not a
+  // build to run here.
+  const image = fs.readFileSync(bin);
+  const markers = ['sapflow-whip test: panic here', 'sapflow-whip test: panic in ', 'sapflow test: panic in the'];
+  check('no panic-injection hook in a build without test targets', markers.every((m) => !image.includes(Buffer.from(m))));
+
   // 1. A3.6 default: nothing bound without SAPFLOW_WHIP_ADDR.
   let s = await sapflow({ ...common }, path.join(out, 'off.log'), 'HLS listening');
   const off = sockets(s.child.pid);
@@ -411,7 +423,7 @@ function hits(text, s) {
   // 3. A3.6 privacy, with the check shown to work first.
   const logText = fs.readFileSync(log, 'utf8');
   const plain = logText.replace(/\x1b\[[0-9;]*m/g, '');
-  check('the session ended with nothing lost', /WHIP session ended reason=Closed lost=0/.test(plain));
+  check('the session ended, deleted, with nothing lost', /WHIP session ended reason="?deleted"? count=\d+ lost=0/.test(plain));
   // Every file, not any one of them.
   const finished = plain.split('\n').filter((l) => l.includes('recording finished'));
   check('every recording finished complete', finished.length === files.length && finished.every((l) => /complete=true/.test(l)),

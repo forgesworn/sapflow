@@ -28,11 +28,20 @@ pub enum Refusal {
     PresentationLimit,
     /// Too many failed attempts from this address recently.
     Throttled,
+    /// The app that authorises publishers answered 403: this publisher may
+    /// not publish here (a gig that cannot take one). SRT and RTMP refuse it
+    /// as they refuse a wrong key; WHIP answers 403.
+    Forbidden,
     /// The app that authorises publishers (`SAPFLOW_PUBLISH_AUTH_URL`) gave
     /// no usable answer: unreachable, too slow, or neither 2xx nor 401/403.
     /// Carries nothing the app said.
     AuthUnavailable,
 }
+
+/// Proof that [`Publication::admit`] admitted a request; spent by
+/// [`Publication::claim_admitted`].
+#[derive(Debug)]
+pub struct Admitted(());
 
 /// A live publisher went over the bitrate cap and is dropped.
 #[derive(Debug)]
@@ -153,13 +162,26 @@ mod health_tests {
 
 impl Publication {
     /// Authorises the request and claims its path, or takes over a stream
-    /// held for a reconnect.
+    /// held for a reconnect. The tests' entry point; the listeners go
+    /// through `begin_authorised` or `admit`.
+    #[cfg(test)]
     pub fn begin(
         app: &Arc<App>,
         req: &PublishRequest,
         kind: SourceKind,
         from: IpAddr,
     ) -> Result<Self, Refusal> {
+        let admitted = Self::admit_locally(app, req, from)?;
+        Self::claim_admitted(app, req, kind, admitted)
+    }
+
+    /// `begin`'s admission without the claim: the global publisher's
+    /// credentials, or open publishing, under the address's throttle.
+    fn admit_locally(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        from: IpAddr,
+    ) -> Result<Admitted, Refusal> {
         // A visible SRT credential can never bypass transport-key possession
         // by being replayed through this legacy RTMP/global-auth entry point.
         if app.publish_sessions.is_some() {
@@ -181,6 +203,17 @@ impl Publication {
             throttle().failed(from, Instant::now());
             return Err(Refusal::Request(e));
         }
+        Ok(Admitted(()))
+    }
+
+    /// Claims the path for a request [`Publication::admit`] admitted, or
+    /// takes over a stream held for a reconnect.
+    pub fn claim_admitted(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        kind: SourceKind,
+        _admitted: Admitted,
+    ) -> Result<Self, Refusal> {
         Self::claim(
             app,
             req,
@@ -201,8 +234,20 @@ impl Publication {
         kind: SourceKind,
         from: IpAddr,
     ) -> Result<Self, Refusal> {
+        let admitted = Self::admit(app, req, kind, from).await?;
+        Self::claim_admitted(app, req, kind, admitted)
+    }
+
+    /// `begin_authorised`'s admission without the claim, so a caller can act
+    /// between the two: WHIP supersedes a stalled session of its own there.
+    pub async fn admit(
+        app: &Arc<App>,
+        req: &PublishRequest,
+        kind: SourceKind,
+        from: IpAddr,
+    ) -> Result<Admitted, Refusal> {
         let Some(endpoint) = &app.config.publish_auth else {
-            return Self::begin(app, req, kind, from);
+            return Self::admit_locally(app, req, from);
         };
         if app.publish_sessions.is_some() {
             return Err(Refusal::Request(PublishError::Unauthorized));
@@ -223,17 +268,14 @@ impl Publication {
                 throttle().failed(from, Instant::now());
                 return Err(Refusal::Request(PublishError::Unauthorized));
             }
+            Verdict::Forbidden => {
+                throttle().failed(from, Instant::now());
+                return Err(Refusal::Forbidden);
+            }
             Verdict::Throttled => return Err(Refusal::Throttled),
             Verdict::Unavailable => return Err(Refusal::AuthUnavailable),
         }
-        Self::claim(
-            app,
-            req,
-            kind,
-            None,
-            app.config.max_publish_bps,
-            app.config.reconnect_grace,
-        )
+        Ok(Admitted(()))
     }
 
     pub async fn begin_srt(

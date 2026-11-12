@@ -1157,9 +1157,10 @@ There is no ICE restart in v1.
   What a session sends to a TCP tuple goes into that connection's queue
   without waiting: a full queue drops the packet, as a lost datagram would
   be, and never holds up the owner.
-- A panic while handling one session's packet ends that session only. Each
-  call into a session runs under `catch_unwind` (safe Rust under
-  `panic = "unwind"`), and the session is then dropped. This is an
+- A panic while handling one session ends that session only. Each call
+  into a session, each read of one between calls, the UDP owner's own code
+  for it and its ingest task's steps run under `catch_unwind` (safe Rust
+  under `panic = "unwind"`), and the session is then dropped. This is an
   acceptance check, not a hope.
 - Every cap is a stated setting with a refusal path:
   - pending (not yet connected) sessions in total and per address;
@@ -1271,14 +1272,15 @@ W3c built `SAPFLOW_WHIP_ADDR`, `SAPFLOW_WHIP_PUBLIC_URL`,
 and `SAPFLOW_WHIP_ALLOW_ORIGINS`, `SAPFLOW_WHIP_TRUSTED_PROXY`,
 `SAPFLOW_WHIP_KEYFRAME_INTERVAL` (seconds, 0 for none) and
 `SAPFLOW_WHIP_OPUS_MAX_BITRATE`. W3d built `SAPFLOW_WHIP_TCP_ADDR` and
-`SAPFLOW_WHIP_TCP_PROXY_PROTOCOL`, and `tcp` candidates. Refused at start:
-any WHIP setting without `SAPFLOW_WHIP_ADDR`; WHIP with the scoped control
+`SAPFLOW_WHIP_TCP_PROXY_PROTOCOL`, and `tcp` candidates. W3c part 2a added
+`SAPFLOW_WHIP_STALE` (seconds, 1 to 60, default 2). Refused at start: any
+WHIP setting without `SAPFLOW_WHIP_ADDR`; WHIP with the scoped control
 API; a `tcp` candidate without `SAPFLOW_WHIP_TCP_ADDR`, and
 `SAPFLOW_WHIP_TCP_ADDR` with no `tcp` candidate or on the signalling
 address; `SAPFLOW_WHIP_TCP_PROXY_PROTOCOL` other than `v2`, or `v2` without
 `SAPFLOW_WHIP_TCP_ADDR` or `SAPFLOW_WHIP_TRUSTED_PROXY`. The UDP socket is
 bound even when only `tcp` candidates are advertised.
-`SAPFLOW_WHIP_JITTER` and `SAPFLOW_WHIP_STALE` are still proposals.
+`SAPFLOW_WHIP_JITTER` is still a proposal.
 
 | Variable | Meaning |
 |---|---|
@@ -1292,7 +1294,7 @@ bound even when only `tcp` candidates are advertised.
 | `SAPFLOW_WHIP_ALLOW_ORIGINS` | Origins allowed by CORS for browser publishing |
 | `SAPFLOW_WHIP_KEYFRAME_INTERVAL` | Keyframe request cadence, proposed 2 s |
 | `SAPFLOW_WHIP_JITTER` | Longest wait for a lost packet, proposed 200 ms |
-| `SAPFLOW_WHIP_STALE` | Media silence after which a new `POST` may supersede a session, proposed 2 s |
+| `SAPFLOW_WHIP_STALE` | Media silence after which a new `POST` may supersede a session, default 2 s |
 | `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | `maxaveragebitrate` offered for Opus |
 
 ## Delay budget
@@ -1676,15 +1678,11 @@ Implementation notes (W3c part 1, 11 November 2026):
   replayed for a session whose publisher has gone (with their IDs
   forgotten) could then break the handshake of a new publisher given the
   same port by a NAT, so the rule is unchanged.
-- **Admission.** A `POST` goes through `Publication::begin_authorised`
-  with protocol `webrtc`: the publish-auth request, the failed-attempt
-  throttle and the global publisher, as for SRT and RTMP. Only the global
-  publisher's refusal and `409` are tested for WHIP. A WHIP claim never
-  takes over an attached publisher, so a second `POST` gets `409` even
-  while the first is handshaking (superseding is not built yet). By the
-  code, and untested: an SRT or RTMP publisher still takes over a live
-  WHIP stream in global-publisher mode, and an app's 403 answers `401`
-  like its 401.
+- **Admission.** A `POST` goes through `Publication::admit` with protocol
+  `webrtc` (the publish-auth request, the failed-attempt throttle and the
+  global publisher, as for SRT and RTMP), then supersede (part 2a, below),
+  then `Publication::claim_admitted`. A WHIP claim never takes over an
+  attached publisher by itself.
 - **`DELETE`** needs the bearer token again (compared as SHA-256 digests)
   and answers `200` once the publication has been released, so a `POST`
   that follows at once is admitted rather than refused `409`.
@@ -1739,8 +1737,8 @@ Implementation notes (W3c part 1, 11 November 2026):
 |---|---|---|
 | A3.1: Chrome publishes through `POST`, LL-HLS plays in hls.js, the recording opens | `scripts/whip-e2e.js` | Partial: headless Chrome 157 on the test host, the gate run: 10.1 s played at 640x360 (206 frames decoded, none dropped); the recording decoded 251 H.264 frames at 640x360 and 625 stereo Opus frames, and was finished complete, and a frame from each was saved. Other browsers, and the DTLS handshake with every target, are later gates |
 | A3.1 in process: `POST`, ICE, DTLS, SRTP over UDP, media in the playlist | `whip::tests::a_publisher_reaches_the_stream_through_post_and_udp` | Met, with the scripted publisher |
-| A3.2 (basic): `DELETE` needs the token, answers `200`, the session is gone, and an immediate `POST` for the path is admitted (`201`) | the same test | Partial: the callbacks, the grace and a handshake timeout at server level are not observed |
-| Refusals before admission: 404, 405 with `Allow`, 401, 415, 413 by `content-length`, 400, 422; 409 and 401 from admission | `whip::tests::refusals_carry_their_statuses`, `whip_request::tests` | Met for these. 403, 429 and 503 from the app are not tested |
+| A3.2 (basic): `DELETE` needs the token, answers `200`, the session is gone, and an immediate `POST` for the path is admitted (`201`) | the same test | Met; the rest of A3.2 is in part 2a, below |
+| Refusals before admission: 404, 405 with `Allow`, 401, 415, 413 by `content-length`, 400, 422; 401 from admission | `whip::tests::refusals_carry_their_statuses`, `whip_request::tests` | Met; the app's 403, 429 and 503, and 409, are in part 2a, below |
 | `503` past `SAPFLOW_MAX_PUBLISHERS` sessions, its path released | `whip::tests::past_the_session_cap_a_post_gets_503` | Met |
 | CORS only for configured origins, refusals included; preflight methods, headers and `Accept-Post` | `whip::tests::cors_only_for_configured_origins`, `whip_request::tests::cors_only_for_configured_origins` | Met |
 | `X-Forwarded-For` only from the trusted proxy, its own entry | `whip_request::tests::forwarded_for_only_from_the_trusted_proxy` | Unit tests only |
@@ -1771,14 +1769,143 @@ Implementation notes (W3c part 1, 11 November 2026):
 | A dual-stack listener believes `X-Forwarded-For` from an IPv4 proxy seen IPv4-mapped | `whip_request::tests::forwarded_for_only_from_the_trusted_proxy` | Unit tests only |
 | WHIP settings | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 
-- **Left to W3c part 2.**
+Implementation notes (W3c part 2a, lifecycle):
+
+- **Leaving and returning (A3.2).** A `DELETE` closes the session; its
+  ingest task ends and drops the `Publication`, which sends `unpublish` at
+  once if the stream had published and holds it for
+  `SAPFLOW_RECONNECT_GRACE`, or releases the path with no callback if it
+  never took media. A session that never completes its handshake ends at
+  its deadline the same way. A `POST` within the grace takes the held
+  stream over (the same stream carries on); one after it starts a new
+  stream. The app's 403 is now its own verdict: WHIP answers it `403`,
+  SRT and RTMP refuse it as they refuse a wrong key (SRT's 401), and it
+  still counts against the throttle.
+- **Supersede (A3.3).** After admission and before the claim, a `POST`
+  looks up the WHIP session publishing to its event and asks the UDP owner
+  when that session last took media (`Session::last_media`). If it has
+  taken none yet (it is checking or handshaking), or none for
+  `SAPFLOW_WHIP_STALE`, the server closes it as if it had left and waits
+  for its publication's release, so the new session takes the stream over
+  at once, without waiting for consent to expire. A session still taking
+  media keeps the path, and the claim answers `409`.
+- **SRT and RTMP over WHIP, kept.** In global-publisher and
+  app-authorised mode an admitted SRT or RTMP publisher takes over any
+  attached stream, a live WHIP session's included: that is the existing
+  rule ("the one authorised publisher may replace its own stale
+  connection"), and SRT and RTMP already take over each other under it. A
+  WHIP session that loses its stream so ends on its next packet. Tested
+  for SRT in global-publisher mode; RTMP and app-authorised mode follow
+  the same claim, read from the code. The
+  reverse is not allowed: a WHIP `POST` never closes an SRT or RTMP
+  publisher, and gets `409`. Narrowing the rule for SRT and RTMP is a
+  change to all three protocols and to the v4v contract, not to WHIP.
+- **Panic isolation (A3.4).** A panic in anything done for one session
+  ends that session only, counted as `panicked`. Its recording is marked
+  (`ingest-error`) and its path is freed, held for a reconnect if it had
+  published. Every other session goes on. Three layers each run under
+  `catch_unwind` (`panic = "unwind"`):
+  - **The router.** It guards every call into a session, and every read
+    of one it makes between calls: each session's deadline in
+    `poll_timeout` and `handle_timeout`, and the tuple owner's state when
+    another session's check arrives from its tuple. A session whose call
+    or read panics is dropped with its queued output, its ufrag and its
+    tuples, and ends with `EndReason::Panicked`. The UDP owner reads
+    sessions through `Router::inspect`, under the same guard.
+  - **The UDP owner's own code for a session**, a block at a time: what it
+    does with each of the session's events (the feed to the ingest task,
+    and the reads it makes of the session for them) and with its end. A
+    panic there drops the feed, marks the recording and closes the
+    session.
+  - **The ingest task's steps on the publication**: the ingest, the muxer
+    and the recorder, with the stream's locks held. A panic there marks
+    the recording, ends the publication as any end does, and has the owner
+    close the session; it sets the session's `panics` count before its
+    queue closes, so the end is named `panicked` whichever way the owner
+    hears of it. The stream's locks take poisoned state as it was left.
+  - **Left bare.** The routing of each datagram before it reaches a
+    session: `classify` reads the first byte, and `stun::request_username`
+    is `Message::parse`, which uses checked reads only and has the
+    `stun_message` fuzz target. `Publication`'s own `Drop`, shared with SRT
+    and RTMP: a panic in it is caught, so WHIP's cleanup still runs, but
+    how far the stream got retired is up to that code. Saturating
+    arithmetic and atomic loads in the owner.
+  - **The held stream.** After an ingest panic the stream is held for the
+    reconnect grace, as SRT and RTMP hold theirs after a panic in their
+    connection task. A muxer that panicked mid-update is left as it was,
+    and a publisher that comes back carries on from it, in a session of
+    its own. Ending the stream at once instead is a change to
+    `Publication`, which all three protocols share.
+  - **ICE-TCP.** Frames from its connections enter through the owner's
+    `receive`, as datagrams do, so the guards above cover a session on a
+    TCP tuple too (`whip::tcp_tests::a_panic_in_a_tcp_session_ends_only_that_session`).
+    A send to a TCP tuple is queued under `catch_unwind` in
+    `Link::transmit`: a panic there drops that packet (counted in the
+    listener's `queue_panics`), never the owner; that guard has no test of
+    its own. Each connection's front and framing run in a task of their
+    own, where tokio contains a panic and the connection's slot is freed.
+  - **Hooks.** `sapflow-whip`'s `test-panic` feature compiles in a
+    datagram that makes a session panic
+    (`sapflow_whip::testing::PANIC_DATAGRAM`) and datagrams that arm one of
+    five reads to panic (`testing::arm`: `poll_timeout`, `media_from`,
+    `last_media`, `receiver` and `stats`). The server's own test build has
+    two Opus payloads that make the feed or the ingest panic. What holds:
+    - A build without test targets contains none of them: the release
+      recipe, `cargo build --release -p sapflow` (the Dockerfile's), and a
+      plain `cargo build -p sapflow`. `scripts/whip-e2e.js` searches the
+      binary it runs for their markers. The fuzz targets never enable
+      `test-panic`.
+    - A build that includes the server's test targets (for example
+      `cargo build -p sapflow --all-targets`) unifies the dev-dependency's
+      `test-panic` into the `sapflow` binary too, so that binary contains
+      `sapflow-whip`'s hooks. They stay inert there: each hook also needs a
+      switch that only a test turns on at run time
+      (`Router::enable_panic_hooks`, which passes it to each session, and
+      the server's `Whip::panic_hooks` for the two payloads, which exist in
+      test builds only). The server never turns it on, and every router
+      starts with it off. With it off, the panic datagram and the arm
+      datagrams are unknown datagrams to the session, and the payloads are
+      only audio (`router::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on`,
+      `whip::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on`,
+      which drives the server's own `prepare` and `run` with the hooks
+      compiled in and the switch off, as such a binary runs).
+    - The switch is per router (and per server for the payloads), not
+      process-wide, so the tests that turn it on and the ones that check it
+      off run side by side in one test binary.
+  - **Checked by mutation.** Each new guard was taken out in turn (the
+    router's deadline read, its claim read and `inspect`; the owner's
+    block guard; the ingest's step guard and its mark), and each time its
+    test failed. Forcing each hook's switch on in turn (the session's, the
+    feed's and the ingest's) fails the switch-off tests.
+- **End reasons.** Every end is counted by name: the session's own
+  (`handshake-timeout`, `consent-expired`, `dtls-failed`, `peer-closed`,
+  `media-timeout`, `keys-exhausted`, `panicked`) or, when the server
+  closed it, why (`deleted`, `superseded`, `ingest-ended`, and `panicked`
+  for a panic in its feed or its ingest). Each end is
+  logged with its reason and that reason's count; no address is logged.
+
+| Claim | Test | Status |
+|---|---|---|
+| A3.2: a `DELETE` after media sends `unpublish` at once and holds the stream; a `POST` within the grace continues the same stream | `whip::tests::delete_after_media_unpublishes_and_a_post_in_the_grace_continues` | Met in process |
+| A3.2: a `POST` after the grace starts a new stream | `whip::tests::a_post_after_the_grace_starts_a_new_stream` | Met in process |
+| A3.2: a `DELETE` before any media releases the path with no callback | `whip::tests::a_delete_before_media_releases_with_no_callback` | Met in process |
+| A3.2: a handshake timeout before any media releases the path with no callback | `whip::tests::a_handshake_timeout_releases_with_no_callback` | Met in process (the deadline shortened to 1 s) |
+| A3.2: every refusal in Resources with its status and reason: 415, 400, 422, 401 (no token, and the app's 401), 403 (the app's 403), 409, 429 (the app's 429), 503 (the app's 500) | `whip::tests::every_refusal_has_its_status_and_reason`, `whip::tests::a_second_post_while_media_flows_gets_409` | Met in process; the 400 and 422 reasons are the SDP refusal's own, checked as present |
+| A3.3: a second `POST` while the first session is still taking media gets `409` | `whip::tests::a_second_post_while_media_flows_gets_409` | Met in process |
+| A3.3: after `SAPFLOW_WHIP_STALE` without media, a second `POST` takes over at once | `whip::tests::a_stalled_session_is_superseded` | Met in process (stale set to 1 s) |
+| A3.3: a second `POST` during the first session's handshake replaces it at once | `whip::tests::a_post_during_the_first_handshake_replaces_it` | Met in process |
+| SRT takes over a live WHIP stream in global-publisher mode, and a WHIP `POST` never takes over SRT | `whip::tests::srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt` | Met in process |
+| A3.4: a panic in a call into a session, or in a read of one (its deadline, a tuple owner's state, the owner's reads), ends only that session; another keeps publishing with nothing lost; its recording is marked | `router::tests::a_panicking_session_is_dropped_and_the_others_go_on`, `a_session_whose_deadline_panics_is_dropped_and_the_others_go_on`, `a_tuple_owner_whose_read_panics_is_dropped_at_another_sessions_check`, `a_session_whose_inspected_read_panics_is_dropped` (sapflow-whip); `whip::tests::a_panic_in_one_session_ends_only_that_session`, `a_panic_in_a_session_deadline_ends_only_that_session`, `a_panic_in_the_owners_read_ends_only_that_session`, `a_panic_in_the_supersede_read_ends_only_that_session` | Met in process |
+| A3.4: a panic in the UDP owner's feed for a session, or in its ingest inside the publication, ends only that session, as above | `whip::tests::a_panic_in_the_feed_ends_only_that_session`, `whip::tests::a_panic_in_the_ingest_ends_only_that_session` | Met in process. Each A3.4 server test checks that A ends as `panicked` and never as `ingest-ended`; that A's recording reads `ingest-error` (when nothing marked it before the panic); that A's entries are gone and its publication released; and that a new `POST` for A's path gets 201. B must show no marks, and its playlist must grow after A has gone |
+| A3.4 over ICE-TCP: a panic in a session on a TCP tuple ends only that session; another on its own connection keeps publishing with nothing marked | `whip::tcp_tests::a_panic_in_a_tcp_session_ends_only_that_session` | Met in process |
+| No build without test targets contains the panic hooks (`cargo build --release -p sapflow`, `cargo build -p sapflow`) | `scripts/whip-e2e.js` (the binary it runs is searched for their markers) | Met |
+| A build with the test targets (`--all-targets`) contains `sapflow-whip`'s hooks, and they do nothing unless a test turns them on | `router::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on` (sapflow-whip), `whip::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on` | Met in process; the server never calls `Router::enable_panic_hooks` |
+| End reasons are counted by name | `whip::tests::every_end_reason_has_a_name`, and the counts asserted in the A3.2, A3.3 and A3.4 tests | Met |
+| `SAPFLOW_WHIP_STALE` | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
+
+- **Left to W3c part 2b.**
   - The throttle as a WHIP refusal path of its own, and pending-session
     caps, in total and per address.
-  - Supersede (A3.3), from `Session::last_media`.
-  - Running each session call under `catch_unwind` (A3.4).
-  - Counting end reasons.
-  - A3.2 beyond the basic `DELETE`: the callbacks and the grace, and every
-    refusal observed.
   - A3.7's bounds and the packet-capture tests, as invariants on the
     router and session harness.
   - The UDP owner scans every session for due timers on each datagram

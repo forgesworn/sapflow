@@ -37,3 +37,10 @@ required-features = ["testing"]
 # test client and SRTP protect, seeded randomness) and the fuzz entry
 # points. Not for production use.
 testing = ["sapflow-dtls/testing", "sapflow-rtp/testing"]
+# With testing: the panic hooks (a datagram that makes a session panic, and
+# datagrams that arm a read to), for panic isolation tests. Each also needs
+# Router::enable_panic_hooks at run time, which only tests call, so a build
+# that unifies this feature in (any that includes the server's test targets)
+# keeps them inert. Apart from testing so that the fuzz targets, which use
+# testing, can never reach it. Not for production use.
+test-panic = ["testing"]

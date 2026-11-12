@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use sapflow_whip::testing::{PPS, Publisher, StunClient, VIDEO_SSRC, idr_slice, server_identity};
+use sapflow_whip::testing::{
+    PPS, Publisher, Read, StunClient, VIDEO_SSRC, arm, idr_slice, server_identity,
+};
 use sapflow_whip::{Event, SessionConfig, Transmit, Tuple};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -87,7 +89,31 @@ fn app(env: &[(&str, &str)]) -> Arc<App> {
 }
 
 async fn start(env: &[(&str, &str)]) -> Server {
-    let app = app(env);
+    start_with(env, |_| {}, None).await
+}
+
+/// A server whose sessions `tweak` adjusts, and whose callbacks go to
+/// `callbacks` if given.
+async fn start_with(
+    env: &[(&str, &str)],
+    tweak: impl FnOnce(&mut SessionConfig),
+    callbacks: Option<Callbacks>,
+) -> Server {
+    serve_test(env, tweak, callbacks, false).await
+}
+
+/// As [`start_with`]; with `hooks`, the panic hooks are on (A3.4), as only
+/// tests turn them on.
+async fn serve_test(
+    env: &[(&str, &str)],
+    tweak: impl FnOnce(&mut SessionConfig),
+    callbacks: Option<Callbacks>,
+    hooks: bool,
+) -> Server {
+    let mut app = app(env);
+    if let Some(callbacks) = callbacks {
+        Arc::get_mut(&mut app).expect("unshared").callbacks = callbacks;
+    }
     let sockets = Sockets {
         http: TcpListener::bind("127.0.0.1:0").await.expect("bind"),
         udp: UdpSocket::bind("127.0.0.1:0").await.expect("bind"),
@@ -97,9 +123,15 @@ async fn start(env: &[(&str, &str)]) -> Server {
         sockets.http.local_addr().expect("addr"),
         sockets.udp.local_addr().expect("addr"),
     );
-    let (whip, router, rx) = prepare(&app, server_identity())
-        .expect("router")
-        .expect("WHIP on");
+    let config = app.config.whip.clone().expect("WHIP on");
+    let mut session = session_config(&config);
+    tweak(&mut session);
+    let (whip, mut router, rx) =
+        prepare_with(&app, server_identity(), config, session).expect("router");
+    if hooks {
+        router.enable_panic_hooks();
+        whip.panic_hooks.store(true, Ordering::Relaxed);
+    }
     tokio::spawn(run(app.clone(), whip.clone(), router, rx, sockets));
     Server {
         app,
@@ -422,14 +454,6 @@ async fn refusals_carry_their_statuses() {
         status(send(at, &sdp_post("/whip/live/event-a", TOKEN, &offer)).await),
         201
     );
-    let second = Phone::new(4, &server).await;
-    let busy = send(
-        at,
-        &sdp_post("/whip/live/event-a", TOKEN, &second.p.offer()),
-    )
-    .await;
-    assert_eq!(busy.status, 409, "the path was claimed at POST");
-    assert_eq!(busy.header("access-control-allow-origin"), Some(ORIGIN));
     let unknown = send(
         at,
         format!("DELETE /whip/session/00112233445566778899aabbccddeeff HTTP/1.1\r\nauthorization: Bearer {TOKEN}\r\n\r\n").as_bytes(),
@@ -581,6 +605,11 @@ async fn audio_run(
 }
 
 async fn udp_server() -> (Server, PathBuf) {
+    udp_server_with(false).await
+}
+
+/// As [`udp_server`], with the panic hooks on if `hooks`.
+async fn udp_server_with(hooks: bool) -> (Server, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target")
         .join(format!(
@@ -590,11 +619,11 @@ async fn udp_server() -> (Server, PathBuf) {
         ));
     std::fs::create_dir_all(&root).expect("owned scratch");
     let dir = root.to_str().expect("utf-8 path").to_owned();
-    let server = start(&[
-        ("SAPFLOW_RECORDINGS", &dir),
+    let env = [
+        ("SAPFLOW_RECORDINGS", dir.as_str()),
         ("SAPFLOW_RECORD_MIN_FREE_GB", "0"),
-    ])
-    .await;
+    ];
+    let server = serve_test(&env, |_| {}, None, hooks).await;
     (server, root)
 }
 
@@ -792,6 +821,7 @@ fn video_only(offer: &str) -> String {
 const AUDIO_ONLY: Setup = Setup {
     video: false,
     audio: true,
+    panic_hooks: false,
 };
 
 /// What a recording says after a session's events: through a `Feed`, as
@@ -1024,6 +1054,7 @@ fn dropped_for_room() -> Run {
 const VIDEO_ONLY: Setup = Setup {
     video: true,
     audio: false,
+    panic_hooks: false,
 };
 
 /// Each path marks the recording through the server, and the muxer alone,
@@ -1114,6 +1145,7 @@ async fn an_abnormal_end_marks_the_recording() {
             Some(IncompleteReason::Protocol),
         ),
         (R::KeysExhausted, Some(IncompleteReason::Protocol)),
+        (R::Panicked, Some(IncompleteReason::IngestError)),
         (R::HandshakeTimeout, None),
         (R::Closed, None),
         (R::PeerClosed, None),
@@ -1193,4 +1225,561 @@ async fn only_authenticated_media_counts_against_the_cap() {
     let audio = p.audio(1);
     receive(&mut router, &mut feeds, p.tuple, &audio);
     assert_eq!(feeds[&id].received, audio.len());
+}
+
+/// Callbacks for `live/event-<event>` into a queue a test reads.
+fn callback_queue(event: &str) -> (Callbacks, mpsc::Receiver<crate::callback::Queued>) {
+    crate::callback::test_queue(crate::publish_observer::fixture_scope(event, 1, 1, 1), 64)
+}
+
+/// The callback events queued within `wait`, by name.
+async fn callback_events(
+    rx: &mut mpsc::Receiver<crate::callback::Queued>,
+    wait: Duration,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    while let Ok(Some(q)) = tokio::time::timeout(wait, rx.recv()).await {
+        let body: serde_json::Value = serde_json::from_slice(&q.body).expect("JSON");
+        names.push(body["event"].as_str().unwrap_or_default().to_owned());
+    }
+    names
+}
+
+fn delete(location: &str) -> Vec<u8> {
+    let path = location
+        .strip_prefix("https://whip.example")
+        .expect("our Location");
+    format!("DELETE {path} HTTP/1.1\r\nauthorization: Bearer {TOKEN}\r\n\r\n").into_bytes()
+}
+
+/// A phone admitted to `event`, connected, publishing until a part is out.
+async fn live(server: &Server, seed: u8, event: &str) -> (Phone, String) {
+    let mut phone = Phone::new(seed, server).await;
+    let a = admit(server, &mut phone, event).await;
+    assert_eq!(a.status, 201, "{}", a.body);
+    let location = a.header("location").expect("Location").to_owned();
+    phone.connect().await;
+    let stream = server.app.streams.get(event).expect("claimed");
+    for _ in 0..10 {
+        phone.publish(1).await;
+        if stream.has_content() {
+            break;
+        }
+    }
+    assert!(stream.has_content());
+    (phone, location)
+}
+
+/// Polls `f` every 50 ms for up to 5 s.
+async fn eventually(mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..100 {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f()
+}
+
+/// A3.2: a DELETE after media sends `unpublish` at once and holds the
+/// stream; a POST within the grace continues the same stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_after_media_unpublishes_and_a_post_in_the_grace_continues() {
+    let (callbacks, mut rx) = callback_queue("grace");
+    let server = start_with(&[], |_| {}, Some(callbacks)).await;
+    let (_phone, location) = live(&server, 30, "event-grace").await;
+    assert_eq!(
+        callback_events(&mut rx, Duration::from_millis(200)).await,
+        ["publish"]
+    );
+    let held = server.app.streams.get("event-grace").expect("live");
+    assert_eq!(send(server.http, &delete(&location)).await.status, 200);
+    assert_eq!(
+        callback_events(&mut rx, Duration::from_millis(200)).await,
+        ["unpublish"],
+        "at once"
+    );
+    let still = server
+        .app
+        .streams
+        .get("event-grace")
+        .expect("held for the grace");
+    assert!(Arc::ptr_eq(&held, &still) && still.has_content());
+    assert_eq!(server.whip.ends.get("deleted"), 1);
+    // A new POST within the grace takes the held stream over.
+    let mut next = Phone::new(31, &server).await;
+    assert_eq!(admit(&server, &mut next, "event-grace").await.status, 201);
+    let resumed = server.app.streams.get("event-grace").expect("claimed");
+    assert!(Arc::ptr_eq(&held, &resumed), "the same stream");
+}
+
+/// A3.2: a POST after the grace starts a new stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_after_the_grace_starts_a_new_stream() {
+    let server = start(&[("SAPFLOW_RECONNECT_GRACE", "1")]).await;
+    let (_phone, location) = live(&server, 32, "event-later").await;
+    let held = server.app.streams.get("event-later").expect("live");
+    assert_eq!(send(server.http, &delete(&location)).await.status, 200);
+    assert!(
+        eventually(|| server.app.streams.get("event-later").is_none()).await,
+        "ended after the grace"
+    );
+    let mut next = Phone::new(33, &server).await;
+    assert_eq!(admit(&server, &mut next, "event-later").await.status, 201);
+    let fresh = server.app.streams.get("event-later").expect("claimed");
+    assert!(!Arc::ptr_eq(&held, &fresh), "a new stream");
+}
+
+/// A3.2: a DELETE before any media releases the path with no callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_before_media_releases_with_no_callback() {
+    let (callbacks, mut rx) = callback_queue("early");
+    let server = start_with(&[], |_| {}, Some(callbacks)).await;
+    let mut phone = Phone::new(34, &server).await;
+    let a = admit(&server, &mut phone, "event-early").await;
+    assert_eq!(a.status, 201);
+    let location = a.header("location").expect("Location").to_owned();
+    assert_eq!(send(server.http, &delete(&location)).await.status, 200);
+    assert!(server.app.streams.get("event-early").is_none(), "released");
+    assert!(
+        callback_events(&mut rx, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+    assert_eq!(server.whip.ends.get("deleted"), 1);
+}
+
+/// A3.2: a session whose handshake never completes ends at its deadline
+/// and releases the path with no callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handshake_timeout_releases_with_no_callback() {
+    let (callbacks, mut rx) = callback_queue("mute");
+    let server = start_with(
+        &[],
+        |s| s.handshake_timeout = Duration::from_secs(1),
+        Some(callbacks),
+    )
+    .await;
+    let mut phone = Phone::new(35, &server).await;
+    assert_eq!(admit(&server, &mut phone, "event-mute").await.status, 201);
+    assert!(server.app.streams.get("event-mute").is_some());
+    assert!(
+        eventually(|| server.app.streams.get("event-mute").is_none()).await,
+        "released at the deadline"
+    );
+    assert_eq!(server.whip.ends.get("handshake-timeout"), 1);
+    assert!(
+        callback_events(&mut rx, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+}
+
+/// A3.2: every refusal in Resources, with its status and its reason, the
+/// app's 401, 403, 429 and a 500 among them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_refusal_has_its_status_and_reason() {
+    use crate::publish_auth::stub::{self, Answer as App};
+    let _keep: Option<stub::Stub> = None;
+    use resource::Refusal as R;
+    let reason = |r: R| r.reason().to_owned();
+    // Before admission, on the global publisher.
+    let server = start(&[]).await;
+    let phone = Phone::new(36, &server).await;
+    let offer = phone.p.offer();
+    let at = server.http;
+    let check = |a: Answer, status: u16, why: String| {
+        assert_eq!((a.status, a.body), (status, why));
+    };
+    let no_type = post(
+        "/whip/live/event-r",
+        &[("authorization", "Bearer publisher:whip-test-secret")],
+        &offer,
+    );
+    check(
+        send(at, &no_type).await,
+        415,
+        reason(R::UnsupportedMediaType),
+    );
+    let not_sdp = send(at, &sdp_post("/whip/live/event-r", TOKEN, "not sdp")).await;
+    assert_eq!(not_sdp.status, 400);
+    assert!(!not_sdp.body.is_empty());
+    let unprofiled = offer
+        .replace("H264/90000", "VP8/90000")
+        .replace("opus/48000/2", "PCMU/8000");
+    let outside = send(at, &sdp_post("/whip/live/event-r", TOKEN, &unprofiled)).await;
+    assert_eq!(outside.status, 422);
+    assert!(!outside.body.is_empty());
+    let no_token = post(
+        "/whip/live/event-r",
+        &[("content-type", "application/sdp")],
+        &offer,
+    );
+    check(send(at, &no_token).await, 401, reason(R::Unauthorised));
+    // From the app that authorises publishers.
+    for (answer, status, why) in [
+        (App::Status(401), 401, R::Unauthorised),
+        (App::Status(403), 403, R::Forbidden),
+        (App::Status(429), 429, R::Throttled),
+        (App::Status(500), 503, R::Unavailable),
+    ] {
+        let auth = stub::start(answer).await;
+        let url = auth.url.clone();
+        let server = start(&[
+            ("SAPFLOW_PUBLISH_USER", ""),
+            ("SAPFLOW_PUBLISH_PASS", ""),
+            ("SAPFLOW_PUBLISH_AUTH_URL", &url),
+        ])
+        .await;
+        let refused = send(server.http, &sdp_post("/whip/live/event-r", TOKEN, &offer)).await;
+        check(refused, status, reason(why));
+    }
+}
+
+/// A3.3: a second POST while the first session is still taking media gets
+/// 409, with its reason and the CORS headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_post_while_media_flows_gets_409() {
+    let server = start(&[]).await;
+    let (mut phone, _) = live(&server, 37, "event-busy").await;
+    // The first goes on publishing while the second asks.
+    let publishing = tokio::spawn(async move {
+        phone.publish(2).await;
+        phone
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let second = Phone::new(38, &server).await;
+    let busy = send(
+        server.http,
+        &sdp_post("/whip/live/event-busy", TOKEN, &second.p.offer()),
+    )
+    .await;
+    let _phone = publishing.await.expect("published");
+    assert_eq!(busy.status, 409);
+    assert_eq!(busy.body, resource::Refusal::Conflict.reason());
+    assert_eq!(busy.header("access-control-allow-origin"), Some(ORIGIN));
+    assert_eq!(server.whip.ends.get("superseded"), 0);
+}
+
+/// A3.3: once the first session has taken no media for SAPFLOW_WHIP_STALE,
+/// a second POST takes over at once, as if it had left, without waiting
+/// for consent to expire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_session_is_superseded() {
+    let server = start(&[("SAPFLOW_WHIP_STALE", "1")]).await;
+    let (_phone, _) = live(&server, 39, "event-stall").await;
+    let held = server.app.streams.get("event-stall").expect("live");
+    // Its last media is stamped as the owner reads it: ask again, until
+    // the stale time has passed on the server's clock.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let mut next = Phone::new(40, &server).await;
+    let mut a = admit(&server, &mut next, "event-stall").await;
+    for _ in 0..40 {
+        if a.status != 409 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        a = admit(&server, &mut next, "event-stall").await;
+    }
+    assert_eq!(a.status, 201, "{}", a.body);
+    assert_eq!(server.whip.ends.get("superseded"), 1);
+    let taken = server.app.streams.get("event-stall").expect("claimed");
+    assert!(Arc::ptr_eq(&held, &taken), "the held stream, carried on");
+}
+
+/// A3.3: a second POST during the first session's handshake replaces it
+/// at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_post_during_the_first_handshake_replaces_it() {
+    let server = start(&[]).await;
+    let mut first = Phone::new(41, &server).await;
+    assert_eq!(admit(&server, &mut first, "event-race").await.status, 201);
+    let mut second = Phone::new(42, &server).await;
+    let a = admit(&server, &mut second, "event-race").await;
+    assert_eq!(a.status, 201, "{}", a.body);
+    assert_eq!(server.whip.ends.get("superseded"), 1);
+    assert_eq!(server.whip.resources().len(), 1, "only the second is live");
+    second.connect().await;
+}
+
+/// Kept from before WHIP: in global-publisher mode an SRT or RTMP publisher
+/// with the publisher's credentials takes over any attached stream, a live
+/// WHIP session's included, which then ends on its next packet. A WHIP
+/// POST never takes over SRT or RTMP: it gets 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt() {
+    let server = start(&[]).await;
+    let (mut phone, _) = live(&server, 43, "event-mixed").await;
+    let req = sapflow_core::PublishRequest::parse_srt_stream_id(
+        "publish:live/event-mixed:publisher:whip-test-secret",
+    )
+    .expect("request");
+    let srt = Publication::begin(
+        &server.app,
+        &req,
+        SourceKind::Ts,
+        "127.0.0.1".parse().expect("ip"),
+    )
+    .expect("SRT takes over");
+    phone.publish(1).await;
+    assert!(
+        eventually(|| server.whip.ends.get("ingest-ended") == 1).await,
+        "the WHIP session ended on its next packet"
+    );
+    let other = Phone::new(44, &server).await;
+    let busy = send(
+        server.http,
+        &sdp_post("/whip/live/event-mixed", TOKEN, &other.p.offer()),
+    )
+    .await;
+    assert_eq!(busy.status, 409, "SRT is never superseded by WHIP");
+    srt.end();
+}
+
+/// How a test makes session A panic (A3.4).
+enum Fault {
+    /// A datagram to A's session.
+    Datagram(Vec<u8>),
+    /// A datagram to A's session, then audio, for which the owner reads
+    /// A's session.
+    DatagramThenAudio(Vec<u8>),
+    /// An Opus payload from A's publisher.
+    Audio(&'static [u8]),
+    /// A datagram to A's session, then a `POST` for A's path, whose
+    /// supersede reads A's session.
+    DatagramThenPost(Vec<u8>),
+}
+
+fn session_id(location: &str) -> SessionId {
+    location
+        .rsplit('/')
+        .next()
+        .and_then(SessionId::parse)
+        .expect("a session Location")
+}
+
+/// Every mark a session's counts hold (re-anchors are not marks).
+fn marks(counts: &LossCounts) -> u64 {
+    counts
+        .fields()
+        .iter()
+        .filter(|(name, _)| *name != "reanchors")
+        .map(|(_, n)| n)
+        .sum()
+}
+
+/// A3.4: session A panics, by `fault`, while B publishes. A ends as
+/// `panicked`, its recording is marked, and its path is freed, with the
+/// listener's entries for it, for a new publisher; B loses nothing, and
+/// its playlist keeps growing after A has gone.
+async fn panic_isolation(seed: u8, fault: Fault) {
+    let (server, root) = udp_server_with(true).await;
+    let (a_event, b_event) = (
+        format!("event-panic-a{seed}"),
+        format!("event-panic-b{seed}"),
+    );
+    let (mut a, a_location) = live(&server, seed, &a_event).await;
+    let (mut b, b_location) = live(&server, seed + 1, &b_event).await;
+    let (a_id, b_id) = (session_id(&a_location), session_id(&b_location));
+    let resource = |id: &SessionId| {
+        server
+            .whip
+            .resources()
+            .get(id)
+            .map(|r| (r.losses.clone(), r.released.clone()))
+    };
+    let (a_counts, mut a_released) = resource(&a_id).expect("A is live");
+    let (b_counts, _) = resource(&b_id).expect("B is live");
+    let a_stream = server.app.streams.get(&a_event).expect("live");
+    let b_stream = server.app.streams.get(&b_event).expect("live");
+    let b_task = tokio::spawn(async move {
+        b.publish(4).await;
+        b
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // With nothing marked before the fault, the panic's reason is the
+    // recording's first.
+    let clean = marks(&a_counts) == 0;
+    // The recording A's media went to.
+    let recording = a_stream
+        .session()
+        .recorder
+        .as_ref()
+        .expect("recording")
+        .status();
+    match fault {
+        Fault::Datagram(d) => a.send(&d).await,
+        Fault::DatagramThenAudio(d) => {
+            a.send(&d).await;
+            for n in 0..5 {
+                let d = a.p.audio(n);
+                a.send(&d).await;
+            }
+        }
+        Fault::Audio(payload) => {
+            let d = a.p.audio_payload(payload.to_vec());
+            a.send(&d).await;
+        }
+        Fault::DatagramThenPost(d) => {
+            a.send(&d).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // 201 or 409: A's publication may not have gone yet.
+            let mut c = Phone::new(seed + 100, &server).await;
+            let _ = admit(&server, &mut c, &a_event).await;
+        }
+    }
+    assert!(
+        eventually(|| server.whip.ends.get("panicked") == 1).await,
+        "A ended as panicked: {:?}; A {a_counts}",
+        server.whip.ends
+    );
+    let after = b_stream.version();
+    let released = tokio::time::timeout(Duration::from_secs(5), a_released.wait_for(|r| *r)).await;
+    assert!(
+        released.is_ok_and(|r| r.is_ok()),
+        "A's publication released"
+    );
+    assert!(server.whip.resources().get(&a_id).is_none());
+    assert_ne!(server.whip.paths().get(&a_event), Some(&a_id));
+    assert_eq!(server.whip.ends.get("ingest-ended"), 0);
+    assert!(a_counts.panics.load(Ordering::Relaxed) >= 1, "{a_counts}");
+    let reason = recording.reason();
+    if clean {
+        assert_eq!(reason, Some(IncompleteReason::IngestError), "{a_counts}");
+    } else {
+        assert!(reason.is_some(), "{a_counts}");
+    }
+    let _b = b_task.await.expect("B published throughout");
+    assert_eq!(marks(&b_counts), 0, "B lost nothing: {b_counts}");
+    assert!(
+        b_stream.version() > after,
+        "B's playlist kept growing after A had gone"
+    );
+    // A's path takes a new publisher.
+    let mut d = Phone::new(seed + 101, &server).await;
+    assert_eq!(admit(&server, &mut d, &a_event).await.status, 201);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// In a call into the session (the router's guard).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_one_session_ends_only_that_session() {
+    panic_isolation(
+        45,
+        Fault::Datagram(sapflow_whip::testing::PANIC_DATAGRAM.to_vec()),
+    )
+    .await;
+}
+
+/// In the session's deadline, which the owner reads every turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_a_session_deadline_ends_only_that_session() {
+    panic_isolation(47, Fault::Datagram(arm(Read::PollTimeout))).await;
+}
+
+/// In the owner's read of the session around an SRTP datagram, which only
+/// `Router::inspect` guards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_owners_read_ends_only_that_session() {
+    panic_isolation(49, Fault::DatagramThenAudio(arm(Read::Stats))).await;
+}
+
+/// In the owner's read of the session for supersede.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_supersede_read_ends_only_that_session() {
+    panic_isolation(51, Fault::DatagramThenPost(arm(Read::LastMedia))).await;
+}
+
+/// In the owner's feed for the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_feed_ends_only_that_session() {
+    panic_isolation(53, Fault::Audio(injected::FEED_PANIC)).await;
+}
+
+/// In the ingest, inside the publication with the stream's locks held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_ingest_ends_only_that_session() {
+    panic_isolation(55, Fault::Audio(injected::INGEST_PANIC)).await;
+}
+
+/// A3.4's hooks with the switch off, as the server always runs: the panic
+/// datagram, every armed read, both payloads and a supersede `POST` reach
+/// a live session, and nothing panics. A build of the test targets
+/// compiles the hooks into the server binary too, which never turns them
+/// on, so this is that binary's case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_panic_hooks_do_nothing_unless_a_test_turns_them_on() {
+    let (server, root) = udp_server_with(false).await;
+    let event = "event-panic-off";
+    let (mut a, location) = live(&server, 57, event).await;
+    let id = session_id(&location);
+    let counts = server
+        .whip
+        .resources()
+        .get(&id)
+        .map(|r| r.losses.clone())
+        .expect("A is live");
+    let stream = server.app.streams.get(event).expect("live");
+    let mut faults = vec![sapflow_whip::testing::PANIC_DATAGRAM.to_vec()];
+    for read in [
+        Read::PollTimeout,
+        Read::MediaFrom,
+        Read::LastMedia,
+        Read::Receiver,
+        Read::Stats,
+    ] {
+        faults.push(arm(read));
+    }
+    for d in faults {
+        a.send(&d).await;
+    }
+    for payload in [injected::FEED_PANIC, injected::INGEST_PANIC] {
+        let d = a.p.audio_payload(payload.to_vec());
+        a.send(&d).await;
+    }
+    a.publish(1).await;
+    // Supersede reads the session's last media: A is live, so 409.
+    let mut c = Phone::new(157, &server).await;
+    assert_eq!(admit(&server, &mut c, event).await.status, 409);
+    let before = stream.version();
+    a.publish(1).await;
+    assert!(stream.version() > before, "A's playlist keeps growing");
+    assert_eq!(
+        server.whip.ends.get("panicked"),
+        0,
+        "{:?}",
+        server.whip.ends
+    );
+    assert!(server.whip.resources().get(&id).is_some(), "A is live");
+    assert_eq!(counts.panics.load(Ordering::Relaxed), 0, "{counts}");
+    assert_eq!(counts.abnormal_ends.load(Ordering::Relaxed), 0, "{counts}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn every_end_reason_has_a_name() {
+    use sapflow_whip::EndReason as R;
+    let names = [
+        end_name(R::Closed, Some(CloseCause::Delete)),
+        end_name(R::Closed, Some(CloseCause::Superseded)),
+        end_name(R::Closed, Some(CloseCause::IngestEnded)),
+        end_name(R::Closed, None),
+        end_name(R::HandshakeTimeout, None),
+        end_name(R::ConsentExpired, None),
+        end_name(R::Dtls(sapflow_dtls::Error::Timeout), None),
+        end_name(R::PeerClosed, None),
+        end_name(R::MediaTimeout, None),
+        end_name(R::KeysExhausted, None),
+        end_name(R::Panicked, None),
+    ];
+    let distinct: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(distinct.len(), names.len());
+    // A panic in the owner's code or the ingest counts with the session's.
+    assert_eq!(
+        end_name(R::Closed, Some(CloseCause::Panicked)),
+        end_name(R::Panicked, None)
+    );
+    let counts = EndCounts::default();
+    assert_eq!((counts.add("deleted"), counts.add("deleted")), (1, 2));
+    assert_eq!((counts.get("deleted"), counts.get("panicked")), (2, 0));
 }
