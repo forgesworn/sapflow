@@ -498,7 +498,10 @@ pub fn multivariant(m: &Muxer) -> String {
 /// from what it lists, so this check is not independent of how the muxer
 /// measures time; a test should also measure on its input timestamps, as
 /// `part_retention_tests` does. A segment first appears at the end of its
-/// own `EXTINF`; a playlist's duration is its `EXTINF` total. Call
+/// own `EXTINF`; a playlist's duration is its `EXTINF` total. It can step
+/// back, when a run ends with its media after a part clamped to the part
+/// target: the open parts' spans counted the hole, and the segment's
+/// `EXTINF` does not. Call
 /// [`RetentionCheck::check`] after every push, so that no entry joins and
 /// leaves the window between calls.
 ///
@@ -555,7 +558,11 @@ impl RetentionCheck {
             .open_parts()
             .iter()
             .fold(Duration::ZERO, |sum, part| sum.saturating_add(part.span));
-        self.published = self.published.max(self.closed.saturating_add(open));
+        // The muxer's own clock, exactly: it steps back when a run ends
+        // with its media after a clamped part, whose span (with the hole)
+        // the open parts had counted. Retention then runs longer in real
+        // time, never shorter, and the muxer's stamps are on this clock.
+        self.published = self.closed.saturating_add(open);
         let early = (m.parts_released_early(), m.segments_released_early());
         let (parts_excused, segments_excused) = (
             early.0 != self.released_early.0,

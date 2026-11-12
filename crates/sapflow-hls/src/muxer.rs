@@ -113,6 +113,9 @@ const BREAK_GAP: i64 = 90_000;
 /// second).
 const LATE_AUDIO_WINDOW: i64 = 180_000;
 
+/// The most epochs [`Muxer::take_late_audio_loss`] keeps undrained.
+const MAX_LATE_LOST: usize = 16;
+
 /// The longest valid Opus packet, 120 ms, in 90 kHz ticks.
 const OPUS_MAX_PACKET_TICKS: i64 = 10_800;
 
@@ -175,7 +178,11 @@ pub struct Part {
     /// Media time from this part's start to the next part's start. Equal to
     /// `duration` unless a long frame was clamped to fit the part target, in
     /// which case it includes the gap that left before the next frame. The
-    /// spans of a segment's parts add up to the segment's duration.
+    /// spans of a segment's parts add up to the segment's duration, except
+    /// where the run then ended: its segment ends with its media, so its
+    /// last part's span can run past the segment's end (a part is sealed,
+    /// and shared, before the run is known to end). The time of a part's
+    /// media is in its own fragment.
     pub span: Duration,
     /// Whether the part can be decoded independently (`INDEPENDENT=YES`): a
     /// video keyframe, or complete audio-only AAC frames or Opus packets.
@@ -324,7 +331,9 @@ pub struct Update {
     pub restarted: bool,
     /// Definite input continuity failure within a run. Intentional detach or
     /// codec-epoch replacement is not loss; a file containing a failed run
-    /// must not later be presented as a complete recording.
+    /// must not later be presented as a complete recording. It excludes
+    /// late audio dropped after a cut on a continuing clock, which belongs
+    /// to the epoch the cut ended: see [`Muxer::take_late_audio_loss`].
     pub media_loss: bool,
 }
 
@@ -524,6 +533,12 @@ pub struct Muxer {
     /// The codec epochs (init ids) that lost late audio since
     /// [`Muxer::take_late_audio_loss`] last ran.
     late_lost: Vec<u64>,
+    /// Late audio frames dropped, ever.
+    late_dropped: u64,
+    /// Test bookkeeping: the segments a run end closed, since the last
+    /// [`Muxer::take_run_ends`].
+    #[cfg(any(test, feature = "testing"))]
+    run_ends: Vec<u64>,
     /// Where the old run ended, after a cut on a continuing clock and
     /// until the new keyframe arrives: an interrupt in between resumes the
     /// next run there.
@@ -757,6 +772,9 @@ impl Muxer {
             open_at_keyframe: false,
             late_audio: None,
             late_lost: Vec::new(),
+            late_dropped: 0,
+            #[cfg(any(test, feature = "testing"))]
+            run_ends: Vec::new(),
             cut_end: None,
             placed_audio: None,
             entries: VecDeque::new(),
@@ -812,6 +830,8 @@ impl Muxer {
             open_at_keyframe,
             late_audio,
             late_lost,
+            late_dropped,
+            run_ends: _,
             cut_end,
             placed_audio,
             entries,
@@ -944,7 +964,7 @@ impl Muxer {
              {timing:?} {learning:?} {target:?} {offset} {rebase_to:?} \
              {presented_end:?} {audio_floor} {discontinuity_next} \
              {discontinuity_sequence} {breaks} {hold_gap} {window_byte_capped} \
-             {last_frame_ticks:?} {:?} {open_at_keyframe} {late_audio:?} {late_lost:?} \
+             {last_frame_ticks:?} {:?} {open_at_keyframe} {late_audio:?} {late_lost:?} {late_dropped} \
              {cut_end:?} {placed_audio:?}",
             init.id,
             init.data.len(),
@@ -1192,6 +1212,32 @@ impl Muxer {
     /// the next one, is the one missing the audio.
     pub fn take_late_audio_loss(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.late_lost)
+    }
+
+    /// How many late audio frames have been dropped since the muxer began
+    /// (see [`Muxer::take_late_audio_loss`]), for counters.
+    pub fn late_audio_dropped(&self) -> u64 {
+        self.late_dropped
+    }
+
+    /// The segments that a run end (a break, an interrupt, a cut or a
+    /// refusal) closed since the last call, by media sequence number: each
+    /// must end with its media. For the fuzz targets.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn take_run_ends(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.run_ends)
+    }
+
+    /// Notes that a run end is closing the open segment, for
+    /// [`Muxer::take_run_ends`].
+    fn note_run_end(&mut self) {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(segment) = &self.next_segment
+            && !segment.parts.is_empty()
+        {
+            self.run_ends.push(segment.id);
+        }
     }
 
     /// The id of the first part cut under the current init segment (zero until
@@ -1766,6 +1812,7 @@ impl Muxer {
             _ => end,
         };
         if closed {
+            self.note_run_end();
             self.rotate_segment(end, now, false)?;
         } else {
             self.next_segment = None;
@@ -1855,6 +1902,10 @@ impl Muxer {
 
     fn note_late_loss(&mut self, epoch: u64) {
         if !self.late_lost.contains(&epoch) {
+            // Bounded for a caller that never drains it: the oldest go.
+            if self.late_lost.len() >= MAX_LATE_LOST {
+                self.late_lost.remove(0);
+            }
             self.late_lost.push(epoch);
         }
     }
@@ -1871,6 +1922,7 @@ impl Muxer {
             return false;
         }
         late.dropped += 1;
+        self.late_dropped += 1;
         let epoch = late.epoch;
         self.note_late_loss(epoch);
         true
@@ -2045,6 +2097,7 @@ impl Muxer {
             .map(|segment| segment.media_end);
         let closed = if let Some(end) = end {
             self.rebase_to = Some(end);
+            self.note_run_end();
             self.rotate_segment(end, now, false).is_ok()
         } else {
             self.next_segment = None;
@@ -2085,6 +2138,7 @@ impl Muxer {
             _ => end,
         };
         let result = if closed {
+            self.note_run_end();
             self.rotate_segment(end, now, false)
         } else {
             self.next_segment = None;

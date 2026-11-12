@@ -585,9 +585,13 @@ impl LiveStream {
     ///   one starts.
     /// - Audio stamped before a cut's keyframe can arrive after the cut
     ///   (FFmpeg's TS muxing leaves it up to 200 ms behind its video in
-    ///   file order). What the muxer had to drop of it belongs to the epoch
-    ///   the cut ended ([`Muxer::take_late_audio_loss`]), so that epoch's
-    ///   recording is marked, never the next one.
+    ///   file order). What the muxer had to drop of it is the one loss
+    ///   marked by its timestamp, not its place in stream order: it is
+    ///   charged to the epoch the cut ended ([`Muxer::take_late_audio_loss`])
+    ///   and marks that epoch's recording. With audio more than a whole
+    ///   epoch behind, the later epoch can be charged with an earlier one's
+    ///   audio; the earlier file is then marked as well, as its window
+    ///   closed short.
     /// - So a recording whose epoch may still lose late audio
     ///   ([`Muxer::late_audio_epoch`]) is held, not finished, until that
     ///   window closes: at the latest two seconds of video after the cut,

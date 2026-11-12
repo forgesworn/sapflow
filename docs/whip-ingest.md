@@ -1047,20 +1047,28 @@ The cut itself loses nothing the muxer holds:
   keyframe that is decided once the first part has closed fits no part
   (in a recording it would come before the file's first video): it is
   dropped, and so is the held frame at a cut if it is such a frame.
-- **A loss is marked on the recording that would have held the lost
-  media.** Late audio belongs to the file its timestamp falls in, which is
-  the outgoing one, so a dropped late frame marks the old file `media-loss`
-  and never the next one. The muxer counts it against the old epoch
-  (`Muxer::take_late_audio_loss`), not in the new run's `media_loss`, and
-  the server keeps the old recording open, not yet finished, while its late
-  audio may still come (`Muxer::late_audio_epoch`): until audio stamped at
-  or after the keyframe arrives, two seconds of video after the keyframe, a
-  change of audio configuration, or the next cut or the end of the
-  connection. Marks for anything later in stream order still go to the
-  current recording. If the window closes before audio has reached the
-  keyframe and the audio received ends more than one audio frame short of
-  it, the old file is marked too. That over-marks an encoder that simply
-  stopped sending audio before the change.
+- **Late audio is the one loss marked by its timestamp.** Every other
+  loss marks the recording current at the loss's place in stream order
+  (Which recording a loss marks, below). Late audio the muxer drops after
+  a cut is charged instead to the epoch its timestamp falls in, the one
+  the cut ended, and marks that epoch's file, held open as the outgoing
+  recording. The muxer counts it (`Muxer::take_late_audio_loss`), not in
+  the new run's `media_loss`, and the server keeps the outgoing recording
+  open, not yet finished, while its late audio may still come
+  (`Muxer::late_audio_epoch`): until audio stamped at or after the
+  keyframe arrives, two seconds of video after the keyframe, a change of
+  audio configuration, or the next cut or the end of the connection. Only
+  late-audio marks go to the held file; everything else still goes to the
+  current recording. With audio lagging by more than a whole epoch, the
+  second cut's window starts in the first epoch's time, so first-epoch
+  audio dropped after it is charged to the second epoch: the first file
+  is then marked as well, by the short audio at its own window's close.
+- **When the window closes before audio has reached the keyframe,** with
+  the audio received more than one audio frame short of it, the old file
+  is marked too. That over-marks an encoder that simply stopped sending
+  audio before the change, and asymmetrically: the file before the change
+  is marked, while the file after it, which has no audio at all, is
+  finalised, since a file is not marked for audio it never had.
 - **At a reconnect or the end of a stream** no clock carries on. The held
   video frame lasts as long as the frame before it did (with no frame
   before it, the SPS frame rate's interval, else 1/30 s), or until the end
@@ -1079,7 +1087,7 @@ video, 1 and 15; and the end of every video-led stream lost its last video
 frame and AAC frame. None was marked. Now every frame comes out in each
 case. With the fixture's audio arriving behind its video, through the
 elementary-stream path (the server test
-`late_audio_at_a_resolution_change_marks_only_the_file_it_belonged_to`):
+`late_audio_dropped_at_a_resolution_change_marks_the_outgoing_file`):
 
 | Audio behind video | First file (video, AAC) | Second file | AAC dropped | First file marked |
 | --- | --- | --- | --- | --- |
@@ -1110,8 +1118,9 @@ Left open:
   target) still drops the frame before it without saying so.
 - Late audio that joins the new run's first part is kept, in the new
   file, and is not counted as a loss: the old file's audio then ends short
-  of its video by those frames (by up to 200 ms behind in the table
-  above), unmarked. Marking it would mark the old file at nearly every
+  of its video by those frames, unmarked: by at most about the new run's
+  first part (up to `PART-TARGET`, more at low frame rates, where the
+  part target is longer). Marking it would mark the old file at nearly every
   resolution change from an FFmpeg TS source.
 - Within a continuous run, a frame longer than the open part's room (a
   stall, or the held frame across a loss gap) is cut to `PART-TARGET` and
@@ -1123,14 +1132,42 @@ Left open:
   its parts only with a part at `PART-TARGET`. A render cannot tell that
   from a hole a run's end should not keep: a continuous run publishes a
   segment ending at the keyframe it expects, and a break can then drop
-  that keyframe (found by `muxer_timing`). So the tests of cuts check from
-  the muxer that every segment ending a run lasts as long as its parts.
-  A run that breaks or is interrupted right after a clamped part now also
-  ends its segment with its media, and the next run resumes there (also
-  found by `muxer_timing`; both inputs are in
-  `fuzz/regressions/muxer_timing`). Both checks allow each part two units
-  of the fifth decimal for its tick rounding: an audio-only part's
-  duration is rounded up from its samples (found by `ts_ingest`).
+  that keyframe. So the muxer, under the `testing` feature, names the
+  segments a run end closed (a break, an interrupt, a cut, a refusal;
+  `Muxer::take_run_ends`), and `muxer_timing` checks that each ends with
+  its media: its `EXTINF` is its parts' spans with the last part's
+  duration. The interrupt tests check the same of every segment that a
+  discontinuity follows. `muxer_timing`'s `CUT1` inputs also cut
+  on a continuing clock (`reconfigure_with_audio_at`) with audio behind,
+  and check that late audio is only charged to an epoch already left.
+  A run that breaks or is interrupted right after a clamped part now ends
+  its segment with its media and the next run resumes there; that part's
+  span, set when it was sealed and already shared, still runs to the next
+  frame, so a recording takes its length from its parts' own timestamps,
+  not their spans. The regression files: in `fuzz/regressions/muxer_timing`,
+  `clamped-part-before-a-break` guards the muxer (it fails the run-end
+  check on the muxer before this change), and so does the seed
+  `fuzz/seeds/muxer_timing/cut-after-a-pause` (a 300 ms pause before a
+  continuing cut); the seeds `cut-with-audio-300ms-behind` and
+  `cut-with-audio-1s-behind` drive late audio through the window; `clamped-part-inside-a-run-before-a-break`
+  and `clamped-segment-then-a-break` guard the checker against being too
+  strict, as does `fuzz/regressions/ts_ingest/audio-only-part-rounding`
+  (each part is allowed two units of the fifth decimal for its tick
+  rounding: an audio-only part's duration is rounded up from its samples).
+  `cut-and-interrupt-in-one-record` keeps `CUT1` checking retention after
+  every call into the muxer, as `RetentionCheck` requires: checked once
+  for a cut, a frame and an interrupt together, it saw a part freed
+  5.74 s after its tag left, because the muxer stamps a tag's removal
+  when it happens inside the batch, not when the batch is rendered.
+  `RetentionCheck` now follows the muxer's clock exactly, which steps
+  back when a run ends with its media after a clamped part (the open
+  parts' spans counted the hole); retention then runs longer in real
+  time, not shorter.
+- The muxer stamps a part tag's removal at the edge it has when the tag
+  leaves, which inside one ingest batch can be before the batch's render:
+  a client then has the part for three target durations less the rest of
+  that batch's media. A batch is normally one frame (WHIP) or one SRT
+  datagram's worth.
 - A cut's own losses (the held frame, or audio past the part and segment
   limits at a reconnect-style cut) are still in the new run's
   `media_loss`, and the server still marks both files for them, as for

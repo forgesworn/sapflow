@@ -65,14 +65,24 @@ Notes for the release after 0.2.0-rc.1.
   The fragment budget's use moves with it at an interrupt, where more
   media is now kept. A cut on a continuing clock ends the old segment with
   its media, so `EXTINF` is the sum of its parts and a video pause before
-  the new keyframe falls at the discontinuity; `RuleCheck` and
-  `scripts/check-playlist.py` now check that sum. Audio stamped before the
-  new keyframe that has to be dropped belongs to the old epoch: it is not
-  in the new run's `media_loss` but counted by the new
+  the new keyframe falls at the discontinuity. `RuleCheck` and
+  `scripts/check-playlist.py` now check that sum, and allow a longer
+  segment only when one of its parts is exactly `PART-TARGET` (a clamped
+  stall, whose hole the next part's time carries). Audio stamped before
+  the new keyframe that has to be dropped belongs to the old epoch: it is
+  not in the new run's `media_loss` but counted by the new
   `Muxer::take_late_audio_loss`, and `Muxer::late_audio_epoch` says while
-  it may still come. The server holds the old recording open until then
-  and marks it, not the next file, `media-loss`. A break or interrupt
-  right after a frame clamped to `PART-TARGET` (a stall) now ends the
-  segment with its media and resumes the next run there, for SRT and RTMP
-  as for WHIP, where `EXTINF` used to include the stall's hole before the
-  discontinuity.
+  it may still come. A library caller that records should drain
+  `take_late_audio_loss()` after every push and interrupt and mark the
+  recording of each epoch it names, and should hold the outgoing
+  recording open, not finish it, while `late_audio_epoch()` names that
+  recording's epoch; sapflow's server does both, and marks the old file,
+  not the next one, `media-loss`. `Muxer::late_audio_dropped` counts the
+  frames, and WHIP's session-end loss counts include them
+  (`late_audio=`). A break or interrupt right after a frame clamped to
+  `PART-TARGET` (a stall) now ends the segment with its media and resumes
+  the next run there, for SRT and RTMP as for WHIP, where `EXTINF` used to
+  include the stall's hole before the discontinuity. A recording's length
+  (`segmentDuration` and the file's header) now comes from its parts' own
+  timestamps (`fmp4::rebase_part_for_file_timed`), not their spans, which
+  over-reported a file by a clamped stall's hole at such a break.
