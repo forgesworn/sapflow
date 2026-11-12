@@ -16,8 +16,11 @@ OpenSSL 4 is used only as a black box.
 
 ## The profile
 
-Everything outside it is refused with a fatal alert and a typed
-`Error`.
+Everything outside it is refused with a typed `Error`. Under the read keys,
+or for a certificate that matches the offer, that ends the handshake with a
+fatal alert. An unauthenticated (epoch 0) message is refused silently
+instead, and the handshake waits for the genuine one; `Server::refused` gives
+the reason (see What ends a handshake, below).
 
 - DTLS 1.2, server role. A hello that also offers 1.3 is answered with 1.2;
   `supported_versions` and `key_share` are ignored, and the server random
@@ -70,11 +73,11 @@ if let Some(Event::Connected(c)) = dtls.poll_event() {
 |--------|------|
 | `record` | Record framing, the 48-bit sequence number, epoch 1 AES-128-GCM (explicit nonce read from the wire, 13-byte AAD over the plaintext length) and the 64-record replay window, applied to epoch 1 only |
 | `message` | The handshake header and fragments; parsers for ClientHello (with every extension the profile reads), Certificate, ClientKeyExchange, CertificateVerify and Finished; builders for our flight; negotiation |
-| `reassembly` | Fragment reassembly with caps on message size, coverage-adding fragments per message and bytes buffered, checked before allocation; overlapping and out-of-order fragments; duplicates dropped without counting; a conflicting fragment for the same seq kept as one of at most four candidates, so it does not block the real message while the buffer has room; a candidate over the fragment cap dropped when the seq has another; the first-started complete candidate released |
+| `reassembly` | Fragment reassembly with caps on message size, coverage-adding fragments per candidate and bytes buffered, checked before allocation; an empty fragment of a non-empty message dropped before allocation; overlapping and out-of-order fragments; a fragment joins every candidate whose bytes it agrees with and starts another otherwise, at most four per seq; duplicates dropped without counting; a candidate over the fragment cap removed and its bytes freed; room reclaimed, paced, from stalled or younger unauthenticated candidates; messages taken in seq order, the seq moving on only when the server accepts one; a fragment over a cap reported, for the server to drop at epoch 0 or fail on at epoch 1 |
 | `flight` | Our flights kept as plaintext and re-recorded on each send (new sequence numbers and nonces), fragmented to the MTU |
 | `crypto` | The TLS 1.2 PRF, extended master secret, key block, Finished and the RFC 5705 exporter |
 | `identity` | Our certificate, fingerprints, the peer's P-256 key |
-| `server` | The state machine, timers, retransmission and the bounds below |
+| `server` | The state machine: it admits fragments by seq, type, epoch and length, and refuses an unauthenticated message without ending the handshake. Timers, retransmission and the bounds below |
 
 ## Bounds and defaults
 
@@ -111,6 +114,111 @@ datagram is accepted, and that is the cookie's purpose (RFC 6347 section
 4.2.1 allows turning it off where amplification is not a problem). It saves
 a round trip. Turning it on works (A2.1 runs it against OpenSSL).
 
+## What ends a handshake, and what is dropped
+
+Epoch 0 input is not authenticated: anyone who can spoof the peer's address
+can send it. Following RFC 6347 section 4.1.2.7, which has invalid records
+discarded rather than answered, the server keeps such input from ending the
+handshake, and the genuine flight can still complete it. Each of these is
+dropped and counted in `Stats::records_dropped`:
+
+- every epoch 0 alert, fatal or `close_notify`, before and after the
+  client's ChangeCipherSpec;
+- an epoch 0 fragment that cannot belong to the message expected at its
+  seq, checked before anything is kept for it. A ClientHello is expected at
+  the next seq until a hello is answered; then Certificate,
+  ClientKeyExchange (2 to 66 bytes) and CertificateVerify (5 to 76 bytes)
+  at epoch 0, and Finished (12 bytes) only at epoch 1. So once
+  CertificateVerify is accepted, no epoch 0 handshake data is kept at all;
+- an epoch 0 fragment that declares more than `max_message_len`, would take
+  reassembly past `max_buffered`, or takes its candidate past
+  `max_fragments` (that candidate is removed), and an empty fragment of a
+  message that is not empty;
+- a complete epoch 0 message that fails a check made before any ECDH or
+  verification: a hello that does not parse, is outside the profile or has
+  run out of HelloVerifyRequests; a Certificate that does not parse, is
+  empty or does not match the offer; a ClientKeyExchange without a valid
+  uncompressed P-256 point; a CertificateVerify that does not parse or uses
+  another scheme. It is discarded on its own: the seq stays, and its other
+  candidates are kept. `Server::refused` gives the reason.
+
+A client that really aborts, or really sends such a message, gets no alert
+and is ended by the caller's handshake deadline.
+
+Reassembly keeps forged bytes from displacing genuine ones. A fragment joins
+every candidate whose bytes it agrees with and starts a new candidate
+otherwise, so it never overwrites bytes already received, and a forged
+fragment that arrives first does not hold the seq: the genuine message
+starts its own candidate. When a new candidate does not
+fit its seq's four slots or the buffer, room is reclaimed from
+unauthenticated candidates that are still incomplete: first those started at
+least `initial_retransmit` ago; then, at most once per `initial_retransmit`,
+later seqs' candidates when the newcomer is the next message, and the
+oldest for the newcomer's own seq. Authenticated input takes room from
+unauthenticated candidates at once. No limit changes, and none of this
+touches the transcript or a timer. A finite burst of forgeries therefore
+holds the genuine flight up for a bounded time, but not always none: forged
+candidates give way once they are `initial_retransmit` old, and a genuine
+message that a forged byte has split between two candidates completes on
+the client's next retransmission. In the worst case found (the slots full,
+replacement spent, and a forged byte inside a later fragment's range) that
+is two of the client's retransmissions. Round 4 of the A4.4 review found
+cases where a finite burst still holds the flight until the deadline; they
+are listed under "Open" below.
+
+These still end the handshake, with one fatal alert where `Error::alert`
+names one:
+
+- anything under the read keys (epoch 1, after the client's
+  ChangeCipherSpec), from the peer whose flight we answered: handshake data
+  that cannot be valid there, a reassembly bound broken, a wrong Finished, a
+  fatal alert, or `close_notify` before the handshake completes;
+- a certificate that matches the offer but cannot be used
+  (`BadCertificate`, `UnsupportedCertificate`): those bytes are the offer's,
+  whoever sent them;
+- a CertificateVerify signature that fails the one verification.
+
+What forged epoch 0 input can still do, each bounded by the caller's
+handshake deadline. Each is to be accepted as inherent, pending the owner's
+written acceptance (A4.4):
+
+- A plausible substituted ClientHello, ClientKeyExchange or
+  CertificateVerify that reaches the state machine before the genuine one.
+  A hello the profile accepts is answered in place of the genuine one. A
+  valid point spends the one ECDH, and the genuine CertificateVerify then
+  fails. A well-formed signature spends the one verification and fails. None
+  can be told from the genuine message until the transcript is proved, and
+  the bound of one signature, one ECDH and one verification is kept rather
+  than spent on retries. The smallest is 37 bytes: a CertificateVerify
+  queued ahead.
+- Continuous injection or flooding. An attacker who keeps sending can keep
+  refilling the slots and the buffer, or keep winning the race above.
+  Reclaiming bounds a finite burst, not a sustained one.
+
+Open: round 4 of the A4.4 review (12 November 2026) found four more ways
+forged epoch 0 input can end or hold a handshake. They are not fixed yet:
+
+- Two complementary forged candidates, each disagreeing with a different
+  genuine fragment, can absorb every genuine retransmission. Stalled
+  candidates are reclaimed only when a new candidate does not fit, and a
+  fragment that agrees with a candidate never starts one, so neither is
+  reclaimed. About 200 forged bytes hold the handshake until the deadline.
+- A CertificateVerify whose signature is not valid DER is accepted by the
+  message parser, counted as the one verification and then fails
+  decoding, which ends the handshake at once. 30 bytes queued ahead do it,
+  and so can a buggy peer.
+- With a smaller `max_buffered` than the default (for example 512 bytes),
+  complete forged messages at a later seq can leave too little room for the
+  expected Certificate. Nothing reclaims complete candidates, so the
+  handshake waits until the deadline. The default 16 KiB is not affected.
+- The first outgoing record mirrors the ClientHello's record sequence
+  number. A ClientHello at the top of the sequence space leaves no room for
+  the server's flights, and the handshake fails after the server has
+  signed. A buggy peer can do this too.
+
+Behind ICE, only an attacker who can spoof the selected address pair can
+send any of this, apart from the two cases a buggy peer can trigger.
+
 ## Dependencies
 
 Only RustCrypto, pinned exactly: `p256` 0.14.0, `ecdsa` 0.17.0,
@@ -139,7 +247,9 @@ is 1.94.
 - A2.2: every W0 ClientHello capture gets a correct first flight, then times
   out cleanly (no browser key to continue); one test per malformed,
   oversized, out-of-order and retransmitted case.
-- A2.3: a mismatched fingerprint is refused with `bad_certificate`.
+- A2.3: a mismatched fingerprint is refused and never accepted. At epoch 0
+  that is silent, with `Server::refused` giving `FingerprintMismatch`, and
+  the handshake times out.
 - A2.4: fuzz targets `dtls_record`, `dtls_server` and
   `dtls_handshake_messages` (`fuzz/`).
 

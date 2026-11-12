@@ -372,7 +372,7 @@ fn handshake_deadline() {
     run_until(s, t0 + Duration::from_secs(10));
     assert_eq!(s.state(), State::Ended(EndReason::HandshakeTimeout));
     // Nominated, but DTLS never completes: the hello is answered and the
-    // client's flight never comes.
+    // client goes quiet. Nothing was refused, so it is a plain timeout.
     let (mut p, mut a, t0) = setup(10, &[GCM]);
     let s = &mut a.session;
     let c = p.check(true);
@@ -389,8 +389,12 @@ fn handshake_deadline() {
     assert_eq!(p.misdirected, 0);
 }
 
+/// The client's certificate does not match the offer. sapflow-dtls refuses
+/// it without an alert, since at epoch 0 a forger could have sent it, so
+/// the session never connects. At its handshake deadline it ends as the
+/// DTLS failure it was, with its reason.
 #[test]
-fn fingerprint_mismatch_ends_the_session() {
+fn fingerprint_mismatch_ends_the_session_at_the_deadline() {
     let t0 = Instant::now();
     let mut p = Publisher::new(11, &[GCM]);
     // The offer names another certificate than the one the client sends.
@@ -407,6 +411,11 @@ fn fingerprint_mismatch_ends_the_session() {
         }
         pending = p.receive(s);
     }
+    assert_eq!(s.state(), State::Handshaking);
+    assert!(!p.has_keys());
+    run_until(s, t0 + Duration::from_millis(9_999));
+    assert_eq!(s.state(), State::Handshaking, "not before the deadline");
+    run_until(s, t0 + Duration::from_secs(10));
     assert_eq!(
         s.state(),
         State::Ended(EndReason::Dtls(sapflow_dtls::Error::FingerprintMismatch))
@@ -1313,9 +1322,9 @@ fn unauthenticated_dtls_after_connect_is_discarded() {
         s.handle_datagram(t0 + ms(5), p.tuple, &d);
         let ev = events(s);
         // Each is one record dropped and counted, not a datagram refused:
-        // the three in epoch 0 fall through to sapflow-dtls's catch-all
-        // drop (server.rs:622), and only the bad tag reaches decryption,
-        // which fails (:629-630).
+        // the three in epoch 0 fall through to the catch-all drop of epoch
+        // 0 records in sapflow-dtls's `Server::record`, and only the bad
+        // tag reaches decryption, which fails.
         let dtls = s.stats().dtls;
         assert_eq!(dtls.records_dropped, 1, "{name}");
         assert_eq!(dtls.datagrams_dropped, 0, "{name}");

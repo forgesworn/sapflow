@@ -834,6 +834,14 @@ impl EndCounts {
     }
 }
 
+/// The DTLS error a session ended with, for its end log line.
+fn dtls_reason(reason: EndReason) -> Option<sapflow_dtls::Error> {
+    match reason {
+        EndReason::Dtls(e) => Some(e),
+        _ => None,
+    }
+}
+
 /// An end reason's name for its count: the server's cause when it closed
 /// the session, else the session's own.
 fn end_name(reason: EndReason, cause: Option<CloseCause>) -> &'static str {
@@ -1271,21 +1279,32 @@ impl Owner {
         self.whip.settled(&id);
         let name = end_name(reason, self.closing.remove(&id));
         let count = self.whip.ends.add(name);
+        // For a DTLS failure, which: one of sapflow-dtls's error variants,
+        // so bounded, and nothing of the peer's beyond an alert code.
+        let dtls = dtls_reason(reason).map(tracing::field::debug);
         let Some(mut feed) = self.feeds.remove(&id) else {
             // Its feed panicked and was dropped, marking the recording.
-            tracing::info!(reason = name, count, "WHIP session ended");
+            tracing::info!(reason = name, dtls, count, "WHIP session ended");
             return;
         };
         let logged = contained(|| {
             feed.ended(reason);
             let (lost, losses) = (feed.lost(), feed.counts());
-            tracing::info!(reason = name, count, lost, %losses, "WHIP session ended");
+            tracing::info!(
+                reason = name,
+                dtls,
+                count,
+                lost,
+                %losses,
+                "WHIP session ended"
+            );
         });
         if logged.is_none() {
             // The session has gone already: mark its recording still.
             let _ = contained(|| feed.panicked());
             tracing::warn!(
                 reason = name,
+                dtls,
                 count,
                 "WHIP session ended; its feed panicked"
             );

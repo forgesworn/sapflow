@@ -1690,6 +1690,10 @@ instead of observed.
   each refused or handled within the caps, with one test per case.
 - **A2.3 Fingerprint.** A peer certificate that does not match the offer's
   fingerprint is refused. Fails if any build or test flag can skip the check.
+  Since the third round of the A4.4 review, the refusal sends no alert, since
+  at epoch 0 a forger could have sent the certificate. The handshake waits
+  for one that matches, and the session ends at its handshake deadline as
+  the DTLS failure it was (`dtls-failed`, `FingerprintMismatch`).
 - **A2.4 Fuzzing.** Records and each handshake message have fuzz targets, held
   to A1.3's corpus and coverage rules.
 
@@ -1711,6 +1715,14 @@ Implementation notes (11 November 2026):
   - A peer's retransmission triggers a resend only when it repeats the
     start of the hello we answered (the version and random included), or
     when an authenticated Finished arrives again after the handshake.
+  - Epoch 0 input never ends a handshake by breaking a bound, as an alert,
+    or as a message that fails a check made before any ECDH or
+    verification: it is dropped and counted, and the genuine flight can
+    still complete. Fragments are admitted by seq, type, epoch and length
+    before anything is kept, and reassembly reclaims room from stalled
+    forgeries once they are a retransmission interval old. Input under the
+    read keys still fails the handshake. See Epoch 0 injection below and
+    the crate README.
 - **A2.1.** OpenSSL 4.0.3 `s_client` matched our exported keying material
   byte for byte in eight runs. Both profiles ran, with 300-byte MTUs, a
   dropped first flight, a dropped final flight and the cookie exchange. The
@@ -1738,10 +1750,63 @@ Implementation notes (11 November 2026):
   - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
     timer doubling to 60 s, six sends), an unanswered flight 4 runs to
     about 63 s before `Error::Timeout`.
-  - **Epoch 0 injection.** An unauthenticated epoch 0 packet, such as a
-    forged fatal alert, can end a handshake. W3 limits the damage:
+  - **Epoch 0 injection.** Epoch 0 input is not authenticated. Rounds 2
+    and 3 of the A4.4 review (12 November 2026) found that one forged packet
+    could end a handshake or hold it until the deadline. Round 2: a 25-byte
+    fragment declaring 8193 bytes, one over the buffer budget, or a 15-byte
+    fatal alert, even after ChangeCipherSpec. Round 3: a 25-byte zero-length
+    Certificate, an epoch 0 Finished (even one queued early), 52 bytes of
+    fragments holding the whole buffer, four forged candidates holding a
+    message's slots, and a forged fragment overwriting genuine bytes. Now:
+    - every epoch 0 alert is dropped;
+    - fragments are admitted by seq, type, epoch and a length the parser
+      could accept, before anything is kept, so after CertificateVerify no
+      epoch 0 handshake data is kept, and a Finished is kept only at
+      epoch 1;
+    - a complete epoch 0 message that fails a check made before any ECDH or
+      verification is refused without moving the handshake on or dropping
+      the other candidates. That covers a hello outside the profile, a
+      certificate that does not match the offer, a bad key share and
+      another verify scheme;
+    - a fragment that disagrees with bytes already received starts its own
+      candidate rather than overwriting them, and reassembly reclaims room
+      from stalled or younger forged candidates, paced by the
+      retransmission interval.
+
+    Each is counted in `records_dropped`, `Server::refused` gives the reason
+    for the last refused message, and the genuine flight still completes.
+    A client that really aborts or sends such a message now ends at the
+    handshake deadline, with no alert. A certificate that matches the offer
+    but cannot be used, a failed signature verification and anything under
+    the read keys still end the handshake at once.
+
+    Forged epoch 0 input can still do two things. Each is to be accepted as
+    inherent, pending the owner's written acceptance for A4.4:
+    - **Plausible substitution.** A plausible substituted ClientHello,
+      ClientKeyExchange or CertificateVerify that reaches the state machine
+      before the genuine one spends the one signature, ECDH or verification
+      and fails the handshake. The smallest is a 37-byte CertificateVerify
+      queued ahead. None can be told from the genuine message until the
+      transcript is proved.
+    - **Continuous injection or flooding.** This can keep refilling the
+      slots and the buffer. Reclaiming bounds a finite burst, not a
+      sustained one.
+
+    Round 4 (on 89bd367) found four more, which are open and not fixed:
+    two complementary forged candidates that absorb every genuine
+    retransmission without triggering reclamation; a CertificateVerify
+    whose signature is not valid DER ending the handshake at once (a buggy
+    peer can do this too); complete forged messages at a later seq
+    blocking the expected Certificate when `max_buffered` is set below the
+    default; and a ClientHello at the top of the record sequence space
+    exhausting the server's outgoing sequence after it has signed (a buggy
+    peer can do this too). The crate README describes each. So a finite
+    burst can still hold a handshake until the deadline. See
+    [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
+
+    W3 limits the damage:
     - each `Server` receives only datagrams from its selected ICE-validated
-      5-tuple;
+      5-tuple, so only an attacker who can spoof that tuple can do either;
     - handshake failures are counted by reason, without addresses;
     - the publisher recovers with a new WHIP `POST`.
 
@@ -1860,7 +1925,11 @@ Implementation notes (W3a, 11 November 2026):
     lists it there.
   - The handshake deadline is the session's (10 s), so `sapflow-dtls`'s
     63 s timeout never runs. A DTLS failure ends the session with
-    `EndReason::Dtls` and its reason, for W3c to count.
+    `EndReason::Dtls` and its reason, for W3c to count. An unauthenticated
+    message that `sapflow-dtls` refuses, such as a certificate that does
+    not match the offer, does not end it at once. At its deadline the
+    session ends as `EndReason::Dtls` with the reason `Server::refused`
+    holds, and as `HandshakeTimeout` only when nothing was refused.
 - **Gate 1, in process.** For both SRTP profiles a scripted publisher (the
   test STUN client, the `sapflow-dtls` test client, `sapflow-rtp`'s SRTP
   protect) sends H.264 in STAP-A and FU-A and Opus. The session emits
@@ -2182,8 +2251,13 @@ Implementation notes (W3c part 2a, lifecycle):
   (`handshake-timeout`, `consent-expired`, `dtls-failed`, `peer-closed`,
   `media-timeout`, `keys-exhausted`, `panicked`) or, when the server
   closed it, why (`deleted`, `superseded`, `ingest-ended`, and `panicked`
-  for a panic in its feed or its ingest). Each end is
-  logged with its reason and that reason's count; no address is logged.
+  for a panic in its feed or its ingest). A handshake that reaches its
+  deadline after `sapflow-dtls` refused an unauthenticated message, such as
+  a certificate that does not match the offer, is `dtls-failed`;
+  `handshake-timeout` is one where nothing was refused. Each end is logged
+  with its reason and that reason's count, and a `dtls-failed` end with
+  the DTLS error, one of `sapflow-dtls`'s error variants. No address and
+  no other peer data is logged.
 
 | Claim | Test | Status |
 |---|---|---|
@@ -2202,6 +2276,7 @@ Implementation notes (W3c part 2a, lifecycle):
 | No build without test targets contains the panic hooks (`cargo build --release -p sapflow`, `cargo build -p sapflow`) | `scripts/whip-e2e.js` (the binary it runs is searched for their markers) | Met |
 | A build with the test targets (`--all-targets`) contains `sapflow-whip`'s hooks, and they do nothing unless a test turns them on | `router::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on` (sapflow-whip), `whip::tests::the_panic_hooks_do_nothing_unless_a_test_turns_them_on` | Met in process; the server never calls `Router::enable_panic_hooks` |
 | End reasons are counted by name | `whip::tests::every_end_reason_has_a_name`, and the counts asserted in the A3.2, A3.3 and A3.4 tests | Met |
+| A fingerprint mismatch ends at the handshake deadline as `dtls-failed` with `FingerprintMismatch`; a client that goes quiet ends as `handshake-timeout` | `whip::tests::a_fingerprint_mismatch_is_a_dtls_failure_at_the_deadline`, `whip::tests::a_handshake_timeout_releases_with_no_callback`; `tests::fingerprint_mismatch_ends_the_session_at_the_deadline`, `tests::handshake_deadline` (sapflow-whip) | Met in process (the server's deadline shortened to 1 s) |
 | `SAPFLOW_WHIP_STALE` | `config::tests::whip_is_off_unless_its_address_is_set` | Met |
 
 - **Left to W3c part 2b.** Done in part 2b, below, apart from what it
@@ -2319,7 +2394,7 @@ Implementation notes (W3c part 2b, limits, 12 November 2026):
 | A3.7: a captured check re-sent from a fresh address draws nothing once its original has arrived, while its ID is remembered | `whip::tests::a_fresh_address_draws_nothing`; the session harness's oracle, over its seeds and mutations | Met in process |
 | A3.7: any mix of re-sent checks and copied SRTP from an address draws at most four times what it sent | the session harness (per tuple) and the router harness (per tuple, across sessions) | Met in the harnesses and the fuzz targets |
 | A3.7: a session with no completed handshake is gone 10 s after its `201`; one without consent checks 30 s after the last | `tests::handshake_deadline`, `tests::consent_expires_30_s_after_the_last_check` (sapflow-whip); `whip::tests::a_handshake_timeout_releases_with_no_callback` (server, 1 s) | Met in process |
-| A3.7: each cap in [Concurrency and resource bounds](#concurrency-and-resource-bounds) refuses at its limit | Mapped here: signalling and pending caps (above), ICE-TCP's (`whip::tcp_tests`), the offer size (`whip_request::tests::routes_and_methods`, 413), RFC 4571 frame size (`framing::tests::too_long_frame_ends_the_stream`, `whip::tcp_tests::a_frame_over_the_cap_ends_the_connection`), the router's session cap (`router::tests::insert_refuses_past_the_cap_and_duplicates`), the receiver's event queue (`sapflow-rtp`'s `the_event_queue_is_bounded`), the H.264 depacketiser's buffers (`buffers_never_pass_their_bounds`), DTLS flight faults (`sapflow-dtls`'s `client_flight_faults_are_refused`) | Partial: the reorder buffer, the start hold, RTCP size, queued feedback, transport-cc and DTLS message size are bounded in their crates but not mapped to a refusal test here |
+| A3.7: each cap in [Concurrency and resource bounds](#concurrency-and-resource-bounds) refuses at its limit | Mapped here: signalling and pending caps (above), ICE-TCP's (`whip::tcp_tests`), the offer size (`whip_request::tests::routes_and_methods`, 413), RFC 4571 frame size (`framing::tests::too_long_frame_ends_the_stream`, `whip::tcp_tests::a_frame_over_the_cap_ends_the_connection`), the router's session cap (`router::tests::insert_refuses_past_the_cap_and_duplicates`), the receiver's event queue (`sapflow-rtp`'s `the_event_queue_is_bounded`), the H.264 depacketiser's buffers (`buffers_never_pass_their_bounds`), DTLS flight faults (`sapflow-dtls`'s `client_flight_faults_are_refused` and `unauthenticated_flight_faults_are_refused_silently`) | Partial: the reorder buffer, the start hold, RTCP size, queued feedback, transport-cc and DTLS message size are bounded in their crates but not mapped to a refusal test here |
 
 - **Left open after W3c part 2b.**
   - The packet-capture form of A3.7, on the wire.
@@ -2534,6 +2609,12 @@ that the inbound queue's back-pressure stays with the slow reader.
   `sapflow-rtp` is recorded, with every finding resolved or accepted in
   writing. A review by the author, or by an agent of the same session, does
   not count.
+  - Status, 12 November 2026: **not met yet.** Reviewed in four rounds,
+    recorded in
+    [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
+    The findings of rounds 1 to 3 are fixed. Round 4's four
+    handshake-availability findings are open. The residuals the record
+    states as inherent await the owner's written acceptance.
 
 ### Qualification status (12 November 2026)
 

@@ -33,7 +33,11 @@ pub mod alert {
     pub const FATAL: u8 = 2;
 }
 
-/// A bound that the peer reached.
+/// A bound that the peer reached. The three reassembly bounds
+/// ([`Limit::MessageSize`], [`Limit::Fragments`], [`Limit::Buffered`]) end
+/// a handshake only for a fragment under the read keys: an unauthenticated
+/// (epoch 0) fragment that would break one is dropped and counted in
+/// [`crate::Stats::records_dropped`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
     /// A handshake message declared a length above
@@ -56,6 +60,12 @@ pub enum Limit {
 /// Why the handshake failed or the association ended. Every variant except
 /// [`Error::Timeout`], [`Error::PeerAlert`] and [`Error::PeerClosed`] sends
 /// one fatal alert ([`Error::alert`]) before the server goes silent.
+///
+/// A variant is also the reason [`crate::Server::refused`] gives for an
+/// unauthenticated (epoch 0) message refused without ending the handshake,
+/// and then nothing is sent: a hello outside the profile, a certificate
+/// that does not match the offer, a bad key share or verify scheme, or a
+/// hello once HelloVerifyRequests have run out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -121,7 +131,8 @@ pub enum Error {
     /// [`crate::Config::max_transmissions`] sends of our flight.
     Timeout,
     /// The peer sent a fatal alert (or `close_notify` during the
-    /// handshake), with this description.
+    /// handshake) under the read keys, with this description. An epoch 0
+    /// alert is not authenticated, so it is dropped and counted instead.
     PeerAlert(u8),
     /// The peer closed the association with `close_notify`.
     PeerClosed,

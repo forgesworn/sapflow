@@ -258,12 +258,16 @@ impl From<EntropyError> for SessionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
     /// ICE and DTLS did not complete within
-    /// [`SessionConfig::handshake_timeout`].
+    /// [`SessionConfig::handshake_timeout`], and `sapflow-dtls` refused no
+    /// message on the way.
     HandshakeTimeout,
     /// No new successful check from the send tuple for
     /// [`IceConfig::consent_timeout`] (RFC 7675).
     ConsentExpired,
-    /// The DTLS handshake or association failed.
+    /// The DTLS handshake or association failed: at once, or at the
+    /// handshake deadline with the reason `sapflow-dtls` last refused an
+    /// unauthenticated message ([`sapflow_dtls::Server::refused`]), such as
+    /// a certificate that does not match the offer.
     Dtls(sapflow_dtls::Error),
     /// The publisher sent `close_notify`.
     PeerClosed,
@@ -931,7 +935,15 @@ impl Session {
         }
         let handshake = self.created.checked_add(self.config.handshake_timeout);
         if self.state != State::Connected && handshake.is_some_and(|d| now >= d) {
-            self.end(EndReason::HandshakeTimeout);
+            // sapflow-dtls refuses an unauthenticated message without ending
+            // the handshake, since a forger could have sent it. If the
+            // handshake has not completed by now, that refusal is the
+            // likely reason: it is reported as the DTLS failure it was.
+            let reason = self
+                .dtls
+                .refused()
+                .map_or(EndReason::HandshakeTimeout, EndReason::Dtls);
+            self.end(reason);
             return true;
         }
         if self.consent_expires().is_some_and(|d| now >= d) {
