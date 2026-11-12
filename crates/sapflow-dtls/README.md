@@ -162,7 +162,9 @@ candidates give way once they are `initial_retransmit` old, and a genuine
 message that a forged byte has split between two candidates completes on
 the client's next retransmission. In the worst case found (the slots full,
 replacement spent, and a forged byte inside a later fragment's range) that
-is two of the client's retransmissions.
+is two of the client's retransmissions. Round 4 of the A4.4 review found
+cases where a finite burst still holds the flight until the deadline; they
+are listed under "Open" below.
 
 These still end the handshake, with one fatal alert where `Error::alert`
 names one:
@@ -193,8 +195,29 @@ written acceptance (A4.4):
   refilling the slots and the buffer, or keep winning the race above.
   Reclaiming bounds a finite burst, not a sustained one.
 
+Open: round 4 of the A4.4 review (12 November 2026) found four more ways
+forged epoch 0 input can end or hold a handshake. They are not fixed yet:
+
+- Two complementary forged candidates, each disagreeing with a different
+  genuine fragment, can absorb every genuine retransmission. Stalled
+  candidates are reclaimed only when a new candidate does not fit, and a
+  fragment that agrees with a candidate never starts one, so neither is
+  reclaimed. About 200 forged bytes hold the handshake until the deadline.
+- A CertificateVerify whose signature is not valid DER is accepted by the
+  message parser, counted as the one verification and then fails
+  decoding, which ends the handshake at once. 30 bytes queued ahead do it,
+  and so can a buggy peer.
+- With a smaller `max_buffered` than the default (for example 512 bytes),
+  complete forged messages at a later seq can leave too little room for the
+  expected Certificate. Nothing reclaims complete candidates, so the
+  handshake waits until the deadline. The default 16 KiB is not affected.
+- The first outgoing record mirrors the ClientHello's record sequence
+  number. A ClientHello at the top of the sequence space leaves no room for
+  the server's flights, and the handshake fails after the server has
+  signed. A buggy peer can do this too.
+
 Behind ICE, only an attacker who can spoof the selected address pair can
-send any of this.
+send any of this, apart from the two cases a buggy peer can trigger.
 
 ## Dependencies
 

@@ -66,7 +66,10 @@ Notes for the release after 0.2.0-rc.1.
   handshake's messages at 0 (RFC 6347 section 4.2.2), so a conforming
   peer's request was silently dropped.
 - Unauthenticated (epoch 0) input no longer ends a handshake, or holds it
-  until the deadline, with a single forged packet:
+  until the deadline, in the ways rounds 2 and 3 of the A4.4 review found.
+  Round 4 found four more that are still open, two of them single packets
+  (see the crate README and
+  `docs/whip-evidence/a4.4-security-review-2026-11-12.md`):
   - Every alert at epoch 0 is dropped.
   - Fragments are admitted by `message_seq`, type, epoch and a length the
     parser could accept before anything is kept, so a Finished is kept

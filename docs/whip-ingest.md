@@ -1542,6 +1542,18 @@ Implementation notes (11 November 2026):
       slots and the buffer. Reclaiming bounds a finite burst, not a
       sustained one.
 
+    Round 4 (on 89bd367) found four more, which are open and not fixed:
+    two complementary forged candidates that absorb every genuine
+    retransmission without triggering reclamation; a CertificateVerify
+    whose signature is not valid DER ending the handshake at once (a buggy
+    peer can do this too); complete forged messages at a later seq
+    blocking the expected Certificate when `max_buffered` is set below the
+    default; and a ClientHello at the top of the record sequence space
+    exhausting the server's outgoing sequence after it has signed (a buggy
+    peer can do this too). The crate README describes each. So a finite
+    burst can still hold a handshake until the deadline. See
+    [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
+
     W3 limits the damage:
     - each `Server` receives only datagrams from its selected ICE-validated
       5-tuple, so only an attacker who can spoof that tuple can do either;
@@ -2343,6 +2355,12 @@ that the inbound queue's back-pressure stays with the slow reader.
   `sapflow-rtp` is recorded, with every finding resolved or accepted in
   writing. A review by the author, or by an agent of the same session, does
   not count.
+  - Status, 12 November 2026: **not met yet.** Reviewed in four rounds,
+    recorded in
+    [the A4.4 record](whip-evidence/a4.4-security-review-2026-11-12.md).
+    The findings of rounds 1 to 3 are fixed. Round 4's four
+    handshake-availability findings are open. The residuals the record
+    states as inherent await the owner's written acceptance.
 
 ### W5: documentation
 
