@@ -390,6 +390,7 @@ assert (audio[0]["codec_name"], int(audio[0]["sample_rate"]), audio[0]["channels
   wait_child "$wpub" || { tail -5 "$WORK/whip-ffmpeg.log" >&2; fail "the WHIP publisher failed"; }
   for _ in $(seq 1 20); do grep -q 'WHIP session ended reason="deleted"' "$WORK/sapflow-whip.log" && break; sleep 0.25; done
   grep -q 'WHIP session ended reason="deleted"' "$WORK/sapflow-whip.log" || fail "FFmpeg's DELETE did not end the WHIP session"
+  for _ in $(seq 1 20); do grep -q "\"unpublish\",\"path\":\"live/$W\"" "$WORK/cb.log" && break; sleep 0.25; done
   grep -q "\"unpublish\",\"path\":\"live/$W\"" "$WORK/cb.log" || fail "no WHIP unpublish callback at the DELETE"
   for _ in $(seq 1 30); do grep -q "recordSegmentComplete\",\"path\":\"live/$W\"" "$WORK/cb.log" && break; sleep 0.5; done
   wrec=$(grep "recordSegmentComplete\",\"path\":\"live/$W\"" "$WORK/cb.log" | grep -o '"segmentPath":"[^"]*"' | head -1 | cut -d'"' -f4)
