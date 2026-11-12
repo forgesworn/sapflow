@@ -838,15 +838,150 @@ fn audio_behind(frames: Vec<Frame>, lag: i64) -> Vec<Frame> {
     out
 }
 
+/// Feeds `frames` through an elementary-stream publication (WHIP's path),
+/// ends the stream, and returns the callbacks of the `files` recordings it
+/// finishes.
+async fn es_recordings(
+    frames: &[Frame],
+    files: usize,
+) -> (Vec<serde_json::Value>, crate::test_support::Scratch) {
+    let (mut app, scratch) = app(true);
+    let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+    let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
+    Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
+    let req = sapflow_core::PublishRequest::parse_srt_stream_id(
+        "publish:live/event-epochs:fixture:fixture",
+    )
+    .expect("request");
+    let mut publisher = crate::publish::Publication::begin(
+        &app,
+        &req,
+        SourceKind::Es,
+        "127.0.0.1".parse().expect("loopback"),
+    )
+    .expect("begin");
+    let config = frames
+        .iter()
+        .find_map(|f| match f {
+            Frame::Aac(_, config, _) => Some(*config),
+            Frame::Video(..) => None,
+        })
+        .expect("AAC");
+    for frame in frames {
+        publisher
+            .push(|source, now| {
+                let crate::stream::Source::Es(es) = source else {
+                    unreachable!()
+                };
+                es.audio_config(config);
+                match frame {
+                    Frame::Video(dts, pts, annexb) => {
+                        es.video(*dts, *pts, sapflow_hls::codec::access_unit(annexb), now)
+                    }
+                    Frame::Aac(pts, config, payload) => es.audio_at(*pts, *config, payload, now),
+                }
+            })
+            .expect("fixture frames");
+    }
+    publisher.end();
+    let path = StreamPath::parse("live/event-epochs").expect("path");
+    let (stream, generation, _) = app
+        .streams
+        .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Es)
+        .expect("claim");
+    app.streams.detach(&stream, generation, false);
+    let mut done = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while done.len() < files {
+            let callback = receiver.recv().await.expect("recording callback queue");
+            let body: serde_json::Value =
+                serde_json::from_slice(&callback.body).expect("recording callback JSON");
+            if body["event"] == "recordSegmentComplete" {
+                done.push(body);
+            }
+        }
+    })
+    .await
+    .expect("finished recordings");
+    (done, scratch)
+}
+
+/// A stall longer than the open part's room (clamped into a held frame),
+/// then a break before the next frame: the run ends with its media, and the
+/// recording's reported duration (`duration_secs`, v4v's
+/// `segmentDuration`, and the file's own) is the media it holds, not the
+/// clamped part's span with the stall's hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffprobe; run explicitly for origin acceptance"]
+async fn a_recording_through_a_stall_and_a_break_reports_its_media_duration() {
+    const CHANGE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-change.ts");
+    let mut frames: Vec<Frame> = elementary_frames(CHANGE)
+        .into_iter()
+        .filter(|f| f.at() < 309_840)
+        .collect();
+    frames.sort_by_key(Frame::at);
+    let videos: Vec<i64> = frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Video(dts, ..) => Some(*dts),
+            Frame::Aac(..) => None,
+        })
+        .collect();
+    // After the 30th frame, 0.6 s more (a stall the part cannot hold); after
+    // the 31st, 1.5 s more (a break).
+    let (stall, broke) = (videos[30], videos[31]);
+    let shift =
+        |at: i64| at + if at >= stall { 54_000 } else { 0 } + if at >= broke { 135_000 } else { 0 };
+    let frames: Vec<Frame> = frames
+        .into_iter()
+        .map(|f| match f {
+            Frame::Video(dts, pts, data) => Frame::Video(shift(dts), pts - dts + shift(dts), data),
+            Frame::Aac(pts, config, data) => Frame::Aac(shift(pts), config, data),
+        })
+        .collect();
+    let (done, _scratch) = es_recordings(&frames, 1).await;
+    let file = std::path::PathBuf::from(done[0]["segmentPath"].as_str().expect("a path"));
+    let reported: f64 = done[0]["segmentDuration"]
+        .as_str()
+        .and_then(|d| d.parse().ok())
+        .unwrap_or_else(|| panic!("a duration in {}", done[0]));
+    // The video's end in the file: its last packet's decode time plus its
+    // duration, from the packets themselves, not the header.
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args([
+            "-show_entries",
+            "packet=dts_time,duration_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&file)
+        .output()
+        .expect("ffprobe runs");
+    let end = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (dts, duration) = l.split_once(',')?;
+            Some(dts.parse::<f64>().ok()? + duration.parse::<f64>().ok()?)
+        })
+        .fold(0.0, f64::max);
+    assert!(end > 1.0, "video in the file: {end}");
+    assert!(
+        (reported - end).abs() <= 0.002,
+        "reported {reported} s, the media ends at {end} s"
+    );
+}
+
 /// The resolution change with its audio arriving 100, 300, 500 and 1000 ms
 /// behind its video, through the elementary-stream path (WHIP's). Audio
 /// stamped before the change that arrives while the new run's first part is
 /// open joins it, in the new file; after that it is dropped. A drop marks
-/// the file whose audio it was, the first, and only then; the second file
-/// is never marked for it. Every frame is in a file or counted as dropped.
+/// the outgoing file, the first, whose epoch its timestamp falls in, and
+/// only then; here the second file is not marked for it. Every frame is in
+/// a file or counted as dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
-async fn late_audio_at_a_resolution_change_marks_only_the_file_it_belonged_to() {
+async fn late_audio_dropped_at_a_resolution_change_marks_the_outgoing_file() {
     const CHANGE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-change.ts");
     let mut table = Vec::new();
     for lag_ms in [0i64, 100, 300, 500, 1000] {
@@ -879,66 +1014,7 @@ async fn late_audio_at_a_resolution_change_marks_only_the_file_it_belonged_to() 
             .filter(|f| matches!(f, Frame::Aac(pts, ..) if *pts >= first_idr))
             .count()
             - early.saturating_sub(1);
-        let (mut app, scratch) = app(true);
-        let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
-        let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
-        Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
-        let req = sapflow_core::PublishRequest::parse_srt_stream_id(
-            "publish:live/event-epochs:fixture:fixture",
-        )
-        .expect("request");
-        let mut publisher = crate::publish::Publication::begin(
-            &app,
-            &req,
-            SourceKind::Es,
-            "127.0.0.1".parse().expect("loopback"),
-        )
-        .expect("begin");
-        let config = frames
-            .iter()
-            .find_map(|f| match f {
-                Frame::Aac(_, config, _) => Some(*config),
-                Frame::Video(..) => None,
-            })
-            .expect("AAC");
-        for frame in &frames {
-            publisher
-                .push(|source, now| {
-                    let crate::stream::Source::Es(es) = source else {
-                        unreachable!()
-                    };
-                    es.audio_config(config);
-                    match frame {
-                        Frame::Video(dts, pts, annexb) => {
-                            es.video(*dts, *pts, sapflow_hls::codec::access_unit(annexb), now)
-                        }
-                        Frame::Aac(pts, config, payload) => {
-                            es.audio_at(*pts, *config, payload, now)
-                        }
-                    }
-                })
-                .expect("fixture frames");
-        }
-        publisher.end();
-        let path = StreamPath::parse("live/event-epochs").expect("path");
-        let (stream, generation, _) = app
-            .streams
-            .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Es)
-            .expect("claim");
-        app.streams.detach(&stream, generation, false);
-        let mut done = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while done.len() < 2 {
-                let callback = receiver.recv().await.expect("recording callback queue");
-                let body: serde_json::Value =
-                    serde_json::from_slice(&callback.body).expect("recording callback JSON");
-                if body["event"] == "recordSegmentComplete" {
-                    done.push(body);
-                }
-            }
-        })
-        .await
-        .expect("two finished recordings");
+        let (done, scratch) = es_recordings(&frames, 2).await;
         let count = |file: &std::path::Path, track: &str| {
             let output = std::process::Command::new("ffprobe")
                 .args(["-v", "error", "-select_streams", track])
