@@ -11,7 +11,7 @@ docs/reference.md), the same as sapflow_hls::playlist::RuleCheck:
   - a segment whose parts are listed lasts, by its EXTINF, as long as they
     do together, except within a continuous run after a part cut to exactly
     PART-TARGET (a clamped stall, whose hole the next part's time carries);
-    a segment a discontinuity follows has no exception;
+    before a discontinuity the clamped part must not be the segment's last;
   - no EXT-X-PART DURATION is above PART-TARGET;
   - every part but the last of its segment is at least 85% of PART-TARGET;
     4.4.4.9 also exempts INDEPENDENT=YES parts, allowed here only in a
@@ -89,7 +89,10 @@ def check(text, live_window=True, byte_capped=False):
                 # Within a continuous run, only the decode-time hole after a
                 # part cut to PART-TARGET (a clamped stall).
                 if d > total and any(p == head.get("PART-TARGET") for _, p, _ in run):
-                    hole = f"segment {msn} lasts {d}, but its parts sum to {total}, before a discontinuity"
+                    # A hole only the last part can explain is at the run's
+                    # end, if a discontinuity follows.
+                    if not any(p == head.get("PART-TARGET") for _, p, _ in run[:-1]):
+                        hole = f"segment {msn} lasts {d}, but its parts sum to {total}, before a discontinuity"
                 else:
                     bad.append(f"segment {msn} lasts {d}, but its parts sum to {total}")
             dseqs[msn] = dseq

@@ -1118,8 +1118,9 @@ Left open:
   there (segments start at keyframes), and leaving the hole out of
   `EXTINF` would move the playlist off the media's time. `RuleCheck` and
   `scripts/check-playlist.py` allow exactly this: a segment longer than
-  its parts only within a continuous run and only with a part at
-  `PART-TARGET`; before a discontinuity, never. So a run that breaks or is
+  its parts only with a part at `PART-TARGET`, and before a
+  discontinuity only if that part is not the segment's last (the hole is
+  inside the run, not at its end). So a run that breaks or is
   interrupted right after such a part also ends its segment with its
   media, and the next run resumes there (found by `muxer_timing` once the
   rule was in; `fuzz/regressions/muxer_timing`). Both allow each part up

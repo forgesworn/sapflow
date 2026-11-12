@@ -276,11 +276,12 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
 ///   [`crate::Muxer::window_byte_capped`]);
 /// - a segment whose parts are listed lasts, by its `EXTINF`, as long as
 ///   they do together (4.4.4.9: a part's duration is that of its media).
-///   The one exception is within a continuous run: after a part cut to
-///   exactly `PART-TARGET` (a frame longer than the part's room, clamped),
-///   the next part's decode time carries the true time, and the segment
-///   lasts as long as that. A segment that a discontinuity follows has no
-///   exception: its run's gap falls at the discontinuity;
+///   The one exception is a hole inside a continuous run: after a part cut
+///   to exactly `PART-TARGET` (a frame longer than the part's room,
+///   clamped), the next part's decode time carries the true time, and the
+///   segment lasts as long as that. A run's end has no such hole: if a
+///   discontinuity follows, the clamped part must not be the segment's
+///   last, since the gap falls at the discontinuity;
 /// - an `EXT-X-DISCONTINUITY` sits before a segment's parts, never among
 ///   them, and every media sequence number keeps one discontinuity
 ///   sequence number from render to render.
@@ -426,15 +427,20 @@ impl RuleCheck {
                 // span, and each printed is rounded by up to half a unit.
                 let sum: u64 = run.iter().map(|&(p, _)| p).sum();
                 if !run.is_empty() && sum.abs_diff(d) > 2 * run.len() as u64 {
-                    // Within a continuous run, only the decode-time hole
-                    // after a part cut to PART-TARGET (a clamped stall).
+                    // Only the decode-time hole after a part cut to
+                    // PART-TARGET (a clamped stall).
                     let clamped = d > sum && run.iter().any(|&(p, _)| p == part_target);
                     if !clamped {
                         return Err(format!(
                             "segment {msn} lasts {d}, but its parts sum to {sum}"
                         ));
                     }
-                    held_hole = Some((msn, d, sum));
+                    // A hole that only the last part can explain is at the
+                    // run's end, if a discontinuity follows.
+                    let inside = run[..run.len() - 1].iter().any(|&(p, _)| p == part_target);
+                    if !inside {
+                        held_hole = Some((msn, d, sum));
+                    }
                 }
                 run.clear();
                 listed += d;
@@ -991,6 +997,16 @@ mod tests {
             part("0.2")
         );
         assert_eq!(RuleCheck::without_live_window().check(&stall), Ok(()));
+        // So is one inside a run that a discontinuity then ends.
+        let inside = format!(
+            "{}{}{}{}#EXT-X-DISCONTINUITY\n{}",
+            head(3, 0, 0),
+            part("0.23400"),
+            part("0.1"),
+            seg("0.5"),
+            part("0.2")
+        );
+        assert_eq!(RuleCheck::without_live_window().check(&inside), Ok(()));
         assert_eq!(
             fresh.check(&format!("{}{}", head(3, 0, 0), seg("1"))),
             Ok(())
