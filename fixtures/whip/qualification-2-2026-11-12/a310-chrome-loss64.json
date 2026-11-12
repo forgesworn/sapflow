@@ -1,0 +1,492 @@
+{
+ "seconds": 60,
+ "feedback": "loss:64:20",
+ "load": 10.974609375,
+ "page": {
+  "errors": [],
+  "series": [
+   {
+    "t": 1,
+    "available_kbps": 300,
+    "target_kbps": 0,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 2,
+    "available_kbps": 325,
+    "target_kbps": 0,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 3,
+    "available_kbps": 352,
+    "target_kbps": 293,
+    "sent_kbps": 329,
+    "width": 1280,
+    "fps": 5,
+    "limit": "none"
+   },
+   {
+    "t": 4,
+    "available_kbps": 381,
+    "target_kbps": 318,
+    "sent_kbps": 1446,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 5,
+    "available_kbps": 413,
+    "target_kbps": 343,
+    "sent_kbps": 1156,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 6,
+    "available_kbps": 447,
+    "target_kbps": 372,
+    "sent_kbps": 462,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 7,
+    "available_kbps": 483,
+    "target_kbps": 403,
+    "sent_kbps": 1585,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 8,
+    "available_kbps": 523,
+    "target_kbps": 436,
+    "sent_kbps": 1218,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 9,
+    "available_kbps": 566,
+    "target_kbps": 471,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 10,
+    "available_kbps": 612,
+    "target_kbps": 510,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 11,
+    "available_kbps": 662,
+    "target_kbps": 552,
+    "sent_kbps": 1631,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 12.1,
+    "available_kbps": 716,
+    "target_kbps": 597,
+    "sent_kbps": 1735,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 13.1,
+    "available_kbps": 774,
+    "target_kbps": 645,
+    "sent_kbps": 1377,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 14.1,
+    "available_kbps": 837,
+    "target_kbps": 698,
+    "sent_kbps": 424,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 15.1,
+    "available_kbps": 905,
+    "target_kbps": 754,
+    "sent_kbps": 2149,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 16.1,
+    "available_kbps": 979,
+    "target_kbps": 815,
+    "sent_kbps": 665,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 17.1,
+    "available_kbps": 1058,
+    "target_kbps": 882,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 18.1,
+    "available_kbps": 1144,
+    "target_kbps": 953,
+    "sent_kbps": 2490,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 19.1,
+    "available_kbps": 1236,
+    "target_kbps": 1030,
+    "sent_kbps": 1565,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 20.1,
+    "available_kbps": 1336,
+    "target_kbps": 1113,
+    "sent_kbps": 2891,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 21.1,
+    "available_kbps": 1032,
+    "target_kbps": 860,
+    "sent_kbps": 1586,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 22.1,
+    "available_kbps": 797,
+    "target_kbps": 664,
+    "sent_kbps": 2096,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 23.1,
+    "available_kbps": 616,
+    "target_kbps": 513,
+    "sent_kbps": 1667,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 24.1,
+    "available_kbps": 475,
+    "target_kbps": 395,
+    "sent_kbps": 1301,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 25.1,
+    "available_kbps": 366,
+    "target_kbps": 304,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 26.1,
+    "available_kbps": 322,
+    "target_kbps": 268,
+    "sent_kbps": 1055,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 27.1,
+    "available_kbps": 249,
+    "target_kbps": 207,
+    "sent_kbps": 1659,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 28.1,
+    "available_kbps": 193,
+    "target_kbps": 160,
+    "sent_kbps": 688,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 29.1,
+    "available_kbps": 171,
+    "target_kbps": 142,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 30.1,
+    "available_kbps": 133,
+    "target_kbps": 111,
+    "sent_kbps": 1130,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 31.1,
+    "available_kbps": 103,
+    "target_kbps": 85,
+    "sent_kbps": 1365,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 32.1,
+    "available_kbps": 80,
+    "target_kbps": 66,
+    "sent_kbps": 217,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 33.1,
+    "available_kbps": 70,
+    "target_kbps": 58,
+    "sent_kbps": 330,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 34.1,
+    "available_kbps": 54,
+    "target_kbps": 45,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 35.1,
+    "available_kbps": 42,
+    "target_kbps": 34,
+    "sent_kbps": 1150,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 36.1,
+    "available_kbps": 32,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 37.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 38.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 39.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 1651,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 40.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 1575,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 41.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 38,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 42.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 43.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 44.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 45.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 46.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 47.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 48.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 49.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 50.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 51.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 52.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 53.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 54.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 55.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 56.1,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 57.2,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 58.2,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 59.2,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 60.2,
+    "available_kbps": 30,
+    "target_kbps": 30,
+    "sent_kbps": 0,
+    "limit": "none"
+   }
+  ],
+  "post": 201,
+  "answer_remb": false,
+  "answer_twcc": false,
+  "connection": "connected",
+  "delete": 200
+ },
+ "recordings": [],
+ "feedback_armed": true
+}

@@ -1,0 +1,349 @@
+{
+ "seconds": 40,
+ "keyframe_interval": "2",
+ "obs_keyint": 10,
+ "bitrate": 2500,
+ "feedback": null,
+ "load": 55.62939453125,
+ "obs_version": "32.0.4",
+ "proxy_loss_pct": 5,
+ "obs_pid": 39570,
+ "connected": "2026-11-12T12:12:22.780760Z",
+ "second_sigterm": true,
+ "obs_ended": true,
+ "restore_diff_exit": 0,
+ "restore_diff": "",
+ "restore_rsync_dry_run": "",
+ "modified_config_moved_to_trash": "obs-studio-1794485597380",
+ "backup_moved_to_trash": "a310-obs-backup-2oPd0V-1794485598025",
+ "counters": {
+  "video_packets": 28932,
+  "video_nacked": 1581,
+  "video_recovered": 1408,
+  "video_lost": 21,
+  "video_frames": 162,
+  "video_incomplete": 20,
+  "video_skipped": 1320,
+  "audio_packets": 2398,
+  "audio_nacked": 0,
+  "audio_recovered": 0,
+  "audio_lost": 108
+ },
+ "proxy": {
+  "sent_c2s": "33052",
+  "dropped_c2s": "1613",
+  "sent_s2c": "1047",
+  "dropped_s2c": "49",
+  "stun_c2s": "13",
+  "dtls_c2s": "5",
+  "rtp_c2s": "32937",
+  "rtcp_c2s": "97",
+  "stun_s2c": "13",
+  "dtls_s2c": "2",
+  "rtp_s2c": "0",
+  "rtcp_s2c": "1032",
+  "rtp_repeats": "1495"
+ },
+ "requests": 58,
+ "keyframes_received": 4,
+ "answered": [
+  {
+   "request_s": 0,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 15501
+  },
+  {
+   "request_s": 0.502,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 14999
+  },
+  {
+   "request_s": 1.322,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 14179
+  },
+  {
+   "request_s": 2.323,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 13178
+  },
+  {
+   "request_s": 3.324,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 12177
+  },
+  {
+   "request_s": 4.326,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 11175
+  },
+  {
+   "request_s": 5.328,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 10173
+  },
+  {
+   "request_s": 5.83,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 9671
+  },
+  {
+   "request_s": 6.831,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 8670
+  },
+  {
+   "request_s": 7.831,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 7670
+  },
+  {
+   "request_s": 8.783,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 6718
+  },
+  {
+   "request_s": 9.784,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 5717
+  },
+  {
+   "request_s": 10.754,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 4747
+  },
+  {
+   "request_s": 11.616,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 3885
+  },
+  {
+   "request_s": 12.48,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 3021
+  },
+  {
+   "request_s": 13.48,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 2021
+  },
+  {
+   "request_s": 14.483,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 1018
+  },
+  {
+   "request_s": 15.484,
+   "next_keyframe_s": 15.501,
+   "delay_ms": 17
+  },
+  {
+   "request_s": 16.823,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 8638
+  },
+  {
+   "request_s": 17.825,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 7636
+  },
+  {
+   "request_s": 18.828,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 6633
+  },
+  {
+   "request_s": 19.829,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 5632
+  },
+  {
+   "request_s": 20.654,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 4807
+  },
+  {
+   "request_s": 21.655,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 3806
+  },
+  {
+   "request_s": 22.295,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 3166
+  },
+  {
+   "request_s": 23.296,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 2165
+  },
+  {
+   "request_s": 23.921,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 1540
+  },
+  {
+   "request_s": 24.923,
+   "next_keyframe_s": 25.461,
+   "delay_ms": 538
+  },
+  {
+   "request_s": 26.823,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 8599
+  },
+  {
+   "request_s": 27.347,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 8075
+  },
+  {
+   "request_s": 27.848,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 7574
+  },
+  {
+   "request_s": 28.35,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 7072
+  },
+  {
+   "request_s": 29.055,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 6367
+  },
+  {
+   "request_s": 30.056,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 5366
+  },
+  {
+   "request_s": 31.057,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 4365
+  },
+  {
+   "request_s": 32.058,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 3364
+  },
+  {
+   "request_s": 33.062,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 2360
+  },
+  {
+   "request_s": 34.062,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 1360
+  },
+  {
+   "request_s": 35.064,
+   "next_keyframe_s": 35.422,
+   "delay_ms": 358
+  },
+  {
+   "request_s": 36.39,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 9071
+  },
+  {
+   "request_s": 37.39,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 8071
+  },
+  {
+   "request_s": 38.392,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 7069
+  },
+  {
+   "request_s": 39.396,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 6065
+  },
+  {
+   "request_s": 40.398,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 5063
+  },
+  {
+   "request_s": 41.399,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 4062
+  },
+  {
+   "request_s": 42.4,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 3061
+  },
+  {
+   "request_s": 43.401,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 2060
+  },
+  {
+   "request_s": 44.403,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 1058
+  },
+  {
+   "request_s": 45.404,
+   "next_keyframe_s": 45.461,
+   "delay_ms": 57
+  },
+  {
+   "request_s": 47.404,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 47.907,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 48.908,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 49.855,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 50.357,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 51.359,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 52.36,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 53.361,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  },
+  {
+   "request_s": 54.363,
+   "next_keyframe_s": null,
+   "delay_ms": null
+  }
+ ],
+ "keyframe_gaps_s": [
+  9.96,
+  9.961,
+  10.039
+ ],
+ "aligned": "SenderReports",
+ "feedback_armed": false,
+ "recordings": []
+}

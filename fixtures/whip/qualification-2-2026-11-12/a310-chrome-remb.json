@@ -1,0 +1,515 @@
+{
+ "seconds": 60,
+ "feedback": "remb:500000:20",
+ "load": 7.86181640625,
+ "page": {
+  "errors": [],
+  "series": [
+   {
+    "t": 1,
+    "available_kbps": 300,
+    "target_kbps": 0,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 2,
+    "available_kbps": 325,
+    "target_kbps": 0,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 3,
+    "available_kbps": 352,
+    "target_kbps": 0,
+    "sent_kbps": 0,
+    "limit": "none"
+   },
+   {
+    "t": 4,
+    "available_kbps": 381,
+    "target_kbps": 318,
+    "sent_kbps": 724,
+    "width": 1280,
+    "fps": 2,
+    "limit": "none"
+   },
+   {
+    "t": 5,
+    "available_kbps": 413,
+    "target_kbps": 343,
+    "sent_kbps": 1646,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 6,
+    "available_kbps": 447,
+    "target_kbps": 372,
+    "sent_kbps": 894,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 7,
+    "available_kbps": 483,
+    "target_kbps": 403,
+    "sent_kbps": 339,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 8,
+    "available_kbps": 523,
+    "target_kbps": 436,
+    "sent_kbps": 1356,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 9,
+    "available_kbps": 566,
+    "target_kbps": 471,
+    "sent_kbps": 1017,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 10,
+    "available_kbps": 612,
+    "target_kbps": 510,
+    "sent_kbps": 462,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 11,
+    "available_kbps": 662,
+    "target_kbps": 552,
+    "sent_kbps": 1641,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 12,
+    "available_kbps": 716,
+    "target_kbps": 597,
+    "sent_kbps": 1160,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 13,
+    "available_kbps": 774,
+    "target_kbps": 645,
+    "sent_kbps": 508,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 14,
+    "available_kbps": 837,
+    "target_kbps": 698,
+    "sent_kbps": 2034,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 15,
+    "available_kbps": 905,
+    "target_kbps": 754,
+    "sent_kbps": 420,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 16,
+    "available_kbps": 979,
+    "target_kbps": 815,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 17,
+    "available_kbps": 1058,
+    "target_kbps": 882,
+    "sent_kbps": 2622,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 18,
+    "available_kbps": 1144,
+    "target_kbps": 953,
+    "sent_kbps": 1621,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 19,
+    "available_kbps": 1236,
+    "target_kbps": 1030,
+    "sent_kbps": 2421,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 20,
+    "available_kbps": 1336,
+    "target_kbps": 1113,
+    "sent_kbps": 2246,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 21,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1551,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 22,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1517,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 23,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1555,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 24,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1658,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 25.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1131,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 26.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 66,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 27.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1450,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 28.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1414,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 29.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 30.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1055,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 31.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 32.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 424,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 33.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 594,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 34.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 35.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 886,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 36.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 66,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 37.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 38.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1414,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 39.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 40.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1055,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 41.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 42.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 424,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 43.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 593,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 44.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 45.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 886,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 46.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 132,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 47.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 48.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1348,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 49.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 50.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1121,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 51.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 52.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 358,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 53.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 660,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 54.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1451,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 55.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 820,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 56.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 198,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   },
+   {
+    "t": 57.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1450,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 58.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1282,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 59.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 0,
+    "width": 1280,
+    "limit": "none"
+   },
+   {
+    "t": 60.1,
+    "available_kbps": 500,
+    "target_kbps": 416,
+    "sent_kbps": 1121,
+    "width": 1280,
+    "fps": 1,
+    "limit": "none"
+   }
+  ],
+  "post": 201,
+  "answer_remb": true,
+  "answer_twcc": false,
+  "connection": "connected",
+  "delete": 200
+ },
+ "recordings": [],
+ "feedback_armed": true
+}

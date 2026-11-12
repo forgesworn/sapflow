@@ -1,0 +1,5 @@
+loss_pct	protocol	seed	audio_frames	decode_errors	delay_ms	frames_sent	jitter_ms	load	proxy_dropped_c2s	proxy_dropped_s2c	proxy_retransmits	publisher_exit	ready	recordings	sapflow_video_incomplete	sapflow_video_lost	sapflow_video_nacked	sapflow_video_recovered	sapflow_video_skipped	unrecovered	video_frames
+0	whip	1	1445	0	30	900	0	5.95	0	0	0	0	True	1	1	0	0	0	29	32	868
+1	whip	1	628	0	30	900	20	5.57	122	10	0	0	True	1	97	100	3273	7950	587	716	184
+5	whip	1	0	0	30	900	20	19.82	634	72	0	0	False	0	413	537	3966	7544	454	900	0
+10	whip	1	0	0	30	900	20	32.6	1302	167	0	0	False	0	640	1110	4974	7089	237	900	0
