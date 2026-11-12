@@ -1,15 +1,26 @@
 //! UDP proxy that drops and delays packets, for SRT loss tests
-//! (`scripts/srt-loss.sh`).
+//! (`scripts/srt-loss.sh`) and WHIP's (`scripts/whip-loss.py`, A4.1).
 //!
 //!     srt-loss-proxy --listen 127.0.0.1:8891 --target 127.0.0.1:8890 \
 //!         --loss random:10 --delay-ms 30 --seed 1 --stats stats.txt
+//!         [--jitter-ms 20] [--protocol srt|whip]
 //!
 //! Forwards datagrams between one client and one target. Each direction
 //! drops packets with its own loss process and delays every packet by a fixed
-//! time, so the round trip is twice `--delay-ms`. Packets leave in the order
-//! they arrived; `reordered_orig` in the stats counts original data packets
-//! that did not, and should be 0. SRT handshakes are never
-//! dropped, so a connection always forms. On SIGINT or SIGTERM it writes what
+//! time, so the round trip is twice `--delay-ms`. Without `--jitter-ms`,
+//! packets leave in the order they arrived; `reordered_orig` in the stats
+//! counts original SRT data packets that did not, and should be 0. With
+//! `--jitter-ms J`, each impaired packet waits a further time drawn
+//! uniformly from 0 to J ms, from its own seeded process (so the loss
+//! pattern is the same with and without it), and packets leave in the order
+//! they fall due, so they can be reordered, as netem's jitter does.
+//!
+//! What is impaired (dropped and jittered) depends on `--protocol`. For
+//! `srt`, the default, every packet but a handshake: SRT handshakes are
+//! never dropped, so a connection always forms. For `whip`, only SRTP and
+//! SRTCP (first byte 128 to 191, RFC 7983): STUN and DTLS pass with the
+//! fixed delay alone, so ICE and the DTLS handshake always complete, and
+//! the loss falls on the media path only. On SIGINT or SIGTERM it writes what
 //! it saw as `key=value` lines: packets sent and dropped each way, and, read
 //! from the SRT headers, original and retransmitted data packets, NAK and ACK
 //! packets and the handshake flags the target advertised. With `--latency-ms`
@@ -27,7 +38,8 @@
 //!
 //! The same seed gives the same loss pattern for the same packet sequence.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -54,34 +66,86 @@ impl Rng {
     }
 }
 
-/// Packets waiting out their delay, oldest first. The delay is the same for
-/// every packet, so arrival order is also release order.
+/// Packets waiting out their delay, in the order they fall due, and in the
+/// order they arrived when they fall due together. With no jitter that is
+/// arrival order.
 struct DelayQueue<T> {
     delay: Duration,
-    queue: VecDeque<(Instant, T)>,
+    next: u64,
+    queue: BinaryHeap<Reverse<(Instant, u64, Slot<T>)>>,
+}
+
+/// An item in the heap, ordered by its due time and number only.
+struct Slot<T>(T);
+impl<T> PartialEq for Slot<T> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl<T> Eq for Slot<T> {}
+impl<T> PartialOrd for Slot<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for Slot<T> {
+    fn cmp(&self, _: &Self) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+    }
 }
 
 impl<T> DelayQueue<T> {
     fn new(delay: Duration) -> Self {
         Self {
             delay,
-            queue: VecDeque::new(),
+            next: 0,
+            queue: BinaryHeap::new(),
         }
     }
 
     fn push(&mut self, now: Instant, item: T) {
-        self.queue.push_back((now + self.delay, item));
+        self.push_after(now, Duration::ZERO, item);
+    }
+
+    /// As [`DelayQueue::push`], waiting `extra` longer.
+    fn push_after(&mut self, now: Instant, extra: Duration, item: T) {
+        self.queue
+            .push(Reverse((now + self.delay + extra, self.next, Slot(item))));
+        self.next += 1;
     }
 
     fn next_due(&self) -> Option<Instant> {
-        self.queue.front().map(|(at, _)| *at)
+        self.queue.peek().map(|Reverse((at, ..))| *at)
     }
 
     fn pop_due(&mut self, now: Instant) -> Option<T> {
-        if self.queue.front().is_some_and(|(at, _)| *at <= now) {
-            return self.queue.pop_front().map(|(_, item)| item);
+        if self.next_due().is_some_and(|at| at <= now) {
+            return self.queue.pop().map(|Reverse((_, _, Slot(item)))| item);
         }
         None
+    }
+}
+
+/// Which protocol's packets are impaired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Protocol {
+    /// Everything but SRT handshakes.
+    Srt,
+    /// SRTP and SRTCP only.
+    Whip,
+}
+
+/// Whether a datagram is WHIP media: RTP or RTCP (first byte 128 to 191,
+/// RFC 7983 section 7), as against STUN (0 to 3) or DTLS (20 to 63).
+fn whip_media(d: &[u8]) -> bool {
+    d.first().is_some_and(|b| (128..=191).contains(b))
+}
+
+/// Whether the loss and the jitter apply to this datagram.
+fn impaired(protocol: Protocol, d: &[u8]) -> bool {
+    match protocol {
+        Protocol::Srt => classify(d) != Kind::Handshake,
+        Protocol::Whip => whip_media(d),
     }
 }
 
@@ -233,6 +297,13 @@ struct Stats {
     /// copy of it was first let through.
     seen: HashMap<u32, Seen>,
     latency: Duration,
+    protocol: Option<Protocol>,
+    /// WHIP: STUN, DTLS, RTP and RTCP datagrams each way.
+    whip: [[u64; 4]; 2],
+    /// WHIP: RTP packets from the client whose SSRC and sequence number
+    /// came before (a retransmission on the original SSRC).
+    rtp_repeats: u64,
+    rtp_seen: HashSet<(u32, u16)>,
 }
 
 struct Seen {
@@ -243,6 +314,10 @@ struct Seen {
 impl Stats {
     fn account(&mut self, dir: usize, d: &[u8]) {
         self.sent[dir] += 1;
+        if self.protocol == Some(Protocol::Whip) {
+            self.account_whip(dir, d);
+            return;
+        }
         match classify(d) {
             Kind::Data { seq, retransmit } => {
                 if retransmit {
@@ -266,9 +341,34 @@ impl Stats {
         }
     }
 
+    /// WHIP's datagrams by kind (RFC 7983), and the client's repeated RTP
+    /// packets. Only the RTP header is read; the payload is encrypted.
+    fn account_whip(&mut self, dir: usize, d: &[u8]) {
+        let kind = match d.first() {
+            Some(0..=3) => 0,
+            Some(20..=63) => 1,
+            Some(128..=191) if d.get(1).is_some_and(|b| (192..=223).contains(b)) => 3,
+            Some(128..=191) => 2,
+            _ => return,
+        };
+        self.whip[dir][kind] += 1;
+        if kind == 2
+            && dir == 0
+            && let (Some(seq), Some(ssrc)) = (d.get(2..4), word(d, 8))
+        {
+            let seq = u16::from_be_bytes([seq[0], seq[1]]);
+            if !self.rtp_seen.insert((ssrc, seq)) {
+                self.rtp_repeats += 1;
+            }
+        }
+    }
+
     /// Records a client-to-target data packet as it arrives and whether the
     /// loss process dropped it.
     fn note_data(&mut self, now: Instant, d: &[u8], dropped: bool) {
+        if self.protocol == Some(Protocol::Whip) {
+            return;
+        }
         let Kind::Data { seq, retransmit } = classify(d) else {
             return;
         };
@@ -298,6 +398,9 @@ impl Stats {
     /// Called as a packet leaves towards the target: an original data packet
     /// older than one already sent means the proxy reordered the stream.
     fn note_sent_to_target(&mut self, d: &[u8]) {
+        if self.protocol == Some(Protocol::Whip) {
+            return;
+        }
         let Kind::Data {
             seq,
             retransmit: false,
@@ -327,6 +430,15 @@ impl Stats {
         kv("dropped_c2s", self.dropped[0].to_string());
         kv("sent_s2c", self.sent[1].to_string());
         kv("dropped_s2c", self.dropped[1].to_string());
+        if self.protocol == Some(Protocol::Whip) {
+            for (dir, name) in [(0, "c2s"), (1, "s2c")] {
+                for (kind, what) in ["stun", "dtls", "rtp", "rtcp"].iter().enumerate() {
+                    kv(&format!("{what}_{name}"), self.whip[dir][kind].to_string());
+                }
+            }
+            kv("rtp_repeats", self.rtp_repeats.to_string());
+            return s;
+        }
         kv("data_orig", self.data_orig.to_string());
         kv("data_retx", self.data_retx.to_string());
         kv("distinct_retx", self.retx_seqs.len().to_string());
@@ -351,6 +463,8 @@ struct Args {
     loss: LossSpec,
     delay: Duration,
     latency: Duration,
+    jitter: Duration,
+    protocol: Protocol,
     seed: u64,
     stats: Option<PathBuf>,
 }
@@ -362,6 +476,8 @@ fn args() -> Result<Args, String> {
         loss: LossSpec::None,
         delay: Duration::ZERO,
         latency: Duration::ZERO,
+        jitter: Duration::ZERO,
+        protocol: Protocol::Srt,
         seed: 1,
         stats: None,
     };
@@ -381,6 +497,16 @@ fn args() -> Result<Args, String> {
             }
             "--latency-ms" => {
                 a.latency = Duration::from_millis(v.parse().map_err(|_| "--latency-ms: a number")?);
+            }
+            "--jitter-ms" => {
+                a.jitter = Duration::from_millis(v.parse().map_err(|_| "--jitter-ms: a number")?);
+            }
+            "--protocol" => {
+                a.protocol = match v.as_str() {
+                    "srt" => Protocol::Srt,
+                    "whip" => Protocol::Whip,
+                    _ => return Err("--protocol: srt or whip".into()),
+                };
             }
             "--seed" => a.seed = v.parse().map_err(|_| "--seed: a number")?,
             "--stats" => a.stats = Some(v.into()),
@@ -407,7 +533,22 @@ async fn run(a: Args) -> std::io::Result<Stats> {
     ];
     let mut stats = Stats {
         latency: a.latency,
+        protocol: Some(a.protocol),
         ..Stats::default()
+    };
+    // The jitter's own processes, apart from the loss's, so the loss
+    // pattern is the same with and without it.
+    let mut jitter = [
+        Rng(a.seed ^ 0x2545_F491_4F6C_DD1D),
+        Rng(a.seed ^ 0x9E37_79B9_7F4A_7C15),
+    ];
+    let jitter_us = a.jitter.as_micros() as f64;
+    let mut wait = |dir: usize| {
+        if jitter_us == 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_micros((jitter[dir].next_f64() * jitter_us) as u64)
+        }
     };
     let mut client: Option<SocketAddr> = None;
     // Direction 0 is client to target, 1 is target to client.
@@ -422,10 +563,13 @@ async fn run(a: Args) -> std::io::Result<Stats> {
                 let d = fbuf[..n].to_vec();
                 stats.account(0, &d);
                 let now = Instant::now();
-                let dropped = classify(&d) != Kind::Handshake && loss[0].drops();
+                let hit = impaired(a.protocol, &d);
+                let dropped = hit && loss[0].drops();
                 stats.note_data(now, &d, dropped);
                 if dropped {
                     stats.dropped[0] += 1;
+                } else if hit {
+                    queue.push_after(now, wait(0), (0, d));
                 } else {
                     queue.push(now, (0, d));
                 }
@@ -437,8 +581,11 @@ async fn run(a: Args) -> std::io::Result<Stats> {
                 if client.is_none() {
                     continue;
                 }
-                if classify(&d) != Kind::Handshake && loss[1].drops() {
+                let hit = impaired(a.protocol, &d);
+                if hit && loss[1].drops() {
                     stats.dropped[1] += 1;
+                } else if hit {
+                    queue.push_after(Instant::now(), wait(1), (1, d));
                 } else {
                     queue.push(Instant::now(), (1, d));
                 }
@@ -471,7 +618,7 @@ async fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!(
-                "{e}\nusage: srt-loss-proxy --target host:port [--listen host:port] [--loss none|random:P|burst:P,L] [--delay-ms N] [--latency-ms N] [--seed N] [--stats file]"
+                "{e}\nusage: srt-loss-proxy --target host:port [--listen host:port] [--loss none|random:P|burst:P,L] [--delay-ms N] [--jitter-ms N] [--latency-ms N] [--protocol srt|whip] [--seed N] [--stats file]"
             );
             return ExitCode::from(2);
         }
@@ -623,6 +770,60 @@ mod tests {
         let out: Vec<u32> = std::iter::from_fn(|| q.pop_due(now)).collect();
         assert_eq!(out, vec![0, 1, 2, 3, 4]);
         assert_eq!(q.next_due(), None);
+    }
+
+    #[test]
+    fn delay_queue_releases_in_due_order_with_jitter() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut q = DelayQueue::new(ms(30));
+        // Arrival order 0..4; 1 waits 15 ms more, 3 waits 5 ms more.
+        for (i, extra) in [(0u32, 0), (1, 15), (2, 0), (3, 5), (4, 0)] {
+            q.push_after(t0, ms(extra), i);
+        }
+        let mut at = |t| {
+            let now = t0 + ms(t);
+            std::iter::from_fn(|| q.pop_due(now)).collect::<Vec<u32>>()
+        };
+        assert_eq!(at(29), Vec::<u32>::new());
+        assert_eq!(at(30), vec![0, 2, 4], "equal due times keep arrival order");
+        assert_eq!(at(35), vec![3]);
+        assert_eq!(at(45), vec![1]);
+        assert_eq!(q.next_due(), None);
+    }
+
+    #[test]
+    fn whip_impairs_srtp_and_srtcp_only() {
+        let rtp = [0x80, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7];
+        let rtcp = [0x81, 201, 0, 1, 0, 0, 0, 7];
+        let stun = [0x00, 0x01, 0, 0];
+        let dtls = [22, 0xfe, 0xfd];
+        assert!(impaired(Protocol::Whip, &rtp));
+        assert!(impaired(Protocol::Whip, &rtcp));
+        assert!(!impaired(Protocol::Whip, &stun));
+        assert!(!impaired(Protocol::Whip, &dtls));
+        assert!(!impaired(Protocol::Whip, &[]));
+        // SRT as before: everything but a handshake.
+        assert!(!impaired(Protocol::Srt, &header(0x8000_0000, 0)));
+        assert!(impaired(Protocol::Srt, &header(77, 0)));
+        // WHIP's counters: kinds each way, and the client's repeated RTP.
+        let mut s = Stats {
+            protocol: Some(Protocol::Whip),
+            ..Stats::default()
+        };
+        for d in [&rtp[..], &rtp, &rtcp, &stun, &dtls] {
+            s.account(0, d);
+        }
+        s.account(1, &rtcp);
+        assert_eq!(s.whip[0], [1, 1, 2, 1]);
+        assert_eq!(s.whip[1], [0, 0, 0, 1]);
+        assert_eq!(s.rtp_repeats, 1);
+        let text = s.render();
+        assert!(
+            text.contains("rtp_repeats=1\n") && text.contains("rtcp_s2c=1\n"),
+            "{text}"
+        );
+        assert!(!text.contains("data_orig"), "no SRT counters for WHIP");
     }
 
     #[test]
