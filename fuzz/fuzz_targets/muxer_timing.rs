@@ -302,8 +302,31 @@ fn fragment_budget(data: &[u8]) {
     let mut dts = 0;
     let mut rules = playlist::RuleCheck::default();
     let mut retention = playlist::RetentionCheck::default();
+    // A second stream on the same budget, so that what one keeps past its
+    // window meets the other's live media; both share one retention pool.
+    let mut other = Muxer::with_fragment_quota(cfg, Some(video.clone()), None, quota.clone()).ok();
+    let (mut other_dts, mut other_retention) = (0, playlist::RetentionCheck::default());
+    let pool = muxer
+        .retention_pool()
+        .cloned()
+        .expect("a budget has a pool");
     for record in data[2..].chunks_exact(8).take(256) {
         match record[0] % 6 {
+            0 if record[1] & 2 != 0 => {
+                if let Some(other) = other.as_mut() {
+                    let _ = other.push_video(
+                        other_dts,
+                        other_dts,
+                        record[1] & 1 != 0,
+                        Bytes::copy_from_slice(&record[2..]),
+                        std::time::UNIX_EPOCH,
+                    );
+                    other_dts += 3000;
+                    other_retention
+                        .check(other)
+                        .unwrap_or_else(|error| panic!("second stream: {error}"));
+                }
+            }
             0 => {
                 let _ = muxer.push_video(
                     dts,
@@ -373,11 +396,13 @@ fn fragment_budget(data: &[u8]) {
             .unwrap_or_else(|error| panic!("{error}"));
     }
     drop(muxer);
+    drop(other);
     for (bytes, expected) in &held {
         assert_eq!(bytes.as_ref(), expected.as_slice());
     }
     drop(held);
     assert_eq!(quota.used(), 0);
+    assert_eq!(pool.used(), 0, "nothing kept outlives its owners");
 }
 
 fuzz_target!(|data: &[u8]| {
