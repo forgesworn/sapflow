@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use sapflow_whip::testing::{PPS, Publisher, StunClient, VIDEO_SSRC, idr_slice, server_identity};
+use sapflow_whip::testing::{
+    PPS, Publisher, Read, StunClient, VIDEO_SSRC, arm, idr_slice, server_identity,
+};
 use sapflow_whip::{Event, SessionConfig, Transmit, Tuple};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1511,45 +1513,170 @@ async fn srt_takes_over_a_live_whip_stream_and_whip_never_takes_over_srt() {
     srt.end();
 }
 
-/// A3.4: a panic while handling one session's datagram ends only that
-/// session; a second session keeps publishing with nothing lost.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_panic_in_one_session_ends_only_that_session() {
-    let server = start(&[]).await;
-    let (a, a_location) = live(&server, 45, "event-pa").await;
-    let (mut b, b_location) = live(&server, 46, "event-pb").await;
-    let b_stream = server.app.streams.get("event-pb").expect("live");
-    let parts = || b_stream.lock().media.as_ref().map_or(0, |m| m.len());
-    let before = parts();
-    let b_task = tokio::spawn(async move {
-        b.publish(2).await;
-        b
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    a.send(sapflow_whip::testing::PANIC_DATAGRAM).await;
-    let _b = b_task.await.expect("B published throughout");
-    assert!(
-        eventually(|| server.whip.ends.get("panicked") == 1).await,
-        "A ended"
-    );
-    assert!(
-        eventually(|| server.losses(&a_location) == "session gone").await,
-        "A's publication released"
-    );
-    let b_counts = server
-        .whip
-        .resources()
-        .get(&SessionId::parse(b_location.rsplit('/').next().expect("id")).expect("id"))
-        .map(|r| r.losses.clone())
-        .expect("B is live");
-    let marks: u64 = b_counts
+/// How a test makes session A panic (A3.4).
+enum Fault {
+    /// A datagram to A's session.
+    Datagram(Vec<u8>),
+    /// A datagram to A's session, then audio, for which the owner reads
+    /// A's session.
+    DatagramThenAudio(Vec<u8>),
+    /// An Opus payload from A's publisher.
+    Audio(&'static [u8]),
+    /// A datagram to A's session, then a `POST` for A's path, whose
+    /// supersede reads A's session.
+    DatagramThenPost(Vec<u8>),
+}
+
+fn session_id(location: &str) -> SessionId {
+    location
+        .rsplit('/')
+        .next()
+        .and_then(SessionId::parse)
+        .expect("a session Location")
+}
+
+/// Every mark a session's counts hold (re-anchors are not marks).
+fn marks(counts: &LossCounts) -> u64 {
+    counts
         .fields()
         .iter()
         .filter(|(name, _)| *name != "reanchors")
         .map(|(_, n)| n)
-        .sum();
-    assert_eq!(marks, 0, "B lost nothing: {b_counts}");
-    assert!(parts() > before, "B's playlist kept growing");
+        .sum()
+}
+
+/// A3.4: session A panics, by `fault`, while B publishes. A ends as
+/// `panicked`, its recording is marked, and its path is freed, with the
+/// listener's entries for it, for a new publisher; B loses nothing, and
+/// its playlist keeps growing after A has gone.
+async fn panic_isolation(seed: u8, fault: Fault) {
+    let (server, root) = udp_server().await;
+    let (a_event, b_event) = (
+        format!("event-panic-a{seed}"),
+        format!("event-panic-b{seed}"),
+    );
+    let (mut a, a_location) = live(&server, seed, &a_event).await;
+    let (mut b, b_location) = live(&server, seed + 1, &b_event).await;
+    let (a_id, b_id) = (session_id(&a_location), session_id(&b_location));
+    let resource = |id: &SessionId| {
+        server
+            .whip
+            .resources()
+            .get(id)
+            .map(|r| (r.losses.clone(), r.released.clone()))
+    };
+    let (a_counts, mut a_released) = resource(&a_id).expect("A is live");
+    let (b_counts, _) = resource(&b_id).expect("B is live");
+    let a_stream = server.app.streams.get(&a_event).expect("live");
+    let b_stream = server.app.streams.get(&b_event).expect("live");
+    let b_task = tokio::spawn(async move {
+        b.publish(4).await;
+        b
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // With nothing marked before the fault, the panic's reason is the
+    // recording's first.
+    let clean = marks(&a_counts) == 0;
+    // The recording A's media went to.
+    let recording = a_stream
+        .session()
+        .recorder
+        .as_ref()
+        .expect("recording")
+        .status();
+    match fault {
+        Fault::Datagram(d) => a.send(&d).await,
+        Fault::DatagramThenAudio(d) => {
+            a.send(&d).await;
+            for n in 0..5 {
+                let d = a.p.audio(n);
+                a.send(&d).await;
+            }
+        }
+        Fault::Audio(payload) => {
+            let d = a.p.audio_payload(payload.to_vec());
+            a.send(&d).await;
+        }
+        Fault::DatagramThenPost(d) => {
+            a.send(&d).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // 201 or 409: A's publication may not have gone yet.
+            let mut c = Phone::new(seed + 100, &server).await;
+            let _ = admit(&server, &mut c, &a_event).await;
+        }
+    }
+    assert!(
+        eventually(|| server.whip.ends.get("panicked") == 1).await,
+        "A ended as panicked: {:?}; A {a_counts}",
+        server.whip.ends
+    );
+    let after = b_stream.version();
+    let released = tokio::time::timeout(Duration::from_secs(5), a_released.wait_for(|r| *r)).await;
+    assert!(
+        released.is_ok_and(|r| r.is_ok()),
+        "A's publication released"
+    );
+    assert!(server.whip.resources().get(&a_id).is_none());
+    assert_ne!(server.whip.paths().get(&a_event), Some(&a_id));
+    assert_eq!(server.whip.ends.get("ingest-ended"), 0);
+    assert!(a_counts.panics.load(Ordering::Relaxed) >= 1, "{a_counts}");
+    let reason = recording.reason();
+    if clean {
+        assert_eq!(reason, Some(IncompleteReason::IngestError), "{a_counts}");
+    } else {
+        assert!(reason.is_some(), "{a_counts}");
+    }
+    let _b = b_task.await.expect("B published throughout");
+    assert_eq!(marks(&b_counts), 0, "B lost nothing: {b_counts}");
+    assert!(
+        b_stream.version() > after,
+        "B's playlist kept growing after A had gone"
+    );
+    // A's path takes a new publisher.
+    let mut d = Phone::new(seed + 101, &server).await;
+    assert_eq!(admit(&server, &mut d, &a_event).await.status, 201);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// In a call into the session (the router's guard).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_one_session_ends_only_that_session() {
+    panic_isolation(
+        45,
+        Fault::Datagram(sapflow_whip::testing::PANIC_DATAGRAM.to_vec()),
+    )
+    .await;
+}
+
+/// In the session's deadline, which the owner reads every turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_a_session_deadline_ends_only_that_session() {
+    panic_isolation(47, Fault::Datagram(arm(Read::PollTimeout))).await;
+}
+
+/// In the owner's read of the session around an SRTP datagram, which only
+/// `Router::inspect` guards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_owners_read_ends_only_that_session() {
+    panic_isolation(49, Fault::DatagramThenAudio(arm(Read::Stats))).await;
+}
+
+/// In the owner's read of the session for supersede.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_supersede_read_ends_only_that_session() {
+    panic_isolation(51, Fault::DatagramThenPost(arm(Read::LastMedia))).await;
+}
+
+/// In the owner's feed for the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_feed_ends_only_that_session() {
+    panic_isolation(53, Fault::Audio(injected::FEED_PANIC)).await;
+}
+
+/// In the ingest, inside the publication with the stream's locks held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_the_ingest_ends_only_that_session() {
+    panic_isolation(55, Fault::Audio(injected::INGEST_PANIC)).await;
 }
 
 #[test]
@@ -1570,6 +1697,11 @@ fn every_end_reason_has_a_name() {
     ];
     let distinct: std::collections::HashSet<_> = names.iter().collect();
     assert_eq!(distinct.len(), names.len());
+    // A panic in the owner's code or the ingest counts with the session's.
+    assert_eq!(
+        end_name(R::Closed, Some(CloseCause::Panicked)),
+        end_name(R::Panicked, None)
+    );
     let counts = EndCounts::default();
     assert_eq!((counts.add("deleted"), counts.add("deleted")), (1, 2));
     assert_eq!((counts.get("deleted"), counts.get("panicked")), (2, 0));

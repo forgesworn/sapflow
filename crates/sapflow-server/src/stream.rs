@@ -345,8 +345,9 @@ impl LiveStream {
     }
 
     pub fn lock(&self) -> MutexGuard<'_, State> {
-        // A panic while holding the lock aborts the process (panic = abort
-        // in release), so poisoning only matters in tests.
+        // Release builds unwind (panic = "unwind"): a panic while holding
+        // the lock ends only the task it happened in, and the next holder
+        // takes the state as it was left.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
