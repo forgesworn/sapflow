@@ -921,10 +921,9 @@ pub const NEW_STREAM_FRAGMENT_PERCENT: usize = 80;
 
 /// Whether the live fragment budget admits a new stream.
 fn admits_new_stream(fragments: &sapflow_core::fragment::FragmentQuota) -> bool {
-    fragments.used().saturating_mul(100)
-        < fragments
-            .maximum()
-            .saturating_mul(NEW_STREAM_FRAGMENT_PERCENT)
+    // Wide enough that a 32-bit usize cannot saturate at 41 MiB.
+    (fragments.used() as u128) * 100
+        < (fragments.maximum() as u128) * NEW_STREAM_FRAGMENT_PERCENT as u128
 }
 
 /// The live streams, by event id, and current RTMP publication admission.

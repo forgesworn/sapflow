@@ -11,9 +11,9 @@
 //! `CUT1` drive codec changes on a clock that carries on
 //! (`Muxer::reconfigure_with_audio_at`) with audio running behind, so late
 //! audio after a cut is placed or dropped and counted against its epoch.
-//! Inputs starting `WIN1` and one byte run the video timing with a window
-//! bounded to that many seconds (`MuxerConfig::window`), so the time bound's
-//! removals meet the same rules.
+//! `WIN1` and one byte before any input (and before any other prefix) bound
+//! the window to that many seconds (`MuxerConfig::window`), so the time
+//! bound's removals meet the same rules in every mode below.
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
@@ -291,7 +291,15 @@ fn check_late_audio(m: &mut Muxer) {
 /// its keyframe, bit 3 an interrupt after the frame, bits 4-6 AAC frames
 /// before it), then bits 0-3 AAC frames after it and bit 4 a change of
 /// AAC configuration at the cut.
-fn continuing_cuts(data: &[u8]) {
+/// The default configuration, with the window bound `WIN1` asked for.
+fn bounded(window: Option<std::time::Duration>) -> MuxerConfig {
+    MuxerConfig {
+        window,
+        ..MuxerConfig::default()
+    }
+}
+
+fn continuing_cuts(data: &[u8], window: Option<std::time::Duration>) {
     let Some(video) = H264Config::new(SPS, PPS) else {
         return;
     };
@@ -302,7 +310,7 @@ fn continuing_cuts(data: &[u8]) {
         channels: if stereo { 2 } else { 1 },
     };
     let mut stereo = true;
-    let mut m = Muxer::new(MuxerConfig::default(), video.clone(), Some(aac(stereo)))
+    let mut m = Muxer::new(bounded(window), video.clone(), Some(aac(stereo)))
         .with_retention_pool(pool());
     let (mut dts, mut audio) = (0i64, 0i64);
     let mut rules = playlist::RuleCheck::default();
@@ -376,7 +384,7 @@ fn continuing_cuts(data: &[u8]) {
     check(&mut m);
 }
 
-fn audio_timing(data: &[u8]) {
+fn audio_timing(data: &[u8], window: Option<std::time::Duration>) {
     let Some((&head, records)) = data.split_first() else {
         return;
     };
@@ -387,7 +395,7 @@ fn audio_timing(data: &[u8]) {
         channels: if stereo { 2 } else { 1 },
     };
     let mut stereo = head & 1 != 0;
-    let mut muxer = Muxer::audio_only(MuxerConfig::default(), config(stereo))
+    let mut muxer = Muxer::audio_only(bounded(window), config(stereo))
         .expect("fixed supported AAC profile")
         .with_retention_pool(pool());
     let mut rules = playlist::RuleCheck::default();
@@ -425,7 +433,7 @@ fn audio_timing(data: &[u8]) {
 
 // Bounded allocations, response aliases and connection recovery. Copies in the
 // oracle are test metadata; this verifies logical charges, not process RSS.
-fn fragment_budget(data: &[u8]) {
+fn fragment_budget(data: &[u8], window: Option<std::time::Duration>) {
     use sapflow_core::fragment::FragmentQuota;
     use sapflow_hls::{EsIngest, PartLookup};
     use std::sync::Arc;
@@ -437,6 +445,7 @@ fn fragment_budget(data: &[u8]) {
     let video = H264Config::new(SPS, PPS).expect("generated supported config");
     let cfg = MuxerConfig {
         segment_count: 8,
+        window,
         ..MuxerConfig::default()
     };
     let pool = Arc::new(FragmentQuota::new(sapflow_hls::muxer::RETENTION_POOL_BYTES));
@@ -553,8 +562,16 @@ fn fragment_budget(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    let (data, window) = match data.strip_prefix(b"WIN1") {
+        Some([secs, rest @ ..]) => (
+            rest,
+            Some(std::time::Duration::from_secs(u64::from(*secs).max(1))),
+        ),
+        Some([]) => return,
+        None => (data, None),
+    };
     if let Some(records) = data.strip_prefix(b"FBUD") {
-        fragment_budget(records);
+        fragment_budget(records, window);
         return;
     }
     if let Some(records) = data.strip_prefix(b"NREC") {
@@ -564,21 +581,13 @@ fuzz_target!(|data: &[u8]| {
     // Preserve historical video-timing inputs. New prefixed seeds exercise
     // exact AAC frame clocks, interruptions and retained codec epochs.
     if let Some(records) = data.strip_prefix(b"AAC1") {
-        audio_timing(records);
+        audio_timing(records, window);
         return;
     }
     if let Some(records) = data.strip_prefix(b"CUT1") {
-        continuing_cuts(records);
+        continuing_cuts(records, window);
         return;
     }
-    let (data, window) = match data.strip_prefix(b"WIN1") {
-        Some([secs, rest @ ..]) => (
-            rest,
-            Some(std::time::Duration::from_secs(u64::from(*secs).max(1))),
-        ),
-        Some([]) => return,
-        None => (data, None),
-    };
     let Some(video) = H264Config::new(SPS, PPS) else {
         return;
     };
@@ -588,11 +597,7 @@ fuzz_target!(|data: &[u8]| {
         sample_rate: 48000,
         channels: 2,
     };
-    let cfg = MuxerConfig {
-        window,
-        ..MuxerConfig::default()
-    };
-    let mut m = Muxer::new(cfg, video, Some(aac)).with_retention_pool(pool());
+    let mut m = Muxer::new(bounded(window), video, Some(aac)).with_retention_pool(pool());
     let (mut dts, mut audio) = (0i64, 0i64);
     let mut rules = playlist::RuleCheck::default();
     let mut retention = playlist::RetentionCheck::default();

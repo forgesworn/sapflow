@@ -313,6 +313,11 @@ struct Steady {
 /// with a retention pool: `RuleCheck` on every render and `RetentionCheck`
 /// after every push.
 fn keyframes_every(cfg: MuxerConfig, gop: i64, frames: i64, warm: i64) -> Steady {
+    keyframes_every_at(cfg, 3000, gop, frames, warm)
+}
+
+/// As [`keyframes_every`], with frames `tick` 90 kHz ticks apart.
+fn keyframes_every_at(cfg: MuxerConfig, tick: i64, gop: i64, frames: i64, warm: i64) -> Steady {
     let pool = std::sync::Arc::new(sapflow_core::fragment::FragmentQuota::new(
         crate::muxer::RETENTION_POOL_BYTES,
     ));
@@ -327,8 +332,8 @@ fn keyframes_every(cfg: MuxerConfig, gop: i64, frames: i64, warm: i64) -> Steady
     };
     for i in 0..frames {
         m.push_video(
-            i * 3000,
-            i * 3000,
+            i * tick,
+            i * tick,
             i % gop == 0,
             Bytes::from_static(&[1; 64]),
             NOW,
@@ -406,4 +411,17 @@ fn a_bound_longer_than_the_count_changes_nothing() {
     assert_eq!(with.entries, (24, 24), "{with:?}");
     assert_eq!(with.entries, without.entries);
     assert_eq!(with.listed_secs, without.listed_secs);
+}
+
+/// The server's default bound is 2 s a segment: keyframes every 2 s, at 30
+/// fps and at 29.97 (2.002 s segments), keep the whole count.
+#[test]
+fn a_bound_of_two_seconds_a_segment_keeps_two_second_keyframes() {
+    for tick in [3000, 3003] {
+        let without = keyframes_every_at(timed(None), tick, 60, 30 * 300, 30 * 150);
+        let with = keyframes_every_at(timed(Some(48)), tick, 60, 30 * 300, 30 * 150);
+        assert_eq!(with.broken, None, "tick {tick}");
+        assert_eq!(with.entries, (24, 24), "tick {tick}: {with:?}");
+        assert_eq!(with.listed_secs, without.listed_secs, "tick {tick}");
+    }
 }
