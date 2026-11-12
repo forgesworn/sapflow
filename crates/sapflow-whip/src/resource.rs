@@ -51,8 +51,9 @@ impl<'a> Token<'a> {
     }
 }
 
-/// A WHIP session's ID: 128 random bits.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// A WHIP session's ID: 128 random bits. Ordered only so that it can key
+/// sorted collections; the order means nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId([u8; 16]);
 
 impl fmt::Debug for SessionId {

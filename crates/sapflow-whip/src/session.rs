@@ -466,6 +466,10 @@ pub struct Session {
     /// panic.
     #[cfg(any(test, feature = "test-panic"))]
     armed: Option<crate::testing::Read>,
+    /// This crate's tests only: how often [`Session::poll_timeout`] was
+    /// read, for the router's deadline index.
+    #[cfg(test)]
+    deadline_reads: std::cell::Cell<u64>,
 }
 
 impl fmt::Debug for Session {
@@ -575,7 +579,15 @@ impl Session {
             panic_hooks: false,
             #[cfg(any(test, feature = "test-panic"))]
             armed: None,
+            #[cfg(test)]
+            deadline_reads: std::cell::Cell::new(0),
         })
+    }
+
+    /// This crate's tests only: how often the deadline was read.
+    #[cfg(test)]
+    pub(crate) fn deadline_reads(&self) -> u64 {
+        self.deadline_reads.get()
     }
 
     /// Test builds only: turns this session's panic hooks on
@@ -723,6 +735,8 @@ impl Session {
     pub fn poll_timeout(&self) -> Option<Instant> {
         #[cfg(any(test, feature = "test-panic"))]
         self.trip(crate::testing::Read::PollTimeout);
+        #[cfg(test)]
+        self.deadline_reads.set(self.deadline_reads.get() + 1);
         if matches!(self.state, State::Ended(_)) {
             return None;
         }

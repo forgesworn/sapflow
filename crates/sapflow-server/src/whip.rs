@@ -975,13 +975,7 @@ async fn own_udp(
     let mut armed = None;
     loop {
         owner.flush(&socket, &tcp, &mut router).await;
-        let panics = router.stats().panics;
         let deadline = router.poll_timeout();
-        if router.stats().panics != panics {
-            // A session's deadline panicked and it was dropped: take its
-            // end before waiting.
-            continue;
-        }
         if deadline != armed {
             if let Some(d) = deadline {
                 timer.as_mut().reset(d.into());
