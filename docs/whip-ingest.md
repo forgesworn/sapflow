@@ -1086,10 +1086,18 @@ Left open:
   recording it was put on never starts.
 - The end-to-end script matches recordings to served epochs by count, not
   by each file's width.
-- Observed stalls of hls.js 1.7.1 at the boundary in the end-to-end runs:
-  0.10 to 0.82 s, and 0.52 s in the review. Once, in the diagnosis, it
-  stalled about 7 s on a 0.37 s buffer hole before stepping over it; that
-  was not seen again.
+- Observed stalls of hls.js 1.7.1 at the boundary in the end-to-end runs,
+  before the cut kept what it held: 0.10 to 0.82 s, and 0.52 s in the
+  review; once, in the diagnosis, about 7 s on a 0.37 s buffer hole, and
+  once 7.10 s after #74 merged. Since, in 13 runs (UDP, TCP, the PROXY
+  relay and ten forced changes over TCP) the longest stall was 0.00 s in 12
+  and 0.11 s in one. That is too few runs to show the long stall has gone,
+  which was seen about once in twelve. At those changes Chrome's new
+  keyframe came 48 to 100 ms after the held frame; the audio received had
+  run 20 to 84 ms past the held frame in 11 cuts and ended 74 ms short of
+  it in one; audio was carried into the new run twice. A new run's file can
+  now start with audio up to about a tenth of a second before its first
+  picture, where late audio joined it.
 
 The cut's log line (`codec change cut`, at debug) gives the gap to the new
 keyframe and how far the audio received ran past the held frame.

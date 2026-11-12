@@ -398,7 +398,11 @@ function hits(text, s) {
     // its init can still count frames. A file that lost whole fragments
     // still decodes cleanly, so this does not see missing media; the
     // server's completeness marks are what report that.
-    const whole = spawnSync('ffmpeg', ['-hide_banner', '-v', 'error', '-i', f, '-f', 'null', '-'], { encoding: 'utf8' });
+    // At the stream's own time base: ffmpeg's default guesses one from the
+    // frame rate, and a file whose video starts after its audio (late audio
+    // kept at a codec change) then has frames rounded onto each other,
+    // which it reports though nothing fails to decode.
+    const whole = spawnSync('ffmpeg', ['-hide_banner', '-v', 'error', '-i', f, '-enc_time_base', 'demux', '-f', 'null', '-'], { encoding: 'utf8' });
     const decodeErrors = whole.stderr.split('\n').filter(Boolean);
     check('recording: decodes whole with no error', whole.status === 0 && decodeErrors.length === 0 && video && +video.nb_read_frames > 0,
       video ? `${video.nb_read_frames} H.264 frames at ${video.width}x${video.height}, ${decodeErrors.length} decode errors; video from ${video.start_time} for ${video.duration} s, audio from ${audio ? audio.start_time : '-'} for ${audio ? audio.duration : '-'} s` : probe.stderr.trim());
