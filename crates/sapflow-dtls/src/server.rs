@@ -705,8 +705,10 @@ impl Server {
             if f.msg_type == message::FINISHED && f.seq == finished_seq && f.offset == 0 {
                 return self.resend(now);
             }
-            if f.msg_type == message::CLIENT_HELLO && f.seq > finished_seq && !refused_renegotiation
-            {
+            // Any authenticated ClientHello now asks to renegotiate. Its
+            // message_seq says nothing: a new handshake starts again at 0
+            // (RFC 6347 section 4.2.2), though some peers keep counting.
+            if f.msg_type == message::CLIENT_HELLO && f.offset == 0 && !refused_renegotiation {
                 self.phase = Phase::Connected {
                     finished_seq,
                     refused_renegotiation: true,

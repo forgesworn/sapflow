@@ -815,20 +815,35 @@ fn retransmitted_finished_resends_our_last_flight() {
 
 #[test]
 fn renegotiation_is_refused_once_with_a_warning() {
-    let mut p = connected_pair();
-    let hello = p.client.options.hello_body(&[1; 32], &[]);
-    let seq = p.client.finished_seq() + 1;
-    let rec = p.client.seal_handshake(message::CLIENT_HELLO, seq, &hello);
-    p.feed(&[rec]).expect("renegotiation");
-    let out = p.drain();
-    assert_eq!(out.len(), 1);
-    let r = record::records(&out[0]).next().expect("record");
-    assert_eq!((r.content_type, r.epoch), (record::ALERT, 1));
-    let rec = p.client.seal_handshake(message::CLIENT_HELLO, seq, &hello);
-    p.feed(&[rec]).expect("again");
-    assert!(p.drain().is_empty(), "refused once, then silence");
-    assert_eq!(p.server.state(), State::Connected);
-    assert_eq!(p.server.stats().signatures, 1);
+    // RFC 6347 section 4.2.2: the first message of each handshake has
+    // message_seq 0, so a conforming peer's renegotiation ClientHello
+    // carries 0. A peer that keeps counting is refused the same way.
+    for conforming in [true, false] {
+        let mut p = connected_pair();
+        let seq = if conforming {
+            0
+        } else {
+            p.client.finished_seq() + 1
+        };
+        let body = p.client.options.hello_body(&[1; 32], &[]);
+        let rec = p.client.seal_handshake(message::CLIENT_HELLO, seq, &body);
+        p.feed(&[rec]).expect("renegotiation");
+        let out = p.drain();
+        assert_eq!(out.len(), 1, "message_seq {seq}: one answer");
+        let r = record::records(&out[0]).next().expect("record");
+        assert_eq!((r.content_type, r.epoch), (record::ALERT, 1));
+        let alert = p.client.handle(&out[0]).expect_err("an alert");
+        assert_eq!(
+            alert,
+            format!("alert {:?}", [alert::WARNING, alert::NO_RENEGOTIATION]),
+            "message_seq {seq}: a warning-level no_renegotiation"
+        );
+        let rec = p.client.seal_handshake(message::CLIENT_HELLO, seq, &body);
+        p.feed(&[rec]).expect("again");
+        assert!(p.drain().is_empty(), "refused once, then silence");
+        assert_eq!(p.server.state(), State::Connected);
+        assert_eq!(p.server.stats().signatures, 1);
+    }
 }
 
 #[test]
