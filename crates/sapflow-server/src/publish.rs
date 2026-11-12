@@ -465,11 +465,22 @@ impl Publication {
         }
         if applied.restarted {
             // A new init segment: the old recording ends here (its file is
-            // finished and reported) and a new one starts.
+            // finished and reported) and a new one starts. The old file
+            // first takes its epoch's last parts, sealed by this push, or
+            // starts with them if the epoch was shorter than one part.
+            let unrecorded = session
+                .recorder
+                .as_mut()
+                .is_some_and(|outgoing| !self.stream.feed_outgoing(outgoing));
             session.recorder = session
                 .recorder_factory
                 .as_ref()
                 .map(RecorderFactory::start);
+            if unrecorded {
+                // Served media with no file: say so on the next one.
+                session
+                    .mark_recording_incomplete(self.generation, IncompleteReason::EpochUnrecorded);
+            }
             // One ingest batch can both begin an epoch and discover loss.
             // Without sample-level attribution, conservatively taint both
             // files before feeding any parts into the successor recorder.

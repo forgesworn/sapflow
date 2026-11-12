@@ -180,6 +180,10 @@ pub struct State {
     /// Rendered only on demand, then shared until the next media update.
     conventional_media: Option<Bytes>,
     pub multivariant: Option<Bytes>,
+    /// The tracks of the current codec epoch and the one before, as the
+    /// muxer had them after a push, so an epoch's recording can still be
+    /// started once the muxer has moved on ([`Stream::feed_outgoing`]).
+    epoch_tracks: Vec<(u64, Tracks)>,
 }
 
 /// Who owns the stream: the connected publisher, or nobody while it is
@@ -321,6 +325,7 @@ impl LiveStream {
                 media: None,
                 conventional_media: None,
                 multivariant: None,
+                epoch_tracks: Vec::new(),
             }),
             session: Mutex::new(Session {
                 generation: 0,
@@ -435,7 +440,10 @@ impl LiveStream {
             return Err(IngestError::PresentationExpired);
         }
         let update = match f(&mut st.ingest, SystemTime::now()) {
-            Ok(update) => update,
+            Ok(update) => {
+                Self::note_epoch(&mut st);
+                update
+            }
             Err(error) => {
                 // A rejected input can still retire accepted muxer state.
                 // Conventional requests previously rendered that state live.
@@ -457,6 +465,26 @@ impl LiveStream {
             restarted: update.restarted,
             media_loss: update.media_loss,
         })
+    }
+
+    /// Remembers the current epoch's tracks (and keeps the one before).
+    fn note_epoch(st: &mut State) {
+        let Some(m) = st.ingest.muxer() else {
+            return;
+        };
+        let id = m.current_initialization_id();
+        let Some(tracks) = Tracks::with_audio(m.video().cloned(), m.audio_config().copied()) else {
+            return;
+        };
+        match st.epoch_tracks.last_mut() {
+            Some((last, current)) if *last == id => *current = tracks,
+            _ => {
+                if st.epoch_tracks.len() >= 2 {
+                    st.epoch_tracks.remove(0);
+                }
+                st.epoch_tracks.push((id, tracks));
+            }
+        }
     }
 
     fn render(st: &mut State) -> bool {
@@ -489,6 +517,7 @@ impl LiveStream {
             let result = state
                 .ingest
                 .finish(SystemTime::now(), session.closed_cleanly());
+            Self::note_epoch(&mut state);
             if !trimmed_before && state.ingest.trimmed_audio_tail() {
                 tracing::info!(
                     path = %self.path.as_path(),
@@ -508,10 +537,20 @@ impl LiveStream {
             session.mark_recording_incomplete(session.generation, IncompleteReason::EndOfInput);
         }
         if result.is_ok_and(|update| update.restarted) {
+            let unrecorded = session
+                .recorder
+                .as_mut()
+                .is_some_and(|outgoing| !self.feed_outgoing(outgoing));
             session.recorder = session
                 .recorder_factory
                 .as_ref()
                 .map(RecorderFactory::start);
+            if unrecorded {
+                session.mark_recording_incomplete(
+                    session.generation,
+                    IncompleteReason::EpochUnrecorded,
+                );
+            }
             if loss {
                 session.mark_recording_incomplete(session.generation, IncompleteReason::EndOfInput);
             }
@@ -528,9 +567,99 @@ impl LiveStream {
         crate::own_http::notify();
     }
 
-    /// The init segment and every finished part after `after`, for the
-    /// recorder. Parts are never skipped as long as this is called after
-    /// every push.
+    /// Before a recording rolls to a new codec epoch: gives the outgoing
+    /// recorder every part of its epoch that it has not had, so media that
+    /// was served is recorded. Returns `false` when some of it cannot be:
+    /// mark the next recording incomplete ([`IncompleteReason::EpochUnrecorded`]).
+    ///
+    /// - The push that starts an epoch also seals the old epoch's last parts
+    ///   (the muxer's interrupt), and [`Stream::parts_after`] gives only the
+    ///   current epoch's. A recorder that has started is fed the rest of
+    ///   its own epoch; it keeps its own init.
+    /// - An epoch shorter than one part, once part timing is known, is still
+    ///   served: the interrupt seals its open part. Its recorder never
+    ///   started, so it is started now with that epoch's tracks, as noted
+    ///   after the push that began it, and fed the epoch's parts.
+    /// - An epoch begun and ended inside one push left no tracks to start
+    ///   its recording with: `false`. So does a late start whose first part
+    ///   was refused (no free writer, or the byte budget full).
+    pub fn feed_outgoing(&self, recorder: &mut Recorder) -> bool {
+        if !recorder.is_accepting() {
+            // Stopped: it has marked itself.
+            return true;
+        }
+        let fed = {
+            let st = self.lock();
+            let Some(m) = st.ingest.muxer() else {
+                return true;
+            };
+            let first = m.epoch_first_part_id();
+            // The outgoing epoch, and the part to feed after.
+            let (epoch, after) = match recorder.last_part() {
+                Some(last) => match m.part(last) {
+                    PartLookup::Found(p) => (p.initialization.id, Some(last)),
+                    _ => return true,
+                },
+                None => match m.current_initialization_id().checked_sub(1) {
+                    Some(previous) => (previous, None),
+                    None => return true,
+                },
+            };
+            let found = |id: u64| match m.part(id) {
+                PartLookup::Found(p) if p.initialization.id == epoch => Some(p),
+                _ => None,
+            };
+            let parts: Vec<Arc<Part>> = match after {
+                // Upwards from the last part fed: the file's own tail, even
+                // when later epochs sealed parts in the same push.
+                Some(last) => (last + 1..first).map_while(found).collect(),
+                // Never started: the epoch just before the current one,
+                // newest first, back to its start or out of the window.
+                None => {
+                    let mut parts: Vec<Arc<Part>> = (0..first).rev().map_while(found).collect();
+                    parts.reverse();
+                    parts
+                }
+            };
+            // An epoch between this one and the current one began and ended
+            // inside one push: any parts it left have no recording.
+            let current = m.current_initialization_id();
+            let skipped = current > epoch + 1
+                && (0..first)
+                    .rev()
+                    .map_while(|id| match m.part(id) {
+                        PartLookup::Found(p) => Some(p.initialization.id),
+                        _ => None,
+                    })
+                    .any(|e| e > epoch && e < current);
+            if parts.is_empty() {
+                return !skipped;
+            }
+            let tracks = if after.is_some() {
+                // Not read by a recorder that has started.
+                Tracks::with_audio(m.video().cloned(), m.audio_config().copied())
+            } else {
+                st.epoch_tracks
+                    .iter()
+                    .find(|(id, _)| *id == epoch)
+                    .map(|(_, tracks)| tracks.clone())
+            };
+            match tracks {
+                Some(tracks) => (tracks, parts, skipped),
+                None => return false,
+            }
+        };
+        let (tracks, parts, skipped) = fed;
+        recorder.feed(tracks, parts);
+        // A late start whose first part was refused (no free writer, or the
+        // byte budget full) recorded nothing of the epoch.
+        !skipped && recorder.last_part().is_some()
+    }
+
+    /// The init segment and every finished part of the current codec epoch
+    /// after `after`, for the recorder. Parts are never skipped as long as
+    /// this is called after every push and, before a recording rolls to a
+    /// new epoch, [`Stream::feed_outgoing`] has fed the old one.
     pub fn parts_after(&self, after: Option<u64>) -> Option<(Tracks, Vec<Arc<Part>>)> {
         let st = self.lock();
         let m = st.ingest.muxer()?;

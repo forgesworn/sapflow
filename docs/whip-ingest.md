@@ -988,11 +988,73 @@ Browsers send a keyframe when asked, not on a schedule. `TargetDuration` and
 
 ### Format changes
 
-A sender may change resolution mid-stream under CPU or bandwidth pressure. A
-new SPS then reaches `EsIngest` as it would from an RTMP encoder, and starts a
-new initialisation epoch (`restarted`) on the retained muxer. Pages that
-publish from a browser should hold resolution and let frame rate drop instead
-(`degradationPreference: "maintain-resolution"` where supported).
+A sender may change resolution mid-stream under CPU or bandwidth pressure,
+and a browser often starts low and ramps up (Chrome 157 went from 480x270 to
+640x360 a few seconds in). A new SPS or PPS reaches `EsIngest` as an RTMP
+sequence header or an SRT encoder's in-band sets do, and the same rule
+applies to all three:
+
+- At the next IDR whose parameter sets differ from the current epoch's (byte
+  for byte, ignoring trailing zero bytes), the ingest starts a new codec
+  epoch on the same muxer: a new init segment with the new avcC, after an
+  `EXT-X-DISCONTINUITY` and a new `EXT-X-MAP`, with `TARGETDURATION` and
+  `PART-TARGET` unchanged and the timeline carried straight on. The update
+  says `restarted`, so the recording rolls to a new file there.
+- A PPS change alone starts an epoch too, since samples carry no parameter
+  sets of their own. Sets repeated unchanged at every IDR start nothing. A
+  changed SPS that does not parse keeps the current epoch, and is logged once.
+- Before the recording rolls, the old file takes its epoch's last parts,
+  which the change sealed. Media that was served is recorded, or the
+  recording is marked:
+  - Once part timing is known, the change seals the open part, so even an
+    epoch shorter than one part is served (its own `EXT-X-MAP` and a
+    segment). Its recording never started; it is started at the roll, with
+    the tracks the stream noted when the epoch began, and fed the epoch's
+    parts.
+  - An epoch that began and ended inside one ingest batch left no tracks to
+    start a recording with; the next recording is then marked incomplete
+    (`epoch-unrecorded`).
+  - While part timing is still being learnt, at the start of a stream, the
+    change seals nothing and that epoch is never served or recorded.
+    Chrome 157 did this at the start of some runs: its first IDR at
+    640x360, then 480x270 at once, then 640x360.
+  - The log line gives the ended epoch's parts after the change sealed them
+    (`previous_parts`); zero means it was never served.
+
+Before this, the first init stayed while frames of the new size were
+written under it, so players failed to decode them (hls.js stalled after a
+few frames) and the recording, though marked complete, did not decode past
+the change.
+
+Left open:
+
+- At the change the muxer drops its pending video frame and pending audio
+  (in the fixture test, 1 video frame and 3 AAC frames of 60 and 96), as it
+  does at any interrupt, and the recording is not marked for it.
+- Two writers a path (`PATH_WRITERS`): epochs that change faster than a
+  finished file can be written out leave a later recording without a
+  writer, which fails it. A late-started file for a short epoch takes one
+  of the two. In real time the short epoch and the next part give the
+  writer that time; nothing bounds the epoch rate but the IDR cadence (for
+  the bounds work in W3c part 2b). A late start refused a writer or byte
+  budget marks the next file `epoch-unrecorded`.
+- Unmarked losses that need several complete access units in one ingest
+  batch, so in practice only crafted input: a short epoch, then an epoch
+  with no part, then a third configuration, all in one batch, loses the
+  short epoch with no mark; and an `epoch-unrecorded` mark is lost if the
+  recording it was put on never starts.
+- The end-to-end script matches recordings to served epochs by count, not
+  by each file's width.
+- Observed stalls of hls.js 1.7.1 at the boundary in the end-to-end runs:
+  0.10 to 0.82 s, and 0.52 s in the review. Once, in the diagnosis, it
+  stalled about 7 s on a 0.37 s buffer hole before stepping over it; that
+  was not seen again.
+
+Pages that publish from a browser should still hold resolution and let frame
+rate drop (`degradationPreference: "maintain-resolution"` where supported):
+an epoch change costs viewers a discontinuity. In one run with it set,
+Chrome held 640x360 throughout, but a run without it did not change
+resolution either, so that is not proof that it prevents one.
 
 ### Loss
 

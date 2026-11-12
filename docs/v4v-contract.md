@@ -132,7 +132,9 @@ fields have unknown integrity, never an implicit finalised result. Retries keep
 the exact same state and reason. Reason codes include `ingest-discarded-packets`,
 `srt-unrecovered-loss`, `srt-timeout`, `srt-ingest-queue-full`,
 `rtmp-protocol-error`, `over-bitrate`, `stale-media`, `srt-listener-stopped`,
-`ingest-error`, `media-loss`, `end-of-input-loss`, `writer-behind` and `disk-low`.
+`ingest-error`, `media-loss`, `end-of-input-loss`, `writer-behind`, `disk-low`
+and `epoch-unrecorded` (a codec epoch before this file was served but not
+recorded).
 Receivers must handle unknown future reason codes without rendering untrusted
 provider text. Failed or unsynchronised files still produce no completion. Do not infer an old file's topology from the latest live
 session, and do not equate a finalised epoch file with a complete-show replay.
