@@ -50,6 +50,14 @@ fn audio_config() -> AacConfig {
 }
 
 fn fixtures(workload: Workload, iterations: u32) -> (MpegTsConfig, Vec<SharedSample>) {
+    fixtures_with_gap(workload, iterations, None)
+}
+
+fn fixtures_with_gap(
+    workload: Workload,
+    iterations: u32,
+    gap_every: Option<u32>,
+) -> (MpegTsConfig, Vec<SharedSample>) {
     let (config, codec) = match workload.kind {
         Kind::Audio => (
             MpegTsConfig {
@@ -102,7 +110,8 @@ fn fixtures(workload: Workload, iterations: u32) -> (MpegTsConfig, Vec<SharedSam
                     SampleTiming::new(ticks, ticks, 1024, 48000).expect("audio timing")
                 }
                 Kind::Video | Kind::Idr => {
-                    let ticks = i64::from(sequence) * 3000;
+                    let gaps = gap_every.map_or(0, |every| sequence / every);
+                    let ticks = i64::from(sequence) * 3000 + i64::from(gaps) * 270_000;
                     SampleTiming::new(ticks, ticks, 3000, 90000).expect("video timing")
                 }
             };
@@ -159,6 +168,84 @@ fn measure(workload: Workload, iterations: u32) -> Measurement {
     }
 }
 
+fn stream_header(output: &mut impl std::io::Write, name: &str, iterations: u32) {
+    output.write_all(b"WORK").expect("workload tag");
+    output
+        .write_all(
+            &u32::try_from(name.len())
+                .expect("bounded name")
+                .to_be_bytes(),
+        )
+        .expect("name length");
+    output.write_all(name.as_bytes()).expect("name");
+    output
+        .write_all(&iterations.to_be_bytes())
+        .expect("sample count");
+}
+
+fn stream_record(output: &mut impl std::io::Write, sequence: u32, chunk: u32, bytes: &[u8]) {
+    output.write_all(&sequence.to_be_bytes()).expect("sequence");
+    output.write_all(&chunk.to_be_bytes()).expect("chunk index");
+    output
+        .write_all(
+            &u32::try_from(bytes.len())
+                .expect("bounded chunk")
+                .to_be_bytes(),
+        )
+        .expect("chunk length");
+    output.write_all(bytes).expect("complete output chunk");
+}
+
+fn stream_footer(output: &mut impl std::io::Write, bytes: u64, chunks: u64) {
+    output.write_all(b"DONE").expect("workload end");
+    output.write_all(&bytes.to_be_bytes()).expect("byte count");
+    output
+        .write_all(&chunks.to_be_bytes())
+        .expect("chunk count");
+}
+
+fn verify_stream(
+    workload: Workload,
+    iterations: u32,
+    gap_every: Option<u32>,
+    output: &mut impl std::io::Write,
+) {
+    let (config, samples) = fixtures_with_gap(workload, iterations, gap_every);
+    let mut mux = MpegTsMuxer::new(config).expect("verification mux");
+    stream_header(output, workload.name, iterations);
+    let mut output_bytes = 0u64;
+    let mut chunks = 0u64;
+    for (sequence, sample) in samples.into_iter().enumerate() {
+        let sequence = u32::try_from(sequence).expect("bounded sample index");
+        mux.push(sample).expect("verification push");
+        let mut chunk_index = 0u32;
+        while let Some(chunk) = mux.poll_chunk().expect("verification drain") {
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= 1316 && chunk.len() % 188 == 0);
+            stream_record(output, sequence, chunk_index, &chunk);
+            output_bytes += chunk.len() as u64;
+            chunks += 1;
+            chunk_index += 1;
+        }
+        assert!(chunk_index > 0 && mux.is_idle());
+        stream_record(output, sequence, chunk_index, &[]);
+    }
+    let stats = mux.stats();
+    assert_eq!(stats.accepted_samples, u64::from(iterations));
+    assert_eq!(stats.emitted_bytes, output_bytes);
+    assert_eq!(stats.emitted_packets * 188, output_bytes);
+    assert_eq!(
+        stats.resets,
+        gap_every.map_or(0, |every| u64::from((iterations - 1) / every))
+    );
+    assert_eq!(stats.discarded_sample_bytes, 0);
+    stream_footer(output, output_bytes, chunks);
+    println!(
+        "{{\"kind\":\"verification_workload\",\"component\":\"mpegts\",\"workload\":\"{}\",\"samples\":{},\"output_bytes\":{},\"chunks\":{},\"resets\":{}}}",
+        workload.name, iterations, output_bytes, chunks, stats.resets,
+    );
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut iterations = 10_000u32;
     let mut args = std::env::args().skip(1);
@@ -175,13 +262,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !(1..=100_000).contains(&iterations) {
         return Err("iterations must be 1..100000".into());
     }
-    println!(
-        "{{\"kind\":\"method\",\"synthetic_payloads\":true,\"architecture\":\"{}\",\"debug_assertions\":{},\"iterations\":{},\"timing\":\"push, drain and output drop; excludes fixture generation, warm-up and checksum\"}}",
-        std::env::consts::ARCH,
-        cfg!(debug_assertions),
-        iterations,
-    );
-    for workload in [
+    let workloads = [
         Workload {
             name: "aac-320",
             kind: Kind::Audio,
@@ -197,21 +278,93 @@ fn main() -> Result<(), Box<dyn Error>> {
             kind: Kind::Idr,
             payload_bytes: 512 * 1024,
         },
-    ] {
-        black_box(measure(workload, 16));
-        let measured = measure(workload, iterations);
+    ];
+
+    if let Some(mode) = std::env::var_os("SAPFLOW_BENCH_VERIFY_STREAM") {
+        if mode != "1" || iterations != 10_000 {
+            return Err("verification requires mode=1 and exactly 10000 samples".into());
+        }
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        let mut output = std::io::BufWriter::with_capacity(65536, stderr.lock());
+        output.write_all(b"SFPERF1T")?;
+        for workload in workloads {
+            verify_stream(workload, iterations, None, &mut output);
+        }
+        verify_stream(
+            Workload {
+                name: "h264-gap-recovery-8500",
+                kind: Kind::Idr,
+                payload_bytes: 8500,
+            },
+            iterations,
+            Some(256),
+            &mut output,
+        );
+        output.write_all(b"END!")?;
+        output.flush()?;
         println!(
-            "{{\"workload\":\"{}\",\"iterations\":{},\"elapsed_ns\":{},\"ns_per_sample\":{:.3},\"output_bytes\":{},\"verification_fnv1a64\":\"{:016x}\",\"staging_copy_bytes\":{},\"packet_copy_bytes\":{},\"writer_copy_bytes\":{},\"output_allocations\":{}}}",
+            "{{\"kind\":\"verification_complete\",\"component\":\"mpegts\",\"workloads\":4,\"samples_per_workload\":10000,\"architecture\":\"{}\",\"debug_assertions\":{}}}",
+            std::env::consts::ARCH,
+            cfg!(debug_assertions)
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{{\"kind\":\"method\",\"synthetic_payloads\":true,\"architecture\":\"{}\",\"debug_assertions\":{},\"iterations\":{},\"timing\":\"sum of fresh-instance inner batches; push, drain and output drop; excludes fixture generation, warm-up and checksum\"}}",
+        std::env::consts::ARCH,
+        cfg!(debug_assertions),
+        iterations,
+    );
+    for workload in workloads {
+        black_box(measure(workload, 16));
+        let batches: u32 = match workload.kind {
+            Kind::Audio => 128,
+            Kind::Video => 16,
+            Kind::Idr => 1,
+        };
+        let mut batch_elapsed_ns = Vec::with_capacity(batches as usize);
+        let mut summed_elapsed_ns = 0u128;
+        let mut total_output_bytes = 0u64;
+        let mut per_batch = None;
+        for _ in 0..batches {
+            let measured = measure(workload, iterations);
+            let signature = (
+                measured.output_bytes,
+                measured.verification_fnv1a64,
+                measured.stats.elementary_staging_copy_bytes,
+                measured.stats.packet_payload_copy_bytes,
+                measured.stats.writer_payload_copy_bytes,
+                measured.stats.output_allocations,
+            );
+            if let Some(expected) = per_batch {
+                assert_eq!(signature, expected, "repeat fresh deterministic batch");
+            }
+            per_batch = Some(signature);
+            batch_elapsed_ns.push(measured.elapsed_ns);
+            summed_elapsed_ns += measured.elapsed_ns;
+            total_output_bytes += measured.output_bytes;
+        }
+        let (output_bytes_per_batch, witness, staging, packet, writer, allocations) =
+            per_batch.expect("positive batches");
+        let operations = u64::from(iterations) * u64::from(batches);
+        println!(
+            "{{\"workload\":\"{}\",\"iterations_per_batch\":{},\"batches\":{},\"operations\":{},\"elapsed_ns\":{},\"ns_per_sample\":{:.3},\"output_bytes\":{},\"output_bytes_per_batch\":{},\"legacy_four_sample_fnv1a64\":\"{:016x}\",\"staging_copy_bytes\":{},\"packet_copy_bytes\":{},\"writer_copy_bytes\":{},\"output_allocations\":{},\"batch_elapsed_ns\":{:?}}}",
             workload.name,
             iterations,
-            measured.elapsed_ns,
-            measured.elapsed_ns as f64 / f64::from(iterations),
-            measured.output_bytes,
-            measured.verification_fnv1a64,
-            measured.stats.elementary_staging_copy_bytes,
-            measured.stats.packet_payload_copy_bytes,
-            measured.stats.writer_payload_copy_bytes,
-            measured.stats.output_allocations,
+            batches,
+            operations,
+            summed_elapsed_ns,
+            summed_elapsed_ns as f64 / operations as f64,
+            total_output_bytes,
+            output_bytes_per_batch,
+            witness,
+            staging * u64::from(batches),
+            packet * u64::from(batches),
+            writer * u64::from(batches),
+            allocations * u64::from(batches),
+            batch_elapsed_ns,
         );
     }
     Ok(())
