@@ -3371,6 +3371,15 @@ impl Muxer {
         self.next_segment.as_ref().is_some_and(|s| s.discontinuity)
     }
 
+    /// The published media time: every `EXTINF` the window has listed, once
+    /// each, plus the open parts' spans. It runs on with the media, through
+    /// reconnects and codec epochs, and can step back a little when a run
+    /// ends with its media after a clamped part. A clock for budgets kept
+    /// in media time.
+    pub fn published_media(&self) -> Duration {
+        self.edge()
+    }
+
     /// `PART-TARGET`: zero until the first segment is complete, then fixed.
     pub fn part_target(&self) -> Duration {
         self.timing

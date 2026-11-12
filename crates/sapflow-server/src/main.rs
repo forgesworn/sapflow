@@ -20,6 +20,7 @@ mod publish_session_store;
 mod publish_session_wire;
 mod publish_sessions;
 mod recorder;
+mod roll_budget;
 mod rtmp;
 mod srt;
 mod srt_own;

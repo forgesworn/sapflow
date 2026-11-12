@@ -358,6 +358,8 @@ impl Publication {
                 |session, claim| {
                     session.recorder_factory = recorder_factory;
                     if claim == Claim::Fresh {
+                        session.rolls =
+                            crate::roll_budget::RollBudget::new(app.config.recording_roll);
                         session.recorder = session
                             .recorder_factory
                             .as_ref()
