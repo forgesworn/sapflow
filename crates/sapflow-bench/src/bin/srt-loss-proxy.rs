@@ -3,7 +3,7 @@
 //!
 //!     srt-loss-proxy --listen 127.0.0.1:8891 --target 127.0.0.1:8890 \
 //!         --loss random:10 --delay-ms 30 --seed 1 --stats stats.txt
-//!         [--jitter-ms 20] [--protocol srt|whip]
+//!         [--jitter-ms 20] [--jitter-order reorder|keep] [--protocol srt|whip]
 //!
 //! Forwards datagrams between one client and one target. Each direction
 //! drops packets with its own loss process and delays every packet by a fixed
@@ -13,7 +13,10 @@
 //! `--jitter-ms J`, each impaired packet waits a further time drawn
 //! uniformly from 0 to J ms, from its own seeded process (so the loss
 //! pattern is the same with and without it), and packets leave in the order
-//! they fall due, so they can be reordered, as netem's jitter does.
+//! they fall due, so they can be reordered, as netem's jitter does. With
+//! `--jitter-order keep` as well, the delays spread the same way but a
+//! packet never leaves before one that arrived ahead of it in the same
+//! direction: it waits for it instead, so nothing is reordered.
 //!
 //! What is impaired (dropped and jittered) depends on `--protocol`. For
 //! `srt`, the default, every packet but a handshake: SRT handshakes are
@@ -103,11 +106,8 @@ impl<T> DelayQueue<T> {
         }
     }
 
-    fn push(&mut self, now: Instant, item: T) {
-        self.push_after(now, Duration::ZERO, item);
-    }
-
-    /// As [`DelayQueue::push`], waiting `extra` longer.
+    /// Queues an item that arrived at `now`, due after the fixed delay and
+    /// `extra` more.
     fn push_after(&mut self, now: Instant, extra: Duration, item: T) {
         self.queue
             .push(Reverse((now + self.delay + extra, self.next, Slot(item))));
@@ -123,6 +123,52 @@ impl<T> DelayQueue<T> {
             return self.queue.pop().map(|Reverse((_, _, Slot(item)))| item);
         }
         None
+    }
+}
+
+/// The delay each packet gets beyond the fixed one: jitter for impaired
+/// packets, from each direction's own seeded process, and with `keep_order`
+/// whatever more it takes not to leave before the packet ahead of it in
+/// that direction.
+struct Spread {
+    jitter: [Rng; 2],
+    jitter_us: f64,
+    keep_order: bool,
+    delay: Duration,
+    last_due: [Option<Instant>; 2],
+}
+
+impl Spread {
+    fn new(seed: u64, jitter: Duration, keep_order: bool, delay: Duration) -> Self {
+        Self {
+            jitter: [
+                Rng(seed ^ 0x2545_F491_4F6C_DD1D),
+                Rng(seed ^ 0x9E37_79B9_7F4A_7C15),
+            ],
+            jitter_us: jitter.as_micros() as f64,
+            keep_order,
+            delay,
+            last_due: [None, None],
+        }
+    }
+
+    /// The extra wait for a packet arriving now in direction `dir`.
+    fn extra(&mut self, dir: usize, now: Instant, impaired: bool) -> Duration {
+        let mut extra = if impaired && self.jitter_us > 0.0 {
+            Duration::from_micros((self.jitter[dir].next_f64() * self.jitter_us) as u64)
+        } else {
+            Duration::ZERO
+        };
+        if self.keep_order {
+            let due = now + self.delay + extra;
+            if let Some(last) = self.last_due[dir]
+                && due < last
+            {
+                extra += last - due;
+            }
+            self.last_due[dir] = Some(now + self.delay + extra);
+        }
+        extra
     }
 }
 
@@ -464,6 +510,7 @@ struct Args {
     delay: Duration,
     latency: Duration,
     jitter: Duration,
+    keep_order: bool,
     protocol: Protocol,
     seed: u64,
     stats: Option<PathBuf>,
@@ -477,6 +524,7 @@ fn args() -> Result<Args, String> {
         delay: Duration::ZERO,
         latency: Duration::ZERO,
         jitter: Duration::ZERO,
+        keep_order: false,
         protocol: Protocol::Srt,
         seed: 1,
         stats: None,
@@ -500,6 +548,13 @@ fn args() -> Result<Args, String> {
             }
             "--jitter-ms" => {
                 a.jitter = Duration::from_millis(v.parse().map_err(|_| "--jitter-ms: a number")?);
+            }
+            "--jitter-order" => {
+                a.keep_order = match v.as_str() {
+                    "reorder" => false,
+                    "keep" => true,
+                    _ => return Err("--jitter-order: reorder or keep".into()),
+                };
             }
             "--protocol" => {
                 a.protocol = match v.as_str() {
@@ -538,18 +593,7 @@ async fn run(a: Args) -> std::io::Result<Stats> {
     };
     // The jitter's own processes, apart from the loss's, so the loss
     // pattern is the same with and without it.
-    let mut jitter = [
-        Rng(a.seed ^ 0x2545_F491_4F6C_DD1D),
-        Rng(a.seed ^ 0x9E37_79B9_7F4A_7C15),
-    ];
-    let jitter_us = a.jitter.as_micros() as f64;
-    let mut wait = |dir: usize| {
-        if jitter_us == 0.0 {
-            Duration::ZERO
-        } else {
-            Duration::from_micros((jitter[dir].next_f64() * jitter_us) as u64)
-        }
-    };
+    let mut spread = Spread::new(a.seed, a.jitter, a.keep_order, a.delay);
     let mut client: Option<SocketAddr> = None;
     // Direction 0 is client to target, 1 is target to client.
     let mut queue: DelayQueue<(usize, Vec<u8>)> = DelayQueue::new(a.delay);
@@ -568,10 +612,8 @@ async fn run(a: Args) -> std::io::Result<Stats> {
                 stats.note_data(now, &d, dropped);
                 if dropped {
                     stats.dropped[0] += 1;
-                } else if hit {
-                    queue.push_after(now, wait(0), (0, d));
                 } else {
-                    queue.push(now, (0, d));
+                    queue.push_after(now, spread.extra(0, now, hit), (0, d));
                 }
             }
             r = up.recv(&mut ubuf) => {
@@ -584,10 +626,9 @@ async fn run(a: Args) -> std::io::Result<Stats> {
                 let hit = impaired(a.protocol, &d);
                 if hit && loss[1].drops() {
                     stats.dropped[1] += 1;
-                } else if hit {
-                    queue.push_after(Instant::now(), wait(1), (1, d));
                 } else {
-                    queue.push(Instant::now(), (1, d));
+                    let now = Instant::now();
+                    queue.push_after(now, spread.extra(1, now, hit), (1, d));
                 }
             }
             () = async {
@@ -618,7 +659,7 @@ async fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!(
-                "{e}\nusage: srt-loss-proxy --target host:port [--listen host:port] [--loss none|random:P|burst:P,L] [--delay-ms N] [--jitter-ms N] [--latency-ms N] [--protocol srt|whip] [--seed N] [--stats file]"
+                "{e}\nusage: srt-loss-proxy --target host:port [--listen host:port] [--loss none|random:P|burst:P,L] [--delay-ms N] [--jitter-ms N] [--jitter-order reorder|keep] [--latency-ms N] [--protocol srt|whip] [--seed N] [--stats file]"
             );
             return ExitCode::from(2);
         }
@@ -762,7 +803,7 @@ mod tests {
         let t0 = Instant::now();
         let mut q = DelayQueue::new(Duration::from_millis(30));
         for i in 0..5u32 {
-            q.push(t0 + Duration::from_micros(u64::from(i)), i);
+            q.push_after(t0 + Duration::from_micros(u64::from(i)), Duration::ZERO, i);
         }
         assert_eq!(q.next_due(), Some(t0 + Duration::from_millis(30)));
         assert_eq!(q.pop_due(t0 + Duration::from_millis(29)), None);
@@ -790,6 +831,38 @@ mod tests {
         assert_eq!(at(35), vec![3]);
         assert_eq!(at(45), vec![1]);
         assert_eq!(q.next_due(), None);
+    }
+
+    /// With `keep`, the jitter spreads delays but never lets a packet
+    /// leave before one ahead of it; without, some overtake.
+    #[test]
+    fn keep_order_spreads_delays_without_overtaking() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let at = |i: u64| t0 + Duration::from_micros(i * 250);
+        let due = |keep: bool| {
+            let mut s = Spread::new(3, ms(20), keep, ms(30));
+            (0..2000u64)
+                .map(|i| at(i) + ms(30) + s.extra(0, at(i), true))
+                .collect::<Vec<_>>()
+        };
+        let kept = due(true);
+        assert!(kept.windows(2).all(|w| w[0] <= w[1]), "kept in order");
+        let free = due(false);
+        assert!(free.windows(2).any(|w| w[0] > w[1]), "free jitter reorders");
+        // Free jitter spreads waits over 30 to 50 ms.
+        let waits = |v: &[Instant]| -> Vec<Duration> {
+            v.iter()
+                .enumerate()
+                .map(|(i, d)| d.saturating_duration_since(at(i as u64)))
+                .collect()
+        };
+        let w = waits(&free);
+        assert!(w.iter().all(|d| *d >= ms(30) && *d <= ms(50)));
+        assert!(waits(&kept).iter().all(|d| *d >= ms(30)));
+        // An exempt packet gets the fixed delay alone.
+        let mut s = Spread::new(3, ms(20), false, ms(30));
+        assert_eq!(s.extra(0, t0, false), Duration::ZERO);
     }
 
     #[test]
