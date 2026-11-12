@@ -1461,6 +1461,11 @@ Implementation notes (11 November 2026):
   - A peer's retransmission triggers a resend only when it repeats the
     start of the hello we answered (the version and random included), or
     when an authenticated Finished arrives again after the handshake.
+  - Epoch 0 input that breaks a reassembly bound (message size, fragments
+    per message, bytes buffered) is dropped and counted, with nothing
+    allocated for it, and so is every epoch 0 alert. Only input under the
+    read keys fails the handshake on a bound or an alert. See Epoch 0
+    injection below.
 - **A2.1.** OpenSSL 4.0.3 `s_client` matched our exported keying material
   byte for byte in eight runs. Both profiles ran, with 300-byte MTUs, a
   dropped first flight, a dropped final flight and the cookie exchange. The
@@ -1488,10 +1493,26 @@ Implementation notes (11 November 2026):
   - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
     timer doubling to 60 s, six sends), an unanswered flight 4 runs to
     about 63 s before `Error::Timeout`.
-  - **Epoch 0 injection.** An unauthenticated epoch 0 packet, such as a
-    forged fatal alert, can end a handshake. W3 limits the damage:
+  - **Epoch 0 injection.** Epoch 0 input is not authenticated. The second
+    round of the A4.4 review (12 November 2026) found that one forged
+    packet could end a handshake: a 25-byte fragment declaring 8193 bytes,
+    one over the buffer budget, or a 15-byte fatal alert, even after
+    ChangeCipherSpec. Now a fragment that breaks a reassembly bound, an
+    empty fragment of a non-empty message and every epoch 0 alert are
+    dropped and counted in `records_dropped`, and the genuine flight still
+    completes. A client that really aborts with an alert now ends at the
+    handshake deadline. Forged epoch 0 input can still:
+    - end a handshake with a forged, complete message that reaches the
+      state machine before the genuine one, such as a 25-byte zero-length
+      message of the wrong type;
+    - keep the genuine flight out until the deadline, by filling a
+      message's four candidate slots or the 16 KiB reassembly budget with
+      forged candidates.
+
+    Neither is resolved, so A4.4 needs each fixed or accepted in writing.
+    W3 limits the damage:
     - each `Server` receives only datagrams from its selected ICE-validated
-      5-tuple;
+      5-tuple, so only an attacker who can spoof that tuple can do either;
     - handshake failures are counted by reason, without addresses;
     - the publisher recovers with a new WHIP `POST`.
 

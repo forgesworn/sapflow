@@ -1,15 +1,20 @@
 //! Handshake message reassembly (RFC 6347 sections 4.2.2 and 4.2.3), with
-//! hard bounds: a message's declared length is checked against the cap
-//! before anything is allocated; every fragment that adds coverage counts
-//! towards the per-message fragment cap, while duplicates are dropped
-//! without counting; a fragment that disagrees with earlier ones for the
-//! same seq (type, length or epoch) starts one of at most [`MAX_VARIANTS`]
+//! hard bounds: a message's declared length is checked against the cap,
+//! and an empty fragment of a message that is not empty is dropped, before
+//! anything is allocated; every fragment that adds coverage counts towards
+//! the per-message fragment cap, while duplicates are dropped without
+//! counting; a fragment that disagrees with earlier ones for the same seq
+//! (type, length or epoch) starts one of at most [`MAX_VARIANTS`]
 //! candidates, so while `max_buffered` has room it neither is lost nor
-//! blocks the real message; a candidate over the fragment cap is dropped
-//! when the seq has another; and all messages in progress together hold at
-//! most `max_buffered` bytes. Messages are released strictly in
-//! `message_seq` order, and of several complete candidates the one started
-//! first wins.
+//! blocks the real message; a candidate over the fragment cap is removed
+//! and its bytes freed; and all messages in progress together hold at most
+//! `max_buffered` bytes. Messages are released strictly in `message_seq`
+//! order, and of several complete candidates the one started first wins.
+//!
+//! A fragment that would break a bound is [`Push::Over`], with nothing kept
+//! for it, and the caller decides what that means: the server drops an
+//! unauthenticated (epoch 0) one and fails the handshake only for one
+//! under the read keys.
 
 /// Candidates kept for one `message_seq`.
 pub(crate) const MAX_VARIANTS: usize = 4;
@@ -43,9 +48,16 @@ pub(crate) enum Push {
     Old { seq: u16, offset: u32 },
     /// Stored (it may or may not have completed its message).
     Stored,
-    /// Dropped: outside the window, empty, or inconsistent with earlier
-    /// fragments of the same message.
+    /// Dropped: outside the window, empty, a duplicate, or a further
+    /// candidate for its seq that is over the candidate, buffer or
+    /// fragment cap.
     Dropped,
+    /// Refused because it would break this bound: a declared length over
+    /// `max_message`, a first candidate for its seq that does not fit
+    /// `max_buffered`, or the only candidate for its seq going over
+    /// `max_fragments`. Nothing is kept for it; a candidate over the
+    /// fragment cap is removed and its bytes freed.
+    Over(Limit),
 }
 
 #[derive(Debug)]
@@ -124,9 +136,16 @@ impl Reassembler {
         if u32::from(f.seq) >= u32::from(self.next_seq) + u32::from(self.limits.ahead) {
             return Ok(Push::Dropped);
         }
-        let length = usize::try_from(f.length).map_err(|_| Error::Limit(Limit::MessageSize))?;
+        let Ok(length) = usize::try_from(f.length) else {
+            return Ok(Push::Over(Limit::MessageSize));
+        };
         if length > self.limits.max_message {
-            return Err(Error::Limit(Limit::MessageSize));
+            return Ok(Push::Over(Limit::MessageSize));
+        }
+        if f.data.is_empty() && length != 0 {
+            // No bytes, so no progress: dropped before a candidate is found
+            // or made for it, so that it can hold no budget.
+            return Ok(Push::Dropped);
         }
         let same = |p: &Partial| {
             p.seq == f.seq && p.msg_type == f.msg_type && p.body.len() == length && p.epoch == epoch
@@ -143,12 +162,13 @@ impl Reassembler {
                     return Ok(Push::Dropped);
                 }
                 if self.buffered + length > self.limits.max_buffered {
-                    // Refused only for a message seen for the first time;
-                    // a conflicting candidate that does not fit is dropped.
+                    // Over the bound only for a message seen for the first
+                    // time; a conflicting candidate that does not fit is
+                    // dropped.
                     if variants > 0 {
                         return Ok(Push::Dropped);
                     }
-                    return Err(Error::Limit(Limit::Buffered));
+                    return Ok(Push::Over(Limit::Buffered));
                 }
                 self.buffered += length;
                 self.partials.push(Partial {
@@ -165,13 +185,9 @@ impl Reassembler {
         let max_fragments = self.limits.max_fragments;
         let p = self.partials.get_mut(index).ok_or(Error::Internal)?;
         if f.data.is_empty() {
-            // Progress only for a zero-length message, which is complete
-            // as soon as it is seen.
-            return Ok(if length == 0 {
-                Push::Stored
-            } else {
-                Push::Dropped
-            });
+            // Only a zero-length message gets here, and it is complete as
+            // soon as it is seen.
+            return Ok(Push::Stored);
         }
         let start = usize::try_from(f.offset).map_err(|_| Error::Internal)?;
         let end = start + f.data.len();
@@ -184,14 +200,18 @@ impl Reassembler {
         p.fragments += 1;
         if p.fragments > max_fragments {
             let (seq, len) = (p.seq, p.body.len());
-            if self.partials.iter().filter(|q| q.seq == seq).count() > 1 {
-                // One of several candidates for this seq: drop it rather
-                // than end the handshake, so a forged candidate cannot.
-                self.partials.remove(index);
-                self.buffered -= len;
-                return Ok(Push::Dropped);
-            }
-            return Err(Error::Limit(Limit::Fragments));
+            let others = self.partials.iter().filter(|q| q.seq == seq).count() > 1;
+            // It can no longer complete, so it goes and frees its bytes.
+            // One of several candidates for this seq is simply dropped, so a
+            // forged candidate cannot end the handshake; the only one is
+            // over the bound, for the caller to judge.
+            self.partials.remove(index);
+            self.buffered -= len;
+            return Ok(if others {
+                Push::Dropped
+            } else {
+                Push::Over(Limit::Fragments)
+            });
         }
         // `fragments` already checked offset + length against the declared
         // length, and the body has exactly that length.
@@ -297,23 +317,45 @@ mod tests {
         let mut r = Reassembler::new(LIMITS);
         assert_eq!(
             r.push(0, &frag(0, 101, 0, b"x")),
-            Err(Error::Limit(Limit::MessageSize))
+            Ok(Push::Over(Limit::MessageSize))
         );
+        assert_eq!(r.buffered(), 0, "nothing allocated");
         r.push(0, &frag(0, 100, 0, b"x")).expect("first");
         assert_eq!(
             r.push(0, &frag(1, 51, 0, b"x")),
-            Err(Error::Limit(Limit::Buffered)),
+            Ok(Push::Over(Limit::Buffered)),
             "100 + 51 > 150"
         );
-        // Fragments that add coverage count: four are allowed, a fifth is
-        // refused.
+        assert_eq!(r.buffered(), 100, "nothing allocated");
+        // Fragments that add coverage count: four are allowed, and a fifth
+        // is over the bound and takes the candidate with it.
         for o in 1..4 {
             assert_eq!(r.push(0, &frag(0, 100, o, b"x")), Ok(Push::Stored));
         }
         assert_eq!(
             r.push(0, &frag(0, 100, 4, b"x")),
-            Err(Error::Limit(Limit::Fragments))
+            Ok(Push::Over(Limit::Fragments))
         );
+        assert_eq!(r.buffered(), 0, "the candidate went");
+        assert_eq!(r.pop(), None);
+        // The seq starts again from nothing.
+        assert_eq!(r.push(0, &frag(0, 2, 0, b"ab")), Ok(Push::Stored));
+        assert_eq!(r.pop().expect("complete").body, b"ab");
+    }
+
+    #[test]
+    fn empty_fragments_allocate_nothing() {
+        let mut r = Reassembler::new(LIMITS);
+        // Empty fragments of non-empty messages, more than the buffer could
+        // hold if each took its declared length.
+        for seq in 0..3 {
+            assert_eq!(r.push(0, &frag(seq, 100, 0, b"")), Ok(Push::Dropped));
+            assert_eq!(r.buffered(), 0);
+        }
+        assert_eq!(r.pop(), None);
+        // A zero-length message still completes on its one empty fragment.
+        assert_eq!(r.push(0, &frag(0, 0, 0, b"")), Ok(Push::Stored));
+        assert_eq!(r.pop().expect("empty message").body, b"");
     }
 
     #[test]

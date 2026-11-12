@@ -70,7 +70,7 @@ if let Some(Event::Connected(c)) = dtls.poll_event() {
 |--------|------|
 | `record` | Record framing, the 48-bit sequence number, epoch 1 AES-128-GCM (explicit nonce read from the wire, 13-byte AAD over the plaintext length) and the 64-record replay window, applied to epoch 1 only |
 | `message` | The handshake header and fragments; parsers for ClientHello (with every extension the profile reads), Certificate, ClientKeyExchange, CertificateVerify and Finished; builders for our flight; negotiation |
-| `reassembly` | Fragment reassembly with caps on message size, coverage-adding fragments per message and bytes buffered, checked before allocation; overlapping and out-of-order fragments; duplicates dropped without counting; a conflicting fragment for the same seq kept as one of at most four candidates, so it does not block the real message while the buffer has room; a candidate over the fragment cap dropped when the seq has another; the first-started complete candidate released |
+| `reassembly` | Fragment reassembly with caps on message size, coverage-adding fragments per message and bytes buffered, checked before allocation; an empty fragment of a message that is not empty dropped before allocation; overlapping and out-of-order fragments; duplicates dropped without counting; a conflicting fragment for the same seq kept as one of at most four candidates, so it does not block the real message while the buffer has room; a candidate over the fragment cap removed and its bytes freed; the first-started complete candidate released; a fragment over a cap reported, for the server to drop at epoch 0 or fail on at epoch 1 |
 | `flight` | Our flights kept as plaintext and re-recorded on each send (new sequence numbers and nonces), fragmented to the MTU |
 | `crypto` | The TLS 1.2 PRF, extended master secret, key block, Finished and the RFC 5705 exporter |
 | `identity` | Our certificate, fingerprints, the peer's P-256 key |
@@ -110,6 +110,42 @@ which proves return routability for the address pair before any DTLS
 datagram is accepted, and that is the cookie's purpose (RFC 6347 section
 4.2.1 allows turning it off where amplification is not a problem). It saves
 a round trip. Turning it on works (A2.1 runs it against OpenSSL).
+
+## What ends a handshake, and what is dropped
+
+Epoch 0 input is not authenticated: anyone who can spoof the peer's address
+can send it. Following RFC 6347 section 4.1.2.7, which has invalid records
+discarded rather than answered, the server drops this input and counts it in
+`Stats::records_dropped`, and the genuine flight can still complete the
+handshake:
+
+- an epoch 0 handshake fragment that declares more than `max_message_len`,
+  would take reassembly past `max_buffered`, or takes its message past
+  `max_fragments`. Nothing is allocated for it, and a candidate over the
+  fragment cap is removed and its bytes freed;
+- an empty fragment of a message that is not empty, before a candidate is
+  made for it;
+- every epoch 0 alert, fatal or `close_notify`, before and after the
+  client's ChangeCipherSpec. A client that really aborts with an alert is
+  ended by the caller's handshake deadline, not at once.
+
+These still end the handshake, with one fatal alert where `Error::alert`
+names one:
+
+- input under the read keys (epoch 1, after the client's ChangeCipherSpec),
+  which comes from the peer whose flight we answered: a reassembly bound
+  broken, a fatal alert, or `close_notify` before the handshake completes;
+- a complete handshake message, at either epoch, that the state machine
+  refuses: the wrong type for its place, one that does not parse, a
+  mismatched fingerprint, a bad key share or signature, or a wrong Finished.
+
+So forged epoch 0 input can still do two things, both bounded by the
+caller's deadline. A forged, complete message that reaches the state machine
+before the genuine one ends the handshake (a zero-length message of the
+wrong type takes 25 bytes). Forged candidates that fill a message's four
+candidate slots, or the reassembly budget, keep the genuine flight out until
+the deadline. Behind ICE, only an attacker who can spoof the selected address
+pair can send either.
 
 ## Dependencies
 

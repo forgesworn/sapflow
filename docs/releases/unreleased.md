@@ -57,3 +57,14 @@ Notes for the release after 0.2.0-rc.1.
   taken): they log it and try again after 100 ms, as WHIP's listeners do.
 - `--help` says the playlist can keep more than `SAPFLOW_SEGMENT_COUNT`
   segments, as above.
+
+## sapflow-dtls
+
+- Unauthenticated (epoch 0) input no longer ends a handshake by breaking a
+  reassembly bound. A fragment over `max_message_len`, `max_buffered` or
+  `max_fragments`, an empty fragment of a non-empty message, and every
+  alert at epoch 0 are dropped, allocate nothing and are counted in
+  `Stats::records_dropped`. `Error::PeerAlert` and those three
+  `Error::Limit`s now come only from input under the read keys, so a client
+  that aborts the handshake with an epoch 0 alert is ended by the caller's
+  handshake deadline. The API is unchanged from 0.2.0-rc.1.

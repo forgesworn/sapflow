@@ -372,6 +372,11 @@ impl Client {
                                 }
                             }
                             Push::Old { .. } | Push::Dropped => {}
+                            // The test client keeps no state worth saving:
+                            // a bound broken by the server is an error.
+                            Push::Over(limit) => {
+                                return Err(format!("{}", crate::Error::Limit(limit)));
+                            }
                         }
                     }
                 }
@@ -712,7 +717,8 @@ pub fn capture_hello(dir: &str, stem: &str) -> Vec<u8> {
     for g in capture(dir, stem) {
         for rec in record::records(&g) {
             for f in message::fragments(rec.body) {
-                r.push(0, &f).expect("fragment");
+                let pushed = r.push(0, &f).expect("fragment");
+                assert!(!matches!(pushed, Push::Over(_)), "within the bounds");
             }
         }
     }

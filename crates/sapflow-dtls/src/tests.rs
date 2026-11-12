@@ -521,8 +521,20 @@ fn out_of_order_and_overlapping_hello_fragments() {
     assert_eq!(p.server.state(), State::Handshaking);
 }
 
-/// One record whose single fragment is `data` at `offset` of a message of
-/// `length`.
+/// One handshake fragment: `data` at `offset` of a message of `length`.
+fn fragment_bytes(msg_type: u8, seq: u16, length: u32, offset: u32, data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(msg_type);
+    body.extend_from_slice(&length.to_be_bytes()[1..]);
+    body.extend_from_slice(&seq.to_be_bytes());
+    body.extend_from_slice(&offset.to_be_bytes()[1..]);
+    body.extend_from_slice(&(data.len() as u32).to_be_bytes()[1..]);
+    body.extend_from_slice(data);
+    body
+}
+
+/// One epoch 0 record whose single fragment is `data` at `offset` of a
+/// message of `length`.
 fn fragment_record(
     msg_type: u8,
     seq: u16,
@@ -531,35 +543,53 @@ fn fragment_record(
     data: &[u8],
     rseq: u64,
 ) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.push(msg_type);
-    body.extend_from_slice(&length.to_be_bytes()[1..]);
-    body.extend_from_slice(&seq.to_be_bytes());
-    body.extend_from_slice(&offset.to_be_bytes()[1..]);
-    body.extend_from_slice(&(data.len() as u32).to_be_bytes()[1..]);
-    body.extend_from_slice(data);
+    let body = fragment_bytes(msg_type, seq, length, offset, data);
     let mut out = Vec::new();
     record::put_record(&mut out, record::HANDSHAKE, 0, rseq, &body).expect("record");
     out
 }
 
+/// One epoch 0 alert record.
+fn alert_record(level: u8, description: u8, rseq: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    record::put_record(&mut out, record::ALERT, 0, rseq, &[level, description]).expect("record");
+    out
+}
+
+/// An unauthenticated fragment that declares more than `max_message_len`
+/// is dropped before anything is allocated, and counted; it sends no
+/// alert, and the real hello still works. The cap is unchanged; only the
+/// outcome is (see `authenticated_input_over_a_bound_stays_fatal`).
 #[test]
-fn oversized_hello_is_refused() {
+fn oversized_hello_is_dropped_unallocated() {
     let mut p = pair(Options::default());
     let d = fragment_record(1, 0, 8193, 0, &[1; 100], 0);
-    assert_eq!(p.feed(&[d]), Err(Error::Limit(Limit::MessageSize)));
-    assert_eq!(plain_alert(&p.drain()), [2, alert::HANDSHAKE_FAILURE]);
+    assert_eq!(p.feed(&[d]), Ok(()));
+    assert_eq!(p.server.buffered(), 0);
+    assert_eq!(p.server.stats().records_dropped, 1);
+    assert!(p.drain().is_empty(), "no alert for unauthenticated input");
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    let hello = p.client.start();
+    p.feed(&hello).expect("real hello");
+    assert_eq!(p.server.state(), State::Handshaking);
 }
 
 #[test]
-fn too_many_fragments_are_refused() {
-    // 33 fragments that each add coverage: the 33rd is refused.
+fn too_many_fragments_drop_the_candidate() {
+    // 33 unauthenticated fragments that each add coverage: the 33rd drops
+    // the candidate and frees its bytes, and the real hello still works.
     let mut p = pair(Options::default());
-    let mut last = Ok(());
     for i in 0..33u32 {
-        last = p.feed(&[fragment_record(1, 0, 4000, i * 10, &[1; 10], u64::from(i))]);
+        let d = fragment_record(1, 0, 4000, i * 10, &[1; 10], u64::from(i));
+        assert_eq!(p.feed(&[d]), Ok(()), "fragment {i}");
     }
-    assert_eq!(last, Err(Error::Limit(Limit::Fragments)));
+    assert_eq!(p.server.buffered(), 0, "the candidate went");
+    assert_eq!(p.server.stats().records_dropped, 1);
+    assert!(p.drain().is_empty());
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    let hello = p.client.start();
+    p.feed(&hello).expect("real hello");
+    assert_eq!(p.server.state(), State::Handshaking);
 }
 
 #[test]
@@ -598,16 +628,21 @@ fn a_forged_first_fragment_does_not_block_the_hello() {
 #[test]
 fn buffered_bytes_are_capped() {
     let mut p = pair(Options::default());
-    // Messages 0 to 2 at 6000 declared bytes each: 18000 > 16384.
+    // Messages 0 to 2 at 6000 declared bytes each: 18000 > 16384, so the
+    // third, unauthenticated, is dropped and nothing is allocated for it.
     p.feed(&[fragment_record(1, 0, 6000, 0, &[1], 0)])
         .expect("first");
     p.feed(&[fragment_record(1, 1, 6000, 0, &[1], 1)])
         .expect("second");
     assert_eq!(p.server.buffered(), 12000);
-    assert_eq!(
-        p.feed(&[fragment_record(1, 2, 6000, 0, &[1], 2)]),
-        Err(Error::Limit(Limit::Buffered))
-    );
+    assert_eq!(p.feed(&[fragment_record(1, 2, 6000, 0, &[1], 2)]), Ok(()));
+    assert_eq!(p.server.buffered(), 12000);
+    assert_eq!(p.server.stats().records_dropped, 1);
+    assert!(p.drain().is_empty());
+    // The real hello fits beside the two and is answered.
+    let hello = p.client.start();
+    p.feed(&hello).expect("real hello");
+    assert_eq!(p.server.state(), State::Handshaking);
 }
 
 #[test]
@@ -873,23 +908,240 @@ fn close_notify_both_ways() {
 }
 
 #[test]
-fn fatal_alert_from_the_peer_ends_the_handshake() {
-    let mut p = pair(Options::default());
-    let hello = p.client.start();
-    p.feed(&hello).expect("hello");
-    p.drain();
-    let mut a = Vec::new();
-    record::put_record(&mut a, record::ALERT, 0, 1, &[2, 42]).expect("record");
-    assert_eq!(p.feed(&[a]), Err(Error::PeerAlert(42)));
-    assert!(p.drain().is_empty(), "no alert in reply to an alert");
-    // A warning (other than close_notify) is ignored during the handshake.
-    let mut p = pair(Options::default());
-    let hello = p.client.start();
-    p.feed(&hello).expect("hello");
-    let mut w = Vec::new();
-    record::put_record(&mut w, record::ALERT, 0, 1, &[1, 90]).expect("record");
+fn only_an_authenticated_fatal_alert_ends_the_handshake() {
+    // An epoch 0 alert is not authenticated, so it is dropped and counted
+    // during the handshake, fatal or not.
+    let (mut p, _) = through_change_cipher_spec();
+    let dropped = p.server.stats().records_dropped;
+    p.feed(&[alert_record(alert::FATAL, 42, 60)])
+        .expect("unauthenticated");
+    assert_eq!(p.server.state(), State::Handshaking);
+    assert_eq!(p.server.stats().records_dropped, dropped + 1);
+    // A warning (other than close_notify) under the read keys is ignored.
+    let w = p.client.seal(record::ALERT, &[alert::WARNING, 90]);
     p.feed(&[w]).expect("warning ignored");
     assert_eq!(p.server.state(), State::Handshaking);
+    // A fatal one under the read keys ends the handshake, with no alert in
+    // reply.
+    let a = p.client.seal(record::ALERT, &[alert::FATAL, 42]);
+    assert_eq!(p.feed(&[a]), Err(Error::PeerAlert(42)));
+    assert_eq!(p.server.state(), State::Failed(Error::PeerAlert(42)));
+    assert!(p.drain().is_empty(), "no alert in reply to an alert");
+    assert!(p.server.poll_event().is_none());
+}
+
+/// The handshake up to and including the client's ChangeCipherSpec, so the
+/// read keys are installed; the rest of flight 5 (its Finished) is
+/// returned.
+fn through_change_cipher_spec() -> (Pair, Vec<Vec<u8>>) {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let ccs = recs
+        .iter()
+        .position(|r| r[0] == record::CHANGE_CIPHER_SPEC)
+        .expect("ccs");
+    p.feed(&recs[..=ccs]).expect("through ChangeCipherSpec");
+    assert!(p.drain().is_empty());
+    assert_eq!(p.server.state(), State::Handshaking);
+    let rest = recs[ccs + 1..].to_vec();
+    assert_eq!(rest.len(), 1, "only Finished is left");
+    (p, rest)
+}
+
+/// Delivers the rest of the client's flight and requires the handshake to
+/// complete: the server verified the client's Finished and exported the
+/// client's keying material, and the client verified ours.
+fn completes(p: &mut Pair, rest: &[Vec<u8>]) {
+    p.feed(rest).expect("flight 5");
+    for d in &p.drain() {
+        p.client.handle(d).expect("client");
+    }
+    assert!(p.client.connected(), "the client verified our Finished");
+    assert_eq!(p.server.state(), State::Connected);
+    let c = p.connected();
+    assert_eq!(
+        c.keying_material.as_bytes(),
+        p.client
+            .keying_material
+            .as_deref()
+            .expect("client keys")
+            .as_slice()
+    );
+    assert_eq!(p.server.buffered(), 0);
+}
+
+/// A4.4 review, round 2: unauthenticated epoch 0 input between the
+/// client's flights must not end a handshake that the genuine flight can
+/// still complete (RFC 6347 section 4.1.2.7). Here a forged fragment
+/// declares more than `max_message_len` (25 bytes on the wire with no
+/// data, as the review sent, and again with one byte). Before, it ended the
+/// handshake with `Limit::MessageSize`.
+#[test]
+fn an_oversized_forged_fragment_does_not_end_the_handshake() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let dropped = p.server.stats().records_dropped;
+    for (i, data) in [&[][..], &[0][..]].into_iter().enumerate() {
+        let d = fragment_record(message::CERTIFICATE, 1, 8193, 0, data, 60 + i as u64);
+        if data.is_empty() {
+            assert_eq!(d.len(), 25);
+        }
+        assert_eq!(p.feed(&[d]), Ok(()), "{}-byte fragment", data.len());
+        assert_eq!(p.server.state(), State::Handshaking);
+        assert_eq!(p.server.buffered(), 0, "nothing allocated");
+    }
+    assert!(p.drain().is_empty(), "no alert");
+    assert_eq!(p.server.stats().records_dropped, dropped + 2);
+    completes(&mut p, &recs);
+}
+
+/// Forged candidates leave room for the genuine flight, and one more that
+/// would take the buffer past `max_buffered` is dropped and counted.
+/// Before, it ended the handshake with `Limit::Buffered`.
+#[test]
+fn an_over_budget_forged_fragment_does_not_end_the_handshake() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    p.feed(&[fragment_record(message::CERTIFICATE, 4, 8192, 0, &[1], 60)])
+        .expect("seq 4");
+    p.feed(&[fragment_record(message::CERTIFICATE, 3, 6000, 0, &[1], 61)])
+        .expect("seq 3");
+    assert_eq!(p.server.buffered(), 14192);
+    let dropped = p.server.stats().records_dropped;
+    let d = fragment_record(message::CERTIFICATE, 2, 8192, 0, &[1], 62);
+    assert_eq!(p.feed(&[d]), Ok(()), "over the budget");
+    assert_eq!(p.server.buffered(), 14192, "nothing allocated for it");
+    assert_eq!(p.server.stats().records_dropped, dropped + 1);
+    assert_eq!(p.server.state(), State::Handshaking);
+    assert!(p.drain().is_empty(), "no alert");
+    completes(&mut p, &recs);
+}
+
+/// An empty fragment of a message that is not empty adds nothing, so it is
+/// dropped before a candidate is made for it. Before, each held its
+/// declared length, and the third ended the handshake with
+/// `Limit::Buffered`.
+#[test]
+fn empty_forged_fragments_allocate_nothing() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let dropped = p.server.stats().records_dropped;
+    for seq in 1..4u16 {
+        let d = fragment_record(message::CERTIFICATE, seq, 8192, 0, &[], 60 + u64::from(seq));
+        assert_eq!(p.feed(&[d]), Ok(()), "seq {seq}");
+        assert_eq!(p.server.buffered(), 0, "seq {seq}: nothing allocated");
+    }
+    assert_eq!(p.server.stats().records_dropped, dropped + 3);
+    assert!(p.drain().is_empty(), "no alert");
+    completes(&mut p, &recs);
+}
+
+/// Forged fragments that each add coverage to one candidate reach the
+/// fragment cap: the candidate is dropped and its bytes freed. Before, the
+/// 33rd ended the handshake with `Limit::Fragments`.
+#[test]
+fn forged_fragments_over_the_cap_do_not_end_the_handshake() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    for i in 0..33u32 {
+        let d = fragment_record(
+            message::CERTIFICATE,
+            1,
+            4000,
+            i * 10,
+            &[1; 10],
+            60 + u64::from(i),
+        );
+        assert_eq!(p.feed(&[d]), Ok(()), "fragment {i}");
+    }
+    assert_eq!(p.server.buffered(), 0, "the candidate went");
+    assert_eq!(p.server.state(), State::Handshaking);
+    assert!(p.drain().is_empty(), "no alert");
+    completes(&mut p, &recs);
+}
+
+/// Epoch 0 alerts before the client's ChangeCipherSpec, before the hello
+/// and between the flights: fatal, close_notify and a warning, each dropped
+/// and counted. A client that really gave up is ended by the handshake
+/// deadline instead. Before, the fatal one and close_notify ended the
+/// handshake with `PeerAlert`.
+#[test]
+fn an_unauthenticated_alert_does_not_end_the_handshake() {
+    let alerts = |base: u64| {
+        [
+            alert_record(alert::FATAL, alert::BAD_CERTIFICATE, base),
+            alert_record(alert::WARNING, alert::CLOSE_NOTIFY, base + 1),
+            alert_record(alert::WARNING, 90, base + 2),
+        ]
+    };
+    let mut p = pair(Options::default());
+    for a in alerts(10) {
+        assert_eq!(p.feed(&[a]), Ok(()), "before the hello");
+        assert_eq!(p.server.state(), State::AwaitingHello);
+    }
+    let recs = flight5(&mut p);
+    for a in alerts(60) {
+        assert_eq!(p.feed(&[a]), Ok(()), "between the flights");
+        assert_eq!(p.server.state(), State::Handshaking);
+    }
+    assert!(p.drain().is_empty(), "no alert in reply");
+    assert_eq!(p.server.stats().records_dropped, 6);
+    completes(&mut p, &recs);
+}
+
+/// An epoch 0 alert after the client's ChangeCipherSpec, when the read
+/// keys are installed and the client's own alerts would be at epoch 1.
+/// Before, it ended the handshake with `PeerAlert`.
+#[test]
+fn an_unauthenticated_alert_after_change_cipher_spec_is_ignored() {
+    let (mut p, rest) = through_change_cipher_spec();
+    let dropped = p.server.stats().records_dropped;
+    let a = alert_record(alert::FATAL, alert::HANDSHAKE_FAILURE, 60);
+    assert_eq!(p.feed(&[a]), Ok(()));
+    assert_eq!(p.server.state(), State::Handshaking);
+    assert_eq!(p.server.stats().records_dropped, dropped + 1);
+    assert!(p.drain().is_empty(), "no alert in reply");
+    completes(&mut p, &rest);
+}
+
+/// The other side of the rule: under the read keys, input comes from the
+/// peer whose flight we answered, so a bound it reaches still ends the
+/// handshake with `handshake_failure`, as before.
+#[test]
+fn authenticated_input_over_a_bound_stays_fatal() {
+    // (message_seq past Finished's, declared length, offset, data length)
+    type Fragments = Vec<(u16, u32, u32, usize)>;
+    let cases: [(Limit, Fragments); 3] = [
+        (Limit::MessageSize, vec![(0, 8193, 0, 1)]),
+        (
+            Limit::Buffered,
+            vec![(0, 8192, 0, 1), (1, 8192, 0, 1), (2, 8192, 0, 1)],
+        ),
+        (
+            Limit::Fragments,
+            (0..33).map(|i| (0, 4000, i * 10, 10)).collect(),
+        ),
+    ];
+    for (limit, fragments) in cases {
+        let (mut p, _) = through_change_cipher_spec();
+        let fin = p.client.finished_seq();
+        let mut last = Ok(());
+        for (ahead, length, offset, n) in fragments {
+            let f = fragment_bytes(message::FINISHED, fin + ahead, length, offset, &vec![1; n]);
+            let rec = p.client.seal(record::HANDSHAKE, &f);
+            last = p.feed(&[rec]);
+            if last.is_err() {
+                break;
+            }
+        }
+        assert_eq!(last, Err(Error::Limit(limit)), "{limit:?}");
+        assert_eq!(
+            plain_alert(&p.drain()),
+            [alert::FATAL, alert::HANDSHAKE_FAILURE],
+            "{limit:?}"
+        );
+        assert!(p.server.poll_event().is_none(), "{limit:?}");
+    }
 }
 
 #[test]

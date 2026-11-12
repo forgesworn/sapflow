@@ -33,7 +33,11 @@ pub mod alert {
     pub const FATAL: u8 = 2;
 }
 
-/// A bound that the peer reached.
+/// A bound that the peer reached. The three reassembly bounds
+/// ([`Limit::MessageSize`], [`Limit::Fragments`], [`Limit::Buffered`]) end
+/// a handshake only for a fragment under the read keys: an unauthenticated
+/// (epoch 0) fragment that would break one is dropped and counted in
+/// [`crate::Stats::records_dropped`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
     /// A handshake message declared a length above
@@ -121,7 +125,8 @@ pub enum Error {
     /// [`crate::Config::max_transmissions`] sends of our flight.
     Timeout,
     /// The peer sent a fatal alert (or `close_notify` during the
-    /// handshake), with this description.
+    /// handshake) under the read keys, with this description. An epoch 0
+    /// alert is not authenticated, so it is dropped and counted instead.
     PeerAlert(u8),
     /// The peer closed the association with `close_notify`.
     PeerClosed,

@@ -1313,9 +1313,9 @@ fn unauthenticated_dtls_after_connect_is_discarded() {
         s.handle_datagram(t0 + ms(5), p.tuple, &d);
         let ev = events(s);
         // Each is one record dropped and counted, not a datagram refused:
-        // the three in epoch 0 fall through to sapflow-dtls's catch-all
-        // drop (server.rs:622), and only the bad tag reaches decryption,
-        // which fails (:629-630).
+        // the three in epoch 0 fall through to the catch-all drop of epoch
+        // 0 records in sapflow-dtls's `Server::record`, and only the bad
+        // tag reaches decryption, which fails.
         let dtls = s.stats().dtls;
         assert_eq!(dtls.records_dropped, 1, "{name}");
         assert_eq!(dtls.datagrams_dropped, 0, "{name}");

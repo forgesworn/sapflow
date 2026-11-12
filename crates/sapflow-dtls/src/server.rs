@@ -204,7 +204,11 @@ pub struct Stats {
     /// association ended.
     pub datagrams_dropped: u64,
     /// Records dropped: bad version, unknown epoch, replayed, failed
-    /// authentication, or not acceptable in this state.
+    /// authentication, not acceptable in this state, or an epoch 0 alert.
+    /// Also each handshake fragment dropped: outside the reassembly window,
+    /// a duplicate, empty, or, at epoch 0, one that would break a
+    /// reassembly bound ([`Config::max_message_len`],
+    /// [`Config::max_fragments`], [`Config::max_buffered`]).
     pub records_dropped: u64,
     /// Application data records, which sapflow does not use.
     pub application_data_dropped: u64,
@@ -447,8 +451,12 @@ impl Server {
     }
 
     /// One datagram from the peer. Invalid records are dropped silently
-    /// (RFC 6347 section 4.1.2.7). An `Err` means the association failed:
-    /// one fatal alert, if any, is queued, and later input is ignored.
+    /// (RFC 6347 section 4.1.2.7). So is unauthenticated (epoch 0) input
+    /// that only a forger needs to send: any epoch 0 alert, and a handshake
+    /// fragment that adds nothing or would break a reassembly bound; each is
+    /// counted in [`Stats::records_dropped`]. An `Err` means the association
+    /// failed: one fatal alert, if any, is queued, and later input is
+    /// ignored.
     pub fn handle_datagram(&mut self, now: Instant, datagram: &[u8]) -> Result<(), Error> {
         if self.terminal() || datagram.len() > self.config.max_datagram {
             self.stats.datagrams_dropped += 1;
@@ -617,8 +625,12 @@ impl Server {
                         Ok(())
                     }
                     record::CHANGE_CIPHER_SPEC => self.change_cipher_spec(rec.body),
-                    record::ALERT if self.handshaking() => self.peer_alert(rec.body),
-                    // Unauthenticated after the handshake, or not ours.
+                    // Dropped: an epoch 0 alert whenever it comes, since
+                    // anyone who can spoof the address could have sent it,
+                    // so it neither ends a handshake nor closes the
+                    // association (a client that really gave up is ended by
+                    // the caller's handshake deadline); handshake data after
+                    // the handshake; and anything not ours.
                     _ => self.drop_record(),
                 }
             }
@@ -669,6 +681,8 @@ impl Server {
         Ok(())
     }
 
+    /// An alert under the read keys (epoch 1). Epoch 0 alerts never get
+    /// here.
     fn peer_alert(&mut self, body: &[u8]) -> Result<(), Error> {
         let [level, description] = <[u8; 2]>::try_from(body).unwrap_or([0, 255]);
         if level != alert::WARNING && level != alert::FATAL {
@@ -725,6 +739,14 @@ impl Server {
                 Ok(())
             }
             Push::Dropped => self.drop_record(),
+            // An unauthenticated fragment that would break a bound is
+            // dropped like any invalid record (RFC 6347 section 4.1.2.7),
+            // since a forger could have sent it; nothing was kept for it,
+            // and the genuine flight can still complete. Under the read
+            // keys it comes from the peer whose flight we answered, and
+            // ends the handshake.
+            Push::Over(_) if epoch == 0 => self.drop_record(),
+            Push::Over(limit) => Err(Error::Limit(limit)),
             Push::Stored => {
                 while let Some(m) = self.reassembler.pop() {
                     self.message(now, record_seq, m)?;
