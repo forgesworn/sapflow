@@ -1,9 +1,10 @@
 # WHIP ingest (design)
 
-Status: design, 10 November 2026, updated 11 November 2026. The WHIP
-libraries `sapflow-rtp`, `sapflow-dtls` and `sapflow-whip` are built but not
-yet wired into the server, so WHIP stays off. It does not face the internet
-before the gates in [Delivery and gates](#delivery-and-gates) pass.
+Status: design, 10 November 2026, updated 12 November 2026. The WHIP
+libraries `sapflow-rtp`, `sapflow-dtls` and `sapflow-whip` are built and
+wired into the server (W1 to W3), but WHIP stays off unless
+`SAPFLOW_WHIP_ADDR` is set. It does not face the internet before the gates
+in [Delivery and gates](#delivery-and-gates) pass.
 
 WHIP (RFC 9725) lets a publisher send live media over WebRTC after a single
 HTTP exchange. A browser can publish with no app installed, and OBS 30 and
