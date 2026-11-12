@@ -107,6 +107,12 @@ const MAX_LEARNED_FRAMES: usize = 1024;
 /// the length rule in `push_video` catches several.
 const BREAK_GAP: i64 = 90_000;
 
+/// How far video may run past a cut's new keyframe while audio stamped
+/// before it is still awaited: two seconds, past the audio lag FFmpeg's TS
+/// muxing leaves in file order (up to 200 ms) and an encoder's (under one
+/// second).
+const LATE_AUDIO_WINDOW: i64 = 180_000;
+
 /// The longest valid Opus packet, 120 ms, in 90 kHz ticks.
 const OPUS_MAX_PACKET_TICKS: i64 = 10_800;
 
@@ -401,6 +407,27 @@ struct Frame {
     data: Bytes,
 }
 
+/// The late-audio window a cut on a continuing clock opens, in output time.
+#[derive(Debug, Clone, Copy)]
+struct LateAudio {
+    /// The epoch (init id) the audio belongs to: the one the cut ended.
+    epoch: u64,
+    /// Half-way through the last audio frame the old run had.
+    floor: i64,
+    /// The new run's first keyframe.
+    keyframe: i64,
+    /// The new run's first part has closed: late audio has no part left
+    /// that it may join, and is dropped.
+    closed: bool,
+    /// The end of the audio taken since the cut (or before it).
+    reached: i64,
+    /// One audio frame, the shortfall forgiven when the window is closed
+    /// before audio reaches the keyframe.
+    frame: i64,
+    /// Late frames dropped.
+    dropped: u64,
+}
+
 #[derive(Debug)]
 struct OpenSegment {
     initialization: Arc<Initialization>,
@@ -487,16 +514,20 @@ pub struct Muxer {
     /// The run after a cut opens its first part at its keyframe, so audio
     /// that arrives before its second frame has a part to join.
     open_at_keyframe: bool,
-    /// After a cut on a continuing clock: audio stamped from the old run's
-    /// end up to the new run's keyframe, which may still arrive. It joins
-    /// the new run's first part while that is open; after that it has no
-    /// part its time fits and is dropped and reported.
-    late_audio: Option<(i64, i64)>,
-    /// The new run's first part has closed: audio in `late_audio`'s span
-    /// is now lost.
-    late_closed: bool,
-    /// Audio was lost that no update has reported yet.
-    unreported_loss: bool,
+    /// After a cut on a clock that carries on, until audio reaches the new
+    /// keyframe: audio stamped before it may still arrive (see
+    /// [`Muxer::late_audio_epoch`]).
+    late_audio: Option<LateAudio>,
+    /// The codec epochs (init ids) that lost late audio since
+    /// [`Muxer::take_late_audio_loss`] last ran.
+    late_lost: Vec<u64>,
+    /// Where the old run ended, after a cut on a continuing clock and
+    /// until the new keyframe arrives: an interrupt in between resumes the
+    /// next run there.
+    cut_end: Option<i64>,
+    /// The start and end, in output time, of the last audio frame a
+    /// video-led run took.
+    placed_audio: Option<(i64, i64)>,
 
     entries: VecDeque<Entry>,
     media_sequence: u64,
@@ -722,8 +753,9 @@ impl Muxer {
             carried_audio: Vec::new(),
             open_at_keyframe: false,
             late_audio: None,
-            late_closed: false,
-            unreported_loss: false,
+            late_lost: Vec::new(),
+            cut_end: None,
+            placed_audio: None,
             entries: VecDeque::new(),
             media_sequence: 0,
             parts: VecDeque::new(),
@@ -776,8 +808,9 @@ impl Muxer {
             carried_audio,
             open_at_keyframe,
             late_audio,
-            late_closed,
-            unreported_loss,
+            late_lost,
+            cut_end,
+            placed_audio,
             entries,
             media_sequence,
             parts,
@@ -907,8 +940,8 @@ impl Muxer {
              {timing:?} {learning:?} {target:?} {offset} {rebase_to:?} \
              {presented_end:?} {audio_floor} {discontinuity_next} \
              {discontinuity_sequence} {breaks} {hold_gap} {window_byte_capped} \
-             {last_frame_ticks:?} {:?} {open_at_keyframe} {late_audio:?} {late_closed} \
-             {unreported_loss}",
+             {last_frame_ticks:?} {:?} {open_at_keyframe} {late_audio:?} {late_lost:?} \
+             {cut_end:?} {placed_audio:?}",
             init.id,
             init.data.len(),
             pending(pending_video),
@@ -1101,11 +1134,15 @@ impl Muxer {
         next_dts: Option<i64>,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
-        let mut update = self.interrupt_cut(next_dts, now);
-        // Carried samples are of the old audio configuration.
-        if audio != self.audio && !self.carried_audio.is_empty() {
-            self.carried_audio.clear();
-            update.media_loss = true;
+        let mut update = self.interrupt_run(next_dts, now);
+        if audio != self.audio || video.is_none() {
+            // Carried samples are of the old audio configuration, and late
+            // audio will not come as such.
+            if !self.carried_audio.is_empty() {
+                self.carried_audio.clear();
+                update.media_loss = true;
+            }
+            self.close_late_audio(false);
         }
         if self.fragment_refused {
             // The new init was admitted, but sealing the old tail was not.
@@ -1123,6 +1160,30 @@ impl Muxer {
         self.video = video;
         self.audio = audio;
         Ok(update)
+    }
+
+    /// The codec epoch (init id) whose audio may still arrive late: after
+    /// [`Muxer::reconfigure_with_audio_at`] has cut that epoch's run with its
+    /// audio short of the new keyframe, until audio stamped at or after the
+    /// keyframe arrives, video runs two seconds past it, the audio changes,
+    /// or the next cut or interrupt. Audio stamped before the keyframe joins
+    /// the new run's first part while that is open, and is dropped after.
+    /// A recording of the epoch should not be finished while this names it,
+    /// so that [`Muxer::take_late_audio_loss`] can still mark it.
+    pub fn late_audio_epoch(&self) -> Option<u64> {
+        self.late_audio.map(|late| late.epoch)
+    }
+
+    /// The codec epochs (init ids) that have lost audio stamped before a
+    /// cut's keyframe since the last call: dropped as it arrived after the
+    /// new run's first part had closed, or, when the window closed before
+    /// audio reached the keyframe, missing by more than one audio frame (an
+    /// encoder that stopped its audio is counted too). This loss is not in
+    /// [`Update::media_loss`], which is about the run the update comes
+    /// from: it belongs to the epoch the cut ended, and its recording, not
+    /// the next one, is the one missing the audio.
+    pub fn take_late_audio_loss(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.late_lost)
     }
 
     /// The id of the first part cut under the current init segment (zero until
@@ -1328,10 +1389,22 @@ impl Muxer {
         data: Bytes,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
-        let mut update = self.push_video_inner(dts, pts, sync, data, now)?;
-        // Audio dropped since the last update (late audio after a cut).
-        update.media_loss |= std::mem::take(&mut self.unreported_loss);
-        Ok(update)
+        self.check_fragment_admission()?;
+        if self.video.is_none() {
+            return Err(MuxError::InvalidTracks);
+        }
+        if self.pending_video.is_none() && self.next_segment.is_none() && !sync {
+            return Ok(Update::default());
+        }
+        self.check_video_entry_admission(dts, sync)?;
+        let at = dts.saturating_add(self.offset);
+        if let Some(late) = self.late_audio
+            && at.saturating_sub(late.keyframe) > LATE_AUDIO_WINDOW
+        {
+            // Audio this far behind is not coming.
+            self.close_late_audio(false);
+        }
+        self.push_video_inner(dts, pts, sync, data, now)
     }
 
     fn push_video_inner(
@@ -1342,14 +1415,6 @@ impl Muxer {
         data: Bytes,
         now: SystemTime,
     ) -> Result<Update, MuxError> {
-        self.check_fragment_admission()?;
-        if self.video.is_none() {
-            return Err(MuxError::InvalidTracks);
-        }
-        if self.pending_video.is_none() && self.next_segment.is_none() && !sync {
-            return Ok(Update::default());
-        }
-        self.check_video_entry_admission(dts, sync)?;
         // The hold covers only the next frame that gets this far.
         let hold_gap = std::mem::take(&mut self.hold_gap);
         let cts = (pts - dts).clamp(0, i64::from(i32::MAX)) as i32;
@@ -1375,6 +1440,8 @@ impl Muxer {
         let Some(cur) = self.pending_video.as_ref() else {
             let (at, sync) = (next.dts, next.sync);
             self.pending_video = Some(next);
+            // The keyframe a cut waited for, if one did.
+            self.cut_end = None;
             // A run after a cut opens its part now, so the audio before its
             // second frame is kept (and any audio the cut carried).
             if sync && self.timing.is_some() && std::mem::take(&mut self.open_at_keyframe) {
@@ -1529,25 +1596,18 @@ impl Muxer {
     /// is known, then rebases the next run after a discontinuity. For a cut
     /// on a clock that carries on, see [`Muxer::reconfigure_with_audio_at`].
     pub fn interrupt(&mut self, now: SystemTime) -> Update {
-        self.interrupt_cut(None, now)
+        self.interrupt_run(None, now)
     }
 
     /// [`Muxer::interrupt`], or with `next_dts` a cut on a continuing clock
     /// ([`Muxer::reconfigure_with_audio_at`]).
-    fn interrupt_cut(&mut self, next_dts: Option<i64>, now: SystemTime) -> Update {
-        let mut update = self.interrupt_run(next_dts, now);
-        // Audio dropped since the last update (late audio after a cut), so a
-        // stream that ends straight after it still reports it.
-        update.media_loss |= std::mem::take(&mut self.unreported_loss);
-        update
-    }
-
     fn interrupt_run(&mut self, next_dts: Option<i64>, now: SystemTime) -> Update {
         self.hold_gap = false;
         if self.fragment_refused {
             return self.interrupt_refused(now);
         }
         if self.video.is_none() {
+            self.close_late_audio(false);
             self.audio_run = None;
             let Some(end) = self.audio_end.take() else {
                 return Update::default();
@@ -1566,9 +1626,23 @@ impl Muxer {
             };
         }
         let Some(cur) = self.pending_video.take() else {
-            return Update::default();
+            self.close_late_audio(false);
+            // Between a cut on a continuing clock and its keyframe: what
+            // comes next resumes where the old run ended, as after any cut.
+            // The audio carried for the keyframe's part has no part now.
+            let mut media_loss = false;
+            if let Some(end) = self.cut_end.take() {
+                self.rebase_to = Some(end);
+                media_loss = !self.carried_audio.is_empty();
+                self.carried_audio.clear();
+            }
+            return Update {
+                media_loss,
+                ..Update::default()
+            };
         };
         if self.timing.is_none() {
+            self.close_late_audio(false);
             self.learning.clear();
             self.next_segment = None;
             self.part = None;
@@ -1584,17 +1658,23 @@ impl Muxer {
             };
         }
         self.open_at_keyframe = true;
-        self.late_audio = None;
         let (end, lost) = match self.flush_held(cur, now) {
             Ok(flushed) => flushed,
             Err(_) => return self.interrupt_refused(now),
         };
+        self.close_late_audio(false);
         let (closed, media_loss) = match self.close_run(end, now) {
             Ok(closed) => (closed, lost),
             Err(_) if self.fragment_refused => return self.interrupt_refused(now),
             Err(_) => (false, true),
         };
         self.rebase_to = Some(end);
+        // A clock that carries on past a gap too long to hold: its audio
+        // stamped before the next keyframe can still arrive, and has no
+        // part to join once the next run is rebased. It is counted.
+        if let Some(next) = next_dts.map(|next| next.saturating_add(self.offset)) {
+            self.open_late_audio(next, true);
+        }
         Update {
             part: closed,
             segment: closed,
@@ -1613,23 +1693,13 @@ impl Muxer {
             && self.target.is_none_or(|t| next - start <= t.limit_ticks())
     }
 
-    /// The start and end, in output time, of the last audio sample in the
-    /// open part.
-    fn open_audio_span(&self) -> Option<(i64, i64)> {
-        let rate = i128::from(self.audio?.sample_rate());
-        let part = self.part.as_ref()?;
-        let (&(at, _), last) = part.audio_times.last().zip(part.audio.last())?;
-        let ticks = (i128::from(last.duration) * i128::from(VIDEO_TIMESCALE) + rate - 1) / rate;
-        Some((at, i64::try_from(i128::from(at) + ticks).ok()?))
-    }
-
     /// A cut on a continuing clock: the held audio and video frames go into
     /// the run, the video frame lasting until the next keyframe at `next`
-    /// (cut to fit the open part, as a stall within a run is, if longer),
-    /// and the segment ends there. Output time is not moved. Audio past the
-    /// part's end is carried to the next run's first part, and the audio
-    /// floor is left at the end of the audio received, so a frame that
-    /// arrives after the cut with a time before `next` joins that part too.
+    /// as far as the open part's target and the segment's limit allow, and
+    /// the segment ends with its media, so `EXTINF` is the sum of its parts.
+    /// A longer gap falls at the discontinuity. Output time is not moved.
+    /// Audio past the segment's end is carried to the next run's first
+    /// part, and the late-audio window opens ([`Muxer::late_audio_epoch`]).
     fn cut_continuing(
         &mut self,
         cur: Pending,
@@ -1639,21 +1709,31 @@ impl Muxer {
         let held = cur.dts;
         self.open_video_part(cur.dts, now);
         let mut lost = self.flush_held_audio();
-        let audio = self.open_audio_span();
-        let fits = self.next_segment.as_ref().is_some_and(|segment| {
-            segment
-                .bytes
-                .checked_add(segment.audio_bytes)
-                .and_then(|n| n.checked_add(cur.data.len()))
-                .is_some_and(|n| n <= MAX_SEGMENT_BYTES)
-        });
+        // A window an earlier cut left open ends here.
+        self.close_late_audio(false);
+        let audio = self.placed_audio;
+        let mut end = next;
+        if let (Some(timing), Some(part)) = (self.timing, self.part.as_ref()) {
+            end = end.min(part.start_dts.saturating_add(timing.target));
+        }
+        if let (Some(target), Some(segment)) = (self.target, self.next_segment.as_ref()) {
+            end = end.min(segment.start_dts.saturating_add(target.limit_ticks()));
+        }
+        let fits = end > cur.dts
+            && self.next_segment.as_ref().is_some_and(|segment| {
+                segment
+                    .bytes
+                    .checked_add(segment.audio_bytes)
+                    .and_then(|n| n.checked_add(cur.data.len()))
+                    .is_some_and(|n| n <= MAX_SEGMENT_BYTES)
+            });
         if fits {
             if let Some(segment) = self.next_segment.as_mut() {
                 segment.bytes += cur.data.len();
             }
             let frame = Frame {
                 dts: cur.dts,
-                next_dts: next,
+                next_dts: end,
                 cts: cur.cts,
                 sync: cur.sync,
                 data: cur.data,
@@ -1662,17 +1742,19 @@ impl Muxer {
         } else {
             lost = true;
             if self.part.as_ref().is_some_and(|p| !p.video.is_empty()) {
-                self.rotate_part(cur.dts, next)?;
+                self.rotate_part(cur.dts, cur.dts)?;
             }
         }
-        // The part after the cut holds only the audio past the old end.
+        // The part after the cut holds only the audio past the old end,
+        // and starts where the sealed parts end.
         let leftover = self.part.take();
+        let end = leftover.as_ref().map_or(end, |part| part.start_dts);
         let closed = self
             .next_segment
             .as_ref()
             .is_some_and(|s| !s.parts.is_empty());
         if closed {
-            self.rotate_segment(next, now, false)?;
+            self.rotate_segment(end, now, false)?;
         } else {
             self.next_segment = None;
         }
@@ -1681,19 +1763,17 @@ impl Muxer {
         }
         tracing::debug!(
             gap_ms = (next - held) / 90,
-            audio_past_ms = audio.map_or(0, |(_, end)| (end - held) / 90),
+            held_ms = (end - held) / 90,
+            audio_past_ms = audio.map_or(0, |(_, a)| (a - held) / 90),
             carried = self.carried_audio.len(),
-            "codec change cut: the old run ends at the new keyframe"
+            "codec change cut: the old run ends with its media"
         );
         self.pending_video = None;
         self.discontinuity_next = true;
         self.breaks += 1;
         self.rebase_to = None;
-        // Half-way through the last audio frame received: a repeat of it is
-        // refused, and the frame after it (whatever its rounding) joins.
-        self.audio_floor = audio.map_or(next, |(at, end)| at + (end - at) / 2);
-        self.late_audio = Some((self.audio_floor, next));
-        self.late_closed = false;
+        self.cut_end = Some(end);
+        self.open_late_audio(next, false);
         self.open_at_keyframe = true;
         Ok(Update {
             part: fits || closed,
@@ -1701,6 +1781,107 @@ impl Muxer {
             media_loss: lost,
             ..Update::default()
         })
+    }
+
+    /// Opens the late-audio window of a cut whose next keyframe is at
+    /// `keyframe` (output time), from half-way through the last audio frame
+    /// taken: a repeat of that frame is refused, and the frame after it,
+    /// whatever its rounding, is late audio. With no audio short of the
+    /// keyframe, there is nothing to wait for. `closed`: the next run has
+    /// no part late audio may join.
+    fn open_late_audio(&mut self, keyframe: i64, closed: bool) {
+        let Some((at, end)) = self.placed_audio.filter(|_| self.audio.is_some()) else {
+            self.audio_floor = self.audio_floor.max(keyframe);
+            return;
+        };
+        let floor = at + (end - at) / 2;
+        self.audio_floor = floor;
+        if floor >= keyframe {
+            return;
+        }
+        self.late_audio = Some(LateAudio {
+            epoch: self.init.id,
+            floor,
+            keyframe,
+            closed,
+            reached: end,
+            frame: end - at,
+            dropped: 0,
+        });
+    }
+
+    /// Ends the late-audio window. `caught_up`: audio stamped at or after
+    /// the keyframe has arrived, so no more is late. Otherwise (the next
+    /// cut, video two seconds on, a change of audio) the epoch is also
+    /// counted as lost if its audio ends more than one frame short of the
+    /// keyframe, or the held frame is late and will be dropped. Anything
+    /// stamped before the keyframe that arrives later is refused.
+    fn close_late_audio(&mut self, caught_up: bool) {
+        let Some(late) = self.late_audio.take() else {
+            return;
+        };
+        let held_late = self
+            .pending_audio
+            .as_ref()
+            .and_then(|held| self.audio_ticks(held.dts))
+            .is_some_and(|at| at >= late.floor && at < late.keyframe);
+        let short = late.reached.saturating_add(late.frame) < late.keyframe;
+        let lost = late.dropped > 0 || (!caught_up && (short || held_late));
+        if lost {
+            self.note_late_loss(late.epoch);
+        }
+        self.audio_floor = self.audio_floor.max(late.keyframe);
+        tracing::debug!(
+            epoch = late.epoch,
+            dropped = late.dropped,
+            caught_up,
+            short_ms = (late.keyframe - late.reached) / 90,
+            lost,
+            "late audio window closed"
+        );
+    }
+
+    fn note_late_loss(&mut self, epoch: u64) {
+        if !self.late_lost.contains(&epoch) {
+            self.late_lost.push(epoch);
+        }
+    }
+
+    /// Whether audio at `at` (output time) is late audio with no part to
+    /// join: stamped in the window, arriving after the new run's first
+    /// part closed (or before it opened). It is counted against its epoch.
+    fn drop_late(&mut self, at: i64) -> bool {
+        let no_part = self.part.is_none();
+        let Some(late) = self.late_audio.as_mut() else {
+            return false;
+        };
+        if !(late.closed || no_part) || at < late.floor || at >= late.keyframe {
+            return false;
+        }
+        late.dropped += 1;
+        let epoch = late.epoch;
+        self.note_late_loss(epoch);
+        true
+    }
+
+    /// A run took the audio frame from `at` to `end` (output time).
+    fn took_audio(&mut self, at: i64, end: i64) {
+        self.placed_audio = Some((at, end));
+        if let Some(late) = self.late_audio.as_mut() {
+            late.reached = late.reached.max(end);
+        }
+    }
+
+    /// `samples` of the audio timescale, in 90 kHz ticks (rounded down).
+    fn audio_ticks(&self, samples: i64) -> Option<i64> {
+        let rate = i128::from(self.audio?.sample_rate());
+        i64::try_from(i128::from(samples) * i128::from(VIDEO_TIMESCALE) / rate).ok()
+    }
+
+    /// `samples` of the audio timescale, in 90 kHz ticks (rounded up).
+    fn audio_ticks_up(&self, samples: i64) -> Option<i64> {
+        let rate = i128::from(self.audio?.sample_rate());
+        i64::try_from((i128::from(samples) * i128::from(VIDEO_TIMESCALE) + rate - 1) / rate).ok()
     }
 
     /// Before an interrupt cuts a video-led run: writes the held audio frame
@@ -1789,22 +1970,25 @@ impl Muxer {
 
     /// The held audio frame into the open part, with its own duration.
     /// Returns whether it had to be dropped. A frame from before this run
-    /// (under the floor a rebase set) is not this run's to keep.
+    /// (under the floor a rebase set) is not this run's to keep, and late
+    /// audio with no part to join is dropped as [`Muxer::push_audio`]
+    /// drops it, counted against its own epoch.
     fn flush_held_audio(&mut self) -> bool {
         let Some(held) = self.pending_audio.take() else {
             return false;
         };
-        let Some(audio) = self.audio else {
-            return false;
-        };
-        let rate = i128::from(audio.sample_rate());
-        let Ok(at) = i64::try_from(i128::from(held.dts) * i128::from(VIDEO_TIMESCALE) / rate)
-        else {
-            return true;
-        };
-        if at < self.audio_floor {
+        if self.audio.is_none() {
             return false;
         }
+        let Some(at) = self.audio_ticks(held.dts) else {
+            return true;
+        };
+        if self.drop_late(at) || at < self.audio_floor {
+            return false;
+        }
+        let end = self
+            .audio_ticks_up(held.samples)
+            .map_or(at, |ticks| at.saturating_add(ticks));
         let (Some(part), Some(segment)) = (self.part.as_mut(), self.next_segment.as_mut()) else {
             return true;
         };
@@ -1824,12 +2008,15 @@ impl Muxer {
             sync: true,
             data: held.data,
         });
+        self.took_audio(at, end);
         false
     }
 
     // A refused unsealed suffix must not extend the accepted prefix's duration.
     // Seal only already-admitted parts, then discard unencoded pending input.
     fn interrupt_refused(&mut self, now: SystemTime) -> Update {
+        self.close_late_audio(false);
+        self.cut_end = None;
         self.carried_audio.clear();
         let had_run =
             self.next_segment.is_some() || self.pending_video.is_some() || self.audio_run.is_some();
@@ -1880,8 +2067,9 @@ impl Muxer {
         {
             self.rotate_part(end, end)?;
         }
-        // An open part with no video (audio alone) is dropped.
-        self.part = None;
+        // An open part with no video (audio alone) is dropped. The sealed
+        // parts end where it starts, and so does the segment.
+        let end = self.part.take().map_or(end, |part| part.start_dts);
         let closed = self
             .next_segment
             .as_ref()
@@ -1910,8 +2098,15 @@ impl Muxer {
     /// Moves output time so that input now at output `from` lands at `to`.
     fn rebase(&mut self, from: i64, to: i64) {
         self.hold_gap = false;
-        self.offset += to - from;
+        let shift = to.saturating_sub(from);
+        self.offset = self.offset.saturating_add(shift);
         self.audio_floor = to;
+        if let Some(late) = self.late_audio.as_mut() {
+            // Late audio is stamped on the input clock.
+            late.floor = late.floor.saturating_add(shift);
+            late.keyframe = late.keyframe.saturating_add(shift);
+            late.reached = late.reached.saturating_add(shift);
+        }
         // Its timestamp was taken with the old offset.
         self.pending_audio = None;
     }
@@ -2506,6 +2701,7 @@ impl Muxer {
         };
         let Some(cur) = self.pending_audio.take() else {
             self.pending_audio = Some(next);
+            self.late_audio_caught_up();
             return Ok(());
         };
         if next.dts < cur.dts {
@@ -2516,28 +2712,29 @@ impl Muxer {
         if duration > 3 * cur.samples {
             duration = cur.samples;
         }
-        let duration = duration as u32;
         self.pending_audio = Some(next);
+        self.take_audio(cur, duration);
+        self.late_audio_caught_up();
+        Ok(())
+    }
 
+    /// The video-led audio frame `cur`, lasting `duration` samples, into
+    /// the open part, unless it is late audio with no part to join, from
+    /// before the floor, or before the first part.
+    fn take_audio(&mut self, cur: Pending, duration: i64) {
+        let at = self
+            .audio_ticks(cur.dts)
+            .expect("nonnegative audio input converted within the 90 kHz input range");
+        if self.drop_late(at) || at < self.audio_floor {
+            return;
+        }
+        let end = self
+            .audio_ticks_up(duration)
+            .map_or(at, |ticks| at.saturating_add(ticks));
         // Audio waits for video to open the first part.
         let Some(part) = self.part.as_mut() else {
-            return Ok(());
+            return;
         };
-        let at =
-            i64::try_from(i128::from(cur.dts) * i128::from(VIDEO_TIMESCALE) / i128::from(rate))
-                .expect("nonnegative AAC input converted within the 90 kHz input range");
-        if self.late_closed
-            && self
-                .late_audio
-                .is_some_and(|(from, to)| (from..to).contains(&at))
-        {
-            // Stamped before the new run, arriving after its first part.
-            self.unreported_loss = true;
-            return Ok(());
-        }
-        if at < self.audio_floor {
-            return Ok(());
-        }
         let segment = self
             .next_segment
             .as_mut()
@@ -2548,12 +2745,27 @@ impl Muxer {
             .expect("AAC byte projection checked before mutation");
         part.audio_times.push((at, cur.dts as u64));
         part.audio.push(Sample {
-            duration,
+            duration: duration as u32,
             cts: 0,
             sync: true,
             data: cur.data,
         });
-        Ok(())
+        self.took_audio(at, end);
+    }
+
+    /// Closes the late-audio window once the frame now held is stamped at
+    /// or after the keyframe: the frame before it has been placed or
+    /// dropped, and no later one can be late.
+    fn late_audio_caught_up(&mut self) {
+        let (Some(late), Some(held)) = (self.late_audio, self.pending_audio.as_ref()) else {
+            return;
+        };
+        if self
+            .audio_ticks(held.dts)
+            .is_some_and(|at| at >= late.keyframe)
+        {
+            self.close_late_audio(true);
+        }
     }
 
     /// Closes the open part at `end_dts` and opens the next at `next_start`
@@ -2563,12 +2775,11 @@ impl Muxer {
         let Some(mut part) = self.part.take() else {
             return Ok(());
         };
-        if let Some((_, start)) = self.late_audio
-            && !self.late_closed
-            && part.start_dts >= start
+        if let Some(late) = self.late_audio.as_mut()
+            && part.start_dts >= late.keyframe
         {
             // The new run's first part: late audio has no later place.
-            self.late_closed = true;
+            late.closed = true;
         }
         let split = part
             .audio_times

@@ -308,15 +308,20 @@ fn an_epoch_change_keeps_every_video_and_aac_frame() {
 /// In the fixture's own order, its audio PES arrive up to 200 ms after the
 /// video they go with (FFmpeg packs several AAC frames a PES). The frame
 /// stamped just before the change (3.4213 s) then arrives after the new
-/// run's first part has closed: no part it fits is open, so it is dropped
-/// and reported. Everything else comes out.
+/// run's first part has closed: no part it fits is open, so it is dropped.
+/// The loss is the old epoch's (its audio stops short of its end), so it is
+/// counted against epoch 0, not reported by the new run's updates.
+/// Everything else comes out.
 #[test]
-fn late_audio_after_the_new_runs_first_part_is_reported() {
+fn late_audio_after_the_new_runs_first_part_is_counted_for_the_old_epoch() {
     let events = events();
     let mut es = aac_ingest();
     let mut watch = Watch::default();
     let up = feed(&mut es, &events, &mut watch);
-    assert!(up.restarted && up.media_loss, "the late frame is reported");
+    assert!(up.restarted && !up.media_loss, "the new run lost nothing");
+    let m = es.muxer_mut().expect("muxer");
+    assert_eq!(m.take_late_audio_loss(), vec![0], "the old epoch lost it");
+    assert_eq!(m.late_audio_epoch(), None, "audio caught up");
     finish(&mut es, &mut watch);
     let late = events
         .iter()
@@ -334,10 +339,11 @@ fn late_audio_after_the_new_runs_first_part_is_reported() {
     assert_continuous_audio_but_for(es.muxer().expect("muxer"), 1024);
 }
 
-/// A late frame dropped and then the stream's end: the end's interrupt
-/// reports it, though no video came after it.
+/// A late frame dropped and then the stream's end: the loss is counted
+/// when the next audio frame drops it, though no video came after it, and
+/// the window stays open for it until then.
 #[test]
-fn late_audio_lost_just_before_the_end_is_reported_by_it() {
+fn late_audio_lost_just_before_the_end_is_counted_for_its_epoch() {
     let events = events();
     // Up to and including the late frame, and no video after it.
     let late = events
@@ -350,16 +356,209 @@ fn late_audio_lost_just_before_the_end_is_reported_by_it() {
     // comes; in the fixture's order it has, by the frame's arrival.
     let up = feed(&mut es, &events[..late], &mut watch);
     assert!(up.restarted && !up.media_loss);
-    let up = feed(&mut es, &events[late..=late], &mut watch);
-    assert!(!up.media_loss, "audio alone reports nothing yet");
+    let m = es.muxer_mut().expect("muxer");
+    assert_eq!(m.late_audio_epoch(), Some(0), "epoch 0's audio may come");
+    assert!(m.take_late_audio_loss().is_empty());
+    feed(&mut es, &events[late..=late], &mut watch);
     // The frame is held until the next audio places or drops it.
+    let m = es.muxer_mut().expect("muxer");
+    assert!(m.take_late_audio_loss().is_empty(), "held, not yet dropped");
     let next_audio = events[late + 1..]
         .iter()
         .find(|e| matches!(e, Event::Aac(..)))
         .cloned()
         .expect("audio after it");
     feed(&mut es, &[next_audio], &mut watch);
-    assert!(finish(&mut es, &mut watch).media_loss, "the end reports it");
+    assert_eq!(
+        es.muxer_mut().expect("muxer").take_late_audio_loss(),
+        vec![0]
+    );
+    assert!(!finish(&mut es, &mut watch).media_loss, "not the new run's");
+    assert_eq!(es.muxer().expect("muxer").late_audio_epoch(), None);
+}
+
+/// Video pauses for more than a second before the new IDR while audio
+/// carries on: too long a gap to hold, so the change cuts as a break does,
+/// and the audio in the gap that no part can take is reported.
+#[test]
+fn an_epoch_change_after_a_pause_over_a_second_reports_the_loss() {
+    for pause in [90_001, 180_000] {
+        let mut events: Vec<Event> = events()
+            .into_iter()
+            .map(|e| match e {
+                Event::Video(dts, pts, au) if dts >= CHANGE => {
+                    Event::Video(dts + pause, pts + pause, au)
+                }
+                Event::Aac(pts, config, p) if pts >= CHANGE => Event::Aac(pts + pause, config, p),
+                other => other,
+            })
+            .collect();
+        // Audio carries on through the pause.
+        let config = aac();
+        let mut gap = Vec::new();
+        let mut at = CHANGE;
+        while at < CHANGE + pause {
+            gap.push(Event::Aac(
+                at,
+                config,
+                vec![0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c],
+            ));
+            at += 1920;
+        }
+        events.extend(gap);
+        let from = events
+            .iter()
+            .position(|e| e.at() >= CHANGE - 9_000)
+            .expect("the change");
+        events[from..].sort_by_key(Event::at);
+        let mut es = aac_ingest();
+        let mut watch = Watch::default();
+        let up = feed(&mut es, &events, &mut watch);
+        assert!(up.restarted, "{pause}: the change starts an epoch");
+        assert!(up.media_loss, "{pause}: the audio in the gap is reported");
+        finish(&mut es, &mut watch);
+    }
+}
+
+/// The video parts of `epoch`: each one's decode time and end, 90 kHz.
+fn video_spans(m: &Muxer, epoch: u64) -> Vec<(u64, u64)> {
+    parts(m)
+        .into_iter()
+        .filter(|p| p.initialization.id == epoch)
+        .filter_map(|part| {
+            let moof = Moof::decode(&mut part.data.as_ref()).expect("moof");
+            let video = moof.traf.iter().find(|t| t.tfhd.track_id == VIDEO_TRACK)?;
+            let base = video.tfdt.as_ref().expect("tfdt").base_media_decode_time;
+            let length: u64 = video
+                .trun
+                .iter()
+                .flat_map(|r| &r.entries)
+                .map(|e| u64::from(e.duration.expect("duration")))
+                .sum();
+            Some((base, base + length))
+        })
+        .collect()
+}
+
+/// [`Muxer::reconfigure_with_audio_at`], then an interrupt before the new
+/// keyframe comes (the publisher left): the next connection, whose clock
+/// starts again at 0, carries on where the old run ended, as it does after
+/// [`Muxer::reconfigure_with_audio`].
+#[test]
+fn an_interrupt_before_a_cuts_keyframe_resumes_where_the_run_ended() {
+    use crate::muxer::tests::{aac, feed, video};
+    for continuing in [true, false] {
+        let mut m = Muxer::new(config(), video(), Some(aac()));
+        feed(&mut m, 0..90, 30);
+        let audio = Some(AudioConfig::Aac(aac()));
+        if continuing {
+            m.reconfigure_with_audio_at(Some(video()), audio, 270_000, NOW)
+        } else {
+            m.reconfigure_with_audio(Some(video()), audio, NOW)
+        }
+        .expect("a new epoch");
+        m.interrupt(NOW);
+        feed(&mut m, 0..60, 30);
+        m.interrupt(NOW);
+        let old = video_spans(&m, 0);
+        let new = video_spans(&m, 1);
+        let end = old.last().expect("old parts").1;
+        let start = new.first().expect("new parts").0;
+        assert_eq!(start, end, "continuing {continuing}: resumes at the end");
+    }
+}
+
+/// A timestamp at the edge of `i64` after an interrupt rebases without
+/// overflowing.
+#[test]
+fn an_extreme_timestamp_after_an_interrupt_does_not_overflow() {
+    use crate::muxer::tests::{aac, feed, video};
+    for dts in [i64::MIN, i64::MAX] {
+        let mut m = Muxer::new(config(), video(), Some(aac()));
+        feed(&mut m, 0..90, 30);
+        m.interrupt(NOW);
+        let _ = m.push_video(dts, dts, true, Bytes::from(vec![0u8; 100]), NOW);
+        let _ = m.push_video(dts, dts, true, Bytes::from(vec![0u8; 100]), NOW);
+    }
+}
+
+/// Audio carried past the old run at a cut, then a change of audio
+/// configuration: the carried samples are of the old one and go, reported.
+/// With the same configuration they are kept.
+#[test]
+fn carried_audio_goes_with_its_audio_configuration() {
+    use crate::muxer::tests::{aac, feed, video};
+    for (changed, lost) in [(false, false), (true, true)] {
+        let mut m = Muxer::new(config(), video(), Some(aac()));
+        feed(&mut m, 0..90, 30);
+        // Audio runs 600 ms past the held frame (267000), further than the
+        // open part's room.
+        let mut at = 270_000;
+        while at < 324_000 {
+            m.push_audio(at, Bytes::from_static(b"aac")).expect("audio");
+            at += 1920;
+        }
+        let next = if changed {
+            AacConfig {
+                channels: 1,
+                ..aac()
+            }
+        } else {
+            aac()
+        };
+        let up = m
+            .reconfigure_with_audio_at(Some(video()), Some(AudioConfig::Aac(next)), 330_000, NOW)
+            .expect("a new epoch");
+        assert_eq!(up.media_loss, lost, "audio changed: {changed}");
+    }
+}
+
+/// The late-audio window: open after a cut with the audio short of the new
+/// keyframe, closed with no loss once audio stamped at or after it comes,
+/// and closed with the epoch counted as lost if video runs two seconds on
+/// with no such audio.
+#[test]
+fn the_late_audio_window_closes_on_audio_or_after_two_seconds() {
+    use crate::muxer::tests::{aac, video};
+    for audio_comes in [true, false] {
+        let mut m = Muxer::new(config(), video(), Some(aac()));
+        let push = |m: &mut Muxer, from: i64, to: i64, audio: bool| {
+            let mut next_audio = from * 3000;
+            for i in from..to {
+                let dts = i * 3000;
+                while audio && next_audio <= dts {
+                    m.push_audio(next_audio, Bytes::from_static(b"aac"))
+                        .expect("audio");
+                    next_audio += 1920;
+                }
+                m.push_video(dts, dts, i % 30 == 0, Bytes::from(vec![0u8; 100]), NOW)
+                    .expect("video");
+            }
+        };
+        // Audio stops 200 ms before the last frame of the old run.
+        push(&mut m, 0, 84, true);
+        push(&mut m, 84, 90, false);
+        m.reconfigure_with_audio_at(Some(video()), Some(AudioConfig::Aac(aac())), 270_000, NOW)
+            .expect("a new epoch");
+        assert_eq!(m.late_audio_epoch(), Some(0));
+        push(&mut m, 90, 91, false);
+        if audio_comes {
+            // From where it stopped, so the first frames are late.
+            let mut at = 252_000;
+            while at < 276_000 {
+                m.push_audio(at, Bytes::from_static(b"aac")).expect("audio");
+                at += 1920;
+            }
+            assert_eq!(m.late_audio_epoch(), None, "caught up");
+            assert!(m.take_late_audio_loss().is_empty(), "joined the first part");
+        } else {
+            push(&mut m, 91, 150, false);
+            assert_eq!(m.late_audio_epoch(), Some(0), "under two seconds");
+            push(&mut m, 150, 152, false);
+            assert_eq!(m.late_audio_epoch(), None, "two seconds on");
+            assert_eq!(m.take_late_audio_loss(), vec![0], "its audio is short");
+        }
+    }
 }
 
 /// Audio-only Opus through a codec change of its own (a new channel count

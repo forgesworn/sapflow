@@ -274,6 +274,13 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
 ///   entries or more, the muxer's entry cap, or the caller says the muxer's
 ///   byte cap cut it ([`RuleCheck::check_with_byte_cap`],
 ///   [`crate::Muxer::window_byte_capped`]);
+/// - a segment whose parts are listed lasts, by its `EXTINF`, as long as
+///   they do together (4.4.4.9: a part's duration is that of its media).
+///   The one exception is within a continuous run: after a part cut to
+///   exactly `PART-TARGET` (a frame longer than the part's room, clamped),
+///   the next part's decode time carries the true time, and the segment
+///   lasts as long as that. A segment that a discontinuity follows has no
+///   exception: its run's gap falls at the discontinuity;
 /// - an `EXT-X-DISCONTINUITY` sits before a segment's parts, never among
 ///   them, and every media sequence number keeps one discontinuity
 ///   sequence number from render to render.
@@ -369,6 +376,9 @@ impl RuleCheck {
             Ok(())
         };
         let mut run = Vec::new();
+        // A segment that lasts longer than its parts, until what follows it
+        // shows whether that is a discontinuity.
+        let mut held_hole: Option<(u64, u64, u64)> = None;
         let mut map = String::new();
         let mut pending_uri = None;
         for l in pl.lines() {
@@ -392,6 +402,7 @@ impl RuleCheck {
                 }
             }
             if let Some(rest) = l.strip_prefix("#EXT-X-PART:DURATION=") {
+                held_hole = None;
                 run.push((
                     fixed5(rest.split(',').next().unwrap_or_default())?,
                     rest.split(',').any(|a| a == "INDEPENDENT=YES"),
@@ -400,11 +411,30 @@ impl RuleCheck {
                 if !run.is_empty() {
                     return Err(format!("discontinuity among the parts of segment {msn}"));
                 }
+                if let Some((msn, d, sum)) = held_hole {
+                    return Err(format!(
+                        "segment {msn} lasts {d}, but its parts sum to {sum}, \
+                         before a discontinuity"
+                    ));
+                }
                 dseq += 1;
             } else if let Some(rest) = l.strip_prefix("#EXTINF:") {
                 parts(&run, false)?;
-                run.clear();
                 let d = fixed5(rest.trim_end_matches(','))?;
+                // Each printed duration is rounded by up to half a unit.
+                let sum: u64 = run.iter().map(|&(p, _)| p).sum();
+                if !run.is_empty() && sum.abs_diff(d) > run.len() as u64 {
+                    // Within a continuous run, only the decode-time hole
+                    // after a part cut to PART-TARGET (a clamped stall).
+                    let clamped = d > sum && run.iter().any(|&(p, _)| p == part_target);
+                    if !clamped {
+                        return Err(format!(
+                            "segment {msn} lasts {d}, but its parts sum to {sum}"
+                        ));
+                    }
+                    held_hole = Some((msn, d, sum));
+                }
+                run.clear();
                 listed += d;
                 entries += 1;
                 // Rounded to the nearest second, halves up.
@@ -798,7 +828,7 @@ mod tests {
         // that is not (held to Apple's stricter rule).
         let render = |first: bool, second: bool| {
             format!(
-                "{}{}{}#EXTINF:1.0,\ns\n",
+                "{}{}{}#EXTINF:0.32,\ns\n",
                 head(0),
                 part("0.12000", first),
                 part("0.20000", second)
@@ -882,9 +912,9 @@ mod tests {
             head(3, 10, 0),
             part("0.20000"),
             part("0.03300"),
-            seg("3.49000"),
+            seg("0.23300"),
             part("0.19890"),
-            seg("1.0"),
+            seg("0.19890"),
             part("0.01000"),
         );
         let mut c = RuleCheck::without_live_window();
@@ -895,7 +925,7 @@ mod tests {
             "{}#EXT-X-DISCONTINUITY\n{}{}",
             head(3, 11, 0),
             part("0.2"),
-            seg("1.0")
+            seg("0.2")
         );
         assert_eq!(c.check(&rolled), Ok(()));
         // Once it leaves, the sequence must have counted it.
@@ -925,6 +955,18 @@ mod tests {
                 part("0.2"),
                 seg("1")
             ),
+            // Parts that do not add up to their segment.
+            format!("{}{}{}", head(3, 0, 0), part("0.2"), seg("0.25")),
+            format!("{}{}{}", head(3, 0, 0), part("0.2"), seg("0.15")),
+            // A clamped part's hole is no exception before a discontinuity:
+            // the gap falls at it.
+            format!(
+                "{}{}{}#EXT-X-DISCONTINUITY\n{}",
+                head(3, 0, 0),
+                part("0.23400"),
+                seg("0.5"),
+                part("0.2"),
+            ),
             "#EXTM3U\n".to_string(),
         ] {
             assert!(
@@ -932,6 +974,21 @@ mod tests {
                 "{bad}"
             );
         }
+        // Rounded to the nearest second, halves up: 3.49 s is within 3.
+        assert_eq!(
+            RuleCheck::without_live_window().check(&format!("{}{}", head(3, 0, 0), seg("3.49000"))),
+            Ok(())
+        );
+        // Within a continuous run, the decode-time hole after a part cut to
+        // PART-TARGET (a clamped stall) stays in its segment.
+        let stall = format!(
+            "{}{}{}{}",
+            head(3, 0, 0),
+            part("0.23400"),
+            seg("0.5"),
+            part("0.2")
+        );
+        assert_eq!(RuleCheck::without_live_window().check(&stall), Ok(()));
         assert_eq!(
             fresh.check(&format!("{}{}", head(3, 0, 0), seg("1"))),
             Ok(())

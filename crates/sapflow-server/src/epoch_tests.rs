@@ -487,7 +487,8 @@ async fn a_mid_stream_resolution_change_rolls_the_recording_and_both_files_decod
     assert_eq!((recorded[first].1, audio), (94, 94), "AAC frames");
     // The fixture's AAC PES arrive up to 200 ms behind their video, so the
     // frame stamped just before the change arrives after the new run's
-    // first part: it is dropped, and the file that follows says so.
+    // first part: it is dropped. The file it belonged to, the first, says
+    // so; the second has all of its own.
     let mut done = Vec::new();
     while let Ok(callback) = receiver.try_recv() {
         let body: serde_json::Value =
@@ -502,11 +503,11 @@ async fn a_mid_stream_resolution_change_rolls_the_recording_and_both_files_decod
             .map(|b| (b["recordingState"].clone(), b["recordingReason"].clone()))
             .expect("a callback for the file")
     };
-    assert_eq!(state(&files[first]).0, "finalised");
     assert_eq!(
-        state(&files[1 - first]),
+        state(&files[first]),
         ("incomplete".into(), "media-loss".into())
     );
+    assert_eq!(state(&files[1 - first]).0, "finalised");
 }
 
 fn widths_of(files: &[std::path::PathBuf]) -> Vec<u32> {
@@ -559,9 +560,10 @@ async fn short_epoch_run() -> (
             .ingest
             .muxer()
             .map(|m| m.current_initialization_id());
-        if epoch == Some(1) && !waited {
-            // As in real time, where the short epoch and the next part give
-            // the first file's writer time to finish: two writers a path.
+        if epoch == Some(2) && !waited {
+            // As in real time, where the next part gives the first file's
+            // writer time to finish: two writers a path. The first file is
+            // finished at the second change, which ends its late audio.
             waited = true;
             tokio::time::timeout(Duration::from_secs(5), async {
                 while done.is_empty() {
@@ -686,36 +688,316 @@ async fn a_refused_late_start_marks_the_next_recording() {
     );
 }
 
-/// Video PES starts in a transport stream, with their PTS (90 kHz), from
-/// the MPEG-TS packet and PES header layouts.
+/// A PES start in one TS packet: its stream id and PTS (90 kHz), from the
+/// MPEG-TS packet and PES header layouts.
+fn pes_start(p: &[u8]) -> Option<(u8, u64)> {
+    if p.len() < 188 || p[0] != 0x47 || p[1] & 0x40 == 0 {
+        return None;
+    }
+    let control = (p[3] >> 4) & 3;
+    let mut at = 4;
+    if control & 2 != 0 {
+        at += 1 + usize::from(p[4]);
+    }
+    if control & 1 == 0 {
+        return None;
+    }
+    let pes = p.get(at..)?;
+    if pes.len() < 14 || pes[..3] != [0, 0, 1] || pes[7] & 0x80 == 0 {
+        return None;
+    }
+    let b = &pes[9..14];
+    let pts = ((u64::from(b[0]) >> 1) & 7) << 30
+        | u64::from(b[1]) << 22
+        | (u64::from(b[2]) >> 1) << 15
+        | u64::from(b[3]) << 7
+        | u64::from(b[4]) >> 1;
+    Some((pes[3], pts))
+}
+
+/// Video PES starts in a transport stream, with their PTS (90 kHz).
 fn video_pes_starts(ts: &[u8]) -> Vec<(usize, u64)> {
     ts.chunks(188)
         .enumerate()
-        .filter_map(|(i, p)| {
-            if p.len() < 188 || p[0] != 0x47 || p[1] & 0x40 == 0 {
-                return None;
-            }
-            let control = (p[3] >> 4) & 3;
-            let mut at = 4;
-            if control & 2 != 0 {
-                at += 1 + usize::from(p[4]);
-            }
-            if control & 1 == 0 {
-                return None;
-            }
-            let pes = p.get(at..)?;
-            if pes.len() < 14 || pes[..4] != [0, 0, 1, 0xe0] || pes[7] & 0x80 == 0 {
-                return None;
-            }
-            let b = &pes[9..14];
-            let pts = ((u64::from(b[0]) >> 1) & 7) << 30
+        .filter_map(|(i, p)| match pes_start(p)? {
+            (0xe0, pts) => Some((i * 188, pts)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One elementary frame of a transport stream: video (DTS, PTS, Annex B) or
+/// one AAC frame (PTS, payload), times 90 kHz.
+enum Frame {
+    Video(i64, i64, Vec<u8>),
+    Aac(i64, sapflow_hls::codec::AacConfig, Vec<u8>),
+}
+
+impl Frame {
+    fn at(&self) -> i64 {
+        match self {
+            Self::Video(dts, ..) | Self::Aac(dts, ..) => *dts,
+        }
+    }
+}
+
+/// The elementary frames of a clean, single-programme TS in file order,
+/// from the MPEG-TS packet and PES header layouts (no clock wrap).
+fn elementary_frames(ts: &[u8]) -> Vec<Frame> {
+    let times = |pes: &[u8]| -> (i64, i64, usize) {
+        let ts = |b: &[u8]| {
+            (((u64::from(b[0]) >> 1) & 7) << 30
                 | u64::from(b[1]) << 22
                 | (u64::from(b[2]) >> 1) << 15
                 | u64::from(b[3]) << 7
-                | u64::from(b[4]) >> 1;
-            Some((i * 188, pts))
+                | u64::from(b[4]) >> 1) as i64
+        };
+        let pts = ts(&pes[9..14]);
+        let dts = if pes[7] & 0x40 != 0 {
+            ts(&pes[14..19])
+        } else {
+            pts
+        };
+        (dts, pts, 9 + usize::from(pes[8]))
+    };
+    let mut out = Vec::new();
+    let mut open: std::collections::HashMap<u16, Vec<u8>> = Default::default();
+    let emit = |pes: Vec<u8>, out: &mut Vec<Frame>| {
+        if pes.len() < 14 || pes[7] & 0x80 == 0 {
+            return;
+        }
+        let (dts, pts, body) = times(&pes);
+        match pes[3] {
+            0xe0 => out.push(Frame::Video(dts, pts, pes[body..].to_vec())),
+            0xc0..=0xdf => {
+                for (i, (config, payload)) in sapflow_hls::codec::adts_frames(&pes[body..])
+                    .into_iter()
+                    .enumerate()
+                {
+                    let step = 1024 * 90_000 / i64::from(config.sample_rate);
+                    out.push(Frame::Aac(pts + step * i as i64, config, payload.to_vec()));
+                }
+            }
+            _ => {}
+        }
+    };
+    for p in ts.chunks(188) {
+        if p.len() < 188 || p[0] != 0x47 {
+            continue;
+        }
+        let pid = (u16::from(p[1] & 0x1f) << 8) | u16::from(p[2]);
+        let control = (p[3] >> 4) & 3;
+        let mut at = 4;
+        if control & 2 != 0 {
+            at += 1 + usize::from(p[4]);
+        }
+        if control & 1 == 0 || at >= 188 || pid == 0 {
+            continue;
+        }
+        let payload = &p[at..];
+        if p[1] & 0x40 != 0 {
+            if payload.starts_with(&[0, 0, 1]) {
+                if let Some(done) = open.insert(pid, payload.to_vec()) {
+                    emit(done, &mut out);
+                }
+            } else {
+                // A table (PAT, PMT): not a PES.
+                open.remove(&pid);
+            }
+        } else if let Some(pes) = open.get_mut(&pid) {
+            pes.extend_from_slice(payload);
+        }
+    }
+    let mut rest: Vec<_> = open.into_values().collect();
+    rest.sort_by_key(|pes| pes.len());
+    for pes in rest {
+        emit(pes, &mut out);
+    }
+    out
+}
+
+/// The frames in time order, but each AAC frame arriving just before the
+/// first video frame `lag` (90 kHz) past it, or at the end: audio that far
+/// behind its video, as from an encoder or a muxer with that much delay.
+fn audio_behind(frames: Vec<Frame>, lag: i64) -> Vec<Frame> {
+    let (mut video, audio): (Vec<Frame>, Vec<Frame>) = frames
+        .into_iter()
+        .partition(|f| matches!(f, Frame::Video(..)));
+    video.sort_by_key(Frame::at);
+    let mut audio = audio;
+    audio.sort_by_key(Frame::at);
+    let mut out = Vec::new();
+    let mut audio = audio.into_iter().peekable();
+    for v in video {
+        while audio.peek().is_some_and(|a| a.at() + lag <= v.at()) {
+            out.push(audio.next().expect("peeked"));
+        }
+        out.push(v);
+    }
+    out.extend(audio);
+    out
+}
+
+/// The resolution change with its audio arriving 100, 300, 500 and 1000 ms
+/// behind its video, through the elementary-stream path (WHIP's). Audio
+/// stamped before the change that arrives while the new run's first part is
+/// open joins it, in the new file; after that it is dropped. A drop marks
+/// the file whose audio it was, the first, and only then; the second file
+/// is never marked for it. Every frame is in a file or counted as dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
+async fn late_audio_at_a_resolution_change_marks_only_the_file_it_belonged_to() {
+    const CHANGE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-change.ts");
+    let mut table = Vec::new();
+    for lag_ms in [0i64, 100, 300, 500, 1000] {
+        let frames = audio_behind(elementary_frames(CHANGE), lag_ms * 90);
+        let first_idr = frames
+            .iter()
+            .find_map(|f| match f {
+                Frame::Video(dts, _, annexb) if sapflow_hls::codec::access_unit(annexb).idr => {
+                    Some(*dts)
+                }
+                _ => None,
+            })
+            .expect("an IDR");
+        // The AAC from the first keyframe on (one frame before it has no
+        // run to join): 95 before the change and 94 after. As at any
+        // stream's start, of those that arrive before the second video
+        // frame opens the first part, only the last is kept.
+        let second = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| matches!(f, Frame::Video(..)))
+            .nth(1)
+            .map_or(0, |(i, _)| i);
+        let early = frames[..second]
+            .iter()
+            .filter(|f| matches!(f, Frame::Aac(pts, ..) if *pts >= first_idr))
+            .count();
+        let audio = frames
+            .iter()
+            .filter(|f| matches!(f, Frame::Aac(pts, ..) if *pts >= first_idr))
+            .count()
+            - early.saturating_sub(1);
+        let (mut app, scratch) = app(true);
+        let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+        let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
+        Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
+        let req = sapflow_core::PublishRequest::parse_srt_stream_id(
+            "publish:live/event-epochs:fixture:fixture",
+        )
+        .expect("request");
+        let mut publisher = crate::publish::Publication::begin(
+            &app,
+            &req,
+            SourceKind::Es,
+            "127.0.0.1".parse().expect("loopback"),
+        )
+        .expect("begin");
+        let config = frames
+            .iter()
+            .find_map(|f| match f {
+                Frame::Aac(_, config, _) => Some(*config),
+                Frame::Video(..) => None,
+            })
+            .expect("AAC");
+        for frame in &frames {
+            publisher
+                .push(|source, now| {
+                    let crate::stream::Source::Es(es) = source else {
+                        unreachable!()
+                    };
+                    es.audio_config(config);
+                    match frame {
+                        Frame::Video(dts, pts, annexb) => {
+                            es.video(*dts, *pts, sapflow_hls::codec::access_unit(annexb), now)
+                        }
+                        Frame::Aac(pts, config, payload) => {
+                            es.audio_at(*pts, *config, payload, now)
+                        }
+                    }
+                })
+                .expect("fixture frames");
+        }
+        publisher.end();
+        let path = StreamPath::parse("live/event-epochs").expect("path");
+        let (stream, generation, _) = app
+            .streams
+            .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Es)
+            .expect("claim");
+        app.streams.detach(&stream, generation, false);
+        let mut done = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while done.len() < 2 {
+                let callback = receiver.recv().await.expect("recording callback queue");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&callback.body).expect("recording callback JSON");
+                if body["event"] == "recordSegmentComplete" {
+                    done.push(body);
+                }
+            }
         })
-        .collect()
+        .await
+        .expect("two finished recordings");
+        let count = |file: &std::path::Path, track: &str| {
+            let output = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", track])
+                .args(["-show_entries", "packet=pts", "-of", "csv=p=0"])
+                .arg(file)
+                .output()
+                .expect("ffprobe runs");
+            String::from_utf8_lossy(&output.stdout).lines().count()
+        };
+        // Per file: its width, (video, AAC) frames, and (state, reason).
+        type Recorded = (u32, (usize, usize), (String, String));
+        let mut files: Vec<Recorded> = done
+            .iter()
+            .map(|b| {
+                let file = std::path::PathBuf::from(b["segmentPath"].as_str().expect("a path"));
+                let width = widths_of(std::slice::from_ref(&file))[0];
+                let decode = std::process::Command::new("ffmpeg")
+                    .args(["-hide_banner", "-v", "error", "-xerror", "-i"])
+                    .arg(&file)
+                    .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+                    .output()
+                    .expect("ffmpeg runs");
+                assert!(
+                    decode.status.success() && decode.stderr.is_empty(),
+                    "{lag_ms} ms: {}: {}",
+                    file.display(),
+                    String::from_utf8_lossy(&decode.stderr)
+                );
+                let state = (
+                    b["recordingState"].as_str().unwrap_or_default().to_owned(),
+                    b["recordingReason"].as_str().unwrap_or_default().to_owned(),
+                );
+                (width, (count(&file, "v:0"), count(&file, "a:0")), state)
+            })
+            .collect();
+        files.sort_by_key(|f| std::cmp::Reverse(f.0));
+        let [(160, old, old_state), (128, new, new_state)] = &files[..] else {
+            panic!("{lag_ms} ms: one file per resolution: {files:?}");
+        };
+        let dropped = audio - old.1 - new.1;
+        table.push((lag_ms, *old, *new, dropped, old_state.clone()));
+        assert_eq!((old.0, new.0), (60, 60), "{lag_ms} ms: every video frame");
+        assert_eq!(new_state.0, "finalised", "{lag_ms} ms: the second file");
+        if dropped > 0 {
+            assert_eq!(
+                (old_state.0.as_str(), old_state.1.as_str()),
+                ("incomplete", "media-loss"),
+                "{lag_ms} ms: {dropped} dropped"
+            );
+        } else {
+            assert_eq!(old_state.0, "finalised", "{lag_ms} ms: nothing dropped");
+        }
+        drop(scratch);
+    }
+    eprintln!("lag ms, (video, AAC) first file, second file, AAC dropped, first file: {table:?}");
+    // The first part of the new run holds about 200 ms of video: audio
+    // later than that behind is what is dropped.
+    let dropped: Vec<usize> = table.iter().map(|row| row.3).collect();
+    assert_eq!(dropped, [0, 0, 5, 15, 38], "AAC dropped at 0 to 1000 ms");
 }
 
 /// A whole short epoch and the next one's first IDR inside one push: the

@@ -8,6 +8,10 @@ Rules (RFC 8216bis 4.4.3.1, 4.4.3.3, 4.4.3.7, 4.4.4.9, 6.2.2;
 docs/reference.md), the same as sapflow_hls::playlist::RuleCheck:
   - TARGETDURATION and PART-TARGET never change while the stream runs;
   - every EXTINF, rounded to the nearest second, is at most TARGETDURATION;
+  - a segment whose parts are listed lasts, by its EXTINF, as long as they
+    do together, except within a continuous run after a part cut to exactly
+    PART-TARGET (a clamped stall, whose hole the next part's time carries);
+    a segment a discontinuity follows has no exception;
   - no EXT-X-PART DURATION is above PART-TARGET;
   - every part but the last of its segment is at least 85% of PART-TARGET;
     4.4.4.9 also exempts INDEPENDENT=YES parts, allowed here only in a
@@ -44,7 +48,7 @@ def check(text, live_window=True, byte_capped=False):
     """One render: (headers, [(uri, duration)], {msn: dseq}, [extinf], [violations])."""
     head = {}
     parts, run, bad, dseqs, extinfs = [], [], [], {}, []
-    msn = dseq = None
+    msn = dseq = hole = None
     for line in text.splitlines():
         for tag in ("#EXT-X-TARGETDURATION:", "#EXT-X-MEDIA-SEQUENCE:", "#EXT-X-DISCONTINUITY-SEQUENCE:"):
             if line.startswith(tag):
@@ -55,6 +59,7 @@ def check(text, live_window=True, byte_capped=False):
                 if k == "PART-TARGET":
                     head["PART-TARGET"] = Decimal(v)
         elif line.startswith("#EXT-X-PART:"):
+            hole = None
             attrs = dict(a.partition("=")[::2] for a in line.split(":", 1)[1].split(","))
             run.append((attrs.get("URI", "").strip('"'), Decimal(attrs["DURATION"]),
                         attrs.get("INDEPENDENT") == "YES"))
@@ -64,6 +69,8 @@ def check(text, live_window=True, byte_capped=False):
                 dseq = head.get("#EXT-X-DISCONTINUITY-SEQUENCE:", 0)
             if run:
                 bad.append(f"EXT-X-DISCONTINUITY among the parts of segment {msn}")
+            if hole:
+                bad.append(hole)
             dseq += 1
         elif line.startswith("#EXTINF:"):
             if msn is None:
@@ -74,6 +81,15 @@ def check(text, live_window=True, byte_capped=False):
             target = head.get("#EXT-X-TARGETDURATION:")
             if target is not None and int(d + Decimal("0.5")) > target:
                 bad.append(f"segment {msn} lasts {d}, over TARGETDURATION {target}")
+            # Each printed duration is rounded by up to half a unit.
+            total = sum(p for _, p, _ in run)
+            if run and abs(total - d) > len(run) * Decimal("0.00001"):
+                # Within a continuous run, only the decode-time hole after a
+                # part cut to PART-TARGET (a clamped stall).
+                if d > total and any(p == head.get("PART-TARGET") for _, p, _ in run):
+                    hole = f"segment {msn} lasts {d}, but its parts sum to {total}, before a discontinuity"
+                else:
+                    bad.append(f"segment {msn} lasts {d}, but its parts sum to {total}")
             dseqs[msn] = dseq
             msn += 1
             parts.append((run, False))
