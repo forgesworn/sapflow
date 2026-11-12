@@ -25,9 +25,26 @@ live media server. MIT.
   rule), up to `muxer::MAX_WINDOW_ENTRIES` (256) entries and 64 MiB of
   media beyond the count. Past either cap removal goes on, so a publisher
   making tiny segments cannot grow the window without bound. 6.2.2's part
-  rule is not met yet: a part should stay downloadable for three target
-  durations after its tag leaves the playlist, but its data goes with its
-  segment, so a window shorter than about six target durations falls short.
+  rule holds in media time: `Muxer::part` keeps serving a part for three
+  target durations of published media after the playlist stops listing it,
+  up to 64 MiB and `muxer::MAX_RETAINED_PARTS` (4,096) parts beyond the
+  window; past either, or when the retention pool is full, the oldest go
+  early and `Muxer::parts_released_early` counts them. A removed
+  segment, with its init, stays fetchable through `Muxer::segment` until
+  its Availability Duration (its own duration plus the longest playlist
+  that listed it) has passed since it first appeared, as 6.2.2 asks,
+  within the same 64 MiB, which counts a segment and its parts once, and
+  `muxer::MAX_RETAINED_SEGMENTS` (1,024); `Muxer::segments_released_early`
+  counts any that go early. Retention needs a pool: pass one to every
+  muxer on a budget with `Muxer::with_retention_pool`, the ingests'
+  `with_retention_pool` or `with_fragment_budget`
+  (`muxer::RETENTION_POOL_BYTES`, 128 MiB, is the server's default size).
+  What is kept is charged to the pool, not to the fragment budget, so it
+  never refuses live media. Without a pool, media leaves with the window,
+  as in 0.2.0-rc.1, so these two rules hold only at windows of about six
+  target durations. The server always gives a pool. Past a stream's end,
+  kept media stays fetchable only while the server keeps the presentation
+  (`SAPFLOW_RECONNECT_GRACE`).
 - **Ingest.** `TsIngest` takes MPEG-TS (what SRT carries), `FlvIngest`
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
   units and AAC frames or Opus packets directly.

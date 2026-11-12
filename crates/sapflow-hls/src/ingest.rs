@@ -502,6 +502,7 @@ pub struct EsIngest {
     declared: Option<TrackSet>,
     muxer: Option<Muxer>,
     fragment_quota: Option<Arc<sapflow_core::fragment::FragmentQuota>>,
+    retention_pool: Option<Arc<sapflow_core::fragment::FragmentQuota>>,
 }
 
 impl EsIngest {
@@ -520,6 +521,7 @@ impl EsIngest {
             declared: None,
             muxer: None,
             fragment_quota: None,
+            retention_pool: None,
         }
     }
 
@@ -530,10 +532,12 @@ impl EsIngest {
     /// and the update says `restarted` (for recording rollover).
     pub fn resume(cfg: MuxerConfig, mut muxer: Muxer) -> Self {
         let fragment_quota = muxer.fragment_quota();
+        let retention_pool = muxer.shared_retention_pool();
         muxer.resume_fragment_admission();
         Self {
             muxer: Some(muxer),
             fragment_quota,
+            retention_pool,
             ..Self::new(cfg)
         }
     }
@@ -546,6 +550,40 @@ impl EsIngest {
         Self {
             fragment_quota: Some(quota),
             ..Self::new(cfg)
+        }
+    }
+
+    /// [`EsIngest::with_fragment_quota`], with the retention pool its muxer
+    /// charges kept media to ([`Muxer::with_retention_pool`]).
+    pub fn with_fragment_budget(
+        cfg: MuxerConfig,
+        quota: Arc<sapflow_core::fragment::FragmentQuota>,
+        retention: Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
+        Self {
+            fragment_quota: Some(quota),
+            retention_pool: Some(retention),
+            ..Self::new(cfg)
+        }
+    }
+
+    /// Turns on retention, with `pool`, for every muxer this ingest makes
+    /// ([`Muxer::with_retention_pool`]). Without one, media leaves with the
+    /// window, as in 0.2.0-rc.1.
+    pub fn with_retention_pool(mut self, pool: Arc<sapflow_core::fragment::FragmentQuota>) -> Self {
+        self.set_retention_pool(pool);
+        self
+    }
+
+    pub(crate) fn set_retention_pool(&mut self, pool: Arc<sapflow_core::fragment::FragmentQuota>) {
+        self.retention_pool = Some(pool);
+    }
+
+    /// A new muxer, given this ingest's retention pool.
+    fn pooled(&self, muxer: Muxer) -> Muxer {
+        match &self.retention_pool {
+            Some(pool) => muxer.with_retention_pool(pool.clone()),
+            None => muxer,
         }
     }
 
@@ -727,7 +765,7 @@ impl EsIngest {
                 restarted = true;
             }
             if self.muxer.is_none() {
-                self.muxer = Some(match (&self.fragment_quota, audio) {
+                let muxer = match (&self.fragment_quota, audio) {
                     (Some(quota), audio) => {
                         Muxer::with_audio_config(self.cfg, Some(video), audio, Some(quota.clone()))?
                     }
@@ -737,7 +775,8 @@ impl EsIngest {
                     (None, audio) => {
                         Muxer::new(self.cfg, video, audio.and_then(|a| a.aac().copied()))
                     }
-                });
+                };
+                self.muxer = Some(self.pooled(muxer));
             }
             self.origin = Some(dts);
         }
@@ -793,12 +832,13 @@ impl EsIngest {
                     update.restarted = true;
                 }
             } else {
-                self.muxer = Some(match &self.fragment_quota {
+                let muxer = match &self.fragment_quota {
                     Some(quota) => {
                         Muxer::with_fragment_quota(self.cfg, None, Some(config), quota.clone())?
                     }
                     None => Muxer::audio_only(self.cfg, config)?,
-                });
+                };
+                self.muxer = Some(self.pooled(muxer));
             }
             self.origin = Some(pts);
         }
@@ -904,12 +944,13 @@ impl EsIngest {
                     update.restarted = true;
                 }
             } else {
-                self.muxer = Some(Muxer::with_audio_config(
+                let muxer = Muxer::with_audio_config(
                     self.cfg,
                     None,
                     Some(audio),
                     self.fragment_quota.clone(),
-                )?);
+                )?;
+                self.muxer = Some(self.pooled(muxer));
             }
             self.origin = Some(pts);
         }
@@ -989,6 +1030,24 @@ impl TsIngest {
     ) -> Self {
         let mut ingest = Self::new(cfg);
         ingest.es = EsIngest::with_fragment_quota(cfg, quota);
+        ingest
+    }
+
+    /// Turns on retention, with `pool` ([`EsIngest::with_retention_pool`]).
+    pub fn with_retention_pool(mut self, pool: Arc<sapflow_core::fragment::FragmentQuota>) -> Self {
+        self.es.set_retention_pool(pool);
+        self
+    }
+
+    /// [`TsIngest::with_fragment_quota`], with a retention pool
+    /// ([`EsIngest::with_fragment_budget`]).
+    pub fn with_fragment_budget(
+        cfg: MuxerConfig,
+        quota: Arc<sapflow_core::fragment::FragmentQuota>,
+        retention: Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
+        let mut ingest = Self::new(cfg);
+        ingest.es = EsIngest::with_fragment_budget(cfg, quota, retention);
         ingest
     }
     /// Carries on another connection's stream ([`EsIngest::resume`]).

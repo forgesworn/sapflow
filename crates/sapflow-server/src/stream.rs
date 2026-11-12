@@ -22,7 +22,7 @@ pub struct LiveStream {
     state: Mutex<State>,
     session: Mutex<Session>,
     version: watch::Sender<u64>,
-    fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    fragments: Budget,
     // Drop after cached state and session: reservation follows the final stream
     // owner, including publications, grace tasks and parked viewer requests.
     _presentation_permit: PresentationPermit,
@@ -105,27 +105,21 @@ pub enum SourceKind {
 }
 
 impl Source {
-    fn new(
-        kind: SourceKind,
-        cfg: MuxerConfig,
-        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
-    ) -> Self {
+    fn new(kind: SourceKind, cfg: MuxerConfig, budget: &Budget) -> Self {
+        let (live, kept) = (budget.fragments.clone(), budget.retained.clone());
         match kind {
-            SourceKind::Ts => Self::Ts(Box::new(TsIngest::with_fragment_quota(cfg, fragments))),
-            SourceKind::Flv => Self::Flv(Box::new(FlvIngest::with_fragment_quota(cfg, fragments))),
-            SourceKind::Es => Self::Es(Box::new(EsIngest::with_fragment_quota(cfg, fragments))),
+            SourceKind::Ts => Self::Ts(Box::new(TsIngest::with_fragment_budget(cfg, live, kept))),
+            SourceKind::Flv => {
+                Self::Flv(Box::new(FlvIngest::with_fragment_budget(cfg, live, kept)))
+            }
+            SourceKind::Es => Self::Es(Box::new(EsIngest::with_fragment_budget(cfg, live, kept))),
         }
     }
 
     /// A new connection's ingest, carrying on `muxer` if there is one.
-    fn resume(
-        kind: SourceKind,
-        cfg: MuxerConfig,
-        muxer: Option<Muxer>,
-        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
-    ) -> Self {
+    fn resume(kind: SourceKind, cfg: MuxerConfig, muxer: Option<Muxer>, budget: &Budget) -> Self {
         match (kind, muxer) {
-            (_, None) => Self::new(kind, cfg, fragments),
+            (_, None) => Self::new(kind, cfg, budget),
             (SourceKind::Ts, Some(m)) => Self::Ts(Box::new(TsIngest::resume(cfg, m))),
             (SourceKind::Flv, Some(m)) => Self::Flv(Box::new(FlvIngest::resume(cfg, m))),
             (SourceKind::Es, Some(m)) => Self::Es(Box::new(EsIngest::resume(cfg, m))),
@@ -315,13 +309,13 @@ impl LiveStream {
         kind: SourceKind,
         publication_permit: Option<PublicationPermit>,
         presentation_permit: PresentationPermit,
-        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+        fragments: Budget,
     ) -> Self {
         Self {
             path,
             cfg,
             state: Mutex::new(State {
-                ingest: Source::new(kind, cfg, fragments.clone()),
+                ingest: Source::new(kind, cfg, &fragments),
                 prefix: fresh_prefix(),
                 closed: false,
                 media: None,
@@ -565,7 +559,7 @@ impl LiveStream {
                 Source::Flv(_) => SourceKind::Flv,
                 Source::Es(_) => SourceKind::Es,
             };
-            state.ingest = Source::new(kind, self.cfg, self.fragments.clone());
+            state.ingest = Source::new(kind, self.cfg, &self.fragments);
             state.media = None;
             state.conventional_media = None;
             state.multivariant = None;
@@ -604,6 +598,16 @@ pub struct Registry {
     rtmp_publications: Arc<PublicationQuota>,
     presentations: Arc<PresentationQuota>,
     fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    /// What muxers keep past their windows for RFC 8216bis 6.2.2, charged
+    /// apart from `fragments` so that it never refuses live media.
+    retained: Arc<sapflow_core::fragment::FragmentQuota>,
+}
+
+/// The fragment budget and retention pool every stream shares.
+#[derive(Clone)]
+struct Budget {
+    fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    retained: Arc<sapflow_core::fragment::FragmentQuota>,
 }
 
 impl Default for Registry {
@@ -618,11 +622,34 @@ impl Registry {
     }
 
     pub fn with_limits(maximum_presentations: usize, fragment_bytes: usize) -> Self {
+        Self::with_budgets(
+            maximum_presentations,
+            fragment_bytes,
+            sapflow_hls::muxer::RETENTION_POOL_BYTES,
+        )
+    }
+
+    /// With a fragment budget and, beside it, the retention pool every
+    /// stream's muxer charges kept media to: fragment memory is the two
+    /// together.
+    pub fn with_budgets(
+        maximum_presentations: usize,
+        fragment_bytes: usize,
+        retained_bytes: usize,
+    ) -> Self {
         Self {
             streams: Mutex::new(HashMap::new()),
             rtmp_publications: Arc::new(PublicationQuota::new()),
             presentations: Arc::new(PresentationQuota::new(maximum_presentations)),
             fragments: Arc::new(sapflow_core::fragment::FragmentQuota::new(fragment_bytes)),
+            retained: Arc::new(sapflow_core::fragment::FragmentQuota::new(retained_bytes)),
+        }
+    }
+
+    fn budget(&self) -> Budget {
+        Budget {
+            fragments: self.fragments.clone(),
+            retained: self.retained.clone(),
         }
     }
     #[cfg(test)]
@@ -728,7 +755,7 @@ impl Registry {
                 // the old run. Its final pending part is already below this
                 // floor, and cannot be completed by this connection's first IDR.
                 session.fresh_part_floor = muxer.as_ref().map_or(0, Muxer::next_part_id);
-                st.ingest = Source::resume(kind, stream.cfg, muxer, self.fragments.clone());
+                st.ingest = Source::resume(kind, stream.cfg, muxer, &self.budget());
                 drop(st);
                 configure(&mut session, Claim::Resumed);
                 return Ok((stream.clone(), session.generation, Claim::Resumed));
@@ -751,7 +778,7 @@ impl Registry {
             kind,
             publication_permit,
             presentation_permit,
-            self.fragments.clone(),
+            self.budget(),
         ));
         configure(&mut stream.session(), Claim::Fresh);
         map.insert(path.event_id().to_owned(), stream.clone());

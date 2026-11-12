@@ -163,23 +163,10 @@ pub fn media_with_mode(m: &Muxer, prefix: &str, low_latency: bool) -> String {
         .unwrap_or(m.current_initialization_id());
 
     let n = m.entries().len();
-    // RFC 8216bis 6.2.2 uses media duration, not a count of parents, for
-    // recent part tags. Keep whole parent part sets while their end lies
-    // within three target durations of the published edge (inclusive).
-    // Count published open-part spans too, including any decode-time gaps.
-    let part_window = Duration::from_secs(m.target_duration().saturating_mul(3));
-    let mut age = m
-        .open_parts()
-        .iter()
-        .fold(Duration::ZERO, |sum, part| sum.saturating_add(part.span));
-    let mut parts_from = n;
-    for (i, entry) in m.entries().iter().enumerate().rev() {
-        if age > part_window {
-            break;
-        }
-        parts_from = i;
-        age = age.saturating_add(entry.duration());
-    }
+    // Part tags for the segments whose end lies within three target
+    // durations of the published edge (RFC 8216bis 6.2.2), decided in one
+    // place with the muxer's part retention.
+    let parts_from = m.part_tags_from();
     for (i, entry) in m.entries().iter().enumerate() {
         match entry {
             Entry::Gap { duration } => {
@@ -472,6 +459,161 @@ pub fn multivariant(m: &Muxer) -> String {
     }
     let _ = write!(s, "\n{MEDIA_PLAYLIST}\n");
     s
+}
+
+/// RFC 8216bis 6.2.2's retention rules, as a client sees them. For parts:
+/// "Clients MUST be able to download the Partial Segment for at least three
+/// Target Durations after the EXT-X-PART tag is removed from the Playlist."
+/// For segments, in a playlist without `EXT-X-ENDLIST`: "clients MUST be
+/// able to download the segment until the time at which it first appeared
+/// in the Playlist plus the segment's Availability Duration", which is "the
+/// duration of the segment plus the duration of the longest-duration
+/// Playlist distributed by the server containing that segment".
+///
+/// Time is the published media: every `EXTINF` the window has listed, once
+/// each, plus the open parts' spans. That is the muxer's own clock, read
+/// from what it lists, so this check is not independent of how the muxer
+/// measures time; a test should also measure on its input timestamps, as
+/// `part_retention_tests` does. A segment first appears at the end of its
+/// own `EXTINF`; a playlist's duration is its `EXTINF` total. Call
+/// [`RetentionCheck::check`] after every push, so that no entry joins and
+/// leaves the window between calls.
+///
+/// Retention is on only for a muxer given a pool
+/// ([`Muxer::with_retention_pool`]); without one, media leaves with the
+/// window and this check fails wherever the window is short.
+///
+/// A part whose tag a render stops listing must be served by
+/// [`Muxer::part`] until the published media is three target durations
+/// further on, and a segment that has left the window must be served by
+/// [`Muxer::segment`] until its Availability Duration has passed, unless
+/// the muxer counted it in [`Muxer::parts_released_early`] or
+/// [`Muxer::segments_released_early`] by then. For tests and fuzzing.
+#[derive(Debug, Default)]
+pub struct RetentionCheck {
+    listed: std::collections::BTreeSet<u64>,
+    /// Part id, and the published media when its tag left.
+    removed: std::collections::BTreeMap<u64, Duration>,
+    /// Segment id: when it first appeared, its duration, and the longest
+    /// playlist that listed it.
+    segments: std::collections::BTreeMap<u64, (Duration, Duration, Duration)>,
+    counted: u64,
+    closed: Duration,
+    published: Duration,
+    released_early: (u64, u64),
+    shortest: Option<Duration>,
+    least_margin: Option<Duration>,
+}
+
+impl RetentionCheck {
+    /// Checks the muxer after one more push, returning a description of the
+    /// first part listed but not served, or part or segment served too
+    /// briefly.
+    pub fn check(&mut self, m: &Muxer) -> Result<(), String> {
+        let total = m
+            .entries()
+            .iter()
+            .fold(Duration::ZERO, |sum, e| sum.saturating_add(e.duration()));
+        for (i, entry) in m.entries().iter().enumerate() {
+            let msn = m.media_sequence() + i as u64;
+            if msn >= self.counted {
+                self.closed = self.closed.saturating_add(entry.duration());
+                self.counted = msn + 1;
+                if let Entry::Segment(s) = entry {
+                    self.segments
+                        .insert(msn, (self.closed, s.duration, Duration::ZERO));
+                }
+            }
+            if let Some(seen) = self.segments.get_mut(&msn) {
+                seen.2 = seen.2.max(total);
+            }
+        }
+        let open = m
+            .open_parts()
+            .iter()
+            .fold(Duration::ZERO, |sum, part| sum.saturating_add(part.span));
+        self.published = self.published.max(self.closed.saturating_add(open));
+        let early = (m.parts_released_early(), m.segments_released_early());
+        let (parts_excused, segments_excused) = (
+            early.0 != self.released_early.0,
+            early.1 != self.released_early.1,
+        );
+        self.released_early = early;
+        let listed: std::collections::BTreeSet<u64> = if m.has_content() {
+            media(m, "r")
+                .lines()
+                .filter_map(|l| l.strip_prefix("#EXT-X-PART:"))
+                .filter_map(|l| l.split("URI=\"r_part").nth(1))
+                .filter_map(|r| r.split('.').next()?.parse().ok())
+                .collect()
+        } else {
+            self.listed.clone()
+        };
+        for &id in &listed {
+            if !matches!(m.part(id), crate::PartLookup::Found(_)) {
+                return Err(format!("part {id} listed but not served"));
+            }
+        }
+        for &id in self.listed.difference(&listed) {
+            self.removed.entry(id).or_insert(self.published);
+        }
+        self.listed = listed;
+        let window = Duration::from_secs(m.target_duration().saturating_mul(3));
+        let mut gone = Vec::new();
+        for (&id, &left) in &self.removed {
+            if matches!(m.part(id), crate::PartLookup::Found(_)) {
+                continue;
+            }
+            let held = self.published.saturating_sub(left);
+            if held < window && !parts_excused {
+                return Err(format!(
+                    "part {id} gone {held:?} after its tag left, under {window:?}"
+                ));
+            }
+            if !parts_excused {
+                self.shortest = Some(self.shortest.map_or(held, |s| s.min(held)));
+            }
+            gone.push(id);
+        }
+        for id in gone {
+            self.removed.remove(&id);
+        }
+        let mut gone = Vec::new();
+        for (&id, &(appeared, duration, longest)) in &self.segments {
+            if id >= m.media_sequence() || m.segment(id).is_some() {
+                continue;
+            }
+            let until = appeared.saturating_add(duration).saturating_add(longest);
+            if self.published < until && !segments_excused {
+                return Err(format!(
+                    "segment {id} gone at {:?}, before {until:?}",
+                    self.published
+                ));
+            }
+            if !segments_excused {
+                let margin = self.published.saturating_sub(until);
+                self.least_margin = Some(self.least_margin.map_or(margin, |s| s.min(margin)));
+            }
+            gone.push(id);
+        }
+        for id in gone {
+            self.segments.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// The shortest time, in published media, a part was still served
+    /// after its tag left, over the parts that have gone in their time.
+    pub fn shortest_held(&self) -> Option<Duration> {
+        self.shortest
+    }
+
+    /// The least time, in published media, a segment was still served past
+    /// the end of its Availability Duration, over the segments that have
+    /// gone in their time.
+    pub fn least_segment_margin(&self) -> Option<Duration> {
+        self.least_margin
+    }
 }
 
 #[cfg(test)]

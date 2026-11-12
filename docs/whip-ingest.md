@@ -805,22 +805,136 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   `--byte-capped`. The `epochs` golden digest changed with it: that
   scenario now keeps one more 1 s segment. Opus output is pinned at 4ab0c12
   by `real_opus_output_is_byte_identical_to_4ab0c12`, which still matches.
-- Open, and older than W3b: RFC 8216bis 6.2.2's part rule. A part must stay
-  downloadable for three target durations after its `EXT-X-PART` tag leaves
-  the playlist. Tags are listed while their segment ends within three
-  target durations of the live edge (`playlist.rs`), but a part's data is
-  freed with its segment (`Muxer::rotate_segment`), so a window shorter than
-  about six target durations falls short. The live-window review measured
-  how long a part stays downloadable after its tag leaves, the same at
-  4ab0c12 and after the segment rule:
+- Settled after W3b, with the user's agreement: RFC 8216bis 6.2.2's
+  retention rules, which drafts 19 and 22 word the same. For parts:
+  "Clients MUST be able to download the Partial Segment for at least three
+  Target Durations after the EXT-X-PART tag is removed from the Playlist."
+  For segments: "The Availability Duration of a Media Segment is the
+  duration of the segment plus the duration of the longest-duration
+  Playlist distributed by the server containing that segment. [...] If the
+  server removes a Media Segment URI from a Playlist that does not contain
+  an EXT-X-ENDLIST tag, clients MUST be able to download the segment until
+  the time at which it first appeared in the Playlist plus the segment's
+  Availability Duration." sapflow never writes `EXT-X-ENDLIST`.
 
-  | Case | Part held after its tag leaves |
-  |---|---|
-  | Steady stream, `segment_count` 7 | 1.0 s |
-  | Default 24, reconnect every 10 frames | 0.000 s |
-  | Default 24, reconnect every 20 frames | 4.05 s |
-  | Steady stream, `segment_count` 12 | 6.02 s |
-  | Steady stream, `segment_count` 24 | 18.05 s |
+  Parts and segments used to be freed when the segment left the window,
+  so a window shorter than about six target durations broke the part rule
+  and every removed segment went one segment duration early. Now, given a
+  retention pool (below), `Muxer::part` and `Muxer::segment`, which the
+  server answers chunk requests from, keep serving them: a part until three target durations
+  past the render that dropped its tag, a segment until its Availability
+  Duration has passed since it first appeared, with its codec epoch's init
+  while either is served. Time is the published media, every `EXTINF` the
+  window has listed plus the open parts' spans; a segment first appears at
+  the end of its own `EXTINF`, and a playlist's duration is its `EXTINF`
+  total. One function, `Muxer::part_tags_from`, decides both which part
+  tags the playlist lists and when they left. A publisher sending faster
+  than real time gets less wall-clock time, and a stall gets more.
+  Playlists are unchanged.
+
+  What is kept past the window is bounded at 64 MiB, counted once for a
+  segment and its parts since they share their bytes, 4,096 parts
+  (`muxer::MAX_RETAINED_PARTS`) and 1,024 segments
+  (`muxer::MAX_RETAINED_SEGMENTS`). Over a count cap the oldest of that
+  kind go early, parts leaving their segment and segments leaving later
+  parts; over the byte cap the oldest segment and its parts go together,
+  since freeing either alone frees no bytes. One byte cap rather than two:
+  a second would count the same bytes twice or allow 128 MiB.
+
+  Kept media never takes room from live media, this stream's or another's
+  on the same fragment budget. When a segment leaves the window, the
+  charges of its parts' allocations, and of an old epoch's init once only
+  kept media uses it, move from the live budget to a retention pool: the
+  pool's permit is taken first, then the live one returned, so nothing is
+  ever uncharged. The live budget then holds exactly what it held before
+  retention, the window and the open segment (`the_live_budget_holds_what_main_held`
+  pins its use after every push against main in three scenarios), so no
+  live allocation can be refused because of retention, and there is no
+  release-and-retry to do on any allocation path, the epoch init
+  included. If the pool is full, the stream's own oldest kept media goes
+  first to make room, and whatever still does not fit goes too, counted,
+  never back onto the live budget. The pool is explicit: the server
+  creates one beside its fragment budget, `SAPFLOW_MAX_RETAINED_BYTES`
+  (default 128 MiB, `muxer::RETENTION_POOL_BYTES`), and gives it to every
+  muxer that shares the budget, through the ingests'
+  `with_fragment_budget` constructors; fragment memory is then
+  `SAPFLOW_MAX_FRAGMENT_BYTES` plus that pool, and each stream is held to
+  its 64 MiB cap within it. 128 MiB fits the server's defaults: 16
+  publishers on a 512 MiB budget, each keeping about 8 MiB (three target
+  durations of parts past the window plus a segment, at 9 Mbit/s with a
+  2 s target). Retention needs a pool and is otherwise off: a library user
+  turns it on with `Muxer::with_retention_pool`, the ingests'
+  `with_retention_pool`, or `with_fragment_budget`. Without one, media
+  leaves with the window as in 0.2.0-rc.1, and the budget holds what rc.1
+  held. With a pool and no budget there is nothing to charge, so only the
+  per-stream caps bound what is kept. The server always gives its pool,
+  so it always retains.
+
+  A segment's charges move to the pool as it leaves the window, in the
+  same step, so the live budget never holds more than main's even within
+  a push. No test shows that step directly: the moment is inside one
+  call on one thread, and only another thread allocating at that instant
+  could observe it, which a test cannot schedule; the live budget's use
+  is pinned to main's after every push instead.
+
+  `Muxer::parts_released_early()` and `Muxer::segments_released_early()`
+  count what went early, and `playlist::RetentionCheck` holds a muxer to
+  both rules given those counts; the `muxer_timing` and `opus_packaging`
+  fuzz targets run it after every push, and `muxer_timing` drives two
+  muxers on one budget and checks that the budget and the pool both empty
+  once they and every alias have gone. `RetentionCheck` measures time with
+  the muxer's own published-media clock, so it is not independent of the
+  muxer; `part_retention_tests` also measures on the input timestamps.
+
+  The review's case (`kept_media_never_fences_another_stream_on_the_same_budget`):
+  two 600 kB/s streams at `segment_count` 7 on one 10 MB budget, A
+  starting 30 s after B. Before, retention held up to 7.83 MB of one
+  stream's budget against main's 4.70 MB (15.54 MB against 14.94 MB at
+  24), and A was refused at its frame 114 (the review saw frame 192 with
+  its own feed). Now both run, the budget peaks at 9.40 MB as on main, and
+  nothing goes early. A new epoch beside another stream's kept media
+  (`a_new_epoch_is_admitted_beside_another_stream_s_kept_media`, 9.5 MB)
+  was refused before and is admitted now.
+
+  After a stream ends, kept parts and segments stay fetchable only while
+  the server keeps the presentation: it answers 404 for everything once a
+  presentation closes, so the rules hold past the end only if
+  `SAPFLOW_RECONNECT_GRACE` (default 90 s) is at least the longest
+  Availability Duration, a segment's duration plus the longest playlist.
+
+  Measured by `part_retention_tests` (target 2 s, so the part rule asks
+  for 6 s): the shortest time a part was still served after its tag left,
+  and the least time a segment was still served past its Availability
+  Duration (negative: gone early), at 9e684b7 and now:
+
+  | Case | Part, before | Part, now | Segment, before | Segment, now |
+  |---|---|---|---|---|
+  | Steady A/V, 1.000 s segments, `segment_count` 7 | 0.8 s | 6.0 s | -1.0 s | 0 |
+  | Steady A/V, 1.000 s segments, `segment_count` 12 | 5.8 s | 6.0 s | -1.0 s | 0 |
+  | Steady A/V, 1.000 s segments, `segment_count` 24 | 17.8 s | 17.8 s | -1.0 s | 0 |
+  | Steady AAC, 1.0027 s segments, `segment_count` 7 | 1.0027 s | 6.016 s | -1.0027 s | 0 |
+  | Steady AAC, 1.0027 s segments, `segment_count` 12 | 6.016 s | 6.016 s | -1.0027 s | 0 |
+  | Steady AAC, 1.0027 s segments, `segment_count` 24 | 18.048 s | 18.048 s | -1.0027 s | 0 |
+  | AAC, default 24, reconnect every 10 frames | 0.0 s | 6.19 s | -0.21 s | 0 |
+  | AAC, default 24, reconnect every 20 frames | 4.05 s | 6.19 s | -0.43 s | 0 |
+  | TS epochs, `segment_count` 8 | 0.2 s | 6.2 s | -2.6 s | 0 |
+  | Opus audio-only, 20 ms, `segment_count` 7 | 0.8 s | 6.0 s | -1.0 s | 0 |
+  | Opus audio-only, 60 ms, `segment_count` 7 | 1.02 s | 6.0 s | -1.02 s | 0 |
+  | Opus video-led, 20 ms, `segment_count` 7 | 0.8 s | 6.0 s | -1.0 s | 0 |
+
+  The live-window review's probe measured 1.0, 6.02 and 18.05 s on steady
+  AAC-only streams, whose 47-frame segments last 1.0027 s: the AAC rows.
+  The A/V rows use exact 1.000 s segments, and at `segment_count` 12 they
+  fell 0.2 s short where AAC did not. Its 0.000 and 4.05 s are the
+  reconnect rows. The golden digests run without a pool, as an rc.1 caller
+  would, so retention leaves them alone: the 13 AAC digests are those of
+  the live-window change and the 6 Opus ones those of 4ab0c12. With a
+  pool, the `epochs` scenario also serves, after the fourth epoch, the
+  first epoch's parts 0 to 10 and its init; every playlist and segment is
+  unchanged. Tested at `Muxer::part` and `Muxer::segment`, not
+  through the server, whose chunk route answers from them
+  (`own_http.rs`) and returns 404 for everything once a presentation
+  closes.
 - The departures from the encapsulation listed above, and the cause of the
   312 click.
 - Safari, iOS and Android with sapflow's packaging, which need the user's

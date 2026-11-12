@@ -344,7 +344,9 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
         // Changed with the RFC 8216bis 6.2.2 live window: at eight entries
         // the old count-only eviction left 5.40 s listed after the third and
         // fourth epochs; one more 1 s segment is now kept (6.40 s). Every
-        // part and segment served before is unchanged.
+        // part and segment served before is unchanged. Retention for 6.2.2's
+        // part and segment rules needs a pool, which this, like an rc.1
+        // caller, does not give.
         (
             "epochs",
             "96bd3461c6d65e769cec2aaa991366e11013497bcccdb1e7fc78dee15a09df75",
