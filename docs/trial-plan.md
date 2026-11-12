@@ -78,6 +78,16 @@ deployment and never committed.
     `rtmps://`, sapflow cannot take it directly: either the trial offers plain
     `rtmp://` to the one performer, or a TLS front (Caddy layer4 or stunnel)
     terminates RTMPS in front of sapflow's RTMP port, and the dry run covers it.
+    A front that sends PROXY protocol v2 should forward to its own listener,
+    `SAPFLOW_RTMP_PROXY_ADDR` with `SAPFLOW_RTMP_TRUSTED_PROXY` set to the
+    front's address as sapflow sees it. Otherwise every RTMPS publisher
+    shares the front's address, under one failed-attempt throttle and one
+    address in the app's publish check. In Caddy layer4 that is
+    `proxy_protocol v2` on the `proxy` handler, with that listener as its
+    upstream. Under Docker the front reaches sapflow through the bridge, so
+    the trusted address is the network's gateway, which every process on
+    the host shares: publish the listener's port on loopback only
+    (`127.0.0.1:<port>:<port>`), so that nothing off the host reaches it.
   - `PULSEWIRE_LIVE_STREAM_ID_TEMPLATE` is `{eventId}` (section 2.5).
   - The publisher password in mediamtx's `authInternalUsers` is letters and
     digits only (section 2.3).

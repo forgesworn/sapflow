@@ -140,6 +140,18 @@ Notes for the release after 0.2.0-rc.1.
   `SAPFLOW_TEST_WHIP_FEEDBACK` make WHIP sessions claim loss in their
   receiver reports or send REMB, for A3.10. Not for production use.
 
+- A second RTMP listener for a TLS front that sends PROXY protocol v2,
+  such as Caddy layer4 or HAProxy terminating RTMPS:
+  `SAPFLOW_RTMP_PROXY_ADDR` (off by default) with
+  `SAPFLOW_RTMP_TRUSTED_PROXY`, the front's address. Each connection on it
+  must come from the front and start with the header, whose source is the
+  publisher's address for the failed-attempt throttle, the app's publish
+  check (`ip`) and logs; anything else is closed unanswered, and LOCAL, the
+  front's own connection, is closed once its header is in. Without it every
+  RTMPS publisher had the front's address, so one encoder retrying a wrong
+  key could throttle them all. The plain listener is unchanged and never
+  reads a header. Both share one cap on open connections.
+
 ## sapflow-dtls
 
 - A connected server now refuses every renegotiation with one warning-level
