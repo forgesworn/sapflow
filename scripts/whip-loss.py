@@ -34,7 +34,12 @@ Decoder error lines and sapflow's own counters are kept beside them.
     scripts/whip-loss.py --bin <sapflow> --proxy <srt-loss-proxy> --out DIR
         [--losses 1,5,10] [--seeds 5] [--clean 3] [--jitter-ms 20]
         [--delay-ms 30] [--protocols srt,whip] [--whip-publisher chrome|ffmpeg]
-        [--base 47300]
+        [--profiles LOSS:JITTER[:keep],...] [--base 47300]
+
+--profiles replaces --losses and --jitter-ms with a list of profiles, each
+a loss percentage and a jitter in ms, and `keep` for jitter that spreads the
+delays without reordering (the proxy's --jitter-order keep): for example
+0:20,5:0,5:20:keep. The clean runs (--clean) are added as before.
 
 Writes DIR/trials.tsv and DIR/summary.tsv. Every child is the driver's own
 and is stopped by its PID.
@@ -209,8 +214,9 @@ def frames_in(files):
     return v, a, errors
 
 
-def trial(args, protocol, loss, seed, out):
-    tag = f"{protocol}-{'clean' if loss == 0 else f'loss{loss}'}-s{seed}"
+def trial(args, protocol, profile, seed, out):
+    loss, jitter, keep = profile
+    tag = f"{protocol}-l{loss}-j{jitter}{'k' if keep else ''}-s{seed}"
     d = out / "trials" / tag
     d.mkdir(parents=True, exist_ok=True)
     base = args.base
@@ -226,7 +232,8 @@ def trial(args, protocol, loss, seed, out):
            "SAPFLOW_WHIP_PUBLIC_URL": f"http://127.0.0.1:{port['whip']}",
            "SAPFLOW_WHIP_ALLOW_ORIGINS": f"http://127.0.0.1:{port['page']}",
            "RUST_LOG": "info,sapflow::whip=debug"}
-    row = {"protocol": protocol, "loss_pct": loss, "seed": seed, "jitter_ms": 0 if loss == 0 else args.jitter_ms,
+    row = {"protocol": protocol, "loss_pct": loss, "seed": seed, "jitter_ms": jitter,
+           "jitter_order": "keep" if keep else "reorder",
            "delay_ms": args.delay_ms, "load": round(os.getloadavg()[0], 2)}
     slog = open(d / "sapflow.log", "w")
     srv = subprocess.Popen([args.bin], env=env, stdout=slog, stderr=slog)
@@ -236,7 +243,8 @@ def trial(args, protocol, loss, seed, out):
         target = port["srt"] if protocol == "srt" else port["media"]
         proxy = subprocess.Popen([args.proxy, "--listen", f"127.0.0.1:{port['proxy']}", "--target", f"127.0.0.1:{target}",
                                   "--loss", "none" if loss == 0 else f"random:{loss}", "--delay-ms", str(args.delay_ms),
-                                  "--jitter-ms", str(0 if loss == 0 else args.jitter_ms), "--protocol", protocol,
+                                  "--jitter-ms", str(jitter), "--jitter-order", "keep" if keep else "reorder",
+                                  "--protocol", protocol,
                                   "--latency-ms", str(LATENCY_MS), "--seed", str(seed), "--stats", str(d / "proxy.txt")],
                                  stdout=subprocess.DEVNULL, stderr=open(d / "proxy.log", "w"))
         procs.append(proxy)
@@ -297,6 +305,7 @@ def trial(args, protocol, loss, seed, out):
     row["proxy_dropped_c2s"] = stats.get("dropped_c2s", "")
     row["proxy_dropped_s2c"] = stats.get("dropped_s2c", "")
     row["proxy_retransmits"] = stats.get("rtp_repeats" if protocol == "whip" else "data_retx", "")
+    row["proxy_reordered"] = stats.get("reordered_orig", "")
     text = (d / "sapflow.log").read_text(errors="replace")
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     if protocol == "whip":
@@ -335,48 +344,59 @@ def main():
     ap.add_argument("--delay-ms", type=int, default=30)
     ap.add_argument("--protocols", default="srt,whip")
     ap.add_argument("--whip-publisher", default="chrome", choices=["chrome", "ffmpeg"])
+    ap.add_argument("--profiles", default=None, help="LOSS:JITTER[:keep],... in place of --losses and --jitter-ms")
     ap.add_argument("--base", type=int, default=47300)
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     clips(args.out)
     protocols = args.protocols.split(",")
-    losses = [int(x) for x in args.losses.split(",")]
+    clean = (0, 0, False)
+    if args.profiles:
+        profiles = []
+        for item in args.profiles.split(","):
+            parts = item.split(":")
+            profiles.append((int(parts[0]), int(parts[1]), len(parts) > 2 and parts[2] == "keep"))
+    else:
+        profiles = [(int(x), args.jitter_ms, False) for x in args.losses.split(",")]
     plan = []
     for s in range(1, args.clean + 1):
         for p in protocols:
-            plan.append((p, 0, s))
-    for loss in losses:
+            plan.append((p, clean, s))
+    for prof in profiles:
         for s in range(1, args.seeds + 1):
             # Back to back per seed, the order flipping each seed.
             for p in (protocols if s % 2 else list(reversed(protocols))):
-                plan.append((p, loss, s))
-    rows = [trial(args, p, loss, s, args.out) for p, loss, s in plan]
-    keys = sorted({k for r in rows for k in r}, key=lambda k: (k not in ("protocol", "loss_pct", "seed"), k))
+                plan.append((p, prof, s))
+    rows = [trial(args, p, prof, s, args.out) for p, prof, s in plan]
+    keys = sorted({k for r in rows for k in r}, key=lambda k: (k not in ("protocol", "loss_pct", "jitter_ms", "seed"), k))
     with open(args.out / "trials.tsv", "w") as f:
         f.write("\t".join(keys) + "\n")
         for r in rows:
             f.write("\t".join(str(r.get(k, "")) for k in keys) + "\n")
+    key = lambda r: (r["loss_pct"], r["jitter_ms"], r["jitter_order"] == "keep")
     with open(args.out / "summary.tsv", "w") as f:
-        f.write("loss_pct\tprotocol\truns\tunrecovered_mean\tunrecovered_sd\tunrecovered\tvs_clean_mean\t"
-                "whip_minus_srt\twelch_t\tnever_ready\n")
-        groups = {}
-        for loss in [0] + losses:
-            for p in protocols:
-                groups[(loss, p)] = [r for r in rows if r["protocol"] == p and r["loss_pct"] == loss]
-        clean = {p: statistics.mean([r.get("unrecovered", 0) for r in groups[(0, p)]]) if groups[(0, p)] else 0.0
-                 for p in protocols}
-        for loss in [0] + losses:
-            un = {p: [r.get("unrecovered") for r in groups[(loss, p)] if r.get("unrecovered") is not None] for p in protocols}
+        f.write("loss_pct\tjitter_ms\tjitter_order\tprotocol\truns\tunrecovered_mean\tunrecovered_sd\tunrecovered\t"
+                "vs_clean_mean\twhip_minus_srt\twelch_t\tnever_ready\tretransmits\treordered\n")
+        order = ([clean] if args.clean else []) + [p for p in profiles if p != clean]
+        groups = {(prof, p): [r for r in rows if r["protocol"] == p and key(r) == prof] for prof in order for p in protocols}
+        base = {p: statistics.mean([r.get("unrecovered", 0) for r in groups[(clean, p)]]) if groups.get((clean, p)) else 0.0
+                for p in protocols}
+        for prof in order:
+            un = {p: [r.get("unrecovered") for r in groups[(prof, p)] if r.get("unrecovered") is not None] for p in protocols}
             both = len(protocols) == 2 and un.get("whip") and un.get("srt")
             t = welch(un["whip"], un["srt"]) if both else None
             diff = statistics.mean(un["whip"]) - statistics.mean(un["srt"]) if both else None
             for p in protocols:
                 xs = un[p]
-                f.write(f"{loss}\t{p}\t{len(groups[(loss, p)])}\t{round(statistics.mean(xs), 1) if xs else ''}\t"
+                g = groups[(prof, p)]
+                f.write(f"{prof[0]}\t{prof[1]}\t{'keep' if prof[2] else 'reorder'}\t{p}\t{len(g)}\t"
+                        f"{round(statistics.mean(xs), 1) if xs else ''}\t"
                         f"{round(statistics.stdev(xs), 1) if len(xs) > 1 else ''}\t{' '.join(str(x) for x in xs)}\t"
-                        f"{round(statistics.mean(xs) - clean[p], 1) if xs else ''}\t"
+                        f"{round(statistics.mean(xs) - base[p], 1) if xs else ''}\t"
                         f"{round(diff, 1) if diff is not None else ''}\t{round(t, 2) if t is not None else ''}\t"
-                        f"{sum(1 for r in groups[(loss, p)] if not r.get('ready'))}\n")
+                        f"{sum(1 for r in g if not r.get('ready'))}\t"
+                        f"{' '.join(str(r.get('proxy_retransmits', '')) for r in g)}\t"
+                        f"{' '.join(str(r.get('proxy_reordered', '')) for r in g)}\n")
     print((args.out / "summary.tsv").read_text())
     return 0
 
