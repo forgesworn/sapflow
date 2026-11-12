@@ -972,7 +972,9 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   and 3 were outside the sync range. The owner raised it to about 4 s
   (12 November 2026), after which all 20 were aligned by the reports and
   within range. A publisher whose reports come with its first packets, as
-  FFmpeg's do, is aligned at once
+  FFmpeg's do, is aligned at once. One above about 8 Mbit/s whose reports
+  come late fills the 4 MiB bound before 4 s, and is aligned by arrival
+  time
   ([status](#qualification-status-12-november-2026)).
 - After start, timestamps advance by RTP deltas, strictly increasing, and
   stay within 500 ms (`max_lead`) of arrival time either way, plus 0.1% of

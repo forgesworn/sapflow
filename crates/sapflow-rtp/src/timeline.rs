@@ -75,7 +75,9 @@ pub struct TimelineConfig {
     /// do, is aligned as soon as they have.
     pub start_hold: Duration,
     /// Most media payload bytes held during the start hold; reaching it
-    /// ends the hold early. Default 4 MiB (4 s at about 8 Mbit/s).
+    /// ends the hold early. Default 4 MiB (4 s at about 8 Mbit/s), so a
+    /// publisher above that whose sender reports come late ends the hold
+    /// before 4 s and is aligned by arrival time.
     pub max_hold_bytes: usize,
     /// How far a stream's timestamps may run ahead of or behind arrival
     /// time, for network jitter, and the largest sender report error that

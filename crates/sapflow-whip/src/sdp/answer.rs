@@ -329,6 +329,9 @@ pub fn answer(
 }
 
 /// Test-only changes to the answer (A3.10). The production answer has none.
+/// The struct is compiled in every build, since the answer is built through
+/// it with its default (no change), but only [`answer_with`], under the
+/// `testing` feature, takes one from outside, and it is exported only there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AnswerHooks {
     /// Answer `goog-remb` for video where the offer lists it.
