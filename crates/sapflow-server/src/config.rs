@@ -67,6 +67,12 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
                            64 at default, explicit values 1..4096)
   SAPFLOW_MAX_FRAGMENT_BYTES shared encoded init/fragment backing capacity
                            (default 536870912, 512 MiB; positive byte count)
+  SAPFLOW_MAX_RETAINED_BYTES media kept past the live window so parts and
+                           segments stay fetchable (RFC 8216bis 6.2.2),
+                           charged apart from the fragment bytes and never
+                           refusing live media (default 134217728, 128 MiB;
+                           positive byte count); fragment memory is
+                           SAPFLOW_MAX_FRAGMENT_BYTES plus this
   SAPFLOW_MAX_PUBLISH_MBPS drop a publisher above this bitrate, averaged over
                            5 s (default 40)
   RUST_LOG                 log filter (default info)
@@ -130,6 +136,7 @@ const KEYS: &[&str] = &[
     "SAPFLOW_MAX_PUBLISHERS",
     "SAPFLOW_MAX_PRESENTATIONS",
     "SAPFLOW_MAX_FRAGMENT_BYTES",
+    "SAPFLOW_MAX_RETAINED_BYTES",
     "SAPFLOW_MAX_PUBLISH_MBPS",
     "SAPFLOW_RECORD_MIN_FREE_GB",
     "SAPFLOW_SRT_IMPL",
@@ -380,6 +387,9 @@ pub struct Config {
     pub max_publishers: usize,
     pub max_presentations: usize,
     pub max_fragment_bytes: usize,
+    /// Bytes of media kept past the live window for RFC 8216bis 6.2.2, in a
+    /// pool beside the fragment bytes.
+    pub max_retained_bytes: usize,
     pub max_publish_bps: u64,
     /// Bytes of free disk below which recording does not start or stops.
     pub record_min_free: u64,
@@ -587,6 +597,15 @@ impl Config {
             })?,
         };
 
+        let max_retained_bytes = match vals.get("SAPFLOW_MAX_RETAINED_BYTES") {
+            None => 128 * 1024 * 1024,
+            Some(v) => v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                ConfigError::Invalid(
+                    "SAPFLOW_MAX_RETAINED_BYTES: positive representable byte count".into(),
+                )
+            })?,
+        };
+
         let max_publish_bps = match vals.get("SAPFLOW_MAX_PUBLISH_MBPS") {
             None => 40_000_000,
             Some(v) => v
@@ -761,6 +780,7 @@ impl Config {
             max_publishers,
             max_presentations,
             max_fragment_bytes,
+            max_retained_bytes,
             srt_addr: addr("SAPFLOW_SRT_ADDR", "0.0.0.0:8890")?,
             http_addr: addr("SAPFLOW_HTTP_ADDR", "0.0.0.0:8888")?,
             publisher,
@@ -1175,6 +1195,36 @@ mod tests {
         .expect("flag override");
         assert_eq!(config.max_fragment_bytes, 64);
         assert_eq!(config.max_presentations, 4);
+    }
+
+    #[test]
+    fn retained_byte_pool_is_explicit_and_checked() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        assert_eq!(
+            load(&[open], &[]).expect("defaults").max_retained_bytes,
+            128 * 1024 * 1024
+        );
+        for limit in ["1".to_string(), usize::MAX.to_string()] {
+            assert_eq!(
+                load(&[open, ("SAPFLOW_MAX_RETAINED_BYTES", &limit)], &[])
+                    .expect("explicit pool")
+                    .max_retained_bytes
+                    .to_string(),
+                limit
+            );
+        }
+        for limit in ["0", "-1", "invalid", "18446744073709551616"] {
+            assert!(matches!(
+                load(&[open, ("SAPFLOW_MAX_RETAINED_BYTES", limit)], &[]),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
+        let config = load(
+            &[open, ("SAPFLOW_MAX_RETAINED_BYTES", "1000")],
+            &["--max-retained-bytes", "64"],
+        )
+        .expect("flag override");
+        assert_eq!(config.max_retained_bytes, 64);
     }
 
     #[test]

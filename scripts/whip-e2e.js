@@ -4,7 +4,7 @@
 //
 //   cargo build -p sapflow [--target <triple>]
 //   node scripts/whip-e2e.js --bin <sapflow> --vendor <dir with hls.min.js> --out <scratch dir> \
-//     [--base 47300] [--seconds 10] [--transport udp|tcp|proxy]
+//     [--base 47300] [--seconds 10] [--transport udp|tcp|proxy] [--resize]
 //
 // Ports: base+1 HLS, base+2 SRT, base+3 WHIP signalling, base+4 WHIP media,
 // base+5 this script's page server, base+6 the ICE-TCP listener, base+7 the
@@ -30,8 +30,14 @@
 //    start, binding nothing.
 // 2. A3.1: headless Chrome with fake media, on a page from another origin
 //    (so CORS is exercised), POSTs to sapflow, plays the stream in hls.js
-//    and draws a decoded frame; then DELETEs the session. ffprobe and ffmpeg
-//    then decode the recording: frame count, dimensions, a frame as PNG.
+//    and draws a decoded frame; then DELETEs the session. ffmpeg then decodes
+//    every recording whole, which must give no error, and a frame as PNG.
+//    --resize halves the sender's resolution (scaleResolutionDownBy) once
+//    100 frames have played, as a browser under load does: playback must
+//    carry on at the new size. Every codec epoch the server logs must have
+//    its own recording, with or without --resize, since a browser may
+//    ramp its resolution up by itself; the longest stall of the playhead
+//    is reported.
 // 3. A3.6 privacy: sapflow ran with RUST_LOG=trace; its log must not hold
 //    the token, any address, port or mDNS name from the offer, or the
 //    publisher's address or port. The check is first shown to catch a
@@ -53,6 +59,7 @@ const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? args[i + 1] : d; };
 const bin = opt('bin'), vendor = opt('vendor'), out = opt('out');
 const base = +opt('base', 47300), seconds = +opt('seconds', 10);
+const resize = args.includes('--resize');
 const transport = opt('transport', 'udp');
 if (!['udp', 'tcp', 'proxy'].includes(transport)) { console.error('--transport udp|tcp|proxy'); process.exit(2); }
 const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -118,7 +125,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   try {
     const media = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: 640, height: 360 } });
     const pc = new RTCPeerConnection();
-    media.getTracks().forEach((t) => pc.addTransceiver(t, { direction: 'sendonly', streams: [media] }));
+    let sender = null;
+    media.getTracks().forEach((t) => { const tr = pc.addTransceiver(t, { direction: 'sendonly', streams: [media] }); if (t.kind === 'video') sender = tr.sender; });
     await pc.setLocalDescription(await pc.createOffer());
     await Promise.race([new Promise((r) => { pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && r(); }), sleep(1500)]);
     out.offer = pc.localDescription.sdp;
@@ -144,11 +152,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     hls.loadSource(playlist);
     hls.attachMedia(v);
     v.play().catch((e) => out.errors.push('play ' + e.message));
-    // Playing: the playhead advances by ${seconds} s from where it started.
-    let start = null;
+    // Playing: the playhead advances by ${seconds} s from where it started
+    // (and, with --resize, past the change). The longest wait with the
+    // playhead still is the stall.
+    let start = null, still = null, last = -1;
+    out.widths = []; out.stall = 0;
     for (let i = 0; i < ${seconds * 10 + 150}; i++) {
       if (start === null && v.videoWidth > 0 && v.currentTime > 0) start = v.currentTime;
-      if (start !== null && v.currentTime - start >= ${seconds}) break;
+      if (start !== null) {
+        if (v.currentTime !== last) { last = v.currentTime; still = performance.now(); }
+        else out.stall = Math.max(out.stall, performance.now() - still);
+      }
+      if (v.videoWidth && out.widths[out.widths.length - 1] !== v.videoWidth) out.widths.push(v.videoWidth);
+      // Forced only from the full 640 wide, so Chrome's own ramp up cannot
+      // pass for it: the playhead must then reach 320 and play on.
+      if (${resize} && out.resizedAt === undefined && v.videoWidth === 640 && v.getVideoPlaybackQuality().totalVideoFrames > 100) {
+        const p = sender.getParameters(); p.encodings[0].scaleResolutionDownBy = 2;
+        await sender.setParameters(p).catch((e) => out.errors.push('setParameters ' + e.message));
+        out.resizedAt = v.currentTime; out.resizeFrom = v.videoWidth;
+      }
+      if (out.resizeFrom && out.halfAt === undefined && v.videoWidth === out.resizeFrom / 2) out.halfAt = v.currentTime;
+      if (out.halfAt !== undefined) out.afterHalf = v.currentTime - out.halfAt;
+      if (start !== null && v.currentTime - start >= ${seconds} && (!${resize} || out.afterHalf >= 3)) break;
       await sleep(100);
     }
     out.played = start === null ? 0 : v.currentTime - start; out.width = v.videoWidth; out.height = v.videoHeight;
@@ -183,7 +208,10 @@ function launchChrome(url) {
   const flags = ['--headless=new', `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check',
     '--autoplay-policy=no-user-gesture-required', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
     '--allow-loopback-in-peer-connection', '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
-    '--disable-backgrounding-occluded-windows'];
+    '--disable-backgrounding-occluded-windows',
+    // The only --disable-features flag (Chrome honours one): without it each
+    // launch on macOS leaves a 1.4 GB code-sign clone of the app behind.
+    '--disable-features=MacAppCodeSignClone'];
   const child = spawn(CHROME, [...flags, url], { stdio: 'ignore', detached: true });
   return { child, profile };
 }
@@ -319,11 +347,21 @@ function hits(text, s) {
   const watch = transport === 'tcp' ? setInterval(() => {
     for (const p of tcpPeers(s.child.pid, port.tcp)) if (!peers.some((q) => q.port === p.port)) peers.push(p);
   }, 250) : null;
+  // Every init the media playlist served while the browser played: one
+  // recording per served codec epoch is the rule.
+  const maps = new Set();
+  const served = setInterval(() => {
+    http.get(`http://127.0.0.1:${port.hls}/live/${EVENT}/stream.m3u8`, (res) => {
+      let body = ''; res.on('data', (d) => { body += d; });
+      res.on('end', () => { for (const m of body.matchAll(/#EXT-X-MAP:URI="([^"]+)"/g)) maps.add(m[1]); });
+    }).on('error', () => {});
+  }, 250);
   let report;
   const done = new Promise((r) => { report = r; });
   const page = await pageServer(report);
   const browser = launchChrome(`http://127.0.0.1:${port.page}/`);
   const r = await Promise.race([done, sleep((seconds + 60) * 1000).then(() => null)]);
+  clearInterval(served);
   if (watch) clearInterval(watch);
   await stopGroup(browser.child.pid);
   page.close();
@@ -339,7 +377,11 @@ function hits(text, s) {
     const pair = r.pair || {};
     check(`the nominated pair is ${want.toUpperCase()}`, pair.local && pair.local.protocol === want && pair.remote && pair.remote.protocol === want
       && (want === 'udp' || pair.remote.tcpType === 'passive'), JSON.stringify(pair));
-    check('hls.js played the stream', r.played >= seconds && r.width > 0 && r.decoded >= seconds * 10, `${(r.played || 0).toFixed(1)} s at ${r.width}x${r.height}, ${r.decoded} frames decoded, ${r.dropped} dropped`);
+    check('hls.js played the stream', r.played >= seconds && r.width > 0 && r.decoded >= seconds * 10, `${(r.played || 0).toFixed(1)} s at ${r.width}x${r.height}, ${r.decoded} frames decoded, ${r.dropped} dropped; widths ${(r.widths || []).join(' then ')}, longest stall ${((r.stall || 0) / 1000).toFixed(2)} s`);
+    if (resize) {
+      check('the forced change halved the width and playback carried on', r.resizeFrom === 640 && r.halfAt !== undefined && r.afterHalf >= 3,
+        `forced at ${r.resizeFrom || 'never'} wide, ${r.halfAt === undefined ? 'never reached half' : `played ${r.afterHalf.toFixed(1)} s at half width`}; widths ${r.widths.join(' then ')}, longest stall ${(r.stall / 1000).toFixed(2)} s`);
+    }
     check('DELETE 200', r.delete === 200, `${r.delete}`);
     check('no page errors', r.errors.length === 0, r.errors.join('; '));
   }
@@ -348,13 +390,30 @@ function hits(text, s) {
   await stopGroup(s.child.pid);
   const files = fs.readdirSync(recordings, { recursive: true }).map((f) => path.join(recordings, f)).filter((f) => f.endsWith('.mp4'));
   check('a recording was written', files.length > 0, files.map((f) => path.basename(f)).join(', '));
+  // One recording per codec epoch that was served: every init the playlist
+  // named. A browser may also ramp its resolution up by itself at the
+  // start. The server's log agrees: an epoch that ended with no part
+  // (previous_parts=0, counted after the change sealed its open part) was
+  // never in the playlist.
+  const changes = fs.readFileSync(log, 'utf8').replace(/\x1b\[[0-9;]*m/g, '').split('\n')
+    .filter((l) => l.includes('mid-stream; starting a new codec epoch'));
+  const withParts = changes.filter((l) => !/previous_parts=0\b/.test(l)).length;
+  check('one recording per served codec epoch', maps.size > 0 && files.length === maps.size && withParts + 1 === maps.size && (!resize || maps.size > 1),
+    `${files.length} files, ${maps.size} inits served, ${changes.length} epoch changes (${changes.length - withParts} from an epoch with no part)`);
   for (const f of files) {
     const probe = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-show_entries', 'stream=codec_name,width,height,nb_read_frames,sample_rate,channels', '-of', 'json', f], { encoding: 'utf8' });
     let streams = [];
     try { streams = JSON.parse(probe.stdout).streams || []; } catch {}
     fs.writeFileSync(path.join(out, path.basename(f) + '.probe.json'), probe.stdout);
     const video = streams.find((x) => x.codec_name === 'h264'), audio = streams.find((x) => x.codec_name === 'opus');
-    check('recording: H.264 frames decode', video && +video.nb_read_frames > 0, video ? `${video.nb_read_frames} frames at ${video.width}x${video.height}` : probe.stderr.trim());
+    // The whole file, not a frame count: a file whose frames do not match
+    // its init can still count frames. A file that lost whole fragments
+    // still decodes cleanly, so this does not see missing media; the
+    // server's completeness marks are what report that.
+    const whole = spawnSync('ffmpeg', ['-hide_banner', '-v', 'error', '-i', f, '-f', 'null', '-'], { encoding: 'utf8' });
+    const decodeErrors = whole.stderr.split('\n').filter(Boolean);
+    check('recording: decodes whole with no error', whole.status === 0 && decodeErrors.length === 0 && video && +video.nb_read_frames > 0,
+      video ? `${video.nb_read_frames} H.264 frames at ${video.width}x${video.height}, ${decodeErrors.length} decode errors` : probe.stderr.trim());
     check('recording: Opus decodes', audio && +audio.nb_read_frames > 0, audio ? `${audio.nb_read_frames} frames, ${audio.channels} channels at ${audio.sample_rate}` : '');
     const png = path.join(out, path.basename(f) + '.frame.png');
     const ff = spawnSync('ffmpeg', ['-v', 'error', '-y', '-i', f, '-frames:v', '1', png], { encoding: 'utf8' });
@@ -365,7 +424,10 @@ function hits(text, s) {
   const logText = fs.readFileSync(log, 'utf8');
   const plain = logText.replace(/\x1b\[[0-9;]*m/g, '');
   check('the session ended, deleted, with nothing lost', /WHIP session ended reason="?deleted"? count=\d+ lost=0/.test(plain));
-  check('the recording finished complete', /recording finished .*complete=true/.test(plain));
+  // Every file, not any one of them.
+  const finished = plain.split('\n').filter((l) => l.includes('recording finished'));
+  check('every recording finished complete', finished.length === files.length && finished.every((l) => /complete=true/.test(l)),
+    `${finished.filter((l) => /complete=true/.test(l)).length} of ${finished.length} complete, ${files.length} files`);
   if (transport !== 'udp') {
     check('the publisher\'s real TCP ends were seen', peers.length > 0 && peers.every((p) => p.port >= 1024 && p.port !== port.tcp),
       `${peers.length} connection(s)`);

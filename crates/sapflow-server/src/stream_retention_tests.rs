@@ -154,27 +154,113 @@ fn partial_response_and_consumed_prefix_keep_backing_charges_after_close() {
     );
     registry.terminate(&stream, generation);
     drop(stream);
-    let charge = registry.fragments.used();
+    // Kept past the window, segment 7's charge moved from the fragment
+    // budget to the retention pool beside it; it stays while a body does.
+    let charged = || registry.fragments.used() + registry.retained.used();
+    let charge = charged();
     assert!(charge >= expected.len());
     let mut slices = [std::io::IoSlice::new(&[]); 128];
     body.slices(&mut slices);
     let first_chunk = slices[0].len();
     body.advance(first_chunk).expect("consume prefix fragment");
     assert_eq!(
-        registry.fragments.used(),
+        charged(),
         charge,
         "shared chunk array still owns consumed prefix"
     );
     assert_eq!(gather(&body), expected[first_chunk..]);
     body.advance(body.len()).expect("drain first viewer");
     assert_eq!(
-        registry.fragments.used(),
+        charged(),
         charge,
         "second viewer retains the original backing"
     );
     assert_eq!(gather(&alias), expected);
     alias.advance(alias.len()).expect("drain final viewer");
-    assert_eq!(registry.fragments.used(), 0);
+    assert_eq!(
+        (registry.fragments.used(), registry.retained.used()),
+        (0, 0)
+    );
+}
+
+/// Two 600 kB/s A/V streams at `segment_count` 7 on the server's shared
+/// 10 MB fragment budget, A starting 30 s after B: what B keeps past its
+/// window is in the retention pool, so both run, and once both have gone
+/// the budget and the pool are both empty.
+#[test]
+fn kept_media_never_fences_a_second_stream_on_the_server_budget() {
+    let registry = Registry::with_budgets(4, 10_000_000, 128 * 1024 * 1024);
+    let claim = |id: usize| {
+        registry
+            .claim_configured(
+                &path(id),
+                MuxerConfig {
+                    segment_count: 7,
+                    ..MuxerConfig::default()
+                },
+                SourceKind::Es,
+                true,
+                1,
+                |_, _| {},
+            )
+            .expect("presentation")
+    };
+    let sps = vec![
+        0x67, 0x4d, 0x40, 0x0d, 0xec, 0xa0, 0xa0, 0xcf, 0xcf, 0x80, 0x88, 0x00, 0x00, 0x03, 0x00,
+        0x08, 0x00, 0x00, 0x03, 0x01, 0xe0, 0x78, 0xa1, 0x4c, 0xb0,
+    ];
+    let pps = vec![0x68, 0xef, 0xbc, 0x80];
+    let aac =
+        sapflow_hls::codec::AacConfig::from_audio_specific_config(&[0x11, 0x90]).expect("AAC");
+    // One frame: its audio first, then 20 kB of video, a keyframe each second.
+    let frame = |stream: &LiveStream, i: i64| {
+        stream
+            .apply(|source, now| {
+                let Source::Es(es) = source else {
+                    unreachable!("elementary streams")
+                };
+                if i == 0 {
+                    es.parameter_sets(Some(sps.clone()), Some(pps.clone()));
+                    es.audio_config(aac);
+                }
+                let mut audio = (i * 3000 + 1919) / 1920 * 1920;
+                while audio < (i + 1) * 3000 {
+                    es.audio(audio, aac, &[0x21, 0x10, 0])?;
+                    audio += 1920;
+                }
+                let idr = i % 30 == 0;
+                let mut data = (20_000u32 - 4).to_be_bytes().to_vec();
+                data.push(if idr { 0x65 } else { 0x41 });
+                data.resize(20_000, 0);
+                let unit = sapflow_hls::codec::AccessUnit {
+                    data,
+                    idr,
+                    ..Default::default()
+                };
+                es.video(i * 3000, i * 3000, unit, now)
+            })
+            .unwrap_or_else(|e| panic!("frame {i} refused: {e:?}"));
+    };
+    let (b, b_generation, _) = claim(0);
+    for i in 0..30 * 30 {
+        frame(&b, i);
+    }
+    let (a, a_generation, _) = claim(1);
+    for i in 0..60 * 30 {
+        frame(&b, 30 * 30 + i);
+        frame(&a, i);
+    }
+    assert!(
+        registry.retained.used() > 0,
+        "media was kept past the window"
+    );
+    registry.terminate(&a, a_generation);
+    registry.terminate(&b, b_generation);
+    drop((a, b));
+    assert_eq!(
+        (registry.fragments.used(), registry.retained.used()),
+        (0, 0)
+    );
 }
 
 #[test]

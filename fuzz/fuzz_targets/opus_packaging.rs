@@ -5,10 +5,12 @@
 //! passed on. With the `OPT1` prefix, records of packet shapes, timestamp
 //! steps, gaps, steps back, malformed packets and interrupts go into an
 //! audio-only or video-led Opus muxer; rendered playlists must pass
-//! `playlist::RuleCheck` after every push, and a refused packet must change
-//! nothing: neither what a viewer or recorder could observe nor the muxer's
-//! internal state (`Muxer::internal_state`, from sapflow-hls's `testing`
-//! feature).
+//! `playlist::RuleCheck` after every push, every part must stay served for
+//! three target durations after its tag leaves the playlist
+//! (`playlist::RetentionCheck`) unless the muxer counts it, and a refused
+//! packet must change nothing: neither what a viewer or recorder could
+//! observe nor the muxer's internal state (`Muxer::internal_state`, from
+//! sapflow-hls's `testing` feature).
 #![no_main]
 use std::time::UNIX_EPOCH;
 
@@ -97,8 +99,13 @@ fn timing(data: &[u8]) {
         Some(AudioConfig::Opus(channels)),
         None,
     )
-    .expect("supported Opus configuration");
+    .expect("supported Opus configuration")
+    // RetentionCheck needs retention, which needs a pool.
+    .with_retention_pool(std::sync::Arc::new(
+        sapflow_core::fragment::FragmentQuota::new(sapflow_hls::muxer::RETENTION_POOL_BYTES),
+    ));
     let mut rules = playlist::RuleCheck::default();
+    let mut retention = playlist::RetentionCheck::default();
     let (mut pts, mut dts, mut frame) = (0i64, -3000i64, 0u32);
     let mut keyframe = true;
     for rec in records.chunks_exact(4).take(4096) {
@@ -121,6 +128,9 @@ fn timing(data: &[u8]) {
                 let pushed = m.push_video(dts, dts, sync, Bytes::from_static(&[0; 8]), UNIX_EPOCH);
                 if pushed.is_err() {
                     return;
+                }
+                if let Err(error) = retention.check(&m) {
+                    panic!("{error}");
                 }
             }
         }
@@ -146,6 +156,9 @@ fn timing(data: &[u8]) {
             if let Err(error) = rules.check_with_byte_cap(&rendered, m.window_byte_capped()) {
                 panic!("{error}\n{rendered}");
             }
+        }
+        if let Err(error) = retention.check(&m) {
+            panic!("{error}");
         }
         match result {
             Ok(_) | Err(MuxError::InvalidAudio) => {}

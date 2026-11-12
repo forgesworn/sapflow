@@ -36,6 +36,28 @@ impl FlvIngest {
         ingest.es.set_expect_audio(false);
         ingest
     }
+
+    /// Turns on retention, with `pool` ([`EsIngest::with_retention_pool`]).
+    pub fn with_retention_pool(
+        mut self,
+        pool: std::sync::Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
+        self.es.set_retention_pool(pool);
+        self
+    }
+
+    /// [`FlvIngest::with_fragment_quota`], with a retention pool
+    /// ([`EsIngest::with_fragment_budget`]).
+    pub fn with_fragment_budget(
+        cfg: MuxerConfig,
+        quota: std::sync::Arc<sapflow_core::fragment::FragmentQuota>,
+        retention: std::sync::Arc<sapflow_core::fragment::FragmentQuota>,
+    ) -> Self {
+        let mut ingest = Self::new(cfg);
+        ingest.es = EsIngest::with_fragment_budget(cfg, quota, retention);
+        ingest.es.set_expect_audio(false);
+        ingest
+    }
     /// An ingest with no muxer yet: normally the first keyframe, once its
     /// parameter sets are known, creates one from `cfg`. Explicit audio-only
     /// declarations instead initialize on their first AAC frame. No audio is expected until

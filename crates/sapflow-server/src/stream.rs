@@ -22,7 +22,7 @@ pub struct LiveStream {
     state: Mutex<State>,
     session: Mutex<Session>,
     version: watch::Sender<u64>,
-    fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    fragments: Budget,
     // Drop after cached state and session: reservation follows the final stream
     // owner, including publications, grace tasks and parked viewer requests.
     _presentation_permit: PresentationPermit,
@@ -105,27 +105,21 @@ pub enum SourceKind {
 }
 
 impl Source {
-    fn new(
-        kind: SourceKind,
-        cfg: MuxerConfig,
-        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
-    ) -> Self {
+    fn new(kind: SourceKind, cfg: MuxerConfig, budget: &Budget) -> Self {
+        let (live, kept) = (budget.fragments.clone(), budget.retained.clone());
         match kind {
-            SourceKind::Ts => Self::Ts(Box::new(TsIngest::with_fragment_quota(cfg, fragments))),
-            SourceKind::Flv => Self::Flv(Box::new(FlvIngest::with_fragment_quota(cfg, fragments))),
-            SourceKind::Es => Self::Es(Box::new(EsIngest::with_fragment_quota(cfg, fragments))),
+            SourceKind::Ts => Self::Ts(Box::new(TsIngest::with_fragment_budget(cfg, live, kept))),
+            SourceKind::Flv => {
+                Self::Flv(Box::new(FlvIngest::with_fragment_budget(cfg, live, kept)))
+            }
+            SourceKind::Es => Self::Es(Box::new(EsIngest::with_fragment_budget(cfg, live, kept))),
         }
     }
 
     /// A new connection's ingest, carrying on `muxer` if there is one.
-    fn resume(
-        kind: SourceKind,
-        cfg: MuxerConfig,
-        muxer: Option<Muxer>,
-        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
-    ) -> Self {
+    fn resume(kind: SourceKind, cfg: MuxerConfig, muxer: Option<Muxer>, budget: &Budget) -> Self {
         match (kind, muxer) {
-            (_, None) => Self::new(kind, cfg, fragments),
+            (_, None) => Self::new(kind, cfg, budget),
             (SourceKind::Ts, Some(m)) => Self::Ts(Box::new(TsIngest::resume(cfg, m))),
             (SourceKind::Flv, Some(m)) => Self::Flv(Box::new(FlvIngest::resume(cfg, m))),
             (SourceKind::Es, Some(m)) => Self::Es(Box::new(EsIngest::resume(cfg, m))),
@@ -186,6 +180,10 @@ pub struct State {
     /// Rendered only on demand, then shared until the next media update.
     conventional_media: Option<Bytes>,
     pub multivariant: Option<Bytes>,
+    /// The tracks of the current codec epoch and the one before, as the
+    /// muxer had them after a push, so an epoch's recording can still be
+    /// started once the muxer has moved on ([`Stream::feed_outgoing`]).
+    epoch_tracks: Vec<(u64, Tracks)>,
 }
 
 /// Who owns the stream: the connected publisher, or nobody while it is
@@ -315,18 +313,19 @@ impl LiveStream {
         kind: SourceKind,
         publication_permit: Option<PublicationPermit>,
         presentation_permit: PresentationPermit,
-        fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+        fragments: Budget,
     ) -> Self {
         Self {
             path,
             cfg,
             state: Mutex::new(State {
-                ingest: Source::new(kind, cfg, fragments.clone()),
+                ingest: Source::new(kind, cfg, &fragments),
                 prefix: fresh_prefix(),
                 closed: false,
                 media: None,
                 conventional_media: None,
                 multivariant: None,
+                epoch_tracks: Vec::new(),
             }),
             session: Mutex::new(Session {
                 generation: 0,
@@ -442,7 +441,10 @@ impl LiveStream {
             return Err(IngestError::PresentationExpired);
         }
         let update = match f(&mut st.ingest, SystemTime::now()) {
-            Ok(update) => update,
+            Ok(update) => {
+                Self::note_epoch(&mut st);
+                update
+            }
             Err(error) => {
                 // A rejected input can still retire accepted muxer state.
                 // Conventional requests previously rendered that state live.
@@ -464,6 +466,26 @@ impl LiveStream {
             restarted: update.restarted,
             media_loss: update.media_loss,
         })
+    }
+
+    /// Remembers the current epoch's tracks (and keeps the one before).
+    fn note_epoch(st: &mut State) {
+        let Some(m) = st.ingest.muxer() else {
+            return;
+        };
+        let id = m.current_initialization_id();
+        let Some(tracks) = Tracks::with_audio(m.video().cloned(), m.audio_config().copied()) else {
+            return;
+        };
+        match st.epoch_tracks.last_mut() {
+            Some((last, current)) if *last == id => *current = tracks,
+            _ => {
+                if st.epoch_tracks.len() >= 2 {
+                    st.epoch_tracks.remove(0);
+                }
+                st.epoch_tracks.push((id, tracks));
+            }
+        }
     }
 
     fn render(st: &mut State) -> bool {
@@ -496,6 +518,7 @@ impl LiveStream {
             let result = state
                 .ingest
                 .finish(SystemTime::now(), session.closed_cleanly());
+            Self::note_epoch(&mut state);
             if !trimmed_before && state.ingest.trimmed_audio_tail() {
                 tracing::info!(
                     path = %self.path.as_path(),
@@ -515,10 +538,20 @@ impl LiveStream {
             session.mark_recording_incomplete(session.generation, IncompleteReason::EndOfInput);
         }
         if result.is_ok_and(|update| update.restarted) {
+            let unrecorded = session
+                .recorder
+                .as_mut()
+                .is_some_and(|outgoing| !self.feed_outgoing(outgoing));
             session.recorder = session
                 .recorder_factory
                 .as_ref()
                 .map(RecorderFactory::start);
+            if unrecorded {
+                session.mark_recording_incomplete(
+                    session.generation,
+                    IncompleteReason::EpochUnrecorded,
+                );
+            }
             if loss {
                 session.mark_recording_incomplete(session.generation, IncompleteReason::EndOfInput);
             }
@@ -535,9 +568,99 @@ impl LiveStream {
         crate::own_http::notify();
     }
 
-    /// The init segment and every finished part after `after`, for the
-    /// recorder. Parts are never skipped as long as this is called after
-    /// every push.
+    /// Before a recording rolls to a new codec epoch: gives the outgoing
+    /// recorder every part of its epoch that it has not had, so media that
+    /// was served is recorded. Returns `false` when some of it cannot be:
+    /// mark the next recording incomplete ([`IncompleteReason::EpochUnrecorded`]).
+    ///
+    /// - The push that starts an epoch also seals the old epoch's last parts
+    ///   (the muxer's interrupt), and [`Stream::parts_after`] gives only the
+    ///   current epoch's. A recorder that has started is fed the rest of
+    ///   its own epoch; it keeps its own init.
+    /// - An epoch shorter than one part, once part timing is known, is still
+    ///   served: the interrupt seals its open part. Its recorder never
+    ///   started, so it is started now with that epoch's tracks, as noted
+    ///   after the push that began it, and fed the epoch's parts.
+    /// - An epoch begun and ended inside one push left no tracks to start
+    ///   its recording with: `false`. So does a late start whose first part
+    ///   was refused (no free writer, or the byte budget full).
+    pub fn feed_outgoing(&self, recorder: &mut Recorder) -> bool {
+        if !recorder.is_accepting() {
+            // Stopped: it has marked itself.
+            return true;
+        }
+        let fed = {
+            let st = self.lock();
+            let Some(m) = st.ingest.muxer() else {
+                return true;
+            };
+            let first = m.epoch_first_part_id();
+            // The outgoing epoch, and the part to feed after.
+            let (epoch, after) = match recorder.last_part() {
+                Some(last) => match m.part(last) {
+                    PartLookup::Found(p) => (p.initialization.id, Some(last)),
+                    _ => return true,
+                },
+                None => match m.current_initialization_id().checked_sub(1) {
+                    Some(previous) => (previous, None),
+                    None => return true,
+                },
+            };
+            let found = |id: u64| match m.part(id) {
+                PartLookup::Found(p) if p.initialization.id == epoch => Some(p),
+                _ => None,
+            };
+            let parts: Vec<Arc<Part>> = match after {
+                // Upwards from the last part fed: the file's own tail, even
+                // when later epochs sealed parts in the same push.
+                Some(last) => (last + 1..first).map_while(found).collect(),
+                // Never started: the epoch just before the current one,
+                // newest first, back to its start or out of the window.
+                None => {
+                    let mut parts: Vec<Arc<Part>> = (0..first).rev().map_while(found).collect();
+                    parts.reverse();
+                    parts
+                }
+            };
+            // An epoch between this one and the current one began and ended
+            // inside one push: any parts it left have no recording.
+            let current = m.current_initialization_id();
+            let skipped = current > epoch + 1
+                && (0..first)
+                    .rev()
+                    .map_while(|id| match m.part(id) {
+                        PartLookup::Found(p) => Some(p.initialization.id),
+                        _ => None,
+                    })
+                    .any(|e| e > epoch && e < current);
+            if parts.is_empty() {
+                return !skipped;
+            }
+            let tracks = if after.is_some() {
+                // Not read by a recorder that has started.
+                Tracks::with_audio(m.video().cloned(), m.audio_config().copied())
+            } else {
+                st.epoch_tracks
+                    .iter()
+                    .find(|(id, _)| *id == epoch)
+                    .map(|(_, tracks)| tracks.clone())
+            };
+            match tracks {
+                Some(tracks) => (tracks, parts, skipped),
+                None => return false,
+            }
+        };
+        let (tracks, parts, skipped) = fed;
+        recorder.feed(tracks, parts);
+        // A late start whose first part was refused (no free writer, or the
+        // byte budget full) recorded nothing of the epoch.
+        !skipped && recorder.last_part().is_some()
+    }
+
+    /// The init segment and every finished part of the current codec epoch
+    /// after `after`, for the recorder. Parts are never skipped as long as
+    /// this is called after every push and, before a recording rolls to a
+    /// new epoch, [`Stream::feed_outgoing`] has fed the old one.
     pub fn parts_after(&self, after: Option<u64>) -> Option<(Tracks, Vec<Arc<Part>>)> {
         let st = self.lock();
         let m = st.ingest.muxer()?;
@@ -566,7 +689,7 @@ impl LiveStream {
                 Source::Flv(_) => SourceKind::Flv,
                 Source::Es(_) => SourceKind::Es,
             };
-            state.ingest = Source::new(kind, self.cfg, self.fragments.clone());
+            state.ingest = Source::new(kind, self.cfg, &self.fragments);
             state.media = None;
             state.conventional_media = None;
             state.multivariant = None;
@@ -605,6 +728,16 @@ pub struct Registry {
     rtmp_publications: Arc<PublicationQuota>,
     presentations: Arc<PresentationQuota>,
     fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    /// What muxers keep past their windows for RFC 8216bis 6.2.2, charged
+    /// apart from `fragments` so that it never refuses live media.
+    retained: Arc<sapflow_core::fragment::FragmentQuota>,
+}
+
+/// The fragment budget and retention pool every stream shares.
+#[derive(Clone)]
+struct Budget {
+    fragments: Arc<sapflow_core::fragment::FragmentQuota>,
+    retained: Arc<sapflow_core::fragment::FragmentQuota>,
 }
 
 impl Default for Registry {
@@ -619,11 +752,34 @@ impl Registry {
     }
 
     pub fn with_limits(maximum_presentations: usize, fragment_bytes: usize) -> Self {
+        Self::with_budgets(
+            maximum_presentations,
+            fragment_bytes,
+            sapflow_hls::muxer::RETENTION_POOL_BYTES,
+        )
+    }
+
+    /// With a fragment budget and, beside it, the retention pool every
+    /// stream's muxer charges kept media to: fragment memory is the two
+    /// together.
+    pub fn with_budgets(
+        maximum_presentations: usize,
+        fragment_bytes: usize,
+        retained_bytes: usize,
+    ) -> Self {
         Self {
             streams: Mutex::new(HashMap::new()),
             rtmp_publications: Arc::new(PublicationQuota::new()),
             presentations: Arc::new(PresentationQuota::new(maximum_presentations)),
             fragments: Arc::new(sapflow_core::fragment::FragmentQuota::new(fragment_bytes)),
+            retained: Arc::new(sapflow_core::fragment::FragmentQuota::new(retained_bytes)),
+        }
+    }
+
+    fn budget(&self) -> Budget {
+        Budget {
+            fragments: self.fragments.clone(),
+            retained: self.retained.clone(),
         }
     }
     #[cfg(test)]
@@ -729,7 +885,7 @@ impl Registry {
                 // the old run. Its final pending part is already below this
                 // floor, and cannot be completed by this connection's first IDR.
                 session.fresh_part_floor = muxer.as_ref().map_or(0, Muxer::next_part_id);
-                st.ingest = Source::resume(kind, stream.cfg, muxer, self.fragments.clone());
+                st.ingest = Source::resume(kind, stream.cfg, muxer, &self.budget());
                 drop(st);
                 configure(&mut session, Claim::Resumed);
                 return Ok((stream.clone(), session.generation, Claim::Resumed));
@@ -752,7 +908,7 @@ impl Registry {
             kind,
             publication_permit,
             presentation_permit,
-            self.fragments.clone(),
+            self.budget(),
         ));
         configure(&mut stream.session(), Claim::Fresh);
         map.insert(path.event_id().to_owned(), stream.clone());

@@ -262,8 +262,23 @@ async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
+    // Packets per track, as (video, audio).
+    let packets = |file: &std::path::Path| {
+        let count = |track: &str| {
+            let output = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", track])
+                .args(["-show_entries", "packet=pts", "-of", "csv=p=0"])
+                .arg(file)
+                .output()
+                .expect("ffprobe runs");
+            String::from_utf8_lossy(&output.stdout).lines().count()
+        };
+        (count("v:0"), count("a:0"))
+    };
     let mut widths = Vec::new();
+    let mut recorded = Vec::new();
     for file in &files {
+        recorded.push(packets(file));
         let output = std::process::Command::new("ffprobe")
             .args([
                 "-v",
@@ -311,4 +326,448 @@ async fn each_resolution_epoch_recording_decodes_independently_with_audio() {
     // expected track configurations and decode independently of their names.
     widths.sort_unstable();
     assert_eq!(widths, [720, 720, 1280]);
+}
+
+/// A resolution change mid-stream on one connection, as an encoder under
+/// load makes: the ingest starts a new codec epoch (`restarted`), the
+/// recording rolls to a new file there, and each file decodes on its own,
+/// audio and video, with no error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
+async fn a_mid_stream_resolution_change_rolls_the_recording_and_both_files_decode() {
+    const CHANGE: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-change.ts");
+    let (mut app, scratch) = app(true);
+    let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+    let (callbacks, _receiver) = crate::callback::test_queue(scope, 32);
+    Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
+    let mut publisher = begin(&app);
+    // As SRT delivers it: one datagram's worth at a time.
+    for chunk in CHANGE.chunks(1316) {
+        feed(&mut publisher, chunk);
+    }
+    {
+        let stream = publisher.stream.clone();
+        let st = stream.lock();
+        let m = st.ingest.muxer().expect("muxer");
+        assert_eq!(m.current_initialization_id(), 1, "one new epoch");
+        // Each epoch's video and audio as the muxer holds them, to compare
+        // with the recordings.
+        for epoch in 0..=1u64 {
+            let mut file = m.initialization(epoch).expect("init").to_vec();
+            for id in 0..m.next_part_id() {
+                if let sapflow_hls::PartLookup::Found(p) = m.part(id)
+                    && p.initialization.id == epoch
+                {
+                    file.extend_from_slice(&p.data);
+                }
+            }
+            std::fs::write(scratch.0.join(format!("muxer-epoch{epoch}.mp4")), file)
+                .expect("scratch");
+        }
+    }
+    publisher.end();
+    // End the held stream, so the last file is finished.
+    let path = StreamPath::parse("live/event-epochs").expect("path");
+    let (stream, generation, _) = app
+        .streams
+        .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Ts)
+        .expect("claim");
+    app.streams.detach(&stream, generation, false);
+    let directory = scratch.0.join("live/event-epochs");
+    let duration = |file: &std::path::Path| {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(file)
+            .output()
+            .expect("ffprobe runs");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let files = loop {
+        let mut files: Vec<_> = std::fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        files.sort();
+        if files.len() == 2 && files.iter().all(|f| duration(f) > 1.0) {
+            break files;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "two finished recordings required, found {files:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    // Packets per track, as (video, audio).
+    let packets = |file: &std::path::Path| {
+        let count = |track: &str| {
+            let output = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", track])
+                .args(["-show_entries", "packet=pts", "-of", "csv=p=0"])
+                .arg(file)
+                .output()
+                .expect("ffprobe runs");
+            String::from_utf8_lossy(&output.stdout).lines().count()
+        };
+        (count("v:0"), count("a:0"))
+    };
+    let mut widths = Vec::new();
+    let mut recorded = Vec::new();
+    for file in &files {
+        recorded.push(packets(file));
+        let probe = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=width", "-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .expect("ffprobe runs");
+        widths.push(
+            String::from_utf8_lossy(&probe.stdout)
+                .trim()
+                .parse::<u32>()
+                .expect("a width"),
+        );
+        let decode = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-xerror", "-i"])
+            .arg(file)
+            .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            decode.status.success() && decode.stderr.is_empty(),
+            "{}: {}",
+            file.display(),
+            String::from_utf8_lossy(&decode.stderr)
+        );
+    }
+    widths.sort_unstable();
+    assert_eq!(widths, [128, 160], "one file per resolution");
+    // The file of the first resolution holds every packet the muxer cut
+    // in its epoch, the last parts sealed by the change included.
+    let first = files
+        .iter()
+        .zip(&widths_of(&files))
+        .position(|(_, w)| *w == 160)
+        .expect("the 160x90 file");
+    assert_eq!(
+        recorded[first],
+        packets(&scratch.0.join("muxer-epoch0.mp4")),
+        "the old recording keeps its epoch's tail: files {:?}, widths {:?}, packets {recorded:?}",
+        files,
+        widths_of(&files)
+    );
+    // The new file holds at least what the muxer had cut in its epoch when
+    // the feed ended; the end of the stream adds the tail.
+    let (video, audio) = recorded[1 - first];
+    let (cut_video, cut_audio) = packets(&scratch.0.join("muxer-epoch1.mp4"));
+    assert!(
+        video >= cut_video && audio >= cut_audio && cut_video > 0,
+        "the new recording: {recorded:?} for ({cut_video}, {cut_audio}) cut"
+    );
+}
+
+fn widths_of(files: &[std::path::PathBuf]) -> Vec<u32> {
+    files
+        .iter()
+        .map(|file| {
+            let probe = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", "v:0"])
+                .args(["-show_entries", "stream=width", "-of", "csv=p=0"])
+                .arg(file)
+                .output()
+                .expect("ffprobe runs");
+            String::from_utf8_lossy(&probe.stdout)
+                .trim()
+                .parse::<u32>()
+                .expect("a width")
+        })
+        .collect()
+}
+
+const BLIP: &[u8] = include_bytes!("../../sapflow-hls/tests/fixtures/resolution-blip.ts");
+
+/// Feeds `resolution-blip.ts` (160x90, three frames at 128x72, 160x90) as
+/// SRT delivers it, ends the stream, and returns the recording callbacks
+/// and the files. The middle epoch is shorter than a part, but part timing
+/// is fixed by then, so the change seals its open part: it is served.
+async fn short_epoch_run() -> (
+    Vec<serde_json::Value>,
+    Vec<std::path::PathBuf>,
+    crate::test_support::Scratch,
+) {
+    let (mut app, scratch) = app(true);
+    let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+    let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
+    Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
+    let mut publisher = begin(&app);
+    let mut done = Vec::new();
+    let next = |receiver: &mut tokio::sync::mpsc::Receiver<crate::callback::Queued>| {
+        let callback = receiver.try_recv().ok()?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&callback.body).expect("recording callback JSON");
+        (body["event"] == "recordSegmentComplete").then_some(body)
+    };
+    let mut waited = false;
+    for chunk in BLIP.chunks(1316) {
+        feed(&mut publisher, chunk);
+        let epoch = publisher
+            .stream
+            .lock()
+            .ingest
+            .muxer()
+            .map(|m| m.current_initialization_id());
+        if epoch == Some(1) && !waited {
+            // As in real time, where the short epoch and the next part give
+            // the first file's writer time to finish: two writers a path.
+            waited = true;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while done.is_empty() {
+                    match next(&mut receiver) {
+                        Some(body) => done.push(body),
+                        None => tokio::time::sleep(Duration::from_millis(5)).await,
+                    }
+                }
+            })
+            .await
+            .expect("the first file finishes");
+        }
+    }
+    {
+        let stream = publisher.stream.clone();
+        let st = stream.lock();
+        let m = st.ingest.muxer().expect("muxer");
+        assert_eq!(m.current_initialization_id(), 2, "two changes");
+        let text = std::str::from_utf8(st.media.as_ref().expect("playlist")).expect("UTF-8");
+        let short = format!(
+            "#EXT-X-MAP:URI=\"{}\"\n",
+            playlist::epoch_init_name(&st.prefix, 1)
+        );
+        let at = text
+            .find(&short)
+            .expect("the short epoch is in the playlist");
+        assert!(
+            text[at..]
+                .lines()
+                .nth(1)
+                .is_some_and(|l| !l.starts_with("#EXT-X-DISCONTINUITY")),
+            "with media under it: {text}"
+        );
+    }
+    publisher.end();
+    let path = StreamPath::parse("live/event-epochs").expect("path");
+    let (stream, generation, _) = app
+        .streams
+        .claim(&path, sapflow_hls::MuxerConfig::default(), SourceKind::Ts)
+        .expect("claim");
+    app.streams.detach(&stream, generation, false);
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while done.len() < 3 {
+            let callback = receiver.recv().await.expect("recording callback queue");
+            let body: serde_json::Value =
+                serde_json::from_slice(&callback.body).expect("recording callback JSON");
+            if body["event"] == "recordSegmentComplete" {
+                done.push(body);
+            }
+        }
+    })
+    .await;
+    let mut files: Vec<_> = std::fs::read_dir(scratch.0.join("live/event-epochs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    (done, files, scratch)
+}
+
+/// Served media is recorded: the short epoch gets its own file, and every
+/// file is finalised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_short_epoch_that_was_served_is_recorded() {
+    let (done, files, _scratch) = short_epoch_run().await;
+    assert_eq!(done.len(), 3, "one recording per served epoch: {done:?}");
+    assert!(
+        done.iter().all(|b| b["recordingState"] == "finalised"),
+        "{done:?}"
+    );
+    assert_eq!(files.len(), 3);
+}
+
+/// Each of the three files decodes alone, at its epoch's size, and the
+/// short epoch's file holds video.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffmpeg and ffprobe; run explicitly for origin acceptance"]
+async fn a_short_epoch_recording_decodes() {
+    let (_, files, _scratch) = short_epoch_run().await;
+    let mut widths = widths_of(&files);
+    for file in &files {
+        let decode = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-xerror", "-i"])
+            .arg(file)
+            .args(["-map", "0:v:0", "-f", "null", "-"])
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            decode.status.success() && decode.stderr.is_empty(),
+            "{}: {}",
+            file.display(),
+            String::from_utf8_lossy(&decode.stderr)
+        );
+    }
+    widths.sort_unstable();
+    assert_eq!(widths, [128, 160, 160]);
+}
+
+/// A recording's first part refused (here every part: a per-path budget of
+/// one byte) leaves a late-started epoch unrecorded, and the next file must
+/// say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_late_start_marks_the_next_recording() {
+    let (mut app, _scratch) = app(true);
+    Arc::get_mut(&mut app)
+        .expect("sole fixture App")
+        .recording_limits = Arc::new(crate::recorder::RecordingLimits::with_path_bytes(1, 1));
+    let mut publisher = begin(&app);
+    for chunk in BLIP.chunks(1316) {
+        feed(&mut publisher, chunk);
+    }
+    let session = publisher.stream.session();
+    let recorder = session
+        .recorder
+        .as_ref()
+        .expect("the third epoch's recorder");
+    assert_eq!(
+        recorder.status().reason(),
+        Some(crate::recorder::IncompleteReason::EpochUnrecorded)
+    );
+}
+
+/// Video PES starts in a transport stream, with their PTS (90 kHz), from
+/// the MPEG-TS packet and PES header layouts.
+fn video_pes_starts(ts: &[u8]) -> Vec<(usize, u64)> {
+    ts.chunks(188)
+        .enumerate()
+        .filter_map(|(i, p)| {
+            if p.len() < 188 || p[0] != 0x47 || p[1] & 0x40 == 0 {
+                return None;
+            }
+            let control = (p[3] >> 4) & 3;
+            let mut at = 4;
+            if control & 2 != 0 {
+                at += 1 + usize::from(p[4]);
+            }
+            if control & 1 == 0 {
+                return None;
+            }
+            let pes = p.get(at..)?;
+            if pes.len() < 14 || pes[..4] != [0, 0, 1, 0xe0] || pes[7] & 0x80 == 0 {
+                return None;
+            }
+            let b = &pes[9..14];
+            let pts = ((u64::from(b[0]) >> 1) & 7) << 30
+                | u64::from(b[1]) << 22
+                | (u64::from(b[2]) >> 1) << 15
+                | u64::from(b[3]) << 7
+                | u64::from(b[4]) >> 1;
+            Some((i * 188, pts))
+        })
+        .collect()
+}
+
+/// A whole short epoch and the next one's first IDR inside one push: the
+/// started recording still gets its own epoch's tail, and the short epoch,
+/// which left no tracks, marks the next file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed ffprobe; run explicitly for origin acceptance"]
+async fn a_started_recording_keeps_its_tail_when_an_epoch_passes_in_one_push() {
+    let (mut app, scratch) = app(true);
+    let scope = crate::publish_observer::fixture_scope("epochs", 1, 1, 1);
+    let (callbacks, mut receiver) = crate::callback::test_queue(scope, 32);
+    Arc::get_mut(&mut app).expect("sole fixture App").callbacks = callbacks;
+    let starts = video_pes_starts(BLIP);
+    // The short epoch's IDR at 3.442667 s, the next one's at 3.564 s.
+    let at = |pts: u64| {
+        starts
+            .iter()
+            .position(|(_, p)| p.abs_diff(pts) < 10)
+            .expect("an IDR at that time")
+    };
+    let (short, next) = (at(309_840), at(320_760));
+    let begin_short = starts[short].0;
+    // Through the start of the PES after the next IDR, so that IDR is whole.
+    let end = starts.get(next + 1).map_or(BLIP.len(), |(o, _)| o + 188);
+    let mut publisher = begin(&app);
+    for chunk in BLIP[..begin_short].chunks(1316) {
+        feed(&mut publisher, chunk);
+    }
+    feed(&mut publisher, &BLIP[begin_short..end]);
+    {
+        let stream = publisher.stream.clone();
+        let st = stream.lock();
+        let m = st.ingest.muxer().expect("muxer");
+        assert_eq!(m.current_initialization_id(), 2, "both changes in one push");
+        let mut file = m.initialization(0).expect("init").to_vec();
+        for id in 0..m.next_part_id() {
+            if let sapflow_hls::PartLookup::Found(p) = m.part(id)
+                && p.initialization.id == 0
+            {
+                file.extend_from_slice(&p.data);
+            }
+        }
+        std::fs::write(scratch.0.join("muxer-epoch0.mp4"), file).expect("scratch");
+        drop(st);
+        let session = stream.session();
+        assert_eq!(
+            session
+                .recorder
+                .as_ref()
+                .expect("recorder")
+                .status()
+                .reason(),
+            Some(crate::recorder::IncompleteReason::EpochUnrecorded),
+            "the short epoch had no recording"
+        );
+    }
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let callback = receiver.recv().await.expect("recording callback queue");
+            let body: serde_json::Value =
+                serde_json::from_slice(&callback.body).expect("recording callback JSON");
+            if body["event"] == "recordSegmentComplete" {
+                break body;
+            }
+        }
+    })
+    .await
+    .expect("the first file finishes");
+    assert_eq!(first["recordingState"], "finalised");
+    let file = std::path::PathBuf::from(first["segmentPath"].as_str().expect("a path"));
+    let packets = |file: &std::path::Path| {
+        let output = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "packet=pts", "-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .expect("ffprobe runs");
+        String::from_utf8_lossy(&output.stdout).lines().count()
+    };
+    assert_eq!(
+        packets(&file),
+        packets(&scratch.0.join("muxer-epoch0.mp4")),
+        "the first file keeps its epoch's tail"
+    );
+    publisher.end();
 }
