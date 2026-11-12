@@ -919,9 +919,18 @@ Left open:
   does at any interrupt, and the recording is not marked for it.
 - Two writers a path (`PATH_WRITERS`): epochs that change faster than a
   finished file can be written out leave a later recording without a
-  writer, which fails it. In real time the short epoch and the next part
-  give the writer that time; nothing bounds the epoch rate but the IDR
-  cadence (for the bounds work in W3c part 2b).
+  writer, which fails it. A late-started file for a short epoch takes one
+  of the two. In real time the short epoch and the next part give the
+  writer that time; nothing bounds the epoch rate but the IDR cadence (for
+  the bounds work in W3c part 2b). A late start refused a writer or byte
+  budget marks the next file `epoch-unrecorded`.
+- Unmarked losses that need several complete access units in one ingest
+  batch, so in practice only crafted input: a short epoch, then an epoch
+  with no part, then a third configuration, all in one batch, loses the
+  short epoch with no mark; and an `epoch-unrecorded` mark is lost if the
+  recording it was put on never starts.
+- The end-to-end script matches recordings to served epochs by count, not
+  by each file's width.
 - Observed stalls of hls.js 1.7.1 at the boundary in the end-to-end runs:
   0.10 to 0.82 s, and 0.52 s in the review. Once, in the diagnosis, it
   stalled about 7 s on a 0.37 s buffer hole before stepping over it; that
