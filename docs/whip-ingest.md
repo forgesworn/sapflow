@@ -819,9 +819,9 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
 
   Parts and segments used to be freed when the segment left the window,
   so a window shorter than about six target durations broke the part rule
-  and every removed segment went one segment duration early. Now
-  `Muxer::part` and `Muxer::segment`, which the server answers chunk
-  requests from, keep serving them: a part until three target durations
+  and every removed segment went one segment duration early. Now, given a
+  retention pool (below), `Muxer::part` and `Muxer::segment`, which the
+  server answers chunk requests from, keep serving them: a part until three target durations
   past the render that dropped its tag, a segment until its Availability
   Duration has passed since it first appeared, with its codec epoch's init
   while either is served. Time is the published media, every `EXTINF` the
@@ -862,12 +862,20 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   its 64 MiB cap within it. 128 MiB fits the server's defaults: 16
   publishers on a 512 MiB budget, each keeping about 8 MiB (three target
   durations of parts past the window plus a segment, at 9 Mbit/s with a
-  2 s target). A library user passes a pool with
-  `Muxer::with_retention_pool` or `with_fragment_budget`; without one, a
-  muxer with a fragment budget keeps its media in a private 64 MiB pool,
-  its own cap, so each stream is bounded and the budget still holds only
-  live media, but streams together are bounded only by their number. With
-  no budget there is no pool, and only the per-stream caps apply.
+  2 s target). Retention needs a pool and is otherwise off: a library user
+  turns it on with `Muxer::with_retention_pool`, the ingests'
+  `with_retention_pool`, or `with_fragment_budget`. Without one, media
+  leaves with the window as in 0.2.0-rc.1, and the budget holds what rc.1
+  held. With a pool and no budget there is nothing to charge, so only the
+  per-stream caps bound what is kept. The server always gives its pool,
+  so it always retains.
+
+  A segment's charges move to the pool as it leaves the window, in the
+  same step, so the live budget never holds more than main's even within
+  a push. No test shows that step directly: the moment is inside one
+  call on one thread, and only another thread allocating at that instant
+  could observe it, which a test cannot schedule; the live budget's use
+  is pinned to main's after every push instead.
 
   `Muxer::parts_released_early()` and `Muxer::segments_released_early()`
   count what went early, and `playlist::RetentionCheck` holds a muxer to
@@ -918,11 +926,12 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   AAC-only streams, whose 47-frame segments last 1.0027 s: the AAC rows.
   The A/V rows use exact 1.000 s segments, and at `segment_count` 12 they
   fell 0.2 s short where AAC did not. Its 0.000 and 4.05 s are the
-  reconnect rows. The `epochs` golden digest changed:
-  after the fourth epoch the first epoch's parts 0 to 10 and its init are
-  still served. Every playlist, segment, and part and init served before
-  is unchanged, and the other 12 AAC and the 6 Opus digests are
-  byte-identical. Tested at `Muxer::part` and `Muxer::segment`, not
+  reconnect rows. The golden digests run without a pool, as an rc.1 caller
+  would, so retention leaves them alone: the 13 AAC digests are those of
+  the live-window change and the 6 Opus ones those of 4ab0c12. With a
+  pool, the `epochs` scenario also serves, after the fourth epoch, the
+  first epoch's parts 0 to 10 and its init; every playlist and segment is
+  unchanged. Tested at `Muxer::part` and `Muxer::segment`, not
   through the server, whose chunk route answers from them
   (`own_http.rs`) and returns 404 for everything once a presentation
   closes.

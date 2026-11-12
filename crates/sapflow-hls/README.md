@@ -35,13 +35,16 @@ live media server. MIT.
   that listed it) has passed since it first appeared, as 6.2.2 asks,
   within the same 64 MiB, which counts a segment and its parts once, and
   `muxer::MAX_RETAINED_SEGMENTS` (1,024); `Muxer::segments_released_early`
-  counts any that go early. What is kept is charged to a retention pool,
-  not to the fragment budget, so it never refuses live media: pass one
-  pool to every muxer on a budget with `Muxer::with_retention_pool` or the
-  ingests' `with_fragment_budget` (`muxer::RETENTION_POOL_BYTES`, 128 MiB,
-  is the server's default size), or each muxer with a budget gets a
-  private 64 MiB pool, its own cap. Past a stream's end it stays fetchable only while the server
-  keeps the presentation (`SAPFLOW_RECONNECT_GRACE`).
+  counts any that go early. Retention needs a pool: pass one to every
+  muxer on a budget with `Muxer::with_retention_pool`, the ingests'
+  `with_retention_pool` or `with_fragment_budget`
+  (`muxer::RETENTION_POOL_BYTES`, 128 MiB, is the server's default size).
+  What is kept is charged to the pool, not to the fragment budget, so it
+  never refuses live media. Without a pool, media leaves with the window,
+  as in 0.2.0-rc.1, so these two rules hold only at windows of about six
+  target durations. The server always gives a pool. Past a stream's end,
+  kept media stays fetchable only while the server keeps the presentation
+  (`SAPFLOW_RECONNECT_GRACE`).
 - **Ingest.** `TsIngest` takes MPEG-TS (what SRT carries), `FlvIngest`
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
   units and AAC frames or Opus packets directly.
