@@ -61,8 +61,10 @@ pub struct Stats {
     /// Copies of packets already delivered or given up on.
     pub belated: u64,
     /// Missing packets that then arrived as originals, not retransmissions:
-    /// the path reordered them. Each had already been reported in a NAK, so
-    /// the sender resends it for nothing.
+    /// the path reordered them. Each had already been queued in a NAK, so
+    /// the sender resends it for nothing. This relies on the caller setting
+    /// the retransmission flag (`REXMITFLG`), as libsrt does; a caller that
+    /// never sets it has its retransmissions counted here too.
     pub reordered: u64,
     /// Packets found missing (each counted once).
     pub lost: u64,
