@@ -851,7 +851,7 @@ mod tests {
             time::{Duration, Instant},
         };
         const ITERATIONS: u32 = 4096;
-        const ROUNDS: u32 = 4;
+        const ROUNDS: u32 = 6;
 
         fn setup_time(mut setup: impl FnMut()) -> Duration {
             let start = Instant::now();
@@ -915,6 +915,38 @@ mod tests {
             ITERATIONS,
             ROUNDS
         );
+        // Complete every packet oracle before any timed phase. Match the
+        // timed helper's input, zero suffix, slot order and wrapping sequence.
+        for size in [KeySize::Aes128, KeySize::Aes256] {
+            let mut material = fixture_for(size);
+            material.keys[1] = Some(fixed_key(size, 64));
+            let legacy = PerPacketMaterial::from(&material);
+            let input: [u8; 1456] = std::array::from_fn(|i| i as u8);
+            for len in [16, 1316, 1456] {
+                let mut verified = 0u32;
+                for n in 0..ITERATIONS {
+                    let mut expected = [0; 1456];
+                    expected[..len].copy_from_slice(&input[..len]);
+                    let mut actual = expected;
+                    let kk = 1 + (n & 1) as u8;
+                    let seq = Seq::new(0x7fff_f800).add(n);
+                    legacy
+                        .crypt(kk, seq, &mut expected[..len])
+                        .expect("packet oracle reference");
+                    material
+                        .crypt(kk, seq, &mut actual[..len])
+                        .expect("packet oracle cached");
+                    assert_eq!(
+                        actual, expected,
+                        "complete packet equality: {size:?} len={len} n={n} slot={kk}"
+                    );
+                    verified += 1;
+                }
+                eprintln!(
+                    "aes-cache verification size={size:?} len={len} complete_array_pairs={verified} array_bytes=1456 sequence_start=2147481600 sequence_modulus=2147483648 slots=1,2 untimed=true"
+                );
+            }
+        }
         for size in [KeySize::Aes128, KeySize::Aes256] {
             let mut material = fixture_for(size);
             material.keys[1] = Some(fixed_key(size, 64));
