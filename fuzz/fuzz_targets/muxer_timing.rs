@@ -293,7 +293,9 @@ fn fragment_budget(data: &[u8]) {
         segment_count: 8,
         ..MuxerConfig::default()
     };
+    let pool = Arc::new(FragmentQuota::new(sapflow_hls::muxer::RETENTION_POOL_BYTES));
     let Ok(mut muxer) = Muxer::with_fragment_quota(cfg, Some(video.clone()), None, quota.clone())
+        .map(|m| m.with_retention_pool(pool.clone()))
     else {
         assert_eq!(quota.used(), 0);
         return;
@@ -304,12 +306,10 @@ fn fragment_budget(data: &[u8]) {
     let mut retention = playlist::RetentionCheck::default();
     // A second stream on the same budget, so that what one keeps past its
     // window meets the other's live media; both share one retention pool.
-    let mut other = Muxer::with_fragment_quota(cfg, Some(video.clone()), None, quota.clone()).ok();
+    let mut other = Muxer::with_fragment_quota(cfg, Some(video.clone()), None, quota.clone())
+        .ok()
+        .map(|m| m.with_retention_pool(pool.clone()));
     let (mut other_dts, mut other_retention) = (0, playlist::RetentionCheck::default());
-    let pool = muxer
-        .retention_pool()
-        .cloned()
-        .expect("a budget has a pool");
     for record in data[2..].chunks_exact(8).take(256) {
         match record[0] % 6 {
             0 if record[1] & 2 != 0 => {

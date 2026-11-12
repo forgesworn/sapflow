@@ -24,10 +24,16 @@ struct Steady {
 }
 
 impl Steady {
-    fn new(cfg: MuxerConfig, quota: &Arc<FragmentQuota>, frame_bytes: usize) -> Self {
+    fn new(
+        cfg: MuxerConfig,
+        quota: &Arc<FragmentQuota>,
+        pool: &Arc<FragmentQuota>,
+        frame_bytes: usize,
+    ) -> Self {
         Self {
             m: Muxer::with_fragment_quota(cfg, Some(video()), Some(aac()), quota.clone())
-                .expect("muxer"),
+                .expect("muxer")
+                .with_retention_pool(pool.clone()),
             frame: 0,
             next_audio: 0,
             frame_bytes,
@@ -68,8 +74,9 @@ fn two_streams() -> (Option<(char, i64)>, usize, Steady, Steady) {
         ..MuxerConfig::default()
     };
     let quota = Arc::new(FragmentQuota::new(10_000_000));
-    let mut b = Steady::new(cfg, &quota, 20_000);
-    let mut a = Steady::new(cfg, &quota, 20_000);
+    let pool = Arc::new(FragmentQuota::new(crate::muxer::RETENTION_POOL_BYTES));
+    let mut b = Steady::new(cfg, &quota, &pool, 20_000);
+    let mut a = Steady::new(cfg, &quota, &pool, 20_000);
     let (mut refused, mut peak) = (None, 0);
     for i in 0..90 * 30 {
         if refused.is_none() && b.push().is_err() {
@@ -102,7 +109,10 @@ fn kept_media_never_fences_another_stream_on_the_same_budget() {
     );
     assert!(kept(&b.m) > 0, "B kept media past its window");
     let pool = b.m.retention_pool().cloned().expect("a pool");
-    assert!(Arc::ptr_eq(&pool, a.m.retention_pool().expect("a pool")));
+    assert!(
+        Arc::ptr_eq(&pool, a.m.retention_pool().expect("a pool")),
+        "the pool passed in"
+    );
     let quota = b.m.fragment_quota().expect("a budget");
     drop((a, b));
     assert_eq!((quota.used(), pool.used()), (0, 0), "nothing leaks");
@@ -134,10 +144,8 @@ fn a_full_retention_pool_releases_kept_media_and_never_live_media() {
     };
     let quota = Arc::new(FragmentQuota::new(10_000_000));
     let pool = Arc::new(FragmentQuota::new(2_000_000));
-    let mut b = Steady::new(cfg, &quota, 20_000);
-    let mut a = Steady::new(cfg, &quota, 20_000);
-    b.m.set_retention_pool(pool.clone());
-    a.m.set_retention_pool(pool.clone());
+    let mut b = Steady::new(cfg, &quota, &pool, 20_000);
+    let mut a = Steady::new(cfg, &quota, &pool, 20_000);
     for i in 0..90 * 30 {
         b.push().expect("B is never refused");
         if i >= 30 * 30 {
@@ -162,8 +170,7 @@ fn an_empty_retention_pool_releases_each_segment_as_it_leaves() {
         ..MuxerConfig::default()
     };
     let quota = Arc::new(FragmentQuota::new(512 << 20));
-    let mut s = Steady::new(cfg, &quota, 20_000);
-    s.m.set_retention_pool(Arc::new(FragmentQuota::new(0)));
+    let mut s = Steady::new(cfg, &quota, &Arc::new(FragmentQuota::new(0)), 20_000);
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     let mut evicted = 0;
@@ -200,11 +207,12 @@ fn a_new_epoch_is_admitted_beside_another_stream_s_kept_media() {
         ..MuxerConfig::default()
     };
     let quota = Arc::new(FragmentQuota::new(9_500_000));
-    let mut b = Steady::new(cfg, &quota, 20_000);
+    let pool = Arc::new(FragmentQuota::new(crate::muxer::RETENTION_POOL_BYTES));
+    let mut b = Steady::new(cfg, &quota, &pool, 20_000);
     for _ in 0..30 * 30 {
         b.push().expect("B is never refused");
     }
-    let mut a = Steady::new(cfg, &quota, 20_000);
+    let mut a = Steady::new(cfg, &quota, &pool, 20_000);
     for _ in 0..90 {
         b.push().expect("B is never refused");
         a.push().expect("A is never refused");
@@ -273,7 +281,10 @@ fn epochs_live_use(pool: Option<Arc<FragmentQuota>>) -> (String, usize) {
         ..MuxerConfig::default()
     };
     let quota = Arc::new(FragmentQuota::new(256 << 20));
-    let mut ingest = Some(crate::TsIngest::with_fragment_quota(cfg, quota.clone()));
+    let mut ingest = Some(match pool {
+        Some(pool) => crate::TsIngest::with_fragment_budget(cfg, quota.clone(), pool),
+        None => crate::TsIngest::with_fragment_quota(cfg, quota.clone()),
+    });
     let chunks: Vec<&[u8]> = (0..16)
         .flat_map(|epoch| {
             let bytes = if epoch % 2 == 0 {
@@ -299,9 +310,6 @@ fn epochs_live_use(pool: Option<Arc<FragmentQuota>>) -> (String, usize) {
                 ingest = Some(crate::TsIngest::resume(cfg, held));
             } else {
                 current.push(chunk, NOW).expect("fixture");
-            }
-            if let (Some(pool), Some(m)) = (&pool, ingest.as_mut().and_then(|i| i.muxer_mut())) {
-                m.set_retention_pool(pool.clone());
             }
             true
         },
@@ -336,4 +344,51 @@ fn the_live_budget_holds_what_main_held() {
     ];
     let actual: Vec<(&str, &str)> = actual.iter().map(|(n, (d, _))| (*n, d.as_str())).collect();
     assert_eq!(actual, expected);
+}
+
+/// Without a pool passed in, each muxer on a budget keeps media in a
+/// private pool at its own 64 MiB cap: the budget still holds only live
+/// media, and each stream is bounded on its own.
+#[test]
+fn without_a_pool_each_muxer_keeps_media_in_a_private_one() {
+    let cfg = MuxerConfig {
+        segment_count: 7,
+        ..MuxerConfig::default()
+    };
+    let quota = Arc::new(FragmentQuota::new(512 << 20));
+    let muxer = || {
+        Muxer::with_fragment_quota(cfg, Some(video()), Some(aac()), quota.clone()).expect("muxer")
+    };
+    let (mut first, second) = (muxer(), muxer());
+    let pool = first.retention_pool().cloned().expect("a private pool");
+    assert!(!Arc::ptr_eq(
+        &pool,
+        second.retention_pool().expect("its own")
+    ));
+    let (mut frame, mut next_audio) = (0i64, 0i64);
+    while frame < 30 * 30 {
+        let dts = frame * 3000;
+        while next_audio <= dts {
+            first
+                .push_audio(next_audio, Bytes::from_static(b"aac"))
+                .expect("AAC");
+            next_audio += 1920;
+        }
+        first
+            .push_video(
+                dts,
+                dts,
+                frame % 30 == 0,
+                Bytes::from(vec![0u8; 20_000]),
+                NOW,
+            )
+            .expect("video");
+        frame += 1;
+    }
+    assert!(
+        kept(&first) > 0 && pool.used() > 0,
+        "kept in the private pool"
+    );
+    drop((first, second));
+    assert_eq!((quota.used(), pool.used()), (0, 0));
 }

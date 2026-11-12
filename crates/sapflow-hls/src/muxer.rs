@@ -80,14 +80,12 @@ pub const MAX_RETAINED_PARTS: usize = 4096;
 /// the same 64 MiB.
 pub const MAX_RETAINED_SEGMENTS: usize = 4 * MAX_WINDOW_ENTRIES;
 
-/// The bytes the retention pool of one live fragment budget can hold: what
-/// every muxer on that budget keeps, past its window, of parts, segments and
-/// inits for RFC 8216bis 6.2.2. Kept media is charged to the pool, not the
-/// live budget, so it never refuses live media; a muxer with no budget has
-/// no pool. Sized for the server's defaults: 16 publishers each keeping
-/// about 8 MiB (three target durations of parts past the window plus a
-/// segment, at 9 Mbit/s with a 2 s target), a quarter more than the
-/// default 512 MiB live budget.
+/// A suggested size for a retention pool shared by every stream on one
+/// fragment budget ([`Muxer::with_retention_pool`]), and the server's
+/// default (`SAPFLOW_MAX_RETAINED_BYTES`): 16 publishers each keeping about
+/// 8 MiB (three target durations of parts past the window plus a segment,
+/// at 9 Mbit/s with a 2 s target), a quarter more than the server's
+/// default 512 MiB fragment budget.
 pub const RETENTION_POOL_BYTES: usize = 128 * 1024 * 1024;
 
 /// Pending AAC plus samples in the current unsealed video-led part.
@@ -604,7 +602,10 @@ impl Muxer {
             return Err(MuxError::InvalidTracks);
         }
         let mut muxer = Self::with_tracks(cfg, video, audio, init);
-        muxer.retention_pool = quota.as_ref().map(crate::fragment::retention_pool);
+        // Without a shared pool, a private one at the stream's own cap.
+        muxer.retention_pool = quota
+            .as_ref()
+            .map(|_| Arc::new(FragmentQuota::new(MAX_RETAINED_BYTES)));
         muxer.fragment_quota = quota;
         if let Some(charge) = charge {
             muxer.inits.push((Arc::downgrade(&muxer.init), charge));
@@ -614,6 +615,26 @@ impl Muxer {
 
     pub(crate) fn fragment_quota(&self) -> Option<Arc<FragmentQuota>> {
         self.fragment_quota.clone()
+    }
+
+    /// Charges what this muxer keeps past its window for RFC 8216bis 6.2.2
+    /// to `pool` instead of its fragment budget, so that kept media never
+    /// takes room from live media. Give every muxer on one fragment budget
+    /// the same pool to bound what they keep together: memory is then the
+    /// budget plus the pool. Without this, a muxer with a fragment budget
+    /// keeps its media in a private pool of 64 MiB, its own cap, so each
+    /// stream is bounded but streams together are not. A muxer without a
+    /// fragment budget charges nothing and ignores the pool. Set it before
+    /// pushing media: what is already kept stays charged where it is.
+    pub fn with_retention_pool(mut self, pool: Arc<FragmentQuota>) -> Self {
+        if self.fragment_quota.is_some() {
+            self.retention_pool = Some(pool);
+        }
+        self
+    }
+
+    pub(crate) fn shared_retention_pool(&self) -> Option<Arc<FragmentQuota>> {
+        self.retention_pool.clone()
     }
 
     pub(crate) fn resume_fragment_admission(&mut self) {
@@ -2425,12 +2446,6 @@ impl Muxer {
                 k += 1;
             }
         }
-    }
-
-    /// Replaces the retention pool, for tests that need a small one.
-    #[cfg(test)]
-    pub(crate) fn set_retention_pool(&mut self, pool: Arc<FragmentQuota>) {
-        self.retention_pool = Some(pool);
     }
 
     /// The retention pool, for checks that it empties.

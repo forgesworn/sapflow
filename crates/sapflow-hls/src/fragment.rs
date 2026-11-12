@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use sapflow_core::fragment::{FragmentLimit, FragmentPermit, FragmentQuota};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Which budget one allocation is charged to, shared by every alias of it:
 /// the live fragment budget, or a retention pool once the muxer keeps it
@@ -80,26 +80,6 @@ pub(crate) fn retain_charged(
     }
 }
 
-/// The retention pool of a live fragment budget: one per budget, shared by
-/// every muxer on it, so that what they keep is bounded together without
-/// the server handing a pool over. Keyed by the budget's allocation; a
-/// budget's entry goes once the budget does.
-pub(crate) fn retention_pool(live: &Arc<FragmentQuota>) -> Arc<FragmentQuota> {
-    type Pools = Vec<(Weak<FragmentQuota>, Arc<FragmentQuota>)>;
-    static POOLS: Mutex<Pools> = Mutex::new(Vec::new());
-    let mut pools = POOLS.lock().unwrap_or_else(PoisonError::into_inner);
-    pools.retain(|(budget, _)| budget.strong_count() > 0);
-    if let Some((_, pool)) = pools
-        .iter()
-        .find(|(budget, _)| std::ptr::eq(budget.as_ptr(), Arc::as_ptr(live)))
-    {
-        return pool.clone();
-    }
-    let pool = Arc::new(FragmentQuota::new(crate::muxer::RETENTION_POOL_BYTES));
-    pools.push((Arc::downgrade(live), pool.clone()));
-    pool
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,15 +135,6 @@ mod tests {
         assert_eq!(pool.used(), capacity, "an alias still holds it");
         drop(alias);
         assert_eq!((live.used(), pool.used()), (0, 0));
-    }
-
-    #[test]
-    fn one_live_budget_has_one_retention_pool() {
-        let live = Arc::new(FragmentQuota::new(1));
-        let other = Arc::new(FragmentQuota::new(1));
-        let pool = retention_pool(&live);
-        assert!(Arc::ptr_eq(&pool, &retention_pool(&live)));
-        assert!(!Arc::ptr_eq(&pool, &retention_pool(&other)));
     }
 
     #[test]
