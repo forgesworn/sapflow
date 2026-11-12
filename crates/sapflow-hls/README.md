@@ -28,14 +28,18 @@ live media server. MIT.
   rule holds in media time: `Muxer::part` keeps serving a part for three
   target durations of published media after the playlist stops listing it,
   up to 64 MiB and `muxer::MAX_RETAINED_PARTS` (4,096) parts beyond the
-  window; past either, or when the fragment budget refuses a new part, the
-  oldest go early and `Muxer::parts_released_early` counts them. A removed
+  window; past either, or when the retention pool is full, the oldest go
+  early and `Muxer::parts_released_early` counts them. A removed
   segment, with its init, stays fetchable through `Muxer::segment` until
   its Availability Duration (its own duration plus the longest playlist
   that listed it) has passed since it first appeared, as 6.2.2 asks,
   within the same 64 MiB, which counts a segment and its parts once, and
   `muxer::MAX_RETAINED_SEGMENTS` (1,024); `Muxer::segments_released_early`
-  counts any that go early.
+  counts any that go early. What is kept is charged to a retention pool
+  (`muxer::RETENTION_POOL_BYTES`, 128 MiB per fragment budget, shared by
+  its streams), not to the fragment budget, so it never refuses live
+  media. Past a stream's end it stays fetchable only while the server
+  keeps the presentation (`SAPFLOW_RECONNECT_GRACE`).
 - **Ingest.** `TsIngest` takes MPEG-TS (what SRT carries), `FlvIngest`
   takes FLV tag bodies (what RTMP carries), `EsIngest` takes H.264 access
   units and AAC frames or Opus packets directly.

@@ -822,15 +822,57 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   kind go early, parts leaving their segment and segments leaving later
   parts; over the byte cap the oldest segment and its parts go together,
   since freeing either alone frees no bytes. One byte cap rather than two:
-  a second would count the same bytes twice or allow 128 MiB. What is kept holds its fragment-budget charge. A part
-  encode the budget refuses first frees all of it and tries once more;
-  that returns only the bytes no viewer still holds, and a new codec
-  epoch's init is not retried. Another stream cannot reclaim it, so each
-  stream can hold up to 64 MiB more of the shared budget than before.
+  a second would count the same bytes twice or allow 128 MiB.
+
+  Kept media never takes room from live media, this stream's or another's
+  on the same fragment budget. When a segment leaves the window, the
+  charges of its parts' allocations, and of an old epoch's init once only
+  kept media uses it, move from the live budget to a retention pool: the
+  pool's permit is taken first, then the live one returned, so nothing is
+  ever uncharged. The live budget then holds exactly what it held before
+  retention, the window and the open segment (`the_live_budget_holds_what_main_held`
+  pins its use after every push against main in three scenarios), so no
+  live allocation can be refused because of retention, and there is no
+  release-and-retry to do on any allocation path, the epoch init
+  included. If the pool is full, the stream's own oldest kept media goes
+  first to make room, and whatever still does not fit goes too, counted,
+  never back onto the live budget. One pool serves each live budget,
+  found from the budget itself, so every stream on it shares the pool
+  without the server handing one over; a cleaner alternative, outside
+  this crate, is for the server or `sapflow-core` to create the pool beside
+  the budget. It holds `muxer::RETENTION_POOL_BYTES`, 128 MiB: the server's
+  defaults are 16 publishers on a 512 MiB budget, and each keeps about
+  8 MiB (three target durations of parts past the window plus a segment,
+  at 9 Mbit/s with a 2 s target). Memory is then bounded by the live
+  budget plus 128 MiB, and each stream by its 64 MiB cap within that. The
+  budget's maximum cannot be read from this crate, so the pool cannot be
+  sized from it. With no budget there is no pool, and only the per-stream
+  caps apply.
+
   `Muxer::parts_released_early()` and `Muxer::segments_released_early()`
   count what went early, and `playlist::RetentionCheck` holds a muxer to
   both rules given those counts; the `muxer_timing` and `opus_packaging`
-  fuzz targets run it after every push.
+  fuzz targets run it after every push, and `muxer_timing` drives two
+  muxers on one budget and checks that the budget and the pool both empty
+  once they and every alias have gone. `RetentionCheck` measures time with
+  the muxer's own published-media clock, so it is not independent of the
+  muxer; `part_retention_tests` also measures on the input timestamps.
+
+  The review's case (`kept_media_never_fences_another_stream_on_the_same_budget`):
+  two 600 kB/s streams at `segment_count` 7 on one 10 MB budget, A
+  starting 30 s after B. Before, retention held up to 7.83 MB of one
+  stream's budget against main's 4.70 MB (15.54 MB against 14.94 MB at
+  24), and A was refused at its frame 114 (the review saw frame 192 with
+  its own feed). Now both run, the budget peaks at 9.40 MB as on main, and
+  nothing goes early. A new epoch beside another stream's kept media
+  (`a_new_epoch_is_admitted_beside_another_stream_s_kept_media`, 9.5 MB)
+  was refused before and is admitted now.
+
+  After a stream ends, kept parts and segments stay fetchable only while
+  the server keeps the presentation: it answers 404 for everything once a
+  presentation closes, so the rules hold past the end only if
+  `SAPFLOW_RECONNECT_GRACE` (default 90 s) is at least the longest
+  Availability Duration, a segment's duration plus the longest playlist.
 
   Measured by `part_retention_tests` (target 2 s, so the part rule asks
   for 6 s): the shortest time a part was still served after its tag left,
@@ -839,9 +881,12 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
 
   | Case | Part, before | Part, now | Segment, before | Segment, now |
   |---|---|---|---|---|
-  | Steady A/V, `segment_count` 7 | 0.8 s | 6.0 s | -1.0 s | 0 |
-  | Steady A/V, `segment_count` 12 | 5.8 s | 6.0 s | -1.0 s | 0 |
-  | Steady A/V, `segment_count` 24 | 17.8 s | 17.8 s | -1.0 s | 0 |
+  | Steady A/V, 1.000 s segments, `segment_count` 7 | 0.8 s | 6.0 s | -1.0 s | 0 |
+  | Steady A/V, 1.000 s segments, `segment_count` 12 | 5.8 s | 6.0 s | -1.0 s | 0 |
+  | Steady A/V, 1.000 s segments, `segment_count` 24 | 17.8 s | 17.8 s | -1.0 s | 0 |
+  | Steady AAC, 1.0027 s segments, `segment_count` 7 | 1.0027 s | 6.016 s | -1.0027 s | 0 |
+  | Steady AAC, 1.0027 s segments, `segment_count` 12 | 6.016 s | 6.016 s | -1.0027 s | 0 |
+  | Steady AAC, 1.0027 s segments, `segment_count` 24 | 18.048 s | 18.048 s | -1.0027 s | 0 |
   | AAC, default 24, reconnect every 10 frames | 0.0 s | 6.19 s | -0.21 s | 0 |
   | AAC, default 24, reconnect every 20 frames | 4.05 s | 6.19 s | -0.43 s | 0 |
   | TS epochs, `segment_count` 8 | 0.2 s | 6.2 s | -2.6 s | 0 |
@@ -849,8 +894,11 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   | Opus audio-only, 60 ms, `segment_count` 7 | 1.02 s | 6.0 s | -1.02 s | 0 |
   | Opus video-led, 20 ms, `segment_count` 7 | 0.8 s | 6.0 s | -1.0 s | 0 |
 
-  The live-window review's own probe measured 1.0, 0.000, 4.05, 6.02 and
-  18.05 s for the first five parts. The `epochs` golden digest changed:
+  The live-window review's probe measured 1.0, 6.02 and 18.05 s on steady
+  AAC-only streams, whose 47-frame segments last 1.0027 s: the AAC rows.
+  The A/V rows use exact 1.000 s segments, and at `segment_count` 12 they
+  fell 0.2 s short where AAC did not. Its 0.000 and 4.05 s are the
+  reconnect rows. The `epochs` golden digest changed:
   after the fourth epoch the first epoch's parts 0 to 10 and its init are
   still served. Every playlist, segment, and part and init served before
   is unchanged, and the other 12 AAC and the 6 Opus digests are

@@ -19,11 +19,10 @@ Notes for the release after 0.2.0-rc.1.
 - A part stays fetchable through `Muxer::part` for three target durations
   of published media after the playlist stops listing it (RFC 8216bis
   6.2.2's part rule), up to 64 MiB and `muxer::MAX_RETAINED_PARTS` parts
-  beyond the window. Past either cap, or when the fragment budget refuses
-  a new part, the oldest go early; `Muxer::parts_released_early()` counts
-  them. Playlists and segments are unchanged; where segments leave a short
-  window, more parts and their codec epoch's init are served than in rc.1,
-  and each stream can hold up to 64 MiB more of the shared fragment budget.
+  beyond the window. Past either cap, or when the retention pool is full,
+  the oldest go early; `Muxer::parts_released_early()` counts them.
+  Playlists and segments are unchanged; where segments leave a short
+  window, more parts and their codec epoch's init are served than in rc.1.
   `playlist::RetentionCheck` checks the rule.
 - A segment that leaves the window stays fetchable through
   `Muxer::segment`, with its init, until its Availability Duration (its
@@ -33,5 +32,14 @@ Notes for the release after 0.2.0-rc.1.
   parts once, and is capped at `muxer::MAX_RETAINED_SEGMENTS` (1,024)
   segments; `Muxer::segments_released_early()` counts any that go early.
   `playlist::RetentionCheck` checks this rule too.
+- What a muxer keeps for these rules is charged to a retention pool of
+  `muxer::RETENTION_POOL_BYTES` (128 MiB), one per fragment budget and
+  shared by every stream on it, not to the fragment budget: the budget's
+  use is rc.1's, so retention never refuses live media. Memory is bounded
+  by the budget plus the pool.
+- After a stream ends, kept media stays fetchable only while the server
+  keeps the presentation: set `SAPFLOW_RECONNECT_GRACE` (default 90 s) to
+  at least a segment's duration plus the longest playlist for the rules to
+  hold past the end.
 - Opus audio beside AAC (#66), with timeline slew carried in audio-only
   Opus and the refusal order tested (#68). See `docs/whip-ingest.md`.
