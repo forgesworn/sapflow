@@ -309,7 +309,7 @@ pub async fn serve(listener: TcpListener, app: Arc<App>) -> std::io::Result<()> 
 }
 
 async fn serve_with(
-    listener: TcpListener,
+    listener: impl crate::accept::Accept,
     app: Arc<App>,
     timeouts: Timeouts,
 ) -> std::io::Result<()> {
@@ -318,7 +318,7 @@ async fn serve_with(
     }
     let slots = Arc::new(tokio::sync::Semaphore::new(CONNECTIONS));
     loop {
-        let (socket, peer) = listener.accept().await?;
+        let (socket, peer) = crate::accept::next(&listener, "control").await;
         if !peer.ip().is_loopback() {
             continue;
         }
