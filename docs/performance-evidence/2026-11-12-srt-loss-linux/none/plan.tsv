@@ -1,0 +1,21 @@
+trial_index	receiver	receiver_spec	loss	latency_ms	seed	encryption
+1	own	own=/work/sapflow-loss	none	2000	0	aes256, no key refresh
+2	libsrt	libsrt	none	2000	0	aes256, no key refresh
+3	own	own=/work/sapflow-loss	random:2	2000	1	aes256, no key refresh
+4	libsrt	libsrt	random:2	2000	1	aes256, no key refresh
+5	own	own=/work/sapflow-loss	random:2	2000	2	aes256, no key refresh
+6	libsrt	libsrt	random:2	2000	2	aes256, no key refresh
+7	own	own=/work/sapflow-loss	random:2	2000	3	aes256, no key refresh
+8	libsrt	libsrt	random:2	2000	3	aes256, no key refresh
+9	own	own=/work/sapflow-loss	random:5	2000	1	aes256, no key refresh
+10	libsrt	libsrt	random:5	2000	1	aes256, no key refresh
+11	own	own=/work/sapflow-loss	random:5	2000	2	aes256, no key refresh
+12	libsrt	libsrt	random:5	2000	2	aes256, no key refresh
+13	own	own=/work/sapflow-loss	random:5	2000	3	aes256, no key refresh
+14	libsrt	libsrt	random:5	2000	3	aes256, no key refresh
+15	own	own=/work/sapflow-loss	burst:5,8	2000	1	aes256, no key refresh
+16	libsrt	libsrt	burst:5,8	2000	1	aes256, no key refresh
+17	own	own=/work/sapflow-loss	burst:5,8	2000	2	aes256, no key refresh
+18	libsrt	libsrt	burst:5,8	2000	2	aes256, no key refresh
+19	own	own=/work/sapflow-loss	burst:5,8	2000	3	aes256, no key refresh
+20	libsrt	libsrt	burst:5,8	2000	3	aes256, no key refresh

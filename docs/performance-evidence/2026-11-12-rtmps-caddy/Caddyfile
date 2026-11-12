@@ -1,0 +1,24 @@
+{
+	admin off
+	auto_https disable_redirects
+	servers :443 {
+		listener_wrappers {
+			layer4 {
+				@rtmps tls sni ingest.test
+				route @rtmps {
+					tls
+					proxy {
+						proxy_protocol v2
+						upstream cap-srv:1936
+					}
+				}
+			}
+			tls
+		}
+	}
+}
+
+ingest.test {
+	tls /certs/cert.pem /certs/key.pem
+	respond "ok"
+}

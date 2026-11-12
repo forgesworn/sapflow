@@ -1800,6 +1800,81 @@ alone, a1 and a2 (1 heavy + 8 x 720p) had no drops at 384 MiB and 1 GiB.
   encoders take to get in once room appears: readiness was polled every
   0.5 s and the host was busy.
 
+## SRT under loss, jitter and reordering on Linux (2026-11-12)
+
+`scripts/srt-loss.sh` (see [docs/srt-loss-method.md](srt-loss-method.md))
+in a Linux container (arm64): sapflow at main f0eac0b as the receiver, at
+v4v's 2000 ms latency and with AES-256 as the reference deployment runs,
+against libsrt's `srt-live-transmit` 1.5.1 (Debian); the sender is libsrt
+in every trial. Loss is random 2% or 5%, or bursty 5% in bursts of 8
+packets (Gilbert-Elliott), both ways, 30 ms each way, three seeds. New
+here, `JITTER_MS` and `JITTER_ORDER`: every packet also delayed by 0 to
+20 ms, either letting packets overtake each other ("reordering") or
+keeping their order ("order kept"). Raw summaries, results and sapflow's
+close counters are in
+[`performance-evidence/2026-11-12-srt-loss-linux`](performance-evidence/2026-11-12-srt-loss-linux/).
+
+| Jitter | Loss | Retransmission overhead, sapflow | libsrt | Video delivered, sapflow |
+|--------|------|---:|---:|---:|
+| none | random 2% | 2.0% | 2.2% | 100% |
+| none | random 5% | 5.4% | 5.8% | 100% |
+| none | burst 5% | 5.5% | 6.2% | 100% |
+| reordering | random 2% | 66.0% | 69.4% | 99.8% |
+| reordering | random 5% | 67.2% | 71.3% | 100% |
+| reordering | burst 5% | 65.3% | 70.3% | 100% |
+| order kept | random 2% | 2.0% | 2.7% | 100% |
+| order kept | random 5% | 5.4% | 7.4% | 100% |
+| order kept | burst 5% | 5.4% | 7.1% | 100% |
+
+- **At 2000 ms nothing is lost.** Sapflow's recordings held every video and
+  audio packet except one trial of reordering at 2% (99.8%). It asks for
+  no more retransmissions than libsrt's receiver does, and in every cell
+  slightly fewer (overhead is counted at the proxy, so it is the same
+  yardstick for both).
+- **Reordering costs uplink, not quality.** Sapflow, like libsrt by
+  default, sends a NAK at the first sequence gap, so a packet that is only
+  late is resent: two thirds of all packets were sent twice, a 2.76 Mbit/s
+  stream needing about 4.6 Mbit/s of the encoder's uplink. Jitter that
+  keeps order costs nothing. The close log's new `reordered` counter tells
+  the two apart exactly: about 5,600 to 6,000 a trial under reordering,
+  matching `duplicates` and the retransmissions, and 0 in every other trial.
+  Whether venue links reorder like this is what that counter will show in
+  the field; this jitter (independent per packet, at about 4 ms between
+  packets) reorders far more than most links do.
+- **No slow start.** Every sapflow trial listed its first segment 2.7 to
+  2.8 s after the encoder started (`ready_ms`), under loss, jitter and
+  reordering alike: the 2 s latency plus the first segment.
+- **libsrt's delivery is not comparable here.** Its clean run failed the
+  harness's qualification on one decode message where its output starts,
+  so its delivered percentages read 0; its files held 895 of 900 video
+  packets in every condition. Its overhead column is unaffected.
+
+## RTMPS through Caddy layer4 with PROXY protocol v2 (2026-11-12)
+
+What terminating RTMPS in Caddy (v2.11.7 with `mholt/caddy-l4`, the build
+the reference deployment runs) and passing it to sapflow's PROXY v2 listener
+(`SAPFLOW_RTMP_PROXY_ADDR`) costs, against the same publishers on plain
+RTMP. Linux containers on one host: sapflow (main f0eac0b; 1 CPU, 1 GiB,
+`whole` HLS, no recording), Caddy at a fixed address that sapflow trusts,
+and N publishers of v4v's 720p clip (2.76 Mbit/s, FFmpeg n8.1.3), started
+0.5 s apart. CPU is each container's cgroup over 60 s, starting 20 s after
+every stream listed its first segment. The script, Caddyfile and results
+are in [`performance-evidence/2026-11-12-rtmps-caddy`](performance-evidence/2026-11-12-rtmps-caddy/).
+
+| Publishers | RTMP: sapflow CPU | RTMPS: sapflow CPU | RTMPS: Caddy CPU | Caddy per stream |
+|---:|---:|---:|---:|---:|
+| 1 | 0.6% | 0.2% | 0.3% | 0.34% |
+| 8 | 0.7% | 0.8% | 1.5% | 0.19% |
+| 16 | 3.0% | 1.8% | 3.5% | 0.22% |
+
+Every stream listed its first segment and was still listed at the end, in
+every run, and sapflow logged no PROXY refusal. TLS and the PROXY header cost
+Caddy about 0.2% of a core per stream at this bitrate, so 16 RTMPS
+publishers took Caddy 3.5% of one core. sapflow's own figures move with the
+host's load (1.9 to 30 across the runs) more than with the protocol, so read
+them as small, not as a difference between RTMP and RTMPS. Not shown: other
+bitrates, TLS handshake cost under reconnect storms, or a real network.
+
 ## Decision
 
 2026-10-20, the user: **keep experimenting.** Before any production

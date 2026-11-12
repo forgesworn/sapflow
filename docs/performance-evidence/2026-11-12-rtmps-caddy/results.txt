@@ -1,0 +1,6 @@
+n=1 mode=rtmp ready=1 listed_at_end=1 sapflow_cpu=0.6% caddy_cpu=0.0% per_stream sapflow=0.56% caddy=0.01% window=60s
+n=1 mode=rtmps ready=1 listed_at_end=1 sapflow_cpu=0.2% caddy_cpu=0.3% per_stream sapflow=0.19% caddy=0.34% window=60s
+n=8 mode=rtmp ready=8 listed_at_end=8 sapflow_cpu=0.7% caddy_cpu=0.0% per_stream sapflow=0.09% caddy=0.00% window=60s
+n=8 mode=rtmps ready=8 listed_at_end=8 sapflow_cpu=0.8% caddy_cpu=1.5% per_stream sapflow=0.10% caddy=0.19% window=60s
+n=16 mode=rtmp ready=16 listed_at_end=16 sapflow_cpu=3.0% caddy_cpu=0.0% per_stream sapflow=0.19% caddy=0.00% window=60s
+n=16 mode=rtmps ready=16 listed_at_end=16 sapflow_cpu=1.8% caddy_cpu=3.5% per_stream sapflow=0.11% caddy=0.22% window=60s
