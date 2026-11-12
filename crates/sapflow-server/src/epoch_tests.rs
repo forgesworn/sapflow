@@ -688,6 +688,52 @@ async fn a_refused_late_start_marks_the_next_recording() {
     );
 }
 
+/// A recording whose first part is refused as it starts after a push has no
+/// file and makes no callback: no free writer (both of the path's still
+/// finishing files, as when codec epochs come faster than a file is synced),
+/// or the byte budget full. The next file must say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recording_refused_its_first_part_marks_the_next_file() {
+    use crate::recorder::RecordingLimits;
+    let (_, _, half) = fixture_halves();
+    let frames = epochs_of(&[true, false]);
+    let cut = frames
+        .iter()
+        .position(|f| f.at() >= 1_000_000 + half)
+        .expect("a second epoch");
+    for limits in [
+        RecordingLimits::with_path_writers(1, 0),
+        RecordingLimits::with_path_bytes(1, 1),
+    ] {
+        let mut run = EpochRun::new(crate::roll_budget::RollLimit::default());
+        Arc::get_mut(&mut run.app)
+            .expect("sole fixture App")
+            .recording_limits = Arc::new(limits);
+        let mut publisher = run.begin();
+        run.feed(&mut publisher, &frames[..cut]).await;
+        assert!(
+            publisher
+                .stream
+                .session()
+                .recorder
+                .as_ref()
+                .expect("the first epoch's recorder")
+                .refused_start(),
+            "refused as it started, not late at the roll"
+        );
+        run.feed(&mut publisher, &frames[cut..]).await;
+        let session = publisher.stream.session();
+        let recorder = session
+            .recorder
+            .as_ref()
+            .expect("the second epoch's recorder");
+        assert_eq!(
+            recorder.status().reason(),
+            Some(crate::recorder::IncompleteReason::EpochUnrecorded)
+        );
+    }
+}
+
 /// A PES start in one TS packet: its stream id and PTS (90 kHz), from the
 /// MPEG-TS packet and PES header layouts.
 fn pes_start(p: &[u8]) -> Option<(u8, u64)> {

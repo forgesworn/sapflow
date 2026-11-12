@@ -72,6 +72,19 @@ impl RecordingLimits {
         )
     }
 
+    /// Default limits but `path_writers` for each path, for tests that need
+    /// a recording refused a writer.
+    #[cfg(test)]
+    pub(crate) fn with_path_writers(max_publishers: usize, path_writers: usize) -> Self {
+        let writers = max_publishers.saturating_mul(10).clamp(1, MAX_WRITERS);
+        Self::with_capacities(
+            GLOBAL_RETAINED_PART_BYTES,
+            RETAINED_PART_BYTES,
+            writers,
+            path_writers,
+        )
+    }
+
     fn with_capacities(
         bytes: usize,
         path_bytes: usize,
@@ -165,7 +178,8 @@ pub enum IncompleteReason {
     /// The recordings disk ran low.
     DiskLow,
     /// A codec epoch before this file was served but could not be recorded
-    /// (it began and ended inside one ingest batch).
+    /// (it began and ended inside one ingest batch, or its recording's first
+    /// part was refused a writer or byte budget).
     EpochUnrecorded,
     /// The encoder changed its codec configuration too often: codec epochs
     /// after this file, or before it, were served but not recorded
@@ -534,6 +548,13 @@ impl Recorder {
 
     pub fn last_part(&self) -> Option<u64> {
         self.last_part
+    }
+
+    /// Whether this recording stopped before it had a file: its first part
+    /// was refused (no free writer, or the byte budget full), so nothing of
+    /// its epoch is recorded and no callback will say so.
+    pub fn refused_start(&self) -> bool {
+        !self.started && self.status.is_fatal()
     }
 
     /// Whether another sealed part can attempt admission. An incomplete file
