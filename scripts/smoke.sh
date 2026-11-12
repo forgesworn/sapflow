@@ -318,11 +318,13 @@ echo "ok   SRT optional encryption: with and without the passphrase play; a wron
 # callback, then the recording once the grace is over.
 # A file decodes with no decoder error. The null muxer's own complaints
 # about the timestamps it is handed ("[null @ ...] ... non monotonically
-# increasing dts") are not the media's, so they do not count; anything else
-# at error level does.
+# increasing dts", which Ubuntu's ffmpeg 6.1 prints for WHIP's video), and
+# the "Last message repeated" lines after them, are not the media's, so they
+# do not count; anything else at error level does.
 decodes() {
   local errors
-  errors=$(ffmpeg -hide_banner -nostdin -v error -i "$1" -f null - 2>&1 | grep -v '^\[null @' || true)
+  errors=$(ffmpeg -hide_banner -nostdin -v error -i "$1" -f null - 2>&1 \
+    | grep -Ev '^\[null @|^ *Last message repeated' || true)
   [ -z "$errors" ] || { printf '%s\n' "$errors" | head -5 >&2; return 1; }
 }
 whip_smoke() {
