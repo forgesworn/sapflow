@@ -1705,23 +1705,29 @@ Implementation notes (W3d, 11 November 2026):
   a seed replay test and a fixed-seed mutation pass run with the unit
   tests. On the test host, built with `-s none` and
   `RUSTFLAGS="-Clink-arg=-undefined -Clink-arg=dynamic_lookup"`, it ran
-  7,474,458 times in 121 s from the seeds with no crash.
+  7,474,458 times in 121 s from the seeds with no crash. Every fuzz
+  target builds that way (38).
 - **End to end** (`scripts/whip-e2e.js --transport tcp|proxy`, headless
   Google Chrome 157 on the test host, loopback, ports 47400 to 47447). The
   answer advertised only a TCP candidate, so ICE-TCP was the only way in:
   - **Direct** (`tcp 127.0.0.1:47406`): the nominated pair was Chrome's
     active TCP candidate (peer-reflexive) to our passive one. Chrome opened
     5 connections, one per local candidate. hls.js played 10.1 s at
-    640x360 (207 frames decoded, none dropped). The recording decoded 248
-    H.264 frames at 640x360 and 630 stereo Opus frames, and was finished
+    640x360 (206 frames decoded, none dropped). The recording decoded 246
+    H.264 frames at 640x360 and 609 stereo Opus frames, and was finished
     complete; the session ended `Closed` with `lost=0`.
+  - **Longer than the timeouts** (`--seconds 60`, direct): the session ran
+    about 79 s (3,944 Opus frames recorded) and ended `Closed`, `lost=0`,
+    complete. All 5 connections stayed open until Chrome closed them: none
+    closed idle, so Chrome kept checking its spare pairs and they were
+    answered. hls.js stalled in that run on the SPS change below.
   - **Through a PROXY v2 relay** (`tcp 127.0.0.1:47427`): a test-only Node
     relay, written from the specification, prefixed each connection with a
     PROXY v2 header and forwarded it from `::1` to the listener on
     `[::1]:47426`, which trusted only `::1`. The browser's `POST` came from
     127.0.0.1, so it was not taken as the proxy's. The pair was again
-    active to passive TCP. 10.1 s played at 640x360 (206 decoded, 1
-    dropped); the recording decoded 235 H.264 frames at 640x360 and 590
+    active to passive TCP. 10.1 s played at 640x360 (205 decoded, none
+    dropped); the recording decoded 247 H.264 frames at 640x360 and 613
     Opus frames, complete, `lost=0`.
   - **Privacy** in both: the trace log held none of 54 literals: the
     token, the offer's addresses, ports and mDNS names, and the
@@ -1729,15 +1735,20 @@ Implementation notes (W3d, 11 November 2026):
     sapflow or from the relay; the run fails without them, since the
     offer's active candidates say port 9). The check first caught a
     planted token.
-  - **UDP** still passes after the change: 10.1 s at 640x360, 206 frames
-    decoded, none dropped; recording 236 H.264 and 590 Opus frames.
-  - **Runs that failed.** With the test host's load average at up to 331
-    from other jobs, Chrome changed its SPS mid-stream to 480x270 in 2 of 4
-    direct runs, 2 of 3 relay runs and 1 of 3 UDP runs. `sapflow-hls` keeps
-    the first SPS (its warning says so), and hls.js decoded 4 frames and
-    stalled. The recordings still decoded (249 to 252 frames at 480x270)
-    and were complete. This does not depend on the transport, and belongs
-    to `sapflow-hls`.
+  - **UDP** still passes after the change: 10.0 s at 640x360, 205 frames
+    decoded, none dropped; recording 243 H.264 and 609 Opus frames.
+
+  These figures are from the final build; earlier builds of the branch
+  gave the same results.
+  - **Runs that failed.** Chrome changed its SPS mid-stream to 480x270 in
+    3 of 6 direct runs, 2 of 4 relay runs and 1 of 4 UDP runs, mostly
+    while the test host's load average was up to 331 from other jobs, once
+    at about 8. `sapflow-hls` keeps the first SPS (its warning says so),
+    and hls.js decoded 4 frames and stalled. The recordings still decoded
+    (249 to 584 frames at 480x270) and were complete. It happened over UDP
+    too, so it is not the transport's, and it belongs to `sapflow-hls`;
+    whether TCP makes Chrome lower its resolution more often is not
+    settled by so few runs.
   - **Loopback artefact.** Over UDP on loopback, about 200 sends a run fail
     with `Can't assign requested address`: Chrome's checks from its
     non-loopback host candidates reach the socket bound to 127.0.0.1,
@@ -1754,7 +1765,7 @@ Implementation notes (W3d, 11 November 2026):
 | LOCAL is closed and no frame on it read | `whip::tcp_tests::a_local_header_is_closed_without_reading_frames`, `whip_tcp_front::tests::local_is_refused_once_its_header_is_in` | Met |
 | A partial header closes at the header timeout (5 s) | `whip::tcp_tests::a_partial_header_times_out` (at 300 ms) | Met |
 | Past the connection cap (128) a connection is closed at accept, and a slot frees when one closes | `whip::tcp_tests::past_the_connection_cap_a_connection_is_closed` (at 2) | Met |
-| Past the per-address cap (32), keyed on the PROXY header's source, a connection is closed; another address is not | `whip::tcp_tests::past_the_per_address_cap_a_connection_is_closed` (at 1) | Met |
+| Past the per-address cap (32), keyed on the PROXY header's source, a connection is closed; another address is not. A direct connection is keyed on its TCP peer by the same code, untested | `whip::tcp_tests::past_the_per_address_cap_a_connection_is_closed` (at 1) | Met |
 | A connection never answered closes at 10 s, whatever it sends; one answered then left quiet, at 30 s | `whip::tcp_tests::unanswered_and_idle_connections_close` (at 300 ms each) | Met |
 | A frame over 1500 bytes ends the connection | `whip::tcp_tests::a_frame_over_the_cap_ends_the_connection`, `whip_tcp_front::tests::a_frame_over_the_cap_ends_the_connection` | Met |
 | A connection's send queue is bounded in frames (256) and bytes (256 KiB); past either, and for a connection that has gone or a packet over 1500 bytes, the packet is dropped and counted | `whip_tcp::tests::the_send_queue_is_bounded_in_bytes_and_frames` (at 4 frames, 3006 bytes) | Met. That the owner never waits on a connection follows from `try_send`; no test stalls a reader to show it |
@@ -1764,8 +1775,8 @@ Implementation notes (W3d, 11 November 2026):
 | A3.6 over ICE-TCP: the trace log holds no token, offer address, port or mDNS name, or the publisher's real TCP ends | the same runs | Met for those runs (54 literals each) |
 
 Not claimed, because nothing tests them: the 5 s write timeout, the retry
-after a failed accept, and that the inbound queue's back-pressure stays
-with the slow reader.
+after a failed accept, the per-address cap on a direct connection, and
+that the inbound queue's back-pressure stays with the slow reader.
 
 - **Left after W3d.**
   - A0.3: a run against a public address on 443 with UDP blocked, for each
