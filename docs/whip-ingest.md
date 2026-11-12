@@ -1067,7 +1067,15 @@ applies to all three:
   clocks it stays at the burst
   (`stretched_timestamps_cannot_refill_the_budget_faster_than_real_time`).
   A full budget just follows both clocks, so its first refill comes a
-  whole period after its first charged roll. The settle time is media
+  whole period after its first charged roll. Neither clock keeps more than
+  one period of lead over the other: otherwise wall time banked while a
+  publisher's timestamps ran slow would come back at media speed (an hour
+  at half speed then gave 30 files in 10 s in the review), or media time
+  banked before an outage would refill during it. So in any window of
+  either clock a stream starts at most the burst, one file per refill
+  period and one more (the property test checks every window), and an
+  outage regains at most one roll
+  (`wall_time_banked_while_media_is_slow_cannot_be_cashed_in`). The settle time is media
   time. The budget is kept across a reconnect with the stream and starts
   full with a new presentation; a burst of 0 turns it off. A burst of 8 covers Chrome's start-up ramp (up
   to five steps in W0), a couple of rotations and one network switch with

@@ -15,8 +15,11 @@
 //! A roll is regained only when a refill period has passed in both media
 //! time (the muxer's published edge) and wall time: media time alone comes
 //! from the sender's timestamps, which a publisher can space out faster than
-//! real time, and wall time alone would refill during an outage. The settle
-//! time is media time: it only decides when a roll the clocks allow is used.
+//! real time, and wall time alone would refill during an outage. Neither
+//! clock keeps more than one period of lead, so a lead banked on one cannot
+//! be spent later at the other's speed: in any window of either clock, at
+//! most the burst, one roll per period and one more. The settle time is
+//! media time: it only decides when a roll the clocks allow is used.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,6 +167,17 @@ impl RollBudget {
         } else {
             self.counted_media += self.limit.refill * gained;
             self.counted_wall += self.limit.refill * gained;
+            // The clock that is ahead keeps at most one period of its lead:
+            // wall time banked while media ran slow (or media banked in an
+            // outage) must not come back at the other clock's speed. So in
+            // any window of either clock, at most the burst, one roll per
+            // period and one more.
+            self.counted_media = self
+                .counted_media
+                .max(media.saturating_sub(self.limit.refill));
+            self.counted_wall = self
+                .counted_wall
+                .max(wall.saturating_sub(self.limit.refill));
         }
     }
 
@@ -314,6 +328,41 @@ mod tests {
         assert!(b.may_resume(s(3600)), "both clocks a period on");
     }
 
+    /// A publisher whose timestamps ran at half speed for an hour, rolling
+    /// at every chance, then spaced its frames wide: the wall time it banked
+    /// while its media was slow must not come back at media speed.
+    #[test]
+    fn wall_time_banked_while_media_is_slow_cannot_be_cashed_in() {
+        let limit = RollLimit::default();
+        let clock = WallClock::manual();
+        let mut b = RollBudget::with_clock(limit, clock.clone());
+        let mut files = 0;
+        let mut step = |b: &mut RollBudget, media: Duration, wall: Duration| {
+            clock.set(wall);
+            if b.is_out() {
+                if b.may_resume(media) {
+                    b.resume();
+                    return 1;
+                }
+                return 0;
+            }
+            u32::from(b.epoch(media, true) == Roll::Record)
+        };
+        // An hour of wall time, media at half speed, a change every second.
+        for t in 0..3600u64 {
+            files += step(&mut b, Duration::from_millis(t * 500), s(t));
+        }
+        assert!(files <= 8 + 30 + 1, "{files} files in the slow hour");
+        // Then ten seconds of wall time in which media races ahead.
+        let mut cashed = 0;
+        for k in 0..100u64 {
+            let wall = s(3600) + Duration::from_millis(k * 100);
+            let media = s(1800) + s(60 * k);
+            cashed += step(&mut b, media, wall);
+        }
+        assert!(cashed <= 1, "{cashed} files in 10 s of wall time");
+    }
+
     #[test]
     fn a_burst_of_zero_turns_the_budget_off() {
         let mut b = Paced::new(RollLimit {
@@ -388,6 +437,8 @@ mod tests {
                 (m, w)
             };
             let mut files = 1u64; // the stream's first file
+            // Each file started, at (media, wall).
+            let mut started: Vec<(Duration, Duration)> = Vec::new();
             for _ in 0..(next() % 400) {
                 let (m, w) = step(&mut next);
                 media += m;
@@ -399,7 +450,10 @@ mod tests {
                 // Now and then a roll from a recording that never started.
                 let charged = next() % 5 != 0;
                 match b.epoch(media, charged) {
-                    Roll::Record if charged => files += 1,
+                    Roll::Record if charged => {
+                        files += 1;
+                        started.push((media, wall));
+                    }
                     Roll::Record => {}
                     Roll::RanOut | Roll::Skip => {
                         assert!(limit.burst > 0 && !had, "case {case}: a roll was available");
@@ -413,6 +467,27 @@ mod tests {
                     if b.may_resume(media) {
                         b.resume();
                         files += 1;
+                        started.push((media, wall));
+                    }
+                }
+            }
+            // In any window, of wall time or of media time, no more files
+            // than the burst, one per refill period of that window, and one
+            // more: neither clock can bank a lead and spend it later.
+            if limit.burst > 0 {
+                let refill = limit.refill.as_nanos();
+                for i in 0..started.len() {
+                    for j in i..started.len() {
+                        let n = (j - i + 1) as u128;
+                        let wall_w = (started[j].1 - started[i].1).as_nanos();
+                        let media_w = started[j].0.saturating_sub(started[i].0).as_nanos();
+                        let bound = |w: u128| u128::from(limit.burst) + w / refill + 1;
+                        assert!(
+                            n <= bound(wall_w) && n <= bound(media_w),
+                            "case {case}: {n} files in a window of {wall_w} ns wall, \
+                             {media_w} ns media, burst {}, refill {refill} ns",
+                            limit.burst
+                        );
                     }
                 }
             }
