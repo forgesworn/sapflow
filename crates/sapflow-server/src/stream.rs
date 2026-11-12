@@ -14,6 +14,7 @@ use sapflow_hls::{
 };
 
 use crate::recorder::{IncompleteReason, Recorder, RecorderFactory};
+use crate::roll_budget::{Roll, RollBudget, RollLimit};
 use tokio::sync::watch;
 
 pub struct LiveStream {
@@ -212,6 +213,11 @@ pub struct Session {
     /// epoch's id, while audio stamped before the cut may still arrive and
     /// be dropped ([`LiveStream::roll_recording`]). Finished after.
     outgoing: Option<(u64, Recorder)>,
+    /// How often the recording may still roll to a new file at a codec
+    /// epoch ([`LiveStream::roll_recording`]). Kept across reconnects, like
+    /// the recording; set from the configuration when the stream is claimed
+    /// fresh.
+    pub rolls: RollBudget,
     pub recorder_factory: Option<RecorderFactory>,
     outage_deadline: Option<Instant>,
     /// The generation whose transport reported an orderly, lossless close.
@@ -352,6 +358,10 @@ impl LiveStream {
                 fresh_part_floor: 0,
                 recorder: None,
                 outgoing: None,
+                rolls: RollBudget::new(RollLimit {
+                    burst: 0,
+                    ..RollLimit::default()
+                }),
                 recorder_factory: None,
                 outage_deadline: None,
                 clean_close: None,
@@ -603,10 +613,14 @@ impl LiveStream {
     ///   window closes: at the latest two seconds of video after the cut,
     ///   or at the next cut or the end of the connection.
     pub fn roll_recording(&self, session: &mut Session, restarted: bool) -> bool {
-        let (lost, open) = {
+        let (lost, open, now) = {
             let mut st = self.lock();
             st.ingest.muxer_mut().map_or_else(Default::default, |m| {
-                (m.take_late_audio_loss(), m.late_audio_epoch())
+                (
+                    m.take_late_audio_loss(),
+                    m.late_audio_epoch(),
+                    m.published_media(),
+                )
             })
         };
         if let Some((epoch, held)) = &session.outgoing
@@ -623,8 +637,14 @@ impl LiveStream {
             session.outgoing = None;
         }
         if !restarted {
+            self.resume_recording(session, now);
             return false;
         }
+        let roll = if session.recorder_factory.is_some() {
+            session.rolls.epoch(now)
+        } else {
+            Roll::Record
+        };
         let mut outgoing = session.recorder.take();
         let unrecorded = outgoing
             .as_mut()
@@ -637,16 +657,63 @@ impl LiveStream {
         {
             recorder.mark_incomplete(IncompleteReason::MediaLoss);
         }
-        session.recorder = session
-            .recorder_factory
-            .as_ref()
-            .map(RecorderFactory::start);
+        session.recorder = match roll {
+            Roll::Record => session
+                .recorder_factory
+                .as_ref()
+                .map(RecorderFactory::start),
+            Roll::RanOut => {
+                // The file that ran out: epochs after it are not recorded.
+                if let Some(recorder) = &outgoing {
+                    recorder.mark_incomplete(IncompleteReason::EpochRate);
+                }
+                tracing::warn!(
+                    path = %self.path.as_path(),
+                    "the encoder changes its codec configuration too often: codec epochs are served but not recorded until one lasts {} s",
+                    session.rolls.settle().as_secs()
+                );
+                None
+            }
+            Roll::Skip => None,
+        };
         if let (Some(recorder), Some(epoch)) = (outgoing, epoch)
             && open == Some(epoch)
         {
             session.outgoing = Some((epoch, recorder));
         }
         unrecorded
+    }
+
+    /// While the recording's budget is spent: once the current epoch has
+    /// lasted the settle time and a roll is back, start its file from the
+    /// epoch's first retained part, marked `epoch-rate` (codec epochs
+    /// before it were served but not recorded). A file must begin with an
+    /// independent part, so leading parts that are not are skipped, and
+    /// with none yet the resume waits.
+    fn resume_recording(&self, session: &mut Session, now: Duration) {
+        if session.recorder.is_some() || !session.rolls.may_resume(now) {
+            return;
+        }
+        let Some(factory) = session.recorder_factory.as_ref() else {
+            return;
+        };
+        let Some((tracks, parts)) = self.parts_after(None) else {
+            return;
+        };
+        let Some(first) = parts.iter().position(|part| part.independent) else {
+            return;
+        };
+        session.rolls.resume();
+        let mut recorder = factory.start();
+        recorder.mark_incomplete(IncompleteReason::EpochRate);
+        let skipped = session.rolls.skipped();
+        recorder.feed(tracks, parts.into_iter().skip(first).collect());
+        tracing::info!(
+            path = %self.path.as_path(),
+            skipped,
+            "recording resumes after codec changes that came too often"
+        );
+        session.recorder = Some(recorder);
     }
 
     /// The codec epoch of the parts `recorder` has had, if any.
@@ -1360,6 +1427,7 @@ mod grace_tests {
             fresh_part_floor: 0,
             recorder: None,
             outgoing: None,
+            rolls: RollBudget::new(RollLimit::default()),
             recorder_factory: None,
             outage_deadline: None,
             clean_close: None,

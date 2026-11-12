@@ -96,6 +96,18 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow
 
+- A stream's recording no longer rolls to a new file at every codec epoch
+  without bound. Each stream has a budget of rolls
+  (`SAPFLOW_RECORDING_ROLL_BURST`, default 8; 0 turns it off), regaining
+  one per `SAPFLOW_RECORDING_ROLL_REFILL` seconds of media (default 60).
+  Past it, epochs are still served but not recorded; recording resumes in
+  the first epoch that lasts `SAPFLOW_RECORDING_ROLL_SETTLE` seconds
+  (default 10) with a roll back, from that epoch's first retained part.
+  The file that ran out and the resumed one are marked with the new reason
+  `epoch-rate`. An encoder that changes its parameter sets at every
+  keyframe used to make a file and a `recordSegmentComplete` callback a
+  second, half of v4v's callback limit for every stage. sapflow-hls adds
+  `Muxer::published_media`, the published media time the budget counts.
 - The RTMP listener and the scoped control API no longer stop on a failed
   accept (out of file descriptors, or a connection reset before it was
   taken): they log it and try again after 100 ms, as WHIP's listeners do.

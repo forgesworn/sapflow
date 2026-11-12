@@ -1033,6 +1033,34 @@ applies to all three:
     640x360, then 480x270 at once, then 640x360.
   - The log line gives the ended epoch's parts after the change sealed them
     (`previous_parts`); zero means it was never served.
+- How often the recording rolls is bounded; how often HLS starts an epoch
+  is not, since a decoder needs every new init. Each stream has a budget of
+  rolls (`SAPFLOW_RECORDING_ROLL_BURST`, default 8), regaining one per
+  `SAPFLOW_RECORDING_ROLL_REFILL` of media (default 60 s), so an encoder
+  that changes its parameter sets at every keyframe cannot make a file and
+  a `recordSegmentComplete` a second (v4v takes 120 callbacks a minute from
+  one address, for every stage together). An epoch change with no roll
+  left finishes the current file as usual, marked `epoch-rate`, and starts
+  none: the epochs after it are served but not recorded. Recording resumes
+  in the first epoch that lasts `SAPFLOW_RECORDING_ROLL_SETTLE` (default
+  10 s) with a roll back, from that epoch's first retained part (the first
+  independent one, if the earliest have gone), and that file is marked
+  `epoch-rate` too. The budget counts media time, is kept across a
+  reconnect with the stream and starts full with a new presentation; a
+  burst of 0 turns it off. A burst of 8 covers Chrome's start-up ramp (up
+  to five steps in W0), a couple of rotations and one network switch with
+  every file recorded. An encoder that changes configuration every few
+  seconds for the rest of a show is recorded only up to the burst and from
+  the next epoch that settles; its viewers see every epoch, as before.
+  Tests: `an_epoch_storm_rolls_the_recording_within_its_budget` (300
+  epochs in ten minutes give 10 files and 10 callbacks),
+  `a_start_up_resolution_ramp_stays_inside_the_burst`,
+  `recording_resumes_from_the_first_part_of_a_settled_epoch`,
+  `the_roll_budget_survives_a_reconnect_and_resets_with_a_new_presentation`,
+  `a_burst_of_zero_rolls_at_every_epoch`, the property test in
+  `roll_budget.rs`, and `scripts/whip-e2e.js --resize-loop` (Chrome
+  toggling its resolution every 5 s for a minute: 13 epochs served, 10
+  files, two marked `epoch-rate`).
 
 Before this, the first init stayed while frames of the new size were
 written under it, so players failed to decode them (hls.js stalled after a

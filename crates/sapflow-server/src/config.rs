@@ -64,6 +64,15 @@ lower case with dashes overrides it (SAPFLOW_HTTP_ADDR = --http-addr).
   SAPFLOW_RECORD_DELETE_AFTER  delete recordings older than this (default 7d)
   SAPFLOW_RECORD_MIN_FREE_GB   do not record below this much free disk
                                (default 2; 0 turns the check off)
+  SAPFLOW_RECORDING_ROLL_BURST  new recording files a stream may start at
+                           codec changes before it must wait (default 8,
+                           0 to 1000; 0 turns the limit off). Past it, codec
+                           epochs are still served but not recorded, and the
+                           files on either side are marked epoch-rate
+  SAPFLOW_RECORDING_ROLL_REFILL  seconds of media per file regained (default
+                           60, 1 to 3600)
+  SAPFLOW_RECORDING_ROLL_SETTLE  seconds a codec epoch must last before
+                           recording resumes in it (default 10, 0 to 3600)
   SAPFLOW_MAX_PUBLISHERS   simultaneous publishers per protocol (default 16)
   SAPFLOW_MAX_PRESENTATIONS resident HLS presentations, including reconnect hold
                            and removed streams with owners (default 4x publishers;
@@ -142,6 +151,9 @@ const KEYS: &[&str] = &[
     "SAPFLOW_MAX_RETAINED_BYTES",
     "SAPFLOW_MAX_PUBLISH_MBPS",
     "SAPFLOW_RECORD_MIN_FREE_GB",
+    "SAPFLOW_RECORDING_ROLL_BURST",
+    "SAPFLOW_RECORDING_ROLL_REFILL",
+    "SAPFLOW_RECORDING_ROLL_SETTLE",
     "SAPFLOW_SRT_IMPL",
     "SAPFLOW_SRT_PASSPHRASE",
     "SAPFLOW_SRT_CIPHER",
@@ -396,6 +408,9 @@ pub struct Config {
     pub max_publish_bps: u64,
     /// Bytes of free disk below which recording does not start or stops.
     pub record_min_free: u64,
+    /// How often a stream's recording may roll to a new file at a codec
+    /// epoch (`SAPFLOW_RECORDING_ROLL_*`).
+    pub recording_roll: crate::roll_budget::RollLimit,
     pub reconnect_grace: Duration,
     pub health_interval: Duration,
     /// WHIP ingest; `None` binds nothing.
@@ -645,6 +660,25 @@ impl Config {
             }
         };
         let reconnect_grace = seconds("SAPFLOW_RECONNECT_GRACE", 90)?;
+        let recording_roll = crate::roll_budget::RollLimit {
+            burst: match vals.get("SAPFLOW_RECORDING_ROLL_BURST") {
+                None => 8,
+                Some(v) => v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n <= 1000)
+                    .ok_or_else(|| {
+                        ConfigError::Invalid("SAPFLOW_RECORDING_ROLL_BURST: 0 to 1000".into())
+                    })?,
+            },
+            refill: seconds("SAPFLOW_RECORDING_ROLL_REFILL", 60)?,
+            settle: seconds("SAPFLOW_RECORDING_ROLL_SETTLE", 10)?,
+        };
+        if recording_roll.refill.is_zero() {
+            return Err(ConfigError::Invalid(
+                "SAPFLOW_RECORDING_ROLL_REFILL: seconds, 1 to 3600".into(),
+            ));
+        }
         let health_interval = seconds("SAPFLOW_HEALTH_INTERVAL", 30)?;
         let http_body_timeout = seconds("SAPFLOW_HTTP_BODY_TIMEOUT", 120)?;
         if http_body_timeout.is_zero() {
@@ -773,6 +807,7 @@ impl Config {
             srt_crypto,
             srt_allow_plaintext,
             record_min_free,
+            recording_roll,
             max_publish_bps,
             rtmp_addr,
             recordings: vals.get("SAPFLOW_RECORDINGS").map(PathBuf::from),
@@ -1228,6 +1263,50 @@ mod tests {
         )
         .expect("flag override");
         assert_eq!(config.max_retained_bytes, 64);
+    }
+
+    #[test]
+    fn the_recording_roll_budget_has_defaults_a_switch_and_bounds() {
+        let open = ("SAPFLOW_OPEN_PUBLISH", "1");
+        assert_eq!(
+            load(&[open], &[]).expect("default").recording_roll,
+            crate::roll_budget::RollLimit::default()
+        );
+        let set = load(
+            &[
+                open,
+                ("SAPFLOW_RECORDING_ROLL_BURST", "0"),
+                ("SAPFLOW_RECORDING_ROLL_REFILL", "1"),
+                ("SAPFLOW_RECORDING_ROLL_SETTLE", "0"),
+            ],
+            &["--recording-roll-burst", "3"],
+        )
+        .expect("set")
+        .recording_roll;
+        assert_eq!(
+            set,
+            crate::roll_budget::RollLimit {
+                burst: 3,
+                refill: Duration::from_secs(1),
+                settle: Duration::ZERO,
+            }
+        );
+        for (key, value) in [
+            ("SAPFLOW_RECORDING_ROLL_BURST", "1001"),
+            ("SAPFLOW_RECORDING_ROLL_BURST", "-1"),
+            ("SAPFLOW_RECORDING_ROLL_REFILL", "0"),
+            ("SAPFLOW_RECORDING_ROLL_REFILL", "3601"),
+            ("SAPFLOW_RECORDING_ROLL_SETTLE", "3601"),
+            ("SAPFLOW_RECORDING_ROLL_SETTLE", "x"),
+        ] {
+            assert!(
+                matches!(
+                    load(&[open, (key, value)], &[]),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "{key}={value}"
+            );
+        }
     }
 
     #[test]
