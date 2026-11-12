@@ -964,7 +964,10 @@ Firefox. The cause is still unknown, so pre-skip stays 0.
   at most 1.5 s (proposed), 4 MiB of media or half the event queue. After
   that, or if the reports disagree with arrival times by more than 500 ms,
   the streams are aligned by arrival time. `sapflow-rtp` says which, and why,
-  in an `Aligned` event before the first frame.
+  in an `Aligned` event before the first frame, which the server logs at
+  debug (`WHIP timeline aligned`). Chrome 157's first sender reports come
+  about 3.5 s after it connects, so it is always aligned by arrival time
+  (A3.8, [status](#qualification-status-12-november-2026)).
 - After start, timestamps advance by RTP deltas, strictly increasing, and
   stay within 500 ms (`max_lead`) of arrival time either way, plus 0.1% of
   elapsed time up to another 500 ms. A little above that bound a timestamp is
@@ -2281,6 +2284,18 @@ that the inbound queue's back-pressure stays with the slow reader.
   writing. A review by the author, or by an agent of the same session, does
   not count.
 
+### Qualification status (12 November 2026)
+
+Evidence: [whip-qualification-2026-11-12.md](whip-evidence/whip-qualification-2026-11-12.md),
+on the test host (Apple M4, macOS 26.6.2), headless Chrome 157 and
+FFmpeg 8.1.
+
+| Claim | Test | Status |
+|---|---|---|
+| A3.8: a browser's audio is within 40 ms early and 60 ms late of its video, in HLS | `scripts/whip-sync.js`: a canvas flash and a WebAudio click in the page (Chrome's file capture stalled after a few frames), 10 runs over UDP and 10 over ICE-TCP; FFmpeg 8.1 as the reference, 10 runs | **Not met.** Chrome 157: 17 of 20 runs within; audio -2.4 to -49.3 ms (early), the three failures at -43.2, -41.6 and -49.3 ms. Every Chrome run was aligned by arrival time, since its first sender reports came after the 1.5 s start hold, and the offset stays where the start put it. With the hold at 6 s (an uncommitted build) every run was aligned by sender reports, and five of five were within (-2.3 to +15.7 ms). FFmpeg, aligned by its reports at once: 0 to 1.5 ms. The cause is the start hold; see Open decisions |
+| A3.9: `scripts/smoke.sh` covers WHIP alongside SRT and RTMP | `scripts/smoke.sh` (`whip_smoke`): FFmpeg's WHIP muxer publishes; 401 for a missing and a wrong token, the token not logged; LL-HLS with H.264 and Opus decodes; publish callback; `DELETE` ends the session, unpublish callback, the recording decodes. CI installs a pinned static FFmpeg 8.1.3 for it (`SMOKE_WHIP_FFMPEG`) | Met locally (whole smoke passed, about 15 s added). CI has not run it yet |
+| A4.2: CPU and memory per WHIP publisher no higher than SRT's | `scripts/whip-cost.py` (benchmarks.md section B, SRT, RTMP and WHIP) | Not yet measured to method: the test host stayed above the load gate |
+
 ### W5: documentation
 
 The README's "When to choose mediamtx instead", [comparison.md](comparison.md)
@@ -2299,3 +2314,4 @@ they describe what ships.
 | Opus to AAC inside sapflow | Decided no (10 November 2026). Revisit if WHIP is used without a downstream converter |
 | ICE restart via `PATCH` | Physical results in A4.3 |
 | Defaults for `SAPFLOW_WHIP_STALE` and `SAPFLOW_WHIP_OPUS_MAX_BITRATE` | A3.3, A0.7 and A4.3 |
+| A3.8: a longer start hold for WHIP (about 4 s; Chrome's reports came by 3.5 s), a correction to the first agreeing reports after an arrival start, or accepting the arrival offset in writing | The owner, from the A3.8 evidence |
