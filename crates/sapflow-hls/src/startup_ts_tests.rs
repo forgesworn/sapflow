@@ -127,11 +127,12 @@ fn generated_av_preserves_the_first_idr_and_entire_known_duration_prefix() {
             assert!(held, "fixture must exercise IDR-before-AAC ordering");
         }
         assert!(!ts.finish(NOW).expect("normal terminal policy").media_loss);
-        // Keep the existing two-tail policy: the unbounded final video PES
-        // and the muxer's unknown-duration pending AU are still excluded.
+        // The unbounded final video PES is still excluded. The muxer's held
+        // AU is not: the terminal interrupt writes it, with the duration of
+        // the frame before it.
         assert_eq!(
             video_samples(&ts).as_slice(),
-            &expected[..expected.len() - 2],
+            &expected[..expected.len() - 1],
             "chunk={chunk}"
         );
         assert_eq!(ts.dropped_packets(), 0);
@@ -385,11 +386,12 @@ fn recovery_matches_the_generated_suffix(damaged: &[u8]) {
         let actual = video_samples(&ts);
         assert!(!actual.is_empty(), "useful media recovers");
         // Compare bytes and order with the SAME generated input, including
-        // every known-duration AU after the next clean IDR. The deliberate
-        // two-tail exclusions and truncated-PES refusal remain unchanged.
+        // every AU after the next clean IDR. The unbounded final PES and
+        // the truncated-PES refusal stay excluded; the held AU is written
+        // by the terminal interrupt.
         assert_eq!(
             actual.as_slice(),
-            &expected[recovery..expected.len() - 2],
+            &expected[recovery..expected.len() - 1],
             "chunk={chunk}"
         );
         assert!(ts.dropped_packets() > 0);

@@ -308,14 +308,20 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
         ("elementary-aac-44k1", elementary_audio_only([0x12, 0x10])),
         ("headers", headers()),
     ];
+    // Changed where an interrupt ends a video-led run, and only there: the
+    // terminal interrupt of `finish` (testsrc-3s, transport-loss-6s and
+    // testsrc-3s-quota) and each reconnect of `epochs` now write the held
+    // video frame, with the frame before it's duration or until the end of
+    // the audio received, and the held AAC frame, where they were dropped.
+    // Audio-only runs, and runs never interrupted, are byte-identical.
     let expected = [
         (
             "testsrc-3s",
-            "7f06f5617b35055643bb84dda80ba3c7ff75f8d3369c96a23472e33624ebf86a",
+            "01e66b558f2eecdb6d17d21e7d6d899b5494b4786cea151620f98ed96e16ada7",
         ),
         (
             "transport-loss-6s",
-            "c09b4200453587011b1565b288f281150b032f9cdcaf2a9ac5ab27d285b23de4",
+            "d1373ac5ecc214bd18d4181f03d1d2cf74769c78b6ef631691fe0709c4b55ae1",
         ),
         (
             "audio-48k-mono",
@@ -335,7 +341,7 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
         ),
         (
             "testsrc-3s-quota",
-            "7f06f5617b35055643bb84dda80ba3c7ff75f8d3369c96a23472e33624ebf86a",
+            "01e66b558f2eecdb6d17d21e7d6d899b5494b4786cea151620f98ed96e16ada7",
         ),
         (
             "audio-48k-mono-quota",
@@ -349,7 +355,7 @@ fn aac_output_is_byte_identical_to_0_2_0_rc_1() {
         // caller, does not give.
         (
             "epochs",
-            "96bd3461c6d65e769cec2aaa991366e11013497bcccdb1e7fc78dee15a09df75",
+            "7a8acae1bd6413f2b9bc0e2533c13ccee2ee85e1b6e164d69d5d1cd920ab7aa9",
         ),
         (
             "audio-only-reconfigure",

@@ -461,6 +461,9 @@ fn real_opus_output_is_byte_identical_to_4ab0c12() {
         assert!(unwindowed(&m), "{name}: nothing removed");
         actual.push((format!("video-led-{name}"), golden(&m, &collected)));
     }
+    // The video-led digests changed with the interrupt flush: the final
+    // interrupt now writes the held video frame and the held Opus packet,
+    // where it dropped them. The audio-only ones are byte-identical.
     let expected = [
         (
             "audio-only-20ms-stereo",
@@ -468,7 +471,7 @@ fn real_opus_output_is_byte_identical_to_4ab0c12() {
         ),
         (
             "video-led-20ms-stereo",
-            "25171e9dda3855310cdcb0062640294338ce7c237543141b6d1408dc38f0dfa1",
+            "16f9feb1230b73df7c96a7f32bf81ced04990b0da2f201903239fb5fa12a54b4",
         ),
         (
             "audio-only-60ms-mono",
@@ -476,7 +479,7 @@ fn real_opus_output_is_byte_identical_to_4ab0c12() {
         ),
         (
             "video-led-60ms-mono",
-            "ba05e8a5827b9df18d60c9811b20791a47057517b5acffa993fb2f192db182ff",
+            "7d6024ffd2efa9d0df6c8830a1454be27459f8b4b655236f35f64dab2b17bfe9",
         ),
         (
             "audio-only-120ms-stereo",
@@ -484,7 +487,7 @@ fn real_opus_output_is_byte_identical_to_4ab0c12() {
         ),
         (
             "video-led-120ms-stereo",
-            "7e9d5bfe27cdcec495ad5648d9ec9f3df880ac6c306676e6894377c4451c2bb2",
+            "188fd2bbb20a84c82f4a87a7ab1d405ac3e1ceca3c3692e3dc3cd3a4c51a3333",
         ),
     ];
     let actual: Vec<(&str, &str)> = actual

@@ -274,6 +274,15 @@ fn write_part(s: &mut String, prefix: &str, id: u64, d: Duration, independent: b
 ///   entries or more, the muxer's entry cap, or the caller says the muxer's
 ///   byte cap cut it ([`RuleCheck::check_with_byte_cap`],
 ///   [`crate::Muxer::window_byte_capped`]);
+/// - a segment whose parts are listed lasts, by its `EXTINF`, as long as
+///   they do together (4.4.4.9: a part's duration is that of its media),
+///   within two units of the fifth decimal a part for tick rounding. The
+///   one exception: after a part cut to exactly `PART-TARGET` (a frame
+///   longer than the part's room, clamped), the next part's decode time
+///   carries the true time, and the segment may last as long as that. A
+///   render cannot tell a hole a run's end should not have kept from one a
+///   continuous run published before a break dropped the keyframe it
+///   expected, so tests of cuts check that from the muxer;
 /// - an `EXT-X-DISCONTINUITY` sits before a segment's parts, never among
 ///   them, and every media sequence number keeps one discontinuity
 ///   sequence number from render to render.
@@ -403,8 +412,22 @@ impl RuleCheck {
                 dseq += 1;
             } else if let Some(rest) = l.strip_prefix("#EXTINF:") {
                 parts(&run, false)?;
-                run.clear();
                 let d = fixed5(rest.trim_end_matches(','))?;
+                // Each part's duration is a whole number of 90 kHz ticks (an
+                // audio-only part's rounded up), up to 1.2 units from its
+                // span, and each printed is rounded by up to half a unit.
+                let sum: u64 = run.iter().map(|&(p, _)| p).sum();
+                if !run.is_empty() && sum.abs_diff(d) > 2 * run.len() as u64 {
+                    // Only the decode-time hole after a part cut to
+                    // PART-TARGET (a clamped stall).
+                    let clamped = d > sum && run.iter().any(|&(p, _)| p == part_target);
+                    if !clamped {
+                        return Err(format!(
+                            "segment {msn} lasts {d}, but its parts sum to {sum}"
+                        ));
+                    }
+                }
+                run.clear();
                 listed += d;
                 entries += 1;
                 // Rounded to the nearest second, halves up.
@@ -475,7 +498,10 @@ pub fn multivariant(m: &Muxer) -> String {
 /// from what it lists, so this check is not independent of how the muxer
 /// measures time; a test should also measure on its input timestamps, as
 /// `part_retention_tests` does. A segment first appears at the end of its
-/// own `EXTINF`; a playlist's duration is its `EXTINF` total. Call
+/// own `EXTINF`; a playlist's duration is its `EXTINF` total. It can step
+/// back, when a run ends with its media after a part clamped to the part
+/// target: the open parts' spans counted the hole, and the segment's
+/// `EXTINF` does not. Call
 /// [`RetentionCheck::check`] after every push, so that no entry joins and
 /// leaves the window between calls.
 ///
@@ -483,7 +509,8 @@ pub fn multivariant(m: &Muxer) -> String {
 /// ([`Muxer::with_retention_pool`]); without one, media leaves with the
 /// window and this check fails wherever the window is short.
 ///
-/// A part whose tag a render stops listing must be served by
+/// A part whose tag a render stops listing must not be listed again, and
+/// must be served by
 /// [`Muxer::part`] until the published media is three target durations
 /// further on, and a segment that has left the window must be served by
 /// [`Muxer::segment`] until its Availability Duration has passed, unless
@@ -532,7 +559,11 @@ impl RetentionCheck {
             .open_parts()
             .iter()
             .fold(Duration::ZERO, |sum, part| sum.saturating_add(part.span));
-        self.published = self.published.max(self.closed.saturating_add(open));
+        // The muxer's own clock, exactly: it steps back when a run ends
+        // with its media after a clamped part, whose span (with the hole)
+        // the open parts had counted. Retention then runs longer in real
+        // time, never shorter, and the muxer's stamps are on this clock.
+        self.published = self.closed.saturating_add(open);
         let early = (m.parts_released_early(), m.segments_released_early());
         let (parts_excused, segments_excused) = (
             early.0 != self.released_early.0,
@@ -552,6 +583,11 @@ impl RetentionCheck {
         for &id in &listed {
             if !matches!(m.part(id), crate::PartLookup::Found(_)) {
                 return Err(format!("part {id} listed but not served"));
+            }
+            // RFC 8216bis 6.2.1 lets a server remove a part tag, never add it
+            // back; its retention runs from the first removal.
+            if self.removed.contains_key(&id) {
+                return Err(format!("part {id} listed again after its tag left"));
             }
         }
         for &id in self.listed.difference(&listed) {
@@ -798,7 +834,7 @@ mod tests {
         // that is not (held to Apple's stricter rule).
         let render = |first: bool, second: bool| {
             format!(
-                "{}{}{}#EXTINF:1.0,\ns\n",
+                "{}{}{}#EXTINF:0.32,\ns\n",
                 head(0),
                 part("0.12000", first),
                 part("0.20000", second)
@@ -882,9 +918,9 @@ mod tests {
             head(3, 10, 0),
             part("0.20000"),
             part("0.03300"),
-            seg("3.49000"),
+            seg("0.23300"),
             part("0.19890"),
-            seg("1.0"),
+            seg("0.19890"),
             part("0.01000"),
         );
         let mut c = RuleCheck::without_live_window();
@@ -895,7 +931,7 @@ mod tests {
             "{}#EXT-X-DISCONTINUITY\n{}{}",
             head(3, 11, 0),
             part("0.2"),
-            seg("1.0")
+            seg("0.2")
         );
         assert_eq!(c.check(&rolled), Ok(()));
         // Once it leaves, the sequence must have counted it.
@@ -925,6 +961,9 @@ mod tests {
                 part("0.2"),
                 seg("1")
             ),
+            // Parts that do not add up to their segment.
+            format!("{}{}{}", head(3, 0, 0), part("0.2"), seg("0.25")),
+            format!("{}{}{}", head(3, 0, 0), part("0.2"), seg("0.15")),
             "#EXTM3U\n".to_string(),
         ] {
             assert!(
@@ -932,6 +971,31 @@ mod tests {
                 "{bad}"
             );
         }
+        // Rounded to the nearest second, halves up: 3.49 s is within 3.
+        assert_eq!(
+            RuleCheck::without_live_window().check(&format!("{}{}", head(3, 0, 0), seg("3.49000"))),
+            Ok(())
+        );
+        // Within a continuous run, the decode-time hole after a part cut to
+        // PART-TARGET (a clamped stall) stays in its segment.
+        let stall = format!(
+            "{}{}{}{}",
+            head(3, 0, 0),
+            part("0.23400"),
+            seg("0.5"),
+            part("0.2")
+        );
+        assert_eq!(RuleCheck::without_live_window().check(&stall), Ok(()));
+        // So is one before a discontinuity.
+        let inside = format!(
+            "{}{}{}{}#EXT-X-DISCONTINUITY\n{}",
+            head(3, 0, 0),
+            part("0.23400"),
+            part("0.1"),
+            seg("0.5"),
+            part("0.2")
+        );
+        assert_eq!(RuleCheck::without_live_window().check(&inside), Ok(()));
         assert_eq!(
             fresh.check(&format!("{}{}", head(3, 0, 0), seg("1"))),
             Ok(())

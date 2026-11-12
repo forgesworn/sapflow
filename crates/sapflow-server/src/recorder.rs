@@ -15,7 +15,7 @@ use sapflow_core::recording::{is_recording_name, recording_file, scoped_recordin
 use sapflow_core::{RecordingTracks, StreamEvent, StreamPath};
 #[cfg(test)]
 use sapflow_hls::fmp4::init_segment_for_tracks;
-use sapflow_hls::fmp4::{FileTimeBase, MAX_FILE_FRAGMENT_BYTES, rebase_part_for_file};
+use sapflow_hls::fmp4::{FileTimeBase, MAX_FILE_FRAGMENT_BYTES, rebase_part_for_file_timed};
 use sapflow_hls::muxer::Part;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -327,7 +327,7 @@ struct RetainedPart {
 struct WritingPart {
     // Drop the rebased copy, then the original, then its byte reservation.
     output: bytes::Bytes,
-    retained: RetainedPart,
+    _retained: RetainedPart,
 }
 
 enum Msg {
@@ -693,14 +693,20 @@ async fn write_part(
     audio_rate: Option<u32>,
     origin: &mut Option<FileTimeBase>,
 ) -> std::io::Result<Duration> {
-    let output = rebase_part_for_file(&retained.part.data, audio_rate, origin).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid recording part")
-    })?;
-    let part = WritingPart { output, retained };
+    let (output, end) = rebase_part_for_file_timed(&retained.part.data, audio_rate, origin)
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid recording part")
+        })?;
+    let part = WritingPart {
+        output,
+        _retained: retained,
+    };
     file.write_all(&part.output).await?;
-    let span = part.retained.part.span;
     drop(part);
-    Ok(span)
+    // Where its media ends in the file, from its own timestamps: a run
+    // that ended with its media may leave its last part's span (set when
+    // the part was sealed and already shared) past that.
+    Ok(end)
 }
 
 struct WriteReceipt {
@@ -933,7 +939,7 @@ impl RecordingWriter {
                     break;
                 }
                 match write_part(file, p, tracks.audio_rate(), &mut origin).await {
-                    Ok(span) => duration = duration.saturating_add(span),
+                    Ok(end) => duration = duration.max(end),
                     Err(_) => {
                         failed = true;
                         rx.close();
@@ -1073,6 +1079,7 @@ pub async fn expire(dir: &Path, max_age: Duration, now: SystemTime) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sapflow_hls::fmp4::rebase_part_for_file;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     #[derive(Default)]

@@ -49,6 +49,50 @@ Notes for the release after 0.2.0-rc.1.
   hold past the end.
 - Opus audio beside AAC (#66), with timeline slew carried in audio-only
   Opus and the refusal order tested (#68). See `docs/whip-ingest.md`.
+- An interrupt no longer drops what the muxer holds. At a codec epoch
+  change, a reconnect or the end of a stream, the held video frame and the
+  held audio frame are written into the run, and audio at or past that
+  frame's time is kept: the video frame lasts as long as the frame before
+  it, or until the end of the audio received, and audio past a full part
+  goes in one short final part. What cannot fit is dropped and reported as
+  `media_loss`, where rc.1 dropped it silently. New and additive:
+  `Muxer::reconfigure_with_audio_at` ends a run at the next keyframe on a
+  clock that carries on, without moving output time; `EsIngest` uses it for
+  a mid-stream parameter-set change. A run after a cut opens its first part
+  at its keyframe, so its program date is that keyframe's arrival.
+  Video-led output changes at every interrupt, including the end of each
+  stream; audio-only output and output with no interrupt are unchanged.
+  The fragment budget's use moves with it at an interrupt, where more
+  media is now kept. A cut on a continuing clock ends the old segment with
+  its media, so `EXTINF` is the sum of its parts and a video pause before
+  the new keyframe falls at the discontinuity. `RuleCheck` and
+  `scripts/check-playlist.py` now check that sum, and allow a longer
+  segment only when one of its parts is exactly `PART-TARGET` (a clamped
+  stall, whose hole the next part's time carries). Audio stamped before
+  the new keyframe that has to be dropped belongs to the old epoch: it is
+  not in the new run's `media_loss` but counted by the new
+  `Muxer::take_late_audio_loss`, and `Muxer::late_audio_epoch` says while
+  it may still come. A library caller that records should drain
+  `take_late_audio_loss()` after every push and interrupt and mark the
+  recording of each epoch it names, and should hold the outgoing
+  recording open, not finish it, while `late_audio_epoch()` names that
+  recording's epoch; sapflow's server does both, and marks the old file,
+  not the next one, `media-loss`. `Muxer::late_audio_dropped` counts the
+  frames, and WHIP's session-end loss counts include them
+  (`late_audio=`). A break or interrupt right after a frame clamped to
+  `PART-TARGET` (a stall) now ends the segment with its media and resumes
+  the next run there, for SRT and RTMP as for WHIP, where `EXTINF` used to
+  include the stall's hole before the discontinuity. A recording's length
+  (`segmentDuration` and the file's header) now comes from its parts' own
+  timestamps (`fmp4::rebase_part_for_file_timed`), not their spans, which
+  over-reported a file by a clamped stall's hole at such a break. Parts
+  are held one part target past their three target durations after their
+  tag leaves, since one call can seal more media after the muxer stamps
+  the removal (an interrupt's short final part of audio). The first
+  segment whose part tags the playlist lists never goes back, so a part
+  tag once removed is never listed again (RFC 8216bis 6.2.1), even where
+  the edge steps back at such a run end; `RetentionCheck` now fails on a
+  tag listed again.
 
 ## sapflow
 
