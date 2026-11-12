@@ -184,7 +184,10 @@ fn downgrade_sentinel_is_recognised() {
 }
 
 /// A2.3: a certificate that does not match the offer's fingerprint is
-/// refused with `bad_certificate`, before the certificate is parsed.
+/// refused, before the certificate is parsed, and never accepted. At epoch 0
+/// anyone who can spoof the address could have sent it, so it is discarded
+/// without an alert, the handshake waits for a certificate that matches, and
+/// with none it times out.
 #[test]
 fn fingerprint_mismatch_is_refused() {
     let wrong = Fingerprint::from_bytes([0xab; 32]);
@@ -195,15 +198,30 @@ fn fingerprint_mismatch_is_refused() {
     for d in &p.drain() {
         back.extend(p.client.handle(d).expect("client"));
     }
-    assert_eq!(p.feed(&back), Err(Error::FingerprintMismatch));
-    assert_eq!(plain_alert(&p.drain()), [2, alert::BAD_CERTIFICATE]);
-    assert_eq!(p.server.state(), State::Failed(Error::FingerprintMismatch));
+    assert_eq!(p.feed(&back), Ok(()));
+    assert!(p.drain().is_empty(), "no alert");
+    assert_eq!(p.server.state(), State::Handshaking);
+    assert_eq!(p.server.refused(), Some(Error::FingerprintMismatch));
     assert_eq!(p.server.peer_fingerprint(), None);
-    assert_eq!(p.server.stats().verifications, 0);
+    let s = p.server.stats();
+    assert_eq!((s.key_agreements, s.verifications), (0, 0));
     assert!(p.server.poll_event().is_none());
-    // Silence afterwards, whatever arrives.
-    p.feed(&back).expect("ignored");
-    assert!(p.drain().is_empty());
+    // Its retransmission is refused again, and the handshake times out.
+    p.feed(&back).expect("retransmission");
+    while let Some(t) = p.server.poll_timeout() {
+        if let Err(e) = p.server.handle_timeout(t) {
+            assert_eq!(e, Error::Timeout);
+            break;
+        }
+    }
+    assert_eq!(p.server.state(), State::Failed(Error::Timeout));
+    assert_eq!(
+        p.server.refused(),
+        Some(Error::FingerprintMismatch),
+        "why it timed out"
+    );
+    assert_eq!(p.server.peer_fingerprint(), None);
+    assert!(p.server.poll_event().is_none());
 }
 
 /// RFC 8122 allows several fingerprints in an offer: any one of up to four
@@ -223,35 +241,25 @@ fn any_of_the_expected_fingerprints_matches() {
     let wrong = [other(1), other(2), other(3), other(4)];
     p.server =
         Server::new_seeded(Config::default(), testing::identity(1), &wrong, SEED).expect("server");
-    assert_eq!(p.run(), Err(Error::FingerprintMismatch));
+    assert_eq!(p.run(), Ok(()), "refused without an alert");
+    assert_eq!(p.server.refused(), Some(Error::FingerprintMismatch));
+    assert!(!p.client.connected());
+    assert_eq!(p.server.state(), State::Handshaking);
+    assert_eq!(p.server.peer_fingerprint(), None);
 
     for bad in [&[][..], &[other(1); 5][..]] {
         assert!(Server::new(Config::default(), testing::identity(1), bad).is_err());
     }
 }
 
+/// Faults the handshake cannot recover from: a signature that fails the one
+/// verification, and a wrong Finished under the read keys. Each ends it with
+/// its alert.
 #[test]
 fn client_flight_faults_are_refused() {
     use alert::*;
     for (fault, err, desc) in [
         (Fault::WrongSigningKey, Error::BadSignature, DECRYPT_ERROR),
-        (Fault::VerifyScheme, Error::VerifyScheme, ILLEGAL_PARAMETER),
-        (
-            Fault::NoCertificate,
-            Error::NoCertificate,
-            HANDSHAKE_FAILURE,
-        ),
-        (
-            Fault::CompressedPoint,
-            Error::BadKeyShare,
-            ILLEGAL_PARAMETER,
-        ),
-        (Fault::OffCurvePoint, Error::BadKeyShare, ILLEGAL_PARAMETER),
-        (
-            Fault::CoordinateAboveP,
-            Error::BadKeyShare,
-            ILLEGAL_PARAMETER,
-        ),
         (Fault::BadFinished, Error::BadFinished, DECRYPT_ERROR),
     ] {
         let mut p = pair(Options {
@@ -261,8 +269,35 @@ fn client_flight_faults_are_refused() {
         assert_eq!(p.run(), Err(err), "{fault:?}");
         assert_eq!(plain_alert(&p.drain()), [FATAL, desc], "{fault:?}");
         assert!(p.server.poll_event().is_none());
-        if err == Error::BadKeyShare {
-            assert_eq!(p.server.stats().key_agreements, 0, "{fault:?}: no ECDH");
+    }
+}
+
+/// Faults in an unauthenticated message, found before any ECDH or
+/// verification: a forger could have sent the message, so it is refused
+/// without an alert and without moving the handshake on. A client that
+/// really sent it gets no further, and its handshake times out.
+#[test]
+fn unauthenticated_flight_faults_are_refused_silently() {
+    for (fault, err) in [
+        (Fault::VerifyScheme, Error::VerifyScheme),
+        (Fault::NoCertificate, Error::NoCertificate),
+        (Fault::CompressedPoint, Error::BadKeyShare),
+        (Fault::OffCurvePoint, Error::BadKeyShare),
+        (Fault::CoordinateAboveP, Error::BadKeyShare),
+    ] {
+        let mut p = pair(Options {
+            fault,
+            ..Options::default()
+        });
+        assert_eq!(p.run(), Ok(()), "{fault:?}");
+        assert!(p.drain().is_empty(), "{fault:?}: no alert");
+        assert_eq!(p.server.state(), State::Handshaking, "{fault:?}");
+        assert_eq!(p.server.refused(), Some(err), "{fault:?}");
+        assert!(p.server.poll_event().is_none(), "{fault:?}");
+        let s = p.server.stats();
+        assert_eq!(s.verifications, 0, "{fault:?}: no verification");
+        if fault != Fault::VerifyScheme {
+            assert_eq!(s.key_agreements, 0, "{fault:?}: no ECDH");
         }
     }
 }
@@ -295,14 +330,28 @@ fn rsa_client_certificate_is_unsupported() {
     assert_eq!(p.server.stats().verifications, 0);
 }
 
+/// A hello outside the profile is unauthenticated, so it is refused without
+/// an alert or any work, and the server keeps waiting for one it can answer.
 #[test]
-fn hello_refusal_sends_the_alert() {
+fn an_unacceptable_hello_is_refused_silently() {
     let mut p = pair(Options {
         mki: vec![1],
         ..Options::default()
     });
-    assert_eq!(p.run(), Err(Error::SrtpMki));
-    assert_eq!(plain_alert(&p.drain()), [2, alert::HANDSHAKE_FAILURE]);
+    assert_eq!(p.run(), Ok(()));
+    assert!(p.drain().is_empty(), "no alert");
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    assert_eq!(p.server.refused(), Some(Error::SrtpMki));
+    assert_eq!(p.server.stats().signatures, 0);
+    // A hello that fits is then answered.
+    let mut c = Client::new(Options::default(), testing::identity(2), 3);
+    p.feed(&c.start()).expect("hello");
+    assert_eq!(p.server.state(), State::Handshaking);
+    assert_eq!(
+        p.server.refused(),
+        None,
+        "cleared when the handshake moves on"
+    );
 }
 
 /// A2.2: each capture gets a correct first flight: ServerHello with the
@@ -559,7 +608,7 @@ fn alert_record(level: u8, description: u8, rseq: u64) -> Vec<u8> {
 /// An unauthenticated fragment that declares more than `max_message_len`
 /// is dropped before anything is allocated, and counted; it sends no
 /// alert, and the real hello still works. The cap is unchanged; only the
-/// outcome is (see `authenticated_input_over_a_bound_stays_fatal`).
+/// outcome is (see `authenticated_inadmissible_input_stays_fatal`).
 #[test]
 fn oversized_hello_is_dropped_unallocated() {
     let mut p = pair(Options::default());
@@ -628,21 +677,29 @@ fn a_forged_first_fragment_does_not_block_the_hello() {
 #[test]
 fn buffered_bytes_are_capped() {
     let mut p = pair(Options::default());
-    // Messages 0 to 2 at 6000 declared bytes each: 18000 > 16384, so the
-    // third, unauthenticated, is dropped and nothing is allocated for it.
-    p.feed(&[fragment_record(1, 0, 6000, 0, &[1], 0)])
-        .expect("first");
-    p.feed(&[fragment_record(1, 1, 6000, 0, &[1], 1)])
-        .expect("second");
-    assert_eq!(p.server.buffered(), 12000);
-    assert_eq!(p.feed(&[fragment_record(1, 2, 6000, 0, &[1], 2)]), Ok(()));
-    assert_eq!(p.server.buffered(), 12000);
-    assert_eq!(p.server.stats().records_dropped, 1);
+    // Unauthenticated hello candidates of about 6000 declared bytes each: a
+    // third would take the buffer past 16384, so it replaces the oldest (the
+    // one replacement allowed now), and a fourth, with none allowed, is
+    // dropped with nothing allocated for it.
+    for (i, length) in [6000u32, 6001].into_iter().enumerate() {
+        let d = fragment_record(1, 0, length, 0, &[1], i as u64);
+        p.feed(&[d]).expect("candidate");
+    }
+    assert_eq!(p.server.buffered(), 12001);
+    p.feed(&[fragment_record(1, 0, 6002, 0, &[1], 2)])
+        .expect("third");
+    assert_eq!(p.server.buffered(), 12003, "it replaced the oldest");
+    let dropped = p.server.stats().records_dropped;
+    p.feed(&[fragment_record(1, 0, 6003, 0, &[1], 3)])
+        .expect("fourth");
+    assert_eq!(p.server.buffered(), 12003, "nothing allocated for it");
+    assert_eq!(p.server.stats().records_dropped, dropped + 1);
     assert!(p.drain().is_empty());
     // The real hello fits beside the two and is answered.
     let hello = p.client.start();
     p.feed(&hello).expect("real hello");
     assert_eq!(p.server.state(), State::Handshaking);
+    assert_eq!(p.server.buffered(), 0, "the candidates went with it");
 }
 
 #[test]
@@ -682,20 +739,39 @@ fn malformed_records_are_dropped_silently() {
     assert_eq!(p.server.state(), State::Handshaking);
 }
 
+/// Only a ClientHello can start the handshake, so any other first message is
+/// dropped before anything is kept for it, and sends no alert.
 #[test]
-fn unexpected_first_message_is_refused() {
+fn unexpected_first_message_is_dropped() {
     let mut p = pair(Options::default());
     let d = fragment_record(message::CERTIFICATE, 0, 3, 0, &[0, 0, 0], 0);
-    assert_eq!(p.feed(&[d]), Err(Error::UnexpectedMessage));
-    assert_eq!(plain_alert(&p.drain()), [2, alert::UNEXPECTED_MESSAGE]);
+    assert_eq!(p.feed(&[d]), Ok(()));
+    assert!(p.drain().is_empty(), "no alert");
+    assert_eq!(p.server.buffered(), 0);
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    let hello = p.client.start();
+    p.feed(&hello).expect("real hello");
+    assert_eq!(p.server.state(), State::Handshaking);
 }
 
+/// A garbage hello is refused without an alert: one shorter than any
+/// ClientHello before anything is kept for it, and a longer one once it has
+/// failed to parse. Neither stops the real hello.
 #[test]
-fn garbage_hello_is_a_decode_error() {
+fn garbage_hellos_are_refused_silently() {
     let mut p = pair(Options::default());
-    let d = fragment_record(1, 0, 5, 0, &[0xfe, 0xfd, 1, 2, 3], 0);
-    assert_eq!(p.feed(&[d]), Err(Error::Decode));
-    assert_eq!(plain_alert(&p.drain()), [2, alert::DECODE_ERROR]);
+    let short = fragment_record(1, 0, 5, 0, &[0xfe, 0xfd, 1, 2, 3], 0);
+    assert_eq!(p.feed(&[short]), Ok(()));
+    assert_eq!(p.server.buffered(), 0);
+    let junk = fragment_record(1, 0, 60, 0, &[0xfe; 60], 1);
+    assert_eq!(p.feed(&[junk]), Ok(()));
+    assert!(p.drain().is_empty(), "no alert");
+    assert_eq!(p.server.buffered(), 0, "the refused hello went");
+    assert_eq!(p.server.refused(), Some(Error::Decode));
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    let hello = p.client.start();
+    p.feed(&hello).expect("real hello");
+    assert_eq!(p.server.state(), State::Handshaking);
 }
 
 #[test]
@@ -767,25 +843,38 @@ fn no_change_cipher_spec_means_no_finished() {
     assert!(p.server.stats().records_dropped >= 1);
 }
 
+/// A4.4 review, round 3: a Finished is valid only under the read keys, so an
+/// epoch 0 one is dropped before anything is kept for it, wherever it falls:
+/// queued before the genuine CertificateVerify, between CertificateVerify
+/// and ChangeCipherSpec, or after ChangeCipherSpec. Before, each was
+/// released in turn and ended the handshake with `UnexpectedMessage`.
 #[test]
-fn finished_at_epoch_0_is_unexpected() {
-    let mut p = pair(Options::default());
-    let recs = flight5(&mut p);
-    let mut epoch0: Vec<Vec<u8>> = recs
-        .iter()
-        .filter(|r| r[0] == record::HANDSHAKE && r[3..5] == [0, 0])
-        .cloned()
-        .collect();
-    let fin_seq = p.client.finished_seq();
-    epoch0.push(fragment_record(
-        message::FINISHED,
-        fin_seq,
-        12,
-        0,
-        &[0; 12],
-        40,
-    ));
-    assert_eq!(p.feed(&epoch0), Err(Error::UnexpectedMessage));
+fn an_epoch_0_finished_is_never_released() {
+    // How many of the genuine flight's records come before the forgery.
+    for before in [
+        "queued early",
+        "after CertificateVerify",
+        "after ChangeCipherSpec",
+    ] {
+        let mut p = pair(Options::default());
+        let recs = flight5(&mut p);
+        let ccs = recs
+            .iter()
+            .position(|r| r[0] == record::CHANGE_CIPHER_SPEC)
+            .expect("ccs");
+        let at = match before {
+            "queued early" => 0,
+            "after CertificateVerify" => ccs,
+            _ => ccs + 1,
+        };
+        p.feed(&recs[..at]).expect("genuine records");
+        let fin = p.client.finished_seq();
+        let forged = fragment_record(message::FINISHED, fin, 12, 0, &[0; 12], 60);
+        assert_eq!(p.feed(&[forged]), Ok(()), "{before}");
+        assert_eq!(p.server.state(), State::Handshaking, "{before}");
+        assert!(p.drain().is_empty(), "{before}: no alert");
+        completes(&mut p, &recs[at..]);
+    }
 }
 
 fn connected_pair() -> Pair {
@@ -995,30 +1084,109 @@ fn an_oversized_forged_fragment_does_not_end_the_handshake() {
     completes(&mut p, &recs);
 }
 
-/// Forged candidates leave room for the genuine flight, and one more that
-/// would take the buffer past `max_buffered` is dropped and counted.
-/// Before, it ended the handshake with `Limit::Buffered`.
+/// Fires the retransmission timer once its time has come, discarding the
+/// resent flight (the test client has already answered it).
+fn advance_past_the_timer(p: &mut Pair) {
+    let at = p.server.poll_timeout().expect("a timer");
+    p.now = p.now.max(at);
+    p.server.handle_timeout(p.now).expect("resend");
+    assert!(!p.drain().is_empty(), "flight 4 resent");
+}
+
+/// What a reclamation test needs at the end: one signature, one ECDH and one
+/// verification, as for any handshake.
+fn crypto_once(p: &Pair) {
+    let s = p.server.stats();
+    assert_eq!((s.signatures, s.key_agreements, s.verifications), (1, 1, 1));
+}
+
+/// A4.4 review, round 3: a burst of forged candidates for the expected
+/// Certificate, declaring nearly 8192 bytes each, fills the 16 KiB buffer
+/// (a third uses up any replacement allowed now). The genuine flight is
+/// kept out at first, but the candidates are reclaimed once a
+/// retransmission interval has passed, and the client's retransmission
+/// completes the handshake. Before, they held the buffer until the
+/// deadline.
 #[test]
-fn an_over_budget_forged_fragment_does_not_end_the_handshake() {
+fn a_buffer_filled_at_the_expected_seq_is_reclaimed() {
     let mut p = pair(Options::default());
     let recs = flight5(&mut p);
-    p.feed(&[fragment_record(message::CERTIFICATE, 4, 8192, 0, &[1], 60)])
-        .expect("seq 4");
-    p.feed(&[fragment_record(message::CERTIFICATE, 3, 6000, 0, &[1], 61)])
-        .expect("seq 3");
-    assert_eq!(p.server.buffered(), 14192);
-    let dropped = p.server.stats().records_dropped;
-    let d = fragment_record(message::CERTIFICATE, 2, 8192, 0, &[1], 62);
-    assert_eq!(p.feed(&[d]), Ok(()), "over the budget");
-    assert_eq!(p.server.buffered(), 14192, "nothing allocated for it");
-    assert_eq!(p.server.stats().records_dropped, dropped + 1);
-    assert_eq!(p.server.state(), State::Handshaking);
-    assert!(p.drain().is_empty(), "no alert");
+    for (i, length) in [8192u32, 8191, 8190].into_iter().enumerate() {
+        let d = fragment_record(message::CERTIFICATE, 1, length, 0, &[1], 60 + i as u64);
+        assert_eq!(p.feed(&[d]), Ok(()));
+        assert!(p.server.buffered() <= 16384);
+    }
+    assert!(p.server.buffered() > 16384 - 2048, "the buffer is full");
+    p.feed(&recs).expect("genuine flight");
+    assert_eq!(p.server.state(), State::Handshaking, "kept out at first");
+    assert!(p.server.poll_event().is_none());
+    assert!(p.drain().is_empty());
+    // The attacker stops; the client retransmits after our timer fires.
+    advance_past_the_timer(&mut p);
+    completes(&mut p, &recs);
+    crypto_once(&p);
+}
+
+/// The same with the four candidate slots for the expected Certificate held
+/// by small forged candidates of other lengths (a fifth uses up any
+/// replacement allowed now), so the genuine one would be a fifth. Before, it
+/// was refused for as long as they stayed.
+#[test]
+fn four_forged_candidates_at_the_expected_seq_are_reclaimed() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    for (i, length) in (100u32..105).enumerate() {
+        let d = fragment_record(message::CERTIFICATE, 1, length, 0, &[1], 60 + i as u64);
+        assert_eq!(p.feed(&[d]), Ok(()));
+    }
+    p.feed(&recs).expect("genuine flight");
+    assert_eq!(p.server.state(), State::Handshaking, "kept out at first");
+    assert!(p.server.poll_event().is_none());
+    advance_past_the_timer(&mut p);
+    completes(&mut p, &recs);
+    crypto_once(&p);
+}
+
+/// With the four slots full but replacement allowed, the genuine
+/// Certificate takes the place of the oldest forged candidate at once.
+#[test]
+fn replacement_admits_the_genuine_message_at_once() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    for (i, length) in (100u32..104).enumerate() {
+        let d = fragment_record(message::CERTIFICATE, 1, length, 0, &[1], 60 + i as u64);
+        assert_eq!(p.feed(&[d]), Ok(()));
+    }
+    completes(&mut p, &recs);
+    crypto_once(&p);
+}
+
+/// Forged fragments for later messages cannot take the buffer: a
+/// ClientKeyExchange and a CertificateVerify have small fixed bounds, so two
+/// one-byte fragments declaring 8192-byte messages for them (52 bytes in
+/// all) are dropped before anything is kept. Before, they held all 16 KiB
+/// and the genuine Certificate did not fit.
+#[test]
+fn future_candidates_cannot_take_the_buffer() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    for (i, (msg_type, seq)) in [
+        (message::CLIENT_KEY_EXCHANGE, 2u16),
+        (message::CERTIFICATE_VERIFY, 3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let d = fragment_record(msg_type, seq, 8192, 0, &[1], 60 + i as u64);
+        assert_eq!(d.len(), 26);
+        assert_eq!(p.feed(&[d]), Ok(()));
+    }
+    assert_eq!(p.server.buffered(), 0, "nothing kept");
     completes(&mut p, &recs);
 }
 
 /// An empty fragment of a message that is not empty adds nothing, so it is
-/// dropped before a candidate is made for it. Before, each held its
+/// dropped before a candidate is made for it. Before round 2, each held its
 /// declared length, and the third ended the handshake with
 /// `Limit::Buffered`.
 #[test]
@@ -1026,13 +1194,202 @@ fn empty_forged_fragments_allocate_nothing() {
     let mut p = pair(Options::default());
     let recs = flight5(&mut p);
     let dropped = p.server.stats().records_dropped;
-    for seq in 1..4u16 {
-        let d = fragment_record(message::CERTIFICATE, seq, 8192, 0, &[], 60 + u64::from(seq));
+    for (seq, msg_type, length) in [
+        (1u16, message::CERTIFICATE, 8192u32),
+        (2, message::CLIENT_KEY_EXCHANGE, 66),
+        (3, message::CERTIFICATE_VERIFY, 76),
+    ] {
+        let d = fragment_record(msg_type, seq, length, 0, &[], 60 + u64::from(seq));
         assert_eq!(p.feed(&[d]), Ok(()), "seq {seq}");
         assert_eq!(p.server.buffered(), 0, "seq {seq}: nothing allocated");
     }
     assert_eq!(p.server.stats().records_dropped, dropped + 3);
     assert!(p.drain().is_empty(), "no alert");
+    completes(&mut p, &recs);
+}
+
+/// A4.4 review, round 3: complete forged messages for flight 5 that fail
+/// their checks before any ECDH or verification are refused without moving
+/// the handshake on or dropping the genuine candidates, wherever they fall:
+/// a zero-length Certificate (25 bytes), one with an empty list (28), one
+/// whose certificate is a single byte (32), and, queued ahead, a
+/// ClientKeyExchange whose point is off the curve and a CertificateVerify
+/// with another scheme. Before, each ended the handshake.
+#[test]
+fn forged_flight_5_messages_are_refused_without_ending_the_handshake() {
+    let mut off_curve = vec![65, 4];
+    off_curve.extend_from_slice(&[0xff; 64]);
+    let mut other_scheme = vec![0x05, 0x03, 0, 8];
+    other_scheme.extend_from_slice(&[0x30, 6, 2, 1, 1, 2, 1, 1]);
+    // (name, type, seq, body, refused at once: those queued ahead are
+    // refused only when their seq comes)
+    type Case = (&'static str, u8, u16, Vec<u8>, Option<Error>);
+    let cases: [Case; 5] = [
+        (
+            "zero-length Certificate",
+            message::CERTIFICATE,
+            1,
+            vec![],
+            None,
+        ),
+        (
+            "empty Certificate",
+            message::CERTIFICATE,
+            1,
+            vec![0, 0, 0],
+            Some(Error::NoCertificate),
+        ),
+        (
+            "one-byte certificate",
+            message::CERTIFICATE,
+            1,
+            vec![0, 0, 4, 0, 0, 1, 0xff],
+            Some(Error::FingerprintMismatch),
+        ),
+        (
+            "off-curve key exchange",
+            message::CLIENT_KEY_EXCHANGE,
+            2,
+            off_curve,
+            None,
+        ),
+        (
+            "another verify scheme",
+            message::CERTIFICATE_VERIFY,
+            3,
+            other_scheme,
+            None,
+        ),
+    ];
+    for (name, msg_type, seq, body, refused) in cases {
+        let mut p = pair(Options::default());
+        let recs = flight5(&mut p);
+        let d = fragment_record(msg_type, seq, body.len() as u32, 0, &body, 60);
+        assert_eq!(p.feed(&[d]), Ok(()), "{name}");
+        assert_eq!(p.server.state(), State::Handshaking, "{name}");
+        assert_eq!(p.server.refused(), refused, "{name}");
+        assert!(p.drain().is_empty(), "{name}: no alert");
+        completes(&mut p, &recs);
+        crypto_once(&p);
+    }
+}
+
+/// The genuine Certificate, as three fragments.
+fn certificate_in_pieces(recs: &[Vec<u8>]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let r = recs
+        .iter()
+        .flat_map(|g| record::records(g).collect::<Vec<_>>())
+        .find(|r| {
+            message::fragments(r.body)
+                .next()
+                .is_some_and(|f| f.msg_type == message::CERTIFICATE)
+        })
+        .expect("Certificate record");
+    let f = message::fragments(r.body).next().expect("fragment");
+    assert_eq!(f.data.len() as u32, f.length, "one fragment");
+    let body = f.data.to_vec();
+    let rest: Vec<Vec<u8>> = recs
+        .iter()
+        .filter(|g| {
+            record::records(g)
+                .all(|r| !message::fragments(r.body).any(|f| f.msg_type == message::CERTIFICATE))
+        })
+        .cloned()
+        .collect();
+    (body, rest)
+}
+
+/// A4.4 review, round 3: a forged fragment that extends coverage but
+/// disagrees with bytes already received does not overwrite them. Genuine
+/// [0, 100), forged [99, 101) changing byte 99, then the genuine remainder:
+/// the Certificate still matches. Before, byte 99 was overwritten and the
+/// handshake ended with `FingerprintMismatch`.
+#[test]
+fn a_conflicting_overlap_does_not_corrupt_the_message() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let (cert, rest) = certificate_in_pieces(&recs);
+    let n = cert.len() as u32;
+    let forged = [cert[99] ^ 1, cert[100]];
+    for (i, (offset, data)) in [(0, &cert[..100]), (99, &forged[..]), (100, &cert[100..])]
+        .into_iter()
+        .enumerate()
+    {
+        let d = fragment_record(message::CERTIFICATE, 1, n, offset, data, 60 + i as u64);
+        p.feed(&[d]).expect("fragment");
+    }
+    completes(&mut p, &rest);
+}
+
+/// The other order: a forged byte inside the first genuine fragment's range
+/// arrives first. The genuine bytes start their own candidate, the next
+/// genuine fragment joins every candidate it agrees with, and the genuine
+/// one completes. (This passed before too, when the last writer won; it
+/// guards the rule that conflicting bytes start a candidate.)
+#[test]
+fn a_forged_byte_sent_first_does_not_block_the_message() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let (cert, rest) = certificate_in_pieces(&recs);
+    let n = cert.len() as u32;
+    let forged = [cert[50] ^ 1];
+    for (i, (offset, data)) in [(50, &forged[..]), (0, &cert[..100]), (100, &cert[100..])]
+        .into_iter()
+        .enumerate()
+    {
+        let d = fragment_record(message::CERTIFICATE, 1, n, offset, data, 60 + i as u64);
+        p.feed(&[d]).expect("fragment");
+    }
+    completes(&mut p, &rest);
+}
+
+/// A forged byte inside a later genuine fragment's range, sent first: the
+/// first genuine fragment agrees with it and joins it, the second disagrees
+/// and starts its own candidate, and neither is complete. The client's
+/// retransmission completes the second, which the first fragment now joins.
+/// So such a forgery costs the handshake one retransmission (two if the
+/// slots are also full and no replacement is allowed, since the forged
+/// candidates must age first).
+#[test]
+fn a_forged_byte_in_a_later_fragment_costs_one_retransmission() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let (cert, rest) = certificate_in_pieces(&recs);
+    let n = cert.len() as u32;
+    assert!(n > 151);
+    let forged = fragment_record(message::CERTIFICATE, 1, n, 150, &[cert[150] ^ 1], 60);
+    p.feed(&[forged]).expect("forged");
+    let genuine = |rseq: u64| {
+        [(0, &cert[..100]), (100, &cert[100..])]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (offset, data))| {
+                fragment_record(message::CERTIFICATE, 1, n, offset, data, rseq + i as u64)
+            })
+            .collect::<Vec<_>>()
+    };
+    p.feed(&genuine(61)).expect("genuine");
+    p.feed(&rest).expect("rest");
+    assert_eq!(p.server.state(), State::Handshaking, "held up");
+    assert!(p.server.poll_event().is_none());
+    // The client's retransmission.
+    p.feed(&genuine(63)).expect("retransmitted");
+    completes(&mut p, &rest);
+    crypto_once(&p);
+}
+
+/// A ClientKeyExchange's length is known, so a forger can plant a wrong
+/// byte under exactly the genuine message's seq, type, length and epoch.
+/// The genuine message disagrees with it, so it starts its own candidate
+/// and completes. (This passed before too; it guards against a first writer
+/// holding the seq.)
+#[test]
+fn a_forged_key_exchange_byte_does_not_hold_its_seq() {
+    let mut p = pair(Options::default());
+    let recs = flight5(&mut p);
+    let d = fragment_record(message::CLIENT_KEY_EXCHANGE, 2, 66, 0, &[0], 60);
+    assert_eq!(d.len(), 26);
+    p.feed(&[d]).expect("forged");
     completes(&mut p, &recs);
 }
 
@@ -1105,42 +1462,51 @@ fn an_unauthenticated_alert_after_change_cipher_spec_is_ignored() {
 }
 
 /// The other side of the rule: under the read keys, input comes from the
-/// peer whose flight we answered, so a bound it reaches still ends the
-/// handshake with `handshake_failure`, as before.
+/// peer whose flight we answered, so handshake data that could never be
+/// valid there still ends the handshake, with its alert: a Finished over
+/// `max_message_len`, one of the wrong length, a message of the wrong type,
+/// and one past Finished. (The buffer and fragment bounds cannot be reached
+/// under the read keys, where only a 12-byte Finished is admitted; the
+/// reassembly tests keep them fatal for authenticated input.)
 #[test]
-fn authenticated_input_over_a_bound_stays_fatal() {
-    // (message_seq past Finished's, declared length, offset, data length)
-    type Fragments = Vec<(u16, u32, u32, usize)>;
-    let cases: [(Limit, Fragments); 3] = [
-        (Limit::MessageSize, vec![(0, 8193, 0, 1)]),
+fn authenticated_inadmissible_input_stays_fatal() {
+    use alert::*;
+    // (type, message_seq past Finished's, declared length, data length)
+    let cases = [
         (
-            Limit::Buffered,
-            vec![(0, 8192, 0, 1), (1, 8192, 0, 1), (2, 8192, 0, 1)],
+            message::FINISHED,
+            0u16,
+            8193u32,
+            1usize,
+            Error::Limit(Limit::MessageSize),
+            HANDSHAKE_FAILURE,
+        ),
+        (message::FINISHED, 0, 13, 13, Error::Decode, DECODE_ERROR),
+        (
+            message::CLIENT_HELLO,
+            0,
+            12,
+            12,
+            Error::UnexpectedMessage,
+            UNEXPECTED_MESSAGE,
         ),
         (
-            Limit::Fragments,
-            (0..33).map(|i| (0, 4000, i * 10, 10)).collect(),
+            message::FINISHED,
+            1,
+            12,
+            12,
+            Error::UnexpectedMessage,
+            UNEXPECTED_MESSAGE,
         ),
     ];
-    for (limit, fragments) in cases {
+    for (msg_type, ahead, length, n, err, desc) in cases {
         let (mut p, _) = through_change_cipher_spec();
         let fin = p.client.finished_seq();
-        let mut last = Ok(());
-        for (ahead, length, offset, n) in fragments {
-            let f = fragment_bytes(message::FINISHED, fin + ahead, length, offset, &vec![1; n]);
-            let rec = p.client.seal(record::HANDSHAKE, &f);
-            last = p.feed(&[rec]);
-            if last.is_err() {
-                break;
-            }
-        }
-        assert_eq!(last, Err(Error::Limit(limit)), "{limit:?}");
-        assert_eq!(
-            plain_alert(&p.drain()),
-            [alert::FATAL, alert::HANDSHAKE_FAILURE],
-            "{limit:?}"
-        );
-        assert!(p.server.poll_event().is_none(), "{limit:?}");
+        let f = fragment_bytes(msg_type, fin + ahead, length, 0, &vec![1; n]);
+        let rec = p.client.seal(record::HANDSHAKE, &f);
+        assert_eq!(p.feed(&[rec]), Err(err), "{err:?}");
+        assert_eq!(plain_alert(&p.drain()), [FATAL, desc], "{err:?}");
+        assert!(p.server.poll_event().is_none(), "{err:?}");
     }
 }
 
@@ -1187,20 +1553,24 @@ fn cookie_exchange() {
     );
 
     // A hello whose cookie is wrong gets a fresh HelloVerifyRequest, up to
-    // the budget.
+    // the budget. After that, being unauthenticated, it is refused without
+    // an answer or an alert, and the handshake does not end.
     let mut p = pair_with(Options::default(), config, None);
-    let mut last = Ok(());
+    let mut answered = 0;
     for seq in 0..8u16 {
         let body = p.client.options.hello_body(&[3; 32], &[0xee; 32]);
         let d = fragment_record(1, seq, body.len() as u32, 0, &body, u64::from(seq));
-        last = p.feed(&[d]);
-        if last.is_err() {
-            break;
-        }
+        assert_eq!(p.feed(&[d]), Ok(()), "seq {seq}");
         let out = p.drain();
+        if out.is_empty() {
+            continue;
+        }
         assert_eq!(flight_types(&out), [message::HELLO_VERIFY_REQUEST]);
+        answered += 1;
     }
-    assert_eq!(last, Err(Error::Limit(Limit::HelloVerify)));
+    assert_eq!(answered, 6, "max_transmissions HelloVerifyRequests");
+    assert_eq!(p.server.state(), State::AwaitingHello);
+    assert_eq!(p.server.refused(), Some(Error::Limit(Limit::HelloVerify)));
     assert_eq!(
         p.server.stats().signatures,
         0,

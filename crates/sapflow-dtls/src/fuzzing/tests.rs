@@ -155,6 +155,8 @@ fn messages_of(grams: &[Vec<u8>]) -> Vec<(u8, Vec<u8>)> {
         max_fragments: 64,
         max_buffered: 1 << 17,
         ahead: 16,
+        expire_after: None,
+        reclaim_every: None,
     });
     let mut out = Vec::new();
     for g in grams {
@@ -163,7 +165,7 @@ fn messages_of(grams: &[Vec<u8>]) -> Vec<(u8, Vec<u8>)> {
                 continue;
             }
             for f in message::fragments(rec.body) {
-                if r.push(0, &f).is_ok() {
+                if r.push(0, &f, std::time::Instant::now()).is_ok() {
                     while let Some(m) = r.pop() {
                         out.push((m.msg_type, m.body));
                     }

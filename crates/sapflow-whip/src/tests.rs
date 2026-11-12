@@ -389,8 +389,11 @@ fn handshake_deadline() {
     assert_eq!(p.misdirected, 0);
 }
 
+/// The client's certificate does not match the offer. sapflow-dtls refuses
+/// it without an alert, since at epoch 0 a forger could have sent it, so
+/// the session never connects and ends at its handshake deadline.
 #[test]
-fn fingerprint_mismatch_ends_the_session() {
+fn fingerprint_mismatch_never_connects() {
     let t0 = Instant::now();
     let mut p = Publisher::new(11, &[GCM]);
     // The offer names another certificate than the one the client sends.
@@ -407,10 +410,10 @@ fn fingerprint_mismatch_ends_the_session() {
         }
         pending = p.receive(s);
     }
-    assert_eq!(
-        s.state(),
-        State::Ended(EndReason::Dtls(sapflow_dtls::Error::FingerprintMismatch))
-    );
+    assert_eq!(s.state(), State::Handshaking);
+    assert!(!p.has_keys());
+    run_until(s, t0 + Duration::from_secs(10));
+    assert_eq!(s.state(), State::Ended(EndReason::HandshakeTimeout));
     assert!(!p.has_keys());
     assert_eq!(p.misdirected, 0);
 }

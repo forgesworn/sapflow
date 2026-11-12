@@ -1461,11 +1461,14 @@ Implementation notes (11 November 2026):
   - A peer's retransmission triggers a resend only when it repeats the
     start of the hello we answered (the version and random included), or
     when an authenticated Finished arrives again after the handshake.
-  - Epoch 0 input that breaks a reassembly bound (message size, fragments
-    per message, bytes buffered) is dropped and counted, with nothing
-    allocated for it, and so is every epoch 0 alert. Only input under the
-    read keys fails the handshake on a bound or an alert. See Epoch 0
-    injection below.
+  - Epoch 0 input never ends a handshake by breaking a bound, as an alert,
+    or as a message that fails a check made before any ECDH or
+    verification: it is dropped and counted, and the genuine flight can
+    still complete. Fragments are admitted by seq, type, epoch and length
+    before anything is kept, and reassembly reclaims room from stalled
+    forgeries once they are a retransmission interval old. Input under the
+    read keys still fails the handshake. See Epoch 0 injection below and
+    the crate README.
 - **A2.1.** OpenSSL 4.0.3 `s_client` matched our exported keying material
   byte for byte in eight runs. Both profiles ran, with 300-byte MTUs, a
   dropped first flight, a dropped final flight and the cookie exchange. The
@@ -1493,23 +1496,48 @@ Implementation notes (11 November 2026):
   - **Handshake deadline.** W3 needs its own. With the defaults (a 1 s
     timer doubling to 60 s, six sends), an unanswered flight 4 runs to
     about 63 s before `Error::Timeout`.
-  - **Epoch 0 injection.** Epoch 0 input is not authenticated. The second
-    round of the A4.4 review (12 November 2026) found that one forged
-    packet could end a handshake: a 25-byte fragment declaring 8193 bytes,
-    one over the buffer budget, or a 15-byte fatal alert, even after
-    ChangeCipherSpec. Now a fragment that breaks a reassembly bound, an
-    empty fragment of a non-empty message and every epoch 0 alert are
-    dropped and counted in `records_dropped`, and the genuine flight still
-    completes. A client that really aborts with an alert now ends at the
-    handshake deadline. Forged epoch 0 input can still:
-    - end a handshake with a forged, complete message that reaches the
-      state machine before the genuine one, such as a 25-byte zero-length
-      message of the wrong type;
-    - keep the genuine flight out until the deadline, by filling a
-      message's four candidate slots or the 16 KiB reassembly budget with
-      forged candidates.
+  - **Epoch 0 injection.** Epoch 0 input is not authenticated. Rounds 2
+    and 3 of the A4.4 review (12 November 2026) found that one forged packet
+    could end a handshake or hold it until the deadline. Round 2: a 25-byte
+    fragment declaring 8193 bytes, one over the buffer budget, or a 15-byte
+    fatal alert, even after ChangeCipherSpec. Round 3: a 25-byte zero-length
+    Certificate, an epoch 0 Finished (even one queued early), 52 bytes of
+    fragments holding the whole buffer, four forged candidates holding a
+    message's slots, and a forged fragment overwriting genuine bytes. Now:
+    - every epoch 0 alert is dropped;
+    - fragments are admitted by seq, type, epoch and a length the parser
+      could accept, before anything is kept, so after CertificateVerify no
+      epoch 0 handshake data is kept, and a Finished is kept only at
+      epoch 1;
+    - a complete epoch 0 message that fails a check made before any ECDH or
+      verification is refused without moving the handshake on or dropping
+      the other candidates. That covers a hello outside the profile, a
+      certificate that does not match the offer, a bad key share and
+      another verify scheme;
+    - a fragment that disagrees with bytes already received starts its own
+      candidate rather than overwriting them, and reassembly reclaims room
+      from stalled or younger forged candidates, paced by the
+      retransmission interval.
 
-    Neither is resolved, so A4.4 needs each fixed or accepted in writing.
+    Each is counted in `records_dropped`, `Server::refused` gives the reason
+    for the last refused message, and the genuine flight still completes.
+    A client that really aborts or sends such a message now ends at the
+    handshake deadline, with no alert. A certificate that matches the offer
+    but cannot be used, a failed signature verification and anything under
+    the read keys still end the handshake at once.
+
+    Forged epoch 0 input can still do two things. Each is to be accepted as
+    inherent, pending the owner's written acceptance for A4.4:
+    - **Plausible substitution.** A plausible substituted ClientHello,
+      ClientKeyExchange or CertificateVerify that reaches the state machine
+      before the genuine one spends the one signature, ECDH or verification
+      and fails the handshake. The smallest is a 37-byte CertificateVerify
+      queued ahead. None can be told from the genuine message until the
+      transcript is proved.
+    - **Continuous injection or flooding.** This can keep refilling the
+      slots and the buffer. Reclaiming bounds a finite burst, not a
+      sustained one.
+
     W3 limits the damage:
     - each `Server` receives only datagrams from its selected ICE-validated
       5-tuple, so only an attacker who can spoof that tuple can do either;
@@ -1631,7 +1659,10 @@ Implementation notes (W3a, 11 November 2026):
     lists it there.
   - The handshake deadline is the session's (10 s), so `sapflow-dtls`'s
     63 s timeout never runs. A DTLS failure ends the session with
-    `EndReason::Dtls` and its reason, for W3c to count.
+    `EndReason::Dtls` and its reason, for W3c to count. An unauthenticated
+    message that `sapflow-dtls` refuses, such as a certificate that does
+    not match the offer, does not end it: the session ends at its deadline
+    as `HandshakeTimeout`, and `Server::refused` holds the reason.
 - **Gate 1, in process.** For both SRTP profiles a scripted publisher (the
   test STUN client, the `sapflow-dtls` test client, `sapflow-rtp`'s SRTP
   protect) sends H.264 in STAP-A and FU-A and Opus. The session emits
@@ -2090,7 +2121,7 @@ Implementation notes (W3c part 2b, limits, 12 November 2026):
 | A3.7: a captured check re-sent from a fresh address draws nothing once its original has arrived, while its ID is remembered | `whip::tests::a_fresh_address_draws_nothing`; the session harness's oracle, over its seeds and mutations | Met in process |
 | A3.7: any mix of re-sent checks and copied SRTP from an address draws at most four times what it sent | the session harness (per tuple) and the router harness (per tuple, across sessions) | Met in the harnesses and the fuzz targets |
 | A3.7: a session with no completed handshake is gone 10 s after its `201`; one without consent checks 30 s after the last | `tests::handshake_deadline`, `tests::consent_expires_30_s_after_the_last_check` (sapflow-whip); `whip::tests::a_handshake_timeout_releases_with_no_callback` (server, 1 s) | Met in process |
-| A3.7: each cap in [Concurrency and resource bounds](#concurrency-and-resource-bounds) refuses at its limit | Mapped here: signalling and pending caps (above), ICE-TCP's (`whip::tcp_tests`), the offer size (`whip_request::tests::routes_and_methods`, 413), RFC 4571 frame size (`framing::tests::too_long_frame_ends_the_stream`, `whip::tcp_tests::a_frame_over_the_cap_ends_the_connection`), the router's session cap (`router::tests::insert_refuses_past_the_cap_and_duplicates`), the receiver's event queue (`sapflow-rtp`'s `the_event_queue_is_bounded`), the H.264 depacketiser's buffers (`buffers_never_pass_their_bounds`), DTLS flight faults (`sapflow-dtls`'s `client_flight_faults_are_refused`) | Partial: the reorder buffer, the start hold, RTCP size, queued feedback, transport-cc and DTLS message size are bounded in their crates but not mapped to a refusal test here |
+| A3.7: each cap in [Concurrency and resource bounds](#concurrency-and-resource-bounds) refuses at its limit | Mapped here: signalling and pending caps (above), ICE-TCP's (`whip::tcp_tests`), the offer size (`whip_request::tests::routes_and_methods`, 413), RFC 4571 frame size (`framing::tests::too_long_frame_ends_the_stream`, `whip::tcp_tests::a_frame_over_the_cap_ends_the_connection`), the router's session cap (`router::tests::insert_refuses_past_the_cap_and_duplicates`), the receiver's event queue (`sapflow-rtp`'s `the_event_queue_is_bounded`), the H.264 depacketiser's buffers (`buffers_never_pass_their_bounds`), DTLS flight faults (`sapflow-dtls`'s `client_flight_faults_are_refused` and `unauthenticated_flight_faults_are_refused_silently`) | Partial: the reorder buffer, the start hold, RTCP size, queued feedback, transport-cc and DTLS message size are bounded in their crates but not mapped to a refusal test here |
 
 - **Left open after W3c part 2b.**
   - The packet-capture form of A3.7, on the wire.

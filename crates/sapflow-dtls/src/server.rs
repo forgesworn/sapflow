@@ -50,6 +50,21 @@ pub const MAX_EXPECTED_FINGERPRINTS: usize = 4;
 /// Messages past the next expected one that reassembly buffers. The
 /// client's longest flight is four handshake messages.
 const AHEAD: u16 = 4;
+/// The shortest ClientHello `ClientHello::parse` accepts: version, random,
+/// empty session id and cookie, one cipher suite and one compression
+/// method.
+const HELLO_MIN: usize = 2 + 32 + 1 + 1 + 2 + 2 + 1 + 1;
+/// The shortest Certificate: the list's length alone, which, as an empty
+/// list, is `NoCertificate`.
+const CERTIFICATE_MIN: usize = 3;
+/// ClientKeyExchange: a length byte and a point, at most the 65 bytes of an
+/// uncompressed P-256 point, the only kind accepted.
+const KEY_EXCHANGE_MAX: usize = 1 + 65;
+/// CertificateVerify: the scheme, a length and a DER signature, which for
+/// P-256 is at most 72 bytes.
+const VERIFY_MAX: usize = 2 + 2 + 72;
+/// Finished's `verify_data`.
+const FINISHED_LEN: usize = 12;
 /// The TLS 1.3 downgrade sentinels (RFC 8446 section 4.1.3), which a DTLS
 /// 1.2 server must not send by chance either.
 const DOWNGRADE: [&[u8; 8]; 2] = [b"DOWNGRD\x01", b"DOWNGRD\x00"];
@@ -64,7 +79,10 @@ pub struct Config {
     /// 65535; default 1500.
     pub max_datagram: usize,
     /// First retransmission timeout (RFC 6347 section 4.2.4.1 suggests
-    /// 1 s). Default 1 s.
+    /// 1 s). Default 1 s. It also paces reassembly's reclaiming: an
+    /// unauthenticated candidate still incomplete this long after it
+    /// started gives up its room to a newcomer that needs it, and room is
+    /// taken from younger ones at most this often.
     pub initial_retransmit: Duration,
     /// Longest retransmission timeout; the timer doubles up to it. Default
     /// 60 s, the RFC's floor for the cap. With the defaults an unanswered
@@ -87,8 +105,8 @@ pub struct Config {
     /// Largest handshake message accepted, by declared length. 512 to
     /// 65536; default 8192 (Chrome's ClientHello is 1413 bytes).
     pub max_message_len: usize,
-    /// Most fragments accepted for one message, duplicates included. 1 to
-    /// 1024; default 32.
+    /// Most fragments that add to one candidate message (duplicates do not
+    /// count). 1 to 1024; default 32.
     pub max_fragments: usize,
     /// Most bytes held by messages being reassembled. At least
     /// `max_message_len`, at most 1 MiB; default 16384.
@@ -206,9 +224,11 @@ pub struct Stats {
     /// Records dropped: bad version, unknown epoch, replayed, failed
     /// authentication, not acceptable in this state, or an epoch 0 alert.
     /// Also each handshake fragment dropped: outside the reassembly window,
-    /// a duplicate, empty, or, at epoch 0, one that would break a
-    /// reassembly bound ([`Config::max_message_len`],
-    /// [`Config::max_fragments`], [`Config::max_buffered`]).
+    /// a duplicate, empty, or, at epoch 0, one that cannot belong to the
+    /// message expected at its seq or would break a reassembly bound
+    /// ([`Config::max_message_len`], [`Config::max_fragments`],
+    /// [`Config::max_buffered`]). And each complete epoch 0 message refused
+    /// ([`Server::refused`]).
     pub records_dropped: u64,
     /// Application data records, which sapflow does not use.
     pub application_data_dropped: u64,
@@ -258,6 +278,17 @@ struct Handshake {
     pending_read: Option<Protection>,
     pending_write: Option<Protection>,
     next_server_seq: u16,
+    /// The `message_seq` of the hello we answered; flight 5 follows it.
+    hello_seq: u16,
+}
+
+/// What became of a complete handshake message.
+enum Taken {
+    /// Accepted: the handshake moves on to the next message.
+    Accepted,
+    /// Refused without ending the handshake: it is unauthenticated, so a
+    /// forger could have sent it, and the genuine message may follow.
+    Refused(Error),
 }
 
 /// A DTLS 1.2 server for one peer (one ICE-validated address pair).
@@ -290,6 +321,7 @@ pub struct Server {
     profile: Option<SrtpProfile>,
     peer_fingerprint: Option<Fingerprint>,
     stats: Stats,
+    refused: Option<Error>,
 }
 
 impl fmt::Debug for Server {
@@ -366,6 +398,11 @@ impl Server {
             max_fragments: config.max_fragments,
             max_buffered: config.max_buffered,
             ahead: AHEAD,
+            // A finite burst of forged candidates gives way once it is a
+            // retransmission interval old, in time for the client's
+            // retransmission.
+            expire_after: Some(config.initial_retransmit),
+            reclaim_every: Some(config.initial_retransmit),
         };
         Ok(Self {
             interval: config.initial_retransmit,
@@ -393,6 +430,7 @@ impl Server {
             profile: None,
             peer_fingerprint: None,
             stats: Stats::default(),
+            refused: None,
         })
     }
 
@@ -420,6 +458,18 @@ impl Server {
     /// Counters.
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Why the last complete handshake message was refused without ending
+    /// the handshake, if one has been since the handshake last moved on.
+    /// An unauthenticated (epoch 0) message that fails its checks before any
+    /// ECDH or signature verification is refused this way rather than with
+    /// a fatal alert, since anyone who can spoof the peer's address could
+    /// have sent it: a hello outside the profile, a certificate that does
+    /// not match the offer, a bad key share, another verify scheme. If the
+    /// handshake then times out, this is the likely reason.
+    pub fn refused(&self) -> Option<Error> {
+        self.refused
     }
 
     /// Bytes held by handshake messages being reassembled.
@@ -452,8 +502,11 @@ impl Server {
 
     /// One datagram from the peer. Invalid records are dropped silently
     /// (RFC 6347 section 4.1.2.7). So is unauthenticated (epoch 0) input
-    /// that only a forger needs to send: any epoch 0 alert, and a handshake
-    /// fragment that adds nothing or would break a reassembly bound; each is
+    /// that a forger could have sent: any epoch 0 alert; a handshake
+    /// fragment that cannot belong to the message expected at its seq, adds
+    /// nothing, or would break a reassembly bound; and a complete message
+    /// that fails its checks before any ECDH or verification, which leaves
+    /// the handshake where it was ([`Server::refused`] says why). Each is
     /// counted in [`Stats::records_dropped`]. An `Err` means the association
     /// failed: one fatal alert, if any, is queued, and later input is
     /// ignored.
@@ -731,7 +784,20 @@ impl Server {
             }
             return Ok(());
         }
-        match self.reassembler.push(epoch, f)? {
+        // Old fragments are not checked here: a retransmission of an earlier
+        // flight still reaches the resend check below.
+        if f.seq >= self.reassembler.next_seq()
+            && let Err(e) = self.admit(epoch, f)
+        {
+            // Unauthenticated: dropped before anything is kept for it.
+            // Under the read keys: the peer's own error.
+            return if epoch == 0 {
+                self.drop_record()
+            } else {
+                Err(e)
+            };
+        }
+        match self.reassembler.push(epoch, f, now)? {
             Push::Old { .. } => {
                 if self.repeats_answered_hello(f) {
                     self.resend(now)?;
@@ -747,16 +813,67 @@ impl Server {
             // ends the handshake.
             Push::Over(_) if epoch == 0 => self.drop_record(),
             Push::Over(limit) => Err(Error::Limit(limit)),
-            Push::Stored => {
-                while let Some(m) = self.reassembler.pop() {
-                    self.message(now, record_seq, m)?;
+            Push::Stored => self.release(now, record_seq),
+        }
+    }
+
+    /// Whether a fragment at or past the next `message_seq` could belong to
+    /// the message the handshake expects there, checked before anything is
+    /// kept for it: its type, its epoch, and a length its parser could
+    /// accept. Each seq holds one message: a ClientHello at the next seq
+    /// while no hello has been answered, then flight 5 after the hello we
+    /// answered (Certificate, ClientKeyExchange and CertificateVerify at
+    /// epoch 0, then Finished, which is valid only under the read keys).
+    /// The error says why not, for a fragment under the read keys.
+    fn admit(&self, epoch: u16, f: &message::Fragment<'_>) -> Result<(), Error> {
+        let length = usize::try_from(f.length).map_err(|_| Error::Limit(Limit::MessageSize))?;
+        if length > self.config.max_message_len {
+            return Err(Error::Limit(Limit::MessageSize));
+        }
+        let (msg_type, at_epoch, lengths) = match (&self.phase, &self.hs) {
+            (Phase::Hello { .. }, _) if f.seq == self.reassembler.next_seq() => {
+                (message::CLIENT_HELLO, 0, HELLO_MIN..=usize::MAX)
+            }
+            (Phase::Flight5 { .. }, Some(hs)) => match f.seq.checked_sub(hs.hello_seq) {
+                Some(1) => (message::CERTIFICATE, 0, CERTIFICATE_MIN..=usize::MAX),
+                Some(2) => (message::CLIENT_KEY_EXCHANGE, 0, 2..=KEY_EXCHANGE_MAX),
+                Some(3) => (message::CERTIFICATE_VERIFY, 0, 5..=VERIFY_MAX),
+                Some(4) => (message::FINISHED, 1, FINISHED_LEN..=FINISHED_LEN),
+                _ => return Err(Error::UnexpectedMessage),
+            },
+            _ => return Err(Error::UnexpectedMessage),
+        };
+        if f.msg_type != msg_type || epoch != at_epoch {
+            return Err(Error::UnexpectedMessage);
+        }
+        if !lengths.contains(&length) {
+            return Err(Error::Decode);
+        }
+        Ok(())
+    }
+
+    /// Hands complete messages to the state machine in order. One it
+    /// refuses is discarded on its own: the seq stays, and so do its other
+    /// candidates, so the genuine message can still be taken.
+    fn release(&mut self, now: Instant, record_seq: u64) -> Result<(), Error> {
+        while let Some(m) = self.reassembler.take() {
+            match self.message(now, record_seq, m)? {
+                Taken::Accepted => {
+                    self.refused = None;
+                    self.reassembler.advance();
                     if !self.handshaking() {
+                        // Nothing buffered can be valid after the handshake.
+                        self.reassembler.restart_at(self.reassembler.next_seq());
                         break;
                     }
                 }
-                Ok(())
+                Taken::Refused(e) => {
+                    self.refused = Some(e);
+                    self.stats.records_dropped += 1;
+                }
             }
         }
+        Ok(())
     }
 
     /// Whether `f` is the start of a retransmission of the ClientHello our
@@ -779,11 +896,11 @@ impl Server {
             && body.get(..f.data.len()) == Some(f.data)
     }
 
-    fn message(&mut self, now: Instant, record_seq: u64, m: Message) -> Result<(), Error> {
+    fn message(&mut self, now: Instant, record_seq: u64, m: Message) -> Result<Taken, Error> {
         match self.phase {
             Phase::Hello { .. } => self.client_hello(now, record_seq, m),
             Phase::Flight5 { .. } => self.client_flight(now, m),
-            _ => Ok(()),
+            _ => Ok(Taken::Accepted),
         }
     }
 
@@ -811,12 +928,21 @@ impl Server {
         )
     }
 
-    fn client_hello(&mut self, now: Instant, record_seq: u64, m: Message) -> Result<(), Error> {
+    /// A hello is unauthenticated, so one that does not parse, is outside
+    /// the profile or has run out of HelloVerifyRequests is refused rather
+    /// than ending the handshake.
+    fn client_hello(&mut self, now: Instant, record_seq: u64, m: Message) -> Result<Taken, Error> {
         if m.msg_type != message::CLIENT_HELLO || m.epoch != 0 {
-            return Err(Error::UnexpectedMessage);
+            return Ok(Taken::Refused(Error::UnexpectedMessage));
         }
-        let hello = ClientHello::parse(&m.body)?;
-        let negotiated = hello.negotiate()?;
+        let hello = match ClientHello::parse(&m.body) {
+            Ok(h) => h,
+            Err(e) => return Ok(Taken::Refused(e)),
+        };
+        let negotiated = match hello.negotiate() {
+            Ok(n) => n,
+            Err(e) => return Ok(Taken::Refused(e)),
+        };
         if !self.sent_any {
             // Our first record reuses the ClientHello's record sequence
             // number (RFC 6347 section 4.2.1); later ones count up.
@@ -829,7 +955,8 @@ impl Server {
                     return Err(Error::Internal);
                 };
                 if hello_verifies >= self.config.max_transmissions {
-                    return Err(Error::Limit(Limit::HelloVerify));
+                    // No more answers: refused, and sends nothing.
+                    return Ok(Taken::Refused(Error::Limit(Limit::HelloVerify)));
                 }
                 self.phase = Phase::Hello {
                     hello_verifies: hello_verifies + 1,
@@ -844,10 +971,12 @@ impl Server {
                     finished: None,
                 });
                 self.transmissions = 0;
-                return self.send_flight(now);
+                self.send_flight(now)?;
+                return Ok(Taken::Accepted);
             }
         }
-        self.server_flight(now, &m, &hello, negotiated)
+        self.server_flight(now, &m, &hello, negotiated)?;
+        Ok(Taken::Accepted)
     }
 
     fn server_random(&mut self) -> Result<[u8; 32], Error> {
@@ -929,6 +1058,7 @@ impl Server {
             pending_read: None,
             pending_write: None,
             next_server_seq: seq(5)?,
+            hello_seq: m.seq,
         }));
         self.flight = Some(Flight {
             messages,
@@ -945,14 +1075,24 @@ impl Server {
         Ok(())
     }
 
-    fn client_flight(&mut self, now: Instant, m: Message) -> Result<(), Error> {
+    /// Flight 5. Until CertificateVerify proves the client's key, its
+    /// messages are unauthenticated, so one that fails a check made before
+    /// any ECDH or verification is refused rather than ending the
+    /// handshake. What stays fatal: a certificate that matches the offer but
+    /// cannot be used (those bytes are the offer's, whoever sent them), a
+    /// failed verification (there is only one), and anything under the read
+    /// keys.
+    fn client_flight(&mut self, now: Instant, m: Message) -> Result<Taken, Error> {
         let Phase::Flight5 { stage } = &mut self.phase else {
             return Err(Error::Internal);
         };
         let hs = self.hs.as_mut().ok_or(Error::Internal)?;
         let next = match (&*stage, m.msg_type, m.epoch) {
             (Stage::Certificate, message::CERTIFICATE, 0) => {
-                let leaf = message::certificate_leaf(&m.body, MAX_CHAIN)?;
+                let leaf = match message::certificate_leaf(&m.body, MAX_CHAIN) {
+                    Ok(leaf) => leaf,
+                    Err(e) => return Ok(Taken::Refused(e)),
+                };
                 // Compared before the DER is parsed at all.
                 let fingerprint = Fingerprint::of_certificate(leaf);
                 // Every candidate is compared, so the time taken does not
@@ -962,17 +1102,25 @@ impl Server {
                     .iter()
                     .fold(false, |any, e| any | fingerprint.ct_eq(e));
                 if !matched {
-                    return Err(Error::FingerprintMismatch);
+                    return Ok(Taken::Refused(Error::FingerprintMismatch));
                 }
+                // The offer's certificate: a fault in it is final.
                 hs.peer = Some(identity::peer_key(leaf)?);
                 self.peer_fingerprint = Some(fingerprint);
                 hs.transcript.update(whole(&m)?);
                 Stage::KeyExchange
             }
             (Stage::KeyExchange, message::CLIENT_KEY_EXCHANGE, 0) => {
-                let point = message::client_key_exchange(&m.body)?;
-                let public =
-                    p256::PublicKey::from_sec1_bytes(point).map_err(|_| Error::BadKeyShare)?;
+                let point = match message::client_key_exchange(&m.body) {
+                    Ok(point) => point,
+                    Err(e) => return Ok(Taken::Refused(e)),
+                };
+                let Ok(public) = p256::PublicKey::from_sec1_bytes(point) else {
+                    return Ok(Taken::Refused(Error::BadKeyShare));
+                };
+                // The one ECDH. A forged but valid point that gets here
+                // first spends it, and CertificateVerify then fails: that
+                // cannot be told apart until the transcript is proved.
                 let secret = hs.ecdh.take().ok_or(Error::Internal)?;
                 let shared =
                     p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
@@ -993,8 +1141,13 @@ impl Server {
                 Stage::Verify { hash: session_hash }
             }
             (Stage::Verify { hash }, message::CERTIFICATE_VERIFY, 0) => {
-                let signature = message::certificate_verify(&m.body)?;
+                let signature = match message::certificate_verify(&m.body) {
+                    Ok(signature) => signature,
+                    Err(e) => return Ok(Taken::Refused(e)),
+                };
                 let key = hs.peer.as_ref().ok_or(Error::Internal)?;
+                // The one verification: once it has failed, the handshake
+                // cannot complete, so the failure is final.
                 self.stats.verifications += 1;
                 identity::verify_der(key, hash, signature)?;
                 hs.transcript.update(whole(&m)?);
@@ -1048,11 +1201,20 @@ impl Server {
                     peer_fingerprint,
                     keying_material: KeyingMaterial(material),
                 }));
-                return Ok(());
+                return Ok(Taken::Accepted);
             }
+            // `admit` lets nothing else through. Were it to, an
+            // unauthenticated message would be refused and one under the
+            // read keys would end the handshake.
+            (_, _, 0) => return Ok(Taken::Refused(Error::UnexpectedMessage)),
             _ => return Err(Error::UnexpectedMessage),
         };
+        let verified = matches!(next, Stage::Finished { .. });
         self.phase = Phase::Flight5 { stage: next };
-        Ok(())
+        if verified {
+            // Only the Finished under the read keys can be valid now.
+            self.reassembler.drop_unauthenticated();
+        }
+        Ok(Taken::Accepted)
     }
 }

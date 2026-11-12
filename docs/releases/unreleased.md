@@ -65,11 +65,33 @@ Notes for the release after 0.2.0-rc.1.
   `message_seq` was above the last Finished's, but DTLS 1.2 starts each
   handshake's messages at 0 (RFC 6347 section 4.2.2), so a conforming
   peer's request was silently dropped.
-- Unauthenticated (epoch 0) input no longer ends a handshake by breaking a
-  reassembly bound. A fragment over `max_message_len`, `max_buffered` or
-  `max_fragments`, an empty fragment of a non-empty message, and every
-  alert at epoch 0 are dropped, allocate nothing and are counted in
-  `Stats::records_dropped`. `Error::PeerAlert` and those three
-  `Error::Limit`s now come only from input under the read keys, so a client
-  that aborts the handshake with an epoch 0 alert is ended by the caller's
-  handshake deadline. The API is unchanged from 0.2.0-rc.1.
+- Unauthenticated (epoch 0) input no longer ends a handshake, or holds it
+  until the deadline, with a single forged packet:
+  - Every alert at epoch 0 is dropped.
+  - Fragments are admitted by `message_seq`, type, epoch and a length the
+    parser could accept before anything is kept, so a Finished is kept
+    only at epoch 1.
+  - A fragment over `max_message_len`, `max_buffered` or `max_fragments`,
+    and an empty fragment of a non-empty message, allocate nothing.
+  - A fragment that disagrees with bytes already received starts its own
+    candidate instead of overwriting them.
+  - Room in reassembly is reclaimed from stalled or younger unauthenticated
+    candidates, paced by `initial_retransmit`. No limit changes.
+  - A complete epoch 0 message that fails a check made before any ECDH or
+    verification is refused without moving the handshake on.
+
+  Each is counted in `Stats::records_dropped`.
+- So these errors no longer come from `handle_datagram` for epoch 0 input,
+  and no alert is sent for them: a hello outside the profile (`Version`,
+  `NoCipherSuite` and the rest, or `Decode`), `Limit::HelloVerify`,
+  `NoCertificate`, `FingerprintMismatch`, `BadKeyShare` before ECDH,
+  `VerifyScheme`, `UnexpectedMessage`, `PeerAlert`, and the reassembly
+  `Limit`s. A client that really sends one is ended by the caller's
+  handshake deadline. The new `Server::refused` (additive) gives the reason
+  for the last refused message. Errors under the read keys, from a
+  certificate that matches the offer, and from a failed verification still
+  end the handshake with their alert.
+- In WHIP, a publisher whose certificate does not match its offer now ends
+  at the 10 s handshake deadline as `EndReason::HandshakeTimeout`, not at
+  once as `EndReason::Dtls(FingerprintMismatch)`.
+- The public API changes only by the addition of `Server::refused`.

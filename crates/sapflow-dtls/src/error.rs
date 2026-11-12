@@ -60,6 +60,12 @@ pub enum Limit {
 /// Why the handshake failed or the association ended. Every variant except
 /// [`Error::Timeout`], [`Error::PeerAlert`] and [`Error::PeerClosed`] sends
 /// one fatal alert ([`Error::alert`]) before the server goes silent.
+///
+/// A variant is also the reason [`crate::Server::refused`] gives for an
+/// unauthenticated (epoch 0) message refused without ending the handshake,
+/// and then nothing is sent: a hello outside the profile, a certificate
+/// that does not match the offer, a bad key share or verify scheme, or a
+/// hello once HelloVerifyRequests have run out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
