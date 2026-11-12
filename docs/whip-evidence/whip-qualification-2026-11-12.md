@@ -14,7 +14,7 @@ A3.9, A4.2).
 |---|---|---|
 | A3.8 sync (EBU R37: audio at most 40 ms early, 60 ms late) | Chrome 157: 17 of 20 runs within (UDP 9 of 10, ICE-TCP 8 of 10); the three others had audio 43 to 49 ms early. Every Chrome run was aligned by arrival time, because Chrome's sender reports for both streams had arrived only 3.4 to 3.5 s after it connected, after Sapflow's 1.5 s start hold. FFmpeg 8.1.2 (sender reports at once): 10 of 10, 0 to 1.5 ms | **Not met.** The cause is Sapflow's start hold, not Chrome: with the hold lengthened to 6 s (an experiment, not committed) every Chrome run was aligned by sender reports and all five were within, at -2.3 to +15.7 ms. A decision point (below) |
 | A3.9 smoke | `scripts/smoke.sh` publishes WHIP with FFmpeg 8's WHIP muxer and checks refusals, LL-HLS, decoding, callbacks, `DELETE` and the recording; CI installs a pinned static FFmpeg 8.1.3 for it | **Met locally**: the whole smoke passed on the test host with Homebrew's FFmpeg 8.1.2. CI has not run it yet (not pushed). The pinned build ran in an emulated x86_64 Linux container (Debian 12) on the test host: it lists the WHIP muxer and encodes H.264 baseline and Opus; it has not published WHIP there |
-| A4.2 cost | Not yet measured to method: the host's load average stayed above the gate of 8 (other sessions). The run is under way | Pending |
+| A4.2 cost | 26 of 27 runs under the load gate. Per stream, WHIP's RSS was above SRT's in every round at 1 and 50 streams (at 50: 10.8 to 11.4 MB against 9.7 to 10.6 MB); its CPU against SRT's disagreed between rounds at every count (WHIP/SRT 0.51 to 2.06), within the host's own round-to-round spread | **Not met as stated**: memory higher at 1 and 50 streams, CPU undecided. A decision point for the owner |
 
 ## Host and versions
 
@@ -276,6 +276,18 @@ The server's log for the part: the wrong token refused as
 `lost=0`, and the recording finished `complete=true` at 11.9 s. The
 multivariant playlist read `CODECS="avc1.42c01f,Opus"`.
 
+CI decodes with Ubuntu's ffmpeg, not Homebrew's, so the part's decode
+checks were run on the files that run kept, in an `ubuntu:24.04` container
+with apt's ffmpeg 6.1.1. Both files (the served segments and the recording)
+decode, and the track profile check passes, but that ffmpeg prints three
+error-level lines for each from the null muxer, not the decoder
+(`[null @ ...] Application provided invalid, non monotonically increasing
+dts to muxer in stream 0: 16 >= 16`, and a "Last message repeated" line).
+So the WHIP part counts only decoder errors (`decodes` in the script): the
+null muxer's lines are left out, anything else at error level fails. With
+that, the decode checks pass in the container, and a second whole smoke run
+on the test host passed (load average 13.5).
+
 A first version sent the wrong token with a placeholder body (`v=0`) and got
 `422`: the offer is parsed before admission checks the token, as the design
 lists. A missing token is refused before that, so it can stay a bare `curl`;
@@ -313,4 +325,88 @@ and the call is the owner's. If the gate never opens, A4.2 is not measured to
 method, and runs above the gate are shown only as labelled indicative
 figures.
 
-Results: not yet measured to method. The host's load average stayed above the gate (other sessions), and the run is under way.
+### Results
+
+Three rounds, from about 09:05 to 10:08, 27 runs: 26 are results, and one
+(RTMP at 10 streams, round 1) started above the gate after its 600 s wait,
+so it is indicative only. Load averages at the start of the results were
+4.5 to 7.97; several rose during the window (to 27.6 at the end of WHIP at
+50 streams, round 1), from other sessions.
+
+| Protocol | Streams | Round | Load (start / end) | Gate wait, s | Server CPU, % of a core | CPU per stream, % | Peak RSS, MB | RSS per stream, MB | Publishers' CPU, % | Sequence advance | Result |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| srt | 1 | 1 | 7.54 / 4.77 | 575 | 0.73 | 0.731 | 17.5 | 17.5 | 1.2 | 45 | result |
+| srt | 1 | 2 | 5.42 / 5.73 | 0 | 1.26 | 1.262 | 16.6 | 16.62 | 2.1 | 45 | result |
+| srt | 1 | 3 | 5.53 / 5.14 | 0 | 1.06 | 1.063 | 16.6 | 16.64 | 1.9 | 45 | result |
+| rtmp | 1 | 1 | 4.77 / 4.72 | 0 | 0.58 | 0.576 | 22.8 | 22.81 | 0.7 | 45 | result |
+| rtmp | 1 | 2 | 7.94 / 5.48 | 130 | 0.47 | 0.465 | 19.7 | 19.72 | 0.6 | 45 | result |
+| rtmp | 1 | 3 | 5.14 / 4.48 | 0 | 0.55 | 0.554 | 17.5 | 17.48 | 0.8 | 45 | result |
+| whip | 1 | 1 | 5.54 / 4.51 | 0 | 1.51 | 1.505 | 17.8 | 17.75 | 2.3 | 45 | result |
+| whip | 1 | 2 | 5.48 / 5.42 | 0 | 1.09 | 1.085 | 25.0 | 25.0 | 1.8 | 45 | result |
+| whip | 1 | 3 | 7.73 / 5.67 | 85 | 1.06 | 1.063 | 16.8 | 16.81 | 1.9 | 45 | result |
+| srt | 10 | 1 | 4.51 / 9.7 | 0 | 9.38 | 0.938 | 126.2 | 12.62 | 18.4 | 45 | result |
+| srt | 10 | 2 | 6.24 / 6.69 | 0 | 8.23 | 0.823 | 105.3 | 10.53 | 16.5 | 45 | result |
+| srt | 10 | 3 | 6.94 / 6.15 | 0 | 7.48 | 0.748 | 104.9 | 10.49 | 15.0 | 45 | result |
+| rtmp | 10 | 1 | 45.21 / 27.27 | 600 | 4.47 | 0.447 | 132.8 | 13.28 | 7.0 | 45 | **indicative** (above the gate) |
+| rtmp | 10 | 2 | 5.73 / 7.45 | 0 | 4.85 | 0.485 | 111.6 | 11.16 | 7.4 | 45 | result |
+| rtmp | 10 | 3 | 6.15 / 5.71 | 0 | 4.14 | 0.414 | 103.1 | 10.31 | 6.4 | 45 | result |
+| whip | 10 | 1 | 7.97 / 7.68 | 95 | 7.66 | 0.766 | 113.2 | 11.32 | 15.0 | 44 | result |
+| whip | 10 | 2 | 7.45 / 6.61 | 0 | 8.63 | 0.863 | 135.5 | 13.55 | 17.2 | 45 | result |
+| whip | 10 | 3 | 4.48 / 6.94 | 0 | 7.9 | 0.79 | 106.7 | 10.67 | 16.0 | 44 | result |
+| srt | 50 | 1 | 7.15 / 10.65 | 0 | 31.36 | 0.627 | 530.9 | 10.62 | 75.3 | 47 | result |
+| srt | 50 | 2 | 7.62 / 16.99 | 35 | 26.99 | 0.54 | 524.6 | 10.49 | 65.2 | 47 | result |
+| srt | 50 | 3 | 7.79 / 8.83 | 130 | 17.23 | 0.345 | 485.9 | 9.72 | 43.6 | 47 | result |
+| rtmp | 50 | 1 | 7.53 / 17.41 | 30 | 16.75 | 0.335 | 547.4 | 10.95 | 27.4 | 46 | result |
+| rtmp | 50 | 2 | 6.79 / 6.27 | 0 | 15.94 | 0.319 | 548.3 | 10.97 | 26.0 | 46 | result |
+| rtmp | 50 | 3 | 7.77 / 8.08 | 20 | 14.48 | 0.29 | 722.8 | 14.46 | 22.0 | 46 | result |
+| whip | 50 | 1 | 7.76 / 27.63 | 325 | 15.97 | 0.319 | 538.8 | 10.78 | 37.9 | 46 | result |
+| whip | 50 | 2 | 7.71 / 12.51 | 60 | 35.89 | 0.718 | 570.8 | 11.42 | 89.1 | 45 | result |
+| whip | 50 | 3 | 5.71 / 8.83 | 0 | 29.87 | 0.597 | 555.8 | 11.12 | 75.8 | 45 | result |
+
+Per round, from results only (the rule above):
+
+| Streams | Round | WHIP/SRT CPU | WHIP/SRT RSS | WHIP/RTMP CPU | WHIP/RTMP RSS |
+|---|---|---|---|---|---|
+| 1 | 1 | 2.06 | 1.01 | 2.61 | 0.78 |
+| 1 | 2 | 0.86 | 1.50 | 2.33 | 1.27 |
+| 1 | 3 | 1.00 | 1.01 | 1.92 | 0.96 |
+| 10 | 1 | 0.82 | 0.90 | (RTMP indicative: 1.71) | (0.85) |
+| 10 | 2 | 1.05 | 1.29 | 1.78 | 1.21 |
+| 10 | 3 | 1.06 | 1.02 | 1.91 | 1.03 |
+| 50 | 1 | 0.51 | 1.02 | 0.95 | 0.98 |
+| 50 | 2 | 1.33 | 1.09 | 2.25 | 1.04 |
+| 50 | 3 | 1.73 | 1.14 | 2.06 | 0.77 |
+
+### Verdict
+
+**A4.2 is not met as stated, and is a decision point.** By the rule:
+
+- **Memory:** WHIP's RSS per stream was above SRT's in every round at 1
+  stream (by 1%, 50% and 1%: 16.8 to 25.0 MB against 16.6 to 17.5 MB) and at
+  50 streams (by 2%, 9% and 14%: 10.8 to 11.4 MB against 9.7 to 10.6 MB, so
+  0.2 to 1.4 MB a stream more). At 10 streams the rounds disagree (0.90,
+  1.29, 1.02).
+- **CPU:** the rounds disagree at every N (WHIP/SRT 0.86 to 2.06 at 1
+  stream, 0.82 to 1.06 at 10, 0.51 to 1.73 at 50), so the call is the
+  owner's. The host's own spread is larger than the difference: the same
+  protocol's CPU at 50 streams moved 1.8x between rounds (SRT 17.2 to
+  31.4%, WHIP 16.0 to 35.9%), with the load rising during some windows.
+  At one stream WHIP was 1.06 to 1.51% of a core against SRT's 0.73 to
+  1.26%.
+
+Nothing was changed for it, and the cause was not investigated. WHIP does
+DTLS, SRTP, ICE and RTP reordering per session that SRT does not, which is
+why the design calls a failure here a decision point, not necessarily a
+defect.
+
+Also seen:
+
+- WHIP's 50 publishers took 16.8 s to all become playable, against 6.0 s
+  for SRT, because they start 0.3 s apart to stay under the per-address
+  pending cap (15 s of starting alone).
+- FFmpeg's WHIP publishers cost 38 to 89% of a core at 50 streams, against
+  44 to 75% for SRT's pipelines and 22 to 27% for RTMP's (not counted).
+- SRT's figures here are lower than in [benchmarks.md](../benchmarks.md)
+  section B (22 October: 34.5 to 39.4% CPU and 950 to 998 MB at 50 streams;
+  here 17.2 to 31.4% and 486 to 531 MB), with the same method and a newer
+  build. That was not investigated.
