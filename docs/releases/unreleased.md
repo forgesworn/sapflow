@@ -60,6 +60,11 @@ Notes for the release after 0.2.0-rc.1.
 
 ## sapflow-dtls
 
+- A connected server now refuses every renegotiation with one warning-level
+  `no_renegotiation`. It used to answer only a ClientHello whose
+  `message_seq` was above the last Finished's, but DTLS 1.2 starts each
+  handshake's messages at 0 (RFC 6347 section 4.2.2), so a conforming
+  peer's request was silently dropped.
 - Unauthenticated (epoch 0) input no longer ends a handshake by breaking a
   reassembly bound. A fragment over `max_message_len`, `max_buffered` or
   `max_fragments`, an empty fragment of a non-empty message, and every
