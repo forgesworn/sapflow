@@ -2162,6 +2162,41 @@ async fn a_connected_session_no_longer_counts_as_pending() {
     assert!(admitted, "admitted once the first had connected");
 }
 
+/// A3.7 over real UDP: unauthenticated STUN, DTLS, RTP and random bytes
+/// sent to the media port from a fresh address draw nothing, and so does a
+/// live publisher's check re-sent from there once its original has
+/// arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_address_draws_nothing() {
+    let server = start(&[]).await;
+    let (mut phone, _) = live(&server, 64, "event-fresh").await;
+    let fresh = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let mut corrupted = phone.p.check(false);
+    if let Some(last) = corrupted.last_mut() {
+        *last ^= 0xff;
+    }
+    let mut unsigned = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42];
+    unsigned.extend_from_slice(&[7; 12]);
+    let mut hello = vec![0x16, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 1];
+    hello.resize(60, 0x5a);
+    let rtp = [0x80, 0x6f, 0, 9, 0, 0, 0, 1, 0, 0, 0x10, 0x01, 1, 2, 3, 4];
+    let random: Vec<u8> = (0..200u32).map(|i| (i * 37 % 251) as u8).collect();
+    for d in [&corrupted, &unsigned, &hello, &rtp[..], &random] {
+        fresh.send_to(d, server.udp).await.expect("send");
+    }
+    // A check the publisher sends, then the same bytes from the fresh
+    // address, as a captured copy would arrive.
+    let check = phone.p.check(false);
+    phone.send(&check).await;
+    phone.receive(Duration::from_millis(200)).await;
+    fresh.send_to(&check, server.udp).await.expect("send");
+    let mut buf = [0u8; 2048];
+    let got = tokio::time::timeout(Duration::from_millis(700), fresh.recv_from(&mut buf)).await;
+    assert!(got.is_err(), "the fresh address was sent {:?}", got.ok());
+    // The publisher was not cut off.
+    phone.publish(1).await;
+}
+
 #[test]
 fn every_end_reason_has_a_name() {
     use sapflow_whip::EndReason as R;
