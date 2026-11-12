@@ -1175,6 +1175,49 @@ mod tests {
         assert_eq!(keepalives, 4);
     }
 
+    /// A control datagram laid out as the draft has it: the header, no CIF.
+    fn header_only(control_type: u32, info: u32, dest: u32) -> Vec<u8> {
+        [0x8000_0000 | (control_type << 16), info, 0, dest]
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn header_only_peer_controls_are_accepted_as_well_as_padded_ones() {
+        // We pad our own keep-alive, ACKACK and shutdown with one zero word
+        // for libsrt 1.5.7, but the draft gives them no CIF and a peer may
+        // still send the bare 16-byte header.
+        let t0 = Instant::now();
+        let mut l = listener(t0);
+        let id = connect(&mut l, t0, 1);
+        l.accept(id, t0);
+        sent_handshakes(&mut l);
+        for padded in [false, true] {
+            for (control_type, info) in [(1, 0), (6, 1)] {
+                let mut datagram = header_only(control_type, info, id.0);
+                if padded {
+                    datagram.extend_from_slice(&[0; 4]);
+                }
+                l.handle_datagram(t0, peer(), &datagram);
+            }
+        }
+        assert_eq!(l.stats(), ListenerStats::default(), "none discarded");
+        assert_eq!(l.connections(), 1);
+        assert!(l.poll_event().is_none());
+
+        l.handle_datagram(t0, peer(), &header_only(5, 0, id.0));
+        assert!(matches!(
+            l.poll_event(),
+            Some(Event::Closed {
+                reason: Some(CloseReason::Shutdown),
+                ..
+            })
+        ));
+        assert_eq!(l.connections(), 0);
+        assert_eq!(l.stats(), ListenerStats::default());
+    }
+
     #[test]
     fn close_sends_shutdown() {
         let t0 = Instant::now();
