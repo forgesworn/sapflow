@@ -303,6 +303,26 @@ jobs:
           sudo apt-get "${apt_options[@]}" -o "Dir::State::lists=$lists" install --no-download -y --no-install-recommends "${packages[@]}"
           sudo install -d -m 0755 /run/sshd
           command -v srt-live-transmit ffmpeg ffprobe
+      - name: Install FFmpeg with the WHIP muxer
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ubuntu's ffmpeg (6.1) has no WHIP muxer, which FFmpeg 8 added. The
+          # smoke's WHIP publisher is a pinned static build, checked by its
+          # SHA-256: a month-end autobuild of FFmpeg-Builds (n8.1.3 linux64
+          # gpl, with OpenSSL, libx264 and libopus); that project keeps its
+          # month-end builds for two years, its daily ones for about two
+          # weeks. Ubuntu's ffmpeg does the rest.
+          url=https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/ffmpeg-n8.1.3-27-g8dca1586f4-linux64-gpl-8.1.tar.xz
+          sha256=41e9c565594c390622cf968d82fa4135d9e9a11d06c1515644288cbc844e3380
+          dir="$(mktemp -d "$RUNNER_TEMP/ffmpeg-whip-XXXXXX")"
+          curl -fsSL --proto '=https' --retry 3 --retry-all-errors --connect-timeout 10 --max-time 240 -o "$dir/ffmpeg.tar.xz" "$url"
+          echo "$sha256  $dir/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xJf "$dir/ffmpeg.tar.xz" -C "$dir" --strip-components=1
+          "$dir/bin/ffmpeg" -hide_banner -version | sed -n 1p
+          "$dir/bin/ffmpeg" -hide_banner -muxers | grep -E '^ *E +whip '
+          echo "SMOKE_WHIP_FFMPEG=$dir/bin/ffmpeg" >> "$GITHUB_ENV"
       - name: Smoke, viewers on the own event loop
         env:
           SAPFLOW_HTTP_IMPL: own
