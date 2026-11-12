@@ -1089,9 +1089,11 @@ elementary-stream path (the server test
 | 500 ms | 60, 72 | 60, 102 | 15 | `media-loss` |
 | 1000 ms | 60, 48 | 60, 103 | 38 | `media-loss` |
 
-The first file's 95 AAC frames from the first keyframe to the change lose
-one at the stream's start in every row (below). The second file holds its
-own 94 and the late frames that joined its first part; it is never marked
+The epoch's 95 AAC frames from the first keyframe to the change lose one
+at the stream's start in time order (the 0 ms row; below); with audio
+behind, none is lost there. From 100 ms on, what the first file lacks is
+late frames that joined the second file's first part, and the drops. The
+second file holds its own 94 and those late frames; it is never marked
 for late audio. In the fixture's TS order, whose AAC PES arrive up to
 200 ms behind their video, one frame is dropped and the first file is
 marked.

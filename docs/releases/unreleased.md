@@ -71,4 +71,8 @@ Notes for the release after 0.2.0-rc.1.
   in the new run's `media_loss` but counted by the new
   `Muxer::take_late_audio_loss`, and `Muxer::late_audio_epoch` says while
   it may still come. The server holds the old recording open until then
-  and marks it, not the next file, `media-loss`.
+  and marks it, not the next file, `media-loss`. A break or interrupt
+  right after a frame clamped to `PART-TARGET` (a stall) now ends the
+  segment with its media and resumes the next run there, for SRT and RTMP
+  as for WHIP, where `EXTINF` used to include the stall's hole before the
+  discontinuity.
