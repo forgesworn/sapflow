@@ -370,7 +370,8 @@ fn av_run(reports: bool) -> (Receiver, Vec<(u64, Event)>) {
             assert!(matches!(packets(&d)[0], Packet::ReceiverReport(_)));
         }
     }
-    timers(&mut r, 4_000 * MS, &mut events);
+    // Past the default hold (4 s from the first packet at 15 ms).
+    timers(&mut r, 6_000 * MS, &mut events);
     (r, events)
 }
 
@@ -441,8 +442,8 @@ fn av_alignment_falls_back_to_arrival_without_reports() {
             alignment: Alignment::Arrival(Fallback::Timeout)
         }
     );
-    // 1.5 s after the first media packet, at 15 ms.
-    assert_eq!(*when, 1515);
+    // The default hold, 4 s, after the first media packet, at 15 ms.
+    assert_eq!(*when, 4015);
     assert_eq!(r.alignment(), Some(Alignment::Arrival(Fallback::Timeout)));
     let (_, v) = first_pts(&events, 0);
     let (_, a) = first_pts(&events, 1);
@@ -551,7 +552,8 @@ fn media_only_over_rtx_still_ends_the_hold() {
     // A padding-only probe is not media: nothing starts.
     feed(&mut r, 0, &pkt(97, 99, 1, 0, false, &[])).expect("probe");
     assert_eq!(r.poll_timeout(), None);
-    for n in 0..60u16 {
+    // 4.3 s of it, past the default hold.
+    for n in 0..130u16 {
         let mut body = n.to_be_bytes().to_vec();
         body.extend_from_slice(&[0x65, 0x88, 1]);
         let at = 10 + u64::from(n) * 33;
@@ -568,7 +570,7 @@ fn media_only_over_rtx_still_ends_the_hold() {
     assert!(std::iter::from_fn(|| r.poll_event()).any(|e| matches!(e, Event::AccessUnit { .. })));
 }
 
-/// A1.2 with the default 1.5 s start hold: exactly the access units and
+/// A1.2 with the default (4 s) start hold: exactly the access units and
 /// audio of the run without it, after one Aligned event (the fixtures carry
 /// no sender reports), with pts strictly increasing in each stream.
 #[test]

@@ -34,7 +34,7 @@ only dependencies are pinned RustCrypto primitives (`aes`, `ctr`,
 | `opus` | The RFC 6716 TOC byte and packet framing (codes 0 to 3, padding, the 120 ms bound), constant encoded-silence packets, and a depacketiser that fills DTX and loss with silence of the stream's channel layout, marked apart |
 | `rtx` | RFC 4588 payloads: the OSN, and padding-only probes |
 | `twcc` | Transport-wide congestion control: arrival times recorded once per transport-wide sequence number in a bounded window, encoded as RTPFB FMT 15 feedback (run-length and one- and two-bit vector chunks, 250 us deltas, 64 ms reference time) at a fixed cadence and split at a size cap |
-| `timeline` | One 90 kHz timeline: a start hold for every stream's first sender report (1.5 s at most, bounded in bytes), then alignment by sender reports or by arrival time, timestamps that strictly increase and stay within a lead of arrival time, and later reports slewed in at up to 500 ppm |
+| `timeline` | One 90 kHz timeline: a start hold for every stream's first sender report (4 s at most, bounded in bytes), then alignment by sender reports or by arrival time, timestamps that strictly increase and stay within a lead of arrival time, and later reports slewed in at up to 500 ppm |
 | `receive` | The `Receiver`: per stream, a bounded reorder buffer, NACKs and RTT, RTX or same-SSRC retransmissions, keyframe requests (PLI or FIR), the depacketisers and receiver report statistics (RFC 3550 A.3 and A.8, each packet counted once); for the session, transport-cc and the timeline; giving events stamped on the timeline, and RTCP datagrams that start with the receiver report |
 
 ```rust
@@ -158,7 +158,7 @@ For the session:
   packets of at most `max_packet` (1000) bytes, at most `max_pending`
   (1024) packets waiting, at most 256 feedback packets queued.
 - **Timeline.** Frames are held from the first media packet until every
-  stream has a sender report, for at most `start_hold` (1.5 s) and
+  stream has a sender report, for at most `start_hold` (4 s) and
   `max_hold_bytes` (4 MiB) or half the event queue, then `Event::Aligned`
   says whether they were aligned by the reports or by arrival time and
   why. Every `AccessUnit` and `Audio` event carries `pts` on one 90 kHz

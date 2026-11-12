@@ -261,7 +261,7 @@ const AUDIO_SSRC: u32 = 0x3333_3333;
 /// The receiver as the server drives it. A mode byte (bit 0: a 16-packet,
 /// 4000-byte buffer; bit 1: a 50 ms jitter wait and a small NACK
 /// allowance; bit 2: FIR instead of PLI and SSRCs bound from the first
-/// packets; bit 3: small H.264 limits; bit 4: the default 1.5 s start
+/// packets; bit 3: small H.264 limits; bit 4: the default (4 s) start
 /// hold instead of none), then records whose first byte
 /// picks an operation (modulo 6):
 ///
