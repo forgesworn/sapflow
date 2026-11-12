@@ -1194,8 +1194,7 @@ impl Owner {
         // so bounded, and nothing of the peer's beyond an alert code.
         let dtls = dtls_reason(reason).map(tracing::field::debug);
         let Some(mut feed) = self.feeds.remove(&id) else {
-            // Its feed panicked and was dropped, marking the recording; or
-            // it never connected.
+            // Its feed panicked and was dropped, marking the recording.
             tracing::info!(reason = name, dtls, count, "WHIP session ended");
             return;
         };
